@@ -21,7 +21,8 @@ enum Type {
     Enum(String),
     Void,
     FunctionValue {
-        params: Vec<String>,
+        params: Vec<FunctionValueParam>,
+        return_type: Option<Box<Type>>,
         body: Vec<Stmt>,
     },
     Unknown,
@@ -31,6 +32,12 @@ enum Type {
 struct VarType {
     ty: Type,
     mutable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FunctionValueParam {
+    name: String,
+    ty: Option<Type>,
 }
 
 #[derive(Debug, Clone)]
@@ -356,6 +363,7 @@ impl Checker {
                 self.pop_scope();
                 Ok(())
             }
+            Stmt::Function(function) => self.check_local_function(function),
             Stmt::Return { value, span } => {
                 let actual = match value {
                     Some(value) => self.check_expr(value)?,
@@ -449,9 +457,15 @@ impl Checker {
                         }
                         if self.contains(name) {
                             let callee_type = self.get(name, callee.span)?.ty;
-                            if let Type::FunctionValue { params, body } = callee_type {
+                            if let Type::FunctionValue {
+                                params,
+                                return_type,
+                                body,
+                            } = callee_type
+                            {
                                 return self.check_function_value_call(
                                     &params,
+                                    return_type.as_deref(),
                                     &body,
                                     args,
                                     expr.span,
@@ -472,8 +486,20 @@ impl Checker {
                         ))
                     } else {
                         let callee_type = self.check_expr(callee)?;
-                        if let Type::FunctionValue { params, body } = callee_type {
-                            self.check_function_value_call(&params, &body, args, expr.span, None)
+                        if let Type::FunctionValue {
+                            params,
+                            return_type,
+                            body,
+                        } = callee_type
+                        {
+                            self.check_function_value_call(
+                                &params,
+                                return_type.as_deref(),
+                                &body,
+                                args,
+                                expr.span,
+                                None,
+                            )
                         } else {
                             Err(KuError::runtime(
                                 format!("cannot call {}", type_name(&callee_type)),
@@ -627,11 +653,43 @@ impl Checker {
                     }
                     Ok(Type::Object(object_fields))
                 }
-                ExprKind::Function { params, body } => {
-                    let arg_types = vec![Type::Unknown; params.len()];
-                    self.check_function_value_body(params, body, &arg_types, expr.span)?;
+                ExprKind::Function {
+                    params,
+                    return_type,
+                    body,
+                } => {
+                    reject_duplicate_function_value_params(params)?;
+                    let params = params
+                        .iter()
+                        .map(|param| {
+                            Ok(FunctionValueParam {
+                                name: param.name.clone(),
+                                ty: param
+                                    .ty
+                                    .as_ref()
+                                    .map(|ty| self.resolve_type_name(ty, param.span))
+                                    .transpose()?,
+                            })
+                        })
+                        .collect::<KuResult<Vec<_>>>()?;
+                    let return_type = return_type
+                        .as_ref()
+                        .map(|ty| self.resolve_type_name(ty, expr.span).map(Box::new))
+                        .transpose()?;
+                    let arg_types = params
+                        .iter()
+                        .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
+                        .collect::<Vec<_>>();
+                    self.check_function_value_body(
+                        &params,
+                        return_type.as_deref(),
+                        body,
+                        &arg_types,
+                        expr.span,
+                    )?;
                     Ok(Type::FunctionValue {
-                        params: params.clone(),
+                        params,
+                        return_type,
                         body: body.clone(),
                     })
                 }
@@ -767,7 +825,8 @@ impl Checker {
 
     fn check_function_value_call(
         &mut self,
-        params: &[String],
+        params: &[FunctionValueParam],
+        return_type: Option<&Type>,
         body: &[Stmt],
         args: &[Expr],
         span: Span,
@@ -786,28 +845,39 @@ impl Checker {
                 span,
             ));
         }
-        let arg_types = args
+        let actual_arg_types = args
             .iter()
             .map(|arg| self.check_expr(arg))
             .collect::<KuResult<Vec<_>>>()?;
-        self.check_function_value_body(params, body, &arg_types, span)
+        let mut arg_types = Vec::new();
+        for ((param, actual), arg) in params.iter().zip(actual_arg_types.iter()).zip(args.iter()) {
+            if let Some(expected) = &param.ty {
+                if !type_matches(expected, actual) {
+                    return Err(type_error(arg.span, expected, actual));
+                }
+                arg_types.push(expected.clone());
+            } else {
+                arg_types.push(actual.clone());
+            }
+        }
+        self.check_function_value_body(params, return_type, body, &arg_types, span)
     }
 
     fn check_function_value_body(
         &mut self,
-        params: &[String],
+        params: &[FunctionValueParam],
+        return_type: Option<&Type>,
         body: &[Stmt],
         arg_types: &[Type],
         span: Span,
     ) -> KuResult<Type> {
         let saved_scopes = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
         let saved_return = self.current_return.clone();
-        self.current_return = Type::Unknown;
+        self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
 
         let result = (|| -> KuResult<Type> {
-            reject_duplicate_names(params, span, "function value parameter")?;
             for (param, ty) in params.iter().zip(arg_types.iter()) {
-                self.define(param.clone(), ty.clone(), false, span)?;
+                self.define(param.name.clone(), ty.clone(), false, span)?;
             }
 
             let mut inferred_return = Type::Null;
@@ -816,12 +886,64 @@ impl Checker {
                     inferred_return = merge_return_types(&inferred_return, &return_type, span)?;
                 }
             }
+            if let Some(expected) = return_type {
+                if expected != &Type::Void && !block_may_return(body) {
+                    return Err(KuError::runtime(
+                        format!("function value must return {}", type_name(expected)),
+                        span,
+                    ));
+                }
+                if inferred_return != Type::Null && !type_matches(expected, &inferred_return) {
+                    return Err(type_error(span, expected, &inferred_return));
+                }
+            }
             Ok(inferred_return)
         })();
 
         self.current_return = saved_return;
         self.scopes = saved_scopes;
         result
+    }
+
+    fn check_local_function(&mut self, function: &FnDecl) -> KuResult<()> {
+        reject_duplicate_params(function)?;
+        let params = function
+            .params
+            .iter()
+            .map(|param| {
+                Ok(FunctionValueParam {
+                    name: param.name.clone(),
+                    ty: Some(self.resolve_type_name(&param.ty, param.span)?),
+                })
+            })
+            .collect::<KuResult<Vec<_>>>()?;
+        let return_type = function
+            .return_type
+            .as_ref()
+            .map(|ty| self.resolve_type_name(ty, function.span))
+            .transpose()?;
+        self.define(
+            function.name.clone(),
+            Type::FunctionValue {
+                params: params.clone(),
+                return_type: return_type.clone().map(Box::new),
+                body: function.body.clone(),
+            },
+            false,
+            function.span,
+        )?;
+        let arg_types = params
+            .iter()
+            .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
+            .collect::<Vec<_>>();
+        self.check_function_value_body(
+            &params,
+            return_type.as_ref(),
+            &function.body,
+            &arg_types,
+            function.span,
+        )?;
+        Ok(())
     }
 
     fn check_stmt_and_infer_return(&mut self, stmt: &Stmt) -> KuResult<Option<Type>> {
@@ -935,13 +1057,13 @@ fn expect_arg_count(name: &str, actual: usize, expected: usize, span: Span) -> K
     }
 }
 
-fn reject_duplicate_names(names: &[String], span: Span, label: &str) -> KuResult<()> {
+fn reject_duplicate_function_value_params(params: &[FunctionParam]) -> KuResult<()> {
     let mut seen = HashSet::new();
-    for name in names {
-        if !seen.insert(name) {
+    for param in params {
+        if !seen.insert(&param.name) {
             return Err(KuError::runtime(
-                format!("duplicate {label} '{name}'"),
-                span,
+                format!("duplicate function value parameter '{}'", param.name),
+                param.span,
             ));
         }
     }
@@ -1098,6 +1220,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
+        | Stmt::Function(FnDecl { span, .. })
         | Stmt::Return { span, .. }
         | Stmt::Print { span, .. }
         | Stmt::Expr { span, .. } => *span,

@@ -16,7 +16,8 @@ use crate::{
     span::Span,
 };
 
-const KU_VERSION: &str = "0.0.2";
+const KU_VERSION: &str = "0.0.3";
+const MAX_SOURCE_BYTES: u64 = 1_000_000;
 const HELP: &str = "\
 ku - simple, small, fast language tool
 
@@ -110,6 +111,7 @@ fn read_ku_file(path: &str) -> Result<String, KuError> {
     if !is_ku_file(path) {
         return Err(expected_ku_file(path));
     }
+    reject_large_file(Path::new(path), Span::default())?;
     fs::read_to_string(path).map_err(|e| KuError::message(format!("failed to read {path}: {e}")))
 }
 
@@ -317,7 +319,7 @@ fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
             ));
         }
         let mut loader = ModuleLoader::new();
-        loader.load_entry(path, source)?
+        loader.load_entry(path, program)?
     } else {
         program
     };
@@ -360,10 +362,9 @@ impl ModuleLoader {
         }
     }
 
-    fn load_entry(&mut self, path: &Path, source: &str) -> KuResult<Program> {
+    fn load_entry(&mut self, path: &Path, program: Program) -> KuResult<Program> {
         let canonical = canonical_file(path, Span::default())?;
         self.states.insert(canonical.clone(), LoadState::Visiting);
-        let program = parse_source(source)?;
         let expanded = self.expand_program(&canonical, program, true)?;
         self.states.insert(canonical, LoadState::Done);
         Ok(expanded)
@@ -381,6 +382,7 @@ impl ModuleLoader {
             return Ok(module.clone());
         }
         self.states.insert(canonical.clone(), LoadState::Visiting);
+        reject_large_file(&canonical, span)?;
         let source = fs::read_to_string(&canonical).map_err(|err| {
             KuError::runtime(
                 format!("failed to read import '{}': {err}", canonical.display()),
@@ -420,6 +422,7 @@ impl ModuleLoader {
             match &import.kind {
                 ImportKind::Named(names) => {
                     let mut seen = HashSet::new();
+                    let mut visible = HashSet::new();
                     for name in names {
                         if !seen.insert(name) {
                             return Err(KuError::runtime(
@@ -441,17 +444,18 @@ impl ModuleLoader {
                                 import.span,
                             )
                         })?;
-                        let prepared = prepare_imported_module_items(
-                            &module.items,
-                            &HashSet::from([name.clone()]),
-                            &mut self.namespace_counter,
-                        )?;
-                        items.extend(prepared);
+                        visible.insert(name.clone());
                     }
+                    let prepared = prepare_imported_module_items(
+                        &module.items,
+                        &visible,
+                        &mut self.namespace_counter,
+                    )?;
+                    items.extend(prepared);
                 }
                 ImportKind::Glob => {
                     let visible: HashSet<String> = module.exports.keys().cloned().collect();
-                    for (name, exported) in &module.exports {
+                    for name in module.exports.keys() {
                         if local_names.contains(name) || !imported_names.insert(name.clone()) {
                             return Err(KuError::runtime(
                                 format!(
@@ -460,7 +464,6 @@ impl ModuleLoader {
                                 import.span,
                             ));
                         }
-                        let _ = exported;
                     }
                     let prepared = prepare_imported_module_items(
                         &module.items,
@@ -509,6 +512,23 @@ impl ModuleLoader {
         let _ = is_entry;
         Ok(Program { items })
     }
+}
+
+fn reject_large_file(path: &Path, span: Span) -> KuResult<()> {
+    let metadata = fs::metadata(path).map_err(|err| {
+        KuError::runtime(format!("failed to read '{}': {err}", path.display()), span)
+    })?;
+    if metadata.len() > MAX_SOURCE_BYTES {
+        return Err(KuError::runtime(
+            format!(
+                "source file too large: {} bytes exceeds {} bytes",
+                metadata.len(),
+                MAX_SOURCE_BYTES
+            ),
+            span,
+        ));
+    }
+    Ok(())
 }
 
 fn canonical_file(path: &Path, span: Span) -> KuResult<PathBuf> {
@@ -691,6 +711,12 @@ fn rewrite_function_calls_in_stmt(
             }
             Ok(())
         }
+        Stmt::Function(function) => {
+            for stmt in &mut function.body {
+                rewrite_function_calls_in_stmt(stmt, rename_map)?;
+            }
+            Ok(())
+        }
         Stmt::Return { value, .. } => {
             if let Some(value) = value {
                 rewrite_function_calls_in_expr(value, rename_map)?;
@@ -800,6 +826,12 @@ fn rewrite_namespaces_in_stmt(
         Stmt::For { iterable, body, .. } => {
             rewrite_namespaces_in_expr(iterable, namespaces)?;
             for stmt in body {
+                rewrite_namespaces_in_stmt(stmt, namespaces)?;
+            }
+            Ok(())
+        }
+        Stmt::Function(function) => {
+            for stmt in &mut function.body {
                 rewrite_namespaces_in_stmt(stmt, namespaces)?;
             }
             Ok(())

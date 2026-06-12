@@ -260,6 +260,22 @@ impl Interpreter {
                 }
                 Ok(Flow::Continue)
             }
+            Stmt::Function(function) => {
+                env.define(
+                    function.name.clone(),
+                    Value::Function {
+                        params: function
+                            .params
+                            .iter()
+                            .map(|param| param.name.clone())
+                            .collect(),
+                        body: function.body.clone(),
+                    },
+                    false,
+                    function.span,
+                )?;
+                Ok(Flow::Continue)
+            }
             Stmt::Return { value, .. } => {
                 let value = match value {
                     Some(value) => self.eval(value, env, depth)?,
@@ -355,8 +371,8 @@ impl Interpreter {
                     )),
                 }
             }
-            ExprKind::Function { params, body } => Ok(Value::Function {
-                params: params.clone(),
+            ExprKind::Function { params, body, .. } => Ok(Value::Function {
+                params: params.iter().map(|param| param.name.clone()).collect(),
                 body: body.clone(),
             }),
             ExprKind::Array(values) => values
@@ -826,6 +842,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
+        | Stmt::Function(FnDecl { span, .. })
         | Stmt::Return { span, .. }
         | Stmt::Print { span, .. }
         | Stmt::Expr { span, .. } => *span,

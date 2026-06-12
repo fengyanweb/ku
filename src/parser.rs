@@ -44,7 +44,7 @@ impl Parser {
     fn check_token_limit(&self) -> KuResult<()> {
         if self.tokens.len() > MAX_TOKENS {
             Err(KuError::parse(
-                "too many tokens; input is too large for Ku v0.0.2",
+                "too many tokens; input is too large for Ku v0.0.3",
                 self.peek().span,
             ))
         } else {
@@ -67,6 +67,9 @@ impl Parser {
         }
         if self.check(&TokenKind::Module) {
             return Ok(Item::Module(self.module_decl()?));
+        }
+        if self.check(&TokenKind::Return) {
+            return Err(KuError::parse("return outside function", self.peek().span));
         }
         Err(KuError::parse(
             "expected top-level item: import, fn, struct, enum, or module",
@@ -315,6 +318,11 @@ impl Parser {
             let stmt = self.for_statement()?;
             self.optional_semicolon();
             return Ok(stmt);
+        }
+        if self.check(&TokenKind::Fn) {
+            let function = self.function()?;
+            self.optional_semicolon();
+            return Ok(Stmt::Function(function));
         }
         if self.match_kind(&TokenKind::Return) {
             return self.return_statement();
@@ -765,8 +773,12 @@ impl Parser {
         let mut params = Vec::new();
         if !self.check(&TokenKind::RParen) {
             loop {
-                let (name, _) = self.consume_ident("expected arrow function parameter")?;
-                params.push(name);
+                let (name, span) = self.consume_ident("expected arrow function parameter")?;
+                params.push(FunctionParam {
+                    name,
+                    ty: None,
+                    span,
+                });
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }
@@ -782,7 +794,11 @@ impl Parser {
         )?;
         let (body, body_span) = self.block()?;
         Ok(Expr::new(
-            ExprKind::Function { params, body },
+            ExprKind::Function {
+                params,
+                return_type: None,
+                body,
+            },
             Span::new(start, body_span.end),
         ))
     }
@@ -942,6 +958,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
+        | Stmt::Function(FnDecl { span, .. })
         | Stmt::Return { span, .. }
         | Stmt::Print { span, .. }
         | Stmt::Expr { span, .. } => *span,

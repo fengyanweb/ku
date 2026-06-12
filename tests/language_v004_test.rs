@@ -413,6 +413,90 @@ fn main() {
 }
 
 #[test]
+fn local_and_global_functions_are_checked_and_callable() {
+    let local = r#"
+fn main() {
+    fn go(name: str, age: int) {
+        print(`我是{name},我{age}岁了`)
+    }
+    go("Ku", 3)
+}
+"#;
+    check_source("inline.ku", local).expect("local function should check");
+    run_source("inline.ku", local).expect("local function should run");
+
+    let global = r#"
+fn go(name: str, age: int) {
+    print(`我是{name},我{age}岁了`)
+}
+
+fn main() {
+    go("Ku", 3)
+}
+"#;
+    check_source("inline.ku", global).expect("global function should check");
+    run_source("inline.ku", global).expect("global function should run");
+
+    let err = check_err(r#"fn main() { fn go(name: str, age: int) { print(name) } go() }"#);
+    assert!(
+        err.contains("function value 'go' expects 2 arguments but got 0"),
+        "unexpected local function arg error: {err}"
+    );
+
+    let err = check_err(r#"fn go(name: str) { print(name) } fn main() { go() }"#);
+    assert!(
+        err.contains("function 'go' expects 1 arguments but got 0"),
+        "unexpected global function arg error: {err}"
+    );
+}
+
+#[test]
+fn check_reports_core_syntax_and_semantic_errors() {
+    let cases = [
+        ("fn main() { print(@) }", "unexpected character"),
+        ("fn main() { print(\"unterminated) }", "unterminated string"),
+        ("fn main() { print((1 + 2) }", "expected ')'"),
+        ("return 1", "return outside function"),
+        (
+            "fn main() { print(missing) }",
+            "undefined variable 'missing'",
+        ),
+        (
+            "fn greet(name: str) { print(name) } fn main() { greet() }",
+            "function 'greet' expects 1 arguments but got 0",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let err = check_err(source);
+        assert!(
+            err.contains(expected),
+            "expected error containing {expected:?}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn cli_rejects_oversized_source_files_before_lexing() {
+    let path = unique_temp_path("oversized-source").with_extension("ku");
+    fs::write(&path, " ".repeat(1_000_001)).expect("write oversized source");
+
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        path.to_string_lossy().to_string(),
+    ])
+    .expect_err("oversized source should fail")
+    .to_string();
+    assert!(
+        err.contains("source file too large"),
+        "unexpected oversized source error: {err}"
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn imports_support_named_namespace_and_glob_forms() {
     let dir = unique_temp_path("imports");
     fs::create_dir_all(&dir).expect("create temp import dir");

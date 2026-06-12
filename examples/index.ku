@@ -1,10 +1,8 @@
-fn main(){
+fn main() {
+    fn go(name: str, age: int) {
+        print(`我是{name},我{age}岁了`)
+    }
 
-    n1:str 
-    n2:int 
-
-    n1 = "'1'2"
-
-    print(`{n1}{n2}`) 
+    go("Ku", 3)
 }
 

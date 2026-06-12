@@ -113,6 +113,7 @@ pub enum Stmt {
         body: Vec<Stmt>,
         span: Span,
     },
+    Function(FnDecl),
     Return {
         value: Option<Expr>,
         span: Span,
@@ -173,9 +174,17 @@ pub enum ExprKind {
         fields: Vec<(String, Expr)>,
     },
     Function {
-        params: Vec<String>,
+        params: Vec<FunctionParam>,
+        return_type: Option<TypeName>,
         body: Vec<Stmt>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionParam {
+    pub name: String,
+    pub ty: Option<TypeName>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
