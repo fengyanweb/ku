@@ -1,0 +1,10 @@
+enum TokenKind {
+    Ident
+    Number
+    Eof
+}
+
+fn main() {
+    kind = TokenKind.Ident
+    print(kind)
+}

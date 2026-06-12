@@ -1,0 +1,11 @@
+struct Token {
+    kind: str
+    text: str
+    line: int
+    column: int
+}
+
+fn main() {
+    token = Token { kind: "Ident", text: "name", line: 1, column: 1 }
+    print(token.kind + ":" + token.text)
+}

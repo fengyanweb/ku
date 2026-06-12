@@ -1,0 +1,717 @@
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use ku::ast::{ExprKind, Item, Stmt};
+use ku::cli::{check_source, run_cli, run_source};
+use ku::lexer::Lexer;
+use ku::parser::Parser;
+use ku::token::TokenKind;
+
+fn unique_temp_path(name: &str) -> PathBuf {
+    env::temp_dir().join(format!(
+        "ku-{name}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos()
+    ))
+}
+
+fn ku_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "\\\\")
+}
+
+fn check_err(source: &str) -> String {
+    check_source("inline.ku", source)
+        .expect_err("program should fail")
+        .to_string()
+}
+
+fn run_err(source: &str) -> String {
+    run_source("inline.ku", source)
+        .expect_err("program should fail")
+        .to_string()
+}
+
+#[test]
+fn lexer_tokenizes_v004_symbols_without_breaking_float() {
+    let tokens = Lexer::new("struct S { xs:[int] } enum E { A } for x in [1.5] { fs.read }")
+        .tokenize()
+        .expect("lex should pass");
+
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::Struct)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::Enum)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::For)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::In)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::LBracket)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::RBracket)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::Dot)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::Float(value) if value == 1.5)));
+}
+
+#[test]
+fn parser_builds_arrays_for_structs_and_top_level_types() {
+    let source = r#"
+module demo
+struct Token { kind: str line: int }
+enum TokenKind { Ident Number }
+fn main() {
+    token = Token { kind: "Ident", line: 1 }
+    xs:[int] = [1, 2]
+    print(token.kind)
+    print(xs[0])
+}
+"#;
+    let tokens = Lexer::new(source).tokenize().expect("lex should pass");
+    let program = Parser::new(tokens).parse().expect("parse should pass");
+
+    assert!(matches!(program.items[0], Item::Module(_)));
+    assert!(matches!(program.items[1], Item::Struct(_)));
+    assert!(matches!(program.items[2], Item::Enum(_)));
+    let Item::Function(function) = &program.items[3] else {
+        panic!("expected function item");
+    };
+    assert!(function.body.iter().any(|stmt| matches!(
+        stmt,
+        Stmt::VarDecl {
+            value,
+            ..
+        } if matches!(value.kind, ExprKind::Array(_))
+    )));
+}
+
+#[test]
+fn checker_and_interpreter_accept_arrays_for_and_structs() {
+    let source = r#"
+struct Token {
+    kind: str
+    line: int
+}
+
+fn main() {
+    values:[int] = [1, 2, 3]
+    total:int = 0
+    for value in values {
+        total = total + value
+    }
+    token = Token { kind: "Ident", line: total }
+    print(token.kind)
+    print(values[1])
+}
+"#;
+
+    check_source("inline.ku", source).expect("program should check");
+    run_source("inline.ku", source).expect("program should run");
+}
+
+#[test]
+fn empty_arrays_and_empty_blocks_keep_their_context() {
+    let source = r#"
+fn main() {
+    values:[int] = []
+    more:[int]
+    ok = true
+    if (ok) {
+    };
+    while (false) {
+    };
+    for value in values {
+    };
+    print(len(values) + len(more))
+}
+"#;
+
+    check_source("inline.ku", source).expect("empty arrays and blocks should check");
+    run_source("inline.ku", source).expect("empty arrays and blocks should run");
+}
+
+#[test]
+fn checker_rejects_invalid_arrays_and_structs() {
+    for source in [
+        r#"fn main() { xs:[int] = [1, "bad"] }"#,
+        r#"fn main() { xs:[int] = [1]; print(xs["0"]) }"#,
+        r#"struct User { name: str } fn main() { user = User { name: "Ku", age: 1 } }"#,
+        r#"struct User { name: str age: int } fn main() { user = User { name: "Ku" } }"#,
+    ] {
+        let err = check_err(source);
+        assert!(err.contains("error:"), "unexpected error: {err}");
+    }
+}
+
+#[test]
+fn enum_unit_variants_are_values() {
+    let source = r#"
+enum TokenKind {
+    Ident
+    Eof
+}
+
+fn main() {
+    kind = TokenKind.Ident
+    print(kind)
+    print(kind == TokenKind.Ident)
+}
+"#;
+
+    check_source("inline.ku", source).expect("enum should check");
+    run_source("inline.ku", source).expect("enum should run");
+}
+
+#[test]
+fn enum_type_annotations_work_and_payload_variants_are_rejected() {
+    let source = r#"
+enum TokenKind {
+    Ident
+}
+
+fn main() {
+    kind:TokenKind = TokenKind.Ident
+    print(kind)
+}
+"#;
+    check_source("inline.ku", source).expect("enum annotation should check");
+    run_source("inline.ku", source).expect("enum annotation should run");
+
+    let err = check_err(
+        r#"
+enum Expr {
+    Number(value: int)
+}
+
+fn main() {
+    expr = Expr.Number
+}
+"#,
+    );
+    assert!(
+        err.contains("payload fields"),
+        "unexpected payload enum error: {err}"
+    );
+}
+
+#[test]
+fn top_level_names_and_unknown_types_are_rejected() {
+    for source in [
+        r#"struct Same { x:int } enum Same { A } fn main() { print(1) }"#,
+        r#"fn Same() {} struct Same { x:int } fn main() { print(1) }"#,
+        r#"struct Box { value: Missing } fn main() { print(1) }"#,
+        r#"fn use_missing(value: Missing) {} fn main() { print(1) }"#,
+    ] {
+        let err = check_err(source);
+        assert!(err.contains("error:"), "unexpected error: {err}");
+    }
+}
+
+#[test]
+fn local_values_shadow_builtin_modules() {
+    let source = r#"
+struct Reader {
+    read: int
+}
+
+fn main() {
+    fs = Reader { read: 7 }
+    print(fs.read)
+}
+"#;
+
+    check_source("inline.ku", source).expect("local fs value should shadow builtin module");
+    run_source("inline.ku", source).expect("local fs value should run");
+
+    let err = check_err(
+        r#"
+struct Reader {
+    read: int
+}
+
+fn main() {
+    fs = Reader { read: 7 }
+    fs.read("x")
+}
+"#,
+    );
+    assert!(
+        err.contains("cannot call"),
+        "unexpected shadowing error: {err}"
+    );
+}
+
+#[test]
+fn builtin_compiler_pipeline_and_fs_read_work() {
+    let path = unique_temp_path("read.txt");
+    fs::write(&path, "fn main() { print(1) }").expect("write temp file");
+    let source = format!(
+        r#"
+fn main() {{
+    text = fs.read("{}")
+    tokens = lexer.scan(text)
+    ast = parser.parse(tokens)
+    print(len(tokens))
+    print(ast)
+}}
+"#,
+        ku_string(&path)
+    );
+
+    check_source("inline.ku", &source).expect("pipeline should check");
+    run_source("inline.ku", &source).expect("pipeline should run");
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn fs_read_resolves_paths_relative_to_source_file() {
+    let dir = unique_temp_path("relative-read");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let data = dir.join("data.txt");
+    let main = dir.join("main.ku");
+    fs::write(&data, "relative-ok").expect("write data");
+    fs::write(
+        &main,
+        r#"
+fn main() {
+    print(fs.read("data.txt"))
+}
+"#,
+    )
+    .expect("write ku file");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("relative fs.read should run");
+
+    let _ = fs::remove_file(data);
+    let _ = fs::remove_file(main);
+    let _ = fs::remove_dir(dir);
+}
+
+#[test]
+fn runtime_rejects_array_bounds_and_missing_files() {
+    let err = run_err("fn main() { xs:[int] = [1]; print(xs[2]) }");
+    assert!(
+        err.contains("array index out of bounds"),
+        "unexpected error: {err}"
+    );
+
+    let err = run_err(r#"fn main() { print(fs.read("definitely-missing.ku")) }"#);
+    assert!(err.contains("failed to read"), "unexpected error: {err}");
+}
+
+#[test]
+fn runtime_rejects_integer_overflow_without_panicking() {
+    for source in [
+        "fn main() { print(9223372036854775807 + 1) }",
+        "fn main() { print(-(-9223372036854775807 - 1)) }",
+        "fn main() { print((-9223372036854775807 - 1) / -1) }",
+        "fn main() { print((-9223372036854775807 - 1) % -1) }",
+    ] {
+        let err = run_err(source);
+        assert!(err.contains("integer overflow"), "unexpected error: {err}");
+    }
+}
+
+#[test]
+fn compiler_builtins_have_resource_limits() {
+    let huge_source = "x ".repeat(100_001);
+    let source = format!(
+        r#"
+fn main() {{
+    text = "{}"
+    print(lexer.scan(text))
+}}
+"#,
+        huge_source
+    );
+    let err = run_err(&source);
+    assert!(
+        err.contains("too large") || err.contains("too many tokens"),
+        "unexpected lexer.scan resource error: {err}"
+    );
+
+    let source = format!(
+        r#"
+fn main() {{
+    text = "{}"
+    print(parser.parse(text))
+}}
+"#,
+        huge_source
+    );
+    let err = run_err(&source);
+    assert!(
+        err.contains("too large") || err.contains("too many tokens"),
+        "unexpected parser.parse resource error: {err}"
+    );
+}
+
+#[test]
+fn if_and_while_require_parenthesized_conditions() {
+    for source in [
+        "fn main() { if true { print(1) } }",
+        "fn main() { while false { print(1) } }",
+    ] {
+        let err = check_err(source);
+        assert!(err.contains("expected '('"), "unexpected error: {err}");
+    }
+
+    let source = r#"
+fn main() {
+    if (true) {
+        print(1)
+    }
+    while (false) {
+        print(2)
+    }
+}
+"#;
+    check_source("inline.ku", source).expect("parenthesized conditions should check");
+    run_source("inline.ku", source).expect("parenthesized conditions should run");
+}
+
+#[test]
+fn object_literals_support_fields_and_errors() {
+    let source = r#"
+fn main() {
+    user = { name: "Ku", age: 1 }
+    print(user.name)
+    print(user.age)
+}
+"#;
+    check_source("inline.ku", source).expect("object literal should check");
+    run_source("inline.ku", source).expect("object literal should run");
+
+    let err = check_err(r#"fn main() { user = { name: "Ku", name: "Lang" } }"#);
+    assert!(err.contains("duplicate field"), "unexpected error: {err}");
+
+    let err = check_err(r#"fn main() { user = { name: "Ku" }; print(user.age) }"#);
+    assert!(
+        err.contains("object has no field"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn imports_support_named_namespace_and_glob_forms() {
+    let dir = unique_temp_path("imports");
+    fs::create_dir_all(&dir).expect("create temp import dir");
+    let math = dir.join("math.ku");
+    let named = dir.join("named.ku");
+    let namespace = dir.join("namespace.ku");
+    let glob = dir.join("glob.ku");
+    fs::write(
+        &math,
+        r#"
+fn Add(a: int, b: int): int {
+    return a + b
+}
+
+fn Twice(a: int): int {
+    return a + a
+}
+
+fn hidden(): int {
+    return 99
+}
+"#,
+    )
+    .expect("write math module");
+    fs::write(
+        &named,
+        r#"
+import { Add } from "./math.ku"
+
+fn main() {
+    print(Add(1, 2))
+}
+"#,
+    )
+    .expect("write named import");
+    fs::write(
+        &namespace,
+        r#"
+import math from "./math"
+
+fn main() {
+    print(math.Add(3, 4))
+}
+"#,
+    )
+    .expect("write namespace import");
+    fs::write(
+        &glob,
+        r#"
+import "./math.ku"
+
+fn main() {
+    print(Add(5, 6))
+    print(Twice(4))
+}
+"#,
+    )
+    .expect("write glob import");
+
+    for source in [&named, &namespace, &glob] {
+        run_cli(vec![
+            "ku".to_string(),
+            "run".to_string(),
+            source.to_string_lossy().to_string(),
+        ])
+        .expect("imported program should run");
+    }
+
+    let _ = fs::remove_file(math);
+    let _ = fs::remove_file(named);
+    let _ = fs::remove_file(namespace);
+    let _ = fs::remove_file(glob);
+    let _ = fs::remove_dir(dir);
+}
+
+#[test]
+fn imports_reject_bad_forms_private_names_and_cycles() {
+    let dir = unique_temp_path("bad-imports");
+    fs::create_dir_all(&dir).expect("create temp import dir");
+    let lib = dir.join("lib.ku");
+    let bad_form = dir.join("bad_form.ku");
+    let private_import = dir.join("private.ku");
+    let a = dir.join("a.ku");
+    let b = dir.join("b.ku");
+    fs::write(
+        &lib,
+        r#"
+fn Public(): int { return 1 }
+fn private(): int { return 2 }
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        &bad_form,
+        r#"import from "./lib.ku" fn main() { print(1) }"#,
+    )
+    .expect("write bad form");
+    fs::write(
+        &private_import,
+        r#"
+import { private } from "./lib.ku"
+fn main() { print(private()) }
+"#,
+    )
+    .expect("write private import");
+    fs::write(
+        &a,
+        r#"
+import "./b.ku"
+fn main() { print(1) }
+"#,
+    )
+    .expect("write a");
+    fs::write(
+        &b,
+        r#"
+import "./a.ku"
+fn B(): int { return 1 }
+"#,
+    )
+    .expect("write b");
+
+    for source in [&bad_form, &private_import, &a] {
+        let err = run_cli(vec![
+            "ku".to_string(),
+            "check".to_string(),
+            source.to_string_lossy().to_string(),
+        ])
+        .expect_err("bad import should fail")
+        .to_string();
+        assert!(
+            err.contains("import") || err.contains("circular"),
+            "unexpected error: {err}"
+        );
+    }
+
+    let _ = fs::remove_file(lib);
+    let _ = fs::remove_file(bad_form);
+    let _ = fs::remove_file(private_import);
+    let _ = fs::remove_file(a);
+    let _ = fs::remove_file(b);
+    let _ = fs::remove_dir(dir);
+}
+
+#[test]
+fn imports_keep_private_helpers_inside_imported_module() {
+    let dir = unique_temp_path("import-helpers");
+    fs::create_dir_all(&dir).expect("create temp import dir");
+    let lib = dir.join("lib.ku");
+    let main = dir.join("main.ku");
+    let namespace = dir.join("namespace.ku");
+    fs::write(
+        &lib,
+        r#"
+fn Public(value: int): int {
+    return helper(value)
+}
+
+fn helper(value: int): int {
+    return value + 1
+}
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        &main,
+        r#"
+import { Public } from "./lib.ku"
+
+fn main() {
+    print(Public(4))
+}
+"#,
+    )
+    .expect("write main");
+    fs::write(
+        &namespace,
+        r#"
+import lib from "./lib.ku"
+
+fn main() {
+    print(lib.Public(5))
+}
+"#,
+    )
+    .expect("write namespace");
+
+    for source in [&main, &namespace] {
+        run_cli(vec![
+            "ku".to_string(),
+            "run".to_string(),
+            source.to_string_lossy().to_string(),
+        ])
+        .expect("imported public function should keep private helper");
+    }
+
+    let _ = fs::remove_file(lib);
+    let _ = fs::remove_file(main);
+    let _ = fs::remove_file(namespace);
+    let _ = fs::remove_dir(dir);
+}
+
+#[test]
+fn named_imports_only_expose_requested_types() {
+    let dir = unique_temp_path("import-types");
+    fs::create_dir_all(&dir).expect("create temp import dir");
+    let lib = dir.join("lib.ku");
+    let good = dir.join("good.ku");
+    let bad = dir.join("bad.ku");
+    fs::write(
+        &lib,
+        r#"
+struct User {
+    name: str
+}
+
+fn Public(): int {
+    return 1
+}
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        &good,
+        r#"
+import { User } from "./lib.ku"
+
+fn main() {
+    user = User { name: "Ku" }
+    print(user.name)
+}
+"#,
+    )
+    .expect("write good");
+    fs::write(
+        &bad,
+        r#"
+import { Public } from "./lib.ku"
+
+fn main() {
+    user = User { name: "Ku" }
+    print(Public())
+}
+"#,
+    )
+    .expect("write bad");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        good.to_string_lossy().to_string(),
+    ])
+    .expect("explicitly imported struct should run");
+
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        bad.to_string_lossy().to_string(),
+    ])
+    .expect_err("unimported struct should not leak")
+    .to_string();
+    assert!(
+        err.contains("undefined struct 'User'"),
+        "unexpected error: {err}"
+    );
+
+    let _ = fs::remove_file(lib);
+    let _ = fs::remove_file(good);
+    let _ = fs::remove_file(bad);
+    let _ = fs::remove_dir(dir);
+}
+
+#[test]
+fn ku_build_creates_runnable_executable_wrapper() {
+    let dir = unique_temp_path("build");
+    fs::create_dir_all(&dir).expect("create temp build dir");
+    let source = dir.join("main.ku");
+    fs::write(&source, "fn main() { print(\"built\") }").expect("write ku source");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        source.to_string_lossy().to_string(),
+    ])
+    .expect("ku build should succeed");
+
+    let mut exe = source.with_extension("");
+    if cfg!(windows) {
+        exe.set_extension("exe");
+    }
+    assert!(exe.exists(), "expected built exe at {}", exe.display());
+    let output = Command::new(&exe).output().expect("run built exe");
+    assert!(output.status.success(), "built exe should run");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("built"),
+        "unexpected stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let _ = fs::remove_file(exe);
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_dir(dir);
+}

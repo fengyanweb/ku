@@ -1,0 +1,1 @@
+﻿fn main() { ok = true; if ok { }; print(1) }

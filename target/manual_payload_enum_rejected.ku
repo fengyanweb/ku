@@ -1,0 +1,1 @@
+﻿enum E { Number(value:int) } fn main() { print(E.Number) }

@@ -1,0 +1,5 @@
+﻿fn main() {
+    APP_NAME = 'ku'
+    APP_NAME = 'max'
+}
+

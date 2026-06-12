@@ -1,0 +1,10 @@
+fn main() {
+    name = 'Ku'
+    total:int
+    add = (a, b) => {
+        return a + b
+    }
+
+    total = add(10, 20)
+    print(`Hello {name} {total}`)
+}

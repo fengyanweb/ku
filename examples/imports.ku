@@ -1,0 +1,7 @@
+import math from "./math"
+import { Add } from "./math.ku"
+
+fn main() {
+    print(math.Twice(5))
+    print(Add(2, 3))
+}

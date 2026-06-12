@@ -1,0 +1,383 @@
+# Ku 0.0.3 Syntax Draft
+
+本文固定 Ku 0.0.3 的语法边界。当前 CLI 版本仍可能显示 `0.0.2`，这里记录的是已经实现或准备稳定保留到 0.0.3 的语法。
+
+## 文件和入口
+
+Ku 源文件使用 `.ku` 扩展名。程序必须提供无参数入口：
+
+```ku
+fn main() {
+    print("Hello Ku")
+}
+```
+
+当前不支持顶层脚本语句。
+
+## 顶层声明
+
+当前支持：
+
+```ku
+module demo
+
+struct Token {
+    kind: str
+    text: str
+    line: int
+    column: int
+}
+
+enum TokenKind {
+    Ident
+    Number
+    Eof
+}
+
+fn main() {
+    print("ok")
+}
+```
+
+首字母大写的顶层 `fn` / `struct` / `enum` 会作为跨文件导出名；首字母小写的顶层名字只在当前文件内部使用。
+
+支持三种导入形式：
+
+```ku
+import math from "./math"
+import { Add, Twice } from "./math.ku"
+import "./math.ku"
+```
+
+`import math from "./math"` 会把 `./math.ku` 中导出的函数放进命名空间，通过 `math.Add(1, 2)` 调用。
+
+`import { Add, Twice } from "./math.ku"` 会按需导入导出名，直接使用 `Add(1, 2)`。
+
+`import "./math.ku"` 会全量导入该文件所有首字母大写的导出名，直接使用。`import from "./math.ku"` 不属于 Ku 0.0.3 语法。
+
+## 类型
+
+基础类型：
+
+```txt
+int
+float
+bool
+str
+null
+```
+
+数组类型：
+
+```ku
+nums:[int] = [1, 2, 3]
+names:[str] = ["Ku"]
+```
+
+结构体类型直接使用结构体名：
+
+```ku
+token:Token = Token { kind: "Ident", text: "name", line: 1, column: 1 }
+```
+
+`string` 和 `nil` 不是 0.0.3 类型名。
+
+## 变量
+
+Ku 不使用 `let` / `let mut`。
+
+```ku
+name = "Ku"           // 首次赋值即声明，默认可变
+score = 100
+title:str = "hello"   // 带类型声明
+count:int             // 默认值声明
+```
+
+全大写或全大写加下划线的名字按常量处理：
+
+```ku
+APP_NAME = "Ku"
+```
+
+常量后续不能再次赋值。
+
+## 函数
+
+普通函数参数必须写类型，返回类型可选：
+
+```ku
+fn add(a: int, b: int): int {
+    return a + b
+}
+
+fn log(message: str) {
+    print(message)
+}
+```
+
+限制：
+
+- `main` 不能有参数。
+- 同一个函数内不能有重复参数名。
+- 带返回类型的函数必须有可见 `return`。
+- 返回值类型必须和声明匹配。
+
+## 函数值
+
+函数值使用箭头语法：
+
+```ku
+fn main() {
+    add = (a, b) => {
+        return a + b
+    }
+
+    print(add(10, 20))
+}
+```
+
+限制：
+
+- 箭头函数参数暂时不写类型。
+- 箭头函数不支持闭包捕获外层变量。
+- 函数值调用会按实参类型检查函数体并推导返回类型。
+
+## 条件和循环
+
+```ku
+if (age >= 18) {
+    print("adult")
+} else {
+    print("child")
+}
+```
+
+```ku
+i = 0
+
+while (i < 5) {
+    print(i)
+    i = i + 1
+}
+```
+
+```ku
+nums:[int] = [1, 2, 3]
+for n in nums {
+    print(n)
+}
+```
+
+`if` 和 `while` 条件必须带小括号，并且条件类型必须是 `bool`。`for` 当前只遍历数组。
+
+## 结构体
+
+结构体是数据容器，当前不支持方法、继承或泛型：
+
+```ku
+struct Token {
+    kind: str
+    text: str
+    line: int
+    column: int
+}
+
+fn main() {
+    token = Token { kind: "Ident", text: "name", line: 1, column: 1 }
+    print(token.kind)
+}
+```
+
+结构体字面量必须提供全部字段，不能写不存在的字段。
+
+## 枚举
+
+当前支持 enum 声明和无 payload 变体值：
+
+```ku
+enum TokenKind {
+    Ident
+    Number
+    Eof
+}
+
+fn main() {
+    kind = TokenKind.Ident
+    print(kind)
+}
+```
+
+带字段的 enum variant 语法可以解析，例如 `Number(value: int)`，但构造、`match` 和模式匹配属于后续版本。
+
+## 数组
+
+数组是同质数组：
+
+```ku
+nums:[int] = [1, 2, 3]
+print(nums[0])
+print(len(nums))
+```
+
+当前支持读取索引，不支持 `nums[0] = value`。
+
+## 对象字面量
+
+对象字面量用于临时组织键值数据，语法接近 JSON，但它是 Ku 表达式，不是 JSON 文本：
+
+```ku
+person = { name: "张三", age: 18 }
+print(person.name)
+print(person.age)
+```
+
+字段名可以是标识符或字符串。字符串值必须加引号，例如 `{ name: "张三" }`；`{ name: 张三 }` 会被当成变量读取。
+
+## 表达式
+
+支持的表达式：
+
+```txt
+字面量:       123, 1.5, true, false, null, "text", 'text', `hello {name}`
+数组:         [1, 2, 3]
+对象:         { name: "Ku", age: 1 }
+结构体:       Token { kind: "Ident", text: "name", line: 1, column: 1 }
+变量:         name
+字段:         token.kind, fs.read
+索引:         nums[0]
+分组:         (expr)
+一元:         -x, !ok
+二元:         +, -, *, /, %, ==, !=, <, <=, >, >=, &&, ||
+调用:         add(1, 2), len("Ku"), fs.read("main.ku")
+函数值:       (a, b) => { return a + b }
+```
+
+优先级从高到低：
+
+```txt
+函数调用 / 字段访问 / 索引
+一元 - !
+* / %
++ -
+< <= > >=
+== !=
+&&
+||
+```
+
+## 字符串
+
+双引号和单引号字符串都支持：
+
+```ku
+"hello"
+'hello'
+```
+
+反引号模板字符串支持 `{表达式}` 插值：
+
+```ku
+print(`Hello {name} {1 + 2}`)
+```
+
+如果要输出字面量花括号，使用转义：
+
+```ku
+print(`literal \{name\}`)
+```
+
+普通表达式中：
+
+- `int/float` 可以做数字运算。
+- `str + str` 是字符串拼接。
+- `str + int` 不允许。
+
+模板插值内部额外允许：
+
+```ku
+`value {1 + "px"}`
+`value {"px" + 1.5}`
+```
+
+其他跨类型运算仍然报错，例如：
+
+```ku
+`bad {1 - "x"}`
+```
+
+## 内置能力
+
+基础函数：
+
+```ku
+len("Ku")    // 2
+len([1, 2])  // 2
+str(123)    // "123"
+```
+
+文件和编译器管线雏形：
+
+```ku
+text = fs.read("main.ku")
+tokens = lexer.scan(text)
+ast = parser.parse(tokens)
+```
+
+`fs.read` 读取 UTF-8 文本，当前有 1MB 文件大小保护，失败直接报运行时错误，不重试。相对路径按当前 `.ku` 源文件所在目录解析，不按启动终端所在目录解析。
+
+`lexer.scan` 当前返回 `[str]` 形式的 token 文本摘要。`parser.parse` 当前返回 AST 摘要字符串，后续会在 struct/enum 稳定后暴露真正的 Token/AST/Span/Error/Symbol 数据模型。二者都有输入大小、token 数和输出大小限制，避免超大字符串绕过主 parser 的资源保护。
+
+## 命令
+
+```powershell
+ku <file.ku>
+ku run <file.ku>
+ku check <file.ku>
+ku build <file.ku>
+ku version
+ku -v
+ku -h
+ku -help
+ku --help
+ku help
+```
+
+`ku check` 只检查，不运行。成功时输出被检查的文件；失败时输出文件名、行号、列号和源码位置。
+
+`ku build` 当前生成“解释器打包型可执行文件”：源码被嵌入生成的 exe 中，运行 exe 会通过 Ku 解释器执行。它是真正可运行的文件，但还不是 native C/LLVM 后端。
+
+当前 `ku build` 是开发环境功能，需要本机可调用 `rustc`，并且 `ku` 可执行文件旁边能找到 `libku.rlib` 或 `deps/libku*.rlib`。它只打包 Ku 源码本身，不打包 `fs.read` 读取的外部资源文件；相对资源路径仍按被 build 的源文件路径解析。
+
+## 当前不支持
+
+```txt
+包管理
+异步
+switch
+match / 模式匹配
+enum payload 构造
+命名空间导入里的结构体/枚举路径访问
+导入文件的私有 helper 重写
+数组元素赋值
+结构体字段赋值
+错误处理语法 try/catch/result
+native C 后端
+顶层脚本语句
+闭包捕获
+```
+
+## 资源保护
+
+当前解释器有基础资源上限，用来避免明显死循环、无限递归或过大输入长期占用资源：
+
+```txt
+最大 token 数: 100000
+最大解析深度: 32
+最大检查深度: 32
+最大执行步数: 1000000
+最大函数调用深度: 64
+fs.read 最大读取: 1000000 bytes
+compiler builtin 最大输入: 1000000 bytes
+compiler builtin 最大 token 数: 100000
+parser.parse 最大输出: 1000000 bytes
+```

@@ -1,0 +1,2 @@
+﻿struct A { x: Missing }
+fn main() { a = A { x: null } }

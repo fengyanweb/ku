@@ -1,0 +1,15 @@
+fn main() {
+    i = 0
+    total:int
+
+    while (i < 5) {
+        total = total + i
+        i = i + 1
+    }
+
+    if (total == 10) {
+        print("ok")
+    } else {
+        print("bad")
+    }
+}

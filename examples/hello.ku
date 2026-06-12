@@ -1,0 +1,4 @@
+﻿fn main() {
+    name = "Ku"
+    print("Hello " + name)
+}

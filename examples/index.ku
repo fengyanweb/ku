@@ -1,0 +1,10 @@
+fn main(){
+
+    n1:str 
+    n2:int 
+
+    n1 = "'1'2"
+
+    print(`{n1}{n2}`) 
+}
+

@@ -1,0 +1,7 @@
+fn main() {
+    text = fs.read("hello.ku")
+    tokens = lexer.scan(text)
+    ast = parser.parse(tokens)
+    print(len(tokens))
+    print(ast)
+}

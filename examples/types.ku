@@ -1,0 +1,9 @@
+fn main() {
+    name:str = "Ku"
+    count:int
+    price:float = 9.9
+    ok:bool = true
+    empty:null = null
+
+    print(`{name} {count} {price} {ok} {empty}`)
+}

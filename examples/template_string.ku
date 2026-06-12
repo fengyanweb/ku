@@ -1,0 +1,9 @@
+fn main() {
+    name:str = "Ku"
+    score:int = 100
+    price:float = 9.5
+
+    print(`Hello {name}`)
+    print(`score {score + " points"}`)
+    print(`price {"$" + price}`)
+}

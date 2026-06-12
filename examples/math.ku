@@ -1,0 +1,15 @@
+fn Add(a: int, b: int): int {
+    return a + b
+}
+
+fn Twice(value: int): int {
+    return value * 2
+}
+
+fn hidden(value: int): int {
+    return value - 1
+}
+
+fn main() {
+    print(Add(1, 2))
+}
