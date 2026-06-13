@@ -1102,8 +1102,135 @@ impl Checker {
                     ))
                 }
             }
+            ("string", "len" | "trim" | "lower" | "upper") => {
+                expect_arg_count(&format!("{module}.{function}"), args.len(), 1, span)?;
+                let actual = self.check_expr(&args[0])?;
+                if actual != Type::String {
+                    return Err(type_error(args[0].span, &Type::String, &actual));
+                }
+                if function == "len" {
+                    Ok(Some(Type::Int))
+                } else {
+                    Ok(Some(Type::String))
+                }
+            }
+            ("string", "contains" | "starts_with" | "ends_with") => {
+                expect_arg_count(&format!("{module}.{function}"), args.len(), 2, span)?;
+                self.expect_string_args(args)?;
+                Ok(Some(Type::Bool))
+            }
+            ("string", "replace") => {
+                expect_arg_count("string.replace", args.len(), 3, span)?;
+                self.expect_string_args(args)?;
+                Ok(Some(Type::String))
+            }
+            ("array", "len") => {
+                expect_arg_count("array.len", args.len(), 1, span)?;
+                match self.check_expr(&args[0])? {
+                    Type::Array(_) => Ok(Some(Type::Int)),
+                    actual => Err(type_error(
+                        args[0].span,
+                        &Type::Array(Box::new(Type::Unknown)),
+                        &actual,
+                    )),
+                }
+            }
+            ("array", "is_empty") => {
+                expect_arg_count("array.is_empty", args.len(), 1, span)?;
+                match self.check_expr(&args[0])? {
+                    Type::Array(_) => Ok(Some(Type::Bool)),
+                    actual => Err(type_error(
+                        args[0].span,
+                        &Type::Array(Box::new(Type::Unknown)),
+                        &actual,
+                    )),
+                }
+            }
+            ("array", "push") => {
+                expect_arg_count("array.push", args.len(), 2, span)?;
+                match self.check_expr(&args[0])? {
+                    Type::Array(element) => {
+                        let value = self.check_expr(&args[1])?;
+                        if !type_matches(&element, &value) {
+                            return Err(type_error(args[1].span, &element, &value));
+                        }
+                        Ok(Some(Type::Array(element)))
+                    }
+                    actual => Err(type_error(
+                        args[0].span,
+                        &Type::Array(Box::new(Type::Unknown)),
+                        &actual,
+                    )),
+                }
+            }
+            ("array", "concat") => {
+                expect_arg_count("array.concat", args.len(), 2, span)?;
+                let left = self.check_expr(&args[0])?;
+                let right = self.check_expr(&args[1])?;
+                match (&left, &right) {
+                    (Type::Array(left), Type::Array(right)) if type_matches(left, right) => {
+                        Ok(Some(Type::Array(left.clone())))
+                    }
+                    (Type::Array(_), Type::Array(_)) => {
+                        Err(type_error(args[1].span, &left, &right))
+                    }
+                    _ => Err(type_error(
+                        args[0].span,
+                        &Type::Array(Box::new(Type::Unknown)),
+                        &left,
+                    )),
+                }
+            }
+            ("array", "first" | "last") => {
+                expect_arg_count(&format!("{module}.{function}"), args.len(), 1, span)?;
+                match self.check_expr(&args[0])? {
+                    Type::Array(element) => Ok(Some(*element)),
+                    actual => Err(type_error(
+                        args[0].span,
+                        &Type::Array(Box::new(Type::Unknown)),
+                        &actual,
+                    )),
+                }
+            }
+            ("json", "parse") => {
+                expect_arg_count("json.parse", args.len(), 1, span)?;
+                let actual = self.check_expr(&args[0])?;
+                if actual == Type::String {
+                    Ok(Some(Type::Unknown))
+                } else {
+                    Err(type_error(args[0].span, &Type::String, &actual))
+                }
+            }
+            ("json", "try_parse") => {
+                expect_arg_count("json.try_parse", args.len(), 1, span)?;
+                let actual = self.check_expr(&args[0])?;
+                if actual == Type::String {
+                    Ok(Some(Type::Result(Box::new(Type::Unknown))))
+                } else {
+                    Err(type_error(args[0].span, &Type::String, &actual))
+                }
+            }
+            ("json", "stringify") => {
+                expect_arg_count("json.stringify", args.len(), 1, span)?;
+                self.check_expr(&args[0])?;
+                Ok(Some(Type::String))
+            }
+            ("time", "now" | "unix" | "millis") => {
+                expect_arg_count(&format!("{module}.{function}"), args.len(), 0, span)?;
+                Ok(Some(Type::Int))
+            }
             _ => Ok(None),
         }
+    }
+
+    fn expect_string_args(&mut self, args: &[Expr]) -> KuResult<()> {
+        for arg in args {
+            let actual = self.check_expr(arg)?;
+            if actual != Type::String {
+                return Err(type_error(arg.span, &Type::String, &actual));
+            }
+        }
+        Ok(())
     }
 
     fn check_function_value_call(

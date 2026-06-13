@@ -1,0 +1,19 @@
+fn main() {
+    text = string.trim("  Ku Lang  ")
+    print(string.upper(text))
+    print(string.replace(text, "Lang", "0.0.6"))
+
+    nums:[int] = [1, 2]
+    nums = array.push(nums, 3)
+    nums = array.concat(nums, [4])
+    print(array.len(nums))
+    print(array.first(nums))
+    print(array.last(nums))
+
+    data = { name: "Ku", version: 6, ok: true }
+    json_text = json.stringify(data)
+    print(json_text)
+    print(json.stringify(json.parse(json_text)))
+
+    print(time.now())
+}

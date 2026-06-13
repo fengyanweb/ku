@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use crate::{
@@ -14,15 +13,12 @@ use crate::{
     lexer::Lexer,
     parser::Parser,
     span::{Position, Span},
+    stdlib,
     value::Value,
 };
 
 const MAX_STEPS: usize = 1_000_000;
 const MAX_CALL_DEPTH: usize = 16;
-const MAX_READ_BYTES: u64 = 1_000_000;
-const MAX_EMBEDDED_SOURCE_BYTES: usize = 1_000_000;
-const MAX_EMBEDDED_TOKENS: usize = 100_000;
-const MAX_AST_OUTPUT_BYTES: usize = 1_000_000;
 
 enum Flow {
     Continue,
@@ -478,10 +474,12 @@ impl Interpreter {
                     }
                 }
                 let args = values;
-                if let Some(value) =
-                    eval_dotted_builtin(callee, &args, expr.span, env, &self.base_dir)?
-                {
-                    return Ok(value);
+                if !dotted_builtin_is_shadowed(callee, env) {
+                    if let Some(value) =
+                        stdlib::eval_dotted_builtin(callee, &args, expr.span, &self.base_dir)?
+                    {
+                        return Ok(value);
+                    }
                 }
                 if let Some((enum_name, variant)) = enum_variant_path(callee) {
                     if self.enums.contains_key(&enum_name) {
@@ -493,7 +491,7 @@ impl Interpreter {
                         return self.call_function(name, args, expr.span, depth + 1);
                     }
                     if !env.contains(name) {
-                        if let Some(value) = eval_builtin(name, &args, expr.span)? {
+                        if let Some(value) = stdlib::eval_builtin(name, &args, expr.span)? {
                             return Ok(value);
                         }
                     }
@@ -876,47 +874,6 @@ impl Interpreter {
     }
 }
 
-fn eval_builtin(name: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
-    match name {
-        "len" => {
-            expect_value_arg_count(name, args.len(), 1, span)?;
-            match &args[0] {
-                Value::String(value) => Ok(Some(Value::Int(value.chars().count() as i64))),
-                Value::Array(values) => Ok(Some(Value::Int(values.len() as i64))),
-                value => Err(KuError::runtime(
-                    format!("type error: expected str but got {}", value.type_name()),
-                    span,
-                )),
-            }
-        }
-        "str" => {
-            expect_value_arg_count(name, args.len(), 1, span)?;
-            Ok(Some(Value::String(args[0].to_string())))
-        }
-        "ok" => {
-            expect_value_arg_count(name, args.len(), 1, span)?;
-            Ok(Some(Value::Result {
-                ok: true,
-                value: Box::new(args[0].clone()),
-            }))
-        }
-        "err" => {
-            expect_value_arg_count(name, args.len(), 1, span)?;
-            let Value::String(message) = &args[0] else {
-                return Err(KuError::runtime(
-                    format!("type error: expected str but got {}", args[0].type_name()),
-                    span,
-                ));
-            };
-            Ok(Some(Value::Result {
-                ok: false,
-                value: Box::new(Value::String(message.clone())),
-            }))
-        }
-        _ => Ok(None),
-    }
-}
-
 fn assignment_root(expr: &Expr) -> Option<String> {
     match &expr.kind {
         ExprKind::Variable(name) => Some(name.clone()),
@@ -1042,182 +999,14 @@ fn enum_variant_path(expr: &Expr) -> Option<(String, String)> {
     Some((enum_name.clone(), name.clone()))
 }
 
-fn eval_dotted_builtin(
-    callee: &Expr,
-    args: &[Value],
-    span: Span,
-    env: &Env,
-    base_dir: &Path,
-) -> KuResult<Option<Value>> {
-    let Some((module, function)) = dotted_name(callee) else {
-        return Ok(None);
-    };
-    if env.contains(&module) {
-        return Ok(None);
-    }
-    match (module.as_str(), function.as_str()) {
-        ("fs", "read") => {
-            expect_value_arg_count("fs.read", args.len(), 1, span)?;
-            let Value::String(path) = &args[0] else {
-                return Err(KuError::runtime(
-                    format!("type error: expected str but got {}", args[0].type_name()),
-                    span,
-                ));
-            };
-            let resolved = resolve_read_path(base_dir, path);
-            let display_path = resolved.display().to_string();
-            let metadata = fs::metadata(&resolved).map_err(|err| {
-                KuError::runtime(format!("failed to read '{display_path}': {err}"), span)
-            })?;
-            if metadata.len() > MAX_READ_BYTES {
-                return Err(KuError::runtime(
-                    format!("failed to read '{display_path}': file is too large"),
-                    span,
-                ));
-            }
-            let text = fs::read_to_string(&resolved).map_err(|err| {
-                KuError::runtime(format!("failed to read '{display_path}': {err}"), span)
-            })?;
-            Ok(Some(Value::String(text)))
-        }
-        ("fs", "try_read") => {
-            expect_value_arg_count("fs.try_read", args.len(), 1, span)?;
-            let Value::String(path) = &args[0] else {
-                return Err(KuError::runtime(
-                    format!("type error: expected str but got {}", args[0].type_name()),
-                    span,
-                ));
-            };
-            let resolved = resolve_read_path(base_dir, path);
-            let display_path = resolved.display().to_string();
-            let metadata = match fs::metadata(&resolved) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    return Ok(Some(Value::Result {
-                        ok: false,
-                        value: Box::new(Value::String(format!(
-                            "failed to read '{display_path}': {err}"
-                        ))),
-                    }));
-                }
-            };
-            if metadata.len() > MAX_READ_BYTES {
-                return Err(KuError::runtime(
-                    format!("failed to read '{display_path}': file is too large"),
-                    span,
-                ));
-            }
-            match fs::read_to_string(&resolved) {
-                Ok(text) => Ok(Some(Value::Result {
-                    ok: true,
-                    value: Box::new(Value::String(text)),
-                })),
-                Err(err) => Ok(Some(Value::Result {
-                    ok: false,
-                    value: Box::new(Value::String(format!(
-                        "failed to read '{display_path}': {err}"
-                    ))),
-                })),
-            }
-        }
-        ("lexer", "scan") => {
-            expect_value_arg_count("lexer.scan", args.len(), 1, span)?;
-            let Value::String(text) = &args[0] else {
-                return Err(KuError::runtime(
-                    format!("type error: expected str but got {}", args[0].type_name()),
-                    span,
-                ));
-            };
-            reject_large_embedded_source(text, span)?;
-            let tokens = Lexer::new(text)
-                .tokenize()?
-                .into_iter()
-                .take(MAX_EMBEDDED_TOKENS + 1)
-                .map(|token| Value::String(format!("{:?}", token.kind)))
-                .collect::<Vec<_>>();
-            if tokens.len() > MAX_EMBEDDED_TOKENS {
-                return Err(KuError::runtime(
-                    "too many tokens; input is too large for lexer.scan",
-                    span,
-                ));
-            }
-            Ok(Some(Value::Array(tokens)))
-        }
-        ("parser", "parse") => {
-            expect_value_arg_count("parser.parse", args.len(), 1, span)?;
-            match &args[0] {
-                Value::String(text) => {
-                    reject_large_embedded_source(text, span)?;
-                    let tokens = Lexer::new(text).tokenize()?;
-                    if tokens.len() > MAX_EMBEDDED_TOKENS {
-                        return Err(KuError::runtime(
-                            "too many tokens; input is too large for parser.parse",
-                            span,
-                        ));
-                    }
-                    let program = Parser::new(tokens).parse_program()?;
-                    let output = format!("{program:#?}");
-                    if output.len() > MAX_AST_OUTPUT_BYTES {
-                        return Err(KuError::runtime("parser.parse output is too large", span));
-                    }
-                    Ok(Some(Value::String(output)))
-                }
-                Value::Array(tokens) => Ok(Some(Value::String(format!(
-                    "Ast(tokens: {})",
-                    tokens.len()
-                )))),
-                value => Err(KuError::runtime(
-                    format!(
-                        "type error: expected str or [str] but got {}",
-                        value.type_name()
-                    ),
-                    span,
-                )),
-            }
-        }
-        _ => Ok(None),
-    }
-}
-
-fn resolve_read_path(base_dir: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base_dir.join(path)
-    }
-}
-
-fn dotted_name(expr: &Expr) -> Option<(String, String)> {
-    let ExprKind::Field { target, name } = &expr.kind else {
-        return None;
+fn dotted_builtin_is_shadowed(expr: &Expr, env: &Env) -> bool {
+    let ExprKind::Field { target, .. } = &expr.kind else {
+        return false;
     };
     let ExprKind::Variable(module) = &target.kind else {
-        return None;
+        return false;
     };
-    Some((module.clone(), name.clone()))
-}
-
-fn reject_large_embedded_source(source: &str, span: Span) -> KuResult<()> {
-    if source.len() > MAX_EMBEDDED_SOURCE_BYTES {
-        Err(KuError::runtime(
-            "embedded source is too large for compiler builtin",
-            span,
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn expect_value_arg_count(name: &str, actual: usize, expected: usize, span: Span) -> KuResult<()> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(KuError::runtime(
-            format!("function '{name}' expects {expected} arguments but got {actual}"),
-            span,
-        ))
-    }
+    env.contains(module)
 }
 
 fn eval_binary(op: BinaryOp, left: Value, right: Value, span: Span) -> KuResult<Value> {

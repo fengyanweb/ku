@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.5`，重点是把可恢复错误、`?` 传播、`try/catch/finally` 和资源保护闭环做扎实。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.6`，重点是完成 Rust 源码模块拆分，并落地第一批 `stdlib`：`string` / `array` / `json` / `time`。
 
 ## 快速开始
 
@@ -32,7 +32,7 @@ ku -h | -help         Print help
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.5 支持的核心语法
+## 0.0.6 支持的核心语法
 
 ```ku
 struct User {
@@ -142,11 +142,14 @@ imports.ku
 compiler_pipeline.ku
 result.ku
 try_read.ku
+stdlib.ku
 ```
 
 ## 文档
 
-- [0.0.5 语法草案](docs/syntax.md)
+- [0.0.6 语法草案](docs/syntax.md)
+- [0.0.6 版本记录](docs/v0.0.6.md)
+- [版本和解释器历史](docs/history.md)
 - [0.0.5 版本记录](docs/v0.0.5.md)
 - [0.0.4 版本记录](docs/v0.0.4.md)
 - [0.0.3 版本记录](docs/v0.0.3.md)
@@ -163,6 +166,16 @@ async / await
 native C / LLVM 后端
 引用捕获闭包和闭包修改外层变量
 复杂嵌套模式和 match 穷尽性检查
+```
+
+已评估但暂不进入 0.0.6 的能力：
+
+```txt
+包管理：需要先固定 package/module 边界和缓存目录。
+async / await：需要事件循环或任务模型，不能只加关键字。
+native C / LLVM 后端：需要明确 IR、类型布局和标准库 ABI。
+引用捕获闭包：会改变 Env/Value 的所有权模型，需要单独版本做。
+match 穷尽性：需要完整类型和模式矩阵，不适合混在 stdlib 拆分里。
 ```
 
 ## 开发验证

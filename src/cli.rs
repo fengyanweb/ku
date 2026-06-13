@@ -16,7 +16,7 @@ use crate::{
     span::Span,
 };
 
-const KU_VERSION: &str = "0.0.5";
+const KU_VERSION: &str = "0.0.6";
 const MAX_SOURCE_BYTES: u64 = 1_000_000;
 const HELP: &str = "\
 ku - simple, small, fast language tool

@@ -1,6 +1,6 @@
-# Ku 0.0.5 Syntax Draft
+# Ku 0.0.6 Syntax Draft
 
-本文固定 Ku 0.0.5 的语法边界。当前 CLI 版本显示 `0.0.5`。
+本文固定 Ku 0.0.6 的语法边界。当前 CLI 版本显示 `0.0.6`。
 
 ## 文件和入口
 
@@ -88,9 +88,9 @@ fn load(): str! {
 }
 ```
 
-`T!` 表示 `Result<T, str>`。0.0.5 固定错误 payload 为 `str`。
+`T!` 表示 `Result<T, str>`。0.0.6 固定错误 payload 为 `str`。
 
-`string` 和 `nil` 不是 0.0.5 类型名。
+`string` 和 `nil` 不是 0.0.6 类型名。
 
 ## 变量
 
@@ -378,7 +378,7 @@ print(`literal \{name\}`)
 
 ## 错误处理
 
-Ku 0.0.5 先固定可恢复错误模型：
+Ku 0.0.6 继续沿用可恢复错误模型：
 
 ```txt
 T!             Result<T, str>
@@ -442,6 +442,36 @@ ast = parser.parse(tokens)
 
 `lexer.scan` 当前返回 `[str]` 形式的 token 文本摘要。`parser.parse` 当前返回 AST 摘要字符串，后续会在 struct/enum 稳定后暴露真正的 Token/AST/Span/Error/Symbol 数据模型。二者都有输入大小、token 数和输出大小限制，避免超大字符串绕过主 parser 的资源保护。
 
+标准库第一批模块：
+
+```ku
+string.len("Ku")
+string.contains("Ku Lang", "Lang")
+string.starts_with("Ku", "K")
+string.ends_with("Ku", "u")
+string.trim("  Ku  ")
+string.lower("KU")
+string.upper("ku")
+string.replace("Ku Lang", "Lang", "0.0.6")
+
+array.len([1, 2])
+array.is_empty([])
+array.push([1, 2], 3)
+array.concat([1], [2])
+array.first([1, 2])
+array.last([1, 2])
+
+json.stringify({ name: "Ku", version: 6 })
+json.parse("{\"name\":\"Ku\"}")
+json.try_parse("{bad}")
+
+time.now()
+time.unix()
+time.millis()
+```
+
+`array.push` 和 `array.concat` 返回新数组，不会原地修改参数。`json.parse` 返回运行时 JSON 值，静态类型暂记为 `Unknown`；字段级类型推断后续随类型系统完善。`json.try_parse` 返回 `Unknown!`，可以配合 `?` 和 `try/catch`。
+
 ## 命令
 
 ```powershell
@@ -474,6 +504,7 @@ if / while 条件类型错误
 数组、对象、结构体、enum 的基础语义错误
 import 语法、私有导入、循环导入
 Result / ? / fail / try 的基础语义错误
+stdlib string / array / json / time 的参数数量和基础类型错误
 ```
 
 `ku build` 当前生成“解释器打包型可执行文件”：源码被嵌入生成的 exe 中，运行 exe 会通过 Ku 解释器执行。它是真正可运行的文件，但还不是 native C/LLVM 后端。
@@ -506,4 +537,7 @@ fs.read 最大读取: 1000000 bytes
 compiler builtin 最大输入: 1000000 bytes
 compiler builtin 最大 token 数: 100000
 parser.parse 最大输出: 1000000 bytes
+json 最大输入: 1000000 bytes
+json 最大嵌套深度: 32
+json.stringify 最大输出: 1000000 bytes
 ```
