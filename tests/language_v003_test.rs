@@ -162,7 +162,6 @@ fn function_system_rejects_bad_signatures_and_calls() {
         r#"fn add(a: int): int { return a } fn main() { print(add(1, 2)) }"#,
         r#"fn add(a: int): int { return a } fn main() { print(add("x")) }"#,
         r#"fn main() { x = 1; x() }"#,
-        r#"fn main() { x = 1; f = () => { return x }; print(f()) }"#,
     ] {
         let err = check_err(source);
         assert!(

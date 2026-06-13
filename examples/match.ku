@@ -1,0 +1,15 @@
+enum Result {
+    Ok(value: int)
+    Err(message: str)
+}
+
+fn main() {
+    result = Result.Ok(42)
+    text = match result {
+        Result.Ok(value) => str(value)
+        Result.Err(message) => message
+        _ => "none"
+    }
+
+    print(text)
+}

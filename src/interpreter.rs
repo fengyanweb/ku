@@ -5,7 +5,10 @@ use std::{
 };
 
 use crate::{
-    ast::{BinaryOp, Expr, ExprKind, FnDecl, Item, Literal, Program, Stmt, UnaryOp},
+    ast::{
+        AssignTarget, BinaryOp, Expr, ExprKind, FnDecl, Item, Literal, MatchPattern, Program, Stmt,
+        UnaryOp,
+    },
     env::Env,
     error::{KuError, KuResult},
     lexer::Lexer,
@@ -29,7 +32,7 @@ enum Flow {
 pub struct Interpreter {
     functions: HashMap<String, FnDecl>,
     structs: HashMap<String, HashSet<String>>,
-    enums: HashMap<String, HashSet<String>>,
+    enums: HashMap<String, HashMap<String, usize>>,
     base_dir: PathBuf,
     steps: usize,
 }
@@ -75,8 +78,7 @@ impl Interpreter {
                         decl.name,
                         decl.variants
                             .into_iter()
-                            .filter(|variant| variant.fields.is_empty())
-                            .map(|variant| variant.name)
+                            .map(|variant| (variant.name, variant.fields.len()))
                             .collect(),
                     );
                 }
@@ -131,6 +133,7 @@ impl Interpreter {
         &mut self,
         params: &[String],
         body: &[Stmt],
+        captured: &Env,
         args: Vec<Value>,
         span: Span,
         depth: usize,
@@ -152,15 +155,18 @@ impl Interpreter {
             ));
         }
 
-        let mut env = Env::new();
+        let mut env = captured.clone();
+        env.push_scope();
         for (param, value) in params.iter().zip(args) {
             env.define(param.clone(), value, false, span)?;
         }
 
-        match self.exec_block(body, &mut env, depth)? {
+        let result = match self.exec_block(body, &mut env, depth)? {
             Flow::Continue => Ok(Value::Null),
             Flow::Return(value) => Ok(value),
-        }
+        };
+        env.pop_scope();
+        result
     }
 
     fn exec_block(&mut self, body: &[Stmt], env: &mut Env, depth: usize) -> KuResult<Flow> {
@@ -202,6 +208,15 @@ impl Interpreter {
                 } else {
                     env.define(name.clone(), value, !is_constant_name(name), *span)?;
                 }
+                Ok(Flow::Continue)
+            }
+            Stmt::AssignTarget {
+                target,
+                value,
+                span,
+            } => {
+                let value = self.eval(value, env, depth)?;
+                self.assign_target(target, value, env, depth, *span)?;
                 Ok(Flow::Continue)
             }
             Stmt::If {
@@ -270,6 +285,7 @@ impl Interpreter {
                             .map(|param| param.name.clone())
                             .collect(),
                         body: function.body.clone(),
+                        env: env.clone(),
                     },
                     false,
                     function.span,
@@ -351,6 +367,11 @@ impl Interpreter {
                 {
                     return Ok(value);
                 }
+                if let Some((enum_name, variant)) = enum_variant_path(callee) {
+                    if self.enums.contains_key(&enum_name) {
+                        return self.construct_enum(&enum_name, &variant, args, expr.span);
+                    }
+                }
                 if let ExprKind::Variable(name) = &callee.kind {
                     if self.functions.contains_key(name) {
                         return self.call_function(name, args, expr.span, depth + 1);
@@ -362,9 +383,18 @@ impl Interpreter {
                     }
                 }
                 match self.eval(callee, env, depth)? {
-                    Value::Function { params, body } => {
-                        self.call_function_value(&params, &body, args, expr.span, depth + 1)
-                    }
+                    Value::Function {
+                        params,
+                        body,
+                        env: captured,
+                    } => self.call_function_value(
+                        &params,
+                        &body,
+                        &captured,
+                        args,
+                        expr.span,
+                        depth + 1,
+                    ),
                     other => Err(KuError::runtime(
                         format!("cannot call {}", other.type_name()),
                         callee.span,
@@ -374,6 +404,7 @@ impl Interpreter {
             ExprKind::Function { params, body, .. } => Ok(Value::Function {
                 params: params.iter().map(|param| param.name.clone()).collect(),
                 body: body.clone(),
+                env: env.clone(),
             }),
             ExprKind::Array(values) => values
                 .iter()
@@ -408,11 +439,12 @@ impl Interpreter {
                     if self
                         .enums
                         .get(enum_name)
-                        .is_some_and(|variants| variants.contains(name))
+                        .is_some_and(|variants| variants.get(name).is_some_and(|arity| *arity == 0))
                     {
                         return Ok(Value::Enum {
                             name: enum_name.clone(),
                             variant: name.clone(),
+                            fields: Vec::new(),
                         });
                     }
                 }
@@ -452,6 +484,88 @@ impl Interpreter {
                     values.insert(field.clone(), self.eval(value, env, depth)?);
                 }
                 Ok(Value::Object(values))
+            }
+            ExprKind::Match { value, arms } => {
+                let value = self.eval(value, env, depth)?;
+                for arm in arms {
+                    env.push_scope();
+                    let matched = match_pattern(&arm.pattern, &value, env, arm.span)?;
+                    if matched {
+                        let result = self.eval(&arm.value, env, depth);
+                        env.pop_scope();
+                        return result;
+                    }
+                    env.pop_scope();
+                }
+                Err(KuError::runtime(
+                    "match expression did not match any arm",
+                    expr.span,
+                ))
+            }
+        }
+    }
+
+    fn construct_enum(
+        &self,
+        enum_name: &str,
+        variant: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> KuResult<Value> {
+        let Some(variants) = self.enums.get(enum_name) else {
+            return Err(KuError::runtime(
+                format!("undefined enum '{enum_name}'"),
+                span,
+            ));
+        };
+        let Some(expected) = variants.get(variant) else {
+            return Err(KuError::runtime(
+                format!("enum '{enum_name}' has no variant '{variant}'"),
+                span,
+            ));
+        };
+        if *expected != args.len() {
+            return Err(KuError::runtime(
+                format!(
+                    "enum variant '{enum_name}.{variant}' expects {expected} arguments but got {}",
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        Ok(Value::Enum {
+            name: enum_name.to_string(),
+            variant: variant.to_string(),
+            fields: args,
+        })
+    }
+
+    fn assign_target(
+        &mut self,
+        target: &AssignTarget,
+        value: Value,
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<()> {
+        match target {
+            AssignTarget::Variable(name) => env.assign(name, value, span),
+            AssignTarget::Index { target, index } => {
+                let root = assignment_root(target).ok_or_else(|| {
+                    KuError::runtime("assignment target must start with a variable", target.span)
+                })?;
+                let mut root_value = env.get(&root, target.span)?;
+                let index = self.eval(index, env, depth)?;
+                assign_index_value(&mut root_value, index, value, span)?;
+                env.assign(&root, root_value, span)
+            }
+            AssignTarget::Field { target, name } => {
+                let root = assignment_root(target).ok_or_else(|| {
+                    KuError::runtime("assignment target must start with a variable", target.span)
+                })?;
+                let mut root_value = env.get(&root, target.span)?;
+                assign_field_value(&mut root_value, name, value, span)?;
+                env.assign(&root, root_value, span)
             }
         }
     }
@@ -588,6 +702,131 @@ fn eval_builtin(name: &str, args: &[Value], span: Span) -> KuResult<Option<Value
         }
         _ => Ok(None),
     }
+}
+
+fn assignment_root(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Variable(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn assign_index_value(target: &mut Value, index: Value, value: Value, span: Span) -> KuResult<()> {
+    let Value::Array(values) = target else {
+        return Err(KuError::runtime(
+            format!("type error: cannot index {}", target.type_name()),
+            span,
+        ));
+    };
+    let Value::Int(index) = index else {
+        return Err(KuError::runtime(
+            format!(
+                "type error: expected int index but got {}",
+                index.type_name()
+            ),
+            span,
+        ));
+    };
+    if index < 0 || index as usize >= values.len() {
+        return Err(KuError::runtime("array index out of bounds", span));
+    }
+    values[index as usize] = value;
+    Ok(())
+}
+
+fn assign_field_value(target: &mut Value, name: &str, value: Value, span: Span) -> KuResult<()> {
+    match target {
+        Value::Struct {
+            name: struct_name,
+            fields,
+        } => {
+            if !fields.contains_key(name) {
+                return Err(KuError::runtime(
+                    format!("struct '{struct_name}' has no field '{name}'"),
+                    span,
+                ));
+            }
+            fields.insert(name.to_string(), value);
+            Ok(())
+        }
+        Value::Object(fields) => {
+            if !fields.contains_key(name) {
+                return Err(KuError::runtime(
+                    format!("object has no field '{name}'"),
+                    span,
+                ));
+            }
+            fields.insert(name.to_string(), value);
+            Ok(())
+        }
+        other => Err(KuError::runtime(
+            format!("type error: {} has no fields", other.type_name()),
+            span,
+        )),
+    }
+}
+
+fn match_pattern(
+    pattern: &MatchPattern,
+    value: &Value,
+    env: &mut Env,
+    span: Span,
+) -> KuResult<bool> {
+    match pattern {
+        MatchPattern::Wildcard => Ok(true),
+        MatchPattern::Literal(literal) => Ok(value == &value_from_literal(literal)),
+        MatchPattern::EnumVariant {
+            enum_name,
+            variant,
+            bindings,
+        } => {
+            let Value::Enum {
+                name,
+                variant: actual_variant,
+                fields,
+            } = value
+            else {
+                return Ok(false);
+            };
+            if name != enum_name || actual_variant != variant {
+                return Ok(false);
+            }
+            if bindings.len() != fields.len() {
+                return Err(KuError::runtime(
+                    format!(
+                        "match pattern '{enum_name}.{variant}' expects {} bindings but got {}",
+                        fields.len(),
+                        bindings.len()
+                    ),
+                    span,
+                ));
+            }
+            for (binding, field) in bindings.iter().zip(fields.iter()) {
+                env.define(binding.clone(), field.clone(), false, span)?;
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn value_from_literal(literal: &Literal) -> Value {
+    match literal {
+        Literal::Int(value) => Value::Int(*value),
+        Literal::Float(value) => Value::Float(*value),
+        Literal::Bool(value) => Value::Bool(*value),
+        Literal::String(value) | Literal::TemplateString(value) => Value::String(value.clone()),
+        Literal::Null => Value::Null,
+    }
+}
+
+fn enum_variant_path(expr: &Expr) -> Option<(String, String)> {
+    let ExprKind::Field { target, name } = &expr.kind else {
+        return None;
+    };
+    let ExprKind::Variable(enum_name) = &target.kind else {
+        return None;
+    };
+    Some((enum_name.clone(), name.clone()))
 }
 
 fn eval_dotted_builtin(
@@ -839,6 +1078,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
     match stmt {
         Stmt::VarDecl { span, .. }
         | Stmt::Assign { span, .. }
+        | Stmt::AssignTarget { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }

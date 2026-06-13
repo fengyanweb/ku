@@ -1,8 +1,9 @@
 use std::{collections::HashMap, fmt};
 
 use crate::ast::Stmt;
+use crate::env::Env;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -17,10 +18,12 @@ pub enum Value {
     Enum {
         name: String,
         variant: String,
+        fields: Vec<Value>,
     },
     Function {
         params: Vec<String>,
         body: Vec<Stmt>,
+        env: Env,
     },
     Null,
 }
@@ -91,9 +94,68 @@ impl fmt::Display for Value {
                 }
                 write!(f, " }}")
             }
-            Value::Enum { name, variant } => write!(f, "{name}.{variant}"),
+            Value::Enum {
+                name,
+                variant,
+                fields,
+            } => {
+                write!(f, "{name}.{variant}")?;
+                if !fields.is_empty() {
+                    write!(f, "(")?;
+                    for (index, field) in fields.iter().enumerate() {
+                        if index > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{field}")?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
             Value::Function { .. } => write!(f, "<function>"),
             Value::Null => write!(f, "null"),
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int(left), Value::Int(right)) => left == right,
+            (Value::Float(left), Value::Float(right)) => left == right,
+            (Value::Bool(left), Value::Bool(right)) => left == right,
+            (Value::String(left), Value::String(right)) => left == right,
+            (Value::Array(left), Value::Array(right)) => left == right,
+            (Value::Object(left), Value::Object(right)) => left == right,
+            (
+                Value::Struct {
+                    name: left_name,
+                    fields: left_fields,
+                },
+                Value::Struct {
+                    name: right_name,
+                    fields: right_fields,
+                },
+            ) => left_name == right_name && left_fields == right_fields,
+            (
+                Value::Enum {
+                    name: left_name,
+                    variant: left_variant,
+                    fields: left_fields,
+                },
+                Value::Enum {
+                    name: right_name,
+                    variant: right_variant,
+                    fields: right_fields,
+                },
+            ) => {
+                left_name == right_name
+                    && left_variant == right_variant
+                    && left_fields == right_fields
+            }
+            (Value::Function { .. }, Value::Function { .. }) => false,
+            (Value::Null, Value::Null) => true,
+            _ => false,
         }
     }
 }

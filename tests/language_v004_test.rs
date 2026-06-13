@@ -178,7 +178,7 @@ fn main() {
 }
 
 #[test]
-fn enum_type_annotations_work_and_payload_variants_are_rejected() {
+fn enum_type_annotations_and_payload_variants_work() {
     let source = r#"
 enum TokenKind {
     Ident
@@ -192,19 +192,33 @@ fn main() {
     check_source("inline.ku", source).expect("enum annotation should check");
     run_source("inline.ku", source).expect("enum annotation should run");
 
-    let err = check_err(
-        r#"
+    let payload = r#"
 enum Expr {
     Number(value: int)
+    Text(value: str)
 }
 
 fn main() {
-    expr = Expr.Number
+    expr = Expr.Number(7)
+    text = match expr {
+        Expr.Number(value) => str(value)
+        Expr.Text(value) => value
+        _ => "none"
+    }
+    print(text)
 }
+"#;
+    check_source("inline.ku", payload).expect("payload enum should check");
+    run_source("inline.ku", payload).expect("payload enum should run");
+
+    let err = check_err(
+        r#"
+enum Expr { Number(value: int) }
+fn main() { expr = Expr.Number("bad") }
 "#,
     );
     assert!(
-        err.contains("payload fields"),
+        err.contains("expected int"),
         "unexpected payload enum error: {err}"
     );
 }
@@ -409,6 +423,107 @@ fn main() {
     assert!(
         err.contains("object has no field"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn closures_capture_outer_locals_by_value() {
+    let source = r#"
+fn main() {
+    prefix = "Hi "
+    say = (name) => {
+        return prefix + name
+    }
+    prefix = "Bye "
+    print(say("Ku"))
+
+    base = 10
+    fn add(value: int): int {
+        return base + value
+    }
+    base = 20
+    print(add(5))
+}
+"#;
+
+    check_source("inline.ku", source).expect("closures should check");
+    run_source("inline.ku", source).expect("closures should run");
+}
+
+#[test]
+fn arrays_structs_and_objects_support_field_assignment() {
+    let source = r#"
+struct User {
+    name: str
+    age: int
+}
+
+fn main() {
+    values:[int] = [1, 2, 3]
+    values[1] = 9
+    user = User { name: "Ku", age: 3 }
+    user.age = values[1]
+    obj = { name: "old" }
+    obj.name = "new"
+    print(values[1])
+    print(user.age)
+    print(obj.name)
+}
+"#;
+    check_source("inline.ku", source).expect("assignment targets should check");
+    run_source("inline.ku", source).expect("assignment targets should run");
+
+    for source in [
+        r#"fn main() { xs:[int] = [1]; xs[0] = "bad" }"#,
+        r#"fn main() { xs:[int] = [1]; xs["0"] = 2 }"#,
+        r#"struct User { age:int } fn main() { user = User { age: 1 }; user.name = "bad" }"#,
+    ] {
+        let err = check_err(source);
+        assert!(err.contains("error:"), "unexpected assignment error: {err}");
+    }
+}
+
+#[test]
+fn match_supports_literals_wildcard_and_enum_payloads() {
+    let source = r#"
+enum Result {
+    Ok(value: int)
+    Err(message: str)
+}
+
+fn main() {
+    value = Result.Ok(42)
+    text = match value {
+        Result.Ok(n) => str(n)
+        Result.Err(message) => message
+    }
+    print(text)
+
+    label = switch 2 {
+        1 => "one"
+        _ => "other"
+    }
+    print(label)
+}
+"#;
+
+    check_source("inline.ku", source).expect("match should check");
+    run_source("inline.ku", source).expect("match should run");
+
+    let err = check_err(
+        r#"
+enum Result { Ok(value:int) }
+fn main() {
+    value = Result.Ok(1)
+    text = match value {
+        Result.Ok() => "bad"
+    }
+}
+"#,
+    );
+    assert!(
+        err.contains("expects 1 bindings"),
+        "unexpected match error: {err}"
     );
 }
 
@@ -766,6 +881,66 @@ fn main() {
     let _ = fs::remove_file(lib);
     let _ = fs::remove_file(good);
     let _ = fs::remove_file(bad);
+    let _ = fs::remove_dir(dir);
+}
+
+#[test]
+fn namespace_imports_expose_structs_and_enums_by_path() {
+    let dir = unique_temp_path("namespace-types");
+    fs::create_dir_all(&dir).expect("create temp import dir");
+    let lib = dir.join("lib.ku");
+    let main = dir.join("main.ku");
+    fs::write(
+        &lib,
+        r#"
+struct User {
+    name: str
+}
+
+enum State {
+    Ready
+    Count(value: int)
+}
+
+fn Make(name: str): User {
+    return User { name: name }
+}
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        &main,
+        r##"
+import lib from "./lib.ku"
+
+fn show(user: lib.User): str {
+    return user.name
+}
+
+fn main() {
+    user = lib.User { name: "Ku" }
+    user.name = show(lib.Make("Lang"))
+    state = lib.State.Count(3)
+    text = match state {
+        lib.State.Count(value) => str(value)
+        lib.State.Ready => "ready"
+    }
+    print(user.name)
+    print(text)
+}
+"##,
+    )
+    .expect("write main");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("namespace struct and enum paths should run");
+
+    let _ = fs::remove_file(lib);
+    let _ = fs::remove_file(main);
     let _ = fs::remove_dir(dir);
 }
 

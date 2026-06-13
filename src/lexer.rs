@@ -358,6 +358,8 @@ impl<'a> Lexer<'a> {
             "while" => TokenKind::While,
             "for" => TokenKind::For,
             "in" => TokenKind::In,
+            "match" => TokenKind::Match,
+            "switch" => TokenKind::Switch,
             "return" => TokenKind::Return,
             "print" => TokenKind::Print,
             "true" => TokenKind::True,

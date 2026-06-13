@@ -1,6 +1,6 @@
-# Ku 0.0.3 Syntax Draft
+# Ku 0.0.4 Syntax Draft
 
-本文固定 Ku 0.0.3 的语法边界。当前 CLI 版本显示 `0.0.3`。
+本文固定 Ku 0.0.4 的语法边界。当前 CLI 版本显示 `0.0.4`。
 
 ## 文件和入口
 
@@ -49,7 +49,7 @@ import { Add, Twice } from "./math.ku"
 import "./math.ku"
 ```
 
-`import math from "./math"` 会把 `./math.ku` 中导出的函数放进命名空间，通过 `math.Add(1, 2)` 调用。
+`import math from "./math"` 会把 `./math.ku` 中导出的函数、结构体和 enum 放进命名空间，通过 `math.Add(1, 2)`、`math.User { ... }`、`math.State.Ready` 使用。
 
 `import { Add, Twice } from "./math.ku"` 会按需导入导出名，直接使用 `Add(1, 2)`。
 
@@ -138,7 +138,7 @@ fn main() {
 - 同一个函数内不能有重复参数名。
 - 带返回类型的函数必须有可见 `return`。
 - 返回值类型必须和声明匹配。
-- 局部函数暂不捕获外层局部变量；闭包捕获属于后续版本。
+- 局部函数按值捕获定义点外层局部变量。
 
 ## 函数值
 
@@ -157,7 +157,7 @@ fn main() {
 限制：
 
 - 箭头函数参数暂时不写类型。
-- 箭头函数不支持闭包捕获外层变量。
+- 箭头函数按值捕获定义点外层局部变量。
 - 函数值调用会按实参类型检查函数体并推导返回类型。
 
 ## 条件和循环
@@ -208,9 +208,15 @@ fn main() {
 
 结构体字面量必须提供全部字段，不能写不存在的字段。
 
+结构体字段可以赋值，字段必须存在且类型必须匹配：
+
+```ku
+token.kind = "Number"
+```
+
 ## 枚举
 
-当前支持 enum 声明和无 payload 变体值：
+当前支持 enum 声明、无 payload 变体值和 payload 构造：
 
 ```ku
 enum TokenKind {
@@ -219,13 +225,39 @@ enum TokenKind {
     Eof
 }
 
+enum Expr {
+    Number(value: int)
+    Text(value: str)
+}
+
 fn main() {
     kind = TokenKind.Ident
+    expr = Expr.Number(1)
     print(kind)
+    print(expr)
 }
 ```
 
-带字段的 enum variant 语法可以解析，例如 `Number(value: int)`，但构造、`match` 和模式匹配属于后续版本。
+payload 构造使用 `EnumName.Variant(args...)`。
+
+## Match / Switch
+
+`match` 和 `switch` 是表达式，当前支持字面量、`_` 和 enum variant 模式：
+
+```ku
+text = match Expr.Number(7) {
+    Expr.Number(value) => str(value)
+    Expr.Text(value) => value
+    _ => "none"
+}
+
+label = switch 2 {
+    1 => "one"
+    _ => "other"
+}
+```
+
+当前暂不做穷尽性检查；没有匹配分支会在运行时报错。
 
 ## 数组
 
@@ -237,7 +269,11 @@ print(nums[0])
 print(len(nums))
 ```
 
-当前支持读取索引，不支持 `nums[0] = value`。
+当前支持读取和写入索引：
+
+```ku
+nums[0] = 9
+```
 
 ## 对象字面量
 
@@ -251,6 +287,12 @@ print(person.age)
 
 字段名可以是标识符或字符串。字符串值必须加引号，例如 `{ name: "张三" }`；`{ name: 张三 }` 会被当成变量读取。
 
+对象字段可以赋值，字段必须已经存在：
+
+```ku
+person.age = 19
+```
+
 ## 表达式
 
 支持的表达式：
@@ -263,6 +305,7 @@ print(person.age)
 变量:         name
 字段:         token.kind, fs.read
 索引:         nums[0]
+match:        match value { _ => "ok" }
 分组:         (expr)
 一元:         -x, !ok
 二元:         +, -, *, /, %, ==, !=, <, <=, >, >=, &&, ||
@@ -387,16 +430,11 @@ import 语法、私有导入、循环导入
 ```txt
 包管理
 异步
-switch
-match / 模式匹配
-enum payload 构造
-命名空间导入里的结构体/枚举路径访问
-数组元素赋值
-结构体字段赋值
 错误处理语法 try/catch/result
 native C 后端
 顶层脚本语句
-闭包捕获
+引用捕获闭包和闭包修改外层变量
+复杂嵌套模式和 match 穷尽性检查
 ```
 
 ## 资源保护

@@ -277,7 +277,15 @@ impl Parser {
                 "bool" => TypeName::Bool,
                 "str" => TypeName::String,
                 "string" | "nil" => return Err(KuError::parse("expected type name", token.span)),
-                _ => TypeName::Custom(name),
+                _ => {
+                    let mut name = name;
+                    while self.match_kind(&TokenKind::Dot) {
+                        let (part, _) = self.consume_ident("expected type name after '.'")?;
+                        name.push('.');
+                        name.push_str(&part);
+                    }
+                    TypeName::Custom(name)
+                }
             }),
             TokenKind::Null => Ok(TypeName::Null),
             _ => Err(KuError::parse("expected type name", token.span)),
@@ -423,18 +431,6 @@ impl Parser {
 
     fn expression_or_assignment_statement(&mut self) -> KuResult<Stmt> {
         if let TokenKind::Ident(name) = self.peek().kind.clone() {
-            if self.peek_next_kind() == Some(&TokenKind::Equal) {
-                let start = self.advance().span.start;
-                self.advance();
-                let value = self.expression()?;
-                self.optional_semicolon();
-                let end = value.span.end;
-                return Ok(Stmt::Assign {
-                    name,
-                    value,
-                    span: Span::new(start, end),
-                });
-            }
             if self.peek_next_kind() == Some(&TokenKind::Colon) {
                 let start = self.advance().span.start;
                 self.advance();
@@ -457,6 +453,25 @@ impl Parser {
         }
 
         let expr = self.expression()?;
+        if self.match_kind(&TokenKind::Equal) {
+            let start = expr.span.start;
+            let target = assign_target_from_expr(expr)?;
+            let value = self.expression()?;
+            self.optional_semicolon();
+            let end = value.span.end;
+            return match target {
+                AssignTarget::Variable(name) => Ok(Stmt::Assign {
+                    name,
+                    value,
+                    span: Span::new(start, end),
+                }),
+                target => Ok(Stmt::AssignTarget {
+                    target,
+                    value,
+                    span: Span::new(start, end),
+                }),
+            };
+        }
         self.optional_semicolon();
         let span = expr.span;
         Ok(Stmt::Expr { expr, span })
@@ -661,6 +676,16 @@ impl Parser {
                     },
                     span,
                 );
+            } else if self.check(&TokenKind::LBrace)
+                && self.is_struct_literal_after_lbrace()
+                && matches!(expr.kind, ExprKind::Field { target: _, name: _ })
+            {
+                let name = dotted_expr_name(&expr).ok_or_else(|| {
+                    KuError::parse("expected struct name before struct literal", expr.span)
+                })?;
+                let start = expr.span;
+                self.advance();
+                expr = self.finish_struct_literal(name, start)?;
             } else {
                 break;
             }
@@ -671,6 +696,9 @@ impl Parser {
     fn primary(&mut self) -> KuResult<Expr> {
         if self.is_arrow_function_start() {
             return self.arrow_function();
+        }
+        if self.match_kind(&TokenKind::Match) || self.match_kind(&TokenKind::Switch) {
+            return self.match_expression(self.previous().span);
         }
         let token = self.advance().clone();
         let span = token.span;
@@ -801,6 +829,84 @@ impl Parser {
             },
             Span::new(start, body_span.end),
         ))
+    }
+
+    fn match_expression(&mut self, start_span: Span) -> KuResult<Expr> {
+        let value = self.expression()?;
+        self.consume(&TokenKind::LBrace, "expected '{' after match value")?;
+        let mut arms = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let arm_start = self.peek().span;
+            let pattern = self.match_pattern()?;
+            self.consume(&TokenKind::Arrow, "expected '=>' after match pattern")?;
+            let value = self.expression()?;
+            let span = Span::new(arm_start.start, value.span.end);
+            arms.push(MatchArm {
+                pattern,
+                value,
+                span,
+            });
+            self.match_kind(&TokenKind::Comma);
+            self.optional_semicolon();
+        }
+        let end = self
+            .consume(&TokenKind::RBrace, "expected '}' after match arms")?
+            .span;
+        Ok(Expr::new(
+            ExprKind::Match {
+                value: Box::new(value),
+                arms,
+            },
+            Span::new(start_span.start, end.end),
+        ))
+    }
+
+    fn match_pattern(&mut self) -> KuResult<MatchPattern> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Ident(name) if name == "_" => Ok(MatchPattern::Wildcard),
+            TokenKind::Int(value) => Ok(MatchPattern::Literal(Literal::Int(value))),
+            TokenKind::Float(value) => Ok(MatchPattern::Literal(Literal::Float(value))),
+            TokenKind::String(value) => Ok(MatchPattern::Literal(Literal::String(value))),
+            TokenKind::True => Ok(MatchPattern::Literal(Literal::Bool(true))),
+            TokenKind::False => Ok(MatchPattern::Literal(Literal::Bool(false))),
+            TokenKind::Null => Ok(MatchPattern::Literal(Literal::Null)),
+            TokenKind::Ident(enum_name) => {
+                self.consume(&TokenKind::Dot, "expected '.' in enum match pattern")?;
+                let (mut variant, _) =
+                    self.consume_ident("expected enum variant in match pattern")?;
+                let enum_name = if self.match_kind(&TokenKind::Dot) {
+                    let namespace = enum_name;
+                    let enum_type = variant;
+                    let (actual_variant, _) =
+                        self.consume_ident("expected enum variant in match pattern")?;
+                    variant = actual_variant;
+                    format!("{namespace}.{enum_type}")
+                } else {
+                    enum_name
+                };
+                let mut bindings = Vec::new();
+                if self.match_kind(&TokenKind::LParen) {
+                    if !self.check(&TokenKind::RParen) {
+                        loop {
+                            let (binding, _) =
+                                self.consume_ident("expected payload binding name")?;
+                            bindings.push(binding);
+                            if !self.match_kind(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.consume(&TokenKind::RParen, "expected ')' after payload bindings")?;
+                }
+                Ok(MatchPattern::EnumVariant {
+                    enum_name,
+                    variant,
+                    bindings,
+                })
+            }
+            _ => Err(KuError::parse("expected match pattern", token.span)),
+        }
     }
 
     fn is_arrow_function_start(&self) -> bool {
@@ -955,6 +1061,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
     match stmt {
         Stmt::VarDecl { span, .. }
         | Stmt::Assign { span, .. }
+        | Stmt::AssignTarget { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
@@ -962,6 +1069,32 @@ fn stmt_span(stmt: &Stmt) -> Span {
         | Stmt::Return { span, .. }
         | Stmt::Print { span, .. }
         | Stmt::Expr { span, .. } => *span,
+    }
+}
+
+fn assign_target_from_expr(expr: Expr) -> KuResult<AssignTarget> {
+    match expr.kind {
+        ExprKind::Variable(name) => Ok(AssignTarget::Variable(name)),
+        ExprKind::Index { target, index } => Ok(AssignTarget::Index {
+            target: *target,
+            index: *index,
+        }),
+        ExprKind::Field { target, name } => Ok(AssignTarget::Field {
+            target: *target,
+            name,
+        }),
+        _ => Err(KuError::parse("invalid assignment target", expr.span)),
+    }
+}
+
+fn dotted_expr_name(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Variable(name) => Some(name.clone()),
+        ExprKind::Field { target, name } => {
+            let target = dotted_expr_name(target)?;
+            Some(format!("{target}.{name}"))
+        }
+        _ => None,
     }
 }
 

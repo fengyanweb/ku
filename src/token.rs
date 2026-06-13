@@ -15,6 +15,8 @@ pub enum TokenKind {
     While,
     For,
     In,
+    Match,
+    Switch,
     Return,
     Print,
     True,

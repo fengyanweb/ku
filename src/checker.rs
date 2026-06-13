@@ -321,6 +321,18 @@ impl Checker {
                 }
                 Ok(())
             }
+            Stmt::AssignTarget {
+                target,
+                value,
+                span,
+            } => {
+                let expected = self.check_assign_target(target, *span)?;
+                let actual = self.check_expr(value)?;
+                if !type_matches(&expected, &actual) {
+                    return Err(type_error(*span, &expected, &actual));
+                }
+                Ok(())
+            }
             Stmt::If {
                 condition,
                 then_branch,
@@ -434,6 +446,12 @@ impl Checker {
                 ExprKind::Call { callee, args } => {
                     if let Some(ty) = self.check_dotted_builtin_call(callee, args, expr.span)? {
                         return Ok(ty);
+                    }
+                    if let Some((enum_name, variant)) = enum_variant_path(callee) {
+                        if self.enums.contains_key(&enum_name) {
+                            return self
+                                .check_enum_constructor(&enum_name, &variant, args, expr.span);
+                        }
                     }
                     if let ExprKind::Variable(name) = &callee.kind {
                         if let Some(function) = self.functions.get(name).cloned() {
@@ -653,6 +671,7 @@ impl Checker {
                     }
                     Ok(Type::Object(object_fields))
                 }
+                ExprKind::Match { value, arms } => self.check_match_expr(value, arms, expr.span),
                 ExprKind::Function {
                     params,
                     return_type,
@@ -773,6 +792,176 @@ impl Checker {
         }
     }
 
+    fn check_assign_target(&mut self, target: &AssignTarget, span: Span) -> KuResult<Type> {
+        match target {
+            AssignTarget::Variable(name) => {
+                let binding = self.get(name, span)?;
+                if !binding.mutable {
+                    return Err(KuError::runtime(
+                        format!("cannot assign to immutable variable '{name}'"),
+                        span,
+                    ));
+                }
+                Ok(binding.ty)
+            }
+            AssignTarget::Index { target, index } => {
+                let target_type = self.check_expr(target)?;
+                let index_type = self.check_expr(index)?;
+                if index_type != Type::Int {
+                    return Err(type_error(index.span, &Type::Int, &index_type));
+                }
+                match target_type {
+                    Type::Array(element) => Ok(*element),
+                    other => Err(KuError::runtime(
+                        format!("type error: cannot index {}", type_name(&other)),
+                        target.span,
+                    )),
+                }
+            }
+            AssignTarget::Field { target, name } => match self.check_expr(target)? {
+                Type::Struct(struct_name) => {
+                    let Some(struct_type) = self.structs.get(&struct_name) else {
+                        return Err(KuError::runtime(
+                            format!("undefined struct '{struct_name}'"),
+                            target.span,
+                        ));
+                    };
+                    struct_type.fields.get(name).cloned().ok_or_else(|| {
+                        KuError::runtime(
+                            format!("struct '{struct_name}' has no field '{name}'"),
+                            span,
+                        )
+                    })
+                }
+                Type::Object(fields) => fields
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| KuError::runtime(format!("object has no field '{name}'"), span)),
+                other => Err(KuError::runtime(
+                    format!("type error: {} has no fields", type_name(&other)),
+                    target.span,
+                )),
+            },
+        }
+    }
+
+    fn check_enum_constructor(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Type> {
+        let Some(enum_type) = self.enums.get(enum_name) else {
+            return Err(KuError::runtime(
+                format!("undefined enum '{enum_name}'"),
+                span,
+            ));
+        };
+        let Some(expected_fields) = enum_type.variants.get(variant).cloned() else {
+            return Err(KuError::runtime(
+                format!("enum '{enum_name}' has no variant '{variant}'"),
+                span,
+            ));
+        };
+        if expected_fields.len() != args.len() {
+            return Err(KuError::runtime(
+                format!(
+                    "enum variant '{enum_name}.{variant}' expects {} arguments but got {}",
+                    expected_fields.len(),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        for (arg, expected) in args.iter().zip(expected_fields.iter()) {
+            let actual = self.check_expr(arg)?;
+            if !type_matches(expected, &actual) {
+                return Err(type_error(arg.span, expected, &actual));
+            }
+        }
+        Ok(Type::Enum(enum_name.to_string()))
+    }
+
+    fn check_match_expr(&mut self, value: &Expr, arms: &[MatchArm], span: Span) -> KuResult<Type> {
+        if arms.is_empty() {
+            return Err(KuError::runtime("match requires at least one arm", span));
+        }
+        let value_type = self.check_expr(value)?;
+        let mut result_type = Type::Unknown;
+        let mut saw_wildcard = false;
+        for arm in arms {
+            if saw_wildcard {
+                return Err(KuError::runtime(
+                    "match arm after '_' is unreachable",
+                    arm.span,
+                ));
+            }
+            self.push_scope();
+            match &arm.pattern {
+                MatchPattern::Wildcard => saw_wildcard = true,
+                MatchPattern::Literal(literal) => {
+                    let literal_type = type_of_literal(literal);
+                    if !type_matches(&value_type, &literal_type) {
+                        self.pop_scope();
+                        return Err(type_error(arm.span, &value_type, &literal_type));
+                    }
+                }
+                MatchPattern::EnumVariant {
+                    enum_name,
+                    variant,
+                    bindings,
+                } => {
+                    if !type_matches(&value_type, &Type::Enum(enum_name.clone())) {
+                        self.pop_scope();
+                        return Err(type_error(
+                            arm.span,
+                            &value_type,
+                            &Type::Enum(enum_name.clone()),
+                        ));
+                    }
+                    let Some(enum_type) = self.enums.get(enum_name) else {
+                        self.pop_scope();
+                        return Err(KuError::runtime(
+                            format!("undefined enum '{enum_name}'"),
+                            arm.span,
+                        ));
+                    };
+                    let Some(payload) = enum_type.variants.get(variant).cloned() else {
+                        self.pop_scope();
+                        return Err(KuError::runtime(
+                            format!("enum '{enum_name}' has no variant '{variant}'"),
+                            arm.span,
+                        ));
+                    };
+                    if payload.len() != bindings.len() {
+                        self.pop_scope();
+                        return Err(KuError::runtime(
+                            format!(
+                                "match pattern '{enum_name}.{variant}' expects {} bindings but got {}",
+                                payload.len(),
+                                bindings.len()
+                            ),
+                            arm.span,
+                        ));
+                    }
+                    for (binding, ty) in bindings.iter().zip(payload) {
+                        self.define(binding.clone(), ty, false, arm.span)?;
+                    }
+                }
+            }
+            let actual = self.check_expr(&arm.value);
+            self.pop_scope();
+            let actual = actual?;
+            if result_type == Type::Unknown {
+                result_type = actual;
+            } else if !type_matches(&result_type, &actual) {
+                return Err(type_error(arm.value.span, &result_type, &actual));
+            }
+        }
+        Ok(result_type)
+    }
+
     fn check_dotted_builtin_call(
         &mut self,
         callee: &Expr,
@@ -871,9 +1060,9 @@ impl Checker {
         arg_types: &[Type],
         span: Span,
     ) -> KuResult<Type> {
-        let saved_scopes = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
         let saved_return = self.current_return.clone();
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
+        self.push_scope();
 
         let result = (|| -> KuResult<Type> {
             for (param, ty) in params.iter().zip(arg_types.iter()) {
@@ -900,8 +1089,8 @@ impl Checker {
             Ok(inferred_return)
         })();
 
+        self.pop_scope();
         self.current_return = saved_return;
-        self.scopes = saved_scopes;
         result
     }
 
@@ -1127,6 +1316,26 @@ fn type_matches(expected: &Type, actual: &Type) -> bool {
     }
 }
 
+fn type_of_literal(literal: &Literal) -> Type {
+    match literal {
+        Literal::Int(_) => Type::Int,
+        Literal::Float(_) => Type::Float,
+        Literal::Bool(_) => Type::Bool,
+        Literal::String(_) | Literal::TemplateString(_) => Type::String,
+        Literal::Null => Type::Null,
+    }
+}
+
+fn enum_variant_path(expr: &Expr) -> Option<(String, String)> {
+    let ExprKind::Field { target, name } = &expr.kind else {
+        return None;
+    };
+    let ExprKind::Variable(enum_name) = &target.kind else {
+        return None;
+    };
+    Some((enum_name.clone(), name.clone()))
+}
+
 fn type_error(span: Span, expected: &Type, actual: &Type) -> KuError {
     KuError::runtime(
         format!(
@@ -1217,6 +1426,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
     match stmt {
         Stmt::VarDecl { span, .. }
         | Stmt::Assign { span, .. }
+        | Stmt::AssignTarget { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }

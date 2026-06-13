@@ -1,0 +1,150 @@
+# Ku
+
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.4`，重点是把基础语法、类型、函数、模块和错误提示先做扎实。
+
+## 快速开始
+
+```powershell
+cargo build --release
+.\target\release\ku.exe -h
+.\target\release\ku.exe run .\examples\hello.ku
+.\target\release\ku.exe check .\examples\index.ku
+```
+
+如果已经把 `ku.exe` 所在目录加入 `PATH`，可以直接：
+
+```powershell
+ku -h
+ku run examples/hello.ku
+ku check examples/index.ku
+```
+
+## 命令
+
+```txt
+ku <file.ku>          Run a Ku source file
+ku run <file.ku>      Run a Ku source file
+ku check <file.ku>    Check a Ku source file without running
+ku build <file.ku>    Build a runnable executable wrapper
+ku version            Print version
+ku -h | -help         Print help
+```
+
+`ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
+
+## 0.0.4 支持的核心语法
+
+```ku
+struct User {
+    name: str
+    age: int
+}
+
+enum Result {
+    Ok(value: int)
+    Err(message: str)
+}
+
+fn main() {
+    user = User { name: "Ku", age: 1 }
+    user.age = 2
+
+    values:[int] = [1, 2, 3]
+    values[0] = 9
+
+    result = Result.Ok(values[0])
+    text = match result {
+        Result.Ok(value) => str(value)
+        Result.Err(message) => message
+        _ => "none"
+    }
+
+    prefix = "Hello "
+    greet = (name) => {
+        return prefix + name
+    }
+
+    print(text)
+    print(greet(user.name))
+}
+```
+
+当前基础类型固定为：
+
+```txt
+int
+float
+bool
+str
+null
+```
+
+Ku 不使用 `let` / `let mut`。首次赋值即声明变量，带类型写作 `name:type = value`。
+
+## 模块导入
+
+导出规则：顶层名字首字母大写对包外可见，小写只在当前文件内部使用。
+
+```ku
+import math from "./math"
+import { Add, User } from "./math.ku"
+import "./math.ku"
+```
+
+namespace import 支持函数、结构体和 enum：
+
+```ku
+import lib from "./lib.ku"
+
+fn main() {
+    user = lib.User { name: "Ku" }
+    state = lib.State.Ready
+    print(lib.Format(user))
+}
+```
+
+## 示例
+
+仓库内置示例在 `examples/`：
+
+```txt
+hello.ku
+fib.ku
+loop.ku
+function.ku
+arrays.ku
+structs.ku
+enum.ku
+object.ku
+imports.ku
+compiler_pipeline.ku
+```
+
+## 文档
+
+- [0.0.4 语法草案](docs/syntax.md)
+- [0.0.4 版本记录](docs/v0.0.4.md)
+- [0.0.3 版本记录](docs/v0.0.3.md)
+
+## 当前边界
+
+`ku build` 当前生成解释器打包型可执行文件，还不是 native C / LLVM 后端。
+
+暂未完成：
+
+```txt
+包管理
+async / await
+try / catch / result 错误处理语法
+native 后端
+引用捕获闭包
+复杂嵌套模式和 match 穷尽性检查
+```
+
+## 开发验证
+
+```powershell
+cargo test --no-fail-fast
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+```

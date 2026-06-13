@@ -1,0 +1,9 @@
+fn main() {
+    prefix = "Hello "
+    greet = (name) => {
+        return prefix + name
+    }
+
+    prefix = "Bye "
+    print(greet("Ku"))
+}

@@ -1,4 +1,4 @@
-﻿use crate::span::Span;
+use crate::span::Span;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
@@ -96,6 +96,11 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    AssignTarget {
+        target: AssignTarget,
+        value: Expr,
+        span: Span,
+    },
     If {
         condition: Expr,
         then_branch: Vec<Stmt>,
@@ -141,6 +146,13 @@ impl Expr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum AssignTarget {
+    Variable(String),
+    Index { target: Expr, index: Expr },
+    Field { target: Expr, name: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Literal(Literal),
     Variable(String),
@@ -173,10 +185,32 @@ pub enum ExprKind {
     ObjectLiteral {
         fields: Vec<(String, Expr)>,
     },
+    Match {
+        value: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
     Function {
         params: Vec<FunctionParam>,
         return_type: Option<TypeName>,
         body: Vec<Stmt>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: MatchPattern,
+    pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchPattern {
+    Wildcard,
+    Literal(Literal),
+    EnumVariant {
+        enum_name: String,
+        variant: String,
+        bindings: Vec<String>,
     },
 }
 

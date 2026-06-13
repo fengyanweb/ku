@@ -16,7 +16,7 @@ use crate::{
     span::Span,
 };
 
-const KU_VERSION: &str = "0.0.3";
+const KU_VERSION: &str = "0.0.4";
 const MAX_SOURCE_BYTES: u64 = 1_000_000;
 const HELP: &str = "\
 ku - simple, small, fast language tool
@@ -485,10 +485,23 @@ impl ModuleLoader {
                     let prefix = format!("__ku_ns{}_{}", self.namespace_counter, namespace);
                     let mut rename_map = HashMap::new();
                     for (name, exported) in &module.exports {
-                        if let Item::Function(function) = exported {
-                            let renamed = format!("{prefix}_{name}");
-                            map.insert(name.clone(), renamed.clone());
-                            rename_map.insert(function.name.clone(), renamed);
+                        match exported {
+                            Item::Function(function) => {
+                                let renamed = format!("{prefix}_{name}");
+                                map.insert(name.clone(), renamed.clone());
+                                rename_map.insert(function.name.clone(), renamed);
+                            }
+                            Item::Struct(decl) => {
+                                let renamed = format!("{prefix}_{name}");
+                                map.insert(name.clone(), renamed.clone());
+                                rename_map.insert(decl.name.clone(), renamed);
+                            }
+                            Item::Enum(decl) => {
+                                let renamed = format!("{prefix}_{name}");
+                                map.insert(name.clone(), renamed.clone());
+                                rename_map.insert(decl.name.clone(), renamed);
+                            }
+                            Item::Module(_) | Item::Import(_) => {}
                         }
                     }
                     let prepared = prepare_imported_module_items_with_renames(
@@ -655,16 +668,39 @@ fn prepare_imported_module_items_with_renames(
                 if let Some(renamed) = effective_renames.get(&function.name) {
                     function.name = renamed.clone();
                 }
+                rewrite_type_names_in_function(&mut function, &effective_renames);
                 for stmt in &mut function.body {
                     rewrite_function_calls_in_stmt(stmt, &effective_renames)?;
                 }
                 items.push(Item::Function(function));
             }
-            Item::Struct(decl) if visible_names.contains(&decl.name) => {
-                items.push(Item::Struct(decl.clone()));
+            Item::Struct(decl)
+                if visible_names.contains(&decl.name)
+                    || effective_renames.contains_key(&decl.name) =>
+            {
+                let mut decl = decl.clone();
+                if let Some(renamed) = effective_renames.get(&decl.name) {
+                    decl.name = renamed.clone();
+                }
+                for field in &mut decl.fields {
+                    rewrite_type_name(&mut field.ty, &effective_renames);
+                }
+                items.push(Item::Struct(decl));
             }
-            Item::Enum(decl) if visible_names.contains(&decl.name) => {
-                items.push(Item::Enum(decl.clone()));
+            Item::Enum(decl)
+                if visible_names.contains(&decl.name)
+                    || effective_renames.contains_key(&decl.name) =>
+            {
+                let mut decl = decl.clone();
+                if let Some(renamed) = effective_renames.get(&decl.name) {
+                    decl.name = renamed.clone();
+                }
+                for variant in &mut decl.variants {
+                    for field in &mut variant.fields {
+                        rewrite_type_name(&mut field.ty, &effective_renames);
+                    }
+                }
+                items.push(Item::Enum(decl));
             }
             Item::Module(_) | Item::Import(_) | Item::Struct(_) | Item::Enum(_) => {}
         }
@@ -672,12 +708,43 @@ fn prepare_imported_module_items_with_renames(
     Ok(items)
 }
 
+fn rewrite_type_names_in_function(function: &mut FnDecl, rename_map: &HashMap<String, String>) {
+    for param in &mut function.params {
+        rewrite_type_name(&mut param.ty, rename_map);
+    }
+    if let Some(return_type) = &mut function.return_type {
+        rewrite_type_name(return_type, rename_map);
+    }
+}
+
+fn rewrite_type_name(ty: &mut TypeName, rename_map: &HashMap<String, String>) {
+    match ty {
+        TypeName::Array(inner) => rewrite_type_name(inner, rename_map),
+        TypeName::Custom(name) => {
+            if let Some(renamed) = rename_map.get(name) {
+                *name = renamed.clone();
+            }
+        }
+        TypeName::Int | TypeName::Float | TypeName::Bool | TypeName::String | TypeName::Null => {}
+    }
+}
+
 fn rewrite_function_calls_in_stmt(
     stmt: &mut Stmt,
     rename_map: &HashMap<String, String>,
 ) -> KuResult<()> {
     match stmt {
-        Stmt::VarDecl { value, .. } | Stmt::Assign { value, .. } | Stmt::Print { value, .. } => {
+        Stmt::VarDecl { ty, value, .. } => {
+            if let Some(ty) = ty {
+                rewrite_type_name(ty, rename_map);
+            }
+            rewrite_function_calls_in_expr(value, rename_map)
+        }
+        Stmt::Assign { value, .. } | Stmt::Print { value, .. } => {
+            rewrite_function_calls_in_expr(value, rename_map)
+        }
+        Stmt::AssignTarget { target, value, .. } => {
+            rewrite_function_calls_in_assign_target(target, rename_map)?;
             rewrite_function_calls_in_expr(value, rename_map)
         }
         Stmt::If {
@@ -712,6 +779,7 @@ fn rewrite_function_calls_in_stmt(
             Ok(())
         }
         Stmt::Function(function) => {
+            rewrite_type_names_in_function(function, rename_map);
             for stmt in &mut function.body {
                 rewrite_function_calls_in_stmt(stmt, rename_map)?;
             }
@@ -724,6 +792,20 @@ fn rewrite_function_calls_in_stmt(
             Ok(())
         }
         Stmt::Expr { expr, .. } => rewrite_function_calls_in_expr(expr, rename_map),
+    }
+}
+
+fn rewrite_function_calls_in_assign_target(
+    target: &mut AssignTarget,
+    rename_map: &HashMap<String, String>,
+) -> KuResult<()> {
+    match target {
+        AssignTarget::Variable(_) => Ok(()),
+        AssignTarget::Index { target, index } => {
+            rewrite_function_calls_in_expr(target, rename_map)?;
+            rewrite_function_calls_in_expr(index, rename_map)
+        }
+        AssignTarget::Field { target, .. } => rewrite_function_calls_in_expr(target, rename_map),
     }
 }
 
@@ -760,13 +842,41 @@ fn rewrite_function_calls_in_expr(
             rewrite_function_calls_in_expr(index, rename_map)
         }
         ExprKind::Field { target, .. } => rewrite_function_calls_in_expr(target, rename_map),
-        ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+        ExprKind::StructLiteral { name, fields } => {
+            if let Some(renamed) = rename_map.get(name) {
+                *name = renamed.clone();
+            }
             for (_, value) in fields {
                 rewrite_function_calls_in_expr(value, rename_map)?;
             }
             Ok(())
         }
-        ExprKind::Function { body, .. } => {
+        ExprKind::ObjectLiteral { fields } => {
+            for (_, value) in fields {
+                rewrite_function_calls_in_expr(value, rename_map)?;
+            }
+            Ok(())
+        }
+        ExprKind::Match { value, arms } => {
+            rewrite_function_calls_in_expr(value, rename_map)?;
+            for arm in arms {
+                rewrite_function_calls_in_expr(&mut arm.value, rename_map)?;
+            }
+            Ok(())
+        }
+        ExprKind::Function {
+            params,
+            return_type,
+            body,
+        } => {
+            for param in params {
+                if let Some(ty) = &mut param.ty {
+                    rewrite_type_name(ty, rename_map);
+                }
+            }
+            if let Some(return_type) = return_type {
+                rewrite_type_name(return_type, rename_map);
+            }
             for stmt in body {
                 rewrite_function_calls_in_stmt(stmt, rename_map)?;
             }
@@ -782,6 +892,7 @@ fn rewrite_namespaces_in_item(
 ) -> KuResult<Item> {
     match item {
         Item::Function(mut function) => {
+            rewrite_namespaces_in_function_types(&mut function, namespaces);
             for stmt in &mut function.body {
                 rewrite_namespaces_in_stmt(stmt, namespaces)?;
             }
@@ -796,7 +907,17 @@ fn rewrite_namespaces_in_stmt(
     namespaces: &HashMap<String, HashMap<String, String>>,
 ) -> KuResult<()> {
     match stmt {
-        Stmt::VarDecl { value, .. } | Stmt::Assign { value, .. } | Stmt::Print { value, .. } => {
+        Stmt::VarDecl { ty, value, .. } => {
+            if let Some(ty) = ty {
+                rewrite_namespaced_type_name(ty, namespaces);
+            }
+            rewrite_namespaces_in_expr(value, namespaces)
+        }
+        Stmt::Assign { value, .. } | Stmt::Print { value, .. } => {
+            rewrite_namespaces_in_expr(value, namespaces)
+        }
+        Stmt::AssignTarget { target, value, .. } => {
+            rewrite_namespaces_in_assign_target(target, namespaces)?;
             rewrite_namespaces_in_expr(value, namespaces)
         }
         Stmt::If {
@@ -831,6 +952,7 @@ fn rewrite_namespaces_in_stmt(
             Ok(())
         }
         Stmt::Function(function) => {
+            rewrite_namespaces_in_function_types(function, namespaces);
             for stmt in &mut function.body {
                 rewrite_namespaces_in_stmt(stmt, namespaces)?;
             }
@@ -846,6 +968,47 @@ fn rewrite_namespaces_in_stmt(
     }
 }
 
+fn rewrite_namespaces_in_assign_target(
+    target: &mut AssignTarget,
+    namespaces: &HashMap<String, HashMap<String, String>>,
+) -> KuResult<()> {
+    match target {
+        AssignTarget::Variable(_) => Ok(()),
+        AssignTarget::Index { target, index } => {
+            rewrite_namespaces_in_expr(target, namespaces)?;
+            rewrite_namespaces_in_expr(index, namespaces)
+        }
+        AssignTarget::Field { target, .. } => rewrite_namespaces_in_expr(target, namespaces),
+    }
+}
+
+fn rewrite_namespaces_in_function_types(
+    function: &mut FnDecl,
+    namespaces: &HashMap<String, HashMap<String, String>>,
+) {
+    for param in &mut function.params {
+        rewrite_namespaced_type_name(&mut param.ty, namespaces);
+    }
+    if let Some(return_type) = &mut function.return_type {
+        rewrite_namespaced_type_name(return_type, namespaces);
+    }
+}
+
+fn rewrite_namespaced_type_name(
+    ty: &mut TypeName,
+    namespaces: &HashMap<String, HashMap<String, String>>,
+) {
+    match ty {
+        TypeName::Array(inner) => rewrite_namespaced_type_name(inner, namespaces),
+        TypeName::Custom(name) => {
+            if let Some(renamed) = namespace_lookup(name, namespaces) {
+                *name = renamed;
+            }
+        }
+        TypeName::Int | TypeName::Float | TypeName::Bool | TypeName::String | TypeName::Null => {}
+    }
+}
+
 fn rewrite_namespaces_in_expr(
     expr: &mut Expr,
     namespaces: &HashMap<String, HashMap<String, String>>,
@@ -857,6 +1020,7 @@ fn rewrite_namespaces_in_expr(
             rewrite_namespaces_in_expr(right, namespaces)
         }
         ExprKind::Call { callee, args } => {
+            rewrite_namespace_enum_path(callee, namespaces)?;
             if let ExprKind::Field { target, name } = &callee.kind {
                 if let ExprKind::Variable(namespace) = &target.kind {
                     if let Some(map) = namespaces.get(namespace) {
@@ -886,14 +1050,53 @@ fn rewrite_namespaces_in_expr(
             rewrite_namespaces_in_expr(target, namespaces)?;
             rewrite_namespaces_in_expr(index, namespaces)
         }
-        ExprKind::Field { target, .. } => rewrite_namespaces_in_expr(target, namespaces),
-        ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+        ExprKind::Field { target: _, .. } => {
+            rewrite_namespace_enum_path(expr, namespaces)?;
+            if let ExprKind::Field { target, .. } = &mut expr.kind {
+                rewrite_namespaces_in_expr(target, namespaces)?;
+            }
+            Ok(())
+        }
+        ExprKind::StructLiteral { name, fields } => {
+            if let Some(renamed) = namespace_lookup(name, namespaces) {
+                *name = renamed;
+            }
             for (_, value) in fields {
                 rewrite_namespaces_in_expr(value, namespaces)?;
             }
             Ok(())
         }
-        ExprKind::Function { body, .. } => {
+        ExprKind::ObjectLiteral { fields } => {
+            for (_, value) in fields {
+                rewrite_namespaces_in_expr(value, namespaces)?;
+            }
+            Ok(())
+        }
+        ExprKind::Match { value, arms } => {
+            rewrite_namespaces_in_expr(value, namespaces)?;
+            for arm in arms {
+                if let MatchPattern::EnumVariant { enum_name, .. } = &mut arm.pattern {
+                    if let Some(renamed) = namespace_lookup(enum_name, namespaces) {
+                        *enum_name = renamed;
+                    }
+                }
+                rewrite_namespaces_in_expr(&mut arm.value, namespaces)?;
+            }
+            Ok(())
+        }
+        ExprKind::Function {
+            params,
+            return_type,
+            body,
+        } => {
+            for param in params {
+                if let Some(ty) = &mut param.ty {
+                    rewrite_namespaced_type_name(ty, namespaces);
+                }
+            }
+            if let Some(return_type) = return_type {
+                rewrite_namespaced_type_name(return_type, namespaces);
+            }
             for stmt in body {
                 rewrite_namespaces_in_stmt(stmt, namespaces)?;
             }
@@ -901,4 +1104,41 @@ fn rewrite_namespaces_in_expr(
         }
         ExprKind::Literal(_) | ExprKind::Variable(_) => Ok(()),
     }
+}
+
+fn namespace_lookup(
+    path: &str,
+    namespaces: &HashMap<String, HashMap<String, String>>,
+) -> Option<String> {
+    let (namespace, name) = path.split_once('.')?;
+    namespaces.get(namespace)?.get(name).cloned()
+}
+
+fn rewrite_namespace_enum_path(
+    expr: &mut Expr,
+    namespaces: &HashMap<String, HashMap<String, String>>,
+) -> KuResult<()> {
+    let ExprKind::Field { target, .. } = &mut expr.kind else {
+        return Ok(());
+    };
+    let ExprKind::Field {
+        target: enum_target,
+        name: enum_name,
+    } = &mut target.kind
+    else {
+        return Ok(());
+    };
+    let ExprKind::Variable(namespace) = &enum_target.kind else {
+        return Ok(());
+    };
+    if let Some(map) = namespaces.get(namespace) {
+        let renamed = map.get(enum_name).ok_or_else(|| {
+            KuError::runtime(
+                format!("module '{namespace}' has no exported type '{enum_name}'"),
+                target.span,
+            )
+        })?;
+        target.kind = ExprKind::Variable(renamed.clone());
+    }
+    Ok(())
 }
