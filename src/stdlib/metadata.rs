@@ -25,6 +25,21 @@ pub(crate) struct Signature {
     pub name: String,
     pub args: Vec<ArgRule>,
     pub returns: TypePattern,
+    pub abi: CallAbi,
+    pub failure: FailureMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallAbi {
+    Builtin,
+    DottedBuiltin { module: String, function: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FailureMode {
+    Never,
+    ReturnsResult,
+    MayPanic,
 }
 
 pub(crate) fn builtin_signature(name: &str) -> Option<Signature> {
@@ -44,6 +59,11 @@ pub(crate) fn builtin_signature(name: &str) -> Option<Signature> {
         name: name.to_string(),
         args,
         returns,
+        abi: CallAbi::Builtin,
+        failure: match name {
+            "ok" | "err" => FailureMode::ReturnsResult,
+            _ => FailureMode::Never,
+        },
     })
 }
 
@@ -91,7 +111,22 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         name,
         args,
         returns,
+        abi: CallAbi::DottedBuiltin {
+            module: module.to_string(),
+            function: function.to_string(),
+        },
+        failure: dotted_failure_mode(module, function),
     })
+}
+
+fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
+    match (module, function) {
+        ("fs", "try_read") | ("string", "slice") | ("array", "try_get") | ("json", "try_parse") => {
+            FailureMode::ReturnsResult
+        }
+        ("fs", "read") | ("json", "parse") => FailureMode::MayPanic,
+        _ => FailureMode::Never,
+    }
 }
 
 fn int_arg() -> ArgRule {

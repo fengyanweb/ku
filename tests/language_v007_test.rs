@@ -215,7 +215,8 @@ fn main() {
     let ir = ir::lower_program(&program).expect("lower ir");
     let text = ir.to_string();
     assert!(text.contains("fn add(a: int, b: int) -> int"));
-    assert!(text.contains("let result: int = a + b"));
+    assert!(text.contains("%t0: int = a + b"));
+    assert!(text.contains("let result: int = %t0"));
     assert!(text.contains("return result"));
 }
 
@@ -237,8 +238,9 @@ fn main() {
     Checker::new().check(&program).expect("check");
     let text = ir::lower_program(&program).expect("lower ir").to_string();
 
-    assert!(text.contains("let values: [int] = [1, 2]"));
+    assert!(text.contains("%t0: [int] = [1, 2]"));
+    assert!(text.contains("let values: [int] = %t0"));
     assert!(text.contains("store values[0] = 9"));
-    assert!(text.contains("branch values[0] > 1 ? block"));
+    assert!(text.contains("branch %t"));
     assert!(text.contains("jump block"));
 }

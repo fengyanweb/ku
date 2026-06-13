@@ -1,6 +1,6 @@
 # Ku Package Draft
 
-0.0.7 固定最小 package 草案，目标是先把本地包边界做清楚，不做远程包下载。
+0.0.7 固定最小 package 草案，0.0.9 增加 version 和 ku.lock。本阶段目标仍是先把本地包边界做清楚，不做远程包下载。
 
 ## ku.mod
 
@@ -8,6 +8,7 @@
 
 ```txt
 name = "demo_pkg"
+version = "0.1.0"
 root = "src"
 cache = ".ku/cache"
 ```
@@ -17,10 +18,11 @@ cache = ".ku/cache"
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `name` | 是 | 包名，必须以小写 ascii 字母开头，只允许小写字母、数字、`_`、`-` |
+| `version` | 否 | 包版本，格式是 `major.minor.patch` 数字 |
 | `root` | 否 | import root，默认 `src` |
 | `cache` | 否 | 包本地缓存目录，默认 `.ku/cache` |
 
-0.0.7 的 `ku.mod` 只接受 `key = "value"`，`#` 后面是注释。
+`ku.mod` 只接受 `key = "value"`，`#` 后面是注释。
 
 ## Import Root
 
@@ -34,13 +36,26 @@ cache = ".ku/cache"
 
 ## Cache
 
-0.0.7 只固定缓存位置，不做远程包解析：
+当前只固定缓存位置，不做远程包解析：
 
 ```txt
 <package>/.ku/cache
 ```
 
 未来远程包、版本锁、校验和、全局缓存会在这个边界上继续做。
+
+## Lockfile
+
+有 `ku.mod` 的 package 在 `ku check` / `ku run` 解析 import 时会生成本地 `ku.lock`：
+
+```txt
+package = "demo_pkg"
+version = "0.1.0"
+root = "src"
+cache = ".ku/cache"
+```
+
+0.0.9 的 lockfile 只记录本地 package 元数据，还没有依赖图和远程校验和。
 
 ## 循环依赖
 
@@ -54,6 +69,6 @@ package import 复用现有 `ModuleLoader`：
 ## 暂不支持
 
 - 远程包下载
-- 版本解析和 lockfile
+- 远程版本解析和依赖 lock
 - 包发布
 - 多 package workspace

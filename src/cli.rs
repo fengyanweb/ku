@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     ast::*,
+    backend,
     checker::Checker,
     error::{KuError, KuResult},
     interpreter::Interpreter,
@@ -29,6 +30,8 @@ Usage:
   ku check <file.ku>    Check a Ku source file without running it
   ku ir <file.ku>       Print checked Ku IR draft
   ku build <file.ku>    Build a runnable executable wrapper
+  ku build --native <file.ku>
+                        Emit prototype native C source
   ku version            Print version
   ku -v                 Print version
   ku -h                 Print this help
@@ -41,6 +44,7 @@ Examples:
   ku check examples\\error.ku
   ku ir examples\\function.ku
   ku build examples\\hello.ku
+  ku build --native examples\\function.ku
 ";
 
 pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
@@ -65,10 +69,17 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
             Ok(())
         }
         Some("build") => {
-            let path = exact_path(&args, "build")?;
-            let source = read_ku_file(path)?;
-            let output = build_executable(path, &source)?;
-            println!("build ok: {}", output.display());
+            if args.get(2).is_some_and(|arg| arg == "--native") {
+                let path = exact_path_at(&args, "build --native", 3)?;
+                let source = read_ku_file(path)?;
+                let output = build_native_c(path, &source)?;
+                println!("native c ok: {}", output.display());
+            } else {
+                let path = exact_path(&args, "build")?;
+                let source = read_ku_file(path)?;
+                let output = build_executable(path, &source)?;
+                println!("build ok: {}", output.display());
+            }
             Ok(())
         }
         Some("version") | Some("--version") | Some("-V") | Some("-v") => {
@@ -106,6 +117,20 @@ fn exact_path<'a>(args: &'a [String], command: &str) -> Result<&'a str, KuError>
     }
     reject_extra_args(args, 3, command)?;
     Ok(args[2].as_str())
+}
+
+fn exact_path_at<'a>(
+    args: &'a [String],
+    command: &str,
+    path_index: usize,
+) -> Result<&'a str, KuError> {
+    if args.len() <= path_index {
+        return Err(command_error(format!(
+            "missing .ku file path for 'ku {command}'"
+        )));
+    }
+    reject_extra_args(args, path_index + 1, command)?;
+    Ok(args[path_index].as_str())
 }
 
 fn reject_extra_args(args: &[String], expected_len: usize, command: &str) -> Result<(), KuError> {
@@ -188,6 +213,20 @@ fn build_executable(path: &str, source: &str) -> Result<PathBuf, KuError> {
             "ku build failed: rustc exited with {status}"
         )));
     }
+    Ok(output)
+}
+
+fn build_native_c(path: &str, source: &str) -> Result<PathBuf, KuError> {
+    let program = parse_and_check(path, source)?;
+    let ir = ir::lower_program(&program)?;
+    let c_source = backend::c::generate_c_source(&ir)?;
+    let output = Path::new(path).with_extension("c");
+    fs::write(&output, c_source).map_err(|err| {
+        KuError::message(format!(
+            "failed to write native C source '{}': {err}",
+            output.display()
+        ))
+    })?;
     Ok(output)
 }
 
@@ -332,6 +371,7 @@ fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
         let package = package::discover_for_file(path)?;
         if let Some(package) = &package {
             package::ensure_cache_dir(package)?;
+            package::write_lock(package)?;
         }
         let mut loader = ModuleLoader::new(package);
         loader.load_entry(path, program)?

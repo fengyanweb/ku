@@ -1,16 +1,22 @@
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use crate::{
     ast::{
-        AssignTarget, BinaryOp, Expr, ExprKind, Item, Literal, Program, Stmt, TypeName, UnaryOp,
+        AssignTarget, BinaryOp, EnumDecl, Expr, ExprKind, Item, Literal, Program, Stmt, StructDecl,
+        TypeName, UnaryOp,
     },
     error::{KuError, KuResult},
     span::Span,
+    stdlib::metadata::{self, Signature, TypePattern},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrProgram {
     pub functions: Vec<IrFunction>,
+    pub layouts: IrLayoutTable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +34,41 @@ pub struct FunctionId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(pub usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TempId(pub usize);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrLayoutTable {
+    pub structs: Vec<IrStructLayout>,
+    pub enums: Vec<IrEnumLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrStructLayout {
+    pub name: String,
+    pub fields: Vec<IrFieldLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrEnumLayout {
+    pub name: String,
+    pub variants: Vec<IrVariantLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrVariantLayout {
+    pub name: String,
+    pub tag: usize,
+    pub fields: Vec<IrFieldLayout>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrFieldLayout {
+    pub name: String,
+    pub ty: IrType,
+    pub offset: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrParam {
     pub name: String,
@@ -44,6 +85,11 @@ pub struct IrBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IrInst {
+    Temp {
+        id: TempId,
+        ty: IrType,
+        value: IrExpr,
+    },
     Let {
         name: String,
         ty: IrType,
@@ -53,9 +99,19 @@ pub enum IrInst {
         target: IrLValue,
         value: IrExpr,
     },
+    Print(IrExpr),
     Expr(IrExpr),
     Fail(IrExpr),
     Panic(IrExpr),
+    BeginTry {
+        catch_block: Option<BlockId>,
+        finally_block: Option<BlockId>,
+        after_block: BlockId,
+    },
+    EndTry,
+    BindError {
+        name: String,
+    },
     DefineClosure {
         name: String,
         function_id: FunctionId,
@@ -74,6 +130,12 @@ pub enum IrTerminator {
         condition: IrExpr,
         then_block: BlockId,
         else_block: BlockId,
+    },
+    ForEach {
+        name: String,
+        iterable: IrExpr,
+        body_block: BlockId,
+        after_block: BlockId,
     },
     Return(Option<IrExpr>),
     Unreachable,
@@ -96,6 +158,7 @@ pub struct IrExpr {
 pub enum IrExprKind {
     Literal(String),
     Local(String),
+    Temp(TempId),
     Unary {
         op: UnaryOp,
         expr: Box<IrExpr>,
@@ -202,11 +265,42 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
             });
         }
     }
-    Ok(IrProgram { functions })
+    Ok(IrProgram {
+        functions,
+        layouts: lower_layouts(program),
+    })
 }
 
 impl fmt::Display for IrProgram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.layouts.structs.is_empty() || !self.layouts.enums.is_empty() {
+            writeln!(f, "layouts {{")?;
+            for layout in &self.layouts.structs {
+                write!(f, "  struct {} {{", layout.name)?;
+                for (index, field) in layout.fields.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}@{}: {}", field.name, field.offset, field.ty)?;
+                }
+                writeln!(f, "}}")?;
+            }
+            for layout in &self.layouts.enums {
+                writeln!(f, "  enum {} {{", layout.name)?;
+                for variant in &layout.variants {
+                    write!(f, "    #{} {}(", variant.tag, variant.name)?;
+                    for (index, field) in variant.fields.iter().enumerate() {
+                        if index > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}@{}: {}", field.name, field.offset, field.ty)?;
+                    }
+                    writeln!(f, ")")?;
+                }
+                writeln!(f, "  }}")?;
+            }
+            writeln!(f, "}}")?;
+        }
         for function in &self.functions {
             write!(f, "fn {}(", function.name)?;
             for (index, param) in function.params.iter().enumerate() {
@@ -252,11 +346,29 @@ impl fmt::Display for IrType {
 impl fmt::Display for IrInst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            IrInst::Temp { id, ty, value } => write!(f, "%t{}: {ty} = {value}", id.0),
             IrInst::Let { name, ty, value } => write!(f, "let {name}: {ty} = {value}"),
             IrInst::Store { target, value } => write!(f, "store {target} = {value}"),
+            IrInst::Print(value) => write!(f, "print {value}"),
             IrInst::Expr(value) => write!(f, "expr {value}"),
             IrInst::Fail(value) => write!(f, "fail {value}"),
             IrInst::Panic(value) => write!(f, "panic {value}"),
+            IrInst::BeginTry {
+                catch_block,
+                finally_block,
+                after_block,
+            } => {
+                write!(f, "try after block{}", after_block.0)?;
+                if let Some(block) = catch_block {
+                    write!(f, " catch block{}", block.0)?;
+                }
+                if let Some(block) = finally_block {
+                    write!(f, " finally block{}", block.0)?;
+                }
+                Ok(())
+            }
+            IrInst::EndTry => write!(f, "end_try"),
+            IrInst::BindError { name } => write!(f, "bind_error {name}"),
             IrInst::DefineClosure {
                 name,
                 function_id,
@@ -287,6 +399,16 @@ impl fmt::Display for IrTerminator {
                 "branch {condition} ? block{} : block{}",
                 then_block.0, else_block.0
             ),
+            IrTerminator::ForEach {
+                name,
+                iterable,
+                body_block,
+                after_block,
+            } => write!(
+                f,
+                "foreach {name} in {iterable} ? block{} : block{}",
+                body_block.0, after_block.0
+            ),
             IrTerminator::Return(Some(value)) => write!(f, "return {value}"),
             IrTerminator::Return(None) => write!(f, "return"),
             IrTerminator::Unreachable => write!(f, "unreachable"),
@@ -308,6 +430,7 @@ impl fmt::Display for IrExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
             IrExprKind::Literal(value) | IrExprKind::Local(value) => write!(f, "{value}"),
+            IrExprKind::Temp(id) => write!(f, "%t{}", id.0),
             IrExprKind::Unary { op, expr } => write!(f, "{}{}", unary_text(*op), expr),
             IrExprKind::Binary { left, op, right } => {
                 write!(f, "{left} {} {right}", binary_text(*op))
@@ -345,6 +468,7 @@ struct FunctionLowerer<'a> {
     blocks: Vec<IrBlock>,
     current: IrBlock,
     next_block_id: usize,
+    next_temp_id: usize,
     next_local_function_id: usize,
 }
 
@@ -361,6 +485,7 @@ impl<'a> FunctionLowerer<'a> {
                 terminator: IrTerminator::Next,
             },
             next_block_id: 1,
+            next_temp_id: 0,
             next_local_function_id: 10_000,
         }
     }
@@ -430,11 +555,14 @@ impl<'a> FunctionLowerer<'a> {
             Stmt::While {
                 condition, body, ..
             } => self.lower_while(condition, body)?,
-            Stmt::For { name, iterable, .. } => {
+            Stmt::For {
+                name,
+                iterable,
+                body,
+                ..
+            } => {
                 let iterable = self.lower_expr(iterable)?;
-                self.current.instructions.push(IrInst::Unsupported {
-                    reason: format!("for {name} in {iterable}"),
-                });
+                self.lower_for(name, iterable, body)?;
             }
             Stmt::Function(function) => {
                 let id = FunctionId(self.next_local_function_id);
@@ -443,12 +571,16 @@ impl<'a> FunctionLowerer<'a> {
                 self.current.instructions.push(IrInst::DefineClosure {
                     name: function.name.clone(),
                     function_id: id,
-                    captures: captured_names(&function.body),
+                    captures: captured_names(function),
                 });
             }
-            Stmt::Try { .. } => self.current.instructions.push(IrInst::Unsupported {
-                reason: "try/catch/finally lowering is pending".to_string(),
-            }),
+            Stmt::Try {
+                body,
+                catch_name,
+                catch_body,
+                finally_body,
+                ..
+            } => self.lower_try(body, catch_name, catch_body, finally_body)?,
             Stmt::Fail { value, .. } => {
                 let value = self.lower_expr(value)?;
                 self.current.instructions.push(IrInst::Fail(value));
@@ -466,7 +598,11 @@ impl<'a> FunctionLowerer<'a> {
                     .transpose()?;
                 self.current.terminator = IrTerminator::Return(value);
             }
-            Stmt::Print { value, .. } | Stmt::Expr { expr: value, .. } => {
+            Stmt::Print { value, .. } => {
+                let value = self.lower_expr(value)?;
+                self.current.instructions.push(IrInst::Print(value));
+            }
+            Stmt::Expr { expr: value, .. } => {
                 let value = self.lower_expr(value)?;
                 self.current.instructions.push(IrInst::Expr(value));
             }
@@ -551,6 +687,121 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
+    fn lower_for(&mut self, name: &str, iterable: IrExpr, body: &[Stmt]) -> KuResult<()> {
+        let iter_id = self.current.id;
+        let body_id = self.next_block("for_body");
+        let after_id = self.next_block("for_after");
+        self.current.terminator = IrTerminator::ForEach {
+            name: name.to_string(),
+            iterable,
+            body_block: body_id,
+            after_block: after_id,
+        };
+        self.finish_current();
+
+        let previous = self.locals.insert(name.to_string(), IrType::Unknown);
+        self.start_block(body_id, "for_body");
+        for stmt in body {
+            self.lower_stmt(stmt)?;
+            if self.current.terminator != IrTerminator::Next {
+                break;
+            }
+        }
+        if self.current.terminator == IrTerminator::Next {
+            self.current.terminator = IrTerminator::Jump(iter_id);
+        }
+        self.finish_current();
+        match previous {
+            Some(ty) => {
+                self.locals.insert(name.to_string(), ty);
+            }
+            None => {
+                self.locals.remove(name);
+            }
+        }
+
+        self.start_block(after_id, "for_after");
+        Ok(())
+    }
+
+    fn lower_try(
+        &mut self,
+        body: &[Stmt],
+        catch_name: &Option<String>,
+        catch_body: &[Stmt],
+        finally_body: &[Stmt],
+    ) -> KuResult<()> {
+        let catch_id =
+            (!catch_body.is_empty() || catch_name.is_some()).then(|| self.next_block("catch"));
+        let finally_id = (!finally_body.is_empty()).then(|| self.next_block("finally"));
+        let after_id = self.next_block("try_after");
+        self.current.instructions.push(IrInst::BeginTry {
+            catch_block: catch_id,
+            finally_block: finally_id,
+            after_block: after_id,
+        });
+        for stmt in body {
+            self.lower_stmt(stmt)?;
+            if self.current.terminator != IrTerminator::Next {
+                break;
+            }
+        }
+        if self.current.terminator == IrTerminator::Next {
+            self.current.instructions.push(IrInst::EndTry);
+            self.current.terminator = IrTerminator::Jump(finally_id.unwrap_or(after_id));
+        }
+        self.finish_current();
+
+        if let Some(catch_id) = catch_id {
+            self.start_block(catch_id, "catch");
+            let previous = catch_name
+                .as_ref()
+                .map(|name| self.locals.insert(name.clone(), IrType::Str));
+            if let Some(name) = catch_name {
+                self.current
+                    .instructions
+                    .push(IrInst::BindError { name: name.clone() });
+            }
+            for stmt in catch_body {
+                self.lower_stmt(stmt)?;
+                if self.current.terminator != IrTerminator::Next {
+                    break;
+                }
+            }
+            if self.current.terminator == IrTerminator::Next {
+                self.current.terminator = IrTerminator::Jump(finally_id.unwrap_or(after_id));
+            }
+            self.finish_current();
+            if let Some(name) = catch_name {
+                match previous.flatten() {
+                    Some(ty) => {
+                        self.locals.insert(name.clone(), ty);
+                    }
+                    None => {
+                        self.locals.remove(name);
+                    }
+                }
+            }
+        }
+
+        if let Some(finally_id) = finally_id {
+            self.start_block(finally_id, "finally");
+            for stmt in finally_body {
+                self.lower_stmt(stmt)?;
+                if self.current.terminator != IrTerminator::Next {
+                    break;
+                }
+            }
+            if self.current.terminator == IrTerminator::Next {
+                self.current.terminator = IrTerminator::Jump(after_id);
+            }
+            self.finish_current();
+        }
+
+        self.start_block(after_id, "try_after");
+        Ok(())
+    }
+
     fn lower_lvalue(&mut self, target: &AssignTarget) -> KuResult<IrLValue> {
         match target {
             AssignTarget::Variable(name) => Ok(IrLValue::Local(name.clone())),
@@ -581,7 +832,7 @@ impl<'a> FunctionLowerer<'a> {
                     UnaryOp::Negate => expr.ty.clone(),
                     UnaryOp::Not => IrType::Bool,
                 };
-                Ok(IrExpr {
+                self.emit_temp(IrExpr {
                     kind: IrExprKind::Unary {
                         op: *op,
                         expr: Box::new(expr),
@@ -593,7 +844,7 @@ impl<'a> FunctionLowerer<'a> {
                 let left = self.lower_expr(left)?;
                 let right = self.lower_expr(right)?;
                 let ty = binary_type(*op, &left.ty, &right.ty);
-                Ok(IrExpr {
+                self.emit_temp(IrExpr {
                     kind: IrExprKind::Binary {
                         left: Box::new(left),
                         op: *op,
@@ -607,10 +858,11 @@ impl<'a> FunctionLowerer<'a> {
                     .iter()
                     .map(|arg| self.lower_expr(arg))
                     .collect::<KuResult<Vec<_>>>()?;
-                let (kind, ty) = call_kind_and_type(callee, self.signatures);
-                Ok(IrExpr {
+                let (kind, ty) = call_kind_and_type(callee, &lowered_args, self.signatures);
+                let callee = self.lower_expr(callee)?;
+                self.emit_temp(IrExpr {
                     kind: IrExprKind::Call {
-                        callee: Box::new(self.lower_expr(callee)?),
+                        callee: Box::new(callee),
                         args: lowered_args,
                         kind,
                     },
@@ -626,7 +878,7 @@ impl<'a> FunctionLowerer<'a> {
                     .first()
                     .map(|value| value.ty.clone())
                     .unwrap_or(IrType::Unknown);
-                Ok(IrExpr {
+                self.emit_temp(IrExpr {
                     kind: IrExprKind::Array(values),
                     ty: IrType::Array(Box::new(element)),
                 })
@@ -638,7 +890,7 @@ impl<'a> FunctionLowerer<'a> {
                     IrType::Array(inner) => *inner.clone(),
                     _ => IrType::Unknown,
                 };
-                Ok(IrExpr {
+                self.emit_temp(IrExpr {
                     kind: IrExprKind::Index {
                         target: Box::new(target),
                         index: Box::new(index),
@@ -646,20 +898,23 @@ impl<'a> FunctionLowerer<'a> {
                     ty,
                 })
             }
-            ExprKind::Field { target, name } => Ok(IrExpr {
-                kind: IrExprKind::Field {
-                    target: Box::new(self.lower_expr(target)?),
-                    name: name.clone(),
-                },
-                ty: IrType::Unknown,
-            }),
+            ExprKind::Field { target, name } => {
+                let target = self.lower_expr(target)?;
+                self.emit_temp(IrExpr {
+                    kind: IrExprKind::Field {
+                        target: Box::new(target),
+                        name: name.clone(),
+                    },
+                    ty: IrType::Unknown,
+                })
+            }
             ExprKind::TryUnwrap { expr } => {
                 let expr = self.lower_expr(expr)?;
                 let ty = match &expr.ty {
                     IrType::Result(inner) => *inner.clone(),
                     _ => IrType::Unknown,
                 };
-                Ok(IrExpr {
+                self.emit_temp(IrExpr {
                     kind: IrExprKind::TryUnwrap(Box::new(expr)),
                     ty,
                 })
@@ -672,6 +927,21 @@ impl<'a> FunctionLowerer<'a> {
                 ty: IrType::Function,
             }),
         }
+    }
+
+    fn emit_temp(&mut self, value: IrExpr) -> KuResult<IrExpr> {
+        let id = TempId(self.next_temp_id);
+        self.next_temp_id += 1;
+        let ty = value.ty.clone();
+        self.current.instructions.push(IrInst::Temp {
+            id,
+            ty: ty.clone(),
+            value,
+        });
+        Ok(IrExpr {
+            kind: IrExprKind::Temp(id),
+            ty,
+        })
     }
 
     fn next_block(&mut self, _name: &str) -> BlockId {
@@ -711,6 +981,60 @@ fn lower_type(ty: &TypeName) -> IrType {
         TypeName::Array(inner) => IrType::Array(Box::new(lower_type(inner))),
         TypeName::Result(inner) => IrType::Result(Box::new(lower_type(inner))),
         TypeName::Custom(name) => IrType::Named(name.clone()),
+    }
+}
+
+fn lower_layouts(program: &Program) -> IrLayoutTable {
+    let mut structs = Vec::new();
+    let mut enums = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Struct(decl) => structs.push(lower_struct_layout(decl)),
+            Item::Enum(decl) => enums.push(lower_enum_layout(decl)),
+            _ => {}
+        }
+    }
+    IrLayoutTable { structs, enums }
+}
+
+fn lower_struct_layout(decl: &StructDecl) -> IrStructLayout {
+    IrStructLayout {
+        name: decl.name.clone(),
+        fields: decl
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(offset, field)| IrFieldLayout {
+                name: field.name.clone(),
+                ty: lower_type(&field.ty),
+                offset,
+            })
+            .collect(),
+    }
+}
+
+fn lower_enum_layout(decl: &EnumDecl) -> IrEnumLayout {
+    IrEnumLayout {
+        name: decl.name.clone(),
+        variants: decl
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(tag, variant)| IrVariantLayout {
+                name: variant.name.clone(),
+                tag,
+                fields: variant
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, field)| IrFieldLayout {
+                        name: field.name.clone(),
+                        ty: lower_type(&field.ty),
+                        offset,
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -764,27 +1088,59 @@ fn binary_type(op: BinaryOp, left: &IrType, right: &IrType) -> IrType {
 
 fn call_kind_and_type(
     callee: &Expr,
+    args: &[IrExpr],
     signatures: &HashMap<String, FunctionSig>,
 ) -> (IrCallKind, IrType) {
     if let ExprKind::Variable(name) = &callee.kind {
         if let Some(signature) = signatures.get(name) {
             return (IrCallKind::Direct(signature.id), signature.returns.clone());
         }
-        if matches!(name.as_str(), "print" | "len" | "str" | "ok" | "err") {
+        if let Some(signature) = metadata::builtin_signature(name) {
             return (
                 IrCallKind::Intrinsic(name.clone()),
-                if name == "ok" || name == "err" {
-                    IrType::Result(Box::new(IrType::Unknown))
-                } else {
-                    IrType::Unknown
-                },
+                signature_return_type(&signature, args),
             );
         }
     }
     if let Some(name) = dotted_name(callee) {
+        if let Some((module, function)) = name.split_once('.') {
+            if let Some(signature) = metadata::dotted_signature(module, function) {
+                return (
+                    IrCallKind::Intrinsic(name),
+                    signature_return_type(&signature, args),
+                );
+            }
+        }
         return (IrCallKind::Intrinsic(name), IrType::Unknown);
     }
     (IrCallKind::Indirect, IrType::Unknown)
+}
+
+fn signature_return_type(signature: &Signature, args: &[IrExpr]) -> IrType {
+    pattern_to_ir_type(&signature.returns, args).unwrap_or(IrType::Unknown)
+}
+
+fn pattern_to_ir_type(pattern: &TypePattern, args: &[IrExpr]) -> Option<IrType> {
+    match pattern {
+        TypePattern::Int => Some(IrType::Int),
+        TypePattern::Bool => Some(IrType::Bool),
+        TypePattern::String => Some(IrType::Str),
+        TypePattern::Unknown | TypePattern::Any | TypePattern::StringOrStringArray => {
+            Some(IrType::Unknown)
+        }
+        TypePattern::ArrayAny => Some(IrType::Array(Box::new(IrType::Unknown))),
+        TypePattern::ArrayOf(inner) => {
+            Some(IrType::Array(Box::new(pattern_to_ir_type(inner, args)?)))
+        }
+        TypePattern::ArrayElementOfArg(index) => match args.get(*index).map(|arg| &arg.ty) {
+            Some(IrType::Array(inner)) => Some(*inner.clone()),
+            _ => Some(IrType::Unknown),
+        },
+        TypePattern::ResultOf(inner) => {
+            Some(IrType::Result(Box::new(pattern_to_ir_type(inner, args)?)))
+        }
+        TypePattern::SameAsArg(index) => args.get(*index).map(|arg| arg.ty.clone()),
+    }
 }
 
 fn dotted_name(expr: &Expr) -> Option<String> {
@@ -804,24 +1160,31 @@ fn unsupported_expr(reason: impl Into<String>) -> IrExpr {
     }
 }
 
-fn captured_names(body: &[Stmt]) -> Vec<String> {
-    let mut names = Vec::new();
-    for stmt in body {
-        collect_stmt_names(stmt, &mut names);
+fn captured_names(function: &crate::ast::FnDecl) -> Vec<String> {
+    let mut bound = HashSet::new();
+    bound.insert(function.name.clone());
+    for param in &function.params {
+        bound.insert(param.name.clone());
     }
+    let mut free = HashSet::new();
+    for stmt in &function.body {
+        collect_free_stmt_names(stmt, &mut bound, &mut free);
+    }
+    let mut names = free.into_iter().collect::<Vec<_>>();
     names.sort();
-    names.dedup();
     names
 }
 
-fn collect_stmt_names(stmt: &Stmt, names: &mut Vec<String>) {
+fn collect_free_stmt_names(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSet<String>) {
     match stmt {
-        Stmt::VarDecl { value, .. } | Stmt::Assign { value, .. } | Stmt::Print { value, .. } => {
-            collect_expr_names(value, names)
+        Stmt::VarDecl { name, value, .. } | Stmt::Assign { name, value, .. } => {
+            collect_free_expr_names(value, bound, free);
+            bound.insert(name.clone());
         }
+        Stmt::Print { value, .. } => collect_free_expr_names(value, bound, free),
         Stmt::AssignTarget { target, value, .. } => {
-            collect_lvalue_names(target, names);
-            collect_expr_names(value, names);
+            collect_free_lvalue_names(target, bound, free);
+            collect_free_expr_names(value, bound, free);
         }
         Stmt::If {
             condition,
@@ -829,109 +1192,136 @@ fn collect_stmt_names(stmt: &Stmt, names: &mut Vec<String>) {
             else_branch,
             ..
         } => {
-            collect_expr_names(condition, names);
-            for stmt in then_branch.iter().chain(else_branch.iter()) {
-                collect_stmt_names(stmt, names);
-            }
+            collect_free_expr_names(condition, bound, free);
+            collect_free_nested_block(then_branch, bound, free);
+            collect_free_nested_block(else_branch, bound, free);
         }
         Stmt::While {
             condition, body, ..
         } => {
-            collect_expr_names(condition, names);
-            for stmt in body {
-                collect_stmt_names(stmt, names);
-            }
+            collect_free_expr_names(condition, bound, free);
+            collect_free_nested_block(body, bound, free);
         }
-        Stmt::For { iterable, body, .. } => {
-            collect_expr_names(iterable, names);
-            for stmt in body {
-                collect_stmt_names(stmt, names);
-            }
+        Stmt::For {
+            name,
+            iterable,
+            body,
+            ..
+        } => {
+            collect_free_expr_names(iterable, bound, free);
+            let mut scoped = bound.clone();
+            scoped.insert(name.clone());
+            collect_free_nested_block(body, &mut scoped, free);
         }
         Stmt::Function(function) => {
-            for stmt in &function.body {
-                collect_stmt_names(stmt, names);
-            }
+            bound.insert(function.name.clone());
         }
         Stmt::Try {
             body,
+            catch_name,
             catch_body,
             finally_body,
             ..
         } => {
-            for stmt in body
-                .iter()
-                .chain(catch_body.iter())
-                .chain(finally_body.iter())
-            {
-                collect_stmt_names(stmt, names);
+            collect_free_nested_block(body, bound, free);
+            let mut catch_bound = bound.clone();
+            if let Some(name) = catch_name {
+                catch_bound.insert(name.clone());
             }
+            collect_free_nested_block(catch_body, &mut catch_bound, free);
+            collect_free_nested_block(finally_body, bound, free);
         }
-        Stmt::Fail { value, .. } | Stmt::Panic { value, .. } => collect_expr_names(value, names),
+        Stmt::Fail { value, .. } | Stmt::Panic { value, .. } => {
+            collect_free_expr_names(value, bound, free)
+        }
         Stmt::Return { value, .. } => {
             if let Some(value) = value {
-                collect_expr_names(value, names);
+                collect_free_expr_names(value, bound, free);
             }
         }
-        Stmt::Expr { expr, .. } => collect_expr_names(expr, names),
+        Stmt::Expr { expr, .. } => collect_free_expr_names(expr, bound, free),
     }
 }
 
-fn collect_lvalue_names(target: &AssignTarget, names: &mut Vec<String>) {
+fn collect_free_nested_block(
+    body: &[Stmt],
+    bound: &mut HashSet<String>,
+    free: &mut HashSet<String>,
+) {
+    for stmt in body {
+        collect_free_stmt_names(stmt, bound, free);
+    }
+}
+
+fn collect_free_lvalue_names(
+    target: &AssignTarget,
+    bound: &HashSet<String>,
+    free: &mut HashSet<String>,
+) {
     match target {
-        AssignTarget::Variable(name) => names.push(name.clone()),
-        AssignTarget::Index { target, index } => {
-            collect_expr_names(target, names);
-            collect_expr_names(index, names);
+        AssignTarget::Variable(name) => {
+            if !bound.contains(name) {
+                free.insert(name.clone());
+            }
         }
-        AssignTarget::Field { target, .. } => collect_expr_names(target, names),
+        AssignTarget::Index { target, index } => {
+            collect_free_expr_names(target, bound, free);
+            collect_free_expr_names(index, bound, free);
+        }
+        AssignTarget::Field { target, .. } => collect_free_expr_names(target, bound, free),
     }
 }
 
-fn collect_expr_names(expr: &Expr, names: &mut Vec<String>) {
+fn collect_free_expr_names(expr: &Expr, bound: &HashSet<String>, free: &mut HashSet<String>) {
     match &expr.kind {
-        ExprKind::Variable(name) => names.push(name.clone()),
+        ExprKind::Variable(name) => {
+            if !bound.contains(name) {
+                free.insert(name.clone());
+            }
+        }
         ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } => {
-            collect_expr_names(expr, names)
+            collect_free_expr_names(expr, bound, free)
         }
         ExprKind::Binary { left, right, .. } => {
-            collect_expr_names(left, names);
-            collect_expr_names(right, names);
+            collect_free_expr_names(left, bound, free);
+            collect_free_expr_names(right, bound, free);
         }
         ExprKind::Call { callee, args } => {
-            collect_expr_names(callee, names);
+            collect_free_expr_names(callee, bound, free);
             for arg in args {
-                collect_expr_names(arg, names);
+                collect_free_expr_names(arg, bound, free);
             }
         }
         ExprKind::Array(values) => {
             for value in values {
-                collect_expr_names(value, names);
+                collect_free_expr_names(value, bound, free);
             }
         }
         ExprKind::Index { target, index } => {
-            collect_expr_names(target, names);
-            collect_expr_names(index, names);
+            collect_free_expr_names(target, bound, free);
+            collect_free_expr_names(index, bound, free);
         }
-        ExprKind::Field { target, .. } => collect_expr_names(target, names),
+        ExprKind::Field { target, .. } => collect_free_expr_names(target, bound, free),
         ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
             for (_, value) in fields {
-                collect_expr_names(value, names);
+                collect_free_expr_names(value, bound, free);
             }
         }
         ExprKind::Match { value, arms } => {
-            collect_expr_names(value, names);
+            collect_free_expr_names(value, bound, free);
             for arm in arms {
                 if let Some(guard) = &arm.guard {
-                    collect_expr_names(guard, names);
+                    collect_free_expr_names(guard, bound, free);
                 }
-                collect_expr_names(&arm.value, names);
+                collect_free_expr_names(&arm.value, bound, free);
             }
         }
-        ExprKind::Function { body, .. } => {
-            for stmt in body {
-                collect_stmt_names(stmt, names);
+        ExprKind::Function { params, body, .. } => {
+            let mut nested = bound.clone();
+            for param in params {
+                nested.insert(param.name.clone());
             }
+            collect_free_nested_block(body, &mut nested, free);
         }
         ExprKind::Literal(_) => {}
     }

@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.8`，重点是闭包引用捕获前置、修正本地递归函数闭环，并把 IR 推进到 typed CFG 草案。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.9`，重点是 typed temp IR、stdlib ABI metadata、package lock 草案和 native C 后端原型。
 
 ## 快速开始
 
@@ -27,13 +27,15 @@ ku run <file.ku>      Run a Ku source file
 ku check <file.ku>    Check a Ku source file without running
 ku ir <file.ku>       Print checked Ku IR draft
 ku build <file.ku>    Build a runnable executable wrapper
+ku build --native <file.ku>
+                      Emit prototype native C source
 ku version            Print version
 ku -h | -help         Print help
 ```
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.8 支持的核心语法
+## 0.0.9 支持的核心语法
 
 ```ku
 struct User {
@@ -131,6 +133,7 @@ fn main() {
 
 ```txt
 name = "demo_pkg"
+version = "0.1.0"
 root = "src"
 cache = ".ku/cache"
 ```
@@ -162,7 +165,8 @@ package/
 
 ## 文档
 
-- [0.0.8 语法草案](docs/syntax.md)
+- [0.0.9 语法草案](docs/syntax.md)
+- [0.0.9 版本记录](docs/v0.0.9.md)
 - [0.0.8 版本记录](docs/v0.0.8.md)
 - [0.0.7 版本记录](docs/v0.0.7.md)
 - [Package 草案](docs/package.md)
@@ -175,24 +179,26 @@ package/
 
 ## 当前边界
 
-`ku build` 当前生成解释器打包型可执行文件，还不是 native C / LLVM 后端。
+`ku build` 当前生成解释器打包型可执行文件。
+
+`ku build --native` 当前输出 prototype C 源码，只覆盖 int/bool/str、局部变量、直接函数调用和 print。复杂语法会清楚报不支持，还不是完整 native C / LLVM 后端。
 
 暂未完成：
 
 ```txt
 async / await
 native C / LLVM 后端
-闭包自由变量精确捕获和循环引用治理
+运行时闭包 capture map 和 Rc 循环引用治理
 复杂嵌套模式和 match 穷尽性检查
 ```
 
-已评估但暂不完整进入 0.0.8 的能力：
+已评估但暂不完整进入 0.0.9 的能力：
 
 ```txt
-包管理：已有 ku.mod/import root/cache 草案；远程包、版本解析、lockfile 还没有做。
+包管理：已有 ku.mod/import root/cache/version/ku.lock 草案；远程包、依赖解析、下载校验和缓存淘汰还没有做。
 async / await：需要事件循环或任务模型，不能只加关键字。
-native C / LLVM 后端：已有 typed CFG IR 草案；类型布局、运行时 ABI 和 stdlib ABI 还没有做。
-引用捕获闭包：已完成共享绑定第一刀，后续还要做自由变量精确捕获和 Rc 循环治理。
+native C / LLVM 后端：已有 typed temp IR、layout table、stdlib ABI metadata 和 prototype C 源码输出；完整 Result、闭包、struct/enum ABI 和 LLVM 还没有做。
+引用捕获闭包：IR 已完成自由变量精确捕获，运行时仍需从保存整个 Env 改成 capture map / weak self binding，彻底治理 Rc 循环。
 match 穷尽性：需要完整类型和模式矩阵，不适合混在 stdlib 拆分里。
 ```
 

@@ -18,6 +18,9 @@ history/
   v0.0.8/
     ku.exe
     libku.rlib
+  v0.0.9/
+    ku.exe
+    libku.rlib
 ```
 
 `release/ku.exe` 始终是当前最新版本；`history/v*/ku.exe` 是对应历史版本快照。
@@ -30,6 +33,7 @@ history/
 | 0.0.6 | 已归档 | 源码模块拆分和第一批 stdlib |
 | 0.0.7 | 发布时归档 | stdlib Result、package 草案、IR 草案 |
 | 0.0.8 | 发布时归档 | 引用捕获闭包前置、typed CFG IR 草案 |
+| 0.0.9 | 发布时归档 | typed temp IR、stdlib ABI metadata、package lock、native C 原型 |
 
 ## 自动化
 

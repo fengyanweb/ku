@@ -1,6 +1,6 @@
-# Ku 0.0.8 Syntax Draft
+# Ku 0.0.9 Syntax Draft
 
-本文固定 Ku 0.0.8 的语法边界。当前 CLI 版本显示 `0.0.8`。
+本文固定 Ku 0.0.9 的语法边界。当前 CLI 版本显示 `0.0.9`。
 
 ## 文件和入口
 
@@ -90,7 +90,7 @@ fn load(): str! {
 
 `T!` 表示 `Result<T, str>`。当前固定错误 payload 为 `str`。
 
-`string` 和 `nil` 不是 0.0.8 类型名。
+`string` 和 `nil` 不是 0.0.9 类型名。
 
 ## 变量
 
@@ -169,7 +169,7 @@ fn main() {
 - 箭头函数参数暂时不写类型。
 - 箭头函数按引用捕获外层局部变量，读取时能看到最新值，赋值会写回外层可变变量。
 - 函数值调用会按实参类型检查函数体并推导返回类型。
-- 0.0.8 仍是共享绑定实现，后续会继续做自由变量精确捕获，避免闭包长期持有不需要的外层变量。
+- 0.0.9 的 IR 已做自由变量精确捕获；运行时仍是共享绑定实现，后续会改成 capture map / weak self binding，避免闭包长期持有不需要的外层变量并治理 Rc 循环。
 
 ## 条件和循环
 
@@ -379,7 +379,7 @@ print(`literal \{name\}`)
 
 ## 错误处理
 
-Ku 0.0.8 继续沿用可恢复错误模型：
+Ku 0.0.9 继续沿用可恢复错误模型：
 
 ```txt
 T!             Result<T, str>
@@ -453,7 +453,7 @@ string.ends_with("Ku", "u")
 string.trim("  Ku  ")
 string.lower("KU")
 string.upper("ku")
-string.replace("Ku Lang", "Lang", "0.0.8")
+string.replace("Ku Lang", "Lang", "0.0.9")
 string.slice("Ku Lang", 0, 2)
 
 array.len([1, 2])
@@ -479,10 +479,11 @@ time.millis()
 
 ## Package
 
-0.0.7 开始固定本地 package 草案。包根目录可以放 `ku.mod`：
+0.0.7 开始固定本地 package 草案，0.0.9 增加 package version 和本地 `ku.lock`。包根目录可以放 `ku.mod`：
 
 ```txt
 name = "demo_pkg"
+version = "0.1.0"
 root = "src"
 cache = ".ku/cache"
 ```
@@ -493,7 +494,7 @@ cache = ".ku/cache"
 import { Value } from "util"
 ```
 
-会从 `root` 下解析为 `util.ku`。相对导入 `./util.ku` 仍按当前文件目录解析，但结果不能跳出 package import root。远程包、版本解析和 lockfile 暂未实现。
+会从 `root` 下解析为 `util.ku`。相对导入 `./util.ku` 仍按当前文件目录解析，但结果不能跳出 package import root。远程包、依赖解析和下载校验暂未实现。
 
 ## 命令
 
@@ -532,6 +533,8 @@ stdlib string / array / json / time 的参数数量和基础类型错误
 ```
 
 `ku build` 当前生成“解释器打包型可执行文件”：源码被嵌入生成的 exe 中，运行 exe 会通过 Ku 解释器执行。它是真正可运行的文件，但还不是 native C/LLVM 后端。
+
+`ku build --native <file.ku>` 当前输出 prototype C 源码，只支持 int/bool/str、局部变量、直接函数调用和 print。遇到数组、struct、enum、Result、闭包、match、try 等复杂语法会明确报不支持。
 
 当前 `ku build` 是开发环境功能，需要本机可调用 `rustc`，并且 `ku` 可执行文件旁边能找到 `libku.rlib` 或 `deps/libku*.rlib`。它只打包 Ku 源码本身，不打包 `fs.read` 读取的外部资源文件；相对资源路径仍按被 build 的源文件路径解析。
 
