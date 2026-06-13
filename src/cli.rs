@@ -11,12 +11,14 @@ use crate::{
     checker::Checker,
     error::{KuError, KuResult},
     interpreter::Interpreter,
+    ir,
     lexer::Lexer,
+    package::{self, PackageContext},
     parser::Parser,
     span::Span,
 };
 
-const KU_VERSION: &str = "0.0.6";
+const KU_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SOURCE_BYTES: u64 = 1_000_000;
 const HELP: &str = "\
 ku - simple, small, fast language tool
@@ -25,6 +27,7 @@ Usage:
   ku <file.ku>          Run a Ku source file
   ku run <file.ku>      Run a Ku source file
   ku check <file.ku>    Check a Ku source file without running it
+  ku ir <file.ku>       Print checked Ku IR draft
   ku build <file.ku>    Build a runnable executable wrapper
   ku version            Print version
   ku -v                 Print version
@@ -36,6 +39,7 @@ Usage:
 Examples:
   ku run examples\\hello.ku
   ku check examples\\error.ku
+  ku ir examples\\function.ku
   ku build examples\\hello.ku
 ";
 
@@ -51,6 +55,13 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
             let source = read_ku_file(path)?;
             check_source(path, &source)?;
             println!("check ok: {path}");
+            Ok(())
+        }
+        Some("ir") => {
+            let path = exact_path(&args, "ir")?;
+            let source = read_ku_file(path)?;
+            let program = parse_and_check(path, &source)?;
+            print!("{}", ir::lower_program(&program)?);
             Ok(())
         }
         Some("build") => {
@@ -318,7 +329,7 @@ fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
                 Span::default(),
             ));
         }
-        let mut loader = ModuleLoader::new();
+        let mut loader = ModuleLoader::new(package::discover_for_file(path)?);
         loader.load_entry(path, program)?
     } else {
         program
@@ -351,14 +362,16 @@ struct ModuleLoader {
     states: HashMap<PathBuf, LoadState>,
     modules: HashMap<PathBuf, ModuleExports>,
     namespace_counter: usize,
+    package: Option<PackageContext>,
 }
 
 impl ModuleLoader {
-    fn new() -> Self {
+    fn new(package: Option<PackageContext>) -> Self {
         Self {
             states: HashMap::new(),
             modules: HashMap::new(),
             namespace_counter: 0,
+            package,
         }
     }
 
@@ -417,7 +430,8 @@ impl ModuleLoader {
             let Item::Import(import) = item else {
                 continue;
             };
-            let import_path = resolve_import_path(path, &import.path, import.span)?;
+            let import_path =
+                resolve_import_path(path, &import.path, import.span, self.package.as_ref())?;
             let module = self.load_module(&import_path, import.span)?;
             match &import.kind {
                 ImportKind::Named(names) => {
@@ -553,15 +567,32 @@ fn canonical_file(path: &Path, span: Span) -> KuResult<PathBuf> {
     })
 }
 
-fn resolve_import_path(current_file: &Path, import_path: &str, span: Span) -> KuResult<PathBuf> {
+fn resolve_import_path(
+    current_file: &Path,
+    import_path: &str,
+    span: Span,
+    package: Option<&PackageContext>,
+) -> KuResult<PathBuf> {
     let raw = Path::new(import_path);
     if raw.is_absolute() {
         return Err(KuError::runtime("import path must be relative", span));
     }
-    let mut path = current_file
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(raw);
+    let base = if let Some(package) = package {
+        if import_path.starts_with("./") || import_path.starts_with("../") {
+            current_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        } else {
+            package.import_root.clone()
+        }
+    } else {
+        current_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    };
+    let mut path = base.join(raw);
     if path.extension().is_none() {
         path.set_extension("ku");
     }
@@ -573,6 +604,9 @@ fn resolve_import_path(current_file: &Path, import_path: &str, span: Span) -> Ku
             "import path must point to a .ku file",
             span,
         ));
+    }
+    if let Some(package) = package {
+        package::ensure_inside_import_root(&path, package, span)?;
     }
     Ok(path)
 }

@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.6`，重点是完成 Rust 源码模块拆分，并落地第一批 `stdlib`：`string` / `array` / `json` / `time`。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.7`，重点是收紧 stdlib 类型签名、补 Result 风格标准库能力，并开始固定 package 和 IR 边界。
 
 ## 快速开始
 
@@ -25,6 +25,7 @@ ku check examples/index.ku
 ku <file.ku>          Run a Ku source file
 ku run <file.ku>      Run a Ku source file
 ku check <file.ku>    Check a Ku source file without running
+ku ir <file.ku>       Print checked Ku IR draft
 ku build <file.ku>    Build a runnable executable wrapper
 ku version            Print version
 ku -h | -help         Print help
@@ -32,7 +33,7 @@ ku -h | -help         Print help
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.6 支持的核心语法
+## 0.0.7 支持的核心语法
 
 ```ku
 struct User {
@@ -125,6 +126,18 @@ fn main() {
 }
 ```
 
+有 `ku.mod` 时可以固定本地 package import root：
+
+```txt
+name = "demo_pkg"
+root = "src"
+cache = ".ku/cache"
+```
+
+```ku
+import { Value } from "util"
+```
+
 ## 示例
 
 仓库内置示例在 `examples/`：
@@ -143,13 +156,17 @@ compiler_pipeline.ku
 result.ku
 try_read.ku
 stdlib.ku
+package/
 ```
 
 ## 文档
 
-- [0.0.6 语法草案](docs/syntax.md)
-- [0.0.6 版本记录](docs/v0.0.6.md)
+- [0.0.7 语法草案](docs/syntax.md)
+- [0.0.7 版本记录](docs/v0.0.7.md)
+- [Package 草案](docs/package.md)
+- [IR 草案](docs/ir.md)
 - [版本和解释器历史](docs/history.md)
+- [0.0.6 版本记录](docs/v0.0.6.md)
 - [0.0.5 版本记录](docs/v0.0.5.md)
 - [0.0.4 版本记录](docs/v0.0.4.md)
 - [0.0.3 版本记录](docs/v0.0.3.md)
@@ -161,19 +178,18 @@ stdlib.ku
 暂未完成：
 
 ```txt
-包管理
 async / await
 native C / LLVM 后端
 引用捕获闭包和闭包修改外层变量
 复杂嵌套模式和 match 穷尽性检查
 ```
 
-已评估但暂不进入 0.0.6 的能力：
+已评估但暂不完整进入 0.0.7 的能力：
 
 ```txt
-包管理：需要先固定 package/module 边界和缓存目录。
+包管理：已有 ku.mod/import root/cache 草案；远程包、版本解析、lockfile 还没有做。
 async / await：需要事件循环或任务模型，不能只加关键字。
-native C / LLVM 后端：需要明确 IR、类型布局和标准库 ABI。
+native C / LLVM 后端：已有 IR 草案；类型布局、运行时 ABI 和 stdlib ABI 还没有做。
 引用捕获闭包：会改变 Env/Value 的所有权模型，需要单独版本做。
 match 穷尽性：需要完整类型和模式矩阵，不适合混在 stdlib 拆分里。
 ```

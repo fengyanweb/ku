@@ -12,6 +12,7 @@ pub mod compiler;
 pub mod core;
 pub mod fs;
 pub mod json;
+pub(crate) mod metadata;
 pub mod string;
 pub mod time;
 

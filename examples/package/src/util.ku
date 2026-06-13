@@ -1,0 +1,3 @@
+fn Value(): int {
+    return 7
+}

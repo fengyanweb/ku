@@ -4,6 +4,7 @@ use crate::{
     ast::*,
     error::{KuError, KuResult},
     span::Span,
+    stdlib::metadata::{self, ArgRule, Signature, TypePattern},
 };
 
 const MAX_CHECK_DEPTH: usize = 32;
@@ -838,36 +839,10 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> KuResult<Option<Type>> {
-        match name {
-            "len" => {
-                expect_arg_count(name, args.len(), 1, span)?;
-                let actual = self.check_expr(&args[0])?;
-                if actual == Type::String || matches!(actual, Type::Array(_)) {
-                    Ok(Some(Type::Int))
-                } else {
-                    Err(type_error(args[0].span, &Type::String, &actual))
-                }
-            }
-            "str" => {
-                expect_arg_count(name, args.len(), 1, span)?;
-                self.check_expr(&args[0])?;
-                Ok(Some(Type::String))
-            }
-            "ok" => {
-                expect_arg_count(name, args.len(), 1, span)?;
-                Ok(Some(Type::Result(Box::new(self.check_expr(&args[0])?))))
-            }
-            "err" => {
-                expect_arg_count(name, args.len(), 1, span)?;
-                let actual = self.check_expr(&args[0])?;
-                if actual == Type::String {
-                    Ok(Some(Type::Result(Box::new(Type::Unknown))))
-                } else {
-                    Err(type_error(args[0].span, &Type::String, &actual))
-                }
-            }
-            _ => Ok(None),
-        }
+        let Some(signature) = metadata::builtin_signature(name) else {
+            return Ok(None);
+        };
+        Ok(Some(self.apply_stdlib_signature(&signature, args, span)?))
     }
 
     fn check_assign_target(&mut self, target: &AssignTarget, span: Span) -> KuResult<Type> {
@@ -1059,178 +1034,148 @@ impl Checker {
         if self.contains(&module) {
             return Ok(None);
         }
-        match (module.as_str(), function.as_str()) {
-            ("fs", "read") => {
-                expect_arg_count("fs.read", args.len(), 1, span)?;
-                let actual = self.check_expr(&args[0])?;
-                if actual == Type::String {
-                    Ok(Some(Type::String))
+        let Some(signature) = metadata::dotted_signature(&module, &function) else {
+            return Ok(None);
+        };
+        Ok(Some(self.apply_stdlib_signature(&signature, args, span)?))
+    }
+
+    fn apply_stdlib_signature(
+        &mut self,
+        signature: &Signature,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Type> {
+        expect_arg_count(&signature.name, args.len(), signature.args.len(), span)?;
+        let actuals = args
+            .iter()
+            .map(|arg| self.check_expr(arg))
+            .collect::<KuResult<Vec<_>>>()?;
+        for (index, rule) in signature.args.iter().enumerate() {
+            self.check_stdlib_arg(rule, index, args, &actuals)?;
+        }
+        self.stdlib_pattern_to_type(&signature.returns, &actuals, span)
+    }
+
+    fn check_stdlib_arg(
+        &self,
+        rule: &ArgRule,
+        index: usize,
+        args: &[Expr],
+        actuals: &[Type],
+    ) -> KuResult<()> {
+        match rule {
+            ArgRule::Is(pattern) => {
+                if self.type_matches_pattern(&actuals[index], pattern) {
+                    Ok(())
                 } else {
-                    Err(type_error(args[0].span, &Type::String, &actual))
-                }
-            }
-            ("fs", "try_read") => {
-                expect_arg_count("fs.try_read", args.len(), 1, span)?;
-                let actual = self.check_expr(&args[0])?;
-                if actual == Type::String {
-                    Ok(Some(Type::Result(Box::new(Type::String))))
-                } else {
-                    Err(type_error(args[0].span, &Type::String, &actual))
-                }
-            }
-            ("lexer", "scan") => {
-                expect_arg_count("lexer.scan", args.len(), 1, span)?;
-                let actual = self.check_expr(&args[0])?;
-                if actual == Type::String {
-                    Ok(Some(Type::Array(Box::new(Type::String))))
-                } else {
-                    Err(type_error(args[0].span, &Type::String, &actual))
-                }
-            }
-            ("parser", "parse") => {
-                expect_arg_count("parser.parse", args.len(), 1, span)?;
-                let actual = self.check_expr(&args[0])?;
-                if actual == Type::String || actual == Type::Array(Box::new(Type::String)) {
-                    Ok(Some(Type::String))
-                } else {
-                    Err(KuError::runtime(
-                        format!(
-                            "type error: expected str or [str] but got {}",
-                            type_name(&actual)
-                        ),
-                        args[0].span,
+                    Err(type_error(
+                        args[index].span,
+                        &self.pattern_expected_type(pattern),
+                        &actuals[index],
                     ))
                 }
             }
-            ("string", "len" | "trim" | "lower" | "upper") => {
-                expect_arg_count(&format!("{module}.{function}"), args.len(), 1, span)?;
-                let actual = self.check_expr(&args[0])?;
-                if actual != Type::String {
-                    return Err(type_error(args[0].span, &Type::String, &actual));
-                }
-                if function == "len" {
-                    Ok(Some(Type::Int))
+            ArgRule::MatchesArrayElement { array_arg } => {
+                let Type::Array(element) = &actuals[*array_arg] else {
+                    return Err(type_error(
+                        args[*array_arg].span,
+                        &Type::Array(Box::new(Type::Unknown)),
+                        &actuals[*array_arg],
+                    ));
+                };
+                if type_matches(element, &actuals[index]) {
+                    Ok(())
                 } else {
-                    Ok(Some(Type::String))
+                    Err(type_error(args[index].span, element, &actuals[index]))
                 }
             }
-            ("string", "contains" | "starts_with" | "ends_with") => {
-                expect_arg_count(&format!("{module}.{function}"), args.len(), 2, span)?;
-                self.expect_string_args(args)?;
-                Ok(Some(Type::Bool))
-            }
-            ("string", "replace") => {
-                expect_arg_count("string.replace", args.len(), 3, span)?;
-                self.expect_string_args(args)?;
-                Ok(Some(Type::String))
-            }
-            ("array", "len") => {
-                expect_arg_count("array.len", args.len(), 1, span)?;
-                match self.check_expr(&args[0])? {
-                    Type::Array(_) => Ok(Some(Type::Int)),
-                    actual => Err(type_error(
-                        args[0].span,
-                        &Type::Array(Box::new(Type::Unknown)),
-                        &actual,
-                    )),
-                }
-            }
-            ("array", "is_empty") => {
-                expect_arg_count("array.is_empty", args.len(), 1, span)?;
-                match self.check_expr(&args[0])? {
-                    Type::Array(_) => Ok(Some(Type::Bool)),
-                    actual => Err(type_error(
-                        args[0].span,
-                        &Type::Array(Box::new(Type::Unknown)),
-                        &actual,
-                    )),
-                }
-            }
-            ("array", "push") => {
-                expect_arg_count("array.push", args.len(), 2, span)?;
-                match self.check_expr(&args[0])? {
-                    Type::Array(element) => {
-                        let value = self.check_expr(&args[1])?;
-                        if !type_matches(&element, &value) {
-                            return Err(type_error(args[1].span, &element, &value));
-                        }
-                        Ok(Some(Type::Array(element)))
-                    }
-                    actual => Err(type_error(
-                        args[0].span,
-                        &Type::Array(Box::new(Type::Unknown)),
-                        &actual,
-                    )),
-                }
-            }
-            ("array", "concat") => {
-                expect_arg_count("array.concat", args.len(), 2, span)?;
-                let left = self.check_expr(&args[0])?;
-                let right = self.check_expr(&args[1])?;
-                match (&left, &right) {
-                    (Type::Array(left), Type::Array(right)) if type_matches(left, right) => {
-                        Ok(Some(Type::Array(left.clone())))
-                    }
-                    (Type::Array(_), Type::Array(_)) => {
-                        Err(type_error(args[1].span, &left, &right))
-                    }
-                    _ => Err(type_error(
-                        args[0].span,
-                        &Type::Array(Box::new(Type::Unknown)),
-                        &left,
-                    )),
-                }
-            }
-            ("array", "first" | "last") => {
-                expect_arg_count(&format!("{module}.{function}"), args.len(), 1, span)?;
-                match self.check_expr(&args[0])? {
-                    Type::Array(element) => Ok(Some(*element)),
-                    actual => Err(type_error(
-                        args[0].span,
-                        &Type::Array(Box::new(Type::Unknown)),
-                        &actual,
-                    )),
-                }
-            }
-            ("json", "parse") => {
-                expect_arg_count("json.parse", args.len(), 1, span)?;
-                let actual = self.check_expr(&args[0])?;
-                if actual == Type::String {
-                    Ok(Some(Type::Unknown))
-                } else {
-                    Err(type_error(args[0].span, &Type::String, &actual))
-                }
-            }
-            ("json", "try_parse") => {
-                expect_arg_count("json.try_parse", args.len(), 1, span)?;
-                let actual = self.check_expr(&args[0])?;
-                if actual == Type::String {
-                    Ok(Some(Type::Result(Box::new(Type::Unknown))))
-                } else {
-                    Err(type_error(args[0].span, &Type::String, &actual))
-                }
-            }
-            ("json", "stringify") => {
-                expect_arg_count("json.stringify", args.len(), 1, span)?;
-                self.check_expr(&args[0])?;
-                Ok(Some(Type::String))
-            }
-            ("time", "now" | "unix" | "millis") => {
-                expect_arg_count(&format!("{module}.{function}"), args.len(), 0, span)?;
-                Ok(Some(Type::Int))
-            }
-            _ => Ok(None),
+            ArgRule::MatchesArrayArg { array_arg } => match (&actuals[*array_arg], &actuals[index])
+            {
+                (Type::Array(left), Type::Array(right)) if type_matches(left, right) => Ok(()),
+                (Type::Array(_), Type::Array(_)) => Err(type_error(
+                    args[index].span,
+                    &actuals[*array_arg],
+                    &actuals[index],
+                )),
+                _ => Err(type_error(
+                    args[index].span,
+                    &Type::Array(Box::new(Type::Unknown)),
+                    &actuals[index],
+                )),
+            },
         }
     }
 
-    fn expect_string_args(&mut self, args: &[Expr]) -> KuResult<()> {
-        for arg in args {
-            let actual = self.check_expr(arg)?;
-            if actual != Type::String {
-                return Err(type_error(arg.span, &Type::String, &actual));
+    fn type_matches_pattern(&self, actual: &Type, pattern: &TypePattern) -> bool {
+        match pattern {
+            TypePattern::Int => actual == &Type::Int,
+            TypePattern::Bool => actual == &Type::Bool,
+            TypePattern::String => actual == &Type::String,
+            TypePattern::Unknown | TypePattern::Any => true,
+            TypePattern::ArrayAny => matches!(actual, Type::Array(_)),
+            TypePattern::StringOrStringArray => {
+                actual == &Type::String || actual == &Type::Array(Box::new(Type::String))
             }
+            TypePattern::ArrayOf(inner) => match actual {
+                Type::Array(element) => self.type_matches_pattern(element, inner),
+                _ => false,
+            },
+            TypePattern::ArrayElementOfArg(_)
+            | TypePattern::ResultOf(_)
+            | TypePattern::SameAsArg(_) => true,
         }
-        Ok(())
+    }
+
+    fn pattern_expected_type(&self, pattern: &TypePattern) -> Type {
+        match pattern {
+            TypePattern::Int => Type::Int,
+            TypePattern::Bool => Type::Bool,
+            TypePattern::String => Type::String,
+            TypePattern::ArrayAny => Type::Array(Box::new(Type::Unknown)),
+            TypePattern::ArrayOf(inner) => Type::Array(Box::new(self.pattern_expected_type(inner))),
+            TypePattern::StringOrStringArray => Type::String,
+            TypePattern::Unknown
+            | TypePattern::Any
+            | TypePattern::ArrayElementOfArg(_)
+            | TypePattern::ResultOf(_)
+            | TypePattern::SameAsArg(_) => Type::Unknown,
+        }
+    }
+
+    fn stdlib_pattern_to_type(
+        &self,
+        pattern: &TypePattern,
+        actuals: &[Type],
+        span: Span,
+    ) -> KuResult<Type> {
+        match pattern {
+            TypePattern::Int => Ok(Type::Int),
+            TypePattern::Bool => Ok(Type::Bool),
+            TypePattern::String => Ok(Type::String),
+            TypePattern::Unknown | TypePattern::Any => Ok(Type::Unknown),
+            TypePattern::ArrayAny => Ok(Type::Array(Box::new(Type::Unknown))),
+            TypePattern::ArrayOf(inner) => Ok(Type::Array(Box::new(
+                self.stdlib_pattern_to_type(inner, actuals, span)?,
+            ))),
+            TypePattern::StringOrStringArray => Ok(Type::String),
+            TypePattern::ArrayElementOfArg(index) => match actuals.get(*index) {
+                Some(Type::Array(element)) => Ok(*element.clone()),
+                Some(actual) => Err(type_error(
+                    span,
+                    &Type::Array(Box::new(Type::Unknown)),
+                    actual,
+                )),
+                None => Err(KuError::runtime("invalid stdlib signature", span)),
+            },
+            TypePattern::ResultOf(inner) => Ok(Type::Result(Box::new(
+                self.stdlib_pattern_to_type(inner, actuals, span)?,
+            ))),
+            TypePattern::SameAsArg(index) => actuals
+                .get(*index)
+                .cloned()
+                .ok_or_else(|| KuError::runtime("invalid stdlib signature", span)),
+        }
     }
 
     fn check_function_value_call(

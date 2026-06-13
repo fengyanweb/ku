@@ -1,6 +1,6 @@
-# Ku 0.0.6 Syntax Draft
+# Ku 0.0.7 Syntax Draft
 
-本文固定 Ku 0.0.6 的语法边界。当前 CLI 版本显示 `0.0.6`。
+本文固定 Ku 0.0.7 的语法边界。当前 CLI 版本显示 `0.0.7`。
 
 ## 文件和入口
 
@@ -53,7 +53,7 @@ import "./math.ku"
 
 `import { Add, Twice } from "./math.ku"` 会按需导入导出名，直接使用 `Add(1, 2)`。
 
-`import "./math.ku"` 会全量导入该文件所有首字母大写的导出名，直接使用。`import from "./math.ku"` 不属于 Ku 0.0.3 语法。
+`import "./math.ku"` 会全量导入该文件所有首字母大写的导出名，直接使用。`import from "./math.ku"` 不属于 Ku 语法。
 
 ## 类型
 
@@ -88,9 +88,9 @@ fn load(): str! {
 }
 ```
 
-`T!` 表示 `Result<T, str>`。0.0.6 固定错误 payload 为 `str`。
+`T!` 表示 `Result<T, str>`。当前固定错误 payload 为 `str`。
 
-`string` 和 `nil` 不是 0.0.6 类型名。
+`string` 和 `nil` 不是 0.0.7 类型名。
 
 ## 变量
 
@@ -378,7 +378,7 @@ print(`literal \{name\}`)
 
 ## 错误处理
 
-Ku 0.0.6 继续沿用可恢复错误模型：
+Ku 0.0.7 继续沿用可恢复错误模型：
 
 ```txt
 T!             Result<T, str>
@@ -452,7 +452,8 @@ string.ends_with("Ku", "u")
 string.trim("  Ku  ")
 string.lower("KU")
 string.upper("ku")
-string.replace("Ku Lang", "Lang", "0.0.6")
+string.replace("Ku Lang", "Lang", "0.0.7")
+string.slice("Ku Lang", 0, 2)
 
 array.len([1, 2])
 array.is_empty([])
@@ -460,6 +461,7 @@ array.push([1, 2], 3)
 array.concat([1], [2])
 array.first([1, 2])
 array.last([1, 2])
+array.try_get([1, 2], 0)
 
 json.stringify({ name: "Ku", version: 6 })
 json.parse("{\"name\":\"Ku\"}")
@@ -470,7 +472,27 @@ time.unix()
 time.millis()
 ```
 
-`array.push` 和 `array.concat` 返回新数组，不会原地修改参数。`json.parse` 返回运行时 JSON 值，静态类型暂记为 `Unknown`；字段级类型推断后续随类型系统完善。`json.try_parse` 返回 `Unknown!`，可以配合 `?` 和 `try/catch`。
+`array.push` 和 `array.concat` 返回新数组，不会原地修改参数。`array.try_get` 返回元素类型的 `T!`，越界或负数返回 `Err(str)`。`string.slice` 按字符下标切片，返回 `str!`，越界返回 `Err(str)`。
+
+`json.parse` 返回运行时 JSON 值，静态类型暂记为 `Unknown`；字段级类型推断后续随类型系统完善。`json.try_parse` 返回 `Unknown!`，可以配合 `?` 和 `try/catch`。
+
+## Package
+
+0.0.7 开始固定本地 package 草案。包根目录可以放 `ku.mod`：
+
+```txt
+name = "demo_pkg"
+root = "src"
+cache = ".ku/cache"
+```
+
+有 `ku.mod` 时：
+
+```ku
+import { Value } from "util"
+```
+
+会从 `root` 下解析为 `util.ku`。相对导入 `./util.ku` 仍按当前文件目录解析，但结果不能跳出 package import root。远程包、版本解析和 lockfile 暂未实现。
 
 ## 命令
 
@@ -478,6 +500,7 @@ time.millis()
 ku <file.ku>
 ku run <file.ku>
 ku check <file.ku>
+ku ir <file.ku>
 ku build <file.ku>
 ku version
 ku -v

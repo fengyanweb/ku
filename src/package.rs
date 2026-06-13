@@ -1,0 +1,187 @@
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+use crate::{
+    error::{KuError, KuResult},
+    span::Span,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KuMod {
+    pub name: String,
+    pub root: Option<String>,
+    pub cache: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageContext {
+    pub manifest_path: PathBuf,
+    pub package_dir: PathBuf,
+    pub import_root: PathBuf,
+    pub cache_dir: PathBuf,
+    pub manifest: KuMod,
+}
+
+pub const MANIFEST_FILE: &str = "ku.mod";
+pub const DEFAULT_IMPORT_ROOT: &str = "src";
+pub const DEFAULT_CACHE_DIR: &str = ".ku/cache";
+
+pub fn discover_for_file(path: &Path) -> KuResult<Option<PackageContext>> {
+    let start = path.parent().unwrap_or_else(|| Path::new("."));
+    discover_from_dir(start)
+}
+
+pub fn discover_from_dir(start: &Path) -> KuResult<Option<PackageContext>> {
+    let mut current = fs::canonicalize(start).map_err(|err| {
+        KuError::message(format!(
+            "failed to resolve package start '{}': {err}",
+            start.display()
+        ))
+    })?;
+    loop {
+        let manifest_path = current.join(MANIFEST_FILE);
+        if manifest_path.exists() {
+            let source = fs::read_to_string(&manifest_path).map_err(|err| {
+                KuError::message(format!(
+                    "failed to read package manifest '{}': {err}",
+                    manifest_path.display()
+                ))
+            })?;
+            let manifest = parse_manifest(&source, Span::default())?;
+            let import_root = current.join(manifest.root.as_deref().unwrap_or(DEFAULT_IMPORT_ROOT));
+            let import_root = if import_root.exists() {
+                fs::canonicalize(&import_root).map_err(|err| {
+                    KuError::message(format!(
+                        "failed to resolve package import root '{}': {err}",
+                        import_root.display()
+                    ))
+                })?
+            } else {
+                import_root
+            };
+            let cache_dir = current.join(manifest.cache.as_deref().unwrap_or(DEFAULT_CACHE_DIR));
+            return Ok(Some(PackageContext {
+                manifest_path,
+                package_dir: current,
+                import_root,
+                cache_dir,
+                manifest,
+            }));
+        }
+        if !current.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+pub fn default_global_cache() -> PathBuf {
+    env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+        .join("ku")
+        .join("cache")
+}
+
+pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
+    let mut name = None;
+    let mut root = None;
+    let mut cache = None;
+    for (index, raw_line) in source.lines().enumerate() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(KuError::runtime(
+                format!("invalid ku.mod line {}: expected key = value", index + 1),
+                span,
+            ));
+        };
+        let key = key.trim();
+        let value = parse_string_value(value.trim(), index + 1, span)?;
+        match key {
+            "name" => name = Some(value),
+            "root" => root = Some(value),
+            "cache" => cache = Some(value),
+            _ => {
+                return Err(KuError::runtime(
+                    format!("invalid ku.mod key '{key}' on line {}", index + 1),
+                    span,
+                ));
+            }
+        }
+    }
+    let name = name.ok_or_else(|| KuError::runtime("ku.mod missing package name", span))?;
+    validate_package_name(&name, span)?;
+    if let Some(value) = &root {
+        reject_unsafe_relative_path("root", value, span)?;
+    }
+    if let Some(value) = &cache {
+        reject_unsafe_relative_path("cache", value, span)?;
+    }
+    Ok(KuMod { name, root, cache })
+}
+
+fn parse_string_value(value: &str, line: usize, span: Span) -> KuResult<String> {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        Ok(value[1..value.len() - 1].to_string())
+    } else {
+        Err(KuError::runtime(
+            format!("invalid ku.mod value on line {line}: expected quoted string"),
+            span,
+        ))
+    }
+}
+
+fn validate_package_name(name: &str, span: Span) -> KuResult<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(KuError::runtime("package name cannot be empty", span));
+    };
+    if !first.is_ascii_lowercase() {
+        return Err(KuError::runtime(
+            "package name must start with a lowercase ascii letter",
+            span,
+        ));
+    }
+    if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
+        return Err(KuError::runtime(
+            "package name may only contain lowercase letters, digits, '_' and '-'",
+            span,
+        ));
+    }
+    Ok(())
+}
+
+fn reject_unsafe_relative_path(kind: &str, value: &str, span: Span) -> KuResult<()> {
+    let path = Path::new(value);
+    if path.is_absolute() || value.contains("..") {
+        return Err(KuError::runtime(
+            format!("ku.mod {kind} must be a safe relative path"),
+            span,
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_inside_import_root(
+    path: &Path,
+    package: &PackageContext,
+    span: Span,
+) -> KuResult<()> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if canonical.starts_with(&package.import_root) {
+        Ok(())
+    } else {
+        Err(KuError::runtime(
+            format!(
+                "import '{}' is outside package import root '{}'",
+                path.display(),
+                package.import_root.display()
+            ),
+            span,
+        ))
+    }
+}

@@ -262,7 +262,11 @@ impl Interpreter {
                 else_branch,
                 ..
             } => {
-                if self.eval(condition, env, depth)?.is_truthy() {
+                let condition = self.eval(condition, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
+                if condition.is_truthy() {
                     self.exec_block(then_branch, env, depth)
                 } else {
                     self.exec_block(else_branch, env, depth)
@@ -273,7 +277,14 @@ impl Interpreter {
                 body,
                 span,
             } => {
-                while self.eval(condition, env, depth)?.is_truthy() {
+                loop {
+                    let condition = self.eval(condition, env, depth)?;
+                    if let Some(value) = self.take_pending_fail() {
+                        return Ok(Flow::Fail(value));
+                    }
+                    if !condition.is_truthy() {
+                        break;
+                    }
                     self.tick(*span)?;
                     match self.exec_block(body, env, depth)? {
                         Flow::Continue => {}
@@ -289,6 +300,9 @@ impl Interpreter {
                 span,
             } => {
                 let values = self.eval(iterable, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
                 let Value::Array(values) = values else {
                     return Err(KuError::runtime(
                         format!(
@@ -362,10 +376,16 @@ impl Interpreter {
             }
             Stmt::Fail { value, .. } => {
                 let value = self.eval(value, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
                 Ok(Flow::Fail(value))
             }
             Stmt::Panic { value, span } => {
                 let value = self.eval(value, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
                 Err(KuError::runtime(format!("panic: {value}"), *span))
             }
             Stmt::Return { value, .. } => {

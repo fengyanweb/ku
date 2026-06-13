@@ -44,7 +44,7 @@ impl Parser {
     fn check_token_limit(&self) -> KuResult<()> {
         if self.tokens.len() > MAX_TOKENS {
             Err(KuError::parse(
-                "too many tokens; input is too large for Ku v0.0.3",
+                "too many tokens; input is too large for Ku",
                 self.peek().span,
             ))
         } else {

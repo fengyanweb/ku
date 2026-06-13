@@ -12,6 +12,9 @@ history/
   v0.0.6/
     ku.exe
     libku.rlib
+  v0.0.7/
+    ku.exe
+    libku.rlib
 ```
 
 `release/ku.exe` 始终是当前最新版本；`history/v*/ku.exe` 是对应历史版本快照。
@@ -22,6 +25,21 @@ history/
 | --- | --- | --- |
 | 0.0.5 | 已归档 | Result / try-catch / ? 错误处理闭环 |
 | 0.0.6 | 已归档 | 源码模块拆分和第一批 stdlib |
+| 0.0.7 | 发布时归档 | stdlib Result、package 草案、IR 草案 |
+
+## 自动化
+
+发布时在项目根目录运行：
+
+```powershell
+.\scripts\archive-release.ps1
+```
+
+只检查产物和版本路径：
+
+```powershell
+.\scripts\archive-release.ps1 -CheckOnly -SkipBuild
+```
 
 ## 规则
 
