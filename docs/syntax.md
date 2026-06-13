@@ -1,6 +1,6 @@
-# Ku 0.0.4 Syntax Draft
+# Ku 0.0.5 Syntax Draft
 
-本文固定 Ku 0.0.4 的语法边界。当前 CLI 版本显示 `0.0.4`。
+本文固定 Ku 0.0.5 的语法边界。当前 CLI 版本显示 `0.0.5`。
 
 ## 文件和入口
 
@@ -80,7 +80,17 @@ names:[str] = ["Ku"]
 token:Token = Token { kind: "Ident", text: "name", line: 1, column: 1 }
 ```
 
-`string` 和 `nil` 不是 0.0.3 类型名。
+可恢复错误类型：
+
+```ku
+fn load(): str! {
+    return ok("ready")
+}
+```
+
+`T!` 表示 `Result<T, str>`。0.0.5 固定错误 payload 为 `str`。
+
+`string` 和 `nil` 不是 0.0.5 类型名。
 
 ## 变量
 
@@ -366,6 +376,45 @@ print(`literal \{name\}`)
 `bad {1 - "x"}`
 ```
 
+## 错误处理
+
+Ku 0.0.5 先固定可恢复错误模型：
+
+```txt
+T!             Result<T, str>
+?              Err 时向上传
+try/catch      局部处理可恢复错误
+finally        无论 try 是否失败都会执行
+fail           主动返回可恢复错误，错误值必须是 str
+panic          不可恢复运行时错误
+```
+
+示例：
+
+```ku
+fn read_name(): str! {
+    fail "name missing"
+}
+
+fn main() {
+    message = "none"
+
+    try {
+        message = read_name()?
+    } catch (err) {
+        message = "caught: " + err
+    } finally {
+        print("cleanup")
+    }
+
+    print(message)
+}
+```
+
+`?` 只能用在返回 `T!` 的函数内，或用在 `try { ... }` 的 body 内。它会短路当前表达式，避免继续执行右侧调用。`catch (err)` 中的 `err` 固定为 `str`。
+
+`panic` 不会被 `try/catch` 捕获；它表示数组越界、内部 bug、主动崩溃等不可恢复问题。
+
 ## 内置能力
 
 基础函数：
@@ -374,17 +423,22 @@ print(`literal \{name\}`)
 len("Ku")    // 2
 len([1, 2])  // 2
 str(123)    // "123"
+ok(123)     // Ok(123)
+err("bad")  // Err("bad")
 ```
 
 文件和编译器管线雏形：
 
 ```ku
 text = fs.read("main.ku")
+safe = fs.try_read("main.ku")
 tokens = lexer.scan(text)
 ast = parser.parse(tokens)
 ```
 
 `fs.read` 读取 UTF-8 文本，当前有 1MB 文件大小保护，失败直接报运行时错误，不重试。相对路径按当前 `.ku` 源文件所在目录解析，不按启动终端所在目录解析。
+
+`fs.try_read` 返回 `str!`，文件不存在或读取失败会返回 `Err(str)`；文件过大仍按资源保护处理为不可恢复运行时错误。
 
 `lexer.scan` 当前返回 `[str]` 形式的 token 文本摘要。`parser.parse` 当前返回 AST 摘要字符串，后续会在 struct/enum 稳定后暴露真正的 Token/AST/Span/Error/Symbol 数据模型。二者都有输入大小、token 数和输出大小限制，避免超大字符串绕过主 parser 的资源保护。
 
@@ -419,6 +473,7 @@ ku help
 if / while 条件类型错误
 数组、对象、结构体、enum 的基础语义错误
 import 语法、私有导入、循环导入
+Result / ? / fail / try 的基础语义错误
 ```
 
 `ku build` 当前生成“解释器打包型可执行文件”：源码被嵌入生成的 exe 中，运行 exe 会通过 Ku 解释器执行。它是真正可运行的文件，但还不是 native C/LLVM 后端。
@@ -430,11 +485,10 @@ import 语法、私有导入、循环导入
 ```txt
 包管理
 异步
-错误处理语法 try/catch/result
-native C 后端
+native C / LLVM 后端
 顶层脚本语句
 引用捕获闭包和闭包修改外层变量
-复杂嵌套模式和 match 穷尽性检查
+复杂嵌套模式、match guard 穷尽性检查
 ```
 
 ## 资源保护
@@ -446,7 +500,7 @@ native C 后端
 最大解析深度: 32
 最大检查深度: 32
 最大执行步数: 1000000
-最大函数调用深度: 64
+最大函数调用深度: 16
 源码文件最大读取: 1000000 bytes
 fs.read 最大读取: 1000000 bytes
 compiler builtin 最大输入: 1000000 bytes

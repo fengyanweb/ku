@@ -16,6 +16,7 @@ enum Type {
     String,
     Null,
     Array(Box<Type>),
+    Result(Box<Type>),
     Object(HashMap<String, Type>),
     Struct(String),
     Enum(String),
@@ -63,6 +64,7 @@ pub struct Checker {
     scopes: Vec<HashMap<String, VarType>>,
     current_return: Type,
     check_depth: usize,
+    recoverable_depth: usize,
     template_mode: bool,
 }
 
@@ -75,6 +77,7 @@ impl Checker {
             scopes: vec![HashMap::new()],
             current_return: Type::Void,
             check_depth: 0,
+            recoverable_depth: 0,
             template_mode: false,
         }
     }
@@ -269,6 +272,9 @@ impl Checker {
             TypeName::Array(inner) => {
                 Ok(Type::Array(Box::new(self.resolve_type_name(inner, span)?)))
             }
+            TypeName::Result(inner) => {
+                Ok(Type::Result(Box::new(self.resolve_type_name(inner, span)?)))
+            }
             TypeName::Custom(name) if self.structs.contains_key(name) => {
                 Ok(Type::Struct(name.clone()))
             }
@@ -376,6 +382,48 @@ impl Checker {
                 Ok(())
             }
             Stmt::Function(function) => self.check_local_function(function),
+            Stmt::Try {
+                body,
+                catch_name,
+                catch_body,
+                finally_body,
+                span,
+            } => {
+                self.recoverable_depth += 1;
+                let body_result = self.check_block(body);
+                self.recoverable_depth -= 1;
+                body_result?;
+                if let Some(name) = catch_name {
+                    self.push_scope();
+                    self.define(name.clone(), Type::String, false, *span)?;
+                    for stmt in catch_body {
+                        self.check_stmt(stmt)?;
+                    }
+                    self.pop_scope();
+                }
+                self.check_block(finally_body)
+            }
+            Stmt::Fail { value, span } => {
+                let actual = self.check_expr(value)?;
+                if actual != Type::String {
+                    return Err(type_error(*span, &Type::String, &actual));
+                }
+                match &self.current_return {
+                    Type::Result(_) => Ok(()),
+                    _ if self.recoverable_depth > 0 => Ok(()),
+                    other => Err(KuError::runtime(
+                        format!(
+                            "fail requires a Result return type or an enclosing try block, got {}",
+                            type_name(other)
+                        ),
+                        *span,
+                    )),
+                }
+            }
+            Stmt::Panic { value, .. } => {
+                self.check_expr(value)?;
+                Ok(())
+            }
             Stmt::Return { value, span } => {
                 let actual = match value {
                     Some(value) => self.check_expr(value)?,
@@ -672,6 +720,23 @@ impl Checker {
                     Ok(Type::Object(object_fields))
                 }
                 ExprKind::Match { value, arms } => self.check_match_expr(value, arms, expr.span),
+                ExprKind::TryUnwrap { expr: inner } => match self.check_expr(inner)? {
+                    Type::Result(value) => {
+                        if !matches!(self.current_return, Type::Result(_))
+                            && self.recoverable_depth == 0
+                        {
+                            return Err(KuError::runtime(
+                                "'?' requires a Result return type or an enclosing try block",
+                                expr.span,
+                            ));
+                        }
+                        Ok(*value)
+                    }
+                    other => Err(KuError::runtime(
+                        format!("'?' expects Result but got {}", type_name(&other)),
+                        expr.span,
+                    )),
+                },
                 ExprKind::Function {
                     params,
                     return_type,
@@ -787,6 +852,19 @@ impl Checker {
                 expect_arg_count(name, args.len(), 1, span)?;
                 self.check_expr(&args[0])?;
                 Ok(Some(Type::String))
+            }
+            "ok" => {
+                expect_arg_count(name, args.len(), 1, span)?;
+                Ok(Some(Type::Result(Box::new(self.check_expr(&args[0])?))))
+            }
+            "err" => {
+                expect_arg_count(name, args.len(), 1, span)?;
+                let actual = self.check_expr(&args[0])?;
+                if actual == Type::String {
+                    Ok(Some(Type::Result(Box::new(Type::Unknown))))
+                } else {
+                    Err(type_error(args[0].span, &Type::String, &actual))
+                }
             }
             _ => Ok(None),
         }
@@ -950,6 +1028,13 @@ impl Checker {
                     }
                 }
             }
+            if let Some(guard) = &arm.guard {
+                let guard_type = self.check_expr(guard)?;
+                if guard_type != Type::Bool {
+                    self.pop_scope();
+                    return Err(type_error(guard.span, &Type::Bool, &guard_type));
+                }
+            }
             let actual = self.check_expr(&arm.value);
             self.pop_scope();
             let actual = actual?;
@@ -980,6 +1065,15 @@ impl Checker {
                 let actual = self.check_expr(&args[0])?;
                 if actual == Type::String {
                     Ok(Some(Type::String))
+                } else {
+                    Err(type_error(args[0].span, &Type::String, &actual))
+                }
+            }
+            ("fs", "try_read") => {
+                expect_arg_count("fs.try_read", args.len(), 1, span)?;
+                let actual = self.check_expr(&args[0])?;
+                if actual == Type::String {
+                    Ok(Some(Type::Result(Box::new(Type::String))))
                 } else {
                     Err(type_error(args[0].span, &Type::String, &actual))
                 }
@@ -1147,6 +1241,25 @@ impl Checker {
                 }
                 Ok(Some(actual))
             }
+            Stmt::Fail { value, span } => {
+                let actual = self.check_expr(value)?;
+                if actual != Type::String {
+                    return Err(type_error(*span, &Type::String, &actual));
+                }
+                if !matches!(self.current_return, Type::Result(_)) {
+                    if self.recoverable_depth > 0 {
+                        return Ok(None);
+                    }
+                    return Err(KuError::runtime(
+                        format!(
+                            "fail requires a Result return type or an enclosing try block, got {}",
+                            type_name(&self.current_return)
+                        ),
+                        *span,
+                    ));
+                }
+                Ok(Some(self.current_return.clone()))
+            }
             Stmt::If {
                 condition,
                 then_branch,
@@ -1304,6 +1417,7 @@ fn type_matches(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Array(left), Type::Array(right)) => type_matches(left, right),
+        (Type::Result(left), Type::Result(right)) => type_matches(left, right),
         (Type::Object(left), Type::Object(right)) => {
             left.len() == right.len()
                 && left.iter().all(|(name, left_ty)| {
@@ -1347,20 +1461,21 @@ fn type_error(span: Span, expected: &Type, actual: &Type) -> KuError {
     )
 }
 
-fn type_name(ty: &Type) -> &'static str {
+fn type_name(ty: &Type) -> String {
     match ty {
-        Type::Int => "int",
-        Type::Float => "float",
-        Type::Bool => "bool",
-        Type::String => "str",
-        Type::Null => "null",
-        Type::Array(_) => "array",
-        Type::Object(_) => "object",
-        Type::Struct(_) => "struct",
-        Type::Enum(_) => "enum",
-        Type::Void => "void",
-        Type::FunctionValue { .. } => "function",
-        Type::Unknown => "unknown",
+        Type::Int => "int".to_string(),
+        Type::Float => "float".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::String => "str".to_string(),
+        Type::Null => "null".to_string(),
+        Type::Array(inner) => format!("[{}]", type_name(inner)),
+        Type::Result(inner) => format!("{}!", type_name(inner)),
+        Type::Object(_) => "object".to_string(),
+        Type::Struct(name) => name.clone(),
+        Type::Enum(name) => name.clone(),
+        Type::Void => "void".to_string(),
+        Type::FunctionValue { .. } => "function".to_string(),
+        Type::Unknown => "unknown".to_string(),
     }
 }
 
@@ -1408,7 +1523,7 @@ fn block_may_return(body: &[Stmt]) -> bool {
 
 fn stmt_may_return(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::Return { .. } => true,
+        Stmt::Return { .. } | Stmt::Fail { .. } => true,
         Stmt::If {
             then_branch,
             else_branch,
@@ -1431,6 +1546,9 @@ fn stmt_span(stmt: &Stmt) -> Span {
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
         | Stmt::Function(FnDecl { span, .. })
+        | Stmt::Try { span, .. }
+        | Stmt::Fail { span, .. }
+        | Stmt::Panic { span, .. }
         | Stmt::Return { span, .. }
         | Stmt::Print { span, .. }
         | Stmt::Expr { span, .. } => *span,

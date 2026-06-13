@@ -16,7 +16,7 @@ use crate::{
     span::Span,
 };
 
-const KU_VERSION: &str = "0.0.4";
+const KU_VERSION: &str = "0.0.5";
 const MAX_SOURCE_BYTES: u64 = 1_000_000;
 const HELP: &str = "\
 ku - simple, small, fast language tool
@@ -719,7 +719,7 @@ fn rewrite_type_names_in_function(function: &mut FnDecl, rename_map: &HashMap<St
 
 fn rewrite_type_name(ty: &mut TypeName, rename_map: &HashMap<String, String>) {
     match ty {
-        TypeName::Array(inner) => rewrite_type_name(inner, rename_map),
+        TypeName::Array(inner) | TypeName::Result(inner) => rewrite_type_name(inner, rename_map),
         TypeName::Custom(name) => {
             if let Some(renamed) = rename_map.get(name) {
                 *name = renamed.clone();
@@ -784,6 +784,26 @@ fn rewrite_function_calls_in_stmt(
                 rewrite_function_calls_in_stmt(stmt, rename_map)?;
             }
             Ok(())
+        }
+        Stmt::Try {
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            for stmt in body {
+                rewrite_function_calls_in_stmt(stmt, rename_map)?;
+            }
+            for stmt in catch_body {
+                rewrite_function_calls_in_stmt(stmt, rename_map)?;
+            }
+            for stmt in finally_body {
+                rewrite_function_calls_in_stmt(stmt, rename_map)?;
+            }
+            Ok(())
+        }
+        Stmt::Fail { value, .. } | Stmt::Panic { value, .. } => {
+            rewrite_function_calls_in_expr(value, rename_map)
         }
         Stmt::Return { value, .. } => {
             if let Some(value) = value {
@@ -860,10 +880,14 @@ fn rewrite_function_calls_in_expr(
         ExprKind::Match { value, arms } => {
             rewrite_function_calls_in_expr(value, rename_map)?;
             for arm in arms {
+                if let Some(guard) = &mut arm.guard {
+                    rewrite_function_calls_in_expr(guard, rename_map)?;
+                }
                 rewrite_function_calls_in_expr(&mut arm.value, rename_map)?;
             }
             Ok(())
         }
+        ExprKind::TryUnwrap { expr } => rewrite_function_calls_in_expr(expr, rename_map),
         ExprKind::Function {
             params,
             return_type,
@@ -958,6 +982,26 @@ fn rewrite_namespaces_in_stmt(
             }
             Ok(())
         }
+        Stmt::Try {
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            for stmt in body {
+                rewrite_namespaces_in_stmt(stmt, namespaces)?;
+            }
+            for stmt in catch_body {
+                rewrite_namespaces_in_stmt(stmt, namespaces)?;
+            }
+            for stmt in finally_body {
+                rewrite_namespaces_in_stmt(stmt, namespaces)?;
+            }
+            Ok(())
+        }
+        Stmt::Fail { value, .. } | Stmt::Panic { value, .. } => {
+            rewrite_namespaces_in_expr(value, namespaces)
+        }
         Stmt::Return { value, .. } => {
             if let Some(value) = value {
                 rewrite_namespaces_in_expr(value, namespaces)?;
@@ -999,7 +1043,9 @@ fn rewrite_namespaced_type_name(
     namespaces: &HashMap<String, HashMap<String, String>>,
 ) {
     match ty {
-        TypeName::Array(inner) => rewrite_namespaced_type_name(inner, namespaces),
+        TypeName::Array(inner) | TypeName::Result(inner) => {
+            rewrite_namespaced_type_name(inner, namespaces)
+        }
         TypeName::Custom(name) => {
             if let Some(renamed) = namespace_lookup(name, namespaces) {
                 *name = renamed;
@@ -1080,10 +1126,14 @@ fn rewrite_namespaces_in_expr(
                         *enum_name = renamed;
                     }
                 }
+                if let Some(guard) = &mut arm.guard {
+                    rewrite_namespaces_in_expr(guard, namespaces)?;
+                }
                 rewrite_namespaces_in_expr(&mut arm.value, namespaces)?;
             }
             Ok(())
         }
+        ExprKind::TryUnwrap { expr } => rewrite_namespaces_in_expr(expr, namespaces),
         ExprKind::Function {
             params,
             return_type,

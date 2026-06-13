@@ -1,0 +1,15 @@
+fn load_config(): str! {
+    return ok(fs.try_read("missing-config.ku")?)
+}
+
+fn main() {
+    text = "empty"
+
+    try {
+        text = load_config()?
+    } catch (err) {
+        text = "using default config"
+    }
+
+    print(text)
+}

@@ -18,7 +18,7 @@ use crate::{
 };
 
 const MAX_STEPS: usize = 1_000_000;
-const MAX_CALL_DEPTH: usize = 64;
+const MAX_CALL_DEPTH: usize = 16;
 const MAX_READ_BYTES: u64 = 1_000_000;
 const MAX_EMBEDDED_SOURCE_BYTES: usize = 1_000_000;
 const MAX_EMBEDDED_TOKENS: usize = 100_000;
@@ -27,6 +27,7 @@ const MAX_AST_OUTPUT_BYTES: usize = 1_000_000;
 enum Flow {
     Continue,
     Return(Value),
+    Fail(Value),
 }
 
 pub struct Interpreter {
@@ -35,6 +36,8 @@ pub struct Interpreter {
     enums: HashMap<String, HashMap<String, usize>>,
     base_dir: PathBuf,
     steps: usize,
+    call_depth: usize,
+    pending_fail: Option<Value>,
 }
 
 impl Interpreter {
@@ -45,6 +48,8 @@ impl Interpreter {
             enums: HashMap::new(),
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             steps: 0,
+            call_depth: 0,
+            pending_fail: None,
         }
     }
 
@@ -85,7 +90,13 @@ impl Interpreter {
                 Item::Module(_) | Item::Import(_) => {}
             }
         }
-        self.call_function("main", Vec::new(), entry_span(), 0)?;
+        let result = self.call_function("main", Vec::new(), entry_span(), 0)?;
+        if let Value::Result { ok: false, value } = result {
+            return Err(KuError::runtime(
+                format!("unhandled recoverable error: {value}"),
+                entry_span(),
+            ));
+        }
         Ok(())
     }
 
@@ -96,7 +107,7 @@ impl Interpreter {
         span: Span,
         depth: usize,
     ) -> KuResult<Value> {
-        if depth > MAX_CALL_DEPTH {
+        if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
             return Err(KuError::runtime(
                 "maximum function call depth exceeded",
                 span,
@@ -107,26 +118,35 @@ impl Interpreter {
             .get(name)
             .cloned()
             .ok_or_else(|| KuError::runtime(format!("undefined function '{name}'"), span))?;
-        if function.params.len() != args.len() {
-            return Err(KuError::runtime(
-                format!(
-                    "function '{name}' expects {} arguments but got {}",
-                    function.params.len(),
-                    args.len()
-                ),
-                function.span,
-            ));
-        }
+        self.call_depth += 1;
+        let result = (|| -> KuResult<Value> {
+            if function.params.len() != args.len() {
+                return Err(KuError::runtime(
+                    format!(
+                        "function '{name}' expects {} arguments but got {}",
+                        function.params.len(),
+                        args.len()
+                    ),
+                    function.span,
+                ));
+            }
 
-        let mut env = Env::new();
-        for (param, value) in function.params.iter().zip(args) {
-            env.define(param.name.clone(), value, false, param.span)?;
-        }
+            let mut env = Env::new();
+            for (param, value) in function.params.iter().zip(args) {
+                env.define(param.name.clone(), value, false, param.span)?;
+            }
 
-        match self.exec_block(&function.body, &mut env, depth)? {
-            Flow::Continue => Ok(Value::Null),
-            Flow::Return(value) => Ok(value),
-        }
+            match self.exec_block(&function.body, &mut env, depth)? {
+                Flow::Continue => Ok(Value::Null),
+                Flow::Return(value) => Ok(value),
+                Flow::Fail(value) => Ok(Value::Result {
+                    ok: false,
+                    value: Box::new(value),
+                }),
+            }
+        })();
+        self.call_depth -= 1;
+        result
     }
 
     fn call_function_value(
@@ -138,34 +158,43 @@ impl Interpreter {
         span: Span,
         depth: usize,
     ) -> KuResult<Value> {
-        if depth > MAX_CALL_DEPTH {
+        if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
             return Err(KuError::runtime(
                 "maximum function call depth exceeded",
                 span,
             ));
         }
-        if params.len() != args.len() {
-            return Err(KuError::runtime(
-                format!(
-                    "function value expects {} arguments but got {}",
-                    params.len(),
-                    args.len()
-                ),
-                span,
-            ));
-        }
+        self.call_depth += 1;
+        let result = (|| -> KuResult<Value> {
+            if params.len() != args.len() {
+                return Err(KuError::runtime(
+                    format!(
+                        "function value expects {} arguments but got {}",
+                        params.len(),
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
 
-        let mut env = captured.clone();
-        env.push_scope();
-        for (param, value) in params.iter().zip(args) {
-            env.define(param.clone(), value, false, span)?;
-        }
+            let mut env = captured.clone();
+            env.push_scope();
+            for (param, value) in params.iter().zip(args) {
+                env.define(param.clone(), value, false, span)?;
+            }
 
-        let result = match self.exec_block(body, &mut env, depth)? {
-            Flow::Continue => Ok(Value::Null),
-            Flow::Return(value) => Ok(value),
-        };
-        env.pop_scope();
+            let result = match self.exec_block(body, &mut env, depth)? {
+                Flow::Continue => Ok(Value::Null),
+                Flow::Return(value) => Ok(value),
+                Flow::Fail(value) => Ok(Value::Result {
+                    ok: false,
+                    value: Box::new(value),
+                }),
+            };
+            env.pop_scope();
+            result
+        })();
+        self.call_depth -= 1;
         result
     }
 
@@ -173,7 +202,7 @@ impl Interpreter {
         env.push_scope();
         for stmt in body {
             let flow = self.exec_stmt(stmt, env, depth)?;
-            if let Flow::Return(_) = flow {
+            if matches!(flow, Flow::Return(_) | Flow::Fail(_)) {
                 env.pop_scope();
                 return Ok(flow);
             }
@@ -193,6 +222,9 @@ impl Interpreter {
                 ..
             } => {
                 let value = self.eval(value, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
                 env.define(
                     name.clone(),
                     value,
@@ -203,6 +235,9 @@ impl Interpreter {
             }
             Stmt::Assign { name, value, span } => {
                 let value = self.eval(value, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
                 if env.contains(name) {
                     env.assign(name, value, *span)?;
                 } else {
@@ -216,7 +251,13 @@ impl Interpreter {
                 span,
             } => {
                 let value = self.eval(value, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
                 self.assign_target(target, value, env, depth, *span)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
                 Ok(Flow::Continue)
             }
             Stmt::If {
@@ -238,8 +279,9 @@ impl Interpreter {
             } => {
                 while self.eval(condition, env, depth)?.is_truthy() {
                     self.tick(*span)?;
-                    if let Flow::Return(value) = self.exec_block(body, env, depth)? {
-                        return Ok(Flow::Return(value));
+                    match self.exec_block(body, env, depth)? {
+                        Flow::Continue => {}
+                        flow @ (Flow::Return(_) | Flow::Fail(_)) => return Ok(flow),
                     }
                 }
                 Ok(Flow::Continue)
@@ -266,7 +308,7 @@ impl Interpreter {
                     env.define(name.clone(), value, true, *span)?;
                     for stmt in body {
                         let flow = self.exec_stmt(stmt, env, depth)?;
-                        if let Flow::Return(_) = flow {
+                        if matches!(flow, Flow::Return(_) | Flow::Fail(_)) {
                             env.pop_scope();
                             return Ok(flow);
                         }
@@ -292,20 +334,67 @@ impl Interpreter {
                 )?;
                 Ok(Flow::Continue)
             }
+            Stmt::Try {
+                body,
+                catch_name,
+                catch_body,
+                finally_body,
+                span,
+            } => {
+                let mut flow = self.exec_block(body, env, depth)?;
+                if let Flow::Fail(value) = flow {
+                    if let Some(name) = catch_name {
+                        env.push_scope();
+                        env.define(name.clone(), value, false, *span)?;
+                        flow = Flow::Continue;
+                        for stmt in catch_body {
+                            flow = self.exec_stmt(stmt, env, depth)?;
+                            if matches!(flow, Flow::Return(_) | Flow::Fail(_)) {
+                                break;
+                            }
+                        }
+                        env.pop_scope();
+                    } else {
+                        flow = Flow::Fail(value);
+                    }
+                }
+                let finally_flow = self.exec_block(finally_body, env, depth)?;
+                if matches!(finally_flow, Flow::Return(_) | Flow::Fail(_)) {
+                    return Ok(finally_flow);
+                }
+                Ok(flow)
+            }
+            Stmt::Fail { value, .. } => {
+                let value = self.eval(value, env, depth)?;
+                Ok(Flow::Fail(value))
+            }
+            Stmt::Panic { value, span } => {
+                let value = self.eval(value, env, depth)?;
+                Err(KuError::runtime(format!("panic: {value}"), *span))
+            }
             Stmt::Return { value, .. } => {
                 let value = match value {
                     Some(value) => self.eval(value, env, depth)?,
                     None => Value::Null,
                 };
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
                 Ok(Flow::Return(value))
             }
             Stmt::Print { value, .. } => {
                 let value = self.eval(value, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
                 println!("{value}");
                 Ok(Flow::Continue)
             }
             Stmt::Expr { expr, .. } => {
                 self.eval(expr, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
                 Ok(Flow::Continue)
             }
         }
@@ -325,6 +414,9 @@ impl Interpreter {
             ExprKind::Variable(name) => env.get(name, expr.span),
             ExprKind::Unary { op, expr: right } => {
                 let value = self.eval(right, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 match (op, value) {
                     (UnaryOp::Negate, Value::Int(value)) => value
                         .checked_neg()
@@ -341,27 +433,51 @@ impl Interpreter {
             ExprKind::Binary { left, op, right } => {
                 if *op == BinaryOp::And {
                     let left = self.eval(left, env, depth)?;
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
                     if !left.is_truthy() {
                         return Ok(Value::Bool(false));
                     }
-                    return Ok(Value::Bool(self.eval(right, env, depth)?.is_truthy()));
+                    let right = self.eval(right, env, depth)?;
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
+                    return Ok(Value::Bool(right.is_truthy()));
                 }
                 if *op == BinaryOp::Or {
                     let left = self.eval(left, env, depth)?;
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
                     if left.is_truthy() {
                         return Ok(Value::Bool(true));
                     }
-                    return Ok(Value::Bool(self.eval(right, env, depth)?.is_truthy()));
+                    let right = self.eval(right, env, depth)?;
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
+                    return Ok(Value::Bool(right.is_truthy()));
                 }
                 let left = self.eval(left, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 let right = self.eval(right, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 eval_binary(*op, left, right, expr.span)
             }
             ExprKind::Call { callee, args } => {
-                let args = args
-                    .iter()
-                    .map(|arg| self.eval(arg, env, depth))
-                    .collect::<KuResult<Vec<_>>>()?;
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args {
+                    values.push(self.eval(arg, env, depth)?);
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
+                }
+                let args = values;
                 if let Some(value) =
                     eval_dotted_builtin(callee, &args, expr.span, env, &self.base_dir)?
                 {
@@ -382,7 +498,11 @@ impl Interpreter {
                         }
                     }
                 }
-                match self.eval(callee, env, depth)? {
+                let callee_value = self.eval(callee, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
+                match callee_value {
                     Value::Function {
                         params,
                         body,
@@ -406,14 +526,25 @@ impl Interpreter {
                 body: body.clone(),
                 env: env.clone(),
             }),
-            ExprKind::Array(values) => values
-                .iter()
-                .map(|value| self.eval(value, env, depth))
-                .collect::<KuResult<Vec<_>>>()
-                .map(Value::Array),
+            ExprKind::Array(values) => {
+                let mut result = Vec::with_capacity(values.len());
+                for value in values {
+                    result.push(self.eval(value, env, depth)?);
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
+                }
+                Ok(Value::Array(result))
+            }
             ExprKind::Index { target, index } => {
                 let target = self.eval(target, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 let index = self.eval(index, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 let Value::Array(values) = target else {
                     return Err(KuError::runtime(
                         format!("type error: cannot index {}", target.type_name()),
@@ -449,6 +580,9 @@ impl Interpreter {
                     }
                 }
                 let target = self.eval(target, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 match target {
                     Value::Struct {
                         name: struct_name,
@@ -472,6 +606,9 @@ impl Interpreter {
                 let mut values = HashMap::new();
                 for (field, value) in fields {
                     values.insert(field.clone(), self.eval(value, env, depth)?);
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
                 }
                 Ok(Value::Struct {
                     name: name.clone(),
@@ -482,15 +619,32 @@ impl Interpreter {
                 let mut values = HashMap::new();
                 for (field, value) in fields {
                     values.insert(field.clone(), self.eval(value, env, depth)?);
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
                 }
                 Ok(Value::Object(values))
             }
             ExprKind::Match { value, arms } => {
                 let value = self.eval(value, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 for arm in arms {
                     env.push_scope();
                     let matched = match_pattern(&arm.pattern, &value, env, arm.span)?;
                     if matched {
+                        if let Some(guard) = &arm.guard {
+                            let guard = self.eval(guard, env, depth)?;
+                            if self.pending_fail.is_some() {
+                                env.pop_scope();
+                                return Ok(Value::Null);
+                            }
+                            if !guard.is_truthy() {
+                                env.pop_scope();
+                                continue;
+                            }
+                        }
                         let result = self.eval(&arm.value, env, depth);
                         env.pop_scope();
                         return result;
@@ -502,7 +656,25 @@ impl Interpreter {
                     expr.span,
                 ))
             }
+            ExprKind::TryUnwrap { expr: inner } => {
+                let value = self.eval(inner, env, depth)?;
+                match value {
+                    Value::Result { ok: true, value } => Ok(*value),
+                    Value::Result { ok: false, value } => {
+                        self.pending_fail = Some(*value);
+                        Ok(Value::Null)
+                    }
+                    other => Err(KuError::runtime(
+                        format!("'?' expects result but got {}", other.type_name()),
+                        expr.span,
+                    )),
+                }
+            }
         }
+    }
+
+    fn take_pending_fail(&mut self) -> Option<Value> {
+        self.pending_fail.take()
     }
 
     fn construct_enum(
@@ -556,6 +728,9 @@ impl Interpreter {
                 })?;
                 let mut root_value = env.get(&root, target.span)?;
                 let index = self.eval(index, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(());
+                }
                 assign_index_value(&mut root_value, index, value, span)?;
                 env.assign(&root, root_value, span)
             }
@@ -628,6 +803,9 @@ impl Interpreter {
             let tokens = Lexer::new(&expr_source).tokenize()?;
             let expr = Parser::new(tokens).parse_expression_only()?;
             let value = self.eval_template_expr(&expr, env, depth)?;
+            if self.pending_fail.is_some() {
+                return Ok(String::new());
+            }
             output.push_str(&value.to_string());
         }
         Ok(output)
@@ -637,7 +815,13 @@ impl Interpreter {
         match &expr.kind {
             ExprKind::Binary { left, op, right } if *op == BinaryOp::Add => {
                 let left = self.eval_template_expr(left, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 let right = self.eval_template_expr(right, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 match eval_binary(*op, left.clone(), right.clone(), expr.span) {
                     Ok(value) => Ok(value),
                     Err(_) if can_template_concat_values(&left, &right) => {
@@ -648,11 +832,20 @@ impl Interpreter {
             }
             ExprKind::Binary { left, op, right } => {
                 let left = self.eval_template_expr(left, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 let right = self.eval_template_expr(right, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 eval_binary(*op, left, right, expr.span)
             }
             ExprKind::Unary { op, expr: right } => {
                 let value = self.eval_template_expr(right, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
                 match (op, value) {
                     (UnaryOp::Negate, Value::Int(value)) => value
                         .checked_neg()
@@ -699,6 +892,26 @@ fn eval_builtin(name: &str, args: &[Value], span: Span) -> KuResult<Option<Value
         "str" => {
             expect_value_arg_count(name, args.len(), 1, span)?;
             Ok(Some(Value::String(args[0].to_string())))
+        }
+        "ok" => {
+            expect_value_arg_count(name, args.len(), 1, span)?;
+            Ok(Some(Value::Result {
+                ok: true,
+                value: Box::new(args[0].clone()),
+            }))
+        }
+        "err" => {
+            expect_value_arg_count(name, args.len(), 1, span)?;
+            let Value::String(message) = &args[0] else {
+                return Err(KuError::runtime(
+                    format!("type error: expected str but got {}", args[0].type_name()),
+                    span,
+                ));
+            };
+            Ok(Some(Value::Result {
+                ok: false,
+                value: Box::new(Value::String(message.clone())),
+            }))
         }
         _ => Ok(None),
     }
@@ -866,6 +1079,46 @@ fn eval_dotted_builtin(
                 KuError::runtime(format!("failed to read '{display_path}': {err}"), span)
             })?;
             Ok(Some(Value::String(text)))
+        }
+        ("fs", "try_read") => {
+            expect_value_arg_count("fs.try_read", args.len(), 1, span)?;
+            let Value::String(path) = &args[0] else {
+                return Err(KuError::runtime(
+                    format!("type error: expected str but got {}", args[0].type_name()),
+                    span,
+                ));
+            };
+            let resolved = resolve_read_path(base_dir, path);
+            let display_path = resolved.display().to_string();
+            let metadata = match fs::metadata(&resolved) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    return Ok(Some(Value::Result {
+                        ok: false,
+                        value: Box::new(Value::String(format!(
+                            "failed to read '{display_path}': {err}"
+                        ))),
+                    }));
+                }
+            };
+            if metadata.len() > MAX_READ_BYTES {
+                return Err(KuError::runtime(
+                    format!("failed to read '{display_path}': file is too large"),
+                    span,
+                ));
+            }
+            match fs::read_to_string(&resolved) {
+                Ok(text) => Ok(Some(Value::Result {
+                    ok: true,
+                    value: Box::new(Value::String(text)),
+                })),
+                Err(err) => Ok(Some(Value::Result {
+                    ok: false,
+                    value: Box::new(Value::String(format!(
+                        "failed to read '{display_path}': {err}"
+                    ))),
+                })),
+            }
         }
         ("lexer", "scan") => {
             expect_value_arg_count("lexer.scan", args.len(), 1, span)?;
@@ -1084,6 +1337,9 @@ fn stmt_span(stmt: &Stmt) -> Span {
         | Stmt::For { span, .. }
         | Stmt::Function(FnDecl { span, .. })
         | Stmt::Return { span, .. }
+        | Stmt::Try { span, .. }
+        | Stmt::Fail { span, .. }
+        | Stmt::Panic { span, .. }
         | Stmt::Print { span, .. }
         | Stmt::Expr { span, .. } => *span,
     }

@@ -101,8 +101,8 @@ fn version_flags_print_v002() {
         assert!(!result.timed_out, "version command timed out");
         assert_eq!(result.code, Some(0), "version command failed: {flag}");
         assert!(
-            result.stdout.trim().contains("0.0.4"),
-            "version output should contain 0.0.4\nstdout:\n{}\nstderr:\n{}",
+            result.stdout.trim().contains("0.0.5"),
+            "version output should contain 0.0.5\nstdout:\n{}\nstderr:\n{}",
             result.stdout,
             result.stderr
         );

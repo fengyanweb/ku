@@ -59,6 +59,7 @@ impl<'a> Lexer<'a> {
                 '-' => TokenKind::Minus,
                 '*' => TokenKind::Star,
                 '%' => TokenKind::Percent,
+                '?' => TokenKind::Question,
                 '!' => {
                     if self.match_char('=') {
                         TokenKind::BangEqual
@@ -360,6 +361,11 @@ impl<'a> Lexer<'a> {
             "in" => TokenKind::In,
             "match" => TokenKind::Match,
             "switch" => TokenKind::Switch,
+            "try" => TokenKind::Try,
+            "catch" => TokenKind::Catch,
+            "finally" => TokenKind::Finally,
+            "fail" => TokenKind::Fail,
+            "panic" => TokenKind::Panic,
             "return" => TokenKind::Return,
             "print" => TokenKind::Print,
             "true" => TokenKind::True,

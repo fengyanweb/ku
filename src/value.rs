@@ -20,6 +20,10 @@ pub enum Value {
         variant: String,
         fields: Vec<Value>,
     },
+    Result {
+        ok: bool,
+        value: Box<Value>,
+    },
     Function {
         params: Vec<String>,
         body: Vec<Stmt>,
@@ -47,6 +51,7 @@ impl Value {
             Value::Object(_) => "object",
             Value::Struct { .. } => "struct",
             Value::Enum { .. } => "enum",
+            Value::Result { .. } => "result",
             Value::Function { .. } => "function",
             Value::Null => "null",
         }
@@ -112,6 +117,13 @@ impl fmt::Display for Value {
                 }
                 Ok(())
             }
+            Value::Result { ok, value } => {
+                if *ok {
+                    write!(f, "Ok({value})")
+                } else {
+                    write!(f, "Err({value})")
+                }
+            }
             Value::Function { .. } => write!(f, "<function>"),
             Value::Null => write!(f, "null"),
         }
@@ -153,6 +165,16 @@ impl PartialEq for Value {
                     && left_variant == right_variant
                     && left_fields == right_fields
             }
+            (
+                Value::Result {
+                    ok: left_ok,
+                    value: left_value,
+                },
+                Value::Result {
+                    ok: right_ok,
+                    value: right_value,
+                },
+            ) => left_ok == right_ok && left_value == right_value,
             (Value::Function { .. }, Value::Function { .. }) => false,
             (Value::Null, Value::Null) => true,
             _ => false,

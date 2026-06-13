@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.4`，重点是把基础语法、类型、函数、模块和错误提示先做扎实。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.5`，重点是把可恢复错误、`?` 传播、`try/catch/finally` 和资源保护闭环做扎实。
 
 ## 快速开始
 
@@ -32,7 +32,7 @@ ku -h | -help         Print help
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.4 支持的核心语法
+## 0.0.5 支持的核心语法
 
 ```ku
 struct User {
@@ -66,6 +66,28 @@ fn main() {
 
     print(text)
     print(greet(user.name))
+}
+```
+
+可恢复错误使用 `T!`、`?`、`try/catch/finally`、`fail`：
+
+```ku
+fn read_name(): str! {
+    fail "name missing"
+}
+
+fn main() {
+    message = "none"
+
+    try {
+        message = read_name()?
+    } catch (err) {
+        message = "caught: " + err
+    } finally {
+        print("cleanup")
+    }
+
+    print(message)
 }
 ```
 
@@ -118,11 +140,14 @@ enum.ku
 object.ku
 imports.ku
 compiler_pipeline.ku
+result.ku
+try_read.ku
 ```
 
 ## 文档
 
-- [0.0.4 语法草案](docs/syntax.md)
+- [0.0.5 语法草案](docs/syntax.md)
+- [0.0.5 版本记录](docs/v0.0.5.md)
 - [0.0.4 版本记录](docs/v0.0.4.md)
 - [0.0.3 版本记录](docs/v0.0.3.md)
 
@@ -135,9 +160,8 @@ compiler_pipeline.ku
 ```txt
 包管理
 async / await
-try / catch / result 错误处理语法
-native 后端
-引用捕获闭包
+native C / LLVM 后端
+引用捕获闭包和闭包修改外层变量
 复杂嵌套模式和 match 穷尽性检查
 ```
 

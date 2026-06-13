@@ -79,6 +79,7 @@ pub enum TypeName {
     String,
     Null,
     Array(Box<TypeName>),
+    Result(Box<TypeName>),
     Custom(String),
 }
 
@@ -119,6 +120,21 @@ pub enum Stmt {
         span: Span,
     },
     Function(FnDecl),
+    Try {
+        body: Vec<Stmt>,
+        catch_name: Option<String>,
+        catch_body: Vec<Stmt>,
+        finally_body: Vec<Stmt>,
+        span: Span,
+    },
+    Fail {
+        value: Expr,
+        span: Span,
+    },
+    Panic {
+        value: Expr,
+        span: Span,
+    },
     Return {
         value: Option<Expr>,
         span: Span,
@@ -189,6 +205,9 @@ pub enum ExprKind {
         value: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+    TryUnwrap {
+        expr: Box<Expr>,
+    },
     Function {
         params: Vec<FunctionParam>,
         return_type: Option<TypeName>,
@@ -199,6 +218,7 @@ pub enum ExprKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
     pub pattern: MatchPattern,
+    pub guard: Option<Expr>,
     pub value: Expr,
     pub span: Span,
 }

@@ -1,0 +1,17 @@
+fn read_name(): str! {
+    fail "name missing"
+}
+
+fn main() {
+    message = "none"
+
+    try {
+        message = read_name()?
+    } catch (err) {
+        message = "caught: " + err
+    } finally {
+        print("cleanup")
+    }
+
+    print(message)
+}

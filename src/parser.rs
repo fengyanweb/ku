@@ -267,11 +267,11 @@ impl Parser {
         if self.match_kind(&TokenKind::LBracket) {
             let inner = self.type_name()?;
             self.consume(&TokenKind::RBracket, "expected ']' after array type")?;
-            return Ok(TypeName::Array(Box::new(inner)));
+            return self.finish_type_name(TypeName::Array(Box::new(inner)));
         }
         let token = self.advance().clone();
-        match token.kind {
-            TokenKind::Ident(name) => Ok(match name.as_str() {
+        let ty = match token.kind {
+            TokenKind::Ident(name) => match name.as_str() {
                 "int" => TypeName::Int,
                 "float" => TypeName::Float,
                 "bool" => TypeName::Bool,
@@ -286,9 +286,18 @@ impl Parser {
                     }
                     TypeName::Custom(name)
                 }
-            }),
-            TokenKind::Null => Ok(TypeName::Null),
-            _ => Err(KuError::parse("expected type name", token.span)),
+            },
+            TokenKind::Null => TypeName::Null,
+            _ => return Err(KuError::parse("expected type name", token.span)),
+        };
+        self.finish_type_name(ty)
+    }
+
+    fn finish_type_name(&mut self, ty: TypeName) -> KuResult<TypeName> {
+        if self.match_kind(&TokenKind::Bang) {
+            Ok(TypeName::Result(Box::new(ty)))
+        } else {
+            Ok(ty)
         }
     }
 
@@ -327,10 +336,19 @@ impl Parser {
             self.optional_semicolon();
             return Ok(stmt);
         }
+        if self.match_kind(&TokenKind::Try) {
+            return self.try_statement();
+        }
         if self.check(&TokenKind::Fn) {
             let function = self.function()?;
             self.optional_semicolon();
             return Ok(Stmt::Function(function));
+        }
+        if self.match_kind(&TokenKind::Fail) {
+            return self.fail_statement();
+        }
+        if self.match_kind(&TokenKind::Panic) {
+            return self.panic_statement();
         }
         if self.match_kind(&TokenKind::Return) {
             return self.return_statement();
@@ -408,6 +426,64 @@ impl Parser {
             .map_or(self.previous().span.end, |expr| expr.span.end);
         Ok(Stmt::Return {
             value,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn fail_statement(&mut self) -> KuResult<Stmt> {
+        let start = self.previous().span.start;
+        let value = self.expression()?;
+        self.optional_semicolon();
+        let end = value.span.end;
+        Ok(Stmt::Fail {
+            value,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn panic_statement(&mut self) -> KuResult<Stmt> {
+        let start = self.previous().span.start;
+        let value = self.expression()?;
+        self.optional_semicolon();
+        let end = value.span.end;
+        Ok(Stmt::Panic {
+            value,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn try_statement(&mut self) -> KuResult<Stmt> {
+        let start = self.previous().span.start;
+        let (body, body_span) = self.block()?;
+        let mut catch_name = None;
+        let mut catch_body = Vec::new();
+        let mut finally_body = Vec::new();
+        let mut end = body_span.end;
+        if self.match_kind(&TokenKind::Catch) {
+            self.consume(&TokenKind::LParen, "expected '(' after 'catch'")?;
+            let (name, _) = self.consume_ident("expected catch error name")?;
+            self.consume(&TokenKind::RParen, "expected ')' after catch error name")?;
+            let (body, span) = self.block()?;
+            catch_name = Some(name);
+            catch_body = body;
+            end = span.end;
+        }
+        if self.match_kind(&TokenKind::Finally) {
+            let (body, span) = self.block()?;
+            finally_body = body;
+            end = span.end;
+        }
+        if catch_name.is_none() && finally_body.is_empty() {
+            return Err(KuError::parse(
+                "try requires catch or finally",
+                Span::new(start, end),
+            ));
+        }
+        Ok(Stmt::Try {
+            body,
+            catch_name,
+            catch_body,
+            finally_body,
             span: Span::new(start, end),
         })
     }
@@ -676,6 +752,14 @@ impl Parser {
                     },
                     span,
                 );
+            } else if self.match_kind(&TokenKind::Question) {
+                let span = expr.span.merge(self.previous().span);
+                expr = Expr::new(
+                    ExprKind::TryUnwrap {
+                        expr: Box::new(expr),
+                    },
+                    span,
+                );
             } else if self.check(&TokenKind::LBrace)
                 && self.is_struct_literal_after_lbrace()
                 && matches!(expr.kind, ExprKind::Field { target: _, name: _ })
@@ -838,11 +922,17 @@ impl Parser {
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
             let arm_start = self.peek().span;
             let pattern = self.match_pattern()?;
+            let guard = if self.match_kind(&TokenKind::If) {
+                Some(self.expression()?)
+            } else {
+                None
+            };
             self.consume(&TokenKind::Arrow, "expected '=>' after match pattern")?;
             let value = self.expression()?;
             let span = Span::new(arm_start.start, value.span.end);
             arms.push(MatchArm {
                 pattern,
+                guard,
                 value,
                 span,
             });
@@ -1066,6 +1156,9 @@ fn stmt_span(stmt: &Stmt) -> Span {
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
         | Stmt::Function(FnDecl { span, .. })
+        | Stmt::Try { span, .. }
+        | Stmt::Fail { span, .. }
+        | Stmt::Panic { span, .. }
         | Stmt::Return { span, .. }
         | Stmt::Print { span, .. }
         | Stmt::Expr { span, .. } => *span,
@@ -1105,7 +1198,9 @@ fn default_expr(ty: &TypeName, span: Span) -> Expr {
         TypeName::Bool => ExprKind::Literal(Literal::Bool(false)),
         TypeName::String => ExprKind::Literal(Literal::String(String::new())),
         TypeName::Array(_) => ExprKind::Array(Vec::new()),
-        TypeName::Null | TypeName::Custom(_) => ExprKind::Literal(Literal::Null),
+        TypeName::Result(_) | TypeName::Null | TypeName::Custom(_) => {
+            ExprKind::Literal(Literal::Null)
+        }
     };
     Expr::new(kind, span)
 }
