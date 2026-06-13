@@ -21,7 +21,7 @@ fn main() {
     print(string.contains(text, "Lang"))
     print(string.starts_with(text, "Ku"))
     print(string.ends_with(text, "Lang"))
-    print(string.replace(text, "Lang", "0.0.7"))
+    print(string.replace(text, "Lang", "0.0.8"))
 
     nums:[int] = [1, 2]
     nums = array.push(nums, 3)

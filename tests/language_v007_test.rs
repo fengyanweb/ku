@@ -167,6 +167,10 @@ fn main() {
         main.to_string_lossy().to_string(),
     ])
     .expect("package root import should check");
+    assert!(
+        package.cache_dir.exists(),
+        "package cache directory should be created"
+    );
 
     let outside = dir.join("outside.ku");
     fs::write(&outside, "fn Value(): int { return 1 }").expect("write outside");
@@ -211,5 +215,30 @@ fn main() {
     let ir = ir::lower_program(&program).expect("lower ir");
     let text = ir.to_string();
     assert!(text.contains("fn add(a: int, b: int) -> int"));
+    assert!(text.contains("let result: int = a + b"));
     assert!(text.contains("return result"));
+}
+
+#[test]
+fn ir_lowering_emits_typed_cfg_and_lvalues() {
+    let source = r#"
+fn main() {
+    values:[int] = [1, 2]
+    values[0] = 9
+    if (values[0] > 1) {
+        print(values[0])
+    } else {
+        print(0)
+    }
+}
+"#;
+    let tokens = Lexer::new(source).tokenize().expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let text = ir::lower_program(&program).expect("lower ir").to_string();
+
+    assert!(text.contains("let values: [int] = [1, 2]"));
+    assert!(text.contains("store values[0] = 9"));
+    assert!(text.contains("branch values[0] > 1 ? block"));
+    assert!(text.contains("jump block"));
 }

@@ -329,7 +329,11 @@ fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
                 Span::default(),
             ));
         }
-        let mut loader = ModuleLoader::new(package::discover_for_file(path)?);
+        let package = package::discover_for_file(path)?;
+        if let Some(package) = &package {
+            package::ensure_cache_dir(package)?;
+        }
+        let mut loader = ModuleLoader::new(package);
         loader.load_entry(path, program)?
     } else {
         program

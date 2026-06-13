@@ -1,7 +1,7 @@
 fn main() {
     text = string.trim("  Ku Lang  ")
     print(string.upper(text))
-    print(string.replace(text, "Lang", "0.0.7"))
+    print(string.replace(text, "Lang", "0.0.8"))
 
     nums:[int] = [1, 2]
     nums = array.push(nums, 3)

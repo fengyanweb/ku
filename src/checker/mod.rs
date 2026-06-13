@@ -1215,6 +1215,9 @@ impl Checker {
                 arg_types.push(actual.clone());
             }
         }
+        if let Some(return_type) = return_type {
+            return Ok(return_type.clone());
+        }
         self.check_function_value_body(params, return_type, body, &arg_types, span)
     }
 

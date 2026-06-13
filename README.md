@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.7`，重点是收紧 stdlib 类型签名、补 Result 风格标准库能力，并开始固定 package 和 IR 边界。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.8`，重点是闭包引用捕获前置、修正本地递归函数闭环，并把 IR 推进到 typed CFG 草案。
 
 ## 快速开始
 
@@ -33,7 +33,7 @@ ku -h | -help         Print help
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.7 支持的核心语法
+## 0.0.8 支持的核心语法
 
 ```ku
 struct User {
@@ -64,6 +64,7 @@ fn main() {
     greet = (name) => {
         return prefix + name
     }
+    prefix = "Hi "
 
     print(text)
     print(greet(user.name))
@@ -161,7 +162,8 @@ package/
 
 ## 文档
 
-- [0.0.7 语法草案](docs/syntax.md)
+- [0.0.8 语法草案](docs/syntax.md)
+- [0.0.8 版本记录](docs/v0.0.8.md)
 - [0.0.7 版本记录](docs/v0.0.7.md)
 - [Package 草案](docs/package.md)
 - [IR 草案](docs/ir.md)
@@ -180,17 +182,17 @@ package/
 ```txt
 async / await
 native C / LLVM 后端
-引用捕获闭包和闭包修改外层变量
+闭包自由变量精确捕获和循环引用治理
 复杂嵌套模式和 match 穷尽性检查
 ```
 
-已评估但暂不完整进入 0.0.7 的能力：
+已评估但暂不完整进入 0.0.8 的能力：
 
 ```txt
 包管理：已有 ku.mod/import root/cache 草案；远程包、版本解析、lockfile 还没有做。
 async / await：需要事件循环或任务模型，不能只加关键字。
-native C / LLVM 后端：已有 IR 草案；类型布局、运行时 ABI 和 stdlib ABI 还没有做。
-引用捕获闭包：会改变 Env/Value 的所有权模型，需要单独版本做。
+native C / LLVM 后端：已有 typed CFG IR 草案；类型布局、运行时 ABI 和 stdlib ABI 还没有做。
+引用捕获闭包：已完成共享绑定第一刀，后续还要做自由变量精确捕获和 Rc 循环治理。
 match 穷尽性：需要完整类型和模式矩阵，不适合混在 stdlib 拆分里。
 ```
 

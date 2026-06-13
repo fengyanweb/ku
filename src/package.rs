@@ -84,6 +84,15 @@ pub fn default_global_cache() -> PathBuf {
         .join("cache")
 }
 
+pub fn ensure_cache_dir(package: &PackageContext) -> KuResult<()> {
+    fs::create_dir_all(&package.cache_dir).map_err(|err| {
+        KuError::message(format!(
+            "failed to create package cache '{}': {err}",
+            package.cache_dir.display()
+        ))
+    })
+}
+
 pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
     let mut name = None;
     let mut root = None;

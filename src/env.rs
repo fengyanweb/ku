@@ -1,5 +1,7 @@
 ﻿use std::collections::HashMap;
 
+use std::{cell::RefCell, rc::Rc};
+
 use crate::error::{KuError, KuResult};
 use crate::span::Span;
 use crate::value::Value;
@@ -10,9 +12,11 @@ pub struct Binding {
     pub mutable: bool,
 }
 
+type BindingCell = Rc<RefCell<Binding>>;
+
 #[derive(Debug, Clone)]
 pub struct Env {
-    scopes: Vec<HashMap<String, Binding>>,
+    scopes: Vec<HashMap<String, BindingCell>>,
 }
 
 impl Env {
@@ -49,13 +53,41 @@ impl Env {
                 span,
             ));
         }
-        scope.insert(name, Binding { value, mutable });
+        scope.insert(name, Rc::new(RefCell::new(Binding { value, mutable })));
+        Ok(())
+    }
+
+    pub fn define_with_env(
+        &mut self,
+        name: String,
+        mutable: bool,
+        span: Span,
+        make_value: impl FnOnce(Env) -> Value,
+    ) -> KuResult<()> {
+        let scope = self
+            .scopes
+            .last_mut()
+            .expect("environment always has a scope");
+        if scope.contains_key(&name) {
+            return Err(KuError::runtime(
+                format!("variable '{}' is already defined in this scope", name),
+                span,
+            ));
+        }
+        let cell = Rc::new(RefCell::new(Binding {
+            value: Value::Null,
+            mutable: true,
+        }));
+        scope.insert(name, cell.clone());
+        let value = make_value(self.clone());
+        *cell.borrow_mut() = Binding { value, mutable };
         Ok(())
     }
 
     pub fn assign(&mut self, name: &str, value: Value, span: Span) -> KuResult<()> {
         for scope in self.scopes.iter_mut().rev() {
-            if let Some(binding) = scope.get_mut(name) {
+            if let Some(binding) = scope.get(name) {
+                let mut binding = binding.borrow_mut();
                 if !binding.mutable {
                     return Err(KuError::runtime(
                         format!("cannot assign to immutable variable '{}'", name),
@@ -82,7 +114,7 @@ impl Env {
     pub fn get(&self, name: &str, span: Span) -> KuResult<Value> {
         for scope in self.scopes.iter().rev() {
             if let Some(binding) = scope.get(name) {
-                return Ok(binding.value.clone());
+                return Ok(binding.borrow().value.clone());
             }
         }
         Err(KuError::runtime(

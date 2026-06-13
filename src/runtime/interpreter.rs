@@ -328,20 +328,19 @@ impl Interpreter {
                 Ok(Flow::Continue)
             }
             Stmt::Function(function) => {
-                env.define(
-                    function.name.clone(),
+                let params = function
+                    .params
+                    .iter()
+                    .map(|param| param.name.clone())
+                    .collect::<Vec<_>>();
+                let body = function.body.clone();
+                env.define_with_env(function.name.clone(), false, function.span, |captured| {
                     Value::Function {
-                        params: function
-                            .params
-                            .iter()
-                            .map(|param| param.name.clone())
-                            .collect(),
-                        body: function.body.clone(),
-                        env: env.clone(),
-                    },
-                    false,
-                    function.span,
-                )?;
+                        params,
+                        body,
+                        env: captured,
+                    }
+                })?;
                 Ok(Flow::Continue)
             }
             Stmt::Try {

@@ -427,7 +427,7 @@ fn main() {
 }
 
 #[test]
-fn closures_capture_outer_locals_by_value() {
+fn closures_capture_outer_locals_by_reference() {
     let source = r#"
 fn main() {
     prefix = "Hi "
@@ -443,11 +443,43 @@ fn main() {
     }
     base = 20
     print(add(5))
+
+    count = 0
+    inc = () => {
+        count = count + 1
+        return count
+    }
+    inc()
+    inc()
+    if (count != 2) {
+        panic("closure did not update outer variable")
+    }
 }
 "#;
 
     check_source("inline.ku", source).expect("closures should check");
     run_source("inline.ku", source).expect("closures should run");
+}
+
+#[test]
+fn local_function_can_call_itself() {
+    let source = r#"
+fn main() {
+    fn fact(n: int): int {
+        if (n <= 1) {
+            return 1
+        }
+        return n * fact(n - 1)
+    }
+    value = fact(5)
+    if (value != 120) {
+        panic("local recursion failed")
+    }
+}
+"#;
+
+    check_source("inline.ku", source).expect("local recursive function should check");
+    run_source("inline.ku", source).expect("local recursive function should run");
 }
 
 #[test]
