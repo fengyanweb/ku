@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.10`，重点是运行时精确闭包捕获、Result 显式 CFG、package lock 依赖记录和 native C 后端 if/while/int 子集。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.11`，重点是 Result ABI、`try/catch/finally` 的错误 CFG 边、package 文件依赖缓存和更严格的 match 诊断。
 
 ## 快速开始
 
@@ -29,13 +29,15 @@ ku ir <file.ku>       Print checked Ku IR draft
 ku build <file.ku>    Build a runnable executable wrapper
 ku build --native <file.ku>
                       Emit prototype native C source
+ku package gc <file.ku>
+                      Remove unused package cache entries for a package
 ku version            Print version
 ku -h | -help         Print help
 ```
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.10 支持的核心语法
+## 0.0.11 支持的核心语法
 
 ```ku
 struct User {
@@ -95,7 +97,7 @@ fn main() {
 }
 ```
 
-当前基础类型固定为：
+基础类型固定为：
 
 ```txt
 int
@@ -107,7 +109,7 @@ null
 
 Ku 不使用 `let` / `let mut`。首次赋值即声明变量，带类型写作 `name:type = value`。
 
-## 模块导入
+## 模块和 Package
 
 导出规则：顶层名字首字母大写对包外可见，小写只在当前文件内部使用。
 
@@ -129,18 +131,26 @@ fn main() {
 }
 ```
 
-有 `ku.mod` 时可以固定本地 package import root：
+有 `ku.mod` 时可以固定本地 package import root，也可以声明 `file://` 依赖：
 
 ```txt
 name = "demo_pkg"
 version = "0.1.0"
 root = "src"
 cache = ".ku/cache"
+
+dep.util = "1.0.0"
+dep.util.source = "file://C:/work/util"
+dep.util.checksum = "ku-fnv64-..."
 ```
 
 ```ku
 import { Value } from "util"
+import { Value as RemoteValue } from "@util/util"
 ```
+
+`ku check` / `ku run` 会把 file dependency 放进 `<package>/.ku/cache/packages/<name>/<version>/`，并把 package dependency 写进 `ku.lock`。`ku package gc <file.ku>` 会清理 manifest 当前依赖之外的缓存版本。
+`dep.<name>.checksum` 必须是 `ku-fnv64-` 加 16 位十六进制；未写 checksum 的 file dependency 会在 source 内容变化后刷新 cache。
 
 ## 示例
 
@@ -165,7 +175,8 @@ package/
 
 ## 文档
 
-- [0.0.10 语法草案](docs/syntax.md)
+- [0.0.11 语法草案](docs/syntax.md)
+- [0.0.11 版本记录](docs/v0.0.11.md)
 - [0.0.10 版本记录](docs/v0.0.10.md)
 - [0.0.9 版本记录](docs/v0.0.9.md)
 - [0.0.8 版本记录](docs/v0.0.8.md)
@@ -182,25 +193,26 @@ package/
 
 `ku build` 当前生成解释器打包型可执行文件。
 
-`ku build --native` 当前输出 prototype C 源码，只覆盖 int/bool/str、局部变量、直接函数调用、print、return、if 和 while。复杂语法会清楚报不支持，还不是完整 native C / LLVM 后端。
+`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、局部变量、直接函数调用、`print`、`return`、`if`、`while`，以及 `Result<int|bool|str, str>` 的 `ok` / `err` / `?` / 错误传播。数组、struct、enum、闭包、match、try/catch 的 native lowering 仍会明确报不支持。
 
-暂未完成：
+已完成到 0.0.11 的关键前置：
+
+```txt
+运行时闭包使用精确 capture map，不再把整个 Env 存进函数值。
+IR 已有 ResultBranch / BindOk / JumpErr / PropagateErr。
+native C 后端已有 Result<int|bool|str,str> ABI 子集。
+package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
+match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
+```
+
+仍未完成：
 
 ```txt
 async / await
-完整 native C / LLVM 后端
-复杂嵌套模式、match guard 模式矩阵和完整穷尽性检查
-远程 package、版本解析、下载校验和缓存淘汰
-```
-
-已评估但暂不完整进入 0.0.10 的能力：
-
-```txt
-包管理：已有 ku.mod/import root/cache/version/ku.lock 依赖列表和 import cache key；远程包、版本解析、下载校验和缓存淘汰还没有做。
-async / await：需要事件循环或任务模型，不能只加关键字。
-native C / LLVM 后端：已有 typed temp IR、layout table、stdlib ABI metadata、Result 显式 CFG 和 prototype C 源码输出；完整 Result、闭包、struct/enum ABI 和 LLVM 还没有做。
-引用捕获闭包：运行时已改成 capture map，递归 self binding 不再保存整个 Env；后续如果做跨线程/异步闭包，再评估 Weak/arena 模型。
-match 穷尽性：enum 顶层 variant 已做基础穷尽性检查；复杂嵌套模式和 guard 模式矩阵还没有做。
+LLVM 后端
+HTTP/registry package、真正语义版本求解、网络下载和强校验
+复杂嵌套模式、match guard 完整模式矩阵和穷尽性检查
+完整 native C 后端
 ```
 
 ## 开发验证

@@ -942,10 +942,11 @@ impl Checker {
         }
         let value_type = self.check_expr(value)?;
         let mut result_type = Type::Unknown;
-        let mut saw_wildcard = false;
+        let mut saw_unguarded_wildcard = false;
         let mut covered_variants = HashSet::new();
+        let mut covered_literals = HashSet::new();
         for arm in arms {
-            if saw_wildcard {
+            if saw_unguarded_wildcard {
                 return Err(KuError::runtime(
                     "match arm after '_' is unreachable",
                     arm.span,
@@ -953,12 +954,24 @@ impl Checker {
             }
             self.push_scope();
             match &arm.pattern {
-                MatchPattern::Wildcard => saw_wildcard = true,
+                MatchPattern::Wildcard if arm.guard.is_none() => saw_unguarded_wildcard = true,
+                MatchPattern::Wildcard => {}
                 MatchPattern::Literal(literal) => {
                     let literal_type = type_of_literal(literal);
                     if !type_matches(&value_type, &literal_type) {
                         self.pop_scope();
                         return Err(type_error(arm.span, &value_type, &literal_type));
+                    }
+                    let key = literal_key(literal);
+                    if covered_literals.contains(&key) {
+                        self.pop_scope();
+                        return Err(KuError::runtime(
+                            "match literal arm is unreachable",
+                            arm.span,
+                        ));
+                    }
+                    if arm.guard.is_none() {
+                        covered_literals.insert(key);
                     }
                 }
                 MatchPattern::EnumVariant {
@@ -1002,12 +1015,15 @@ impl Checker {
                     for (binding, ty) in bindings.iter().zip(payload) {
                         self.define(binding.clone(), ty, false, arm.span)?;
                     }
-                    if arm.guard.is_none() && !covered_variants.insert(variant.clone()) {
+                    if covered_variants.contains(variant) {
                         self.pop_scope();
                         return Err(KuError::runtime(
                             format!("match arm for '{enum_name}.{variant}' is unreachable"),
                             arm.span,
                         ));
+                    }
+                    if arm.guard.is_none() {
+                        covered_variants.insert(variant.clone());
                     }
                 }
             }
@@ -1027,7 +1043,7 @@ impl Checker {
                 return Err(type_error(arm.value.span, &result_type, &actual));
             }
         }
-        if !saw_wildcard {
+        if !saw_unguarded_wildcard {
             if let Type::Enum(enum_name) = &value_type {
                 let Some(enum_type) = self.enums.get(enum_name) else {
                     return Err(KuError::runtime(
@@ -1545,6 +1561,16 @@ fn type_of_literal(literal: &Literal) -> Type {
         Literal::Bool(_) => Type::Bool,
         Literal::String(_) | Literal::TemplateString(_) => Type::String,
         Literal::Null => Type::Null,
+    }
+}
+
+fn literal_key(literal: &Literal) -> String {
+    match literal {
+        Literal::Int(value) => format!("int:{value}"),
+        Literal::Float(value) => format!("float:{value:?}"),
+        Literal::Bool(value) => format!("bool:{value}"),
+        Literal::String(value) | Literal::TemplateString(value) => format!("str:{value}"),
+        Literal::Null => "null".to_string(),
     }
 }
 

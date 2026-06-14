@@ -11,6 +11,7 @@ use crate::{
 pub fn generate_c_source(program: &IrProgram) -> KuResult<String> {
     reject_layouts(program)?;
     let mut out = String::from("#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n\n");
+    emit_result_abi(&mut out, program)?;
     for function in &program.functions {
         emit_function(&mut out, function)?;
         out.push('\n');
@@ -41,7 +42,7 @@ fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
     }
     out.push_str(") {\n");
     for block in &function.blocks {
-        emit_block(out, block)?;
+        emit_block(out, block, &function.return_type)?;
     }
     if function.return_type == IrType::Void {
         out.push_str("  return;\n");
@@ -50,17 +51,17 @@ fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
     Ok(())
 }
 
-fn emit_block(out: &mut String, block: &IrBlock) -> KuResult<()> {
+fn emit_block(out: &mut String, block: &IrBlock, return_type: &IrType) -> KuResult<()> {
     if block.id.0 != 0 {
         out.push_str(&format!("block{}:;\n", block.id.0));
     }
     for inst in &block.instructions {
-        emit_inst(out, inst)?;
+        emit_inst(out, inst, return_type)?;
     }
-    emit_terminator(out, &block.terminator)
+    emit_terminator(out, &block.terminator, return_type)
 }
 
-fn emit_inst(out: &mut String, inst: &IrInst) -> KuResult<()> {
+fn emit_inst(out: &mut String, inst: &IrInst, return_type: &IrType) -> KuResult<()> {
     match inst {
         IrInst::Temp { id, ty, value } => {
             out.push_str(&format!(
@@ -70,9 +71,12 @@ fn emit_inst(out: &mut String, inst: &IrInst) -> KuResult<()> {
                 c_expr(value)?
             ));
         }
-        IrInst::BindOk { .. } => {
-            return Err(unsupported(
-                "native C prototype does not support Result ok binding yet",
+        IrInst::BindOk { id, ty, result } => {
+            out.push_str(&format!(
+                "  {} t{} = {}.value;\n",
+                c_type(ty)?,
+                id.0,
+                c_expr(result)?
             ));
         }
         IrInst::Let { name, ty, value } => {
@@ -93,8 +97,18 @@ fn emit_inst(out: &mut String, inst: &IrInst) -> KuResult<()> {
         }
         IrInst::Print(value) => emit_print(out, value)?,
         IrInst::Expr(value) => emit_expr_statement(out, value)?,
-        IrInst::Fail(_)
-        | IrInst::Panic(_)
+        IrInst::Fail(value) => {
+            let IrType::Result(inner) = return_type else {
+                return Err(unsupported("native C fail requires a Result return type"));
+            };
+            out.push_str(&format!(
+                "  return ({}){{ false, {}, {} }};\n",
+                c_type(return_type)?,
+                c_zero_value(inner)?,
+                c_expr(value)?
+            ));
+        }
+        IrInst::Panic(_)
         | IrInst::BeginTry { .. }
         | IrInst::EndTry
         | IrInst::BindError { .. }
@@ -133,7 +147,11 @@ fn emit_print(out: &mut String, value: &IrExpr) -> KuResult<()> {
     Ok(())
 }
 
-fn emit_terminator(out: &mut String, terminator: &IrTerminator) -> KuResult<()> {
+fn emit_terminator(
+    out: &mut String,
+    terminator: &IrTerminator,
+    return_type: &IrType,
+) -> KuResult<()> {
     match terminator {
         IrTerminator::Next => Ok(()),
         IrTerminator::Jump(target) => {
@@ -156,9 +174,36 @@ fn emit_terminator(out: &mut String, terminator: &IrTerminator) -> KuResult<()> 
         IrTerminator::ForEach { .. } => Err(unsupported(
             "native C prototype does not support for lowering yet",
         )),
-        IrTerminator::ResultBranch { .. } | IrTerminator::PropagateErr(_) => Err(unsupported(
-            "native C prototype does not support Result control flow yet",
-        )),
+        IrTerminator::ResultBranch {
+            result,
+            ok_block,
+            err_block,
+        } => {
+            out.push_str(&format!(
+                "  if ({}.ok) goto block{}; else goto block{};\n",
+                c_expr(result)?,
+                ok_block.0,
+                err_block.0
+            ));
+            Ok(())
+        }
+        IrTerminator::JumpErr { result, target } => {
+            out.push_str(&format!(
+                "  (void){}; goto block{};\n",
+                c_expr(result)?,
+                target.0
+            ));
+            Ok(())
+        }
+        IrTerminator::PropagateErr(value) => {
+            if !matches!(return_type, IrType::Result(_)) {
+                return Err(unsupported(
+                    "native C prototype can only propagate errors from Result functions",
+                ));
+            }
+            out.push_str(&format!("  return {};\n", c_expr(value)?));
+            Ok(())
+        }
         IrTerminator::Return(Some(value)) => {
             out.push_str(&format!("  return {};\n", c_expr(value)?));
             Ok(())
@@ -187,6 +232,9 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
             c_expr(right)?
         )),
         IrExprKind::Call { callee, args, kind } => {
+            if let IrCallKind::Intrinsic(name) = kind {
+                return c_intrinsic_expr(name, args, &expr.ty);
+            }
             if !matches!(kind, IrCallKind::Direct(_)) {
                 return Err(unsupported(
                     "native C prototype only supports direct function calls",
@@ -214,9 +262,165 @@ fn c_type(ty: &IrType) -> KuResult<&'static str> {
         IrType::Int => Ok("int64_t"),
         IrType::Bool => Ok("bool"),
         IrType::Str => Ok("const char*"),
+        IrType::Result(inner) => c_result_type(inner),
         IrType::Void => Ok("void"),
         _ => Err(unsupported(format!(
             "native C prototype does not support type {ty}"
+        ))),
+    }
+}
+
+fn emit_result_abi(out: &mut String, program: &IrProgram) -> KuResult<()> {
+    let mut has_int = false;
+    let mut has_bool = false;
+    let mut has_str = false;
+    for function in &program.functions {
+        collect_result_type(
+            &function.return_type,
+            &mut has_int,
+            &mut has_bool,
+            &mut has_str,
+        )?;
+        for param in &function.params {
+            collect_result_type(&param.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+        }
+        for block in &function.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    IrInst::Temp { ty, value, .. } => {
+                        collect_result_type(ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                        collect_result_type(&value.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                    }
+                    IrInst::BindOk { result, .. } => {
+                        collect_result_type(&result.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                    }
+                    IrInst::Let { ty, value, .. } => {
+                        collect_result_type(ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                        collect_result_type(&value.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                    }
+                    IrInst::Store { value, .. }
+                    | IrInst::Print(value)
+                    | IrInst::Expr(value)
+                    | IrInst::Fail(value)
+                    | IrInst::Panic(value) => {
+                        collect_result_type(&value.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                    }
+                    IrInst::BeginTry { .. }
+                    | IrInst::EndTry
+                    | IrInst::BindError { .. }
+                    | IrInst::DefineClosure { .. }
+                    | IrInst::Unsupported { .. } => {}
+                }
+            }
+            match &block.terminator {
+                IrTerminator::ResultBranch { result, .. }
+                | IrTerminator::JumpErr { result, .. }
+                | IrTerminator::PropagateErr(result)
+                | IrTerminator::Return(Some(result)) => {
+                    collect_result_type(&result.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                }
+                IrTerminator::Branch { condition, .. } => {
+                    collect_result_type(&condition.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                }
+                IrTerminator::ForEach { iterable, .. } => {
+                    collect_result_type(&iterable.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                }
+                IrTerminator::Next
+                | IrTerminator::Jump(_)
+                | IrTerminator::Return(None)
+                | IrTerminator::Unreachable => {}
+            }
+        }
+    }
+    if has_int {
+        out.push_str(
+            "typedef struct { bool ok; int64_t value; const char* error; } KuResultInt;\n",
+        );
+    }
+    if has_bool {
+        out.push_str("typedef struct { bool ok; bool value; const char* error; } KuResultBool;\n");
+    }
+    if has_str {
+        out.push_str(
+            "typedef struct { bool ok; const char* value; const char* error; } KuResultStr;\n",
+        );
+    }
+    if has_int || has_bool || has_str {
+        out.push('\n');
+    }
+    Ok(())
+}
+
+fn collect_result_type(
+    ty: &IrType,
+    has_int: &mut bool,
+    has_bool: &mut bool,
+    has_str: &mut bool,
+) -> KuResult<()> {
+    match ty {
+        IrType::Result(inner) => match inner.as_ref() {
+            IrType::Int => *has_int = true,
+            IrType::Bool => *has_bool = true,
+            IrType::Str => *has_str = true,
+            _ => {
+                return Err(unsupported(format!(
+                    "native C prototype does not support Result<{inner}>"
+                )))
+            }
+        },
+        IrType::Array(inner) => collect_result_type(inner, has_int, has_bool, has_str)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn c_result_type(inner: &IrType) -> KuResult<&'static str> {
+    match inner {
+        IrType::Int => Ok("KuResultInt"),
+        IrType::Bool => Ok("KuResultBool"),
+        IrType::Str => Ok("KuResultStr"),
+        _ => Err(unsupported(format!(
+            "native C prototype does not support Result<{inner}>"
+        ))),
+    }
+}
+
+fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String> {
+    match (name, ty) {
+        ("ok", IrType::Result(_)) => {
+            let value = args
+                .first()
+                .ok_or_else(|| unsupported("ok requires one argument"))?;
+            Ok(format!(
+                "({}){{ true, {}, (const char*)0 }}",
+                c_type(ty)?,
+                c_expr(value)?
+            ))
+        }
+        ("err", IrType::Result(inner)) => {
+            let value = args
+                .first()
+                .ok_or_else(|| unsupported("err requires one argument"))?;
+            Ok(format!(
+                "({}){{ false, {}, {} }}",
+                c_type(ty)?,
+                c_zero_value(inner)?,
+                c_expr(value)?
+            ))
+        }
+        _ => Err(unsupported(format!(
+            "native C prototype cannot lower intrinsic '{name}'"
+        ))),
+    }
+}
+
+fn c_zero_value(ty: &IrType) -> KuResult<&'static str> {
+    match ty {
+        IrType::Int => Ok("0"),
+        IrType::Bool => Ok("false"),
+        IrType::Str => Ok("(const char*)0"),
+        _ => Err(unsupported(format!(
+            "native C prototype does not support zero value for {ty}"
         ))),
     }
 }

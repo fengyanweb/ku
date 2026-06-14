@@ -32,6 +32,8 @@ Usage:
   ku build <file.ku>    Build a runnable executable wrapper
   ku build --native <file.ku>
                         Emit prototype native C source
+  ku package gc <file.ku>
+                        Remove unused package cache entries for a package
   ku version            Print version
   ku -v                 Print version
   ku -h                 Print this help
@@ -45,6 +47,7 @@ Examples:
   ku ir examples\\function.ku
   ku build examples\\hello.ku
   ku build --native examples\\function.ku
+  ku package gc examples\\package\\src\\main.ku
 ";
 
 pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
@@ -81,6 +84,25 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
                 println!("build ok: {}", output.display());
             }
             Ok(())
+        }
+        Some("package") => {
+            let subcommand = args
+                .get(2)
+                .map(String::as_str)
+                .ok_or_else(|| command_error("missing package command"))?;
+            match subcommand {
+                "gc" => {
+                    let path = exact_path_at(&args, "package gc", 3)?;
+                    let package = package::discover_for_file(Path::new(path))?
+                        .ok_or_else(|| KuError::message(format!("no ku.mod found for '{path}'")))?;
+                    let removed = package::gc_cache(&package, 64)?;
+                    println!("package gc ok: removed {removed} cache entries");
+                    Ok(())
+                }
+                _ => Err(command_error(format!(
+                    "unknown package command '{subcommand}'"
+                ))),
+            }
         }
         Some("version") | Some("--version") | Some("-V") | Some("-v") => {
             reject_extra_args(&args, 2, "version")?;
@@ -371,6 +393,7 @@ fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
         let package = package::discover_for_file(path)?;
         if let Some(package) = &package {
             package::ensure_cache_dir(package)?;
+            package::resolve_remote_dependencies(package)?;
         }
         let mut loader = ModuleLoader::new(package);
         let program = loader.load_entry(path, program)?;
@@ -628,6 +651,11 @@ fn resolve_import_path(
     let raw = Path::new(import_path);
     if raw.is_absolute() {
         return Err(KuError::runtime("import path must be relative", span));
+    }
+    if let Some(package) = package {
+        if let Some(path) = package::resolve_dependency_import(package, import_path, span)? {
+            return Ok(path);
+        }
     }
     let base = if let Some(package) = package {
         if import_path.starts_with("./") || import_path.starts_with("../") {

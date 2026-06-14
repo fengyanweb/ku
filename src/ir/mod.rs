@@ -116,6 +116,7 @@ pub enum IrInst {
     EndTry,
     BindError {
         name: String,
+        result: IrExpr,
     },
     DefineClosure {
         name: String,
@@ -146,6 +147,10 @@ pub enum IrTerminator {
         result: IrExpr,
         ok_block: BlockId,
         err_block: BlockId,
+    },
+    JumpErr {
+        result: IrExpr,
+        target: BlockId,
     },
     PropagateErr(IrExpr),
     Return(Option<IrExpr>),
@@ -262,7 +267,7 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                     ty: ty.clone(),
                 })
                 .collect::<Vec<_>>();
-            let mut lower = FunctionLowerer::new(&signatures);
+            let mut lower = FunctionLowerer::new(&signatures, signature.returns.clone());
             for param in &params {
                 lower.locals.insert(param.name.clone(), param.ty.clone());
             }
@@ -382,7 +387,7 @@ impl fmt::Display for IrInst {
                 Ok(())
             }
             IrInst::EndTry => write!(f, "end_try"),
-            IrInst::BindError { name } => write!(f, "bind_error {name}"),
+            IrInst::BindError { name, result } => write!(f, "bind_error {name} from {result}"),
             IrInst::DefineClosure {
                 name,
                 function_id,
@@ -432,6 +437,9 @@ impl fmt::Display for IrTerminator {
                 "result_branch {result} ok block{} err block{}",
                 ok_block.0, err_block.0
             ),
+            IrTerminator::JumpErr { result, target } => {
+                write!(f, "jump_err {result} block{}", target.0)
+            }
             IrTerminator::PropagateErr(value) => write!(f, "propagate_err {value}"),
             IrTerminator::Return(Some(value)) => write!(f, "return {value}"),
             IrTerminator::Return(None) => write!(f, "return"),
@@ -488,6 +496,7 @@ impl fmt::Display for IrExpr {
 
 struct FunctionLowerer<'a> {
     signatures: &'a HashMap<String, FunctionSig>,
+    return_type: IrType,
     locals: HashMap<String, IrType>,
     blocks: Vec<IrBlock>,
     current: IrBlock,
@@ -499,15 +508,15 @@ struct FunctionLowerer<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct IrTryHandler {
-    catch_block: Option<BlockId>,
-    finally_block: Option<BlockId>,
-    after_block: BlockId,
+    error_block: BlockId,
+    error_name: &'static str,
 }
 
 impl<'a> FunctionLowerer<'a> {
-    fn new(signatures: &'a HashMap<String, FunctionSig>) -> Self {
+    fn new(signatures: &'a HashMap<String, FunctionSig>, return_type: IrType) -> Self {
         Self {
             signatures,
+            return_type,
             locals: HashMap::new(),
             blocks: Vec::new(),
             current: IrBlock {
@@ -616,8 +625,27 @@ impl<'a> FunctionLowerer<'a> {
             } => self.lower_try(body, catch_name, catch_body, finally_body)?,
             Stmt::Fail { value, .. } => {
                 let value = self.lower_expr(value)?;
-                self.current.instructions.push(IrInst::Fail(value));
-                self.current.terminator = IrTerminator::Unreachable;
+                if self.try_handlers.is_empty() {
+                    self.current.instructions.push(IrInst::Fail(value));
+                    self.current.terminator = IrTerminator::Unreachable;
+                } else {
+                    let result_ty = match &self.return_type {
+                        IrType::Result(_) => self.return_type.clone(),
+                        _ => IrType::Result(Box::new(IrType::Unknown)),
+                    };
+                    let result = IrExpr {
+                        kind: IrExprKind::Call {
+                            callee: Box::new(IrExpr {
+                                kind: IrExprKind::Local("err".to_string()),
+                                ty: IrType::Function,
+                            }),
+                            args: vec![value],
+                            kind: IrCallKind::Intrinsic("err".to_string()),
+                        },
+                        ty: result_ty,
+                    };
+                    self.current.terminator = self.err_terminator(result);
+                }
             }
             Stmt::Panic { value, .. } => {
                 let value = self.lower_expr(value)?;
@@ -767,16 +795,17 @@ impl<'a> FunctionLowerer<'a> {
         let catch_id =
             (!catch_body.is_empty() || catch_name.is_some()).then(|| self.next_block("catch"));
         let finally_id = (!finally_body.is_empty()).then(|| self.next_block("finally"));
+        let finally_err_id = (!finally_body.is_empty()).then(|| self.next_block("finally_err"));
         let after_id = self.next_block("try_after");
+        let error_block = catch_id.or(finally_err_id).unwrap_or(after_id);
         self.current.instructions.push(IrInst::BeginTry {
             catch_block: catch_id,
             finally_block: finally_id,
             after_block: after_id,
         });
         self.try_handlers.push(IrTryHandler {
-            catch_block: catch_id,
-            finally_block: finally_id,
-            after_block: after_id,
+            error_block,
+            error_name: "__ku_error",
         });
         for stmt in body {
             self.lower_stmt(stmt)?;
@@ -797,15 +826,28 @@ impl<'a> FunctionLowerer<'a> {
                 .as_ref()
                 .map(|name| self.locals.insert(name.clone(), IrType::Str));
             if let Some(name) = catch_name {
-                self.current
-                    .instructions
-                    .push(IrInst::BindError { name: name.clone() });
+                self.current.instructions.push(IrInst::BindError {
+                    name: name.clone(),
+                    result: IrExpr {
+                        kind: IrExprKind::Local("__ku_error".to_string()),
+                        ty: IrType::Result(Box::new(IrType::Unknown)),
+                    },
+                });
+            }
+            if let Some(finally_err_id) = finally_err_id {
+                self.try_handlers.push(IrTryHandler {
+                    error_block: finally_err_id,
+                    error_name: "__ku_error",
+                });
             }
             for stmt in catch_body {
                 self.lower_stmt(stmt)?;
                 if self.current.terminator != IrTerminator::Next {
                     break;
                 }
+            }
+            if finally_err_id.is_some() {
+                self.try_handlers.pop();
             }
             if self.current.terminator == IrTerminator::Next {
                 self.current.terminator = IrTerminator::Jump(finally_id.unwrap_or(after_id));
@@ -833,6 +875,30 @@ impl<'a> FunctionLowerer<'a> {
             }
             if self.current.terminator == IrTerminator::Next {
                 self.current.terminator = IrTerminator::Jump(after_id);
+            }
+            self.finish_current();
+        }
+
+        if let Some(finally_err_id) = finally_err_id {
+            self.start_block(finally_err_id, "finally_err");
+            self.current.instructions.push(IrInst::BindError {
+                name: "__ku_error".to_string(),
+                result: IrExpr {
+                    kind: IrExprKind::Local("__ku_error".to_string()),
+                    ty: IrType::Result(Box::new(IrType::Unknown)),
+                },
+            });
+            for stmt in finally_body {
+                self.lower_stmt(stmt)?;
+                if self.current.terminator != IrTerminator::Next {
+                    break;
+                }
+            }
+            if self.current.terminator == IrTerminator::Next {
+                self.current.terminator = IrTerminator::PropagateErr(IrExpr {
+                    kind: IrExprKind::Local("__ku_error".to_string()),
+                    ty: IrType::Result(Box::new(IrType::Unknown)),
+                });
             }
             self.finish_current();
         }
@@ -1008,14 +1074,26 @@ impl<'a> FunctionLowerer<'a> {
         })
     }
 
-    fn err_terminator(&self, result: IrExpr) -> IrTerminator {
+    fn err_terminator(&mut self, result: IrExpr) -> IrTerminator {
         if let Some(handler) = self.try_handlers.last() {
-            IrTerminator::Jump(
-                handler
-                    .catch_block
-                    .or(handler.finally_block)
-                    .unwrap_or(handler.after_block),
-            )
+            let error_name = handler.error_name.to_string();
+            if self.locals.contains_key(&error_name) {
+                self.current.instructions.push(IrInst::Store {
+                    target: IrLValue::Local(error_name.clone()),
+                    value: result.clone(),
+                });
+            } else {
+                self.locals.insert(error_name.clone(), result.ty.clone());
+                self.current.instructions.push(IrInst::Let {
+                    name: error_name,
+                    ty: result.ty.clone(),
+                    value: result.clone(),
+                });
+            }
+            IrTerminator::JumpErr {
+                result,
+                target: handler.error_block,
+            }
         } else {
             IrTerminator::PropagateErr(result)
         }

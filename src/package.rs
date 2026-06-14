@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     env, fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use crate::{
@@ -14,6 +15,15 @@ pub struct KuMod {
     pub version: Option<String>,
     pub root: Option<String>,
     pub cache: Option<String>,
+    pub dependencies: Vec<PackageDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageDependency {
+    pub name: String,
+    pub version: String,
+    pub source: Option<String>,
+    pub checksum: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +46,9 @@ pub const MANIFEST_FILE: &str = "ku.mod";
 pub const LOCK_FILE: &str = "ku.lock";
 pub const DEFAULT_IMPORT_ROOT: &str = "src";
 pub const DEFAULT_CACHE_DIR: &str = ".ku/cache";
+const PACKAGE_CACHE_DIR: &str = "packages";
+const MAX_PACKAGE_BYTES: u64 = 10_000_000;
+const MAX_PACKAGE_FILES: usize = 512;
 
 pub fn discover_for_file(path: &Path) -> KuResult<Option<PackageContext>> {
     let start = path.parent().unwrap_or_else(|| Path::new("."));
@@ -134,12 +147,246 @@ pub fn write_lock_with_dependencies(
             dependency.cache_key
         ));
     }
+    for dependency in &package.manifest.dependencies {
+        source.push_str(&format!(
+            "\n[[package_dependency]]\nname = {:?}\nversion = {:?}\ncache = {:?}\n",
+            dependency.name,
+            dependency.version,
+            dependency_cache_root(package, dependency)
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        ));
+        if let Some(dep_source) = &dependency.source {
+            source.push_str(&format!("source = {:?}\n", dep_source));
+        }
+        if let Some(checksum) = &dependency.checksum {
+            source.push_str(&format!("checksum = {:?}\n", checksum));
+        }
+    }
     fs::write(&package.lock_path, source).map_err(|err| {
         KuError::message(format!(
             "failed to write package lock '{}': {err}",
             package.lock_path.display()
         ))
     })
+}
+
+pub fn resolve_remote_dependencies(package: &PackageContext) -> KuResult<()> {
+    ensure_cache_dir(package)?;
+    for dependency in &package.manifest.dependencies {
+        let Some(source) = &dependency.source else {
+            continue;
+        };
+        let source_path = file_url_path(source).ok_or_else(|| {
+            KuError::message(format!(
+                "dependency '{}' uses unsupported source '{}'; only file:// is supported in this stage",
+                dependency.name, source
+            ))
+        })?;
+        let source_path = fs::canonicalize(&source_path).map_err(|err| {
+            KuError::message(format!(
+                "failed to resolve dependency '{}' source '{}': {err}",
+                dependency.name,
+                source_path.display()
+            ))
+        })?;
+        let actual_checksum = package_source_checksum(&source_path)?;
+        if let Some(expected) = &dependency.checksum {
+            if expected != &actual_checksum {
+                return Err(KuError::message(format!(
+                    "dependency '{}' checksum mismatch: expected {}, got {}",
+                    dependency.name, expected, actual_checksum
+                )));
+            }
+        }
+        let target = dependency_cache_root(package, dependency);
+        if target.exists() && package_source_checksum(&target)? == actual_checksum {
+            continue;
+        }
+        if target.exists() {
+            fs::remove_dir_all(&target).map_err(|err| {
+                KuError::message(format!(
+                    "failed to refresh dependency cache '{}': {err}",
+                    target.display()
+                ))
+            })?;
+        }
+        let tmp = target.with_extension("tmp");
+        if tmp.exists() {
+            fs::remove_dir_all(&tmp).map_err(|err| {
+                KuError::message(format!(
+                    "failed to clear dependency temp cache '{}': {err}",
+                    tmp.display()
+                ))
+            })?;
+        }
+        fs::create_dir_all(&tmp).map_err(|err| {
+            KuError::message(format!(
+                "failed to create dependency temp cache '{}': {err}",
+                tmp.display()
+            ))
+        })?;
+        copy_package_source(&source_path, &tmp)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                KuError::message(format!(
+                    "failed to create dependency cache '{}': {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        fs::rename(&tmp, &target).map_err(|err| {
+            KuError::message(format!(
+                "failed to install dependency cache '{}': {err}",
+                target.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_dependency_import(
+    package: &PackageContext,
+    import_path: &str,
+    span: Span,
+) -> KuResult<Option<PathBuf>> {
+    let Some(rest) = import_path.strip_prefix('@') else {
+        return Ok(None);
+    };
+    let Some((name, relative)) = rest.split_once('/') else {
+        return Err(KuError::runtime(
+            "package dependency import must use @name/path",
+            span,
+        ));
+    };
+    let dependency = package
+        .manifest
+        .dependencies
+        .iter()
+        .find(|dep| dep.name == name)
+        .ok_or_else(|| KuError::runtime(format!("unknown package dependency '{name}'"), span))?;
+    reject_unsafe_dependency_import(relative, span)?;
+    let root = dependency_cache_root(package, dependency).join(dependency.root());
+    let mut path = root.join(relative);
+    if path.extension().is_none() {
+        path.set_extension("ku");
+    }
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ku"))
+    {
+        return Err(KuError::runtime(
+            "package dependency import must point to a .ku file",
+            span,
+        ));
+    }
+    if path.exists() {
+        let canonical_root = fs::canonicalize(&root).map_err(|err| {
+            KuError::runtime(
+                format!(
+                    "failed to resolve package dependency root '{}': {err}",
+                    root.display()
+                ),
+                span,
+            )
+        })?;
+        let canonical_path = fs::canonicalize(&path).map_err(|err| {
+            KuError::runtime(
+                format!(
+                    "failed to resolve package dependency import '{}': {err}",
+                    path.display()
+                ),
+                span,
+            )
+        })?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(KuError::runtime(
+                "package dependency import is outside dependency root",
+                span,
+            ));
+        }
+    }
+    Ok(Some(path))
+}
+
+pub fn package_source_checksum(path: &Path) -> KuResult<String> {
+    let mut bytes = Vec::new();
+    let mut files = 0;
+    let mut total_bytes = 0;
+    collect_source_bytes(path, path, &mut bytes, &mut files, &mut total_bytes)?;
+    Ok(format!("ku-fnv64-{:016x}", stable_hash(&bytes)))
+}
+
+pub fn gc_cache(package: &PackageContext, max_entries: usize) -> KuResult<usize> {
+    let packages_dir = package.cache_dir.join(PACKAGE_CACHE_DIR);
+    if !packages_dir.exists() {
+        return Ok(0);
+    }
+    let keep = package
+        .manifest
+        .dependencies
+        .iter()
+        .map(|dependency| dependency_cache_root(package, dependency))
+        .collect::<Vec<_>>();
+    let mut removed = 0;
+    for name_entry in fs::read_dir(&packages_dir).map_err(|err| {
+        KuError::message(format!(
+            "failed to read package cache '{}': {err}",
+            packages_dir.display()
+        ))
+    })? {
+        let name_entry = name_entry
+            .map_err(|err| KuError::message(format!("failed to read cache entry: {err}")))?;
+        let name_path = name_entry.path();
+        if !name_path.is_dir() {
+            continue;
+        }
+        for version_entry in fs::read_dir(&name_path).map_err(|err| {
+            KuError::message(format!(
+                "failed to read package cache '{}': {err}",
+                name_path.display()
+            ))
+        })? {
+            let version_entry = version_entry
+                .map_err(|err| KuError::message(format!("failed to read cache entry: {err}")))?;
+            let path = version_entry.path();
+            if !path.is_dir() || keep.contains(&path) {
+                continue;
+            }
+            if removed >= max_entries {
+                break;
+            }
+            fs::remove_dir_all(&path).map_err(|err| {
+                KuError::message(format!(
+                    "failed to remove cache '{}': {err}",
+                    path.display()
+                ))
+            })?;
+            removed += 1;
+        }
+        if removed >= max_entries {
+            break;
+        }
+        if fs::read_dir(&name_path)
+            .map_err(|err| {
+                KuError::message(format!(
+                    "failed to read package cache '{}': {err}",
+                    name_path.display()
+                ))
+            })?
+            .next()
+            .is_none()
+        {
+            fs::remove_dir(&name_path).map_err(|err| {
+                KuError::message(format!(
+                    "failed to remove empty cache '{}': {err}",
+                    name_path.display()
+                ))
+            })?;
+        }
+    }
+    Ok(removed)
 }
 
 pub fn lock_dependencies(
@@ -188,6 +435,7 @@ pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
     let mut version = None;
     let mut root = None;
     let mut cache = None;
+    let mut dependencies = HashMap::<String, PackageDependencyDraft>::new();
     for (index, raw_line) in source.lines().enumerate() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -206,6 +454,9 @@ pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
             "version" => version = Some(value),
             "root" => root = Some(value),
             "cache" => cache = Some(value),
+            key if key.starts_with("dep.") => {
+                parse_dependency_key(key, value, &mut dependencies, index + 1, span)?;
+            }
             _ => {
                 return Err(KuError::runtime(
                     format!("invalid ku.mod key '{key}' on line {}", index + 1),
@@ -225,12 +476,90 @@ pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
     if let Some(value) = &cache {
         reject_unsafe_relative_path("cache", value, span)?;
     }
+    let mut dependencies = dependencies
+        .into_values()
+        .map(|dependency| dependency.finish(span))
+        .collect::<KuResult<Vec<_>>>()?;
+    dependencies.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(KuMod {
         name,
         version,
         root,
         cache,
+        dependencies,
     })
+}
+
+#[derive(Default)]
+struct PackageDependencyDraft {
+    name: String,
+    version: Option<String>,
+    source: Option<String>,
+    checksum: Option<String>,
+}
+
+impl PackageDependencyDraft {
+    fn finish(self, span: Span) -> KuResult<PackageDependency> {
+        validate_package_name(&self.name, span)?;
+        let version = self.version.ok_or_else(|| {
+            KuError::runtime(format!("dependency '{}' missing version", self.name), span)
+        })?;
+        validate_version_requirement(&version, span)?;
+        if let Some(checksum) = &self.checksum {
+            validate_checksum(checksum, span)?;
+        }
+        Ok(PackageDependency {
+            name: self.name,
+            version,
+            source: self.source,
+            checksum: self.checksum,
+        })
+    }
+}
+
+impl PackageDependency {
+    fn root(&self) -> &'static str {
+        DEFAULT_IMPORT_ROOT
+    }
+}
+
+fn parse_dependency_key(
+    key: &str,
+    value: String,
+    dependencies: &mut HashMap<String, PackageDependencyDraft>,
+    line: usize,
+    span: Span,
+) -> KuResult<()> {
+    let rest = key.trim_start_matches("dep.");
+    let (name, field) = rest
+        .split_once('.')
+        .map(|(name, field)| (name, Some(field)))
+        .unwrap_or((rest, None));
+    if name.is_empty() {
+        return Err(KuError::runtime(
+            format!("invalid dependency key on line {line}"),
+            span,
+        ));
+    }
+    let dependency =
+        dependencies
+            .entry(name.to_string())
+            .or_insert_with(|| PackageDependencyDraft {
+                name: name.to_string(),
+                ..Default::default()
+            });
+    match field {
+        None => dependency.version = Some(value),
+        Some("source") => dependency.source = Some(value),
+        Some("checksum") => dependency.checksum = Some(value),
+        Some(other) => {
+            return Err(KuError::runtime(
+                format!("invalid dependency field '{other}' on line {line}"),
+                span,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_string_value(value: &str, line: usize, span: Span) -> KuResult<String> {
@@ -279,6 +608,14 @@ fn validate_version(version: &str, span: Span) -> KuResult<()> {
     Ok(())
 }
 
+fn validate_version_requirement(version: &str, span: Span) -> KuResult<()> {
+    let version = version
+        .strip_prefix('^')
+        .or_else(|| version.strip_prefix('~'))
+        .unwrap_or(version);
+    validate_version(version, span)
+}
+
 fn reject_unsafe_relative_path(kind: &str, value: &str, span: Span) -> KuResult<()> {
     let path = Path::new(value);
     if path.is_absolute() || value.contains("..") {
@@ -286,6 +623,207 @@ fn reject_unsafe_relative_path(kind: &str, value: &str, span: Span) -> KuResult<
             format!("ku.mod {kind} must be a safe relative path"),
             span,
         ));
+    }
+    Ok(())
+}
+
+fn reject_unsafe_dependency_import(value: &str, span: Span) -> KuResult<()> {
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(KuError::runtime(
+            "package dependency import must stay inside dependency root",
+            span,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_checksum(value: &str, span: Span) -> KuResult<()> {
+    let Some(hex) = value.strip_prefix("ku-fnv64-") else {
+        return Err(KuError::runtime(
+            "dependency checksum must use ku-fnv64- followed by 16 hex digits",
+            span,
+        ));
+    };
+    if hex.len() != 16 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(KuError::runtime(
+            "dependency checksum must use ku-fnv64- followed by 16 hex digits",
+            span,
+        ));
+    }
+    Ok(())
+}
+
+fn dependency_cache_root(package: &PackageContext, dependency: &PackageDependency) -> PathBuf {
+    package
+        .cache_dir
+        .join(PACKAGE_CACHE_DIR)
+        .join(&dependency.name)
+        .join(&dependency.version)
+}
+
+fn file_url_path(source: &str) -> Option<PathBuf> {
+    let raw = source.strip_prefix("file://")?;
+    let path = if raw.starts_with('/') && raw.as_bytes().get(2) == Some(&b':') {
+        &raw[1..]
+    } else {
+        raw
+    };
+    percent_decode(path).map(PathBuf::from)
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hi = *bytes.get(index + 1)?;
+            let lo = *bytes.get(index + 2)?;
+            output.push((hex_value(hi)? << 4) | hex_value(lo)?);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn copy_package_source(source: &Path, target: &Path) -> KuResult<()> {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    copy_package_source_inner(source, source, target, &mut files, &mut bytes)
+}
+
+fn copy_package_source_inner(
+    root: &Path,
+    current: &Path,
+    target_root: &Path,
+    files: &mut usize,
+    bytes: &mut u64,
+) -> KuResult<()> {
+    for entry in fs::read_dir(current).map_err(|err| {
+        KuError::message(format!(
+            "failed to read package source '{}': {err}",
+            current.display()
+        ))
+    })? {
+        let entry = entry
+            .map_err(|err| KuError::message(format!("failed to read package entry: {err}")))?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root).map_err(|err| {
+            KuError::message(format!(
+                "failed to compute package relative path '{}': {err}",
+                path.display()
+            ))
+        })?;
+        let target = target_root.join(relative);
+        let metadata = entry.metadata().map_err(|err| {
+            KuError::message(format!(
+                "failed to read package metadata '{}': {err}",
+                path.display()
+            ))
+        })?;
+        if metadata.is_dir() {
+            fs::create_dir_all(&target).map_err(|err| {
+                KuError::message(format!(
+                    "failed to create package cache directory '{}': {err}",
+                    target.display()
+                ))
+            })?;
+            copy_package_source_inner(root, &path, target_root, files, bytes)?;
+        } else if metadata.is_file() {
+            *files += 1;
+            *bytes += metadata.len();
+            if *files > MAX_PACKAGE_FILES || *bytes > MAX_PACKAGE_BYTES {
+                return Err(KuError::message("package source exceeds cache limits"));
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    KuError::message(format!(
+                        "failed to create package cache directory '{}': {err}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            fs::copy(&path, &target).map_err(|err| {
+                KuError::message(format!(
+                    "failed to copy package file '{}' to '{}': {err}",
+                    path.display(),
+                    target.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_source_bytes(
+    root: &Path,
+    current: &Path,
+    output: &mut Vec<u8>,
+    files: &mut usize,
+    bytes: &mut u64,
+) -> KuResult<()> {
+    let mut entries = fs::read_dir(current)
+        .map_err(|err| {
+            KuError::message(format!(
+                "failed to read package source '{}': {err}",
+                current.display()
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| KuError::message(format!("failed to read package source entry: {err}")))?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = entry.metadata().map_err(|err| {
+            KuError::message(format!(
+                "failed to read package metadata '{}': {err}",
+                path.display()
+            ))
+        })?;
+        if metadata.is_dir() {
+            collect_source_bytes(root, &path, output, files, bytes)?;
+        } else if metadata.is_file() {
+            *files += 1;
+            *bytes += metadata.len();
+            if *files > MAX_PACKAGE_FILES || *bytes > MAX_PACKAGE_BYTES {
+                return Err(KuError::message("package source exceeds checksum limits"));
+            }
+            let relative = path.strip_prefix(root).map_err(|err| {
+                KuError::message(format!(
+                    "failed to compute package relative path '{}': {err}",
+                    path.display()
+                ))
+            })?;
+            output.extend_from_slice(relative.to_string_lossy().replace('\\', "/").as_bytes());
+            output.push(0);
+            output.extend(fs::read(&path).map_err(|err| {
+                KuError::message(format!(
+                    "failed to read package file '{}': {err}",
+                    path.display()
+                ))
+            })?);
+            output.push(0);
+        }
     }
     Ok(())
 }
