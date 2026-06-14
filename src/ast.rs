@@ -226,11 +226,12 @@ pub struct MatchArm {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchPattern {
     Wildcard,
+    Binding(String),
     Literal(Literal),
     EnumVariant {
         enum_name: String,
         variant: String,
-        bindings: Vec<String>,
+        fields: Vec<MatchPattern>,
     },
 }
 

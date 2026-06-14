@@ -962,7 +962,9 @@ impl Parser {
             TokenKind::False => Ok(MatchPattern::Literal(Literal::Bool(false))),
             TokenKind::Null => Ok(MatchPattern::Literal(Literal::Null)),
             TokenKind::Ident(enum_name) => {
-                self.consume(&TokenKind::Dot, "expected '.' in enum match pattern")?;
+                if !self.match_kind(&TokenKind::Dot) {
+                    return Ok(MatchPattern::Binding(enum_name));
+                }
                 let (mut variant, _) =
                     self.consume_ident("expected enum variant in match pattern")?;
                 let enum_name = if self.match_kind(&TokenKind::Dot) {
@@ -975,24 +977,22 @@ impl Parser {
                 } else {
                     enum_name
                 };
-                let mut bindings = Vec::new();
+                let mut fields = Vec::new();
                 if self.match_kind(&TokenKind::LParen) {
                     if !self.check(&TokenKind::RParen) {
                         loop {
-                            let (binding, _) =
-                                self.consume_ident("expected payload binding name")?;
-                            bindings.push(binding);
+                            fields.push(self.match_pattern()?);
                             if !self.match_kind(&TokenKind::Comma) {
                                 break;
                             }
                         }
                     }
-                    self.consume(&TokenKind::RParen, "expected ')' after payload bindings")?;
+                    self.consume(&TokenKind::RParen, "expected ')' after payload patterns")?;
                 }
                 Ok(MatchPattern::EnumVariant {
                     enum_name,
                     variant,
-                    bindings,
+                    fields,
                 })
             }
             _ => Err(KuError::parse("expected match pattern", token.span)),

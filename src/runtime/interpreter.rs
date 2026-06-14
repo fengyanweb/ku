@@ -44,6 +44,7 @@ pub struct Interpreter {
     steps: usize,
     call_depth: usize,
     pending_fail: Option<Value>,
+    std_modules: HashSet<String>,
 }
 
 impl Interpreter {
@@ -56,6 +57,7 @@ impl Interpreter {
             steps: 0,
             call_depth: 0,
             pending_fail: None,
+            std_modules: HashSet::new(),
         }
     }
 
@@ -93,7 +95,12 @@ impl Interpreter {
                             .collect(),
                     );
                 }
-                Item::Module(_) | Item::Import(_) => {}
+                Item::Module(module) => {
+                    if let Some(name) = module.name.strip_prefix("std:") {
+                        self.std_modules.insert(name.to_string());
+                    }
+                }
+                Item::Import(_) => {}
             }
         }
         let result = self.call_function("main", Vec::new(), entry_span(), 0)?;
@@ -524,6 +531,14 @@ impl Interpreter {
                 }
                 let args = values;
                 if !dotted_builtin_is_shadowed(callee, env) {
+                    if let Some(module) = dotted_builtin_module(callee) {
+                        if module == "http" && !self.std_modules.contains(module) {
+                            return Err(KuError::runtime(
+                                "std module 'http' must be imported before use",
+                                expr.span,
+                            ));
+                        }
+                    }
                     if let Some(value) =
                         stdlib::eval_dotted_builtin(callee, &args, expr.span, &self.base_dir)?
                     {
@@ -994,13 +1009,33 @@ fn match_pattern(
     env: &mut Env,
     span: Span,
 ) -> KuResult<bool> {
+    let mut bindings = Vec::new();
+    if !collect_match_bindings(pattern, value, &mut bindings, span)? {
+        return Ok(false);
+    }
+    for (name, value) in bindings {
+        env.define(name, value, false, span)?;
+    }
+    Ok(true)
+}
+
+fn collect_match_bindings(
+    pattern: &MatchPattern,
+    value: &Value,
+    bindings: &mut Vec<(String, Value)>,
+    span: Span,
+) -> KuResult<bool> {
     match pattern {
         MatchPattern::Wildcard => Ok(true),
+        MatchPattern::Binding(name) => {
+            bindings.push((name.clone(), value.clone()));
+            Ok(true)
+        }
         MatchPattern::Literal(literal) => Ok(value == &value_from_literal(literal)),
         MatchPattern::EnumVariant {
             enum_name,
             variant,
-            bindings,
+            fields: patterns,
         } => {
             let Value::Enum {
                 name,
@@ -1013,18 +1048,22 @@ fn match_pattern(
             if name != enum_name || actual_variant != variant {
                 return Ok(false);
             }
-            if bindings.len() != fields.len() {
+            if patterns.len() != fields.len() {
                 return Err(KuError::runtime(
                     format!(
-                        "match pattern '{enum_name}.{variant}' expects {} bindings but got {}",
+                        "match pattern '{enum_name}.{variant}' expects {} fields but got {}",
                         fields.len(),
-                        bindings.len()
+                        patterns.len()
                     ),
                     span,
                 ));
             }
-            for (binding, field) in bindings.iter().zip(fields.iter()) {
-                env.define(binding.clone(), field.clone(), false, span)?;
+            let snapshot = bindings.len();
+            for (pattern, field) in patterns.iter().zip(fields.iter()) {
+                if !collect_match_bindings(pattern, field, bindings, span)? {
+                    bindings.truncate(snapshot);
+                    return Ok(false);
+                }
             }
             Ok(true)
         }
@@ -1059,6 +1098,16 @@ fn dotted_builtin_is_shadowed(expr: &Expr, env: &Env) -> bool {
         return false;
     };
     env.contains(module)
+}
+
+fn dotted_builtin_module(expr: &Expr) -> Option<&str> {
+    let ExprKind::Field { target, .. } = &expr.kind else {
+        return None;
+    };
+    let ExprKind::Variable(module) = &target.kind else {
+        return None;
+    };
+    Some(module)
 }
 
 fn eval_binary(op: BinaryOp, left: Value, right: Value, span: Span) -> KuResult<Value> {

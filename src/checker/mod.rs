@@ -67,6 +67,7 @@ pub struct Checker {
     check_depth: usize,
     recoverable_depth: usize,
     template_mode: bool,
+    std_modules: HashSet<String>,
 }
 
 impl Checker {
@@ -80,6 +81,7 @@ impl Checker {
             check_depth: 0,
             recoverable_depth: 0,
             template_mode: false,
+            std_modules: HashSet::new(),
         }
     }
 
@@ -113,6 +115,10 @@ impl Checker {
                     }
                 }
                 Item::Module(decl) => {
+                    if let Some(name) = decl.name.strip_prefix("std:") {
+                        self.std_modules.insert(name.to_string());
+                        continue;
+                    }
                     if !top_level_names.insert(decl.name.clone()) {
                         return Err(KuError::runtime(
                             format!("top-level name '{}' is already defined", decl.name),
@@ -942,90 +948,51 @@ impl Checker {
         }
         let value_type = self.check_expr(value)?;
         let mut result_type = Type::Unknown;
-        let mut saw_unguarded_wildcard = false;
-        let mut covered_variants = HashSet::new();
-        let mut covered_literals = HashSet::new();
+        let mut saw_unguarded_catch_all = false;
+        let mut covered_full_variants = HashSet::new();
+        let mut covered_patterns = HashSet::new();
         for arm in arms {
-            if saw_unguarded_wildcard {
+            if saw_unguarded_catch_all {
                 return Err(KuError::runtime(
-                    "match arm after '_' is unreachable",
+                    "match arm after catch-all pattern is unreachable",
                     arm.span,
                 ));
             }
             self.push_scope();
-            match &arm.pattern {
-                MatchPattern::Wildcard if arm.guard.is_none() => saw_unguarded_wildcard = true,
-                MatchPattern::Wildcard => {}
-                MatchPattern::Literal(literal) => {
-                    let literal_type = type_of_literal(literal);
-                    if !type_matches(&value_type, &literal_type) {
-                        self.pop_scope();
-                        return Err(type_error(arm.span, &value_type, &literal_type));
-                    }
-                    let key = literal_key(literal);
-                    if covered_literals.contains(&key) {
-                        self.pop_scope();
-                        return Err(KuError::runtime(
-                            "match literal arm is unreachable",
-                            arm.span,
-                        ));
-                    }
-                    if arm.guard.is_none() {
-                        covered_literals.insert(key);
+            if let Err(err) = self.check_match_pattern(&arm.pattern, &value_type, arm.span) {
+                self.pop_scope();
+                return Err(err);
+            }
+            if let MatchPattern::EnumVariant {
+                enum_name, variant, ..
+            } = &arm.pattern
+            {
+                if covered_full_variants.contains(variant) {
+                    self.pop_scope();
+                    return Err(KuError::runtime(
+                        format!("match arm for '{enum_name}.{variant}' is unreachable"),
+                        arm.span,
+                    ));
+                }
+            }
+            if arm.guard.is_none() {
+                if pattern_is_catch_all(&arm.pattern) {
+                    saw_unguarded_catch_all = true;
+                }
+                if let MatchPattern::EnumVariant { variant, .. } = &arm.pattern {
+                    if enum_pattern_covers_all_payload(&arm.pattern) {
+                        covered_full_variants.insert(variant.clone());
                     }
                 }
-                MatchPattern::EnumVariant {
-                    enum_name,
-                    variant,
-                    bindings,
-                } => {
-                    if !type_matches(&value_type, &Type::Enum(enum_name.clone())) {
-                        self.pop_scope();
-                        return Err(type_error(
-                            arm.span,
-                            &value_type,
-                            &Type::Enum(enum_name.clone()),
-                        ));
-                    }
-                    let Some(enum_type) = self.enums.get(enum_name) else {
-                        self.pop_scope();
-                        return Err(KuError::runtime(
-                            format!("undefined enum '{enum_name}'"),
-                            arm.span,
-                        ));
-                    };
-                    let Some(payload) = enum_type.variants.get(variant).cloned() else {
-                        self.pop_scope();
-                        return Err(KuError::runtime(
-                            format!("enum '{enum_name}' has no variant '{variant}'"),
-                            arm.span,
-                        ));
-                    };
-                    if payload.len() != bindings.len() {
-                        self.pop_scope();
-                        return Err(KuError::runtime(
-                            format!(
-                                "match pattern '{enum_name}.{variant}' expects {} bindings but got {}",
-                                payload.len(),
-                                bindings.len()
-                            ),
-                            arm.span,
-                        ));
-                    }
-                    for (binding, ty) in bindings.iter().zip(payload) {
-                        self.define(binding.clone(), ty, false, arm.span)?;
-                    }
-                    if covered_variants.contains(variant) {
-                        self.pop_scope();
-                        return Err(KuError::runtime(
-                            format!("match arm for '{enum_name}.{variant}' is unreachable"),
-                            arm.span,
-                        ));
-                    }
-                    if arm.guard.is_none() {
-                        covered_variants.insert(variant.clone());
-                    }
+                let key = pattern_key(&arm.pattern);
+                if covered_patterns.contains(&key) {
+                    self.pop_scope();
+                    return Err(KuError::runtime(
+                        "match arm pattern is unreachable",
+                        arm.span,
+                    ));
                 }
+                covered_patterns.insert(key);
             }
             if let Some(guard) = &arm.guard {
                 let guard_type = self.check_expr(guard)?;
@@ -1043,7 +1010,7 @@ impl Checker {
                 return Err(type_error(arm.value.span, &result_type, &actual));
             }
         }
-        if !saw_unguarded_wildcard {
+        if !saw_unguarded_catch_all {
             if let Type::Enum(enum_name) = &value_type {
                 let Some(enum_type) = self.enums.get(enum_name) else {
                     return Err(KuError::runtime(
@@ -1054,7 +1021,7 @@ impl Checker {
                 let missing = enum_type
                     .variants
                     .keys()
-                    .filter(|variant| !covered_variants.contains(*variant))
+                    .filter(|variant| !covered_full_variants.contains(*variant))
                     .cloned()
                     .collect::<Vec<_>>();
                 if !missing.is_empty() {
@@ -1069,6 +1036,62 @@ impl Checker {
             }
         }
         Ok(result_type)
+    }
+
+    fn check_match_pattern(
+        &mut self,
+        pattern: &MatchPattern,
+        expected: &Type,
+        span: Span,
+    ) -> KuResult<()> {
+        match pattern {
+            MatchPattern::Wildcard => Ok(()),
+            MatchPattern::Binding(name) => self.define(name.clone(), expected.clone(), false, span),
+            MatchPattern::Literal(literal) => {
+                let actual = type_of_literal(literal);
+                if type_matches(expected, &actual) {
+                    Ok(())
+                } else {
+                    Err(type_error(span, expected, &actual))
+                }
+            }
+            MatchPattern::EnumVariant {
+                enum_name,
+                variant,
+                fields,
+            } => {
+                let expected_enum = Type::Enum(enum_name.clone());
+                if !type_matches(expected, &expected_enum) {
+                    return Err(type_error(span, expected, &expected_enum));
+                }
+                let Some(enum_type) = self.enums.get(enum_name) else {
+                    return Err(KuError::runtime(
+                        format!("undefined enum '{enum_name}'"),
+                        span,
+                    ));
+                };
+                let Some(payload) = enum_type.variants.get(variant).cloned() else {
+                    return Err(KuError::runtime(
+                        format!("enum '{enum_name}' has no variant '{variant}'"),
+                        span,
+                    ));
+                };
+                if payload.len() != fields.len() {
+                    return Err(KuError::runtime(
+                        format!(
+                            "match pattern '{enum_name}.{variant}' expects {} fields but got {}",
+                            payload.len(),
+                            fields.len()
+                        ),
+                        span,
+                    ));
+                }
+                for (field, ty) in fields.iter().zip(payload.iter()) {
+                    self.check_match_pattern(field, ty, span)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn check_dotted_builtin_call(
@@ -1086,6 +1109,12 @@ impl Checker {
         let Some(signature) = metadata::dotted_signature(&module, &function) else {
             return Ok(None);
         };
+        if metadata::module_requires_import(&module) && !self.std_modules.contains(&module) {
+            return Err(KuError::runtime(
+                format!("std module '{module}' must be imported before use"),
+                span,
+            ));
+        }
         Ok(Some(self.apply_stdlib_signature(&signature, args, span)?))
     }
 
@@ -1571,6 +1600,33 @@ fn literal_key(literal: &Literal) -> String {
         Literal::Bool(value) => format!("bool:{value}"),
         Literal::String(value) | Literal::TemplateString(value) => format!("str:{value}"),
         Literal::Null => "null".to_string(),
+    }
+}
+
+fn pattern_is_catch_all(pattern: &MatchPattern) -> bool {
+    matches!(pattern, MatchPattern::Wildcard | MatchPattern::Binding(_))
+}
+
+fn enum_pattern_covers_all_payload(pattern: &MatchPattern) -> bool {
+    let MatchPattern::EnumVariant { fields, .. } = pattern else {
+        return false;
+    };
+    fields.iter().all(pattern_is_catch_all)
+}
+
+fn pattern_key(pattern: &MatchPattern) -> String {
+    match pattern {
+        MatchPattern::Wildcard => "_".to_string(),
+        MatchPattern::Binding(_) => "$binding".to_string(),
+        MatchPattern::Literal(literal) => literal_key(literal),
+        MatchPattern::EnumVariant {
+            enum_name,
+            variant,
+            fields,
+        } => {
+            let fields = fields.iter().map(pattern_key).collect::<Vec<_>>().join(",");
+            format!("enum:{enum_name}.{variant}({fields})")
+        }
     }
 }
 

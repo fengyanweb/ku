@@ -16,6 +16,7 @@ pub fn generate_c_source(program: &IrProgram) -> KuResult<String> {
         emit_function(&mut out, function)?;
         out.push('\n');
     }
+    emit_main_wrapper(&mut out, program)?;
     Ok(out)
 }
 
@@ -32,7 +33,7 @@ fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
     out.push_str(&format!(
         "{} {}(",
         c_type(&function.return_type)?,
-        c_ident(&function.name)
+        c_symbol(&function.name)
     ));
     for (index, param) in function.params.iter().enumerate() {
         if index > 0 {
@@ -222,7 +223,7 @@ fn emit_terminator(
 fn c_expr(expr: &IrExpr) -> KuResult<String> {
     match &expr.kind {
         IrExprKind::Literal(value) => Ok(value.clone()),
-        IrExprKind::Local(name) => Ok(c_ident(name)),
+        IrExprKind::Local(name) => Ok(c_symbol(name)),
         IrExprKind::Temp(id) => Ok(format!("t{}", id.0)),
         IrExprKind::Unary { op, expr } => Ok(format!("({}{})", c_unary(*op), c_expr(expr)?)),
         IrExprKind::Binary { left, op, right } => Ok(format!(
@@ -385,6 +386,49 @@ fn c_result_type(inner: &IrType) -> KuResult<&'static str> {
     }
 }
 
+fn emit_main_wrapper(out: &mut String, program: &IrProgram) -> KuResult<()> {
+    let Some(function) = program
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+    else {
+        return Ok(());
+    };
+    if !function.params.is_empty() {
+        return Err(unsupported(
+            "native C main wrapper does not support main parameters",
+        ));
+    }
+    out.push_str("int main(void) {\n");
+    match &function.return_type {
+        IrType::Void => {
+            out.push_str("  ku_main();\n  return 0;\n");
+        }
+        IrType::Int => {
+            out.push_str("  return (int)ku_main();\n");
+        }
+        IrType::Bool => {
+            out.push_str("  return ku_main() ? 0 : 1;\n");
+        }
+        IrType::Str => {
+            out.push_str("  const char* result = ku_main();\n  if (result) printf(\"%s\\n\", result);\n  return 0;\n");
+        }
+        IrType::Result(_) => {
+            out.push_str(&format!(
+                "  {} result = ku_main();\n  if (!result.ok) {{ fprintf(stderr, \"%s\\n\", result.error ? result.error : \"error\"); return 1; }}\n  return 0;\n",
+                c_type(&function.return_type)?
+            ));
+        }
+        other => {
+            return Err(unsupported(format!(
+                "native C main wrapper does not support main return type {other}"
+            )));
+        }
+    }
+    out.push_str("}\n");
+    Ok(())
+}
+
 fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String> {
     match (name, ty) {
         ("ok", IrType::Result(_)) => {
@@ -465,6 +509,14 @@ fn c_ident(name: &str) -> String {
         "_".to_string()
     } else {
         output
+    }
+}
+
+fn c_symbol(name: &str) -> String {
+    if name == "main" {
+        "ku_main".to_string()
+    } else {
+        c_ident(name)
     }
 }
 

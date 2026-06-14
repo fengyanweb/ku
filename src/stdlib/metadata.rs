@@ -85,6 +85,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("json", "parse" | "try_parse") => vec![str_arg()],
         ("json", "stringify") => vec![ArgRule::Is(TypePattern::Any)],
         ("time", "now" | "unix" | "millis") => vec![],
+        ("http", "try_get") => vec![str_arg()],
         _ => return None,
     };
     let returns = match (module, function) {
@@ -105,6 +106,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("json", "try_parse") => TypePattern::ResultOf(Box::new(TypePattern::Unknown)),
         ("json", "stringify") => TypePattern::String,
         ("time", "now" | "unix" | "millis") => TypePattern::Int,
+        ("http", "try_get") => TypePattern::ResultOf(Box::new(TypePattern::String)),
         _ => return None,
     };
     Some(Signature {
@@ -121,12 +123,18 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
 
 fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
     match (module, function) {
-        ("fs", "try_read") | ("string", "slice") | ("array", "try_get") | ("json", "try_parse") => {
-            FailureMode::ReturnsResult
-        }
+        ("fs", "try_read")
+        | ("string", "slice")
+        | ("array", "try_get")
+        | ("json", "try_parse")
+        | ("http", "try_get") => FailureMode::ReturnsResult,
         ("fs", "read") | ("json", "parse") => FailureMode::MayPanic,
         _ => FailureMode::Never,
     }
+}
+
+pub(crate) fn module_requires_import(module: &str) -> bool {
+    module == "http"
 }
 
 fn int_arg() -> ArgRule {

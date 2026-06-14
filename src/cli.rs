@@ -505,6 +505,21 @@ impl ModuleLoader {
             let Item::Import(import) = item else {
                 continue;
             };
+            if let Some(module) = std_import_module(import)? {
+                if local_names.contains(&module) || !imported_names.insert(module.clone()) {
+                    return Err(KuError::runtime(
+                        format!(
+                            "import namespace '{module}' conflicts with another top-level name"
+                        ),
+                        import.span,
+                    ));
+                }
+                items.push(Item::Module(ModuleDecl {
+                    name: format!("std:{module}"),
+                    span: import.span,
+                }));
+                continue;
+            }
             let import_path =
                 resolve_import_path(path, &import.path, import.span, self.package.as_ref())?;
             let module = self.load_module(&import_path, import.span)?;
@@ -613,6 +628,26 @@ impl ModuleLoader {
         }
         let _ = is_entry;
         Ok(Program { items })
+    }
+}
+
+fn std_import_module(import: &ImportDecl) -> KuResult<Option<String>> {
+    let Some(module) = import.path.strip_prefix("std:") else {
+        return Ok(None);
+    };
+    match &import.kind {
+        ImportKind::Namespace(namespace) if namespace == module => Ok(Some(module.to_string())),
+        ImportKind::Namespace(_) => Err(KuError::runtime(
+            format!(
+                "std module '{}' must be imported as '{}'",
+                import.path, module
+            ),
+            import.span,
+        )),
+        ImportKind::Named(_) | ImportKind::Glob => Err(KuError::runtime(
+            "std module imports must use namespace form, for example import http from \"std:http\"",
+            import.span,
+        )),
     }
 }
 
@@ -1235,11 +1270,7 @@ fn rewrite_namespaces_in_expr(
         ExprKind::Match { value, arms } => {
             rewrite_namespaces_in_expr(value, namespaces)?;
             for arm in arms {
-                if let MatchPattern::EnumVariant { enum_name, .. } = &mut arm.pattern {
-                    if let Some(renamed) = namespace_lookup(enum_name, namespaces) {
-                        *enum_name = renamed;
-                    }
-                }
+                rewrite_namespaces_in_match_pattern(&mut arm.pattern, namespaces);
                 if let Some(guard) = &mut arm.guard {
                     rewrite_namespaces_in_expr(guard, namespaces)?;
                 }
@@ -1267,6 +1298,23 @@ fn rewrite_namespaces_in_expr(
             Ok(())
         }
         ExprKind::Literal(_) | ExprKind::Variable(_) => Ok(()),
+    }
+}
+
+fn rewrite_namespaces_in_match_pattern(
+    pattern: &mut MatchPattern,
+    namespaces: &HashMap<String, HashMap<String, String>>,
+) {
+    if let MatchPattern::EnumVariant {
+        enum_name, fields, ..
+    } = pattern
+    {
+        if let Some(renamed) = namespace_lookup(enum_name, namespaces) {
+            *enum_name = renamed;
+        }
+        for field in fields {
+            rewrite_namespaces_in_match_pattern(field, namespaces);
+        }
     }
 }
 

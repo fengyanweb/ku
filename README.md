@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.11`，重点是 Result ABI、`try/catch/finally` 的错误 CFG 边、package 文件依赖缓存和更严格的 match 诊断。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.12`，重点是嵌套 `match` 模式、独立导入的 `std:http` 标准库雏形，以及更接近真实可执行入口的 native C 输出。
 
 ## 快速开始
 
@@ -37,7 +37,7 @@ ku -h | -help         Print help
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.11 支持的核心语法
+## 0.0.12 支持的核心语法
 
 ```ku
 struct User {
@@ -176,6 +176,7 @@ package/
 ## 文档
 
 - [0.0.11 语法草案](docs/syntax.md)
+- [0.0.12 版本记录](docs/v0.0.12.md)
 - [0.0.11 版本记录](docs/v0.0.11.md)
 - [0.0.10 版本记录](docs/v0.0.10.md)
 - [0.0.9 版本记录](docs/v0.0.9.md)
@@ -195,7 +196,7 @@ package/
 
 `ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、局部变量、直接函数调用、`print`、`return`、`if`、`while`，以及 `Result<int|bool|str, str>` 的 `ok` / `err` / `?` / 错误传播。数组、struct、enum、闭包、match、try/catch 的 native lowering 仍会明确报不支持。
 
-已完成到 0.0.11 的关键前置：
+已完成到 0.0.12 的关键前置：
 
 ```txt
 运行时闭包使用精确 capture map，不再把整个 Env 存进函数值。
@@ -203,6 +204,9 @@ IR 已有 ResultBranch / BindOk / JumpErr / PropagateErr。
 native C 后端已有 Result<int|bool|str,str> ABI 子集。
 package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
+match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。
+std:http 必须显式 import，当前提供 http.try_get(url): str! 的 http:// 同步 Result 子集。
+native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wrapper。
 ```
 
 仍未完成：
@@ -211,7 +215,7 @@ match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面�
 async / await
 LLVM 后端
 HTTP/registry package、真正语义版本求解、网络下载和强校验
-复杂嵌套模式、match guard 完整模式矩阵和穷尽性检查
+完整 match guard 模式矩阵和跨 guard 的穷尽性证明
 完整 native C 后端
 ```
 

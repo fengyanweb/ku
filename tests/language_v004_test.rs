@@ -554,7 +554,7 @@ fn main() {
 "#,
     );
     assert!(
-        err.contains("expects 1 bindings"),
+        err.contains("expects 1 fields"),
         "unexpected match error: {err}"
     );
 }

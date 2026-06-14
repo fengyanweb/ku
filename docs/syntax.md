@@ -1,6 +1,6 @@
-# Ku 0.0.11 Syntax Draft
+# Ku 0.0.12 Syntax Draft
 
-本文固定 Ku 0.0.11 的语法边界。当前 CLI 版本显示 `0.0.11`。
+本文固定 Ku 0.0.12 的语法边界。当前 CLI 版本显示 `0.0.12`。
 
 ## 文件和入口
 
@@ -90,7 +90,7 @@ fn load(): str! {
 
 `T!` 表示 `Result<T, str>`。当前固定错误 payload 为 `str`。
 
-`string` 和 `nil` 不是 0.0.11 类型名。
+`string` 和 `nil` 不是 0.0.12 类型名。
 
 ## 变量
 
@@ -253,7 +253,7 @@ payload 构造使用 `EnumName.Variant(args...)`。
 
 ## Match / Switch
 
-`match` 和 `switch` 是表达式，当前支持字面量、`_` 和 enum variant 模式：
+`match` 和 `switch` 是表达式，当前支持字面量、`_`、绑定名和 enum variant 模式：
 
 ```ku
 text = match Expr.Number(7) {
@@ -262,13 +262,19 @@ text = match Expr.Number(7) {
     _ => "none"
 }
 
+nested = match Expr.Box(Inner.Number(7)) {
+    Expr.Box(Inner.Number(value)) if (value > 0) => "positive"
+    Expr.Box(_) => "box"
+    Expr.Empty => "empty"
+}
+
 label = switch 2 {
     1 => "one"
     _ => "other"
 }
 ```
 
-对 enum 做 `match` 时，如果没有未带 guard 的 `_`，必须覆盖所有未带 guard 的 variant。带 guard 的分支不计入穷尽覆盖；`_ if (...)` 不会让后续分支变成不可达。重复的未带 guard 字面量分支和 enum variant 分支会被诊断为不可达。复杂嵌套模式和完整 guard 模式矩阵后续再补。非 enum 值当前没有完整穷尽性检查，没有匹配分支会在运行时报错。
+对 enum 做 `match` 时，如果没有未带 guard 的 `_` 或绑定名 catch-all，必须覆盖所有未带 guard 的 variant。带 guard 的分支不计入穷尽覆盖；`_ if (...)` 不会让后续分支变成不可达。重复的未带 guard 字面量分支、enum variant 分支和嵌套 enum 模式会被诊断为不可达。`Expr.Box(Inner.Number(v))` 这类局部嵌套模式不会被误判为覆盖整个 `Expr.Box(_)`。完整 guard 模式矩阵和跨 guard 的穷尽性证明后续再补。非 enum 值当前没有完整穷尽性检查，没有匹配分支会在运行时报错。
 
 ## 数组
 
@@ -379,7 +385,7 @@ print(`literal \{name\}`)
 
 ## 错误处理
 
-Ku 0.0.11 继续沿用可恢复错误模型：
+Ku 0.0.12 继续沿用可恢复错误模型：
 
 ```txt
 T!             Result<T, str>
@@ -412,7 +418,7 @@ fn main() {
 }
 ```
 
-`?` 只能用在返回 `T!` 的函数内，或用在 `try { ... }` 的 body 内。它会短路当前表达式，避免继续执行右侧调用。`catch (err)` 中的 `err` 固定为 `str`。0.0.11 的 IR 已把 `?` 降成显式 `ok/err` 控制流，native C 后端已经支持 `Result<int|bool|str, str>` 的基础 ABI。
+`?` 只能用在返回 `T!` 的函数内，或用在 `try { ... }` 的 body 内。它会短路当前表达式，避免继续执行右侧调用。`catch (err)` 中的 `err` 固定为 `str`。0.0.12 的 IR 已把 `?` 降成显式 `ok/err` 控制流，native C 后端已经支持 `Result<int|bool|str, str>` 的基础 ABI。
 
 `panic` 不会被 `try/catch` 捕获；它表示数组越界、内部 bug、主动崩溃等不可恢复问题。
 
@@ -453,7 +459,7 @@ string.ends_with("Ku", "u")
 string.trim("  Ku  ")
 string.lower("KU")
 string.upper("ku")
-string.replace("Ku Lang", "Lang", "0.0.11")
+string.replace("Ku Lang", "Lang", "0.0.12")
 string.slice("Ku Lang", 0, 2)
 
 array.len([1, 2])
@@ -476,6 +482,19 @@ time.millis()
 `array.push` 和 `array.concat` 返回新数组，不会原地修改参数。`array.try_get` 返回元素类型的 `T!`，越界或负数返回 `Err(str)`。`string.slice` 按字符下标切片，返回 `str!`，越界返回 `Err(str)`。
 
 `json.parse` 返回运行时 JSON 值，静态类型暂记为 `Unknown`；字段级类型推断后续随类型系统完善。`json.try_parse` 返回 `Unknown!`，可以配合 `?` 和 `try/catch`。
+
+HTTP 是独立标准库模块，必须显式导入：
+
+```ku
+import http from "std:http"
+
+fn main(): str! {
+    text = http.try_get("http://example.com")?
+    return ok(text)
+}
+```
+
+`http.try_get(url)` 返回 `str!`。当前只支持 `http://`，有 5 秒读写超时和 1MB body 上限，不做自动重试；非法 URL、`https://`、连接失败、非 200 状态和超大响应都会返回 `Err(str)`。裸写 `http.try_get(...)` 不导入会在 `ku check` 阶段报错。
 
 ## Package
 
@@ -543,7 +562,7 @@ stdlib string / array / json / time 的参数数量和基础类型错误
 
 `ku build` 当前生成“解释器打包型可执行文件”：源码被嵌入生成的 exe 中，运行 exe 会通过 Ku 解释器执行。它是真正可运行的文件，但还不是 native C/LLVM 后端。
 
-`ku build --native <file.ku>` 当前输出 prototype C 源码，支持 int/bool/str、局部变量、直接函数调用、print、return、if、while，以及 `Result<int|bool|str, str>` 的 `ok` / `err` / `?` / 错误传播。遇到数组、struct、enum、闭包、match、try/catch 等复杂语法会明确报不支持。
+`ku build --native <file.ku>` 当前输出 prototype C 源码，支持 int/bool/str、局部变量、直接函数调用、print、return、if、while，以及 `Result<int|bool|str, str>` 的 `ok` / `err` / `?` / 错误传播。生成的 Ku `main` 会在 C 中改名为 `ku_main`，并额外生成系统 `int main(void)` wrapper；Result main 返回 Err 时会打印错误并返回非 0。遇到数组、struct、enum、闭包、match、try/catch 等复杂语法会明确报不支持。
 
 当前 `ku build` 是开发环境功能，需要本机可调用 `rustc`，并且 `ku` 可执行文件旁边能找到 `libku.rlib` 或 `deps/libku*.rlib`。它只打包 Ku 源码本身，不打包 `fs.read` 读取的外部资源文件；相对资源路径仍按被 build 的源文件路径解析。
 
@@ -554,7 +573,7 @@ HTTP/registry package、网络下载、真正语义版本求解和强校验
 异步
 完整 native C / LLVM 后端
 顶层脚本语句
-复杂嵌套模式、match guard 模式矩阵和完整穷尽性检查
+match guard 模式矩阵和跨 guard 的完整穷尽性检查
 ```
 
 ## 资源保护

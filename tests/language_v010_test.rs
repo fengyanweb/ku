@@ -5,8 +5,8 @@ use std::{
 };
 
 use ku::{
-    backend, checker::Checker, cli::run_cli, cli::run_source, ir, lexer::Lexer, package,
-    parser::Parser,
+    backend, checker::Checker, cli::check_source, cli::run_cli, cli::run_source, ir, lexer::Lexer,
+    package, parser::Parser,
 };
 
 fn unique_temp_path(name: &str) -> PathBuf {
@@ -177,6 +177,8 @@ fn main() {
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate c");
 
+    assert!(c.contains("void ku_main("));
+    assert!(c.contains("int main(void)"));
     assert!(c.contains("if ("));
     assert!(c.contains("goto block"));
     assert!(c.contains("block"));
@@ -204,6 +206,8 @@ fn main(): int! {
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate c");
 
+    assert!(c.contains("KuResultInt ku_main("));
+    assert!(c.contains("int main(void)"));
     assert!(c.contains("typedef struct { bool ok; int64_t value; const char* error; } KuResultInt"));
     assert!(c.contains("if (t0.ok) goto block"));
     assert!(c.contains(" = t0.value;"));
@@ -349,6 +353,137 @@ fn main() {
     );
 
     assert!(err.contains("unreachable"), "unexpected error: {err}");
+}
+
+#[test]
+fn nested_enum_match_patterns_bind_and_run_with_guards() {
+    let source = r#"
+enum Inner {
+    Number(value:int)
+    Empty
+}
+
+enum Expr {
+    Box(value:Inner)
+    Other
+}
+
+fn main() {
+    value = Expr.Box(Inner.Number(7))
+    text = match value {
+        Expr.Box(Inner.Number(n)) if (n == 7) => "seven"
+        Expr.Box(_) => "box"
+        Expr.Other => "other"
+    }
+    if (text != "seven") {
+        panic("bad nested match")
+    }
+}
+"#;
+
+    run_source("inline.ku", source).expect("nested enum match should run");
+}
+
+#[test]
+fn nested_enum_match_partial_payload_is_not_exhaustive() {
+    let err = check_err(
+        r#"
+enum Inner {
+    Number(value:int)
+    Empty
+}
+
+enum Expr {
+    Box(value:Inner)
+    Other
+}
+
+fn main() {
+    value = Expr.Box(Inner.Empty)
+    text = match value {
+        Expr.Box(Inner.Number(n)) => "boxed number"
+        Expr.Other => "other"
+    }
+    print(text)
+}
+"#,
+    );
+
+    assert!(err.contains("not exhaustive"), "unexpected error: {err}");
+    assert!(err.contains("Box"), "unexpected error: {err}");
+}
+
+#[test]
+fn duplicate_nested_match_pattern_is_unreachable() {
+    let err = check_err(
+        r#"
+enum Inner {
+    Number(value:int)
+    Empty
+}
+
+enum Expr {
+    Box(value:Inner)
+    Other
+}
+
+fn main() {
+    value = Expr.Box(Inner.Number(1))
+    text = match value {
+        Expr.Box(Inner.Number(1)) => "one"
+        Expr.Box(Inner.Number(1)) => "again"
+        Expr.Box(_) => "box"
+        Expr.Other => "other"
+    }
+    print(text)
+}
+"#,
+    );
+
+    assert!(err.contains("unreachable"), "unexpected error: {err}");
+}
+
+#[test]
+fn http_stdlib_requires_explicit_std_import() {
+    let err = check_err(
+        r#"
+fn main() {
+    result = http.try_get("http://example.com")
+    print(str(result))
+}
+"#,
+    );
+
+    assert!(
+        err.contains("std module 'http' must be imported"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn imported_http_stdlib_returns_recoverable_errors_without_network_retry() {
+    let dir = unique_temp_path("std-http");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let main = dir.join("main.ku");
+    let source = r#"
+import http from "std:http"
+
+fn main(): str! {
+    text = http.try_get("https://example.com")?
+    return ok(text)
+}
+"#;
+    fs::write(&main, source).expect("write main");
+
+    check_source(&main.display().to_string(), source).expect("std:http import should check");
+    let err = run_source(&main.display().to_string(), source)
+        .expect_err("https should be a recoverable http error in this stage")
+        .to_string();
+    assert!(
+        err.contains("http.try_get currently supports only http:// URLs"),
+        "unexpected error: {err}"
+    );
+    fs::remove_dir_all(dir).expect("remove temp dir");
 }
 
 #[test]
