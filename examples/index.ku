@@ -1,8 +1,13 @@
+import "./hello.ku"
 fn main() {
     fn go(name: str, age: int) {
         print(`我是{name},我{age}岁了`)
     }
 
     go("Ku", 3)
+    he()
+    Ab()
 }
-
+fn he() {
+    print("哈哈哈哈")
+}
