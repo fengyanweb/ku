@@ -5,8 +5,8 @@ use std::{
 
 use crate::{
     ast::{
-        AssignTarget, BinaryOp, Expr, ExprKind, FnDecl, Item, Literal, MatchPattern, Program, Stmt,
-        UnaryOp,
+        AssignTarget, BinaryOp, Expr, ExprKind, FnDecl, FunctionParam, Item, Literal, MatchPattern,
+        Program, Stmt, UnaryOp,
     },
     env::Env,
     error::{KuError, KuResult},
@@ -24,6 +24,16 @@ enum Flow {
     Continue,
     Return(Value),
     Fail(Value),
+}
+
+struct FunctionValueCall<'a> {
+    params: &'a [String],
+    body: &'a [Stmt],
+    captures: &'a Env,
+    self_name: &'a Option<String>,
+    args: Vec<Value>,
+    span: Span,
+    depth: usize,
 }
 
 pub struct Interpreter {
@@ -145,15 +155,16 @@ impl Interpreter {
         result
     }
 
-    fn call_function_value(
-        &mut self,
-        params: &[String],
-        body: &[Stmt],
-        captured: &Env,
-        args: Vec<Value>,
-        span: Span,
-        depth: usize,
-    ) -> KuResult<Value> {
+    fn call_function_value(&mut self, call: FunctionValueCall<'_>) -> KuResult<Value> {
+        let FunctionValueCall {
+            params,
+            body,
+            captures,
+            self_name,
+            args,
+            span,
+            depth,
+        } = call;
         if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
             return Err(KuError::runtime(
                 "maximum function call depth exceeded",
@@ -173,8 +184,21 @@ impl Interpreter {
                 ));
             }
 
-            let mut env = captured.clone();
+            let mut env = captures.clone();
             env.push_scope();
+            if let Some(name) = self_name {
+                env.define(
+                    name.clone(),
+                    Value::Function {
+                        params: params.to_vec(),
+                        body: body.to_vec(),
+                        captures: captures.clone(),
+                        self_name: self_name.clone(),
+                    },
+                    false,
+                    span,
+                )?;
+            }
             for (param, value) in params.iter().zip(args) {
                 env.define(param.clone(), value, false, span)?;
             }
@@ -334,13 +358,19 @@ impl Interpreter {
                     .map(|param| param.name.clone())
                     .collect::<Vec<_>>();
                 let body = function.body.clone();
-                env.define_with_env(function.name.clone(), false, function.span, |captured| {
+                let capture_names = function_capture_names(function);
+                let captures = env.capture(&capture_names);
+                env.define(
+                    function.name.clone(),
                     Value::Function {
                         params,
                         body,
-                        env: captured,
-                    }
-                })?;
+                        captures,
+                        self_name: Some(function.name.clone()),
+                    },
+                    false,
+                    function.span,
+                )?;
                 Ok(Flow::Continue)
             }
             Stmt::Try {
@@ -523,15 +553,17 @@ impl Interpreter {
                     Value::Function {
                         params,
                         body,
-                        env: captured,
-                    } => self.call_function_value(
-                        &params,
-                        &body,
-                        &captured,
+                        captures,
+                        self_name,
+                    } => self.call_function_value(FunctionValueCall {
+                        params: &params,
+                        body: &body,
+                        captures: &captures,
+                        self_name: &self_name,
                         args,
-                        expr.span,
-                        depth + 1,
-                    ),
+                        span: expr.span,
+                        depth: depth + 1,
+                    }),
                     other => Err(KuError::runtime(
                         format!("cannot call {}", other.type_name()),
                         callee.span,
@@ -541,7 +573,8 @@ impl Interpreter {
             ExprKind::Function { params, body, .. } => Ok(Value::Function {
                 params: params.iter().map(|param| param.name.clone()).collect(),
                 body: body.clone(),
-                env: env.clone(),
+                captures: env.capture(&closure_capture_names(params, body)),
+                self_name: None,
             }),
             ExprKind::Array(values) => {
                 let mut result = Vec::with_capacity(values.len());
@@ -1170,6 +1203,174 @@ fn is_constant_name(name: &str) -> bool {
         }
     }
     has_alpha
+}
+
+fn function_capture_names(function: &FnDecl) -> HashSet<String> {
+    let mut bound = HashSet::new();
+    bound.insert(function.name.clone());
+    for param in &function.params {
+        bound.insert(param.name.clone());
+    }
+    let mut free = HashSet::new();
+    collect_free_block(&function.body, &mut bound, &mut free);
+    free
+}
+
+fn closure_capture_names(params: &[FunctionParam], body: &[Stmt]) -> HashSet<String> {
+    let mut bound = HashSet::new();
+    for param in params {
+        bound.insert(param.name.clone());
+    }
+    let mut free = HashSet::new();
+    collect_free_block(body, &mut bound, &mut free);
+    free
+}
+
+fn collect_free_block(body: &[Stmt], bound: &mut HashSet<String>, free: &mut HashSet<String>) {
+    for stmt in body {
+        collect_free_stmt(stmt, bound, free);
+    }
+}
+
+fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSet<String>) {
+    match stmt {
+        Stmt::VarDecl { name, value, .. } | Stmt::Assign { name, value, .. } => {
+            collect_free_expr(value, bound, free);
+            bound.insert(name.clone());
+        }
+        Stmt::AssignTarget { target, value, .. } => {
+            collect_free_assign_target(target, bound, free);
+            collect_free_expr(value, bound, free);
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_free_expr(condition, bound, free);
+            collect_free_block(then_branch, &mut bound.clone(), free);
+            collect_free_block(else_branch, &mut bound.clone(), free);
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            collect_free_expr(condition, bound, free);
+            collect_free_block(body, &mut bound.clone(), free);
+        }
+        Stmt::For {
+            name,
+            iterable,
+            body,
+            ..
+        } => {
+            collect_free_expr(iterable, bound, free);
+            let mut scoped = bound.clone();
+            scoped.insert(name.clone());
+            collect_free_block(body, &mut scoped, free);
+        }
+        Stmt::Function(function) => {
+            bound.insert(function.name.clone());
+        }
+        Stmt::Try {
+            body,
+            catch_name,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            collect_free_block(body, &mut bound.clone(), free);
+            let mut catch_bound = bound.clone();
+            if let Some(name) = catch_name {
+                catch_bound.insert(name.clone());
+            }
+            collect_free_block(catch_body, &mut catch_bound, free);
+            collect_free_block(finally_body, &mut bound.clone(), free);
+        }
+        Stmt::Fail { value, .. } | Stmt::Panic { value, .. } | Stmt::Print { value, .. } => {
+            collect_free_expr(value, bound, free);
+        }
+        Stmt::Return { value, .. } => {
+            if let Some(value) = value {
+                collect_free_expr(value, bound, free);
+            }
+        }
+        Stmt::Expr { expr, .. } => collect_free_expr(expr, bound, free),
+    }
+}
+
+fn collect_free_assign_target(
+    target: &AssignTarget,
+    bound: &HashSet<String>,
+    free: &mut HashSet<String>,
+) {
+    match target {
+        AssignTarget::Variable(name) => {
+            if !bound.contains(name) {
+                free.insert(name.clone());
+            }
+        }
+        AssignTarget::Index { target, index } => {
+            collect_free_expr(target, bound, free);
+            collect_free_expr(index, bound, free);
+        }
+        AssignTarget::Field { target, .. } => collect_free_expr(target, bound, free),
+    }
+}
+
+fn collect_free_expr(expr: &Expr, bound: &HashSet<String>, free: &mut HashSet<String>) {
+    match &expr.kind {
+        ExprKind::Variable(name) => {
+            if !bound.contains(name) {
+                free.insert(name.clone());
+            }
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } => {
+            collect_free_expr(expr, bound, free);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_free_expr(left, bound, free);
+            collect_free_expr(right, bound, free);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_free_expr(callee, bound, free);
+            for arg in args {
+                collect_free_expr(arg, bound, free);
+            }
+        }
+        ExprKind::Array(values) => {
+            for value in values {
+                collect_free_expr(value, bound, free);
+            }
+        }
+        ExprKind::Index { target, index } => {
+            collect_free_expr(target, bound, free);
+            collect_free_expr(index, bound, free);
+        }
+        ExprKind::Field { target, .. } => collect_free_expr(target, bound, free),
+        ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+            for (_, value) in fields {
+                collect_free_expr(value, bound, free);
+            }
+        }
+        ExprKind::Match { value, arms } => {
+            collect_free_expr(value, bound, free);
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    collect_free_expr(guard, bound, free);
+                }
+                collect_free_expr(&arm.value, bound, free);
+            }
+        }
+        ExprKind::Function { params, body, .. } => {
+            let mut nested = bound.clone();
+            for param in params {
+                nested.insert(param.name.clone());
+            }
+            collect_free_block(body, &mut nested, free);
+        }
+        ExprKind::Literal(_) => {}
+    }
 }
 
 impl Default for Interpreter {

@@ -371,10 +371,13 @@ fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
         let package = package::discover_for_file(path)?;
         if let Some(package) = &package {
             package::ensure_cache_dir(package)?;
-            package::write_lock(package)?;
         }
         let mut loader = ModuleLoader::new(package);
-        loader.load_entry(path, program)?
+        let program = loader.load_entry(path, program)?;
+        if let Some(package) = &loader.package {
+            package::write_lock_with_dependencies(package, &loader.dependency_paths)?;
+        }
+        program
     } else {
         program
     };
@@ -407,6 +410,7 @@ struct ModuleLoader {
     modules: HashMap<PathBuf, ModuleExports>,
     namespace_counter: usize,
     package: Option<PackageContext>,
+    dependency_paths: Vec<PathBuf>,
 }
 
 impl ModuleLoader {
@@ -416,6 +420,7 @@ impl ModuleLoader {
             modules: HashMap::new(),
             namespace_counter: 0,
             package,
+            dependency_paths: Vec::new(),
         }
     }
 
@@ -429,6 +434,9 @@ impl ModuleLoader {
 
     fn load_module(&mut self, path: &Path, span: Span) -> KuResult<ModuleExports> {
         let canonical = canonical_file(path, span)?;
+        if !self.dependency_paths.contains(&canonical) {
+            self.dependency_paths.push(canonical.clone());
+        }
         if self.states.get(&canonical) == Some(&LoadState::Visiting) {
             return Err(KuError::runtime(
                 format!("circular import detected at {}", canonical.display()),

@@ -27,7 +27,8 @@ pub enum Value {
     Function {
         params: Vec<String>,
         body: Vec<Stmt>,
-        env: Env,
+        captures: Env,
+        self_name: Option<String>,
     },
     Null,
 }

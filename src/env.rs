@@ -1,6 +1,5 @@
 ﻿use std::collections::HashMap;
-
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
 use crate::error::{KuError, KuResult};
 use crate::span::Span;
@@ -12,7 +11,7 @@ pub struct Binding {
     pub mutable: bool,
 }
 
-type BindingCell = Rc<RefCell<Binding>>;
+pub(crate) type BindingCell = Rc<RefCell<Binding>>;
 
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -57,31 +56,25 @@ impl Env {
         Ok(())
     }
 
-    pub fn define_with_env(
-        &mut self,
-        name: String,
-        mutable: bool,
-        span: Span,
-        make_value: impl FnOnce(Env) -> Value,
-    ) -> KuResult<()> {
-        let scope = self
-            .scopes
-            .last_mut()
-            .expect("environment always has a scope");
-        if scope.contains_key(&name) {
-            return Err(KuError::runtime(
-                format!("variable '{}' is already defined in this scope", name),
-                span,
-            ));
+    pub(crate) fn capture(&self, names: &HashSet<String>) -> Env {
+        let mut captured = HashMap::new();
+        for name in names {
+            if let Some(cell) = self.find_cell(name) {
+                captured.insert(name.clone(), cell);
+            }
         }
-        let cell = Rc::new(RefCell::new(Binding {
-            value: Value::Null,
-            mutable: true,
-        }));
-        scope.insert(name, cell.clone());
-        let value = make_value(self.clone());
-        *cell.borrow_mut() = Binding { value, mutable };
-        Ok(())
+        Env {
+            scopes: vec![captured],
+        }
+    }
+
+    fn find_cell(&self, name: &str) -> Option<BindingCell> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(binding) = scope.get(name) {
+                return Some(binding.clone());
+            }
+        }
+        None
     }
 
     pub fn assign(&mut self, name: &str, value: Value, span: Span) -> KuResult<()> {

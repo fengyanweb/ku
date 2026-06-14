@@ -1,6 +1,6 @@
 # Ku IR Draft
 
-0.0.7 开始引入 IR，0.0.9 推进到 typed temp CFG 草案。目标是给 native C / LLVM 后端打地基，不直接从 AST 跳到 C 或 LLVM。
+0.0.7 开始引入 IR，0.0.10 推进到 typed temp CFG + Result ok/err CFG 草案。目标是给 native C / LLVM 后端打地基，不直接从 AST 跳到 C 或 LLVM。
 
 ## 目标
 
@@ -41,7 +41,7 @@ ku ir examples\function.ku
 
 ## 当前边界
 
-0.0.9 的 IR 是 typed temp CFG 草案层：
+0.0.10 的 IR 是 typed temp CFG 草案层：
 
 - 能列出顶层函数。
 - 能保留参数和返回类型。
@@ -51,15 +51,16 @@ ku ir examples\function.ku
 - 数组/字段赋值通过 `IrLValue` 表达。
 - `if` / `while` 已有基础 block 和 `Branch` / `Jump` / `Return` terminator。
 - `for` 已有 `ForEach` terminator。
-- `try/catch/finally` 已有 `BeginTry` / `EndTry` / `BindError` 标记。
+- `?` 会降成 `ResultBranch`，ok 分支用 `BindOk` 取值，err 分支用 `PropagateErr` 或跳入 try handler。
+- `try/catch/finally` 已有 `BeginTry` / `EndTry` / `BindError` 标记，并可作为 `?` 的错误边目标。
 - struct / enum 会进入 layout table。
-- 复杂 `match` 和 `?` 的完整失败路径 CFG 仍是待 lowering 边界。
+- 复杂 `match` lowering、Result ABI 和 try/finally 的完整 native lowering 仍是待完成边界。
 - 暂不做 SSA、寄存器分配和完整 native ABI lowering。
 
 ## 后续 native 前置任务
 
-1. 把 `?` / `try` 的失败路径降成显式 ok/err block。
-2. 完整 lowering `match`，再做穷尽性检查。
+1. 固定 Result ABI，让 `ResultBranch` 可以进入 native C / LLVM 后端。
+2. 完整 lowering `match`，再扩展复杂嵌套模式检查。
 3. 固定 struct / enum / array / result / string 的 native ABI。
-4. 扩展 C 后端到 if / while / int 函数子集。
+4. 继续扩展 C 后端，覆盖 Result、struct/enum 和闭包。
 5. 再评估 LLVM 后端。

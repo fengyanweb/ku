@@ -1,7 +1,10 @@
 use crate::{
     ast::{BinaryOp, UnaryOp},
     error::{KuError, KuResult},
-    ir::{IrBlock, IrExpr, IrExprKind, IrFunction, IrInst, IrProgram, IrTerminator, IrType},
+    ir::{
+        IrBlock, IrCallKind, IrExpr, IrExprKind, IrFunction, IrInst, IrProgram, IrTerminator,
+        IrType,
+    },
     span::Span,
 };
 
@@ -49,7 +52,7 @@ fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
 
 fn emit_block(out: &mut String, block: &IrBlock) -> KuResult<()> {
     if block.id.0 != 0 {
-        out.push_str(&format!("block{}:\n", block.id.0));
+        out.push_str(&format!("block{}:;\n", block.id.0));
     }
     for inst in &block.instructions {
         emit_inst(out, inst)?;
@@ -65,6 +68,11 @@ fn emit_inst(out: &mut String, inst: &IrInst) -> KuResult<()> {
                 c_type(ty)?,
                 id.0,
                 c_expr(value)?
+            ));
+        }
+        IrInst::BindOk { .. } => {
+            return Err(unsupported(
+                "native C prototype does not support Result ok binding yet",
             ));
         }
         IrInst::Let { name, ty, value } => {
@@ -148,6 +156,9 @@ fn emit_terminator(out: &mut String, terminator: &IrTerminator) -> KuResult<()> 
         IrTerminator::ForEach { .. } => Err(unsupported(
             "native C prototype does not support for lowering yet",
         )),
+        IrTerminator::ResultBranch { .. } | IrTerminator::PropagateErr(_) => Err(unsupported(
+            "native C prototype does not support Result control flow yet",
+        )),
         IrTerminator::Return(Some(value)) => {
             out.push_str(&format!("  return {};\n", c_expr(value)?));
             Ok(())
@@ -175,7 +186,12 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
             c_binary(*op),
             c_expr(right)?
         )),
-        IrExprKind::Call { callee, args, .. } => {
+        IrExprKind::Call { callee, args, kind } => {
+            if !matches!(kind, IrCallKind::Direct(_)) {
+                return Err(unsupported(
+                    "native C prototype only supports direct function calls",
+                ));
+            }
             let callee = c_expr(callee)?;
             let args = args
                 .iter()

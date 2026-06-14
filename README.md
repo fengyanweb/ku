@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.9`，重点是 typed temp IR、stdlib ABI metadata、package lock 草案和 native C 后端原型。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.10`，重点是运行时精确闭包捕获、Result 显式 CFG、package lock 依赖记录和 native C 后端 if/while/int 子集。
 
 ## 快速开始
 
@@ -35,7 +35,7 @@ ku -h | -help         Print help
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.9 支持的核心语法
+## 0.0.10 支持的核心语法
 
 ```ku
 struct User {
@@ -165,7 +165,8 @@ package/
 
 ## 文档
 
-- [0.0.9 语法草案](docs/syntax.md)
+- [0.0.10 语法草案](docs/syntax.md)
+- [0.0.10 版本记录](docs/v0.0.10.md)
 - [0.0.9 版本记录](docs/v0.0.9.md)
 - [0.0.8 版本记录](docs/v0.0.8.md)
 - [0.0.7 版本记录](docs/v0.0.7.md)
@@ -181,25 +182,25 @@ package/
 
 `ku build` 当前生成解释器打包型可执行文件。
 
-`ku build --native` 当前输出 prototype C 源码，只覆盖 int/bool/str、局部变量、直接函数调用和 print。复杂语法会清楚报不支持，还不是完整 native C / LLVM 后端。
+`ku build --native` 当前输出 prototype C 源码，只覆盖 int/bool/str、局部变量、直接函数调用、print、return、if 和 while。复杂语法会清楚报不支持，还不是完整 native C / LLVM 后端。
 
 暂未完成：
 
 ```txt
 async / await
-native C / LLVM 后端
-运行时闭包 capture map 和 Rc 循环引用治理
-复杂嵌套模式和 match 穷尽性检查
+完整 native C / LLVM 后端
+复杂嵌套模式、match guard 模式矩阵和完整穷尽性检查
+远程 package、版本解析、下载校验和缓存淘汰
 ```
 
-已评估但暂不完整进入 0.0.9 的能力：
+已评估但暂不完整进入 0.0.10 的能力：
 
 ```txt
-包管理：已有 ku.mod/import root/cache/version/ku.lock 草案；远程包、依赖解析、下载校验和缓存淘汰还没有做。
+包管理：已有 ku.mod/import root/cache/version/ku.lock 依赖列表和 import cache key；远程包、版本解析、下载校验和缓存淘汰还没有做。
 async / await：需要事件循环或任务模型，不能只加关键字。
-native C / LLVM 后端：已有 typed temp IR、layout table、stdlib ABI metadata 和 prototype C 源码输出；完整 Result、闭包、struct/enum ABI 和 LLVM 还没有做。
-引用捕获闭包：IR 已完成自由变量精确捕获，运行时仍需从保存整个 Env 改成 capture map / weak self binding，彻底治理 Rc 循环。
-match 穷尽性：需要完整类型和模式矩阵，不适合混在 stdlib 拆分里。
+native C / LLVM 后端：已有 typed temp IR、layout table、stdlib ABI metadata、Result 显式 CFG 和 prototype C 源码输出；完整 Result、闭包、struct/enum ABI 和 LLVM 还没有做。
+引用捕获闭包：运行时已改成 capture map，递归 self binding 不再保存整个 Env；后续如果做跨线程/异步闭包，再评估 Weak/arena 模型。
+match 穷尽性：enum 顶层 variant 已做基础穷尽性检查；复杂嵌套模式和 guard 模式矩阵还没有做。
 ```
 
 ## 开发验证

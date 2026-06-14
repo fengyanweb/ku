@@ -90,6 +90,11 @@ pub enum IrInst {
         ty: IrType,
         value: IrExpr,
     },
+    BindOk {
+        id: TempId,
+        ty: IrType,
+        result: IrExpr,
+    },
     Let {
         name: String,
         ty: IrType,
@@ -137,6 +142,12 @@ pub enum IrTerminator {
         body_block: BlockId,
         after_block: BlockId,
     },
+    ResultBranch {
+        result: IrExpr,
+        ok_block: BlockId,
+        err_block: BlockId,
+    },
+    PropagateErr(IrExpr),
     Return(Option<IrExpr>),
     Unreachable,
 }
@@ -347,6 +358,9 @@ impl fmt::Display for IrInst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IrInst::Temp { id, ty, value } => write!(f, "%t{}: {ty} = {value}", id.0),
+            IrInst::BindOk { id, ty, result } => {
+                write!(f, "%t{}: {ty} = ok_value {result}", id.0)
+            }
             IrInst::Let { name, ty, value } => write!(f, "let {name}: {ty} = {value}"),
             IrInst::Store { target, value } => write!(f, "store {target} = {value}"),
             IrInst::Print(value) => write!(f, "print {value}"),
@@ -409,6 +423,16 @@ impl fmt::Display for IrTerminator {
                 "foreach {name} in {iterable} ? block{} : block{}",
                 body_block.0, after_block.0
             ),
+            IrTerminator::ResultBranch {
+                result,
+                ok_block,
+                err_block,
+            } => write!(
+                f,
+                "result_branch {result} ok block{} err block{}",
+                ok_block.0, err_block.0
+            ),
+            IrTerminator::PropagateErr(value) => write!(f, "propagate_err {value}"),
             IrTerminator::Return(Some(value)) => write!(f, "return {value}"),
             IrTerminator::Return(None) => write!(f, "return"),
             IrTerminator::Unreachable => write!(f, "unreachable"),
@@ -470,6 +494,14 @@ struct FunctionLowerer<'a> {
     next_block_id: usize,
     next_temp_id: usize,
     next_local_function_id: usize,
+    try_handlers: Vec<IrTryHandler>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IrTryHandler {
+    catch_block: Option<BlockId>,
+    finally_block: Option<BlockId>,
+    after_block: BlockId,
 }
 
 impl<'a> FunctionLowerer<'a> {
@@ -487,6 +519,7 @@ impl<'a> FunctionLowerer<'a> {
             next_block_id: 1,
             next_temp_id: 0,
             next_local_function_id: 10_000,
+            try_handlers: Vec::new(),
         }
     }
 
@@ -740,12 +773,18 @@ impl<'a> FunctionLowerer<'a> {
             finally_block: finally_id,
             after_block: after_id,
         });
+        self.try_handlers.push(IrTryHandler {
+            catch_block: catch_id,
+            finally_block: finally_id,
+            after_block: after_id,
+        });
         for stmt in body {
             self.lower_stmt(stmt)?;
             if self.current.terminator != IrTerminator::Next {
                 break;
             }
         }
+        self.try_handlers.pop();
         if self.current.terminator == IrTerminator::Next {
             self.current.instructions.push(IrInst::EndTry);
             self.current.terminator = IrTerminator::Jump(finally_id.unwrap_or(after_id));
@@ -914,10 +953,7 @@ impl<'a> FunctionLowerer<'a> {
                     IrType::Result(inner) => *inner.clone(),
                     _ => IrType::Unknown,
                 };
-                self.emit_temp(IrExpr {
-                    kind: IrExprKind::TryUnwrap(Box::new(expr)),
-                    ty,
-                })
+                self.emit_try_unwrap(expr, ty)
             }
             ExprKind::StructLiteral { name, .. } => Ok(unsupported_expr(format!("{name} literal"))),
             ExprKind::ObjectLiteral { .. } => Ok(unsupported_expr("object literal")),
@@ -942,6 +978,47 @@ impl<'a> FunctionLowerer<'a> {
             kind: IrExprKind::Temp(id),
             ty,
         })
+    }
+
+    fn emit_try_unwrap(&mut self, result: IrExpr, ty: IrType) -> KuResult<IrExpr> {
+        let id = TempId(self.next_temp_id);
+        self.next_temp_id += 1;
+        let ok_block = self.next_block("try_ok");
+        let err_block = self.next_block("try_err");
+        self.current.terminator = IrTerminator::ResultBranch {
+            result: result.clone(),
+            ok_block,
+            err_block,
+        };
+        self.finish_current();
+
+        self.start_block(err_block, "try_err");
+        self.current.terminator = self.err_terminator(result.clone());
+        self.finish_current();
+
+        self.start_block(ok_block, "try_ok");
+        self.current.instructions.push(IrInst::BindOk {
+            id,
+            ty: ty.clone(),
+            result,
+        });
+        Ok(IrExpr {
+            kind: IrExprKind::Temp(id),
+            ty,
+        })
+    }
+
+    fn err_terminator(&self, result: IrExpr) -> IrTerminator {
+        if let Some(handler) = self.try_handlers.last() {
+            IrTerminator::Jump(
+                handler
+                    .catch_block
+                    .or(handler.finally_block)
+                    .unwrap_or(handler.after_block),
+            )
+        } else {
+            IrTerminator::PropagateErr(result)
+        }
     }
 
     fn next_block(&mut self, _name: &str) -> BlockId {

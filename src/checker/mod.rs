@@ -943,6 +943,7 @@ impl Checker {
         let value_type = self.check_expr(value)?;
         let mut result_type = Type::Unknown;
         let mut saw_wildcard = false;
+        let mut covered_variants = HashSet::new();
         for arm in arms {
             if saw_wildcard {
                 return Err(KuError::runtime(
@@ -1001,6 +1002,13 @@ impl Checker {
                     for (binding, ty) in bindings.iter().zip(payload) {
                         self.define(binding.clone(), ty, false, arm.span)?;
                     }
+                    if arm.guard.is_none() && !covered_variants.insert(variant.clone()) {
+                        self.pop_scope();
+                        return Err(KuError::runtime(
+                            format!("match arm for '{enum_name}.{variant}' is unreachable"),
+                            arm.span,
+                        ));
+                    }
                 }
             }
             if let Some(guard) = &arm.guard {
@@ -1017,6 +1025,31 @@ impl Checker {
                 result_type = actual;
             } else if !type_matches(&result_type, &actual) {
                 return Err(type_error(arm.value.span, &result_type, &actual));
+            }
+        }
+        if !saw_wildcard {
+            if let Type::Enum(enum_name) = &value_type {
+                let Some(enum_type) = self.enums.get(enum_name) else {
+                    return Err(KuError::runtime(
+                        format!("undefined enum '{enum_name}'"),
+                        span,
+                    ));
+                };
+                let missing = enum_type
+                    .variants
+                    .keys()
+                    .filter(|variant| !covered_variants.contains(*variant))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    return Err(KuError::runtime(
+                        format!(
+                            "match on enum '{enum_name}' is not exhaustive; missing {}",
+                            missing.join(", ")
+                        ),
+                        span,
+                    ));
+                }
             }
         }
         Ok(result_type)

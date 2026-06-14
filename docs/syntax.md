@@ -1,6 +1,6 @@
-# Ku 0.0.9 Syntax Draft
+# Ku 0.0.10 Syntax Draft
 
-本文固定 Ku 0.0.9 的语法边界。当前 CLI 版本显示 `0.0.9`。
+本文固定 Ku 0.0.10 的语法边界。当前 CLI 版本显示 `0.0.10`。
 
 ## 文件和入口
 
@@ -90,7 +90,7 @@ fn load(): str! {
 
 `T!` 表示 `Result<T, str>`。当前固定错误 payload 为 `str`。
 
-`string` 和 `nil` 不是 0.0.9 类型名。
+`string` 和 `nil` 不是 0.0.10 类型名。
 
 ## 变量
 
@@ -169,7 +169,7 @@ fn main() {
 - 箭头函数参数暂时不写类型。
 - 箭头函数按引用捕获外层局部变量，读取时能看到最新值，赋值会写回外层可变变量。
 - 函数值调用会按实参类型检查函数体并推导返回类型。
-- 0.0.9 的 IR 已做自由变量精确捕获；运行时仍是共享绑定实现，后续会改成 capture map / weak self binding，避免闭包长期持有不需要的外层变量并治理 Rc 循环。
+- 0.0.10 的 IR 和运行时都使用精确 capture map。函数值只保存实际自由变量的共享绑定；递归局部函数在调用时临时注入 self binding，不再把整个外层 `Env` 保存进函数值。
 
 ## 条件和循环
 
@@ -268,7 +268,7 @@ label = switch 2 {
 }
 ```
 
-当前暂不做穷尽性检查；没有匹配分支会在运行时报错。
+对 enum 做 `match` 时，如果没有 `_`，必须覆盖所有未带 guard 的 variant。带 guard 的分支不计入穷尽覆盖；复杂嵌套模式和完整 guard 模式矩阵后续再补。非 enum 值当前没有完整穷尽性检查，没有匹配分支会在运行时报错。
 
 ## 数组
 
@@ -379,7 +379,7 @@ print(`literal \{name\}`)
 
 ## 错误处理
 
-Ku 0.0.9 继续沿用可恢复错误模型：
+Ku 0.0.10 继续沿用可恢复错误模型：
 
 ```txt
 T!             Result<T, str>
@@ -412,7 +412,7 @@ fn main() {
 }
 ```
 
-`?` 只能用在返回 `T!` 的函数内，或用在 `try { ... }` 的 body 内。它会短路当前表达式，避免继续执行右侧调用。`catch (err)` 中的 `err` 固定为 `str`。
+`?` 只能用在返回 `T!` 的函数内，或用在 `try { ... }` 的 body 内。它会短路当前表达式，避免继续执行右侧调用。`catch (err)` 中的 `err` 固定为 `str`。0.0.10 的 IR 已把 `?` 降成显式 `ok/err` 控制流，native 后端可以在此基础上继续补 Result ABI。
 
 `panic` 不会被 `try/catch` 捕获；它表示数组越界、内部 bug、主动崩溃等不可恢复问题。
 
@@ -453,7 +453,7 @@ string.ends_with("Ku", "u")
 string.trim("  Ku  ")
 string.lower("KU")
 string.upper("ku")
-string.replace("Ku Lang", "Lang", "0.0.9")
+string.replace("Ku Lang", "Lang", "0.0.10")
 string.slice("Ku Lang", 0, 2)
 
 array.len([1, 2])
@@ -479,7 +479,7 @@ time.millis()
 
 ## Package
 
-0.0.7 开始固定本地 package 草案，0.0.9 增加 package version 和本地 `ku.lock`。包根目录可以放 `ku.mod`：
+0.0.7 开始固定本地 package 草案，0.0.10 增加 `ku.lock` 依赖列表和 import cache key。包根目录可以放 `ku.mod`：
 
 ```txt
 name = "demo_pkg"
@@ -494,7 +494,7 @@ cache = ".ku/cache"
 import { Value } from "util"
 ```
 
-会从 `root` 下解析为 `util.ku`。相对导入 `./util.ku` 仍按当前文件目录解析，但结果不能跳出 package import root。远程包、依赖解析和下载校验暂未实现。
+会从 `root` 下解析为 `util.ku`。相对导入 `./util.ku` 仍按当前文件目录解析，但结果不能跳出 package import root。`ku.lock` 会记录本地导入依赖和稳定内容 hash 作为 cache key。远程包、版本解析、下载校验和缓存淘汰暂未实现。
 
 ## 命令
 
@@ -534,19 +534,18 @@ stdlib string / array / json / time 的参数数量和基础类型错误
 
 `ku build` 当前生成“解释器打包型可执行文件”：源码被嵌入生成的 exe 中，运行 exe 会通过 Ku 解释器执行。它是真正可运行的文件，但还不是 native C/LLVM 后端。
 
-`ku build --native <file.ku>` 当前输出 prototype C 源码，只支持 int/bool/str、局部变量、直接函数调用和 print。遇到数组、struct、enum、Result、闭包、match、try 等复杂语法会明确报不支持。
+`ku build --native <file.ku>` 当前输出 prototype C 源码，只支持 int/bool/str、局部变量、直接函数调用、print、return、if 和 while。遇到数组、struct、enum、Result、闭包、match、try 等复杂语法会明确报不支持。
 
 当前 `ku build` 是开发环境功能，需要本机可调用 `rustc`，并且 `ku` 可执行文件旁边能找到 `libku.rlib` 或 `deps/libku*.rlib`。它只打包 Ku 源码本身，不打包 `fs.read` 读取的外部资源文件；相对资源路径仍按被 build 的源文件路径解析。
 
 ## 当前不支持
 
 ```txt
-包管理
+远程 package、版本解析、下载校验和缓存淘汰
 异步
-native C / LLVM 后端
+完整 native C / LLVM 后端
 顶层脚本语句
-闭包自由变量精确捕获和循环引用治理
-复杂嵌套模式、match guard 穷尽性检查
+复杂嵌套模式、match guard 模式矩阵和完整穷尽性检查
 ```
 
 ## 资源保护
