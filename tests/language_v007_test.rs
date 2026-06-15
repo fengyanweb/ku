@@ -46,7 +46,7 @@ fn main() {
         print(get_value()?)
         print(get_text()?)
     } catch (err) {
-        print(err)
+        print(err.message)
     }
 }
 "#;
@@ -64,7 +64,7 @@ fn main() {
         value = array.try_get([1], 9)?
         print(value)
     } catch (err) {
-        message = err
+        message = err.message
     }
     print(message)
 
@@ -72,7 +72,7 @@ fn main() {
         text = string.slice("Ku", 2, 9)?
         print(text)
     } catch (err) {
-        message = err
+        message = err.message
     }
     print(message)
 }
@@ -97,7 +97,7 @@ fn main() {
         }
         message = "side effect"
     } catch (err) {
-        message = err
+        message = err.message
     }
     print(message)
 }

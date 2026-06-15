@@ -3,6 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,10 +18,12 @@ use crate::{
     package::{self, PackageContext},
     parser::Parser,
     span::Span,
+    stdlib,
 };
 
 const KU_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SOURCE_BYTES: u64 = 1_000_000;
+const INTERPRETER_STACK_SIZE: usize = 8 * 1024 * 1024;
 const HELP: &str = "\
 ku - simple, small, fast language tool
 
@@ -361,10 +364,21 @@ pub fn check_source(file: &str, source: &str) -> Result<(), KuError> {
 pub fn run_source(file: &str, source: &str) -> Result<(), KuError> {
     let program = parse_and_check(file, source)
         .map_err(|err| KuError::message(err.diagnostic(file, source)))?;
-    let mut interpreter = Interpreter::with_base_dir(source_base_dir(file));
-    interpreter
-        .run(program)
+    run_program_with_stack(program, source_base_dir(file))
         .map_err(|err| KuError::message(err.diagnostic(file, source)))
+}
+
+fn run_program_with_stack(program: Program, base_dir: PathBuf) -> Result<(), KuError> {
+    thread::Builder::new()
+        .name("ku-interpreter".to_string())
+        .stack_size(INTERPRETER_STACK_SIZE)
+        .spawn(move || {
+            let mut interpreter = Interpreter::with_base_dir(base_dir);
+            interpreter.run(program)
+        })
+        .map_err(|err| KuError::message(format!("failed to start interpreter: {err}")))?
+        .join()
+        .map_err(|_| KuError::message("interpreter thread panicked"))?
 }
 
 fn source_base_dir(file: &str) -> PathBuf {
@@ -385,22 +399,28 @@ fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
     let program = if program_has_imports(&program) {
         let path = Path::new(file);
         if !path.exists() {
-            return Err(KuError::runtime(
-                "imports require a real .ku file path",
-                Span::default(),
-            ));
+            if program_has_only_std_imports(&program) {
+                let mut loader = ModuleLoader::new(None);
+                loader.expand_program(path, program, true)?
+            } else {
+                return Err(KuError::runtime(
+                    "imports require a real .ku file path",
+                    Span::default(),
+                ));
+            }
+        } else {
+            let package = package::discover_for_file(path)?;
+            if let Some(package) = &package {
+                package::ensure_cache_dir(package)?;
+                package::resolve_remote_dependencies(package)?;
+            }
+            let mut loader = ModuleLoader::new(package);
+            let program = loader.load_entry(path, program)?;
+            if let Some(package) = &loader.package {
+                package::write_lock_with_dependencies(package, &loader.dependency_paths)?;
+            }
+            program
         }
-        let package = package::discover_for_file(path)?;
-        if let Some(package) = &package {
-            package::ensure_cache_dir(package)?;
-            package::resolve_remote_dependencies(package)?;
-        }
-        let mut loader = ModuleLoader::new(package);
-        let program = loader.load_entry(path, program)?;
-        if let Some(package) = &loader.package {
-            package::write_lock_with_dependencies(package, &loader.dependency_paths)?;
-        }
-        program
     } else {
         program
     };
@@ -413,6 +433,17 @@ fn program_has_imports(program: &Program) -> bool {
         .items
         .iter()
         .any(|item| matches!(item, Item::Import(_)))
+}
+
+fn program_has_only_std_imports(program: &Program) -> bool {
+    program.items.iter().all(|item| match item {
+        Item::Import(import) => is_std_import_path(&import.path),
+        _ => true,
+    })
+}
+
+fn is_std_import_path(path: &str) -> bool {
+    path.starts_with("std.") || path.starts_with("std:")
 }
 
 #[derive(Clone)]
@@ -477,8 +508,17 @@ impl ModuleLoader {
                 span,
             )
         })?;
-        let program = parse_source(&source)?;
-        let expanded = self.expand_program(&canonical, program, false)?;
+        let program = parse_source(&source).map_err(|err| {
+            err.with_diagnostic_context(canonical.display().to_string(), source.clone())
+        })?;
+        let expanded = self
+            .expand_program(&canonical, program, false)
+            .map_err(|err| {
+                err.with_diagnostic_context(canonical.display().to_string(), source.clone())
+            })?;
+        check_library_program(&expanded).map_err(|err| {
+            err.with_diagnostic_context(canonical.display().to_string(), source.clone())
+        })?;
         let exports = collect_exports(&expanded)?;
         let module = ModuleExports {
             path: canonical.clone(),
@@ -525,35 +565,54 @@ impl ModuleLoader {
             let module = self.load_module(&import_path, import.span)?;
             match &import.kind {
                 ImportKind::Named(names) => {
-                    let mut seen = HashSet::new();
+                    let mut seen_sources = HashSet::new();
+                    let mut seen_locals = HashSet::new();
                     let mut visible = HashSet::new();
+                    let mut rename_map = HashMap::new();
                     for name in names {
-                        if !seen.insert(name) {
+                        if !seen_sources.insert(name.source.clone()) {
                             return Err(KuError::runtime(
-                                format!("duplicate import name '{name}'"),
-                                import.span,
+                                format!("duplicate import name '{}'", name.source),
+                                name.span,
                             ));
                         }
-                        if local_names.contains(name) || !imported_names.insert(name.clone()) {
+                        let local = name.local_name().to_string();
+                        if !seen_locals.insert(local.clone()) {
+                            return Err(KuError::runtime(
+                                format!("duplicate import alias '{local}'"),
+                                name.span,
+                            ));
+                        }
+                        if local_names.contains(&local) || !imported_names.insert(local.clone()) {
                             return Err(KuError::runtime(
                                 format!(
-                                    "imported name '{name}' conflicts with another top-level name"
+                                    "imported name '{local}' conflicts with another top-level name"
                                 ),
-                                import.span,
+                                name.span,
                             ));
                         }
-                        module.exports.get(name).ok_or_else(|| {
+                        module.exports.get(&name.source).ok_or_else(|| {
                             KuError::runtime(
-                                format!("'{name}' is not exported by {}", module.path.display()),
-                                import.span,
+                                format!(
+                                    "'{}' is not exported by {}",
+                                    name.source,
+                                    module.path.display()
+                                ),
+                                name.span,
                             )
                         })?;
-                        visible.insert(name.clone());
+                        if local != name.source {
+                            rename_map.insert(name.source.clone(), local.clone());
+                        }
+                        visible.insert(name.source.clone());
                     }
-                    let prepared = prepare_imported_module_items(
+                    self.namespace_counter += 1;
+                    let prefix = format!("__ku_import{}", self.namespace_counter);
+                    let prepared = prepare_imported_module_items_with_renames(
                         &module.items,
+                        &rename_map,
+                        &prefix,
                         &visible,
-                        &mut self.namespace_counter,
                     )?;
                     items.extend(prepared);
                 }
@@ -631,10 +690,37 @@ impl ModuleLoader {
     }
 }
 
+fn check_library_program(program: &Program) -> KuResult<()> {
+    let mut program = program.clone();
+    if !program
+        .items
+        .iter()
+        .any(|item| matches!(item, Item::Function(function) if function.name == "main"))
+    {
+        program.items.push(Item::Function(FnDecl {
+            name: "main".to_string(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            return_type: None,
+            body: Vec::new(),
+            span: Span::default(),
+        }));
+    }
+    Checker::new().check(&program)
+}
+
 fn std_import_module(import: &ImportDecl) -> KuResult<Option<String>> {
-    let Some(module) = import.path.strip_prefix("std:") else {
+    let module = if let Some(module) = import.path.strip_prefix("std.") {
+        module
+    } else {
         return Ok(None);
     };
+    if !stdlib::metadata::is_std_module(module) {
+        return Err(KuError::runtime(
+            format!("unknown std module '{}'", import.path),
+            import.span,
+        ));
+    }
     match &import.kind {
         ImportKind::Namespace(namespace) if namespace == module => Ok(Some(module.to_string())),
         ImportKind::Namespace(_) => Err(KuError::runtime(
@@ -644,8 +730,9 @@ fn std_import_module(import: &ImportDecl) -> KuResult<Option<String>> {
             ),
             import.span,
         )),
-        ImportKind::Named(_) | ImportKind::Glob => Err(KuError::runtime(
-            "std module imports must use namespace form, for example import http from \"std:http\"",
+        ImportKind::Glob => Ok(Some(module.to_string())),
+        ImportKind::Named(_) => Err(KuError::runtime(
+            "std module imports must use namespace form, for example import http from \"std.http\", or shorthand import \"std.http\"",
             import.span,
         )),
     }
@@ -684,15 +771,14 @@ fn resolve_import_path(
     package: Option<&PackageContext>,
 ) -> KuResult<PathBuf> {
     let raw = Path::new(import_path);
-    if raw.is_absolute() {
-        return Err(KuError::runtime("import path must be relative", span));
-    }
     if let Some(package) = package {
         if let Some(path) = package::resolve_dependency_import(package, import_path, span)? {
             return Ok(path);
         }
     }
-    let base = if let Some(package) = package {
+    let base = if raw.is_absolute() {
+        PathBuf::new()
+    } else if let Some(package) = package {
         if import_path.starts_with("./") || import_path.starts_with("../") {
             current_file
                 .parent()
@@ -832,7 +918,7 @@ fn prepare_imported_module_items_with_renames(
                     decl.name = renamed.clone();
                 }
                 for field in &mut decl.fields {
-                    rewrite_type_name(&mut field.ty, &effective_renames);
+                    rewrite_required_type_name(&mut field.ty, &effective_renames);
                 }
                 items.push(Item::Struct(decl));
             }
@@ -846,7 +932,7 @@ fn prepare_imported_module_items_with_renames(
                 }
                 for variant in &mut decl.variants {
                     for field in &mut variant.fields {
-                        rewrite_type_name(&mut field.ty, &effective_renames);
+                        rewrite_required_type_name(&mut field.ty, &effective_renames);
                     }
                 }
                 items.push(Item::Enum(decl));
@@ -859,16 +945,31 @@ fn prepare_imported_module_items_with_renames(
 
 fn rewrite_type_names_in_function(function: &mut FnDecl, rename_map: &HashMap<String, String>) {
     for param in &mut function.params {
-        rewrite_type_name(&mut param.ty, rename_map);
+        rewrite_optional_type_name(&mut param.ty, rename_map);
     }
     if let Some(return_type) = &mut function.return_type {
         rewrite_type_name(return_type, rename_map);
     }
 }
 
+fn rewrite_optional_type_name(ty: &mut Option<TypeName>, rename_map: &HashMap<String, String>) {
+    if let Some(ty) = ty {
+        rewrite_type_name(ty, rename_map);
+    }
+}
+
+fn rewrite_required_type_name(ty: &mut Option<TypeName>, rename_map: &HashMap<String, String>) {
+    rewrite_optional_type_name(ty, rename_map);
+}
+
 fn rewrite_type_name(ty: &mut TypeName, rename_map: &HashMap<String, String>) {
     match ty {
         TypeName::Array(inner) | TypeName::Result(inner) => rewrite_type_name(inner, rename_map),
+        TypeName::Union(types) => {
+            for ty in types {
+                rewrite_type_name(ty, rename_map);
+            }
+        }
         TypeName::Custom(name) => {
             if let Some(renamed) = rename_map.get(name) {
                 *name = renamed.clone();
@@ -895,6 +996,12 @@ fn rewrite_function_calls_in_stmt(
         Stmt::AssignTarget { target, value, .. } => {
             rewrite_function_calls_in_assign_target(target, rename_map)?;
             rewrite_function_calls_in_expr(value, rename_map)
+        }
+        Stmt::DestructureAssign { values, .. } => {
+            for value in values {
+                rewrite_function_calls_in_expr(value, rename_map)?;
+            }
+            Ok(())
         }
         Stmt::If {
             condition,
@@ -960,6 +1067,7 @@ fn rewrite_function_calls_in_stmt(
             }
             Ok(())
         }
+        Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
         Stmt::Expr { expr, .. } => rewrite_function_calls_in_expr(expr, rename_map),
     }
 }
@@ -1010,7 +1118,9 @@ fn rewrite_function_calls_in_expr(
             rewrite_function_calls_in_expr(target, rename_map)?;
             rewrite_function_calls_in_expr(index, rename_map)
         }
-        ExprKind::Field { target, .. } => rewrite_function_calls_in_expr(target, rename_map),
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            rewrite_function_calls_in_expr(target, rename_map)
+        }
         ExprKind::StructLiteral { name, fields } => {
             if let Some(renamed) = rename_map.get(name) {
                 *name = renamed.clone();
@@ -1093,6 +1203,12 @@ fn rewrite_namespaces_in_stmt(
             rewrite_namespaces_in_assign_target(target, namespaces)?;
             rewrite_namespaces_in_expr(value, namespaces)
         }
+        Stmt::DestructureAssign { values, .. } => {
+            for value in values {
+                rewrite_namespaces_in_expr(value, namespaces)?;
+            }
+            Ok(())
+        }
         Stmt::If {
             condition,
             then_branch,
@@ -1157,6 +1273,7 @@ fn rewrite_namespaces_in_stmt(
             }
             Ok(())
         }
+        Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
         Stmt::Expr { expr, .. } => rewrite_namespaces_in_expr(expr, namespaces),
     }
 }
@@ -1180,10 +1297,19 @@ fn rewrite_namespaces_in_function_types(
     namespaces: &HashMap<String, HashMap<String, String>>,
 ) {
     for param in &mut function.params {
-        rewrite_namespaced_type_name(&mut param.ty, namespaces);
+        rewrite_optional_namespaced_type_name(&mut param.ty, namespaces);
     }
     if let Some(return_type) = &mut function.return_type {
         rewrite_namespaced_type_name(return_type, namespaces);
+    }
+}
+
+fn rewrite_optional_namespaced_type_name(
+    ty: &mut Option<TypeName>,
+    namespaces: &HashMap<String, HashMap<String, String>>,
+) {
+    if let Some(ty) = ty {
+        rewrite_namespaced_type_name(ty, namespaces);
     }
 }
 
@@ -1194,6 +1320,11 @@ fn rewrite_namespaced_type_name(
     match ty {
         TypeName::Array(inner) | TypeName::Result(inner) => {
             rewrite_namespaced_type_name(inner, namespaces)
+        }
+        TypeName::Union(types) => {
+            for ty in types {
+                rewrite_namespaced_type_name(ty, namespaces);
+            }
         }
         TypeName::Custom(name) => {
             if let Some(renamed) = namespace_lookup(name, namespaces) {
@@ -1252,6 +1383,7 @@ fn rewrite_namespaces_in_expr(
             }
             Ok(())
         }
+        ExprKind::OptionalField { target, .. } => rewrite_namespaces_in_expr(target, namespaces),
         ExprKind::StructLiteral { name, fields } => {
             if let Some(renamed) = namespace_lookup(name, namespaces) {
                 *name = renamed;

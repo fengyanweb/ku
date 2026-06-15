@@ -1,3 +1,7 @@
-fn Ab(): str {
+fn Ab()  {
     return "A "
+}
+
+fn main() {
+    print("Hello Ku")
 }

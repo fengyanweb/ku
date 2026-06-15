@@ -37,6 +37,11 @@ impl Value {
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Bool(value) => *value,
+            Value::Int(value) => *value != 0,
+            Value::Float(value) => *value != 0.0,
+            Value::String(value) => !value.is_empty(),
+            Value::Array(values) => !values.is_empty(),
+            Value::Object(fields) => !fields.is_empty(),
             Value::Null => false,
             _ => true,
         }

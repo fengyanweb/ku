@@ -179,10 +179,10 @@ pub fn resolve_remote_dependencies(package: &PackageContext) -> KuResult<()> {
             continue;
         };
         let source_path = file_url_path(source).ok_or_else(|| {
-            KuError::message(format!(
+            KuError::package("unsupported_source", format!(
                 "dependency '{}' uses unsupported source '{}'; only file:// is supported in this stage",
                 dependency.name, source
-            ))
+            ), Span::default())
         })?;
         let source_path = fs::canonicalize(&source_path).map_err(|err| {
             KuError::message(format!(
@@ -194,10 +194,14 @@ pub fn resolve_remote_dependencies(package: &PackageContext) -> KuResult<()> {
         let actual_checksum = package_source_checksum(&source_path)?;
         if let Some(expected) = &dependency.checksum {
             if expected != &actual_checksum {
-                return Err(KuError::message(format!(
-                    "dependency '{}' checksum mismatch: expected {}, got {}",
-                    dependency.name, expected, actual_checksum
-                )));
+                return Err(KuError::package(
+                    "checksum_mismatch",
+                    format!(
+                        "dependency '{}' checksum mismatch: expected {}, got {}",
+                        dependency.name, expected, actual_checksum
+                    ),
+                    Span::default(),
+                ));
             }
         }
         let target = dependency_cache_root(package, dependency);
@@ -255,7 +259,8 @@ pub(crate) fn resolve_dependency_import(
         return Ok(None);
     };
     let Some((name, relative)) = rest.split_once('/') else {
-        return Err(KuError::runtime(
+        return Err(KuError::package(
+            "invalid_import",
             "package dependency import must use @name/path",
             span,
         ));
@@ -265,7 +270,13 @@ pub(crate) fn resolve_dependency_import(
         .dependencies
         .iter()
         .find(|dep| dep.name == name)
-        .ok_or_else(|| KuError::runtime(format!("unknown package dependency '{name}'"), span))?;
+        .ok_or_else(|| {
+            KuError::package(
+                "unknown_dependency",
+                format!("unknown package dependency '{name}'"),
+                span,
+            )
+        })?;
     reject_unsafe_dependency_import(relative, span)?;
     let root = dependency_cache_root(package, dependency).join(dependency.root());
     let mut path = root.join(relative);
@@ -442,7 +453,8 @@ pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            return Err(KuError::runtime(
+            return Err(KuError::package(
+                "invalid_manifest_line",
                 format!("invalid ku.mod line {}: expected key = value", index + 1),
                 span,
             ));
@@ -458,14 +470,16 @@ pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
                 parse_dependency_key(key, value, &mut dependencies, index + 1, span)?;
             }
             _ => {
-                return Err(KuError::runtime(
+                return Err(KuError::package(
+                    "invalid_manifest_key",
                     format!("invalid ku.mod key '{key}' on line {}", index + 1),
                     span,
                 ));
             }
         }
     }
-    let name = name.ok_or_else(|| KuError::runtime("ku.mod missing package name", span))?;
+    let name =
+        name.ok_or_else(|| KuError::package("missing_name", "ku.mod missing package name", span))?;
     validate_package_name(&name, span)?;
     if let Some(value) = &version {
         validate_version(value, span)?;
@@ -502,7 +516,11 @@ impl PackageDependencyDraft {
     fn finish(self, span: Span) -> KuResult<PackageDependency> {
         validate_package_name(&self.name, span)?;
         let version = self.version.ok_or_else(|| {
-            KuError::runtime(format!("dependency '{}' missing version", self.name), span)
+            KuError::package(
+                "missing_dependency_version",
+                format!("dependency '{}' missing version", self.name),
+                span,
+            )
         })?;
         validate_version_requirement(&version, span)?;
         if let Some(checksum) = &self.checksum {
@@ -536,7 +554,8 @@ fn parse_dependency_key(
         .map(|(name, field)| (name, Some(field)))
         .unwrap_or((rest, None));
     if name.is_empty() {
-        return Err(KuError::runtime(
+        return Err(KuError::package(
+            "invalid_dependency_key",
             format!("invalid dependency key on line {line}"),
             span,
         ));
@@ -553,7 +572,8 @@ fn parse_dependency_key(
         Some("source") => dependency.source = Some(value),
         Some("checksum") => dependency.checksum = Some(value),
         Some(other) => {
-            return Err(KuError::runtime(
+            return Err(KuError::package(
+                "invalid_dependency_field",
                 format!("invalid dependency field '{other}' on line {line}"),
                 span,
             ));
@@ -566,7 +586,8 @@ fn parse_string_value(value: &str, line: usize, span: Span) -> KuResult<String> 
     if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
         Ok(value[1..value.len() - 1].to_string())
     } else {
-        Err(KuError::runtime(
+        Err(KuError::package(
+            "invalid_manifest_value",
             format!("invalid ku.mod value on line {line}: expected quoted string"),
             span,
         ))
@@ -576,16 +597,22 @@ fn parse_string_value(value: &str, line: usize, span: Span) -> KuResult<String> 
 fn validate_package_name(name: &str, span: Span) -> KuResult<()> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
-        return Err(KuError::runtime("package name cannot be empty", span));
+        return Err(KuError::package(
+            "invalid_name",
+            "package name cannot be empty",
+            span,
+        ));
     };
     if !first.is_ascii_lowercase() {
-        return Err(KuError::runtime(
+        return Err(KuError::package(
+            "invalid_name",
             "package name must start with a lowercase ascii letter",
             span,
         ));
     }
     if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
-        return Err(KuError::runtime(
+        return Err(KuError::package(
+            "invalid_name",
             "package name may only contain lowercase letters, digits, '_' and '-'",
             span,
         ));
@@ -600,7 +627,8 @@ fn validate_version(version: &str, span: Span) -> KuResult<()> {
             .iter()
             .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
     {
-        return Err(KuError::runtime(
+        return Err(KuError::package(
+            "invalid_version",
             "package version must use major.minor.patch digits",
             span,
         ));
@@ -619,7 +647,8 @@ fn validate_version_requirement(version: &str, span: Span) -> KuResult<()> {
 fn reject_unsafe_relative_path(kind: &str, value: &str, span: Span) -> KuResult<()> {
     let path = Path::new(value);
     if path.is_absolute() || value.contains("..") {
-        return Err(KuError::runtime(
+        return Err(KuError::package(
+            "unsafe_path",
             format!("ku.mod {kind} must be a safe relative path"),
             span,
         ));
@@ -637,7 +666,8 @@ fn reject_unsafe_dependency_import(value: &str, span: Span) -> KuResult<()> {
             )
         })
     {
-        return Err(KuError::runtime(
+        return Err(KuError::package(
+            "unsafe_import",
             "package dependency import must stay inside dependency root",
             span,
         ));
@@ -647,13 +677,15 @@ fn reject_unsafe_dependency_import(value: &str, span: Span) -> KuResult<()> {
 
 fn validate_checksum(value: &str, span: Span) -> KuResult<()> {
     let Some(hex) = value.strip_prefix("ku-fnv64-") else {
-        return Err(KuError::runtime(
+        return Err(KuError::package(
+            "invalid_checksum",
             "dependency checksum must use ku-fnv64- followed by 16 hex digits",
             span,
         ));
     };
     if hex.len() != 16 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(KuError::runtime(
+        return Err(KuError::package(
+            "invalid_checksum",
             "dependency checksum must use ku-fnv64- followed by 16 hex digits",
             span,
         ));
@@ -753,7 +785,11 @@ fn copy_package_source_inner(
             *files += 1;
             *bytes += metadata.len();
             if *files > MAX_PACKAGE_FILES || *bytes > MAX_PACKAGE_BYTES {
-                return Err(KuError::message("package source exceeds cache limits"));
+                return Err(KuError::package(
+                    "cache_limit",
+                    "package source exceeds cache limits",
+                    Span::default(),
+                ));
             }
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|err| {
@@ -806,7 +842,11 @@ fn collect_source_bytes(
             *files += 1;
             *bytes += metadata.len();
             if *files > MAX_PACKAGE_FILES || *bytes > MAX_PACKAGE_BYTES {
-                return Err(KuError::message("package source exceeds checksum limits"));
+                return Err(KuError::package(
+                    "checksum_limit",
+                    "package source exceeds checksum limits",
+                    Span::default(),
+                ));
             }
             let relative = path.strip_prefix(root).map_err(|err| {
                 KuError::message(format!(

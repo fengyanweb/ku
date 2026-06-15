@@ -1,0 +1,22 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+.cache/
+*.log
+.DS_Store
+.vscode/
+*.rar
+*.zip
+秘钥.md
+对称密钥.txt
+非对称密钥.txt
+.claude
+
+# Electron 打包产物（构建产物不入库；本地保留）
+dist-electron/
+web/bc/dist-electron/
+history/
+target/
+test/

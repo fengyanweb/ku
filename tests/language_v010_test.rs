@@ -448,7 +448,7 @@ fn http_stdlib_requires_explicit_std_import() {
     let err = check_err(
         r#"
 fn main() {
-    result = http.try_get("http://example.com")
+    result = http.get("http://example.com")
     print(str(result))
 }
 "#,
@@ -461,29 +461,118 @@ fn main() {
 }
 
 #[test]
+fn fs_stdlib_requires_explicit_std_import() {
+    let err = check_source(
+        "inline.ku",
+        r#"
+fn main() {
+    text = fs.try_read("missing.txt")
+    print(str(text))
+}
+"#,
+    )
+    .expect_err("fs should require explicit std import")
+    .to_string();
+
+    assert!(
+        err.contains("std module 'fs' must be imported"),
+        "unexpected error: {err}"
+    );
+
+    let source = r#"
+import "std.fs"
+
+fn load(): str! {
+    return fs.try_read("definitely-missing-ku-file.txt")
+}
+
+fn main() {
+    try {
+        value = load()?
+        print(value)
+    } catch (err) {
+        print("missing")
+    }
+}
+"#;
+
+    check_source("inline.ku", source).expect("std.fs import should check");
+    run_source("inline.ku", source).expect("std.fs import should run");
+}
+
+#[test]
 fn imported_http_stdlib_returns_recoverable_errors_without_network_retry() {
     let dir = unique_temp_path("std-http");
     fs::create_dir_all(&dir).expect("create temp dir");
     let main = dir.join("main.ku");
     let source = r#"
-import http from "std:http"
+import "std.http"
 
-fn main(): str! {
-    text = http.try_get("https://example.com")?
-    return ok(text)
+fn main(): null! {
+    res = http.get("ftp://example.com")?
+    print(res.body)
+    return ok(null)
 }
 "#;
     fs::write(&main, source).expect("write main");
 
-    check_source(&main.display().to_string(), source).expect("std:http import should check");
+    check_source(&main.display().to_string(), source).expect("std.http import should check");
     let err = run_source(&main.display().to_string(), source)
-        .expect_err("https should be a recoverable http error in this stage")
+        .expect_err("invalid url should be a recoverable http error")
         .to_string();
     assert!(
-        err.contains("http.try_get currently supports only http:// URLs"),
+        err.contains("http url must start with http:// or https://"),
         "unexpected error: {err}"
     );
     fs::remove_dir_all(dir).expect("remove temp dir");
+}
+
+#[test]
+fn old_http_try_get_and_std_colon_import_are_rejected() {
+    let err = check_source(
+        "inline.ku",
+        r#"
+import "std.http"
+fn main() {
+    http.try_get("http://example.com")
+}
+"#,
+    )
+    .expect_err("http.try_get should not exist")
+    .to_string();
+    if !err.contains("unknown stdlib function") && !err.contains("undefined variable 'http'") {
+        let err = check_source(
+            "inline.ku",
+            r#"
+import http from "std.http"
+fn main() {
+    http.try_get("http://example.com")
+}
+"#,
+        )
+        .expect_err("http.try_get should not exist")
+        .to_string();
+        assert!(
+            err.contains("unknown stdlib function") || err.contains("undefined variable 'http'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    let err = check_source(
+        "inline.ku",
+        r#"
+import "std:http"
+fn main() {
+    print("bad")
+}
+"#,
+    )
+    .expect_err("std: import should not be supported")
+    .to_string();
+    assert!(
+        err.contains("unsupported import path") || err.contains("failed to resolve"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -761,6 +850,34 @@ dep.util.checksum = "bad"
     assert!(err.contains("checksum"), "unexpected error: {err}");
 
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn package_errors_carry_domain_and_code_metadata() {
+    let err = package::parse_manifest(
+        r#"
+name = "demo"
+version = "bad"
+"#,
+        Default::default(),
+    )
+    .expect_err("bad version should fail");
+
+    assert_eq!(err.domain.as_deref(), Some("package"));
+    assert_eq!(err.code.as_deref(), Some("invalid_version"));
+
+    let err = package::parse_manifest(
+        r#"
+name = "demo"
+dep.bad = "1.0.0"
+dep.bad.checksum = "bad"
+"#,
+        Default::default(),
+    )
+    .expect_err("bad checksum should fail");
+
+    assert_eq!(err.domain.as_deref(), Some("package"));
+    assert_eq!(err.code.as_deref(), Some("invalid_checksum"));
 }
 
 #[test]

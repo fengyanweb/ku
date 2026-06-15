@@ -98,7 +98,20 @@ impl Parser {
                         span,
                     ));
                 }
-                names.push(name);
+                let alias = if self.match_ident_text("as") {
+                    let (alias, alias_span) = self.consume_ident("expected import alias")?;
+                    if !is_valid_namespace(&alias) {
+                        return Err(KuError::parse("expected import alias", alias_span));
+                    }
+                    Some(alias)
+                } else {
+                    None
+                };
+                names.push(ImportName {
+                    source: name,
+                    alias,
+                    span,
+                });
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }
@@ -133,14 +146,18 @@ impl Parser {
     fn function(&mut self) -> KuResult<FnDecl> {
         let start = self.consume(&TokenKind::Fn, "expected 'fn'")?.span.start;
         let (name, _) = self.consume_ident("expected function name")?;
+        let type_params = self.type_params()?;
         self.consume(&TokenKind::LParen, "expected '(' after function name")?;
 
         let mut params = Vec::new();
         if !self.check(&TokenKind::RParen) {
             loop {
                 let (param_name, param_span) = self.consume_ident("expected parameter name")?;
-                self.consume(&TokenKind::Colon, "expected ':' after parameter name")?;
-                let ty = self.type_name()?;
+                let ty = if self.match_kind(&TokenKind::Colon) {
+                    Some(self.type_name()?)
+                } else {
+                    None
+                };
                 params.push(Param {
                     name: param_name,
                     ty,
@@ -161,11 +178,37 @@ impl Parser {
         let (body, body_span) = self.block()?;
         Ok(FnDecl {
             name,
+            type_params,
             params,
             return_type,
             body,
             span: Span::new(start, body_span.end),
         })
+    }
+
+    fn type_params(&mut self) -> KuResult<Vec<String>> {
+        if !self.match_kind(&TokenKind::Less) {
+            return Ok(Vec::new());
+        }
+        let mut params = Vec::new();
+        loop {
+            let (name, span) = self.consume_ident("expected generic type parameter")?;
+            if params.contains(&name) {
+                return Err(KuError::parse(
+                    format!("duplicate generic type parameter '{name}'"),
+                    span,
+                ));
+            }
+            params.push(name);
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.consume(
+            &TokenKind::Greater,
+            "expected '>' after generic type parameters",
+        )?;
+        Ok(params)
     }
 
     fn struct_decl(&mut self) -> KuResult<StructDecl> {
@@ -182,7 +225,7 @@ impl Parser {
             let ty = self.type_name()?;
             fields.push(Param {
                 name: field_name,
-                ty,
+                ty: Some(ty),
                 span: field_span,
             });
             self.match_kind(&TokenKind::Comma);
@@ -219,7 +262,7 @@ impl Parser {
                         let ty = self.type_name()?;
                         fields.push(Param {
                             name: field_name,
-                            ty,
+                            ty: Some(ty),
                             span: field_span,
                         });
                         if !self.match_kind(&TokenKind::Comma) {
@@ -264,10 +307,24 @@ impl Parser {
     }
 
     fn type_name(&mut self) -> KuResult<TypeName> {
+        let first = self.type_atom()?;
+        let mut types = vec![self.finish_type_name(first)?];
+        while self.match_kind(&TokenKind::Pipe) {
+            let next = self.type_atom()?;
+            types.push(self.finish_type_name(next)?);
+        }
+        if types.len() == 1 {
+            Ok(types.remove(0))
+        } else {
+            Ok(TypeName::Union(types))
+        }
+    }
+
+    fn type_atom(&mut self) -> KuResult<TypeName> {
         if self.match_kind(&TokenKind::LBracket) {
             let inner = self.type_name()?;
             self.consume(&TokenKind::RBracket, "expected ']' after array type")?;
-            return self.finish_type_name(TypeName::Array(Box::new(inner)));
+            return Ok(TypeName::Array(Box::new(inner)));
         }
         let token = self.advance().clone();
         let ty = match token.kind {
@@ -290,7 +347,7 @@ impl Parser {
             TokenKind::Null => TypeName::Null,
             _ => return Err(KuError::parse("expected type name", token.span)),
         };
-        self.finish_type_name(ty)
+        Ok(ty)
     }
 
     fn finish_type_name(&mut self, ty: TypeName) -> KuResult<TypeName> {
@@ -335,6 +392,16 @@ impl Parser {
             let stmt = self.for_statement()?;
             self.optional_semicolon();
             return Ok(stmt);
+        }
+        if self.match_kind(&TokenKind::Break) {
+            let span = self.previous().span;
+            self.optional_semicolon();
+            return Ok(Stmt::Break { span });
+        }
+        if self.match_kind(&TokenKind::Continue) {
+            let span = self.previous().span;
+            self.optional_semicolon();
+            return Ok(Stmt::Continue { span });
         }
         if self.match_kind(&TokenKind::Try) {
             return self.try_statement();
@@ -506,6 +573,9 @@ impl Parser {
     }
 
     fn expression_or_assignment_statement(&mut self) -> KuResult<Stmt> {
+        if self.is_destructure_assignment_start() {
+            return self.destructure_assignment_statement();
+        }
         if let TokenKind::Ident(name) = self.peek().kind.clone() {
             if self.peek_next_kind() == Some(&TokenKind::Colon) {
                 let start = self.advance().span.start;
@@ -548,9 +618,84 @@ impl Parser {
                 }),
             };
         }
+        if self.match_kind(&TokenKind::PlusPlus) {
+            return self.increment_statement(expr, BinaryOp::Add);
+        }
+        if self.match_kind(&TokenKind::MinusMinus) {
+            return self.increment_statement(expr, BinaryOp::Subtract);
+        }
         self.optional_semicolon();
         let span = expr.span;
         Ok(Stmt::Expr { expr, span })
+    }
+
+    fn destructure_assignment_statement(&mut self) -> KuResult<Stmt> {
+        let start = self.peek().span.start;
+        let mut names = Vec::new();
+        loop {
+            let (name, _) = self.consume_ident("expected destructuring target")?;
+            names.push(if name == "_" { None } else { Some(name) });
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.consume(
+            &TokenKind::Equal,
+            "expected '=' after destructuring targets",
+        )?;
+        let mut values = Vec::new();
+        loop {
+            values.push(self.expression()?);
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.optional_semicolon();
+        let end = values
+            .last()
+            .map(|value| value.span.end)
+            .unwrap_or_else(|| Span::point(start).end);
+        Ok(Stmt::DestructureAssign {
+            names,
+            values,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn is_destructure_assignment_start(&self) -> bool {
+        matches!(self.peek().kind, TokenKind::Ident(_))
+            && matches!(
+                self.tokens.get(self.current + 1).map(|token| &token.kind),
+                Some(TokenKind::Comma)
+            )
+    }
+
+    fn increment_statement(&mut self, expr: Expr, op: BinaryOp) -> KuResult<Stmt> {
+        let start = expr.span.start;
+        let end = self.previous().span.end;
+        let target = assign_target_from_expr(expr.clone())?;
+        let one = Expr::new(ExprKind::Literal(Literal::Int(1)), Span::new(start, end));
+        let value = Expr::new(
+            ExprKind::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(one),
+            },
+            Span::new(start, end),
+        );
+        self.optional_semicolon();
+        match target {
+            AssignTarget::Variable(name) => Ok(Stmt::Assign {
+                name,
+                value,
+                span: Span::new(start, end),
+            }),
+            target => Ok(Stmt::AssignTarget {
+                target,
+                value,
+                span: Span::new(start, end),
+            }),
+        }
     }
 
     fn expression(&mut self) -> KuResult<Expr> {
@@ -752,6 +897,16 @@ impl Parser {
                     },
                     span,
                 );
+            } else if self.match_kind(&TokenKind::QuestionDot) {
+                let (name, name_span) = self.consume_ident("expected field name after '?.'")?;
+                let span = expr.span.merge(name_span);
+                expr = Expr::new(
+                    ExprKind::OptionalField {
+                        target: Box::new(expr),
+                        name,
+                    },
+                    span,
+                );
             } else if self.match_kind(&TokenKind::Question) {
                 let span = expr.span.merge(self.previous().span);
                 expr = Expr::new(
@@ -781,8 +936,14 @@ impl Parser {
         if self.is_arrow_function_start() {
             return self.arrow_function();
         }
-        if self.match_kind(&TokenKind::Match) || self.match_kind(&TokenKind::Switch) {
+        if self.match_kind(&TokenKind::Match) {
             return self.match_expression(self.previous().span);
+        }
+        if self.match_kind(&TokenKind::Switch) {
+            return Err(KuError::parse(
+                "switch is not supported; use match",
+                self.previous().span,
+            ));
         }
         let token = self.advance().clone();
         let span = token.span;
@@ -795,6 +956,21 @@ impl Parser {
             TokenKind::False => ExprKind::Literal(Literal::Bool(false)),
             TokenKind::Null => ExprKind::Literal(Literal::Null),
             TokenKind::Ident(name) => {
+                if self.match_kind(&TokenKind::Arrow) {
+                    let (body, body_span) = self.arrow_body()?;
+                    return Ok(Expr::new(
+                        ExprKind::Function {
+                            params: vec![FunctionParam {
+                                name,
+                                ty: None,
+                                span,
+                            }],
+                            return_type: None,
+                            body,
+                        },
+                        Span::new(span.start, body_span.end),
+                    ));
+                }
                 if self.check(&TokenKind::LBrace) && self.is_struct_literal_after_lbrace() {
                     self.advance();
                     return self.finish_struct_literal(name, span);
@@ -904,7 +1080,7 @@ impl Parser {
             &TokenKind::Arrow,
             "expected '=>' after arrow function parameters",
         )?;
-        let (body, body_span) = self.block()?;
+        let (body, body_span) = self.arrow_body()?;
         Ok(Expr::new(
             ExprKind::Function {
                 params,
@@ -912,6 +1088,21 @@ impl Parser {
                 body,
             },
             Span::new(start, body_span.end),
+        ))
+    }
+
+    fn arrow_body(&mut self) -> KuResult<(Vec<Stmt>, Span)> {
+        if self.check(&TokenKind::LBrace) {
+            return self.block();
+        }
+        let value = self.expression()?;
+        let span = value.span;
+        Ok((
+            vec![Stmt::Return {
+                value: Some(value),
+                span,
+            }],
+            span,
         ))
     }
 
@@ -1064,6 +1255,16 @@ impl Parser {
         }
     }
 
+    fn match_ident_text(&mut self, text: &str) -> bool {
+        match &self.peek().kind {
+            TokenKind::Ident(value) if value == text => {
+                self.advance();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn consume_string(&mut self, message: &str) -> KuResult<(String, Span)> {
         let token = self.advance().clone();
         match token.kind {
@@ -1152,9 +1353,12 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::VarDecl { span, .. }
         | Stmt::Assign { span, .. }
         | Stmt::AssignTarget { span, .. }
+        | Stmt::DestructureAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
+        | Stmt::Break { span }
+        | Stmt::Continue { span }
         | Stmt::Function(FnDecl { span, .. })
         | Stmt::Try { span, .. }
         | Stmt::Fail { span, .. }
@@ -1198,7 +1402,7 @@ fn default_expr(ty: &TypeName, span: Span) -> Expr {
         TypeName::Bool => ExprKind::Literal(Literal::Bool(false)),
         TypeName::String => ExprKind::Literal(Literal::String(String::new())),
         TypeName::Array(_) => ExprKind::Array(Vec::new()),
-        TypeName::Result(_) | TypeName::Null | TypeName::Custom(_) => {
+        TypeName::Result(_) | TypeName::Union(_) | TypeName::Null | TypeName::Custom(_) => {
             ExprKind::Literal(Literal::Null)
         }
     };

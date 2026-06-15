@@ -1,0 +1,52 @@
+{
+  "fn main": {
+    "prefix": "main",
+    "body": ["fn main() {", "    $0", "}"],
+    "description": "Ku main function"
+  },
+  "function": {
+    "prefix": "fn",
+    "body": ["fn ${1:name}(${2:arg}:${3:int})${4:: int} {", "    $0", "}"],
+    "description": "Ku function"
+  },
+  "struct": {
+    "prefix": "struct",
+    "body": ["struct ${1:Name} {", "    ${2:field}: ${3:str}", "}"],
+    "description": "Ku struct"
+  },
+  "enum": {
+    "prefix": "enum",
+    "body": ["enum ${1:Result} {", "    ${2:Ok}(value: ${3:int})", "    ${4:Err}(message: str)", "}"],
+    "description": "Ku enum"
+  },
+  "match": {
+    "prefix": "match",
+    "body": ["match ${1:value} {", "    ${2:_} => ${3:null}", "}"],
+    "description": "Ku match expression"
+  },
+  "try catch finally": {
+    "prefix": "try",
+    "body": ["try {", "    ${1:value} = ${2:work}()?", "} catch (${3:err}) {", "    $0", "} finally {", "    ${4:println(\"done\")}", "}"],
+    "description": "Ku try/catch/finally"
+  },
+  "import std.fs": {
+    "prefix": "std.fs",
+    "body": ["import \"std.fs\""],
+    "description": "Import std.fs"
+  },
+  "import std.http": {
+    "prefix": "std.http",
+    "body": ["import \"std.http\""],
+    "description": "Import std.http"
+  },
+  "http get": {
+    "prefix": "http.get",
+    "body": ["res = http.get(${1:\"https://example.com\"})?", "print(res.status)", "print(res.body)"],
+    "description": "HTTP GET response"
+  },
+  "array map": {
+    "prefix": "map",
+    "body": ["${1:result} = ${2:nums}.map(${3:x} => ${3:x} * 2)"],
+    "description": "Array map"
+  }
+}

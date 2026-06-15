@@ -241,7 +241,11 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                 function.name.clone(),
                 FunctionSig {
                     id,
-                    params: function.params.iter().map(|p| lower_type(&p.ty)).collect(),
+                    params: function
+                        .params
+                        .iter()
+                        .map(|p| lower_optional_type(&p.ty))
+                        .collect(),
                     returns: function
                         .return_type
                         .as_ref()
@@ -588,6 +592,45 @@ impl<'a> FunctionLowerer<'a> {
                     .instructions
                     .push(IrInst::Store { target, value });
             }
+            Stmt::DestructureAssign {
+                names,
+                values,
+                span,
+            } => {
+                if names.len() != values.len() {
+                    return Err(KuError::runtime(
+                        format!(
+                            "destructuring assignment expects {} values but got {}",
+                            names.len(),
+                            values.len()
+                        ),
+                        *span,
+                    ));
+                }
+                let values = values
+                    .iter()
+                    .map(|value| self.lower_expr(value))
+                    .collect::<KuResult<Vec<_>>>()?;
+                for (name, value) in names.iter().zip(values) {
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    if self.locals.contains_key(name) {
+                        self.current.instructions.push(IrInst::Store {
+                            target: IrLValue::Local(name.clone()),
+                            value,
+                        });
+                    } else {
+                        let ty = value.ty.clone();
+                        self.locals.insert(name.clone(), ty.clone());
+                        self.current.instructions.push(IrInst::Let {
+                            name: name.clone(),
+                            ty,
+                            value,
+                        });
+                    }
+                }
+            }
             Stmt::If {
                 condition,
                 then_branch,
@@ -605,6 +648,12 @@ impl<'a> FunctionLowerer<'a> {
             } => {
                 let iterable = self.lower_expr(iterable)?;
                 self.lower_for(name, iterable, body)?;
+            }
+            Stmt::Break { span } | Stmt::Continue { span } => {
+                return Err(KuError::runtime(
+                    "break/continue are not supported by IR/native lowering yet",
+                    *span,
+                ));
             }
             Stmt::Function(function) => {
                 let id = FunctionId(self.next_local_function_id);
@@ -1013,6 +1062,10 @@ impl<'a> FunctionLowerer<'a> {
                     ty: IrType::Unknown,
                 })
             }
+            ExprKind::OptionalField { .. } => Err(KuError::runtime(
+                "optional chaining is not supported by IR/native lowering yet",
+                expr.span,
+            )),
             ExprKind::TryUnwrap { expr } => {
                 let expr = self.lower_expr(expr)?;
                 let ty = match &expr.ty {
@@ -1135,8 +1188,13 @@ fn lower_type(ty: &TypeName) -> IrType {
         TypeName::Null => IrType::Null,
         TypeName::Array(inner) => IrType::Array(Box::new(lower_type(inner))),
         TypeName::Result(inner) => IrType::Result(Box::new(lower_type(inner))),
+        TypeName::Union(_) => IrType::Unknown,
         TypeName::Custom(name) => IrType::Named(name.clone()),
     }
+}
+
+fn lower_optional_type(ty: &Option<TypeName>) -> IrType {
+    ty.as_ref().map(lower_type).unwrap_or(IrType::Unknown)
 }
 
 fn lower_layouts(program: &Program) -> IrLayoutTable {
@@ -1161,7 +1219,7 @@ fn lower_struct_layout(decl: &StructDecl) -> IrStructLayout {
             .enumerate()
             .map(|(offset, field)| IrFieldLayout {
                 name: field.name.clone(),
-                ty: lower_type(&field.ty),
+                ty: lower_optional_type(&field.ty),
                 offset,
             })
             .collect(),
@@ -1184,7 +1242,7 @@ fn lower_enum_layout(decl: &EnumDecl) -> IrEnumLayout {
                     .enumerate()
                     .map(|(offset, field)| IrFieldLayout {
                         name: field.name.clone(),
-                        ty: lower_type(&field.ty),
+                        ty: lower_optional_type(&field.ty),
                         offset,
                     })
                     .collect(),
@@ -1280,9 +1338,12 @@ fn pattern_to_ir_type(pattern: &TypePattern, args: &[IrExpr]) -> Option<IrType> 
         TypePattern::Int => Some(IrType::Int),
         TypePattern::Bool => Some(IrType::Bool),
         TypePattern::String => Some(IrType::Str),
-        TypePattern::Unknown | TypePattern::Any | TypePattern::StringOrStringArray => {
-            Some(IrType::Unknown)
-        }
+        TypePattern::Null
+        | TypePattern::Unknown
+        | TypePattern::Any
+        | TypePattern::ObjectAny
+        | TypePattern::ObjectFields(_)
+        | TypePattern::StringOrStringArray => Some(IrType::Unknown),
         TypePattern::ArrayAny => Some(IrType::Array(Box::new(IrType::Unknown))),
         TypePattern::ArrayOf(inner) => {
             Some(IrType::Array(Box::new(pattern_to_ir_type(inner, args)?)))
@@ -1341,6 +1402,14 @@ fn collect_free_stmt_names(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut 
             collect_free_lvalue_names(target, bound, free);
             collect_free_expr_names(value, bound, free);
         }
+        Stmt::DestructureAssign { names, values, .. } => {
+            for value in values {
+                collect_free_expr_names(value, bound, free);
+            }
+            for name in names.iter().flatten() {
+                bound.insert(name.clone());
+            }
+        }
         Stmt::If {
             condition,
             then_branch,
@@ -1394,6 +1463,7 @@ fn collect_free_stmt_names(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut 
                 collect_free_expr_names(value, bound, free);
             }
         }
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
         Stmt::Expr { expr, .. } => collect_free_expr_names(expr, bound, free),
     }
 }
@@ -1456,7 +1526,9 @@ fn collect_free_expr_names(expr: &Expr, bound: &HashSet<String>, free: &mut Hash
             collect_free_expr_names(target, bound, free);
             collect_free_expr_names(index, bound, free);
         }
-        ExprKind::Field { target, .. } => collect_free_expr_names(target, bound, free),
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            collect_free_expr_names(target, bound, free)
+        }
         ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
             for (_, value) in fields {
                 collect_free_expr_names(value, bound, free);

@@ -18,9 +18,11 @@ enum Type {
     Null,
     Array(Box<Type>),
     Result(Box<Type>),
+    Union(Vec<Type>),
     Object(HashMap<String, Type>),
     Struct(String),
     Enum(String),
+    Generic(String),
     Void,
     FunctionValue {
         params: Vec<FunctionValueParam>,
@@ -44,6 +46,7 @@ struct FunctionValueParam {
 
 #[derive(Debug, Clone)]
 struct FunctionType {
+    type_params: Vec<String>,
     params: Vec<Type>,
     returns: Type,
 }
@@ -66,6 +69,7 @@ pub struct Checker {
     current_return: Type,
     check_depth: usize,
     recoverable_depth: usize,
+    loop_depth: usize,
     template_mode: bool,
     std_modules: HashSet<String>,
 }
@@ -80,6 +84,7 @@ impl Checker {
             current_return: Type::Void,
             check_depth: 0,
             recoverable_depth: 0,
+            loop_depth: 0,
             template_mode: false,
             std_modules: HashSet::new(),
         }
@@ -142,17 +147,30 @@ impl Checker {
                 self.functions.insert(
                     function.name.clone(),
                     FunctionType {
+                        type_params: function.type_params.clone(),
                         params: function
                             .params
                             .iter()
-                            .map(|p| self.resolve_type_name(&p.ty, p.span))
+                            .map(|p| {
+                                self.resolve_optional_type_name_with_generics(
+                                    &p.ty,
+                                    p.span,
+                                    &function.type_params,
+                                )
+                            })
                             .collect::<KuResult<Vec<_>>>()?,
                         returns: function
                             .return_type
                             .as_ref()
-                            .map(|ty| self.resolve_type_name(ty, function.span))
+                            .map(|ty| {
+                                self.resolve_type_name_with_generics(
+                                    ty,
+                                    function.span,
+                                    &function.type_params,
+                                )
+                            })
                             .transpose()?
-                            .unwrap_or(Type::Void),
+                            .unwrap_or(Type::Unknown),
                     },
                 );
             }
@@ -198,7 +216,7 @@ impl Checker {
             }
             fields.insert(
                 field.name.clone(),
-                self.resolve_type_name(&field.ty, field.span)?,
+                self.resolve_required_type_name(&field.ty, field.span)?,
             );
         }
         self.structs
@@ -226,7 +244,7 @@ impl Checker {
                 variant
                     .fields
                     .iter()
-                    .map(|p| self.resolve_type_name(&p.ty, p.span))
+                    .map(|p| self.resolve_required_type_name(&p.ty, p.span))
                     .collect::<KuResult<Vec<_>>>()?,
             );
         }
@@ -237,24 +255,53 @@ impl Checker {
     fn check_function(&mut self, function: &FnDecl) -> KuResult<()> {
         reject_duplicate_params(function)?;
         self.push_scope();
-        self.current_return = function
+        let explicit_return = function
             .return_type
             .as_ref()
-            .map(|ty| self.resolve_type_name(ty, function.span))
-            .transpose()?
-            .unwrap_or(Type::Void);
+            .map(|ty| {
+                self.resolve_type_name_with_generics(ty, function.span, &function.type_params)
+            })
+            .transpose()?;
+        self.current_return = explicit_return.clone().unwrap_or(Type::Unknown);
         for param in &function.params {
             self.define(
                 param.name.clone(),
-                self.resolve_type_name(&param.ty, param.span)?,
+                self.resolve_optional_type_name_with_generics(
+                    &param.ty,
+                    param.span,
+                    &function.type_params,
+                )?,
                 false,
                 param.span,
             )?;
         }
+        let mut inferred_return = Type::Null;
         for stmt in &function.body {
-            self.check_stmt(stmt)?;
+            if let Some(return_type) = self.check_stmt_and_infer_return(stmt)? {
+                inferred_return =
+                    merge_return_types(&inferred_return, &return_type, stmt_span(stmt))?;
+            }
         }
-        if self.current_return != Type::Void && !block_may_return(&function.body) {
+        if let Some(expected) = &explicit_return {
+            if expected != &Type::Void && !block_may_return(&function.body) {
+                return Err(KuError::runtime(
+                    format!(
+                        "function '{}' must return {}",
+                        function.name,
+                        type_name(expected)
+                    ),
+                    function.span,
+                ));
+            }
+        }
+        let resolved_return = explicit_return.unwrap_or(inferred_return);
+        if let Some(signature) = self.functions.get_mut(&function.name) {
+            signature.returns = resolved_return;
+        }
+        if self.current_return != Type::Unknown
+            && self.current_return != Type::Void
+            && !block_may_return(&function.body)
+        {
             return Err(KuError::runtime(
                 format!(
                     "function '{}' must return {}",
@@ -270,18 +317,38 @@ impl Checker {
     }
 
     fn resolve_type_name(&self, name: &TypeName, span: Span) -> KuResult<Type> {
+        self.resolve_type_name_with_generics(name, span, &[])
+    }
+
+    fn resolve_type_name_with_generics(
+        &self,
+        name: &TypeName,
+        span: Span,
+        generics: &[String],
+    ) -> KuResult<Type> {
         match name {
             TypeName::Int => Ok(Type::Int),
             TypeName::Float => Ok(Type::Float),
             TypeName::Bool => Ok(Type::Bool),
             TypeName::String => Ok(Type::String),
             TypeName::Null => Ok(Type::Null),
-            TypeName::Array(inner) => {
-                Ok(Type::Array(Box::new(self.resolve_type_name(inner, span)?)))
+            TypeName::Array(inner) => Ok(Type::Array(Box::new(
+                self.resolve_type_name_with_generics(inner, span, generics)?,
+            ))),
+            TypeName::Result(inner) => Ok(Type::Result(Box::new(
+                self.resolve_type_name_with_generics(inner, span, generics)?,
+            ))),
+            TypeName::Union(types) => {
+                let mut resolved = Vec::with_capacity(types.len());
+                for ty in types {
+                    let ty = self.resolve_type_name_with_generics(ty, span, generics)?;
+                    if !resolved.iter().any(|existing| type_matches(existing, &ty)) {
+                        resolved.push(ty);
+                    }
+                }
+                Ok(Type::Union(resolved))
             }
-            TypeName::Result(inner) => {
-                Ok(Type::Result(Box::new(self.resolve_type_name(inner, span)?)))
-            }
+            TypeName::Custom(name) if generics.contains(name) => Ok(Type::Generic(name.clone())),
             TypeName::Custom(name) if self.structs.contains_key(name) => {
                 Ok(Type::Struct(name.clone()))
             }
@@ -289,6 +356,25 @@ impl Checker {
             TypeName::Custom(name) => {
                 Err(KuError::runtime(format!("undefined type '{name}'"), span))
             }
+        }
+    }
+
+    fn resolve_optional_type_name_with_generics(
+        &self,
+        name: &Option<TypeName>,
+        span: Span,
+        generics: &[String],
+    ) -> KuResult<Type> {
+        match name {
+            Some(name) => self.resolve_type_name_with_generics(name, span, generics),
+            None => Ok(Type::Unknown),
+        }
+    }
+
+    fn resolve_required_type_name(&self, name: &Option<TypeName>, span: Span) -> KuResult<Type> {
+        match name {
+            Some(name) => self.resolve_type_name(name, span),
+            None => Err(KuError::runtime("expected type name", span)),
         }
     }
 
@@ -346,13 +432,53 @@ impl Checker {
                 }
                 Ok(())
             }
+            Stmt::DestructureAssign {
+                names,
+                values,
+                span,
+            } => {
+                if names.len() != values.len() {
+                    return Err(KuError::runtime(
+                        format!(
+                            "destructuring assignment expects {} values but got {}",
+                            names.len(),
+                            values.len()
+                        ),
+                        *span,
+                    ));
+                }
+                let actuals = values
+                    .iter()
+                    .map(|value| self.check_expr(value))
+                    .collect::<KuResult<Vec<_>>>()?;
+                for (name, actual) in names.iter().zip(actuals) {
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    if !self.contains(name) {
+                        self.define(name.clone(), actual, !is_constant_name(name), *span)?;
+                        continue;
+                    }
+                    let binding = self.get(name, *span)?;
+                    if !binding.mutable {
+                        return Err(KuError::runtime(
+                            format!("cannot assign to immutable variable '{name}'"),
+                            *span,
+                        ));
+                    }
+                    if !type_matches(&binding.ty, &actual) {
+                        return Err(type_error(*span, &binding.ty, &actual));
+                    }
+                }
+                Ok(())
+            }
             Stmt::If {
                 condition,
                 then_branch,
                 else_branch,
                 span,
             } => {
-                self.expect_bool(condition, *span)?;
+                self.expect_condition(condition, *span)?;
                 self.check_block(then_branch)?;
                 self.check_block(else_branch)
             }
@@ -361,8 +487,11 @@ impl Checker {
                 body,
                 span,
             } => {
-                self.expect_bool(condition, *span)?;
-                self.check_block(body)
+                self.expect_condition(condition, *span)?;
+                self.loop_depth += 1;
+                let result = self.check_block(body);
+                self.loop_depth -= 1;
+                result
             }
             Stmt::For {
                 name,
@@ -381,12 +510,31 @@ impl Checker {
                     ));
                 };
                 self.push_scope();
-                self.define(name.clone(), *element, true, *span)?;
-                for stmt in body {
-                    self.check_stmt(stmt)?;
-                }
+                self.loop_depth += 1;
+                let result = (|| -> KuResult<()> {
+                    self.define(name.clone(), *element, true, *span)?;
+                    for stmt in body {
+                        self.check_stmt(stmt)?;
+                    }
+                    Ok(())
+                })();
+                self.loop_depth -= 1;
                 self.pop_scope();
-                Ok(())
+                result
+            }
+            Stmt::Break { span } => {
+                if self.loop_depth == 0 {
+                    Err(KuError::runtime("break outside loop", *span))
+                } else {
+                    Ok(())
+                }
+            }
+            Stmt::Continue { span } => {
+                if self.loop_depth == 0 {
+                    Err(KuError::runtime("continue outside loop", *span))
+                } else {
+                    Ok(())
+                }
             }
             Stmt::Function(function) => self.check_local_function(function),
             Stmt::Try {
@@ -402,7 +550,7 @@ impl Checker {
                 body_result?;
                 if let Some(name) = catch_name {
                     self.push_scope();
-                    self.define(name.clone(), Type::String, false, *span)?;
+                    self.define(name.clone(), error_type(), false, *span)?;
                     for stmt in catch_body {
                         self.check_stmt(stmt)?;
                     }
@@ -412,8 +560,8 @@ impl Checker {
             }
             Stmt::Fail { value, span } => {
                 let actual = self.check_expr(value)?;
-                if actual != Type::String {
-                    return Err(type_error(*span, &Type::String, &actual));
+                if actual != Type::String && !matches!(actual, Type::Object(_)) {
+                    return Err(type_error(*span, &error_type(), &actual));
                 }
                 match &self.current_return {
                     Type::Result(_) => Ok(()),
@@ -499,6 +647,9 @@ impl Checker {
                     self.check_binary(*op, &left, &right, expr.span)
                 }
                 ExprKind::Call { callee, args } => {
+                    if let Some(ty) = self.check_array_map_call(callee, args, expr.span)? {
+                        return Ok(ty);
+                    }
                     if let Some(ty) = self.check_dotted_builtin_call(callee, args, expr.span)? {
                         return Ok(ty);
                     }
@@ -507,6 +658,9 @@ impl Checker {
                             return self
                                 .check_enum_constructor(&enum_name, &variant, args, expr.span);
                         }
+                    }
+                    if let Some(ty) = self.check_std_method_call(callee, args, expr.span)? {
+                        return Ok(ty);
                     }
                     if let ExprKind::Variable(name) = &callee.kind {
                         if let Some(function) = self.functions.get(name).cloned() {
@@ -520,13 +674,26 @@ impl Checker {
                                     expr.span,
                                 ));
                             }
+                            let mut generic_bindings = HashMap::new();
                             for (arg, expected) in args.iter().zip(function.params.iter()) {
                                 let actual = self.check_expr(arg)?;
-                                if !type_matches(expected, &actual) {
+                                if !bind_generic_type(expected, &actual, &mut generic_bindings)
+                                    || !type_matches(expected, &actual)
+                                {
                                     return Err(type_error(arg.span, expected, &actual));
                                 }
                             }
-                            return Ok(function.returns);
+                            if !function
+                                .type_params
+                                .iter()
+                                .all(|name| generic_bindings.contains_key(name))
+                            {
+                                return Err(KuError::runtime(
+                                    format!("function '{name}' could not infer generic type"),
+                                    expr.span,
+                                ));
+                            }
+                            return Ok(substitute_generics(&function.returns, &generic_bindings));
                         }
                         if self.contains(name) {
                             let callee_type = self.get(name, callee.span)?.ty;
@@ -596,11 +763,25 @@ impl Checker {
                 ExprKind::Index { target, index } => {
                     let target_type = self.check_expr(target)?;
                     let index_type = self.check_expr(index)?;
-                    if index_type != Type::Int {
-                        return Err(type_error(index.span, &Type::Int, &index_type));
-                    }
                     match target_type {
-                        Type::Array(element) => Ok(*element),
+                        Type::Array(element) => {
+                            if index_type != Type::Int {
+                                return Err(type_error(index.span, &Type::Int, &index_type));
+                            }
+                            Ok(*element)
+                        }
+                        Type::String => {
+                            if index_type != Type::Int {
+                                return Err(type_error(index.span, &Type::Int, &index_type));
+                            }
+                            Ok(Type::String)
+                        }
+                        Type::Object(_) => {
+                            if index_type != Type::String {
+                                return Err(type_error(index.span, &Type::String, &index_type));
+                            }
+                            Ok(Type::Unknown)
+                        }
                         other => Err(KuError::runtime(
                             format!("type error: cannot index {}", type_name(&other)),
                             target.span,
@@ -670,6 +851,27 @@ impl Checker {
                                 ))
                             }
                         }
+                        other => Err(KuError::runtime(
+                            format!("type error: {} has no fields", type_name(&other)),
+                            target.span,
+                        )),
+                    }
+                }
+                ExprKind::OptionalField { target, name } => {
+                    let target_type = self.check_expr(target)?;
+                    match target_type {
+                        Type::Null => Ok(Type::Null),
+                        Type::Struct(struct_name) => {
+                            let Some(struct_type) = self.structs.get(&struct_name) else {
+                                return Err(KuError::runtime(
+                                    format!("undefined struct '{struct_name}'"),
+                                    target.span,
+                                ));
+                            };
+                            Ok(struct_type.fields.get(name).cloned().unwrap_or(Type::Null))
+                        }
+                        Type::Object(fields) => Ok(fields.get(name).cloned().unwrap_or(Type::Null)),
+                        Type::Unknown => Ok(Type::Unknown),
                         other => Err(KuError::runtime(
                             format!("type error: {} has no fields", type_name(&other)),
                             target.span,
@@ -792,17 +994,17 @@ impl Checker {
 
     fn check_binary(&self, op: BinaryOp, left: &Type, right: &Type, span: Span) -> KuResult<Type> {
         match op {
-            _ if left == &Type::Unknown || right == &Type::Unknown => Ok(Type::Unknown),
             BinaryOp::Add if self.template_mode && can_template_concat(left, right) => {
                 Ok(Type::String)
             }
             BinaryOp::Add if left == &Type::String && right == &Type::String => Ok(Type::String),
+            BinaryOp::Equal | BinaryOp::NotEqual if type_matches(left, right) => Ok(Type::Bool),
+            _ if left == &Type::Unknown || right == &Type::Unknown => Ok(Type::Unknown),
             BinaryOp::Add
             | BinaryOp::Subtract
             | BinaryOp::Multiply
             | BinaryOp::Divide
             | BinaryOp::Remainder => numeric_result(op, left, right, span),
-            BinaryOp::Equal | BinaryOp::NotEqual if type_matches(left, right) => Ok(Type::Bool),
             BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual
                 if is_numeric(left) && is_numeric(right) =>
             {
@@ -866,11 +1068,19 @@ impl Checker {
             AssignTarget::Index { target, index } => {
                 let target_type = self.check_expr(target)?;
                 let index_type = self.check_expr(index)?;
-                if index_type != Type::Int {
-                    return Err(type_error(index.span, &Type::Int, &index_type));
-                }
                 match target_type {
-                    Type::Array(element) => Ok(*element),
+                    Type::Array(element) => {
+                        if index_type != Type::Int {
+                            return Err(type_error(index.span, &Type::Int, &index_type));
+                        }
+                        Ok(*element)
+                    }
+                    Type::Object(_) => {
+                        if index_type != Type::String {
+                            return Err(type_error(index.span, &Type::String, &index_type));
+                        }
+                        Ok(Type::Unknown)
+                    }
                     other => Err(KuError::runtime(
                         format!("type error: cannot index {}", type_name(&other)),
                         target.span,
@@ -1107,6 +1317,12 @@ impl Checker {
             return Ok(None);
         }
         let Some(signature) = metadata::dotted_signature(&module, &function) else {
+            if metadata::is_std_module(&module) && self.std_modules.contains(&module) {
+                return Err(KuError::runtime(
+                    format!("unknown stdlib function '{module}.{function}'"),
+                    span,
+                ));
+            }
             return Ok(None);
         };
         if metadata::module_requires_import(&module) && !self.std_modules.contains(&module) {
@@ -1116,6 +1332,31 @@ impl Checker {
             ));
         }
         Ok(Some(self.apply_stdlib_signature(&signature, args, span)?))
+    }
+
+    fn check_std_method_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Option<Type>> {
+        let ExprKind::Field { target, name } = &callee.kind else {
+            return Ok(None);
+        };
+        let target_type = self.check_expr(target)?;
+        let module = match target_type {
+            Type::String => "string",
+            Type::Array(_) if name != "map" => "array",
+            _ => return Ok(None),
+        };
+        let Some(signature) = metadata::dotted_signature(module, name) else {
+            return Ok(None);
+        };
+        let mut method_args = Vec::with_capacity(args.len() + 1);
+        method_args.push((**target).clone());
+        method_args.extend(args.iter().cloned());
+        self.apply_stdlib_signature(&signature, &method_args, span)
+            .map(Some)
     }
 
     fn apply_stdlib_signature(
@@ -1186,12 +1427,27 @@ impl Checker {
     }
 
     fn type_matches_pattern(&self, actual: &Type, pattern: &TypePattern) -> bool {
+        if let Type::Union(types) = actual {
+            return types
+                .iter()
+                .all(|actual| self.type_matches_pattern(actual, pattern));
+        }
         match pattern {
             TypePattern::Int => actual == &Type::Int,
             TypePattern::Bool => actual == &Type::Bool,
             TypePattern::String => actual == &Type::String,
+            TypePattern::Null => actual == &Type::Null,
             TypePattern::Unknown | TypePattern::Any => true,
             TypePattern::ArrayAny => matches!(actual, Type::Array(_)),
+            TypePattern::ObjectAny => matches!(actual, Type::Object(_)),
+            TypePattern::ObjectFields(fields) => match actual {
+                Type::Object(actual_fields) => fields.iter().all(|(name, pattern)| {
+                    actual_fields
+                        .get(name)
+                        .is_some_and(|actual| self.type_matches_pattern(actual, pattern))
+                }),
+                _ => false,
+            },
             TypePattern::StringOrStringArray => {
                 actual == &Type::String || actual == &Type::Array(Box::new(Type::String))
             }
@@ -1210,7 +1466,15 @@ impl Checker {
             TypePattern::Int => Type::Int,
             TypePattern::Bool => Type::Bool,
             TypePattern::String => Type::String,
+            TypePattern::Null => Type::Null,
             TypePattern::ArrayAny => Type::Array(Box::new(Type::Unknown)),
+            TypePattern::ObjectAny => Type::Object(HashMap::new()),
+            TypePattern::ObjectFields(fields) => Type::Object(
+                fields
+                    .iter()
+                    .map(|(name, pattern)| (name.clone(), self.pattern_expected_type(pattern)))
+                    .collect(),
+            ),
             TypePattern::ArrayOf(inner) => Type::Array(Box::new(self.pattern_expected_type(inner))),
             TypePattern::StringOrStringArray => Type::String,
             TypePattern::Unknown
@@ -1231,8 +1495,21 @@ impl Checker {
             TypePattern::Int => Ok(Type::Int),
             TypePattern::Bool => Ok(Type::Bool),
             TypePattern::String => Ok(Type::String),
+            TypePattern::Null => Ok(Type::Null),
             TypePattern::Unknown | TypePattern::Any => Ok(Type::Unknown),
             TypePattern::ArrayAny => Ok(Type::Array(Box::new(Type::Unknown))),
+            TypePattern::ObjectAny => Ok(Type::Object(HashMap::new())),
+            TypePattern::ObjectFields(fields) => Ok(Type::Object(
+                fields
+                    .iter()
+                    .map(|(name, pattern)| {
+                        Ok((
+                            name.clone(),
+                            self.stdlib_pattern_to_type(pattern, actuals, span)?,
+                        ))
+                    })
+                    .collect::<KuResult<HashMap<_, _>>>()?,
+            )),
             TypePattern::ArrayOf(inner) => Ok(Type::Array(Box::new(
                 self.stdlib_pattern_to_type(inner, actuals, span)?,
             ))),
@@ -1254,6 +1531,54 @@ impl Checker {
                 .cloned()
                 .ok_or_else(|| KuError::runtime("invalid stdlib signature", span)),
         }
+    }
+
+    fn check_array_map_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Option<Type>> {
+        let ExprKind::Field { target, name } = &callee.kind else {
+            return Ok(None);
+        };
+        if name != "map" {
+            return Ok(None);
+        }
+        expect_arg_count("array.map", args.len(), 1, span)?;
+        let target_type = self.check_expr(target)?;
+        let Type::Array(element) = target_type else {
+            return Err(KuError::runtime(
+                format!(
+                    "type error: map expects array but got {}",
+                    type_name(&target_type)
+                ),
+                target.span,
+            ));
+        };
+        let mapper_type = self.check_expr(&args[0])?;
+        let Type::FunctionValue {
+            params,
+            return_type,
+            body,
+        } = mapper_type
+        else {
+            return Err(KuError::runtime(
+                format!(
+                    "type error: array.map expects function but got {}",
+                    type_name(&mapper_type)
+                ),
+                args[0].span,
+            ));
+        };
+        let mapped = self.check_function_value_call_with_types(
+            &params,
+            return_type.as_deref(),
+            &body,
+            &[*element],
+            span,
+        )?;
+        Ok(Some(Type::Array(Box::new(mapped))))
     }
 
     fn check_function_value_call(
@@ -1293,10 +1618,38 @@ impl Checker {
                 arg_types.push(actual.clone());
             }
         }
+        self.check_function_value_call_with_types(params, return_type, body, &arg_types, span)
+    }
+
+    fn check_function_value_call_with_types(
+        &mut self,
+        params: &[FunctionValueParam],
+        return_type: Option<&Type>,
+        body: &[Stmt],
+        arg_types: &[Type],
+        span: Span,
+    ) -> KuResult<Type> {
+        if params.len() != arg_types.len() {
+            return Err(KuError::runtime(
+                format!(
+                    "function value expects {} arguments but got {}",
+                    params.len(),
+                    arg_types.len()
+                ),
+                span,
+            ));
+        }
+        for (param, actual) in params.iter().zip(arg_types.iter()) {
+            if let Some(expected) = &param.ty {
+                if !type_matches(expected, actual) {
+                    return Err(type_error(span, expected, actual));
+                }
+            }
+        }
         if let Some(return_type) = return_type {
             return Ok(return_type.clone());
         }
-        self.check_function_value_body(params, return_type, body, &arg_types, span)
+        self.check_function_value_body(params, return_type, body, arg_types, span)
     }
 
     fn check_function_value_body(
@@ -1349,14 +1702,26 @@ impl Checker {
             .map(|param| {
                 Ok(FunctionValueParam {
                     name: param.name.clone(),
-                    ty: Some(self.resolve_type_name(&param.ty, param.span)?),
+                    ty: param
+                        .ty
+                        .as_ref()
+                        .map(|ty| {
+                            self.resolve_type_name_with_generics(
+                                ty,
+                                param.span,
+                                &function.type_params,
+                            )
+                        })
+                        .transpose()?,
                 })
             })
             .collect::<KuResult<Vec<_>>>()?;
         let return_type = function
             .return_type
             .as_ref()
-            .map(|ty| self.resolve_type_name(ty, function.span))
+            .map(|ty| {
+                self.resolve_type_name_with_generics(ty, function.span, &function.type_params)
+            })
             .transpose()?;
         self.define(
             function.name.clone(),
@@ -1387,6 +1752,7 @@ impl Checker {
             Stmt::Return { value, span } => {
                 let actual = match value {
                     Some(value) => self.check_expr(value)?,
+                    None if self.current_return == Type::Void => Type::Void,
                     None => Type::Null,
                 };
                 if !type_matches(&self.current_return, &actual) {
@@ -1396,8 +1762,8 @@ impl Checker {
             }
             Stmt::Fail { value, span } => {
                 let actual = self.check_expr(value)?;
-                if actual != Type::String {
-                    return Err(type_error(*span, &Type::String, &actual));
+                if actual != Type::String && !matches!(actual, Type::Object(_)) {
+                    return Err(type_error(*span, &error_type(), &actual));
                 }
                 if !matches!(self.current_return, Type::Result(_)) {
                     if self.recoverable_depth > 0 {
@@ -1419,7 +1785,7 @@ impl Checker {
                 else_branch,
                 span,
             } => {
-                self.expect_bool(condition, *span)?;
+                self.expect_condition(condition, *span)?;
                 let then_return = self.check_block_and_infer_return(then_branch)?;
                 let else_return = self.check_block_and_infer_return(else_branch)?;
                 match (then_return, else_return) {
@@ -1428,6 +1794,20 @@ impl Checker {
                     }
                     (Some(left), None) | (None, Some(left)) => Ok(Some(left)),
                     (None, None) => Ok(None),
+                }
+            }
+            Stmt::Break { span } => {
+                if self.loop_depth == 0 {
+                    Err(KuError::runtime("break outside loop", *span))
+                } else {
+                    Ok(None)
+                }
+            }
+            Stmt::Continue { span } => {
+                if self.loop_depth == 0 {
+                    Err(KuError::runtime("continue outside loop", *span))
+                } else {
+                    Ok(None)
                 }
             }
             _ => {
@@ -1452,12 +1832,18 @@ impl Checker {
         Ok(inferred)
     }
 
-    fn expect_bool(&mut self, expr: &Expr, span: Span) -> KuResult<()> {
+    fn expect_condition(&mut self, expr: &Expr, span: Span) -> KuResult<()> {
         let ty = self.check_expr(expr)?;
         if ty == Type::Bool {
             Ok(())
         } else {
-            Err(type_error(span, &Type::Bool, &ty))
+            Err(KuError::runtime(
+                format!(
+                    "type error: condition must be bool but got {}",
+                    type_name(&ty)
+                ),
+                span,
+            ))
         }
     }
 
@@ -1539,7 +1925,11 @@ fn reject_duplicate_params(function: &FnDecl) -> KuResult<()> {
 }
 
 fn is_numeric(ty: &Type) -> bool {
-    matches!(ty, Type::Int | Type::Float)
+    match ty {
+        Type::Int | Type::Float => true,
+        Type::Union(types) => !types.is_empty() && types.iter().all(is_numeric),
+        _ => false,
+    }
 }
 
 fn numeric_result(op: BinaryOp, left: &Type, right: &Type, span: Span) -> KuResult<Type> {
@@ -1559,16 +1949,27 @@ fn numeric_result(op: BinaryOp, left: &Type, right: &Type, span: Span) -> KuResu
             span,
         ));
     }
-    if left == &Type::Float || right == &Type::Float {
+    if contains_float(left) || contains_float(right) {
         Ok(Type::Float)
     } else {
         Ok(Type::Int)
     }
 }
 
+fn contains_float(ty: &Type) -> bool {
+    match ty {
+        Type::Float => true,
+        Type::Union(types) => types.iter().any(contains_float),
+        _ => false,
+    }
+}
+
 fn type_matches(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
+        (Type::Generic(_), _) | (_, Type::Generic(_)) => true,
         (Type::Unknown, _) | (_, Type::Unknown) => true,
+        (Type::Union(options), _) => options.iter().any(|option| type_matches(option, actual)),
+        (_, Type::Union(options)) => options.iter().all(|option| type_matches(expected, option)),
         (Type::Array(left), Type::Array(right)) => type_matches(left, right),
         (Type::Result(left), Type::Result(right)) => type_matches(left, right),
         (Type::Object(left), Type::Object(right)) => {
@@ -1580,6 +1981,45 @@ fn type_matches(expected: &Type, actual: &Type) -> bool {
                 })
         }
         _ => expected == actual,
+    }
+}
+
+fn bind_generic_type(expected: &Type, actual: &Type, bindings: &mut HashMap<String, Type>) -> bool {
+    match expected {
+        Type::Generic(name) => match bindings.get(name) {
+            Some(existing) => type_matches(existing, actual),
+            None => {
+                bindings.insert(name.clone(), actual.clone());
+                true
+            }
+        },
+        Type::Array(expected) => match actual {
+            Type::Array(actual) => bind_generic_type(expected, actual, bindings),
+            _ => false,
+        },
+        Type::Result(expected) => match actual {
+            Type::Result(actual) => bind_generic_type(expected, actual, bindings),
+            _ => false,
+        },
+        Type::Union(options) => options
+            .iter()
+            .any(|option| bind_generic_type(option, actual, bindings)),
+        _ => true,
+    }
+}
+
+fn substitute_generics(ty: &Type, bindings: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::Generic(name) => bindings.get(name).cloned().unwrap_or(Type::Unknown),
+        Type::Array(inner) => Type::Array(Box::new(substitute_generics(inner, bindings))),
+        Type::Result(inner) => Type::Result(Box::new(substitute_generics(inner, bindings))),
+        Type::Union(types) => Type::Union(
+            types
+                .iter()
+                .map(|ty| substitute_generics(ty, bindings))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -1651,6 +2091,14 @@ fn type_error(span: Span, expected: &Type, actual: &Type) -> KuError {
     )
 }
 
+fn error_type() -> Type {
+    Type::Object(HashMap::from([
+        ("domain".to_string(), Type::String),
+        ("code".to_string(), Type::String),
+        ("message".to_string(), Type::String),
+    ]))
+}
+
 fn type_name(ty: &Type) -> String {
     match ty {
         Type::Int => "int".to_string(),
@@ -1660,9 +2108,11 @@ fn type_name(ty: &Type) -> String {
         Type::Null => "null".to_string(),
         Type::Array(inner) => format!("[{}]", type_name(inner)),
         Type::Result(inner) => format!("{}!", type_name(inner)),
+        Type::Union(types) => types.iter().map(type_name).collect::<Vec<_>>().join(" | "),
         Type::Object(_) => "object".to_string(),
         Type::Struct(name) => name.clone(),
         Type::Enum(name) => name.clone(),
+        Type::Generic(name) => name.clone(),
         Type::Void => "void".to_string(),
         Type::FunctionValue { .. } => "function".to_string(),
         Type::Unknown => "unknown".to_string(),
@@ -1670,6 +2120,12 @@ fn type_name(ty: &Type) -> String {
 }
 
 fn can_template_concat(left: &Type, right: &Type) -> bool {
+    if let Type::Union(types) = left {
+        return types.iter().all(|ty| can_template_concat(ty, right));
+    }
+    if let Type::Union(types) = right {
+        return types.iter().all(|ty| can_template_concat(left, ty));
+    }
     matches!(
         (left, right),
         (Type::String, Type::Int | Type::Float)
@@ -1714,6 +2170,7 @@ fn block_may_return(body: &[Stmt]) -> bool {
 fn stmt_may_return(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return { .. } | Stmt::Fail { .. } => true,
+        Stmt::Break { .. } | Stmt::Continue { .. } => false,
         Stmt::If {
             then_branch,
             else_branch,
@@ -1732,9 +2189,12 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::VarDecl { span, .. }
         | Stmt::Assign { span, .. }
         | Stmt::AssignTarget { span, .. }
+        | Stmt::DestructureAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
+        | Stmt::Break { span }
+        | Stmt::Continue { span }
         | Stmt::Function(FnDecl { span, .. })
         | Stmt::Try { span, .. }
         | Stmt::Fail { span, .. }

@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.12`，重点是嵌套 `match` 模式、独立导入的 `std:http` 标准库雏形，以及更接近真实可执行入口的 native C 输出。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.12`，重点是嵌套 `match` 模式、独立导入的 `std.http` 标准库雏形，以及更接近真实可执行入口的 native C 输出。
 
 ## 快速开始
 
@@ -88,7 +88,7 @@ fn main() {
     try {
         message = read_name()?
     } catch (err) {
-        message = "caught: " + err
+        message = "caught: " + err.message
     } finally {
         print("cleanup")
     }
@@ -146,7 +146,7 @@ dep.util.checksum = "ku-fnv64-..."
 
 ```ku
 import { Value } from "util"
-import { Value as RemoteValue } from "@util/util"
+import { Value } from "@util/util"
 ```
 
 `ku check` / `ku run` 会把 file dependency 放进 `<package>/.ku/cache/packages/<name>/<version>/`，并把 package dependency 写进 `ku.lock`。`ku package gc <file.ku>` 会清理 manifest 当前依赖之外的缓存版本。
@@ -175,7 +175,7 @@ package/
 
 ## 文档
 
-- [0.0.11 语法草案](docs/syntax.md)
+- [0.0.12 语法文档](docs/syntax.md)
 - [0.0.12 版本记录](docs/v0.0.12.md)
 - [0.0.11 版本记录](docs/v0.0.11.md)
 - [0.0.10 版本记录](docs/v0.0.10.md)
@@ -194,18 +194,28 @@ package/
 
 `ku build` 当前生成解释器打包型可执行文件。
 
-`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、局部变量、直接函数调用、`print`、`return`、`if`、`while`，以及 `Result<int|bool|str, str>` 的 `ok` / `err` / `?` / 错误传播。数组、struct、enum、闭包、match、try/catch 的 native lowering 仍会明确报不支持。
+`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、局部变量、直接函数调用、`print`、`return`、`if`、`while`，以及基础 Result 的 `ok` / `err` / `?` / 错误传播。native C 的错误槽仍是原型字符串 ABI；数组、struct、enum、闭包、match、try/catch 的 native lowering 仍会明确报不支持。
 
 已完成到 0.0.12 的关键前置：
 
 ```txt
+支持 str | int 这类联合类型，用于参数、变量和返回值检查。
+支持 break / continue，并修复 for + continue 作用域弹出问题。
+支持位置解构赋值 a, b = 1, 2 和丢弃占位符 _。
+支持可选字段访问 user?.name。
+支持单参数箭头函数 x => x * 2。
+支持数组链式 map：nums.map(x => x * 2)。
+支持泛型函数：fn id<T>(value:T): T。
+支持 string / array 标准库实例方法：text.trim()、items.try_get(0)?。
+支持对象字符串键索引和字符串 int 索引：object["name"]、text[0]。
+可恢复错误统一为 Error 对象：{ domain, code, message }，catch (err) 后使用 err.message / err.domain / err.code。
 运行时闭包使用精确 capture map，不再把整个 Env 存进函数值。
 IR 已有 ResultBranch / BindOk / JumpErr / PropagateErr。
-native C 后端已有 Result<int|bool|str,str> ABI 子集。
+native C 后端已有基础 Result ABI 子集，但还不是完整 Error 对象 ABI。
 package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
 match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。
-std:http 必须显式 import，当前提供 http.try_get(url): str! 的 http:// 同步 Result 子集。
+std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象。fs 需要 `import "std.fs"` 后使用，并提供 read/write 与 try_read/try_write。
 native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wrapper。
 ```
 

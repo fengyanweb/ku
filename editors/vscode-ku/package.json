@@ -1,0 +1,40 @@
+{
+  "name": "ku-language",
+  "displayName": "Ku Language",
+  "description": "Syntax highlighting and snippets for Ku",
+  "version": "0.0.12",
+  "publisher": "ku-lang",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "ku",
+        "aliases": ["Ku", "ku"],
+        "extensions": [".ku"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ku",
+        "scopeName": "source.ku",
+        "path": "./syntaxes/ku.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "ku",
+        "path": "./snippets/ku.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[ku]": {
+        "editor.insertSpaces": true,
+        "editor.tabSize": 4
+      }
+    }
+  }
+}

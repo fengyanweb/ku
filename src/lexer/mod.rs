@@ -55,11 +55,29 @@ impl<'a> Lexer<'a> {
                 ':' => TokenKind::Colon,
                 ';' => TokenKind::Semicolon,
                 '.' => TokenKind::Dot,
-                '+' => TokenKind::Plus,
-                '-' => TokenKind::Minus,
+                '+' => {
+                    if self.match_char('+') {
+                        TokenKind::PlusPlus
+                    } else {
+                        TokenKind::Plus
+                    }
+                }
+                '-' => {
+                    if self.match_char('-') {
+                        TokenKind::MinusMinus
+                    } else {
+                        TokenKind::Minus
+                    }
+                }
                 '*' => TokenKind::Star,
                 '%' => TokenKind::Percent,
-                '?' => TokenKind::Question,
+                '?' => {
+                    if self.match_char('.') {
+                        TokenKind::QuestionDot
+                    } else {
+                        TokenKind::Question
+                    }
+                }
                 '!' => {
                     if self.match_char('=') {
                         TokenKind::BangEqual
@@ -102,7 +120,7 @@ impl<'a> Lexer<'a> {
                     if self.match_char('|') {
                         TokenKind::OrOr
                     } else {
-                        return Err(KuError::lex("expected '|' after '|'", Span::point(start)));
+                        TokenKind::Pipe
                     }
                 }
                 '"' => {
@@ -359,6 +377,8 @@ impl<'a> Lexer<'a> {
             "while" => TokenKind::While,
             "for" => TokenKind::For,
             "in" => TokenKind::In,
+            "break" => TokenKind::Break,
+            "continue" => TokenKind::Continue,
             "match" => TokenKind::Match,
             "switch" => TokenKind::Switch,
             "try" => TokenKind::Try,

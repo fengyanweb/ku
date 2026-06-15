@@ -1,6 +1,7 @@
 use crate::{
     error::{KuError, KuResult},
     span::Span,
+    stdlib::errors,
     value::Value,
 };
 
@@ -30,10 +31,12 @@ pub fn eval_builtin(name: &str, args: &[Value], span: Span) -> KuResult<Option<V
             let Value::String(message) = &args[0] else {
                 return Err(expected_type("str", &args[0], span));
             };
-            Ok(Some(Value::Result {
-                ok: false,
-                value: Box::new(Value::String(message.clone())),
-            }))
+            Ok(Some(errors::err("ku", "err", message.clone())))
+        }
+        "println" => {
+            expect_arg_count(name, args.len(), 1, span)?;
+            println!("{}", args[0]);
+            Ok(Some(Value::Null))
         }
         _ => Ok(None),
     }

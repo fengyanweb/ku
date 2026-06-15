@@ -16,6 +16,15 @@ pub struct KuError {
     pub kind: KuErrorKind,
     pub message: String,
     pub span: Span,
+    pub domain: Option<Box<str>>,
+    pub code: Option<Box<str>>,
+    diagnostic_context: Option<Box<DiagnosticContext>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticContext {
+    file: String,
+    source: String,
 }
 
 impl KuError {
@@ -24,7 +33,31 @@ impl KuError {
             kind,
             message: message.into(),
             span,
+            domain: None,
+            code: None,
+            diagnostic_context: None,
         }
+    }
+
+    pub fn structured(
+        kind: KuErrorKind,
+        domain: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        span: Span,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            span,
+            domain: Some(domain.into().into_boxed_str()),
+            code: Some(code.into().into_boxed_str()),
+            diagnostic_context: None,
+        }
+    }
+
+    pub fn package(code: impl Into<String>, message: impl Into<String>, span: Span) -> Self {
+        Self::structured(KuErrorKind::Runtime, "package", code, message, span)
     }
 
     pub fn lex(message: impl Into<String>, span: Span) -> Self {
@@ -55,7 +88,26 @@ impl KuError {
         self.span.start.column
     }
 
+    pub fn with_diagnostic_context(
+        mut self,
+        file: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        if self.diagnostic_context.is_none() {
+            self.diagnostic_context = Some(Box::new(DiagnosticContext {
+                file: file.into(),
+                source: source.into(),
+            }));
+        }
+        self
+    }
+
     pub fn diagnostic(&self, file: &str, source: &str) -> String {
+        let (file, source) = self
+            .diagnostic_context
+            .as_ref()
+            .map(|context| (context.file.as_str(), context.source.as_str()))
+            .unwrap_or((file, source));
         let line = self.line().max(1);
         let column = self.column().max(1);
         let line_text = source.lines().nth(line.saturating_sub(1)).unwrap_or("");

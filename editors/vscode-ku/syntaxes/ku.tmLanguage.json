@@ -1,0 +1,57 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Ku",
+  "scopeName": "source.ku",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#functions" },
+    { "include": "#constants" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.ku", "match": "//.*$" },
+        { "name": "comment.block.ku", "begin": "/\\*", "end": "\\*/" }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        { "name": "string.quoted.double.ku", "begin": "\"", "end": "\"", "patterns": [{ "name": "constant.character.escape.ku", "match": "\\\\." }] },
+        { "name": "string.quoted.single.ku", "begin": "'", "end": "'", "patterns": [{ "name": "constant.character.escape.ku", "match": "\\\\." }] },
+        { "name": "string.template.ku", "begin": "`", "end": "`", "patterns": [{ "name": "constant.character.escape.ku", "match": "\\\\." }, { "name": "meta.interpolation.ku", "begin": "\\{", "end": "\\}" }] }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.float.ku", "match": "\\b[0-9]+\\.[0-9]+\\b" },
+        { "name": "constant.numeric.integer.ku", "match": "\\b[0-9]+\\b" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.ku", "match": "\\b(fn|struct|enum|module|import|from|if|else|while|for|in|break|continue|match|try|catch|finally|fail|panic|return|print)\\b" },
+        { "name": "invalid.deprecated.ku", "match": "\\b(let|mut|switch)\\b" }
+      ]
+    },
+    "types": {
+      "patterns": [
+        { "name": "storage.type.ku", "match": "\\b(int|float|bool|str|null)\\b" }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        { "name": "entity.name.function.ku", "match": "(?<=\\bfn\\s)[A-Za-z_][A-Za-z0-9_]*" },
+        { "name": "support.function.stdlib.ku", "match": "\\b(string|array|json|time|lexer|parser|fs|http)\\.[A-Za-z_][A-Za-z0-9_]*\\b" }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        { "name": "constant.language.ku", "match": "\\b(true|false|null)\\b" }
+      ]
+    }
+  }
+}

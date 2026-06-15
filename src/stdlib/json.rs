@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use crate::{
     error::{KuError, KuResult},
     span::{Position, Span},
-    stdlib::core::{expect_arg_count, expected_type},
+    stdlib::{
+        core::{expect_arg_count, expected_type},
+        errors,
+    },
     value::Value,
 };
 
@@ -26,14 +29,8 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
                 return Err(expected_type("str", &args[0], span));
             };
             match parse_json(text, span) {
-                Ok(value) => Ok(Some(Value::Result {
-                    ok: true,
-                    value: Box::new(value),
-                })),
-                Err(err) => Ok(Some(Value::Result {
-                    ok: false,
-                    value: Box::new(Value::String(err.message)),
-                })),
+                Ok(value) => Ok(Some(errors::ok(value))),
+                Err(err) => Ok(Some(errors::err("json", "parse_error", err.message))),
             }
         }
         "stringify" => {

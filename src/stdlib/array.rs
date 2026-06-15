@@ -1,7 +1,10 @@
 use crate::{
     error::KuResult,
     span::Span,
-    stdlib::core::{expect_arg_count, expected_type},
+    stdlib::{
+        core::{expect_arg_count, expected_type},
+        errors,
+    },
     value::Value,
 };
 
@@ -80,8 +83,5 @@ fn one_array<'a>(name: &str, args: &'a [Value], span: Span) -> KuResult<&'a [Val
 }
 
 fn err(message: impl Into<String>) -> Value {
-    Value::Result {
-        ok: false,
-        value: Box::new(Value::String(message.into())),
-    }
+    errors::err("array", "index_out_of_bounds", message)
 }

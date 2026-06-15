@@ -4,3 +4,4 @@ version = "0.0.12"
 edition = "2021"
 
 [dependencies]
+ureq = { version = "2.12", default-features = true }

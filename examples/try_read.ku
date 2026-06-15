@@ -1,3 +1,5 @@
+import "std.fs"
+
 fn load_config(): str! {
     return ok(fs.try_read("missing-config.ku")?)
 }

@@ -45,7 +45,7 @@ history/
 | 0.0.9 | 发布时归档 | typed temp IR、stdlib ABI metadata、package lock、native C 原型 |
 | 0.0.10 | 发布时归档 | 运行时 capture map、Result CFG、package lock 依赖、C 后端 if/while/int 子集 |
 | 0.0.11 | 发布时归档 | Result ABI、try/finally 错误 CFG、file package 依赖缓存、match guard 诊断 |
-| 0.0.12 | 本次发布待归档 | 嵌套 match 模式、std:http 显式导入、native C main wrapper |
+| 0.0.12 | 已归档 | 嵌套 match 模式、std.http Response API、fs 写入、严格 bool 条件、native C main wrapper |
 
 ## 自动化
 

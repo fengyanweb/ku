@@ -69,7 +69,7 @@ fn main() {
     try {
         print(load()?)
     } catch (err) {
-        print(err)
+        print(err.message)
     } finally {
         print("done")
     }
@@ -107,7 +107,7 @@ fn main() {
     try {
         message = read_name()?
     } catch (err) {
-        message = "caught " + err
+        message = "caught " + err.message
     } finally {
         message = message + " finally"
     }
@@ -157,7 +157,7 @@ fn main() {
     try {
         message = missing()? + boom()
     } catch (err) {
-        message = err
+        message = err.message
     }
     print(message)
 }
@@ -170,6 +170,8 @@ fn main() {
 #[test]
 fn try_read_returns_recoverable_result_for_missing_files() {
     let source = r#"
+import "std.fs"
+
 fn load(): str! {
     return ok(fs.try_read("definitely-missing-ku-file.txt")?)
 }
@@ -209,7 +211,7 @@ fn main() { print(value()) }
 "#,
     );
     assert!(
-        wrong_fail_value.contains("expected str but got int"),
+        wrong_fail_value.contains("expected object but got int"),
         "unexpected error: {wrong_fail_value}"
     );
 
@@ -219,7 +221,7 @@ fn main() {
     try {
         print(1?)
     } catch (err) {
-        print(err)
+        print(err.message)
     }
 }
 "#,
@@ -245,7 +247,9 @@ fn main() {
 "#,
     );
     assert!(
-        unhandled.contains("unhandled recoverable error: bad"),
+        unhandled.contains("unhandled recoverable error:")
+            && unhandled.contains("message")
+            && unhandled.contains("bad"),
         "unexpected error: {unhandled}"
     );
 
@@ -335,7 +339,7 @@ fn main() {
         }
         print(text)
     } catch (err) {
-        print(err)
+        print(err.message)
     }
 }
 "#;

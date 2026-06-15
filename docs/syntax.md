@@ -1,10 +1,19 @@
-# Ku 0.0.12 Syntax Draft
+# Ku 0.0.12 Syntax
 
-本文固定 Ku 0.0.12 的语法边界。当前 CLI 版本显示 `0.0.12`。
+本文档固定 Ku 0.0.12 当前真实支持的全部语法和边界。CLI 版本应显示：
 
-## 文件和入口
+```powershell
+ku version
+# ku 0.0.12
+```
 
-Ku 源文件使用 `.ku` 扩展名。程序必须提供无参数入口：
+Ku 当前是解释器优先的语言实现。文档只记录已经能被 lexer / parser / checker / runtime 闭环处理的语法；仍在设计中的能力放在文末“不支持 / 未完成”。
+
+## 1. 文件和入口
+
+Ku 源文件使用 `.ku` 扩展名。
+
+程序入口必须是无参数 `main` 函数：
 
 ```ku
 fn main() {
@@ -12,52 +21,236 @@ fn main() {
 }
 ```
 
-当前不支持顶层脚本语句。
+当前不支持顶层脚本语句。源文件顶层只能出现：
 
-## 顶层声明
+```txt
+import
+module
+fn
+struct
+enum
+```
 
-当前支持：
+顶层 `return` 会报错。
+
+## 2. 词法
+
+### 2.1 空白和注释
+
+空格、Tab、换行、Windows 回车换行和 UTF-8 BOM 会被忽略。
+
+支持行注释：
+
+```ku
+// comment
+```
+
+支持块注释：
+
+```ku
+/*
+comment
+*/
+```
+
+块注释必须闭合，不支持嵌套块注释。
+
+### 2.2 标识符
+
+标识符只能使用 ASCII 字母、数字和下划线：
+
+```txt
+name
+User
+APP_NAME
+value2
+_temp
+```
+
+首字符必须是字母或 `_`，后续可以是字母、数字或 `_`。
+
+### 2.3 关键字
+
+以下单词是保留关键字：
+
+```txt
+fn struct enum module import from
+let mut
+if else while for in
+break continue
+match
+try catch finally fail panic
+return print
+true false null
+```
+
+`let` / `mut` 被 lexer 识别，但 Ku 语法不使用它们；写 `let` 会得到明确错误。
+
+### 2.4 字面量
+
+整数：
+
+```ku
+0
+123
+```
+
+浮点数：
+
+```ku
+1.5
+0.25
+```
+
+布尔值：
+
+```ku
+true
+false
+```
+
+空值：
+
+```ku
+null
+```
+
+字符串：
+
+```ku
+"hello"
+'hello'
+```
+
+双引号字符串支持转义：
+
+```txt
+\n \r \t \" \\
+```
+
+单引号字符串支持转义：
+
+```txt
+\n \r \t \' \\
+```
+
+模板字符串使用反引号：
+
+```ku
+`Hello {name}`
+`value {1 + 2}`
+```
+
+模板字符串中输出字面量花括号：
+
+```ku
+`literal \{name\}`
+```
+
+## 3. 顶层声明
+
+### 3.1 module
+
+`module` 声明当前是轻量模块名标记：
 
 ```ku
 module demo
+```
 
-struct Token {
-    kind: str
-    text: str
-    line: int
-    column: int
+### 3.2 导出规则
+
+顶层 `fn` / `struct` / `enum` 的名字首字母大写时，可以被其他文件导入。
+
+```ku
+fn Add(a: int, b: int): int {
+    return a + b
 }
 
-enum TokenKind {
-    Ident
-    Number
-    Eof
+struct User {
+    name: str
 }
 
-fn main() {
-    print("ok")
+enum State {
+    Ready
 }
 ```
 
-首字母大写的顶层 `fn` / `struct` / `enum` 会作为跨文件导出名；首字母小写的顶层名字只在当前文件内部使用。
+首字母小写的顶层名字只在当前文件内部使用，不能从包外导入。
 
-支持三种导入形式：
+### 3.3 import
+
+Ku 当前支持三种文件导入形式。
+
+命名空间导入：
 
 ```ku
 import math from "./math"
-import { Add, Twice } from "./math.ku"
+```
+
+使用：
+
+```ku
+math.Add(1, 2)
+math.User { name: "Ku" }
+math.State.Ready
+```
+
+按需导入：
+
+```ku
+import { Add, User, State } from "./math.ku"
+import { Add as Plus } from "./math"
+```
+
+使用：
+
+```ku
+Add(1, 2)
+Plus(1, 2)
+user = User { name: "Ku" }
+state = State.Ready
+```
+
+全量导入：
+
+```ku
 import "./math.ku"
 ```
 
-`import math from "./math"` 会把 `./math.ku` 中导出的函数、结构体和 enum 放进命名空间，通过 `math.Add(1, 2)`、`math.User { ... }`、`math.State.Ready` 使用。
+全量导入会把目标文件所有导出名直接放进当前文件。
 
-`import { Add, Twice } from "./math.ku"` 会按需导入导出名，直接使用 `Add(1, 2)`。
+不支持：
 
-`import "./math.ku"` 会全量导入该文件所有首字母大写的导出名，直接使用。`import from "./math.ku"` 不属于 Ku 语法。
+```ku
+import from "./math.ku"       // 错误
+```
 
-## 类型
+导入路径可以使用相对路径或绝对路径，并且可以省略 `.ku` 后缀：
 
-基础类型：
+```ku
+import math from "./math"
+import { Add } from "C:/work/math.ku"
+```
+
+### 3.4 标准库模块导入
+
+`fs` 和 `http` 标准库必须显式导入：
+
+```ku
+import "std.fs"
+import "std.http"
+import http from "std.http"
+```
+
+`import "std.http"` 等价于导入名为 `http` 的标准库模块；`import http from "std.http"` 是显式命名空间形式。旧写法 `std:http` 不支持。
+
+当前 `fs` / `http` 使用强制导入门禁。历史内置模块 `string` / `array` / `json` / `time` / `lexer` / `parser` 仍可直接点调用。
+
+## 4. 类型
+
+### 4.1 基础类型
+
+Ku 0.0.12 的基础类型：
 
 ```txt
 int
@@ -67,20 +260,47 @@ str
 null
 ```
 
-数组类型：
+不支持：
+
+```txt
+string
+nil
+```
+
+### 4.2 数组类型
+
+数组类型写作 `[T]`：
 
 ```ku
 nums:[int] = [1, 2, 3]
 names:[str] = ["Ku"]
+matrix:[[int]] = [[1], [2]]
 ```
 
-结构体类型直接使用结构体名：
+数组是同质数组。
+
+### 4.3 结构体和枚举类型
+
+结构体名和枚举名可以直接作为类型：
 
 ```ku
-token:Token = Token { kind: "Ident", text: "name", line: 1, column: 1 }
+user:User = User { name: "Ku" }
+state:State = State.Ready
 ```
 
-可恢复错误类型：
+命名空间导入的类型可以通过 namespace 使用：
+
+```ku
+import lib from "./lib.ku"
+
+fn show(user: lib.User): str {
+    return user.name
+}
+```
+
+### 4.4 Result 类型
+
+`T!` 表示可恢复错误类型：
 
 ```ku
 fn load(): str! {
@@ -88,35 +308,125 @@ fn load(): str! {
 }
 ```
 
-`T!` 表示 `Result<T, str>`。当前固定错误 payload 为 `str`。
+当前 `T!` 表示 `Result<T, Error>`。解释器中的 Error 是对象：
 
-`string` 和 `nil` 不是 0.0.12 类型名。
+```ku
+{
+    domain: "fs"
+    code: "read_failed"
+    message: "..."
+}
+```
 
-## 变量
+`catch (err)` 后可以使用 `err.domain`、`err.code`、`err.message`。
+
+### 4.5 联合类型
+
+联合类型使用 `|`：
+
+```ku
+fn show(value: str | int): str {
+    return str(value)
+}
+```
+
+当前联合类型主要用于参数、变量和返回值的静态检查。`str | int` 表示值可以是 `str` 或 `int`；传入 `bool` 会在 `ku check` 阶段报类型错误。IR/native 暂时把 union 降成 `unknown`，不承诺 native ABI。
+
+## 5. 变量和赋值
 
 Ku 不使用 `let` / `let mut`。
 
+首次赋值即声明变量：
+
 ```ku
-name = "Ku"           // 首次赋值即声明，默认可变
-score = 100
-title:str = "hello"   // 带类型声明
-count:int             // 默认值声明
+name = "Ku"
+count = 0
 ```
+
+带类型声明：
+
+```ku
+name:str = "Ku"
+count:int = 0
+```
+
+部分类型可以声明默认值：
+
+```ku
+count:int
+ratio:float
+ok:bool
+name:str
+items:[int]
+empty:null
+```
+
+默认值规则：
+
+```txt
+int   -> 0
+float -> 0.0
+bool  -> false
+str   -> ""
+[T]   -> []
+null  -> null
+```
+
+再次赋值：
+
+```ku
+count = count + 1
+```
+
+位置解构赋值：
+
+```ku
+a, b = 1, 2
+a, _ = 3, 4
+```
+
+`_` 表示丢弃该位置的值。当前解构赋值只支持变量名和 `_`，左右数量必须一致。
+
+赋值目标可以是变量、数组元素、结构体字段或对象字段：
+
+```ku
+items[0] = 9
+user.name = "Ku"
+object.age = 18
+```
+
+语句级自增 / 自减会脱糖为赋值：
+
+```ku
+i++
+i--
+items[0]++
+user.age--
+```
+
+当前 `++` / `--` 只能作为独立语句使用，目标必须可赋值且支持数字运算；不支持在表达式里读取旧值或新值。
 
 全大写或全大写加下划线的名字按常量处理：
 
 ```ku
 APP_NAME = "Ku"
+MAX_COUNT = 10
 ```
 
 常量后续不能再次赋值。
 
-## 函数
+## 6. 函数
 
-普通函数参数必须写类型，返回类型可选：
+### 6.1 普通函数
+
+函数参数可以写类型，也可以省略类型。返回类型也可省略：
 
 ```ku
 fn add(a: int, b: int): int {
+    return a + b
+}
+
+fn add_inferred(a, b) {
     return a + b
 }
 
@@ -125,53 +435,120 @@ fn log(message: str) {
 }
 ```
 
-函数可以写在顶层，也可以写在函数内部作为局部函数：
+`main` 不能有参数。
+
+带返回类型的函数必须有可见 `return` 或 `fail`，并且返回值类型必须匹配。未写返回类型时，checker 会从 `return` 路径推断；没有返回值时按 `null` 处理。
+
+泛型函数使用 `<T>`：
 
 ```ku
-fn greet(name: str) {
-    print(`Hello {name}`)
+fn id<T>(value:T): T {
+    return value
 }
 
+fn first<T>(left:T, right:T): T {
+    return left
+}
+```
+
+泛型参数会在调用处按实参推断；同一个泛型名在同次调用中必须推断为一致类型。
+
+### 6.2 局部函数
+
+函数可以写在函数内部：
+
+```ku
 fn main() {
-    fn go(name: str, age: int) {
+    fn go(name, age) {
         print(`我是{name},我{age}岁了`)
     }
 
-    greet("Ku")
     go("Ku", 3)
 }
 ```
 
-限制：
+局部函数可以递归调用自身。
 
-- `main` 不能有参数。
-- 同一个函数内不能有重复参数名。
-- 带返回类型的函数必须有可见 `return`。
-- 返回值类型必须和声明匹配。
-- 局部函数按引用捕获外层局部变量，读取时能看到最新值，赋值会写回外层可变变量。
+### 6.3 函数值
 
-## 函数值
-
-函数值使用箭头语法：
+箭头函数写作：
 
 ```ku
 fn main() {
     add = (a, b) => {
         return a + b
     }
+    double = (x) => x * 2
+    triple = x => x * 3
 
-    print(add(10, 20))
+    print(add(1, 2))
+    print(double(3))
+    print(triple(3))
 }
 ```
 
 限制：
 
-- 箭头函数参数暂时不写类型。
-- 箭头函数按引用捕获外层局部变量，读取时能看到最新值，赋值会写回外层可变变量。
-- 函数值调用会按实参类型检查函数体并推导返回类型。
-- 0.0.11 的 IR 和运行时都使用精确 capture map。函数值只保存实际自由变量的共享绑定；递归局部函数在调用时临时注入 self binding，不再把整个外层 `Env` 保存进函数值。
+```txt
+箭头函数参数暂时不写类型
+箭头函数可以使用块体或单表达式
+单参数箭头函数可以省略参数小括号
+```
 
-## 条件和循环
+### 6.4 闭包捕获
+
+局部函数和箭头函数会精确捕获实际使用到的外层局部变量。
+
+```ku
+fn main() {
+    prefix = "Hello "
+
+    greet = (name) => {
+        return prefix + name
+    }
+
+    prefix = "Hi "
+    print(greet("Ku"))
+}
+```
+
+当前解释器按共享绑定捕获，读取会看到外层变量最新值，赋值会写回外层可变变量。
+
+## 7. 语句
+
+语句之间可以使用换行或分号分隔。大多数语句末尾的分号是可选的。
+
+### 7.1 表达式语句
+
+```ku
+add(1, 2)
+user.name
+```
+
+### 7.2 print
+
+`print` 支持两种写法，`println(value)` 是可复用的内置函数形式：
+
+```ku
+print("hello")
+print "hello"
+println("hello")
+```
+
+推荐使用括号形式。
+
+### 7.3 return
+
+```ku
+return
+return value
+```
+
+`return` 只能写在函数体里。
+
+### 7.4 if / else
+
+条件必须带小括号，且条件表达式类型必须是 `bool`。Ku 不使用 truthy 规则；需要判断非空、长度或 null 时请写成显式比较。
 
 ```ku
 if (age >= 18) {
@@ -181,27 +558,651 @@ if (age >= 18) {
 }
 ```
 
+支持 `else if`：
+
+```ku
+if (score >= 90) {
+    print("A")
+} else if (score >= 60) {
+    print("B")
+} else {
+    print("C")
+}
+```
+
+不支持省略小括号：
+
+```ku
+if age >= 18 { }  // 错误
+```
+
+### 7.5 while
+
+条件必须带小括号，且条件表达式类型必须是 `bool`：
+
 ```ku
 i = 0
-
 while (i < 5) {
     print(i)
     i = i + 1
 }
 ```
 
+### 7.6 for
+
+`for` 当前只遍历数组：
+
 ```ku
 nums:[int] = [1, 2, 3]
+
 for n in nums {
     print(n)
 }
 ```
 
-`if` 和 `while` 条件必须带小括号，并且条件类型必须是 `bool`。`for` 当前只遍历数组。
+### 7.7 break / continue
 
-## 结构体
+`break` 结束当前循环，`continue` 跳过当前循环剩余语句并进入下一轮：
 
-结构体是数据容器，当前不支持方法、继承或泛型：
+```ku
+i = 0
+while (i < 10) {
+    i++
+    if (i == 2) {
+        continue
+    }
+    if (i > 5) {
+        break
+    }
+    print(i)
+}
+```
+
+`break` / `continue` 只能写在 `while` 或 `for` 内部。
+
+### 7.8 try / catch / finally
+
+`try` 至少需要 `catch` 或 `finally`：
+
+```ku
+try {
+    value = load()?
+} catch (err) {
+    print("caught: " + err.message)
+} finally {
+    print("cleanup")
+}
+```
+
+`catch (err)` 中 `err` 类型固定为 Error 对象，不再是 `str`。
+
+### 7.9 fail
+
+`fail` 主动返回可恢复错误：
+
+```ku
+fn load(): str! {
+    fail "missing"
+}
+```
+
+`fail` 的值可以是 `str` 或 Error 对象，并且只能在返回 `T!` 的函数里使用，或出现在 `try` body 内。`fail "missing"` 会被包装成 `{ domain: "ku", code: "fail", message: "missing" }`。
+
+### 7.10 panic
+
+`panic` 表示不可恢复错误，不会被 `try/catch` 捕获：
+
+```ku
+panic("bad state")
+```
+
+## 8. 表达式
+
+### 8.1 表达式总览
+
+```txt
+字面量       1, 1.5, true, false, null, "x", 'x', `x {name}`
+变量         name
+数组         [1, 2, 3]
+对象         { name: "Ku", age: 1 }
+结构体       User { name: "Ku" }
+字段         user.name, lib.User, string.len
+可选字段     user?.name
+索引         nums[0]
+调用         add(1, 2)
+分组         (1 + 2)
+一元         -x, !ok
+二元         + - * / % == != < <= > >= && ||
+自增自减     i++, i--
+match        match value { _ => "ok" }
+?            load()?
+函数值       (a, b) => { return a + b }, x => x * 2
+```
+
+### 8.2 优先级
+
+从高到低：
+
+```txt
+调用 / 字段 / 可选字段 / 索引 / ?
+一元 - !
+* / %
++ -
+< <= > >=
+== !=
+&&
+||
+```
+
+`?` 绑定在前面的表达式上：
+
+```ku
+value = load()?
+```
+
+### 8.3 算术和比较
+
+数字运算：
+
+```ku
+1 + 2
+1.5 + 2
+5 - 1
+2 * 3
+8 / 2
+5 % 2
+```
+
+规则：
+
+```txt
+int 和 int 运算结果是 int
+int 和 float 混合运算结果是 float
+% 只接受 int 和 int
+```
+
+字符串拼接：
+
+```ku
+"Hello " + "Ku"
+```
+
+普通表达式不允许 `str + int`：
+
+```ku
+"v" + 1  // 错误
+```
+
+比较：
+
+```ku
+1 < 2
+1 <= 2
+1 > 2
+1 >= 2
+1 == 1
+1 != 2
+```
+
+大小比较只支持数字。相等比较要求两边类型兼容。
+
+逻辑运算：
+
+```ku
+ok && ready
+ok || ready
+!ok
+```
+
+逻辑运算只支持 `bool`。
+
+### 8.4 数组表达式
+
+```ku
+nums = [1, 2, 3]
+empty:[int] = []
+print(nums[0])
+nums[0] = 9
+doubled = nums.map(x => x * 2)
+```
+
+数组元素类型必须一致。索引必须是 `int`。
+
+`array.map` 的链式写法会返回新数组，不会修改原数组。mapper 必须是函数值，参数类型由数组元素自动推断。
+
+对象可以用字符串键动态索引；缺失键运行时返回 `null`：
+
+```ku
+user = { name: "Ku" }
+print(user["name"])
+print(user["missing"])
+user["age"] = 1
+```
+
+字符串可以用 `int` 索引，返回单字符 `str`：
+
+```ku
+text = "Ku"
+print(text[0])
+```
+
+### 8.5 可选字段访问
+
+```ku
+name = user?.name
+missing = object?.missing
+none = null?.name
+```
+
+`?.` 左侧是 `null` 时返回 `null`；左侧是对象或结构体但字段不存在时也返回 `null`。左侧不是对象、结构体或 `null` 时仍会报类型错误。当前支持可选字段访问，不支持可选调用或可选索引。
+
+### 8.6 对象字面量
+
+对象字面量用于临时键值数据：
+
+```ku
+person = { name: "张三", age: 18 }
+print(person.name)
+person.age = 19
+```
+
+字段名可以是标识符或字符串：
+
+```ku
+person = { "name": "Ku" }
+```
+
+对象字面量不是 JSON 文本。字符串值必须加引号：
+
+```ku
+{ name: "张三" }
+```
+
+对象字段赋值要求字段已经存在。
+
+### 8.7 结构体字面量
+
+```ku
+struct User {
+    name: str
+    age: int
+}
+
+fn main() {
+    user = User { name: "Ku", age: 1 }
+    user.age = 2
+}
+```
+
+结构体字面量必须提供全部字段，不能提供不存在的字段。
+
+命名空间结构体：
+
+```ku
+import lib from "./lib.ku"
+
+user = lib.User { name: "Ku" }
+```
+
+### 8.8 enum 构造
+
+无 payload 变体：
+
+```ku
+state = State.Ready
+```
+
+payload 变体：
+
+```ku
+expr = Expr.Number(1)
+```
+
+命名空间 enum：
+
+```ku
+import lib from "./lib.ku"
+
+state = lib.State.Ready
+value = lib.Result.Ok(1)
+```
+
+### 8.9 match 表达式
+
+Ku 只保留 `match`：
+
+```ku
+text = match value {
+    1 => "one"
+    2 => "two"
+    _ => "other"
+}
+```
+
+enum match：
+
+```ku
+enum Result {
+    Ok(value: int)
+    Err(message: str)
+}
+
+fn main() {
+    result = Result.Ok(42)
+    text = match result {
+        Result.Ok(value) => str(value)
+        Result.Err(message) => message
+    }
+    print(text)
+}
+```
+
+guard：
+
+```ku
+text = match result {
+    Result.Ok(value) if (value > 0) => "positive"
+    Result.Ok(value) => "zero or negative"
+    Result.Err(message) => message
+}
+```
+
+嵌套 payload 模式：
+
+```ku
+text = match value {
+    Expr.Box(Inner.Number(n)) => str(n)
+    Expr.Box(_) => "box"
+    Expr.Empty => "empty"
+}
+```
+
+arm 之间可以用逗号、分号或换行分隔。
+
+## 9. Match 模式
+
+当前模式类型：
+
+```txt
+_                         wildcard
+name                      binding
+1, 1.5, "x", true, null   literal
+Enum.Variant(...)         enum variant
+ns.Enum.Variant(...)      namespace enum variant
+```
+
+绑定模式会把匹配到的值放进当前 arm 作用域：
+
+```ku
+Result.Ok(value) => str(value)
+```
+
+穷尽性规则：
+
+```txt
+enum match 没有未带 guard 的 _ 或 binding catch-all 时，必须覆盖所有未带 guard 的 variant
+带 guard 的分支不计入穷尽覆盖
+局部嵌套模式不等于覆盖整个 variant
+```
+
+不可达诊断：
+
+```txt
+_ 之后的未带 guard 分支不可达
+绑定名 catch-all 之后的未带 guard 分支不可达
+重复未带 guard 字面量不可达
+重复未带 guard 嵌套模式不可达
+完整 variant 捕获后，后续同 variant 分支不可达
+```
+
+当前还没有完整 guard 模式矩阵和跨 guard 的穷尽性证明。
+
+## 10. 字符串和模板字符串
+
+普通字符串：
+
+```ku
+"hello"
+'hello'
+```
+
+模板字符串：
+
+```ku
+name = "Ku"
+print(`Hello {name}`)
+print(`1 + 2 = {1 + 2}`)
+```
+
+模板插值中会解析 Ku 表达式。
+
+模板插值里额外允许字符串和数字使用 `+` 拼接：
+
+```ku
+`size {1 + "px"}`
+`value {"v" + 1.5}`
+```
+
+模板插值中其他跨类型运算仍然报错：
+
+```ku
+`bad {1 - "x"}`  // 错误
+```
+
+## 11. 错误处理
+
+Ku 区分可恢复错误和不可恢复错误。
+
+可恢复错误使用：
+
+```txt
+T!
+?
+try / catch / finally
+fail
+ok(value)
+err(message)
+```
+
+不可恢复错误使用：
+
+```txt
+panic
+运行时边界错误，如数组越界、除零、整数溢出、资源上限
+```
+
+### 11.1 T!
+
+```ku
+fn read_name(): str! {
+    return ok("Ku")
+}
+```
+
+### 11.2 ?
+
+`?` 用于传播 `Err`：
+
+```ku
+fn main(): str! {
+    name = read_name()?
+    return ok(name)
+}
+```
+
+`?` 只能在返回 `T!` 的函数内，或 `try` body 内使用。
+
+### 11.3 try / catch / finally
+
+```ku
+fn main() {
+    message = "none"
+
+    try {
+        message = read_name()?
+    } catch (err) {
+        message = "caught: " + err.message
+    } finally {
+        print("cleanup")
+    }
+
+    print(message)
+}
+```
+
+`finally` 无论 try 是否失败都会执行。
+
+`panic` 不会被 `try/catch` 捕获。
+
+## 12. 内置函数和标准库
+
+### 12.1 基础内置函数
+
+```txt
+len(value:any): int
+str(value:any): str
+ok(value:T): T!
+err(message:str): Unknown!
+println(value:any): null
+```
+
+示例：
+
+```ku
+print(len("Ku"))
+print(str(123))
+println("Ku")
+return ok(1)
+return err("bad")
+```
+
+### 12.2 fs
+
+使用前必须导入：
+
+```ku
+import "std.fs"
+```
+
+```txt
+fs.read(path:str): str
+fs.try_read(path:str): str!
+fs.write(path:str, text:str): null
+fs.try_write(path:str, text:str): null!
+```
+
+`fs.read` / `fs.write` 失败会产生不可恢复运行时错误。`fs.try_read` / `fs.try_write` 在文件不存在、读取或写入失败时返回 Result。
+
+相对路径按当前 `.ku` 文件所在目录解析。
+
+### 12.3 lexer / parser
+
+```txt
+lexer.scan(text:str): [str]
+parser.parse(input:str | [str]): str
+```
+
+当前返回调试摘要，不是完整 Token / AST 数据结构。
+
+### 12.4 string
+
+```txt
+string.len(text:str): int
+string.contains(text:str, needle:str): bool
+string.starts_with(text:str, prefix:str): bool
+string.ends_with(text:str, suffix:str): bool
+string.trim(text:str): str
+string.lower(text:str): str
+string.upper(text:str): str
+string.replace(text:str, from:str, to:str): str
+string.slice(text:str, start:int, end:int): str!
+```
+
+`string.slice` 按字符下标切片，越界返回 `Err(Error)`。
+
+字符串函数也可以作为实例方法调用：
+
+```ku
+text = " Ku "
+print(text.trim())
+print(text.slice(1, 3)?)
+```
+
+### 12.5 array
+
+```txt
+array.len(values:[T]): int
+array.is_empty(values:[T]): bool
+array.first(values:[T]): T
+array.last(values:[T]): T
+array.try_get(values:[T], index:int): T!
+array.push(values:[T], value:T): [T]
+array.concat(left:[T], right:[T]): [T]
+values.map(mapper): [U]
+```
+
+`array.push` 和 `array.concat` 返回新数组，不会原地修改参数。
+
+`array.first` / `array.last` 对空数组返回 `null`；需要带错误信息的越界访问时使用 `array.try_get`，错误 payload 是 Error 对象。
+
+`values.map(mapper)` 是数组实例方法。`mapper` 是函数值，例如 `nums.map(x => x * 2)`。
+
+除 `map` 外，数组函数也可以作为实例方法调用：
+
+```ku
+values = [1, 2]
+print(values.len())
+print(values.try_get(0)?)
+```
+
+### 12.6 json
+
+```txt
+json.stringify(value:any): str
+json.parse(text:str): Unknown
+json.try_parse(text:str): Unknown!
+```
+
+`json.parse` 失败是不可恢复运行时错误；`json.try_parse` 失败返回 `Err(Error)`。
+
+### 12.7 time
+
+```txt
+time.now(): int
+time.unix(): int
+time.millis(): int
+```
+
+### 12.8 http
+
+HTTP 需要显式导入：
+
+```ku
+import "std.http"
+import http from "std.http"
+```
+
+签名：
+
+```txt
+http.get(url:str): HttpResponse!
+http.post(url:str, body:str): HttpResponse!
+http.request(config:object): HttpResponse!
+```
+
+`HttpResponse` 当前用对象表示：
+
+```ku
+res = http.get("https://example.com")?
+print(res.status)
+print(res.body)
+```
+
+`http.request` 支持 `{ method, url, headers, body, timeout_ms, max_body_bytes }`。网络、协议、URL 和 body 限制错误返回结构化 `Err({ domain, code, message })`；HTTP 非 2xx 状态仍返回 `Ok(HttpResponse)`，由调用者检查 `res.status`。
+
+## 13. struct
+
+声明：
 
 ```ku
 struct Token {
@@ -210,24 +1211,35 @@ struct Token {
     line: int
     column: int
 }
-
-fn main() {
-    token = Token { kind: "Ident", text: "name", line: 1, column: 1 }
-    print(token.kind)
-}
 ```
 
-结构体字面量必须提供全部字段，不能写不存在的字段。
-
-结构体字段可以赋值，字段必须存在且类型必须匹配：
+使用：
 
 ```ku
+token = Token {
+    kind: "Ident",
+    text: "name",
+    line: 1,
+    column: 1
+}
+
+print(token.kind)
 token.kind = "Number"
 ```
 
-## 枚举
+当前不支持：
 
-当前支持 enum 声明、无 payload 变体值和 payload 构造：
+```txt
+方法
+继承
+泛型
+可选字段
+默认字段值
+```
+
+## 14. enum
+
+声明：
 
 ```ku
 enum TokenKind {
@@ -238,267 +1250,25 @@ enum TokenKind {
 
 enum Expr {
     Number(value: int)
-    Text(value: str)
-}
-
-fn main() {
-    kind = TokenKind.Ident
-    expr = Expr.Number(1)
-    print(kind)
-    print(expr)
+    String(value: str)
+    Flag(ok: bool)
 }
 ```
 
-payload 构造使用 `EnumName.Variant(args...)`。
-
-## Match / Switch
-
-`match` 和 `switch` 是表达式，当前支持字面量、`_`、绑定名和 enum variant 模式：
+构造：
 
 ```ku
-text = match Expr.Number(7) {
-    Expr.Number(value) => str(value)
-    Expr.Text(value) => value
-    _ => "none"
-}
-
-nested = match Expr.Box(Inner.Number(7)) {
-    Expr.Box(Inner.Number(value)) if (value > 0) => "positive"
-    Expr.Box(_) => "box"
-    Expr.Empty => "empty"
-}
-
-label = switch 2 {
-    1 => "one"
-    _ => "other"
-}
+kind = TokenKind.Ident
+expr = Expr.Number(1)
 ```
 
-对 enum 做 `match` 时，如果没有未带 guard 的 `_` 或绑定名 catch-all，必须覆盖所有未带 guard 的 variant。带 guard 的分支不计入穷尽覆盖；`_ if (...)` 不会让后续分支变成不可达。重复的未带 guard 字面量分支、enum variant 分支和嵌套 enum 模式会被诊断为不可达。`Expr.Box(Inner.Number(v))` 这类局部嵌套模式不会被误判为覆盖整个 `Expr.Box(_)`。完整 guard 模式矩阵和跨 guard 的穷尽性证明后续再补。非 enum 值当前没有完整穷尽性检查，没有匹配分支会在运行时报错。
+注意：当前 checker 尚未开放 enum 自递归 payload，例如 `Expr.Binary(left: Expr, right: Expr)` 仍会报未知类型。需要树结构时，先用非递归 payload 或等待后续类型系统升级。
 
-## 数组
+## 15. Package 和 ku.mod
 
-数组是同质数组：
-
-```ku
-nums:[int] = [1, 2, 3]
-print(nums[0])
-print(len(nums))
-```
-
-当前支持读取和写入索引：
-
-```ku
-nums[0] = 9
-```
-
-## 对象字面量
-
-对象字面量用于临时组织键值数据，语法接近 JSON，但它是 Ku 表达式，不是 JSON 文本：
-
-```ku
-person = { name: "张三", age: 18 }
-print(person.name)
-print(person.age)
-```
-
-字段名可以是标识符或字符串。字符串值必须加引号，例如 `{ name: "张三" }`；`{ name: 张三 }` 会被当成变量读取。
-
-对象字段可以赋值，字段必须已经存在：
-
-```ku
-person.age = 19
-```
-
-## 表达式
-
-支持的表达式：
-
-```txt
-字面量:       123, 1.5, true, false, null, "text", 'text', `hello {name}`
-数组:         [1, 2, 3]
-对象:         { name: "Ku", age: 1 }
-结构体:       Token { kind: "Ident", text: "name", line: 1, column: 1 }
-变量:         name
-字段:         token.kind, fs.read
-索引:         nums[0]
-match:        match value { _ => "ok" }
-分组:         (expr)
-一元:         -x, !ok
-二元:         +, -, *, /, %, ==, !=, <, <=, >, >=, &&, ||
-调用:         add(1, 2), len("Ku"), fs.read("main.ku")
-函数值:       (a, b) => { return a + b }
-```
-
-优先级从高到低：
-
-```txt
-函数调用 / 字段访问 / 索引
-一元 - !
-* / %
-+ -
-< <= > >=
-== !=
-&&
-||
-```
-
-## 字符串
-
-双引号和单引号字符串都支持：
-
-```ku
-"hello"
-'hello'
-```
-
-反引号模板字符串支持 `{表达式}` 插值：
-
-```ku
-print(`Hello {name} {1 + 2}`)
-```
-
-如果要输出字面量花括号，使用转义：
-
-```ku
-print(`literal \{name\}`)
-```
-
-普通表达式中：
-
-- `int/float` 可以做数字运算。
-- `str + str` 是字符串拼接。
-- `str + int` 不允许。
-
-模板插值内部额外允许：
-
-```ku
-`value {1 + "px"}`
-`value {"px" + 1.5}`
-```
-
-其他跨类型运算仍然报错，例如：
-
-```ku
-`bad {1 - "x"}`
-```
-
-## 错误处理
-
-Ku 0.0.12 继续沿用可恢复错误模型：
-
-```txt
-T!             Result<T, str>
-?              Err 时向上传
-try/catch      局部处理可恢复错误
-finally        无论 try 是否失败都会执行
-fail           主动返回可恢复错误，错误值必须是 str
-panic          不可恢复运行时错误
-```
+`ku.mod` 是包配置文件，不是 Ku 源码。
 
 示例：
-
-```ku
-fn read_name(): str! {
-    fail "name missing"
-}
-
-fn main() {
-    message = "none"
-
-    try {
-        message = read_name()?
-    } catch (err) {
-        message = "caught: " + err
-    } finally {
-        print("cleanup")
-    }
-
-    print(message)
-}
-```
-
-`?` 只能用在返回 `T!` 的函数内，或用在 `try { ... }` 的 body 内。它会短路当前表达式，避免继续执行右侧调用。`catch (err)` 中的 `err` 固定为 `str`。0.0.12 的 IR 已把 `?` 降成显式 `ok/err` 控制流，native C 后端已经支持 `Result<int|bool|str, str>` 的基础 ABI。
-
-`panic` 不会被 `try/catch` 捕获；它表示数组越界、内部 bug、主动崩溃等不可恢复问题。
-
-## 内置能力
-
-基础函数：
-
-```ku
-len("Ku")    // 2
-len([1, 2])  // 2
-str(123)    // "123"
-ok(123)     // Ok(123)
-err("bad")  // Err("bad")
-```
-
-文件和编译器管线雏形：
-
-```ku
-text = fs.read("main.ku")
-safe = fs.try_read("main.ku")
-tokens = lexer.scan(text)
-ast = parser.parse(tokens)
-```
-
-`fs.read` 读取 UTF-8 文本，当前有 1MB 文件大小保护，失败直接报运行时错误，不重试。相对路径按当前 `.ku` 源文件所在目录解析，不按启动终端所在目录解析。
-
-`fs.try_read` 返回 `str!`，文件不存在或读取失败会返回 `Err(str)`；文件过大仍按资源保护处理为不可恢复运行时错误。
-
-`lexer.scan` 当前返回 `[str]` 形式的 token 文本摘要。`parser.parse` 当前返回 AST 摘要字符串，后续会在 struct/enum 稳定后暴露真正的 Token/AST/Span/Error/Symbol 数据模型。二者都有输入大小、token 数和输出大小限制，避免超大字符串绕过主 parser 的资源保护。
-
-标准库第一批模块：
-
-```ku
-string.len("Ku")
-string.contains("Ku Lang", "Lang")
-string.starts_with("Ku", "K")
-string.ends_with("Ku", "u")
-string.trim("  Ku  ")
-string.lower("KU")
-string.upper("ku")
-string.replace("Ku Lang", "Lang", "0.0.12")
-string.slice("Ku Lang", 0, 2)
-
-array.len([1, 2])
-array.is_empty([])
-array.push([1, 2], 3)
-array.concat([1], [2])
-array.first([1, 2])
-array.last([1, 2])
-array.try_get([1, 2], 0)
-
-json.stringify({ name: "Ku", version: 6 })
-json.parse("{\"name\":\"Ku\"}")
-json.try_parse("{bad}")
-
-time.now()
-time.unix()
-time.millis()
-```
-
-`array.push` 和 `array.concat` 返回新数组，不会原地修改参数。`array.try_get` 返回元素类型的 `T!`，越界或负数返回 `Err(str)`。`string.slice` 按字符下标切片，返回 `str!`，越界返回 `Err(str)`。
-
-`json.parse` 返回运行时 JSON 值，静态类型暂记为 `Unknown`；字段级类型推断后续随类型系统完善。`json.try_parse` 返回 `Unknown!`，可以配合 `?` 和 `try/catch`。
-
-HTTP 是独立标准库模块，必须显式导入：
-
-```ku
-import http from "std:http"
-
-fn main(): str! {
-    text = http.try_get("http://example.com")?
-    return ok(text)
-}
-```
-
-`http.try_get(url)` 返回 `str!`。当前只支持 `http://`，有 5 秒读写超时和 1MB body 上限，不做自动重试；非法 URL、`https://`、连接失败、非 200 状态和超大响应都会返回 `Err(str)`。裸写 `http.try_get(...)` 不导入会在 `ku check` 阶段报错。
-
-## Package
-
-0.0.7 开始固定本地 package 草案，0.0.11 增加 `file://` dependency、checksum、`ku.lock` package dependency 记录和缓存淘汰。包根目录可以放 `ku.mod`：
 
 ```txt
 name = "demo_pkg"
@@ -508,21 +1278,35 @@ cache = ".ku/cache"
 
 dep.util = "1.0.0"
 dep.util.source = "file://C:/work/util"
-dep.util.checksum = "ku-fnv64-..."
+dep.util.checksum = "ku-fnv64-0123456789abcdef"
 ```
 
-有 `ku.mod` 时：
+字段：
+
+```txt
+name       package 名
+version    package 版本
+root       import root，默认 src
+cache      cache 目录，默认 .ku/cache
+dep.NAME   dependency 版本
+dep.NAME.source
+dep.NAME.checksum
+```
+
+package import：
 
 ```ku
 import { Value } from "util"
-import { Value as RemoteValue } from "@util/util"
+import { Value } from "@util/util"
 ```
 
-`import { Value } from "util"` 会从 `root` 下解析为 `util.ku`。相对导入 `./util.ku` 仍按当前文件目录解析，但结果不能跳出 package import root。`import { Value } from "@util/util"` 会从 dependency cache 的 `src/util.ku` 解析。
+`@util/util` 表示从 dependency cache 的 `util` 包里导入 `util.ku`。
 
-`ku.lock` 会记录本地导入依赖、稳定内容 hash、package dependency、source、checksum 和 cache path。`ku package gc <file.ku>` 会清理当前 manifest 依赖之外的缓存版本。当前只支持 `file://` source；HTTP/registry、网络下载、语义版本求解和强校验还没有实现。
+当前 package source 只支持 `file://` 目录；HTTP/registry package、真正语义版本求解、网络下载和强校验还没有完成。
 
-## 命令
+## 16. CLI 相关语法
+
+命令：
 
 ```powershell
 ku <file.ku>
@@ -540,9 +1324,7 @@ ku --help
 ku help
 ```
 
-`ku check` 只检查，不运行。成功时输出被检查的文件；失败时输出文件名、行号、列号和源码位置。
-
-当前 `ku check` 会覆盖：
+`ku check` 会检查：
 
 ```txt
 未知字符
@@ -554,31 +1336,35 @@ ku help
 变量未定义
 基础类型错误
 if / while 条件类型错误
-数组、对象、结构体、enum 的基础语义错误
+数组、对象、结构体、enum 基础语义错误
 import 语法、私有导入、循环导入
-Result / ? / fail / try 的基础语义错误
-stdlib string / array / json / time 的参数数量和基础类型错误
+Result / ? / fail / try 基础语义错误
+stdlib 参数数量和基础类型错误
+http std module 是否已显式导入
 ```
 
-`ku build` 当前生成“解释器打包型可执行文件”：源码被嵌入生成的 exe 中，运行 exe 会通过 Ku 解释器执行。它是真正可运行的文件，但还不是 native C/LLVM 后端。
+`ku build` 当前生成解释器打包型可执行文件。
 
-`ku build --native <file.ku>` 当前输出 prototype C 源码，支持 int/bool/str、局部变量、直接函数调用、print、return、if、while，以及 `Result<int|bool|str, str>` 的 `ok` / `err` / `?` / 错误传播。生成的 Ku `main` 会在 C 中改名为 `ku_main`，并额外生成系统 `int main(void)` wrapper；Result main 返回 Err 时会打印错误并返回非 0。遇到数组、struct、enum、闭包、match、try/catch 等复杂语法会明确报不支持。
-
-当前 `ku build` 是开发环境功能，需要本机可调用 `rustc`，并且 `ku` 可执行文件旁边能找到 `libku.rlib` 或 `deps/libku*.rlib`。它只打包 Ku 源码本身，不打包 `fs.read` 读取的外部资源文件；相对资源路径仍按被 build 的源文件路径解析。
-
-## 当前不支持
+`ku build --native` 当前输出 prototype C 源码，支持：
 
 ```txt
-HTTP/registry package、网络下载、真正语义版本求解和强校验
-异步
-完整 native C / LLVM 后端
-顶层脚本语句
-match guard 模式矩阵和跨 guard 的完整穷尽性检查
+int / bool / str
+局部变量
+直接函数调用
+print
+return
+if / while
+基础 Result ABI
+ok / err / ?
+错误传播
+系统 int main(void) wrapper
 ```
 
-## 资源保护
+native C 当前仍是 prototype：错误槽还不是完整 Error 对象 ABI，并且明确不支持数组、struct、enum、闭包、match、try/catch 等复杂 lowering。
 
-当前解释器有基础资源上限，用来避免明显死循环、无限递归或过大输入长期占用资源：
+## 17. 资源保护
+
+当前资源上限：
 
 ```txt
 最大 token 数: 100000
@@ -594,4 +1380,66 @@ parser.parse 最大输出: 1000000 bytes
 json 最大输入: 1000000 bytes
 json 最大嵌套深度: 32
 json.stringify 最大输出: 1000000 bytes
+http response 最大 body: 1000000 bytes
+http 默认超时: 5 秒
+```
+
+## 18. 当前不支持 / 未完成
+
+```txt
+async / await
+LLVM 后端
+完整 native C 后端
+HTTP/registry package
+真正语义版本求解
+网络下载和强校验
+match guard 模式矩阵和跨 guard 的完整穷尽性检查
+顶层脚本语句
+方法 / trait / interface
+泛型
+模块内嵌作用域
+异常式 throw
+JavaScript 式 Promise
+数组切片语法
+表达式级 ++ / --
+字典 / Map 专用类型
+文件写入 stdlib
+```
+
+## 19. 快速语法表
+
+```txt
+program       ::= item*
+item          ::= import | module | fn | struct | enum
+import        ::= 'import' IDENT 'from' STRING
+                | 'import' '{' import_name (',' import_name)* '}' 'from' STRING
+                | 'import' STRING
+import_name   ::= IDENT ('as' IDENT)?
+module        ::= 'module' IDENT
+fn            ::= 'fn' IDENT '(' params? ')' (':' type)? block
+params        ::= IDENT (':' type)? (',' IDENT (':' type)?)*
+struct        ::= 'struct' IDENT '{' fields* '}'
+enum          ::= 'enum' IDENT '{' variants* '}'
+type          ::= union
+union         ::= result ('|' result)*
+result        ::= atom '!'?
+atom          ::= 'int' | 'float' | 'bool' | 'str' | 'null' | '[' type ']' | IDENT ('.' IDENT)*
+block         ::= '{' stmt* '}'
+stmt          ::= var | assign | destructure | inc | if | while | for | break | continue | try | fail | panic | return | print | expr
+var           ::= IDENT ':' type ('=' expr)?
+assign        ::= assign_target '=' expr
+destructure   ::= (IDENT | '_') (',' (IDENT | '_'))+ '=' expr (',' expr)+
+inc           ::= assign_target ('++' | '--')
+assign_target ::= IDENT | expr '[' expr ']' | expr '.' IDENT
+if            ::= 'if' '(' expr ')' block ('else' (if | block))?
+while         ::= 'while' '(' expr ')' block
+for           ::= 'for' IDENT 'in' expr block
+try           ::= 'try' block ('catch' '(' IDENT ')' block)? ('finally' block)?
+return        ::= 'return' expr?
+print         ::= 'print' expr | 'print' '(' expr ')'
+expr          ::= literal | IDENT | call | field | index | array | object | struct_lit | match | arrow | unary | binary | '(' expr ')'
+match         ::= 'match' expr '{' arm* '}'
+arm           ::= pattern ('if' expr)? '=>' expr
+pattern       ::= '_' | IDENT | literal | IDENT '.' IDENT ('(' pattern* ')')? | IDENT '.' IDENT '.' IDENT ('(' pattern* ')')?
+arrow         ::= IDENT '=>' (expr | block) | '(' IDENT (',' IDENT)* ')' '=>' (expr | block)
 ```

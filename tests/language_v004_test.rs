@@ -39,9 +39,11 @@ fn run_err(source: &str) -> String {
 
 #[test]
 fn lexer_tokenizes_v004_symbols_without_breaking_float() {
-    let tokens = Lexer::new("struct S { xs:[int] } enum E { A } for x in [1.5] { fs.read }")
-        .tokenize()
-        .expect("lex should pass");
+    let tokens = Lexer::new(
+        "struct S { xs:[int] } enum E { A } for x in [1.5] { fs.read i++ i-- break continue x?.y }",
+    )
+    .tokenize()
+    .expect("lex should pass");
 
     assert!(tokens
         .iter()
@@ -64,6 +66,21 @@ fn lexer_tokenizes_v004_symbols_without_breaking_float() {
     assert!(tokens
         .iter()
         .any(|token| matches!(token.kind, TokenKind::Dot)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::PlusPlus)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::MinusMinus)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::Break)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::Continue)));
+    assert!(tokens
+        .iter()
+        .any(|token| matches!(token.kind, TokenKind::QuestionDot)));
     assert!(tokens
         .iter()
         .any(|token| matches!(token.kind, TokenKind::Float(value) if value == 1.5)));
@@ -276,6 +293,8 @@ fn builtin_compiler_pipeline_and_fs_read_work() {
     fs::write(&path, "fn main() { print(1) }").expect("write temp file");
     let source = format!(
         r#"
+import "std.fs"
+
 fn main() {{
     text = fs.read("{}")
     tokens = lexer.scan(text)
@@ -302,6 +321,8 @@ fn fs_read_resolves_paths_relative_to_source_file() {
     fs::write(
         &main,
         r#"
+import "std.fs"
+
 fn main() {
     print(fs.read("data.txt"))
 }
@@ -329,7 +350,7 @@ fn runtime_rejects_array_bounds_and_missing_files() {
         "unexpected error: {err}"
     );
 
-    let err = run_err(r#"fn main() { print(fs.read("definitely-missing.ku")) }"#);
+    let err = run_err(r#"import "std.fs" fn main() { print(fs.read("definitely-missing.ku")) }"#);
     assert!(err.contains("failed to read"), "unexpected error: {err}");
 }
 
@@ -424,6 +445,41 @@ fn main() {
         err.contains("object has no field"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn objects_work_as_string_keyed_maps_and_strings_are_indexable() {
+    let source = r##"
+fn main() {
+    user = { name: "Ku" }
+    if (user["name"] != "Ku") {
+        panic("bad map read")
+    }
+    if (user["missing"] != null) {
+        panic("missing map key should be null")
+    }
+    user["age"] = 12
+    if (user["age"] != 12) {
+        panic("bad map write")
+    }
+    text = "Ku"
+    if (text[0] != "K") {
+        panic("bad string index")
+    }
+}
+"##;
+
+    check_source("inline.ku", source).expect("map/string index should check");
+    run_source("inline.ku", source).expect("map/string index should run");
+
+    for source in [
+        r#"fn main() { value = { name: "Ku" }; print(value[0]) }"#,
+        r##"fn main() { text = "Ku"; print(text["0"]) }"##,
+        r#"fn main() { value = 1; print(value[0]) }"#,
+    ] {
+        let err = check_err(source);
+        assert!(err.contains("type error:"), "unexpected index error: {err}");
+    }
 }
 
 #[test]
@@ -531,7 +587,7 @@ fn main() {
     }
     print(text)
 
-    label = switch 2 {
+    label = match 2 {
         1 => "one"
         _ => "other"
     }
@@ -541,6 +597,12 @@ fn main() {
 
     check_source("inline.ku", source).expect("match should check");
     run_source("inline.ku", source).expect("match should run");
+
+    let err = check_err(r#"fn main() { value = switch 1 { _ => 1 } }"#);
+    assert!(
+        err.contains("switch is not supported; use match"),
+        "unexpected switch error: {err}"
+    );
 
     let err = check_err(
         r#"
@@ -649,8 +711,11 @@ fn imports_support_named_namespace_and_glob_forms() {
     fs::create_dir_all(&dir).expect("create temp import dir");
     let math = dir.join("math.ku");
     let named = dir.join("named.ku");
+    let alias = dir.join("alias.ku");
+    let absolute = dir.join("absolute.ku");
     let namespace = dir.join("namespace.ku");
     let glob = dir.join("glob.ku");
+    let imported_return = dir.join("imported_return.ku");
     fs::write(
         &math,
         r#"
@@ -660,6 +725,10 @@ fn Add(a: int, b: int): int {
 
 fn Twice(a: int): int {
     return a + a
+}
+
+fn Label(): str {
+    return "Ku"
 }
 
 fn hidden(): int {
@@ -679,6 +748,31 @@ fn main() {
 "#,
     )
     .expect("write named import");
+    fs::write(
+        &alias,
+        r#"
+import { Add as Plus } from "./math"
+
+fn main() {
+    print(Plus(1, 2))
+}
+"#,
+    )
+    .expect("write alias import");
+    fs::write(
+        &absolute,
+        format!(
+            r#"
+import {{ Add }} from "{}"
+
+fn main() {{
+    print(Add(7, 8))
+}}
+"#,
+            ku_string(&math)
+        ),
+    )
+    .expect("write absolute import");
     fs::write(
         &namespace,
         r#"
@@ -702,8 +796,26 @@ fn main() {
 "#,
     )
     .expect("write glob import");
+    fs::write(
+        &imported_return,
+        r#"
+import "./math.ku"
 
-    for source in [&named, &namespace, &glob] {
+fn main() {
+    print(Label())
+}
+"#,
+    )
+    .expect("write imported return program");
+
+    for source in [
+        &named,
+        &alias,
+        &absolute,
+        &namespace,
+        &glob,
+        &imported_return,
+    ] {
         run_cli(vec![
             "ku".to_string(),
             "run".to_string(),
@@ -714,8 +826,63 @@ fn main() {
 
     let _ = fs::remove_file(math);
     let _ = fs::remove_file(named);
+    let _ = fs::remove_file(alias);
+    let _ = fs::remove_file(absolute);
     let _ = fs::remove_file(namespace);
     let _ = fs::remove_file(glob);
+    let _ = fs::remove_file(imported_return);
+    let _ = fs::remove_dir(dir);
+}
+
+#[test]
+fn import_errors_use_imported_file_diagnostic_context() {
+    let dir = unique_temp_path("bad-import-diagnostic");
+    fs::create_dir_all(&dir).expect("create temp import dir");
+    let lib = dir.join("badlib.ku");
+    let main = dir.join("main.ku");
+    fs::write(
+        &lib,
+        r#"
+fn Bad(): int {
+    return "x"
+}
+"#,
+    )
+    .expect("write bad lib");
+    fs::write(
+        &main,
+        r#"
+import { Bad } from "./badlib.ku"
+
+fn main() {
+    print(Bad())
+}
+"#,
+    )
+    .expect("write main");
+
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect_err("bad imported module should fail")
+    .to_string();
+    assert!(
+        err.contains("badlib.ku"),
+        "diagnostic should point to imported file: {err}"
+    );
+    assert!(
+        err.contains("return \"x\""),
+        "diagnostic should show imported source line: {err}"
+    );
+    assert!(
+        !err.contains("print(Bad())"),
+        "diagnostic should not render entry source line: {err}"
+    );
+
+    let _ = fs::remove_file(lib);
+    let _ = fs::remove_file(main);
     let _ = fs::remove_dir(dir);
 }
 

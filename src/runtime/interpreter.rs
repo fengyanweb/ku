@@ -22,6 +22,8 @@ const MAX_CALL_DEPTH: usize = 16;
 
 enum Flow {
     Continue,
+    Break,
+    LoopContinue,
     Return(Value),
     Fail(Value),
 }
@@ -156,6 +158,10 @@ impl Interpreter {
                     ok: false,
                     value: Box::new(value),
                 }),
+                Flow::Break | Flow::LoopContinue => Err(KuError::runtime(
+                    "loop control escaped function",
+                    function.span,
+                )),
             }
         })();
         self.call_depth -= 1;
@@ -217,6 +223,10 @@ impl Interpreter {
                     ok: false,
                     value: Box::new(value),
                 }),
+                Flow::Break | Flow::LoopContinue => Err(KuError::runtime(
+                    "loop control escaped function value",
+                    span,
+                )),
             };
             env.pop_scope();
             result
@@ -229,7 +239,7 @@ impl Interpreter {
         env.push_scope();
         for stmt in body {
             let flow = self.exec_stmt(stmt, env, depth)?;
-            if matches!(flow, Flow::Return(_) | Flow::Fail(_)) {
+            if !matches!(flow, Flow::Continue) {
                 env.pop_scope();
                 return Ok(flow);
             }
@@ -287,17 +297,51 @@ impl Interpreter {
                 }
                 Ok(Flow::Continue)
             }
+            Stmt::DestructureAssign {
+                names,
+                values,
+                span,
+            } => {
+                if names.len() != values.len() {
+                    return Err(KuError::runtime(
+                        format!(
+                            "destructuring assignment expects {} values but got {}",
+                            names.len(),
+                            values.len()
+                        ),
+                        *span,
+                    ));
+                }
+                let mut evaluated = Vec::with_capacity(values.len());
+                for value in values {
+                    evaluated.push(self.eval(value, env, depth)?);
+                    if let Some(value) = self.take_pending_fail() {
+                        return Ok(Flow::Fail(value));
+                    }
+                }
+                for (name, value) in names.iter().zip(evaluated) {
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    if env.contains(name) {
+                        env.assign(name, value, *span)?;
+                    } else {
+                        env.define(name.clone(), value, !is_constant_name(name), *span)?;
+                    }
+                }
+                Ok(Flow::Continue)
+            }
             Stmt::If {
                 condition,
                 then_branch,
                 else_branch,
-                ..
+                span,
             } => {
                 let condition = self.eval(condition, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
                     return Ok(Flow::Fail(value));
                 }
-                if condition.is_truthy() {
+                if expect_bool_condition(condition, *span)? {
                     self.exec_block(then_branch, env, depth)
                 } else {
                     self.exec_block(else_branch, env, depth)
@@ -313,12 +357,14 @@ impl Interpreter {
                     if let Some(value) = self.take_pending_fail() {
                         return Ok(Flow::Fail(value));
                     }
-                    if !condition.is_truthy() {
+                    if !expect_bool_condition(condition, *span)? {
                         break;
                     }
                     self.tick(*span)?;
                     match self.exec_block(body, env, depth)? {
                         Flow::Continue => {}
+                        Flow::LoopContinue => continue,
+                        Flow::Break => break,
                         flow @ (Flow::Return(_) | Flow::Fail(_)) => return Ok(flow),
                     }
                 }
@@ -347,17 +393,24 @@ impl Interpreter {
                     self.tick(*span)?;
                     env.push_scope();
                     env.define(name.clone(), value, true, *span)?;
+                    let mut loop_flow = Flow::Continue;
                     for stmt in body {
-                        let flow = self.exec_stmt(stmt, env, depth)?;
-                        if matches!(flow, Flow::Return(_) | Flow::Fail(_)) {
-                            env.pop_scope();
-                            return Ok(flow);
+                        loop_flow = self.exec_stmt(stmt, env, depth)?;
+                        if !matches!(loop_flow, Flow::Continue) {
+                            break;
                         }
                     }
                     env.pop_scope();
+                    match loop_flow {
+                        Flow::Continue | Flow::LoopContinue => {}
+                        Flow::Break => return Ok(Flow::Continue),
+                        Flow::Return(_) | Flow::Fail(_) => return Ok(loop_flow),
+                    }
                 }
                 Ok(Flow::Continue)
             }
+            Stmt::Break { .. } => Ok(Flow::Break),
+            Stmt::Continue { .. } => Ok(Flow::LoopContinue),
             Stmt::Function(function) => {
                 let params = function
                     .params
@@ -395,7 +448,7 @@ impl Interpreter {
                         flow = Flow::Continue;
                         for stmt in catch_body {
                             flow = self.exec_stmt(stmt, env, depth)?;
-                            if matches!(flow, Flow::Return(_) | Flow::Fail(_)) {
+                            if !matches!(flow, Flow::Continue) {
                                 break;
                             }
                         }
@@ -405,7 +458,7 @@ impl Interpreter {
                     }
                 }
                 let finally_flow = self.exec_block(finally_body, env, depth)?;
-                if matches!(finally_flow, Flow::Return(_) | Flow::Fail(_)) {
+                if !matches!(finally_flow, Flow::Continue) {
                     return Ok(finally_flow);
                 }
                 Ok(flow)
@@ -415,7 +468,7 @@ impl Interpreter {
                 if let Some(value) = self.take_pending_fail() {
                     return Ok(Flow::Fail(value));
                 }
-                Ok(Flow::Fail(value))
+                Ok(Flow::Fail(normalize_error_value(value)))
             }
             Stmt::Panic { value, span } => {
                 let value = self.eval(value, env, depth)?;
@@ -449,6 +502,113 @@ impl Interpreter {
                 }
                 Ok(Flow::Continue)
             }
+        }
+    }
+
+    fn eval_array_map(
+        &mut self,
+        target: &Expr,
+        args: &[Expr],
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<Value> {
+        if args.len() != 1 {
+            return Err(KuError::runtime(
+                format!("array.map expects 1 argument but got {}", args.len()),
+                span,
+            ));
+        }
+        let target = self.eval(target, env, depth)?;
+        if self.pending_fail.is_some() {
+            return Ok(Value::Null);
+        }
+        let Value::Array(items) = target else {
+            return Err(KuError::runtime(
+                format!(
+                    "type error: map expects array but got {}",
+                    target.type_name()
+                ),
+                span,
+            ));
+        };
+        let mapper = self.eval(&args[0], env, depth)?;
+        if self.pending_fail.is_some() {
+            return Ok(Value::Null);
+        }
+        let Value::Function {
+            params,
+            body,
+            captures,
+            self_name,
+        } = mapper
+        else {
+            return Err(KuError::runtime(
+                format!(
+                    "type error: array.map expects function but got {}",
+                    mapper.type_name()
+                ),
+                args[0].span,
+            ));
+        };
+        let mut mapped = Vec::with_capacity(items.len());
+        for item in items {
+            self.tick(span)?;
+            mapped.push(self.call_function_value(FunctionValueCall {
+                params: &params,
+                body: &body,
+                captures: &captures,
+                self_name: &self_name,
+                args: vec![item],
+                span,
+                depth: depth + 1,
+            })?);
+        }
+        Ok(Value::Array(mapped))
+    }
+
+    fn eval_std_method_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<Option<Value>> {
+        let ExprKind::Field { target, name } = &callee.kind else {
+            return Ok(None);
+        };
+        if let ExprKind::Variable(module) = &target.kind {
+            if stdlib::metadata::is_std_module(module) && !env.contains(module) {
+                return Ok(None);
+            }
+        }
+        if let Some((enum_name, _)) = enum_variant_path(callee) {
+            if self.enums.contains_key(&enum_name) {
+                return Ok(None);
+            }
+        }
+        let target_value = self.eval(target, env, depth)?;
+        if self.pending_fail.is_some() {
+            return Ok(Some(Value::Null));
+        }
+        let module = match &target_value {
+            Value::String(_) => "string",
+            Value::Array(_) if name != "map" => "array",
+            _ => return Ok(None),
+        };
+        let mut values = Vec::with_capacity(args.len() + 1);
+        values.push(target_value);
+        for arg in args {
+            values.push(self.eval(arg, env, depth)?);
+            if self.pending_fail.is_some() {
+                return Ok(Some(Value::Null));
+            }
+        }
+        match module {
+            "string" => stdlib::string::eval(name, &values, span),
+            "array" => stdlib::array::eval(name, &values, span),
+            _ => Ok(None),
         }
     }
 
@@ -488,28 +648,28 @@ impl Interpreter {
                     if self.pending_fail.is_some() {
                         return Ok(Value::Null);
                     }
-                    if !left.is_truthy() {
+                    if !expect_bool_condition(left, expr.span)? {
                         return Ok(Value::Bool(false));
                     }
                     let right = self.eval(right, env, depth)?;
                     if self.pending_fail.is_some() {
                         return Ok(Value::Null);
                     }
-                    return Ok(Value::Bool(right.is_truthy()));
+                    return Ok(Value::Bool(expect_bool_condition(right, expr.span)?));
                 }
                 if *op == BinaryOp::Or {
                     let left = self.eval(left, env, depth)?;
                     if self.pending_fail.is_some() {
                         return Ok(Value::Null);
                     }
-                    if left.is_truthy() {
+                    if expect_bool_condition(left, expr.span)? {
                         return Ok(Value::Bool(true));
                     }
                     let right = self.eval(right, env, depth)?;
                     if self.pending_fail.is_some() {
                         return Ok(Value::Null);
                     }
-                    return Ok(Value::Bool(right.is_truthy()));
+                    return Ok(Value::Bool(expect_bool_condition(right, expr.span)?));
                 }
                 let left = self.eval(left, env, depth)?;
                 if self.pending_fail.is_some() {
@@ -522,6 +682,16 @@ impl Interpreter {
                 eval_binary(*op, left, right, expr.span)
             }
             ExprKind::Call { callee, args } => {
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    if name == "map" {
+                        return self.eval_array_map(target, args, env, depth, expr.span);
+                    }
+                }
+                if let Some(value) =
+                    self.eval_std_method_call(callee, args, env, depth, expr.span)?
+                {
+                    return Ok(value);
+                }
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
                     values.push(self.eval(arg, env, depth)?);
@@ -532,9 +702,11 @@ impl Interpreter {
                 let args = values;
                 if !dotted_builtin_is_shadowed(callee, env) {
                     if let Some(module) = dotted_builtin_module(callee) {
-                        if module == "http" && !self.std_modules.contains(module) {
+                        if stdlib::metadata::module_requires_import(module)
+                            && !self.std_modules.contains(module)
+                        {
                             return Err(KuError::runtime(
-                                "std module 'http' must be imported before use",
+                                format!("std module '{module}' must be imported before use"),
                                 expr.span,
                             ));
                         }
@@ -610,25 +782,57 @@ impl Interpreter {
                 if self.pending_fail.is_some() {
                     return Ok(Value::Null);
                 }
-                let Value::Array(values) = target else {
-                    return Err(KuError::runtime(
-                        format!("type error: cannot index {}", target.type_name()),
+                match target {
+                    Value::Array(values) => {
+                        let Value::Int(index) = index else {
+                            return Err(KuError::runtime(
+                                format!(
+                                    "type error: expected int index but got {}",
+                                    index.type_name()
+                                ),
+                                expr.span,
+                            ));
+                        };
+                        if index < 0 || index as usize >= values.len() {
+                            return Err(KuError::runtime("array index out of bounds", expr.span));
+                        }
+                        Ok(values[index as usize].clone())
+                    }
+                    Value::String(text) => {
+                        let Value::Int(index) = index else {
+                            return Err(KuError::runtime(
+                                format!(
+                                    "type error: expected int index but got {}",
+                                    index.type_name()
+                                ),
+                                expr.span,
+                            ));
+                        };
+                        let Some(ch) = (index >= 0)
+                            .then(|| text.chars().nth(index as usize))
+                            .flatten()
+                        else {
+                            return Err(KuError::runtime("string index out of bounds", expr.span));
+                        };
+                        Ok(Value::String(ch.to_string()))
+                    }
+                    Value::Object(fields) => {
+                        let Value::String(key) = index else {
+                            return Err(KuError::runtime(
+                                format!(
+                                    "type error: expected str index but got {}",
+                                    index.type_name()
+                                ),
+                                expr.span,
+                            ));
+                        };
+                        Ok(fields.get(&key).cloned().unwrap_or(Value::Null))
+                    }
+                    other => Err(KuError::runtime(
+                        format!("type error: cannot index {}", other.type_name()),
                         expr.span,
-                    ));
-                };
-                let Value::Int(index) = index else {
-                    return Err(KuError::runtime(
-                        format!(
-                            "type error: expected int index but got {}",
-                            index.type_name()
-                        ),
-                        expr.span,
-                    ));
-                };
-                if index < 0 || index as usize >= values.len() {
-                    return Err(KuError::runtime("array index out of bounds", expr.span));
+                    )),
                 }
-                Ok(values[index as usize].clone())
             }
             ExprKind::Field { target, name } => {
                 if let ExprKind::Variable(enum_name) = &target.kind {
@@ -661,6 +865,22 @@ impl Interpreter {
                     Value::Object(fields) => fields.get(name).cloned().ok_or_else(|| {
                         KuError::runtime(format!("object has no field '{name}'"), expr.span)
                     }),
+                    other => Err(KuError::runtime(
+                        format!("type error: {} has no fields", other.type_name()),
+                        expr.span,
+                    )),
+                }
+            }
+            ExprKind::OptionalField { target, name } => {
+                let target = self.eval(target, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
+                match target {
+                    Value::Null => Ok(Value::Null),
+                    Value::Struct { fields, .. } | Value::Object(fields) => {
+                        Ok(fields.get(name).cloned().unwrap_or(Value::Null))
+                    }
                     other => Err(KuError::runtime(
                         format!("type error: {} has no fields", other.type_name()),
                         expr.span,
@@ -705,7 +925,7 @@ impl Interpreter {
                                 env.pop_scope();
                                 return Ok(Value::Null);
                             }
-                            if !guard.is_truthy() {
+                            if !expect_bool_condition(guard, arm.span)? {
                                 env.pop_scope();
                                 continue;
                             }
@@ -949,26 +1169,58 @@ fn assignment_root(expr: &Expr) -> Option<String> {
 }
 
 fn assign_index_value(target: &mut Value, index: Value, value: Value, span: Span) -> KuResult<()> {
-    let Value::Array(values) = target else {
-        return Err(KuError::runtime(
-            format!("type error: cannot index {}", target.type_name()),
-            span,
-        ));
-    };
-    let Value::Int(index) = index else {
-        return Err(KuError::runtime(
-            format!(
-                "type error: expected int index but got {}",
-                index.type_name()
-            ),
-            span,
-        ));
-    };
-    if index < 0 || index as usize >= values.len() {
-        return Err(KuError::runtime("array index out of bounds", span));
+    match target {
+        Value::Array(values) => {
+            let Value::Int(index) = index else {
+                return Err(KuError::runtime(
+                    format!(
+                        "type error: expected int index but got {}",
+                        index.type_name()
+                    ),
+                    span,
+                ));
+            };
+            if index < 0 || index as usize >= values.len() {
+                return Err(KuError::runtime("array index out of bounds", span));
+            }
+            values[index as usize] = value;
+        }
+        Value::Object(fields) => {
+            let Value::String(key) = index else {
+                return Err(KuError::runtime(
+                    format!(
+                        "type error: expected str index but got {}",
+                        index.type_name()
+                    ),
+                    span,
+                ));
+            };
+            fields.insert(key, value);
+        }
+        other => {
+            return Err(KuError::runtime(
+                format!("type error: cannot index {}", other.type_name()),
+                span,
+            ));
+        }
     }
-    values[index as usize] = value;
     Ok(())
+}
+
+fn normalize_error_value(value: Value) -> Value {
+    if is_error_object(&value) {
+        return value;
+    }
+    stdlib::errors::error_object("ku", "fail", value.to_string())
+}
+
+fn is_error_object(value: &Value) -> bool {
+    let Value::Object(fields) = value else {
+        return false;
+    };
+    matches!(fields.get("domain"), Some(Value::String(_)))
+        && matches!(fields.get("code"), Some(Value::String(_)))
+        && matches!(fields.get("message"), Some(Value::String(_)))
 }
 
 fn assign_field_value(target: &mut Value, name: &str, value: Value, span: Span) -> KuResult<()> {
@@ -1222,9 +1474,12 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::VarDecl { span, .. }
         | Stmt::Assign { span, .. }
         | Stmt::AssignTarget { span, .. }
+        | Stmt::DestructureAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
+        | Stmt::Break { span }
+        | Stmt::Continue { span }
         | Stmt::Function(FnDecl { span, .. })
         | Stmt::Return { span, .. }
         | Stmt::Try { span, .. }
@@ -1291,6 +1546,14 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             collect_free_assign_target(target, bound, free);
             collect_free_expr(value, bound, free);
         }
+        Stmt::DestructureAssign { names, values, .. } => {
+            for value in values {
+                collect_free_expr(value, bound, free);
+            }
+            for name in names.iter().flatten() {
+                bound.insert(name.clone());
+            }
+        }
         Stmt::If {
             condition,
             then_branch,
@@ -1344,6 +1607,7 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
                 collect_free_expr(value, bound, free);
             }
         }
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
         Stmt::Expr { expr, .. } => collect_free_expr(expr, bound, free),
     }
 }
@@ -1364,6 +1628,19 @@ fn collect_free_assign_target(
             collect_free_expr(index, bound, free);
         }
         AssignTarget::Field { target, .. } => collect_free_expr(target, bound, free),
+    }
+}
+
+fn expect_bool_condition(value: Value, span: Span) -> KuResult<bool> {
+    match value {
+        Value::Bool(value) => Ok(value),
+        other => Err(KuError::runtime(
+            format!(
+                "type error: condition must be bool but got {}",
+                other.type_name()
+            ),
+            span,
+        )),
     }
 }
 
@@ -1396,7 +1673,9 @@ fn collect_free_expr(expr: &Expr, bound: &HashSet<String>, free: &mut HashSet<St
             collect_free_expr(target, bound, free);
             collect_free_expr(index, bound, free);
         }
-        ExprKind::Field { target, .. } => collect_free_expr(target, bound, free),
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            collect_free_expr(target, bound, free)
+        }
         ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
             for (_, value) in fields {
                 collect_free_expr(value, bound, free);

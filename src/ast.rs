@@ -24,13 +24,27 @@ pub struct ImportDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImportKind {
     Namespace(String),
-    Named(Vec<String>),
+    Named(Vec<ImportName>),
     Glob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportName {
+    pub source: String,
+    pub alias: Option<String>,
+    pub span: Span,
+}
+
+impl ImportName {
+    pub fn local_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.source)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub name: String,
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub return_type: Option<TypeName>,
     pub body: Vec<Stmt>,
@@ -40,7 +54,7 @@ pub struct FnDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
-    pub ty: TypeName,
+    pub ty: Option<TypeName>,
     pub span: Span,
 }
 
@@ -80,6 +94,7 @@ pub enum TypeName {
     Null,
     Array(Box<TypeName>),
     Result(Box<TypeName>),
+    Union(Vec<TypeName>),
     Custom(String),
 }
 
@@ -102,6 +117,11 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    DestructureAssign {
+        names: Vec<Option<String>>,
+        values: Vec<Expr>,
+        span: Span,
+    },
     If {
         condition: Expr,
         then_branch: Vec<Stmt>,
@@ -117,6 +137,12 @@ pub enum Stmt {
         name: String,
         iterable: Expr,
         body: Vec<Stmt>,
+        span: Span,
+    },
+    Break {
+        span: Span,
+    },
+    Continue {
         span: Span,
     },
     Function(FnDecl),
@@ -191,6 +217,10 @@ pub enum ExprKind {
         index: Box<Expr>,
     },
     Field {
+        target: Box<Expr>,
+        name: String,
+    },
+    OptionalField {
         target: Box<Expr>,
         name: String,
     },

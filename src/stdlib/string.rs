@@ -1,7 +1,10 @@
 use crate::{
     error::KuResult,
     span::Span,
-    stdlib::core::{expect_arg_count, expected_type},
+    stdlib::{
+        core::{expect_arg_count, expected_type},
+        errors,
+    },
     value::Value,
 };
 
@@ -107,8 +110,5 @@ fn slice(value: &str, start: i64, end: i64) -> Value {
 }
 
 fn err(message: impl Into<String>) -> Value {
-    Value::Result {
-        ok: false,
-        value: Box::new(Value::String(message.into())),
-    }
+    errors::err("string", "slice_error", message)
 }

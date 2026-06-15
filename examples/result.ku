@@ -8,7 +8,7 @@ fn main() {
     try {
         message = read_name()?
     } catch (err) {
-        message = "caught: " + err
+        message = "caught: " + err.message
     } finally {
         print("cleanup")
     }

@@ -3,9 +3,12 @@ pub(crate) enum TypePattern {
     Int,
     Bool,
     String,
+    Null,
     Unknown,
     Any,
     ArrayAny,
+    ObjectAny,
+    ObjectFields(Vec<(String, TypePattern)>),
     ArrayOf(Box<TypePattern>),
     StringOrStringArray,
     ArrayElementOfArg(usize),
@@ -44,7 +47,7 @@ pub(crate) enum FailureMode {
 
 pub(crate) fn builtin_signature(name: &str) -> Option<Signature> {
     let args = match name {
-        "len" | "str" | "ok" => vec![ArgRule::Is(TypePattern::Any)],
+        "len" | "str" | "ok" | "println" => vec![ArgRule::Is(TypePattern::Any)],
         "err" => vec![str_arg()],
         _ => return None,
     };
@@ -53,6 +56,7 @@ pub(crate) fn builtin_signature(name: &str) -> Option<Signature> {
         "str" => TypePattern::String,
         "ok" => TypePattern::ResultOf(Box::new(TypePattern::SameAsArg(0))),
         "err" => TypePattern::ResultOf(Box::new(TypePattern::Unknown)),
+        "println" => TypePattern::Null,
         _ => return None,
     };
     Some(Signature {
@@ -72,6 +76,8 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
     let args = match (module, function) {
         ("fs", "read") => vec![str_arg()],
         ("fs", "try_read") => vec![str_arg()],
+        ("fs", "write") => vec![str_arg(), str_arg()],
+        ("fs", "try_write") => vec![str_arg(), str_arg()],
         ("lexer", "scan") => vec![str_arg()],
         ("parser", "parse") => vec![ArgRule::Is(TypePattern::StringOrStringArray)],
         ("string", "len" | "trim" | "lower" | "upper") => vec![str_arg()],
@@ -85,12 +91,16 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("json", "parse" | "try_parse") => vec![str_arg()],
         ("json", "stringify") => vec![ArgRule::Is(TypePattern::Any)],
         ("time", "now" | "unix" | "millis") => vec![],
-        ("http", "try_get") => vec![str_arg()],
+        ("http", "get") => vec![str_arg()],
+        ("http", "post") => vec![str_arg(), str_arg()],
+        ("http", "request") => vec![ArgRule::Is(TypePattern::ObjectAny)],
         _ => return None,
     };
     let returns = match (module, function) {
         ("fs", "read") => TypePattern::String,
         ("fs", "try_read") => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        ("fs", "write") => TypePattern::Null,
+        ("fs", "try_write") => TypePattern::ResultOf(Box::new(TypePattern::Null)),
         ("lexer", "scan") => TypePattern::ArrayOf(Box::new(TypePattern::String)),
         ("parser", "parse") => TypePattern::String,
         ("string", "len") => TypePattern::Int,
@@ -106,7 +116,9 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("json", "try_parse") => TypePattern::ResultOf(Box::new(TypePattern::Unknown)),
         ("json", "stringify") => TypePattern::String,
         ("time", "now" | "unix" | "millis") => TypePattern::Int,
-        ("http", "try_get") => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        ("http", "get" | "post" | "request") => {
+            TypePattern::ResultOf(Box::new(http_response_pattern()))
+        }
         _ => return None,
     };
     Some(Signature {
@@ -123,18 +135,25 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
 
 fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
     match (module, function) {
-        ("fs", "try_read")
+        ("fs", "try_read" | "try_write")
         | ("string", "slice")
         | ("array", "try_get")
         | ("json", "try_parse")
-        | ("http", "try_get") => FailureMode::ReturnsResult,
-        ("fs", "read") | ("json", "parse") => FailureMode::MayPanic,
+        | ("http", "get" | "post" | "request") => FailureMode::ReturnsResult,
+        ("fs", "read" | "write") | ("json", "parse") => FailureMode::MayPanic,
         _ => FailureMode::Never,
     }
 }
 
 pub(crate) fn module_requires_import(module: &str) -> bool {
-    module == "http"
+    matches!(module, "fs" | "http")
+}
+
+pub(crate) fn is_std_module(module: &str) -> bool {
+    matches!(
+        module,
+        "fs" | "lexer" | "parser" | "string" | "array" | "json" | "time" | "http"
+    )
 }
 
 fn int_arg() -> ArgRule {
@@ -147,4 +166,12 @@ fn str_arg() -> ArgRule {
 
 fn array_arg() -> ArgRule {
     ArgRule::Is(TypePattern::ArrayAny)
+}
+
+fn http_response_pattern() -> TypePattern {
+    TypePattern::ObjectFields(vec![
+        ("status".to_string(), TypePattern::Int),
+        ("headers".to_string(), TypePattern::ObjectAny),
+        ("body".to_string(), TypePattern::String),
+    ])
 }

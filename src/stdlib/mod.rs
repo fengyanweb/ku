@@ -10,6 +10,7 @@ use crate::{
 pub mod array;
 pub mod compiler;
 pub mod core;
+pub mod errors;
 pub mod fs;
 pub mod http;
 pub mod json;
