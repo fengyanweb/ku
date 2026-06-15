@@ -105,7 +105,7 @@ function activate(context) {
     status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
     status.command = "ku.showVersion";
     context.subscriptions.push(status);
-    context.subscriptions.push(vscode.commands.registerCommand("ku.runCurrentFile", () => runKuCommand("run")), vscode.commands.registerCommand("ku.checkCurrentFile", () => checkActiveFile(true)), vscode.commands.registerCommand("ku.showIr", () => runKuCommand("ir")), vscode.commands.registerCommand("ku.buildCurrentFile", () => runKuCommand("build")), vscode.commands.registerCommand("ku.buildNativeC", () => buildNativeC()), vscode.commands.registerCommand("ku.packageGc", () => runKuCommand("package gc")), vscode.commands.registerCommand("ku.showVersion", () => showVersion()), vscode.workspace.onDidOpenTextDocument((doc) => {
+    context.subscriptions.push(vscode.commands.registerCommand("ku.runCurrentFile", (uri) => runKuCommand("run", uri)), vscode.commands.registerCommand("ku.checkCurrentFile", () => checkActiveFile(true)), vscode.commands.registerCommand("ku.showIr", () => runKuCommand("ir")), vscode.commands.registerCommand("ku.buildCurrentFile", () => runKuCommand("build")), vscode.commands.registerCommand("ku.buildNativeC", () => buildNativeC()), vscode.commands.registerCommand("ku.packageGc", () => runKuCommand("package gc")), vscode.commands.registerCommand("ku.showVersion", () => showVersion()), vscode.workspace.onDidOpenTextDocument((doc) => {
         if (isKu(doc) && config().get("checkOnOpen", true)) {
             void scheduleCheck(doc, 0);
         }
@@ -237,25 +237,32 @@ function hintFor(message) {
     }
     return "";
 }
-async function runKuCommand(command) {
+async function kuDocumentFromCommand(uri) {
+    if (uri?.scheme === "file" && uri.fsPath.endsWith(".ku")) {
+        return await vscode.workspace.openTextDocument(uri);
+    }
     const editor = vscode.window.activeTextEditor;
-    if (!editor || !isKu(editor.document)) {
+    return editor && isKu(editor.document) ? editor.document : undefined;
+}
+async function runKuCommand(command, uri) {
+    const document = await kuDocumentFromCommand(uri);
+    if (!document || !isKu(document)) {
         void vscode.window.showWarningMessage("当前文件不是 Ku 源文件。");
         return;
     }
-    if (command === "run" && !documentHasMain(editor.document)) {
+    if (command === "run" && !documentHasMain(document)) {
         void vscode.window.showWarningMessage("当前 Ku 文件没有 fn main()，不能运行。");
         return;
     }
-    await editor.document.save();
-    const exe = await findKuExecutable(editor.document.uri);
+    await document.save();
+    const exe = await findKuExecutable(document.uri);
     if (!exe) {
         return;
     }
-    const cwd = terminalCwd(editor.document.uri);
+    const cwd = terminalCwd(document.uri);
     const terminal = vscode.window.createTerminal({ name: `Ku ${command}`, cwd });
     terminal.show();
-    terminal.sendText(terminalCommand(exe, [...command.split(" "), editor.document.uri.fsPath], cwd));
+    terminal.sendText(terminalCommand(exe, [...command.split(" "), document.uri.fsPath], cwd));
 }
 async function buildNativeC() {
     const editor = vscode.window.activeTextEditor;
@@ -321,12 +328,12 @@ async function findKuExecutable(uri, notify = true) {
     if (configured) {
         candidates.push(configured);
     }
+    candidates.push("ku");
     const folder = workspaceFolder(uri);
     if (folder) {
         candidates.push(path.join(folder, "release", exeName()), path.join(folder, "target", "release", exeName()), path.join(folder, "target", "debug", exeName()));
     }
-    candidates.push("ku");
-    for (const candidate of candidates) {
+    for (const candidate of [...new Set(candidates)]) {
         const result = await execFile(candidate, ["version"], folder, 3000);
         if (result.code === 0) {
             return candidate;

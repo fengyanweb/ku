@@ -53,7 +53,7 @@
         "ku.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Path to ku executable. Empty means auto-detect from workspace release/target or PATH."
+          "description": "Path to ku executable. Empty means use PATH ku first, then workspace release/target fallback."
         },
         "ku.checkOnSave": {
           "type": "boolean",
@@ -122,6 +122,9 @@
     "menus": {
       "editor/context": [
         { "command": "ku.runCurrentFile", "when": "editorLangId == ku", "group": "navigation@1" }
+      ],
+      "explorer/context": [
+        { "command": "ku.runCurrentFile", "when": "resourceExtname == .ku", "group": "navigation@1" }
       ],
       "editor/title": [
         { "command": "ku.runCurrentFile", "when": "resourceLangId == ku", "group": "navigation@1" },

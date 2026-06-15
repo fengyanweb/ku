@@ -10,7 +10,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 - Snippets for `main`, functions, generic functions, struct, enum, match, try/catch/finally, `std.fs`, `std.http`, HTTP response usage, array map, string methods, and `array.try_get`.
 - `ku check` diagnostics on open/save, shown in Problems with red squiggles.
 - Command Palette commands: Run, Check, Show IR, Build, Build Native C, Package GC, Show Version.
-- Right-click menu `Ku Run` for `.ku` files; if the file does not define `fn main()`, the command shows a clear warning instead of disappearing.
+- Right-click menu `Ku Run` in the editor and Explorer for `.ku` files; if the file does not define `fn main()`, the command shows a clear warning instead of disappearing.
 - Editor title buttons for Run, Check, IR, and Build.
 - Status bar version check for interpreter/plugin mismatch.
 - Hover docs for Error, Result, std.fs, std.http, match, string and array helpers.
@@ -59,6 +59,6 @@ Open `editors/vscode-ku` in VS Code and press `F5` to launch an Extension Develo
 
 ## Interpreter Path
 
-The extension auto-detects `release/ku.exe`, `target/release/ku.exe`, `target/debug/ku.exe`, or `ku` from PATH.
+The extension uses `ku` from PATH first, then falls back to `release/ku.exe`, `target/release/ku.exe`, or `target/debug/ku.exe` in the workspace.
 
 If needed, set `ku.executablePath` in VS Code settings.
