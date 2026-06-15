@@ -39,7 +39,7 @@
   },
   "contributes": {
     "commands": [
-      { "command": "ku.runCurrentFile", "title": "Ku: Run Current File", "icon": "$(play)" },
+      { "command": "ku.runCurrentFile", "title": "Ku Run", "icon": "$(play)" },
       { "command": "ku.checkCurrentFile", "title": "Ku: Check Current File", "icon": "$(check)" },
       { "command": "ku.showIr", "title": "Ku: Show IR", "icon": "$(symbol-misc)" },
       { "command": "ku.buildCurrentFile", "title": "Ku: Build Current File", "icon": "$(package)" },
@@ -120,6 +120,9 @@
       }
     },
     "menus": {
+      "editor/context": [
+        { "command": "ku.runCurrentFile", "when": "resourceLangId == ku && ku.hasMain", "group": "navigation@1" }
+      ],
       "editor/title": [
         { "command": "ku.runCurrentFile", "when": "resourceLangId == ku", "group": "navigation@1" },
         { "command": "ku.checkCurrentFile", "when": "resourceLangId == ku", "group": "navigation@2" },

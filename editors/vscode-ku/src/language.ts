@@ -85,6 +85,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (isKu(doc) && config().get("checkOnOpen", true)) {
         void scheduleCheck(doc, 0);
       }
+      void refreshEditorContext(doc);
       if (doc.fileName.endsWith("ku.lock")) {
         void vscode.window.showInformationMessage("ku.lock 是生成文件，通常不建议手动编辑。");
       }
@@ -93,18 +94,22 @@ export function activate(context: vscode.ExtensionContext) {
       if (isKu(doc) && config().get("checkOnSave", true)) {
         void scheduleCheck(doc, 0);
       }
+      void refreshEditorContext(doc);
     }),
     vscode.workspace.onDidChangeTextDocument((event) => {
       if (isKu(event.document) && config().get("checkOnChange", false)) {
         void scheduleCheck(event.document, 500);
       }
+      void refreshEditorContext(event.document);
     }),
-    vscode.window.onDidChangeActiveTextEditor(() => void refreshStatus()),
+    vscode.window.onDidChangeActiveTextEditor(() => {
+      void refreshStatus();
+      void refreshEditorContext();
+    }),
     vscode.languages.registerCompletionItemProvider(KU_MODE, new KuCompletionProvider(), ".", "\"", "'", "/", "{", "@"),
     vscode.languages.registerHoverProvider(KU_MODE, new KuHoverProvider()),
     vscode.languages.registerDefinitionProvider(KU_MODE, new KuDefinitionProvider()),
     vscode.languages.registerDocumentSymbolProvider(KU_MODE, new KuSymbolProvider()),
-    vscode.languages.registerCodeLensProvider(KU_MODE, new KuCodeLensProvider()),
     vscode.languages.registerCodeActionsProvider(KU_MODE, new KuCodeActionProvider(), {
       providedCodeActionKinds: [vscode.CodeActionKind.QuickFix],
     }),
@@ -117,6 +122,7 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
   void refreshStatus();
+  void refreshEditorContext();
 }
 
 export function deactivate() {
@@ -129,6 +135,15 @@ function config() {
 
 function isKu(document: vscode.TextDocument): boolean {
   return document.languageId === "ku" && document.uri.scheme === "file";
+}
+
+async function refreshEditorContext(document = vscode.window.activeTextEditor?.document) {
+  const hasMain = !!document && isKu(document) && documentHasMain(document);
+  await vscode.commands.executeCommand("setContext", "ku.hasMain", hasMain);
+}
+
+function documentHasMain(document: vscode.TextDocument): boolean {
+  return /^\s*fn\s+main\s*\(/m.test(document.getText());
 }
 
 async function scheduleCheck(document: vscode.TextDocument, delayMs: number) {
@@ -598,20 +613,6 @@ class KuSymbolProvider implements vscode.DocumentSymbolProvider {
       }
     }
     return symbols;
-  }
-}
-
-class KuCodeLensProvider implements vscode.CodeLensProvider {
-  provideCodeLenses(document: vscode.TextDocument) {
-    const lenses: vscode.CodeLens[] = [];
-    for (let line = 0; line < document.lineCount; line++) {
-      if (!/^\s*fn\s+main\s*\(/.test(document.lineAt(line).text)) {
-        continue;
-      }
-      const range = new vscode.Range(line, 0, line, 0);
-      lenses.push(new vscode.CodeLens(range, { title: "▶ Run", command: "ku.runCurrentFile" }));
-    }
-    return lenses;
   }
 }
 

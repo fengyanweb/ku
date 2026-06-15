@@ -109,6 +109,7 @@ function activate(context) {
         if (isKu(doc) && config().get("checkOnOpen", true)) {
             void scheduleCheck(doc, 0);
         }
+        void refreshEditorContext(doc);
         if (doc.fileName.endsWith("ku.lock")) {
             void vscode.window.showInformationMessage("ku.lock 是生成文件，通常不建议手动编辑。");
         }
@@ -116,11 +117,16 @@ function activate(context) {
         if (isKu(doc) && config().get("checkOnSave", true)) {
             void scheduleCheck(doc, 0);
         }
+        void refreshEditorContext(doc);
     }), vscode.workspace.onDidChangeTextDocument((event) => {
         if (isKu(event.document) && config().get("checkOnChange", false)) {
             void scheduleCheck(event.document, 500);
         }
-    }), vscode.window.onDidChangeActiveTextEditor(() => void refreshStatus()), vscode.languages.registerCompletionItemProvider(KU_MODE, new KuCompletionProvider(), ".", "\"", "'", "/", "{", "@"), vscode.languages.registerHoverProvider(KU_MODE, new KuHoverProvider()), vscode.languages.registerDefinitionProvider(KU_MODE, new KuDefinitionProvider()), vscode.languages.registerDocumentSymbolProvider(KU_MODE, new KuSymbolProvider()), vscode.languages.registerCodeLensProvider(KU_MODE, new KuCodeLensProvider()), vscode.languages.registerCodeActionsProvider(KU_MODE, new KuCodeActionProvider(), {
+        void refreshEditorContext(event.document);
+    }), vscode.window.onDidChangeActiveTextEditor(() => {
+        void refreshStatus();
+        void refreshEditorContext();
+    }), vscode.languages.registerCompletionItemProvider(KU_MODE, new KuCompletionProvider(), ".", "\"", "'", "/", "{", "@"), vscode.languages.registerHoverProvider(KU_MODE, new KuHoverProvider()), vscode.languages.registerDefinitionProvider(KU_MODE, new KuDefinitionProvider()), vscode.languages.registerDocumentSymbolProvider(KU_MODE, new KuSymbolProvider()), vscode.languages.registerCodeActionsProvider(KU_MODE, new KuCodeActionProvider(), {
         providedCodeActionKinds: [vscode.CodeActionKind.QuickFix],
     }), vscode.languages.registerDocumentFormattingEditProvider(KU_MODE, new KuFormatter()));
     for (const doc of vscode.workspace.textDocuments) {
@@ -129,6 +135,7 @@ function activate(context) {
         }
     }
     void refreshStatus();
+    void refreshEditorContext();
 }
 function deactivate() {
     diagnosticCollection.clear();
@@ -138,6 +145,13 @@ function config() {
 }
 function isKu(document) {
     return document.languageId === "ku" && document.uri.scheme === "file";
+}
+async function refreshEditorContext(document = vscode.window.activeTextEditor?.document) {
+    const hasMain = !!document && isKu(document) && documentHasMain(document);
+    await vscode.commands.executeCommand("setContext", "ku.hasMain", hasMain);
+}
+function documentHasMain(document) {
+    return /^\s*fn\s+main\s*\(/m.test(document.getText());
 }
 async function scheduleCheck(document, delayMs) {
     const key = document.uri.toString();
@@ -562,19 +576,6 @@ class KuSymbolProvider {
             }
         }
         return symbols;
-    }
-}
-class KuCodeLensProvider {
-    provideCodeLenses(document) {
-        const lenses = [];
-        for (let line = 0; line < document.lineCount; line++) {
-            if (!/^\s*fn\s+main\s*\(/.test(document.lineAt(line).text)) {
-                continue;
-            }
-            const range = new vscode.Range(line, 0, line, 0);
-            lenses.push(new vscode.CodeLens(range, { title: "▶ Run", command: "ku.runCurrentFile" }));
-        }
-        return lenses;
     }
 }
 class KuCodeActionProvider {
