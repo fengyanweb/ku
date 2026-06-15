@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Ku Manifest",
+  "scopeName": "source.ku-mod",
+  "patterns": [
+    { "name": "comment.line.number-sign.ku-mod", "match": "#.*$" },
+    { "name": "keyword.other.key.ku-mod", "match": "^\\s*[A-Za-z_][A-Za-z0-9_.-]*(?=\\s*=)" },
+    { "name": "string.quoted.double.ku-mod", "begin": "\"", "end": "\"", "patterns": [{ "name": "constant.character.escape.ku-mod", "match": "\\\\." }] },
+    { "name": "constant.language.boolean.ku-mod", "match": "\\b(true|false)\\b" },
+    { "name": "constant.numeric.version.ku-mod", "match": "\\b[0-9]+\\.[0-9]+\\.[0-9]+\\b" },
+    { "name": "support.type.package.ku-mod", "match": "\\b(package|name|version|import_root|dependencies|source|checksum|cache|cache_key)\\b" }
+  ]
+}

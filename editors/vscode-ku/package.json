@@ -1,7 +1,7 @@
 {
   "name": "ku-language",
   "displayName": "Ku Language",
-  "description": "Syntax highlighting and snippets for Ku",
+  "description": "Syntax highlighting, snippets, and editor intelligence for Ku",
   "version": "0.0.12",
   "publisher": "ku-lang",
   "license": "UNLICENSED",
@@ -13,14 +13,81 @@
   "engines": {
     "vscode": "^1.85.0"
   },
+  "main": "./out/language.js",
+  "activationEvents": [
+    "onLanguage:ku",
+    "onLanguage:ku-mod",
+    "onLanguage:ku-lock",
+    "onCommand:ku.runCurrentFile",
+    "onCommand:ku.checkCurrentFile",
+    "onCommand:ku.showIr",
+    "onCommand:ku.buildCurrentFile",
+    "onCommand:ku.buildNativeC",
+    "onCommand:ku.packageGc",
+    "onCommand:ku.showVersion"
+  ],
   "categories": ["Programming Languages"],
+  "scripts": {
+    "compile": "tsc --target ES2020 --module commonjs --lib ES2020 --rootDir src --outDir out --strict --esModuleInterop --skipLibCheck src/language.ts src/imports.ts",
+    "test": "npm run compile && node -e \"for (const f of ['package.json','language-configuration.json','snippets/ku.json','syntaxes/ku.tmLanguage.json','syntaxes/ku-mod.tmLanguage.json']) JSON.parse(require('fs').readFileSync(f,'utf8')); console.log('ku vscode extension ok')\"",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  },
   "contributes": {
+    "commands": [
+      { "command": "ku.runCurrentFile", "title": "Ku: Run Current File", "icon": "$(play)" },
+      { "command": "ku.checkCurrentFile", "title": "Ku: Check Current File", "icon": "$(check)" },
+      { "command": "ku.showIr", "title": "Ku: Show IR", "icon": "$(symbol-misc)" },
+      { "command": "ku.buildCurrentFile", "title": "Ku: Build Current File", "icon": "$(package)" },
+      { "command": "ku.buildNativeC", "title": "Ku: Build Native C", "icon": "$(gear)" },
+      { "command": "ku.packageGc", "title": "Ku: Package GC", "icon": "$(trash)" },
+      { "command": "ku.showVersion", "title": "Ku: Show Version", "icon": "$(versions)" }
+    ],
+    "configuration": {
+      "title": "Ku",
+      "properties": {
+        "ku.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to ku executable. Empty means auto-detect from workspace release/target or PATH."
+        },
+        "ku.checkOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run ku check when a .ku file is saved."
+        },
+        "ku.checkOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run ku check when a .ku file is opened."
+        },
+        "ku.checkOnChange": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run ku check after edits. Disabled by default to avoid noisy diagnostics while typing."
+        }
+      }
+    },
     "languages": [
       {
         "id": "ku",
         "aliases": ["Ku", "ku"],
         "extensions": [".ku"],
         "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "ku-mod",
+        "aliases": ["Ku Mod", "ku.mod"],
+        "filenames": ["ku.mod"]
+      },
+      {
+        "id": "ku-lock",
+        "aliases": ["Ku Lock", "ku.lock"],
+        "filenames": ["ku.lock"]
       }
     ],
     "grammars": [
@@ -28,6 +95,16 @@
         "language": "ku",
         "scopeName": "source.ku",
         "path": "./syntaxes/ku.tmLanguage.json"
+      },
+      {
+        "language": "ku-mod",
+        "scopeName": "source.ku-mod",
+        "path": "./syntaxes/ku-mod.tmLanguage.json"
+      },
+      {
+        "language": "ku-lock",
+        "scopeName": "source.ku-lock",
+        "path": "./syntaxes/ku-mod.tmLanguage.json"
       }
     ],
     "snippets": [
@@ -41,6 +118,23 @@
         "editor.insertSpaces": true,
         "editor.tabSize": 4
       }
+    },
+    "menus": {
+      "editor/title": [
+        { "command": "ku.runCurrentFile", "when": "resourceLangId == ku", "group": "navigation@1" },
+        { "command": "ku.checkCurrentFile", "when": "resourceLangId == ku", "group": "navigation@2" },
+        { "command": "ku.showIr", "when": "resourceLangId == ku", "group": "navigation@3" },
+        { "command": "ku.buildCurrentFile", "when": "resourceLangId == ku", "group": "navigation@4" }
+      ],
+      "commandPalette": [
+        { "command": "ku.runCurrentFile", "when": "resourceLangId == ku" },
+        { "command": "ku.checkCurrentFile", "when": "resourceLangId == ku" },
+        { "command": "ku.showIr", "when": "resourceLangId == ku" },
+        { "command": "ku.buildCurrentFile", "when": "resourceLangId == ku" },
+        { "command": "ku.buildNativeC", "when": "resourceLangId == ku" },
+        { "command": "ku.packageGc", "when": "resourceLangId == ku" },
+        { "command": "ku.showVersion" }
+      ]
     }
   }
 }

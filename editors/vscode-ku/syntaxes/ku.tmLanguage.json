@@ -33,8 +33,8 @@
     },
     "keywords": {
       "patterns": [
-        { "name": "keyword.control.ku", "match": "\\b(fn|struct|enum|module|import|from|if|else|while|for|in|break|continue|match|try|catch|finally|fail|panic|return|print)\\b" },
-        { "name": "invalid.deprecated.ku", "match": "\\b(let|mut|switch)\\b" }
+        { "name": "keyword.control.ku", "match": "\\b(fn|struct|enum|module|import|from|if|else|while|for|in|break|continue|match|try|catch|finally|fail|panic|return|print|println)\\b" },
+        { "name": "invalid.deprecated.ku", "match": "\\b(let|mut|const)\\b" }
       ]
     },
     "types": {

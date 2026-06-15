@@ -229,6 +229,38 @@ HTTP/registry package、真正语义版本求解、网络下载和强校验
 完整 native C 后端
 ```
 
+## VS Code 插件
+
+插件目录：
+
+```txt
+editors/vscode-ku
+```
+
+已提供：
+
+```txt
+Ku 0.0.12 语法高亮和 snippet
+ku.mod / ku.lock 高亮
+保存/打开时运行 ku check，并把错误放进 Problems 面板
+命令面板：Run / Check / Show IR / Build / Build Native C / Package GC / Show Version
+编辑器右上角 Run / Check / IR / Build 按钮
+状态栏解释器版本检查
+Hover、补全、定义跳转、Outline、CodeLens、Quick Fix、基础格式化
+```
+
+图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择：
+
+```txt
+editors/vscode-ku/ku-language-0.0.12.vsix
+```
+
+命令安装方式：
+
+```powershell
+code --install-extension editors\vscode-ku\ku-language-0.0.12.vsix --force
+```
+
 ## 开发验证
 
 ```powershell
