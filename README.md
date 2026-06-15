@@ -185,6 +185,7 @@ package/
 - [Package 草案](docs/package.md)
 - [IR 草案](docs/ir.md)
 - [版本和解释器历史](docs/history.md)
+- [完整化前置决策](docs/roadmap-decisions.md)
 - [0.0.6 版本记录](docs/v0.0.6.md)
 - [0.0.5 版本记录](docs/v0.0.5.md)
 - [0.0.4 版本记录](docs/v0.0.4.md)
