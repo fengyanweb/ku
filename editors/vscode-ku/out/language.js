@@ -39,6 +39,7 @@ const cp = __importStar(require("child_process"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const vscode = __importStar(require("vscode"));
+const completionModel_1 = require("./completionModel");
 const imports_1 = require("./imports");
 const KU_VERSION = "0.0.12";
 const KU_MODE = [{ language: "ku", scheme: "file" }];
@@ -46,65 +47,6 @@ const diagnosticCollection = vscode.languages.createDiagnosticCollection("ku");
 const output = vscode.window.createOutputChannel("Ku");
 let status;
 const checkTimers = new Map();
-const keywords = [
-    "fn",
-    "struct",
-    "enum",
-    "module",
-    "import",
-    "from",
-    "if",
-    "else",
-    "while",
-    "for",
-    "in",
-    "break",
-    "continue",
-    "match",
-    "try",
-    "catch",
-    "finally",
-    "fail",
-    "panic",
-    "return",
-    "print",
-    "println",
-    "true",
-    "false",
-    "null",
-];
-const types = ["int", "float", "bool", "str", "null"];
-const builtins = ["len", "str", "ok", "err", "println"];
-const stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.time"];
-const stdFunctions = [
-    "fs.read",
-    "fs.try_read",
-    "fs.write",
-    "fs.try_write",
-    "http.get",
-    "http.post",
-    "http.request",
-    "http.client",
-    "http.text",
-    "http.json",
-    "http.service",
-    "http.server",
-    "string.len",
-    "string.trim",
-    "string.lower",
-    "string.upper",
-    "string.slice",
-    "array.len",
-    "array.try_get",
-    "array.push",
-    "array.concat",
-    "json.parse",
-    "json.try_parse",
-    "json.stringify",
-    "time.now",
-    "time.unix",
-    "time.millis",
-];
 function activate(context) {
     context.subscriptions.push(diagnosticCollection, output);
     status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
@@ -401,6 +343,14 @@ class KuCompletionProvider {
         if (isNamedImportContext(document, position)) {
             return exportNameCompletions(document, position);
         }
+        const member = memberAccessContext(linePrefix, position);
+        if (member) {
+            const labels = (0, completionModel_1.memberCompletionLabels)(member.receiver, member.prefix);
+            if (labels.length > 0) {
+                return labels.map((label) => memberCompletionItem(label, member.receiver, member.range));
+            }
+            return [];
+        }
         if (/@dep\/?$/.test(linePrefix)) {
             return dependencyCompletions(document);
         }
@@ -416,25 +366,39 @@ class KuCompletionProvider {
         if (/\b(values|items|nums)\.$/.test(linePrefix)) {
             return methodCompletions(["len", "is_empty", "first", "last", "try_get", "push", "concat", "map"]);
         }
-        for (const value of keywords) {
+        for (const value of completionModel_1.keywords) {
             items.push(new vscode.CompletionItem(value, vscode.CompletionItemKind.Keyword));
         }
-        for (const value of types) {
+        for (const value of completionModel_1.types) {
             items.push(new vscode.CompletionItem(value, vscode.CompletionItemKind.TypeParameter));
         }
-        for (const value of builtins) {
+        for (const value of completionModel_1.builtins) {
             items.push(new vscode.CompletionItem(value, vscode.CompletionItemKind.Function));
         }
-        for (const value of stdModules) {
+        for (const value of completionModel_1.stdModules) {
             const item = new vscode.CompletionItem(value, vscode.CompletionItemKind.Module);
             item.insertText = `import "${value}"`;
             items.push(item);
         }
-        for (const value of stdFunctions) {
+        for (const value of completionModel_1.stdFunctions) {
             items.push(new vscode.CompletionItem(value, vscode.CompletionItemKind.Function));
         }
         return items;
     }
+}
+function memberAccessContext(linePrefix, position) {
+    const match = /\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)?$/.exec(linePrefix);
+    if (!match) {
+        return undefined;
+    }
+    const receiver = match[1];
+    const prefix = match[2] ?? "";
+    const start = position.character - prefix.length;
+    return {
+        receiver,
+        prefix,
+        range: new vscode.Range(position.line, start, position.line, position.character),
+    };
 }
 function isImportPathContext(linePrefix) {
     return /^\s*import\b.*["'][^"']*$/.test(linePrefix);
@@ -444,7 +408,7 @@ async function importPathCompletions(document, position, linePrefix) {
     const current = quoteMatch?.[1] ?? "";
     const replaceRange = importPathReplaceRange(linePrefix, position);
     if (current.startsWith("std.")) {
-        return stdModules.map((module) => importPathItem(module, replaceRange, vscode.CompletionItemKind.Module));
+        return (0, completionModel_1.stdImportPathLabels)(current).map((module) => importPathItem(module, replaceRange, vscode.CompletionItemKind.Module));
     }
     if (current.startsWith("@")) {
         return dependencyCompletions(document);
@@ -473,6 +437,13 @@ function importPathReplaceRange(linePrefix, position) {
         return undefined;
     }
     return new vscode.Range(position.line, quoteIndex + 1, position.line, position.character);
+}
+function memberCompletionItem(label, receiver, range) {
+    const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Method);
+    item.insertText = label;
+    item.range = range;
+    item.detail = `${receiver} member`;
+    return item;
 }
 function importPathItem(label, range, kind) {
     const item = new vscode.CompletionItem(label, kind);

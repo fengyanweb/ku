@@ -14,7 +14,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 - Editor title buttons for Run, Check, IR, and Build.
 - Status bar version check for interpreter/plugin mismatch.
 - Hover docs for Error, Result, std.fs, std.http, match, string and array helpers.
-- Completion for keywords, base types, builtins, stdlib modules/functions, Error fields, HttpResponse fields, string/array methods, import paths, and package dependency prefixes.
+- Completion for keywords, base types, builtins, stdlib modules/functions, Error fields, HttpResponse fields, string/array methods, import paths, and package dependency prefixes. Member completion is context-aware: typing `http.s` only offers `service` / `server` and inserts only the member name, so it will not become `http.http.server`.
 - Go to definition for local functions/types, imported files, and exported imported symbols.
 - Outline symbols for module, function, struct, enum, and local functions.
 - Quick Fixes for missing `std.http` / `std.fs`, `let`, and `switch`.

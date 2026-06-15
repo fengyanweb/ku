@@ -1,0 +1,86 @@
+export const keywords = [
+  "fn",
+  "struct",
+  "enum",
+  "module",
+  "import",
+  "from",
+  "if",
+  "else",
+  "while",
+  "for",
+  "in",
+  "break",
+  "continue",
+  "match",
+  "try",
+  "catch",
+  "finally",
+  "fail",
+  "panic",
+  "return",
+  "print",
+  "println",
+  "true",
+  "false",
+  "null",
+];
+
+export const types = ["int", "float", "bool", "str", "null"];
+export const builtins = ["len", "str", "ok", "err", "println"];
+export const stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.time"];
+
+export const stdFunctions = [
+  "fs.read",
+  "fs.try_read",
+  "fs.write",
+  "fs.try_write",
+  "http.get",
+  "http.post",
+  "http.request",
+  "http.client",
+  "http.text",
+  "http.json",
+  "http.service",
+  "http.server",
+  "string.len",
+  "string.trim",
+  "string.lower",
+  "string.upper",
+  "string.slice",
+  "array.len",
+  "array.try_get",
+  "array.push",
+  "array.concat",
+  "json.parse",
+  "json.try_parse",
+  "json.stringify",
+  "time.now",
+  "time.unix",
+  "time.millis",
+];
+
+export const namespaceMembers: Record<string, string[]> = {
+  fs: ["read", "try_read", "write", "try_write"],
+  http: ["get", "post", "request", "client", "text", "json", "service", "server"],
+  string: ["len", "trim", "lower", "upper", "slice"],
+  array: ["len", "try_get", "push", "concat"],
+  json: ["parse", "try_parse", "stringify"],
+  time: ["now", "unix", "millis"],
+};
+
+export function stdImportPathLabels(current: string): string[] {
+  if (!current.startsWith("std.")) {
+    return [];
+  }
+  return stdModules.filter((module) => module.startsWith(current));
+}
+
+export function memberCompletionLabels(receiver: string, prefix = ""): string[] {
+  const members = namespaceMembers[receiver] ?? [];
+  return members.filter((member) => member.startsWith(prefix));
+}
+
+export function globalCompletionLabels(): string[] {
+  return [...keywords, ...types, ...builtins, ...stdModules, ...stdFunctions];
+}

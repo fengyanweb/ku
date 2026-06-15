@@ -250,7 +250,7 @@ ku.mod / ku.lock 高亮
 解释器查找：优先使用 PATH 里的 ku，找不到再回退到工作区 release/target
 状态栏解释器版本检查
 Hover、补全、定义跳转、Outline、Quick Fix、基础格式化
-Ku 文件默认保存时格式化；import path 补全会替换引号内路径，避免 `std.std.fs`
+Ku 文件默认保存时格式化；import path 补全会替换引号内路径，避免 `std.std.fs`；成员补全会识别 `http.` / `fs.` / `json.` 等上下文，只插入成员名，避免 `http.http.server`。
 ```
 
 图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择：

@@ -2,6 +2,7 @@ import * as cp from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
+import { builtins, keywords, memberCompletionLabels, stdFunctions, stdImportPathLabels, stdModules, types } from "./completionModel";
 import { defaultModuleName, parseImports, resolveImportUri } from "./imports";
 
 const KU_VERSION = "0.0.12";
@@ -10,66 +11,6 @@ const diagnosticCollection = vscode.languages.createDiagnosticCollection("ku");
 const output = vscode.window.createOutputChannel("Ku");
 let status: vscode.StatusBarItem;
 const checkTimers = new Map<string, NodeJS.Timeout>();
-
-const keywords = [
-  "fn",
-  "struct",
-  "enum",
-  "module",
-  "import",
-  "from",
-  "if",
-  "else",
-  "while",
-  "for",
-  "in",
-  "break",
-  "continue",
-  "match",
-  "try",
-  "catch",
-  "finally",
-  "fail",
-  "panic",
-  "return",
-  "print",
-  "println",
-  "true",
-  "false",
-  "null",
-];
-const types = ["int", "float", "bool", "str", "null"];
-const builtins = ["len", "str", "ok", "err", "println"];
-const stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.time"];
-const stdFunctions = [
-  "fs.read",
-  "fs.try_read",
-  "fs.write",
-  "fs.try_write",
-  "http.get",
-  "http.post",
-  "http.request",
-  "http.client",
-  "http.text",
-  "http.json",
-  "http.service",
-  "http.server",
-  "string.len",
-  "string.trim",
-  "string.lower",
-  "string.upper",
-  "string.slice",
-  "array.len",
-  "array.try_get",
-  "array.push",
-  "array.concat",
-  "json.parse",
-  "json.try_parse",
-  "json.stringify",
-  "time.now",
-  "time.unix",
-  "time.millis",
-];
 
 export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(diagnosticCollection, output);
@@ -427,6 +368,14 @@ class KuCompletionProvider implements vscode.CompletionItemProvider {
     if (isNamedImportContext(document, position)) {
       return exportNameCompletions(document, position);
     }
+    const member = memberAccessContext(linePrefix, position);
+    if (member) {
+      const labels = memberCompletionLabels(member.receiver, member.prefix);
+      if (labels.length > 0) {
+        return labels.map((label) => memberCompletionItem(label, member.receiver, member.range));
+      }
+      return [];
+    }
     if (/@dep\/?$/.test(linePrefix)) {
       return dependencyCompletions(document);
     }
@@ -464,6 +413,21 @@ class KuCompletionProvider implements vscode.CompletionItemProvider {
   }
 }
 
+function memberAccessContext(linePrefix: string, position: vscode.Position) {
+  const match = /\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)?$/.exec(linePrefix);
+  if (!match) {
+    return undefined;
+  }
+  const receiver = match[1];
+  const prefix = match[2] ?? "";
+  const start = position.character - prefix.length;
+  return {
+    receiver,
+    prefix,
+    range: new vscode.Range(position.line, start, position.line, position.character),
+  };
+}
+
 function isImportPathContext(linePrefix: string): boolean {
   return /^\s*import\b.*["'][^"']*$/.test(linePrefix);
 }
@@ -473,7 +437,7 @@ async function importPathCompletions(document: vscode.TextDocument, position: vs
   const current = quoteMatch?.[1] ?? "";
   const replaceRange = importPathReplaceRange(linePrefix, position);
   if (current.startsWith("std.")) {
-    return stdModules.map((module) => importPathItem(module, replaceRange, vscode.CompletionItemKind.Module));
+    return stdImportPathLabels(current).map((module) => importPathItem(module, replaceRange, vscode.CompletionItemKind.Module));
   }
   if (current.startsWith("@")) {
     return dependencyCompletions(document);
@@ -503,6 +467,14 @@ function importPathReplaceRange(linePrefix: string, position: vscode.Position): 
     return undefined;
   }
   return new vscode.Range(position.line, quoteIndex + 1, position.line, position.character);
+}
+
+function memberCompletionItem(label: string, receiver: string, range: vscode.Range) {
+  const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Method);
+  item.insertText = label;
+  item.range = range;
+  item.detail = `${receiver} member`;
+  return item;
 }
 
 function importPathItem(label: string, range: vscode.Range | undefined, kind: vscode.CompletionItemKind) {

@@ -29,7 +29,7 @@
   "categories": ["Programming Languages"],
   "scripts": {
     "compile": "tsc --target ES2020 --module commonjs --lib ES2020 --rootDir src --outDir out --strict --esModuleInterop --skipLibCheck src/language.ts src/imports.ts",
-    "test": "npm run compile && node -e \"for (const f of ['package.json','language-configuration.json','snippets/ku.json','syntaxes/ku.tmLanguage.json','syntaxes/ku-mod.tmLanguage.json']) JSON.parse(require('fs').readFileSync(f,'utf8')); console.log('ku vscode extension ok')\"",
+    "test": "npm run compile && node -e \"for (const f of ['package.json','language-configuration.json','snippets/ku.json','syntaxes/ku.tmLanguage.json','syntaxes/ku-mod.tmLanguage.json']) JSON.parse(require('fs').readFileSync(f,'utf8')); console.log('ku vscode extension json ok')\" && node test-completion-model.js",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {
