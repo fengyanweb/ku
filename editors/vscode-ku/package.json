@@ -121,7 +121,7 @@
     },
     "menus": {
       "editor/context": [
-        { "command": "ku.runCurrentFile", "when": "resourceLangId == ku && ku.hasMain", "group": "navigation@1" }
+        { "command": "ku.runCurrentFile", "when": "editorLangId == ku && ku.hasMain", "group": "navigation@1" }
       ],
       "editor/title": [
         { "command": "ku.runCurrentFile", "when": "resourceLangId == ku", "group": "navigation@1" },
