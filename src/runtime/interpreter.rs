@@ -692,6 +692,11 @@ impl Interpreter {
                 {
                     return Ok(value);
                 }
+                if let Some(value) =
+                    self.eval_http_service_method_call(callee, args, env, depth, expr.span)?
+                {
+                    return Ok(value);
+                }
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
                     values.push(self.eval(arg, env, depth)?);
@@ -1037,6 +1042,107 @@ impl Interpreter {
         }
     }
 
+    fn eval_http_service_method_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<Option<Value>> {
+        let ExprKind::Field { target, name } = &callee.kind else {
+            return Ok(None);
+        };
+        if !matches!(name.as_str(), "get" | "post" | "put" | "del" | "listen") {
+            return Ok(None);
+        }
+        if matches!(&target.kind, ExprKind::Variable(module) if module == "http") {
+            return Ok(None);
+        }
+        let target_value = self.eval(target, env, depth)?;
+        if self.pending_fail.is_some() {
+            return Ok(Some(Value::Null));
+        }
+        if !is_http_service_object(&target_value) {
+            return Ok(None);
+        }
+        if name == "listen" {
+            if args.is_empty() || args.len() > 2 {
+                return Err(KuError::runtime(
+                    format!(
+                        "http service listen expects 1 or 2 arguments but got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            let address = self.eval(&args[0], env, depth)?;
+            if self.pending_fail.is_some() {
+                return Ok(Some(Value::Null));
+            }
+            let Value::String(address) = address else {
+                return Err(KuError::runtime(
+                    format!("type error: expected str but got {}", address.type_name()),
+                    args[0].span,
+                ));
+            };
+            if let Some(config) = args.get(1) {
+                let config = self.eval(config, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Some(Value::Null));
+                }
+                if !matches!(config, Value::Object(_)) {
+                    return Err(KuError::runtime(
+                        format!("type error: expected object but got {}", config.type_name()),
+                        args[1].span,
+                    ));
+                }
+            }
+            return Ok(Some(http_error_result(
+                "server_not_implemented",
+                format!("http service listen({address}) is not implemented yet"),
+            )));
+        }
+        if args.len() != 2 {
+            return Err(KuError::runtime(
+                format!(
+                    "http service {name} expects 2 arguments but got {}",
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        let route_path = self.eval(&args[0], env, depth)?;
+        if self.pending_fail.is_some() {
+            return Ok(Some(Value::Null));
+        }
+        let Value::String(route_path) = route_path else {
+            return Err(KuError::runtime(
+                format!(
+                    "type error: expected str but got {}",
+                    route_path.type_name()
+                ),
+                args[0].span,
+            ));
+        };
+        let handler = self.eval(&args[1], env, depth)?;
+        if self.pending_fail.is_some() {
+            return Ok(Some(Value::Null));
+        }
+        if !matches!(handler, Value::Function { .. }) {
+            return Err(KuError::runtime(
+                format!("http service {name} handler must be a function"),
+                args[1].span,
+            ));
+        }
+        let mut service = target_value;
+        append_http_route(&mut service, name, route_path, handler, span)?;
+        if let Some(root) = assignment_root(target) {
+            env.assign(&root, service.clone(), span)?;
+        }
+        Ok(Some(service))
+    }
+
     fn eval_template(
         &mut self,
         raw: &str,
@@ -1259,6 +1365,54 @@ fn assign_field_value(target: &mut Value, name: &str, value: Value, span: Span) 
             format!("type error: {} has no fields", other.type_name()),
             span,
         )),
+    }
+}
+
+fn is_http_service_object(value: &Value) -> bool {
+    let Value::Object(fields) = value else {
+        return false;
+    };
+    matches!(
+        fields.get("kind"),
+        Some(Value::String(kind)) if kind == "http.service"
+    ) && matches!(fields.get("routes"), Some(Value::Array(_)))
+}
+
+fn append_http_route(
+    service: &mut Value,
+    method: &str,
+    path: String,
+    handler: Value,
+    span: Span,
+) -> KuResult<()> {
+    let Value::Object(fields) = service else {
+        return Err(KuError::runtime("http service must be an object", span));
+    };
+    let Some(Value::Array(routes)) = fields.get_mut("routes") else {
+        return Err(KuError::runtime(
+            "http service routes field must be an array",
+            span,
+        ));
+    };
+    routes.push(Value::Object(HashMap::from([
+        (
+            "method".to_string(),
+            Value::String(method.to_ascii_uppercase()),
+        ),
+        ("path".to_string(), Value::String(path)),
+        ("handler".to_string(), handler),
+    ])));
+    Ok(())
+}
+
+fn http_error_result(code: &str, message: impl Into<String>) -> Value {
+    Value::Result {
+        ok: false,
+        value: Box::new(Value::Object(HashMap::from([
+            ("domain".to_string(), Value::String("http".to_string())),
+            ("code".to_string(), Value::String(code.to_string())),
+            ("message".to_string(), Value::String(message.into())),
+        ]))),
     }
 }
 

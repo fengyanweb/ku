@@ -200,6 +200,17 @@ fn http_service_pattern() -> TypePattern {
         ("max_header_bytes".to_string(), TypePattern::Int),
         ("max_connections".to_string(), TypePattern::Int),
         ("max_concurrency".to_string(), TypePattern::Int),
-        ("routes".to_string(), TypePattern::ArrayAny),
+        (
+            "routes".to_string(),
+            TypePattern::ArrayOf(Box::new(http_route_pattern())),
+        ),
+    ])
+}
+
+fn http_route_pattern() -> TypePattern {
+    TypePattern::ObjectFields(vec![
+        ("method".to_string(), TypePattern::String),
+        ("path".to_string(), TypePattern::String),
+        ("handler".to_string(), TypePattern::Any),
     ])
 }

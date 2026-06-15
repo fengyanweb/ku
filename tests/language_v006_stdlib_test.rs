@@ -292,6 +292,57 @@ fn main() {
 }
 
 #[test]
+fn std_http_service_route_methods_register_routes() {
+    let source = r#"
+import "std.http"
+
+fn main() {
+    app = http.service
+    app.get("/index", (req, res) => {
+        return http.text("ok")
+    })
+    app.post("/pets", (req, res) => {
+        return http.json({ ok: true })
+    })
+    if (array.len(app.routes) != 2) {
+        panic("routes were not registered")
+    }
+    if (app.routes[0].method != "GET") {
+        panic("bad route method")
+    }
+    if (app.routes[0].path != "/index") {
+        panic("bad route path")
+    }
+}
+"#;
+
+    check_source("inline.ku", source).expect("http service routes should check");
+    run_source("inline.ku", source).expect("http service routes should run");
+}
+
+#[test]
+fn std_http_service_listen_reports_clear_not_implemented_result() {
+    let source = r#"
+import "std.http"
+
+fn main() {
+    app = http.service
+    try {
+        app.listen(":8080")?
+        panic("listen should not be implemented yet")
+    } catch (err) {
+        if (err.code != "server_not_implemented") {
+            panic("bad listen error")
+        }
+    }
+}
+"#;
+
+    check_source("inline.ku", source).expect("http service listen should check");
+    run_source("inline.ku", source).expect("http service listen should run");
+}
+
+#[test]
 fn stdlib_type_errors_are_checked_before_run() {
     for source in [
         r#"fn main() { print(string.len(123)) }"#,

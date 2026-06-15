@@ -1226,11 +1226,18 @@ HTTP server/router API 已固定服务配置对象：
 ```ku
 service = http.service
 server = http.server()
+service.get("/index", (req, res) => {
+    return http.text("ok")
+})
+service.post("/pets", (req, res) => {
+    return http.json({ ok: true })
+})
 print(service.max_concurrency)
 print(service.max_body_bytes)
+print(service.routes[0].method)
 ```
 
-默认 server 配置包含 `read_timeout_ms`、`write_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_concurrency` 和预留 `routes`。Ku handler 回调、`service.get/post/put/del`、`listen`、并发调度和共享变量规则还需要运行时 handler ABI 支持；当前文档只承诺配置对象和 API 方向，不把 `listen` 标成可运行语法。
+默认 server 配置包含 `read_timeout_ms`、`write_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_concurrency` 和 `routes`。`service.get/post/put/del(path, handler)` 当前支持注册路由，会把 `{ method, path, handler }` 写入 `service.routes`；`listen(address)?` 仍返回 `Err({ domain:"http", code:"server_not_implemented", message })`，真正并发 HTTP runtime、请求/响应 handler ABI、共享变量规则还没有完成。
 
 ## 13. struct
 

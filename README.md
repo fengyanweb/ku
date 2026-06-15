@@ -215,8 +215,7 @@ native C 后端已有基础 Result ABI 子集，但还不是完整 Error 对象 
 package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
 match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。
-std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.service/http.server 配置与响应 helper。fs 需要 `import "std.fs"` 后使用，并提供 read/write 与 try_read/try_write。
-HTTP server/router 的 API 方向已固定为 service/server 配置对象；Ku handler 回调、listen 并发调度和共享变量规则还需要 runtime handler ABI，当前不承诺可运行 listen。
+std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.service/http.server 配置与响应 helper。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes；listen 仍返回 server_not_implemented，真正并发 HTTP runtime 还未完成。fs 需要 `import "std.fs"` 后使用，并提供 read/write 与 try_read/try_write。
 native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wrapper。
 ```
 

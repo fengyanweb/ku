@@ -725,6 +725,11 @@ impl Checker {
                             callee.span,
                         ))
                     } else {
+                        if let Some(ty) =
+                            self.check_http_service_method_call(callee, args, expr.span)?
+                        {
+                            return Ok(ty);
+                        }
                         let callee_type = self.check_expr(callee)?;
                         if let Type::FunctionValue {
                             params,
@@ -1119,6 +1124,71 @@ impl Checker {
                 )),
             },
         }
+    }
+
+    fn check_http_service_method_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Option<Type>> {
+        let ExprKind::Field { target, name } = &callee.kind else {
+            return Ok(None);
+        };
+        if !matches!(name.as_str(), "get" | "post" | "put" | "del" | "listen") {
+            return Ok(None);
+        }
+        let target_type = self.check_expr(target)?;
+        if !is_http_service_type(&target_type) {
+            return Ok(None);
+        }
+        if name == "listen" {
+            if args.is_empty() || args.len() > 2 {
+                return Err(KuError::runtime(
+                    format!(
+                        "http service listen expects 1 or 2 arguments but got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            let address = self.check_expr(&args[0])?;
+            if !type_matches(&Type::String, &address) {
+                return Err(type_error(args[0].span, &Type::String, &address));
+            }
+            if let Some(config) = args.get(1) {
+                let config_type = self.check_expr(config)?;
+                if !matches!(config_type, Type::Object(_) | Type::Unknown) {
+                    return Err(type_error(
+                        config.span,
+                        &Type::Object(HashMap::new()),
+                        &config_type,
+                    ));
+                }
+            }
+            return Ok(Some(Type::Result(Box::new(Type::Null))));
+        }
+        if args.len() != 2 {
+            return Err(KuError::runtime(
+                format!(
+                    "http service {name} expects 2 arguments but got {}",
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        let path_type = self.check_expr(&args[0])?;
+        if !type_matches(&Type::String, &path_type) {
+            return Err(type_error(args[0].span, &Type::String, &path_type));
+        }
+        let handler_type = self.check_expr(&args[1])?;
+        if !matches!(handler_type, Type::FunctionValue { .. } | Type::Unknown) {
+            return Err(KuError::runtime(
+                format!("http service {name} handler must be a function"),
+                args[1].span,
+            ));
+        }
+        Ok(Some(target_type))
     }
 
     fn check_enum_constructor(
@@ -2231,8 +2301,29 @@ fn http_service_type() -> Type {
         ("max_header_bytes".to_string(), Type::Int),
         ("max_connections".to_string(), Type::Int),
         ("max_concurrency".to_string(), Type::Int),
-        ("routes".to_string(), Type::Array(Box::new(Type::Unknown))),
+        (
+            "routes".to_string(),
+            Type::Array(Box::new(http_route_type())),
+        ),
     ]))
+}
+
+fn http_route_type() -> Type {
+    Type::Object(HashMap::from([
+        ("method".to_string(), Type::String),
+        ("path".to_string(), Type::String),
+        ("handler".to_string(), Type::Unknown),
+    ]))
+}
+
+fn is_http_service_type(ty: &Type) -> bool {
+    let Type::Object(fields) = ty else {
+        return false;
+    };
+    matches!(fields.get("kind"), Some(Type::String))
+        && fields.contains_key("routes")
+        && fields.contains_key("max_concurrency")
+        && fields.contains_key("max_body_bytes")
 }
 
 struct TemplateInterpolation {
