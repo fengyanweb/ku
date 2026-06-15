@@ -256,6 +256,42 @@ fn main(): null! {{
 }
 
 #[test]
+fn std_http_helpers_and_default_service_are_checked_and_runtime_safe() {
+    let source = r#"
+import "std.http"
+
+fn main() {
+    text = http.text("hello")
+    if (text.status != 200) {
+        panic("bad text status")
+    }
+    if (text.body != "hello") {
+        panic("bad text body")
+    }
+    json_res = http.json({ ok: true, count: 2 })
+    if (json_res.headers["content-type"] != "application/json") {
+        panic("bad json content type")
+    }
+    client = http.client()
+    if (client.kind != "http.client") {
+        panic("bad client")
+    }
+    service = http.service
+    if (service.kind != "http.service") {
+        panic("bad service")
+    }
+    server = http.server()
+    if (server.max_concurrency <= 0) {
+        panic("bad server limits")
+    }
+}
+"#;
+
+    check_source("inline.ku", source).expect("http helpers should check");
+    run_source("inline.ku", source).expect("http helpers should run");
+}
+
+#[test]
 fn stdlib_type_errors_are_checked_before_run() {
     for source in [
         r#"fn main() { print(string.len(123)) }"#,

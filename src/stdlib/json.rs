@@ -35,15 +35,19 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
         }
         "stringify" => {
             expect_arg_count("json.stringify", args.len(), 1, span)?;
-            let mut output = String::new();
-            write_json(&args[0], &mut output, 0, span)?;
-            if output.len() > MAX_JSON_OUTPUT_BYTES {
-                return Err(KuError::runtime("json.stringify output is too large", span));
-            }
-            Ok(Some(Value::String(output)))
+            Ok(Some(Value::String(stringify_value(&args[0], span)?)))
         }
         _ => Ok(None),
     }
+}
+
+pub fn stringify_value(value: &Value, span: Span) -> KuResult<String> {
+    let mut output = String::new();
+    write_json(value, &mut output, 0, span)?;
+    if output.len() > MAX_JSON_OUTPUT_BYTES {
+        return Err(KuError::runtime("json.stringify output is too large", span));
+    }
+    Ok(output)
 }
 
 fn parse_json(text: &str, span: Span) -> KuResult<Value> {

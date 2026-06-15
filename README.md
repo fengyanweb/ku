@@ -215,7 +215,8 @@ native C 后端已有基础 Result ABI 子集，但还不是完整 Error 对象 
 package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
 match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。
-std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象。fs 需要 `import "std.fs"` 后使用，并提供 read/write 与 try_read/try_write。
+std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.service/http.server 配置与响应 helper。fs 需要 `import "std.fs"` 后使用，并提供 read/write 与 try_read/try_write。
+HTTP server/router 的 API 方向已固定为 service/server 配置对象；Ku handler 回调、listen 并发调度和共享变量规则还需要 runtime handler ABI，当前不承诺可运行 listen。
 native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wrapper。
 ```
 
@@ -249,6 +250,7 @@ ku.mod / ku.lock 高亮
 解释器查找：优先使用 PATH 里的 ku，找不到再回退到工作区 release/target
 状态栏解释器版本检查
 Hover、补全、定义跳转、Outline、Quick Fix、基础格式化
+Ku 文件默认保存时格式化；import path 补全会替换引号内路径，避免 `std.std.fs`
 ```
 
 图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择：

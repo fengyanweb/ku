@@ -1,9 +1,12 @@
-use std::{collections::HashMap, io::Read, time::Duration};
+use std::{collections::HashMap, io::Read, sync::OnceLock, time::Duration};
 
 use crate::{
     error::{KuError, KuResult},
     span::Span,
-    stdlib::core::{expect_arg_count, expected_type},
+    stdlib::{
+        core::{expect_arg_count, expected_type},
+        json,
+    },
     value::Value,
 };
 
@@ -11,6 +14,11 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const MIN_TIMEOUT_MS: u64 = 1;
 const MAX_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_BODY_BYTES: usize = 1_000_000;
+const DEFAULT_MAX_HEADER_BYTES: i64 = 16 * 1024;
+const DEFAULT_MAX_CONNECTIONS: i64 = 1024;
+const DEFAULT_MAX_CONCURRENCY: i64 = 256;
+
+static DEFAULT_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
     match function {
@@ -50,8 +58,70 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
             let request = request_from_value(&args[0], span)?;
             Ok(Some(result_from_http(http_request(request))))
         }
+        "client" => {
+            if args.len() > 1 {
+                return Err(KuError::runtime(
+                    format!(
+                        "http.client expects 0 or 1 arguments but got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            let config = args.first();
+            Ok(Some(client_value(config, span)?))
+        }
+        "text" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(KuError::runtime(
+                    format!("http.text expects 1 or 2 arguments but got {}", args.len()),
+                    span,
+                ));
+            }
+            let Value::String(body) = &args[0] else {
+                return Err(expected_type("str", &args[0], span));
+            };
+            let status = optional_status(args.get(1), span)?;
+            Ok(Some(response_helper_value(
+                status,
+                "text/plain; charset=utf-8",
+                body.clone(),
+            )))
+        }
+        "json" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(KuError::runtime(
+                    format!("http.json expects 1 or 2 arguments but got {}", args.len()),
+                    span,
+                ));
+            }
+            let status = optional_status(args.get(1), span)?;
+            let body = json::stringify_value(&args[0], span)?;
+            Ok(Some(response_helper_value(
+                status,
+                "application/json",
+                body,
+            )))
+        }
+        "service" | "server" => {
+            if args.len() > 1 {
+                return Err(KuError::runtime(
+                    format!(
+                        "http.{function} expects 0 or 1 arguments but got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            let config = args.first();
+            Ok(Some(server_config_value(config, span)?))
+        }
         _ => Ok(None),
     }
+}
+
+pub fn default_server_value(span: Span) -> KuResult<Value> {
+    server_config_value(None, span)
 }
 
 #[derive(Debug)]
@@ -92,8 +162,9 @@ fn http_request(config: HttpRequest) -> Result<HttpResponse, HttpError> {
         ));
     }
 
-    let mut request =
-        ureq::request(&method, &config.url).timeout(Duration::from_millis(config.timeout_ms));
+    let mut request = default_agent()
+        .request(&method, &config.url)
+        .timeout(Duration::from_millis(config.timeout_ms));
     for (name, value) in &config.headers {
         request = request.set(name, value);
     }
@@ -112,6 +183,16 @@ fn http_request(config: HttpRequest) -> Result<HttpResponse, HttpError> {
         }
     };
     response_to_value(response, config.max_body_bytes)
+}
+
+fn default_agent() -> &'static ureq::Agent {
+    DEFAULT_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(DEFAULT_TIMEOUT_MS))
+            .timeout_read(Duration::from_millis(DEFAULT_TIMEOUT_MS))
+            .timeout_write(Duration::from_millis(DEFAULT_TIMEOUT_MS))
+            .build()
+    })
 }
 
 fn response_to_value(
@@ -281,6 +362,89 @@ fn result_from_http(response: Result<HttpResponse, HttpError>) -> Value {
         Ok(response) => ok_value(response_value(response)),
         Err(error) => err_value(error_value("http", &error.code, &error.message)),
     }
+}
+
+fn optional_status(value: Option<&Value>, span: Span) -> KuResult<i64> {
+    match value {
+        Some(Value::Int(status)) if (100..=599).contains(status) => Ok(*status),
+        Some(Value::Int(_)) => Err(KuError::runtime(
+            "http status must be between 100 and 599",
+            span,
+        )),
+        Some(other) => Err(expected_type("int", other, span)),
+        None => Ok(200),
+    }
+}
+
+fn response_helper_value(status: i64, content_type: &str, body: String) -> Value {
+    Value::Object(HashMap::from([
+        ("status".to_string(), Value::Int(status)),
+        (
+            "headers".to_string(),
+            Value::Object(HashMap::from([(
+                "content-type".to_string(),
+                Value::String(content_type.to_string()),
+            )])),
+        ),
+        ("body".to_string(), Value::String(body)),
+    ]))
+}
+
+fn client_value(config: Option<&Value>, span: Span) -> KuResult<Value> {
+    let mut timeout_ms = DEFAULT_TIMEOUT_MS as i64;
+    let mut max_body_bytes = DEFAULT_MAX_BODY_BYTES as i64;
+    let mut max_idle_connections = 128_i64;
+    if let Some(config) = config {
+        let Value::Object(fields) = config else {
+            return Err(expected_type("object", config, span));
+        };
+        timeout_ms = optional_int(fields, "timeout_ms", timeout_ms, span)?;
+        max_body_bytes = optional_int(fields, "max_body_bytes", max_body_bytes, span)?;
+        max_idle_connections =
+            optional_int(fields, "max_idle_connections", max_idle_connections, span)?;
+    }
+    Ok(Value::Object(HashMap::from([
+        ("kind".to_string(), Value::String("http.client".to_string())),
+        ("timeout_ms".to_string(), Value::Int(timeout_ms)),
+        ("max_body_bytes".to_string(), Value::Int(max_body_bytes)),
+        (
+            "max_idle_connections".to_string(),
+            Value::Int(max_idle_connections),
+        ),
+    ])))
+}
+
+fn server_config_value(config: Option<&Value>, span: Span) -> KuResult<Value> {
+    let mut read_timeout_ms = DEFAULT_TIMEOUT_MS as i64;
+    let mut write_timeout_ms = DEFAULT_TIMEOUT_MS as i64;
+    let mut max_body_bytes = DEFAULT_MAX_BODY_BYTES as i64;
+    let mut max_header_bytes = DEFAULT_MAX_HEADER_BYTES;
+    let mut max_connections = DEFAULT_MAX_CONNECTIONS;
+    let mut max_concurrency = DEFAULT_MAX_CONCURRENCY;
+    if let Some(config) = config {
+        let Value::Object(fields) = config else {
+            return Err(expected_type("object", config, span));
+        };
+        read_timeout_ms = optional_int(fields, "read_timeout_ms", read_timeout_ms, span)?;
+        write_timeout_ms = optional_int(fields, "write_timeout_ms", write_timeout_ms, span)?;
+        max_body_bytes = optional_int(fields, "max_body_bytes", max_body_bytes, span)?;
+        max_header_bytes = optional_int(fields, "max_header_bytes", max_header_bytes, span)?;
+        max_connections = optional_int(fields, "max_connections", max_connections, span)?;
+        max_concurrency = optional_int(fields, "max_concurrency", max_concurrency, span)?;
+    }
+    Ok(Value::Object(HashMap::from([
+        (
+            "kind".to_string(),
+            Value::String("http.service".to_string()),
+        ),
+        ("read_timeout_ms".to_string(), Value::Int(read_timeout_ms)),
+        ("write_timeout_ms".to_string(), Value::Int(write_timeout_ms)),
+        ("max_body_bytes".to_string(), Value::Int(max_body_bytes)),
+        ("max_header_bytes".to_string(), Value::Int(max_header_bytes)),
+        ("max_connections".to_string(), Value::Int(max_connections)),
+        ("max_concurrency".to_string(), Value::Int(max_concurrency)),
+        ("routes".to_string(), Value::Array(Vec::new())),
+    ])))
 }
 
 fn response_value(response: HttpResponse) -> Value {

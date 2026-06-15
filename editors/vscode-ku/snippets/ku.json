@@ -54,6 +54,30 @@
     "body": ["res = http.get(${1:\"https://example.com\"})?", "print(res.status)", "print(res.body)"],
     "description": "HTTP GET response"
   },
+  "http client": {
+    "prefix": "http.client",
+    "body": ["client = http.client({ timeout_ms: ${1:5000}, max_body_bytes: ${2:1000000}, max_idle_connections: ${3:128} })"],
+    "description": "HTTP client config"
+  },
+  "http response text": {
+    "prefix": "http.text",
+    "body": ["return http.text(${1:\"ok\"})"],
+    "description": "HTTP text response helper"
+  },
+  "http response json": {
+    "prefix": "http.json",
+    "body": ["return http.json({ ${1:ok}: true })"],
+    "description": "HTTP JSON response helper"
+  },
+  "http service": {
+    "prefix": "http.service",
+    "body": [
+      "service = http.service",
+      "print(service.max_concurrency)",
+      "print(service.max_body_bytes)"
+    ],
+    "description": "HTTP service default limits"
+  },
   "array map": {
     "prefix": "map",
     "body": ["${1:result} = ${2:nums}.map(${3:x} => ${3:x} * 2)"],

@@ -790,6 +790,13 @@ impl Checker {
                 }
                 ExprKind::Field { target, name } => {
                     if let ExprKind::Variable(module) = &target.kind {
+                        if module == "http"
+                            && !self.contains("http")
+                            && self.std_modules.contains("http")
+                            && matches!(name.as_str(), "service" | "server")
+                        {
+                            return Ok(http_service_type());
+                        }
                         if let Some(enum_type) = self.enums.get(module) {
                             if let Some(payload) = enum_type.variants.get(name) {
                                 if !payload.is_empty() {
@@ -2213,6 +2220,19 @@ fn dotted_name(expr: &Expr) -> Option<(String, String)> {
         return None;
     };
     Some((module.clone(), name.clone()))
+}
+
+fn http_service_type() -> Type {
+    Type::Object(HashMap::from([
+        ("kind".to_string(), Type::String),
+        ("read_timeout_ms".to_string(), Type::Int),
+        ("write_timeout_ms".to_string(), Type::Int),
+        ("max_body_bytes".to_string(), Type::Int),
+        ("max_header_bytes".to_string(), Type::Int),
+        ("max_connections".to_string(), Type::Int),
+        ("max_concurrency".to_string(), Type::Int),
+        ("routes".to_string(), Type::Array(Box::new(Type::Unknown))),
+    ]))
 }
 
 struct TemplateInterpolation {

@@ -1188,6 +1188,11 @@ import http from "std.http"
 http.get(url:str): HttpResponse!
 http.post(url:str, body:str): HttpResponse!
 http.request(config:object): HttpResponse!
+http.client(): object
+http.text(body:str): HttpResponse
+http.json(value:any): HttpResponse
+http.service: object
+http.server(): object
 ```
 
 `HttpResponse` 当前用对象表示：
@@ -1199,6 +1204,33 @@ print(res.body)
 ```
 
 `http.request` 支持 `{ method, url, headers, body, timeout_ms, max_body_bytes }`。网络、协议、URL 和 body 限制错误返回结构化 `Err({ domain, code, message })`；HTTP 非 2xx 状态仍返回 `Ok(HttpResponse)`，由调用者检查 `res.status`。
+
+HTTP client 使用全局默认 client/agent，底层复用连接；`http.get` / `http.post` / `http.request` 是默认 client 的快捷方式。默认限制：
+
+```txt
+timeout_ms: 5000
+max_body_bytes: 1000000
+```
+
+`http.client()` 返回 client 配置对象，适合后续扩展 cookie、默认 header、代理、认证 token、重试策略和连接池参数。当前 `http.get/post/request` 仍使用默认全局 client。
+
+响应 helper：
+
+```ku
+return http.text("ok")
+return http.json({ ok: true })
+```
+
+HTTP server/router API 已固定服务配置对象：
+
+```ku
+service = http.service
+server = http.server()
+print(service.max_concurrency)
+print(service.max_body_bytes)
+```
+
+默认 server 配置包含 `read_timeout_ms`、`write_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_concurrency` 和预留 `routes`。Ku handler 回调、`service.get/post/put/del`、`listen`、并发调度和共享变量规则还需要运行时 handler ABI 支持；当前文档只承诺配置对象和 API 方向，不把 `listen` 标成可运行语法。
 
 ## 13. struct
 

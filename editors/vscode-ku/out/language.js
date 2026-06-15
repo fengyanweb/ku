@@ -84,6 +84,11 @@ const stdFunctions = [
     "http.get",
     "http.post",
     "http.request",
+    "http.client",
+    "http.text",
+    "http.json",
+    "http.service",
+    "http.server",
     "string.len",
     "string.trim",
     "string.lower",
@@ -391,7 +396,7 @@ class KuCompletionProvider {
         const linePrefix = document.lineAt(position).text.slice(0, position.character);
         const items = [];
         if (isImportPathContext(linePrefix)) {
-            return await importPathCompletions(document, linePrefix);
+            return await importPathCompletions(document, position, linePrefix);
         }
         if (isNamedImportContext(document, position)) {
             return exportNameCompletions(document, position);
@@ -434,11 +439,12 @@ class KuCompletionProvider {
 function isImportPathContext(linePrefix) {
     return /^\s*import\b.*["'][^"']*$/.test(linePrefix);
 }
-async function importPathCompletions(document, linePrefix) {
+async function importPathCompletions(document, position, linePrefix) {
     const quoteMatch = /["']([^"']*)$/.exec(linePrefix);
     const current = quoteMatch?.[1] ?? "";
+    const replaceRange = importPathReplaceRange(linePrefix, position);
     if (current.startsWith("std.")) {
-        return stdModules.map((module) => new vscode.CompletionItem(module, vscode.CompletionItemKind.Module));
+        return stdModules.map((module) => importPathItem(module, replaceRange, vscode.CompletionItemKind.Module));
     }
     if (current.startsWith("@")) {
         return dependencyCompletions(document);
@@ -454,11 +460,25 @@ async function importPathCompletions(document, linePrefix) {
         .filter((entry) => entry.isDirectory() || entry.name.endsWith(".ku"))
         .map((entry) => {
         const item = new vscode.CompletionItem(entry.name.replace(/\.ku$/, ""), entry.isDirectory() ? vscode.CompletionItemKind.Folder : vscode.CompletionItemKind.File);
+        item.range = replaceRange;
         if (entry.isDirectory()) {
             item.insertText = `${entry.name}/`;
         }
         return item;
     });
+}
+function importPathReplaceRange(linePrefix, position) {
+    const quoteIndex = Math.max(linePrefix.lastIndexOf("\""), linePrefix.lastIndexOf("'"));
+    if (quoteIndex < 0) {
+        return undefined;
+    }
+    return new vscode.Range(position.line, quoteIndex + 1, position.line, position.character);
+}
+function importPathItem(label, range, kind) {
+    const item = new vscode.CompletionItem(label, kind);
+    item.insertText = label;
+    item.range = range;
+    return item;
 }
 function dependencyCompletions(document) {
     const deps = readKuModDependencies(document);
@@ -512,6 +532,8 @@ class KuHoverProvider {
             "err": "`err(message)` 返回 `Unknown!`，失败 payload 是 `{ domain, code, message }`。",
             "fail": "`fail` 主动返回可恢复错误；字符串会包装为 `{ domain: \"ku\", code: \"fail\", message }`。",
             "http": "`import \"std.http\"` 后使用。`http.get/post/request` 返回 `{ status, headers, body }!`。",
+            "service": "`http.service` 返回带默认资源限制的 HTTP service 配置对象；完整 Ku handler listen 仍需要 runtime handler ABI。",
+            "server": "`http.server()` 返回带默认 timeout/body/header/concurrency 限制的 server 配置对象。",
             "fs": "`import \"std.fs\"` 后使用。支持 `fs.read/write/try_read/try_write`。",
             "match": "Ku 0.0.12 保留 `match`，不再支持 `switch`。",
             "try_get": "`values.try_get(index)?` 越界时返回结构化 Error。",
@@ -665,15 +687,49 @@ function formatKu(source) {
             out.push("");
             continue;
         }
-        if (/^[}\])]/.test(trimmed)) {
+        if (/^}/.test(trimmed)) {
             indent = Math.max(0, indent - 1);
         }
         out.push(`${"    ".repeat(indent)}${trimmed}`);
-        const opens = (trimmed.match(/[{\[(]/g) ?? []).length;
-        const closes = (trimmed.match(/[}\])]/g) ?? []).length;
-        indent = Math.max(0, indent + opens - closes);
+        const balance = braceBalanceOutsideTrivia(trimmed);
+        indent = Math.max(0, indent + balance.opens - balance.closes);
     }
     return out.join("\n");
+}
+function braceBalanceOutsideTrivia(line) {
+    let opens = 0;
+    let closes = 0;
+    let quote;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        const next = line[i + 1];
+        if (!quote && ch === "/" && next === "/") {
+            break;
+        }
+        if (quote) {
+            if (ch === "\\") {
+                i++;
+            }
+            else if (ch === quote) {
+                quote = undefined;
+            }
+            continue;
+        }
+        if (ch === "\"" || ch === "'" || ch === "`") {
+            quote = ch;
+            continue;
+        }
+        if (ch === "{") {
+            opens++;
+        }
+        else if (ch === "}") {
+            closes++;
+        }
+    }
+    if (/^}/.test(line)) {
+        closes = Math.max(0, closes - 1);
+    }
+    return { opens, closes };
 }
 function readKuModDependencies(document) {
     const root = workspaceFolder(document.uri);

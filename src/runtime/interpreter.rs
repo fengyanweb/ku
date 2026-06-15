@@ -836,6 +836,13 @@ impl Interpreter {
             }
             ExprKind::Field { target, name } => {
                 if let ExprKind::Variable(enum_name) = &target.kind {
+                    if enum_name == "http"
+                        && !env.contains("http")
+                        && self.std_modules.contains("http")
+                        && matches!(name.as_str(), "service" | "server")
+                    {
+                        return Ok(stdlib::http::default_server_value(expr.span)?);
+                    }
                     if self
                         .enums
                         .get(enum_name)

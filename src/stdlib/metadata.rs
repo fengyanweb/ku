@@ -94,6 +94,9 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("http", "get") => vec![str_arg()],
         ("http", "post") => vec![str_arg(), str_arg()],
         ("http", "request") => vec![ArgRule::Is(TypePattern::ObjectAny)],
+        ("http", "client" | "service" | "server") => vec![],
+        ("http", "text") => vec![str_arg()],
+        ("http", "json") => vec![ArgRule::Is(TypePattern::Any)],
         _ => return None,
     };
     let returns = match (module, function) {
@@ -119,6 +122,9 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("http", "get" | "post" | "request") => {
             TypePattern::ResultOf(Box::new(http_response_pattern()))
         }
+        ("http", "client") => http_client_pattern(),
+        ("http", "service" | "server") => http_service_pattern(),
+        ("http", "text" | "json") => http_response_pattern(),
         _ => return None,
     };
     Some(Signature {
@@ -173,5 +179,27 @@ fn http_response_pattern() -> TypePattern {
         ("status".to_string(), TypePattern::Int),
         ("headers".to_string(), TypePattern::ObjectAny),
         ("body".to_string(), TypePattern::String),
+    ])
+}
+
+fn http_client_pattern() -> TypePattern {
+    TypePattern::ObjectFields(vec![
+        ("kind".to_string(), TypePattern::String),
+        ("timeout_ms".to_string(), TypePattern::Int),
+        ("max_body_bytes".to_string(), TypePattern::Int),
+        ("max_idle_connections".to_string(), TypePattern::Int),
+    ])
+}
+
+fn http_service_pattern() -> TypePattern {
+    TypePattern::ObjectFields(vec![
+        ("kind".to_string(), TypePattern::String),
+        ("read_timeout_ms".to_string(), TypePattern::Int),
+        ("write_timeout_ms".to_string(), TypePattern::Int),
+        ("max_body_bytes".to_string(), TypePattern::Int),
+        ("max_header_bytes".to_string(), TypePattern::Int),
+        ("max_connections".to_string(), TypePattern::Int),
+        ("max_concurrency".to_string(), TypePattern::Int),
+        ("routes".to_string(), TypePattern::ArrayAny),
     ])
 }
