@@ -236,3 +236,11 @@ cargo test --no-fail-fast
 cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
+
+更新本地解释器和历史版本快照：
+
+```powershell
+.\scripts\archive-release.ps1
+```
+
+该脚本会把 `target\release\ku.exe` / `libku.rlib` 同步到 `release\`，并归档到 `history\v当前版本\`。详细规则见 [版本和解释器历史](docs/history.md)。

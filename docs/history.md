@@ -49,16 +49,38 @@ history/
 
 ## 自动化
 
-发布时在项目根目录运行：
+发布或本地更新解释器时，在项目根目录运行：
 
 ```powershell
 .\scripts\archive-release.ps1
 ```
 
+脚本会自动执行：
+
+```powershell
+cargo build --release
+Copy-Item -LiteralPath target\release\ku.exe -Destination release\ku.exe -Force
+Copy-Item -LiteralPath target\release\libku.rlib -Destination release\libku.rlib -Force
+Copy-Item -LiteralPath target\release\ku.exe -Destination history\v$version\ku.exe -Force
+Copy-Item -LiteralPath target\release\libku.rlib -Destination history\v$version\libku.rlib -Force
+```
+
+其中 `$version` 来自 `Cargo.toml` 的 `package.version`，例如当前版本会写入 `history\v0.0.12\`。
+
 只检查产物和版本路径：
 
 ```powershell
 .\scripts\archive-release.ps1 -CheckOnly -SkipBuild
+```
+
+如果只想手动更新当前本地解释器，可以运行：
+
+```powershell
+cargo build --release
+Copy-Item -LiteralPath target\release\ku.exe -Destination release\ku.exe -Force
+Copy-Item -LiteralPath target\release\libku.rlib -Destination release\libku.rlib -Force
+Copy-Item -LiteralPath target\release\ku.exe -Destination history\v0.0.12\ku.exe -Force
+Copy-Item -LiteralPath target\release\libku.rlib -Destination history\v0.0.12\libku.rlib -Force
 ```
 
 ## 规则
