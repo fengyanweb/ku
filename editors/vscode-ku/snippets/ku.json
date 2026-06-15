@@ -9,6 +9,11 @@
     "body": ["fn ${1:name}(${2:arg}:${3:int})${4:: int} {", "    $0", "}"],
     "description": "Ku function"
   },
+  "generic function": {
+    "prefix": "fng",
+    "body": ["fn ${1:id}<${2:T}>(${3:value}:${2:T}): ${2:T} {", "    return ${3:value}", "}"],
+    "description": "Ku generic function"
+  },
   "struct": {
     "prefix": "struct",
     "body": ["struct ${1:Name} {", "    ${2:field}: ${3:str}", "}"],
@@ -29,6 +34,11 @@
     "body": ["try {", "    ${1:value} = ${2:work}()?", "} catch (${3:err}) {", "    $0", "} finally {", "    ${4:println(\"done\")}", "}"],
     "description": "Ku try/catch/finally"
   },
+  "catch error message": {
+    "prefix": "err.message",
+    "body": ["${1:message} = ${2:err}.message"],
+    "description": "Use structured Ku Error message"
+  },
   "import std.fs": {
     "prefix": "std.fs",
     "body": ["import \"std.fs\""],
@@ -48,5 +58,15 @@
     "prefix": "map",
     "body": ["${1:result} = ${2:nums}.map(${3:x} => ${3:x} * 2)"],
     "description": "Array map"
+  },
+  "string method": {
+    "prefix": "str.trim",
+    "body": ["${1:text}.trim()"],
+    "description": "String instance method"
+  },
+  "array try_get": {
+    "prefix": "try_get",
+    "body": ["${1:value} = ${2:values}.try_get(${3:0})?"],
+    "description": "Array safe index with Result"
   }
 }

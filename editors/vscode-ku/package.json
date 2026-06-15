@@ -4,6 +4,12 @@
   "description": "Syntax highlighting and snippets for Ku",
   "version": "0.0.12",
   "publisher": "ku-lang",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fengyanweb/ku.git",
+    "directory": "editors/vscode-ku"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
