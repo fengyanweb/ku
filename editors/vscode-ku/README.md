@@ -16,7 +16,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 - Completion for keywords, base types, builtins, stdlib modules/functions, Error fields, HttpResponse fields, string/array methods, import paths, and package dependency prefixes.
 - Go to definition for local functions/types, imported files, and exported imported symbols.
 - Outline symbols for module, function, struct, enum, and local functions.
-- CodeLens on functions: Run file, Check file, IR Show.
+- CodeLens above `fn main`: a single `▶ Run` button.
 - Quick Fixes for missing `std.http` / `std.fs`, `let`, and `switch`.
 - Built-in formatter for basic indentation.
 

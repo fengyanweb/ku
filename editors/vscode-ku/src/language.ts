@@ -237,7 +237,7 @@ async function runKuCommand(command: "run" | "ir" | "build" | "package gc") {
   }
   const terminal = vscode.window.createTerminal({ name: `Ku ${command}` });
   terminal.show();
-  terminal.sendText(`"${exe}" ${command} "${editor.document.uri.fsPath}"`);
+  terminal.sendText(terminalCommand(exe, [...command.split(" "), editor.document.uri.fsPath]));
 }
 
 async function buildNativeC() {
@@ -263,7 +263,7 @@ async function buildNativeC() {
   }
   const terminal = vscode.window.createTerminal({ name: "Ku Native C" });
   terminal.show();
-  terminal.sendText(`"${exe}" build --native "${editor.document.uri.fsPath}"`);
+  terminal.sendText(terminalCommand(exe, ["build", "--native", editor.document.uri.fsPath]));
 }
 
 function detectNativeUnsupported(source: string): string[] {
@@ -349,6 +349,18 @@ function execFile(file: string, args: string[], cwd?: string, timeoutMs = 15000)
       resolve({ code, stdout: stdout.toString(), stderr: stderr.toString() });
     });
   });
+}
+
+function terminalCommand(exe: string, args: string[]): string {
+  const quoted = [exe, ...args].map(shellQuote).join(" ");
+  return process.platform === "win32" ? `& ${quoted}` : quoted;
+}
+
+function shellQuote(value: string): string {
+  if (process.platform === "win32") {
+    return `"${value.replace(/"/g, '`"')}"`;
+  }
+  return `"${value.replace(/(["\\$`])/g, "\\$1")}"`;
 }
 
 class KuCompletionProvider implements vscode.CompletionItemProvider {
@@ -593,13 +605,11 @@ class KuCodeLensProvider implements vscode.CodeLensProvider {
   provideCodeLenses(document: vscode.TextDocument) {
     const lenses: vscode.CodeLens[] = [];
     for (let line = 0; line < document.lineCount; line++) {
-      if (!/^\s*fn\s+/.test(document.lineAt(line).text)) {
+      if (!/^\s*fn\s+main\s*\(/.test(document.lineAt(line).text)) {
         continue;
       }
       const range = new vscode.Range(line, 0, line, 0);
-      lenses.push(new vscode.CodeLens(range, { title: "▶ Run file", command: "ku.runCurrentFile" }));
-      lenses.push(new vscode.CodeLens(range, { title: "✓ Check file", command: "ku.checkCurrentFile" }));
-      lenses.push(new vscode.CodeLens(range, { title: "IR Show", command: "ku.showIr" }));
+      lenses.push(new vscode.CodeLens(range, { title: "▶ Run", command: "ku.runCurrentFile" }));
     }
     return lenses;
   }
