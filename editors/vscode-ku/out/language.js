@@ -243,14 +243,19 @@ async function runKuCommand(command) {
         void vscode.window.showWarningMessage("当前文件不是 Ku 源文件。");
         return;
     }
+    if (command === "run" && !documentHasMain(editor.document)) {
+        void vscode.window.showWarningMessage("当前 Ku 文件没有 fn main()，不能运行。");
+        return;
+    }
     await editor.document.save();
     const exe = await findKuExecutable(editor.document.uri);
     if (!exe) {
         return;
     }
-    const terminal = vscode.window.createTerminal({ name: `Ku ${command}` });
+    const cwd = terminalCwd(editor.document.uri);
+    const terminal = vscode.window.createTerminal({ name: `Ku ${command}`, cwd });
     terminal.show();
-    terminal.sendText(terminalCommand(exe, [...command.split(" "), editor.document.uri.fsPath]));
+    terminal.sendText(terminalCommand(exe, [...command.split(" "), editor.document.uri.fsPath], cwd));
 }
 async function buildNativeC() {
     const editor = vscode.window.activeTextEditor;
@@ -269,9 +274,10 @@ async function buildNativeC() {
     if (!exe) {
         return;
     }
-    const terminal = vscode.window.createTerminal({ name: "Ku Native C" });
+    const cwd = terminalCwd(editor.document.uri);
+    const terminal = vscode.window.createTerminal({ name: "Ku Native C", cwd });
     terminal.show();
-    terminal.sendText(terminalCommand(exe, ["build", "--native", editor.document.uri.fsPath]));
+    terminal.sendText(terminalCommand(exe, ["build", "--native", editor.document.uri.fsPath], cwd));
 }
 function detectNativeUnsupported(source) {
     const checks = [
@@ -338,6 +344,9 @@ function workspaceFolder(uri) {
     const folder = uri ? vscode.workspace.getWorkspaceFolder(uri) : vscode.workspace.workspaceFolders?.[0];
     return folder?.uri.fsPath;
 }
+function terminalCwd(uri) {
+    return workspaceFolder(uri) ?? path.dirname(uri.fsPath);
+}
 function execFile(file, args, cwd, timeoutMs = 15000) {
     return new Promise((resolve) => {
         cp.execFile(file, args, { cwd, timeout: timeoutMs, windowsHide: true }, (error, stdout, stderr) => {
@@ -346,15 +355,29 @@ function execFile(file, args, cwd, timeoutMs = 15000) {
         });
     });
 }
-function terminalCommand(exe, args) {
-    const quoted = [exe, ...args].map(shellQuote).join(" ");
+function terminalCommand(exe, args, cwd) {
+    const quoted = [shortPath(exe, cwd), ...args.map((arg) => shortPath(arg, cwd))].map(shellQuote).join(" ");
     return process.platform === "win32" ? `& ${quoted}` : quoted;
 }
 function shellQuote(value) {
+    if (/^[A-Za-z0-9_./\\:-]+$/.test(value)) {
+        return value;
+    }
     if (process.platform === "win32") {
         return `"${value.replace(/"/g, '`"')}"`;
     }
     return `"${value.replace(/(["\\$`])/g, "\\$1")}"`;
+}
+function shortPath(value, cwd) {
+    if (!path.isAbsolute(value)) {
+        return value;
+    }
+    const relative = path.relative(cwd, value);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+        return value;
+    }
+    const normalized = relative.replace(/\//g, "\\");
+    return normalized.startsWith(".") ? normalized : `.${path.sep}${normalized}`;
 }
 class KuCompletionProvider {
     async provideCompletionItems(document, position) {

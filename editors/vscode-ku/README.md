@@ -10,7 +10,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 - Snippets for `main`, functions, generic functions, struct, enum, match, try/catch/finally, `std.fs`, `std.http`, HTTP response usage, array map, string methods, and `array.try_get`.
 - `ku check` diagnostics on open/save, shown in Problems with red squiggles.
 - Command Palette commands: Run, Check, Show IR, Build, Build Native C, Package GC, Show Version.
-- Right-click menu `Ku Run` for `.ku` files that define `fn main()`.
+- Right-click menu `Ku Run` for `.ku` files; if the file does not define `fn main()`, the command shows a clear warning instead of disappearing.
 - Editor title buttons for Run, Check, IR, and Build.
 - Status bar version check for interpreter/plugin mismatch.
 - Hover docs for Error, Result, std.fs, std.http, match, string and array helpers.

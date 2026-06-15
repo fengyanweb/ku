@@ -245,7 +245,7 @@ ku.mod / ku.lock 高亮
 保存/打开时运行 ku check，并把错误放进 Problems 面板
 命令面板：Run / Check / Show IR / Build / Build Native C / Package GC / Show Version
 编辑器右上角 Run / Check / IR / Build 按钮
-右键菜单：当前 .ku 文件存在 fn main() 时显示 Ku Run
+右键菜单：.ku 文件显示 Ku Run；没有 fn main() 时点击会提示
 状态栏解释器版本检查
 Hover、补全、定义跳转、Outline、Quick Fix、基础格式化
 ```
