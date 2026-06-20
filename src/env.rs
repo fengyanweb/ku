@@ -1,5 +1,7 @@
-﻿use std::collections::HashMap;
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
 
 use crate::error::{KuError, KuResult};
 use crate::span::Span;
@@ -9,9 +11,10 @@ use crate::value::Value;
 pub struct Binding {
     pub value: Value,
     pub mutable: bool,
+    owner_task_id: i64,
 }
 
-pub(crate) type BindingCell = Rc<RefCell<Binding>>;
+pub(crate) type BindingCell = Arc<Mutex<Binding>>;
 
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -52,7 +55,14 @@ impl Env {
                 span,
             ));
         }
-        scope.insert(name, Rc::new(RefCell::new(Binding { value, mutable })));
+        scope.insert(
+            name,
+            Arc::new(Mutex::new(Binding {
+                value,
+                mutable,
+                owner_task_id: crate::runtime::task::current_task_id(),
+            })),
+        );
         Ok(())
     }
 
@@ -80,10 +90,19 @@ impl Env {
     pub fn assign(&mut self, name: &str, value: Value, span: Span) -> KuResult<()> {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(binding) = scope.get(name) {
-                let mut binding = binding.borrow_mut();
+                let mut binding = binding
+                    .lock()
+                    .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
                 if !binding.mutable {
                     return Err(KuError::runtime(
                         format!("cannot assign to immutable variable '{}'", name),
+                        span,
+                    ));
+                }
+                let current_task_id = crate::runtime::task::current_task_id();
+                if binding.owner_task_id != current_task_id {
+                    return Err(KuError::runtime(
+                        format!("async task cannot modify captured variable '{}'", name),
                         span,
                     ));
                 }
@@ -107,7 +126,10 @@ impl Env {
     pub fn get(&self, name: &str, span: Span) -> KuResult<Value> {
         for scope in self.scopes.iter().rev() {
             if let Some(binding) = scope.get(name) {
-                return Ok(binding.borrow().value.clone());
+                return binding
+                    .lock()
+                    .map(|binding| binding.value.clone())
+                    .map_err(|_| KuError::runtime("environment binding is poisoned", span));
             }
         }
         Err(KuError::runtime(

@@ -455,7 +455,7 @@ fn main() {
     if (user["name"] != "Ku") {
         panic("bad map read")
     }
-    if (user["missing"] != null) {
+    if (user["missing"]? != null) {
         panic("missing map key should be null")
     }
     user["age"] = 12

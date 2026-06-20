@@ -11,6 +11,8 @@ const diagnosticCollection = vscode.languages.createDiagnosticCollection("ku");
 const output = vscode.window.createOutputChannel("Ku");
 let status: vscode.StatusBarItem;
 const checkTimers = new Map<string, NodeJS.Timeout>();
+const checkGenerations = new Map<string, number>();
+const diagnosticUrisByRoot = new Map<string, vscode.Uri[]>();
 
 export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(diagnosticCollection, output);
@@ -89,7 +91,7 @@ async function refreshEditorContext(document = vscode.window.activeTextEditor?.d
 }
 
 function documentHasMain(document: vscode.TextDocument): boolean {
-  return /^\s*fn\s+main\s*\(/m.test(document.getText());
+  return /^\s*(?:async\s+)?fn\s+main\s*\(/m.test(document.getText());
 }
 
 async function scheduleCheck(document: vscode.TextDocument, delayMs: number) {
@@ -117,25 +119,136 @@ async function checkActiveFile(reveal: boolean) {
 }
 
 async function runCheck(document: vscode.TextDocument, reveal: boolean) {
+  const rootKey = document.uri.toString();
+  const generation = (checkGenerations.get(rootKey) ?? 0) + 1;
+  checkGenerations.set(rootKey, generation);
   const exe = await findKuExecutable(document.uri);
   if (!exe) {
     setStatus("Ku: missing", true);
     return;
   }
-  const result = await execFile(exe, ["check", document.uri.fsPath], workspaceFolder(document.uri));
+  let result = await execFile(exe, ["check", "--json", document.uri.fsPath], workspaceFolder(document.uri));
+  let diagnostics = parseJsonDiagnosticEntries(result.stdout + result.stderr, document);
+  let command = `${exe} check --json ${document.uri.fsPath}`;
+  if (result.code !== 0 && diagnostics === undefined) {
+    result = await execFile(exe, ["check", document.uri.fsPath], workspaceFolder(document.uri));
+    diagnostics = parseTextDiagnosticEntries(result.stdout + result.stderr, document);
+    command = `${exe} check ${document.uri.fsPath}`;
+  }
+  if (checkGenerations.get(rootKey) !== generation) {
+    return;
+  }
   output.clear();
-  output.appendLine(`> ${exe} check ${document.uri.fsPath}`);
+  output.appendLine(`> ${command}`);
   output.append(result.stdout);
   output.append(result.stderr);
-  diagnosticCollection.set(document.uri, parseDiagnostics(result.stdout + result.stderr, document));
+  replaceDiagnostics(rootKey, diagnostics ?? []);
   if (reveal) {
     output.show(true);
   }
   setStatus(result.code === 0 ? `Ku ${KU_VERSION}: check ok` : `Ku ${KU_VERSION}: check failed`, result.code !== 0);
 }
 
-function parseDiagnostics(text: string, document: vscode.TextDocument): vscode.Diagnostic[] {
-  const diagnostics: vscode.Diagnostic[] = [];
+interface JsonDiagnostic {
+  level: string;
+  code: string;
+  message: string;
+  file: string;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+  notes: string[];
+  helps: string[];
+}
+
+export function parseDiagnostics(text: string, document: vscode.TextDocument): vscode.Diagnostic[] {
+  return (parseJsonDiagnosticEntries(text, document) ?? parseTextDiagnosticEntries(text, document))
+    .map((entry) => entry.diagnostic);
+}
+
+interface DiagnosticEntry {
+  uri: vscode.Uri;
+  diagnostic: vscode.Diagnostic;
+}
+
+function parseJsonDiagnosticEntries(text: string, document: vscode.TextDocument): DiagnosticEntry[] | undefined {
+  const records: JsonDiagnostic[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const value = JSON.parse(line) as Partial<JsonDiagnostic>;
+      if (
+        typeof value.level !== "string" ||
+        typeof value.code !== "string" ||
+        typeof value.message !== "string" ||
+        typeof value.file !== "string" ||
+        !isPositiveInteger(value.line) ||
+        !isPositiveInteger(value.column) ||
+        !isPositiveInteger(value.endLine) ||
+        !isPositiveInteger(value.endColumn) ||
+        !Array.isArray(value.notes) ||
+        !value.notes.every((note) => typeof note === "string") ||
+        !Array.isArray(value.helps) ||
+        !value.helps.every((help) => typeof help === "string")
+      ) {
+        continue;
+      }
+      records.push(value as JsonDiagnostic);
+    } catch {
+      // Older Ku executables emit human-readable diagnostics.
+    }
+  }
+  if (records.length === 0) {
+    return undefined;
+  }
+  return records.map((record) => {
+    const startLine = Math.max(0, record.line - 1);
+    const startColumn = Math.max(0, record.column - 1);
+    const endLine = Math.max(startLine, record.endLine - 1);
+    const endColumn = endLine === startLine
+      ? Math.max(startColumn + 1, record.endColumn - 1)
+      : Math.max(0, record.endColumn - 1);
+    const details = [
+      ...record.notes.map((note) => `note: ${note}`),
+      ...record.helps.map((help) => `help: ${help}`),
+    ];
+    const message = details.length > 0 ? `${record.message}\n${details.join("\n")}` : record.message;
+    const diagnostic = new vscode.Diagnostic(
+      new vscode.Range(startLine, startColumn, endLine, endColumn),
+      message,
+      diagnosticSeverity(record.level),
+    );
+    diagnostic.source = "ku check";
+    diagnostic.code = record.code;
+    return {
+      uri: diagnosticUri(record.file, document),
+      diagnostic,
+    };
+  });
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1;
+}
+
+function diagnosticSeverity(level: string): vscode.DiagnosticSeverity {
+  switch (level.toLowerCase()) {
+    case "warning":
+      return vscode.DiagnosticSeverity.Warning;
+    case "info":
+      return vscode.DiagnosticSeverity.Information;
+    case "hint":
+      return vscode.DiagnosticSeverity.Hint;
+    default:
+      return vscode.DiagnosticSeverity.Error;
+  }
+}
+
+function parseTextDiagnosticEntries(text: string, document: vscode.TextDocument): DiagnosticEntry[] {
+  const diagnostics: DiagnosticEntry[] = [];
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const location = /^\s*-->\s+(.+):(\d+):(\d+)\s*$/.exec(lines[i]);
@@ -157,13 +270,45 @@ function parseDiagnostics(text: string, document: vscode.TextDocument): vscode.D
     const range = new vscode.Range(line, col, line, endCol);
     const diagnostic = new vscode.Diagnostic(range, `${message}${hintFor(message)}`, vscode.DiagnosticSeverity.Error);
     diagnostic.source = "ku check";
-    diagnostics.push(diagnostic);
+    diagnostics.push({
+      uri: diagnosticUri(location[1], document),
+      diagnostic,
+    });
   }
   return diagnostics;
 }
 
+function diagnosticUri(file: string, document: vscode.TextDocument): vscode.Uri {
+  if (!file || file === document.fileName || file === document.uri.fsPath) {
+    return document.uri;
+  }
+  const absolute = path.isAbsolute(file)
+    ? file
+    : path.resolve(workspaceFolder(document.uri) ?? path.dirname(document.uri.fsPath), file);
+  return vscode.Uri.file(absolute);
+}
+
+function replaceDiagnostics(rootKey: string, entries: DiagnosticEntry[]) {
+  for (const uri of diagnosticUrisByRoot.get(rootKey) ?? []) {
+    diagnosticCollection.delete(uri);
+  }
+  const grouped = new Map<string, { uri: vscode.Uri; diagnostics: vscode.Diagnostic[] }>();
+  for (const entry of entries) {
+    const key = entry.uri.toString();
+    const group = grouped.get(key) ?? { uri: entry.uri, diagnostics: [] };
+    group.diagnostics.push(entry.diagnostic);
+    grouped.set(key, group);
+  }
+  const uris: vscode.Uri[] = [];
+  for (const group of grouped.values()) {
+    diagnosticCollection.set(group.uri, group.diagnostics);
+    uris.push(group.uri);
+  }
+  diagnosticUrisByRoot.set(rootKey, uris);
+}
+
 function cleanupMessage(message: string): string {
-  return message.replace(/^error:\s+/, "").trim();
+  return message.replace(/^error(?:\[[A-Z]\d+\])?:\s+/, "").replace(/^error:\s+/, "").trim();
 }
 
 function hintFor(message: string): string {
@@ -172,6 +317,9 @@ function hintFor(message: string): string {
   }
   if (message.includes("std module 'fs' must be imported")) {
     return "\nhelp: add import \"std.fs\"";
+  }
+  if (message.includes("std module 'config' must be imported")) {
+    return "\nhelp: add import \"std.config\"";
   }
   if (message.includes("expected numbers")) {
     return "\nhint: 普通表达式不允许 str 和数字混合运算；模板字符串内才允许拼接。";
@@ -538,13 +686,16 @@ class KuHoverProvider implements vscode.HoverProvider {
   provideHover(document: vscode.TextDocument, position: vscode.Position) {
     const word = document.getText(document.getWordRangeAtPosition(position));
     const docs: Record<string, string> = {
+      "async": "`async fn` 调用会立即启动 task，并且第一版必须显式返回 `T!`。",
+      "await": "`await task?` 等价于 `(await task)?`，只能写在 `async fn` 内。",
       "catch": "`catch (err)` 中 `err` 是结构化 Error 对象：`err.domain`、`err.code`、`err.message`。",
       "err": "`err(message)` 返回 `Unknown!`，失败 payload 是 `{ domain, code, message }`。",
       "fail": "`fail` 主动返回可恢复错误；字符串会包装为 `{ domain: \"ku\", code: \"fail\", message }`。",
       "http": "`import \"std.http\"` 后使用。`http.get/post/request` 返回 `{ status, headers, body }!`。",
-      "service": "`http.service` 返回带默认资源限制的 HTTP service 配置对象；完整 Ku handler listen 仍需要 runtime handler ABI。",
+      "service": "`http.service` 返回带默认资源限制的 HTTP service 配置对象；支持 route/bind/listen/run 基础阻塞 server。",
       "server": "`http.server()` 返回带默认 timeout/body/header/concurrency 限制的 server 配置对象。",
       "fs": "`import \"std.fs\"` 后使用。支持 `fs.read/write/try_read/try_write`。",
+      "config": "`import \"std.config\"` 后使用。支持 `config.env/env_file/yaml`。",
       "match": "Ku 0.0.12 保留 `match`，不再支持 `switch`。",
       "try_get": "`values.try_get(index)?` 越界时返回结构化 Error。",
       "trim": "`text.trim()` 是 string 实例方法。",
@@ -601,7 +752,7 @@ function findDefinitionInDocument(document: vscode.TextDocument, word: string) {
 function findDefinitionInText(uri: vscode.Uri, source: string, word: string) {
   const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const patterns = [
-    new RegExp(`^\\s*fn\\s+${escaped}\\b`, "m"),
+    new RegExp(`^\\s*(?:async\\s+)?fn\\s+${escaped}\\b`, "m"),
     new RegExp(`^\\s*struct\\s+${escaped}\\b`, "m"),
     new RegExp(`^\\s*enum\\s+${escaped}\\b`, "m"),
     new RegExp(`^\\s*${escaped}\\s*=`, "m"),
@@ -625,19 +776,19 @@ class KuSymbolProvider implements vscode.DocumentSymbolProvider {
     const stack: vscode.DocumentSymbol[] = [];
     for (let line = 0; line < document.lineCount; line++) {
       const text = document.lineAt(line).text;
-      const match = /^\s*(module|fn|struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(text);
+      const match = /^\s*(?:async\s+)?(module|fn|struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(text);
       if (!match) {
         continue;
       }
       const kind = match[1] === "fn" ? vscode.SymbolKind.Function : match[1] === "struct" ? vscode.SymbolKind.Struct : match[1] === "enum" ? vscode.SymbolKind.Enum : vscode.SymbolKind.Module;
       const range = new vscode.Range(line, 0, line, text.length);
       const symbol = new vscode.DocumentSymbol(match[2], match[1], kind, range, range);
-      if (/^\s+fn\b/.test(text) && stack.length > 0) {
+      if (/^\s+(?:async\s+)?fn\b/.test(text) && stack.length > 0) {
         stack[stack.length - 1].children.push(symbol);
       } else {
         symbols.push(symbol);
       }
-      if (match[1] !== "fn" || !/^\s+fn\b/.test(text)) {
+      if (match[1] !== "fn" || !/^\s+(?:async\s+)?fn\b/.test(text)) {
         stack[0] = symbol;
       }
     }
@@ -654,6 +805,9 @@ class KuCodeActionProvider implements vscode.CodeActionProvider {
       }
       if (diagnostic.message.includes("std module 'fs' must be imported")) {
         actions.push(insertImportAction(document, "std.fs"));
+      }
+      if (diagnostic.message.includes("std module 'config' must be imported")) {
+        actions.push(insertImportAction(document, "std.config"));
       }
       if (diagnostic.message.includes("let")) {
         const action = new vscode.CodeAction("Ku: remove let keyword", vscode.CodeActionKind.QuickFix);
@@ -695,24 +849,158 @@ class KuFormatter implements vscode.DocumentFormattingEditProvider {
   }
 }
 
-function formatKu(source: string): string {
+export function formatKu(source: string): string {
   const lines = source.replace(/\r\n/g, "\n").split("\n");
   let indent = 0;
   const out: string[] = [];
+  let blankRun = 0;
+  let inBlockComment = false;
   for (const raw of lines) {
-    const trimmed = raw.trim();
+    const trimmed = raw.trimEnd().trimStart();
     if (!trimmed) {
-      out.push("");
+      blankRun++;
+      if (blankRun === 1) {
+        out.push("");
+      }
+      continue;
+    }
+    blankRun = 0;
+    if (inBlockComment || /^\/\*/.test(trimmed)) {
+      out.push(`${"    ".repeat(indent)}${trimmed}`);
+      inBlockComment = !trimmed.includes("*/");
       continue;
     }
     if (/^}/.test(trimmed)) {
       indent = Math.max(0, indent - 1);
     }
-    out.push(`${"    ".repeat(indent)}${trimmed}`);
-    const balance = braceBalanceOutsideTrivia(trimmed);
+    const formatted = formatCodeLine(trimmed);
+    if (/^(else|catch|finally)\b/.test(formatted) && out.length > 0 && /\}\s*$/.test(out[out.length - 1])) {
+      out[out.length - 1] = `${out[out.length - 1]} ${formatted}`;
+    } else {
+      out.push(`${"    ".repeat(indent)}${formatted}`);
+    }
+    const balance = braceBalanceOutsideTrivia(formatted);
     indent = Math.max(0, indent + balance.opens - balance.closes);
   }
-  return out.join("\n");
+  while (out.length > 0 && out[out.length - 1] === "") {
+    out.pop();
+  }
+  return `${out.join("\n")}\n`;
+}
+
+function formatCodeLine(line: string): string {
+  const { code, comment } = splitCommentOutsideTrivia(line);
+  const formatted = formatCodeOutsideStrings(code)
+    .replace(/^}\s*(else|catch|finally)\b/, "} $1")
+    .replace(/^\s*import\s+/, "import ")
+    .trim();
+  return comment ? `${formatted} ${comment.trimEnd()}`.trimEnd() : formatted;
+}
+
+function splitCommentOutsideTrivia(line: string) {
+  let quote: string | undefined;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    const next = line[i + 1];
+    if (quote) {
+      if (ch === "\\") {
+        i++;
+      } else if (ch === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (ch === "\"" || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      return { code: line.slice(0, i), comment: line.slice(i) };
+    }
+  }
+  return { code: line, comment: "" };
+}
+
+function formatCodeOutsideStrings(code: string): string {
+  let out = "";
+  let quote: string | undefined;
+  const operators = ["==", "!=", "<=", ">=", "&&", "||", "=>", "=", "+", "-", "*", "/", "%", "<", ">"];
+  for (let i = 0; i < code.length; i++) {
+    const ch = code[i];
+    if (quote) {
+      out += ch;
+      if (ch === "\\") {
+        i++;
+        if (i < code.length) {
+          out += code[i];
+        }
+      } else if (ch === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (ch === "\"" || ch === "'" || ch === "`") {
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    const op = operators.find((candidate) => code.startsWith(candidate, i));
+    if (op) {
+      if ((op === "<" || op === ">") && isGenericDeclarationAngle(code, i, op)) {
+        out += ch;
+        continue;
+      }
+      out = out.replace(/\s+$/, "");
+      out += ` ${op} `;
+      i += op.length - 1;
+      while (i + 1 < code.length && /\s/.test(code[i + 1])) {
+        i++;
+      }
+      continue;
+    }
+    if (ch === ",") {
+      out = out.replace(/\s+$/, "");
+      out += ", ";
+      while (i + 1 < code.length && /\s/.test(code[i + 1])) {
+        i++;
+      }
+      continue;
+    }
+    if (ch === ":") {
+      out = out.replace(/\s+$/, "");
+      out += ": ";
+      while (i + 1 < code.length && /\s/.test(code[i + 1])) {
+        i++;
+      }
+      continue;
+    }
+    if (ch === "{") {
+      out = out.replace(/\s+$/, "");
+      out += " {";
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function isGenericDeclarationAngle(code: string, index: number, op: string): boolean {
+  if (op === "<") {
+    const before = code.slice(0, index).trimEnd();
+    return /\b(?:async\s+)?(fn|struct|enum)\s+[A-Za-z_][A-Za-z0-9_]*$/.test(before);
+  }
+  let depth = 0;
+  for (let i = index; i >= 0; i--) {
+    if (code[i] === ">") {
+      depth++;
+    } else if (code[i] === "<") {
+      depth--;
+      if (depth === 0) {
+        return isGenericDeclarationAngle(code, i, "<");
+      }
+    }
+  }
+  return false;
 }
 
 function braceBalanceOutsideTrivia(line: string) {

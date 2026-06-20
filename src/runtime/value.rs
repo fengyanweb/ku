@@ -2,6 +2,7 @@ use std::{collections::HashMap, fmt};
 
 use crate::ast::Stmt;
 use crate::env::Env;
+use crate::runtime::task::TaskHandle;
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -29,7 +30,9 @@ pub enum Value {
         body: Vec<Stmt>,
         captures: Env,
         self_name: Option<String>,
+        is_async: bool,
     },
+    Task(TaskHandle),
     Null,
 }
 
@@ -59,6 +62,7 @@ impl Value {
             Value::Enum { .. } => "enum",
             Value::Result { .. } => "result",
             Value::Function { .. } => "function",
+            Value::Task(_) => "task",
             Value::Null => "null",
         }
     }
@@ -131,6 +135,7 @@ impl fmt::Display for Value {
                 }
             }
             Value::Function { .. } => write!(f, "<function>"),
+            Value::Task(task) => write!(f, "<task:{}>", task.id()),
             Value::Null => write!(f, "null"),
         }
     }
@@ -182,6 +187,7 @@ impl PartialEq for Value {
                 },
             ) => left_ok == right_ok && left_value == right_value,
             (Value::Function { .. }, Value::Function { .. }) => false,
+            (Value::Task(left), Value::Task(right)) => left == right,
             (Value::Null, Value::Null) => true,
             _ => false,
         }

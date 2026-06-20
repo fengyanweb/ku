@@ -1,16 +1,19 @@
+use std::collections::{HashMap, VecDeque};
+
 use crate::{
     ast::{BinaryOp, UnaryOp},
     error::{KuError, KuResult},
     ir::{
-        IrBlock, IrCallKind, IrExpr, IrExprKind, IrFunction, IrInst, IrProgram, IrTerminator,
-        IrType,
+        IrBlock, IrCallKind, IrExpr, IrExprKind, IrFunction, IrInst, IrLValue, IrProgram,
+        IrStructLayout, IrTerminator, IrType,
     },
     span::Span,
 };
 
 pub fn generate_c_source(program: &IrProgram) -> KuResult<String> {
-    reject_layouts(program)?;
+    validate_layouts(program)?;
     let mut out = String::from("#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n\n");
+    emit_struct_layouts(&mut out, program)?;
     emit_result_abi(&mut out, program)?;
     for function in &program.functions {
         emit_function(&mut out, function)?;
@@ -20,12 +23,105 @@ pub fn generate_c_source(program: &IrProgram) -> KuResult<String> {
     Ok(out)
 }
 
-fn reject_layouts(program: &IrProgram) -> KuResult<()> {
-    if !program.layouts.structs.is_empty() || !program.layouts.enums.is_empty() {
+fn validate_layouts(program: &IrProgram) -> KuResult<()> {
+    if !program.layouts.enums.is_empty() {
         return Err(unsupported(
-            "native C prototype does not support struct or enum layouts yet",
+            "native C prototype does not support enum layouts yet",
         ));
     }
+
+    let indexes = program
+        .layouts
+        .structs
+        .iter()
+        .enumerate()
+        .map(|(index, layout)| (layout.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut dependency_count = vec![0usize; program.layouts.structs.len()];
+    let mut dependents = vec![Vec::new(); program.layouts.structs.len()];
+
+    for (index, layout) in program.layouts.structs.iter().enumerate() {
+        for field in &layout.fields {
+            match &field.ty {
+                IrType::Int | IrType::Bool | IrType::Str => {}
+                IrType::Named(name) => {
+                    let Some(&dependency) = indexes.get(name.as_str()) else {
+                        return Err(unsupported(format!(
+                            "native C struct '{}.{}' references unknown struct '{name}'",
+                            layout.name, field.name
+                        )));
+                    };
+                    dependency_count[index] += 1;
+                    dependents[dependency].push(index);
+                }
+                other => {
+                    return Err(unsupported(format!(
+                        "native C struct '{}.{}' does not support field type {other}; supported field types are int, bool, str, and non-recursive named structs",
+                        layout.name, field.name
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut ready = dependency_count
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect::<VecDeque<_>>();
+    let mut visited = 0usize;
+    while let Some(index) = ready.pop_front() {
+        visited += 1;
+        for dependent in &dependents[index] {
+            dependency_count[*dependent] -= 1;
+            if dependency_count[*dependent] == 0 {
+                ready.push_back(*dependent);
+            }
+        }
+    }
+    if visited != program.layouts.structs.len() {
+        return Err(unsupported(
+            "native C prototype does not support recursive value struct layouts",
+        ));
+    }
+
+    for (index, layout) in program.layouts.structs.iter().enumerate() {
+        for field in &layout.fields {
+            if let IrType::Named(name) = &field.ty {
+                let dependency = indexes[name.as_str()];
+                if dependency >= index {
+                    return Err(unsupported(format!(
+                        "native C struct '{}.{}' must reference a struct declared earlier than '{}'; declaration-order value layouts cannot use a later struct",
+                        layout.name, field.name, layout.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_struct_layouts(out: &mut String, program: &IrProgram) -> KuResult<()> {
+    for layout in &program.layouts.structs {
+        emit_struct_layout(out, layout)?;
+    }
+    if !program.layouts.structs.is_empty() {
+        out.push('\n');
+    }
+    Ok(())
+}
+
+fn emit_struct_layout(out: &mut String, layout: &IrStructLayout) -> KuResult<()> {
+    let name = c_struct_type(&layout.name);
+    out.push_str(&format!("typedef struct {name} {{\n"));
+    for field in &layout.fields {
+        out.push_str(&format!(
+            "  {} {};\n",
+            c_type(&field.ty)?,
+            c_ident(&field.name)
+        ));
+    }
+    out.push_str(&format!("}} {name};\n"));
     Ok(())
 }
 
@@ -89,12 +185,7 @@ fn emit_inst(out: &mut String, inst: &IrInst, return_type: &IrType) -> KuResult<
             ));
         }
         IrInst::Store { target, value } => {
-            let crate::ir::IrLValue::Local(name) = target else {
-                return Err(unsupported(
-                    "native C prototype only supports local assignment",
-                ));
-            };
-            out.push_str(&format!("  {} = {};\n", c_ident(name), c_expr(value)?));
+            out.push_str(&format!("  {} = {};\n", c_lvalue(target)?, c_expr(value)?));
         }
         IrInst::Print(value) => emit_print(out, value)?,
         IrInst::Expr(value) => emit_expr_statement(out, value)?,
@@ -225,6 +316,14 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
         IrExprKind::Literal(value) => Ok(value.clone()),
         IrExprKind::Local(name) => Ok(c_symbol(name)),
         IrExprKind::Temp(id) => Ok(format!("t{}", id.0)),
+        IrExprKind::StructLiteral { name, fields } => {
+            let fields = fields
+                .iter()
+                .map(|(field, value)| Ok(format!(".{} = {}", c_ident(field), c_expr(value)?)))
+                .collect::<KuResult<Vec<_>>>()?
+                .join(", ");
+            Ok(format!("({}){{ {fields} }}", c_struct_type(name)))
+        }
         IrExprKind::Unary { op, expr } => Ok(format!("({}{})", c_unary(*op), c_expr(expr)?)),
         IrExprKind::Binary { left, op, right } => Ok(format!(
             "({} {} {})",
@@ -249,22 +348,35 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 .join(", ");
             Ok(format!("{callee}({args})"))
         }
-        IrExprKind::Array(_)
-        | IrExprKind::Index { .. }
-        | IrExprKind::Field { .. }
-        | IrExprKind::TryUnwrap(_) => Err(unsupported(format!(
-            "native C prototype cannot lower expression '{expr}'"
-        ))),
+        IrExprKind::Field { target, name } => {
+            Ok(format!("({}).{}", c_expr(target)?, c_ident(name)))
+        }
+        IrExprKind::Array(_) | IrExprKind::Index { .. } | IrExprKind::TryUnwrap(_) => {
+            Err(unsupported(format!(
+                "native C prototype cannot lower expression '{expr}'"
+            )))
+        }
     }
 }
 
-fn c_type(ty: &IrType) -> KuResult<&'static str> {
+fn c_lvalue(target: &IrLValue) -> KuResult<String> {
+    match target {
+        IrLValue::Local(name) => Ok(c_ident(name)),
+        IrLValue::Field { target, name } => Ok(format!("({}).{}", c_expr(target)?, c_ident(name))),
+        IrLValue::Index { .. } => Err(unsupported(
+            "native C prototype does not support array/index assignment yet",
+        )),
+    }
+}
+
+fn c_type(ty: &IrType) -> KuResult<String> {
     match ty {
-        IrType::Int => Ok("int64_t"),
-        IrType::Bool => Ok("bool"),
-        IrType::Str => Ok("const char*"),
+        IrType::Int => Ok("int64_t".to_string()),
+        IrType::Bool => Ok("bool".to_string()),
+        IrType::Str => Ok("const char*".to_string()),
         IrType::Result(inner) => c_result_type(inner),
-        IrType::Void => Ok("void"),
+        IrType::Named(name) => Ok(c_struct_type(name)),
+        IrType::Void => Ok("void".to_string()),
         _ => Err(unsupported(format!(
             "native C prototype does not support type {ty}"
         ))),
@@ -375,11 +487,11 @@ fn collect_result_type(
     Ok(())
 }
 
-fn c_result_type(inner: &IrType) -> KuResult<&'static str> {
+fn c_result_type(inner: &IrType) -> KuResult<String> {
     match inner {
-        IrType::Int => Ok("KuResultInt"),
-        IrType::Bool => Ok("KuResultBool"),
-        IrType::Str => Ok("KuResultStr"),
+        IrType::Int => Ok("KuResultInt".to_string()),
+        IrType::Bool => Ok("KuResultBool".to_string()),
+        IrType::Str => Ok("KuResultStr".to_string()),
         _ => Err(unsupported(format!(
             "native C prototype does not support Result<{inner}>"
         ))),
@@ -518,6 +630,10 @@ fn c_symbol(name: &str) -> String {
     } else {
         c_ident(name)
     }
+}
+
+fn c_struct_type(name: &str) -> String {
+    format!("KuStruct_{}", c_ident(name))
 }
 
 fn unsupported(message: impl Into<String>) -> KuError {

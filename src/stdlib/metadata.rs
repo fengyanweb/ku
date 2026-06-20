@@ -90,6 +90,9 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("array", "concat") => vec![array_arg(), ArgRule::MatchesArrayArg { array_arg: 0 }],
         ("json", "parse" | "try_parse") => vec![str_arg()],
         ("json", "stringify") => vec![ArgRule::Is(TypePattern::Any)],
+        ("config", "env") => vec![],
+        ("config", "env_file") => vec![str_arg()],
+        ("config", "yaml") => vec![str_arg()],
         ("time", "now" | "unix" | "millis") => vec![],
         ("http", "get") => vec![str_arg()],
         ("http", "post") => vec![str_arg(), str_arg()],
@@ -118,6 +121,8 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("json", "parse") => TypePattern::Unknown,
         ("json", "try_parse") => TypePattern::ResultOf(Box::new(TypePattern::Unknown)),
         ("json", "stringify") => TypePattern::String,
+        ("config", "env" | "env_file") => TypePattern::ObjectAny,
+        ("config", "yaml") => TypePattern::ResultOf(Box::new(TypePattern::ObjectAny)),
         ("time", "now" | "unix" | "millis") => TypePattern::Int,
         ("http", "get" | "post" | "request") => {
             TypePattern::ResultOf(Box::new(http_response_pattern()))
@@ -145,20 +150,23 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("string", "slice")
         | ("array", "try_get")
         | ("json", "try_parse")
+        | ("config", "yaml")
         | ("http", "get" | "post" | "request") => FailureMode::ReturnsResult,
-        ("fs", "read" | "write") | ("json", "parse") => FailureMode::MayPanic,
+        ("fs", "read" | "write") | ("json", "parse") | ("config", "env_file") => {
+            FailureMode::MayPanic
+        }
         _ => FailureMode::Never,
     }
 }
 
 pub(crate) fn module_requires_import(module: &str) -> bool {
-    matches!(module, "fs" | "http")
+    matches!(module, "fs" | "http" | "config")
 }
 
 pub(crate) fn is_std_module(module: &str) -> bool {
     matches!(
         module,
-        "fs" | "lexer" | "parser" | "string" | "array" | "json" | "time" | "http"
+        "fs" | "lexer" | "parser" | "string" | "array" | "json" | "config" | "time" | "http"
     )
 }
 
@@ -194,12 +202,16 @@ fn http_client_pattern() -> TypePattern {
 fn http_service_pattern() -> TypePattern {
     TypePattern::ObjectFields(vec![
         ("kind".to_string(), TypePattern::String),
-        ("read_timeout_ms".to_string(), TypePattern::Int),
+        ("read_header_timeout_ms".to_string(), TypePattern::Int),
+        ("read_body_timeout_ms".to_string(), TypePattern::Int),
         ("write_timeout_ms".to_string(), TypePattern::Int),
+        ("idle_timeout_ms".to_string(), TypePattern::Int),
+        ("handler_timeout_ms".to_string(), TypePattern::Int),
         ("max_body_bytes".to_string(), TypePattern::Int),
         ("max_header_bytes".to_string(), TypePattern::Int),
         ("max_connections".to_string(), TypePattern::Int),
-        ("max_concurrency".to_string(), TypePattern::Int),
+        ("max_active_requests".to_string(), TypePattern::Int),
+        ("max_pending_requests".to_string(), TypePattern::Int),
         (
             "routes".to_string(),
             TypePattern::ArrayOf(Box::new(http_route_pattern())),
@@ -211,6 +223,10 @@ fn http_route_pattern() -> TypePattern {
     TypePattern::ObjectFields(vec![
         ("method".to_string(), TypePattern::String),
         ("path".to_string(), TypePattern::String),
+        (
+            "param_names".to_string(),
+            TypePattern::ArrayOf(Box::new(TypePattern::String)),
+        ),
         ("handler".to_string(), TypePattern::Any),
     ])
 }

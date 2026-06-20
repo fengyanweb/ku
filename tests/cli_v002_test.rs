@@ -179,9 +179,119 @@ fn check_error_prints_diagnostic_location() {
 
     assert_ne!(result.code, Some(0), "check error should fail");
     let text = format!("{}\n{}", result.stdout, result.stderr);
-    assert!(text.contains("error:"), "missing error heading");
+    assert!(text.contains("error["), "missing error code heading");
     assert!(text.contains("error.ku:"), "missing file location");
     assert!(text.contains("|"), "missing source gutter");
+}
+
+#[test]
+fn check_errors_include_codes_notes_and_help() {
+    let cases = [
+        (
+            "let.ku",
+            "fn main() { let name = \"Ku\" }",
+            "E0105",
+            "remove `let`",
+        ),
+        (
+            "switch.ku",
+            "fn main() { value = switch 1 { 1 => 1 } }",
+            "E0104",
+            "replace `switch` with `match`",
+        ),
+        (
+            "condition.ku",
+            "fn main() { if (\"yes\") { print(\"bad\") } }",
+            "E0302",
+            "truthy/falsy",
+        ),
+        (
+            "question.ku",
+            "import \"std.fs\"\nfn main() { text = fs.try_read(\"x\")? }",
+            "E0401",
+            "return `T!`",
+        ),
+    ];
+
+    for (name, source, code, help) in cases {
+        let path = write_temp_ku(name, source);
+        let path_text = path_arg(&path);
+        let result = run_ku(&["check", &path_text]);
+        fs::remove_file(&path).ok();
+        let text = format!("{}\n{}", result.stdout, result.stderr);
+        assert_ne!(result.code, Some(0), "{name} should fail");
+        assert!(text.contains(code), "{name} missing {code}:\n{text}");
+        assert!(text.contains(help), "{name} missing help/note:\n{text}");
+    }
+}
+
+#[test]
+fn check_json_emits_stable_json_lines_diagnostic() {
+    let path = write_temp_ku(
+        "json-diagnostic.ku",
+        "fn main() {\n    if (\"yes\") {\n        print(\"bad\")\n    }\n}\n",
+    );
+    let path_text = path_arg(&path);
+    let result = run_ku(&["check", "--json", &path_text]);
+    fs::remove_file(&path).ok();
+
+    assert_ne!(result.code, Some(0), "invalid source should fail");
+    assert!(
+        result.stdout.trim().is_empty(),
+        "JSON check stdout should be empty"
+    );
+    let lines = result
+        .stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "expected one JSON diagnostic line");
+    let line = lines[0];
+    for field in [
+        "\"level\":\"error\"",
+        "\"code\":\"E0302\"",
+        "condition must be bool",
+        "\"file\":",
+        "\"line\":2",
+        "\"column\":5",
+        "\"endLine\":",
+        "\"endColumn\":",
+        "\"notes\":[",
+        "\"helps\":[",
+    ] {
+        assert!(
+            line.contains(field),
+            "missing {field} in JSON line:\n{line}"
+        );
+    }
+    assert!(line.starts_with('{') && line.ends_with('}'));
+}
+
+#[test]
+fn check_json_success_is_silent_and_rejects_extra_arguments() {
+    let path = path_arg(&repo_root().join("examples").join("hello.ku"));
+    let result = run_ku(&["check", "--json", &path]);
+    assert_eq!(result.code, Some(0), "valid JSON check should pass");
+    assert!(
+        result.stdout.is_empty(),
+        "successful JSON check must be silent"
+    );
+    assert!(
+        result.stderr.is_empty(),
+        "successful JSON check must be silent"
+    );
+
+    let result = run_ku(&["check", "--json", &path, "extra"]);
+    assert_ne!(
+        result.code,
+        Some(0),
+        "extra JSON check argument should fail"
+    );
+    assert!(
+        result.stderr.contains("too many arguments"),
+        "missing argument error:\n{}",
+        result.stderr
+    );
 }
 
 #[test]

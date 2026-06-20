@@ -4,10 +4,40 @@
     "body": ["fn main() {", "    $0", "}"],
     "description": "Ku main function"
   },
+  "async fn main": {
+    "prefix": "amain",
+    "body": ["async fn main(): null! {", "    $0", "    return ok(null)", "}"],
+    "description": "Ku async main function"
+  },
+  "async function": {
+    "prefix": "afn",
+    "body": ["async fn ${1:name}(${2:arg}:${3:int}): ${4:int}! {", "    return ok(${5:${2:arg}})", "}"],
+    "description": "Ku async function returning Result"
+  },
+  "await task": {
+    "prefix": "await",
+    "body": ["${1:value} = await ${2:task}?"],
+    "description": "Await a task and propagate its Result error"
+  },
   "function": {
     "prefix": "fn",
     "body": ["fn ${1:name}(${2:arg}:${3:int})${4:: int} {", "    $0", "}"],
     "description": "Ku function"
+  },
+  "typed arrow function": {
+    "prefix": "arrow",
+    "body": ["${1:add} = (${2:a}:int, ${3:b}:int): int => ${2:a} + ${3:b}"],
+    "description": "Typed first-class arrow function"
+  },
+  "strict object index": {
+    "prefix": "obj.index",
+    "body": ["${1:value} = ${2:object}[${3:\"key\"}]"],
+    "description": "Strict object lookup; missing keys are errors"
+  },
+  "optional object index": {
+    "prefix": "obj.index?",
+    "body": ["${1:value} = ${2:object}[${3:\"key\"}]?"],
+    "description": "Optional object lookup; missing keys return null"
   },
   "generic function": {
     "prefix": "fng",
@@ -49,6 +79,11 @@
     "body": ["import \"std.http\""],
     "description": "Import std.http"
   },
+  "import std.config": {
+    "prefix": "std.config",
+    "body": ["import \"std.config\""],
+    "description": "Import std.config"
+  },
   "http get": {
     "prefix": "http.get",
     "body": ["res = http.get(${1:\"https://example.com\"})?", "print(res.status)", "print(res.body)"],
@@ -73,7 +108,8 @@
     "prefix": "http.service",
     "body": [
       "service = http.service",
-      "print(service.max_concurrency)",
+      "print(service.max_active_requests)",
+      "print(service.max_pending_requests)",
       "print(service.max_body_bytes)"
     ],
     "description": "HTTP service default limits"

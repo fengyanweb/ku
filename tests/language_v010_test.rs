@@ -186,6 +186,66 @@ fn main() {
 }
 
 #[test]
+fn native_build_rejects_async_syntax_with_clear_error() {
+    let dir = unique_temp_path("native-async");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let file = dir.join("main.ku");
+    fs::write(
+        &file,
+        r#"
+async fn main() {
+    print("hi")
+}
+"#,
+    )
+    .expect("write source");
+
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--native".to_string(),
+        file.display().to_string(),
+    ])
+    .expect_err("native async should be rejected")
+    .to_string();
+    assert!(
+        err.contains("native C prototype does not support async/await yet"),
+        "unexpected error: {err}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_build_ignores_async_words_in_comments_strings_and_identifiers() {
+    let dir = unique_temp_path("native-async-trivia");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let file = dir.join("main.ku");
+    fs::write(
+        &file,
+        r#"
+/* async await in block comment */
+fn main() {
+    async_value = 1
+    print("async await in string")
+    print(`await in template`)
+    print(async_value)
+}
+"#,
+    )
+    .expect("write source");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--native".to_string(),
+        file.display().to_string(),
+    ])
+    .expect("native build should ignore async words in trivia");
+    fs::remove_file(file.with_extension("c")).ok();
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_c_backend_lowers_result_int_question_and_propagation() {
     let tokens = Lexer::new(
         r#"
@@ -881,6 +941,84 @@ dep.bad.checksum = "bad"
 }
 
 #[test]
+fn registry_manifest_and_lock_schema_parse_strictly() {
+    let checksum = format!("sha256-{}", "a".repeat(64));
+    let manifest = package::parse_registry_manifest(
+        &format!(
+            r#"
+name = "math"
+version = "0.1.0"
+source = "https://registry.example/ku/math/0.1.0.tar.gz"
+checksum = "{checksum}"
+"#
+        ),
+        Default::default(),
+    )
+    .expect("registry manifest");
+    assert_eq!(manifest.name, "math");
+    assert_eq!(manifest.version, "0.1.0");
+
+    let packages = package::parse_registry_lock(
+        &format!(
+            r#"
+[[package]]
+name = "math"
+version = "0.1.0"
+source = "registry"
+url = "https://registry.example/ku/math/0.1.0.tar.gz"
+checksum = "{checksum}"
+cache_key = "math-0.1.0-a"
+"#
+        ),
+        Default::default(),
+    )
+    .expect("registry lock");
+    assert_eq!(packages.len(), 1);
+    assert_eq!(packages[0].source, "registry");
+}
+
+#[test]
+fn registry_schema_rejects_missing_bad_semver_and_checksum() {
+    let err = package::parse_registry_manifest(
+        r#"
+name = "math"
+version = "latest"
+source = "https://registry.example/math.tar.gz"
+checksum = "bad"
+"#,
+        Default::default(),
+    )
+    .expect_err("bad semver should fail");
+    assert_eq!(err.code.as_deref(), Some("invalid_version"));
+
+    let err = package::parse_registry_manifest(
+        r#"
+name = "math"
+version = "0.1.0"
+source = "https://registry.example/math.tar.gz"
+"#,
+        Default::default(),
+    )
+    .expect_err("missing checksum should fail");
+    assert_eq!(err.code.as_deref(), Some("missing_registry_field"));
+
+    let err = package::parse_registry_lock(
+        r#"
+[[package]]
+name = "math"
+version = "0.1.0"
+source = "registry"
+url = "https://registry.example/math.tar.gz"
+checksum = "sha256-deadbeef"
+cache_key = "math-0.1.0"
+"#,
+        Default::default(),
+    )
+    .expect_err("short sha256 should fail");
+    assert_eq!(err.code.as_deref(), Some("invalid_registry_checksum"));
+}
+
+#[test]
 fn package_file_dependency_checksum_mismatch_is_rejected() {
     let dir = unique_temp_path("package-remote-dep-bad-checksum");
     let app_src = dir.join("app").join("src");
@@ -922,6 +1060,38 @@ fn main() { print(Value()) }
     assert!(err.contains("checksum mismatch"), "unexpected error: {err}");
 
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn package_source_checksum_rejects_symlink_entries() {
+    let dir = unique_temp_path("package-symlink");
+    let root = dir.join("dep");
+    fs::create_dir_all(&root).expect("create dep root");
+    fs::write(root.join("lib.ku"), "fn value(): int { return 1 }\n").expect("write dep");
+    let link = root.join("loop");
+    if create_dir_symlink(&root, &link).is_err() {
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let err = package::package_source_checksum(&root)
+        .expect_err("package checksum should reject symlink")
+        .to_string();
+    assert!(
+        err.contains("unsupported symlink"),
+        "unexpected error: {err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+fn create_dir_symlink(target: &PathBuf, link: &PathBuf) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_dir_symlink(target: &PathBuf, link: &PathBuf) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
 }
 
 #[test]

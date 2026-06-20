@@ -16,7 +16,13 @@ const MAX_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_BODY_BYTES: usize = 1_000_000;
 const DEFAULT_MAX_HEADER_BYTES: i64 = 16 * 1024;
 const DEFAULT_MAX_CONNECTIONS: i64 = 1024;
-const DEFAULT_MAX_CONCURRENCY: i64 = 256;
+const DEFAULT_READ_HEADER_TIMEOUT_MS: i64 = 5_000;
+const DEFAULT_READ_BODY_TIMEOUT_MS: i64 = 10_000;
+const DEFAULT_WRITE_TIMEOUT_MS: i64 = 10_000;
+const DEFAULT_IDLE_TIMEOUT_MS: i64 = 5_000;
+const DEFAULT_HANDLER_TIMEOUT_MS: i64 = 15_000;
+const DEFAULT_MAX_ACTIVE_REQUESTS: i64 = 256;
+const DEFAULT_MAX_PENDING_REQUESTS: i64 = 1024;
 
 static DEFAULT_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
@@ -313,7 +319,11 @@ fn optional_int(
     span: Span,
 ) -> KuResult<i64> {
     match fields.get(name) {
-        Some(Value::Int(value)) => Ok(*value),
+        Some(Value::Int(value)) if *value > 0 => Ok(*value),
+        Some(Value::Int(_)) => Err(KuError::runtime(
+            format!("http config field '{name}' must be a positive int"),
+            span,
+        )),
         Some(Value::Null) | None => Ok(default),
         Some(other) => Err(KuError::runtime(
             format!(
@@ -415,34 +425,69 @@ fn client_value(config: Option<&Value>, span: Span) -> KuResult<Value> {
 }
 
 fn server_config_value(config: Option<&Value>, span: Span) -> KuResult<Value> {
-    let mut read_timeout_ms = DEFAULT_TIMEOUT_MS as i64;
-    let mut write_timeout_ms = DEFAULT_TIMEOUT_MS as i64;
+    let mut read_header_timeout_ms = DEFAULT_READ_HEADER_TIMEOUT_MS;
+    let mut read_body_timeout_ms = DEFAULT_READ_BODY_TIMEOUT_MS;
+    let mut write_timeout_ms = DEFAULT_WRITE_TIMEOUT_MS;
+    let mut idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS;
+    let mut handler_timeout_ms = DEFAULT_HANDLER_TIMEOUT_MS;
     let mut max_body_bytes = DEFAULT_MAX_BODY_BYTES as i64;
     let mut max_header_bytes = DEFAULT_MAX_HEADER_BYTES;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
-    let mut max_concurrency = DEFAULT_MAX_CONCURRENCY;
+    let mut max_active_requests = DEFAULT_MAX_ACTIVE_REQUESTS;
+    let mut max_pending_requests = DEFAULT_MAX_PENDING_REQUESTS;
     if let Some(config) = config {
         let Value::Object(fields) = config else {
             return Err(expected_type("object", config, span));
         };
-        read_timeout_ms = optional_int(fields, "read_timeout_ms", read_timeout_ms, span)?;
+        read_header_timeout_ms = optional_int(
+            fields,
+            "read_header_timeout_ms",
+            read_header_timeout_ms,
+            span,
+        )?;
+        read_body_timeout_ms =
+            optional_int(fields, "read_body_timeout_ms", read_body_timeout_ms, span)?;
         write_timeout_ms = optional_int(fields, "write_timeout_ms", write_timeout_ms, span)?;
+        idle_timeout_ms = optional_int(fields, "idle_timeout_ms", idle_timeout_ms, span)?;
+        handler_timeout_ms = optional_int(fields, "handler_timeout_ms", handler_timeout_ms, span)?;
         max_body_bytes = optional_int(fields, "max_body_bytes", max_body_bytes, span)?;
         max_header_bytes = optional_int(fields, "max_header_bytes", max_header_bytes, span)?;
         max_connections = optional_int(fields, "max_connections", max_connections, span)?;
-        max_concurrency = optional_int(fields, "max_concurrency", max_concurrency, span)?;
+        max_active_requests =
+            optional_int(fields, "max_active_requests", max_active_requests, span)?;
+        max_pending_requests =
+            optional_int(fields, "max_pending_requests", max_pending_requests, span)?;
     }
     Ok(Value::Object(HashMap::from([
         (
             "kind".to_string(),
             Value::String("http.service".to_string()),
         ),
-        ("read_timeout_ms".to_string(), Value::Int(read_timeout_ms)),
+        (
+            "read_header_timeout_ms".to_string(),
+            Value::Int(read_header_timeout_ms),
+        ),
+        (
+            "read_body_timeout_ms".to_string(),
+            Value::Int(read_body_timeout_ms),
+        ),
         ("write_timeout_ms".to_string(), Value::Int(write_timeout_ms)),
+        ("idle_timeout_ms".to_string(), Value::Int(idle_timeout_ms)),
+        (
+            "handler_timeout_ms".to_string(),
+            Value::Int(handler_timeout_ms),
+        ),
         ("max_body_bytes".to_string(), Value::Int(max_body_bytes)),
         ("max_header_bytes".to_string(), Value::Int(max_header_bytes)),
         ("max_connections".to_string(), Value::Int(max_connections)),
-        ("max_concurrency".to_string(), Value::Int(max_concurrency)),
+        (
+            "max_active_requests".to_string(),
+            Value::Int(max_active_requests),
+        ),
+        (
+            "max_pending_requests".to_string(),
+            Value::Int(max_pending_requests),
+        ),
         ("routes".to_string(), Value::Array(Vec::new())),
     ])))
 }

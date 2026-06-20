@@ -281,14 +281,60 @@ fn main() {
         panic("bad service")
     }
     server = http.server()
-    if (server.max_concurrency <= 0) {
+    if (server.max_active_requests <= 0) {
         panic("bad server limits")
+    }
+    if (server.max_pending_requests <= 0) {
+        panic("bad pending limit")
+    }
+    tuned = http.server({
+        max_body_bytes: 4,
+        read_header_timeout_ms: 500,
+        max_connections: 2,
+        max_active_requests: 1,
+        max_pending_requests: 1
+    })
+    if (tuned.max_body_bytes != 4) {
+        panic("bad configured server")
+    }
+    if (tuned.max_connections != 2 || tuned.max_active_requests != 1 || tuned.max_pending_requests != 1) {
+        panic("bad configured backpressure")
+    }
+    client2 = http.client({ timeout_ms: 1000 })
+    if (client2.timeout_ms != 1000) {
+        panic("bad configured client")
     }
 }
 "#;
 
     check_source("inline.ku", source).expect("http helpers should check");
     run_source("inline.ku", source).expect("http helpers should run");
+}
+
+#[test]
+fn std_http_config_limits_must_be_positive() {
+    for source in [
+        r#"
+import "std.http"
+
+fn main() {
+    http.server({ max_header_bytes: 0 })
+}
+"#,
+        r#"
+import "std.http"
+
+fn main() {
+    http.client({ timeout_ms: -1 })
+}
+"#,
+    ] {
+        let err = run_err(source);
+        assert!(
+            err.contains("must be a positive int"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 #[test]
@@ -304,7 +350,10 @@ fn main() {
     app.post("/pets", (req, res) => {
         return http.json({ ok: true })
     })
-    if (array.len(app.routes) != 2) {
+    app.get("/user/{id}", (req, res) => {
+        return http.text(req.params.id)
+    })
+    if (array.len(app.routes) != 3) {
         panic("routes were not registered")
     }
     if (app.routes[0].method != "GET") {
@@ -312,6 +361,9 @@ fn main() {
     }
     if (app.routes[0].path != "/index") {
         panic("bad route path")
+    }
+    if (app.routes[2].param_names[0] != "id") {
+        panic("bad route param")
     }
 }
 "#;
@@ -321,25 +373,316 @@ fn main() {
 }
 
 #[test]
-fn std_http_service_listen_reports_clear_not_implemented_result() {
+fn std_http_service_bind_returns_listener_result() {
     let source = r#"
+import "std.http"
+
+fn main(): null! {
+    app = http.service
+    listener = app.bind(":0")?
+    if (listener.kind != "http.listener") {
+        panic("bad listener")
+    }
+    listener.close()?
+    return ok(null)
+}
+"#;
+
+    check_source("inline.ku", source).expect("http service bind should check");
+    run_source("inline.ku", source).expect("http service bind should run");
+}
+
+#[test]
+fn std_http_listener_close_consumes_listener() {
+    let source = r#"
+import "std.http"
+
+fn main(): null! {
+    app = http.service
+    listener = app.bind(":0")?
+    listener.close()?
+    try {
+        listener.close()?
+        panic("second close should fail")
+    } catch (err) {
+        if (err.code != "close_failed") {
+            panic("bad close error")
+        }
+    }
+    try {
+        listener.run()?
+        panic("run after close should fail")
+    } catch (err) {
+        if (err.code != "run_failed") {
+            panic("bad run error")
+        }
+    }
+    return ok(null)
+}
+"#;
+
+    check_source("inline.ku", source).expect("http listener close should check");
+    run_source("inline.ku", source).expect("http listener close should run");
+}
+
+#[test]
+fn std_http_service_bind_compiles_routes() {
+    let source = r#"
+import "std.http"
+
+fn main(): null! {
+    app = http.service
+    app.get("/user/{id}", (req, res) => http.text("ok"))
+    listener = app.bind(":0")?
+    if (listener.kind != "http.listener") {
+        panic("bad listener")
+    }
+    if (listener.compiled_router["GET"]["/user/{}"].path != "/user/{id}") {
+        panic("bad compiled route")
+    }
+    return ok(null)
+}
+"#;
+
+    check_source("inline.ku", source).expect("http service bind should check");
+    run_source("inline.ku", source).expect("http service bind should run");
+}
+
+#[test]
+fn std_http_service_rejects_invalid_or_duplicate_routes_before_bind() {
+    let duplicate = r#"
+import "std.http"
+
+fn main(): null! {
+    app = http.service
+    app.get("/user/{id}", (req, res) => http.text("one"))
+    app.get("/user/{name}", (req, res) => http.text("two"))
+    app.bind(":0")?
+    return ok(null)
+}
+"#;
+    let err = run_err(duplicate);
+    assert!(
+        err.contains("duplicate http route"),
+        "unexpected error: {err}"
+    );
+
+    let express_style = r#"
 import "std.http"
 
 fn main() {
     app = http.service
-    try {
-        app.listen(":8080")?
-        panic("listen should not be implemented yet")
-    } catch (err) {
-        if (err.code != "server_not_implemented") {
-            panic("bad listen error")
+    app.get("/user/:id", (req, res) => http.text("bad"))
+}
+"#;
+    let err = run_err(express_style);
+    assert!(
+        err.contains("http route params use '{name}'"),
+        "unexpected error: {err}"
+    );
+
+    let route_config = r#"
+import "std.http"
+
+fn main() {
+    app = http.service
+    app.get("/user/{id}", { auth: "none" }, (req, res) => http.text("bad"))
+}
+"#;
+    let err = check_err(route_config);
+    assert!(
+        err.contains("expects 2 arguments but got 3"),
+        "unexpected error: {err}"
+    );
+
+    let bind_config = r#"
+import "std.http"
+
+fn main() {
+    app = http.service
+    app.bind(":0", { max_body_bytes: 4 })
+}
+"#;
+    let err = check_err(bind_config);
+    assert!(
+        err.contains("expects 1 argument but got 2"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn std_http_handler_signature_and_capture_rules_are_checked() {
+    let valid = r#"
+import "std.http"
+
+fn main() {
+    app = http.service
+    app.get("/user/{id}", (req, res) => {
+        if (req.method != "GET") {
+            panic("bad method")
         }
+        return http.text(req.params.id)
+    })
+}
+"#;
+    check_source("inline.ku", valid).expect("http handler request fields should check");
+
+    let wrong_arity = r#"
+import "std.http"
+
+fn main() {
+    app = http.service
+    app.get("/", (req) => http.text("bad"))
+}
+"#;
+    let err = check_err(wrong_arity);
+    assert!(
+        err.contains("handler expects 2 parameters"),
+        "unexpected error: {err}"
+    );
+
+    let bad_return = r#"
+import "std.http"
+
+fn main() {
+    app = http.service
+    app.get("/", (req, res) => "bad")
+}
+"#;
+    let err = check_err(bad_return);
+    assert!(
+        err.contains("expected object but got str"),
+        "unexpected error: {err}"
+    );
+
+    let captured_assign = r#"
+import "std.http"
+
+fn main() {
+    count = 0
+    app = http.service
+    app.get("/", (req, res) => {
+        count = count + 1
+        return http.text("bad")
+    })
+}
+"#;
+    let err = check_err(captured_assign);
+    assert!(
+        err.contains("cannot modify captured variable 'count'"),
+        "unexpected error: {err}"
+    );
+
+    let captured_field_assign = r#"
+import "std.http"
+
+fn main() {
+    state = { n: 0 }
+    app = http.service
+    app.get("/", (req, res) => {
+        state.n = 1
+        return http.text("bad")
+    })
+}
+"#;
+    let err = check_err(captured_field_assign);
+    assert!(
+        err.contains("cannot modify captured variable 'state'"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn std_config_reads_env_and_flat_yaml_relative_to_source_file() {
+    let dir = unique_temp_path("config");
+    fs::create_dir_all(&dir).expect("create temp config dir");
+    fs::write(
+        dir.join(".env"),
+        "APP_NAME=ku\nQUOTED=\"hello world\"\nESCAPED=\"a\\nb\"\n",
+    )
+    .expect("write .env");
+    fs::write(dir.join("extra.env"), "TOKEN='abc'\n").expect("write extra env");
+    fs::write(
+        dir.join("app.yaml"),
+        "port: 8080\ndebug: true\nname: ku\npi: 3.5\n",
+    )
+    .expect("write yaml");
+    let source_path = dir.join("main.ku");
+    let source_file = source_path.to_string_lossy().into_owned();
+    let source = r#"
+import "std.config"
+
+fn main(): null! {
+    env = config.env()
+    if (env.APP_NAME != "ku") {
+        panic("bad env")
     }
+    if (env.QUOTED != "hello world") {
+        panic("bad quoted env")
+    }
+    extra = config.env_file("extra.env")
+    if (extra.TOKEN != "abc") {
+        panic("bad env_file")
+    }
+    cfg = config.yaml("app.yaml")?
+    if (cfg.port != 8080) {
+        panic("bad yaml int")
+    }
+    if (cfg.debug != true) {
+        panic("bad yaml bool")
+    }
+    if (cfg.name != "ku") {
+        panic("bad yaml string")
+    }
+    return ok(null)
 }
 "#;
 
-    check_source("inline.ku", source).expect("http service listen should check");
-    run_source("inline.ku", source).expect("http service listen should run");
+    check_source(&source_file, source).expect("std.config program should check");
+    run_source(&source_file, source).expect("std.config program should run");
+    fs::remove_dir_all(&dir).expect("remove temp config dir");
+}
+
+#[test]
+fn std_config_import_gate_and_error_paths_are_checked() {
+    let missing_import = r#"
+fn main() {
+    env = config.env()
+}
+"#;
+    let err = check_err(missing_import);
+    assert!(
+        err.contains("std module 'config' must be imported"),
+        "unexpected error: {err}"
+    );
+
+    let dir = unique_temp_path("config-errors");
+    fs::create_dir_all(&dir).expect("create temp config dir");
+    fs::write(dir.join("bad.yaml"), "nested:\n  value: 1\n").expect("write bad yaml");
+    let source_path = dir.join("main.ku");
+    let source_file = source_path.to_string_lossy().into_owned();
+    let source = r#"
+import "std.config"
+
+fn main() {
+    env = config.env()
+    print("empty env ok")
+    try {
+        config.yaml("bad.yaml")?
+        panic("bad yaml should fail")
+    } catch (err) {
+        if (err.domain != "config") {
+            panic("bad yaml domain")
+        }
+    }
+    config.env_file("missing.env")
+}
+"#;
+    let err = run_source(&source_file, source)
+        .expect_err("missing env_file should be unrecoverable")
+        .to_string();
+    assert!(err.contains("cannot be read"), "unexpected error: {err}");
+    fs::remove_dir_all(&dir).expect("remove temp config dir");
 }
 
 #[test]

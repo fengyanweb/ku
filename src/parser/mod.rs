@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::error::{KuError, KuResult};
-use crate::span::Span;
+use crate::span::{Position, Span};
 use crate::token::{Token, TokenKind};
 
 const MAX_PARSE_DEPTH: usize = 32;
@@ -56,8 +56,11 @@ impl Parser {
         if self.check(&TokenKind::Import) {
             return Ok(Item::Import(self.import_decl()?));
         }
+        if self.match_kind(&TokenKind::Async) {
+            return Ok(Item::Function(self.function(true)?));
+        }
         if self.check(&TokenKind::Fn) {
-            return Ok(Item::Function(self.function()?));
+            return Ok(Item::Function(self.function(false)?));
         }
         if self.check(&TokenKind::Struct) {
             return Ok(Item::Struct(self.struct_decl()?));
@@ -143,8 +146,14 @@ impl Parser {
         })
     }
 
-    fn function(&mut self) -> KuResult<FnDecl> {
-        let start = self.consume(&TokenKind::Fn, "expected 'fn'")?.span.start;
+    fn function(&mut self, is_async: bool) -> KuResult<FnDecl> {
+        let start = if is_async {
+            let start = self.previous().span.start;
+            self.consume(&TokenKind::Fn, "expected 'fn' after 'async'")?;
+            start
+        } else {
+            self.consume(&TokenKind::Fn, "expected 'fn'")?.span.start
+        };
         let (name, _) = self.consume_ident("expected function name")?;
         let type_params = self.type_params()?;
         self.consume(&TokenKind::LParen, "expected '(' after function name")?;
@@ -178,6 +187,7 @@ impl Parser {
         let (body, body_span) = self.block()?;
         Ok(FnDecl {
             name,
+            is_async,
             type_params,
             params,
             return_type,
@@ -406,8 +416,13 @@ impl Parser {
         if self.match_kind(&TokenKind::Try) {
             return self.try_statement();
         }
+        if self.match_kind(&TokenKind::Async) {
+            let function = self.function(true)?;
+            self.optional_semicolon();
+            return Ok(Stmt::Function(function));
+        }
         if self.check(&TokenKind::Fn) {
-            let function = self.function()?;
+            let function = self.function(false)?;
             self.optional_semicolon();
             return Ok(Stmt::Function(function));
         }
@@ -832,6 +847,14 @@ impl Parser {
     }
 
     fn unary(&mut self) -> KuResult<Expr> {
+        if self.match_kind(&TokenKind::Await) {
+            let await_span = self.previous().span;
+            self.enter_parse_depth()?;
+            let value = self.unary();
+            self.leave_parse_depth();
+            let value = value?;
+            return Ok(attach_await(value, await_span.start));
+        }
         if self.match_any(&[TokenKind::Bang, TokenKind::Minus]) {
             let op_token = self.previous().clone();
             let op = match op_token.kind {
@@ -956,6 +979,26 @@ impl Parser {
             TokenKind::False => ExprKind::Literal(Literal::Bool(false)),
             TokenKind::Null => ExprKind::Literal(Literal::Null),
             TokenKind::Ident(name) => {
+                if self.match_kind(&TokenKind::Colon) {
+                    let ty = self.type_name()?;
+                    self.consume(
+                        &TokenKind::Arrow,
+                        "expected '=>' after typed arrow function parameter",
+                    )?;
+                    let (body, body_span) = self.arrow_body()?;
+                    return Ok(Expr::new(
+                        ExprKind::Function {
+                            params: vec![FunctionParam {
+                                name,
+                                ty: Some(ty),
+                                span,
+                            }],
+                            return_type: None,
+                            body,
+                        },
+                        Span::new(span.start, body_span.end),
+                    ));
+                }
                 if self.match_kind(&TokenKind::Arrow) {
                     let (body, body_span) = self.arrow_body()?;
                     return Ok(Expr::new(
@@ -1062,11 +1105,12 @@ impl Parser {
         if !self.check(&TokenKind::RParen) {
             loop {
                 let (name, span) = self.consume_ident("expected arrow function parameter")?;
-                params.push(FunctionParam {
-                    name,
-                    ty: None,
-                    span,
-                });
+                let ty = if self.match_kind(&TokenKind::Colon) {
+                    Some(self.type_name()?)
+                } else {
+                    None
+                };
+                params.push(FunctionParam { name, ty, span });
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }
@@ -1076,6 +1120,11 @@ impl Parser {
             &TokenKind::RParen,
             "expected ')' after arrow function parameters",
         )?;
+        let return_type = if self.match_kind(&TokenKind::Colon) {
+            Some(self.type_name()?)
+        } else {
+            None
+        };
         self.consume(
             &TokenKind::Arrow,
             "expected '=>' after arrow function parameters",
@@ -1084,7 +1133,7 @@ impl Parser {
         Ok(Expr::new(
             ExprKind::Function {
                 params,
-                return_type: None,
+                return_type,
                 body,
             },
             Span::new(start, body_span.end),
@@ -1196,33 +1245,51 @@ impl Parser {
         }
         let mut index = self.current + 1;
         if matches!(
-            self.tokens.get(index).map(|t| &t.kind),
+            self.tokens.get(index).map(|token| &token.kind),
             Some(TokenKind::RParen)
         ) {
             index += 1;
-            return matches!(
-                self.tokens.get(index).map(|t| &t.kind),
-                Some(TokenKind::Arrow)
-            );
-        }
-
-        loop {
-            match self.tokens.get(index).map(|t| &t.kind) {
-                Some(TokenKind::Ident(_)) => index += 1,
-                _ => return false,
-            }
-            match self.tokens.get(index).map(|t| &t.kind) {
-                Some(TokenKind::Comma) => index += 1,
-                Some(TokenKind::RParen) => {
-                    index += 1;
-                    return matches!(
-                        self.tokens.get(index).map(|t| &t.kind),
-                        Some(TokenKind::Arrow)
-                    );
+        } else {
+            loop {
+                if !matches!(
+                    self.tokens.get(index).map(|token| &token.kind),
+                    Some(TokenKind::Ident(_))
+                ) {
+                    return false;
                 }
-                _ => return false,
+                index += 1;
+                if matches!(
+                    self.tokens.get(index).map(|token| &token.kind),
+                    Some(TokenKind::Colon)
+                ) {
+                    index += 1;
+                    if !scan_arrow_type(&self.tokens, &mut index, true) {
+                        return false;
+                    }
+                }
+                match self.tokens.get(index).map(|token| &token.kind) {
+                    Some(TokenKind::Comma) => index += 1,
+                    Some(TokenKind::RParen) => {
+                        index += 1;
+                        break;
+                    }
+                    _ => return false,
+                }
             }
         }
+        if matches!(
+            self.tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Colon)
+        ) {
+            index += 1;
+            if !scan_arrow_type(&self.tokens, &mut index, false) {
+                return false;
+            }
+        }
+        matches!(
+            self.tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Arrow)
+        )
     }
 
     fn is_struct_literal_after_lbrace(&self) -> bool {
@@ -1346,6 +1413,56 @@ fn is_valid_namespace(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+}
+
+fn attach_await(value: Expr, await_start: Position) -> Expr {
+    match value {
+        Expr {
+            kind: ExprKind::TryUnwrap { expr },
+            span: try_span,
+        } => Expr::new(
+            ExprKind::TryUnwrap {
+                expr: Box::new(attach_await(*expr, await_start)),
+            },
+            try_span,
+        ),
+        value => {
+            let span = Span::new(await_start, value.span.end);
+            Expr::new(ExprKind::Await(Box::new(value)), span)
+        }
+    }
+}
+
+fn scan_arrow_type(tokens: &[Token], index: &mut usize, parameter: bool) -> bool {
+    let mut bracket_depth = 0usize;
+    let mut consumed_atom = false;
+    while let Some(token) = tokens.get(*index) {
+        match &token.kind {
+            TokenKind::Ident(_) | TokenKind::Null => {
+                consumed_atom = true;
+                *index += 1;
+            }
+            TokenKind::LBracket => {
+                bracket_depth += 1;
+                *index += 1;
+            }
+            TokenKind::RBracket if bracket_depth > 0 => {
+                bracket_depth -= 1;
+                *index += 1;
+            }
+            TokenKind::Dot | TokenKind::Bang | TokenKind::Pipe if consumed_atom => {
+                *index += 1;
+            }
+            TokenKind::Comma | TokenKind::RParen
+                if parameter && bracket_depth == 0 && consumed_atom =>
+            {
+                return true;
+            }
+            TokenKind::Arrow if !parameter && bracket_depth == 0 && consumed_atom => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn stmt_span(stmt: &Stmt) -> Span {

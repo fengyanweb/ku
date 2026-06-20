@@ -9,6 +9,7 @@ use crate::{
 
 pub mod array;
 pub mod compiler;
+pub mod config;
 pub mod core;
 pub mod errors;
 pub mod fs;
@@ -36,6 +37,7 @@ pub fn eval_dotted_builtin(
         "lexer" | "parser" => compiler::eval(&module, &function, args, span),
         "string" => string::eval(&function, args, span),
         "array" => array::eval(&function, args, span),
+        "config" => config::eval(&function, args, span, base_dir),
         "json" => json::eval(&function, args, span),
         "time" => time::eval(&function, args, span),
         "http" => http::eval(&function, args, span),

@@ -5,6 +5,8 @@ exports.stdImportPathLabels = stdImportPathLabels;
 exports.memberCompletionLabels = memberCompletionLabels;
 exports.globalCompletionLabels = globalCompletionLabels;
 exports.keywords = [
+    "async",
+    "await",
     "fn",
     "struct",
     "enum",
@@ -33,7 +35,7 @@ exports.keywords = [
 ];
 exports.types = ["int", "float", "bool", "str", "null"];
 exports.builtins = ["len", "str", "ok", "err", "println"];
-exports.stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.time"];
+exports.stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.config", "std.time"];
 exports.stdFunctions = [
     "fs.read",
     "fs.try_read",
@@ -59,6 +61,9 @@ exports.stdFunctions = [
     "json.parse",
     "json.try_parse",
     "json.stringify",
+    "config.env",
+    "config.env_file",
+    "config.yaml",
     "time.now",
     "time.unix",
     "time.millis",
@@ -69,6 +74,7 @@ exports.namespaceMembers = {
     string: ["len", "trim", "lower", "upper", "slice"],
     array: ["len", "try_get", "push", "concat"],
     json: ["parse", "try_parse", "stringify"],
+    config: ["env", "env_file", "yaml"],
     time: ["now", "unix", "millis"],
 };
 function stdImportPathLabels(current) {

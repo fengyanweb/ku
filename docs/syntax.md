@@ -27,6 +27,7 @@ fn main() {
 import
 module
 fn
+async fn
 struct
 enum
 ```
@@ -74,7 +75,7 @@ _temp
 以下单词是保留关键字：
 
 ```txt
-fn struct enum module import from
+fn async await struct enum module import from
 let mut
 if else while for in
 break continue
@@ -234,11 +235,12 @@ import { Add } from "C:/work/math.ku"
 
 ### 3.4 标准库模块导入
 
-`fs` 和 `http` 标准库必须显式导入：
+`fs`、`http` 和 `config` 标准库必须显式导入：
 
 ```ku
 import "std.fs"
 import "std.http"
+import "std.config"
 import http from "std.http"
 ```
 
@@ -288,7 +290,7 @@ user:User = User { name: "Ku" }
 state:State = State.Ready
 ```
 
-命名空间导入的类型可以通过 namespace 使用：
+命名空间导入的结构体类型可以通过 namespace 限定：
 
 ```ku
 import lib from "./lib.ku"
@@ -297,6 +299,8 @@ fn show(user: lib.User): str {
     return user.name
 }
 ```
+
+这里的 `lib.User` 是“命名空间限定的结构体类型”，不是一种叫“命名空间结构体”的新结构。
 
 ### 4.4 Result 类型
 
@@ -471,28 +475,30 @@ fn main() {
 
 ### 6.3 函数值
 
-箭头函数写作：
+函数是第一公民。普通函数、局部函数和箭头函数都可以作为值保存、传递和调用。箭头函数与普通函数一样，可以给参数和返回值写类型：
 
 ```ku
 fn main() {
-    add = (a, b) => {
+    add = (a: int, b: int): int => {
         return a + b
     }
-    double = (x) => x * 2
-    triple = x => x * 3
+    double = (x: int): int => x * 2
+    triple = x: int => x * 3
+    selected = double
 
     print(add(1, 2))
-    print(double(3))
+    print(selected(3))
     print(triple(3))
 }
 ```
 
-限制：
+类型也可以省略并由 checker 推断：
 
 ```txt
-箭头函数参数暂时不写类型
 箭头函数可以使用块体或单表达式
 单参数箭头函数可以省略参数小括号
+带返回类型的箭头函数会检查所有 return 路径
+函数值赋给另一个变量后仍然可以调用
 ```
 
 ### 6.4 闭包捕获
@@ -513,6 +519,46 @@ fn main() {
 ```
 
 当前解释器按共享绑定捕获，读取会看到外层变量最新值，赋值会写回外层可变变量。
+
+### 6.5 async fn 和 await
+
+`async fn` 表示可启动小协程的函数。调用一个 `async fn` 会得到一个 task；在同一个函数里调用多个 `async fn`，语义上就是启动多个独立 task，之后可以分别 `await`：
+
+```ku
+async fn load(value: int): int! {
+    return ok(value)
+}
+
+async fn main(): null! {
+    first = load(1)
+    second = load(2)
+    a = await first?
+    b = await second?
+    print(a + b)
+    return ok(null)
+}
+```
+
+第一版规则：
+
+- 调用 `async fn` 会立即启动 task，不是延迟到 `await` 才运行。
+- `async fn` 必须显式声明 `T!` 返回类型。
+- `await` 只能出现在 `async fn` 内。
+- `await` 的值必须是 task。
+- `await task?` 等价于 `(await task)?`。
+- `fn main()` 和 `async fn main()` 不能同时存在。
+- async task 可以读取外层捕获，但不能修改外层捕获；checker 和 runtime 都会拒绝写入。
+- native C 明确拒绝 async。
+
+运行时默认边界：
+
+- `max_tasks = 1024`。
+- task 队列有界；超过 task 上限返回 `Err({ domain: "task", code: "too_many_tasks", ... })`。
+- 队列满返回 `Err({ domain: "task", code: "queue_full", ... })`，不 panic，也不无限重试。
+- blocking worker 数为 `min(32, max(4, CPU 核心数))`。
+- `max_blocking_queue = 1024`。
+- async task 中的 `fs.read/try_read/write/try_write`、`config.env/env_file/yaml`、`http.get/post/request` 会进入 blocking pool。
+- self-await、await cycle 和过深等待链会返回结构化 task 错误，避免永久死等。
 
 ## 7. 语句
 
@@ -770,14 +816,17 @@ doubled = nums.map(x => x * 2)
 
 `array.map` 的链式写法会返回新数组，不会修改原数组。mapper 必须是函数值，参数类型由数组元素自动推断。
 
-对象可以用字符串键动态索引；缺失键运行时返回 `null`：
+对象可以用字符串键动态索引。Ku 默认严格：普通索引缺少键时直接报错；只有显式在索引后写 `?` 才允许缺失并返回 `null`：
 
 ```ku
 user = { name: "Ku" }
 print(user["name"])
-print(user["missing"])
+print(user["missing"])   // 运行时错误：object has no key 'missing'
+print(user["missing"]?)  // null
 user["age"] = 1
 ```
+
+`object[key]?` 只改变对象字符串索引的缺失键行为。数组/字符串索引越界仍然报错；其他表达式后的 `?` 仍是 Result 错误传播。
 
 字符串可以用 `int` 索引，返回单字符 `str`：
 
@@ -794,7 +843,7 @@ missing = object?.missing
 none = null?.name
 ```
 
-`?.` 左侧是 `null` 时返回 `null`；左侧是对象或结构体但字段不存在时也返回 `null`。左侧不是对象、结构体或 `null` 时仍会报类型错误。当前支持可选字段访问，不支持可选调用或可选索引。
+`?.` 左侧是 `null` 时返回 `null`；左侧是对象或结构体但字段不存在时也返回 `null`。左侧不是对象、结构体或 `null` 时仍会报类型错误。当前支持可选字段访问和对象字符串键的显式可选索引 `object[key]?`，不支持可选调用。
 
 ### 8.6 对象字面量
 
@@ -836,13 +885,15 @@ fn main() {
 
 结构体字面量必须提供全部字段，不能提供不存在的字段。
 
-命名空间结构体：
+命名空间限定的结构体字面量：
 
 ```ku
 import lib from "./lib.ku"
 
 user = lib.User { name: "Ku" }
 ```
+
+`lib.User { ... }` 是导入命名空间 `lib` 中导出的 `User` 结构体字面量，不是另一种结构体类别。
 
 ### 8.8 enum 构造
 
@@ -1173,7 +1224,32 @@ time.unix(): int
 time.millis(): int
 ```
 
-### 12.8 http
+### 12.8 config
+
+配置读取需要显式导入：
+
+```ku
+import "std.config"
+```
+
+签名：
+
+```txt
+config.env(): object
+config.env_file(path:str): object
+config.yaml(path:str): object!
+```
+
+`config.env()` 从当前源码文件所在目录读取 `.env`；文件不存在时返回空对象。`config.env_file(path)` 读取显式 `.env` 文件，读取或解析失败是不可恢复运行时错误。`config.yaml(path)?` 读取第一版平面 YAML，返回 `Result`，失败时返回 `Err({ domain:"config", code:"read_failed", message })`。
+
+第一版配置格式保持小而稳：
+
+- `.env` 支持 `KEY=value`、单双引号、基础转义和 `#` 注释行。
+- `yaml` 支持平面 `key: value`，标量支持 `str/int/float/bool/null`。
+- 配置文件上限为 1000000 bytes。
+- YAML 嵌套、数组和复杂对象暂不支持。
+
+### 12.9 http
 
 HTTP 需要显式导入：
 
@@ -1188,11 +1264,12 @@ import http from "std.http"
 http.get(url:str): HttpResponse!
 http.post(url:str, body:str): HttpResponse!
 http.request(config:object): HttpResponse!
-http.client(): object
+http.client(config?:object): object
 http.text(body:str): HttpResponse
 http.json(value:any): HttpResponse
 http.service: object
-http.server(): object
+http.service(config?:object): object
+http.server(config?:object): object
 ```
 
 `HttpResponse` 当前用对象表示：
@@ -1212,7 +1289,7 @@ timeout_ms: 5000
 max_body_bytes: 1000000
 ```
 
-`http.client()` 返回 client 配置对象，适合后续扩展 cookie、默认 header、代理、认证 token、重试策略和连接池参数。当前 `http.get/post/request` 仍使用默认全局 client。
+`http.client(config?)` 返回 client 配置对象，当前支持 `timeout_ms` 和 `max_body_bytes`。它适合后续扩展 cookie、默认 header、代理、认证 token、重试策略和连接池参数。当前 `http.get/post/request` 仍使用默认全局 client。
 
 响应 helper：
 
@@ -1225,19 +1302,50 @@ HTTP server/router API 已固定服务配置对象：
 
 ```ku
 service = http.service
-server = http.server()
+server = http.server({ max_body_bytes: 4096 })
 service.get("/index", (req, res) => {
     return http.text("ok")
 })
 service.post("/pets", (req, res) => {
     return http.json({ ok: true })
 })
-print(service.max_concurrency)
+service.get("/user/{id}", (req, res) => {
+    return http.text("ok")
+})
+listener = service.bind(":0")?
+print(service.max_active_requests)
+print(service.max_pending_requests)
 print(service.max_body_bytes)
 print(service.routes[0].method)
 ```
 
-默认 server 配置包含 `read_timeout_ms`、`write_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_concurrency` 和 `routes`。`service.get/post/put/del(path, handler)` 当前支持注册路由，会把 `{ method, path, handler }` 写入 `service.routes`；`listen(address)?` 仍返回 `Err({ domain:"http", code:"server_not_implemented", message })`，真正并发 HTTP runtime、请求/响应 handler ABI、共享变量规则还没有完成。
+默认 server 配置包含 `read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests` 和 `routes`。`service.get/post/put/del(path, handler)` 当前支持注册路由，会把 `{ method, path, param_names, handler }` 写入 `service.routes`。路径参数使用 `/user/{id}`，不使用 Express 的 `:id`。
+
+`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。第一版 handler 参数固定 `(req, res)`，handler 返回 `http.text/json(...)` 这类 `{ status, headers, body }` 响应对象。
+
+第一版 `req` 字段：
+
+```txt
+req.method: str
+req.path: str
+req.params: object   // 字段值按 str 检查
+req.query: object    // 字段值按 str 检查
+req.headers: object  // 字段值按 str 检查
+req.body: str
+```
+
+HTTP handler 会在类型检查阶段按 `(req, res)` ABI 复查参数和返回值。为了给后续并发 runtime 留安全边界，handler 第一版不能修改外层捕获变量；需要共享状态时后续应通过专门的 `std.atomic` / `std.sync` 一类 API 设计。
+
+当前 runtime 是有界阻塞 server：
+
+- `max_connections` 表示同时在线连接上限；超过时立即返回 503。
+- `max_active_requests` 控制同时工作的连接/handler worker 数。
+- `max_pending_requests` 是有界等待队列；队列满时立即返回 503，不无限排队。
+- `handler_timeout_ms` 到时返回 504。解释器执行会检查 deadline；响应线程不会在超时后继续无限等待。
+- `idle_timeout_ms` 限制连接在发送首字节前的空闲等待。
+- header/body/write 分别使用自己的 timeout，网络错误不自动无限重试。
+
+路由未命中返回 404，路径存在但 method 不匹配返回 405，body 超过 `max_body_bytes` 返回 413，header 超过 `max_header_bytes` 返回 431，坏请求返回 400。
 
 ## 13. struct
 
@@ -1341,7 +1449,16 @@ import { Value } from "@util/util"
 
 `@util/util` 表示从 dependency cache 的 `util` 包里导入 `util.ku`。
 
-当前 package source 只支持 `file://` 目录；HTTP/registry package、真正语义版本求解、网络下载和强校验还没有完成。
+当前 package source 只执行 `file://` 目录下载/缓存。registry 网络下载尚未实现，但第一版离线 schema 已实现严格解析：
+
+```toml
+name = "math"
+version = "0.1.0"
+source = "https://registry.example/ku/math/0.1.0.tar.gz"
+checksum = "sha256-<64 hex digits>"
+```
+
+registry lock 使用一个或多个 `[[package]]`，要求 `name/version/source/url/checksum/cache_key` 齐全；`source` 必须是 `registry`，版本必须是 `major.minor.patch`，checksum 必须是 `sha256-` 加 64 位十六进制。真正版本求解和网络下载仍未完成。
 
 ## 16. CLI 相关语法
 
@@ -1351,7 +1468,9 @@ import { Value } from "@util/util"
 ku <file.ku>
 ku run <file.ku>
 ku check <file.ku>
+ku check --json <file.ku>
 ku ir <file.ku>
+ku llvm <file.ku>
 ku build <file.ku>
 ku build --native <file.ku>
 ku package gc <file.ku>
@@ -1382,12 +1501,23 @@ stdlib 参数数量和基础类型错误
 http std module 是否已显式导入
 ```
 
+`ku check --json` 使用 JSON Lines。成功时静默；失败时每行一个诊断对象，稳定字段为：
+
+```txt
+level code message file line column endLine endColumn notes helps
+```
+
+VS Code 扩展优先读取 JSON diagnostics；面对旧版 Ku CLI 时只回退一次文本解析，不循环重试。
+
+`ku llvm file.ku` 在源文件旁输出 `.ll`，不要求本机安装 LLVM。当前文本后端支持 `int/bool/str`、普通函数、局部变量、直接调用、`return`、`if/while` 和 `print`；数组、struct、enum、闭包、Result、HTTP 和 async 会明确报不支持。golden test 不依赖外部工具；检测到 `llvm-as` 时会额外验证生成文本。
+
 `ku build` 当前生成解释器打包型可执行文件。
 
 `ku build --native` 当前输出 prototype C 源码，支持：
 
 ```txt
 int / bool / str
+非递归 struct layout / literal / field read / field write
 局部变量
 直接函数调用
 print
@@ -1399,7 +1529,7 @@ ok / err / ?
 系统 int main(void) wrapper
 ```
 
-native C 当前仍是 prototype：错误槽还不是完整 Error 对象 ABI，并且明确不支持数组、struct、enum、闭包、match、try/catch 等复杂 lowering。
+native C 当前仍是 prototype：struct 字段按声明顺序生成 C layout，字段类型第一阶段支持 `int/bool/str` 和已先声明的非递归结构体。错误槽还不是完整 Error 对象 ABI，并且明确不支持数组、enum、闭包、match、try/catch 和 async 等复杂 lowering。
 
 ## 17. 资源保护
 
@@ -1426,36 +1556,35 @@ http 默认超时: 5 秒
 ## 18. 当前不支持 / 未完成
 
 ```txt
-async / await
-LLVM 后端
+LLVM 数组、struct、enum、Result、闭包、HTTP、async lowering
 完整 native C 后端
-HTTP/registry package
+registry 网络下载
 真正语义版本求解
 网络下载和强校验
 match guard 模式矩阵和跨 guard 的完整穷尽性检查
 顶层脚本语句
 方法 / trait / interface
-泛型
+泛型类型 / 泛型 struct / 泛型方法 / trait 约束泛型
 模块内嵌作用域
 异常式 throw
 JavaScript 式 Promise
 数组切片语法
 表达式级 ++ / --
 字典 / Map 专用类型
-文件写入 stdlib
 ```
 
 ## 19. 快速语法表
 
 ```txt
 program       ::= item*
-item          ::= import | module | fn | struct | enum
+item          ::= import | module | fn | async_fn | struct | enum
 import        ::= 'import' IDENT 'from' STRING
                 | 'import' '{' import_name (',' import_name)* '}' 'from' STRING
                 | 'import' STRING
 import_name   ::= IDENT ('as' IDENT)?
 module        ::= 'module' IDENT
 fn            ::= 'fn' IDENT '(' params? ')' (':' type)? block
+async_fn      ::= 'async' 'fn' IDENT '(' params? ')' (':' type)? block
 params        ::= IDENT (':' type)? (',' IDENT (':' type)?)*
 struct        ::= 'struct' IDENT '{' fields* '}'
 enum          ::= 'enum' IDENT '{' variants* '}'
@@ -1476,9 +1605,12 @@ for           ::= 'for' IDENT 'in' expr block
 try           ::= 'try' block ('catch' '(' IDENT ')' block)? ('finally' block)?
 return        ::= 'return' expr?
 print         ::= 'print' expr | 'print' '(' expr ')'
-expr          ::= literal | IDENT | call | field | index | array | object | struct_lit | match | arrow | unary | binary | '(' expr ')'
+expr          ::= literal | IDENT | call | field | index | optional_index | await | array | object | struct_lit | match | arrow | unary | binary | '(' expr ')'
 match         ::= 'match' expr '{' arm* '}'
 arm           ::= pattern ('if' expr)? '=>' expr
 pattern       ::= '_' | IDENT | literal | IDENT '.' IDENT ('(' pattern* ')')? | IDENT '.' IDENT '.' IDENT ('(' pattern* ')')?
-arrow         ::= IDENT '=>' (expr | block) | '(' IDENT (',' IDENT)* ')' '=>' (expr | block)
+optional_index ::= expr '[' expr ']' '?'
+await         ::= 'await' expr
+arrow         ::= IDENT (':' type)? '=>' (expr | block)
+                | '(' params? ')' (':' type)? '=>' (expr | block)
 ```

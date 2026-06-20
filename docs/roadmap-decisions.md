@@ -1,530 +1,208 @@
-# Ku 完整化前置决策文档
-
-这份文档列出把 Ku 从当前 0.0.12 推到更完整语言时，需要先确认的设计点。目标不是拖慢实现，而是避免继续出现“语法看起来支持、实际一用就炸”的情况。
-
-每个问题都有推荐方案。你可以直接按编号回复，例如：
-
-```txt
-1A 2B 3A 4C
-其余按推荐
-```
-
-## 当前真实状态
-
-已完成：
-
-- VS Code import 补全不会再生成 `std.std.fs`。
-- VS Code 成员补全不会再生成 `http.http.server`。
-- Ku 文件默认保存格式化已开启，但格式化器仍是基础版，不是完整 prettier 级别。
-- `http.get/post/request` 已返回 `{ status, headers, body }!`。
-- HTTP client 默认复用连接，并有 timeout / max body 限制。
-- `http.client()`、`http.text()`、`http.json()` 已有。
-- `http.service` / `http.server()` 返回带默认限制的配置对象。
-- `service.get/post/put/del(path, handler)` 已能注册路由到 `service.routes`。
-
-未完成：
-
-- 真正的 HTTP server / `listen` / 并发请求处理。
-- Router 预编译匹配、params/query/header/body 懒解析。
-- Ku handler ABI，也就是 Rust HTTP server 如何安全调用 Ku 函数。
-- `.env` / `.yaml` 配置文件标准库。
-- `async / await`、Future、Task、Executor、async main。
-- async native lowering。
-
-## 1. HTTP Server 底层模型
-
-问题：Ku 的 HTTP server 底层到底用什么 Rust 库承载？
-
-### A. 使用 `tiny_http` / `rouille` 类同步库先落地
-
-优点：
-
-- 实现快。
-- 当前 Ku 解释器是同步 runtime，接入成本低。
-- 可以先把 `listen`、router、request/response 对象做闭环。
-
-缺点：
-
-- 性能和并发模型离 hyper / Go net/http 还有距离。
-- 后面做 async runtime 时可能要迁移。
-
-### B. 使用 `hyper` / `tokio` 直接做生产方向
-
-优点：
-
-- 性能和生态更好。
-- 更接近最终 HTTP server 架构。
-- async/await 后续能复用 tokio 概念。
-
-缺点：
-
-- 当前 Ku runtime 是 `Rc<RefCell>` / 非 Send，同步解释器直接跨线程调用 handler 会很麻烦。
-- 需要先解决 handler ABI、线程安全、共享变量模型。
-
-### C. 先做 Ku 自己的同步 server ABI，底层实现暂时抽象
-
-优点：
-
-- 先固定 Ku API 和 request/response 类型。
-- 后面可以把底层从同步 server 换成 hyper。
-
-缺点：
-
-- 第一版性能不会是最终形态。
-
-推荐：C。先固定 Ku API 和 handler ABI，再替换底层实现。否则直接上 hyper 会被当前 runtime 所有权模型卡住。
-
-## 2. `listen` 行为
-
-问题：`service.listen(":8080")?` 应该阻塞当前 main，还是启动后台服务后立即返回？
-
-### A. 阻塞式 listen
-
-```ku
-fn main() {
-    service = http.service
-    service.get("/", (req, res) => http.text("ok"))
-    service.listen(":8080")?
-}
-```
-
-优点：
-
-- 最简单。
-- 像 Go 的 `http.ListenAndServe`。
-- 适合 CLI server。
-
-缺点：
-
-- `listen` 后面的代码默认不会执行。
-
-### B. 后台启动，立即返回 server handle
-
-```ku
-server = service.listen(":8080")?
-print("started")
-server.stop()
-```
-
-优点：
-
-- 灵活。
-- 适合测试和多服务。
-
-缺点：
-
-- 需要 server handle、生命周期、stop/join、错误传播设计。
-
-推荐：A 作为默认，后续增加 `service.start()` 返回 handle。简单优先。
-
-## 3. Handler 参数顺序
-
-你给过两种风格：`(req,res)` 和示例里有过 `(res,req)`。
-
-### A. 固定为 `(req, res)`
-
-```ku
-service.get("/index", (req, res) => {
-    return http.text("ok")
-})
-```
-
-优点：
-
-- 符合 Express、Go handler 的阅读顺序。
-- 请求先进来，响应再返回。
-
-缺点：
-
-- 如果你更喜欢 res-first，需要调整习惯。
-
-### B. 固定为 `(res, req)`
-
-优点：
-
-- 强调“要写响应”。
-
-缺点：
-
-- 和主流生态不一致。
-
-推荐：A，固定 `(req, res)`。
-
-## 4. Handler 返回值
-
-问题：handler 是直接 `return http.text("ok")`，还是通过 `res.text("ok")` 写响应？
-
-### A. 返回 `HttpResponse`
-
-```ku
-service.get("/", (req, res) => {
-    return http.text("ok")
-})
-```
-
-优点：
-
-- 函数式、简单。
-- 不需要可变 response 对象。
-- 更适合当前解释器。
-
-缺点：
-
-- 流式 body / 分块写入要后续扩展。
-
-### B. 使用 `res` 写响应
-
-```ku
-service.get("/", (req, res) => {
-    res.text("ok")
-})
-```
-
-优点：
-
-- 类 Express。
-- 后续流式写入自然。
-
-缺点：
-
-- 需要可变 response 对象和生命周期管理。
-
-推荐：A。先让 handler 返回 `HttpResponse`，`res` 先保留为未来扩展，可以传但不用。
-
-## 5. 路由参数语法
-
-问题：路径参数用什么格式？
-
-### A. Express 风格
-
-```ku
-service.get("/user/:id", (req, res) => {
-    print(req.params.id)
-})
-```
-
-### B. Go / OpenAPI 风格
-
-```ku
-service.get("/user/{id}", (req, res) => {
-    print(req.params.id)
-})
-```
-
-推荐：B。`{id}` 和 Ku 的结构化语法更统一，也更容易和后续文档生成、OpenAPI 对齐。
-
-## 6. Router 匹配策略
-
-问题：router 是简单线性扫描，还是构建预编译 trie？
-
-### A. 先线性扫描
-
-优点：快做。
-
-缺点：违背你要求的“不能每次线性扫描”。
-
-### B. 注册阶段预编译 trie
-
-优点：
-
-- 符合性能目标。
-- `listen` 前一次性构建。
-
-缺点：
-
-- 实现复杂。
-
-推荐：B。即使第一版只支持静态路径和 `{param}`，也要在 listen 前编译，不做长期线性扫描。
-
-## 7. Request 对象字段
-
-推荐第一版固定这些字段：
-
-```ku
-req.method: str
-req.path: str
-req.params: object
-req.query: object
-req.headers: object
-req.body: str
-```
-
-待确认：
-
-- body 第一版是否只支持 `str`？
-- 是否要内置 `req.json()?`？
-
-推荐：body 是 `str`，同时提供 `req.json()?` 或 `http.parse_json(req.body)?` 二选一。当前 Ku 还没有对象方法通用 ABI，推荐先用 `json.try_parse(req.body)?`。
-
-## 8. Response 类型
-
-推荐第一版：
-
-```ku
-HttpResponse {
-    status: int
-    headers: object
-    body: str
-}
-```
-
-已有：
-
-```ku
-http.text(body)
-http.json(value)
-```
-
-待确认：
-
-- `http.text("ok", 201)` 是否保留第二参数 status？
-- `http.json(value, 201)` 是否同样支持？
-
-推荐：保留，简单实用。
-
-## 9. 共享变量和并发安全
-
-问题：HTTP server 默认并发后，handler 捕获外层变量怎么办？
-
-### A. 禁止 handler 修改外层变量
-
-```ku
-count = 0
-service.get("/", (req, res) => {
-    count = count + 1 // check 报错
-})
-```
-
-优点：
-
-- 简单稳定。
-- 避免数据竞争。
-
-缺点：
-
-- 有状态 server 要用专门状态 API。
-
-### B. 允许，但用锁保护
-
-优点：灵活。
-
-缺点：解释器和 Value 都要变成线程安全模型，改动大。
-
-### C. 默认禁止，后续加 `state` / `atomic` / `mutex`
-
-推荐：C。先禁止 HTTP handler 修改外层捕获变量，后续设计 `http.state()` 或 std sync 模块。
-
-## 10. 并发模型
-
-问题：HTTP server 默认如何并发？
-
-### A. 线程池
-
-优点：
-
-- 适合同步解释器。
-- 实现比 async executor 简单。
-
-缺点：
-
-- 每个请求跑解释器需要隔离 Env。
-
-### B. async executor
-
-优点：未来方向。
-
-缺点：当前前置不够。
-
-推荐：A 第一版。受控线程池，默认 `max_concurrency = 256`，超过后排队或返回 503。
-
-## 11. 超时和资源限制默认值
-
-推荐默认：
-
-```txt
-read_timeout_ms: 5000
-write_timeout_ms: 5000
-handler_timeout_ms: 30000
-max_body_bytes: 1000000
-max_header_bytes: 16384
-max_connections: 1024
-max_concurrency: 256
-```
-
-待确认：
-
-- handler 超时默认 30 秒是否太长？
-- 超限返回 `413/431/503` 还是 `Err`？
-
-推荐：
-
-- HTTP 层请求错误返回 HTTP status。
-- Ku 内部启动/配置错误返回 `Err(Error)`。
-
-## 12. `.env` / `.yaml` 配置
-
-问题：放到哪个标准库模块？
-
-### A. `std.config`
-
-```ku
-import "std.config"
-
-env = config.env()
-cfg = config.yaml("app.yaml")?
-```
-
-### B. 放进 `std.fs`
-
-```ku
-env = fs.env()
-cfg = fs.yaml("app.yaml")?
-```
-
-推荐：A。配置不是文件 IO 本身，单独 `std.config` 更清楚。
-
-## 13. async / await 调用语义
-
-你已经明确不想学 Rust 那种“调用 async fn 只创建 Future 不运行”。
-
-推荐语义：
-
-```ku
-async fn get_a(): str! {
-    return http.get("https://a.com")?.body
-}
-
-fn main() {
-    task = get_a()      // 立即启动任务
-    body = await task?  // 等待结果
-}
-```
-
-待确认：
-
-- 调用 async fn 是否一定立即启动？推荐：是。
-- `await` 是否只能在 `async fn` 里？你之前说只能在 async fn，推荐保持。
-- 普通 `main` 能不能 await？推荐不能，使用 `async fn main()`。
-
-## 14. async main
-
-推荐：
-
-```ku
-async fn main() {
-    res = await http.get("https://example.com")?
-    print(res.body)
-}
-```
-
-入口规则：
-
-- `fn main()` 和 `async fn main()` 二选一。
-- 不能同时存在。
-- async main 的返回值规则和普通 main 一致。
-
-## 15. `await all`
-
-问题：语法选哪一种？
-
-### A. 函数式
-
-```ku
-res_a, res_b = await all([get_a(), get_b()])?
-```
-
-### B. 关键字式
-
-```ku
-res_a, res_b = await all(get_a(), get_b())?
-```
-
-推荐：A。数组表达式更统一，后续可以复用 array。
-
-## 16. Future / Task 类型是否暴露
-
-### A. 暴露 `Task<T>`
-
-```ku
-task: Task<str> = get_a()
-```
-
-### B. 暂时不暴露类型名
-
-```ku
-task = get_a()
-```
-
-推荐：B。先让推导工作，避免泛型系统还没完全成熟时暴露太多类型。
-
-## 17. async 错误传播
-
-推荐：
+# Ku 待决策问题与路线草案
+
+这份文档是当前路线和待决策问题的唯一集中入口。已经确定的设计草案也放在这里，避免为了看后续计划来回翻多个文档。
+
+`Ku语言总路线图.md` 保留为历史路线图和大方向参考；当前真实能力边界继续以 README、`docs/syntax.md`、版本记录和本文档为准。
+
+## 已按选择处理
+
+- 箭头函数：与普通函数一样可以写参数类型和返回类型；函数继续保持第一公民，可保存、赋值和调用。
+- async：`async fn` 调用立即启动 task；同一函数可以启动多个 task，async main、await、blocking pool 和有界资源 runtime 已实现。
+- 对象索引：Ku 默认严格，`object[key]` 缺键直接报错；只有显式 `object[key]?` 才允许缺失并返回 `null`。
+- 命名空间结构体表述：统一称“命名空间限定的结构体类型/结构体字面量”，不创造新的结构体类别。
+- async / await：第一版采用“调用即启动任务”的语义，`await` 只能在 `async fn` 内使用，native C 第一版明确拒绝 async。
+- LLVM：先生成文本 `.ll`，通过 golden test 锁定输出；外部 LLVM 工具只用于额外验证。
+- 远程 package / registry：先做 registry manifest 和 lockfile schema，不急着接网络下载。
+- native C：下一阶段按 struct、array、enum/match、try/catch/finally 的顺序推进。
+- match guard：继续保守，guard 分支永远不计入 enum 穷尽覆盖；当前 checker 已符合。
+- HTTP service/server：保持同一种 service 对象；`http.server(config?)` 是构造别名。
+- `bind/listen` 第二参数：已删除，只允许 `bind(address)` / `listen(address)`，配置来自 `http.service(config?)` / `http.server(config?)`。
+- `compiled_router`：已接入真实请求匹配，不再每次请求扫描 `service.routes`。
+- `listener.close()?`：已实现显式关闭，重复 close / close 后 run 会返回 Result 错误。
+- 错误提示：第一批人类可读诊断已加入错误编号、note/help。
+- HTTP 资源限制：同时在线连接、active/pending 有界队列、handler timeout 和 idle timeout 已执行；超限返回 503，handler 超时返回 504。
+- JSON diagnostics：`ku check --json` 使用 JSON Lines，VS Code 已切到 JSON 优先、文本兼容。
+- LLVM：`ku llvm file.ku` 已实现文本 `.ll` 最小后端和 golden test，不要求本机安装 LLVM。
+- native C：struct layout/literal/字段读写第一阶段已实现。
+- registry：manifest 和 lockfile 离线 schema/parser 已实现严格校验；网络下载尚未实现。
+
+## 已定路线草案
+
+### async / await 第一版
+
+已定选择：
+
+- 调用 `async fn` 会立即启动任务，不采用 Rust 那种“只创建 Future、不运行”的默认语义。
+- `await` 只能出现在 `async fn` 内。
+- 支持 `async fn main()`，且不能和普通 `fn main()` 同时存在。
+- 阻塞 stdlib 进入 blocking pool。
+- native C 第一版明确拒绝 async。
+
+第一版语义示例：
 
 ```ku
 async fn load(): str! {
-    res = await http.get("https://example.com")?
-    return res.body
+    res = http.get("https://example.com")?
+    return ok(res.body)
 }
 ```
 
-规则：
+`async fn` 调用返回一个 task handle。task 内部结果保留原函数返回类型，例如 `str!` 仍然是可恢复 Result。`await task?` 的含义是先等待 task 完成，再对 Result 做 `?` 传播。
 
-- `await task?` 先 await，再传播 Result 错误。
-- async function 返回 `T!` 时，task 的输出是 `T!`。
-- `try/catch` 能捕获 await 后的 Result 错误。
+`http.get`、`fs.read` 等 API 本身仍返回普通 Result；当它们在 async task 中执行时，runtime 会透明地把实际阻塞工作送入 blocking pool，因此不写 `await http.get(...)`。
 
-## 18. async 和 native 后端
+Checker 边界：
 
-问题：native C 后端是否必须立刻支持 async？
+- `await` outside async fn 报 `E0801`。
+- `async fn main()` 和 `fn main()` 同时出现报错。
+- async 函数体内允许 `?`，但仍要遵守 Result 返回类型规则。
+- `ku build --native` 遇到 async/await 继续明确拒绝。
 
-### A. 必须支持
+Runtime 边界：
 
-缺点：会拖垮 native C 后端，需要 runtime ABI、task scheduler、polling ABI。
+- `max_tasks = 1024`，task 队列有界。
+- blocking worker 数为 `min(32, max(4, CPU 核心数))`。
+- `max_blocking_queue = 1024`。
+- 每个 task 有明确完成状态：pending / ok / err / panic。
+- blocking stdlib 调用必须通过 blocking pool，避免阻塞 async executor。
+- 超过 task 上限返回 `task/too_many_tasks`；队列满返回 `task/queue_full`，都不 panic、不无限重试。
+- async task 可读取但不能修改外层捕获，checker 和 runtime 双重限制。
+- self-await、await cycle 和等待深度都有界失败，避免永久等待。
 
-### B. 解释器先支持，native 明确拒绝 async
+### LLVM 文本后端
 
-推荐：B。`ku build --native` 检测到 async 直接报清楚错误。
+已定选择：先生成文本 `.ll`，用 `llvm-as` / `lli` / `clang` 验证，并用 golden test 锁定输出。等 IR 子集稳定后，再决定是否接 `inkwell` / `llvm-sys`。
 
-## 19. VS Code 格式化目标
+第一阶段子集：
 
-当前格式化器只是基础缩进整理。
+- `int` / `bool` / `str` 字面量。
+- `fn main()` 和普通函数。
+- 局部变量。
+- `return`。
+- `if` / `while`。
+- 直接函数调用。
+- `print` 最小 runtime shim。
 
-推荐下一步：
+第一阶段不做：
 
-- 保留已有保存自动格式化。
-- 增加运算符空格：`a=1+2` -> `a = 1 + 2`。
-- 增加逗号后空格。
-- 增加 `} catch` / `} finally` 同行规则。
-- 不做复杂换行，避免破坏用户代码。
+- array / struct / enum。
+- closure。
+- match。
+- Result / try / catch。
+- HTTP / fs / package。
+- async / await。
 
-待确认：
+遇到非子集节点必须清楚报错，不能生成错误 `.ll`。
 
-- 是否允许格式化器调整空行？
-- 是否强制 4 空格？
+测试策略：
 
-推荐：4 空格，最多压缩连续 3 个以上空行为 1 个空行。
+- golden test 比较 `.ll` 文本。
+- 如果本机有 `llvm-as`，验证 `.ll` 可汇编。
+- 如果本机有 `lli`，运行最小程序。
+- 如果本机有 `clang`，验证可编译可执行。
+- 外部工具缺失时跳过工具链验证，但 golden test 必须跑。
 
-## 20. 需要你确认的最小清单
+### Registry / lockfile 第一版
 
-请优先确认这些：
+已定顺序：先做 registry manifest 文档草案和 lockfile schema，不急着接网络下载。
 
-1. HTTP server 底层第一版是否按“同步受控线程池 + 预编译 router”做？
-2. `listen` 默认是否阻塞？
-3. handler 参数是否固定 `(req, res)`？
-4. handler 是否通过 `return http.text/json(...)` 返回响应？
-5. 路由参数是否使用 `/user/{id}`？
-6. handler 是否禁止修改外层捕获变量？
-7. 配置模块是否叫 `std.config`？
-8. async fn 调用是否立即启动任务？
-9. `await` 是否只能出现在 `async fn`？
-10. native C 后端是否先明确拒绝 async？
+Registry manifest 草案：
 
-## 推荐的一次性实施顺序
+```toml
+name = "math"
+version = "0.1.0"
+source = "https://registry.example/ku/math/0.1.0.tar.gz"
+checksum = "sha256-..."
+```
 
-1. 先做 HTTP server/listen 最小闭环：阻塞 listen、预编译 router、request/response 对象、资源限制、清楚错误。
-2. 补 VS Code 格式化器第二阶段：运算符空格、逗号、catch/finally 规则。
-3. 做 `std.config`：`.env` 和 `.yaml`。
-4. 设计并实现 async parser/checker/runtime 第一版。
-5. VS Code 补 async snippets / diagnostics / hover。
-6. native C 后端对 HTTP server 和 async 做明确拒绝诊断，避免误导。
+第一版 registry manifest 只描述一个包版本，不做复杂索引协议。
+
+Lockfile 字段草案：
+
+```toml
+[[package]]
+name = "math"
+version = "0.1.0"
+source = "registry"
+url = "https://registry.example/ku/math/0.1.0.tar.gz"
+checksum = "sha256-..."
+cache_key = "math-0.1.0-sha256-..."
+```
+
+Semver 第一版：
+
+- 解析 `major.minor.patch`。
+- lockfile 固定精确版本。
+- resolver 第一版只接受精确版本或简单 caret 范围。
+- 冲突先报错，不做复杂 SAT solver。
+
+强校验：当前 `ku-fnv64-*` 只适合本地快速校验。远程包第一版应使用 `sha256-*`，lockfile 必须记录最终 checksum。
+
+后续测试：
+
+- registry manifest 解析。
+- lockfile schema 写入和读取。
+- bad semver 报错。
+- checksum 字段格式报错。
+- resolver 冲突报错。
+
+### Native C 后端阶段计划
+
+已定优先级：
+
+1. struct layout / literal / field lowering。
+2. array lowering。
+3. enum layout / match lowering。
+4. try / catch / finally native error slot。
+
+阶段 1：struct
+
+- 固定 struct 字段顺序，按声明顺序生成 C struct。
+- struct literal 生成临时值或局部初始化。
+- field read/write 映射到 C 字段访问。
+- 不支持递归 struct 值，直到内存模型明确。
+
+阶段 2：array
+
+- 第一版用 runtime-owned array 结构，不把数组退化成裸 C 指针。
+- 必须保留长度，所有索引都做边界检查。
+- array literal / index / len 先做，map/filter 后做。
+
+阶段 3：enum / match
+
+- enum 使用 tag + payload layout。
+- unit variant 先做，payload variant 后做。
+- match lowering 必须复用 checker 的穷尽性结果，native 后端只负责生成分支。
+
+阶段 4：try / catch / finally
+
+- 完整 Error 对象 ABI 后再做。
+- `?`、`fail`、`try/catch/finally` 共享同一套 error slot。
+- 不允许 silent string error ABI 混进正式阶段。
+
+后续测试：
+
+- struct literal 和字段读写 golden C。
+- array 越界返回清晰 runtime error。
+- enum unit variant match。
+- payload enum match。
+- native 后端遇到未支持节点仍要明确拒绝。
+
+## 仍需你决定
+
+当前没有新的阻塞性决策。后续做到 registry 网络协议、LLVM 复杂类型或 async native lowering 的具体设计分叉时，再把需要你选择的问题集中补到这里。
+
+## 接下来要做
+
+1. native C 做有界 array runtime、长度保存和越界检查。
+2. native C 做 enum tag/payload 和 match lowering。
+3. registry 做精确版本/caret 范围解析、冲突检测，再设计网络下载和缓存更新策略。
+4. LLVM 根据实际项目需要扩展 struct/Result，或继续保持清晰的小子集。
+5. async 后续增加取消、超时和状态 API；native async lowering 继续明确拒绝，直到 ABI 单独决策。
+
+## 语言方向
+
+- 语法体验像 Go：简单、直接、适合写服务端。
+- 语义规则像 Rust：默认严格、错误明确、少隐式、少坑。
+- 运行时并发像 Go：HTTP 和 async 默认并发，用户不手写线程池。
+- 资源控制像 Zig/Rust：默认有上限，不无限排队、不无限吃内存。

@@ -2,6 +2,8 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
+    Async,
+    Await,
     Fn,
     Struct,
     Enum,

@@ -25,7 +25,10 @@ ku check examples/index.ku
 ku <file.ku>          Run a Ku source file
 ku run <file.ku>      Run a Ku source file
 ku check <file.ku>    Check a Ku source file without running
+ku check --json <file.ku>
+                      Check and emit JSON Lines diagnostics
 ku ir <file.ku>       Print checked Ku IR draft
+ku llvm <file.ku>     Emit prototype LLVM text IR
 ku build <file.ku>    Build a runnable executable wrapper
 ku build --native <file.ku>
                       Emit prototype native C source
@@ -185,7 +188,7 @@ package/
 - [Package 草案](docs/package.md)
 - [IR 草案](docs/ir.md)
 - [版本和解释器历史](docs/history.md)
-- [完整化前置决策](docs/roadmap-decisions.md)
+- [待决策问题与路线草案](docs/roadmap-decisions.md)
 - [0.0.6 版本记录](docs/v0.0.6.md)
 - [0.0.5 版本记录](docs/v0.0.5.md)
 - [0.0.4 版本记录](docs/v0.0.4.md)
@@ -195,7 +198,7 @@ package/
 
 `ku build` 当前生成解释器打包型可执行文件。
 
-`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、局部变量、直接函数调用、`print`、`return`、`if`、`while`，以及基础 Result 的 `ok` / `err` / `?` / 错误传播。native C 的错误槽仍是原型字符串 ABI；数组、struct、enum、闭包、match、try/catch 的 native lowering 仍会明确报不支持。
+`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct layout/字面量/字段读写、局部变量、直接函数调用、`print`、`return`、`if`、`while`，以及基础 Result 的 `ok` / `err` / `?` / 错误传播。native C 的错误槽仍是原型字符串 ABI；数组、enum、闭包、match、try/catch 和 async 的 native lowering 仍会明确报不支持。
 
 已完成到 0.0.12 的关键前置：
 
@@ -204,11 +207,11 @@ package/
 支持 break / continue，并修复 for + continue 作用域弹出问题。
 支持位置解构赋值 a, b = 1, 2 和丢弃占位符 _。
 支持可选字段访问 user?.name。
-支持单参数箭头函数 x => x * 2。
+支持带参数/返回类型的箭头函数，例如 `(a:int, b:int): int => a + b` 和 `x:int => x * 2`；函数保持第一公民。
 支持数组链式 map：nums.map(x => x * 2)。
 支持泛型函数：fn id<T>(value:T): T。
 支持 string / array 标准库实例方法：text.trim()、items.try_get(0)?。
-支持对象字符串键索引和字符串 int 索引：object["name"]、text[0]。
+支持严格对象字符串键索引和字符串 int 索引：`object["name"]`、`text[0]`；对象缺键默认报错，显式 `object["missing"]?` 才返回 `null`。
 可恢复错误统一为 Error 对象：{ domain, code, message }，catch (err) 后使用 err.message / err.domain / err.code。
 运行时闭包使用精确 capture map，不再把整个 Env 存进函数值。
 IR 已有 ResultBranch / BindOk / JumpErr / PropagateErr。
@@ -216,18 +219,19 @@ native C 后端已有基础 Result ABI 子集，但还不是完整 Error 对象 
 package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
 match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。
-std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.service/http.server 配置与响应 helper。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes；listen 仍返回 server_not_implemented，真正并发 HTTP runtime 还未完成。fs 需要 `import "std.fs"` 后使用，并提供 read/write 与 try_read/try_write。
+std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.service/http.server 配置与响应 helper。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes，路径参数使用 `{id}`；handler 固定 `(req, res)`，返回 `{ status, headers, body }`，并禁止修改外层捕获变量；bind/listen 只接收 address，配置来自 service/server 对象，会先真实绑定端口并编译运行时路由表，listen/run 会阻塞处理基础 HTTP 请求，listener.close 可显式关闭未运行的 listener。fs 需要 `import "std.fs"` 后使用，并提供 read/write 与 try_read/try_write。std.config 需要 `import "std.config"` 后使用，并提供 env/env_file/yaml 第一版配置读取。VS Code formatter 已支持 4 空格缩进、空行压缩、运算符/逗号空格和 `} else/catch/finally` 合并。
 native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wrapper。
+async fn 调用会立即启动 task，必须显式返回 T!；await task? 等价于 (await task)?。
+async runtime 默认最多 1024 个 task；blocking worker 为 min(32, max(4, CPU 核心数))，blocking queue 最多 1024，超限返回结构化 task Err。
 ```
 
 仍未完成：
 
 ```txt
-async / await
-LLVM 后端
-HTTP/registry package、真正语义版本求解、网络下载和强校验
+LLVM 复杂类型和高级控制流 lowering
+registry 网络下载、真正语义版本求解和缓存更新
 完整 match guard 模式矩阵和跨 guard 的穷尽性证明
-完整 native C 后端
+完整 native C 后端（array / enum / match / async 等）
 ```
 
 ## VS Code 插件

@@ -15,10 +15,14 @@ assert.deepStrictEqual(model.stdImportPathLabels("std."), [
   "std.string",
   "std.array",
   "std.json",
+  "std.config",
   "std.time",
 ]);
 
 assert(model.globalCompletionLabels().includes("http.server"));
+assert(model.globalCompletionLabels().includes("config.yaml"));
 assert(model.globalCompletionLabels().includes("std.http"));
+assert(model.globalCompletionLabels().includes("async"));
+assert(model.globalCompletionLabels().includes("await"));
 
 console.log("ku completion model ok");

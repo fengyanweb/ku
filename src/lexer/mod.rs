@@ -364,6 +364,8 @@ impl<'a> Lexer<'a> {
         }
 
         match text.as_str() {
+            "async" => TokenKind::Async,
+            "await" => TokenKind::Await,
             "fn" => TokenKind::Fn,
             "struct" => TokenKind::Struct,
             "enum" => TokenKind::Enum,

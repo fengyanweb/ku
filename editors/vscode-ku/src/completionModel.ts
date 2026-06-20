@@ -1,4 +1,6 @@
 export const keywords = [
+  "async",
+  "await",
   "fn",
   "struct",
   "enum",
@@ -28,7 +30,7 @@ export const keywords = [
 
 export const types = ["int", "float", "bool", "str", "null"];
 export const builtins = ["len", "str", "ok", "err", "println"];
-export const stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.time"];
+export const stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.config", "std.time"];
 
 export const stdFunctions = [
   "fs.read",
@@ -55,6 +57,9 @@ export const stdFunctions = [
   "json.parse",
   "json.try_parse",
   "json.stringify",
+  "config.env",
+  "config.env_file",
+  "config.yaml",
   "time.now",
   "time.unix",
   "time.millis",
@@ -66,6 +71,7 @@ export const namespaceMembers: Record<string, string[]> = {
   string: ["len", "trim", "lower", "upper", "slice"],
   array: ["len", "try_get", "push", "concat"],
   json: ["parse", "try_parse", "stringify"],
+  config: ["env", "env_file", "yaml"],
   time: ["now", "unix", "millis"],
 };
 

@@ -42,6 +42,24 @@ pub struct LockDependency {
     pub cache_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryManifest {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryLockPackage {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub url: String,
+    pub checksum: String,
+    pub cache_key: String,
+}
+
 pub const MANIFEST_FILE: &str = "ku.mod";
 pub const LOCK_FILE: &str = "ku.lock";
 pub const DEFAULT_IMPORT_ROOT: &str = "src";
@@ -504,6 +522,194 @@ pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
     })
 }
 
+pub fn parse_registry_manifest(source: &str, span: Span) -> KuResult<RegistryManifest> {
+    let fields = parse_flat_string_fields(source, "registry manifest", span)?;
+    reject_unknown_fields(
+        &fields,
+        &["name", "version", "source", "checksum"],
+        "registry manifest",
+        span,
+    )?;
+    let name = required_field(&fields, "name", "registry manifest", span)?;
+    let version = required_field(&fields, "version", "registry manifest", span)?;
+    let source = required_field(&fields, "source", "registry manifest", span)?;
+    let checksum = required_field(&fields, "checksum", "registry manifest", span)?;
+    validate_package_name(&name, span)?;
+    validate_version(&version, span)?;
+    validate_registry_url(&source, span)?;
+    validate_sha256_checksum(&checksum, span)?;
+    Ok(RegistryManifest {
+        name,
+        version,
+        source,
+        checksum,
+    })
+}
+
+pub fn parse_registry_lock(source: &str, span: Span) -> KuResult<Vec<RegistryLockPackage>> {
+    let mut packages = Vec::new();
+    let mut current = None::<HashMap<String, String>>;
+    for (index, raw_line) in source.lines().enumerate() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "[[package]]" {
+            if let Some(fields) = current.take() {
+                packages.push(finish_registry_lock_package(fields, span)?);
+            }
+            current = Some(HashMap::new());
+            continue;
+        }
+        let Some(fields) = current.as_mut() else {
+            return Err(KuError::package(
+                "invalid_registry_lock",
+                format!(
+                    "invalid registry lock line {}: expected [[package]]",
+                    index + 1
+                ),
+                span,
+            ));
+        };
+        let Some((key, raw_value)) = line.split_once('=') else {
+            return Err(KuError::package(
+                "invalid_registry_lock",
+                format!(
+                    "invalid registry lock line {}: expected key = value",
+                    index + 1
+                ),
+                span,
+            ));
+        };
+        let key = key.trim().to_string();
+        let value = parse_string_value(raw_value.trim(), index + 1, span)?;
+        if fields.insert(key.clone(), value).is_some() {
+            return Err(KuError::package(
+                "duplicate_registry_lock_field",
+                format!("duplicate registry lock field '{key}'"),
+                span,
+            ));
+        }
+    }
+    if let Some(fields) = current {
+        packages.push(finish_registry_lock_package(fields, span)?);
+    }
+    if packages.is_empty() {
+        return Err(KuError::package(
+            "empty_registry_lock",
+            "registry lock must contain at least one [[package]] entry",
+            span,
+        ));
+    }
+    Ok(packages)
+}
+
+fn finish_registry_lock_package(
+    fields: HashMap<String, String>,
+    span: Span,
+) -> KuResult<RegistryLockPackage> {
+    reject_unknown_fields(
+        &fields,
+        &["name", "version", "source", "url", "checksum", "cache_key"],
+        "registry lock package",
+        span,
+    )?;
+    let name = required_field(&fields, "name", "registry lock package", span)?;
+    let version = required_field(&fields, "version", "registry lock package", span)?;
+    let source = required_field(&fields, "source", "registry lock package", span)?;
+    let url = required_field(&fields, "url", "registry lock package", span)?;
+    let checksum = required_field(&fields, "checksum", "registry lock package", span)?;
+    let cache_key = required_field(&fields, "cache_key", "registry lock package", span)?;
+    validate_package_name(&name, span)?;
+    validate_version(&version, span)?;
+    if source != "registry" {
+        return Err(KuError::package(
+            "invalid_registry_source",
+            "registry lock source must be \"registry\"",
+            span,
+        ));
+    }
+    validate_registry_url(&url, span)?;
+    validate_sha256_checksum(&checksum, span)?;
+    if cache_key.is_empty() || cache_key.contains(['/', '\\']) {
+        return Err(KuError::package(
+            "invalid_cache_key",
+            "registry lock cache_key must be a non-empty path-free value",
+            span,
+        ));
+    }
+    Ok(RegistryLockPackage {
+        name,
+        version,
+        source,
+        url,
+        checksum,
+        cache_key,
+    })
+}
+
+fn parse_flat_string_fields(
+    source: &str,
+    kind: &str,
+    span: Span,
+) -> KuResult<HashMap<String, String>> {
+    let mut fields = HashMap::new();
+    for (index, raw_line) in source.lines().enumerate() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, raw_value)) = line.split_once('=') else {
+            return Err(KuError::package(
+                "invalid_registry_manifest",
+                format!("invalid {kind} line {}: expected key = value", index + 1),
+                span,
+            ));
+        };
+        let key = key.trim().to_string();
+        let value = parse_string_value(raw_value.trim(), index + 1, span)?;
+        if fields.insert(key.clone(), value).is_some() {
+            return Err(KuError::package(
+                "duplicate_registry_field",
+                format!("duplicate {kind} field '{key}'"),
+                span,
+            ));
+        }
+    }
+    Ok(fields)
+}
+
+fn required_field(
+    fields: &HashMap<String, String>,
+    name: &str,
+    kind: &str,
+    span: Span,
+) -> KuResult<String> {
+    fields.get(name).cloned().ok_or_else(|| {
+        KuError::package(
+            "missing_registry_field",
+            format!("{kind} missing required field '{name}'"),
+            span,
+        )
+    })
+}
+
+fn reject_unknown_fields(
+    fields: &HashMap<String, String>,
+    allowed: &[&str],
+    kind: &str,
+    span: Span,
+) -> KuResult<()> {
+    if let Some(name) = fields.keys().find(|name| !allowed.contains(&name.as_str())) {
+        return Err(KuError::package(
+            "invalid_registry_field",
+            format!("{kind} has unsupported field '{name}'"),
+            span,
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct PackageDependencyDraft {
     name: String,
@@ -693,6 +899,37 @@ fn validate_checksum(value: &str, span: Span) -> KuResult<()> {
     Ok(())
 }
 
+fn validate_sha256_checksum(value: &str, span: Span) -> KuResult<()> {
+    let Some(hex) = value.strip_prefix("sha256-") else {
+        return Err(KuError::package(
+            "invalid_registry_checksum",
+            "registry checksum must use sha256- followed by 64 hex digits",
+            span,
+        ));
+    };
+    if hex.len() != 64 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(KuError::package(
+            "invalid_registry_checksum",
+            "registry checksum must use sha256- followed by 64 hex digits",
+            span,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registry_url(value: &str, span: Span) -> KuResult<()> {
+    if !(value.starts_with("https://") || value.starts_with("http://"))
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err(KuError::package(
+            "invalid_registry_url",
+            "registry source URL must use http:// or https:// without whitespace",
+            span,
+        ));
+    }
+    Ok(())
+}
+
 fn dependency_cache_root(package: &PackageContext, dependency: &PackageDependency) -> PathBuf {
     package
         .cache_dir
@@ -767,12 +1004,22 @@ fn copy_package_source_inner(
             ))
         })?;
         let target = target_root.join(relative);
-        let metadata = entry.metadata().map_err(|err| {
+        let metadata = fs::symlink_metadata(&path).map_err(|err| {
             KuError::message(format!(
                 "failed to read package metadata '{}': {err}",
                 path.display()
             ))
         })?;
+        if metadata.file_type().is_symlink() {
+            return Err(KuError::package(
+                "unsupported_symlink",
+                format!(
+                    "package source contains unsupported symlink '{}'",
+                    path.display()
+                ),
+                Span::default(),
+            ));
+        }
         if metadata.is_dir() {
             fs::create_dir_all(&target).map_err(|err| {
                 KuError::message(format!(
@@ -830,12 +1077,22 @@ fn collect_source_bytes(
     entries.sort_by_key(|entry| entry.path());
     for entry in entries {
         let path = entry.path();
-        let metadata = entry.metadata().map_err(|err| {
+        let metadata = fs::symlink_metadata(&path).map_err(|err| {
             KuError::message(format!(
                 "failed to read package metadata '{}': {err}",
                 path.display()
             ))
         })?;
+        if metadata.file_type().is_symlink() {
+            return Err(KuError::package(
+                "unsupported_symlink",
+                format!(
+                    "package source contains unsupported symlink '{}'",
+                    path.display()
+                ),
+                Span::default(),
+            ));
+        }
         if metadata.is_dir() {
             collect_source_bytes(root, &path, output, files, bytes)?;
         } else if metadata.is_file() {

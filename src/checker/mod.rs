@@ -18,8 +18,11 @@ enum Type {
     Null,
     Array(Box<Type>),
     Result(Box<Type>),
+    Task(Box<Type>),
     Union(Vec<Type>),
     Object(HashMap<String, Type>),
+    StringMap,
+    DynamicObject,
     Struct(String),
     Enum(String),
     Generic(String),
@@ -28,6 +31,7 @@ enum Type {
         params: Vec<FunctionValueParam>,
         return_type: Option<Box<Type>>,
         body: Vec<Stmt>,
+        is_async: bool,
     },
     Unknown,
 }
@@ -49,6 +53,7 @@ struct FunctionType {
     type_params: Vec<String>,
     params: Vec<Type>,
     returns: Type,
+    is_async: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +76,8 @@ pub struct Checker {
     recoverable_depth: usize,
     loop_depth: usize,
     template_mode: bool,
+    async_depth: usize,
+    readonly_capture: Option<ReadonlyCapture>,
     std_modules: HashSet<String>,
 }
 
@@ -86,16 +93,27 @@ impl Checker {
             recoverable_depth: 0,
             loop_depth: 0,
             template_mode: false,
+            async_depth: 0,
+            readonly_capture: None,
             std_modules: HashSet::new(),
         }
     }
 
     pub fn check(mut self, program: &Program) -> KuResult<()> {
-        let mut top_level_names = HashSet::new();
+        let mut top_level_names = HashMap::new();
         for item in &program.items {
             match item {
                 Item::Function(function) => {
-                    if !top_level_names.insert(function.name.clone()) {
+                    let is_async = function.is_async;
+                    if let Some(previous_async) =
+                        top_level_names.insert(function.name.clone(), is_async)
+                    {
+                        if function.name == "main" && previous_async != is_async {
+                            return Err(KuError::runtime(
+                                "async fn main() cannot coexist with fn main()",
+                                function.span,
+                            ));
+                        }
                         return Err(KuError::runtime(
                             format!("top-level name '{}' is already defined", function.name),
                             function.span,
@@ -104,7 +122,7 @@ impl Checker {
                 }
                 Item::Import(_) => {}
                 Item::Struct(decl) => {
-                    if !top_level_names.insert(decl.name.clone()) {
+                    if top_level_names.insert(decl.name.clone(), false).is_some() {
                         return Err(KuError::runtime(
                             format!("top-level name '{}' is already defined", decl.name),
                             decl.span,
@@ -112,7 +130,7 @@ impl Checker {
                     }
                 }
                 Item::Enum(decl) => {
-                    if !top_level_names.insert(decl.name.clone()) {
+                    if top_level_names.insert(decl.name.clone(), false).is_some() {
                         return Err(KuError::runtime(
                             format!("top-level name '{}' is already defined", decl.name),
                             decl.span,
@@ -124,7 +142,7 @@ impl Checker {
                         self.std_modules.insert(name.to_string());
                         continue;
                     }
-                    if !top_level_names.insert(decl.name.clone()) {
+                    if top_level_names.insert(decl.name.clone(), false).is_some() {
                         return Err(KuError::runtime(
                             format!("top-level name '{}' is already defined", decl.name),
                             decl.span,
@@ -171,6 +189,7 @@ impl Checker {
                             })
                             .transpose()?
                             .unwrap_or(Type::Unknown),
+                        is_async: function.is_async,
                     },
                 );
             }
@@ -254,6 +273,12 @@ impl Checker {
 
     fn check_function(&mut self, function: &FnDecl) -> KuResult<()> {
         reject_duplicate_params(function)?;
+        let is_async = function.is_async;
+        if is_async {
+            self.require_async_result_return(function)?;
+        }
+        let saved_async_depth = self.async_depth;
+        self.async_depth = usize::from(is_async);
         self.push_scope();
         let explicit_return = function
             .return_type
@@ -313,6 +338,7 @@ impl Checker {
         }
         self.pop_scope();
         self.current_return = Type::Void;
+        self.async_depth = saved_async_depth;
         Ok(())
     }
 
@@ -408,6 +434,7 @@ impl Checker {
                 if !self.contains(name) {
                     return self.define(name.clone(), actual, !is_constant_name(name), *span);
                 }
+                self.reject_readonly_capture_assignment(name, *span)?;
                 let binding = self.get(name, *span)?;
                 if !binding.mutable {
                     return Err(KuError::runtime(
@@ -425,6 +452,9 @@ impl Checker {
                 value,
                 span,
             } => {
+                if let Some(name) = assign_target_root_name(target) {
+                    self.reject_readonly_capture_assignment(name, *span)?;
+                }
                 let expected = self.check_assign_target(target, *span)?;
                 let actual = self.check_expr(value)?;
                 if !type_matches(&expected, &actual) {
@@ -459,6 +489,7 @@ impl Checker {
                         self.define(name.clone(), actual, !is_constant_name(name), *span)?;
                         continue;
                     }
+                    self.reject_readonly_capture_assignment(name, *span)?;
                     let binding = self.get(name, *span)?;
                     if !binding.mutable {
                         return Err(KuError::runtime(
@@ -693,7 +724,12 @@ impl Checker {
                                     expr.span,
                                 ));
                             }
-                            return Ok(substitute_generics(&function.returns, &generic_bindings));
+                            let returns = substitute_generics(&function.returns, &generic_bindings);
+                            return Ok(if function.is_async {
+                                Type::Task(Box::new(returns))
+                            } else {
+                                returns
+                            });
                         }
                         if self.contains(name) {
                             let callee_type = self.get(name, callee.span)?.ty;
@@ -701,16 +737,22 @@ impl Checker {
                                 params,
                                 return_type,
                                 body,
+                                is_async,
                             } = callee_type
                             {
-                                return self.check_function_value_call(
+                                let returns = self.check_function_value_call(
                                     &params,
                                     return_type.as_deref(),
                                     &body,
                                     args,
                                     expr.span,
                                     Some(name),
-                                );
+                                )?;
+                                return Ok(if is_async {
+                                    Type::Task(Box::new(returns))
+                                } else {
+                                    returns
+                                });
                             }
                             return Err(KuError::runtime(
                                 format!("cannot call {}", type_name(&callee_type)),
@@ -730,21 +772,32 @@ impl Checker {
                         {
                             return Ok(ty);
                         }
+                        if let Some(ty) =
+                            self.check_http_config_constructor_call(callee, args, expr.span)?
+                        {
+                            return Ok(ty);
+                        }
                         let callee_type = self.check_expr(callee)?;
                         if let Type::FunctionValue {
                             params,
                             return_type,
                             body,
+                            is_async,
                         } = callee_type
                         {
-                            self.check_function_value_call(
+                            let returns = self.check_function_value_call(
                                 &params,
                                 return_type.as_deref(),
                                 &body,
                                 args,
                                 expr.span,
                                 None,
-                            )
+                            )?;
+                            Ok(if is_async {
+                                Type::Task(Box::new(returns))
+                            } else {
+                                returns
+                            })
                         } else {
                             Err(KuError::runtime(
                                 format!("cannot call {}", type_name(&callee_type)),
@@ -787,6 +840,19 @@ impl Checker {
                             }
                             Ok(Type::Unknown)
                         }
+                        Type::StringMap => {
+                            if index_type != Type::String {
+                                return Err(type_error(index.span, &Type::String, &index_type));
+                            }
+                            Ok(Type::String)
+                        }
+                        Type::DynamicObject => {
+                            if index_type != Type::String {
+                                return Err(type_error(index.span, &Type::String, &index_type));
+                            }
+                            Ok(Type::Unknown)
+                        }
+                        Type::Unknown => Ok(Type::Unknown),
                         other => Err(KuError::runtime(
                             format!("type error: cannot index {}", type_name(&other)),
                             target.span,
@@ -822,6 +888,7 @@ impl Checker {
                     }
                     let target_type = self.check_expr(target)?;
                     match target_type {
+                        Type::Unknown => Ok(Type::Unknown),
                         Type::Struct(struct_name) => {
                             let Some(struct_type) = self.structs.get(&struct_name) else {
                                 return Err(KuError::runtime(
@@ -839,6 +906,8 @@ impl Checker {
                         Type::Object(fields) => fields.get(name).cloned().ok_or_else(|| {
                             KuError::runtime(format!("object has no field '{name}'"), expr.span)
                         }),
+                        Type::StringMap => Ok(Type::String),
+                        Type::DynamicObject => Ok(Type::Unknown),
                         Type::Enum(enum_name) => {
                             let Some(enum_type) = self.enums.get(&enum_name) else {
                                 return Err(KuError::runtime(
@@ -941,23 +1010,65 @@ impl Checker {
                     Ok(Type::Object(object_fields))
                 }
                 ExprKind::Match { value, arms } => self.check_match_expr(value, arms, expr.span),
-                ExprKind::TryUnwrap { expr: inner } => match self.check_expr(inner)? {
-                    Type::Result(value) => {
-                        if !matches!(self.current_return, Type::Result(_))
-                            && self.recoverable_depth == 0
-                        {
-                            return Err(KuError::runtime(
-                                "'?' requires a Result return type or an enclosing try block",
-                                expr.span,
-                            ));
-                        }
-                        Ok(*value)
+                ExprKind::Await(task) => {
+                    if self.async_depth == 0 {
+                        return Err(KuError::runtime(
+                            "await can only be used inside async fn",
+                            expr.span,
+                        ));
                     }
-                    other => Err(KuError::runtime(
-                        format!("'?' expects Result but got {}", type_name(&other)),
-                        expr.span,
-                    )),
-                },
+                    match self.check_expr(task)? {
+                        Type::Task(value) => Ok(*value),
+                        Type::Unknown => Ok(Type::Unknown),
+                        other => Err(KuError::runtime(
+                            format!("await expects task but got {}", type_name(&other)),
+                            expr.span,
+                        )),
+                    }
+                }
+                ExprKind::TryUnwrap { expr: inner } => {
+                    if let ExprKind::Index { target, index } = &inner.kind {
+                        let target_type = self.check_expr(target)?;
+                        if matches!(
+                            target_type,
+                            Type::Object(_) | Type::StringMap | Type::DynamicObject
+                        ) {
+                            let index_type = self.check_expr(index)?;
+                            if index_type != Type::String {
+                                return Err(type_error(index.span, &Type::String, &index_type));
+                            }
+                            let value_type = match target_type {
+                                Type::Object(fields) => match &index.kind {
+                                    ExprKind::Literal(Literal::String(key)) => {
+                                        fields.get(key).cloned().unwrap_or(Type::Null)
+                                    }
+                                    _ => Type::Unknown,
+                                },
+                                Type::StringMap => Type::String,
+                                Type::DynamicObject => Type::Unknown,
+                                _ => unreachable!(),
+                            };
+                            return Ok(nullable_type(value_type));
+                        }
+                    }
+                    match self.check_expr(inner)? {
+                        Type::Result(value) => {
+                            if !matches!(self.current_return, Type::Result(_))
+                                && self.recoverable_depth == 0
+                            {
+                                return Err(KuError::runtime(
+                                    "'?' requires a Result return type or an enclosing try block",
+                                    expr.span,
+                                ));
+                            }
+                            Ok(*value)
+                        }
+                        other => Err(KuError::runtime(
+                            format!("'?' expects Result but got {}", type_name(&other)),
+                            expr.span,
+                        )),
+                    }
+                }
                 ExprKind::Function {
                     params,
                     return_type,
@@ -985,17 +1096,22 @@ impl Checker {
                         .iter()
                         .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
                         .collect::<Vec<_>>();
-                    self.check_function_value_body(
+                    let saved_async_depth = self.async_depth;
+                    self.async_depth = 0;
+                    let body_result = self.check_function_value_body(
                         &params,
                         return_type.as_deref(),
                         body,
                         &arg_types,
                         expr.span,
-                    )?;
+                    );
+                    self.async_depth = saved_async_depth;
+                    body_result?;
                     Ok(Type::FunctionValue {
                         params,
                         return_type,
                         body: body.clone(),
+                        is_async: false,
                     })
                 }
             }
@@ -1087,7 +1203,20 @@ impl Checker {
                         }
                         Ok(*element)
                     }
+                    Type::Unknown => Ok(Type::Unknown),
                     Type::Object(_) => {
+                        if index_type != Type::String {
+                            return Err(type_error(index.span, &Type::String, &index_type));
+                        }
+                        Ok(Type::Unknown)
+                    }
+                    Type::StringMap => {
+                        if index_type != Type::String {
+                            return Err(type_error(index.span, &Type::String, &index_type));
+                        }
+                        Ok(Type::String)
+                    }
+                    Type::DynamicObject => {
                         if index_type != Type::String {
                             return Err(type_error(index.span, &Type::String, &index_type));
                         }
@@ -1118,6 +1247,8 @@ impl Checker {
                     .get(name)
                     .cloned()
                     .ok_or_else(|| KuError::runtime(format!("object has no field '{name}'"), span)),
+                Type::StringMap => Ok(Type::String),
+                Type::DynamicObject => Ok(Type::Unknown),
                 other => Err(KuError::runtime(
                     format!("type error: {} has no fields", type_name(&other)),
                     target.span,
@@ -1135,18 +1266,36 @@ impl Checker {
         let ExprKind::Field { target, name } = &callee.kind else {
             return Ok(None);
         };
-        if !matches!(name.as_str(), "get" | "post" | "put" | "del" | "listen") {
+        if !matches!(
+            name.as_str(),
+            "get" | "post" | "put" | "del" | "listen" | "bind" | "run" | "close"
+        ) {
             return Ok(None);
         }
         let target_type = self.check_expr(target)?;
+        if (name == "run" || name == "close") && is_http_listener_type(&target_type) {
+            if !args.is_empty() {
+                return Err(KuError::runtime(
+                    format!(
+                        "http listener {name} expects 0 arguments but got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            return Ok(Some(Type::Result(Box::new(Type::Null))));
+        }
         if !is_http_service_type(&target_type) {
             return Ok(None);
         }
-        if name == "listen" {
-            if args.is_empty() || args.len() > 2 {
+        if name == "run" || name == "close" {
+            return Ok(None);
+        }
+        if name == "listen" || name == "bind" {
+            if args.len() != 1 {
                 return Err(KuError::runtime(
                     format!(
-                        "http service listen expects 1 or 2 arguments but got {}",
+                        "http service {name} expects 1 argument but got {}",
                         args.len()
                     ),
                     span,
@@ -1156,17 +1305,11 @@ impl Checker {
             if !type_matches(&Type::String, &address) {
                 return Err(type_error(args[0].span, &Type::String, &address));
             }
-            if let Some(config) = args.get(1) {
-                let config_type = self.check_expr(config)?;
-                if !matches!(config_type, Type::Object(_) | Type::Unknown) {
-                    return Err(type_error(
-                        config.span,
-                        &Type::Object(HashMap::new()),
-                        &config_type,
-                    ));
-                }
-            }
-            return Ok(Some(Type::Result(Box::new(Type::Null))));
+            return Ok(Some(if name == "bind" {
+                Type::Result(Box::new(http_listener_type()))
+            } else {
+                Type::Result(Box::new(Type::Null))
+            }));
         }
         if args.len() != 2 {
             return Err(KuError::runtime(
@@ -1181,14 +1324,180 @@ impl Checker {
         if !type_matches(&Type::String, &path_type) {
             return Err(type_error(args[0].span, &Type::String, &path_type));
         }
-        let handler_type = self.check_expr(&args[1])?;
-        if !matches!(handler_type, Type::FunctionValue { .. } | Type::Unknown) {
-            return Err(KuError::runtime(
-                format!("http service {name} handler must be a function"),
-                args[1].span,
-            ));
+        let handler_arg = &args[1];
+        if let ExprKind::Function {
+            params,
+            return_type,
+            body,
+        } = &handler_arg.kind
+        {
+            reject_duplicate_function_value_params(params)?;
+            let params = params
+                .iter()
+                .map(|param| {
+                    Ok(FunctionValueParam {
+                        name: param.name.clone(),
+                        ty: param
+                            .ty
+                            .as_ref()
+                            .map(|ty| self.resolve_type_name(ty, param.span))
+                            .transpose()?,
+                    })
+                })
+                .collect::<KuResult<Vec<_>>>()?;
+            let return_type = return_type
+                .as_ref()
+                .map(|ty| self.resolve_type_name(ty, handler_arg.span).map(Box::new))
+                .transpose()?;
+            self.check_http_handler(
+                name,
+                &params,
+                return_type.as_deref(),
+                body,
+                handler_arg.span,
+            )?;
+        } else {
+            let handler_type = self.check_expr(handler_arg)?;
+            match handler_type {
+                Type::FunctionValue {
+                    params,
+                    return_type,
+                    body,
+                    ..
+                } => {
+                    self.check_http_handler(
+                        name,
+                        &params,
+                        return_type.as_deref(),
+                        &body,
+                        handler_arg.span,
+                    )?;
+                }
+                Type::Unknown => {}
+                _ => {
+                    return Err(KuError::runtime(
+                        format!("http service {name} handler must be a function"),
+                        handler_arg.span,
+                    ));
+                }
+            }
         }
         Ok(Some(target_type))
+    }
+
+    fn check_http_config_constructor_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Option<Type>> {
+        let ExprKind::Field { target, name } = &callee.kind else {
+            return Ok(None);
+        };
+        if !matches!(name.as_str(), "client" | "service" | "server") {
+            return Ok(None);
+        }
+        let ExprKind::Variable(module) = &target.kind else {
+            return Ok(None);
+        };
+        if module != "http" || self.contains("http") || !self.std_modules.contains("http") {
+            return Ok(None);
+        }
+        if args.len() > 1 {
+            return Err(KuError::runtime(
+                format!(
+                    "http.{name} expects 0 or 1 arguments but got {}",
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        if let Some(config) = args.first() {
+            let config_type = self.check_expr(config)?;
+            if !matches!(
+                config_type,
+                Type::Object(_) | Type::DynamicObject | Type::Unknown
+            ) {
+                return Err(type_error(
+                    config.span,
+                    &Type::Object(HashMap::new()),
+                    &config_type,
+                ));
+            }
+        }
+        Ok(Some(if name == "client" {
+            http_client_type()
+        } else {
+            http_service_type()
+        }))
+    }
+
+    fn apply_http_config_constructor_signature(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Type> {
+        if args.len() > 1 {
+            return Err(KuError::runtime(
+                format!(
+                    "function '{name}' expects 0 or 1 arguments but got {}",
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        if let Some(config) = args.first() {
+            let config_type = self.check_expr(config)?;
+            if !matches!(
+                config_type,
+                Type::Object(_) | Type::DynamicObject | Type::Unknown
+            ) {
+                return Err(type_error(
+                    config.span,
+                    &Type::Object(HashMap::new()),
+                    &config_type,
+                ));
+            }
+        }
+        Ok(if name == "http.client" {
+            http_client_type()
+        } else {
+            http_service_type()
+        })
+    }
+
+    fn check_http_handler(
+        &mut self,
+        method: &str,
+        params: &[FunctionValueParam],
+        return_type: Option<&Type>,
+        body: &[Stmt],
+        span: Span,
+    ) -> KuResult<()> {
+        if params.len() != 2 {
+            return Err(KuError::runtime(
+                format!("http service {method} handler expects 2 parameters"),
+                span,
+            ));
+        }
+        let expected = http_response_type();
+        let actual = self.check_function_value_call_with_types_readonly_captures(
+            params,
+            Some(&expected),
+            body,
+            &[http_request_type(), http_response_type()],
+            span,
+        )?;
+        if let Some(return_type) = return_type {
+            if !type_matches(&expected, return_type) {
+                return Err(type_error(span, &expected, return_type));
+            }
+        }
+        if !type_matches(&expected, &actual) {
+            return Err(type_error(span, &expected, &actual));
+        }
+        Ok(())
     }
 
     fn check_enum_constructor(
@@ -1442,6 +1751,12 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> KuResult<Type> {
+        if matches!(
+            signature.name.as_str(),
+            "http.client" | "http.service" | "http.server"
+        ) {
+            return self.apply_http_config_constructor_signature(&signature.name, args, span);
+        }
         expect_arg_count(&signature.name, args.len(), signature.args.len(), span)?;
         let actuals = args
             .iter()
@@ -1516,7 +1831,7 @@ impl Checker {
             TypePattern::Null => actual == &Type::Null,
             TypePattern::Unknown | TypePattern::Any => true,
             TypePattern::ArrayAny => matches!(actual, Type::Array(_)),
-            TypePattern::ObjectAny => matches!(actual, Type::Object(_)),
+            TypePattern::ObjectAny => matches!(actual, Type::Object(_) | Type::DynamicObject),
             TypePattern::ObjectFields(fields) => match actual {
                 Type::Object(actual_fields) => fields.iter().all(|(name, pattern)| {
                     actual_fields
@@ -1545,7 +1860,7 @@ impl Checker {
             TypePattern::String => Type::String,
             TypePattern::Null => Type::Null,
             TypePattern::ArrayAny => Type::Array(Box::new(Type::Unknown)),
-            TypePattern::ObjectAny => Type::Object(HashMap::new()),
+            TypePattern::ObjectAny => Type::DynamicObject,
             TypePattern::ObjectFields(fields) => Type::Object(
                 fields
                     .iter()
@@ -1575,7 +1890,7 @@ impl Checker {
             TypePattern::Null => Ok(Type::Null),
             TypePattern::Unknown | TypePattern::Any => Ok(Type::Unknown),
             TypePattern::ArrayAny => Ok(Type::Array(Box::new(Type::Unknown))),
-            TypePattern::ObjectAny => Ok(Type::Object(HashMap::new())),
+            TypePattern::ObjectAny => Ok(Type::DynamicObject),
             TypePattern::ObjectFields(fields) => Ok(Type::Object(
                 fields
                     .iter()
@@ -1638,6 +1953,7 @@ impl Checker {
             params,
             return_type,
             body,
+            ..
         } = mapper_type
         else {
             return Err(KuError::runtime(
@@ -1706,6 +2022,43 @@ impl Checker {
         arg_types: &[Type],
         span: Span,
     ) -> KuResult<Type> {
+        self.check_function_value_call_with_types_inner(
+            params,
+            return_type,
+            body,
+            arg_types,
+            span,
+            None,
+        )
+    }
+
+    fn check_function_value_call_with_types_readonly_captures(
+        &mut self,
+        params: &[FunctionValueParam],
+        return_type: Option<&Type>,
+        body: &[Stmt],
+        arg_types: &[Type],
+        span: Span,
+    ) -> KuResult<Type> {
+        self.check_function_value_call_with_types_inner(
+            params,
+            return_type,
+            body,
+            arg_types,
+            span,
+            Some("http handler"),
+        )
+    }
+
+    fn check_function_value_call_with_types_inner(
+        &mut self,
+        params: &[FunctionValueParam],
+        return_type: Option<&Type>,
+        body: &[Stmt],
+        arg_types: &[Type],
+        span: Span,
+        readonly_capture_owner: Option<&'static str>,
+    ) -> KuResult<Type> {
         if params.len() != arg_types.len() {
             return Err(KuError::runtime(
                 format!(
@@ -1723,10 +2076,21 @@ impl Checker {
                 }
             }
         }
-        if let Some(return_type) = return_type {
-            return Ok(return_type.clone());
+        if let Some(owner) = readonly_capture_owner {
+            self.check_function_value_body_readonly_captures(
+                params,
+                return_type,
+                body,
+                arg_types,
+                span,
+                owner,
+            )
+        } else {
+            if let Some(return_type) = return_type {
+                return Ok(return_type.clone());
+            }
+            self.check_function_value_body(params, return_type, body, arg_types, span)
         }
-        self.check_function_value_body(params, return_type, body, arg_types, span)
     }
 
     fn check_function_value_body(
@@ -1771,8 +2135,61 @@ impl Checker {
         result
     }
 
+    fn check_function_value_body_readonly_captures(
+        &mut self,
+        params: &[FunctionValueParam],
+        return_type: Option<&Type>,
+        body: &[Stmt],
+        arg_types: &[Type],
+        span: Span,
+        owner: &'static str,
+    ) -> KuResult<Type> {
+        let saved_capture = self.readonly_capture;
+        self.push_scope();
+        self.readonly_capture = Some(ReadonlyCapture {
+            boundary: self.scopes.len() - 1,
+            owner,
+        });
+        let saved_return = self.current_return.clone();
+        self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
+
+        let result = (|| -> KuResult<Type> {
+            for (param, ty) in params.iter().zip(arg_types.iter()) {
+                self.define(param.name.clone(), ty.clone(), false, span)?;
+            }
+
+            let mut inferred_return = Type::Null;
+            for stmt in body {
+                if let Some(return_type) = self.check_stmt_and_infer_return(stmt)? {
+                    inferred_return = merge_return_types(&inferred_return, &return_type, span)?;
+                }
+            }
+            if let Some(expected) = return_type {
+                if expected != &Type::Void && !block_may_return(body) {
+                    return Err(KuError::runtime(
+                        format!("function value must return {}", type_name(expected)),
+                        span,
+                    ));
+                }
+                if inferred_return != Type::Null && !type_matches(expected, &inferred_return) {
+                    return Err(type_error(span, expected, &inferred_return));
+                }
+            }
+            Ok(inferred_return)
+        })();
+
+        self.current_return = saved_return;
+        self.readonly_capture = saved_capture;
+        self.pop_scope();
+        result
+    }
+
     fn check_local_function(&mut self, function: &FnDecl) -> KuResult<()> {
         reject_duplicate_params(function)?;
+        let is_async = function.is_async;
+        if is_async {
+            self.require_async_result_return(function)?;
+        }
         let params = function
             .params
             .iter()
@@ -1806,6 +2223,7 @@ impl Checker {
                 params: params.clone(),
                 return_type: return_type.clone().map(Box::new),
                 body: function.body.clone(),
+                is_async,
             },
             false,
             function.span,
@@ -1814,13 +2232,55 @@ impl Checker {
             .iter()
             .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
             .collect::<Vec<_>>();
-        self.check_function_value_body(
-            &params,
-            return_type.as_ref(),
-            &function.body,
-            &arg_types,
+        let saved_async_depth = self.async_depth;
+        self.async_depth = usize::from(is_async);
+        let result = if is_async {
+            self.check_function_value_body_readonly_captures(
+                &params,
+                return_type.as_ref(),
+                &function.body,
+                &arg_types,
+                function.span,
+                "async task",
+            )
+        } else {
+            self.check_function_value_body(
+                &params,
+                return_type.as_ref(),
+                &function.body,
+                &arg_types,
+                function.span,
+            )
+        };
+        self.async_depth = saved_async_depth;
+        result.map(|_| ())
+    }
+
+    fn require_async_result_return(&self, function: &FnDecl) -> KuResult<()> {
+        let Some(return_type) = &function.return_type else {
+            return Err(KuError::runtime(
+                format!(
+                    "async fn '{}' must explicitly declare a Result return type such as T!",
+                    function.name
+                ),
+                function.span,
+            ));
+        };
+        let resolved = self.resolve_type_name_with_generics(
+            return_type,
             function.span,
+            &function.type_params,
         )?;
+        if !matches!(resolved, Type::Result(_)) {
+            return Err(KuError::runtime(
+                format!(
+                    "async fn '{}' must return T!, got {}",
+                    function.name,
+                    type_name(&resolved)
+                ),
+                function.span,
+            ));
+        }
         Ok(())
     }
 
@@ -1962,6 +2422,36 @@ impl Checker {
             span,
         ))
     }
+
+    fn reject_readonly_capture_assignment(&self, name: &str, span: Span) -> KuResult<()> {
+        let Some(capture) = self.readonly_capture else {
+            return Ok(());
+        };
+        if self.scopes[capture.boundary..]
+            .iter()
+            .rev()
+            .any(|scope| scope.contains_key(name))
+        {
+            return Ok(());
+        }
+        if self.scopes[..capture.boundary]
+            .iter()
+            .rev()
+            .any(|scope| scope.contains_key(name))
+        {
+            return Err(KuError::runtime(
+                format!("{} cannot modify captured variable '{name}'", capture.owner),
+                span,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReadonlyCapture {
+    boundary: usize,
+    owner: &'static str,
 }
 
 fn expect_arg_count(name: &str, actual: usize, expected: usize, span: Span) -> KuResult<()> {
@@ -2049,6 +2539,8 @@ fn type_matches(expected: &Type, actual: &Type) -> bool {
         (_, Type::Union(options)) => options.iter().all(|option| type_matches(expected, option)),
         (Type::Array(left), Type::Array(right)) => type_matches(left, right),
         (Type::Result(left), Type::Result(right)) => type_matches(left, right),
+        (Type::Object(_), Type::StringMap) | (Type::StringMap, Type::Object(_)) => true,
+        (Type::Object(_), Type::DynamicObject) | (Type::DynamicObject, Type::Object(_)) => true,
         (Type::Object(left), Type::Object(right)) => {
             left.len() == right.len()
                 && left.iter().all(|(name, left_ty)| {
@@ -2058,6 +2550,19 @@ fn type_matches(expected: &Type, actual: &Type) -> bool {
                 })
         }
         _ => expected == actual,
+    }
+}
+
+fn nullable_type(value: Type) -> Type {
+    match value {
+        Type::Null => Type::Null,
+        Type::Union(mut types) => {
+            if !types.contains(&Type::Null) {
+                types.push(Type::Null);
+            }
+            Type::Union(types)
+        }
+        other => Type::Union(vec![other, Type::Null]),
     }
 }
 
@@ -2185,8 +2690,11 @@ fn type_name(ty: &Type) -> String {
         Type::Null => "null".to_string(),
         Type::Array(inner) => format!("[{}]", type_name(inner)),
         Type::Result(inner) => format!("{}!", type_name(inner)),
+        Type::Task(inner) => format!("task<{}>", type_name(inner)),
         Type::Union(types) => types.iter().map(type_name).collect::<Vec<_>>().join(" | "),
         Type::Object(_) => "object".to_string(),
+        Type::StringMap => "object".to_string(),
+        Type::DynamicObject => "object".to_string(),
         Type::Struct(name) => name.clone(),
         Type::Enum(name) => name.clone(),
         Type::Generic(name) => name.clone(),
@@ -2292,15 +2800,27 @@ fn dotted_name(expr: &Expr) -> Option<(String, String)> {
     Some((module.clone(), name.clone()))
 }
 
+fn http_client_type() -> Type {
+    Type::Object(HashMap::from([
+        ("kind".to_string(), Type::String),
+        ("timeout_ms".to_string(), Type::Int),
+        ("max_body_bytes".to_string(), Type::Int),
+    ]))
+}
+
 fn http_service_type() -> Type {
     Type::Object(HashMap::from([
         ("kind".to_string(), Type::String),
-        ("read_timeout_ms".to_string(), Type::Int),
+        ("read_header_timeout_ms".to_string(), Type::Int),
+        ("read_body_timeout_ms".to_string(), Type::Int),
         ("write_timeout_ms".to_string(), Type::Int),
+        ("idle_timeout_ms".to_string(), Type::Int),
+        ("handler_timeout_ms".to_string(), Type::Int),
         ("max_body_bytes".to_string(), Type::Int),
         ("max_header_bytes".to_string(), Type::Int),
         ("max_connections".to_string(), Type::Int),
-        ("max_concurrency".to_string(), Type::Int),
+        ("max_active_requests".to_string(), Type::Int),
+        ("max_pending_requests".to_string(), Type::Int),
         (
             "routes".to_string(),
             Type::Array(Box::new(http_route_type())),
@@ -2312,8 +2832,52 @@ fn http_route_type() -> Type {
     Type::Object(HashMap::from([
         ("method".to_string(), Type::String),
         ("path".to_string(), Type::String),
+        (
+            "param_names".to_string(),
+            Type::Array(Box::new(Type::String)),
+        ),
         ("handler".to_string(), Type::Unknown),
     ]))
+}
+
+fn http_request_type() -> Type {
+    Type::Object(HashMap::from([
+        ("method".to_string(), Type::String),
+        ("path".to_string(), Type::String),
+        ("params".to_string(), Type::StringMap),
+        ("query".to_string(), Type::StringMap),
+        ("headers".to_string(), Type::StringMap),
+        ("body".to_string(), Type::String),
+    ]))
+}
+
+fn http_response_type() -> Type {
+    Type::Object(HashMap::from([
+        ("status".to_string(), Type::Int),
+        ("headers".to_string(), Type::Object(HashMap::new())),
+        ("body".to_string(), Type::String),
+    ]))
+}
+
+fn http_listener_type() -> Type {
+    Type::Object(HashMap::from([
+        ("kind".to_string(), Type::String),
+        ("listener_id".to_string(), Type::Int),
+        ("address".to_string(), Type::String),
+        ("service".to_string(), http_service_type()),
+        ("compiled_router".to_string(), Type::Object(HashMap::new())),
+    ]))
+}
+
+fn is_http_listener_type(ty: &Type) -> bool {
+    let Type::Object(fields) = ty else {
+        return false;
+    };
+    matches!(fields.get("kind"), Some(Type::String))
+        && fields.contains_key("listener_id")
+        && fields.contains_key("address")
+        && fields.contains_key("service")
+        && fields.contains_key("compiled_router")
 }
 
 fn is_http_service_type(ty: &Type) -> bool {
@@ -2322,8 +2886,25 @@ fn is_http_service_type(ty: &Type) -> bool {
     };
     matches!(fields.get("kind"), Some(Type::String))
         && fields.contains_key("routes")
-        && fields.contains_key("max_concurrency")
+        && fields.contains_key("max_active_requests")
         && fields.contains_key("max_body_bytes")
+}
+
+fn assign_target_root_name(target: &AssignTarget) -> Option<&str> {
+    match target {
+        AssignTarget::Variable(name) => Some(name),
+        AssignTarget::Index { target, .. } | AssignTarget::Field { target, .. } => {
+            expr_root_name(target)
+        }
+    }
+}
+
+fn expr_root_name(expr: &Expr) -> Option<&str> {
+    match &expr.kind {
+        ExprKind::Variable(name) => Some(name),
+        ExprKind::Index { target, .. } | ExprKind::Field { target, .. } => expr_root_name(target),
+        _ => None,
+    }
 }
 
 struct TemplateInterpolation {

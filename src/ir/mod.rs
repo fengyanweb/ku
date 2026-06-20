@@ -175,6 +175,10 @@ pub enum IrExprKind {
     Literal(String),
     Local(String),
     Temp(TempId),
+    StructLiteral {
+        name: String,
+        fields: Vec<(String, IrExpr)>,
+    },
     Unary {
         op: UnaryOp,
         expr: Box<IrExpr>,
@@ -231,6 +235,7 @@ struct FunctionSig {
 }
 
 pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
+    let layouts = lower_layouts(program);
     let mut signatures = HashMap::new();
     let mut next_function_id = 0;
     for item in &program.items {
@@ -271,7 +276,7 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                     ty: ty.clone(),
                 })
                 .collect::<Vec<_>>();
-            let mut lower = FunctionLowerer::new(&signatures, signature.returns.clone());
+            let mut lower = FunctionLowerer::new(&signatures, &layouts, signature.returns.clone());
             for param in &params {
                 lower.locals.insert(param.name.clone(), param.ty.clone());
             }
@@ -285,10 +290,7 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
             });
         }
     }
-    Ok(IrProgram {
-        functions,
-        layouts: lower_layouts(program),
-    })
+    Ok(IrProgram { functions, layouts })
 }
 
 impl fmt::Display for IrProgram {
@@ -467,6 +469,16 @@ impl fmt::Display for IrExpr {
         match &self.kind {
             IrExprKind::Literal(value) | IrExprKind::Local(value) => write!(f, "{value}"),
             IrExprKind::Temp(id) => write!(f, "%t{}", id.0),
+            IrExprKind::StructLiteral { name, fields } => {
+                write!(f, "{name} {{")?;
+                for (index, (field, value)) in fields.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{field}: {value}")?;
+                }
+                write!(f, "}}")
+            }
             IrExprKind::Unary { op, expr } => write!(f, "{}{}", unary_text(*op), expr),
             IrExprKind::Binary { left, op, right } => {
                 write!(f, "{left} {} {right}", binary_text(*op))
@@ -500,6 +512,7 @@ impl fmt::Display for IrExpr {
 
 struct FunctionLowerer<'a> {
     signatures: &'a HashMap<String, FunctionSig>,
+    layouts: &'a IrLayoutTable,
     return_type: IrType,
     locals: HashMap<String, IrType>,
     blocks: Vec<IrBlock>,
@@ -517,9 +530,14 @@ struct IrTryHandler {
 }
 
 impl<'a> FunctionLowerer<'a> {
-    fn new(signatures: &'a HashMap<String, FunctionSig>, return_type: IrType) -> Self {
+    fn new(
+        signatures: &'a HashMap<String, FunctionSig>,
+        layouts: &'a IrLayoutTable,
+        return_type: IrType,
+    ) -> Self {
         Self {
             signatures,
+            layouts,
             return_type,
             locals: HashMap::new(),
             blocks: Vec::new(),
@@ -964,10 +982,44 @@ impl<'a> FunctionLowerer<'a> {
                 index: self.lower_expr(index)?,
             }),
             AssignTarget::Field { target, name } => Ok(IrLValue::Field {
-                target: self.lower_expr(target)?,
+                target: self.lower_lvalue_target_expr(target)?,
                 name: name.clone(),
             }),
         }
+    }
+
+    fn lower_lvalue_target_expr(&mut self, expr: &Expr) -> KuResult<IrExpr> {
+        match &expr.kind {
+            ExprKind::Variable(name) => Ok(IrExpr {
+                kind: IrExprKind::Local(name.clone()),
+                ty: self.locals.get(name).cloned().unwrap_or(IrType::Unknown),
+            }),
+            ExprKind::Field { target, name } => {
+                let target = self.lower_lvalue_target_expr(target)?;
+                let ty = self.field_type(&target.ty, name);
+                Ok(IrExpr {
+                    kind: IrExprKind::Field {
+                        target: Box::new(target),
+                        name: name.clone(),
+                    },
+                    ty,
+                })
+            }
+            _ => self.lower_expr(expr),
+        }
+    }
+
+    fn field_type(&self, target: &IrType, field_name: &str) -> IrType {
+        let IrType::Named(struct_name) = target else {
+            return IrType::Unknown;
+        };
+        self.layouts
+            .structs
+            .iter()
+            .find(|layout| layout.name == *struct_name)
+            .and_then(|layout| layout.fields.iter().find(|field| field.name == field_name))
+            .map(|field| field.ty.clone())
+            .unwrap_or(IrType::Unknown)
     }
 
     fn lower_expr(&mut self, expr: &Expr) -> KuResult<IrExpr> {
@@ -1054,16 +1106,21 @@ impl<'a> FunctionLowerer<'a> {
             }
             ExprKind::Field { target, name } => {
                 let target = self.lower_expr(target)?;
+                let ty = self.field_type(&target.ty, name);
                 self.emit_temp(IrExpr {
                     kind: IrExprKind::Field {
                         target: Box::new(target),
                         name: name.clone(),
                     },
-                    ty: IrType::Unknown,
+                    ty,
                 })
             }
             ExprKind::OptionalField { .. } => Err(KuError::runtime(
                 "optional chaining is not supported by IR/native lowering yet",
+                expr.span,
+            )),
+            ExprKind::Await(_) => Err(KuError::runtime(
+                "async/await is not supported by IR/native lowering yet",
                 expr.span,
             )),
             ExprKind::TryUnwrap { expr } => {
@@ -1074,7 +1131,19 @@ impl<'a> FunctionLowerer<'a> {
                 };
                 self.emit_try_unwrap(expr, ty)
             }
-            ExprKind::StructLiteral { name, .. } => Ok(unsupported_expr(format!("{name} literal"))),
+            ExprKind::StructLiteral { name, fields } => {
+                let fields = fields
+                    .iter()
+                    .map(|(field, value)| Ok((field.clone(), self.lower_expr(value)?)))
+                    .collect::<KuResult<Vec<_>>>()?;
+                Ok(IrExpr {
+                    kind: IrExprKind::StructLiteral {
+                        name: name.clone(),
+                        fields,
+                    },
+                    ty: IrType::Named(name.clone()),
+                })
+            }
             ExprKind::ObjectLiteral { .. } => Ok(unsupported_expr("object literal")),
             ExprKind::Match { .. } => Ok(unsupported_expr("match expression")),
             ExprKind::Function { .. } => Ok(IrExpr {
@@ -1504,7 +1573,7 @@ fn collect_free_expr_names(expr: &Expr, bound: &HashSet<String>, free: &mut Hash
                 free.insert(name.clone());
             }
         }
-        ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } => {
+        ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => {
             collect_free_expr_names(expr, bound, free)
         }
         ExprKind::Binary { left, right, .. } => {

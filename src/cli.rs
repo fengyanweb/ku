@@ -31,7 +31,10 @@ Usage:
   ku <file.ku>          Run a Ku source file
   ku run <file.ku>      Run a Ku source file
   ku check <file.ku>    Check a Ku source file without running it
+  ku check --json <file.ku>
+                        Check and emit JSON Lines diagnostics
   ku ir <file.ku>       Print checked Ku IR draft
+  ku llvm <file.ku>     Emit prototype LLVM text IR
   ku build <file.ku>    Build a runnable executable wrapper
   ku build --native <file.ku>
                         Emit prototype native C source
@@ -48,6 +51,7 @@ Examples:
   ku run examples\\hello.ku
   ku check examples\\error.ku
   ku ir examples\\function.ku
+  ku llvm examples\\function.ku
   ku build examples\\hello.ku
   ku build --native examples\\function.ku
   ku package gc examples\\package\\src\\main.ku
@@ -61,17 +65,33 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
             run_source(path, &source)
         }
         Some("check") => {
-            let path = exact_path(&args, "check")?;
-            let source = read_ku_file(path)?;
-            check_source(path, &source)?;
-            println!("check ok: {path}");
-            Ok(())
+            if args.get(2).is_some_and(|arg| arg == "--json") {
+                let path = exact_path_at(&args, "check --json", 3)?;
+                let source = read_ku_file(path)
+                    .map_err(|err| KuError::message(diagnostic_json_line(&err, path, "")))?;
+                parse_and_check(path, &source)
+                    .map(|_| ())
+                    .map_err(|err| KuError::message(diagnostic_json_line(&err, path, &source)))
+            } else {
+                let path = exact_path(&args, "check")?;
+                let source = read_ku_file(path)?;
+                check_source(path, &source)?;
+                println!("check ok: {path}");
+                Ok(())
+            }
         }
         Some("ir") => {
             let path = exact_path(&args, "ir")?;
             let source = read_ku_file(path)?;
             let program = parse_and_check(path, &source)?;
             print!("{}", ir::lower_program(&program)?);
+            Ok(())
+        }
+        Some("llvm") => {
+            let path = exact_path(&args, "llvm")?;
+            let source = read_ku_file(path)?;
+            let output = build_llvm_ir(path, &source)?;
+            println!("llvm ir ok: {}", output.display());
             Ok(())
         }
         Some("build") => {
@@ -242,7 +262,9 @@ fn build_executable(path: &str, source: &str) -> Result<PathBuf, KuError> {
 }
 
 fn build_native_c(path: &str, source: &str) -> Result<PathBuf, KuError> {
-    let program = parse_and_check(path, source)?;
+    let program = parse_and_expand(path, source)?;
+    reject_native_async(&program)?;
+    Checker::new().check(&program)?;
     let ir = ir::lower_program(&program)?;
     let c_source = backend::c::generate_c_source(&ir)?;
     let output = Path::new(path).with_extension("c");
@@ -253,6 +275,136 @@ fn build_native_c(path: &str, source: &str) -> Result<PathBuf, KuError> {
         ))
     })?;
     Ok(output)
+}
+
+fn build_llvm_ir(path: &str, source: &str) -> Result<PathBuf, KuError> {
+    let program = parse_and_expand(path, source)?;
+    reject_compiled_async(
+        &program,
+        "LLVM text prototype does not support async/await yet; use the interpreter runtime",
+    )?;
+    Checker::new().check(&program)?;
+    let ir = ir::lower_program(&program)?;
+    let llvm_ir = backend::llvm::generate_llvm_ir(&ir)?;
+    let output = Path::new(path).with_extension("ll");
+    fs::write(&output, llvm_ir).map_err(|err| {
+        KuError::message(format!(
+            "failed to write LLVM IR '{}': {err}",
+            output.display()
+        ))
+    })?;
+    Ok(output)
+}
+
+fn reject_native_async(program: &Program) -> Result<(), KuError> {
+    reject_compiled_async(
+        program,
+        "native C prototype does not support async/await yet; use the interpreter runtime",
+    )
+}
+
+fn reject_compiled_async(program: &Program, message: &str) -> Result<(), KuError> {
+    if program.items.iter().any(item_contains_async) {
+        return Err(KuError::message(message));
+    }
+    Ok(())
+}
+
+fn item_contains_async(item: &Item) -> bool {
+    match item {
+        Item::Function(function) => function_contains_async(function),
+        Item::Import(_) | Item::Struct(_) | Item::Enum(_) | Item::Module(_) => false,
+    }
+}
+
+fn function_contains_async(function: &FnDecl) -> bool {
+    function.is_async || function.body.iter().any(stmt_contains_async)
+}
+
+fn stmt_contains_async(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::VarDecl { value, .. }
+        | Stmt::Assign { value, .. }
+        | Stmt::Fail { value, .. }
+        | Stmt::Panic { value, .. }
+        | Stmt::Print { value, .. } => expr_contains_await(value),
+        Stmt::AssignTarget { target, value, .. } => {
+            assign_target_contains_await(target) || expr_contains_await(value)
+        }
+        Stmt::DestructureAssign { values, .. } => values.iter().any(expr_contains_await),
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_contains_await(condition)
+                || then_branch.iter().any(stmt_contains_async)
+                || else_branch.iter().any(stmt_contains_async)
+        }
+        Stmt::While {
+            condition, body, ..
+        } => expr_contains_await(condition) || body.iter().any(stmt_contains_async),
+        Stmt::For { iterable, body, .. } => {
+            expr_contains_await(iterable) || body.iter().any(stmt_contains_async)
+        }
+        Stmt::Function(function) => function_contains_async(function),
+        Stmt::Try {
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            body.iter().any(stmt_contains_async)
+                || catch_body.iter().any(stmt_contains_async)
+                || finally_body.iter().any(stmt_contains_async)
+        }
+        Stmt::Return { value, .. } => value.as_ref().is_some_and(expr_contains_await),
+        Stmt::Expr { expr, .. } => expr_contains_await(expr),
+        Stmt::Break { .. } | Stmt::Continue { .. } => false,
+    }
+}
+
+fn assign_target_contains_await(target: &AssignTarget) -> bool {
+    match target {
+        AssignTarget::Variable(_) => false,
+        AssignTarget::Index { target, index } => {
+            expr_contains_await(target) || expr_contains_await(index)
+        }
+        AssignTarget::Field { target, .. } => expr_contains_await(target),
+    }
+}
+
+fn expr_contains_await(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Await(_) => true,
+        ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } => expr_contains_await(expr),
+        ExprKind::Binary { left, right, .. } => {
+            expr_contains_await(left) || expr_contains_await(right)
+        }
+        ExprKind::Call { callee, args } => {
+            expr_contains_await(callee) || args.iter().any(expr_contains_await)
+        }
+        ExprKind::Array(values) => values.iter().any(expr_contains_await),
+        ExprKind::Index { target, index } => {
+            expr_contains_await(target) || expr_contains_await(index)
+        }
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            expr_contains_await(target)
+        }
+        ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+            fields.iter().any(|(_, value)| expr_contains_await(value))
+        }
+        ExprKind::Match { value, arms } => {
+            expr_contains_await(value)
+                || arms.iter().any(|arm| {
+                    arm.guard.as_ref().is_some_and(expr_contains_await)
+                        || expr_contains_await(&arm.value)
+                })
+        }
+        ExprKind::Function { body, .. } => body.iter().any(stmt_contains_async),
+        ExprKind::Literal(_) | ExprKind::Variable(_) => false,
+    }
 }
 
 struct TempBuildDir {
@@ -345,6 +497,54 @@ fn command_error(message: impl Into<String>) -> KuError {
     KuError::message(format!("{}\n\n{}", message.into(), HELP))
 }
 
+fn diagnostic_json_line(error: &KuError, file: &str, source: &str) -> String {
+    let diagnostic = error.diagnostic_data(file, source);
+    format!(
+        "{{\"level\":{},\"code\":{},\"message\":{},\"file\":{},\"line\":{},\"column\":{},\"endLine\":{},\"endColumn\":{},\"notes\":{},\"helps\":{}}}",
+        json_string(diagnostic.level),
+        json_string(diagnostic.code),
+        json_string(&diagnostic.message),
+        json_string(&diagnostic.file),
+        diagnostic.line,
+        diagnostic.column,
+        diagnostic.end_line,
+        diagnostic.end_column,
+        json_string_array(&diagnostic.notes),
+        json_string_array(&diagnostic.helps),
+    )
+}
+
+fn json_string_array(values: &[&str]) -> String {
+    let values = values
+        .iter()
+        .map(|value| json_string(value))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{values}]")
+}
+
+fn json_string(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0C}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            ch if ch <= '\u{1F}' => {
+                output.push_str(&format!("\\u{:04x}", ch as u32));
+            }
+            ch => output.push(ch),
+        }
+    }
+    output.push('"');
+    output
+}
+
 fn is_ku_file(path: &str) -> bool {
     Path::new(path)
         .extension()
@@ -395,6 +595,12 @@ fn parse_source(source: &str) -> Result<Program, KuError> {
 }
 
 fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
+    let program = parse_and_expand(file, source)?;
+    Checker::new().check(&program)?;
+    Ok(program)
+}
+
+fn parse_and_expand(file: &str, source: &str) -> Result<Program, KuError> {
     let program = parse_source(source)?;
     let program = if program_has_imports(&program) {
         let path = Path::new(file);
@@ -424,7 +630,6 @@ fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
     } else {
         program
     };
-    Checker::new().check(&program)?;
     Ok(program)
 }
 
@@ -699,6 +904,7 @@ fn check_library_program(program: &Program) -> KuResult<()> {
     {
         program.items.push(Item::Function(FnDecl {
             name: "main".to_string(),
+            is_async: false,
             type_params: Vec::new(),
             params: Vec::new(),
             return_type: None,
@@ -1146,7 +1352,9 @@ fn rewrite_function_calls_in_expr(
             }
             Ok(())
         }
-        ExprKind::TryUnwrap { expr } => rewrite_function_calls_in_expr(expr, rename_map),
+        ExprKind::Await(expr) | ExprKind::TryUnwrap { expr } => {
+            rewrite_function_calls_in_expr(expr, rename_map)
+        }
         ExprKind::Function {
             params,
             return_type,
@@ -1410,7 +1618,9 @@ fn rewrite_namespaces_in_expr(
             }
             Ok(())
         }
-        ExprKind::TryUnwrap { expr } => rewrite_namespaces_in_expr(expr, namespaces),
+        ExprKind::Await(expr) | ExprKind::TryUnwrap { expr } => {
+            rewrite_namespaces_in_expr(expr, namespaces)
+        }
         ExprKind::Function {
             params,
             return_type,

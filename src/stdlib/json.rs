@@ -328,7 +328,7 @@ fn write_json(value: &Value, output: &mut String, depth: usize, span: Span) -> K
             }
             output.push('}');
         }
-        Value::Enum { .. } | Value::Result { .. } | Value::Function { .. } => {
+        Value::Enum { .. } | Value::Result { .. } | Value::Function { .. } | Value::Task(_) => {
             return Err(KuError::runtime(
                 format!("json.stringify does not support {}", value.type_name()),
                 span,

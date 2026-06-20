@@ -409,6 +409,64 @@ fn main() {
 }
 
 #[test]
+fn typed_arrow_functions_are_first_class_function_values() {
+    let source = r#"
+fn main() {
+    add = (a: int, b: int): int => a + b
+    double = value: int => value * 2
+    selected = double
+    print(add(2, 3))
+    print(selected(4))
+}
+"#;
+
+    check_source("inline.ku", source).expect("typed arrow functions should check");
+    run_source("inline.ku", source).expect("typed arrow functions should remain first class");
+}
+
+#[test]
+fn typed_arrow_function_return_type_is_checked() {
+    let source = r#"
+fn main() {
+    broken = (value: int): str => value
+    print(broken(1))
+}
+"#;
+
+    let err =
+        check_source("inline.ku", source).expect_err("typed arrow return mismatch should fail");
+    assert!(
+        err.to_string().contains("type error"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn object_index_is_strict_unless_question_is_explicit() {
+    let strict = r#"
+fn main() {
+    user = { name: "Ku" }
+    print(user["missing"])
+}
+"#;
+    let err = run_source("inline.ku", strict).expect_err("missing object key should fail");
+    assert!(
+        err.to_string().contains("object has no key 'missing'"),
+        "unexpected error: {err}"
+    );
+
+    let optional = r#"
+fn main() {
+    user = { name: "Ku" }
+    print(user["name"]?)
+    print(user["missing"]?)
+}
+"#;
+    check_source("inline.ku", optional).expect("optional object index should check");
+    run_source("inline.ku", optional).expect("optional object index should return null");
+}
+
+#[test]
 fn check_rejects_constant_reassignment_by_name_rule() {
     let source = r#"
 fn main() {

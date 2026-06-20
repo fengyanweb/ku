@@ -1,17 +1,12 @@
-import "./hello.ku"
+import "std.http"
 fn main() {
-    fn go(name :str, age:int ) {
-        
-        return '11'
-        print(`我是{name},我{age}岁了`)
+    app = http.service
+    print(app)
+    try {
+        app.get('/idnex',((res,req)=>{
+            print(`{res}`)
+        }))
+    } catch (err) {
+        print(err)
     }
-
-    go("Ku", 3)
-    he()
-    
-    print(Ab())
-    
-}
-fn he() {
-    print("哈哈哈哈")
 }

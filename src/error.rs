@@ -27,6 +27,20 @@ struct DiagnosticContext {
     source: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticData {
+    pub level: &'static str,
+    pub code: &'static str,
+    pub message: String,
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+    pub notes: Vec<&'static str>,
+    pub helps: Vec<&'static str>,
+}
+
 impl KuError {
     pub fn new(kind: KuErrorKind, message: impl Into<String>, span: Span) -> Self {
         Self {
@@ -103,35 +117,145 @@ impl KuError {
     }
 
     pub fn diagnostic(&self, file: &str, source: &str) -> String {
-        let (file, source) = self
+        let data = self.diagnostic_data(file, source);
+        let (_, source) = self
             .diagnostic_context
             .as_ref()
             .map(|context| (context.file.as_str(), context.source.as_str()))
             .unwrap_or((file, source));
-        let line = self.line().max(1);
-        let column = self.column().max(1);
+        let line = data.line;
+        let column = data.column;
         let line_text = source.lines().nth(line.saturating_sub(1)).unwrap_or("");
-        let caret_len = self
-            .span
-            .end
-            .column
-            .saturating_sub(self.span.start.column)
-            .max(1);
+        let caret_len = if data.end_line == line {
+            data.end_column.saturating_sub(column).max(1)
+        } else {
+            1
+        };
         let marker = format!(
             "{}{}",
             " ".repeat(column.saturating_sub(1)),
             "^".repeat(caret_len)
         );
 
-        let heading = if self.message.starts_with("type error:") {
-            self.message.clone()
-        } else {
-            format!("error: {}", self.message)
-        };
+        let mut output = format!(
+            "error[{}]: error: {}\n  --> {}:{line}:{column}\n   |\n{line:>3} | {line_text}\n   | {marker}",
+            data.code, data.message, data.file
+        );
+        for note in data.notes {
+            output.push_str(&format!("\n   |\nnote: {note}"));
+        }
+        for help in data.helps {
+            output.push_str(&format!("\nhelp: {help}"));
+        }
+        output
+    }
 
-        format!(
-            "{heading}\n  --> {file}:{line}:{column}\n   |\n{line:>3} | {line_text}\n   | {marker}"
-        )
+    pub fn diagnostic_data(&self, file: &str, _source: &str) -> DiagnosticData {
+        let file = self
+            .diagnostic_context
+            .as_ref()
+            .map(|context| context.file.as_str())
+            .unwrap_or(file);
+        let line = self.line().max(1);
+        let column = self.column().max(1);
+        let mut end_line = self.span.end.line.max(line);
+        let mut end_column = self.span.end.column.max(1);
+        if end_line == line {
+            end_column = end_column.max(column.saturating_add(1));
+        } else if self.span.end.line == 0 {
+            end_line = line;
+            end_column = column.saturating_add(1);
+        }
+        let info = self.diagnostic_info();
+        DiagnosticData {
+            level: "error",
+            code: info.code,
+            message: self.message.clone(),
+            file: file.to_string(),
+            line,
+            column,
+            end_line,
+            end_column,
+            notes: info.notes,
+            helps: info.helps,
+        }
+    }
+
+    fn diagnostic_info(&self) -> DiagnosticInfo {
+        let message = self.message.as_str();
+        if message.contains("'let' is not supported") {
+            return DiagnosticInfo::new("E0105")
+                .help("Ku declares variables by assignment, so remove `let`");
+        }
+        if message.contains("switch is not supported") {
+            return DiagnosticInfo::new("E0104").help("replace `switch` with `match`");
+        }
+        if message.contains("condition must be bool") {
+            return DiagnosticInfo::new("E0302")
+                .note("Ku does not use truthy/falsy conditions")
+                .help("compare explicitly, for example `value != 0` or `text != \"\"`");
+        }
+        if message.contains("'?' requires a Result return type")
+            || message.contains("'?' expects Result")
+        {
+            return DiagnosticInfo::new("E0401")
+                .note("`?` can only unwrap recoverable Result values")
+                .help("change the enclosing function to return `T!`, or handle the error with `try/catch`");
+        }
+        if message.contains("http handler cannot modify captured variable") {
+            return DiagnosticInfo::new("E0701")
+                .note("HTTP handlers may run concurrently")
+                .help("avoid shared mutable captures in handlers until a sync/state API exists");
+        }
+        if message.starts_with("type error:") || message.contains("type mismatch") {
+            return DiagnosticInfo::new("E0301");
+        }
+        if message.contains("not exhaustive") || message.contains("unreachable match arm") {
+            return DiagnosticInfo::new("E0501");
+        }
+        if message.contains("std module")
+            || message.contains("import")
+            || self.domain_name() == Some("package")
+        {
+            return DiagnosticInfo::new("E0601");
+        }
+        if message.contains("http ") {
+            return DiagnosticInfo::new("E0700");
+        }
+        match self.kind {
+            KuErrorKind::Lex | KuErrorKind::Parse => DiagnosticInfo::new("E0101"),
+            KuErrorKind::Runtime => DiagnosticInfo::new("E0001"),
+        }
+    }
+
+    fn domain_name(&self) -> Option<&str> {
+        self.domain.as_deref()
+    }
+}
+
+struct DiagnosticInfo {
+    code: &'static str,
+    notes: Vec<&'static str>,
+    helps: Vec<&'static str>,
+}
+
+impl DiagnosticInfo {
+    fn new(code: &'static str) -> Self {
+        Self {
+            code,
+            notes: Vec::new(),
+            helps: Vec::new(),
+        }
+    }
+
+    fn note(mut self, note: &'static str) -> Self {
+        self.notes.push(note);
+        self
+    }
+
+    fn help(mut self, help: &'static str) -> Self {
+        self.helps.push(help);
+        self
     }
 }
 

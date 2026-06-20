@@ -44,6 +44,7 @@ impl ImportName {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub name: String,
+    pub is_async: bool,
     pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub return_type: Option<TypeName>,
@@ -235,6 +236,7 @@ pub enum ExprKind {
         value: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+    Await(Box<Expr>),
     TryUnwrap {
         expr: Box<Expr>,
     },
