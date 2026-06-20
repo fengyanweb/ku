@@ -1,3 +1,0 @@
-﻿struct Same { x:int }
-enum Same { A }
-fn main() { print(Same.A) }
