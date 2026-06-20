@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::{
     ast::{BinaryOp, UnaryOp},
     error::{KuError, KuResult},
     ir::{
         BlockId, FunctionId, IrCallKind, IrExpr, IrExprKind, IrFunction, IrInst, IrLValue,
-        IrProgram, IrTerminator, IrType, TempId,
+        IrProgram, IrStructLayout, IrTerminator, IrType, TempId,
     },
     span::Span,
 };
@@ -17,17 +17,37 @@ pub fn generate_llvm_ir(program: &IrProgram) -> KuResult<String> {
 struct Generator<'a> {
     program: &'a IrProgram,
     symbols: HashMap<FunctionId, String>,
+    struct_symbols: HashMap<String, String>,
+    struct_layouts: HashMap<String, &'a IrStructLayout>,
     strings: BTreeMap<Vec<u8>, String>,
 }
 
 impl<'a> Generator<'a> {
     fn new(program: &'a IrProgram) -> KuResult<Self> {
-        if !program.layouts.structs.is_empty() || !program.layouts.enums.is_empty() {
+        if !program.layouts.enums.is_empty() {
             return Err(unsupported(
-                "LLVM text prototype does not support struct or enum layouts yet",
+                "LLVM text prototype does not support enum layouts yet",
             ));
         }
 
+        let struct_symbols = program
+            .layouts
+            .structs
+            .iter()
+            .enumerate()
+            .map(|(index, layout)| {
+                (
+                    layout.name.clone(),
+                    format!("ku.struct.{index}.{}", sanitize_identifier(&layout.name)),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let struct_layouts = program
+            .layouts
+            .structs
+            .iter()
+            .map(|layout| (layout.name.clone(), layout))
+            .collect::<HashMap<_, _>>();
         let symbols = program
             .functions
             .iter()
@@ -47,8 +67,11 @@ impl<'a> Generator<'a> {
         let mut generator = Self {
             program,
             symbols,
+            struct_symbols,
+            struct_layouts,
             strings: BTreeMap::new(),
         };
+        generator.validate_struct_layouts()?;
         generator.collect_strings()?;
         Ok(generator)
     }
@@ -63,6 +86,18 @@ impl<'a> Generator<'a> {
              @.ku.true = private unnamed_addr constant [5 x i8] c\"true\\00\"\n\
              @.ku.false = private unnamed_addr constant [6 x i8] c\"false\\00\"\n",
         );
+        for layout in &self.program.layouts.structs {
+            let fields = layout
+                .fields
+                .iter()
+                .map(|field| self.llvm_type(&field.ty))
+                .collect::<KuResult<Vec<_>>>()?
+                .join(", ");
+            out.push_str(&format!(
+                "%{} = type {{ {fields} }}\n",
+                self.struct_symbol(&layout.name)?
+            ));
+        }
         for (bytes, symbol) in &self.strings {
             out.push_str(&format!(
                 "@{symbol} = private unnamed_addr constant [{} x i8] c\"{}\"\n",
@@ -78,6 +113,112 @@ impl<'a> Generator<'a> {
         }
         self.emit_main_wrapper(&mut out)?;
         Ok(out)
+    }
+
+    fn validate_struct_layouts(&self) -> KuResult<()> {
+        let indexes = self
+            .program
+            .layouts
+            .structs
+            .iter()
+            .enumerate()
+            .map(|(index, layout)| (layout.name.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let mut dependency_count = vec![0usize; indexes.len()];
+        let mut dependents = vec![Vec::new(); indexes.len()];
+
+        for (index, layout) in self.program.layouts.structs.iter().enumerate() {
+            let mut field_names = HashSet::new();
+            for (expected_offset, field) in layout.fields.iter().enumerate() {
+                if field.offset != expected_offset {
+                    return Err(unsupported(format!(
+                        "LLVM struct '{}.{}' has non-contiguous field offset {}; expected {expected_offset}",
+                        layout.name, field.name, field.offset
+                    )));
+                }
+                if !field_names.insert(field.name.as_str()) {
+                    return Err(unsupported(format!(
+                        "LLVM struct '{}' has duplicate field '{}'",
+                        layout.name, field.name
+                    )));
+                }
+                self.llvm_type(&field.ty)?;
+                let mut dependencies = Vec::new();
+                collect_named_dependencies(&field.ty, &mut dependencies);
+                for name in dependencies {
+                    let Some(&dependency) = indexes.get(name.as_str()) else {
+                        return Err(unsupported(format!(
+                            "LLVM struct '{}.{}' references unknown struct '{name}'",
+                            layout.name, field.name
+                        )));
+                    };
+                    dependency_count[index] += 1;
+                    dependents[dependency].push(index);
+                }
+            }
+        }
+
+        let mut ready = dependency_count
+            .iter()
+            .enumerate()
+            .filter_map(|(index, count)| (*count == 0).then_some(index))
+            .collect::<VecDeque<_>>();
+        let mut visited = 0usize;
+        while let Some(index) = ready.pop_front() {
+            visited += 1;
+            for dependent in &dependents[index] {
+                dependency_count[*dependent] -= 1;
+                if dependency_count[*dependent] == 0 {
+                    ready.push_back(*dependent);
+                }
+            }
+        }
+        if visited != self.program.layouts.structs.len() {
+            return Err(unsupported(
+                "LLVM text prototype does not support recursive value struct layouts",
+            ));
+        }
+        Ok(())
+    }
+
+    fn struct_symbol(&self, name: &str) -> KuResult<&str> {
+        self.struct_symbols
+            .get(name)
+            .map(String::as_str)
+            .ok_or_else(|| unsupported(format!("LLVM cannot find struct layout '{name}'")))
+    }
+
+    fn struct_layout(&self, name: &str) -> KuResult<&IrStructLayout> {
+        self.struct_layouts
+            .get(name)
+            .copied()
+            .ok_or_else(|| unsupported(format!("LLVM cannot find struct layout '{name}'")))
+    }
+
+    fn llvm_type(&self, ty: &IrType) -> KuResult<String> {
+        match ty {
+            IrType::Int => Ok("i64".to_string()),
+            IrType::Bool => Ok("i1".to_string()),
+            IrType::Str => Ok("i8*".to_string()),
+            IrType::Named(name) => Ok(format!("%{}", self.struct_symbol(name)?)),
+            IrType::Result(inner) => Ok(format!(
+                "{{ i1, {}, i8* }}",
+                self.result_payload_type(inner)?
+            )),
+            IrType::Void => Ok("void".to_string()),
+            _ => Err(unsupported(format!(
+                "LLVM text prototype does not support type {ty}"
+            ))),
+        }
+    }
+
+    fn result_payload_type(&self, ty: &IrType) -> KuResult<String> {
+        match ty {
+            IrType::Int | IrType::Bool | IrType::Str | IrType::Named(_) => self.llvm_type(ty),
+            _ => Err(unsupported(format!(
+                "LLVM text prototype does not support Result<{ty}>"
+            ))),
+        }
     }
 
     fn collect_strings(&mut self) -> KuResult<()> {
@@ -179,7 +320,7 @@ impl<'a> Generator<'a> {
         }
 
         out.push_str("define i32 @main() {\nentry:\n");
-        match main.return_type {
+        match &main.return_type {
             IrType::Void => out.push_str("  call void @ku_main()\n  ret i32 0\n"),
             IrType::Int => {
                 out.push_str("  %result = call i64 @ku_main()\n");
@@ -193,7 +334,21 @@ impl<'a> Generator<'a> {
                 out.push_str("  %result = call i8* @ku_main()\n");
                 out.push_str("  call i32 @puts(i8* %result)\n  ret i32 0\n");
             }
-            ref ty => {
+            IrType::Result(_) => {
+                let ty = self.llvm_type(&main.return_type)?;
+                out.push_str(&format!("  %result = call {ty} @ku_main()\n"));
+                out.push_str(&format!("  %ok = extractvalue {ty} %result, 0\n"));
+                out.push_str("  br i1 %ok, label %result.ok, label %result.err\n");
+                out.push_str("result.ok:\n  ret i32 0\n");
+                out.push_str("result.err:\n");
+                out.push_str(&format!("  %error = extractvalue {ty} %result, 2\n"));
+                out.push_str("  %has.error = icmp ne i8* %error, null\n");
+                out.push_str("  br i1 %has.error, label %result.print, label %result.exit\n");
+                out.push_str("result.print:\n  call i32 @puts(i8* %error)\n");
+                out.push_str("  br label %result.exit\n");
+                out.push_str("result.exit:\n  ret i32 1\n");
+            }
+            ty => {
                 return Err(unsupported(format!(
                     "LLVM text prototype does not support main return type {ty}"
                 )))
@@ -240,25 +395,30 @@ struct FunctionEmitter<'a> {
 
 impl<'a> FunctionEmitter<'a> {
     fn new(generator: &'a Generator<'a>, function: &'a IrFunction) -> KuResult<Self> {
-        llvm_type(&function.return_type)?;
+        validate_cfg(function)?;
+        generator.llvm_type(&function.return_type)?;
         let mut locals = HashMap::new();
         for param in &function.params {
-            ensure_local_type(&param.ty)?;
+            ensure_local_type(generator, &param.ty)?;
             locals.insert(param.name.clone(), param.ty.clone());
         }
         for block in &function.blocks {
             for instruction in &block.instructions {
-                if let IrInst::Let { name, ty, .. } = instruction {
-                    ensure_local_type(ty)?;
-                    match locals.get(name) {
-                        Some(existing) if existing != ty => {
+                let local = match instruction {
+                    IrInst::Let { name, ty, .. } => Some((name, ty.clone())),
+                    IrInst::BindError { name, .. } => Some((name, IrType::Str)),
+                    _ => None,
+                };
+                if let Some((name, ty)) = local {
+                    ensure_local_type(generator, &ty)?;
+                    if let Some(existing) = locals.get(name) {
+                        if existing != &ty {
                             return Err(unsupported(format!(
                                 "LLVM text prototype found conflicting types for local '{name}'"
-                            )))
+                            )));
                         }
-                        _ => {
-                            locals.insert(name.clone(), ty.clone());
-                        }
+                    } else {
+                        locals.insert(name.clone(), ty);
                     }
                 }
             }
@@ -273,7 +433,7 @@ impl<'a> FunctionEmitter<'a> {
     }
 
     fn emit(mut self, out: &mut String) -> KuResult<()> {
-        let return_type = llvm_type(&self.function.return_type)?;
+        let return_type = self.generator.llvm_type(&self.function.return_type)?;
         let symbol = self.generator.function_symbol(self.function.id)?;
         out.push_str(&format!("define {return_type} @{symbol}("));
         for (index, param) in self.function.params.iter().enumerate() {
@@ -282,7 +442,7 @@ impl<'a> FunctionEmitter<'a> {
             }
             out.push_str(&format!(
                 "{} %arg.{}",
-                llvm_type(&param.ty)?,
+                self.generator.llvm_type(&param.ty)?,
                 sanitize_identifier(&param.name)
             ));
         }
@@ -299,15 +459,16 @@ impl<'a> FunctionEmitter<'a> {
             out.push_str(&format!(
                 "  %local.{} = alloca {}\n",
                 sanitize_identifier(name),
-                llvm_type(ty)?
+                self.generator.llvm_type(ty)?
             ));
         }
         for param in &self.function.params {
+            let ty = self.generator.llvm_type(&param.ty)?;
             out.push_str(&format!(
                 "  store {} %arg.{}, {}* %local.{}\n",
-                llvm_type(&param.ty)?,
+                ty,
                 sanitize_identifier(&param.name),
-                llvm_type(&param.ty)?,
+                ty,
                 sanitize_identifier(&param.name)
             ));
         }
@@ -315,17 +476,31 @@ impl<'a> FunctionEmitter<'a> {
 
         for (index, block) in self.function.blocks.iter().enumerate() {
             out.push_str(&format!("{}:\n", block_label(block.id)));
+            let mut terminated = false;
             for instruction in &block.instructions {
-                self.emit_instruction(out, instruction)?;
+                if terminated {
+                    return Err(unsupported(format!(
+                        "LLVM block '{}' has instructions after a terminating instruction",
+                        block.name
+                    )));
+                }
+                terminated = self.emit_instruction(out, instruction)?;
             }
-            let next = self.function.blocks.get(index + 1).map(|block| block.id);
-            self.emit_terminator(out, &block.terminator, next)?;
+            if !terminated {
+                let next = self.function.blocks.get(index + 1).map(|block| block.id);
+                self.emit_terminator(out, &block.terminator, next)?;
+            } else if block.terminator != IrTerminator::Unreachable {
+                return Err(unsupported(format!(
+                    "LLVM block '{}' terminates before IR terminator '{}'",
+                    block.name, block.terminator
+                )));
+            }
         }
         out.push_str("}\n");
         Ok(())
     }
 
-    fn emit_instruction(&mut self, out: &mut String, instruction: &IrInst) -> KuResult<()> {
+    fn emit_instruction(&mut self, out: &mut String, instruction: &IrInst) -> KuResult<bool> {
         match instruction {
             IrInst::Temp { id, ty, value } => {
                 if ty != &value.ty {
@@ -343,18 +518,11 @@ impl<'a> FunctionEmitter<'a> {
                 self.emit_store(out, name, &value)?;
             }
             IrInst::Store { target, value } => {
-                let IrLValue::Local(name) = target else {
-                    return Err(unsupported(
-                        "LLVM text prototype only supports local assignment",
-                    ));
-                };
                 let value = self.emit_expr(out, value)?;
-                let ty = self
-                    .locals
-                    .get(name)
-                    .ok_or_else(|| unsupported(format!("unknown LLVM local '{name}'")))?;
-                ensure_same_type(ty, &value.ty, "local assignment")?;
-                self.emit_store(out, name, &value)?;
+                let (target_ty, pointer) = self.emit_lvalue_pointer(out, target)?;
+                ensure_same_type(&target_ty, &value.ty, "assignment")?;
+                let ty = self.generator.llvm_type(&target_ty)?;
+                out.push_str(&format!("  store {ty} {}, {ty}* {pointer}\n", value.text));
             }
             IrInst::Print(value) => {
                 let value = self.emit_expr(out, value)?;
@@ -363,30 +531,146 @@ impl<'a> FunctionEmitter<'a> {
             IrInst::Expr(value) => {
                 self.emit_expr(out, value)?;
             }
-            IrInst::BindOk { .. }
-            | IrInst::Fail(_)
-            | IrInst::Panic(_)
-            | IrInst::BeginTry { .. }
-            | IrInst::EndTry
-            | IrInst::BindError { .. }
-            | IrInst::DefineClosure { .. }
-            | IrInst::Unsupported { .. } => {
+            IrInst::BindOk { id, ty, result } => {
+                let result = self.emit_expr(out, result)?;
+                let IrType::Result(inner) = &result.ty else {
+                    return Err(unsupported("LLVM BindOk requires a Result value"));
+                };
+                ensure_same_type(ty, inner, "Result ok binding")?;
+                let result_ty = self.generator.llvm_type(&result.ty)?;
+                let register = self.fresh_value();
+                out.push_str(&format!(
+                    "  {register} = extractvalue {result_ty} {}, 1\n",
+                    result.text
+                ));
+                self.temps.insert(
+                    *id,
+                    Operand {
+                        ty: ty.clone(),
+                        text: register,
+                    },
+                );
+            }
+            IrInst::Fail(error) => {
+                let IrType::Result(inner) = &self.function.return_type else {
+                    return Err(unsupported("LLVM fail requires a Result return type"));
+                };
+                let error = self.emit_expr(out, error)?;
+                ensure_same_type(&IrType::Str, &error.ty, "fail error")?;
+                let result = self.emit_result_value(out, inner, false, None, Some(error))?;
+                let ty = self.generator.llvm_type(&self.function.return_type)?;
+                out.push_str(&format!("  ret {ty} {}\n", result.text));
+                return Ok(true);
+            }
+            IrInst::BeginTry { .. } | IrInst::EndTry => {}
+            IrInst::BindError { name, result } => {
+                let result = self.emit_expr(out, result)?;
+                if !matches!(result.ty, IrType::Result(_)) {
+                    return Err(unsupported("LLVM BindError requires a Result value"));
+                }
+                let result_ty = self.generator.llvm_type(&result.ty)?;
+                let register = self.fresh_value();
+                out.push_str(&format!(
+                    "  {register} = extractvalue {result_ty} {}, 2\n",
+                    result.text
+                ));
+                self.emit_store(
+                    out,
+                    name,
+                    &Operand {
+                        ty: IrType::Str,
+                        text: register,
+                    },
+                )?;
+            }
+            IrInst::Panic(_) | IrInst::DefineClosure { .. } | IrInst::Unsupported { .. } => {
                 return Err(unsupported(format!(
                     "LLVM text prototype cannot lower IR instruction '{instruction}'"
                 )))
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     fn emit_store(&self, out: &mut String, name: &str, value: &Operand) -> KuResult<()> {
-        let ty = llvm_type(&value.ty)?;
+        let expected = self
+            .locals
+            .get(name)
+            .ok_or_else(|| unsupported(format!("unknown LLVM local '{name}'")))?;
+        ensure_same_type(expected, &value.ty, "local store")?;
+        let ty = self.generator.llvm_type(&value.ty)?;
         out.push_str(&format!(
             "  store {ty} {}, {ty}* %local.{}\n",
             value.text,
             sanitize_identifier(name)
         ));
         Ok(())
+    }
+
+    fn emit_lvalue_pointer(
+        &mut self,
+        out: &mut String,
+        target: &IrLValue,
+    ) -> KuResult<(IrType, String)> {
+        match target {
+            IrLValue::Local(name) => {
+                let ty = self
+                    .locals
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| unsupported(format!("unknown LLVM local '{name}'")))?;
+                Ok((ty, format!("%local.{}", sanitize_identifier(name))))
+            }
+            IrLValue::Field { target, name } => {
+                let (container_ty, pointer) = self.emit_expr_pointer(out, target)?;
+                let IrType::Named(struct_name) = &container_ty else {
+                    return Err(unsupported(format!(
+                        "LLVM field assignment requires a struct target, got {container_ty}"
+                    )));
+                };
+                let (index, field_ty) = self.struct_field(struct_name, name)?;
+                let struct_ty = self.generator.llvm_type(&container_ty)?;
+                let field_pointer = self.fresh_value();
+                out.push_str(&format!(
+                    "  {field_pointer} = getelementptr inbounds {struct_ty}, {struct_ty}* {pointer}, i32 0, i32 {index}\n"
+                ));
+                Ok((field_ty, field_pointer))
+            }
+            IrLValue::Index { .. } => Err(unsupported(
+                "LLVM text prototype does not support array/index assignment",
+            )),
+        }
+    }
+
+    fn emit_expr_pointer(&mut self, out: &mut String, expr: &IrExpr) -> KuResult<(IrType, String)> {
+        match &expr.kind {
+            IrExprKind::Local(name) => {
+                let ty = self
+                    .locals
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| unsupported(format!("unknown LLVM local '{name}'")))?;
+                Ok((ty, format!("%local.{}", sanitize_identifier(name))))
+            }
+            IrExprKind::Field { target, name } => {
+                let (container_ty, pointer) = self.emit_expr_pointer(out, target)?;
+                let IrType::Named(struct_name) = &container_ty else {
+                    return Err(unsupported(format!(
+                        "LLVM nested field assignment requires a struct target, got {container_ty}"
+                    )));
+                };
+                let (index, field_ty) = self.struct_field(struct_name, name)?;
+                let struct_ty = self.generator.llvm_type(&container_ty)?;
+                let field_pointer = self.fresh_value();
+                out.push_str(&format!(
+                    "  {field_pointer} = getelementptr inbounds {struct_ty}, {struct_ty}* {pointer}, i32 0, i32 {index}\n"
+                ));
+                Ok((field_ty, field_pointer))
+            }
+            _ => Err(unsupported(
+                "LLVM field assignment target must be rooted in a local struct",
+            )),
+        }
     }
 
     fn emit_print(&mut self, out: &mut String, value: &Operand) -> KuResult<()> {
@@ -460,7 +744,11 @@ impl<'a> FunctionEmitter<'a> {
                 Some(value) => {
                     let value = self.emit_expr(out, value)?;
                     ensure_same_type(&self.function.return_type, &value.ty, "function return")?;
-                    out.push_str(&format!("  ret {} {}\n", llvm_type(&value.ty)?, value.text));
+                    out.push_str(&format!(
+                        "  ret {} {}\n",
+                        self.generator.llvm_type(&value.ty)?,
+                        value.text
+                    ));
                 }
                 None if self.function.return_type == IrType::Void => out.push_str("  ret void\n"),
                 None => {
@@ -471,10 +759,46 @@ impl<'a> FunctionEmitter<'a> {
                 }
             },
             IrTerminator::Unreachable => out.push_str("  unreachable\n"),
-            IrTerminator::ForEach { .. }
-            | IrTerminator::ResultBranch { .. }
-            | IrTerminator::JumpErr { .. }
-            | IrTerminator::PropagateErr(_) => {
+            IrTerminator::ResultBranch {
+                result,
+                ok_block,
+                err_block,
+            } => {
+                let result = self.emit_expr(out, result)?;
+                if !matches!(result.ty, IrType::Result(_)) {
+                    return Err(unsupported("LLVM ResultBranch requires a Result value"));
+                }
+                let ty = self.generator.llvm_type(&result.ty)?;
+                let ok = self.fresh_value();
+                out.push_str(&format!("  {ok} = extractvalue {ty} {}, 0\n", result.text));
+                out.push_str(&format!(
+                    "  br i1 {ok}, label %{}, label %{}\n",
+                    block_label(*ok_block),
+                    block_label(*err_block)
+                ));
+            }
+            IrTerminator::JumpErr { result, target } => {
+                let result = self.emit_expr(out, result)?;
+                if !matches!(result.ty, IrType::Result(_)) {
+                    return Err(unsupported("LLVM JumpErr requires a Result value"));
+                }
+                out.push_str(&format!("  br label %{}\n", block_label(*target)));
+            }
+            IrTerminator::PropagateErr(value) => {
+                let value = self.emit_expr(out, value)?;
+                if !matches!(self.function.return_type, IrType::Result(_)) {
+                    return Err(unsupported(
+                        "LLVM can only propagate errors from Result functions",
+                    ));
+                }
+                ensure_same_type(&self.function.return_type, &value.ty, "Result propagation")?;
+                out.push_str(&format!(
+                    "  ret {} {}\n",
+                    self.generator.llvm_type(&value.ty)?,
+                    value.text
+                ));
+            }
+            IrTerminator::ForEach { .. } => {
                 return Err(unsupported(format!(
                     "LLVM text prototype cannot lower terminator '{terminator}'"
                 )))
@@ -493,7 +817,7 @@ impl<'a> FunctionEmitter<'a> {
                     .cloned()
                     .ok_or_else(|| unsupported(format!("unknown LLVM local '{name}'")))?;
                 let register = self.fresh_value();
-                let llvm_ty = llvm_type(&ty)?;
+                let llvm_ty = self.generator.llvm_type(&ty)?;
                 out.push_str(&format!(
                     "  {register} = load {llvm_ty}, {llvm_ty}* %local.{}\n",
                     sanitize_identifier(name)
@@ -536,9 +860,13 @@ impl<'a> FunctionEmitter<'a> {
                 for (arg, param) in args.iter().zip(&target.params) {
                     let arg = self.emit_expr(out, arg)?;
                     ensure_same_type(&param.ty, &arg.ty, "direct call argument")?;
-                    lowered.push(format!("{} {}", llvm_type(&arg.ty)?, arg.text));
+                    lowered.push(format!(
+                        "{} {}",
+                        self.generator.llvm_type(&arg.ty)?,
+                        arg.text
+                    ));
                 }
-                let return_ty = llvm_type(&target.return_type)?;
+                let return_ty = self.generator.llvm_type(&target.return_type)?;
                 let call = format!(
                     "call {return_ty} @{}({})",
                     self.generator.function_symbol(*id)?,
@@ -559,17 +887,200 @@ impl<'a> FunctionEmitter<'a> {
                     })
                 }
             }
+            IrExprKind::Call {
+                args,
+                kind: IrCallKind::Intrinsic(name),
+                ..
+            } => self.emit_intrinsic(out, name, args, &expr.ty),
             IrExprKind::Call { kind, .. } => Err(unsupported(format!(
                 "LLVM text prototype only supports direct function calls, got {kind:?}"
             ))),
-            IrExprKind::Array(_)
-            | IrExprKind::StructLiteral { .. }
-            | IrExprKind::Index { .. }
-            | IrExprKind::Field { .. }
-            | IrExprKind::TryUnwrap(_) => Err(unsupported(format!(
-                "LLVM text prototype cannot lower expression '{expr}'"
+            IrExprKind::Array(_) | IrExprKind::Index { .. } | IrExprKind::TryUnwrap(_) => {
+                Err(unsupported(format!(
+                    "LLVM text prototype cannot lower expression '{expr}'"
+                )))
+            }
+            IrExprKind::StructLiteral { name, fields } => {
+                self.emit_struct_literal(out, name, fields, &expr.ty)
+            }
+            IrExprKind::Field { target, name } => {
+                let target = self.emit_expr(out, target)?;
+                let IrType::Named(struct_name) = &target.ty else {
+                    return Err(unsupported(format!(
+                        "LLVM field access requires a struct target, got {}",
+                        target.ty
+                    )));
+                };
+                let (index, field_ty) = self.struct_field(struct_name, name)?;
+                let struct_ty = self.generator.llvm_type(&target.ty)?;
+                let register = self.fresh_value();
+                out.push_str(&format!(
+                    "  {register} = extractvalue {struct_ty} {}, {index}\n",
+                    target.text
+                ));
+                ensure_same_type(&expr.ty, &field_ty, "field expression")?;
+                Ok(Operand {
+                    ty: field_ty,
+                    text: register,
+                })
+            }
+        }
+    }
+
+    fn emit_intrinsic(
+        &mut self,
+        out: &mut String,
+        name: &str,
+        args: &[IrExpr],
+        result_ty: &IrType,
+    ) -> KuResult<Operand> {
+        let IrType::Result(inner) = result_ty else {
+            return Err(unsupported(format!(
+                "LLVM intrinsic '{name}' requires a Result type"
+            )));
+        };
+        if args.len() != 1 {
+            return Err(unsupported(format!(
+                "LLVM intrinsic '{name}' expects one argument"
+            )));
+        }
+        let value = self.emit_expr(out, &args[0])?;
+        match name {
+            "ok" => {
+                ensure_same_type(inner, &value.ty, "ok payload")?;
+                self.emit_result_value(out, inner, true, Some(value), None)
+            }
+            "err" => {
+                ensure_same_type(&IrType::Str, &value.ty, "err payload")?;
+                self.emit_result_value(out, inner, false, None, Some(value))
+            }
+            _ => Err(unsupported(format!(
+                "LLVM text prototype cannot lower intrinsic '{name}'"
             ))),
         }
+    }
+
+    fn emit_result_value(
+        &mut self,
+        out: &mut String,
+        inner: &IrType,
+        ok: bool,
+        value: Option<Operand>,
+        error: Option<Operand>,
+    ) -> KuResult<Operand> {
+        let result_ty = IrType::Result(Box::new(inner.clone()));
+        let llvm_ty = self.generator.llvm_type(&result_ty)?;
+        let tag = self.fresh_value();
+        out.push_str(&format!(
+            "  {tag} = insertvalue {llvm_ty} undef, i1 {}, 0\n",
+            if ok { 1 } else { 0 }
+        ));
+
+        let payload_text = match value {
+            Some(value) => {
+                ensure_same_type(inner, &value.ty, "Result payload")?;
+                value.text
+            }
+            None => zero_value(inner)?,
+        };
+        let payload = self.fresh_value();
+        out.push_str(&format!(
+            "  {payload} = insertvalue {llvm_ty} {tag}, {} {payload_text}, 1\n",
+            self.generator.result_payload_type(inner)?
+        ));
+
+        let error_text = match error {
+            Some(error) => {
+                ensure_same_type(&IrType::Str, &error.ty, "Result error")?;
+                error.text
+            }
+            None => "null".to_string(),
+        };
+        let complete = self.fresh_value();
+        out.push_str(&format!(
+            "  {complete} = insertvalue {llvm_ty} {payload}, i8* {error_text}, 2\n"
+        ));
+        Ok(Operand {
+            ty: result_ty,
+            text: complete,
+        })
+    }
+
+    fn emit_struct_literal(
+        &mut self,
+        out: &mut String,
+        name: &str,
+        fields: &[(String, IrExpr)],
+        expr_ty: &IrType,
+    ) -> KuResult<Operand> {
+        ensure_same_type(&IrType::Named(name.to_string()), expr_ty, "struct literal")?;
+        let layout = self.generator.struct_layout(name)?;
+        if fields.len() != layout.fields.len() {
+            return Err(unsupported(format!(
+                "LLVM struct literal '{name}' expected {} fields, got {}",
+                layout.fields.len(),
+                fields.len()
+            )));
+        }
+        let mut provided = HashSet::new();
+        for (field, _) in fields {
+            if !provided.insert(field.as_str()) {
+                return Err(unsupported(format!(
+                    "LLVM struct literal '{name}' repeats field '{field}'"
+                )));
+            }
+            if !layout
+                .fields
+                .iter()
+                .any(|layout_field| layout_field.name == *field)
+            {
+                return Err(unsupported(format!(
+                    "LLVM struct '{name}' has no field '{field}'"
+                )));
+            }
+        }
+
+        let llvm_ty = self.generator.llvm_type(expr_ty)?;
+        let mut aggregate = "undef".to_string();
+        for (field_name, value) in fields {
+            let field = layout
+                .fields
+                .iter()
+                .find(|field| field.name == *field_name)
+                .expect("validated struct field");
+            let value = self.emit_expr(out, value)?;
+            ensure_same_type(&field.ty, &value.ty, "struct field")?;
+            let next = self.fresh_value();
+            out.push_str(&format!(
+                "  {next} = insertvalue {llvm_ty} {aggregate}, {} {}, {}\n",
+                self.generator.llvm_type(&field.ty)?,
+                value.text,
+                field.offset
+            ));
+            aggregate = next;
+        }
+        Ok(Operand {
+            ty: expr_ty.clone(),
+            text: if layout.fields.is_empty() {
+                "zeroinitializer".to_string()
+            } else {
+                aggregate
+            },
+        })
+    }
+
+    fn struct_field(&self, struct_name: &str, field_name: &str) -> KuResult<(usize, IrType)> {
+        let layout = self.generator.struct_layout(struct_name)?;
+        let field = layout
+            .fields
+            .iter()
+            .find(|field| field.name == field_name)
+            .ok_or_else(|| {
+                unsupported(format!(
+                    "LLVM struct '{struct_name}' has no field '{field_name}'"
+                ))
+            })?;
+        Ok((field.offset, field.ty.clone()))
     }
 
     fn literal_operand(&self, value: &str, ty: &IrType) -> KuResult<Operand> {
@@ -675,23 +1186,94 @@ struct Operand {
     text: String,
 }
 
-fn llvm_type(ty: &IrType) -> KuResult<&'static str> {
+fn ensure_local_type(generator: &Generator<'_>, ty: &IrType) -> KuResult<()> {
+    if *ty == IrType::Void {
+        return Err(unsupported("LLVM text prototype cannot store a void local"));
+    }
+    generator.llvm_type(ty).map(|_| ())
+}
+
+fn zero_value(ty: &IrType) -> KuResult<String> {
     match ty {
-        IrType::Int => Ok("i64"),
-        IrType::Bool => Ok("i1"),
-        IrType::Str => Ok("i8*"),
-        IrType::Void => Ok("void"),
+        IrType::Int | IrType::Bool => Ok("0".to_string()),
+        IrType::Str => Ok("null".to_string()),
+        IrType::Named(_) => Ok("zeroinitializer".to_string()),
         _ => Err(unsupported(format!(
-            "LLVM text prototype does not support type {ty}"
+            "LLVM text prototype does not support zero value for {ty}"
         ))),
     }
 }
 
-fn ensure_local_type(ty: &IrType) -> KuResult<()> {
-    if *ty == IrType::Void {
-        return Err(unsupported("LLVM text prototype cannot store a void local"));
+fn collect_named_dependencies(ty: &IrType, output: &mut Vec<String>) {
+    match ty {
+        IrType::Named(name) => output.push(name.clone()),
+        IrType::Result(inner) => collect_named_dependencies(inner, output),
+        _ => {}
     }
-    llvm_type(ty).map(|_| ())
+}
+
+fn validate_cfg(function: &IrFunction) -> KuResult<()> {
+    let mut block_ids = HashSet::new();
+    for block in &function.blocks {
+        if !block_ids.insert(block.id) {
+            return Err(unsupported(format!(
+                "LLVM function '{}' has duplicate block id {}",
+                function.name, block.id.0
+            )));
+        }
+    }
+    for block in &function.blocks {
+        let mut targets = Vec::new();
+        match &block.terminator {
+            IrTerminator::Jump(target) => {
+                if *target == block.id {
+                    return Err(unsupported(format!(
+                        "LLVM function '{}' block {} has an unconditional self-jump",
+                        function.name, block.id.0
+                    )));
+                }
+                targets.push(*target);
+            }
+            IrTerminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => {
+                targets.push(*then_block);
+                targets.push(*else_block);
+            }
+            IrTerminator::ForEach {
+                body_block,
+                after_block,
+                ..
+            } => {
+                targets.push(*body_block);
+                targets.push(*after_block);
+            }
+            IrTerminator::ResultBranch {
+                ok_block,
+                err_block,
+                ..
+            } => {
+                targets.push(*ok_block);
+                targets.push(*err_block);
+            }
+            IrTerminator::JumpErr { target, .. } => targets.push(*target),
+            IrTerminator::Next
+            | IrTerminator::PropagateErr(_)
+            | IrTerminator::Return(_)
+            | IrTerminator::Unreachable => {}
+        }
+        for target in targets {
+            if !block_ids.contains(&target) {
+                return Err(unsupported(format!(
+                    "LLVM function '{}' block {} branches to missing block {}",
+                    function.name, block.id.0, target.0
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_same_type(expected: &IrType, actual: &IrType, context: &str) -> KuResult<()> {

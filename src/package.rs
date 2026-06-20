@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     env, fs,
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::{
@@ -60,6 +61,56 @@ pub struct RegistryLockPackage {
     pub cache_key: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PackageVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionRequirement {
+    Exact(PackageVersion),
+    Caret(PackageVersion),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryFetchPolicy {
+    pub max_attempts: u8,
+    pub connect_timeout_ms: u64,
+    pub read_timeout_ms: u64,
+    pub max_download_bytes: u64,
+}
+
+impl Default for RegistryFetchPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            connect_timeout_ms: 10_000,
+            read_timeout_ms: 30_000,
+            max_download_bytes: 50_000_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryCacheAction {
+    ReuseVerified,
+    DownloadAndReplace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryDownloadPlan {
+    pub name: String,
+    pub version: String,
+    pub url: String,
+    pub checksum: String,
+    pub target_dir: PathBuf,
+    pub temporary_dir: PathBuf,
+    pub action: RegistryCacheAction,
+    pub policy: RegistryFetchPolicy,
+}
+
 pub const MANIFEST_FILE: &str = "ku.mod";
 pub const LOCK_FILE: &str = "ku.lock";
 pub const DEFAULT_IMPORT_ROOT: &str = "src";
@@ -67,6 +118,10 @@ pub const DEFAULT_CACHE_DIR: &str = ".ku/cache";
 const PACKAGE_CACHE_DIR: &str = "packages";
 const MAX_PACKAGE_BYTES: u64 = 10_000_000;
 const MAX_PACKAGE_FILES: usize = 512;
+const MAX_REGISTRY_FETCH_ATTEMPTS: u8 = 8;
+const MAX_REGISTRY_DOWNLOAD_BYTES: u64 = 100_000_000;
+const MAX_REGISTRY_TIMEOUT_MS: u64 = 300_000;
+static NEXT_REGISTRY_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn discover_for_file(path: &Path) -> KuResult<Option<PackageContext>> {
     let start = path.parent().unwrap_or_else(|| Path::new("."));
@@ -546,6 +601,166 @@ pub fn parse_registry_manifest(source: &str, span: Span) -> KuResult<RegistryMan
     })
 }
 
+pub fn parse_package_version(version: &str, span: Span) -> KuResult<PackageVersion> {
+    let mut parts = version.split('.');
+    let (Some(major), Some(minor), Some(patch), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid_version_error(span));
+    };
+    if [major, minor, patch]
+        .iter()
+        .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(invalid_version_error(span));
+    }
+    let parse_part = |part: &str| part.parse::<u64>().map_err(|_| invalid_version_error(span));
+    Ok(PackageVersion {
+        major: parse_part(major)?,
+        minor: parse_part(minor)?,
+        patch: parse_part(patch)?,
+    })
+}
+
+pub fn parse_version_requirement(requirement: &str, span: Span) -> KuResult<VersionRequirement> {
+    if let Some(version) = requirement.strip_prefix('^') {
+        if version.starts_with('^') {
+            return Err(invalid_version_requirement_error(span));
+        }
+        return parse_package_version(version, span)
+            .map(VersionRequirement::Caret)
+            .map_err(|_| invalid_version_requirement_error(span));
+    }
+    parse_package_version(requirement, span)
+        .map(VersionRequirement::Exact)
+        .map_err(|_| invalid_version_requirement_error(span))
+}
+
+pub fn version_requirement_matches(
+    requirement: VersionRequirement,
+    version: PackageVersion,
+) -> bool {
+    match requirement {
+        VersionRequirement::Exact(expected) => version == expected,
+        VersionRequirement::Caret(minimum) if minimum.major > 0 => {
+            version >= minimum && version.major == minimum.major
+        }
+        VersionRequirement::Caret(minimum) if minimum.minor > 0 => {
+            version >= minimum && version.major == 0 && version.minor == minimum.minor
+        }
+        VersionRequirement::Caret(minimum) => {
+            version >= minimum
+                && version.major == 0
+                && version.minor == 0
+                && version.patch == minimum.patch
+        }
+    }
+}
+
+pub fn resolve_registry_dependencies(
+    requirements: &[PackageDependency],
+    manifests: &[RegistryManifest],
+    span: Span,
+) -> KuResult<Vec<RegistryManifest>> {
+    let mut grouped = HashMap::<String, Vec<VersionRequirement>>::new();
+    for dependency in requirements {
+        validate_package_name(&dependency.name, span)?;
+        let requirement = parse_version_requirement(&dependency.version, span)?;
+        grouped
+            .entry(dependency.name.clone())
+            .or_default()
+            .push(requirement);
+    }
+
+    let mut names = grouped.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    let mut resolved = Vec::with_capacity(names.len());
+    for name in names {
+        let constraints = &grouped[&name];
+        let mut candidates = manifests
+            .iter()
+            .filter(|manifest| manifest.name == name)
+            .map(|manifest| {
+                parse_package_version(&manifest.version, span).map(|version| (version, manifest))
+            })
+            .collect::<KuResult<Vec<_>>>()?;
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+
+        let (selected_version, selected) = candidates
+            .iter()
+            .find(|(version, _)| {
+                constraints
+                    .iter()
+                    .all(|requirement| version_requirement_matches(*requirement, *version))
+            })
+            .map(|(version, manifest)| (*version, *manifest))
+            .ok_or_else(|| {
+                KuError::package(
+                    "dependency_conflict",
+                    format!(
+                        "dependency '{name}' has no registry version satisfying all requirements"
+                    ),
+                    span,
+                )
+            })?;
+        if candidates
+            .iter()
+            .any(|(version, manifest)| *version == selected_version && *manifest != selected)
+        {
+            return Err(KuError::package(
+                "registry_metadata_conflict",
+                format!(
+                    "registry contains conflicting metadata for '{}@{}'",
+                    selected.name, selected.version
+                ),
+                span,
+            ));
+        }
+        resolved.push(selected.clone());
+    }
+    Ok(resolved)
+}
+
+pub fn plan_registry_download(
+    cache_dir: &Path,
+    manifest: &RegistryManifest,
+    cached_checksum: Option<&str>,
+    policy: RegistryFetchPolicy,
+    span: Span,
+) -> KuResult<RegistryDownloadPlan> {
+    validate_package_name(&manifest.name, span)?;
+    parse_package_version(&manifest.version, span)?;
+    validate_registry_url(&manifest.source, span)?;
+    validate_sha256_checksum(&manifest.checksum, span)?;
+    validate_registry_fetch_policy(policy, span)?;
+
+    let target_dir = cache_dir
+        .join(PACKAGE_CACHE_DIR)
+        .join(&manifest.name)
+        .join(&manifest.version);
+    let download_id = NEXT_REGISTRY_DOWNLOAD_ID.fetch_add(1, Ordering::Relaxed);
+    let temporary_dir = target_dir.with_file_name(format!(
+        "{}.download-{}-{download_id}",
+        manifest.version,
+        std::process::id()
+    ));
+    let action = if cached_checksum == Some(manifest.checksum.as_str()) {
+        RegistryCacheAction::ReuseVerified
+    } else {
+        RegistryCacheAction::DownloadAndReplace
+    };
+    Ok(RegistryDownloadPlan {
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        url: manifest.source.clone(),
+        checksum: manifest.checksum.clone(),
+        target_dir,
+        temporary_dir,
+        action,
+        policy,
+    })
+}
+
 pub fn parse_registry_lock(source: &str, span: Span) -> KuResult<Vec<RegistryLockPackage>> {
     let mut packages = Vec::new();
     let mut current = None::<HashMap<String, String>>;
@@ -827,27 +1042,60 @@ fn validate_package_name(name: &str, span: Span) -> KuResult<()> {
 }
 
 fn validate_version(version: &str, span: Span) -> KuResult<()> {
-    let parts = version.split('.').collect::<Vec<_>>();
-    if parts.len() != 3
-        || parts
-            .iter()
-            .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
+    parse_package_version(version, span).map(|_| ())
+}
+
+fn validate_version_requirement(version: &str, span: Span) -> KuResult<()> {
+    parse_version_requirement(version, span).map(|_| ())
+}
+
+fn invalid_version_error(span: Span) -> KuError {
+    KuError::package(
+        "invalid_version",
+        "package version must use major.minor.patch digits within u64 range",
+        span,
+    )
+}
+
+fn invalid_version_requirement_error(span: Span) -> KuError {
+    KuError::package(
+        "invalid_version_requirement",
+        "dependency version must be an exact major.minor.patch version or a ^major.minor.patch range",
+        span,
+    )
+}
+
+fn validate_registry_fetch_policy(policy: RegistryFetchPolicy, span: Span) -> KuResult<()> {
+    if policy.max_attempts == 0 || policy.max_attempts > MAX_REGISTRY_FETCH_ATTEMPTS {
+        return Err(KuError::package(
+            "invalid_fetch_policy",
+            format!("registry max_attempts must be between 1 and {MAX_REGISTRY_FETCH_ATTEMPTS}"),
+            span,
+        ));
+    }
+    if policy.connect_timeout_ms == 0
+        || policy.connect_timeout_ms > MAX_REGISTRY_TIMEOUT_MS
+        || policy.read_timeout_ms == 0
+        || policy.read_timeout_ms > MAX_REGISTRY_TIMEOUT_MS
     {
         return Err(KuError::package(
-            "invalid_version",
-            "package version must use major.minor.patch digits",
+            "invalid_fetch_policy",
+            format!(
+                "registry timeouts must be between 1 and {MAX_REGISTRY_TIMEOUT_MS} milliseconds"
+            ),
+            span,
+        ));
+    }
+    if policy.max_download_bytes == 0 || policy.max_download_bytes > MAX_REGISTRY_DOWNLOAD_BYTES {
+        return Err(KuError::package(
+            "invalid_fetch_policy",
+            format!(
+                "registry max_download_bytes must be between 1 and {MAX_REGISTRY_DOWNLOAD_BYTES}"
+            ),
             span,
         ));
     }
     Ok(())
-}
-
-fn validate_version_requirement(version: &str, span: Span) -> KuResult<()> {
-    let version = version
-        .strip_prefix('^')
-        .or_else(|| version.strip_prefix('~'))
-        .unwrap_or(version);
-    validate_version(version, span)
 }
 
 fn reject_unsafe_relative_path(kind: &str, value: &str, span: Span) -> KuResult<()> {

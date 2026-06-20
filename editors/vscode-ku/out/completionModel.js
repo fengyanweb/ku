@@ -76,6 +76,7 @@ exports.namespaceMembers = {
     json: ["parse", "try_parse", "stringify"],
     config: ["env", "env_file", "yaml"],
     time: ["now", "unix", "millis"],
+    task: ["status", "cancel", "await_timeout"],
 };
 function stdImportPathLabels(current) {
     if (!current.startsWith("std.")) {

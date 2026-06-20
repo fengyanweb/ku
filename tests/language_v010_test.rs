@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     env, fs,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -33,6 +34,83 @@ fn check_err(source: &str) -> String {
         .check(&program)
         .expect_err("program should fail")
         .to_string()
+}
+
+fn assert_ir_cfg_acyclic(program: &ir::IrProgram) {
+    fn visit(
+        id: ir::BlockId,
+        edges: &HashMap<ir::BlockId, Vec<ir::BlockId>>,
+        visiting: &mut HashSet<ir::BlockId>,
+        visited: &mut HashSet<ir::BlockId>,
+    ) {
+        if visited.contains(&id) {
+            return;
+        }
+        assert!(
+            visiting.insert(id),
+            "IR CFG contains a cycle at block{}",
+            id.0
+        );
+        for target in edges.get(&id).into_iter().flatten() {
+            visit(*target, edges, visiting, visited);
+        }
+        visiting.remove(&id);
+        visited.insert(id);
+    }
+
+    for function in &program.functions {
+        let mut edges = HashMap::new();
+        let block_ids = function
+            .blocks
+            .iter()
+            .map(|block| block.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            block_ids.len(),
+            function.blocks.len(),
+            "IR function '{}' contains duplicate block ids",
+            function.name
+        );
+        for block in &function.blocks {
+            let targets = match &block.terminator {
+                ir::IrTerminator::Jump(target) => vec![*target],
+                ir::IrTerminator::Branch {
+                    then_block,
+                    else_block,
+                    ..
+                } => vec![*then_block, *else_block],
+                ir::IrTerminator::ForEach {
+                    body_block,
+                    after_block,
+                    ..
+                } => vec![*body_block, *after_block],
+                ir::IrTerminator::ResultBranch {
+                    ok_block,
+                    err_block,
+                    ..
+                } => vec![*ok_block, *err_block],
+                ir::IrTerminator::JumpErr { target, .. } => vec![*target],
+                ir::IrTerminator::Next
+                | ir::IrTerminator::PropagateErr(_)
+                | ir::IrTerminator::Return(_)
+                | ir::IrTerminator::Unreachable => Vec::new(),
+            };
+            for target in &targets {
+                assert!(
+                    block_ids.contains(target),
+                    "IR block{} targets missing block{}",
+                    block.id.0,
+                    target.0
+                );
+            }
+            edges.insert(block.id, targets);
+        }
+        let mut visiting = HashSet::new();
+        let mut visited = HashSet::new();
+        for block in &function.blocks {
+            visit(block.id, &edges, &mut visiting, &mut visited);
+        }
+    }
 }
 
 #[test]
@@ -300,6 +378,125 @@ fn main() {
         err.contains("native C prototype"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn native_c_backend_lowers_bounded_array_reads_and_writes() {
+    let tokens = Lexer::new(
+        r#"
+fn replace(values:[int]): int {
+    values[0] = 8
+    return values[0]
+}
+
+fn main() {
+    values = [1, 2, 3]
+    values[1] = 7
+    copy = values
+    copy[0] = 9
+    if (values[1] != 7) {
+        panic("bad array write")
+    }
+    if (values[0] != 1) {
+        panic("array assignment must copy")
+    }
+    changed = replace(values)
+    if (changed != 8 || values[0] != 1) {
+        panic("array argument must copy")
+    }
+    print(values[0])
+}
+"#,
+    )
+    .tokenize()
+    .expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let ir = ir::lower_program(&program).expect("lower");
+    let c = backend::c::generate_c_source(&ir).expect("generate c");
+
+    assert!(c.contains("typedef struct { size_t len; int64_t* data; } KuArray_int"));
+    assert!(c.contains("ku_array_make_int(3"));
+    assert!(c.contains("ku_array_clone_int(values)"));
+    assert!(c.contains("replace(ku_array_clone_int(values))"));
+    assert!(c.contains("index < 0 || (uint64_t)index >= array.len"));
+    assert!(c.contains("index < 0 || (uint64_t)index >= array->len"));
+    assert!(c.contains("ku_array_get_int("));
+    assert!(c.contains("*ku_array_at_int("));
+}
+
+#[test]
+fn native_c_backend_lowers_enum_payload_and_guarded_match_cfg() {
+    let source = r#"
+enum Maybe {
+    Some(value:int)
+    None
+}
+
+fn main() {
+    value = Maybe.Some(7)
+    result = match value {
+        Maybe.Some(n) if (n > 0) => n + 1
+        Maybe.Some(_) => 0
+        Maybe.None => -1
+    }
+    print(result)
+}
+"#;
+    let tokens = Lexer::new(source).tokenize().expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let ir = ir::lower_program(&program).expect("lower");
+    let ir_text = ir.to_string();
+    assert_ir_cfg_acyclic(&ir);
+    let c = backend::c::generate_c_source(&ir).expect("generate c");
+
+    assert!(ir_text.contains("match_arm"), "unexpected IR:\n{ir_text}");
+    assert!(ir_text.contains("match_next"), "unexpected IR:\n{ir_text}");
+    assert!(ir_text.contains("match_after"), "unexpected IR:\n{ir_text}");
+    assert!(c.contains("typedef struct KuEnum_Maybe"));
+    assert!(c.contains("int32_t tag;"));
+    assert!(c.contains("payload.Some.value"));
+    assert!(c.contains(".tag = 0"));
+    assert!(c.contains("goto block"));
+    assert!(!c.contains("while (1)"), "match lowering must not retry");
+}
+
+#[test]
+fn native_c_backend_lowers_nested_enum_match_payloads() {
+    let tokens = Lexer::new(
+        r#"
+enum Inner {
+    Number(value:int)
+    Empty
+}
+
+enum Expr {
+    Box(value:Inner)
+    Other
+}
+
+fn main() {
+    value = Expr.Box(Inner.Number(9))
+    result = match value {
+        Expr.Box(Inner.Number(n)) => n
+        Expr.Box(_) => 0
+        Expr.Other => -1
+    }
+    print(result)
+}
+"#,
+    )
+    .tokenize()
+    .expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let ir = ir::lower_program(&program).expect("lower");
+    let c = backend::c::generate_c_source(&ir).expect("generate c");
+
+    assert!(c.contains("KuEnum_Inner value;"));
+    assert!(c.contains("payload.Box.value"));
+    assert!(c.contains("payload.Number.value"));
 }
 
 #[test]
@@ -1016,6 +1213,162 @@ cache_key = "math-0.1.0"
     )
     .expect_err("short sha256 should fail");
     assert_eq!(err.code.as_deref(), Some("invalid_registry_checksum"));
+}
+
+#[test]
+fn registry_version_requirements_support_exact_and_caret_boundaries() {
+    let exact =
+        package::parse_version_requirement("1.2.3", Default::default()).expect("exact requirement");
+    let caret = package::parse_version_requirement("^1.2.3", Default::default())
+        .expect("caret requirement");
+    let zero_minor = package::parse_version_requirement("^0.2.3", Default::default())
+        .expect("zero-major caret requirement");
+    let zero_patch = package::parse_version_requirement("^0.0.3", Default::default())
+        .expect("zero-minor caret requirement");
+    let version =
+        |value| package::parse_package_version(value, Default::default()).expect("package version");
+
+    assert!(package::version_requirement_matches(
+        exact,
+        version("1.2.3")
+    ));
+    assert!(!package::version_requirement_matches(
+        exact,
+        version("1.2.4")
+    ));
+    assert!(package::version_requirement_matches(
+        caret,
+        version("1.9.0")
+    ));
+    assert!(!package::version_requirement_matches(
+        caret,
+        version("2.0.0")
+    ));
+    assert!(package::version_requirement_matches(
+        zero_minor,
+        version("0.2.99")
+    ));
+    assert!(!package::version_requirement_matches(
+        zero_minor,
+        version("0.3.0")
+    ));
+    assert!(package::version_requirement_matches(
+        zero_patch,
+        version("0.0.3")
+    ));
+    assert!(!package::version_requirement_matches(
+        zero_patch,
+        version("0.0.4")
+    ));
+
+    let err = package::parse_version_requirement("~1.2.3", Default::default())
+        .expect_err("tilde requirement should be rejected");
+    assert_eq!(err.code.as_deref(), Some("invalid_version_requirement"));
+}
+
+#[test]
+fn registry_resolver_selects_highest_shared_version_and_reports_conflicts() {
+    let checksum = format!("sha256-{}", "a".repeat(64));
+    let manifest = |version: &str| package::RegistryManifest {
+        name: "math".to_string(),
+        version: version.to_string(),
+        source: format!("https://registry.example/math/{version}.tar.gz"),
+        checksum: checksum.clone(),
+    };
+    let dependency = |requirement: &str| package::PackageDependency {
+        name: "math".to_string(),
+        version: requirement.to_string(),
+        source: None,
+        checksum: None,
+    };
+    let manifests = vec![manifest("1.2.3"), manifest("1.8.0"), manifest("2.0.0")];
+
+    let resolved = package::resolve_registry_dependencies(
+        &[dependency("^1.2.0"), dependency("^1.7.0")],
+        &manifests,
+        Default::default(),
+    )
+    .expect("compatible requirements");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].version, "1.8.0");
+
+    let err = package::resolve_registry_dependencies(
+        &[dependency("1.2.3"), dependency("^2.0.0")],
+        &manifests,
+        Default::default(),
+    )
+    .expect_err("incompatible requirements should fail");
+    assert_eq!(err.code.as_deref(), Some("dependency_conflict"));
+}
+
+#[test]
+fn registry_download_plan_is_offline_bounded_and_cache_aware() {
+    let manifest = package::RegistryManifest {
+        name: "math".to_string(),
+        version: "1.2.3".to_string(),
+        source: "https://registry.example/math/1.2.3.tar.gz".to_string(),
+        checksum: format!("sha256-{}", "b".repeat(64)),
+    };
+    let cache = unique_temp_path("registry-plan");
+    let policy = package::RegistryFetchPolicy::default();
+    let reuse = package::plan_registry_download(
+        &cache,
+        &manifest,
+        Some(&manifest.checksum),
+        policy,
+        Default::default(),
+    )
+    .expect("reuse plan");
+    assert_eq!(reuse.action, package::RegistryCacheAction::ReuseVerified);
+    assert_eq!(reuse.policy.max_attempts, 3);
+    assert!(reuse
+        .target_dir
+        .ends_with(PathBuf::from("packages").join("math").join("1.2.3")));
+
+    let refresh =
+        package::plan_registry_download(&cache, &manifest, None, policy, Default::default())
+            .expect("refresh plan");
+    assert_eq!(
+        refresh.action,
+        package::RegistryCacheAction::DownloadAndReplace
+    );
+    assert_ne!(refresh.target_dir, refresh.temporary_dir);
+    let second_refresh =
+        package::plan_registry_download(&cache, &manifest, None, policy, Default::default())
+            .expect("second refresh plan");
+    assert_ne!(
+        refresh.temporary_dir, second_refresh.temporary_dir,
+        "concurrent registry downloads must not share a temporary directory"
+    );
+
+    let err = package::plan_registry_download(
+        &cache,
+        &manifest,
+        None,
+        package::RegistryFetchPolicy {
+            max_attempts: 0,
+            ..policy
+        },
+        Default::default(),
+    )
+    .expect_err("zero retry attempts should fail");
+    assert_eq!(err.code.as_deref(), Some("invalid_fetch_policy"));
+
+    for policy in [
+        package::RegistryFetchPolicy {
+            max_attempts: 9,
+            ..policy
+        },
+        package::RegistryFetchPolicy {
+            max_download_bytes: 100_000_001,
+            ..policy
+        },
+    ] {
+        let err =
+            package::plan_registry_download(&cache, &manifest, None, policy, Default::default())
+                .expect_err("excessive registry resource policy should fail");
+        assert_eq!(err.code.as_deref(), Some("invalid_fetch_policy"));
+    }
 }
 
 #[test]

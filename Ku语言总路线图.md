@@ -7,6 +7,8 @@
 > 本文档用于固定大方向，具体细节后续可以逐项找 AI 拆方案。
 > 当前语法修订：0.0.3 语法边界已废弃 `let` / `let mut`。变量使用 `name = value`、`name:type = value`、`name:type`；常量使用全大写命名规则。本文中较早出现的 `let` 示例属于历史草案，不代表当前语法。
 
+> 2026-06-20 当前检查点：解释器语义、HTTP 有界服务、async task 生命周期、native C 的 struct/array/enum/match、LLVM struct/Result 小子集、registry 精确/caret resolver 已完成。接下来大方向不是继续堆语法，而是固定 native 内存所有权与 Error ABI、完成 try/catch/finally 和闭包 lowering、接入可验证的 registry 网络协议，并持续用真实项目决定 LLVM 扩展范围。
+
 ---
 
 ## 1. ku 的总定位

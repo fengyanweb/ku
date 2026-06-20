@@ -1730,6 +1730,27 @@ impl Checker {
             return Ok(None);
         };
         let target_type = self.check_expr(target)?;
+        if let Type::Task(value) = target_type {
+            return match name.as_str() {
+                "status" => {
+                    expect_arg_count("task.status", args.len(), 0, span)?;
+                    Ok(Some(Type::String))
+                }
+                "cancel" => {
+                    expect_arg_count("task.cancel", args.len(), 0, span)?;
+                    Ok(Some(Type::Bool))
+                }
+                "await_timeout" => {
+                    expect_arg_count("task.await_timeout", args.len(), 1, span)?;
+                    let timeout = self.check_expr(&args[0])?;
+                    if timeout != Type::Int {
+                        return Err(type_error(args[0].span, &Type::Int, &timeout));
+                    }
+                    Ok(Some(*value))
+                }
+                _ => Ok(None),
+            };
+        }
         let module = match target_type {
             Type::String => "string",
             Type::Array(_) if name != "map" => "array",

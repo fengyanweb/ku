@@ -21,7 +21,7 @@ use crate::{
     error::{KuError, KuResult},
     lexer::Lexer,
     parser::Parser,
-    runtime::task::TaskRuntime,
+    runtime::task::{current_task_cancelled, TaskRuntime},
     span::{Position, Span},
     stdlib,
     value::Value,
@@ -138,11 +138,20 @@ impl Interpreter {
             }
         }
         self.task_runtime = Some(TaskRuntime::new());
-        let result = self.call_function("main", Vec::new(), entry_span(), 0)?;
-        let result = match result {
-            Value::Task(task) => task.await_result()?,
-            value => value,
-        };
+        let result = (|| -> KuResult<Value> {
+            let result = self.call_function("main", Vec::new(), entry_span(), 0)?;
+            match result {
+                Value::Task(task) => task.await_result(),
+                value => Ok(value),
+            }
+        })();
+        let shutdown = self
+            .task_runtime
+            .as_ref()
+            .map(|runtime| runtime.cancel_all_and_wait(Duration::from_secs(1)))
+            .transpose();
+        let result = result?;
+        shutdown?;
         if let Value::Result { ok: false, value } = result {
             return Err(KuError::runtime(
                 format!("unhandled recoverable error: {value}"),
@@ -731,6 +740,42 @@ impl Interpreter {
         let target_value = self.eval(target, env, depth)?;
         if self.pending_fail.is_some() {
             return Ok(Some(Value::Null));
+        }
+        if let Value::Task(task) = target_value {
+            let value = match name.as_str() {
+                "status" => {
+                    expect_runtime_arg_count("task.status", args.len(), 0, span)?;
+                    Value::String(task.status().to_string())
+                }
+                "cancel" => {
+                    expect_runtime_arg_count("task.cancel", args.len(), 0, span)?;
+                    Value::Bool(task.cancel())
+                }
+                "await_timeout" => {
+                    expect_runtime_arg_count("task.await_timeout", args.len(), 1, span)?;
+                    let timeout = self.eval(&args[0], env, depth)?;
+                    let Value::Int(timeout) = timeout else {
+                        return Err(KuError::runtime(
+                            "type error: task.await_timeout expects int milliseconds",
+                            args[0].span,
+                        ));
+                    };
+                    let timeout = u64::try_from(timeout).map_err(|_| {
+                        KuError::runtime(
+                            "task.await_timeout milliseconds must be non-negative",
+                            args[0].span,
+                        )
+                    })?;
+                    task.await_timeout(Duration::from_millis(timeout))?
+                }
+                _ => {
+                    return Err(KuError::runtime(
+                        format!("task has no method '{name}'"),
+                        span,
+                    ))
+                }
+            };
+            return Ok(Some(value));
         }
         let module = match &target_value {
             Value::String(_) => "string",
@@ -1656,6 +1701,15 @@ impl Interpreter {
     }
 
     fn tick(&mut self, span: Span) -> KuResult<()> {
+        if current_task_cancelled() {
+            return Err(KuError::structured(
+                crate::error::KuErrorKind::Runtime,
+                "task",
+                "cancelled",
+                "async task was cancelled",
+                span,
+            ));
+        }
         if self
             .execution_deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -3059,6 +3113,22 @@ fn expect_bool_condition(value: Value, span: Span) -> KuResult<bool> {
             ),
             span,
         )),
+    }
+}
+
+fn expect_runtime_arg_count(
+    name: &str,
+    actual: usize,
+    expected: usize,
+    span: Span,
+) -> KuResult<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(KuError::runtime(
+            format!("{name} expects {expected} arguments but got {actual}"),
+            span,
+        ))
     }
 }
 

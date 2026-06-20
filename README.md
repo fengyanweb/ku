@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.12`，重点是嵌套 `match` 模式、独立导入的 `std.http` 标准库雏形，以及更接近真实可执行入口的 native C 输出。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.12`，正在补齐 native C、LLVM、registry resolver 和 async task 生命周期能力。
 
 ## 快速开始
 
@@ -198,7 +198,7 @@ package/
 
 `ku build` 当前生成解释器打包型可执行文件。
 
-`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct layout/字面量/字段读写、局部变量、直接函数调用、`print`、`return`、`if`、`while`，以及基础 Result 的 `ok` / `err` / `?` / 错误传播。native C 的错误槽仍是原型字符串 ABI；数组、enum、闭包、match、try/catch 和 async 的 native lowering 仍会明确报不支持。
+`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流，以及基础 Result 的 `ok` / `err` / `?` / 错误传播。native C 的错误槽和内存所有权仍是原型 ABI；闭包、try/catch/finally 和 async native lowering 仍会明确报不支持。
 
 已完成到 0.0.12 的关键前置：
 
@@ -223,15 +223,19 @@ std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ st
 native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wrapper。
 async fn 调用会立即启动 task，必须显式返回 T!；await task? 等价于 (await task)?。
 async runtime 默认最多 1024 个 task；blocking worker 为 min(32, max(4, CPU 核心数))，blocking queue 最多 1024，超限返回结构化 task Err。
+task.status/cancel/await_timeout 已实现；取消是协作式的，等待超时不会隐式取消目标任务。
+registry resolver 支持精确版本和 caret 范围、最高兼容版本选择和冲突诊断；网络下载仍未接入。
+LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 ```
 
 仍未完成：
 
 ```txt
-LLVM 复杂类型和高级控制流 lowering
-registry 网络下载、真正语义版本求解和缓存更新
+LLVM array/enum、闭包和高级控制流 lowering
+registry 索引协议、网络下载、SHA-256 执行和缓存原子更新
 完整 match guard 模式矩阵和跨 guard 的穷尽性证明
-完整 native C 后端（array / enum / match / async 等）
+完整 native C 所有权、闭包、try/catch/finally 后端
+native async ABI
 ```
 
 ## VS Code 插件

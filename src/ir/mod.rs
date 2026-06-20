@@ -5,8 +5,8 @@ use std::{
 
 use crate::{
     ast::{
-        AssignTarget, BinaryOp, EnumDecl, Expr, ExprKind, Item, Literal, Program, Stmt, StructDecl,
-        TypeName, UnaryOp,
+        AssignTarget, BinaryOp, EnumDecl, Expr, ExprKind, Item, Literal, MatchArm, MatchPattern,
+        Program, Stmt, StructDecl, TypeName, UnaryOp,
     },
     error::{KuError, KuResult},
     span::Span,
@@ -249,12 +249,12 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                     params: function
                         .params
                         .iter()
-                        .map(|p| lower_optional_type(&p.ty))
+                        .map(|p| lower_optional_type(&p.ty, &layouts))
                         .collect(),
                     returns: function
                         .return_type
                         .as_ref()
-                        .map(lower_type)
+                        .map(|ty| lower_type(ty, &layouts))
                         .unwrap_or(IrType::Void),
                 },
             );
@@ -357,7 +357,7 @@ impl fmt::Display for IrType {
             IrType::Null => write!(f, "null"),
             IrType::Array(inner) => write!(f, "[{inner}]"),
             IrType::Result(inner) => write!(f, "{inner}!"),
-            IrType::Named(name) => write!(f, "{name}"),
+            IrType::Named(name) => write!(f, "{}", enum_type_name(name).unwrap_or(name)),
             IrType::Function => write!(f, "function"),
             IrType::Unknown => write!(f, "unknown"),
             IrType::Void => write!(f, "void"),
@@ -521,6 +521,7 @@ struct FunctionLowerer<'a> {
     next_temp_id: usize,
     next_local_function_id: usize,
     try_handlers: Vec<IrTryHandler>,
+    pattern_bindings: HashMap<String, IrExpr>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -551,6 +552,7 @@ impl<'a> FunctionLowerer<'a> {
             next_temp_id: 0,
             next_local_function_id: 10_000,
             try_handlers: Vec::new(),
+            pattern_bindings: HashMap::new(),
         }
     }
 
@@ -577,7 +579,7 @@ impl<'a> FunctionLowerer<'a> {
                 let value = self.lower_expr(value)?;
                 let ty = ty
                     .as_ref()
-                    .map(lower_type)
+                    .map(|ty| lower_type(ty, self.layouts))
                     .unwrap_or_else(|| value.ty.clone());
                 self.locals.insert(name.clone(), ty.clone());
                 self.current.instructions.push(IrInst::Let {
@@ -1028,10 +1030,15 @@ impl<'a> FunctionLowerer<'a> {
                 kind: IrExprKind::Literal(literal_text(literal)),
                 ty: literal_type(literal),
             }),
-            ExprKind::Variable(name) => Ok(IrExpr {
-                kind: IrExprKind::Local(name.clone()),
-                ty: self.locals.get(name).cloned().unwrap_or(IrType::Unknown),
-            }),
+            ExprKind::Variable(name) => {
+                if let Some(value) = self.pattern_bindings.get(name) {
+                    return Ok(value.clone());
+                }
+                Ok(IrExpr {
+                    kind: IrExprKind::Local(name.clone()),
+                    ty: self.locals.get(name).cloned().unwrap_or(IrType::Unknown),
+                })
+            }
             ExprKind::Unary { op, expr } => {
                 let expr = self.lower_expr(expr)?;
                 let ty = match op {
@@ -1064,6 +1071,37 @@ impl<'a> FunctionLowerer<'a> {
                     .iter()
                     .map(|arg| self.lower_expr(arg))
                     .collect::<KuResult<Vec<_>>>()?;
+                if let Some((layout, variant)) = self.enum_variant(callee) {
+                    let fields = variant
+                        .fields
+                        .iter()
+                        .zip(lowered_args)
+                        .map(|(field, value)| (field.name.clone(), value))
+                        .collect::<Vec<_>>();
+                    let field_names = fields
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    return self.emit_temp(IrExpr {
+                        kind: IrExprKind::Call {
+                            callee: Box::new(IrExpr {
+                                kind: IrExprKind::Local(format!(
+                                    "{enum_name}.{variant_name}",
+                                    enum_name = layout.name,
+                                    variant_name = variant.name
+                                )),
+                                ty: IrType::Function,
+                            }),
+                            args: fields.into_iter().map(|(_, value)| value).collect(),
+                            kind: IrCallKind::Intrinsic(format!(
+                                "__ku_enum:{}:{}:{}:{field_names}",
+                                layout.name, variant.name, variant.tag
+                            )),
+                        },
+                        ty: enum_ir_type(&layout.name),
+                    });
+                }
                 let (kind, ty) = call_kind_and_type(callee, &lowered_args, self.signatures);
                 let callee = self.lower_expr(callee)?;
                 self.emit_temp(IrExpr {
@@ -1105,6 +1143,38 @@ impl<'a> FunctionLowerer<'a> {
                 })
             }
             ExprKind::Field { target, name } => {
+                if let ExprKind::Variable(enum_name) = &target.kind {
+                    if let Some(layout) = self
+                        .layouts
+                        .enums
+                        .iter()
+                        .find(|layout| layout.name == *enum_name)
+                    {
+                        if let Some(variant) = layout
+                            .variants
+                            .iter()
+                            .find(|variant| variant.name == *name && variant.fields.is_empty())
+                        {
+                            return self.emit_temp(IrExpr {
+                                kind: IrExprKind::Call {
+                                    callee: Box::new(IrExpr {
+                                        kind: IrExprKind::Local(format!(
+                                            "{}.{}",
+                                            layout.name, variant.name
+                                        )),
+                                        ty: IrType::Function,
+                                    }),
+                                    args: Vec::new(),
+                                    kind: IrCallKind::Intrinsic(format!(
+                                        "__ku_enum:{}:{}:{}:",
+                                        layout.name, variant.name, variant.tag
+                                    )),
+                                },
+                                ty: enum_ir_type(&layout.name),
+                            });
+                        }
+                    }
+                }
                 let target = self.lower_expr(target)?;
                 let ty = self.field_type(&target.ty, name);
                 self.emit_temp(IrExpr {
@@ -1145,7 +1215,7 @@ impl<'a> FunctionLowerer<'a> {
                 })
             }
             ExprKind::ObjectLiteral { .. } => Ok(unsupported_expr("object literal")),
-            ExprKind::Match { .. } => Ok(unsupported_expr("match expression")),
+            ExprKind::Match { value, arms } => self.lower_match(value, arms, expr.span),
             ExprKind::Function { .. } => Ok(IrExpr {
                 kind: IrExprKind::Literal("<closure>".to_string()),
                 ty: IrType::Function,
@@ -1166,6 +1236,184 @@ impl<'a> FunctionLowerer<'a> {
             kind: IrExprKind::Temp(id),
             ty,
         })
+    }
+
+    fn enum_variant(&self, expr: &Expr) -> Option<(&IrEnumLayout, &IrVariantLayout)> {
+        let ExprKind::Field { target, name } = &expr.kind else {
+            return None;
+        };
+        let ExprKind::Variable(enum_name) = &target.kind else {
+            return None;
+        };
+        let layout = self
+            .layouts
+            .enums
+            .iter()
+            .find(|layout| layout.name == *enum_name)?;
+        let variant = layout
+            .variants
+            .iter()
+            .find(|variant| variant.name == *name)?;
+        Some((layout, variant))
+    }
+
+    fn lower_match(&mut self, value: &Expr, arms: &[MatchArm], span: Span) -> KuResult<IrExpr> {
+        let subject = self.lower_expr(value)?;
+        let origin = self.current.id;
+        let result_name = format!("__ku_match_{}", self.next_temp_id);
+        self.next_temp_id += 1;
+        let after_id = self.next_block("match_after");
+        let mut result_ty = None;
+
+        for arm in arms {
+            let arm_id = self.next_block("match_arm");
+            let next_id = self.next_block("match_next");
+            let mut bindings = HashMap::new();
+            let condition =
+                self.lower_match_pattern(&arm.pattern, subject.clone(), &mut bindings)?;
+            self.current.terminator = IrTerminator::Branch {
+                condition,
+                then_block: arm_id,
+                else_block: next_id,
+            };
+            self.finish_current();
+
+            self.start_block(arm_id, "match_arm");
+            let saved_bindings = std::mem::replace(&mut self.pattern_bindings, bindings);
+            if let Some(guard) = &arm.guard {
+                let guard = self.lower_expr(guard)?;
+                let value_id = self.next_block("match_value");
+                self.current.terminator = IrTerminator::Branch {
+                    condition: guard,
+                    then_block: value_id,
+                    else_block: next_id,
+                };
+                self.finish_current();
+                self.start_block(value_id, "match_value");
+            }
+            let arm_value = self.lower_expr(&arm.value)?;
+            if let Some(expected) = &result_ty {
+                if expected != &arm_value.ty {
+                    self.pattern_bindings = saved_bindings;
+                    return Err(KuError::runtime(
+                        "match arm result types changed after checking",
+                        arm.span,
+                    ));
+                }
+            } else {
+                result_ty = Some(arm_value.ty.clone());
+            }
+            self.current.instructions.push(IrInst::Store {
+                target: IrLValue::Local(result_name.clone()),
+                value: arm_value,
+            });
+            if self.current.terminator == IrTerminator::Next {
+                self.current.terminator = IrTerminator::Jump(after_id);
+            }
+            self.finish_current();
+            self.pattern_bindings = saved_bindings;
+            self.start_block(next_id, "match_next");
+        }
+
+        self.current.instructions.push(IrInst::Panic(IrExpr {
+            kind: IrExprKind::Literal("\"match expression did not match any arm\"".to_string()),
+            ty: IrType::Str,
+        }));
+        self.current.terminator = IrTerminator::Unreachable;
+        self.finish_current();
+
+        let ty =
+            result_ty.ok_or_else(|| KuError::runtime("match requires at least one arm", span))?;
+        let origin_block = self
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == origin)
+            .ok_or_else(|| KuError::runtime("missing match origin block", span))?;
+        origin_block.instructions.push(IrInst::Let {
+            name: result_name.clone(),
+            ty: ty.clone(),
+            value: zero_expr(ty.clone()),
+        });
+        self.start_block(after_id, "match_after");
+        Ok(IrExpr {
+            kind: IrExprKind::Local(result_name),
+            ty,
+        })
+    }
+
+    fn lower_match_pattern(
+        &self,
+        pattern: &MatchPattern,
+        value: IrExpr,
+        bindings: &mut HashMap<String, IrExpr>,
+    ) -> KuResult<IrExpr> {
+        match pattern {
+            MatchPattern::Wildcard => Ok(bool_literal(true)),
+            MatchPattern::Binding(name) => {
+                bindings.insert(name.clone(), value);
+                Ok(bool_literal(true))
+            }
+            MatchPattern::Literal(literal) => Ok(IrExpr {
+                kind: IrExprKind::Binary {
+                    left: Box::new(value),
+                    op: BinaryOp::Equal,
+                    right: Box::new(IrExpr {
+                        kind: IrExprKind::Literal(literal_text(literal)),
+                        ty: literal_type(literal),
+                    }),
+                },
+                ty: IrType::Bool,
+            }),
+            MatchPattern::EnumVariant {
+                enum_name,
+                variant,
+                fields,
+            } => {
+                let layout = self
+                    .layouts
+                    .enums
+                    .iter()
+                    .find(|layout| layout.name == *enum_name)
+                    .ok_or_else(|| {
+                        KuError::runtime(format!("undefined enum '{enum_name}'"), Span::default())
+                    })?;
+                let variant_layout = layout
+                    .variants
+                    .iter()
+                    .find(|candidate| candidate.name == *variant)
+                    .ok_or_else(|| {
+                        KuError::runtime(
+                            format!("enum '{enum_name}' has no variant '{variant}'"),
+                            Span::default(),
+                        )
+                    })?;
+                let mut condition = IrExpr {
+                    kind: IrExprKind::Binary {
+                        left: Box::new(intrinsic_expr(
+                            "__ku_enum_tag",
+                            vec![value.clone()],
+                            IrType::Int,
+                        )),
+                        op: BinaryOp::Equal,
+                        right: Box::new(IrExpr {
+                            kind: IrExprKind::Literal(variant_layout.tag.to_string()),
+                            ty: IrType::Int,
+                        }),
+                    },
+                    ty: IrType::Bool,
+                };
+                for (pattern, field) in fields.iter().zip(&variant_layout.fields) {
+                    let payload = intrinsic_expr(
+                        format!("__ku_enum_payload:{variant}:{}", field.name),
+                        vec![value.clone()],
+                        field.ty.clone(),
+                    );
+                    let field_condition = self.lower_match_pattern(pattern, payload, bindings)?;
+                    condition = and_expr(condition, field_condition);
+                }
+                Ok(condition)
+            }
+        }
     }
 
     fn emit_try_unwrap(&mut self, result: IrExpr, ty: IrType) -> KuResult<IrExpr> {
@@ -1248,38 +1496,51 @@ impl<'a> FunctionLowerer<'a> {
     }
 }
 
-fn lower_type(ty: &TypeName) -> IrType {
+fn lower_type(ty: &TypeName, layouts: &IrLayoutTable) -> IrType {
     match ty {
         TypeName::Int => IrType::Int,
         TypeName::Float => IrType::Float,
         TypeName::Bool => IrType::Bool,
         TypeName::String => IrType::Str,
         TypeName::Null => IrType::Null,
-        TypeName::Array(inner) => IrType::Array(Box::new(lower_type(inner))),
-        TypeName::Result(inner) => IrType::Result(Box::new(lower_type(inner))),
+        TypeName::Array(inner) => IrType::Array(Box::new(lower_type(inner, layouts))),
+        TypeName::Result(inner) => IrType::Result(Box::new(lower_type(inner, layouts))),
         TypeName::Union(_) => IrType::Unknown,
+        TypeName::Custom(name) if layouts.enums.iter().any(|layout| layout.name == *name) => {
+            enum_ir_type(name)
+        }
         TypeName::Custom(name) => IrType::Named(name.clone()),
     }
 }
 
-fn lower_optional_type(ty: &Option<TypeName>) -> IrType {
-    ty.as_ref().map(lower_type).unwrap_or(IrType::Unknown)
+fn lower_optional_type(ty: &Option<TypeName>, layouts: &IrLayoutTable) -> IrType {
+    ty.as_ref()
+        .map(|ty| lower_type(ty, layouts))
+        .unwrap_or(IrType::Unknown)
 }
 
 fn lower_layouts(program: &Program) -> IrLayoutTable {
+    let enum_names = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Enum(decl) => Some(decl.name.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let mut structs = Vec::new();
     let mut enums = Vec::new();
     for item in &program.items {
         match item {
-            Item::Struct(decl) => structs.push(lower_struct_layout(decl)),
-            Item::Enum(decl) => enums.push(lower_enum_layout(decl)),
+            Item::Struct(decl) => structs.push(lower_struct_layout(decl, &enum_names)),
+            Item::Enum(decl) => enums.push(lower_enum_layout(decl, &enum_names)),
             _ => {}
         }
     }
     IrLayoutTable { structs, enums }
 }
 
-fn lower_struct_layout(decl: &StructDecl) -> IrStructLayout {
+fn lower_struct_layout(decl: &StructDecl, enum_names: &HashSet<String>) -> IrStructLayout {
     IrStructLayout {
         name: decl.name.clone(),
         fields: decl
@@ -1288,14 +1549,14 @@ fn lower_struct_layout(decl: &StructDecl) -> IrStructLayout {
             .enumerate()
             .map(|(offset, field)| IrFieldLayout {
                 name: field.name.clone(),
-                ty: lower_optional_type(&field.ty),
+                ty: lower_layout_type(&field.ty, enum_names),
                 offset,
             })
             .collect(),
     }
 }
 
-fn lower_enum_layout(decl: &EnumDecl) -> IrEnumLayout {
+fn lower_enum_layout(decl: &EnumDecl, enum_names: &HashSet<String>) -> IrEnumLayout {
     IrEnumLayout {
         name: decl.name.clone(),
         variants: decl
@@ -1311,12 +1572,88 @@ fn lower_enum_layout(decl: &EnumDecl) -> IrEnumLayout {
                     .enumerate()
                     .map(|(offset, field)| IrFieldLayout {
                         name: field.name.clone(),
-                        ty: lower_optional_type(&field.ty),
+                        ty: lower_layout_type(&field.ty, enum_names),
                         offset,
                     })
                     .collect(),
             })
             .collect(),
+    }
+}
+
+fn lower_layout_type(ty: &Option<TypeName>, enum_names: &HashSet<String>) -> IrType {
+    fn lower(ty: &TypeName, enum_names: &HashSet<String>) -> IrType {
+        match ty {
+            TypeName::Int => IrType::Int,
+            TypeName::Float => IrType::Float,
+            TypeName::Bool => IrType::Bool,
+            TypeName::String => IrType::Str,
+            TypeName::Null => IrType::Null,
+            TypeName::Array(inner) => IrType::Array(Box::new(lower(inner, enum_names))),
+            TypeName::Result(inner) => IrType::Result(Box::new(lower(inner, enum_names))),
+            TypeName::Union(_) => IrType::Unknown,
+            TypeName::Custom(name) if enum_names.contains(name) => enum_ir_type(name),
+            TypeName::Custom(name) => IrType::Named(name.clone()),
+        }
+    }
+    ty.as_ref()
+        .map(|ty| lower(ty, enum_names))
+        .unwrap_or(IrType::Unknown)
+}
+
+fn bool_literal(value: bool) -> IrExpr {
+    IrExpr {
+        kind: IrExprKind::Literal(value.to_string()),
+        ty: IrType::Bool,
+    }
+}
+
+fn and_expr(left: IrExpr, right: IrExpr) -> IrExpr {
+    if left == bool_literal(true) {
+        return right;
+    }
+    if right == bool_literal(true) {
+        return left;
+    }
+    IrExpr {
+        kind: IrExprKind::Binary {
+            left: Box::new(left),
+            op: BinaryOp::And,
+            right: Box::new(right),
+        },
+        ty: IrType::Bool,
+    }
+}
+
+const ENUM_TYPE_PREFIX: &str = "__ku_enum_type:";
+
+fn enum_ir_type(name: &str) -> IrType {
+    IrType::Named(format!("{ENUM_TYPE_PREFIX}{name}"))
+}
+
+fn enum_type_name(name: &str) -> Option<&str> {
+    name.strip_prefix(ENUM_TYPE_PREFIX)
+}
+
+fn intrinsic_expr(name: impl Into<String>, args: Vec<IrExpr>, ty: IrType) -> IrExpr {
+    let name = name.into();
+    IrExpr {
+        kind: IrExprKind::Call {
+            callee: Box::new(IrExpr {
+                kind: IrExprKind::Local(name.clone()),
+                ty: IrType::Function,
+            }),
+            args,
+            kind: IrCallKind::Intrinsic(name),
+        },
+        ty,
+    }
+}
+
+fn zero_expr(ty: IrType) -> IrExpr {
+    IrExpr {
+        kind: IrExprKind::Literal("<native-zero>".to_string()),
+        ty,
     }
 }
 

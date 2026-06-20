@@ -4,16 +4,20 @@ use crate::{
     ast::{BinaryOp, UnaryOp},
     error::{KuError, KuResult},
     ir::{
-        IrBlock, IrCallKind, IrExpr, IrExprKind, IrFunction, IrInst, IrLValue, IrProgram,
-        IrStructLayout, IrTerminator, IrType,
+        IrBlock, IrCallKind, IrEnumLayout, IrExpr, IrExprKind, IrFunction, IrInst, IrLValue,
+        IrProgram, IrStructLayout, IrTerminator, IrType,
     },
     span::Span,
 };
 
 pub fn generate_c_source(program: &IrProgram) -> KuResult<String> {
     validate_layouts(program)?;
-    let mut out = String::from("#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n\n");
+    let mut out = String::from(
+        "#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n",
+    );
     emit_struct_layouts(&mut out, program)?;
+    emit_enum_layouts(&mut out, program)?;
+    emit_array_abi(&mut out, program)?;
     emit_result_abi(&mut out, program)?;
     for function in &program.functions {
         emit_function(&mut out, function)?;
@@ -24,12 +28,6 @@ pub fn generate_c_source(program: &IrProgram) -> KuResult<String> {
 }
 
 fn validate_layouts(program: &IrProgram) -> KuResult<()> {
-    if !program.layouts.enums.is_empty() {
-        return Err(unsupported(
-            "native C prototype does not support enum layouts yet",
-        ));
-    }
-
     let indexes = program
         .layouts
         .structs
@@ -44,7 +42,7 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
         for field in &layout.fields {
             match &field.ty {
                 IrType::Int | IrType::Bool | IrType::Str => {}
-                IrType::Named(name) => {
+                IrType::Named(name) if enum_type_name(name).is_none() => {
                     let Some(&dependency) = indexes.get(name.as_str()) else {
                         return Err(unsupported(format!(
                             "native C struct '{}.{}' references unknown struct '{name}'",
@@ -53,6 +51,12 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
                     };
                     dependency_count[index] += 1;
                     dependents[dependency].push(index);
+                }
+                IrType::Named(_) => {
+                    return Err(unsupported(format!(
+                        "native C struct '{}.{}' cannot contain an enum value before enum layouts are emitted",
+                        layout.name, field.name
+                    )));
                 }
                 other => {
                     return Err(unsupported(format!(
@@ -98,6 +102,52 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
             }
         }
     }
+
+    let enum_indexes = program
+        .layouts
+        .enums
+        .iter()
+        .enumerate()
+        .map(|(index, layout)| (layout.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    for (index, layout) in program.layouts.enums.iter().enumerate() {
+        for variant in &layout.variants {
+            for field in &variant.fields {
+                match &field.ty {
+                    IrType::Int | IrType::Bool | IrType::Str => {}
+                    IrType::Named(name) if enum_type_name(name).is_none() => {
+                        if !indexes.contains_key(name.as_str()) {
+                            return Err(unsupported(format!(
+                                "native C enum '{}.{}.{}' references unknown struct '{name}'",
+                                layout.name, variant.name, field.name
+                            )));
+                        }
+                    }
+                    IrType::Named(name) => {
+                        let enum_name = enum_type_name(name).expect("checked enum marker");
+                        let Some(&dependency) = enum_indexes.get(enum_name) else {
+                            return Err(unsupported(format!(
+                                "native C enum '{}.{}.{}' references unknown enum '{enum_name}'",
+                                layout.name, variant.name, field.name
+                            )));
+                        };
+                        if dependency >= index {
+                            return Err(unsupported(format!(
+                                "native C enum '{}.{}.{}' must reference an enum declared earlier; recursive enum value layouts are not supported",
+                                layout.name, variant.name, field.name
+                            )));
+                        }
+                    }
+                    other => {
+                        return Err(unsupported(format!(
+                            "native C enum '{}.{}.{}' does not support payload type {other}; supported payloads are int, bool, str, structs, and earlier enums",
+                            layout.name, variant.name, field.name
+                        )));
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -123,6 +173,178 @@ fn emit_struct_layout(out: &mut String, layout: &IrStructLayout) -> KuResult<()>
     }
     out.push_str(&format!("}} {name};\n"));
     Ok(())
+}
+
+fn emit_enum_layouts(out: &mut String, program: &IrProgram) -> KuResult<()> {
+    for layout in &program.layouts.enums {
+        emit_enum_layout(out, layout)?;
+    }
+    if !program.layouts.enums.is_empty() {
+        out.push('\n');
+    }
+    Ok(())
+}
+
+fn emit_enum_layout(out: &mut String, layout: &IrEnumLayout) -> KuResult<()> {
+    let name = c_enum_type(&layout.name);
+    out.push_str(&format!(
+        "typedef struct {name} {{\n  int32_t tag;\n  union {{\n"
+    ));
+    let mut emitted_payload = false;
+    for variant in &layout.variants {
+        if variant.fields.is_empty() {
+            continue;
+        }
+        emitted_payload = true;
+        out.push_str("    struct {\n");
+        for field in &variant.fields {
+            out.push_str(&format!(
+                "      {} {};\n",
+                c_type(&field.ty)?,
+                c_ident(&field.name)
+            ));
+        }
+        out.push_str(&format!("    }} {};\n", c_ident(&variant.name)));
+    }
+    if !emitted_payload {
+        out.push_str("    unsigned char empty;\n");
+    }
+    out.push_str(&format!("  }} payload;\n}} {name};\n"));
+    Ok(())
+}
+
+fn emit_array_abi(out: &mut String, program: &IrProgram) -> KuResult<()> {
+    let mut element_types = Vec::new();
+    for function in &program.functions {
+        collect_array_element_type(&function.return_type, &mut element_types);
+        for param in &function.params {
+            collect_array_element_type(&param.ty, &mut element_types);
+        }
+        for block in &function.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    IrInst::Temp { ty, value, .. } | IrInst::Let { ty, value, .. } => {
+                        collect_array_element_type(ty, &mut element_types);
+                        collect_array_expr_types(value, &mut element_types);
+                    }
+                    IrInst::BindOk { ty, result, .. } => {
+                        collect_array_element_type(ty, &mut element_types);
+                        collect_array_expr_types(result, &mut element_types);
+                    }
+                    IrInst::Store { target, value } => {
+                        collect_array_lvalue_types(target, &mut element_types);
+                        collect_array_expr_types(value, &mut element_types);
+                    }
+                    IrInst::Print(value)
+                    | IrInst::Expr(value)
+                    | IrInst::Fail(value)
+                    | IrInst::Panic(value) => {
+                        collect_array_expr_types(value, &mut element_types);
+                    }
+                    IrInst::BeginTry { .. }
+                    | IrInst::EndTry
+                    | IrInst::BindError { .. }
+                    | IrInst::DefineClosure { .. }
+                    | IrInst::Unsupported { .. } => {}
+                }
+            }
+        }
+    }
+    if element_types.is_empty() {
+        return Ok(());
+    }
+
+    out.push_str(
+        "static void ku_array_bounds_fail(int64_t index, size_t len) {\n  fprintf(stderr, \"array index %lld out of bounds for length %zu\\n\", (long long)index, len);\n  exit(1);\n}\n\n",
+    );
+    for element in &element_types {
+        let array_type = c_array_type(element)?;
+        let suffix = c_type_suffix(element)?;
+        let element_type = c_type(element)?;
+        out.push_str(&format!(
+            "typedef struct {{ size_t len; {element_type}* data; }} {array_type};\n\
+             static {array_type} ku_array_make_{suffix}(size_t len, const {element_type}* values) {{\n\
+             \x20 {array_type} result = {{ len, NULL }};\n\
+             \x20 if (len == 0) return result;\n\
+             \x20 if (len > SIZE_MAX / sizeof({element_type})) {{ fprintf(stderr, \"array allocation is too large\\n\"); exit(1); }}\n\
+             \x20 result.data = ({element_type}*)malloc(len * sizeof({element_type}));\n\
+             \x20 if (!result.data) {{ fprintf(stderr, \"array allocation failed\\n\"); exit(1); }}\n\
+             \x20 memcpy(result.data, values, len * sizeof({element_type}));\n\
+             \x20 return result;\n\
+             }}\n\
+             static {array_type} ku_array_clone_{suffix}({array_type} array) {{\n\
+             \x20 return ku_array_make_{suffix}(array.len, array.data);\n\
+             }}\n\
+             static {element_type} ku_array_get_{suffix}({array_type} array, int64_t index) {{\n\
+             \x20 if (index < 0 || (uint64_t)index >= array.len) ku_array_bounds_fail(index, array.len);\n\
+             \x20 return array.data[index];\n\
+             }}\n\
+             static {element_type}* ku_array_at_{suffix}({array_type}* array, int64_t index) {{\n\
+             \x20 if (index < 0 || (uint64_t)index >= array->len) ku_array_bounds_fail(index, array->len);\n\
+             \x20 return &array->data[index];\n\
+             }}\n\n"
+        ));
+    }
+    Ok(())
+}
+
+fn collect_array_element_type(ty: &IrType, output: &mut Vec<IrType>) {
+    match ty {
+        IrType::Array(inner) => {
+            collect_array_element_type(inner, output);
+            if !output.contains(inner.as_ref()) {
+                output.push(*inner.clone());
+            }
+        }
+        IrType::Result(inner) => collect_array_element_type(inner, output),
+        _ => {}
+    }
+}
+
+fn collect_array_expr_types(expr: &IrExpr, output: &mut Vec<IrType>) {
+    collect_array_element_type(&expr.ty, output);
+    match &expr.kind {
+        IrExprKind::Unary { expr, .. } | IrExprKind::TryUnwrap(expr) => {
+            collect_array_expr_types(expr, output)
+        }
+        IrExprKind::Binary { left, right, .. } => {
+            collect_array_expr_types(left, output);
+            collect_array_expr_types(right, output);
+        }
+        IrExprKind::Call { callee, args, .. } => {
+            collect_array_expr_types(callee, output);
+            for arg in args {
+                collect_array_expr_types(arg, output);
+            }
+        }
+        IrExprKind::Array(values) => {
+            for value in values {
+                collect_array_expr_types(value, output);
+            }
+        }
+        IrExprKind::Index { target, index } => {
+            collect_array_expr_types(target, output);
+            collect_array_expr_types(index, output);
+        }
+        IrExprKind::Field { target, .. } => collect_array_expr_types(target, output),
+        IrExprKind::StructLiteral { fields, .. } => {
+            for (_, value) in fields {
+                collect_array_expr_types(value, output);
+            }
+        }
+        IrExprKind::Literal(_) | IrExprKind::Local(_) | IrExprKind::Temp(_) => {}
+    }
+}
+
+fn collect_array_lvalue_types(target: &IrLValue, output: &mut Vec<IrType>) {
+    match target {
+        IrLValue::Local(_) => {}
+        IrLValue::Index { target, index } => {
+            collect_array_expr_types(target, output);
+            collect_array_expr_types(index, output);
+        }
+        IrLValue::Field { target, .. } => collect_array_expr_types(target, output),
+    }
 }
 
 fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
@@ -155,6 +377,14 @@ fn emit_block(out: &mut String, block: &IrBlock, return_type: &IrType) -> KuResu
     for inst in &block.instructions {
         emit_inst(out, inst, return_type)?;
     }
+    if block.terminator == IrTerminator::Unreachable
+        && matches!(
+            block.instructions.last(),
+            Some(IrInst::Fail(_) | IrInst::Panic(_))
+        )
+    {
+        return Ok(());
+    }
     emit_terminator(out, &block.terminator, return_type)
 }
 
@@ -181,11 +411,19 @@ fn emit_inst(out: &mut String, inst: &IrInst, return_type: &IrType) -> KuResult<
                 "  {} {} = {};\n",
                 c_type(ty)?,
                 c_ident(name),
-                c_expr(value)?
+                if is_native_zero(value) {
+                    c_zero_initializer(ty)?
+                } else {
+                    c_value_expr(value)?
+                }
             ));
         }
         IrInst::Store { target, value } => {
-            out.push_str(&format!("  {} = {};\n", c_lvalue(target)?, c_expr(value)?));
+            out.push_str(&format!(
+                "  {} = {};\n",
+                c_lvalue(target)?,
+                c_value_expr(value)?
+            ));
         }
         IrInst::Print(value) => emit_print(out, value)?,
         IrInst::Expr(value) => emit_expr_statement(out, value)?,
@@ -200,8 +438,17 @@ fn emit_inst(out: &mut String, inst: &IrInst, return_type: &IrType) -> KuResult<
                 c_expr(value)?
             ));
         }
-        IrInst::Panic(_)
-        | IrInst::BeginTry { .. }
+        IrInst::Panic(value) => {
+            if value.ty == IrType::Str {
+                out.push_str(&format!(
+                    "  fprintf(stderr, \"%s\\n\", {}); exit(1);\n",
+                    c_expr(value)?
+                ));
+            } else {
+                out.push_str("  fprintf(stderr, \"panic\\n\"); exit(1);\n");
+            }
+        }
+        IrInst::BeginTry { .. }
         | IrInst::EndTry
         | IrInst::BindError { .. }
         | IrInst::DefineClosure { .. }
@@ -297,7 +544,7 @@ fn emit_terminator(
             Ok(())
         }
         IrTerminator::Return(Some(value)) => {
-            out.push_str(&format!("  return {};\n", c_expr(value)?));
+            out.push_str(&format!("  return {};\n", c_value_expr(value)?));
             Ok(())
         }
         IrTerminator::Return(None) => {
@@ -305,7 +552,7 @@ fn emit_terminator(
             Ok(())
         }
         IrTerminator::Unreachable => {
-            out.push_str("  __builtin_unreachable();\n");
+            out.push_str("  abort();\n");
             Ok(())
         }
     }
@@ -313,7 +560,13 @@ fn emit_terminator(
 
 fn c_expr(expr: &IrExpr) -> KuResult<String> {
     match &expr.kind {
-        IrExprKind::Literal(value) => Ok(value.clone()),
+        IrExprKind::Literal(value) => {
+            if value == "<native-zero>" {
+                c_zero_initializer(&expr.ty)
+            } else {
+                Ok(value.clone())
+            }
+        }
         IrExprKind::Local(name) => Ok(c_symbol(name)),
         IrExprKind::Temp(id) => Ok(format!("t{}", id.0)),
         IrExprKind::StructLiteral { name, fields } => {
@@ -325,6 +578,36 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
             Ok(format!("({}){{ {fields} }}", c_struct_type(name)))
         }
         IrExprKind::Unary { op, expr } => Ok(format!("({}{})", c_unary(*op), c_expr(expr)?)),
+        IrExprKind::Binary { left, op, right }
+            if left.ty == IrType::Str
+                && right.ty == IrType::Str
+                && matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) =>
+        {
+            Ok(format!(
+                "(strcmp({}, {}) {} 0)",
+                c_expr(left)?,
+                c_expr(right)?,
+                if *op == BinaryOp::Equal { "==" } else { "!=" }
+            ))
+        }
+        IrExprKind::Binary { left, op, .. }
+            if matches!(left.ty, IrType::Array(_))
+                && matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) =>
+        {
+            Err(unsupported(
+                "native C prototype does not support array equality yet",
+            ))
+        }
+        IrExprKind::Binary { left, op, .. }
+            if matches!(
+                &left.ty,
+                IrType::Named(name) if enum_type_name(name).is_some()
+            ) && matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) =>
+        {
+            Err(unsupported(
+                "native C prototype does not support enum equality yet",
+            ))
+        }
         IrExprKind::Binary { left, op, right } => Ok(format!(
             "({} {} {})",
             c_expr(left)?,
@@ -343,7 +626,7 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
             let callee = c_expr(callee)?;
             let args = args
                 .iter()
-                .map(c_expr)
+                .map(c_value_expr)
                 .collect::<KuResult<Vec<_>>>()?
                 .join(", ");
             Ok(format!("{callee}({args})"))
@@ -351,21 +634,79 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
         IrExprKind::Field { target, name } => {
             Ok(format!("({}).{}", c_expr(target)?, c_ident(name)))
         }
-        IrExprKind::Array(_) | IrExprKind::Index { .. } | IrExprKind::TryUnwrap(_) => {
-            Err(unsupported(format!(
-                "native C prototype cannot lower expression '{expr}'"
-            )))
+        IrExprKind::Array(values) => {
+            let IrType::Array(element) = &expr.ty else {
+                return Err(unsupported(
+                    "native C array literal is missing its element type",
+                ));
+            };
+            if values.is_empty() {
+                return Ok(format!(
+                    "ku_array_make_{}(0, NULL)",
+                    c_type_suffix(element)?
+                ));
+            }
+            let len = values.len();
+            let values = values
+                .iter()
+                .map(c_value_expr)
+                .collect::<KuResult<Vec<_>>>()?
+                .join(", ");
+            Ok(format!(
+                "ku_array_make_{}({}, ({}[]){{ {} }})",
+                c_type_suffix(element)?,
+                len,
+                c_type(element)?,
+                values
+            ))
         }
+        IrExprKind::Index { target, index } => {
+            let IrType::Array(element) = &target.ty else {
+                return Err(unsupported(
+                    "native C index expression requires an array target",
+                ));
+            };
+            Ok(format!(
+                "ku_array_get_{}({}, {})",
+                c_type_suffix(element)?,
+                c_expr(target)?,
+                c_expr(index)?
+            ))
+        }
+        IrExprKind::TryUnwrap(_) => Err(unsupported(format!(
+            "native C prototype cannot lower expression '{expr}'"
+        ))),
     }
+}
+
+fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
+    if let (IrType::Array(element), IrExprKind::Local(_)) = (&expr.ty, &expr.kind) {
+        return Ok(format!(
+            "ku_array_clone_{}({})",
+            c_type_suffix(element)?,
+            c_expr(expr)?
+        ));
+    }
+    c_expr(expr)
 }
 
 fn c_lvalue(target: &IrLValue) -> KuResult<String> {
     match target {
         IrLValue::Local(name) => Ok(c_ident(name)),
         IrLValue::Field { target, name } => Ok(format!("({}).{}", c_expr(target)?, c_ident(name))),
-        IrLValue::Index { .. } => Err(unsupported(
-            "native C prototype does not support array/index assignment yet",
-        )),
+        IrLValue::Index { target, index } => {
+            let IrType::Array(element) = &target.ty else {
+                return Err(unsupported(
+                    "native C index assignment requires an array target",
+                ));
+            };
+            Ok(format!(
+                "*ku_array_at_{}(&({}), {})",
+                c_type_suffix(element)?,
+                c_expr(target)?,
+                c_expr(index)?
+            ))
+        }
     }
 }
 
@@ -374,8 +715,12 @@ fn c_type(ty: &IrType) -> KuResult<String> {
         IrType::Int => Ok("int64_t".to_string()),
         IrType::Bool => Ok("bool".to_string()),
         IrType::Str => Ok("const char*".to_string()),
+        IrType::Array(inner) => c_array_type(inner),
         IrType::Result(inner) => c_result_type(inner),
-        IrType::Named(name) => Ok(c_struct_type(name)),
+        IrType::Named(name) => Ok(match enum_type_name(name) {
+            Some(name) => c_enum_type(name),
+            None => c_struct_type(name),
+        }),
         IrType::Void => Ok("void".to_string()),
         _ => Err(unsupported(format!(
             "native C prototype does not support type {ty}"
@@ -542,6 +887,61 @@ fn emit_main_wrapper(out: &mut String, program: &IrProgram) -> KuResult<()> {
 }
 
 fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String> {
+    if let Some(rest) = name.strip_prefix("__ku_enum:") {
+        let mut parts = rest.splitn(4, ':');
+        let enum_name = parts
+            .next()
+            .ok_or_else(|| unsupported("invalid native enum constructor"))?;
+        let variant = parts
+            .next()
+            .ok_or_else(|| unsupported("invalid native enum constructor"))?;
+        let tag = parts
+            .next()
+            .ok_or_else(|| unsupported("invalid native enum constructor"))?;
+        let fields = parts.next().unwrap_or_default();
+        let field_names = if fields.is_empty() {
+            Vec::new()
+        } else {
+            fields.split(',').collect::<Vec<_>>()
+        };
+        if field_names.len() != args.len() {
+            return Err(unsupported(format!(
+                "native enum constructor '{enum_name}.{variant}' payload metadata mismatch"
+            )));
+        }
+        let mut initializer = format!("({}){{ .tag = {tag}", c_type(ty)?);
+        if !args.is_empty() {
+            let fields = field_names
+                .iter()
+                .zip(args)
+                .map(|(field, value)| Ok(format!(".{} = {}", c_ident(field), c_expr(value)?)))
+                .collect::<KuResult<Vec<_>>>()?
+                .join(", ");
+            initializer.push_str(&format!(", .payload.{} = {{ {fields} }}", c_ident(variant)));
+        }
+        initializer.push_str(" }");
+        return Ok(initializer);
+    }
+    if name == "__ku_enum_tag" {
+        let value = args
+            .first()
+            .ok_or_else(|| unsupported("enum tag requires one argument"))?;
+        return Ok(format!("({}).tag", c_expr(value)?));
+    }
+    if let Some(rest) = name.strip_prefix("__ku_enum_payload:") {
+        let (variant, field) = rest
+            .split_once(':')
+            .ok_or_else(|| unsupported("invalid native enum payload access"))?;
+        let value = args
+            .first()
+            .ok_or_else(|| unsupported("enum payload access requires one argument"))?;
+        return Ok(format!(
+            "({}).payload.{}.{}",
+            c_expr(value)?,
+            c_ident(variant),
+            c_ident(field)
+        ));
+    }
     match (name, ty) {
         ("ok", IrType::Result(_)) => {
             let value = args
@@ -577,6 +977,22 @@ fn c_zero_value(ty: &IrType) -> KuResult<&'static str> {
         IrType::Str => Ok("(const char*)0"),
         _ => Err(unsupported(format!(
             "native C prototype does not support zero value for {ty}"
+        ))),
+    }
+}
+
+fn is_native_zero(expr: &IrExpr) -> bool {
+    matches!(&expr.kind, IrExprKind::Literal(value) if value == "<native-zero>")
+}
+
+fn c_zero_initializer(ty: &IrType) -> KuResult<String> {
+    match ty {
+        IrType::Int => Ok("0".to_string()),
+        IrType::Bool => Ok("false".to_string()),
+        IrType::Str => Ok("(const char*)0".to_string()),
+        IrType::Array(_) | IrType::Named(_) => Ok(format!("({}){{0}}", c_type(ty)?)),
+        _ => Err(unsupported(format!(
+            "native C prototype does not support zero initialization for {ty}"
         ))),
     }
 }
@@ -634,6 +1050,36 @@ fn c_symbol(name: &str) -> String {
 
 fn c_struct_type(name: &str) -> String {
     format!("KuStruct_{}", c_ident(name))
+}
+
+fn c_enum_type(name: &str) -> String {
+    format!("KuEnum_{}", c_ident(name))
+}
+
+fn c_array_type(element: &IrType) -> KuResult<String> {
+    Ok(format!("KuArray_{}", c_type_suffix(element)?))
+}
+
+fn c_type_suffix(ty: &IrType) -> KuResult<String> {
+    match ty {
+        IrType::Int => Ok("int".to_string()),
+        IrType::Bool => Ok("bool".to_string()),
+        IrType::Str => Ok("str".to_string()),
+        IrType::Named(name) => Ok(match enum_type_name(name) {
+            Some(name) => format!("enum_{}", c_ident(name)),
+            None => format!("struct_{}", c_ident(name)),
+        }),
+        IrType::Array(_) => Err(unsupported(
+            "native C prototype does not support nested arrays yet",
+        )),
+        _ => Err(unsupported(format!(
+            "native C prototype does not support arrays of {ty}"
+        ))),
+    }
+}
+
+fn enum_type_name(name: &str) -> Option<&str> {
+    name.strip_prefix("__ku_enum_type:")
 }
 
 fn unsupported(message: impl Into<String>) -> KuError {

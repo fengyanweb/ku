@@ -7,6 +7,8 @@ assert.deepStrictEqual(model.memberCompletionLabels("http", "ser"), ["service", 
 assert.deepStrictEqual(model.memberCompletionLabels("http", "serve"), ["server"]);
 assert(!model.memberCompletionLabels("http", "s").some((label) => label.startsWith("std.")));
 assert(!model.memberCompletionLabels("http", "s").some((label) => label.startsWith("http.")));
+assert.deepStrictEqual(model.memberCompletionLabels("task", ""), ["status", "cancel", "await_timeout"]);
+assert.deepStrictEqual(model.memberCompletionLabels("task", "a"), ["await_timeout"]);
 
 assert.deepStrictEqual(model.stdImportPathLabels("std.h"), ["std.http"]);
 assert.deepStrictEqual(model.stdImportPathLabels("std."), [

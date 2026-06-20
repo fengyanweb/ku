@@ -73,6 +73,7 @@ export const namespaceMembers: Record<string, string[]> = {
   json: ["parse", "try_parse", "stringify"],
   config: ["env", "env_file", "yaml"],
   time: ["now", "unix", "millis"],
+  task: ["status", "cancel", "await_timeout"],
 };
 
 export function stdImportPathLabels(current: string): string[] {

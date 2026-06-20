@@ -1,14 +1,14 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
         Arc, Condvar, Mutex, Weak,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -23,8 +23,18 @@ pub const MAX_TASK_QUEUE: usize = 1024;
 pub const MAX_BLOCKING_QUEUE: usize = 1024;
 pub const MAX_AWAIT_DEPTH: usize = 64;
 
+const TASK_PENDING: u8 = 0;
+const TASK_RUNNING: u8 = 1;
+const TASK_WAITING: u8 = 2;
+const TASK_COMPLETED: u8 = 3;
+const TASK_FAILED: u8 = 4;
+const TASK_CANCELLED: u8 = 5;
+const TASK_CANCELLING: u8 = 6;
+const TASK_PANICKED: u8 = 7;
+
 thread_local! {
     static CURRENT_TASK_ID: Cell<i64> = const { Cell::new(0) };
+    static CURRENT_TASK_STATE: RefCell<Option<Weak<TaskState>>> = const { RefCell::new(None) };
     static AWAIT_HELP_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -52,12 +62,15 @@ struct TaskRuntimeInner {
     task_rx: Arc<Mutex<Receiver<TaskJob>>>,
     blocking_tx: SyncSender<BlockingJob>,
     states: Mutex<HashMap<i64, Weak<TaskState>>>,
+    wait_edges: Mutex<HashMap<i64, i64>>,
     active_tasks: AtomicUsize,
     next_task_id: AtomicI64,
     shutdown: AtomicBool,
     max_tasks: usize,
     task_queue_limit: usize,
     blocking_queue_limit: usize,
+    task_workers: AtomicUsize,
+    blocking_workers: AtomicUsize,
 }
 
 pub struct TaskHandle {
@@ -69,7 +82,8 @@ pub struct TaskHandle {
 struct TaskState {
     result: Mutex<Option<KuResult<Value>>>,
     ready: Condvar,
-    waiting_on: AtomicI64,
+    cancelled: AtomicBool,
+    status: AtomicU8,
 }
 
 impl TaskRuntime {
@@ -97,12 +111,15 @@ impl TaskRuntime {
             task_rx: Arc::new(Mutex::new(task_rx)),
             blocking_tx,
             states: Mutex::new(HashMap::new()),
+            wait_edges: Mutex::new(HashMap::new()),
             active_tasks: AtomicUsize::new(0),
             next_task_id: AtomicI64::new(1),
             shutdown: AtomicBool::new(false),
             max_tasks,
             task_queue_limit,
             blocking_queue_limit,
+            task_workers: AtomicUsize::new(0),
+            blocking_workers: AtomicUsize::new(0),
         });
         spawn_task_workers(&inner, task_workers);
         spawn_blocking_workers(&inner, blocking_workers, blocking_rx);
@@ -117,13 +134,21 @@ impl TaskRuntime {
         let state = Arc::new(TaskState {
             result: Mutex::new(None),
             ready: Condvar::new(),
-            waiting_on: AtomicI64::new(0),
+            cancelled: AtomicBool::new(false),
+            status: AtomicU8::new(TASK_PENDING),
         });
         let handle = TaskHandle {
             id,
             state: Arc::clone(&state),
             runtime: self.clone(),
         };
+        if self.inner.task_workers.load(Ordering::Acquire) == 0 {
+            state.complete(Ok(task_error(
+                "runtime_stopped",
+                "async task runtime has no available workers",
+            )));
+            return handle;
+        }
         if self
             .inner
             .active_tasks
@@ -178,6 +203,20 @@ impl TaskRuntime {
     }
 
     pub fn await_task(&self, handle: &TaskHandle) -> KuResult<Value> {
+        self.await_task_until(handle, None)
+    }
+
+    pub fn await_task_timeout(&self, handle: &TaskHandle, timeout: Duration) -> KuResult<Value> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            KuError::runtime(
+                "task timeout is too large for this platform",
+                Span::default(),
+            )
+        })?;
+        self.await_task_until(handle, Some(deadline))
+    }
+
+    fn await_task_until(&self, handle: &TaskHandle, deadline: Option<Instant>) -> KuResult<Value> {
         let current = current_task_id();
         if current == handle.id {
             return Ok(task_error(
@@ -190,42 +229,130 @@ impl TaskRuntime {
         } else {
             self.state(current)?
         };
+        if current != 0 {
+            if let Some(code) = self.register_wait(current, handle.id)? {
+                return Ok(task_error(
+                    code,
+                    format!("task {current} cannot await task {}", handle.id),
+                ));
+            }
+        }
         if let Some(state) = &current_state {
-            state.waiting_on.store(handle.id, Ordering::Release);
+            state.set_status(TASK_WAITING);
         }
         let result = (|| loop {
+            if current_task_cancelled() {
+                return Ok(task_error(
+                    "cancelled",
+                    format!("task {current} was cancelled"),
+                ));
+            }
             if let Some(result) = handle.state.result()? {
                 return result;
             }
-            if current != 0 {
-                if let Some(code) = self.wait_cycle_error(current, handle.id)? {
-                    return Ok(task_error(
-                        code,
-                        format!("task {current} cannot await task {}", handle.id),
-                    ));
-                }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(task_error(
+                    "timeout",
+                    format!("timed out waiting for task {}", handle.id),
+                ));
+            }
+            if await_help_depth() >= MAX_AWAIT_DEPTH {
+                return Ok(task_error(
+                    "await_depth",
+                    format!("task {current} exceeded await depth {MAX_AWAIT_DEPTH}"),
+                ));
             }
             if self.help_one_bounded()? {
                 continue;
             }
-            handle.state.wait(Duration::from_millis(2))?;
+            let wait = deadline
+                .map(|deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(2))
+                })
+                .unwrap_or(Duration::from_millis(2));
+            if wait.is_zero() {
+                continue;
+            }
+            handle.state.wait(wait)?;
         })();
+        if current != 0 {
+            self.clear_wait(current);
+        }
         if let Some(state) = current_state {
-            state.waiting_on.store(0, Ordering::Release);
+            if !state.is_cancelled() {
+                state.set_status(TASK_RUNNING);
+            }
         }
         result
+    }
+
+    pub fn cancel_all(&self) -> usize {
+        let states = self
+            .inner
+            .states
+            .lock()
+            .map(|states| {
+                states
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        states
+            .into_iter()
+            .filter(|state| state.request_cancel())
+            .count()
+    }
+
+    pub fn cancel_all_and_wait(&self, timeout: Duration) -> KuResult<usize> {
+        let cancelled = self.cancel_all();
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            KuError::runtime(
+                "task shutdown timeout is too large for this platform",
+                Span::default(),
+            )
+        })?;
+        while self.inner.active_tasks.load(Ordering::Acquire) != 0 {
+            if Instant::now() >= deadline {
+                return Err(KuError::structured(
+                    crate::error::KuErrorKind::Runtime,
+                    "task",
+                    "shutdown_timeout",
+                    "async tasks did not stop before the bounded shutdown timeout",
+                    Span::default(),
+                ));
+            }
+            if !self.help_one_bounded()? {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        Ok(cancelled)
     }
 
     pub fn run_blocking<F>(&self, run: F, _span: Span) -> KuResult<Value>
     where
         F: FnOnce() -> KuResult<Value> + Send + 'static,
     {
+        if self.inner.blocking_workers.load(Ordering::Acquire) == 0 {
+            return Ok(task_error(
+                "blocking_pool_stopped",
+                "blocking pool has no available workers",
+            ));
+        }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         match self.inner.blocking_tx.try_send(BlockingJob {
             run: Box::new(run),
             response: response_tx,
         }) {
             Ok(()) => loop {
+                if current_task_cancelled() {
+                    break Ok(task_error(
+                        "cancelled",
+                        format!("task {} was cancelled", current_task_id()),
+                    ));
+                }
                 match response_rx.try_recv() {
                     Ok(result) => break result,
                     Err(TryRecvError::Disconnected) => {
@@ -321,22 +448,32 @@ impl TaskRuntime {
         }
     }
 
-    fn wait_cycle_error(&self, current: i64, target: i64) -> KuResult<Option<&'static str>> {
+    fn register_wait(&self, current: i64, target: i64) -> KuResult<Option<&'static str>> {
+        let mut edges = self
+            .inner
+            .wait_edges
+            .lock()
+            .map_err(|_| KuError::runtime("async wait graph is poisoned", Span::default()))?;
+        edges.insert(current, target);
         let mut cursor = target;
         for _ in 0..MAX_AWAIT_DEPTH {
             if cursor == current {
+                edges.remove(&current);
                 return Ok(Some("await_cycle"));
             }
-            let Some(state) = self.state(cursor)? else {
+            let Some(next) = edges.get(&cursor).copied() else {
                 return Ok(None);
             };
-            let next = state.waiting_on.load(Ordering::Acquire);
-            if next == 0 {
-                return Ok(None);
-            }
             cursor = next;
         }
+        edges.remove(&current);
         Ok(Some("await_depth"))
+    }
+
+    fn clear_wait(&self, current: i64) {
+        if let Ok(mut edges) = self.inner.wait_edges.lock() {
+            edges.remove(&current);
+        }
     }
 }
 
@@ -359,6 +496,18 @@ impl TaskHandle {
 
     pub fn await_result(&self) -> KuResult<Value> {
         self.runtime.await_task(self)
+    }
+
+    pub fn await_timeout(&self, timeout: Duration) -> KuResult<Value> {
+        self.runtime.await_task_timeout(self, timeout)
+    }
+
+    pub fn cancel(&self) -> bool {
+        self.state.request_cancel()
+    }
+
+    pub fn status(&self) -> &'static str {
+        self.state.status_name()
     }
 }
 
@@ -386,9 +535,63 @@ impl PartialEq for TaskHandle {
 
 impl TaskState {
     fn complete(&self, result: KuResult<Value>) {
+        self.complete_with_status(result, None);
+    }
+
+    fn complete_with_status(&self, result: KuResult<Value>, status: Option<u8>) {
         if let Ok(mut slot) = self.result.lock() {
-            *slot = Some(result);
-            self.ready.notify_all();
+            if slot.is_none() {
+                let status = status.unwrap_or_else(|| {
+                    if self.cancelled.load(Ordering::Acquire) {
+                        TASK_CANCELLED
+                    } else if result.is_err() {
+                        TASK_FAILED
+                    } else {
+                        TASK_COMPLETED
+                    }
+                });
+                *slot = Some(result);
+                self.status.store(status, Ordering::Release);
+                self.ready.notify_all();
+            }
+        }
+    }
+
+    fn request_cancel(&self) -> bool {
+        let Ok(slot) = self.result.lock() else {
+            return false;
+        };
+        if slot.is_some() || self.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        self.cancelled.store(true, Ordering::Release);
+        self.status.store(TASK_CANCELLING, Ordering::Release);
+        drop(slot);
+        self.ready.notify_all();
+        true
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn set_status(&self, status: u8) {
+        if !self.is_cancelled() {
+            self.status.store(status, Ordering::Release);
+        }
+    }
+
+    fn status_name(&self) -> &'static str {
+        match self.status.load(Ordering::Acquire) {
+            TASK_PENDING => "pending",
+            TASK_RUNNING => "running",
+            TASK_WAITING => "waiting",
+            TASK_COMPLETED => "completed",
+            TASK_FAILED => "failed",
+            TASK_CANCELLED => "cancelled",
+            TASK_CANCELLING => "cancelling",
+            TASK_PANICKED => "panicked",
+            _ => "unknown",
         }
     }
 
@@ -415,50 +618,96 @@ impl TaskState {
 fn spawn_task_workers(inner: &Arc<TaskRuntimeInner>, count: usize) {
     for index in 0..count {
         let weak = Arc::downgrade(inner);
-        let _ = thread::Builder::new()
+        let receiver = Arc::clone(&inner.task_rx);
+        if thread::Builder::new()
             .name(format!("ku-task-{index}"))
-            .spawn(move || task_worker_loop(weak));
+            .spawn(move || task_worker_loop(weak, receiver))
+            .is_ok()
+        {
+            inner.task_workers.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
-fn task_worker_loop(weak: Weak<TaskRuntimeInner>) {
+fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<TaskJob>>>) {
     loop {
-        let Some(inner) = weak.upgrade() else {
+        let Some(shutdown) = weak
+            .upgrade()
+            .map(|inner| inner.shutdown.load(Ordering::Acquire))
+        else {
             return;
         };
-        if inner.shutdown.load(Ordering::Acquire) {
+        if shutdown {
             return;
         }
         let job = {
-            let Ok(receiver) = inner.task_rx.lock() else {
+            let Ok(receiver) = receiver.lock() else {
                 return;
             };
-            receiver.recv_timeout(Duration::from_millis(50))
+            receiver.try_recv()
         };
         match job {
-            Ok(job) => execute_task_job(&inner, job),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Ok(job) => {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                execute_task_job(&inner, job)
+            }
+            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(2)),
+            Err(TryRecvError::Disconnected) => return,
         }
     }
 }
 
 fn execute_task_job(inner: &TaskRuntimeInner, job: TaskJob) {
+    if job.state.is_cancelled() {
+        job.state.complete_with_status(
+            Ok(task_error(
+                "cancelled",
+                format!("task {} was cancelled", job.id),
+            )),
+            Some(TASK_CANCELLED),
+        );
+        finish_task_job(inner, job.id);
+        return;
+    }
+    job.state.set_status(TASK_RUNNING);
     let previous = CURRENT_TASK_ID.with(|current| {
         let previous = current.get();
         current.set(job.id);
         previous
     });
+    let previous_state =
+        CURRENT_TASK_STATE.with(|current| current.replace(Some(Arc::downgrade(&job.state))));
     let result = catch_unwind(AssertUnwindSafe(job.run))
         .map_err(|_| task_error("panic", "async task panicked"));
+    let panicked = result.is_err();
     let result = match result {
         Ok(result) => result,
         Err(error) => Ok(error),
     };
+    CURRENT_TASK_STATE.with(|current| {
+        current.replace(previous_state);
+    });
     CURRENT_TASK_ID.with(|current| current.set(previous));
-    job.state.complete(result);
+    if job.state.is_cancelled() {
+        job.state.complete_with_status(
+            Ok(task_error(
+                "cancelled",
+                format!("task {} was cancelled", job.id),
+            )),
+            Some(TASK_CANCELLED),
+        );
+    } else {
+        job.state
+            .complete_with_status(result, panicked.then_some(TASK_PANICKED));
+    }
+    finish_task_job(inner, job.id);
+}
+
+fn finish_task_job(inner: &TaskRuntimeInner, id: i64) {
     if let Ok(mut states) = inner.states.lock() {
-        states.remove(&job.id);
+        states.remove(&id);
     }
     inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
 }
@@ -472,28 +721,38 @@ fn spawn_blocking_workers(
     for index in 0..count {
         let weak = Arc::downgrade(inner);
         let receiver = Arc::clone(&receiver);
-        let _ = thread::Builder::new()
+        if thread::Builder::new()
             .name(format!("ku-blocking-{index}"))
-            .spawn(move || blocking_worker_loop(weak, receiver));
+            .spawn(move || blocking_worker_loop(weak, receiver))
+            .is_ok()
+        {
+            inner.blocking_workers.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
 fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<BlockingJob>>>) {
     loop {
-        let Some(inner) = weak.upgrade() else {
+        let Some(shutdown) = weak
+            .upgrade()
+            .map(|inner| inner.shutdown.load(Ordering::Acquire))
+        else {
             return;
         };
-        if inner.shutdown.load(Ordering::Acquire) {
+        if shutdown {
             return;
         }
         let job = {
             let Ok(receiver) = receiver.lock() else {
                 return;
             };
-            receiver.recv_timeout(Duration::from_millis(50))
+            receiver.try_recv()
         };
         match job {
             Ok(job) => {
+                if weak.upgrade().is_none() {
+                    return;
+                }
                 let result = catch_unwind(AssertUnwindSafe(job.run)).map_err(|_| {
                     KuError::structured(
                         crate::error::KuErrorKind::Runtime,
@@ -509,8 +768,8 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                 };
                 let _ = job.response.send(result);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(2)),
+            Err(TryRecvError::Disconnected) => return,
         }
     }
 }
@@ -533,6 +792,85 @@ pub fn current_task_id() -> i64 {
     CURRENT_TASK_ID.with(Cell::get)
 }
 
+pub fn current_task_cancelled() -> bool {
+    CURRENT_TASK_STATE.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|state| state.is_cancelled())
+    })
+}
+
+fn await_help_depth() -> usize {
+    AWAIT_HELP_DEPTH.with(Cell::get)
+}
+
 fn task_error(code: &str, message: impl Into<String>) -> Value {
     errors::err("task", code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_workers_do_not_keep_inner_alive() {
+        let runtime = TaskRuntime::with_limits(1, 1, 1, 1, 1);
+        let inner = Arc::downgrade(&runtime.inner);
+        drop(runtime);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while inner.upgrade().is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            inner.upgrade().is_none(),
+            "worker threads must not retain TaskRuntimeInner"
+        );
+    }
+
+    #[test]
+    fn timeout_does_not_cancel_target_task() {
+        let runtime = TaskRuntime::with_limits(1, 2, 1, 1, 2);
+        let task = runtime.spawn(|| {
+            thread::sleep(Duration::from_millis(20));
+            Ok(Value::Int(7))
+        });
+
+        let timed = task
+            .await_timeout(Duration::ZERO)
+            .expect("timeout should be a task Result value");
+        assert!(matches!(timed, Value::Result { ok: false, .. }));
+        assert_eq!(
+            task.await_result().expect("task should finish"),
+            Value::Int(7)
+        );
+        assert_eq!(task.status(), "completed");
+    }
+
+    #[test]
+    fn cancellation_is_idempotent_and_wakes_waiters() {
+        let runtime = TaskRuntime::with_limits(1, 2, 1, 1, 2);
+        let task = runtime.spawn(|| {
+            while !current_task_cancelled() {
+                thread::yield_now();
+            }
+            Ok(Value::Int(1))
+        });
+
+        assert!(task.cancel());
+        assert!(!task.cancel());
+        assert_eq!(
+            runtime
+                .cancel_all_and_wait(Duration::from_secs(1))
+                .expect("bounded shutdown should drain cancelled tasks"),
+            0
+        );
+        let value = task
+            .await_timeout(Duration::from_secs(1))
+            .expect("cancelled task should wake waiters");
+        assert!(matches!(value, Value::Result { ok: false, .. }));
+        assert_eq!(task.status(), "cancelled");
+    }
 }

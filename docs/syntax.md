@@ -550,6 +550,22 @@ async fn main(): null! {
 - async task 可以读取外层捕获，但不能修改外层捕获；checker 和 runtime 都会拒绝写入。
 - native C 明确拒绝 async。
 
+Task 生命周期 API：
+
+```ku
+task = load(1)
+state = task.status()
+result = task.await_timeout(1000)
+cancelled = task.cancel()
+```
+
+- `task.status(): str` 返回 `pending`、`running`、`waiting`、`cancelling`、`completed`、`failed`、`cancelled` 或 `panicked`。
+- `task.cancel(): bool` 发起协作式取消；返回 `true` 表示本次成功把未结束任务切换到取消流程，已经结束或已经请求取消时返回 `false`。
+- `task.await_timeout(ms:int): T` 最多等待指定毫秒。超时返回结构化 `Err({ domain: "task", code: "timeout", ... })`，只结束本次等待，不自动取消目标 task。
+- 取消会唤醒普通 `await` 和超时等待。排队中的任务不会再执行；运行中的 Ku 代码会在下一次解释器安全检查点结束。
+- 已经送入 blocking pool 的系统调用不能被强行终止。取消会停止 task 对该调用的等待，但已经开始的文件或网络操作可能自行完成，因此带外部副作用的操作仍应使用自身超时和幂等设计。
+- main 返回后，runtime 会取消仍未结束的子 task，并在 1 秒有界窗口内排空；未能停止会返回 `task/shutdown_timeout`，不会无限等待。native C / LLVM 仍明确拒绝 async lowering。
+
 运行时默认边界：
 
 - `max_tasks = 1024`。
@@ -1458,7 +1474,9 @@ source = "https://registry.example/ku/math/0.1.0.tar.gz"
 checksum = "sha256-<64 hex digits>"
 ```
 
-registry lock 使用一个或多个 `[[package]]`，要求 `name/version/source/url/checksum/cache_key` 齐全；`source` 必须是 `registry`，版本必须是 `major.minor.patch`，checksum 必须是 `sha256-` 加 64 位十六进制。真正版本求解和网络下载仍未完成。
+registry lock 使用一个或多个 `[[package]]`，要求 `name/version/source/url/checksum/cache_key` 齐全；`source` 必须是 `registry`，版本必须是 `major.minor.patch`，checksum 必须是 `sha256-` 加 64 位十六进制。
+
+离线 resolver 已支持精确版本 `1.2.3` 和 caret 范围 `^1.2.3`。同名依赖的全部约束会合并，选择满足全部约束的最高可用版本；没有共同版本时返回 `package/dependency_conflict`，不做无限回溯或 SAT 搜索。网络层仍未接入，但下载计划已固定为有界策略：最多 8 次尝试、连接/读取超时均有上限、单包最多 100 MB、校验通过的 cache 直接复用，否则下载到进程和序号唯一的临时位置，并在 checksum 通过后原子替换。
 
 ## 16. CLI 相关语法
 
@@ -1509,7 +1527,7 @@ level code message file line column endLine endColumn notes helps
 
 VS Code 扩展优先读取 JSON diagnostics；面对旧版 Ku CLI 时只回退一次文本解析，不循环重试。
 
-`ku llvm file.ku` 在源文件旁输出 `.ll`，不要求本机安装 LLVM。当前文本后端支持 `int/bool/str`、普通函数、局部变量、直接调用、`return`、`if/while` 和 `print`；数组、struct、enum、闭包、Result、HTTP 和 async 会明确报不支持。golden test 不依赖外部工具；检测到 `llvm-as` 时会额外验证生成文本。
+`ku llvm file.ku` 在源文件旁输出 `.ll`，不要求本机安装 LLVM。当前文本后端支持 `int/bool/str`、普通函数、局部变量、直接调用、`return`、`if/while`、`print`、非递归 struct 值与字段读写，以及 `Result<int|bool|str|struct>` 的 `ok`、`fail`、`?` 和错误传播。数组、enum、闭包、HTTP 和 async 仍会明确报不支持。后端会拒绝递归值 struct、缺失/重复 CFG block 和无条件自跳，避免生成明显错误或永久循环的 `.ll`。golden test 不依赖外部工具；检测到 `llvm-as` 时会额外验证生成文本。
 
 `ku build` 当前生成解释器打包型可执行文件。
 
@@ -1526,10 +1544,13 @@ if / while
 基础 Result ABI
 ok / err / ?
 错误传播
+有界 array runtime / length / read-write bounds check
+enum tag + payload layout
+unit / payload / nested enum match lowering
 系统 int main(void) wrapper
 ```
 
-native C 当前仍是 prototype：struct 字段按声明顺序生成 C layout，字段类型第一阶段支持 `int/bool/str` 和已先声明的非递归结构体。错误槽还不是完整 Error 对象 ABI，并且明确不支持数组、enum、闭包、match、try/catch 和 async 等复杂 lowering。
+native C 当前仍是 prototype：array 使用 `{ len, data }` runtime-owned 结构，字面量会复制数据，所有读写索引都检查负数和 `index >= len`；越界打印清晰错误并终止进程。enum 使用 `tag + union payload`，支持 unit variant、payload variant、guard、绑定和嵌套 enum match。struct/enum 值布局仍拒绝递归；array 暂无释放/所有权 ABI，错误槽也还不是完整 Error 对象 ABI。闭包、try/catch/finally 和 async native lowering 仍明确不支持。
 
 ## 17. 资源保护
 
@@ -1556,11 +1577,12 @@ http 默认超时: 5 秒
 ## 18. 当前不支持 / 未完成
 
 ```txt
-LLVM 数组、struct、enum、Result、闭包、HTTP、async lowering
+LLVM 数组、enum、闭包、HTTP、async lowering
+LLVM 递归 struct 和更复杂 Result payload
 完整 native C 后端
 registry 网络下载
-真正语义版本求解
-网络下载和强校验
+registry 索引协议、签名信任和实际网络缓存更新
+native array/struct/enum 的释放、复制和移动所有权 ABI
 match guard 模式矩阵和跨 guard 的完整穷尽性检查
 顶层脚本语句
 方法 / trait / interface

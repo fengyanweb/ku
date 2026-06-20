@@ -94,6 +94,56 @@ fn write_temp_ku(name: &str, source: &str) -> PathBuf {
 }
 
 #[test]
+fn async_task_timeout_cancel_and_status_are_bounded() {
+    let path = write_temp_ku(
+        "async-task-lifecycle.ku",
+        r#"
+async fn spin(): int! {
+    while (true) {
+    }
+    return ok(1)
+}
+
+async fn main(): null! {
+    task = spin()
+    timed = task.await_timeout(0)
+    print(timed)
+    task.cancel()
+    print(task.status())
+    print(await task)
+    return ok(null)
+}
+"#,
+    );
+    let path_text = path_arg(&path);
+    let result = run_with_timeout(&ku_binary(), &["run", &path_text], Duration::from_secs(3));
+    fs::remove_file(&path).ok();
+
+    assert!(
+        !result.timed_out,
+        "async lifecycle test must not deadlock\nstdout:\n{}\nstderr:\n{}",
+        result.stdout, result.stderr
+    );
+    assert_eq!(
+        result.code,
+        Some(0),
+        "async lifecycle run failed\nstdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        result.stdout.contains("timeout"),
+        "timeout should be a structured task error: {}",
+        result.stdout
+    );
+    assert!(
+        result.stdout.contains("cancelled"),
+        "cancelled task should wake waiters and expose its state: {}",
+        result.stdout
+    );
+}
+
+#[test]
 fn version_flags_print_v002() {
     for flag in ["-v", "--version", "version"] {
         let result = run_ku(&[flag]);

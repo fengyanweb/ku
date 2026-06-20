@@ -470,7 +470,6 @@ class KuCompletionProvider {
             if (labels.length > 0) {
                 return labels.map((label) => memberCompletionItem(label, member.receiver, member.range));
             }
-            return [];
         }
         if (/@dep\/?$/.test(linePrefix)) {
             return dependencyCompletions(document);
@@ -486,6 +485,9 @@ class KuCompletionProvider {
         }
         if (/\b(values|items|nums)\.$/.test(linePrefix)) {
             return methodCompletions(["len", "is_empty", "first", "last", "try_get", "push", "concat", "map"]);
+        }
+        if (/\b(task|future|job)\.$/.test(linePrefix)) {
+            return methodCompletions(["status", "cancel", "await_timeout"]);
         }
         for (const value of completionModel_1.keywords) {
             items.push(new vscode.CompletionItem(value, vscode.CompletionItemKind.Keyword));
@@ -622,6 +624,9 @@ class KuHoverProvider {
         const docs = {
             "async": "`async fn` 调用会立即启动 task，并且第一版必须显式返回 `T!`。",
             "await": "`await task?` 等价于 `(await task)?`，只能写在 `async fn` 内。",
+            "await_timeout": "`task.await_timeout(ms)` 只限制本次等待；超时返回 `task/timeout`，不会自动取消任务。",
+            "cancel": "`task.cancel()` 请求协作式取消，并返回是否成功发起取消。",
+            "status": "`task.status()` 返回 pending、running、waiting、cancelling、completed、failed、cancelled 或 panicked。",
             "catch": "`catch (err)` 中 `err` 是结构化 Error 对象：`err.domain`、`err.code`、`err.message`。",
             "err": "`err(message)` 返回 `Unknown!`，失败 payload 是 `{ domain, code, message }`。",
             "fail": "`fail` 主动返回可恢复错误；字符串会包装为 `{ domain: \"ku\", code: \"fail\", message }`。",

@@ -25,7 +25,7 @@ dep.util.checksum = "ku-fnv64-..."
 | `version` | 否 | 包版本，格式是 `major.minor.patch` 数字 |
 | `root` | 否 | import root，默认 `src` |
 | `cache` | 否 | 包本地缓存目录，默认 `.ku/cache` |
-| `dep.<name>` | 否 | 依赖版本，支持 `1.2.3`、`^1.2.3`、`~1.2.3` 的语法校验 |
+| `dep.<name>` | 否 | 依赖版本；resolver 支持精确 `1.2.3` 和 caret `^1.2.3`，`~` 暂不进入求解 |
 | `dep.<name>.source` | 否 | 当前只支持 `file://` 目录 source |
 | `dep.<name>.checksum` | 否 | 依赖目录稳定 hash，格式为 `ku-fnv64-` 加 16 位十六进制 |
 
@@ -111,10 +111,30 @@ package import 复用现有 `ModuleLoader`：
 - 私有/导出规则保持不变
 - 写入 `ku.lock` 的依赖列表和 cache key
 
+## Registry Resolver 与下载计划
+
+离线 registry schema 和 resolver 已实现：
+
+- 精确版本 `1.2.3`。
+- caret 范围 `^1.2.3`，按 semver 的首个非零位限制兼容上界。
+- 同名依赖合并约束并选择满足全部约束的最高版本。
+- 没有共同版本时返回 `package/dependency_conflict`，不做无限回溯。
+- lockfile 始终记录精确版本和 `sha256-*` checksum。
+
+实际网络请求尚未接入。已经固定的执行策略是：
+
+- 下载尝试次数必须在 1 到 8 之间。
+- 连接和读取超时必须显式有界，最大 300 秒。
+- 单个归档最大 100 MB。
+- 已存在且 checksum 匹配的 cache 直接复用。
+- 缓存缺失或校验失败时下载到带进程号和单调序号的唯一临时位置，避免并发下载互相覆盖；完成大小限制和 SHA-256 校验后再原子替换正式 cache。
+- 不对 checksum mismatch、manifest/schema 错误或 4xx 做无限重试；未来网络实现只允许对明确的瞬时错误执行有限退避。
+
 ## 暂不支持
 
 - HTTP/registry package 下载
-- 远程版本解析和依赖求解
-- 下载签名、强校验和缓存淘汰策略
+- registry 索引发现协议
+- 包发布者签名和信任根
+- 实际 SHA-256 下载校验执行
 - 包发布
 - 多 package workspace
