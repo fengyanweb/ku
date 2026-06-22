@@ -524,10 +524,12 @@ struct FunctionLowerer<'a> {
     pattern_bindings: HashMap<String, IrExpr>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct IrTryHandler {
     error_block: BlockId,
-    error_name: &'static str,
+    error_name: String,
+    return_block: Option<BlockId>,
+    return_name: Option<String>,
 }
 
 impl<'a> FunctionLowerer<'a> {
@@ -629,7 +631,10 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 let values = values
                     .iter()
-                    .map(|value| self.lower_expr(value))
+                    .map(|value| {
+                        let value = self.lower_expr(value)?;
+                        self.emit_temp(value)
+                    })
                     .collect::<KuResult<Vec<_>>>()?;
                 for (name, value) in names.iter().zip(values) {
                     let Some(name) = name else {
@@ -700,7 +705,7 @@ impl<'a> FunctionLowerer<'a> {
                 } else {
                     let result_ty = match &self.return_type {
                         IrType::Result(_) => self.return_type.clone(),
-                        _ => IrType::Result(Box::new(IrType::Unknown)),
+                        _ => IrType::Result(Box::new(IrType::Null)),
                     };
                     let result = IrExpr {
                         kind: IrExprKind::Call {
@@ -726,7 +731,7 @@ impl<'a> FunctionLowerer<'a> {
                     .as_ref()
                     .map(|value| self.lower_expr(value))
                     .transpose()?;
-                self.current.terminator = IrTerminator::Return(value);
+                self.current.terminator = self.return_terminator(value);
             }
             Stmt::Print { value, .. } => {
                 let value = self.lower_expr(value)?;
@@ -865,8 +870,21 @@ impl<'a> FunctionLowerer<'a> {
             (!catch_body.is_empty() || catch_name.is_some()).then(|| self.next_block("catch"));
         let finally_id = (!finally_body.is_empty()).then(|| self.next_block("finally"));
         let finally_err_id = (!finally_body.is_empty()).then(|| self.next_block("finally_err"));
+        let finally_return_id =
+            (!finally_body.is_empty()).then(|| self.next_block("finally_return"));
         let after_id = self.next_block("try_after");
         let error_block = catch_id.or(finally_err_id).unwrap_or(after_id);
+        let error_name = format!("__ku_error_{}", after_id.0);
+        let return_name =
+            (self.return_type != IrType::Void).then(|| format!("__ku_return_{}", after_id.0));
+        if let Some(name) = &return_name {
+            self.locals.insert(name.clone(), self.return_type.clone());
+            self.current.instructions.push(IrInst::Let {
+                name: name.clone(),
+                ty: self.return_type.clone(),
+                value: zero_expr(self.return_type.clone()),
+            });
+        }
         self.current.instructions.push(IrInst::BeginTry {
             catch_block: catch_id,
             finally_block: finally_id,
@@ -874,7 +892,9 @@ impl<'a> FunctionLowerer<'a> {
         });
         self.try_handlers.push(IrTryHandler {
             error_block,
-            error_name: "__ku_error",
+            error_name: error_name.clone(),
+            return_block: finally_return_id,
+            return_name: return_name.clone(),
         });
         for stmt in body {
             self.lower_stmt(stmt)?;
@@ -893,20 +913,26 @@ impl<'a> FunctionLowerer<'a> {
             self.start_block(catch_id, "catch");
             let previous = catch_name
                 .as_ref()
-                .map(|name| self.locals.insert(name.clone(), IrType::Str));
+                .map(|name| self.locals.insert(name.clone(), error_ir_type()));
             if let Some(name) = catch_name {
                 self.current.instructions.push(IrInst::BindError {
                     name: name.clone(),
                     result: IrExpr {
-                        kind: IrExprKind::Local("__ku_error".to_string()),
-                        ty: IrType::Result(Box::new(IrType::Unknown)),
+                        kind: IrExprKind::Local(error_name.clone()),
+                        ty: self
+                            .locals
+                            .get(&error_name)
+                            .cloned()
+                            .unwrap_or_else(|| IrType::Result(Box::new(IrType::Null))),
                     },
                 });
             }
             if let Some(finally_err_id) = finally_err_id {
                 self.try_handlers.push(IrTryHandler {
                     error_block: finally_err_id,
-                    error_name: "__ku_error",
+                    error_name: error_name.clone(),
+                    return_block: finally_return_id,
+                    return_name: return_name.clone(),
                 });
             }
             for stmt in catch_body {
@@ -950,13 +976,6 @@ impl<'a> FunctionLowerer<'a> {
 
         if let Some(finally_err_id) = finally_err_id {
             self.start_block(finally_err_id, "finally_err");
-            self.current.instructions.push(IrInst::BindError {
-                name: "__ku_error".to_string(),
-                result: IrExpr {
-                    kind: IrExprKind::Local("__ku_error".to_string()),
-                    ty: IrType::Result(Box::new(IrType::Unknown)),
-                },
-            });
             for stmt in finally_body {
                 self.lower_stmt(stmt)?;
                 if self.current.terminator != IrTerminator::Next {
@@ -964,10 +983,33 @@ impl<'a> FunctionLowerer<'a> {
                 }
             }
             if self.current.terminator == IrTerminator::Next {
-                self.current.terminator = IrTerminator::PropagateErr(IrExpr {
-                    kind: IrExprKind::Local("__ku_error".to_string()),
-                    ty: IrType::Result(Box::new(IrType::Unknown)),
+                let result = IrExpr {
+                    kind: IrExprKind::Local(error_name.clone()),
+                    ty: self
+                        .locals
+                        .get(&error_name)
+                        .cloned()
+                        .unwrap_or_else(|| IrType::Result(Box::new(IrType::Null))),
+                };
+                self.current.terminator = self.err_terminator(result);
+            }
+            self.finish_current();
+        }
+
+        if let Some(finally_return_id) = finally_return_id {
+            self.start_block(finally_return_id, "finally_return");
+            for stmt in finally_body {
+                self.lower_stmt(stmt)?;
+                if self.current.terminator != IrTerminator::Next {
+                    break;
+                }
+            }
+            if self.current.terminator == IrTerminator::Next {
+                let value = return_name.as_ref().map(|name| IrExpr {
+                    kind: IrExprKind::Local(name.clone()),
+                    ty: self.return_type.clone(),
                 });
+                self.current.terminator = self.return_terminator(value);
             }
             self.finish_current();
         }
@@ -1015,6 +1057,9 @@ impl<'a> FunctionLowerer<'a> {
         let IrType::Named(struct_name) = target else {
             return IrType::Unknown;
         };
+        if struct_name == "__ku_error_type" && matches!(field_name, "domain" | "code" | "message") {
+            return IrType::Str;
+        }
         self.layouts
             .structs
             .iter()
@@ -1067,6 +1112,23 @@ impl<'a> FunctionLowerer<'a> {
                 })
             }
             ExprKind::Call { callee, args } => {
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    if name == "clone" && args.is_empty() {
+                        let target = self.lower_expr(target)?;
+                        let ty = target.ty.clone();
+                        return self.emit_temp(IrExpr {
+                            kind: IrExprKind::Call {
+                                callee: Box::new(IrExpr {
+                                    kind: IrExprKind::Local("__ku_clone".to_string()),
+                                    ty: IrType::Function,
+                                }),
+                                args: vec![target],
+                                kind: IrCallKind::Intrinsic("__ku_clone".to_string()),
+                            },
+                            ty,
+                        });
+                    }
+                }
                 let lowered_args = args
                     .iter()
                     .map(|arg| self.lower_expr(arg))
@@ -1417,6 +1479,10 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn emit_try_unwrap(&mut self, result: IrExpr, ty: IrType) -> KuResult<IrExpr> {
+        let result = match result.kind {
+            IrExprKind::Local(_) | IrExprKind::Temp(_) => result,
+            _ => self.emit_temp(result)?,
+        };
         let id = TempId(self.next_temp_id);
         self.next_temp_id += 1;
         let ok_block = self.next_block("try_ok");
@@ -1445,8 +1511,8 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn err_terminator(&mut self, result: IrExpr) -> IrTerminator {
-        if let Some(handler) = self.try_handlers.last() {
-            let error_name = handler.error_name.to_string();
+        if let Some(handler) = self.try_handlers.last().cloned() {
+            let error_name = handler.error_name;
             if self.locals.contains_key(&error_name) {
                 self.current.instructions.push(IrInst::Store {
                     target: IrLValue::Local(error_name.clone()),
@@ -1467,6 +1533,22 @@ impl<'a> FunctionLowerer<'a> {
         } else {
             IrTerminator::PropagateErr(result)
         }
+    }
+
+    fn return_terminator(&mut self, value: Option<IrExpr>) -> IrTerminator {
+        let Some(handler) = self.try_handlers.last().cloned() else {
+            return IrTerminator::Return(value);
+        };
+        let Some(return_block) = handler.return_block else {
+            return IrTerminator::Return(value);
+        };
+        if let (Some(name), Some(value)) = (handler.return_name, value) {
+            self.current.instructions.push(IrInst::Store {
+                target: IrLValue::Local(name),
+                value,
+            });
+        }
+        IrTerminator::Jump(return_block)
     }
 
     fn next_block(&mut self, _name: &str) -> BlockId {
@@ -1655,6 +1737,10 @@ fn zero_expr(ty: IrType) -> IrExpr {
         kind: IrExprKind::Literal("<native-zero>".to_string()),
         ty,
     }
+}
+
+fn error_ir_type() -> IrType {
+    IrType::Named("__ku_error_type".to_string())
 }
 
 fn literal_text(literal: &Literal) -> String {

@@ -1,9 +1,15 @@
 use std::{
     collections::HashMap,
     env, fs,
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::Duration,
 };
+
+use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::{
     error::{KuError, KuResult},
@@ -49,6 +55,16 @@ pub struct RegistryManifest {
     pub version: String,
     pub source: String,
     pub checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryIndex {
+    pub name: String,
+    pub versions: Vec<RegistryManifest>,
+}
+
+pub trait RegistryIndexVerifier {
+    fn verify(&self, index_url: &str, index_bytes: &[u8], span: Span) -> KuResult<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +137,11 @@ const MAX_PACKAGE_FILES: usize = 512;
 const MAX_REGISTRY_FETCH_ATTEMPTS: u8 = 8;
 const MAX_REGISTRY_DOWNLOAD_BYTES: u64 = 100_000_000;
 const MAX_REGISTRY_TIMEOUT_MS: u64 = 300_000;
+const REGISTRY_ARTIFACT_FILE: &str = "package.archive";
+const REGISTRY_CHECKSUM_FILE: &str = ".sha256";
+const REGISTRY_INSTALL_LOCK_ATTEMPTS: u8 = 100;
+const REGISTRY_INSTALL_LOCK_DELAY_MS: u64 = 10;
+const REGISTRY_INSTALL_LOCK_STALE_SECS: u64 = 30;
 static NEXT_REGISTRY_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn discover_for_file(path: &Path) -> KuResult<Option<PackageContext>> {
@@ -435,7 +456,16 @@ pub fn gc_cache(package: &PackageContext, max_entries: usize) -> KuResult<usize>
             let version_entry = version_entry
                 .map_err(|err| KuError::message(format!("failed to read cache entry: {err}")))?;
             let path = version_entry.path();
-            if !path.is_dir() || keep.contains(&path) {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if !path.is_dir()
+                || keep.contains(&path)
+                || file_name.contains(".download-")
+                || file_name.contains(".replaced-")
+                || name_path.join(format!("{file_name}.install.lock")).exists()
+            {
                 continue;
             }
             if removed >= max_entries {
@@ -601,6 +631,130 @@ pub fn parse_registry_manifest(source: &str, span: Span) -> KuResult<RegistryMan
     })
 }
 
+pub fn parse_registry_index(source: &str, index_url: &str, span: Span) -> KuResult<RegistryIndex> {
+    validate_registry_url(index_url, span)?;
+    let mut name = None;
+    let mut versions = Vec::new();
+    let mut current = None::<HashMap<String, String>>;
+    for (index, raw_line) in source.lines().enumerate() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "[[version]]" {
+            if let Some(fields) = current.take() {
+                versions.push(finish_registry_index_version(
+                    name.as_deref(),
+                    fields,
+                    index_url,
+                    span,
+                )?);
+            }
+            current = Some(HashMap::new());
+            continue;
+        }
+        let Some((key, raw_value)) = line.split_once('=') else {
+            return Err(KuError::package(
+                "invalid_registry_index",
+                format!(
+                    "invalid registry index line {}: expected key = value",
+                    index + 1
+                ),
+                span,
+            ));
+        };
+        let key = key.trim();
+        let value = parse_string_value(raw_value.trim(), index + 1, span)?;
+        if let Some(fields) = current.as_mut() {
+            if fields.insert(key.to_string(), value).is_some() {
+                return Err(KuError::package(
+                    "duplicate_registry_index_field",
+                    format!("duplicate registry index version field '{key}'"),
+                    span,
+                ));
+            }
+        } else if key == "name" && name.is_none() {
+            name = Some(value);
+        } else {
+            return Err(KuError::package(
+                "invalid_registry_index",
+                "registry index must contain one name before [[version]] entries",
+                span,
+            ));
+        }
+    }
+    if let Some(fields) = current {
+        versions.push(finish_registry_index_version(
+            name.as_deref(),
+            fields,
+            index_url,
+            span,
+        )?);
+    }
+    let name = name.ok_or_else(|| {
+        KuError::package(
+            "missing_registry_field",
+            "registry index missing required field 'name'",
+            span,
+        )
+    })?;
+    validate_package_name(&name, span)?;
+    if versions.is_empty() {
+        return Err(KuError::package(
+            "empty_registry_index",
+            "registry index must contain at least one [[version]] entry",
+            span,
+        ));
+    }
+    versions.sort_by_key(|manifest| {
+        std::cmp::Reverse(
+            parse_package_version(&manifest.version, span)
+                .expect("validated registry index version"),
+        )
+    });
+    for pair in versions.windows(2) {
+        if pair[0].version == pair[1].version {
+            return Err(KuError::package(
+                "duplicate_registry_version",
+                format!(
+                    "registry index contains duplicate version '{}'",
+                    pair[0].version
+                ),
+                span,
+            ));
+        }
+    }
+    Ok(RegistryIndex { name, versions })
+}
+
+pub fn fetch_registry_index(
+    index_url: &str,
+    verifier: &dyn RegistryIndexVerifier,
+    policy: RegistryFetchPolicy,
+    span: Span,
+) -> KuResult<RegistryIndex> {
+    validate_registry_fetch_policy(policy, span)?;
+    validate_registry_url(index_url, span)?;
+    let bytes = fetch_https_bytes(index_url, policy, span)?;
+    verifier.verify(index_url, &bytes, span)?;
+    let source = std::str::from_utf8(&bytes).map_err(|_| {
+        KuError::package(
+            "invalid_registry_index",
+            "registry index must be valid UTF-8",
+            span,
+        )
+    })?;
+    parse_registry_index(source, index_url, span)
+}
+
+pub fn reject_unconfigured_registry_index_trust(span: Span) -> KuError {
+    KuError::package(
+        "registry_trust_unconfigured",
+        "registry index verification requires a configured signature algorithm and trusted public key source",
+        span,
+    )
+}
+
 pub fn parse_package_version(version: &str, span: Span) -> KuResult<PackageVersion> {
     let mut parts = version.split('.');
     let (Some(major), Some(minor), Some(patch), None) =
@@ -737,10 +891,11 @@ pub fn plan_registry_download(
     let target_dir = cache_dir
         .join(PACKAGE_CACHE_DIR)
         .join(&manifest.name)
-        .join(&manifest.version);
+        .join(registry_cache_key(manifest));
     let download_id = NEXT_REGISTRY_DOWNLOAD_ID.fetch_add(1, Ordering::Relaxed);
-    let temporary_dir = target_dir.with_file_name(format!(
-        "{}.download-{}-{download_id}",
+    let temporary_dir = cache_dir.join(".registry-downloads").join(format!(
+        "{}-{}-{}-{download_id}",
+        manifest.name,
         manifest.version,
         std::process::id()
     ));
@@ -759,6 +914,474 @@ pub fn plan_registry_download(
         action,
         policy,
     })
+}
+
+pub fn execute_registry_download(plan: &RegistryDownloadPlan, span: Span) -> KuResult<PathBuf> {
+    validate_registry_fetch_policy(plan.policy, span)?;
+    validate_registry_url(&plan.url, span)?;
+    validate_sha256_checksum(&plan.checksum, span)?;
+    let artifact = plan.target_dir.join(REGISTRY_ARTIFACT_FILE);
+    if artifact.is_file()
+        && sha256_file_matches(&artifact, &plan.checksum, plan.policy.max_download_bytes)?
+    {
+        return Ok(artifact);
+    }
+
+    let parent = plan.target_dir.parent().ok_or_else(|| {
+        KuError::package(
+            "invalid_cache_path",
+            "registry cache target must have a parent directory",
+            span,
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|err| {
+        KuError::message(format!(
+            "failed to create registry cache '{}': {err}",
+            parent.display()
+        ))
+    })?;
+    if let Some(temporary_parent) = plan.temporary_dir.parent() {
+        fs::create_dir_all(temporary_parent).map_err(|err| {
+            KuError::message(format!(
+                "failed to create registry download staging '{}': {err}",
+                temporary_parent.display()
+            ))
+        })?;
+    }
+    if plan.temporary_dir.exists() {
+        return Err(KuError::package(
+            "registry_temp_collision",
+            format!(
+                "registry temporary directory already exists '{}'",
+                plan.temporary_dir.display()
+            ),
+            span,
+        ));
+    }
+    fs::create_dir(&plan.temporary_dir).map_err(|err| {
+        KuError::message(format!(
+            "failed to create registry temporary directory '{}': {err}",
+            plan.temporary_dir.display()
+        ))
+    })?;
+    let mut temporary = TemporaryDirectory::new(plan.temporary_dir.clone());
+    let temporary_artifact = plan.temporary_dir.join(REGISTRY_ARTIFACT_FILE);
+    download_https_to_file(
+        &plan.url,
+        &temporary_artifact,
+        &plan.checksum,
+        plan.policy,
+        span,
+    )?;
+    let checksum_path = plan.temporary_dir.join(REGISTRY_CHECKSUM_FILE);
+    let mut checksum_file = fs::File::create(&checksum_path).map_err(|err| {
+        KuError::message(format!(
+            "failed to write registry checksum metadata '{}': {err}",
+            plan.temporary_dir.display()
+        ))
+    })?;
+    writeln!(checksum_file, "{}", plan.checksum).map_err(|err| {
+        KuError::message(format!(
+            "failed to write registry checksum metadata '{}': {err}",
+            checksum_path.display()
+        ))
+    })?;
+    checksum_file.sync_all().map_err(|err| {
+        KuError::message(format!(
+            "failed to sync registry checksum metadata '{}': {err}",
+            checksum_path.display()
+        ))
+    })?;
+
+    let lock_path = parent.join(format!(
+        "{}.install.lock",
+        plan.target_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("package")
+    ));
+    let _lock = acquire_registry_install_lock(&lock_path, span)?;
+    if artifact.is_file()
+        && sha256_file_matches(&artifact, &plan.checksum, plan.policy.max_download_bytes)?
+    {
+        return Ok(artifact);
+    }
+    install_immutable_registry_cache(&plan.temporary_dir, &plan.target_dir, span)?;
+    temporary.keep();
+    Ok(artifact)
+}
+
+fn finish_registry_index_version(
+    name: Option<&str>,
+    fields: HashMap<String, String>,
+    index_url: &str,
+    span: Span,
+) -> KuResult<RegistryManifest> {
+    reject_unknown_fields(
+        &fields,
+        &["version", "url", "checksum"],
+        "registry index version",
+        span,
+    )?;
+    let name = name.ok_or_else(|| {
+        KuError::package(
+            "missing_registry_field",
+            "registry index version appears before package name",
+            span,
+        )
+    })?;
+    let version = required_field(&fields, "version", "registry index version", span)?;
+    let url = required_field(&fields, "url", "registry index version", span)?;
+    let checksum = required_field(&fields, "checksum", "registry index version", span)?;
+    validate_package_name(name, span)?;
+    validate_version(&version, span)?;
+    validate_sha256_checksum(&checksum, span)?;
+    Ok(RegistryManifest {
+        name: name.to_string(),
+        version,
+        source: resolve_registry_url(index_url, &url, span)?,
+        checksum,
+    })
+}
+
+pub fn resolve_registry_url(base_url: &str, value: &str, span: Span) -> KuResult<String> {
+    validate_registry_url(base_url, span)?;
+    if value.chars().any(char::is_whitespace) {
+        return Err(invalid_registry_url_error(span));
+    }
+    let base = Url::parse(base_url).map_err(|_| invalid_registry_url_error(span))?;
+    let resolved = base
+        .join(value)
+        .map_err(|_| invalid_registry_url_error(span))?;
+    validate_parsed_registry_url(&resolved, span)?;
+    Ok(resolved.into())
+}
+
+fn fetch_https_bytes(url: &str, policy: RegistryFetchPolicy, span: Span) -> KuResult<Vec<u8>> {
+    retry_registry_request(policy, span, || {
+        let response = registry_get(url, policy)?;
+        let mut bytes = Vec::new();
+        read_limited(
+            response.into_reader(),
+            &mut bytes,
+            policy.max_download_bytes,
+        )
+        .map_err(classify_stream_error)?;
+        Ok(bytes)
+    })
+}
+
+fn download_https_to_file(
+    url: &str,
+    path: &Path,
+    expected_checksum: &str,
+    policy: RegistryFetchPolicy,
+    span: Span,
+) -> KuResult<()> {
+    retry_registry_request(policy, span, || {
+        let response = registry_get(url, policy)?;
+        let mut file = fs::File::create(path).map_err(|err| {
+            FetchAttemptError::Fatal(KuError::message(format!(
+                "failed to create registry download '{}': {err}",
+                path.display()
+            )))
+        })?;
+        let actual = stream_sha256(response.into_reader(), &mut file, policy.max_download_bytes)
+            .map_err(classify_stream_error)?;
+        file.sync_all().map_err(|err| {
+            FetchAttemptError::Fatal(KuError::message(format!(
+                "failed to sync registry download '{}': {err}",
+                path.display()
+            )))
+        })?;
+        if !checksum_hex(expected_checksum).eq_ignore_ascii_case(&actual) {
+            return Err(FetchAttemptError::Fatal(KuError::package(
+                "checksum_mismatch",
+                format!(
+                    "registry package checksum mismatch: expected {expected_checksum}, got sha256-{actual}"
+                ),
+                span,
+            )));
+        }
+        Ok(())
+    })
+}
+
+enum FetchAttemptError {
+    Retry(String),
+    Fatal(KuError),
+}
+
+fn classify_stream_error(err: KuError) -> FetchAttemptError {
+    if err.code.as_deref() == Some("registry_read_failed") {
+        FetchAttemptError::Retry(err.to_string())
+    } else {
+        FetchAttemptError::Fatal(err)
+    }
+}
+
+fn retry_registry_request<T>(
+    policy: RegistryFetchPolicy,
+    span: Span,
+    mut request: impl FnMut() -> Result<T, FetchAttemptError>,
+) -> KuResult<T> {
+    let mut last_error = String::new();
+    for attempt in 1..=policy.max_attempts {
+        match request() {
+            Ok(value) => return Ok(value),
+            Err(FetchAttemptError::Fatal(err)) => return Err(err),
+            Err(FetchAttemptError::Retry(message)) => {
+                last_error = message;
+                if attempt < policy.max_attempts {
+                    let delay_ms = 25u64.saturating_mul(1u64 << (attempt - 1).min(7));
+                    thread::sleep(Duration::from_millis(delay_ms));
+                }
+            }
+        }
+    }
+    Err(KuError::package(
+        "registry_fetch_failed",
+        format!(
+            "registry request failed after {} attempts: {last_error}",
+            policy.max_attempts
+        ),
+        span,
+    ))
+}
+
+fn registry_get(
+    url: &str,
+    policy: RegistryFetchPolicy,
+) -> Result<ureq::Response, FetchAttemptError> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_millis(policy.connect_timeout_ms))
+        .timeout(Duration::from_millis(policy.read_timeout_ms))
+        .timeout_read(Duration::from_millis(policy.read_timeout_ms))
+        .redirects(0)
+        .build();
+    match agent.get(url).set("Accept-Encoding", "identity").call() {
+        Ok(response) => Ok(response),
+        Err(ureq::Error::Status(status, _))
+            if matches!(status, 408 | 429 | 500 | 502 | 503 | 504) =>
+        {
+            Err(FetchAttemptError::Retry(format!(
+                "server returned retryable HTTP status {status}"
+            )))
+        }
+        Err(ureq::Error::Status(status, _)) => Err(FetchAttemptError::Fatal(KuError::package(
+            "registry_http_status",
+            format!("registry server returned non-retryable HTTP status {status}"),
+            Span::default(),
+        ))),
+        Err(ureq::Error::Transport(err)) => Err(FetchAttemptError::Retry(err.to_string())),
+    }
+}
+
+fn read_limited(mut reader: impl Read, mut writer: impl Write, max_bytes: u64) -> KuResult<u64> {
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).map_err(|err| {
+            KuError::package(
+                "registry_read_failed",
+                format!("failed to read registry response: {err}"),
+                Span::default(),
+            )
+        })?;
+        if count == 0 {
+            return Ok(total);
+        }
+        total = total.saturating_add(count as u64);
+        if total > max_bytes {
+            return Err(KuError::package(
+                "download_limit",
+                format!("registry response exceeds {max_bytes} bytes"),
+                Span::default(),
+            ));
+        }
+        writer
+            .write_all(&buffer[..count])
+            .map_err(|err| KuError::message(format!("failed to write registry response: {err}")))?;
+    }
+}
+
+fn stream_sha256(
+    mut reader: impl Read,
+    mut writer: impl Write,
+    max_bytes: u64,
+) -> KuResult<String> {
+    let mut total = 0u64;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).map_err(|err| {
+            KuError::package(
+                "registry_read_failed",
+                format!("failed to read registry response: {err}"),
+                Span::default(),
+            )
+        })?;
+        if count == 0 {
+            return Ok(format!("{:x}", hasher.finalize()));
+        }
+        total = total.saturating_add(count as u64);
+        if total > max_bytes {
+            return Err(KuError::package(
+                "download_limit",
+                format!("registry package exceeds {max_bytes} bytes"),
+                Span::default(),
+            ));
+        }
+        hasher.update(&buffer[..count]);
+        writer
+            .write_all(&buffer[..count])
+            .map_err(|err| KuError::message(format!("failed to write registry package: {err}")))?;
+    }
+}
+
+fn sha256_file_matches(path: &Path, checksum: &str, max_bytes: u64) -> KuResult<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(KuError::message(format!(
+                "failed to inspect registry cache '{}': {err}",
+                path.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > max_bytes {
+        return Ok(false);
+    }
+    let file = fs::File::open(path).map_err(|err| {
+        KuError::message(format!(
+            "failed to open registry cache '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let actual = stream_sha256(file, io::sink(), max_bytes)?;
+    Ok(checksum_hex(checksum).eq_ignore_ascii_case(&actual))
+}
+
+fn checksum_hex(checksum: &str) -> &str {
+    checksum.strip_prefix("sha256-").unwrap_or("")
+}
+
+struct TemporaryDirectory {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl TemporaryDirectory {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            remove_on_drop: true,
+        }
+    }
+
+    fn keep(&mut self) {
+        self.remove_on_drop = false;
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+struct RegistryInstallLock {
+    path: PathBuf,
+}
+
+impl Drop for RegistryInstallLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_registry_install_lock(path: &Path, span: Span) -> KuResult<RegistryInstallLock> {
+    for attempt in 1..=REGISTRY_INSTALL_LOCK_ATTEMPTS {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                if let Err(err) = writeln!(file, "{}", std::process::id()) {
+                    drop(file);
+                    let _ = fs::remove_file(path);
+                    return Err(KuError::message(format!(
+                        "failed to write registry install lock '{}': {err}",
+                        path.display()
+                    )));
+                }
+                return Ok(RegistryInstallLock {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if registry_install_lock_is_stale(path) {
+                    let _ = fs::remove_file(path);
+                    continue;
+                }
+                if attempt < REGISTRY_INSTALL_LOCK_ATTEMPTS {
+                    thread::sleep(Duration::from_millis(REGISTRY_INSTALL_LOCK_DELAY_MS));
+                }
+            }
+            Err(err) => {
+                return Err(KuError::message(format!(
+                    "failed to create registry install lock '{}': {err}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Err(KuError::package(
+        "registry_cache_busy",
+        format!(
+            "registry cache remained locked after {} bounded attempts",
+            REGISTRY_INSTALL_LOCK_ATTEMPTS
+        ),
+        span,
+    ))
+}
+
+fn registry_install_lock_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| modified.elapsed().map_err(io::Error::other))
+        .is_ok_and(|age| age >= Duration::from_secs(REGISTRY_INSTALL_LOCK_STALE_SECS))
+}
+
+fn install_immutable_registry_cache(source: &Path, target: &Path, span: Span) -> KuResult<()> {
+    if target.exists() {
+        return Err(KuError::package(
+            "registry_cache_conflict",
+            format!(
+                "content-addressed registry cache already exists but did not verify '{}'",
+                target.display()
+            ),
+            span,
+        ));
+    }
+    fs::rename(source, target).map_err(|err| {
+        KuError::message(format!(
+            "failed to atomically install registry cache '{}': {err}",
+            target.display()
+        ))
+    })
+}
+
+fn registry_cache_key(manifest: &RegistryManifest) -> String {
+    let digest = manifest
+        .checksum
+        .strip_prefix("sha256-")
+        .unwrap_or(&manifest.checksum);
+    format!("{}-{}-sha256-{digest}", manifest.name, manifest.version)
 }
 
 pub fn parse_registry_lock(source: &str, span: Span) -> KuResult<Vec<RegistryLockPackage>> {
@@ -846,10 +1469,18 @@ fn finish_registry_lock_package(
     }
     validate_registry_url(&url, span)?;
     validate_sha256_checksum(&checksum, span)?;
-    if cache_key.is_empty() || cache_key.contains(['/', '\\']) {
+    let expected_cache_key = registry_cache_key(&RegistryManifest {
+        name: name.clone(),
+        version: version.clone(),
+        source: url.clone(),
+        checksum: checksum.clone(),
+    });
+    if cache_key != expected_cache_key {
         return Err(KuError::package(
             "invalid_cache_key",
-            "registry lock cache_key must be a non-empty path-free value",
+            format!(
+                "registry lock cache_key must be derived from name, version, and checksum; expected '{expected_cache_key}'"
+            ),
             span,
         ));
     }
@@ -1100,7 +1731,14 @@ fn validate_registry_fetch_policy(policy: RegistryFetchPolicy, span: Span) -> Ku
 
 fn reject_unsafe_relative_path(kind: &str, value: &str, span: Span) -> KuResult<()> {
     let path = Path::new(value);
-    if path.is_absolute() || value.contains("..") {
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
         return Err(KuError::package(
             "unsafe_path",
             format!("ku.mod {kind} must be a safe relative path"),
@@ -1166,16 +1804,32 @@ fn validate_sha256_checksum(value: &str, span: Span) -> KuResult<()> {
 }
 
 fn validate_registry_url(value: &str, span: Span) -> KuResult<()> {
-    if !(value.starts_with("https://") || value.starts_with("http://"))
-        || value.chars().any(char::is_whitespace)
+    if value.chars().any(char::is_whitespace) {
+        return Err(invalid_registry_url_error(span));
+    }
+    let parsed = Url::parse(value).map_err(|_| invalid_registry_url_error(span))?;
+    validate_parsed_registry_url(&parsed, span)
+}
+
+fn validate_parsed_registry_url(value: &Url, span: Span) -> KuResult<()> {
+    if value.scheme() != "https"
+        || value.host_str().is_none()
+        || !value.username().is_empty()
+        || value.password().is_some()
+        || value.fragment().is_some()
+        || value.as_str().chars().any(char::is_whitespace)
     {
-        return Err(KuError::package(
-            "invalid_registry_url",
-            "registry source URL must use http:// or https:// without whitespace",
-            span,
-        ));
+        return Err(invalid_registry_url_error(span));
     }
     Ok(())
+}
+
+fn invalid_registry_url_error(span: Span) -> KuError {
+    KuError::package(
+        "invalid_registry_url",
+        "registry URL must use HTTPS, include a host, and omit credentials, fragments, and whitespace",
+        span,
+    )
 }
 
 fn dependency_cache_root(package: &PackageContext, dependency: &PackageDependency) -> PathBuf {
@@ -1390,5 +2044,181 @@ pub(crate) fn ensure_inside_import_root(
             ),
             span,
         ))
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn temp_path(label: &str) -> PathBuf {
+        let id = NEXT_REGISTRY_DOWNLOAD_ID.fetch_add(1, Ordering::Relaxed);
+        env::temp_dir().join(format!("ku-{label}-{}-{id}", std::process::id()))
+    }
+
+    #[test]
+    fn static_index_resolves_https_urls_and_sorts_versions() {
+        let index = parse_registry_index(
+            r#"
+name = "math"
+
+[[version]]
+version = "1.2.3"
+url = "../packages/math-1.2.3.tar.gz"
+checksum = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[version]]
+version = "2.0.0"
+url = "https://cdn.example/math-2.0.0.tar.gz"
+checksum = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#,
+            "https://registry.example/index/math",
+            Span::default(),
+        )
+        .expect("valid static index");
+
+        assert_eq!(index.name, "math");
+        assert_eq!(index.versions[0].version, "2.0.0");
+        assert_eq!(
+            index.versions[1].source,
+            "https://registry.example/packages/math-1.2.3.tar.gz"
+        );
+    }
+
+    #[test]
+    fn registry_rejects_http_and_duplicate_index_versions() {
+        let manifest = RegistryManifest {
+            name: "math".to_string(),
+            version: "1.0.0".to_string(),
+            source: "http://registry.example/math.tar.gz".to_string(),
+            checksum: "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+        };
+        let err = plan_registry_download(
+            Path::new("cache"),
+            &manifest,
+            None,
+            RegistryFetchPolicy::default(),
+            Span::default(),
+        )
+        .expect_err("HTTP must be rejected");
+        assert_eq!(err.code.as_deref(), Some("invalid_registry_url"));
+
+        let err = parse_registry_index(
+            r#"
+name = "math"
+[[version]]
+version = "1.0.0"
+url = "math.tar.gz"
+checksum = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[[version]]
+version = "1.0.0"
+url = "math-copy.tar.gz"
+checksum = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#,
+            "https://registry.example/index/math",
+            Span::default(),
+        )
+        .expect_err("duplicate versions must be rejected");
+        assert_eq!(err.code.as_deref(), Some("duplicate_registry_version"));
+    }
+
+    #[test]
+    fn sha256_streaming_enforces_the_download_limit() {
+        let mut output = Vec::new();
+        let digest = stream_sha256(&b"abc"[..], &mut output, 3).expect("bounded stream");
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(output, b"abc");
+
+        let err =
+            stream_sha256(&b"abcd"[..], io::sink(), 3).expect_err("oversized stream must fail");
+        assert_eq!(err.code.as_deref(), Some("download_limit"));
+    }
+
+    #[test]
+    fn retry_loop_stops_at_the_configured_attempt_count() {
+        let attempts = AtomicUsize::new(0);
+        let policy = RegistryFetchPolicy {
+            max_attempts: 3,
+            ..RegistryFetchPolicy::default()
+        };
+        let err = retry_registry_request(policy, Span::default(), || {
+            attempts.fetch_add(1, AtomicOrdering::Relaxed);
+            Err::<(), _>(FetchAttemptError::Retry("temporary".to_string()))
+        })
+        .expect_err("bounded retries must eventually fail");
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 3);
+        assert_eq!(err.code.as_deref(), Some("registry_fetch_failed"));
+    }
+
+    #[test]
+    fn fatal_fetch_errors_are_not_retried() {
+        let attempts = AtomicUsize::new(0);
+        let err = retry_registry_request(RegistryFetchPolicy::default(), Span::default(), || {
+            attempts.fetch_add(1, AtomicOrdering::Relaxed);
+            Err::<(), _>(FetchAttemptError::Fatal(KuError::package(
+                "checksum_mismatch",
+                "bad checksum",
+                Span::default(),
+            )))
+        })
+        .expect_err("fatal errors must stop immediately");
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(err.code.as_deref(), Some("checksum_mismatch"));
+    }
+
+    #[test]
+    fn immutable_cache_install_refuses_to_replace_existing_content() {
+        let root = temp_path("registry-cache-install");
+        let target = root.join("math-1.0.0");
+        let source = root.join("math-1.0.0.download");
+        fs::create_dir_all(&target).expect("create old cache");
+        fs::create_dir_all(&source).expect("create new cache");
+        fs::write(target.join("old"), b"old").expect("write old cache");
+        fs::write(source.join(REGISTRY_ARTIFACT_FILE), b"new").expect("write new cache");
+
+        let err = install_immutable_registry_cache(&source, &target, Span::default())
+            .expect_err("content-addressed cache must never replace an existing directory");
+        assert_eq!(err.code.as_deref(), Some("registry_cache_conflict"));
+        assert!(source.exists());
+        assert_eq!(
+            fs::read(target.join("old")).expect("read old cache"),
+            b"old"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_cache_is_reused_without_network_access() {
+        let root = temp_path("registry-cache-reuse");
+        let target = root.join("packages").join("math").join("1.0.0");
+        fs::create_dir_all(&target).expect("create cache");
+        fs::write(target.join(REGISTRY_ARTIFACT_FILE), b"abc").expect("write artifact");
+        let plan = RegistryDownloadPlan {
+            name: "math".to_string(),
+            version: "1.0.0".to_string(),
+            url: "https://unreachable.invalid/math.tar.gz".to_string(),
+            checksum: "sha256-ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                .to_string(),
+            target_dir: target.clone(),
+            temporary_dir: target.with_extension("download-test"),
+            action: RegistryCacheAction::ReuseVerified,
+            policy: RegistryFetchPolicy::default(),
+        };
+
+        let artifact =
+            execute_registry_download(&plan, Span::default()).expect("verified cache reuse");
+        assert_eq!(artifact, target.join(REGISTRY_ARTIFACT_FILE));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trust_boundary_refuses_unconfigured_signature_verification() {
+        let err = reject_unconfigured_registry_index_trust(Span::default());
+        assert_eq!(err.code.as_deref(), Some("registry_trust_unconfigured"));
     }
 }

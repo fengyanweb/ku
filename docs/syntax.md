@@ -1465,7 +1465,7 @@ import { Value } from "@util/util"
 
 `@util/util` 表示从 dependency cache 的 `util` 包里导入 `util.ku`。
 
-当前 package source 只执行 `file://` 目录下载/缓存。registry 网络下载尚未实现，但第一版离线 schema 已实现严格解析：
+当前 CLI package import 仍只启用 `file://` 目录 source。registry 的执行层已经实现 HTTPS-only 获取、静态 index 解析、SHA-256 流式校验、有界重试/超时/下载大小、唯一临时目录和内容寻址 cache；在签名信任根与归档格式完成决策前，CLI 不会绕过验证直接启用远程包：
 
 ```toml
 name = "math"
@@ -1474,9 +1474,9 @@ source = "https://registry.example/ku/math/0.1.0.tar.gz"
 checksum = "sha256-<64 hex digits>"
 ```
 
-registry lock 使用一个或多个 `[[package]]`，要求 `name/version/source/url/checksum/cache_key` 齐全；`source` 必须是 `registry`，版本必须是 `major.minor.patch`，checksum 必须是 `sha256-` 加 64 位十六进制。
+registry lock 使用一个或多个 `[[package]]`，要求 `name/version/source/url/checksum/cache_key` 齐全；`source` 必须是 `registry`，版本必须是 `major.minor.patch`，checksum 必须是 `sha256-` 加 64 位十六进制。`cache_key` 必须由 name、精确版本和完整 SHA-256 确定，不能自行填写任意值。
 
-离线 resolver 已支持精确版本 `1.2.3` 和 caret 范围 `^1.2.3`。同名依赖的全部约束会合并，选择满足全部约束的最高可用版本；没有共同版本时返回 `package/dependency_conflict`，不做无限回溯或 SAT 搜索。网络层仍未接入，但下载计划已固定为有界策略：最多 8 次尝试、连接/读取超时均有上限、单包最多 100 MB、校验通过的 cache 直接复用，否则下载到进程和序号唯一的临时位置，并在 checksum 通过后原子替换。
+resolver 支持精确版本 `1.2.3` 和 caret 范围 `^1.2.3`。同名依赖的全部约束会合并，选择满足全部约束的最高可用版本；没有共同版本时返回 `package/dependency_conflict`，不做无限回溯或 SAT 搜索。远程请求最多 8 次，连接/读取超时均有上限，单包最多 100 MB；只对明确瞬时错误有限退避。下载 staging 与 GC 隔离，SHA-256 通过后安装到不可覆盖的内容寻址 cache；并发安装锁和旧锁恢复均有界。
 
 ## 16. CLI 相关语法
 
@@ -1541,16 +1541,23 @@ int / bool / str
 print
 return
 if / while
-基础 Result ABI
+统一 KuError / Result ABI
 ok / err / ?
 错误传播
+try / catch / finally
+return-through-finally
+Result<int/bool/str/null/array/struct/enum>
 有界 array runtime / length / read-write bounds check
+默认 move / 显式 clone() / 自动 drop
+嵌套 owned array 递归 clone/drop
 enum tag + payload layout
 unit / payload / nested enum match lowering
 系统 int main(void) wrapper
 ```
 
-native C 当前仍是 prototype：array 使用 `{ len, data }` runtime-owned 结构，字面量会复制数据，所有读写索引都检查负数和 `index >= len`；越界打印清晰错误并终止进程。enum 使用 `tag + union payload`，支持 unit variant、payload variant、guard、绑定和嵌套 enum match。struct/enum 值布局仍拒绝递归；array 暂无释放/所有权 ABI，错误槽也还不是完整 Error 对象 ABI。闭包、try/catch/finally 和 async native lowering 仍明确不支持。
+native C 当前仍是 prototype，但同步所有权和错误流已闭环：Copy 类型是 `int/bool/float/null`；`str/array/object/struct/enum/Result/task` 在语言检查层按 Owned 处理，赋值和传参默认 move，复制必须显式 `.clone()`。checker 会拒绝 use-after-move、重复消费 Result、match 分支漏合并和循环回边重复 move。C 后端为 array、named value 和 Result 生成 move/clone/drop，赋值先物化 RHS 再 drop 旧值，解构交换先物化全部 RHS；嵌套 owned array 递归 clone/drop。
+
+native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、错误和 return 都经过对应 finally block。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。递归值 struct/enum、native closure、动态 object ABI 和 async native lowering仍明确拒绝。native `str` 暂时仍使用只读 C 字符串原型，正式 owned string ABI 等待路线决策。
 
 ## 17. 资源保护
 
@@ -1572,7 +1579,31 @@ json 最大嵌套深度: 32
 json.stringify 最大输出: 1000000 bytes
 http response 最大 body: 1000000 bytes
 http 默认超时: 5 秒
+async active task 上限: 1024
+async task queue 上限: 1024
+async blocking queue 上限: 1024
+async await 深度上限: 64
 ```
+
+async runtime snapshot 会报告 active/registered/queued task、等待边、blocking queue/running job、worker 数和累计 accepted/rejected/finished。shutdown 同时等待 task 与 blocking job；已经开始且不配合取消的系统调用不能被强杀，超过有界窗口返回 `task/shutdown_timeout`。
+
+2026-06-22 的 release 压力测试使用 15 个生产者并发提交 1,000,000 个 task demand，并让已接纳任务同时保持 active。结果：
+
+```txt
+peak_active: 1024
+accepted: 1024
+rejected_limit: 998976
+rejected_queue/internal: 0
+submit: 126 ms
+runtime total: 379 ms
+外部观测 wall time: 648 ms
+CPU time: 2312 ms
+峰值 working set: 6.07 MiB
+峰值 private memory: 1.91 MiB
+观测峰值线程数: 13
+```
+
+这个测试验证的是“百万并发需求下仍保持 1024 有界接纳”，不是允许一百万个活跃协程常驻内存。超限请求立即得到结构化拒绝，不排队死等、不无限重试。
 
 ## 18. 当前不支持 / 未完成
 
@@ -1580,9 +1611,9 @@ http 默认超时: 5 秒
 LLVM 数组、enum、闭包、HTTP、async lowering
 LLVM 递归 struct 和更复杂 Result payload
 完整 native C 后端
-registry 网络下载
-registry 索引协议、签名信任和实际网络缓存更新
-native array/struct/enum 的释放、复制和移动所有权 ABI
+registry 签名信任根、归档格式、受限解包和 CLI 远程 import 串联
+native closure ABI、captured env 和函数类型语法
+native owned string 与动态 object ABI
 match guard 模式矩阵和跨 guard 的完整穷尽性检查
 顶层脚本语句
 方法 / trait / interface

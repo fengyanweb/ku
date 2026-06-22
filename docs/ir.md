@@ -52,34 +52,42 @@ ku ir examples\function.ku
 - `if` / `while` 已有基础 block 和 `Branch` / `Jump` / `Return` terminator。
 - `for` 已有 `ForEach` terminator。
 - `?` 会降成 `ResultBranch`，ok 分支用 `BindOk` 取值，err 分支用 `PropagateErr` 或 `JumpErr` 跳入 try handler。
-- `try/catch/finally` 已有 `BeginTry` / `EndTry` / `BindError` 标记；0.0.11 增加 finally error block，让 `?` 或 `fail` 失败后能先执行 finally，再继续传播错误。
+- `try/catch/finally` 已有 `BeginTry` / `EndTry` / `BindError` 标记；错误、普通完成和 return 使用独立 finally block，return value 先写入隐藏槽，再经过 finally 返回。
 - struct / enum 会进入 layout table，enum variant 有稳定 tag 和 payload 字段顺序。
 - array literal/index/assignment 保留元素类型，native C 从 IR 生成带长度的 array ABI。
 - enum 构造、tag、payload 访问和 match 已降低为显式 CFG 与 intrinsic，不再使用 unsupported 占位。
-- native C 后端已经能读取 `Result<int|bool|str, str>` ABI，生成 `{ ok, value, error }` 结构体、`ResultBranch` 分支、`BindOk` 取值和 `PropagateErr` 返回。
+- native C 后端使用统一 `KuError` 和按 payload 生成的 Result ABI，生成 `ResultBranch`、消费式 `BindOk` 和只传播 Error 的 `PropagateErr`。
 - native C 已支持非递归 struct、带长度 array、enum tag/payload 和嵌套 match CFG。
+- native C 已支持 array/named/Result 的 move、clone、drop；解构赋值先物化全部 RHS，避免 owned swap 丢值。
 - LLVM 文本后端已支持非递归 struct 和 `Result<int|bool|str|struct>`。
-- try/catch 的完整 native error slot、return 穿过 finally 的 IR 延迟返回、闭包 native ABI 和 async native ABI 仍是待完成边界。
+- 闭包 native ABI 和 async native ABI 仍是待完成边界。
 - 暂不做 SSA、寄存器分配和完整 native ABI lowering。
 
 ## Result ABI 草案
 
-当前 native C 子集固定三种基础 Result 结构：
+当前 native C Result 使用统一 Error 对象，并按 payload 类型生成结构：
 
 ```c
-typedef struct { bool ok; int64_t value; const char* error; } KuResultInt;
-typedef struct { bool ok; bool value; const char* error; } KuResultBool;
-typedef struct { bool ok; const char* value; const char* error; } KuResultStr;
+typedef struct KuError {
+    const char* domain;
+    const char* code;
+    const char* message;
+} KuError;
+
+typedef struct {
+    bool ok;
+    int64_t value;
+    KuError error;
+} KuResult_int;
 ```
 
-`ok(value)` 生成 `{ true, value, 0 }`，`err(message)` 和 `fail message` 生成 `{ false, zero, message }`。`?` 会变成 `if (result.ok) goto ok_block; else goto err_block;`，错误路径在 Result 返回函数中直接 `return result`。
+`ok(value)` 会 move payload 进入 Result。`err(message)` 和 `fail message` 构造 KuError。`?` 会变成 `if (result.ok) goto ok_block; else goto err_block;`，成功分支 take payload 并清空来源 Result；错误分支只取出 KuError，再按当前函数的 Result payload 构造 Err，因此 `[int]!` 可以安全传播到 `null!`，不会错误复制不同 C struct。
 
-native C 的基础 Result ABI 仍只覆盖 int/bool/str；LLVM 文本后端额外支持非递归 struct Result。对象、数组 Result、enum Result、闭包和泛型 Result 仍不支持。
+native C 当前覆盖 `Result<int|bool|str|null|array|struct|enum>`；owned payload 的 clone/drop 会递归调用对应 ABI。动态 object、closure 和泛型实例化 Result 仍不支持。LLVM 文本后端继续保持较小子集。
 
 ## 后续 native 前置任务
 
-1. 固定 array/struct/enum 的释放、复制、移动和嵌套所有权 ABI，消除当前 native array 只分配不释放的 prototype 边界。
-2. 给 try/catch native lowering 增加显式 Error slot 或 block parameter，并补 return-through-finally 的延迟返回 block。
-3. 固定闭包 ABI，包括捕获值、引用捕获和异步边界所有权。
-4. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
-5. async native lowering继续拒绝，直到 task ABI、调度器嵌入方式和取消语义单独决策。
+1. 固定闭包 ABI，包括 typed invoke pointer、捕获 binding、env 生命周期和逃逸规则。
+2. 固定 owned string 和动态 object ABI，使语言层 Owned 分类与 native 资源释放完全一致。
+3. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
+4. async native lowering继续拒绝，直到状态机 task ABI、调度器嵌入方式和取消语义单独决策。

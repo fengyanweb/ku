@@ -10,13 +10,23 @@ use crate::{
     span::Span,
 };
 
+struct OwnedLocal {
+    source_name: String,
+    name: String,
+    ty: IrType,
+    is_param: bool,
+}
+
 pub fn generate_c_source(program: &IrProgram) -> KuResult<String> {
     validate_layouts(program)?;
     let mut out = String::from(
-        "#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n",
+        "#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n\
+         typedef struct KuError {\n  const char* domain;\n  const char* code;\n  const char* message;\n} KuError;\n\
+         static KuError ku_error_message(const char* message) {\n  return (KuError){ \"ku\", \"error\", message ? message : \"error\" };\n}\n\n",
     );
     emit_struct_layouts(&mut out, program)?;
     emit_enum_layouts(&mut out, program)?;
+    emit_named_ownership_helpers(&mut out, program)?;
     emit_array_abi(&mut out, program)?;
     emit_result_abi(&mut out, program)?;
     for function in &program.functions {
@@ -261,6 +271,8 @@ fn emit_array_abi(out: &mut String, program: &IrProgram) -> KuResult<()> {
         let array_type = c_array_type(element)?;
         let suffix = c_type_suffix(element)?;
         let element_type = c_type(element)?;
+        let clone_element = c_clone_value(element, "array.data[index]")?;
+        let drop_element = c_drop_value(element, "array->data[index]")?;
         out.push_str(&format!(
             "typedef struct {{ size_t len; {element_type}* data; }} {array_type};\n\
              static {array_type} ku_array_make_{suffix}(size_t len, const {element_type}* values) {{\n\
@@ -273,7 +285,22 @@ fn emit_array_abi(out: &mut String, program: &IrProgram) -> KuResult<()> {
              \x20 return result;\n\
              }}\n\
              static {array_type} ku_array_clone_{suffix}({array_type} array) {{\n\
-             \x20 return ku_array_make_{suffix}(array.len, array.data);\n\
+             \x20 {array_type} result = ku_array_make_{suffix}(array.len, array.data);\n\
+             \x20 for (size_t index = 0; index < result.len; index++) result.data[index] = {clone_element};\n\
+             \x20 return result;\n\
+             }}\n\
+             static {array_type} ku_array_move_{suffix}({array_type}* array) {{\n\
+             \x20 {array_type} result = *array;\n\
+             \x20 array->len = 0;\n\
+             \x20 array->data = NULL;\n\
+             \x20 return result;\n\
+             }}\n\
+             static void ku_array_drop_{suffix}({array_type}* array) {{\n\
+             \x20 if (!array || !array->data) return;\n\
+             \x20 for (size_t index = 0; index < array->len; index++) {{ {drop_element} }}\n\
+             \x20 free(array->data);\n\
+             \x20 array->data = NULL;\n\
+             \x20 array->len = 0;\n\
              }}\n\
              static {element_type} ku_array_get_{suffix}({array_type} array, int64_t index) {{\n\
              \x20 if (index < 0 || (uint64_t)index >= array.len) ku_array_bounds_fail(index, array.len);\n\
@@ -348,6 +375,7 @@ fn collect_array_lvalue_types(target: &IrLValue, output: &mut Vec<IrType>) {
 }
 
 fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
+    let owned_locals = collect_owned_locals(function);
     out.push_str(&format!(
         "{} {}(",
         c_type(&function.return_type)?,
@@ -360,22 +388,39 @@ fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
         out.push_str(&format!("{} {}", c_type(&param.ty)?, c_ident(&param.name)));
     }
     out.push_str(") {\n");
+    for local in &owned_locals {
+        if local.is_param {
+            continue;
+        }
+        out.push_str(&format!(
+            "  {} {} = {};\n",
+            c_type(&local.ty)?,
+            local.name,
+            c_zero_initializer(&local.ty)?
+        ));
+    }
     for block in &function.blocks {
-        emit_block(out, block, &function.return_type)?;
+        emit_block(out, block, &function.return_type, &owned_locals)?;
     }
     if function.return_type == IrType::Void {
+        emit_owned_cleanup(out, &owned_locals)?;
         out.push_str("  return;\n");
     }
     out.push_str("}\n");
     Ok(())
 }
 
-fn emit_block(out: &mut String, block: &IrBlock, return_type: &IrType) -> KuResult<()> {
+fn emit_block(
+    out: &mut String,
+    block: &IrBlock,
+    return_type: &IrType,
+    owned_locals: &[OwnedLocal],
+) -> KuResult<()> {
     if block.id.0 != 0 {
         out.push_str(&format!("block{}:;\n", block.id.0));
     }
     for inst in &block.instructions {
-        emit_inst(out, inst, return_type)?;
+        emit_inst(out, inst, return_type, owned_locals)?;
     }
     if block.terminator == IrTerminator::Unreachable
         && matches!(
@@ -385,40 +430,83 @@ fn emit_block(out: &mut String, block: &IrBlock, return_type: &IrType) -> KuResu
     {
         return Ok(());
     }
-    emit_terminator(out, &block.terminator, return_type)
+    emit_terminator(out, &block.terminator, return_type, owned_locals)
 }
 
-fn emit_inst(out: &mut String, inst: &IrInst, return_type: &IrType) -> KuResult<()> {
+fn emit_inst(
+    out: &mut String,
+    inst: &IrInst,
+    return_type: &IrType,
+    owned_locals: &[OwnedLocal],
+) -> KuResult<()> {
     match inst {
         IrInst::Temp { id, ty, value } => {
-            out.push_str(&format!(
-                "  {} t{} = {};\n",
-                c_type(ty)?,
-                id.0,
-                c_expr(value)?
-            ));
+            if is_c_owned_type(ty) {
+                out.push_str(&format!("  t{} = {};\n", id.0, c_value_expr(value)?));
+            } else {
+                out.push_str(&format!(
+                    "  {} t{} = {};\n",
+                    c_type(ty)?,
+                    id.0,
+                    c_expr(value)?
+                ));
+            }
         }
         IrInst::BindOk { id, ty, result } => {
-            out.push_str(&format!(
-                "  {} t{} = {}.value;\n",
-                c_type(ty)?,
-                id.0,
-                c_expr(result)?
-            ));
+            if is_c_owned_type(ty) {
+                out.push_str(&format!(
+                    "  t{} = ku_result_take_{}(&{});\n",
+                    id.0,
+                    c_type_suffix(ty)?,
+                    c_addressable_expr(result)?
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  {} t{} = ku_result_take_{}(&{});\n",
+                    c_type(ty)?,
+                    id.0,
+                    c_type_suffix(ty)?,
+                    c_addressable_expr(result)?
+                ));
+            }
         }
         IrInst::Let { name, ty, value } => {
-            out.push_str(&format!(
-                "  {} {} = {};\n",
-                c_type(ty)?,
-                c_ident(name),
-                if is_native_zero(value) {
-                    c_zero_initializer(ty)?
-                } else {
-                    c_value_expr(value)?
-                }
-            ));
+            if is_c_owned_type(ty) {
+                out.push_str(&format!(
+                    "  {} = {};\n",
+                    c_ident(name),
+                    if is_native_zero(value) {
+                        c_zero_initializer(ty)?
+                    } else {
+                        c_value_expr(value)?
+                    }
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  {} {} = {};\n",
+                    c_type(ty)?,
+                    c_ident(name),
+                    if is_native_zero(value) {
+                        c_zero_initializer(ty)?
+                    } else {
+                        c_value_expr(value)?
+                    }
+                ));
+            }
         }
         IrInst::Store { target, value } => {
+            if let IrLValue::Local(name) = target {
+                if let Some(local) = owned_locals.iter().find(|local| local.source_name == *name) {
+                    out.push_str(&format!(
+                        "  {{ {} __ku_store = {};\n",
+                        c_type(&local.ty)?,
+                        c_value_expr(value)?
+                    ));
+                    emit_drop_expr(out, &local.ty, &local.name)?;
+                    out.push_str(&format!("  {} = __ku_store; }}\n", local.name));
+                    return Ok(());
+                }
+            }
             out.push_str(&format!(
                 "  {} = {};\n",
                 c_lvalue(target)?,
@@ -431,12 +519,14 @@ fn emit_inst(out: &mut String, inst: &IrInst, return_type: &IrType) -> KuResult<
             let IrType::Result(inner) = return_type else {
                 return Err(unsupported("native C fail requires a Result return type"));
             };
-            out.push_str(&format!(
-                "  return ({}){{ false, {}, {} }};\n",
+            let result = format!(
+                "({}){{ false, {}, {} }}",
                 c_type(return_type)?,
                 c_zero_value(inner)?,
-                c_expr(value)?
-            ));
+                c_error_expr(value)?
+            );
+            emit_owned_cleanup(out, owned_locals)?;
+            out.push_str(&format!("  return {result};\n"));
         }
         IrInst::Panic(value) => {
             if value.ty == IrType::Str {
@@ -448,11 +538,15 @@ fn emit_inst(out: &mut String, inst: &IrInst, return_type: &IrType) -> KuResult<
                 out.push_str("  fprintf(stderr, \"panic\\n\"); exit(1);\n");
             }
         }
-        IrInst::BeginTry { .. }
-        | IrInst::EndTry
-        | IrInst::BindError { .. }
-        | IrInst::DefineClosure { .. }
-        | IrInst::Unsupported { .. } => {
+        IrInst::BeginTry { .. } | IrInst::EndTry => {}
+        IrInst::BindError { name, result } => {
+            out.push_str(&format!(
+                "  KuError {} = {}.error;\n",
+                c_ident(name),
+                c_expr(result)?
+            ));
+        }
+        IrInst::DefineClosure { .. } | IrInst::Unsupported { .. } => {
             return Err(unsupported(format!(
                 "native C prototype cannot lower IR instruction '{inst}'"
             )));
@@ -490,6 +584,7 @@ fn emit_terminator(
     out: &mut String,
     terminator: &IrTerminator,
     return_type: &IrType,
+    owned_locals: &[OwnedLocal],
 ) -> KuResult<()> {
     match terminator {
         IrTerminator::Next => Ok(()),
@@ -535,19 +630,44 @@ fn emit_terminator(
             Ok(())
         }
         IrTerminator::PropagateErr(value) => {
-            if !matches!(return_type, IrType::Result(_)) {
+            let IrType::Result(return_inner) = return_type else {
                 return Err(unsupported(
                     "native C prototype can only propagate errors from Result functions",
                 ));
+            };
+            if !matches!(value.ty, IrType::Result(_)) {
+                return Err(unsupported(
+                    "native C error propagation requires a Result value",
+                ));
             }
-            out.push_str(&format!("  return {};\n", c_expr(value)?));
+            let result = c_expr(value)?;
+            out.push_str(&format!("  {{ KuError __ku_error = {}.error;\n", result));
+            emit_owned_cleanup(out, owned_locals)?;
+            out.push_str(&format!(
+                "  return ({}){{ false, {}, __ku_error }}; }}\n",
+                c_type(return_type)?,
+                c_zero_value(return_inner)?
+            ));
             Ok(())
         }
         IrTerminator::Return(Some(value)) => {
-            out.push_str(&format!("  return {};\n", c_value_expr(value)?));
+            if is_c_owned_type(&value.ty) {
+                out.push_str(&format!(
+                    "  {{ {} __ku_return = {};\n",
+                    c_type(&value.ty)?,
+                    c_value_expr(value)?
+                ));
+                emit_owned_cleanup(out, owned_locals)?;
+                out.push_str("  return __ku_return; }\n");
+            } else {
+                let value = c_value_expr(value)?;
+                emit_owned_cleanup(out, owned_locals)?;
+                out.push_str(&format!("  return {value};\n"));
+            }
             Ok(())
         }
         IrTerminator::Return(None) => {
+            emit_owned_cleanup(out, owned_locals)?;
             out.push_str("  return;\n");
             Ok(())
         }
@@ -563,6 +683,8 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
         IrExprKind::Literal(value) => {
             if value == "<native-zero>" {
                 c_zero_initializer(&expr.ty)
+            } else if expr.ty == IrType::Null && value == "null" {
+                Ok("0".to_string())
             } else {
                 Ok(value.clone())
             }
@@ -680,14 +802,115 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
 }
 
 fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
-    if let (IrType::Array(element), IrExprKind::Local(_)) = (&expr.ty, &expr.kind) {
-        return Ok(format!(
+    if let IrExprKind::Call { kind, args, .. } = &expr.kind {
+        if matches!(kind, IrCallKind::Intrinsic(name) if name == "__ku_clone") {
+            let value = args
+                .first()
+                .ok_or_else(|| unsupported("clone intrinsic requires one argument"))?;
+            return c_clone_expr(value);
+        }
+    }
+    if let IrType::Array(element) = &expr.ty {
+        match &expr.kind {
+            IrExprKind::Local(name) => {
+                return Ok(format!(
+                    "ku_array_move_{}(&{})",
+                    c_type_suffix(element)?,
+                    c_symbol(name)
+                ))
+            }
+            IrExprKind::Temp(id) => {
+                return Ok(format!(
+                    "ku_array_move_{}(&t{})",
+                    c_type_suffix(element)?,
+                    id.0
+                ))
+            }
+            _ => {}
+        }
+    }
+    if let IrType::Result(inner) = &expr.ty {
+        match &expr.kind {
+            IrExprKind::Local(name) => {
+                return Ok(format!(
+                    "ku_result_move_{}(&{})",
+                    c_type_suffix(inner)?,
+                    c_symbol(name)
+                ))
+            }
+            IrExprKind::Temp(id) => {
+                return Ok(format!(
+                    "ku_result_move_{}(&t{})",
+                    c_type_suffix(inner)?,
+                    id.0
+                ))
+            }
+            _ => {}
+        }
+    }
+    if let IrType::Named(name) = &expr.ty {
+        match &expr.kind {
+            IrExprKind::Local(local) => {
+                return Ok(format!(
+                    "{}(&{})",
+                    c_named_move_function(name),
+                    c_symbol(local)
+                ))
+            }
+            IrExprKind::Temp(id) => {
+                return Ok(format!("{}(&t{})", c_named_move_function(name), id.0))
+            }
+            _ => {}
+        }
+    }
+    c_expr(expr)
+}
+
+fn c_clone_expr(expr: &IrExpr) -> KuResult<String> {
+    match &expr.ty {
+        IrType::Array(element) => Ok(format!(
             "ku_array_clone_{}({})",
             c_type_suffix(element)?,
             c_expr(expr)?
-        ));
+        )),
+        IrType::Str => c_expr(expr),
+        IrType::Result(inner) => Ok(format!(
+            "ku_result_clone_{}({})",
+            c_type_suffix(inner)?,
+            c_expr(expr)?
+        )),
+        IrType::Named(name) => Ok(format!(
+            "{}({})",
+            c_named_clone_function(name),
+            c_expr(expr)?
+        )),
+        _ => Err(unsupported(format!(
+            "native C clone() is not implemented for {} yet",
+            expr.ty
+        ))),
     }
-    c_expr(expr)
+}
+
+fn c_addressable_expr(expr: &IrExpr) -> KuResult<String> {
+    match &expr.kind {
+        IrExprKind::Local(name) => Ok(c_symbol(name)),
+        IrExprKind::Temp(id) => Ok(format!("t{}", id.0)),
+        _ => Err(unsupported(
+            "native C Result unwrapping requires a materialized local result",
+        )),
+    }
+}
+
+fn c_error_expr(value: &IrExpr) -> KuResult<String> {
+    if value.ty == IrType::Named("__ku_error_type".to_string()) {
+        c_expr(value)
+    } else if value.ty == IrType::Str {
+        Ok(format!("ku_error_message({})", c_expr(value)?))
+    } else {
+        Err(unsupported(
+            "native C errors currently require a string or Error value",
+        ))
+    }
 }
 
 fn c_lvalue(target: &IrLValue) -> KuResult<String> {
@@ -715,8 +938,10 @@ fn c_type(ty: &IrType) -> KuResult<String> {
         IrType::Int => Ok("int64_t".to_string()),
         IrType::Bool => Ok("bool".to_string()),
         IrType::Str => Ok("const char*".to_string()),
+        IrType::Null => Ok("uint8_t".to_string()),
         IrType::Array(inner) => c_array_type(inner),
         IrType::Result(inner) => c_result_type(inner),
+        IrType::Named(name) if name == "__ku_error_type" => Ok("KuError".to_string()),
         IrType::Named(name) => Ok(match enum_type_name(name) {
             Some(name) => c_enum_type(name),
             None => c_struct_type(name),
@@ -729,39 +954,32 @@ fn c_type(ty: &IrType) -> KuResult<String> {
 }
 
 fn emit_result_abi(out: &mut String, program: &IrProgram) -> KuResult<()> {
-    let mut has_int = false;
-    let mut has_bool = false;
-    let mut has_str = false;
+    let mut result_types = Vec::new();
     for function in &program.functions {
-        collect_result_type(
-            &function.return_type,
-            &mut has_int,
-            &mut has_bool,
-            &mut has_str,
-        )?;
+        collect_result_type(&function.return_type, &mut result_types)?;
         for param in &function.params {
-            collect_result_type(&param.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+            collect_result_type(&param.ty, &mut result_types)?;
         }
         for block in &function.blocks {
             for inst in &block.instructions {
                 match inst {
                     IrInst::Temp { ty, value, .. } => {
-                        collect_result_type(ty, &mut has_int, &mut has_bool, &mut has_str)?;
-                        collect_result_type(&value.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                        collect_result_type(ty, &mut result_types)?;
+                        collect_result_type(&value.ty, &mut result_types)?;
                     }
                     IrInst::BindOk { result, .. } => {
-                        collect_result_type(&result.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                        collect_result_type(&result.ty, &mut result_types)?;
                     }
                     IrInst::Let { ty, value, .. } => {
-                        collect_result_type(ty, &mut has_int, &mut has_bool, &mut has_str)?;
-                        collect_result_type(&value.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                        collect_result_type(ty, &mut result_types)?;
+                        collect_result_type(&value.ty, &mut result_types)?;
                     }
                     IrInst::Store { value, .. }
                     | IrInst::Print(value)
                     | IrInst::Expr(value)
                     | IrInst::Fail(value)
                     | IrInst::Panic(value) => {
-                        collect_result_type(&value.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                        collect_result_type(&value.ty, &mut result_types)?;
                     }
                     IrInst::BeginTry { .. }
                     | IrInst::EndTry
@@ -775,13 +993,13 @@ fn emit_result_abi(out: &mut String, program: &IrProgram) -> KuResult<()> {
                 | IrTerminator::JumpErr { result, .. }
                 | IrTerminator::PropagateErr(result)
                 | IrTerminator::Return(Some(result)) => {
-                    collect_result_type(&result.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                    collect_result_type(&result.ty, &mut result_types)?;
                 }
                 IrTerminator::Branch { condition, .. } => {
-                    collect_result_type(&condition.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                    collect_result_type(&condition.ty, &mut result_types)?;
                 }
                 IrTerminator::ForEach { iterable, .. } => {
-                    collect_result_type(&iterable.ty, &mut has_int, &mut has_bool, &mut has_str)?;
+                    collect_result_type(&iterable.ty, &mut result_types)?;
                 }
                 IrTerminator::Next
                 | IrTerminator::Jump(_)
@@ -790,57 +1008,63 @@ fn emit_result_abi(out: &mut String, program: &IrProgram) -> KuResult<()> {
             }
         }
     }
-    if has_int {
-        out.push_str(
-            "typedef struct { bool ok; int64_t value; const char* error; } KuResultInt;\n",
-        );
+    for inner in &result_types {
+        let result_type = c_result_type(inner)?;
+        let suffix = c_type_suffix(inner)?;
+        let value_type = c_type(inner)?;
+        out.push_str(&format!(
+            "typedef struct {{ bool ok; {value_type} value; KuError error; }} {result_type};\n"
+        ));
+        out.push_str(&format!(
+            "static {result_type} ku_result_move_{suffix}({result_type}* result) {{ {result_type} value = *result; *result = ({result_type}){{0}}; return value; }}\n"
+        ));
+        out.push_str(&format!(
+            "static {value_type} ku_result_take_{suffix}({result_type}* result) {{ {value_type} value = result->value; result->value = {}; result->ok = false; return value; }}\n",
+            c_zero_value(inner)?
+        ));
+        out.push_str(&format!(
+            "static {result_type} ku_result_clone_{suffix}({result_type} result) {{ if (result.ok) result.value = {}; return result; }}\n",
+            c_clone_value(inner, "result.value")?
+        ));
+        out.push_str(&format!(
+            "static void ku_result_drop_{suffix}({result_type}* result) {{ if (!result) return; if (result->ok) {{ {} }} *result = ({result_type}){{0}}; }}\n",
+            c_drop_value(inner, "result->value")?
+        ));
     }
-    if has_bool {
-        out.push_str("typedef struct { bool ok; bool value; const char* error; } KuResultBool;\n");
-    }
-    if has_str {
-        out.push_str(
-            "typedef struct { bool ok; const char* value; const char* error; } KuResultStr;\n",
-        );
-    }
-    if has_int || has_bool || has_str {
+    if !result_types.is_empty() {
         out.push('\n');
     }
     Ok(())
 }
 
-fn collect_result_type(
-    ty: &IrType,
-    has_int: &mut bool,
-    has_bool: &mut bool,
-    has_str: &mut bool,
-) -> KuResult<()> {
+fn collect_result_type(ty: &IrType, result_types: &mut Vec<IrType>) -> KuResult<()> {
     match ty {
-        IrType::Result(inner) => match inner.as_ref() {
-            IrType::Int => *has_int = true,
-            IrType::Bool => *has_bool = true,
-            IrType::Str => *has_str = true,
-            _ => {
-                return Err(unsupported(format!(
-                    "native C prototype does not support Result<{inner}>"
-                )))
+        IrType::Result(inner) => {
+            match inner.as_ref() {
+                IrType::Int
+                | IrType::Bool
+                | IrType::Str
+                | IrType::Null
+                | IrType::Array(_)
+                | IrType::Named(_) => {}
+                _ => {
+                    return Err(unsupported(format!(
+                        "native C prototype does not support Result<{inner}>"
+                    )))
+                }
             }
-        },
-        IrType::Array(inner) => collect_result_type(inner, has_int, has_bool, has_str)?,
+            if !result_types.contains(inner.as_ref()) {
+                result_types.push(*inner.clone());
+            }
+        }
+        IrType::Array(inner) => collect_result_type(inner, result_types)?,
         _ => {}
     }
     Ok(())
 }
 
 fn c_result_type(inner: &IrType) -> KuResult<String> {
-    match inner {
-        IrType::Int => Ok("KuResultInt".to_string()),
-        IrType::Bool => Ok("KuResultBool".to_string()),
-        IrType::Str => Ok("KuResultStr".to_string()),
-        _ => Err(unsupported(format!(
-            "native C prototype does not support Result<{inner}>"
-        ))),
-    }
+    Ok(format!("KuResult_{}", c_type_suffix(inner)?))
 }
 
 fn emit_main_wrapper(out: &mut String, program: &IrProgram) -> KuResult<()> {
@@ -870,10 +1094,12 @@ fn emit_main_wrapper(out: &mut String, program: &IrProgram) -> KuResult<()> {
         IrType::Str => {
             out.push_str("  const char* result = ku_main();\n  if (result) printf(\"%s\\n\", result);\n  return 0;\n");
         }
-        IrType::Result(_) => {
+        IrType::Result(inner) => {
             out.push_str(&format!(
-                "  {} result = ku_main();\n  if (!result.ok) {{ fprintf(stderr, \"%s\\n\", result.error ? result.error : \"error\"); return 1; }}\n  return 0;\n",
-                c_type(&function.return_type)?
+                "  {} result = ku_main();\n  if (!result.ok) {{ fprintf(stderr, \"%s\\n\", result.error.message ? result.error.message : \"error\"); ku_result_drop_{}(&result); return 1; }}\n  ku_result_drop_{}(&result);\n  return 0;\n",
+                c_type(&function.return_type)?,
+                c_type_suffix(inner)?,
+                c_type_suffix(inner)?
             ));
         }
         other => {
@@ -948,9 +1174,9 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
                 .first()
                 .ok_or_else(|| unsupported("ok requires one argument"))?;
             Ok(format!(
-                "({}){{ true, {}, (const char*)0 }}",
+                "({}){{ true, {}, (KuError){{0}} }}",
                 c_type(ty)?,
-                c_expr(value)?
+                c_value_expr(value)?
             ))
         }
         ("err", IrType::Result(inner)) => {
@@ -961,7 +1187,7 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
                 "({}){{ false, {}, {} }}",
                 c_type(ty)?,
                 c_zero_value(inner)?,
-                c_expr(value)?
+                c_error_expr(value)?
             ))
         }
         _ => Err(unsupported(format!(
@@ -970,11 +1196,14 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
     }
 }
 
-fn c_zero_value(ty: &IrType) -> KuResult<&'static str> {
+fn c_zero_value(ty: &IrType) -> KuResult<String> {
     match ty {
-        IrType::Int => Ok("0"),
-        IrType::Bool => Ok("false"),
-        IrType::Str => Ok("(const char*)0"),
+        IrType::Int | IrType::Null => Ok("0".to_string()),
+        IrType::Bool => Ok("false".to_string()),
+        IrType::Str => Ok("(const char*)0".to_string()),
+        IrType::Array(_) | IrType::Named(_) | IrType::Result(_) => {
+            Ok(format!("({}){{0}}", c_type(ty)?))
+        }
         _ => Err(unsupported(format!(
             "native C prototype does not support zero value for {ty}"
         ))),
@@ -987,10 +1216,12 @@ fn is_native_zero(expr: &IrExpr) -> bool {
 
 fn c_zero_initializer(ty: &IrType) -> KuResult<String> {
     match ty {
-        IrType::Int => Ok("0".to_string()),
+        IrType::Int | IrType::Null => Ok("0".to_string()),
         IrType::Bool => Ok("false".to_string()),
         IrType::Str => Ok("(const char*)0".to_string()),
-        IrType::Array(_) | IrType::Named(_) => Ok(format!("({}){{0}}", c_type(ty)?)),
+        IrType::Array(_) | IrType::Named(_) | IrType::Result(_) => {
+            Ok(format!("({}){{0}}", c_type(ty)?))
+        }
         _ => Err(unsupported(format!(
             "native C prototype does not support zero initialization for {ty}"
         ))),
@@ -1012,6 +1243,38 @@ fn c_binary(op: BinaryOp) -> &'static str {
         BinaryOp::GreaterEqual => ">=",
         BinaryOp::And => "&&",
         BinaryOp::Or => "||",
+    }
+}
+
+fn c_clone_value(ty: &IrType, expression: &str) -> KuResult<String> {
+    match ty {
+        IrType::Array(element) => Ok(format!(
+            "ku_array_clone_{}({expression})",
+            c_type_suffix(element)?
+        )),
+        IrType::Named(name) if name != "__ku_error_type" => {
+            Ok(format!("{}({expression})", c_named_clone_function(name)))
+        }
+        IrType::Int | IrType::Bool | IrType::Str | IrType::Null => Ok(expression.to_string()),
+        _ => Err(unsupported(format!(
+            "native C clone is not implemented for {ty}"
+        ))),
+    }
+}
+
+fn c_drop_value(ty: &IrType, expression: &str) -> KuResult<String> {
+    match ty {
+        IrType::Array(element) => Ok(format!(
+            "ku_array_drop_{}(&{expression});",
+            c_type_suffix(element)?
+        )),
+        IrType::Named(name) if name != "__ku_error_type" => {
+            Ok(format!("{}(&{expression});", c_named_drop_function(name)))
+        }
+        IrType::Int | IrType::Bool | IrType::Str | IrType::Null => Ok(String::new()),
+        _ => Err(unsupported(format!(
+            "native C drop is not implemented for {ty}"
+        ))),
     }
 }
 
@@ -1065,13 +1328,12 @@ fn c_type_suffix(ty: &IrType) -> KuResult<String> {
         IrType::Int => Ok("int".to_string()),
         IrType::Bool => Ok("bool".to_string()),
         IrType::Str => Ok("str".to_string()),
+        IrType::Null => Ok("null".to_string()),
         IrType::Named(name) => Ok(match enum_type_name(name) {
             Some(name) => format!("enum_{}", c_ident(name)),
             None => format!("struct_{}", c_ident(name)),
         }),
-        IrType::Array(_) => Err(unsupported(
-            "native C prototype does not support nested arrays yet",
-        )),
+        IrType::Array(inner) => Ok(format!("array_{}", c_type_suffix(inner)?)),
         _ => Err(unsupported(format!(
             "native C prototype does not support arrays of {ty}"
         ))),
@@ -1084,4 +1346,150 @@ fn enum_type_name(name: &str) -> Option<&str> {
 
 fn unsupported(message: impl Into<String>) -> KuError {
     KuError::runtime(message.into(), Span::default())
+}
+
+fn is_c_owned_type(ty: &IrType) -> bool {
+    matches!(
+        ty,
+        IrType::Str | IrType::Array(_) | IrType::Result(_) | IrType::Named(_)
+    )
+}
+
+fn collect_owned_locals(function: &IrFunction) -> Vec<OwnedLocal> {
+    let mut locals = Vec::new();
+    for param in &function.params {
+        if is_c_owned_type(&param.ty) {
+            locals.push(OwnedLocal {
+                source_name: param.name.clone(),
+                name: c_ident(&param.name),
+                ty: param.ty.clone(),
+                is_param: true,
+            });
+        }
+    }
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            match instruction {
+                IrInst::Temp { id, ty, .. } if is_c_owned_type(ty) => locals.push(OwnedLocal {
+                    source_name: format!("%t{}", id.0),
+                    name: format!("t{}", id.0),
+                    ty: ty.clone(),
+                    is_param: false,
+                }),
+                IrInst::BindOk { id, ty, .. } if is_c_owned_type(ty) => locals.push(OwnedLocal {
+                    source_name: format!("%t{}", id.0),
+                    name: format!("t{}", id.0),
+                    ty: ty.clone(),
+                    is_param: false,
+                }),
+                IrInst::Let { name, ty, .. }
+                    if is_c_owned_type(ty)
+                        && !locals.iter().any(|local| local.source_name == *name) =>
+                {
+                    locals.push(OwnedLocal {
+                        source_name: name.clone(),
+                        name: c_ident(name),
+                        ty: ty.clone(),
+                        is_param: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    locals
+}
+
+fn emit_owned_cleanup(out: &mut String, locals: &[OwnedLocal]) -> KuResult<()> {
+    for local in locals.iter().rev() {
+        emit_drop_expr(out, &local.ty, &local.name)?;
+    }
+    Ok(())
+}
+
+fn emit_drop_expr(out: &mut String, ty: &IrType, expression: &str) -> KuResult<()> {
+    match ty {
+        IrType::Str => Ok(()),
+        IrType::Array(element) => {
+            out.push_str(&format!(
+                "  ku_array_drop_{}(&{});\n",
+                c_type_suffix(element)?,
+                expression
+            ));
+            Ok(())
+        }
+        IrType::Named(name) => {
+            out.push_str(&format!(
+                "  {}(&{});\n",
+                c_named_drop_function(name),
+                expression
+            ));
+            Ok(())
+        }
+        IrType::Result(inner) => {
+            out.push_str(&format!(
+                "  ku_result_drop_{}(&{});\n",
+                c_type_suffix(inner)?,
+                expression
+            ));
+            Ok(())
+        }
+        _ => Err(unsupported(format!(
+            "native C drop is not implemented for {ty}"
+        ))),
+    }
+}
+
+fn emit_named_ownership_helpers(out: &mut String, program: &IrProgram) -> KuResult<()> {
+    for layout in &program.layouts.structs {
+        emit_named_ownership_helper(out, &layout.name, false)?;
+    }
+    for layout in &program.layouts.enums {
+        emit_named_ownership_helper(out, &format!("__ku_enum_type:{}", layout.name), true)?;
+    }
+    if !program.layouts.structs.is_empty() || !program.layouts.enums.is_empty() {
+        out.push('\n');
+    }
+    Ok(())
+}
+
+fn emit_named_ownership_helper(out: &mut String, name: &str, is_enum: bool) -> KuResult<()> {
+    let ty = IrType::Named(name.to_string());
+    let c_ty = c_type(&ty)?;
+    let move_fn = c_named_move_function(name);
+    let clone_fn = c_named_clone_function(name);
+    let drop_fn = c_named_drop_function(name);
+    if is_enum {
+        out.push_str(&format!(
+            "static {c_ty} {move_fn}({c_ty}* value) {{ {c_ty} result = *value; memset(value, 0, sizeof(*value)); value->tag = -1; return result; }}\n\
+             static {c_ty} {clone_fn}({c_ty} value) {{ return value; }}\n\
+             static void {drop_fn}({c_ty}* value) {{ if (value) {{ memset(value, 0, sizeof(*value)); value->tag = -1; }} }}\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "static {c_ty} {move_fn}({c_ty}* value) {{ {c_ty} result = *value; *value = ({c_ty}){{0}}; return result; }}\n\
+             static {c_ty} {clone_fn}({c_ty} value) {{ return value; }}\n\
+             static void {drop_fn}({c_ty}* value) {{ if (value) *value = ({c_ty}){{0}}; }}\n"
+        ));
+    }
+    Ok(())
+}
+
+fn c_named_suffix(name: &str) -> String {
+    match enum_type_name(name) {
+        Some(name) => format!("enum_{}", c_ident(name)),
+        None => format!("struct_{}", c_ident(name)),
+    }
+}
+
+fn c_named_move_function(name: &str) -> String {
+    format!("ku_move_{}", c_named_suffix(name))
+}
+
+fn c_named_clone_function(name: &str) -> String {
+    format!("ku_clone_{}", c_named_suffix(name))
+}
+
+fn c_named_drop_function(name: &str) -> String {
+    format!("ku_drop_{}", c_named_suffix(name))
 }

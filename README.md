@@ -198,7 +198,7 @@ package/
 
 `ku build` 当前生成解释器打包型可执行文件。
 
-`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流，以及基础 Result 的 `ok` / `err` / `?` / 错误传播。native C 的错误槽和内存所有权仍是原型 ABI；闭包、try/catch/finally 和 async native lowering 仍会明确报不支持。
+`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally` 和 return-through-finally。array/named/Result 已按默认 move、显式 `clone()`、自动 drop 生成所有权代码；闭包、动态 object、正式 owned string 和 async native lowering 仍会明确报不支持。
 
 已完成到 0.0.12 的关键前置：
 
@@ -215,8 +215,10 @@ package/
 可恢复错误统一为 Error 对象：{ domain, code, message }，catch (err) 后使用 err.message / err.domain / err.code。
 运行时闭包使用精确 capture map，不再把整个 Env 存进函数值。
 IR 已有 ResultBranch / BindOk / JumpErr / PropagateErr。
-native C 后端已有基础 Result ABI 子集，但还不是完整 Error 对象 ABI。
+native C 后端已有统一 Error 对象 ABI、复杂 Result payload 和 try/catch/finally。
 package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
+registry 执行层已有 HTTPS-only 下载、SHA-256、内容寻址 cache 和有界安装锁；签名/归档决策前 CLI 保持 fail-closed。
+async runtime 已有 blocking shutdown drain、累计指标和百万并发需求压力测试。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
 match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。
 std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.service/http.server 配置与响应 helper。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes，路径参数使用 `{id}`；handler 固定 `(req, res)`，返回 `{ status, headers, body }`，并禁止修改外层捕获变量；bind/listen 只接收 address，配置来自 service/server 对象，会先真实绑定端口并编译运行时路由表，listen/run 会阻塞处理基础 HTTP 请求，listener.close 可显式关闭未运行的 listener。fs 需要 `import "std.fs"` 后使用，并提供 read/write 与 try_read/try_write。std.config 需要 `import "std.config"` 后使用，并提供 env/env_file/yaml 第一版配置读取。VS Code formatter 已支持 4 空格缩进、空行压缩、运算符/逗号空格和 `} else/catch/finally` 合并。

@@ -344,17 +344,17 @@ fn main(): int! {
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate c");
 
-    assert!(c.contains("KuResultInt ku_main("));
+    assert!(c.contains("KuResult_int ku_main("));
     assert!(c.contains("int main(void)"));
-    assert!(c.contains("typedef struct { bool ok; int64_t value; const char* error; } KuResultInt"));
+    assert!(c.contains("typedef struct { bool ok; int64_t value; KuError error; } KuResult_int"));
     assert!(c.contains("if (t0.ok) goto block"));
-    assert!(c.contains(" = t0.value;"));
+    assert!(c.contains("ku_result_take_int(&t0)"));
     assert!(c.contains("int64_t item = "));
-    assert!(c.contains("return t"));
+    assert!(c.contains("ku_result_move_int(&t"));
 }
 
 #[test]
-fn native_c_backend_still_rejects_complex_result_payloads() {
+fn native_c_backend_lowers_owned_array_result_payloads() {
     let tokens = Lexer::new(
         r#"
 fn values(): [int]! {
@@ -371,13 +371,56 @@ fn main() {
     let program = Parser::new(tokens).parse().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
-    let err = backend::c::generate_c_source(&ir)
-        .expect_err("array Result payload is outside native C prototype")
-        .to_string();
-    assert!(
-        err.contains("native C prototype"),
-        "unexpected error: {err}"
-    );
+    let c = backend::c::generate_c_source(&ir).expect("generate array Result C");
+    assert!(c.contains(
+        "typedef struct { bool ok; KuArray_int value; KuError error; } KuResult_array_int"
+    ));
+    assert!(c.contains("ku_result_move_array_int"));
+    assert!(c.contains("ku_result_take_array_int"));
+    assert!(c.contains("ku_result_drop_array_int"));
+    assert!(c.contains("ku_array_move_int"));
+}
+
+#[test]
+fn native_try_finally_routes_return_and_error_through_cleanup_blocks() {
+    let tokens = Lexer::new(
+        r#"
+fn value(flag:bool): int! {
+    try {
+        if (flag) {
+            return ok(7)
+        }
+        fail "bad"
+    } catch (err) {
+        print(err.message)
+        return ok(8)
+    } finally {
+        print("cleanup")
+    }
+    return ok(9)
+}
+
+fn main(): int! {
+    return value(true)
+}
+"#,
+    )
+    .tokenize()
+    .expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let ir = ir::lower_program(&program).expect("lower");
+    let text = ir.to_string();
+    assert!(text.contains("finally_return"), "unexpected IR:\n{text}");
+    assert!(text.contains("__ku_return_"), "unexpected IR:\n{text}");
+    assert!(text.contains("__ku_error_"), "unexpected IR:\n{text}");
+
+    let c = backend::c::generate_c_source(&ir).expect("generate try/finally C");
+    assert!(c.contains("typedef struct KuError"));
+    assert!(c.contains("KuError err = "));
+    assert!(c.contains(".error;"));
+    assert!(c.contains("goto block"));
+    assert!(c.contains("ku_result_move_int"));
 }
 
 #[test]
@@ -392,7 +435,7 @@ fn replace(values:[int]): int {
 fn main() {
     values = [1, 2, 3]
     values[1] = 7
-    copy = values
+    copy = values.clone()
     copy[0] = 9
     if (values[1] != 7) {
         panic("bad array write")
@@ -400,7 +443,7 @@ fn main() {
     if (values[0] != 1) {
         panic("array assignment must copy")
     }
-    changed = replace(values)
+    changed = replace(values.clone())
     if (changed != 8 || values[0] != 1) {
         panic("array argument must copy")
     }
@@ -418,11 +461,186 @@ fn main() {
     assert!(c.contains("typedef struct { size_t len; int64_t* data; } KuArray_int"));
     assert!(c.contains("ku_array_make_int(3"));
     assert!(c.contains("ku_array_clone_int(values)"));
-    assert!(c.contains("replace(ku_array_clone_int(values))"));
+    assert!(c.contains("replace(ku_array_move_int(&t"));
+    assert!(c.contains("ku_array_drop_int(&values)"));
+    assert!(c.contains("ku_array_move_int(&"));
     assert!(c.contains("index < 0 || (uint64_t)index >= array.len"));
     assert!(c.contains("index < 0 || (uint64_t)index >= array->len"));
     assert!(c.contains("ku_array_get_int("));
     assert!(c.contains("*ku_array_at_int("));
+}
+
+#[test]
+fn checker_enforces_owned_move_and_explicit_clone() {
+    let moved = check_err(
+        r#"
+fn take(values:[int]): null {
+    return null
+}
+
+fn main() {
+    values = [1, 2]
+    take(values)
+    print(values[0])
+}
+"#,
+    );
+    assert!(
+        moved.contains("use of moved value 'values'"),
+        "unexpected move diagnostic: {moved}"
+    );
+
+    let branch = check_err(
+        r#"
+fn take(values:[int]): null {
+    return null
+}
+
+fn main() {
+    values = [1, 2]
+    if (true) {
+        take(values)
+    }
+    print(values[0])
+}
+"#,
+    );
+    assert!(
+        branch.contains("use of moved value 'values'"),
+        "branch move must conservatively merge: {branch}"
+    );
+
+    let cloned = r#"
+fn take(values:[int]): null {
+    return null
+}
+
+fn main() {
+    values = [1, 2]
+    take(values.clone())
+    print(values[0])
+}
+"#;
+    let tokens = Lexer::new(cloned).tokenize().expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new()
+        .check(&program)
+        .expect("explicit clone should check");
+
+    let loop_move = check_err(
+        r#"
+fn take(values:[int]): null {
+    return null
+}
+
+fn main() {
+    values = [1, 2]
+    while (true) {
+        take(values)
+        continue
+    }
+}
+"#,
+    );
+    assert!(
+        loop_move.contains("later iteration would reuse a moved value"),
+        "loop-carried move must be rejected: {loop_move}"
+    );
+
+    let break_move = r#"
+fn take(values:[int]): null {
+    return null
+}
+
+fn main() {
+    values = [1, 2]
+    while (true) {
+        take(values)
+        break
+    }
+}
+"#;
+    let tokens = Lexer::new(break_move).tokenize().expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new()
+        .check(&program)
+        .expect("a move followed by unconditional break has no loop backedge");
+
+    let repeated_question = check_err(
+        r#"
+fn values(): [int]! {
+    return ok([1])
+}
+
+fn main(): null! {
+    result = values()
+    first = result?
+    second = result?
+    print(first[0] + second[0])
+    return ok(null)
+}
+"#,
+    );
+    assert!(
+        repeated_question.contains("use of moved value 'result'"),
+        "Result '?' must consume an owned Result once: {repeated_question}"
+    );
+
+    let match_move = check_err(
+        r#"
+fn main() {
+    values = [1]
+    selected = match true {
+        true => values
+        _ => [2]
+    }
+    print(selected[0])
+    print(values[0])
+}
+"#,
+    );
+    assert!(
+        match_move.contains("use of moved value 'values'"),
+        "match result arms must merge owned moves: {match_move}"
+    );
+}
+
+#[test]
+fn native_owned_assignment_swap_nested_clone_and_cross_result_error_are_safe() {
+    let source = r#"
+fn load(): [int]! {
+    fail "bad"
+}
+
+fn convert(): null! {
+    load()?
+    return ok(null)
+}
+
+fn main(): null! {
+    left = [1]
+    right = [2]
+    left, right = right, left
+    left = left
+    nested = [[1], [2]]
+    copy = nested.clone()
+    print(left[0] + right[0] + copy[0][0])
+    return convert()
+}
+"#;
+    let tokens = Lexer::new(source).tokenize().expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let ir = ir::lower_program(&program).expect("lower");
+    let c = backend::c::generate_c_source(&ir).expect("generate c");
+
+    assert!(c.contains("{ KuArray_int __ku_store = ku_array_move_int(&left);"));
+    assert!(c.contains("ku_array_clone_array_int"));
+    assert!(c.contains("ku_array_clone_int(array.data[index])"));
+    assert!(c.contains("ku_array_drop_int(&array->data[index])"));
+    assert!(c.contains("return (KuResult_null){ false, 0, __ku_error };"));
+    assert!(!c.contains("KuResult_null __ku_error_return = ku_result_move_array_int"));
+    assert!(c.contains("ku_result_drop_null(&result)"));
 }
 
 #[test]
@@ -1164,8 +1382,9 @@ version = "0.1.0"
 source = "registry"
 url = "https://registry.example/ku/math/0.1.0.tar.gz"
 checksum = "{checksum}"
-cache_key = "math-0.1.0-a"
-"#
+cache_key = "math-0.1.0-sha256-{}"
+"#,
+            "a".repeat(64)
         ),
         Default::default(),
     )
@@ -1321,9 +1540,14 @@ fn registry_download_plan_is_offline_bounded_and_cache_aware() {
     .expect("reuse plan");
     assert_eq!(reuse.action, package::RegistryCacheAction::ReuseVerified);
     assert_eq!(reuse.policy.max_attempts, 3);
+    assert!(reuse.target_dir.ends_with(
+        PathBuf::from("packages")
+            .join("math")
+            .join(format!("math-1.2.3-sha256-{}", "b".repeat(64)))
+    ));
     assert!(reuse
-        .target_dir
-        .ends_with(PathBuf::from("packages").join("math").join("1.2.3")));
+        .temporary_dir
+        .starts_with(cache.join(".registry-downloads")));
 
     let refresh =
         package::plan_registry_download(&cache, &manifest, None, policy, Default::default())

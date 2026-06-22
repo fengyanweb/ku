@@ -40,6 +40,7 @@ enum Type {
 struct VarType {
     ty: Type,
     mutable: bool,
+    moved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -413,7 +414,7 @@ impl Checker {
                 value,
                 span,
             } => {
-                let actual = self.check_expr(value)?;
+                let actual = self.consume_expr(value)?;
                 let expected = ty
                     .as_ref()
                     .map(|ty| self.resolve_type_name(ty, *span))
@@ -430,12 +431,12 @@ impl Checker {
                 )
             }
             Stmt::Assign { name, value, span } => {
-                let actual = self.check_expr(value)?;
+                let actual = self.consume_expr(value)?;
                 if !self.contains(name) {
                     return self.define(name.clone(), actual, !is_constant_name(name), *span);
                 }
                 self.reject_readonly_capture_assignment(name, *span)?;
-                let binding = self.get(name, *span)?;
+                let binding = self.get_allow_moved(name, *span)?;
                 if !binding.mutable {
                     return Err(KuError::runtime(
                         format!("cannot assign to immutable variable '{name}'"),
@@ -445,6 +446,7 @@ impl Checker {
                 if !type_matches(&binding.ty, &actual) {
                     return Err(type_error(*span, &binding.ty, &actual));
                 }
+                self.mark_initialized(name);
                 Ok(())
             }
             Stmt::AssignTarget {
@@ -456,7 +458,7 @@ impl Checker {
                     self.reject_readonly_capture_assignment(name, *span)?;
                 }
                 let expected = self.check_assign_target(target, *span)?;
-                let actual = self.check_expr(value)?;
+                let actual = self.consume_expr(value)?;
                 if !type_matches(&expected, &actual) {
                     return Err(type_error(*span, &expected, &actual));
                 }
@@ -479,7 +481,7 @@ impl Checker {
                 }
                 let actuals = values
                     .iter()
-                    .map(|value| self.check_expr(value))
+                    .map(|value| self.consume_expr(value))
                     .collect::<KuResult<Vec<_>>>()?;
                 for (name, actual) in names.iter().zip(actuals) {
                     let Some(name) = name else {
@@ -490,7 +492,7 @@ impl Checker {
                         continue;
                     }
                     self.reject_readonly_capture_assignment(name, *span)?;
-                    let binding = self.get(name, *span)?;
+                    let binding = self.get_allow_moved(name, *span)?;
                     if !binding.mutable {
                         return Err(KuError::runtime(
                             format!("cannot assign to immutable variable '{name}'"),
@@ -500,6 +502,7 @@ impl Checker {
                     if !type_matches(&binding.ty, &actual) {
                         return Err(type_error(*span, &binding.ty, &actual));
                     }
+                    self.mark_initialized(name);
                 }
                 Ok(())
             }
@@ -510,8 +513,14 @@ impl Checker {
                 span,
             } => {
                 self.expect_condition(condition, *span)?;
+                let before = self.scopes.clone();
                 self.check_block(then_branch)?;
-                self.check_block(else_branch)
+                let then_scopes = self.scopes.clone();
+                self.scopes = before.clone();
+                self.check_block(else_branch)?;
+                let else_scopes = self.scopes.clone();
+                self.scopes = merge_moved_scopes(before, then_scopes, else_scopes);
+                Ok(())
             }
             Stmt::While {
                 condition,
@@ -519,10 +528,15 @@ impl Checker {
                 span,
             } => {
                 self.expect_condition(condition, *span)?;
+                let before = self.scopes.clone();
                 self.loop_depth += 1;
                 let result = self.check_block(body);
                 self.loop_depth -= 1;
-                result
+                result?;
+                if loop_body_has_backedge(body) {
+                    self.reject_loop_carried_moves(&before, *span)?;
+                }
+                Ok(())
             }
             Stmt::For {
                 name,
@@ -540,6 +554,7 @@ impl Checker {
                         *span,
                     ));
                 };
+                let before = self.scopes.clone();
                 self.push_scope();
                 self.loop_depth += 1;
                 let result = (|| -> KuResult<()> {
@@ -551,7 +566,11 @@ impl Checker {
                 })();
                 self.loop_depth -= 1;
                 self.pop_scope();
-                result
+                result?;
+                if loop_body_has_backedge(body) {
+                    self.reject_loop_carried_moves(&before, *span)?;
+                }
+                Ok(())
             }
             Stmt::Break { span } => {
                 if self.loop_depth == 0 {
@@ -590,7 +609,7 @@ impl Checker {
                 self.check_block(finally_body)
             }
             Stmt::Fail { value, span } => {
-                let actual = self.check_expr(value)?;
+                let actual = self.consume_expr(value)?;
                 if actual != Type::String && !matches!(actual, Type::Object(_)) {
                     return Err(type_error(*span, &error_type(), &actual));
                 }
@@ -612,7 +631,7 @@ impl Checker {
             }
             Stmt::Return { value, span } => {
                 let actual = match value {
-                    Some(value) => self.check_expr(value)?,
+                    Some(value) => self.consume_expr(value)?,
                     None => Type::Void,
                 };
                 if !type_matches(&self.current_return, &actual) {
@@ -635,6 +654,9 @@ impl Checker {
         self.push_scope();
         for stmt in body {
             self.check_stmt(stmt)?;
+            if stmt_stops_fallthrough(stmt) {
+                break;
+            }
         }
         self.pop_scope();
         Ok(())
@@ -707,7 +729,7 @@ impl Checker {
                             }
                             let mut generic_bindings = HashMap::new();
                             for (arg, expected) in args.iter().zip(function.params.iter()) {
-                                let actual = self.check_expr(arg)?;
+                                let actual = self.consume_expr(arg)?;
                                 if !bind_generic_type(expected, &actual, &mut generic_bindings)
                                     || !type_matches(expected, &actual)
                                 {
@@ -809,7 +831,7 @@ impl Checker {
                 ExprKind::Array(values) => {
                     let mut element_type = Type::Unknown;
                     for value in values {
-                        let actual = self.check_expr(value)?;
+                        let actual = self.consume_expr(value)?;
                         if element_type == Type::Unknown {
                             element_type = actual;
                         } else if !type_matches(&element_type, &actual) {
@@ -980,7 +1002,7 @@ impl Checker {
                                 value.span,
                             ));
                         };
-                        let actual = self.check_expr(value)?;
+                        let actual = self.consume_expr(value)?;
                         if !type_matches(expected, &actual) {
                             return Err(type_error(value.span, expected, &actual));
                         }
@@ -1005,7 +1027,7 @@ impl Checker {
                                 value.span,
                             ));
                         }
-                        object_fields.insert(field_name.clone(), self.check_expr(value)?);
+                        object_fields.insert(field_name.clone(), self.consume_expr(value)?);
                     }
                     Ok(Type::Object(object_fields))
                 }
@@ -1051,7 +1073,7 @@ impl Checker {
                             return Ok(nullable_type(value_type));
                         }
                     }
-                    match self.check_expr(inner)? {
+                    match self.consume_expr(inner)? {
                         Type::Result(value) => {
                             if !matches!(self.current_return, Type::Result(_))
                                 && self.recoverable_depth == 0
@@ -1530,7 +1552,7 @@ impl Checker {
             ));
         }
         for (arg, expected) in args.iter().zip(expected_fields.iter()) {
-            let actual = self.check_expr(arg)?;
+            let actual = self.consume_expr(arg)?;
             if !type_matches(expected, &actual) {
                 return Err(type_error(arg.span, expected, &actual));
             }
@@ -1543,11 +1565,14 @@ impl Checker {
             return Err(KuError::runtime("match requires at least one arm", span));
         }
         let value_type = self.check_expr(value)?;
+        let before_arms = self.scopes.clone();
+        let mut arm_scopes = Vec::with_capacity(arms.len());
         let mut result_type = Type::Unknown;
         let mut saw_unguarded_catch_all = false;
         let mut covered_full_variants = HashSet::new();
         let mut covered_patterns = HashSet::new();
         for arm in arms {
+            self.scopes = before_arms.clone();
             if saw_unguarded_catch_all {
                 return Err(KuError::runtime(
                     "match arm after catch-all pattern is unreachable",
@@ -1597,15 +1622,17 @@ impl Checker {
                     return Err(type_error(guard.span, &Type::Bool, &guard_type));
                 }
             }
-            let actual = self.check_expr(&arm.value);
+            let actual = self.consume_expr(&arm.value);
             self.pop_scope();
             let actual = actual?;
+            arm_scopes.push(self.scopes.clone());
             if result_type == Type::Unknown {
                 result_type = actual;
             } else if !type_matches(&result_type, &actual) {
                 return Err(type_error(arm.value.span, &result_type, &actual));
             }
         }
+        self.scopes = merge_moved_scope_paths(before_arms, &arm_scopes);
         if !saw_unguarded_catch_all {
             if let Type::Enum(enum_name) = &value_type {
                 let Some(enum_type) = self.enums.get(enum_name) else {
@@ -1730,6 +1757,19 @@ impl Checker {
             return Ok(None);
         };
         let target_type = self.check_expr(target)?;
+        if name == "clone" {
+            expect_arg_count("clone", args.len(), 0, span)?;
+            if self.is_owned_type(&target_type) {
+                return Ok(Some(target_type));
+            }
+            return Err(KuError::runtime(
+                format!(
+                    "clone() is only available on owned values, got {}",
+                    type_name(&target_type)
+                ),
+                span,
+            ));
+        }
         if let Type::Task(value) = target_type {
             return match name.as_str() {
                 "status" => {
@@ -2019,7 +2059,7 @@ impl Checker {
         }
         let actual_arg_types = args
             .iter()
-            .map(|arg| self.check_expr(arg))
+            .map(|arg| self.consume_expr(arg))
             .collect::<KuResult<Vec<_>>>()?;
         let mut arg_types = Vec::new();
         for ((param, actual), arg) in params.iter().zip(actual_arg_types.iter()).zip(args.iter()) {
@@ -2421,7 +2461,14 @@ impl Checker {
                 span,
             ));
         }
-        scope.insert(name, VarType { ty, mutable });
+        scope.insert(
+            name,
+            VarType {
+                ty,
+                mutable,
+                moved: false,
+            },
+        );
         Ok(())
     }
 
@@ -2435,6 +2482,14 @@ impl Checker {
     fn get(&self, name: &str, span: Span) -> KuResult<VarType> {
         for scope in self.scopes.iter().rev() {
             if let Some(var) = scope.get(name) {
+                if var.moved {
+                    return Err(KuError::runtime(
+                        format!(
+                            "use of moved value '{name}'; call '{name}.clone()' before moving when an explicit copy is required"
+                        ),
+                        span,
+                    ));
+                }
                 return Ok(var.clone());
             }
         }
@@ -2442,6 +2497,108 @@ impl Checker {
             format!("undefined variable '{name}'"),
             span,
         ))
+    }
+
+    fn get_allow_moved(&self, name: &str, span: Span) -> KuResult<VarType> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(var) = scope.get(name) {
+                return Ok(var.clone());
+            }
+        }
+        Err(KuError::runtime(
+            format!("undefined variable '{name}'"),
+            span,
+        ))
+    }
+
+    fn mark_initialized(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(var) = scope.get_mut(name) {
+                var.moved = false;
+                return;
+            }
+        }
+    }
+
+    fn consume_expr(&mut self, expr: &Expr) -> KuResult<Type> {
+        let ty = self.check_expr(expr)?;
+        if !self.is_owned_type(&ty) {
+            return Ok(ty);
+        }
+        match &expr.kind {
+            ExprKind::Variable(name) => {
+                for scope in self.scopes.iter_mut().rev() {
+                    if let Some(var) = scope.get_mut(name) {
+                        var.moved = true;
+                        break;
+                    }
+                }
+            }
+            ExprKind::Field { .. } | ExprKind::Index { .. } => {
+                if enum_variant_path(expr).is_some() {
+                    return Ok(ty);
+                }
+                return Err(KuError::runtime(
+                    "cannot move an owned field or indexed element directly; assign clone() when an owned copy is required",
+                    expr.span,
+                ));
+            }
+            _ => {}
+        }
+        Ok(ty)
+    }
+
+    fn is_owned_type(&self, ty: &Type) -> bool {
+        match ty {
+            Type::String
+            | Type::Array(_)
+            | Type::Object(_)
+            | Type::StringMap
+            | Type::DynamicObject => true,
+            Type::Struct(name) => {
+                self.structs.get(name).is_some_and(|layout| {
+                    layout
+                        .fields
+                        .values()
+                        .any(|field| self.is_owned_type(field))
+                }) || self.structs.contains_key(name)
+            }
+            Type::Enum(name) => {
+                self.enums.get(name).is_some_and(|layout| {
+                    layout
+                        .variants
+                        .values()
+                        .flatten()
+                        .any(|field| self.is_owned_type(field))
+                }) || self.enums.contains_key(name)
+            }
+            Type::Result(_) | Type::Task(_) => true,
+            Type::Union(types) => types.iter().any(|ty| self.is_owned_type(ty)),
+            _ => false,
+        }
+    }
+
+    fn reject_loop_carried_moves(
+        &self,
+        before: &[HashMap<String, VarType>],
+        span: Span,
+    ) -> KuResult<()> {
+        for (before_scope, after_scope) in before.iter().zip(&self.scopes) {
+            for (name, before_var) in before_scope {
+                let Some(after_var) = after_scope.get(name) else {
+                    continue;
+                };
+                if !before_var.moved && after_var.moved && self.is_owned_type(&before_var.ty) {
+                    return Err(KuError::runtime(
+                        format!(
+                            "cannot move outer owned value '{name}' from a loop body because a later iteration would reuse a moved value; use '{name}.clone()' or reinitialize it on every path"
+                        ),
+                        span,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn reject_readonly_capture_assignment(&self, name: &str, span: Span) -> KuResult<()> {
@@ -2740,6 +2897,43 @@ fn can_template_concat(left: &Type, right: &Type) -> bool {
     )
 }
 
+fn merge_moved_scopes(
+    mut base: Vec<HashMap<String, VarType>>,
+    then_scopes: Vec<HashMap<String, VarType>>,
+    else_scopes: Vec<HashMap<String, VarType>>,
+) -> Vec<HashMap<String, VarType>> {
+    for (index, scope) in base.iter_mut().enumerate() {
+        for (name, var) in scope.iter_mut() {
+            let moved_then = then_scopes
+                .get(index)
+                .and_then(|scope| scope.get(name))
+                .is_some_and(|value| value.moved);
+            let moved_else = else_scopes
+                .get(index)
+                .and_then(|scope| scope.get(name))
+                .is_some_and(|value| value.moved);
+            var.moved = moved_then || moved_else;
+        }
+    }
+    base
+}
+
+fn merge_moved_scope_paths(
+    mut base: Vec<HashMap<String, VarType>>,
+    paths: &[Vec<HashMap<String, VarType>>],
+) -> Vec<HashMap<String, VarType>> {
+    for (index, scope) in base.iter_mut().enumerate() {
+        for (name, var) in scope.iter_mut() {
+            var.moved = paths.iter().any(|path| {
+                path.get(index)
+                    .and_then(|scope| scope.get(name))
+                    .is_some_and(|value| value.moved)
+            });
+        }
+    }
+    base
+}
+
 fn merge_return_types(left: &Type, right: &Type, span: Span) -> KuResult<Type> {
     if left == &Type::Null {
         return Ok(right.clone());
@@ -2788,6 +2982,110 @@ fn stmt_may_return(stmt: &Stmt) -> bool {
         }
         _ => false,
     }
+}
+
+fn stmt_stops_fallthrough(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Return { .. }
+        | Stmt::Fail { .. }
+        | Stmt::Panic { .. } => true,
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            !else_branch.is_empty()
+                && block_stops_fallthrough(then_branch)
+                && block_stops_fallthrough(else_branch)
+        }
+        _ => false,
+    }
+}
+
+fn block_stops_fallthrough(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_stops_fallthrough)
+}
+
+#[derive(Clone, Copy)]
+struct LoopBodyFlow {
+    fallthrough: bool,
+    continues: bool,
+}
+
+fn loop_body_has_backedge(body: &[Stmt]) -> bool {
+    let mut flow = LoopBodyFlow {
+        fallthrough: true,
+        continues: false,
+    };
+    for stmt in body {
+        if !flow.fallthrough {
+            break;
+        }
+        let next = loop_stmt_flow(stmt);
+        flow.continues |= next.continues;
+        flow.fallthrough = next.fallthrough;
+    }
+    flow.fallthrough || flow.continues
+}
+
+fn loop_stmt_flow(stmt: &Stmt) -> LoopBodyFlow {
+    match stmt {
+        Stmt::Continue { .. } => LoopBodyFlow {
+            fallthrough: false,
+            continues: true,
+        },
+        Stmt::Break { .. } | Stmt::Return { .. } | Stmt::Fail { .. } | Stmt::Panic { .. } => {
+            LoopBodyFlow {
+                fallthrough: false,
+                continues: false,
+            }
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let then_flow = loop_block_flow(then_branch);
+            let else_flow = if else_branch.is_empty() {
+                LoopBodyFlow {
+                    fallthrough: true,
+                    continues: false,
+                }
+            } else {
+                loop_block_flow(else_branch)
+            };
+            LoopBodyFlow {
+                fallthrough: then_flow.fallthrough || else_flow.fallthrough,
+                continues: then_flow.continues || else_flow.continues,
+            }
+        }
+        Stmt::While { .. } | Stmt::For { .. } => LoopBodyFlow {
+            fallthrough: true,
+            continues: false,
+        },
+        _ => LoopBodyFlow {
+            fallthrough: true,
+            continues: false,
+        },
+    }
+}
+
+fn loop_block_flow(body: &[Stmt]) -> LoopBodyFlow {
+    let mut flow = LoopBodyFlow {
+        fallthrough: true,
+        continues: false,
+    };
+    for stmt in body {
+        if !flow.fallthrough {
+            break;
+        }
+        let next = loop_stmt_flow(stmt);
+        flow.continues |= next.continues;
+        flow.fallthrough = next.fallthrough;
+    }
+    flow
 }
 
 fn stmt_span(stmt: &Stmt) -> Span {

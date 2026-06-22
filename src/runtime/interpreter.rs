@@ -238,12 +238,14 @@ impl Interpreter {
             .task_runtime
             .clone()
             .ok_or_else(|| KuError::runtime("async task runtime is not initialized", span))?;
-        let template = self.template();
         let child_runtime = runtime.clone();
-        let task = runtime.spawn(move || {
-            let mut interpreter = Interpreter::from_template(template, child_runtime);
-            interpreter.async_execution = true;
-            interpreter.call_function_direct(function, args, span, 0)
+        let task = runtime.spawn_deferred(|| {
+            let template = self.template();
+            move || {
+                let mut interpreter = Interpreter::from_template(template, child_runtime);
+                interpreter.async_execution = true;
+                interpreter.call_function_direct(function, args, span, 0)
+            }
         });
         Ok(Value::Task(task))
     }
@@ -740,6 +742,10 @@ impl Interpreter {
         let target_value = self.eval(target, env, depth)?;
         if self.pending_fail.is_some() {
             return Ok(Some(Value::Null));
+        }
+        if name == "clone" {
+            expect_runtime_arg_count("clone", args.len(), 0, span)?;
+            return Ok(Some(target_value));
         }
         if let Value::Task(task) = target_value {
             let value = match name.as_str() {

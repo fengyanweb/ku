@@ -1,250 +1,78 @@
-# Ku 待决策问题与路线草案
-
-这份文档是当前路线和待决策问题的唯一集中入口。已经确定的设计草案也放在这里，避免为了看后续计划来回翻多个文档。
-
-`Ku语言总路线图.md` 保留为历史路线图和大方向参考；当前真实能力边界继续以 README、`docs/syntax.md`、版本记录和本文档为准。
-
-## 已按选择处理
-
-- 箭头函数：与普通函数一样可以写参数类型和返回类型；函数继续保持第一公民，可保存、赋值和调用。
-- async：`async fn` 调用立即启动 task；同一函数可以启动多个 task，async main、await、blocking pool、有界 runtime、取消、等待超时和状态 API 已实现。
-- 对象索引：Ku 默认严格，`object[key]` 缺键直接报错；只有显式 `object[key]?` 才允许缺失并返回 `null`。
-- 命名空间结构体表述：统一称“命名空间限定的结构体类型/结构体字面量”，不创造新的结构体类别。
-- async / await：第一版采用“调用即启动任务”的语义，`await` 只能在 `async fn` 内使用，native C 第一版明确拒绝 async。
-- LLVM：保持文本 `.ll` 后端和清晰小子集，已按真实 IR 扩展非递归 struct 与基础/struct Result；外部 LLVM 工具只用于额外验证。
-- 远程 package / registry：先做 registry manifest 和 lockfile schema，不急着接网络下载。
-- native C：struct、带长度 array、enum tag/payload 和 match 已完成；下一阶段进入内存所有权、try/catch/finally 和闭包 ABI。
-- match guard：继续保守，guard 分支永远不计入 enum 穷尽覆盖；当前 checker 已符合。
-- HTTP service/server：保持同一种 service 对象；`http.server(config?)` 是构造别名。
-- `bind/listen` 第二参数：已删除，只允许 `bind(address)` / `listen(address)`，配置来自 `http.service(config?)` / `http.server(config?)`。
-- `compiled_router`：已接入真实请求匹配，不再每次请求扫描 `service.routes`。
-- `listener.close()?`：已实现显式关闭，重复 close / close 后 run 会返回 Result 错误。
-- 错误提示：第一批人类可读诊断已加入错误编号、note/help。
-- HTTP 资源限制：同时在线连接、active/pending 有界队列、handler timeout 和 idle timeout 已执行；超限返回 503，handler 超时返回 504。
-- JSON diagnostics：`ku check --json` 使用 JSON Lines，VS Code 已切到 JSON 优先、文本兼容。
-- LLVM：`ku llvm file.ku` 已实现文本 `.ll` 最小后端和 golden test，不要求本机安装 LLVM。
-- native C：struct、array、enum/match 第一阶段已实现，array 读写全部有界。
-- registry：manifest/lockfile、精确版本/caret resolver、冲突检测和有界下载/缓存计划已实现；实际网络 I/O 尚未接入。
-- LLVM：非递归 struct、字段读写和 `Result<int|bool|str|struct>` 已进入文本后端。
-- async：`task.status()`、`task.cancel()`、`task.await_timeout(ms)` 已实现；等待环、深度、队列和取消均有界失败。
-
-## 已定路线草案
+# Ku 待决策问题
 
-### async / await 第一版
+这份文档只保留仍需要决定的设计。已经确定并完成的内容写入 `docs/syntax.md`、`docs/package.md`、`docs/ir.md` 和版本记录，不再在这里重复堆积。
 
-已定选择：
+当前已完成但不再需要决定的主线：
 
-- 调用 `async fn` 会立即启动任务，不采用 Rust 那种“只创建 Future、不运行”的默认语义。
-- `await` 只能出现在 `async fn` 内。
-- 支持 `async fn main()`，且不能和普通 `fn main()` 同时存在。
-- 阻塞 stdlib 进入 blocking pool。
-- native C 第一版明确拒绝 async。
-
-第一版语义示例：
-
-```ku
-async fn load(): str! {
-    res = http.get("https://example.com")?
-    return ok(res.body)
-}
-```
-
-`async fn` 调用返回一个 task handle。task 内部结果保留原函数返回类型，例如 `str!` 仍然是可恢复 Result。`await task?` 的含义是先等待 task 完成，再对 Result 做 `?` 传播。
-
-`http.get`、`fs.read` 等 API 本身仍返回普通 Result；当它们在 async task 中执行时，runtime 会透明地把实际阻塞工作送入 blocking pool，因此不写 `await http.get(...)`。
-
-Checker 边界：
+- native C：默认 move、显式 `clone()`、自动 drop；array/struct/enum/Result 已有 copy/move/drop 路径和回归测试。
+- native C：统一 `KuError { domain, code, message }`，支持 `try/catch/finally`、return-through-finally、跨 payload 错误传播和复杂 Result payload。
+- registry：HTTPS-only 请求、SHA-256 流式校验、有界重试/超时/大小、唯一临时目录、内容寻址 cache、安装锁和 GC 隔离已实现。
+- async：取消、超时、状态、runtime snapshot、blocking shutdown drain 和百万并发需求压力测试已完成；native C/LLVM 继续明确拒绝 async。
+- LLVM：继续保持清晰的小子集，只按真实项目需求扩展。
 
-- `await` outside async fn 报 `E0801`。
-- `async fn main()` 和 `fn main()` 同时出现报错。
-- async 函数体内允许 `?`，但仍要遵守 Result 返回类型规则。
-- `ku build --native` 遇到 async/await 继续明确拒绝。
-
-Runtime 边界：
+## 决策 1：native 闭包 ABI 与捕获语义
 
-- `max_tasks = 1024`，task 队列有界。
-- blocking worker 数为 `min(32, max(4, CPU 核心数))`。
-- `max_blocking_queue = 1024`。
-- 每个 task 有明确状态：pending / running / waiting / cancelling / completed / failed / cancelled / panicked。
-- blocking stdlib 调用必须通过 blocking pool，避免阻塞 async executor。
-- 超过 task 上限返回 `task/too_many_tasks`；队列满返回 `task/queue_full`，都不 panic、不无限重试。
-- async task 可读取但不能修改外层捕获，checker 和 runtime 双重限制。
-- self-await、await cycle 和等待深度都有界失败，避免永久等待。
-- `task.await_timeout(ms)` 只限制本次等待，超时返回 `task/timeout`，不隐式取消目标任务。
-- `task.cancel()` 是协作式取消。排队任务不再执行，运行中的 Ku 代码在下一安全检查点退出。
-- blocking pool 中已经开始的系统调用不能强杀；取消停止等待者，但外部副作用可能自行完成。
-- main 完成后会取消尚未结束的子 task，并在 1 秒有界窗口内排空；超时返回 `task/shutdown_timeout`。
+完整 native closure 需要一次把下面规则定齐，否则很容易出现解释器和 native 语义不一致。
 
-### LLVM 文本后端
+推荐整组选项：
 
-已定选择：先生成文本 `.ll`，用 `llvm-as` / `lli` / `clang` 验证，并用 golden test 锁定输出。等 IR 子集稳定后，再决定是否接 `inkwell` / `llvm-sys`。
+1. 分阶段交付：先做无捕获同步函数值和精确间接调用，再做 Copy 捕获，最后做 Owned 捕获。
+2. 保持现有共享绑定捕获：closure 读取外层最新值；允许写回的前提仍是外层 binding 可变。
+3. 函数值属于 Owned：默认 move、显式 `clone()`、作用域结束 drop；调用函数值本身不消耗它。
+4. 只允许 closure env / captured binding cell 使用局部非原子引用计数，不把全局值模型改成 RC。
+5. 捕获动作本身不 move；共享槽中的 Owned 值不能直接 move-out，传参或返回时必须 `.clone()`；重赋值先 drop 旧值。
+6. 增加结构化函数类型语法：`fn(int, str): bool`。类型身份只包含参数类型、返回类型和 async 标志，不包含参数名或函数体。
+7. 0.x closure ABI 只保证编译器内部使用：`{ typed invoke pointer, env pointer }`，隐藏 env 作为首参；暂不承诺外部 C callback ABI。
+8. 第一阶段支持同步 closure 逃逸和局部函数自递归；互递归 closure graph、循环 env 和 async closure 暂时明确拒绝，不引入 tracing GC。
+9. native closure 默认线程封闭，env 引用计数非原子；native async 仍拒绝。
+10. native 直接/间接递归是否增加 Ku 自己的调用深度守卫：推荐增加，避免只依赖 C 栈崩溃。
 
-第一阶段子集：
+我选择：
 
-- `int` / `bool` / `str` 字面量。
-- `fn main()` 和普通函数。
-- 局部变量。
-- `return`。
-- `if` / `while`。
-- 直接函数调用。
-- `print` 最小 runtime shim。
+## 决策 2：registry 签名、信任根与包归档
 
-当前仍不做：
+HTTPS、SHA-256 和 cache 执行层已经完成，但生产 CLI 必须 fail-closed；签名算法、信任根和解包格式没定之前，不能把下载到的归档直接当成可导入 package。
 
-- array / enum。
-- closure。
-- match。
-- try / catch。
-- HTTP / fs / package。
-- async / await。
+推荐整组选项：
 
-当前扩展：
+1. registry index 使用 Ed25519 detached signature。
+2. 签名输入是规范化后的原始 index 字节，不对解析后的对象重新序列化。
+3. 官方 registry 根公钥随 Ku 工具链内置；自定义 registry 的公钥由用户配置显式提供，不允许静默信任首次连接。
+4. key rotation 使用“旧 key 签新 key”的过渡记录；撤销列表由仍受信任的 key 签名，并设置单调版本号，防止回滚。
+5. package 归档第一版统一使用 `.tar.zst`；解包时拒绝绝对路径、`..`、设备文件、硬链接和逃逸 symlink，并继续执行文件数、总字节数和单文件大小上限。
+6. 归档根必须只有一个 package 目录，且必须包含 `ku.mod`；manifest 的 name/version 必须与 index/lockfile 一致。
+7. cache 以 `name + exact version + SHA-256` 内容寻址；已验证目录不可覆盖，只能新增或 GC。
+8. 默认 registry 地址由工具链内置，同时允许 `KU_REGISTRY` 和用户配置覆盖；lockfile 永远记录最终 resolved URL 和 SHA-256。
+9. 第一版允许 registry 标记 yanked，但已有 lockfile 仍可重现安装；新解析不再选择 yanked 版本。
+10. 发布者签名放到第二阶段，不阻塞第一版 registry index 签名。
 
-- 非递归 struct 声明、字面量、参数/返回值和字段读写。
-- `Result<int|bool|str|struct>` 的 `ok`、`fail`、`?` 和错误传播。
-- CFG 目标校验，拒绝缺失/重复 block 和无条件自跳。
+我选择：
 
-遇到非子集节点必须清楚报错，不能生成错误 `.ll`。
+## 决策 3：native `str` 与动态 `object` 的正式内存 ABI
 
-测试策略：
+语言层已经把 `str` 和 `object` 定为 Owned，但当前 native C 的 `str` 仍是只读 `const char*`，动态 object 也还没有 native hash map。要完成全类型所有权，必须固定正式 ABI。
 
-- golden test 比较 `.ll` 文本。
-- 如果本机有 `llvm-as`，验证 `.ll` 可汇编。
-- 如果本机有 `lli`，运行最小程序。
-- 如果本机有 `clang`，验证可编译可执行。
-- 外部工具缺失时跳过工具链验证，但 golden test 必须跑。
+推荐整组选项：
 
-### Registry / lockfile 第一版
+1. `str` 使用 UTF-8 `KuString { ptr, len, capacity, storage }`，不把 NUL 结尾当成长度来源。
+2. `storage` 区分 static/owned；字符串字面量零分配、drop no-op，运行时拼接结果持有 heap allocation。
+3. `clone()` 深拷贝 owned string；move 清空源；drop 只释放 owned storage。
+4. 与 C API 交互时提供临时 NUL 结尾 view/copy，不把内部字符串 ABI退化为裸 C 字符串。
+5. 动态 `object` 第一版使用开放寻址 hash table，key 为 KuString，value 为 tagged KuValue。
+6. object 默认 move、显式深 clone、自动 drop；缺键严格报错，只有 `object[key]?` 返回 `null`。
+7. 第一版禁止 object 自引用和循环图，不引入 tracing GC。
+8. OOM、array 越界和内部 invariant 失败默认终止当前进程；普通缺键、解析错误和 I/O 错误继续走 Result。是否接受这个边界？
 
-已定顺序：先做 registry manifest 文档草案和 lockfile schema，不急着接网络下载。
+我选择：
 
-Registry manifest 草案：
+## 决策 4：下一阶段优先级
 
-```toml
-name = "math"
-version = "0.1.0"
-source = "https://registry.example/ku/math/0.1.0.tar.gz"
-checksum = "sha256-..."
-```
+当前建议顺序：
 
-第一版 registry manifest 只描述一个包版本，不做复杂索引协议。
+1. 根据决策 1 完成 typed callable IR、无捕获 native closure、捕获 env 和闭包所有权。
+2. 根据决策 2 完成 registry 签名验证、受限解包、CLI resolver/download/import 全链路。
+3. 根据决策 3 替换 native `const char*` 原型 ABI并实现动态 object。
+4. 用两个真实 Ku 项目做 native C/LLVM 编译验证；LLVM 只补项目实际需要的 array/enum。
+5. 同步 native ABI 稳定后，再单独设计状态机式 native async runtime；不使用 OS 线程冒充小协程。
 
-Lockfile 字段草案：
-
-```toml
-[[package]]
-name = "math"
-version = "0.1.0"
-source = "registry"
-url = "https://registry.example/ku/math/0.1.0.tar.gz"
-checksum = "sha256-..."
-cache_key = "math-0.1.0-sha256-..."
-```
-
-Semver / resolver 第一版：
-
-- 解析 `major.minor.patch`。
-- lockfile 固定精确版本。
-- resolver 第一版只接受精确版本或简单 caret 范围。
-- 同名依赖合并约束，选择满足全部约束的最高版本。
-- 冲突返回 `package/dependency_conflict`，不做复杂 SAT solver 或无限回溯。
-
-强校验：当前 `ku-fnv64-*` 只适合本地快速校验。远程包第一版应使用 `sha256-*`，lockfile 必须记录最终 checksum。
-
-下载和缓存策略：
-
-- 实际网络 I/O 尚未接入。
-- 下载尝试次数最多 8 次；连接、读取超时和单包 100 MB 上限必须执行。
-- 已验证 cache 直接复用；未命中或校验失败时下载到并发唯一的临时位置，SHA-256 通过后原子替换。
-- schema、checksum mismatch 和确定性 4xx 不进入无限重试。
-
-### Native C 后端阶段计划
-
-已定优先级：
-
-1. struct layout / literal / field lowering。
-2. array lowering。
-3. enum layout / match lowering。
-4. try / catch / finally native error slot。
-
-阶段 1：struct
-
-- 固定 struct 字段顺序，按声明顺序生成 C struct。
-- struct literal 生成临时值或局部初始化。
-- field read/write 映射到 C 字段访问。
-- 不支持递归 struct 值，直到内存模型明确。
-
-阶段 2：array，已完成第一阶段
-
-- 第一版用 runtime-owned array 结构，不把数组退化成裸 C 指针。
-- 必须保留长度，所有索引都做边界检查。
-- array literal、读写 index、长度保存已完成；所有索引检查负数和上界。
-- 当前 runtime-owned 内存尚无正式 free/copy/move 所有权 ABI。
-
-阶段 3：enum / match，已完成第一阶段
-
-- enum 使用 tag + payload layout。
-- unit variant、payload variant、guard、绑定和嵌套 enum payload match 已完成。
-- match lowering 复用 checker 的穷尽性结果，native 后端生成显式 tag/payload CFG。
-
-阶段 4：try / catch / finally
-
-- 完整 Error 对象 ABI 后再做。
-- `?`、`fail`、`try/catch/finally` 共享同一套 error slot。
-- 不允许 silent string error ABI 混进正式阶段。
-
-后续测试：
-
-- struct literal 和字段读写 golden C。
-- array 越界返回清晰 runtime error。
-- enum unit variant match。
-- payload enum match。
-- native 后端遇到未支持节点仍要明确拒绝。
-
-## 仍需你决定
-
-### 决策 1：native 值类型的所有权模型
-
-array 已经会分配 runtime-owned 内存，但正式后端必须决定何时复制、移动和释放；struct/enum 内嵌 array 后也依赖同一规则。
-
-- 方案 A，推荐：默认 move，显式 `clone()`，作用域结束自动 drop。长期性能和资源边界最好，但 checker/IR 要新增 move/drop 语义。
-- 方案 B：引用计数值。实现较快，复制直观，但每次复制有原子或计数成本，循环引用还要另行限制。
-- 方案 C：当前阶段统一深拷贝。规则简单，但大数组和嵌套值成本高，不符合 Ku 的低资源目标。
-
-需要你在后续进入完整 native 内存管理前选择。
-
-### 决策 2：registry 索引与信任协议
-
-resolver 和下载策略已经就绪，但实际联网需要确定如何发现版本和信任包：
-
-- 方案 A，推荐：HTTPS 静态索引，每个包一个版本清单，lockfile 固定 URL + SHA-256；第一阶段不做账号体系。
-- 方案 B：中心化 JSON API，支持搜索、下架和元数据更新，但服务端和兼容成本更高。
-- 签名可先采用“registry 索引签名 + 包 SHA-256”，后续再加发布者签名；也可以第一版直接要求发布者签名，但工具链会明显变重。
-
-需要你在开始真实网络下载前选择索引形式和第一版签名强度。
-
-### 决策 3：native async ABI
-
-当前 native C / LLVM 继续明确拒绝 async，不会偷偷退化成阻塞调用。后续可选：
-
-- 方案 A，推荐：先完成同步 native ABI，async 继续只在解释器可用，等内存所有权和 Error ABI 稳定后设计统一 task ABI。
-- 方案 B：native 每个 task 使用 OS 线程，容易落地但资源成本高，和“小协程”目标不一致。
-- 方案 C：生成状态机并嵌入事件循环，语义最接近目标，但需要完整 suspension point、取消和阻塞桥接 ABI。
-
-这项当前不阻塞同步 native 后端；进入 native async 前再选择。
-
-## 接下来要做
-
-1. 先定 native 值类型所有权，补 array/struct/enum 的 copy/move/drop 和无泄漏测试。
-2. 完成统一 Error ABI，再做 native `try/catch/finally`、return-through-finally 和复杂 Result payload。
-3. 固定闭包 ABI与捕获所有权，再做 native 闭包调用。
-4. 选择 registry 索引/签名方案，接入 HTTPS 下载、SHA-256 执行、临时文件和原子 cache 更新。
-5. 用真实 Ku 项目验证 native C 与 LLVM；LLVM 只扩展项目确实需要的 array/enum，不追求一次性全覆盖。
-6. async 继续补压力测试和可观测性；native async 保持明确拒绝，等待 task ABI 决策。
-
-## 语言方向
-
-- 语法体验像 Go：简单、直接、适合写服务端。
-- 语义规则像 Rust：默认严格、错误明确、少隐式、少坑。
-- 运行时并发像 Go：HTTP 和 async 默认并发，用户不手写线程池。
-- 资源控制像 Zig/Rust：默认有上限，不无限排队、不无限吃内存。
+我选择：

@@ -50,6 +50,7 @@ struct TaskJob {
 struct BlockingJob {
     run: BlockingFn,
     response: SyncSender<KuResult<Value>>,
+    cancelled: Option<Weak<TaskState>>,
 }
 
 #[derive(Clone)]
@@ -64,6 +65,15 @@ struct TaskRuntimeInner {
     states: Mutex<HashMap<i64, Weak<TaskState>>>,
     wait_edges: Mutex<HashMap<i64, i64>>,
     active_tasks: AtomicUsize,
+    queued_tasks: AtomicUsize,
+    queued_blocking_jobs: AtomicUsize,
+    running_blocking_jobs: AtomicUsize,
+    total_submissions: AtomicUsize,
+    accepted_submissions: AtomicUsize,
+    rejected_task_limit: AtomicUsize,
+    rejected_task_queue: AtomicUsize,
+    rejected_task_internal: AtomicUsize,
+    finished_tasks: AtomicUsize,
     next_task_id: AtomicI64,
     shutdown: AtomicBool,
     max_tasks: usize,
@@ -77,6 +87,33 @@ pub struct TaskHandle {
     id: i64,
     state: Arc<TaskState>,
     runtime: TaskRuntime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRuntimeSnapshot {
+    pub active_tasks: usize,
+    pub registered_tasks: usize,
+    pub queued_tasks: usize,
+    pub pending_tasks: usize,
+    pub running_tasks: usize,
+    pub waiting_tasks: usize,
+    pub cancelling_tasks: usize,
+    pub completed_tasks: usize,
+    pub failed_tasks: usize,
+    pub cancelled_tasks: usize,
+    pub panicked_tasks: usize,
+    pub wait_edges: usize,
+    pub queued_blocking_jobs: usize,
+    pub running_blocking_jobs: usize,
+    pub task_workers: usize,
+    pub blocking_workers: usize,
+    pub shutdown: bool,
+    pub total_submissions: usize,
+    pub accepted_submissions: usize,
+    pub rejected_task_limit: usize,
+    pub rejected_task_queue: usize,
+    pub rejected_task_internal: usize,
+    pub finished_tasks: usize,
 }
 
 struct TaskState {
@@ -113,6 +150,15 @@ impl TaskRuntime {
             states: Mutex::new(HashMap::new()),
             wait_edges: Mutex::new(HashMap::new()),
             active_tasks: AtomicUsize::new(0),
+            queued_tasks: AtomicUsize::new(0),
+            queued_blocking_jobs: AtomicUsize::new(0),
+            running_blocking_jobs: AtomicUsize::new(0),
+            total_submissions: AtomicUsize::new(0),
+            accepted_submissions: AtomicUsize::new(0),
+            rejected_task_limit: AtomicUsize::new(0),
+            rejected_task_queue: AtomicUsize::new(0),
+            rejected_task_internal: AtomicUsize::new(0),
+            finished_tasks: AtomicUsize::new(0),
             next_task_id: AtomicI64::new(1),
             shutdown: AtomicBool::new(false),
             max_tasks,
@@ -130,6 +176,15 @@ impl TaskRuntime {
     where
         F: FnOnce() -> KuResult<Value> + Send + 'static,
     {
+        self.spawn_deferred(|| run)
+    }
+
+    pub(crate) fn spawn_deferred<B, F>(&self, build: B) -> TaskHandle
+    where
+        B: FnOnce() -> F,
+        F: FnOnce() -> KuResult<Value> + Send + 'static,
+    {
+        self.inner.total_submissions.fetch_add(1, Ordering::Relaxed);
         let id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
         let state = Arc::new(TaskState {
             result: Mutex::new(None),
@@ -143,6 +198,9 @@ impl TaskRuntime {
             runtime: self.clone(),
         };
         if self.inner.task_workers.load(Ordering::Acquire) == 0 {
+            self.inner
+                .rejected_task_internal
+                .fetch_add(1, Ordering::Relaxed);
             state.complete(Ok(task_error(
                 "runtime_stopped",
                 "async task runtime has no available workers",
@@ -157,6 +215,9 @@ impl TaskRuntime {
             })
             .is_err()
         {
+            self.inner
+                .rejected_task_limit
+                .fetch_add(1, Ordering::Relaxed);
             state.complete(Ok(task_error(
                 "too_many_tasks",
                 format!("async task limit {} reached", self.inner.max_tasks),
@@ -167,19 +228,46 @@ impl TaskRuntime {
             states.insert(id, Arc::downgrade(&state));
         } else {
             self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
+            self.inner
+                .rejected_task_internal
+                .fetch_add(1, Ordering::Relaxed);
             state.complete(Err(KuError::runtime(
                 "async task registry is poisoned",
                 Span::default(),
             )));
             return handle;
         }
+        let run = match catch_unwind(AssertUnwindSafe(build)) {
+            Ok(run) => run,
+            Err(_) => {
+                self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
+                self.inner
+                    .rejected_task_internal
+                    .fetch_add(1, Ordering::Relaxed);
+                self.remove_state(id);
+                state.complete(Ok(task_error(
+                    "spawn_panic",
+                    "async task construction panicked",
+                )));
+                return handle;
+            }
+        };
+        self.inner.queued_tasks.fetch_add(1, Ordering::AcqRel);
         match self.inner.task_tx.try_send(TaskJob {
             id,
             run: Box::new(run),
             state: Arc::clone(&state),
         }) {
-            Ok(()) => {}
+            Ok(()) => {
+                self.inner
+                    .accepted_submissions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             Err(TrySendError::Full(_)) => {
+                self.inner
+                    .rejected_task_queue
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
                 self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
                 self.remove_state(id);
                 state.complete(Ok(task_error(
@@ -191,6 +279,10 @@ impl TaskRuntime {
                 )));
             }
             Err(TrySendError::Disconnected(_)) => {
+                self.inner
+                    .rejected_task_internal
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
                 self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
                 self.remove_state(id);
                 state.complete(Ok(task_error(
@@ -200,6 +292,60 @@ impl TaskRuntime {
             }
         }
         handle
+    }
+
+    pub fn snapshot(&self) -> KuResult<TaskRuntimeSnapshot> {
+        let states =
+            self.inner.states.lock().map_err(|_| {
+                KuError::runtime("async task registry is poisoned", Span::default())
+            })?;
+        let mut snapshot = TaskRuntimeSnapshot {
+            active_tasks: self.inner.active_tasks.load(Ordering::Acquire),
+            registered_tasks: 0,
+            queued_tasks: self.inner.queued_tasks.load(Ordering::Acquire),
+            pending_tasks: 0,
+            running_tasks: 0,
+            waiting_tasks: 0,
+            cancelling_tasks: 0,
+            completed_tasks: 0,
+            failed_tasks: 0,
+            cancelled_tasks: 0,
+            panicked_tasks: 0,
+            wait_edges: 0,
+            queued_blocking_jobs: self.inner.queued_blocking_jobs.load(Ordering::Acquire),
+            running_blocking_jobs: self.inner.running_blocking_jobs.load(Ordering::Acquire),
+            task_workers: self.inner.task_workers.load(Ordering::Acquire),
+            blocking_workers: self.inner.blocking_workers.load(Ordering::Acquire),
+            shutdown: self.inner.shutdown.load(Ordering::Acquire),
+            total_submissions: self.inner.total_submissions.load(Ordering::Relaxed),
+            accepted_submissions: self.inner.accepted_submissions.load(Ordering::Relaxed),
+            rejected_task_limit: self.inner.rejected_task_limit.load(Ordering::Relaxed),
+            rejected_task_queue: self.inner.rejected_task_queue.load(Ordering::Relaxed),
+            rejected_task_internal: self.inner.rejected_task_internal.load(Ordering::Relaxed),
+            finished_tasks: self.inner.finished_tasks.load(Ordering::Relaxed),
+        };
+        for state in states.values().filter_map(Weak::upgrade) {
+            snapshot.registered_tasks += 1;
+            match state.status.load(Ordering::Acquire) {
+                TASK_PENDING => snapshot.pending_tasks += 1,
+                TASK_RUNNING => snapshot.running_tasks += 1,
+                TASK_WAITING => snapshot.waiting_tasks += 1,
+                TASK_CANCELLING => snapshot.cancelling_tasks += 1,
+                TASK_COMPLETED => snapshot.completed_tasks += 1,
+                TASK_FAILED => snapshot.failed_tasks += 1,
+                TASK_CANCELLED => snapshot.cancelled_tasks += 1,
+                TASK_PANICKED => snapshot.panicked_tasks += 1,
+                _ => {}
+            }
+        }
+        drop(states);
+        snapshot.wait_edges = self
+            .inner
+            .wait_edges
+            .lock()
+            .map_err(|_| KuError::runtime("async wait graph is poisoned", Span::default()))?
+            .len();
+        Ok(snapshot)
     }
 
     pub fn await_task(&self, handle: &TaskHandle) -> KuResult<Value> {
@@ -314,7 +460,10 @@ impl TaskRuntime {
                 Span::default(),
             )
         })?;
-        while self.inner.active_tasks.load(Ordering::Acquire) != 0 {
+        while self.inner.active_tasks.load(Ordering::Acquire) != 0
+            || self.inner.queued_blocking_jobs.load(Ordering::Acquire) != 0
+            || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0
+        {
             if Instant::now() >= deadline {
                 return Err(KuError::structured(
                     crate::error::KuErrorKind::Runtime,
@@ -342,9 +491,13 @@ impl TaskRuntime {
             ));
         }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.inner
+            .queued_blocking_jobs
+            .fetch_add(1, Ordering::AcqRel);
         match self.inner.blocking_tx.try_send(BlockingJob {
             run: Box::new(run),
             response: response_tx,
+            cancelled: CURRENT_TASK_STATE.with(|current| current.borrow().as_ref().cloned()),
         }) {
             Ok(()) => loop {
                 if current_task_cancelled() {
@@ -377,17 +530,27 @@ impl TaskRuntime {
                     }
                 }
             },
-            Err(TrySendError::Full(_)) => Ok(task_error(
-                "queue_full",
-                format!(
-                    "blocking queue limit {} reached",
-                    self.inner.blocking_queue_limit
-                ),
-            )),
-            Err(TrySendError::Disconnected(_)) => Ok(task_error(
-                "blocking_pool_stopped",
-                "blocking pool is stopped",
-            )),
+            Err(TrySendError::Full(_)) => {
+                self.inner
+                    .queued_blocking_jobs
+                    .fetch_sub(1, Ordering::AcqRel);
+                Ok(task_error(
+                    "queue_full",
+                    format!(
+                        "blocking queue limit {} reached",
+                        self.inner.blocking_queue_limit
+                    ),
+                ))
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.inner
+                    .queued_blocking_jobs
+                    .fetch_sub(1, Ordering::AcqRel);
+                Ok(task_error(
+                    "blocking_pool_stopped",
+                    "blocking pool is stopped",
+                ))
+            }
         }
     }
 
@@ -427,6 +590,7 @@ impl TaskRuntime {
             }
         };
         if let Some(job) = job {
+            self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
             execute_task_job(&self.inner, job);
             Ok(true)
         } else {
@@ -651,6 +815,7 @@ fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<T
                 let Some(inner) = weak.upgrade() else {
                     return;
                 };
+                inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
                 execute_task_job(&inner, job)
             }
             Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(2)),
@@ -710,6 +875,7 @@ fn finish_task_job(inner: &TaskRuntimeInner, id: i64) {
         states.remove(&id);
     }
     inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
+    inner.finished_tasks.fetch_add(1, Ordering::Relaxed);
 }
 
 fn spawn_blocking_workers(
@@ -750,23 +916,37 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
         };
         match job {
             Ok(job) => {
-                if weak.upgrade().is_none() {
+                let Some(inner) = weak.upgrade() else {
                     return;
-                }
-                let result = catch_unwind(AssertUnwindSafe(job.run)).map_err(|_| {
-                    KuError::structured(
-                        crate::error::KuErrorKind::Runtime,
-                        "task",
-                        "blocking_panic",
-                        "blocking pool job panicked",
-                        Span::default(),
-                    )
-                });
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => Err(error),
+                };
+                inner.queued_blocking_jobs.fetch_sub(1, Ordering::AcqRel);
+                inner.running_blocking_jobs.fetch_add(1, Ordering::AcqRel);
+                let cancelled = job
+                    .cancelled
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|state| state.is_cancelled());
+                let result = if cancelled {
+                    Ok(task_error(
+                        "cancelled",
+                        "blocking job was cancelled before it started",
+                    ))
+                } else {
+                    match catch_unwind(AssertUnwindSafe(job.run)).map_err(|_| {
+                        KuError::structured(
+                            crate::error::KuErrorKind::Runtime,
+                            "task",
+                            "blocking_panic",
+                            "blocking pool job panicked",
+                            Span::default(),
+                        )
+                    }) {
+                        Ok(result) => result,
+                        Err(error) => Err(error),
+                    }
                 };
                 let _ = job.response.send(result);
+                inner.running_blocking_jobs.fetch_sub(1, Ordering::AcqRel);
             }
             Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(2)),
             Err(TryRecvError::Disconnected) => return,
@@ -813,6 +993,14 @@ fn task_error(code: &str, message: impl Into<String>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_until(timeout: Duration, message: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !ready() {
+            assert!(Instant::now() < deadline, "{message}");
+            thread::yield_now();
+        }
+    }
 
     #[test]
     fn runtime_workers_do_not_keep_inner_alive() {
@@ -872,5 +1060,301 @@ mod tests {
             .expect("cancelled task should wake waiters");
         assert!(matches!(value, Value::Result { ok: false, .. }));
         assert_eq!(task.status(), "cancelled");
+    }
+
+    #[test]
+    fn snapshot_tracks_timeout_cancel_queue_and_reclamation() {
+        let runtime = TaskRuntime::with_limits(1, 4, 1, 1, 4);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let first_started = Arc::clone(&started);
+        let first_release = Arc::clone(&release);
+        let first = runtime.spawn(move || {
+            first_started.store(true, Ordering::Release);
+            while !first_release.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            Ok(Value::Int(1))
+        });
+        wait_until(Duration::from_secs(1), "first task did not start", || {
+            started.load(Ordering::Acquire)
+        });
+
+        let second = runtime.spawn(|| Ok(Value::Int(2)));
+        let third = runtime.spawn(|| Ok(Value::Int(3)));
+        let snapshot = runtime.snapshot().expect("snapshot queued tasks");
+        assert_eq!(snapshot.active_tasks, 3);
+        assert_eq!(snapshot.registered_tasks, 3);
+        assert_eq!(snapshot.queued_tasks, 2);
+        assert_eq!(snapshot.running_tasks, 1);
+        assert_eq!(snapshot.pending_tasks, 2);
+        assert_eq!(snapshot.wait_edges, 0);
+
+        assert!(second.cancel());
+        let timed = third
+            .await_timeout(Duration::ZERO)
+            .expect("zero timeout should return a task error value");
+        assert!(matches!(timed, Value::Result { ok: false, .. }));
+        let snapshot = runtime.snapshot().expect("snapshot cancelled task");
+        assert_eq!(snapshot.queued_tasks, 2);
+        assert_eq!(snapshot.cancelling_tasks, 1);
+
+        release.store(true, Ordering::Release);
+        assert_eq!(
+            first
+                .await_timeout(Duration::from_secs(1))
+                .expect("first task"),
+            Value::Int(1)
+        );
+        assert!(matches!(
+            second
+                .await_timeout(Duration::from_secs(1))
+                .expect("cancelled second task"),
+            Value::Result { ok: false, .. }
+        ));
+        assert_eq!(
+            third
+                .await_timeout(Duration::from_secs(1))
+                .expect("third task"),
+            Value::Int(3)
+        );
+        assert_eq!(
+            runtime
+                .cancel_all_and_wait(Duration::from_secs(1))
+                .expect("shutdown should observe an empty runtime"),
+            0
+        );
+
+        let snapshot = runtime.snapshot().expect("snapshot reclaimed runtime");
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.registered_tasks, 0);
+        assert_eq!(snapshot.queued_tasks, 0);
+        assert_eq!(snapshot.wait_edges, 0);
+        assert_eq!(snapshot.queued_blocking_jobs, 0);
+        assert_eq!(snapshot.running_blocking_jobs, 0);
+    }
+
+    #[test]
+    fn shutdown_timeout_is_bounded_for_non_cooperative_task() {
+        let runtime = TaskRuntime::with_limits(1, 1, 1, 1, 1);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let task_started = Arc::clone(&started);
+        let task_release = Arc::clone(&release);
+        let task = runtime.spawn(move || {
+            task_started.store(true, Ordering::Release);
+            while !task_release.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            Ok(Value::Null)
+        });
+        wait_until(
+            Duration::from_secs(1),
+            "non-cooperative task did not start",
+            || started.load(Ordering::Acquire),
+        );
+
+        let began = Instant::now();
+        let error = runtime
+            .cancel_all_and_wait(Duration::from_millis(20))
+            .expect_err("non-cooperative task must hit bounded shutdown timeout");
+        assert_eq!(error.code.as_deref(), Some("shutdown_timeout"));
+        assert!(began.elapsed() < Duration::from_secs(1));
+        let snapshot = runtime.snapshot().expect("snapshot timed out shutdown");
+        assert_eq!(snapshot.active_tasks, 1);
+        assert_eq!(snapshot.cancelling_tasks, 1);
+
+        release.store(true, Ordering::Release);
+        assert!(matches!(
+            task.await_timeout(Duration::from_secs(1))
+                .expect("cancelled task should finish after release"),
+            Value::Result { ok: false, .. }
+        ));
+        runtime
+            .cancel_all_and_wait(Duration::from_secs(1))
+            .expect("runtime should drain after release");
+        assert_eq!(runtime.snapshot().expect("final snapshot").active_tasks, 0);
+    }
+
+    #[test]
+    fn snapshot_tracks_blocking_queue_reclamation() {
+        let runtime = TaskRuntime::with_limits(1, 1, 1, 2, 1);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+
+        let first_runtime = runtime.clone();
+        let first_started = Arc::clone(&started);
+        let first_release = Arc::clone(&release);
+        let first = thread::spawn(move || {
+            first_runtime.run_blocking(
+                move || {
+                    first_started.store(true, Ordering::Release);
+                    while !first_release.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    Ok(Value::Int(1))
+                },
+                Span::default(),
+            )
+        });
+        wait_until(Duration::from_secs(1), "blocking job did not start", || {
+            started.load(Ordering::Acquire)
+        });
+
+        let second_runtime = runtime.clone();
+        let second = thread::spawn(move || {
+            second_runtime.run_blocking(|| Ok(Value::Int(2)), Span::default())
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = runtime.snapshot().expect("snapshot blocking queue");
+            if snapshot.running_blocking_jobs == 1 && snapshot.queued_blocking_jobs == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "blocking queue did not reach the expected bounded state: {snapshot:?}"
+            );
+            thread::yield_now();
+        }
+
+        release.store(true, Ordering::Release);
+        assert_eq!(
+            first
+                .join()
+                .expect("first blocking caller")
+                .expect("first job"),
+            Value::Int(1)
+        );
+        assert_eq!(
+            second
+                .join()
+                .expect("second blocking caller")
+                .expect("second job"),
+            Value::Int(2)
+        );
+        let snapshot = runtime.snapshot().expect("reclaimed blocking queue");
+        assert_eq!(snapshot.queued_blocking_jobs, 0);
+        assert_eq!(snapshot.running_blocking_jobs, 0);
+    }
+
+    #[test]
+    fn shutdown_waits_for_already_running_blocking_jobs() {
+        let runtime = TaskRuntime::with_limits(1, 1, 1, 1, 1);
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let task_runtime = runtime.clone();
+        let job_started = Arc::clone(&started);
+        let job_release = Arc::clone(&release);
+        let task = runtime.spawn(move || {
+            task_runtime.run_blocking(
+                move || {
+                    job_started.store(true, Ordering::Release);
+                    while !job_release.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    Ok(Value::Null)
+                },
+                Span::default(),
+            )
+        });
+        wait_until(
+            Duration::from_secs(1),
+            "blocking shutdown test job did not start",
+            || started.load(Ordering::Acquire),
+        );
+
+        let error = runtime
+            .cancel_all_and_wait(Duration::from_millis(20))
+            .expect_err("shutdown must report a running blocking job");
+        assert_eq!(error.code.as_deref(), Some("shutdown_timeout"));
+        assert_eq!(
+            runtime
+                .snapshot()
+                .expect("blocking shutdown snapshot")
+                .running_blocking_jobs,
+            1
+        );
+
+        release.store(true, Ordering::Release);
+        let _ = task
+            .await_timeout(Duration::from_secs(1))
+            .expect("cancelled task should finish");
+        runtime
+            .cancel_all_and_wait(Duration::from_secs(1))
+            .expect("runtime should drain after blocking job release");
+    }
+
+    #[test]
+    #[ignore = "manual bounded million-demand concurrency stress benchmark"]
+    fn million_concurrent_demand_stress_report() {
+        const SUBMISSIONS: usize = 1_000_000;
+        const PRODUCERS: usize = 15;
+        let runtime = TaskRuntime::with_limits(4, 1024, 4, 1024, 1024);
+        let release = Arc::new(AtomicBool::new(false));
+        let peak_active = Arc::new(AtomicUsize::new(0));
+        let began = Instant::now();
+        let mut producers = Vec::new();
+        for producer in 0..PRODUCERS {
+            let runtime = runtime.clone();
+            let release = Arc::clone(&release);
+            let peak_active = Arc::clone(&peak_active);
+            let count = SUBMISSIONS / PRODUCERS + usize::from(producer < SUBMISSIONS % PRODUCERS);
+            producers.push(thread::spawn(move || {
+                for _ in 0..count {
+                    let release = Arc::clone(&release);
+                    drop(runtime.spawn(move || {
+                        while !release.load(Ordering::Acquire) && !current_task_cancelled() {
+                            thread::yield_now();
+                        }
+                        Ok(Value::Null)
+                    }));
+                    let active = runtime.inner.active_tasks.load(Ordering::Acquire);
+                    peak_active.fetch_max(active, Ordering::AcqRel);
+                }
+            }));
+        }
+        for producer in producers {
+            producer.join().expect("stress producer must not panic");
+        }
+        let submit_elapsed = began.elapsed();
+        let held = runtime.snapshot().expect("held stress snapshot");
+        assert!(
+            held.active_tasks <= 1024,
+            "bounded runtime exceeded max active tasks: {held:?}"
+        );
+        thread::sleep(Duration::from_millis(250));
+        release.store(true, Ordering::Release);
+        runtime
+            .cancel_all_and_wait(Duration::from_secs(30))
+            .expect("million-demand stress must drain within the bounded deadline");
+        let total_elapsed = began.elapsed();
+        let snapshot = runtime.snapshot().expect("stress snapshot");
+        assert_eq!(snapshot.total_submissions, SUBMISSIONS);
+        assert_eq!(
+            snapshot.accepted_submissions
+                + snapshot.rejected_task_limit
+                + snapshot.rejected_task_queue
+                + snapshot.rejected_task_internal,
+            SUBMISSIONS
+        );
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.registered_tasks, 0);
+        assert_eq!(snapshot.queued_tasks, 0);
+        println!(
+            "KU_ASYNC_STRESS demand={} producers={} peak_active={} accepted={} rejected_limit={} rejected_queue={} rejected_internal={} finished={} submit_ms={} total_ms={} demand_per_sec={:.0} accepted_per_sec={:.0}",
+            snapshot.total_submissions,
+            PRODUCERS,
+            peak_active.load(Ordering::Acquire),
+            snapshot.accepted_submissions,
+            snapshot.rejected_task_limit,
+            snapshot.rejected_task_queue,
+            snapshot.rejected_task_internal,
+            snapshot.finished_tasks,
+            submit_elapsed.as_millis(),
+            total_elapsed.as_millis(),
+            SUBMISSIONS as f64 / submit_elapsed.as_secs_f64(),
+            snapshot.accepted_submissions as f64 / total_elapsed.as_secs_f64()
+        );
     }
 }

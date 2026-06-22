@@ -105,12 +105,19 @@ async fn spin(): int! {
 }
 
 async fn main(): null! {
-    task = spin()
-    timed = task.await_timeout(0)
-    print(timed)
-    task.cancel()
-    print(task.status())
-    print(await task)
+    tasks = [
+        spin(), spin(), spin(), spin(),
+        spin(), spin(), spin(), spin(),
+        spin(), spin(), spin(), spin()
+    ]
+    for task in tasks.clone() {
+        print(task.await_timeout(0))
+        task.cancel()
+        print(task.status())
+    }
+    for task in tasks {
+        print(await task)
+    }
     return ok(null)
 }
 "#,
@@ -139,6 +146,24 @@ async fn main(): null! {
     assert!(
         result.stdout.contains("cancelled"),
         "cancelled task should wake waiters and expose its state: {}",
+        result.stdout
+    );
+    let lines = result.stdout.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines.len(),
+        36,
+        "unexpected stress output:\n{}",
+        result.stdout
+    );
+    for status in lines.iter().take(24).skip(1).step_by(2) {
+        assert!(
+            matches!(*status, "cancelling" | "cancelled"),
+            "unexpected task status {status:?}"
+        );
+    }
+    assert!(
+        lines.iter().skip(24).all(|line| line.contains("cancelled")),
+        "every cancelled task should be awaitable:\n{}",
         result.stdout
     );
 }

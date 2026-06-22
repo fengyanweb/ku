@@ -1,6 +1,6 @@
 # Ku Package Draft
 
-0.0.7 固定最小 package 草案，0.0.11 增加 `file://` dependency、checksum、`ku.lock` package dependency 记录和 cache GC。本阶段目标是把本地 package 边界、文件依赖缓存和可重复校验做清楚，再进入 HTTP/registry。
+0.0.7 固定最小 package 草案，0.0.11 增加 `file://` dependency、checksum、`ku.lock` package dependency 记录和 cache GC。0.0.12 后续补齐 HTTPS registry 请求、SHA-256 执行和内容寻址 cache；生产 CLI 仍在签名与归档协议确定前保持 fail-closed。
 
 ## ku.mod
 
@@ -121,20 +121,28 @@ package import 复用现有 `ModuleLoader`：
 - 没有共同版本时返回 `package/dependency_conflict`，不做无限回溯。
 - lockfile 始终记录精确版本和 `sha256-*` checksum。
 
-实际网络请求尚未接入。已经固定的执行策略是：
+registry 网络执行层已经实现：
 
 - 下载尝试次数必须在 1 到 8 之间。
 - 连接和读取超时必须显式有界，最大 300 秒。
 - 单个归档最大 100 MB。
+- URL 必须是 HTTPS，拒绝 HTTP、凭据、fragment 和自动 redirect。
+- 静态 index 支持相对/绝对 HTTPS URL、版本排序和重复版本冲突检查。
 - 已存在且 checksum 匹配的 cache 直接复用。
-- 缓存缺失或校验失败时下载到带进程号和单调序号的唯一临时位置，避免并发下载互相覆盖；完成大小限制和 SHA-256 校验后再原子替换正式 cache。
-- 不对 checksum mismatch、manifest/schema 错误或 4xx 做无限重试；未来网络实现只允许对明确的瞬时错误执行有限退避。
+- 缓存缺失时下载到 cache 外的唯一 staging 目录，边读取边计算 SHA-256；校验通过后安装到 `name + exact version + SHA-256` 内容寻址目录。
+- 已验证的内容寻址目录不可覆盖。同版本不同 checksum 不会互相替换。
+- 安装锁按完整 cache key 隔离，等待最多约 1 秒；旧锁恢复有时间上限。
+- GC 不进入下载 staging，也不删除持有安装锁的目录。
+- 不对 checksum mismatch、manifest/schema 错误或确定性 4xx 重试；只对明确瞬时错误执行有限退避。
+- Windows 路径检查拒绝 drive prefix、根路径和 `..`，dependency import canonicalize 后必须仍在依赖根内。
+
+当前尚未把该执行层接入 `ku check/run` 的远程 import。原因不是下载能力缺失，而是必须先确定 registry index 签名信任根、归档格式和受限解包规则。未配置 verifier 时返回 `package/registry_trust_unconfigured`，不能传 no-op 信任进入正式 CLI。
 
 ## 暂不支持
 
-- HTTP/registry package 下载
-- registry 索引发现协议
-- 包发布者签名和信任根
-- 实际 SHA-256 下载校验执行
+- registry index 签名算法的正式实现和信任根配置
+- package 归档格式、受限解包和解包后 manifest 复核
+- CLI resolver/download/cache/import 全链路启用
+- 包发布者签名
 - 包发布
 - 多 package workspace

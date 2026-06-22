@@ -4,4 +4,6 @@ version = "0.0.12"
 edition = "2021"
 
 [dependencies]
+sha2 = "0.10"
 ureq = { version = "2.12", default-features = true }
+url = "2.5"
