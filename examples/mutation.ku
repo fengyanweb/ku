@@ -13,7 +13,7 @@ fn main() {
     obj = { name: "old" }
     obj.name = "new"
 
-    print(nums[1])
-    print(user.age)
-    print(obj.name)
+    println(nums[1])
+    println(user.age)
+    println(obj.name)
 }

@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.namespaceMembers = exports.stdFunctions = exports.stdModules = exports.builtins = exports.types = exports.keywords = void 0;
+exports.namespaceMembers = exports.stdFunctions = exports.stdRootModules = exports.stdModules = exports.builtins = exports.types = exports.keywords = void 0;
 exports.stdImportPathLabels = stdImportPathLabels;
 exports.memberCompletionLabels = memberCompletionLabels;
 exports.globalCompletionLabels = globalCompletionLabels;
@@ -28,14 +28,14 @@ exports.keywords = [
     "panic",
     "return",
     "print",
-    "println",
     "true",
     "false",
     "null",
 ];
 exports.types = ["int", "float", "bool", "str", "null"];
 exports.builtins = ["len", "str", "ok", "err", "println"];
-exports.stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.config", "std.time"];
+exports.stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.config", "std.time", "std.task"];
+exports.stdRootModules = ["fs", "http", "string", "array", "json", "config", "time", "task"];
 exports.stdFunctions = [
     "fs.read",
     "fs.try_read",
@@ -67,6 +67,24 @@ exports.stdFunctions = [
     "time.now",
     "time.unix",
     "time.millis",
+    "time.from_unix",
+    "time.from_millis",
+    "time.date",
+    "time.datetime",
+    "time.format",
+    "time.parse",
+    "time.duration",
+    "time.add",
+    "time.sub",
+    "time.diff",
+    "time.compare",
+    "time.parts",
+    "time.weekday",
+    "time.is_leap",
+    "time.days_in_month",
+    "time.sleep",
+    "task.stats",
+    "task.stress",
 ];
 exports.namespaceMembers = {
     fs: ["read", "try_read", "write", "try_write"],
@@ -75,8 +93,28 @@ exports.namespaceMembers = {
     array: ["len", "try_get", "push", "concat"],
     json: ["parse", "try_parse", "stringify"],
     config: ["env", "env_file", "yaml"],
-    time: ["now", "unix", "millis"],
-    task: ["status", "cancel", "await_timeout"],
+    time: [
+        "now",
+        "unix",
+        "millis",
+        "from_unix",
+        "from_millis",
+        "date",
+        "datetime",
+        "format",
+        "parse",
+        "duration",
+        "add",
+        "sub",
+        "diff",
+        "compare",
+        "parts",
+        "weekday",
+        "is_leap",
+        "days_in_month",
+        "sleep",
+    ],
+    task: ["status", "cancel", "await_timeout", "stats", "stress"],
 };
 function stdImportPathLabels(current) {
     if (!current.startsWith("std.")) {

@@ -103,15 +103,37 @@ fn run_supports_statement_increment_and_decrement() {
     let source = r#"
 fn main() {
     i = 1
+    ++i
+    --i
     i++
     i--
+    i += i + 1
+    i *= 2
+    i /= 3
+    i %= 2
     nums:[int] = [1]
     nums[0]++
-    if (i != 1) {
+    nums[0] += 3
+    user = { age: 1 }
+    user.age += 2
+    nested = { inner: { age: 1 } }
+    nested.inner.age += 4
+    rows:[[int]] = [[1]]
+    rows[0][0] += 6
+    if (i != 0) {
         panic("bad variable increment")
     }
-    if (nums[0] != 2) {
+    if (nums[0] != 5) {
         panic("bad index increment")
+    }
+    if (user.age != 3) {
+        panic("bad field compound assignment")
+    }
+    if (nested.inner.age != 5) {
+        panic("bad nested field compound assignment")
+    }
+    if (rows[0][0] != 7) {
+        panic("bad nested index compound assignment")
     }
 }
 "#;
@@ -123,6 +145,42 @@ fn main() {
         .expect_err("string increment should fail");
     assert!(
         err.to_string().contains("expected numbers"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn run_supports_int_for_iterator_and_single_statement_control_bodies() {
+    let source = r#"
+fn main() {
+    total = 0
+    for i in 4 total += i
+    if (total != 6) panic("bad int iterator")
+
+    i = 0
+    while (true)
+        if (i >= 3) break
+        else i++
+    if (i != 3) panic("bad single statement while/if")
+}
+"#;
+
+    check_source("inline.ku", source).expect("int iterator program should check");
+    run_source("inline.ku", source).expect("int iterator program should run");
+    run_source(
+        "inline.ku",
+        r#"
+fn main() {
+    for i in 9223372036854775807 break
+}
+"#,
+    )
+    .expect("huge int iterator should not preallocate before break");
+
+    let err = run_source("inline.ku", "fn main() { for i in -1 print(i) }")
+        .expect_err("negative int iterator should fail");
+    assert!(
+        err.to_string().contains("non-negative"),
         "unexpected error: {err}"
     );
 }
@@ -549,7 +607,7 @@ fn main() {
 }
 
 #[test]
-fn run_stops_unbounded_while_loop() {
+fn check_accepts_unbounded_loop_without_fixed_step_limit() {
     let source = r#"
 fn main() {
     while (true) {
@@ -557,11 +615,7 @@ fn main() {
 }
 "#;
 
-    let err = run_source("inline.ku", source).expect_err("while loop should be bounded");
-    assert!(
-        err.to_string().contains("execution step limit"),
-        "unexpected error: {err}"
-    );
+    check_source("inline.ku", source).expect("unbounded loop syntax should check");
 }
 
 #[test]

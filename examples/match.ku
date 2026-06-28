@@ -11,5 +11,5 @@ fn main() {
         _ => "none"
     }
 
-    print(text)
+    println(text)
 }

@@ -5,6 +5,10 @@
 当前关键规则：
 
 - `if` / `while` 条件必须是 `bool`。
+- `if` / `while` / `for` 的单语句 body 可以省略 `{}`，多语句仍必须用块。
+- `for` 支持数组和非负整数迭代：`for i in 10` 表示 `0..9`。
+- 支持语句级 `i++`、`++i`、`i--`、`--i` 和 `+=` / `-=` / `*=` / `/=` / `%=`。
+- `print(value)` 不自动换行；逐行输出使用 `println(value)`。
 - 分支表达式只保留 `match`，不支持 `switch`。
 - 标准库路径使用 `std.http`，不支持 `std:http`。
 - HTTP 使用 `http.get/post/request`，不支持旧的 `http.try_get`。

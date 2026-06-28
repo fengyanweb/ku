@@ -80,9 +80,9 @@ impl<'a> Generator<'a> {
         let mut out = String::from(
             "; Ku LLVM text prototype\n\
              source_filename = \"ku\"\n\n\
-             declare i32 @printf(i8*, ...)\n\
-             declare i32 @puts(i8*)\n\n\
-             @.ku.fmt.int = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"\n\
+             declare i32 @printf(i8*, ...)\n\n\
+             @.ku.fmt.int = private unnamed_addr constant [5 x i8] c\"%lld\\00\"\n\
+             @.ku.fmt.str = private unnamed_addr constant [3 x i8] c\"%s\\00\"\n\
              @.ku.true = private unnamed_addr constant [5 x i8] c\"true\\00\"\n\
              @.ku.false = private unnamed_addr constant [6 x i8] c\"false\\00\"\n",
         );
@@ -678,7 +678,7 @@ impl<'a> FunctionEmitter<'a> {
             IrType::Int => {
                 let call = self.fresh_value();
                 out.push_str(&format!(
-                    "  {call} = call i32 (i8*, ...) @printf(i8* getelementptr inbounds ([6 x i8], [6 x i8]* @.ku.fmt.int, i64 0, i64 0), i64 {})\n",
+                    "  {call} = call i32 (i8*, ...) @printf(i8* getelementptr inbounds ([5 x i8], [5 x i8]* @.ku.fmt.int, i64 0, i64 0), i64 {})\n",
                     value.text
                 ));
             }
@@ -689,11 +689,11 @@ impl<'a> FunctionEmitter<'a> {
                     value.text
                 ));
                 let call = self.fresh_value();
-                out.push_str(&format!("  {call} = call i32 @puts(i8* {selected})\n"));
+                out.push_str(&format!("  {call} = call i32 (i8*, ...) @printf(i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.ku.fmt.str, i64 0, i64 0), i8* {selected})\n"));
             }
             IrType::Str => {
                 let call = self.fresh_value();
-                out.push_str(&format!("  {call} = call i32 @puts(i8* {})\n", value.text));
+                out.push_str(&format!("  {call} = call i32 (i8*, ...) @printf(i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.ku.fmt.str, i64 0, i64 0), i8* {})\n", value.text));
             }
             _ => {
                 return Err(unsupported(

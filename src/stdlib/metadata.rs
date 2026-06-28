@@ -93,7 +93,12 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("config", "env") => vec![],
         ("config", "env_file") => vec![str_arg()],
         ("config", "yaml") => vec![str_arg()],
-        ("time", "now" | "unix" | "millis") => vec![],
+        ("time", "now" | "unix" | "millis" | "date") => vec![],
+        ("time", "from_unix" | "from_millis" | "is_leap") => vec![int_arg()],
+        ("time", "days_in_month") => vec![int_arg(), int_arg()],
+        ("time", "sleep") => vec![ArgRule::Is(TypePattern::Any)],
+        ("task", "stats") => vec![],
+        ("task", "stress") => vec![int_arg(), int_arg(), int_arg()],
         ("http", "get") => vec![str_arg()],
         ("http", "post") => vec![str_arg(), str_arg()],
         ("http", "request") => vec![ArgRule::Is(TypePattern::ObjectAny)],
@@ -123,7 +128,13 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("json", "stringify") => TypePattern::String,
         ("config", "env" | "env_file") => TypePattern::ObjectAny,
         ("config", "yaml") => TypePattern::ResultOf(Box::new(TypePattern::ObjectAny)),
-        ("time", "now" | "unix" | "millis") => TypePattern::Int,
+        ("time", "now" | "date" | "from_unix" | "from_millis") => TypePattern::ObjectAny,
+        ("time", "unix" | "millis") => TypePattern::Int,
+        ("time", "is_leap") => TypePattern::Bool,
+        ("time", "days_in_month") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
+        ("time", "sleep") => TypePattern::ResultOf(Box::new(TypePattern::Null)),
+        ("task", "stats") => task_stats_pattern(),
+        ("task", "stress") => task_stress_pattern(),
         ("http", "get" | "post" | "request") => {
             TypePattern::ResultOf(Box::new(http_response_pattern()))
         }
@@ -151,22 +162,32 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("array", "try_get")
         | ("json", "try_parse")
         | ("config", "yaml")
+        | ("time", "days_in_month" | "sleep")
         | ("http", "get" | "post" | "request") => FailureMode::ReturnsResult,
-        ("fs", "read" | "write") | ("json", "parse") | ("config", "env_file") => {
-            FailureMode::MayPanic
-        }
+        ("fs", "read" | "write")
+        | ("json", "parse")
+        | ("config", "env_file")
+        | ("task", "stats" | "stress") => FailureMode::MayPanic,
         _ => FailureMode::Never,
     }
 }
 
 pub(crate) fn module_requires_import(module: &str) -> bool {
-    matches!(module, "fs" | "http" | "config")
+    matches!(module, "fs" | "http" | "config" | "task")
 }
 
 pub(crate) fn is_std_module(module: &str) -> bool {
     matches!(
         module,
-        "fs" | "lexer" | "parser" | "string" | "array" | "json" | "config" | "time" | "http"
+        "fs" | "lexer"
+            | "parser"
+            | "string"
+            | "array"
+            | "json"
+            | "config"
+            | "time"
+            | "task"
+            | "http"
     )
 }
 
@@ -228,5 +249,42 @@ fn http_route_pattern() -> TypePattern {
             TypePattern::ArrayOf(Box::new(TypePattern::String)),
         ),
         ("handler".to_string(), TypePattern::Any),
+    ])
+}
+
+fn task_stats_pattern() -> TypePattern {
+    TypePattern::ObjectFields(vec![
+        ("active_tasks".to_string(), TypePattern::Int),
+        ("registered_tasks".to_string(), TypePattern::Int),
+        ("queued_tasks".to_string(), TypePattern::Int),
+        ("wait_edges".to_string(), TypePattern::Int),
+        ("queued_blocking_jobs".to_string(), TypePattern::Int),
+        ("running_blocking_jobs".to_string(), TypePattern::Int),
+        ("task_workers".to_string(), TypePattern::Int),
+        ("blocking_workers".to_string(), TypePattern::Int),
+        ("total_submissions".to_string(), TypePattern::Int),
+        ("accepted_submissions".to_string(), TypePattern::Int),
+        ("rejected_task_limit".to_string(), TypePattern::Int),
+        ("rejected_task_queue".to_string(), TypePattern::Int),
+        ("rejected_task_internal".to_string(), TypePattern::Int),
+        ("finished_tasks".to_string(), TypePattern::Int),
+    ])
+}
+
+fn task_stress_pattern() -> TypePattern {
+    TypePattern::ObjectFields(vec![
+        ("demand".to_string(), TypePattern::Int),
+        ("producers".to_string(), TypePattern::Int),
+        ("hold_ms".to_string(), TypePattern::Int),
+        ("peak_active".to_string(), TypePattern::Int),
+        ("accepted".to_string(), TypePattern::Int),
+        ("rejected_limit".to_string(), TypePattern::Int),
+        ("rejected_queue".to_string(), TypePattern::Int),
+        ("rejected_internal".to_string(), TypePattern::Int),
+        ("finished".to_string(), TypePattern::Int),
+        ("submit_ms".to_string(), TypePattern::Int),
+        ("total_ms".to_string(), TypePattern::Int),
+        ("task_workers".to_string(), TypePattern::Int),
+        ("blocking_workers".to_string(), TypePattern::Int),
     ])
 }

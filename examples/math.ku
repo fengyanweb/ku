@@ -11,5 +11,5 @@ fn hidden(value: int): int {
 }
 
 fn main() {
-    print(Add(1, 2))
+    println(Add(1, 2))
 }

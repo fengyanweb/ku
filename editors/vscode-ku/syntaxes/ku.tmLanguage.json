@@ -33,7 +33,7 @@
     },
     "keywords": {
       "patterns": [
-        { "name": "keyword.control.ku", "match": "\\b(async|await|fn|struct|enum|module|import|from|if|else|while|for|in|break|continue|match|try|catch|finally|fail|panic|return|print|println)\\b" },
+        { "name": "keyword.control.ku", "match": "\\b(async|await|fn|struct|enum|module|import|from|if|else|while|for|in|break|continue|match|try|catch|finally|fail|panic|return|print)\\b" },
         { "name": "invalid.deprecated.ku", "match": "\\b(let|mut|const)\\b" }
       ]
     },
@@ -45,7 +45,8 @@
     "functions": {
       "patterns": [
         { "name": "entity.name.function.ku", "match": "(?<=\\bfn\\s)[A-Za-z_][A-Za-z0-9_]*" },
-        { "name": "support.function.stdlib.ku", "match": "\\b(string|array|json|time|lexer|parser|fs|http|config)\\.[A-Za-z_][A-Za-z0-9_]*\\b" }
+        { "name": "support.function.builtin.ku", "match": "\\b(len|str|ok|err|println)\\b(?=\\s*\\()" },
+        { "name": "support.function.stdlib.ku", "match": "\\b(string|array|json|time|lexer|parser|fs|http|config|task)\\.[A-Za-z_][A-Za-z0-9_]*\\b" }
       ]
     },
     "constants": {

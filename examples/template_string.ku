@@ -3,7 +3,7 @@ fn main() {
     score:int = 100
     price:float = 9.5
 
-    print(`Hello {name}`)
-    print(`score {score + " points"}`)
-    print(`price {"$" + price}`)
+    println(`Hello {name}`)
+    println(`score {score + " points"}`)
+    println(`price {"$" + price}`)
 }

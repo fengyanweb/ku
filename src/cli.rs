@@ -331,6 +331,9 @@ fn stmt_contains_async(stmt: &Stmt) -> bool {
         Stmt::AssignTarget { target, value, .. } => {
             assign_target_contains_await(target) || expr_contains_await(value)
         }
+        Stmt::CompoundAssign { target, value, .. } => {
+            assign_target_contains_await(target) || expr_contains_await(value)
+        }
         Stmt::DestructureAssign { values, .. } => values.iter().any(expr_contains_await),
         Stmt::If {
             condition,
@@ -648,7 +651,7 @@ fn program_has_only_std_imports(program: &Program) -> bool {
 }
 
 fn is_std_import_path(path: &str) -> bool {
-    path.starts_with("std.") || path.starts_with("std:")
+    path == "std" || path.starts_with("std.") || path.starts_with("std:")
 }
 
 #[derive(Clone)]
@@ -750,19 +753,21 @@ impl ModuleLoader {
             let Item::Import(import) = item else {
                 continue;
             };
-            if let Some(module) = std_import_module(import)? {
-                if local_names.contains(&module) || !imported_names.insert(module.clone()) {
-                    return Err(KuError::runtime(
-                        format!(
-                            "import namespace '{module}' conflicts with another top-level name"
-                        ),
-                        import.span,
-                    ));
+            if let Some(modules) = std_import_modules(import)? {
+                for module in modules {
+                    if local_names.contains(&module) || !imported_names.insert(module.clone()) {
+                        return Err(KuError::runtime(
+                            format!(
+                                "import namespace '{module}' conflicts with another top-level name"
+                            ),
+                            import.span,
+                        ));
+                    }
+                    items.push(Item::Module(ModuleDecl {
+                        name: format!("std:{module}"),
+                        span: import.span,
+                    }));
                 }
-                items.push(Item::Module(ModuleDecl {
-                    name: format!("std:{module}"),
-                    span: import.span,
-                }));
                 continue;
             }
             let import_path =
@@ -915,7 +920,39 @@ fn check_library_program(program: &Program) -> KuResult<()> {
     Checker::new().check(&program)
 }
 
-fn std_import_module(import: &ImportDecl) -> KuResult<Option<String>> {
+fn std_import_modules(import: &ImportDecl) -> KuResult<Option<Vec<String>>> {
+    if import.path == "std" {
+        let ImportKind::Named(names) = &import.kind else {
+            return Err(KuError::runtime(
+                "std root imports must use named form, for example import { fs, http } from \"std\"",
+                import.span,
+            ));
+        };
+        let mut modules = Vec::new();
+        let mut seen = HashSet::new();
+        for name in names {
+            if name.alias.is_some() {
+                return Err(KuError::runtime(
+                    "std root imports do not support aliases yet",
+                    name.span,
+                ));
+            }
+            if !stdlib::metadata::is_std_module(&name.source) {
+                return Err(KuError::runtime(
+                    format!("unknown std module '{}'", name.source),
+                    name.span,
+                ));
+            }
+            if !seen.insert(name.source.clone()) {
+                return Err(KuError::runtime(
+                    format!("duplicate std module import '{}'", name.source),
+                    name.span,
+                ));
+            }
+            modules.push(name.source.clone());
+        }
+        return Ok(Some(modules));
+    }
     let module = if let Some(module) = import.path.strip_prefix("std.") {
         module
     } else {
@@ -928,7 +965,7 @@ fn std_import_module(import: &ImportDecl) -> KuResult<Option<String>> {
         ));
     }
     match &import.kind {
-        ImportKind::Namespace(namespace) if namespace == module => Ok(Some(module.to_string())),
+        ImportKind::Namespace(namespace) if namespace == module => Ok(Some(vec![module.to_string()])),
         ImportKind::Namespace(_) => Err(KuError::runtime(
             format!(
                 "std module '{}' must be imported as '{}'",
@@ -936,7 +973,7 @@ fn std_import_module(import: &ImportDecl) -> KuResult<Option<String>> {
             ),
             import.span,
         )),
-        ImportKind::Glob => Ok(Some(module.to_string())),
+        ImportKind::Glob => Ok(Some(vec![module.to_string()])),
         ImportKind::Named(_) => Err(KuError::runtime(
             "std module imports must use namespace form, for example import http from \"std.http\", or shorthand import \"std.http\"",
             import.span,
@@ -1203,6 +1240,10 @@ fn rewrite_function_calls_in_stmt(
             rewrite_function_calls_in_assign_target(target, rename_map)?;
             rewrite_function_calls_in_expr(value, rename_map)
         }
+        Stmt::CompoundAssign { target, value, .. } => {
+            rewrite_function_calls_in_assign_target(target, rename_map)?;
+            rewrite_function_calls_in_expr(value, rename_map)
+        }
         Stmt::DestructureAssign { values, .. } => {
             for value in values {
                 rewrite_function_calls_in_expr(value, rename_map)?;
@@ -1408,6 +1449,10 @@ fn rewrite_namespaces_in_stmt(
             rewrite_namespaces_in_expr(value, namespaces)
         }
         Stmt::AssignTarget { target, value, .. } => {
+            rewrite_namespaces_in_assign_target(target, namespaces)?;
+            rewrite_namespaces_in_expr(value, namespaces)
+        }
+        Stmt::CompoundAssign { target, value, .. } => {
             rewrite_namespaces_in_assign_target(target, namespaces)?;
             rewrite_namespaces_in_expr(value, namespaces)
         }

@@ -186,6 +186,47 @@ fn main() {
 }
 
 #[test]
+fn ir_compound_assignment_evaluates_index_once() {
+    let text = lower_ir(
+        r#"
+fn idx(): int {
+    return 0
+}
+
+fn row(): int {
+    return 0
+}
+
+fn col(): int {
+    return 0
+}
+
+fn main() {
+    nums:[int] = [1]
+    nums[idx()] += 1
+    rows:[[int]] = [[1]]
+    rows[row()][col()] += 1
+}
+"#,
+    );
+    let idx_calls = text.matches("idx()").count();
+    assert_eq!(
+        idx_calls, 2,
+        "compound assignment should lower one idx() call plus the function header:\n{text}"
+    );
+    assert_eq!(
+        text.matches("row()").count(),
+        2,
+        "compound assignment should lower one row() call plus the function header:\n{text}"
+    );
+    assert_eq!(
+        text.matches("col()").count(),
+        2,
+        "compound assignment should lower one col() call plus the function header:\n{text}"
+    );
+}
+
+#[test]
 fn llvm_backend_lowers_struct_values_and_field_assignment() {
     let llvm = generate_llvm(
         r#"

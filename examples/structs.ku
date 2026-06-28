@@ -7,5 +7,5 @@ struct Token {
 
 fn main() {
     token = Token { kind: "Ident", text: "name", line: 1, column: 1 }
-    print(token.kind + ":" + token.text)
+    println(token.kind + ":" + token.text)
 }

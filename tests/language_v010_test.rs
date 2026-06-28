@@ -644,6 +644,44 @@ fn main(): null! {
 }
 
 #[test]
+fn std_task_exposes_bounded_runtime_stats_and_stress_report() {
+    let source = r#"
+import "std.task"
+import "std.time"
+
+fn main() {
+    started = time.millis()
+    before = task.stats()
+    report = task.stress(2000, 4, 1)
+    after = task.stats()
+    print(report.demand)
+    print(report.peak_active)
+    print(report.accepted + report.rejected_limit + report.rejected_queue + report.rejected_internal)
+    print(after.finished_tasks - before.finished_tasks)
+    print(time.millis() - started)
+}
+"#;
+    check_source("inline.ku", source).expect("task stress API should check");
+    run_source("inline.ku", source).expect("task stress API should run and drain");
+
+    let err = check_source(
+        "inline.ku",
+        r#"
+import "std.task"
+fn main() {
+    task.stress("many", 4, 1)
+}
+"#,
+    )
+    .expect_err("task.stress must reject non-int demand")
+    .to_string();
+    assert!(
+        err.contains("expected int"),
+        "task.stress argument types must be checked: {err}"
+    );
+}
+
+#[test]
 fn native_c_backend_lowers_enum_payload_and_guarded_match_cfg() {
     let source = r#"
 enum Maybe {

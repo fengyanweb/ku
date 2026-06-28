@@ -1,0 +1,42 @@
+import { task, time } from "std"
+
+fn main() {
+    demand = 1000000
+    producers = 15
+    hold_ms = 250
+
+    started_at = time.millis()
+    before = task.stats()
+
+    println("=== Ku million concurrent-demand stress test ===")
+    println(`StartMs: {started_at}`)
+    println(`Demand: {demand}`)
+    println(`Producers: {producers}`)
+    println(`AcceptedTaskHoldMs: {hold_ms}`)
+    println(`BeforeActiveTasks: {before.active_tasks}`)
+    println(`TaskWorkers: {before.task_workers}`)
+    println(`BlockingWorkers: {before.blocking_workers}`)
+
+    report = task.stress(demand, producers, hold_ms)
+
+    finished_at = time.millis()
+    after = task.stats()
+    wall_elapsed = finished_at - started_at
+
+    println("")
+    println(`FinishMs: {finished_at}`)
+    println(`ObservedWallMs: {wall_elapsed}`)
+    println(`SubmitMs: {report.submit_ms}`)
+    println(`RuntimeTotalMs: {report.total_ms}`)
+    println(`PeakActiveTasks: {report.peak_active}`)
+    println(`AcceptedTasks: {report.accepted}`)
+    println(`RejectedByTaskLimit: {report.rejected_limit}`)
+    println(`RejectedByQueue: {report.rejected_queue}`)
+    println(`RejectedInternal: {report.rejected_internal}`)
+    println(`FinishedTasks: {report.finished}`)
+    println(`AfterActiveTasks: {after.active_tasks}`)
+    println(`AfterQueuedTasks: {after.queued_tasks}`)
+    println(`AfterBlockingJobs: {after.queued_blocking_jobs + after.running_blocking_jobs}`)
+    println("Note: demand is one million submissions. Ku keeps the active task cap bounded, rejects excess demand structurally, and does not queue forever.")
+    println("Use run-test.ps1 for process CPU, memory, and thread sampling.")
+}

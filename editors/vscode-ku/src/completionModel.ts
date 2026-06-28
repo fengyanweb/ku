@@ -22,7 +22,6 @@ export const keywords = [
   "panic",
   "return",
   "print",
-  "println",
   "true",
   "false",
   "null",
@@ -30,7 +29,8 @@ export const keywords = [
 
 export const types = ["int", "float", "bool", "str", "null"];
 export const builtins = ["len", "str", "ok", "err", "println"];
-export const stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.config", "std.time"];
+export const stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.config", "std.time", "std.task"];
+export const stdRootModules = ["fs", "http", "string", "array", "json", "config", "time", "task"];
 
 export const stdFunctions = [
   "fs.read",
@@ -63,6 +63,24 @@ export const stdFunctions = [
   "time.now",
   "time.unix",
   "time.millis",
+  "time.from_unix",
+  "time.from_millis",
+  "time.date",
+  "time.datetime",
+  "time.format",
+  "time.parse",
+  "time.duration",
+  "time.add",
+  "time.sub",
+  "time.diff",
+  "time.compare",
+  "time.parts",
+  "time.weekday",
+  "time.is_leap",
+  "time.days_in_month",
+  "time.sleep",
+  "task.stats",
+  "task.stress",
 ];
 
 export const namespaceMembers: Record<string, string[]> = {
@@ -72,8 +90,28 @@ export const namespaceMembers: Record<string, string[]> = {
   array: ["len", "try_get", "push", "concat"],
   json: ["parse", "try_parse", "stringify"],
   config: ["env", "env_file", "yaml"],
-  time: ["now", "unix", "millis"],
-  task: ["status", "cancel", "await_timeout"],
+  time: [
+    "now",
+    "unix",
+    "millis",
+    "from_unix",
+    "from_millis",
+    "date",
+    "datetime",
+    "format",
+    "parse",
+    "duration",
+    "add",
+    "sub",
+    "diff",
+    "compare",
+    "parts",
+    "weekday",
+    "is_leap",
+    "days_in_month",
+    "sleep",
+  ],
+  task: ["status", "cancel", "await_timeout", "stats", "stress"],
 };
 
 export function stdImportPathLabels(current: string): string[] {

@@ -315,6 +315,39 @@ fn run_hello_prints_expected_greeting() {
 }
 
 #[test]
+fn run_print_does_not_append_newline_and_println_does() {
+    let path = unique_temp_path("print-newline");
+    fs::write(
+        &path,
+        r#"
+fn main() {
+    print("A")
+    print("B")
+    println("C")
+}
+"#,
+    )
+    .expect("write print semantics source");
+
+    let path_arg = path_arg(&path);
+    let result = run_ku(&["run", &path_arg]);
+    let _ = fs::remove_file(&path);
+
+    assert_eq!(
+        result.code,
+        Some(0),
+        "print semantics program failed\nstdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
+    );
+    assert_eq!(
+        result.stdout, "ABC\n",
+        "print should not add a newline, println should\nstderr:\n{}",
+        result.stderr
+    );
+}
+
+#[test]
 fn run_http_service_handles_local_request() {
     let _guard = HTTP_TEST_LOCK.lock().expect("http test lock poisoned");
     let address = unused_local_address();

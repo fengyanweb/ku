@@ -2,7 +2,7 @@ fn main() {
     nums:[int] = [1, 2, 3]
     names:[str] = ["Ku", "Lang"]
 
-    print(nums[0])
-    print(len(nums))
-    print(names[1])
+    println(nums[0])
+    println(len(nums))
+    println(names[1])
 }

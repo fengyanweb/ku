@@ -95,12 +95,6 @@ impl Parser {
             }
             loop {
                 let (name, span) = self.consume_ident("expected imported name")?;
-                if !is_exported_name(&name) {
-                    return Err(KuError::parse(
-                        format!("imported name '{name}' is not exported; exported names must start with uppercase"),
-                        span,
-                    ));
-                }
                 let alias = if self.match_ident_text("as") {
                     let (alias, alias_span) = self.consume_ident("expected import alias")?;
                     if !is_valid_namespace(&alias) {
@@ -381,6 +375,21 @@ impl Parser {
         Ok((statements, Span::new(start, end)))
     }
 
+    fn block_or_single_statement(&mut self, context: &str) -> KuResult<(Vec<Stmt>, Span)> {
+        if self.check(&TokenKind::LBrace) {
+            return self.block();
+        }
+        if self.check(&TokenKind::Eof) || self.check(&TokenKind::Else) {
+            return Err(KuError::parse(
+                format!("expected '{{' or statement after '{context}'"),
+                self.peek().span,
+            ));
+        }
+        let stmt = self.statement()?;
+        let span = stmt_span(&stmt);
+        Ok((vec![stmt], span))
+    }
+
     fn statement(&mut self) -> KuResult<Stmt> {
         if self.match_kind(&TokenKind::Let) {
             return Err(KuError::parse(
@@ -447,14 +456,14 @@ impl Parser {
         self.consume(&TokenKind::LParen, "expected '(' after 'if'")?;
         let condition = self.expression()?;
         self.consume(&TokenKind::RParen, "expected ')' after if condition")?;
-        let (then_branch, then_span) = self.block()?;
+        let (then_branch, then_span) = self.block_or_single_statement("if")?;
         let (else_branch, end) = if self.match_kind(&TokenKind::Else) {
             if self.match_kind(&TokenKind::If) {
                 let nested = self.if_statement()?;
                 let span = stmt_span(&nested);
                 (vec![nested], span.end)
             } else {
-                let (body, span) = self.block()?;
+                let (body, span) = self.block_or_single_statement("else")?;
                 (body, span.end)
             }
         } else {
@@ -473,7 +482,7 @@ impl Parser {
         self.consume(&TokenKind::LParen, "expected '(' after 'while'")?;
         let condition = self.expression()?;
         self.consume(&TokenKind::RParen, "expected ')' after while condition")?;
-        let (body, body_span) = self.block()?;
+        let (body, body_span) = self.block_or_single_statement("while")?;
         Ok(Stmt::While {
             condition,
             body,
@@ -486,7 +495,7 @@ impl Parser {
         let (name, _) = self.consume_ident("expected loop variable after 'for'")?;
         self.consume(&TokenKind::In, "expected 'in' after loop variable")?;
         let iterable = self.expression()?;
-        let (body, body_span) = self.block()?;
+        let (body, body_span) = self.block_or_single_statement("for")?;
         Ok(Stmt::For {
             name,
             iterable,
@@ -588,6 +597,16 @@ impl Parser {
     }
 
     fn expression_or_assignment_statement(&mut self) -> KuResult<Stmt> {
+        if self.match_kind(&TokenKind::PlusPlus) {
+            let start = self.previous().span.start;
+            let expr = self.expression()?;
+            return self.increment_statement(expr, BinaryOp::Add, start);
+        }
+        if self.match_kind(&TokenKind::MinusMinus) {
+            let start = self.previous().span.start;
+            let expr = self.expression()?;
+            return self.increment_statement(expr, BinaryOp::Subtract, start);
+        }
         if self.is_destructure_assignment_start() {
             return self.destructure_assignment_statement();
         }
@@ -633,11 +652,26 @@ impl Parser {
                 }),
             };
         }
+        if let Some(op) = self.match_compound_assignment_op() {
+            let start = expr.span.start;
+            let target = assign_target_from_expr(expr)?;
+            let value = self.expression()?;
+            self.optional_semicolon();
+            let end = value.span.end;
+            return Ok(Stmt::CompoundAssign {
+                target,
+                op,
+                value,
+                span: Span::new(start, end),
+            });
+        }
         if self.match_kind(&TokenKind::PlusPlus) {
-            return self.increment_statement(expr, BinaryOp::Add);
+            let start = expr.span.start;
+            return self.increment_statement(expr, BinaryOp::Add, start);
         }
         if self.match_kind(&TokenKind::MinusMinus) {
-            return self.increment_statement(expr, BinaryOp::Subtract);
+            let start = expr.span.start;
+            return self.increment_statement(expr, BinaryOp::Subtract, start);
         }
         self.optional_semicolon();
         let span = expr.span;
@@ -685,32 +719,30 @@ impl Parser {
             )
     }
 
-    fn increment_statement(&mut self, expr: Expr, op: BinaryOp) -> KuResult<Stmt> {
-        let start = expr.span.start;
+    fn match_compound_assignment_op(&mut self) -> Option<BinaryOp> {
+        let op = match &self.peek().kind {
+            TokenKind::PlusEqual => BinaryOp::Add,
+            TokenKind::MinusEqual => BinaryOp::Subtract,
+            TokenKind::StarEqual => BinaryOp::Multiply,
+            TokenKind::SlashEqual => BinaryOp::Divide,
+            TokenKind::PercentEqual => BinaryOp::Remainder,
+            _ => return None,
+        };
+        self.advance();
+        Some(op)
+    }
+
+    fn increment_statement(&mut self, expr: Expr, op: BinaryOp, start: Position) -> KuResult<Stmt> {
         let end = self.previous().span.end;
-        let target = assign_target_from_expr(expr.clone())?;
+        let target = assign_target_from_expr(expr)?;
         let one = Expr::new(ExprKind::Literal(Literal::Int(1)), Span::new(start, end));
-        let value = Expr::new(
-            ExprKind::Binary {
-                left: Box::new(expr),
-                op,
-                right: Box::new(one),
-            },
-            Span::new(start, end),
-        );
         self.optional_semicolon();
-        match target {
-            AssignTarget::Variable(name) => Ok(Stmt::Assign {
-                name,
-                value,
-                span: Span::new(start, end),
-            }),
-            target => Ok(Stmt::AssignTarget {
-                target,
-                value,
-                span: Span::new(start, end),
-            }),
-        }
+        Ok(Stmt::CompoundAssign {
+            target,
+            op,
+            value: one,
+            span: Span::new(start, end),
+        })
     }
 
     fn expression(&mut self) -> KuResult<Expr> {
@@ -1403,12 +1435,6 @@ fn token_kind_eq(left: &TokenKind, right: &TokenKind) -> bool {
     std::mem::discriminant(left) == std::mem::discriminant(right)
 }
 
-fn is_exported_name(name: &str) -> bool {
-    name.chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_uppercase())
-}
-
 fn is_valid_namespace(name: &str) -> bool {
     name.chars()
         .next()
@@ -1470,6 +1496,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::VarDecl { span, .. }
         | Stmt::Assign { span, .. }
         | Stmt::AssignTarget { span, .. }
+        | Stmt::CompoundAssign { span, .. }
         | Stmt::DestructureAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }

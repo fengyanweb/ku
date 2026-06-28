@@ -118,6 +118,12 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    CompoundAssign {
+        target: AssignTarget,
+        op: BinaryOp,
+        value: Expr,
+        span: Span,
+    },
     DestructureAssign {
         names: Vec<Option<String>>,
         values: Vec<Expr>,

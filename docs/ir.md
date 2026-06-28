@@ -47,7 +47,7 @@ ku ir examples\function.ku
 - 能保留参数和返回类型。
 - 非叶子表达式会生成稳定 `%tN` 临时值。
 - 表达式有 `IrExpr.ty`，变量首次赋值降成 typed `let`，再次赋值降成 `store`。
-- `print` 有独立 IR 指令，不再和普通表达式混在一起。
+- `print` 有独立 IR 指令，不再和普通表达式混在一起；语义是不自动追加换行。
 - 数组/字段赋值通过 `IrLValue` 表达。
 - `if` / `while` 已有基础 block 和 `Branch` / `Jump` / `Return` terminator。
 - `for` 已有 `ForEach` terminator。

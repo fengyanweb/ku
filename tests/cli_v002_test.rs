@@ -111,12 +111,12 @@ async fn main(): null! {
         spin(), spin(), spin(), spin()
     ]
     for task in tasks.clone() {
-        print(task.await_timeout(0))
+        println(task.await_timeout(0))
         task.cancel()
-        print(task.status())
+        println(task.status())
     }
     for task in tasks {
-        print(await task)
+        println(await task)
     }
     return ok(null)
 }

@@ -55,9 +55,10 @@ fn main() {
     parsed = json.parse(json_text)
     print(json.stringify(parsed))
 
-    now:int = time.now()
+    now = time.now()
+    unix:int = time.unix(now)
     millis:int = time.millis()
-    print(now <= millis)
+    print(unix <= millis)
 }
 "#;
 
@@ -699,6 +700,71 @@ fn stdlib_type_errors_are_checked_before_run() {
         let err = check_err(source);
         assert!(err.contains("error:"), "unexpected error: {err}");
     }
+}
+
+#[test]
+fn std_time_documented_api_check_and_run() {
+    let source = r#"
+import { time } from "std"
+
+fn main(): null! {
+    t = time.from_millis(1782210600123)
+    if (time.unix(t) != 1782210600) {
+        panic("bad unix")
+    }
+    if (time.millis(t) != 1782210600123) {
+        panic("bad millis")
+    }
+
+    d = time.date(2026, 6, 23)?
+    if (time.weekday(d) != 2) {
+        panic("bad weekday")
+    }
+    if (time.days_in_month(2026, 2)? != 28) {
+        panic("bad days")
+    }
+    if (!time.is_leap(2028)) {
+        panic("bad leap")
+    }
+
+    duration = time.duration(5, "s")?
+    if (time.millis(duration) != 5000) {
+        panic("bad duration")
+    }
+    later = time.add(t, duration)
+    if (time.diff(later, t).millis != 5000) {
+        panic("bad diff")
+    }
+    if (time.compare(later, t) != 1) {
+        panic("bad compare")
+    }
+
+    text = time.format(t, "yyyy-MM-dd HH:mm:ss", "utc")?
+    parsed = time.parse(text, "yyyy-MM-dd HH:mm:ss", "utc")?
+    if (time.millis(parsed) != 1782210600000) {
+        panic("bad parse")
+    }
+    parts = time.parts(t, "+08:00")?
+    if (parts.year != 2026 || parts.month != 6 || parts.day != 23) {
+        panic("bad parts")
+    }
+    time.sleep(time.duration(0)?)?
+    return ok(null)
+}
+"#;
+
+    check_source("inline.ku", source).expect("std.time documented api should check");
+    run_source("inline.ku", source).expect("std.time documented api should run");
+
+    let err = run_source(
+        "inline.ku",
+        r#"fn main(): null! { time.date(2026, 13, 40)? return ok(null) }"#,
+    )
+    .expect_err("bad date should propagate Result error");
+    assert!(
+        err.to_string().contains("invalid_date"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

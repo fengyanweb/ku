@@ -73,8 +73,8 @@ fn main() {
     }
     prefix = "Hi "
 
-    print(text)
-    print(greet(user.name))
+    println(text)
+    println(greet(user.name))
 }
 ```
 
@@ -93,10 +93,10 @@ fn main() {
     } catch (err) {
         message = "caught: " + err.message
     } finally {
-        print("cleanup")
+        println("cleanup")
     }
 
-    print(message)
+    println(message)
 }
 ```
 
@@ -130,7 +130,7 @@ import lib from "./lib.ku"
 fn main() {
     user = lib.User { name: "Ku" }
     state = lib.State.Ready
-    print(lib.Format(user))
+    println(lib.Format(user))
 }
 ```
 
@@ -174,6 +174,8 @@ result.ku
 try_read.ku
 stdlib.ku
 package/
+http_server.ku
+http_bench.ps1
 ```
 
 ## 文档
@@ -205,6 +207,9 @@ package/
 ```txt
 支持 str | int 这类联合类型，用于参数、变量和返回值检查。
 支持 break / continue，并修复 for + continue 作用域弹出问题。
+支持 `for i in 10` 非负整数迭代，语义为 `0 <= i < 10`。
+支持单语句控制体：`if (ok) break`、`while (i < 10) i++`、`for i in 4 total += i`。
+支持 `++i`、`--i`、`i++`、`i--` 和 `+=` / `-=` / `*=` / `/=` / `%=` 复合赋值。
 支持位置解构赋值 a, b = 1, 2 和丢弃占位符 _。
 支持可选字段访问 user?.name。
 支持带参数/返回类型的箭头函数，例如 `(a:int, b:int): int => a + b` 和 `x:int => x * 2`；函数保持第一公民。
@@ -219,14 +224,25 @@ native C 后端已有统一 Error 对象 ABI、复杂 Result payload 和 try/cat
 package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
 registry 执行层已有 HTTPS-only 下载、SHA-256、内容寻址 cache 和有界安装锁；签名/归档决策前 CLI 保持 fail-closed。
 async runtime 已有 blocking shutdown drain、累计指标和百万并发需求压力测试。
+仓库根目录提供 `test.ku` 和 `run-test.ps1`：前者通过 `std.task` 打印百万并发需求测试的前后时间与 runtime 指标，后者额外采集进程 CPU、峰值内存和线程数。
+`std.time` 已按第一版文档实现 Time/Date/Duration object、format/parse/date/datetime/duration/add/sub/diff/compare/parts/weekday/is_leap/days_in_month/sleep 和固定偏移 zone。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
 match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。
-std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.service/http.server 配置与响应 helper。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes，路径参数使用 `{id}`；handler 固定 `(req, res)`，返回 `{ status, headers, body }`，并禁止修改外层捕获变量；bind/listen 只接收 address，配置来自 service/server 对象，会先真实绑定端口并编译运行时路由表，listen/run 会阻塞处理基础 HTTP 请求，listener.close 可显式关闭未运行的 listener。fs 需要 `import "std.fs"` 后使用，并提供 read/write 与 try_read/try_write。std.config 需要 `import "std.config"` 后使用，并提供 env/env_file/yaml 第一版配置读取。VS Code formatter 已支持 4 空格缩进、空行压缩、运算符/逗号空格和 `} else/catch/finally` 合并。
+标准库可以用 `import { fs, http, time } from "std"` 一次导入多个模块。std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.service/http.server 配置与响应 helper。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes，路径参数使用 `{id}`；handler 固定 `(req, res)`，返回 `{ status, headers, body }`，并禁止修改外层捕获变量；bind/listen 只接收 address，配置来自 service/server 对象，会先真实绑定端口并编译运行时路由表，listen/run 会阻塞处理基础 HTTP 请求，listener.close 可显式关闭未运行的 listener。fs 需要 `import "std.fs"` 或 `import { fs } from "std"` 后使用，并提供 read/write 与 try_read/try_write。std.config 需要显式导入后使用，并提供 env/env_file/yaml 第一版配置读取。VS Code formatter 已支持 4 空格缩进、空行压缩、运算符/逗号空格、`++/--`、复合赋值和 `} else/catch/finally` 合并。
+
+`print(value)` 不自动换行；需要逐行输出时使用 `println(value)`。
+
+HTTP 服务端示例和压测脚本：
+
+```powershell
+cargo run -- run examples\http_server.ku
+powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127.0.0.1:8080/json -Requests 10000 -Concurrency 100
+```
 native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wrapper。
 async fn 调用会立即启动 task，必须显式返回 T!；await task? 等价于 (await task)?。
 async runtime 默认最多 1024 个 task；blocking worker 为 min(32, max(4, CPU 核心数))，blocking queue 最多 1024，超限返回结构化 task Err。
 task.status/cancel/await_timeout 已实现；取消是协作式的，等待超时不会隐式取消目标任务。
-registry resolver 支持精确版本和 caret 范围、最高兼容版本选择和冲突诊断；网络下载仍未接入。
+registry resolver 支持精确版本和 caret 范围、最高兼容版本选择和冲突诊断；HTTPS-only 获取、SHA-256、内容寻址 cache 和安装锁已实现，签名信任根、归档格式、受限解包和 CLI 远程 import 串联前仍保持 fail-closed。
 LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 ```
 
@@ -234,9 +250,9 @@ LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 
 ```txt
 LLVM array/enum、闭包和高级控制流 lowering
-registry 索引协议、网络下载、SHA-256 执行和缓存原子更新
+registry 签名信任根、归档格式、受限解包和 CLI 远程 import 串联
 完整 match guard 模式矩阵和跨 guard 的穷尽性证明
-完整 native C 所有权、闭包、try/catch/finally 后端
+native C 闭包、动态 object、正式 owned string ABI
 native async ABI
 ```
 

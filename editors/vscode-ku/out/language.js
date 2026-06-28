@@ -77,7 +77,7 @@ function activate(context) {
     }), vscode.window.onDidChangeActiveTextEditor(() => {
         void refreshStatus();
         void refreshEditorContext();
-    }), vscode.languages.registerCompletionItemProvider(KU_MODE, new KuCompletionProvider(), ".", "\"", "'", "/", "{", "@"), vscode.languages.registerHoverProvider(KU_MODE, new KuHoverProvider()), vscode.languages.registerDefinitionProvider(KU_MODE, new KuDefinitionProvider()), vscode.languages.registerDocumentSymbolProvider(KU_MODE, new KuSymbolProvider()), vscode.languages.registerCodeActionsProvider(KU_MODE, new KuCodeActionProvider(), {
+    }), vscode.languages.registerCompletionItemProvider(KU_MODE, new KuCompletionProvider(), ".", "\"", "'", "/", "@"), vscode.languages.registerHoverProvider(KU_MODE, new KuHoverProvider()), vscode.languages.registerDefinitionProvider(KU_MODE, new KuDefinitionProvider()), vscode.languages.registerDocumentSymbolProvider(KU_MODE, new KuSymbolProvider()), vscode.languages.registerCodeActionsProvider(KU_MODE, new KuCodeActionProvider(), {
         providedCodeActionKinds: [vscode.CodeActionKind.QuickFix],
     }), vscode.languages.registerDocumentFormattingEditProvider(KU_MODE, new KuFormatter()));
     for (const doc of vscode.workspace.textDocuments) {
@@ -293,6 +293,9 @@ function hintFor(message) {
     }
     if (message.includes("std module 'config' must be imported")) {
         return "\nhelp: add import \"std.config\"";
+    }
+    if (message.includes("std module 'task' must be imported")) {
+        return "\nhelp: add import \"std.task\"";
     }
     if (message.includes("expected numbers")) {
         return "\nhint: 普通表达式不允许 str 和数字混合运算；模板字符串内才允许拼接。";
@@ -533,6 +536,10 @@ async function importPathCompletions(document, position, linePrefix) {
     if (current.startsWith("std.")) {
         return (0, completionModel_1.stdImportPathLabels)(current).map((module) => importPathItem(module, replaceRange, vscode.CompletionItemKind.Module));
     }
+    if ("std".startsWith(current)) {
+        const item = importPathItem("std", replaceRange, vscode.CompletionItemKind.Module);
+        return [item, ...(0, completionModel_1.stdImportPathLabels)("std.").map((module) => importPathItem(module, replaceRange, vscode.CompletionItemKind.Module))];
+    }
     if (current.startsWith("@")) {
         return dependencyCompletions(document);
     }
@@ -592,6 +599,9 @@ function exportNameCompletions(document, position) {
     if (!importPath) {
         return [];
     }
+    if (importPath === "std") {
+        return completionModel_1.stdRootModules.map((name) => new vscode.CompletionItem(name, vscode.CompletionItemKind.Module));
+    }
     const uri = (0, imports_1.resolveImportUri)(document, importPath);
     if (!uri || !fs.existsSync(uri.fsPath)) {
         return [];
@@ -618,9 +628,29 @@ function fieldCompletions(fields, detail) {
 function methodCompletions(methods) {
     return methods.map((method) => new vscode.CompletionItem(method, vscode.CompletionItemKind.Method));
 }
+function dottedHoverKey(document, range) {
+    const line = document.lineAt(range.start.line).text;
+    const word = document.getText(range);
+    const before = line.slice(0, range.start.character);
+    const after = line.slice(range.end.character);
+    const receiver = /([A-Za-z_][A-Za-z0-9_]*)\.$/.exec(before)?.[1];
+    if (receiver) {
+        return `${receiver}.${word}`;
+    }
+    const member = /^\s*\.([A-Za-z_][A-Za-z0-9_]*)/.exec(after)?.[1];
+    if (member) {
+        return `${word}.${member}`;
+    }
+    return undefined;
+}
 class KuHoverProvider {
     provideHover(document, position) {
-        const word = document.getText(document.getWordRangeAtPosition(position));
+        const range = document.getWordRangeAtPosition(position);
+        if (!range) {
+            return undefined;
+        }
+        const word = document.getText(range);
+        const dotted = dottedHoverKey(document, range);
         const docs = {
             "async": "`async fn` 调用会立即启动 task，并且第一版必须显式返回 `T!`。",
             "await": "`await task?` 等价于 `(await task)?`，只能写在 `async fn` 内。",
@@ -635,11 +665,30 @@ class KuHoverProvider {
             "server": "`http.server()` 返回带默认 timeout/body/header/concurrency 限制的 server 配置对象。",
             "fs": "`import \"std.fs\"` 后使用。支持 `fs.read/write/try_read/try_write`。",
             "config": "`import \"std.config\"` 后使用。支持 `config.env/env_file/yaml`。",
+            "task": "`import { task } from \"std\"` 或 `import \"std.task\"` 后使用。`task.stats()` 查看 runtime 指标，`task.stress(count, producers, hold_ms)` 执行有界并发需求压测。",
+            "time": "`time.now()` 返回 Time 对象；`time.millis()` 返回当前毫秒时间戳；支持 date/duration/format/parse/sleep。",
+            "time.now": "`time.now()` 返回 `{ kind: \"time.time\", millis }`；`time.now(t)` 返回 t 到当前时间的毫秒差。",
+            "time.millis": "`time.millis()` 返回当前 Unix 毫秒；`time.millis(timeOrDuration)` 读取 Time/Duration 的毫秒值。",
+            "time.unix": "`time.unix()` 返回当前 Unix 秒；`time.unix(time)` 读取 Time 的 Unix 秒。",
+            "time.date": "`time.date()` 返回今天日期；`time.date(time, zone)?` 或 `time.date(year, month, day)?` 返回 Date。",
+            "time.datetime": "`time.datetime(year, month, day, hour, minute, second[, zone])?` 构造 Time。",
+            "time.duration": "`time.duration(ms)?` 或 `time.duration(value, unit)?` 构造 Duration；unit 支持 ms/s/m/h/d。",
+            "time.format": "`time.format(time, layout[, zone])?` 使用 yyyy/MM/dd/HH/mm/ss/SSS token 格式化。",
+            "time.parse": "`time.parse(text[, layout[, zone]])?` 解析 Time。",
+            "time.add": "`time.add(time, duration)` 返回加上 Duration 后的 Time。",
+            "time.sub": "`time.sub(time, duration)` 返回减去 Duration 后的 Time。",
+            "time.diff": "`time.diff(later, earlier)` 返回 Duration。",
+            "time.compare": "`time.compare(a, b)` 返回 -1、0 或 1。",
+            "time.parts": "`time.parts(time[, zone])?` 返回 year/month/day/hour/minute/second/millis 等字段。",
+            "time.weekday": "`time.weekday(date)` 返回 1..7，1 表示周一。",
+            "time.is_leap": "`time.is_leap(year)` 判断闰年。",
+            "time.days_in_month": "`time.days_in_month(year, month)?` 返回月份天数。",
+            "time.sleep": "`time.sleep(msOrDuration)?` 阻塞当前任务；async 中会进入 blocking pool。",
             "match": "Ku 0.0.12 保留 `match`，不再支持 `switch`。",
             "try_get": "`values.try_get(index)?` 越界时返回结构化 Error。",
             "trim": "`text.trim()` 是 string 实例方法。",
         };
-        const text = docs[word];
+        const text = (dotted && docs[dotted]) || docs[word];
         return text ? new vscode.Hover(new vscode.MarkdownString(text)) : undefined;
     }
 }
@@ -742,6 +791,9 @@ class KuCodeActionProvider {
             }
             if (diagnostic.message.includes("std module 'config' must be imported")) {
                 actions.push(insertImportAction(document, "std.config"));
+            }
+            if (diagnostic.message.includes("std module 'task' must be imported")) {
+                actions.push(insertImportAction(document, "std.task"));
             }
             if (diagnostic.message.includes("let")) {
                 const action = new vscode.CodeAction("Ku: remove let keyword", vscode.CodeActionKind.QuickFix);
@@ -854,7 +906,7 @@ function splitCommentOutsideTrivia(line) {
 function formatCodeOutsideStrings(code) {
     let out = "";
     let quote;
-    const operators = ["==", "!=", "<=", ">=", "&&", "||", "=>", "=", "+", "-", "*", "/", "%", "<", ">"];
+    const operators = ["++", "--", "+=", "-=", "*=", "/=", "%=", "==", "!=", "<=", ">=", "&&", "||", "=>", "=", "+", "-", "*", "/", "%", "<", ">"];
     for (let i = 0; i < code.length; i++) {
         const ch = code[i];
         if (quote) {
@@ -882,9 +934,14 @@ function formatCodeOutsideStrings(code) {
                 continue;
             }
             out = out.replace(/\s+$/, "");
-            out += ` ${op} `;
+            if (op === "++" || op === "--") {
+                out += op;
+            }
+            else {
+                out += ` ${op} `;
+            }
             i += op.length - 1;
-            while (i + 1 < code.length && /\s/.test(code[i + 1])) {
+            while (op !== "++" && op !== "--" && i + 1 < code.length && /\s/.test(code[i + 1])) {
                 i++;
             }
             continue;

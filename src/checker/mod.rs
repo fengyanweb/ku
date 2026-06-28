@@ -464,6 +464,23 @@ impl Checker {
                 }
                 Ok(())
             }
+            Stmt::CompoundAssign {
+                target,
+                op,
+                value,
+                span,
+            } => {
+                if let Some(name) = assign_target_root_name(target) {
+                    self.reject_readonly_capture_assignment(name, *span)?;
+                }
+                let left = self.check_assign_target(target, *span)?;
+                let right = self.consume_expr(value)?;
+                let actual = self.check_binary(*op, &left, &right, *span)?;
+                if !type_matches(&left, &actual) {
+                    return Err(type_error(*span, &left, &actual));
+                }
+                Ok(())
+            }
             Stmt::DestructureAssign {
                 names,
                 values,
@@ -545,20 +562,25 @@ impl Checker {
                 span,
             } => {
                 let iterable = self.check_expr(iterable)?;
-                let Type::Array(element) = iterable else {
-                    return Err(KuError::runtime(
-                        format!(
-                            "type error: for expects array but got {}",
-                            type_name(&iterable)
-                        ),
-                        *span,
-                    ));
+                let element = match iterable {
+                    Type::Array(element) => *element,
+                    Type::Int => Type::Int,
+                    Type::Unknown => Type::Unknown,
+                    other => {
+                        return Err(KuError::runtime(
+                            format!(
+                                "type error: for expects array or int but got {}",
+                                type_name(&other)
+                            ),
+                            *span,
+                        ));
+                    }
                 };
                 let before = self.scopes.clone();
                 self.push_scope();
                 self.loop_depth += 1;
                 let result = (|| -> KuResult<()> {
-                    self.define(name.clone(), *element, true, *span)?;
+                    self.define(name.clone(), element, true, *span)?;
                     for stmt in body {
                         self.check_stmt(stmt)?;
                     }
@@ -1729,6 +1751,9 @@ impl Checker {
         if self.contains(&module) {
             return Ok(None);
         }
+        if module == "time" {
+            return Ok(Some(self.check_time_call(&function, args, span)?));
+        }
         let Some(signature) = metadata::dotted_signature(&module, &function) else {
             if metadata::is_std_module(&module) && self.std_modules.contains(&module) {
                 return Err(KuError::runtime(
@@ -1745,6 +1770,208 @@ impl Checker {
             ));
         }
         Ok(Some(self.apply_stdlib_signature(&signature, args, span)?))
+    }
+
+    fn check_time_call(&mut self, function: &str, args: &[Expr], span: Span) -> KuResult<Type> {
+        let actuals = args
+            .iter()
+            .map(|arg| self.check_expr(arg))
+            .collect::<KuResult<Vec<_>>>()?;
+        match function {
+            "now" => {
+                expect_arg_count_range("time.now", args.len(), 0, 1, span)?;
+                if let Some(actual) = actuals.first() {
+                    expect_dynamic_object_arg("time.now", actual, args[0].span)?;
+                }
+                Ok(if args.is_empty() {
+                    Type::DynamicObject
+                } else {
+                    Type::Int
+                })
+            }
+            "unix" => {
+                expect_arg_count_range("time.unix", args.len(), 0, 1, span)?;
+                if let Some(actual) = actuals.first() {
+                    expect_dynamic_object_arg("time.unix", actual, args[0].span)?;
+                }
+                Ok(Type::Int)
+            }
+            "millis" => {
+                expect_arg_count_range("time.millis", args.len(), 0, 1, span)?;
+                if let Some(actual) = actuals.first() {
+                    expect_dynamic_object_arg("time.millis", actual, args[0].span)?;
+                }
+                Ok(Type::Int)
+            }
+            "from_unix" | "from_millis" => {
+                expect_arg_count(&format!("time.{function}"), args.len(), 1, span)?;
+                expect_type_arg(&actuals[0], &Type::Int, args[0].span)?;
+                Ok(Type::DynamicObject)
+            }
+            "date" => match args.len() {
+                0 => Ok(Type::DynamicObject),
+                1 => {
+                    expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
+                    Ok(Type::DynamicObject)
+                }
+                2 => {
+                    expect_dynamic_object_arg("time.date", &actuals[0], args[0].span)?;
+                    expect_type_arg(&actuals[1], &Type::String, args[1].span)?;
+                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                }
+                3 => {
+                    for (actual, arg) in actuals.iter().zip(args) {
+                        expect_type_arg(actual, &Type::Int, arg.span)?;
+                    }
+                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                }
+                _ => Err(KuError::runtime(
+                    format!(
+                        "function 'time.date' expects 0, 1, 2, or 3 arguments but got {}",
+                        args.len()
+                    ),
+                    span,
+                )),
+            },
+            "datetime" => {
+                if args.len() != 6 && args.len() != 7 {
+                    return Err(KuError::runtime(
+                        format!(
+                            "function 'time.datetime' expects 6 or 7 arguments but got {}",
+                            args.len()
+                        ),
+                        span,
+                    ));
+                }
+                for (index, actual) in actuals.iter().enumerate() {
+                    let expected = if index == 6 { Type::String } else { Type::Int };
+                    expect_type_arg(actual, &expected, args[index].span)?;
+                }
+                Ok(Type::Result(Box::new(Type::DynamicObject)))
+            }
+            "format" => match args.len() {
+                1 => {
+                    expect_dynamic_object_arg("time.format", &actuals[0], args[0].span)?;
+                    Ok(Type::String)
+                }
+                2 | 3 => {
+                    expect_dynamic_object_arg("time.format", &actuals[0], args[0].span)?;
+                    expect_type_arg(&actuals[1], &Type::String, args[1].span)?;
+                    if args.len() == 3 {
+                        expect_type_arg(&actuals[2], &Type::String, args[2].span)?;
+                    }
+                    Ok(Type::Result(Box::new(Type::String)))
+                }
+                _ => Err(KuError::runtime(
+                    format!(
+                        "function 'time.format' expects 1, 2, or 3 arguments but got {}",
+                        args.len()
+                    ),
+                    span,
+                )),
+            },
+            "parse" => {
+                if args.is_empty() || args.len() > 3 {
+                    return Err(KuError::runtime(
+                        format!(
+                            "function 'time.parse' expects 1, 2, or 3 arguments but got {}",
+                            args.len()
+                        ),
+                        span,
+                    ));
+                }
+                for (actual, arg) in actuals.iter().zip(args) {
+                    expect_type_arg(actual, &Type::String, arg.span)?;
+                }
+                Ok(Type::Result(Box::new(Type::DynamicObject)))
+            }
+            "duration" => {
+                if args.len() != 1 && args.len() != 2 {
+                    return Err(KuError::runtime(
+                        format!(
+                            "function 'time.duration' expects 1 or 2 arguments but got {}",
+                            args.len()
+                        ),
+                        span,
+                    ));
+                }
+                expect_type_arg(&actuals[0], &Type::Int, args[0].span)?;
+                if args.len() == 2 {
+                    expect_type_arg(&actuals[1], &Type::String, args[1].span)?;
+                }
+                Ok(Type::Result(Box::new(Type::DynamicObject)))
+            }
+            "add" | "sub" | "diff" | "compare" => {
+                expect_arg_count(&format!("time.{function}"), args.len(), 2, span)?;
+                expect_dynamic_object_arg(&format!("time.{function}"), &actuals[0], args[0].span)?;
+                expect_dynamic_object_arg(&format!("time.{function}"), &actuals[1], args[1].span)?;
+                Ok(match function {
+                    "compare" => Type::Int,
+                    "diff" => Type::DynamicObject,
+                    _ => Type::DynamicObject,
+                })
+            }
+            "parts" => match args.len() {
+                1 => {
+                    expect_dynamic_object_arg("time.parts", &actuals[0], args[0].span)?;
+                    Ok(Type::DynamicObject)
+                }
+                2 => {
+                    expect_dynamic_object_arg("time.parts", &actuals[0], args[0].span)?;
+                    expect_type_arg(&actuals[1], &Type::String, args[1].span)?;
+                    Ok(Type::Result(Box::new(Type::DynamicObject)))
+                }
+                _ => Err(KuError::runtime(
+                    format!(
+                        "function 'time.parts' expects 1 or 2 arguments but got {}",
+                        args.len()
+                    ),
+                    span,
+                )),
+            },
+            "weekday" => match args.len() {
+                1 => {
+                    expect_dynamic_object_arg("time.weekday", &actuals[0], args[0].span)?;
+                    Ok(Type::Int)
+                }
+                2 => {
+                    expect_dynamic_object_arg("time.weekday", &actuals[0], args[0].span)?;
+                    expect_type_arg(&actuals[1], &Type::String, args[1].span)?;
+                    Ok(Type::Result(Box::new(Type::Int)))
+                }
+                _ => Err(KuError::runtime(
+                    format!(
+                        "function 'time.weekday' expects 1 or 2 arguments but got {}",
+                        args.len()
+                    ),
+                    span,
+                )),
+            },
+            "is_leap" => {
+                expect_arg_count("time.is_leap", args.len(), 1, span)?;
+                expect_type_arg(&actuals[0], &Type::Int, args[0].span)?;
+                Ok(Type::Bool)
+            }
+            "days_in_month" => {
+                expect_arg_count("time.days_in_month", args.len(), 2, span)?;
+                expect_type_arg(&actuals[0], &Type::Int, args[0].span)?;
+                expect_type_arg(&actuals[1], &Type::Int, args[1].span)?;
+                Ok(Type::Result(Box::new(Type::Int)))
+            }
+            "sleep" => {
+                expect_arg_count("time.sleep", args.len(), 1, span)?;
+                if actuals[0] != Type::Int
+                    && !matches!(actuals[0], Type::DynamicObject | Type::Object(_))
+                {
+                    return Err(type_error(args[0].span, &Type::Int, &actuals[0]));
+                }
+                Ok(Type::Result(Box::new(Type::Null)))
+            }
+            _ => Err(KuError::runtime(
+                format!("unknown stdlib function 'time.{function}'"),
+                span,
+            )),
+        }
     }
 
     fn check_std_method_call(
@@ -2163,7 +2390,9 @@ impl Checker {
         span: Span,
     ) -> KuResult<Type> {
         let saved_return = self.current_return.clone();
+        let saved_loop_depth = self.loop_depth;
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
+        self.loop_depth = 0;
         self.push_scope();
 
         let result = (|| -> KuResult<Type> {
@@ -2193,6 +2422,7 @@ impl Checker {
 
         self.pop_scope();
         self.current_return = saved_return;
+        self.loop_depth = saved_loop_depth;
         result
     }
 
@@ -2212,7 +2442,9 @@ impl Checker {
             owner,
         });
         let saved_return = self.current_return.clone();
+        let saved_loop_depth = self.loop_depth;
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
+        self.loop_depth = 0;
 
         let result = (|| -> KuResult<Type> {
             for (param, ty) in params.iter().zip(arg_types.iter()) {
@@ -2240,6 +2472,7 @@ impl Checker {
         })();
 
         self.current_return = saved_return;
+        self.loop_depth = saved_loop_depth;
         self.readonly_capture = saved_capture;
         self.pop_scope();
         result
@@ -2851,6 +3084,53 @@ fn type_error(span: Span, expected: &Type, actual: &Type) -> KuError {
     )
 }
 
+fn expect_type_arg(actual: &Type, expected: &Type, span: Span) -> KuResult<()> {
+    if type_matches(expected, actual) {
+        Ok(())
+    } else {
+        Err(type_error(span, expected, actual))
+    }
+}
+
+fn expect_dynamic_object_arg(label: &str, actual: &Type, span: Span) -> KuResult<()> {
+    if matches!(
+        actual,
+        Type::DynamicObject | Type::Object(_) | Type::Unknown
+    ) {
+        Ok(())
+    } else {
+        Err(KuError::runtime(
+            format!(
+                "{label} expects a time object but got {}",
+                type_name(actual)
+            ),
+            span,
+        ))
+    }
+}
+
+fn expect_arg_count_range(
+    name: &str,
+    actual: usize,
+    min: usize,
+    max: usize,
+    span: Span,
+) -> KuResult<()> {
+    if (min..=max).contains(&actual) {
+        Ok(())
+    } else if min == max {
+        Err(KuError::runtime(
+            format!("function '{name}' expects {min} arguments but got {actual}"),
+            span,
+        ))
+    } else {
+        Err(KuError::runtime(
+            format!("function '{name}' expects {min} to {max} arguments but got {actual}"),
+            span,
+        ))
+    }
+}
+
 fn error_type() -> Type {
     Type::Object(HashMap::from([
         ("domain".to_string(), Type::String),
@@ -3093,6 +3373,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::VarDecl { span, .. }
         | Stmt::Assign { span, .. }
         | Stmt::AssignTarget { span, .. }
+        | Stmt::CompoundAssign { span, .. }
         | Stmt::DestructureAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }

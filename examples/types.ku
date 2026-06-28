@@ -5,5 +5,5 @@ fn main() {
     ok:bool = true
     empty:null = null
 
-    print(`{name} {count} {price} {ok} {empty}`)
+    println(`{name} {count} {price} {ok} {empty}`)
 }

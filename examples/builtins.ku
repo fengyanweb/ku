@@ -3,6 +3,6 @@ fn main() {
     count:int = len(name)
     text:str = str(123)
 
-    print(`len {count}`)
-    print(text + "!")
+    println(`len {count}`)
+    println(text + "!")
 }

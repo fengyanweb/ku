@@ -21,13 +21,12 @@ use crate::{
     error::{KuError, KuResult},
     lexer::Lexer,
     parser::Parser,
-    runtime::task::{current_task_cancelled, TaskRuntime},
+    runtime::task::{current_task_cancelled, TaskRuntime, TaskRuntimeSnapshot, TaskStressReport},
     span::{Position, Span},
     stdlib,
     value::Value,
 };
 
-const MAX_STEPS: usize = 1_000_000;
 const MAX_CALL_DEPTH: usize = 16;
 const HTTP_HANDLER_TIMEOUT_MESSAGE: &str = "http handler timeout";
 const HTTP_ACCEPT_BATCH: usize = 64;
@@ -445,6 +444,22 @@ impl Interpreter {
                 }
                 Ok(Flow::Continue)
             }
+            Stmt::CompoundAssign {
+                target,
+                op,
+                value,
+                span,
+            } => {
+                let right = self.eval(value, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
+                self.compound_assign_target(target, *op, right, env, depth, *span)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
+                Ok(Flow::Continue)
+            }
             Stmt::DestructureAssign {
                 names,
                 values,
@@ -524,35 +539,54 @@ impl Interpreter {
                 body,
                 span,
             } => {
-                let values = self.eval(iterable, env, depth)?;
+                let iterable = self.eval(iterable, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
                     return Ok(Flow::Fail(value));
                 }
-                let Value::Array(values) = values else {
-                    return Err(KuError::runtime(
-                        format!(
-                            "type error: for expects array but got {}",
-                            values.type_name()
-                        ),
-                        *span,
-                    ));
-                };
-                for value in values {
-                    self.tick(*span)?;
-                    env.push_scope();
-                    env.define(name.clone(), value, true, *span)?;
-                    let mut loop_flow = Flow::Continue;
-                    for stmt in body {
-                        loop_flow = self.exec_stmt(stmt, env, depth)?;
-                        if !matches!(loop_flow, Flow::Continue) {
-                            break;
+                match iterable {
+                    Value::Array(values) => {
+                        for value in values {
+                            self.tick(*span)?;
+                            match self.exec_for_iteration(name, value, body, env, depth, *span)? {
+                                Flow::Continue | Flow::LoopContinue => {}
+                                Flow::Break => return Ok(Flow::Continue),
+                                flow @ (Flow::Return(_) | Flow::Fail(_)) => return Ok(flow),
+                            }
                         }
                     }
-                    env.pop_scope();
-                    match loop_flow {
-                        Flow::Continue | Flow::LoopContinue => {}
-                        Flow::Break => return Ok(Flow::Continue),
-                        Flow::Return(_) | Flow::Fail(_) => return Ok(loop_flow),
+                    Value::Int(limit) => {
+                        if limit < 0 {
+                            return Err(KuError::runtime(
+                                "for int iterator expects a non-negative int",
+                                *span,
+                            ));
+                        }
+                        let mut current = 0;
+                        while current < limit {
+                            self.tick(*span)?;
+                            match self.exec_for_iteration(
+                                name,
+                                Value::Int(current),
+                                body,
+                                env,
+                                depth,
+                                *span,
+                            )? {
+                                Flow::Continue | Flow::LoopContinue => {}
+                                Flow::Break => return Ok(Flow::Continue),
+                                flow @ (Flow::Return(_) | Flow::Fail(_)) => return Ok(flow),
+                            }
+                            current += 1;
+                        }
+                    }
+                    other => {
+                        return Err(KuError::runtime(
+                            format!(
+                                "type error: for expects array or int but got {}",
+                                other.type_name()
+                            ),
+                            *span,
+                        ));
                     }
                 }
                 Ok(Flow::Continue)
@@ -636,12 +670,15 @@ impl Interpreter {
                 }
                 Ok(Flow::Return(value))
             }
-            Stmt::Print { value, .. } => {
+            Stmt::Print { value, span } => {
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
                     return Ok(Flow::Fail(value));
                 }
-                println!("{value}");
+                print!("{value}");
+                std::io::stdout().flush().map_err(|err| {
+                    KuError::runtime(format!("failed to flush stdout: {err}"), *span)
+                })?;
                 Ok(Flow::Continue)
             }
             Stmt::Expr { expr, .. } => {
@@ -809,6 +846,34 @@ impl Interpreter {
         args: &[Value],
         span: Span,
     ) -> KuResult<Option<Value>> {
+        if let ExprKind::Field { target, name } = &callee.kind {
+            if matches!(&target.kind, ExprKind::Variable(module) if module == "task")
+                && self.std_modules.contains("task")
+            {
+                let runtime = self.task_runtime.clone().ok_or_else(|| {
+                    KuError::runtime("async task runtime is not initialized", span)
+                })?;
+                return match name.as_str() {
+                    "stats" => {
+                        expect_runtime_arg_count("task.stats", args.len(), 0, span)?;
+                        Ok(Some(task_runtime_snapshot_value(runtime.snapshot()?)))
+                    }
+                    "stress" => {
+                        expect_runtime_arg_count("task.stress", args.len(), 3, span)?;
+                        let demand = stress_usize_arg("demand", &args[0], span)?;
+                        let producers = stress_usize_arg("producers", &args[1], span)?;
+                        let hold_ms = stress_u64_arg("hold_ms", &args[2], span)?;
+                        let report = runtime.stress_concurrent_demand(
+                            demand,
+                            producers,
+                            Duration::from_millis(hold_ms),
+                        )?;
+                        Ok(Some(task_stress_report_value(report)))
+                    }
+                    _ => Ok(None),
+                };
+            }
+        }
         if !self.async_execution || !is_blocking_dotted_builtin(callee) {
             return stdlib::eval_dotted_builtin(callee, args, span, &self.base_dir);
         }
@@ -1215,6 +1280,31 @@ impl Interpreter {
         })
     }
 
+    fn exec_for_iteration(
+        &mut self,
+        name: &str,
+        value: Value,
+        body: &[Stmt],
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<Flow> {
+        env.push_scope();
+        let result = (|| -> KuResult<Flow> {
+            env.define(name.to_string(), value, true, span)?;
+            let mut loop_flow = Flow::Continue;
+            for stmt in body {
+                loop_flow = self.exec_stmt(stmt, env, depth)?;
+                if !matches!(loop_flow, Flow::Continue) {
+                    break;
+                }
+            }
+            Ok(loop_flow)
+        })();
+        env.pop_scope();
+        result
+    }
+
     fn assign_target(
         &mut self,
         target: &AssignTarget,
@@ -1225,25 +1315,144 @@ impl Interpreter {
     ) -> KuResult<()> {
         match target {
             AssignTarget::Variable(name) => env.assign(name, value, span),
-            AssignTarget::Index { target, index } => {
-                let root = assignment_root(target).ok_or_else(|| {
-                    KuError::runtime("assignment target must start with a variable", target.span)
+            AssignTarget::Index { .. } | AssignTarget::Field { .. } => {
+                let root = assignment_target_root(target).ok_or_else(|| {
+                    KuError::runtime("assignment target must start with a variable", span)
                 })?;
-                let mut root_value = env.get(&root, target.span)?;
+                let mut root_value = env.get(&root, span)?;
+                self.assign_into_target(&mut root_value, target, value, env, depth, span)?;
+                if self.pending_fail.is_some() {
+                    return Ok(());
+                }
+                env.assign(&root, root_value, span)
+            }
+        }
+    }
+
+    fn assign_into_target(
+        &mut self,
+        root_value: &mut Value,
+        target: &AssignTarget,
+        value: Value,
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<()> {
+        match target {
+            AssignTarget::Variable(_) => {
+                *root_value = value;
+                Ok(())
+            }
+            AssignTarget::Index { target, index } => {
+                let container = self.assign_expr_value_mut(root_value, target, env, depth)?;
                 let index = self.eval(index, env, depth)?;
                 if self.pending_fail.is_some() {
                     return Ok(());
                 }
-                assign_index_value(&mut root_value, index, value, span)?;
-                env.assign(&root, root_value, span)
+                assign_index_value(container, index, value, span)
             }
             AssignTarget::Field { target, name } => {
-                let root = assignment_root(target).ok_or_else(|| {
-                    KuError::runtime("assignment target must start with a variable", target.span)
+                let container = self.assign_expr_value_mut(root_value, target, env, depth)?;
+                assign_field_value(container, name, value, span)
+            }
+        }
+    }
+
+    fn assign_expr_value_mut<'a>(
+        &mut self,
+        current: &'a mut Value,
+        expr: &Expr,
+        env: &mut Env,
+        depth: usize,
+    ) -> KuResult<&'a mut Value> {
+        match &expr.kind {
+            ExprKind::Variable(_) => Ok(current),
+            ExprKind::Index { target, index } => {
+                let target = self.assign_expr_value_mut(current, target, env, depth)?;
+                let index = self.eval(index, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(target);
+                }
+                index_value_mut(target, index, expr.span)
+            }
+            ExprKind::Field { target, name } => {
+                let target = self.assign_expr_value_mut(current, target, env, depth)?;
+                field_value_mut(target, name, expr.span)
+            }
+            _ => Err(KuError::runtime(
+                "assignment target must start with a variable",
+                expr.span,
+            )),
+        }
+    }
+
+    fn compound_assign_target(
+        &mut self,
+        target: &AssignTarget,
+        op: BinaryOp,
+        right: Value,
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<()> {
+        match target {
+            AssignTarget::Variable(name) => {
+                let left = env.get(name, span)?;
+                let value = eval_binary(op, left, right, span)?;
+                env.assign(name, value, span)
+            }
+            AssignTarget::Index { .. } | AssignTarget::Field { .. } => {
+                let root = assignment_target_root(target).ok_or_else(|| {
+                    KuError::runtime("assignment target must start with a variable", span)
                 })?;
-                let mut root_value = env.get(&root, target.span)?;
-                assign_field_value(&mut root_value, name, value, span)?;
+                let mut root_value = env.get(&root, span)?;
+                self.compound_assign_into_target(
+                    &mut root_value,
+                    target,
+                    (op, right),
+                    env,
+                    depth,
+                    span,
+                )?;
+                if self.pending_fail.is_some() {
+                    return Ok(());
+                }
                 env.assign(&root, root_value, span)
+            }
+        }
+    }
+
+    fn compound_assign_into_target(
+        &mut self,
+        root_value: &mut Value,
+        target: &AssignTarget,
+        operation: (BinaryOp, Value),
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<()> {
+        let (op, right) = operation;
+        match target {
+            AssignTarget::Variable(_) => {
+                let left = root_value.clone();
+                *root_value = eval_binary(op, left, right, span)?;
+                Ok(())
+            }
+            AssignTarget::Index { target, index } => {
+                let container = self.assign_expr_value_mut(root_value, target, env, depth)?;
+                let index = self.eval(index, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(());
+                }
+                let left = eval_index_value(container.clone(), index.clone(), span, false)?;
+                let value = eval_binary(op, left, right, span)?;
+                assign_index_value(container, index, value, span)
+            }
+            AssignTarget::Field { target, name } => {
+                let container = self.assign_expr_value_mut(root_value, target, env, depth)?;
+                let left = field_value(container, name, span)?;
+                let value = eval_binary(op, left, right, span)?;
+                assign_field_value(container, name, value, span)
             }
         }
     }
@@ -1722,21 +1931,33 @@ impl Interpreter {
         {
             return Err(KuError::runtime(HTTP_HANDLER_TIMEOUT_MESSAGE, span));
         }
-        self.steps += 1;
-        if self.steps > MAX_STEPS {
-            Err(KuError::runtime(
-                "execution step limit exceeded; possible infinite loop or recursion",
-                span,
-            ))
-        } else {
-            Ok(())
-        }
+        self.steps = self.steps.saturating_add(1);
+        Ok(())
     }
 }
 
 fn assignment_root(expr: &Expr) -> Option<String> {
     match &expr.kind {
         ExprKind::Variable(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn assignment_target_root(target: &AssignTarget) -> Option<String> {
+    match target {
+        AssignTarget::Variable(name) => Some(name.clone()),
+        AssignTarget::Index { target, .. } | AssignTarget::Field { target, .. } => {
+            assignment_expr_root(target)
+        }
+    }
+}
+
+fn assignment_expr_root(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Variable(name) => Some(name.clone()),
+        ExprKind::Index { target, .. } | ExprKind::Field { target, .. } => {
+            assignment_expr_root(target)
+        }
         _ => None,
     }
 }
@@ -1843,6 +2064,44 @@ fn assign_index_value(target: &mut Value, index: Value, value: Value, span: Span
     Ok(())
 }
 
+fn index_value_mut(target: &mut Value, index: Value, span: Span) -> KuResult<&mut Value> {
+    match target {
+        Value::Array(values) => {
+            let Value::Int(index) = index else {
+                return Err(KuError::runtime(
+                    format!(
+                        "type error: expected int index but got {}",
+                        index.type_name()
+                    ),
+                    span,
+                ));
+            };
+            if index < 0 || index as usize >= values.len() {
+                return Err(KuError::runtime("array index out of bounds", span));
+            }
+            Ok(&mut values[index as usize])
+        }
+        Value::Object(fields) => {
+            let Value::String(key) = index else {
+                return Err(KuError::runtime(
+                    format!(
+                        "type error: expected str index but got {}",
+                        index.type_name()
+                    ),
+                    span,
+                ));
+            };
+            fields
+                .get_mut(&key)
+                .ok_or_else(|| KuError::runtime(format!("object has no key '{key}'"), span))
+        }
+        other => Err(KuError::runtime(
+            format!("type error: cannot index {}", other.type_name()),
+            span,
+        )),
+    }
+}
+
 fn normalize_error_value(value: Value) -> Value {
     if is_error_object(&value) {
         return value;
@@ -1884,6 +2143,49 @@ fn assign_field_value(target: &mut Value, name: &str, value: Value, span: Span) 
             fields.insert(name.to_string(), value);
             Ok(())
         }
+        other => Err(KuError::runtime(
+            format!("type error: {} has no fields", other.type_name()),
+            span,
+        )),
+    }
+}
+
+fn field_value(target: &Value, name: &str, span: Span) -> KuResult<Value> {
+    match target {
+        Value::Struct {
+            name: struct_name,
+            fields,
+        } => fields.get(name).cloned().ok_or_else(|| {
+            KuError::runtime(
+                format!("struct '{struct_name}' has no field '{name}'"),
+                span,
+            )
+        }),
+        Value::Object(fields) => fields
+            .get(name)
+            .cloned()
+            .ok_or_else(|| KuError::runtime(format!("object has no field '{name}'"), span)),
+        other => Err(KuError::runtime(
+            format!("type error: {} has no fields", other.type_name()),
+            span,
+        )),
+    }
+}
+
+fn field_value_mut<'a>(target: &'a mut Value, name: &str, span: Span) -> KuResult<&'a mut Value> {
+    match target {
+        Value::Struct {
+            name: struct_name,
+            fields,
+        } => fields.get_mut(name).ok_or_else(|| {
+            KuError::runtime(
+                format!("struct '{struct_name}' has no field '{name}'"),
+                span,
+            )
+        }),
+        Value::Object(fields) => fields
+            .get_mut(name)
+            .ok_or_else(|| KuError::runtime(format!("object has no field '{name}'"), span)),
         other => Err(KuError::runtime(
             format!("type error: {} has no fields", other.type_name()),
             span,
@@ -2923,6 +3225,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::VarDecl { span, .. }
         | Stmt::Assign { span, .. }
         | Stmt::AssignTarget { span, .. }
+        | Stmt::CompoundAssign { span, .. }
         | Stmt::DestructureAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
@@ -2941,6 +3244,128 @@ fn stmt_span(stmt: &Stmt) -> Span {
 
 fn entry_span() -> Span {
     Span::point(Position::new(1, 1, 0))
+}
+
+fn stress_usize_arg(name: &str, value: &Value, span: Span) -> KuResult<usize> {
+    let Value::Int(value) = value else {
+        return Err(KuError::runtime(
+            format!("task.stress {name} must be int"),
+            span,
+        ));
+    };
+    usize::try_from(*value)
+        .map_err(|_| KuError::runtime(format!("task.stress {name} must be non-negative"), span))
+}
+
+fn stress_u64_arg(name: &str, value: &Value, span: Span) -> KuResult<u64> {
+    let Value::Int(value) = value else {
+        return Err(KuError::runtime(
+            format!("task.stress {name} must be int"),
+            span,
+        ));
+    };
+    u64::try_from(*value)
+        .map_err(|_| KuError::runtime(format!("task.stress {name} must be non-negative"), span))
+}
+
+fn task_runtime_snapshot_value(snapshot: TaskRuntimeSnapshot) -> Value {
+    Value::Object(HashMap::from([
+        (
+            "active_tasks".to_string(),
+            usize_value(snapshot.active_tasks),
+        ),
+        (
+            "registered_tasks".to_string(),
+            usize_value(snapshot.registered_tasks),
+        ),
+        (
+            "queued_tasks".to_string(),
+            usize_value(snapshot.queued_tasks),
+        ),
+        ("wait_edges".to_string(), usize_value(snapshot.wait_edges)),
+        (
+            "queued_blocking_jobs".to_string(),
+            usize_value(snapshot.queued_blocking_jobs),
+        ),
+        (
+            "running_blocking_jobs".to_string(),
+            usize_value(snapshot.running_blocking_jobs),
+        ),
+        (
+            "task_workers".to_string(),
+            usize_value(snapshot.task_workers),
+        ),
+        (
+            "blocking_workers".to_string(),
+            usize_value(snapshot.blocking_workers),
+        ),
+        (
+            "total_submissions".to_string(),
+            usize_value(snapshot.total_submissions),
+        ),
+        (
+            "accepted_submissions".to_string(),
+            usize_value(snapshot.accepted_submissions),
+        ),
+        (
+            "rejected_task_limit".to_string(),
+            usize_value(snapshot.rejected_task_limit),
+        ),
+        (
+            "rejected_task_queue".to_string(),
+            usize_value(snapshot.rejected_task_queue),
+        ),
+        (
+            "rejected_task_internal".to_string(),
+            usize_value(snapshot.rejected_task_internal),
+        ),
+        (
+            "finished_tasks".to_string(),
+            usize_value(snapshot.finished_tasks),
+        ),
+    ]))
+}
+
+fn task_stress_report_value(report: TaskStressReport) -> Value {
+    Value::Object(HashMap::from([
+        ("demand".to_string(), usize_value(report.demand)),
+        ("producers".to_string(), usize_value(report.producers)),
+        ("hold_ms".to_string(), u64_value(report.hold_ms)),
+        ("peak_active".to_string(), usize_value(report.peak_active)),
+        ("accepted".to_string(), usize_value(report.accepted)),
+        (
+            "rejected_limit".to_string(),
+            usize_value(report.rejected_limit),
+        ),
+        (
+            "rejected_queue".to_string(),
+            usize_value(report.rejected_queue),
+        ),
+        (
+            "rejected_internal".to_string(),
+            usize_value(report.rejected_internal),
+        ),
+        ("finished".to_string(), usize_value(report.finished)),
+        ("submit_ms".to_string(), u128_value(report.submit_ms)),
+        ("total_ms".to_string(), u128_value(report.total_ms)),
+        ("task_workers".to_string(), usize_value(report.task_workers)),
+        (
+            "blocking_workers".to_string(),
+            usize_value(report.blocking_workers),
+        ),
+    ]))
+}
+
+fn usize_value(value: usize) -> Value {
+    Value::Int(i64::try_from(value).unwrap_or(i64::MAX))
+}
+
+fn u64_value(value: u64) -> Value {
+    Value::Int(i64::try_from(value).unwrap_or(i64::MAX))
+}
+
+fn u128_value(value: u128) -> Value {
+    Value::Int(i64::try_from(value).unwrap_or(i64::MAX))
 }
 
 fn is_constant_name(name: &str) -> bool {
@@ -2969,6 +3394,7 @@ fn is_blocking_dotted_builtin(expr: &Expr) -> bool {
         (module.as_str(), name.as_str()),
         ("fs", "read" | "try_read" | "write" | "try_write")
             | ("config", "env" | "env_file" | "yaml")
+            | ("time", "sleep")
             | ("http", "get" | "post" | "request")
     )
 }
@@ -3021,6 +3447,10 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             bound.insert(name.clone());
         }
         Stmt::AssignTarget { target, value, .. } => {
+            collect_free_assign_target(target, bound, free);
+            collect_free_expr(value, bound, free);
+        }
+        Stmt::CompoundAssign { target, value, .. } => {
             collect_free_assign_target(target, bound, free);
             collect_free_expr(value, bound, free);
         }

@@ -93,7 +93,7 @@ export function resolveImportUri(
 }
 
 export function isStdImport(importPath: string): boolean {
-  return importPath.startsWith("std.");
+  return importPath === "std" || importPath.startsWith("std.");
 }
 
 export function defaultModuleName(importPath: string): string | undefined {

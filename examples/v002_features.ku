@@ -6,5 +6,5 @@ fn main() {
     }
 
     total = add(10, 20)
-    print(`Hello {name} {total}`)
+    println(`Hello {name} {total}`)
 }

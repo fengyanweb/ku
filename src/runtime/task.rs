@@ -116,6 +116,23 @@ pub struct TaskRuntimeSnapshot {
     pub finished_tasks: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskStressReport {
+    pub demand: usize,
+    pub producers: usize,
+    pub hold_ms: u64,
+    pub peak_active: usize,
+    pub accepted: usize,
+    pub rejected_limit: usize,
+    pub rejected_queue: usize,
+    pub rejected_internal: usize,
+    pub finished: usize,
+    pub submit_ms: u128,
+    pub total_ms: u128,
+    pub task_workers: usize,
+    pub blocking_workers: usize,
+}
+
 struct TaskState {
     result: Mutex<Option<KuResult<Value>>>,
     ready: Condvar,
@@ -346,6 +363,151 @@ impl TaskRuntime {
             .map_err(|_| KuError::runtime("async wait graph is poisoned", Span::default()))?
             .len();
         Ok(snapshot)
+    }
+
+    pub fn stress_concurrent_demand(
+        &self,
+        demand: usize,
+        producers: usize,
+        hold: Duration,
+    ) -> KuResult<TaskStressReport> {
+        const MAX_STRESS_DEMAND: usize = 10_000_000;
+        const MAX_STRESS_PRODUCERS: usize = 64;
+        const MAX_STRESS_HOLD: Duration = Duration::from_secs(60);
+        const STRESS_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+        if demand == 0 || demand > MAX_STRESS_DEMAND {
+            return Err(KuError::runtime(
+                format!("task.stress demand must be between 1 and {MAX_STRESS_DEMAND}"),
+                Span::default(),
+            ));
+        }
+        if producers == 0 || producers > MAX_STRESS_PRODUCERS {
+            return Err(KuError::runtime(
+                format!("task.stress producers must be between 1 and {MAX_STRESS_PRODUCERS}"),
+                Span::default(),
+            ));
+        }
+        if hold > MAX_STRESS_HOLD {
+            return Err(KuError::runtime(
+                "task.stress hold_ms must be between 0 and 60000",
+                Span::default(),
+            ));
+        }
+
+        let before = self.snapshot()?;
+        if before.active_tasks != 0
+            || before.queued_tasks != 0
+            || before.queued_blocking_jobs != 0
+            || before.running_blocking_jobs != 0
+        {
+            return Err(KuError::structured(
+                crate::error::KuErrorKind::Runtime,
+                "task",
+                "stress_runtime_busy",
+                "task.stress requires an idle task runtime so metrics do not mix with application tasks",
+                Span::default(),
+            ));
+        }
+        let release = Arc::new(AtomicBool::new(false));
+        let peak_active = Arc::new(AtomicUsize::new(before.active_tasks));
+        let began = Instant::now();
+        let mut producers_threads = Vec::with_capacity(producers);
+        for producer in 0..producers {
+            let runtime = self.clone();
+            let producer_release = Arc::clone(&release);
+            let peak_active = Arc::clone(&peak_active);
+            let count = demand / producers + usize::from(producer < demand % producers);
+            let producer_thread = thread::Builder::new()
+                .name(format!("ku-stress-producer-{producer}"))
+                .spawn(move || {
+                    for _ in 0..count {
+                        let release = Arc::clone(&producer_release);
+                        drop(runtime.spawn(move || {
+                            while !release.load(Ordering::Acquire) && !current_task_cancelled() {
+                                thread::yield_now();
+                            }
+                            Ok(Value::Null)
+                        }));
+                        peak_active.fetch_max(
+                            runtime.inner.active_tasks.load(Ordering::Acquire),
+                            Ordering::AcqRel,
+                        );
+                    }
+                });
+            match producer_thread {
+                Ok(producer_thread) => producers_threads.push(producer_thread),
+                Err(err) => {
+                    release.store(true, Ordering::Release);
+                    for producer_thread in producers_threads {
+                        let _ = producer_thread.join();
+                    }
+                    return Err(KuError::runtime(
+                        format!("failed to start task stress producer: {err}"),
+                        Span::default(),
+                    ));
+                }
+            }
+        }
+        let mut producer_panicked = false;
+        for producer in producers_threads {
+            producer_panicked |= producer.join().is_err();
+        }
+        if producer_panicked {
+            release.store(true, Ordering::Release);
+            return Err(KuError::runtime(
+                "task stress producer panicked",
+                Span::default(),
+            ));
+        }
+        let submit_elapsed = began.elapsed();
+        if !hold.is_zero() {
+            thread::sleep(hold);
+        }
+        release.store(true, Ordering::Release);
+
+        let drain_deadline = Instant::now() + STRESS_DRAIN_TIMEOUT;
+        while self.inner.active_tasks.load(Ordering::Acquire) > before.active_tasks {
+            if Instant::now() >= drain_deadline {
+                return Err(KuError::structured(
+                    crate::error::KuErrorKind::Runtime,
+                    "task",
+                    "stress_timeout",
+                    "task stress workload did not drain before the bounded timeout",
+                    Span::default(),
+                ));
+            }
+            if !self.help_one_bounded()? {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        let after = self.snapshot()?;
+        Ok(TaskStressReport {
+            demand,
+            producers,
+            hold_ms: hold.as_millis() as u64,
+            peak_active: peak_active
+                .load(Ordering::Acquire)
+                .saturating_sub(before.active_tasks),
+            accepted: after
+                .accepted_submissions
+                .saturating_sub(before.accepted_submissions),
+            rejected_limit: after
+                .rejected_task_limit
+                .saturating_sub(before.rejected_task_limit),
+            rejected_queue: after
+                .rejected_task_queue
+                .saturating_sub(before.rejected_task_queue),
+            rejected_internal: after
+                .rejected_task_internal
+                .saturating_sub(before.rejected_task_internal),
+            finished: after.finished_tasks.saturating_sub(before.finished_tasks),
+            submit_ms: submit_elapsed.as_millis(),
+            total_ms: began.elapsed().as_millis(),
+            task_workers: after.task_workers,
+            blocking_workers: after.blocking_workers,
+        })
     }
 
     pub fn await_task(&self, handle: &TaskHandle) -> KuResult<Value> {
@@ -1288,73 +1450,37 @@ mod tests {
     #[test]
     #[ignore = "manual bounded million-demand concurrency stress benchmark"]
     fn million_concurrent_demand_stress_report() {
-        const SUBMISSIONS: usize = 1_000_000;
-        const PRODUCERS: usize = 15;
         let runtime = TaskRuntime::with_limits(4, 1024, 4, 1024, 1024);
-        let release = Arc::new(AtomicBool::new(false));
-        let peak_active = Arc::new(AtomicUsize::new(0));
-        let began = Instant::now();
-        let mut producers = Vec::new();
-        for producer in 0..PRODUCERS {
-            let runtime = runtime.clone();
-            let release = Arc::clone(&release);
-            let peak_active = Arc::clone(&peak_active);
-            let count = SUBMISSIONS / PRODUCERS + usize::from(producer < SUBMISSIONS % PRODUCERS);
-            producers.push(thread::spawn(move || {
-                for _ in 0..count {
-                    let release = Arc::clone(&release);
-                    drop(runtime.spawn(move || {
-                        while !release.load(Ordering::Acquire) && !current_task_cancelled() {
-                            thread::yield_now();
-                        }
-                        Ok(Value::Null)
-                    }));
-                    let active = runtime.inner.active_tasks.load(Ordering::Acquire);
-                    peak_active.fetch_max(active, Ordering::AcqRel);
-                }
-            }));
-        }
-        for producer in producers {
-            producer.join().expect("stress producer must not panic");
-        }
-        let submit_elapsed = began.elapsed();
-        let held = runtime.snapshot().expect("held stress snapshot");
-        assert!(
-            held.active_tasks <= 1024,
-            "bounded runtime exceeded max active tasks: {held:?}"
-        );
-        thread::sleep(Duration::from_millis(250));
-        release.store(true, Ordering::Release);
-        runtime
-            .cancel_all_and_wait(Duration::from_secs(30))
+        let report = runtime
+            .stress_concurrent_demand(1_000_000, 15, Duration::from_millis(250))
             .expect("million-demand stress must drain within the bounded deadline");
-        let total_elapsed = began.elapsed();
-        let snapshot = runtime.snapshot().expect("stress snapshot");
-        assert_eq!(snapshot.total_submissions, SUBMISSIONS);
+        assert_eq!(report.demand, 1_000_000);
+        assert_eq!(report.peak_active, 1024);
         assert_eq!(
-            snapshot.accepted_submissions
-                + snapshot.rejected_task_limit
-                + snapshot.rejected_task_queue
-                + snapshot.rejected_task_internal,
-            SUBMISSIONS
+            report.accepted
+                + report.rejected_limit
+                + report.rejected_queue
+                + report.rejected_internal,
+            report.demand
         );
+        let snapshot = runtime.snapshot().expect("stress snapshot");
         assert_eq!(snapshot.active_tasks, 0);
         assert_eq!(snapshot.registered_tasks, 0);
         assert_eq!(snapshot.queued_tasks, 0);
         println!(
             "KU_ASYNC_STRESS demand={} producers={} peak_active={} accepted={} rejected_limit={} rejected_queue={} rejected_internal={} finished={} submit_ms={} total_ms={} demand_per_sec={:.0} accepted_per_sec={:.0}",
-            snapshot.total_submissions,
-            PRODUCERS,
-            peak_active.load(Ordering::Acquire),
-            snapshot.accepted_submissions,
-            snapshot.rejected_task_limit,
-            snapshot.rejected_task_queue,
-            snapshot.rejected_task_internal,
-            snapshot.finished_tasks,
-            submit_elapsed.as_millis(),
-            total_elapsed.as_millis(),
-            SUBMISSIONS as f64 / submit_elapsed.as_secs_f64(),
-            snapshot.accepted_submissions as f64 / total_elapsed.as_secs_f64()
+            report.demand,
+            report.producers,
+            report.peak_active,
+            report.accepted,
+            report.rejected_limit,
+            report.rejected_queue,
+            report.rejected_internal,
+            report.finished,
+            report.submit_ms,
+            report.total_ms,
+            report.demand as f64 / (report.submit_ms.max(1) as f64 / 1000.0),
+            report.accepted as f64 / (report.total_ms.max(1) as f64 / 1000.0)
         );
     }
 }

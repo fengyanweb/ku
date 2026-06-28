@@ -3,5 +3,5 @@ fn Ab()  {
 }
 
 fn main() {
-    print("Hello Ku")
+    println("Hello Ku")
 }

@@ -614,6 +614,24 @@ impl<'a> FunctionLowerer<'a> {
                     .instructions
                     .push(IrInst::Store { target, value });
             }
+            Stmt::CompoundAssign {
+                target, op, value, ..
+            } => {
+                let target = self.lower_lvalue_cached(target)?;
+                let left = self.lvalue_read_expr(&target);
+                let right = self.lower_expr(value)?;
+                let value = self.emit_temp(IrExpr {
+                    ty: binary_type(*op, &left.ty, &right.ty),
+                    kind: IrExprKind::Binary {
+                        left: Box::new(left),
+                        op: *op,
+                        right: Box::new(right),
+                    },
+                })?;
+                self.current
+                    .instructions
+                    .push(IrInst::Store { target, value });
+            }
             Stmt::DestructureAssign {
                 names,
                 values,
@@ -1029,6 +1047,49 @@ impl<'a> FunctionLowerer<'a> {
                 target: self.lower_lvalue_target_expr(target)?,
                 name: name.clone(),
             }),
+        }
+    }
+
+    fn lower_lvalue_cached(&mut self, target: &AssignTarget) -> KuResult<IrLValue> {
+        match target {
+            AssignTarget::Variable(name) => Ok(IrLValue::Local(name.clone())),
+            AssignTarget::Index { target, index } => {
+                let target = self.lower_expr(target)?;
+                let target = self.emit_temp(target)?;
+                let index = self.lower_expr(index)?;
+                let index = self.emit_temp(index)?;
+                Ok(IrLValue::Index { target, index })
+            }
+            AssignTarget::Field { target, name } => Ok(IrLValue::Field {
+                target: self.lower_lvalue_target_expr(target)?,
+                name: name.clone(),
+            }),
+        }
+    }
+
+    fn lvalue_read_expr(&self, target: &IrLValue) -> IrExpr {
+        match target {
+            IrLValue::Local(name) => IrExpr {
+                kind: IrExprKind::Local(name.clone()),
+                ty: self.locals.get(name).cloned().unwrap_or(IrType::Unknown),
+            },
+            IrLValue::Index { target, index } => IrExpr {
+                ty: match &target.ty {
+                    IrType::Array(element) => *element.clone(),
+                    _ => IrType::Unknown,
+                },
+                kind: IrExprKind::Index {
+                    target: Box::new(target.clone()),
+                    index: Box::new(index.clone()),
+                },
+            },
+            IrLValue::Field { target, name } => IrExpr {
+                ty: self.field_type(&target.ty, name),
+                kind: IrExprKind::Field {
+                    target: Box::new(target.clone()),
+                    name: name.clone(),
+                },
+            },
         }
     }
 
@@ -1891,6 +1952,10 @@ fn collect_free_stmt_names(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut 
         }
         Stmt::Print { value, .. } => collect_free_expr_names(value, bound, free),
         Stmt::AssignTarget { target, value, .. } => {
+            collect_free_lvalue_names(target, bound, free);
+            collect_free_expr_names(value, bound, free);
+        }
+        Stmt::CompoundAssign { target, value, .. } => {
             collect_free_lvalue_names(target, bound, free);
             collect_free_expr_names(value, bound, free);
         }

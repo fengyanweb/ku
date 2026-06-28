@@ -7,19 +7,19 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 - Syntax highlighting for Ku 0.0.12 keywords including `async` / `await`, strings, template strings, numbers, built-in types, stdlib calls, and unsupported `let` / `mut` / `const`.
 - `ku.mod` / `ku.lock` syntax highlighting.
 - Language configuration for comments, brackets, auto-closing pairs, and surrounding pairs.
-- Snippets for sync/async main, sync/async functions, `await task?`, generic functions, struct, enum, match, try/catch/finally, `std.fs`, `std.http`, `std.config`, HTTP response usage, array map, string methods, and `array.try_get`.
+- Snippets for sync/async main, sync/async functions, `await task?`, generic functions, struct, enum, match, try/catch/finally, `std.fs`, `std.http`, `std.config`, `std.task`, bounded task stress, HTTP response usage, array map, string methods, and `array.try_get`.
 - `ku check` diagnostics on open/save, shown in Problems with red squiggles.
 - Command Palette commands: Run, Check, Show IR, Build, Build Native C, Package GC, Show Version.
 - Right-click menu `Ku Run` in the editor and Explorer for `.ku` files; if the file does not define `fn main()`, the command shows a clear warning instead of disappearing.
 - Editor title buttons for Run, Check, IR, and Build.
 - Status bar version check for interpreter/plugin mismatch.
-- Hover docs for async/await, Error, Result, std.fs, std.http, std.config, match, string and array helpers.
+- Hover docs for async/await, Error, Result, std.fs, std.http, std.config, std.task, match, string and array helpers.
 - Completion for keywords, base types, builtins, stdlib modules/functions, Error fields, HttpResponse fields, string/array methods, import paths, and package dependency prefixes. Member completion is context-aware: typing `http.s` only offers `service` / `server` and inserts only the member name, so it will not become `http.http.server`.
 - Typed arrow functions are first-class values. Object indexing is strict by default; `object[key]?` is the explicit nullable lookup form.
 - JSON diagnostics are routed to the actual imported file, and stale checks cannot overwrite a newer save/change result.
 - Go to definition for local functions/types, imported files, and exported imported symbols.
 - Outline symbols for module, function, struct, enum, and local functions.
-- Quick Fixes for missing `std.http` / `std.fs`, `let`, and `switch`.
+- Quick Fixes for missing `std.http` / `std.fs` / `std.config` / `std.task`, `let`, and `switch`.
 - Built-in formatter for 4-space indentation, compressed blank lines, operator/comma spacing, and `} else` / `} catch` / `} finally` joining.
 
 ## Install From VSIX

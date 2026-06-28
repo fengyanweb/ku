@@ -242,9 +242,22 @@ import "std.fs"
 import "std.http"
 import "std.config"
 import http from "std.http"
+import { fs, http, time } from "std"
 ```
 
-`import "std.http"` 等价于导入名为 `http` 的标准库模块；`import http from "std.http"` 是显式命名空间形式。旧写法 `std:http` 不支持。
+`import "std.http"` 等价于导入名为 `http` 的标准库模块；`import http from "std.http"` 是显式命名空间形式。
+
+`import { fs, http } from "std"` 表示一次导入多个标准库模块，也可以多行书写：
+
+```ku
+import {
+    fs,
+    http,
+    time
+} from "std"
+```
+
+`from "std"` 只接受标准库模块名，不支持 alias；`import { fs as file } from "std"` 当前会报错。旧写法 `std:http` 不支持。
 
 当前 `fs` / `http` 使用强制导入门禁。历史内置模块 `string` / `array` / `json` / `time` / `lexer` / `parser` 仍可直接点调用。
 
@@ -404,11 +417,27 @@ object.age = 18
 ```ku
 i++
 i--
+++i
+--i
 items[0]++
 user.age--
 ```
 
-当前 `++` / `--` 只能作为独立语句使用，目标必须可赋值且支持数字运算；不支持在表达式里读取旧值或新值。
+`++` / `--` 只能作为独立语句使用，目标必须可赋值且支持数字运算；不支持在表达式里读取旧值或新值。
+
+复合赋值支持：
+
+```ku
+i += i + 1
+i -= 1
+i *= 2
+i /= 3
+i %= 2
+items[0] += 10
+user.age -= 1
+```
+
+复合赋值按“读取当前左值一次、计算、写回”的语义执行。当前赋值目标仍沿用已有边界：变量、直接数组/对象索引、直接字段可写；深层链式写入仍按现有 assignment target 规则检查。
 
 全大写或全大写加下划线的名字按常量处理：
 
@@ -587,17 +616,20 @@ add(1, 2)
 user.name
 ```
 
-### 7.2 print
+### 7.2 print / println
 
-`print` 支持两种写法，`println(value)` 是可复用的内置函数形式：
+`print` 输出内容但不自动换行；`println(value)` 输出内容并追加换行。
+
+`print` 支持两种写法，推荐使用括号形式：
 
 ```ku
 print("hello")
 print "hello"
-println("hello")
+print(" ")
+println("world")
 ```
 
-推荐使用括号形式。
+上面输出为同一行 `hello world\n`。需要逐行日志、示例输出、压测结果时优先使用 `println`。
 
 ### 7.3 return
 
@@ -638,6 +670,19 @@ if (score >= 90) {
 if age >= 18 { }  // 错误
 ```
 
+当 `then` / `else` 分支只有一个语句时，可以省略 `{}`：
+
+```ku
+if (age >= 18) print("adult")
+else print("child")
+
+while (true)
+    if (ready) break
+    else continue
+```
+
+省略 `{}` 只包住紧跟着的一条语句。多条语句必须继续使用块。
+
 ### 7.5 while
 
 条件必须带小括号，且条件表达式类型必须是 `bool`：
@@ -650,9 +695,15 @@ while (i < 5) {
 }
 ```
 
+循环体只有一个语句时可以省略 `{}`：
+
+```ku
+while (i < 5) i++
+```
+
 ### 7.6 for
 
-`for` 当前只遍历数组：
+`for` 可以遍历数组，也可以遍历非负整数范围。
 
 ```ku
 nums:[int] = [1, 2, 3]
@@ -660,6 +711,19 @@ nums:[int] = [1, 2, 3]
 for n in nums {
     print(n)
 }
+
+for i in 10 {
+    print(i) // 0 到 9
+}
+```
+
+`for i in 10` 表示迭代 `0 <= i < 10`。负数会报错，不会静默跳过。
+
+循环体只有一个语句时可以省略 `{}`：
+
+```ku
+total = 0
+for i in 4 total += i
 ```
 
 ### 7.7 break / continue
@@ -681,6 +745,18 @@ while (i < 10) {
 ```
 
 `break` / `continue` 只能写在 `while` 或 `for` 内部。
+
+### 7.8 循环上限与抢占边界
+
+解释器不再设置固定“最多执行多少步”的硬性循环上限。同步死循环会一直占用当前解释器线程，直到进程、终端、测试 harness、HTTP handler timeout 或操作系统限制终止它。
+
+仍然存在这些边界：
+
+- `int` 运算使用有界整数，溢出会报 `integer overflow`。
+- 函数调用深度有保护，直接或间接递归过深会报错，避免只依赖宿主栈崩溃。
+- async task 的循环会在语句 tick 时检查协作式取消；main 返回后的 shutdown 会取消未完成 task，并在有界窗口内排空。
+- HTTP handler 有 `handler_timeout_ms`，超时返回 504，不会让请求无限等待。
+- 不断分配内存的循环仍可能触发宿主环境 OOM。
 
 ### 7.8 try / catch / finally
 
@@ -1137,7 +1213,7 @@ println(value:any): null
 
 ```ku
 print(len("Ku"))
-print(str(123))
+println(str(123))
 println("Ku")
 return ok(1)
 return err("bad")
@@ -1235,12 +1311,126 @@ json.try_parse(text:str): Unknown!
 ### 12.7 time
 
 ```txt
-time.now(): int
+time.now(): Time
+time.now(value: Time): int
 time.unix(): int
+time.unix(value: Time): int
 time.millis(): int
+time.millis(value: Time | Duration): int
+time.from_unix(seconds:int): Time
+time.from_millis(ms:int): Time
+time.date(): Date
+time.date(value: Time): Date
+time.date(value: Time, zone:str): Date!
+time.date(year:int, month:int, day:int): Date!
+time.datetime(year:int, month:int, day:int, hour:int, minute:int, second:int): Time!
+time.datetime(year:int, month:int, day:int, hour:int, minute:int, second:int, zone:str): Time!
+time.format(value: Time): str
+time.format(value: Time, layout:str): str!
+time.format(value: Time, layout:str, zone:str): str!
+time.parse(text:str): Time!
+time.parse(text:str, layout:str): Time!
+time.parse(text:str, layout:str, zone:str): Time!
+time.duration(ms:int): Duration!
+time.duration(value:int, unit:str): Duration!
+time.add(value: Time, duration: Duration): Time
+time.sub(value: Time, duration: Duration): Time
+time.diff(left: Time, right: Time): Duration
+time.compare(left: Time, right: Time): int
+time.parts(value: Time): object
+time.parts(value: Time, zone:str): object!
+time.weekday(value: Time | Date): int
+time.weekday(value: Time, zone:str): int!
+time.is_leap(year:int): bool
+time.days_in_month(year:int, month:int): int!
+time.sleep(ms:int): null!
+time.sleep(duration: Duration): null!
 ```
 
-### 12.8 config
+第一版不新增独立 VM 值类型，`Time` / `Date` / `Duration` 用普通 object 承载：
+
+```ku
+now = time.now()
+print(now.kind)   // "time.time"
+print(now.millis) // Unix 毫秒时间戳
+```
+
+`Date` 形如 `{ kind:"time.date", year, month, day }`，`Duration` 形如 `{ kind:"time.duration", millis }`。
+
+默认格式为：
+
+```txt
+yyyy-MM-dd HH:mm:ss
+```
+
+支持的格式符：
+
+```txt
+yyyy 年
+MM   月 01-12
+dd   日 01-31
+HH   小时 00-23
+mm   分钟 00-59
+ss   秒 00-59
+SSS  毫秒 000-999
+```
+
+`zone` 第一版支持 `"local"`、`"utc"`、`"+08:00"`、`"-05:30"` 这类固定偏移。
+
+示例：
+
+```ku
+import { time } from "std"
+
+fn main(): null! {
+    now = time.now()
+    text = time.format(now, "yyyy-MM-dd HH:mm:ss", "+08:00")?
+    println(text)
+
+    duration = time.duration(5, "s")?
+    later = time.add(now, duration)
+    println(time.millis(time.diff(later, now)))
+
+    d = time.date(2026, 6, 23)?
+    println(time.weekday(d)) // 1=周一，7=周日
+
+    time.sleep(1000)?
+    return ok(null)
+}
+```
+
+非法日期、非法时间、非法格式、非法时区和非法 duration 返回结构化 `Err({ domain:"time", code, message })`。`time.sleep` 在同步 main 中阻塞当前线程；在 async task 中会走 blocking worker，避免长时间占用 task worker。
+
+### 12.8 task runtime 观测与压力测试
+
+使用前显式导入：
+
+```ku
+import "std.task"
+```
+
+```txt
+task.stats(): object
+task.stress(demand:int, producers:int, hold_ms:int): object
+```
+
+`task.stats()` 返回当前 runtime 的 active/registered/queued task、等待边、blocking job、worker 数以及累计 accepted/rejected/finished。
+
+`task.stress` 用多个生产者并发提交指定数量的 task demand。runtime 仍执行默认 `max_tasks = 1024`，超出的需求立即按 `too_many_tasks` 计入拒绝，不会扩大上限或无限排队。参数边界：
+
+- demand：1 到 10000000。
+- producers：1 到 64。
+- hold_ms：0 到 60000。
+- 调用时 runtime 必须空闲；如果已有 active/queued task 或 blocking job，会返回 `task/stress_runtime_busy`，避免指标和业务 task 混在一起。
+- workload drain 最多等待 30 秒，超时返回 `task/stress_timeout`。
+
+仓库根目录的 `test.ku` 打印前后时间、耗时和 runtime 指标；`run-test.ps1` 额外从进程外采集 CPU 时间、峰值 working set、峰值 private memory 和线程数：
+
+```powershell
+.\run-test.ps1
+```
+
+### 12.9 config
 
 配置读取需要显式导入：
 
@@ -1265,7 +1455,7 @@ config.yaml(path:str): object!
 - 配置文件上限为 1000000 bytes。
 - YAML 嵌套、数组和复杂对象暂不支持。
 
-### 12.9 http
+### 12.10 http
 
 HTTP 需要显式导入：
 
@@ -1362,6 +1552,20 @@ HTTP handler 会在类型检查阶段按 `(req, res)` ABI 复查参数和返回�
 - header/body/write 分别使用自己的 timeout，网络错误不自动无限重试。
 
 路由未命中返回 404，路径存在但 method 不匹配返回 405，body 超过 `max_body_bytes` 返回 413，header 超过 `max_header_bytes` 返回 431，坏请求返回 400。
+
+可直接运行的 HTTP 示例：
+
+```powershell
+cargo run -- run examples\http_server.ku
+```
+
+另开一个终端压测：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127.0.0.1:8080/json -Requests 10000 -Concurrency 100
+```
+
+`examples/http_bench.ps1` 使用内嵌 C# `HttpClient` 并发发送请求，输出开始/结束时间、总耗时、RPS、错误数、状态码分布和粗略延迟分位；脚本有外部 deadline，不会无限等待。
 
 ## 13. struct
 
@@ -1567,7 +1771,7 @@ native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error�
 最大 token 数: 100000
 最大解析深度: 32
 最大检查深度: 32
-最大执行步数: 1000000
+最大执行步数: 无固定硬上限；仍受取消、timeout、调用深度和宿主环境限制
 最大函数调用深度: 16
 源码文件最大读取: 1000000 bytes
 fs.read 最大读取: 1000000 bytes
@@ -1646,15 +1850,17 @@ union         ::= result ('|' result)*
 result        ::= atom '!'?
 atom          ::= 'int' | 'float' | 'bool' | 'str' | 'null' | '[' type ']' | IDENT ('.' IDENT)*
 block         ::= '{' stmt* '}'
-stmt          ::= var | assign | destructure | inc | if | while | for | break | continue | try | fail | panic | return | print | expr
+stmt          ::= var | assign | compound_assign | destructure | inc | if | while | for | break | continue | try | fail | panic | return | print | expr
 var           ::= IDENT ':' type ('=' expr)?
 assign        ::= assign_target '=' expr
+compound_assign ::= assign_target ('+=' | '-=' | '*=' | '/=' | '%=') expr
 destructure   ::= (IDENT | '_') (',' (IDENT | '_'))+ '=' expr (',' expr)+
-inc           ::= assign_target ('++' | '--')
+inc           ::= assign_target ('++' | '--') | ('++' | '--') assign_target
 assign_target ::= IDENT | expr '[' expr ']' | expr '.' IDENT
-if            ::= 'if' '(' expr ')' block ('else' (if | block))?
-while         ::= 'while' '(' expr ')' block
-for           ::= 'for' IDENT 'in' expr block
+body          ::= block | stmt
+if            ::= 'if' '(' expr ')' body ('else' (if | body))?
+while         ::= 'while' '(' expr ')' body
+for           ::= 'for' IDENT 'in' expr body
 try           ::= 'try' block ('catch' '(' IDENT ')' block)? ('finally' block)?
 return        ::= 'return' expr?
 print         ::= 'print' expr | 'print' '(' expr ')'

@@ -1,7 +1,7 @@
-﻿fn add(a: int, b: int): int {
+fn add(a: int, b: int): int {
     return a + b
 }
 
 fn main() {
-    print(add(10, 20))
+    println(add(10, 20))
 }

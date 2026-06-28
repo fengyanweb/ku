@@ -8,8 +8,8 @@ fn main() {
     }
 
     if (total == 10) {
-        print("ok")
+        println("ok")
     } else {
-        print("bad")
+        println("bad")
     }
 }

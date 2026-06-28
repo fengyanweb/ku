@@ -145,7 +145,10 @@ const REGISTRY_INSTALL_LOCK_STALE_SECS: u64 = 30;
 static NEXT_REGISTRY_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn discover_for_file(path: &Path) -> KuResult<Option<PackageContext>> {
-    let start = path.parent().unwrap_or_else(|| Path::new("."));
+    let start = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     discover_from_dir(start)
 }
 

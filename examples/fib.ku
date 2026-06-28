@@ -1,4 +1,4 @@
-﻿fn fib(n: int): int {
+fn fib(n: int): int {
     if (n <= 1) {
         return n
     }
@@ -7,5 +7,5 @@
 }
 
 fn main() {
-    print(fib(10))
+    println(fib(10))
 }

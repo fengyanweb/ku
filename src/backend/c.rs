@@ -564,12 +564,15 @@ fn emit_print(out: &mut String, value: &IrExpr) -> KuResult<()> {
     match value.ty {
         IrType::Int | IrType::Bool => {
             out.push_str(&format!(
-                "  printf(\"%lld\\n\", (long long){});\n",
+                "  printf(\"%lld\", (long long){});\n  fflush(stdout);\n",
                 c_expr(value)?
             ));
         }
         IrType::Str => {
-            out.push_str(&format!("  printf(\"%s\\n\", {});\n", c_expr(value)?));
+            out.push_str(&format!(
+                "  printf(\"%s\", {});\n  fflush(stdout);\n",
+                c_expr(value)?
+            ));
         }
         _ => {
             return Err(unsupported(

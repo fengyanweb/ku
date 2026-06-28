@@ -13,5 +13,5 @@ fn main() {
         text = "using default config"
     }
 
-    print(text)
+    println(text)
 }

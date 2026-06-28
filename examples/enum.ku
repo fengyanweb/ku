@@ -6,5 +6,5 @@ enum TokenKind {
 
 fn main() {
     kind = TokenKind.Ident
-    print(kind)
+    println(kind)
 }

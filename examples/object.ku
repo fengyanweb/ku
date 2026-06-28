@@ -1,5 +1,5 @@
 fn main() {
     person = { name: "张三", age: 18 }
-    print(person.name)
-    print(person.age)
+    println(person.name)
+    println(person.age)
 }

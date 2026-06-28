@@ -58,6 +58,8 @@ impl<'a> Lexer<'a> {
                 '+' => {
                     if self.match_char('+') {
                         TokenKind::PlusPlus
+                    } else if self.match_char('=') {
+                        TokenKind::PlusEqual
                     } else {
                         TokenKind::Plus
                     }
@@ -65,12 +67,26 @@ impl<'a> Lexer<'a> {
                 '-' => {
                     if self.match_char('-') {
                         TokenKind::MinusMinus
+                    } else if self.match_char('=') {
+                        TokenKind::MinusEqual
                     } else {
                         TokenKind::Minus
                     }
                 }
-                '*' => TokenKind::Star,
-                '%' => TokenKind::Percent,
+                '*' => {
+                    if self.match_char('=') {
+                        TokenKind::StarEqual
+                    } else {
+                        TokenKind::Star
+                    }
+                }
+                '%' => {
+                    if self.match_char('=') {
+                        TokenKind::PercentEqual
+                    } else {
+                        TokenKind::Percent
+                    }
+                }
                 '?' => {
                     if self.match_char('.') {
                         TokenKind::QuestionDot
@@ -108,7 +124,13 @@ impl<'a> Lexer<'a> {
                         TokenKind::Greater
                     }
                 }
-                '/' => TokenKind::Slash,
+                '/' => {
+                    if self.match_char('=') {
+                        TokenKind::SlashEqual
+                    } else {
+                        TokenKind::Slash
+                    }
+                }
                 '&' => {
                     if self.match_char('&') {
                         TokenKind::AndAnd

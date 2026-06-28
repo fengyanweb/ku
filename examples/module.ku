@@ -1,5 +1,5 @@
 module demo
 
 fn main() {
-    print("module declaration parsed")
+    println("module declaration parsed")
 }

@@ -1,6 +1,6 @@
 import "./math.ku"
 
 fn main() {
-    print(Add(1, 2))
-    print(Twice(4))
+    println(Add(1, 2))
+    println(Twice(4))
 }

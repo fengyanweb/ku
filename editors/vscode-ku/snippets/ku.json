@@ -89,14 +89,35 @@
     "body": ["import \"std.http\""],
     "description": "Import std.http"
   },
+  "import std modules": {
+    "prefix": "std",
+    "body": ["import { ${1:fs}, ${2:http} } from \"std\""],
+    "description": "Import multiple standard library modules"
+  },
   "import std.config": {
     "prefix": "std.config",
     "body": ["import \"std.config\""],
     "description": "Import std.config"
   },
+  "import std.task": {
+    "prefix": "std.task",
+    "body": ["import \"std.task\""],
+    "description": "Import std.task"
+  },
+  "task stress": {
+    "prefix": "task.stress",
+    "body": [
+      "started = time.millis()",
+      "report = task.stress(${1:1000000}, ${2:15}, ${3:250})",
+      "finished = time.millis()",
+      "println(`耗时(ms): {finished - started}`)",
+      "println(`峰值 active: {report.peak_active}`)"
+    ],
+    "description": "Run bounded async task demand stress test"
+  },
   "http get": {
     "prefix": "http.get",
-    "body": ["res = http.get(${1:\"https://example.com\"})?", "print(res.status)", "print(res.body)"],
+    "body": ["res = http.get(${1:\"https://example.com\"})?", "println(res.status)", "println(res.body)"],
     "description": "HTTP GET response"
   },
   "http client": {
@@ -118,9 +139,9 @@
     "prefix": "http.service",
     "body": [
       "service = http.service",
-      "print(service.max_active_requests)",
-      "print(service.max_pending_requests)",
-      "print(service.max_body_bytes)"
+      "println(service.max_active_requests)",
+      "println(service.max_pending_requests)",
+      "println(service.max_body_bytes)"
     ],
     "description": "HTTP service default limits"
   },

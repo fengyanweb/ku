@@ -106,7 +106,7 @@ function resolveImportUri(from, importPath) {
     return vscode.Uri.file(candidate);
 }
 function isStdImport(importPath) {
-    return importPath.startsWith("std.");
+    return importPath === "std" || importPath.startsWith("std.");
 }
 function defaultModuleName(importPath) {
     if (importPath.startsWith("std.")) {
