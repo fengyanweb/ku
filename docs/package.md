@@ -1,6 +1,6 @@
 # Ku Package Draft
 
-0.0.7 固定最小 package 草案，0.0.11 增加 `file://` dependency、checksum、`ku.lock` package dependency 记录和 cache GC。0.0.12 后续补齐 HTTPS registry 请求、SHA-256 执行和内容寻址 cache；生产 CLI 仍在签名与归档协议确定前保持 fail-closed。
+0.0.7 固定最小 package 草案，0.0.11 增加 `file://` dependency、checksum、`ku.lock` package dependency 记录和 cache GC。0.0.12 补齐 HTTPS registry 请求、SHA-256 执行和内容寻址 cache；0.0.13 增加 `ku build` 入口字段 `main` 和输出字段 `out`。生产 CLI 仍在签名与归档协议确定前保持 fail-closed。
 
 ## ku.mod
 
@@ -10,6 +10,8 @@
 name = "demo_pkg"
 version = "0.1.0"
 root = "src"
+main = "main.ku"
+out = ".ku/build"
 cache = ".ku/cache"
 
 dep.util = "1.0.0"
@@ -24,12 +26,32 @@ dep.util.checksum = "ku-fnv64-..."
 | `name` | 是 | 包名，必须以小写 ascii 字母开头，只允许小写字母、数字、`_`、`-` |
 | `version` | 否 | 包版本，格式是 `major.minor.patch` 数字 |
 | `root` | 否 | import root，默认 `src` |
+| `main` | 否 | build 默认入口，相对 `root`，默认 `main.ku` |
+| `out` | 否 | build 输出根目录，相对包根，默认 `.ku/build` |
 | `cache` | 否 | 包本地缓存目录，默认 `.ku/cache` |
 | `dep.<name>` | 否 | 依赖版本；resolver 支持精确 `1.2.3` 和 caret `^1.2.3`，`~` 暂不进入求解 |
 | `dep.<name>.source` | 否 | 当前只支持 `file://` 目录 source |
 | `dep.<name>.checksum` | 否 | 依赖目录稳定 hash，格式为 `ku-fnv64-` 加 16 位十六进制 |
 
 `ku.mod` 只接受 `key = "value"`，`#` 后面是注释。
+
+## Build Entry
+
+`ku build` 无显式文件时会读取当前目录或指定目录向上的 `ku.mod`：
+
+```txt
+entry = <package>/<root>/<main>
+output = <package>/<out>/<profile>/<name>
+```
+
+例如：
+
+```powershell
+ku build .
+ku build --release -o dist\demo.exe
+```
+
+当前 `ku build` 默认生成解释器打包型二进制；它会嵌入口文件源码，但带 import 的程序仍要求原源码依赖路径可访问。最终 native binary 的完整 import graph 打包仍在 native ABI 队列里。
 
 ## Import Root
 

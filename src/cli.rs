@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -35,9 +35,21 @@ Usage:
                         Check and emit JSON Lines diagnostics
   ku ir <file.ku>       Print checked Ku IR draft
   ku llvm <file.ku>     Emit prototype LLVM text IR
-  ku build <file.ku>    Build a runnable executable wrapper
+  ku build [file.ku]    Build a runnable executable package
+  ku build .            Build the nearest ku.mod package
+  ku build -o <path> [file.ku]
+                        Build to an explicit executable path
+  ku build --release [file.ku]
+                        Build with release profile
+  ku build --profile <debug|release|small|fast> [file.ku]
+  ku build --emit-c [file.ku]
+                        Also emit prototype native C source under .ku/build
+  ku build --emit-ir [file.ku]
+                        Also emit checked Ku IR draft under .ku/build
+  ku build --backend c [file.ku]
+                        Build the native C prototype with a C compiler
   ku build --native <file.ku>
-                        Emit prototype native C source
+                        Compatibility form: emit prototype native C source beside file
   ku package gc <file.ku>
                         Remove unused package cache entries for a package
   ku version            Print version
@@ -53,6 +65,7 @@ Examples:
   ku ir examples\\function.ku
   ku llvm examples\\function.ku
   ku build examples\\hello.ku
+  ku build --release -o dist\\hello.exe examples\\hello.ku
   ku build --native examples\\function.ku
   ku package gc examples\\package\\src\\main.ku
 ";
@@ -60,6 +73,14 @@ Examples:
 pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
     match args.get(1).map(String::as_str) {
         Some("run") => {
+            if args.get(2).is_some_and(|arg| arg == "build") {
+                eprintln!(
+                    "warning[W0101]: `ku run build` is deprecated\nhelp: use `ku build` instead"
+                );
+                let mut build_args = vec![args[0].clone(), "build".to_string()];
+                build_args.extend(args.iter().skip(3).cloned());
+                return run_build_command(&build_args);
+            }
             let path = exact_path(&args, "run")?;
             let source = read_ku_file(path)?;
             run_source(path, &source)
@@ -101,10 +122,7 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
                 let output = build_native_c(path, &source)?;
                 println!("native c ok: {}", output.display());
             } else {
-                let path = exact_path(&args, "build")?;
-                let source = read_ku_file(path)?;
-                let output = build_executable(path, &source)?;
-                println!("build ok: {}", output.display());
+                run_build_command(&args)?;
             }
             Ok(())
         }
@@ -196,9 +214,456 @@ fn read_ku_file(path: &str) -> Result<String, KuError> {
     fs::read_to_string(path).map_err(|e| KuError::message(format!("failed to read {path}: {e}")))
 }
 
-fn build_executable(path: &str, source: &str) -> Result<PathBuf, KuError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildProfile {
+    Debug,
+    Release,
+    Small,
+    Fast,
+}
+
+impl BuildProfile {
+    fn parse(value: &str) -> Result<Self, KuError> {
+        match value {
+            "debug" => Ok(Self::Debug),
+            "release" => Ok(Self::Release),
+            "small" => Ok(Self::Small),
+            "fast" => Ok(Self::Fast),
+            _ => Err(command_error(format!(
+                "unknown build profile '{value}'; expected debug, release, small, or fast"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+            Self::Small => "small",
+            Self::Fast => "fast",
+        }
+    }
+
+    fn rustc_opt_level(self) -> Option<&'static str> {
+        match self {
+            Self::Debug => None,
+            Self::Release => Some("2"),
+            Self::Small => Some("s"),
+            Self::Fast => Some("3"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildBackend {
+    Runner,
+    C,
+    Llvm,
+}
+
+impl BuildBackend {
+    fn parse(value: &str) -> Result<Self, KuError> {
+        match value {
+            "runner" | "interp" | "interpreter" => Ok(Self::Runner),
+            "c" | "native-c" => Ok(Self::C),
+            "llvm" | "ll" => Ok(Self::Llvm),
+            _ => Err(command_error(format!(
+                "unknown build backend '{value}'; expected runner, c, or llvm"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BuildOptions {
+    entry: Option<PathBuf>,
+    output: Option<PathBuf>,
+    profile: BuildProfile,
+    target: Option<String>,
+    backend: BuildBackend,
+    emit_c: bool,
+    emit_ir: bool,
+    emit_llvm: bool,
+    clean: bool,
+    verbose: bool,
+    lto: bool,
+    strip: bool,
+    static_link: bool,
+}
+
+#[derive(Debug)]
+struct BuildPlan {
+    entry: PathBuf,
+    source: String,
+    out_root: PathBuf,
+    build_dir: PathBuf,
+    output: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RunnerBuildConfig<'a> {
+    profile: BuildProfile,
+    target: Option<&'a str>,
+    lto: bool,
+    strip: bool,
+    verbose: bool,
+}
+
+fn run_build_command(args: &[String]) -> Result<(), KuError> {
+    let options = parse_build_options(args)?;
+    let plan = resolve_build_plan(&options)?;
+    if options.clean && plan.out_root.exists() {
+        fs::remove_dir_all(&plan.out_root).map_err(|err| {
+            KuError::message(format!(
+                "failed to clean build directory '{}': {err}",
+                plan.out_root.display()
+            ))
+        })?;
+    }
+    fs::create_dir_all(&plan.build_dir).map_err(|err| {
+        KuError::message(format!(
+            "failed to create build directory '{}': {err}",
+            plan.build_dir.display()
+        ))
+    })?;
+
+    if options.verbose {
+        println!("build entry: {}", plan.entry.display());
+        println!("build profile: {}", options.profile.as_str());
+        println!("build directory: {}", plan.build_dir.display());
+    }
+
+    if options.emit_ir {
+        let output = write_checked_ir_artifact(&plan)?;
+        println!("ir ok: {}", output.display());
+    }
+    if options.emit_llvm {
+        let output = write_llvm_ir_artifact(&plan)?;
+        println!("llvm ir ok: {}", output.display());
+    }
+
+    match options.backend {
+        BuildBackend::Runner => {
+            if options.emit_c {
+                let output = write_native_c_artifact(&plan)?;
+                println!("native c ok: {}", output.display());
+            }
+            if options.static_link && options.verbose {
+                println!("note: --static is reserved for native backends; runner backend embeds Ku source in a Rust wrapper");
+            }
+            let entry = path_string(&plan.entry);
+            let output = build_executable_to(
+                &entry,
+                &plan.source,
+                &plan.output,
+                RunnerBuildConfig {
+                    profile: options.profile,
+                    target: options.target.as_deref(),
+                    lto: options.lto,
+                    strip: options.strip,
+                    verbose: options.verbose,
+                },
+            )?;
+            println!("build ok: {}", output.display());
+        }
+        BuildBackend::C => {
+            let c_output = write_native_c_artifact(&plan)?;
+            println!("native c ok: {}", c_output.display());
+            compile_c_source(
+                &c_output,
+                &plan.output,
+                options.profile,
+                options.static_link,
+                options.verbose,
+            )?;
+            println!("build ok: {}", plan.output.display());
+        }
+        BuildBackend::Llvm => {
+            let llvm_output = write_llvm_ir_artifact(&plan)?;
+            println!("llvm ir ok: {}", llvm_output.display());
+            return Err(KuError::message(format!(
+                "LLVM backend does not link executables yet; wrote {}\nhelp: use `ku build` for a runnable wrapper, or `ku build --emit-llvm` when you only need text IR",
+                llvm_output.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_build_options(args: &[String]) -> Result<BuildOptions, KuError> {
+    let mut options = BuildOptions {
+        entry: None,
+        output: None,
+        profile: BuildProfile::Debug,
+        target: None,
+        backend: BuildBackend::Runner,
+        emit_c: false,
+        emit_ir: false,
+        emit_llvm: false,
+        clean: false,
+        verbose: false,
+        lto: false,
+        strip: false,
+        static_link: false,
+    };
+
+    let mut index = 2;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "-o" | "--output" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(command_error("missing output path after -o/--output"));
+                };
+                options.output = Some(PathBuf::from(value));
+            }
+            "--profile" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(command_error("missing profile after --profile"));
+                };
+                options.profile = BuildProfile::parse(value)?;
+            }
+            "--release" => options.profile = BuildProfile::Release,
+            "--debug" => options.profile = BuildProfile::Debug,
+            "--small" => options.profile = BuildProfile::Small,
+            "--fast" => options.profile = BuildProfile::Fast,
+            "--target" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(command_error("missing target after --target"));
+                };
+                options.target = Some(value.clone());
+            }
+            "--backend" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(command_error("missing backend after --backend"));
+                };
+                options.backend = BuildBackend::parse(value)?;
+            }
+            "--emit-c" => options.emit_c = true,
+            "--emit-ir" => options.emit_ir = true,
+            "--emit-llvm" | "--emit-ll" => options.emit_llvm = true,
+            "--clean" => options.clean = true,
+            "--verbose" | "-v" => options.verbose = true,
+            "--lto" => options.lto = true,
+            "--strip" => options.strip = true,
+            "--static" => options.static_link = true,
+            value if value.starts_with('-') => {
+                return Err(command_error(format!("unknown build option '{value}'")));
+            }
+            value => {
+                if options.entry.is_some() {
+                    return Err(command_error(
+                        "ku build accepts at most one file or project path",
+                    ));
+                }
+                options.entry = Some(PathBuf::from(value));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(options)
+}
+
+fn resolve_build_plan(options: &BuildOptions) -> Result<BuildPlan, KuError> {
+    let cwd = env::current_dir()
+        .map_err(|err| KuError::message(format!("failed to read current directory: {err}")))?;
+    let (entry, package) = match &options.entry {
+        Some(path) if path.is_dir() => {
+            let package = package::discover_from_dir(path)?.ok_or_else(|| {
+                KuError::message(format!(
+                    "no ku.mod found for project '{}'\nhelp: run `ku build <file.ku>` or add ku.mod with name/root/main",
+                    path.display()
+                ))
+            })?;
+            (package_entry_path(&package), Some(package))
+        }
+        Some(path) => {
+            if !is_ku_path(path) {
+                return Err(KuError::message(format!(
+                    "expected a .ku source file or package directory for ku build, got '{}'\nhelp: use `ku build src/main.ku` or `ku build .`",
+                    path.display()
+                )));
+            }
+            let entry = fs::canonicalize(path).map_err(|err| {
+                KuError::message(format!(
+                    "failed to resolve build entry '{}': {err}",
+                    path.display()
+                ))
+            })?;
+            let package = package::discover_for_file(&entry)?;
+            (entry, package)
+        }
+        None => {
+            let package = package::discover_from_dir(&cwd)?.ok_or_else(|| {
+                KuError::message(
+                    "ku build needs a .ku file or a ku.mod package in the current directory\nhelp: use `ku build <file.ku>`, or create ku.mod with name/root/main",
+                )
+            })?;
+            (package_entry_path(&package), Some(package))
+        }
+    };
+
+    if !entry.exists() {
+        return Err(KuError::message(format!(
+            "build entry '{}' does not exist\nhelp: check ku.mod main/root, or pass an explicit .ku file",
+            entry.display()
+        )));
+    }
+    if !is_ku_path(&entry) {
+        return Err(KuError::message(format!(
+            "build entry '{}' is not a .ku source file\nhelp: set ku.mod main to a .ku file",
+            entry.display()
+        )));
+    }
+    reject_large_file(&entry, Span::default())?;
+    let source = fs::read_to_string(&entry).map_err(|err| {
+        KuError::message(format!(
+            "failed to read build entry '{}': {err}",
+            entry.display()
+        ))
+    })?;
+
+    let package_name = package
+        .as_ref()
+        .map(|package| package.manifest.name.clone())
+        .unwrap_or_else(|| {
+            entry
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("ku_app")
+                .to_string()
+        });
+    let out_root = package
+        .as_ref()
+        .map(|package| {
+            package.package_dir.join(
+                package
+                    .manifest
+                    .out
+                    .as_deref()
+                    .unwrap_or(package::DEFAULT_BUILD_DIR),
+            )
+        })
+        .unwrap_or_else(|| {
+            entry
+                .parent()
+                .map(|parent| parent.join(package::DEFAULT_BUILD_DIR))
+                .unwrap_or_else(|| cwd.join(package::DEFAULT_BUILD_DIR))
+        });
+    let build_dir = build_profile_dir(&out_root, options.profile, options.target.as_deref());
+    let output = options
+        .output
+        .clone()
+        .unwrap_or_else(|| build_dir.join(&package_name));
+    let output = with_executable_extension(output, options.target.as_deref());
+
+    Ok(BuildPlan {
+        entry,
+        source,
+        out_root,
+        build_dir,
+        output,
+    })
+}
+
+fn package_entry_path(package: &PackageContext) -> PathBuf {
+    let mut entry = package.import_root.join(
+        package
+            .manifest
+            .main
+            .as_deref()
+            .unwrap_or(package::DEFAULT_MAIN_FILE),
+    );
+    if entry.extension().is_none() {
+        entry.set_extension("ku");
+    }
+    entry
+}
+
+fn build_profile_dir(out_root: &Path, profile: BuildProfile, target: Option<&str>) -> PathBuf {
+    if let Some(target) = target {
+        out_root.join(target).join(profile.as_str())
+    } else {
+        out_root.join(profile.as_str())
+    }
+}
+
+fn with_executable_extension(mut path: PathBuf, target: Option<&str>) -> PathBuf {
+    let needs_exe = target
+        .map(|target| target.contains("windows"))
+        .unwrap_or_else(|| cfg!(windows));
+    if needs_exe && path.extension().is_none() {
+        path.set_extension("exe");
+    }
+    path
+}
+
+fn is_ku_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ku"))
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn write_checked_ir_artifact(plan: &BuildPlan) -> Result<PathBuf, KuError> {
+    let entry = path_string(&plan.entry);
+    let program = parse_and_check(&entry, &plan.source)?;
+    let output = plan.build_dir.join("ir").join("main.ir");
+    write_text_artifact(&output, format!("{}", ir::lower_program(&program)?))
+}
+
+fn write_native_c_artifact(plan: &BuildPlan) -> Result<PathBuf, KuError> {
+    let output = plan.build_dir.join("c").join("main.c");
+    write_native_c_to(&path_string(&plan.entry), &plan.source, &output)
+}
+
+fn write_llvm_ir_artifact(plan: &BuildPlan) -> Result<PathBuf, KuError> {
+    let output = plan.build_dir.join("llvm").join("main.ll");
+    write_llvm_ir_to(&path_string(&plan.entry), &plan.source, &output)
+}
+
+fn write_text_artifact(output: &Path, text: String) -> Result<PathBuf, KuError> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            KuError::message(format!(
+                "failed to create artifact directory '{}': {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    fs::write(output, text).map_err(|err| {
+        KuError::message(format!(
+            "failed to write artifact '{}': {err}",
+            output.display()
+        ))
+    })?;
+    Ok(output.to_path_buf())
+}
+
+fn build_executable_to(
+    path: &str,
+    source: &str,
+    output: &Path,
+    config: RunnerBuildConfig<'_>,
+) -> Result<PathBuf, KuError> {
     check_source(path, source)?;
-    let output = executable_output_path(path);
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            KuError::message(format!(
+                "failed to create output directory '{}': {err}",
+                parent.display()
+            ))
+        })?;
+    }
     let embedded_path = fs::canonicalize(path)
         .unwrap_or_else(|_| Path::new(path).to_path_buf())
         .to_string_lossy()
@@ -240,44 +705,68 @@ fn build_executable(path: &str, source: &str) -> Result<PathBuf, KuError> {
         exe_dir
     };
     let lib = find_ku_rlib(&target_dir)?;
-    let deps = target_dir.join("deps");
-    let status = Command::new("rustc")
+    let dependency_dirs = find_dependency_dirs(&target_dir);
+    let mut command = Command::new("rustc");
+    command
         .arg("--edition=2021")
         .arg(&runner)
         .arg("--extern")
         .arg(format!("ku={}", lib.display()))
-        .arg("-L")
-        .arg(format!("dependency={}", deps.display()))
         .arg("-o")
-        .arg(&output)
+        .arg(output);
+    for deps in &dependency_dirs {
+        command
+            .arg("-L")
+            .arg(format!("dependency={}", deps.display()));
+    }
+    if let Some(target) = config.target {
+        command.arg("--target").arg(target);
+    }
+    if let Some(opt_level) = config.profile.rustc_opt_level() {
+        command.arg("-C").arg(format!("opt-level={opt_level}"));
+        command.arg("-C").arg("debuginfo=0");
+    }
+    if config.lto {
+        command.arg("-C").arg("lto=fat");
+    }
+    if config.strip {
+        command.arg("-C").arg("strip=symbols");
+    }
+    if config.verbose {
+        println!("rustc command: {command:?}");
+    }
+    let status = command
         .status()
         .map_err(|err| KuError::message(format!("failed to run rustc for ku build: {err}")))?;
     temp_guard.cleanup();
     if !status.success() {
         return Err(KuError::message(format!(
-            "ku build failed: rustc exited with {status}"
+            "ku build failed: rustc exited with {status}\nhelp: make sure Rust is installed and libku.rlib plus its dependency directory match the selected target"
         )));
     }
-    Ok(output)
+    Ok(output.to_path_buf())
 }
 
 fn build_native_c(path: &str, source: &str) -> Result<PathBuf, KuError> {
+    let output = Path::new(path).with_extension("c");
+    write_native_c_to(path, source, &output)
+}
+
+fn write_native_c_to(path: &str, source: &str, output: &Path) -> Result<PathBuf, KuError> {
     let program = parse_and_expand(path, source)?;
     reject_native_async(&program)?;
     Checker::new().check(&program)?;
     let ir = ir::lower_program(&program)?;
     let c_source = backend::c::generate_c_source(&ir)?;
-    let output = Path::new(path).with_extension("c");
-    fs::write(&output, c_source).map_err(|err| {
-        KuError::message(format!(
-            "failed to write native C source '{}': {err}",
-            output.display()
-        ))
-    })?;
-    Ok(output)
+    write_text_artifact(output, c_source)
 }
 
 fn build_llvm_ir(path: &str, source: &str) -> Result<PathBuf, KuError> {
+    let output = Path::new(path).with_extension("ll");
+    write_llvm_ir_to(path, source, &output)
+}
+
+fn write_llvm_ir_to(path: &str, source: &str, output: &Path) -> Result<PathBuf, KuError> {
     let program = parse_and_expand(path, source)?;
     reject_compiled_async(
         &program,
@@ -286,14 +775,85 @@ fn build_llvm_ir(path: &str, source: &str) -> Result<PathBuf, KuError> {
     Checker::new().check(&program)?;
     let ir = ir::lower_program(&program)?;
     let llvm_ir = backend::llvm::generate_llvm_ir(&ir)?;
-    let output = Path::new(path).with_extension("ll");
-    fs::write(&output, llvm_ir).map_err(|err| {
-        KuError::message(format!(
-            "failed to write LLVM IR '{}': {err}",
-            output.display()
-        ))
-    })?;
-    Ok(output)
+    write_text_artifact(output, llvm_ir)
+}
+
+fn compile_c_source(
+    source: &Path,
+    output: &Path,
+    profile: BuildProfile,
+    static_link: bool,
+    verbose: bool,
+) -> Result<(), KuError> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            KuError::message(format!(
+                "failed to create output directory '{}': {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut tried = Vec::new();
+    let mut candidates = Vec::new();
+    if let Ok(cc) = env::var("KU_CC") {
+        if !cc.trim().is_empty() {
+            candidates.push(cc);
+        }
+    }
+    for fallback in ["zig", "clang", "cc", "gcc", "cl"] {
+        if !candidates.iter().any(|candidate| candidate == fallback) {
+            candidates.push(fallback.to_string());
+        }
+    }
+    for candidate in candidates {
+        tried.push(candidate.clone());
+        let mut command = if candidate == "zig" {
+            let mut command = Command::new("zig");
+            command.arg("cc");
+            command
+        } else {
+            Command::new(&candidate)
+        };
+        if candidate == "cl" {
+            command
+                .arg("/nologo")
+                .arg(source)
+                .arg(format!("/Fe:{}", output.display()));
+            if profile != BuildProfile::Debug {
+                command.arg("/O2");
+            }
+        } else {
+            command.arg(source).arg("-std=c11").arg("-o").arg(output);
+            if let Some(opt_level) = profile.rustc_opt_level() {
+                command.arg(format!("-O{opt_level}"));
+            }
+            if static_link {
+                command.arg("-static");
+            }
+        }
+        if verbose {
+            println!("c compiler command: {command:?}");
+        }
+        match command.status() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                return Err(KuError::message(format!(
+                    "native C build failed: {candidate} exited with {status}\nhelp: inspect generated source at {} or use default `ku build` until the native backend supports this program",
+                    source.display()
+                )));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(KuError::message(format!(
+                    "failed to run C compiler '{candidate}': {err}\nhelp: set KU_CC to clang/gcc/zig/cl, or use default `ku build`"
+                )));
+            }
+        }
+    }
+    Err(KuError::message(format!(
+        "C compiler not found for native build\nhelp: install clang/gcc/zig/cl, set KU_CC, or use default `ku build`; tried {}",
+        tried.join(", ")
+    )))
 }
 
 fn reject_native_async(program: &Program) -> Result<(), KuError> {
@@ -430,14 +990,6 @@ impl Drop for TempBuildDir {
     }
 }
 
-fn executable_output_path(path: &str) -> PathBuf {
-    let mut output = Path::new(path).with_extension("");
-    if cfg!(windows) {
-        output.set_extension("exe");
-    }
-    output
-}
-
 fn build_runner_source(path: &str, source: &str) -> String {
     let literal = raw_string_literal(source);
     format!(
@@ -486,6 +1038,38 @@ fn find_ku_rlib(exe_dir: &Path) -> Result<PathBuf, KuError> {
             deps.display()
         ))
     })
+}
+
+fn find_dependency_dirs(exe_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    push_existing_dir(&mut dirs, exe_dir.join("deps"));
+    if exe_dir.file_name().is_some_and(|name| name == "release") {
+        if let Some(repo) = exe_dir.parent().and_then(Path::parent) {
+            push_existing_dir(&mut dirs, repo.join("target").join("release").join("deps"));
+        }
+    }
+    if exe_dir.file_name().is_some_and(|name| name == "debug") {
+        if let Some(repo) = exe_dir.parent().and_then(Path::parent) {
+            push_existing_dir(&mut dirs, repo.join("target").join("debug").join("deps"));
+        }
+    }
+    if exe_dir.file_name().is_some_and(|name| name == "release") {
+        if let Some(repo) = exe_dir.parent() {
+            push_existing_dir(&mut dirs, repo.join("target").join("release").join("deps"));
+        }
+    }
+    if exe_dir.file_name().is_some_and(|name| name == "debug") {
+        if let Some(repo) = exe_dir.parent() {
+            push_existing_dir(&mut dirs, repo.join("target").join("debug").join("deps"));
+        }
+    }
+    dirs
+}
+
+fn push_existing_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.is_dir() && !dirs.iter().any(|existing| existing == &path) {
+        dirs.push(path);
+    }
 }
 
 fn expected_ku_file(path: &str) -> KuError {

@@ -207,6 +207,24 @@ impl KuError {
                 .note("HTTP handlers may run concurrently")
                 .help("avoid shared mutable captures in handlers until a sync/state API exists");
         }
+        if message.contains("unknown std module") {
+            return DiagnosticInfo::new("E0601")
+                .note("standard library module names are lowercase")
+                .help("use lowercase std names, for example `import { task, time } from \"std\"`");
+        }
+        if message.contains("not exported by")
+            || message.contains("has no exported function")
+            || message.contains("has no exported type")
+        {
+            return DiagnosticInfo::new("E0601")
+                .note("lowercase top-level names in user files are private to that file")
+                .help("rename the exported fn/struct/enum so it starts with an uppercase ASCII letter");
+        }
+        if message.contains("std module") && message.contains("must be imported") {
+            return DiagnosticInfo::new("E0601")
+                .note("std modules with side effects or runtime state must be imported explicitly")
+                .help("add `import { module } from \"std\"`, or use the module path form such as `import \"std.task\"`");
+        }
         if message.starts_with("type error:") || message.contains("type mismatch") {
             return DiagnosticInfo::new("E0301");
         }

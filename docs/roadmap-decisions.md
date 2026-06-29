@@ -6,7 +6,7 @@
 
 暂无。
 
-本轮已完成的固定语法/API 和示例已写入 `docs/syntax.md`、`README.md`、`docs-site/guide/*` 与 `docs/v0.0.12.md`；这里不再重复堆清单。
+本轮已完成的固定语法/API 和示例已写入 `docs/syntax.md`、`README.md`、`docs-site/guide/*` 与 `docs/v0.0.13.md`；这里不再重复堆清单。
 
 ## 已决定的语言方向
 
@@ -31,6 +31,7 @@
 4. registry fail-closed：Ed25519 detached signature、内置官方根公钥、自定义 registry 显式公钥、key rotation/revocation、受限 `.tar.zst` 解包、manifest/index/lockfile 一致性校验。
 5. 真实项目验证：用两个真实 Ku 项目验证 native C / LLVM；LLVM 只按真实项目需要继续扩展。
 6. native async：等 native ABI 稳定后单独设计状态机 runtime，不使用 OS 线程冒充小协程。
+7. 最终 native binary build：在解释器打包型 `ku build` 稳定后，继续做完整 import graph 打包、runtime ABI lowering、object file/linker、增量 cache，并满足生成物不依赖 Ku 源码文件的验收标准。
 
 ## 下阶段建议顺序
 

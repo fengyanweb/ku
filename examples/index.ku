@@ -1,12 +1,11 @@
-import "std.http"
 fn main() {
-    app = http.service
-    print(app)
-    try {
-        app.get('/idnex',((res,req)=>{
-            print(`{res}`)
-        }))
-    } catch (err) {
-        print(err)
-    }
+    nums: [int] = [11, 12, 13]
+    println(nums[0])
+
+    text = "Ku"
+    println(text[0])
+
+    user = { name: "Ku" }
+    println(user["name"])
+    println(str(user["missing"]?))
 }

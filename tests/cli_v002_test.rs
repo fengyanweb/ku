@@ -343,6 +343,37 @@ fn check_json_emits_stable_json_lines_diagnostic() {
 }
 
 #[test]
+fn check_json_import_errors_include_actionable_help() {
+    let path = write_temp_ku(
+        "json-import-diagnostic.ku",
+        "import { Task } from \"std\"\nfn main() { print(1) }\n",
+    );
+    let path_text = path_arg(&path);
+    let result = run_ku(&["check", "--json", &path_text]);
+    fs::remove_file(&path).ok();
+
+    assert_ne!(result.code, Some(0), "invalid import should fail");
+    let line = result
+        .stderr
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("expected JSON diagnostic");
+    for field in [
+        "\"code\":\"E0601\"",
+        "unknown std module",
+        "\"line\":1",
+        "\"column\":10",
+        "standard library module names are lowercase",
+        "import { task, time } from \\\"std\\\"",
+    ] {
+        assert!(
+            line.contains(field),
+            "missing {field} in JSON line:\n{line}"
+        );
+    }
+}
+
+#[test]
 fn check_json_success_is_silent_and_rejects_extra_arguments() {
     let path = path_arg(&repo_root().join("examples").join("hello.ku"));
     let result = run_ku(&["check", "--json", &path]);

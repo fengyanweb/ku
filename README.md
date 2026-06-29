@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.12`，正在补齐 native C、LLVM、registry resolver 和 async task 生命周期能力。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.13`，正在补齐二进制构建系统、native C、LLVM、registry resolver 和 async task 生命周期能力。
 
 ## 快速开始
 
@@ -29,9 +29,21 @@ ku check --json <file.ku>
                       Check and emit JSON Lines diagnostics
 ku ir <file.ku>       Print checked Ku IR draft
 ku llvm <file.ku>     Emit prototype LLVM text IR
-ku build <file.ku>    Build a runnable executable wrapper
+ku build [file.ku]    Build a runnable executable package
+ku build .            Build the nearest ku.mod package
+ku build -o <path> [file.ku]
+                      Build to an explicit executable path
+ku build --release [file.ku]
+                      Build with release profile
+ku build --profile <debug|release|small|fast> [file.ku]
+ku build --emit-c [file.ku]
+                      Also emit prototype native C under .ku/build
+ku build --emit-ir [file.ku]
+                      Also emit checked Ku IR under .ku/build
+ku build --backend c [file.ku]
+                      Build the native C prototype with a C compiler
 ku build --native <file.ku>
-                      Emit prototype native C source
+                      Compatibility form: emit prototype native C source beside file
 ku package gc <file.ku>
                       Remove unused package cache entries for a package
 ku version            Print version
@@ -40,7 +52,7 @@ ku -h | -help         Print help
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.12 支持的核心语法
+## 0.0.13 支持的核心语法
 
 ```ku
 struct User {
@@ -180,7 +192,8 @@ http_bench.ps1
 
 ## 文档
 
-- [0.0.12 语法文档](docs/syntax.md)
+- [0.0.13 语法文档](docs/syntax.md)
+- [0.0.13 版本记录](docs/v0.0.13.md)
 - [0.0.12 版本记录](docs/v0.0.12.md)
 - [0.0.11 版本记录](docs/v0.0.11.md)
 - [0.0.10 版本记录](docs/v0.0.10.md)
@@ -198,11 +211,13 @@ http_bench.ps1
 
 ## 当前边界
 
-`ku build` 当前生成解释器打包型可执行文件。
+`ku build` 当前生成解释器打包型可执行文件。单文件默认输出到源文件旁的 `.ku/build/<profile>/<name>`；有 `ku.mod` 时可以直接 `ku build` 或 `ku build .`，入口来自 `root + main`，默认 `src/main.ku`，输出目录来自 `out`，默认 `.ku/build`。支持 `-o` 指定输出、`--debug` / `--release` / `--profile debug|release|small|fast`、`--target` 目标目录分层、`--emit-ir`、`--emit-c`、`--emit-llvm` 和 `--backend c` 原型。`ku run build` 保留兼容，但会提示改用 `ku build`。
+
+注意：0.0.13 的默认 build 是“解释器打包型二进制”，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于最终 native ABI。带 import 的程序仍应保持源码依赖路径可访问。完整 native binary 目标仍在执行队列：native closure、正式 `KuString`、dynamic object、async state machine runtime、增量缓存和真正不依赖源码的 import graph 打包。
 
 `ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally` 和 return-through-finally。array/named/Result 已按默认 move、显式 `clone()`、自动 drop 生成所有权代码；闭包、动态 object、正式 owned string 和 async native lowering 仍会明确报不支持。
 
-已完成到 0.0.12 的关键前置：
+已完成到 0.0.13 的关键前置：
 
 ```txt
 支持 str | int 这类联合类型，用于参数、变量和返回值检查。
@@ -244,6 +259,9 @@ async runtime 默认最多 1024 个 task；blocking worker 为 min(32, max(4, CP
 task.status/cancel/await_timeout 已实现；取消是协作式的，等待超时不会隐式取消目标任务。
 registry resolver 支持精确版本和 caret 范围、最高兼容版本选择和冲突诊断；HTTPS-only 获取、SHA-256、内容寻址 cache 和安装锁已实现，签名信任根、归档格式、受限解包和 CLI 远程 import 串联前仍保持 fail-closed。
 LLVM 文本后端已支持非递归 struct 和基础/struct Result。
+标准库 root import 允许小写导出，例如 `import { task, time } from "std"`；用户自定义文件的顶层 `fn/struct/enum` 仍必须首字母大写才对外导出。import/export 诊断会给出位置、问题描述和修改方向。
+`std.time` 会拒绝超出 chrono 支持范围的毫秒值，不再静默回退到当前时间。
+`ku.mod` 增加 `main` 和 `out` 字段，供 `ku build` 解析项目默认入口和输出目录。
 ```
 
 仍未完成：
@@ -267,7 +285,7 @@ editors/vscode-ku
 已提供：
 
 ```txt
-Ku 0.0.12 语法高亮和 snippet
+Ku 0.0.13 语法高亮和 snippet
 ku.mod / ku.lock 高亮
 保存/打开时运行 ku check，并把错误放进 Problems 面板
 命令面板：Run / Check / Show IR / Build / Build Native C / Package GC / Show Version
@@ -282,13 +300,13 @@ Ku 文件默认保存时格式化；import path 补全会替换引号内路径�
 图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择：
 
 ```txt
-editors/vscode-ku/ku-language-0.0.12.vsix
+editors/vscode-ku/ku-language-0.0.13.vsix
 ```
 
 命令安装方式：
 
 ```powershell
-code --install-extension editors\vscode-ku\ku-language-0.0.12.vsix --force
+code --install-extension editors\vscode-ku\ku-language-0.0.13.vsix --force
 ```
 
 ## 开发验证

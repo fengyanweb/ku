@@ -768,6 +768,26 @@ fn main(): null! {
 }
 
 #[test]
+fn std_time_rejects_out_of_range_millis_without_falling_back_to_now() {
+    let source = r#"
+import { time } from "std"
+
+fn main(): null! {
+    value = time.from_millis(9223372036854775807)
+    print(time.format(value))
+    return ok(null)
+}
+"#;
+    let err = run_source("inline.ku", source)
+        .expect_err("out-of-range millis should be rejected")
+        .to_string();
+    assert!(
+        err.contains("outside supported range"),
+        "error should explain the range problem: {err}"
+    );
+}
+
+#[test]
 fn stdlib_modules_can_be_shadowed_by_local_values() {
     let source = r#"
 fn main() {

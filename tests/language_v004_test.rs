@@ -956,6 +956,41 @@ fn B(): int { return 1 }
 }
 
 #[test]
+fn lowercase_user_top_level_names_are_private_but_diagnostic_suggests_export_form() {
+    let dir = unique_temp_path("private-import-help");
+    fs::create_dir_all(&dir).expect("create temp import dir");
+    let lib = dir.join("lib.ku");
+    let main = dir.join("main.ku");
+    fs::write(&lib, "fn helper(): int { return 1 }\n").expect("write lib");
+    fs::write(
+        &main,
+        r#"
+import { helper } from "./lib.ku"
+fn main() { print(helper()) }
+"#,
+    )
+    .expect("write main");
+
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect_err("lowercase user export should fail")
+    .to_string();
+    assert!(err.contains("not exported"), "unexpected error: {err}");
+    assert!(
+        err.contains("starts with an uppercase ASCII letter"),
+        "missing export help: {err}"
+    );
+    assert!(err.contains("main.ku:2:"), "missing import location: {err}");
+
+    let _ = fs::remove_file(lib);
+    let _ = fs::remove_file(main);
+    let _ = fs::remove_dir(dir);
+}
+
+#[test]
 fn imports_keep_private_helpers_inside_imported_module() {
     let dir = unique_temp_path("import-helpers");
     fs::create_dir_all(&dir).expect("create temp import dir");
@@ -1157,7 +1192,7 @@ fn ku_build_creates_runnable_executable_wrapper() {
     ])
     .expect("ku build should succeed");
 
-    let mut exe = source.with_extension("");
+    let mut exe = dir.join(".ku").join("build").join("debug").join("main");
     if cfg!(windows) {
         exe.set_extension("exe");
     }
@@ -1169,7 +1204,72 @@ fn ku_build_creates_runnable_executable_wrapper() {
         "unexpected stdout: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    let _ = fs::remove_file(exe);
-    let _ = fs::remove_file(source);
-    let _ = fs::remove_dir(dir);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ku_build_supports_output_path_alias_and_package_manifest_entry() {
+    let dir = unique_temp_path("build-options");
+    fs::create_dir_all(&dir).expect("create temp build dir");
+    let source = dir.join("single.ku");
+    fs::write(&source, "fn main() { print(\"single\") }").expect("write ku source");
+    let mut explicit = dir.join("dist").join("single-bin");
+    if cfg!(windows) {
+        explicit.set_extension("exe");
+    }
+    run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        "build".to_string(),
+        "-o".to_string(),
+        explicit.to_string_lossy().to_string(),
+        source.to_string_lossy().to_string(),
+    ])
+    .expect("ku run build alias should build");
+    let output = Command::new(&explicit).output().expect("run explicit exe");
+    assert!(output.status.success(), "explicit exe should run");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("single"));
+
+    let package_dir = dir.join("pkg");
+    let src = package_dir.join("src");
+    fs::create_dir_all(&src).expect("create package src");
+    fs::write(
+        package_dir.join("ku.mod"),
+        "name = \"build_pkg\"\nversion = \"0.1.0\"\nroot = \"src\"\nmain = \"app.ku\"\nout = \"dist\"\n",
+    )
+    .expect("write ku.mod");
+    fs::write(src.join("app.ku"), "fn main() { print(\"package\") }").expect("write app");
+    run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--release".to_string(),
+        "--emit-ir".to_string(),
+        package_dir.to_string_lossy().to_string(),
+    ])
+    .expect("ku build package should succeed");
+    let mut package_exe = package_dir.join("dist").join("release").join("build_pkg");
+    if cfg!(windows) {
+        package_exe.set_extension("exe");
+    }
+    assert!(
+        package_exe.exists(),
+        "expected package exe at {}",
+        package_exe.display()
+    );
+    assert!(
+        package_dir
+            .join("dist")
+            .join("release")
+            .join("ir")
+            .join("main.ir")
+            .exists(),
+        "expected emitted Ku IR artifact"
+    );
+    let output = Command::new(&package_exe)
+        .output()
+        .expect("run package exe");
+    assert!(output.status.success(), "package exe should run");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("package"));
+
+    let _ = fs::remove_dir_all(dir);
 }

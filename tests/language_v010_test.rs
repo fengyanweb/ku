@@ -682,6 +682,22 @@ fn main() {
 }
 
 #[test]
+fn std_root_import_allows_lowercase_task_and_time_modules() {
+    let source = r#"
+import { task, time } from "std"
+
+fn main() {
+    now = time.millis()
+    stats = task.stats()
+    print(now >= 0)
+    print(stats.active_tasks >= 0)
+}
+"#;
+    check_source("inline.ku", source).expect("lowercase std root imports should check");
+    run_source("inline.ku", source).expect("lowercase std root imports should run");
+}
+
+#[test]
 fn native_c_backend_lowers_enum_payload_and_guarded_match_cfg() {
     let source = r#"
 enum Maybe {

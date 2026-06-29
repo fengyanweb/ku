@@ -18,6 +18,7 @@ $version = $Matches[1]
 $historyDir = Join-Path "history" "v$version"
 $releaseExe = Join-Path "target" "release\ku.exe"
 $releaseLib = Join-Path "target" "release\libku.rlib"
+$releasePdb = Join-Path "target" "release\ku.pdb"
 
 if (-not $SkipBuild) {
     cargo build --release
@@ -40,5 +41,9 @@ Copy-Item -LiteralPath $releaseExe -Destination "release\ku.exe" -Force
 Copy-Item -LiteralPath $releaseLib -Destination "release\libku.rlib" -Force
 Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $historyDir "ku.exe") -Force
 Copy-Item -LiteralPath $releaseLib -Destination (Join-Path $historyDir "libku.rlib") -Force
+if (Test-Path -LiteralPath $releasePdb) {
+    Copy-Item -LiteralPath $releasePdb -Destination "release\ku.pdb" -Force
+    Copy-Item -LiteralPath $releasePdb -Destination (Join-Path $historyDir "ku.pdb") -Force
+}
 
 Write-Output "archive ok: ku $version"

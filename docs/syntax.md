@@ -1,10 +1,10 @@
-# Ku 0.0.12 Syntax
+# Ku 0.0.13 Syntax
 
-本文档固定 Ku 0.0.12 当前真实支持的全部语法和边界。CLI 版本应显示：
+本文档固定 Ku 0.0.13 当前真实支持的全部语法和边界。CLI 版本应显示：
 
 ```powershell
 ku version
-# ku 0.0.12
+# ku 0.0.13
 ```
 
 Ku 当前是解释器优先的语言实现。文档只记录已经能被 lexer / parser / checker / runtime 闭环处理的语法；仍在设计中的能力放在文末“不支持 / 未完成”。
@@ -265,7 +265,7 @@ import {
 
 ### 4.1 基础类型
 
-Ku 0.0.12 的基础类型：
+Ku 0.0.13 的基础类型：
 
 ```txt
 int
@@ -1693,7 +1693,17 @@ ku check <file.ku>
 ku check --json <file.ku>
 ku ir <file.ku>
 ku llvm <file.ku>
-ku build <file.ku>
+ku build [file.ku]
+ku build .
+ku build -o <path> [file.ku]
+ku build --release [file.ku]
+ku build --debug [file.ku]
+ku build --profile <debug|release|small|fast> [file.ku]
+ku build --target <target> [file.ku]
+ku build --emit-c [file.ku]
+ku build --emit-ir [file.ku]
+ku build --emit-llvm [file.ku]
+ku build --backend c [file.ku]
 ku build --native <file.ku>
 ku package gc <file.ku>
 ku version
@@ -1734,6 +1744,44 @@ VS Code 扩展优先读取 JSON diagnostics；面对旧版 Ku CLI 时只回退�
 `ku llvm file.ku` 在源文件旁输出 `.ll`，不要求本机安装 LLVM。当前文本后端支持 `int/bool/str`、普通函数、局部变量、直接调用、`return`、`if/while`、`print`、非递归 struct 值与字段读写，以及 `Result<int|bool|str|struct>` 的 `ok`、`fail`、`?` 和错误传播。数组、enum、闭包、HTTP 和 async 仍会明确报不支持。后端会拒绝递归值 struct、缺失/重复 CFG block 和无条件自跳，避免生成明显错误或永久循环的 `.ll`。golden test 不依赖外部工具；检测到 `llvm-as` 时会额外验证生成文本。
 
 `ku build` 当前生成解释器打包型可执行文件。
+
+构建入口规则：
+
+```txt
+ku build src/main.ku      使用显式传入文件
+ku build .                从指定目录向上找 ku.mod
+ku build                  从当前目录向上找 ku.mod
+```
+
+有 `ku.mod` 时，入口为 `root + main`；`root` 默认 `src`，`main` 默认 `main.ku`。输出目录为 `out`，默认 `.ku/build`。单文件没有 `ku.mod` 时，输出根目录为源文件所在目录下的 `.ku/build`。
+
+默认 profile 是 `debug`：
+
+```txt
+ku build                  -> .ku/build/debug/<package_name>
+ku build --release        -> .ku/build/release/<package_name>
+ku build --target x86_64-windows --release
+                          -> .ku/build/x86_64-windows/release/<package_name>.exe
+```
+
+Windows host 或 Windows target 会自动追加 `.exe`。`-o` / `--output` 可以覆盖输出路径：
+
+```powershell
+ku build -o app.exe src/main.ku
+ku build --release -o dist/app.exe
+```
+
+调试产物：
+
+```txt
+--emit-ir      写入 .ku/build/<profile>/ir/main.ir
+--emit-c       写入 .ku/build/<profile>/c/main.c
+--emit-llvm    写入 .ku/build/<profile>/llvm/main.ll
+```
+
+`--backend c` 会使用 prototype C 后端生成 C 后再调用 C 编译器。查找顺序为 `KU_CC`、`zig cc`、`clang`、`cc`、`gcc`、`cl`；找不到或编译失败会给出修改方向。默认 backend 仍是解释器 wrapper，因为完整 native closure / KuString / dynamic object / async ABI 尚未完成。`ku run build` 仅作为兼容别名保留，会提示改用 `ku build`。
+
+0.0.13 build 的重要边界：默认生成的是“解释器打包型二进制”，入口源码会嵌入 wrapper；带 import 的程序仍会按原源码路径读取依赖，因此还不是最终“不依赖 Ku 源码文件”的 native binary。最终 native build 仍需要 import graph 打包、runtime ABI lowering、closure/native string/object/async lowering 和增量缓存继续补齐。
 
 `ku build --native` 当前输出 prototype C 源码，支持：
 

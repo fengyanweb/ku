@@ -70,7 +70,9 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
         }
         "from_millis" => {
             expect_arg_count("time.from_millis", args.len(), 1, span)?;
-            time_value(expect_int(&args[0], span)?)
+            let millis = expect_int(&args[0], span)?;
+            validate_time_millis(millis, span)?;
+            time_value(millis)
         }
         "date" => eval_date(args, span),
         "datetime" => eval_datetime(args, span),
@@ -159,7 +161,7 @@ fn eval_date(args: &[Value], span: Span) -> Value {
             let Ok(millis) = expect_time(&args[0], span) else {
                 return result(Err(time_error("invalid_time", "expected Time object")));
             };
-            date_value_from_local(millis_to_local(millis))
+            result(local_from_millis(millis, span).map(date_value_from_local))
         }
         2 => result((|| {
             let millis = expect_time(&args[0], span)?;
@@ -215,7 +217,10 @@ fn eval_datetime(args: &[Value], span: Span) -> Value {
 fn eval_format(args: &[Value], span: Span) -> Value {
     match args.len() {
         1 => match expect_time(&args[0], span) {
-            Ok(millis) => Value::String(format_local(millis, DEFAULT_LAYOUT)),
+            Ok(millis) => match format_local(millis, DEFAULT_LAYOUT, span) {
+                Ok(text) => Value::String(text),
+                Err(err) => result(Err(err)),
+            },
             Err(err) => result(Err(err)),
         },
         2 | 3 => result((|| {
@@ -225,7 +230,7 @@ fn eval_format(args: &[Value], span: Span) -> Value {
                 let zone = expect_str(zone, span)?;
                 format_zoned(millis, layout, zone, span)?
             } else {
-                format_local(millis, layout)
+                format_local(millis, layout, span)?
             };
             Ok(Value::String(text))
         })()),
@@ -314,7 +319,10 @@ fn eval_duration(args: &[Value], span: Span) -> Value {
 fn eval_parts(args: &[Value], span: Span) -> Value {
     match args.len() {
         1 => match expect_time(&args[0], span) {
-            Ok(millis) => parts_value(millis_to_local(millis), "local"),
+            Ok(millis) => match local_from_millis(millis, span) {
+                Ok(local) => parts_value(local, "local"),
+                Err(err) => result(Err(err)),
+            },
             Err(err) => result(Err(err)),
         },
         2 => result((|| {
@@ -565,17 +573,25 @@ fn zoned_datetime(millis: i64, zone: &str, span: Span) -> KuResult<DateTime<Fixe
     }
 }
 
-fn millis_to_local(millis: i64) -> DateTime<Local> {
+fn validate_time_millis(millis: i64, span: Span) -> KuResult<()> {
     Utc.timestamp_millis_opt(millis)
         .single()
-        .unwrap_or_else(Utc::now)
-        .with_timezone(&Local)
+        .map(|_| ())
+        .ok_or_else(|| time_error_at("invalid_time", "time millis outside supported range", span))
 }
 
-fn format_local(millis: i64, layout: &str) -> String {
-    millis_to_local(millis)
+fn local_from_millis(millis: i64, span: Span) -> KuResult<DateTime<Local>> {
+    Ok(Utc
+        .timestamp_millis_opt(millis)
+        .single()
+        .ok_or_else(|| time_error_at("invalid_time", "time millis outside supported range", span))?
+        .with_timezone(&Local))
+}
+
+fn format_local(millis: i64, layout: &str, span: Span) -> KuResult<String> {
+    Ok(local_from_millis(millis, span)?
         .format(&chrono_layout(layout))
-        .to_string()
+        .to_string())
 }
 
 fn format_zoned(millis: i64, layout: &str, zone: &str, span: Span) -> KuResult<String> {
@@ -663,7 +679,9 @@ fn weekday_value(value: &Value, zone: Option<&str>, span: Span) -> KuResult<i64>
                     .weekday()
                     .number_from_monday()
             } else {
-                millis_to_local(millis).weekday().number_from_monday()
+                local_from_millis(millis, span)?
+                    .weekday()
+                    .number_from_monday()
             };
             Ok(i64::from(weekday))
         }
