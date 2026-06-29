@@ -79,6 +79,8 @@ HTTP server 有连接上限、active/pending 背压、handler timeout、idle tim
 
 ## task
 
+`std.task` 是 runtime 诊断和压力测试命名空间，不是普通 task 句柄 API。业务并发只通过 `async fn` 调用返回 task，然后 `await task` / `await task?`；用户不能手动 spawn、调度或管理 task。
+
 ```ku
 import { task, time } from "std"
 

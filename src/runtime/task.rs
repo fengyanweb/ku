@@ -137,6 +137,7 @@ struct TaskState {
     result: Mutex<Option<KuResult<Value>>>,
     ready: Condvar,
     cancelled: AtomicBool,
+    awaited: AtomicBool,
     status: AtomicU8,
 }
 
@@ -189,7 +190,7 @@ impl TaskRuntime {
         Self { inner }
     }
 
-    pub fn spawn<F>(&self, run: F) -> TaskHandle
+    pub(crate) fn spawn<F>(&self, run: F) -> TaskHandle
     where
         F: FnOnce() -> KuResult<Value> + Send + 'static,
     {
@@ -207,6 +208,7 @@ impl TaskRuntime {
             result: Mutex::new(None),
             ready: Condvar::new(),
             cancelled: AtomicBool::new(false),
+            awaited: AtomicBool::new(false),
             status: AtomicU8::new(TASK_PENDING),
         });
         let handle = TaskHandle {
@@ -511,6 +513,12 @@ impl TaskRuntime {
     }
 
     pub fn await_task(&self, handle: &TaskHandle) -> KuResult<Value> {
+        if !handle.state.claim_await() {
+            return Ok(task_error(
+                "already_awaited",
+                format!("task {} has already been awaited", handle.id),
+            ));
+        }
         self.await_task_until(handle, None)
     }
 
@@ -901,6 +909,12 @@ impl TaskState {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    fn claim_await(&self) -> bool {
+        self.awaited
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     fn set_status(&self, status: u8) {
         if !self.is_cancelled() {
             self.status.store(status, Ordering::Release);
@@ -1197,6 +1211,31 @@ mod tests {
             Value::Int(7)
         );
         assert_eq!(task.status(), "completed");
+    }
+
+    #[test]
+    fn await_result_consumes_task_once() {
+        let runtime = TaskRuntime::with_limits(1, 2, 1, 1, 2);
+        let task = runtime.spawn(|| Ok(Value::Int(7)));
+
+        assert_eq!(
+            task.await_result().expect("first await should finish"),
+            Value::Int(7)
+        );
+        let second = task
+            .await_result()
+            .expect("second await should return a task Result value");
+        let Value::Result { ok, value } = second else {
+            panic!("second await should be a structured task error");
+        };
+        assert!(!ok);
+        let Value::Object(fields) = *value else {
+            panic!("task error payload should be an object");
+        };
+        assert_eq!(
+            fields.get("code"),
+            Some(&Value::String("already_awaited".to_string()))
+        );
     }
 
     #[test]

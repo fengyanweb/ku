@@ -254,9 +254,9 @@ cargo run -- run examples\http_server.ku
 powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127.0.0.1:8080/json -Requests 10000 -Concurrency 100
 ```
 native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wrapper。
-async fn 调用会立即启动 task，必须显式返回 T!；await task? 等价于 (await task)?。
+async fn 调用会立即启动一次性 task 句柄，必须显式返回 T!；await task? 等价于 (await task)?，并且 await 会消费 task，普通 task 只能 await 一次。
+Ku 不提供 task.spawn、Task.new、runtime.schedule 或 thread.spawn；HTTP server 内部可以使用 task，但 handler 用户不需要手动管理。
 async runtime 默认最多 1024 个 task；blocking worker 为 min(32, max(4, CPU 核心数))，blocking queue 最多 1024，超限返回结构化 task Err。
-task.status/cancel/await_timeout 已实现；取消是协作式的，等待超时不会隐式取消目标任务。
 registry resolver 支持精确版本和 caret 范围、最高兼容版本选择和冲突诊断；HTTPS-only 获取、SHA-256、内容寻址 cache 和安装锁已实现，签名信任根、归档格式、受限解包和 CLI 远程 import 串联前仍保持 fail-closed。
 LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 标准库 root import 允许小写导出，例如 `import { task, time } from "std"`；用户自定义文件的顶层 `fn/struct/enum` 仍必须首字母大写才对外导出。import/export 诊断会给出位置、问题描述和修改方向。

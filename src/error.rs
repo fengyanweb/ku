@@ -225,6 +225,21 @@ impl KuError {
                 .note("std modules with side effects or runtime state must be imported explicitly")
                 .help("add `import { module } from \"std\"`, or use the module path form such as `import \"std.task\"`");
         }
+        if message.contains("has already been awaited") {
+            return DiagnosticInfo::new("E0804")
+                .note("awaiting a task consumes its result")
+                .help("store the awaited value if you need to use it again");
+        }
+        if message.contains("task values cannot be cloned") {
+            return DiagnosticInfo::new("E0803")
+                .note("Task<T> is owned and move-only")
+                .help("keep the original task handle and await it once");
+        }
+        if message.contains("task handles can only be awaited") {
+            return DiagnosticInfo::new("E0802")
+                .note("Ku does not expose task.spawn, Task.new, or user-level task scheduling")
+                .help("start work by calling an async fn, then use `result = await task?`");
+        }
         if message.starts_with("type error:") || message.contains("type mismatch") {
             return DiagnosticInfo::new("E0301");
         }

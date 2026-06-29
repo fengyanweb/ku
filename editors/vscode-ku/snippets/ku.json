@@ -17,17 +17,7 @@
   "await task": {
     "prefix": "await",
     "body": ["${1:value} = await ${2:task}?"],
-    "description": "Await a task and propagate its Result error"
-  },
-  "task lifecycle": {
-    "prefix": "taskctl",
-    "body": [
-      "${1:result} = ${2:task}.await_timeout(${3:1000})",
-      "if (${2:task}.status() != \"completed\") {",
-      "    ${2:task}.cancel()",
-      "}"
-    ],
-    "description": "Wait with a timeout, inspect status, and cancel a task"
+    "description": "Await a one-use async fn task and propagate its Result error"
   },
   "function": {
     "prefix": "fn",
@@ -102,7 +92,7 @@
   "import std.task": {
     "prefix": "std.task",
     "body": ["import \"std.task\""],
-    "description": "Import std.task"
+    "description": "Import std.task diagnostics"
   },
   "task stress": {
     "prefix": "task.stress",
@@ -113,7 +103,7 @@
       "println(`耗时(ms): {finished - started}`)",
       "println(`峰值 active: {report.peak_active}`)"
     ],
-    "description": "Run bounded async task demand stress test"
+    "description": "Run bounded runtime task demand stress test"
   },
   "http get": {
     "prefix": "http.get",

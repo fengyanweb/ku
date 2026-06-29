@@ -7,9 +7,12 @@ assert.deepStrictEqual(model.memberCompletionLabels("http", "ser"), ["service", 
 assert.deepStrictEqual(model.memberCompletionLabels("http", "serve"), ["server"]);
 assert(!model.memberCompletionLabels("http", "s").some((label) => label.startsWith("std.")));
 assert(!model.memberCompletionLabels("http", "s").some((label) => label.startsWith("http.")));
-assert.deepStrictEqual(model.memberCompletionLabels("task", ""), ["status", "cancel", "await_timeout", "stats", "stress"]);
-assert.deepStrictEqual(model.memberCompletionLabels("task", "a"), ["await_timeout"]);
-assert.deepStrictEqual(model.memberCompletionLabels("task", "st"), ["status", "stats", "stress"]);
+assert.deepStrictEqual(model.memberCompletionLabels("task", ""), ["stats", "stress"]);
+assert.deepStrictEqual(model.memberCompletionLabels("task", "a"), []);
+assert.deepStrictEqual(model.memberCompletionLabels("task", "st"), ["stats", "stress"]);
+for (const label of ["status", "cancel", "await_timeout"]) {
+  assert(!model.memberCompletionLabels("task", "").includes(label));
+}
 assert.deepStrictEqual(model.memberCompletionLabels("time", "d"), ["date", "datetime", "duration", "diff", "days_in_month"]);
 assert.deepStrictEqual(model.stdRootModules, ["fs", "http", "string", "array", "json", "config", "time", "task"]);
 assert(!model.keywords.includes("println"));

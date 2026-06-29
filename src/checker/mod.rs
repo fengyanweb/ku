@@ -1061,7 +1061,7 @@ impl Checker {
                             expr.span,
                         ));
                     }
-                    match self.check_expr(task)? {
+                    match self.consume_await_task_expr(task, expr.span)? {
                         Type::Task(value) => Ok(*value),
                         Type::Unknown => Ok(Type::Unknown),
                         other => Err(KuError::runtime(
@@ -1986,6 +1986,9 @@ impl Checker {
         let target_type = self.check_expr(target)?;
         if name == "clone" {
             expect_arg_count("clone", args.len(), 0, span)?;
+            if contains_task_type(&target_type) {
+                return Err(KuError::runtime("task values cannot be cloned", span));
+            }
             if self.is_owned_type(&target_type) {
                 return Ok(Some(target_type));
             }
@@ -1998,14 +2001,21 @@ impl Checker {
             ));
         }
         if let Type::Task(value) = target_type {
+            let _ = value;
             return match name.as_str() {
                 "status" => {
                     expect_arg_count("task.status", args.len(), 0, span)?;
-                    Ok(Some(Type::String))
+                    Err(KuError::runtime(
+                        "task handles can only be awaited; status() is not part of Ku's user task API",
+                        span,
+                    ))
                 }
                 "cancel" => {
                     expect_arg_count("task.cancel", args.len(), 0, span)?;
-                    Ok(Some(Type::Bool))
+                    Err(KuError::runtime(
+                        "task handles can only be awaited; cancel() is not part of Ku's user task API",
+                        span,
+                    ))
                 }
                 "await_timeout" => {
                     expect_arg_count("task.await_timeout", args.len(), 1, span)?;
@@ -2013,7 +2023,10 @@ impl Checker {
                     if timeout != Type::Int {
                         return Err(type_error(args[0].span, &Type::Int, &timeout));
                     }
-                    Ok(Some(*value))
+                    Err(KuError::runtime(
+                        "task handles can only be awaited; await_timeout() is not part of Ku's user task API",
+                        span,
+                    ))
                 }
                 _ => Ok(None),
             };
@@ -2781,6 +2794,19 @@ impl Checker {
         Ok(ty)
     }
 
+    fn consume_await_task_expr(&mut self, expr: &Expr, await_span: Span) -> KuResult<Type> {
+        if let ExprKind::Variable(name) = &expr.kind {
+            let var = self.get_allow_moved(name, expr.span)?;
+            if var.moved && matches!(var.ty, Type::Task(_)) {
+                return Err(KuError::runtime(
+                    format!("task '{name}' has already been awaited"),
+                    await_span,
+                ));
+            }
+        }
+        self.consume_expr(expr)
+    }
+
     fn is_owned_type(&self, ty: &Type) -> bool {
         match ty {
             Type::String
@@ -3148,7 +3174,7 @@ fn type_name(ty: &Type) -> String {
         Type::Null => "null".to_string(),
         Type::Array(inner) => format!("[{}]", type_name(inner)),
         Type::Result(inner) => format!("{}!", type_name(inner)),
-        Type::Task(inner) => format!("task<{}>", type_name(inner)),
+        Type::Task(inner) => format!("Task<{}>", type_name(inner)),
         Type::Union(types) => types.iter().map(type_name).collect::<Vec<_>>().join(" | "),
         Type::Object(_) => "object".to_string(),
         Type::StringMap => "object".to_string(),
@@ -3159,6 +3185,26 @@ fn type_name(ty: &Type) -> String {
         Type::Void => "void".to_string(),
         Type::FunctionValue { .. } => "function".to_string(),
         Type::Unknown => "unknown".to_string(),
+    }
+}
+
+fn contains_task_type(ty: &Type) -> bool {
+    match ty {
+        Type::Task(_) => true,
+        Type::Array(inner) | Type::Result(inner) => contains_task_type(inner),
+        Type::Object(fields) => fields.values().any(contains_task_type),
+        Type::FunctionValue {
+            params,
+            return_type,
+            ..
+        } => {
+            params
+                .iter()
+                .any(|param| param.ty.as_ref().is_some_and(contains_task_type))
+                || return_type.as_deref().is_some_and(contains_task_type)
+        }
+        Type::Union(types) => types.iter().any(contains_task_type),
+        _ => false,
     }
 }
 

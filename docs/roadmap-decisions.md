@@ -13,7 +13,7 @@
 这些是后续设计和实现必须遵守的产品/技术取向，不需要再反复确认：
 
 1. 语法简单参考 Go，严格规则参考 Rust，低资源和 native 布局参考 Zig / C，native 内存模型参考 Rust / C++。
-2. HTTP server 默认并发，但用户不需要手写线程；async runtime 参考 Go / Tokio 的协作调度思路。
+2. HTTP server 默认并发，但用户不需要手写线程、不调度 task、不管理 runtime；async runtime 参考 Go / Tokio 的协作调度思路。
 3. 错误提示参考 Rust / Elm；错误结果默认结构化 `Result`。
 4. 包管理参考 Cargo / npm lock，但 fail-closed，签名、lockfile 和缓存一致性要更严格。
 5. 数据处理性能目标参考 Rust / C++，工具链体验参考 Go。
@@ -30,7 +30,7 @@
 3. native dynamic object：开放寻址 hash table、Owned move/clone/drop、严格缺键错误、`object.get_or` 后续补。
 4. registry fail-closed：Ed25519 detached signature、内置官方根公钥、自定义 registry 显式公钥、key rotation/revocation、受限 `.tar.zst` 解包、manifest/index/lockfile 一致性校验。
 5. 真实项目验证：用两个真实 Ku 项目验证 native C / LLVM；LLVM 只按真实项目需要继续扩展。
-6. native async：等 native ABI 稳定后单独设计状态机 runtime，不使用 OS 线程冒充小协程。
+6. native async：等 native ABI 稳定后单独设计状态机 runtime，不使用 OS 线程冒充小协程；用户侧仍只保留“async fn 返回一次性 task + await task”模型，不开放 `task.spawn`、`Task.new`、`runtime.schedule` 或 `thread.spawn`。
 7. 最终 native binary build：在解释器打包型 `ku build` 稳定后，继续做完整 import graph 打包、runtime ABI lowering、object file/linker、增量 cache，并满足生成物不依赖 Ku 源码文件的验收标准。
 
 ## 下阶段建议顺序

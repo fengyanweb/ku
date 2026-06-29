@@ -114,7 +114,7 @@ exports.namespaceMembers = {
         "days_in_month",
         "sleep",
     ],
-    task: ["status", "cancel", "await_timeout", "stats", "stress"],
+    task: ["stats", "stress"],
 };
 function stdImportPathLabels(current) {
     if (!current.startsWith("std.")) {

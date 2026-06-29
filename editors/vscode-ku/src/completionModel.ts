@@ -111,7 +111,7 @@ export const namespaceMembers: Record<string, string[]> = {
     "days_in_month",
     "sleep",
   ],
-  task: ["status", "cancel", "await_timeout", "stats", "stress"],
+  task: ["stats", "stress"],
 };
 
 export function stdImportPathLabels(current: string): string[] {

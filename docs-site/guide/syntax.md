@@ -15,5 +15,6 @@
 - 箭头函数可写参数和返回类型，例如 `(a:int, b:int): int => a + b`；函数保持第一公民。
 - 对象索引默认严格，缺键报错；`object[key]?` 才显式允许缺失并返回 `null`。
 - `lib.User { ... }` 称为命名空间限定的结构体字面量。
-- `async fn` 调用立即启动 task，必须显式返回 `T!`；`await task?` 等价于 `(await task)?`。
+- `async fn` 调用立即启动一次性 task 句柄，必须显式返回 `T!`；`await task?` 等价于 `(await task)?`，并会消费 task。
+- Ku 不提供 `task.spawn` / `Task.new` / `runtime.schedule` / `thread.spawn`；普通开发者只保存 async fn 返回的 task 并 `await`。
 - runtime 默认最多 1024 个 task，blocking worker 为 `min(32, max(4, CPU 核心数))`，blocking 队列最多 1024；超限返回结构化 `task` Err。

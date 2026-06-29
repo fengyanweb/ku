@@ -682,6 +682,87 @@ fn main() {
 }
 
 #[test]
+fn async_task_handles_are_move_only_and_await_once() {
+    let repeated = check_err(
+        r#"
+async fn load(): int! {
+    return ok(1)
+}
+
+async fn main(): null! {
+    task = load()
+    first = await task?
+    second = await task?
+    println(first + second)
+    return ok(null)
+}
+"#,
+    );
+    assert!(
+        repeated.contains("task 'task' has already been awaited"),
+        "task await should be single-use: {repeated}"
+    );
+
+    let cloned = check_err(
+        r#"
+async fn load(): int! {
+    return ok(1)
+}
+
+async fn main(): null! {
+    task = load()
+    copy = task.clone()
+    value = await copy?
+    println(value)
+    return ok(null)
+}
+"#,
+    );
+    assert!(
+        cloned.contains("task values cannot be cloned"),
+        "task handles must be move-only: {cloned}"
+    );
+
+    let array_clone = check_err(
+        r#"
+async fn load(): int! {
+    return ok(1)
+}
+
+async fn main(): null! {
+    tasks = [load()]
+    copy = tasks.clone()
+    value = await copy[0]?
+    println(value)
+    return ok(null)
+}
+"#,
+    );
+    assert!(
+        array_clone.contains("task values cannot be cloned"),
+        "collections containing task handles must not clone: {array_clone}"
+    );
+
+    let method = check_err(
+        r#"
+async fn load(): int! {
+    return ok(1)
+}
+
+async fn main(): null! {
+    task = load()
+    println(task.status())
+    return ok(null)
+}
+"#,
+    );
+    assert!(
+        method.contains("task handles can only be awaited"),
+        "task lifecycle methods should not be part of the user API: {method}"
+    );
+}
+
+#[test]
 fn std_root_import_allows_lowercase_task_and_time_modules() {
     let source = r#"
 import { task, time } from "std"

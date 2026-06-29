@@ -549,9 +549,11 @@ fn main() {
 
 当前解释器按共享绑定捕获，读取会看到外层变量最新值，赋值会写回外层可变变量。
 
-### 6.5 async fn 和 await
+### 6.5 async fn、task 句柄和 await
 
-`async fn` 表示可启动小协程的函数。调用一个 `async fn` 会得到一个 task；在同一个函数里调用多个 `async fn`，语义上就是启动多个独立 task，之后可以分别 `await`：
+`async fn` 表示可异步执行的函数。调用一个 `async fn` 会立即启动一个轻量 task，并返回一个一次性 task 句柄；task 不是线程，也不是关键字，用户不能手动创建或调度 task。
+
+普通开发者只需要使用这一种模型：
 
 ```ku
 async fn load(value: int): int! {
@@ -568,32 +570,41 @@ async fn main(): null! {
 }
 ```
 
-第一版规则：
+核心规则：
 
 - 调用 `async fn` 会立即启动 task，不是延迟到 `await` 才运行。
-- `async fn` 必须显式声明 `T!` 返回类型。
+- `async fn` 必须显式声明 `T!` 返回类型；调用结果的内部类型可显示为 `Task<T!>`，但日常代码推荐靠类型推导。
+- `task` 不是关键字，普通变量仍然可以叫 `task`。
+- task 是异步任务句柄，不是 OS 线程，不代表用户能直接管理调度器。
+- Ku 不提供 `task.spawn`、`Task.new`、`runtime.schedule` 或 `thread.spawn` 这类用户级任务创建/调度 API。
+- 普通 task 是 owned、move-only，不能隐式复制，不能 `clone()`。
+- `await task` 会消费 task 句柄；普通 task 只能 await 一次。
+- `await task?` 等价于 `(await task)?`，先等待任务完成，再把 `Result` 错误向外传播。
 - `await` 只能出现在 `async fn` 内。
 - `await` 的值必须是 task。
-- `await task?` 等价于 `(await task)?`。
 - `fn main()` 和 `async fn main()` 不能同时存在。
 - async task 可以读取外层捕获，但不能修改外层捕获；checker 和 runtime 都会拒绝写入。
+- HTTP server 内部可以使用 task 处理并发请求，但 handler 用户不需要手动创建或管理 task。
 - native C 明确拒绝 async。
 
-Task 生命周期 API：
+错误示例：
 
 ```ku
 task = load(1)
-state = task.status()
-result = task.await_timeout(1000)
-cancelled = task.cancel()
+first = await task?
+second = await task? // error: task has already been awaited
 ```
 
-- `task.status(): str` 返回 `pending`、`running`、`waiting`、`cancelling`、`completed`、`failed`、`cancelled` 或 `panicked`。
-- `task.cancel(): bool` 发起协作式取消；返回 `true` 表示本次成功把未结束任务切换到取消流程，已经结束或已经请求取消时返回 `false`。
-- `task.await_timeout(ms:int): T` 最多等待指定毫秒。超时返回结构化 `Err({ domain: "task", code: "timeout", ... })`，只结束本次等待，不自动取消目标 task。
-- 取消会唤醒普通 `await` 和超时等待。排队中的任务不会再执行；运行中的 Ku 代码会在下一次解释器安全检查点结束。
-- 已经送入 blocking pool 的系统调用不能被强行终止。取消会停止 task 对该调用的等待，但已经开始的文件或网络操作可能自行完成，因此带外部副作用的操作仍应使用自身超时和幂等设计。
-- main 返回后，runtime 会取消仍未结束的子 task，并在 1 秒有界窗口内排空；未能停止会返回 `task/shutdown_timeout`，不会无限等待。native C / LLVM 仍明确拒绝 async lowering。
+正确写法：
+
+```ku
+task = load(1)
+value = await task?
+println(value)
+println(value)
+```
+
+作用域结束时，用户没有 detach/cancel/spawn 入口。当前解释器在 `main` 返回后会请求取消仍未结束的子 task，并在 1 秒有界窗口内排空；未能停止会返回 `task/shutdown_timeout`，不会无限等待。native C / LLVM 仍明确拒绝 async lowering。
 
 运行时默认边界：
 
@@ -1399,9 +1410,9 @@ fn main(): null! {
 }
 ```
 
-非法日期、非法时间、非法格式、非法时区和非法 duration 返回结构化 `Err({ domain:"time", code, message })`。`time.sleep` 在同步 main 中阻塞当前线程；在 async task 中会走 blocking worker，避免长时间占用 task worker。
+非法日期、非法时间、非法格式、非法时区和非法 duration 返回结构化 `Err({ domain:"time", code, message })`。`time.sleep` 在同步 main 中阻塞当前执行；在 async task 中会走 blocking worker，避免长时间占用 task worker。
 
-### 12.8 task runtime 观测与压力测试
+### 12.8 std.task 观测与压力测试
 
 使用前显式导入：
 
@@ -1413,6 +1424,8 @@ import "std.task"
 task.stats(): object
 task.stress(demand:int, producers:int, hold_ms:int): object
 ```
+
+`std.task` 是 runtime 诊断和压力测试命名空间，不是普通 task 句柄 API。它不提供 `task.spawn`、`Task.new`、`runtime.schedule` 或 `thread.spawn`，也不能手动创建用户任务。普通业务并发仍然只通过 `async fn` 调用返回的 `Task<T>` 句柄和 `await task` / `await task?` 完成。
 
 `task.stats()` 返回当前 runtime 的 active/registered/queued task、等待边、blocking job、worker 数以及累计 accepted/rejected/finished。
 
@@ -1807,7 +1820,7 @@ unit / payload / nested enum match lowering
 系统 int main(void) wrapper
 ```
 
-native C 当前仍是 prototype，但同步所有权和错误流已闭环：Copy 类型是 `int/bool/float/null`；`str/array/object/struct/enum/Result/task` 在语言检查层按 Owned 处理，赋值和传参默认 move，复制必须显式 `.clone()`。checker 会拒绝 use-after-move、重复消费 Result、match 分支漏合并和循环回边重复 move。C 后端为 array、named value 和 Result 生成 move/clone/drop，赋值先物化 RHS 再 drop 旧值，解构交换先物化全部 RHS；嵌套 owned array 递归 clone/drop。
+native C 当前仍是 prototype，但同步所有权和错误流已闭环：Copy 类型是 `int/bool/float/null`；`str/array/object/struct/enum/Result/task` 在语言检查层按 Owned 处理，赋值和传参默认 move。`str/array/object/struct/enum/Result` 的复制必须显式 `.clone()`，`Task<T>` 是 move-only，不能 clone，`await` 会消费 task。checker 会拒绝 use-after-move、重复消费 Result、重复 await task、match 分支漏合并和循环回边重复 move。C 后端为 array、named value 和 Result 生成 move/clone/drop，赋值先物化 RHS 再 drop 旧值，解构交换先物化全部 RHS；嵌套 owned array 递归 clone/drop。
 
 native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、错误和 return 都经过对应 finally block。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。递归值 struct/enum、native closure、动态 object ABI 和 async native lowering仍明确拒绝。native `str` 暂时仍使用只读 C 字符串原型，正式 owned string ABI 等待路线决策。
 

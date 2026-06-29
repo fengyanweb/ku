@@ -489,9 +489,6 @@ class KuCompletionProvider {
         if (/\b(values|items|nums)\.$/.test(linePrefix)) {
             return methodCompletions(["len", "is_empty", "first", "last", "try_get", "push", "concat", "map"]);
         }
-        if (/\b(task|future|job)\.$/.test(linePrefix)) {
-            return methodCompletions(["status", "cancel", "await_timeout"]);
-        }
         for (const value of completionModel_1.keywords) {
             items.push(new vscode.CompletionItem(value, vscode.CompletionItemKind.Keyword));
         }
@@ -652,11 +649,8 @@ class KuHoverProvider {
         const word = document.getText(range);
         const dotted = dottedHoverKey(document, range);
         const docs = {
-            "async": "`async fn` 调用会立即启动 task，并且第一版必须显式返回 `T!`。",
-            "await": "`await task?` 等价于 `(await task)?`，只能写在 `async fn` 内。",
-            "await_timeout": "`task.await_timeout(ms)` 只限制本次等待；超时返回 `task/timeout`，不会自动取消任务。",
-            "cancel": "`task.cancel()` 请求协作式取消，并返回是否成功发起取消。",
-            "status": "`task.status()` 返回 pending、running、waiting、cancelling、completed、failed、cancelled 或 panicked。",
+            "async": "`async fn` 调用会立即启动一次性 task 句柄，并且必须显式返回 `T!`。",
+            "await": "`await task?` 等价于 `(await task)?`；await 会消费 task，普通 task 只能 await 一次。",
             "catch": "`catch (err)` 中 `err` 是结构化 Error 对象：`err.domain`、`err.code`、`err.message`。",
             "err": "`err(message)` 返回 `Unknown!`，失败 payload 是 `{ domain, code, message }`。",
             "fail": "`fail` 主动返回可恢复错误；字符串会包装为 `{ domain: \"ku\", code: \"fail\", message }`。",
@@ -665,7 +659,7 @@ class KuHoverProvider {
             "server": "`http.server()` 返回带默认 timeout/body/header/concurrency 限制的 server 配置对象。",
             "fs": "`import \"std.fs\"` 后使用。支持 `fs.read/write/try_read/try_write`。",
             "config": "`import \"std.config\"` 后使用。支持 `config.env/env_file/yaml`。",
-            "task": "`import { task } from \"std\"` 或 `import \"std.task\"` 后使用。`task.stats()` 查看 runtime 指标，`task.stress(count, producers, hold_ms)` 执行有界并发需求压测。",
+            "task": "`task` 不是关键字。业务 task 来自 async fn 调用并只能 await；`std.task` 只提供 stats/stress 诊断压测函数。",
             "time": "`time.now()` 返回 Time 对象；`time.millis()` 返回当前毫秒时间戳；支持 date/duration/format/parse/sleep。",
             "time.now": "`time.now()` 返回 `{ kind: \"time.time\", millis }`；`time.now(t)` 返回 t 到当前时间的毫秒差。",
             "time.millis": "`time.millis()` 返回当前 Unix 毫秒；`time.millis(timeOrDuration)` 读取 Time/Duration 的毫秒值。",

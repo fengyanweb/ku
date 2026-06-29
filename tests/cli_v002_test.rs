@@ -94,30 +94,21 @@ fn write_temp_ku(name: &str, source: &str) -> PathBuf {
 }
 
 #[test]
-fn async_task_timeout_cancel_and_status_are_bounded() {
+fn async_tasks_start_immediately_and_await_once() {
     let path = write_temp_ku(
-        "async-task-lifecycle.ku",
+        "async-task-await-once.ku",
         r#"
-async fn spin(): int! {
-    while (true) {
-    }
-    return ok(1)
+async fn load(value:int): int! {
+    return ok(value)
 }
 
 async fn main(): null! {
-    tasks = [
-        spin(), spin(), spin(), spin(),
-        spin(), spin(), spin(), spin(),
-        spin(), spin(), spin(), spin()
-    ]
-    for task in tasks.clone() {
-        println(task.await_timeout(0))
-        task.cancel()
-        println(task.status())
-    }
-    for task in tasks {
-        println(await task)
-    }
+    first = load(1)
+    second = load(2)
+    println("request started")
+    a = await first?
+    b = await second?
+    println(a + b)
     return ok(null)
 }
 "#,
@@ -128,44 +119,18 @@ async fn main(): null! {
 
     assert!(
         !result.timed_out,
-        "async lifecycle test must not deadlock\nstdout:\n{}\nstderr:\n{}",
+        "async await test must not deadlock\nstdout:\n{}\nstderr:\n{}",
         result.stdout, result.stderr
     );
     assert_eq!(
         result.code,
         Some(0),
-        "async lifecycle run failed\nstdout:\n{}\nstderr:\n{}",
+        "async await run failed\nstdout:\n{}\nstderr:\n{}",
         result.stdout,
         result.stderr
     );
-    assert!(
-        result.stdout.contains("timeout"),
-        "timeout should be a structured task error: {}",
-        result.stdout
-    );
-    assert!(
-        result.stdout.contains("cancelled"),
-        "cancelled task should wake waiters and expose its state: {}",
-        result.stdout
-    );
     let lines = result.stdout.lines().collect::<Vec<_>>();
-    assert_eq!(
-        lines.len(),
-        36,
-        "unexpected stress output:\n{}",
-        result.stdout
-    );
-    for status in lines.iter().take(24).skip(1).step_by(2) {
-        assert!(
-            matches!(*status, "cancelling" | "cancelled"),
-            "unexpected task status {status:?}"
-        );
-    }
-    assert!(
-        lines.iter().skip(24).all(|line| line.contains("cancelled")),
-        "every cancelled task should be awaitable:\n{}",
-        result.stdout
-    );
+    assert_eq!(lines, vec!["request started", "3"]);
 }
 
 #[test]
@@ -285,6 +250,12 @@ fn check_errors_include_codes_notes_and_help() {
             "import \"std.fs\"\nfn main() { text = fs.try_read(\"x\")? }",
             "E0401",
             "return `T!`",
+        ),
+        (
+            "task-await-once.ku",
+            "async fn load(): int! { return ok(1) }\nasync fn main(): null! {\n    task = load()\n    first = await task?\n    second = await task?\n    return ok(null)\n}\n",
+            "E0804",
+            "store the awaited value",
         ),
     ];
 

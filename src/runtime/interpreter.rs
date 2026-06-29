@@ -782,34 +782,34 @@ impl Interpreter {
         }
         if name == "clone" {
             expect_runtime_arg_count("clone", args.len(), 0, span)?;
+            if value_contains_task(&target_value) {
+                return Err(KuError::runtime("task values cannot be cloned", span));
+            }
             return Ok(Some(target_value));
         }
         if let Value::Task(task) = target_value {
-            let value = match name.as_str() {
+            let _ = task;
+            match name.as_str() {
                 "status" => {
                     expect_runtime_arg_count("task.status", args.len(), 0, span)?;
-                    Value::String(task.status().to_string())
+                    return Err(KuError::runtime(
+                        "task handles can only be awaited; status() is not part of Ku's user task API",
+                        span,
+                    ));
                 }
                 "cancel" => {
                     expect_runtime_arg_count("task.cancel", args.len(), 0, span)?;
-                    Value::Bool(task.cancel())
+                    return Err(KuError::runtime(
+                        "task handles can only be awaited; cancel() is not part of Ku's user task API",
+                        span,
+                    ));
                 }
                 "await_timeout" => {
                     expect_runtime_arg_count("task.await_timeout", args.len(), 1, span)?;
-                    let timeout = self.eval(&args[0], env, depth)?;
-                    let Value::Int(timeout) = timeout else {
-                        return Err(KuError::runtime(
-                            "type error: task.await_timeout expects int milliseconds",
-                            args[0].span,
-                        ));
-                    };
-                    let timeout = u64::try_from(timeout).map_err(|_| {
-                        KuError::runtime(
-                            "task.await_timeout milliseconds must be non-negative",
-                            args[0].span,
-                        )
-                    })?;
-                    task.await_timeout(Duration::from_millis(timeout))?
+                    return Err(KuError::runtime(
+                        "task handles can only be awaited; await_timeout() is not part of Ku's user task API",
+                        span,
+                    ));
                 }
                 _ => {
                     return Err(KuError::runtime(
@@ -817,8 +817,7 @@ impl Interpreter {
                         span,
                     ))
                 }
-            };
-            return Ok(Some(value));
+            }
         }
         let module = match &target_value {
             Value::String(_) => "string",
@@ -3080,6 +3079,20 @@ fn value_from_literal(literal: &Literal) -> Value {
         Literal::Bool(value) => Value::Bool(*value),
         Literal::String(value) | Literal::TemplateString(value) => Value::String(value.clone()),
         Literal::Null => Value::Null,
+    }
+}
+
+fn value_contains_task(value: &Value) -> bool {
+    match value {
+        Value::Task(_) => true,
+        Value::Array(values) | Value::Enum { fields: values, .. } => {
+            values.iter().any(value_contains_task)
+        }
+        Value::Object(fields) | Value::Struct { fields, .. } => {
+            fields.values().any(value_contains_task)
+        }
+        Value::Result { value, .. } => value_contains_task(value),
+        _ => false,
     }
 }
 
