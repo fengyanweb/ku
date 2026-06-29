@@ -269,15 +269,38 @@ fn main() {
     if (text.body != "hello") {
         panic("bad text body")
     }
+    created = http.text(http.status.created, "created")
+    if (created.status != 201) {
+        panic("bad explicit text status")
+    }
     json_res = http.json({ ok: true, count: 2 })
     if (json_res.headers["content-type"] != "application/json") {
         panic("bad json content type")
+    }
+    created_json = http.json(http.status.created, { id: 1 })
+    if (created_json.status != 201) {
+        panic("bad explicit json status")
+    }
+    if (http.statusText(http.status.notFound) != "Not Found") {
+        panic("bad status text")
+    }
+    empty = http.empty()
+    if (empty.status != 204 || empty.body != "") {
+        panic("bad empty response")
+    }
+    redirect = http.redirect(http.status.temporaryRedirect, "/next")
+    if (redirect.status != 307 || redirect.headers["location"] != "/next") {
+        panic("bad redirect response")
+    }
+    code = http.code
+    if (code.SUCCESS != 200) {
+        panic("bad http code alias")
     }
     client = http.client()
     if (client.kind != "http.client") {
         panic("bad client")
     }
-    service = http.service
+    service = http.service()
     if (service.kind != "http.service") {
         panic("bad service")
     }

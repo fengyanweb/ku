@@ -1,6 +1,6 @@
 # Ku Package Draft
 
-0.0.7 固定最小 package 草案，0.0.11 增加 `file://` dependency、checksum、`ku.lock` package dependency 记录和 cache GC。0.0.12 补齐 HTTPS registry 请求、SHA-256 执行和内容寻址 cache；0.0.13 增加 `ku build` 入口字段 `main` 和输出字段 `out`。生产 CLI 仍在签名与归档协议确定前保持 fail-closed。
+0.0.7 固定最小 package 草案，0.0.11 增加 `file://` dependency、checksum、`ku.lock` package dependency 记录和 cache GC。0.0.12 补齐 HTTPS registry 请求、SHA-256 执行和内容寻址 cache；0.0.13 增加 `ku build` 入口字段 `main` 和输出字段 `out`；0.0.14 增加 `ku create` / `ku init` 模板入口和 `template` / `type` manifest 字段。生产 CLI 仍在签名与归档协议确定前保持 fail-closed。
 
 ## ku.mod
 
@@ -13,6 +13,7 @@ root = "src"
 main = "main.ku"
 out = ".ku/build"
 cache = ".ku/cache"
+template = "basic"
 
 dep.util = "1.0.0"
 dep.util.source = "file://C:/work/util"
@@ -29,6 +30,8 @@ dep.util.checksum = "ku-fnv64-..."
 | `main` | 否 | build 默认入口，相对 `root`，默认 `main.ku` |
 | `out` | 否 | build 输出根目录，相对包根，默认 `.ku/build` |
 | `cache` | 否 | 包本地缓存目录，默认 `.ku/cache` |
+| `template` | 否 | `ku create/init` 生成项目时使用的模板名 |
+| `type` | 否 | package 类型，当前 `lib` 只表示库模板意图 |
 | `dep.<name>` | 否 | 依赖版本；resolver 支持精确 `1.2.3` 和 caret `^1.2.3`，`~` 暂不进入求解 |
 | `dep.<name>.source` | 否 | 当前只支持 `file://` 目录 source |
 | `dep.<name>.checksum` | 否 | 依赖目录稳定 hash，格式为 `ku-fnv64-` 加 16 位十六进制 |
@@ -52,6 +55,20 @@ ku build --release -o dist\demo.exe
 ```
 
 当前 `ku build` 默认生成解释器打包型二进制；它会嵌入口文件源码，但带 import 的程序仍要求原源码依赖路径可访问。最终 native binary 的完整 import graph 打包仍在 native ABI 队列里。
+
+## Create / Init
+
+`ku create <name> --template <template>` 创建新目录；`ku init --template <template>` 在当前目录写入 `ku.mod` 和 `src/main.ku`。默认模板是 `basic`。
+
+```powershell
+ku create hello
+ku create my-api --template http
+ku init --template cli
+ku template list
+ku create --list
+```
+
+内置模板：`basic`、`cli`、`http`、`json`、`fs`、`lib`。`create` 负责新建项目，`init` 负责初始化当前目录，`run` 只负责运行当前 package 或指定 `.ku` 文件。
 
 ## Import Root
 

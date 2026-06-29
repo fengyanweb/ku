@@ -1,10 +1,10 @@
-# Ku 0.0.13 Syntax
+# Ku 0.0.14 Syntax
 
-本文档固定 Ku 0.0.13 当前真实支持的全部语法和边界。CLI 版本应显示：
+本文档固定 Ku 0.0.14 当前真实支持的全部语法和边界。CLI 版本应显示：
 
 ```powershell
 ku version
-# ku 0.0.13
+# ku 0.0.14
 ```
 
 Ku 当前是解释器优先的语言实现。文档只记录已经能被 lexer / parser / checker / runtime 闭环处理的语法；仍在设计中的能力放在文末“不支持 / 未完成”。
@@ -265,7 +265,7 @@ import {
 
 ### 4.1 基础类型
 
-Ku 0.0.13 的基础类型：
+Ku 0.0.14 的基础类型：
 
 ```txt
 int
@@ -504,7 +504,7 @@ fn main() {
 
 ### 6.3 函数值
 
-函数是第一公民。普通函数、局部函数和箭头函数都可以作为值保存、传递和调用。箭头函数与普通函数一样，可以给参数和返回值写类型：
+函数是第一公民。普通函数、局部函数、匿名 `fn` 和箭头函数都可以作为值保存、传递和调用。箭头函数与普通函数一样，可以给参数和返回值写类型：
 
 ```ku
 fn main() {
@@ -513,6 +513,9 @@ fn main() {
     }
     double = (x: int): int => x * 2
     triple = x: int => x * 3
+    handler = fn(req, res) {
+        return "ok"
+    }
     selected = double
 
     print(add(1, 2))
@@ -528,6 +531,7 @@ fn main() {
 单参数箭头函数可以省略参数小括号
 带返回类型的箭头函数会检查所有 return 路径
 函数值赋给另一个变量后仍然可以调用
+匿名 fn 使用块体，适合 HTTP handler 这类需要普通函数形状的内联写法
 ```
 
 ### 6.4 闭包捕获
@@ -1485,11 +1489,18 @@ http.post(url:str, body:str): HttpResponse!
 http.request(config:object): HttpResponse!
 http.client(config?:object): object
 http.text(body:str): HttpResponse
+http.text(status:int, body:str): HttpResponse
 http.json(value:any): HttpResponse
-http.service: object
+http.json(status:int, value:any): HttpResponse
+http.empty(status?:int): HttpResponse
+http.redirect(location:str): HttpResponse
+http.redirect(status:int, location:str): HttpResponse
+http.statusText(code:int): str
 http.service(config?:object): object
 http.server(config?:object): object
 ```
+
+`http.service` 不加括号的属性式默认对象仍兼容，但只建议旧代码继续用；新代码统一写 `http.service()`。
 
 `HttpResponse` 当前用对象表示：
 
@@ -1514,19 +1525,74 @@ max_body_bytes: 1000000
 
 ```ku
 return http.text("ok")
-return http.json({ ok: true })
+return http.text(http.status.created, "created")
+return http.json({ code: 0, msg: "ok", data: null })
+return http.json(http.status.created, { code: 0, msg: "created", data: null })
+return http.empty()
+return http.empty(http.status.noContent)
+return http.redirect("/login")
+return http.redirect(http.status.temporaryRedirect, "/login")
 ```
+
+`http.text(body)` 和 `http.json(body)` 默认 HTTP status 是 `http.status.ok` / `200`。创建资源建议显式 `http.status.created` / `201`。`http.empty()` 默认 `204`。错误响应建议显式传入 `4xx/5xx`。`http.redirect(location)` 默认 `302`，也可以显式传入 `301/303/307/308`。
+
+HTTP status 是协议状态码，放在 `http.text/json/empty/redirect` 的第一个参数；业务响应里的 `body.code` 由开发者自己维护，Ku 不替业务维护业务码。推荐业务成功固定 `code: 0`，`msg` 是提示文本，`data` 成功时放数据、失败时通常放 `null`。
+
+状态码常量：
+
+```ku
+http.status.ok                 // 200 OK
+http.status.created            // 201 Created
+http.status.accepted           // 202 Accepted
+http.status.noContent          // 204 No Content
+http.status.movedPermanently   // 301 Moved Permanently
+http.status.found              // 302 Found
+http.status.seeOther           // 303 See Other
+http.status.notModified        // 304 Not Modified
+http.status.temporaryRedirect  // 307 Temporary Redirect
+http.status.permanentRedirect  // 308 Permanent Redirect
+http.status.badRequest         // 400 Bad Request
+http.status.unauthorized       // 401 Unauthorized
+http.status.forbidden          // 403 Forbidden
+http.status.notFound           // 404 Not Found
+http.status.methodNotAllowed   // 405 Method Not Allowed
+http.status.notAcceptable      // 406 Not Acceptable
+http.status.requestTimeout     // 408 Request Timeout
+http.status.conflict           // 409 Conflict
+http.status.gone               // 410 Gone
+http.status.contentTooLarge    // 413 Content Too Large
+http.status.uriTooLong         // 414 URI Too Long
+http.status.unsupportedMedia   // 415 Unsupported Media Type
+http.status.rangeNotSatisfiable // 416 Range Not Satisfiable
+http.status.unprocessable      // 422 Unprocessable Content
+http.status.tooManyRequests    // 429 Too Many Requests
+http.status.headerTooLarge     // 431 Request Header Fields Too Large
+http.status.internalError      // 500 Internal Server Error
+http.status.notImplemented     // 501 Not Implemented
+http.status.badGateway         // 502 Bad Gateway
+http.status.serviceUnavailable // 503 Service Unavailable
+http.status.gatewayTimeout     // 504 Gateway Timeout
+
+text = http.statusText(http.status.notFound) // "Not Found"
+```
+
+`http.code` 是大写短别名对象，当前只用于少量常见 HTTP status，例如 `http.code.SUCCESS == 200`。新代码优先使用更清楚的 `http.status.*`。
 
 HTTP server/router API 已固定服务配置对象：
 
 ```ku
-service = http.service
-server = http.server({ max_body_bytes: 4096 })
-service.get("/index", (req, res) => {
+fn index(req, res) {
     return http.text("ok")
+}
+
+service = http.service()
+server = http.server({ max_body_bytes: 4096 })
+service.get("/index", index)
+service.get("/fn", fn(req, res) {
+    return http.text("Ku HTTP 123")
 })
 service.post("/pets", (req, res) => {
-    return http.json({ ok: true })
+    return http.json(http.status.created, { code: 0, msg: "created", data: null })
 })
 service.get("/user/{id}", (req, res) => {
     return http.text("ok")
@@ -1540,7 +1606,7 @@ print(service.routes[0].method)
 
 默认 server 配置包含 `read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests` 和 `routes`。`service.get/post/put/del(path, handler)` 当前支持注册路由，会把 `{ method, path, param_names, handler }` 写入 `service.routes`。路径参数使用 `/user/{id}`，不使用 Express 的 `:id`。
 
-`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。第一版 handler 参数固定 `(req, res)`，handler 返回 `http.text/json(...)` 这类 `{ status, headers, body }` 响应对象。
+`http.service()` / `http.server(config?)` 返回 service 配置对象；旧的 `http.service` 属性式写法暂时兼容，但推荐始终写 `http.service()`，语义更清楚。`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。第一版 handler 参数固定 `(req, res)`，handler 返回 `http.text/json/empty/redirect(...)` 这类 `{ status, headers, body }` 响应对象。
 
 第一版 `req` 字段：
 
@@ -1553,6 +1619,8 @@ req.headers: object  // 字段值按 str 检查
 req.body: str
 ```
 
+`req` 是请求对象，提供 method/path、路由参数、query、headers 和 body。`res` 是第一版 handler ABI 的响应占位对象，当前常规写法不需要手动修改 `res`，直接 `return http.text/json/empty/redirect(...)` 即可；保留 `res` 是为了让 handler 形状固定，后续可扩展 response builder。
+
 HTTP handler 会在类型检查阶段按 `(req, res)` ABI 复查参数和返回值。为了给后续并发 runtime 留安全边界，handler 第一版不能修改外层捕获变量；需要共享状态时后续应通过专门的 `std.atomic` / `std.sync` 一类 API 设计。
 
 当前 runtime 是有界阻塞 server：
@@ -1564,7 +1632,7 @@ HTTP handler 会在类型检查阶段按 `(req, res)` ABI 复查参数和返回�
 - `idle_timeout_ms` 限制连接在发送首字节前的空闲等待。
 - header/body/write 分别使用自己的 timeout，网络错误不自动无限重试。
 
-路由未命中返回 404，路径存在但 method 不匹配返回 405，body 超过 `max_body_bytes` 返回 413，header 超过 `max_header_bytes` 返回 431，坏请求返回 400。
+Ku runtime 自动维护自己能判断的协议错误：路由未命中返回 404，路径存在但 method 不匹配返回 405，body 超过 `max_body_bytes` 返回 413，header 超过 `max_header_bytes` 返回 431，坏请求返回 400，handler timeout 返回 504，服务过载返回 503，handler panic/内部失败返回 500。
 
 可直接运行的 HTTP 示例：
 
@@ -1667,7 +1735,11 @@ dep.util.checksum = "ku-fnv64-0123456789abcdef"
 name       package 名
 version    package 版本
 root       import root，默认 src
+main       package 入口，默认 main.ku
+out        build 输出目录，默认 .ku/build
 cache      cache 目录，默认 .ku/cache
+template   create/init 使用的内置模板名，可选
+type       package 类型，例如 lib，可选
 dep.NAME   dependency 版本
 dep.NAME.source
 dep.NAME.checksum
@@ -1701,8 +1773,17 @@ resolver 支持精确版本 `1.2.3` 和 caret 范围 `^1.2.3`。同名依赖的�
 
 ```powershell
 ku <file.ku>
+ku create <name>
+ku create <name> --template <template>
+ku create --list
+ku init
+ku init --template <template>
+ku template list
+ku run
 ku run <file.ku>
+ku check
 ku check <file.ku>
+ku check --json
 ku check --json <file.ku>
 ku ir <file.ku>
 ku llvm <file.ku>
@@ -1726,6 +1807,19 @@ ku -help
 ku --help
 ku help
 ```
+
+`ku create` 创建新目录，`ku init` 初始化当前目录，`ku run` 只负责运行当前 package 或指定 `.ku` 文件，不再承担创建项目语义。内置模板：
+
+```txt
+basic    minimal Ku project
+cli      command line tool
+http     HTTP server
+json     JSON processing example
+fs       file processing example
+lib      library project
+```
+
+模板项目生成 `ku.mod` 和 `src/main.ku`；`http` 模板会生成可直接 `ku check` / `ku run` / `ku build` 的 HTTP server 示例。
 
 `ku check` 会检查：
 
@@ -1794,7 +1888,7 @@ ku build --release -o dist/app.exe
 
 `--backend c` 会使用 prototype C 后端生成 C 后再调用 C 编译器。查找顺序为 `KU_CC`、`zig cc`、`clang`、`cc`、`gcc`、`cl`；找不到或编译失败会给出修改方向。默认 backend 仍是解释器 wrapper，因为完整 native closure / KuString / dynamic object / async ABI 尚未完成。`ku run build` 仅作为兼容别名保留，会提示改用 `ku build`。
 
-0.0.13 build 的重要边界：默认生成的是“解释器打包型二进制”，入口源码会嵌入 wrapper；带 import 的程序仍会按原源码路径读取依赖，因此还不是最终“不依赖 Ku 源码文件”的 native binary。最终 native build 仍需要 import graph 打包、runtime ABI lowering、closure/native string/object/async lowering 和增量缓存继续补齐。
+0.0.14 build 的重要边界：默认生成的是“解释器打包型二进制”，入口源码会嵌入 wrapper；带 import 的程序仍会按原源码路径读取依赖，因此还不是最终“不依赖 Ku 源码文件”的 native binary。最终 native build 仍需要 import graph 打包、runtime ABI lowering、closure/native string/object/async lowering 和增量缓存继续补齐。
 
 `ku build --native` 当前输出 prototype C 源码，支持：
 
@@ -1925,7 +2019,7 @@ for           ::= 'for' IDENT 'in' expr body
 try           ::= 'try' block ('catch' '(' IDENT ')' block)? ('finally' block)?
 return        ::= 'return' expr?
 print         ::= 'print' expr | 'print' '(' expr ')'
-expr          ::= literal | IDENT | call | field | index | optional_index | await | array | object | struct_lit | match | arrow | unary | binary | '(' expr ')'
+expr          ::= literal | IDENT | call | field | index | optional_index | await | array | object | struct_lit | match | fn_expr | arrow | unary | binary | '(' expr ')'
 match         ::= 'match' expr '{' arm* '}'
 arm           ::= pattern ('if' expr)? '=>' expr
 pattern       ::= '_' | IDENT | literal | IDENT '.' IDENT ('(' pattern* ')')? | IDENT '.' IDENT '.' IDENT ('(' pattern* ')')?
@@ -1933,4 +2027,5 @@ optional_index ::= expr '[' expr ']' '?'
 await         ::= 'await' expr
 arrow         ::= IDENT (':' type)? '=>' (expr | block)
                 | '(' params? ')' (':' type)? '=>' (expr | block)
+fn_expr       ::= 'fn' '(' params? ')' (':' type)? block
 ```

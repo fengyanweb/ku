@@ -1,7 +1,7 @@
 const assert = require("assert");
 const model = require("./out/completionModel");
 
-assert.deepStrictEqual(model.memberCompletionLabels("http", "s"), ["service", "server"]);
+assert.deepStrictEqual(model.memberCompletionLabels("http", "s"), ["status", "statusText", "service", "server"]);
 assert.deepStrictEqual(model.memberCompletionLabels("http", "se"), ["service", "server"]);
 assert.deepStrictEqual(model.memberCompletionLabels("http", "ser"), ["service", "server"]);
 assert.deepStrictEqual(model.memberCompletionLabels("http", "serve"), ["server"]);
@@ -16,6 +16,8 @@ for (const label of ["status", "cancel", "await_timeout"]) {
 assert.deepStrictEqual(model.memberCompletionLabels("req", ""), ["method", "path", "params", "query", "headers", "body"]);
 assert.deepStrictEqual(model.memberCompletionLabels("req", "p"), ["path", "params"]);
 assert.deepStrictEqual(model.memberCompletionLabels("res", ""), ["status", "headers", "body"]);
+assert.deepStrictEqual(model.memberCompletionLabels("status", "not"), ["notModified", "notFound", "notAcceptable", "notImplemented"]);
+assert.deepStrictEqual(model.memberCompletionLabels("code", "SUCCESS"), ["SUCCESS"]);
 assert.deepStrictEqual(model.memberCompletionLabels("router", "g"), ["get"]);
 assert.deepStrictEqual(model.memberCompletionLabels("app", "listen"), ["listen"]);
 assert.deepStrictEqual(model.memberCompletionLabels("values", ""), ["len", "try_get", "push", "concat", "map"]);
@@ -38,6 +40,7 @@ assert.deepStrictEqual(model.stdImportPathLabels("std."), [
 ]);
 
 assert(model.globalCompletionLabels().includes("http.server"));
+assert(model.globalCompletionLabels().includes("http.statusText"));
 assert(model.globalCompletionLabels().includes("config.yaml"));
 assert(model.globalCompletionLabels().includes("std.http"));
 assert(model.globalCompletionLabels().includes("task.stress"));

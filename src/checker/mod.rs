@@ -53,7 +53,10 @@ struct FunctionValueParam {
 struct FunctionType {
     type_params: Vec<String>,
     params: Vec<Type>,
+    value_params: Vec<FunctionValueParam>,
+    return_type: Option<Type>,
     returns: Type,
+    body: Vec<Stmt>,
     is_async: bool,
 }
 
@@ -178,6 +181,37 @@ impl Checker {
                                 )
                             })
                             .collect::<KuResult<Vec<_>>>()?,
+                        value_params: function
+                            .params
+                            .iter()
+                            .map(|p| {
+                                Ok(FunctionValueParam {
+                                    name: p.name.clone(),
+                                    ty: p
+                                        .ty
+                                        .as_ref()
+                                        .map(|ty| {
+                                            self.resolve_type_name_with_generics(
+                                                ty,
+                                                p.span,
+                                                &function.type_params,
+                                            )
+                                        })
+                                        .transpose()?,
+                                })
+                            })
+                            .collect::<KuResult<Vec<_>>>()?,
+                        return_type: function
+                            .return_type
+                            .as_ref()
+                            .map(|ty| {
+                                self.resolve_type_name_with_generics(
+                                    ty,
+                                    function.span,
+                                    &function.type_params,
+                                )
+                            })
+                            .transpose()?,
                         returns: function
                             .return_type
                             .as_ref()
@@ -190,6 +224,7 @@ impl Checker {
                             })
                             .transpose()?
                             .unwrap_or(Type::Unknown),
+                        body: function.body.clone(),
                         is_async: function.is_async,
                     },
                 );
@@ -704,7 +739,18 @@ impl Checker {
                     Ok(Type::String)
                 }
                 ExprKind::Literal(Literal::Null) => Ok(Type::Null),
-                ExprKind::Variable(name) => self.get(name, expr.span).map(|v| v.ty),
+                ExprKind::Variable(name) => {
+                    if self.contains(name) {
+                        return self.get(name, expr.span).map(|v| v.ty);
+                    }
+                    if let Some(function) = self.functions.get(name) {
+                        return function_value_type(name, function, expr.span);
+                    }
+                    Err(KuError::runtime(
+                        format!("undefined variable '{name}'"),
+                        expr.span,
+                    ))
+                }
                 ExprKind::Unary { op, expr: right } => {
                     let right = self.check_expr(right)?;
                     match op {
@@ -908,9 +954,13 @@ impl Checker {
                         if module == "http"
                             && !self.contains("http")
                             && self.std_modules.contains("http")
-                            && matches!(name.as_str(), "service" | "server")
                         {
-                            return Ok(http_service_type());
+                            match name.as_str() {
+                                "service" | "server" => return Ok(http_service_type()),
+                                "status" => return Ok(http_status_type()),
+                                "code" => return Ok(http_code_type()),
+                                _ => {}
+                            }
                         }
                         if let Some(enum_type) = self.enums.get(module) {
                             if let Some(payload) = enum_type.variants.get(name) {
@@ -2058,6 +2108,12 @@ impl Checker {
         ) {
             return self.apply_http_config_constructor_signature(&signature.name, args, span);
         }
+        if matches!(
+            signature.name.as_str(),
+            "http.text" | "http.json" | "http.empty" | "http.redirect" | "http.statusText"
+        ) {
+            return self.apply_http_response_helper_signature(&signature.name, args, span);
+        }
         expect_arg_count(&signature.name, args.len(), signature.args.len(), span)?;
         let actuals = args
             .iter()
@@ -2116,6 +2172,104 @@ impl Checker {
                     &actuals[index],
                 )),
             },
+        }
+    }
+
+    fn apply_http_response_helper_signature(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Type> {
+        match name {
+            "http.text" => {
+                if args.len() == 1 {
+                    let body = self.check_expr(&args[0])?;
+                    if body == Type::String {
+                        Ok(http_response_type())
+                    } else {
+                        Err(type_error(args[0].span, &Type::String, &body))
+                    }
+                } else if args.len() == 2 {
+                    self.check_http_status_arg(&args[0])?;
+                    let body = self.check_expr(&args[1])?;
+                    if body == Type::String {
+                        Ok(http_response_type())
+                    } else {
+                        Err(type_error(args[1].span, &Type::String, &body))
+                    }
+                } else {
+                    Err(KuError::runtime(
+                        format!("{name} expects 1 or 2 arguments but got {}", args.len()),
+                        span,
+                    ))
+                }
+            }
+            "http.json" => {
+                if args.len() == 1 {
+                    self.check_expr(&args[0])?;
+                    Ok(http_response_type())
+                } else if args.len() == 2 {
+                    self.check_http_status_arg(&args[0])?;
+                    self.check_expr(&args[1])?;
+                    Ok(http_response_type())
+                } else {
+                    Err(KuError::runtime(
+                        format!("{name} expects 1 or 2 arguments but got {}", args.len()),
+                        span,
+                    ))
+                }
+            }
+            "http.empty" => {
+                if args.len() > 1 {
+                    return Err(KuError::runtime(
+                        format!("{name} expects 0 or 1 arguments but got {}", args.len()),
+                        span,
+                    ));
+                }
+                if let Some(status) = args.first() {
+                    self.check_http_status_arg(status)?;
+                }
+                Ok(http_response_type())
+            }
+            "http.redirect" => {
+                if args.len() == 1 {
+                    let location = self.check_expr(&args[0])?;
+                    if location == Type::String {
+                        Ok(http_response_type())
+                    } else {
+                        Err(type_error(args[0].span, &Type::String, &location))
+                    }
+                } else if args.len() == 2 {
+                    self.check_http_status_arg(&args[0])?;
+                    let location = self.check_expr(&args[1])?;
+                    if location == Type::String {
+                        Ok(http_response_type())
+                    } else {
+                        Err(type_error(args[1].span, &Type::String, &location))
+                    }
+                } else {
+                    Err(KuError::runtime(
+                        format!("{name} expects 1 or 2 arguments but got {}", args.len()),
+                        span,
+                    ))
+                }
+            }
+            "http.statusText" => {
+                expect_arg_count(name, args.len(), 1, span)?;
+                self.check_http_status_arg(&args[0])?;
+                Ok(Type::String)
+            }
+            _ => Err(KuError::runtime("invalid http helper signature", span)),
+        }
+    }
+
+    fn check_http_status_arg(&mut self, expr: &Expr) -> KuResult<()> {
+        let actual = self.check_expr(expr)?;
+        if actual == Type::Int || actual == Type::Unknown {
+            Ok(())
+        } else {
+            Err(type_error(expr.span, &Type::Int, &actual))
         }
     }
 
@@ -3208,6 +3362,21 @@ fn contains_task_type(ty: &Type) -> bool {
     }
 }
 
+fn function_value_type(name: &str, function: &FunctionType, span: Span) -> KuResult<Type> {
+    if !function.type_params.is_empty() {
+        return Err(KuError::runtime(
+            format!("generic function '{name}' cannot be used as a function value yet"),
+            span,
+        ));
+    }
+    Ok(Type::FunctionValue {
+        params: function.value_params.clone(),
+        return_type: function.return_type.clone().map(Box::new),
+        body: function.body.clone(),
+        is_async: function.is_async,
+    })
+}
+
 fn can_template_concat(left: &Type, right: &Type) -> bool {
     if let Type::Union(types) = left {
         return types.iter().all(|ty| can_template_concat(ty, right));
@@ -3483,6 +3652,57 @@ fn http_route_type() -> Type {
             Type::Array(Box::new(Type::String)),
         ),
         ("handler".to_string(), Type::Unknown),
+    ]))
+}
+
+fn http_status_type() -> Type {
+    Type::Object(HashMap::from([
+        ("ok".to_string(), Type::Int),
+        ("created".to_string(), Type::Int),
+        ("accepted".to_string(), Type::Int),
+        ("noContent".to_string(), Type::Int),
+        ("movedPermanently".to_string(), Type::Int),
+        ("found".to_string(), Type::Int),
+        ("seeOther".to_string(), Type::Int),
+        ("notModified".to_string(), Type::Int),
+        ("temporaryRedirect".to_string(), Type::Int),
+        ("permanentRedirect".to_string(), Type::Int),
+        ("badRequest".to_string(), Type::Int),
+        ("unauthorized".to_string(), Type::Int),
+        ("forbidden".to_string(), Type::Int),
+        ("notFound".to_string(), Type::Int),
+        ("methodNotAllowed".to_string(), Type::Int),
+        ("notAcceptable".to_string(), Type::Int),
+        ("requestTimeout".to_string(), Type::Int),
+        ("conflict".to_string(), Type::Int),
+        ("gone".to_string(), Type::Int),
+        ("contentTooLarge".to_string(), Type::Int),
+        ("uriTooLong".to_string(), Type::Int),
+        ("unsupportedMedia".to_string(), Type::Int),
+        ("rangeNotSatisfiable".to_string(), Type::Int),
+        ("unprocessable".to_string(), Type::Int),
+        ("tooManyRequests".to_string(), Type::Int),
+        ("headerTooLarge".to_string(), Type::Int),
+        ("internalError".to_string(), Type::Int),
+        ("notImplemented".to_string(), Type::Int),
+        ("badGateway".to_string(), Type::Int),
+        ("serviceUnavailable".to_string(), Type::Int),
+        ("gatewayTimeout".to_string(), Type::Int),
+    ]))
+}
+
+fn http_code_type() -> Type {
+    Type::Object(HashMap::from([
+        ("SUCCESS".to_string(), Type::Int),
+        ("CREATED".to_string(), Type::Int),
+        ("ACCEPTED".to_string(), Type::Int),
+        ("NO_CONTENT".to_string(), Type::Int),
+        ("BAD_REQUEST".to_string(), Type::Int),
+        ("UNAUTHORIZED".to_string(), Type::Int),
+        ("FORBIDDEN".to_string(), Type::Int),
+        ("NOT_FOUND".to_string(), Type::Int),
+        ("VALIDATION_FAILED".to_string(), Type::Int),
+        ("INTERNAL_ERROR".to_string(), Type::Int),
     ]))
 }
 

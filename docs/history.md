@@ -46,7 +46,8 @@ history/
 | 0.0.10 | 发布时归档 | 运行时 capture map、Result CFG、package lock 依赖、C 后端 if/while/int 子集 |
 | 0.0.11 | 发布时归档 | Result ABI、try/finally 错误 CFG、file package 依赖缓存、match guard 诊断 |
 | 0.0.12 | 已归档 | 嵌套 match 模式、std.http Response API、HTTP client 连接复用和 helper、fs 写入、严格 bool 条件、native C main wrapper |
-| 0.0.13 | 当前 | build 命令入口、ku.mod main/out、std root 小写导入诊断、std.time 边界、VS Code/release 同步 |
+| 0.0.13 | 已归档 | build 命令入口、ku.mod main/out、std root 小写导入诊断、std.time 边界、VS Code/release 同步 |
+| 0.0.14 | 当前 | create/init/template 项目模板、HTTP status helper、匿名 fn handler、VS Code/release 同步 |
 
 ## 自动化
 
@@ -68,7 +69,7 @@ Copy-Item -LiteralPath target\release\libku.rlib -Destination history\v$version\
 Copy-Item -LiteralPath target\release\ku.pdb -Destination history\v$version\ku.pdb -Force
 ```
 
-其中 `$version` 来自 `Cargo.toml` 的 `package.version`，例如当前版本会写入 `history\v0.0.13\`。
+其中 `$version` 来自 `Cargo.toml` 的 `package.version`，例如当前版本会写入 `history\v0.0.14\`。
 
 只检查产物和版本路径：
 
@@ -83,9 +84,9 @@ cargo build --release
 Copy-Item -LiteralPath target\release\ku.exe -Destination release\ku.exe -Force
 Copy-Item -LiteralPath target\release\libku.rlib -Destination release\libku.rlib -Force
 Copy-Item -LiteralPath target\release\ku.pdb -Destination release\ku.pdb -Force
-Copy-Item -LiteralPath target\release\ku.exe -Destination history\v0.0.13\ku.exe -Force
-Copy-Item -LiteralPath target\release\libku.rlib -Destination history\v0.0.13\libku.rlib -Force
-Copy-Item -LiteralPath target\release\ku.pdb -Destination history\v0.0.13\ku.pdb -Force
+Copy-Item -LiteralPath target\release\ku.exe -Destination history\v0.0.14\ku.exe -Force
+Copy-Item -LiteralPath target\release\libku.rlib -Destination history\v0.0.14\libku.rlib -Force
+Copy-Item -LiteralPath target\release\ku.pdb -Destination history\v0.0.14\ku.pdb -Force
 ```
 
 ## 规则

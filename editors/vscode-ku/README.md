@@ -4,7 +4,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 
 ## Features
 
-- Syntax highlighting for Ku 0.0.13 keywords including `async` / `await`, strings, template strings, numbers, built-in types, stdlib calls, and unsupported `let` / `mut` / `const`.
+- Syntax highlighting for Ku 0.0.14 keywords including `async` / `await`, strings, template strings, numbers, built-in types, stdlib calls, and unsupported `let` / `mut` / `const`.
 - `ku.mod` / `ku.lock` syntax highlighting.
 - Language configuration for comments, brackets, auto-closing pairs, and surrounding pairs.
 - Snippets for sync/async main, sync/async functions, `await task?`, generic functions, struct, enum, match, try/catch/finally, `std.fs`, `std.http`, `std.config`, `std.task`, bounded task stress, HTTP response usage, array map, string methods, and `array.try_get`.
@@ -30,8 +30,8 @@ From the repository root:
 
 ```powershell
 cd editors\vscode-ku
-npx @vscode/vsce package --out ku-language-0.0.13.vsix
-code --install-extension .\ku-language-0.0.13.vsix
+npx @vscode/vsce package --out ku-language-0.0.14.vsix
+code --install-extension .\ku-language-0.0.14.vsix
 ```
 
 Then reload VS Code from the Command Palette with `Developer: Reload Window`, or restart VS Code, and open any `.ku` file.
@@ -42,7 +42,7 @@ Then reload VS Code from the Command Palette with `Developer: Reload Window`, or
 2. Open the Extensions view.
 3. Click `...`.
 4. Choose `Install from VSIX...`.
-5. Pick `editors/vscode-ku/ku-language-0.0.13.vsix`.
+5. Pick `editors/vscode-ku/ku-language-0.0.14.vsix`.
 6. Reload VS Code from the Command Palette with `Developer: Reload Window`, or restart VS Code.
 
 ## Install By Copying The Extension Folder
@@ -50,7 +50,7 @@ Then reload VS Code from the Command Palette with `Developer: Reload Window`, or
 If you do not want to use `vsce`, copy this folder into the VS Code extensions directory:
 
 ```powershell
-$target = "$env:USERPROFILE\.vscode\extensions\ku-lang.ku-language-0.0.13"
+$target = "$env:USERPROFILE\.vscode\extensions\ku-lang.ku-language-0.0.14"
 New-Item -ItemType Directory -Force -Path $target | Out-Null
 Copy-Item -LiteralPath .\editors\vscode-ku\* -Destination $target -Recurse -Force
 ```

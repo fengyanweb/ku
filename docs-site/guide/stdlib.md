@@ -77,6 +77,18 @@ powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127
 
 HTTP server 有连接上限、active/pending 背压、handler timeout、idle timeout、header/body/write timeout；队列满或连接超限会立即返回 503，不无限排队。
 
+响应 helper 支持默认状态码和显式状态码：
+
+```ku
+return http.json({ code: 0, msg: "ok", data: null })
+return http.json(http.status.created, { code: 0, msg: "created", data: null })
+return http.empty()
+return http.redirect("/login")
+println(http.statusText(http.status.notFound))
+```
+
+HTTP status 是协议状态码；业务 `body.code/msg/data` 由开发者自己维护。handler 固定接收 `(req, res)`，`req` 是请求对象，`res` 是当前 ABI 占位，普通代码直接返回 `http.text/json/empty/redirect(...)`。
+
 ## task
 
 `std.task` 是 runtime 诊断和压力测试命名空间，不是普通 task 句柄 API。业务并发只通过 `async fn` 调用返回 task，然后 `await task` / `await task?`；用户不能手动 spawn、调度或管理 task。

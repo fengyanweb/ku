@@ -24,6 +24,8 @@ pub struct KuMod {
     pub main: Option<String>,
     pub out: Option<String>,
     pub cache: Option<String>,
+    pub template: Option<String>,
+    pub package_type: Option<String>,
     pub dependencies: Vec<PackageDependency>,
 }
 
@@ -568,6 +570,8 @@ pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
     let mut main = None;
     let mut out = None;
     let mut cache = None;
+    let mut template = None;
+    let mut package_type = None;
     let mut dependencies = HashMap::<String, PackageDependencyDraft>::new();
     for (index, raw_line) in source.lines().enumerate() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -590,6 +594,8 @@ pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
             "main" => main = Some(value),
             "out" => out = Some(value),
             "cache" => cache = Some(value),
+            "template" => template = Some(value),
+            "type" => package_type = Some(value),
             key if key.starts_with("dep.") => {
                 parse_dependency_key(key, value, &mut dependencies, index + 1, span)?;
             }
@@ -620,6 +626,12 @@ pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
     if let Some(value) = &cache {
         reject_unsafe_relative_path("cache", value, span)?;
     }
+    if let Some(value) = &template {
+        validate_manifest_label("template", value, span)?;
+    }
+    if let Some(value) = &package_type {
+        validate_manifest_label("type", value, span)?;
+    }
     let mut dependencies = dependencies
         .into_values()
         .map(|dependency| dependency.finish(span))
@@ -632,6 +644,8 @@ pub fn parse_manifest(source: &str, span: Span) -> KuResult<KuMod> {
         main,
         out,
         cache,
+        template,
+        package_type,
         dependencies,
     })
 }
@@ -1695,6 +1709,27 @@ fn validate_package_name(name: &str, span: Span) -> KuResult<()> {
         return Err(KuError::package(
             "invalid_name",
             "package name may only contain lowercase letters, digits, '_' and '-'",
+            span,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manifest_label(kind: &str, value: &str, span: Span) -> KuResult<()> {
+    if value.is_empty() {
+        return Err(KuError::package(
+            "invalid_manifest_label",
+            format!("ku.mod {kind} cannot be empty"),
+            span,
+        ));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+    {
+        return Err(KuError::package(
+            "invalid_manifest_label",
+            format!("ku.mod {kind} may only contain lowercase letters, digits, '_' and '-'"),
             span,
         ));
     }

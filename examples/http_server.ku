@@ -1,37 +1,63 @@
 import { http, time } from "std"
 
-fn main(): null! {
-    app = http.service
-    app.max_connections = 1024
-    app.max_active_requests = 256
-    app.max_pending_requests = 1024
-    app.handler_timeout_ms = 5000
-    app.idle_timeout_ms = 3000
-    app.max_body_bytes = 1000000
+fn ret(req, res) {
+    // req 是请求对象；res 是 handler ABI 里的响应占位对象，通常直接 return http.text/json/empty。
+    return http.text("Ku HTTP OK")
+}
 
-    app.get("/", (req, res) => {
-        return http.text("Ku HTTP OK")
+fn main(): null! {
+    // http.service() 创建 HTTP service 对象；旧的 http.service 属性式写法不推荐。
+    app = http.service()
+
+    app.get("/", ret)
+    app.get("/index", fn(req, res) {
+        return http.json({
+            code: 0,
+            msg: "成功",
+            data: {
+                name: "张三",
+                age: 18,
+                aihao: ["打羽毛球", "吃饭"]
+            }
+        })
     })
     app.get("/json", (req, res) => {
         return http.json({
-            ok: true,
-            path: req.path.clone(),
-            now_ms: time.millis()
+            code: 0,
+            msg: "ok",
+            data: {
+                path: req.path.clone(),
+                now_ms: time.millis()
+            }
+        })
+    })
+    app.get("/created", (req, res) => {
+        return http.json(http.status.created, {
+            code: 0,
+            msg: "created",
+            data: null
         })
     })
     app.get("/user/{id}", (req, res) => {
         return http.json({
-            id: req.params.id.clone(),
-            q: req.query["q"]?,
-            method: req.method.clone()
+            code: 0,
+            msg: "ok",
+            data: {
+                id: req.params.id.clone(),
+                q: req.query["q"]?,
+                method: req.method.clone()
+            }
         })
     })
     app.post("/echo", (req, res) => {
         return http.text(req.body.clone())
     })
+    app.get("/empty", (req, res) => {
+        return http.empty()
+    })
 
     println("Ku HTTP server listening on http://127.0.0.1:8080")
-    println("Try: GET /, GET /json, GET /user/42?q=ku, POST /echo")
+    println("Try: GET /, GET /index, GET /json, GET /created, GET /user/42?q=ku, GET /empty, POST /echo")
     app.listen("127.0.0.1:8080")?
     return ok(null)
 }

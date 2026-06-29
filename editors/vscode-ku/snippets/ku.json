@@ -122,13 +122,23 @@
   },
   "http response json": {
     "prefix": "http.json",
-    "body": ["return http.json({ ${1:ok}: true })"],
+    "body": ["return http.json(${1:http.status.ok}, { ${2:code}: 0, ${3:msg}: \"ok\", ${4:data}: null })"],
     "description": "HTTP JSON response helper"
+  },
+  "http empty response": {
+    "prefix": "http.empty",
+    "body": ["return http.empty(${1:http.status.noContent})"],
+    "description": "HTTP empty response helper"
+  },
+  "http status text": {
+    "prefix": "http.statusText",
+    "body": ["${1:text} = http.statusText(${2:http.status.notFound})"],
+    "description": "HTTP status reason phrase"
   },
   "http service": {
     "prefix": "http.service",
     "body": [
-      "service = http.service",
+      "service = http.service()",
       "println(service.max_active_requests)",
       "println(service.max_pending_requests)",
       "println(service.max_body_bytes)"
@@ -140,18 +150,27 @@
     "body": [
       "import { http } from \"std\"",
       "",
-      "fn main(): null! {",
-      "    app = http.service",
+      "fn ok(req, res) {",
+      "    return http.text(\"ok\")",
+      "}",
       "",
-      "    app.get(\"/\", (req, res) => {",
-      "        return http.text(\"ok\")",
+      "fn main(): null! {",
+      "    app = http.service()",
+      "",
+      "    app.get(\"/\", ok)",
+      "    app.get(\"/index\", fn(req, res) {",
+      "        return http.text(\"Ku HTTP 123\")",
       "    })",
       "",
       "    app.get(\"/json\", (req, res) => {",
       "        return http.json({",
-      "            ok: true,",
-      "            path: req.path.clone()",
+      "            code: 0,",
+      "            msg: \"ok\",",
+      "            data: { path: req.path.clone() }",
       "        })",
+      "    })",
+      "    app.get(\"/created\", (req, res) => {",
+      "        return http.json(http.status.created, { code: 0, msg: \"created\", data: null })",
       "    })",
       "",
       "    println(\"Ku HTTP server listening on http://127.0.0.1:8080\")",

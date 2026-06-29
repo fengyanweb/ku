@@ -6,7 +6,7 @@
 
 暂无。
 
-本轮已完成的固定语法/API 和示例已写入 `docs/syntax.md`、`README.md`、`docs-site/guide/*` 与 `docs/v0.0.13.md`；这里不再重复堆清单。
+本轮已完成的固定语法/API 和示例已写入 `docs/syntax.md`、`README.md`、`docs-site/guide/*` 与 `docs/v0.0.14.md`；这里不再重复堆清单。
 
 ## 已决定的语言方向
 
@@ -32,6 +32,8 @@
 5. 真实项目验证：用两个真实 Ku 项目验证 native C / LLVM；LLVM 只按真实项目需要继续扩展。
 6. native async：等 native ABI 稳定后单独设计状态机 runtime，不使用 OS 线程冒充小协程；用户侧仍只保留“async fn 返回一次性 task + await task”模型，不开放 `task.spawn`、`Task.new`、`runtime.schedule` 或 `thread.spawn`。
 7. 最终 native binary build：在解释器打包型 `ku build` 稳定后，继续做完整 import graph 打包、runtime ABI lowering、object file/linker、增量 cache，并满足生成物不依赖 Ku 源码文件的验收标准。
+8. 严格检查未使用 import；未使用变量/常量也进入 error 方向，但要先设计 `_` 丢弃、测试/示例豁免和跨文件导出影响。
+9. 对象解构赋值按 JS 风格进入执行队列，例如 `{ code } = http`；需要先明确只支持对象字段，还是同时支持重命名/default/rest。
 
 ## 下阶段建议顺序
 
@@ -39,3 +41,4 @@
 2. 再替换 native `const char*` 原型为正式 `KuString`。
 3. 再做 native dynamic object 和 `object.get_or`。
 4. 再做 registry 签名验证与受限 `.tar.zst` 解包。
+5. 再做未使用 import/变量检查和对象解构赋值语法。

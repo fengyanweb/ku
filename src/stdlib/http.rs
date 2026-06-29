@@ -84,14 +84,11 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
                     span,
                 ));
             }
-            let Value::String(body) = &args[0] else {
-                return Err(expected_type("str", &args[0], span));
-            };
-            let status = optional_status(args.get(1), span)?;
+            let (status, body) = text_response_args(args, span)?;
             Ok(Some(response_helper_value(
                 status,
                 "text/plain; charset=utf-8",
-                body.clone(),
+                body,
             )))
         }
         "json" => {
@@ -101,13 +98,43 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
                     span,
                 ));
             }
-            let status = optional_status(args.get(1), span)?;
-            let body = json::stringify_value(&args[0], span)?;
+            let (status, value) = json_response_args(args, span)?;
+            let body = json::stringify_value(value, span)?;
             Ok(Some(response_helper_value(
                 status,
                 "application/json",
                 body,
             )))
+        }
+        "empty" => {
+            if args.len() > 1 {
+                return Err(KuError::runtime(
+                    format!("http.empty expects 0 or 1 arguments but got {}", args.len()),
+                    span,
+                ));
+            }
+            let status = optional_status(args.first(), 204, span)?;
+            Ok(Some(response_helper_value(status, "", String::new())))
+        }
+        "redirect" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(KuError::runtime(
+                    format!(
+                        "http.redirect expects 1 or 2 arguments but got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            let (status, location) = redirect_response_args(args, span)?;
+            Ok(Some(redirect_response_value(status, location)))
+        }
+        "statusText" => {
+            expect_arg_count("http.statusText", args.len(), 1, span)?;
+            let Value::Int(status) = &args[0] else {
+                return Err(expected_type("int", &args[0], span));
+            };
+            Ok(Some(Value::String(status_text(*status).to_string())))
         }
         "service" | "server" => {
             if args.len() > 1 {
@@ -129,6 +156,72 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
 pub fn default_server_value(span: Span) -> KuResult<Value> {
     server_config_value(None, span)
 }
+
+pub fn status_object_value() -> Value {
+    Value::Object(
+        HTTP_STATUS_CODES
+            .iter()
+            .map(|(name, code, _)| ((*name).to_string(), Value::Int(*code)))
+            .collect(),
+    )
+}
+
+pub fn code_object_value() -> Value {
+    Value::Object(HashMap::from([
+        ("SUCCESS".to_string(), Value::Int(200)),
+        ("CREATED".to_string(), Value::Int(201)),
+        ("ACCEPTED".to_string(), Value::Int(202)),
+        ("NO_CONTENT".to_string(), Value::Int(204)),
+        ("BAD_REQUEST".to_string(), Value::Int(400)),
+        ("UNAUTHORIZED".to_string(), Value::Int(401)),
+        ("FORBIDDEN".to_string(), Value::Int(403)),
+        ("NOT_FOUND".to_string(), Value::Int(404)),
+        ("VALIDATION_FAILED".to_string(), Value::Int(422)),
+        ("INTERNAL_ERROR".to_string(), Value::Int(500)),
+    ]))
+}
+
+pub fn status_text(status: i64) -> &'static str {
+    HTTP_STATUS_CODES
+        .iter()
+        .find(|(_, code, _)| *code == status)
+        .map(|(_, _, text)| *text)
+        .unwrap_or("OK")
+}
+
+const HTTP_STATUS_CODES: &[(&str, i64, &str)] = &[
+    ("ok", 200, "OK"),
+    ("created", 201, "Created"),
+    ("accepted", 202, "Accepted"),
+    ("noContent", 204, "No Content"),
+    ("movedPermanently", 301, "Moved Permanently"),
+    ("found", 302, "Found"),
+    ("seeOther", 303, "See Other"),
+    ("notModified", 304, "Not Modified"),
+    ("temporaryRedirect", 307, "Temporary Redirect"),
+    ("permanentRedirect", 308, "Permanent Redirect"),
+    ("badRequest", 400, "Bad Request"),
+    ("unauthorized", 401, "Unauthorized"),
+    ("forbidden", 403, "Forbidden"),
+    ("notFound", 404, "Not Found"),
+    ("methodNotAllowed", 405, "Method Not Allowed"),
+    ("notAcceptable", 406, "Not Acceptable"),
+    ("requestTimeout", 408, "Request Timeout"),
+    ("conflict", 409, "Conflict"),
+    ("gone", 410, "Gone"),
+    ("contentTooLarge", 413, "Content Too Large"),
+    ("uriTooLong", 414, "URI Too Long"),
+    ("unsupportedMedia", 415, "Unsupported Media Type"),
+    ("rangeNotSatisfiable", 416, "Range Not Satisfiable"),
+    ("unprocessable", 422, "Unprocessable Content"),
+    ("tooManyRequests", 429, "Too Many Requests"),
+    ("headerTooLarge", 431, "Request Header Fields Too Large"),
+    ("internalError", 500, "Internal Server Error"),
+    ("notImplemented", 501, "Not Implemented"),
+    ("badGateway", 502, "Bad Gateway"),
+    ("serviceUnavailable", 503, "Service Unavailable"),
+    ("gatewayTimeout", 504, "Gateway Timeout"),
+];
 
 #[derive(Debug)]
 struct HttpRequest {
@@ -374,29 +467,116 @@ fn result_from_http(response: Result<HttpResponse, HttpError>) -> Value {
     }
 }
 
-fn optional_status(value: Option<&Value>, span: Span) -> KuResult<i64> {
-    match value {
-        Some(Value::Int(status)) if (100..=599).contains(status) => Ok(*status),
-        Some(Value::Int(_)) => Err(KuError::runtime(
-            "http status must be between 100 and 599",
+fn text_response_args(args: &[Value], span: Span) -> KuResult<(i64, String)> {
+    match args {
+        [Value::String(body)] => Ok((200, body.clone())),
+        [Value::Int(status), Value::String(body)] => {
+            Ok((validate_status(*status, span)?, body.clone()))
+        }
+        [first, _] => Err(expected_type(
+            "int status as the first argument",
+            first,
             span,
         )),
+        [other] => Err(expected_type("str", other, span)),
+        _ => Err(KuError::runtime(
+            format!("http.text expects 1 or 2 arguments but got {}", args.len()),
+            span,
+        )),
+    }
+}
+
+fn json_response_args(args: &[Value], span: Span) -> KuResult<(i64, &Value)> {
+    match args {
+        [value] => Ok((200, value)),
+        [Value::Int(status), value] => Ok((validate_status(*status, span)?, value)),
+        [first, _] => Err(expected_type(
+            "int status as the first argument",
+            first,
+            span,
+        )),
+        _ => Err(KuError::runtime(
+            format!("http.json expects 1 or 2 arguments but got {}", args.len()),
+            span,
+        )),
+    }
+}
+
+fn redirect_response_args(args: &[Value], span: Span) -> KuResult<(i64, String)> {
+    match args {
+        [Value::String(location)] => Ok((302, location.clone())),
+        [Value::Int(status), Value::String(location)] => {
+            let status = validate_status(*status, span)?;
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                return Err(KuError::runtime(
+                    "http redirect status must be 301, 302, 303, 307, or 308",
+                    span,
+                ));
+            }
+            Ok((status, location.clone()))
+        }
+        [first, _] => Err(expected_type(
+            "int redirect status as the first argument",
+            first,
+            span,
+        )),
+        [other] => Err(expected_type("str", other, span)),
+        _ => Err(KuError::runtime(
+            format!(
+                "http.redirect expects 1 or 2 arguments but got {}",
+                args.len()
+            ),
+            span,
+        )),
+    }
+}
+
+fn optional_status(value: Option<&Value>, default: i64, span: Span) -> KuResult<i64> {
+    match value {
+        Some(Value::Int(status)) => validate_status(*status, span),
         Some(other) => Err(expected_type("int", other, span)),
-        None => Ok(200),
+        None => Ok(default),
+    }
+}
+
+fn validate_status(status: i64, span: Span) -> KuResult<i64> {
+    if (100..=599).contains(&status) {
+        Ok(status)
+    } else {
+        Err(KuError::runtime(
+            "http status must be between 100 and 599",
+            span,
+        ))
     }
 }
 
 fn response_helper_value(status: i64, content_type: &str, body: String) -> Value {
+    let headers = if content_type.is_empty() {
+        HashMap::new()
+    } else {
+        HashMap::from([(
+            "content-type".to_string(),
+            Value::String(content_type.to_string()),
+        )])
+    };
+    Value::Object(HashMap::from([
+        ("status".to_string(), Value::Int(status)),
+        ("headers".to_string(), Value::Object(headers)),
+        ("body".to_string(), Value::String(body)),
+    ]))
+}
+
+fn redirect_response_value(status: i64, location: String) -> Value {
     Value::Object(HashMap::from([
         ("status".to_string(), Value::Int(status)),
         (
             "headers".to_string(),
             Value::Object(HashMap::from([(
-                "content-type".to_string(),
-                Value::String(content_type.to_string()),
+                "location".to_string(),
+                Value::String(location),
             )])),
         ),
-        ("body".to_string(), Value::String(body)),
+        ("body".to_string(), Value::String(String::new())),
     ]))
 }
 

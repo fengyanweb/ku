@@ -105,6 +105,9 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("http", "client" | "service" | "server") => vec![],
         ("http", "text") => vec![str_arg()],
         ("http", "json") => vec![ArgRule::Is(TypePattern::Any)],
+        ("http", "empty") => vec![],
+        ("http", "redirect") => vec![str_arg()],
+        ("http", "statusText") => vec![int_arg()],
         _ => return None,
     };
     let returns = match (module, function) {
@@ -140,7 +143,8 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         }
         ("http", "client") => http_client_pattern(),
         ("http", "service" | "server") => http_service_pattern(),
-        ("http", "text" | "json") => http_response_pattern(),
+        ("http", "text" | "json" | "empty" | "redirect") => http_response_pattern(),
+        ("http", "statusText") => TypePattern::String,
         _ => return None,
     };
     Some(Signature {

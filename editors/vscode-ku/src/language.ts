@@ -5,7 +5,7 @@ import * as vscode from "vscode";
 import { builtins, keywords, memberCompletionLabels, stdFunctions, stdImportPathLabels, stdModules, stdRootModules, types } from "./completionModel";
 import { defaultModuleName, parseImports, resolveImportUri } from "./imports";
 
-const KU_VERSION = "0.0.13";
+const KU_VERSION = "0.0.14";
 const KU_MODE: vscode.DocumentSelector = [{ language: "ku", scheme: "file" }];
 const diagnosticCollection = vscode.languages.createDiagnosticCollection("ku");
 const output = vscode.window.createOutputChannel("Ku");
@@ -718,8 +718,10 @@ class KuHoverProvider implements vscode.HoverProvider {
       "catch": "`catch (err)` 中 `err` 是结构化 Error 对象：`err.domain`、`err.code`、`err.message`。",
       "err": "`err(message)` 返回 `Unknown!`，失败 payload 是 `{ domain, code, message }`。",
       "fail": "`fail` 主动返回可恢复错误；字符串会包装为 `{ domain: \"ku\", code: \"fail\", message }`。",
-      "http": "`import \"std.http\"` 后使用。`http.get/post/request` 返回 `{ status, headers, body }!`。",
-      "service": "`http.service` 返回带默认资源限制的 HTTP service 配置对象；支持 route/bind/listen/run 基础阻塞 server。",
+      "http": "`import \"std.http\"` 后使用。`http.get/post/request` 返回 `{ status, headers, body }!`；`http.status.*` 提供协议状态码常量。",
+      "service": "`http.service()` 返回带默认资源限制的 HTTP service 配置对象；支持 route/bind/listen/run 基础阻塞 server。",
+      "status": "`http.status` 是 HTTP 协议状态码常量对象，例如 `http.status.ok`、`http.status.created`、`http.status.notFound`。",
+      "statusText": "`http.statusText(code)` 把 HTTP 状态码转成标准原因短语，例如 404 -> \"Not Found\"。",
       "server": "`http.server()` 返回带默认 timeout/body/header/concurrency 限制的 server 配置对象。",
       "fs": "`import \"std.fs\"` 后使用。支持 `fs.read/write/try_read/try_write`。",
       "config": "`import \"std.config\"` 后使用。支持 `config.env/env_file/yaml`。",
@@ -742,7 +744,7 @@ class KuHoverProvider implements vscode.HoverProvider {
       "time.is_leap": "`time.is_leap(year)` 判断闰年。",
       "time.days_in_month": "`time.days_in_month(year, month)?` 返回月份天数。",
       "time.sleep": "`time.sleep(msOrDuration)?` 阻塞当前任务；async 中会进入 blocking pool。",
-      "match": "Ku 0.0.13 保留 `match`，不再支持 `switch`。",
+      "match": "Ku 0.0.14 保留 `match`，不再支持 `switch`。",
       "try_get": "`values.try_get(index)?` 越界时返回结构化 Error。",
       "trim": "`text.trim()` 是 string 实例方法。",
     };

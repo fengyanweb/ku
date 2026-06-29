@@ -354,10 +354,15 @@ fn run_http_service_handles_local_request() {
     let source = r#"
 import "std.http"
 
+fn exact(req, res) {
+    return http.text("exact")
+}
+
 fn main(): null! {
-    app = http.service
-    app.get("/user/me", (req, res) => {
-        return http.text("exact")
+    app = http.service()
+    app.get("/user/me", exact)
+    app.get("/fn", fn(req, res) {
+        return http.text(req.path.clone())
     })
     app.get("/user/{id}", (req, res) => {
         return http.text(req.params.id + ":" + req.query.q + ":" + req.headers.host)
@@ -377,6 +382,16 @@ fn main(): null! {
     assert!(
         exact.contains("\r\n\r\nexact"),
         "compiled router should prefer exact route:\n{exact}"
+    );
+
+    let anonymous = http_response_or_stop(
+        &mut server,
+        &address,
+        "GET /fn HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        anonymous.contains("\r\n\r\n/fn"),
+        "anonymous fn handler should run:\n{anonymous}"
     );
 
     let request = "GET /user/42?q=ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
@@ -438,7 +453,7 @@ fn main(): null! {
         &address,
         "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\n12345",
     );
-    assert_http_status(&too_large, "HTTP/1.1 413 Payload Too Large");
+    assert_http_status(&too_large, "HTTP/1.1 413 Content Too Large");
 
     let bad_header = http_response_or_stop(
         &mut server,

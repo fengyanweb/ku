@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 #[derive(Debug)]
@@ -35,9 +35,13 @@ fn ku_binary() -> PathBuf {
 }
 
 fn run_with_timeout(bin: &Path, args: &[&str], timeout: Duration) -> RunResult {
+    run_with_timeout_in(repo_root(), bin, args, timeout)
+}
+
+fn run_with_timeout_in(cwd: PathBuf, bin: &Path, args: &[&str], timeout: Duration) -> RunResult {
     let mut child = Command::new(bin)
         .args(args)
-        .current_dir(repo_root())
+        .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -91,6 +95,14 @@ fn write_temp_ku(name: &str, source: &str) -> PathBuf {
     let path = env::temp_dir().join(format!("ku-{}-{}", std::process::id(), name));
     fs::write(&path, source).expect("failed to write temp ku file");
     path
+}
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_nanos();
+    env::temp_dir().join(format!("ku-{}-{}-{}", std::process::id(), name, nanos))
 }
 
 #[test]
@@ -166,6 +178,111 @@ fn help_flags_print_commands() {
 }
 
 #[test]
+fn create_init_and_template_commands_manage_projects() {
+    let root = unique_temp_dir("project-commands");
+    fs::create_dir_all(&root).expect("create temp root");
+    let bin = ku_binary();
+
+    let list = run_with_timeout_in(
+        root.clone(),
+        &bin,
+        &["template", "list"],
+        Duration::from_secs(2),
+    );
+    assert_eq!(list.code, Some(0), "template list failed: {}", list.stderr);
+    assert!(list.stdout.contains("basic"));
+    assert!(list.stdout.contains("http"));
+
+    let created = run_with_timeout_in(
+        root.clone(),
+        &bin,
+        &["create", "my-api", "--template", "http"],
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        created.code,
+        Some(0),
+        "create failed\nstdout:\n{}\nstderr:\n{}",
+        created.stdout,
+        created.stderr
+    );
+    let project = root.join("my-api");
+    assert!(project.join("ku.mod").exists(), "missing ku.mod");
+    assert!(
+        project.join("src").join("main.ku").exists(),
+        "missing main.ku"
+    );
+
+    let check = run_with_timeout_in(project.clone(), &bin, &["check"], Duration::from_secs(2));
+    assert_eq!(
+        check.code,
+        Some(0),
+        "project check failed\nstdout:\n{}\nstderr:\n{}",
+        check.stdout,
+        check.stderr
+    );
+
+    let duplicate = run_with_timeout_in(
+        root.clone(),
+        &bin,
+        &["create", "my-api"],
+        Duration::from_secs(2),
+    );
+    assert_ne!(duplicate.code, Some(0), "duplicate create should fail");
+    assert!(
+        duplicate.stderr.contains("E1001"),
+        "duplicate create missing code: {}",
+        duplicate.stderr
+    );
+
+    let init_dir = root.join("existing");
+    fs::create_dir_all(&init_dir).expect("create init dir");
+    let init = run_with_timeout_in(
+        init_dir.clone(),
+        &bin,
+        &["init", "--template", "cli"],
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        init.code,
+        Some(0),
+        "init failed\nstdout:\n{}\nstderr:\n{}",
+        init.stdout,
+        init.stderr
+    );
+    let run = run_with_timeout_in(init_dir.clone(), &bin, &["run"], Duration::from_secs(2));
+    assert_eq!(run.code, Some(0), "project run failed: {}", run.stderr);
+    assert!(run.stdout.contains("Ku CLI tool"));
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn create_unknown_template_reports_available_templates() {
+    let root = unique_temp_dir("bad-template");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = run_with_timeout_in(
+        root.clone(),
+        &ku_binary(),
+        &["create", "demo", "--template", "web"],
+        Duration::from_secs(2),
+    );
+    fs::remove_dir_all(&root).ok();
+
+    assert_ne!(result.code, Some(0), "unknown template should fail");
+    assert!(
+        result.stderr.contains("E1003"),
+        "missing E1003: {}",
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("available templates"),
+        "missing template help: {}",
+        result.stderr
+    );
+}
+
+#[test]
 fn invalid_command_prints_help() {
     let result = run_ku(&["wat"]);
 
@@ -194,8 +311,6 @@ fn check_success_names_checked_file() {
 #[test]
 fn cli_rejects_missing_and_extra_arguments() {
     for args in [
-        vec!["run"],
-        vec!["check"],
         vec!["run", "examples\\hello.ku", "extra"],
         vec!["check", "examples\\hello.ku", "extra"],
         vec!["examples\\hello.ku", "extra"],

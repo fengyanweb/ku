@@ -29,8 +29,19 @@ ku - simple, small, fast language tool
 
 Usage:
   ku <file.ku>          Run a Ku source file
+  ku create <name>      Create a new Ku project directory
+  ku create <name> --template <template>
+                        Create a project from a built-in template
+  ku create --list      List built-in project templates
+  ku init               Initialize the current directory as a Ku project
+  ku init --template <template>
+                        Initialize the current directory from a template
+  ku template list      List built-in project templates
+  ku run                Run the nearest ku.mod package entry
   ku run <file.ku>      Run a Ku source file
+  ku check              Check the nearest ku.mod package entry
   ku check <file.ku>    Check a Ku source file without running it
+  ku check --json       Check nearest ku.mod package and emit JSON Lines diagnostics
   ku check --json <file.ku>
                         Check and emit JSON Lines diagnostics
   ku ir <file.ku>       Print checked Ku IR draft
@@ -60,7 +71,13 @@ Usage:
   ku help               Print this help
 
 Examples:
+  ku create hello
+  ku create my-api --template http
+  ku init --template cli
+  ku template list
+  ku run
   ku run examples\\hello.ku
+  ku check
   ku check examples\\error.ku
   ku ir examples\\function.ku
   ku llvm examples\\function.ku
@@ -72,6 +89,9 @@ Examples:
 
 pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
     match args.get(1).map(String::as_str) {
+        Some("create") => run_create_command(&args),
+        Some("init") => run_init_command(&args),
+        Some("template") => run_template_command(&args),
         Some("run") => {
             if args.get(2).is_some_and(|arg| arg == "build") {
                 eprintln!(
@@ -81,23 +101,32 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
                 build_args.extend(args.iter().skip(3).cloned());
                 return run_build_command(&build_args);
             }
-            let path = exact_path(&args, "run")?;
-            let source = read_ku_file(path)?;
-            run_source(path, &source)
+            let (path, source) = source_arg_or_project(&args, "run")?;
+            run_source(&path_string(&path), &source)
         }
         Some("check") => {
             if args.get(2).is_some_and(|arg| arg == "--json") {
-                let path = exact_path_at(&args, "check --json", 3)?;
-                let source = read_ku_file(path)
-                    .map_err(|err| KuError::message(diagnostic_json_line(&err, path, "")))?;
-                parse_and_check(path, &source)
+                let (path, source) = if args.len() == 3 {
+                    project_entry_source("check --json")?
+                } else {
+                    let path = exact_path_at(&args, "check --json", 3)?;
+                    let path = PathBuf::from(path);
+                    let source = read_ku_path(&path).map_err(|err| {
+                        KuError::message(diagnostic_json_line(&err, &path_string(&path), ""))
+                    })?;
+                    (path, source)
+                };
+                let path_text = path_string(&path);
+                parse_and_check(&path_text, &source)
                     .map(|_| ())
-                    .map_err(|err| KuError::message(diagnostic_json_line(&err, path, &source)))
+                    .map_err(|err| {
+                        KuError::message(diagnostic_json_line(&err, &path_text, &source))
+                    })
             } else {
-                let path = exact_path(&args, "check")?;
-                let source = read_ku_file(path)?;
-                check_source(path, &source)?;
-                println!("check ok: {path}");
+                let (path, source) = source_arg_or_project(&args, "check")?;
+                let path_text = path_string(&path);
+                check_source(&path_text, &source)?;
+                println!("check ok: {path_text}");
                 Ok(())
             }
         }
@@ -172,6 +201,364 @@ pub fn help_text() -> &'static str {
     HELP
 }
 
+#[derive(Clone, Copy)]
+struct ProjectTemplate {
+    name: &'static str,
+    description: &'static str,
+    is_lib: bool,
+}
+
+const PROJECT_TEMPLATES: &[ProjectTemplate] = &[
+    ProjectTemplate {
+        name: "basic",
+        description: "minimal Ku project",
+        is_lib: false,
+    },
+    ProjectTemplate {
+        name: "cli",
+        description: "command line tool",
+        is_lib: false,
+    },
+    ProjectTemplate {
+        name: "http",
+        description: "HTTP server",
+        is_lib: false,
+    },
+    ProjectTemplate {
+        name: "json",
+        description: "JSON processing example",
+        is_lib: false,
+    },
+    ProjectTemplate {
+        name: "fs",
+        description: "file processing example",
+        is_lib: false,
+    },
+    ProjectTemplate {
+        name: "lib",
+        description: "library project",
+        is_lib: true,
+    },
+];
+
+fn run_create_command(args: &[String]) -> Result<(), KuError> {
+    if args.len() == 3 && args[2] == "--list" {
+        return list_project_templates();
+    }
+    if args.len() < 3 {
+        return Err(project_command_error(
+            "create needs a project name",
+            "help: use `ku create hello` or `ku create my-api --template http`",
+        ));
+    }
+    let name = &args[2];
+    let template = parse_template_option(args, 3, "create")?;
+    validate_project_name(name)?;
+    let path = PathBuf::from(name);
+    if path.exists() {
+        return Err(project_command_error(
+            format!(
+                "error[E1001]: project directory already exists\n   |\n   | ku create {name}\n   |           {}\n   |",
+                "^".repeat(name.len().max(1))
+            ),
+            "help: choose another name, or use `ku init` inside the existing directory",
+        ));
+    }
+    write_project_template(&path, name, template)?;
+    println!("create ok: {}", path.display());
+    println!("next: cd {name} && ku run");
+    Ok(())
+}
+
+fn run_init_command(args: &[String]) -> Result<(), KuError> {
+    let template = parse_template_option(args, 2, "init")?;
+    let cwd = env::current_dir()
+        .map_err(|err| KuError::message(format!("failed to read current directory: {err}")))?;
+    let manifest = cwd.join("ku.mod");
+    if manifest.exists() {
+        return Err(project_command_error(
+            "error[E1002]: Ku project already exists\n   |\nnote: found `ku.mod` in current directory",
+            "help: use `ku run`, `ku build`, or remove `ku.mod` before running `ku init`",
+        ));
+    }
+    let name = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| is_valid_project_name(name))
+        .unwrap_or("ku_app");
+    write_project_template(&cwd, name, template)?;
+    println!("init ok: {}", cwd.display());
+    println!("next: ku run");
+    Ok(())
+}
+
+fn run_template_command(args: &[String]) -> Result<(), KuError> {
+    match args.get(2).map(String::as_str) {
+        Some("list") => {
+            reject_extra_args(args, 3, "template list")?;
+            list_project_templates()
+        }
+        Some(other) => Err(project_command_error(
+            format!("unknown template command '{other}'"),
+            "help: use `ku template list`",
+        )),
+        None => Err(project_command_error(
+            "missing template command",
+            "help: use `ku template list`",
+        )),
+    }
+}
+
+fn parse_template_option<'a>(
+    args: &'a [String],
+    mut index: usize,
+    command: &str,
+) -> Result<&'a ProjectTemplate, KuError> {
+    let mut template = "basic";
+    while index < args.len() {
+        match args[index].as_str() {
+            "--template" | "-t" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(project_command_error(
+                        format!("missing template after {}", args[index - 1]),
+                        format!("help: use `ku {command} --template http`"),
+                    ));
+                };
+                template = value;
+            }
+            value if command == "create" && value == "--list" => {
+                return Err(project_command_error(
+                    "`ku create --list` does not take a project name",
+                    "help: use `ku create --list` or `ku create <name> --template http`",
+                ));
+            }
+            value => {
+                return Err(project_command_error(
+                    format!("unknown {command} option '{value}'"),
+                    format!("help: use `ku {command} --template http`"),
+                ));
+            }
+        }
+        index += 1;
+    }
+    find_project_template(template).ok_or_else(|| {
+        project_command_error(
+            format!("error[E1003]: unknown template `{template}`\n   |"),
+            "help: available templates: basic, cli, http, json, fs, lib",
+        )
+    })
+}
+
+fn find_project_template(name: &str) -> Option<&'static ProjectTemplate> {
+    PROJECT_TEMPLATES
+        .iter()
+        .find(|template| template.name == name)
+}
+
+fn list_project_templates() -> Result<(), KuError> {
+    for template in PROJECT_TEMPLATES {
+        println!("{:<8} {}", template.name, template.description);
+    }
+    Ok(())
+}
+
+fn write_project_template(
+    path: &Path,
+    name: &str,
+    template: &ProjectTemplate,
+) -> Result<(), KuError> {
+    let manifest_path = path.join("ku.mod");
+    let main_path = path.join("src").join("main.ku");
+    if manifest_path.exists() || main_path.exists() {
+        return Err(project_command_error(
+            "project template target already exists",
+            "help: move existing ku.mod/src/main.ku aside, or choose another project directory",
+        ));
+    }
+    fs::create_dir_all(path.join("src")).map_err(|err| {
+        KuError::message(format!(
+            "failed to create project directory '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let manifest = project_manifest(name, template);
+    let main = project_main_source(template);
+    fs::write(&manifest_path, manifest).map_err(|err| {
+        KuError::message(format!(
+            "failed to write '{}': {err}",
+            manifest_path.display()
+        ))
+    })?;
+    fs::write(&main_path, main).map_err(|err| {
+        KuError::message(format!("failed to write '{}': {err}", main_path.display()))
+    })?;
+    Ok(())
+}
+
+fn project_manifest(name: &str, template: &ProjectTemplate) -> String {
+    let mut manifest = format!(
+        "name = \"{name}\"\nversion = \"0.1.0\"\nroot = \"src\"\ncache = \".ku/cache\"\nout = \".ku/build\"\n"
+    );
+    manifest.push_str("main = \"main.ku\"\n");
+    manifest.push_str(&format!("template = \"{}\"\n", template.name));
+    if template.is_lib {
+        manifest.push_str("type = \"lib\"\n");
+    }
+    manifest
+}
+
+fn project_main_source(template: &ProjectTemplate) -> &'static str {
+    match template.name {
+        "basic" => {
+            r#"fn main() {
+    // `println` prints one line.
+    println("Hello Ku")
+}
+"#
+        }
+        "cli" => {
+            r#"fn main() {
+    // Command line arguments will get a dedicated std API later.
+    println("Ku CLI tool")
+}
+"#
+        }
+        "http" => {
+            r#"import { http, time } from "std"
+
+fn ret(req, res) {
+    // `req` is the request object; handlers return an HttpResponse.
+    return http.text("Ku HTTP OK")
+}
+
+fn main(): null! {
+    app = http.service()
+
+    app.get("/", ret)
+    app.get("/index", fn(req, res) {
+        return http.text("Ku HTTP 123")
+    })
+    app.get("/json", (req, res) => {
+        return http.json({
+            code: 0,
+            msg: "ok",
+            data: {
+                path: req.path.clone(),
+                now_ms: time.millis()
+            }
+        })
+    })
+    app.get("/user/{id}", (req, res) => {
+        return http.json({
+            code: 0,
+            msg: "ok",
+            data: {
+                id: req.params.id.clone(),
+                q: req.query["q"]?,
+                method: req.method.clone()
+            }
+        })
+    })
+    app.post("/echo", (req, res) => {
+        return http.text(req.body.clone())
+    })
+
+    println("Ku HTTP server listening on http://127.0.0.1:8080")
+    app.listen("127.0.0.1:8080")?
+    return ok(null)
+}
+"#
+        }
+        "json" => {
+            r#"import { json } from "std"
+
+fn main() {
+    data = {
+        code: 0,
+        msg: "ok",
+        data: { name: "Ku" }
+    }
+    println(json.stringify(data))
+}
+"#
+        }
+        "fs" => {
+            r#"import { fs } from "std"
+
+fn main(): null! {
+    fs.write("hello.txt", "Hello Ku")
+    text = fs.read("hello.txt")
+    println(text)
+    return ok(null)
+}
+"#
+        }
+        "lib" => {
+            r#"fn Add(a:int, b:int): int {
+    return a + b
+}
+
+fn main() {
+    println(Add(1, 2))
+}
+"#
+        }
+        _ => unreachable!("unknown built-in template"),
+    }
+}
+
+fn validate_project_name(name: &str) -> Result<(), KuError> {
+    if is_valid_project_name(name) {
+        Ok(())
+    } else {
+        Err(project_command_error(
+            format!("invalid project name '{name}'"),
+            "help: use lowercase names like `hello`, `my-api`, or `data_tool`",
+        ))
+    }
+}
+
+fn is_valid_project_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_lowercase()
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+}
+
+fn project_command_error(message: impl Into<String>, help: impl Into<String>) -> KuError {
+    KuError::message(format!("{}\n{}", message.into(), help.into()))
+}
+
+fn source_arg_or_project(args: &[String], command: &str) -> Result<(PathBuf, String), KuError> {
+    match args.len() {
+        2 => project_entry_source(command),
+        3 => {
+            let path = PathBuf::from(&args[2]);
+            let source = read_ku_path(&path)?;
+            Ok((path, source))
+        }
+        _ => Err(command_error(format!(
+            "too many arguments for 'ku {command}'"
+        ))),
+    }
+}
+
+fn project_entry_source(command: &str) -> Result<(PathBuf, String), KuError> {
+    let cwd = env::current_dir()
+        .map_err(|err| KuError::message(format!("failed to read current directory: {err}")))?;
+    let package = package::discover_from_dir(&cwd)?.ok_or_else(|| {
+        command_error(format!(
+            "ku {command} needs a .ku file or a ku.mod package in the current directory"
+        ))
+    })?;
+    let entry = package_entry_path(&package);
+    let source = read_ku_path(&entry)?;
+    Ok((entry, source))
+}
+
 fn exact_path<'a>(args: &'a [String], command: &str) -> Result<&'a str, KuError> {
     if args.len() < 3 {
         return Err(command_error(format!(
@@ -207,11 +594,16 @@ fn reject_extra_args(args: &[String], expected_len: usize, command: &str) -> Res
 }
 
 fn read_ku_file(path: &str) -> Result<String, KuError> {
-    if !is_ku_file(path) {
-        return Err(expected_ku_file(path));
+    read_ku_path(Path::new(path))
+}
+
+fn read_ku_path(path: &Path) -> Result<String, KuError> {
+    if !is_ku_path(path) {
+        return Err(expected_ku_file(&path_string(path)));
     }
-    reject_large_file(Path::new(path), Span::default())?;
-    fs::read_to_string(path).map_err(|e| KuError::message(format!("failed to read {path}: {e}")))
+    reject_large_file(path, Span::default())?;
+    fs::read_to_string(path)
+        .map_err(|e| KuError::message(format!("failed to read {}: {e}", path.display())))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

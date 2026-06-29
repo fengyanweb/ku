@@ -991,6 +991,9 @@ impl Parser {
         if self.is_arrow_function_start() {
             return self.arrow_function();
         }
+        if self.check(&TokenKind::Fn) {
+            return self.anonymous_function();
+        }
         if self.match_kind(&TokenKind::Match) {
             return self.match_expression(self.previous().span);
         }
@@ -1133,21 +1136,7 @@ impl Parser {
 
     fn arrow_function(&mut self) -> KuResult<Expr> {
         let start = self.consume(&TokenKind::LParen, "expected '('")?.span.start;
-        let mut params = Vec::new();
-        if !self.check(&TokenKind::RParen) {
-            loop {
-                let (name, span) = self.consume_ident("expected arrow function parameter")?;
-                let ty = if self.match_kind(&TokenKind::Colon) {
-                    Some(self.type_name()?)
-                } else {
-                    None
-                };
-                params.push(FunctionParam { name, ty, span });
-                if !self.match_kind(&TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
+        let params = self.function_value_params("arrow function")?;
         self.consume(
             &TokenKind::RParen,
             "expected ')' after arrow function parameters",
@@ -1170,6 +1159,50 @@ impl Parser {
             },
             Span::new(start, body_span.end),
         ))
+    }
+
+    fn anonymous_function(&mut self) -> KuResult<Expr> {
+        let start = self.consume(&TokenKind::Fn, "expected 'fn'")?.span.start;
+        self.consume(&TokenKind::LParen, "expected '(' after 'fn'")?;
+        let params = self.function_value_params("anonymous function")?;
+        self.consume(
+            &TokenKind::RParen,
+            "expected ')' after anonymous function parameters",
+        )?;
+        let return_type = if self.match_kind(&TokenKind::Colon) {
+            Some(self.type_name()?)
+        } else {
+            None
+        };
+        let (body, body_span) = self.block()?;
+        Ok(Expr::new(
+            ExprKind::Function {
+                params,
+                return_type,
+                body,
+            },
+            Span::new(start, body_span.end),
+        ))
+    }
+
+    fn function_value_params(&mut self, context: &str) -> KuResult<Vec<FunctionParam>> {
+        let mut params = Vec::new();
+        if self.check(&TokenKind::RParen) {
+            return Ok(params);
+        }
+        loop {
+            let (name, span) = self.consume_ident(&format!("expected {context} parameter"))?;
+            let ty = if self.match_kind(&TokenKind::Colon) {
+                Some(self.type_name()?)
+            } else {
+                None
+            };
+            params.push(FunctionParam { name, ty, span });
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(params)
     }
 
     fn arrow_body(&mut self) -> KuResult<(Vec<Stmt>, Span)> {

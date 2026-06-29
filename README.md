@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.13`，正在补齐二进制构建系统、native C、LLVM、registry resolver 和 async task 生命周期能力。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.14`，正在补齐二进制构建系统、native C、LLVM、registry resolver 和 async task 生命周期能力。
 
 ## 快速开始
 
@@ -15,6 +15,16 @@ cargo build --release
 
 ```powershell
 ku -h
+ku create my-api --template http
+cd my-api
+ku check
+ku build
+ku run
+```
+
+在仓库根目录仍可以直接运行单文件示例：
+
+```powershell
 ku run examples/hello.ku
 ku check examples/index.ku
 ```
@@ -23,8 +33,19 @@ ku check examples/index.ku
 
 ```txt
 ku <file.ku>          Run a Ku source file
+ku create <name>      Create a new Ku project directory
+ku create <name> --template <template>
+                      Create a project from a built-in template
+ku create --list      List built-in project templates
+ku init               Initialize the current directory as a Ku project
+ku init --template <template>
+                      Initialize the current directory from a template
+ku template list      List built-in project templates
+ku run                Run the nearest ku.mod package entry
 ku run <file.ku>      Run a Ku source file
+ku check              Check the nearest ku.mod package entry
 ku check <file.ku>    Check a Ku source file without running
+ku check --json       Check nearest ku.mod package and emit JSON Lines diagnostics
 ku check --json <file.ku>
                       Check and emit JSON Lines diagnostics
 ku ir <file.ku>       Print checked Ku IR draft
@@ -52,7 +73,7 @@ ku -h | -help         Print help
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.13 支持的核心语法
+## 0.0.14 支持的核心语法
 
 ```ku
 struct User {
@@ -192,7 +213,8 @@ http_bench.ps1
 
 ## 文档
 
-- [0.0.13 语法文档](docs/syntax.md)
+- [0.0.14 语法文档](docs/syntax.md)
+- [0.0.14 版本记录](docs/v0.0.14.md)
 - [0.0.13 版本记录](docs/v0.0.13.md)
 - [0.0.12 版本记录](docs/v0.0.12.md)
 - [0.0.11 版本记录](docs/v0.0.11.md)
@@ -213,11 +235,11 @@ http_bench.ps1
 
 `ku build` 当前生成解释器打包型可执行文件。单文件默认输出到源文件旁的 `.ku/build/<profile>/<name>`；有 `ku.mod` 时可以直接 `ku build` 或 `ku build .`，入口来自 `root + main`，默认 `src/main.ku`，输出目录来自 `out`，默认 `.ku/build`。支持 `-o` 指定输出、`--debug` / `--release` / `--profile debug|release|small|fast`、`--target` 目标目录分层、`--emit-ir`、`--emit-c`、`--emit-llvm` 和 `--backend c` 原型。`ku run build` 保留兼容，但会提示改用 `ku build`。
 
-注意：0.0.13 的默认 build 是“解释器打包型二进制”，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于最终 native ABI。带 import 的程序仍应保持源码依赖路径可访问。完整 native binary 目标仍在执行队列：native closure、正式 `KuString`、dynamic object、async state machine runtime、增量缓存和真正不依赖源码的 import graph 打包。
+注意：0.0.14 的默认 build 是“解释器打包型二进制”，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于最终 native ABI。带 import 的程序仍应保持源码依赖路径可访问。完整 native binary 目标仍在执行队列：native closure、正式 `KuString`、dynamic object、async state machine runtime、增量缓存和真正不依赖源码的 import graph 打包。
 
 `ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally` 和 return-through-finally。array/named/Result 已按默认 move、显式 `clone()`、自动 drop 生成所有权代码；闭包、动态 object、正式 owned string 和 async native lowering 仍会明确报不支持。
 
-已完成到 0.0.13 的关键前置：
+已完成到 0.0.14 的关键前置：
 
 ```txt
 支持 str | int 这类联合类型，用于参数、变量和返回值检查。
@@ -243,7 +265,8 @@ async runtime 已有 blocking shutdown drain、累计指标和百万并发需求
 `std.time` 已按第一版文档实现 Time/Date/Duration object、format/parse/date/datetime/duration/add/sub/diff/compare/parts/weekday/is_leap/days_in_month/sleep 和固定偏移 zone。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
 match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。
-标准库可以用 `import { fs, http, time } from "std"` 一次导入多个模块。std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.service/http.server 配置与响应 helper。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes，路径参数使用 `{id}`；handler 固定 `(req, res)`，返回 `{ status, headers, body }`，并禁止修改外层捕获变量；bind/listen 只接收 address，配置来自 service/server 对象，会先真实绑定端口并编译运行时路由表，listen/run 会阻塞处理基础 HTTP 请求，listener.close 可显式关闭未运行的 listener。fs 需要 `import "std.fs"` 或 `import { fs } from "std"` 后使用，并提供 read/write 与 try_read/try_write。std.config 需要显式导入后使用，并提供 env/env_file/yaml 第一版配置读取。VS Code formatter 已支持 4 空格缩进、空行压缩、运算符/逗号空格、`++/--`、复合赋值和 `} else/catch/finally` 合并。
+标准库可以用 `import { fs, http, time } from "std"` 一次导入多个模块。std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.empty/http.redirect/http.status/http.statusText/http.service/http.server 配置与响应 helper。`http.text/json(body)` 默认 200，`http.text/json(status, body)` 显式协议状态码，`http.empty()` 默认 204，`http.redirect(location)` 默认 302；业务 `body.code/msg/data` 由开发者自己维护。推荐用 `app = http.service()` 创建 HTTP service；旧的 `http.service` 属性式写法暂时兼容。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes，路径参数使用 `{id}`；handler 支持顶层函数名、`fn(req,res){...}` 和箭头函数，固定接收 `(req, res)`，返回 `{ status, headers, body }`，并禁止修改外层捕获变量；`req` 是请求对象，`res` 是 handler ABI 的响应占位对象，常规写法直接 return 响应 helper。bind/listen 只接收 address，配置来自 service/server 对象，会先真实绑定端口并编译运行时路由表，listen/run 会阻塞处理基础 HTTP 请求，listener.close 可显式关闭未运行的 listener。fs 需要 `import "std.fs"` 或 `import { fs } from "std"` 后使用，并提供 read/write 与 try_read/try_write。std.config 需要显式导入后使用，并提供 env/env_file/yaml 第一版配置读取。VS Code formatter 已支持 4 空格缩进、空行压缩、运算符/逗号空格、`++/--`、复合赋值和 `} else/catch/finally` 合并。
+工具链新增 `ku create <name> --template <template>`、`ku init --template <template>` 和 `ku template list`；内置 basic/cli/http/json/fs/lib 模板。`ku run` / `ku check` 无参数时读取当前 `ku.mod` 的入口，带 `.ku` 文件路径时仍运行/检查指定文件。
 
 `print(value)` 不自动换行；需要逐行输出时使用 `println(value)`。
 
@@ -261,7 +284,7 @@ registry resolver 支持精确版本和 caret 范围、最高兼容版本选择�
 LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 标准库 root import 允许小写导出，例如 `import { task, time } from "std"`；用户自定义文件的顶层 `fn/struct/enum` 仍必须首字母大写才对外导出。import/export 诊断会给出位置、问题描述和修改方向。
 `std.time` 会拒绝超出 chrono 支持范围的毫秒值，不再静默回退到当前时间。
-`ku.mod` 增加 `main` 和 `out` 字段，供 `ku build` 解析项目默认入口和输出目录。
+`ku.mod` 增加 `main`、`out`、`template` 和 `type` 字段，供 create/init/build 和库项目记录使用。
 ```
 
 仍未完成：
@@ -282,10 +305,17 @@ native async ABI
 editors/vscode-ku
 ```
 
+统一打包解释器和 VS Code 插件：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1
+powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -InstallExtension
+```
+
 已提供：
 
 ```txt
-Ku 0.0.13 语法高亮和 snippet
+Ku 0.0.14 语法高亮和 snippet
 ku.mod / ku.lock 高亮
 保存/打开时运行 ku check，并把错误放进 Problems 面板
 命令面板：Run / Check / Show IR / Build / Build Native C / Package GC / Show Version
@@ -300,13 +330,13 @@ Ku 文件默认保存时格式化；import path 补全会替换引号内路径�
 图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择：
 
 ```txt
-editors/vscode-ku/ku-language-0.0.13.vsix
+editors/vscode-ku/ku-language-0.0.14.vsix
 ```
 
 命令安装方式：
 
 ```powershell
-code --install-extension editors\vscode-ku\ku-language-0.0.13.vsix --force
+code --install-extension editors\vscode-ku\ku-language-0.0.14.vsix --force
 ```
 
 ## 开发验证

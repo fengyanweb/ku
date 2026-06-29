@@ -909,7 +909,7 @@ impl Interpreter {
                 .eval_template(value, env, depth, expr.span)
                 .map(Value::String),
             ExprKind::Literal(Literal::Null) => Ok(Value::Null),
-            ExprKind::Variable(name) => env.get(name, expr.span),
+            ExprKind::Variable(name) => self.eval_variable(name, env, expr.span),
             ExprKind::Await(task) => {
                 let value = self.eval(task, env, depth)?;
                 if self.pending_fail.is_some() {
@@ -1094,9 +1094,15 @@ impl Interpreter {
                     if enum_name == "http"
                         && !env.contains("http")
                         && self.std_modules.contains("http")
-                        && matches!(name.as_str(), "service" | "server")
                     {
-                        return stdlib::http::default_server_value(expr.span);
+                        match name.as_str() {
+                            "service" | "server" => {
+                                return stdlib::http::default_server_value(expr.span);
+                            }
+                            "status" => return Ok(stdlib::http::status_object_value()),
+                            "code" => return Ok(stdlib::http::code_object_value()),
+                            _ => {}
+                        }
                     }
                     if self
                         .enums
@@ -1454,6 +1460,29 @@ impl Interpreter {
                 assign_field_value(container, name, value, span)
             }
         }
+    }
+
+    fn eval_variable(&self, name: &str, env: &Env, span: Span) -> KuResult<Value> {
+        if env.contains(name) {
+            return env.get(name, span);
+        }
+        if let Some(function) = self.functions.get(name) {
+            return Ok(Value::Function {
+                params: function
+                    .params
+                    .iter()
+                    .map(|param| param.name.clone())
+                    .collect(),
+                body: function.body.clone(),
+                captures: Env::new(),
+                self_name: Some(function.name.clone()),
+                is_async: function.is_async,
+            });
+        }
+        Err(KuError::runtime(
+            format!("undefined variable '{name}'"),
+            span,
+        ))
     }
 
     fn eval_http_service_method_call(
@@ -2663,7 +2692,7 @@ fn read_http_request(
         None => 0,
     };
     if content_length > limits.max_body_bytes {
-        return Err(status_response(413, "Payload Too Large"));
+        return Err(status_response(413, "Content Too Large"));
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
@@ -2934,19 +2963,7 @@ fn status_response(status: i64, message: &str) -> HttpWireResponse {
 }
 
 fn write_http_response(stream: &mut TcpStream, response: HttpWireResponse) -> KuResult<()> {
-    let reason = match response.status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        413 => "Payload Too Large",
-        431 => "Request Header Fields Too Large",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "OK",
-    };
+    let reason = stdlib::http::status_text(response.status);
     let mut headers = response.headers;
     headers
         .entry("content-length".to_string())
