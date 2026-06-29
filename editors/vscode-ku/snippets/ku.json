@@ -135,6 +135,32 @@
     ],
     "description": "HTTP service default limits"
   },
+  "http server app": {
+    "prefix": "http.server",
+    "body": [
+      "import { http } from \"std\"",
+      "",
+      "fn main(): null! {",
+      "    app = http.service",
+      "",
+      "    app.get(\"/\", (req, res) => {",
+      "        return http.text(\"ok\")",
+      "    })",
+      "",
+      "    app.get(\"/json\", (req, res) => {",
+      "        return http.json({",
+      "            ok: true,",
+      "            path: req.path.clone()",
+      "        })",
+      "    })",
+      "",
+      "    println(\"Ku HTTP server listening on http://127.0.0.1:8080\")",
+      "    app.listen(\"127.0.0.1:8080\")?",
+      "    return ok(null)",
+      "}"
+    ],
+    "description": "Runnable Ku HTTP server"
+  },
   "array map": {
     "prefix": "map",
     "body": ["${1:result} = ${2:nums}.map(${3:x} => ${3:x} * 2)"],

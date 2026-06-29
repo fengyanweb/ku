@@ -13,6 +13,12 @@ assert.deepStrictEqual(model.memberCompletionLabels("task", "st"), ["stats", "st
 for (const label of ["status", "cancel", "await_timeout"]) {
   assert(!model.memberCompletionLabels("task", "").includes(label));
 }
+assert.deepStrictEqual(model.memberCompletionLabels("req", ""), ["method", "path", "params", "query", "headers", "body"]);
+assert.deepStrictEqual(model.memberCompletionLabels("req", "p"), ["path", "params"]);
+assert.deepStrictEqual(model.memberCompletionLabels("res", ""), ["status", "headers", "body"]);
+assert.deepStrictEqual(model.memberCompletionLabels("router", "g"), ["get"]);
+assert.deepStrictEqual(model.memberCompletionLabels("app", "listen"), ["listen"]);
+assert.deepStrictEqual(model.memberCompletionLabels("values", ""), ["len", "try_get", "push", "concat", "map"]);
 assert.deepStrictEqual(model.memberCompletionLabels("time", "d"), ["date", "datetime", "duration", "diff", "days_in_month"]);
 assert.deepStrictEqual(model.stdRootModules, ["fs", "http", "string", "array", "json", "config", "time", "task"]);
 assert(!model.keywords.includes("println"));

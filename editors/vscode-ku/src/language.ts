@@ -525,6 +525,7 @@ class KuCompletionProvider implements vscode.CompletionItemProvider {
       if (labels.length > 0) {
         return labels.map((label) => memberCompletionItem(label, member.receiver, member.range));
       }
+      return [];
     }
     if (/@dep\/?$/.test(linePrefix)) {
       return dependencyCompletions(document);
@@ -537,9 +538,6 @@ class KuCompletionProvider implements vscode.CompletionItemProvider {
     }
     if (/["'`][^"'`]*\.$/.test(linePrefix) || /\btext\.$/.test(linePrefix)) {
       return methodCompletions(["trim", "lower", "upper", "len", "slice"]);
-    }
-    if (/\b(values|items|nums)\.$/.test(linePrefix)) {
-      return methodCompletions(["len", "is_empty", "first", "last", "try_get", "push", "concat", "map"]);
     }
     for (const value of keywords) {
       items.push(new vscode.CompletionItem(value, vscode.CompletionItemKind.Keyword));
