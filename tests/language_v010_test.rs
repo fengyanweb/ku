@@ -183,6 +183,42 @@ fn main(): int! {
 }
 
 #[test]
+fn ir_optimizer_folds_constants_and_removes_dead_branch_blocks() {
+    let tokens = Lexer::new(
+        r#"
+fn main() {
+    value = 1 + 2
+    if (true) {
+        print(value)
+    } else {
+        print(0)
+    }
+}
+"#,
+    )
+    .tokenize()
+    .expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let lowered = ir::lower_program(&program).expect("lower ir");
+    let optimized = ir::optimize_program(&lowered);
+    assert_ir_cfg_acyclic(&optimized);
+    let text = optimized.to_string();
+    assert!(
+        text.contains("%t0: int = 3"),
+        "constant folding should fold simple int arithmetic:\n{text}"
+    );
+    assert!(
+        text.contains("jump block"),
+        "constant branch should become a jump:\n{text}"
+    );
+    assert!(
+        !text.contains("else:"),
+        "unreachable else block should be removed:\n{text}"
+    );
+}
+
+#[test]
 fn checker_requires_enum_match_to_be_exhaustive() {
     let err = check_err(
         r#"
@@ -264,6 +300,19 @@ fn main() {
 }
 
 #[test]
+fn checker_does_not_stack_overflow_on_untyped_local_recursion() {
+    let source = r#"
+fn main() {
+    fn forever() {
+        forever()
+    }
+}
+"#;
+
+    check_source("inline.ku", source).expect("recursive local inference should be bounded");
+}
+
+#[test]
 fn native_build_rejects_async_syntax_with_clear_error() {
     let dir = unique_temp_path("native-async");
     fs::create_dir_all(&dir).expect("create temp dir");
@@ -323,6 +372,31 @@ fn main() {
         "unexpected error: {err}"
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_c_rejects_string_concat_until_kustring_abi_is_lowered() {
+    let tokens = Lexer::new(
+        r#"
+fn main() {
+    name = "Ku"
+    text = "Hello " + name
+    print(text)
+}
+"#,
+    )
+    .tokenize()
+    .expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let ir = ir::lower_program(&program).expect("lower");
+    let err = backend::c::generate_c_source(&ir)
+        .expect_err("native C string concat must be rejected until KuString exists")
+        .to_string();
+    assert!(
+        err.contains("string concatenation") && err.contains("KuString ABI"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -1363,6 +1437,55 @@ fn main() { print(Value()) }
 }
 
 #[test]
+fn package_dependency_without_source_fails_closed_even_when_cache_exists() {
+    let dir = unique_temp_path("package-dep-nosource");
+    let app_src = dir.join("app").join("src");
+    let cache_src = dir
+        .join("app")
+        .join(".ku")
+        .join("cache")
+        .join("packages")
+        .join("util")
+        .join("1.0.0")
+        .join("src");
+    fs::create_dir_all(&app_src).expect("create app src");
+    fs::create_dir_all(&cache_src).expect("create stale cache src");
+    fs::write(cache_src.join("util.ku"), "fn Value(): int { return 42 }")
+        .expect("write stale cached dep");
+    fs::write(
+        dir.join("app").join("ku.mod"),
+        r#"
+name = "demo_pkg"
+dep.util = "1.0.0"
+"#,
+    )
+    .expect("write ku.mod");
+    let main = app_src.join("main.ku");
+    fs::write(
+        &main,
+        r#"
+import { Value } from "@util/util"
+fn main() { print(Value()) }
+"#,
+    )
+    .expect("write main");
+
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect_err("dependency without trusted source should fail")
+    .to_string();
+    assert!(
+        err.contains("trusted source") || err.contains("registry_trust_unconfigured"),
+        "unexpected error: {err}"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn package_dependency_import_rejects_parent_escape() {
     let dir = unique_temp_path("package-dep-escape");
     let app_src = dir.join("app").join("src");
@@ -1636,6 +1759,41 @@ cache_key = "math-0.1.0"
     )
     .expect_err("short sha256 should fail");
     assert_eq!(err.code.as_deref(), Some("invalid_registry_checksum"));
+}
+
+#[test]
+fn registry_index_ed25519_verifier_accepts_signed_bytes_and_rejects_tampering() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use ku::package::RegistryIndexVerifier;
+
+    let index_url = "https://registry.example/ku/index";
+    let checksum = format!("sha256-{}", "a".repeat(64));
+    let source = format!(
+        "name = \"math\"\nversion = \"0.1.0\"\nsource = \"https://registry.example/ku/math/0.1.0.tar.zst\"\nchecksum = \"{checksum}\"\n"
+    );
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let signature = signing_key.sign(source.as_bytes()).to_bytes();
+    let verifier = package::Ed25519RegistryIndexVerifier::new(
+        signing_key.verifying_key().to_bytes(),
+        signature,
+    );
+
+    verifier
+        .verify(index_url, source.as_bytes(), Default::default())
+        .expect("signed registry index should verify");
+
+    let err = verifier
+        .verify(
+            index_url,
+            source.replace("0.1.0", "0.1.1").as_bytes(),
+            Default::default(),
+        )
+        .expect_err("tampered registry index should fail")
+        .to_string();
+    assert!(
+        err.contains("signature") || err.contains("registry_signature_mismatch"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

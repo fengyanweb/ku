@@ -293,6 +293,291 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
     Ok(IrProgram { functions, layouts })
 }
 
+pub fn optimize_program(program: &IrProgram) -> IrProgram {
+    IrProgram {
+        functions: program.functions.iter().map(optimize_function).collect(),
+        layouts: program.layouts.clone(),
+    }
+}
+
+fn optimize_function(function: &IrFunction) -> IrFunction {
+    let mut optimized = function.clone();
+    for block in &mut optimized.blocks {
+        for inst in &mut block.instructions {
+            optimize_inst(inst);
+        }
+        optimize_terminator(&mut block.terminator);
+    }
+    remove_unreachable_blocks(&mut optimized);
+    optimized
+}
+
+fn optimize_inst(inst: &mut IrInst) {
+    match inst {
+        IrInst::Temp { value, .. }
+        | IrInst::BindOk { result: value, .. }
+        | IrInst::Let { value, .. }
+        | IrInst::Store { value, .. }
+        | IrInst::Print(value)
+        | IrInst::Expr(value)
+        | IrInst::Fail(value)
+        | IrInst::Panic(value) => {
+            *value = optimize_expr(value.clone());
+        }
+        IrInst::BeginTry { .. }
+        | IrInst::EndTry
+        | IrInst::BindError { .. }
+        | IrInst::DefineClosure { .. }
+        | IrInst::Unsupported { .. } => {}
+    }
+}
+
+fn optimize_terminator(terminator: &mut IrTerminator) {
+    match terminator {
+        IrTerminator::Branch {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            *condition = optimize_expr(condition.clone());
+            if let Some(value) = bool_literal_value(condition) {
+                *terminator = IrTerminator::Jump(if value { *then_block } else { *else_block });
+            }
+        }
+        IrTerminator::ForEach { iterable, .. } => {
+            *iterable = optimize_expr(iterable.clone());
+        }
+        IrTerminator::ResultBranch { result, .. }
+        | IrTerminator::JumpErr { result, .. }
+        | IrTerminator::PropagateErr(result)
+        | IrTerminator::Return(Some(result)) => {
+            *result = optimize_expr(result.clone());
+        }
+        IrTerminator::Next
+        | IrTerminator::Jump(_)
+        | IrTerminator::Return(None)
+        | IrTerminator::Unreachable => {}
+    }
+}
+
+fn optimize_expr(expr: IrExpr) -> IrExpr {
+    match expr.kind {
+        IrExprKind::Unary { op, expr: inner } => {
+            let inner = optimize_expr(*inner);
+            fold_unary(op, inner).unwrap_or_else(|inner| IrExpr {
+                ty: expr.ty,
+                kind: IrExprKind::Unary {
+                    op,
+                    expr: Box::new(inner),
+                },
+            })
+        }
+        IrExprKind::Binary { left, op, right } => {
+            let left = optimize_expr(*left);
+            let right = optimize_expr(*right);
+            if let Some(folded) = fold_binary(&left, op, &right) {
+                folded
+            } else {
+                IrExpr {
+                    ty: expr.ty,
+                    kind: IrExprKind::Binary {
+                        left: Box::new(left),
+                        op,
+                        right: Box::new(right),
+                    },
+                }
+            }
+        }
+        IrExprKind::Call { callee, args, kind } => IrExpr {
+            ty: expr.ty,
+            kind: IrExprKind::Call {
+                callee: Box::new(optimize_expr(*callee)),
+                args: args.into_iter().map(optimize_expr).collect(),
+                kind,
+            },
+        },
+        IrExprKind::Array(values) => IrExpr {
+            ty: expr.ty,
+            kind: IrExprKind::Array(values.into_iter().map(optimize_expr).collect()),
+        },
+        IrExprKind::Index { target, index } => IrExpr {
+            ty: expr.ty,
+            kind: IrExprKind::Index {
+                target: Box::new(optimize_expr(*target)),
+                index: Box::new(optimize_expr(*index)),
+            },
+        },
+        IrExprKind::Field { target, name } => IrExpr {
+            ty: expr.ty,
+            kind: IrExprKind::Field {
+                target: Box::new(optimize_expr(*target)),
+                name,
+            },
+        },
+        IrExprKind::StructLiteral { name, fields } => IrExpr {
+            ty: expr.ty,
+            kind: IrExprKind::StructLiteral {
+                name,
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| (name, optimize_expr(value)))
+                    .collect(),
+            },
+        },
+        IrExprKind::TryUnwrap(value) => IrExpr {
+            ty: expr.ty,
+            kind: IrExprKind::TryUnwrap(Box::new(optimize_expr(*value))),
+        },
+        IrExprKind::Literal(_) | IrExprKind::Local(_) | IrExprKind::Temp(_) => expr,
+    }
+}
+
+fn fold_unary(op: UnaryOp, expr: IrExpr) -> Result<IrExpr, IrExpr> {
+    match op {
+        UnaryOp::Negate => {
+            if let Some(value) = int_literal_value(&expr) {
+                if let Some(value) = value.checked_neg() {
+                    return Ok(int_literal(value));
+                }
+            }
+        }
+        UnaryOp::Not => {
+            if let Some(value) = bool_literal_value(&expr) {
+                return Ok(bool_literal(!value));
+            }
+        }
+    }
+    Err(expr)
+}
+
+fn fold_binary(left: &IrExpr, op: BinaryOp, right: &IrExpr) -> Option<IrExpr> {
+    if let (Some(left_value), Some(right_value)) =
+        (int_literal_value(left), int_literal_value(right))
+    {
+        let folded = match op {
+            BinaryOp::Add => left_value.checked_add(right_value).map(int_literal),
+            BinaryOp::Subtract => left_value.checked_sub(right_value).map(int_literal),
+            BinaryOp::Multiply => left_value.checked_mul(right_value).map(int_literal),
+            BinaryOp::Divide if right_value != 0 => {
+                left_value.checked_div(right_value).map(int_literal)
+            }
+            BinaryOp::Remainder if right_value != 0 => {
+                left_value.checked_rem(right_value).map(int_literal)
+            }
+            BinaryOp::Equal => Some(bool_literal(left_value == right_value)),
+            BinaryOp::NotEqual => Some(bool_literal(left_value != right_value)),
+            BinaryOp::Less => Some(bool_literal(left_value < right_value)),
+            BinaryOp::LessEqual => Some(bool_literal(left_value <= right_value)),
+            BinaryOp::Greater => Some(bool_literal(left_value > right_value)),
+            BinaryOp::GreaterEqual => Some(bool_literal(left_value >= right_value)),
+            BinaryOp::Divide | BinaryOp::Remainder | BinaryOp::And | BinaryOp::Or => None,
+        };
+        if let Some(expr) = folded {
+            return Some(expr);
+        }
+    }
+    if let (Some(left_value), Some(right_value)) =
+        (bool_literal_value(left), bool_literal_value(right))
+    {
+        let folded = match op {
+            BinaryOp::And => Some(bool_literal(left_value && right_value)),
+            BinaryOp::Or => Some(bool_literal(left_value || right_value)),
+            BinaryOp::Equal => Some(bool_literal(left_value == right_value)),
+            BinaryOp::NotEqual => Some(bool_literal(left_value != right_value)),
+            _ => None,
+        };
+        if let Some(expr) = folded {
+            return Some(expr);
+        }
+    }
+    None
+}
+
+fn remove_unreachable_blocks(function: &mut IrFunction) {
+    let Some(entry) = function.blocks.first().map(|block| block.id) else {
+        return;
+    };
+    let mut index_by_id = HashMap::new();
+    for (index, block) in function.blocks.iter().enumerate() {
+        index_by_id.insert(block.id, index);
+    }
+    let mut stack = vec![entry];
+    let mut reachable = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        let Some(&index) = index_by_id.get(&id) else {
+            continue;
+        };
+        for target in terminator_successors(
+            &function.blocks[index].terminator,
+            function.blocks.get(index + 1).map(|block| block.id),
+        ) {
+            stack.push(target);
+        }
+    }
+    function
+        .blocks
+        .retain(|block| reachable.contains(&block.id));
+}
+
+fn terminator_successors(terminator: &IrTerminator, next: Option<BlockId>) -> Vec<BlockId> {
+    match terminator {
+        IrTerminator::Next => next.into_iter().collect(),
+        IrTerminator::Jump(target) | IrTerminator::JumpErr { target, .. } => vec![*target],
+        IrTerminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+        IrTerminator::ForEach {
+            body_block,
+            after_block,
+            ..
+        }
+        | IrTerminator::ResultBranch {
+            ok_block: body_block,
+            err_block: after_block,
+            ..
+        } => vec![*body_block, *after_block],
+        IrTerminator::PropagateErr(_) | IrTerminator::Return(_) | IrTerminator::Unreachable => {
+            Vec::new()
+        }
+    }
+}
+
+fn int_literal(value: i64) -> IrExpr {
+    IrExpr {
+        kind: IrExprKind::Literal(value.to_string()),
+        ty: IrType::Int,
+    }
+}
+
+fn int_literal_value(expr: &IrExpr) -> Option<i64> {
+    if expr.ty != IrType::Int {
+        return None;
+    }
+    let IrExprKind::Literal(value) = &expr.kind else {
+        return None;
+    };
+    value.parse().ok()
+}
+
+fn bool_literal_value(expr: &IrExpr) -> Option<bool> {
+    if expr.ty != IrType::Bool {
+        return None;
+    }
+    let IrExprKind::Literal(value) = &expr.kind else {
+        return None;
+    };
+    match value.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 impl fmt::Display for IrProgram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if !self.layouts.structs.is_empty() || !self.layouts.enums.is_empty() {

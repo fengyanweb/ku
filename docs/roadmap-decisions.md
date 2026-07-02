@@ -1,48 +1,71 @@
 # Ku 待决策问题
 
-这份文档只放仍需要你决定、或已经决定但必须集中追踪的大方向。已经完成并固定的语法/API 写入 `docs/syntax.md`，不在这里重复堆文档。
+这份文档只保留需要你决定的问题。已经决定并进入执行队列的内容，不再重复堆在这里；已固定语法/API 写入 `docs/syntax.md`，package/registry 写入 `docs/package.md`，IR 优化写入 `docs/ir.md`。
 
 ## 当前需要你决定
 
-暂无。
+### 1. 函数类型语法采用哪一种
 
-本轮已完成的固定语法/API 和示例已写入 `docs/syntax.md`、`README.md` 与 `docs/v0.0.15.md`；这里不再重复堆清单。
+native closure 第一阶段要做“无捕获同步函数值 + 精确间接调用”，需要有可写、可诊断的函数签名类型。需要确定用户层语法。
 
-## 已决定的语言方向
+可选方向：
 
-这些是后续设计和实现必须遵守的产品/技术取向，不需要再反复确认：
+- 建议方案：`fn(int, int): int` 表示函数类型。优点是和普通 `fn` 声明一致，和箭头函数表达式不冲突。
+- 备选：`(int, int) => int` 表示函数类型。优点是贴近箭头函数，但 parser 要额外区分类型位置和表达式位置。
 
-1. 语法简单参考 Go，严格规则参考 Rust，低资源和 native 布局参考 Zig / C，native 内存模型参考 Rust / C++。
-2. HTTP server 默认并发，但用户不需要手写线程、不调度 task、不管理 runtime；async runtime 参考 Go / Tokio 的协作调度思路。
-3. 错误提示参考 Rust / Elm；错误结果默认结构化 `Result`。
-4. 包管理参考 Cargo / npm lock，但 fail-closed，签名、lockfile 和缓存一致性要更严格。
-5. 数据处理性能目标参考 Rust / C++，工具链体验参考 Go。
-6. `struct` / `enum` / `array` 必须走 native layout；`object` 只用于动态数据和 JSON。
-7. 默认 move，显式 `clone`，自动 drop；不支持的 native 能力必须明确报错。
-8. benchmark 固定覆盖 loop / array / string / JSON / HTTP / memory。
-9. `http.service` / `http.server` 只允许函数调用形式，不保留属性式默认对象兼容。
-10. 对象解构赋值按 JS 风格固定：字段同名、重命名、default、rest；解释器/checker 先闭环，native dynamic object ABI 后续再 lowering。
+影响范围：parser、checker、IR `FunctionPtr(params, return)`、C/LLVM 间接调用、native closure 第一阶段拒绝捕获时的错误提示。
 
-## 已决定但仍在执行队列
+### 2. registry 官方根公钥与自定义 registry 信任配置格式
 
-下面内容已经由你选择，不需要再次拍板；只是工作量较大，后续按顺序实施。
+当前已实现 Ed25519 detached signature verifier，但还没有 CLI 可用的根公钥配置。需要确定信任根写在哪里。
 
-1. native closure ABI：小范围 RC env、Owned 函数值、共享绑定捕获；先做无捕获同步函数值和精确间接调用，再做 Copy 捕获，最后做 Owned 捕获。
-2. native `KuString`：正式 UTF-8 `{ ptr, len, capacity, storage }` ABI，字面量 static、运行时结果 owned，`clone()` 深拷贝，move 清空源，drop 只释放 owned。
-3. native dynamic object：开放寻址 hash table、Owned move/clone/drop、严格缺键错误、`object.get_or` 后续补。
-4. registry fail-closed：Ed25519 detached signature、内置官方根公钥、自定义 registry 显式公钥、key rotation/revocation、受限 `.tar.zst` 解包、manifest/index/lockfile 一致性校验。
-5. 真实项目验证：用两个真实 Ku 项目验证 native C / LLVM；LLVM 只按真实项目需要继续扩展。
-6. native async：等 native ABI 稳定后单独设计状态机 runtime，不使用 OS 线程冒充小协程；用户侧仍只保留“async fn 返回一次性 task + await task”模型，不开放 `task.spawn`、`Task.new`、`runtime.schedule` 或 `thread.spawn`。
-7. 最终 native binary build：在解释器打包型 `ku build` 稳定后，继续做完整 import graph 打包、runtime ABI lowering、object file/linker、增量 cache，并满足生成物不依赖 Ku 源码文件的验收标准。
-8. 严格检查未使用 import；未使用变量/常量也进入 error 方向，但要先设计 `_` 丢弃、测试/示例豁免和跨文件导出影响。
-9. `.clone()` / 深拷贝实现细则：Copy clone 消除；Owned 的 `str/array/object/struct/enum/Result/function` 显式 clone；Task 禁 clone；native 需要失败清理路径和 clone/drop 优化。
-10. IR 优化管线至少覆盖：常量折叠、死代码删除、简单函数内联、临时变量消除、drop 消除、clone 消除、escape analysis、stack allocation、monomorphization 泛型特化和 bounds check 优化。
+可选方向：
 
-## 下阶段建议顺序
+- 建议方案：内置官方 registry 根公钥，同时允许 `ku.mod` 或用户配置显式写自定义 registry 公钥。优点是官方源易用，自定义源显式可信。
+- 备选：完全不内置公钥，所有 registry 都必须在项目或用户配置里写公钥。优点是更透明，但新手体验更重。
 
-1. 先补 native closure 第一阶段：函数类型解析/检查、无捕获函数值 lowering、间接调用、递归深度守卫测试。
-2. 再替换 native `const char*` 原型为正式 `KuString`。
-3. 再做 native dynamic object 和 `object.get_or`。
-4. 再做 registry 签名验证与受限 `.tar.zst` 解包。
-5. 再做未使用 import/变量检查。
-6. 再接入 IR 优化 pass，先做常量折叠、死代码删除和 bounds check 优化，再推进 clone/drop/escape/stack/monomorphization。
+需要一并决定：公钥编码使用 hex 还是 base64；key id 格式；key rotation/revocation 是写进 signed index，还是单独 signed roots 文件。
+
+### 3. package 归档格式和受限解包规则
+
+远程 registry 下载后还需要受限解包。用户已倾向 `.tar.zst`，但需要确定文件布局和禁止项。
+
+可选方向：
+
+- 建议方案：`.tar.zst`，归档根目录必须包含 `ku.mod`，源码只能在 package root 内；拒绝绝对路径、`..`、Windows drive prefix、symlink/hardlink、设备文件、超限文件数和超限总大小。
+- 备选：先只支持 `.tar.gz`。优点是生态工具更常见，但压缩率和长期目标不如 zstd。
+
+需要确认：最大归档大小、最大解包后总字节数、最大文件数、是否允许 README/LICENSE 这类非源码文件。
+
+### 4. unused import / unused variable 何时默认变成 error
+
+当前 `ku check --deny-unused` 已做本文件局部变量/常量第一阶段，`_` / `_name` 表示有意丢弃；函数参数和 import 暂未默认进入 error。
+
+可选方向：
+
+- 建议方案：先保持显式 `--deny-unused`，等 import-origin、示例/测试豁免和跨文件导出影响闭环后，再升级为默认 error。
+- 备选：0.0.16 直接默认 error。优点是严格，但会更容易打断现有示例和用户迁移。
+
+需要确认：HTTP handler 未使用的 `req/res` 是否允许 `_req/_res`；测试/示例是否也必须完全零 unused。
+
+### 5. `object.get_or` API 形状
+
+对象默认严格缺键，宽松读取必须显式写出来。`object.get_or` 是后续补充 API，需要确定调用形式。
+
+可选方向：
+
+- 建议方案：`object.get_or(obj, "key", default)` 和实例方法 `obj.get_or("key", default)` 都支持；缺键返回 default，存在则返回值。
+- 备选：只支持函数式 `object.get_or(obj, key, default)`。优点是实现简单，缺点是和 `array.len` / 实例方法体验不完全一致。
+
+需要确认：default 是立即求值，还是缺键时才惰性求值。
+
+### 6. 最终 native binary 的第一批目标平台
+
+`ku build` 当前是解释器打包型二进制；最终 native binary 需要 import graph 打包、runtime ABI lowering、object file/linker 和 cache。需要先定第一批目标平台。
+
+可选方向：
+
+- 建议方案：先支持当前 host 平台 + `x86_64-windows`，再补 `x86_64-linux` 和 `aarch64-darwin`。
+- 备选：一开始就做 Go 式多平台 target matrix。优点是目标清晰，代价是 linker/runtime matrix 过早变大。
+
+需要确认：第一阶段是否允许依赖系统 C compiler/linker，还是必须直接生成 object 并自己驱动 linker。

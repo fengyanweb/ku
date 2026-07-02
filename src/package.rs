@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -69,6 +70,43 @@ pub struct RegistryIndex {
 
 pub trait RegistryIndexVerifier {
     fn verify(&self, index_url: &str, index_bytes: &[u8], span: Span) -> KuResult<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ed25519RegistryIndexVerifier {
+    pub public_key: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl Ed25519RegistryIndexVerifier {
+    pub fn new(public_key: [u8; 32], signature: [u8; 64]) -> Self {
+        Self {
+            public_key,
+            signature,
+        }
+    }
+}
+
+impl RegistryIndexVerifier for Ed25519RegistryIndexVerifier {
+    fn verify(&self, index_url: &str, index_bytes: &[u8], span: Span) -> KuResult<()> {
+        let public_key = VerifyingKey::from_bytes(&self.public_key).map_err(|_| {
+            KuError::package(
+                "invalid_registry_public_key",
+                format!("registry index '{index_url}' has an invalid Ed25519 public key"),
+                span,
+            )
+        })?;
+        let signature = Signature::from_bytes(&self.signature);
+        public_key.verify(index_bytes, &signature).map_err(|_| {
+            KuError::package(
+                "registry_signature_mismatch",
+                format!(
+                    "registry index '{index_url}' failed Ed25519 detached signature verification"
+                ),
+                span,
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,6 +428,15 @@ pub(crate) fn resolve_dependency_import(
                 span,
             )
         })?;
+    if dependency.source.is_none() {
+        return Err(KuError::package(
+            "registry_trust_unconfigured",
+            format!(
+                "dependency '{name}' has no trusted source configured; package dependency imports require an explicit file:// source in this stage"
+            ),
+            span,
+        ));
+    }
     reject_unsafe_dependency_import(relative, span)?;
     let root = dependency_cache_root(package, dependency).join(dependency.root());
     let mut path = root.join(relative);

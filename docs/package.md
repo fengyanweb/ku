@@ -1,6 +1,6 @@
 # Ku Package Draft
 
-0.0.7 固定最小 package 草案，0.0.11 增加 `file://` dependency、checksum、`ku.lock` package dependency 记录和 cache GC。0.0.12 补齐 HTTPS registry 请求、SHA-256 执行和内容寻址 cache；0.0.13 增加 `ku build` 入口字段 `main` 和输出字段 `out`；0.0.14 增加 `ku create` / `ku init` 模板入口和 `template` / `type` manifest 字段。生产 CLI 仍在签名与归档协议确定前保持 fail-closed。
+0.0.7 固定最小 package 草案，0.0.11 增加 `file://` dependency、checksum、`ku.lock` package dependency 记录和 cache GC。0.0.12 补齐 HTTPS registry 请求、SHA-256 执行和内容寻址 cache；0.0.13 增加 `ku build` 入口字段 `main` 和输出字段 `out`；0.0.14 增加 `ku create` / `ku init` 模板入口和 `template` / `type` manifest 字段。当前已提供 Ed25519 detached signature verifier，但生产 CLI 在根公钥、轮换/吊销和归档协议完全固定前仍保持 fail-closed。
 
 ## ku.mod
 
@@ -33,7 +33,7 @@ dep.util.checksum = "ku-fnv64-..."
 | `template` | 否 | `ku create/init` 生成项目时使用的模板名 |
 | `type` | 否 | package 类型，当前 `lib` 只表示库模板意图 |
 | `dep.<name>` | 否 | 依赖版本；resolver 支持精确 `1.2.3` 和 caret `^1.2.3`，`~` 暂不进入求解 |
-| `dep.<name>.source` | 否 | 当前只支持 `file://` 目录 source |
+| `dep.<name>.source` | 否 | 当前只支持 `file://` 目录 source；如果 import `@name/...` 时未配置 source，会按 fail-closed 报错，不能读取旧 cache |
 | `dep.<name>.checksum` | 否 | 依赖目录稳定 hash，格式为 `ku-fnv64-` 加 16 位十六进制 |
 
 `ku.mod` 只接受 `key = "value"`，`#` 后面是注释。
@@ -175,11 +175,11 @@ registry 网络执行层已经实现：
 - 不对 checksum mismatch、manifest/schema 错误或确定性 4xx 重试；只对明确瞬时错误执行有限退避。
 - Windows 路径检查拒绝 drive prefix、根路径和 `..`，dependency import canonicalize 后必须仍在依赖根内。
 
-当前尚未把该执行层接入 `ku check/run` 的远程 import。原因不是下载能力缺失，而是必须先确定 registry index 签名信任根、归档格式和受限解包规则。未配置 verifier 时返回 `package/registry_trust_unconfigured`，不能传 no-op 信任进入正式 CLI。
+当前尚未把该执行层接入 `ku check/run` 的远程 import。原因不是下载能力缺失，而是必须先确定 registry index 签名信任根、key rotation/revocation、归档格式和受限解包规则。未配置 verifier 时返回 `package/registry_trust_unconfigured`，不能传 no-op 信任进入正式 CLI。`Ed25519RegistryIndexVerifier` 已能验证 registry index 的 detached signature；签名覆盖 exact index bytes，篡改 index 会返回 `package/registry_signature_mismatch`。
 
 ## 暂不支持
 
-- registry index 签名算法的正式实现和信任根配置
+- 内置官方根公钥、自定义 registry 公钥配置、key rotation/revocation
 - package 归档格式、受限解包和解包后 manifest 复核
 - CLI resolver/download/cache/import 全链路启用
 - 包发布者签名

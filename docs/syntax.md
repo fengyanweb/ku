@@ -1784,7 +1784,7 @@ checksum = "sha256-<64 hex digits>"
 
 registry lock 使用一个或多个 `[[package]]`，要求 `name/version/source/url/checksum/cache_key` 齐全；`source` 必须是 `registry`，版本必须是 `major.minor.patch`，checksum 必须是 `sha256-` 加 64 位十六进制。`cache_key` 必须由 name、精确版本和完整 SHA-256 确定，不能自行填写任意值。
 
-resolver 支持精确版本 `1.2.3` 和 caret 范围 `^1.2.3`。同名依赖的全部约束会合并，选择满足全部约束的最高可用版本；没有共同版本时返回 `package/dependency_conflict`，不做无限回溯或 SAT 搜索。远程请求最多 8 次，连接/读取超时均有上限，单包最多 100 MB；只对明确瞬时错误有限退避。下载 staging 与 GC 隔离，SHA-256 通过后安装到不可覆盖的内容寻址 cache；并发安装锁和旧锁恢复均有界。
+resolver 支持精确版本 `1.2.3` 和 caret 范围 `^1.2.3`。同名依赖的全部约束会合并，选择满足全部约束的最高可用版本；没有共同版本时返回 `package/dependency_conflict`，不做无限回溯或 SAT 搜索。远程请求最多 8 次，连接/读取超时均有上限，单包最多 100 MB；只对明确瞬时错误有限退避。下载 staging 与 GC 隔离，SHA-256 通过后安装到不可覆盖的内容寻址 cache；并发安装锁和旧锁恢复均有界。当前已实现 `Ed25519RegistryIndexVerifier`，可验证 registry index 的 detached signature；未配置 verifier、缺少 dependency source 或签名不匹配都会 fail-closed，不会读取旧 cache 绕过信任边界。内置官方根公钥、自定义 registry 公钥配置、key rotation/revocation 和受限 `.tar.zst` 解包仍在后续队列。
 
 ## 16. CLI 相关语法
 
@@ -1802,8 +1802,9 @@ ku run
 ku run <file.ku>
 ku check
 ku check <file.ku>
+ku check --deny-unused [file.ku]
 ku check --json
-ku check --json <file.ku>
+ku check --json [--deny-unused] <file.ku>
 ku ir <file.ku>
 ku llvm <file.ku>
 ku build [file.ku]
@@ -1866,6 +1867,8 @@ level code message file line column endLine endColumn notes helps
 ```
 
 VS Code 扩展优先读取 JSON diagnostics；面对旧版 Ku CLI 时只回退一次文本解析，不循环重试。
+
+`ku check --deny-unused` 是严格 unused 检查第一阶段：本文件局部变量/常量如果声明后没有被读取，会报 `E0905`；用 `_` 或 `_name` 表示明确丢弃。函数参数暂不纳入错误，避免破坏 HTTP handler `(req, res)` 形状。未使用 import 还未默认开启，因为 import expansion 需要先保留 import-origin，避免跨文件导出和 std namespace 误判。
 
 `ku llvm file.ku` 在源文件旁输出 `.ll`，不要求本机安装 LLVM。当前文本后端支持 `int/bool/str`、普通函数、局部变量、直接调用、`return`、`if/while`、`print`、非递归 struct 值与字段读写，以及 `Result<int|bool|str|struct>` 的 `ok`、`fail`、`?` 和错误传播。数组、enum、闭包、HTTP 和 async 仍会明确报不支持。后端会拒绝递归值 struct、缺失/重复 CFG block 和无条件自跳，避免生成明显错误或永久循环的 `.ll`。golden test 不依赖外部工具；检测到 `llvm-as` 时会额外验证生成文本。
 
@@ -1948,7 +1951,7 @@ native C 当前仍是 prototype，但同步所有权和错误流已闭环：Copy
 - `Task<T>` 不允许 clone；`await task` 消费 task，普通 task 只能 await 一次。
 - 优化方向包括 Copy clone 消除、源值随后不再使用时的 clone-to-move、临时 clone 消除、return clone-to-move、static string clone 零分配、struct clone inline、array/object 预分配，以及不需要的 drop/clone 消除。
 
-native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、错误和 return 都经过对应 finally block。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。递归值 struct/enum、native closure、动态 object ABI 和 async native lowering仍明确拒绝。native `str` 暂时仍使用只读 C 字符串原型，正式 owned `KuString` ABI 已进入执行队列。
+native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、错误和 return 都经过对应 finally block。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。递归值 struct/enum、native closure、动态 object ABI 和 async native lowering仍明确拒绝。native `str` 暂时仍使用只读 C 字符串原型，正式 owned `KuString` ABI 已进入执行队列；在 KuString lowering 完成前，native C 会明确拒绝字符串拼接，不生成 `const char* + const char*` 这类错误 C。
 
 ## 17. 资源保护
 
@@ -2002,7 +2005,7 @@ CPU time: 2312 ms
 LLVM 数组、enum、闭包、HTTP、async lowering
 LLVM 递归 struct 和更复杂 Result payload
 完整 native C 后端
-registry 签名信任根、归档格式、受限解包和 CLI 远程 import 串联
+registry 根公钥配置、key rotation/revocation、归档格式、受限解包和 CLI 远程 import 串联
 native closure ABI、captured env 和函数类型语法
 native owned string 与动态 object ABI
 match guard 模式矩阵和跨 guard 的完整穷尽性检查

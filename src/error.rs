@@ -240,6 +240,11 @@ impl KuError {
                 .note("Ku does not expose task.spawn, Task.new, or user-level task scheduling")
                 .help("start work by calling an async fn, then use `result = await task?`");
         }
+        if message.contains("unused local binding") {
+            return DiagnosticInfo::new("E0905")
+                .note("strict unused checks are enabled by `ku check --deny-unused`")
+                .help("remove the binding, use it, or rename it with a leading `_` when it is intentionally unused");
+        }
         if message.contains("std module member 'http.service'")
             || message.contains("std module member 'http.server'")
         {

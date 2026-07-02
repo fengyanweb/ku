@@ -41,8 +41,10 @@ Usage:
   ku run <file.ku>      Run a Ku source file
   ku check              Check the nearest ku.mod package entry
   ku check <file.ku>    Check a Ku source file without running it
+  ku check --deny-unused [file.ku]
+                        Treat unused local bindings as errors
   ku check --json       Check nearest ku.mod package and emit JSON Lines diagnostics
-  ku check --json <file.ku>
+  ku check --json [--deny-unused] <file.ku>
                         Check and emit JSON Lines diagnostics
   ku ir <file.ku>       Print checked Ku IR draft
   ku llvm <file.ku>     Emit prototype LLVM text IR
@@ -104,37 +106,13 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
             let (path, source) = source_arg_or_project(&args, "run")?;
             run_source(&path_string(&path), &source)
         }
-        Some("check") => {
-            if args.get(2).is_some_and(|arg| arg == "--json") {
-                let (path, source) = if args.len() == 3 {
-                    project_entry_source("check --json")?
-                } else {
-                    let path = exact_path_at(&args, "check --json", 3)?;
-                    let path = PathBuf::from(path);
-                    let source = read_ku_path(&path).map_err(|err| {
-                        KuError::message(diagnostic_json_line(&err, &path_string(&path), ""))
-                    })?;
-                    (path, source)
-                };
-                let path_text = path_string(&path);
-                parse_and_check(&path_text, &source)
-                    .map(|_| ())
-                    .map_err(|err| {
-                        KuError::message(diagnostic_json_line(&err, &path_text, &source))
-                    })
-            } else {
-                let (path, source) = source_arg_or_project(&args, "check")?;
-                let path_text = path_string(&path);
-                check_source(&path_text, &source)?;
-                println!("check ok: {path_text}");
-                Ok(())
-            }
-        }
+        Some("check") => run_check_command(&args),
         Some("ir") => {
             let path = exact_path(&args, "ir")?;
             let source = read_ku_file(path)?;
             let program = parse_and_check(path, &source)?;
-            print!("{}", ir::lower_program(&program)?);
+            let lowered = ir::lower_program(&program)?;
+            print!("{}", ir::optimize_program(&lowered));
             Ok(())
         }
         Some("llvm") => {
@@ -199,6 +177,57 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
 
 pub fn help_text() -> &'static str {
     HELP
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CheckOptions {
+    deny_unused: bool,
+}
+
+fn run_check_command(args: &[String]) -> Result<(), KuError> {
+    let mut json = false;
+    let mut options = CheckOptions::default();
+    let mut path = None::<String>;
+    for arg in args.iter().skip(2) {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--deny-unused" => options.deny_unused = true,
+            value if value.starts_with('-') => {
+                return Err(command_error(format!("unknown check option '{value}'")));
+            }
+            value => {
+                if path.is_some() {
+                    return Err(command_error("too many arguments for 'ku check'"));
+                }
+                path = Some(value.to_string());
+            }
+        }
+    }
+
+    let (path, source) = match path {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            let source = read_ku_path(&path).map_err(|err| {
+                if json {
+                    KuError::message(diagnostic_json_line(&err, &path_string(&path), ""))
+                } else {
+                    err
+                }
+            })?;
+            (path, source)
+        }
+        None => project_entry_source(if json { "check --json" } else { "check" })?,
+    };
+    let path_text = path_string(&path);
+    if json {
+        parse_and_check_with_options(&path_text, &source, options)
+            .map(|_| ())
+            .map_err(|err| KuError::message(diagnostic_json_line(&err, &path_text, &source)))
+    } else {
+        check_source_with_options(&path_text, &source, options)?;
+        println!("check ok: {path_text}");
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1010,7 +1039,8 @@ fn write_checked_ir_artifact(plan: &BuildPlan) -> Result<PathBuf, KuError> {
     let entry = path_string(&plan.entry);
     let program = parse_and_check(&entry, &plan.source)?;
     let output = plan.build_dir.join("ir").join("main.ir");
-    write_text_artifact(&output, format!("{}", ir::lower_program(&program)?))
+    let lowered = ir::lower_program(&program)?;
+    write_text_artifact(&output, format!("{}", ir::optimize_program(&lowered)))
 }
 
 fn write_native_c_artifact(plan: &BuildPlan) -> Result<PathBuf, KuError> {
@@ -1148,8 +1178,9 @@ fn write_native_c_to(path: &str, source: &str, output: &Path) -> Result<PathBuf,
     let program = parse_and_expand(path, source)?;
     reject_native_async(&program)?;
     Checker::new().check(&program)?;
-    let ir = ir::lower_program(&program)?;
-    let c_source = backend::c::generate_c_source(&ir)?;
+    let lowered = ir::lower_program(&program)?;
+    let optimized = ir::optimize_program(&lowered);
+    let c_source = backend::c::generate_c_source(&optimized)?;
     write_text_artifact(output, c_source)
 }
 
@@ -1165,8 +1196,9 @@ fn write_llvm_ir_to(path: &str, source: &str, output: &Path) -> Result<PathBuf, 
         "LLVM text prototype does not support async/await yet; use the interpreter runtime",
     )?;
     Checker::new().check(&program)?;
-    let ir = ir::lower_program(&program)?;
-    let llvm_ir = backend::llvm::generate_llvm_ir(&ir)?;
+    let lowered = ir::lower_program(&program)?;
+    let optimized = ir::optimize_program(&lowered);
+    let llvm_ir = backend::llvm::generate_llvm_ir(&optimized)?;
     write_text_artifact(output, llvm_ir)
 }
 
@@ -1543,14 +1575,27 @@ fn looks_like_file_path(path: &str) -> bool {
 }
 
 pub fn check_source(file: &str, source: &str) -> Result<(), KuError> {
-    parse_and_check(file, source)
+    check_source_with_options(file, source, CheckOptions::default())
+}
+
+fn check_source_with_options(
+    file: &str,
+    source: &str,
+    options: CheckOptions,
+) -> Result<(), KuError> {
+    parse_and_check_with_options(file, source, options)
         .map(|_| ())
         .map_err(|err| KuError::message(err.diagnostic(file, source)))
 }
 
-pub fn run_source(file: &str, source: &str) -> Result<(), KuError> {
+fn checked_program(file: &str, source: &str) -> Result<Program, KuError> {
     let program = parse_and_check(file, source)
         .map_err(|err| KuError::message(err.diagnostic(file, source)))?;
+    Ok(program)
+}
+
+pub fn run_source(file: &str, source: &str) -> Result<(), KuError> {
+    let program = checked_program(file, source)?;
     run_program_with_stack(program, source_base_dir(file))
         .map_err(|err| KuError::message(err.diagnostic(file, source)))
 }
@@ -1582,9 +1627,441 @@ fn parse_source(source: &str) -> Result<Program, KuError> {
 }
 
 fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
+    parse_and_check_with_options(file, source, CheckOptions::default())
+}
+
+fn parse_and_check_with_options(
+    file: &str,
+    source: &str,
+    options: CheckOptions,
+) -> Result<Program, KuError> {
     let program = parse_and_expand(file, source)?;
     Checker::new().check(&program)?;
+    if options.deny_unused {
+        deny_unused_local_bindings(&program)?;
+    }
     Ok(program)
+}
+
+#[derive(Debug, Clone)]
+struct UnusedBinding {
+    name: String,
+    span: Span,
+    used: bool,
+}
+
+#[derive(Debug, Default)]
+struct UnusedScope {
+    bindings: Vec<UnusedBinding>,
+}
+
+#[derive(Debug, Default)]
+struct UnusedAnalyzer {
+    scopes: Vec<UnusedScope>,
+}
+
+impl UnusedAnalyzer {
+    fn new() -> Self {
+        Self {
+            scopes: vec![UnusedScope::default()],
+        }
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(UnusedScope::default());
+    }
+
+    fn pop_scope(&mut self) -> KuResult<()> {
+        let Some(scope) = self.scopes.pop() else {
+            return Ok(());
+        };
+        for binding in scope.bindings {
+            if !binding.used {
+                return Err(unused_binding_error(&binding.name, binding.span));
+            }
+        }
+        Ok(())
+    }
+
+    fn define(&mut self, name: &str, span: Span, track: bool) {
+        if name == "_" || name.starts_with('_') {
+            return;
+        }
+        let used = !track;
+        if let Some(scope) = self.scopes.last_mut() {
+            if let Some(existing) = scope
+                .bindings
+                .iter_mut()
+                .find(|binding| binding.name == name)
+            {
+                existing.span = span;
+                existing.used = used;
+            } else {
+                scope.bindings.push(UnusedBinding {
+                    name: name.to_string(),
+                    span,
+                    used,
+                });
+            }
+        }
+    }
+
+    fn binding_exists(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.bindings.iter().any(|binding| binding.name == name))
+    }
+
+    fn use_name(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(binding) = scope
+                .bindings
+                .iter_mut()
+                .rev()
+                .find(|binding| binding.name == name)
+            {
+                binding.used = true;
+                return;
+            }
+        }
+    }
+
+    fn write_name(&mut self, name: &str, span: Span) {
+        if name == "_" || name.starts_with('_') {
+            return;
+        }
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(binding) = scope
+                .bindings
+                .iter_mut()
+                .rev()
+                .find(|binding| binding.name == name)
+            {
+                binding.span = span;
+                binding.used = false;
+                return;
+            }
+        }
+        self.define(name, span, true);
+    }
+
+    fn finish(mut self) -> KuResult<()> {
+        while !self.scopes.is_empty() {
+            self.pop_scope()?;
+        }
+        Ok(())
+    }
+
+    fn visit_items(&mut self, items: &[Item]) -> KuResult<()> {
+        for item in items {
+            if let Item::Function(function) = item {
+                self.visit_function(function, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_function(&mut self, function: &FnDecl, track_name: bool) -> KuResult<()> {
+        if track_name {
+            self.define(&function.name, function.span, true);
+        }
+        self.push_scope();
+        if track_name {
+            self.define(&function.name, function.span, false);
+        }
+        for param in &function.params {
+            self.define(&param.name, param.span, false);
+        }
+        self.visit_block(&function.body)?;
+        self.pop_scope()
+    }
+
+    fn visit_block(&mut self, body: &[Stmt]) -> KuResult<()> {
+        for stmt in body {
+            self.visit_stmt(stmt)?;
+        }
+        Ok(())
+    }
+
+    fn visit_scoped_block(&mut self, body: &[Stmt]) -> KuResult<()> {
+        self.push_scope();
+        self.visit_block(body)?;
+        self.pop_scope()
+    }
+
+    fn visit_stmt(&mut self, stmt: &Stmt) -> KuResult<()> {
+        match stmt {
+            Stmt::VarDecl {
+                name, value, span, ..
+            } => {
+                self.visit_expr(value)?;
+                self.define(name, *span, true);
+            }
+            Stmt::Assign { name, value, span } => {
+                self.visit_expr(value)?;
+                if self.binding_exists(name) {
+                    self.write_name(name, *span);
+                } else {
+                    self.define(name, *span, true);
+                }
+            }
+            Stmt::AssignTarget { target, value, .. } => {
+                self.visit_assign_target(target)?;
+                self.visit_expr(value)?;
+            }
+            Stmt::CompoundAssign { target, value, .. } => {
+                self.visit_assign_target(target)?;
+                self.visit_expr(value)?;
+            }
+            Stmt::DestructureAssign {
+                names,
+                values,
+                span,
+            } => {
+                for value in values {
+                    self.visit_expr(value)?;
+                }
+                for name in names.iter().flatten() {
+                    self.define(name, *span, true);
+                }
+            }
+            Stmt::ObjectDestructureAssign {
+                bindings,
+                rest,
+                value,
+                ..
+            } => {
+                self.visit_expr(value)?;
+                for binding in bindings {
+                    if let Some(default) = &binding.default {
+                        self.visit_expr(default)?;
+                    }
+                    let local = binding.local.as_deref().unwrap_or(&binding.field);
+                    self.define(local, binding.span, true);
+                }
+                if let Some(rest) = rest {
+                    if let Some(local) = &rest.local {
+                        self.define(local, rest.span, true);
+                    }
+                }
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.visit_expr(condition)?;
+                self.visit_scoped_block(then_branch)?;
+                if !else_branch.is_empty() {
+                    self.visit_scoped_block(else_branch)?;
+                }
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                self.visit_expr(condition)?;
+                self.visit_scoped_block(body)?;
+            }
+            Stmt::For {
+                name,
+                iterable,
+                body,
+                span,
+            } => {
+                self.visit_expr(iterable)?;
+                self.push_scope();
+                self.define(name, *span, true);
+                self.visit_block(body)?;
+                self.pop_scope()?;
+            }
+            Stmt::Function(function) => {
+                self.visit_function(function, true)?;
+            }
+            Stmt::Try {
+                body,
+                catch_name,
+                catch_body,
+                finally_body,
+                span,
+            } => {
+                self.visit_scoped_block(body)?;
+                if !catch_body.is_empty() {
+                    self.push_scope();
+                    if let Some(catch_name) = catch_name {
+                        self.define(catch_name, *span, true);
+                    }
+                    self.visit_block(catch_body)?;
+                    self.pop_scope()?;
+                }
+                if !finally_body.is_empty() {
+                    self.visit_scoped_block(finally_body)?;
+                }
+            }
+            Stmt::Fail { value, .. } | Stmt::Panic { value, .. } | Stmt::Print { value, .. } => {
+                self.visit_expr(value)?;
+            }
+            Stmt::Return { value, .. } => {
+                if let Some(value) = value {
+                    self.visit_expr(value)?;
+                }
+            }
+            Stmt::Expr { expr, .. } => {
+                self.visit_expr(expr)?;
+            }
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn visit_assign_target(&mut self, target: &AssignTarget) -> KuResult<()> {
+        match target {
+            AssignTarget::Variable(name) => self.use_name(name),
+            AssignTarget::Index { target, index } => {
+                self.visit_expr(target)?;
+                self.visit_expr(index)?;
+            }
+            AssignTarget::Field { target, .. } => {
+                self.visit_expr(target)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) -> KuResult<()> {
+        match &expr.kind {
+            ExprKind::Literal(Literal::TemplateString(text)) => {
+                self.visit_template_string(text, expr.span)?;
+            }
+            ExprKind::Literal(_) => {}
+            ExprKind::Variable(name) => self.use_name(name),
+            ExprKind::Unary { expr, .. } | ExprKind::Await(expr) | ExprKind::TryUnwrap { expr } => {
+                self.visit_expr(expr)?;
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.visit_expr(left)?;
+                self.visit_expr(right)?;
+            }
+            ExprKind::Call { callee, args } => {
+                self.visit_expr(callee)?;
+                for arg in args {
+                    self.visit_expr(arg)?;
+                }
+            }
+            ExprKind::Array(values) => {
+                for value in values {
+                    self.visit_expr(value)?;
+                }
+            }
+            ExprKind::Index { target, index } => {
+                self.visit_expr(target)?;
+                self.visit_expr(index)?;
+            }
+            ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+                self.visit_expr(target)?;
+            }
+            ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+                for (_, value) in fields {
+                    self.visit_expr(value)?;
+                }
+            }
+            ExprKind::Match { value, arms } => {
+                self.visit_expr(value)?;
+                for arm in arms {
+                    self.push_scope();
+                    self.define_match_pattern(&arm.pattern);
+                    if let Some(guard) = &arm.guard {
+                        self.visit_expr(guard)?;
+                    }
+                    self.visit_expr(&arm.value)?;
+                    self.pop_scope()?;
+                }
+            }
+            ExprKind::Function { params, body, .. } => {
+                self.push_scope();
+                for param in params {
+                    self.define(&param.name, param.span, false);
+                }
+                self.visit_block(body)?;
+                self.pop_scope()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_template_string(&mut self, text: &str, base_span: Span) -> KuResult<()> {
+        let mut chars = text.char_indices().peekable();
+        while let Some((_, ch)) = chars.next() {
+            if ch == '\\' {
+                let _ = chars.next();
+                continue;
+            }
+            if ch != '{' {
+                continue;
+            }
+            let mut expr = String::new();
+            let mut depth = 1usize;
+            let iter = chars.by_ref();
+            while let Some((_, inner)) = iter.next() {
+                match inner {
+                    '\\' => {
+                        expr.push(inner);
+                        if let Some((_, escaped)) = iter.next() {
+                            expr.push(escaped);
+                        }
+                    }
+                    '{' => {
+                        depth += 1;
+                        expr.push(inner);
+                    }
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                        expr.push(inner);
+                    }
+                    _ => expr.push(inner),
+                }
+            }
+            if depth == 0 && !expr.trim().is_empty() {
+                let parsed = Lexer::new(&expr)
+                    .tokenize()
+                    .and_then(|tokens| Parser::new(tokens).parse_expression_only())
+                    .map_err(|err| KuError::runtime(err.message, base_span))?;
+                self.visit_expr(&parsed)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn define_match_pattern(&mut self, pattern: &MatchPattern) {
+        match pattern {
+            MatchPattern::Binding(name) => self.define(name, Span::default(), true),
+            MatchPattern::EnumVariant { fields, .. } => {
+                for field in fields {
+                    self.define_match_pattern(field);
+                }
+            }
+            MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
+        }
+    }
+}
+
+fn deny_unused_local_bindings(program: &Program) -> KuResult<()> {
+    let mut analyzer = UnusedAnalyzer::new();
+    analyzer.visit_items(&program.items)?;
+    analyzer.finish()
+}
+
+fn unused_binding_error(name: &str, span: Span) -> KuError {
+    KuError::runtime(
+        format!(
+            "unused local binding '{name}'; remove it, use it, or rename it to '_{name}' when it is intentionally unused"
+        ),
+        span,
+    )
 }
 
 fn parse_and_expand(file: &str, source: &str) -> Result<Program, KuError> {

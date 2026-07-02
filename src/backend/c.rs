@@ -715,6 +715,13 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 if *op == BinaryOp::Equal { "==" } else { "!=" }
             ))
         }
+        IrExprKind::Binary { left, op, right }
+            if left.ty == IrType::Str && right.ty == IrType::Str && *op == BinaryOp::Add =>
+        {
+            Err(unsupported(
+                "native C prototype does not support string concatenation until KuString ABI is lowered",
+            ))
+        }
         IrExprKind::Binary { left, op, .. }
             if matches!(left.ty, IrType::Array(_))
                 && matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) =>

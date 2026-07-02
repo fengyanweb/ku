@@ -83,6 +83,7 @@ pub struct Checker {
     async_depth: usize,
     readonly_capture: Option<ReadonlyCapture>,
     std_modules: HashSet<String>,
+    function_value_inference_stack: Vec<(usize, usize, usize)>,
 }
 
 impl Checker {
@@ -100,6 +101,7 @@ impl Checker {
             async_depth: 0,
             readonly_capture: None,
             std_modules: HashSet::new(),
+            function_value_inference_stack: Vec::new(),
         }
     }
 
@@ -2676,6 +2678,14 @@ impl Checker {
         arg_types: &[Type],
         span: Span,
     ) -> KuResult<Type> {
+        let inference_key = function_body_key(body);
+        let guard_inference = return_type.is_none();
+        if guard_inference && self.function_value_inference_stack.contains(&inference_key) {
+            return Ok(Type::Unknown);
+        }
+        if guard_inference {
+            self.function_value_inference_stack.push(inference_key);
+        }
         let saved_return = self.current_return.clone();
         let saved_loop_depth = self.loop_depth;
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
@@ -2710,6 +2720,9 @@ impl Checker {
         self.pop_scope();
         self.current_return = saved_return;
         self.loop_depth = saved_loop_depth;
+        if guard_inference {
+            self.function_value_inference_stack.pop();
+        }
         result
     }
 
@@ -3495,6 +3508,20 @@ fn function_value_type(name: &str, function: &FunctionType, span: Span) -> KuRes
         body: function.body.clone(),
         is_async: function.is_async,
     })
+}
+
+fn function_body_key(body: &[Stmt]) -> (usize, usize, usize) {
+    let start = body
+        .first()
+        .map(stmt_span)
+        .map(|span| span.start.offset)
+        .unwrap_or(0);
+    let end = body
+        .last()
+        .map(stmt_span)
+        .map(|span| span.end.offset)
+        .unwrap_or(0);
+    (start, end, body.len())
 }
 
 fn can_template_concat(left: &Type, right: &Type) -> bool {

@@ -487,6 +487,112 @@ fn check_json_success_is_silent_and_rejects_extra_arguments() {
 }
 
 #[test]
+fn check_deny_unused_reports_local_bindings_with_help() {
+    let path = write_temp_ku(
+        "deny-unused-local.ku",
+        r#"
+fn main() {
+    used = 1
+    print(used)
+    unused = 2
+}
+"#,
+    );
+    let path_text = path_arg(&path);
+    let result = run_ku(&["check", "--deny-unused", &path_text]);
+    fs::remove_file(&path).ok();
+
+    assert_ne!(result.code, Some(0), "unused binding should fail");
+    assert!(
+        result.stderr.contains("unused local binding 'unused'"),
+        "missing unused error:\n{}",
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("rename it with a leading `_`"),
+        "missing help:\n{}",
+        result.stderr
+    );
+}
+
+#[test]
+fn check_deny_unused_json_and_discard_prefix_work() {
+    let ok_path = write_temp_ku(
+        "deny-unused-ok.ku",
+        r#"
+fn main() {
+    _ignored = 1
+    used = 2
+    print(`value {used}`)
+}
+"#,
+    );
+    let ok_text = path_arg(&ok_path);
+    let result = run_ku(&["check", "--deny-unused", &ok_text]);
+    fs::remove_file(&ok_path).ok();
+    assert_eq!(result.code, Some(0), "discard-prefixed binding should pass");
+
+    let err_path = write_temp_ku(
+        "deny-unused-json.ku",
+        r#"
+fn main() {
+    unused = 1
+}
+"#,
+    );
+    let err_text = path_arg(&err_path);
+    let result = run_ku(&["check", "--json", "--deny-unused", &err_text]);
+    fs::remove_file(&err_path).ok();
+
+    assert_ne!(result.code, Some(0), "unused JSON check should fail");
+    let line = result
+        .stderr
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("expected JSON diagnostic");
+    for field in [
+        "\"code\":\"E0905\"",
+        "unused local binding 'unused'",
+        "strict unused checks are enabled",
+        "rename it with a leading `_`",
+    ] {
+        assert!(
+            line.contains(field),
+            "missing {field} in JSON line:\n{line}"
+        );
+    }
+}
+
+#[test]
+fn check_deny_unused_does_not_count_reassignment_or_self_recursion_as_reads() {
+    let path = write_temp_ku(
+        "deny-unused-writes.ku",
+        r#"
+fn main() {
+    value = 1
+    value = 2
+
+    fn unused_fact(n: int): int {
+        if (n <= 1) return 1
+        return n * unused_fact(n - 1)
+    }
+}
+"#,
+    );
+    let path_text = path_arg(&path);
+    let result = run_ku(&["check", "--deny-unused", &path_text]);
+    fs::remove_file(&path).ok();
+
+    assert_ne!(result.code, Some(0), "unused writes should fail");
+    assert!(
+        result.stderr.contains("unused local binding 'value'")
+            || result.stderr.contains("unused local binding 'unused_fact'"),
+        "missing unused binding error:\n{}",
+        result.stderr
+    );
+}
+
+#[test]
 fn shorthand_file_path_runs_ku_file() {
     let path = path_arg(&repo_root().join("examples").join("hello.ku"));
     let result = run_ku(&[&path]);

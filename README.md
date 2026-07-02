@@ -45,8 +45,10 @@ ku run                Run the nearest ku.mod package entry
 ku run <file.ku>      Run a Ku source file
 ku check              Check the nearest ku.mod package entry
 ku check <file.ku>    Check a Ku source file without running
+ku check --deny-unused [file.ku]
+                      Treat unused local bindings as errors
 ku check --json       Check nearest ku.mod package and emit JSON Lines diagnostics
-ku check --json <file.ku>
+ku check --json [--deny-unused] <file.ku>
                       Check and emit JSON Lines diagnostics
 ku ir <file.ku>       Print checked Ku IR draft
 ku llvm <file.ku>     Emit prototype LLVM text IR
@@ -71,7 +73,7 @@ ku version            Print version
 ku -h | -help         Print help
 ```
 
-`ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
+`ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。`--deny-unused` 是严格 unused 第一阶段，会把未读取的本文件局部变量/常量报成 `E0905`；`_` 或 `_name` 表示有意丢弃。
 
 ## 0.0.15 支持的核心语法
 
@@ -252,7 +254,7 @@ http_bench.ps1
 
 注意：0.0.15 的默认 build 是“解释器打包型二进制”，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于最终 native ABI。带 import 的程序仍应保持源码依赖路径可访问。完整 native binary 目标仍在执行队列：native closure、正式 `KuString`、dynamic object、async state machine runtime、增量缓存和真正不依赖源码的 import graph 打包。
 
-`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally` 和 return-through-finally。array/named/Result 已按默认 move、显式 `clone()`、自动 drop 生成所有权代码；闭包、动态 object、正式 owned string 和 async native lowering 仍会明确报不支持。
+`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally` 和 return-through-finally。array/named/Result 已按默认 move、显式 `clone()`、自动 drop 生成所有权代码；闭包、动态 object、正式 owned string 和 async native lowering 仍会明确报不支持。在正式 `KuString` ABI 完成前，native C 会明确拒绝字符串拼接，避免生成错误的 `const char* + const char*`。
 
 已完成到 0.0.15 的关键前置：
 
@@ -274,7 +276,7 @@ http_bench.ps1
 IR 已有 ResultBranch / BindOk / JumpErr / PropagateErr。
 native C 后端已有统一 Error 对象 ABI、复杂 Result payload 和 try/catch/finally。
 package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
-registry 执行层已有 HTTPS-only 下载、SHA-256、内容寻址 cache 和有界安装锁；签名/归档决策前 CLI 保持 fail-closed。
+registry 执行层已有 HTTPS-only 下载、SHA-256、内容寻址 cache、有界安装锁和 Ed25519 detached signature verifier；根公钥/轮换/吊销/归档决策前 CLI 保持 fail-closed，未配置 dependency source 时不会读取旧 cache 绕过信任。
 async runtime 已有 blocking shutdown drain、累计指标和百万并发需求压力测试。
 仓库根目录提供 `test.ku` 和 `run-test.ps1`：前者通过 `std.task` 打印百万并发需求测试的前后时间与 runtime 指标，后者额外采集进程 CPU、峰值内存和线程数。
 `std.time` 已按第一版文档实现 Time/Date/Duration object、format/parse/date/datetime/duration/add/sub/diff/compare/parts/weekday/is_leap/days_in_month/sleep 和固定偏移 zone。
@@ -295,7 +297,7 @@ native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wr
 async fn 调用会立即启动一次性 task 句柄，必须显式返回 T!；await task? 等价于 (await task)?，并且 await 会消费 task，普通 task 只能 await 一次。
 Ku 不提供 task.spawn、Task.new、runtime.schedule 或 thread.spawn；HTTP server 内部可以使用 task，但 handler 用户不需要手动管理。
 async runtime 默认最多 1024 个 task；blocking worker 为 min(32, max(4, CPU 核心数))，blocking queue 最多 1024，超限返回结构化 task Err。
-registry resolver 支持精确版本和 caret 范围、最高兼容版本选择和冲突诊断；HTTPS-only 获取、SHA-256、内容寻址 cache 和安装锁已实现，签名信任根、归档格式、受限解包和 CLI 远程 import 串联前仍保持 fail-closed。
+registry resolver 支持精确版本和 caret 范围、最高兼容版本选择和冲突诊断；HTTPS-only 获取、SHA-256、Ed25519 index verifier、内容寻址 cache 和安装锁已实现，根公钥配置、key rotation/revocation、归档格式、受限解包和 CLI 远程 import 串联前仍保持 fail-closed。
 LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 标准库 root import 允许小写导出，例如 `import { task, time } from "std"`；用户自定义文件的顶层 `fn/struct/enum` 仍必须首字母大写才对外导出。import/export 诊断会给出位置、问题描述和修改方向。
 `std.time` 会拒绝超出 chrono 支持范围的毫秒值，不再静默回退到当前时间。
@@ -306,7 +308,7 @@ LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 
 ```txt
 LLVM array/enum、闭包和高级控制流 lowering
-registry 签名信任根、归档格式、受限解包和 CLI 远程 import 串联
+registry 根公钥配置、key rotation/revocation、归档格式、受限解包和 CLI 远程 import 串联
 完整 match guard 模式矩阵和跨 guard 的穷尽性证明
 native C 闭包、动态 object、正式 owned string ABI
 native async ABI

@@ -96,8 +96,12 @@ native C 当前覆盖 `Result<int|bool|str|null|array|struct|enum>`；owned payl
 
 Ku 要做高性能 native binary，IR 不能只做语法翻译。优化 pass 按可验证顺序推进：
 
-1. 常量折叠：先覆盖整数/布尔/字符串长度、简单比较和不会触发错误的纯表达式。
-2. 死代码删除：删除 `return/fail/panic/break/continue` 后不可达 block 和未使用临时。
+当前 `optimize_program` 已接入 `ku ir`、`--emit-ir`、native C 和 LLVM 输出路径。第一阶段只做确定安全的局部优化：整数/布尔纯表达式常量折叠，`if true/false` 分支折叠为 `jump`，以及由此产生的不可达 block 删除。除零、取余零、可能改变错误时机的表达式不会被折叠。
+
+后续优化继续按队列推进：
+
+1. 常量折叠：继续覆盖字符串长度、简单比较和更多不会触发错误的纯表达式。
+2. 死代码删除：继续删除 `return/fail/panic/break/continue` 后不可达 block 和未使用临时。
 3. 简单函数内联：只内联无递归、无捕获、体积小、无复杂错误边的函数。
 4. 临时变量消除：合并单次使用的 temp，避免 C/LLVM 输出无意义中间值。
 5. drop 消除：证明值未初始化、已 move、或 Copy 类型时删除 drop。
