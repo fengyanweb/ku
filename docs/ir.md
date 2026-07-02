@@ -91,3 +91,18 @@ native C 当前覆盖 `Result<int|bool|str|null|array|struct|enum>`；owned payl
 2. 固定 owned string 和动态 object ABI，使语言层 Owned 分类与 native 资源释放完全一致。
 3. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
 4. async native lowering继续拒绝，直到状态机 task ABI、调度器嵌入方式和取消语义单独决策。
+
+## IR 优化队列
+
+Ku 要做高性能 native binary，IR 不能只做语法翻译。优化 pass 按可验证顺序推进：
+
+1. 常量折叠：先覆盖整数/布尔/字符串长度、简单比较和不会触发错误的纯表达式。
+2. 死代码删除：删除 `return/fail/panic/break/continue` 后不可达 block 和未使用临时。
+3. 简单函数内联：只内联无递归、无捕获、体积小、无复杂错误边的函数。
+4. 临时变量消除：合并单次使用的 temp，避免 C/LLVM 输出无意义中间值。
+5. drop 消除：证明值未初始化、已 move、或 Copy 类型时删除 drop。
+6. clone 消除：Copy clone 直接删除；源值随后不再使用时 clone-to-move。
+7. escape analysis：识别不逃逸对象/数组/闭包 env，为 stack allocation 做准备。
+8. stack allocation：不逃逸、定长或生命周期清楚的 native value 放栈上。
+9. monomorphization 泛型特化：对实际调用的泛型实例生成具体 IR，避免动态分派。
+10. bounds check 优化：循环范围和数组长度可证明时消除重复检查，但保留所有不能证明的运行时检查。

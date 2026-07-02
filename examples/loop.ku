@@ -1,8 +1,6 @@
 fn main() {
-    i = 0
-
-    while (i < 5) {
+    for i in 10 {
+        if (i == 5) break
         println(i)
-        i = i + 1
     }
 }

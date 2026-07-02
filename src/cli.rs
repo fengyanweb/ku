@@ -1287,6 +1287,14 @@ fn stmt_contains_async(stmt: &Stmt) -> bool {
             assign_target_contains_await(target) || expr_contains_await(value)
         }
         Stmt::DestructureAssign { values, .. } => values.iter().any(expr_contains_await),
+        Stmt::ObjectDestructureAssign {
+            bindings, value, ..
+        } => {
+            expr_contains_await(value)
+                || bindings
+                    .iter()
+                    .any(|binding| binding.default.as_ref().is_some_and(expr_contains_await))
+        }
         Stmt::If {
             condition,
             then_branch,
@@ -2226,6 +2234,17 @@ fn rewrite_function_calls_in_stmt(
             }
             Ok(())
         }
+        Stmt::ObjectDestructureAssign {
+            bindings, value, ..
+        } => {
+            rewrite_function_calls_in_expr(value, rename_map)?;
+            for binding in bindings {
+                if let Some(default) = &mut binding.default {
+                    rewrite_function_calls_in_expr(default, rename_map)?;
+                }
+            }
+            Ok(())
+        }
         Stmt::If {
             condition,
             then_branch,
@@ -2435,6 +2454,17 @@ fn rewrite_namespaces_in_stmt(
         Stmt::DestructureAssign { values, .. } => {
             for value in values {
                 rewrite_namespaces_in_expr(value, namespaces)?;
+            }
+            Ok(())
+        }
+        Stmt::ObjectDestructureAssign {
+            bindings, value, ..
+        } => {
+            rewrite_namespaces_in_expr(value, namespaces)?;
+            for binding in bindings {
+                if let Some(default) = &mut binding.default {
+                    rewrite_namespaces_in_expr(default, namespaces)?;
+                }
             }
             Ok(())
         }

@@ -39,7 +39,8 @@ assert.deepStrictEqual(model.stdImportPathLabels("std."), [
   "std.task",
 ]);
 
-assert(model.globalCompletionLabels().includes("http.server"));
+assert(!model.globalCompletionLabels().includes("http.service"));
+assert(!model.globalCompletionLabels().includes("http.server"));
 assert(model.globalCompletionLabels().includes("http.statusText"));
 assert(model.globalCompletionLabels().includes("config.yaml"));
 assert(model.globalCompletionLabels().includes("std.http"));

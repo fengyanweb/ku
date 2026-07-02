@@ -558,6 +558,12 @@ impl Checker {
                 }
                 Ok(())
             }
+            Stmt::ObjectDestructureAssign {
+                bindings,
+                rest,
+                value,
+                span,
+            } => self.check_object_destructure_assign(bindings, rest.as_ref(), value, *span),
             Stmt::If {
                 condition,
                 then_branch,
@@ -716,6 +722,113 @@ impl Checker {
             }
         }
         self.pop_scope();
+        Ok(())
+    }
+
+    fn check_object_destructure_assign(
+        &mut self,
+        bindings: &[ObjectDestructureBinding],
+        rest: Option<&ObjectDestructureRest>,
+        value: &Expr,
+        span: Span,
+    ) -> KuResult<()> {
+        let source_type = self.check_object_destructure_source(value)?;
+        let mut consumed = HashSet::new();
+        match source_type {
+            Type::Object(fields) => {
+                for binding in bindings {
+                    consumed.insert(binding.field.clone());
+                    let actual = match fields.get(&binding.field) {
+                        Some(ty) => ty.clone(),
+                        None => match &binding.default {
+                            Some(default) => self.consume_expr(default)?,
+                            None => {
+                                return Err(KuError::runtime(
+                                    format!("object has no field '{}'", binding.field),
+                                    binding.span,
+                                ))
+                            }
+                        },
+                    };
+                    if let Some(local) = &binding.local {
+                        self.assign_or_define_destructured(local, actual, binding.span)?;
+                    }
+                }
+                if let Some(rest) =
+                    rest.and_then(|rest| rest.local.as_ref().map(|name| (rest, name)))
+                {
+                    let rest_fields = fields
+                        .into_iter()
+                        .filter(|(name, _)| !consumed.contains(name))
+                        .collect::<HashMap<_, _>>();
+                    self.assign_or_define_destructured(
+                        rest.1,
+                        Type::Object(rest_fields),
+                        rest.0.span,
+                    )?;
+                }
+                Ok(())
+            }
+            Type::DynamicObject | Type::StringMap | Type::Unknown => {
+                for binding in bindings {
+                    if let Some(default) = &binding.default {
+                        self.consume_expr(default)?;
+                    }
+                    if let Some(local) = &binding.local {
+                        self.assign_or_define_destructured(local, Type::Unknown, binding.span)?;
+                    }
+                }
+                if let Some(rest) =
+                    rest.and_then(|rest| rest.local.as_ref().map(|name| (rest, name)))
+                {
+                    self.assign_or_define_destructured(rest.1, Type::DynamicObject, rest.0.span)?;
+                }
+                Ok(())
+            }
+            other => Err(KuError::runtime(
+                format!(
+                    "type error: object destructuring expects object but got {}",
+                    type_name(&other)
+                ),
+                span,
+            )),
+        }
+    }
+
+    fn check_object_destructure_source(&mut self, value: &Expr) -> KuResult<Type> {
+        if let ExprKind::Variable(module) = &value.kind {
+            if metadata::is_std_module(module)
+                && !self.contains(module)
+                && self.std_modules.contains(module)
+            {
+                return std_module_object_type(module, value.span);
+            }
+        }
+        self.consume_expr(value)
+    }
+
+    fn assign_or_define_destructured(
+        &mut self,
+        name: &str,
+        actual: Type,
+        span: Span,
+    ) -> KuResult<()> {
+        if !self.contains(name) {
+            self.define(name.to_string(), actual, !is_constant_name(name), span)?;
+            return Ok(());
+        }
+        self.reject_readonly_capture_assignment(name, span)?;
+        let binding = self.get_allow_moved(name, span)?;
+        if !binding.mutable {
+            return Err(KuError::runtime(
+                format!("cannot assign to immutable variable '{name}'"),
+                span,
+            ));
+        }
+        if !type_matches(&binding.ty, &actual) {
+            return Err(type_error(span, &binding.ty, &actual));
+        }
+        self.mark_initialized(name);
         Ok(())
     }
 
@@ -956,7 +1069,14 @@ impl Checker {
                             && self.std_modules.contains("http")
                         {
                             match name.as_str() {
-                                "service" | "server" => return Ok(http_service_type()),
+                                "service" | "server" => {
+                                    return Err(KuError::runtime(
+                                        format!(
+                                            "std module member 'http.{name}' is a function; call it as 'http.{name}()'"
+                                        ),
+                                        expr.span,
+                                    ))
+                                }
                                 "status" => return Ok(http_status_type()),
                                 "code" => return Ok(http_code_type()),
                                 _ => {}
@@ -3590,6 +3710,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         | Stmt::AssignTarget { span, .. }
         | Stmt::CompoundAssign { span, .. }
         | Stmt::DestructureAssign { span, .. }
+        | Stmt::ObjectDestructureAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
@@ -3704,6 +3825,21 @@ fn http_code_type() -> Type {
         ("VALIDATION_FAILED".to_string(), Type::Int),
         ("INTERNAL_ERROR".to_string(), Type::Int),
     ]))
+}
+
+fn std_module_object_type(module: &str, span: Span) -> KuResult<Type> {
+    match module {
+        "http" => Ok(Type::Object(HashMap::from([
+            ("status".to_string(), http_status_type()),
+            ("code".to_string(), http_code_type()),
+        ]))),
+        _ => Err(KuError::runtime(
+            format!(
+                "std module '{module}' cannot be used as an object value yet; access functions with '{module}.name(...)'"
+            ),
+            span,
+        )),
+    }
 }
 
 fn http_request_type() -> Type {

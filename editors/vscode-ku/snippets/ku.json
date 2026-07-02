@@ -39,6 +39,11 @@
     "body": ["${1:value} = ${2:object}[${3:\"key\"}]?"],
     "description": "Optional object lookup; missing keys return null"
   },
+  "object destructuring": {
+    "prefix": "obj.destructure",
+    "body": ["{ ${1:name}, ${2:field}: ${3:local}, ${4:missing} = ${5:null}, ...${6:rest} } = ${7:object}"],
+    "description": "Destructure object fields with rename, default, and rest"
+  },
   "generic function": {
     "prefix": "fng",
     "body": ["fn ${1:id}<${2:T}>(${3:value}:${2:T}): ${2:T} {", "    return ${3:value}", "}"],

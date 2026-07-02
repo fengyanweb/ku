@@ -1,12 +1,10 @@
 import { http, time } from "std"
 
 fn ret(req, res) {
-    // req 是请求对象；res 是 handler ABI 里的响应占位对象，通常直接 return http.text/json/empty。
     return http.text("Ku HTTP OK")
 }
 
 fn main(): null! {
-    // http.service() 创建 HTTP service 对象；旧的 http.service 属性式写法不推荐。
     app = http.service()
 
     app.get("/", ret)

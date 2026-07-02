@@ -48,8 +48,6 @@ export const stdFunctions = [
   "http.status",
   "http.statusText",
   "http.code",
-  "http.service",
-  "http.server",
   "string.len",
   "string.trim",
   "string.lower",

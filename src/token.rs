@@ -63,6 +63,7 @@ pub enum TokenKind {
     OrOr,
     Pipe,
     Dot,
+    Ellipsis,
     LParen,
     RParen,
     LBrace,

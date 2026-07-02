@@ -129,6 +129,12 @@ pub enum Stmt {
         values: Vec<Expr>,
         span: Span,
     },
+    ObjectDestructureAssign {
+        bindings: Vec<ObjectDestructureBinding>,
+        rest: Option<ObjectDestructureRest>,
+        value: Expr,
+        span: Span,
+    },
     If {
         condition: Expr,
         then_branch: Vec<Stmt>,
@@ -199,6 +205,20 @@ pub enum AssignTarget {
     Variable(String),
     Index { target: Expr, index: Expr },
     Field { target: Expr, name: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectDestructureBinding {
+    pub field: String,
+    pub local: Option<String>,
+    pub default: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectDestructureRest {
+    pub local: Option<String>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

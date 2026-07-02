@@ -294,6 +294,38 @@ async fn main() {
 }
 
 #[test]
+fn native_build_rejects_object_destructuring_until_lowered() {
+    let dir = unique_temp_path("native-object-destructure");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let file = dir.join("main.ku");
+    fs::write(
+        &file,
+        r#"
+fn main() {
+    user = { name: "Ku" }
+    { name } = user
+    print(name)
+}
+"#,
+    )
+    .expect("write source");
+
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--emit-ir".to_string(),
+        file.display().to_string(),
+    ])
+    .expect_err("IR/native object destructuring should be rejected")
+    .to_string();
+    assert!(
+        err.contains("IR/native lowering does not support object destructuring yet"),
+        "unexpected error: {err}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_build_ignores_async_words_in_comments_strings_and_identifiers() {
     let dir = unique_temp_path("native-async-trivia");
     fs::create_dir_all(&dir).expect("create temp dir");
@@ -526,6 +558,43 @@ fn main() {
     Checker::new()
         .check(&program)
         .expect("explicit clone should check");
+
+    let object_destructure_move = check_err(
+        r#"
+fn main() {
+    user = { name: "Ku" }
+    { name } = user
+    print(user.name)
+}
+"#,
+    );
+    assert!(
+        object_destructure_move.contains("use of moved value 'user'"),
+        "object destructuring must consume the source object: {object_destructure_move}"
+    );
+
+    let object_destructure_reinit = r#"
+fn take(value: str): null {
+    return null
+}
+
+fn main() {
+    name = "old"
+    take(name)
+    user = { name: "Ku" }
+    { name } = user
+    print(name)
+}
+"#;
+    let tokens = Lexer::new(object_destructure_reinit)
+        .tokenize()
+        .expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new()
+        .check(&program)
+        .expect("object destructuring assignment should reinitialize moved locals");
+    run_source("inline.ku", object_destructure_reinit)
+        .expect("object destructuring reinitialization should run");
 
     let loop_move = check_err(
         r#"

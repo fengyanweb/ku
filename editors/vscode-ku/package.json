@@ -2,7 +2,7 @@
   "name": "ku-language",
   "displayName": "Ku Language",
   "description": "Syntax highlighting, snippets, and editor intelligence for Ku",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "publisher": "ku-lang",
   "license": "UNLICENSED",
   "repository": {

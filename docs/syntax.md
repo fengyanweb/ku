@@ -1,10 +1,10 @@
-# Ku 0.0.14 Syntax
+# Ku 0.0.15 Syntax
 
-本文档固定 Ku 0.0.14 当前真实支持的全部语法和边界。CLI 版本应显示：
+本文档固定 Ku 0.0.15 当前真实支持的全部语法和边界。CLI 版本应显示：
 
 ```powershell
 ku version
-# ku 0.0.14
+# ku 0.0.15
 ```
 
 Ku 当前是解释器优先的语言实现。文档只记录已经能被 lexer / parser / checker / runtime 闭环处理的语法；仍在设计中的能力放在文末“不支持 / 未完成”。
@@ -265,7 +265,7 @@ import {
 
 ### 4.1 基础类型
 
-Ku 0.0.14 的基础类型：
+Ku 0.0.15 的基础类型：
 
 ```txt
 int
@@ -402,7 +402,26 @@ a, b = 1, 2
 a, _ = 3, 4
 ```
 
-`_` 表示丢弃该位置的值。当前解构赋值只支持变量名和 `_`，左右数量必须一致。
+`_` 表示丢弃该位置的值。位置解构赋值只支持变量名和 `_`，左右数量必须一致。
+
+对象解构赋值按 JS 风格进入当前语法：
+
+```ku
+user = { name: "Ku", city: "Hangzhou" }
+{ name, city: place, missing = "fallback", ...rest } = user
+{ code } = http
+```
+
+规则：
+
+- `{ name } = obj` 绑定同名字段。
+- `{ city: place } = obj` 读取 `city` 字段并绑定到 `place`。
+- `{ missing = value } = obj` 仅在字段缺失时使用 default。
+- `{ ...rest } = obj` 绑定剩余字段对象，rest 必须放最后。
+- `{ field: _ } = obj` 读取并丢弃字段。
+- 对象解构会消费右侧 source object；解构后不能继续使用原对象。需要保留原对象时写 `{ name } = user.clone()`。
+- 静态 object 缺字段会在检查阶段报错；动态 object 缺字段在运行时报错。需要宽松读取时继续使用显式 `obj["field"]?`。
+- `http` 作为 std 模块对象只暴露可作为值读取的对象成员，例如 `{ code } = http`；`http.service` / `http.server` 是函数，不能被当作属性式默认对象解构或读取。
 
 赋值目标可以是变量、数组元素、结构体字段或对象字段：
 
@@ -1500,7 +1519,7 @@ http.service(config?:object): object
 http.server(config?:object): object
 ```
 
-`http.service` 不加括号的属性式默认对象仍兼容，但只建议旧代码继续用；新代码统一写 `http.service()`。
+`http.service` / `http.server` 是函数，必须写成 `http.service()` / `http.server(config)`。Ku 不再兼容旧的属性式默认对象；写 `app = http.service` 会报错并提示改成函数调用。
 
 `HttpResponse` 当前用对象表示：
 
@@ -1606,7 +1625,7 @@ print(service.routes[0].method)
 
 默认 server 配置包含 `read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests` 和 `routes`。`service.get/post/put/del(path, handler)` 当前支持注册路由，会把 `{ method, path, param_names, handler }` 写入 `service.routes`。路径参数使用 `/user/{id}`，不使用 Express 的 `:id`。
 
-`http.service()` / `http.server(config?)` 返回 service 配置对象；旧的 `http.service` 属性式写法暂时兼容，但推荐始终写 `http.service()`，语义更清楚。`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。第一版 handler 参数固定 `(req, res)`，handler 返回 `http.text/json/empty/redirect(...)` 这类 `{ status, headers, body }` 响应对象。
+`http.service()` / `http.server(config?)` 返回 service 配置对象。`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。第一版 handler 参数固定 `(req, res)`，handler 返回 `http.text/json/empty/redirect(...)` 这类 `{ status, headers, body }` 响应对象。
 
 第一版 `req` 字段：
 
@@ -1888,7 +1907,7 @@ ku build --release -o dist/app.exe
 
 `--backend c` 会使用 prototype C 后端生成 C 后再调用 C 编译器。查找顺序为 `KU_CC`、`zig cc`、`clang`、`cc`、`gcc`、`cl`；找不到或编译失败会给出修改方向。默认 backend 仍是解释器 wrapper，因为完整 native closure / KuString / dynamic object / async ABI 尚未完成。`ku run build` 仅作为兼容别名保留，会提示改用 `ku build`。
 
-0.0.14 build 的重要边界：默认生成的是“解释器打包型二进制”，入口源码会嵌入 wrapper；带 import 的程序仍会按原源码路径读取依赖，因此还不是最终“不依赖 Ku 源码文件”的 native binary。最终 native build 仍需要 import graph 打包、runtime ABI lowering、closure/native string/object/async lowering 和增量缓存继续补齐。
+0.0.15 build 的重要边界：默认生成的是“解释器打包型二进制”，入口源码会嵌入 wrapper；带 import 的程序仍会按原源码路径读取依赖，因此还不是最终“不依赖 Ku 源码文件”的 native binary。最终 native build 仍需要 import graph 打包、runtime ABI lowering、closure/native string/object/async lowering 和增量缓存继续补齐。
 
 `ku build --native` 当前输出 prototype C 源码，支持：
 
@@ -1916,7 +1935,20 @@ unit / payload / nested enum match lowering
 
 native C 当前仍是 prototype，但同步所有权和错误流已闭环：Copy 类型是 `int/bool/float/null`；`str/array/object/struct/enum/Result/task` 在语言检查层按 Owned 处理，赋值和传参默认 move。`str/array/object/struct/enum/Result` 的复制必须显式 `.clone()`，`Task<T>` 是 move-only，不能 clone，`await` 会消费 task。checker 会拒绝 use-after-move、重复消费 Result、重复 await task、match 分支漏合并和循环回边重复 move。C 后端为 array、named value 和 Result 生成 move/clone/drop，赋值先物化 RHS 再 drop 旧值，解构交换先物化全部 RHS；嵌套 owned array 递归 clone/drop。
 
-native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、错误和 return 都经过对应 finally block。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。递归值 struct/enum、native closure、动态 object ABI 和 async native lowering仍明确拒绝。native `str` 暂时仍使用只读 C 字符串原型，正式 owned string ABI 等待路线决策。
+`.clone()` 规则：
+
+- Copy 类型 `int/bool/float/null` 可以写 `.clone()`，语义等同复制，优化阶段应直接消掉。
+- `str.clone()` 语义是得到独立字符串值；解释器当前用 host String 深拷贝，native 后续固定为 `KuString { ptr, len, capacity, storage }`，字面量 `static` clone 零分配，运行时 `owned` clone 复制 UTF-8 bytes。
+- `[T].clone()` 生成新数组并递归 clone 元素；如果中途失败，已经 clone 的元素必须按 drop 路径清理。
+- `object.clone()` 生成新动态对象并递归 clone key/value；第一阶段禁止 native 自引用/cycle，后续如需要再设计 cycle 策略。
+- `struct.clone()` 按字段递归 clone；字段不可 clone 时错误定位到字段。
+- `enum.clone()` 只 clone 当前 tag 对应 payload，不访问其它 variant payload。
+- `Result<T>.clone()` 只 clone 当前 ok payload；Error payload 按 Error 对象 clone。
+- `function` 值在语言方向上是 Owned，未来 native closure clone 只复制函数入口并增加小范围 RC env，不深拷贝捕获环境；捕获 binding 默认共享。
+- `Task<T>` 不允许 clone；`await task` 消费 task，普通 task 只能 await 一次。
+- 优化方向包括 Copy clone 消除、源值随后不再使用时的 clone-to-move、临时 clone 消除、return clone-to-move、static string clone 零分配、struct clone inline、array/object 预分配，以及不需要的 drop/clone 消除。
+
+native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、错误和 return 都经过对应 finally block。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。递归值 struct/enum、native closure、动态 object ABI 和 async native lowering仍明确拒绝。native `str` 暂时仍使用只读 C 字符串原型，正式 owned `KuString` ABI 已进入执行队列。
 
 ## 17. 资源保护
 
@@ -2005,11 +2037,15 @@ union         ::= result ('|' result)*
 result        ::= atom '!'?
 atom          ::= 'int' | 'float' | 'bool' | 'str' | 'null' | '[' type ']' | IDENT ('.' IDENT)*
 block         ::= '{' stmt* '}'
-stmt          ::= var | assign | compound_assign | destructure | inc | if | while | for | break | continue | try | fail | panic | return | print | expr
+stmt          ::= var | assign | compound_assign | destructure | object_destructure | inc | if | while | for | break | continue | try | fail | panic | return | print | expr
 var           ::= IDENT ':' type ('=' expr)?
 assign        ::= assign_target '=' expr
 compound_assign ::= assign_target ('+=' | '-=' | '*=' | '/=' | '%=') expr
 destructure   ::= (IDENT | '_') (',' (IDENT | '_'))+ '=' expr (',' expr)+
+object_destructure ::= '{' object_binding (',' object_binding)* (',' rest_binding)? '}' '=' expr
+object_binding ::= IDENT (':' IDENT_OR_DISCARD)? ('=' expr)?
+rest_binding  ::= '...' IDENT_OR_DISCARD
+IDENT_OR_DISCARD ::= IDENT | '_'
 inc           ::= assign_target ('++' | '--') | ('++' | '--') assign_target
 assign_target ::= IDENT | expr '[' expr ']' | expr '.' IDENT
 body          ::= block | stmt

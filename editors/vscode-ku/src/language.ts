@@ -5,7 +5,7 @@ import * as vscode from "vscode";
 import { builtins, keywords, memberCompletionLabels, stdFunctions, stdImportPathLabels, stdModules, stdRootModules, types } from "./completionModel";
 import { defaultModuleName, parseImports, resolveImportUri } from "./imports";
 
-const KU_VERSION = "0.0.14";
+const KU_VERSION = "0.0.15";
 const KU_MODE: vscode.DocumentSelector = [{ language: "ku", scheme: "file" }];
 const diagnosticCollection = vscode.languages.createDiagnosticCollection("ku");
 const output = vscode.window.createOutputChannel("Ku");
@@ -622,7 +622,11 @@ function importPathReplaceRange(linePrefix: string, position: vscode.Position): 
 
 function memberCompletionItem(label: string, receiver: string, range: vscode.Range) {
   const item = new vscode.CompletionItem(label, vscode.CompletionItemKind.Method);
-  item.insertText = label;
+  if (receiver === "http" && (label === "service" || label === "server")) {
+    item.insertText = new vscode.SnippetString(`${label}($0)`);
+  } else {
+    item.insertText = label;
+  }
   item.range = range;
   item.detail = `${receiver} member`;
   return item;
@@ -744,7 +748,7 @@ class KuHoverProvider implements vscode.HoverProvider {
       "time.is_leap": "`time.is_leap(year)` 判断闰年。",
       "time.days_in_month": "`time.days_in_month(year, month)?` 返回月份天数。",
       "time.sleep": "`time.sleep(msOrDuration)?` 阻塞当前任务；async 中会进入 blocking pool。",
-      "match": "Ku 0.0.14 保留 `match`，不再支持 `switch`。",
+      "match": "Ku 0.0.15 保留 `match`，不再支持 `switch`。",
       "try_get": "`values.try_get(index)?` 越界时返回结构化 Error。",
       "trim": "`text.trim()` 是 string 实例方法。",
     };

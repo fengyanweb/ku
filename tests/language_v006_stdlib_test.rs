@@ -336,6 +336,47 @@ fn main() {
 }
 
 #[test]
+fn std_http_service_requires_constructor_call() {
+    for source in [
+        r#"
+import "std.http"
+
+fn main() {
+    app = http.service
+}
+"#,
+        r#"
+import "std.http"
+
+fn main() {
+    app = http.server
+}
+"#,
+        r#"
+import "std.http"
+
+fn main() {
+    http.service.get("/", (req, res) => http.text("bad"))
+}
+"#,
+        r#"
+import "std.http"
+
+fn main() {
+    app = http.service.kind
+}
+"#,
+    ] {
+        let err = check_err(source);
+        assert!(
+            err.contains("call it as 'http.service()'")
+                || err.contains("call it as 'http.server()'"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
 fn std_http_config_limits_must_be_positive() {
     for source in [
         r#"
@@ -367,7 +408,7 @@ fn std_http_service_route_methods_register_routes() {
 import "std.http"
 
 fn main() {
-    app = http.service
+    app = http.service()
     app.get("/index", (req, res) => {
         return http.text("ok")
     })
@@ -402,7 +443,7 @@ fn std_http_service_bind_returns_listener_result() {
 import "std.http"
 
 fn main(): null! {
-    app = http.service
+    app = http.service()
     listener = app.bind(":0")?
     if (listener.kind != "http.listener") {
         panic("bad listener")
@@ -422,7 +463,7 @@ fn std_http_listener_close_consumes_listener() {
 import "std.http"
 
 fn main(): null! {
-    app = http.service
+    app = http.service()
     listener = app.bind(":0")?
     listener.close()?
     try {
@@ -455,7 +496,7 @@ fn std_http_service_bind_compiles_routes() {
 import "std.http"
 
 fn main(): null! {
-    app = http.service
+    app = http.service()
     app.get("/user/{id}", (req, res) => http.text("ok"))
     listener = app.bind(":0")?
     if (listener.kind != "http.listener") {
@@ -478,7 +519,7 @@ fn std_http_service_rejects_invalid_or_duplicate_routes_before_bind() {
 import "std.http"
 
 fn main(): null! {
-    app = http.service
+    app = http.service()
     app.get("/user/{id}", (req, res) => http.text("one"))
     app.get("/user/{name}", (req, res) => http.text("two"))
     app.bind(":0")?
@@ -495,7 +536,7 @@ fn main(): null! {
 import "std.http"
 
 fn main() {
-    app = http.service
+    app = http.service()
     app.get("/user/:id", (req, res) => http.text("bad"))
 }
 "#;
@@ -509,7 +550,7 @@ fn main() {
 import "std.http"
 
 fn main() {
-    app = http.service
+    app = http.service()
     app.get("/user/{id}", { auth: "none" }, (req, res) => http.text("bad"))
 }
 "#;
@@ -523,7 +564,7 @@ fn main() {
 import "std.http"
 
 fn main() {
-    app = http.service
+    app = http.service()
     app.bind(":0", { max_body_bytes: 4 })
 }
 "#;
@@ -540,7 +581,7 @@ fn std_http_handler_signature_and_capture_rules_are_checked() {
 import "std.http"
 
 fn main() {
-    app = http.service
+    app = http.service()
     app.get("/user/{id}", (req, res) => {
         if (req.method != "GET") {
             panic("bad method")
@@ -555,7 +596,7 @@ fn main() {
 import "std.http"
 
 fn main() {
-    app = http.service
+    app = http.service()
     app.get("/", (req) => http.text("bad"))
 }
 "#;
@@ -569,7 +610,7 @@ fn main() {
 import "std.http"
 
 fn main() {
-    app = http.service
+    app = http.service()
     app.get("/", (req, res) => "bad")
 }
 "#;
@@ -584,7 +625,7 @@ import "std.http"
 
 fn main() {
     count = 0
-    app = http.service
+    app = http.service()
     app.get("/", (req, res) => {
         count = count + 1
         return http.text("bad")
@@ -602,7 +643,7 @@ import "std.http"
 
 fn main() {
     state = { n: 0 }
-    app = http.service
+    app = http.service()
     app.get("/", (req, res) => {
         state.n = 1
         return http.text("bad")

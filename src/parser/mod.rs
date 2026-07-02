@@ -447,6 +447,9 @@ impl Parser {
         if self.match_kind(&TokenKind::Print) {
             return self.print_statement();
         }
+        if self.is_object_destructure_assignment_start() {
+            return self.object_destructure_assignment_statement();
+        }
 
         self.expression_or_assignment_statement()
     }
@@ -711,12 +714,128 @@ impl Parser {
         })
     }
 
+    fn object_destructure_assignment_statement(&mut self) -> KuResult<Stmt> {
+        let start = self
+            .consume(&TokenKind::LBrace, "expected '{' for object destructuring")?
+            .span
+            .start;
+        let mut bindings = Vec::new();
+        let mut rest = None;
+        let mut seen_fields = std::collections::HashSet::new();
+        if !self.check(&TokenKind::RBrace) {
+            loop {
+                if self.match_kind(&TokenKind::Ellipsis) {
+                    let (name, span) =
+                        self.consume_ident("expected rest binding name after '...'")?;
+                    rest = Some(ObjectDestructureRest {
+                        local: (name != "_").then_some(name),
+                        span,
+                    });
+                    if self.match_kind(&TokenKind::Comma) && !self.check(&TokenKind::RBrace) {
+                        return Err(KuError::parse(
+                            "object destructuring rest binding must be last",
+                            self.peek().span,
+                        ));
+                    }
+                    break;
+                }
+
+                let token = self.advance().clone();
+                let field = match token.kind {
+                    TokenKind::Ident(name) | TokenKind::String(name) => name,
+                    _ => {
+                        return Err(KuError::parse(
+                            "expected object destructuring field name",
+                            token.span,
+                        ))
+                    }
+                };
+                if !seen_fields.insert(field.clone()) {
+                    return Err(KuError::parse(
+                        format!("duplicate object destructuring field '{field}'"),
+                        token.span,
+                    ));
+                }
+                let mut local = field.clone();
+                let mut default = None;
+                if self.match_kind(&TokenKind::Colon) {
+                    let (renamed, _) =
+                        self.consume_ident("expected local binding name after ':'")?;
+                    local = renamed;
+                }
+                if self.match_kind(&TokenKind::Equal) {
+                    default = Some(self.expression()?);
+                }
+                bindings.push(ObjectDestructureBinding {
+                    field,
+                    local: (local != "_").then_some(local),
+                    default,
+                    span: token.span,
+                });
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RBrace) {
+                    break;
+                }
+            }
+        }
+        self.consume(
+            &TokenKind::RBrace,
+            "expected '}' after object destructuring pattern",
+        )?;
+        self.consume(
+            &TokenKind::Equal,
+            "expected '=' after object destructuring pattern",
+        )?;
+        let value = self.expression()?;
+        self.optional_semicolon();
+        let end = value.span.end;
+        Ok(Stmt::ObjectDestructureAssign {
+            bindings,
+            rest,
+            value,
+            span: Span::new(start, end),
+        })
+    }
+
     fn is_destructure_assignment_start(&self) -> bool {
         matches!(self.peek().kind, TokenKind::Ident(_))
             && matches!(
                 self.tokens.get(self.current + 1).map(|token| &token.kind),
                 Some(TokenKind::Comma)
             )
+    }
+
+    fn is_object_destructure_assignment_start(&self) -> bool {
+        if !self.check(&TokenKind::LBrace) {
+            return false;
+        }
+        let mut index = self.current;
+        let mut depth = 0usize;
+        while let Some(token) = self.tokens.get(index) {
+            match token.kind {
+                TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => {
+                    depth += 1;
+                }
+                TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => {
+                    depth = match depth.checked_sub(1) {
+                        Some(depth) => depth,
+                        None => return false,
+                    };
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(index + 1).map(|token| &token.kind),
+                            Some(TokenKind::Equal)
+                        );
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            index += 1;
+        }
+        false
     }
 
     fn match_compound_assignment_op(&mut self) -> Option<BinaryOp> {
@@ -971,6 +1090,7 @@ impl Parser {
                     span,
                 );
             } else if self.check(&TokenKind::LBrace)
+                && same_line(expr.span, self.peek().span)
                 && self.is_struct_literal_after_lbrace()
                 && matches!(expr.kind, ExprKind::Field { target: _, name: _ })
             {
@@ -1049,7 +1169,10 @@ impl Parser {
                         Span::new(span.start, body_span.end),
                     ));
                 }
-                if self.check(&TokenKind::LBrace) && self.is_struct_literal_after_lbrace() {
+                if self.check(&TokenKind::LBrace)
+                    && same_line(span, self.peek().span)
+                    && self.is_struct_literal_after_lbrace()
+                {
                     self.advance();
                     return self.finish_struct_literal(name, span);
                 }
@@ -1468,6 +1591,10 @@ fn token_kind_eq(left: &TokenKind, right: &TokenKind) -> bool {
     std::mem::discriminant(left) == std::mem::discriminant(right)
 }
 
+fn same_line(left: Span, right: Span) -> bool {
+    left.end.line == right.start.line
+}
+
 fn is_valid_namespace(name: &str) -> bool {
     name.chars()
         .next()
@@ -1531,6 +1658,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         | Stmt::AssignTarget { span, .. }
         | Stmt::CompoundAssign { span, .. }
         | Stmt::DestructureAssign { span, .. }
+        | Stmt::ObjectDestructureAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }

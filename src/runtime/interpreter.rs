@@ -494,6 +494,22 @@ impl Interpreter {
                 }
                 Ok(Flow::Continue)
             }
+            Stmt::ObjectDestructureAssign {
+                bindings,
+                rest,
+                value,
+                span,
+            } => {
+                let source = self.eval_object_destructure_source(value, env, depth)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
+                self.object_destructure_assign(bindings, rest.as_ref(), source, env, depth, *span)?;
+                if let Some(value) = self.take_pending_fail() {
+                    return Ok(Flow::Fail(value));
+                }
+                Ok(Flow::Continue)
+            }
             Stmt::If {
                 condition,
                 then_branch,
@@ -1097,7 +1113,12 @@ impl Interpreter {
                     {
                         match name.as_str() {
                             "service" | "server" => {
-                                return stdlib::http::default_server_value(expr.span);
+                                return Err(KuError::runtime(
+                                    format!(
+                                        "std module member 'http.{name}' is a function; call it as 'http.{name}()'"
+                                    ),
+                                    expr.span,
+                                ));
                             }
                             "status" => return Ok(stdlib::http::status_object_value()),
                             "code" => return Ok(stdlib::http::code_object_value()),
@@ -1248,6 +1269,78 @@ impl Interpreter {
 
     fn take_pending_fail(&mut self) -> Option<Value> {
         self.pending_fail.take()
+    }
+
+    fn eval_object_destructure_source(
+        &mut self,
+        value: &Expr,
+        env: &mut Env,
+        depth: usize,
+    ) -> KuResult<Value> {
+        if let ExprKind::Variable(module) = &value.kind {
+            if stdlib::metadata::is_std_module(module)
+                && !env.contains(module)
+                && self.std_modules.contains(module)
+            {
+                return std_module_object_value(module, value.span);
+            }
+        }
+        self.eval(value, env, depth)
+    }
+
+    fn object_destructure_assign(
+        &mut self,
+        bindings: &[crate::ast::ObjectDestructureBinding],
+        rest: Option<&crate::ast::ObjectDestructureRest>,
+        source: Value,
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<()> {
+        let Value::Object(mut fields) = source else {
+            return Err(KuError::runtime(
+                format!(
+                    "type error: object destructuring expects object but got {}",
+                    source.type_name()
+                ),
+                span,
+            ));
+        };
+        for binding in bindings {
+            let value = match fields.remove(&binding.field) {
+                Some(value) => value,
+                None => match &binding.default {
+                    Some(default) => self.eval(default, env, depth)?,
+                    None => {
+                        return Err(KuError::runtime(
+                            format!("object has no key '{}'", binding.field),
+                            binding.span,
+                        ))
+                    }
+                },
+            };
+            if self.pending_fail.is_some() {
+                return Ok(());
+            }
+            if let Some(local) = &binding.local {
+                if env.contains(local) {
+                    env.assign(local, value, binding.span)?;
+                } else {
+                    env.define(local.clone(), value, !is_constant_name(local), binding.span)?;
+                }
+            }
+        }
+        if let Some((rest, local)) =
+            rest.and_then(|rest| rest.local.as_ref().map(|name| (rest, name)))
+        {
+            let value = Value::Object(fields);
+            if env.contains(local) {
+                env.assign(local, value, rest.span)?;
+            } else {
+                env.define(local.clone(), value, !is_constant_name(local), rest.span)?;
+            }
+        }
+        Ok(())
     }
 
     fn construct_enum(
@@ -3113,6 +3206,21 @@ fn value_contains_task(value: &Value) -> bool {
     }
 }
 
+fn std_module_object_value(module: &str, span: Span) -> KuResult<Value> {
+    match module {
+        "http" => Ok(Value::Object(HashMap::from([
+            ("status".to_string(), stdlib::http::status_object_value()),
+            ("code".to_string(), stdlib::http::code_object_value()),
+        ]))),
+        _ => Err(KuError::runtime(
+            format!(
+                "std module '{module}' cannot be used as an object value yet; access functions with '{module}.name(...)'"
+            ),
+            span,
+        )),
+    }
+}
+
 fn enum_variant_path(expr: &Expr) -> Option<(String, String)> {
     let ExprKind::Field { target, name } = &expr.kind else {
         return None;
@@ -3257,6 +3365,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         | Stmt::AssignTarget { span, .. }
         | Stmt::CompoundAssign { span, .. }
         | Stmt::DestructureAssign { span, .. }
+        | Stmt::ObjectDestructureAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
         | Stmt::For { span, .. }
@@ -3490,6 +3599,25 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             }
             for name in names.iter().flatten() {
                 bound.insert(name.clone());
+            }
+        }
+        Stmt::ObjectDestructureAssign {
+            bindings,
+            rest,
+            value,
+            ..
+        } => {
+            collect_free_expr(value, bound, free);
+            for binding in bindings {
+                if let Some(default) = &binding.default {
+                    collect_free_expr(default, bound, free);
+                }
+                if let Some(local) = &binding.local {
+                    bound.insert(local.clone());
+                }
+            }
+            if let Some(local) = rest.as_ref().and_then(|rest| rest.local.as_ref()) {
+                bound.insert(local.clone());
             }
         }
         Stmt::If {

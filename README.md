@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.14`，正在补齐二进制构建系统、native C、LLVM、registry resolver 和 async task 生命周期能力。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.15`，正在补齐二进制构建系统、native C、LLVM、registry resolver 和 async task 生命周期能力。
 
 ## 快速开始
 
@@ -73,7 +73,7 @@ ku -h | -help         Print help
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。
 
-## 0.0.14 支持的核心语法
+## 0.0.15 支持的核心语法
 
 ```ku
 struct User {
@@ -193,19 +193,33 @@ import { Value } from "@util/util"
 仓库内置示例在 `examples/`：
 
 ```txt
+index.ku
 hello.ku
+main.ku
+types.ku
+constants.ku
+template_string.ku
+builtins.ku
 fib.ku
 loop.ku
 function.ku
+closure.ku
+control_flow.ku
+match.ku
 arrays.ku
 structs.ku
 enum.ku
 object.ku
+mutation.ku
 imports.ku
+import_all.ku
+math.ku
+module.ku
 compiler_pipeline.ku
 result.ku
 try_read.ku
 stdlib.ku
+v002_features.ku
 package/
 http_server.ku
 http_bench.ps1
@@ -213,7 +227,8 @@ http_bench.ps1
 
 ## 文档
 
-- [0.0.14 语法文档](docs/syntax.md)
+- [0.0.15 语法文档](docs/syntax.md)
+- [0.0.15 版本记录](docs/v0.0.15.md)
 - [0.0.14 版本记录](docs/v0.0.14.md)
 - [0.0.13 版本记录](docs/v0.0.13.md)
 - [0.0.12 版本记录](docs/v0.0.12.md)
@@ -235,11 +250,11 @@ http_bench.ps1
 
 `ku build` 当前生成解释器打包型可执行文件。单文件默认输出到源文件旁的 `.ku/build/<profile>/<name>`；有 `ku.mod` 时可以直接 `ku build` 或 `ku build .`，入口来自 `root + main`，默认 `src/main.ku`，输出目录来自 `out`，默认 `.ku/build`。支持 `-o` 指定输出、`--debug` / `--release` / `--profile debug|release|small|fast`、`--target` 目标目录分层、`--emit-ir`、`--emit-c`、`--emit-llvm` 和 `--backend c` 原型。`ku run build` 保留兼容，但会提示改用 `ku build`。
 
-注意：0.0.14 的默认 build 是“解释器打包型二进制”，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于最终 native ABI。带 import 的程序仍应保持源码依赖路径可访问。完整 native binary 目标仍在执行队列：native closure、正式 `KuString`、dynamic object、async state machine runtime、增量缓存和真正不依赖源码的 import graph 打包。
+注意：0.0.15 的默认 build 是“解释器打包型二进制”，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于最终 native ABI。带 import 的程序仍应保持源码依赖路径可访问。完整 native binary 目标仍在执行队列：native closure、正式 `KuString`、dynamic object、async state machine runtime、增量缓存和真正不依赖源码的 import graph 打包。
 
 `ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally` 和 return-through-finally。array/named/Result 已按默认 move、显式 `clone()`、自动 drop 生成所有权代码；闭包、动态 object、正式 owned string 和 async native lowering 仍会明确报不支持。
 
-已完成到 0.0.14 的关键前置：
+已完成到 0.0.15 的关键前置：
 
 ```txt
 支持 str | int 这类联合类型，用于参数、变量和返回值检查。
@@ -247,7 +262,7 @@ http_bench.ps1
 支持 `for i in 10` 非负整数迭代，语义为 `0 <= i < 10`。
 支持单语句控制体：`if (ok) break`、`while (i < 10) i++`、`for i in 4 total += i`。
 支持 `++i`、`--i`、`i++`、`i--` 和 `+=` / `-=` / `*=` / `/=` / `%=` 复合赋值。
-支持位置解构赋值 a, b = 1, 2 和丢弃占位符 _。
+支持位置解构赋值 a, b = 1, 2、对象解构赋值 `{ name, city: place, missing = fallback, ...rest } = obj` 和丢弃占位符 _。对象解构会消费右侧 object；要保留原对象时写 `obj.clone()`。
 支持可选字段访问 user?.name。
 支持带参数/返回类型的箭头函数，例如 `(a:int, b:int): int => a + b` 和 `x:int => x * 2`；函数保持第一公民。
 支持数组链式 map：nums.map(x => x * 2)。
@@ -265,7 +280,7 @@ async runtime 已有 blocking shutdown drain、累计指标和百万并发需求
 `std.time` 已按第一版文档实现 Time/Date/Duration object、format/parse/date/datetime/duration/add/sub/diff/compare/parts/weekday/is_leap/days_in_month/sleep 和固定偏移 zone。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
 match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。
-标准库可以用 `import { fs, http, time } from "std"` 一次导入多个模块。std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.empty/http.redirect/http.status/http.statusText/http.service/http.server 配置与响应 helper。`http.text/json(body)` 默认 200，`http.text/json(status, body)` 显式协议状态码，`http.empty()` 默认 204，`http.redirect(location)` 默认 302；业务 `body.code/msg/data` 由开发者自己维护。推荐用 `app = http.service()` 创建 HTTP service；旧的 `http.service` 属性式写法暂时兼容。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes，路径参数使用 `{id}`；handler 支持顶层函数名、`fn(req,res){...}` 和箭头函数，固定接收 `(req, res)`，返回 `{ status, headers, body }`，并禁止修改外层捕获变量；`req` 是请求对象，`res` 是 handler ABI 的响应占位对象，常规写法直接 return 响应 helper。bind/listen 只接收 address，配置来自 service/server 对象，会先真实绑定端口并编译运行时路由表，listen/run 会阻塞处理基础 HTTP 请求，listener.close 可显式关闭未运行的 listener。fs 需要 `import "std.fs"` 或 `import { fs } from "std"` 后使用，并提供 read/write 与 try_read/try_write。std.config 需要显式导入后使用，并提供 env/env_file/yaml 第一版配置读取。VS Code formatter 已支持 4 空格缩进、空行压缩、运算符/逗号空格、`++/--`、复合赋值和 `} else/catch/finally` 合并。
+标准库可以用 `import { fs, http, time } from "std"` 一次导入多个模块。std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.json/http.empty/http.redirect/http.status/http.statusText/http.service()/http.server() 配置与响应 helper。`http.text/json(body)` 默认 200，`http.text/json(status, body)` 显式协议状态码，`http.empty()` 默认 204，`http.redirect(location)` 默认 302；业务 `body.code/msg/data` 由开发者自己维护。必须用 `app = http.service()` 创建 HTTP service；旧的 `http.service` 属性式写法不再兼容。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes，路径参数使用 `{id}`；handler 支持顶层函数名、`fn(req,res){...}` 和箭头函数，固定接收 `(req, res)`，返回 `{ status, headers, body }`，并禁止修改外层捕获变量；`req` 是请求对象，`res` 是 handler ABI 的响应占位对象，常规写法直接 return 响应 helper。bind/listen 只接收 address，配置来自 service/server 对象，会先真实绑定端口并编译运行时路由表，listen/run 会阻塞处理基础 HTTP 请求，listener.close 可显式关闭未运行的 listener。fs 需要 `import "std.fs"` 或 `import { fs } from "std"` 后使用，并提供 read/write 与 try_read/try_write。std.config 需要显式导入后使用，并提供 env/env_file/yaml 第一版配置读取。VS Code formatter 已支持 4 空格缩进、空行压缩、运算符/逗号空格、`++/--`、复合赋值和 `} else/catch/finally` 合并。
 工具链新增 `ku create <name> --template <template>`、`ku init --template <template>` 和 `ku template list`；内置 basic/cli/http/json/fs/lib 模板。`ku run` / `ku check` 无参数时读取当前 `ku.mod` 的入口，带 `.ku` 文件路径时仍运行/检查指定文件。
 
 `print(value)` 不自动换行；需要逐行输出时使用 `println(value)`。
@@ -315,7 +330,7 @@ powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -InstallExt
 已提供：
 
 ```txt
-Ku 0.0.14 语法高亮和 snippet
+Ku 0.0.15 语法高亮和 snippet
 ku.mod / ku.lock 高亮
 保存/打开时运行 ku check，并把错误放进 Problems 面板
 命令面板：Run / Check / Show IR / Build / Build Native C / Package GC / Show Version
@@ -330,13 +345,13 @@ Ku 文件默认保存时格式化；import path 补全会替换引号内路径�
 图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择：
 
 ```txt
-editors/vscode-ku/ku-language-0.0.14.vsix
+editors/vscode-ku/ku-language-0.0.15.vsix
 ```
 
 命令安装方式：
 
 ```powershell
-code --install-extension editors\vscode-ku\ku-language-0.0.14.vsix --force
+code --install-extension editors\vscode-ku\ku-language-0.0.15.vsix --force
 ```
 
 ## 开发验证

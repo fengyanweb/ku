@@ -54,7 +54,20 @@ impl<'a> Lexer<'a> {
                 ',' => TokenKind::Comma,
                 ':' => TokenKind::Colon,
                 ';' => TokenKind::Semicolon,
-                '.' => TokenKind::Dot,
+                '.' => {
+                    if self.match_char('.') {
+                        if self.match_char('.') {
+                            TokenKind::Ellipsis
+                        } else {
+                            return Err(KuError::lex(
+                                "expected third '.' for '...'",
+                                Span::point(start),
+                            ));
+                        }
+                    } else {
+                        TokenKind::Dot
+                    }
+                }
                 '+' => {
                     if self.match_char('+') {
                         TokenKind::PlusPlus

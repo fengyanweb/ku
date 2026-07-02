@@ -240,6 +240,13 @@ impl KuError {
                 .note("Ku does not expose task.spawn, Task.new, or user-level task scheduling")
                 .help("start work by calling an async fn, then use `result = await task?`");
         }
+        if message.contains("std module member 'http.service'")
+            || message.contains("std module member 'http.server'")
+        {
+            return DiagnosticInfo::new("E0602")
+                .note("stdlib constructors are functions, not property-style default objects")
+                .help("write `app = http.service()` or `app = http.server(config)`");
+        }
         if message.starts_with("type error:") || message.contains("type mismatch") {
             return DiagnosticInfo::new("E0301");
         }

@@ -674,6 +674,12 @@ impl<'a> FunctionLowerer<'a> {
                     }
                 }
             }
+            Stmt::ObjectDestructureAssign { span, .. } => {
+                return Err(KuError::runtime(
+                    "IR/native lowering does not support object destructuring yet; use interpreter mode or destructure fields explicitly",
+                    *span,
+                ));
+            }
             Stmt::If {
                 condition,
                 then_branch,
@@ -1965,6 +1971,25 @@ fn collect_free_stmt_names(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut 
             }
             for name in names.iter().flatten() {
                 bound.insert(name.clone());
+            }
+        }
+        Stmt::ObjectDestructureAssign {
+            bindings,
+            rest,
+            value,
+            ..
+        } => {
+            collect_free_expr_names(value, bound, free);
+            for binding in bindings {
+                if let Some(default) = &binding.default {
+                    collect_free_expr_names(default, bound, free);
+                }
+                if let Some(local) = &binding.local {
+                    bound.insert(local.clone());
+                }
+            }
+            if let Some(local) = rest.as_ref().and_then(|rest| rest.local.as_ref()) {
+                bound.insert(local.clone());
             }
         }
         Stmt::If {

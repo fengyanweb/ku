@@ -1,7 +1,3 @@
-fn Ab()  {
-    return "A "
-}
-
 fn main() {
     println("Hello Ku")
 }

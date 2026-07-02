@@ -327,6 +327,66 @@ fn main() {
 }
 
 #[test]
+fn run_supports_object_destructuring_assignment() {
+    let source = r#"
+import { http } from "std"
+
+fn main() {
+    user = { code: 7, name: "Ku", city: "Hangzhou" }
+    { code, name: userName, missing = 42, ...rest } = user
+    { code: _ } = { code: 9 }
+    { code: httpCode } = http
+
+    if (code != 7) {
+        panic("bad shorthand field")
+    }
+    if (userName != "Ku") {
+        panic("bad renamed field")
+    }
+    if (missing != 42) {
+        panic("bad default field")
+    }
+    if (rest.city != "Hangzhou") {
+        panic("bad rest object")
+    }
+    if (httpCode.SUCCESS != 200) {
+        panic("bad std module object destructuring")
+    }
+}
+"#;
+
+    check_source("inline.ku", source).expect("object destructuring should check");
+    run_source("inline.ku", source).expect("object destructuring should run");
+
+    let err = check_source("inline.ku", "fn main() { { missing } = { name: \"Ku\" } }")
+        .expect_err("missing static field should fail");
+    assert!(
+        err.to_string().contains("object has no field 'missing'"),
+        "unexpected error: {err}"
+    );
+
+    let err = check_source(
+        "inline.ku",
+        "import { http } from \"std\" fn main() { { service } = http }",
+    )
+    .expect_err("http service must not be exposed as an object field");
+    assert!(
+        err.to_string().contains("object has no field 'service'"),
+        "unexpected error: {err}"
+    );
+
+    let err = run_source(
+        "inline.ku",
+        "fn main() { obj = json.parse(\"{}\") { missing } = obj }",
+    )
+    .expect_err("missing dynamic field should fail at runtime");
+    assert!(
+        err.to_string().contains("object has no key 'missing'"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn check_supports_union_parameter_types() {
     let source = r#"
 fn show(value: str | int): str {

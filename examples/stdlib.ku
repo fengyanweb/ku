@@ -1,3 +1,5 @@
+import { time } from "std"
+
 fn main() {
     text = string.trim("  Ku Lang  ")
     println(string.upper(text))

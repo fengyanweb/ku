@@ -419,7 +419,7 @@ fn run_http_service_handles_error_statuses_and_limits() {
 import "std.http"
 
 fn main(): null! {
-    app = http.service
+    app = http.service()
     app.max_body_bytes = 4
     app.max_header_bytes = 128
     app.read_header_timeout_ms = 500

@@ -69,6 +69,15 @@ fn main(): null! {
 cargo run -- run examples\http_server.ku
 ```
 
+HTTP service 必须通过函数调用创建：
+
+```ku
+app = http.service()
+server = http.server({ max_body_bytes: 4096 })
+```
+
+`http.service` / `http.server` 不再作为属性式默认对象运行。
+
 压测：
 
 ```powershell

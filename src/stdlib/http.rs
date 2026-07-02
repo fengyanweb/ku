@@ -153,10 +153,6 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
     }
 }
 
-pub fn default_server_value(span: Span) -> KuResult<Value> {
-    server_config_value(None, span)
-}
-
 pub fn status_object_value() -> Value {
     Value::Object(
         HTTP_STATUS_CODES

@@ -1,15 +1,14 @@
 fn main() {
+    total = 0
+    for i in 5 total += i
+
+    if (total == 10) println("sum ok") else println("sum bad")
+
     i = 0
-    total:int
-
-    while (i < 5) {
-        total = total + i
-        i = i + 1
-    }
-
-    if (total == 10) {
-        println("ok")
-    } else {
-        println("bad")
+    while (i < 10) {
+        i++
+        if (i < 3) continue
+        if (i > 4) break
+        println(i)
     }
 }

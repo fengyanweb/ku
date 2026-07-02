@@ -6,7 +6,7 @@
 
 暂无。
 
-本轮已完成的固定语法/API 和示例已写入 `docs/syntax.md`、`README.md`、`docs-site/guide/*` 与 `docs/v0.0.14.md`；这里不再重复堆清单。
+本轮已完成的固定语法/API 和示例已写入 `docs/syntax.md`、`README.md` 与 `docs/v0.0.15.md`；这里不再重复堆清单。
 
 ## 已决定的语言方向
 
@@ -20,6 +20,8 @@
 6. `struct` / `enum` / `array` 必须走 native layout；`object` 只用于动态数据和 JSON。
 7. 默认 move，显式 `clone`，自动 drop；不支持的 native 能力必须明确报错。
 8. benchmark 固定覆盖 loop / array / string / JSON / HTTP / memory。
+9. `http.service` / `http.server` 只允许函数调用形式，不保留属性式默认对象兼容。
+10. 对象解构赋值按 JS 风格固定：字段同名、重命名、default、rest；解释器/checker 先闭环，native dynamic object ABI 后续再 lowering。
 
 ## 已决定但仍在执行队列
 
@@ -33,7 +35,8 @@
 6. native async：等 native ABI 稳定后单独设计状态机 runtime，不使用 OS 线程冒充小协程；用户侧仍只保留“async fn 返回一次性 task + await task”模型，不开放 `task.spawn`、`Task.new`、`runtime.schedule` 或 `thread.spawn`。
 7. 最终 native binary build：在解释器打包型 `ku build` 稳定后，继续做完整 import graph 打包、runtime ABI lowering、object file/linker、增量 cache，并满足生成物不依赖 Ku 源码文件的验收标准。
 8. 严格检查未使用 import；未使用变量/常量也进入 error 方向，但要先设计 `_` 丢弃、测试/示例豁免和跨文件导出影响。
-9. 对象解构赋值按 JS 风格进入执行队列，例如 `{ code } = http`；需要先明确只支持对象字段，还是同时支持重命名/default/rest。
+9. `.clone()` / 深拷贝实现细则：Copy clone 消除；Owned 的 `str/array/object/struct/enum/Result/function` 显式 clone；Task 禁 clone；native 需要失败清理路径和 clone/drop 优化。
+10. IR 优化管线至少覆盖：常量折叠、死代码删除、简单函数内联、临时变量消除、drop 消除、clone 消除、escape analysis、stack allocation、monomorphization 泛型特化和 bounds check 优化。
 
 ## 下阶段建议顺序
 
@@ -41,4 +44,5 @@
 2. 再替换 native `const char*` 原型为正式 `KuString`。
 3. 再做 native dynamic object 和 `object.get_or`。
 4. 再做 registry 签名验证与受限 `.tar.zst` 解包。
-5. 再做未使用 import/变量检查和对象解构赋值语法。
+5. 再做未使用 import/变量检查。
+6. 再接入 IR 优化 pass，先做常量折叠、死代码删除和 bounds check 优化，再推进 clone/drop/escape/stack/monomorphization。

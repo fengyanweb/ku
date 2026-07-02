@@ -1,11 +1,21 @@
+import { http, time } from "std"
+
 fn main() {
-    nums: [int] = [11, 12, 13]
+    nums:[int] = [11, 12, 13]
+    total = 0
+    for i in 3 total += nums[i]
+
+    user = { name: "Ku", city: "Hangzhou", score: total }
+    { name, score: points, missing = "fallback", ...rest } = user.clone()
+    { code } = http
+
+    if (points > 30) println(name + " ok")
+
     println(nums[0])
-
-    text = "Ku"
-    println(text[0])
-
-    user = { name: "Ku" }
     println(user["name"])
     println(str(user["missing"]?))
+    println(rest.city)
+    println(missing)
+    println(code.SUCCESS)
+    println(time.millis() > 0)
 }
