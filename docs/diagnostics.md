@@ -59,4 +59,4 @@ fn main() {
 }
 ```
 
-当前普通函数参数 unused 仍未进入全局 error；HTTP handler 单独要求请求参数使用 `req`，不读取请求时必须写 `_req`。变量、常量、普通参数默认 warning 还需要先接 warning 管线，避免破坏 `ku check --json` 成功静默契约。
+当前普通函数参数 unused 仍未进入全局 error。HTTP handler 读取请求时写 `fn(req)`；不读取请求时主写法是 `fn()`。`fn(_req)` 保留给中间件、接口适配器、测试 mock 等签名必须带参数但暂时不用它的场景。变量、常量、普通参数默认 warning 还需要先接 warning 管线，避免破坏 `ku check --json` 成功静默契约。

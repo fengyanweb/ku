@@ -1902,6 +1902,14 @@ impl Interpreter {
                 span,
             ));
         }
+        let args = match params.len() {
+            0 => Vec::new(),
+            1 => vec![req],
+            _ => return Err(KuError::runtime(
+                "ordinary HTTP route handler accepts fn() or fn(req); fn(req, res) is not allowed",
+                span,
+            )),
+        };
         self.steps = 0;
         let previous_deadline = self.execution_deadline.replace(deadline);
         let result = self.call_function_value(FunctionValueCall {
@@ -1910,7 +1918,7 @@ impl Interpreter {
             captures: &captures,
             self_name: &self_name,
             is_async: false,
-            args: vec![req],
+            args,
             span,
             depth: 0,
         });

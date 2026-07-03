@@ -1,10 +1,10 @@
 import { http, time } from "std"
 
-fn health(_req) {
+fn health() {
     return http.text("Ku HTTP OK")
 }
 
-fn index(_req) {
+fn index() {
     return http.json({
         code: 0,
         msg: "成功",
@@ -16,7 +16,7 @@ fn index(_req) {
     })
 }
 
-fn created(_req) {
+fn created() {
     return http.json(http.status.created, {
         code: 0,
         msg: "created",
@@ -24,11 +24,11 @@ fn created(_req) {
     })
 }
 
-fn empty(_req) {
+fn empty() {
     return http.empty()
 }
 
-fn page(_req) {
+fn page() {
     return http.html("<h1>Ku HTTP</h1>")
 }
 

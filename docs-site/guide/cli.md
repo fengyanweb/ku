@@ -33,6 +33,6 @@ ku -h | -help
 
 当前没有 `ku fmt` / `ku test` 命令。
 
-`ku create` 创建新项目目录，`ku init` 初始化当前目录，`ku run` 只负责运行当前 package 或指定 `.ku` 文件。内置模板：`basic`、`cli`、`http`、`json`、`fs`、`lib`。
+`ku create` 创建新项目目录，`ku init` 初始化当前目录，`ku run` 只负责运行当前 package 或指定 `.ku` 文件。项目目录名允许大小写字母、数字、`_`、`-`；`ku.mod` 的 package `name` 仍保持小写。内置模板：`basic`、`cli`、`http`、`json`、`fs`、`lib`。
 
 `ku build` 默认生成解释器打包型可执行文件，输出到 `.ku/build/<profile>/<name>`；有 `ku.mod` 时可以无参读取 `root + main`，默认 `src/main.ku`。`--emit-c`、`--emit-ir`、`--emit-llvm` 会把调试产物写到 build 目录；完整 native ABI 仍在后续路线中。

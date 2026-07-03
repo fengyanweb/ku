@@ -58,10 +58,11 @@ ku build --release -o dist\demo.exe
 
 ## Create / Init
 
-`ku create <name> --template <template>` 创建新目录；`ku init --template <template>` 在当前目录写入 `ku.mod` 和 `src/main.ku`。默认模板是 `basic`。
+`ku create <name> --template <template>` 创建新目录；`ku init --template <template>` 在当前目录写入 `ku.mod` 和 `src/main.ku`。默认模板是 `basic`。项目目录名允许大小写字母、数字、`_`、`-`，但 `ku.mod` 里的 package `name` 仍按包管理规则保持小写；`ku create HelloWorld` 会生成 `name = "helloworld"`。
 
 ```powershell
 ku create hello
+ku create HelloWorld --template http
 ku create my-api --template http
 ku init --template cli
 ku template list

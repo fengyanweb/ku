@@ -155,11 +155,11 @@
     "body": [
       "import { http } from \"std\"",
       "",
-      "fn health(_req) {",
+      "fn health() {",
       "    return http.text(\"ok\")",
       "}",
       "",
-      "fn index(_req) {",
+      "fn index() {",
       "    return http.text(\"Ku HTTP 123\")",
       "}",
       "",

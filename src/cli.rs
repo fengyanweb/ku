@@ -74,7 +74,7 @@ Usage:
 
 Examples:
   ku create hello
-  ku create my-api --template http
+  ku create HelloWorld --template http
   ku init --template cli
   ku template list
   ku run
@@ -411,7 +411,8 @@ fn write_project_template(
             path.display()
         ))
     })?;
-    let manifest = project_manifest(name, template);
+    let package_name = package_name_from_project_name(name);
+    let manifest = project_manifest(&package_name, template);
     let main = project_main_source(template);
     fs::write(&manifest_path, manifest).map_err(|err| {
         KuError::message(format!(
@@ -456,11 +457,11 @@ fn project_main_source(template: &ProjectTemplate) -> &'static str {
         "http" => {
             r#"import { http, time } from "std"
 
-fn health(_req) {
+fn health() {
     return http.text("Ku HTTP OK")
 }
 
-fn index(_req) {
+fn index() {
     return http.text("Ku HTTP 123")
 }
 
@@ -544,7 +545,7 @@ fn validate_project_name(name: &str) -> Result<(), KuError> {
     } else {
         Err(project_command_error(
             format!("invalid project name '{name}'"),
-            "help: use lowercase names like `hello`, `my-api`, or `data_tool`",
+            "help: use names like `hello`, `HelloWorld`, `my-api`, or `data_tool`",
         ))
     }
 }
@@ -554,8 +555,12 @@ fn is_valid_project_name(name: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    first.is_ascii_lowercase()
-        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+    first.is_ascii_alphabetic()
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn package_name_from_project_name(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 fn project_command_error(message: impl Into<String>, help: impl Into<String>) -> KuError {

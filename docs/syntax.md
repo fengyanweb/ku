@@ -1643,17 +1643,17 @@ text = http.statusText(http.status.notFound) // "Not Found"
 HTTP server/router API 已固定服务配置对象：
 
 ```ku
-fn index(_req) {
+fn index() {
     return http.text("ok")
 }
 
 service = http.service()
 server = http.server({ max_body_bytes: 4096 })
 service.get("/index", index)
-service.get("/fn", fn(_req) {
+service.get("/fn", fn() {
     return http.text("Ku HTTP 123")
 })
-service.post("/pets", fn(_req) {
+service.post("/pets", fn() {
     return http.json(http.status.created, { code: 0, msg: "created", data: null })
 })
 service.get("/user/{id}", fn(req) {
@@ -1670,21 +1670,25 @@ print(service.routes[0].method)
 
 `http.service()` / `http.server(config?)` 返回 service 配置对象。`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。
 
-普通 HTTP handler 固定只接收一个请求参数：
+普通 HTTP handler 可以接收 0 或 1 个请求参数：
 
 ```ku
-fn route(req) {
-    return http.text(req.path.clone())
+fn health() {
+    return http.empty()
 }
 
-fn health(_req) {
-    return http.empty()
+service.get("/path", fn(req) {
+    return http.text(req.path.clone())
+})
+
+fn adapter(_req) {
+    return http.text("adapter")
 }
 ```
 
-参数必须命名为 `req`；如果 handler 不读取请求，必须写 `_req`。普通 handler 不允许第二个 `res` / `writer` 参数，也不允许调用 `res.write`、`res.end`、`reply.send`、`writer.write` 这类副作用式响应 API。响应统一通过 `return http.text/json/html/empty/redirect(...)` 返回。handler 返回值必须是 `HttpResponse` 形状对象或 `HttpResponse!`。
+`fn()` 用于不读取请求的 route；`fn(req)` 用于读取 `method/path/params/query/headers/body` 的 route。`fn(_req)` 仍然保留，但只用于以后中间件、接口适配器、测试 mock 这类“签名必须带参数但暂时不用它”的场景，不作为 HTTP 普通路由模板主写法。普通 handler 不允许第二个 `res` / `writer` 参数，也不允许调用 `res.write`、`res.end`、`reply.send`、`writer.write` 这类副作用式响应 API。响应统一通过 `return http.text/json/html/empty/redirect(...)` 返回。handler 返回值必须是 `HttpResponse` 形状对象或 `HttpResponse!`。
 
-当前还没有公开的 `HttpRequest` 名义类型可用于顶层函数参数注解；需要读取 `req.method/path/params/...` 时，推荐在 route 注册点写 `fn(req) { ... }`，这样 checker 会按 HTTP handler 上下文检查请求字段。不读取请求的顶层 handler 可以写 `fn health(_req) { return http.empty() }` 后传给 route。
+当前还没有公开的 `HttpRequest` 名义类型可用于顶层函数参数注解；需要读取 `req.method/path/params/...` 时，推荐在 route 注册点写 `fn(req) { ... }`，这样 checker 会按 HTTP handler 上下文检查请求字段。不读取请求的顶层 handler 推荐写 `fn health() { return http.empty() }` 后传给 route。
 
 第一版 `req` 字段：
 
@@ -1699,7 +1703,7 @@ req.body: str
 
 `req` 是请求对象，提供 method/path、路由参数、query、headers 和 body。`del` 是当前唯一的删除路由 API，对应 HTTP 协议方法 `DELETE`；不额外提供 `delete` 别名。
 
-HTTP handler 会在类型检查阶段按单参数 Return 模型复查参数和返回值。为了给后续并发 runtime 留安全边界，handler 第一版不能修改外层捕获变量；需要共享状态时后续应通过专门的 `std.atomic` / `std.sync` 一类 API 设计。
+HTTP handler 会在类型检查阶段按 0/1 参数 Return 模型复查参数和返回值。为了给后续并发 runtime 留安全边界，handler 第一版不能修改外层捕获变量；需要共享状态时后续应通过专门的 `std.atomic` / `std.sync` 一类 API 设计。
 
 `writer` 会保留给受控流式响应，但它不是普通 handler 参数。后续 `http.stream(fn(writer) { ... })` 落地时，`writer.write(value)` 必须返回 Result 并由调用方处理；`writer.status(code)` / `writer.header(name, value)` 只能在第一次 write 前调用；不会给普通用户暴露 `writer.end()`，stream 函数正常返回后 runtime 自动结束。当前一次性响应 runtime 还没有开放 `http.stream/sse/websocket`。
 
@@ -1889,7 +1893,7 @@ ku --help
 ku help
 ```
 
-`ku create` 创建新目录，`ku init` 初始化当前目录，`ku run` 只负责运行当前 package 或指定 `.ku` 文件，不再承担创建项目语义。内置模板：
+`ku create` 创建新目录，`ku init` 初始化当前目录，`ku run` 只负责运行当前 package 或指定 `.ku` 文件，不再承担创建项目语义。项目目录名允许大小写字母、数字、`_`、`-`；生成到 `ku.mod` 的 package `name` 仍是小写包名，例如 `ku create HelloWorld` 会写入 `name = "helloworld"`。内置模板：
 
 ```txt
 basic    minimal Ku project
@@ -1929,7 +1933,7 @@ level code message file line column endLine endColumn notes helps
 
 VS Code 扩展优先读取 JSON diagnostics；面对旧版 Ku CLI 时只回退一次文本解析，不循环重试。
 
-未使用 import 默认报 `E0901`，named import 和 namespace import 都会检查；用 `_` 或 `_name` alias 表示明确丢弃。glob / side-effect import 暂不做 unused 判断，避免误伤副作用导入。`ku check --deny-unused` 继续开启严格 unused 本地绑定检查：本文件局部变量/常量如果声明后没有被读取，会报 `E0905`；用 `_` 或 `_name` 表示明确丢弃。普通函数参数当前仍不纳入全局 unused 错误，但 HTTP handler 的请求参数会单独检查：读取请求时必须叫 `req`，不读取时必须叫 `_req`。
+未使用 import 默认报 `E0901`，named import 和 namespace import 都会检查；用 `_` 或 `_name` alias 表示明确丢弃。glob / side-effect import 暂不做 unused 判断，避免误伤副作用导入。`ku check --deny-unused` 继续开启严格 unused 本地绑定检查：本文件局部变量/常量如果声明后没有被读取，会报 `E0905`；用 `_` 或 `_name` 表示明确丢弃。普通函数参数当前仍不纳入全局 unused 错误。HTTP handler 读取请求时写 `fn(req)`；不读取请求时主写法是 `fn()`，`fn(_req)` 只保留给适配器/测试 mock 等必须带参数的场景。
 
 `ku llvm file.ku` 在源文件旁输出 `.ll`，不要求本机安装 LLVM。当前文本后端支持 `int/bool/str`、普通函数、局部变量、直接调用、`return`、`if/while`、`print`、非递归 struct 值与字段读写，以及 `Result<int|bool|str|struct>` 的 `ok`、`fail`、`?` 和错误传播。数组、enum、闭包、HTTP 和 async 仍会明确报不支持。后端会拒绝递归值 struct、缺失/重复 CFG block 和无条件自跳，避免生成明显错误或永久循环的 `.ll`。golden test 不依赖外部工具；检测到 `llvm-as` 时会额外验证生成文本。
 

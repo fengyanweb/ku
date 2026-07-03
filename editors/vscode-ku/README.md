@@ -15,7 +15,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 - Status bar version check for interpreter/plugin mismatch.
 - Hover docs for async/await, Error, Result, std.fs, std.http, std.config, std.task, match, string and array helpers.
 - Completion for keywords, base types, builtins, stdlib modules/functions, Error fields, HttpResponse fields, string/array methods, import paths, and package dependency prefixes. Member completion is context-aware: typing `http.se` offers `service` / `server`, and those constructors insert `service()` / `server()` so old property-style objects are not suggested; global completion no longer inserts bare `http.service` / `http.server`.
-- HTTP handler completions understand common `req` / `res` / `app` / `router` names, so `req.` offers request fields instead of falling back to global stdlib functions.
+- HTTP handler completions understand `req` / `app` / `router` names, so `req.` offers request fields instead of falling back to global stdlib functions. Normal route templates use `fn()` when request data is not needed and `fn(req)` when it is.
 - Ordinary async task handles are one-use values returned by `async fn`; the extension does not suggest `status` / `cancel` / `await_timeout` lifecycle methods for them.
 - Typed arrow functions are first-class values. Object indexing is strict by default; `object[key]?` is the explicit nullable lookup form. Object destructuring snippets cover rename/default/rest.
 - JSON diagnostics are routed to the actual imported file, and stale checks cannot overwrite a newer save/change result.

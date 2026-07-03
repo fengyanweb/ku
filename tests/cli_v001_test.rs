@@ -354,7 +354,7 @@ fn run_http_service_handles_local_request() {
     let source = r#"
 import "std.http"
 
-fn exact(_req) {
+fn exact() {
     return http.text("exact")
 }
 
@@ -367,7 +367,7 @@ fn main(): null! {
     app.get("/user/{id}", fn(req) {
         return http.text(req.params.id + ":" + req.query.q + ":" + req.headers.host)
     })
-    app.del("/gone", fn(_req) {
+    app.del("/gone", fn() {
         return http.empty()
     })
     app.listen("__ADDRESS__")?
@@ -433,7 +433,7 @@ fn main(): null! {
     app.read_header_timeout_ms = 500
     app.read_body_timeout_ms = 500
     app.write_timeout_ms = 500
-    app.get("/ok", fn(_req) {
+    app.get("/ok", fn() {
         return http.text("ok")
     })
     app.post("/echo", fn(req) {
@@ -503,12 +503,12 @@ fn main(): null! {
         max_active_requests: 2,
         max_pending_requests: 4
     })
-    app.get("/slow", fn(_req) {
+    app.get("/slow", fn() {
         while (true) {
         }
         return http.text("unreachable")
     })
-    app.get("/ok", fn(_req) {
+    app.get("/ok", fn() {
         return http.text("ok")
     })
     app.listen("__ADDRESS__")?
@@ -562,7 +562,7 @@ fn main(): null! {
         max_active_requests: 1,
         max_pending_requests: 1
     })
-    app.get("/ok", fn(_req) {
+    app.get("/ok", fn() {
         return http.text("ok")
     })
     app.listen("__ADDRESS__")?

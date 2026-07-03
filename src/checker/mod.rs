@@ -1714,56 +1714,61 @@ impl Checker {
         body: &[Stmt],
         span: Span,
     ) -> KuResult<()> {
-        if params.len() != 1 {
-            return Err(KuError::runtime(
-                format!("http service {method} handler expects exactly one req parameter"),
-                span,
-            ));
-        }
-        let param = &params[0];
-        if matches!(param.name.as_str(), "res" | "writer") {
-            return Err(KuError::runtime(
-                "http handler parameter must be named req, or _req when intentionally unused; res/writer parameters are not allowed in ordinary handlers",
-                span,
-            ));
-        }
-        if param.name != "req" && param.name != "_req" {
+        if params.len() > 1 {
             return Err(KuError::runtime(
                 format!(
-                    "http handler parameter must be named req, or _req when intentionally unused; got '{}'",
-                    param.name
+                    "ordinary HTTP route handler for {method} accepts fn() or fn(req); fn(req, res) is not allowed"
                 ),
                 span,
             ));
         }
-        if param.name == "req" && !function_body_uses_name(body, "req") {
-            return Err(KuError::runtime(
-                "http handler parameter 'req' is unused; write '_req' when the request is intentionally unused",
-                span,
-            ));
-        }
+        let arg_types = if let Some(param) = params.first() {
+            if matches!(param.name.as_str(), "res" | "writer") {
+                return Err(KuError::runtime(
+                    "http handler parameter must be named req, or _req when an adapter requires an unused request parameter; res/writer parameters are not allowed in ordinary handlers",
+                    span,
+                ));
+            }
+            if param.name != "req" && param.name != "_req" {
+                return Err(KuError::runtime(
+                    format!(
+                        "http handler parameter must be named req, or _req when an adapter requires an unused request parameter; got '{}'",
+                        param.name
+                    ),
+                    span,
+                ));
+            }
+            if param.name == "req" && !function_body_uses_name(body, "req") {
+                return Err(KuError::runtime(
+                    "http handler parameter 'req' is unused; write fn() when the route does not need the request",
+                    span,
+                ));
+            }
+            vec![http_request_type()]
+        } else {
+            Vec::new()
+        };
         reject_http_side_effect_response_calls(body, span)?;
         let response = http_response_type();
         let result_response = Type::Result(Box::new(response.clone()));
         let allowed = union_or_single(vec![response.clone(), result_response.clone()]);
-        let expected = return_type.unwrap_or(&allowed);
-        if !type_matches(&allowed, expected) {
-            return Err(type_error(span, &allowed, expected));
+        if let Some(return_type) = return_type {
+            if !type_matches(&allowed, return_type) {
+                return Err(http_handler_return_error(span, return_type));
+            }
+        }
+        if !block_may_return(body) {
+            return Err(http_handler_return_error(span, &Type::Null));
         }
         let actual = self.check_function_value_call_with_types_readonly_captures(
             params,
-            Some(expected),
+            return_type,
             body,
-            &[http_request_type()],
+            &arg_types,
             span,
         )?;
-        if let Some(return_type) = return_type {
-            if !type_matches(&allowed, return_type) {
-                return Err(type_error(span, &allowed, return_type));
-            }
-        }
         if !type_matches(&allowed, &actual) {
-            return Err(type_error(span, &allowed, &actual));
+            return Err(http_handler_return_error(span, &actual));
         }
         Ok(())
     }
@@ -3881,6 +3886,16 @@ fn type_error(span: Span, expected: &Type, actual: &Type) -> KuError {
         format!(
             "type error: expected {} but got {}",
             type_name(expected),
+            type_name(actual)
+        ),
+        span,
+    )
+}
+
+fn http_handler_return_error(span: Span, actual: &Type) -> KuError {
+    KuError::runtime(
+        format!(
+            "HTTP handler must return HttpResponse or HttpResponse!, but got {}",
             type_name(actual)
         ),
         span,

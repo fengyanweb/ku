@@ -360,7 +360,7 @@ fn main() {
 import "std.http"
 
 fn main() {
-    http.service.get("/", fn(_req) {
+    http.service.get("/", fn() {
         return http.text("bad")
     })
 }
@@ -415,10 +415,10 @@ import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/index", fn(_req) {
+    app.get("/index", fn() {
         return http.text("ok")
     })
-    app.post("/pets", fn(_req) {
+    app.post("/pets", fn() {
         return http.json({ ok: true })
     })
     app.get("/user/{id}", fn(req) {
@@ -503,7 +503,7 @@ import "std.http"
 
 fn main(): null! {
     app = http.service()
-    app.get("/user/{id}", fn(_req) {
+    app.get("/user/{id}", fn() {
         return http.text("ok")
     })
     listener = app.bind(":0")?
@@ -528,10 +528,10 @@ import "std.http"
 
 fn main(): null! {
     app = http.service()
-    app.get("/user/{id}", fn(_req) {
+    app.get("/user/{id}", fn() {
         return http.text("one")
     })
-    app.get("/user/{name}", fn(_req) {
+    app.get("/user/{name}", fn() {
         return http.text("two")
     })
     app.bind(":0")?
@@ -549,7 +549,7 @@ import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/user/:id", fn(_req) {
+    app.get("/user/:id", fn() {
         return http.text("bad")
     })
 }
@@ -565,7 +565,7 @@ import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/user/{id}", { auth: "none" }, fn(_req) {
+    app.get("/user/{id}", { auth: "none" }, fn() {
         return http.text("bad")
     })
 }
@@ -608,6 +608,26 @@ fn main() {
 "#;
     check_source("inline.ku", valid).expect("http handler request fields should check");
 
+    let valid_no_req = r#"
+import "std.http"
+
+fn health() {
+    return http.text("ok")
+}
+
+fn main() {
+    app = http.service()
+    app.get("/", health)
+    app.get("/inline", fn() {
+        return http.text("inline")
+    })
+    app.get("/adapter", fn(_req) {
+        return http.text("adapter")
+    })
+}
+"#;
+    check_source("inline.ku", valid_no_req).expect("http handlers may omit req");
+
     let wrong_arity = r#"
 import "std.http"
 
@@ -620,7 +640,7 @@ fn main() {
 "#;
     let err = check_err(wrong_arity);
     assert!(
-        err.contains("expects exactly one req parameter"),
+        err.contains("accepts fn() or fn(req); fn(req, res) is not allowed"),
         "unexpected error: {err}"
     );
 
@@ -635,21 +655,55 @@ fn main() {
 }
 "#;
     let err = check_err(unused_req);
-    assert!(err.contains("write '_req'"), "unexpected error: {err}");
+    assert!(err.contains("write fn()"), "unexpected error: {err}");
 
     let bad_return = r#"
 import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/", fn(_req) {
+    app.get("/", fn() {
         return "bad"
     })
 }
 "#;
     let err = check_err(bad_return);
     assert!(
-        err.contains("expected object | object! but got str"),
+        err.contains("HTTP handler must return HttpResponse or HttpResponse!, but got str"),
+        "unexpected error: {err}"
+    );
+
+    let missing_return = r#"
+import "std.http"
+
+fn main() {
+    app = http.service()
+    app.get("/", fn() {
+        value = 1
+    })
+}
+"#;
+    let err = check_err(missing_return);
+    assert!(
+        err.contains("HTTP handler must return HttpResponse or HttpResponse!, but got null"),
+        "unexpected error: {err}"
+    );
+
+    let incomplete_return = r#"
+import "std.http"
+
+fn main() {
+    app = http.service()
+    app.get("/", fn(req) {
+        if (req.path == "/") {
+            return http.text("ok")
+        }
+    })
+}
+"#;
+    let err = check_err(incomplete_return);
+    assert!(
+        err.contains("HTTP handler must return HttpResponse or HttpResponse!, but got null"),
         "unexpected error: {err}"
     );
 
@@ -659,7 +713,7 @@ import "std.http"
 fn main() {
     count = 0
     app = http.service()
-    app.get("/", fn(_req) {
+    app.get("/", fn() {
         count = count + 1
         return http.text("bad")
     })
@@ -677,7 +731,7 @@ import "std.http"
 fn main() {
     state = { n: 0 }
     app = http.service()
-    app.get("/", fn(_req) {
+    app.get("/", fn() {
         state.n = 1
         return http.text("bad")
     })
@@ -711,7 +765,7 @@ import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/", fn(_req) {
+    app.get("/", fn() {
         return ok(http.text("ok"))
     })
 }

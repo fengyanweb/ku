@@ -260,12 +260,16 @@ impl KuError {
         if message.contains("http handler parameter")
             || message.contains("res/writer parameters are not allowed")
             || message.contains("side-effect response API")
+            || message.contains("ordinary HTTP route handler")
+            || message.contains("fn(req, res) is not allowed")
         {
             return DiagnosticInfo::new("E0701")
                 .note("ordinary HTTP handlers use the Return model")
-                .help("write `fn(req) { return http.text(...) }`, or `fn(_req) { ... }` when the request is intentionally unused");
+                .help("write `fn() { return http.text(...) }` when request data is not needed, or `fn(req) { ... }` when it is");
         }
-        if message.contains("handler did not return HttpResponse") {
+        if message.contains("handler did not return HttpResponse")
+            || message.contains("HTTP handler must return HttpResponse")
+        {
             return DiagnosticInfo::new("E0702")
                 .note("HTTP handlers must return an HttpResponse or HttpResponse!")
                 .help("return `http.text/json/html/empty/redirect(...)` from the handler");

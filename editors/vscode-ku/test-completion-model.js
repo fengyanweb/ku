@@ -59,7 +59,7 @@ for (const forbidden of ["req, res", "(req, res)", "res.write", "res.end", "repl
   assert(!httpSnippet.includes(forbidden), `http snippet must not include ${forbidden}`);
 }
 assert(httpSnippet.includes("http.service()"));
-assert(httpSnippet.includes("fn health(_req)"));
+assert(httpSnippet.includes("fn health()"));
 assert(httpSnippet.includes("app.get(\"/json\", fn(req)"));
 
 console.log("ku completion model ok");

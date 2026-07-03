@@ -212,6 +212,11 @@ fn create_init_and_template_commands_manage_projects() {
         project.join("src").join("main.ku").exists(),
         "missing main.ku"
     );
+    let manifest = fs::read_to_string(project.join("ku.mod")).expect("read ku.mod");
+    assert!(
+        manifest.contains("name = \"my-api\""),
+        "manifest should preserve valid lowercase package name:\n{manifest}"
+    );
 
     let check = run_with_timeout_in(project.clone(), &bin, &["check"], Duration::from_secs(2));
     assert_eq!(
@@ -233,6 +238,39 @@ fn create_init_and_template_commands_manage_projects() {
         duplicate.stderr.contains("E1001"),
         "duplicate create missing code: {}",
         duplicate.stderr
+    );
+
+    let mixed_case = run_with_timeout_in(
+        root.clone(),
+        &bin,
+        &["create", "HelloWorld", "--template", "http"],
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        mixed_case.code,
+        Some(0),
+        "mixed-case create failed\nstdout:\n{}\nstderr:\n{}",
+        mixed_case.stdout,
+        mixed_case.stderr
+    );
+    let mixed_project = root.join("HelloWorld");
+    let mixed_manifest = fs::read_to_string(mixed_project.join("ku.mod")).expect("read ku.mod");
+    assert!(
+        mixed_manifest.contains("name = \"helloworld\""),
+        "mixed-case project names should lower-case the package name:\n{mixed_manifest}"
+    );
+    let mixed_check = run_with_timeout_in(
+        mixed_project.clone(),
+        &bin,
+        &["check"],
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        mixed_check.code,
+        Some(0),
+        "mixed-case project check failed\nstdout:\n{}\nstderr:\n{}",
+        mixed_check.stdout,
+        mixed_check.stderr
     );
 
     let init_dir = root.join("existing");
@@ -371,6 +409,18 @@ fn check_errors_include_codes_notes_and_help() {
             "async fn load(): int! { return ok(1) }\nasync fn main(): null! {\n    task = load()\n    first = await task?\n    second = await task?\n    return ok(null)\n}\n",
             "E0804",
             "store the awaited value",
+        ),
+        (
+            "http-handler-arity.ku",
+            "import \"std.http\"\nfn main() {\n    app = http.service()\n    app.get(\"/\", fn(req, res) { return http.text(\"bad\") })\n}\n",
+            "E0701",
+            "fn(req)",
+        ),
+        (
+            "http-handler-return.ku",
+            "import \"std.http\"\nfn main() {\n    app = http.service()\n    app.get(\"/\", fn() { return \"bad\" })\n}\n",
+            "E0702",
+            "HttpResponse",
         ),
     ];
 

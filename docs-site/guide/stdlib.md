@@ -97,7 +97,7 @@ return http.redirect("/login")
 println(http.statusText(http.status.notFound))
 ```
 
-HTTP status 是协议状态码；业务 `body.code/msg/data` 由开发者自己维护。普通 handler 固定只接收 `req` 一个参数；不读取请求时写 `_req`。handler 不接收 `res/writer`，普通代码直接返回 `http.text/json/html/empty/redirect(...)`。
+HTTP status 是协议状态码；业务 `body.code/msg/data` 由开发者自己维护。普通 handler 不读请求时写 `fn()`，读取请求时写 `fn(req)`；`_req` 只保留给适配器/测试 mock 等必须带参数但暂时不用的场景。handler 不接收 `res/writer`，普通代码直接返回 `http.text/json/html/empty/redirect(...)`。
 
 ## task
 
