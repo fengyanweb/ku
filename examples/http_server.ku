@@ -1,25 +1,43 @@
 import { http, time } from "std"
 
-fn ret(req, res) {
+fn health(_req) {
     return http.text("Ku HTTP OK")
+}
+
+fn index(_req) {
+    return http.json({
+        code: 0,
+        msg: "成功",
+        data: {
+            name: "张三",
+            age: 18,
+            aihao: ["打羽毛球", "吃饭"]
+        }
+    })
+}
+
+fn created(_req) {
+    return http.json(http.status.created, {
+        code: 0,
+        msg: "created",
+        data: null
+    })
+}
+
+fn empty(_req) {
+    return http.empty()
+}
+
+fn page(_req) {
+    return http.html("<h1>Ku HTTP</h1>")
 }
 
 fn main(): null! {
     app = http.service()
 
-    app.get("/", ret)
-    app.get("/index", fn(req, res) {
-        return http.json({
-            code: 0,
-            msg: "成功",
-            data: {
-                name: "张三",
-                age: 18,
-                aihao: ["打羽毛球", "吃饭"]
-            }
-        })
-    })
-    app.get("/json", (req, res) => {
+    app.get("/", health)
+    app.get("/index", index)
+    app.get("/json", fn(req) {
         return http.json({
             code: 0,
             msg: "ok",
@@ -29,14 +47,8 @@ fn main(): null! {
             }
         })
     })
-    app.get("/created", (req, res) => {
-        return http.json(http.status.created, {
-            code: 0,
-            msg: "created",
-            data: null
-        })
-    })
-    app.get("/user/{id}", (req, res) => {
+    app.get("/created", created)
+    app.get("/user/{id}", fn(req) {
         return http.json({
             code: 0,
             msg: "ok",
@@ -47,15 +59,14 @@ fn main(): null! {
             }
         })
     })
-    app.post("/echo", (req, res) => {
+    app.post("/echo", fn(req) {
         return http.text(req.body.clone())
     })
-    app.get("/empty", (req, res) => {
-        return http.empty()
-    })
+    app.get("/empty", empty)
+    app.get("/page", page)
 
     println("Ku HTTP server listening on http://127.0.0.1:8080")
-    println("Try: GET /, GET /index, GET /json, GET /created, GET /user/42?q=ku, GET /empty, POST /echo")
+    println("Try: GET /, GET /index, GET /json, GET /created, GET /user/42?q=ku, GET /empty, GET /page, POST /echo")
     app.listen("127.0.0.1:8080")?
     return ok(null)
 }

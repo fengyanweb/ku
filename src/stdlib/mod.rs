@@ -16,6 +16,7 @@ pub mod fs;
 pub mod http;
 pub mod json;
 pub(crate) mod metadata;
+pub mod object;
 pub mod string;
 pub mod time;
 
@@ -39,6 +40,7 @@ pub fn eval_dotted_builtin(
         "array" => array::eval(&function, args, span),
         "config" => config::eval(&function, args, span, base_dir),
         "json" => json::eval(&function, args, span),
+        "object" => object::eval(&function, args, span),
         "time" => time::eval(&function, args, span),
         "http" => http::eval(&function, args, span),
         _ => Ok(None),

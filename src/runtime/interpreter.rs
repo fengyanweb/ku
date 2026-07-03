@@ -838,6 +838,7 @@ impl Interpreter {
         let module = match &target_value {
             Value::String(_) => "string",
             Value::Array(_) if name != "map" => "array",
+            Value::Object(_) if name == "get_or" => "object",
             _ => return Ok(None),
         };
         let mut values = Vec::with_capacity(args.len() + 1);
@@ -851,6 +852,7 @@ impl Interpreter {
         match module {
             "string" => stdlib::string::eval(name, &values, span),
             "array" => stdlib::array::eval(name, &values, span),
+            "object" => stdlib::object::eval(name, &values, span),
             _ => Ok(None),
         }
     }
@@ -1862,8 +1864,7 @@ impl Interpreter {
         match route {
             RouteLookup::Found(handler, params) => {
                 let req = http_request_value(&request, params);
-                let res = Value::Object(HashMap::new());
-                match self.call_http_handler(handler, req, res, span, deadline) {
+                match self.call_http_handler(handler, req, span, deadline) {
                     Ok(value) => value_to_http_response(value).unwrap_or_else(|| {
                         status_response(500, "handler did not return HttpResponse")
                     }),
@@ -1882,7 +1883,6 @@ impl Interpreter {
         &mut self,
         handler: Value,
         req: Value,
-        res: Value,
         span: Span,
         deadline: Instant,
     ) -> KuResult<Value> {
@@ -1910,7 +1910,7 @@ impl Interpreter {
             captures: &captures,
             self_name: &self_name,
             is_async: false,
-            args: vec![req, res],
+            args: vec![req],
             span,
             depth: 0,
         });
@@ -2354,7 +2354,7 @@ fn append_http_route(
     routes.push(Value::Object(HashMap::from([
         (
             "method".to_string(),
-            Value::String(method.to_ascii_uppercase()),
+            Value::String(http_route_method(method).to_string()),
         ),
         ("path".to_string(), Value::String(path)),
         (
@@ -2364,6 +2364,16 @@ fn append_http_route(
         ("handler".to_string(), handler),
     ])));
     Ok(())
+}
+
+fn http_route_method(method: &str) -> &'static str {
+    match method {
+        "get" => "GET",
+        "post" => "POST",
+        "put" => "PUT",
+        "del" => "DELETE",
+        _ => unreachable!("checked route methods are normalized before route append"),
+    }
 }
 
 fn http_listener_value(
@@ -3016,6 +3026,12 @@ struct HttpWireResponse {
 }
 
 fn value_to_http_response(value: Value) -> Option<HttpWireResponse> {
+    if let Value::Result { ok, value } = value {
+        if ok {
+            return value_to_http_response(*value);
+        }
+        return Some(status_response(500, &http_error_message(*value)));
+    }
     let Value::Object(fields) = value else {
         return None;
     };
@@ -3042,6 +3058,15 @@ fn value_to_http_response(value: Value) -> Option<HttpWireResponse> {
         headers,
         body,
     })
+}
+
+fn http_error_message(value: Value) -> String {
+    if let Value::Object(fields) = &value {
+        if let Some(Value::String(message)) = fields.get("message") {
+            return message.clone();
+        }
+    }
+    value.to_string()
 }
 
 fn status_response(status: i64, message: &str) -> HttpWireResponse {

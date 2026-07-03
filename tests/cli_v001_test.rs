@@ -354,18 +354,21 @@ fn run_http_service_handles_local_request() {
     let source = r#"
 import "std.http"
 
-fn exact(req, res) {
+fn exact(_req) {
     return http.text("exact")
 }
 
 fn main(): null! {
     app = http.service()
     app.get("/user/me", exact)
-    app.get("/fn", fn(req, res) {
+    app.get("/fn", fn(req) {
         return http.text(req.path.clone())
     })
-    app.get("/user/{id}", (req, res) => {
+    app.get("/user/{id}", fn(req) {
         return http.text(req.params.id + ":" + req.query.q + ":" + req.headers.host)
+    })
+    app.del("/gone", fn(_req) {
+        return http.empty()
     })
     app.listen("__ADDRESS__")?
     return ok(null)
@@ -397,18 +400,23 @@ fn main(): null! {
     let request = "GET /user/42?q=ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     let response = http_response_or_stop(&mut server, &address, request);
 
-    let output = server.take().expect("server should exist").stop();
-
     assert!(
         response.starts_with("HTTP/1.1 200 OK"),
-        "unexpected http response:\n{response}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "unexpected http response:\n{response}"
     );
     assert!(
         response.contains("\r\n\r\n42:ok:localhost"),
         "unexpected http response body:\n{response}"
     );
+
+    let deleted = http_response_or_stop(
+        &mut server,
+        &address,
+        "DELETE /gone HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_http_status(&deleted, "HTTP/1.1 204 No Content");
+
+    let _ = server.take().expect("server should exist").stop();
 }
 
 #[test]
@@ -425,8 +433,12 @@ fn main(): null! {
     app.read_header_timeout_ms = 500
     app.read_body_timeout_ms = 500
     app.write_timeout_ms = 500
-    app.get("/ok", (req, res) => http.text("ok"))
-    app.post("/echo", (req, res) => http.text(req.body))
+    app.get("/ok", fn(_req) {
+        return http.text("ok")
+    })
+    app.post("/echo", fn(req) {
+        return http.text(req.body)
+    })
     app.listen("__ADDRESS__")?
     return ok(null)
 }
@@ -491,12 +503,14 @@ fn main(): null! {
         max_active_requests: 2,
         max_pending_requests: 4
     })
-    app.get("/slow", (req, res) => {
+    app.get("/slow", fn(_req) {
         while (true) {
         }
         return http.text("unreachable")
     })
-    app.get("/ok", (req, res) => http.text("ok"))
+    app.get("/ok", fn(_req) {
+        return http.text("ok")
+    })
     app.listen("__ADDRESS__")?
     return ok(null)
 }
@@ -548,7 +562,9 @@ fn main(): null! {
         max_active_requests: 1,
         max_pending_requests: 1
     })
-    app.get("/ok", (req, res) => http.text("ok"))
+    app.get("/ok", fn(_req) {
+        return http.text("ok")
+    })
     app.listen("__ADDRESS__")?
     return ok(null)
 }

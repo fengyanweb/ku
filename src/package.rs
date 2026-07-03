@@ -140,13 +140,36 @@ pub struct RegistryFetchPolicy {
     pub max_download_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageArchivePolicy {
+    pub max_compressed_bytes: u64,
+    pub max_unpacked_bytes: u64,
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub max_path_bytes: usize,
+    pub max_depth: usize,
+}
+
 impl Default for RegistryFetchPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 3,
             connect_timeout_ms: 10_000,
             read_timeout_ms: 30_000,
-            max_download_bytes: 50_000_000,
+            max_download_bytes: MAX_REGISTRY_DOWNLOAD_BYTES,
+        }
+    }
+}
+
+impl Default for PackageArchivePolicy {
+    fn default() -> Self {
+        Self {
+            max_compressed_bytes: MAX_REGISTRY_DOWNLOAD_BYTES,
+            max_unpacked_bytes: 128_000_000,
+            max_files: 4096,
+            max_file_bytes: 16_000_000,
+            max_path_bytes: 240,
+            max_depth: 32,
         }
     }
 }
@@ -179,9 +202,10 @@ const PACKAGE_CACHE_DIR: &str = "packages";
 const MAX_PACKAGE_BYTES: u64 = 10_000_000;
 const MAX_PACKAGE_FILES: usize = 512;
 const MAX_REGISTRY_FETCH_ATTEMPTS: u8 = 8;
-const MAX_REGISTRY_DOWNLOAD_BYTES: u64 = 100_000_000;
+const MAX_REGISTRY_DOWNLOAD_BYTES: u64 = 32_000_000;
 const MAX_REGISTRY_TIMEOUT_MS: u64 = 300_000;
 const REGISTRY_ARTIFACT_FILE: &str = "package.archive";
+const REGISTRY_UNPACKED_DIR: &str = "package";
 const REGISTRY_CHECKSUM_FILE: &str = ".sha256";
 const REGISTRY_INSTALL_LOCK_ATTEMPTS: u8 = 100;
 const REGISTRY_INSTALL_LOCK_DELAY_MS: u64 = 10;
@@ -975,6 +999,7 @@ pub fn plan_registry_download(
     validate_package_name(&manifest.name, span)?;
     parse_package_version(&manifest.version, span)?;
     validate_registry_url(&manifest.source, span)?;
+    validate_registry_archive_url(&manifest.source, span)?;
     validate_sha256_checksum(&manifest.checksum, span)?;
     validate_registry_fetch_policy(policy, span)?;
 
@@ -1009,12 +1034,15 @@ pub fn plan_registry_download(
 pub fn execute_registry_download(plan: &RegistryDownloadPlan, span: Span) -> KuResult<PathBuf> {
     validate_registry_fetch_policy(plan.policy, span)?;
     validate_registry_url(&plan.url, span)?;
+    validate_registry_archive_url(&plan.url, span)?;
     validate_sha256_checksum(&plan.checksum, span)?;
     let artifact = plan.target_dir.join(REGISTRY_ARTIFACT_FILE);
+    let package_root = plan.target_dir.join(REGISTRY_UNPACKED_DIR);
     if artifact.is_file()
         && sha256_file_matches(&artifact, &plan.checksum, plan.policy.max_download_bytes)?
+        && package_root_is_valid(&package_root)
     {
-        return Ok(artifact);
+        return Ok(package_root);
     }
 
     let parent = plan.target_dir.parent().ok_or_else(|| {
@@ -1063,6 +1091,16 @@ pub fn execute_registry_download(plan: &RegistryDownloadPlan, span: Span) -> KuR
         plan.policy,
         span,
     )?;
+    let archive_policy = PackageArchivePolicy {
+        max_compressed_bytes: plan.policy.max_download_bytes,
+        ..PackageArchivePolicy::default()
+    };
+    unpack_package_archive(
+        &temporary_artifact,
+        &plan.temporary_dir.join(REGISTRY_UNPACKED_DIR),
+        archive_policy,
+        span,
+    )?;
     let checksum_path = plan.temporary_dir.join(REGISTRY_CHECKSUM_FILE);
     let mut checksum_file = fs::File::create(&checksum_path).map_err(|err| {
         KuError::message(format!(
@@ -1093,12 +1131,13 @@ pub fn execute_registry_download(plan: &RegistryDownloadPlan, span: Span) -> KuR
     let _lock = acquire_registry_install_lock(&lock_path, span)?;
     if artifact.is_file()
         && sha256_file_matches(&artifact, &plan.checksum, plan.policy.max_download_bytes)?
+        && package_root_is_valid(&package_root)
     {
-        return Ok(artifact);
+        return Ok(package_root);
     }
     install_immutable_registry_cache(&plan.temporary_dir, &plan.target_dir, span)?;
     temporary.keep();
-    Ok(artifact)
+    Ok(package_root)
 }
 
 fn finish_registry_index_version(
@@ -1126,10 +1165,12 @@ fn finish_registry_index_version(
     validate_package_name(name, span)?;
     validate_version(&version, span)?;
     validate_sha256_checksum(&checksum, span)?;
+    let source = resolve_registry_url(index_url, &url, span)?;
+    validate_registry_archive_url(&source, span)?;
     Ok(RegistryManifest {
         name: name.to_string(),
         version,
-        source: resolve_registry_url(index_url, &url, span)?,
+        source,
         checksum,
     })
 }
@@ -1145,6 +1186,202 @@ pub fn resolve_registry_url(base_url: &str, value: &str, span: Span) -> KuResult
         .map_err(|_| invalid_registry_url_error(span))?;
     validate_parsed_registry_url(&resolved, span)?;
     Ok(resolved.into())
+}
+
+pub fn unpack_package_archive(
+    archive_path: &Path,
+    output_dir: &Path,
+    policy: PackageArchivePolicy,
+    span: Span,
+) -> KuResult<PathBuf> {
+    validate_package_archive_policy(policy, span)?;
+    let metadata = fs::metadata(archive_path).map_err(|err| {
+        KuError::package(
+            "invalid_package_archive",
+            format!(
+                "failed to read package archive '{}': {err}",
+                archive_path.display()
+            ),
+            span,
+        )
+    })?;
+    if metadata.len() > policy.max_compressed_bytes {
+        return Err(KuError::package(
+            "package_archive_limit",
+            format!(
+                "package archive exceeds compressed limit of {} bytes",
+                policy.max_compressed_bytes
+            ),
+            span,
+        ));
+    }
+    if output_dir.exists() {
+        return Err(KuError::package(
+            "package_archive_collision",
+            format!(
+                "package unpack destination already exists '{}'",
+                output_dir.display()
+            ),
+            span,
+        ));
+    }
+    fs::create_dir_all(output_dir).map_err(|err| {
+        KuError::message(format!(
+            "failed to create package unpack destination '{}': {err}",
+            output_dir.display()
+        ))
+    })?;
+
+    let file = fs::File::open(archive_path).map_err(|err| {
+        KuError::package(
+            "invalid_package_archive",
+            format!(
+                "failed to open package archive '{}': {err}",
+                archive_path.display()
+            ),
+            span,
+        )
+    })?;
+    let decoder = zstd::stream::read::Decoder::new(file).map_err(|err| {
+        KuError::package(
+            "invalid_package_archive",
+            format!(
+                "package archive '{}' is not valid .tar.zst: {err}",
+                archive_path.display()
+            ),
+            span,
+        )
+    })?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut root_name: Option<String> = None;
+    let mut total_unpacked = 0u64;
+    let mut files = 0usize;
+    let mut saw_manifest = false;
+
+    let entries = archive.entries().map_err(|err| {
+        KuError::package(
+            "invalid_package_archive",
+            format!("failed to read package archive entries: {err}"),
+            span,
+        )
+    })?;
+    for entry in entries {
+        let mut entry = entry.map_err(|err| {
+            KuError::package(
+                "invalid_package_archive",
+                format!("failed to read package archive entry: {err}"),
+                span,
+            )
+        })?;
+        let entry_type = entry.header().entry_type();
+        if !(entry_type.is_dir() || entry_type.is_file()) {
+            return Err(KuError::package(
+                "unsupported_archive_entry",
+                "package archives may only contain regular files and directories",
+                span,
+            ));
+        }
+        let entry_path = entry.path().map_err(|err| {
+            KuError::package(
+                "invalid_package_archive",
+                format!("failed to read package archive path: {err}"),
+                span,
+            )
+        })?;
+        let relative = validate_archive_entry_path(&entry_path, &mut root_name, policy, span)?;
+        if relative.as_os_str().is_empty() {
+            if entry_type.is_dir() {
+                continue;
+            }
+            return Err(KuError::package(
+                "invalid_package_archive",
+                "package archive root must be a directory",
+                span,
+            ));
+        }
+        validate_archive_top_level(&relative, span)?;
+        let target = output_dir.join(&relative);
+        if entry_type.is_dir() {
+            fs::create_dir_all(&target).map_err(|err| {
+                KuError::message(format!(
+                    "failed to create package archive directory '{}': {err}",
+                    target.display()
+                ))
+            })?;
+            continue;
+        }
+        let file_size = entry.header().size().map_err(|err| {
+            KuError::package(
+                "invalid_package_archive",
+                format!("failed to read package archive file size: {err}"),
+                span,
+            )
+        })?;
+        if file_size > policy.max_file_bytes {
+            return Err(KuError::package(
+                "package_archive_limit",
+                format!(
+                    "package archive file '{}' exceeds {} bytes",
+                    relative.display(),
+                    policy.max_file_bytes
+                ),
+                span,
+            ));
+        }
+        total_unpacked = total_unpacked.saturating_add(file_size);
+        if total_unpacked > policy.max_unpacked_bytes {
+            return Err(KuError::package(
+                "package_archive_limit",
+                format!(
+                    "package archive exceeds unpacked limit of {} bytes",
+                    policy.max_unpacked_bytes
+                ),
+                span,
+            ));
+        }
+        files += 1;
+        if files > policy.max_files {
+            return Err(KuError::package(
+                "package_archive_limit",
+                format!("package archive exceeds file limit of {}", policy.max_files),
+                span,
+            ));
+        }
+        if relative == Path::new(MANIFEST_FILE) {
+            saw_manifest = true;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                KuError::message(format!(
+                    "failed to create package archive directory '{}': {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let mut output = fs::File::create(&target).map_err(|err| {
+            KuError::message(format!(
+                "failed to create package archive file '{}': {err}",
+                target.display()
+            ))
+        })?;
+        copy_archive_file(&mut entry, &mut output, policy.max_file_bytes, span)?;
+    }
+
+    if root_name.is_none() {
+        return Err(KuError::package(
+            "invalid_package_archive",
+            "package archive is empty",
+            span,
+        ));
+    }
+    if !saw_manifest {
+        return Err(KuError::package(
+            "missing_package_manifest",
+            "package archive root must contain ku.mod",
+            span,
+        ));
+    }
+    Ok(output_dir.to_path_buf())
 }
 
 fn fetch_https_bytes(url: &str, policy: RegistryFetchPolicy, span: Span) -> KuResult<Vec<u8>> {
@@ -1840,6 +2077,23 @@ fn validate_registry_fetch_policy(policy: RegistryFetchPolicy, span: Span) -> Ku
     Ok(())
 }
 
+fn validate_package_archive_policy(policy: PackageArchivePolicy, span: Span) -> KuResult<()> {
+    if policy.max_compressed_bytes == 0
+        || policy.max_unpacked_bytes == 0
+        || policy.max_files == 0
+        || policy.max_file_bytes == 0
+        || policy.max_path_bytes == 0
+        || policy.max_depth == 0
+    {
+        return Err(KuError::package(
+            "invalid_archive_policy",
+            "package archive limits must be greater than zero",
+            span,
+        ));
+    }
+    Ok(())
+}
+
 fn reject_unsafe_relative_path(kind: &str, value: &str, span: Span) -> KuResult<()> {
     let path = Path::new(value);
     if path.is_absolute()
@@ -1922,6 +2176,18 @@ fn validate_registry_url(value: &str, span: Span) -> KuResult<()> {
     validate_parsed_registry_url(&parsed, span)
 }
 
+fn validate_registry_archive_url(value: &str, span: Span) -> KuResult<()> {
+    let parsed = Url::parse(value).map_err(|_| invalid_registry_url_error(span))?;
+    if !parsed.path().ends_with(".tar.zst") {
+        return Err(KuError::package(
+            "invalid_registry_archive",
+            "registry package archive must use .tar.zst",
+            span,
+        ));
+    }
+    Ok(())
+}
+
 fn validate_parsed_registry_url(value: &Url, span: Span) -> KuResult<()> {
     if value.scheme() != "https"
         || value.host_str().is_none()
@@ -1941,6 +2207,152 @@ fn invalid_registry_url_error(span: Span) -> KuError {
         "registry URL must use HTTPS, include a host, and omit credentials, fragments, and whitespace",
         span,
     )
+}
+
+fn validate_archive_entry_path(
+    path: &Path,
+    root_name: &mut Option<String>,
+    policy: PackageArchivePolicy,
+    span: Span,
+) -> KuResult<PathBuf> {
+    let text = path.to_str().ok_or_else(|| {
+        KuError::package(
+            "unsafe_archive_path",
+            "package archive paths must be valid UTF-8",
+            span,
+        )
+    })?;
+    if text.len() > policy.max_path_bytes {
+        return Err(KuError::package(
+            "unsafe_archive_path",
+            format!(
+                "package archive path exceeds {} bytes",
+                policy.max_path_bytes
+            ),
+            span,
+        ));
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => {
+                let Some(value) = value.to_str() else {
+                    return Err(KuError::package(
+                        "unsafe_archive_path",
+                        "package archive paths must be valid UTF-8",
+                        span,
+                    ));
+                };
+                if value.is_empty() || value == "." || value == ".." {
+                    return Err(unsafe_archive_path_error(span));
+                }
+                components.push(value.to_string());
+            }
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::ParentDir
+            | Component::CurDir => {
+                return Err(unsafe_archive_path_error(span));
+            }
+        }
+    }
+    if components.is_empty() || components.len() > policy.max_depth {
+        return Err(unsafe_archive_path_error(span));
+    }
+    let root = components[0].clone();
+    match root_name {
+        Some(existing) if existing != &root => {
+            return Err(KuError::package(
+                "invalid_package_archive",
+                "package archive must contain exactly one root directory",
+                span,
+            ));
+        }
+        Some(_) => {}
+        None => *root_name = Some(root),
+    }
+    let mut relative = PathBuf::new();
+    for component in components.iter().skip(1) {
+        relative.push(component);
+    }
+    Ok(relative)
+}
+
+fn validate_archive_top_level(relative: &Path, span: Span) -> KuResult<()> {
+    let Some(first) = relative.components().next() else {
+        return Ok(());
+    };
+    let Component::Normal(value) = first else {
+        return Err(unsafe_archive_path_error(span));
+    };
+    let Some(name) = value.to_str() else {
+        return Err(unsafe_archive_path_error(span));
+    };
+    if matches!(
+        name,
+        MANIFEST_FILE
+            | "src"
+            | "docs"
+            | "examples"
+            | "tests"
+            | "README"
+            | "README.md"
+            | "LICENSE"
+            | "LICENSE.md"
+    ) {
+        Ok(())
+    } else {
+        Err(KuError::package(
+            "unsupported_archive_path",
+            format!("package archive top-level path '{name}' is not allowed"),
+            span,
+        ))
+    }
+}
+
+fn unsafe_archive_path_error(span: Span) -> KuError {
+    KuError::package(
+        "unsafe_archive_path",
+        "package archive paths must stay under one relative root directory",
+        span,
+    )
+}
+
+fn copy_archive_file(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    max_bytes: u64,
+    span: Span,
+) -> KuResult<u64> {
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).map_err(|err| {
+            KuError::package(
+                "invalid_package_archive",
+                format!("failed to read package archive file: {err}"),
+                span,
+            )
+        })?;
+        if count == 0 {
+            return Ok(total);
+        }
+        total = total.saturating_add(count as u64);
+        if total > max_bytes {
+            return Err(KuError::package(
+                "package_archive_limit",
+                format!("package archive file exceeds {max_bytes} bytes"),
+                span,
+            ));
+        }
+        writer.write_all(&buffer[..count]).map_err(|err| {
+            KuError::message(format!("failed to write package archive file: {err}"))
+        })?;
+    }
+}
+
+fn package_root_is_valid(path: &Path) -> bool {
+    path.join(MANIFEST_FILE).is_file()
 }
 
 fn dependency_cache_root(package: &PackageContext, dependency: &PackageDependency) -> PathBuf {
@@ -2161,11 +2573,58 @@ pub(crate) fn ensure_inside_import_root(
 #[cfg(test)]
 mod registry_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::{
+        io::Cursor,
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
 
     fn temp_path(label: &str) -> PathBuf {
         let id = NEXT_REGISTRY_DOWNLOAD_ID.fetch_add(1, Ordering::Relaxed);
         env::temp_dir().join(format!("ku-{label}-{}-{id}", std::process::id()))
+    }
+
+    fn archive_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            for (path, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, *path, Cursor::new(*data))
+                    .expect("append archive file");
+            }
+            builder.finish().expect("finish tar archive");
+        }
+        zstd::stream::encode_all(Cursor::new(tar_bytes), 0).expect("encode zstd archive")
+    }
+
+    fn archive_with_special_entry(path: &str, target: &str, entry_type: tar::EntryType) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(entry_type);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_link_name(target).expect("set link target");
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, io::empty())
+                .expect("append special archive entry");
+            builder.finish().expect("finish tar archive");
+        }
+        zstd::stream::encode_all(Cursor::new(tar_bytes), 0).expect("encode zstd archive")
+    }
+
+    fn write_archive(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).expect("write archive");
+    }
+
+    fn sha256_checksum(bytes: &[u8]) -> String {
+        format!("sha256-{:x}", Sha256::digest(bytes))
     }
 
     #[test]
@@ -2176,12 +2635,12 @@ name = "math"
 
 [[version]]
 version = "1.2.3"
-url = "../packages/math-1.2.3.tar.gz"
+url = "../packages/math-1.2.3.tar.zst"
 checksum = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 [[version]]
 version = "2.0.0"
-url = "https://cdn.example/math-2.0.0.tar.gz"
+url = "https://cdn.example/math-2.0.0.tar.zst"
 checksum = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 "#,
             "https://registry.example/index/math",
@@ -2193,7 +2652,7 @@ checksum = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         assert_eq!(index.versions[0].version, "2.0.0");
         assert_eq!(
             index.versions[1].source,
-            "https://registry.example/packages/math-1.2.3.tar.gz"
+            "https://registry.example/packages/math-1.2.3.tar.zst"
         );
     }
 
@@ -2202,7 +2661,7 @@ checksum = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         let manifest = RegistryManifest {
             name: "math".to_string(),
             version: "1.0.0".to_string(),
-            source: "http://registry.example/math.tar.gz".to_string(),
+            source: "http://registry.example/math.tar.zst".to_string(),
             checksum: "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_string(),
         };
@@ -2221,11 +2680,11 @@ checksum = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 name = "math"
 [[version]]
 version = "1.0.0"
-url = "math.tar.gz"
+url = "math.tar.zst"
 checksum = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 [[version]]
 version = "1.0.0"
-url = "math-copy.tar.gz"
+url = "math-copy.tar.zst"
 checksum = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 "#,
             "https://registry.example/index/math",
@@ -2304,26 +2763,165 @@ checksum = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     }
 
     #[test]
+    fn package_archive_unpack_accepts_safe_tar_zst() {
+        let root = temp_path("archive-safe");
+        fs::create_dir_all(&root).expect("create archive temp root");
+        let archive = root.join("math.tar.zst");
+        write_archive(
+            &archive,
+            &archive_bytes(&[
+                ("math/ku.mod", b"name = \"math\"\nversion = \"1.0.0\"\n"),
+                ("math/src/main.ku", b"fn main() {}\n"),
+                ("math/README.md", b"# math\n"),
+            ]),
+        );
+        let output = root.join("out");
+        unpack_package_archive(
+            &archive,
+            &output,
+            PackageArchivePolicy::default(),
+            Span::default(),
+        )
+        .expect("safe archive should unpack");
+        assert_eq!(
+            fs::read_to_string(output.join("src").join("main.ku")).expect("read unpacked file"),
+            "fn main() {}\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn package_archive_rejects_unsafe_paths_missing_manifest_and_multiple_roots() {
+        let root = temp_path("archive-reject");
+        fs::create_dir_all(&root).expect("create archive temp root");
+
+        let mut archive_root = None;
+        let err = validate_archive_entry_path(
+            Path::new("math/../evil"),
+            &mut archive_root,
+            PackageArchivePolicy::default(),
+            Span::default(),
+        )
+        .expect_err("parent path must be rejected");
+        assert_eq!(err.code.as_deref(), Some("unsafe_archive_path"));
+
+        let missing_manifest = root.join("missing.tar.zst");
+        write_archive(
+            &missing_manifest,
+            &archive_bytes(&[("math/src/main.ku", b"fn main() {}\n")]),
+        );
+        let err = unpack_package_archive(
+            &missing_manifest,
+            &root.join("missing-out"),
+            PackageArchivePolicy::default(),
+            Span::default(),
+        )
+        .expect_err("missing ku.mod must be rejected");
+        assert_eq!(err.code.as_deref(), Some("missing_package_manifest"));
+
+        let multiple_roots = root.join("multi.tar.zst");
+        write_archive(
+            &multiple_roots,
+            &archive_bytes(&[
+                ("math/ku.mod", b"name = \"math\"\n"),
+                ("other/ku.mod", b"name = \"other\"\n"),
+            ]),
+        );
+        let err = unpack_package_archive(
+            &multiple_roots,
+            &root.join("multi-out"),
+            PackageArchivePolicy::default(),
+            Span::default(),
+        )
+        .expect_err("multiple roots must be rejected");
+        assert_eq!(err.code.as_deref(), Some("invalid_package_archive"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn package_archive_rejects_links_and_resource_limits() {
+        let root = temp_path("archive-links");
+        fs::create_dir_all(&root).expect("create archive temp root");
+
+        let symlink_archive = root.join("link.tar.zst");
+        write_archive(
+            &symlink_archive,
+            &archive_with_special_entry("math/link", "ku.mod", tar::EntryType::Symlink),
+        );
+        let err = unpack_package_archive(
+            &symlink_archive,
+            &root.join("link-out"),
+            PackageArchivePolicy::default(),
+            Span::default(),
+        )
+        .expect_err("symlink must be rejected");
+        assert_eq!(err.code.as_deref(), Some("unsupported_archive_entry"));
+
+        let hardlink_archive = root.join("hardlink.tar.zst");
+        write_archive(
+            &hardlink_archive,
+            &archive_with_special_entry("math/link", "ku.mod", tar::EntryType::Link),
+        );
+        let err = unpack_package_archive(
+            &hardlink_archive,
+            &root.join("hardlink-out"),
+            PackageArchivePolicy::default(),
+            Span::default(),
+        )
+        .expect_err("hardlink must be rejected");
+        assert_eq!(err.code.as_deref(), Some("unsupported_archive_entry"));
+
+        let oversized_file = root.join("oversized.tar.zst");
+        write_archive(
+            &oversized_file,
+            &archive_bytes(&[
+                ("math/ku.mod", b"name = \"math\"\n"),
+                ("math/src/main.ku", b"12345"),
+            ]),
+        );
+        let err = unpack_package_archive(
+            &oversized_file,
+            &root.join("oversized-out"),
+            PackageArchivePolicy {
+                max_file_bytes: 4,
+                ..PackageArchivePolicy::default()
+            },
+            Span::default(),
+        )
+        .expect_err("oversized file must be rejected");
+        assert_eq!(err.code.as_deref(), Some("package_archive_limit"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn verified_cache_is_reused_without_network_access() {
         let root = temp_path("registry-cache-reuse");
         let target = root.join("packages").join("math").join("1.0.0");
         fs::create_dir_all(&target).expect("create cache");
-        fs::write(target.join(REGISTRY_ARTIFACT_FILE), b"abc").expect("write artifact");
+        let archive = archive_bytes(&[("math/ku.mod", b"name = \"math\"\nversion = \"1.0.0\"\n")]);
+        fs::write(target.join(REGISTRY_ARTIFACT_FILE), &archive).expect("write artifact");
+        fs::create_dir_all(target.join(REGISTRY_UNPACKED_DIR)).expect("create package root");
+        fs::write(
+            target.join(REGISTRY_UNPACKED_DIR).join(MANIFEST_FILE),
+            b"name = \"math\"\nversion = \"1.0.0\"\n",
+        )
+        .expect("write unpacked manifest");
         let plan = RegistryDownloadPlan {
             name: "math".to_string(),
             version: "1.0.0".to_string(),
-            url: "https://unreachable.invalid/math.tar.gz".to_string(),
-            checksum: "sha256-ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-                .to_string(),
+            url: "https://unreachable.invalid/math.tar.zst".to_string(),
+            checksum: sha256_checksum(&archive),
             target_dir: target.clone(),
             temporary_dir: target.with_extension("download-test"),
             action: RegistryCacheAction::ReuseVerified,
             policy: RegistryFetchPolicy::default(),
         };
 
-        let artifact =
+        let package_root =
             execute_registry_download(&plan, Span::default()).expect("verified cache reuse");
-        assert_eq!(artifact, target.join(REGISTRY_ARTIFACT_FILE));
+        assert_eq!(package_root, target.join(REGISTRY_UNPACKED_DIR));
         let _ = fs::remove_dir_all(root);
     }
 

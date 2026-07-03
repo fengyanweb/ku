@@ -245,12 +245,30 @@ impl KuError {
                 .note("strict unused checks are enabled by `ku check --deny-unused`")
                 .help("remove the binding, use it, or rename it with a leading `_` when it is intentionally unused");
         }
+        if message.contains("unused import") {
+            return DiagnosticInfo::new("E0901")
+                .note("Ku treats unused imports as errors by default")
+                .help("remove the import, use the imported name, or alias it with a leading `_` when it is intentionally unused");
+        }
         if message.contains("std module member 'http.service'")
             || message.contains("std module member 'http.server'")
         {
             return DiagnosticInfo::new("E0602")
                 .note("stdlib constructors are functions, not property-style default objects")
                 .help("write `app = http.service()` or `app = http.server(config)`");
+        }
+        if message.contains("http handler parameter")
+            || message.contains("res/writer parameters are not allowed")
+            || message.contains("side-effect response API")
+        {
+            return DiagnosticInfo::new("E0701")
+                .note("ordinary HTTP handlers use the Return model")
+                .help("write `fn(req) { return http.text(...) }`, or `fn(_req) { ... }` when the request is intentionally unused");
+        }
+        if message.contains("handler did not return HttpResponse") {
+            return DiagnosticInfo::new("E0702")
+                .note("HTTP handlers must return an HttpResponse or HttpResponse!")
+                .help("return `http.text/json/html/empty/redirect(...)` from the handler");
         }
         if message.starts_with("type error:") || message.contains("type mismatch") {
             return DiagnosticInfo::new("E0301");

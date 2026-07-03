@@ -273,6 +273,10 @@ fn main() {
     if (created.status != 201) {
         panic("bad explicit text status")
     }
+    html = http.html("<h1>Ku</h1>")
+    if (html.headers["content-type"] != "text/html; charset=utf-8") {
+        panic("bad html content type")
+    }
     json_res = http.json({ ok: true, count: 2 })
     if (json_res.headers["content-type"] != "application/json") {
         panic("bad json content type")
@@ -356,7 +360,9 @@ fn main() {
 import "std.http"
 
 fn main() {
-    http.service.get("/", (req, res) => http.text("bad"))
+    http.service.get("/", fn(_req) {
+        return http.text("bad")
+    })
 }
 "#,
         r#"
@@ -409,13 +415,13 @@ import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/index", (req, res) => {
+    app.get("/index", fn(_req) {
         return http.text("ok")
     })
-    app.post("/pets", (req, res) => {
+    app.post("/pets", fn(_req) {
         return http.json({ ok: true })
     })
-    app.get("/user/{id}", (req, res) => {
+    app.get("/user/{id}", fn(req) {
         return http.text(req.params.id)
     })
     if (array.len(app.routes) != 3) {
@@ -497,7 +503,9 @@ import "std.http"
 
 fn main(): null! {
     app = http.service()
-    app.get("/user/{id}", (req, res) => http.text("ok"))
+    app.get("/user/{id}", fn(_req) {
+        return http.text("ok")
+    })
     listener = app.bind(":0")?
     if (listener.kind != "http.listener") {
         panic("bad listener")
@@ -520,8 +528,12 @@ import "std.http"
 
 fn main(): null! {
     app = http.service()
-    app.get("/user/{id}", (req, res) => http.text("one"))
-    app.get("/user/{name}", (req, res) => http.text("two"))
+    app.get("/user/{id}", fn(_req) {
+        return http.text("one")
+    })
+    app.get("/user/{name}", fn(_req) {
+        return http.text("two")
+    })
     app.bind(":0")?
     return ok(null)
 }
@@ -537,7 +549,9 @@ import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/user/:id", (req, res) => http.text("bad"))
+    app.get("/user/:id", fn(_req) {
+        return http.text("bad")
+    })
 }
 "#;
     let err = run_err(express_style);
@@ -551,7 +565,9 @@ import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/user/{id}", { auth: "none" }, (req, res) => http.text("bad"))
+    app.get("/user/{id}", { auth: "none" }, fn(_req) {
+        return http.text("bad")
+    })
 }
 "#;
     let err = check_err(route_config);
@@ -582,7 +598,7 @@ import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/user/{id}", (req, res) => {
+    app.get("/user/{id}", fn(req) {
         if (req.method != "GET") {
             panic("bad method")
         }
@@ -597,26 +613,43 @@ import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/", (req) => http.text("bad"))
+    app.get("/", fn(req, res) {
+        return http.text("bad")
+    })
 }
 "#;
     let err = check_err(wrong_arity);
     assert!(
-        err.contains("handler expects 2 parameters"),
+        err.contains("expects exactly one req parameter"),
         "unexpected error: {err}"
     );
+
+    let unused_req = r#"
+import "std.http"
+
+fn main() {
+    app = http.service()
+    app.get("/", fn(req) {
+        return http.text("bad")
+    })
+}
+"#;
+    let err = check_err(unused_req);
+    assert!(err.contains("write '_req'"), "unexpected error: {err}");
 
     let bad_return = r#"
 import "std.http"
 
 fn main() {
     app = http.service()
-    app.get("/", (req, res) => "bad")
+    app.get("/", fn(_req) {
+        return "bad"
+    })
 }
 "#;
     let err = check_err(bad_return);
     assert!(
-        err.contains("expected object but got str"),
+        err.contains("expected object | object! but got str"),
         "unexpected error: {err}"
     );
 
@@ -626,7 +659,7 @@ import "std.http"
 fn main() {
     count = 0
     app = http.service()
-    app.get("/", (req, res) => {
+    app.get("/", fn(_req) {
         count = count + 1
         return http.text("bad")
     })
@@ -644,7 +677,7 @@ import "std.http"
 fn main() {
     state = { n: 0 }
     app = http.service()
-    app.get("/", (req, res) => {
+    app.get("/", fn(_req) {
         state.n = 1
         return http.text("bad")
     })
@@ -655,6 +688,35 @@ fn main() {
         err.contains("cannot modify captured variable 'state'"),
         "unexpected error: {err}"
     );
+
+    let side_effect_response = r#"
+import "std.http"
+
+fn main() {
+    app = http.service()
+    app.get("/", fn(req) {
+        res.write("bad")
+        return http.text(req.path)
+    })
+}
+"#;
+    let err = check_err(side_effect_response);
+    assert!(
+        err.contains("side-effect response API 'res.write' is not allowed"),
+        "unexpected error: {err}"
+    );
+
+    let result_return = r#"
+import "std.http"
+
+fn main() {
+    app = http.service()
+    app.get("/", fn(_req) {
+        return ok(http.text("ok"))
+    })
+}
+"#;
+    check_source("inline.ku", result_return).expect("HttpResponse! handlers should check");
 }
 
 #[test]

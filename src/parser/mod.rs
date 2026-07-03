@@ -330,6 +330,16 @@ impl Parser {
             self.consume(&TokenKind::RBracket, "expected ']' after array type")?;
             return Ok(TypeName::Array(Box::new(inner)));
         }
+        if self.match_kind(&TokenKind::Async) {
+            self.consume(
+                &TokenKind::Fn,
+                "expected 'fn' after 'async' in function type",
+            )?;
+            return self.function_type(true);
+        }
+        if self.match_kind(&TokenKind::Fn) {
+            return self.function_type(false);
+        }
         let token = self.advance().clone();
         let ty = match token.kind {
             TokenKind::Ident(name) => match name.as_str() {
@@ -352,6 +362,36 @@ impl Parser {
             _ => return Err(KuError::parse("expected type name", token.span)),
         };
         Ok(ty)
+    }
+
+    fn function_type(&mut self, is_async: bool) -> KuResult<TypeName> {
+        self.consume(
+            &TokenKind::LParen,
+            "expected '(' after 'fn' in function type",
+        )?;
+        let mut params = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                params.push(self.type_name()?);
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.consume(
+            &TokenKind::RParen,
+            "expected ')' after function type parameters",
+        )?;
+        self.consume(
+            &TokenKind::Colon,
+            "expected ':' before function type return",
+        )?;
+        let return_type = self.type_name()?;
+        Ok(TypeName::Function {
+            params,
+            return_type: Box::new(return_type),
+            is_async,
+        })
     }
 
     fn finish_type_name(&mut self, ty: TypeName) -> KuResult<TypeName> {
@@ -1620,35 +1660,144 @@ fn attach_await(value: Expr, await_start: Position) -> Expr {
 }
 
 fn scan_arrow_type(tokens: &[Token], index: &mut usize, parameter: bool) -> bool {
-    let mut bracket_depth = 0usize;
-    let mut consumed_atom = false;
+    scan_type(
+        tokens,
+        index,
+        if parameter {
+            TypeScanStop::ArrowParameter
+        } else {
+            TypeScanStop::ArrowReturn
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum TypeScanStop {
+    ArrowParameter,
+    ArrowReturn,
+    FunctionParameter,
+    Array,
+}
+
+fn scan_type(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -> bool {
+    if !scan_type_atom(tokens, index, stop) {
+        return false;
+    }
     while let Some(token) = tokens.get(*index) {
         match &token.kind {
-            TokenKind::Ident(_) | TokenKind::Null => {
-                consumed_atom = true;
+            TokenKind::Bang => *index += 1,
+            TokenKind::Pipe => {
                 *index += 1;
+                if !scan_type_atom(tokens, index, stop) {
+                    return false;
+                }
             }
-            TokenKind::LBracket => {
-                bracket_depth += 1;
-                *index += 1;
-            }
-            TokenKind::RBracket if bracket_depth > 0 => {
-                bracket_depth -= 1;
-                *index += 1;
-            }
-            TokenKind::Dot | TokenKind::Bang | TokenKind::Pipe if consumed_atom => {
-                *index += 1;
-            }
-            TokenKind::Comma | TokenKind::RParen
-                if parameter && bracket_depth == 0 && consumed_atom =>
-            {
-                return true;
-            }
-            TokenKind::Arrow if !parameter && bracket_depth == 0 && consumed_atom => return true,
+            kind if is_type_stop(kind, stop) => return true,
             _ => return false,
         }
     }
     false
+}
+
+fn scan_type_atom(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -> bool {
+    match tokens.get(*index).map(|token| &token.kind) {
+        Some(TokenKind::Ident(_)) => {
+            *index += 1;
+            while matches!(
+                tokens.get(*index).map(|token| &token.kind),
+                Some(TokenKind::Dot)
+            ) {
+                *index += 1;
+                if !matches!(
+                    tokens.get(*index).map(|token| &token.kind),
+                    Some(TokenKind::Ident(_))
+                ) {
+                    return false;
+                }
+                *index += 1;
+            }
+            true
+        }
+        Some(TokenKind::Null) => {
+            *index += 1;
+            true
+        }
+        Some(TokenKind::LBracket) => {
+            *index += 1;
+            if !scan_type(tokens, index, TypeScanStop::Array) {
+                return false;
+            }
+            if !matches!(
+                tokens.get(*index).map(|token| &token.kind),
+                Some(TokenKind::RBracket)
+            ) {
+                return false;
+            }
+            *index += 1;
+            true
+        }
+        Some(TokenKind::Async) => {
+            *index += 1;
+            scan_function_type(tokens, index, stop)
+        }
+        Some(TokenKind::Fn) => scan_function_type(tokens, index, stop),
+        _ => false,
+    }
+}
+
+fn scan_function_type(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -> bool {
+    if !matches!(
+        tokens.get(*index).map(|token| &token.kind),
+        Some(TokenKind::Fn)
+    ) {
+        return false;
+    }
+    *index += 1;
+    if !matches!(
+        tokens.get(*index).map(|token| &token.kind),
+        Some(TokenKind::LParen)
+    ) {
+        return false;
+    }
+    *index += 1;
+    if matches!(
+        tokens.get(*index).map(|token| &token.kind),
+        Some(TokenKind::RParen)
+    ) {
+        *index += 1;
+    } else {
+        loop {
+            if !scan_type(tokens, index, TypeScanStop::FunctionParameter) {
+                return false;
+            }
+            match tokens.get(*index).map(|token| &token.kind) {
+                Some(TokenKind::Comma) => *index += 1,
+                Some(TokenKind::RParen) => {
+                    *index += 1;
+                    break;
+                }
+                _ => return false,
+            }
+        }
+    }
+    if !matches!(
+        tokens.get(*index).map(|token| &token.kind),
+        Some(TokenKind::Colon)
+    ) {
+        return false;
+    }
+    *index += 1;
+    scan_type(tokens, index, stop)
+}
+
+fn is_type_stop(kind: &TokenKind, stop: TypeScanStop) -> bool {
+    match stop {
+        TypeScanStop::ArrowParameter | TypeScanStop::FunctionParameter => {
+            matches!(kind, TokenKind::Comma | TokenKind::RParen)
+        }
+        TypeScanStop::ArrowReturn => matches!(kind, TokenKind::Arrow),
+        TypeScanStop::Array => matches!(kind, TokenKind::RBracket),
+    }
 }
 
 fn stmt_span(stmt: &Stmt) -> Span {
@@ -1707,9 +1856,11 @@ fn default_expr(ty: &TypeName, span: Span) -> Expr {
         TypeName::Bool => ExprKind::Literal(Literal::Bool(false)),
         TypeName::String => ExprKind::Literal(Literal::String(String::new())),
         TypeName::Array(_) => ExprKind::Array(Vec::new()),
-        TypeName::Result(_) | TypeName::Union(_) | TypeName::Null | TypeName::Custom(_) => {
-            ExprKind::Literal(Literal::Null)
-        }
+        TypeName::Result(_)
+        | TypeName::Function { .. }
+        | TypeName::Union(_)
+        | TypeName::Null
+        | TypeName::Custom(_) => ExprKind::Literal(Literal::Null),
     };
     Expr::new(kind, span)
 }

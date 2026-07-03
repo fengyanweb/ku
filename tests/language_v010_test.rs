@@ -1690,7 +1690,7 @@ fn registry_manifest_and_lock_schema_parse_strictly() {
             r#"
 name = "math"
 version = "0.1.0"
-source = "https://registry.example/ku/math/0.1.0.tar.gz"
+source = "https://registry.example/ku/math/0.1.0.tar.zst"
 checksum = "{checksum}"
 "#
         ),
@@ -1707,7 +1707,7 @@ checksum = "{checksum}"
 name = "math"
 version = "0.1.0"
 source = "registry"
-url = "https://registry.example/ku/math/0.1.0.tar.gz"
+url = "https://registry.example/ku/math/0.1.0.tar.zst"
 checksum = "{checksum}"
 cache_key = "math-0.1.0-sha256-{}"
 "#,
@@ -1726,7 +1726,7 @@ fn registry_schema_rejects_missing_bad_semver_and_checksum() {
         r#"
 name = "math"
 version = "latest"
-source = "https://registry.example/math.tar.gz"
+source = "https://registry.example/math.tar.zst"
 checksum = "bad"
 "#,
         Default::default(),
@@ -1738,7 +1738,7 @@ checksum = "bad"
         r#"
 name = "math"
 version = "0.1.0"
-source = "https://registry.example/math.tar.gz"
+source = "https://registry.example/math.tar.zst"
 "#,
         Default::default(),
     )
@@ -1751,7 +1751,7 @@ source = "https://registry.example/math.tar.gz"
 name = "math"
 version = "0.1.0"
 source = "registry"
-url = "https://registry.example/math.tar.gz"
+url = "https://registry.example/math.tar.zst"
 checksum = "sha256-deadbeef"
 cache_key = "math-0.1.0"
 "#,
@@ -1853,7 +1853,7 @@ fn registry_resolver_selects_highest_shared_version_and_reports_conflicts() {
     let manifest = |version: &str| package::RegistryManifest {
         name: "math".to_string(),
         version: version.to_string(),
-        source: format!("https://registry.example/math/{version}.tar.gz"),
+        source: format!("https://registry.example/math/{version}.tar.zst"),
         checksum: checksum.clone(),
     };
     let dependency = |requirement: &str| package::PackageDependency {
@@ -1887,7 +1887,7 @@ fn registry_download_plan_is_offline_bounded_and_cache_aware() {
     let manifest = package::RegistryManifest {
         name: "math".to_string(),
         version: "1.2.3".to_string(),
-        source: "https://registry.example/math/1.2.3.tar.gz".to_string(),
+        source: "https://registry.example/math/1.2.3.tar.zst".to_string(),
         checksum: format!("sha256-{}", "b".repeat(64)),
     };
     let cache = unique_temp_path("registry-plan");
@@ -1946,7 +1946,7 @@ fn registry_download_plan_is_offline_bounded_and_cache_aware() {
             ..policy
         },
         package::RegistryFetchPolicy {
-            max_download_bytes: 100_000_001,
+            max_download_bytes: 32_000_001,
             ..policy
         },
     ] {

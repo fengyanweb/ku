@@ -1939,6 +1939,7 @@ fn lower_type(ty: &TypeName, layouts: &IrLayoutTable) -> IrType {
         TypeName::Null => IrType::Null,
         TypeName::Array(inner) => IrType::Array(Box::new(lower_type(inner, layouts))),
         TypeName::Result(inner) => IrType::Result(Box::new(lower_type(inner, layouts))),
+        TypeName::Function { .. } => IrType::Function,
         TypeName::Union(_) => IrType::Unknown,
         TypeName::Custom(name) if layouts.enums.iter().any(|layout| layout.name == *name) => {
             enum_ir_type(name)
@@ -2025,6 +2026,7 @@ fn lower_layout_type(ty: &Option<TypeName>, enum_names: &HashSet<String>) -> IrT
             TypeName::Null => IrType::Null,
             TypeName::Array(inner) => IrType::Array(Box::new(lower(inner, enum_names))),
             TypeName::Result(inner) => IrType::Result(Box::new(lower(inner, enum_names))),
+            TypeName::Function { .. } => IrType::Function,
             TypeName::Union(_) => IrType::Unknown,
             TypeName::Custom(name) if enum_names.contains(name) => enum_ir_type(name),
             TypeName::Custom(name) => IrType::Named(name.clone()),

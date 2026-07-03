@@ -84,10 +84,24 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
                     span,
                 ));
             }
-            let (status, body) = text_response_args(args, span)?;
+            let (status, body) = text_response_args("http.text", args, span)?;
             Ok(Some(response_helper_value(
                 status,
                 "text/plain; charset=utf-8",
+                body,
+            )))
+        }
+        "html" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(KuError::runtime(
+                    format!("http.html expects 1 or 2 arguments but got {}", args.len()),
+                    span,
+                ));
+            }
+            let (status, body) = text_response_args("http.html", args, span)?;
+            Ok(Some(response_helper_value(
+                status,
+                "text/html; charset=utf-8",
                 body,
             )))
         }
@@ -463,7 +477,7 @@ fn result_from_http(response: Result<HttpResponse, HttpError>) -> Value {
     }
 }
 
-fn text_response_args(args: &[Value], span: Span) -> KuResult<(i64, String)> {
+fn text_response_args(name: &str, args: &[Value], span: Span) -> KuResult<(i64, String)> {
     match args {
         [Value::String(body)] => Ok((200, body.clone())),
         [Value::Int(status), Value::String(body)] => {
@@ -476,7 +490,7 @@ fn text_response_args(args: &[Value], span: Span) -> KuResult<(i64, String)> {
         )),
         [other] => Err(expected_type("str", other, span)),
         _ => Err(KuError::runtime(
-            format!("http.text expects 1 or 2 arguments but got {}", args.len()),
+            format!("{name} expects 1 or 2 arguments but got {}", args.len()),
             span,
         )),
     }

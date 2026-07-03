@@ -95,6 +95,11 @@ pub enum TypeName {
     Null,
     Array(Box<TypeName>),
     Result(Box<TypeName>),
+    Function {
+        params: Vec<TypeName>,
+        return_type: Box<TypeName>,
+        is_async: bool,
+    },
     Union(Vec<TypeName>),
     Custom(String),
 }

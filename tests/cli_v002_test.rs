@@ -487,6 +487,68 @@ fn check_json_success_is_silent_and_rejects_extra_arguments() {
 }
 
 #[test]
+fn check_rejects_unused_imports_by_default_with_json_help() {
+    let err_path = write_temp_ku(
+        "unused-import.ku",
+        r#"
+import { http } from "std"
+
+fn main() {
+    println("ok")
+}
+"#,
+    );
+    let err_text = path_arg(&err_path);
+    let result = run_ku(&["check", "--json", &err_text]);
+    fs::remove_file(&err_path).ok();
+
+    assert_ne!(result.code, Some(0), "unused import should fail");
+    assert!(
+        result.stderr.contains("\"code\":\"E0901\""),
+        "missing unused import code:\n{}",
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("unused import 'http'"),
+        "missing unused import message:\n{}",
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("alias it with a leading `_`"),
+        "missing unused import help:\n{}",
+        result.stderr
+    );
+
+    let ok_root = unique_temp_dir("unused-import-discard");
+    fs::create_dir_all(&ok_root).expect("create unused import temp dir");
+    fs::write(
+        ok_root.join("helper.ku"),
+        r#"
+fn Helper(): int {
+    return 1
+}
+"#,
+    )
+    .expect("write helper module");
+    let ok_path = ok_root.join("main.ku");
+    fs::write(
+        &ok_path,
+        r#"
+import { Helper as _Helper } from "./helper.ku"
+
+fn main() {
+    println("ok")
+}
+"#,
+    )
+    .expect("write main module");
+    let ok_text = path_arg(&ok_path);
+    let result = run_ku(&["check", &ok_text]);
+    fs::remove_dir_all(&ok_root).ok();
+    assert_eq!(result.code, Some(0), "discard import alias should pass");
+}
+
+#[test]
 fn check_deny_unused_reports_local_bindings_with_help() {
     let path = write_temp_ku(
         "deny-unused-local.ku",

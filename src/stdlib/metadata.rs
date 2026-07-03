@@ -88,6 +88,11 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("array", "try_get") => vec![array_arg(), int_arg()],
         ("array", "push") => vec![array_arg(), ArgRule::MatchesArrayElement { array_arg: 0 }],
         ("array", "concat") => vec![array_arg(), ArgRule::MatchesArrayArg { array_arg: 0 }],
+        ("object", "get_or") => vec![
+            ArgRule::Is(TypePattern::ObjectAny),
+            str_arg(),
+            ArgRule::Is(TypePattern::Any),
+        ],
         ("json", "parse" | "try_parse") => vec![str_arg()],
         ("json", "stringify") => vec![ArgRule::Is(TypePattern::Any)],
         ("config", "env") => vec![],
@@ -104,6 +109,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("http", "request") => vec![ArgRule::Is(TypePattern::ObjectAny)],
         ("http", "client" | "service" | "server") => vec![],
         ("http", "text") => vec![str_arg()],
+        ("http", "html") => vec![str_arg()],
         ("http", "json") => vec![ArgRule::Is(TypePattern::Any)],
         ("http", "empty") => vec![],
         ("http", "redirect") => vec![str_arg()],
@@ -126,6 +132,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("array", "first" | "last") => TypePattern::ArrayElementOfArg(0),
         ("array", "try_get") => TypePattern::ResultOf(Box::new(TypePattern::ArrayElementOfArg(0))),
         ("array", "push" | "concat") => TypePattern::SameAsArg(0),
+        ("object", "get_or") => TypePattern::Unknown,
         ("json", "parse") => TypePattern::Unknown,
         ("json", "try_parse") => TypePattern::ResultOf(Box::new(TypePattern::Unknown)),
         ("json", "stringify") => TypePattern::String,
@@ -143,7 +150,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         }
         ("http", "client") => http_client_pattern(),
         ("http", "service" | "server") => http_service_pattern(),
-        ("http", "text" | "json" | "empty" | "redirect") => http_response_pattern(),
+        ("http", "text" | "html" | "json" | "empty" | "redirect") => http_response_pattern(),
         ("http", "statusText") => TypePattern::String,
         _ => return None,
     };
@@ -187,6 +194,7 @@ pub(crate) fn is_std_module(module: &str) -> bool {
             | "parser"
             | "string"
             | "array"
+            | "object"
             | "json"
             | "config"
             | "time"

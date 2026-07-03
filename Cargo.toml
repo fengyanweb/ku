@@ -7,5 +7,7 @@ edition = "2021"
 chrono = "0.4"
 ed25519-dalek = "2"
 sha2 = "0.10"
+tar = "0.4"
 ureq = { version = "2.12", default-features = true }
 url = "2.5"
+zstd = "0.13"

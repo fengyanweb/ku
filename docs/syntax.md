@@ -532,7 +532,7 @@ fn main() {
     }
     double = (x: int): int => x * 2
     triple = x: int => x * 3
-    handler = fn(req, res) {
+    handler = fn(req) {
         return "ok"
     }
     selected = double
@@ -552,6 +552,26 @@ fn main() {
 函数值赋给另一个变量后仍然可以调用
 匿名 fn 使用块体，适合 HTTP handler 这类需要普通函数形状的内联写法
 ```
+
+函数值可以写显式函数类型。类型语法使用 `fn(params): return`，async 函数类型使用 `async fn(params): return`，不使用 `(int, int) => int` 作为类型：
+
+```ku
+fn Add(a: int, b: int): int {
+    return a + b
+}
+
+async fn Load(id: int): str! {
+    return ok("user")
+}
+
+fn main() {
+    op: fn(int, int): int = Add
+    loader: async fn(int): str! = Load
+    print(op(1, 2))
+}
+```
+
+函数类型只描述参数类型、返回类型和 async 标志，不包含参数名、函数体或捕获环境。当前 checker 保持严格：赋给显式函数类型的箭头函数 / 匿名函数需要自己写清参数和返回类型，例如 `f: fn(int): int = (x: int): int => x + 1`。`f: fn(int): int = (x) => x + 1` 暂不做上下文类型推导。
 
 ### 6.4 闭包捕获
 
@@ -954,6 +974,17 @@ user["age"] = 1
 
 `object[key]?` 只改变对象字符串索引的缺失键行为。数组/字符串索引越界仍然报错；其他表达式后的 `?` 仍是 Result 错误传播。
 
+需要带默认值的显式宽松读取时，使用 `object.get_or(obj, key, default)` 或实例方法 `obj.get_or(key, default)`：
+
+```ku
+user = { name: "Ku" }
+print(user.get_or("name", "unknown"))
+print(user.get_or("missing", "unknown"))
+print(object.get_or(user, "missing", "unknown"))
+```
+
+`get_or` 存在 key 时返回字段值，缺失时返回 default。default 参数会立即求值，不是惰性求值；即使 key 存在，`user.get_or("name", MakeDefault())` 也会先执行 `MakeDefault()`。静态 object + 字符串字面量 key 会尽量保留字段类型，避免把明显类型错误放到运行时。
+
 字符串可以用 `int` 索引，返回单字符 `str`：
 
 ```ku
@@ -1332,7 +1363,16 @@ print(values.len())
 print(values.try_get(0)?)
 ```
 
-### 12.6 json
+### 12.6 object
+
+```txt
+object.get_or(obj:object, key:str, default:any): any
+obj.get_or(key:str, default:any): any
+```
+
+`object.get_or` 是对象严格读取之外的显式宽松 API。普通 `obj["missing"]` 仍然报错；`obj["missing"]?` 返回 `null`；`obj.get_or("missing", fallback)` 返回 fallback。
+
+### 12.7 json
 
 ```txt
 json.stringify(value:any): str
@@ -1342,7 +1382,7 @@ json.try_parse(text:str): Unknown!
 
 `json.parse` 失败是不可恢复运行时错误；`json.try_parse` 失败返回 `Err(Error)`。
 
-### 12.7 time
+### 12.8 time
 
 ```txt
 time.now(): Time
@@ -1435,7 +1475,7 @@ fn main(): null! {
 
 非法日期、非法时间、非法格式、非法时区和非法 duration 返回结构化 `Err({ domain:"time", code, message })`。`time.sleep` 在同步 main 中阻塞当前执行；在 async task 中会走 blocking worker，避免长时间占用 task worker。
 
-### 12.8 std.task 观测与压力测试
+### 12.9 std.task 观测与压力测试
 
 使用前显式导入：
 
@@ -1466,7 +1506,7 @@ task.stress(demand:int, producers:int, hold_ms:int): object
 .\run-test.ps1
 ```
 
-### 12.9 config
+### 12.10 config
 
 配置读取需要显式导入：
 
@@ -1491,7 +1531,7 @@ config.yaml(path:str): object!
 - 配置文件上限为 1000000 bytes。
 - YAML 嵌套、数组和复杂对象暂不支持。
 
-### 12.10 http
+### 12.11 http
 
 HTTP 需要显式导入：
 
@@ -1509,6 +1549,8 @@ http.request(config:object): HttpResponse!
 http.client(config?:object): object
 http.text(body:str): HttpResponse
 http.text(status:int, body:str): HttpResponse
+http.html(body:str): HttpResponse
+http.html(status:int, body:str): HttpResponse
 http.json(value:any): HttpResponse
 http.json(status:int, value:any): HttpResponse
 http.empty(status?:int): HttpResponse
@@ -1545,6 +1587,7 @@ max_body_bytes: 1000000
 ```ku
 return http.text("ok")
 return http.text(http.status.created, "created")
+return http.html("<h1>ok</h1>")
 return http.json({ code: 0, msg: "ok", data: null })
 return http.json(http.status.created, { code: 0, msg: "created", data: null })
 return http.empty()
@@ -1553,9 +1596,9 @@ return http.redirect("/login")
 return http.redirect(http.status.temporaryRedirect, "/login")
 ```
 
-`http.text(body)` 和 `http.json(body)` 默认 HTTP status 是 `http.status.ok` / `200`。创建资源建议显式 `http.status.created` / `201`。`http.empty()` 默认 `204`。错误响应建议显式传入 `4xx/5xx`。`http.redirect(location)` 默认 `302`，也可以显式传入 `301/303/307/308`。
+`http.text(body)`、`http.html(body)` 和 `http.json(body)` 默认 HTTP status 是 `http.status.ok` / `200`。创建资源建议显式 `http.status.created` / `201`。`http.empty()` 默认 `204`。错误响应建议显式传入 `4xx/5xx`。`http.redirect(location)` 默认 `302`，也可以显式传入 `301/303/307/308`。
 
-HTTP status 是协议状态码，放在 `http.text/json/empty/redirect` 的第一个参数；业务响应里的 `body.code` 由开发者自己维护，Ku 不替业务维护业务码。推荐业务成功固定 `code: 0`，`msg` 是提示文本，`data` 成功时放数据、失败时通常放 `null`。
+HTTP status 是协议状态码，放在 `http.text/html/json/empty/redirect` 的第一个参数；业务响应里的 `body.code` 由开发者自己维护，Ku 不替业务维护业务码。推荐业务成功固定 `code: 0`，`msg` 是提示文本，`data` 成功时放数据、失败时通常放 `null`。
 
 状态码常量：
 
@@ -1600,21 +1643,21 @@ text = http.statusText(http.status.notFound) // "Not Found"
 HTTP server/router API 已固定服务配置对象：
 
 ```ku
-fn index(req, res) {
+fn index(_req) {
     return http.text("ok")
 }
 
 service = http.service()
 server = http.server({ max_body_bytes: 4096 })
 service.get("/index", index)
-service.get("/fn", fn(req, res) {
+service.get("/fn", fn(_req) {
     return http.text("Ku HTTP 123")
 })
-service.post("/pets", (req, res) => {
+service.post("/pets", fn(_req) {
     return http.json(http.status.created, { code: 0, msg: "created", data: null })
 })
-service.get("/user/{id}", (req, res) => {
-    return http.text("ok")
+service.get("/user/{id}", fn(req) {
+    return http.text(req.params.id)
 })
 listener = service.bind(":0")?
 print(service.max_active_requests)
@@ -1625,7 +1668,23 @@ print(service.routes[0].method)
 
 默认 server 配置包含 `read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests` 和 `routes`。`service.get/post/put/del(path, handler)` 当前支持注册路由，会把 `{ method, path, param_names, handler }` 写入 `service.routes`。路径参数使用 `/user/{id}`，不使用 Express 的 `:id`。
 
-`http.service()` / `http.server(config?)` 返回 service 配置对象。`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。第一版 handler 参数固定 `(req, res)`，handler 返回 `http.text/json/empty/redirect(...)` 这类 `{ status, headers, body }` 响应对象。
+`http.service()` / `http.server(config?)` 返回 service 配置对象。`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。
+
+普通 HTTP handler 固定只接收一个请求参数：
+
+```ku
+fn route(req) {
+    return http.text(req.path.clone())
+}
+
+fn health(_req) {
+    return http.empty()
+}
+```
+
+参数必须命名为 `req`；如果 handler 不读取请求，必须写 `_req`。普通 handler 不允许第二个 `res` / `writer` 参数，也不允许调用 `res.write`、`res.end`、`reply.send`、`writer.write` 这类副作用式响应 API。响应统一通过 `return http.text/json/html/empty/redirect(...)` 返回。handler 返回值必须是 `HttpResponse` 形状对象或 `HttpResponse!`。
+
+当前还没有公开的 `HttpRequest` 名义类型可用于顶层函数参数注解；需要读取 `req.method/path/params/...` 时，推荐在 route 注册点写 `fn(req) { ... }`，这样 checker 会按 HTTP handler 上下文检查请求字段。不读取请求的顶层 handler 可以写 `fn health(_req) { return http.empty() }` 后传给 route。
 
 第一版 `req` 字段：
 
@@ -1638,9 +1697,11 @@ req.headers: object  // 字段值按 str 检查
 req.body: str
 ```
 
-`req` 是请求对象，提供 method/path、路由参数、query、headers 和 body。`res` 是第一版 handler ABI 的响应占位对象，当前常规写法不需要手动修改 `res`，直接 `return http.text/json/empty/redirect(...)` 即可；保留 `res` 是为了让 handler 形状固定，后续可扩展 response builder。
+`req` 是请求对象，提供 method/path、路由参数、query、headers 和 body。`del` 是当前唯一的删除路由 API，对应 HTTP 协议方法 `DELETE`；不额外提供 `delete` 别名。
 
-HTTP handler 会在类型检查阶段按 `(req, res)` ABI 复查参数和返回值。为了给后续并发 runtime 留安全边界，handler 第一版不能修改外层捕获变量；需要共享状态时后续应通过专门的 `std.atomic` / `std.sync` 一类 API 设计。
+HTTP handler 会在类型检查阶段按单参数 Return 模型复查参数和返回值。为了给后续并发 runtime 留安全边界，handler 第一版不能修改外层捕获变量；需要共享状态时后续应通过专门的 `std.atomic` / `std.sync` 一类 API 设计。
+
+`writer` 会保留给受控流式响应，但它不是普通 handler 参数。后续 `http.stream(fn(writer) { ... })` 落地时，`writer.write(value)` 必须返回 Result 并由调用方处理；`writer.status(code)` / `writer.header(name, value)` 只能在第一次 write 前调用；不会给普通用户暴露 `writer.end()`，stream 函数正常返回后 runtime 自动结束。当前一次性响应 runtime 还没有开放 `http.stream/sse/websocket`。
 
 当前 runtime 是有界阻塞 server：
 
@@ -1778,13 +1839,13 @@ import { Value } from "@util/util"
 ```toml
 name = "math"
 version = "0.1.0"
-source = "https://registry.example/ku/math/0.1.0.tar.gz"
+source = "https://registry.example/ku/math/0.1.0.tar.zst"
 checksum = "sha256-<64 hex digits>"
 ```
 
 registry lock 使用一个或多个 `[[package]]`，要求 `name/version/source/url/checksum/cache_key` 齐全；`source` 必须是 `registry`，版本必须是 `major.minor.patch`，checksum 必须是 `sha256-` 加 64 位十六进制。`cache_key` 必须由 name、精确版本和完整 SHA-256 确定，不能自行填写任意值。
 
-resolver 支持精确版本 `1.2.3` 和 caret 范围 `^1.2.3`。同名依赖的全部约束会合并，选择满足全部约束的最高可用版本；没有共同版本时返回 `package/dependency_conflict`，不做无限回溯或 SAT 搜索。远程请求最多 8 次，连接/读取超时均有上限，单包最多 100 MB；只对明确瞬时错误有限退避。下载 staging 与 GC 隔离，SHA-256 通过后安装到不可覆盖的内容寻址 cache；并发安装锁和旧锁恢复均有界。当前已实现 `Ed25519RegistryIndexVerifier`，可验证 registry index 的 detached signature；未配置 verifier、缺少 dependency source 或签名不匹配都会 fail-closed，不会读取旧 cache 绕过信任边界。内置官方根公钥、自定义 registry 公钥配置、key rotation/revocation 和受限 `.tar.zst` 解包仍在后续队列。
+resolver 支持精确版本 `1.2.3` 和 caret 范围 `^1.2.3`。同名依赖的全部约束会合并，选择满足全部约束的最高可用版本；没有共同版本时返回 `package/dependency_conflict`，不做无限回溯或 SAT 搜索。远程请求最多 8 次，连接/读取超时均有上限，单个压缩归档最多 32 MB；只对明确瞬时错误有限退避。下载 staging 与 GC 隔离，SHA-256 通过后会按受限 `.tar.zst` 规则解包并安装到不可覆盖的内容寻址 cache；并发安装锁和旧锁恢复均有界。当前已实现 `Ed25519RegistryIndexVerifier`，可验证 registry index 的 detached signature；未配置 verifier、缺少 dependency source 或签名不匹配都会 fail-closed，不会读取旧 cache 绕过信任边界。内置官方根公钥、自定义 registry 公钥配置、key rotation/revocation 仍在后续队列。
 
 ## 16. CLI 相关语法
 
@@ -1854,7 +1915,7 @@ lib      library project
 基础类型错误
 if / while 条件类型错误
 数组、对象、结构体、enum 基础语义错误
-import 语法、私有导入、循环导入
+import 语法、未使用 import、私有导入、循环导入
 Result / ? / fail / try 基础语义错误
 stdlib 参数数量和基础类型错误
 http std module 是否已显式导入
@@ -1868,7 +1929,7 @@ level code message file line column endLine endColumn notes helps
 
 VS Code 扩展优先读取 JSON diagnostics；面对旧版 Ku CLI 时只回退一次文本解析，不循环重试。
 
-`ku check --deny-unused` 是严格 unused 检查第一阶段：本文件局部变量/常量如果声明后没有被读取，会报 `E0905`；用 `_` 或 `_name` 表示明确丢弃。函数参数暂不纳入错误，避免破坏 HTTP handler `(req, res)` 形状。未使用 import 还未默认开启，因为 import expansion 需要先保留 import-origin，避免跨文件导出和 std namespace 误判。
+未使用 import 默认报 `E0901`，named import 和 namespace import 都会检查；用 `_` 或 `_name` alias 表示明确丢弃。glob / side-effect import 暂不做 unused 判断，避免误伤副作用导入。`ku check --deny-unused` 继续开启严格 unused 本地绑定检查：本文件局部变量/常量如果声明后没有被读取，会报 `E0905`；用 `_` 或 `_name` 表示明确丢弃。普通函数参数当前仍不纳入全局 unused 错误，但 HTTP handler 的请求参数会单独检查：读取请求时必须叫 `req`，不读取时必须叫 `_req`。
 
 `ku llvm file.ku` 在源文件旁输出 `.ll`，不要求本机安装 LLVM。当前文本后端支持 `int/bool/str`、普通函数、局部变量、直接调用、`return`、`if/while`、`print`、非递归 struct 值与字段读写，以及 `Result<int|bool|str|struct>` 的 `ok`、`fail`、`?` 和错误传播。数组、enum、闭包、HTTP 和 async 仍会明确报不支持。后端会拒绝递归值 struct、缺失/重复 CFG block 和无条件自跳，避免生成明显错误或永久循环的 `.ll`。golden test 不依赖外部工具；检测到 `llvm-as` 时会额外验证生成文本。
 
@@ -1908,7 +1969,7 @@ ku build --release -o dist/app.exe
 --emit-llvm    写入 .ku/build/<profile>/llvm/main.ll
 ```
 
-`--backend c` 会使用 prototype C 后端生成 C 后再调用 C 编译器。查找顺序为 `KU_CC`、`zig cc`、`clang`、`cc`、`gcc`、`cl`；找不到或编译失败会给出修改方向。默认 backend 仍是解释器 wrapper，因为完整 native closure / KuString / dynamic object / async ABI 尚未完成。`ku run build` 仅作为兼容别名保留，会提示改用 `ku build`。
+`--target` 第一阶段只接受 `host`、`x86_64-linux`、`x86_64-windows`、`aarch64-darwin`；包含路径分隔符、Windows drive prefix 或未知 target 会直接报错，避免输出路径逃逸。`--backend c` 会使用 prototype C 后端生成 C 后再调用 C 编译器。查找顺序为 `KU_CC`、`zig cc`、`clang`、`cc`、`gcc`；找不到或编译失败会给出修改方向。跨 target 会把 resolver 输出的三元组传给 `zig cc -target` 或 `clang/cc/gcc --target`，实际是否可链接取决于本机工具链。默认 backend 仍是解释器 wrapper，因为完整 native closure / KuString / dynamic object / async ABI 尚未完成。`ku run build` 仅作为兼容别名保留，会提示改用 `ku build`。
 
 0.0.15 build 的重要边界：默认生成的是“解释器打包型二进制”，入口源码会嵌入 wrapper；带 import 的程序仍会按原源码路径读取依赖，因此还不是最终“不依赖 Ku 源码文件”的 native binary。最终 native build 仍需要 import graph 打包、runtime ABI lowering、closure/native string/object/async lowering 和增量缓存继续补齐。
 

@@ -34,8 +34,8 @@ exports.keywords = [
 ];
 exports.types = ["int", "float", "bool", "str", "null"];
 exports.builtins = ["len", "str", "ok", "err", "println"];
-exports.stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.json", "std.config", "std.time", "std.task"];
-exports.stdRootModules = ["fs", "http", "string", "array", "json", "config", "time", "task"];
+exports.stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.object", "std.json", "std.config", "std.time", "std.task"];
+exports.stdRootModules = ["fs", "http", "string", "array", "object", "json", "config", "time", "task"];
 exports.stdFunctions = [
     "fs.read",
     "fs.try_read",
@@ -46,6 +46,7 @@ exports.stdFunctions = [
     "http.request",
     "http.client",
     "http.text",
+    "http.html",
     "http.json",
     "http.empty",
     "http.redirect",
@@ -61,6 +62,7 @@ exports.stdFunctions = [
     "array.try_get",
     "array.push",
     "array.concat",
+    "object.get_or",
     "json.parse",
     "json.try_parse",
     "json.stringify",
@@ -91,7 +93,7 @@ exports.stdFunctions = [
 ];
 exports.namespaceMembers = {
     fs: ["read", "try_read", "write", "try_write"],
-    http: ["get", "post", "request", "client", "text", "json", "empty", "redirect", "status", "statusText", "code", "service", "server"],
+    http: ["get", "post", "request", "client", "text", "html", "json", "empty", "redirect", "status", "statusText", "code", "service", "server"],
     status: [
         "ok",
         "created",
@@ -128,6 +130,7 @@ exports.namespaceMembers = {
     code: ["SUCCESS", "CREATED", "ACCEPTED", "NO_CONTENT", "BAD_REQUEST", "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "VALIDATION_FAILED", "INTERNAL_ERROR"],
     string: ["len", "trim", "lower", "upper", "slice"],
     array: ["len", "try_get", "push", "concat"],
+    object: ["get_or"],
     json: ["parse", "try_parse", "stringify"],
     config: ["env", "env_file", "yaml"],
     time: [
@@ -159,7 +162,6 @@ exports.namespaceMembers = {
     nums: ["len", "try_get", "push", "concat", "map"],
     req: ["method", "path", "params", "query", "headers", "body"],
     request: ["method", "path", "params", "query", "headers", "body"],
-    res: ["status", "headers", "body"],
     response: ["status", "headers", "body"],
     app: [
         "get",

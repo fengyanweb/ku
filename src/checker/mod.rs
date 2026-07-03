@@ -402,6 +402,29 @@ impl Checker {
             TypeName::Result(inner) => Ok(Type::Result(Box::new(
                 self.resolve_type_name_with_generics(inner, span, generics)?,
             ))),
+            TypeName::Function {
+                params,
+                return_type,
+                is_async,
+            } => Ok(Type::FunctionValue {
+                params: params
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ty)| {
+                        Ok(FunctionValueParam {
+                            name: format!("arg{index}"),
+                            ty: Some(self.resolve_type_name_with_generics(ty, span, generics)?),
+                        })
+                    })
+                    .collect::<KuResult<Vec<_>>>()?,
+                return_type: Some(Box::new(self.resolve_type_name_with_generics(
+                    return_type,
+                    span,
+                    generics,
+                )?)),
+                body: Vec::new(),
+                is_async: *is_async,
+            }),
             TypeName::Union(types) => {
                 let mut resolved = Vec::with_capacity(types.len());
                 for ty in types {
@@ -1691,27 +1714,56 @@ impl Checker {
         body: &[Stmt],
         span: Span,
     ) -> KuResult<()> {
-        if params.len() != 2 {
+        if params.len() != 1 {
             return Err(KuError::runtime(
-                format!("http service {method} handler expects 2 parameters"),
+                format!("http service {method} handler expects exactly one req parameter"),
                 span,
             ));
         }
-        let expected = http_response_type();
+        let param = &params[0];
+        if matches!(param.name.as_str(), "res" | "writer") {
+            return Err(KuError::runtime(
+                "http handler parameter must be named req, or _req when intentionally unused; res/writer parameters are not allowed in ordinary handlers",
+                span,
+            ));
+        }
+        if param.name != "req" && param.name != "_req" {
+            return Err(KuError::runtime(
+                format!(
+                    "http handler parameter must be named req, or _req when intentionally unused; got '{}'",
+                    param.name
+                ),
+                span,
+            ));
+        }
+        if param.name == "req" && !function_body_uses_name(body, "req") {
+            return Err(KuError::runtime(
+                "http handler parameter 'req' is unused; write '_req' when the request is intentionally unused",
+                span,
+            ));
+        }
+        reject_http_side_effect_response_calls(body, span)?;
+        let response = http_response_type();
+        let result_response = Type::Result(Box::new(response.clone()));
+        let allowed = union_or_single(vec![response.clone(), result_response.clone()]);
+        let expected = return_type.unwrap_or(&allowed);
+        if !type_matches(&allowed, expected) {
+            return Err(type_error(span, &allowed, expected));
+        }
         let actual = self.check_function_value_call_with_types_readonly_captures(
             params,
-            Some(&expected),
+            Some(expected),
             body,
-            &[http_request_type(), http_response_type()],
+            &[http_request_type()],
             span,
         )?;
         if let Some(return_type) = return_type {
-            if !type_matches(&expected, return_type) {
-                return Err(type_error(span, &expected, return_type));
+            if !type_matches(&allowed, return_type) {
+                return Err(type_error(span, &allowed, return_type));
             }
         }
-        if !type_matches(&expected, &actual) {
-            return Err(type_error(span, &expected, &actual));
+        if !type_matches(&allowed, &actual) {
+            return Err(type_error(span, &allowed, &actual));
         }
         Ok(())
     }
@@ -2206,6 +2258,7 @@ impl Checker {
         let module = match target_type {
             Type::String => "string",
             Type::Array(_) if name != "map" => "array",
+            Type::Object(_) | Type::StringMap | Type::DynamicObject if name == "get_or" => "object",
             _ => return Ok(None),
         };
         let Some(signature) = metadata::dotted_signature(module, name) else {
@@ -2232,9 +2285,17 @@ impl Checker {
         }
         if matches!(
             signature.name.as_str(),
-            "http.text" | "http.json" | "http.empty" | "http.redirect" | "http.statusText"
+            "http.text"
+                | "http.html"
+                | "http.json"
+                | "http.empty"
+                | "http.redirect"
+                | "http.statusText"
         ) {
             return self.apply_http_response_helper_signature(&signature.name, args, span);
+        }
+        if signature.name == "object.get_or" {
+            return self.apply_object_get_or_signature(args, span);
         }
         expect_arg_count(&signature.name, args.len(), signature.args.len(), span)?;
         let actuals = args
@@ -2304,7 +2365,7 @@ impl Checker {
         span: Span,
     ) -> KuResult<Type> {
         match name {
-            "http.text" => {
+            "http.text" | "http.html" => {
                 if args.len() == 1 {
                     let body = self.check_expr(&args[0])?;
                     if body == Type::String {
@@ -2386,6 +2447,29 @@ impl Checker {
         }
     }
 
+    fn apply_object_get_or_signature(&mut self, args: &[Expr], span: Span) -> KuResult<Type> {
+        expect_arg_count("object.get_or", args.len(), 3, span)?;
+        let object_type = self.check_expr(&args[0])?;
+        let key_type = self.check_expr(&args[1])?;
+        if !type_matches(&Type::String, &key_type) {
+            return Err(type_error(args[1].span, &Type::String, &key_type));
+        }
+        let default_type = self.check_expr(&args[2])?;
+        match object_type {
+            Type::Object(fields) => {
+                let Some(key) = string_literal_value(&args[1]) else {
+                    let mut options = fields.values().cloned().collect::<Vec<_>>();
+                    options.push(default_type);
+                    return Ok(union_or_single(options));
+                };
+                Ok(fields.get(&key).cloned().unwrap_or(default_type))
+            }
+            Type::StringMap => Ok(union_or_single(vec![Type::String, default_type])),
+            Type::DynamicObject | Type::Unknown => Ok(Type::Unknown),
+            actual => Err(type_error(args[0].span, &Type::DynamicObject, &actual)),
+        }
+    }
+
     fn check_http_status_arg(&mut self, expr: &Expr) -> KuResult<()> {
         let actual = self.check_expr(expr)?;
         if actual == Type::Int || actual == Type::Unknown {
@@ -2408,7 +2492,10 @@ impl Checker {
             TypePattern::Null => actual == &Type::Null,
             TypePattern::Unknown | TypePattern::Any => true,
             TypePattern::ArrayAny => matches!(actual, Type::Array(_)),
-            TypePattern::ObjectAny => matches!(actual, Type::Object(_) | Type::DynamicObject),
+            TypePattern::ObjectAny => matches!(
+                actual,
+                Type::Object(_) | Type::StringMap | Type::DynamicObject
+            ),
             TypePattern::ObjectFields(fields) => match actual {
                 Type::Object(actual_fields) => fields.iter().all(|(name, pattern)| {
                     actual_fields
@@ -3259,10 +3346,41 @@ fn type_matches(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Generic(_), _) | (_, Type::Generic(_)) => true,
         (Type::Unknown, _) | (_, Type::Unknown) => true,
+        (Type::Union(expected_options), Type::Union(actual_options)) => {
+            actual_options.iter().all(|actual| {
+                expected_options
+                    .iter()
+                    .any(|expected| type_matches(expected, actual))
+            })
+        }
         (Type::Union(options), _) => options.iter().any(|option| type_matches(option, actual)),
         (_, Type::Union(options)) => options.iter().all(|option| type_matches(expected, option)),
         (Type::Array(left), Type::Array(right)) => type_matches(left, right),
         (Type::Result(left), Type::Result(right)) => type_matches(left, right),
+        (
+            Type::FunctionValue {
+                params: left_params,
+                return_type: left_return,
+                is_async: left_async,
+                ..
+            },
+            Type::FunctionValue {
+                params: right_params,
+                return_type: right_return,
+                is_async: right_async,
+                ..
+            },
+        ) => {
+            left_async == right_async
+                && left_params.len() == right_params.len()
+                && left_params
+                    .iter()
+                    .zip(right_params.iter())
+                    .all(|(left, right)| {
+                        function_param_matches(left.ty.as_ref(), right.ty.as_ref())
+                    })
+                && function_return_matches(left_return.as_deref(), right_return.as_deref())
+        }
         (Type::Object(_), Type::StringMap) | (Type::StringMap, Type::Object(_)) => true,
         (Type::Object(_), Type::DynamicObject) | (Type::DynamicObject, Type::Object(_)) => true,
         (Type::Object(left), Type::Object(right)) => {
@@ -3274,6 +3392,46 @@ fn type_matches(expected: &Type, actual: &Type) -> bool {
                 })
         }
         _ => expected == actual,
+    }
+}
+
+fn function_param_matches(expected: Option<&Type>, actual: Option<&Type>) -> bool {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => type_matches(expected, actual),
+        (Some(_), None) => false,
+        (None, Some(_)) | (None, None) => true,
+    }
+}
+
+fn function_return_matches(expected: Option<&Type>, actual: Option<&Type>) -> bool {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => type_matches(expected, actual),
+        (Some(_), None) => false,
+        (None, Some(_)) | (None, None) => true,
+    }
+}
+
+fn union_or_single(types: Vec<Type>) -> Type {
+    let mut deduped = Vec::new();
+    for ty in types {
+        if !deduped
+            .iter()
+            .any(|existing| type_matches(existing, &ty) && type_matches(&ty, existing))
+        {
+            deduped.push(ty);
+        }
+    }
+    if deduped.len() == 1 {
+        deduped.remove(0)
+    } else {
+        Type::Union(deduped)
+    }
+}
+
+fn string_literal_value(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Literal(Literal::String(value)) => Some(value.clone()),
+        _ => None,
     }
 }
 
@@ -3386,6 +3544,338 @@ fn enum_variant_path(expr: &Expr) -> Option<(String, String)> {
     Some((enum_name.clone(), name.clone()))
 }
 
+fn function_body_uses_name(body: &[Stmt], name: &str) -> bool {
+    body.iter().any(|stmt| stmt_uses_name(stmt, name, false))
+}
+
+fn stmt_uses_name(stmt: &Stmt, name: &str, shadowed: bool) -> bool {
+    match stmt {
+        Stmt::VarDecl { value, .. } | Stmt::Assign { value, .. } => {
+            expr_uses_name(value, name, shadowed)
+        }
+        Stmt::AssignTarget { target, value, .. } | Stmt::CompoundAssign { target, value, .. } => {
+            assign_target_uses_name(target, name, shadowed) || expr_uses_name(value, name, shadowed)
+        }
+        Stmt::DestructureAssign { values, .. } => values
+            .iter()
+            .any(|value| expr_uses_name(value, name, shadowed)),
+        Stmt::ObjectDestructureAssign {
+            bindings, value, ..
+        } => {
+            expr_uses_name(value, name, shadowed)
+                || bindings.iter().any(|binding| {
+                    binding
+                        .default
+                        .as_ref()
+                        .is_some_and(|default| expr_uses_name(default, name, shadowed))
+                })
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_uses_name(condition, name, shadowed)
+                || then_branch
+                    .iter()
+                    .any(|stmt| stmt_uses_name(stmt, name, shadowed))
+                || else_branch
+                    .iter()
+                    .any(|stmt| stmt_uses_name(stmt, name, shadowed))
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            expr_uses_name(condition, name, shadowed)
+                || body.iter().any(|stmt| stmt_uses_name(stmt, name, shadowed))
+        }
+        Stmt::For {
+            name: loop_name,
+            iterable,
+            body,
+            ..
+        } => {
+            expr_uses_name(iterable, name, shadowed)
+                || body
+                    .iter()
+                    .any(|stmt| stmt_uses_name(stmt, name, shadowed || loop_name == name))
+        }
+        Stmt::Function(function) => {
+            let shadowed = shadowed
+                || function.name == name
+                || function.params.iter().any(|param| param.name == name);
+            function
+                .body
+                .iter()
+                .any(|stmt| stmt_uses_name(stmt, name, shadowed))
+        }
+        Stmt::Try {
+            body,
+            catch_name,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            body.iter().any(|stmt| stmt_uses_name(stmt, name, shadowed))
+                || catch_body.iter().any(|stmt| {
+                    stmt_uses_name(stmt, name, shadowed || catch_name.as_deref() == Some(name))
+                })
+                || finally_body
+                    .iter()
+                    .any(|stmt| stmt_uses_name(stmt, name, shadowed))
+        }
+        Stmt::Fail { value, .. } | Stmt::Panic { value, .. } | Stmt::Print { value, .. } => {
+            expr_uses_name(value, name, shadowed)
+        }
+        Stmt::Return { value, .. } => value
+            .as_ref()
+            .is_some_and(|value| expr_uses_name(value, name, shadowed)),
+        Stmt::Expr { expr, .. } => expr_uses_name(expr, name, shadowed),
+        Stmt::Break { .. } | Stmt::Continue { .. } => false,
+    }
+}
+
+fn assign_target_uses_name(target: &AssignTarget, name: &str, shadowed: bool) -> bool {
+    match target {
+        AssignTarget::Variable(_) => false,
+        AssignTarget::Index { target, index } => {
+            expr_uses_name(target, name, shadowed) || expr_uses_name(index, name, shadowed)
+        }
+        AssignTarget::Field { target, .. } => expr_uses_name(target, name, shadowed),
+    }
+}
+
+fn expr_uses_name(expr: &Expr, name: &str, shadowed: bool) -> bool {
+    match &expr.kind {
+        ExprKind::Variable(variable) => !shadowed && variable == name,
+        ExprKind::Unary { expr, .. } | ExprKind::Await(expr) | ExprKind::TryUnwrap { expr } => {
+            expr_uses_name(expr, name, shadowed)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            expr_uses_name(left, name, shadowed) || expr_uses_name(right, name, shadowed)
+        }
+        ExprKind::Call { callee, args } => {
+            expr_uses_name(callee, name, shadowed)
+                || args.iter().any(|arg| expr_uses_name(arg, name, shadowed))
+        }
+        ExprKind::Array(values) => values
+            .iter()
+            .any(|value| expr_uses_name(value, name, shadowed)),
+        ExprKind::Index { target, index } => {
+            expr_uses_name(target, name, shadowed) || expr_uses_name(index, name, shadowed)
+        }
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            expr_uses_name(target, name, shadowed)
+        }
+        ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => fields
+            .iter()
+            .any(|(_, value)| expr_uses_name(value, name, shadowed)),
+        ExprKind::Match { value, arms } => {
+            expr_uses_name(value, name, shadowed)
+                || arms.iter().any(|arm| {
+                    let shadowed = shadowed || pattern_binds_name(&arm.pattern, name);
+                    arm.guard
+                        .as_ref()
+                        .is_some_and(|guard| expr_uses_name(guard, name, shadowed))
+                        || expr_uses_name(&arm.value, name, shadowed)
+                })
+        }
+        ExprKind::Function { params, body, .. } => {
+            let shadowed = shadowed || params.iter().any(|param| param.name == name);
+            body.iter().any(|stmt| stmt_uses_name(stmt, name, shadowed))
+        }
+        ExprKind::Literal(_) => false,
+    }
+}
+
+fn pattern_binds_name(pattern: &MatchPattern, name: &str) -> bool {
+    match pattern {
+        MatchPattern::Binding(binding) => binding == name,
+        MatchPattern::EnumVariant { fields, .. } => {
+            fields.iter().any(|field| pattern_binds_name(field, name))
+        }
+        MatchPattern::Wildcard | MatchPattern::Literal(_) => false,
+    }
+}
+
+fn reject_http_side_effect_response_calls(body: &[Stmt], span: Span) -> KuResult<()> {
+    for stmt in body {
+        reject_http_side_effect_response_calls_in_stmt(stmt, span)?;
+    }
+    Ok(())
+}
+
+fn reject_http_side_effect_response_calls_in_stmt(stmt: &Stmt, span: Span) -> KuResult<()> {
+    match stmt {
+        Stmt::VarDecl { value, .. } | Stmt::Assign { value, .. } => {
+            reject_http_side_effect_response_calls_in_expr(value, span)
+        }
+        Stmt::AssignTarget { target, value, .. } | Stmt::CompoundAssign { target, value, .. } => {
+            reject_http_side_effect_response_calls_in_assign_target(target, span)?;
+            reject_http_side_effect_response_calls_in_expr(value, span)
+        }
+        Stmt::DestructureAssign { values, .. } => {
+            for value in values {
+                reject_http_side_effect_response_calls_in_expr(value, span)?;
+            }
+            Ok(())
+        }
+        Stmt::ObjectDestructureAssign {
+            bindings, value, ..
+        } => {
+            reject_http_side_effect_response_calls_in_expr(value, span)?;
+            for binding in bindings {
+                if let Some(default) = &binding.default {
+                    reject_http_side_effect_response_calls_in_expr(default, span)?;
+                }
+            }
+            Ok(())
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            reject_http_side_effect_response_calls_in_expr(condition, span)?;
+            reject_http_side_effect_response_calls_in_block(then_branch, span)?;
+            reject_http_side_effect_response_calls_in_block(else_branch, span)
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            reject_http_side_effect_response_calls_in_expr(condition, span)?;
+            reject_http_side_effect_response_calls_in_block(body, span)
+        }
+        Stmt::For { iterable, body, .. } => {
+            reject_http_side_effect_response_calls_in_expr(iterable, span)?;
+            reject_http_side_effect_response_calls_in_block(body, span)
+        }
+        Stmt::Function(function) => {
+            reject_http_side_effect_response_calls_in_block(&function.body, span)
+        }
+        Stmt::Try {
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            reject_http_side_effect_response_calls_in_block(body, span)?;
+            reject_http_side_effect_response_calls_in_block(catch_body, span)?;
+            reject_http_side_effect_response_calls_in_block(finally_body, span)
+        }
+        Stmt::Fail { value, .. } | Stmt::Panic { value, .. } | Stmt::Print { value, .. } => {
+            reject_http_side_effect_response_calls_in_expr(value, span)
+        }
+        Stmt::Return { value, .. } => {
+            if let Some(value) = value {
+                reject_http_side_effect_response_calls_in_expr(value, span)?;
+            }
+            Ok(())
+        }
+        Stmt::Expr { expr, .. } => reject_http_side_effect_response_calls_in_expr(expr, span),
+        Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
+    }
+}
+
+fn reject_http_side_effect_response_calls_in_block(body: &[Stmt], span: Span) -> KuResult<()> {
+    for stmt in body {
+        reject_http_side_effect_response_calls_in_stmt(stmt, span)?;
+    }
+    Ok(())
+}
+
+fn reject_http_side_effect_response_calls_in_assign_target(
+    target: &AssignTarget,
+    span: Span,
+) -> KuResult<()> {
+    match target {
+        AssignTarget::Variable(_) => Ok(()),
+        AssignTarget::Index { target, index } => {
+            reject_http_side_effect_response_calls_in_expr(target, span)?;
+            reject_http_side_effect_response_calls_in_expr(index, span)
+        }
+        AssignTarget::Field { target, .. } => {
+            reject_http_side_effect_response_calls_in_expr(target, span)
+        }
+    }
+}
+
+fn reject_http_side_effect_response_calls_in_expr(expr: &Expr, handler_span: Span) -> KuResult<()> {
+    match &expr.kind {
+        ExprKind::Call { callee, args } => {
+            if let Some(name) = http_side_effect_response_call_name(callee) {
+                return Err(KuError::runtime(
+                    format!(
+                        "ordinary HTTP handlers must return an HttpResponse; side-effect response API '{name}' is not allowed"
+                    ),
+                    expr.span,
+                ));
+            }
+            reject_http_side_effect_response_calls_in_expr(callee, handler_span)?;
+            for arg in args {
+                reject_http_side_effect_response_calls_in_expr(arg, handler_span)?;
+            }
+            Ok(())
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::Await(expr) | ExprKind::TryUnwrap { expr } => {
+            reject_http_side_effect_response_calls_in_expr(expr, handler_span)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            reject_http_side_effect_response_calls_in_expr(left, handler_span)?;
+            reject_http_side_effect_response_calls_in_expr(right, handler_span)
+        }
+        ExprKind::Array(values) => {
+            for value in values {
+                reject_http_side_effect_response_calls_in_expr(value, handler_span)?;
+            }
+            Ok(())
+        }
+        ExprKind::Index { target, index } => {
+            reject_http_side_effect_response_calls_in_expr(target, handler_span)?;
+            reject_http_side_effect_response_calls_in_expr(index, handler_span)
+        }
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            reject_http_side_effect_response_calls_in_expr(target, handler_span)
+        }
+        ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+            for (_, value) in fields {
+                reject_http_side_effect_response_calls_in_expr(value, handler_span)?;
+            }
+            Ok(())
+        }
+        ExprKind::Match { value, arms } => {
+            reject_http_side_effect_response_calls_in_expr(value, handler_span)?;
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    reject_http_side_effect_response_calls_in_expr(guard, handler_span)?;
+                }
+                reject_http_side_effect_response_calls_in_expr(&arm.value, handler_span)?;
+            }
+            Ok(())
+        }
+        ExprKind::Function { body, .. } => {
+            reject_http_side_effect_response_calls_in_block(body, handler_span)
+        }
+        ExprKind::Literal(_) | ExprKind::Variable(_) => Ok(()),
+    }
+}
+
+fn http_side_effect_response_call_name(callee: &Expr) -> Option<String> {
+    let ExprKind::Field { target, name } = &callee.kind else {
+        return None;
+    };
+    let root = expr_root_name(target)?;
+    let blocked = matches!(
+        (root, name.as_str()),
+        ("res", "write" | "end" | "status" | "header")
+            | ("reply", "send" | "write" | "end")
+            | ("writer", "write" | "status" | "header" | "end")
+    );
+    blocked.then(|| format!("{root}.{name}"))
+}
+
 fn type_error(span: Span, expected: &Type, actual: &Type) -> KuError {
     KuError::runtime(
         format!(
@@ -3470,7 +3960,33 @@ fn type_name(ty: &Type) -> String {
         Type::Enum(name) => name.clone(),
         Type::Generic(name) => name.clone(),
         Type::Void => "void".to_string(),
-        Type::FunctionValue { .. } => "function".to_string(),
+        Type::FunctionValue {
+            params,
+            return_type,
+            is_async,
+            ..
+        } => {
+            let params = params
+                .iter()
+                .map(|param| {
+                    param
+                        .ty
+                        .as_ref()
+                        .map(type_name)
+                        .unwrap_or_else(|| "unknown".to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let returns = return_type
+                .as_deref()
+                .map(type_name)
+                .unwrap_or_else(|| "unknown".to_string());
+            if *is_async {
+                format!("async fn({params}): {returns}")
+            } else {
+                format!("fn({params}): {returns}")
+            }
+        }
         Type::Unknown => "unknown".to_string(),
     }
 }

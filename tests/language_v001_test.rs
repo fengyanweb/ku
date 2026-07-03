@@ -543,6 +543,88 @@ fn main() {
 }
 
 #[test]
+fn function_type_annotations_accept_sync_and_async_function_values() {
+    let source = r#"
+fn Add(a: int, b: int): int {
+    return a + b
+}
+
+async fn Load(id: int): str! {
+    return ok("user")
+}
+
+fn main() {
+    op: fn(int, int): int = Add
+    loader: async fn(int): str! = Load
+    print(op(2, 3))
+}
+"#;
+
+    check_source("inline.ku", source).expect("function type annotations should check");
+    run_source("inline.ku", source).expect("sync function type value should run");
+}
+
+#[test]
+fn function_type_annotation_rejects_mismatched_signatures() {
+    let source = r#"
+fn Add(a: int, b: int): int {
+    return a + b
+}
+
+fn main() {
+    op: fn(int): int = Add
+    print(op(2))
+}
+"#;
+
+    let err = check_source("inline.ku", source)
+        .expect_err("mismatched function type annotation should fail");
+    assert!(
+        err.to_string()
+            .contains("expected fn(int): int but got fn(int, int): int"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn function_type_annotation_requires_precise_function_value_signature() {
+    let source = r#"
+fn main() {
+    f: fn(int): int = (x) => "bad"
+    print(f(1))
+}
+"#;
+
+    let err = check_source("inline.ku", source)
+        .expect_err("untyped function value should not satisfy a precise function type");
+    assert!(
+        err.to_string()
+            .contains("expected fn(int): int but got fn(unknown): unknown"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn arrow_function_type_syntax_is_not_a_type_annotation() {
+    let source = r#"
+fn Add(a: int, b: int): int {
+    return a + b
+}
+
+fn main() {
+    op: (int, int) => int = Add
+    print(op(2, 3))
+}
+"#;
+
+    let err = check_source("inline.ku", source).expect_err("arrow syntax is not a function type");
+    assert!(
+        err.to_string().contains("expected type name"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn typed_arrow_function_return_type_is_checked() {
     let source = r#"
 fn main() {
@@ -582,6 +664,62 @@ fn main() {
 "#;
     check_source("inline.ku", optional).expect("optional object index should check");
     run_source("inline.ku", optional).expect("optional object index should return null");
+}
+
+#[test]
+fn object_get_or_supports_function_and_method_forms() {
+    let source = r#"
+fn main() {
+    user = { name: "Ku" }
+    print(object.get_or(user, "name", "fallback"))
+    print(object.get_or(user, "missing", "fallback"))
+    print(user.get_or("name", "fallback"))
+    print(user.get_or("missing", "fallback"))
+}
+"#;
+
+    check_source("inline.ku", source).expect("object.get_or forms should check");
+    run_source("inline.ku", source).expect("object.get_or forms should run");
+}
+
+#[test]
+fn object_get_or_default_argument_is_evaluated_immediately() {
+    let source = r#"
+fn Boom(): str {
+    panic("default evaluated")
+    return "fallback"
+}
+
+fn main() {
+    user = { name: "Ku" }
+    print(user.get_or("name", Boom()))
+}
+"#;
+
+    let err = run_source("inline.ku", source)
+        .expect_err("object.get_or default argument should be evaluated immediately");
+    assert!(
+        err.to_string().contains("default evaluated"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn object_get_or_uses_static_field_type_for_literal_keys() {
+    let source = r#"
+fn main() {
+    obj = { name: "Ku" }
+    value: int = obj.get_or("name", 0)
+    print(value)
+}
+"#;
+
+    let err = check_source("inline.ku", source)
+        .expect_err("literal object.get_or key should preserve static field type");
+    assert!(
+        err.to_string().contains("expected int but got str"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

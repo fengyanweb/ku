@@ -481,7 +481,7 @@ class KuCompletionProvider {
         if (/\berr\.$/.test(linePrefix)) {
             return fieldCompletions(["domain", "code", "message"], "Error field");
         }
-        if (/\b(res|response)\.$/.test(linePrefix)) {
+        if (/\bresponse\.$/.test(linePrefix)) {
             return fieldCompletions(["status", "headers", "body"], "HttpResponse field");
         }
         if (/["'`][^"'`]*\.$/.test(linePrefix) || /\btext\.$/.test(linePrefix)) {
@@ -657,7 +657,7 @@ class KuHoverProvider {
             "catch": "`catch (err)` 中 `err` 是结构化 Error 对象：`err.domain`、`err.code`、`err.message`。",
             "err": "`err(message)` 返回 `Unknown!`，失败 payload 是 `{ domain, code, message }`。",
             "fail": "`fail` 主动返回可恢复错误；字符串会包装为 `{ domain: \"ku\", code: \"fail\", message }`。",
-            "http": "`import \"std.http\"` 后使用。`http.get/post/request` 返回 `{ status, headers, body }!`；`http.status.*` 提供协议状态码常量。",
+            "http": "`import \"std.http\"` 后使用。`http.get/post/request` 返回 `{ status, headers, body }!`；`http.text/html/json/empty/redirect` 返回 HTTP 响应对象。",
             "service": "`http.service()` 返回带默认资源限制的 HTTP service 配置对象；支持 route/bind/listen/run 基础阻塞 server。",
             "status": "`http.status` 是 HTTP 协议状态码常量对象，例如 `http.status.ok`、`http.status.created`、`http.status.notFound`。",
             "statusText": "`http.statusText(code)` 把 HTTP 状态码转成标准原因短语，例如 404 -> \"Not Found\"。",
@@ -665,6 +665,9 @@ class KuHoverProvider {
             "fs": "`import \"std.fs\"` 后使用。支持 `fs.read/write/try_read/try_write`。",
             "config": "`import \"std.config\"` 后使用。支持 `config.env/env_file/yaml`。",
             "task": "`task` 不是关键字。业务 task 来自 async fn 调用并只能 await；`std.task` 只提供 stats/stress 诊断压测函数。",
+            "object": "`object.get_or(obj, key, default)` 和 `obj.get_or(key, default)` 是显式宽松读取；普通对象缺键仍报错。",
+            "object.get_or": "`object.get_or(obj, key, default)` 缺键返回 default，存在则返回字段值；default 参数会立即求值。",
+            "get_or": "`obj.get_or(key, default)` 缺键返回 default；default 参数会立即求值，不是惰性计算。",
             "time": "`time.now()` 返回 Time 对象；`time.millis()` 返回当前毫秒时间戳；支持 date/duration/format/parse/sleep。",
             "time.now": "`time.now()` 返回 `{ kind: \"time.time\", millis }`；`time.now(t)` 返回 t 到当前时间的毫秒差。",
             "time.millis": "`time.millis()` 返回当前 Unix 毫秒；`time.millis(timeOrDuration)` 读取 Time/Duration 的毫秒值。",

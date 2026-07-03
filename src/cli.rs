@@ -456,19 +456,20 @@ fn project_main_source(template: &ProjectTemplate) -> &'static str {
         "http" => {
             r#"import { http, time } from "std"
 
-fn ret(req, res) {
-    // `req` is the request object; handlers return an HttpResponse.
+fn health(_req) {
     return http.text("Ku HTTP OK")
+}
+
+fn index(_req) {
+    return http.text("Ku HTTP 123")
 }
 
 fn main(): null! {
     app = http.service()
 
-    app.get("/", ret)
-    app.get("/index", fn(req, res) {
-        return http.text("Ku HTTP 123")
-    })
-    app.get("/json", (req, res) => {
+    app.get("/", health)
+    app.get("/index", index)
+    app.get("/json", fn(req) {
         return http.json({
             code: 0,
             msg: "ok",
@@ -478,7 +479,7 @@ fn main(): null! {
             }
         })
     })
-    app.get("/user/{id}", (req, res) => {
+    app.get("/user/{id}", fn(req) {
         return http.json({
             code: 0,
             msg: "ok",
@@ -489,7 +490,7 @@ fn main(): null! {
             }
         })
     })
-    app.post("/echo", (req, res) => {
+    app.post("/echo", fn(req) {
         return http.text(req.body.clone())
     })
 
@@ -719,6 +720,7 @@ struct BuildPlan {
     out_root: PathBuf,
     build_dir: PathBuf,
     output: PathBuf,
+    target: Option<BuildTarget>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -728,6 +730,28 @@ struct RunnerBuildConfig<'a> {
     lto: bool,
     strip: bool,
     verbose: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BuildTarget {
+    slug: String,
+    rust_triple: &'static str,
+    c_triple: &'static str,
+    is_windows: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CCompilerCandidate {
+    label: String,
+    program: String,
+    args: Vec<String>,
+    kind: CCompilerKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CCompilerKind {
+    ZigCc,
+    ClangLike,
 }
 
 fn run_build_command(args: &[String]) -> Result<(), KuError> {
@@ -779,7 +803,7 @@ fn run_build_command(args: &[String]) -> Result<(), KuError> {
                 &plan.output,
                 RunnerBuildConfig {
                     profile: options.profile,
-                    target: options.target.as_deref(),
+                    target: plan.target.as_ref().map(|target| target.rust_triple),
                     lto: options.lto,
                     strip: options.strip,
                     verbose: options.verbose,
@@ -793,6 +817,7 @@ fn run_build_command(args: &[String]) -> Result<(), KuError> {
             compile_c_source(
                 &c_output,
                 &plan.output,
+                plan.target.as_ref(),
                 options.profile,
                 options.static_link,
                 options.verbose,
@@ -978,12 +1003,13 @@ fn resolve_build_plan(options: &BuildOptions) -> Result<BuildPlan, KuError> {
                 .map(|parent| parent.join(package::DEFAULT_BUILD_DIR))
                 .unwrap_or_else(|| cwd.join(package::DEFAULT_BUILD_DIR))
         });
-    let build_dir = build_profile_dir(&out_root, options.profile, options.target.as_deref());
+    let target = resolve_build_target(options.target.as_deref())?;
+    let build_dir = build_profile_dir(&out_root, options.profile, target.as_ref());
     let output = options
         .output
         .clone()
         .unwrap_or_else(|| build_dir.join(&package_name));
-    let output = with_executable_extension(output, options.target.as_deref());
+    let output = with_executable_extension(output, target.as_ref());
 
     Ok(BuildPlan {
         entry,
@@ -991,6 +1017,7 @@ fn resolve_build_plan(options: &BuildOptions) -> Result<BuildPlan, KuError> {
         out_root,
         build_dir,
         output,
+        target,
     })
 }
 
@@ -1008,22 +1035,70 @@ fn package_entry_path(package: &PackageContext) -> PathBuf {
     entry
 }
 
-fn build_profile_dir(out_root: &Path, profile: BuildProfile, target: Option<&str>) -> PathBuf {
+fn build_profile_dir(
+    out_root: &Path,
+    profile: BuildProfile,
+    target: Option<&BuildTarget>,
+) -> PathBuf {
     if let Some(target) = target {
-        out_root.join(target).join(profile.as_str())
+        out_root.join(&target.slug).join(profile.as_str())
     } else {
         out_root.join(profile.as_str())
     }
 }
 
-fn with_executable_extension(mut path: PathBuf, target: Option<&str>) -> PathBuf {
+fn with_executable_extension(mut path: PathBuf, target: Option<&BuildTarget>) -> PathBuf {
     let needs_exe = target
-        .map(|target| target.contains("windows"))
+        .map(|target| target.is_windows)
         .unwrap_or_else(|| cfg!(windows));
     if needs_exe && path.extension().is_none() {
         path.set_extension("exe");
     }
     path
+}
+
+fn resolve_build_target(target: Option<&str>) -> Result<Option<BuildTarget>, KuError> {
+    let Some(raw) = target else {
+        return Ok(None);
+    };
+    let value = raw.trim();
+    if value == "host" {
+        return Ok(None);
+    }
+    if value.is_empty()
+        || value.contains(['/', '\\', ':'])
+        || value.split('-').any(|part| part == "." || part == "..")
+    {
+        return Err(command_error(format!(
+            "invalid build target '{raw}'\nhelp: use host, x86_64-linux, x86_64-windows, or aarch64-darwin"
+        )));
+    }
+    let target = match value {
+        "x86_64-linux" => BuildTarget {
+            slug: value.to_string(),
+            rust_triple: "x86_64-unknown-linux-gnu",
+            c_triple: "x86_64-linux-gnu",
+            is_windows: false,
+        },
+        "x86_64-windows" => BuildTarget {
+            slug: value.to_string(),
+            rust_triple: "x86_64-pc-windows-msvc",
+            c_triple: "x86_64-windows-gnu",
+            is_windows: true,
+        },
+        "aarch64-darwin" => BuildTarget {
+            slug: value.to_string(),
+            rust_triple: "aarch64-apple-darwin",
+            c_triple: "aarch64-macos",
+            is_windows: false,
+        },
+        _ => {
+            return Err(command_error(format!(
+                "unsupported build target '{raw}'\nhelp: this stage supports host, x86_64-linux, x86_64-windows, and aarch64-darwin"
+            )))
+        }
+    };
+    Ok(Some(target))
 }
 
 fn is_ku_path(path: &Path) -> bool {
@@ -1205,6 +1280,7 @@ fn write_llvm_ir_to(path: &str, source: &str, output: &Path) -> Result<PathBuf, 
 fn compile_c_source(
     source: &Path,
     output: &Path,
+    target: Option<&BuildTarget>,
     profile: BuildProfile,
     static_link: bool,
     verbose: bool,
@@ -1218,42 +1294,29 @@ fn compile_c_source(
         })?;
     }
     let mut tried = Vec::new();
-    let mut candidates = Vec::new();
-    if let Ok(cc) = env::var("KU_CC") {
-        if !cc.trim().is_empty() {
-            candidates.push(cc);
+    let env_cc = env::var("KU_CC").ok();
+    for candidate in c_compiler_candidates(env_cc.as_deref()) {
+        tried.push(candidate.label.clone());
+        let mut command = Command::new(&candidate.program);
+        for arg in &candidate.args {
+            command.arg(arg);
         }
-    }
-    for fallback in ["zig", "clang", "cc", "gcc", "cl"] {
-        if !candidates.iter().any(|candidate| candidate == fallback) {
-            candidates.push(fallback.to_string());
+        if let Some(target) = target {
+            match candidate.kind {
+                CCompilerKind::ZigCc => {
+                    command.arg("-target").arg(target.c_triple);
+                }
+                CCompilerKind::ClangLike => {
+                    command.arg("--target").arg(target.rust_triple);
+                }
+            }
         }
-    }
-    for candidate in candidates {
-        tried.push(candidate.clone());
-        let mut command = if candidate == "zig" {
-            let mut command = Command::new("zig");
-            command.arg("cc");
-            command
-        } else {
-            Command::new(&candidate)
-        };
-        if candidate == "cl" {
-            command
-                .arg("/nologo")
-                .arg(source)
-                .arg(format!("/Fe:{}", output.display()));
-            if profile != BuildProfile::Debug {
-                command.arg("/O2");
-            }
-        } else {
-            command.arg(source).arg("-std=c11").arg("-o").arg(output);
-            if let Some(opt_level) = profile.rustc_opt_level() {
-                command.arg(format!("-O{opt_level}"));
-            }
-            if static_link {
-                command.arg("-static");
-            }
+        command.arg(source).arg("-std=c11").arg("-o").arg(output);
+        if let Some(opt_level) = profile.rustc_opt_level() {
+            command.arg(format!("-O{opt_level}"));
+        }
+        if static_link {
+            command.arg("-static");
         }
         if verbose {
             println!("c compiler command: {command:?}");
@@ -1262,22 +1325,69 @@ fn compile_c_source(
             Ok(status) if status.success() => return Ok(()),
             Ok(status) => {
                 return Err(KuError::message(format!(
-                    "native C build failed: {candidate} exited with {status}\nhelp: inspect generated source at {} or use default `ku build` until the native backend supports this program",
+                    "native C build failed: {} exited with {status}\nhelp: inspect generated source at {} or use default `ku build` until the native backend supports this program",
+                    candidate.label,
                     source.display()
                 )));
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => {
                 return Err(KuError::message(format!(
-                    "failed to run C compiler '{candidate}': {err}\nhelp: set KU_CC to clang/gcc/zig/cl, or use default `ku build`"
+                    "failed to run C compiler '{}': {err}\nhelp: set KU_CC to clang, gcc, or 'zig cc', or use default `ku build`",
+                    candidate.label
                 )));
             }
         }
     }
     Err(KuError::message(format!(
-        "C compiler not found for native build\nhelp: install clang/gcc/zig/cl, set KU_CC, or use default `ku build`; tried {}",
+        "C compiler not found for native build\nhelp: install clang/gcc/zig, set KU_CC, or use default `ku build`; tried {}",
         tried.join(", ")
     )))
+}
+
+fn c_compiler_candidates(env_cc: Option<&str>) -> Vec<CCompilerCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(env_cc) = env_cc {
+        if let Some(candidate) = parse_c_compiler_candidate(env_cc) {
+            candidates.push(candidate);
+        }
+    }
+    for fallback in ["zig cc", "clang", "cc", "gcc"] {
+        if let Some(candidate) = parse_c_compiler_candidate(fallback) {
+            if !candidates
+                .iter()
+                .any(|existing| existing.label == candidate.label)
+            {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
+fn parse_c_compiler_candidate(value: &str) -> Option<CCompilerCandidate> {
+    let parts = split_command_words(value);
+    let (program, args) = parts.split_first()?;
+    let label = parts.join(" ");
+    let kind = if program == "zig" && args.first().is_some_and(|arg| arg == "cc") {
+        CCompilerKind::ZigCc
+    } else {
+        CCompilerKind::ClangLike
+    };
+    Some(CCompilerCandidate {
+        label,
+        program: program.clone(),
+        args: args.to_vec(),
+        kind,
+    })
+}
+
+fn split_command_words(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn reject_native_async(program: &Program) -> Result<(), KuError> {
@@ -1635,6 +1745,8 @@ fn parse_and_check_with_options(
     source: &str,
     options: CheckOptions,
 ) -> Result<Program, KuError> {
+    let original = parse_source(source)?;
+    deny_unused_imports(&original)?;
     let program = parse_and_expand(file, source)?;
     Checker::new().check(&program)?;
     if options.deny_unused {
@@ -2055,6 +2167,41 @@ fn deny_unused_local_bindings(program: &Program) -> KuResult<()> {
     analyzer.finish()
 }
 
+fn deny_unused_imports(program: &Program) -> KuResult<()> {
+    let used = collect_import_name_references(program);
+    for item in &program.items {
+        let Item::Import(import) = item else {
+            continue;
+        };
+        if is_std_import_path(&import.path) && std_import_modules(import).is_err() {
+            continue;
+        }
+        match &import.kind {
+            ImportKind::Named(names) => {
+                for name in names {
+                    let local = name.local_name();
+                    if local == "_" || local.starts_with('_') {
+                        continue;
+                    }
+                    if !used.contains(local) {
+                        return Err(unused_import_error(local, name.span));
+                    }
+                }
+            }
+            ImportKind::Namespace(namespace) => {
+                if namespace == "_" || namespace.starts_with('_') {
+                    continue;
+                }
+                if !used.contains(namespace) {
+                    return Err(unused_import_error(namespace, import.span));
+                }
+            }
+            ImportKind::Glob => {}
+        }
+    }
+    Ok(())
+}
+
 fn unused_binding_error(name: &str, span: Span) -> KuError {
     KuError::runtime(
         format!(
@@ -2062,6 +2209,250 @@ fn unused_binding_error(name: &str, span: Span) -> KuError {
         ),
         span,
     )
+}
+
+fn unused_import_error(name: &str, span: Span) -> KuError {
+    KuError::runtime(
+        format!(
+            "unused import '{name}'; remove it, use it, or rename it to '_{name}' when it is intentionally unused"
+        ),
+        span,
+    )
+}
+
+fn collect_import_name_references(program: &Program) -> HashSet<String> {
+    let mut used = HashSet::new();
+    for item in &program.items {
+        match item {
+            Item::Import(_) | Item::Module(_) => {}
+            Item::Function(function) => collect_function_references(function, &mut used),
+            Item::Struct(decl) => {
+                for field in &decl.fields {
+                    if let Some(ty) = &field.ty {
+                        collect_type_references(ty, &mut used);
+                    }
+                }
+            }
+            Item::Enum(decl) => {
+                for variant in &decl.variants {
+                    for field in &variant.fields {
+                        if let Some(ty) = &field.ty {
+                            collect_type_references(ty, &mut used);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    used
+}
+
+fn collect_function_references(function: &FnDecl, used: &mut HashSet<String>) {
+    for param in &function.params {
+        if let Some(ty) = &param.ty {
+            collect_type_references(ty, used);
+        }
+    }
+    if let Some(return_type) = &function.return_type {
+        collect_type_references(return_type, used);
+    }
+    collect_stmt_references(&function.body, used);
+}
+
+fn collect_stmt_references(body: &[Stmt], used: &mut HashSet<String>) {
+    for stmt in body {
+        match stmt {
+            Stmt::VarDecl { ty, value, .. } => {
+                if let Some(ty) = ty {
+                    collect_type_references(ty, used);
+                }
+                collect_expr_references(value, used);
+            }
+            Stmt::Assign { value, .. } | Stmt::Fail { value, .. } | Stmt::Panic { value, .. } => {
+                collect_expr_references(value, used)
+            }
+            Stmt::Print { value, .. } => collect_expr_references(value, used),
+            Stmt::AssignTarget { target, value, .. }
+            | Stmt::CompoundAssign { target, value, .. } => {
+                collect_assign_target_references(target, used);
+                collect_expr_references(value, used);
+            }
+            Stmt::DestructureAssign { values, .. } => {
+                for value in values {
+                    collect_expr_references(value, used);
+                }
+            }
+            Stmt::ObjectDestructureAssign {
+                bindings, value, ..
+            } => {
+                collect_expr_references(value, used);
+                for binding in bindings {
+                    if let Some(default) = &binding.default {
+                        collect_expr_references(default, used);
+                    }
+                }
+            }
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_expr_references(condition, used);
+                collect_stmt_references(then_branch, used);
+                collect_stmt_references(else_branch, used);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                collect_expr_references(condition, used);
+                collect_stmt_references(body, used);
+            }
+            Stmt::For { iterable, body, .. } => {
+                collect_expr_references(iterable, used);
+                collect_stmt_references(body, used);
+            }
+            Stmt::Function(function) => collect_function_references(function, used),
+            Stmt::Try {
+                body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                collect_stmt_references(body, used);
+                collect_stmt_references(catch_body, used);
+                collect_stmt_references(finally_body, used);
+            }
+            Stmt::Return { value, .. } => {
+                if let Some(value) = value {
+                    collect_expr_references(value, used);
+                }
+            }
+            Stmt::Expr { expr, .. } => collect_expr_references(expr, used),
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        }
+    }
+}
+
+fn collect_assign_target_references(target: &AssignTarget, used: &mut HashSet<String>) {
+    match target {
+        AssignTarget::Variable(name) => collect_name_reference(name, used),
+        AssignTarget::Index { target, index } => {
+            collect_expr_references(target, used);
+            collect_expr_references(index, used);
+        }
+        AssignTarget::Field { target, .. } => collect_expr_references(target, used),
+    }
+}
+
+fn collect_expr_references(expr: &Expr, used: &mut HashSet<String>) {
+    match &expr.kind {
+        ExprKind::Variable(name) => collect_name_reference(name, used),
+        ExprKind::Unary { expr, .. } | ExprKind::Await(expr) | ExprKind::TryUnwrap { expr } => {
+            collect_expr_references(expr, used)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_expr_references(left, used);
+            collect_expr_references(right, used);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_expr_references(callee, used);
+            for arg in args {
+                collect_expr_references(arg, used);
+            }
+        }
+        ExprKind::Array(values) => {
+            for value in values {
+                collect_expr_references(value, used);
+            }
+        }
+        ExprKind::Index { target, index } => {
+            collect_expr_references(target, used);
+            collect_expr_references(index, used);
+        }
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            collect_expr_references(target, used);
+        }
+        ExprKind::StructLiteral { name, fields } => {
+            collect_name_reference(name, used);
+            for (_, value) in fields {
+                collect_expr_references(value, used);
+            }
+        }
+        ExprKind::ObjectLiteral { fields } => {
+            for (_, value) in fields {
+                collect_expr_references(value, used);
+            }
+        }
+        ExprKind::Match { value, arms } => {
+            collect_expr_references(value, used);
+            for arm in arms {
+                collect_match_pattern_references(&arm.pattern, used);
+                if let Some(guard) = &arm.guard {
+                    collect_expr_references(guard, used);
+                }
+                collect_expr_references(&arm.value, used);
+            }
+        }
+        ExprKind::Function {
+            params,
+            return_type,
+            body,
+        } => {
+            for param in params {
+                if let Some(ty) = &param.ty {
+                    collect_type_references(ty, used);
+                }
+            }
+            if let Some(return_type) = return_type {
+                collect_type_references(return_type, used);
+            }
+            collect_stmt_references(body, used);
+        }
+        ExprKind::Literal(_) => {}
+    }
+}
+
+fn collect_match_pattern_references(pattern: &MatchPattern, used: &mut HashSet<String>) {
+    if let MatchPattern::EnumVariant {
+        enum_name, fields, ..
+    } = pattern
+    {
+        collect_name_reference(enum_name, used);
+        for field in fields {
+            collect_match_pattern_references(field, used);
+        }
+    }
+}
+
+fn collect_type_references(ty: &TypeName, used: &mut HashSet<String>) {
+    match ty {
+        TypeName::Array(inner) | TypeName::Result(inner) => collect_type_references(inner, used),
+        TypeName::Function {
+            params,
+            return_type,
+            ..
+        } => {
+            for param in params {
+                collect_type_references(param, used);
+            }
+            collect_type_references(return_type, used);
+        }
+        TypeName::Union(types) => {
+            for ty in types {
+                collect_type_references(ty, used);
+            }
+        }
+        TypeName::Custom(name) => collect_name_reference(name, used),
+        TypeName::Int | TypeName::Float | TypeName::Bool | TypeName::String | TypeName::Null => {}
+    }
+}
+
+fn collect_name_reference(name: &str, used: &mut HashSet<String>) {
+    used.insert(name.to_string());
+    if let Some((namespace, _)) = name.split_once('.') {
+        used.insert(namespace.to_string());
+    }
 }
 
 fn parse_and_expand(file: &str, source: &str) -> Result<Program, KuError> {
@@ -2669,6 +3060,16 @@ fn rewrite_required_type_name(ty: &mut Option<TypeName>, rename_map: &HashMap<St
 fn rewrite_type_name(ty: &mut TypeName, rename_map: &HashMap<String, String>) {
     match ty {
         TypeName::Array(inner) | TypeName::Result(inner) => rewrite_type_name(inner, rename_map),
+        TypeName::Function {
+            params,
+            return_type,
+            ..
+        } => {
+            for param in params {
+                rewrite_type_name(param, rename_map);
+            }
+            rewrite_type_name(return_type, rename_map);
+        }
         TypeName::Union(types) => {
             for ty in types {
                 rewrite_type_name(ty, rename_map);
@@ -3057,6 +3458,16 @@ fn rewrite_namespaced_type_name(
         TypeName::Array(inner) | TypeName::Result(inner) => {
             rewrite_namespaced_type_name(inner, namespaces)
         }
+        TypeName::Function {
+            params,
+            return_type,
+            ..
+        } => {
+            for param in params {
+                rewrite_namespaced_type_name(param, namespaces);
+            }
+            rewrite_namespaced_type_name(return_type, namespaces);
+        }
         TypeName::Union(types) => {
             for ty in types {
                 rewrite_namespaced_type_name(ty, namespaces);
@@ -3223,4 +3634,78 @@ fn rewrite_namespace_enum_path(
         target.kind = ExprKind::Variable(renamed.clone());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_target_resolver_accepts_host_and_supported_targets() {
+        assert!(resolve_build_target(None)
+            .expect("default target")
+            .is_none());
+        assert!(resolve_build_target(Some("host"))
+            .expect("host target")
+            .is_none());
+
+        let linux = resolve_build_target(Some("x86_64-linux"))
+            .expect("linux target")
+            .expect("resolved linux target");
+        assert_eq!(linux.slug, "x86_64-linux");
+        assert_eq!(linux.rust_triple, "x86_64-unknown-linux-gnu");
+        assert_eq!(linux.c_triple, "x86_64-linux-gnu");
+        assert!(!linux.is_windows);
+
+        let windows = resolve_build_target(Some("x86_64-windows"))
+            .expect("windows target")
+            .expect("resolved windows target");
+        assert_eq!(windows.rust_triple, "x86_64-pc-windows-msvc");
+        assert!(windows.is_windows);
+        assert_eq!(
+            with_executable_extension(PathBuf::from("app"), Some(&windows)),
+            PathBuf::from("app.exe")
+        );
+
+        let darwin = resolve_build_target(Some("aarch64-darwin"))
+            .expect("darwin target")
+            .expect("resolved darwin target");
+        assert_eq!(darwin.rust_triple, "aarch64-apple-darwin");
+    }
+
+    #[test]
+    fn build_target_resolver_rejects_path_escape_and_unknown_targets() {
+        let err = resolve_build_target(Some("../escape")).expect_err("path target must fail");
+        assert!(
+            err.to_string().contains("invalid build target"),
+            "unexpected error: {err}"
+        );
+
+        let err = resolve_build_target(Some("wasm32-wasi")).expect_err("unknown target must fail");
+        assert!(
+            err.to_string().contains("unsupported build target"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn c_compiler_candidates_use_ku_cc_then_bounded_fallbacks() {
+        let candidates = c_compiler_candidates(Some("zig cc"));
+        let labels = candidates
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["zig cc", "clang", "cc", "gcc"]);
+        assert_eq!(candidates[0].program, "zig");
+        assert_eq!(candidates[0].args, vec!["cc"]);
+        assert_eq!(candidates[0].kind, CCompilerKind::ZigCc);
+        assert!(!labels.contains(&"cl"));
+
+        let candidates = c_compiler_candidates(Some("clang"));
+        let labels = candidates
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["clang", "zig cc", "cc", "gcc"]);
+    }
 }

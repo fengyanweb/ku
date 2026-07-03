@@ -92,11 +92,12 @@ HTTP server 有连接上限、active/pending 背压、handler timeout、idle tim
 return http.json({ code: 0, msg: "ok", data: null })
 return http.json(http.status.created, { code: 0, msg: "created", data: null })
 return http.empty()
+return http.html("<h1>ok</h1>")
 return http.redirect("/login")
 println(http.statusText(http.status.notFound))
 ```
 
-HTTP status 是协议状态码；业务 `body.code/msg/data` 由开发者自己维护。handler 固定接收 `(req, res)`，`req` 是请求对象，`res` 是当前 ABI 占位，普通代码直接返回 `http.text/json/empty/redirect(...)`。
+HTTP status 是协议状态码；业务 `body.code/msg/data` 由开发者自己维护。普通 handler 固定只接收 `req` 一个参数；不读取请求时写 `_req`。handler 不接收 `res/writer`，普通代码直接返回 `http.text/json/html/empty/redirect(...)`。
 
 ## task
 
