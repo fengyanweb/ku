@@ -1,0 +1,54 @@
+import { http, time } from "std"
+
+fn home() {
+    return http.text("Ku HTTP 服务运行中")
+}
+
+fn health() {
+    return http.json({
+        code: 0,
+        msg: "ok",
+        data: {
+            service: "Ku HTTP 千万请求压测示例",
+            now_ms: time.millis()
+        }
+    })
+}
+
+fn main(): null! {
+    app = http.service()
+
+    // 不读请求时，handler 写成 fn()。
+    app.get("/", home)
+    app.get("/health", health)
+
+    // 需要读取路径参数、查询参数、请求方法时，在路由注册点写 fn(req)。
+    app.get("/user/{id}", fn(req) {
+        return http.json({
+            code: 0,
+            msg: "ok",
+            data: {
+                id: req.params.id.clone(),
+                q: req.query["q"]?,
+                path: req.path.clone(),
+                method: req.method.clone()
+            }
+        })
+    })
+
+    // 普通 HTTP handler 只返回 HttpResponse，不接收 res/writer。
+    app.post("/echo", fn(req) {
+        return http.text(req.body.clone())
+    })
+
+    println("=== Ku HTTP 千万请求压测服务 ===")
+    println("启动地址: http://127.0.0.1:8080")
+    println("健康检查: http://127.0.0.1:8080/health")
+    println("带参数接口: http://127.0.0.1:8080/user/42?q=ku")
+    println("压测命令:")
+    println("powershell -ExecutionPolicy Bypass -File examples/http_bench.ps1 -Url http://127.0.0.1:8080/health -Requests 10000000 -Concurrency 1000 -TimeoutSeconds 600")
+    println("说明: 这是业务开发者写 HTTP 服务的方式；并发由 Ku runtime 管理，业务代码不直接管理 task。")
+
+    app.listen("127.0.0.1:8080")?
+    return ok(null)
+}

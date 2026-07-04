@@ -9,6 +9,21 @@ ku version
 
 Ku 当前是解释器优先的语言实现。文档只记录已经能被 lexer / parser / checker / runtime 闭环处理的语法；仍在设计中的能力放在文末“不支持 / 未完成”。
 
+## 0. 专题文档入口
+
+本文是完整语法总览。需要进入某个具体主题时，从这里跳转：
+
+| 主题 | 文档 |
+| --- | --- |
+| 语法、类型、控制流、函数、async、标准库总览 | 当前文档 |
+| 诊断错误码、JSON diagnostics、unused 规则 | [diagnostics.md](diagnostics.md) |
+| package、`ku.mod`、`ku build`、registry / lockfile | [package.md](package.md) |
+| IR、native C、LLVM、优化路线 | [ir.md](ir.md) |
+| async task、HTTP 并发、HTTP 千万请求压测 demo | [concurrency.md](concurrency.md) |
+| 自举状态、native binary 缺口、bootstrap 路线 | [self-hosting.md](self-hosting.md) |
+| 当前待决策问题和执行队列 | [roadmap-decisions.md](roadmap-decisions.md) |
+| 版本历史索引 | [history.md](history.md) |
+
 ## 1. 文件和入口
 
 Ku 源文件使用 `.ku` 扩展名。
@@ -1475,9 +1490,11 @@ fn main(): null! {
 
 非法日期、非法时间、非法格式、非法时区和非法 duration 返回结构化 `Err({ domain:"time", code, message })`。`time.sleep` 在同步 main 中阻塞当前执行；在 async task 中会走 blocking worker，避免长时间占用 task worker。
 
-### 12.9 std.task 观测与压力测试
+### 12.9 std.task 内部观测与压力测试
 
-使用前显式导入：
+`std.task` 是 runtime 内部诊断和压力测试命名空间，不是普通开发者业务 API。普通业务并发仍然只通过 `async fn` 调用返回的 `Task<T>` 句柄和 `await task` / `await task?` 完成；用户不能手动 `task.spawn`、`Task.new`、`runtime.schedule`、`thread.spawn`，也不能手动创建用户任务。
+
+维护者诊断时显式导入：
 
 ```ku
 import "std.task"
@@ -1487,8 +1504,6 @@ import "std.task"
 task.stats(): object
 task.stress(demand:int, producers:int, hold_ms:int): object
 ```
-
-`std.task` 是 runtime 诊断和压力测试命名空间，不是普通 task 句柄 API。它不提供 `task.spawn`、`Task.new`、`runtime.schedule` 或 `thread.spawn`，也不能手动创建用户任务。普通业务并发仍然只通过 `async fn` 调用返回的 `Task<T>` 句柄和 `await task` / `await task?` 完成。
 
 `task.stats()` 返回当前 runtime 的 active/registered/queued task、等待边、blocking job、worker 数以及累计 accepted/rejected/finished。
 
@@ -1500,11 +1515,20 @@ task.stress(demand:int, producers:int, hold_ms:int): object
 - 调用时 runtime 必须空闲；如果已有 active/queued task 或 blocking job，会返回 `task/stress_runtime_busy`，避免指标和业务 task 混在一起。
 - workload drain 最多等待 30 秒，超时返回 `task/stress_timeout`。
 
-仓库根目录的 `test.ku` 打印前后时间、耗时和 runtime 指标；`run-test.ps1` 额外从进程外采集 CPU 时间、峰值 working set、峰值 private memory 和线程数：
+仓库根目录的 `test.ku` 打印百万并发需求测试的前后时间、耗时和 runtime 指标；`run-test.ps1` 额外从进程外采集 CPU 时间、峰值 working set、峰值 private memory 和线程数。这两个入口用于 runtime 维护者诊断，不作为普通业务开发示例：
 
 ```powershell
 .\run-test.ps1
 ```
+
+普通开发者要压测 HTTP 服务时，使用 HTTP 示例和压测脚本：
+
+```powershell
+ku run examples\http_capacity_10m.ku
+powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127.0.0.1:8080/health -Requests 10000000 -Concurrency 1000 -TimeoutSeconds 600
+```
+
+HTTP demo 的业务代码不导入 `std.task`，只写 `http.service()`、`app.get/post`、`fn()` / `fn(req)` 和 `return http.text/json(...)`；并发由 Ku runtime 管理。
 
 ### 12.10 config
 
@@ -2062,7 +2086,7 @@ CPU time: 2312 ms
 观测峰值线程数: 13
 ```
 
-这个测试验证的是“百万并发需求下仍保持 1024 有界接纳”，不是允许一百万个活跃协程常驻内存。超限请求立即得到结构化拒绝，不排队死等、不无限重试。
+这个测试验证的是“百万并发需求下仍保持 1024 有界接纳”，不是允许一百万个活跃协程常驻内存。超限请求立即得到结构化拒绝，不排队死等、不无限重试。普通开发者要看 HTTP 压测入口时，使用 `examples/http_capacity_10m.ku` 和 `examples/http_bench.ps1`。
 
 ## 18. 当前不支持 / 未完成
 
@@ -2071,7 +2095,7 @@ LLVM 数组、enum、闭包、HTTP、async lowering
 LLVM 递归 struct 和更复杂 Result payload
 完整 native C 后端
 registry 根公钥配置、key rotation/revocation、归档格式、受限解包和 CLI 远程 import 串联
-native closure ABI、captured env 和函数类型语法
+native closure ABI、captured env 和函数值 native ABI / lowering
 native owned string 与动态 object ABI
 match guard 模式矩阵和跨 guard 的完整穷尽性检查
 顶层脚本语句

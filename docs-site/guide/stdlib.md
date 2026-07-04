@@ -101,18 +101,13 @@ HTTP status 是协议状态码；业务 `body.code/msg/data` 由开发者自己�
 
 ## task
 
-`std.task` 是 runtime 诊断和压力测试命名空间，不是普通 task 句柄 API。业务并发只通过 `async fn` 调用返回 task，然后 `await task` / `await task?`；用户不能手动 spawn、调度或管理 task。
+`std.task` 是 runtime 内部诊断和压力测试命名空间，不是普通开发者业务 API。业务并发只通过 `async fn` 调用返回 task，然后 `await task` / `await task?`；用户不能手动 spawn、调度或管理 task。
 
-```ku
-import { task, time } from "std"
+普通开发者压测 HTTP 服务时使用：
 
-fn main() {
-    before = task.stats()
-    report = task.stress(1000000, 15, 250)
-    after = task.stats()
-    println(report.peak_active)
-    println(after.active_tasks)
-}
+```powershell
+ku run examples\http_capacity_10m.ku
+powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127.0.0.1:8080/health -Requests 10000000 -Concurrency 1000 -TimeoutSeconds 600
 ```
 
-根目录 `test.ku` 和 `run-test.ps1` 是可直接运行的百万并发需求压力测试入口。
+根目录 `test.ku` 和 `run-test.ps1` 只作为 runtime 维护者内部诊断入口，不作为业务开发示例。

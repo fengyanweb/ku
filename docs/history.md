@@ -30,6 +30,12 @@ history/
   v0.0.12/
     ku.exe
     libku.rlib
+  v0.0.13/
+    ku.exe
+    libku.rlib
+  v0.0.15/
+    ku.exe
+    libku.rlib
 ```
 
 `release/ku.exe` 始终是当前最新版本；`history/v*/ku.exe` 是对应历史版本快照。

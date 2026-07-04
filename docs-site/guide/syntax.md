@@ -2,6 +2,14 @@
 
 完整语法以仓库内的 `docs/syntax.md` 为准。
 
+专题入口：
+
+- [命令行](./cli.md)
+- [标准库](./stdlib.md)
+- [并发](./concurrency.md)
+- [自举](./self-hosting.md)
+- [Native C](./native-c.md)
+
 当前关键规则：
 
 - `if` / `while` 条件必须是 `bool`。

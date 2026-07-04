@@ -116,7 +116,7 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
             let body = json::stringify_value(value, span)?;
             Ok(Some(response_helper_value(
                 status,
-                "application/json",
+                "application/json; charset=utf-8",
                 body,
             )))
         }

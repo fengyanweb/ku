@@ -18,6 +18,8 @@ export default defineConfig({
           { text: "语法", link: "/guide/syntax" },
           { text: "命令行", link: "/guide/cli" },
           { text: "标准库", link: "/guide/stdlib" },
+          { text: "并发", link: "/guide/concurrency" },
+          { text: "自举", link: "/guide/self-hosting" },
           { text: "Native C", link: "/guide/native-c" }
         ]
       },

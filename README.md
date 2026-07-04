@@ -230,6 +230,8 @@ http_bench.ps1
 ## 文档
 
 - [0.0.15 语法文档](docs/syntax.md)
+- [自举状态与 bootstrap 路线](docs/self-hosting.md)
+- [并发模型与 HTTP 千万请求压测 demo](docs/concurrency.md)
 - [0.0.15 版本记录](docs/v0.0.15.md)
 - [0.0.14 版本记录](docs/v0.0.14.md)
 - [0.0.13 版本记录](docs/v0.0.13.md)
@@ -277,8 +279,8 @@ IR 已有 ResultBranch / BindOk / JumpErr / PropagateErr。
 native C 后端已有统一 Error 对象 ABI、复杂 Result payload 和 try/catch/finally。
 package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
 registry 执行层已有 HTTPS-only 下载、SHA-256、内容寻址 cache、有界安装锁和 Ed25519 detached signature verifier；根公钥/轮换/吊销/归档决策前 CLI 保持 fail-closed，未配置 dependency source 时不会读取旧 cache 绕过信任。
-async runtime 已有 blocking shutdown drain、累计指标和百万并发需求压力测试。
-仓库根目录提供 `test.ku` 和 `run-test.ps1`：前者通过 `std.task` 打印百万并发需求测试的前后时间与 runtime 指标，后者额外采集进程 CPU、峰值内存和线程数。
+async runtime 已有 blocking shutdown drain、累计指标和内部百万并发需求压力测试；开发者侧提供 HTTP 千万请求压测 demo。
+仓库根目录的 `test.ku` 和 `run-test.ps1` 是 runtime 内部诊断入口，前者通过 `std.task` 打印百万并发需求测试的前后时间与 runtime 指标，后者额外采集进程 CPU、峰值内存和线程数。普通开发者示例使用 `examples/http_capacity_10m.ku`：业务代码只写 HTTP handler 和返回值，不直接管理 task；压测由 `examples/http_bench.ps1` 发起。
 `std.time` 已按第一版文档实现 Time/Date/Duration object、format/parse/date/datetime/duration/add/sub/diff/compare/parts/weekday/is_leap/days_in_month/sleep 和固定偏移 zone。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
 match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。

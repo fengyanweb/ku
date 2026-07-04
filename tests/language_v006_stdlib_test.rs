@@ -278,7 +278,7 @@ fn main() {
         panic("bad html content type")
     }
     json_res = http.json({ ok: true, count: 2 })
-    if (json_res.headers["content-type"] != "application/json") {
+    if (json_res.headers["content-type"] != "application/json; charset=utf-8") {
         panic("bad json content type")
     }
     created_json = http.json(http.status.created, { id: 1 })
