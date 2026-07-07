@@ -1,6 +1,6 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.15`，正在补齐二进制构建系统、native C、LLVM、registry resolver 和 async task 生命周期能力。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.15`，正在补齐二进制构建系统、native C、LLVM、registry resolver 和 async task 生命周期能力。实验性语言，目前不可用于生产，欢迎围观讨论
 
 ## 快速开始
 
