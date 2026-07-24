@@ -104,7 +104,7 @@ fn main() {
 fn local_function_value_can_shadow_builtin_name() {
     let source = r#"
 fn main() {
-    len = (x) => {
+    len = (x: int) => {
         return x + 1
     }
     total:int = len(41)

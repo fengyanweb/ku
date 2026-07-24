@@ -4,7 +4,7 @@ fn main() {
 
     println(user.name)
     println(user["name"])
-    println(str(user["missing"]?))
+    println(str(user.get_or("missing", null)))
     println(name)
     println(years)
     println(missing)

@@ -14,6 +14,13 @@ pub(crate) enum TypePattern {
     ArrayElementOfArg(usize),
     ResultOf(Box<TypePattern>),
     SameAsArg(usize),
+    /// A dynamic tagged value (e.g. `json.parse` result). Maps to `Type::KuValue`.
+    KuValue,
+    /// An opaque native handle owned by a C-library binding (e.g. a `pg` connection
+    /// or result). Maps to `Type::Native(name)` — owned, move-tracked, dropped by the
+    /// backend (which closes/frees the underlying C resource). The name carries the
+    /// backend's synthetic type id (e.g. `__ku_pg_conn`).
+    Native(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +100,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
             str_arg(),
             ArgRule::Is(TypePattern::Any),
         ],
+        ("kuvalue", "as_int" | "as_str") => vec![ArgRule::Is(TypePattern::Any)],
         ("json", "parse" | "try_parse") => vec![str_arg()],
         ("json", "stringify") => vec![ArgRule::Is(TypePattern::Any)],
         ("config", "env") => vec![],
@@ -114,6 +122,57 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("http", "empty") => vec![],
         ("http", "redirect") => vec![str_arg()],
         ("http", "statusText") => vec![int_arg()],
+        // std.pg — thin libpq binding. Conn/result are opaque owned native handles.
+        ("pg", "connect") => vec![str_arg()],
+        ("pg", "query") => vec![ArgRule::Is(TypePattern::Native(PG_CONN)), str_arg()],
+        ("pg", "query_params") => vec![
+            ArgRule::Is(TypePattern::Native(PG_CONN)),
+            str_arg(),
+            ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
+        ],
+        ("pg", "rows" | "cols") => vec![ArgRule::Is(TypePattern::Native(PG_RESULT))],
+        ("pg", "value") => vec![
+            ArgRule::Is(TypePattern::Native(PG_RESULT)),
+            int_arg(),
+            int_arg(),
+        ],
+        ("pg", "close") => vec![ArgRule::Is(TypePattern::Native(PG_CONN))],
+        // Connection pool: the pool owns the connections; queries borrow one
+        // internally and return it, so a caller can never leak a connection.
+        ("pg", "pool") => vec![str_arg(), int_arg()],
+        ("pg", "pool_query") => vec![ArgRule::Is(TypePattern::Native(PG_POOL)), str_arg()],
+        ("pg", "pool_query_params") => vec![
+            ArgRule::Is(TypePattern::Native(PG_POOL)),
+            str_arg(),
+            ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
+        ],
+        ("pg", "pool_close") => vec![ArgRule::Is(TypePattern::Native(PG_POOL))],
+        // std.mysql — thin libmysqlclient binding. Conn/result are opaque owned handles.
+        ("mysql", "connect") => vec![str_arg(), int_arg(), str_arg(), str_arg(), str_arg()],
+        ("mysql", "query") => vec![ArgRule::Is(TypePattern::Native(MYSQL_CONN)), str_arg()],
+        ("mysql", "query_params") => vec![
+            ArgRule::Is(TypePattern::Native(MYSQL_CONN)),
+            str_arg(),
+            ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
+        ],
+        ("mysql", "rows" | "cols") => vec![ArgRule::Is(TypePattern::Native(MYSQL_RESULT))],
+        ("mysql", "value") => vec![
+            ArgRule::Is(TypePattern::Native(MYSQL_RESULT)),
+            int_arg(),
+            int_arg(),
+        ],
+        ("mysql", "close") => vec![ArgRule::Is(TypePattern::Native(MYSQL_CONN))],
+        // std.redis — thin RESP-over-socket binding. Conn is an opaque owned handle.
+        ("redis", "connect") => vec![str_arg(), int_arg()],
+        ("redis", "auth") => vec![ArgRule::Is(TypePattern::Native(REDIS_CONN)), str_arg()],
+        ("redis", "get") => vec![ArgRule::Is(TypePattern::Native(REDIS_CONN)), str_arg()],
+        ("redis", "set") => vec![
+            ArgRule::Is(TypePattern::Native(REDIS_CONN)),
+            str_arg(),
+            str_arg(),
+        ],
+        ("redis", "del") => vec![ArgRule::Is(TypePattern::Native(REDIS_CONN)), str_arg()],
+        ("redis", "close") => vec![ArgRule::Is(TypePattern::Native(REDIS_CONN))],
         _ => return None,
     };
     let returns = match (module, function) {
@@ -133,8 +192,10 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("array", "try_get") => TypePattern::ResultOf(Box::new(TypePattern::ArrayElementOfArg(0))),
         ("array", "push" | "concat") => TypePattern::SameAsArg(0),
         ("object", "get_or") => TypePattern::Unknown,
-        ("json", "parse") => TypePattern::Unknown,
-        ("json", "try_parse") => TypePattern::ResultOf(Box::new(TypePattern::Unknown)),
+        ("kuvalue", "as_int") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
+        ("kuvalue", "as_str") => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        ("json", "parse") => TypePattern::KuValue,
+        ("json", "try_parse") => TypePattern::ResultOf(Box::new(TypePattern::KuValue)),
         ("json", "stringify") => TypePattern::String,
         ("config", "env" | "env_file") => TypePattern::ObjectAny,
         ("config", "yaml") => TypePattern::ResultOf(Box::new(TypePattern::ObjectAny)),
@@ -152,6 +213,30 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("http", "service" | "server") => http_service_pattern(),
         ("http", "text" | "html" | "json" | "empty" | "redirect") => http_response_pattern(),
         ("http", "statusText") => TypePattern::String,
+        ("pg", "connect") => TypePattern::ResultOf(Box::new(TypePattern::Native(PG_CONN))),
+        ("pg", "query" | "query_params") => {
+            TypePattern::ResultOf(Box::new(TypePattern::Native(PG_RESULT)))
+        }
+        ("pg", "rows" | "cols") => TypePattern::Int,
+        ("pg", "value") => TypePattern::String,
+        ("pg", "close") => TypePattern::Null,
+        ("pg", "pool") => TypePattern::ResultOf(Box::new(TypePattern::Native(PG_POOL))),
+        ("pg", "pool_query" | "pool_query_params") => {
+            TypePattern::ResultOf(Box::new(TypePattern::Native(PG_RESULT)))
+        }
+        ("pg", "pool_close") => TypePattern::Null,
+        ("mysql", "connect") => TypePattern::ResultOf(Box::new(TypePattern::Native(MYSQL_CONN))),
+        ("mysql", "query" | "query_params") => {
+            TypePattern::ResultOf(Box::new(TypePattern::Native(MYSQL_RESULT)))
+        }
+        ("mysql", "rows" | "cols") => TypePattern::Int,
+        ("mysql", "value") => TypePattern::String,
+        ("mysql", "close") => TypePattern::Null,
+        ("redis", "connect") => TypePattern::ResultOf(Box::new(TypePattern::Native(REDIS_CONN))),
+        ("redis", "auth" | "set") => TypePattern::ResultOf(Box::new(TypePattern::Null)),
+        ("redis", "get") => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        ("redis", "del") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
+        ("redis", "close") => TypePattern::Null,
         _ => return None,
     };
     Some(Signature {
@@ -171,10 +256,14 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         ("fs", "try_read" | "try_write")
         | ("string", "slice")
         | ("array", "try_get")
+        | ("kuvalue", "as_int" | "as_str")
         | ("json", "try_parse")
         | ("config", "yaml")
         | ("time", "days_in_month" | "sleep")
-        | ("http", "get" | "post" | "request") => FailureMode::ReturnsResult,
+        | ("http", "get" | "post" | "request")
+        | ("pg", "connect" | "query" | "query_params" | "pool" | "pool_query" | "pool_query_params")
+        | ("mysql", "connect" | "query" | "query_params")
+        | ("redis", "connect" | "auth" | "get" | "set" | "del") => FailureMode::ReturnsResult,
         ("fs", "read" | "write")
         | ("json", "parse")
         | ("config", "env_file")
@@ -183,8 +272,18 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
     }
 }
 
+/// Backend synthetic type ids for the opaque `pg` native handles.
+pub(crate) const PG_CONN: &str = "__ku_pg_conn";
+pub(crate) const PG_RESULT: &str = "__ku_pg_result";
+pub(crate) const PG_POOL: &str = "__ku_pg_pool";
+/// Backend synthetic type id for the opaque `redis` connection handle.
+pub(crate) const REDIS_CONN: &str = "__ku_redis_conn";
+/// Backend synthetic type ids for the opaque `mysql` handles.
+pub(crate) const MYSQL_CONN: &str = "__ku_mysql_conn";
+pub(crate) const MYSQL_RESULT: &str = "__ku_mysql_result";
+
 pub(crate) fn module_requires_import(module: &str) -> bool {
-    matches!(module, "fs" | "http" | "config" | "task")
+    matches!(module, "fs" | "http" | "config" | "task" | "pg" | "redis" | "mysql")
 }
 
 pub(crate) fn is_std_module(module: &str) -> bool {
@@ -200,6 +299,9 @@ pub(crate) fn is_std_module(module: &str) -> bool {
             | "time"
             | "task"
             | "http"
+            | "pg"
+            | "redis"
+            | "mysql"
     )
 }
 

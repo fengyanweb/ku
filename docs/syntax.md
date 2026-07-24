@@ -975,19 +975,43 @@ doubled = nums.map(x => x * 2)
 
 数组元素类型必须一致。索引必须是 `int`。
 
-`array.map` 的链式写法会返回新数组，不会修改原数组。mapper 必须是函数值，参数类型由数组元素自动推断。
-
-对象可以用字符串键动态索引。Ku 默认严格：普通索引缺少键时直接报错；只有显式在索引后写 `?` 才允许缺失并返回 `null`：
+**索引越界语义（已定，勿再更改）**：直接索引 `nums[i]` 的结果类型是元素类型 `T`，越界是 **runtime panic（终止当前进程）**，不是可恢复错误——所以 `nums[i]` 不能接 `?`（它不是 `Result`）。需要可恢复的越界读取时，必须使用 `nums.try_get(i)`，它返回 `T!`（即 `Result<T>`），越界时返回 `Err{ domain: "array", code: "index_out_of_bounds" }`，配合 `?` 或 `try/catch` 处理：
 
 ```ku
-user = { name: "Ku" }
-print(user["name"])
-print(user["missing"])   // 运行时错误：object has no key 'missing'
-print(user["missing"]?)  // null
-user["age"] = 1
+first = nums[0]              // 类型 T；越界则进程终止
+safe = nums.try_get(10)?     // 可恢复：越界返回 Err，由 ? 向上传播
 ```
 
-`object[key]?` 只改变对象字符串索引的缺失键行为。数组/字符串索引越界仍然报错；其他表达式后的 `?` 仍是 Result 错误传播。
+这与内存模型的错误边界一致：数组越界、OOM、内部不变量失败默认终止进程；缺键、解析、I/O 等可恢复错误走 `Result`。native（C 后端）与解释器在这一点上行为一致。
+
+`array.push` 是不可变操作：返回追加了元素的新数组，不修改原数组（`nums.push(x)` 单独一行没有效果，需 `nums = nums.push(x)`）。
+
+`array.map` 的链式写法会返回新数组，不会修改原数组。mapper 必须是函数值，参数类型由数组元素自动推断。
+
+对象可以用字符串键动态索引。Ku 默认严格：普通索引 `obj["key"]` 缺键直接 panic；`obj["key"]?` 是**可恢复的严格读取**——有键解包出值，缺键返回 `Err{domain:"object", code:"missing_key", message:"missing object key: <key>"}`，由 `?` 向上传播（因此 `obj["key"]?` 必须位于返回 `T!` 的函数或 `try` 块中）：
+
+```ku
+fn read(user): str! {
+    println(user["name"])       // 有键：直接读取
+    name = user["name"]?        // 有键：解包为 "Ku"
+    missing = user["age"]?      // 缺键：Err{missing_key}，由 ? 传播
+    return ok(name.clone())
+}
+```
+
+`obj["key"]?` 缺键返回 `Err` 而非 `null`——因为 `?` 在 Ku 统一表示 Result 错误传播，不重载为“缺失即 null”。`obj["key"]`（不带 `?`）缺键是 runtime panic。数组/字符串索引越界同样是 panic（数组可恢复读取用 `arr.try_get(i)`）。
+
+`obj["key"]?` 解包出的是 **KuValue**——一个一等的 tagged 动态值（不是 `Unknown`/`any`）。KuValue 只能用于 `println`、`json.stringify`、object/array 嵌套、`==` / `!=`，以及显式转换 `.as_int()` / `.as_str()`；**不允许直接算术**（`obj["age"]? + 1` 编译报错）。要当具体类型用必须显式转换（返回 `T!`，tag 不匹配则 `Err`）：
+
+```ku
+fn read(obj): int! {
+    age = obj["age"]?.as_int()?      // KuValue -> int
+    name = obj["name"]?.as_str()?    // KuValue -> str
+    return ok(age + 1)
+}
+```
+
+`obj["key"]?.method()` 中，紧跟索引的 `?.` 按 `(obj["key"]?).method()` 解析（先 try 出 KuValue，再调方法）。
 
 需要带默认值的显式宽松读取时，使用 `object.get_or(obj, key, default)` 或实例方法 `obj.get_or(key, default)`：
 
@@ -998,7 +1022,7 @@ print(user.get_or("missing", "unknown"))
 print(object.get_or(user, "missing", "unknown"))
 ```
 
-`get_or` 存在 key 时返回字段值，缺失时返回 default。default 参数会立即求值，不是惰性求值；即使 key 存在，`user.get_or("name", MakeDefault())` 也会先执行 `MakeDefault()`。静态 object + 字符串字面量 key 会尽量保留字段类型，避免把明显类型错误放到运行时。
+`get_or` 返回 **KuValue**（同 `obj["key"]?` 的一等动态值）：存在 key 时是字段值，缺失时返回 default。default 参数会立即求值，不是惰性求值；即使 key 存在，`user.get_or("name", MakeDefault())` 也会先执行 `MakeDefault()`。要当具体类型用，同样经 `.as_int()` / `.as_str()`。
 
 字符串可以用 `int` 索引，返回单字符 `str`：
 
@@ -1740,7 +1764,18 @@ HTTP handler 会在类型检查阶段按 0/1 参数 Return 模型复查参数和
 - `idle_timeout_ms` 限制连接在发送首字节前的空闲等待。
 - header/body/write 分别使用自己的 timeout，网络错误不自动无限重试。
 
-Ku runtime 自动维护自己能判断的协议错误：路由未命中返回 404，路径存在但 method 不匹配返回 405，body 超过 `max_body_bytes` 返回 413，header 超过 `max_header_bytes` 返回 431，坏请求返回 400，handler timeout 返回 504，服务过载返回 503，handler panic/内部失败返回 500。
+Ku runtime 自动维护自己能判断的协议错误：路由未命中返回 404，路径存在但 method 不匹配返回 405，body 超过 `max_body_bytes` 返回 413，header 超过 `max_header_bytes` 返回 431，request target 超过内部上限（固定 8192 bytes）返回 414（在复制和路由前判断，绝不截断），坏请求返回 400，handler timeout 返回 504，服务过载返回 503，handler panic/内部失败返回 500。
+
+服务配置字段是固定集合：`read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests`。两种写法等价——构造时传 `http.server({ max_body_bytes: 4096 })`，或构造后逐个赋值 `service.max_body_bytes = 4096`。**未定义的配置字段在类型检查阶段报错**，不会被静默忽略：`http.server({ bogus: 1 })` 和 `service.bogus = 1` 都是 checker 错误。
+
+### HTTP 与 native C 后端
+
+`ku build --native` 编译出的二进制与解释器跑同一套 HTTP 规则，可观测响应一致：路由（exact 优先于 `{param}`、404/405）、`req` 的 method/path/params/query/headers/body、`http.text/html/empty/redirect` 响应、有界接纳（`max_connections`/`max_active_requests`/`max_pending_requests` 超限返回 503）、以及请求级限制 400/413/414/431/408 都与解释器逐一对齐；命名函数 handler（`service.get("/x", index)`）和内联 `fn(req)` 都支持。native 用真 worker 线程并行跑 handler（解释器 handler 串行），并行只是内部实现差异，不改变单个请求的可观测响应。
+
+native 与解释器的已知差异只有两条：
+
+- **`handler_timeout_ms` / 504 在 native 上不生效**。编译后的 compute-bound handler 无法被安全抢占，所以 native 不会返回 504；一个死循环 handler 会一直占住它那个 worker（其余 worker 仍正常服务）。需要 handler 超时保护时用解释器运行。
+- 响应头**顺序**不同。两边头名都是小写且语义相同，但解释器遍历 HashMap（顺序本身不确定），native 用固定顺序输出。HTTP 头与顺序无关，不影响客户端。
 
 可直接运行的 HTTP 示例：
 
@@ -2036,11 +2071,11 @@ native C 当前仍是 prototype，但同步所有权和错误流已闭环：Copy
 - `struct.clone()` 按字段递归 clone；字段不可 clone 时错误定位到字段。
 - `enum.clone()` 只 clone 当前 tag 对应 payload，不访问其它 variant payload。
 - `Result<T>.clone()` 只 clone 当前 ok payload；Error payload 按 Error 对象 clone。
-- `function` 值在语言方向上是 Owned，未来 native closure clone 只复制函数入口并增加小范围 RC env，不深拷贝捕获环境；捕获 binding 默认共享。
+- `function` 值是 Owned；native closure clone 只复制函数入口并对 env 引用计数 rc++，不深拷贝捕获环境；捕获 binding 默认按引用共享 cell（闭包与外层双向可见，Copy/str/array/object 捕获均已支持）。
 - `Task<T>` 不允许 clone；`await task` 消费 task，普通 task 只能 await 一次。
 - 优化方向包括 Copy clone 消除、源值随后不再使用时的 clone-to-move、临时 clone 消除、return clone-to-move、static string clone 零分配、struct clone inline、array/object 预分配，以及不需要的 drop/clone 消除。
 
-native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、错误和 return 都经过对应 finally block。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。递归值 struct/enum、native closure、动态 object ABI 和 async native lowering仍明确拒绝。native `str` 暂时仍使用只读 C 字符串原型，正式 owned `KuString` ABI 已进入执行队列；在 KuString lowering 完成前，native C 会明确拒绝字符串拼接，不生成 `const char* + const char*` 这类错误 C。
+native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、错误和 return 都经过对应 finally block。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。native `KuString`（owned `{ptr,len,cap,storage}`）、动态 object hash、closure/函数值 ABI（`{invoke, env*}` + 引用计数 env、按引用共享 cell、逃逸、clone、局部函数自递归、array.map、深度守卫）均已落地，native 与解释器逐字一致。递归值 struct/enum、闭包捕获 struct/enum/Result/Task 等 owned 类型、async native lowering 仍明确拒绝（纯文本报错，不生成错误 C）。
 
 ## 17. 资源保护
 
@@ -2095,8 +2130,8 @@ LLVM 数组、enum、闭包、HTTP、async lowering
 LLVM 递归 struct 和更复杂 Result payload
 完整 native C 后端
 registry 根公钥配置、key rotation/revocation、归档格式、受限解包和 CLI 远程 import 串联
-native closure ABI、captured env 和函数值 native ABI / lowering
-native owned string 与动态 object ABI
+native async 函数值 / async lowering；闭包捕获 struct/enum/Result/Task 等 owned 类型；从 dynamic object 取回闭包后再调用（KuValue 不可 call）
+native C HTTP 的 handler_timeout_ms / 504（编译后的 compute-bound handler 无法安全抢占；解释器支持）
 match guard 模式矩阵和跨 guard 的完整穷尽性检查
 顶层脚本语句
 方法 / trait / interface

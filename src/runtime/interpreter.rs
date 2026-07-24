@@ -27,7 +27,7 @@ use crate::{
     value::Value,
 };
 
-const MAX_CALL_DEPTH: usize = 16;
+const MAX_CALL_DEPTH: usize = 512;
 const HTTP_HANDLER_TIMEOUT_MESSAGE: &str = "http handler timeout";
 const HTTP_ACCEPT_BATCH: usize = 64;
 const HTTP_EVENT_LOOP_SLEEP: Duration = Duration::from_millis(1);
@@ -168,8 +168,11 @@ impl Interpreter {
         depth: usize,
     ) -> KuResult<Value> {
         if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
-            return Err(KuError::runtime(
-                "maximum function call depth exceeded",
+            return Err(KuError::structured(
+                crate::error::KuErrorKind::Runtime,
+                "runtime",
+                "call_depth_exceeded",
+                format!("maximum call depth exceeded: {MAX_CALL_DEPTH}"),
                 span,
             ));
         }
@@ -325,8 +328,11 @@ impl Interpreter {
             depth,
         } = call;
         if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
-            return Err(KuError::runtime(
-                "maximum function call depth exceeded",
+            return Err(KuError::structured(
+                crate::error::KuErrorKind::Runtime,
+                "runtime",
+                "call_depth_exceeded",
+                format!("maximum call depth exceeded: {MAX_CALL_DEPTH}"),
                 span,
             ));
         }
@@ -836,6 +842,10 @@ impl Interpreter {
             }
         }
         let module = match &target_value {
+            // KuValue converters win over the concrete-type modules: a value read
+            // from an object may carry any tag, so `.as_int()`/`.as_str()` must
+            // dispatch to the kuvalue path regardless of the runtime tag.
+            _ if name == "as_int" || name == "as_str" => "kuvalue",
             Value::String(_) => "string",
             Value::Array(_) if name != "map" => "array",
             Value::Object(_) if name == "get_or" => "object",
@@ -853,6 +863,7 @@ impl Interpreter {
             "string" => stdlib::string::eval(name, &values, span),
             "array" => stdlib::array::eval(name, &values, span),
             "object" => stdlib::object::eval(name, &values, span),
+            "kuvalue" => Ok(eval_kuvalue_method(name, &values)),
             _ => Ok(None),
         }
     }
@@ -1233,26 +1244,27 @@ impl Interpreter {
                 ))
             }
             ExprKind::TryUnwrap { expr: inner } => {
-                let (value, optional_object_index) =
-                    if let ExprKind::Index { target, index } = &inner.kind {
-                        let target = self.eval(target, env, depth)?;
-                        if self.pending_fail.is_some() {
-                            return Ok(Value::Null);
-                        }
-                        let index = self.eval(index, env, depth)?;
-                        if self.pending_fail.is_some() {
-                            return Ok(Value::Null);
-                        }
-                        let optional_object_index = matches!(target, Value::Object(_));
-                        (
-                            eval_index_value(target, index, inner.span, true)?,
-                            optional_object_index,
-                        )
-                    } else {
-                        (self.eval(inner, env, depth)?, false)
-                    };
-                if optional_object_index {
-                    return Ok(value);
+                let value = if let ExprKind::Index { target, index } = &inner.kind {
+                    let target = self.eval(target, env, depth)?;
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
+                    let index = self.eval(index, env, depth)?;
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
+                    // Object indexing under `?` yields Result(ok / err missing_key);
+                    // `?` then unwraps or propagates it like any other Result.
+                    eval_index_value(target, index, inner.span, true)?
+                } else {
+                    self.eval(inner, env, depth)?
+                };
+                // A nested `?` inside `inner` (e.g. `arr[i]?.as_int()?`) may have
+                // already failed and set pending_fail, returning a placeholder
+                // Null. Propagate that failure instead of matching Null as a
+                // Result.
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
                 }
                 match value {
                     Value::Result { ok: true, value } => Ok(*value),
@@ -2091,6 +2103,31 @@ fn assignment_expr_root(expr: &Expr) -> Option<String> {
     }
 }
 
+/// `KuValue.as_int()` / `.as_str()`: convert a dynamic value read from an object
+/// to a concrete type, returning `T!` (Err on a tag mismatch).
+fn eval_kuvalue_method(name: &str, values: &[Value]) -> Option<Value> {
+    let value = values.first()?;
+    match name {
+        "as_int" => Some(match value {
+            Value::Int(i) => stdlib::errors::ok(Value::Int(*i)),
+            other => stdlib::errors::err(
+                "value",
+                "type_mismatch",
+                format!("expected int value, got {}", other.type_name()),
+            ),
+        }),
+        "as_str" => Some(match value {
+            Value::String(s) => stdlib::errors::ok(Value::String(s.clone())),
+            other => stdlib::errors::err(
+                "value",
+                "type_mismatch",
+                format!("expected str value, got {}", other.type_name()),
+            ),
+        }),
+        _ => None,
+    }
+}
+
 fn eval_index_value(
     target: Value,
     index: Value,
@@ -2108,10 +2145,28 @@ fn eval_index_value(
                     span,
                 ));
             };
+            // A KuValue array element read `arr[i]?` (optional_object) yields a
+            // Result: Ok(element) in bounds, Err{domain:"array",
+            // code:"index_out_of_bounds"} otherwise, so `?` propagates a
+            // recoverable error. A static `nums[i]` (no `?`) still hard-panics
+            // out of bounds — its non-Result element type is rejected by `?` in
+            // the checker, so it never reaches here with optional_object set.
             if index < 0 || index as usize >= values.len() {
+                if optional_object {
+                    return Ok(crate::stdlib::errors::err(
+                        "array",
+                        "index_out_of_bounds",
+                        format!("array index out of bounds: {index}"),
+                    ));
+                }
                 return Err(KuError::runtime("array index out of bounds", span));
             }
-            Ok(values[index as usize].clone())
+            let element = values[index as usize].clone();
+            if optional_object {
+                Ok(crate::stdlib::errors::ok(element))
+            } else {
+                Ok(element)
+            }
         }
         Value::String(text) => {
             let Value::Int(index) = index else {
@@ -2141,9 +2196,18 @@ fn eval_index_value(
                     span,
                 ));
             };
+            // With `?` (optional_object) object indexing yields a Result:
+            // Ok(value) when present, Err{domain:"object", code:"missing_key"}
+            // when absent — so `?` propagates a recoverable error instead of
+            // returning null. Without `?`, a missing key is a hard error.
             match fields.get(&key).cloned() {
+                Some(value) if optional_object => Ok(crate::stdlib::errors::ok(value)),
                 Some(value) => Ok(value),
-                None if optional_object => Ok(Value::Null),
+                None if optional_object => Ok(crate::stdlib::errors::err(
+                    "object",
+                    "missing_key",
+                    format!("missing object key: {key}"),
+                )),
                 None => Err(KuError::runtime(format!("object has no key '{key}'"), span)),
             }
         }
@@ -2783,6 +2847,12 @@ fn read_http_request(
     let parts = first_line.split_whitespace().collect::<Vec<_>>();
     if parts.len() != 3 {
         return Err(status_response(400, "Bad Request"));
+    }
+    // Checked before the target is copied or routed: an over-long target is 414,
+    // never truncated. Truncating would let two distinct paths that share a long
+    // prefix resolve to the same route.
+    if parts[1].len() > stdlib::http::MAX_REQUEST_TARGET_BYTES {
+        return Err(status_response(414, "URI Too Long"));
     }
     let method = parts[0].to_ascii_uppercase();
     let target = parts[1].to_string();
@@ -3585,7 +3655,7 @@ fn task_error_payload(value: &Value) -> Option<Value> {
     .then(|| value.as_ref().clone())
 }
 
-fn function_capture_names(function: &FnDecl) -> HashSet<String> {
+pub(crate) fn function_capture_names(function: &FnDecl) -> HashSet<String> {
     let mut bound = HashSet::new();
     bound.insert(function.name.clone());
     for param in &function.params {
@@ -3596,7 +3666,7 @@ fn function_capture_names(function: &FnDecl) -> HashSet<String> {
     free
 }
 
-fn closure_capture_names(params: &[FunctionParam], body: &[Stmt]) -> HashSet<String> {
+pub(crate) fn closure_capture_names(params: &[FunctionParam], body: &[Stmt]) -> HashSet<String> {
     let mut bound = HashSet::new();
     for param in params {
         bound.insert(param.name.clone());

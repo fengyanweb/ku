@@ -54,7 +54,7 @@ fn main(): null! {
             msg: "ok",
             data: {
                 id: req.params.id.clone(),
-                q: req.query["q"]?,
+                q: req.query.get_or("q", ""),
                 method: req.method.clone()
             }
         })

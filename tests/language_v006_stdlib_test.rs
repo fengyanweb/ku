@@ -444,6 +444,28 @@ fn main() {
 }
 
 #[test]
+fn std_http_handler_param_inferred_from_route_signature() {
+    // C: an HTTP route handler `fn(req) { ... }` needs no annotation on `req`;
+    // the route API supplies the handler signature, so `req` is typed as the
+    // request and `req.params` is available. Checker and interpreter agree.
+    let source = r#"
+import "std.http"
+
+fn main() {
+    app = http.service()
+    app.get("/user/{id}", fn(req) {
+        return http.text(req.params.id)
+    })
+    if (app.routes[0].param_names[0] != "id") {
+        panic("handler with inferred req did not register")
+    }
+}
+"#;
+    check_source("inline.ku", source).expect("inferred http handler parameter should check");
+    run_source("inline.ku", source).expect("inferred http handler should run");
+}
+
+#[test]
 fn std_http_service_bind_returns_listener_result() {
     let source = r#"
 import "std.http"

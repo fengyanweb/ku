@@ -13,7 +13,7 @@ fn main() {
 
     println(nums[0])
     println(user["name"])
-    println(str(user["missing"]?))
+    println(str(user.get_or("missing", null)))
     println(rest.city)
     println(missing)
     println(code.SUCCESS)

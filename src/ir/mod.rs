@@ -1,6 +1,8 @@
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     fmt,
+    rc::Rc,
 };
 
 use crate::{
@@ -26,6 +28,16 @@ pub struct IrFunction {
     pub params: Vec<IrParam>,
     pub return_type: IrType,
     pub blocks: Vec<IrBlock>,
+    /// True for lifted closure-body functions (Stage 6a). Their C signature
+    /// carries a leading `void* __env` and they are invoked directly through a
+    /// `KuClosure` `invoke` slot; top-level functions (false) are reached via a
+    /// generated `__thunk` adapter instead.
+    pub is_closure_body: bool,
+    /// Stage 6b: the cells this closure body captures, in the same (sorted)
+    /// order the enclosing `MakeClosure` passes them to `ku_env_{id}_new`. Each
+    /// entry's type is `Cell(payload)`. Empty for top-level functions and for
+    /// non-capturing closure bodies (Stage 6a).
+    pub captures: Vec<(String, IrType)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -123,6 +135,22 @@ pub enum IrInst {
         function_id: FunctionId,
         captures: Vec<String>,
     },
+    /// Stage 6b: box a captured Copy local into a heap `KuCell` (rc=1). `ty` is
+    /// the payload type (Int/Float/Bool/Null); the local's IR type becomes
+    /// `Cell(ty)`.
+    CellNew {
+        name: String,
+        ty: IrType,
+        init: IrExpr,
+    },
+    /// Stage 6b: write through a cell pointer (`cell->value = value`). `cell`
+    /// evaluates to a `KuCell*` (a `Local` cell or a `CapturedCell`).
+    CellStore {
+        cell: IrExpr,
+        value: IrExpr,
+    },
+    /// Stage 6b: release the outer scope's reference to a boxed local's cell.
+    CellRelease(String),
     Unsupported {
         reason: String,
     },
@@ -203,6 +231,20 @@ pub enum IrExprKind {
         name: String,
     },
     TryUnwrap(Box<IrExpr>),
+    /// A closure value (Stage 6a): a function pointer paired with an env. In 6a
+    /// `captures` is always empty and the env is NULL at runtime. `function_id`
+    /// points either at a lifted closure body or at a top-level function (reached
+    /// through a `__thunk`).
+    MakeClosure {
+        function_id: FunctionId,
+        captures: Vec<(String, IrType)>,
+    },
+    /// Stage 6b: read a cell's payload (`cell->value`). The inner expr evaluates
+    /// to a `KuCell*`; the result type is the payload type.
+    CellLoad(Box<IrExpr>),
+    /// Stage 6b: inside a closure body, the captured cell pointer for `name`
+    /// (resolves to `__e->{name}`). Its type is `Cell(payload)`.
+    CapturedCell(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +265,13 @@ pub enum IrType {
     Result(Box<IrType>),
     Named(String),
     Function,
+    Closure {
+        params: Vec<IrType>,
+        ret: Box<IrType>,
+    },
+    /// Stage 6b: a heap-boxed Copy local shared with the closures that capture
+    /// it. Backend type is `KuCell_{suffix}*`.
+    Cell(Box<IrType>),
     Unknown,
     Void,
 }
@@ -232,6 +281,35 @@ struct FunctionSig {
     id: FunctionId,
     params: Vec<IrType>,
     returns: IrType,
+}
+
+/// Whether an expression names a place (variable/field/index/cell) rather than a
+/// fresh owned rvalue (a literal, call, or arithmetic result). A place is still owned
+/// by its binding, so it must not be materialized/moved when only borrowed.
+fn ir_expr_is_place(expr: &IrExpr) -> bool {
+    matches!(
+        expr.kind,
+        IrExprKind::Local(_)
+            | IrExprKind::Temp(_)
+            | IrExprKind::Field { .. }
+            | IrExprKind::Index { .. }
+            | IrExprKind::CapturedCell(_)
+            | IrExprKind::CellLoad(_)
+    )
+}
+
+/// Whether a value of this type owns heap memory and therefore needs a clone/drop
+/// (rather than being a trivially-copyable Copy value). Matches the set of types
+/// `c_clone_expr` / `c_drop_value` know how to handle in the backend.
+fn ir_type_is_owned(ty: &IrType) -> bool {
+    matches!(
+        ty,
+        IrType::Str
+            | IrType::Array(_)
+            | IrType::Result(_)
+            | IrType::Named(_)
+            | IrType::Closure { .. }
+    )
 }
 
 pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
@@ -261,6 +339,95 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
         }
     }
 
+    // Seed the shared FunctionId allocator past the top-level function ids so
+    // lifted closure bodies get fresh, globally-unique ids.
+    let next_function_id = Rc::new(Cell::new(next_function_id));
+    let lifted_functions = Rc::new(RefCell::new(Vec::new()));
+
+    // Stage 8e: infer the return type of a top-level function declared without a
+    // `: T` annotation from the body's `return <value>` — the same body-based
+    // inference closures already use. Without this, an unannotated function
+    // lowered with a `void` return type, so referencing it as a value (e.g. a
+    // named HTTP route handler `app.get("/x", handler)`) produced a
+    // `Closure { ret: void }` the C backend cannot emit. The checker already
+    // infers unannotated returns, so this keeps native == checker (rule 8).
+    //
+    // Each unannotated body is lowered once in a throwaway probe (Unknown seed,
+    // like a closure literal, so `try`/`finally` return slots are still created)
+    // and the first concrete `return` type is recovered. Probe failures and
+    // value-less bodies fall back to `void` — identical to the previous
+    // behaviour — so this is strictly additive. Functions are visited in source
+    // order and their signatures updated in place, so a later function that
+    // returns an earlier one's result sees the inferred type.
+    for item in &program.items {
+        let Item::Function(function) = item else {
+            continue;
+        };
+        if function.return_type.is_some() {
+            continue;
+        }
+        let saved_id = next_function_id.get();
+        let inferred = {
+            let throwaway_lifted: Rc<RefCell<Vec<IrFunction>>> =
+                Rc::new(RefCell::new(Vec::new()));
+            let mut probe = FunctionLowerer::new(
+                &signatures,
+                &layouts,
+                IrType::Unknown,
+                next_function_id.clone(),
+                throwaway_lifted,
+            );
+            if let Some(sig) = signatures.get(&function.name) {
+                for (param, ty) in function.params.iter().zip(sig.params.iter()) {
+                    probe.locals.insert(param.name.clone(), ty.clone());
+                }
+            }
+            if probe
+                .lower_block_body("entry", &function.body, function.span)
+                .is_ok()
+            {
+                // Fold the body's `return <value>` types the way the checker's
+                // merge_return_types does: `null` is the identity element, so a
+                // body that returns `null` on one path and a concrete type on
+                // another has the concrete type -- taking the first return
+                // instead would infer `null` where the checker says `int`. Only
+                // an all-`null` body is `null`; a body with no value return (or
+                // one whose returns route through a `try`/`finally` slot, which
+                // the Unknown seed leaves untyped) stays `void`, which is the
+                // pre-existing behaviour.
+                let mut found = IrType::Void;
+                for block in &probe.blocks {
+                    let IrTerminator::Return(Some(value)) = &block.terminator else {
+                        continue;
+                    };
+                    if value.ty == IrType::Unknown {
+                        continue;
+                    }
+                    if value.ty == IrType::Null {
+                        if found == IrType::Void {
+                            found = IrType::Null;
+                        }
+                        continue;
+                    }
+                    found = value.ty.clone();
+                    break;
+                }
+                found
+            } else {
+                IrType::Void
+            }
+        };
+        // Give back the FunctionId range the probe consumed for nested closures
+        // so the real lowering re-allocates identical ids; the probe's lifted
+        // bodies and blocks are dropped.
+        next_function_id.set(saved_id);
+        if inferred != IrType::Void {
+            if let Some(sig) = signatures.get_mut(&function.name) {
+                sig.returns = inferred;
+            }
+        }
+    }
+
     let mut functions = Vec::new();
     for item in &program.items {
         if let Item::Function(function) = item {
@@ -276,7 +443,13 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                     ty: ty.clone(),
                 })
                 .collect::<Vec<_>>();
-            let mut lower = FunctionLowerer::new(&signatures, &layouts, signature.returns.clone());
+            let mut lower = FunctionLowerer::new(
+                &signatures,
+                &layouts,
+                signature.returns.clone(),
+                next_function_id.clone(),
+                lifted_functions.clone(),
+            );
             for param in &params {
                 lower.locals.insert(param.name.clone(), param.ty.clone());
             }
@@ -287,9 +460,12 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                 params,
                 return_type: signature.returns.clone(),
                 blocks: lower.blocks,
+                is_closure_body: false,
+                captures: Vec::new(),
             });
         }
     }
+    functions.append(&mut lifted_functions.borrow_mut());
     Ok(IrProgram { functions, layouts })
 }
 
@@ -324,10 +500,18 @@ fn optimize_inst(inst: &mut IrInst) {
         | IrInst::Panic(value) => {
             *value = optimize_expr(value.clone());
         }
+        IrInst::CellNew { init, .. } => {
+            *init = optimize_expr(init.clone());
+        }
+        IrInst::CellStore { cell, value } => {
+            *cell = optimize_expr(cell.clone());
+            *value = optimize_expr(value.clone());
+        }
         IrInst::BeginTry { .. }
         | IrInst::EndTry
         | IrInst::BindError { .. }
         | IrInst::DefineClosure { .. }
+        | IrInst::CellRelease(_)
         | IrInst::Unsupported { .. } => {}
     }
 }
@@ -428,7 +612,15 @@ fn optimize_expr(expr: IrExpr) -> IrExpr {
             ty: expr.ty,
             kind: IrExprKind::TryUnwrap(Box::new(optimize_expr(*value))),
         },
-        IrExprKind::Literal(_) | IrExprKind::Local(_) | IrExprKind::Temp(_) => expr,
+        IrExprKind::CellLoad(inner) => IrExpr {
+            ty: expr.ty,
+            kind: IrExprKind::CellLoad(Box::new(optimize_expr(*inner))),
+        },
+        IrExprKind::Literal(_)
+        | IrExprKind::Local(_)
+        | IrExprKind::Temp(_)
+        | IrExprKind::MakeClosure { .. }
+        | IrExprKind::CapturedCell(_) => expr,
     }
 }
 
@@ -644,6 +836,8 @@ impl fmt::Display for IrType {
             IrType::Result(inner) => write!(f, "{inner}!"),
             IrType::Named(name) => write!(f, "{}", enum_type_name(name).unwrap_or(name)),
             IrType::Function => write!(f, "function"),
+            IrType::Closure { .. } => write!(f, "closure"),
+            IrType::Cell(inner) => write!(f, "cell<{inner}>"),
             IrType::Unknown => write!(f, "unknown"),
             IrType::Void => write!(f, "void"),
         }
@@ -690,6 +884,11 @@ impl fmt::Display for IrInst {
                 }
                 Ok(())
             }
+            IrInst::CellNew { name, ty, init } => {
+                write!(f, "cell_new {name}: {ty} = {init}")
+            }
+            IrInst::CellStore { cell, value } => write!(f, "cell_store {cell} = {value}"),
+            IrInst::CellRelease(name) => write!(f, "cell_release {name}"),
             IrInst::Unsupported { reason } => write!(f, "unsupported {reason}"),
         }
     }
@@ -791,6 +990,11 @@ impl fmt::Display for IrExpr {
             IrExprKind::Index { target, index } => write!(f, "{target}[{index}]"),
             IrExprKind::Field { target, name } => write!(f, "{target}.{name}"),
             IrExprKind::TryUnwrap(value) => write!(f, "{value}?"),
+            IrExprKind::MakeClosure { function_id, .. } => {
+                write!(f, "make_closure fn#{}", function_id.0)
+            }
+            IrExprKind::CellLoad(inner) => write!(f, "cell_load {inner}"),
+            IrExprKind::CapturedCell(name) => write!(f, "captured_cell {name}"),
         }
     }
 }
@@ -804,9 +1008,28 @@ struct FunctionLowerer<'a> {
     current: IrBlock,
     next_block_id: usize,
     next_temp_id: usize,
-    next_local_function_id: usize,
     try_handlers: Vec<IrTryHandler>,
     pattern_bindings: HashMap<String, IrExpr>,
+    /// Program-global FunctionId allocator, shared between the top-level lowerer
+    /// and every child lowerer that lifts a closure body (Stage 6a).
+    next_function_id: Rc<Cell<usize>>,
+    /// Closure bodies lifted out of expressions, appended to the program's
+    /// functions once every top-level function has been lowered.
+    lifted_functions: Rc<RefCell<Vec<IrFunction>>>,
+    /// Stage 6b: names declared in this function body that some closure literal
+    /// captures, so their first `Let`/`Assign` boxes them into a `KuCell`.
+    boxed: HashSet<String>,
+    /// Stage 6b: for a closure-body lowerer, the cells captured from the
+    /// enclosing scope (`name` -> `Cell(payload)`). Reads become
+    /// `CellLoad(CapturedCell(name))`; writes become
+    /// `CellStore{CapturedCell(name), ..}`. Empty for top-level functions.
+    captures: HashMap<String, IrType>,
+    /// Stage 6f: inside a lifted local-named-function body, the function's own
+    /// name plus the lifted function id and its return type. A call to this name
+    /// in the body lowers to a direct call to the lifted function threading the
+    /// running `__env` (rather than capturing the function into its own env,
+    /// which would form a reference cycle). `None` everywhere else.
+    self_recurse: Option<(String, FunctionId, IrType)>,
 }
 
 #[derive(Debug, Clone)]
@@ -822,6 +1045,8 @@ impl<'a> FunctionLowerer<'a> {
         signatures: &'a HashMap<String, FunctionSig>,
         layouts: &'a IrLayoutTable,
         return_type: IrType,
+        next_function_id: Rc<Cell<usize>>,
+        lifted_functions: Rc<RefCell<Vec<IrFunction>>>,
     ) -> Self {
         Self {
             signatures,
@@ -837,13 +1062,22 @@ impl<'a> FunctionLowerer<'a> {
             },
             next_block_id: 1,
             next_temp_id: 0,
-            next_local_function_id: 10_000,
             try_handlers: Vec::new(),
             pattern_bindings: HashMap::new(),
+            next_function_id,
+            lifted_functions,
+            boxed: HashSet::new(),
+            captures: HashMap::new(),
+            self_recurse: None,
         }
     }
 
     fn lower_block_body(&mut self, name: &str, body: &[Stmt], span: Span) -> KuResult<()> {
+        // Stage 6b: any local this body declares that a nested closure literal
+        // captures must be boxed into a shared `KuCell` at its declaration.
+        let mut boxed = HashSet::new();
+        collect_boxed_candidates(body, &mut boxed);
+        self.boxed = boxed;
         self.current.name = name.to_string();
         for stmt in body {
             self.lower_stmt(stmt)?;
@@ -863,21 +1097,54 @@ impl<'a> FunctionLowerer<'a> {
             Stmt::VarDecl {
                 name, ty, value, ..
             } => {
-                let value = self.lower_expr(value)?;
-                let ty = ty
-                    .as_ref()
-                    .map(|ty| lower_type(ty, self.layouts))
-                    .unwrap_or_else(|| value.ty.clone());
-                self.locals.insert(name.clone(), ty.clone());
-                self.current.instructions.push(IrInst::Let {
-                    name: name.clone(),
-                    ty,
-                    value,
-                });
+                let span = value.span;
+                let declared = ty.as_ref().map(|ty| lower_type(ty, self.layouts));
+                let value = self.lower_expr_with_expected(value, declared.as_ref())?;
+                let ty = declared.unwrap_or_else(|| value.ty.clone());
+                if self.boxed.contains(name) {
+                    self.push_cell_new(name.clone(), ty, value, span)?;
+                } else {
+                    self.locals.insert(name.clone(), ty.clone());
+                    self.current.instructions.push(IrInst::Let {
+                        name: name.clone(),
+                        ty,
+                        value,
+                    });
+                }
             }
             Stmt::Assign { name, value, .. } => {
-                let value = self.lower_expr(value)?;
-                if self.locals.contains_key(name) {
+                let span = value.span;
+                // A closure assigned to an already-declared function-typed local
+                // takes that local's type as its expected function type.
+                let expected = match self.locals.get(name) {
+                    Some(IrType::Cell(inner)) => Some((**inner).clone()),
+                    Some(ty) => Some(ty.clone()),
+                    None => self.captures.get(name).and_then(|ty| match ty {
+                        IrType::Cell(inner) => Some((**inner).clone()),
+                        other => Some(other.clone()),
+                    }),
+                };
+                let value = self.lower_expr_with_expected(value, expected.as_ref())?;
+                if self.captures.contains_key(name) {
+                    // Closure body writing a cell captured from the outer scope.
+                    let cell = self.captured_cell_expr(name);
+                    self.current
+                        .instructions
+                        .push(IrInst::CellStore { cell, value });
+                } else if let Some(inner) = self.boxed_local_inner(name) {
+                    // Write through an already-boxed local's cell.
+                    let cell = IrExpr {
+                        kind: IrExprKind::Local(name.clone()),
+                        ty: IrType::Cell(Box::new(inner)),
+                    };
+                    self.current
+                        .instructions
+                        .push(IrInst::CellStore { cell, value });
+                } else if self.boxed.contains(name) && !self.locals.contains_key(name) {
+                    // First assignment to a to-be-boxed local: allocate its cell.
+                    let inner = value.ty.clone();
+                    self.push_cell_new(name.clone(), inner, value, span)?;
+                } else if self.locals.contains_key(name) {
                     self.current.instructions.push(IrInst::Store {
                         target: IrLValue::Local(name.clone()),
                         value,
@@ -989,16 +1256,7 @@ impl<'a> FunctionLowerer<'a> {
                     *span,
                 ));
             }
-            Stmt::Function(function) => {
-                let id = FunctionId(self.next_local_function_id);
-                self.next_local_function_id += 1;
-                self.locals.insert(function.name.clone(), IrType::Function);
-                self.current.instructions.push(IrInst::DefineClosure {
-                    name: function.name.clone(),
-                    function_id: id,
-                    captures: captured_names(function),
-                });
-            }
+            Stmt::Function(function) => self.lower_local_function(function)?,
             Stmt::Try {
                 body,
                 catch_name,
@@ -1007,7 +1265,7 @@ impl<'a> FunctionLowerer<'a> {
                 ..
             } => self.lower_try(body, catch_name, catch_body, finally_body)?,
             Stmt::Fail { value, .. } => {
-                let value = self.lower_expr(value)?;
+                let value = self.lower_error_expr(value)?;
                 if self.try_handlers.is_empty() {
                     self.current.instructions.push(IrInst::Fail(value));
                     self.current.terminator = IrTerminator::Unreachable;
@@ -1036,9 +1294,10 @@ impl<'a> FunctionLowerer<'a> {
                 self.current.terminator = IrTerminator::Unreachable;
             }
             Stmt::Return { value, .. } => {
+                let expected = self.return_type.clone();
                 let value = value
                     .as_ref()
-                    .map(|value| self.lower_expr(value))
+                    .map(|value| self.lower_expr_with_expected(value, Some(&expected)))
                     .transpose()?;
                 self.current.terminator = self.return_terminator(value);
             }
@@ -1384,6 +1643,132 @@ impl<'a> FunctionLowerer<'a> {
         }
     }
 
+    /// Desugar a backtick template string into `lit + str(expr) + lit + ...`,
+    /// mirroring the interpreter's `eval_template` exactly: literal text keeps every
+    /// escape except `\{` -> `{` and `\}` -> `}`, and each `{expr}` becomes
+    /// `str(<parsed expr>)` (native `str` == the interpreter's `value.to_string()`).
+    /// Interpolations whose type `str()` can't render (e.g. a struct) fail loudly at
+    /// build time rather than silently, upholding native==interpreter.
+    fn lower_template_string(&mut self, raw: &str, span: Span) -> KuResult<IrExpr> {
+        let mut parts: Vec<Expr> = Vec::new();
+        let mut text = String::new();
+        let mut chars = raw.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some(next @ ('{' | '}')) => text.push(next),
+                    Some(next) => {
+                        text.push('\\');
+                        text.push(next);
+                    }
+                    None => text.push('\\'),
+                }
+                continue;
+            }
+            if ch != '{' {
+                text.push(ch);
+                continue;
+            }
+            if !text.is_empty() {
+                parts.push(Expr::new(
+                    ExprKind::Literal(Literal::String(std::mem::take(&mut text))),
+                    span,
+                ));
+            }
+            let mut source = String::new();
+            let mut found_end = false;
+            while let Some(inner) = chars.next() {
+                if inner == '\\' {
+                    if let Some(next) = chars.next() {
+                        source.push('\\');
+                        source.push(next);
+                    }
+                    continue;
+                }
+                if inner == '}' {
+                    found_end = true;
+                    break;
+                }
+                source.push(inner);
+            }
+            if !found_end {
+                return Err(KuError::runtime("unterminated template interpolation", span));
+            }
+            if source.trim().is_empty() {
+                return Err(KuError::runtime("empty template interpolation", span));
+            }
+            let tokens = crate::lexer::Lexer::new(&source).tokenize()?;
+            let expr = crate::parser::Parser::new(tokens).parse_expression_only()?;
+            // `{expr}` -> `str(expr)` so the run-time value is stringified like the
+            // interpreter's `to_string()`.
+            parts.push(Expr::new(
+                ExprKind::Call {
+                    callee: Box::new(Expr::new(ExprKind::Variable("str".to_string()), span)),
+                    args: vec![expr],
+                },
+                span,
+            ));
+        }
+        if !text.is_empty() {
+            parts.push(Expr::new(ExprKind::Literal(Literal::String(text)), span));
+        }
+        let mut iter = parts.into_iter();
+        let mut acc = iter.next().unwrap_or_else(|| {
+            Expr::new(ExprKind::Literal(Literal::String(String::new())), span)
+        });
+        for part in iter {
+            acc = Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(acc),
+                    op: BinaryOp::Add,
+                    right: Box::new(part),
+                },
+                span,
+            );
+        }
+        self.lower_expr(&acc)
+    }
+
+    /// Lower the target of a value-position field read. A nested `Field` is built
+    /// as an in-place projection (no `emit_temp`, so no whole-struct move); any
+    /// other base (a variable — which may need a cell load — a call result, etc.)
+    /// is lowered normally.
+    fn lower_field_target(&mut self, expr: &Expr) -> KuResult<IrExpr> {
+        if let ExprKind::Field { target, name } = &expr.kind {
+            // Only build an in-place projection when the target is statically a
+            // user struct — reading a field of a struct is a member access, whereas
+            // a field of an object / string-map is a runtime lookup that must go
+            // through the normal lowering. Peek the type without lowering to avoid
+            // lowering the target twice.
+            if matches!(self.static_place_type(target), Some(IrType::Named(ref n)) if self.layouts.structs.iter().any(|s| &s.name == n))
+            {
+                let base = self.lower_field_target(target)?;
+                let ty = self.field_type(&base.ty, name);
+                return Ok(IrExpr {
+                    kind: IrExprKind::Field {
+                        target: Box::new(base),
+                        name: name.clone(),
+                    },
+                    ty,
+                });
+            }
+        }
+        self.lower_expr(expr)
+    }
+
+    /// The static type of a variable / struct-field-chain place, without emitting
+    /// anything. `None` for anything that is not a plain projection.
+    fn static_place_type(&self, expr: &Expr) -> Option<IrType> {
+        match &expr.kind {
+            ExprKind::Variable(name) => self.locals.get(name).cloned(),
+            ExprKind::Field { target, name } => {
+                let target_ty = self.static_place_type(target)?;
+                Some(self.field_type(&target_ty, name))
+            }
+            _ => None,
+        }
+    }
+
     fn lower_lvalue_target_expr(&mut self, expr: &Expr) -> KuResult<IrExpr> {
         match &expr.kind {
             ExprKind::Variable(name) => Ok(IrExpr {
@@ -1405,12 +1790,144 @@ impl<'a> FunctionLowerer<'a> {
         }
     }
 
+    /// Lower a `fail` payload. An object literal `{domain, code, message}` becomes
+    /// a native `__ku_error_make` intrinsic (a fixed three-KuString `KuError`),
+    /// not a generic object — so Error stays representable without dynamic objects.
+    /// Other payloads (a string message, or an existing Error value) lower normally.
+    fn lower_error_expr(&mut self, value: &Expr) -> KuResult<IrExpr> {
+        if let ExprKind::ObjectLiteral { fields } = &value.kind {
+            let mut domain = None;
+            let mut code = None;
+            let mut message = None;
+            for (name, expr) in fields {
+                match name.as_str() {
+                    "domain" => domain = Some(expr),
+                    "code" => code = Some(expr),
+                    "message" => message = Some(expr),
+                    _ => {}
+                }
+            }
+            if let (Some(domain), Some(code), Some(message)) = (domain, code, message) {
+                if fields.len() == 3 {
+                    let domain = self.lower_expr(domain)?;
+                    let code = self.lower_expr(code)?;
+                    let message = self.lower_expr(message)?;
+                    return Ok(IrExpr {
+                        kind: IrExprKind::Call {
+                            callee: Box::new(IrExpr {
+                                kind: IrExprKind::Local("__ku_error_make".to_string()),
+                                ty: IrType::Function,
+                            }),
+                            args: vec![domain, code, message],
+                            kind: IrCallKind::Intrinsic("__ku_error_make".to_string()),
+                        },
+                        ty: error_ir_type(),
+                    });
+                }
+            }
+        }
+        self.lower_expr(value)
+    }
+
+    /// Stage 8a: lower a native HTTP server method call. `get/post/put/del`
+    /// register an exact-path route (method + path + handler closure); `listen`
+    /// runs the single-threaded accept loop. The handler is lowered with an
+    /// expected `(req) -> _` function type so an unannotated `req` parameter is
+    /// filled with the synthetic request struct type (matching how the checker
+    /// types `req`); a `fn()` handler simply ignores the expected parameter.
+    fn lower_http_server_method(
+        &mut self,
+        server: IrExpr,
+        method: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<IrExpr> {
+        if method == "listen" {
+            if args.len() != 1 {
+                return Err(KuError::runtime(
+                    format!("http service listen expects 1 argument but got {}", args.len()),
+                    span,
+                ));
+            }
+            let address = self.lower_expr(&args[0])?;
+            return self.emit_temp(IrExpr {
+                kind: IrExprKind::Call {
+                    callee: Box::new(IrExpr {
+                        kind: IrExprKind::Local("__ku_http_listen".to_string()),
+                        ty: IrType::Function,
+                    }),
+                    args: vec![server, address],
+                    kind: IrCallKind::Intrinsic("__ku_http_listen".to_string()),
+                },
+                ty: IrType::Result(Box::new(IrType::Null)),
+            });
+        }
+        if args.len() != 2 {
+            return Err(KuError::runtime(
+                format!("http service {method} expects 2 arguments but got {}", args.len()),
+                span,
+            ));
+        }
+        let path = self.lower_expr(&args[0])?;
+        let expected = IrType::Closure {
+            params: vec![IrType::Named(HTTP_REQUEST_TYPE.to_string())],
+            ret: Box::new(IrType::Unknown),
+        };
+        let handler = self.lower_expr_with_expected(&args[1], Some(&expected))?;
+        let (arity, returns_result) = match &handler.ty {
+            IrType::Closure { params, ret } => (
+                params.len(),
+                matches!(ret.as_ref(), IrType::Result(_)),
+            ),
+            _ => {
+                return Err(KuError::runtime(
+                    format!("http service {method} handler must be a function"),
+                    args[1].span,
+                ))
+            }
+        };
+        let http_method = match method {
+            "get" => "GET",
+            "post" => "POST",
+            "put" => "PUT",
+            "del" => "DELETE",
+            _ => "GET",
+        };
+        let intrinsic = format!(
+            "__ku_http_route:{http_method}:{arity}:{}",
+            if returns_result { 1 } else { 0 }
+        );
+        self.emit_temp(IrExpr {
+            kind: IrExprKind::Call {
+                callee: Box::new(IrExpr {
+                    kind: IrExprKind::Local(intrinsic.clone()),
+                    ty: IrType::Function,
+                }),
+                args: vec![server, path, handler],
+                kind: IrCallKind::Intrinsic(intrinsic),
+            },
+            ty: IrType::Named(HTTP_SERVER_TYPE.to_string()),
+        })
+    }
+
     fn field_type(&self, target: &IrType, field_name: &str) -> IrType {
         let IrType::Named(struct_name) = target else {
             return IrType::Unknown;
         };
         if struct_name == "__ku_error_type" && matches!(field_name, "domain" | "code" | "message") {
             return IrType::Str;
+        }
+        if struct_name == HTTP_REQUEST_TYPE && matches!(field_name, "method" | "path" | "body") {
+            return IrType::Str;
+        }
+        // Stage 8b: `req.params` / `req.query` / `req.headers` are dynamic string
+        // maps backed by the native `KuObject` ABI. Typing them as `__ku_object`
+        // lets `req.query.get_or(...)` dispatch and marks the program as using the
+        // object runtime (see `program_uses_object`).
+        if struct_name == HTTP_REQUEST_TYPE
+            && matches!(field_name, "params" | "query" | "headers")
+        {
+            return IrType::Named("__ku_object".to_string());
         }
         self.layouts
             .structs
@@ -1423,6 +1940,11 @@ impl<'a> FunctionLowerer<'a> {
 
     fn lower_expr(&mut self, expr: &Expr) -> KuResult<IrExpr> {
         match &expr.kind {
+            // A backtick template must be desugared, not emitted as a literal: the
+            // interpreter interpolates `{expr}` at run time, so native must too.
+            ExprKind::Literal(Literal::TemplateString(raw)) => {
+                self.lower_template_string(raw, expr.span)
+            }
             ExprKind::Literal(literal) => Ok(IrExpr {
                 kind: IrExprKind::Literal(literal_text(literal)),
                 ty: literal_type(literal),
@@ -1430,6 +1952,32 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Variable(name) => {
                 if let Some(value) = self.pattern_bindings.get(name) {
                     return Ok(value.clone());
+                }
+                // Stage 6b: a captured cell read inside a closure body.
+                if let Some(IrType::Cell(inner)) = self.captures.get(name) {
+                    let inner = (**inner).clone();
+                    return Ok(self.cell_load(IrExprKind::CapturedCell(name.clone()), inner));
+                }
+                // Stage 6b: a boxed local read in the scope that owns the cell.
+                if let Some(IrType::Cell(inner)) = self.locals.get(name) {
+                    let inner = (**inner).clone();
+                    return Ok(self.cell_load(IrExprKind::Local(name.clone()), inner));
+                }
+                // A top-level function name used as a value (not as a direct call
+                // callee — those are intercepted in Call lowering) lowers to a
+                // closure over that function via its `__thunk` (Stage 6a).
+                if !self.locals.contains_key(name) {
+                    if let Some(signature) = self.signatures.get(name) {
+                        let params = signature.params.clone();
+                        let ret = Box::new(signature.returns.clone());
+                        return Ok(IrExpr {
+                            kind: IrExprKind::MakeClosure {
+                                function_id: signature.id,
+                                captures: Vec::new(),
+                            },
+                            ty: IrType::Closure { params, ret },
+                        });
+                    }
                 }
                 Ok(IrExpr {
                     kind: IrExprKind::Local(name.clone()),
@@ -1464,9 +2012,40 @@ impl<'a> FunctionLowerer<'a> {
                 })
             }
             ExprKind::Call { callee, args } => {
+                // Stage 6f: a self-recursive call inside a lifted local-named
+                // function body. Resolve the callee to the lifted function itself
+                // and thread the running `__env` as the leading argument, instead
+                // of capturing the function into its own env (which would form a
+                // reference cycle). Mirrors the interpreter's `self_name` binding.
+                if let ExprKind::Variable(name) = &callee.kind {
+                    if let Some((self_id, ret_ty)) = self.self_recurse_target(name) {
+                        let mut lowered_args = Vec::with_capacity(args.len() + 1);
+                        lowered_args.push(IrExpr {
+                            kind: IrExprKind::Local("__env".to_string()),
+                            ty: IrType::Unknown,
+                        });
+                        for arg in args {
+                            lowered_args.push(self.lower_expr(arg)?);
+                        }
+                        return self.emit_temp(IrExpr {
+                            kind: IrExprKind::Call {
+                                callee: Box::new(IrExpr {
+                                    kind: IrExprKind::Local(format!("__ku_closure_{}", self_id.0)),
+                                    ty: IrType::Function,
+                                }),
+                                args: lowered_args,
+                                kind: IrCallKind::Direct(self_id),
+                            },
+                            ty: ret_ty,
+                        });
+                    }
+                }
                 if let ExprKind::Field { target, name } = &callee.kind {
                     if name == "clone" && args.is_empty() {
-                        let target = self.lower_expr(target)?;
+                        // Read the receiver in place: `u.name.clone()` must clone
+                        // the field without first moving (clearing) it. For a
+                        // non-field receiver this is identical to `lower_expr`.
+                        let target = self.lower_field_target(target)?;
                         let ty = target.ty.clone();
                         return self.emit_temp(IrExpr {
                             kind: IrExprKind::Call {
@@ -1481,9 +2060,84 @@ impl<'a> FunctionLowerer<'a> {
                         });
                     }
                 }
-                let lowered_args = args
+                // Stage 6f: `<array>.map(closure)`. Handled ahead of the generic
+                // argument lowering so the mapper closure's *unannotated* parameter
+                // is filled from the array's element type — the checker infers it
+                // (so the interpreter accepts `map(x => x*2)`), and native must too
+                // (rule 8). The whole call's IR type is `Array(<closure return
+                // type>)` rather than the unknown a fall-through would leave it. The
+                // checker guarantees any `.map(<1 arg>)` has an array receiver, so a
+                // non-array receiver here is unreachable for a checked program.
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    if name == "map" && args.len() == 1 {
+                        let receiver = self.lower_expr(target)?;
+                        let IrType::Array(element) = receiver.ty.clone() else {
+                            return Err(KuError::runtime(
+                                "array.map requires an array receiver",
+                                expr.span,
+                            ));
+                        };
+                        // Propagate the element type as the mapper's expected
+                        // parameter type; the return type is recovered from the
+                        // closure body (no body-driven inference of the parameter).
+                        let expected = IrType::Closure {
+                            params: vec![*element],
+                            ret: Box::new(IrType::Unknown),
+                        };
+                        let mapper = self.lower_expr_with_expected(&args[0], Some(&expected))?;
+                        let ret = match &mapper.ty {
+                            IrType::Closure { ret, .. } => (**ret).clone(),
+                            _ => IrType::Unknown,
+                        };
+                        return self.emit_temp(IrExpr {
+                            kind: IrExprKind::Call {
+                                callee: Box::new(IrExpr {
+                                    kind: IrExprKind::Local("array.map".to_string()),
+                                    ty: IrType::Function,
+                                }),
+                                args: vec![receiver, mapper],
+                                kind: IrCallKind::Intrinsic("array.map".to_string()),
+                            },
+                            ty: IrType::Array(Box::new(ret)),
+                        });
+                    }
+                }
+                // Stage 8a: native HTTP server lifecycle. `app.get/post/put/del`
+                // register a route; `app.listen` runs the accept loop. Detected by
+                // the receiver lowering to the synthetic `__ku_http_server` type
+                // (see `call_kind_and_type`), so a user object with a `.get` method
+                // is never mistaken for a server.
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    if matches!(
+                        name.as_str(),
+                        "get" | "post" | "put" | "del" | "listen"
+                    ) && is_pure_path(target)
+                    {
+                        let receiver = self.lower_expr(target)?;
+                        if matches!(&receiver.ty, IrType::Named(n) if n == HTTP_SERVER_TYPE) {
+                            return self.lower_http_server_method(receiver, name, args, expr.span);
+                        }
+                    }
+                }
+                // For a direct call to a known top-level function, thread each
+                // parameter's type into the argument so a closure argument's
+                // unannotated parameters are filled from the expected function
+                // type (e.g. `Apply((x) => x + 1, 41)`).
+                let expected_param_types = match &callee.kind {
+                    ExprKind::Variable(name) => {
+                        self.signatures.get(name).map(|sig| sig.params.clone())
+                    }
+                    _ => None,
+                };
+                let mut lowered_args = args
                     .iter()
-                    .map(|arg| self.lower_expr(arg))
+                    .enumerate()
+                    .map(|(index, arg)| {
+                        let expected = expected_param_types
+                            .as_ref()
+                            .and_then(|params| params.get(index));
+                        self.lower_expr_with_expected(arg, expected)
+                    })
                     .collect::<KuResult<Vec<_>>>()?;
                 if let Some((layout, variant)) = self.enum_variant(callee) {
                     let fields = variant
@@ -1516,8 +2170,104 @@ impl<'a> FunctionLowerer<'a> {
                         ty: enum_ir_type(&layout.name),
                     });
                 }
-                let (kind, ty) = call_kind_and_type(callee, &lowered_args, self.signatures);
-                let callee = self.lower_expr(callee)?;
+                // Receiver-typed builtin method dispatch: `<array>.push(x)` /
+                // `<array>.len()`. Resolve by the lowered receiver's type so it
+                // becomes a typed `array.*` intrinsic instead of an unknown-typed
+                // indirect call. Restricted to pure-path receivers so the
+                // fall-through never re-lowers a side-effecting expression.
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    // KuValue converters (as_int/as_str) dispatch even when the
+                    // receiver is a `?` expression (not a pure path); the checker
+                    // guarantees the receiver is a KuValue so it always matches.
+                    let force_kuvalue = matches!(name.as_str(), "as_int" | "as_str");
+                    if is_pure_path(target) || force_kuvalue {
+                        let receiver = self.lower_expr(target)?;
+                        let module = match &receiver.ty {
+                            IrType::Array(_) => Some("array"),
+                            IrType::Str => Some("string"),
+                            IrType::Named(n) if n == "__ku_object" => Some("object"),
+                            IrType::Named(n) if n == "__ku_value" => Some("kuvalue"),
+                            _ => None,
+                        };
+                        if let Some(module) = module {
+                            if let Some(signature) = metadata::dotted_signature(module, name) {
+                                // `array.push` CLONES its value into the new array
+                                // (matching the interpreter, which leaves the source
+                                // usable). A fresh owned rvalue — e.g. a struct literal
+                                // — is otherwise never dropped and leaks its owned
+                                // fields, so materialize it into a temp that cleanup
+                                // frees. A place (variable/field) is left alone: it is
+                                // borrowed, and its own binding still owns it.
+                                if module == "array" && name == "push" {
+                                    let needs_temp = lowered_args.first().is_some_and(|value| {
+                                        ir_type_is_owned(&value.ty) && !ir_expr_is_place(value)
+                                    });
+                                    if needs_temp {
+                                        let value = lowered_args[0].clone();
+                                        lowered_args[0] = self.emit_temp(value)?;
+                                    }
+                                }
+                                let mut all_args = Vec::with_capacity(lowered_args.len() + 1);
+                                all_args.push(receiver);
+                                all_args.extend(lowered_args.iter().cloned());
+                                // Dynamic-object methods (`get_or`) yield a KuValue.
+                                let ty = if module == "object" {
+                                    IrType::Named("__ku_value".to_string())
+                                } else {
+                                    signature_return_type(&signature, &all_args)
+                                };
+                                return self.emit_temp(IrExpr {
+                                    kind: IrExprKind::Call {
+                                        callee: Box::new(IrExpr {
+                                            kind: IrExprKind::Local(format!("{module}.{name}")),
+                                            ty: IrType::Function,
+                                        }),
+                                        args: all_args,
+                                        kind: IrCallKind::Intrinsic(format!("{module}.{name}")),
+                                    },
+                                    ty,
+                                });
+                            }
+                        }
+                    }
+                }
+                let (kind, mut ty) = call_kind_and_type(callee, &lowered_args, self.signatures);
+                // For intrinsics the backend dispatches by name and ignores the
+                // callee, so avoid lowering a dotted callee (e.g. `time.millis`)
+                // into an unknown-typed Field temp — use a Function placeholder.
+                // Direct calls likewise keep the bare function name as a
+                // placeholder: lowering the callee would turn a top-level
+                // function name into a MakeClosure and break the direct call.
+                let callee = match &kind {
+                    IrCallKind::Intrinsic(intrinsic) => IrExpr {
+                        kind: IrExprKind::Local(intrinsic.clone()),
+                        ty: IrType::Function,
+                    },
+                    IrCallKind::Direct(_) => {
+                        let name = match &callee.kind {
+                            ExprKind::Variable(name) => name.clone(),
+                            _ => {
+                                return Err(KuError::runtime(
+                                    "native direct call requires a function name",
+                                    expr.span,
+                                ))
+                            }
+                        };
+                        IrExpr {
+                            kind: IrExprKind::Local(name),
+                            ty: IrType::Function,
+                        }
+                    }
+                    IrCallKind::Indirect => {
+                        let lowered = self.lower_expr(callee)?;
+                        // Calling a closure value: the call yields the closure's
+                        // return type (otherwise it stays Unknown).
+                        if let IrType::Closure { ret, .. } = &lowered.ty {
+                            ty = (**ret).clone();
+                        }
+                        lowered
+                    }
+                };
                 self.emit_temp(IrExpr {
                     kind: IrExprKind::Call {
                         callee: Box::new(callee),
@@ -1544,6 +2294,39 @@ impl<'a> FunctionLowerer<'a> {
             ExprKind::Index { target, index } => {
                 let target = self.lower_expr(target)?;
                 let index = self.lower_expr(index)?;
+                // `obj[key]` on a dynamic object yields Result<KuValue>: Ok(value)
+                // when present, Err{object, missing_key} when absent. `?` unwraps
+                // it to a KuValue.
+                if let IrType::Named(name) = &target.ty {
+                    if name == "__ku_object" || name == "__ku_value" {
+                        // `obj[key]?` on a KuObject or a KuValue (e.g. json.parse
+                        // result) yields Result<KuValue>. The KuValue variant checks
+                        // the tag is an object at runtime.
+                        let intrinsic = if name == "__ku_value" {
+                            // A KuValue index dispatches by key type: an int key
+                            // reads an array element (__ku_value_index), a str key
+                            // reads an object member (__ku_value_get).
+                            if matches!(&index.ty, IrType::Int) {
+                                "__ku_value_index"
+                            } else {
+                                "__ku_value_get"
+                            }
+                        } else {
+                            "__ku_object_get"
+                        };
+                        return self.emit_temp(IrExpr {
+                            kind: IrExprKind::Call {
+                                callee: Box::new(IrExpr {
+                                    kind: IrExprKind::Local(intrinsic.to_string()),
+                                    ty: IrType::Function,
+                                }),
+                                args: vec![target, index],
+                                kind: IrCallKind::Intrinsic(intrinsic.to_string()),
+                            },
+                            ty: IrType::Result(Box::new(IrType::Named("__ku_value".to_string()))),
+                        });
+                    }
+                }
                 let ty = match &target.ty {
                     IrType::Array(inner) => *inner.clone(),
                     _ => IrType::Unknown,
@@ -1589,15 +2372,84 @@ impl<'a> FunctionLowerer<'a> {
                         }
                     }
                 }
-                let target = self.lower_expr(target)?;
+                // Stage 8b: `req.params.<key>` / `req.query.<key>` / `req.headers.<key>`
+                // read a string out of the request's dynamic map (KuObject). It lowers
+                // to a `__ku_http_map_get` intrinsic that returns an owned KuString
+                // (empty when the key is absent), matching the interpreter's
+                // StringMap `.field` -> str access on `req.params`/`query`/`headers`.
+                if let ExprKind::Field {
+                    target: inner,
+                    name: map_name,
+                } = &target.kind
+                {
+                    if matches!(map_name.as_str(), "params" | "query" | "headers")
+                        && is_pure_path(inner)
+                    {
+                        let inner_lowered = self.lower_expr(inner)?;
+                        if matches!(&inner_lowered.ty, IrType::Named(n) if n == HTTP_REQUEST_TYPE) {
+                            let map_obj = IrExpr {
+                                kind: IrExprKind::Field {
+                                    target: Box::new(inner_lowered),
+                                    name: map_name.clone(),
+                                },
+                                ty: IrType::Named("__ku_object".to_string()),
+                            };
+                            let key = IrExpr {
+                                kind: IrExprKind::Literal(format!("{name:?}")),
+                                ty: IrType::Str,
+                            };
+                            return self.emit_temp(IrExpr {
+                                kind: IrExprKind::Call {
+                                    callee: Box::new(IrExpr {
+                                        kind: IrExprKind::Local("__ku_http_map_get".to_string()),
+                                        ty: IrType::Function,
+                                    }),
+                                    args: vec![map_obj, key],
+                                    kind: IrCallKind::Intrinsic("__ku_http_map_get".to_string()),
+                                },
+                                ty: IrType::Str,
+                            });
+                        }
+                    }
+                }
+                // Lower the target in place: a nested struct-field read
+                // (`c.user.name`) must NOT materialize the intermediate struct
+                // into a temp, because that moves the whole struct — and its
+                // sibling fields — out. `lower_field_target` builds the projection
+                // chain without an intervening move.
+                let target = self.lower_field_target(target)?;
                 let ty = self.field_type(&target.ty, name);
-                self.emit_temp(IrExpr {
+                let field = IrExpr {
                     kind: IrExprKind::Field {
                         target: Box::new(target),
                         name: name.clone(),
                     },
-                    ty,
-                })
+                    ty: ty.clone(),
+                };
+                if ir_type_is_owned(&ty) {
+                    // A value-position field read is a BORROW: it must leave the
+                    // struct intact for later reads and for the struct's own drop.
+                    // Cloning yields an independent value that satisfies both. A
+                    // genuine consuming move could clear the field instead (more
+                    // efficient), but the IR cannot tell a read from a move here
+                    // without the checker's per-occurrence move info (the deferred
+                    // BorrowPlace/MovePlace/ClonePlace) — and moving a read is the
+                    // one unsafe direction (it empties a field the source still
+                    // owns), so the conservative clone is always correct.
+                    self.emit_temp(IrExpr {
+                        kind: IrExprKind::Call {
+                            callee: Box::new(IrExpr {
+                                kind: IrExprKind::Local("__ku_clone".to_string()),
+                                ty: IrType::Function,
+                            }),
+                            args: vec![field],
+                            kind: IrCallKind::Intrinsic("__ku_clone".to_string()),
+                        },
+                        ty,
+                    })
+                } else {
+                    self.emit_temp(field)
+                }
             }
             ExprKind::OptionalField { .. } => Err(KuError::runtime(
                 "optional chaining is not supported by IR/native lowering yet",
@@ -1616,9 +2468,27 @@ impl<'a> FunctionLowerer<'a> {
                 self.emit_try_unwrap(expr, ty)
             }
             ExprKind::StructLiteral { name, fields } => {
+                // A struct field whose declared type is a function type supplies
+                // the expected function type for a closure written in that field.
+                let field_types = self
+                    .layouts
+                    .structs
+                    .iter()
+                    .find(|layout| layout.name == *name)
+                    .map(|layout| {
+                        layout
+                            .fields
+                            .iter()
+                            .map(|field| (field.name.clone(), field.ty.clone()))
+                            .collect::<HashMap<_, _>>()
+                    })
+                    .unwrap_or_default();
                 let fields = fields
                     .iter()
-                    .map(|(field, value)| Ok((field.clone(), self.lower_expr(value)?)))
+                    .map(|(field, value)| {
+                        let expected = field_types.get(field);
+                        Ok((field.clone(), self.lower_expr_with_expected(value, expected)?))
+                    })
                     .collect::<KuResult<Vec<_>>>()?;
                 Ok(IrExpr {
                     kind: IrExprKind::StructLiteral {
@@ -1628,16 +2498,302 @@ impl<'a> FunctionLowerer<'a> {
                     ty: IrType::Named(name.clone()),
                 })
             }
-            ExprKind::ObjectLiteral { .. } => Ok(unsupported_expr("object literal")),
+            ExprKind::ObjectLiteral { fields } => {
+                // Lower to a `__ku_object` intrinsic carrying [key, value, ...].
+                // The backend builds a runtime open-addressing hash (KuObject*),
+                // wrapping each value into a tagged KuValue by its IR type.
+                let mut args = Vec::with_capacity(fields.len() * 2);
+                for (name, value) in fields {
+                    args.push(IrExpr {
+                        kind: IrExprKind::Literal(format!("{name:?}")),
+                        ty: IrType::Str,
+                    });
+                    args.push(self.lower_expr(value)?);
+                }
+                self.emit_temp(IrExpr {
+                    kind: IrExprKind::Call {
+                        callee: Box::new(IrExpr {
+                            kind: IrExprKind::Local("__ku_object".to_string()),
+                            ty: IrType::Function,
+                        }),
+                        args,
+                        kind: IrCallKind::Intrinsic("__ku_object".to_string()),
+                    },
+                    ty: IrType::Named("__ku_object".to_string()),
+                })
+            }
             ExprKind::Match { value, arms } => self.lower_match(value, arms, expr.span),
-            ExprKind::Function { .. } => Ok(IrExpr {
-                kind: IrExprKind::Literal("<closure>".to_string()),
-                ty: IrType::Function,
-            }),
+            ExprKind::Function {
+                params,
+                return_type: _,
+                body,
+            } => self.lower_closure_literal(params, body, expr.span, None),
         }
     }
 
+    /// Like [`lower_expr`], but threads an expected type from context into a
+    /// closure literal so an unannotated parameter can be filled from the
+    /// expected function type. Mirrors the checker's `check_expr_expecting` so
+    /// every closure the checker accepts also lowers to native code (rule 8).
+    fn lower_expr_with_expected(
+        &mut self,
+        expr: &Expr,
+        expected: Option<&IrType>,
+    ) -> KuResult<IrExpr> {
+        if let ExprKind::Function { params, body, .. } = &expr.kind {
+            let expected_params = match expected {
+                Some(IrType::Closure { params, .. }) => Some(params.as_slice()),
+                _ => None,
+            };
+            return self.lower_closure_literal(params, body, expr.span, expected_params);
+        }
+        self.lower_expr(expr)
+    }
+
+    /// Lower a closure literal into a lifted, globally-unique IrFunction plus a
+    /// `MakeClosure` value (Stage 6a: no captures, env is NULL). An unannotated
+    /// parameter is filled from `expected` — the parameter types of the expected
+    /// function type supplied by context — matching the checker's rules; with no
+    /// annotation and no expected type it is an error (the checker rejects this
+    /// first, so reaching here means a missing context propagation).
+    fn lower_closure_literal(
+        &mut self,
+        params: &[crate::ast::FunctionParam],
+        body: &[Stmt],
+        span: Span,
+        expected: Option<&[IrType]>,
+    ) -> KuResult<IrExpr> {
+        let mut ir_params = Vec::with_capacity(params.len());
+        for (index, param) in params.iter().enumerate() {
+            let ty = if param.ty.is_some() {
+                lower_optional_type(&param.ty, self.layouts)
+            } else if let Some(expected_ty) = expected.and_then(|expected| expected.get(index)) {
+                // Filled from the expected function type from context (a typed
+                // binding, a higher-order parameter, or an API signature).
+                // Inferring it from how the body uses the parameter is not done.
+                expected_ty.clone()
+            } else {
+                // The checker rejects the no-context case, so reaching here means
+                // the annotation was neither present nor supplied by context;
+                // fail loudly rather than guess.
+                return Err(KuError::runtime(
+                    "closure parameter needs a type annotation or an expected function type from context",
+                    span,
+                ));
+            };
+            ir_params.push(IrParam {
+                name: param.name.clone(),
+                ty,
+            });
+        }
+
+        // Stage 6b: the cells this closure captures = its free variables that
+        // are boxed cells in the enclosing scope (a boxed local, or — for nested
+        // closures — a cell already captured here). Sorted for a stable env-field
+        // and argument order shared by the body and every `MakeClosure`.
+        let mut capture_names = crate::runtime::interpreter::closure_capture_names(params, body)
+            .into_iter()
+            .filter(|name| {
+                matches!(self.locals.get(name), Some(IrType::Cell(_)))
+                    || matches!(self.captures.get(name), Some(IrType::Cell(_)))
+            })
+            .collect::<Vec<_>>();
+        capture_names.sort();
+        let captures = capture_names
+            .into_iter()
+            .map(|name| {
+                let ty = self
+                    .locals
+                    .get(&name)
+                    .or_else(|| self.captures.get(&name))
+                    .cloned()
+                    .unwrap_or(IrType::Cell(Box::new(IrType::Unknown)));
+                (name, ty)
+            })
+            .collect::<Vec<_>>();
+
+        let mut child = FunctionLowerer::new(
+            self.signatures,
+            self.layouts,
+            IrType::Unknown,
+            self.next_function_id.clone(),
+            self.lifted_functions.clone(),
+        );
+        child.captures = captures.iter().cloned().collect();
+        for param in &ir_params {
+            child.locals.insert(param.name.clone(), param.ty.clone());
+        }
+        child.lower_block_body("entry", body, span)?;
+
+        // Recover the real return type from the first `return <value>` the body
+        // produced (6a closure bodies contain no `?`, so the Unknown seed above
+        // never leaks into a Return terminator).
+        let return_type = child
+            .blocks
+            .iter()
+            .find_map(|block| match &block.terminator {
+                IrTerminator::Return(Some(value)) => Some(value.ty.clone()),
+                _ => None,
+            })
+            .unwrap_or(IrType::Null);
+
+        let cid = FunctionId(self.next_function_id.get());
+        self.next_function_id.set(cid.0 + 1);
+        let param_types = ir_params.iter().map(|param| param.ty.clone()).collect();
+        self.lifted_functions.borrow_mut().push(IrFunction {
+            id: cid,
+            name: format!("__ku_closure_{}", cid.0),
+            params: ir_params,
+            return_type: return_type.clone(),
+            blocks: child.blocks,
+            is_closure_body: true,
+            captures: captures.clone(),
+        });
+
+        self.emit_temp(IrExpr {
+            kind: IrExprKind::MakeClosure {
+                function_id: cid,
+                captures,
+            },
+            ty: IrType::Closure {
+                params: param_types,
+                ret: Box::new(return_type),
+            },
+        })
+    }
+
+    /// Stage 6f: lower a local named function (`fn name(...) {...}` defined inside
+    /// another function body) by reusing the closure-literal machinery. The body
+    /// is lifted into a globally-unique `__ku_closure_{id}` function; the name is
+    /// bound in the enclosing scope to a `MakeClosure` closure value so it can be
+    /// called, passed as an argument, or stored (parity with the interpreter).
+    ///
+    /// Captures use `function_capture_names`, which excludes the function's own
+    /// name, so the function never captures itself. Self-recursive calls in the
+    /// body instead go straight to the lifted function with the running `__env`
+    /// (see `self_recurse`), keeping the env free of a self-reference — no RC
+    /// cycle, no leak.
+    fn lower_local_function(&mut self, function: &crate::ast::FnDecl) -> KuResult<()> {
+        let name = function.name.clone();
+        // Allocate the lifted function id first so the body can reference it for
+        // self-recursive calls while it is still being lowered.
+        let cid = FunctionId(self.next_function_id.get());
+        self.next_function_id.set(cid.0 + 1);
+
+        // Parameters must be annotated, exactly like a top-level function (rule 1).
+        let mut ir_params = Vec::with_capacity(function.params.len());
+        for param in &function.params {
+            if param.ty.is_none() {
+                return Err(KuError::runtime(
+                    "local function parameter needs a type annotation for native lowering",
+                    param.span,
+                ));
+            }
+            ir_params.push(IrParam {
+                name: param.name.clone(),
+                ty: lower_optional_type(&param.ty, self.layouts),
+            });
+        }
+        let param_types = ir_params
+            .iter()
+            .map(|param| param.ty.clone())
+            .collect::<Vec<_>>();
+        // A declared return type is authoritative (and available up front, unlike
+        // a closure literal's recovered type); default to Null when omitted.
+        let return_type = function
+            .return_type
+            .as_ref()
+            .map(|ty| lower_type(ty, self.layouts))
+            .unwrap_or(IrType::Null);
+
+        // Captures = the function's free variables (its own name excluded) that
+        // are boxed cells in the enclosing scope. Sorted for a stable env layout,
+        // matching `lower_closure_literal`.
+        let mut capture_names = crate::runtime::interpreter::function_capture_names(function)
+            .into_iter()
+            .filter(|name| {
+                matches!(self.locals.get(name), Some(IrType::Cell(_)))
+                    || matches!(self.captures.get(name), Some(IrType::Cell(_)))
+            })
+            .collect::<Vec<_>>();
+        capture_names.sort();
+        let captures = capture_names
+            .into_iter()
+            .map(|name| {
+                let ty = self
+                    .locals
+                    .get(&name)
+                    .or_else(|| self.captures.get(&name))
+                    .cloned()
+                    .unwrap_or(IrType::Cell(Box::new(IrType::Unknown)));
+                (name, ty)
+            })
+            .collect::<Vec<_>>();
+
+        let mut child = FunctionLowerer::new(
+            self.signatures,
+            self.layouts,
+            return_type.clone(),
+            self.next_function_id.clone(),
+            self.lifted_functions.clone(),
+        );
+        child.captures = captures.iter().cloned().collect();
+        for param in &ir_params {
+            child.locals.insert(param.name.clone(), param.ty.clone());
+        }
+        // Wire self-recursion: a call to `name` in the body reuses the running env.
+        child.self_recurse = Some((name.clone(), cid, return_type.clone()));
+        child.lower_block_body("entry", &function.body, function.span)?;
+
+        self.lifted_functions.borrow_mut().push(IrFunction {
+            id: cid,
+            name: format!("__ku_closure_{}", cid.0),
+            params: ir_params,
+            return_type: return_type.clone(),
+            blocks: child.blocks,
+            is_closure_body: true,
+            captures: captures.clone(),
+        });
+
+        // Bind the name in the enclosing scope as a first-class closure value.
+        let closure_ty = IrType::Closure {
+            params: param_types,
+            ret: Box::new(return_type),
+        };
+        let value = self.emit_temp(IrExpr {
+            kind: IrExprKind::MakeClosure {
+                function_id: cid,
+                captures,
+            },
+            ty: closure_ty.clone(),
+        })?;
+        self.locals.insert(name.clone(), closure_ty.clone());
+        self.current.instructions.push(IrInst::Let {
+            name,
+            ty: closure_ty,
+            value,
+        });
+        Ok(())
+    }
+
+    /// Stage 6f: when `name` is the enclosing local function's own name inside its
+    /// lifted body, return the lifted function id and return type so the call site
+    /// can emit a direct self-recursive call.
+    fn self_recurse_target(&self, name: &str) -> Option<(FunctionId, IrType)> {
+        self.self_recurse
+            .as_ref()
+            .filter(|(self_name, _, _)| self_name == name)
+            .map(|(_, id, ret)| (*id, ret.clone()))
+    }
+
     fn emit_temp(&mut self, value: IrExpr) -> KuResult<IrExpr> {
+        // A void value (a call to a function with no return) has no result to
+        // bind — binding it would emit invalid `void t0 = f(...)`. Hand the value
+        // straight back; its only consumer is a statement position, which emits it
+        // as `f(...);`.
+        if value.ty == IrType::Void {
+            return Ok(value);
+        }
         let id = TempId(self.next_temp_id);
         self.next_temp_id += 1;
         let ty = value.ty.clone();
@@ -1650,6 +2806,72 @@ impl<'a> FunctionLowerer<'a> {
             kind: IrExprKind::Temp(id),
             ty,
         })
+    }
+
+    /// Stage 6b: build a `CellLoad` over `pointer` (a `Local`/`CapturedCell`
+    /// cell expression) whose payload is `inner`.
+    fn cell_load(&self, pointer: IrExprKind, inner: IrType) -> IrExpr {
+        IrExpr {
+            ty: inner.clone(),
+            kind: IrExprKind::CellLoad(Box::new(IrExpr {
+                kind: pointer,
+                ty: IrType::Cell(Box::new(inner)),
+            })),
+        }
+    }
+
+    /// Stage 6b: the `CapturedCell` pointer expression for a captured name.
+    fn captured_cell_expr(&self, name: &str) -> IrExpr {
+        let ty = self
+            .captures
+            .get(name)
+            .cloned()
+            .unwrap_or(IrType::Cell(Box::new(IrType::Unknown)));
+        IrExpr {
+            kind: IrExprKind::CapturedCell(name.to_string()),
+            ty,
+        }
+    }
+
+    /// Stage 6b: the payload type if `name` is a boxed local cell in this scope.
+    fn boxed_local_inner(&self, name: &str) -> Option<IrType> {
+        match self.locals.get(name) {
+            Some(IrType::Cell(inner)) => Some((**inner).clone()),
+            _ => None,
+        }
+    }
+
+    /// Stage 6b: box a captured Copy local into a fresh cell (rc=1), recording
+    /// its `Cell(inner)` type. Owned payloads are rejected (Stage 6c).
+    fn push_cell_new(
+        &mut self,
+        name: String,
+        inner: IrType,
+        init: IrExpr,
+        span: Span,
+    ) -> KuResult<()> {
+        // Stage 6c: str/array/object captures are boxed into a shared cell (the
+        // cell owns the payload and drops it exactly once). Other owned payloads
+        // (struct/enum/Result/function/KuValue) remain unsupported.
+        let is_dynamic_object = matches!(&inner, IrType::Named(name) if name == "__ku_object");
+        let supported = is_copy_ir_type(&inner)
+            || inner == IrType::Str
+            || matches!(&inner, IrType::Array(_))
+            || is_dynamic_object;
+        if !supported {
+            return Err(KuError::runtime(
+                format!("native closure capture of {inner} not supported yet (Stage 6c)"),
+                span,
+            ));
+        }
+        self.locals
+            .insert(name.clone(), IrType::Cell(Box::new(inner.clone())));
+        self.current.instructions.push(IrInst::CellNew {
+            name,
+            ty: inner,
+            init,
+        });
+        Ok(())
     }
 
     fn enum_variant(&self, expr: &Expr) -> Option<(&IrEnumLayout, &IrVariantLayout)> {
@@ -1694,6 +2916,22 @@ impl<'a> FunctionLowerer<'a> {
 
             self.start_block(arm_id, "match_arm");
             let saved_bindings = std::mem::replace(&mut self.pattern_bindings, bindings);
+            // Materialize each binding that is a computed projection (an enum
+            // payload access, which moves-and-clears the slot when its type is
+            // owned) into a single temp, so using the binding more than once reads
+            // that temp instead of re-moving the value out of the enum each time.
+            let binding_names: Vec<String> = self.pattern_bindings.keys().cloned().collect();
+            for name in binding_names {
+                let bound = self.pattern_bindings[&name].clone();
+                if matches!(
+                    bound.kind,
+                    IrExprKind::Local(_) | IrExprKind::Temp(_) | IrExprKind::Literal(_)
+                ) {
+                    continue;
+                }
+                let temp = self.emit_temp(bound)?;
+                self.pattern_bindings.insert(name, temp);
+            }
             if let Some(guard) = &arm.guard {
                 let guard = self.lower_expr(guard)?;
                 let value_id = self.next_block("match_value");
@@ -1717,10 +2955,17 @@ impl<'a> FunctionLowerer<'a> {
             } else {
                 result_ty = Some(arm_value.ty.clone());
             }
-            self.current.instructions.push(IrInst::Store {
-                target: IrLValue::Local(result_name.clone()),
-                value: arm_value,
-            });
+            // A void-result match (its arms are statements) has no value to store —
+            // run the arm's expression for its side effects instead of storing it
+            // into a (would-be `void`) result local.
+            if arm_value.ty == IrType::Void {
+                self.current.instructions.push(IrInst::Expr(arm_value));
+            } else {
+                self.current.instructions.push(IrInst::Store {
+                    target: IrLValue::Local(result_name.clone()),
+                    value: arm_value,
+                });
+            }
             if self.current.terminator == IrTerminator::Next {
                 self.current.terminator = IrTerminator::Jump(after_id);
             }
@@ -1738,6 +2983,14 @@ impl<'a> FunctionLowerer<'a> {
 
         let ty =
             result_ty.ok_or_else(|| KuError::runtime("match requires at least one arm", span))?;
+        // A void match produces no value, so it needs no result local.
+        if ty == IrType::Void {
+            self.start_block(after_id, "match_after");
+            return Ok(IrExpr {
+                kind: IrExprKind::Literal("0".to_string()),
+                ty: IrType::Void,
+            });
+        }
         let origin_block = self
             .blocks
             .iter_mut()
@@ -1863,19 +3116,39 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn err_terminator(&mut self, result: IrExpr) -> IrTerminator {
+        // The try error slot stores just the bare KuError — the part shared by
+        // every Result type — so `?` operators unwrapping different Result types
+        // inside one try block all target a single, consistently-typed slot
+        // (otherwise the first `?`'s Result type would pin the slot and a later
+        // `?` of another type would clash). `result` is either a failed Result
+        // (take its `.error`) or an already-extracted error being re-propagated
+        // out of a finally block (use it as-is).
+        let error_ty = error_ir_type();
+        let is_error = matches!(&result.ty, IrType::Named(name) if name == "__ku_error_type");
+        let error_value = if is_error {
+            result.clone()
+        } else {
+            IrExpr {
+                kind: IrExprKind::Field {
+                    target: Box::new(result.clone()),
+                    name: "error".to_string(),
+                },
+                ty: error_ty.clone(),
+            }
+        };
         if let Some(handler) = self.try_handlers.last().cloned() {
             let error_name = handler.error_name;
             if self.locals.contains_key(&error_name) {
                 self.current.instructions.push(IrInst::Store {
                     target: IrLValue::Local(error_name.clone()),
-                    value: result.clone(),
+                    value: error_value,
                 });
             } else {
-                self.locals.insert(error_name.clone(), result.ty.clone());
+                self.locals.insert(error_name.clone(), error_ty.clone());
                 self.current.instructions.push(IrInst::Let {
                     name: error_name,
-                    ty: result.ty.clone(),
-                    value: result.clone(),
+                    ty: error_ty,
+                    value: error_value,
                 });
             }
             IrTerminator::JumpErr {
@@ -1939,7 +3212,17 @@ fn lower_type(ty: &TypeName, layouts: &IrLayoutTable) -> IrType {
         TypeName::Null => IrType::Null,
         TypeName::Array(inner) => IrType::Array(Box::new(lower_type(inner, layouts))),
         TypeName::Result(inner) => IrType::Result(Box::new(lower_type(inner, layouts))),
-        TypeName::Function { .. } => IrType::Function,
+        // A function-type annotation (`fn(int): int`) lowers to the same
+        // monomorphized closure type as a closure value, so typed function
+        // bindings and function-typed parameters share one representation.
+        TypeName::Function {
+            params,
+            return_type,
+            ..
+        } => IrType::Closure {
+            params: params.iter().map(|p| lower_type(p, layouts)).collect(),
+            ret: Box::new(lower_type(return_type, layouts)),
+        },
         TypeName::Union(_) => IrType::Unknown,
         TypeName::Custom(name) if layouts.enums.iter().any(|layout| layout.name == *name) => {
             enum_ir_type(name)
@@ -2026,7 +3309,14 @@ fn lower_layout_type(ty: &Option<TypeName>, enum_names: &HashSet<String>) -> IrT
             TypeName::Null => IrType::Null,
             TypeName::Array(inner) => IrType::Array(Box::new(lower(inner, enum_names))),
             TypeName::Result(inner) => IrType::Result(Box::new(lower(inner, enum_names))),
-            TypeName::Function { .. } => IrType::Function,
+            TypeName::Function {
+                params,
+                return_type,
+                ..
+            } => IrType::Closure {
+                params: params.iter().map(|p| lower(p, enum_names)).collect(),
+                ret: Box::new(lower(return_type, enum_names)),
+            },
             TypeName::Union(_) => IrType::Unknown,
             TypeName::Custom(name) if enum_names.contains(name) => enum_ir_type(name),
             TypeName::Custom(name) => IrType::Named(name.clone()),
@@ -2164,6 +3454,13 @@ fn call_kind_and_type(
     if let Some(name) = dotted_name(callee) {
         if let Some((module, function)) = name.split_once('.') {
             if let Some(signature) = metadata::dotted_signature(module, function) {
+                // Stage 8a: give native HTTP builtins concrete synthetic types so
+                // the server/response values flow through the backend as dedicated
+                // C structs rather than the unknown-typed dynamic objects the
+                // interpreter uses. Only affects native lowering.
+                if let Some(ty) = http_builtin_ir_type(module, function) {
+                    return (IrCallKind::Intrinsic(name), ty);
+                }
                 return (
                     IrCallKind::Intrinsic(name),
                     signature_return_type(&signature, args),
@@ -2175,6 +3472,28 @@ fn call_kind_and_type(
     (IrCallKind::Indirect, IrType::Unknown)
 }
 
+/// Stage 8a: the synthetic IR type of the native HTTP server value, produced by
+/// `http.server()`/`http.service()` and consumed by `app.get/listen`.
+const HTTP_SERVER_TYPE: &str = "__ku_http_server";
+/// Stage 8a: the synthetic IR type of an HTTP response produced by the response
+/// helpers (`http.text`/`html`/`empty`/`redirect`).
+const HTTP_RESPONSE_TYPE: &str = "__ku_http_response";
+/// Stage 8a: the synthetic IR type of the request struct passed to `fn(req)`
+/// route handlers (fields `method`/`path`/`body`).
+const HTTP_REQUEST_TYPE: &str = "__ku_http_request";
+
+/// The synthetic native IR type for a native-lowered HTTP builtin, or `None` for
+/// builtins that keep their metadata-derived type.
+fn http_builtin_ir_type(module: &str, function: &str) -> Option<IrType> {
+    match (module, function) {
+        ("http", "server" | "service") => Some(IrType::Named(HTTP_SERVER_TYPE.to_string())),
+        ("http", "text" | "html" | "empty" | "redirect") => {
+            Some(IrType::Named(HTTP_RESPONSE_TYPE.to_string()))
+        }
+        _ => None,
+    }
+}
+
 fn signature_return_type(signature: &Signature, args: &[IrExpr]) -> IrType {
     pattern_to_ir_type(&signature.returns, args).unwrap_or(IrType::Unknown)
 }
@@ -2184,8 +3503,10 @@ fn pattern_to_ir_type(pattern: &TypePattern, args: &[IrExpr]) -> Option<IrType> 
         TypePattern::Int => Some(IrType::Int),
         TypePattern::Bool => Some(IrType::Bool),
         TypePattern::String => Some(IrType::Str),
-        TypePattern::Null
-        | TypePattern::Unknown
+        TypePattern::Null => Some(IrType::Null),
+        TypePattern::KuValue => Some(IrType::Named("__ku_value".to_string())),
+        TypePattern::Native(name) => Some(IrType::Named(name.to_string())),
+        TypePattern::Unknown
         | TypePattern::Any
         | TypePattern::ObjectAny
         | TypePattern::ObjectFields(_)
@@ -2202,6 +3523,17 @@ fn pattern_to_ir_type(pattern: &TypePattern, args: &[IrExpr]) -> Option<IrType> 
             Some(IrType::Result(Box::new(pattern_to_ir_type(inner, args)?)))
         }
         TypePattern::SameAsArg(index) => args.get(*index).map(|arg| arg.ty.clone()),
+    }
+}
+
+/// A receiver expression with no side effects, safe to lower more than once
+/// while probing for builtin method dispatch.
+fn is_pure_path(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Variable(_) | ExprKind::Literal(_) => true,
+        ExprKind::Field { target, .. } => is_pure_path(target),
+        ExprKind::Index { target, index } => is_pure_path(target) && is_pure_path(index),
+        _ => false,
     }
 }
 
@@ -2222,61 +3554,48 @@ fn unsupported_expr(reason: impl Into<String>) -> IrExpr {
     }
 }
 
-fn captured_names(function: &crate::ast::FnDecl) -> Vec<String> {
-    let mut bound = HashSet::new();
-    bound.insert(function.name.clone());
-    for param in &function.params {
-        bound.insert(param.name.clone());
-    }
-    let mut free = HashSet::new();
-    for stmt in &function.body {
-        collect_free_stmt_names(stmt, &mut bound, &mut free);
-    }
-    let mut names = free.into_iter().collect::<Vec<_>>();
-    names.sort();
-    names
+/// Stage 6b: only Copy scalars can be boxed into a shared cell for now; owned
+/// payloads (str/array/object/struct/enum) are deferred to Stage 6c.
+fn is_copy_ir_type(ty: &IrType) -> bool {
+    matches!(
+        ty,
+        IrType::Int | IrType::Float | IrType::Bool | IrType::Null
+    )
 }
 
-fn collect_free_stmt_names(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSet<String>) {
+/// Stage 6b: collect the names captured by every closure literal (arrow function
+/// or nested named function) reachable in `body`. Their intersection with the
+/// locals a function declares is what must be boxed. Reuses the interpreter's
+/// free-variable analysis so the native capture set matches the interpreter's
+/// exactly.
+fn collect_boxed_candidates(body: &[Stmt], out: &mut HashSet<String>) {
+    for stmt in body {
+        collect_boxed_candidates_stmt(stmt, out);
+    }
+}
+
+fn collect_boxed_candidates_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
     match stmt {
-        Stmt::VarDecl { name, value, .. } | Stmt::Assign { name, value, .. } => {
-            collect_free_expr_names(value, bound, free);
-            bound.insert(name.clone());
+        Stmt::VarDecl { value, .. } | Stmt::Assign { value, .. } => {
+            collect_boxed_candidates_expr(value, out)
         }
-        Stmt::Print { value, .. } => collect_free_expr_names(value, bound, free),
-        Stmt::AssignTarget { target, value, .. } => {
-            collect_free_lvalue_names(target, bound, free);
-            collect_free_expr_names(value, bound, free);
+        Stmt::AssignTarget { target, value, .. } | Stmt::CompoundAssign { target, value, .. } => {
+            collect_boxed_candidates_assign_target(target, out);
+            collect_boxed_candidates_expr(value, out);
         }
-        Stmt::CompoundAssign { target, value, .. } => {
-            collect_free_lvalue_names(target, bound, free);
-            collect_free_expr_names(value, bound, free);
-        }
-        Stmt::DestructureAssign { names, values, .. } => {
+        Stmt::DestructureAssign { values, .. } => {
             for value in values {
-                collect_free_expr_names(value, bound, free);
-            }
-            for name in names.iter().flatten() {
-                bound.insert(name.clone());
+                collect_boxed_candidates_expr(value, out);
             }
         }
         Stmt::ObjectDestructureAssign {
-            bindings,
-            rest,
-            value,
-            ..
+            bindings, value, ..
         } => {
-            collect_free_expr_names(value, bound, free);
+            collect_boxed_candidates_expr(value, out);
             for binding in bindings {
                 if let Some(default) = &binding.default {
-                    collect_free_expr_names(default, bound, free);
+                    collect_boxed_candidates_expr(default, out);
                 }
-                if let Some(local) = &binding.local {
-                    bound.insert(local.clone());
-                }
-            }
-            if let Some(local) = rest.as_ref().and_then(|rest| rest.local.as_ref()) {
-                bound.insert(local.clone());
             }
         }
         Stmt::If {
@@ -2285,141 +3604,106 @@ fn collect_free_stmt_names(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut 
             else_branch,
             ..
         } => {
-            collect_free_expr_names(condition, bound, free);
-            collect_free_nested_block(then_branch, bound, free);
-            collect_free_nested_block(else_branch, bound, free);
+            collect_boxed_candidates_expr(condition, out);
+            collect_boxed_candidates(then_branch, out);
+            collect_boxed_candidates(else_branch, out);
         }
         Stmt::While {
             condition, body, ..
         } => {
-            collect_free_expr_names(condition, bound, free);
-            collect_free_nested_block(body, bound, free);
+            collect_boxed_candidates_expr(condition, out);
+            collect_boxed_candidates(body, out);
         }
-        Stmt::For {
-            name,
-            iterable,
-            body,
-            ..
-        } => {
-            collect_free_expr_names(iterable, bound, free);
-            let mut scoped = bound.clone();
-            scoped.insert(name.clone());
-            collect_free_nested_block(body, &mut scoped, free);
+        Stmt::For { iterable, body, .. } => {
+            collect_boxed_candidates_expr(iterable, out);
+            collect_boxed_candidates(body, out);
         }
         Stmt::Function(function) => {
-            bound.insert(function.name.clone());
+            out.extend(crate::runtime::interpreter::function_capture_names(function));
+            collect_boxed_candidates(&function.body, out);
         }
         Stmt::Try {
             body,
-            catch_name,
             catch_body,
             finally_body,
             ..
         } => {
-            collect_free_nested_block(body, bound, free);
-            let mut catch_bound = bound.clone();
-            if let Some(name) = catch_name {
-                catch_bound.insert(name.clone());
-            }
-            collect_free_nested_block(catch_body, &mut catch_bound, free);
-            collect_free_nested_block(finally_body, bound, free);
+            collect_boxed_candidates(body, out);
+            collect_boxed_candidates(catch_body, out);
+            collect_boxed_candidates(finally_body, out);
         }
-        Stmt::Fail { value, .. } | Stmt::Panic { value, .. } => {
-            collect_free_expr_names(value, bound, free)
+        Stmt::Fail { value, .. } | Stmt::Panic { value, .. } | Stmt::Print { value, .. } => {
+            collect_boxed_candidates_expr(value, out)
         }
         Stmt::Return { value, .. } => {
             if let Some(value) = value {
-                collect_free_expr_names(value, bound, free);
+                collect_boxed_candidates_expr(value, out);
             }
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
-        Stmt::Expr { expr, .. } => collect_free_expr_names(expr, bound, free),
+        Stmt::Expr { expr, .. } => collect_boxed_candidates_expr(expr, out),
     }
 }
 
-fn collect_free_nested_block(
-    body: &[Stmt],
-    bound: &mut HashSet<String>,
-    free: &mut HashSet<String>,
-) {
-    for stmt in body {
-        collect_free_stmt_names(stmt, bound, free);
-    }
-}
-
-fn collect_free_lvalue_names(
-    target: &AssignTarget,
-    bound: &HashSet<String>,
-    free: &mut HashSet<String>,
-) {
+fn collect_boxed_candidates_assign_target(target: &AssignTarget, out: &mut HashSet<String>) {
     match target {
-        AssignTarget::Variable(name) => {
-            if !bound.contains(name) {
-                free.insert(name.clone());
-            }
-        }
+        AssignTarget::Variable(_) => {}
         AssignTarget::Index { target, index } => {
-            collect_free_expr_names(target, bound, free);
-            collect_free_expr_names(index, bound, free);
+            collect_boxed_candidates_expr(target, out);
+            collect_boxed_candidates_expr(index, out);
         }
-        AssignTarget::Field { target, .. } => collect_free_expr_names(target, bound, free),
+        AssignTarget::Field { target, .. } => collect_boxed_candidates_expr(target, out),
     }
 }
 
-fn collect_free_expr_names(expr: &Expr, bound: &HashSet<String>, free: &mut HashSet<String>) {
+fn collect_boxed_candidates_expr(expr: &Expr, out: &mut HashSet<String>) {
     match &expr.kind {
-        ExprKind::Variable(name) => {
-            if !bound.contains(name) {
-                free.insert(name.clone());
-            }
+        ExprKind::Function { params, body, .. } => {
+            out.extend(crate::runtime::interpreter::closure_capture_names(
+                params, body,
+            ));
+            collect_boxed_candidates(body, out);
         }
         ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => {
-            collect_free_expr_names(expr, bound, free)
+            collect_boxed_candidates_expr(expr, out)
         }
         ExprKind::Binary { left, right, .. } => {
-            collect_free_expr_names(left, bound, free);
-            collect_free_expr_names(right, bound, free);
+            collect_boxed_candidates_expr(left, out);
+            collect_boxed_candidates_expr(right, out);
         }
         ExprKind::Call { callee, args } => {
-            collect_free_expr_names(callee, bound, free);
+            collect_boxed_candidates_expr(callee, out);
             for arg in args {
-                collect_free_expr_names(arg, bound, free);
+                collect_boxed_candidates_expr(arg, out);
             }
         }
         ExprKind::Array(values) => {
             for value in values {
-                collect_free_expr_names(value, bound, free);
+                collect_boxed_candidates_expr(value, out);
             }
         }
         ExprKind::Index { target, index } => {
-            collect_free_expr_names(target, bound, free);
-            collect_free_expr_names(index, bound, free);
+            collect_boxed_candidates_expr(target, out);
+            collect_boxed_candidates_expr(index, out);
         }
         ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
-            collect_free_expr_names(target, bound, free)
+            collect_boxed_candidates_expr(target, out)
         }
         ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
             for (_, value) in fields {
-                collect_free_expr_names(value, bound, free);
+                collect_boxed_candidates_expr(value, out);
             }
         }
         ExprKind::Match { value, arms } => {
-            collect_free_expr_names(value, bound, free);
+            collect_boxed_candidates_expr(value, out);
             for arm in arms {
                 if let Some(guard) = &arm.guard {
-                    collect_free_expr_names(guard, bound, free);
+                    collect_boxed_candidates_expr(guard, out);
                 }
-                collect_free_expr_names(&arm.value, bound, free);
+                collect_boxed_candidates_expr(&arm.value, out);
             }
         }
-        ExprKind::Function { params, body, .. } => {
-            let mut nested = bound.clone();
-            for param in params {
-                nested.insert(param.name.clone());
-            }
-            collect_free_nested_block(body, &mut nested, free);
-        }
-        ExprKind::Literal(_) => {}
+        ExprKind::Literal(_) | ExprKind::Variable(_) => {}
     }
 }
 

@@ -1,6 +1,8 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.15`，正在补齐二进制构建系统、native C、LLVM、registry resolver 和 async task 生命周期能力。实验性语言，目前不可用于生产，欢迎围观讨论
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.16`，重点是补齐 native 标准库(str()/字符串方法/struct 复杂字段/模板字符串)并接入数据库驱动(PostgreSQL / Redis / MySQL,含连接池)。实验性语言，目前不可用于生产，欢迎围观讨论。
+
+> **0.0.16 数据库驱动验证程度不同,请勿一概当作可用**:`std.pg`、`std.redis` 已对真实数据库端到端跑通并做 CRT 循环压测 0 泄漏;`std.mysql` **仅编译+链接+连接握手+错误路径验证,成功查询路径因无测试凭据从未实际执行,属实验性**。详见 [0.0.16 版本记录](docs/v0.0.16.md)。数据库驱动目前均为 native-only(`ku build --native`),解释器 `ku run` 暂不支持连库。
 
 ## 快速开始
 
@@ -147,6 +149,35 @@ null
 
 Ku 不使用 `let` / `let mut`。首次赋值即声明变量，带类型写作 `name:type = value`。
 
+## 0.0.16 新增
+
+**native 标准库补齐**(以下均已对齐解释器 + 通过 CRT/ASan 验证):
+
+- `str()`:整数/布尔/字符串/null 转字符串。
+- 字符串方法 6/9:`len`(Unicode 码点)/`contains`/`starts_with`/`ends_with`/`replace`/`slice`;`trim`/`lower`/`upper` 因需 Unicode 表暂以明确错误提示,不静默偏离。
+- struct 复杂字段:`[int]`/`[str]` 基本数组、`[Person]` 结构体数组、`[[int]]` 嵌套数组、`enum` 字段。
+- 模板字符串 `` `Hello {name}` `` 在 native 下正确插值。
+- 修复非 ASCII/非打印字符字面量在 native 下的错误转义。
+
+**数据库驱动**(native-only,详见 [0.0.16 版本记录](docs/v0.0.16.md),各驱动验证程度见上文说明):
+
+```ku
+import pg from "std.pg"
+fn main(): null! {
+    conn = pg.connect("host=... dbname=... user=... password=...")?
+    res = pg.query_params(conn, "SELECT name FROM users WHERE id = $1", ["42"])?
+    println(pg.value(res, 0, 0))
+    pg.close(conn)
+    return ok(null)
+}
+```
+
+- **std.pg**(libpq):connect/query/参数化 query_params(防注入)/结果读取/close + 有界阻塞连接池 pool/pool_query/pool_query_params/pool_close。**已对真实 PostgreSQL 端到端验证 + CRT 0 泄漏**。
+- **std.redis**(自实现 RESP-over-Winsock,零外部依赖):connect/auth/get/set/del/close。**已对真实 Redis 端到端验证 + CRT 0 泄漏**。
+- **std.mysql**(libmysqlclient):API 与 pg 对齐,query_params 用 `mysql_real_escape_string` 防注入。**⚠️ 实验性:仅编译+连接+错误路径验证,成功查询/取值路径从未实际执行,投产前必须先对可访问的 MySQL 实测**。
+
+**稳定与安全**:路径级所有权 checker(部分 move 分析)作为第一道防线;对抗式审计发现并修复了循环内 `catch` 错误绑定、`?` 借用解包、`array.push` 字面量的内存泄漏。
+
 ## 模块和 Package
 
 导出规则：顶层名字首字母大写对包外可见，小写只在当前文件内部使用。
@@ -229,9 +260,10 @@ http_bench.ps1
 
 ## 文档
 
-- [0.0.15 语法文档](docs/syntax.md)
+- [语法文档](docs/syntax.md)
 - [自举状态与 bootstrap 路线](docs/self-hosting.md)
 - [并发模型与 HTTP 千万请求压测 demo](docs/concurrency.md)
+- [0.0.16 版本记录](docs/v0.0.16.md)
 - [0.0.15 版本记录](docs/v0.0.15.md)
 - [0.0.14 版本记录](docs/v0.0.14.md)
 - [0.0.13 版本记录](docs/v0.0.13.md)
@@ -256,7 +288,7 @@ http_bench.ps1
 
 注意：0.0.15 的默认 build 是“解释器打包型二进制”，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于最终 native ABI。带 import 的程序仍应保持源码依赖路径可访问。完整 native binary 目标仍在执行队列：native closure、正式 `KuString`、dynamic object、async state machine runtime、增量缓存和真正不依赖源码的 import graph 打包。
 
-`ku build --native` 当前输出 prototype C 源码，覆盖 `int` / `bool` / `str`、非递归 struct、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally` 和 return-through-finally。array/named/Result 已按默认 move、显式 `clone()`、自动 drop 生成所有权代码；闭包、动态 object、正式 owned string 和 async native lowering 仍会明确报不支持。在正式 `KuString` ABI 完成前，native C 会明确拒绝字符串拼接，避免生成错误的 `const char* + const char*`。
+`ku build --native` 可用 MSVC 直接编译成独立二进制,覆盖 `int` / `bool` / `str`(正式 `KuString` owned ABI,支持拼接与 `str()`/`len`/`contains`/`slice` 等方法)、struct(含数组/嵌套/enum 字段)、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包(env 引用计数)、native HTTP 服务、以及数据库驱动(std.pg/redis/mysql)。array/named/Result/struct/闭包均按默认 move、显式 `clone()`、自动 drop 生成所有权代码,并由 checker 做路径级 move 分析。仍明确报不支持的:动态 object 的部分复杂场景、async native lowering、str 的 `trim`/`lower`/`upper`(需 Unicode 表)。
 
 已完成到 0.0.15 的关键前置：
 
@@ -312,8 +344,9 @@ LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 LLVM array/enum、闭包和高级控制流 lowering
 registry 根公钥配置、key rotation/revocation、归档格式、受限解包和 CLI 远程 import 串联
 完整 match guard 模式矩阵和跨 guard 的穷尽性证明
-native C 闭包、动态 object、正式 owned string ABI
+native C 动态 object 的部分复杂场景、str 的 trim/lower/upper(需 Unicode 表)
 native async ABI
+数据库驱动的解释器(`ku run`)支持;std.mysql 成功查询路径的实测;连接池扩展到 redis/mysql
 ```
 
 ## VS Code 插件
@@ -334,7 +367,7 @@ powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -InstallExt
 已提供：
 
 ```txt
-Ku 0.0.15 语法高亮和 snippet
+Ku 语法高亮和 snippet(0.0.16 已加入 pg/redis/mysql 模块高亮与补全)
 ku.mod / ku.lock 高亮
 保存/打开时运行 ku check，并把错误放进 Problems 面板
 命令面板：Run / Check / Show IR / Build / Build Native C / Package GC / Show Version
@@ -346,16 +379,14 @@ Hover、补全、定义跳转、Outline、Quick Fix、基础格式化
 Ku 文件默认保存时格式化；import path 补全会替换引号内路径，避免 `std.std.fs`；成员补全会识别 `http.` / `fs.` / `json.` 等上下文，只插入成员名，避免 `http.http.server`。
 ```
 
-图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择：
+> 说明:`editors/vscode-ku/ku-language-0.0.16.vsix` 已打包(含 pg/redis/mysql 高亮与补全、0.0.16 版本号)。需要自行重打时用 `npx @vscode/vsce package`(会先跑 `npm run compile`)。仓库同时保留了旧的 `ku-language-0.0.15.vsix`。
 
-```txt
-editors/vscode-ku/ku-language-0.0.15.vsix
-```
+图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择 `editors/vscode-ku/ku-language-0.0.16.vsix`。
 
 命令安装方式：
 
 ```powershell
-code --install-extension editors\vscode-ku\ku-language-0.0.15.vsix --force
+code --install-extension editors\vscode-ku\ku-language-0.0.16.vsix --force
 ```
 
 ## 开发验证
