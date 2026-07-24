@@ -240,13 +240,26 @@ impl KuError {
                 .note("Ku does not expose task.spawn, Task.new, or user-level task scheduling")
                 .help("start work by calling an async fn, then use `result = await task?`");
         }
+        if message.contains("cannot move captured owned value") {
+            return DiagnosticInfo::new("E0904")
+                .note("a closure shares captured variables by reference; it may borrow them but cannot move an owned capture out")
+                .help("call `.clone()` inside the closure to return or store an owned copy");
+        }
+        if message.contains("use of moved value")
+            || message.contains("cannot move an owned field or indexed element")
+            || message.contains("cannot move outer owned value")
+        {
+            return DiagnosticInfo::new("E0901")
+                .note("Ku is move-by-default; str/array/object/struct/enum/function values are owned")
+                .help("call `.clone()` to keep the original, or restructure so the value is used once");
+        }
         if message.contains("unused local binding") {
             return DiagnosticInfo::new("E0905")
                 .note("strict unused checks are enabled by `ku check --deny-unused`")
                 .help("remove the binding, use it, or rename it with a leading `_` when it is intentionally unused");
         }
         if message.contains("unused import") {
-            return DiagnosticInfo::new("E0901")
+            return DiagnosticInfo::new("E0603")
                 .note("Ku treats unused imports as errors by default")
                 .help("remove the import, use the imported name, or alias it with a leading `_` when it is intentionally unused");
         }

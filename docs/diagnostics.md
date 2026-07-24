@@ -8,9 +8,26 @@ level code message file line column endLine endColumn notes helps
 
 成功时 `ku check --json` 静默输出。
 
+## Ownership
+
+### E0901 use of moved value
+
+Ku 默认 move；`str` / `array` / `object` / `struct` / `enum` / 函数值是 owned。owned 值赋值或传参默认 move，move 之后再读取源值报错：
+
+```ku
+fn main(): null! {
+    a = "hello"
+    b = a        // a 被 move
+    println(a)   // error[E0901]: use of moved value 'a'
+    return ok(null)
+}
+```
+
+需要保留原值时显式 `a.clone()`。同类错误还包括从 owned 字段 / 索引元素直接 move、以及在循环体内 move 外层 owned 值。
+
 ## Unused
 
-### E0901 unused import
+### E0603 unused import
 
 未使用的 named import / namespace import 默认是 error：
 

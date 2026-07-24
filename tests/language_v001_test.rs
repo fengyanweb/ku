@@ -65,7 +65,7 @@ fn main() {
 fn run_accepts_bool_conditions_expr_arrows_and_println() {
     let source = r#"
 fn main() {
-    double = (x) => x * 2
+    double = (x: int) => x * 2
     if (double(3) != 6) {
         panic("bad arrow")
     }
@@ -375,13 +375,17 @@ fn main() {
         "unexpected error: {err}"
     );
 
-    let err = run_source(
+    // json.parse yields a KuValue (a first-class tagged dynamic value), not a
+    // static object, so destructuring it is a compile-time error — dynamic reads
+    // must go through obj["key"]? instead.
+    let err = check_source(
         "inline.ku",
         "fn main() { obj = json.parse(\"{}\") { missing } = obj }",
     )
-    .expect_err("missing dynamic field should fail at runtime");
+    .expect_err("a KuValue cannot be destructured");
     assert!(
-        err.to_string().contains("object has no key 'missing'"),
+        err.to_string()
+            .contains("object destructuring expects object but got KuValue"),
         "unexpected error: {err}"
     );
 }
@@ -514,7 +518,7 @@ fn main() {
     name = 'Ku'
     count:int
     title:str
-    add = (a, b) => {
+    add = (a: int, b: int) => {
         return a + b
     }
 
@@ -599,7 +603,7 @@ fn main() {
         .expect_err("untyped function value should not satisfy a precise function type");
     assert!(
         err.to_string()
-            .contains("expected fn(int): int but got fn(unknown): unknown"),
+            .contains("expected fn(int): int but got fn(int): str"),
         "unexpected error: {err}"
     );
 }
@@ -655,15 +659,40 @@ fn main() {
         "unexpected error: {err}"
     );
 
-    let optional = r#"
-fn main() {
+    let present = r#"
+fn main(): null! {
     user = { name: "Ku" }
     print(user["name"]?)
-    print(user["missing"]?)
+    return ok(null)
 }
 "#;
-    check_source("inline.ku", optional).expect("optional object index should check");
-    run_source("inline.ku", optional).expect("optional object index should return null");
+    check_source("inline.ku", present).expect("present key with ? should check");
+    run_source("inline.ku", present).expect("present key with ? should unwrap");
+
+    // `obj[key]?` is strict: a missing key propagates a recoverable Err
+    // (domain "object", code "missing_key"), it does not return null.
+    let missing = r#"
+fn main(): null! {
+    user = { name: "Ku" }
+    print(user["missing"]?)
+    return ok(null)
+}
+"#;
+    let missing_err = run_source("inline.ku", missing)
+        .expect_err("missing key with ? should propagate a recoverable error");
+    assert!(
+        missing_err.to_string().contains("missing_key"),
+        "expected missing_key error: {missing_err}"
+    );
+
+    // Lenient reads use get_or, which returns the default for a missing key.
+    let lenient = r#"
+fn main() {
+    user = { name: "Ku" }
+    print(str(user.get_or("missing", null)))
+}
+"#;
+    run_source("inline.ku", lenient).expect("get_or returns the default for a missing key");
 }
 
 #[test]
@@ -705,7 +734,7 @@ fn main() {
 }
 
 #[test]
-fn object_get_or_uses_static_field_type_for_literal_keys() {
+fn object_get_or_returns_kuvalue_not_static_field_type() {
     let source = r#"
 fn main() {
     obj = { name: "Ku" }
@@ -714,10 +743,12 @@ fn main() {
 }
 "#;
 
+    // get_or yields a first-class KuValue (dynamic), not the static field type,
+    // so binding it to `int` is a type error mentioning KuValue.
     let err = check_source("inline.ku", source)
-        .expect_err("literal object.get_or key should preserve static field type");
+        .expect_err("get_or returns a KuValue, not the static field type");
     assert!(
-        err.to_string().contains("expected int but got str"),
+        err.to_string().contains("expected int but got KuValue"),
         "unexpected error: {err}"
     );
 }
@@ -761,7 +792,7 @@ fn main() {
 fn check_rejects_function_value_return_type_mismatch() {
     let source = r##"
 fn main() {
-    add = (a, b) => {
+    add = (a: int, b: int) => {
         return a + b
     }
 

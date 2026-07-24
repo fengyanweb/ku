@@ -554,7 +554,7 @@ fn main() {
 
     assert_ne!(result.code, Some(0), "unused import should fail");
     assert!(
-        result.stderr.contains("\"code\":\"E0901\""),
+        result.stderr.contains("\"code\":\"E0603\""),
         "missing unused import code:\n{}",
         result.stderr
     );
@@ -737,7 +737,7 @@ fn run_v002_features_print_expected_output() {
 fn main() {
     name = 'Ku'
     total:int
-    add = (a, b) => {
+    add = (a: int, b: int) => {
         return a + b
     }
     total = add(10, 20)

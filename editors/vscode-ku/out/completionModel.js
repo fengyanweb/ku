@@ -34,8 +34,8 @@ exports.keywords = [
 ];
 exports.types = ["int", "float", "bool", "str", "null"];
 exports.builtins = ["len", "str", "ok", "err", "println"];
-exports.stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.object", "std.json", "std.config", "std.time", "std.task"];
-exports.stdRootModules = ["fs", "http", "string", "array", "object", "json", "config", "time", "task"];
+exports.stdModules = ["std.fs", "std.http", "std.string", "std.array", "std.object", "std.json", "std.config", "std.time", "std.task", "std.pg", "std.redis", "std.mysql"];
+exports.stdRootModules = ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql"];
 exports.stdFunctions = [
     "fs.read",
     "fs.try_read",
@@ -90,6 +90,38 @@ exports.stdFunctions = [
     "time.sleep",
     "task.stats",
     "task.stress",
+    "string.contains",
+    "string.starts_with",
+    "string.ends_with",
+    "string.replace",
+    "array.first",
+    "array.last",
+    "array.is_empty",
+    "array.map",
+    "pg.connect",
+    "pg.query",
+    "pg.query_params",
+    "pg.rows",
+    "pg.cols",
+    "pg.value",
+    "pg.close",
+    "pg.pool",
+    "pg.pool_query",
+    "pg.pool_query_params",
+    "pg.pool_close",
+    "redis.connect",
+    "redis.auth",
+    "redis.get",
+    "redis.set",
+    "redis.del",
+    "redis.close",
+    "mysql.connect",
+    "mysql.query",
+    "mysql.query_params",
+    "mysql.rows",
+    "mysql.cols",
+    "mysql.value",
+    "mysql.close",
 ];
 exports.namespaceMembers = {
     fs: ["read", "try_read", "write", "try_write"],

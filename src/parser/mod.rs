@@ -1114,13 +1114,32 @@ impl Parser {
             } else if self.match_kind(&TokenKind::QuestionDot) {
                 let (name, name_span) = self.consume_ident("expected field name after '?.'")?;
                 let span = expr.span.merge(name_span);
-                expr = Expr::new(
-                    ExprKind::OptionalField {
-                        target: Box::new(expr),
-                        name,
-                    },
-                    span,
-                );
+                // `obj[key]?.method()` means `(obj[key]?).method()`: an object index
+                // with `?` is a strict recoverable read yielding a KuValue, then a
+                // method/field on it. Plain `x?.field` stays optional field access.
+                expr = if matches!(expr.kind, ExprKind::Index { .. }) {
+                    let unwrapped = Expr::new(
+                        ExprKind::TryUnwrap {
+                            expr: Box::new(expr),
+                        },
+                        span,
+                    );
+                    Expr::new(
+                        ExprKind::Field {
+                            target: Box::new(unwrapped),
+                            name,
+                        },
+                        span,
+                    )
+                } else {
+                    Expr::new(
+                        ExprKind::OptionalField {
+                            target: Box::new(expr),
+                            name,
+                        },
+                        span,
+                    )
+                };
             } else if self.match_kind(&TokenKind::Question) {
                 let span = expr.span.merge(self.previous().span);
                 expr = Expr::new(

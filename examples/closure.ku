@@ -1,6 +1,6 @@
 fn main() {
     prefix = "Hello "
-    greet = (name) => {
+    greet = (name: str) => {
         return prefix + name
     }
 

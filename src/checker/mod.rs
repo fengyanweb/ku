@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
     ast::*,
@@ -8,6 +8,12 @@ use crate::{
 };
 
 const MAX_CHECK_DEPTH: usize = 32;
+/// Prefix owned by the compiler's generated C identifiers; see `reject_reserved_name`.
+const RESERVED_NAME_PREFIX: &str = "__ku_";
+/// Sub-namespaces the import expander synthesizes inside the reserved prefix. These
+/// are the only generated names that exist before checking — everything else under
+/// `__ku_` is created during lowering or codegen, well after this check runs.
+const EXPANDER_PREFIXES: [&str; 2] = ["__ku_import", "__ku_ns"];
 
 #[derive(Debug, Clone, PartialEq)]
 enum Type {
@@ -25,6 +31,11 @@ enum Type {
     DynamicObject,
     Struct(String),
     Enum(String),
+    /// An opaque owned handle from a C-library binding (e.g. a `pg` connection or
+    /// result). The string is the backend's synthetic type id (`__ku_pg_conn`). It is
+    /// owned (move-tracked, dropped so the backend can close the C resource) but has
+    /// no user-visible fields or methods — only the module functions accept it.
+    Native(String),
     Generic(String),
     Void,
     FunctionValue {
@@ -33,14 +44,159 @@ enum Type {
         body: Vec<Stmt>,
         is_async: bool,
     },
+    /// A tagged dynamic value read out of a dynamic object (`obj[key]?`,
+    /// `get_or`). A first-class type, NOT `Unknown`: only println /
+    /// json.stringify / object-array nesting / `==` `!=` / explicit
+    /// `.as_int()` / `.as_str()` accept it; arithmetic is rejected.
+    KuValue,
     Unknown,
+}
+
+/// How a projection path has been moved out. Both states forbid reading the
+/// path; they differ only for diagnostics and control-flow merging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveMark {
+    /// Moved on every path reaching here.
+    Moved,
+    /// Moved on some control-flow paths but not all; still unreadable until it is
+    /// re-initialized.
+    MaybeMoved,
+}
+
+/// True when `prefix` is a (non-strict) projection prefix of `full`: `[]` is a
+/// prefix of everything, `["user"]` is a prefix of `["user", "name"]`.
+fn path_is_prefix(prefix: &[String], full: &[String]) -> bool {
+    prefix.len() <= full.len() && prefix.iter().zip(full).all(|(a, b)| a == b)
+}
+
+/// A movable place: a local variable plus a static struct-field projection path
+/// (`user` → `{root: "user", path: []}`, `config.user.name` → `{root: "config",
+/// path: ["user", "name"]}`).
+#[derive(Debug, Clone)]
+struct PlacePath {
+    root: String,
+    path: Vec<String>,
+}
+
+/// What kind of place an expression denotes for move analysis.
+enum PlaceClass {
+    Movable(PlacePath),
+    Index,
+    Fresh,
+}
+
+/// Render a place as `user.name` / `config.user.name` for diagnostics.
+fn place_display(root: &str, path: &[String]) -> String {
+    let mut out = root.to_string();
+    for segment in path {
+        out.push('.');
+        out.push_str(segment);
+    }
+    out
+}
+
+fn read_of_moved_error(root: &str, path: &[String], mark: MoveMark, span: Span) -> KuError {
+    let place = place_display(root, path);
+    let how = match mark {
+        MoveMark::Moved => "was moved out",
+        MoveMark::MaybeMoved => "may have been moved out on some paths",
+    };
+    if path.is_empty() {
+        KuError::runtime(
+            format!("use of moved value '{place}'; it {how} — call '.clone()' when an owned copy is required"),
+            span,
+        )
+    } else {
+        KuError::runtime(
+            format!("use of moved field '{place}'; it {how} — read it before the move, or '.clone()' it when an owned copy is required"),
+            span,
+        )
+    }
+}
+
+fn move_of_moved_error(root: &str, path: &[String], span: Span) -> KuError {
+    let place = place_display(root, path);
+    if path.is_empty() {
+        KuError::runtime(
+            format!("use of moved value '{place}'; call '{place}.clone()' before moving when an explicit copy is required"),
+            span,
+        )
+    } else {
+        KuError::runtime(
+            format!("use of moved field '{place}'; it was already moved out — call '.clone()' when an owned copy is required"),
+            span,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
 struct VarType {
     ty: Type,
     mutable: bool,
-    moved: bool,
+    /// Move state at struct-field-path granularity. A key is a projection path
+    /// from this variable (`[]` = the whole variable, `["name"]` = the `name`
+    /// field, `["user", "name"]` = a nested field). A present key means that path
+    /// — and everything under it — has been moved out; an absent path is live.
+    /// Array/object index projections are never tracked here (they cannot be
+    /// partially moved; the checker requires an explicit `.clone()`).
+    moves: BTreeMap<Vec<String>, MoveMark>,
+    /// True only for a `catch` error binding. Its checker type is `Type::Object`
+    /// (so `fail {...}` can pass an object literal), but the runtime backs it with
+    /// a `KuError` struct whose fields the C backend can move-and-clear — unlike a
+    /// user object literal of the same shape. This flag distinguishes the two
+    /// reliably, so error fields stay movable while user-object fields require an
+    /// explicit `.clone()`.
+    /// This binding is lowered to a native struct (a caught error, or an HTTP
+    /// handler's request), so its fields are individually movable rather than
+    /// being hashmap entries the backend cannot move-and-clear.
+    struct_backed: bool,
+    /// A closure captured this binding, so its value now lives in a shared cell
+    /// that the closure reads on every call. Moving it would empty that cell.
+    captured: bool,
+}
+
+impl VarType {
+    fn live(ty: Type, mutable: bool) -> Self {
+        Self {
+            ty,
+            mutable,
+            moves: BTreeMap::new(),
+            struct_backed: false,
+            captured: false,
+        }
+    }
+
+    /// The move mark on the whole variable (`[]`), if any. Used for the bare
+    /// "use of moved value" diagnostic and for task/closure whole-value checks.
+    fn whole_move(&self) -> Option<MoveMark> {
+        self.moves.get(&Vec::new()).copied()
+    }
+
+    /// The move mark blocking a read of the place at `path`, if any. A move at `q`
+    /// blocks reading `p` when the two lie on one root-to-leaf line: `q` is an
+    /// ancestor of `p` (a parent was moved) or `p` is an ancestor of `q` (a part
+    /// of `p` was moved, so `p` can no longer be used as a whole).
+    fn read_block(&self, path: &[String]) -> Option<MoveMark> {
+        self.moves.iter().find_map(|(q, mark)| {
+            (path_is_prefix(q, path) || path_is_prefix(path, q)).then_some(*mark)
+        })
+    }
+
+    /// Mark `path` moved. Any finer moves strictly under `path` are subsumed.
+    fn mark_moved(&mut self, path: Vec<String>, mark: MoveMark) {
+        self.moves
+            .retain(|q, _| !(q.len() > path.len() && path_is_prefix(&path, q)));
+        self.moves.insert(path, mark);
+    }
+
+    /// Re-initialize `path` and everything under it (an assignment to that place).
+    fn reinit(&mut self, path: &[String]) {
+        self.moves.retain(|q, _| !path_is_prefix(path, q));
+    }
+
+    fn any_moved(&self) -> bool {
+        !self.moves.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,11 +235,23 @@ pub struct Checker {
     check_depth: usize,
     recoverable_depth: usize,
     loop_depth: usize,
+    /// One collector per enclosing loop; each holds the move state captured at
+    /// every `break` that exits that loop, so the after-loop state can join them
+    /// (a value moved on a break path is moved after the loop).
+    loop_break_states: Vec<Vec<Vec<HashMap<String, VarType>>>>,
+    /// Move state captured at each `continue`. A `continue` jumps to the top of the
+    /// iteration, so unlike a `break` its moves belong to the loop-top join, not to
+    /// the state after the loop.
+    loop_continue_states: Vec<Vec<Vec<HashMap<String, VarType>>>>,
     template_mode: bool,
     async_depth: usize,
     readonly_capture: Option<ReadonlyCapture>,
     std_modules: HashSet<String>,
     function_value_inference_stack: Vec<(usize, usize, usize)>,
+    /// Stage 6c-str: scope-index boundaries of the closure bodies currently being
+    /// checked (one per nesting level). Moving an owned value found in a scope
+    /// below the active boundary out of the closure is rejected (E0904).
+    closure_capture_boundaries: Vec<usize>,
 }
 
 impl Checker {
@@ -97,11 +265,14 @@ impl Checker {
             check_depth: 0,
             recoverable_depth: 0,
             loop_depth: 0,
+            loop_break_states: Vec::new(),
+            loop_continue_states: Vec::new(),
             template_mode: false,
             async_depth: 0,
             readonly_capture: None,
             std_modules: HashSet::new(),
             function_value_inference_stack: Vec::new(),
+            closure_capture_boundaries: Vec::new(),
         }
     }
 
@@ -110,6 +281,10 @@ impl Checker {
         for item in &program.items {
             match item {
                 Item::Function(function) => {
+                    reject_reserved_name(&function.name, function.span)?;
+                    for param in &function.params {
+                        reject_reserved_name(&param.name, param.span)?;
+                    }
                     let is_async = function.is_async;
                     if let Some(previous_async) =
                         top_level_names.insert(function.name.clone(), is_async)
@@ -128,6 +303,10 @@ impl Checker {
                 }
                 Item::Import(_) => {}
                 Item::Struct(decl) => {
+                    reject_reserved_name(&decl.name, decl.span)?;
+                    for field in &decl.fields {
+                        reject_reserved_name(&field.name, decl.span)?;
+                    }
                     if top_level_names.insert(decl.name.clone(), false).is_some() {
                         return Err(KuError::runtime(
                             format!("top-level name '{}' is already defined", decl.name),
@@ -136,6 +315,13 @@ impl Checker {
                     }
                 }
                 Item::Enum(decl) => {
+                    reject_reserved_name(&decl.name, decl.span)?;
+                    for variant in &decl.variants {
+                        reject_reserved_name(&variant.name, decl.span)?;
+                        for field in &variant.fields {
+                            reject_reserved_name(&field.name, decl.span)?;
+                        }
+                    }
                     if top_level_names.insert(decl.name.clone(), false).is_some() {
                         return Err(KuError::runtime(
                             format!("top-level name '{}' is already defined", decl.name),
@@ -474,12 +660,12 @@ impl Checker {
                 value,
                 span,
             } => {
-                let actual = self.consume_expr(value)?;
-                let expected = ty
+                let declared = ty
                     .as_ref()
                     .map(|ty| self.resolve_type_name(ty, *span))
-                    .transpose()?
-                    .unwrap_or_else(|| actual.clone());
+                    .transpose()?;
+                let actual = self.consume_expr_expecting(value, declared.as_ref())?;
+                let expected = declared.unwrap_or_else(|| actual.clone());
                 if !type_matches(&expected, &actual) {
                     return Err(type_error(*span, &expected, &actual));
                 }
@@ -491,7 +677,14 @@ impl Checker {
                 )
             }
             Stmt::Assign { name, value, span } => {
-                let actual = self.consume_expr(value)?;
+                // A closure assigned to an already-declared function-typed
+                // variable takes that binding as its expected function type.
+                let expected = if self.contains(name) {
+                    Some(self.get_allow_moved(name, *span)?.ty)
+                } else {
+                    None
+                };
+                let actual = self.consume_expr_expecting(value, expected.as_ref())?;
                 if !self.contains(name) {
                     return self.define(name.clone(), actual, !is_constant_name(name), *span);
                 }
@@ -522,6 +715,11 @@ impl Checker {
                 if !type_matches(&expected, &actual) {
                     return Err(type_error(*span, &expected, &actual));
                 }
+                // Assigning a moved place re-initializes it (`user.name = x` after
+                // `user.name` was moved makes it live again).
+                if let Some(place) = self.assign_target_place(target) {
+                    self.reinit_place(&place);
+                }
                 Ok(())
             }
             Stmt::CompoundAssign {
@@ -534,10 +732,19 @@ impl Checker {
                     self.reject_readonly_capture_assignment(name, *span)?;
                 }
                 let left = self.check_assign_target(target, *span)?;
+                // `a += b` reads the target before writing it, so the target place
+                // must still be live — a compound-assign to a moved field is a
+                // use-after-move (`check_assign_target` only checks the base).
+                if let Some(place) = self.assign_target_place(target) {
+                    self.check_place_readable(&place, *span)?;
+                }
                 let right = self.consume_expr(value)?;
                 let actual = self.check_binary(*op, &left, &right, *span)?;
                 if !type_matches(&left, &actual) {
                     return Err(type_error(*span, &left, &actual));
+                }
+                if let Some(place) = self.assign_target_place(target) {
+                    self.reinit_place(&place);
                 }
                 Ok(())
             }
@@ -602,7 +809,10 @@ impl Checker {
                 self.scopes = before.clone();
                 self.check_block(else_branch)?;
                 let else_scopes = self.scopes.clone();
-                self.scopes = merge_moved_scopes(before, then_scopes, else_scopes);
+                let then_falls = !block_stops_fallthrough(then_branch);
+                let else_falls = !block_stops_fallthrough(else_branch);
+                self.scopes =
+                    merge_if_scopes(before, then_scopes, else_scopes, then_falls, else_falls);
                 Ok(())
             }
             Stmt::While {
@@ -612,13 +822,17 @@ impl Checker {
             } => {
                 self.expect_condition(condition, *span)?;
                 let before = self.scopes.clone();
+                let top = self.compute_loop_top(&before, body, None);
+                self.scopes = top;
                 self.loop_depth += 1;
+                self.loop_break_states.push(Vec::new());
+                self.loop_continue_states.push(Vec::new());
                 let result = self.check_block(body);
+                let breaks = self.loop_break_states.pop().unwrap_or_default();
+                self.loop_continue_states.pop();
                 self.loop_depth -= 1;
                 result?;
-                if loop_body_has_backedge(body) {
-                    self.reject_loop_carried_moves(&before, *span)?;
-                }
+                self.scopes = self.after_loop_state(before, self.scopes.clone(), breaks);
                 Ok(())
             }
             Stmt::For {
@@ -643,8 +857,12 @@ impl Checker {
                     }
                 };
                 let before = self.scopes.clone();
+                let top = self.compute_loop_top(&before, body, Some((name, &element)));
+                self.scopes = top;
                 self.push_scope();
                 self.loop_depth += 1;
+                self.loop_break_states.push(Vec::new());
+                self.loop_continue_states.push(Vec::new());
                 let result = (|| -> KuResult<()> {
                     self.define(name.clone(), element, true, *span)?;
                     for stmt in body {
@@ -652,18 +870,23 @@ impl Checker {
                     }
                     Ok(())
                 })();
+                let breaks = self.loop_break_states.pop().unwrap_or_default();
+                self.loop_continue_states.pop();
                 self.loop_depth -= 1;
                 self.pop_scope();
                 result?;
-                if loop_body_has_backedge(body) {
-                    self.reject_loop_carried_moves(&before, *span)?;
-                }
+                self.scopes = self.after_loop_state(before, self.scopes.clone(), breaks);
                 Ok(())
             }
             Stmt::Break { span } => {
                 if self.loop_depth == 0 {
                     Err(KuError::runtime("break outside loop", *span))
                 } else {
+                    // Record the move state here: this state reaches the code after
+                    // the loop, so a value moved before the break is moved after it.
+                    if let Some(collector) = self.loop_break_states.last_mut() {
+                        collector.push(self.scopes.clone());
+                    }
                     Ok(())
                 }
             }
@@ -671,6 +894,12 @@ impl Checker {
                 if self.loop_depth == 0 {
                     Err(KuError::runtime("continue outside loop", *span))
                 } else {
+                    // A `continue` jumps to the top of the iteration, so the moves
+                    // made before it are carried into the next one. `merge_if_scopes`
+                    // drops this branch as diverging, so record it here instead.
+                    if let Some(collector) = self.loop_continue_states.last_mut() {
+                        collector.push(self.scopes.clone());
+                    }
                     Ok(())
                 }
             }
@@ -682,18 +911,76 @@ impl Checker {
                 finally_body,
                 span,
             } => {
+                let before = self.scopes.clone();
+                // Only a body that can actually throw (a `fail` or a `?`) can
+                // divert to the catch/finally partway through. When it cannot, the
+                // catch is dead code and the value flow is fully linear, so the
+                // conservative "moved on the throw path" reasoning below would only
+                // reject valid code (a value moved then re-initialized in the body).
+                let can_throw = block_can_throw(body);
+                // Walk the body accumulating every move seen at any point: a throw
+                // can happen right after any statement, so the catch/finally must
+                // treat anything moved in the body as MaybeMoved even if a later
+                // statement re-initialized it (at the throw point the re-init had
+                // not run yet).
                 self.recoverable_depth += 1;
-                let body_result = self.check_block(body);
+                self.push_scope();
+                let mut throw_state = before.clone();
+                let mut body_result = Ok(());
+                for (index, stmt) in body.iter().enumerate() {
+                    body_result = self.check_stmt(stmt);
+                    if body_result.is_err() {
+                        break;
+                    }
+                    // The catch can only observe this point if a throw can still
+                    // happen from here — either inside this statement (its moves
+                    // precede the throw) or in a later one. Folding in every point
+                    // unconditionally poisoned values moved only after the last
+                    // throwing statement, which the catch could still read.
+                    if body[index..].iter().any(stmt_can_throw) {
+                        accumulate_throw_moves(&mut throw_state, &self.scopes);
+                    }
+                    if stmt_stops_fallthrough(stmt) {
+                        break;
+                    }
+                }
+                self.pop_scope();
                 self.recoverable_depth -= 1;
                 body_result?;
+                let end_state = self.scopes.clone();
+                // The state reaching the code after the try (before `finally`).
+                let mut after = end_state.clone();
                 if let Some(name) = catch_name {
+                    // Check the catch against the throw state (anything moved in the
+                    // body is MaybeMoved); if the body cannot throw this is dead code.
+                    self.scopes = throw_state.clone();
                     self.push_scope();
                     self.define(name.clone(), error_type(), false, *span)?;
+                    // Flag the binding so its (struct-backed) fields stay movable,
+                    // unlike a same-shaped user object literal.
+                    if let Some(scope) = self.scopes.last_mut() {
+                        if let Some(var) = scope.get_mut(name) {
+                            var.struct_backed = true;
+                        }
+                    }
                     for stmt in catch_body {
                         self.check_stmt(stmt)?;
                     }
                     self.pop_scope();
+                    let catch_end = self.scopes.clone();
+                    if can_throw {
+                        // Reached by the body completing OR the catch handling a throw.
+                        after = merge_moved_scopes(before.clone(), end_state.clone(), catch_end);
+                    }
                 }
+                // `finally` runs on every exit path. If the body can throw it also
+                // runs after a throw (before any re-initialization), so it — and the
+                // code after it — must see the throw state joined in.
+                self.scopes = if can_throw && !finally_body.is_empty() {
+                    merge_moved_scopes(before, after, throw_state)
+                } else {
+                    after
+                };
                 self.check_block(finally_body)
             }
             Stmt::Fail { value, span } => {
@@ -718,8 +1005,9 @@ impl Checker {
                 Ok(())
             }
             Stmt::Return { value, span } => {
+                let expected = self.current_return.clone();
                 let actual = match value {
-                    Some(value) => self.consume_expr(value)?,
+                    Some(value) => self.consume_expr_expecting(value, Some(&expected))?,
                     None => Type::Void,
                 };
                 if !type_matches(&self.current_return, &actual) {
@@ -935,7 +1223,7 @@ impl Checker {
                             }
                             let mut generic_bindings = HashMap::new();
                             for (arg, expected) in args.iter().zip(function.params.iter()) {
-                                let actual = self.consume_expr(arg)?;
+                                let actual = self.consume_arg_expr_expecting(arg, Some(expected))?;
                                 if !bind_generic_type(expected, &actual, &mut generic_bindings)
                                     || !type_matches(expected, &actual)
                                 {
@@ -1126,6 +1414,15 @@ impl Checker {
                         }
                     }
                     let target_type = self.check_expr(target)?;
+                    // Reading a field whose place — or an ancestor of it — was moved
+                    // out is a use-after-move. Only the exact path or an ancestor
+                    // blocks; a moved *descendant* does not, so resolving an
+                    // intermediate projection base (`config.user` on the way to
+                    // `config.user.age`) stays legal even when a sibling under it
+                    // was moved.
+                    if let PlaceClass::Movable(place) = self.classify_place(expr) {
+                        self.check_place_readable(&place, expr.span)?;
+                    }
                     match target_type {
                         Type::Unknown => Ok(Type::Unknown),
                         Type::Struct(struct_name) => {
@@ -1219,7 +1516,7 @@ impl Checker {
                                 value.span,
                             ));
                         };
-                        let actual = self.consume_expr(value)?;
+                        let actual = self.consume_expr_expecting(value, Some(expected))?;
                         if !type_matches(expected, &actual) {
                             return Err(type_error(value.span, expected, &actual));
                         }
@@ -1270,24 +1567,42 @@ impl Checker {
                         let target_type = self.check_expr(target)?;
                         if matches!(
                             target_type,
-                            Type::Object(_) | Type::StringMap | Type::DynamicObject
+                            Type::Object(_)
+                                | Type::StringMap
+                                | Type::DynamicObject
+                                | Type::KuValue
                         ) {
                             let index_type = self.check_expr(index)?;
-                            if index_type != Type::String {
+                            // A KuValue index accepts a str key (object member) or
+                            // an int key (array element); concrete objects/maps
+                            // require str keys.
+                            let key_ok = if target_type == Type::KuValue {
+                                index_type == Type::String || index_type == Type::Int
+                            } else {
+                                index_type == Type::String
+                            };
+                            if !key_ok {
                                 return Err(type_error(index.span, &Type::String, &index_type));
                             }
+                            // `obj[key]?` yields a KuValue — a first-class tagged
+                            // dynamic value, not the concrete field type. A
+                            // StringMap is homogeneous str, so it unwraps to str.
                             let value_type = match target_type {
-                                Type::Object(fields) => match &index.kind {
-                                    ExprKind::Literal(Literal::String(key)) => {
-                                        fields.get(key).cloned().unwrap_or(Type::Null)
-                                    }
-                                    _ => Type::Unknown,
-                                },
                                 Type::StringMap => Type::String,
-                                Type::DynamicObject => Type::Unknown,
-                                _ => unreachable!(),
+                                _ => Type::KuValue,
                             };
-                            return Ok(nullable_type(value_type));
+                            // `obj[key]?` unwraps a Result(missing_key): it needs a
+                            // Result return type or an enclosing try, and yields the
+                            // unwrapped value type (not a nullable).
+                            if !matches!(self.current_return, Type::Result(_))
+                                && self.recoverable_depth == 0
+                            {
+                                return Err(KuError::runtime(
+                                    "'?' requires a Result return type or an enclosing try block",
+                                    expr.span,
+                                ));
+                            }
+                            return Ok(value_type);
                         }
                     }
                     match self.consume_expr(inner)? {
@@ -1312,51 +1627,176 @@ impl Checker {
                     params,
                     return_type,
                     body,
-                } => {
-                    reject_duplicate_function_value_params(params)?;
-                    let params = params
-                        .iter()
-                        .map(|param| {
-                            Ok(FunctionValueParam {
-                                name: param.name.clone(),
-                                ty: param
-                                    .ty
-                                    .as_ref()
-                                    .map(|ty| self.resolve_type_name(ty, param.span))
-                                    .transpose()?,
-                            })
-                        })
-                        .collect::<KuResult<Vec<_>>>()?;
-                    let return_type = return_type
-                        .as_ref()
-                        .map(|ty| self.resolve_type_name(ty, expr.span).map(Box::new))
-                        .transpose()?;
-                    let arg_types = params
-                        .iter()
-                        .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
-                        .collect::<Vec<_>>();
-                    let saved_async_depth = self.async_depth;
-                    self.async_depth = 0;
-                    let body_result = self.check_function_value_body(
-                        &params,
-                        return_type.as_deref(),
-                        body,
-                        &arg_types,
-                        expr.span,
-                    );
-                    self.async_depth = saved_async_depth;
-                    body_result?;
-                    Ok(Type::FunctionValue {
-                        params,
-                        return_type,
-                        body: body.clone(),
-                        is_async: false,
-                    })
-                }
+                } => self.check_closure_literal(params, return_type.as_ref(), body, expr.span, None),
             }
         })();
         self.check_depth = self.check_depth.saturating_sub(1);
         result
+    }
+
+    /// Check a closure literal against an optional expected function type drawn
+    /// from context (a typed binding, a function-typed parameter, a `return`
+    /// position, or a struct field). The expected type only ever fills in
+    /// unannotated parameters and is validated against any explicit annotation:
+    ///
+    /// * rule 4 — with no expected function type, every parameter must be
+    ///   explicitly annotated, otherwise it is rejected;
+    /// * rule 6 — the expected type's parameter count must match exactly;
+    /// * rule 7 — an explicit annotation must agree with the expected type.
+    ///
+    /// Inference never looks at how the body uses a parameter.
+    fn check_closure_literal(
+        &mut self,
+        params: &[FunctionParam],
+        return_type: Option<&TypeName>,
+        body: &[Stmt],
+        span: Span,
+        expected: Option<&Type>,
+    ) -> KuResult<Type> {
+        reject_duplicate_function_value_params(params)?;
+
+        // Only a non-async function type from context supplies expected params.
+        let expected_fn = match expected {
+            Some(Type::FunctionValue {
+                params,
+                is_async: false,
+                ..
+            }) => Some(params.as_slice()),
+            _ => None,
+        };
+
+        // rule 6: the expected function type's arity must match exactly.
+        if let Some(expected_params) = expected_fn {
+            if expected_params.len() != params.len() {
+                return Err(KuError::runtime(
+                    format!(
+                        "closure has {} parameter(s) but the expected function type takes {}",
+                        params.len(),
+                        expected_params.len()
+                    ),
+                    span,
+                ));
+            }
+        }
+
+        let mut resolved_params = Vec::with_capacity(params.len());
+        for (index, param) in params.iter().enumerate() {
+            let expected_param = expected_fn
+                .and_then(|expected_params| expected_params.get(index))
+                .and_then(|param| param.ty.clone());
+            let ty = match &param.ty {
+                Some(annotation) => {
+                    let annotated = self.resolve_type_name(annotation, param.span)?;
+                    // rule 7: an explicit annotation must match the expected type.
+                    if let Some(expected_param) = &expected_param {
+                        if !type_matches(expected_param, &annotated) {
+                            return Err(type_error(param.span, expected_param, &annotated));
+                        }
+                    }
+                    Some(annotated)
+                }
+                None => match expected_param {
+                    Some(ty) => Some(ty),
+                    // rule 4: no annotation and no expected type from context.
+                    None => {
+                        return Err(KuError::runtime(
+                            "closure parameter needs a type annotation or an expected function type from context",
+                            param.span,
+                        ));
+                    }
+                },
+            };
+            resolved_params.push(FunctionValueParam {
+                name: param.name.clone(),
+                ty,
+            });
+        }
+
+        let own_return = return_type
+            .map(|ty| self.resolve_type_name(ty, span).map(Box::new))
+            .transpose()?;
+
+        let arg_types = resolved_params
+            .iter()
+            .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
+            .collect::<Vec<_>>();
+
+        let saved_async_depth = self.async_depth;
+        self.async_depth = 0;
+        let inferred = self.check_function_value_body(
+            &resolved_params,
+            own_return.as_deref(),
+            body,
+            &arg_types,
+            span,
+        );
+        self.async_depth = saved_async_depth;
+        let inferred = inferred?;
+
+        // The resulting function value's return type: an explicit annotation
+        // wins; otherwise always fold in the body-inferred return type. Inferring
+        // the *return* type from the body is legitimate and always done (rule 5
+        // only forbids reverse-inferring *parameter* types from the body). This
+        // lets `f = () => { return 5 }` resolve to `fn(): int`, which is what an
+        // owned function value needs to be stored, cloned, or compared.
+        let result_return = match own_return {
+            Some(return_type) => Some(return_type),
+            None => Some(Box::new(inferred)),
+        };
+
+        Ok(Type::FunctionValue {
+            params: resolved_params,
+            return_type: result_return,
+            body: body.to_vec(),
+            is_async: false,
+        })
+    }
+
+    /// Like [`check_expr`], but when `expr` is a closure literal the expected
+    /// function type from context is threaded into the closure check.
+    fn check_expr_expecting(&mut self, expr: &Expr, expected: Option<&Type>) -> KuResult<Type> {
+        if let ExprKind::Function {
+            params,
+            return_type,
+            body,
+        } = &expr.kind
+        {
+            return self.check_closure_literal(params, return_type.as_ref(), body, expr.span, expected);
+        }
+        self.check_expr(expr)
+    }
+
+    /// Like [`consume_expr`], but threads an expected function type into a
+    /// closure literal. A closure literal is a fresh value, so the ownership
+    /// move-tracking done by `consume_expr` never applies to it.
+    fn consume_expr_expecting(&mut self, expr: &Expr, expected: Option<&Type>) -> KuResult<Type> {
+        if matches!(expr.kind, ExprKind::Function { .. }) {
+            return self.check_expr_expecting(expr, expected);
+        }
+        self.consume_expr(expr)
+    }
+
+    /// Consume a call argument, but *borrow* function values instead of moving
+    /// them (Stage 6d: "call/pass borrows, store moves"). Handing a closure to a
+    /// higher-order function or invoking it must not consume the caller's binding
+    /// — only an explicit store (binding/field/array element/return) does. Every
+    /// other owned type keeps the normal move-on-pass behaviour.
+    fn consume_arg_expr_expecting(
+        &mut self,
+        expr: &Expr,
+        expected: Option<&Type>,
+    ) -> KuResult<Type> {
+        if let ExprKind::Variable(name) = &expr.kind {
+            if self.contains(name) {
+                let bound = self.get_allow_moved(name, expr.span)?.ty;
+                if matches!(bound, Type::FunctionValue { .. }) {
+                    // Borrow: verify the binding is still live (not moved-from)
+                    // but leave it usable for later calls/passes.
+                    return self.check_expr_expecting(expr, expected);
+                }
+            }
+        }
+        self.consume_expr_expecting(expr, expected)
     }
 
     fn check_binary(&self, op: BinaryOp, left: &Type, right: &Type, span: Span) -> KuResult<Type> {
@@ -1366,6 +1806,13 @@ impl Checker {
             }
             BinaryOp::Add if left == &Type::String && right == &Type::String => Ok(Type::String),
             BinaryOp::Equal | BinaryOp::NotEqual if type_matches(left, right) => Ok(Type::Bool),
+            // A KuValue is a first-class tagged value: `==` / `!=` compare it
+            // against anything (by tag + value); arithmetic stays rejected.
+            BinaryOp::Equal | BinaryOp::NotEqual
+                if left == &Type::KuValue || right == &Type::KuValue =>
+            {
+                Ok(Type::Bool)
+            }
             _ if left == &Type::Unknown || right == &Type::Unknown => Ok(Type::Unknown),
             BinaryOp::Add
             | BinaryOp::Subtract
@@ -1663,6 +2110,9 @@ impl Checker {
                     &config_type,
                 ));
             }
+            if matches!(name.as_str(), "service" | "server") {
+                validate_http_service_config_fields(&config_type, config.span)?;
+            }
         }
         Ok(Some(if name == "client" {
             http_client_type()
@@ -1697,6 +2147,9 @@ impl Checker {
                     &Type::Object(HashMap::new()),
                     &config_type,
                 ));
+            }
+            if name != "http.client" {
+                validate_http_service_config_fields(&config_type, config.span)?;
             }
         }
         Ok(if name == "http.client" {
@@ -1816,6 +2269,12 @@ impl Checker {
             return Err(KuError::runtime("match requires at least one arm", span));
         }
         let value_type = self.check_expr(value)?;
+        // Binding an owned enum payload MOVES it out of the scrutinee (the backend
+        // clears the slot), so a match that binds one consumes the scrutinee.
+        // Record that move after the arms are checked, so later uses (a second
+        // match, a clone, passing it on) are rejected instead of silently reading
+        // an emptied payload.
+        let consumes_scrutinee = self.match_consumes_scrutinee(&value_type, arms);
         let before_arms = self.scopes.clone();
         let mut arm_scopes = Vec::with_capacity(arms.len());
         let mut result_type = Type::Unknown;
@@ -1909,7 +2368,36 @@ impl Checker {
                 }
             }
         }
+        if consumes_scrutinee {
+            self.consume_expr(value)?;
+        }
         Ok(result_type)
+    }
+
+    /// True when matching `value` binds an owned enum payload — the backend moves
+    /// that payload out of the scrutinee, so the match consumes it.
+    fn match_consumes_scrutinee(&self, value_type: &Type, arms: &[MatchArm]) -> bool {
+        let Type::Enum(enum_name) = value_type else {
+            return false;
+        };
+        let Some(enum_type) = self.enums.get(enum_name) else {
+            return false;
+        };
+        arms.iter().any(|arm| {
+            let MatchPattern::EnumVariant {
+                variant, fields, ..
+            } = &arm.pattern
+            else {
+                return false;
+            };
+            let Some(field_types) = enum_type.variants.get(variant) else {
+                return false;
+            };
+            fields
+                .iter()
+                .zip(field_types)
+                .any(|(pat, ty)| matches!(pat, MatchPattern::Binding(_)) && self.is_owned_type(ty))
+        })
     }
 
     fn check_match_pattern(
@@ -2218,7 +2706,21 @@ impl Checker {
             if contains_task_type(&target_type) {
                 return Err(KuError::runtime("task values cannot be cloned", span));
             }
+            // `obj["key"]` erases its element type, so resolve the declared one —
+            // otherwise the clone the index rule tells the user to add is itself
+            // rejected, leaving no legal way to read an owned element.
+            let target_type = match target_type {
+                Type::Unknown => self
+                    .static_index_element_type(target)
+                    .unwrap_or(Type::Unknown),
+                other => other,
+            };
             if self.is_owned_type(&target_type) {
+                // Cloning reads the WHOLE value, so it must be fully live: a
+                // partially-moved struct would clone an already-emptied field.
+                if let PlaceClass::Movable(place) = self.classify_place(target) {
+                    self.check_place_fully_live(&place, span)?;
+                }
                 return Ok(Some(target_type));
             }
             return Err(KuError::runtime(
@@ -2264,6 +2766,7 @@ impl Checker {
             Type::String => "string",
             Type::Array(_) if name != "map" => "array",
             Type::Object(_) | Type::StringMap | Type::DynamicObject if name == "get_or" => "object",
+            Type::KuValue if name == "as_int" || name == "as_str" => "kuvalue",
             _ => return Ok(None),
         };
         let Some(signature) = metadata::dotted_signature(module, name) else {
@@ -2303,9 +2806,17 @@ impl Checker {
             return self.apply_object_get_or_signature(args, span);
         }
         expect_arg_count(&signature.name, args.len(), signature.args.len(), span)?;
+        let consuming = stdlib_consuming_args(&signature.name);
         let actuals = args
             .iter()
-            .map(|arg| self.check_expr(arg))
+            .enumerate()
+            .map(|(index, arg)| {
+                if consuming.contains(&index) {
+                    self.consume_expr(arg)
+                } else {
+                    self.check_expr(arg)
+                }
+            })
             .collect::<KuResult<Vec<_>>>()?;
         for (index, rule) in signature.args.iter().enumerate() {
             self.check_stdlib_arg(rule, index, args, &actuals)?;
@@ -2372,7 +2883,7 @@ impl Checker {
         match name {
             "http.text" | "http.html" => {
                 if args.len() == 1 {
-                    let body = self.check_expr(&args[0])?;
+                    let body = self.consume_expr(&args[0])?;
                     if body == Type::String {
                         Ok(http_response_type())
                     } else {
@@ -2380,7 +2891,7 @@ impl Checker {
                     }
                 } else if args.len() == 2 {
                     self.check_http_status_arg(&args[0])?;
-                    let body = self.check_expr(&args[1])?;
+                    let body = self.consume_expr(&args[1])?;
                     if body == Type::String {
                         Ok(http_response_type())
                     } else {
@@ -2395,11 +2906,11 @@ impl Checker {
             }
             "http.json" => {
                 if args.len() == 1 {
-                    self.check_expr(&args[0])?;
+                    self.consume_expr(&args[0])?;
                     Ok(http_response_type())
                 } else if args.len() == 2 {
                     self.check_http_status_arg(&args[0])?;
-                    self.check_expr(&args[1])?;
+                    self.consume_expr(&args[1])?;
                     Ok(http_response_type())
                 } else {
                     Err(KuError::runtime(
@@ -2422,7 +2933,7 @@ impl Checker {
             }
             "http.redirect" => {
                 if args.len() == 1 {
-                    let location = self.check_expr(&args[0])?;
+                    let location = self.consume_expr(&args[0])?;
                     if location == Type::String {
                         Ok(http_response_type())
                     } else {
@@ -2430,7 +2941,7 @@ impl Checker {
                     }
                 } else if args.len() == 2 {
                     self.check_http_status_arg(&args[0])?;
-                    let location = self.check_expr(&args[1])?;
+                    let location = self.consume_expr(&args[1])?;
                     if location == Type::String {
                         Ok(http_response_type())
                     } else {
@@ -2459,18 +2970,13 @@ impl Checker {
         if !type_matches(&Type::String, &key_type) {
             return Err(type_error(args[1].span, &Type::String, &key_type));
         }
-        let default_type = self.check_expr(&args[2])?;
+        // The default is stored into the returned value, so it is consumed.
+        let default_type = self.consume_expr(&args[2])?;
         match object_type {
-            Type::Object(fields) => {
-                let Some(key) = string_literal_value(&args[1]) else {
-                    let mut options = fields.values().cloned().collect::<Vec<_>>();
-                    options.push(default_type);
-                    return Ok(union_or_single(options));
-                };
-                Ok(fields.get(&key).cloned().unwrap_or(default_type))
-            }
+            // get_or on a dynamic object yields a KuValue (first-class tagged
+            // value); a StringMap is homogeneous str.
+            Type::Object(_) | Type::DynamicObject | Type::Unknown => Ok(Type::KuValue),
             Type::StringMap => Ok(union_or_single(vec![Type::String, default_type])),
-            Type::DynamicObject | Type::Unknown => Ok(Type::Unknown),
             actual => Err(type_error(args[0].span, &Type::DynamicObject, &actual)),
         }
     }
@@ -2496,6 +3002,7 @@ impl Checker {
             TypePattern::String => actual == &Type::String,
             TypePattern::Null => actual == &Type::Null,
             TypePattern::Unknown | TypePattern::Any => true,
+            TypePattern::KuValue => actual == &Type::KuValue,
             TypePattern::ArrayAny => matches!(actual, Type::Array(_)),
             TypePattern::ObjectAny => matches!(
                 actual,
@@ -2516,6 +3023,7 @@ impl Checker {
                 Type::Array(element) => self.type_matches_pattern(element, inner),
                 _ => false,
             },
+            TypePattern::Native(name) => matches!(actual, Type::Native(n) if n == name),
             TypePattern::ArrayElementOfArg(_)
             | TypePattern::ResultOf(_)
             | TypePattern::SameAsArg(_) => true,
@@ -2538,6 +3046,8 @@ impl Checker {
             ),
             TypePattern::ArrayOf(inner) => Type::Array(Box::new(self.pattern_expected_type(inner))),
             TypePattern::StringOrStringArray => Type::String,
+            TypePattern::KuValue => Type::KuValue,
+            TypePattern::Native(name) => Type::Native(name.to_string()),
             TypePattern::Unknown
             | TypePattern::Any
             | TypePattern::ArrayElementOfArg(_)
@@ -2557,6 +3067,8 @@ impl Checker {
             TypePattern::Bool => Ok(Type::Bool),
             TypePattern::String => Ok(Type::String),
             TypePattern::Null => Ok(Type::Null),
+            TypePattern::KuValue => Ok(Type::KuValue),
+            TypePattern::Native(name) => Ok(Type::Native(name.to_string())),
             TypePattern::Unknown | TypePattern::Any => Ok(Type::Unknown),
             TypePattern::ArrayAny => Ok(Type::Array(Box::new(Type::Unknown))),
             TypePattern::ObjectAny => Ok(Type::DynamicObject),
@@ -2617,7 +3129,18 @@ impl Checker {
                 target.span,
             ));
         };
-        let mapper_type = self.check_expr(&args[0])?;
+        // The mapper is called with one element, so an unannotated closure
+        // parameter is filled from the array's element type (the HOF context).
+        let expected_mapper = Type::FunctionValue {
+            params: vec![FunctionValueParam {
+                name: "arg0".to_string(),
+                ty: Some((*element).clone()),
+            }],
+            return_type: None,
+            body: Vec::new(),
+            is_async: false,
+        };
+        let mapper_type = self.check_expr_expecting(&args[0], Some(&expected_mapper))?;
         let Type::FunctionValue {
             params,
             return_type,
@@ -2667,7 +3190,8 @@ impl Checker {
         }
         let actual_arg_types = args
             .iter()
-            .map(|arg| self.consume_expr(arg))
+            .zip(params.iter())
+            .map(|(arg, param)| self.consume_arg_expr_expecting(arg, param.ty.as_ref()))
             .collect::<KuResult<Vec<_>>>()?;
         let mut arg_types = Vec::new();
         for ((param, actual), arg) in params.iter().zip(actual_arg_types.iter()).zip(args.iter()) {
@@ -2783,6 +3307,10 @@ impl Checker {
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
         self.loop_depth = 0;
         self.push_scope();
+        // Stage 6c-str: everything defined at or above this scope index is local to
+        // the closure body; anything below it is captured from an enclosing scope
+        // and may not be moved out (E0904).
+        self.closure_capture_boundaries.push(self.scopes.len() - 1);
 
         let result = (|| -> KuResult<Type> {
             for (param, ty) in params.iter().zip(arg_types.iter()) {
@@ -2809,6 +3337,25 @@ impl Checker {
             Ok(inferred_return)
         })();
 
+        // Every enclosing binding this closure reads is boxed into a shared cell
+        // that the closure loads from on each call. Moving such a binding in the
+        // outer scope empties the cell (the backend moves out of `(cell)->value`),
+        // so mark them and let `record_move` require an explicit clone instead.
+        if let Some(&boundary) = self.closure_capture_boundaries.last() {
+            let captured: Vec<String> = self.scopes[..boundary]
+                .iter()
+                .flat_map(|scope| scope.keys().cloned())
+                .filter(|name| function_body_uses_name(body, name))
+                .collect();
+            for scope in self.scopes[..boundary].iter_mut() {
+                for name in &captured {
+                    if let Some(var) = scope.get_mut(name) {
+                        var.captured = true;
+                    }
+                }
+            }
+        }
+        self.closure_capture_boundaries.pop();
         self.pop_scope();
         self.current_return = saved_return;
         self.loop_depth = saved_loop_depth;
@@ -2841,6 +3388,17 @@ impl Checker {
         let result = (|| -> KuResult<Type> {
             for (param, ty) in params.iter().zip(arg_types.iter()) {
                 self.define(param.name.clone(), ty.clone(), false, span)?;
+                // An HTTP handler's request is a native struct in the IR, so its
+                // fields are movable individually -- `http.text(req.body)` is the
+                // idiomatic handler body. Keying on `owner` keeps a user object of
+                // the same shape (passed to an async task) out of this.
+                if owner == "http handler" && *ty == http_request_type() {
+                    if let Some(scope) = self.scopes.last_mut() {
+                        if let Some(var) = scope.get_mut(&param.name) {
+                            var.struct_backed = true;
+                        }
+                    }
+                }
             }
 
             let mut inferred_return = Type::Null;
@@ -2973,8 +3531,12 @@ impl Checker {
     fn check_stmt_and_infer_return(&mut self, stmt: &Stmt) -> KuResult<Option<Type>> {
         match stmt {
             Stmt::Return { value, span } => {
+                let expected = self.current_return.clone();
                 let actual = match value {
-                    Some(value) => self.check_expr(value)?,
+                    // Returning an owned value moves it out; consuming here lets the
+                    // closure-body move checks (e.g. E0904 for a captured owned
+                    // value) fire, matching the top-level `return` path.
+                    Some(value) => self.consume_expr_expecting(value, Some(&expected))?,
                     None if self.current_return == Type::Void => Type::Void,
                     None => Type::Null,
                 };
@@ -3009,8 +3571,21 @@ impl Checker {
                 span,
             } => {
                 self.expect_condition(condition, *span)?;
+                // Check each branch from the pre-if move state, then merge the two
+                // resulting states per field path (`join_move_marks`). Without this
+                // the then-branch's moves would leak into the else-branch and past
+                // the `if`, and a path moved on only one branch would look
+                // definitely-moved instead of `MaybeMoved`.
+                let before = self.scopes.clone();
                 let then_return = self.check_block_and_infer_return(then_branch)?;
+                let then_scopes = self.scopes.clone();
+                self.scopes = before.clone();
                 let else_return = self.check_block_and_infer_return(else_branch)?;
+                let else_scopes = self.scopes.clone();
+                let then_falls = !block_stops_fallthrough(then_branch);
+                let else_falls = !block_stops_fallthrough(else_branch);
+                self.scopes =
+                    merge_if_scopes(before, then_scopes, else_scopes, then_falls, else_falls);
                 match (then_return, else_return) {
                     (Some(left), Some(right)) => {
                         Ok(Some(merge_return_types(&left, &right, *span)?))
@@ -3079,6 +3654,7 @@ impl Checker {
     }
 
     fn define(&mut self, name: String, ty: Type, mutable: bool, span: Span) -> KuResult<()> {
+        reject_reserved_name(&name, span)?;
         let scope = self.scopes.last_mut().expect("checker always has a scope");
         if scope.contains_key(&name) {
             return Err(KuError::runtime(
@@ -3086,14 +3662,7 @@ impl Checker {
                 span,
             ));
         }
-        scope.insert(
-            name,
-            VarType {
-                ty,
-                mutable,
-                moved: false,
-            },
-        );
+        scope.insert(name, VarType::live(ty, mutable));
         Ok(())
     }
 
@@ -3107,7 +3676,11 @@ impl Checker {
     fn get(&self, name: &str, span: Span) -> KuResult<VarType> {
         for scope in self.scopes.iter().rev() {
             if let Some(var) = scope.get(name) {
-                if var.moved {
+                // Whole-variable move only. A partially-moved variable can still be
+                // projected into for its live fields (`user.age` after `user.name`
+                // moved), so the partial read-block is enforced at the value node,
+                // not here where field-projection bases are also resolved.
+                if var.whole_move().is_some() {
                     return Err(KuError::runtime(
                         format!(
                             "use of moved value '{name}'; call '{name}.clone()' before moving when an explicit copy is required"
@@ -3139,44 +3712,253 @@ impl Checker {
     fn mark_initialized(&mut self, name: &str) {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(var) = scope.get_mut(name) {
-                var.moved = false;
+                // Reassigning the whole variable re-initializes every path.
+                var.reinit(&[]);
                 return;
             }
         }
     }
 
+    /// The type of a resolved movable place: the root variable's type projected
+    /// through its static field path. `None` if the path leaves struct territory
+    /// (which never happens for a place built by `classify_place`).
+    /// True when `root` names a `catch` error binding (its struct-backed fields
+    /// are movable, unlike a same-shaped user object literal).
+    fn is_struct_backed_binding(&self, root: &str) -> bool {
+        self.get_allow_moved(root, Span::default())
+            .map(|var| var.struct_backed)
+            .unwrap_or(false)
+    }
+
+    /// True when a field of the place `pp` is a movable struct field: `pp` is a
+    /// struct value, or it is the error binding itself (whose fields are
+    /// struct-backed at runtime).
+    fn field_is_movable(&self, pp: &PlacePath) -> bool {
+        matches!(self.place_type(pp), Some(Type::Struct(_)))
+            || (pp.path.is_empty() && self.is_struct_backed_binding(&pp.root))
+    }
+
+    fn place_type(&self, place: &PlacePath) -> Option<Type> {
+        let mut ty = self.get_allow_moved(&place.root, Span::default()).ok()?.ty;
+        for field in &place.path {
+            ty = match &ty {
+                Type::Struct(name) => self.structs.get(name)?.fields.get(field)?.clone(),
+                // A struct-backed object (a caught error, an HTTP request) projects
+                // through its declared shape too, so `req.params` resolves to the
+                // string map rather than stopping the walk.
+                Type::Object(fields) => fields.get(field)?.clone(),
+                _ => return None,
+            };
+        }
+        Some(ty)
+    }
+
+    /// Classify what kind of place an expression denotes, for move analysis:
+    ///   * `Movable` — a local variable or a chain of static struct fields rooted
+    ///     at one. These support path-level partial move (and the C backend can
+    ///     move-and-clear them).
+    ///   * `Index` — an array element or an object field/index. The backend cannot
+    ///     move-and-clear these, so moving an owned value here is rejected and an
+    ///     explicit `.clone()` (or `take`/`remove`) is required.
+    ///   * `Fresh` — a temporary that owns no other binding (a call result,
+    ///     literal, constructor, or `.clone()`); moving it tracks nothing.
+    fn classify_place(&self, expr: &Expr) -> PlaceClass {
+        match &expr.kind {
+            ExprKind::Variable(name) if self.contains(name) => {
+                PlaceClass::Movable(PlacePath {
+                    root: name.clone(),
+                    path: Vec::new(),
+                })
+            }
+            ExprKind::Field { target, name } => {
+                // `EnumName.Variant` is a constructor, not a projection.
+                if let ExprKind::Variable(enum_name) = &target.kind {
+                    if self.enums.contains_key(enum_name) {
+                        return PlaceClass::Fresh;
+                    }
+                }
+                match self.classify_place(target) {
+                    PlaceClass::Movable(pp) => {
+                        // A static field of a struct (or of the struct-backed catch
+                        // error object) is a movable place. A field of a user object
+                        // / string-map / dynamic object is a `KuObject` hash-map
+                        // entry the backend cannot move-and-clear, so it is an Index
+                        // place requiring `.clone()`.
+                        if self.field_is_movable(&pp) {
+                            let mut path = pp.path;
+                            path.push(name.clone());
+                            PlaceClass::Movable(PlacePath {
+                                root: pp.root,
+                                path,
+                            })
+                        } else {
+                            self.container_read_class(self.place_type(&pp))
+                        }
+                    }
+                    other => other,
+                }
+            }
+            ExprKind::Index { target, .. } | ExprKind::OptionalField { target, .. } => {
+                let container = match self.classify_place(target) {
+                    PlaceClass::Movable(pp) => self.place_type(&pp),
+                    _ => None,
+                };
+                self.container_read_class(container)
+            }
+            _ => PlaceClass::Fresh,
+        }
+    }
+
+    /// How reading an element out of `container` behaves in the native backend.
+    ///
+    /// Array elements are returned by `ku_array_get_*` as a shallow copy that still
+    /// aliases the container's buffer, so consuming one would double free — those
+    /// are `Index` places and require an explicit `.clone()`. Object, string-map and
+    /// dynamic-object lookups go through `ku_object_get_result` / `ku_http_map_get`,
+    /// which `ku_value_clone` the entry, so the read already yields an independent
+    /// value: consuming it moves nothing and is `Fresh`.
+    fn container_read_class(&self, container: Option<Type>) -> PlaceClass {
+        match container {
+            Some(Type::Object(_)) | Some(Type::StringMap) | Some(Type::DynamicObject) => {
+                PlaceClass::Fresh
+            }
+            Some(Type::String) => PlaceClass::Fresh,
+            _ => PlaceClass::Index,
+        }
+    }
+
+    /// The movable place an assignment target writes to, if it is a variable or a
+    /// static struct-field chain. Assigning it re-initializes that path.
+    fn assign_target_place(&self, target: &AssignTarget) -> Option<PlacePath> {
+        match target {
+            AssignTarget::Variable(name) if self.contains(name) => Some(PlacePath {
+                root: name.clone(),
+                path: Vec::new(),
+            }),
+            AssignTarget::Field { target, name } => match self.classify_place(target) {
+                PlaceClass::Movable(pp) => self.field_is_movable(&pp).then(|| {
+                    let mut path = pp.path;
+                    path.push(name.clone());
+                    PlacePath {
+                        root: pp.root,
+                        path,
+                    }
+                }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Re-initialize the place `place` after an assignment to it (`user.name = x`
+    /// makes `user.name` — and anything under it — live again).
+    fn reinit_place(&mut self, place: &PlacePath) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(var) = scope.get_mut(&place.root) {
+                var.reinit(&place.path);
+                return;
+            }
+        }
+    }
+
+    /// Reject reading `place` unless it is FULLY live: neither the place, nor an
+    /// ancestor, nor any descendant of it was moved. Used where the whole value is
+    /// consumed as a unit (e.g. `.clone()`), which a partial move invalidates.
+    fn check_place_fully_live(&self, place: &PlacePath, span: Span) -> KuResult<()> {
+        if let Ok(var) = self.get_allow_moved(&place.root, span) {
+            if let Some(mark) = var.read_block(&place.path) {
+                return Err(read_of_moved_error(&place.root, &place.path, mark, span));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject reading `place` when the exact path or an ancestor of it was moved
+    /// out (its value is gone). A moved descendant does not block — reading a
+    /// sibling field, or resolving an intermediate projection base, stays legal.
+    fn check_place_readable(&self, place: &PlacePath, span: Span) -> KuResult<()> {
+        let Ok(var) = self.get_allow_moved(&place.root, span) else {
+            return Ok(());
+        };
+        for (q, mark) in &var.moves {
+            if path_is_prefix(q, &place.path) {
+                return Err(read_of_moved_error(&place.root, &place.path, *mark, span));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record that the movable place `place` has been moved out. Enforces the
+    /// closure capture boundary (E0904) on the root and that the place is still
+    /// live (a double move / move-through-moved-parent is rejected).
+    fn record_move(&mut self, place: &PlacePath, span: Span) -> KuResult<()> {
+        let boundary = self.closure_capture_boundaries.last().copied();
+        for (index, scope) in self.scopes.iter_mut().enumerate().rev() {
+            if let Some(var) = scope.get_mut(&place.root) {
+                if let Some(boundary) = boundary {
+                    if index < boundary {
+                        return Err(KuError::runtime(
+                            format!(
+                                "cannot move captured owned value '{}' out of a closure; use '{}.clone()'",
+                                place.root, place.root
+                            ),
+                            span,
+                        ));
+                    }
+                }
+                if var.captured {
+                    return Err(KuError::runtime(
+                        format!(
+                            "cannot move '{}': a closure captured it, and the closure reads the same value; use '{}.clone()'",
+                            place.root, place.root
+                        ),
+                        span,
+                    ));
+                }
+                if var.read_block(&place.path).is_some() {
+                    return Err(move_of_moved_error(&place.root, &place.path, span));
+                }
+                var.mark_moved(place.path.clone(), MoveMark::Moved);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     fn consume_expr(&mut self, expr: &Expr) -> KuResult<Type> {
         let ty = self.check_expr(expr)?;
         if !self.is_owned_type(&ty) {
+            // Copy types (int/float/bool/null) and other non-owned reads never
+            // move, whatever place they come from.
             return Ok(ty);
         }
-        match &expr.kind {
-            ExprKind::Variable(name) => {
-                for scope in self.scopes.iter_mut().rev() {
-                    if let Some(var) = scope.get_mut(name) {
-                        var.moved = true;
-                        break;
-                    }
-                }
-            }
-            ExprKind::Field { .. } | ExprKind::Index { .. } => {
-                if enum_variant_path(expr).is_some() {
-                    return Ok(ty);
-                }
-                return Err(KuError::runtime(
-                    "cannot move an owned field or indexed element directly; assign clone() when an owned copy is required",
-                    expr.span,
-                ));
-            }
-            _ => {}
+        match self.classify_place(expr) {
+            PlaceClass::Movable(place) => self.record_move(&place, expr.span)?,
+            PlaceClass::Index => return Err(index_move_error(expr.span)),
+            PlaceClass::Fresh => {}
         }
         Ok(ty)
+    }
+
+    /// The declared type of `obj["key"]` when both the object's shape and the key
+    /// are known statically. `Type::DynamicObject` and computed keys stay unknown.
+    fn static_index_element_type(&mut self, expr: &Expr) -> Option<Type> {
+        let ExprKind::Index { target, index } = &expr.kind else {
+            return None;
+        };
+        let ExprKind::Literal(Literal::String(key)) = &index.kind else {
+            return None;
+        };
+        let Type::Object(fields) = self.check_expr(target).ok()? else {
+            return None;
+        };
+        fields.get(key.as_str()).cloned()
     }
 
     fn consume_await_task_expr(&mut self, expr: &Expr, await_span: Span) -> KuResult<Type> {
         if let ExprKind::Variable(name) = &expr.kind {
             let var = self.get_allow_moved(name, expr.span)?;
-            if var.moved && matches!(var.ty, Type::Task(_)) {
+            if var.whole_move().is_some() && matches!(var.ty, Type::Task(_)) {
                 return Err(KuError::runtime(
                     format!("task '{name}' has already been awaited"),
                     await_span,
@@ -3192,7 +3974,9 @@ impl Checker {
             | Type::Array(_)
             | Type::Object(_)
             | Type::StringMap
-            | Type::DynamicObject => true,
+            | Type::DynamicObject
+            // A native handle owns a C resource; it must be move-tracked and dropped.
+            | Type::Native(_) => true,
             Type::Struct(name) => {
                 self.structs.get(name).is_some_and(|layout| {
                     layout
@@ -3211,11 +3995,91 @@ impl Checker {
                 }) || self.enums.contains_key(name)
             }
             Type::Result(_) | Type::Task(_) => true,
+            // Stage 6d: a function value owns its captured environment (a
+            // ref-counted cell chain), so it is an owned type: `.clone()` bumps
+            // the env refcount, and storing one into a binding/field/array/return
+            // moves it. Calling or passing it as an argument only borrows (see
+            // `consume_arg_expr_expecting`).
+            Type::FunctionValue { .. } => true,
             Type::Union(types) => types.iter().any(|ty| self.is_owned_type(ty)),
             _ => false,
         }
     }
 
+    /// The move state after a loop, joining every way it can exit: running zero
+    /// times (`before`), falling through / the condition going false (`end`), and
+    /// each `break` point. A value moved on any reachable exit is (maybe) moved
+    /// after the loop.
+    fn after_loop_state(
+        &self,
+        before: Vec<HashMap<String, VarType>>,
+        end: Vec<HashMap<String, VarType>>,
+        breaks: Vec<Vec<HashMap<String, VarType>>>,
+    ) -> Vec<HashMap<String, VarType>> {
+        let mut exits = vec![before.clone(), end];
+        exits.extend(breaks);
+        merge_moved_scope_paths(before, &exits)
+    }
+
+    /// The move state at the top of a loop iteration. A loop with a back-edge can
+    /// carry a move from one iteration into the next, so any owned value moved in
+    /// the body is `MaybeMoved` at the top; the authoritative pass then rejects a
+    /// use before re-initialization (a loop-carried move) but accepts a value that
+    /// the body re-initializes at the top before using it. A loop that cannot
+    /// iterate (no back-edge) keeps the pre-loop state.
+    ///
+    /// This runs a throwaway pass over the body to discover its moves; its scope
+    /// mutations are rolled back and its errors ignored (the authoritative pass
+    /// re-checks the body and surfaces any real error).
+    fn compute_loop_top(
+        &mut self,
+        before: &[HashMap<String, VarType>],
+        body: &[Stmt],
+        loop_var: Option<(&str, &Type)>,
+    ) -> Vec<HashMap<String, VarType>> {
+        if !loop_body_has_backedge(body) {
+            return before.to_vec();
+        }
+        let saved = self.scopes.clone();
+        self.push_scope();
+        if let Some((name, ty)) = loop_var {
+            let _ = self.define(name.to_string(), ty.clone(), true, Span::default());
+        }
+        // The scan must run inside a loop context: without it `break`/`continue`
+        // fail as "outside loop", and treating that as the end of the body hides
+        // every move after them — which is how a loop-carried move slipped past.
+        self.loop_depth += 1;
+        self.loop_break_states.push(Vec::new());
+        self.loop_continue_states.push(Vec::new());
+        for stmt in body {
+            // A statement that fails to check may still have been a move, and the
+            // statements after it certainly can be, so keep scanning. Errors here
+            // are not reported; the authoritative pass re-checks the body.
+            let _ = self.check_stmt(stmt);
+            if stmt_stops_fallthrough(stmt) {
+                break;
+            }
+        }
+        self.loop_break_states.pop();
+        let continues = self.loop_continue_states.pop().unwrap_or_default();
+        self.loop_depth -= 1;
+        self.pop_scope();
+        let end_of_body = self.scopes.clone();
+        self.scopes = saved;
+        // The top of an iteration is reached either on the first iteration
+        // (pre-loop state) or via the back-edge (end-of-body state). Join them:
+        // a value moved in the body without re-initialization is MaybeMoved at the
+        // top (a loop-carried move); a value re-initialized before the end of the
+        // body is live again at the top, so re-using it next iteration is fine.
+        // `continue` paths reach the top too, so they join in the same way.
+        let mut top = merge_moved_scopes(before.to_vec(), before.to_vec(), end_of_body);
+        for state in continues {
+            top = merge_moved_scopes(before.to_vec(), top, state);
+        }
+        top
+    }
+
+    #[allow(dead_code)]
     fn reject_loop_carried_moves(
         &self,
         before: &[HashMap<String, VarType>],
@@ -3226,7 +4090,10 @@ impl Checker {
                 let Some(after_var) = after_scope.get(name) else {
                     continue;
                 };
-                if !before_var.moved && after_var.moved && self.is_owned_type(&before_var.ty) {
+                if !before_var.any_moved()
+                    && after_var.any_moved()
+                    && self.is_owned_type(&before_var.ty)
+                {
                     return Err(KuError::runtime(
                         format!(
                             "cannot move outer owned value '{name}' from a loop body because a later iteration would reuse a moved value; use '{name}.clone()' or reinitialize it on every path"
@@ -3440,17 +4307,65 @@ fn string_literal_value(expr: &Expr) -> Option<String> {
     }
 }
 
-fn nullable_type(value: Type) -> Type {
-    match value {
-        Type::Null => Type::Null,
-        Type::Union(mut types) => {
-            if !types.contains(&Type::Null) {
-                types.push(Type::Null);
-            }
-            Type::Union(types)
-        }
-        other => Type::Union(vec![other, Type::Null]),
+/// Identifiers starting with `__ku_` belong to the native C backend, which emits
+/// helpers and block-scoped temporaries under that prefix. A user binding of the
+/// same name is silently shadowed in the generated C — `__ku_p` printed an empty
+/// string and `__ku_store` crashed — so the checker reserves the prefix outright.
+/// Argument positions where a stdlib/builtin call takes ownership of its argument,
+/// mirroring the `c_value_expr` (move-and-clear) sites in the native C backend. The
+/// checker must record a move at exactly these positions: recording none let the
+/// backend move a value the checker still believed live (silent emptying), and let
+/// an array/object element be moved out by indexing (aliasing double free).
+///
+/// Everything absent from this table borrows — `println(x)`, `len(x)`, `x.trim()`,
+/// and every read-only receiver keep their argument usable.
+fn stdlib_consuming_args(name: &str) -> &'static [usize] {
+    match name {
+        // The value is wrapped into the Result and handed to the caller.
+        "ok" | "err" => &[0],
+        "json.stringify" => &[0],
+        "kuvalue.as_int" | "kuvalue.as_str" => &[0],
+        // Closing consumes (and frees) the connection; a later use must be rejected.
+        // pg.query / pg.rows / pg.value only borrow their handle.
+        "pg.close" | "pg.pool_close" | "redis.close" | "mysql.close" => &[0],
+        _ => &[],
     }
+}
+
+/// An owned element cannot be moved out of an array by indexing: `ku_array_get_*`
+/// returns a shallow copy that still aliases the container's buffer, and there is
+/// no way to clear the slot it came from.
+///
+/// The remedy is `.clone()`. Ku has no `array.take(index)` yet, so the message must
+/// not advertise one — a user following that advice hits "no such method".
+fn index_move_error(span: Span) -> KuError {
+    KuError::runtime(
+        "cannot move an owned value out of an array by indexing; add '.clone()' for an independent copy"
+            .to_string(),
+        span,
+    )
+}
+
+fn reject_reserved_name(name: &str, span: Span) -> KuResult<()> {
+    // Import expansion renames a module's items into the reserved namespace after
+    // parsing, so those synthesized names reach the checker too. They cannot collide
+    // with backend temporaries, and a user who writes one anyway hits the loud
+    // "top-level name is already defined" error.
+    if EXPANDER_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return Ok(());
+    }
+    if name.starts_with(RESERVED_NAME_PREFIX) {
+        return Err(KuError::runtime(
+            format!(
+                "name '{name}' is reserved: identifiers starting with '{RESERVED_NAME_PREFIX}' are used by the compiler"
+            ),
+            span,
+        ));
+    }
+    Ok(())
 }
 
 fn bind_generic_type(expected: &Type, actual: &Type, bindings: &mut HashMap<String, Type>) -> bool {
@@ -3957,6 +4872,7 @@ fn error_type() -> Type {
     ]))
 }
 
+
 fn type_name(ty: &Type) -> String {
     match ty {
         Type::Int => "int".to_string(),
@@ -3971,8 +4887,10 @@ fn type_name(ty: &Type) -> String {
         Type::Object(_) => "object".to_string(),
         Type::StringMap => "object".to_string(),
         Type::DynamicObject => "object".to_string(),
+        Type::KuValue => "KuValue".to_string(),
         Type::Struct(name) => name.clone(),
         Type::Enum(name) => name.clone(),
+        Type::Native(name) => name.trim_start_matches("__ku_").to_string(),
         Type::Generic(name) => name.clone(),
         Type::Void => "void".to_string(),
         Type::FunctionValue {
@@ -4070,6 +4988,93 @@ fn can_template_concat(left: &Type, right: &Type) -> bool {
     )
 }
 
+/// Dataflow join of a projection path's move mark across control-flow branches.
+/// `branch_marks[i]` is the path's mark in branch `i` (`None` = live there).
+/// The path is `Moved` only when it is definitely `Moved` in *every* branch;
+/// moved on some paths (or `MaybeMoved` in any) yields `MaybeMoved`; live in all
+/// yields `None`.
+fn join_move_marks(branch_marks: &[Option<MoveMark>]) -> Option<MoveMark> {
+    let branch_count = branch_marks.len();
+    let present = branch_marks.iter().filter(|m| m.is_some()).count();
+    if present == 0 {
+        return None;
+    }
+    if present == branch_count
+        && branch_marks
+            .iter()
+            .all(|m| *m == Some(MoveMark::Moved))
+    {
+        Some(MoveMark::Moved)
+    } else {
+        Some(MoveMark::MaybeMoved)
+    }
+}
+
+/// Merge the per-path move state of one variable across the branch scopes.
+fn merge_var_moves(var: &mut VarType, branch_moves: &[Option<&BTreeMap<Vec<String>, MoveMark>>]) {
+    let mut paths: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
+    for moves in branch_moves.iter().flatten() {
+        paths.extend(moves.keys().cloned());
+    }
+    let mut merged = BTreeMap::new();
+    for path in paths {
+        let marks: Vec<Option<MoveMark>> = branch_moves
+            .iter()
+            .map(|moves| moves.and_then(|m| m.get(&path)).copied())
+            .collect();
+        if let Some(mark) = join_move_marks(&marks) {
+            merged.insert(path, mark);
+        }
+    }
+    var.moves = merged;
+}
+
+/// Fold every move seen so far in a `try` body into the throw state: a throw can
+/// occur after any statement, so any path moved at any point is `MaybeMoved` for
+/// the catch (a later re-initialization in the body had not run yet at the throw
+/// point). `acc` holds the outer scopes only (the try body's own scope is not
+/// merged — its locals do not escape).
+fn accumulate_throw_moves(
+    acc: &mut [HashMap<String, VarType>],
+    current: &[HashMap<String, VarType>],
+) {
+    for (index, scope) in acc.iter_mut().enumerate() {
+        for (name, var) in scope.iter_mut() {
+            let Some(cur) = current.get(index).and_then(|s| s.get(name)) else {
+                continue;
+            };
+            for path in cur.moves.keys() {
+                var.moves
+                    .entry(path.clone())
+                    .or_insert(MoveMark::MaybeMoved);
+            }
+        }
+    }
+}
+
+/// Merge the two branch states of an `if` into the state that reaches the code
+/// after it. A branch that DIVERGES (ends in `return`/`break`/`continue`/`fail`/
+/// `panic`) never falls through, so its moves must not reach the fall-through
+/// path — only the state(s) that can actually reach the join contribute. Without
+/// this a guard clause like `if (bad) { take(x); return }` would poison `x` for
+/// the code after the `if`, where `x` is in fact still live.
+fn merge_if_scopes(
+    before: Vec<HashMap<String, VarType>>,
+    then_scopes: Vec<HashMap<String, VarType>>,
+    else_scopes: Vec<HashMap<String, VarType>>,
+    then_falls: bool,
+    else_falls: bool,
+) -> Vec<HashMap<String, VarType>> {
+    match (then_falls, else_falls) {
+        (true, true) => merge_moved_scopes(before, then_scopes, else_scopes),
+        (true, false) => then_scopes,
+        (false, true) => else_scopes,
+        // Both branches diverge: the code after the `if` is unreachable. Keep the
+        // pre-`if` state so it is checked as if the branches never ran.
+        (false, false) => before,
+    }
+}
+
 fn merge_moved_scopes(
     mut base: Vec<HashMap<String, VarType>>,
     then_scopes: Vec<HashMap<String, VarType>>,
@@ -4077,15 +5082,15 @@ fn merge_moved_scopes(
 ) -> Vec<HashMap<String, VarType>> {
     for (index, scope) in base.iter_mut().enumerate() {
         for (name, var) in scope.iter_mut() {
-            let moved_then = then_scopes
+            let then_moves = then_scopes
                 .get(index)
                 .and_then(|scope| scope.get(name))
-                .is_some_and(|value| value.moved);
-            let moved_else = else_scopes
+                .map(|value| &value.moves);
+            let else_moves = else_scopes
                 .get(index)
                 .and_then(|scope| scope.get(name))
-                .is_some_and(|value| value.moved);
-            var.moved = moved_then || moved_else;
+                .map(|value| &value.moves);
+            merge_var_moves(var, &[then_moves, else_moves]);
         }
     }
     base
@@ -4097,11 +5102,15 @@ fn merge_moved_scope_paths(
 ) -> Vec<HashMap<String, VarType>> {
     for (index, scope) in base.iter_mut().enumerate() {
         for (name, var) in scope.iter_mut() {
-            var.moved = paths.iter().any(|path| {
-                path.get(index)
-                    .and_then(|scope| scope.get(name))
-                    .is_some_and(|value| value.moved)
-            });
+            let branch_moves: Vec<Option<&BTreeMap<Vec<String>, MoveMark>>> = paths
+                .iter()
+                .map(|path| {
+                    path.get(index)
+                        .and_then(|scope| scope.get(name))
+                        .map(|value| &value.moves)
+                })
+                .collect();
+            merge_var_moves(var, &branch_moves);
         }
     }
     base
@@ -4173,6 +5182,121 @@ fn stmt_stops_fallthrough(stmt: &Stmt) -> bool {
                 && block_stops_fallthrough(then_branch)
                 && block_stops_fallthrough(else_branch)
         }
+        // `while (true) { ... }` with no `break` that exits it never falls through.
+        Stmt::While { condition, body, .. } => {
+            matches!(&condition.kind, ExprKind::Literal(Literal::Bool(true)))
+                && !block_has_own_break(body)
+        }
+        _ => false,
+    }
+}
+
+/// True when executing `body` can throw a recoverable error (a `fail` statement
+/// or a `?` on a Result) that would reach an enclosing `catch`. A `?`/`fail`
+/// inside a nested `try` that has its own `catch` is absorbed there; one inside a
+/// nested closure belongs to that closure, not here.
+fn block_can_throw(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_can_throw)
+}
+
+fn stmt_can_throw(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Fail { .. } => true,
+        Stmt::VarDecl { value, .. } | Stmt::Assign { value, .. } => expr_can_throw(value),
+        Stmt::AssignTarget { value, .. } | Stmt::CompoundAssign { value, .. } => {
+            expr_can_throw(value)
+        }
+        Stmt::Expr { expr, .. } | Stmt::Print { value: expr, .. } | Stmt::Panic { value: expr, .. } => {
+            expr_can_throw(expr)
+        }
+        Stmt::Return { value, .. } => value.as_ref().is_some_and(expr_can_throw),
+        Stmt::DestructureAssign { values, .. } => values.iter().any(expr_can_throw),
+        Stmt::ObjectDestructureAssign { value, .. } => expr_can_throw(value),
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_can_throw(condition)
+                || block_can_throw(then_branch)
+                || block_can_throw(else_branch)
+        }
+        Stmt::While { condition, body, .. } => {
+            expr_can_throw(condition) || block_can_throw(body)
+        }
+        Stmt::For { iterable, body, .. } => expr_can_throw(iterable) || block_can_throw(body),
+        // A nested `try` absorbs its body's throws only when it has a catch; its
+        // catch and finally can still throw onward.
+        Stmt::Try {
+            body,
+            catch_name,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            (catch_name.is_none() && block_can_throw(body))
+                || block_can_throw(catch_body)
+                || block_can_throw(finally_body)
+        }
+        _ => false,
+    }
+}
+
+fn expr_can_throw(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::TryUnwrap { .. } => true,
+        ExprKind::Unary { expr, .. } => expr_can_throw(expr),
+        ExprKind::Binary { left, right, .. } => expr_can_throw(left) || expr_can_throw(right),
+        ExprKind::Call { callee, args } => {
+            expr_can_throw(callee) || args.iter().any(expr_can_throw)
+        }
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            expr_can_throw(target)
+        }
+        ExprKind::Index { target, index } => expr_can_throw(target) || expr_can_throw(index),
+        ExprKind::Array(values) => values.iter().any(expr_can_throw),
+        ExprKind::ObjectLiteral { fields } => fields.iter().any(|(_, v)| expr_can_throw(v)),
+        ExprKind::StructLiteral { fields, .. } => fields.iter().any(|(_, v)| expr_can_throw(v)),
+        ExprKind::Match { value, arms } => {
+            expr_can_throw(value)
+                || arms.iter().any(|arm| {
+                    expr_can_throw(&arm.value)
+                        || arm.guard.as_ref().is_some_and(expr_can_throw)
+                })
+        }
+        ExprKind::Await(inner) => expr_can_throw(inner),
+        // A closure body's `?` belongs to the closure, not to the enclosing try.
+        _ => false,
+    }
+}
+
+/// True when `body` contains a `break` that would exit the enclosing loop (a
+/// `break` inside a NESTED loop targets that loop, not this one, so nested loops
+/// are not descended into).
+fn block_has_own_break(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_has_own_break)
+}
+
+fn stmt_has_own_break(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Break { .. } => true,
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => block_has_own_break(then_branch) || block_has_own_break(else_branch),
+        Stmt::Try {
+            body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            block_has_own_break(body)
+                || block_has_own_break(catch_body)
+                || block_has_own_break(finally_body)
+        }
+        // Nested loops capture their own `break`.
         _ => false,
     }
 }
@@ -4300,6 +5424,43 @@ fn http_client_type() -> Type {
         ("timeout_ms".to_string(), Type::Int),
         ("max_body_bytes".to_string(), Type::Int),
     ]))
+}
+
+/// The config fields `http.server`/`http.service` accepts, kept in one place so the
+/// checker's unknown-field rejection stays aligned with the interpreter's
+/// `server_config_value` reader and the native backend's `ku_http_server_new_cfg`.
+const HTTP_SERVICE_CONFIG_FIELDS: [&str; 10] = [
+    "read_header_timeout_ms",
+    "read_body_timeout_ms",
+    "write_timeout_ms",
+    "idle_timeout_ms",
+    "handler_timeout_ms",
+    "max_body_bytes",
+    "max_header_bytes",
+    "max_connections",
+    "max_active_requests",
+    "max_pending_requests",
+];
+
+/// Reject an `http.server({...})` / `http.service({...})` config object literal that
+/// carries a field the server does not understand. Only statically-known object
+/// shapes are checked; `DynamicObject`/`Unknown` are passed through unchecked.
+fn validate_http_service_config_fields(config_type: &Type, span: Span) -> KuResult<()> {
+    let Type::Object(fields) = config_type else {
+        return Ok(());
+    };
+    let mut unknown: Vec<&String> = fields
+        .keys()
+        .filter(|key| !HTTP_SERVICE_CONFIG_FIELDS.contains(&key.as_str()))
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(KuError::runtime(
+            format!("unknown http config field '{key}'"),
+            span,
+        ));
+    }
+    Ok(())
 }
 
 fn http_service_type() -> Type {

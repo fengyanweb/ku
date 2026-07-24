@@ -46,7 +46,7 @@
       "patterns": [
         { "name": "entity.name.function.ku", "match": "(?<=\\bfn\\s)[A-Za-z_][A-Za-z0-9_]*" },
         { "name": "support.function.builtin.ku", "match": "\\b(len|str|ok|err|println)\\b(?=\\s*\\()" },
-        { "name": "support.function.stdlib.ku", "match": "\\b(string|array|json|time|lexer|parser|fs|http|config|task)\\.[A-Za-z_][A-Za-z0-9_]*\\b" }
+        { "name": "support.function.stdlib.ku", "match": "\\b(string|array|object|json|time|lexer|parser|fs|http|config|task|pg|redis|mysql)\\.[A-Za-z_][A-Za-z0-9_]*\\b" }
       ]
     },
     "constants": {

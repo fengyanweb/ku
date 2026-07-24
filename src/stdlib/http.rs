@@ -23,6 +23,12 @@ const DEFAULT_IDLE_TIMEOUT_MS: i64 = 5_000;
 const DEFAULT_HANDLER_TIMEOUT_MS: i64 = 15_000;
 const DEFAULT_MAX_ACTIVE_REQUESTS: i64 = 256;
 const DEFAULT_MAX_PENDING_REQUESTS: i64 = 1024;
+/// Longest accepted request target (the `/path?query` token of the request line).
+/// A target over this is answered with 414 before it is copied or routed -- it is
+/// never truncated, because truncating would let two distinct long paths collide
+/// on the same route. Deliberately a fixed limit, not a service config field.
+/// The native backend pins the same value (`KU_HTTP_MAX_TARGET`).
+pub const MAX_REQUEST_TARGET_BYTES: usize = 8192;
 
 static DEFAULT_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 

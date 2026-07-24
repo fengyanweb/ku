@@ -23,7 +23,11 @@ use crate::{
 
 const KU_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SOURCE_BYTES: u64 = 1_000_000;
-const INTERPRETER_STACK_SIZE: usize = 8 * 1024 * 1024;
+// Large enough that the MAX_CALL_DEPTH=512 guard trips (a clean Ku runtime
+// error) before the interpreter's own Rust eval recursion overflows the OS
+// thread stack. ~16KB of Rust stack per Ku call frame; 64MB clears 512 with
+// wide margin. Reserved address space on Windows, not committed memory.
+const INTERPRETER_STACK_SIZE: usize = 64 * 1024 * 1024;
 const HELP: &str = "\
 ku - simple, small, fast language tool
 
@@ -124,10 +128,28 @@ pub fn run_cli(args: Vec<String>) -> Result<(), KuError> {
         }
         Some("build") => {
             if args.get(2).is_some_and(|arg| arg == "--native") {
-                let path = exact_path_at(&args, "build --native", 3)?;
-                let source = read_ku_file(path)?;
-                let output = build_native_c(path, &source)?;
-                println!("native c ok: {}", output.display());
+                // With -o/--output, `ku build --native <file> -o <out>` produces a
+                // standalone native binary (identical to `--backend c`). Without an
+                // output path it stays the compatibility form that only emits C.
+                let wants_binary = args
+                    .iter()
+                    .skip(3)
+                    .any(|arg| arg == "-o" || arg == "--output");
+                if wants_binary {
+                    let mut rewritten = vec![
+                        args[0].clone(),
+                        "build".to_string(),
+                        "--backend".to_string(),
+                        "c".to_string(),
+                    ];
+                    rewritten.extend(args.iter().skip(3).cloned());
+                    run_build_command(&rewritten)?;
+                } else {
+                    let path = exact_path_at(&args, "build --native", 3)?;
+                    let source = read_ku_file(path)?;
+                    let output = build_native_c(path, &source)?;
+                    println!("native c ok: {}", output.display());
+                }
             } else {
                 run_build_command(&args)?;
             }
@@ -486,7 +508,7 @@ fn main(): null! {
             msg: "ok",
             data: {
                 id: req.params.id.clone(),
-                q: req.query["q"]?,
+                q: req.query.get_or("q", ""),
                 method: req.method.clone()
             }
         })
@@ -677,6 +699,15 @@ impl BuildProfile {
             Self::Release => Some("2"),
             Self::Small => Some("s"),
             Self::Fast => Some("3"),
+        }
+    }
+
+    fn msvc_opt_flag(self) -> Option<&'static str> {
+        match self {
+            Self::Debug => None,
+            Self::Release => Some("/O2"),
+            Self::Small => Some("/O1"),
+            Self::Fast => Some("/O2"),
         }
     }
 }
@@ -1282,6 +1313,100 @@ fn write_llvm_ir_to(path: &str, source: &str, output: &Path) -> Result<PathBuf, 
     write_text_artifact(output, llvm_ir)
 }
 
+/// True when the generated C source includes winsock (a native HTTP program).
+/// Detected from the emitted `<winsock2.h>` include so the linker gets `ws2_32`.
+fn source_needs_winsock(source: &Path) -> bool {
+    fs::read_to_string(source)
+        .map(|text| text.contains("winsock2.h"))
+        .unwrap_or(false)
+}
+
+/// True when the generated C links libpq (a `std.pg` program). Detected from the
+/// `#pragma comment(lib, "libpq.lib")` the backend emits, so the CLI can add the
+/// library search path MSVC needs to resolve it.
+fn source_needs_libpq(source: &Path) -> bool {
+    fs::read_to_string(source)
+        .map(|text| text.contains("libpq.lib"))
+        .unwrap_or(false)
+}
+
+/// True when the generated C links libmysqlclient (a `std.mysql` program).
+fn source_needs_libmysql(source: &Path) -> bool {
+    fs::read_to_string(source)
+        .map(|text| text.contains("libmysql.lib"))
+        .unwrap_or(false)
+}
+
+/// The directory holding `libmysql.lib`. Resolution order: `KU_MYSQL_LIB` env var,
+/// then the common Windows `MySQL Server */lib` install location.
+fn detect_libmysql_dir() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("KU_MYSQL_LIB") {
+        let dir = PathBuf::from(dir);
+        if dir.join("libmysql.lib").exists() {
+            return Some(dir);
+        }
+    }
+    for base in [
+        r"C:\Program Files\MySQL",
+        r"D:\Program Files\MySQL",
+    ] {
+        if let Ok(entries) = fs::read_dir(base) {
+            let mut dirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path().join("lib"))
+                .filter(|lib| lib.join("libmysql.lib").exists())
+                .collect();
+            dirs.sort();
+            if let Some(dir) = dirs.pop() {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// The directory holding `libpq.lib`, so MSVC can find it (libpq is not on the
+/// default library path). Resolution order: `KU_PG_LIB` env var, then
+/// `pg_config --libdir`, then the common Windows install location. Returns `None`
+/// if none resolve — the build then relies on the linker's default path.
+fn detect_libpq_dir() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("KU_PG_LIB") {
+        let dir = PathBuf::from(dir);
+        if dir.join("libpq.lib").exists() {
+            return Some(dir);
+        }
+    }
+    if let Ok(output) = Command::new("pg_config").arg("--libdir").output() {
+        if output.status.success() {
+            let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !dir.is_empty() {
+                let dir = PathBuf::from(dir);
+                if dir.join("libpq.lib").exists() {
+                    return Some(dir);
+                }
+            }
+        }
+    }
+    for candidate in [
+        r"C:\Program Files\PostgreSQL",
+        r"D:\Program Files\PostgreSQL",
+    ] {
+        if let Ok(entries) = fs::read_dir(candidate) {
+            // Prefer the highest version directory that actually has libpq.lib.
+            let mut dirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path().join("lib"))
+                .filter(|lib| lib.join("libpq.lib").exists())
+                .collect();
+            dirs.sort();
+            if let Some(dir) = dirs.pop() {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
 fn compile_c_source(
     source: &Path,
     output: &Path,
@@ -1298,6 +1423,11 @@ fn compile_c_source(
             ))
         })?;
     }
+    // Stage 8a: a native HTTP program pulls in winsock. MSVC auto-links via the
+    // `#pragma comment(lib, "ws2_32.lib")` the backend emits, but gcc/clang/zig
+    // need `-lws2_32` on the command line. Only for a native (host) build — winsock
+    // does not exist on the cross targets, and such programs are Windows-only.
+    let needs_winsock = target.is_none() && source_needs_winsock(source);
     let mut tried = Vec::new();
     let env_cc = env::var("KU_CC").ok();
     for candidate in c_compiler_candidates(env_cc.as_deref()) {
@@ -1323,6 +1453,9 @@ fn compile_c_source(
         if static_link {
             command.arg("-static");
         }
+        if needs_winsock {
+            command.arg("-lws2_32");
+        }
         if verbose {
             println!("c compiler command: {command:?}");
         }
@@ -1344,10 +1477,213 @@ fn compile_c_source(
             }
         }
     }
+    // No GCC-style compiler found. On Windows, fall back to a native MSVC (cl.exe)
+    // toolchain located via vswhere and driven through vcvars64.bat. Only for the
+    // native target; cross builds still require zig/clang.
+    if target.is_none() {
+        if let Some(vcvars) = detect_msvc_vcvars() {
+            tried.push("cl (MSVC)".to_string());
+            return compile_with_msvc(&vcvars, source, output, profile, static_link, verbose);
+        }
+    }
     Err(KuError::message(format!(
-        "C compiler not found for native build\nhelp: install clang/gcc/zig, set KU_CC, or use default `ku build`; tried {}",
+        "C compiler not found for native build\nhelp: install clang/gcc/zig or Visual Studio (MSVC), set KU_CC, or use default `ku build`; tried {}",
         tried.join(", ")
     )))
+}
+
+/// Locate a native MSVC toolchain by asking vswhere for the latest install that
+/// carries the VC C/C++ tools, then returning its `vcvars64.bat`. Returns `None`
+/// when vswhere or Visual Studio is absent (e.g. non-Windows hosts).
+fn detect_msvc_vcvars() -> Option<PathBuf> {
+    let program_files_x86 = env::var("ProgramFiles(x86)")
+        .or_else(|_| env::var("ProgramFiles"))
+        .ok()?;
+    let vswhere = Path::new(&program_files_x86)
+        .join("Microsoft Visual Studio")
+        .join("Installer")
+        .join("vswhere.exe");
+    if !vswhere.exists() {
+        return None;
+    }
+    let output = Command::new(&vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let install = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if install.is_empty() {
+        return None;
+    }
+    let vcvars = Path::new(&install)
+        .join("VC")
+        .join("Auxiliary")
+        .join("Build")
+        .join("vcvars64.bat");
+    vcvars.exists().then_some(vcvars)
+}
+
+/// Compile a generated C source with MSVC `cl.exe`. cl needs INCLUDE/LIB/PATH
+/// from `vcvars64.bat`, so we snapshot that environment once and inject it into
+/// the cl process directly (no `cmd`, which cannot handle the `\\?\` verbatim
+/// paths that `fs::canonicalize` produces). `/utf-8` keeps diagnostics readable
+/// regardless of the console code page.
+fn compile_with_msvc(
+    vcvars: &Path,
+    source: &Path,
+    output: &Path,
+    profile: BuildProfile,
+    static_link: bool,
+    verbose: bool,
+) -> Result<(), KuError> {
+    let env = load_vcvars_env(vcvars)?;
+    let cl = find_cl_in_env(&env).ok_or_else(|| {
+        KuError::message(
+            "located Visual Studio but cl.exe was not on the vcvars PATH\nhelp: repair the \"Desktop development with C++\" workload, or install clang/gcc/zig and set KU_CC",
+        )
+    })?;
+
+    // cl and cmd both dislike \\?\ verbatim paths; hand cl plain absolute paths.
+    let source = strip_verbatim(source);
+    let output = strip_verbatim(output);
+    let obj = output.with_extension("obj");
+
+    let mut command = Command::new(&cl);
+    command.env_clear();
+    for (key, value) in &env {
+        command.env(key, value);
+    }
+    command.arg("/nologo").arg("/std:c11").arg("/utf-8");
+    if let Some(opt) = profile.msvc_opt_flag() {
+        command.arg(opt);
+    }
+    if static_link {
+        command.arg("/MT");
+    }
+    command.arg(&source);
+    command.arg(format!("/Fe:{}", output.display()));
+    command.arg(format!("/Fo:{}", obj.display()));
+    // A `std.pg` program links libpq.lib (named via a pragma). MSVC needs its search
+    // path since libpq is not on the default lib path.
+    if source_needs_libpq(&source) {
+        if let Some(dir) = detect_libpq_dir() {
+            command.arg("/link").arg(format!("/LIBPATH:{}", dir.display()));
+        }
+    }
+    if source_needs_libmysql(&source) {
+        if let Some(dir) = detect_libmysql_dir() {
+            command.arg("/link").arg(format!("/LIBPATH:{}", dir.display()));
+        }
+    }
+    if verbose {
+        println!("msvc: {} (env from {})", cl.display(), vcvars.display());
+    }
+
+    let result = command.output();
+    let _ = fs::remove_file(&obj);
+    match result {
+        Ok(done) if done.status.success() => Ok(()),
+        Ok(done) => {
+            let stdout = String::from_utf8_lossy(&done.stdout);
+            let stderr = String::from_utf8_lossy(&done.stderr);
+            Err(KuError::message(format!(
+                "native C build failed: MSVC cl exited with {}\n{}{}help: inspect generated source at {}",
+                done.status,
+                stdout,
+                stderr,
+                source.display()
+            )))
+        }
+        Err(err) => Err(KuError::message(format!(
+            "failed to run MSVC cl.exe: {err}\nhelp: repair Visual Studio C++ tools, or install clang/gcc/zig and set KU_CC"
+        ))),
+    }
+}
+
+/// Run `vcvars64.bat` and capture the resulting environment as key/value pairs.
+/// We write a throwaway bat into a plain temp dir (not the `\\?\` build dir) and
+/// run it as `cmd /C <bat>` — passing the vcvars path inside the bat body avoids
+/// the `cmd /C "..."` inner-quote escaping that mangles spaced paths. A marker
+/// line separates any residual vcvars banner from the `set` dump.
+fn load_vcvars_env(vcvars: &Path) -> Result<Vec<(String, String)>, KuError> {
+    const MARKER: &str = "___KU_VCVARS_ENV___";
+    let bat = env::temp_dir().join(format!("ku_vcvars_probe_{}.bat", std::process::id()));
+    let script = format!(
+        "@echo off\r\ncall \"{}\" >nul 2>&1\r\necho {}\r\nset\r\n",
+        vcvars.display(),
+        MARKER
+    );
+    fs::write(&bat, script)
+        .map_err(|err| KuError::message(format!("failed to write vcvars probe script: {err}")))?;
+    let result = Command::new("cmd").arg("/C").arg(&bat).output();
+    let _ = fs::remove_file(&bat);
+    let output =
+        result.map_err(|err| KuError::message(format!("failed to run vcvars64.bat: {err}")))?;
+    if !output.status.success() {
+        return Err(KuError::message(
+            "vcvars64.bat failed to initialize the MSVC build environment",
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut vars = Vec::new();
+    let mut seen_marker = false;
+    for line in text.lines() {
+        if !seen_marker {
+            seen_marker = line.trim() == MARKER;
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if !key.is_empty() {
+                vars.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    if vars.is_empty() {
+        return Err(KuError::message(
+            "vcvars64.bat produced no environment; the MSVC C++ tools may be missing",
+        ));
+    }
+    Ok(vars)
+}
+
+/// Find cl.exe by scanning the PATH captured from vcvars.
+fn find_cl_in_env(env: &[(String, String)]) -> Option<PathBuf> {
+    let path = env
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone())?;
+    for dir in path.split(';') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join("cl.exe");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Strip a Windows `\\?\` verbatim prefix so downstream tools see a normal path.
+fn strip_verbatim(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
 }
 
 fn c_compiler_candidates(env_cc: Option<&str>) -> Vec<CCompilerCandidate> {

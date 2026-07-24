@@ -455,8 +455,8 @@ fn main() {
     if (user["name"] != "Ku") {
         panic("bad map read")
     }
-    if (user["missing"]? != null) {
-        panic("missing map key should be null")
+    if (user.get_or("missing", null) != null) {
+        panic("missing map key should default to null via get_or")
     }
     user["age"] = 12
     if (user["age"] != 12) {
@@ -487,7 +487,7 @@ fn closures_capture_outer_locals_by_reference() {
     let source = r#"
 fn main() {
     prefix = "Hi "
-    say = (name) => {
+    say = (name: str) => {
         return prefix + name
     }
     prefix = "Bye "
@@ -515,6 +515,60 @@ fn main() {
 
     check_source("inline.ku", source).expect("closures should check");
     run_source("inline.ku", source).expect("closures should run");
+}
+
+#[test]
+fn moving_out_captured_owned_value_is_rejected_e0904() {
+    // Stage 6c: a closure shares the outer variable's cell by reference, so it
+    // may borrow the captured owned value (read/print/concat) but cannot move
+    // it out (return/store/pass) without `.clone()`.
+    let err = check_err(
+        r#"
+fn main() {
+    p = "x"
+    f = () => { return p }
+    print(f())
+}
+"#,
+    );
+    assert!(
+        err.contains("cannot move captured owned value"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn moving_out_captured_array_or_object_is_rejected_e0904() {
+    // Stage 6c-array/object: array and object captures use the same shared cell
+    // as str, so borrowing (len/index/get) is fine but moving the captured owned
+    // value out of the closure without `.clone()` is rejected (E0904).
+    let array_err = check_err(
+        r#"
+fn main() {
+    xs = [1, 2, 3]
+    f = () => { return xs }
+    print(f())
+}
+"#,
+    );
+    assert!(
+        array_err.contains("cannot move captured owned value 'xs'"),
+        "unexpected array error: {array_err}"
+    );
+
+    let object_err = check_err(
+        r#"
+fn main() {
+    o = { a: 1 }
+    g = () => { return o }
+    print(g())
+}
+"#,
+    );
+    assert!(
+        object_err.contains("cannot move captured owned value 'o'"),
+        "unexpected object error: {object_err}"
+    );
 }
 
 #[test]
@@ -1272,4 +1326,202 @@ fn ku_build_supports_output_path_alias_and_package_manifest_entry() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("package"));
 
     let _ = fs::remove_dir_all(dir);
+}
+
+// -- Closure parameter type rules: contextual inference from an expected
+// -- function type (typed binding, higher-order parameter, HTTP handler), and
+// -- rejection when no expected type is available or an annotation disagrees.
+
+#[test]
+fn closure_param_inferred_from_typed_binding_context() {
+    // A: a typed binding `greet: fn(str): str` supplies the parameter type of an
+    // otherwise unannotated closure.
+    let source = r#"
+fn main() {
+    greet: fn(str): str = (name) => {
+        return "Hello " + name
+    }
+    print(greet("Ku"))
+}
+"#;
+    check_source("inline.ku", source).expect("typed binding should infer the closure parameter");
+    run_source("inline.ku", source).expect("typed binding closure should run");
+}
+
+#[test]
+fn closure_param_inferred_from_higher_order_parameter_context() {
+    // B: a user-defined higher-order function `Apply(op: fn(int): int, v: int)`
+    // supplies the parameter type of the closure passed as `op`.
+    let source = r#"
+fn Apply(op: fn(int): int, v: int): int {
+    return op(v)
+}
+
+fn main() {
+    print(Apply((x) => x + 1, 41))
+}
+"#;
+    check_source("inline.ku", source).expect("HOF parameter should infer the closure parameter");
+    run_source("inline.ku", source).expect("HOF closure should run");
+}
+
+#[test]
+fn closure_param_inferred_in_array_map_context() {
+    // The existing HOF `array.map` path still infers the closure parameter from
+    // the element type.
+    let source = r#"
+fn main() {
+    nums:[int] = [1, 2, 3]
+    doubled = nums.map(x => x * 2)
+    print(doubled[2])
+}
+"#;
+    check_source("inline.ku", source).expect("array.map should infer the closure parameter");
+    run_source("inline.ku", source).expect("array.map closure should run");
+}
+
+#[test]
+fn closure_without_context_or_annotation_is_rejected() {
+    // D: no expected function type and no annotation -> rejected by the checker,
+    // and therefore also by `ku run` (which checks before interpreting).
+    let source = r#"
+fn main() {
+    f = (x) => x + 1
+    print(f(1))
+}
+"#;
+    let err = check_err(source);
+    assert!(
+        err.contains("closure parameter needs a type annotation or an expected function type"),
+        "unexpected error: {err}"
+    );
+    let run = run_err(source);
+    assert!(
+        run.contains("closure parameter needs a type annotation or an expected function type"),
+        "interpreter must reject the same closure: {run}"
+    );
+}
+
+#[test]
+fn closure_annotation_conflicting_with_expected_type_is_rejected() {
+    // E: an explicit annotation that disagrees with the expected function type.
+    let source = r#"
+fn main() {
+    greet: fn(str): str = (name: int) => {
+        return "Hello"
+    }
+    print(greet("Ku"))
+}
+"#;
+    let err = check_err(source);
+    assert!(
+        err.contains("type error: expected str but got int"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn closure_param_count_mismatch_with_expected_type_is_rejected() {
+    // F: the closure's parameter count differs from the expected function type.
+    let source = r#"
+fn main() {
+    f: fn(int): int = (a, b) => {
+        return a + b
+    }
+    print(f(1))
+}
+"#;
+    let err = check_err(source);
+    assert!(
+        err.contains("closure has 2 parameter(s) but the expected function type takes 1"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn closure_return_type_is_folded_without_annotation() {
+    // Stage 6e-1: an unannotated closure folds its body-inferred return type into
+    // its function-value type. That makes it an owned value, so `.clone()` is
+    // available even without an explicit `fn(): int` annotation.
+    let source = r#"
+fn main() {
+    f = () => { return 5 }
+    g = f.clone()
+    print(f())
+    print(g())
+}
+"#;
+    check_source("inline.ku", source).expect("unannotated closure should clone and stay usable");
+}
+
+#[test]
+fn closure_stored_twice_reports_use_of_moved() {
+    // Stage 6d: storing a function value into an array element consumes (moves)
+    // it, so reusing the same binding in the next element is a use-of-moved.
+    let source = r#"
+fn main() {
+    f = () => { return 5 }
+    xs = [f, f]
+    print(xs[0]())
+}
+"#;
+    let err = check_err(source);
+    assert!(
+        err.contains("use of moved value 'f'"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn closure_clone_allows_storing_and_keeping() {
+    // Stage 6e-2/6d: `.clone()` yields an independent owned function value, so the
+    // clone can be stored while the original stays usable.
+    let source = r#"
+fn main() {
+    f = () => { return 5 }
+    xs = [f.clone(), f]
+    print(xs[0]())
+    print(xs[1]())
+}
+"#;
+    check_source("inline.ku", source).expect("clone before storing should keep the original usable");
+}
+
+#[test]
+fn closure_passed_to_higher_order_is_borrowed_not_moved() {
+    // Stage 6d: passing a function value as a call argument borrows it, so the
+    // caller's binding stays usable for a later direct call.
+    let source = r#"
+fn Apply(op: fn(int, int): int, a: int, b: int): int {
+    return op(a, b)
+}
+fn Add(a: int, b: int): int {
+    return a + b
+}
+fn main() {
+    op: fn(int, int): int = Add
+    print(Apply(op, 3, 4))
+    print(op(5, 6))
+}
+"#;
+    check_source("inline.ku", source).expect("passing a function value should borrow, not move it");
+}
+
+#[test]
+fn closure_moved_by_binding_reports_use_of_moved() {
+    // Stage 6d: binding `g = f` stores (moves) the function value, so a later
+    // call to `f` is a use-of-moved.
+    let source = r#"
+fn main() {
+    f = () => { return 5 }
+    g = f
+    print(g())
+    print(f())
+}
+"#;
+    let err = check_err(source);
+    assert!(
+        err.contains("use of moved value 'f'"),
+        "unexpected error: {err}"
+    );
 }

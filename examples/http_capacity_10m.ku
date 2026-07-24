@@ -29,7 +29,7 @@ fn main(): null! {
             msg: "ok",
             data: {
                 id: req.params.id.clone(),
-                q: req.query["q"]?,
+                q: req.query.get_or("q", ""),
                 path: req.path.clone(),
                 method: req.method.clone()
             }

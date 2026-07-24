@@ -17,6 +17,23 @@ build/
 # Electron 打包产物（构建产物不入库；本地保留）
 dist-electron/
 web/bc/dist-electron/
-history/
 target/
 test/
+
+# 本地构建/调试产物（native 编译、崩溃转储、临时探针，均不入库）
+*.exe
+*.obj
+*.pdb
+*.stackdump
+*.err
+*.out
+cl_log.txt
+vc140.pdb
+# 各类临时/scratch 目录与文件
+scratch/
+scratch_*/
+scratch_*.ku
+scratchpad_guard*.ku
+probe/
+hellowolrd/
+.ku/

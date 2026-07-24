@@ -80,12 +80,24 @@ fn main() {
 "#,
     );
 
+    // Stage 6f: a local named function lowers through the closure machinery — its
+    // body is lifted into a `__ku_closure_N` and the name binds a closure value.
+    // Only the free variable `outer` is captured (boxed into a shared cell and
+    // read via `captured_cell`); the parameter `x` and the local `y` are not.
+    assert!(text.contains("let add: closure"), "unexpected IR:\n{text}");
+    assert!(text.contains("cell_new outer"), "unexpected IR:\n{text}");
     assert!(
-        text.contains("closure add = fn#10000 captures [outer]"),
-        "unexpected IR:\n{text}"
+        text.contains("captured_cell outer"),
+        "outer must be captured:\n{text}"
     );
-    assert!(!text.contains("captures [outer, x"));
-    assert!(!text.contains("captures [outer, y"));
+    assert!(
+        !text.contains("captured_cell x") && !text.contains("cell_new x"),
+        "parameter x must not be captured:\n{text}"
+    );
+    assert!(
+        !text.contains("captured_cell y") && !text.contains("cell_new y"),
+        "local y must not be captured:\n{text}"
+    );
 }
 
 #[test]
@@ -356,6 +368,8 @@ fn main() {
                 instructions: Vec::new(),
                 terminator: ir::IrTerminator::Jump(ir::BlockId(0)),
             }],
+            is_closure_body: false,
+            captures: Vec::new(),
         }],
         layouts: ir::IrLayoutTable {
             structs: Vec::new(),

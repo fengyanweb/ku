@@ -1,7 +1,7 @@
 fn main() {
     name = 'Ku'
     total:int
-    add = (a, b) => {
+    add = (a: int, b: int) => {
         return a + b
     }
 

@@ -343,6 +343,56 @@ async fn main() {
 }
 
 #[test]
+fn native_build_emit_c_includes_local_import_graph_without_runner_source_loader() {
+    let dir = unique_temp_path("native-import-graph");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).expect("create temp src");
+    let main = src.join("main.ku");
+    fs::write(
+        src.join("math.ku"),
+        r#"
+fn Add(a:int, b:int): int {
+    return a + b
+}
+"#,
+    )
+    .expect("write imported module");
+    fs::write(
+        &main,
+        r#"
+import { Add } from "./math.ku"
+
+fn main(): null! {
+    println(Add(1, 2))
+    return ok(null)
+}
+"#,
+    )
+    .expect("write entry module");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--emit-c".to_string(),
+        main.display().to_string(),
+    ])
+    .expect("native C artifact should include import graph");
+
+    let c_path = src.join(".ku").join("build").join("debug").join("c").join("main.c");
+    let c = fs::read_to_string(&c_path).expect("read generated C");
+    assert!(
+        c.contains("int64_t Add(int64_t a, int64_t b)"),
+        "imported Add missing:\n{c}"
+    );
+    assert!(c.contains("KuResult_null ku_main()"), "entry main missing:\n{c}");
+    assert!(
+        !c.contains("run_source") && !c.contains("const SOURCE"),
+        "native C artifact must not use runner source loader:\n{c}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_build_rejects_object_destructuring_until_lowered() {
     let dir = unique_temp_path("native-object-destructure");
     fs::create_dir_all(&dir).expect("create temp dir");
@@ -375,13 +425,14 @@ fn main() {
 }
 
 #[test]
-fn native_c_rejects_string_concat_until_kustring_abi_is_lowered() {
+fn native_c_backend_lowers_kustring_static_clone_concat_and_drop() {
     let tokens = Lexer::new(
         r#"
 fn main() {
     name = "Ku"
-    text = "Hello " + name
-    print(text)
+    again = name.clone()
+    text = "Hello " + again
+    println(text)
 }
 "#,
     )
@@ -390,13 +441,12 @@ fn main() {
     let program = Parser::new(tokens).parse().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
-    let err = backend::c::generate_c_source(&ir)
-        .expect_err("native C string concat must be rejected until KuString exists")
-        .to_string();
-    assert!(
-        err.contains("string concatenation") && err.contains("KuString ABI"),
-        "unexpected error: {err}"
-    );
+    let c = backend::c::generate_c_source(&ir).expect("generate C with KuString");
+    assert!(c.contains("typedef struct KuString"), "missing KuString ABI:\n{c}");
+    assert!(c.contains("ku_string_static"), "missing static string literal:\n{c}");
+    assert!(c.contains("ku_string_clone"), "missing string clone:\n{c}");
+    assert!(c.contains("ku_string_concat"), "missing string concat:\n{c}");
+    assert!(c.contains("ku_string_drop"), "missing string drop:\n{c}");
 }
 
 #[test]
@@ -524,7 +574,7 @@ fn main(): int! {
     let c = backend::c::generate_c_source(&ir).expect("generate try/finally C");
     assert!(c.contains("typedef struct KuError"));
     assert!(c.contains("KuError err = "));
-    assert!(c.contains(".error;"));
+    assert!(c.contains("ku_error_move(&"));
     assert!(c.contains("goto block"));
     assert!(c.contains("ku_result_move_int"));
 }
@@ -574,6 +624,30 @@ fn main() {
     assert!(c.contains("index < 0 || (uint64_t)index >= array->len"));
     assert!(c.contains("ku_array_get_int("));
     assert!(c.contains("*ku_array_at_int("));
+}
+
+#[test]
+fn use_of_moved_value_reports_e0901() {
+    let source = r#"
+fn take(values:[int]): null {
+    return null
+}
+
+fn main() {
+    values = [1, 2]
+    take(values)
+    print(values[0])
+}
+"#;
+    let tokens = Lexer::new(source).tokenize().expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    let err = Checker::new().check(&program).expect_err("should fail");
+    let diagnostic = err.diagnostic("main.ku", source);
+    assert!(
+        diagnostic.contains("E0901"),
+        "use-of-moved must report E0901:\n{diagnostic}"
+    );
+    assert!(diagnostic.contains("use of moved value 'values'"));
 }
 
 #[test]
@@ -686,7 +760,7 @@ fn main() {
 "#,
     );
     assert!(
-        loop_move.contains("later iteration would reuse a moved value"),
+        loop_move.contains("moved") && loop_move.contains("values"),
         "loop-carried move must be rejected: {loop_move}"
     );
 

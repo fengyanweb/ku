@@ -235,9 +235,15 @@ impl<'a> Generator<'a> {
                         | IrInst::Fail(value)
                         | IrInst::Panic(value) => self.collect_expr_strings(value)?,
                         IrInst::BindError { result, .. } => self.collect_expr_strings(result)?,
+                        IrInst::CellNew { init, .. } => self.collect_expr_strings(init)?,
+                        IrInst::CellStore { cell, value } => {
+                            self.collect_expr_strings(cell)?;
+                            self.collect_expr_strings(value)?;
+                        }
                         IrInst::BeginTry { .. }
                         | IrInst::EndTry
                         | IrInst::DefineClosure { .. }
+                        | IrInst::CellRelease(_)
                         | IrInst::Unsupported { .. } => {}
                     }
                 }
@@ -299,7 +305,12 @@ impl<'a> Generator<'a> {
                     self.collect_expr_strings(value)?;
                 }
             }
-            IrExprKind::Literal(_) | IrExprKind::Local(_) | IrExprKind::Temp(_) => {}
+            IrExprKind::CellLoad(inner) => self.collect_expr_strings(inner)?,
+            IrExprKind::Literal(_)
+            | IrExprKind::Local(_)
+            | IrExprKind::Temp(_)
+            | IrExprKind::MakeClosure { .. }
+            | IrExprKind::CapturedCell(_) => {}
         }
         Ok(())
     }
@@ -583,7 +594,12 @@ impl<'a> FunctionEmitter<'a> {
                     },
                 )?;
             }
-            IrInst::Panic(_) | IrInst::DefineClosure { .. } | IrInst::Unsupported { .. } => {
+            IrInst::Panic(_)
+            | IrInst::DefineClosure { .. }
+            | IrInst::CellNew { .. }
+            | IrInst::CellStore { .. }
+            | IrInst::CellRelease(_)
+            | IrInst::Unsupported { .. } => {
                 return Err(unsupported(format!(
                     "LLVM text prototype cannot lower IR instruction '{instruction}'"
                 )))
@@ -895,11 +911,14 @@ impl<'a> FunctionEmitter<'a> {
             IrExprKind::Call { kind, .. } => Err(unsupported(format!(
                 "LLVM text prototype only supports direct function calls, got {kind:?}"
             ))),
-            IrExprKind::Array(_) | IrExprKind::Index { .. } | IrExprKind::TryUnwrap(_) => {
-                Err(unsupported(format!(
-                    "LLVM text prototype cannot lower expression '{expr}'"
-                )))
-            }
+            IrExprKind::Array(_)
+            | IrExprKind::Index { .. }
+            | IrExprKind::TryUnwrap(_)
+            | IrExprKind::MakeClosure { .. }
+            | IrExprKind::CellLoad(_)
+            | IrExprKind::CapturedCell(_) => Err(unsupported(format!(
+                "LLVM text prototype cannot lower expression '{expr}'"
+            ))),
             IrExprKind::StructLiteral { name, fields } => {
                 self.emit_struct_literal(out, name, fields, &expr.ty)
             }
@@ -1305,7 +1324,10 @@ fn sanitize_identifier(name: &str) -> String {
     output
 }
 
-fn decode_string_literal(value: &str) -> KuResult<Vec<u8>> {
+/// Decode an IR string-literal text (a Rust-`Debug`-quoted string, e.g. `"x\u{a0}y"`)
+/// back into its raw UTF-8 bytes. Shared with the C backend so both lower string
+/// literals from the same canonical decoding.
+pub(crate) fn decode_string_literal(value: &str) -> KuResult<Vec<u8>> {
     let Some(inner) = value
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
