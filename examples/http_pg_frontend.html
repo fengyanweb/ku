@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ku · HTTP + PostgreSQL</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: linear-gradient(135deg, #0f172a, #1e293b); color: #e2e8f0;
+  }
+  .card {
+    width: min(560px, 92vw); background: rgba(255,255,255,.04);
+    border: 1px solid rgba(255,255,255,.12); border-radius: 16px;
+    padding: 28px 32px; box-shadow: 0 20px 60px rgba(0,0,0,.4);
+    backdrop-filter: blur(8px);
+  }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  .sub { margin: 0 0 20px; font-size: 13px; color: #94a3b8; }
+  .chain { font-size: 12px; color: #64748b; margin-bottom: 18px; }
+  .chain b { color: #38bdf8; }
+  .row { display: flex; justify-content: space-between; gap: 16px;
+    padding: 11px 0; border-top: 1px solid rgba(255,255,255,.08); }
+  .k { color: #94a3b8; font-size: 13px; }
+  .v { font-weight: 600; text-align: right; word-break: break-all; }
+  .v.num { color: #4ade80; }
+  button {
+    margin-top: 22px; width: 100%; padding: 11px; border: 0; border-radius: 10px;
+    background: #2563eb; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button:hover { background: #1d4ed8; }
+  button:disabled { opacity: .5; cursor: default; }
+  .err { color: #f87171; font-size: 13px; margin-top: 12px; }
+  .tag { display:inline-block; font-size:11px; padding:2px 8px; border-radius:999px;
+    background:#334155; color:#cbd5e1; margin-left:8px; vertical-align:middle;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Ku HTTP + PostgreSQL <span class="tag" id="lat">—</span></h1>
+    <p class="sub">纯 Ku 编写、编译为 native 可执行文件的服务</p>
+    <p class="chain">链路:<b>浏览器</b> → HTTP → <b>Ku native 服务</b> → libpq → <b>阿里云 PostgreSQL</b> → JSON</p>
+    <div id="data"></div>
+    <div class="err" id="err"></div>
+    <button id="btn" onclick="load()">重新查询</button>
+  </div>
+<script>
+  const F = [
+    ["PostgreSQL 版本", "version", false],
+    ["数据库", "database", false],
+    ["服务器时间", "now", false],
+    ["public 表数量", "public_tables", true],
+  ];
+  async function load() {
+    const btn = document.getElementById('btn');
+    const err = document.getElementById('err');
+    btn.disabled = true; err.textContent = '';
+    const t0 = performance.now();
+    try {
+      const res = await fetch('/db/info');
+      const j = await res.json();
+      const ms = Math.round(performance.now() - t0);
+      document.getElementById('lat').textContent = ms + ' ms';
+      if (j.code !== 0) throw new Error(j.msg || '查询失败');
+      document.getElementById('data').innerHTML = F.map(([label, key, num]) =>
+        `<div class="row"><span class="k">${label}</span><span class="v ${num?'num':''}">${j.data[key]}</span></div>`
+      ).join('');
+    } catch (e) {
+      err.textContent = '错误:' + e.message;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  load();
+</script>
+</body>
+</html>
