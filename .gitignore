@@ -37,3 +37,8 @@ scratchpad_guard*.ku
 probe/
 hellowolrd/
 .ku/
+db.conn
+redis.pw
+mysql.pw
+*.conn
+*.pw

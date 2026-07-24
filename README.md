@@ -2,7 +2,7 @@
 
 Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.16`，重点是补齐 native 标准库(str()/字符串方法/struct 复杂字段/模板字符串)并接入数据库驱动(PostgreSQL / Redis / MySQL,含连接池)。实验性语言，目前不可用于生产，欢迎围观讨论。
 
-> **0.0.16 数据库驱动验证程度不同,请勿一概当作可用**:`std.pg`、`std.redis` 已对真实数据库端到端跑通并做 CRT 循环压测 0 泄漏;`std.mysql` **仅编译+链接+连接握手+错误路径验证,成功查询路径因无测试凭据从未实际执行,属实验性**。详见 [0.0.16 版本记录](docs/v0.0.16.md)。数据库驱动目前均为 native-only(`ku build --native`),解释器 `ku run` 暂不支持连库。
+> **0.0.16 数据库驱动均为 native-only(`ku build --native`),解释器 `ku run` 暂不支持连库**:`std.pg`、`std.redis` 已对真实数据库端到端跑通并做 CRT 循环压测 0 泄漏;`std.mysql` 已对真实 MySQL(server 8.0.12)端到端验证 query/value 与 query_params 注入安全,目前只在这一个版本/平台验证过。详见 [0.0.16 版本记录](docs/v0.0.16.md)。
 
 ## 快速开始
 
@@ -174,7 +174,7 @@ fn main(): null! {
 
 - **std.pg**(libpq):connect/query/参数化 query_params(防注入)/结果读取/close + 有界阻塞连接池 pool/pool_query/pool_query_params/pool_close。**已对真实 PostgreSQL 端到端验证 + CRT 0 泄漏**。
 - **std.redis**(自实现 RESP-over-Winsock,零外部依赖):connect/auth/get/set/del/close。**已对真实 Redis 端到端验证 + CRT 0 泄漏**。
-- **std.mysql**(libmysqlclient):API 与 pg 对齐,query_params 用 `mysql_real_escape_string` 防注入。**⚠️ 实验性:仅编译+连接+错误路径验证,成功查询/取值路径从未实际执行,投产前必须先对可访问的 MySQL 实测**。
+- **std.mysql**(libmysqlclient):API 与 pg 对齐,query_params 用 `mysql_real_escape_string` 防注入。**已对真实 MySQL(server 8.0.12)端到端验证 query/rows/cols/value 与 query_params 注入安全,单连接 500 次查询循环干净完成**(目前只在这一个版本/平台验证过)。
 
 **稳定与安全**:路径级所有权 checker(部分 move 分析)作为第一道防线;对抗式审计发现并修复了循环内 `catch` 错误绑定、`?` 借用解包、`array.push` 字面量的内存泄漏。
 
@@ -256,7 +256,14 @@ v002_features.ku
 package/
 http_server.ku
 http_bench.ps1
+pg_demo.ku            # PostgreSQL:连接 + 参数化查询(native-only)
+redis_demo.ku         # Redis:SET/GET/DEL,\r\n 值安全往返(native-only)
+mysql_demo.ku         # MySQL:查询 + 参数化(native-only)
+http_pg.ku            # HTTP + PostgreSQL 端到端 + 前端页(native-only)
+http_pg_frontend.html # http_pg 的前端页面
 ```
+
+> 数据库示例是 native-only(`ku build --native`),需要各自的连接凭据与运行时库,准备步骤见 [examples/README.md](examples/README.md)(凭据放 `db.conn`/`redis.pw`/`mysql.pw`,均已 gitignore)。
 
 ## 文档
 

@@ -25,7 +25,7 @@ assert.deepStrictEqual(model.memberCompletionLabels("app", "listen"), ["listen"]
 assert.deepStrictEqual(model.memberCompletionLabels("values", ""), ["len", "try_get", "push", "concat", "map"]);
 assert.deepStrictEqual(model.memberCompletionLabels("time", "d"), ["date", "datetime", "duration", "diff", "days_in_month"]);
 assert.deepStrictEqual(model.memberCompletionLabels("object", ""), ["get_or"]);
-assert.deepStrictEqual(model.stdRootModules, ["fs", "http", "string", "array", "object", "json", "config", "time", "task"]);
+assert.deepStrictEqual(model.stdRootModules, ["fs", "http", "string", "array", "object", "json", "config", "time", "task", "pg", "redis", "mysql"]);
 assert(!model.keywords.includes("println"));
 assert(model.builtins.includes("println"));
 assert.strictEqual(model.globalCompletionLabels().filter((label) => label === "println").length, 1);
@@ -41,6 +41,9 @@ assert.deepStrictEqual(model.stdImportPathLabels("std."), [
   "std.config",
   "std.time",
   "std.task",
+  "std.pg",
+  "std.redis",
+  "std.mysql",
 ]);
 
 assert(!model.globalCompletionLabels().includes("http.service"));
