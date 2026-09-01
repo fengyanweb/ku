@@ -15,6 +15,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -139,6 +140,10 @@ class WindowsJob:
 
 def fail(message: str) -> NoReturn:
     raise SystemExit(f"native CI verification failed: {message}")
+
+
+def workflow_command_escape(message: str) -> str:
+    return message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def resolve_existing_file(raw: str, label: str) -> Path:
@@ -674,7 +679,16 @@ def run() -> None:
 
 
 def main() -> None:
-    run()
+    try:
+        run()
+    except (Exception, SystemExit) as error:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            detail = workflow_command_escape(str(error))
+            print(
+                f"::error title=Native three-OS verification::{detail}",
+                file=sys.stderr,
+            )
+        raise
 
 
 if __name__ == "__main__":

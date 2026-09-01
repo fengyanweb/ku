@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 import importlib.util
+import io
 import os
 from pathlib import Path
 import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 sys.dont_write_bytecode = True
@@ -21,6 +24,22 @@ SPEC.loader.exec_module(VERIFIER)
 
 
 class BoundedProcessTests(unittest.TestCase):
+    def test_main_emits_one_escaped_actions_annotation(self) -> None:
+        stderr = io.StringIO()
+        failure = SystemExit("bad % value\r\nnext line")
+        with (
+            mock.patch.object(VERIFIER, "run", side_effect=failure),
+            mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}),
+            redirect_stderr(stderr),
+            self.assertRaisesRegex(SystemExit, "bad % value"),
+        ):
+            VERIFIER.main()
+        self.assertEqual(
+            stderr.getvalue(),
+            "::error title=Native three-OS verification::"
+            "bad %25 value%0D%0Anext line\n",
+        )
+
     def test_live_pipe_reader_is_never_closed_synchronously(self) -> None:
         read_fd, write_fd = os.pipe()
         stream = os.fdopen(read_fd, "rb")
