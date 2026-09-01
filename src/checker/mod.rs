@@ -3716,7 +3716,7 @@ impl Checker {
         for (index, rule) in signature.args.iter().enumerate() {
             self.check_stdlib_arg(rule, index, args, &actuals)?;
         }
-        self.stdlib_pattern_to_type(&signature.returns, &actuals, span)
+        Self::stdlib_pattern_to_type(&signature.returns, &actuals, span)
     }
 
     fn check_stdlib_arg(
@@ -3728,12 +3728,12 @@ impl Checker {
     ) -> KuResult<()> {
         match rule {
             ArgRule::Is(pattern) => {
-                if self.type_matches_pattern(&actuals[index], pattern) {
+                if Self::type_matches_pattern(&actuals[index], pattern) {
                     Ok(())
                 } else {
                     Err(type_error(
                         args[index].span,
-                        &self.pattern_expected_type(pattern),
+                        &Self::pattern_expected_type(pattern),
                         &actuals[index],
                     ))
                 }
@@ -3885,11 +3885,11 @@ impl Checker {
         }
     }
 
-    fn type_matches_pattern(&self, actual: &Type, pattern: &TypePattern) -> bool {
+    fn type_matches_pattern(actual: &Type, pattern: &TypePattern) -> bool {
         if let Type::Union(types) = actual {
             return types
                 .iter()
-                .all(|actual| self.type_matches_pattern(actual, pattern));
+                .all(|actual| Self::type_matches_pattern(actual, pattern));
         }
         match pattern {
             TypePattern::Int => actual == &Type::Int,
@@ -3907,7 +3907,7 @@ impl Checker {
                 Type::Object(actual_fields) => fields.iter().all(|(name, pattern)| {
                     actual_fields
                         .get(name)
-                        .is_some_and(|actual| self.type_matches_pattern(actual, pattern))
+                        .is_some_and(|actual| Self::type_matches_pattern(actual, pattern))
                 }),
                 _ => false,
             },
@@ -3916,7 +3916,7 @@ impl Checker {
             }
             TypePattern::ArrayOf(inner) => match actual {
                 Type::Array(element) if **element == Type::Unknown => true,
-                Type::Array(element) => self.type_matches_pattern(element, inner),
+                Type::Array(element) => Self::type_matches_pattern(element, inner),
                 _ => false,
             },
             TypePattern::Native(name) => matches!(actual, Type::Native(n) if n == name),
@@ -3926,7 +3926,7 @@ impl Checker {
         }
     }
 
-    fn pattern_expected_type(&self, pattern: &TypePattern) -> Type {
+    fn pattern_expected_type(pattern: &TypePattern) -> Type {
         match pattern {
             TypePattern::Int => Type::Int,
             TypePattern::Bool => Type::Bool,
@@ -3937,10 +3937,12 @@ impl Checker {
             TypePattern::ObjectFields(fields) => Type::Object(
                 fields
                     .iter()
-                    .map(|(name, pattern)| (name.clone(), self.pattern_expected_type(pattern)))
+                    .map(|(name, pattern)| (name.clone(), Self::pattern_expected_type(pattern)))
                     .collect(),
             ),
-            TypePattern::ArrayOf(inner) => Type::Array(Box::new(self.pattern_expected_type(inner))),
+            TypePattern::ArrayOf(inner) => {
+                Type::Array(Box::new(Self::pattern_expected_type(inner)))
+            }
             TypePattern::StringOrStringArray => Type::String,
             TypePattern::KuValue => Type::KuValue,
             TypePattern::Native(name) => Type::Native(name.to_string()),
@@ -3953,7 +3955,6 @@ impl Checker {
     }
 
     fn stdlib_pattern_to_type(
-        &self,
         pattern: &TypePattern,
         actuals: &[Type],
         span: Span,
@@ -3974,14 +3975,14 @@ impl Checker {
                     .map(|(name, pattern)| {
                         Ok((
                             name.clone(),
-                            self.stdlib_pattern_to_type(pattern, actuals, span)?,
+                            Self::stdlib_pattern_to_type(pattern, actuals, span)?,
                         ))
                     })
                     .collect::<KuResult<HashMap<_, _>>>()?,
             )),
-            TypePattern::ArrayOf(inner) => Ok(Type::Array(Box::new(
-                self.stdlib_pattern_to_type(inner, actuals, span)?,
-            ))),
+            TypePattern::ArrayOf(inner) => Ok(Type::Array(Box::new(Self::stdlib_pattern_to_type(
+                inner, actuals, span,
+            )?))),
             TypePattern::StringOrStringArray => Ok(Type::String),
             TypePattern::ArrayElementOfArg(index) => match actuals.get(*index) {
                 Some(Type::Array(element)) => Ok(*element.clone()),
@@ -3993,7 +3994,7 @@ impl Checker {
                 None => Err(KuError::runtime("invalid stdlib signature", span)),
             },
             TypePattern::ResultOf(inner) => Ok(Type::Result(Box::new(
-                self.stdlib_pattern_to_type(inner, actuals, span)?,
+                Self::stdlib_pattern_to_type(inner, actuals, span)?,
             ))),
             TypePattern::SameAsArg(index) => actuals
                 .get(*index)
