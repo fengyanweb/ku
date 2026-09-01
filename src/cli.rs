@@ -2951,14 +2951,8 @@ fn compile_c_source(
             command.arg(arg);
         }
         if let Some(target) = target {
-            match candidate.kind {
-                CCompilerKind::ZigCc => {
-                    command.arg("-target").arg(target.c_triple);
-                }
-                CCompilerKind::Clang => {
-                    command.arg("--target").arg(target.rust_triple);
-                }
-                CCompilerKind::Preconfigured => {}
+            for argument in c_compiler_target_arguments(candidate.kind, target) {
+                command.arg(argument);
             }
         }
         let compiler_output = temporary_output.as_deref().unwrap_or(output);
@@ -3125,6 +3119,17 @@ fn c_compiler_supports_explicit_target(
     target.matches_host()
         || candidate.kind != CCompilerKind::Preconfigured
         || candidate.explicitly_configured
+}
+
+fn c_compiler_target_arguments(kind: CCompilerKind, target: &BuildTarget) -> Vec<String> {
+    match kind {
+        CCompilerKind::ZigCc => vec!["-target".to_string(), target.c_triple.to_string()],
+        // Clang accepts the GNU-style target option only in its joined form.
+        // Passing `--target` and the triple as separate argv entries is rejected
+        // by both Apple Clang and the LLVM Clang shipped on GitHub runners.
+        CCompilerKind::Clang => vec![format!("--target={}", target.rust_triple)],
+        CCompilerKind::Preconfigured => Vec::new(),
+    }
 }
 
 /// Locate a native MSVC toolchain by asking vswhere for the latest install that
@@ -6975,6 +6980,22 @@ mod tests {
             &configured_gcc,
             &cross_target
         ));
+    }
+
+    #[test]
+    fn explicit_target_arguments_match_each_compiler_driver() {
+        let linux = resolve_build_target(Some("x86_64-linux"))
+            .expect("supported Linux target")
+            .expect("explicit Linux target");
+        assert_eq!(
+            c_compiler_target_arguments(CCompilerKind::Clang, &linux),
+            vec!["--target=x86_64-unknown-linux-gnu"]
+        );
+        assert_eq!(
+            c_compiler_target_arguments(CCompilerKind::ZigCc, &linux),
+            vec!["-target", "x86_64-linux-gnu"]
+        );
+        assert!(c_compiler_target_arguments(CCompilerKind::Preconfigured, &linux).is_empty());
     }
 
     #[test]
