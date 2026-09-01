@@ -7181,9 +7181,13 @@ struct KuMysqlClient {
   KuMysqlCondition condition;
   size_t active;
   size_t waiters;
+  uint32_t consecutive_connect_failures;
+  unsigned long long reconnect_not_before_ms;
   bool closing;
   bool finalizing;
   bool sync_ready;
+  bool connect_in_flight;
+  bool backoff_timer_armed;
 };
 
 typedef struct {
@@ -7466,6 +7470,42 @@ static unsigned long long ku_mysql_deadline(unsigned int timeout_ms) {
     deadline = __ku_handler_deadline;
   }
   return deadline;
+}
+
+static unsigned long long ku_mysql_saturating_add_ms(
+    unsigned long long now, unsigned long long delay) {
+  return ~0ULL - now < delay ? ~0ULL : now + delay;
+}
+
+static unsigned long long ku_mysql_backoff_delay_ms(
+    KuMysqlClient* client, unsigned long long now) {
+  uint32_t failures = client->consecutive_connect_failures;
+  unsigned int shift = failures > 6U ? 6U : (failures ? failures - 1U : 0U);
+  unsigned long long window = 25ULL << shift;
+  if (window > 1000ULL) window = 1000ULL;
+  unsigned long long mixed = (unsigned long long)(uintptr_t)client
+      ^ now ^ ((unsigned long long)failures * 0x9e3779b97f4a7c15ULL);
+  mixed ^= mixed >> 30;
+  mixed *= 0xbf58476d1ce4e5b9ULL;
+  mixed ^= mixed >> 27;
+  mixed *= 0x94d049bb133111ebULL;
+  mixed ^= mixed >> 31;
+  unsigned long long lower = (window + 1ULL) / 2ULL;
+  return lower + mixed % (window - lower + 1ULL);
+}
+
+static void ku_mysql_record_connect_failure_locked(
+    KuMysqlClient* client, unsigned long long now) {
+  if (client->consecutive_connect_failures != UINT32_MAX) {
+    client->consecutive_connect_failures++;
+  }
+  client->reconnect_not_before_ms = ku_mysql_saturating_add_ms(
+      now, ku_mysql_backoff_delay_ms(client, now));
+}
+
+static void ku_mysql_record_connect_success_locked(KuMysqlClient* client) {
+  client->consecutive_connect_failures = 0;
+  client->reconnect_not_before_ms = 0;
 }
 
 static bool ku_mysql_key_is(KuString key, const char* expected) {
@@ -7838,7 +7878,7 @@ static KuResult_mysql_client ku_mysql_client_new(KuObject* config) {
   if (!ku_mysql_library_ready()) {
     return (KuResult_mysql_client){
       false, NULL,
-      ku_mysql_error("library_init_error", "MySQL client library initialization failed")
+      ku_mysql_error("sync_error", "MySQL client library initialization failed")
     };
   }
 
@@ -7920,10 +7960,15 @@ static KuResult_mysql_client ku_mysql_client_new(KuObject* config) {
 }
 
 /* Called with the client lock held. A timed-out waiter must hand an available
-   slot to the next waiter instead of consuming the release signal. */
+   slot to another queued waiter instead of consuming the release signal. */
 static bool ku_mysql_slot_available_locked(KuMysqlClient* client) {
   for (size_t index = 0; index < client->max_connections; index++) {
-    if (!client->slots[index].busy) return true;
+    if (client->slots[index].connection && !client->slots[index].busy) return true;
+  }
+  if (client->connect_in_flight
+      || __ku_handler_now_ms() < client->reconnect_not_before_ms) return false;
+  for (size_t index = 0; index < client->max_connections; index++) {
+    if (!client->slots[index].connection && !client->slots[index].busy) return true;
   }
   return false;
 }
@@ -7934,11 +7979,21 @@ static void ku_mysql_handoff_available_locked(KuMysqlClient* client) {
   }
 }
 
+/* A timed waiter owns the reconnect wake-up only while it is blocked. If it
+   wakes for another reason or its own deadline wins, hand that responsibility
+   to another queued waiter before this thread can leave the acquire loop. */
+static void ku_mysql_release_backoff_timer_locked(
+    KuMysqlClient* client, bool owned) {
+  if (!owned) return;
+  client->backoff_timer_armed = false;
+  if (client->waiters > 1) ku_mysql_wake_one(client);
+}
+
 static MYSQL* ku_mysql_acquire(
     KuMysqlClient* client, size_t* slot_index, KuError* error,
     unsigned long long operation_deadline) {
   if (!client || !slot_index) {
-    *error = ku_mysql_error("closed", "MySQL client is closed");
+    *error = ku_mysql_error("client_closed", "MySQL client is closed");
     return NULL;
   }
   unsigned long long deadline = ku_mysql_deadline(client->acquire_timeout_ms);
@@ -7952,7 +8007,7 @@ static MYSQL* ku_mysql_acquire(
       bool finalize = ku_mysql_finalize_ready(client);
       ku_mysql_unlock(client);
       if (finalize) ku_mysql_client_destroy(client);
-      *error = ku_mysql_error("closed", "MySQL client is closed");
+      *error = ku_mysql_error("client_closed", "MySQL client is closed");
       return NULL;
     }
     if (__ku_handler_now_ms() >= deadline) {
@@ -7967,58 +8022,82 @@ static MYSQL* ku_mysql_acquire(
           "acquire_timeout", "Timed out waiting for a MySQL connection");
       return NULL;
     }
-    for (size_t index = 0; index < client->max_connections; index++) {
-      if (client->slots[index].connection && !client->slots[index].busy) {
-        client->slots[index].busy = true;
-        client->active++;
-        if (registered_waiter) client->waiters--;
-        *slot_index = index;
-        MYSQL* connection = client->slots[index].connection;
-        ku_mysql_unlock(client);
-        return connection;
+    bool can_claim = registered_waiter || client->waiters == 0;
+    if (can_claim) {
+      for (size_t index = 0; index < client->max_connections; index++) {
+        if (client->slots[index].connection && !client->slots[index].busy) {
+          client->slots[index].busy = true;
+          client->active++;
+          if (registered_waiter) client->waiters--;
+          *slot_index = index;
+          MYSQL* connection = client->slots[index].connection;
+          ku_mysql_unlock(client);
+          return connection;
+        }
       }
-    }
-    for (size_t index = 0; index < client->max_connections; index++) {
-      if (!client->slots[index].connection && !client->slots[index].busy) {
-        client->slots[index].busy = true;
-        client->active++;
-        if (registered_waiter) client->waiters--;
-        *slot_index = index;
-        ku_mysql_unlock(client);
-        MYSQL* connection = ku_mysql_open_connection(
-            client, error, deadline, operation_deadline);
-        if (!connection) {
-          ku_mysql_lock(client);
-          client->slots[index].busy = false;
-          client->active--;
-          if (client->closing) ku_mysql_wake_all(client);
-          else ku_mysql_wake_one(client);
-          bool finalize = ku_mysql_finalize_ready(client);
+      bool can_connect = !client->connect_in_flight
+          && __ku_handler_now_ms() >= client->reconnect_not_before_ms;
+      for (size_t index = 0; can_connect && index < client->max_connections; index++) {
+        if (!client->slots[index].connection && !client->slots[index].busy) {
+          client->slots[index].busy = true;
+          client->active++;
+          client->connect_in_flight = true;
+          if (registered_waiter) client->waiters--;
+          *slot_index = index;
+          unsigned long long connect_budget_deadline =
+              ku_mysql_saturating_add_ms(
+                  __ku_handler_now_ms(), client->connect_timeout_ms);
+          bool acquire_limited_connect = deadline <= connect_budget_deadline;
+          unsigned long long connect_deadline = acquire_limited_connect
+              ? deadline : connect_budget_deadline;
           ku_mysql_unlock(client);
-          if (finalize) ku_mysql_client_destroy(client);
-          return NULL;
-        }
-        ku_mysql_lock(client);
-        bool closed = client->closing;
-        bool expired = __ku_handler_now_ms() >= deadline;
-        if (closed || expired) {
-          client->slots[index].busy = false;
-          client->active--;
-          if (closed) ku_mysql_wake_all(client);
-          else ku_mysql_handoff_available_locked(client);
-          bool finalize = ku_mysql_finalize_ready(client);
-          ku_mysql_unlock(client);
-          mysql_close(connection);
-          if (finalize) ku_mysql_client_destroy(client);
-          *error = closed
-              ? ku_mysql_error("closed", "MySQL client is closed")
-              : ku_mysql_error(
+          MYSQL* connection = ku_mysql_open_connection(
+              client, error, connect_deadline, operation_deadline);
+          if (!connection) {
+            if (acquire_limited_connect
+                && ku_mysql_key_is(error->code, "connect_timeout")) {
+              ku_error_drop(error);
+              *error = ku_mysql_error(
                   "acquire_timeout", "Timed out acquiring a MySQL connection");
-          return NULL;
+            }
+            ku_mysql_lock(client);
+            client->connect_in_flight = false;
+            ku_mysql_record_connect_failure_locked(
+                client, __ku_handler_now_ms());
+            client->slots[index].busy = false;
+            client->active--;
+            if (client->closing) ku_mysql_wake_all(client);
+            else ku_mysql_wake_one(client);
+            bool finalize = ku_mysql_finalize_ready(client);
+            ku_mysql_unlock(client);
+            if (finalize) ku_mysql_client_destroy(client);
+            return NULL;
+          }
+          ku_mysql_lock(client);
+          client->connect_in_flight = false;
+          ku_mysql_record_connect_success_locked(client);
+          bool closed = client->closing;
+          bool expired = __ku_handler_now_ms() >= deadline;
+          if (closed || expired) {
+            client->slots[index].busy = false;
+            client->active--;
+            if (closed) ku_mysql_wake_all(client);
+            else ku_mysql_handoff_available_locked(client);
+            bool finalize = ku_mysql_finalize_ready(client);
+            ku_mysql_unlock(client);
+            mysql_close(connection);
+            if (finalize) ku_mysql_client_destroy(client);
+            *error = closed
+                ? ku_mysql_error("client_closed", "MySQL client is closed")
+                : ku_mysql_error(
+                    "acquire_timeout", "Timed out acquiring a MySQL connection");
+            return NULL;
+          }
+          client->slots[index].connection = connection;
+          ku_mysql_wake_one(client);
+          ku_mysql_unlock(client);
+          return connection;
         }
-        client->slots[index].connection = connection;
-        ku_mysql_unlock(client);
-        return connection;
       }
     }
     if (!registered_waiter) {
@@ -8030,8 +8109,24 @@ static MYSQL* ku_mysql_acquire(
       client->waiters++;
       registered_waiter = true;
     }
-    int wait_status = ku_mysql_wait_until(client, deadline);
+    unsigned long long wait_deadline = deadline;
+    bool owns_backoff_timer = false;
+    unsigned long long now = __ku_handler_now_ms();
+    if (client->reconnect_not_before_ms > now
+        && !client->backoff_timer_armed) {
+      client->backoff_timer_armed = true;
+      owns_backoff_timer = true;
+      if (client->reconnect_not_before_ms < wait_deadline) {
+        wait_deadline = client->reconnect_not_before_ms;
+      }
+    }
+    int wait_status = ku_mysql_wait_until(client, wait_deadline);
+    ku_mysql_release_backoff_timer_locked(client, owns_backoff_timer);
     if (wait_status <= 0) {
+      now = __ku_handler_now_ms();
+      if (wait_status == 0 && wait_deadline < deadline && now < deadline) {
+        continue;
+      }
       client->waiters--;
       if (!client->closing) ku_mysql_handoff_available_locked(client);
       bool finalize = ku_mysql_finalize_ready(client);
@@ -8047,8 +8142,20 @@ static MYSQL* ku_mysql_acquire(
   }
 }
 
+static bool ku_mysql_reset_for_pool(
+    MYSQL* connection, bool broken, unsigned long long deadline);
+
 static void ku_mysql_release(
-    KuMysqlClient* client, size_t slot_index, bool broken) {
+    KuMysqlClient* client, size_t slot_index, bool broken,
+    unsigned long long deadline) {
+  ku_mysql_lock(client);
+  bool reset_allowed = !client->closing;
+  MYSQL* connection = slot_index < client->max_connections
+      ? client->slots[slot_index].connection
+      : NULL;
+  ku_mysql_unlock(client);
+  if (!reset_allowed) broken = true;
+  else broken = ku_mysql_reset_for_pool(connection, broken, deadline);
   ku_mysql_lock(client);
   MYSQL* discard = NULL;
   if (slot_index < client->max_connections) {
@@ -8500,7 +8607,7 @@ static KuResult_mysql_result ku_mysql_client_query(
   KuError error = (KuError){0};
   if (!client) {
     return (KuResult_mysql_result){
-      false, NULL, ku_mysql_error("closed", "MySQL client is closed")
+      false, NULL, ku_mysql_error("client_closed", "MySQL client is closed")
     };
   }
   unsigned long long deadline = ku_mysql_deadline(client->query_timeout_ms);
@@ -8536,8 +8643,7 @@ static KuResult_mysql_result ku_mysql_client_query(
     if (!result) broken = true;
     ku_mysql_statement_close_checked(&statement, true, &broken);
   }
-  broken = ku_mysql_reset_for_pool(connection, broken, deadline);
-  ku_mysql_release(client, slot_index, broken);
+  ku_mysql_release(client, slot_index, broken, deadline);
   ku_mysql_thread_leave();
   if (!result) return (KuResult_mysql_result){ false, NULL, error };
   return (KuResult_mysql_result){ true, result, (KuError){0} };
@@ -8548,7 +8654,7 @@ static KuResult_int ku_mysql_client_execute(
   KuError error = (KuError){0};
   if (!client) {
     return (KuResult_int){
-      false, 0, ku_mysql_error("closed", "MySQL client is closed")
+      false, 0, ku_mysql_error("client_closed", "MySQL client is closed")
     };
   }
   unsigned long long deadline = ku_mysql_deadline(client->query_timeout_ms);
@@ -8602,8 +8708,7 @@ static KuResult_int ku_mysql_client_execute(
     }
     ku_mysql_statement_close_checked(&statement, true, &broken);
   }
-  broken = ku_mysql_reset_for_pool(connection, broken, deadline);
-  ku_mysql_release(client, slot_index, broken);
+  ku_mysql_release(client, slot_index, broken, deadline);
   ku_mysql_thread_leave();
   if (!ok) return (KuResult_int){ false, 0, error };
   return (KuResult_int){ true, affected, (KuError){0} };
@@ -8809,9 +8914,13 @@ struct KuRedisClient {
   uint32_t borrowed;
   uint32_t waiters;
   uint32_t idle_count;
+  uint32_t consecutive_connect_failures;
+  unsigned long long reconnect_not_before_ms;
   uint8_t has_username;
   uint8_t has_password;
   uint8_t closing;
+  uint8_t connect_in_flight;
+  uint8_t backoff_timer_armed;
 };
 
 typedef struct {
@@ -9060,7 +9169,7 @@ static KuError ku_redis_out_of_memory_err(void) {
 }
 
 static KuError ku_redis_connect_timeout_err(void) {
-  return ku_redis_static_error("timeout", "redis connect timed out");
+  return ku_redis_static_error("connect_timeout", "redis connect timed out");
 }
 
 static KuError ku_redis_command_timeout_err(void) {
@@ -9068,15 +9177,30 @@ static KuError ku_redis_command_timeout_err(void) {
 }
 
 static KuError ku_redis_acquire_timeout_err(void) {
-  return ku_redis_static_error("timeout", "redis client timed out waiting for a connection");
+  return ku_redis_static_error(
+      "acquire_timeout", "redis client timed out waiting for a connection");
 }
 
-static KuError ku_redis_pool_exhausted_err(void) {
-  return ku_redis_static_error("pool_exhausted", "redis client waiter limit reached");
+static KuError ku_redis_pool_busy_err(void) {
+  return ku_redis_static_error("pool_busy", "redis client waiter limit reached");
 }
 
-static KuError ku_redis_closed_err(void) {
-  return ku_redis_static_error("closed", "redis client is closed");
+static KuError ku_redis_client_closed_err(void) {
+  return ku_redis_static_error("client_closed", "redis client is closed");
+}
+
+static KuError ku_redis_connect_error_err(void) {
+  return ku_redis_static_error("connect_error", "redis connection failed");
+}
+
+static KuError ku_redis_sync_error_err(void) {
+  return ku_redis_static_error("sync_error", "redis client synchronization failed");
+}
+
+static int ku_redis_error_code_is(KuError error, const char* expected) {
+  size_t len = strlen(expected);
+  return error.code.len == len
+      && (len == 0 || (error.code.ptr && memcmp(error.code.ptr, expected, len) == 0));
 }
 
 static KuError ku_redis_invalid_config_err(const char* message) {
@@ -9177,6 +9301,42 @@ static unsigned long long ku_redis_deadline_after_ms(unsigned long long timeout_
   if (__ku_handler_deadline != 0 && __ku_handler_deadline < deadline)
     deadline = __ku_handler_deadline;
   return deadline;
+}
+
+static unsigned long long ku_redis_saturating_add_ms(
+    unsigned long long now, unsigned long long delay) {
+  return ~0ULL - now < delay ? ~0ULL : now + delay;
+}
+
+static unsigned long long ku_redis_backoff_delay_ms(
+    KuRedisClient* client, unsigned long long now) {
+  uint32_t failures = client->consecutive_connect_failures;
+  unsigned int shift = failures > 6U ? 6U : (failures ? failures - 1U : 0U);
+  unsigned long long window = 25ULL << shift;
+  if (window > 1000ULL) window = 1000ULL;
+  unsigned long long mixed = (unsigned long long)(uintptr_t)client
+      ^ now ^ ((unsigned long long)failures * 0x9e3779b97f4a7c15ULL);
+  mixed ^= mixed >> 30;
+  mixed *= 0xbf58476d1ce4e5b9ULL;
+  mixed ^= mixed >> 27;
+  mixed *= 0x94d049bb133111ebULL;
+  mixed ^= mixed >> 31;
+  unsigned long long lower = (window + 1ULL) / 2ULL;
+  return lower + mixed % (window - lower + 1ULL);
+}
+
+static void ku_redis_record_connect_failure_locked(
+    KuRedisClient* client, unsigned long long now) {
+  if (client->consecutive_connect_failures != UINT32_MAX) {
+    client->consecutive_connect_failures++;
+  }
+  client->reconnect_not_before_ms = ku_redis_saturating_add_ms(
+      now, ku_redis_backoff_delay_ms(client, now));
+}
+
+static void ku_redis_record_connect_success_locked(KuRedisClient* client) {
+  client->consecutive_connect_failures = 0;
+  client->reconnect_not_before_ms = 0;
 }
 
 /* 0: lock held, -1: closed, -2: deadline elapsed while waiting. A lock-wait
@@ -9373,7 +9533,8 @@ static int ku_redis_pool_unlock(KuRedisPoolSync* sync) {
 #endif
 }
 
-/* Called with the pool lock held. 0 means signaled/spurious wake, -2 timeout. */
+/* Called with the pool lock held. 0 means signaled/spurious wake, -1 means
+   synchronization failure, and -2 means timeout. */
 static int ku_redis_pool_wait_until(KuRedisPoolSync* sync, unsigned long long deadline) {
   unsigned long long now = ku_redis_now_ms();
   if (now >= deadline) return -2;
@@ -9384,8 +9545,7 @@ static int ku_redis_pool_wait_until(KuRedisPoolSync* sync, unsigned long long de
   if (wait_ms == 0) wait_ms = 1;
   if (SleepConditionVariableSRW(&sync->condition, &sync->mutex, wait_ms, 0)) return 0;
   if (GetLastError() == ERROR_TIMEOUT) return -2;
-  fputs("redis client condition wait failed\n", stderr);
-  exit(1);
+  return -1;
 #else
   int result;
 #if defined(__APPLE__)
@@ -9409,8 +9569,7 @@ static int ku_redis_pool_wait_until(KuRedisPoolSync* sync, unsigned long long de
 #endif
   if (result == 0) return 0;
   if (result == ETIMEDOUT) return -2;
-  fputs("redis client condition wait failed\n", stderr);
-  exit(1);
+  return -1;
 #endif
 }
 
@@ -9654,6 +9813,17 @@ static int ku_redis_parse_i64(const char* text, size_t len, int64_t* out) {
   return 0;
 }
 
+static int ku_redis_resolver_out_of_memory(int code) {
+#if defined(_WIN32)
+  return code == WSA_NOT_ENOUGH_MEMORY;
+#elif defined(EAI_MEMORY)
+  return code == EAI_MEMORY;
+#else
+  (void)code;
+  return 0;
+#endif
+}
+
 static KuRedisOpenResult ku_redis_open_connection(
     KuString host,
     int64_t port,
@@ -9668,7 +9838,7 @@ static KuRedisOpenResult ku_redis_open_connection(
   if (!host.ptr || host.len == 0 || host.len == SIZE_MAX || memchr(host.ptr, 0, host.len))
     return (KuRedisOpenResult){ false, 0, ku_redis_err("redis host is empty or contains NUL") };
   if (ku_redis_ensure_wsa() != 0)
-    return (KuRedisOpenResult){ false, 0, ku_redis_err("network initialization failed") };
+    return (KuRedisOpenResult){ false, 0, ku_redis_connect_error_err() };
 
   /* Validation, allocation, DNS and every address share the same absolute
      deadline, also bounded by the caller's handler budget. Synchronous DNS is
@@ -9695,13 +9865,17 @@ static KuRedisOpenResult ku_redis_open_connection(
   }
   int resolve_rc = getaddrinfo(hostname, service, &hints, &addresses);
   free(hostname);
+  if (resolve_rc != 0 && ku_redis_resolver_out_of_memory(resolve_rc)) {
+    if (addresses) freeaddrinfo(addresses);
+    return (KuRedisOpenResult){ false, 0, ku_redis_out_of_memory_err() };
+  }
   if (ku_redis_now_ms() >= deadline) {
     if (addresses) freeaddrinfo(addresses);
     return (KuRedisOpenResult){ false, 0, ku_redis_connect_timeout_err() };
   }
   if (resolve_rc != 0 || !addresses) {
     if (addresses) freeaddrinfo(addresses);
-    return (KuRedisOpenResult){ false, 0, ku_redis_err("redis host resolution failed") };
+    return (KuRedisOpenResult){ false, 0, ku_redis_connect_error_err() };
   }
 
   KuRedisSocket connected = KU_REDIS_INVALID_SOCKET;
@@ -9779,7 +9953,7 @@ static KuRedisOpenResult ku_redis_open_connection(
   if (connected == KU_REDIS_INVALID_SOCKET) {
     if (saw_timeout)
       return (KuRedisOpenResult){ false, 0, ku_redis_connect_timeout_err() };
-    return (KuRedisOpenResult){ false, 0, ku_redis_err("redis connect failed") };
+    return (KuRedisOpenResult){ false, 0, ku_redis_connect_error_err() };
   }
   KuRedis* redis = (KuRedis*)malloc(sizeof(KuRedis));
   if (!redis) {
@@ -9790,7 +9964,7 @@ static KuRedisOpenResult ku_redis_open_connection(
   if (ku_redis_gate_init(&redis->command_gate) != 0) {
     ku_redis_socket_close(connected);
     free(redis);
-    return (KuRedisOpenResult){ false, 0, ku_redis_err("redis command gate initialization failed") };
+    return (KuRedisOpenResult){ false, 0, ku_redis_sync_error_err() };
   }
   redis->timeout_ms = (uint32_t)timeout_ms;
   redis->operation_deadline = 0;
@@ -10116,7 +10290,14 @@ static KuRedisOpenResult ku_redis_open_authenticated(
       : ku_redis_connection_auth(opened.value, client->password, deadline);
     if (!auth.ok) {
       ku_redis_connection_destroy(opened.value);
-      return (KuRedisOpenResult){ false, NULL, auth.error };
+      if (ku_redis_error_code_is(auth.error, "auth_failed")
+          || ku_redis_error_code_is(auth.error, "out_of_memory")) {
+        return (KuRedisOpenResult){ false, NULL, auth.error };
+      }
+      int timed_out = ku_redis_error_code_is(auth.error, "timeout");
+      ku_error_drop(&auth.error);
+      return (KuRedisOpenResult){ false, NULL,
+        timed_out ? ku_redis_connect_timeout_err() : ku_redis_connect_error_err() };
     }
   }
   opened.value->timeout_ms = client->command_timeout_ms;
@@ -10246,8 +10427,7 @@ static KuResult_redis_client ku_redis_client(KuObject* config) {
   memset(client->idle, 0, (size_t)max_connections * sizeof(KuRedis*));
   if (ku_redis_pool_sync_init(&client->sync) != 0) {
     ku_redis_client_free_unpublished(client, 0);
-    return (KuResult_redis_client){ false, NULL,
-      ku_redis_err("redis client synchronization initialization failed") };
+    return (KuResult_redis_client){ false, NULL, ku_redis_sync_error_err() };
   }
 
   /* Validate networking and AUTH before publishing the client. Further pool
@@ -10266,26 +10446,36 @@ static KuResult_redis_client ku_redis_client(KuObject* config) {
 }
 
 /* Called with the pool lock held. Preserve wake-one efficiency without losing
-   a released slot when the selected waiter reaches its deadline first. */
+   a released slot when the signaled waiter reaches its deadline first. */
 static void ku_redis_client_handoff_available_locked(KuRedisClient* client) {
   if (client->waiters != 0
       && (client->idle_count != 0
-          || client->total_connections < client->max_connections)) {
+          || (!client->connect_in_flight
+              && ku_redis_now_ms() >= client->reconnect_not_before_ms
+              && client->total_connections < client->max_connections))) {
     ku_redis_pool_wake_one(&client->sync);
   }
+}
+
+/* Keep exactly one reconnect deadline represented by a timed waiter. The
+   current waiter is still included in client->waiters at this point. */
+static void ku_redis_client_release_backoff_timer_locked(
+    KuRedisClient* client, int owned) {
+  if (!owned) return;
+  client->backoff_timer_armed = 0;
+  if (client->waiters > 1) ku_redis_pool_wake_one(&client->sync);
 }
 
 static KuRedisLeaseResult ku_redis_client_acquire(
     KuRedisClient* client,
     unsigned long long command_deadline) {
   if (!client)
-    return (KuRedisLeaseResult){ false, NULL, ku_redis_closed_err() };
+    return (KuRedisLeaseResult){ false, NULL, ku_redis_client_closed_err() };
   unsigned long long acquire_deadline = ku_redis_earlier_deadline(
       command_deadline,
       ku_redis_deadline_after_ms(client->acquire_timeout_ms));
   if (ku_redis_pool_lock(&client->sync) != 0) {
-    fputs("redis client mutex lock failed\n", stderr);
-    exit(1);
+    return (KuRedisLeaseResult){ false, NULL, ku_redis_sync_error_err() };
   }
   int registered_waiter = 0;
   for (;;) {
@@ -10294,7 +10484,7 @@ static KuRedisLeaseResult ku_redis_client_acquire(
       int dispose = ku_redis_client_ready_to_dispose(client);
       ku_redis_pool_unlock(&client->sync);
       if (dispose) ku_redis_client_free_unpublished(client, 1);
-      return (KuRedisLeaseResult){ false, NULL, ku_redis_closed_err() };
+      return (KuRedisLeaseResult){ false, NULL, ku_redis_client_closed_err() };
     }
     if (ku_redis_now_ms() >= acquire_deadline) {
       if (registered_waiter) {
@@ -10304,7 +10494,8 @@ static KuRedisLeaseResult ku_redis_client_acquire(
       ku_redis_pool_unlock(&client->sync);
       return (KuRedisLeaseResult){ false, NULL, ku_redis_acquire_timeout_err() };
     }
-    if (client->idle_count != 0) {
+    int can_claim = registered_waiter || client->waiters == 0;
+    if (can_claim && client->idle_count != 0) {
       KuRedis* connection = client->idle[--client->idle_count];
       client->idle[client->idle_count] = NULL;
       client->borrowed++;
@@ -10312,22 +10503,36 @@ static KuRedisLeaseResult ku_redis_client_acquire(
       ku_redis_pool_unlock(&client->sync);
       return (KuRedisLeaseResult){ true, connection, (KuError){0} };
     }
-    if (client->total_connections < client->max_connections) {
+    if (can_claim && !client->connect_in_flight
+        && ku_redis_now_ms() >= client->reconnect_not_before_ms
+        && client->total_connections < client->max_connections) {
       client->total_connections++;
       client->borrowed++;
+      client->connect_in_flight = 1;
       if (registered_waiter) client->waiters--;
       ku_redis_pool_unlock(&client->sync);
 
+      unsigned long long connect_budget_deadline = ku_redis_saturating_add_ms(
+          ku_redis_now_ms(), client->connect_timeout_ms);
+      int acquire_limited_connect = acquire_deadline <= connect_budget_deadline;
       unsigned long long connect_deadline = ku_redis_earlier_deadline(
-          acquire_deadline,
-          ku_redis_deadline_after_ms(client->connect_timeout_ms));
+          acquire_deadline, connect_budget_deadline);
       KuRedisOpenResult opened = ku_redis_open_authenticated(client, connect_deadline);
+      if (!opened.ok && acquire_limited_connect
+          && ku_redis_now_ms() >= acquire_deadline
+          && ku_redis_error_code_is(opened.error, "connect_timeout")) {
+        ku_error_drop(&opened.error);
+        opened.error = ku_redis_acquire_timeout_err();
+      }
       if (ku_redis_pool_lock(&client->sync) != 0) {
         fputs("redis client mutex lock failed after connect\n", stderr);
         exit(1);
       }
       int closed = client->closing;
       int expired = ku_redis_now_ms() >= acquire_deadline;
+      client->connect_in_flight = 0;
+      if (opened.ok) ku_redis_record_connect_success_locked(client);
+      else ku_redis_record_connect_failure_locked(client, ku_redis_now_ms());
       if (!opened.ok || closed || expired) {
         client->total_connections--;
         client->borrowed--;
@@ -10339,21 +10544,39 @@ static KuRedisLeaseResult ku_redis_client_acquire(
         if (dispose) ku_redis_client_free_unpublished(client, 1);
         if (!opened.ok) return (KuRedisLeaseResult){ false, NULL, opened.error };
         return (KuRedisLeaseResult){ false, NULL,
-          closed ? ku_redis_closed_err() : ku_redis_acquire_timeout_err() };
+          closed ? ku_redis_client_closed_err() : ku_redis_acquire_timeout_err() };
       }
+      ku_redis_pool_wake_one(&client->sync);
       ku_redis_pool_unlock(&client->sync);
       return (KuRedisLeaseResult){ true, opened.value, (KuError){0} };
     }
     if (!registered_waiter) {
       if (client->max_waiters == 0 || client->waiters >= client->max_waiters) {
         ku_redis_pool_unlock(&client->sync);
-        return (KuRedisLeaseResult){ false, NULL, ku_redis_pool_exhausted_err() };
+        return (KuRedisLeaseResult){ false, NULL, ku_redis_pool_busy_err() };
       }
       client->waiters++;
       registered_waiter = 1;
     }
-    int wait_result = ku_redis_pool_wait_until(&client->sync, acquire_deadline);
+    unsigned long long wait_deadline = acquire_deadline;
+    int owns_backoff_timer = 0;
+    unsigned long long now = ku_redis_now_ms();
+    if (client->reconnect_not_before_ms > now
+        && !client->backoff_timer_armed) {
+      client->backoff_timer_armed = 1;
+      owns_backoff_timer = 1;
+      if (client->reconnect_not_before_ms < wait_deadline) {
+        wait_deadline = client->reconnect_not_before_ms;
+      }
+    }
+    int wait_result = ku_redis_pool_wait_until(&client->sync, wait_deadline);
+    ku_redis_client_release_backoff_timer_locked(client, owns_backoff_timer);
     if (wait_result != 0) {
+      now = ku_redis_now_ms();
+      if (wait_result == -2 && wait_deadline < acquire_deadline
+          && now < acquire_deadline) {
+        continue;
+      }
       client->waiters--;
       if (client->closing) ku_redis_pool_wake_all(&client->sync);
       else ku_redis_client_handoff_available_locked(client);
@@ -10362,7 +10585,7 @@ static KuRedisLeaseResult ku_redis_client_acquire(
       if (dispose) ku_redis_client_free_unpublished(client, 1);
       return (KuRedisLeaseResult){ false, NULL,
         wait_result == -2 ? ku_redis_acquire_timeout_err()
-                          : ku_redis_err("redis client wait failed") };
+                          : ku_redis_sync_error_err() };
     }
   }
 }
@@ -10398,6 +10621,7 @@ static unsigned long long ku_redis_client_command_deadline(KuRedisClient* client
 }
 
 static KuResult_null ku_redis_ping(KuRedisClient* client) {
+  if (!client) return (KuResult_null){ false, 0, ku_redis_client_closed_err() };
   unsigned long long deadline = ku_redis_client_command_deadline(client);
   if (!deadline || ku_redis_now_ms() >= deadline)
     return (KuResult_null){ false, 0, ku_redis_command_timeout_err() };
@@ -10409,6 +10633,7 @@ static KuResult_null ku_redis_ping(KuRedisClient* client) {
 }
 
 static KuResult_null ku_redis_set(KuRedisClient* client, KuString key, KuString value) {
+  if (!client) return (KuResult_null){ false, 0, ku_redis_client_closed_err() };
   unsigned long long deadline = ku_redis_client_command_deadline(client);
   if (!deadline || ku_redis_now_ms() >= deadline)
     return (KuResult_null){ false, 0, ku_redis_command_timeout_err() };
@@ -10420,6 +10645,8 @@ static KuResult_null ku_redis_set(KuRedisClient* client, KuString key, KuString 
 }
 
 static KuResult_str ku_redis_get(KuRedisClient* client, KuString key) {
+  if (!client)
+    return (KuResult_str){ false, (KuString){0}, ku_redis_client_closed_err() };
   unsigned long long deadline = ku_redis_client_command_deadline(client);
   if (!deadline || ku_redis_now_ms() >= deadline)
     return (KuResult_str){ false, (KuString){0}, ku_redis_command_timeout_err() };
@@ -10431,6 +10658,7 @@ static KuResult_str ku_redis_get(KuRedisClient* client, KuString key) {
 }
 
 static KuResult_int ku_redis_del(KuRedisClient* client, KuString key) {
+  if (!client) return (KuResult_int){ false, 0, ku_redis_client_closed_err() };
   unsigned long long deadline = ku_redis_client_command_deadline(client);
   if (!deadline || ku_redis_now_ms() >= deadline)
     return (KuResult_int){ false, 0, ku_redis_command_timeout_err() };
@@ -10442,6 +10670,7 @@ static KuResult_int ku_redis_del(KuRedisClient* client, KuString key) {
 }
 
 static KuResult_bool ku_redis_exists(KuRedisClient* client, KuString key) {
+  if (!client) return (KuResult_bool){ false, false, ku_redis_client_closed_err() };
   unsigned long long deadline = ku_redis_client_command_deadline(client);
   if (!deadline || ku_redis_now_ms() >= deadline)
     return (KuResult_bool){ false, false, ku_redis_command_timeout_err() };
@@ -10459,15 +10688,17 @@ static uint8_t ku_redis_close(KuRedisClient* client) {
     exit(1);
   }
   client->closing = 1;
-  for (uint32_t index = 0; index < client->idle_count; index++) {
-    ku_redis_connection_destroy(client->idle[index]);
-    client->idle[index] = NULL;
-  }
-  client->total_connections -= client->idle_count;
+  KuRedis** detached_idle = client->idle;
+  uint32_t detached_count = client->idle_count;
+  client->idle = NULL;
+  client->total_connections -= detached_count;
   client->idle_count = 0;
   ku_redis_pool_wake_all(&client->sync);
   int dispose = ku_redis_client_ready_to_dispose(client);
   ku_redis_pool_unlock(&client->sync);
+  for (uint32_t index = 0; index < detached_count; index++)
+    ku_redis_connection_destroy(detached_idle[index]);
+  free(detached_idle);
   if (dispose) ku_redis_client_free_unpublished(client, 1);
   return 0;
 }
@@ -10786,6 +11017,7 @@ fn emit_pg_runtime(out: &mut String, program: &IrProgram) {
         "#define KU_PG_CONNECT_FAILED 0\n",
         "#define KU_PG_CONNECT_OK 1\n",
         "#define KU_PG_CONNECT_TIMED_OUT 2\n",
+        "#define KU_PG_CONNECT_OUT_OF_MEMORY 3\n",
         "#define KU_PG_WAIT_ACTIVE 0\n",
         "#define KU_PG_WAIT_READ 1\n",
         "#define KU_PG_WAIT_WRITE 2\n",
@@ -10867,7 +11099,10 @@ fn emit_pg_runtime(out: &mut String, program: &IrProgram) {
            cannot hard-cancel the resolver. */
         "  PGconn* h = PQconnectStartParams(keywords, values, 1);\n",
         "  now = KU_PG_MONOTONIC_MS();\n",
-        "  if (!h) { attempt.outcome = now >= deadline ? KU_PG_CONNECT_TIMED_OUT : KU_PG_CONNECT_FAILED; return attempt; }\n",
+        /* libpq documents NULL here as failure to allocate the PGconn itself.
+           The pre-call deadline check already handled an expired budget, so do
+           not overwrite this exact allocation failure with a timeout. */
+        "  if (!h) { attempt.outcome = KU_PG_CONNECT_OUT_OF_MEMORY; return attempt; }\n",
         "  if (now >= deadline) { PQfinish(h); attempt.outcome = KU_PG_CONNECT_TIMED_OUT; return attempt; }\n",
         "  if (PQstatus(h) == KU_PG_CONNECTION_BAD) { PQfinish(h); return attempt; }\n",
         "  int direction = KU_PG_WAIT_WRITE;\n",
@@ -11327,8 +11562,21 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "#define KU_PG_CLIENT_DEFAULT_CONNECT_TIMEOUT_MS 5000LL\n",
             "#define KU_PG_CLIENT_DEFAULT_ACQUIRE_TIMEOUT_MS 5000LL\n",
             "#define KU_PG_CLIENT_DEFAULT_QUERY_TIMEOUT_MS 30000LL\n",
-            "struct KuPgClient { PGconn** conns; char* in_use; size_t size; size_t max_waiters; char* conninfo; size_t conninfo_len; unsigned long long connect_timeout_ms, acquire_timeout_ms, query_timeout_ms; KuPgMutex lock; KuPgCond cv; size_t active; size_t waiters; int closing; };\n",
+            "struct KuPgClient { PGconn** conns; char* in_use; size_t size; size_t max_waiters; char* conninfo; size_t conninfo_len; unsigned long long connect_timeout_ms, acquire_timeout_ms, query_timeout_ms; KuPgMutex lock; KuPgCond cv; size_t active; size_t waiters; uint32_t consecutive_connect_failures; unsigned long long reconnect_not_before_ms; int closing; int connect_in_flight; int backoff_timer_armed; };\n",
             "static void ku_pg_client_dispose(KuPgClient* p);\n",
+            "static unsigned long long ku_pg_client_saturating_add_ms(unsigned long long now, unsigned long long delay) { return ~0ULL - now < delay ? ~0ULL : now + delay; }\n",
+            "static unsigned long long ku_pg_client_backoff_delay_ms(KuPgClient* p, unsigned long long now) {\n",
+            "  uint32_t failures = p->consecutive_connect_failures; unsigned int shift = failures > 6U ? 6U : (failures ? failures - 1U : 0U);\n",
+            "  unsigned long long window = 25ULL << shift; if (window > 1000ULL) window = 1000ULL;\n",
+            "  unsigned long long mixed = (unsigned long long)(uintptr_t)p ^ now ^ ((unsigned long long)failures * 0x9e3779b97f4a7c15ULL);\n",
+            "  mixed ^= mixed >> 30; mixed *= 0xbf58476d1ce4e5b9ULL; mixed ^= mixed >> 27; mixed *= 0x94d049bb133111ebULL; mixed ^= mixed >> 31;\n",
+            "  unsigned long long lower = (window + 1ULL) / 2ULL; return lower + mixed % (window - lower + 1ULL);\n",
+            "}\n",
+            "static void ku_pg_client_record_connect_failure_locked(KuPgClient* p, unsigned long long now) {\n",
+            "  if (p->consecutive_connect_failures != UINT32_MAX) p->consecutive_connect_failures++;\n",
+            "  p->reconnect_not_before_ms = ku_pg_client_saturating_add_ms(now, ku_pg_client_backoff_delay_ms(p, now));\n",
+            "}\n",
+            "static void ku_pg_client_record_connect_success_locked(KuPgClient* p) { p->consecutive_connect_failures = 0; p->reconnect_not_before_ms = 0; }\n",
             "static KuError ku_pg_invalid_config(const char* message, size_t len) { return ku_pg_client_error(\"invalid_config\", sizeof(\"invalid_config\") - 1, message, len); }\n",
             "static KuValue* ku_pg_client_config_get(KuObject* config, const char* key, size_t len) { return config ? ku_object_get(config, ku_string_static((const uint8_t*)key, len)) : 0; }\n",
             "static int ku_pg_client_config_int(KuObject* config, const char* key, size_t key_len, int64_t fallback, int64_t minimum, int64_t maximum, int64_t* out, KuError* error) {\n",
@@ -11355,13 +11603,14 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "  p->conninfo = (char*)malloc(conninfo.len + 1);\n",
             "  if (!p->conns || !p->in_use || !p->conninfo) { free(p->conns); free(p->in_use); free(p->conninfo); free(p); return (KuResult_pg_client){ false, 0, ku_pg_out_of_memory_error() }; }\n",
             "  if (conninfo.len) memcpy(p->conninfo, conninfo.ptr, conninfo.len); p->conninfo[conninfo.len] = '\\0';\n",
-            "  if (ku_pg_sync_init(&p->lock, &p->cv) != 0) { free(p->conns); free(p->in_use); ku_pg_wipe_secret(p->conninfo, p->conninfo_len); free(p->conninfo); free(p); return (KuResult_pg_client){ false, 0, ku_pg_client_error(\"client_error\", sizeof(\"client_error\") - 1, \"PostgreSQL client synchronization initialization failed\", sizeof(\"PostgreSQL client synchronization initialization failed\") - 1) }; }\n",
+            "  if (ku_pg_sync_init(&p->lock, &p->cv) != 0) { free(p->conns); free(p->in_use); ku_pg_wipe_secret(p->conninfo, p->conninfo_len); free(p->conninfo); free(p); return (KuResult_pg_client){ false, 0, ku_pg_client_error(\"sync_error\", sizeof(\"sync_error\") - 1, \"PostgreSQL client synchronization initialization failed\", sizeof(\"PostgreSQL client synchronization initialization failed\") - 1) }; }\n",
             "  unsigned long long initial_deadline = ku_pg_deadline_after_ms(p->connect_timeout_ms);\n",
             "  KuPgConnectAttempt initial_attempt = ku_pg_connect_until(p->conninfo, initial_deadline);\n",
             "  PGconn* initial = initial_attempt.conn;\n",
             "  if (!initial) {\n",
             "    ku_pg_sync_destroy(&p->lock, &p->cv); free(p->conns); free(p->in_use); ku_pg_wipe_secret(p->conninfo, p->conninfo_len); free(p->conninfo); free(p);\n",
-            "    return (KuResult_pg_client){ false, 0, initial_attempt.outcome == KU_PG_CONNECT_TIMED_OUT ? ku_pg_static_error(\"connect_timeout\", sizeof(\"connect_timeout\") - 1, \"PostgreSQL client connection timed out\", sizeof(\"PostgreSQL client connection timed out\") - 1) : ku_pg_connect_failure_error() };\n",
+            "    KuError initial_error = initial_attempt.outcome == KU_PG_CONNECT_OUT_OF_MEMORY ? ku_pg_out_of_memory_error() : (initial_attempt.outcome == KU_PG_CONNECT_TIMED_OUT ? ku_pg_static_error(\"connect_timeout\", sizeof(\"connect_timeout\") - 1, \"PostgreSQL client connection timed out\", sizeof(\"PostgreSQL client connection timed out\") - 1) : ku_pg_connect_failure_error());\n",
+            "    return (KuResult_pg_client){ false, 0, initial_error };\n",
             "  }\n",
             "  p->conns[0] = initial;\n",
             "  return (KuResult_pg_client){ true, p, (KuError){0} };\n",
@@ -11377,7 +11626,12 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "}\n",
             "static void ku_pg_client_handoff_available_locked(KuPgClient* p) {\n",
             "  if (!p || p->waiters == 0) return;\n",
-            "  for (size_t i = 0; i < p->size; i++) if (!p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }\n",
+            "  for (size_t i = 0; i < p->size; i++) if (p->conns[i] && !p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }\n",
+            "  if (p->connect_in_flight || ku_pg_now_ms() < p->reconnect_not_before_ms) return;\n",
+            "  for (size_t i = 0; i < p->size; i++) if (!p->conns[i] && !p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }\n",
+            "}\n",
+            "static void ku_pg_client_release_backoff_timer_locked(KuPgClient* p, int owned) {\n",
+            "  if (!owned) return; p->backoff_timer_armed = 0; if (p->waiters != 0) ku_pg_cond_signal(&p->cv);\n",
             "}\n",
             // Acquire a slot (blocking). Returns slot index and sets *out; on connect
             // failure returns -1 with a static structured error. A reserved slot has
@@ -11388,46 +11642,52 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "  unsigned long long deadline = ~0ULL - started < p->acquire_timeout_ms ? ~0ULL : started + p->acquire_timeout_ms;\n",
             "  if (__ku_handler_deadline != 0 && __ku_handler_deadline < deadline) deadline = __ku_handler_deadline;\n",
             "  if (operation_deadline != 0 && operation_deadline < deadline) deadline = operation_deadline;\n",
+            "  int has_waited = 0;\n",
             "  ku_pg_mutex_lock(&p->lock);\n",
             "  for (;;) {\n",
             "    if (p->closing) { ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1); return -1; }\n",
             "    unsigned long long now = ku_pg_now_ms();\n",
             "    if (now >= deadline) { ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
-            "    for (size_t i = 0; i < p->size; i++) if (p->conns[i] && !p->in_use[i]) { p->in_use[i] = 1; p->active++; *out = p->conns[i]; ku_pg_mutex_unlock(&p->lock); return (int)i; }\n",
+            "    int can_claim = has_waited || p->waiters == 0;\n",
+            "    if (can_claim) for (size_t i = 0; i < p->size; i++) if (p->conns[i] && !p->in_use[i]) { p->in_use[i] = 1; p->active++; *out = p->conns[i]; ku_pg_mutex_unlock(&p->lock); return (int)i; }\n",
             "    int made = -1;\n",
-            "    for (size_t i = 0; i < p->size; i++) if (!p->conns[i] && !p->in_use[i]) { p->in_use[i] = 1; p->active++; made = (int)i; break; }\n",
+            "    if (can_claim && !p->connect_in_flight && now >= p->reconnect_not_before_ms) for (size_t i = 0; i < p->size; i++) if (!p->conns[i] && !p->in_use[i]) { p->in_use[i] = 1; p->active++; p->connect_in_flight = 1; made = (int)i; break; }\n",
             "    if (made >= 0) {\n",
             "      now = ku_pg_now_ms();\n",
             "      if (now >= deadline) {\n",
-            "        p->in_use[made] = 0; p->active--; ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "        p->connect_in_flight = 0; p->in_use[made] = 0; p->active--; ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
             "        *err = ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1); return -1;\n",
             "      }\n",
             "      ku_pg_mutex_unlock(&p->lock);\n",
-            "      unsigned long long connect_deadline = ~0ULL - now < p->connect_timeout_ms ? ~0ULL : now + p->connect_timeout_ms; if (deadline < connect_deadline) connect_deadline = deadline;\n",
+            "      unsigned long long connect_budget_deadline = ku_pg_client_saturating_add_ms(now, p->connect_timeout_ms); int acquire_limited_connect = deadline <= connect_budget_deadline; unsigned long long connect_deadline = acquire_limited_connect ? deadline : connect_budget_deadline;\n",
             "      KuPgConnectAttempt connect_attempt = ku_pg_connect_until(p->conninfo, connect_deadline);\n",
             "      PGconn* h = connect_attempt.conn;\n",
             "      if (!h) {\n",
-            "        KuError e = connect_attempt.outcome == KU_PG_CONNECT_TIMED_OUT ? ku_pg_static_error(\"connect_timeout\", sizeof(\"connect_timeout\") - 1, \"timed out connecting a PostgreSQL client connection\", sizeof(\"timed out connecting a PostgreSQL client connection\") - 1) : ku_pg_connect_failure_error();\n",
-            "        ku_pg_mutex_lock(&p->lock); p->in_use[made] = 0; p->active--; int dispose = p->closing && p->active == 0 && p->waiters == 0; if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "        KuError e = connect_attempt.outcome == KU_PG_CONNECT_OUT_OF_MEMORY ? ku_pg_out_of_memory_error() : (connect_attempt.outcome == KU_PG_CONNECT_TIMED_OUT ? (acquire_limited_connect ? ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1) : ku_pg_static_error(\"connect_timeout\", sizeof(\"connect_timeout\") - 1, \"timed out connecting a PostgreSQL client connection\", sizeof(\"timed out connecting a PostgreSQL client connection\") - 1)) : ku_pg_connect_failure_error());\n",
+            "        ku_pg_mutex_lock(&p->lock); p->connect_in_flight = 0; ku_pg_client_record_connect_failure_locked(p, ku_pg_now_ms()); p->in_use[made] = 0; p->active--; int dispose = p->closing && p->active == 0 && p->waiters == 0; if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
             "        *err = e; if (dispose) ku_pg_client_dispose(p); return -1;\n",
             "      }\n",
             "      ku_pg_mutex_lock(&p->lock);\n",
+            "      p->connect_in_flight = 0; ku_pg_client_record_connect_success_locked(p);\n",
             /* This thread can be descheduled after the poll helper succeeds and
                before it reacquires the pool lock. Re-check the absolute deadline
                while holding the lock so an expired reservation is rolled back
                instead of being installed and used by the query pump. */
             "      int connect_expired = ku_pg_now_ms() >= deadline;\n",
             "      if (p->closing || connect_expired) { int client_closing = p->closing; p->in_use[made] = 0; p->active--; int dispose = p->closing && p->active == 0 && p->waiters == 0; if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock); PQfinish(h); *err = client_closing ? ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1) : ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
-            "      p->conns[made] = h; ku_pg_mutex_unlock(&p->lock);\n",
+            "      p->conns[made] = h; ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
             "      *out = h; return made;\n",
             "    }\n",
             "    now = ku_pg_now_ms();\n",
             "    if (now >= deadline) { ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
-            "    if (p->waiters >= p->max_waiters) { ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"too_many_waiters\", sizeof(\"too_many_waiters\") - 1, \"PostgreSQL client waiter limit reached\", sizeof(\"PostgreSQL client waiter limit reached\") - 1); return -1; }\n",
-            "    unsigned long long remaining = deadline - now;\n",
-            "    p->waiters++; int wait_result = ku_pg_cond_wait_ms(&p->cv, &p->lock, remaining); p->waiters--;\n",
+            "    if (p->waiters >= p->max_waiters) { ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"pool_busy\", sizeof(\"pool_busy\") - 1, \"PostgreSQL client waiter limit reached\", sizeof(\"PostgreSQL client waiter limit reached\") - 1); return -1; }\n",
+            "    unsigned long long wait_deadline = deadline; int owns_backoff_timer = 0;\n",
+            "    if (p->reconnect_not_before_ms > now && !p->backoff_timer_armed) { p->backoff_timer_armed = 1; owns_backoff_timer = 1; if (p->reconnect_not_before_ms < wait_deadline) wait_deadline = p->reconnect_not_before_ms; }\n",
+            "    unsigned long long remaining = wait_deadline - now;\n",
+            "    p->waiters++; int wait_result = ku_pg_cond_wait_ms(&p->cv, &p->lock, remaining); p->waiters--; ku_pg_client_release_backoff_timer_locked(p, owns_backoff_timer);\n",
             "    if (p->closing) { int dispose = p->active == 0 && p->waiters == 0; ku_pg_cond_broadcast(&p->cv); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
-            "    if (wait_result != 0) { ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = wait_result == 1 ? ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1) : ku_pg_client_error(\"client_error\", sizeof(\"client_error\") - 1, \"failed waiting for a PostgreSQL client connection\", sizeof(\"failed waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
+            "    if (wait_result != 0) { now = ku_pg_now_ms(); if (wait_result == 1 && wait_deadline < deadline && now < deadline) { has_waited = 1; continue; } ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = wait_result == 1 ? ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1) : ku_pg_client_error(\"sync_error\", sizeof(\"sync_error\") - 1, \"failed waiting for a PostgreSQL client connection\", sizeof(\"failed waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
+            "    has_waited = 1;\n",
             "  }\n",
             "}\n",
             // A single-query pool API must never hand a transaction/session in an
@@ -11453,12 +11713,17 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "  return !ku_pg_connection_is_utf8(c);\n",
             "}\n",
             "static void ku_pg_client_release(KuPgClient* p, int slot, int broken, unsigned long long deadline) {\n",
-            "  broken = ku_pg_client_cleanup_connection(p->conns[slot], broken, deadline);\n",
             "  ku_pg_mutex_lock(&p->lock);\n",
-            "  if ((broken || p->closing) && p->conns[slot]) { PQfinish(p->conns[slot]); p->conns[slot] = 0; }\n",
+            "  int cleanup_allowed = !p->closing; PGconn* connection = p->conns[slot];\n",
+            "  ku_pg_mutex_unlock(&p->lock);\n",
+            "  if (!cleanup_allowed) broken = 1; else broken = ku_pg_client_cleanup_connection(connection, broken, deadline);\n",
+            "  ku_pg_mutex_lock(&p->lock);\n",
+            "  PGconn* discard = 0;\n",
+            "  if ((broken || p->closing) && p->conns[slot]) { discard = p->conns[slot]; p->conns[slot] = 0; }\n",
             "  p->in_use[slot] = 0; if (p->active > 0) p->active--;\n",
             "  int dispose = p->closing && p->active == 0 && p->waiters == 0;\n",
             "  if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "  if (discard) PQfinish(discard);\n",
             "  if (dispose) ku_pg_client_dispose(p);\n",
             "}\n",
             "static KuResult_pg_result ku_pg_client_query(KuPgClient* p, KuString sql, KuArray_str params) {\n",

@@ -191,9 +191,9 @@ fn main(): null! {
 }
 ```
 
-- **统一写法**：三个驱动都只公开 `module.client(config)?`，client 内部自动维护有界连接池；业务代码只调用 receiver 方法。连接数和等待者数有硬上限，所有操作共享绝对预算；同步 DNS、libpq/SSL 内部调用和 libmysqlclient FFI 不能被 portable C 硬抢占，只能在返回后复核 deadline 并淘汰过期连接。0.0.x 直接删除旧 raw connection、手动 pool 和模块级 query 入口，不提供兼容别名。
+- **统一写法**：三个驱动都只公开 `module.client(config)?`，client 内部自动维护有界连接池；业务代码只调用 receiver 方法。连接数和等待者数有硬上限，所有操作共享绝对预算；同步 DNS、libpq/SSL 内部调用和 libmysqlclient FFI 不能被 portable C 硬抢占，只能在返回后复核 deadline 并淘汰过期连接。0.0.x 直接删除旧 raw connection、手动 pool 和模块级 query 入口，不提供兼容别名。构造前配置校验统一返回 `invalid_config`；client/池层跨驱动统一为 `client_closed`、`pool_busy`、`acquire_timeout`、`connect_timeout`、`connect_error`、`sync_error`、`out_of_memory`，阶段和重试边界见[版本记录](docs/v0.0.16.md#数据库驱动stdpg--stdredis--stdmysql)。
 - **std.pg**（libpq 9.2+）：`client.query(sql, params)` 始终走服务端参数绑定，无参数也传 `[]`；`result.rows()` / `cols()` / `value()` / `is_null()` 读取与连接脱钩的 owned 结果。内部复用 nonblocking poll、单行增量聚合、严格 UTF-8/NULL/边界与 64 MiB 文本上限；每次归还前在原 query deadline 内执行 `DISCARD ALL`，非 IDLE、reset 失败、超时或协议失步只淘汰对应连接，不自动重放 SQL。
-- **std.redis**（自实现 RESP2-over-socket，零外部依赖）：client 配置中的用户名/密码会应用到每条懒创建连接；提供 `ping/get/set/exists/del`。`get` 只有一种严格语义：缺键返回 `redis/key_not_found`，不再把缺键折叠为空串。坏帧或 I/O 超时只淘汰对应连接；AUTH 拒绝与 transport/OOM/timeout 保持不同错误，服务端文本不直接进入诊断。
+- **std.redis**（自实现 RESP2-over-socket，零外部依赖）：client 配置中的用户名/密码会应用到每条懒创建连接；提供 `ping/get/set/exists/del`。`get` 只有一种严格语义：缺键返回 `redis/key_not_found`，不再把缺键折叠为空串。坏帧或 I/O 超时只淘汰对应连接；AUTH 拒绝、建连 transport、建连 timeout、池 timeout、命令 timeout 和 OOM 分阶段返回固定错误，服务端文本不直接进入诊断。
 - **std.mysql**（libmysqlclient）：`client.query(sql, params)` 和 `client.execute(sql, params)` 都使用真正的 `MYSQL_STMT` 参数绑定，不再做 escape 后的 SQL 拼接；结果复制到 Ku owned、有上限的表后再归还连接。statement 清理后调用 `mysql_reset_connection()` 清除事务、临时表、锁和 session 变量，清理/reset 失败即淘汰单槽；自动 reconnect 与 `LOCAL INFILE` 都显式关闭。当前不支持 SQL NULL 输入参数和任意 binary 列。
 
 SQL 错误有一条必须遵守的重试边界：语句发送前的配置、连接和借用失败保留各自错误；语句发送后无法确认终态返回 `execution_unknown`，已收到成功终态但本地结果无法交付返回 `execution_completed_without_result`。这两个错误都表示不能自动重试，否则 INSERT/UPDATE 可能重复执行。驱动自身从不重放 SQL。各结果上限是单次结果的防护，不是进程总内存硬上限；并发持有多个 detached result 时仍应使用进程级资源限制。
@@ -201,6 +201,8 @@ SQL 错误有一条必须遵守的重试边界：语句发送前的配置、连�
 Redis 当前是明文 TCP，MySQL 当前也没有跨 Oracle/MariaDB 一致、fail-closed 的证书和主机名验证配置；二者只能直连 loopback/受控私网或已验证的 TLS tunnel。PostgreSQL 远程连接必须在 conninfo 中显式使用 `sslmode=verify-full` 和可信 `sslrootcert`。
 
 client 的 `close()` 消费 Ku owned 句柄并立即拒绝新借用；已有借用由最后一个归还者完成延迟销毁，不用无界等待来“关池”。该保证以 Ku checker/closure 生命周期为边界；当前生成的数据库 helper 是 translation-unit 内部实现，不是第三方 C ABI，外部 C 调用方不能绕过所有权和 MySQL thread attach 规则并发 close/use 裸指针。
+
+连接恢复不会形成重拨风暴：一个 client 同时只执行一次懒建探测；失败退避窗口从 25ms 指数增长并封顶 1000ms，实际 equal-jitter 延迟落在 `ceil(window/2)..window`（首次 13～25ms）；健康空闲连接仍可立即借用。新请求必须先进入等待集合，不能以未排队身份直接夺取空闲槽；集合内由平台 condition variable 无序选择，不保证 FIFO 或无饥饿。`close()` 线性化前已开始的归还清理可能继续到完成，活动借用计数保证底层 client 不会被提前释放。
 
 **稳定与安全**:路径级所有权 checker(部分 move 分析)作为第一道防线;对抗式审计发现并修复了循环内 `catch` 错误绑定、`?` 借用解包、`array.push` 字面量的内存泄漏。
 

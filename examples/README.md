@@ -21,6 +21,8 @@ ku package pack examples/package
 
 `pg_demo.ku` / `redis_demo.ku` / `mysql_demo.ku` / `http_pg.ku` 使用 `std.pg` / `std.redis` / `std.mysql`。三者只有一种普通业务写法：`module.client(config)?` 创建内部自动池化的 client，随后调用 receiver 方法；旧的 raw connection / 手动 pool 模块函数不再支持。这些驱动目前**只支持 native 后端**(`ku build --native`),解释器 `ku run` 暂不支持连库。
 
+三个驱动的构造前配置错误统一为 `invalid_config`。业务 `catch(err)` 可以跨驱动统一处理 client/池阶段的 `client_closed`、`pool_busy`、`acquire_timeout`、`connect_timeout`、`connect_error`、`sync_error`、`out_of_memory`。命令或 SQL 已发送后的 `execution_unknown` / `execution_completed_without_result` 等错误不属于该集合，禁止自动重试。
+
 ### 凭据放在 gitignore 的本地文件里
 
 为避免把密码写进源码或误提交,这些示例从**运行目录**下的本地文件读取凭据。以下文件已在 `.gitignore`:
