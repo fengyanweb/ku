@@ -9,7 +9,10 @@ mod native_pg_harness;
 use std::fs;
 use std::process::Command;
 
-use native_pg_harness::{compile_harness, emit_c, run_bounded, TempDir, RUN_LIMITS, RUN_TIMEOUT};
+use native_pg_harness::{
+    compile_harness, emit_c, run_bounded, TempDir, NATIVE_THREAD_LIFECYCLE_HARNESS, RUN_LIMITS,
+    RUN_TIMEOUT,
+};
 
 #[test]
 fn native_redis_posix_destroy_failures_stop_before_connection_or_pool_free() {
@@ -228,6 +231,109 @@ int main(int argc, char** argv) {{
 }
 
 #[test]
+fn native_redis_real_threads_close_wakes_waiter_and_defers_one_dispose() {
+    let directory = TempDir::new("redis-pool-thread-lifecycle");
+    let generated = emit_c(
+        directory.path(),
+        r#"import redis from "std.redis"
+fn main(): null! {
+    client = redis.client({ host: "127.0.0.1", port: 6379, max_connections: 1 })?
+    client.close()
+    return ok(null)
+}
+"#,
+    );
+    let hook = format!(
+        r#"
+{NATIVE_THREAD_LIFECYCLE_HARNESS}
+#if defined(_WIN32)
+static volatile LONG ku_test_redis_dispose_calls = 0;
+static volatile LONG ku_test_redis_connection_destroy_calls = 0;
+static void ku_test_redis_record_dispose(void) {{
+  InterlockedIncrement(&ku_test_redis_dispose_calls);
+}}
+static void ku_test_redis_record_connection_destroy(void) {{
+  InterlockedIncrement(&ku_test_redis_connection_destroy_calls);
+}}
+static long ku_test_redis_load_dispose_calls(void) {{
+  return InterlockedCompareExchange(&ku_test_redis_dispose_calls, 0, 0);
+}}
+static long ku_test_redis_load_connection_destroy_calls(void) {{
+  return InterlockedCompareExchange(
+      &ku_test_redis_connection_destroy_calls, 0, 0);
+}}
+#else
+static _Atomic int ku_test_redis_dispose_calls = 0;
+static _Atomic int ku_test_redis_connection_destroy_calls = 0;
+static void ku_test_redis_record_dispose(void) {{
+  atomic_fetch_add_explicit(
+      &ku_test_redis_dispose_calls, 1, memory_order_relaxed);
+}}
+static void ku_test_redis_record_connection_destroy(void) {{
+  atomic_fetch_add_explicit(
+      &ku_test_redis_connection_destroy_calls, 1, memory_order_relaxed);
+}}
+static int ku_test_redis_load_dispose_calls(void) {{
+  return atomic_load_explicit(
+      &ku_test_redis_dispose_calls, memory_order_relaxed);
+}}
+static int ku_test_redis_load_connection_destroy_calls(void) {{
+  return atomic_load_explicit(
+      &ku_test_redis_connection_destroy_calls, memory_order_relaxed);
+}}
+#endif
+"#
+    );
+    let mut harness = generated
+        .replacen(
+            "typedef struct KuString {",
+            &format!("{hook}\ntypedef struct KuString {{"),
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int ku_generated_main(void) {",
+            1,
+        )
+        .replacen(
+            "static void ku_redis_connection_destroy(KuRedis* connection) {",
+            "static void ku_redis_connection_destroy(KuRedis* connection) { ku_test_redis_record_connection_destroy();",
+            1,
+        )
+        .replacen(
+            "static void ku_redis_client_free_unpublished(KuRedisClient* client, int sync_ready) {",
+            "static void ku_redis_client_free_unpublished(KuRedisClient* client, int sync_ready) { ku_test_redis_record_dispose();",
+            1,
+        );
+    harness.push_str(REDIS_THREAD_LIFECYCLE_MAIN);
+    let source = directory.path().join("redis-pool-thread-lifecycle.c");
+    fs::write(&source, harness).expect("write Redis real-thread lifecycle harness");
+    let Some(executable) =
+        compile_harness(directory.path(), &source, "redis-pool-thread-lifecycle")
+    else {
+        eprintln!("skip: no C compiler available for Redis real-thread lifecycle test");
+        return;
+    };
+    let mut command = Command::new(executable);
+    command.current_dir(directory.path());
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS).unwrap_or_else(|error| {
+        panic!("Redis real-thread lifecycle test was not bounded: {error}")
+    });
+    assert!(
+        output.status.success(),
+        "Redis real-thread lifecycle harness failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "redis real-thread lifecycle closed loop\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_redis_failures_are_catchable_bounded_and_release_resources() {
     let directory = TempDir::new("redis-failures");
     let generated = emit_c(
@@ -371,6 +477,142 @@ fn main(): null! {
         assert!(output.stderr.is_empty(), "unexpected Redis failure output");
     }
 }
+
+const REDIS_THREAD_LIFECYCLE_MAIN: &str = r#"
+#define THREAD_CHECK(value) do { \
+  if (!(value)) { \
+    fprintf(stderr, "thread lifecycle check failed at %d: %s\n", \
+        __LINE__, #value); \
+    return 1; \
+  } \
+} while (0)
+
+typedef struct KuTestRedisActiveWorker {
+  KuRedisClient* client;
+  KuTestEvent acquired;
+  KuTestEvent release;
+} KuTestRedisActiveWorker;
+
+static int ku_test_redis_active_worker(void* raw) {
+  KuTestRedisActiveWorker* worker = (KuTestRedisActiveWorker*)raw;
+  KuRedisLeaseResult lease = ku_redis_client_acquire(
+      worker->client, ku_redis_deadline_after_ms(60000));
+  if (!lease.ok || !lease.value) {
+    if (!lease.ok) ku_error_drop(&lease.error);
+    return 10;
+  }
+  if (!ku_test_event_set(&worker->acquired)) {
+    ku_redis_client_release(worker->client, lease.value);
+    return 11;
+  }
+  int released = ku_test_event_wait(&worker->release, 5000);
+  ku_redis_client_release(worker->client, lease.value);
+  return released ? 0 : 12;
+}
+
+static int ku_test_redis_waiter_worker(void* raw) {
+  KuRedisClient* client = (KuRedisClient*)raw;
+  KuRedisLeaseResult lease = ku_redis_client_acquire(
+      client, ku_redis_deadline_after_ms(60000));
+  if (lease.ok || lease.value) {
+    if (lease.ok) ku_redis_client_release(client, lease.value);
+    return 20;
+  }
+  int closed = ku_redis_error_code_is(lease.error, "client_closed");
+  ku_error_drop(&lease.error);
+  return closed ? 0 : 21;
+}
+
+static int ku_test_redis_close_worker(void* raw) {
+  ku_redis_close((KuRedisClient*)raw);
+  return 0;
+}
+
+static int ku_test_redis_wait_for_registered_waiter(
+    KuRedisClient* client, unsigned long timeout_ms) {
+  unsigned long long deadline = ku_test_real_now_ms() + timeout_ms;
+  for (;;) {
+    if (ku_redis_pool_lock(&client->sync) != 0) return 0;
+    int registered = client->waiters == 1 && client->borrowed == 1;
+    if (ku_redis_pool_unlock(&client->sync) != 0) return 0;
+    if (registered) return 1;
+    if (ku_test_real_now_ms() >= deadline) return 0;
+    ku_test_thread_yield();
+  }
+}
+
+static KuRedisClient* ku_test_redis_pool(void) {
+  KuRedisClient* client = (KuRedisClient*)calloc(1, sizeof(KuRedisClient));
+  if (!client) return NULL;
+  client->idle = (KuRedis**)calloc(1, sizeof(KuRedis*));
+  if (!client->idle) { free(client); return NULL; }
+  if (ku_redis_pool_sync_init(&client->sync) != 0) {
+    free(client->idle); free(client); return NULL;
+  }
+  KuRedis* connection = (KuRedis*)calloc(1, sizeof(KuRedis));
+  if (!connection) {
+    ku_redis_pool_sync_destroy(&client->sync);
+    free(client->idle); free(client); return NULL;
+  }
+  connection->sock = KU_REDIS_INVALID_SOCKET;
+  if (ku_redis_gate_init(&connection->command_gate) != 0) {
+    free(connection);
+    ku_redis_pool_sync_destroy(&client->sync);
+    free(client->idle); free(client); return NULL;
+  }
+  connection->timeout_ms = 60000;
+  client->max_connections = 1;
+  client->max_waiters = 1;
+  client->connect_timeout_ms = 60000;
+  client->acquire_timeout_ms = 60000;
+  client->command_timeout_ms = 60000;
+  client->total_connections = 1;
+  client->idle_count = 1;
+  client->idle[0] = connection;
+  return client;
+}
+
+int main(void) {
+  KuRedisClient* client = ku_test_redis_pool();
+  THREAD_CHECK(client != NULL);
+  KuTestRedisActiveWorker active = {0};
+  active.client = client;
+  THREAD_CHECK(ku_test_event_init(&active.acquired));
+  THREAD_CHECK(ku_test_event_init(&active.release));
+
+  KuTestThread active_thread = {0};
+  KuTestThread waiter_thread = {0};
+  KuTestThread close_thread = {0};
+  THREAD_CHECK(ku_test_thread_start(
+      &active_thread, ku_test_redis_active_worker, &active));
+  THREAD_CHECK(ku_test_event_wait(&active.acquired, 3000));
+  THREAD_CHECK(ku_test_thread_start(
+      &waiter_thread, ku_test_redis_waiter_worker, client));
+  THREAD_CHECK(ku_test_redis_wait_for_registered_waiter(client, 3000));
+  THREAD_CHECK(ku_test_thread_start(
+      &close_thread, ku_test_redis_close_worker, client));
+
+  /* The active connection remains gated. close() must return, wake the
+     registered waiter with client_closed, and leave ownership with release. */
+  THREAD_CHECK(ku_test_event_wait(&close_thread.finished, 3000));
+  THREAD_CHECK(ku_test_event_wait(&waiter_thread.finished, 3000));
+  THREAD_CHECK(close_thread.outcome == 0 && waiter_thread.outcome == 0);
+  THREAD_CHECK(ku_test_redis_load_dispose_calls() == 0);
+  THREAD_CHECK(ku_test_redis_load_connection_destroy_calls() == 0);
+
+  THREAD_CHECK(ku_test_event_set(&active.release));
+  THREAD_CHECK(ku_test_thread_join(&close_thread, 3000));
+  THREAD_CHECK(ku_test_thread_join(&waiter_thread, 3000));
+  THREAD_CHECK(ku_test_thread_join(&active_thread, 3000));
+  THREAD_CHECK(active_thread.outcome == 0);
+  THREAD_CHECK(ku_test_event_destroy(&active.acquired));
+  THREAD_CHECK(ku_test_event_destroy(&active.release));
+  THREAD_CHECK(ku_test_redis_load_connection_destroy_calls() == 1);
+  THREAD_CHECK(ku_test_redis_load_dispose_calls() == 1);
+  puts("redis real-thread lifecycle closed loop");
+  return 0;
+}
+"#;
 
 const ALLOCATION_HOOKS: &str = r#"
 static void* ku_test_malloc(size_t);

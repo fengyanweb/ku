@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use native_pg_harness::{
-    compile_harness, compile_harness_with_libpq, emit_c, run_bounded, TempDir, RUN_LIMITS,
-    RUN_TIMEOUT,
+    compile_harness, compile_harness_with_libpq, emit_c, run_bounded, TempDir,
+    NATIVE_THREAD_LIFECYCLE_HARNESS, RUN_LIMITS, RUN_TIMEOUT,
 };
 
 fn fixture() -> &'static str {
@@ -425,6 +425,90 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
 }
 
 #[test]
+fn native_pg_real_threads_close_wakes_waiter_and_defers_one_dispose() {
+    let directory = TempDir::new("pool-thread-lifecycle");
+    let generated = emit_c(directory.path(), fixture());
+    let hook = format!(
+        r#"
+{NATIVE_THREAD_LIFECYCLE_HARNESS}
+#if defined(_WIN32)
+static int ku_test_pg_poll(WSAPOLLFD*, ULONG, INT);
+static int ku_test_pg_shutdown(SOCKET, int);
+#define WSAPoll ku_test_pg_poll
+static volatile LONG ku_test_pg_dispose_calls = 0;
+static void ku_test_pg_record_dispose(void) {{
+  InterlockedIncrement(&ku_test_pg_dispose_calls);
+}}
+static long ku_test_pg_load_dispose_calls(void) {{
+  return InterlockedCompareExchange(&ku_test_pg_dispose_calls, 0, 0);
+}}
+#else
+static int ku_test_pg_poll(struct pollfd*, nfds_t, int);
+static int ku_test_pg_shutdown(int, int);
+#define poll ku_test_pg_poll
+static _Atomic int ku_test_pg_dispose_calls = 0;
+static void ku_test_pg_record_dispose(void) {{
+  atomic_fetch_add_explicit(&ku_test_pg_dispose_calls, 1, memory_order_relaxed);
+}}
+static int ku_test_pg_load_dispose_calls(void) {{
+  return atomic_load_explicit(&ku_test_pg_dispose_calls, memory_order_relaxed);
+}}
+#endif
+#define shutdown ku_test_pg_shutdown
+static unsigned long long ku_test_pg_now(void);
+#define KU_PG_MONOTONIC_MS() ku_test_pg_now()
+static int ku_test_pg_pool_lock_depth = 0;
+static int ku_test_pg_finishes_while_pool_locked = 0;
+static int ku_test_pg_acquire_calls = 0;
+"#
+    );
+    let mut harness = generated
+        .replacen(
+            "typedef struct pg_conn PGconn;",
+            &format!("{hook}\ntypedef struct pg_conn PGconn;"),
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int ku_generated_main(void) {",
+            1,
+        )
+        .replacen(
+            "static void ku_pg_client_dispose(KuPgClient* p) {",
+            "static void ku_pg_client_dispose(KuPgClient* p) { ku_test_pg_record_dispose();",
+            1,
+        );
+    let (query_stub, _) = QUERY_STUB
+        .split_once("\nint main(void) {\n")
+        .expect("PG fake libpq definitions before sequential harness main");
+    harness.push_str(query_stub);
+    harness.push_str(PG_THREAD_LIFECYCLE_MAIN);
+    let source = directory.path().join("pg-pool-thread-lifecycle.c");
+    fs::write(&source, harness).expect("write PG real-thread lifecycle harness");
+    let Some(executable) = compile_harness(directory.path(), &source, "pg-pool-thread-lifecycle")
+    else {
+        eprintln!("skip: no C compiler available for PG real-thread lifecycle test");
+        return;
+    };
+    let mut command = Command::new(executable);
+    command.current_dir(directory.path());
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS)
+        .unwrap_or_else(|error| panic!("PG real-thread lifecycle test was not bounded: {error}"));
+    assert!(
+        output.status.success(),
+        "PG real-thread lifecycle harness failed ({:?}):\n{}{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        "pg real-thread lifecycle closed loop\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn native_pg_query_poller_stub_covers_backpressure_deadlines_and_owned_cleanup() {
     let directory = TempDir::new("query-harness");
     let generated = emit_c(directory.path(), fixture());
@@ -726,6 +810,111 @@ int main(void) {
   LIVE_CHECK(result.ok && ku_test_value(result.value, "x'; SELECT pg_sleep(999); --")); ku_drop_pg_result(&result.value);
   ku_drop_pg_client(&pool); LIVE_CHECK(!pool);
   puts("pg query live loopback closed loop");
+  return 0;
+}
+"#;
+
+const PG_THREAD_LIFECYCLE_MAIN: &str = r#"
+typedef struct KuTestPgActiveWorker {
+  KuPgClient* client;
+  KuTestEvent acquired;
+  KuTestEvent release;
+} KuTestPgActiveWorker;
+
+static int ku_test_pg_active_worker(void* raw) {
+  KuTestPgActiveWorker* worker = (KuTestPgActiveWorker*)raw;
+  PGconn* connection = NULL;
+  KuError error = {0};
+  int slot = ku_pg_client_acquire(
+      worker->client, &connection, &error, clock_ms + 60000ULL);
+  if (slot < 0 || !connection) {
+    ku_error_drop(&error);
+    return 10;
+  }
+  if (!ku_test_event_set(&worker->acquired)) {
+    ku_pg_client_release(worker->client, slot, 1, clock_ms + 60000ULL);
+    return 11;
+  }
+  int released = ku_test_event_wait(&worker->release, 5000);
+  ku_pg_client_release(worker->client, slot, 0, clock_ms + 60000ULL);
+  return released ? 0 : 12;
+}
+
+static int ku_test_pg_waiter_worker(void* raw) {
+  KuPgClient* client = (KuPgClient*)raw;
+  PGconn* connection = NULL;
+  KuError error = {0};
+  int slot = ku_pg_client_acquire(
+      client, &connection, &error, clock_ms + 60000ULL);
+  if (slot >= 0 || connection) {
+    if (slot >= 0) {
+      ku_pg_client_release(client, slot, 1, clock_ms + 60000ULL);
+    }
+    return 20;
+  }
+  int closed = equals(error.code, "client_closed");
+  ku_error_drop(&error);
+  return closed ? 0 : 21;
+}
+
+static int ku_test_pg_close_worker(void* raw) {
+  ku_pg_client_close_owned((KuPgClient*)raw);
+  return 0;
+}
+
+static int ku_test_pg_wait_for_registered_waiter(
+    KuPgClient* client, unsigned long timeout_ms) {
+  unsigned long long deadline = ku_test_real_now_ms() + timeout_ms;
+  for (;;) {
+    ku_pg_mutex_lock(&client->lock);
+    int registered = client->waiters == 1 && client->active == 1;
+    ku_pg_mutex_unlock(&client->lock);
+    if (registered) return 1;
+    if (ku_test_real_now_ms() >= deadline) return 0;
+    ku_test_thread_yield();
+  }
+}
+
+int main(void) {
+  KuResult_pg_client opened = ku_pg_client_open(
+      text("hostaddr=127.0.0.1"), 1, 1, 5000, 60000, 60000);
+  CHECK(opened.ok && opened.value);
+  KuPgClient* client = opened.value;
+  KuTestPgActiveWorker active = {0};
+  active.client = client;
+  CHECK(ku_test_event_init(&active.acquired));
+  CHECK(ku_test_event_init(&active.release));
+
+  KuTestThread active_thread = {0};
+  KuTestThread waiter_thread = {0};
+  KuTestThread close_thread = {0};
+  CHECK(ku_test_thread_start(
+      &active_thread, ku_test_pg_active_worker, &active));
+  CHECK(ku_test_event_wait(&active.acquired, 3000));
+  CHECK(ku_test_thread_start(
+      &waiter_thread, ku_test_pg_waiter_worker, client));
+  CHECK(ku_test_pg_wait_for_registered_waiter(client, 3000));
+  CHECK(ku_test_thread_start(
+      &close_thread, ku_test_pg_close_worker, client));
+
+  /* The borrower remains gated here. close() and the registered waiter must
+     both finish without waiting for that borrower to release its lease. */
+  CHECK(ku_test_event_wait(&close_thread.finished, 3000));
+  CHECK(ku_test_event_wait(&waiter_thread.finished, 3000));
+  CHECK(close_thread.outcome == 0 && waiter_thread.outcome == 0);
+  CHECK(ku_test_pg_load_dispose_calls() == 0);
+  CHECK(live_connections == 1 && starts == 1 && finishes == 0);
+
+  CHECK(ku_test_event_set(&active.release));
+  CHECK(ku_test_thread_join(&close_thread, 3000));
+  CHECK(ku_test_thread_join(&waiter_thread, 3000));
+  CHECK(ku_test_thread_join(&active_thread, 3000));
+  CHECK(active_thread.outcome == 0);
+  CHECK(ku_test_event_destroy(&active.acquired));
+  CHECK(ku_test_event_destroy(&active.release));
+  CHECK(ku_test_pg_load_dispose_calls() == 1);
+  CHECK(!live_connections && starts == finishes && !bad_calls);
+  puts("pg real-thread lifecycle closed loop");
   return 0;
 }
 "#;
