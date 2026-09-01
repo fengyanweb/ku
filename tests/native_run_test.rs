@@ -72,6 +72,55 @@ fn exe_name(stem: &str) -> String {
     }
 }
 
+fn configure_mysql_runtime_search(command: &mut Command) {
+    let mut directories = Vec::new();
+    if let Some(configured) = env::var_os("KU_MYSQL_LIB") {
+        let library_dir = PathBuf::from(configured);
+        directories.push(library_dir.clone());
+        if let Some(install_root) = library_dir.parent() {
+            directories.push(install_root.join("bin"));
+        }
+    }
+
+    #[cfg(windows)]
+    if directories.is_empty() {
+        for base in [r"C:\Program Files\MySQL", r"D:\Program Files\MySQL"] {
+            let Ok(entries) = fs::read_dir(base) else {
+                continue;
+            };
+            let mut installs = entries
+                .take(256)
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>();
+            installs.sort();
+            installs.reverse();
+            for install in installs {
+                directories.push(install.join("lib"));
+                directories.push(install.join("bin"));
+            }
+        }
+    }
+
+    directories.retain(|path| path.is_dir());
+    let variable = if cfg!(windows) {
+        "PATH"
+    } else if cfg!(target_os = "macos") {
+        "DYLD_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
+    if let Some(existing) = env::var_os(variable) {
+        directories.extend(env::split_paths(&existing));
+    }
+    if !directories.is_empty() {
+        let joined = env::join_paths(directories)
+            .expect("MySQL runtime search directories must form a valid loader path");
+        command.env(variable, joined);
+    }
+}
+
 /// Build `entry_rel` (relative to `dir`) into a native binary at `dir/out`.
 /// Returns the binary path, or `None` when no C compiler is available (skip).
 fn native_build(dir: &Path, entry_rel: &str, out_stem: &str) -> Option<PathBuf> {
@@ -1178,22 +1227,23 @@ fn main(): null! {
     let executable = dir.join(exe_name("mysql-client"));
     let mut run = Command::new(&executable);
     run.current_dir(&dir);
+    configure_mysql_runtime_search(&mut run);
     let started = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
         .unwrap_or_else(|error| panic!("linked MySQL client could not start safely: {error}"));
     let stdout = String::from_utf8_lossy(&started.stdout).replace('\r', "");
     let stderr = String::from_utf8_lossy(&started.stderr);
     assert!(
+        started.status.success(),
+        "linked MySQL client failed to load or execute its dynamic runtime path: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        started.status.code()
+    );
+    assert!(
         stdout == "mysql\nconnect_error\n" || stdout == "mysql\nconnect_timeout\n",
-        "linked MySQL client returned an unexpected bounded connection outcome: {stdout:?}"
+        "linked MySQL client returned an unexpected bounded connection outcome: {stdout:?}; stderr: {stderr}"
     );
     assert!(
         stderr.is_empty(),
         "linked MySQL client wrote unexpected stderr: {stderr}"
-    );
-    assert!(
-        started.status.success(),
-        "linked MySQL client failed to load and start its client library path: {:?}",
-        started.status.code()
     );
     fs::remove_dir_all(&dir).ok();
 }
