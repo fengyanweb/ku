@@ -142,11 +142,13 @@ v1 index 没有单调 revision，因此 Ed25519 签名本身不能识别一个�
 | `KU_REGISTRY_DATA_DIR` | 服务独占写入的数据目录 |
 | `KU_REGISTRY_CREDENTIALS_FILE` | publish/yank 的 schema 2 身份、团队、所有权、token hash 与审计链文件 |
 | `KU_REGISTRY_SIGNING_KEY_FILE` | Ed25519 32-byte seed 文件 |
-| `KU_REGISTRY_TLS_CERT_FILE` | PEM 证书链 |
-| `KU_REGISTRY_TLS_KEY_FILE` | 与证书匹配的 PEM 私钥 |
+| `KU_REGISTRY_TLS_CERT_FILE` | 只含证书块的 PEM 证书链；混合块和尾随垃圾拒绝 |
+| `KU_REGISTRY_TLS_KEY_FILE` | 与证书匹配且恰好一个的 PKCS#1、PKCS#8 或 SEC1 PEM 私钥 |
 | `KU_REGISTRY_WORKERS` | 固定 worker 数，默认 16、范围 1..64 |
 | `KU_REGISTRY_QUEUE_CAPACITY` | 有界连接队列，默认 32、范围 1..256 |
 | `KU_REGISTRY_REQUEST_TIMEOUT_MS` | 从 accept 时刻开始的 TLS/header/body/校验/提交总 deadline，默认 15000、范围 100..60000 |
+
+这些配置文件的最终路径必须是有界真实常规文件；Unix 使用 `O_NOFOLLOW`，Windows 打开 reparse point 本身并在 handle 上拒绝，读取后再次检查上限。该保证只覆盖最终路径；父目录必须由服务账户信任且不允许非授权本地写者并发替换常规文件，当前实现不声明 inode/file-ID identity proof。Windows 测试机如果没有创建 symlink 的权限会明确跳过该平台探针，不能据此推导所有 reparse point 都已覆盖。TLS 证书和私钥文件只允许首尾 ASCII 空白；空输入、混合 PEM、多个私钥和尾随垃圾全部 fail closed。
 
 签名 key 文件只接受一种格式：
 
