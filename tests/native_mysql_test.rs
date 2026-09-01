@@ -8,7 +8,10 @@ mod native_harness;
 use std::fs;
 use std::process::Command;
 
-use native_harness::{compile_harness, emit_c, run_bounded, OutputLimits, TempDir, RUN_TIMEOUT};
+use native_harness::{
+    compile_harness, emit_c, run_bounded, OutputLimits, TempDir, NATIVE_THREAD_LIFECYCLE_HARNESS,
+    RUN_TIMEOUT,
+};
 
 const RUN_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
 
@@ -421,14 +424,20 @@ fn native_mysql_pool_prioritizes_waiters_and_close_does_not_wait_for_borrowers()
             "MYSQL* connected = mysql_real_connect(",
             "if (ku_test_mysql_clock_enabled) ku_test_mysql_clock_ms += ku_test_mysql_connect_elapsed_ms;\n  MYSQL* connected = mysql_real_connect(",
             1,
+        )
+        .replacen(
+            "static void ku_mysql_client_destroy(KuMysqlClient* client) {",
+            "static size_t ku_test_mysql_dispose_calls = 0;\nstatic void ku_mysql_client_destroy(KuMysqlClient* client) { ku_test_mysql_dispose_calls++;",
+            1,
         );
     fs::write(directory.path().join("mysql.h"), fake_mysql_header()).expect("write fake mysql.h");
     let harness = directory.path().join("mysql_pool_harness.c");
     fs::write(
         &harness,
         format!(
-            "#define KU_MYSQL_FAKE_CLIENT 1\n#define main ku_fixture_main\n{generated}\n#undef main\n{}\n{}",
+            "#define KU_MYSQL_FAKE_CLIENT 1\n#define main ku_fixture_main\n{generated}\n#undef main\n{}\n{}\n{}",
             fake_mysql_source(),
+            NATIVE_THREAD_LIFECYCLE_HARNESS,
             fake_mysql_pool_harness()
         ),
     )
@@ -2045,11 +2054,7 @@ static void pool_verify_library_shutdown(void) {
 #endif
 }
 
-#if defined(_WIN32)
-static DWORD WINAPI fake_worker(void* raw) {
-#else
-static void* fake_worker(void* raw) {
-#endif
+static int fake_worker(void* raw) {
   KuFakeWorker* worker = (KuFakeWorker*)raw;
   KuArray_str params = fake_params();
   KuResult_mysql_result result = ku_mysql_client_query(
@@ -2063,11 +2068,7 @@ static void* fake_worker(void* raw) {
     ku_error_drop(&result.error);
   }
   ku_mysql_thread_shutdown();
-#if defined(_WIN32)
-  return 0;
-#else
-  return NULL;
-#endif
+  return worker->outcome < 0 ? worker->outcome : 0;
 }
 
 int main(void) {
@@ -2120,25 +2121,15 @@ int main(void) {
   KuFakeWorker waiting = {client, 0};
   fake_atomic_store(&ku_fake_block_execute, 1);
 
-#if defined(_WIN32)
-  HANDLE active_thread = CreateThread(NULL, 0, fake_worker, &active, 0, NULL);
-  if (!active_thread) return 11;
-#else
-  pthread_t active_thread;
-  if (pthread_create(&active_thread, NULL, fake_worker, &active) != 0) return 11;
-#endif
+  KuTestThread active_thread = {0};
+  if (!ku_test_thread_start(&active_thread, fake_worker, &active)) return 11;
   unsigned long long wait_deadline = __ku_handler_now_ms() + 5000;
   while (!fake_atomic_load(&ku_fake_execute_entered)
       && __ku_handler_now_ms() < wait_deadline) fake_pause();
   if (!fake_atomic_load(&ku_fake_execute_entered)) return 12;
 
-#if defined(_WIN32)
-  HANDLE waiting_thread = CreateThread(NULL, 0, fake_worker, &waiting, 0, NULL);
-  if (!waiting_thread) return 13;
-#else
-  pthread_t waiting_thread;
-  if (pthread_create(&waiting_thread, NULL, fake_worker, &waiting) != 0) return 13;
-#endif
+  KuTestThread waiting_thread = {0};
+  if (!ku_test_thread_start(&waiting_thread, fake_worker, &waiting)) return 13;
   bool waiter_registered = false;
   wait_deadline = __ku_handler_now_ms() + 5000;
   while (__ku_handler_now_ms() < wait_deadline) {
@@ -2162,15 +2153,10 @@ int main(void) {
   unsigned long long close_elapsed = __ku_handler_now_ms() - close_start;
   if (close_elapsed > 500) return 16;
   fake_atomic_store(&ku_fake_release_execute, 1);
-#if defined(_WIN32)
-  if (WaitForSingleObject(active_thread, 5000) != WAIT_OBJECT_0) return 17;
-  if (WaitForSingleObject(waiting_thread, 5000) != WAIT_OBJECT_0) return 18;
-  CloseHandle(active_thread); CloseHandle(waiting_thread);
-#else
-  if (pthread_join(active_thread, NULL) != 0) return 17;
-  if (pthread_join(waiting_thread, NULL) != 0) return 18;
-#endif
+  if (!ku_test_thread_join(&active_thread, 5000)) return 17;
+  if (!ku_test_thread_join(&waiting_thread, 5000)) return 18;
   if (active.outcome != 1 || waiting.outcome != 2) return 19;
+  if (ku_test_mysql_dispose_calls != 1) return 22;
   if (fake_atomic_load(&ku_fake_reset_connection_calls) != 0) return 20;
   ku_mysql_thread_shutdown();
   if (fake_atomic_load(&ku_fake_connections_live) != 0
