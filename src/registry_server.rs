@@ -17,8 +17,13 @@ use std::{
 use std::sync::atomic::AtomicUsize;
 
 use ed25519_dalek::{Signer, SigningKey};
+use rustls::pki_types::{
+    pem::{PemObject, SectionKind},
+    CertificateDer, PrivateKeyDer,
+};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 pub use crate::registry_admin::REGISTRY_CREDENTIALS_FILE_ENV;
 
@@ -3956,35 +3961,20 @@ fn read_signing_key(path: &Path) -> KuResult<SigningKey> {
 }
 
 fn load_tls_config(cert_path: &Path, key_path: &Path) -> KuResult<ServerConfig> {
-    let cert_file = open_bounded_regular_file(cert_path, MAX_TLS_FILE_BYTES, "TLS certificate")?;
-    let key_file = open_bounded_regular_file(key_path, MAX_TLS_FILE_BYTES, "TLS private key")?;
-    let certificates = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| {
-            server_config_error(
-                "invalid_registry_tls",
-                "registry TLS certificate file is not valid PEM",
-            )
-        })?;
+    let cert_pem = read_bounded_regular_file(cert_path, MAX_TLS_FILE_BYTES, "TLS certificate")?;
+    let key_pem = Zeroizing::new(read_bounded_regular_file(
+        key_path,
+        MAX_TLS_FILE_BYTES,
+        "TLS private key",
+    )?);
+    let certificates = parse_tls_certificates(&cert_pem)?;
     if certificates.is_empty() {
         return Err(server_config_error(
             "invalid_registry_tls",
             "registry TLS certificate file contains no certificates",
         ));
     }
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .map_err(|_| {
-            server_config_error(
-                "invalid_registry_tls",
-                "registry TLS private key file is not valid PEM",
-            )
-        })?
-        .ok_or_else(|| {
-            server_config_error(
-                "invalid_registry_tls",
-                "registry TLS private key file contains no private key",
-            )
-        })?;
+    let key = parse_tls_private_key(&key_pem)?;
     ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, key)
@@ -3994,6 +3984,92 @@ fn load_tls_config(cert_path: &Path, key_path: &Path) -> KuResult<ServerConfig> 
                 "registry TLS certificate and private key do not match",
             )
         })
+}
+
+fn parse_tls_certificates(pem: &[u8]) -> KuResult<Vec<CertificateDer<'static>>> {
+    const CERTIFICATE_BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    let mut remaining = pem;
+    let mut certificates = Vec::new();
+
+    loop {
+        remaining = trim_ascii_whitespace_start(remaining);
+        if remaining.is_empty() {
+            return Ok(certificates);
+        }
+        if !remaining.starts_with(CERTIFICATE_BEGIN) {
+            return Err(invalid_tls_pem(
+                "registry TLS certificate file must contain only PEM certificates",
+            ));
+        }
+        let ((kind, der), rest) = parse_one_pem_section(remaining)
+            .map_err(|()| invalid_tls_pem("registry TLS certificate file is not valid PEM"))?;
+        if kind != SectionKind::Certificate {
+            return Err(invalid_tls_pem(
+                "registry TLS certificate file must contain only PEM certificates",
+            ));
+        }
+        certificates.push(CertificateDer::from(der));
+        remaining = rest;
+    }
+}
+
+fn parse_tls_private_key(pem: &[u8]) -> KuResult<PrivateKeyDer<'static>> {
+    const PRIVATE_KEY_BEGINS: [&[u8]; 3] = [
+        b"-----BEGIN PRIVATE KEY-----",
+        b"-----BEGIN RSA PRIVATE KEY-----",
+        b"-----BEGIN EC PRIVATE KEY-----",
+    ];
+    let remaining = trim_ascii_whitespace_start(pem);
+    if remaining.is_empty() {
+        return Err(invalid_tls_pem(
+            "registry TLS private key file contains no private key",
+        ));
+    }
+    if !PRIVATE_KEY_BEGINS
+        .iter()
+        .any(|begin| remaining.starts_with(begin))
+    {
+        return Err(invalid_tls_pem(
+            "registry TLS private key file must contain exactly one supported PEM private key",
+        ));
+    }
+    let ((kind, der), rest) = parse_one_pem_section(remaining)
+        .map_err(|()| invalid_tls_pem("registry TLS private key file is not valid PEM"))?;
+    if !trim_ascii_whitespace_start(rest).is_empty() {
+        return Err(invalid_tls_pem(
+            "registry TLS private key file must contain exactly one supported PEM private key",
+        ));
+    }
+    PrivateKeyDer::from_pem(kind, der).ok_or_else(|| {
+        invalid_tls_pem(
+            "registry TLS private key file must contain exactly one supported PEM private key",
+        )
+    })
+}
+
+type ParsedPemSection<'a> = ((SectionKind, Vec<u8>), &'a [u8]);
+
+fn parse_one_pem_section(input: &[u8]) -> Result<ParsedPemSection<'_>, ()> {
+    let before = input.len();
+    let mut sections = <(SectionKind, Vec<u8>)>::pem_slice_iter(input);
+    let section = sections.next().ok_or(())?.map_err(|_| ())?;
+    let rest = sections.remainder();
+    if rest.len() >= before {
+        return Err(());
+    }
+    Ok((section, rest))
+}
+
+fn trim_ascii_whitespace_start(input: &[u8]) -> &[u8] {
+    let whitespace = input
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    &input[whitespace..]
+}
+
+fn invalid_tls_pem(message: &'static str) -> KuError {
+    server_config_error("invalid_registry_tls", message)
 }
 
 fn open_bounded_regular_file(path: &Path, max_bytes: u64, kind: &str) -> KuResult<fs::File> {
@@ -4009,18 +4085,52 @@ fn open_bounded_regular_file(path: &Path, max_bytes: u64, kind: &str) -> KuResul
             format!("registry {kind} must be a regular file no larger than {max_bytes} bytes"),
         ));
     }
-    fs::File::open(path).map_err(|err| {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|err| {
         server_config_error(
             "invalid_registry_file",
             format!("failed to open registry {kind} file: {err}"),
         )
-    })
+    })?;
+    let opened = file.metadata().map_err(|err| {
+        server_config_error(
+            "invalid_registry_file",
+            format!("failed to inspect opened registry {kind} file: {err}"),
+        )
+    })?;
+    #[cfg(windows)]
+    let opened_is_reparse = {
+        use std::os::windows::fs::MetadataExt;
+        opened.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    };
+    #[cfg(not(windows))]
+    let opened_is_reparse = false;
+    if opened_is_reparse || !opened.is_file() || opened.len() > max_bytes {
+        return Err(server_config_error(
+            "invalid_registry_file",
+            format!("registry {kind} must remain a regular file no larger than {max_bytes} bytes"),
+        ));
+    }
+    Ok(file)
 }
 
 fn read_bounded_regular_file(path: &Path, max_bytes: u64, kind: &str) -> KuResult<Vec<u8>> {
     let file = open_bounded_regular_file(path, max_bytes, kind)?;
     let mut bytes = Vec::new();
-    file.take(max_bytes + 1)
+    file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|err| {
             server_config_error(
@@ -4257,6 +4367,111 @@ mod tests {
         let error = read_credentials(&path).expect_err("server must require one credential");
         assert_eq!(error.code.as_deref(), Some("invalid_registry_credentials"));
         assert!(error.message.contains("at least one"));
+    }
+
+    #[test]
+    fn registry_tls_pem_loader_accepts_only_a_certificate_chain_and_one_private_key() {
+        let root = TestRoot::new("strict-tls-pem");
+        let files = test_server_files(&root.0, &[("token", "demo")], Duration::from_secs(1));
+        let cert_path = &files.config.tls_cert_file;
+        let key_path = &files.config.tls_key_file;
+        let certificate = fs::read(cert_path).expect("read valid TLS certificate PEM");
+        let private_key = fs::read(key_path).expect("read valid TLS private key PEM");
+
+        load_tls_config(cert_path, key_path).expect("accept one certificate and one private key");
+        let certificate_chain = [certificate.as_slice(), b"\r\n", certificate.as_slice()].concat();
+        fs::write(cert_path, &certificate_chain).expect("write TLS certificate chain");
+        load_tls_config(cert_path, key_path).expect("accept a certificate-only chain");
+
+        let rejected = [
+            (Vec::new(), private_key.clone(), "empty certificate input"),
+            (
+                [certificate.as_slice(), b"garbage"].concat(),
+                private_key.clone(),
+                "certificate trailing garbage",
+            ),
+            (
+                [certificate.as_slice(), private_key.as_slice()].concat(),
+                private_key.clone(),
+                "mixed certificate PEM",
+            ),
+            (certificate.clone(), Vec::new(), "empty private key input"),
+            (
+                certificate.clone(),
+                [private_key.as_slice(), private_key.as_slice()].concat(),
+                "multiple private keys",
+            ),
+            (
+                certificate.clone(),
+                [private_key.as_slice(), b"garbage"].concat(),
+                "private key trailing garbage",
+            ),
+            (
+                certificate.clone(),
+                [certificate.as_slice(), private_key.as_slice()].concat(),
+                "mixed private key PEM",
+            ),
+        ];
+        for (certificate_input, key_input, label) in rejected {
+            fs::write(cert_path, certificate_input).expect("write rejected TLS certificate case");
+            fs::write(key_path, key_input).expect("write rejected TLS private key case");
+            let error = load_tls_config(cert_path, key_path)
+                .expect_err("strict TLS PEM loader must reject malformed structure");
+            assert_eq!(
+                error.code.as_deref(),
+                Some("invalid_registry_tls"),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_registry_file_reader_rejects_nonregular_oversized_and_symlink_paths() {
+        let root = TestRoot::new("bounded-file-reader");
+        let regular = root.0.join("regular.txt");
+        fs::write(&regular, b"1234").expect("write bounded regular file");
+        assert_eq!(
+            read_bounded_regular_file(&regular, 4, "test").expect("read bounded regular file"),
+            b"1234"
+        );
+        assert_eq!(
+            read_bounded_regular_file(&regular, u64::MAX, "test")
+                .expect("maximum byte limit must not overflow"),
+            b"1234"
+        );
+
+        let oversized = root.0.join("oversized.txt");
+        fs::write(&oversized, b"12345").expect("write oversized file");
+        let error = read_bounded_regular_file(&oversized, 4, "test")
+            .expect_err("oversized registry file must be rejected");
+        assert_eq!(error.code.as_deref(), Some("invalid_registry_file"));
+
+        let directory = root.0.join("directory");
+        fs::create_dir(&directory).expect("create non-file registry path");
+        let error = read_bounded_regular_file(&directory, 4, "test")
+            .expect_err("directory registry path must be rejected");
+        assert_eq!(error.code.as_deref(), Some("invalid_registry_file"));
+
+        let symlink = root.0.join("regular-link.txt");
+        #[cfg(unix)]
+        let symlink_result = std::os::unix::fs::symlink(&regular, &symlink);
+        #[cfg(windows)]
+        let symlink_result = std::os::windows::fs::symlink_file(&regular, &symlink);
+        #[cfg(not(any(unix, windows)))]
+        let symlink_result = Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "symlink probe is unavailable on this platform",
+        ));
+        match symlink_result {
+            Ok(()) => {
+                let error = read_bounded_regular_file(&symlink, 4, "test")
+                    .expect_err("registry file symlink must be rejected without following it");
+                assert_eq!(error.code.as_deref(), Some("invalid_registry_file"));
+            }
+            Err(error) => eprintln!(
+                "skipping registry symlink probe because this host cannot create one: {error}"
+            ),
+        }
     }
 
     fn test_entry_metadata(name: &str, version: &str, checksum_digit: char) -> EntryMetadata {
