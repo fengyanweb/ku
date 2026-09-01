@@ -1,0 +1,52 @@
+import { Token } from "../stage1/token.ku"
+import { SpanFromToken } from "../stage2/span.ku"
+import { Diagnostic, DiagnosticCanonical } from "../stage2/diagnostic.ku"
+import { ParseOutput } from "../stage2/ast.ku"
+import { ParseWithContext } from "../stage2/parser.ku"
+import { ParseContext } from "../stage2/context.ku"
+
+// Pure Stage 3 helpers live outside parser.ku so each self-hosted source file
+// remains below Stage 1's fixed per-file token ceiling.
+fn RejectAt(token: Token, code: str, message: str): null! {
+    diagnostic = Diagnostic {
+        code: code.clone(),
+        message: message,
+        line: token.line,
+        column: token.column,
+        offset: token.offset,
+        end_line: token.end_line,
+        end_column: token.end_column,
+        end_offset: token.end_offset
+    }
+    canonical = DiagnosticCanonical(diagnostic)
+    fail { domain: "bootstrap.parser.stage3", code: code, message: canonical }
+}
+
+fn ParseExpressionAt(source: str, origin: Token, boundary: Token): ParseOutput! {
+    try {
+        return ok(ParseWithContext(source, ParseContext {
+            origin: SpanFromToken(origin),
+            boundary: SpanFromToken(boundary),
+            has_boundary: true
+        })?)
+    } catch(err) {
+        fail {
+            domain: "bootstrap.parser.stage3",
+            code: err.code.clone(),
+            message: err.message
+        }
+    }
+    fail {
+        domain: "bootstrap.parser.stage3",
+        code: "unreachable_expression_error",
+        message: "stage-3 expression error path did not terminate"
+    }
+}
+
+fn CanEndExpression(kind: str): bool {
+    return kind == "Ident" || kind == "Int" || kind == "Float" || kind == "String" || kind == "TemplateString" || kind == "True" || kind == "False" || kind == "Null" || kind == "RParen" || kind == "RBracket" || kind == "Question"
+}
+
+fn CanStartStatement(kind: str): bool {
+    return kind == "Ident" || kind == "Int" || kind == "Float" || kind == "String" || kind == "TemplateString" || kind == "True" || kind == "False" || kind == "Null" || kind == "Bang" || kind == "Return" || kind == "Let" || kind == "If" || kind == "While" || kind == "For" || kind == "Break" || kind == "Continue" || kind == "Try" || kind == "Async" || kind == "Fn" || kind == "Fail" || kind == "Panic" || kind == "Print"
+}

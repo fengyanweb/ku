@@ -1,15 +1,15 @@
 import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken } from "../stage2/span.ku"
-import { Diagnostic, DiagnosticCanonical } from "../stage2/diagnostic.ku"
 import { Node, ParseOutput, EmptyArena } from "../stage2/ast.ku"
-import { ParseWithContext } from "../stage2/parser.ku"
-import { ParseContext } from "../stage2/context.ku"
+import { RejectAt, ParseExpressionAt, CanEndExpression, CanStartStatement } from "./support.ku"
 
 // Stage 3 is intentionally a strict, useful subset of the production Rust
-// parser. It accepts ordinary zero-parameter functions whose bodies contain
+// parser. It accepts ordinary functions whose bodies contain
 // primitive typed declarations, variable assignments, expression statements
-// and return statements. Statement boundaries follow the production token
+// and return statements. Function parameters may be untyped or use the same
+// primitive types; explicit primitive and Result return types are represented
+// by source-positioned arena nodes. Statement boundaries follow the production token
 // grammar, including Ku's ordinary newline/whitespace-separated style; an
 // existing optional semicolon is also accepted. Unsupported production syntax
 // is rejected explicitly rather than guessed at or given a second interpretation.
@@ -20,48 +20,10 @@ import { ParseContext } from "../stage2/context.ku"
 // origin/boundary context, so it relocates both AST and parser-error spans
 // before returning them to this module's fixed NodeId/edge arenas.
 
-fn RejectAt(token: Token, code: str, message: str): null! {
-    diagnostic = Diagnostic {
-        code: code.clone(),
-        message: message,
-        line: token.line,
-        column: token.column,
-        offset: token.offset,
-        end_line: token.end_line,
-        end_column: token.end_column,
-        end_offset: token.end_offset
-    }
-    canonical = DiagnosticCanonical(diagnostic)
-    fail { domain: "bootstrap.parser.stage3", code: code, message: canonical }
-}
-
-fn ParseExpressionAt(source: str, origin: Token, boundary: Token): ParseOutput! {
-    try {
-        return ok(ParseWithContext(source, ParseContext {
-            origin: SpanFromToken(origin),
-            boundary: SpanFromToken(boundary),
-            has_boundary: true
-        })?)
-    } catch(err) {
-        fail {
-            domain: "bootstrap.parser.stage3",
-            code: err.code.clone(),
-            message: err.message
-        }
-    }
-    fail {
-        domain: "bootstrap.parser.stage3",
-        code: "unreachable_expression_error",
-        message: "stage-3 expression error path did not terminate"
-    }
-}
-
-fn CanEndExpression(kind: str): bool {
-    return kind == "Ident" || kind == "Int" || kind == "Float" || kind == "String" || kind == "TemplateString" || kind == "True" || kind == "False" || kind == "Null" || kind == "RParen" || kind == "RBracket" || kind == "Question"
-}
-
-fn CanStartStatement(kind: str): bool {
-    return kind == "Ident" || kind == "Int" || kind == "Float" || kind == "String" || kind == "TemplateString" || kind == "True" || kind == "False" || kind == "Null" || kind == "Bang" || kind == "Return" || kind == "Let" || kind == "If" || kind == "While" || kind == "For" || kind == "Break" || kind == "Continue" || kind == "Try" || kind == "Async" || kind == "Fn" || kind == "Fail" || kind == "Panic" || kind == "Print"
+struct SignatureType {
+    text: str
+    span: Span
+    next: int
 }
 
 fn ParseProgram(source: str): ParseOutput! {
@@ -235,6 +197,44 @@ fn ParseProgram(source: str): ParseOutput! {
         return ok(node_base + parsed.root)
     }
 
+    fn ReadSignatureType(start: int): SignatureType! {
+        if (start < 0 || start >= tokens.len()) {
+            RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "function signature type starts outside the token stream")?
+        }
+        token = tokens[start].clone()
+        type_text = ""
+        if (token.kind == "Ident" && (token.lexeme == "int" || token.lexeme == "float" || token.lexeme == "bool" || token.lexeme == "str")) {
+            type_text = token.lexeme.clone()
+        } else if (token.kind == "Null") {
+            type_text = "null"
+        } else if (token.kind == "Ident" && (token.lexeme == "string" || token.lexeme == "nil")) {
+            RejectAt(token.clone(), "unexpected_token", "expected type name")?
+        } else if (token.kind == "Ident" || token.kind == "LBracket" || token.kind == "Fn" || token.kind == "Async") {
+            RejectAt(token.clone(), "unsupported_type", "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms")?
+        } else {
+            RejectAt(token.clone(), "unexpected_token", "expected type name")?
+        }
+        next = start + 1
+        if (next >= tokens.len()) {
+            RejectAt(token.clone(), "invalid_token_stream", "function signature type is missing final EOF")?
+        }
+        end = token.clone()
+        if (tokens[next].kind == "Bang") {
+            type_text = type_text + "!"
+            end = tokens[next].clone()
+            next = next + 1
+        }
+        span = Span {
+            line: token.line,
+            column: token.column,
+            offset: token.offset,
+            end_line: end.end_line,
+            end_column: end.end_column,
+            end_offset: end.end_offset
+        }
+        return ok(SignatureType { text: type_text, span: span, next: next })
+    }
+
     fn ExpressionEnd(start: int): int! {
         probe = start
         paren_depth = 0
@@ -296,15 +296,57 @@ fn ParseProgram(source: str): ParseOutput! {
             RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '(' after function name")?
         }
         cursor = cursor + 1
-        if (tokens[cursor].kind != "RParen") {
-            RejectAt(tokens[cursor].clone(), "unsupported_function_signature", "stage-3 functions do not yet accept parameters")?
+        parameters: [int] = []
+        parameter_count = 0
+        while (tokens[cursor].kind != "RParen") {
+            parse_steps = parse_steps + 1
+            if (parse_steps > 16384) {
+                RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
+            }
+            if (parameter_count >= 32) {
+                RejectAt(tokens[cursor].clone(), "parameter_limit", "stage-3 functions accept at most 32 parameters")?
+            }
+            parameter_token = tokens[cursor].clone()
+            if (parameter_token.kind != "Ident") {
+                RejectAt(parameter_token.clone(), "unexpected_token", "expected parameter name")?
+            }
+            cursor = cursor + 1
+            parameter_children: [int] = []
+            if (tokens[cursor].kind == "Colon") {
+                parsed_type = ReadSignatureType(cursor + 1)?
+                cursor = parsed_type.next
+                if (tokens[cursor].kind == "Pipe") {
+                    RejectAt(tokens[cursor].clone(), "unsupported_type", "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms")?
+                }
+                type_node = AddNode("Type", parsed_type.text.clone(), 0, parsed_type.span.clone(), [], parameter_token.clone())?
+                parameter_children = parameter_children.push(type_node)
+            }
+            parameter = AddNode("Parameter", parameter_token.lexeme.clone(), 0, SpanFromToken(parameter_token.clone()), parameter_children, parameter_token.clone())?
+            parameters = parameters.push(parameter)
+            parameter_count = parameter_count + 1
+            if (tokens[cursor].kind == "Comma") {
+                cursor = cursor + 1
+                if (tokens[cursor].kind == "RParen") {
+                    RejectAt(tokens[cursor].clone(), "unexpected_token", "expected parameter name")?
+                }
+            } else if (tokens[cursor].kind != "RParen") {
+                RejectAt(tokens[cursor].clone(), "unexpected_token", "expected ')' after parameters")?
+            }
         }
         cursor = cursor + 1
+        return_type = 0
+        has_return_type = false
         if (tokens[cursor].kind == "Colon") {
-            RejectAt(tokens[cursor].clone(), "unsupported_function_signature", "stage-3 functions do not yet accept an explicit return type")?
+            parsed_type = ReadSignatureType(cursor + 1)?
+            has_return_type = true
+            cursor = parsed_type.next
+            if (tokens[cursor].kind == "Pipe") {
+                RejectAt(tokens[cursor].clone(), "unsupported_type", "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms")?
+            }
+            return_type = AddNode("Type", parsed_type.text.clone(), 0, parsed_type.span.clone(), [], tokens[cursor - 1].clone())?
         }
         if (tokens[cursor].kind != "LBrace") {
-            RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '{' before function body")?
+            RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '{'")?
         }
         cursor = cursor + 1
         statements: [int] = []
@@ -421,6 +463,9 @@ fn ParseProgram(source: str): ParseOutput! {
         }
         function_end = tokens[cursor].clone()
         cursor = cursor + 1
+        function_children: [int] = parameters
+        if (has_return_type) { function_children = function_children.push(return_type) }
+        for statement in statements { function_children = function_children.push(statement) }
         function = AddNode("Function", function_name, 0, Span {
             line: function_start.line,
             column: function_start.column,
@@ -428,7 +473,7 @@ fn ParseProgram(source: str): ParseOutput! {
             end_line: function_end.end_line,
             end_column: function_end.end_column,
             end_offset: function_end.end_offset
-        }, statements, function_start.clone())?
+        }, function_children, function_start.clone())?
         functions = functions.push(function)
         function_count = function_count + 1
     }

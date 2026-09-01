@@ -12,7 +12,7 @@ use ku::ast::{BinaryOp, Expr, ExprKind, FnDecl, Item, Literal, Stmt, TypeName, U
 use ku::lexer::Lexer;
 use ku::parser::Parser;
 use ku::span::Span;
-use ku::token::TokenKind;
+use ku::token::{Token, TokenKind};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -171,15 +171,40 @@ fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize 
     push_node(arena, kind, text, int_value, expr.span, &child_ids)
 }
 
-fn type_name_text(ty: &TypeName) -> &'static str {
+fn type_name_text(ty: &TypeName) -> String {
     match ty {
-        TypeName::Int => "int",
-        TypeName::Float => "float",
-        TypeName::Bool => "bool",
-        TypeName::String => "str",
-        TypeName::Null => "null",
+        TypeName::Int => "int".to_string(),
+        TypeName::Float => "float".to_string(),
+        TypeName::Bool => "bool".to_string(),
+        TypeName::String => "str".to_string(),
+        TypeName::Null => "null".to_string(),
+        TypeName::Result(inner) => format!("{}!", type_name_text(inner)),
         other => panic!("stage-3 oracle received unsupported type: {other:?}"),
     }
+}
+
+fn project_signature_type(
+    tokens: &[Token],
+    cursor: &mut usize,
+    ty: &TypeName,
+    arena: &mut ProjectedArena,
+) -> usize {
+    let start = tokens[*cursor].span.start;
+    *cursor += 1;
+    let mut end = tokens[*cursor - 1].span.end;
+    if matches!(ty, TypeName::Result(_)) {
+        assert!(matches!(tokens[*cursor].kind, TokenKind::Bang));
+        end = tokens[*cursor].span.end;
+        *cursor += 1;
+    }
+    push_node(
+        arena,
+        "Type",
+        type_name_text(ty),
+        0,
+        Span::new(start, end),
+        &[],
+    )
 }
 
 fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> usize {
@@ -223,13 +248,58 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
 fn project_function(source: &str, function: &FnDecl, arena: &mut ProjectedArena) -> usize {
     assert!(!function.is_async, "stage-3 fixture must be synchronous");
     assert!(function.type_params.is_empty());
-    assert!(function.params.is_empty());
-    assert!(function.return_type.is_none());
-    let children = function
-        .body
+    let tokens = Lexer::new(source).lex().expect("signature projection lex");
+    let mut cursor = tokens
         .iter()
-        .map(|statement| project_stmt(source, statement, arena))
-        .collect::<Vec<_>>();
+        .position(|token| {
+            matches!(token.kind, TokenKind::Fn)
+                && token.span.start.offset == function.span.start.offset
+        })
+        .expect("function start token");
+    cursor += 1;
+    assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+    cursor += 1;
+    assert!(matches!(tokens[cursor].kind, TokenKind::LParen));
+    cursor += 1;
+
+    let mut children = Vec::new();
+    for param in &function.params {
+        assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+        cursor += 1;
+        let param_children = if let Some(ty) = &param.ty {
+            assert!(matches!(tokens[cursor].kind, TokenKind::Colon));
+            cursor += 1;
+            vec![project_signature_type(&tokens, &mut cursor, ty, arena)]
+        } else {
+            Vec::new()
+        };
+        children.push(push_node(
+            arena,
+            "Parameter",
+            param.name.clone(),
+            0,
+            param.span,
+            &param_children,
+        ));
+        if matches!(tokens[cursor].kind, TokenKind::Comma) {
+            cursor += 1;
+        }
+    }
+    assert!(matches!(tokens[cursor].kind, TokenKind::RParen));
+    cursor += 1;
+    if let Some(ty) = &function.return_type {
+        assert!(matches!(tokens[cursor].kind, TokenKind::Colon));
+        cursor += 1;
+        children.push(project_signature_type(&tokens, &mut cursor, ty, arena));
+    }
+    assert!(matches!(tokens[cursor].kind, TokenKind::LBrace));
+
+    children.extend(
+        function
+            .body
+            .iter()
+            .map(|statement| project_stmt(source, statement, arena)),
+    );
     push_node(
         arena,
         "Function",
@@ -385,6 +455,9 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let cases = [
         "",
         "fn main() {}",
+        "fn typed(): int { return 1 }",
+        "fn add(left: int, right: int): int { return left + right }\nfn echo(value): str { return \"ok\" }",
+        "// 签名😀\r\nfn load(path: str, cached: bool, prior: int!): str! {\r\n  return path\r\n}",
         "fn helper() { return 7 }\nfn main() {\n  answer:int = 40 + 2\n  answer = answer + 1\n  println(answer)\n  return\n}",
         "fn main(){\n  a:float = 1.250\n  b:bool = true\n  c:str = \"中😀\"\n  d:null = null\n  return c\n}",
         "// 前置😀\nfn main() {\n  // gap 中\n  text:str = \"中😀\"\n  text = text + \"!\"\n  println(text)\n}",
@@ -394,7 +467,6 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     // syntax example used to assert Stage 3's explicit subset boundary.
     let accepted = &cases[..cases.len() - 1];
 
-    let param_source = "fn add(value) {}";
     let let_source = "fn main() { let value = 1; }";
     let missing_body = "fn main() {";
     let return_outside = "return 1";
@@ -409,6 +481,30 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let empty_rhs_expression = "fn main(){ value = ; }";
     let unicode_broken_expression =
         "// 前😀\r\nfn main() {\r\n  text:str = \"中😀\"\r\n  value = 1 + ;\r\n}";
+    let missing_param_name = "fn f(: int) {}";
+    let missing_param_type = "fn f(value:) {}";
+    let missing_param_comma = "fn f(left:int right:int) {}";
+    let trailing_param_comma = "fn f(value:int,) {}";
+    let missing_return_type = "fn f(): {}";
+    let missing_signature_body = "fn f(): int!";
+    let legacy_type_alias = "fn f(value: string) {}";
+    let unicode_broken_signature = "// 前😀\r\nfn f(value: str, : int): null! {}";
+    let unsupported_signature_type = "fn f(values: [int]) {}";
+    let unsupported_union_type = "fn f(value: int | str) {}";
+    let parameter_boundary = format!(
+        "fn many({}): null {{ return null }}",
+        (0..32)
+            .map(|index| format!("p{index}: int"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let over_parameter_limit = format!(
+        "fn many({}) {{}}",
+        (0..33)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let large_program = format!("fn main(){{{}}}", "x;".repeat(128));
     let over_statement_limit = format!("fn main(){{{}}}", "x;".repeat(129));
     let function_boundary = "fn f(){}".repeat(64);
@@ -468,6 +564,11 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "    AssertCase(near_limit_source, {})?\n",
         ku_string(&rust_canonical(&near_limit_source))
     ));
+    body.push_str(&format!(
+        "    AssertCase({}, {})?\n",
+        ku_string(&parameter_boundary),
+        ku_string(&rust_canonical(&parameter_boundary))
+    ));
     body.push_str(
         "    budget_gap = comment_chunk.clone() + comment_chunk.clone()\n    budget_source = \"fn main(){/*\" + budget_gap + \"*/\\n\"\n    budget_index = 0\n    while (budget_index < 32) {\n        budget_source += \"x\\n\"\n        budget_index = budget_index + 1\n    }\n    budget_source += \"}\"\n",
     );
@@ -480,11 +581,6 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         ku_string(&function_boundary)
     ));
 
-    let param_message = diagnostic_at(
-        param_source,
-        3,
-        "stage-3 functions do not yet accept parameters",
-    );
     let let_message = diagnostic_for_kind(
         let_source,
         TokenKind::Let,
@@ -519,6 +615,29 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let broken_message = rust_error_canonical(broken_expression);
     let empty_rhs_message = rust_error_canonical(empty_rhs_expression);
     let unicode_broken_message = rust_error_canonical(unicode_broken_expression);
+    let missing_param_name_message = rust_error_canonical(missing_param_name);
+    let missing_param_type_message = rust_error_canonical(missing_param_type);
+    let missing_param_comma_message = rust_error_canonical(missing_param_comma);
+    let trailing_param_comma_message = rust_error_canonical(trailing_param_comma);
+    let missing_return_type_message = rust_error_canonical(missing_return_type);
+    let missing_signature_body_message = rust_error_canonical(missing_signature_body);
+    let legacy_type_alias_message = rust_error_canonical(legacy_type_alias);
+    let unicode_broken_signature_message = rust_error_canonical(unicode_broken_signature);
+    let unsupported_signature_type_message = diagnostic_for_kind(
+        unsupported_signature_type,
+        TokenKind::LBracket,
+        "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms",
+    );
+    let unsupported_union_type_message = diagnostic_for_kind(
+        unsupported_union_type,
+        TokenKind::Pipe,
+        "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms",
+    );
+    let parameter_limit_message = diagnostic_at(
+        &over_parameter_limit,
+        3 + 32 * 2,
+        "stage-3 functions accept at most 32 parameters",
+    );
     let statement_tokens = Lexer::new(&over_statement_limit)
         .lex()
         .expect("statement limit fixture lex");
@@ -544,11 +663,6 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     );
 
     for (source, code, message) in [
-        (
-            param_source,
-            "unsupported_function_signature",
-            param_message,
-        ),
         (let_source, "unsupported_statement", let_message),
         (missing_body, "unexpected_eof", missing_message),
         (
@@ -565,6 +679,61 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             unicode_broken_expression,
             "unexpected_eof",
             unicode_broken_message,
+        ),
+        (
+            missing_param_name,
+            "unexpected_token",
+            missing_param_name_message,
+        ),
+        (
+            missing_param_type,
+            "unexpected_token",
+            missing_param_type_message,
+        ),
+        (
+            missing_param_comma,
+            "unexpected_token",
+            missing_param_comma_message,
+        ),
+        (
+            trailing_param_comma,
+            "unexpected_token",
+            trailing_param_comma_message,
+        ),
+        (
+            missing_return_type,
+            "unexpected_token",
+            missing_return_type_message,
+        ),
+        (
+            missing_signature_body,
+            "unexpected_token",
+            missing_signature_body_message,
+        ),
+        (
+            legacy_type_alias,
+            "unexpected_token",
+            legacy_type_alias_message,
+        ),
+        (
+            unicode_broken_signature,
+            "unexpected_token",
+            unicode_broken_signature_message,
+        ),
+        (
+            unsupported_signature_type,
+            "unsupported_type",
+            unsupported_signature_type_message,
+        ),
+        (
+            unsupported_union_type,
+            "unsupported_type",
+            unsupported_union_type_message,
+        ),
+        (
+            &over_parameter_limit,
+            "parameter_limit",
+            parameter_limit_message,
         ),
         (&over_statement_limit, "statement_limit", statement_message),
         (&over_function_limit, "function_limit", function_message),
@@ -613,7 +782,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         )
         .expect("copy stage-2 parser dependency");
     }
-    for name in ["ast.ku", "parser.ku"] {
+    for name in ["ast.ku", "parser.ku", "support.ku"] {
         fs::copy(
             repository_bootstrap.join("stage3").join(name),
             stage3.join(name),
