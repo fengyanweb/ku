@@ -3935,10 +3935,10 @@ fn eval_binary(op: BinaryOp, left: Value, right: Value, span: Span) -> KuResult<
         },
         BinaryOp::Equal => Ok(Value::Bool(left == right)),
         BinaryOp::NotEqual => Ok(Value::Bool(left != right)),
-        BinaryOp::Less => compare(left, right, span, |a, b| a < b),
-        BinaryOp::LessEqual => compare(left, right, span, |a, b| a <= b),
-        BinaryOp::Greater => compare(left, right, span, |a, b| a > b),
-        BinaryOp::GreaterEqual => compare(left, right, span, |a, b| a >= b),
+        BinaryOp::Less => compare(left, right, span, |a, b| a < b, |a, b| a < b),
+        BinaryOp::LessEqual => compare(left, right, span, |a, b| a <= b, |a, b| a <= b),
+        BinaryOp::Greater => compare(left, right, span, |a, b| a > b, |a, b| a > b),
+        BinaryOp::GreaterEqual => compare(left, right, span, |a, b| a >= b, |a, b| a >= b),
         BinaryOp::And | BinaryOp::Or => unreachable!("logical operators are short-circuited"),
     }
 }
@@ -3986,12 +3986,18 @@ fn checked_div(left: i64, right: i64) -> Option<i64> {
     left.checked_div(right)
 }
 
-fn compare(left: Value, right: Value, span: Span, op: fn(f64, f64) -> bool) -> KuResult<Value> {
+fn compare(
+    left: Value,
+    right: Value,
+    span: Span,
+    int_op: fn(i64, i64) -> bool,
+    float_op: fn(f64, f64) -> bool,
+) -> KuResult<Value> {
     match (left, right) {
-        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(op(a as f64, b as f64))),
-        (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(op(a, b))),
-        (Value::Int(a), Value::Float(b)) => Ok(Value::Bool(op(a as f64, b))),
-        (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(op(a, b as f64))),
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Bool(int_op(a, b))),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Bool(float_op(a, b))),
+        (Value::Int(a), Value::Float(b)) => Ok(Value::Bool(float_op(a as f64, b))),
+        (Value::Float(a), Value::Int(b)) => Ok(Value::Bool(float_op(a, b as f64))),
         (a, b) => type_error(span, "comparison operator", a, b),
     }
 }

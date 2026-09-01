@@ -155,6 +155,41 @@ fn null_equality_is_allowed_but_null_math_is_rejected() {
 }
 
 #[test]
+fn interpreter_integer_comparisons_preserve_i64_precision() {
+    let source = r#"
+fn assert_ordered(lower: int, higher: int) {
+    if (!(lower < higher)) panic("less")
+    if (!(lower <= higher)) panic("less equal ordered")
+    if (lower > higher) panic("greater reversed")
+    if (lower >= higher) panic("greater equal reversed")
+    if (lower == higher) panic("equal distinct")
+    if (!(lower != higher)) panic("not equal distinct")
+
+    if (higher < lower) panic("less reversed")
+    if (higher <= lower) panic("less equal reversed")
+    if (!(higher > lower)) panic("greater")
+    if (!(higher >= lower)) panic("greater equal ordered")
+
+    if (lower < lower) panic("less equal values")
+    if (!(lower <= lower)) panic("less equal equal values")
+    if (lower > lower) panic("greater equal values")
+    if (!(lower >= lower)) panic("greater equal equal values")
+    if (!(lower == lower)) panic("equal same")
+    if (lower != lower) panic("not equal same")
+}
+
+fn main() {
+    minimum = -9223372036854775807 - 1
+    assert_ordered(minimum, -9223372036854775807)
+    assert_ordered(9223372036854775806, 9223372036854775807)
+}
+"#;
+
+    check_source("inline.ku", source).expect("i64 boundary comparisons should check");
+    run_source("inline.ku", source).expect("i64 boundary comparisons should be exact");
+}
+
+#[test]
 fn function_system_rejects_bad_signatures_and_calls() {
     for source in [
         r#"fn main(a: int) {}"#,
