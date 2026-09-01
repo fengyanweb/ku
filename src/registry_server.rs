@@ -6188,8 +6188,15 @@ mod tests {
         let body = Arc::new(fs::read(&artifact.path).expect("read test package body"));
         assert!(body.len() <= MAX_BUFFERED_REJECT_BODY_BYTES);
 
-        let mut slow = connect_test_tls(&server.base_url, certificate.clone());
-        write_test_publish(slow.get_mut(), "token-math", &artifact, &[]);
+        // Hold the package admission slot directly. The real TLS duplicates
+        // below still exercise worker/queue scheduling and rejection framing,
+        // without coupling this test to an intentionally incomplete socket's
+        // accept-based request deadline.
+        let state = server.state.upgrade().expect("registry is running");
+        let held_math = state
+            .mutation_admission
+            .try_acquire("math")
+            .expect("hold active package admission");
         wait_for_mutation_names(&server, &["math"]);
 
         let barrier = Arc::new(Barrier::new(7));
@@ -6240,29 +6247,20 @@ mod tests {
         }
         assert!(
             duplicates.iter().all(thread::JoinHandle::is_finished),
-            "duplicate mutations must reject without waiting for the slow upload"
+            "duplicate mutations must reject without waiting for the held package admission"
         );
         for duplicate in duplicates {
             assert_eq!(duplicate.join().expect("duplicate mutation panicked"), 429);
         }
         wait_for_mutation_names(&server, &["math"]);
-        let staging = server.state.upgrade().unwrap().storage.staging.clone();
+        let staging = state.storage.staging.clone();
         assert_eq!(
             fs::read_dir(&staging).expect("read active staging").count(),
-            1,
-            "rejected duplicate requests must not allocate upload staging"
+            0,
+            "rejected duplicates and the completed independent publish must not leave staging"
         );
 
-        slow.get_mut()
-            .write_all(&body)
-            .expect("finish admitted upload");
-        slow.get_mut().flush().expect("flush admitted upload");
-        assert_eq!(
-            read_test_http_response(&mut slow)
-                .expect("read admitted publish response")
-                .0,
-            201
-        );
+        drop(held_math);
         wait_for_mutation_names(&server, &[]);
         assert_eq!(
             fs::read_dir(&staging)
