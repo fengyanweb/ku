@@ -454,6 +454,17 @@ static int ku_test_pg_load_dispose_calls(void) {{
   return atomic_load_explicit(&ku_test_pg_dispose_calls, memory_order_relaxed);
 }}
 #endif
+static KuTestEvent ku_test_pg_dispose_entered;
+static KuTestEvent ku_test_pg_dispose_release;
+static int ku_test_pg_block_dispose = 0;
+static void ku_test_pg_pause_dispose(void) {{
+  if (!ku_test_pg_block_dispose) return;
+  if (!ku_test_event_set(&ku_test_pg_dispose_entered)
+      || !ku_test_event_wait(&ku_test_pg_dispose_release, 5000)) {{
+    fputs("PG disposer barrier failed\n", stderr);
+    abort();
+  }}
+}}
 #define shutdown ku_test_pg_shutdown
 static unsigned long long ku_test_pg_now(void);
 #define KU_PG_MONOTONIC_MS() ku_test_pg_now()
@@ -475,7 +486,7 @@ static int ku_test_pg_acquire_calls = 0;
         )
         .replacen(
             "static void ku_pg_client_dispose(KuPgClient* p) {",
-            "static void ku_pg_client_dispose(KuPgClient* p) { ku_test_pg_record_dispose();",
+            "static void ku_pg_client_dispose(KuPgClient* p) { ku_test_pg_record_dispose(); ku_test_pg_pause_dispose();",
             1,
         );
     let (query_stub, _) = QUERY_STUB
@@ -913,6 +924,34 @@ int main(void) {
   CHECK(ku_test_event_destroy(&active.acquired));
   CHECK(ku_test_event_destroy(&active.release));
   CHECK(ku_test_pg_load_dispose_calls() == 1);
+  CHECK(!live_connections && starts == finishes && !bad_calls);
+
+  /* Both raw close calls begin while the allocation is live. The first owns
+     finalization and pauses before destruction; the second must return without
+     selecting a second disposer. This does not permit close-after-free. */
+  KuResult_pg_client double_opened = ku_pg_client_open(
+      text("hostaddr=127.0.0.1"), 1, 1, 5000, 60000, 60000);
+  CHECK(double_opened.ok && double_opened.value);
+  KuPgClient* double_client = double_opened.value;
+  CHECK(ku_test_event_init(&ku_test_pg_dispose_entered));
+  CHECK(ku_test_event_init(&ku_test_pg_dispose_release));
+  ku_test_pg_block_dispose = 1;
+  KuTestThread first_close = {0};
+  KuTestThread second_close = {0};
+  CHECK(ku_test_thread_start(
+      &first_close, ku_test_pg_close_worker, double_client));
+  CHECK(ku_test_event_wait(&ku_test_pg_dispose_entered, 3000));
+  CHECK(ku_test_thread_start(
+      &second_close, ku_test_pg_close_worker, double_client));
+  CHECK(ku_test_event_wait(&second_close.finished, 3000));
+  CHECK(second_close.outcome == 0 && ku_test_pg_load_dispose_calls() == 2);
+  CHECK(ku_test_event_set(&ku_test_pg_dispose_release));
+  CHECK(ku_test_thread_join(&second_close, 3000));
+  CHECK(ku_test_thread_join(&first_close, 3000));
+  ku_test_pg_block_dispose = 0;
+  CHECK(ku_test_event_destroy(&ku_test_pg_dispose_entered));
+  CHECK(ku_test_event_destroy(&ku_test_pg_dispose_release));
+  CHECK(ku_test_pg_load_dispose_calls() == 2);
   CHECK(!live_connections && starts == finishes && !bad_calls);
   puts("pg real-thread lifecycle closed loop");
   return 0;

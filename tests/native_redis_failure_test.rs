@@ -107,7 +107,7 @@ fn main(): null! {
         )
         .expect("generated Redis pool destructor")
         .1
-        .split_once("static int ku_redis_client_ready_to_dispose")
+        .split_once("static int ku_redis_client_take_dispose")
         .expect("generated Redis pool destructor end")
         .0;
     let sync_destroy = pool_destroy_path
@@ -282,6 +282,17 @@ static int ku_test_redis_load_connection_destroy_calls(void) {{
       &ku_test_redis_connection_destroy_calls, memory_order_relaxed);
 }}
 #endif
+static KuTestEvent ku_test_redis_dispose_entered;
+static KuTestEvent ku_test_redis_dispose_release;
+static int ku_test_redis_block_dispose = 0;
+static void ku_test_redis_pause_dispose(void) {{
+  if (!ku_test_redis_block_dispose) return;
+  if (!ku_test_event_set(&ku_test_redis_dispose_entered)
+      || !ku_test_event_wait(&ku_test_redis_dispose_release, 5000)) {{
+    fputs("Redis disposer barrier failed\n", stderr);
+    abort();
+  }}
+}}
 "#
     );
     let mut harness = generated
@@ -302,7 +313,7 @@ static int ku_test_redis_load_connection_destroy_calls(void) {{
         )
         .replacen(
             "static void ku_redis_client_free_unpublished(KuRedisClient* client, int sync_ready) {",
-            "static void ku_redis_client_free_unpublished(KuRedisClient* client, int sync_ready) { ku_test_redis_record_dispose();",
+            "static void ku_redis_client_free_unpublished(KuRedisClient* client, int sync_ready) { ku_test_redis_record_dispose(); ku_test_redis_pause_dispose();",
             1,
         );
     harness.push_str(REDIS_THREAD_LIFECYCLE_MAIN);
@@ -609,6 +620,33 @@ int main(void) {
   THREAD_CHECK(ku_test_event_destroy(&active.release));
   THREAD_CHECK(ku_test_redis_load_connection_destroy_calls() == 1);
   THREAD_CHECK(ku_test_redis_load_dispose_calls() == 1);
+
+  /* Both raw close calls begin before destruction. The first finalizer pauses
+     with a live allocation, and the second must observe finalizing and return.
+     Calling close again after the first returns remains outside the contract. */
+  KuRedisClient* double_client = ku_test_redis_pool();
+  THREAD_CHECK(double_client != NULL);
+  THREAD_CHECK(ku_test_event_init(&ku_test_redis_dispose_entered));
+  THREAD_CHECK(ku_test_event_init(&ku_test_redis_dispose_release));
+  ku_test_redis_block_dispose = 1;
+  KuTestThread first_close = {0};
+  KuTestThread second_close = {0};
+  THREAD_CHECK(ku_test_thread_start(
+      &first_close, ku_test_redis_close_worker, double_client));
+  THREAD_CHECK(ku_test_event_wait(&ku_test_redis_dispose_entered, 3000));
+  THREAD_CHECK(ku_test_thread_start(
+      &second_close, ku_test_redis_close_worker, double_client));
+  THREAD_CHECK(ku_test_event_wait(&second_close.finished, 3000));
+  THREAD_CHECK(second_close.outcome == 0
+      && ku_test_redis_load_dispose_calls() == 2);
+  THREAD_CHECK(ku_test_event_set(&ku_test_redis_dispose_release));
+  THREAD_CHECK(ku_test_thread_join(&second_close, 3000));
+  THREAD_CHECK(ku_test_thread_join(&first_close, 3000));
+  ku_test_redis_block_dispose = 0;
+  THREAD_CHECK(ku_test_event_destroy(&ku_test_redis_dispose_entered));
+  THREAD_CHECK(ku_test_event_destroy(&ku_test_redis_dispose_release));
+  THREAD_CHECK(ku_test_redis_load_connection_destroy_calls() == 2);
+  THREAD_CHECK(ku_test_redis_load_dispose_calls() == 2);
   puts("redis real-thread lifecycle closed loop");
   return 0;
 }

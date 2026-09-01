@@ -10305,6 +10305,9 @@ typedef struct KuRedis {
   size_t read_length;
 } KuRedis;
 
+/* Translation-unit-private raw helpers require one unique Ku owner. Repeated
+   close, use after close, and starting an operation concurrently with consuming
+   close are outside the contract; there is intentionally no entrant refcount. */
 struct KuRedisClient {
   KuString host;
   KuString username;
@@ -10326,6 +10329,7 @@ struct KuRedisClient {
   uint8_t has_username;
   uint8_t has_password;
   uint8_t closing;
+  uint8_t finalizing;
   uint8_t connect_in_flight;
   uint8_t backoff_timer_armed;
 };
@@ -11755,8 +11759,14 @@ static void ku_redis_client_free_unpublished(KuRedisClient* client, int sync_rea
   free(client);
 }
 
-static int ku_redis_client_ready_to_dispose(const KuRedisClient* client) {
-  return client->closing && client->borrowed == 0 && client->waiters == 0;
+/* Called with the pool mutex held. This arbitrates concurrent close/release
+   paths while the allocation is still live; it does not make a freed raw
+   pointer reusable or permit a new operation to race consuming close. */
+static int ku_redis_client_take_dispose(KuRedisClient* client) {
+  if (!client->closing || client->finalizing
+      || client->borrowed != 0 || client->waiters != 0) return 0;
+  client->finalizing = 1;
+  return 1;
 }
 
 static KuResult_redis_client ku_redis_client(KuObject* config) {
@@ -11911,7 +11921,7 @@ static KuRedisLeaseResult ku_redis_client_acquire(
   for (;;) {
     if (client->closing) {
       if (registered_waiter) { client->waiters--; ku_redis_pool_wake_all(&client->sync); }
-      int dispose = ku_redis_client_ready_to_dispose(client);
+      int dispose = ku_redis_client_take_dispose(client);
       ku_redis_pool_unlock(&client->sync);
       if (dispose) ku_redis_client_free_unpublished(client, 1);
       return (KuRedisLeaseResult){ false, NULL, ku_redis_client_closed_err() };
@@ -11968,7 +11978,7 @@ static KuRedisLeaseResult ku_redis_client_acquire(
         client->borrowed--;
         if (client->closing) ku_redis_pool_wake_all(&client->sync);
         else ku_redis_pool_wake_one(&client->sync);
-        int dispose = ku_redis_client_ready_to_dispose(client);
+        int dispose = ku_redis_client_take_dispose(client);
         ku_redis_pool_unlock(&client->sync);
         if (opened.ok) ku_redis_connection_destroy(opened.value);
         if (dispose) ku_redis_client_free_unpublished(client, 1);
@@ -12010,7 +12020,7 @@ static KuRedisLeaseResult ku_redis_client_acquire(
       client->waiters--;
       if (client->closing) ku_redis_pool_wake_all(&client->sync);
       else ku_redis_client_handoff_available_locked(client);
-      int dispose = ku_redis_client_ready_to_dispose(client);
+      int dispose = ku_redis_client_take_dispose(client);
       ku_redis_pool_unlock(&client->sync);
       if (dispose) ku_redis_client_free_unpublished(client, 1);
       return (KuRedisLeaseResult){ false, NULL,
@@ -12040,7 +12050,7 @@ static void ku_redis_client_release(KuRedisClient* client, KuRedis* connection) 
   }
   if (client->closing) ku_redis_pool_wake_all(&client->sync);
   else ku_redis_pool_wake_one(&client->sync);
-  int dispose = ku_redis_client_ready_to_dispose(client);
+  int dispose = ku_redis_client_take_dispose(client);
   ku_redis_pool_unlock(&client->sync);
   ku_redis_connection_destroy(connection);
   if (dispose) ku_redis_client_free_unpublished(client, 1);
@@ -12124,7 +12134,7 @@ static uint8_t ku_redis_close(KuRedisClient* client) {
   client->total_connections -= detached_count;
   client->idle_count = 0;
   ku_redis_pool_wake_all(&client->sync);
-  int dispose = ku_redis_client_ready_to_dispose(client);
+  int dispose = ku_redis_client_take_dispose(client);
   ku_redis_pool_unlock(&client->sync);
   for (uint32_t index = 0; index < detached_count; index++)
     ku_redis_connection_destroy(detached_idle[index]);
@@ -13088,8 +13098,10 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
     // abstraction. The client owns every connection; queries borrow one and always
     // return it. In Ku's move-only ownership path, closing marks the client first and
     // defers destruction until registered borrowers and condition waiters leave.
-    // External C callers must not start an operation concurrently with consuming
-    // close: the raw pointer ABI intentionally does not provide an entrant refcount.
+    // These translation-unit-private raw helpers require one unique owner: callers
+    // must not repeat close or start an operation concurrently with consuming close.
+    // The raw pointer contract intentionally has no entrant refcount and does not
+    // make a pointer reusable after close returns.
     if program_uses_pg_client(program) {
         out.push_str(concat!(
             "#if defined(_WIN32)\n",
@@ -13155,8 +13167,9 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "#define KU_PG_CLIENT_DEFAULT_CONNECT_TIMEOUT_MS 5000LL\n",
             "#define KU_PG_CLIENT_DEFAULT_ACQUIRE_TIMEOUT_MS 5000LL\n",
             "#define KU_PG_CLIENT_DEFAULT_QUERY_TIMEOUT_MS 30000LL\n",
-            "struct KuPgClient { PGconn** conns; char* in_use; size_t size; size_t max_waiters; char* conninfo; size_t conninfo_len; unsigned long long connect_timeout_ms, acquire_timeout_ms, query_timeout_ms; KuPgMutex lock; KuPgCond cv; size_t active; size_t waiters; uint32_t consecutive_connect_failures; unsigned long long reconnect_not_before_ms; int closing; int connect_in_flight; int backoff_timer_armed; };\n",
+            "struct KuPgClient { PGconn** conns; char* in_use; size_t size; size_t max_waiters; char* conninfo; size_t conninfo_len; unsigned long long connect_timeout_ms, acquire_timeout_ms, query_timeout_ms; KuPgMutex lock; KuPgCond cv; size_t active; size_t waiters; uint32_t consecutive_connect_failures; unsigned long long reconnect_not_before_ms; int closing; int finalizing; int connect_in_flight; int backoff_timer_armed; };\n",
             "static void ku_pg_client_dispose(KuPgClient* p);\n",
+            "static int ku_pg_client_take_dispose_locked(KuPgClient* p) { if (!p->closing || p->finalizing || p->active != 0 || p->waiters != 0) return 0; p->finalizing = 1; return 1; }\n",
             "static unsigned long long ku_pg_client_saturating_add_ms(unsigned long long now, unsigned long long delay) { return ~0ULL - now < delay ? ~0ULL : now + delay; }\n",
             "static unsigned long long ku_pg_client_backoff_delay_ms(KuPgClient* p, unsigned long long now) {\n",
             "  uint32_t failures = p->consecutive_connect_failures; unsigned int shift = failures > 6U ? 6U : (failures ? failures - 1U : 0U);\n",
@@ -13257,7 +13270,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "      PGconn* h = connect_attempt.conn;\n",
             "      if (!h) {\n",
             "        KuError e = connect_attempt.outcome == KU_PG_CONNECT_OUT_OF_MEMORY ? ku_pg_out_of_memory_error() : (connect_attempt.outcome == KU_PG_CONNECT_TIMED_OUT ? (acquire_limited_connect ? ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1) : ku_pg_static_error(\"connect_timeout\", sizeof(\"connect_timeout\") - 1, \"timed out connecting a PostgreSQL client connection\", sizeof(\"timed out connecting a PostgreSQL client connection\") - 1)) : ku_pg_connect_failure_error());\n",
-            "        ku_pg_mutex_lock(&p->lock); p->connect_in_flight = 0; ku_pg_client_record_connect_failure_locked(p, ku_pg_now_ms()); p->in_use[made] = 0; p->active--; int dispose = p->closing && p->active == 0 && p->waiters == 0; if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
+            "        ku_pg_mutex_lock(&p->lock); p->connect_in_flight = 0; ku_pg_client_record_connect_failure_locked(p, ku_pg_now_ms()); p->in_use[made] = 0; p->active--; int dispose = ku_pg_client_take_dispose_locked(p); if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
             "        *err = e; if (dispose) ku_pg_client_dispose(p); return -1;\n",
             "      }\n",
             "      ku_pg_mutex_lock(&p->lock);\n",
@@ -13267,7 +13280,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
                while holding the lock so an expired reservation is rolled back
                instead of being installed and used by the query pump. */
             "      int connect_expired = ku_pg_now_ms() >= deadline;\n",
-            "      if (p->closing || connect_expired) { int client_closing = p->closing; p->in_use[made] = 0; p->active--; int dispose = p->closing && p->active == 0 && p->waiters == 0; if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock); PQfinish(h); *err = client_closing ? ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1) : ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
+            "      if (p->closing || connect_expired) { int client_closing = p->closing; p->in_use[made] = 0; p->active--; int dispose = ku_pg_client_take_dispose_locked(p); if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock); PQfinish(h); *err = client_closing ? ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1) : ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out acquiring a PostgreSQL client connection\", sizeof(\"timed out acquiring a PostgreSQL client connection\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
             "      p->conns[made] = h; ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
             "      *out = h; return made;\n",
             "    }\n",
@@ -13278,7 +13291,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "    if (p->reconnect_not_before_ms > now && !p->backoff_timer_armed) { p->backoff_timer_armed = 1; owns_backoff_timer = 1; if (p->reconnect_not_before_ms < wait_deadline) wait_deadline = p->reconnect_not_before_ms; }\n",
             "    unsigned long long remaining = wait_deadline - now;\n",
             "    p->waiters++; int wait_result = ku_pg_cond_wait_ms(&p->cv, &p->lock, remaining); p->waiters--; ku_pg_client_release_backoff_timer_locked(p, owns_backoff_timer);\n",
-            "    if (p->closing) { int dispose = p->active == 0 && p->waiters == 0; ku_pg_cond_broadcast(&p->cv); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
+            "    if (p->closing) { int dispose = ku_pg_client_take_dispose_locked(p); ku_pg_cond_broadcast(&p->cv); ku_pg_mutex_unlock(&p->lock); *err = ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1); if (dispose) ku_pg_client_dispose(p); return -1; }\n",
             "    if (wait_result != 0) { now = ku_pg_now_ms(); if (wait_result == 1 && wait_deadline < deadline && now < deadline) { has_waited = 1; continue; } ku_pg_client_handoff_available_locked(p); ku_pg_mutex_unlock(&p->lock); *err = wait_result == 1 ? ku_pg_client_error(\"acquire_timeout\", sizeof(\"acquire_timeout\") - 1, \"timed out waiting for a PostgreSQL client connection\", sizeof(\"timed out waiting for a PostgreSQL client connection\") - 1) : ku_pg_client_error(\"sync_error\", sizeof(\"sync_error\") - 1, \"failed waiting for a PostgreSQL client connection\", sizeof(\"failed waiting for a PostgreSQL client connection\") - 1); return -1; }\n",
             "    has_waited = 1;\n",
             "  }\n",
@@ -13314,7 +13327,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "  PGconn* discard = 0;\n",
             "  if ((broken || p->closing) && p->conns[slot]) { discard = p->conns[slot]; p->conns[slot] = 0; }\n",
             "  p->in_use[slot] = 0; if (p->active > 0) p->active--;\n",
-            "  int dispose = p->closing && p->active == 0 && p->waiters == 0;\n",
+            "  int dispose = ku_pg_client_take_dispose_locked(p);\n",
             "  if (p->closing) ku_pg_cond_broadcast(&p->cv); else ku_pg_cond_signal(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
             "  if (discard) PQfinish(discard);\n",
             "  if (dispose) ku_pg_client_dispose(p);\n",
@@ -13344,7 +13357,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "static void ku_pg_client_close_owned(KuPgClient* p) {\n",
             "  if (!p) return;\n",
             "  ku_pg_mutex_lock(&p->lock);\n",
-            "  p->closing = 1; int dispose = p->active == 0 && p->waiters == 0;\n",
+            "  p->closing = 1; int dispose = ku_pg_client_take_dispose_locked(p);\n",
             "  ku_pg_cond_broadcast(&p->cv); ku_pg_mutex_unlock(&p->lock);\n",
             "  if (dispose) ku_pg_client_dispose(p);\n",
             "}\n",
