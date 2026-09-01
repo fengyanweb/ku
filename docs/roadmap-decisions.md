@@ -54,11 +54,11 @@ ku build --backend c --release --target <target> .
 
 当前 runtime module 边界仍未完成，不能把“三目标路径存在”写成“所有程序均已跨平台”：
 
-- 核心同步 ABI 与 `std.fs/std.json/std.time` 已有 Windows/POSIX C 分支；仍需在 Linux/macOS 真机 CI 跑完整 native suite。
-- native `std.http` 和 `std.redis` 已有 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 源码分支；Windows 已本地验证，Linux/macOS 仍待对应真机 CI 首次跑绿。
-- socket-free `ku-native-tls` runtime ABI 已固定 rustls/ring、WebPKI/显式 PEM CA 和资源上限，并进入 workspace CI 配置；它尚未接入 `std.net`、HTTP 或 Redis，且配置存在不等于远端三系统 workflow 已实际跑绿。
+- 核心同步 ABI 与 `std.fs/std.json/std.time` 的 Windows/POSIX C 分支已在 Windows 2025、Ubuntu 24.04、macOS 15 完整 workspace CI 跑绿，三个目标的 native build/run 门槛也已通过；这仍不是生产负载 soak。
+- native `std.http`、plain `std.net` 和 `std.redis` 的 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支已在上述三系统 workspace CI 跑绿；Redis 新 client 的真实服务复验仍未完成。
+- socket-free `ku-native-tls` runtime ABI 已固定 rustls/ring、WebPKI/显式 PEM CA 和资源上限，并在三系统 workspace CI 完成 crate 构建/测试；它尚未接入 generated C 的 `std.net`、HTTP 或 Redis，也没有最终消费者链接门槛，不能写成通用 TLS 已完成。
 - `std.mysql` Unix host build 使用绝对 `KU_MYSQL_LIB`/`KU_MYSQL_INCLUDE`；Windows 可使用同一显式配置，也可发现常见的完整安装。候选 symlink 必须先解析为 canonical 非空普通文件，family、archive magic 和 loader identity 从 canonical target 与固定句柄判定；编译器只读取该句柄的私有副本。最终产物必须精确动态导入所选 loader identity，并完成 header/runtime ABI 握手；显式 non-host target 仍明确拒绝自动链接，可在目标系统分别构建，或自行链接保留的 C artifact。
-- `std.pg` 已有 Windows/POSIX 同步与目标库格式处理；三系统统一通过绝对路径 `KU_PG_LIB` 的专用小目录提供匹配 target 的 shared/import libpq，不再扫描系统安装目录或走隐式 linker 搜索。候选 symlink 必须先解析为 canonical 非空普通文件；Windows import library 由有界解析器提取目标 `libpq.dll`，ELF/Mach-O 分别读取 `DT_SONAME`/`LC_ID_DYLIB`，链接字节从固定句柄复制。最终产物必须包含与本次选中库完全一致的 loader identity；缺失、静态回退、路径替换或同族不同 loader 都拒绝安装。
+- `std.pg` 已有 Windows/POSIX 同步与目标库格式处理；三系统统一通过绝对路径 `KU_PG_LIB` 的专用小目录提供匹配 target 的 shared/import libpq，不再扫描系统安装目录或走隐式 linker 搜索。候选 symlink 必须先解析为 canonical 非空普通文件；Windows import library 由有界解析器提取目标 `libpq.dll`，ELF/Mach-O 分别读取 `DT_SONAME`/`LC_ID_DYLIB`，链接字节从固定句柄复制。最终产物必须包含与本次选中库完全一致的 loader identity；缺失、静态回退、路径替换或同族不同 loader 都拒绝安装。PG/MySQL 的三系统精确动态库链接/启动门槛现已通过；identity 指最终直接依赖记录的 loader name，不证明部署时解析到同一文件 hash/path，也不验证传递依赖。
 - native async lowering 仍未完成。
 
 ## 6. HTTP 专用响应 wire ABI
