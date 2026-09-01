@@ -1,0 +1,49 @@
+import { EscapeCanonical } from "../stage1/token.ku"
+// NodeId 0 is permanently reserved for "none". Nodes and child edges live in
+// separate, append-only bounded arenas, so a NodeId remains stable as arrays
+// grow. The first bootstrap parser deliberately has no recursive AST values.
+struct Node {
+    kind: str
+    text: str
+    int_value: int
+    line: int
+    column: int
+    offset: int
+    end_line: int
+    end_column: int
+    end_offset: int
+    first_edge: int
+    edge_count: int
+}
+
+struct Arena {
+    nodes: [Node]
+    edges: [int]
+}
+
+struct ParseOutput {
+    arena: Arena
+    root: int
+}
+
+fn EmptyArena(): Arena {
+    nodes: [Node] = []
+    edges: [int] = []
+    return Arena { nodes: nodes, edges: edges }
+}
+
+fn AstCanonical(output: ParseOutput): str {
+    text = "ROOT|" + str(output.root)
+    index = 0
+    while (index < output.arena.nodes.len()) {
+        node = output.arena.nodes[index].clone()
+        text += "\nNODE|" + str(index + 1) + "|" + node.kind + "|" + EscapeCanonical(node.text) + "|" + str(node.int_value) + "|" + str(node.line) + ":" + str(node.column) + "@" + str(node.offset) + ".." + str(node.end_line) + ":" + str(node.end_column) + "@" + str(node.end_offset) + "|" + str(node.first_edge) + "|" + str(node.edge_count)
+        index = index + 1
+    }
+    index = 0
+    while (index < output.arena.edges.len()) {
+        text += "\nEDGE|" + str(index) + "|" + str(output.arena.edges[index])
+        index = index + 1
+    }
+    return text
+}
