@@ -4,6 +4,10 @@ version = "0.0.16"
 edition = "2021"
 rust-version = "1.89"
 
+[workspace]
+members = ["crates/ku-native-tls"]
+resolver = "2"
+
 [dependencies]
 chrono = "0.4"
 ed25519-dalek = "2"

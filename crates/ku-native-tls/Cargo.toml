@@ -1,0 +1,17 @@
+[package]
+name = "ku-native-tls"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+ring = "=0.17.14"
+rustls = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "=1.0.7"
+
+[dev-dependencies]
+rcgen = { version = "=0.13.2", default-features = false, features = ["pem", "ring"] }
