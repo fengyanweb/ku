@@ -602,7 +602,7 @@ impl BuildWindowsJob {
         // for the duration of the call. The owned handle closes on every path.
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if handle == 0 {
+            if handle.is_null() {
                 return Err(format!(
                     "CreateJobObjectW failed: {}",
                     io::Error::last_os_error()
@@ -777,7 +777,7 @@ impl BuildWindowsJob {
                 thread_id,
             )
         };
-        if thread == 0 {
+        if thread.is_null() {
             return Err(format!(
                 "OpenThread failed before compiler resume: {}",
                 io::Error::last_os_error()
