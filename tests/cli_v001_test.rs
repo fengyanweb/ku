@@ -4,7 +4,7 @@ pub mod bounded_process;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Mutex;
@@ -15,6 +15,8 @@ use bounded_process::{run_bounded, FailureKind, OutputLimits};
 
 const SHORT_PROCESS_OUTPUT_LIMITS: OutputLimits =
     OutputLimits::new(4 * 1024 * 1024, 6 * 1024 * 1024);
+const HTTP_TEST_RESPONSE_LIMIT: usize = 1024 * 1024;
+const HTTP_TEST_READ_POLL_TIMEOUT: Duration = Duration::from_millis(200);
 const SERVER_STREAM_CAPTURE_LIMIT: usize = 1024 * 1024;
 const SERVER_READER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -90,14 +92,27 @@ fn unused_local_address() -> String {
 }
 
 fn connect_with_retry(address: &str, timeout: Duration) -> TcpStream {
+    let socket_address = address
+        .parse::<SocketAddr>()
+        .expect("HTTP test address must be a socket address");
     let started = Instant::now();
     let mut last_error = None;
     while started.elapsed() < timeout {
-        match TcpStream::connect(address) {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(
+            &socket_address,
+            remaining.min(HTTP_TEST_READ_POLL_TIMEOUT),
+        ) {
             Ok(stream) => return stream,
             Err(err) => last_error = Some(err),
         }
-        thread::sleep(Duration::from_millis(20));
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if !remaining.is_zero() {
+            thread::sleep(remaining.min(Duration::from_millis(20)));
+        }
     }
     panic!(
         "http server did not accept connections within {timeout:?}: {}",
@@ -114,22 +129,217 @@ fn connect_with_read_timeout(
 ) -> TcpStream {
     let stream = connect_with_retry(address, connect_timeout);
     stream
-        .set_read_timeout(Some(read_timeout))
+        .set_read_timeout(Some(read_timeout.min(HTTP_TEST_READ_POLL_TIMEOUT)))
         .expect("set http test read timeout");
     stream
 }
 
-fn read_http_stream(mut stream: TcpStream) -> String {
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 1024];
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => response.extend_from_slice(&buffer[..read]),
-            Err(_) if !response.is_empty() => break,
-            Err(err) => panic!("read http test response: {err}"),
+fn http_response_expected_total(
+    response: &[u8],
+    header_offset: usize,
+) -> std::io::Result<Option<usize>> {
+    let header_end = header_offset.checked_add(4).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP test response header length overflowed",
+        )
+    })?;
+    let header = std::str::from_utf8(&response[..header_offset]).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP test response header is not UTF-8",
+        )
+    })?;
+    let mut lines = header.split("\r\n");
+    let status_code = lines
+        .next()
+        .and_then(|status| status.split_ascii_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP test response has an invalid status line",
+            )
+        })?;
+    if matches!(status_code, 204 | 304) {
+        return Ok(Some(header_end));
+    }
+
+    let mut content_length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP test response has an invalid header field",
+            ));
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP test response has duplicate Content-Length",
+                ));
+            }
+            let value = value.trim_matches(|character| matches!(character, ' ' | '\t'));
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP test response has an invalid Content-Length",
+                ));
+            }
+            content_length = Some(value.parse::<usize>().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP test response has an invalid Content-Length",
+                )
+            })?);
         }
     }
+
+    content_length
+        .map(|length| {
+            header_end.checked_add(length).map(Some).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP test response body length overflowed",
+                )
+            })
+        })
+        .unwrap_or(Ok(None))
+}
+
+fn http_response_frame_complete(
+    response_len: usize,
+    expected_total: Option<usize>,
+) -> std::io::Result<bool> {
+    let Some(total) = expected_total else {
+        return Ok(false);
+    };
+    if response_len > total {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP test response contains bytes beyond its declared frame",
+        ));
+    }
+    Ok(response_len == total)
+}
+
+fn read_http_stream_bytes_until(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    initial_poll_timeout: Duration,
+) -> std::io::Result<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let mut header_parsed = false;
+    let mut expected_total = None;
+    // Callers configure the first poll immediately after connect, before the
+    // peer can close an idle socket. Later polls can safely use the remaining
+    // absolute deadline because no test path half-closes the write side.
+    let mut first_poll = true;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| *remaining >= Duration::from_millis(1))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "HTTP test response exceeded its absolute deadline",
+                )
+            })?;
+        if first_poll {
+            if initial_poll_timeout.is_zero() || initial_poll_timeout > remaining {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "HTTP test initial read poll exceeds its absolute deadline",
+                ));
+            }
+        } else {
+            stream.set_read_timeout(Some(remaining.min(HTTP_TEST_READ_POLL_TIMEOUT)))?;
+        }
+        first_poll = false;
+
+        let read_result = stream.read(&mut buffer);
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP test response exceeded its absolute deadline",
+            ));
+        }
+        match read_result {
+            Ok(0) => {
+                if !header_parsed || expected_total.is_some_and(|total| response.len() < total) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "HTTP test response closed before its complete frame",
+                    ));
+                }
+                return Ok(response);
+            }
+            Ok(read) => {
+                let previous_len = response.len();
+                if response.len().saturating_add(read) > HTTP_TEST_RESPONSE_LIMIT {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("HTTP test response exceeded {HTTP_TEST_RESPONSE_LIMIT} bytes"),
+                    ));
+                }
+                response.extend_from_slice(&buffer[..read]);
+                if !header_parsed {
+                    let search_start = previous_len.saturating_sub(3);
+                    if let Some(relative) = response[search_start..]
+                        .windows(4)
+                        .position(|part| part == b"\r\n\r\n")
+                    {
+                        let header_offset = search_start + relative;
+                        expected_total = http_response_expected_total(&response, header_offset)?;
+                        if expected_total.is_some_and(|total| total > HTTP_TEST_RESPONSE_LIMIT) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "HTTP test response declared more than {HTTP_TEST_RESPONSE_LIMIT} bytes"
+                                ),
+                            ));
+                        }
+                        header_parsed = true;
+                    }
+                }
+                if http_response_frame_complete(response.len(), expected_total)? {
+                    return Ok(response);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(1)),
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(1)),
+            ),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn read_http_stream(mut stream: TcpStream, timeout: Duration) -> String {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .expect("HTTP test response deadline overflowed");
+    let response = read_http_stream_bytes_until(
+        &mut stream,
+        deadline,
+        timeout.min(HTTP_TEST_READ_POLL_TIMEOUT),
+    )
+    .unwrap_or_else(|error| panic!("read bounded HTTP test response: {error}"));
     String::from_utf8_lossy(&response).into_owned()
 }
 
@@ -167,48 +377,53 @@ fn wait_for_http_response(
     request: &str,
     timeout: Duration,
 ) -> Result<String, String> {
+    let socket_address = address
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid HTTP test address: {error}"))?;
     let started = Instant::now();
+    let deadline = started
+        .checked_add(timeout)
+        .ok_or_else(|| "HTTP test response deadline overflowed".to_string())?;
     let mut last_error = String::new();
-    while started.elapsed() < timeout {
-        match TcpStream::connect(address) {
+    while Instant::now() < deadline {
+        let connect_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(HTTP_TEST_READ_POLL_TIMEOUT);
+        if connect_timeout.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&socket_address, connect_timeout) {
             Ok(mut stream) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let read_poll_timeout = remaining.min(HTTP_TEST_READ_POLL_TIMEOUT);
                 stream
-                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .set_read_timeout(Some(read_poll_timeout))
                     .expect("set read timeout");
                 stream
-                    .set_write_timeout(Some(Duration::from_millis(500)))
+                    .set_write_timeout(Some(remaining.min(Duration::from_millis(500))))
                     .expect("set write timeout");
                 if let Err(err) = stream.write_all(request.as_bytes()) {
                     last_error = err.to_string();
-                    thread::sleep(Duration::from_millis(30));
-                    continue;
-                }
-                let _ = stream.shutdown(Shutdown::Write);
-                let mut response = Vec::new();
-                let mut buffer = [0u8; 1024];
-                loop {
-                    match stream.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(read) => response.extend_from_slice(&buffer[..read]),
-                        Err(err) if !response.is_empty() => {
-                            last_error = err.to_string();
-                            break;
+                } else {
+                    match read_http_stream_bytes_until(&mut stream, deadline, read_poll_timeout) {
+                        Ok(response) => {
+                            return Ok(String::from_utf8_lossy(&response).into_owned());
                         }
-                        Err(err) => {
-                            last_error = err.to_string();
-                            break;
-                        }
+                        Err(error) => last_error = error.to_string(),
                     }
-                }
-                if !response.is_empty() {
-                    return Ok(String::from_utf8_lossy(&response).into_owned());
                 }
             }
             Err(err) => {
                 last_error = err.to_string();
             }
         }
-        thread::sleep(Duration::from_millis(30));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            thread::sleep(remaining.min(Duration::from_millis(30)));
+        }
     }
     Err(format!(
         "http server did not respond within {timeout:?}: {last_error}"
@@ -220,6 +435,99 @@ fn assert_http_status(response: &str, status: &str) {
         response.starts_with(status),
         "expected {status}, got response:\n{response}"
     );
+}
+
+#[test]
+fn bounded_http_reader_enforces_deadline_and_frame_contract() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind partial-response fixture");
+    let address = listener
+        .local_addr()
+        .expect("partial-response fixture address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept partial-response fixture");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nx")
+            .expect("write partial response fixture");
+        thread::sleep(Duration::from_millis(400));
+    });
+
+    let mut stream = connect_with_read_timeout(
+        &address.to_string(),
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+    );
+    let started = Instant::now();
+    let error = read_http_stream_bytes_until(
+        &mut stream,
+        started + Duration::from_millis(150),
+        Duration::from_millis(50),
+    )
+    .expect_err("partial HTTP response must not pass as complete");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "bounded reader exceeded its hard cleanup envelope"
+    );
+
+    drop(stream);
+    server.join().expect("join partial-response fixture");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind late-response fixture");
+    let address = listener
+        .local_addr()
+        .expect("late-response fixture address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept late-response fixture");
+        thread::sleep(Duration::from_millis(150));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx")
+            .expect("write late response fixture");
+    });
+    let mut stream = connect_with_read_timeout(
+        &address.to_string(),
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+    );
+    let started = Instant::now();
+    let error = read_http_stream_bytes_until(
+        &mut stream,
+        started + Duration::from_millis(100),
+        Duration::from_millis(50),
+    )
+    .expect_err("response completed after the deadline must fail");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "late response escaped the absolute reader deadline"
+    );
+    drop(stream);
+    server.join().expect("join late-response fixture");
+
+    assert!(http_response_frame_complete(42, Some(42)).expect("exact frame length"));
+    assert!(!http_response_frame_complete(41, Some(42)).expect("partial frame length"));
+    assert_eq!(
+        http_response_frame_complete(43, Some(42))
+            .expect_err("trailing bytes must fail")
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    for malformed in [
+        b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999999999999999999999\r\n\r\n"
+            .as_slice(),
+    ] {
+        let header_offset = malformed
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .expect("malformed fixture header delimiter");
+        assert_eq!(
+            http_response_expected_total(malformed, header_offset)
+                .expect_err("malformed Content-Length must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
 }
 
 fn http_response_or_stop(
@@ -563,10 +871,7 @@ fn main(): null! {
     fragmented
         .write_all(b"\nfrag")
         .expect("write fragmented delimiter and body");
-    fragmented
-        .shutdown(Shutdown::Write)
-        .expect("half-close fragmented request");
-    let fragmented_response = read_http_stream(fragmented);
+    let fragmented_response = read_http_stream(fragmented, Duration::from_secs(2));
     assert_http_status(&fragmented_response, "HTTP/1.1 200 OK");
     assert!(
         fragmented_response.ends_with("\r\n\r\nfrag"),
@@ -736,7 +1041,7 @@ fn main(): null! {
     assert_http_status(&ready, "HTTP/1.1 200 OK");
 
     let idle = connect_with_read_timeout(&address, Duration::from_secs(2), Duration::from_secs(2));
-    let idle_response = read_http_stream(idle);
+    let idle_response = read_http_stream(idle, Duration::from_secs(2));
     assert_http_status(&idle_response, "HTTP/1.1 408 Request Timeout");
 
     let mut drip =
@@ -749,7 +1054,7 @@ fn main(): null! {
             thread::sleep(Duration::from_millis(80));
         }
     }
-    let drip_response = read_http_stream(drip);
+    let drip_response = read_http_stream(drip, Duration::from_secs(2));
     assert_http_status(&drip_response, "HTTP/1.1 408 Request Timeout");
 
     let mut partial_body =
@@ -757,7 +1062,7 @@ fn main(): null! {
     partial_body
         .write_all(b"POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\na")
         .expect("write partial body");
-    let body_response = read_http_stream(partial_body);
+    let body_response = read_http_stream(partial_body, Duration::from_secs(2));
     assert_http_status(&body_response, "HTTP/1.1 408 Request Timeout");
 
     let slow = http_response_or_stop(
@@ -829,8 +1134,7 @@ fn main(): null! {
     rejected
         .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .expect("write rejected probe");
-    let _ = rejected.shutdown(Shutdown::Write);
-    let rejected_response = read_http_stream(rejected);
+    let rejected_response = read_http_stream(rejected, Duration::from_secs(2));
     assert_http_status(&rejected_response, "HTTP/1.1 503 Service Unavailable");
 
     drop(active);
