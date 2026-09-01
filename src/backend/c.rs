@@ -7093,6 +7093,8 @@ fn emit_mysql_types(out: &mut String, program: &IrProgram) {
         "#if defined(MARIADB_BASE_VERSION)\n",
         "# if !defined(MARIADB_PACKAGE_VERSION_ID)\n",
         "#  error \"std.mysql requires a MariaDB Connector/C package version macro\"\n",
+        "# elif !defined(MARIADB_VERSION_ID)\n",
+        "#  error \"std.mysql requires a MariaDB client compatibility version macro\"\n",
         "# elif MARIADB_PACKAGE_VERSION_ID < 30100 || MARIADB_PACKAGE_VERSION_ID >= 40000\n",
         "#  error \"std.mysql requires MariaDB Connector/C 3.1.x through 3.x\"\n",
         "# endif\n",
@@ -7244,9 +7246,7 @@ struct KuMysqlResult {
 #define KU_MYSQL_LIBRARY_FAILED (-1)
 #define KU_MYSQL_LIBRARY_ABI_MISMATCH (-2)
 
-/* mysql_get_client_info() is documented by both supported vendors as a
-   client-library version string. Parse only its bounded leading major; this
-   cross-checks the numeric API without scanning an untrusted, unbounded tail. */
+/* Parse only a bounded leading major from a vendor version string. */
 static bool ku_mysql_client_info_major(
     const char* info, unsigned long* output) {
   if (!info || !output) return false;
@@ -7267,8 +7267,29 @@ static bool ku_mysql_client_info_major(
 }
 
 static bool ku_mysql_client_abi_compatible(void) {
-  /* These two calls are the only client-library operations permitted before
-     the ABI gate. They require neither MYSQL storage nor library init. */
+  /* The caller has successfully completed mysql_library_init(). */
+  /* MariaDB server-bundled Connector/C builds have changed whether the legacy
+     mysql_get_client_* APIs report the server package or Connector/C package
+     version. The generic MariaDB API accepts a NULL connection handle for
+     MARIADB_CLIENT_VERSION[_ID], so use only that API for this family and
+     compare it with the matching header compatibility version. Connector/C
+     package support remains a separate compile-time gate above. */
+#if KU_MYSQL_HEADER_FAMILY_MARIADB
+  size_t runtime_version = 0;
+  const char* runtime_info = NULL;
+  unsigned long info_major = 0;
+  if (mariadb_get_infov(
+          NULL, MARIADB_CLIENT_VERSION_ID, &runtime_version) != 0
+      || mariadb_get_infov(
+          NULL, MARIADB_CLIENT_VERSION, &runtime_info) != 0
+      || runtime_version > (size_t)ULONG_MAX
+      || !ku_mysql_client_info_major(runtime_info, &info_major)) return false;
+  unsigned long runtime_major =
+      (unsigned long)runtime_version / 10000UL;
+  return runtime_major == info_major
+      && runtime_major == (unsigned long)(MARIADB_VERSION_ID / 10000UL);
+#else
+  /* Oracle MySQL documents these as the runtime client-library version. */
   unsigned long runtime_version = mysql_get_client_version();
   const char* runtime_info = mysql_get_client_info();
   unsigned long info_major = 0;
@@ -7276,11 +7297,6 @@ static bool ku_mysql_client_abi_compatible(void) {
   unsigned long runtime_major = runtime_version / 10000UL;
   if (runtime_major != info_major
       || runtime_major != (unsigned long)KU_MYSQL_HEADER_ABI_MAJOR) return false;
-#if KU_MYSQL_HEADER_FAMILY_MARIADB
-  /* Ku accepts Connector/C 3.x only. Its client-version major is therefore
-     disjoint from every supported Oracle MySQL client major (5 or newer). */
-  return runtime_major == 3UL;
-#else
   return runtime_major >= 5UL;
 #endif
 }
@@ -7298,10 +7314,11 @@ static BOOL CALLBACK ku_mysql_library_initialize_once(
   (void)once;
   (void)parameter;
   (void)context;
-  if (!ku_mysql_client_abi_compatible()) {
-    ku_mysql_library_status = KU_MYSQL_LIBRARY_ABI_MISMATCH;
-  } else if (mysql_library_init(0, NULL, NULL) != 0) {
+  if (mysql_library_init(0, NULL, NULL) != 0) {
     ku_mysql_library_status = KU_MYSQL_LIBRARY_FAILED;
+  } else if (!ku_mysql_client_abi_compatible()) {
+    mysql_library_end();
+    ku_mysql_library_status = KU_MYSQL_LIBRARY_ABI_MISMATCH;
   } else if (atexit(ku_mysql_library_shutdown) != 0) {
     mysql_library_end();
     ku_mysql_library_status = KU_MYSQL_LIBRARY_FAILED;
@@ -7320,10 +7337,11 @@ static bool ku_mysql_library_ready(void) {
 #else
 static pthread_once_t ku_mysql_library_once = PTHREAD_ONCE_INIT;
 static void ku_mysql_library_initialize_once(void) {
-  if (!ku_mysql_client_abi_compatible()) {
-    ku_mysql_library_status = KU_MYSQL_LIBRARY_ABI_MISMATCH;
-  } else if (mysql_library_init(0, NULL, NULL) != 0) {
+  if (mysql_library_init(0, NULL, NULL) != 0) {
     ku_mysql_library_status = KU_MYSQL_LIBRARY_FAILED;
+  } else if (!ku_mysql_client_abi_compatible()) {
+    mysql_library_end();
+    ku_mysql_library_status = KU_MYSQL_LIBRARY_ABI_MISMATCH;
   } else if (atexit(ku_mysql_library_shutdown) != 0) {
     mysql_library_end();
     ku_mysql_library_status = KU_MYSQL_LIBRARY_FAILED;

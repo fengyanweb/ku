@@ -104,6 +104,9 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
         "pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC)",
         "pthread_cond_timedwait_relative_np(",
         "SleepConditionVariableCS(",
+        "mariadb_get_infov(",
+        "MARIADB_CLIENT_VERSION_ID",
+        "MARIADB_CLIENT_VERSION",
         "mysql_get_client_version()",
         "mysql_get_client_info()",
         "KU_MYSQL_LIBRARY_ABI_MISMATCH",
@@ -163,8 +166,17 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
         .find("mysql_library_init(0, NULL, NULL)")
         .expect("MySQL library init call");
     assert!(
-        abi_gate < library_init,
-        "MySQL ABI gate must run before client-library initialization"
+        library_init < abi_gate,
+        "MySQL client library must initialize before any ABI probe"
+    );
+    assert_eq!(
+        generated
+            .matches(
+                "} else if (!ku_mysql_client_abi_compatible()) {\n    mysql_library_end();\n    ku_mysql_library_status = KU_MYSQL_LIBRARY_ABI_MISMATCH;",
+            )
+            .count(),
+        2,
+        "both Windows and POSIX ABI mismatches must tear down the initialized library"
     );
 }
 
@@ -352,7 +364,92 @@ fn native_mysql_library_init_failure_is_a_structured_sync_error() {
 }
 
 #[test]
-fn native_mysql_runtime_header_mismatches_fail_before_library_or_connection_use() {
+fn native_mysql_vendor_compatibility_gates_accept_matching_headers_and_runtimes() {
+    let generated_directory = TempDir::new("mysql-mariadb-abi-match");
+    let generated = emit_c(generated_directory.path(), fixture());
+    fs::write(
+        generated_directory.path().join("mysql.h"),
+        fake_mysql_header(),
+    )
+    .expect("write fake mysql.h");
+
+    for (
+        name,
+        definitions,
+        expected_mariadb_version_calls,
+        expected_mariadb_info_calls,
+        expected_mysql_version_calls,
+        expected_mysql_info_calls,
+    ) in [
+        (
+            "mariadb-10-package-3",
+            "#define KU_FAKE_MARIADB_HEADER_VERSION 101106\n#define KU_FAKE_MARIADB_RUNTIME_VERSION 101106L\n#define KU_FAKE_MARIADB_RUNTIME_INFO \"10.11.6\"",
+            1,
+            1,
+            0,
+            0,
+        ),
+        (
+            "mariadb-11-package-3",
+            "#define KU_FAKE_MARIADB_HEADER_VERSION 110602\n#define KU_FAKE_MARIADB_RUNTIME_VERSION 110602L\n#define KU_FAKE_MARIADB_RUNTIME_INFO \"11.6.2\"",
+            1,
+            1,
+            0,
+            0,
+        ),
+        (
+            "oracle-8",
+            "#define KU_FAKE_ORACLE_HEADER 1\n#define KU_FAKE_ORACLE_HEADER_VERSION 80029\n#define KU_FAKE_MYSQL_RUNTIME_VERSION 80029L\n#define KU_FAKE_MYSQL_RUNTIME_INFO \"8.0.29\"",
+            0,
+            0,
+            1,
+            1,
+        ),
+    ] {
+        let harness = generated_directory
+            .path()
+            .join(format!("mysql_abi_{name}_harness.c"));
+        fs::write(
+            &harness,
+            format!(
+                "#define KU_MYSQL_FAKE_CLIENT 1\n{definitions}\n#define KU_FAKE_EXPECT_MARIADB_VERSION_CALLS {expected_mariadb_version_calls}L\n#define KU_FAKE_EXPECT_MARIADB_INFO_CALLS {expected_mariadb_info_calls}L\n#define KU_FAKE_EXPECT_MYSQL_VERSION_CALLS {expected_mysql_version_calls}L\n#define KU_FAKE_EXPECT_MYSQL_INFO_CALLS {expected_mysql_info_calls}L\n#define main ku_fixture_main\n{generated}\n#undef main\n{}\n{}",
+                fake_mysql_source(),
+                fake_mysql_abi_match_harness()
+            ),
+        )
+        .expect("write fake MySQL compatibility-match harness");
+        let Some(executable) = compile_harness(
+            generated_directory.path(),
+            &harness,
+            &format!("mysql-abi-{name}"),
+        ) else {
+            eprintln!("skip: no C compiler available for MySQL compatibility-match test");
+            return;
+        };
+        let mut command = Command::new(&executable);
+        command.current_dir(generated_directory.path());
+        let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS)
+            .unwrap_or_else(|error| panic!("MySQL compatibility-match test was not bounded: {error}"));
+        assert!(
+            output.status.success(),
+            "MySQL {name} compatibility-match test failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            "mysql-abi-match-ok"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "unexpected MySQL compatibility-match diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn native_mysql_runtime_header_mismatches_fail_before_thread_or_connection_use() {
     let generated_directory = TempDir::new("mysql-abi-mismatch");
     let generated = emit_c(generated_directory.path(), fixture());
     fs::write(
@@ -361,10 +458,70 @@ fn native_mysql_runtime_header_mismatches_fail_before_library_or_connection_use(
     )
     .expect("write fake mysql.h");
 
-    for (name, runtime_version, runtime_info) in [
-        ("family", 80029_u64, "8.0.29"),
-        ("major", 40405_u64, "4.4.5"),
-        ("numeric-info", 30405_u64, "4.4.5"),
+    for (
+        name,
+        definitions,
+        expected_mariadb_version_calls,
+        expected_mariadb_info_calls,
+        expected_mysql_version_calls,
+        expected_mysql_info_calls,
+    ) in [
+        (
+            "mariadb-header-major",
+            "#define KU_FAKE_MARIADB_HEADER_VERSION 101106\n#define KU_FAKE_MARIADB_RUNTIME_VERSION 110602L\n#define KU_FAKE_MARIADB_RUNTIME_INFO \"11.6.2\"",
+            1,
+            1,
+            0,
+            0,
+        ),
+        (
+            "mariadb-numeric-info",
+            "#define KU_FAKE_MARIADB_RUNTIME_VERSION 101106L\n#define KU_FAKE_MARIADB_RUNTIME_INFO \"11.1.6\"",
+            1,
+            1,
+            0,
+            0,
+        ),
+        (
+            "mariadb-version-api-error",
+            "#define KU_FAKE_MARIADB_FAIL_VERSION 1",
+            1,
+            0,
+            0,
+            0,
+        ),
+        (
+            "mariadb-info-api-error",
+            "#define KU_FAKE_MARIADB_FAIL_INFO 1",
+            1,
+            1,
+            0,
+            0,
+        ),
+        (
+            "oracle-header-major",
+            "#define KU_FAKE_ORACLE_HEADER 1\n#define KU_FAKE_ORACLE_HEADER_VERSION 80029\n#define KU_FAKE_MYSQL_RUNTIME_VERSION 90000L\n#define KU_FAKE_MYSQL_RUNTIME_INFO \"9.0.0\"",
+            0,
+            0,
+            1,
+            1,
+        ),
+        (
+            "oracle-numeric-info",
+            "#define KU_FAKE_ORACLE_HEADER 1\n#define KU_FAKE_ORACLE_HEADER_VERSION 80029\n#define KU_FAKE_MYSQL_RUNTIME_VERSION 80029L\n#define KU_FAKE_MYSQL_RUNTIME_INFO \"9.0.0\"",
+            0,
+            0,
+            1,
+            1,
+        ),
+        (
+            "oracle-malformed-info",
+            "#define KU_FAKE_ORACLE_HEADER 1\n#define KU_FAKE_ORACLE_HEADER_VERSION 80029\n#define KU_FAKE_MYSQL_RUNTIME_VERSION 80029L\n#define KU_FAKE_MYSQL_RUNTIME_INFO \"8\"",
+            0,
+            0,
+            1,
+            1,
+        ),
     ] {
         let harness = generated_directory
             .path()
@@ -372,7 +529,7 @@ fn native_mysql_runtime_header_mismatches_fail_before_library_or_connection_use(
         fs::write(
             &harness,
             format!(
-                "#define KU_MYSQL_FAKE_CLIENT 1\n#define KU_FAKE_MYSQL_RUNTIME_VERSION {runtime_version}L\n#define KU_FAKE_MYSQL_RUNTIME_INFO \"{runtime_info}\"\n#define main ku_fixture_main\n{generated}\n#undef main\n{}\n{}",
+                "#define KU_MYSQL_FAKE_CLIENT 1\n{definitions}\n#define KU_FAKE_EXPECT_MARIADB_VERSION_CALLS {expected_mariadb_version_calls}L\n#define KU_FAKE_EXPECT_MARIADB_INFO_CALLS {expected_mariadb_info_calls}L\n#define KU_FAKE_EXPECT_MYSQL_VERSION_CALLS {expected_mysql_version_calls}L\n#define KU_FAKE_EXPECT_MYSQL_INFO_CALLS {expected_mysql_info_calls}L\n#define main ku_fixture_main\n{generated}\n#undef main\n{}\n{}",
                 fake_mysql_source(),
                 fake_mysql_abi_mismatch_harness()
             ),
@@ -759,8 +916,11 @@ int main(void) {
       || !outcome_code(null_opened.error, "invalid_config")) return 1;
   ku_error_drop(&null_opened.error);
   if (fake_atomic_load(&ku_fake_real_connect_calls) != 0
+      || fake_atomic_load(&ku_fake_mariadb_version_calls) != 0
+      || fake_atomic_load(&ku_fake_mariadb_info_calls) != 0
       || fake_atomic_load(&ku_fake_client_version_calls) != 0
       || fake_atomic_load(&ku_fake_client_info_calls) != 0
+      || fake_atomic_load(&ku_fake_probe_before_library_init_calls) != 0
       || fake_atomic_load(&ku_fake_library_init_calls) != 0
       || fake_atomic_load(&ku_fake_library_end_calls) != 0
       || fake_atomic_load(&ku_fake_thread_init_calls) != 0
@@ -1195,9 +1355,62 @@ int main(void) {
   if (fake_atomic_load(&ku_fake_fail_library_init) != 0
       || fake_atomic_load(&ku_fake_library_init_calls) != 1
       || fake_atomic_load(&ku_fake_library_end_calls) != 0
+      || fake_atomic_load(&ku_fake_mariadb_version_calls) != 0
+      || fake_atomic_load(&ku_fake_mariadb_info_calls) != 0
+      || fake_atomic_load(&ku_fake_client_version_calls) != 0
+      || fake_atomic_load(&ku_fake_client_info_calls) != 0
+      || fake_atomic_load(&ku_fake_probe_before_library_init_calls) != 0
       || fake_atomic_load(&ku_fake_connections_live) != 0
       || fake_atomic_load(&ku_fake_thread_active) != 0) return 12;
   puts("mysql-library-error-ok");
+  return 0;
+}
+"#
+}
+
+fn fake_mysql_abi_match_harness() -> &'static str {
+    r#"
+static KuString abi_match_text(const char* value) {
+  return ku_string_static((const uint8_t*)value, strlen(value));
+}
+static void abi_match_config_str(
+    KuObject* config, const char* key, const char* value) {
+  ku_object_set(config, abi_match_text(key), ku_v_str(abi_match_text(value)));
+}
+int main(void) {
+  KuObject* config = ku_object_new(8);
+  if (!config) return 10;
+  abi_match_config_str(config, "host", "127.0.0.1");
+  abi_match_config_str(config, "user", "tester");
+  abi_match_config_str(config, "password", "secret");
+  abi_match_config_str(config, "database", "fixture");
+
+  KuResult_mysql_client opened = ku_mysql_client_new(config);
+  ku_object_drop(config);
+  if (!opened.ok || !opened.value) return 11;
+  ku_mysql_client_close(opened.value);
+  ku_mysql_thread_shutdown();
+
+  if (ku_mysql_library_status != KU_MYSQL_LIBRARY_READY
+      || fake_atomic_load(&ku_fake_library_init_calls) != 1
+      || fake_atomic_load(&ku_fake_library_end_calls) != 0
+      || fake_atomic_load(&ku_fake_mariadb_version_calls)
+          != KU_FAKE_EXPECT_MARIADB_VERSION_CALLS
+      || fake_atomic_load(&ku_fake_mariadb_info_calls)
+          != KU_FAKE_EXPECT_MARIADB_INFO_CALLS
+      || fake_atomic_load(&ku_fake_client_version_calls)
+          != KU_FAKE_EXPECT_MYSQL_VERSION_CALLS
+      || fake_atomic_load(&ku_fake_client_info_calls)
+          != KU_FAKE_EXPECT_MYSQL_INFO_CALLS
+      || fake_atomic_load(&ku_fake_probe_before_library_init_calls) != 0
+      || fake_atomic_load(&ku_fake_thread_init_calls) != 1
+      || fake_atomic_load(&ku_fake_thread_end_calls) != 1
+      || fake_atomic_load(&ku_fake_thread_active) != 0
+      || fake_atomic_load(&ku_fake_mysql_init_calls) != 1
+      || fake_atomic_load(&ku_fake_real_connect_calls) != 1
+      || fake_atomic_load(&ku_fake_connections_live) != 0
+      || fake_atomic_load(&ku_fake_statements_live) != 0) return 12;
+  puts("mysql-abi-match-ok");
   return 0;
 }
 "#
@@ -1236,10 +1449,17 @@ int main(void) {
   ku_error_drop(&second.error);
 
   if (ku_mysql_library_status != KU_MYSQL_LIBRARY_ABI_MISMATCH
-      || fake_atomic_load(&ku_fake_client_version_calls) != 1
-      || fake_atomic_load(&ku_fake_client_info_calls) != 1
-      || fake_atomic_load(&ku_fake_library_init_calls) != 0
-      || fake_atomic_load(&ku_fake_library_end_calls) != 0
+      || fake_atomic_load(&ku_fake_mariadb_version_calls)
+          != KU_FAKE_EXPECT_MARIADB_VERSION_CALLS
+      || fake_atomic_load(&ku_fake_mariadb_info_calls)
+          != KU_FAKE_EXPECT_MARIADB_INFO_CALLS
+      || fake_atomic_load(&ku_fake_client_version_calls)
+          != KU_FAKE_EXPECT_MYSQL_VERSION_CALLS
+      || fake_atomic_load(&ku_fake_client_info_calls)
+          != KU_FAKE_EXPECT_MYSQL_INFO_CALLS
+      || fake_atomic_load(&ku_fake_probe_before_library_init_calls) != 0
+      || fake_atomic_load(&ku_fake_library_init_calls) != 1
+      || fake_atomic_load(&ku_fake_library_end_calls) != 1
       || fake_atomic_load(&ku_fake_thread_init_calls) != 0
       || fake_atomic_load(&ku_fake_mysql_init_calls) != 0
       || fake_atomic_load(&ku_fake_real_connect_calls) != 0
@@ -1684,11 +1904,21 @@ fn fake_mysql_header() -> &'static str {
 #define KU_FAKE_MYSQL_H
 #include <stddef.h>
 #include <stdbool.h>
+#if !defined(KU_FAKE_ORACLE_HEADER)
 #define MARIADB_BASE_VERSION "mariadb-10.11"
-#define MARIADB_VERSION_ID 101106
-#define MYSQL_VERSION_ID 101106
+#ifndef KU_FAKE_MARIADB_HEADER_VERSION
+#define KU_FAKE_MARIADB_HEADER_VERSION 101106
+#endif
+#define MARIADB_VERSION_ID KU_FAKE_MARIADB_HEADER_VERSION
+#define MYSQL_VERSION_ID KU_FAKE_MARIADB_HEADER_VERSION
 #define MARIADB_PACKAGE_VERSION "3.4.5"
 #define MARIADB_PACKAGE_VERSION_ID 30405
+#else
+#ifndef KU_FAKE_ORACLE_HEADER_VERSION
+#define KU_FAKE_ORACLE_HEADER_VERSION 80029
+#endif
+#define MYSQL_VERSION_ID KU_FAKE_ORACLE_HEADER_VERSION
+#endif
 #define CR_MIN_ERROR 2000
 #define CR_MAX_ERROR 2999
 #define CER_MIN_ERROR 5000
@@ -1720,6 +1950,12 @@ typedef struct st_mysql_field {
   enum enum_field_types type;
   unsigned int charsetnr;
 } MYSQL_FIELD;
+#if !defined(KU_FAKE_ORACLE_HEADER)
+enum mariadb_value {
+  MARIADB_CLIENT_VERSION,
+  MARIADB_CLIENT_VERSION_ID
+};
+#endif
 enum mysql_option {
   MYSQL_OPT_CONNECT_TIMEOUT, MYSQL_OPT_READ_TIMEOUT, MYSQL_OPT_WRITE_TIMEOUT,
   MYSQL_OPT_LOCAL_INFILE, MYSQL_OPT_RECONNECT, MYSQL_SET_CHARSET_NAME
@@ -1728,6 +1964,9 @@ enum mysql_option {
 #define MYSQL_DATA_TRUNCATED 101
 const char* mysql_get_client_info(void);
 unsigned long mysql_get_client_version(void);
+#if !defined(KU_FAKE_ORACLE_HEADER)
+my_bool mariadb_get_infov(MYSQL*, enum mariadb_value, void*, ...);
+#endif
 int mysql_library_init(int, char**, char**);
 void mysql_library_end(void);
 MYSQL* mysql_init(MYSQL*);
@@ -1812,10 +2051,33 @@ struct st_mysql_res { MYSQL_FIELD fields[3]; };
 #ifndef KU_FAKE_MYSQL_RUNTIME_INFO
 #define KU_FAKE_MYSQL_RUNTIME_INFO "3.4.5"
 #endif
+#ifndef KU_FAKE_MARIADB_HEADER_VERSION
+#define KU_FAKE_MARIADB_HEADER_VERSION 101106
+#endif
+#ifndef KU_FAKE_MARIADB_RUNTIME_VERSION
+#define KU_FAKE_MARIADB_RUNTIME_VERSION KU_FAKE_MARIADB_HEADER_VERSION
+#endif
+#ifndef KU_FAKE_MARIADB_RUNTIME_INFO
+#define KU_FAKE_MARIADB_RUNTIME_INFO "10.11.6"
+#endif
+#ifndef KU_FAKE_MARIADB_FAIL_VERSION
+#define KU_FAKE_MARIADB_FAIL_VERSION 0
+#endif
+#ifndef KU_FAKE_MARIADB_FAIL_INFO
+#define KU_FAKE_MARIADB_FAIL_INFO 0
+#endif
 static KuFakeAtomicLong ku_fake_client_info_calls = 0;
 static KuFakeAtomicLong ku_fake_client_version_calls = 0;
 static KuFakeAtomicLong ku_fake_client_version = KU_FAKE_MYSQL_RUNTIME_VERSION;
 static const char* ku_fake_client_info = KU_FAKE_MYSQL_RUNTIME_INFO;
+static KuFakeAtomicLong ku_fake_mariadb_version_calls = 0;
+static KuFakeAtomicLong ku_fake_mariadb_info_calls = 0;
+static KuFakeAtomicLong ku_fake_mariadb_version = KU_FAKE_MARIADB_RUNTIME_VERSION;
+static const char* ku_fake_mariadb_info = KU_FAKE_MARIADB_RUNTIME_INFO;
+static KuFakeAtomicLong ku_fake_fail_mariadb_version = KU_FAKE_MARIADB_FAIL_VERSION;
+static KuFakeAtomicLong ku_fake_fail_mariadb_info = KU_FAKE_MARIADB_FAIL_INFO;
+static KuFakeAtomicLong ku_fake_probe_before_library_init_calls = 0;
+static KuFakeAtomicLong ku_fake_library_ready_for_probe = 0;
 static KuFakeAtomicLong ku_fake_block_execute = 0;
 static KuFakeAtomicLong ku_fake_execute_entered = 0;
 static KuFakeAtomicLong ku_fake_release_execute = 0;
@@ -1842,18 +2104,59 @@ static KuFakeAtomicLong ku_fake_reset_connection_calls = 0;
 
 const char* mysql_get_client_info(void) {
   fake_atomic_add(&ku_fake_client_info_calls, 1);
+  if (fake_atomic_load(&ku_fake_library_ready_for_probe) != 1
+      || fake_atomic_load(&ku_fake_library_init_calls) != 1
+      || fake_atomic_load(&ku_fake_library_end_calls) != 0) {
+    fake_atomic_add(&ku_fake_probe_before_library_init_calls, 1);
+    return NULL;
+  }
   return ku_fake_client_info;
 }
 unsigned long mysql_get_client_version(void) {
   fake_atomic_add(&ku_fake_client_version_calls, 1);
+  if (fake_atomic_load(&ku_fake_library_ready_for_probe) != 1
+      || fake_atomic_load(&ku_fake_library_init_calls) != 1
+      || fake_atomic_load(&ku_fake_library_end_calls) != 0) {
+    fake_atomic_add(&ku_fake_probe_before_library_init_calls, 1);
+    return 0;
+  }
   return (unsigned long)fake_atomic_load(&ku_fake_client_version);
 }
+#if !defined(KU_FAKE_ORACLE_HEADER)
+my_bool mariadb_get_infov(
+    MYSQL* mysql, enum mariadb_value value, void* output, ...) {
+  (void)mysql;
+  if (!output) return 1;
+  if (fake_atomic_load(&ku_fake_library_ready_for_probe) != 1
+      || fake_atomic_load(&ku_fake_library_init_calls) != 1
+      || fake_atomic_load(&ku_fake_library_end_calls) != 0) {
+    fake_atomic_add(&ku_fake_probe_before_library_init_calls, 1);
+    return 1;
+  }
+  if (value == MARIADB_CLIENT_VERSION_ID) {
+    fake_atomic_add(&ku_fake_mariadb_version_calls, 1);
+    if (fake_atomic_exchange(&ku_fake_fail_mariadb_version, 0)) return 1;
+    *(size_t*)output = (size_t)fake_atomic_load(&ku_fake_mariadb_version);
+    return 0;
+  }
+  if (value == MARIADB_CLIENT_VERSION) {
+    fake_atomic_add(&ku_fake_mariadb_info_calls, 1);
+    if (fake_atomic_exchange(&ku_fake_fail_mariadb_info, 0)) return 1;
+    *(const char**)output = ku_fake_mariadb_info;
+    return 0;
+  }
+  return 1;
+}
+#endif
 int mysql_library_init(int argc, char** argv, char** groups) {
   (void)argc; (void)argv; (void)groups;
   fake_atomic_add(&ku_fake_library_init_calls, 1);
-  return (int)fake_atomic_exchange(&ku_fake_fail_library_init, 0);
+  int failed = (int)fake_atomic_exchange(&ku_fake_fail_library_init, 0);
+  if (!failed) fake_atomic_store(&ku_fake_library_ready_for_probe, 1);
+  return failed;
 }
 void mysql_library_end(void) {
+  fake_atomic_store(&ku_fake_library_ready_for_probe, 0);
   fake_atomic_add(&ku_fake_library_end_calls, 1);
 }
 
