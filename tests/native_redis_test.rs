@@ -633,7 +633,17 @@ fn main(): null! {{
         .split_once("static KuResult_null ku_redis_simple_expected(")
         .expect("Redis simple reply wrapper")
         .0;
-    assert!(auth.contains("if (read_rc != 0) return"));
+    let read_error = auth
+        .find("if (read_rc != 0)")
+        .expect("Redis read failure branch");
+    let auth_wipe = auth
+        .find("if (redact_server_error)")
+        .expect("Redis AUTH reply wipe");
+    let result_return = auth
+        .rfind("return result")
+        .expect("Redis simple reply unified return");
+    assert!(read_error < auth_wipe && auth_wipe < result_return);
+    assert!(!auth[read_error..auth_wipe].contains("return"));
     assert!(auth.contains("line[0] == '-'"));
     assert!(auth.contains("redact_server_error ? ku_redis_auth_failed_err()"));
     let handoff = generated

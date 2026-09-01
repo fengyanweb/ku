@@ -420,6 +420,7 @@ pub fn generate_c_source_with_options(
     // bodies can already refer to the earlier clone/drop prototypes.
     emit_array_helper_bodies(&mut out, program)?;
     emit_bytes_runtime(&mut out, program);
+    emit_windows_socket_runtime(&mut out, program);
     emit_net_runtime(&mut out, program);
     emit_string_chars_helper(&mut out, program)?;
     emit_kuvalue_array_wrappers(&mut out, program)?;
@@ -7823,10 +7824,15 @@ static bool ku_mysql_result_append(
   return true;
 }
 
-static void ku_mysql_secure_free(char* value, size_t len) {
+static void ku_mysql_secure_wipe(char* value, size_t len) {
   if (!value) return;
   volatile unsigned char* bytes = (volatile unsigned char*)value;
   while (len) bytes[--len] = 0;
+}
+
+static void ku_mysql_secure_free(char* value, size_t len) {
+  if (!value) return;
+  ku_mysql_secure_wipe(value, len);
   ku_mysql_free(value);
 }
 
@@ -7883,6 +7889,10 @@ static void ku_mysql_client_destroy(KuMysqlClient* client) {
     ku_mysql_close_connections(client);
     if (has_connection) ku_mysql_thread_leave();
   }
+  /* A POSIX synchronization destructor is fail-stop. Scrub the still-owned
+     password before it can terminate the process, but keep the allocation live
+     until the embedded mutex/condition have been destroyed. */
+  ku_mysql_secure_wipe(client->password, client->password_len);
   if (client->sync_ready) ku_mysql_sync_destroy(client);
   ku_mysql_client_free_fields(client);
   ku_mysql_free(client);
@@ -9256,6 +9266,66 @@ fn program_uses_net(program: &IrProgram) -> bool {
     program_uses_native_named(program, "__ku_net_client")
 }
 
+/// Emit one process-level Winsock owner for the native transports that Ku owns
+/// directly. Net and Redis share the same successful WSAStartup reference; it is
+/// released once at normal process exit, never when an individual client closes.
+fn emit_windows_socket_runtime(out: &mut String, program: &IrProgram) {
+    if !program_uses_net(program) && !program_uses_redis(program) {
+        return;
+    }
+    out.push_str(
+        r#"
+#define KU_NATIVE_RUNTIME_WINSOCK 1
+#if defined(_WIN32)
+enum {
+  KU_WINSOCK_RUNTIME_UNINITIALIZED = 0,
+  KU_WINSOCK_RUNTIME_READY = 1,
+  KU_WINSOCK_RUNTIME_FAILED = 2
+};
+static INIT_ONCE ku_winsock_runtime_once = INIT_ONCE_STATIC_INIT;
+static int ku_winsock_runtime_status = KU_WINSOCK_RUNTIME_UNINITIALIZED;
+static void ku_winsock_runtime_shutdown(void) {
+  if (ku_winsock_runtime_status != KU_WINSOCK_RUNTIME_READY) return;
+  ku_winsock_runtime_status = KU_WINSOCK_RUNTIME_FAILED;
+  (void)WSACleanup();
+}
+static BOOL CALLBACK ku_winsock_runtime_initialize_once(
+    PINIT_ONCE once, PVOID parameter, PVOID* context) {
+  (void)once;
+  (void)parameter;
+  (void)context;
+  WSADATA data;
+  if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+    ku_winsock_runtime_status = KU_WINSOCK_RUNTIME_FAILED;
+    return TRUE;
+  }
+  if (LOBYTE(data.wVersion) != 2 || HIBYTE(data.wVersion) != 2) {
+    (void)WSACleanup();
+    ku_winsock_runtime_status = KU_WINSOCK_RUNTIME_FAILED;
+    return TRUE;
+  }
+  if (atexit(ku_winsock_runtime_shutdown) != 0) {
+    (void)WSACleanup();
+    ku_winsock_runtime_status = KU_WINSOCK_RUNTIME_FAILED;
+    return TRUE;
+  }
+  ku_winsock_runtime_status = KU_WINSOCK_RUNTIME_READY;
+  return TRUE;
+}
+static int ku_winsock_runtime_startup(void) {
+  if (!InitOnceExecuteOnce(
+          &ku_winsock_runtime_once, ku_winsock_runtime_initialize_once,
+          NULL, NULL)) return -1;
+  return ku_winsock_runtime_status == KU_WINSOCK_RUNTIME_READY ? 0 : -1;
+}
+#else
+static int ku_winsock_runtime_startup(void) { return 0; }
+#endif
+
+"#,
+    );
+}
+
 fn program_uses_bytes(program: &IrProgram) -> bool {
     program_uses_net(program) || program_uses_native_named(program, "__ku_bytes")
 }
@@ -9661,19 +9731,9 @@ static int ku_net_socket_recv(KuNetSocket socket_value, uint8_t* data, size_t le
 #endif
 }
 
-#if defined(_WIN32)
-static INIT_ONCE ku_net_wsa_once = INIT_ONCE_STATIC_INIT;
-static BOOL CALLBACK ku_net_wsa_init(PINIT_ONCE once, PVOID parameter, PVOID* context) {
-  (void)once; (void)parameter; (void)context;
-  WSADATA data;
-  return WSAStartup(MAKEWORD(2, 2), &data) == 0;
-}
 static int ku_net_socket_startup(void) {
-  return InitOnceExecuteOnce(&ku_net_wsa_once, ku_net_wsa_init, NULL, NULL) ? 0 : -1;
+  return ku_winsock_runtime_startup();
 }
-#else
-static int ku_net_socket_startup(void) { return 0; }
-#endif
 
 static int ku_net_gate_init(KuNetGate* gate) {
 #if defined(_WIN32)
@@ -10591,6 +10651,14 @@ static void ku_redis_poison(KuRedis* r) {
   }
 }
 
+static void ku_redis_secure_wipe_bytes(void* pointer, size_t len) {
+  volatile uint8_t* bytes = (volatile uint8_t*)pointer;
+  while (bytes && len) {
+    *bytes++ = 0;
+    len--;
+  }
+}
+
 static int ku_redis_is_open(const KuRedis* r) {
   return r && r->sock != KU_REDIS_INVALID_SOCKET;
 }
@@ -10972,24 +11040,18 @@ static KuError ku_redis_lock_error(int rc) {
 static void ku_redis_connection_destroy(KuRedis* connection) {
   if (!connection) return;
   ku_redis_poison(connection);
+  ku_redis_secure_wipe_bytes(
+      connection->read_buffer, sizeof(connection->read_buffer));
   ku_redis_gate_destroy(&connection->command_gate);
   free(connection);
 }
 
 #if defined(_WIN32)
-static INIT_ONCE ku_redis_wsa_once = INIT_ONCE_STATIC_INIT;
-static BOOL CALLBACK ku_redis_wsa_init(PINIT_ONCE once, PVOID parameter, PVOID* context) {
-  (void)once;
-  (void)parameter;
-  (void)context;
-  WSADATA data;
-  return WSAStartup(MAKEWORD(2, 2), &data) == 0;
-}
 static int ku_redis_ensure_wsa(void) {
-  return InitOnceExecuteOnce(&ku_redis_wsa_once, ku_redis_wsa_init, 0, 0) ? 0 : -1;
+  return ku_winsock_runtime_startup();
 }
 #else
-static int ku_redis_ensure_wsa(void) { return 0; }
+static int ku_redis_ensure_wsa(void) { return ku_winsock_runtime_startup(); }
 #endif
 
 static int ku_redis_send_all(KuRedis* r, const char* data, size_t len) {
@@ -11348,18 +11410,31 @@ static KuResult_null ku_redis_simple_expected_locked(KuRedis* r, int argc, const
   char line[KU_REDIS_MAX_LINE_BYTES + 1];
   size_t len = 0;
   int read_rc = ku_redis_read_line(r, line, sizeof(line), &len);
-  if (read_rc != 0) return (KuResult_null){ false, 0, ku_redis_read_error(read_rc) };
-  if (len == 0) {
+  KuResult_null result;
+  if (read_rc != 0) {
+    result = (KuResult_null){ false, 0, ku_redis_read_error(read_rc) };
+  } else if (len == 0) {
     ku_redis_poison(r);
-    return (KuResult_null){ false, 0, ku_redis_err("empty RESP reply") };
+    result = (KuResult_null){ false, 0, ku_redis_err("empty RESP reply") };
+  } else if (line[0] == '+' && len == expected_len + 1
+      && memcmp(line + 1, expected, expected_len) == 0) {
+    result = (KuResult_null){ true, 0, (KuError){0} };
+  } else if (line[0] == '-') {
+    result = (KuResult_null){ false, 0,
+      redact_server_error ? ku_redis_auth_failed_err()
+                          : ku_redis_err_n(line + 1, len - 1) };
+  } else {
+    ku_redis_poison(r);
+    result = (KuResult_null){ false, 0,
+      ku_redis_err("unexpected RESP simple string reply") };
   }
-  if (line[0] == '+' && len == expected_len + 1 && memcmp(line + 1, expected, expected_len) == 0)
-    return (KuResult_null){ true, 0, (KuError){0} };
-  if (line[0] == '-') return (KuResult_null){ false, 0,
-    redact_server_error ? ku_redis_auth_failed_err()
-                        : ku_redis_err_n(line + 1, len - 1) };
-  ku_redis_poison(r);
-  return (KuResult_null){ false, 0, ku_redis_err("unexpected RESP simple string reply") };
+  if (redact_server_error) {
+    ku_redis_secure_wipe_bytes(line, sizeof(line));
+    ku_redis_secure_wipe_bytes(r->read_buffer, sizeof(r->read_buffer));
+    r->read_position = 0;
+    r->read_length = 0;
+  }
+  return result;
 }
 
 static KuResult_null ku_redis_simple_expected(KuRedis* r, int argc, const KuString* args, const char* expected, size_t expected_len, unsigned long long deadline) {
@@ -11662,20 +11737,19 @@ static KuRedisOpenResult ku_redis_open_authenticated(
 
 static void ku_redis_secure_wipe(KuString* value) {
   if (!value || value->storage != KU_STRING_OWNED || !value->ptr) return;
-  volatile uint8_t* bytes = (volatile uint8_t*)value->ptr;
   size_t count = value->capacity >= value->len ? value->capacity : value->len;
-  while (count != 0) bytes[--count] = 0;
+  ku_redis_secure_wipe_bytes(value->ptr, count);
 }
 
 static void ku_redis_client_free_unpublished(KuRedisClient* client, int sync_ready) {
   if (!client) return;
+  ku_redis_secure_wipe(&client->username);
+  ku_redis_secure_wipe(&client->password);
   for (uint32_t index = 0; index < client->idle_count; index++)
     ku_redis_connection_destroy(client->idle[index]);
   if (sync_ready) ku_redis_pool_sync_destroy(&client->sync);
   free(client->idle);
   ku_string_drop(&client->host);
-  ku_redis_secure_wipe(&client->username);
-  ku_redis_secure_wipe(&client->password);
   ku_string_drop(&client->username);
   ku_string_drop(&client->password);
   free(client);
@@ -13127,7 +13201,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "  KuPgConnectAttempt initial_attempt = ku_pg_connect_until(p->conninfo, initial_deadline);\n",
             "  PGconn* initial = initial_attempt.conn;\n",
             "  if (!initial) {\n",
-            "    ku_pg_sync_destroy(&p->lock, &p->cv); free(p->conns); free(p->in_use); ku_pg_wipe_secret(p->conninfo, p->conninfo_len); free(p->conninfo); free(p);\n",
+            "    ku_pg_wipe_secret(p->conninfo, p->conninfo_len); ku_pg_sync_destroy(&p->lock, &p->cv); free(p->conns); free(p->in_use); free(p->conninfo); free(p);\n",
             "    KuError initial_error = initial_attempt.outcome == KU_PG_CONNECT_OUT_OF_MEMORY ? ku_pg_out_of_memory_error() : (initial_attempt.outcome == KU_PG_CONNECT_TIMED_OUT ? ku_pg_static_error(\"connect_timeout\", sizeof(\"connect_timeout\") - 1, \"PostgreSQL client connection timed out\", sizeof(\"PostgreSQL client connection timed out\") - 1) : ku_pg_connect_failure_error());\n",
             "    return (KuResult_pg_client){ false, 0, initial_error };\n",
             "  }\n",
@@ -13265,7 +13339,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "static void ku_pg_client_dispose(KuPgClient* p) {\n",
             "  if (!p) return;\n",
             "  for (size_t i = 0; i < p->size; i++) if (p->conns[i]) PQfinish(p->conns[i]);\n",
-            "  ku_pg_sync_destroy(&p->lock, &p->cv); free(p->conns); free(p->in_use); ku_pg_wipe_secret(p->conninfo, p->conninfo_len); free(p->conninfo); free(p);\n",
+            "  ku_pg_wipe_secret(p->conninfo, p->conninfo_len); ku_pg_sync_destroy(&p->lock, &p->cv); free(p->conns); free(p->in_use); free(p->conninfo); free(p);\n",
             "}\n",
             "static void ku_pg_client_close_owned(KuPgClient* p) {\n",
             "  if (!p) return;\n",
