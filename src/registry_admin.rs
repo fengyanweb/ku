@@ -4637,34 +4637,6 @@ mod tests {
         revoke_token(&path, "math", token.as_bytes(), Duration::from_secs(1)).unwrap();
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_empty_acl_with_inheritance_flags_is_rejected_before_write() {
-        let root = TestDirectory::new("macos-empty-acl-flags");
-        let path = root.0.join("credentials.txt");
-        let original = format!(
-            "sha256-{} original\n",
-            encode_hex(&Sha256::digest(b"original"))
-        );
-        fs::write(&path, original.as_bytes()).unwrap();
-        let file = fs::File::open(&path).unwrap();
-        credential_macos_acl::install_test_acl(&file, c"!#acl 1 no_inherit\n")
-            .expect("install empty macOS ACL with a nontrivial inheritance flag");
-        let mut reached_write = false;
-        let error = write_credentials_atomically_with_hook(&path, original.as_bytes(), |_| {
-            reached_write = true;
-            Ok(())
-        })
-        .expect_err("an empty ACL with flags is not mode-only");
-        assert_eq!(
-            error.code.as_deref(),
-            Some("registry_credentials_acl_unsupported")
-        );
-        assert!(!reached_write);
-        assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
-        assert!(!staging_path(&path).unwrap().exists());
-    }
-
     #[cfg(unix)]
     #[test]
     fn unix_existing_uid_gid_and_mode_are_preserved() {

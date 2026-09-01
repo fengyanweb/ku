@@ -357,6 +357,8 @@ fn read_http_stream_bytes_until(
 ) -> std::io::Result<Vec<u8>> {
     let mut response = Vec::new();
     let mut buffer = [0u8; 1024];
+    let mut header_parsed = false;
+    let mut expected_total = None;
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -366,10 +368,18 @@ fn read_http_stream_bytes_until(
                     "HTTP test response exceeded its absolute deadline",
                 )
             })?;
-        stream.set_read_timeout(Some(remaining.min(Duration::from_millis(200))))?;
+        let socket_timeout = remaining.min(Duration::from_millis(200));
+        if socket_timeout < Duration::from_millis(1) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP test response exceeded its absolute deadline",
+            ));
+        }
+        stream.set_read_timeout(Some(socket_timeout))?;
         match stream.read(&mut buffer) {
             Ok(0) => return Ok(response),
             Ok(read) => {
+                let previous_len = response.len();
                 if response.len().saturating_add(read) > MAX_HTTP_TEST_RESPONSE_BYTES {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -377,6 +387,20 @@ fn read_http_stream_bytes_until(
                     ));
                 }
                 response.extend_from_slice(&buffer[..read]);
+                if !header_parsed {
+                    let search_start = previous_len.saturating_sub(3);
+                    if let Some(relative) = response[search_start..]
+                        .windows(4)
+                        .position(|part| part == b"\r\n\r\n")
+                    {
+                        let header_offset = search_start + relative;
+                        expected_total = http_response_expected_total(&response, header_offset)?;
+                        header_parsed = true;
+                    }
+                }
+                if expected_total.is_some_and(|total| response.len() >= total) {
+                    return Ok(response);
+                }
             }
             Err(error)
                 if matches!(
@@ -390,6 +414,77 @@ fn read_http_stream_bytes_until(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn http_response_expected_total(
+    response: &[u8],
+    header_offset: usize,
+) -> std::io::Result<Option<usize>> {
+    let header_end = header_offset.checked_add(4).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP test response header length overflowed",
+        )
+    })?;
+    let header = std::str::from_utf8(&response[..header_offset]).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP test response header is not UTF-8",
+        )
+    })?;
+    let mut lines = header.split("\r\n");
+    let status = lines.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP test response has no status line",
+        )
+    })?;
+    let status_code = status
+        .split_ascii_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP test response has an invalid status line",
+            )
+        })?;
+    if matches!(status_code, 204 | 304) {
+        return Ok(Some(header_end));
+    }
+    let mut content_length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP test response has an invalid header field",
+            ));
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP test response has duplicate Content-Length",
+                ));
+            }
+            content_length = Some(value.trim().parse::<usize>().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP test response has an invalid Content-Length",
+                )
+            })?);
+        }
+    }
+    content_length
+        .map(|length| {
+            header_end.checked_add(length).map(Some).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP test response body length overflowed",
+                )
+            })
+        })
+        .unwrap_or(Ok(None))
 }
 
 fn read_http_stream(mut stream: TcpStream, timeout: Duration) -> String {
@@ -414,7 +509,7 @@ fn http_response_bytes(address: &str, request: &[u8], timeout: Duration) -> Stri
         match TcpStream::connect(address) {
             Ok(mut stream) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
+                if remaining < Duration::from_millis(1) {
                     break;
                 }
                 stream

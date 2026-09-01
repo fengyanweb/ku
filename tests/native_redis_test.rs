@@ -386,7 +386,7 @@ fn http_get_with_timeout(
                 ),
             ));
         };
-        if remaining.is_zero() {
+        if remaining < Duration::from_millis(1) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("HTTP connect to {address} timed out"),
@@ -407,6 +407,12 @@ fn http_get_with_timeout(
             "HTTP request timed out before write",
         )
     })?;
+    if remaining < Duration::from_millis(1) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "HTTP request timed out before write",
+        ));
+    }
     stream.set_write_timeout(Some(remaining))?;
     write!(
         stream,
@@ -416,14 +422,24 @@ fn http_get_with_timeout(
 
     let mut response = Vec::new();
     let mut buffer = [0_u8; 1024];
+    let mut header_parsed = false;
+    let mut expected_total = None;
     loop {
         let remaining = timeout
             .checked_sub(started.elapsed())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HTTP response timed out"))?;
-        stream.set_read_timeout(Some(remaining.min(Duration::from_millis(500))))?;
+        let socket_timeout = remaining.min(Duration::from_millis(500));
+        if socket_timeout < Duration::from_millis(1) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP response timed out",
+            ));
+        }
+        stream.set_read_timeout(Some(socket_timeout))?;
         match stream.read(&mut buffer) {
             Ok(0) => return Ok(response),
             Ok(read) => {
+                let previous_len = response.len();
                 if response.len().saturating_add(read) > RESPONSE_LIMIT {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -431,6 +447,21 @@ fn http_get_with_timeout(
                     ));
                 }
                 response.extend_from_slice(&buffer[..read]);
+                if !header_parsed {
+                    let search_start = previous_len.saturating_sub(3);
+                    if let Some(relative) = response[search_start..]
+                        .windows(4)
+                        .position(|part| part == b"\r\n\r\n")
+                    {
+                        let header_offset = search_start + relative;
+                        expected_total =
+                            http_test_response_expected_total(&response, header_offset)?;
+                        header_parsed = true;
+                    }
+                }
+                if expected_total.is_some_and(|total| response.len() >= total) {
+                    return Ok(response);
+                }
             }
             Err(error)
                 if matches!(
@@ -440,6 +471,54 @@ fn http_get_with_timeout(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn http_test_response_expected_total(
+    response: &[u8],
+    header_offset: usize,
+) -> io::Result<Option<usize>> {
+    let header_end = header_offset
+        .checked_add(4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "HTTP header overflowed"))?;
+    let header = std::str::from_utf8(&response[..header_offset])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP response header"))?;
+    let mut lines = header.split("\r\n");
+    let status_code = lines
+        .next()
+        .and_then(|line| line.split_ascii_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP status line"))?;
+    if matches!(status_code, 204 | 304) {
+        return Ok(Some(header_end));
+    }
+    let mut content_length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HTTP response field",
+            ));
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate HTTP Content-Length",
+                ));
+            }
+            content_length = Some(value.trim().parse::<usize>().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP Content-Length")
+            })?);
+        }
+    }
+    content_length
+        .map(|length| {
+            header_end
+                .checked_add(length)
+                .map(Some)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "HTTP body overflowed"))
+        })
+        .unwrap_or(Ok(None))
 }
 
 #[test]
