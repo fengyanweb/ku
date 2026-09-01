@@ -449,6 +449,9 @@ fn main(): null! {
         "static int ku_pg_validate_query_params",
         "static int ku_pg_prepare_query_params",
         "static KuResult_pg_result ku_pg_query_params_validated_impl",
+        "static KuResult_pg_result ku_pg_query_params_all_validated_impl",
+        "static int ku_pg_validate_sql_input",
+        "static int ku_pg_sql_has_explicit_session_control",
         "parameter_too_large",
         "PostgreSQL query parameters exceed 64 MiB total UTF-8 bytes",
         "PostgreSQL query parameter is not valid UTF-8",
@@ -503,7 +506,7 @@ fn main(): null! {
         "p->closing = 1",
         "p->active == 0 && p->waiters == 0",
         "static void ku_pg_client_dispose",
-        "int broken = 0; KuResult_pg_result r = ku_pg_query_params_validated_impl(c, sql, params, param_bytes, deadline, &broken)",
+        "int broken = 0; KuResult_pg_result r = ku_pg_query_params_all_validated_impl(c, sql, params, param_bytes, deadline, &broken)",
         "ku_pg_client_release(p, slot, broken || PQstatus(c) != KU_PG_CONNECTION_OK, deadline)",
     ] {
         assert!(c.contains(expected), "generated PG runtime missed: {expected}");
@@ -554,6 +557,12 @@ fn main(): null! {
         .expect("client parameter wrapper end")
         .0;
     let client_closed = client_params.find("if (!p)").expect("closed client guard");
+    let client_sql_validation = client_params
+        .find("ku_pg_validate_sql_input")
+        .expect("client SQL validation");
+    let client_sql_policy = client_params
+        .find("ku_pg_sql_has_explicit_session_control")
+        .expect("client SQL policy");
     let client_validation = client_params
         .find("ku_pg_validate_query_params")
         .expect("client validation");
@@ -561,8 +570,11 @@ fn main(): null! {
         .find("ku_pg_client_acquire")
         .expect("client acquire");
     assert!(
-        client_closed < client_validation && client_validation < client_acquire,
-        "client must preserve closed-handle precedence and reject invalid parameters before borrowing a connection"
+        client_closed < client_sql_validation
+            && client_sql_validation < client_sql_policy
+            && client_sql_policy < client_validation
+            && client_validation < client_acquire,
+        "client must validate bounded SQL before policy scanning, then reject invalid parameters before borrowing a connection"
     );
     assert!(
         !c.contains("PQexec(c, \"ROLLBACK\")"),
@@ -692,7 +704,6 @@ static int ku_test_pg_os_poll(struct pollfd* item, nfds_t count, int timeout_ms)
 #endif
 "#;
     let mut harness = generated
-        .replacen("#pragma comment(lib, \"libpq.lib\")\n", "", 1)
         .replacen(
             "typedef struct pg_conn PGconn;",
             &format!("{pg_poll_hook}\ntypedef struct pg_conn PGconn;"),
@@ -873,13 +884,11 @@ fn main(): null! {
     .expect("write PG parameter budget fixture");
 
     let generated = native_emit_c(&dir, "main.ku");
-    let mut harness = generated
-        .replacen("#pragma comment(lib, \"libpq.lib\")\n", "", 1)
-        .replacen(
-            "int main(void) {",
-            "static int ku_generated_main(void) {",
-            1,
-        );
+    let mut harness = generated.replacen(
+        "int main(void) {",
+        "static int ku_generated_main(void) {",
+        1,
+    );
     harness.push_str(
         r#"
 struct pg_conn { int unused; };
@@ -1018,14 +1027,20 @@ int main(void) {
 }
 
 #[test]
-fn native_pg_client_c_compiles_when_toolchain_and_libpq_are_available() {
+fn native_pg_client_c_links_and_starts_when_toolchain_and_libpq_are_available() {
     let dir = unique_temp_dir("pg-client-host-compile");
     fs::write(
         dir.join("main.ku"),
         r#"import pg from "std.pg"
 fn main(): null! {
-    client = pg.client({ conninfo: "host=127.0.0.1 port=1", max_connections: 1 })?
-    client.close()
+    try {
+        client = pg.client({ conninfo: "ku_ci_invalid_conninfo_keyword=1", max_connections: 1 })?
+        client.close()
+        println("unexpected connection")
+    } catch(err) {
+        println(err.domain)
+        println(err.code)
+    }
     return ok(null)
 }
 "#,
@@ -1043,11 +1058,19 @@ fn main(): null! {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    if !output.status.success()
+    let configured_libpq = env::var_os("KU_PG_LIB").is_some();
+    let required_libpq = env::var("KU_PG_LINK_REQUIRED").is_ok_and(|value| value == "1");
+    if required_libpq {
+        assert!(
+            configured_libpq,
+            "KU_PG_LINK_REQUIRED=1 requires an exact KU_PG_LIB directory"
+        );
+    }
+    let strict_libpq = configured_libpq || required_libpq;
+    if !strict_libpq
+        && !output.status.success()
         && (combined.contains("C compiler not found")
-            || combined.contains("cannot open file 'libpq.lib'")
-            || combined.contains("cannot find -lpq")
-            || combined.contains("library not found for -lpq"))
+            || combined.contains("requires an exact shared/import libpq library"))
     {
         eprintln!("skip: host C compiler or libpq development library unavailable: {combined}");
         fs::remove_dir_all(&dir).ok();
@@ -1056,6 +1079,121 @@ fn main(): null! {
     assert!(
         output.status.success(),
         "native PostgreSQL client C failed to compile/link:\n{combined}"
+    );
+
+    let executable = dir.join(exe_name("pg-client"));
+    let mut run = Command::new(&executable);
+    run.current_dir(&dir);
+    let started = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("linked PG client could not start safely: {error}"));
+    let stdout = String::from_utf8_lossy(&started.stdout).replace('\r', "");
+    let stderr = String::from_utf8_lossy(&started.stderr);
+    assert_eq!(stdout, "pg\nconnect_error\n");
+    assert!(
+        stderr.is_empty(),
+        "linked PG client wrote unexpected stderr: {stderr}"
+    );
+    assert!(
+        started.status.success(),
+        "linked PG client failed to start or close its libpq error path: {:?}",
+        started.status.code()
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_mysql_client_c_links_and_starts_when_toolchain_and_library_are_available() {
+    let dir = unique_temp_dir("mysql-client-host-compile");
+    fs::write(
+        dir.join("main.ku"),
+        r#"import mysql from "std.mysql"
+fn main(): null! {
+    try {
+        client = mysql.client({
+            host: "127.0.0.1",
+            port: 1,
+            user: "ku_runtime_probe",
+            password: "not-a-secret",
+            database: "ku_runtime_probe",
+            max_connections: 1,
+            max_waiters: 0,
+            connect_timeout_ms: 100,
+            acquire_timeout_ms: 100,
+            query_timeout_ms: 100
+        })?
+        client.close()
+        println("unexpected connection")
+    } catch(err) {
+        println(err.domain)
+        println(err.code)
+    }
+    return ok(null)
+}
+"#,
+    )
+    .expect("write MySQL client host compile fixture");
+
+    let mut command = Command::new(ku_binary());
+    command.current_dir(&dir).args([
+        "build",
+        "--native",
+        "main.ku",
+        "-o",
+        &exe_name("mysql-client"),
+    ]);
+    let output = run_bounded(&mut command, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("MySQL client native build was not bounded: {error}"));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let configured_library = env::var_os("KU_MYSQL_LIB").is_some();
+    let required_library = env::var("KU_MYSQL_LINK_REQUIRED").is_ok_and(|value| value == "1");
+    if required_library {
+        assert!(
+            configured_library,
+            "KU_MYSQL_LINK_REQUIRED=1 requires exact KU_MYSQL_LIB and KU_MYSQL_INCLUDE directories"
+        );
+        assert!(
+            env::var_os("KU_MYSQL_INCLUDE").is_some(),
+            "KU_MYSQL_LINK_REQUIRED=1 requires KU_MYSQL_INCLUDE"
+        );
+    }
+    let strict_library = configured_library || required_library;
+    if !strict_library
+        && !output.status.success()
+        && (combined.contains("C compiler not found")
+            || combined.contains("requires an exact shared/import client library"))
+    {
+        eprintln!("skip: host C compiler or MySQL development library unavailable: {combined}");
+        fs::remove_dir_all(&dir).ok();
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "native MySQL client C failed to compile/link:\n{combined}"
+    );
+
+    let executable = dir.join(exe_name("mysql-client"));
+    let mut run = Command::new(&executable);
+    run.current_dir(&dir);
+    let started = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("linked MySQL client could not start safely: {error}"));
+    let stdout = String::from_utf8_lossy(&started.stdout).replace('\r', "");
+    let stderr = String::from_utf8_lossy(&started.stderr);
+    assert!(
+        stdout == "mysql\nconnect_error\n" || stdout == "mysql\nconnect_timeout\n",
+        "linked MySQL client returned an unexpected bounded connection outcome: {stdout:?}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "linked MySQL client wrote unexpected stderr: {stderr}"
+    );
+    assert!(
+        started.status.success(),
+        "linked MySQL client failed to load and start its client library path: {:?}",
+        started.status.code()
     );
     fs::remove_dir_all(&dir).ok();
 }

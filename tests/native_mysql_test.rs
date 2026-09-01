@@ -104,6 +104,10 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
         "pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC)",
         "pthread_cond_timedwait_relative_np(",
         "SleepConditionVariableCS(",
+        "mysql_get_client_version()",
+        "mysql_get_client_info()",
+        "KU_MYSQL_LIBRARY_ABI_MISMATCH",
+        "client_abi_mismatch",
     ] {
         assert!(
             generated.contains(required),
@@ -145,6 +149,23 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
     );
     assert!(acquire.contains("ku_mysql_release_backoff_timer_locked(client, owns_backoff_timer)"));
     assert!(acquire.contains("bool acquire_limited_connect = deadline <= connect_budget_deadline;"));
+
+    let initialize = generated
+        .split_once("static void ku_mysql_library_initialize_once(void) {")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| suffix.split_once("static bool ku_mysql_library_ready(void)"))
+        .map(|(body, _)| body)
+        .expect("generated POSIX MySQL library initialization");
+    let abi_gate = initialize
+        .find("ku_mysql_client_abi_compatible()")
+        .expect("MySQL ABI gate runs during one-time initialization");
+    let library_init = initialize
+        .find("mysql_library_init(0, NULL, NULL)")
+        .expect("MySQL library init call");
+    assert!(
+        abi_gate < library_init,
+        "MySQL ABI gate must run before client-library initialization"
+    );
 }
 
 #[test]
@@ -331,6 +352,63 @@ fn native_mysql_library_init_failure_is_a_structured_sync_error() {
 }
 
 #[test]
+fn native_mysql_runtime_header_mismatches_fail_before_library_or_connection_use() {
+    let generated_directory = TempDir::new("mysql-abi-mismatch");
+    let generated = emit_c(generated_directory.path(), fixture());
+    fs::write(
+        generated_directory.path().join("mysql.h"),
+        fake_mysql_header(),
+    )
+    .expect("write fake mysql.h");
+
+    for (name, runtime_version, runtime_info) in [
+        ("family", 80029_u64, "8.0.29"),
+        ("major", 40405_u64, "4.4.5"),
+        ("numeric-info", 30405_u64, "4.4.5"),
+    ] {
+        let harness = generated_directory
+            .path()
+            .join(format!("mysql_abi_{name}_harness.c"));
+        fs::write(
+            &harness,
+            format!(
+                "#define KU_MYSQL_FAKE_CLIENT 1\n#define KU_FAKE_MYSQL_RUNTIME_VERSION {runtime_version}L\n#define KU_FAKE_MYSQL_RUNTIME_INFO \"{runtime_info}\"\n#define main ku_fixture_main\n{generated}\n#undef main\n{}\n{}",
+                fake_mysql_source(),
+                fake_mysql_abi_mismatch_harness()
+            ),
+        )
+        .expect("write fake MySQL ABI-mismatch harness");
+        let Some(executable) = compile_harness(
+            generated_directory.path(),
+            &harness,
+            &format!("mysql-abi-{name}"),
+        ) else {
+            eprintln!("skip: no C compiler available for MySQL ABI-mismatch test");
+            return;
+        };
+        let mut command = Command::new(&executable);
+        command.current_dir(generated_directory.path());
+        let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS)
+            .unwrap_or_else(|error| panic!("MySQL ABI-mismatch test was not bounded: {error}"));
+        assert!(
+            output.status.success(),
+            "MySQL {name} ABI-mismatch test failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim_end(),
+            "mysql-abi-mismatch-ok"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "unexpected MySQL ABI-mismatch diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn native_mysql_cleanup_failures_discard_connection_slots() {
     let directory = TempDir::new("mysql-cleanup-failures");
     let generated = emit_c(directory.path(), fixture());
@@ -373,7 +451,25 @@ fn native_mysql_cleanup_failures_discard_connection_slots() {
 #[test]
 fn native_mysql_execution_outcomes_are_not_reported_as_retryable() {
     let directory = TempDir::new("mysql-outcomes");
-    let generated = emit_c(directory.path(), fixture());
+    let generated = emit_c(directory.path(), fixture())
+        .replacen(
+            "static void ku_mysql_result_free(KuMysqlResult* result) {\n  if (!result) return;",
+            "static size_t ku_test_mysql_result_free_calls = 0;\nstatic void ku_mysql_result_free(KuMysqlResult* result) {\n  if (!result) return;\n  ku_test_mysql_result_free_calls++;",
+            1,
+        )
+        .replacen(
+            "static unsigned long long __ku_handler_now_ms(void) {",
+            "static int ku_test_mysql_clock_enabled = 0;\nstatic unsigned long long ku_test_mysql_clock_ms = 0;\nstatic unsigned long long ku_test_mysql_clock_calls = 0;\nstatic unsigned long long ku_test_mysql_clock_expire_after = 0;\nstatic unsigned long long __ku_handler_now_ms(void) { if (ku_test_mysql_clock_enabled) { ku_test_mysql_clock_calls++; return ku_test_mysql_clock_calls >= ku_test_mysql_clock_expire_after ? ku_test_mysql_clock_ms + 2 : ku_test_mysql_clock_ms; }",
+            1,
+        );
+    assert!(
+        generated.contains("ku_test_mysql_result_free_calls++"),
+        "MySQL outcome harness failed to instrument result destruction"
+    );
+    assert!(
+        generated.contains("ku_test_mysql_clock_expire_after"),
+        "MySQL outcome harness failed to instrument the monotonic clock"
+    );
     fs::write(directory.path().join("mysql.h"), fake_mysql_header()).expect("write fake mysql.h");
     let harness = directory.path().join("mysql_outcomes_harness.c");
     fs::write(
@@ -611,7 +707,73 @@ static bool outcome_pool_has_connection(KuMysqlClient* client, bool expected) {
   ku_mysql_unlock(client);
   return matches;
 }
+static bool outcome_input_rejected_before_database(
+    KuMysqlClient* client, KuString sql, KuArray_str params,
+    const char* expected_code) {
+  long execute_calls = fake_atomic_load(&ku_fake_execute_calls);
+  long statement_init_calls = fake_atomic_load(&ku_fake_stmt_init_calls);
+  long statement_prepare_calls = fake_atomic_load(&ku_fake_stmt_prepare_calls);
+  long reset_calls = fake_atomic_load(&ku_fake_reset_connection_calls);
+  long opened = fake_atomic_load(&ku_fake_connections_opened);
+  long live = fake_atomic_load(&ku_fake_connections_live);
+  long statements = fake_atomic_load(&ku_fake_statements_live);
+  size_t result_frees = ku_test_mysql_result_free_calls;
+  KuResult_int rejected = ku_mysql_client_execute(client, sql, params);
+  bool expected_error = !rejected.ok
+      && outcome_code(rejected.error, expected_code);
+  if (!rejected.ok) ku_error_drop(&rejected.error);
+  return expected_error
+      && fake_atomic_load(&ku_fake_execute_calls) == execute_calls
+      && fake_atomic_load(&ku_fake_stmt_init_calls) == statement_init_calls
+      && fake_atomic_load(&ku_fake_stmt_prepare_calls) == statement_prepare_calls
+      && fake_atomic_load(&ku_fake_reset_connection_calls) == reset_calls
+      && fake_atomic_load(&ku_fake_connections_opened) == opened
+      && fake_atomic_load(&ku_fake_connections_live) == live
+      && fake_atomic_load(&ku_fake_statements_live) == statements
+      && ku_test_mysql_result_free_calls == result_frees
+      && outcome_pool_has_connection(client, true);
+}
+static bool outcome_rejected_before_database(
+    KuMysqlClient* client, const char* sql) {
+  return outcome_input_rejected_before_database(
+      client, outcome_text(sql), (KuArray_str){0},
+      "session_state_unsupported");
+}
+static void outcome_test_clock_start(unsigned long long expire_after) {
+  ku_test_mysql_clock_ms = 1000;
+  ku_test_mysql_clock_calls = 0;
+  ku_test_mysql_clock_expire_after = expire_after;
+  ku_test_mysql_clock_enabled = 1;
+}
+static void outcome_test_clock_stop(void) {
+  ku_test_mysql_clock_enabled = 0;
+  ku_test_mysql_clock_calls = 0;
+  ku_test_mysql_clock_expire_after = 0;
+}
 int main(void) {
+  KuObject* null_config = outcome_config();
+  ku_object_set(null_config, outcome_text("port"), ku_v_null());
+  KuResult_mysql_client null_opened = ku_mysql_client_new(null_config);
+  ku_object_drop(null_config);
+  if (null_opened.ok || null_opened.value
+      || !outcome_code(null_opened.error, "invalid_config")) return 1;
+  ku_error_drop(&null_opened.error);
+  if (fake_atomic_load(&ku_fake_real_connect_calls) != 0
+      || fake_atomic_load(&ku_fake_client_version_calls) != 0
+      || fake_atomic_load(&ku_fake_client_info_calls) != 0
+      || fake_atomic_load(&ku_fake_library_init_calls) != 0
+      || fake_atomic_load(&ku_fake_library_end_calls) != 0
+      || fake_atomic_load(&ku_fake_thread_init_calls) != 0
+      || fake_atomic_load(&ku_fake_thread_end_calls) != 0
+      || fake_atomic_load(&ku_fake_mysql_init_calls) != 0
+      || fake_atomic_load(&ku_fake_stmt_init_calls) != 0
+      || fake_atomic_load(&ku_fake_stmt_prepare_calls) != 0
+      || fake_atomic_load(&ku_fake_execute_calls) != 0
+      || fake_atomic_load(&ku_fake_connections_opened) != 0
+      || fake_atomic_load(&ku_fake_connections_live) != 0
+      || fake_atomic_load(&ku_fake_statements_live) != 0
+      || fake_atomic_load(&ku_fake_thread_active) != 0) return 2;
+
   KuObject* config = outcome_config();
   KuResult_mysql_client opened = ku_mysql_client_new(config);
   ku_object_drop(config);
@@ -680,11 +842,128 @@ int main(void) {
       || fake_atomic_load(&ku_fake_statements_live) != 0
       || !outcome_pool_has_connection(client, true)) return 22;
 
+  if (!outcome_rejected_before_database(client, "BEGIN")) return 23;
+  if (!outcome_rejected_before_database(
+          client, " /* ordinary comment */ SeT autocommit = 0")) return 24;
+  if (!outcome_rejected_before_database(
+          client, "/*!40101 SET autocommit = 0 */ UPDATE fixture")) return 25;
+  if (!outcome_rejected_before_database(
+          client, "/*M!100100 SET autocommit = 0 */ UPDATE fixture")) return 26;
+  if (!outcome_rejected_before_database(
+          client,
+          "/* outer /* fake nested */ SET GLOBAL max_connections=1 # */")) return 27;
+  if (!outcome_rejected_before_database(
+          client, "CREATE OR REPLACE TEMPORARY TABLE transient_table(id INT)")) return 28;
+  if (!outcome_rejected_before_database(
+          client, "FLUSH TABLES WITH READ LOCK")) return 29;
+  if (!outcome_rejected_before_database(client, "HANDLER records OPEN")) return 30;
+  if (!outcome_rejected_before_database(client, "/* unterminated")) return 31;
+
+  KuString oversized_sql = {
+    (uint8_t*)"x", (size_t)KU_MYSQL_MAX_SQL_BYTES + 1, 0, KU_STRING_STATIC
+  };
+  if (!outcome_input_rejected_before_database(
+          client, oversized_sql, no_params, "query_too_large")) return 32;
+  uint8_t nul_sql_bytes[] = { 'S', 'E', 'L', 'E', 'C', 'T', ' ', 0, 0xff };
+  KuString nul_sql = {
+    nul_sql_bytes, sizeof(nul_sql_bytes), 0, KU_STRING_STATIC
+  };
+  if (!outcome_input_rejected_before_database(
+          client, nul_sql, no_params, "query_error")) return 33;
+  uint8_t invalid_sql_bytes[] = { 0xc3, 0x28 };
+  KuString invalid_sql = {
+    invalid_sql_bytes, sizeof(invalid_sql_bytes), 0, KU_STRING_STATIC
+  };
+  if (!outcome_input_rejected_before_database(
+          client, invalid_sql, no_params, "invalid_utf8")) return 34;
+
+  size_t long_length = 128 * 1024;
+  uint8_t* long_bytes = (uint8_t*)malloc(long_length);
+  if (!long_bytes) return 35;
+  memset(long_bytes, ' ', long_length);
+  KuString long_sql = {
+    long_bytes, long_length, 0, KU_STRING_STATIC
+  };
+  client->query_timeout_ms = 1;
+  outcome_test_clock_start(75);
+  bool long_sql_timed_out = outcome_input_rejected_before_database(
+      client, long_sql, no_params, "query_timeout");
+  outcome_test_clock_stop();
+  free(long_bytes);
+  if (!long_sql_timed_out) return 36;
+
+  long_bytes = (uint8_t*)malloc(long_length);
+  if (!long_bytes) return 37;
+  memset(long_bytes, 'p', long_length);
+  KuString long_param = {
+    long_bytes, long_length, 0, KU_STRING_STATIC
+  };
+  KuArray_str long_params = ku_array_make_str(1, &long_param);
+  if (!long_params.data) { free(long_bytes); return 38; }
+  outcome_test_clock_start(20);
+  bool long_param_timed_out = outcome_input_rejected_before_database(
+      client, outcome_text("SELECT ?"), long_params, "query_timeout");
+  outcome_test_clock_stop();
+  ku_array_drop_str(&long_params);
+  free(long_bytes);
+  if (!long_param_timed_out) return 39;
+  client->query_timeout_ms = 1000;
+
+  size_t result_frees = ku_test_mysql_result_free_calls;
+  long opened_before_pollution = fake_atomic_load(&ku_fake_connections_opened);
+  KuResult_mysql_result polluted = ku_mysql_client_query(
+      client, outcome_text("POST_STATE_QUERY"), no_params);
+  if (polluted.ok || polluted.value
+      || !outcome_code(polluted.error, "session_state_unsupported")) return 40;
+  ku_error_drop(&polluted.error);
+  if (fake_atomic_load(&ku_fake_execute_calls) != 7
+      || fake_atomic_load(&ku_fake_reset_connection_calls) != 2
+      || fake_atomic_load(&ku_fake_connections_opened) != opened_before_pollution
+      || fake_atomic_load(&ku_fake_connections_live) != 0
+      || fake_atomic_load(&ku_fake_statements_live) != 0
+      || ku_test_mysql_result_free_calls != result_frees + 1
+      || !outcome_pool_has_connection(client, false)) return 41;
+
+  KuResult_int session_recovered = ku_mysql_client_execute(
+      client, outcome_text("UPDATE recovered"), no_params);
+  if (!session_recovered.ok) return 42;
+  if (fake_atomic_load(&ku_fake_execute_calls) != 8
+      || fake_atomic_load(&ku_fake_reset_connection_calls) != 3
+      || fake_atomic_load(&ku_fake_connections_opened) != opened_before_pollution + 1
+      || fake_atomic_load(&ku_fake_connections_live) != 1
+      || fake_atomic_load(&ku_fake_statements_live) != 0
+      || !outcome_pool_has_connection(client, true)) return 43;
+
+  size_t result_frees_before_execute_pollution = ku_test_mysql_result_free_calls;
+  long opened_before_execute_pollution = fake_atomic_load(&ku_fake_connections_opened);
+  KuResult_int polluted_execute = ku_mysql_client_execute(
+      client, outcome_text("POST_STATE_EXECUTE"), no_params);
+  if (polluted_execute.ok || polluted_execute.value != 0
+      || !outcome_code(polluted_execute.error, "session_state_unsupported")) return 44;
+  ku_error_drop(&polluted_execute.error);
+  if (fake_atomic_load(&ku_fake_execute_calls) != 9
+      || fake_atomic_load(&ku_fake_reset_connection_calls) != 3
+      || fake_atomic_load(&ku_fake_connections_opened) != opened_before_execute_pollution
+      || fake_atomic_load(&ku_fake_connections_live) != 0
+      || fake_atomic_load(&ku_fake_statements_live) != 0
+      || ku_test_mysql_result_free_calls != result_frees_before_execute_pollution
+      || !outcome_pool_has_connection(client, false)) return 45;
+
+  KuResult_int execute_recovered = ku_mysql_client_execute(
+      client, outcome_text("UPDATE recovered again"), no_params);
+  if (!execute_recovered.ok) return 46;
+  if (fake_atomic_load(&ku_fake_execute_calls) != 10
+      || fake_atomic_load(&ku_fake_reset_connection_calls) != 4
+      || fake_atomic_load(&ku_fake_connections_opened) != opened_before_execute_pollution + 1
+      || fake_atomic_load(&ku_fake_connections_live) != 1
+      || fake_atomic_load(&ku_fake_statements_live) != 0
+      || !outcome_pool_has_connection(client, true)) return 47;
+
   ku_mysql_client_close(client);
   ku_mysql_thread_shutdown();
   if (fake_atomic_load(&ku_fake_connections_live) != 0
       || fake_atomic_load(&ku_fake_statements_live) != 0
-      || fake_atomic_load(&ku_fake_thread_active) != 0) return 23;
+      || fake_atomic_load(&ku_fake_thread_active) != 0) return 48;
   puts("mysql-outcomes-ok");
   return 0;
 }
@@ -919,6 +1198,57 @@ int main(void) {
       || fake_atomic_load(&ku_fake_connections_live) != 0
       || fake_atomic_load(&ku_fake_thread_active) != 0) return 12;
   puts("mysql-library-error-ok");
+  return 0;
+}
+"#
+}
+
+fn fake_mysql_abi_mismatch_harness() -> &'static str {
+    r#"
+static KuString abi_mismatch_text(const char* value) {
+  return ku_string_static((const uint8_t*)value, strlen(value));
+}
+static void abi_mismatch_config_str(
+    KuObject* config, const char* key, const char* value) {
+  ku_object_set(config, abi_mismatch_text(key), ku_v_str(abi_mismatch_text(value)));
+}
+static bool abi_mismatch_error_is_expected(KuError error) {
+  return ku_string_equal(error.domain, abi_mismatch_text("mysql"))
+      && ku_string_equal(error.code, abi_mismatch_text("client_abi_mismatch"))
+      && error.domain.storage == KU_STRING_STATIC
+      && error.code.storage == KU_STRING_STATIC
+      && error.message.storage == KU_STRING_STATIC;
+}
+int main(void) {
+  KuObject* config = ku_object_new(8);
+  if (!config) return 10;
+  abi_mismatch_config_str(config, "host", "127.0.0.1");
+  abi_mismatch_config_str(config, "user", "tester");
+  abi_mismatch_config_str(config, "password", "secret");
+  abi_mismatch_config_str(config, "database", "fixture");
+
+  KuResult_mysql_client first = ku_mysql_client_new(config);
+  if (first.ok || first.value || !abi_mismatch_error_is_expected(first.error)) return 11;
+  ku_error_drop(&first.error);
+  KuResult_mysql_client second = ku_mysql_client_new(config);
+  ku_object_drop(config);
+  if (second.ok || second.value || !abi_mismatch_error_is_expected(second.error)) return 12;
+  ku_error_drop(&second.error);
+
+  if (ku_mysql_library_status != KU_MYSQL_LIBRARY_ABI_MISMATCH
+      || fake_atomic_load(&ku_fake_client_version_calls) != 1
+      || fake_atomic_load(&ku_fake_client_info_calls) != 1
+      || fake_atomic_load(&ku_fake_library_init_calls) != 0
+      || fake_atomic_load(&ku_fake_library_end_calls) != 0
+      || fake_atomic_load(&ku_fake_thread_init_calls) != 0
+      || fake_atomic_load(&ku_fake_mysql_init_calls) != 0
+      || fake_atomic_load(&ku_fake_real_connect_calls) != 0
+      || fake_atomic_load(&ku_fake_stmt_init_calls) != 0
+      || fake_atomic_load(&ku_fake_stmt_prepare_calls) != 0
+      || fake_atomic_load(&ku_fake_execute_calls) != 0
+      || fake_atomic_load(&ku_fake_connections_live) != 0
+      || fake_atomic_load(&ku_fake_statements_live) != 0) return 13;
+  puts("mysql-abi-mismatch-ok");
   return 0;
 }
 "#
@@ -1354,15 +1684,22 @@ fn fake_mysql_header() -> &'static str {
 #define KU_FAKE_MYSQL_H
 #include <stddef.h>
 #include <stdbool.h>
-#define MARIADB_BASE_VERSION "fake"
-#define MYSQL_VERSION_ID 100000
+#define MARIADB_BASE_VERSION "mariadb-10.11"
+#define MARIADB_VERSION_ID 101106
+#define MYSQL_VERSION_ID 101106
+#define MARIADB_PACKAGE_VERSION "3.4.5"
+#define MARIADB_PACKAGE_VERSION_ID 30405
 #define CR_MIN_ERROR 2000
 #define CR_MAX_ERROR 2999
 #define CER_MIN_ERROR 5000
 #define CER_MAX_ERROR 5999
 typedef unsigned char my_bool;
 typedef unsigned long long my_ulonglong;
-typedef struct st_mysql MYSQL;
+typedef struct st_mysql {
+  int broken;
+  long identity;
+  unsigned int server_status;
+} MYSQL;
 typedef struct st_mysql_stmt MYSQL_STMT;
 typedef struct st_mysql_res MYSQL_RES;
 enum enum_field_types {
@@ -1389,6 +1726,8 @@ enum mysql_option {
 };
 #define MYSQL_NO_DATA 100
 #define MYSQL_DATA_TRUNCATED 101
+const char* mysql_get_client_info(void);
+unsigned long mysql_get_client_version(void);
 int mysql_library_init(int, char**, char**);
 void mysql_library_end(void);
 MYSQL* mysql_init(MYSQL*);
@@ -1456,7 +1795,6 @@ static long fake_atomic_add(KuFakeAtomicLong* value, long amount) {
 }
 #endif
 
-struct st_mysql { int broken; long identity; };
 struct st_mysql_stmt {
   MYSQL* connection;
   char* sql;
@@ -1468,6 +1806,16 @@ struct st_mysql_stmt {
   size_t row;
 };
 struct st_mysql_res { MYSQL_FIELD fields[3]; };
+#ifndef KU_FAKE_MYSQL_RUNTIME_VERSION
+#define KU_FAKE_MYSQL_RUNTIME_VERSION 30405L
+#endif
+#ifndef KU_FAKE_MYSQL_RUNTIME_INFO
+#define KU_FAKE_MYSQL_RUNTIME_INFO "3.4.5"
+#endif
+static KuFakeAtomicLong ku_fake_client_info_calls = 0;
+static KuFakeAtomicLong ku_fake_client_version_calls = 0;
+static KuFakeAtomicLong ku_fake_client_version = KU_FAKE_MYSQL_RUNTIME_VERSION;
+static const char* ku_fake_client_info = KU_FAKE_MYSQL_RUNTIME_INFO;
 static KuFakeAtomicLong ku_fake_block_execute = 0;
 static KuFakeAtomicLong ku_fake_execute_entered = 0;
 static KuFakeAtomicLong ku_fake_release_execute = 0;
@@ -1477,18 +1825,29 @@ static KuFakeAtomicLong ku_fake_fail_library_init = 0;
 static KuFakeAtomicLong ku_fake_thread_init_calls = 0;
 static KuFakeAtomicLong ku_fake_thread_end_calls = 0;
 static KuFakeAtomicLong ku_fake_thread_active = 0;
+static KuFakeAtomicLong ku_fake_mysql_init_calls = 0;
 static KuFakeAtomicLong ku_fake_connections_live = 0;
 static KuFakeAtomicLong ku_fake_connections_opened = 0;
 static KuFakeAtomicLong ku_fake_real_connect_calls = 0;
 static KuFakeAtomicLong ku_fake_fail_real_connect = 0;
 static KuFakeAtomicLong ku_fake_local_infile_disabled = 0;
 static KuFakeAtomicLong ku_fake_statements_live = 0;
+static KuFakeAtomicLong ku_fake_stmt_init_calls = 0;
+static KuFakeAtomicLong ku_fake_stmt_prepare_calls = 0;
 static KuFakeAtomicLong ku_fake_execute_calls = 0;
 static KuFakeAtomicLong ku_fake_fail_stmt_free_result = 0;
 static KuFakeAtomicLong ku_fake_fail_stmt_close = 0;
 static KuFakeAtomicLong ku_fake_fail_reset_connection = 0;
 static KuFakeAtomicLong ku_fake_reset_connection_calls = 0;
 
+const char* mysql_get_client_info(void) {
+  fake_atomic_add(&ku_fake_client_info_calls, 1);
+  return ku_fake_client_info;
+}
+unsigned long mysql_get_client_version(void) {
+  fake_atomic_add(&ku_fake_client_version_calls, 1);
+  return (unsigned long)fake_atomic_load(&ku_fake_client_version);
+}
 int mysql_library_init(int argc, char** argv, char** groups) {
   (void)argc; (void)argv; (void)groups;
   fake_atomic_add(&ku_fake_library_init_calls, 1);
@@ -1509,9 +1868,11 @@ static void fake_pause(void) {
 
 MYSQL* mysql_init(MYSQL* unused) {
   (void)unused;
+  fake_atomic_add(&ku_fake_mysql_init_calls, 1);
   MYSQL* connection = (MYSQL*)calloc(1, sizeof(MYSQL));
   if (connection) {
     connection->identity = fake_atomic_add(&ku_fake_connections_opened, 1);
+    connection->server_status = 2U;
     fake_atomic_add(&ku_fake_connections_live, 1);
   }
   return connection;
@@ -1548,6 +1909,7 @@ int mysql_reset_connection(MYSQL* c) {
     return 1;
   }
   if (!c || c->broken) return 1;
+  c->server_status = 2U;
   return 0;
 }
 void mysql_close(MYSQL* c) {
@@ -1558,6 +1920,7 @@ void mysql_close(MYSQL* c) {
 }
 
 MYSQL_STMT* mysql_stmt_init(MYSQL* c) {
+  fake_atomic_add(&ku_fake_stmt_init_calls, 1);
   if (!c || c->broken) return NULL;
   MYSQL_STMT* s = (MYSQL_STMT*)calloc(1, sizeof(MYSQL_STMT));
   if (s) {
@@ -1567,6 +1930,7 @@ MYSQL_STMT* mysql_stmt_init(MYSQL* c) {
   return s;
 }
 int mysql_stmt_prepare(MYSQL_STMT* s, const char* sql, unsigned long len) {
+  fake_atomic_add(&ku_fake_stmt_prepare_calls, 1);
   s->sql = (char*)malloc((size_t)len + 1);
   if (!s->sql) { s->error_code = 1; return 1; }
   memcpy(s->sql, sql, len); s->sql[len] = 0;
@@ -1601,6 +1965,20 @@ int mysql_stmt_execute(MYSQL_STMT* s) {
   }
   if (strncmp(s->sql, "SERVER_ERROR", 12) == 0) {
     s->error_code = 1064; return 1;
+  }
+  if (strncmp(s->sql, "POST_STATE_QUERY", 16) == 0) {
+    s->field_count = 3;
+    s->connection->server_status = 1U;
+    return 0;
+  }
+  if (strncmp(s->sql, "POST_STATE_EXECUTE", 18) == 0) {
+    s->field_count = 0;
+    s->connection->server_status = 1U;
+    return 0;
+  }
+  if (strncmp(s->sql, "BEGIN", 5) == 0) {
+    s->connection->server_status = 1U;
+    return 0;
   }
   if (strncmp(s->sql, "SELECT", 6) == 0) {
     static const char payload[] = "x'; DROP TABLE users; --";

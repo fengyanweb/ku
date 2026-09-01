@@ -66,6 +66,8 @@ jobs:
           - macos-15
     env:
       CARGO_INCREMENTAL: "0"
+      KU_MYSQL_LINK_REQUIRED: "1"
+      KU_PG_LINK_REQUIRED: "1"
       RUST_BACKTRACE: "1"
 
     steps:
@@ -82,8 +84,184 @@ jobs:
           rustup default 1.89.0
           rustc --version --verbose
 
+      - name: Prepare exact shared database client link inputs on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            default-libmysqlclient-dev libpq-dev pkg-config
+          source_lib="$(pg_config --libdir)/libpq.so"
+          test -e "$source_lib"
+          pg_config --version
+          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-libpq-link.XXXXXXXX")"
+          chmod 700 "$private_lib"
+          ln -s "$source_lib" "$private_lib/libpq.so"
+          test -L "$private_lib/libpq.so"
+          printf 'KU_PG_LIB=%s\n' "$private_lib" >> "$GITHUB_ENV"
+
+          if pkg-config --exists mysqlclient; then
+            mysql_module=mysqlclient
+            mysql_name=libmysqlclient.so
+          elif pkg-config --exists mariadb; then
+            mysql_module=mariadb
+            mysql_name=libmariadb.so
+          else
+            echo 'No mysqlclient or mariadb pkg-config module was installed' >&2
+            exit 1
+          fi
+          mysql_libdir="$(pkg-config --variable=libdir "$mysql_module")"
+          mysql_include="$(pkg-config --variable=includedir "$mysql_module")"
+          pkg-config --modversion "$mysql_module"
+          test -e "$mysql_libdir/$mysql_name"
+          test -f "$mysql_include/mysql.h" -o -f "$mysql_include/mysql/mysql.h"
+          private_mysql="$(mktemp -d "$RUNNER_TEMP/ku-libmysql-link.XXXXXXXX")"
+          chmod 700 "$private_mysql"
+          ln -s "$mysql_libdir/$mysql_name" "$private_mysql/$mysql_name"
+          test -L "$private_mysql/$mysql_name"
+          printf 'KU_MYSQL_LIB=%s\n' "$private_mysql" >> "$GITHUB_ENV"
+          printf 'KU_MYSQL_INCLUDE=%s\n' "$mysql_include" >> "$GITHUB_ENV"
+
+      - name: Prepare exact shared database client link inputs on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          brew install libpq mysql-client
+          brew list --versions libpq mysql-client
+          source_lib="$(brew --prefix libpq)/lib/libpq.dylib"
+          test -e "$source_lib"
+          private_lib="$(mktemp -d "$RUNNER_TEMP/ku-libpq-link.XXXXXXXX")"
+          chmod 700 "$private_lib"
+          ln -s "$source_lib" "$private_lib/libpq.dylib"
+          test -L "$private_lib/libpq.dylib"
+          printf 'KU_PG_LIB=%s\n' "$private_lib" >> "$GITHUB_ENV"
+
+          mysql_prefix="$(brew --prefix mysql-client)"
+          mysql_lib="$mysql_prefix/lib/libmysqlclient.dylib"
+          mysql_include="$mysql_prefix/include"
+          test -e "$mysql_lib"
+          test -f "$mysql_include/mysql.h" -o -f "$mysql_include/mysql/mysql.h"
+          private_mysql="$(mktemp -d "$RUNNER_TEMP/ku-libmysql-link.XXXXXXXX")"
+          chmod 700 "$private_mysql"
+          ln -s "$mysql_lib" "$private_mysql/libmysqlclient.dylib"
+          test -L "$private_mysql/libmysqlclient.dylib"
+          printf 'KU_MYSQL_LIB=%s\n' "$private_mysql" >> "$GITHUB_ENV"
+          printf 'KU_MYSQL_INCLUDE=%s\n' "$mysql_include" >> "$GITHUB_ENV"
+
+      - name: Prepare an exact libpq import library on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:PGROOT) -or
+              -not [IO.Path]::IsPathFullyQualified($env:PGROOT)) {
+            throw "The Windows runner did not provide an absolute PGROOT"
+          }
+          $selected = (Resolve-Path -LiteralPath $env:PGROOT).Path
+          $importLibrary = Join-Path $selected 'lib\libpq.lib'
+          $runtimeDirectory = Join-Path $selected 'bin'
+          if (-not (Test-Path -LiteralPath $importLibrary -PathType Leaf) -or
+              -not (Test-Path -LiteralPath (Join-Path $runtimeDirectory 'libpq.dll') -PathType Leaf)) {
+            throw "PGROOT does not contain libpq.lib and libpq.dll"
+          }
+          (Get-Item -LiteralPath (Join-Path $runtimeDirectory 'libpq.dll')).VersionInfo |
+            Format-List FileVersion,ProductVersion
+          $privateLib = Join-Path $env:RUNNER_TEMP ("ku-libpq-link-{0}" -f [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $privateLib | Out-Null
+          $privateImport = Join-Path $privateLib 'libpq.lib'
+          Copy-Item -LiteralPath $importLibrary -Destination $privateImport
+          if (-not (Test-Path -LiteralPath $privateImport -PathType Leaf)) {
+            throw 'Failed to create the private libpq import-library copy'
+          }
+          "KU_PG_LIB=$privateLib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $runtimeDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Locate the exact MySQL client import library on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $roots = @()
+          foreach ($candidate in @($env:MYSQL_ROOT, $env:MYSQL_PATH, 'C:\mysql', 'C:\tools\mysql')) {
+            if (-not [string]::IsNullOrWhiteSpace($candidate) -and
+                (Test-Path -LiteralPath $candidate -PathType Container)) {
+              $item = Get-Item -LiteralPath $candidate
+              $roots += $item
+              if ($item.Name -ieq 'bin' -and $null -ne $item.Parent) {
+                $roots += $item.Parent
+              }
+            }
+          }
+          $programFilesMySql = Join-Path $env:ProgramFiles 'MySQL'
+          if (Test-Path -LiteralPath $programFilesMySql -PathType Container) {
+            $roots += Get-ChildItem -LiteralPath $programFilesMySql -Directory
+          }
+          $selected = $roots |
+            Where-Object {
+              (Test-Path -LiteralPath (Join-Path $_.FullName 'lib\libmysql.lib') -PathType Leaf) -and
+              (Test-Path -LiteralPath (Join-Path $_.FullName 'lib\libmysql.dll') -PathType Leaf) -and
+              (Test-Path -LiteralPath (Join-Path $_.FullName 'include\mysql.h') -PathType Leaf)
+            } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $selected) {
+            throw 'No complete MySQL client installation was found'
+          }
+          $mysqlLib = (Resolve-Path -LiteralPath (Join-Path $selected.FullName 'lib')).Path
+          $mysqlInclude = (Resolve-Path -LiteralPath (Join-Path $selected.FullName 'include')).Path
+          $mysqlImport = Join-Path $mysqlLib 'libmysql.lib'
+          $privateMysql = Join-Path $env:RUNNER_TEMP ("ku-libmysql-link-{0}" -f [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $privateMysql | Out-Null
+          $privateMysqlImport = Join-Path $privateMysql 'libmysql.lib'
+          Copy-Item -LiteralPath $mysqlImport -Destination $privateMysqlImport
+          if (-not (Test-Path -LiteralPath $privateMysqlImport -PathType Leaf)) {
+            throw 'Failed to create the private MySQL import-library copy'
+          }
+          "KU_MYSQL_LIB=$privateMysql" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "KU_MYSQL_INCLUDE=$mysqlInclude" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $mysqlLib | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $mysqlBin = Join-Path $selected.FullName 'bin'
+          if (Test-Path -LiteralPath $mysqlBin -PathType Container) {
+            (Resolve-Path -LiteralPath $mysqlBin).Path |
+              Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          (Get-Item -LiteralPath (Join-Path $mysqlLib 'libmysql.dll')).VersionInfo |
+            Format-List FileVersion,ProductVersion
+
       - name: Build Ku CLI
         run: cargo build --locked --release --bin ku
+
+      - name: Require native PostgreSQL client linking and startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then export LD_BIND_NOW=1; fi
+          if [ "$RUNNER_OS" = macOS ]; then export DYLD_BIND_AT_LAUNCH=1; fi
+          test_log="$(mktemp)"
+          trap 'rm -f "$test_log"' EXIT
+          cargo test --locked --release \
+            --test native_run_test \
+            native_pg_client_c_links_and_starts_when_toolchain_and_libpq_are_available \
+            -- --exact --nocapture --test-threads=1 2>&1 | tee "$test_log"
+          grep -F "test result: ok. 1 passed; 0 failed" "$test_log"
+
+      - name: Require native MySQL client linking and startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then export LD_BIND_NOW=1; fi
+          if [ "$RUNNER_OS" = macOS ]; then export DYLD_BIND_AT_LAUNCH=1; fi
+          test_log="$(mktemp)"
+          trap 'rm -f "$test_log"' EXIT
+          cargo test --locked --release \
+            --test native_run_test \
+            native_mysql_client_c_links_and_starts_when_toolchain_and_library_are_available \
+            -- --exact --nocapture --test-threads=1 2>&1 | tee "$test_log"
+          grep -F "test result: ok. 1 passed; 0 failed" "$test_log"
 
       - name: Run every default test target without stopping at the first failure
         run: >-

@@ -193,7 +193,7 @@ pub fn generate_c_source_with_options(
         "#if defined(__linux__) && !defined(_GNU_SOURCE)\n#define _GNU_SOURCE\n#endif\n\
          #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)\n#define _DARWIN_C_SOURCE\n#endif\n\
          #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)\n#define _POSIX_C_SOURCE 200809L\n#endif\n\
-         #include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n#include <errno.h>\n#include <math.h>\n\n\
+         #include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n#include <errno.h>\n#include <limits.h>\n#include <math.h>\n\n\
          #if defined(_WIN32)\n\
          #if defined(_MSC_VER)\n__declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);\n\
          #elif defined(__GNUC__) || defined(__clang__)\n__attribute__((dllimport)) unsigned long long __attribute__((stdcall)) GetTickCount64(void);\n\
@@ -246,9 +246,9 @@ pub fn generate_c_source_with_options(
     // must precede any `windows.h`; on POSIX both runtimes use poll(2) rather
     // than select(2), so descriptors above FD_SETSIZE remain safe.
     // The pragma makes MSVC link `ws2_32` without a command-line change.
-    // The pg connection poller also needs WSAPoll/poll. Keep a PG-only artifact
-    // lean: it does not need the HTTP/Redis resolver, socket, atomic, or thread
-    // headers unless it also uses one of those runtimes.
+    // The pg connection poller also needs WSAPoll/poll and shutdown(2). Keep a
+    // PG-only artifact lean: it does not need the HTTP/Redis resolver, atomic,
+    // or thread headers unless it also uses one of those runtimes.
     let uses_native_socket_runtime = program_uses_http(program) || program_uses_redis(program);
     if uses_native_socket_runtime {
         out.push_str(
@@ -269,7 +269,7 @@ pub fn generate_c_source_with_options(
              #include <winsock2.h>\n\
              #if defined(_MSC_VER)\n#pragma comment(lib, \"ws2_32.lib\")\n#endif\n\
              #else\n\
-             #include <poll.h>\n\
+             #include <sys/socket.h>\n#include <poll.h>\n\
              #endif\n\n",
         );
     }
@@ -7066,11 +7066,22 @@ fn emit_mysql_types(out: &mut String, program: &IrProgram) {
         "# elif __has_include(<mariadb/mysql.h>)\n#  include <mariadb/mysql.h>\n",
         "# else\n#  error \"std.mysql requires libmysqlclient development headers\"\n# endif\n",
         "#else\n# include <mysql.h>\n#endif\n#include <limits.h>\n",
-        "#if defined(MYSQL_VERSION_ID) && !defined(MARIADB_BASE_VERSION) && MYSQL_VERSION_ID < 50703\n",
-        "# error \"std.mysql requires mysql_reset_connection (MySQL 5.7.3 or newer)\"\n",
-        "#endif\n",
-        "#if defined(MARIADB_PACKAGE_VERSION_ID) && MARIADB_PACKAGE_VERSION_ID < 30000\n",
-        "# error \"std.mysql requires MariaDB Connector/C 3.0.0 or newer\"\n",
+        "#if defined(MARIADB_BASE_VERSION)\n",
+        "# if !defined(MARIADB_PACKAGE_VERSION_ID)\n",
+        "#  error \"std.mysql requires a MariaDB Connector/C package version macro\"\n",
+        "# elif MARIADB_PACKAGE_VERSION_ID < 30100 || MARIADB_PACKAGE_VERSION_ID >= 40000\n",
+        "#  error \"std.mysql requires MariaDB Connector/C 3.1.x through 3.x\"\n",
+        "# endif\n",
+        "# define KU_MYSQL_HEADER_FAMILY_MARIADB 1\n",
+        "# define KU_MYSQL_HEADER_ABI_MAJOR (MARIADB_PACKAGE_VERSION_ID / 10000UL)\n",
+        "#else\n",
+        "# if !defined(MYSQL_VERSION_ID)\n",
+        "#  error \"std.mysql requires a supported MySQL or MariaDB client header\"\n",
+        "# elif MYSQL_VERSION_ID < 50703\n",
+        "#  error \"std.mysql requires mysql_reset_connection (MySQL 5.7.3 or newer)\"\n",
+        "# endif\n",
+        "# define KU_MYSQL_HEADER_FAMILY_MARIADB 0\n",
+        "# define KU_MYSQL_HEADER_ABI_MAJOR (MYSQL_VERSION_ID / 10000UL)\n",
         "#endif\n",
         "typedef struct KuMysqlClient KuMysqlClient;\n",
         "typedef struct KuMysqlResult KuMysqlResult;\n",
@@ -7092,10 +7103,7 @@ fn emit_mysql_runtime(out: &mut String, program: &IrProgram) {
     }
     out.push_str(
         r#"
-#if defined(_MSC_VER) && !defined(KU_MYSQL_FAKE_CLIENT)
-#pragma comment(lib, "libmysql.lib")
-#endif
-
+#define KU_FEATURE_LIBMYSQL 1
 #define KU_NATIVE_RUNTIME_MYSQL 1
 
 #define KU_MYSQL_MAX_CONNECTIONS 256U
@@ -7207,6 +7215,52 @@ struct KuMysqlResult {
   size_t data_capacity;
 };
 
+#define KU_MYSQL_LIBRARY_UNINITIALIZED 0
+#define KU_MYSQL_LIBRARY_READY 1
+#define KU_MYSQL_LIBRARY_FAILED (-1)
+#define KU_MYSQL_LIBRARY_ABI_MISMATCH (-2)
+
+/* mysql_get_client_info() is documented by both supported vendors as a
+   client-library version string. Parse only its bounded leading major; this
+   cross-checks the numeric API without scanning an untrusted, unbounded tail. */
+static bool ku_mysql_client_info_major(
+    const char* info, unsigned long* output) {
+  if (!info || !output) return false;
+  unsigned long major = 0;
+  for (size_t index = 0; index < 20; index++) {
+    unsigned char byte = (unsigned char)info[index];
+    if (byte == '.') {
+      if (index == 0) return false;
+      *output = major;
+      return true;
+    }
+    if (byte < '0' || byte > '9') return false;
+    unsigned long digit = (unsigned long)(byte - '0');
+    if (major > (ULONG_MAX - digit) / 10UL) return false;
+    major = major * 10UL + digit;
+  }
+  return false;
+}
+
+static bool ku_mysql_client_abi_compatible(void) {
+  /* These two calls are the only client-library operations permitted before
+     the ABI gate. They require neither MYSQL storage nor library init. */
+  unsigned long runtime_version = mysql_get_client_version();
+  const char* runtime_info = mysql_get_client_info();
+  unsigned long info_major = 0;
+  if (!ku_mysql_client_info_major(runtime_info, &info_major)) return false;
+  unsigned long runtime_major = runtime_version / 10000UL;
+  if (runtime_major != info_major
+      || runtime_major != (unsigned long)KU_MYSQL_HEADER_ABI_MAJOR) return false;
+#if KU_MYSQL_HEADER_FAMILY_MARIADB
+  /* Ku accepts Connector/C 3.x only. Its client-version major is therefore
+     disjoint from every supported Oracle MySQL client major (5 or newer). */
+  return runtime_major == 3UL;
+#else
+  return runtime_major >= 5UL;
+#endif
+}
+
 static int ku_mysql_library_status = 0;
 
 static void ku_mysql_library_shutdown(void) {
@@ -7220,13 +7274,15 @@ static BOOL CALLBACK ku_mysql_library_initialize_once(
   (void)once;
   (void)parameter;
   (void)context;
-  if (mysql_library_init(0, NULL, NULL) != 0) {
-    ku_mysql_library_status = -1;
+  if (!ku_mysql_client_abi_compatible()) {
+    ku_mysql_library_status = KU_MYSQL_LIBRARY_ABI_MISMATCH;
+  } else if (mysql_library_init(0, NULL, NULL) != 0) {
+    ku_mysql_library_status = KU_MYSQL_LIBRARY_FAILED;
   } else if (atexit(ku_mysql_library_shutdown) != 0) {
     mysql_library_end();
-    ku_mysql_library_status = -1;
+    ku_mysql_library_status = KU_MYSQL_LIBRARY_FAILED;
   } else {
-    ku_mysql_library_status = 1;
+    ku_mysql_library_status = KU_MYSQL_LIBRARY_READY;
   }
   return TRUE;
 }
@@ -7235,24 +7291,26 @@ static bool ku_mysql_library_ready(void) {
   if (!InitOnceExecuteOnce(
           &ku_mysql_library_once, ku_mysql_library_initialize_once,
           NULL, NULL)) return false;
-  return ku_mysql_library_status == 1;
+  return ku_mysql_library_status == KU_MYSQL_LIBRARY_READY;
 }
 #else
 static pthread_once_t ku_mysql_library_once = PTHREAD_ONCE_INIT;
 static void ku_mysql_library_initialize_once(void) {
-  if (mysql_library_init(0, NULL, NULL) != 0) {
-    ku_mysql_library_status = -1;
+  if (!ku_mysql_client_abi_compatible()) {
+    ku_mysql_library_status = KU_MYSQL_LIBRARY_ABI_MISMATCH;
+  } else if (mysql_library_init(0, NULL, NULL) != 0) {
+    ku_mysql_library_status = KU_MYSQL_LIBRARY_FAILED;
   } else if (atexit(ku_mysql_library_shutdown) != 0) {
     mysql_library_end();
-    ku_mysql_library_status = -1;
+    ku_mysql_library_status = KU_MYSQL_LIBRARY_FAILED;
   } else {
-    ku_mysql_library_status = 1;
+    ku_mysql_library_status = KU_MYSQL_LIBRARY_READY;
   }
 }
 
 static bool ku_mysql_library_ready(void) {
   return pthread_once(&ku_mysql_library_once, ku_mysql_library_initialize_once) == 0
-      && ku_mysql_library_status == 1;
+      && ku_mysql_library_status == KU_MYSQL_LIBRARY_READY;
 }
 #endif
 
@@ -7310,9 +7368,19 @@ static KuError ku_mysql_execution_completed_without_result_error(void) {
       "MySQL statement completed but its result could not be delivered; never retry automatically");
 }
 
-static int ku_mysql_utf8_valid(const uint8_t* data, size_t len) {
+/* Return 1 for valid UTF-8, 0 for invalid UTF-8 and -1 when an optional
+   absolute deadline expires. Query input uses the deadline-aware path;
+   configuration/result validation passes zero because it has a separate,
+   already-bounded lifecycle. */
+static int ku_mysql_utf8_valid_until(
+    const uint8_t* data, size_t len, unsigned long long deadline) {
   size_t index = 0;
+  size_t next_deadline_check = 0;
   while (index < len) {
+    if (deadline != 0 && index >= next_deadline_check) {
+      if (__ku_handler_now_ms() >= deadline) return -1;
+      next_deadline_check = len - index > 4096 ? index + 4096 : len;
+    }
     uint8_t first = data[index++];
     if (first <= 0x7f) continue;
     uint32_t scalar = 0;
@@ -7340,7 +7408,25 @@ static int ku_mysql_utf8_valid(const uint8_t* data, size_t len) {
         || scalar > 0x10ffff
         || (scalar >= 0xd800 && scalar <= 0xdfff)) return 0;
   }
+  if (deadline != 0 && __ku_handler_now_ms() >= deadline) return -1;
   return 1;
+}
+
+static int ku_mysql_utf8_valid(const uint8_t* data, size_t len) {
+  return ku_mysql_utf8_valid_until(data, len, 0) == 1;
+}
+
+static int ku_mysql_string_has_nul_until(
+    KuString value, unsigned long long deadline) {
+  if (value.len && !value.ptr) return 1;
+  for (size_t offset = 0; offset < value.len;) {
+    if (deadline != 0 && __ku_handler_now_ms() >= deadline) return -1;
+    size_t part = value.len - offset;
+    if (part > 4096) part = 4096;
+    if (memchr(value.ptr + offset, 0, part)) return 1;
+    offset += part;
+  }
+  return deadline != 0 && __ku_handler_now_ms() >= deadline ? -1 : 0;
 }
 
 static bool ku_mysql_sync_init(KuMysqlClient* client) {
@@ -7557,7 +7643,7 @@ static bool ku_mysql_config_uint(
     unsigned int minimum, unsigned int maximum, unsigned int* output,
     KuError* error) {
   KuValue* value = ku_mysql_config_value(config, key);
-  if (!value || value->tag == KU_NULL) {
+  if (!value) {
     *output = fallback;
     return true;
   }
@@ -7875,7 +7961,43 @@ static KuResult_mysql_client ku_mysql_client_new(KuObject* config) {
     return (KuResult_mysql_client){ false, NULL, error };
   }
 
+  unsigned int port = 0;
+  unsigned int max_connections = 0;
+  unsigned int max_waiters = 0;
+  unsigned int connect_timeout_ms = 0;
+  unsigned int acquire_timeout_ms = 0;
+  unsigned int query_timeout_ms = 0;
+  /* Reject the complete config before even version-probing or initializing the
+     client library. Invalid user input must have no external client side effect. */
+  if (!ku_mysql_config_uint(
+          config, "port", 3306, 1, 65535, &port, &error)
+      || !ku_mysql_config_uint(
+          config, "max_connections", 8, 1, KU_MYSQL_MAX_CONNECTIONS,
+          &max_connections, &error)
+      || !ku_mysql_config_uint(
+          config, "max_waiters", 64, 0, KU_MYSQL_MAX_WAITERS,
+          &max_waiters, &error)
+      || !ku_mysql_config_uint(
+          config, "connect_timeout_ms", 5000, 1, KU_MYSQL_MAX_TIMEOUT_MS,
+          &connect_timeout_ms, &error)
+      || !ku_mysql_config_uint(
+          config, "acquire_timeout_ms", 5000, 1, KU_MYSQL_MAX_TIMEOUT_MS,
+          &acquire_timeout_ms, &error)
+      || !ku_mysql_config_uint(
+          config, "query_timeout_ms", 30000, 1, KU_MYSQL_MAX_TIMEOUT_MS,
+          &query_timeout_ms, &error)) {
+    return (KuResult_mysql_client){ false, NULL, error };
+  }
+
   if (!ku_mysql_library_ready()) {
+    if (ku_mysql_library_status == KU_MYSQL_LIBRARY_ABI_MISMATCH) {
+      return (KuResult_mysql_client){
+        false, NULL,
+        ku_mysql_error(
+            "client_abi_mismatch",
+            "MySQL client headers and runtime library are ABI-incompatible")
+      };
+    }
     return (KuResult_mysql_client){
       false, NULL,
       ku_mysql_error("sync_error", "MySQL client library initialization failed")
@@ -7890,26 +8012,12 @@ static KuResult_mysql_client ku_mysql_client_new(KuObject* config) {
       ku_mysql_error("out_of_memory", "MySQL client allocation failed")
     };
   }
-  if (!ku_mysql_config_uint(
-          config, "port", 3306, 1, 65535, &client->port, &error)
-      || !ku_mysql_config_uint(
-          config, "max_connections", 8, 1, KU_MYSQL_MAX_CONNECTIONS,
-          &client->max_connections, &error)
-      || !ku_mysql_config_uint(
-          config, "max_waiters", 64, 0, KU_MYSQL_MAX_WAITERS,
-          &client->max_waiters, &error)
-      || !ku_mysql_config_uint(
-          config, "connect_timeout_ms", 5000, 1, KU_MYSQL_MAX_TIMEOUT_MS,
-          &client->connect_timeout_ms, &error)
-      || !ku_mysql_config_uint(
-          config, "acquire_timeout_ms", 5000, 1, KU_MYSQL_MAX_TIMEOUT_MS,
-          &client->acquire_timeout_ms, &error)
-      || !ku_mysql_config_uint(
-          config, "query_timeout_ms", 30000, 1, KU_MYSQL_MAX_TIMEOUT_MS,
-          &client->query_timeout_ms, &error)) {
-    ku_mysql_free(client);
-    return (KuResult_mysql_client){ false, NULL, error };
-  }
+  client->port = port;
+  client->max_connections = max_connections;
+  client->max_waiters = max_waiters;
+  client->connect_timeout_ms = connect_timeout_ms;
+  client->acquire_timeout_ms = acquire_timeout_ms;
+  client->query_timeout_ms = query_timeout_ms;
 
   client->host = ku_mysql_config_copy(host);
   client->user = ku_mysql_config_copy(user);
@@ -8223,14 +8331,249 @@ static bool ku_mysql_reset_for_pool(
   return charset_status != 0 || __ku_handler_now_ms() >= deadline;
 }
 
+static bool ku_mysql_session_state_is_supported(MYSQL* connection) {
+  /* These protocol status bits are shared by Oracle MySQL and MariaDB. The
+     matching public mysql.h is required because MYSQL is a versioned ABI. */
+  const unsigned int in_transaction = 1U;
+  const unsigned int autocommit = 2U;
+  return connection
+      && (connection->server_status & in_transaction) == 0
+      && (connection->server_status & autocommit) != 0;
+}
+
+static bool ku_mysql_sql_keyword_byte(uint8_t value) {
+  return (value >= (uint8_t)'A' && value <= (uint8_t)'Z')
+      || (value >= (uint8_t)'a' && value <= (uint8_t)'z')
+      || (value >= (uint8_t)'0' && value <= (uint8_t)'9')
+      || value == (uint8_t)'_';
+}
+
+static bool ku_mysql_sql_token_equals(
+    KuString sql, size_t start, size_t len, const char* expected) {
+  size_t expected_len = strlen(expected);
+  if (len != expected_len) return false;
+  for (size_t index = 0; index < len; index++) {
+    uint8_t value = sql.ptr[start + index];
+    if (value >= (uint8_t)'A' && value <= (uint8_t)'Z') value += 32;
+    if (value != (uint8_t)expected[index]) return false;
+  }
+  return true;
+}
+
+/* Conservatively reject executable-comment markers anywhere in statement
+   text, including quoted text. That small false-positive surface is preferable
+   to attempting a partial emulation of server/version-specific comment rules. */
+static int ku_mysql_sql_contains_executable_comment(
+    KuString sql, unsigned long long deadline) {
+  size_t next_deadline_check = 0;
+  for (size_t index = 0; index + 2 < sql.len; index++) {
+    if (index >= next_deadline_check) {
+      if (__ku_handler_now_ms() >= deadline) return -1;
+      next_deadline_check = SIZE_MAX - index < 4096
+          ? SIZE_MAX : index + 4096;
+    }
+    if (sql.ptr[index] != (uint8_t)'/'
+        || sql.ptr[index + 1] != (uint8_t)'*') continue;
+    if (sql.ptr[index + 2] == (uint8_t)'!') return 1;
+    if (index + 3 < sql.len
+        && (sql.ptr[index + 2] == (uint8_t)'M'
+            || sql.ptr[index + 2] == (uint8_t)'m')
+        && sql.ptr[index + 3] == (uint8_t)'!') return 1;
+  }
+  return __ku_handler_now_ms() >= deadline ? -1 : 0;
+}
+
+/* MySQL has two executable block-comment forms (`/*!` and `/*M!`) and `#`
+   line comments. The ordinary pooled client rejects executable comments
+   rather than trying to interpret version gates embedded in them. Return 1
+   for a token, 0 for end/non-keyword input, -1 for fail-closed syntax, and -2
+   when the already-established operation deadline expires. */
+static int ku_mysql_sql_next_top_token(
+    KuString sql, size_t* cursor, size_t* start, size_t* len,
+    unsigned long long deadline) {
+  size_t index = *cursor;
+  size_t next_deadline_check = index;
+  for (;;) {
+#define KU_MYSQL_SQL_SCAN_CHECK() do { \
+  if (index >= next_deadline_check) { \
+    if (__ku_handler_now_ms() >= deadline) return -2; \
+    next_deadline_check = SIZE_MAX - index < 4096 ? SIZE_MAX : index + 4096; \
+  } \
+} while (0)
+    while (index < sql.len) {
+      KU_MYSQL_SQL_SCAN_CHECK();
+      uint8_t value = sql.ptr[index];
+      if (value != (uint8_t)' ' && value != (uint8_t)'\t'
+          && value != (uint8_t)'\r' && value != (uint8_t)'\n'
+          && value != (uint8_t)'\f') break;
+      index++;
+    }
+    if (index == 0 && sql.len >= 3 && sql.ptr[0] == 0xef
+        && sql.ptr[1] == 0xbb && sql.ptr[2] == 0xbf) {
+      index = 3;
+      continue;
+    }
+    if (index + 1 < sql.len && sql.ptr[index] == (uint8_t)'-'
+        && sql.ptr[index + 1] == (uint8_t)'-'
+        && index + 2 < sql.len && sql.ptr[index + 2] <= (uint8_t)' ') {
+      index += 2;
+      while (index < sql.len && sql.ptr[index] != (uint8_t)'\n'
+          && sql.ptr[index] != (uint8_t)'\r') {
+        KU_MYSQL_SQL_SCAN_CHECK();
+        index++;
+      }
+      continue;
+    }
+    if (index < sql.len && sql.ptr[index] == (uint8_t)'#') {
+      index++;
+      while (index < sql.len && sql.ptr[index] != (uint8_t)'\n'
+          && sql.ptr[index] != (uint8_t)'\r') {
+        KU_MYSQL_SQL_SCAN_CHECK();
+        index++;
+      }
+      continue;
+    }
+    if (index + 1 < sql.len && sql.ptr[index] == (uint8_t)'/'
+        && sql.ptr[index + 1] == (uint8_t)'*') {
+      bool executable = index + 2 < sql.len && sql.ptr[index + 2] == (uint8_t)'!';
+      bool mariadb_executable = index + 3 < sql.len
+          && (sql.ptr[index + 2] == (uint8_t)'M'
+              || sql.ptr[index + 2] == (uint8_t)'m')
+          && sql.ptr[index + 3] == (uint8_t)'!';
+      if (executable || mariadb_executable) return -1;
+      /* Unlike PostgreSQL, MySQL/MariaDB ordinary block comments do not
+         nest. Stop at the first closing delimiter so a later top-level SET
+         cannot be hidden from this scanner by a fake nested opener. */
+      bool closed = false;
+      index += 2;
+      while (index < sql.len) {
+        KU_MYSQL_SQL_SCAN_CHECK();
+        if (index + 1 < sql.len && sql.ptr[index] == (uint8_t)'*'
+            && sql.ptr[index + 1] == (uint8_t)'/') {
+          index += 2;
+          closed = true;
+          break;
+        }
+        index++;
+      }
+      if (!closed) return -1;
+      continue;
+    }
+    break;
+  }
+  KU_MYSQL_SQL_SCAN_CHECK();
+  if (index >= sql.len) { *cursor = index; return 0; }
+  if (sql.ptr[index] == (uint8_t)';') return -1;
+  if (!ku_mysql_sql_keyword_byte(sql.ptr[index])
+      || (sql.ptr[index] >= (uint8_t)'0' && sql.ptr[index] <= (uint8_t)'9')) {
+    *cursor = index;
+    return 0;
+  }
+  *start = index;
+  while (index < sql.len && ku_mysql_sql_keyword_byte(sql.ptr[index])) {
+    KU_MYSQL_SQL_SCAN_CHECK();
+    index++;
+  }
+  *len = index - *start; *cursor = index;
+#undef KU_MYSQL_SQL_SCAN_CHECK
+  return 1;
+}
+
+/* This is deliberately a narrow policy guard, not a proof of session purity:
+   SQL can call stored routines or vendor extensions. Protocol state is checked
+   again after execution, and every reusable connection is reset. */
+static int ku_mysql_sql_has_explicit_session_control(
+    KuString sql, unsigned long long deadline) {
+  size_t cursor = 0, start = 0, len = 0;
+  int token = ku_mysql_sql_next_top_token(
+      sql, &cursor, &start, &len, deadline);
+  if (token <= 0) return token;
+  static const char* const forbidden[] = {
+    "begin", "start", "commit", "rollback", "savepoint", "release",
+    "set", "reset", "lock", "unlock", "use", "xa", "prepare",
+    "execute", "deallocate", "handler", "flush"
+  };
+  for (size_t index = 0;
+       index < sizeof(forbidden) / sizeof(forbidden[0]); index++) {
+    if (ku_mysql_sql_token_equals(sql, start, len, forbidden[index])) return 1;
+  }
+  bool create_statement = ku_mysql_sql_token_equals(sql, start, len, "create");
+  bool drop_statement = ku_mysql_sql_token_equals(sql, start, len, "drop");
+  if (create_statement || drop_statement) {
+    token = ku_mysql_sql_next_top_token(
+        sql, &cursor, &start, &len, deadline);
+    if (token <= 0) return token;
+    if (create_statement && ku_mysql_sql_token_equals(sql, start, len, "or")) {
+      token = ku_mysql_sql_next_top_token(
+          sql, &cursor, &start, &len, deadline);
+      if (token <= 0) return token;
+      if (!ku_mysql_sql_token_equals(sql, start, len, "replace")) return 0;
+      token = ku_mysql_sql_next_top_token(
+          sql, &cursor, &start, &len, deadline);
+      if (token <= 0) return token;
+    }
+    if (ku_mysql_sql_token_equals(sql, start, len, "temporary")) return 1;
+  }
+  return 0;
+}
+
+static KuError ku_mysql_session_state_error(void) {
+  return ku_mysql_error(
+      "session_state_unsupported",
+      "MySQL client operations cannot retain transaction or session state; use a future exclusive transaction API");
+}
+
 static bool ku_mysql_validate_statement_input(
-    KuString sql, KuArray_str params, KuError* error) {
-  if ((sql.len && !sql.ptr) || sql.len > KU_MYSQL_MAX_SQL_BYTES) {
+    KuString sql, KuArray_str params, KuError* error,
+    unsigned long long deadline) {
+  if (__ku_handler_now_ms() >= deadline) {
+    *error = ku_mysql_error("query_timeout", "MySQL query budget expired");
+    return false;
+  }
+  if (sql.len && !sql.ptr) {
+    *error = ku_mysql_error("query_error", "MySQL SQL storage is invalid");
+    return false;
+  }
+  if (sql.len > KU_MYSQL_MAX_SQL_BYTES) {
     *error = ku_mysql_error("query_too_large", "MySQL SQL text exceeds its limit");
     return false;
   }
-  if (!ku_mysql_utf8_valid(sql.ptr, sql.len)) {
+  int has_nul = ku_mysql_string_has_nul_until(sql, deadline);
+  if (has_nul < 0) {
+    *error = ku_mysql_error("query_timeout", "MySQL query budget expired");
+    return false;
+  }
+  if (has_nul > 0) {
+    *error = ku_mysql_error("query_error", "MySQL SQL text contains a NUL byte");
+    return false;
+  }
+  int valid_sql = ku_mysql_utf8_valid_until(sql.ptr, sql.len, deadline);
+  if (valid_sql < 0) {
+    *error = ku_mysql_error("query_timeout", "MySQL query budget expired");
+    return false;
+  }
+  if (valid_sql == 0) {
     *error = ku_mysql_error("invalid_utf8", "MySQL SQL text is not valid UTF-8");
+    return false;
+  }
+  int executable_comment =
+      ku_mysql_sql_contains_executable_comment(sql, deadline);
+  if (executable_comment < 0) {
+    *error = ku_mysql_error("query_timeout", "MySQL query budget expired");
+    return false;
+  }
+  if (executable_comment > 0) {
+    *error = ku_mysql_session_state_error();
+    return false;
+  }
+  int session_control =
+      ku_mysql_sql_has_explicit_session_control(sql, deadline);
+  if (session_control == -2) {
+    *error = ku_mysql_error("query_timeout", "MySQL query budget expired");
+    return false;
+  }
+  if (session_control != 0) {
+    *error = ku_mysql_session_state_error();
     return false;
   }
   if (params.len > KU_MYSQL_MAX_PARAMS || (params.len && !params.data)) {
@@ -8240,6 +8583,10 @@ static bool ku_mysql_validate_statement_input(
   }
   size_t total = 0;
   for (size_t index = 0; index < params.len; index++) {
+    if (__ku_handler_now_ms() >= deadline) {
+      *error = ku_mysql_error("query_timeout", "MySQL query budget expired");
+      return false;
+    }
     KuString value = params.data[index];
     if ((value.len && !value.ptr)
         || value.len > KU_MYSQL_MAX_CELL_BYTES
@@ -8249,12 +8596,21 @@ static bool ku_mysql_validate_statement_input(
           "parameter_too_large", "MySQL parameter data exceeds its limit");
       return false;
     }
-    if (!ku_mysql_utf8_valid(value.ptr, value.len)) {
+    int valid_param = ku_mysql_utf8_valid_until(value.ptr, value.len, deadline);
+    if (valid_param < 0) {
+      *error = ku_mysql_error("query_timeout", "MySQL query budget expired");
+      return false;
+    }
+    if (valid_param == 0) {
       *error = ku_mysql_error(
           "invalid_utf8", "MySQL parameter text is not valid UTF-8");
       return false;
     }
     total += value.len;
+  }
+  if (__ku_handler_now_ms() >= deadline) {
+    *error = ku_mysql_error("query_timeout", "MySQL query budget expired");
+    return false;
   }
   return true;
 }
@@ -8611,7 +8967,7 @@ static KuResult_mysql_result ku_mysql_client_query(
     };
   }
   unsigned long long deadline = ku_mysql_deadline(client->query_timeout_ms);
-  if (!ku_mysql_validate_statement_input(sql, params, &error)) {
+  if (!ku_mysql_validate_statement_input(sql, params, &error, deadline)) {
     return (KuResult_mysql_result){ false, NULL, error };
   }
   if (!ku_mysql_thread_enter()) {
@@ -8643,6 +8999,12 @@ static KuResult_mysql_result ku_mysql_client_query(
     if (!result) broken = true;
     ku_mysql_statement_close_checked(&statement, true, &broken);
   }
+  if (result && !ku_mysql_session_state_is_supported(connection)) {
+    ku_mysql_result_free(result);
+    result = NULL;
+    error = ku_mysql_session_state_error();
+    broken = true;
+  }
   ku_mysql_release(client, slot_index, broken, deadline);
   ku_mysql_thread_leave();
   if (!result) return (KuResult_mysql_result){ false, NULL, error };
@@ -8658,7 +9020,7 @@ static KuResult_int ku_mysql_client_execute(
     };
   }
   unsigned long long deadline = ku_mysql_deadline(client->query_timeout_ms);
-  if (!ku_mysql_validate_statement_input(sql, params, &error)) {
+  if (!ku_mysql_validate_statement_input(sql, params, &error, deadline)) {
     return (KuResult_int){ false, 0, error };
   }
   if (!ku_mysql_thread_enter()) {
@@ -8707,6 +9069,12 @@ static KuResult_int ku_mysql_client_execute(
       }
     }
     ku_mysql_statement_close_checked(&statement, true, &broken);
+  }
+  if (ok && !ku_mysql_session_state_is_supported(connection)) {
+    affected = 0;
+    error = ku_mysql_session_state_error();
+    broken = true;
+    ok = false;
   }
   ku_mysql_release(client, slot_index, broken, deadline);
   ku_mysql_thread_leave();
@@ -10777,7 +11145,7 @@ fn emit_pg_types(out: &mut String, program: &IrProgram) {
     ));
 }
 
-/// Emit the `pg` (thin libpq binding) runtime: link pragma, `PQ*` prototypes, the
+/// Emit the `pg` (thin libpq binding) runtime: `PQ*` prototypes, the
 /// opaque-handle move/clone/drop helpers (drop closes/frees the C resource), and the
 /// private query machinery. Emitted after the Result ABI so `KuResult_pg_result` exists.
 /// Values come back as text (libpq text mode). Connections are pinned to UTF-8 and
@@ -10789,11 +11157,7 @@ fn emit_pg_runtime(out: &mut String, program: &IrProgram) {
         return;
     }
     out.push_str(concat!(
-        "#if defined(_MSC_VER)\n",
-        // The library NAME is fixed; the CLI supplies the search path (/LIBPATH) from
-        // KU_PG_LIB / `pg_config --libdir` / a default, so no absolute path is baked in.
-        "#pragma comment(lib, \"libpq.lib\")\n",
-        "#endif\n",
+        "#define KU_FEATURE_LIBPQ 1\n",
         "extern PGconn* PQconnectStartParams(const char* const*, const char* const*, int);\n",
         "extern int PQconnectPoll(PGconn*);\n",
         "extern int PQsocket(const PGconn*);\n",
@@ -10900,7 +11264,7 @@ fn emit_pg_runtime(out: &mut String, program: &IrProgram) {
         "}\n",
         "static void ku_pg_wipe_secret(void* pointer, size_t len) { volatile uint8_t* bytes = (volatile uint8_t*)pointer; while (bytes && len) { *bytes++ = 0; len--; } }\n",
         "static KuError ku_pg_query_timeout_error(void) {\n",
-        "  return ku_pg_static_error(\"query_timeout\", sizeof(\"query_timeout\") - 1, \"PostgreSQL query timed out; execution outcome may be unknown; close and reconnect\", sizeof(\"PostgreSQL query timed out; execution outcome may be unknown; close and reconnect\") - 1);\n",
+        "  return ku_pg_static_error(\"query_timeout\", sizeof(\"query_timeout\") - 1, \"PostgreSQL query budget expired before the requested statement was sent\", sizeof(\"PostgreSQL query budget expired before the requested statement was sent\") - 1);\n",
         "}\n",
         "static int ku_pg_query_check_deadline(unsigned long long deadline, KuError* error) {\n",
         "  if (!ku_pg_deadline_expired(deadline)) return 1;\n",
@@ -10928,6 +11292,150 @@ fn emit_pg_runtime(out: &mut String, program: &IrProgram) {
         "  }\n",
         "  return !ku_pg_deadline_expired(deadline);\n",
         "}\n",
+        r#"static int ku_pg_sql_keyword_byte(uint8_t value) {
+  return (value >= (uint8_t)'A' && value <= (uint8_t)'Z')
+      || (value >= (uint8_t)'a' && value <= (uint8_t)'z')
+      || (value >= (uint8_t)'0' && value <= (uint8_t)'9')
+      || value == (uint8_t)'_';
+}
+static int ku_pg_sql_token_equals(
+    KuString sql, size_t start, size_t len, const char* expected) {
+  size_t expected_len = strlen(expected);
+  if (len != expected_len) return 0;
+  for (size_t index = 0; index < len; index++) {
+    uint8_t value = sql.ptr[start + index];
+    if (value >= (uint8_t)'A' && value <= (uint8_t)'Z') value += 32;
+    if (value != (uint8_t)expected[index]) return 0;
+  }
+  return 1;
+}
+/* PostgreSQL has `--` and nestable block comments, but `#` is not a line
+   comment. Return 1 for a token, 0 for end/non-keyword input, -1 for
+   fail-closed syntax, and -2 when the absolute operation deadline expires.
+   The caller has already capped sql.len at KU_PG_MAX_SQL_BYTES; the scanner
+   additionally checks its time budget at least every 4096 input bytes. */
+static int ku_pg_sql_next_top_token(
+    KuString sql, size_t* cursor, size_t* start, size_t* len,
+    unsigned long long deadline) {
+  size_t index = *cursor;
+  size_t next_deadline_check = index;
+  for (;;) {
+#define KU_PG_SQL_SCAN_CHECK() do { \
+  if (index >= next_deadline_check) { \
+    if (ku_pg_deadline_expired(deadline)) return -2; \
+    next_deadline_check = SIZE_MAX - index < 4096 ? SIZE_MAX : index + 4096; \
+  } \
+} while (0)
+    while (index < sql.len) {
+      KU_PG_SQL_SCAN_CHECK();
+      uint8_t value = sql.ptr[index];
+      if (value != (uint8_t)' ' && value != (uint8_t)'\t'
+          && value != (uint8_t)'\r' && value != (uint8_t)'\n'
+          && value != (uint8_t)'\f') break;
+      index++;
+    }
+    if (index == 0 && sql.len >= 3 && sql.ptr[0] == 0xef
+        && sql.ptr[1] == 0xbb && sql.ptr[2] == 0xbf) {
+      index = 3;
+      continue;
+    }
+    if (index + 1 < sql.len && sql.ptr[index] == (uint8_t)'-'
+        && sql.ptr[index + 1] == (uint8_t)'-') {
+      index += 2;
+      while (index < sql.len && sql.ptr[index] != (uint8_t)'\n'
+          && sql.ptr[index] != (uint8_t)'\r') {
+        KU_PG_SQL_SCAN_CHECK();
+        index++;
+      }
+      continue;
+    }
+    if (index + 1 < sql.len && sql.ptr[index] == (uint8_t)'/'
+        && sql.ptr[index + 1] == (uint8_t)'*') {
+      size_t depth = 1;
+      index += 2;
+      while (index < sql.len && depth != 0) {
+        KU_PG_SQL_SCAN_CHECK();
+        if (index + 1 < sql.len && sql.ptr[index] == (uint8_t)'/'
+            && sql.ptr[index + 1] == (uint8_t)'*') {
+          if (depth == SIZE_MAX) return -1;
+          depth++; index += 2; continue;
+        }
+        if (index + 1 < sql.len && sql.ptr[index] == (uint8_t)'*'
+            && sql.ptr[index + 1] == (uint8_t)'/') {
+          depth--; index += 2; continue;
+        }
+        index++;
+      }
+      if (depth != 0) return -1;
+      continue;
+    }
+    break;
+  }
+  KU_PG_SQL_SCAN_CHECK();
+  if (index >= sql.len) { *cursor = index; return 0; }
+  if (sql.ptr[index] == (uint8_t)';') return -1;
+  if (!ku_pg_sql_keyword_byte(sql.ptr[index])
+      || (sql.ptr[index] >= (uint8_t)'0' && sql.ptr[index] <= (uint8_t)'9')) {
+    *cursor = index;
+    return 0;
+  }
+  *start = index;
+  while (index < sql.len && ku_pg_sql_keyword_byte(sql.ptr[index])) {
+    KU_PG_SQL_SCAN_CHECK();
+    index++;
+  }
+  *len = index - *start; *cursor = index;
+#undef KU_PG_SQL_SCAN_CHECK
+  return 1;
+}
+/* This only rejects explicit transaction/session-control statements. It does
+   not claim to prove arbitrary SQL session-pure: functions, procedures and
+   extensions may have hidden effects. The pooled path also checks libpq's
+   post-execution protocol state and resets an idle connection before reuse. */
+static int ku_pg_sql_has_explicit_session_control(
+    KuString sql, unsigned long long deadline) {
+  size_t cursor = 0, start = 0, len = 0;
+  int token = ku_pg_sql_next_top_token(
+      sql, &cursor, &start, &len, deadline);
+  if (token <= 0) return token;
+  static const char* const forbidden[] = {
+    "begin", "start", "commit", "end", "rollback", "abort",
+    "savepoint", "release", "set", "reset", "discard", "declare",
+    "fetch", "move", "close", "copy", "listen", "unlisten", "notify",
+    "lock", "prepare", "execute", "deallocate", "load"
+  };
+  for (size_t index = 0;
+       index < sizeof(forbidden) / sizeof(forbidden[0]); index++) {
+    if (ku_pg_sql_token_equals(sql, start, len, forbidden[index])) return 1;
+  }
+  int create_statement = ku_pg_sql_token_equals(sql, start, len, "create");
+  int drop_statement = ku_pg_sql_token_equals(sql, start, len, "drop");
+  if (create_statement || drop_statement) {
+    token = ku_pg_sql_next_top_token(
+        sql, &cursor, &start, &len, deadline);
+    if (token <= 0) return token;
+    if (create_statement && ku_pg_sql_token_equals(sql, start, len, "or")) {
+      token = ku_pg_sql_next_top_token(
+          sql, &cursor, &start, &len, deadline);
+      if (token <= 0) return token;
+      if (!ku_pg_sql_token_equals(sql, start, len, "replace")) return 0;
+      token = ku_pg_sql_next_top_token(
+          sql, &cursor, &start, &len, deadline);
+      if (token <= 0) return token;
+    }
+    if (create_statement
+        && (ku_pg_sql_token_equals(sql, start, len, "global")
+            || ku_pg_sql_token_equals(sql, start, len, "local"))) {
+      token = ku_pg_sql_next_top_token(
+          sql, &cursor, &start, &len, deadline);
+      if (token <= 0) return token;
+    }
+    if (ku_pg_sql_token_equals(sql, start, len, "temp")
+        || ku_pg_sql_token_equals(sql, start, len, "temporary")) return 1;
+  }
+  return 0;
+}
+"#,
         /* A libpq connection error may echo arbitrary conninfo fields, including
            passwords. Never copy or print it on an initial connection path. */
         "static KuString ku_pg_connection_failure_message(void) {\n",
@@ -10941,6 +11449,19 @@ fn emit_pg_runtime(out: &mut String, program: &IrProgram) {
         "}\n",
         "static KuError ku_pg_client_error(const char* code, size_t code_len, const char* message, size_t message_len) {\n",
         "  return ku_pg_static_error(code, code_len, message, message_len);\n",
+        "}\n",
+        "static int ku_pg_validate_sql_input(KuString sql, KuError* error, unsigned long long deadline) {\n",
+        "  if (error) *error = (KuError){0};\n",
+        "  if (!ku_pg_query_check_deadline(deadline, error)) return 0;\n",
+        "  if (sql.len == SIZE_MAX || (sql.len && !sql.ptr)) { if (error) *error = ku_pg_static_error(\"query_error\", sizeof(\"query_error\") - 1, \"SQL storage is invalid\", sizeof(\"SQL storage is invalid\") - 1); return 0; }\n",
+        "  if (sql.len > KU_PG_MAX_SQL_BYTES) { if (error) *error = ku_pg_static_error(\"query_too_large\", sizeof(\"query_too_large\") - 1, \"PostgreSQL SQL text exceeds its limit\", sizeof(\"PostgreSQL SQL text exceeds its limit\") - 1); return 0; }\n",
+        "  int has_nul = ku_pg_string_has_nul_until(sql, deadline);\n",
+        "  if (!ku_pg_query_check_deadline(deadline, error)) return 0;\n",
+        "  if (has_nul != 0) { if (error) *error = ku_pg_static_error(\"query_error\", sizeof(\"query_error\") - 1, \"SQL contains a NUL byte\", sizeof(\"SQL contains a NUL byte\") - 1); return 0; }\n",
+        "  int valid = ku_pg_utf8_valid(sql.ptr, sql.len, deadline);\n",
+        "  if (!ku_pg_query_check_deadline(deadline, error)) return 0;\n",
+        "  if (valid != 1) { if (error) *error = ku_pg_static_error(\"invalid_utf8\", sizeof(\"invalid_utf8\") - 1, \"PostgreSQL SQL text is not valid UTF-8\", sizeof(\"PostgreSQL SQL text is not valid UTF-8\") - 1); return 0; }\n",
+        "  return 1;\n",
         "}\n",
         "static int ku_pg_validate_query_params(KuArray_str params, size_t* total_bytes, KuError* error, unsigned long long deadline) {\n",
         "  if (total_bytes) *total_bytes = 0;\n",
@@ -11422,18 +11943,10 @@ static KuResult_pg_result ku_pg_finish_query(PGconn* conn, KuPgQuery query, unsi
   if (ku_pg_deadline_expired(deadline)) { ku_drop_pg_result(&value); ku_pg_break_connection(conn, broken); return (KuResult_pg_result){ false, 0, ku_pg_execution_completed_without_result_error() }; }
   return (KuResult_pg_result){ true, value, (KuError){0} };
 }
-static KuResult_pg_result ku_pg_query_prepared_until(PGconn* conn, KuString sql, int parameterized, int count, const char* const* values, unsigned long long deadline, int* broken) {
+static KuResult_pg_result ku_pg_query_prepared_validated_until(PGconn* conn, KuString sql, int parameterized, int count, const char* const* values, unsigned long long deadline, int* broken) {
   if (broken) *broken = 0;
   if (!conn) return (KuResult_pg_result){ false, 0, ku_pg_static_error("query_error", sizeof("query_error") - 1, "connection is closed", sizeof("connection is closed") - 1) };
   if (ku_pg_deadline_expired(deadline)) return (KuResult_pg_result){ false, 0, ku_pg_query_timeout_error() };
-  if (sql.len == SIZE_MAX || (sql.len && !sql.ptr)) return (KuResult_pg_result){ false, 0, ku_pg_static_error("query_error", sizeof("query_error") - 1, "SQL storage is invalid", sizeof("SQL storage is invalid") - 1) };
-  if (sql.len > KU_PG_MAX_SQL_BYTES) return (KuResult_pg_result){ false, 0, ku_pg_static_error("query_too_large", sizeof("query_too_large") - 1, "PostgreSQL SQL text exceeds its limit", sizeof("PostgreSQL SQL text exceeds its limit") - 1) };
-  int has_nul = ku_pg_string_has_nul_until(sql, deadline);
-  if (ku_pg_deadline_expired(deadline)) return (KuResult_pg_result){ false, 0, ku_pg_query_timeout_error() };
-  if (has_nul) return (KuResult_pg_result){ false, 0, ku_pg_static_error("query_error", sizeof("query_error") - 1, "SQL contains a NUL byte", sizeof("SQL contains a NUL byte") - 1) };
-  int valid = ku_pg_utf8_valid(sql.ptr, sql.len, deadline);
-  if (ku_pg_deadline_expired(deadline)) return (KuResult_pg_result){ false, 0, ku_pg_query_timeout_error() };
-  if (valid != 1) return (KuResult_pg_result){ false, 0, ku_pg_static_error("invalid_utf8", sizeof("invalid_utf8") - 1, "PostgreSQL SQL text is not valid UTF-8", sizeof("PostgreSQL SQL text is not valid UTF-8") - 1) };
   char* query = (char*)malloc(sql.len + 1);
   if (!query) return (KuResult_pg_result){ false, 0, ku_pg_static_error("out_of_memory", sizeof("out_of_memory") - 1, "failed to allocate PostgreSQL SQL buffer", sizeof("failed to allocate PostgreSQL SQL buffer") - 1) };
   if (!ku_pg_copy_until(query, sql.ptr, sql.len, deadline)) { free(query); return (KuResult_pg_result){ false, 0, ku_pg_query_timeout_error() }; }
@@ -11443,6 +11956,13 @@ static KuResult_pg_result ku_pg_query_prepared_until(PGconn* conn, KuString sql,
   KuPgQuery result = ku_pg_run_query_until(conn, query, parameterized, count, values, deadline, broken);
   free(query);
   return ku_pg_finish_query(conn, result, deadline, broken);
+}
+static KuResult_pg_result ku_pg_query_prepared_until(PGconn* conn, KuString sql, int parameterized, int count, const char* const* values, unsigned long long deadline, int* broken) {
+  if (broken) *broken = 0;
+  if (!conn) return (KuResult_pg_result){ false, 0, ku_pg_static_error("query_error", sizeof("query_error") - 1, "connection is closed", sizeof("connection is closed") - 1) };
+  KuError sql_error = (KuError){0};
+  if (!ku_pg_validate_sql_input(sql, &sql_error, deadline)) return (KuResult_pg_result){ false, 0, sql_error };
+  return ku_pg_query_prepared_validated_until(conn, sql, parameterized, count, values, deadline, broken);
 }
 static KuResult_pg_result ku_pg_query_impl(PGconn* conn, KuString sql, unsigned long long deadline, int* broken) {
   return ku_pg_query_prepared_until(conn, sql, 0, 0, 0, deadline, broken);
@@ -11456,6 +11976,14 @@ static KuResult_pg_result ku_pg_query_params_validated_impl(PGconn* conn, KuStri
   KuPgPreparedParams prepared; KuError prepare_error = (KuError){0};
   if (!ku_pg_prepare_query_params(params, param_bytes, &prepared, &prepare_error, deadline)) return (KuResult_pg_result){ false, 0, prepare_error };
   KuResult_pg_result result = ku_pg_query_prepared_until(conn, sql, 1, (int)params.len, prepared.values, deadline, broken);
+  ku_pg_drop_prepared_params(&prepared);
+  return result;
+}
+static KuResult_pg_result ku_pg_query_params_all_validated_impl(PGconn* conn, KuString sql, KuArray_str params, size_t param_bytes, unsigned long long deadline, int* broken) {
+  if (broken) *broken = 0;
+  KuPgPreparedParams prepared; KuError prepare_error = (KuError){0};
+  if (!ku_pg_prepare_query_params(params, param_bytes, &prepared, &prepare_error, deadline)) return (KuResult_pg_result){ false, 0, prepare_error };
+  KuResult_pg_result result = ku_pg_query_prepared_validated_until(conn, sql, 1, (int)params.len, prepared.values, deadline, broken);
   ku_pg_drop_prepared_params(&prepared);
   return result;
 }
@@ -11729,12 +12257,17 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "static KuResult_pg_result ku_pg_client_query(KuPgClient* p, KuString sql, KuArray_str params) {\n",
             "  if (!p) return (KuResult_pg_result){ false, 0, ku_pg_client_error(\"client_closed\", sizeof(\"client_closed\") - 1, \"PostgreSQL client is closed\", sizeof(\"PostgreSQL client is closed\") - 1) };\n",
             "  unsigned long long deadline = ku_pg_deadline_after_ms(p->query_timeout_ms);\n",
+            "  KuError sql_error = (KuError){0}; if (!ku_pg_validate_sql_input(sql, &sql_error, deadline)) return (KuResult_pg_result){ false, 0, sql_error };\n",
+            "  int session_control = ku_pg_sql_has_explicit_session_control(sql, deadline);\n",
+            "  if (session_control == -2) return (KuResult_pg_result){ false, 0, ku_pg_query_timeout_error() };\n",
+            "  if (session_control != 0) return (KuResult_pg_result){ false, 0, ku_pg_client_error(\"session_state_unsupported\", sizeof(\"session_state_unsupported\") - 1, \"PostgreSQL client.query does not accept explicit transaction or session-control SQL; use a future exclusive transaction API\", sizeof(\"PostgreSQL client.query does not accept explicit transaction or session-control SQL; use a future exclusive transaction API\") - 1) };\n",
             "  size_t param_bytes = 0; KuError param_error = (KuError){0};\n",
             "  if (!ku_pg_validate_query_params(params, &param_bytes, &param_error, deadline)) return (KuResult_pg_result){ false, 0, param_error };\n",
             "  PGconn* c = 0; KuError err = (KuError){0};\n",
             "  int slot = ku_pg_client_acquire(p, &c, &err, deadline);\n",
             "  if (slot < 0) return (KuResult_pg_result){ false, 0, err };\n",
-            "  int broken = 0; KuResult_pg_result r = ku_pg_query_params_validated_impl(c, sql, params, param_bytes, deadline, &broken);\n",
+            "  int broken = 0; KuResult_pg_result r = ku_pg_query_params_all_validated_impl(c, sql, params, param_bytes, deadline, &broken);\n",
+            "  if (r.ok && PQtransactionStatus(c) != KU_PQTRANS_IDLE) { ku_drop_pg_result(&r.value); r = (KuResult_pg_result){ false, 0, ku_pg_client_error(\"session_state_unsupported\", sizeof(\"session_state_unsupported\") - 1, \"PostgreSQL client.query cannot retain transaction or COPY state; use a future exclusive transaction API\", sizeof(\"PostgreSQL client.query cannot retain transaction or COPY state; use a future exclusive transaction API\") - 1) }; broken = 1; }\n",
             "  ku_pg_client_release(p, slot, broken || PQstatus(c) != KU_PG_CONNECTION_OK, deadline);\n",
             "  return r;\n",
             "}\n",

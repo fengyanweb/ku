@@ -2646,6 +2646,26 @@ fn main(): null! {
 "#,
             "cache",
         ),
+        (
+            "http-handler-close-mysql-client.ku",
+            r#"
+import "std.http"
+import mysql from "std.mysql"
+fn main(): null! {
+    client = mysql.client({
+        host: "127.0.0.1", user: "user", password: "password", database: "db",
+        max_connections: 1
+    })?
+    app = http.service()
+    app.get("/close", fn() {
+        client.close()
+        return http.text("closed")
+    })
+    return ok(null)
+}
+"#,
+            "client",
+        ),
     ] {
         rejects(
             name,
