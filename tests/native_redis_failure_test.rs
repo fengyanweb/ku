@@ -89,7 +89,7 @@ fn main(): null! {
         .split_once("static void ku_redis_connection_destroy(KuRedis* connection) {")
         .expect("generated Redis connection destructor")
         .1
-        .split_once("#if defined(_WIN32)\nstatic INIT_ONCE")
+        .split_once("#if defined(_WIN32)\nstatic int ku_redis_ensure_wsa(void)")
         .expect("generated Redis connection destructor end")
         .0;
     assert!(
