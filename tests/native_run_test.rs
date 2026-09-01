@@ -4946,6 +4946,54 @@ fn native_bool_println() {
 }
 
 #[test]
+fn native_integer_comparisons_preserve_i64_precision() {
+    let dir = unique_temp_dir("i64-compare");
+    fs::write(
+        dir.join("main.ku"),
+        r#"fn assert_ordered(lower: int, higher: int) {
+    if (!(lower < higher)) panic("less")
+    if (!(lower <= higher)) panic("less equal ordered")
+    if (lower > higher) panic("greater reversed")
+    if (lower >= higher) panic("greater equal reversed")
+    if (lower == higher) panic("equal distinct")
+    if (!(lower != higher)) panic("not equal distinct")
+
+    if (higher < lower) panic("less reversed")
+    if (higher <= lower) panic("less equal reversed")
+    if (!(higher > lower)) panic("greater")
+    if (!(higher >= lower)) panic("greater equal ordered")
+
+    if (lower < lower) panic("less equal values")
+    if (!(lower <= lower)) panic("less equal equal values")
+    if (lower > lower) panic("greater equal values")
+    if (!(lower >= lower)) panic("greater equal equal values")
+    if (!(lower == lower)) panic("equal same")
+    if (lower != lower) panic("not equal same")
+}
+
+fn main(): null! {
+    minimum = -9223372036854775807 - 1
+    assert_ordered(minimum, -9223372036854775807)
+    assert_ordered(9223372036854775806, 9223372036854775807)
+    println("ok")
+    return ok(null)
+}
+"#,
+    )
+    .expect("write main.ku");
+
+    let Some(exe) = native_build(&dir, "main.ku", "i64compare") else {
+        return;
+    };
+
+    let (stdout, code) = run_binary(&exe);
+    assert_eq!(stdout.replace('\r', ""), "ok\n");
+    assert_eq!(code, Some(0));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_call_depth_guard_matches_interpreter() {
     // Stage 6f: deep/infinite recursion reports "maximum function call depth
     // exceeded" and exits cleanly (code 1) instead of a native stack-overflow
