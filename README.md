@@ -192,15 +192,17 @@ fn main(): null! {
 ```
 
 - **统一写法**：三个驱动都只公开 `module.client(config)?`，client 内部自动维护有界连接池；业务代码只调用 receiver 方法。连接数和等待者数有硬上限，所有操作共享绝对预算；同步 DNS、libpq/SSL 内部调用和 libmysqlclient FFI 不能被 portable C 硬抢占，只能在返回后复核 deadline 并淘汰过期连接。0.0.x 直接删除旧 raw connection、手动 pool 和模块级 query 入口，不提供兼容别名。构造前配置校验统一返回 `invalid_config`；client/池层跨驱动统一为 `client_closed`、`pool_busy`、`acquire_timeout`、`connect_timeout`、`connect_error`、`sync_error`、`out_of_memory`，阶段和重试边界见[版本记录](docs/v0.0.16.md#数据库驱动stdpg--stdredis--stdmysql)。
-- **std.pg**（libpq 9.2+）：`client.query(sql, params)` 始终走服务端参数绑定，无参数也传 `[]`；`result.rows()` / `cols()` / `value()` / `is_null()` 读取与连接脱钩的 owned 结果。内部复用 nonblocking poll、单行增量聚合、严格 UTF-8/NULL/边界与 64 MiB 文本上限；每次归还前在原 query deadline 内执行 `DISCARD ALL`，非 IDLE、reset 失败、超时或协议失步只淘汰对应连接，不自动重放 SQL。
+- **std.pg**（libpq 9.2+）：`client.query(sql, params)` 始终走服务端参数绑定，无参数也传 `[]`；`result.rows()` / `cols()` / `value()` / `is_null()` 读取与连接脱钩的 owned 结果。内部复用 nonblocking poll、单行增量聚合、严格 UTF-8/NULL/边界与 64 MiB 文本上限。明确识别出的 transaction/session-control SQL 在借连接前返回 `pg/session_state_unsupported`；成功响应若留下非 IDLE 状态会丢弃 payload、返回同一错误并淘汰连接。其余成功查询在原 deadline 内执行 `DISCARD ALL`，reset 失败、超时或协议失步淘汰对应连接，不自动重放 SQL。
 - **std.redis**（自实现 RESP2-over-socket，零外部依赖）：client 配置中的用户名/密码会应用到每条懒创建连接；提供 `ping/get/set/exists/del`。`get` 只有一种严格语义：缺键返回 `redis/key_not_found`，不再把缺键折叠为空串。坏帧或 I/O 超时只淘汰对应连接；AUTH 拒绝、建连 transport、建连 timeout、池 timeout、命令 timeout 和 OOM 分阶段返回固定错误，服务端文本不直接进入诊断。
-- **std.mysql**（libmysqlclient）：`client.query(sql, params)` 和 `client.execute(sql, params)` 都使用真正的 `MYSQL_STMT` 参数绑定，不再做 escape 后的 SQL 拼接；结果复制到 Ku owned、有上限的表后再归还连接。statement 清理后调用 `mysql_reset_connection()` 清除事务、临时表、锁和 session 变量，清理/reset 失败即淘汰单槽；自动 reconnect 与 `LOCAL INFILE` 都显式关闭。当前不支持 SQL NULL 输入参数和任意 binary 列。
+- **std.mysql**（libmysqlclient）：`client.query(sql, params)` 和 `client.execute(sql, params)` 都使用真正的 `MYSQL_STMT` 参数绑定，不再做 escape 后的 SQL 拼接；结果复制到 Ku owned、有上限的表后再归还连接。明确识别出的 transaction/session-control SQL 在执行前返回 `mysql/session_state_unsupported`；执行后若 server status 显示事务未结束或 autocommit 被关闭，会丢弃 payload、返回同一错误并淘汰单槽。普通完成路径仍调用 `mysql_reset_connection()`，清理/reset 失败也淘汰单槽；自动 reconnect 与 `LOCAL INFILE` 都显式关闭。client library 一次性初始化前会核对 header family/ABI major 与运行库的 numeric/string version，错配固定返回 `mysql/client_abi_mismatch`，且不会进入 library init、连接或 statement API。当前不支持 SQL NULL 输入参数和任意 binary 列。
+
+前置 SQL 识别是 fail-closed 的有限语法防线，不是任意 SQL “session purity”的证明。存储过程、扩展函数或表达式仍可能产生驱动无法从 SQL 文本完整判定的会话、全局或外部副作用；普通 pooled client 不支持依赖跨调用保留的 session 状态，也不提供 transaction/exclusive 逃生门。后置状态检查和 reset 负责保护下一位借用者，但不能把已执行 SQL 的副作用回滚成“从未发生”。共享 client 不接受不受信任方提供的任意 SQL；生产账号必须最小权限，PG 不使用 superuser，MySQL/MariaDB 不授予 `SYSTEM_VARIABLES_ADMIN`、`RELOAD`、`FILE` 等业务查询不需要的管理权限。
 
 SQL 错误有一条必须遵守的重试边界：语句发送前的配置、连接和借用失败保留各自错误；语句发送后无法确认终态返回 `execution_unknown`，已收到成功终态但本地结果无法交付返回 `execution_completed_without_result`。这两个错误都表示不能自动重试，否则 INSERT/UPDATE 可能重复执行。驱动自身从不重放 SQL。各结果上限是单次结果的防护，不是进程总内存硬上限；并发持有多个 detached result 时仍应使用进程级资源限制。
 
 Redis 当前是明文 TCP，MySQL 当前也没有跨 Oracle/MariaDB 一致、fail-closed 的证书和主机名验证配置；二者只能直连 loopback/受控私网或已验证的 TLS tunnel。PostgreSQL 远程连接必须在 conninfo 中显式使用 `sslmode=verify-full` 和可信 `sslrootcert`。
 
-client 的 `close()` 消费 Ku owned 句柄并立即拒绝新借用；已有借用由最后一个归还者完成延迟销毁，不用无界等待来“关池”。该保证以 Ku checker/closure 生命周期为边界；当前生成的数据库 helper 是 translation-unit 内部实现，不是第三方 C ABI，外部 C 调用方不能绕过所有权和 MySQL thread attach 规则并发 close/use 裸指针。
+client 的 `close()` 消费 Ku owned 句柄并立即拒绝新借用；已经在池内登记的借用由最后一个归还者完成延迟销毁，不用无界等待来“关池”。该保证以 Ku checker/closure 生命周期为边界：client 不可 clone、close 后源值清空、只读 HTTP handler 不能消费外层 client。生成的数据库 helper 全部是 translation-unit 内部 `static` 实现，不是第三方 C ABI；绕过 checker 后让裸指针调用刚进入、尚未登记时与 close 并发，属于明确不支持的调用方式。
 
 连接恢复不会形成重拨风暴：一个 client 同时只执行一次懒建探测；失败退避窗口从 25ms 指数增长并封顶 1000ms，实际 equal-jitter 延迟落在 `ceil(window/2)..window`（首次 13～25ms）；健康空闲连接仍可立即借用。新请求必须先进入等待集合，不能以未排队身份直接夺取空闲槽；集合内由平台 condition variable 无序选择，不保证 FIFO 或无饥饿。`close()` 线性化前已开始的归还清理可能继续到完成，活动借用计数保证底层 client 不会被提前释放。
 
@@ -257,7 +259,7 @@ file dependency 的常规写法只需要版本和绝对 `file://` source；resol
 
 仓库已提供可自行部署的有界参考服务 `ku-registry`，并用真实 TLS listener 验证作者 publish、消费者 resolve/check/run/native、locked/offline、ACL、幂等、冲突、并发竞争和重启恢复。它不是官方托管 registry，也没有生产吞吐量或“超级高并发”基准结论。联网解析、相关锁等待、分块校验和重试共享一个 300 秒绝对预算；单次内核文件 I/O 与同步 DNS 不能硬取消，但返回后会再次检查且超时后不会开始 cache quarantine/安装。依赖图最多 256 个包、求解最多 20000 步，同一 package cache 根的全进程全局下载槽固定为 8 个。artifact 只接受稳定、无 query 的 HTTPS `.tar.zst` URL；签名不匹配时 index 与 `.sig` 最多重新配对获取 3 次。部署配置和掉电持久性边界见 [Registry API v1](docs/registry-api.md)。
 
-自托管 registry 的作者凭据只用离线运维命令：`ku-registry token issue <exact-package-name>` 生成 32-byte OS 随机 token、只保存 SHA-256 并把明文向 stdout 输出一次；撤销时把旧 token 放入 `KU_REGISTRY_TOKEN`，执行 `ku-registry token revoke <exact-package-name>`，不接受 token 命令行参数。凭据修改采用跨进程锁与同目录原子替换；运行中的服务不会热加载，修改后必须重启。它不是注册/登录、团队、包名认领或官方托管身份系统，完整边界见 [Registry API v1](docs/registry-api.md#启动自托管服务)。
+自托管 registry 已提供单一的离线治理路径：开发者 token、团队成员增删、包名认领/转移与 hash-chain 审计都通过 `ku-registry governance|developer|team|package|audit ...` 管理；token 由 OS 随机源生成，只保存 SHA-256，明文仅向 stdout 输出一次。旧 ACL 必须显式 `governance migrate`，迁移 token 保留原精确包 scope，不扩大权限。所有变更共享跨进程锁与同目录原子替换；运行中的服务不热加载，修改后必须重启。这里的“开发者/团队”是受信本机 operator 管理的自托管记录，不是在线注册/登录、外部不可抵赖审计或官方托管身份平台，完整命令、迁移和回滚边界见 [Registry API v1](docs/registry-api.md#启动自托管服务)。
 
 ## 示例
 
@@ -331,13 +333,15 @@ http_pg_frontend.html # http_pg 的前端页面
 
 `ku build` 当前生成解释器打包型可执行文件。单文件默认输出到源文件旁的 `.ku/build/<profile>/<name>`；有 `ku.mod` 时可以直接 `ku build` 或 `ku build .`，入口来自 `root + main`，默认 `src/main.ku`，输出目录来自 `out`，默认 `.ku/build`。支持 `-o` 指定输出、`--debug` / `--release` / `--profile debug|release|small|fast`、`--target` 目标目录分层、`--emit-ir`、`--emit-c`、`--emit-llvm` 和 `--backend c`。
 
-跨系统 native 发布只有一种构建方式：从同一份源码分别执行 `ku build --backend c --release --target x86_64-windows .`、`ku build --backend c --release --target x86_64-linux .`、`ku build --backend c --release --target aarch64-darwin .`，得到三个独立产物；不存在同时兼容三个系统的“万能二进制”。默认输出分别位于 `.ku/build/<target>/release/`，只有 Windows target 自动加 `.exe`。IR/C/LLVM 中间产物统一位于 `.ku/build/[<target>/]<profile>/{ir,c,llvm}/<binary-stem>.<ext>`；Windows 的 `app.exe` 对应 `app.ir`、`app.c`、`app.ll`。显式 `-o` 时三类目录都会增加完整输出路径的 SHA-256 层，即 `{ir,c,llvm}/<output-path-sha256>/<binary-stem>.<ext>`。这样同目录多入口、不同目录同名输出都不共享中间产物，也不会覆盖用户输出目录里的 `.c` 文件。缺 compiler、sysroot 或目标库时链接明确失败并保留 C artifact，不会降级生成 host 二进制。显式 target 的链接结果还会检查完整的 PE32+ x86_64、Linux ELF x86_64 或 macOS Mach-O arm64 头、表和可加载段，不匹配不会安装到最终路径。链接使用同目录的唯一 `.ku-link-*` 临时文件；每次最多扫描 256 个目录项、删除 16 个超过 24 小时的严格匹配普通文件，不会删除目录、符号链接或近期活动文件。`KU_CC` 可指定 `zig cc`、Clang，或已经配置好目标的交叉 compiler；普通 host `cc/gcc` 不会被当作自动支持 `--target`。
+跨系统 native 发布只有一种用户写法：在对应目标系统，或具备匹配 target 编译器、sysroot 和动态库的构建环境中，从同一份源码分别执行 `ku build --backend c --release --target x86_64-windows .`、`ku build --backend c --release --target x86_64-linux .`、`ku build --backend c --release --target aarch64-darwin .`。只有各命令成功且产物校验通过后，才能得到三个独立产物；不存在同时兼容三个系统的“万能二进制”。默认输出分别位于 `.ku/build/<target>/release/`，只有 Windows target 自动加 `.exe`。IR/C/LLVM 中间产物统一位于 `.ku/build/[<target>/]<profile>/{ir,c,llvm}/<binary-stem>.<ext>`；Windows 的 `app.exe` 对应 `app.ir`、`app.c`、`app.ll`。显式 `-o` 时三类目录都会增加完整输出路径的 SHA-256 层，即 `{ir,c,llvm}/<output-path-sha256>/<binary-stem>.<ext>`。这样同目录多入口、不同目录同名输出都不共享中间产物，也不会覆盖用户输出目录里的 `.c` 文件。缺 compiler、sysroot 或目标库时链接明确失败并保留 C artifact，不会降级生成 host 二进制。显式 target 的链接结果会检查完整的 PE32+ x86_64、Linux ELF x86_64 或 macOS Mach-O arm64 头、表和可加载段；使用数据库时还会有界解析 PE import、ELF `DT_NEEDED` 或 Mach-O dylib command，要求最终产物实际动态导入 libpq 以及本次选定的 MySQL/MariaDB family，静态或跨 family 回退不会安装。数据库链接输入从已打开且验证过的句柄复制到随机、私有、`create_new` 的临时目录，编译器只接收该副本；临时目录由 RAII 清理，不再按名字扫描或删除用户输出目录中的文件。`KU_CC` 可指定 `zig cc`、Clang，或已经配置好目标的交叉 compiler；普通 host `cc/gcc` 不会被当作自动支持 `--target`。
 
-注意：不带 `--native` 的默认 build 仍是解释器打包型二进制，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于 native ABI，带 import 的程序仍应保持源码依赖路径可访问。`ku build --native` 已通过本地 import graph 展开生成不依赖源码目录的 C/二进制，并已具备正式 `KuString`、array、dynamic object、Result/Error、closure/函数值以及 fs/json/time native ABI；剩余边界见下段，不再把这些已完成项列入待办。
+动态依赖验证不等于把数据库 runtime 打进二进制。发布机器仍必须让产物依赖表中记录的 libpq/libmysql/libmariadb 及其传递依赖对系统 loader 可见，并满足构建时的 target ABI；MySQL 在进程启动后的首次 `client()` 还会执行 header/runtime family-major 握手。Windows MySQL 常见安装需要把同一安装根的 `lib` 与 `bin` 都加入 `PATH`，因为 OpenSSL 等传递 DLL 可能位于 `bin`。
+
+注意：不带 `--native` 的默认 build 仍是解释器打包型二进制，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于 native ABI，带 import 的程序仍应保持源码依赖路径可访问。`ku build --native` 已通过本地 import graph 展开生成不依赖源码目录的 C/二进制，并已具备 `KuString`、array、dynamic object、Result/Error、closure/函数值以及 fs/json/time 的已实现 native ABI 子集；剩余边界见下段，不能把“ABI 主路径存在”解释成所有 payload、捕获形式和动态组合都已完成。
 
 `ku build --native <file.ku>` 不带 `-o` 时保留旧的单文件兼容模式，只在源码旁写出 `.c`，不执行链接；`ku build --native -o <path> <file.ku>` 则进入与 `--backend c` 相同的生成、编译、链接和产物校验流程。普通跨系统发布使用上面的 `--backend c --target` 命令，避免把“只生成 C”误认为已经得到目标二进制。
 
-native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制，覆盖 `int` / `bool` / `str`（正式 `KuString` owned ABI，支持拼接与 `str()`/`len`/`chars`/`contains`/`slice` 等方法）、struct（含数组/嵌套/enum 字段）、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包（env 引用计数）、native HTTP 服务以及数据库驱动（std.pg/redis/mysql）。array/named/Result/struct/闭包均按默认 move、显式 `clone()`、自动 drop 生成所有权代码，并由 checker 做路径级 move 分析。核心同步 ABI 与 `std.fs/std.json/std.time` 的 C 路径面向 Windows/Linux/macOS；native HTTP 与 Redis 也已有 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支，其中 Windows 已本地验证，Linux/macOS 仍待对应真机 CI 首次跑绿。`std.mysql` 尚无跨 target 自动链接约定，`std.pg` 跨 target 需要匹配目标的 shared libpq/sysroot。仍明确报不支持的：动态 object 的部分复杂场景、async native lowering、str 的 `trim`/`lower`/`upper`（需 Unicode 表）。
+native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制，覆盖 `int` / `bool` / `str`（正式 `KuString` owned ABI，支持拼接与 `str()`/`len`/`chars`/`contains`/`slice` 等方法）、struct（含数组/嵌套/enum 字段）、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包（env 引用计数）、native HTTP 服务以及数据库驱动（std.pg/redis/mysql）的已实现子集。array/named/Result/struct/闭包按默认 move、显式 `clone()`、自动 drop 生成所有权代码，并由 checker 做路径级 move 分析。核心同步 ABI 与 `std.fs/std.json/std.time` 的 C 路径面向 Windows/Linux/macOS；native HTTP 与 Redis 也已有 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支，其中 Windows 已本地验证，Linux/macOS 仍待对应真机 CI 首次跑绿。`std.mysql` 目前只在 host build 自动配对 client library，显式 non-host target 会提前拒绝；三系统发布因此应在各目标系统分别构建。`std.pg` 构建必须通过绝对、专用的 `KU_PG_LIB` 目录提供匹配目标的 shared/import libpq；compiler/sysroot 还必须满足其传递依赖。仍明确报不支持的：动态 object 的部分复杂场景、从 dynamic object 取回闭包后调用、闭包捕获 struct/enum/Result/Task 等 owned 类型、async native lowering，以及 str 的 `trim`/`lower`/`upper`（需 Unicode 表）。
 
 已完成到 0.0.15 的关键前置：
 
@@ -353,7 +357,7 @@ native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制�
 支持数组链式 map：nums.map(x => x * 2)。
 支持泛型函数：fn id<T>(value:T): T。
 支持 string / array 标准库实例方法：text.trim()、items.try_get(0)?。
-支持严格对象字符串键索引和字符串 int 索引：`object["name"]`、`text[0]`；对象缺键默认报错，显式 `object["missing"]?` 才返回 `null`。
+支持严格对象字符串键索引和字符串 int 索引：`object["name"]`、`text[0]`；对象缺键默认 panic，显式 `object["missing"]?` 返回可恢复的 `object/missing_key` 错误。只有 `object.get_or(key, default)` 是带默认值的宽松读取。
 可恢复错误统一为 Error 对象：{ domain, code, message }，catch (err) 后使用 err.message / err.domain / err.code。
 运行时闭包使用精确 capture map，不再把整个 Env 存进函数值。
 IR 已有 ResultBranch / BindOk / JumpErr / PropagateErr。
@@ -393,7 +397,8 @@ LLVM array/enum、闭包和高级控制流 lowering
 registry v2 自动 signed-roots、在线 key 吊销和透明轮换（v1 使用项目显式公钥 pin）
 完整 match guard 模式矩阵和跨 guard 的穷尽性证明
 native C 动态 object 的部分复杂场景、str 的 trim/lower/upper(需 Unicode 表)
-native async ABI
+native closure 捕获 struct/enum/Result/Task 等 owned 类型，以及从 dynamic object 取回闭包后调用
+native async ABI / async 函数值
 数据库驱动的解释器(`ku run`)支持；Redis/MySQL 新 client 的真实服务与三系统实测；Redis/MySQL 可强制证书与主机名验证的 TLS 配置
 ```
 

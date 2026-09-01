@@ -140,7 +140,7 @@ v1 index 没有单调 revision，因此 Ed25519 签名本身不能识别一个�
 | --- | --- |
 | `KU_REGISTRY_BIND` | 监听 IP 与端口；默认 `127.0.0.1:8443` |
 | `KU_REGISTRY_DATA_DIR` | 服务独占写入的数据目录 |
-| `KU_REGISTRY_CREDENTIALS_FILE` | publish/yank 凭据与精确包名 ACL 文件 |
+| `KU_REGISTRY_CREDENTIALS_FILE` | publish/yank 的 schema 2 身份、团队、所有权、token hash 与审计链文件 |
 | `KU_REGISTRY_SIGNING_KEY_FILE` | Ed25519 32-byte seed 文件 |
 | `KU_REGISTRY_TLS_CERT_FILE` | PEM 证书链 |
 | `KU_REGISTRY_TLS_KEY_FILE` | 与证书匹配的 PEM 私钥 |
@@ -154,28 +154,62 @@ v1 index 没有单调 revision，因此 Ed25519 签名本身不能识别一个�
 ed25519-<64 hex digits>
 ```
 
-凭据文件每个非注释行只接受一种格式；服务端不保存明文 token，也不支持通配符包名：
+新的自托管部署使用同一个 schema 2 文件保存开发者、团队成员关系、包所有权、带 scope 的 token hash 和审计链。它是有界 UTF-8 文本快照，不是 SQLite 数据库；因此没有 SQL migration，也不存在数据库锁表风险。服务端不保存明文 token，也不支持通配符包名。记录形态如下，实际应只由管理命令生成，不应手写 hash 或审计行：
 
 ```txt
-sha256-<64 hex digits of bearer token> <exact-package-name>
+schema 2
+developer alice
+team core
+member core alice
+owner math team:core
+token sha256-<64 hex digits> alice all
+audit <sequence> <previous-hash|root> <event-hash> <before-transition-hash> <after-transition-hash> <action> <subject>
 ```
 
-为兼容既有凭据文件，同一 token hash 可以出现在多个精确包名行；新的管理命令始终为一个精确包名签发独立 token，不再提供另一套“把既有 token 追加给其他包”的命令。token hash 使用 SHA-256；运行时对 hash 固定遍历比较，已识别 token 发布未授权包返回 403，未知 token 返回 401。SHA-256 不会把低熵 token 变成强凭据；token 必须由安全随机源生成并至少包含 32 个随机字节，凭据文件权限只允许 registry 进程账号读取，泄露或人员变更时应轮换 token。
+`developer token-issue` 生成的 token scope 固定为 `all`，但“all”仍只表示该开发者直接拥有的包和其所在团队拥有的包。旧 ACL 迁移产生 `package:<exact-name>` scope，防止多个旧 token 和多个包被错误展开成笛卡尔积权限。运行时先按 developer/team 建索引，再展开最多 4096 条精确 `(token hash, package)` 授权；工作量接近输入记录数与实际有效授权数之和，不执行每枚 token 对每个 owner 的笛卡尔扫描。hash 存在于有效 ACL 但包名不匹配时返回 403，未知 hash 或当前没有任何有效包授权的开发者 token 返回 401。token hash 使用 SHA-256；SHA-256 不会把低熵 token 变成强凭据，管理命令始终从 OS CSPRNG 生成 32 个随机字节。
 
-参考服务的第三方作者凭据只有一条离线运维路径。先配置 `KU_REGISTRY_CREDENTIALS_FILE`，再由 registry 运维者执行：
+治理控制面只有一条离线运维路径。拥有凭据文件写权限的 registry 运维者执行命令；bearer token 只能 publish/yank，不能创建身份、加入团队、认领或转移包。全新部署先执行 `ku-registry governance init <first-developer>`，该命令只接受不存在或没有有效记录的凭据文件，重复初始化 fail-closed。随后用以下命令签发首枚 token、认领首个包，再启动服务；服务会拒绝没有任何有效 token-to-package 授权的中间快照：
 
 ```txt
-ku-registry token issue <exact-package-name>
-ku-registry token revoke <exact-package-name>
+ku-registry developer create <developer>
+ku-registry developer token-issue <developer>
+ku-registry team create <team>
+ku-registry team member-add <team> <developer>
+ku-registry team member-remove <team> <developer>
+ku-registry package claim <package> <developer:name|team:name>
+ku-registry package transfer <package> <developer:name|team:name>
+ku-registry developer token-revoke <developer>
+ku-registry audit verify
 ```
 
-`issue` 从操作系统 CSPRNG 读取 32 个随机字节，输出一个 `ku_` 开头的 token；明文只在凭据文件原子提交成功后向 stdout 输出一次，服务端文件只写 SHA-256。应把 stdout 直接接入受控 secret store，不要复制到 shell 参数、配置文件或日志。`issue` 是新增授权，不会隐式删除旧 token；轮换顺序唯一为“先 issue 并分发新 token，再把旧 token 放入 `KU_REGISTRY_TOKEN` 后执行 revoke”。`revoke` 不接受 token 参数，只读取 `KU_REGISTRY_TOKEN`，并且只删除该 token 对命令中精确包名的授权；撤销最后一条服务凭据会 fail-closed，必须先 issue 替代凭据。
+`developer token-issue` 输出一个 `ku_` token；明文只在文件原子提交成功后向 stdout 输出一次，应直接进入受控 secret store。`developer token-revoke` 不接受 token 参数，只读取 `KU_REGISTRY_TOKEN`，并删除该 hash 属于指定开发者的全部 scope；若这会让任一包失去最后一个有效发布者则事务拒绝且文件不变。轮换顺序固定为先 issue 并分发新 token，再 revoke 旧 token。团队成员拥有团队全部包的发布权；`member-remove` 会在同一事务中检查团队包仍有至少一个有效成员 token，否则拒绝，必须先加入并为替代成员签发 token。`claim` 只接受未被认领的包；已有包只能 `transfer`，且目标开发者或团队必须已存在并对该包拥有至少一个有效 token。
 
-管理操作持有 `<credentials-file>.lock` 跨进程 OS 独占锁，锁等待使用 10 秒绝对截止和有界轮询。锁内重新读取最多 16 KiB 的 UTF-8 凭据文件，沿用服务端的 8192-byte 行、4096 条 ACL 与精确包名校验；随后写入同目录固定 staging 文件并同步，再原子替换目标。既有凭据的权限先复制到尚未写入内容的 staging 并读回验证：Unix 保留 uid/gid/mode，Windows 保留 DACL 及其继承保护位；权限无法完整保留时在替换前 fail-closed，不忽略 ACL 错误。Unix 首次新建凭据、锁和 staging 文件请求 `0600`；Windows 首次新建文件仍继承父目录权限，必须预先把凭据目录配置为仅允许 registry 服务账号和管理账号访问，不能视为自动获得 Unix `0600`。凭据、锁、staging 的符号链接以及 Windows reparse point 都拒绝，已打开锁还会和当前路径比较 OS file identity。崩溃发生在替换前时旧文件保持可读，发生在替换后时新文件保持可读；固定 staging 名避免每次崩溃累积新垃圾。所有正常修改者都必须使用该命令并共享同一个 lock；手工并行编辑不受它协调。底层文件系统卡死的同步 I/O 不能由用户态 deadline 强行中断，凭据目录仍必须位于可以可靠检查权限的受信本地文件系统，拥有该目录写权限的本地恶意进程仍在安全边界之外。
+正常开发者 token 生命周期只有上述 `token-issue` 与读取 `KU_REGISTRY_TOKEN` 的 `token-revoke` 两条命令。唯一的例外是离线 operator 恢复：若 `developer token-issue` 返回“凭据已提交但 stdout 写入/flush 失败”，明文已不可恢复，诊断会给出非秘密 hash 和一条精确命令：
+
+```txt
+ku-registry developer token-revoke-hash <developer> <sha256-64-hex-digits>
+```
+
+该命令只能由本来就拥有凭据文件写权限的运维者用于清理这枚孤儿 token，不读取也不允许复用 `KU_REGISTRY_TOKEN`，不是 bearer API 或普通撤销的第二种业务写法。它只删除 hash 与 developer 同时精确匹配的 token，仍执行“每个包保留至少一个有效发布者”的不变量检查，并把 hash 恢复动作追加到同一个审计链。开发者不匹配、hash 不存在或格式不是精确 `sha256-` 加 64 位十六进制时都在写入前失败。若不变量阻止清理，先按正常路径安全签发并保存替代 token，再执行该离线恢复命令。
+
+已有两字段 ACL 文件必须显式迁移，不能由服务启动时静默转换：
+
+```txt
+# 停止服务并先建立权限同样严格的离线备份
+ku-registry governance migrate <developer>
+ku-registry audit verify
+# 重启服务并验证启动成功
+```
+
+迁移在同一把跨进程锁内读取旧快照并原子替换；每条旧授权变为同一开发者的 `package:<name>` scoped token，因此迁移前后的有效 ACL 相等。审计重放用独立的 `migration-init`、`migration-token-import`、`migration-complete` 阶段封闭迁移：普通 token issue 只能产生 `all` scope，package scope 只能在未完成的迁移阶段导入，迁移缺少 owner、token 或 complete 事件都会拒绝。失败发生在替换前时旧文件不变；若报告 `registry_credentials_commit_uncertain`，必须先检查文件首个有效记录与审计链，不能盲目重试。回滚只允许在尚未执行任何后续 schema 2 变更时，停止服务后用迁移前的安全备份做同目录原子恢复；一旦发生 token、成员或所有权变更，恢复旧备份会回滚安全状态，禁止作为常规回滚方案，应在 schema 2 上执行补偿操作。旧 `token issue/revoke` 只服务尚未迁移的旧 ACL，schema 2 会显式拒绝它们。
+
+管理操作持有 `<credentials-file>.lock` 跨进程 OS 独占锁，锁等待使用 10 秒绝对截止和有界轮询。锁内重新读取最多 8 MiB 的 UTF-8 文件；单行最多 8192 bytes，developer/team/member/owner/token 各最多 4096 条，审计最多 32768 条，展开后的有效 ACL 最多 4096 条。8 MiB 是为最坏 4096 条旧 ACL 的逐事件可重放迁移保留的固定启动/离线管理上限；服务只在启动时解析并展开凭据，publish/yank 热路径使用内存中的精确 ACL，不逐请求重读治理文件。修改、审计追加和不变量检查在内存中的一个新快照完成，随后写入同目录固定 staging、同步并原子替换，不存在“状态已改但审计未写”的两个文件窗口。既有凭据权限先复制到尚未写入内容的 staging 并读回验证：Unix 保留 uid/gid/mode；Windows 同时保留 OWNER、GROUP、DACL 及 DACL 继承保护位，并从 staging handle 回读逐字节复核。Windows 若当前 operator 无权恢复原 owner/group，或任一安全描述符字段无法读取、设置、复核，会在写入凭据内容及 replace 前 fail-closed，而不会让新 staging 的 operator 身份静默成为最终 owner。Unix 首次新建凭据、锁和 staging 请求 `0600`；Windows 没有 `0600` 等价保证，首次新建仍继承父目录权限，必须预先将凭据父目录的写权限限制为受信 registry 服务账号和管理账号。凭据、锁、staging 的 symlink 与 Windows reparse point 都拒绝，已打开锁还会和当前路径比较 OS file identity。所有正常修改者必须共享该命令和 lock；持有父目录写权限的非协作本机进程仍可在 staging/rename 边界竞争或重写文件，这不在当前威胁模型内，因此不能把路径检查或同文件 hash 链视为对恶意本机 writer 的防护。底层同步 I/O 不能由用户态 deadline 强行中断，目录必须位于可信本地文件系统。
 
 Unix 扩展文件 ACL 不会被静默丢弃。管理命令在原凭据的安全打开 fd、以及尚未写入内容的 staging fd 上分别检查，首次 issue 也检查 staging，避免父目录默认/继承 ACL 绕过 `0600`：Linux 只接受无 POSIX access ACL 或完全等同普通权限位的三个基础项；macOS 只接受无 extended ACL 或不带任何条目和 flags 的显式空 ACL，延迟继承、禁止继承等 flags 也会拒绝。扩展/未知 ACL、无法可靠查询的文件系统或未实现 ACL 检查的 Unix 平台返回 `registry_credentials_acl_unsupported`，其他 ACL 查询 I/O/权限错误返回 `registry_credentials_permissions_failed`，都在写入和替换前停止并保留旧凭据；`ENOTSUP` 不被误当作“无 ACL”。当前不会自动移除 ACL，也不提供绕过检查的另一种命令；凭据目录应预先配置为可可靠检查的普通 Unix 权限环境。
 
-运行中的 `ku-registry` 在启动时静态加载凭据，不热加载。每次 issue/revoke 后必须由服务管理器重启服务并确认启动成功。Unix 在替换前打开目录同步句柄，把可预见的目录权限错误提前拦截；替换成功后的目录同步失败则单独报告 `registry_credentials_commit_uncertain`：新文件已对路径可见，但掉电持久性未确认，不能假定命令失败就没有提交。issue 的此类错误以及 stdout 写入/flush 失败都会附带精确的非秘密 `sha256-...` 标识，不向错误或 stderr 输出 token 明文；运维者应按这个 hash 检查已提交内容，必要时协调所有管理进程后从凭据文件人工撤销该条授权，再决定是否重试，不能盲目追加未知凭据。revoke 已提交后的确认输出失败也明确标记为已提交，重试找不到授权时会提示它可能已被前一次操作撤销。这个工具只是自托管 registry 的离线 ACL 运维，不提供注册/登录、身份验证、token 到期、团队、包名认领/转移、审计或官方托管服务，不能称为公共开发者身份系统。
+上述 Linux/macOS ACL 行为目前是源码合同与平台条件测试，不能由 Windows 本机结果代替真实 Unix syscall 验收；对应 workspace workflow 在 Linux/macOS 实际跑绿前，不应把它写成三系统部署已验证。
+
+运行中的 `ku-registry` 在启动时静态加载凭据，不热加载。每次治理变更后必须由服务管理器重启并确认启动成功；transfer、member-remove 和 token-revoke 等收窄权限的操作若要求立即生效，应先停止服务，再修改并重启，不能把磁盘提交时刻误认为运行中实例的授权切换时刻。每个审计 event hash 同时绑定前一事件、动作、主体以及确定性的 before/after rolling transition hash；该 transition hash 从前一值、动作和主体增量计算，避免对每个历史事件重新哈希完整状态。验证从空状态开始，只接受固定动作集合，按 subject 重放每个 developer、team、member、owner、token 和 bootstrap/migration phase 变更；before 必须连续、after 必须等于本事件的增量结果、每个事件必须真实改变治理状态或受限控制阶段，最终阶段必须正常且重放状态还必须逐项等于文件当前状态。因此未知 action、追加同状态事件、虚假的 create/transfer/revoke、未同步修改审计的状态篡改都会失败。它仍不是 keyed log，且审计与治理状态位于同一文件，所以拥有文件写权限的恶意管理员仍可重写状态并重新构造一条语义自洽的完整历史，不能称为不可抵赖日志或外部透明账本。Unix 替换后的目录同步失败会报告 `registry_credentials_commit_uncertain`；token issue 的此类错误及 stdout 写入/flush 失败只附带非秘密 hash，不输出明文 token。所有有状态治理命令都检查并 flush 成功确认；若状态已经原子提交但 stdout 随后失败，进程返回明确的 committed-but-output-failed 错误，磁盘状态仍生效，盲目重试可能得到 already-exists、already-applied 或 already-revoked，应先检查审计链。`audit verify` 是纯读取，验证成功但输出失败只表示无法交付确认，不表示发生过状态提交。当前闭环是自托管、离线 operator 管理的开发者名、团队成员、包所有权、转移、token 和可验证审计；它仍不提供在线注册/登录、邮箱或组织验证、团队角色、token 到期、身份/团队删除、跨节点一致性、不可变外部审计或官方托管服务，不能称为完整公共开发者身份平台。
 
 构建后直接启动：
 
