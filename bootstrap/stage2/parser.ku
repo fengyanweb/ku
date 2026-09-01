@@ -3,6 +3,7 @@ import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "./span.ku"
 import { Diagnostic, DiagnosticCanonical } from "./diagnostic.ku"
 import { Node, ParseOutput, EmptyArena } from "./ast.ku"
+import { ParseContext, DefaultParseContext, ParseContextError, RelocateTokens } from "./context.ku"
 
 // Stage 2B uses append-only operator/value stacks and integer links. Flat
 // binary and postfix chains are iterative; nested delimiters and unary prefixes
@@ -63,7 +64,9 @@ fn MakeOperator(marker: str, text: str, precedence: int, unary: bool, token: Tok
     }
 }
 
-fn Parse(source: str): ParseOutput! {
+fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
+    source_characters = source.len()
+    source_bytes = source.byte_len()
     tokens = Scan(source)?
     if (tokens.len() == 0) {
         fail {
@@ -72,6 +75,9 @@ fn Parse(source: str): ParseOutput! {
             message: "token stream must end in exactly one EOF|0:0@0..0:0@0"
         }
     }
+    context_error = ParseContextError(source_characters, source_bytes, tokens[tokens.len() - 1].clone(), context.clone())
+    if (context_error != "") { RejectAt(tokens[0].clone(), "invalid_parse_context", context_error)? }
+    tokens = RelocateTokens(tokens, context)
     if (tokens.len() > 4096) {
         RejectAt(tokens[0].clone(), "invalid_token_stream", "stage-2 parser accepts at most 4096 tokens")?
     }
@@ -474,4 +480,8 @@ fn Parse(source: str): ParseOutput! {
     // Local helpers capture the arena; returning an owned captured value needs
     // one explicit bounded clone after parsing, never one clone per token.
     return ok(ParseOutput { arena: arena.clone(), root: root })
+}
+
+fn Parse(source: str): ParseOutput! {
+    return ok(ParseWithContext(source, DefaultParseContext())?)
 }

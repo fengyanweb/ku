@@ -1,0 +1,85 @@
+import { Token } from "../stage1/token.ku"
+import { Span } from "./span.ku"
+
+// A caller parsing a lexically-valid source window supplies the absolute
+// position of its first character and the token which follows that window.
+// Relocation happens before Stage 2 builds AST nodes or Diagnostics, so no
+// caller decodes error strings. Stage 1 lexer errors are outside this contract.
+struct ParseContext {
+    origin: Span
+    boundary: Span
+    has_boundary: bool
+}
+
+fn DefaultParseContext(): ParseContext {
+    origin = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    return ParseContext {
+        origin: origin.clone(),
+        boundary: origin,
+        has_boundary: false
+    }
+}
+
+fn ParseContextError(source_characters: int, source_bytes: int, eof: Token, context: ParseContext): str {
+    max_int = 9223372036854775807
+    origin_end_before_start = context.origin.end_line < context.origin.line || (context.origin.end_line == context.origin.line && context.origin.end_column < context.origin.column)
+    if (context.origin.line < 1 || context.origin.column < 1 || context.origin.offset < 0 || context.origin.end_line < 1 || context.origin.end_column < 1 || context.origin.end_offset < context.origin.offset || origin_end_before_start) {
+        return "parse origin must use positive ordered line/column coordinates and a non-negative byte offset"
+    }
+    // Compare the small window length with the remaining positive range instead
+    // of forming origin + length first. The subtraction cannot underflow after
+    // the non-negative checks above.
+    if (source_characters > max_int - context.origin.line || source_characters > max_int - context.origin.column || source_bytes > max_int - context.origin.offset) {
+        return "parse origin cannot be relocated without integer overflow"
+    }
+    if (!context.has_boundary) { return "" }
+    window_end_line = context.origin.line + eof.line - 1
+    window_end_column = eof.column
+    if (eof.line == 1) { window_end_column = window_end_column + context.origin.column - 1 }
+    window_end_offset = context.origin.offset + eof.offset
+    boundary_end_before_start = context.boundary.end_line < context.boundary.line || (context.boundary.end_line == context.boundary.line && context.boundary.end_column < context.boundary.column)
+    boundary_before_window = context.boundary.offset < window_end_offset || context.boundary.line < window_end_line || (context.boundary.line == window_end_line && context.boundary.column < window_end_column)
+    if (context.boundary.line < 1 || context.boundary.column < 1 || context.boundary.end_line < 1 || context.boundary.end_column < 1 || context.boundary.end_offset < context.boundary.offset || boundary_end_before_start || boundary_before_window) {
+        return "parse boundary must be an ordered absolute span at or after the source window"
+    }
+    return ""
+}
+
+fn RelocateTokens(tokens: [Token], context: ParseContext): [Token] {
+    needs_relocation = context.origin.line != 1 || context.origin.column != 1 || context.origin.offset != 0 || context.has_boundary
+    if (!needs_relocation) { return tokens }
+    relocated: [Token] = []
+    relocate_index = 0
+    while (relocate_index < tokens.len()) {
+        input = tokens[relocate_index].clone()
+        line = input.line + context.origin.line - 1
+        column = input.column
+        if (input.line == 1) { column = column + context.origin.column - 1 }
+        end_line = input.end_line + context.origin.line - 1
+        end_column = input.end_column
+        if (input.end_line == 1) { end_column = end_column + context.origin.column - 1 }
+        offset = input.offset + context.origin.offset
+        end_offset = input.end_offset + context.origin.offset
+        if (context.has_boundary && input.kind == "Eof") {
+            line = context.boundary.line
+            column = context.boundary.column
+            offset = context.boundary.offset
+            end_line = context.boundary.end_line
+            end_column = context.boundary.end_column
+            end_offset = context.boundary.end_offset
+        }
+        relocated = relocated.push(Token {
+            kind: input.kind,
+            lexeme: input.lexeme,
+            int_value: input.int_value,
+            line: line,
+            column: column,
+            offset: offset,
+            end_line: end_line,
+            end_column: end_column,
+            end_offset: end_offset
+        })
+        relocate_index = relocate_index + 1
+    }
+    return relocated
+}

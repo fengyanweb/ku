@@ -3,7 +3,8 @@ import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken } from "../stage2/span.ku"
 import { Diagnostic, DiagnosticCanonical } from "../stage2/diagnostic.ku"
 import { Node, ParseOutput, EmptyArena } from "../stage2/ast.ku"
-import { Parse as ParseExpression } from "../stage2/parser.ku"
+import { ParseWithContext } from "../stage2/parser.ku"
+import { ParseContext } from "../stage2/context.ku"
 
 // Stage 3 is intentionally a strict, useful subset of the production Rust
 // parser. It accepts ordinary zero-parameter functions whose bodies contain
@@ -13,10 +14,11 @@ import { Parse as ParseExpression } from "../stage2/parser.ku"
 // existing optional semicolon is also accepted. Unsupported production syntax
 // is rejected explicitly rather than guessed at or given a second interpretation.
 //
-// The source is scanned once. Token byte offsets are mapped to Unicode-scalar
-// slice indexes in one monotonic pass, then each disjoint statement expression
-// is parsed by Stage 2. Its nodes are relocated back to the original source and
-// appended to this module's fixed NodeId/edge arenas.
+// The complete module is scanned once. Token byte offsets are mapped to
+// Unicode-scalar slice indexes in one monotonic pass. Stage 2 then re-scans
+// each bounded, already lexically-valid expression window with a structured
+// origin/boundary context, so it relocates both AST and parser-error spans
+// before returning them to this module's fixed NodeId/edge arenas.
 
 fn RejectAt(token: Token, code: str, message: str): null! {
     diagnostic = Diagnostic {
@@ -33,11 +35,19 @@ fn RejectAt(token: Token, code: str, message: str): null! {
     fail { domain: "bootstrap.parser.stage3", code: code, message: canonical }
 }
 
-fn ParseExpressionAt(source: str, origin: Token): ParseOutput! {
+fn ParseExpressionAt(source: str, origin: Token, boundary: Token): ParseOutput! {
     try {
-        return ok(ParseExpression(source)?)
+        return ok(ParseWithContext(source, ParseContext {
+            origin: SpanFromToken(origin),
+            boundary: SpanFromToken(boundary),
+            has_boundary: true
+        })?)
     } catch(err) {
-        RejectAt(origin, "invalid_expression", "stage-2 expression parser rejected statement: " + err.code)?
+        fail {
+            domain: "bootstrap.parser.stage3",
+            code: err.code.clone(),
+            message: err.message
+        }
     }
     fail {
         domain: "bootstrap.parser.stage3",
@@ -165,10 +175,13 @@ fn ParseProgram(source: str): ParseOutput! {
     }
 
     fn AddExpression(start: int, end: int): int! {
-        if (start >= end || start < 0 || end > tokens.len() - 1) {
-            RejectAt(tokens[start].clone(), "invalid_expression_range", "statement expression token range is empty or invalid")?
+        if (start > end || start < 0 || end > tokens.len() - 1) {
+            diagnostic_index = tokens.len() - 1
+            if (start >= 0 && start < tokens.len()) { diagnostic_index = start }
+            RejectAt(tokens[diagnostic_index].clone(), "invalid_expression_range", "statement expression token range is invalid")?
         }
         origin = tokens[start].clone()
+        boundary = tokens[end].clone()
         // string.slice may scan the complete source. Keep an explicit aggregate
         // budget so comment-heavy modules cannot multiply that scan by every
         // statement. This also avoids interpreter per-character concatenation.
@@ -177,8 +190,10 @@ fn ParseProgram(source: str): ParseOutput! {
             RejectAt(origin.clone(), "work_limit", "stage-3 expression slicing budget exceeded")?
         }
         slice_work = slice_work + source_length
-        expression_source = expression_source_text.slice(token_char_starts[start], token_char_ends[end - 1])?
-        parsed = ParseExpressionAt(expression_source, origin.clone())?
+        slice_end = token_char_starts[start]
+        if (end > start) { slice_end = token_char_ends[end - 1] }
+        expression_source = expression_source_text.slice(token_char_starts[start], slice_end)?
+        parsed = ParseExpressionAt(expression_source, origin.clone(), boundary)?
         if (parsed.arena.nodes.len() > 4096 - arena.nodes.len()) {
             RejectAt(origin.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")?
         }
@@ -199,22 +214,16 @@ fn ParseProgram(source: str): ParseOutput! {
                 arena.edges = arena.edges.push(node_base + child)
                 edge_index = edge_index + 1
             }
-            line = input.line + origin.line - 1
-            column = input.column
-            if (input.line == 1) { column = column + origin.column - 1 }
-            end_line = input.end_line + origin.line - 1
-            end_column = input.end_column
-            if (input.end_line == 1) { end_column = end_column + origin.column - 1 }
             arena.nodes = arena.nodes.push(Node {
                 kind: input.kind,
                 text: input.text,
                 int_value: input.int_value,
-                line: line,
-                column: column,
-                offset: input.offset + origin.offset,
-                end_line: end_line,
-                end_column: end_column,
-                end_offset: input.end_offset + origin.offset,
+                line: input.line,
+                column: input.column,
+                offset: input.offset,
+                end_line: input.end_line,
+                end_column: input.end_column,
+                end_offset: input.end_offset,
                 first_edge: first_edge,
                 edge_count: arena.edges.len() - first_edge
             })
