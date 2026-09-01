@@ -578,7 +578,7 @@ impl WindowsJob {
         // handle is closed on all failure paths or by `Drop`.
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if handle == 0 {
+            if handle.is_null() {
                 return None;
             }
             let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
