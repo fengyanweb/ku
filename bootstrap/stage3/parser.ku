@@ -2,16 +2,16 @@ import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken } from "../stage2/span.ku"
 import { Node, ParseOutput, EmptyArena } from "../stage2/ast.ku"
-import { RejectAt, ParseExpressionAt, CanEndExpression, CanStartStatement, MapTokenCharacters } from "./support.ku"
-import { SignatureType, ReadSignatureType } from "./signature.ku"
+import { RejectAt, ParseExpressionAt, CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, MapTokenCharacters } from "./support.ku"
+import { SignatureType, EmptyTypeWindow, PushTypeWindow, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { ReadImport } from "./imports.ku"
 
 // Stage 3 is intentionally a strict, useful subset of the production Rust
-// parser. It accepts ordinary functions whose bodies contain
-// primitive typed declarations, variable assignments, expression statements
-// and return statements. Function parameters may be untyped or use the same
-// primitive types; explicit primitive and Result return types are represented
-// by source-positioned arena nodes. Statement boundaries follow the production token
+// parser. It accepts ordinary functions whose bodies contain explicitly typed
+// declarations, variable assignments, expression statements and return statements.
+// Parameters may be untyped; parameter, return and local-declaration types share
+// source-positioned TypeName, TypeArray and TypeResult arena nodes. Statement
+// boundaries follow the production token
 // grammar, including Ku's ordinary newline/whitespace-separated style; an
 // existing optional semicolon is also accepted. Unsupported production syntax
 // is rejected explicitly rather than guessed at or given a second interpretation.
@@ -157,47 +157,39 @@ fn ParseProgram(source: str): ParseOutput! {
     }
 
     fn ReadTypeAt(start: int): SignatureType! {
-        if (start < 0 || start >= tokens.len()) {
-            RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "function signature type starts outside the token stream")?
+        window = EmptyTypeWindow()
+        probe = start
+        while (!window.complete) {
+            if (probe >= tokens.len()) { RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "type inspection escaped its bounded token window")? }
+            window = PushTypeWindow(window, tokens[probe].clone())?
+            probe = probe + 1
         }
-        next = start
-        has_next = start + 1 < tokens.len()
-        if (has_next) { next = start + 1 }
-        return ReadSignatureType(tokens[start].clone(), tokens[next].clone(), has_next)
+        parsed = ParseTypeWindow(window.tokens)?
+        parsed.work = parsed.work + probe - start
+        return ok(parsed)
+    }
+
+    fn AddParsedType(parsed: SignatureType, error_token: Token): int! {
+        root = 0
+        for part in parsed.parts {
+            has_child = root > 0
+            CheckTypeArenaCapacity(arena.nodes.len(), arena.edges.len(), has_child, error_token.clone())?
+            first_edge = arena.edges.len()
+            if (has_child) { arena.edges = arena.edges.push(root) }
+            arena.nodes = arena.nodes.push(TypePartToNode(part, first_edge, has_child))
+            root = arena.nodes.len()
+        }
+        return ok(root)
     }
 
     fn ExpressionEnd(start: int): int! {
         probe = start
-        paren_depth = 0
-        bracket_depth = 0
-        steps = 0
-        searching = true
-        while (searching) {
-            if (probe >= tokens.len()) {
-                RejectAt(tokens[tokens.len() - 1].clone(), "unexpected_eof", "expression is missing a terminator")?
-            }
-            token = tokens[probe].clone()
-            previous_can_end = false
-            if (probe > start) {
-                previous_can_end = CanEndExpression(tokens[probe - 1].kind.clone())
-            }
-            starts_next_statement = previous_can_end && paren_depth == 0 && bracket_depth == 0 && CanStartStatement(token.kind.clone())
-            if (((token.kind == "Semicolon" || token.kind == "RBrace" || token.kind == "Eof") && paren_depth == 0 && bracket_depth == 0) || starts_next_statement) {
-                searching = false
-            } else {
-                if (token.kind == "LParen") { paren_depth = paren_depth + 1 }
-                if (token.kind == "RParen" && paren_depth > 0) { paren_depth = paren_depth - 1 }
-                if (token.kind == "LBracket") { bracket_depth = bracket_depth + 1 }
-                if (token.kind == "RBracket" && bracket_depth > 0) { bracket_depth = bracket_depth - 1 }
-                if (token.kind == "LBrace") {
-                    RejectAt(token.clone(), "unsupported_expression", "brace expressions are outside the stage-3 subset")?
-                }
-                probe = probe + 1
-            }
-            steps = steps + 1
-            if (steps > 4096) {
-                RejectAt(token.clone(), "work_limit", "stage-3 expression boundary budget exceeded")?
-            }
+        boundary = EmptyExpressionBoundary()
+        while (!boundary.complete) {
+            if (probe >= tokens.len()) { RejectAt(tokens[tokens.len() - 1].clone(), "unexpected_eof", "expression is missing a terminator")? }
+            previous_can_end = probe > start && CanEndExpression(tokens[probe - 1].kind.clone())
+            boundary = PushExpressionBoundary(boundary, tokens[probe].clone(), previous_can_end)?
+            if (!boundary.complete) { probe = probe + 1 }
         }
         return ok(probe)
     }
@@ -314,11 +306,12 @@ fn ParseProgram(source: str): ParseOutput! {
             parameter_children: [int] = []
             if (tokens[cursor].kind == "Colon") {
                 parsed_type = ReadTypeAt(cursor + 1)?
-                cursor = cursor + 1 + parsed_type.consumed
-                if (tokens[cursor].kind == "Pipe") {
-                    RejectAt(tokens[cursor].clone(), "unsupported_type", "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms")?
+                parse_steps = parse_steps + parsed_type.work
+                if (parse_steps > 16384) {
+                    RejectAt(tokens[cursor + 1].clone(), "work_limit", "stage-3 parser work budget exceeded")?
                 }
-                type_node = AddNode("Type", parsed_type.text.clone(), 0, parsed_type.span.clone(), [], parameter_token.clone())?
+                cursor = cursor + 1 + parsed_type.consumed
+                type_node = AddParsedType(parsed_type, parameter_token.clone())?
                 parameter_children = parameter_children.push(type_node)
             }
             parameter = AddNode("Parameter", parameter_token.lexeme.clone(), 0, SpanFromToken(parameter_token.clone()), parameter_children, parameter_token.clone())?
@@ -338,12 +331,13 @@ fn ParseProgram(source: str): ParseOutput! {
         has_return_type = false
         if (tokens[cursor].kind == "Colon") {
             parsed_type = ReadTypeAt(cursor + 1)?
+            parse_steps = parse_steps + parsed_type.work
+            if (parse_steps > 16384) {
+                RejectAt(tokens[cursor + 1].clone(), "work_limit", "stage-3 parser work budget exceeded")?
+            }
             has_return_type = true
             cursor = cursor + 1 + parsed_type.consumed
-            if (tokens[cursor].kind == "Pipe") {
-                RejectAt(tokens[cursor].clone(), "unsupported_type", "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms")?
-            }
-            return_type = AddNode("Type", parsed_type.text.clone(), 0, parsed_type.span.clone(), [], tokens[cursor - 1].clone())?
+            return_type = AddParsedType(parsed_type, tokens[cursor - 1].clone())?
         }
         if (tokens[cursor].kind != "LBrace") {
             RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '{'")?
@@ -400,16 +394,14 @@ fn ParseProgram(source: str): ParseOutput! {
             } else if (statement_start.kind == "Ident" && tokens[cursor + 1].kind == "Colon") {
                 name = statement_start.lexeme.clone()
                 cursor = cursor + 2
-                type_token = tokens[cursor].clone()
-                type_name = ""
-                if (type_token.kind == "Ident" && (type_token.lexeme == "int" || type_token.lexeme == "float" || type_token.lexeme == "bool" || type_token.lexeme == "str")) {
-                    type_name = type_token.lexeme.clone()
-                } else if (type_token.kind == "Null") {
-                    type_name = "null"
-                } else {
-                    RejectAt(type_token.clone(), "unsupported_type", "stage-3 declarations accept only int, float, bool, str, or null")?
+                parsed_type = ReadTypeAt(cursor)?
+                parse_steps = parse_steps + parsed_type.work
+                if (parse_steps > 16384) {
+                    RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
                 }
-                cursor = cursor + 1
+                type_consumed = parsed_type.consumed
+                type_node = AddParsedType(parsed_type, tokens[cursor].clone())?
+                cursor = cursor + type_consumed
                 if (tokens[cursor].kind != "Equal") {
                     RejectAt(tokens[cursor].clone(), "unsupported_statement", "stage-3 typed declarations require an initializer")?
                 }
@@ -417,14 +409,14 @@ fn ParseProgram(source: str): ParseOutput! {
                 expression_end = ExpressionEnd(cursor)?
                 expression = AddExpression(cursor, expression_end)?
                 expression_node = arena.nodes[expression - 1].clone()
-                statement = AddNode("VarDecl", name + ":" + type_name, 0, Span {
+                statement = AddNode("VarDecl", name, 0, Span {
                     line: statement_start.line,
                     column: statement_start.column,
                     offset: statement_start.offset,
                     end_line: expression_node.end_line,
                     end_column: expression_node.end_column,
                     end_offset: expression_node.end_offset
-                }, [expression], statement_start.clone())?
+                }, [type_node, expression], statement_start.clone())?
                 cursor = expression_end
                 if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
             } else if (statement_start.kind == "Ident" && tokens[cursor + 1].kind == "Equal") {

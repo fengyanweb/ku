@@ -174,40 +174,67 @@ fn project_expr(source: &str, expr: &Expr, arena: &mut ProjectedArena) -> usize 
     push_node(arena, kind, text, int_value, expr.span, &child_ids)
 }
 
-fn type_name_text(ty: &TypeName) -> String {
-    match ty {
-        TypeName::Int => "int".to_string(),
-        TypeName::Float => "float".to_string(),
-        TypeName::Bool => "bool".to_string(),
-        TypeName::String => "str".to_string(),
-        TypeName::Null => "null".to_string(),
-        TypeName::Result(inner) => format!("{}!", type_name_text(inner)),
-        other => panic!("stage-3 oracle received unsupported type: {other:?}"),
-    }
-}
-
-fn project_signature_type(
+fn project_type(
     tokens: &[Token],
     cursor: &mut usize,
     ty: &TypeName,
     arena: &mut ProjectedArena,
 ) -> usize {
-    let start = tokens[*cursor].span.start;
-    *cursor += 1;
-    let mut end = tokens[*cursor - 1].span.end;
-    if matches!(ty, TypeName::Result(_)) {
-        assert!(matches!(tokens[*cursor].kind, TokenKind::Bang));
-        end = tokens[*cursor].span.end;
-        *cursor += 1;
+    match ty {
+        TypeName::Array(inner) => {
+            assert!(matches!(tokens[*cursor].kind, TokenKind::LBracket));
+            let start = tokens[*cursor].span.start;
+            *cursor += 1;
+            let child = project_type(tokens, cursor, inner, arena);
+            assert!(matches!(tokens[*cursor].kind, TokenKind::RBracket));
+            let end = tokens[*cursor].span.end;
+            *cursor += 1;
+            push_node(
+                arena,
+                "TypeArray",
+                String::new(),
+                0,
+                Span::new(start, end),
+                &[child],
+            )
+        }
+        TypeName::Result(inner) => {
+            let child = project_type(tokens, cursor, inner, arena);
+            assert!(matches!(tokens[*cursor].kind, TokenKind::Bang));
+            let span = Span::new(arena.nodes[child - 1].span.start, tokens[*cursor].span.end);
+            *cursor += 1;
+            push_node(arena, "TypeResult", String::new(), 0, span, &[child])
+        }
+        TypeName::Int
+        | TypeName::Float
+        | TypeName::Bool
+        | TypeName::String
+        | TypeName::Null
+        | TypeName::Custom(_) => {
+            let text = match ty {
+                TypeName::Int => "int".to_string(),
+                TypeName::Float => "float".to_string(),
+                TypeName::Bool => "bool".to_string(),
+                TypeName::String => "str".to_string(),
+                TypeName::Null => "null".to_string(),
+                TypeName::Custom(name) => name.clone(),
+                _ => unreachable!(),
+            };
+            let start = tokens[*cursor].span.start;
+            let component_count = text.split('.').count();
+            let mut end = tokens[*cursor].span.end;
+            *cursor += 1;
+            for _ in 1..component_count {
+                assert!(matches!(tokens[*cursor].kind, TokenKind::Dot));
+                *cursor += 1;
+                assert!(matches!(tokens[*cursor].kind, TokenKind::Ident(_)));
+                end = tokens[*cursor].span.end;
+                *cursor += 1;
+            }
+            push_node(arena, "TypeName", text, 0, Span::new(start, end), &[])
+        }
+        other => panic!("stage-3 oracle received unsupported type: {other:?}"),
     }
-    push_node(
-        arena,
-        "Type",
-        type_name_text(ty),
-        0,
-        Span::new(start, end),
-        &[],
-    )
 }
 
 fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> usize {
@@ -219,15 +246,17 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
             span,
             ..
         } => {
+            let tokens = Lexer::new(source)
+                .lex()
+                .expect("declaration projection lex");
+            let mut cursor = tokens
+                .iter()
+                .position(|token| token.span.start == span.start)
+                .expect("declaration start token")
+                + 2;
+            let ty = project_type(&tokens, &mut cursor, ty, arena);
             let value = project_expr(source, value, arena);
-            push_node(
-                arena,
-                "VarDecl",
-                format!("{name}:{}", type_name_text(ty)),
-                0,
-                *span,
-                &[value],
-            )
+            push_node(arena, "VarDecl", name.clone(), 0, *span, &[ty, value])
         }
         Stmt::Assign { name, value, span } => {
             let value = project_expr(source, value, arena);
@@ -354,7 +383,7 @@ fn project_function(source: &str, function: &FnDecl, arena: &mut ProjectedArena)
         let param_children = if let Some(ty) = &param.ty {
             assert!(matches!(tokens[cursor].kind, TokenKind::Colon));
             cursor += 1;
-            vec![project_signature_type(&tokens, &mut cursor, ty, arena)]
+            vec![project_type(&tokens, &mut cursor, ty, arena)]
         } else {
             Vec::new()
         };
@@ -375,7 +404,7 @@ fn project_function(source: &str, function: &FnDecl, arena: &mut ProjectedArena)
     if let Some(ty) = &function.return_type {
         assert!(matches!(tokens[cursor].kind, TokenKind::Colon));
         cursor += 1;
-        children.push(project_signature_type(&tokens, &mut cursor, ty, arena));
+        children.push(project_type(&tokens, &mut cursor, ty, arena));
     }
     assert!(matches!(tokens[cursor].kind, TokenKind::LBrace));
 
@@ -546,20 +575,18 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "fn typed(): int { return 1 }",
         "fn add(left: int, right: int): int { return left + right }\nfn echo(value): str { return \"ok\" }",
         "// 签名😀\r\nfn load(path: str, cached: bool, prior: int!): str! {\r\n  return path\r\n}",
+        "fn typed(values: [pkg.model.User!]!): [[int]!]! { local:[pkg.Item!] = [] return values }",
         "fn helper() { return 7 }\nfn main() {\n  answer:int = 40 + 2\n  answer = answer + 1\n  println(answer)\n  return\n}",
         "fn main(){\n  a:float = 1.250\n  b:bool = true\n  c:str = \"中😀\"\n  d:null = null\n  return c\n}",
         "// 前置😀\nfn main() {\n  // gap 中\n  text:str = \"中😀\"\n  text = text + \"!\"\n  println(text)\n}",
         "fn main(){ values:[int] = [1] }",
     ];
-    // The final case is intentionally filtered out below: it is a production
-    // syntax example used to assert Stage 3's explicit subset boundary.
-    let accepted = &cases[..cases.len() - 1];
+    let accepted = &cases;
 
     let let_source = "fn main() { let value = 1; }";
     let missing_body = "fn main() {";
     let return_outside = "return 1";
     let top_level_expression = "42";
-    let unsupported_type = cases[cases.len() - 1];
     let deep_expression = format!(
         "fn main(){{ value = {}1{} }}",
         "(".repeat(32),
@@ -577,8 +604,19 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let missing_signature_body = "fn f(): int!";
     let legacy_type_alias = "fn f(value: string) {}";
     let unicode_broken_signature = "// 前😀\r\nfn f(value: str, : int): null! {}";
-    let unsupported_signature_type = "fn f(values: [int]) {}";
+    let unsupported_signature_type = "fn f(op: fn(int): int) {}";
     let unsupported_union_type = "fn f(value: int | str) {}";
+    let unsupported_return_union = "fn f(): int | str {}";
+    let unsupported_local_union = "fn f() { value:int | str = 1 }";
+    let unsupported_nested_union = "fn f(value: [int | str]) {}";
+    let primitive_dotted_parameter = "fn f(value: int.foo) {}";
+    let primitive_dotted_return = "fn f(): str.X {}";
+    let primitive_dotted_local = "fn f() { value:null.Y = null }";
+    let missing_array_close = "fn f(value: [pkg.User) {}";
+    let missing_dotted_name = "fn f(value: pkg.) {}";
+    let repeated_result = "fn f(value: int!!) {}";
+    let accepted_type_depth = format!("fn f(value: {}int{}) {{}}", "[".repeat(32), "]".repeat(32));
+    let rejected_type_depth = format!("fn f(value: {}int{}) {{}}", "[".repeat(33), "]".repeat(33));
     let empty_named_import = "import {} from \"./math.ku\"";
     let trailing_import_comma = "import { Add, } from \"./math.ku\"";
     let missing_import_alias = "import { Add as } from \"./math.ku\"";
@@ -706,6 +744,11 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         ));
     }
     body.push_str(&format!(
+        "    AssertCase({}, {})?\n",
+        ku_string(&accepted_type_depth),
+        ku_string(&rust_canonical(&accepted_type_depth))
+    ));
+    body.push_str(&format!(
         "    comment_chunk = {}\n",
         ku_string(&comment_chunk)
     ));
@@ -772,11 +815,6 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     );
     let return_outside_message = diagnostic_at(return_outside, 0, "return outside function");
     let top_level_message = rust_error_canonical(top_level_expression);
-    let type_message = diagnostic_for_kind(
-        unsupported_type,
-        TokenKind::LBracket,
-        "stage-3 declarations accept only int, float, bool, str, or null",
-    );
     let deep_tokens = Lexer::new(&deep_expression)
         .lex()
         .expect("deep expression lex");
@@ -823,15 +861,37 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         TokenKind::Struct,
         "stage-3 supports import and ordinary function items only",
     );
-    let unsupported_signature_type_message = diagnostic_for_kind(
+    let unsupported_signature_type_message = diagnostic_at(
         unsupported_signature_type,
-        TokenKind::LBracket,
-        "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms",
+        5,
+        "stage-3 types do not support function, async, or union types",
     );
     let unsupported_union_type_message = diagnostic_for_kind(
         unsupported_union_type,
         TokenKind::Pipe,
-        "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms",
+        "stage-3 types do not support function, async, or union types",
+    );
+    let union_message = |source| {
+        diagnostic_for_kind(
+            source,
+            TokenKind::Pipe,
+            "stage-3 types do not support function, async, or union types",
+        )
+    };
+    let dotted_message = |source| {
+        diagnostic_for_kind(
+            source,
+            TokenKind::Dot,
+            "dotted type names must start with a custom identifier",
+        )
+    };
+    let missing_array_close_message = rust_error_canonical(missing_array_close);
+    let missing_dotted_name_message = rust_error_canonical(missing_dotted_name);
+    let repeated_result_message = rust_error_canonical(repeated_result);
+    let rejected_type_depth_message = diagnostic_at(
+        &rejected_type_depth,
+        5 + 32,
+        "stage-3 type nesting exceeds 32 levels",
     );
     let parameter_limit_message = diagnostic_at(
         &over_parameter_limit,
@@ -886,7 +946,6 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             return_outside_message,
         ),
         (top_level_expression, "expected_item", top_level_message),
-        (unsupported_type, "unsupported_type", type_message),
         (&deep_expression, "depth_exceeded", deep_message),
         (broken_expression, "unexpected_eof", broken_message),
         (empty_rhs_expression, "unexpected_eof", empty_rhs_message),
@@ -1036,6 +1095,47 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             unsupported_union_type_message,
         ),
         (
+            unsupported_return_union,
+            "unsupported_type",
+            union_message(unsupported_return_union),
+        ),
+        (
+            unsupported_local_union,
+            "unsupported_type",
+            union_message(unsupported_local_union),
+        ),
+        (
+            unsupported_nested_union,
+            "unsupported_type",
+            union_message(unsupported_nested_union),
+        ),
+        (
+            primitive_dotted_parameter,
+            "unsupported_type",
+            dotted_message(primitive_dotted_parameter),
+        ),
+        (
+            primitive_dotted_return,
+            "unsupported_type",
+            dotted_message(primitive_dotted_return),
+        ),
+        (
+            primitive_dotted_local,
+            "unsupported_type",
+            dotted_message(primitive_dotted_local),
+        ),
+        (
+            missing_array_close,
+            "unexpected_token",
+            missing_array_close_message,
+        ),
+        (
+            missing_dotted_name,
+            "unexpected_token",
+            missing_dotted_name_message,
+        ),
+        (repeated_result, "unexpected_token", repeated_result_message),
+        (
             &over_parameter_limit,
             "parameter_limit",
             parameter_limit_message,
@@ -1062,6 +1162,11 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             ku_string(&message)
         ));
     }
+    body.push_str(&format!(
+        "    ExpectError({}, \"type_depth_exceeded\", {})?\n",
+        ku_string(&rejected_type_depth),
+        ku_string(&rejected_type_depth_message)
+    ));
     body.push_str(&format!(
         "    ExpectError(budget_source, \"work_limit\", {})?\n",
         ku_string(&slice_budget_message)

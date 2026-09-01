@@ -58,6 +58,33 @@ fn CanStartStatement(kind: str): bool {
     return kind == "Ident" || kind == "Int" || kind == "Float" || kind == "String" || kind == "TemplateString" || kind == "True" || kind == "False" || kind == "Null" || kind == "Bang" || kind == "Return" || kind == "Let" || kind == "If" || kind == "While" || kind == "For" || kind == "Break" || kind == "Continue" || kind == "Try" || kind == "Async" || kind == "Fn" || kind == "Fail" || kind == "Panic" || kind == "Print"
 }
 
+struct ExpressionBoundary {
+    paren_depth: int
+    bracket_depth: int
+    steps: int
+    complete: bool
+}
+
+fn EmptyExpressionBoundary(): ExpressionBoundary {
+    return ExpressionBoundary { paren_depth: 0, bracket_depth: 0, steps: 0, complete: false }
+}
+
+fn PushExpressionBoundary(state: ExpressionBoundary, token: Token, previous_can_end: bool): ExpressionBoundary! {
+    complete = state.paren_depth == 0 && state.bracket_depth == 0 && ((token.kind == "Semicolon" || token.kind == "RBrace" || token.kind == "Eof") || (previous_can_end && CanStartStatement(token.kind.clone())))
+    paren_depth = state.paren_depth
+    bracket_depth = state.bracket_depth
+    if (!complete) {
+        if (token.kind == "LParen") { paren_depth = paren_depth + 1 }
+        else if (token.kind == "RParen" && paren_depth > 0) { paren_depth = paren_depth - 1 }
+        if (token.kind == "LBracket") { bracket_depth = bracket_depth + 1 }
+        else if (token.kind == "RBracket" && bracket_depth > 0) { bracket_depth = bracket_depth - 1 }
+        if (token.kind == "LBrace") { RejectAt(token.clone(), "unsupported_expression", "brace expressions are outside the stage-3 subset")? }
+    }
+    steps = state.steps + 1
+    if (steps > 4096) { RejectAt(token, "work_limit", "stage-3 expression boundary budget exceeded")? }
+    return ok(ExpressionBoundary { paren_depth: paren_depth, bracket_depth: bracket_depth, steps: steps, complete: complete })
+}
+
 fn MapTokenCharacters(source: str, tokens: [Token]): SourceMap! {
     characters: [str] = source.chars()
     starts: [int] = []
