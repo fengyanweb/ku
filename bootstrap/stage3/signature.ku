@@ -1,46 +1,131 @@
 import { Token } from "../stage1/token.ku"
 import { Span } from "../stage2/span.ku"
+import { Node } from "../stage2/ast.ku"
 import { RejectAt } from "./support.ku"
 
-struct SignatureType {
+struct TypePart {
+    kind: str
     text: str
     span: Span
-    consumed: int
 }
 
-fn ReadSignatureType(token: Token, next: Token, has_next: bool): SignatureType! {
-    type_text = ""
-    if (token.kind == "Ident" && (token.lexeme == "int" || token.lexeme == "float" || token.lexeme == "bool" || token.lexeme == "str")) {
-        type_text = token.lexeme.clone()
-    } else if (token.kind == "Null") {
-        type_text = "null"
-    } else if (token.kind == "Ident" && (token.lexeme == "string" || token.lexeme == "nil")) {
-        RejectAt(token.clone(), "unexpected_token", "expected type name")?
-    } else if (token.kind == "Ident" || token.kind == "LBracket" || token.kind == "Fn" || token.kind == "Async") {
-        RejectAt(token.clone(), "unsupported_type", "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms")?
-    } else {
-        RejectAt(token.clone(), "unexpected_token", "expected type name")?
+struct SignatureType {
+    parts: [TypePart]
+    consumed: int
+    work: int
+}
+
+struct TypeWindow {
+    tokens: [Token]
+    complete: bool
+}
+
+fn EmptyTypeWindow(): TypeWindow {
+    return TypeWindow { tokens: [], complete: false }
+}
+
+fn TypeWindowContinues(kind: str): bool {
+    return kind == "LBracket" || kind == "RBracket" || kind == "Ident" || kind == "Null" || kind == "Dot" || kind == "Bang" || kind == "Pipe" || kind == "Fn" || kind == "Async"
+}
+
+fn PushTypeWindow(window: TypeWindow, token: Token): TypeWindow! {
+    if (window.complete) { RejectAt(token.clone(), "invalid_token_stream", "type inspection continued past its boundary")? }
+    if (window.tokens.len() >= 512) { RejectAt(token.clone(), "invalid_token_stream", "type inspection escaped its bounded token window")? }
+    boundary = !TypeWindowContinues(token.kind.clone())
+    return ok(TypeWindow { tokens: window.tokens.push(token), complete: boundary })
+}
+
+fn TypeNamePart(text: str, start: Token, end: Token): TypePart {
+    return TypePart { kind: "TypeName", text: text, span: Span { line: start.line, column: start.column, offset: start.offset, end_line: end.end_line, end_column: end.end_column, end_offset: end.end_offset } }
+}
+
+fn TypeArrayPart(start: Token, end: Token): TypePart {
+    return TypePart { kind: "TypeArray", text: "", span: Span { line: start.line, column: start.column, offset: start.offset, end_line: end.end_line, end_column: end.end_column, end_offset: end.end_offset } }
+}
+
+fn TypeResultPart(inner: Span, bang: Token): TypePart {
+    return TypePart { kind: "TypeResult", text: "", span: Span { line: inner.line, column: inner.column, offset: inner.offset, end_line: bang.end_line, end_column: bang.end_column, end_offset: bang.end_offset } }
+}
+
+fn CheckTypeArenaCapacity(node_count: int, edge_count: int, has_child: bool, error_token: Token): null! {
+    if (node_count >= 4096) { RejectAt(error_token.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")? }
+    if (has_child && edge_count >= 8192) { RejectAt(error_token, "edge_limit", "stage-3 parser accepts at most 8192 AST edges")? }
+    return ok(null)
+}
+
+fn TypePartToNode(part: TypePart, first_edge: int, has_child: bool): Node {
+    edge_count = 0
+    if (has_child) { edge_count = 1 }
+    return Node { kind: part.kind, text: part.text, int_value: 0, line: part.span.line, column: part.span.column, offset: part.span.offset, end_line: part.span.end_line, end_column: part.span.end_column, end_offset: part.span.end_offset, first_edge: first_edge, edge_count: edge_count }
+}
+
+fn CheckTypeDepth(count: int, token: Token): null! {
+    if (count > 32) { RejectAt(token, "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
+    return ok(null)
+}
+
+fn ParseTypeWindow(tokens: [Token]): SignatureType! {
+    cursor = 0
+    work = 0
+    wrappers = 0
+    openers: [Token] = []
+    while (tokens[cursor].kind == "LBracket") {
+        if (openers.len() >= 32) { RejectAt(tokens[cursor].clone(), "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
+        openers = openers.push(tokens[cursor].clone())
+        cursor = cursor + 1
+        work = work + 1
     }
-    if (!has_next) {
-        RejectAt(token.clone(), "invalid_token_stream", "function signature type is missing final EOF")?
+    atom = tokens[cursor].clone()
+    name = ""
+    end = atom.clone()
+    custom = false
+    if (atom.kind == "Ident" && (atom.lexeme == "int" || atom.lexeme == "float" || atom.lexeme == "bool" || atom.lexeme == "str")) { name = atom.lexeme.clone() }
+    else if (atom.kind == "Null") { name = "null" }
+    else if (atom.kind == "Ident" && (atom.lexeme == "string" || atom.lexeme == "nil")) { RejectAt(atom.clone(), "unexpected_token", "expected type name")? }
+    else if (atom.kind == "Ident") { name = atom.lexeme.clone(); custom = true }
+    else if (atom.kind == "Fn" || atom.kind == "Async") { RejectAt(atom.clone(), "unsupported_type", "stage-3 types do not support function, async, or union types")? }
+    else { RejectAt(atom.clone(), "unexpected_token", "expected type name")? }
+    cursor = cursor + 1
+    work = work + 1
+    if (!custom && tokens[cursor].kind == "Dot") { RejectAt(tokens[cursor].clone(), "unsupported_type", "dotted type names must start with a custom identifier")? }
+    while (custom && tokens[cursor].kind == "Dot") {
+        cursor = cursor + 1
+        work = work + 1
+        part = tokens[cursor].clone()
+        if (part.kind != "Ident") { RejectAt(part.clone(), "unexpected_token", "expected type name after '.'")? }
+        name = name + "." + part.lexeme.clone()
+        end = part
+        cursor = cursor + 1
+        work = work + 1
     }
-    end = token.clone()
-    consumed = 1
-    if (next.kind == "Bang") {
-        type_text = type_text + "!"
-        end = next
-        consumed = 2
+    parts: [TypePart] = [TypeNamePart(name, atom, end)]
+    if (tokens[cursor].kind == "Bang") {
+        bang = tokens[cursor].clone()
+        wrappers = wrappers + 1
+        parts = parts.push(TypeResultPart(parts[parts.len() - 1].span.clone(), bang))
+        cursor = cursor + 1
+        work = work + 1
     }
-    return ok(SignatureType {
-        text: type_text,
-        span: Span {
-            line: token.line,
-            column: token.column,
-            offset: token.offset,
-            end_line: end.end_line,
-            end_column: end.end_column,
-            end_offset: end.end_offset
-        },
-        consumed: consumed
-    })
+    if (tokens[cursor].kind == "Pipe") { RejectAt(tokens[cursor].clone(), "unsupported_type", "stage-3 types do not support function, async, or union types")? }
+    opener_index = openers.len()
+    while (opener_index > 0) {
+        opener_index = opener_index - 1
+        if (tokens[cursor].kind != "RBracket") { RejectAt(tokens[cursor].clone(), "unexpected_token", "expected ']' after array type")? }
+        close = tokens[cursor].clone()
+        wrappers = wrappers + 1
+        CheckTypeDepth(wrappers, openers[opener_index].clone())?
+        parts = parts.push(TypeArrayPart(openers[opener_index].clone(), close))
+        cursor = cursor + 1
+        work = work + 1
+        if (tokens[cursor].kind == "Bang") {
+            bang = tokens[cursor].clone()
+            wrappers = wrappers + 1
+            CheckTypeDepth(wrappers, bang.clone())?
+            parts = parts.push(TypeResultPart(parts[parts.len() - 1].span.clone(), bang))
+            cursor = cursor + 1
+            work = work + 1
+        }
+        if (tokens[cursor].kind == "Pipe") { RejectAt(tokens[cursor].clone(), "unsupported_type", "stage-3 types do not support function, async, or union types")? }
+    }
+    return ok(SignatureType { parts: parts, consumed: cursor, work: work })
 }
