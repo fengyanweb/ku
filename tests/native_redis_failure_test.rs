@@ -31,6 +31,8 @@ fn main(): null! {
     assert!(generated.contains("#define KU_REDIS_MAX_CONFIG_BYTES 65536ULL"));
     assert!(generated.contains("redis server returned an error"));
     assert!(generated.contains("else ku_redis_client_handoff_available_locked(client)"));
+    assert!(generated.contains("if (GetLastError() == ERROR_TIMEOUT) return -2;\n  return -1;"));
+    assert!(generated.contains("if (result == ETIMEDOUT) return -2;\n  return -1;"));
     let mut harness = generated
         .replacen(
             "typedef struct KuString {",
@@ -50,6 +52,36 @@ fn main(): null! {
         .replacen(
             "static void ku_redis_pool_wake_one(KuRedisPoolSync* sync) {",
             "static int ku_test_redis_wake_one_calls = 0;\nstatic void ku_redis_pool_wake_one(KuRedisPoolSync* sync) { ku_test_redis_wake_one_calls++;",
+            1,
+        )
+        .replacen(
+            "static int ku_redis_pool_lock(KuRedisPoolSync* sync) {",
+            "static int ku_redis_pool_lock(KuRedisPoolSync* sync) { ku_test_pool_lock_enter();",
+            1,
+        )
+        .replacen(
+            "static int ku_redis_pool_unlock(KuRedisPoolSync* sync) {",
+            "static int ku_redis_pool_unlock(KuRedisPoolSync* sync) { ku_test_pool_lock_leave();",
+            1,
+        )
+        .replacen(
+            "static void ku_redis_gate_destroy(KuRedisGate* gate) {",
+            "static void ku_redis_gate_destroy(KuRedisGate* gate) { ku_test_pool_destroy_observed();",
+            1,
+        )
+        .replacen(
+            "static void ku_redis_connection_destroy(KuRedis* connection) {",
+            "static void ku_redis_connection_destroy(KuRedis* connection) { ku_test_pool_destroy_observed();",
+            1,
+        )
+        .replacen(
+            "static void ku_redis_pool_sync_destroy(KuRedisPoolSync* sync) {",
+            "static void ku_redis_pool_sync_destroy(KuRedisPoolSync* sync) { ku_test_pool_destroy_observed();",
+            1,
+        )
+        .replacen(
+            "static int ku_redis_pool_wait_until(KuRedisPoolSync* sync, unsigned long long deadline) {",
+            "static int ku_redis_pool_wait_until(KuRedisPoolSync* sync, unsigned long long deadline) { if (ku_test_script_pool_wait) return ku_test_pool_wait_script(deadline);",
             1,
         );
     harness.push_str(REDIS_FAILURE_STUB);
@@ -79,6 +111,21 @@ fn main(): null! {
         "recv-deadline-overrun",
         "pool-expired-classification",
         "waiter-handoff-helper",
+        "waiter-blocks-idle-newcomer",
+        "waiter-blocks-connect-newcomer",
+        "connect-single-flight-admission",
+        "connect-failure-backoff-clock",
+        "backoff-timer-handoff",
+        "null-client-contract",
+        "resolver-oom-classification",
+        "client-initial-resolver-oom",
+        "lazy-resolver-oom-recovery",
+        "connect-error-classification",
+        "lazy-connect-acquire-budget",
+        "lazy-connect-equal-budget",
+        "lazy-connect-connect-budget",
+        "pool-wait-sync-error",
+        "close-destroys-outside-pool-lock",
         "max-waiters-zero-deferred-close",
         "credential-wipe-close",
         "dynamic-config-validation",
@@ -114,6 +161,11 @@ static void* ku_test_malloc(size_t);
 static void* ku_test_calloc(size_t, size_t);
 static void* ku_test_realloc(void*, size_t);
 static void ku_test_free(void*);
+static void ku_test_pool_lock_enter(void);
+static void ku_test_pool_lock_leave(void);
+static void ku_test_pool_destroy_observed(void);
+static int ku_test_pool_wait_script(unsigned long long);
+static int ku_test_script_pool_wait;
 #define malloc ku_test_malloc
 #define calloc ku_test_calloc
 #define realloc ku_test_realloc
@@ -134,9 +186,11 @@ static int ku_test_ioctlsocket(SOCKET, long, u_long*);
 static int ku_test_send(SOCKET, const char*, int, int);
 static int ku_test_recv(SOCKET, char*, int, int);
 static int ku_test_closesocket(SOCKET);
+static BOOL WINAPI ku_test_condition_wait(PCONDITION_VARIABLE, PSRWLOCK, DWORD, ULONG);
 #define select ku_test_select
 #define ioctlsocket ku_test_ioctlsocket
 #define closesocket ku_test_closesocket
+#define SleepConditionVariableSRW ku_test_condition_wait
 #else
 static int ku_test_socket(int, int, int);
 static int ku_test_connect(int, const struct sockaddr*, socklen_t);
@@ -147,9 +201,15 @@ static int ku_test_fcntl(int, int, ...);
 static ssize_t ku_test_send(int, const void*, size_t, int);
 static ssize_t ku_test_recv(int, void*, size_t, int);
 static int ku_test_close(int);
+static int ku_test_condition_wait(pthread_cond_t*, pthread_mutex_t*, const struct timespec*);
 #define poll ku_test_poll
 #define fcntl ku_test_fcntl
 #define close ku_test_close
+#if defined(__APPLE__)
+#define pthread_cond_timedwait_relative_np ku_test_condition_wait
+#else
+#define pthread_cond_timedwait ku_test_condition_wait
+#endif
 #endif
 #define __ku_handler_now_ms ku_test_now
 #define getaddrinfo ku_test_getaddrinfo
@@ -182,14 +242,18 @@ const REDIS_FAILURE_STUB: &str = r#"
 #undef recv
 #undef closesocket
 #undef close
+#undef SleepConditionVariableSRW
+#undef pthread_cond_timedwait_relative_np
+#undef pthread_cond_timedwait
 
 #define CHECK(value) do { if (!(value)) { fprintf(stderr, "check failed at %d: %s\n", __LINE__, #value); return 1; } } while (0)
 static unsigned long long clock_ms = 1000, expire_at = 0;
 static unsigned long long resolve_elapsed = 0, connect_elapsed = 0, wait_budget = 0;
 static int bad_calls = 0, resolve_calls = 0, free_address_calls = 0;
+static int resolve_error = 0;
 static int socket_calls = 0, close_calls = 0, socket_live = 0, connect_calls = 0;
 static int send_calls = 0, recv_calls = 0, wait_calls = 0, connect_pending = 0;
-static int fail_connect_timeout = 0;
+static int fail_connect_timeout = 0, fail_connect_error = 0;
 static int connect_wait_ready = 0, pending_connect_timeout = 0;
 static int expire_setup = 0, expire_owner = 0;
 static int fail_send_timeout = 0, fail_recv_timeout = 0, fail_recv_transport = 0;
@@ -199,11 +263,65 @@ static size_t fail_size = 0, live_allocations = 0, live_bytes = 0;
 static void* wipe_username = 0;
 static void* wipe_password = 0;
 static int credential_wipes = 0;
+static int pool_lock_depth = 0, destroy_under_pool_lock = 0, free_under_pool_lock = 0;
+static int pool_destroy_observed_calls = 0;
+static int scripted_pool_wait_calls = 0;
+static unsigned long long scripted_pool_wait_deadline = 0;
+static int scripted_pool_wait_error = 0;
+static int condition_wait_calls = 0, fail_condition_wait = 0;
 static struct { void* pointer; size_t size; } allocations[64];
 static struct addrinfo address;
 static struct sockaddr_in socket_address;
 static const char* reply = "";
 static size_t reply_length = 0, reply_position = 0;
+
+static void ku_test_pool_lock_enter(void) {
+  if (pool_lock_depth != 0) bad_calls++;
+  pool_lock_depth++;
+}
+static void ku_test_pool_lock_leave(void) {
+  if (pool_lock_depth != 1) bad_calls++;
+  else pool_lock_depth--;
+}
+static void ku_test_pool_destroy_observed(void) {
+  pool_destroy_observed_calls++;
+  if (pool_lock_depth != 0) destroy_under_pool_lock++;
+}
+static int ku_test_pool_wait_script(unsigned long long deadline) {
+  if (!ku_test_script_pool_wait || pool_lock_depth != 1 || deadline <= clock_ms) {
+    bad_calls++;
+    return -1;
+  }
+  scripted_pool_wait_calls++;
+  scripted_pool_wait_deadline = deadline;
+  if (scripted_pool_wait_error) {
+    scripted_pool_wait_error = 0;
+    return -1;
+  }
+  clock_ms = deadline;
+  return -2;
+}
+
+#if defined(_WIN32)
+static BOOL WINAPI ku_test_condition_wait(
+    PCONDITION_VARIABLE condition, PSRWLOCK mutex, DWORD timeout, ULONG flags) {
+  (void)condition; (void)mutex; (void)timeout; (void)flags;
+  condition_wait_calls++;
+  if (pool_lock_depth != 1 || !fail_condition_wait) bad_calls++;
+  fail_condition_wait = 0;
+  SetLastError(ERROR_INVALID_FUNCTION);
+  return FALSE;
+}
+#else
+static int ku_test_condition_wait(
+    pthread_cond_t* condition, pthread_mutex_t* mutex, const struct timespec* timeout) {
+  (void)condition; (void)mutex; (void)timeout;
+  condition_wait_calls++;
+  if (pool_lock_depth != 1 || !fail_condition_wait) bad_calls++;
+  fail_condition_wait = 0;
+  return EINVAL;
+}
+#endif
 
 static int allocation_slot(void* pointer) {
   for (int i = 0; i < 64; i++) if (allocations[i].pointer == pointer) return i;
@@ -246,6 +364,7 @@ static void* ku_test_realloc(void* pointer, size_t size) {
 }
 static void ku_test_free(void* pointer) {
   if (!pointer) return;
+  if (pool_lock_depth != 0) free_under_pool_lock++;
   int slot = allocation_slot(pointer);
   if (slot < 0) { bad_calls++; return; }
   if (pointer == wipe_username || pointer == wipe_password) {
@@ -266,6 +385,10 @@ static int ku_test_getaddrinfo(const char* host, const char* service, const stru
   resolve_calls++;
   if (!host || strcmp(host, "127.0.0.1") || !service || strcmp(service, "6379") || !hints || !out) {
     bad_calls++; return -1;
+  }
+  if (resolve_error) {
+    int error = resolve_error; resolve_error = 0; *out = 0;
+    clock_ms += resolve_elapsed; return error;
   }
   memset(&address, 0, sizeof(address)); memset(&socket_address, 0, sizeof(socket_address));
   address.ai_family = AF_INET; address.ai_socktype = SOCK_STREAM; address.ai_protocol = IPPROTO_TCP;
@@ -294,6 +417,9 @@ static int socket_connecting(uintptr_t value, const struct sockaddr* target, siz
   connect_calls++; clock_ms += connect_elapsed;
   if (fail_connect_timeout) {
     fail_connect_timeout = 0; set_socket_failure(1); return -1;
+  }
+  if (fail_connect_error) {
+    fail_connect_error = 0; set_socket_failure(0); return -1;
   }
   if (connect_pending) {
 #if defined(_WIN32)
@@ -420,6 +546,32 @@ static KuObject* redis_auth_config(void) {
   ku_object_set(config, text("password"), ku_v_str(text("secret")));
   return config;
 }
+static KuRedisClient* empty_pool(uint32_t max_connections, uint32_t max_waiters) {
+  KuRedisClient* client = (KuRedisClient*)ku_test_malloc(sizeof(KuRedisClient));
+  if (!client) return 0;
+  memset(client, 0, sizeof(*client));
+  client->idle = (KuRedis**)ku_test_malloc((size_t)max_connections * sizeof(KuRedis*));
+  if (!client->idle) { ku_test_free(client); return 0; }
+  memset(client->idle, 0, (size_t)max_connections * sizeof(KuRedis*));
+  if (ku_redis_pool_sync_init(&client->sync) != 0) {
+    ku_test_free(client->idle); ku_test_free(client); return 0;
+  }
+  client->host = text("127.0.0.1");
+  client->port = 6379;
+  client->max_connections = max_connections;
+  client->max_waiters = max_waiters;
+  client->connect_timeout_ms = 5000;
+  client->acquire_timeout_ms = 5000;
+  client->command_timeout_ms = 5000;
+  return client;
+}
+static void fail_resolver_out_of_memory(void) {
+#if defined(_WIN32)
+  resolve_error = WSA_NOT_ENOUGH_MEMORY;
+#else
+  resolve_error = EAI_MEMORY;
+#endif
+}
 static int rejects_dynamic_config(KuObject* config) {
   KuResult_redis_client result = ku_redis_client(config);
   int rejected = !result.ok && !result.value && static_error(result.error, "invalid_config");
@@ -493,7 +645,7 @@ static int run_case(const char* mode) {
     else { connect_pending = 1; connect_wait_ready = 1; pending_connect_timeout = 1; }
     KuRedisOpenResult opened = ku_redis_open_connection(
         text("127.0.0.1"), 6379, 5000, ku_redis_deadline_after_ms(5000));
-    CHECK(!opened.ok && !opened.value && static_error(opened.error, "timeout")
+    CHECK(!opened.ok && !opened.value && static_error(opened.error, "connect_timeout")
         && !fail_connect_timeout && !connect_wait_ready && !pending_connect_timeout
         && connect_calls == 1 && close_calls == 1);
     ku_error_drop(&opened.error);
@@ -525,7 +677,7 @@ static int run_case(const char* mode) {
     client->connect_timeout_ms = 5000; client->acquire_timeout_ms = 5000;
     client->command_timeout_ms = 5000; client->total_connections = 1; client->borrowed = 1;
     KuRedisLeaseResult lease = ku_redis_client_acquire(client, clock_ms);
-    CHECK(!lease.ok && !lease.value && static_error(lease.error, "timeout")
+    CHECK(!lease.ok && !lease.value && static_error(lease.error, "acquire_timeout")
         && !client->waiters && !close_calls);
     ku_error_drop(&lease.error);
     ku_redis_close(client);
@@ -548,6 +700,224 @@ static int run_case(const char* mode) {
     client->idle_count = 1; client->waiters = 0;
     ku_redis_close(client); client = 0; conn = 0;
     CHECK(!client && !conn && close_calls == 1);
+  } else if (!strcmp(mode, "waiter-blocks-idle-newcomer")) {
+    KuRedis* conn = open_connection();
+    KuRedisClient* client = empty_pool(1, 1); CHECK(client);
+    client->idle[0] = conn; client->idle_count = 1; client->total_connections = 1;
+    client->waiters = 1; /* A queued borrower owns the next handoff. */
+    KuRedisLeaseResult newcomer = ku_redis_client_acquire(
+        client, ku_redis_deadline_after_ms(5000));
+    CHECK(!newcomer.ok && !newcomer.value
+        && static_error(newcomer.error, "pool_busy")
+        && client->idle_count == 1 && client->idle[0] == conn
+        && client->borrowed == 0 && client->total_connections == 1);
+    ku_error_drop(&newcomer.error);
+    client->waiters = 0;
+    ku_redis_close(client); client = 0; conn = 0;
+    CHECK(!client && !conn && close_calls == 1);
+  } else if (!strcmp(mode, "waiter-blocks-connect-newcomer")) {
+    KuRedisClient* client = empty_pool(1, 1); CHECK(client);
+    client->waiters = 1; /* Do not open a socket ahead of this waiter. */
+    KuRedisLeaseResult newcomer = ku_redis_client_acquire(
+        client, ku_redis_deadline_after_ms(5000));
+    CHECK(!newcomer.ok && !newcomer.value
+        && static_error(newcomer.error, "pool_busy")
+        && !resolve_calls && !socket_calls && !connect_calls
+        && client->idle_count == 0 && client->borrowed == 0
+        && client->total_connections == 0);
+    ku_error_drop(&newcomer.error);
+    client->waiters = 0;
+    ku_redis_close(client); client = 0;
+    CHECK(!client && !close_calls);
+  } else if (!strcmp(mode, "connect-single-flight-admission")) {
+    KuRedisClient* client = empty_pool(2, 0); CHECK(client);
+    client->connect_in_flight = 1; /* Another borrower owns the connect flight. */
+    KuRedisLeaseResult newcomer = ku_redis_client_acquire(
+        client, ku_redis_deadline_after_ms(5000));
+    CHECK(!newcomer.ok && !newcomer.value
+        && static_error(newcomer.error, "pool_busy")
+        && !resolve_calls && !socket_calls && !connect_calls
+        && client->idle_count == 0 && client->borrowed == 0
+        && client->total_connections == 0 && client->connect_in_flight == 1);
+    ku_error_drop(&newcomer.error);
+    client->connect_in_flight = 0;
+    ku_redis_close(client); client = 0;
+    CHECK(!client && !close_calls);
+  } else if (!strcmp(mode, "connect-failure-backoff-clock")) {
+    KuRedisClient* client = empty_pool(1, 1); CHECK(client);
+    unsigned long long failure_time = clock_ms;
+    fail_connect_timeout = 1;
+    KuRedisLeaseResult failed = ku_redis_client_acquire(
+        client, ku_redis_deadline_after_ms(5000));
+    CHECK(!failed.ok && !failed.value && static_error(failed.error, "connect_timeout")
+        && !fail_connect_timeout && socket_calls == 1 && connect_calls == 1
+        && close_calls == 1 && client->consecutive_connect_failures == 1
+        && client->reconnect_not_before_ms >= failure_time + 13
+        && client->reconnect_not_before_ms <= failure_time + 25
+        && !client->connect_in_flight && !client->backoff_timer_armed
+        && client->total_connections == 0 && client->borrowed == 0);
+    ku_error_drop(&failed.error);
+    unsigned long long retry_at = client->reconnect_not_before_ms;
+    ku_test_script_pool_wait = 1;
+    KuRedisLeaseResult recovered = ku_redis_client_acquire(
+        client, ku_redis_deadline_after_ms(5000));
+    CHECK(recovered.ok && recovered.value
+        && scripted_pool_wait_calls == 1
+        && scripted_pool_wait_deadline == retry_at && clock_ms == retry_at
+        && socket_calls == 2 && connect_calls == 2 && close_calls == 1
+        && client->consecutive_connect_failures == 0
+        && client->reconnect_not_before_ms == 0
+        && !client->connect_in_flight && !client->backoff_timer_armed
+        && client->total_connections == 1 && client->borrowed == 1);
+    ku_redis_client_release(client, recovered.value);
+    ku_redis_close(client); client = 0;
+    CHECK(!client && close_calls == 2);
+  } else if (!strcmp(mode, "backoff-timer-handoff")) {
+    KuRedisClient* client = empty_pool(1, 2); CHECK(client);
+    int before_wake = ku_test_redis_wake_one_calls;
+    client->waiters = 2; /* current timer owner plus another blocked waiter */
+    client->backoff_timer_armed = 1;
+    CHECK(ku_redis_pool_lock(&client->sync) == 0);
+    ku_redis_client_release_backoff_timer_locked(client, 1);
+    CHECK(ku_redis_pool_unlock(&client->sync) == 0);
+    CHECK(!client->backoff_timer_armed
+        && ku_test_redis_wake_one_calls == before_wake + 1);
+    client->waiters = 0;
+    ku_redis_close(client); client = 0;
+    CHECK(!client && !close_calls);
+  } else if (!strcmp(mode, "null-client-contract")) {
+    KuResult_null ping = ku_redis_ping(NULL);
+    KuResult_null set = ku_redis_set(NULL, text("key"), text("value"));
+    KuResult_str get = ku_redis_get(NULL, text("key"));
+    KuResult_int del = ku_redis_del(NULL, text("key"));
+    KuResult_bool exists = ku_redis_exists(NULL, text("key"));
+    CHECK(!ping.ok && static_error(ping.error, "client_closed")
+        && !set.ok && static_error(set.error, "client_closed")
+        && !get.ok && !get.value.ptr && static_error(get.error, "client_closed")
+        && !del.ok && static_error(del.error, "client_closed")
+        && !exists.ok && static_error(exists.error, "client_closed")
+        && !allocation_calls && !resolve_calls && !socket_calls);
+    ku_error_drop(&ping.error); ku_error_drop(&set.error); ku_error_drop(&get.error);
+    ku_error_drop(&del.error); ku_error_drop(&exists.error);
+  } else if (!strcmp(mode, "resolver-oom-classification")) {
+    fail_resolver_out_of_memory();
+    KuRedisOpenResult opened = ku_redis_open_connection(
+        text("127.0.0.1"), 6379, 5000, ku_redis_deadline_after_ms(5000));
+    CHECK(!opened.ok && !opened.value && static_error(opened.error, "out_of_memory")
+        && !resolve_error && resolve_calls == 1 && !free_address_calls
+        && !socket_calls && !connect_calls && !close_calls);
+    ku_error_drop(&opened.error);
+  } else if (!strcmp(mode, "client-initial-resolver-oom")) {
+    KuObject* config = redis_config_base(); CHECK(config);
+    size_t baseline_allocations = live_allocations, baseline_bytes = live_bytes;
+    int destroys_before = pool_destroy_observed_calls;
+    fail_resolver_out_of_memory();
+    KuResult_redis_client client = ku_redis_client(config);
+    CHECK(!client.ok && !client.value && static_error(client.error, "out_of_memory")
+        && !resolve_error && resolve_calls == 1 && !free_address_calls
+        && !socket_calls && !connect_calls && !close_calls
+        && pool_lock_depth == 0 && destroy_under_pool_lock == 0
+        && pool_destroy_observed_calls == destroys_before + 1
+        && live_allocations == baseline_allocations && live_bytes == baseline_bytes);
+    ku_error_drop(&client.error); ku_object_drop(config); config = 0;
+    CHECK(!config);
+  } else if (!strcmp(mode, "lazy-resolver-oom-recovery")) {
+    KuRedisClient* client = empty_pool(1, 1); CHECK(client);
+    size_t baseline_allocations = live_allocations, baseline_bytes = live_bytes;
+    unsigned long long failure_time = clock_ms;
+    fail_resolver_out_of_memory();
+    KuRedisLeaseResult failed = ku_redis_client_acquire(
+        client, ku_redis_deadline_after_ms(5000));
+    CHECK(!failed.ok && !failed.value && static_error(failed.error, "out_of_memory")
+        && !resolve_error && resolve_calls == 1 && !free_address_calls
+        && !socket_calls && !connect_calls && !close_calls
+        && client->total_connections == 0 && client->borrowed == 0
+        && !client->connect_in_flight && !client->backoff_timer_armed
+        && client->consecutive_connect_failures == 1
+        && client->reconnect_not_before_ms >= failure_time + 13
+        && client->reconnect_not_before_ms <= failure_time + 25
+        && live_allocations == baseline_allocations && live_bytes == baseline_bytes);
+    ku_error_drop(&failed.error);
+
+    unsigned long long retry_at = client->reconnect_not_before_ms;
+    ku_test_script_pool_wait = 1;
+    KuRedisLeaseResult recovered = ku_redis_client_acquire(
+        client, ku_redis_deadline_after_ms(5000));
+    CHECK(recovered.ok && recovered.value
+        && scripted_pool_wait_calls == 1 && scripted_pool_wait_deadline == retry_at
+        && clock_ms == retry_at && resolve_calls == 2 && free_address_calls == 1
+        && socket_calls == 1 && connect_calls == 1 && !close_calls
+        && client->total_connections == 1 && client->borrowed == 1
+        && !client->connect_in_flight && !client->backoff_timer_armed
+        && client->consecutive_connect_failures == 0
+        && client->reconnect_not_before_ms == 0);
+    ku_redis_client_release(client, recovered.value);
+    CHECK(client->total_connections == 1 && client->borrowed == 0
+        && client->idle_count == 1 && !close_calls);
+    ku_redis_close(client); client = 0;
+    CHECK(!client && close_calls == 1 && pool_lock_depth == 0
+        && destroy_under_pool_lock == 0 && free_under_pool_lock == 0);
+  } else if (!strcmp(mode, "connect-error-classification")) {
+    fail_connect_error = 1;
+    KuRedisOpenResult opened = ku_redis_open_connection(
+        text("127.0.0.1"), 6379, 5000, ku_redis_deadline_after_ms(5000));
+    CHECK(!opened.ok && !opened.value && static_error(opened.error, "connect_error")
+        && !fail_connect_error && socket_calls == 1 && connect_calls == 1
+        && close_calls == 1);
+    ku_error_drop(&opened.error);
+  } else if (!strcmp(mode, "lazy-connect-acquire-budget")
+      || !strcmp(mode, "lazy-connect-equal-budget")) {
+    KuRedisClient* client = empty_pool(1, 1); CHECK(client);
+    client->acquire_timeout_ms = 5;
+    client->connect_timeout_ms = !strcmp(mode, "lazy-connect-equal-budget") ? 5 : 5000;
+    connect_pending = 1;
+    unsigned long long started = clock_ms;
+    KuRedisLeaseResult lease = ku_redis_client_acquire(client, started + 50);
+    CHECK(!lease.ok && !lease.value && static_error(lease.error, "acquire_timeout")
+        && clock_ms == started + 5 && wait_budget == 5
+        && socket_calls == 1 && connect_calls == 1 && close_calls == 1
+        && client->total_connections == 0 && client->borrowed == 0
+        && client->consecutive_connect_failures == 1);
+    ku_error_drop(&lease.error);
+    ku_redis_close(client); client = 0;
+    CHECK(!client && close_calls == 1);
+  } else if (!strcmp(mode, "lazy-connect-connect-budget")) {
+    KuRedisClient* client = empty_pool(1, 1); CHECK(client);
+    client->acquire_timeout_ms = 50;
+    client->connect_timeout_ms = 5;
+    connect_pending = 1;
+    unsigned long long started = clock_ms;
+    KuRedisLeaseResult lease = ku_redis_client_acquire(client, started + 50);
+    CHECK(!lease.ok && !lease.value && static_error(lease.error, "connect_timeout")
+        && clock_ms == started + 5 && wait_budget == 5
+        && socket_calls == 1 && connect_calls == 1 && close_calls == 1
+        && client->total_connections == 0 && client->borrowed == 0
+        && !client->connect_in_flight && !client->backoff_timer_armed
+        && client->consecutive_connect_failures == 1);
+    ku_error_drop(&lease.error); connect_pending = 0;
+    ku_redis_close(client); client = 0;
+    CHECK(!client && close_calls == 1);
+  } else if (!strcmp(mode, "pool-wait-sync-error")) {
+    KuRedisClient* client = empty_pool(1, 1); CHECK(client);
+    client->connect_in_flight = 1;
+    fail_condition_wait = 1;
+    KuRedisLeaseResult lease = ku_redis_client_acquire(client, clock_ms + 50);
+    CHECK(!lease.ok && !lease.value && static_error(lease.error, "sync_error")
+        && condition_wait_calls == 1 && !fail_condition_wait
+        && scripted_pool_wait_calls == 0 && !scripted_pool_wait_error
+        && client->waiters == 0 && client->borrowed == 0);
+    ku_error_drop(&lease.error); client->connect_in_flight = 0;
+    ku_redis_close(client); client = 0;
+    CHECK(!client && !close_calls);
+  } else if (!strcmp(mode, "close-destroys-outside-pool-lock")) {
+    KuRedis* conn = open_connection();
+    KuRedisClient* client = empty_pool(1, 1); CHECK(client);
+    client->idle[0] = conn; client->idle_count = 1; client->total_connections = 1;
+    destroy_under_pool_lock = 0; free_under_pool_lock = 0;
+    ku_redis_close(client); client = 0; conn = 0;
+    CHECK(!client && !conn && close_calls == 1
+        && pool_lock_depth == 0 && destroy_under_pool_lock == 0
+        && free_under_pool_lock == 0);
   } else if (!strcmp(mode, "max-waiters-zero-deferred-close")) {
     KuRedis* conn = open_connection();
     /* Pool storage is released by runtime functions compiled through the
@@ -561,7 +931,7 @@ static int run_case(const char* mode) {
     client->connect_timeout_ms = 5000; client->acquire_timeout_ms = 5000;
     client->command_timeout_ms = 5000; client->total_connections = 1; client->borrowed = 1;
     KuRedisLeaseResult rejected = ku_redis_client_acquire(client, ku_redis_deadline_after_ms(5000));
-    CHECK(!rejected.ok && !rejected.value && static_error(rejected.error, "pool_exhausted"));
+    CHECK(!rejected.ok && !rejected.value && static_error(rejected.error, "pool_busy"));
     ku_error_drop(&rejected.error);
     ku_redis_close(client); /* borrowed connection keeps the client alive without blocking */
     CHECK(close_calls == 0);
@@ -660,7 +1030,7 @@ static int run_case(const char* mode) {
     else { fputs("unknown test case\n", stderr); return 2; }
     KuRedisOpenResult opened = ku_redis_open_connection(
         text("127.0.0.1"), 6379, 5000, ku_redis_deadline_after_ms(5000));
-    CHECK(!opened.ok && !opened.value && static_error(opened.error, "timeout")); ku_error_drop(&opened.error);
+    CHECK(!opened.ok && !opened.value && static_error(opened.error, "connect_timeout")); ku_error_drop(&opened.error);
     if (!strcmp(mode, "expired-handler")) CHECK(!allocation_calls && !resolve_calls && !socket_calls);
     else {
       CHECK(resolve_calls == 1 && free_address_calls == 1 && clock_ms == expire_at);
@@ -675,7 +1045,8 @@ static int run_case(const char* mode) {
     fprintf(stderr, "fixture state: bad=%d socket=%d allocations=%zu bytes=%zu\n",
         bad_calls, socket_live, live_allocations, live_bytes);
   }
-  CHECK(!bad_calls && !socket_live && !live_allocations && !live_bytes);
+  CHECK(!bad_calls && !pool_lock_depth && !socket_live
+      && !live_allocations && !live_bytes);
   return 0;
 }
 int main(int argc, char** argv) {

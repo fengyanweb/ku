@@ -41,6 +41,7 @@ fn native_pg_connect_poller_is_portable_bounded_and_lean() {
         "#define KU_PGRES_POLLING_WRITING 2",
         "#define KU_PGRES_POLLING_OK 3",
         "#define KU_PGRES_POLLING_ACTIVE 4",
+        "#define KU_PG_CONNECT_OUT_OF_MEMORY 3",
         "static KuPgConnectAttempt ku_pg_connect_until",
         "PGconn* h = PQconnectStartParams(keywords, values, 1)",
         "const char* keywords[] = { \"dbname\", \"client_encoding\", 0 }",
@@ -305,6 +306,12 @@ static int ku_test_timeout_error(KuError error) {
       && ku_test_string_is(error.message, "PostgreSQL client connection timed out");
 }
 
+static int ku_test_oom_error(KuError error) {
+  return ku_test_string_is(error.domain, "pg")
+      && ku_test_string_is(error.code, "out_of_memory")
+      && ku_test_string_is(error.message, "PostgreSQL allocation failed");
+}
+
 int main(void) {
   KuString conninfo = ku_string_static((const uint8_t*)"host=db-a,db-b password=fixture-secret", sizeof("host=db-a,db-b password=fixture-secret") - 1);
 
@@ -346,7 +353,17 @@ int main(void) {
   if (!ku_test_attempt(KU_TEST_ENCODING_BAD, 50, KU_PG_CONNECT_FAILED)) return 18;
   if (!ku_test_attempt(KU_TEST_UNKNOWN_POLL, 50, KU_PG_CONNECT_FAILED)) return 19;
   if (!ku_test_attempt(KU_TEST_POLL_ERROR, 50, KU_PG_CONNECT_FAILED)) return 20;
-  if (!ku_test_attempt(KU_TEST_NULL_START, 50, KU_PG_CONNECT_FAILED)) return 21;
+  if (!ku_test_attempt(KU_TEST_NULL_START, 50, KU_PG_CONNECT_OUT_OF_MEMORY)) return 21;
+
+  ku_test_mode = KU_TEST_NULL_START;
+  int starts_before_oom = ku_test_start_calls;
+  int finishes_before_oom = ku_test_finish_calls;
+  KuResult_pg_client start_oom = ku_pg_client_open(conninfo, 1, 64, 5000, 5000, 30000);
+  if (start_oom.ok || start_oom.value || !ku_test_oom_error(start_oom.error)
+      || ku_test_start_calls != starts_before_oom + 1
+      || ku_test_finish_calls != finishes_before_oom
+      || ku_test_live_connections != 0) return 38;
+  ku_error_drop(&start_oom.error);
 
   int active_before = ku_test_active_waits;
   if (!ku_test_attempt(KU_TEST_ACTIVE_OK, 50, KU_PG_CONNECT_OK)) return 22;

@@ -142,8 +142,12 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
         "PostgreSQL statement may have executed; outcome is unknown; never retry automatically; close and reconnect",
         "PostgreSQL statement completed but its result could not be delivered; never retry automatically",
         "DISCARD ALL",
-        "ku_pg_client_cleanup_connection(p->conns[slot], broken, deadline)",
+        "ku_pg_client_cleanup_connection(connection, broken, deadline)",
         "ku_pg_client_release(p, slot, broken || PQstatus(c) != KU_PG_CONNECTION_OK, deadline)",
+        "ku_pg_client_record_connect_failure_locked",
+        "!p->connect_in_flight && now >= p->reconnect_not_before_ms",
+        "p->reconnect_not_before_ms > now && !p->backoff_timer_armed",
+        "ku_pg_client_release_backoff_timer_locked(p, owns_backoff_timer)",
     ] {
         assert!(
             generated.contains(expected),
@@ -185,6 +189,27 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
         "ku_pg_query_params_validated_impl(c, ku_string_static((const uint8_t*)\"DISCARD ALL\""
     ));
     assert!(cleanup.contains("reset_failed || ku_pg_deadline_expired(deadline)"));
+    let release = generated
+        .split_once("static void ku_pg_client_release(")
+        .expect("client release")
+        .1
+        .split_once("static KuResult_pg_result ku_pg_client_query(")
+        .expect("client query after release")
+        .0;
+    assert!(release.contains("int cleanup_allowed = !p->closing"));
+    assert!(release.contains("if (!cleanup_allowed) broken = 1"));
+    let detach = release.find("PGconn* discard = 0").expect("detached close");
+    let unlock = release[detach..]
+        .find("ku_pg_mutex_unlock(&p->lock)")
+        .map(|offset| detach + offset)
+        .expect("unlock after detach");
+    let finish = release
+        .find("if (discard) PQfinish(discard)")
+        .expect("finish detached connection");
+    assert!(
+        unlock < finish,
+        "PQfinish must run after releasing the pool mutex"
+    );
     let acquire = generated
         .split_once("static int ku_pg_client_acquire(")
         .expect("client acquire")
@@ -193,7 +218,10 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
         .expect("client cleanup")
         .0;
     assert!(acquire.contains("if (now >= deadline) { ku_pg_client_handoff_available_locked(p)"));
-    assert!(acquire.contains("if (wait_result != 0) { ku_pg_client_handoff_available_locked(p)"));
+    assert!(acquire.contains("if (wait_result != 0) { now = ku_pg_now_ms()"));
+    assert!(acquire.contains(
+        "if (wait_result == 1 && wait_deadline < deadline && now < deadline) { has_waited = 1; continue; } ku_pg_client_handoff_available_locked(p)"
+    ));
     let handoff = generated
         .split_once("static void ku_pg_client_handoff_available_locked(")
         .expect("client waiter handoff")
@@ -202,7 +230,13 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
         .expect("client acquire after handoff")
         .0;
     assert!(handoff.contains("p->waiters == 0"));
-    assert!(handoff.contains("if (!p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }"));
+    assert!(handoff
+        .contains("if (p->conns[i] && !p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }"));
+    assert!(handoff.contains(
+        "if (p->connect_in_flight || ku_pg_now_ms() < p->reconnect_not_before_ms) return;"
+    ));
+    assert!(handoff
+        .contains("if (!p->conns[i] && !p->in_use[i]) { ku_pg_cond_signal(&p->cv); return; }"));
     let poison = generated
         .split_once("static void ku_pg_break_connection(")
         .expect("connection poison")
@@ -236,6 +270,8 @@ static void* ku_test_pg_malloc(size_t);
 static void* ku_test_pg_calloc(size_t, size_t);
 static void* ku_test_pg_realloc(void*, size_t);
 static void ku_test_pg_free(void*);
+static int ku_test_pg_pool_lock_depth = 0;
+static int ku_test_pg_finishes_while_pool_locked = 0;
 #define malloc ku_test_pg_malloc
 #define calloc ku_test_pg_calloc
 #define realloc ku_test_pg_realloc
@@ -276,6 +312,18 @@ static void ku_test_pg_free(void*);
         .replace(
             "static void ku_pg_cond_signal(KuPgCond* cond) {",
             "static int ku_test_pg_signal_calls = 0;\nstatic void ku_pg_cond_signal(KuPgCond* cond) { ku_test_pg_signal_calls++;",
+        )
+        .replace(
+            "static void ku_pg_mutex_lock(KuPgMutex* mutex) {",
+            "static void ku_pg_mutex_lock(KuPgMutex* mutex) { ku_test_pg_pool_lock_depth++;",
+        )
+        .replace(
+            "static void ku_pg_mutex_unlock(KuPgMutex* mutex) {",
+            "static void ku_pg_mutex_unlock(KuPgMutex* mutex) { ku_test_pg_pool_lock_depth--;",
+        )
+        .replace(
+            "static int ku_pg_cond_wait_ms(KuPgCond* cond, KuPgMutex* mutex, unsigned long long timeout_ms) {",
+            "static int ku_test_pg_wait_failure = 0;\nstatic int ku_pg_cond_wait_ms(KuPgCond* cond, KuPgMutex* mutex, unsigned long long timeout_ms) { if (ku_test_pg_wait_failure) { ku_test_pg_wait_failure = 0; return -1; }",
         );
     harness.push_str("\n#undef malloc\n#undef calloc\n#undef realloc\n#undef free\n");
     harness.push_str(QUERY_STUB);
@@ -525,14 +573,14 @@ struct pg_conn {
 struct pg_result { int status, mode, number; };
 static PGconn* connections[128];
 static unsigned long long clock_ms = 1000, clock_step = 0, test_deadline = 0;
-static int starts = 0, finishes = 0, sends = 0, param_sends = 0, clears = 0;
+static int connect_attempts = 0, starts = 0, finishes = 0, sends = 0, param_sends = 0, clears = 0;
 static int live_results = 0, live_connections = 0, shutdowns = 0, bad_calls = 0;
 static int both_waits = 0, read_waits = 0, get_gate = 0, restore_mode = T_RESTORE;
 static int mode_on_send = T_OK, fail_nonblocking = 0, parameter_checks = 0;
 static int reset_mode_on_send = T_RESTORE, reset_sends = 0, user_sends = 0;
 static int next_user_transaction_status = KU_PQTRANS_IDLE;
 static int expire_encoding_observation = 0, connect_elapsed = 0;
-static int fail_connect_on_attempt = 0;
+static int fail_connect_on_attempt = 0, bad_connect_on_attempt = 0;
 static int poisoned_consumes = 0;
 static size_t fail_malloc_size = 0;
 static int injected_allocation_failures = 0;
@@ -542,6 +590,8 @@ static int expire_oom_after_shutdown = 0;
 static struct { void* pointer; size_t size; } runtime_allocations[16];
 static size_t runtime_bytes = 0, runtime_peak_bytes = 0;
 static unsigned long long last_wait_budget = 0;
+static KuPgClient* reentrant_connect_pool = 0;
+static int reentrant_connect_checked = 0, reentrant_connect_violation = 0;
 #define CHECK(value) do { if (!(value)) { fprintf(stderr, "check failed at %d: %s\n", __LINE__, #value); return 1; } } while (0)
 static int runtime_allocation_index(void* pointer) {
   if (pointer) for (int i = 0; i < 16; i++) if (runtime_allocations[i].pointer == pointer) return i;
@@ -645,11 +695,29 @@ static int ku_test_pg_poll(struct pollfd* item, nfds_t count, int timeout_ms) {
 }
 PGconn* PQconnectStartParams(const char* const* keys, const char* const* values, int expand) {
   (void)keys; (void)values; (void)expand;
+  connect_attempts++;
+  if (reentrant_connect_pool && !reentrant_connect_checked) {
+    reentrant_connect_checked = 1;
+    int attempts_before_competitor = connect_attempts;
+    PGconn* competitor = 0; KuError competitor_error = {0};
+    int competitor_slot = ku_pg_client_acquire(
+        reentrant_connect_pool, &competitor, &competitor_error, clock_ms + 1);
+    if (competitor_slot >= 0 || competitor || connect_attempts != attempts_before_competitor) {
+      reentrant_connect_violation++;
+    }
+    if (competitor_slot >= 0) {
+      ku_pg_client_release(reentrant_connect_pool, competitor_slot, 1, clock_ms + 1);
+    } else {
+      ku_error_drop(&competitor_error);
+    }
+  }
   if (fail_connect_on_attempt > 0 && --fail_connect_on_attempt == 0) return 0;
+  int bad_connect = bad_connect_on_attempt > 0 && --bad_connect_on_attempt == 0;
   if (starts >= 127) { bad_calls++; return 0; }
   PGconn* conn = (PGconn*)calloc(1, sizeof(PGconn));
   if (!conn) abort();
-  conn->id = ++starts; conn->utf8 = 1; connections[conn->id] = conn; live_connections++;
+  conn->id = ++starts; conn->status = bad_connect ? KU_PG_CONNECTION_BAD : KU_PG_CONNECTION_OK;
+  conn->utf8 = 1; connections[conn->id] = conn; live_connections++;
   return conn;
 }
 int PQconnectPoll(PGconn* conn) { (void)conn; clock_ms += (unsigned long long)connect_elapsed; return KU_PGRES_POLLING_OK; }
@@ -666,6 +734,7 @@ const char* PQparameterStatus(const PGconn* conn, const char* parameter) {
 int PQsetnonblocking(PGconn* conn, int mode) { if (fail_nonblocking) return -1; conn->nonblocking = mode; return 0; }
 void PQfinish(PGconn* conn) {
   if (!conn) return;
+  if (ku_test_pg_pool_lock_depth != 0) ku_test_pg_finishes_while_pool_locked++;
   /* Check identity before dereferencing so a double-drop is reported without
      the mock itself reading freed storage. */
   for (int id = 1; id < 128; id++) if (connections[id] == conn) {
@@ -857,7 +926,7 @@ int main(void) {
   comparison_starts = starts; comparison_finishes = finishes;
   fail_connect_on_attempt = 2;
   comparison = HandleComparisons();
-  CHECK(!comparison.ok && equals(comparison.error.domain, "pg") && equals(comparison.error.code, "connect_error")
+  CHECK(!comparison.ok && equals(comparison.error.domain, "pg") && equals(comparison.error.code, "out_of_memory")
       && !fail_connect_on_attempt && starts == comparison_starts + 1
       && finishes == comparison_finishes + 1 && !live_connections && !bad_calls
       && !live_runtime_allocations && !runtime_bytes);
@@ -1139,12 +1208,47 @@ int main(void) {
   ku_pg_client_handoff_available_locked(pool);
   CHECK(ku_test_pg_signal_calls == before_handoff_signals + 1);
   pool->waiters = 0;
+
+  int before_timer_handoff_signals = ku_test_pg_signal_calls;
+  pool->waiters = 1; /* another waiter remains after the timer owner wakes */
+  pool->backoff_timer_armed = 1;
+  ku_pg_client_release_backoff_timer_locked(pool, 1);
+  CHECK(!pool->backoff_timer_armed
+      && ku_test_pg_signal_calls == before_timer_handoff_signals + 1);
+  pool->waiters = 0;
+
+  pool->in_use[0] = 1; pool->active = 1; ku_test_pg_wait_failure = 1;
+  PGconn* sync_connection = 0; KuError sync_error = {0};
+  CHECK(ku_pg_client_acquire(pool, &sync_connection, &sync_error, clock_ms + 50) < 0
+      && !sync_connection && equals(sync_error.code, "sync_error")
+      && !ku_test_pg_wait_failure && pool->waiters == 0);
+  ku_error_drop(&sync_error); pool->in_use[0] = 0; pool->active = 0;
+
+  /* A thread that has not waited must never barge ahead of an already queued
+     borrower. Cover both forms of immediately available capacity: an idle
+     connection and a lazy-connect empty slot. The synthetic existing waiter
+     is enough to make this deterministic without scheduler timing. */
+  pool->waiters = 1;
+  PGconn* barged = 0; KuError barged_error = {0}; int before_attempts = connect_attempts;
+  CHECK(ku_pg_client_acquire(pool, &barged, &barged_error, clock_ms + 1) < 0
+      && !barged && equals(barged_error.code, "acquire_timeout")
+      && pool->waiters == 1 && pool->active == 0 && !pool->in_use[0]
+      && pool->conns[0] && connect_attempts == before_attempts);
+  ku_error_drop(&barged_error);
+  PGconn* removed_idle = pool->conns[0]; pool->conns[0] = 0; PQfinish(removed_idle);
+  barged_error = (KuError){0}; before_attempts = connect_attempts;
+  CHECK(ku_pg_client_acquire(pool, &barged, &barged_error, clock_ms + 1) < 0
+      && !barged && equals(barged_error.code, "acquire_timeout")
+      && pool->waiters == 1 && pool->active == 0 && !pool->in_use[0]
+      && !pool->conns[0] && connect_attempts == before_attempts);
+  ku_error_drop(&barged_error); pool->waiters = 0;
+
   PGconn* held = 0; KuError held_error = {0};
   int held_slot = ku_pg_client_acquire(pool, &held, &held_error, clock_ms + 50);
   CHECK(held_slot == 0 && held && pool->active == 1 && pool->waiters == 0);
   pool->max_waiters = 0; PGconn* rejected = 0; KuError rejected_error = {0};
   CHECK(ku_pg_client_acquire(pool, &rejected, &rejected_error, clock_ms + 50) < 0
-      && !rejected && equals(rejected_error.code, "too_many_waiters")
+      && !rejected && equals(rejected_error.code, "pool_busy")
       && pool->active == 1 && pool->waiters == 0);
   ku_error_drop(&rejected_error); pool->max_waiters = 64;
   int before_resets = reset_sends;
@@ -1209,8 +1313,82 @@ int main(void) {
   connect_elapsed = 3; __ku_handler_deadline = clock_ms + 7;
   result = ku_pg_client_query(pool, text("SELECT 1"), empty_params); __ku_handler_deadline = 0; connect_elapsed = 0;
   CHECK(error_is(result, "execution_unknown") && last_wait_budget == 4 && !pool->conns[0] && pool->active == 0); ku_error_drop(&result.error);
-  ku_drop_pg_client(&pool);
-  CHECK(!pool && live_connections == 0 && live_results == 0 && starts == finishes);
+
+  /* close() linearizes before this active borrower releases. Release must skip
+     DISCARD ALL, detach under the mutex, finish outside it, and perform the
+     deferred pool disposal exactly once. */
+  PGconn* closing_connection = 0; KuError closing_error = {0};
+  int closing_slot = ku_pg_client_acquire(
+      pool, &closing_connection, &closing_error, clock_ms + 50);
+  CHECK(closing_slot == 0 && closing_connection && pool->active == 1);
+  before_resets = reset_sends; int before_close_finishes = finishes;
+  KuPgClient* closing_pool = pool; pool = 0;
+  ku_pg_client_close_owned(closing_pool);
+  ku_pg_client_release(closing_pool, closing_slot, 0, clock_ms + 50);
+  CHECK(reset_sends == before_resets && finishes == before_close_finishes + 1);
+  CHECK(!pool && live_connections == 0 && live_results == 0);
+
+  /* Failed connects publish a bounded retry window. Requests whose entire
+     budget lies inside that window must not redial. Once fake time advances
+     beyond the cap, only one borrower may run the half-open recovery probe,
+     even when another empty slot could otherwise trigger a second dial. */
+  KuResult_pg_client flight_opened = ku_pg_client_open(
+      text("hostaddr=127.0.0.1"), 2, 64, 5000, 5000, 30000);
+  CHECK(flight_opened.ok); KuPgClient* flight_pool = flight_opened.value;
+  PGconn* flight_initial = flight_pool->conns[0]; flight_pool->conns[0] = 0;
+  PQfinish(flight_initial);
+  /* The earlier phase budget owns the timeout code. A short acquire budget is
+     not mislabeled as connect_timeout; a shorter connect budget remains a
+     connect_timeout. Both paths evict the unfinished physical connection. */
+  connect_elapsed = 7;
+  PGconn* budget_connection = 0; KuError budget_error = {0};
+  CHECK(ku_pg_client_acquire(
+          flight_pool, &budget_connection, &budget_error, clock_ms + 5) < 0
+      && !budget_connection && equals(budget_error.code, "acquire_timeout"));
+  ku_error_drop(&budget_error); clock_ms += 1001;
+  flight_pool->connect_timeout_ms = 5; budget_error = (KuError){0};
+  CHECK(ku_pg_client_acquire(
+          flight_pool, &budget_connection, &budget_error, clock_ms + 5) < 0
+      && !budget_connection && equals(budget_error.code, "acquire_timeout"));
+  ku_error_drop(&budget_error); clock_ms += 1001;
+  flight_pool->connect_timeout_ms = 5; budget_error = (KuError){0};
+  CHECK(ku_pg_client_acquire(
+          flight_pool, &budget_connection, &budget_error, clock_ms + 50) < 0
+      && !budget_connection && equals(budget_error.code, "connect_timeout"));
+  ku_error_drop(&budget_error); connect_elapsed = 0; clock_ms += 1001;
+  flight_pool->connect_timeout_ms = 5000;
+  fail_connect_on_attempt = 1;
+  PGconn* flight_connection = 0; KuError flight_error = {0};
+  int before_flight_attempts = connect_attempts;
+  CHECK(ku_pg_client_acquire(
+          flight_pool, &flight_connection, &flight_error, clock_ms + 50) < 0
+      && !flight_connection && equals(flight_error.code, "out_of_memory")
+      && connect_attempts == before_flight_attempts + 1);
+  ku_error_drop(&flight_error); before_flight_attempts = connect_attempts;
+  flight_error = (KuError){0};
+  CHECK(ku_pg_client_acquire(
+          flight_pool, &flight_connection, &flight_error, clock_ms + 1) < 0
+      && !flight_connection && equals(flight_error.code, "acquire_timeout")
+      && connect_attempts == before_flight_attempts);
+  ku_error_drop(&flight_error); clock_ms += 1001;
+  bad_connect_on_attempt = 1; flight_error = (KuError){0};
+  CHECK(ku_pg_client_acquire(
+          flight_pool, &flight_connection, &flight_error, clock_ms + 50) < 0
+      && !flight_connection && equals(flight_error.code, "connect_error")
+      && !bad_connect_on_attempt
+      && connect_attempts == before_flight_attempts + 1);
+  ku_error_drop(&flight_error); before_flight_attempts = connect_attempts; clock_ms += 1001;
+  reentrant_connect_pool = flight_pool;
+  flight_error = (KuError){0};
+  int flight_slot = ku_pg_client_acquire(
+      flight_pool, &flight_connection, &flight_error, clock_ms + 50);
+  reentrant_connect_pool = 0;
+  CHECK(flight_slot >= 0 && flight_connection && reentrant_connect_checked
+      && !reentrant_connect_violation && connect_attempts == before_flight_attempts + 1);
+  ku_pg_client_release(flight_pool, flight_slot, 1, clock_ms + 50);
+  ku_drop_pg_client(&flight_pool);
+  CHECK(!flight_pool && live_connections == 0 && live_results == 0 && starts == finishes);
+  CHECK(ku_test_pg_pool_lock_depth == 0 && ku_test_pg_finishes_while_pool_locked == 0);
   CHECK(bad_calls == 0);
   CHECK(shutdowns > 0 && poisoned_consumes >= 2 && single_row_calls > 0 && read_ahead_calls == 0);
   CHECK(!live_runtime_allocations && !runtime_bytes);

@@ -27,9 +27,9 @@
 
 ## 本轮驱动错误恢复与资源验收
 
-- Redis 建连、借用、逐连接 AUTH 和命令共享绝对 deadline；同步 DNS 只能返回后复核。分配失败返回静态 `redis/out_of_memory`；未完整消费的响应会 poison 该连接，完整消费后的值/UTF-8 错误不会污染其他槽位。
+- Redis 建连、借用、逐连接 AUTH 和命令共享绝对 deadline；同步 DNS 只能返回后复核。三个驱动的构造前配置校验统一使用 `invalid_config`；client/池层统一使用 `client_closed`、`pool_busy`、`acquire_timeout`、`connect_timeout`、`connect_error`、`sync_error`、`out_of_memory`，命令层的 `timeout` / `redis_error` 不混入池合同。分配失败返回静态 `redis/out_of_memory`；未完整消费的响应会 poison 该连接，完整消费后的值/UTF-8 错误不会污染其他槽位。
 - PG/MySQL 的 `result.value(): str!` 是唯一读取写法：NULL、越界和复制 OOM 都可 catch，原结果仍可再次读取或释放；`is_null()` 使用同一边界检查。
-- 新 client 的专项测试覆盖 OOM、waiter 上限、丢失唤醒、close 与 borrowed 并发、session reset、清理失败、坏连接单槽淘汰、密码不进诊断和延迟销毁。旧单连接/旧 pool 的实库结果只作底层回归证据，不能替代新 API 验收；当前缺口仍是 Redis/MySQL 新 client 实库与 Linux/macOS CI。
+- 新 client 的专项测试覆盖 OOM、waiter 上限、防未排队 newcomer 直接夺槽、退避定时责任转交、single-flight 懒建、close 与 borrowed 并发、session reset、清理失败、坏连接单槽淘汰、密码不进诊断和延迟销毁。失败退避窗口从 25ms 指数增长并封顶 1000ms，实际 equal-jitter 是 `ceil(window/2)..window`（首次 13～25ms），健康空闲连接不受影响；已入等待集合的请求由平台 condition variable 无序选择，不保证 FIFO 或无饥饿。旧单连接/旧 pool 的实库结果只作底层回归证据，不能替代新 API 验收；当前缺口仍是 Redis/MySQL 新 client 实库与 Linux/macOS CI。
 - 三个驱动的结果 cap 都是单结果限制，不是进程总 retained-memory 预算；多个并发查询和长期持有的 detached result 会叠加，生产部署仍需进程级内存与并发上限。
 
 ## 通用 TLS 的落地决策

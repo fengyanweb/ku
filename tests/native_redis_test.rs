@@ -756,7 +756,7 @@ fn main(): null! {{
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
-    assert_eq!(stdout, "closed:redis_error\ntimeout:timeout\n");
+    assert_eq!(stdout, "closed:connect_error\ntimeout:connect_timeout\n");
     assert!(!stdout.contains("auth_failed"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("secret"));
     for command in [
