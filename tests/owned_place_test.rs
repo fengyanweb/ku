@@ -2676,6 +2676,63 @@ fn main(): null! {
 }
 
 #[test]
+fn captured_database_receivers_reject_effectful_arguments_that_can_replace_the_cell() {
+    for (name, source) in [
+        (
+            "captured-pg-receiver-effectful-arg.ku",
+            r#"
+import pg from "std.pg"
+fn main(): null! {
+    client = pg.client({ conninfo: "host=localhost" })?
+    fn Replace(): str! {
+        client = pg.client({ conninfo: "host=other" })?
+        return ok("SELECT 1")
+    }
+    client.query(Replace()?, [])?
+    return ok(null)
+}
+"#,
+        ),
+        (
+            "captured-redis-receiver-effectful-arg.ku",
+            r#"
+import redis from "std.redis"
+fn main(): null! {
+    client = redis.client({ host: "127.0.0.1" })?
+    fn Replace(): str! {
+        client = redis.client({ host: "127.0.0.2" })?
+        return ok("key")
+    }
+    client.get(Replace()?)?
+    return ok(null)
+}
+"#,
+        ),
+        (
+            "captured-mysql-receiver-effectful-arg.ku",
+            r#"
+import mysql from "std.mysql"
+fn main(): null! {
+    client = mysql.client({ host: "127.0.0.1", user: "u", password: "p", database: "db" })?
+    fn Replace(): str! {
+        client = mysql.client({ host: "127.0.0.2", user: "u", password: "p", database: "db" })?
+        return ok("SELECT 1")
+    }
+    client.query(Replace()?, [])?
+    return ok(null)
+}
+"#,
+        ),
+    ] {
+        rejects(
+            name,
+            source,
+            "cannot call a move-only native receiver rooted at 'client' with an effectful argument",
+        );
+    }
+}
+
+#[test]
 fn http_handler_rejects_concurrent_unsafe_database_handle_captures() {
     for (name, source, native_name) in [
         (

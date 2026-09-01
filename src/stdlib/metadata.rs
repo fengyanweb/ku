@@ -16,10 +16,10 @@ pub(crate) enum TypePattern {
     SameAsArg(usize),
     /// A dynamic tagged value (e.g. `json.parse` result). Maps to `Type::KuValue`.
     KuValue,
-    /// An opaque native handle owned by a C-library binding (e.g. a `pg` connection
-    /// or result). Maps to `Type::Native(name)` — owned, move-tracked, dropped by the
-    /// backend (which closes/frees the underlying C resource). The name carries the
-    /// backend's synthetic type id (e.g. `__ku_pg_client`).
+    /// A backend-defined owned value. Most are move-only external handles (for
+    /// example a database/net client); `__ku_bytes` is the deliberate cloneable
+    /// exception. All remain opaque in Ku source and dispatch ownership through
+    /// helpers selected by this synthetic type id.
     Native(&'static str),
 }
 
@@ -150,6 +150,16 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         // bounded, lazy connection pool; commands are receiver methods described
         // by `redis_client_method_signature`, not duplicate module functions.
         ("redis", "client") => vec![ArgRule::Is(TypePattern::ObjectAny)],
+        // Binary data has one explicit construction boundary. `from_str` encodes
+        // the string's UTF-8 bytes, while `from_array` validates every element as
+        // one byte; receiver methods are intentionally not duplicated here.
+        ("bytes", "from_str") => vec![str_arg()],
+        ("bytes", "from_array") => vec![ArgRule::Is(TypePattern::ArrayOf(Box::new(
+            TypePattern::Int,
+        )))],
+        // std.net exposes one move-only TCP client constructor. TLS will extend
+        // this same config path rather than adding a parallel socket API.
+        ("net", "client") => vec![ArgRule::Is(TypePattern::ObjectAny)],
         _ => return None,
     };
     let returns = match (module, function) {
@@ -203,6 +213,10 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("pg_client", "close") => TypePattern::Null,
         ("mysql", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(MYSQL_CLIENT))),
         ("redis", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(REDIS_CLIENT))),
+        ("bytes", "from_str" | "from_array") => {
+            TypePattern::ResultOf(Box::new(TypePattern::Native(BYTES)))
+        }
+        ("net", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(NET_CLIENT))),
         _ => return None,
     };
     Some(Signature {
@@ -327,6 +341,71 @@ pub(crate) fn redis_client_method_signature(function: &str) -> Option<Signature>
     })
 }
 
+/// Receiver-only API for owned binary data. The value is cloneable and has no
+/// external resource identity; `TypePattern::Native` is used only to keep the
+/// ABI opaque to Ku source and avoid introducing a second public type spelling.
+pub(crate) fn bytes_method_signature(function: &str) -> Option<Signature> {
+    let bytes = || ArgRule::Is(TypePattern::Native(BYTES));
+    let args = match function {
+        "len" | "to_str" => vec![bytes()],
+        "get" => vec![bytes(), int_arg()],
+        _ => return None,
+    };
+    let returns = match function {
+        "len" => TypePattern::Int,
+        "get" => TypePattern::ResultOf(Box::new(TypePattern::Int)),
+        "to_str" => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        _ => return None,
+    };
+    Some(Signature {
+        name: format!("bytes.{function}"),
+        args,
+        returns,
+        abi: CallAbi::DottedBuiltin {
+            module: "bytes".to_string(),
+            function: function.to_string(),
+        },
+        failure: if function == "len" {
+            FailureMode::Never
+        } else {
+            FailureMode::ReturnsResult
+        },
+    })
+}
+
+/// Receiver-only API for one bounded plain-TCP transport. Reads and writes
+/// borrow the move-only client; close consumes it. TLS will be selected through
+/// `net.client(config)` once the native rustls runtime contract is fixed.
+pub(crate) fn net_client_method_signature(function: &str) -> Option<Signature> {
+    let client = || ArgRule::Is(TypePattern::Native(NET_CLIENT));
+    let args = match function {
+        "read" => vec![client(), int_arg()],
+        "write" => vec![client(), ArgRule::Is(TypePattern::Native(BYTES))],
+        "close" => vec![client()],
+        _ => return None,
+    };
+    let returns = match function {
+        "read" => TypePattern::ResultOf(Box::new(TypePattern::Native(BYTES))),
+        "write" => TypePattern::ResultOf(Box::new(TypePattern::Null)),
+        "close" => TypePattern::Null,
+        _ => return None,
+    };
+    Some(Signature {
+        name: format!("net.{function}"),
+        args,
+        returns,
+        abi: CallAbi::DottedBuiltin {
+            module: "net".to_string(),
+            function: function.to_string(),
+        },
+        failure: if function == "close" {
+            FailureMode::Never
+        } else {
+            FailureMode::ReturnsResult
+        },
+    })
+}
+
 fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
     match (module, function) {
         ("fs", "read" | "try_read" | "write" | "try_write" | "read_dir")
@@ -341,7 +420,9 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("pg_client", "query")
         | ("pg_result", "value" | "is_null")
         | ("mysql", "client")
-        | ("redis", "client") => FailureMode::ReturnsResult,
+        | ("redis", "client")
+        | ("bytes", "from_str" | "from_array")
+        | ("net", "client") => FailureMode::ReturnsResult,
         ("config", "env_file") | ("task", "stats" | "stress") => FailureMode::MayPanic,
         _ => FailureMode::Never,
     }
@@ -352,6 +433,10 @@ pub(crate) const PG_RESULT: &str = "__ku_pg_result";
 pub(crate) const PG_CLIENT: &str = "__ku_pg_client";
 /// Backend synthetic type id for the opaque, bounded `redis` client/pool handle.
 pub(crate) const REDIS_CLIENT: &str = "__ku_redis_client";
+/// Backend synthetic type id for cloneable owned binary data.
+pub(crate) const BYTES: &str = "__ku_bytes";
+/// Backend synthetic type id for the move-only bounded TCP transport.
+pub(crate) const NET_CLIENT: &str = "__ku_net_client";
 /// Backend synthetic type ids for the pooled `mysql` client and detached result.
 pub(crate) const MYSQL_CLIENT: &str = "__ku_mysql_client";
 pub(crate) const MYSQL_RESULT: &str = "__ku_mysql_result";
@@ -359,7 +444,7 @@ pub(crate) const MYSQL_RESULT: &str = "__ku_mysql_result";
 pub(crate) fn module_requires_import(module: &str) -> bool {
     matches!(
         module,
-        "fs" | "http" | "config" | "task" | "pg" | "redis" | "mysql"
+        "fs" | "http" | "config" | "task" | "pg" | "redis" | "mysql" | "bytes" | "net"
     )
 }
 
@@ -379,6 +464,8 @@ pub(crate) fn is_std_module(module: &str) -> bool {
             | "pg"
             | "redis"
             | "mysql"
+            | "bytes"
+            | "net"
     )
 }
 

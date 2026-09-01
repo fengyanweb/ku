@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bounded_process::FailureKind;
 pub use bounded_process::{run_bounded, OutputLimits};
+pub type BoundedOutput = bounded_process::BoundedOutput;
 
 const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(20);
