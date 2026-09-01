@@ -11890,11 +11890,11 @@ fn main(): null! {
                     .arg(format!("/Fo:{}", strip_verbatim(&object).display()))
                     .stdout(Stdio::null())
                     .stderr(Stdio::null());
-                return match run_build_process_bounded(&mut command, C_COMPILER_PROCESS_TIMEOUT) {
+                match run_build_process_bounded(&mut command, C_COMPILER_PROCESS_TIMEOUT) {
                     Ok(status) => Some(status.success()),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => None,
                     Err(error) => panic!("MSVC header-family compiler was not bounded: {error}"),
-                };
+                }
             }
             #[cfg(not(windows))]
             None

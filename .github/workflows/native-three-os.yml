@@ -81,6 +81,7 @@ jobs:
         run: |
           rustup set profile minimal
           rustup toolchain install 1.89.0 --no-self-update
+          rustup component add clippy --toolchain 1.89.0
           rustup default 1.89.0
           rustc --version --verbose
 
@@ -265,6 +266,10 @@ jobs:
             native_mysql_client_c_links_and_starts_when_toolchain_and_library_are_available \
             -- --exact --nocapture --test-threads=1 2>&1 | tee "$test_log"
           grep -F "test result: ok. 1 passed; 0 failed" "$test_log"
+
+      - name: Reject platform-specific clippy warnings
+        if: runner.os != 'Linux'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run every default test target without stopping at the first failure
         run: >-
