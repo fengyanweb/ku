@@ -435,7 +435,7 @@ user = { name: "Ku", city: "Hangzhou" }
 - `{ ...rest } = obj` 绑定剩余字段对象，rest 必须放最后。
 - `{ field: _ } = obj` 读取并丢弃字段。
 - 对象解构会消费右侧 source object；解构后不能继续使用原对象。需要保留原对象时写 `{ name } = user.clone()`。
-- 静态 object 缺字段会在检查阶段报错；动态 object 缺字段在运行时报错。需要宽松读取时继续使用显式 `obj["field"]?`。
+- 静态 object 缺字段会在检查阶段报错；动态 object 的普通缺键读取会在运行时 panic，`obj["field"]?` 是返回 `object/missing_key` 的可恢复严格读取。需要带默认值的宽松读取时只使用 `obj.get_or("field", default)`。
 - `http` 作为 std 模块对象只暴露可作为值读取的对象成员，例如 `{ code } = http`；`http.service` / `http.server` 是函数，不能被当作属性式默认对象解构或读取。
 
 赋值目标可以是变量、数组元素、结构体字段或对象字段：
@@ -1411,7 +1411,7 @@ object.get_or(obj:object, key:str, default:any): any
 obj.get_or(key:str, default:any): any
 ```
 
-`object.get_or` 是对象严格读取之外的显式宽松 API。普通 `obj["missing"]` 仍然报错；`obj["missing"]?` 返回 `null`；`obj.get_or("missing", fallback)` 返回 fallback。
+`object.get_or` 是对象严格读取之外的显式宽松 API。普通 `obj["missing"]` 缺键会 panic；`obj["missing"]?` 返回可恢复的 `object/missing_key` 错误；只有 `obj.get_or("missing", fallback)` 返回 fallback。
 
 ### 12.7 json
 
@@ -1723,7 +1723,7 @@ print(service.routes[0].method)
 
 `http.service()` / `http.server(config?)` 返回 service 配置对象。`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。
 
-上述 `bind` / `listener.run` / `listener.close` 生命周期当前仅由解释器实现。Windows native C 后端使用 `service.listen(address)?` 直接进入阻塞 accept loop；尝试 native 编译 `bind` 会提前报能力边界错误。`listen` 会消费 service，调用后不能再复用该句柄。
+上述 `bind` / `listener.run` / `listener.close` 生命周期当前仅由解释器实现。native C 的 Windows Winsock 与 Linux/macOS POSIX 分支都使用 `service.listen(address)?` 直接进入阻塞 accept loop；尝试 native 编译 `bind` 会提前报能力边界错误。`listen` 会消费 service，调用后不能再复用该句柄。Windows 已本地验证，Linux/macOS 仍待对应真机 CI 首次跑绿。
 
 普通 HTTP handler 可以接收 0 或 1 个请求参数：
 
@@ -1781,7 +1781,7 @@ Ku runtime 自动维护自己能判断的协议错误：路由未命中返回 40
 
 native 与解释器的主要已知差异：
 
-- **native 的 `handler_timeout_ms` 是协作式，不是线程抢占**。`while` / `for` 回边及 Ku 调用返回点会检查 deadline；到期后沿正常清理路径展开并返回 504。同步系统调用、libpq/其他 FFI 阻塞期间不能被它中断，必须给下游单独配置 timeout。为避免超时重入，展开期间不会在 `finally` 内再次轮询，所以 `finally` 必须有限且非阻塞；如果 deadline 首次在正常执行的 `finally` 中被观察到，该 `finally` 的剩余语句可能被跳过，外层清理仍继续。
+- **native 的 `handler_timeout_ms` 是协作式，不是线程抢占**。`while` / `for` 回边及 Ku 调用返回点会检查 deadline；到期后沿正常清理路径展开并返回 504。超时展开中的 `finally` 获得固定一秒 cleanup grace，期间 safepoint 允许有限清理继续；grace 到期后的下一 safepoint 会转向超时出口，因此纯 Ku 的无限 `finally` 不能永久占用 worker。同步系统调用、libpq/其他 FFI 阻塞期间仍不能被它中断，必须给下游单独配置 timeout；`finally` 仍应有限且非阻塞。
 - 响应头**顺序**不同。两边头名都是小写且语义相同，但解释器遍历 HashMap（顺序本身不确定），native 用固定顺序输出。HTTP 头与顺序无关，不影响客户端。
 
 可直接运行的 HTTP 示例：
@@ -2044,7 +2044,7 @@ ku build --release -o dist/app.exe
 
 显式 `-o` 时，IR/C/LLVM 都增加输出路径哈希层，写入 `.ku/build/[<target>/]<profile>/{ir,c,llvm}/<output-path-sha256>/<binary-stem>.<ext>`；完整输出路径参与 SHA-256，仅用于隔离中间产物，不是安全签名。不同目录下的同名输出不会争用中间文件，也不会在用户输出目录旁创建或覆盖 `.c`。
 
-`--target` 第一阶段只接受 `host`、`x86_64-linux`、`x86_64-windows`、`aarch64-darwin`；包含路径分隔符、Windows drive prefix 或未知 target 会直接报错，避免输出路径逃逸。`--backend c` 会使用 native C 后端生成 C 后再调用 C 编译器。查找顺序为 `KU_CC`、`zig cc`、`clang`、`cc`、`gcc`；找不到或编译失败会给出修改方向。显式跨 target 时，Ku 自动给 Zig 传 `-target`、给 Clang 传 `--target`；普通 fallback `cc/gcc` 只用于 host，不会假装支持 cross。需要使用已配置好的交叉 GCC 时，通过 `KU_CC` 显式指定。链接成功后仍校验目标产物的 PE/ELF/Mach-O 格式和 CPU 架构，不匹配就拒绝安装，且不会降级成 host binary。默认 backend 仍保留解释器 wrapper 以兼容尚未进入 native lowering 的 async 程序；同步程序的 KuString、array、dynamic object、Result/Error 和 closure ABI 已由 native C 后端实现。
+`--target` 第一阶段只接受 `host`、`x86_64-linux`、`x86_64-windows`、`aarch64-darwin`；包含路径分隔符、Windows drive prefix 或未知 target 会直接报错，避免输出路径逃逸。`--backend c` 会使用 native C 后端生成 C 后再调用 C 编译器。未设置 `KU_CC` 时，自动候选固定为 `zig cc`、`clang`、`cc`、`gcc`，失败后有界尝试下一个；一旦设置 `KU_CC`，它就是唯一且权威的 compiler，空值、不可执行或编译失败都会直接报错，不会静默换用另一套工具链。显式跨 target 时，Ku 自动给 Zig 传 `-target`、给 Clang 传 `--target`；普通 fallback `cc/gcc` 只用于 host，不会假装支持 cross。需要使用已配置好的交叉 GCC 时，通过 `KU_CC` 显式指定。链接成功后校验目标产物的 PE/ELF/Mach-O 格式和 CPU 架构；使用数据库时还解析最终动态依赖表并要求实际导入 libpq 以及本次选定的 MySQL/MariaDB family，静态、跨 family 或 host 回退都拒绝安装。数据库库文件从已打开句柄复制到私有临时目录后才交给 linker，不扫描或删除用户输出目录中的同名临时文件。默认 backend 仍保留解释器 wrapper 以兼容尚未进入 native lowering 的 async 程序；同步程序的 KuString、array、dynamic object、Result/Error 和 closure ABI 已实现明确列出的子集，不能从 ABI 存在推导为所有 payload、捕获形式和动态组合均已支持。
 
 0.0.15 的历史边界是：默认生成“解释器打包型二进制”，带 import 的程序仍会按原路径读取依赖。当前 native C 路径已经在生成期展开完整 import graph，生成物不包含 runner 的 `run_source` / `const SOURCE`，移动原源码目录后仍能运行；async native lowering 和增量缓存仍未宣称完成。
 

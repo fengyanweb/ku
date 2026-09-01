@@ -35,7 +35,7 @@ x86_64-windows
 aarch64-darwin
 ```
 
-同一源码按 target 分别生成 PE32+ x86_64、ELF x86_64 和 Mach-O arm64 三个二进制，不设计万能二进制。唯一推荐命令是：
+同一源码按 target 分别生成 PE32+ x86_64、ELF x86_64 和 Mach-O arm64，不设计万能二进制。命令只有在对应系统或具备匹配 target 编译器、sysroot 和动态库的环境中成功并通过产物校验后，才得到相应二进制。唯一推荐命令是：
 
 ```txt
 ku build --backend c --release --target <target> .
@@ -46,7 +46,7 @@ ku build --backend c --release --target <target> .
 - 每个显式非 host target 使用独立 `.ku/build/<target>/<profile>/`；host 使用 `.ku/build/<profile>/`。只有 Windows 最终二进制自动追加 `.exe`，IR/C/LLVM 中间文件始终使用不含 `.exe` 的 binary stem。
 - IR/C/LLVM 默认落盘为 `.ku/build/[<target>/]<profile>/{ir,c,llvm}/<binary-stem>.<ext>`；显式 `-o` 是 `.ku/build/[<target>/]<profile>/{ir,c,llvm}/<output-path-sha256>/<binary-stem>.<ext>`。同目录多个入口、不同目录同名输出都不共享中间产物，也不会覆盖用户目录中的 C 文件；没有交叉 compiler/sysroot 时保留 C artifact 并报错。
 - cross target 不允许自动降级成 host build；linker 成功后校验完整的目标主头、表边界与可加载段，并区分 Linux ELF、Windows PE32+ 和 macOS Mach-O，不匹配就拒绝安装最终产物。
-- 链接先写同目录的唯一 `.ku-link-*` staging。构建启动时仅扫描至多 256 个目录项、删除至多 16 个超过 24 小时且名称严格匹配的普通文件；目录、符号链接和近期文件不会被删除。
+- 链接先在最终输出的同一父目录内原子创建随机 `.ku-link-*` staging 目录，再把候选产物写入其中；Unix 目录权限固定为 `0700`，Windows 继承输出父目录 ACL，因此输出目录和构建账号是可信边界，不能把这套机制宣称为可抵御同账号写者。构建不会按名称扫描或删除用户输出目录中的既有文件。候选产物从同一个已打开句柄完成格式、动态依赖和内容身份校验，安装前再次确认路径仍指向该文件。已有目标使用同卷原子替换；初始不存在的 Unix 目标用 `hard_link` 的 create-if-absent 语义再移除 staging 名称，Windows 用不带 replace 标志的 `MoveFileExW`，两者都拒绝覆盖校验后才由其他写者创建的目标。RAII 只清理本次持有的 staging 目录。
 - Zig/Clang 自动接收 target triple；普通 fallback `cc/gcc` 只用于 host。需要 target-prefixed GCC 等驱动时必须通过 `KU_CC` 显式配置，最终仍经过格式校验。
 - package registry 发布的是确定性、无安装脚本和第三方本机二进制的 Ku 源码包；消费者为每个系统独立构建，不在 source package 中混装三平台二进制。
 
@@ -56,15 +56,16 @@ ku build --backend c --release --target <target> .
 
 - 核心同步 ABI 与 `std.fs/std.json/std.time` 已有 Windows/POSIX C 分支；仍需在 Linux/macOS 真机 CI 跑完整 native suite。
 - native `std.http` 和 `std.redis` 已有 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 源码分支；Windows 已本地验证，Linux/macOS 仍待对应真机 CI 首次跑绿。
-- `std.mysql` 尚无 portable cross-target library contract；显式 target 自动链接会明确拒绝，可自行链接保留的 C artifact。
-- `std.pg` 已有 Windows/POSIX 同步与目标库格式处理，但 cross build 必须提供匹配 target 的 shared libpq 或 sysroot。
+- socket-free `ku-native-tls` runtime ABI 已固定 rustls/ring、WebPKI/显式 PEM CA 和资源上限，并进入 workspace CI 配置；它尚未接入 `std.net`、HTTP 或 Redis，且配置存在不等于远端三系统 workflow 已实际跑绿。
+- `std.mysql` Unix host build 使用绝对 `KU_MYSQL_LIB`/`KU_MYSQL_INCLUDE`；Windows 可使用同一显式配置，也可发现常见的完整安装。选中后都使用私有 pinned copy、最终动态 family 验证和 header/runtime ABI 握手；显式 non-host target 仍明确拒绝自动链接，可在目标系统分别构建，或自行链接保留的 C artifact。
+- `std.pg` 已有 Windows/POSIX 同步与目标库格式处理；三系统统一通过绝对路径 `KU_PG_LIB` 的专用小目录提供匹配 target 的 shared/import libpq，不再扫描系统安装目录或走隐式 linker 搜索。Windows import library 由有界解析器提取目标 `libpq.dll`，ELF/Mach-O 分别读取 `DT_SONAME`/`LC_ID_DYLIB`，最终产物必须包含与本次选中库完全一致的 loader identity；缺失、静态回退或同族不同 loader 都拒绝安装。
 - native async lowering 仍未完成。
 
 ## 6. HTTP 专用响应 wire ABI
 
 已决定：
 
-- 普通 handler 只接收 `req`，不接收 `res/writer`。
+- 普通 handler 只允许 `fn()` / `fn(req)`，不接收第二个 `res/writer` 参数。
 - 普通 handler 返回 `HttpResponse` 或 `HttpResponse!`。
 - writer 只通过 `http.stream(fn(writer) { ... })` 暴露。
 - writer 不提供 `end()`；stream 函数正常返回后 runtime 自动结束。
