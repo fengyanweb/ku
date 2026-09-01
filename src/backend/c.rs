@@ -7515,8 +7515,14 @@ static void ku_mysql_sync_destroy(KuMysqlClient* client) {
 #if defined(_WIN32)
   DeleteCriticalSection(&client->mutex);
 #else
-  pthread_cond_destroy(&client->condition);
-  pthread_mutex_destroy(&client->mutex);
+  if (pthread_cond_destroy(&client->condition) != 0) {
+    fputs("mysql client condition destroy failed\n", stderr);
+    exit(1);
+  }
+  if (pthread_mutex_destroy(&client->mutex) != 0) {
+    fputs("mysql client mutex destroy failed\n", stderr);
+    exit(1);
+  }
 #endif
 }
 
@@ -10818,8 +10824,14 @@ static void ku_redis_gate_destroy(KuRedisGate* gate) {
   if (gate->semaphore) CloseHandle(gate->semaphore);
   gate->semaphore = NULL;
 #else
-  pthread_cond_destroy(&gate->condition);
-  pthread_mutex_destroy(&gate->mutex);
+  if (pthread_cond_destroy(&gate->condition) != 0) {
+    fputs("redis command gate condition destroy failed\n", stderr);
+    exit(1);
+  }
+  if (pthread_mutex_destroy(&gate->mutex) != 0) {
+    fputs("redis command gate mutex destroy failed\n", stderr);
+    exit(1);
+  }
   gate->available = 0;
 #endif
 }
@@ -10938,9 +10950,12 @@ static void ku_redis_pool_wake_all(KuRedisPoolSync* sync) {
 
 static void ku_redis_pool_sync_destroy(KuRedisPoolSync* sync) {
 #if !defined(_WIN32)
-  if (pthread_cond_destroy(&sync->condition) != 0
-      || pthread_mutex_destroy(&sync->mutex) != 0) {
-    fputs("redis client synchronization destroy failed\n", stderr);
+  if (pthread_cond_destroy(&sync->condition) != 0) {
+    fputs("redis client condition destroy failed\n", stderr);
+    exit(1);
+  }
+  if (pthread_mutex_destroy(&sync->mutex) != 0) {
+    fputs("redis client mutex destroy failed\n", stderr);
     exit(1);
   }
 #else
@@ -13037,7 +13052,10 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "  if (rc != 0) pthread_mutex_destroy(mutex);\n",
             "  return rc;\n",
             "}\n",
-            "static void ku_pg_sync_destroy(KuPgMutex* mutex, KuPgCond* cond) { pthread_cond_destroy(cond); pthread_mutex_destroy(mutex); }\n",
+            "static void ku_pg_sync_destroy(KuPgMutex* mutex, KuPgCond* cond) {\n",
+            "  if (pthread_cond_destroy(cond) != 0) { fputs(\"pg client condition destroy failed\\n\", stderr); exit(1); }\n",
+            "  if (pthread_mutex_destroy(mutex) != 0) { fputs(\"pg client mutex destroy failed\\n\", stderr); exit(1); }\n",
+            "}\n",
             "static void ku_pg_mutex_lock(KuPgMutex* mutex) { if (pthread_mutex_lock(mutex) != 0) { fprintf(stderr, \"pg client mutex lock failed\\n\"); exit(1); } }\n",
             "static void ku_pg_mutex_unlock(KuPgMutex* mutex) { if (pthread_mutex_unlock(mutex) != 0) { fprintf(stderr, \"pg client mutex unlock failed\\n\"); exit(1); } }\n",
             "static void ku_pg_cond_signal(KuPgCond* cond) { if (pthread_cond_signal(cond) != 0) { fprintf(stderr, \"pg client condition signal failed\\n\"); exit(1); } }\n",
