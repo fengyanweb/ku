@@ -132,6 +132,48 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
             "legacy interpolation/raw connection path survived: {forbidden}"
         );
     }
+    for foreign_lexer in [
+        "ku_pg_sql_next_top_token(",
+        "ku_pg_sql_has_explicit_session_control(",
+    ] {
+        assert!(
+            !generated.contains(foreign_lexer),
+            "MySQL artifact must not depend on PostgreSQL SQL policy code: {foreign_lexer}"
+        );
+    }
+
+    for (name, start, end) in [
+        (
+            "query",
+            "static KuResult_mysql_result ku_mysql_client_query(",
+            "static KuResult_int ku_mysql_client_execute(",
+        ),
+        (
+            "execute",
+            "static KuResult_int ku_mysql_client_execute(",
+            "static int64_t ku_mysql_result_rows(",
+        ),
+    ] {
+        let body = generated
+            .split_once(start)
+            .map(|(_, suffix)| suffix)
+            .and_then(|suffix| suffix.split_once(end))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("generated MySQL {name} implementation"));
+        let validation = body
+            .find("ku_mysql_validate_statement_input")
+            .unwrap_or_else(|| panic!("MySQL {name} input validation"));
+        let thread_enter = body
+            .find("ku_mysql_thread_enter()")
+            .unwrap_or_else(|| panic!("MySQL {name} thread entry"));
+        let acquire = body
+            .find("ku_mysql_acquire(")
+            .unwrap_or_else(|| panic!("MySQL {name} pool acquisition"));
+        assert!(
+            validation < thread_enter && thread_enter < acquire,
+            "MySQL {name} must reject hostile input before thread or pool side effects"
+        );
+    }
 
     let acquire = generated
         .split_once("static MYSQL* ku_mysql_acquire(")
@@ -758,6 +800,11 @@ fn native_mysql_execution_outcomes_are_not_reported_as_retryable() {
             "static unsigned long long __ku_handler_now_ms(void) {",
             "static int ku_test_mysql_clock_enabled = 0;\nstatic unsigned long long ku_test_mysql_clock_ms = 0;\nstatic unsigned long long ku_test_mysql_clock_calls = 0;\nstatic unsigned long long ku_test_mysql_clock_expire_after = 0;\nstatic unsigned long long __ku_handler_now_ms(void) { if (ku_test_mysql_clock_enabled) { ku_test_mysql_clock_calls++; return ku_test_mysql_clock_calls >= ku_test_mysql_clock_expire_after ? ku_test_mysql_clock_ms + 2 : ku_test_mysql_clock_ms; }",
             1,
+        )
+        .replacen(
+            "static MYSQL* ku_mysql_acquire(\n    KuMysqlClient* client, size_t* slot_index, KuError* error,\n    unsigned long long operation_deadline) {",
+            "static size_t ku_test_mysql_acquire_calls = 0;\nstatic MYSQL* ku_mysql_acquire(\n    KuMysqlClient* client, size_t* slot_index, KuError* error,\n    unsigned long long operation_deadline) {\n  ku_test_mysql_acquire_calls++;",
+            1,
         );
     assert!(
         generated.contains("ku_test_mysql_result_free_calls++"),
@@ -766,6 +813,10 @@ fn native_mysql_execution_outcomes_are_not_reported_as_retryable() {
     assert!(
         generated.contains("ku_test_mysql_clock_expire_after"),
         "MySQL outcome harness failed to instrument the monotonic clock"
+    );
+    assert!(
+        generated.contains("ku_test_mysql_acquire_calls++"),
+        "MySQL outcome harness failed to instrument pool acquisition"
     );
     fs::write(directory.path().join("mysql.h"), fake_mysql_header()).expect("write fake mysql.h");
     let harness = directory.path().join("mysql_outcomes_harness.c");
@@ -1004,9 +1055,76 @@ static bool outcome_pool_has_connection(KuMysqlClient* client, bool expected) {
   ku_mysql_unlock(client);
   return matches;
 }
+static bool outcome_invalid_config_rejected_without_database(KuObject* config) {
+  long mariadb_version_calls = fake_atomic_load(&ku_fake_mariadb_version_calls);
+  long mariadb_info_calls = fake_atomic_load(&ku_fake_mariadb_info_calls);
+  long client_version_calls = fake_atomic_load(&ku_fake_client_version_calls);
+  long client_info_calls = fake_atomic_load(&ku_fake_client_info_calls);
+  long probe_before_init_calls =
+      fake_atomic_load(&ku_fake_probe_before_library_init_calls);
+  long library_ready_for_probe =
+      fake_atomic_load(&ku_fake_library_ready_for_probe);
+  long library_init_calls = fake_atomic_load(&ku_fake_library_init_calls);
+  long library_end_calls = fake_atomic_load(&ku_fake_library_end_calls);
+  long thread_init_calls = fake_atomic_load(&ku_fake_thread_init_calls);
+  long thread_end_calls = fake_atomic_load(&ku_fake_thread_end_calls);
+  long thread_active = fake_atomic_load(&ku_fake_thread_active);
+  long mysql_init_calls = fake_atomic_load(&ku_fake_mysql_init_calls);
+  long real_connect_calls = fake_atomic_load(&ku_fake_real_connect_calls);
+  long connections_opened = fake_atomic_load(&ku_fake_connections_opened);
+  long connections_live = fake_atomic_load(&ku_fake_connections_live);
+  long local_infile_disabled = fake_atomic_load(&ku_fake_local_infile_disabled);
+  long reconnect_option_calls = fake_atomic_load(&ku_fake_reconnect_option_calls);
+  long statements_live = fake_atomic_load(&ku_fake_statements_live);
+  long statement_init_calls = fake_atomic_load(&ku_fake_stmt_init_calls);
+  long statement_prepare_calls = fake_atomic_load(&ku_fake_stmt_prepare_calls);
+  long execute_calls = fake_atomic_load(&ku_fake_execute_calls);
+  long reset_calls = fake_atomic_load(&ku_fake_reset_connection_calls);
+  size_t acquire_calls = ku_test_mysql_acquire_calls;
+  size_t result_frees = ku_test_mysql_result_free_calls;
+  int library_status = ku_mysql_library_status;
+  unsigned int thread_depth = ku_mysql_thread_depth;
+  bool thread_initialized = ku_mysql_thread_initialized;
+  KuResult_mysql_client rejected = ku_mysql_client_new(config);
+  bool expected_error = !rejected.ok && !rejected.value
+      && outcome_code(rejected.error, "invalid_config");
+  if (rejected.value) ku_drop_mysql_client(&rejected.value);
+  if (!rejected.ok) ku_error_drop(&rejected.error);
+  return expected_error
+      && fake_atomic_load(&ku_fake_mariadb_version_calls) == mariadb_version_calls
+      && fake_atomic_load(&ku_fake_mariadb_info_calls) == mariadb_info_calls
+      && fake_atomic_load(&ku_fake_client_version_calls) == client_version_calls
+      && fake_atomic_load(&ku_fake_client_info_calls) == client_info_calls
+      && fake_atomic_load(&ku_fake_probe_before_library_init_calls)
+          == probe_before_init_calls
+      && fake_atomic_load(&ku_fake_library_ready_for_probe)
+          == library_ready_for_probe
+      && fake_atomic_load(&ku_fake_library_init_calls) == library_init_calls
+      && fake_atomic_load(&ku_fake_library_end_calls) == library_end_calls
+      && fake_atomic_load(&ku_fake_thread_init_calls) == thread_init_calls
+      && fake_atomic_load(&ku_fake_thread_end_calls) == thread_end_calls
+      && fake_atomic_load(&ku_fake_thread_active) == thread_active
+      && fake_atomic_load(&ku_fake_mysql_init_calls) == mysql_init_calls
+      && fake_atomic_load(&ku_fake_real_connect_calls) == real_connect_calls
+      && fake_atomic_load(&ku_fake_connections_opened) == connections_opened
+      && fake_atomic_load(&ku_fake_connections_live) == connections_live
+      && fake_atomic_load(&ku_fake_local_infile_disabled) == local_infile_disabled
+      && fake_atomic_load(&ku_fake_reconnect_option_calls) == reconnect_option_calls
+      && fake_atomic_load(&ku_fake_statements_live) == statements_live
+      && fake_atomic_load(&ku_fake_stmt_init_calls) == statement_init_calls
+      && fake_atomic_load(&ku_fake_stmt_prepare_calls) == statement_prepare_calls
+      && fake_atomic_load(&ku_fake_execute_calls) == execute_calls
+      && fake_atomic_load(&ku_fake_reset_connection_calls) == reset_calls
+      && ku_test_mysql_acquire_calls == acquire_calls
+      && ku_test_mysql_result_free_calls == result_frees
+      && ku_mysql_library_status == library_status
+      && ku_mysql_thread_depth == thread_depth
+      && ku_mysql_thread_initialized == thread_initialized;
+}
 static bool outcome_input_rejected_before_database(
     KuMysqlClient* client, KuString sql, KuArray_str params,
     const char* expected_code) {
+  size_t acquire_calls = ku_test_mysql_acquire_calls;
   long execute_calls = fake_atomic_load(&ku_fake_execute_calls);
   long statement_init_calls = fake_atomic_load(&ku_fake_stmt_init_calls);
   long statement_prepare_calls = fake_atomic_load(&ku_fake_stmt_prepare_calls);
@@ -1014,12 +1132,28 @@ static bool outcome_input_rejected_before_database(
   long opened = fake_atomic_load(&ku_fake_connections_opened);
   long live = fake_atomic_load(&ku_fake_connections_live);
   long statements = fake_atomic_load(&ku_fake_statements_live);
+  long thread_init_calls = fake_atomic_load(&ku_fake_thread_init_calls);
+  long thread_end_calls = fake_atomic_load(&ku_fake_thread_end_calls);
+  long thread_active = fake_atomic_load(&ku_fake_thread_active);
+  unsigned int thread_depth = ku_mysql_thread_depth;
+  bool thread_initialized = ku_mysql_thread_initialized;
   size_t result_frees = ku_test_mysql_result_free_calls;
-  KuResult_int rejected = ku_mysql_client_execute(client, sql, params);
-  bool expected_error = !rejected.ok
-      && outcome_code(rejected.error, expected_code);
-  if (!rejected.ok) ku_error_drop(&rejected.error);
-  return expected_error
+  KuResult_int rejected_execute = ku_mysql_client_execute(client, sql, params);
+  bool execute_error = !rejected_execute.ok
+      && outcome_code(rejected_execute.error, expected_code);
+  if (!rejected_execute.ok) ku_error_drop(&rejected_execute.error);
+  unsigned long long execute_clock_calls = ku_test_mysql_clock_calls;
+  if (ku_test_mysql_clock_enabled) ku_test_mysql_clock_calls = 0;
+  KuResult_mysql_result rejected_query = ku_mysql_client_query(client, sql, params);
+  bool query_error = !rejected_query.ok && !rejected_query.value
+      && outcome_code(rejected_query.error, expected_code);
+  if (rejected_query.value) ku_drop_mysql_result(&rejected_query.value);
+  if (!rejected_query.ok) ku_error_drop(&rejected_query.error);
+  bool both_deadlines_observed = !ku_test_mysql_clock_enabled
+      || (execute_clock_calls >= ku_test_mysql_clock_expire_after
+          && ku_test_mysql_clock_calls >= ku_test_mysql_clock_expire_after);
+  return execute_error && query_error && both_deadlines_observed
+      && ku_test_mysql_acquire_calls == acquire_calls
       && fake_atomic_load(&ku_fake_execute_calls) == execute_calls
       && fake_atomic_load(&ku_fake_stmt_init_calls) == statement_init_calls
       && fake_atomic_load(&ku_fake_stmt_prepare_calls) == statement_prepare_calls
@@ -1027,6 +1161,11 @@ static bool outcome_input_rejected_before_database(
       && fake_atomic_load(&ku_fake_connections_opened) == opened
       && fake_atomic_load(&ku_fake_connections_live) == live
       && fake_atomic_load(&ku_fake_statements_live) == statements
+      && fake_atomic_load(&ku_fake_thread_init_calls) == thread_init_calls
+      && fake_atomic_load(&ku_fake_thread_end_calls) == thread_end_calls
+      && fake_atomic_load(&ku_fake_thread_active) == thread_active
+      && ku_mysql_thread_depth == thread_depth
+      && ku_mysql_thread_initialized == thread_initialized
       && ku_test_mysql_result_free_calls == result_frees
       && outcome_pool_has_connection(client, true);
 }
@@ -1048,31 +1187,34 @@ static void outcome_test_clock_stop(void) {
   ku_test_mysql_clock_expire_after = 0;
 }
 int main(void) {
-  KuObject* null_config = outcome_config();
-  ku_object_set(null_config, outcome_text("port"), ku_v_null());
-  KuResult_mysql_client null_opened = ku_mysql_client_new(null_config);
-  ku_object_drop(null_config);
-  if (null_opened.ok || null_opened.value
-      || !outcome_code(null_opened.error, "invalid_config")) return 1;
-  ku_error_drop(&null_opened.error);
-  if (fake_atomic_load(&ku_fake_real_connect_calls) != 0
-      || fake_atomic_load(&ku_fake_mariadb_version_calls) != 0
-      || fake_atomic_load(&ku_fake_mariadb_info_calls) != 0
-      || fake_atomic_load(&ku_fake_client_version_calls) != 0
-      || fake_atomic_load(&ku_fake_client_info_calls) != 0
-      || fake_atomic_load(&ku_fake_probe_before_library_init_calls) != 0
-      || fake_atomic_load(&ku_fake_library_init_calls) != 0
-      || fake_atomic_load(&ku_fake_library_end_calls) != 0
-      || fake_atomic_load(&ku_fake_thread_init_calls) != 0
-      || fake_atomic_load(&ku_fake_thread_end_calls) != 0
-      || fake_atomic_load(&ku_fake_mysql_init_calls) != 0
-      || fake_atomic_load(&ku_fake_stmt_init_calls) != 0
-      || fake_atomic_load(&ku_fake_stmt_prepare_calls) != 0
-      || fake_atomic_load(&ku_fake_execute_calls) != 0
-      || fake_atomic_load(&ku_fake_connections_opened) != 0
-      || fake_atomic_load(&ku_fake_connections_live) != 0
-      || fake_atomic_load(&ku_fake_statements_live) != 0
-      || fake_atomic_load(&ku_fake_thread_active) != 0) return 2;
+  uint8_t embedded_nul[] = { 'b', 'a', 'd', 0, 'h', 'o', 's', 't' };
+  uint8_t invalid_utf8[] = { 0xc3, 0x28 };
+  const char* invalid_keys[] = {
+    "port", "pool_size", "host", "user", "max_connections"
+  };
+  KuValue invalid_values[] = {
+    ku_v_null(),
+    ku_v_int(1),
+    ku_v_str((KuString){
+      embedded_nul, sizeof(embedded_nul), 0, KU_STRING_STATIC
+    }),
+    ku_v_str((KuString){
+      invalid_utf8, sizeof(invalid_utf8), 0, KU_STRING_STATIC
+    }),
+    ku_v_int(KU_MYSQL_MAX_CONNECTIONS + 1)
+  };
+  for (size_t invalid_index = 0;
+       invalid_index < sizeof(invalid_values) / sizeof(invalid_values[0]);
+       invalid_index++) {
+    KuObject* invalid_config = outcome_config();
+    ku_object_set(
+        invalid_config, outcome_text(invalid_keys[invalid_index]),
+        invalid_values[invalid_index]);
+    bool rejected_without_database =
+        outcome_invalid_config_rejected_without_database(invalid_config);
+    ku_object_drop(invalid_config);
+    if (!rejected_without_database) return 1 + (int)invalid_index;
+  }
 
   KuObject* config = outcome_config();
   KuResult_mysql_client opened = ku_mysql_client_new(config);
@@ -1145,6 +1287,8 @@ int main(void) {
   if (!outcome_rejected_before_database(client, "BEGIN")) return 23;
   if (!outcome_rejected_before_database(
           client, " /* ordinary comment */ SeT autocommit = 0")) return 24;
+  if (!outcome_rejected_before_database(
+          client, " # MySQL line comment\nSET autocommit = 0")) return 49;
   if (!outcome_rejected_before_database(
           client, "/*!40101 SET autocommit = 0 */ UPDATE fixture")) return 25;
   if (!outcome_rejected_before_database(
@@ -2418,12 +2562,14 @@ int mysql_stmt_execute(MYSQL_STMT* s) {
   }
   if (strncmp(s->sql, "POST_STATE_QUERY", 16) == 0) {
     s->field_count = 3;
+    /* SERVER_STATUS_IN_TRANS set: query payload must be discarded. */
     s->connection->server_status = 1U;
     return 0;
   }
   if (strncmp(s->sql, "POST_STATE_EXECUTE", 18) == 0) {
     s->field_count = 0;
-    s->connection->server_status = 1U;
+    /* No IN_TRANS bit, but SERVER_STATUS_AUTOCOMMIT is also absent. */
+    s->connection->server_status = 0U;
     return 0;
   }
   if (strncmp(s->sql, "BEGIN", 5) == 0) {
