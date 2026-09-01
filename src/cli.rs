@@ -2907,26 +2907,87 @@ fn detect_libmysql_directory() -> Result<Option<LibmysqlDirectorySnapshot>, KuEr
     Ok(None)
 }
 
-fn mysql_header_in(dir: &Path) -> bool {
-    path_is_plain_regular_file(&dir.join("mysql.h"))
-        || path_is_plain_regular_file(&dir.join("mysql").join("mysql.h"))
-        || path_is_plain_regular_file(&dir.join("mariadb").join("mysql.h"))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlHeaderSelection {
+    /// The exact top-level public header selected by Ku. The compiler receives
+    /// this path through a preprocessor definition, so a missing nested header
+    /// cannot silently fall through to an unrelated system-level `mysql.h`.
+    header: PathBuf,
+    /// Search roots used by the selected header for its own public includes.
+    /// The header's direct parent comes first, followed by the configured root.
+    include_dirs: Vec<PathBuf>,
+}
+
+fn mysql_header_selection(dir: &Path) -> Result<Option<MysqlHeaderSelection>, KuError> {
+    let candidates = [
+        dir.join("mysql.h"),
+        dir.join("mysql").join("mysql.h"),
+        dir.join("mariadb").join("mysql.h"),
+    ];
+    let mut headers = Vec::new();
+    for header in candidates {
+        let parent = header
+            .parent()
+            .expect("MySQL header candidate has a parent");
+        if !path_is_plain_directory(parent) || !path_is_plain_regular_file(&header) {
+            continue;
+        }
+        let header = fs::canonicalize(&header).map_err(|error| {
+            KuError::message(format!(
+                "failed to canonicalize MySQL client header '{}': {error}",
+                header.display()
+            ))
+        })?;
+        if !headers.contains(&header) {
+            headers.push(header);
+        }
+    }
+    if headers.is_empty() {
+        return Ok(None);
+    }
+    if headers.len() != 1 {
+        return Err(KuError::message(format!(
+            "MySQL include directory '{}' contains multiple mysql.h layouts; refusing an ambiguous header search\nhelp: set KU_MYSQL_INCLUDE to the exact directory that directly contains the mysql.h for the selected client library",
+            dir.display()
+        )));
+    }
+    let header = headers.pop().expect("one MySQL header was selected");
+    let direct_parent = header
+        .parent()
+        .expect("canonical MySQL header has a parent")
+        .to_path_buf();
+    let configured_root = fs::canonicalize(dir).map_err(|error| {
+        KuError::message(format!(
+            "failed to canonicalize MySQL include directory '{}': {error}",
+            dir.display()
+        ))
+    })?;
+    let mut include_dirs = vec![direct_parent];
+    if !include_dirs.contains(&configured_root) {
+        include_dirs.push(configured_root);
+    }
+    Ok(Some(MysqlHeaderSelection {
+        header,
+        include_dirs,
+    }))
 }
 
 /// MYSQL_BIND is a versioned public struct and must come from the matching
 /// development header. Never synthesize its layout in generated C.
-fn explicit_libmysql_include_dir(configured: Option<OsString>) -> Result<Option<PathBuf>, KuError> {
+fn explicit_libmysql_include_dir(
+    configured: Option<OsString>,
+) -> Result<Option<MysqlHeaderSelection>, KuError> {
     if let Some(dir) = configured {
         let dir = PathBuf::from(dir);
-        if !dir.is_absolute() || !path_is_plain_directory(&dir) || !mysql_header_in(&dir) {
+        if !dir.is_absolute() || !path_is_plain_directory(&dir) {
             return Err(KuError::message(format!(
                 "KU_MYSQL_INCLUDE must name an absolute plain directory containing mysql.h, got '{}'",
                 dir.display()
             )));
         }
-        return fs::canonicalize(&dir).map(Some).map_err(|error| {
+        return mysql_header_selection(&dir)?.map(Some).ok_or_else(|| {
             KuError::message(format!(
-                "failed to canonicalize KU_MYSQL_INCLUDE '{}': {error}",
+                "KU_MYSQL_INCLUDE must name an absolute plain directory containing exactly one mysql.h layout, got '{}'",
                 dir.display()
             ))
         });
@@ -2934,19 +2995,18 @@ fn explicit_libmysql_include_dir(configured: Option<OsString>) -> Result<Option<
     Ok(None)
 }
 
-fn detect_libmysql_include_dir(library_dir: Option<&Path>) -> Result<Option<PathBuf>, KuError> {
+fn detect_libmysql_include_dir(
+    library_dir: Option<&Path>,
+) -> Result<Option<MysqlHeaderSelection>, KuError> {
     if let Some(dir) = explicit_libmysql_include_dir(env::var_os("KU_MYSQL_INCLUDE"))? {
         return Ok(Some(dir));
     }
     if let Some(root) = library_dir.and_then(Path::parent) {
         for candidate in [root.join("include"), root.join("include").join("mysql")] {
-            if path_is_plain_directory(&candidate) && mysql_header_in(&candidate) {
-                return fs::canonicalize(&candidate).map(Some).map_err(|error| {
-                    KuError::message(format!(
-                        "failed to canonicalize MySQL include directory '{}': {error}",
-                        candidate.display()
-                    ))
-                });
+            if path_is_plain_directory(&candidate) {
+                if let Some(selection) = mysql_header_selection(&candidate)? {
+                    return Ok(Some(selection));
+                }
             }
         }
         return Err(KuError::message(format!(
@@ -2954,14 +3014,19 @@ fn detect_libmysql_include_dir(library_dir: Option<&Path>) -> Result<Option<Path
             library_dir.expect("library root exists").display()
         )));
     }
-    Ok([
+    for candidate in [
         PathBuf::from("/usr/include/mysql"),
         PathBuf::from("/usr/include/mariadb"),
         PathBuf::from("/usr/local/include/mysql"),
         PathBuf::from("/usr/local/include/mariadb"),
-    ]
-    .into_iter()
-    .find(|candidate| path_is_plain_directory(candidate) && mysql_header_in(candidate)))
+    ] {
+        if path_is_plain_directory(&candidate) {
+            if let Some(selection) = mysql_header_selection(&candidate)? {
+                return Ok(Some(selection));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3941,6 +4006,54 @@ struct LibmysqlSnapshotFile {
 enum MysqlClientFamily {
     Mysql,
     Mariadb,
+}
+
+fn mysql_header_contract_definitions(
+    selection: &MysqlHeaderSelection,
+    family: MysqlClientFamily,
+    msvc: bool,
+) -> Result<[String; 2], KuError> {
+    let header = strip_verbatim(&selection.header);
+    let header = header.to_str().ok_or_else(|| {
+        KuError::message(format!(
+            "selected MySQL client header '{}' cannot be represented in a portable C include\nhelp: install the client development headers under a Unicode path without quote, backslash, or newline characters",
+            selection.header.display()
+        ))
+    })?;
+    let header = if cfg!(windows) {
+        header.replace('\\', "/")
+    } else {
+        header.to_string()
+    };
+    if header.contains(['"', '\r', '\n']) || (!cfg!(windows) && header.contains('\\')) {
+        return Err(KuError::message(format!(
+            "selected MySQL client header '{}' cannot be represented in a portable C include\nhelp: install the client development headers under a Unicode path without quote, backslash, or newline characters",
+            selection.header.display()
+        )));
+    }
+    let prefix = if msvc { "/D" } else { "-D" };
+    let family = match family {
+        MysqlClientFamily::Mysql => 0,
+        MysqlClientFamily::Mariadb => 1,
+    };
+    Ok([
+        format!("{prefix}KU_MYSQL_SELECTED_HEADER=\"{header}\""),
+        format!("{prefix}KU_MYSQL_EXPECT_HEADER_FAMILY={family}"),
+    ])
+}
+
+fn add_gnu_mysql_header_contract(
+    command: &mut Command,
+    selection: &MysqlHeaderSelection,
+    family: MysqlClientFamily,
+) -> Result<(), KuError> {
+    for include in &selection.include_dirs {
+        command.arg("-I").arg(strip_verbatim(include));
+    }
+    for definition in mysql_header_contract_definitions(selection, family, false)? {
+        command.arg(definition);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6302,8 +6415,15 @@ fn compile_c_source(
             .arg("-std=c11")
             .arg("-o")
             .arg(compiler_output);
-        if let Some(include) = &libmysql_include {
-            command.arg(format!("-I{}", include.display()));
+        if needs_libmysql {
+            let header = libmysql_include
+                .as_ref()
+                .expect("std.mysql requires an exact selected development header");
+            let family = mysql_requirement
+                .as_ref()
+                .expect("std.mysql requires a selected runtime dependency")
+                .family;
+            add_gnu_mysql_header_contract(&mut command, header, family)?;
         }
         if let Some(opt_level) = profile.rustc_opt_level() {
             command.arg(format!("-O{opt_level}"));
@@ -6471,7 +6591,10 @@ fn compile_c_source(
                         libmysql: staged_msvc_libmysql_library
                             .as_ref()
                             .map(StagedLinkLibrary::path),
-                        libmysql_include: libmysql_include.as_deref(),
+                        libmysql_header: libmysql_include.as_ref(),
+                        libmysql_family: mysql_requirement
+                            .as_ref()
+                            .map(|requirement| requirement.family),
                     },
                     MsvcCompileOptions {
                         profile,
@@ -6746,7 +6869,8 @@ fn detect_msvc_vcvars(deadline: Instant) -> Result<Option<PathBuf>, KuError> {
 struct MsvcDatabaseLinks<'a> {
     libpq: Option<&'a Path>,
     libmysql: Option<&'a Path>,
-    libmysql_include: Option<&'a Path>,
+    libmysql_header: Option<&'a MysqlHeaderSelection>,
+    libmysql_family: Option<MysqlClientFamily>,
 }
 
 #[derive(Clone, Copy)]
@@ -6788,8 +6912,21 @@ fn compile_with_msvc(
     if options.static_link {
         command.arg("/MT");
     }
-    if let Some(include) = database.libmysql_include {
-        command.arg(format!("/I{}", strip_verbatim(include).display()));
+    match (database.libmysql_header, database.libmysql_family) {
+        (Some(header), Some(family)) => {
+            for include in &header.include_dirs {
+                command.arg("/I").arg(strip_verbatim(include));
+            }
+            for definition in mysql_header_contract_definitions(header, family, true)? {
+                command.arg(definition);
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(KuError::message(
+                "MSVC MySQL compilation is missing its selected header-family contract",
+            ))
+        }
     }
     if let Some(library) = database.libpq {
         if !path_is_plain_regular_file(library) {
@@ -11550,11 +11687,231 @@ mod tests {
                 .dir,
             fs::canonicalize(&library_dir).expect("canonicalize MySQL library fixture")
         );
+        let selected = explicit_libmysql_include_dir(Some(include_dir.clone().into_os_string()))
+            .expect("validate explicit MySQL include directory")
+            .expect("explicit include directory");
         assert_eq!(
-            explicit_libmysql_include_dir(Some(include_dir.clone().into_os_string()))
-                .expect("validate explicit MySQL include directory")
-                .expect("explicit include directory"),
-            fs::canonicalize(&include_dir).expect("canonicalize MySQL include fixture")
+            selected.header,
+            fs::canonicalize(include_dir.join("mysql.h"))
+                .expect("canonicalize MySQL header fixture")
+        );
+        assert_eq!(
+            selected.include_dirs,
+            vec![fs::canonicalize(&include_dir).expect("canonicalize MySQL include fixture")]
+        );
+        guard.cleanup();
+    }
+
+    #[test]
+    fn mysql_header_selection_pins_nested_layout_and_rejects_ambiguity() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "ku-mysql-header-selection-{}-{nonce}",
+            std::process::id()
+        ));
+        let guard = TempBuildDir::new(root.clone());
+        let nested = root.join("mysql");
+        fs::create_dir_all(&nested).expect("create nested MySQL include fixture");
+        fs::write(nested.join("mysql.h"), b"/* selected nested header */")
+            .expect("write nested MySQL header fixture");
+
+        let selected = explicit_libmysql_include_dir(Some(root.clone().into_os_string()))
+            .expect("select nested MySQL header")
+            .expect("nested MySQL header selection");
+        assert_eq!(
+            selected.header,
+            fs::canonicalize(nested.join("mysql.h")).expect("canonicalize nested MySQL header")
+        );
+        assert_eq!(selected.include_dirs.len(), 2);
+        assert_eq!(
+            selected.include_dirs[0],
+            fs::canonicalize(&nested).expect("canonicalize nested header parent")
+        );
+        assert_eq!(
+            selected.include_dirs[1],
+            fs::canonicalize(&root).expect("canonicalize configured include root")
+        );
+        let definitions =
+            mysql_header_contract_definitions(&selected, MysqlClientFamily::Mysql, false)
+                .expect("encode exact selected MySQL header");
+        assert!(definitions[0].starts_with("-DKU_MYSQL_SELECTED_HEADER=\""));
+        assert!(definitions[0].contains("mysql"));
+        assert!(definitions[0].ends_with("mysql.h\""));
+        assert_eq!(definitions[1], "-DKU_MYSQL_EXPECT_HEADER_FAMILY=0");
+        let definitions =
+            mysql_header_contract_definitions(&selected, MysqlClientFamily::Mariadb, true)
+                .expect("encode MariaDB header-family contract for MSVC");
+        assert_eq!(definitions[1], "/DKU_MYSQL_EXPECT_HEADER_FAMILY=1");
+
+        let mariadb = root.join("mariadb");
+        fs::create_dir(&mariadb).expect("create second header layout");
+        fs::write(mariadb.join("mysql.h"), b"/* ambiguous MariaDB header */")
+            .expect("write ambiguous MariaDB header fixture");
+        let error = explicit_libmysql_include_dir(Some(root.clone().into_os_string()))
+            .expect_err("multiple mysql.h layouts must fail closed")
+            .to_string();
+        assert!(error.contains("multiple mysql.h layouts"));
+        assert!(error.contains("exact directory"));
+        guard.cleanup();
+    }
+
+    #[test]
+    fn mysql_header_family_contract_is_a_compiler_gate_not_search_order() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "ku-mysql-header-family-{}-{nonce}",
+            std::process::id()
+        ));
+        let guard = TempBuildDir::new(root.clone());
+        let selected_root = root.join("selected");
+        let selected_nested = selected_root.join("mysql");
+        let decoy = root.join("decoy");
+        fs::create_dir_all(&selected_nested).expect("create selected nested header directory");
+        fs::create_dir(&decoy).expect("create decoy header directory");
+        fs::write(
+            selected_nested.join("mysql.h"),
+            concat!(
+                "#define MARIADB_BASE_VERSION \"mariadb-10.11\"\n",
+                "#define MARIADB_PACKAGE_VERSION_ID 30405\n",
+                "#define MARIADB_VERSION_ID 101106\n",
+                "#define MYSQL_VERSION_ID MARIADB_VERSION_ID\n",
+            ),
+        )
+        .expect("write selected MariaDB header");
+        fs::write(decoy.join("mysql.h"), "#define MYSQL_VERSION_ID 80029\n")
+            .expect("write unrelated top-level Oracle header");
+        let selected = explicit_libmysql_include_dir(Some(selected_root.into_os_string()))
+            .expect("resolve nested selected header")
+            .expect("selected header contract");
+
+        let ku_source = root.join("main.ku");
+        let c_source = root.join("main.c");
+        let source = r#"import mysql from "std.mysql"
+fn main(): null! {
+    client = mysql.client({
+        host: "127.0.0.1", user: "u", password: "p", database: "d"
+    })?
+    client.close()
+    return ok(null)
+}
+"#;
+        fs::write(&ku_source, source).expect("write MySQL header-family Ku fixture");
+        write_native_c_to(
+            ku_source.to_str().expect("Unicode test source path"),
+            source,
+            &c_source,
+            backend::c::NativeFsBase::ExecutableRelative(".".to_string()),
+            DependencyResolveMode::Update,
+        )
+        .expect("emit MySQL header-family C fixture");
+        let generated = fs::read_to_string(&c_source).expect("read generated MySQL C fixture");
+        let gate_start = generated
+            .find("#if defined(KU_MYSQL_SELECTED_HEADER)")
+            .expect("generated selected-header gate");
+        let gate_end = generated[gate_start..]
+            .find("typedef struct KuMysqlClient")
+            .map(|offset| gate_start + offset)
+            .expect("generated MySQL type boundary");
+        let gate_source = root.join("header_gate.c");
+        fs::write(
+            &gate_source,
+            format!(
+                "{}int main(void) {{ return 0; }}\n",
+                &generated[gate_start..gate_end]
+            ),
+        )
+        .expect("write isolated generated header-family gate");
+
+        let compile = |family: MysqlClientFamily, stem: &str| -> Option<bool> {
+            for candidate in c_compiler_candidates(None) {
+                let mut command = Command::new(&candidate.program);
+                command
+                    .args(&candidate.args)
+                    // Put the unrelated top-level mysql.h first deliberately.
+                    // The exact selected-header macro must make this irrelevant.
+                    .arg("-I")
+                    .arg(&decoy);
+                add_gnu_mysql_header_contract(&mut command, &selected, family)
+                    .expect("encode MySQL compiler header-family contract");
+                let object = root.join(format!("{stem}.o"));
+                command
+                    .arg("-std=c11")
+                    .arg("-c")
+                    .arg(&gate_source)
+                    .arg("-o")
+                    .arg(object)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                match run_build_process_bounded(&mut command, C_COMPILER_PROCESS_TIMEOUT) {
+                    Ok(status) => return Some(status.success()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => panic!("header-family compiler was not bounded: {error}"),
+                }
+            }
+            #[cfg(windows)]
+            {
+                let deadline = Instant::now()
+                    .checked_add(BUILD_TOOL_PROBE_TIMEOUT)
+                    .unwrap_or_else(Instant::now);
+                let vcvars = detect_msvc_vcvars(deadline)
+                    .unwrap_or_else(|error| panic!("MSVC discovery was not bounded: {error}"))?;
+                let environment = load_vcvars_env(&vcvars, deadline)
+                    .unwrap_or_else(|error| panic!("MSVC environment was not bounded: {error}"));
+                let cl = find_cl_in_env(&environment)?;
+                let mut command = Command::new(cl);
+                command.env_clear();
+                for (key, value) in &environment {
+                    command.env(key, value);
+                }
+                command
+                    .arg("/nologo")
+                    .arg("/std:c11")
+                    .arg("/utf-8")
+                    .arg("/I")
+                    .arg(strip_verbatim(&decoy));
+                for include in &selected.include_dirs {
+                    command.arg("/I").arg(strip_verbatim(include));
+                }
+                for definition in mysql_header_contract_definitions(&selected, family, true)
+                    .expect("encode MSVC MySQL header-family contract")
+                {
+                    command.arg(definition);
+                }
+                let object = root.join(format!("{stem}.obj"));
+                command
+                    .arg("/c")
+                    .arg(strip_verbatim(&gate_source))
+                    .arg(format!("/Fo:{}", strip_verbatim(&object).display()))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                return match run_build_process_bounded(&mut command, C_COMPILER_PROCESS_TIMEOUT) {
+                    Ok(status) => Some(status.success()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("MSVC header-family compiler was not bounded: {error}"),
+                };
+            }
+            #[cfg(not(windows))]
+            None
+        };
+        let Some(matches) = compile(MysqlClientFamily::Mariadb, "matching") else {
+            eprintln!("skip: no GCC-compatible C compiler for MySQL header-family gate");
+            guard.cleanup();
+            return;
+        };
+        assert!(
+            matches,
+            "the exact nested MariaDB header must compile despite an earlier decoy mysql.h"
+        );
+        assert_eq!(
+            compile(MysqlClientFamily::Mysql, "mismatching"),
+            Some(false),
+            "a selected MySQL library contract must reject the MariaDB header at compile time"
         );
         guard.cleanup();
     }
