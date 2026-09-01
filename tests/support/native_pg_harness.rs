@@ -23,6 +23,188 @@ const BUILD_LIMITS: OutputLimits = OutputLimits::new(8 * 1024 * 1024, 12 * 1024 
 pub const RUN_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Cross-platform C test support for deterministic native lifecycle races.
+/// Worker progress is coordinated with OS events/condition variables; no
+/// scheduling delay is used as a correctness signal. The POSIX join is guarded
+/// by both a completion deadline and `alarm`, because macOS has no portable
+/// equivalent of `pthread_timedjoin_np`.
+pub const NATIVE_THREAD_LIFECYCLE_HARNESS: &str = r#"
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <stdatomic.h>
+#include <sched.h>
+#include <unistd.h>
+#endif
+
+typedef struct KuTestEvent {
+#if defined(_WIN32)
+  HANDLE handle;
+#else
+  pthread_mutex_t mutex;
+  pthread_cond_t condition;
+  int signaled;
+#endif
+} KuTestEvent;
+
+static unsigned long long ku_test_real_now_ms(void) {
+#if defined(_WIN32)
+  return (unsigned long long)GetTickCount64();
+#else
+  struct timespec now = {0};
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+  return (unsigned long long)now.tv_sec * 1000ULL
+      + (unsigned long long)now.tv_nsec / 1000000ULL;
+#endif
+}
+
+static void ku_test_thread_yield(void) {
+#if defined(_WIN32)
+  Sleep(0);
+#else
+  sched_yield();
+#endif
+}
+
+static int ku_test_event_init(KuTestEvent* event) {
+#if defined(_WIN32)
+  event->handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+  return event->handle != NULL;
+#else
+  event->signaled = 0;
+  if (pthread_mutex_init(&event->mutex, NULL) != 0) return 0;
+  if (pthread_cond_init(&event->condition, NULL) != 0) {
+    pthread_mutex_destroy(&event->mutex);
+    return 0;
+  }
+  return 1;
+#endif
+}
+
+static int ku_test_event_set(KuTestEvent* event) {
+#if defined(_WIN32)
+  return SetEvent(event->handle) != 0;
+#else
+  if (pthread_mutex_lock(&event->mutex) != 0) return 0;
+  event->signaled = 1;
+  int broadcast_result = pthread_cond_broadcast(&event->condition);
+  int unlock_result = pthread_mutex_unlock(&event->mutex);
+  return broadcast_result == 0 && unlock_result == 0;
+#endif
+}
+
+static int ku_test_event_wait(KuTestEvent* event, unsigned long timeout_ms) {
+#if defined(_WIN32)
+  return WaitForSingleObject(event->handle, (DWORD)timeout_ms) == WAIT_OBJECT_0;
+#else
+  struct timespec deadline = {0};
+  if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return 0;
+  deadline.tv_sec += (time_t)(timeout_ms / 1000UL);
+  long extra_ns = (long)((timeout_ms % 1000UL) * 1000000UL);
+  if (deadline.tv_nsec > 999999999L - extra_ns) {
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000L - extra_ns;
+  } else {
+    deadline.tv_nsec += extra_ns;
+  }
+  if (pthread_mutex_lock(&event->mutex) != 0) return 0;
+  int result = 1;
+  while (!event->signaled) {
+    int wait_result = pthread_cond_timedwait(
+        &event->condition, &event->mutex, &deadline);
+    if (wait_result == ETIMEDOUT) { result = 0; break; }
+    if (wait_result != 0) { result = 0; break; }
+  }
+  if (pthread_mutex_unlock(&event->mutex) != 0) result = 0;
+  return result;
+#endif
+}
+
+static int ku_test_event_destroy(KuTestEvent* event) {
+#if defined(_WIN32)
+  int result = event->handle && CloseHandle(event->handle);
+  event->handle = NULL;
+  return result;
+#else
+  if (pthread_cond_destroy(&event->condition) != 0) return 0;
+  return pthread_mutex_destroy(&event->mutex) == 0;
+#endif
+}
+
+typedef int (*KuTestThreadFn)(void*);
+typedef struct KuTestThread {
+  KuTestThreadFn function;
+  void* argument;
+  int outcome;
+  KuTestEvent finished;
+#if defined(_WIN32)
+  HANDLE handle;
+#else
+  pthread_t handle;
+#endif
+} KuTestThread;
+
+#if defined(_WIN32)
+static DWORD WINAPI ku_test_thread_trampoline(void* raw) {
+#else
+static void* ku_test_thread_trampoline(void* raw) {
+#endif
+  KuTestThread* thread = (KuTestThread*)raw;
+  thread->outcome = thread->function(thread->argument);
+  if (!ku_test_event_set(&thread->finished)) thread->outcome = 127;
+#if defined(_WIN32)
+  return 0;
+#else
+  return NULL;
+#endif
+}
+
+static int ku_test_thread_start(
+    KuTestThread* thread, KuTestThreadFn function, void* argument) {
+  memset(thread, 0, sizeof(*thread));
+  thread->function = function;
+  thread->argument = argument;
+  if (!ku_test_event_init(&thread->finished)) return 0;
+#if defined(_WIN32)
+  thread->handle = CreateThread(
+      NULL, 0, ku_test_thread_trampoline, thread, 0, NULL);
+  if (!thread->handle) {
+    ku_test_event_destroy(&thread->finished);
+    return 0;
+  }
+#else
+  if (pthread_create(
+          &thread->handle, NULL, ku_test_thread_trampoline, thread) != 0) {
+    ku_test_event_destroy(&thread->finished);
+    return 0;
+  }
+#endif
+  return 1;
+}
+
+static int ku_test_thread_join(KuTestThread* thread, unsigned long timeout_ms) {
+  if (!ku_test_event_wait(&thread->finished, timeout_ms)) return 0;
+#if defined(_WIN32)
+  if (WaitForSingleObject(thread->handle, (DWORD)timeout_ms) != WAIT_OBJECT_0) {
+    return 0;
+  }
+  if (!CloseHandle(thread->handle)) return 0;
+  thread->handle = NULL;
+#else
+  unsigned int timeout_seconds = (unsigned int)((timeout_ms + 999UL) / 1000UL);
+  if (timeout_seconds == 0) timeout_seconds = 1;
+  alarm(timeout_seconds);
+  int join_result = pthread_join(thread->handle, NULL);
+  alarm(0);
+  if (join_result != 0) return 0;
+#endif
+  return ku_test_event_destroy(&thread->finished);
+}
+"#;
+
 pub struct TempDir(PathBuf);
 
 impl TempDir {
