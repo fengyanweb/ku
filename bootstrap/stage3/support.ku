@@ -5,6 +5,13 @@ import { ParseOutput } from "../stage2/ast.ku"
 import { ParseWithContext } from "../stage2/parser.ku"
 import { ParseContext } from "../stage2/context.ku"
 
+struct SourceMap {
+    source: str
+    characters: [str]
+    starts: [int]
+    ends: [int]
+}
+
 // Pure Stage 3 helpers live outside parser.ku so each self-hosted source file
 // remains below Stage 1's fixed per-file token ceiling.
 fn RejectAt(token: Token, code: str, message: str): null! {
@@ -49,4 +56,49 @@ fn CanEndExpression(kind: str): bool {
 
 fn CanStartStatement(kind: str): bool {
     return kind == "Ident" || kind == "Int" || kind == "Float" || kind == "String" || kind == "TemplateString" || kind == "True" || kind == "False" || kind == "Null" || kind == "Bang" || kind == "Return" || kind == "Let" || kind == "If" || kind == "While" || kind == "For" || kind == "Break" || kind == "Continue" || kind == "Try" || kind == "Async" || kind == "Fn" || kind == "Fail" || kind == "Panic" || kind == "Print"
+}
+
+fn MapTokenCharacters(source: str, tokens: [Token]): SourceMap! {
+    characters: [str] = source.chars()
+    starts: [int] = []
+    ends: [int] = []
+    char_index = 0
+    byte_offset = 0
+    token_index = 0
+    map_steps = 0
+    while (token_index < tokens.len()) {
+        token = tokens[token_index].clone()
+        while (byte_offset < token.offset) {
+            if (char_index >= characters.len()) {
+                RejectAt(token.clone(), "invalid_token_span", "token start lies outside source")?
+            }
+            byte_offset = byte_offset + characters[char_index].byte_len()
+            char_index = char_index + 1
+            map_steps = map_steps + 1
+            if (map_steps > 36864) {
+                RejectAt(token.clone(), "work_limit", "stage-3 token mapping budget exceeded")?
+            }
+        }
+        if (byte_offset != token.offset) {
+            RejectAt(token.clone(), "invalid_token_span", "token start splits a UTF-8 scalar")?
+        }
+        starts = starts.push(char_index)
+        while (byte_offset < token.end_offset) {
+            if (char_index >= characters.len()) {
+                RejectAt(token.clone(), "invalid_token_span", "token end lies outside source")?
+            }
+            byte_offset = byte_offset + characters[char_index].byte_len()
+            char_index = char_index + 1
+            map_steps = map_steps + 1
+            if (map_steps > 36864) {
+                RejectAt(token.clone(), "work_limit", "stage-3 token mapping budget exceeded")?
+            }
+        }
+        if (byte_offset != token.end_offset) {
+            RejectAt(token.clone(), "invalid_token_span", "token end splits a UTF-8 scalar")?
+        }
+        ends = ends.push(char_index)
+        token_index = token_index + 1
+    }
+    return ok(SourceMap { source: source, characters: characters, starts: starts, ends: ends })
 }

@@ -2,7 +2,9 @@ import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken } from "../stage2/span.ku"
 import { Node, ParseOutput, EmptyArena } from "../stage2/ast.ku"
-import { RejectAt, ParseExpressionAt, CanEndExpression, CanStartStatement } from "./support.ku"
+import { RejectAt, ParseExpressionAt, CanEndExpression, CanStartStatement, MapTokenCharacters } from "./support.ku"
+import { SignatureType, ReadSignatureType } from "./signature.ku"
+import { ReadImport } from "./imports.ku"
 
 // Stage 3 is intentionally a strict, useful subset of the production Rust
 // parser. It accepts ordinary functions whose bodies contain
@@ -19,12 +21,6 @@ import { RejectAt, ParseExpressionAt, CanEndExpression, CanStartStatement } from
 // each bounded, already lexically-valid expression window with a structured
 // origin/boundary context, so it relocates both AST and parser-error spans
 // before returning them to this module's fixed NodeId/edge arenas.
-
-struct SignatureType {
-    text: str
-    span: Span
-    next: int
-}
 
 fn ParseProgram(source: str): ParseOutput! {
     tokens = Scan(source.clone())?
@@ -53,55 +49,18 @@ fn ParseProgram(source: str): ParseOutput! {
         RejectAt(eof, "invalid_token_stream", "token stream is missing EOF")?
     }
 
-    // Token offsets count UTF-8 bytes while source_chars uses Unicode-scalar
-    // indexes. Build both token boundaries in a single forward pass. Every loop
-    // advances a token or source character and is bounded by Stage 1 limits.
-    expression_source_text: str = source.clone()
-    source_chars: [str] = source.chars()
-    token_char_starts: [int] = []
-    token_char_ends: [int] = []
-    char_index = 0
-    byte_offset = 0
-    token_index = 0
-    map_steps = 0
-    while (token_index < tokens.len()) {
-        token = tokens[token_index].clone()
-        while (byte_offset < token.offset) {
-            if (char_index >= source_chars.len()) {
-                RejectAt(token.clone(), "invalid_token_span", "token start lies outside source")?
-            }
-            byte_offset = byte_offset + source_chars[char_index].byte_len()
-            char_index = char_index + 1
-            map_steps = map_steps + 1
-            if (map_steps > 36864) {
-                RejectAt(token.clone(), "work_limit", "stage-3 token mapping budget exceeded")?
-            }
-        }
-        if (byte_offset != token.offset) {
-            RejectAt(token.clone(), "invalid_token_span", "token start splits a UTF-8 scalar")?
-        }
-        token_char_starts = token_char_starts.push(char_index)
-        while (byte_offset < token.end_offset) {
-            if (char_index >= source_chars.len()) {
-                RejectAt(token.clone(), "invalid_token_span", "token end lies outside source")?
-            }
-            byte_offset = byte_offset + source_chars[char_index].byte_len()
-            char_index = char_index + 1
-            map_steps = map_steps + 1
-            if (map_steps > 36864) {
-                RejectAt(token.clone(), "work_limit", "stage-3 token mapping budget exceeded")?
-            }
-        }
-        if (byte_offset != token.end_offset) {
-            RejectAt(token.clone(), "invalid_token_span", "token end splits a UTF-8 scalar")?
-        }
-        token_char_ends = token_char_ends.push(char_index)
-        token_index = token_index + 1
-    }
+    // The source moves through the mapper and back; only the bounded token
+    // array is cloned once so the main parser can keep its cursor.
+    mapped = MapTokenCharacters(source, tokens.clone())?
+    token_char_starts: [int] = mapped.starts
+    token_char_ends: [int] = mapped.ends
+    source_chars: [str] = mapped.characters
+    expression_source_text: str = mapped.source
 
     arena = EmptyArena()
     cursor = 0
-    functions: [int] = []
+    items: [int] = []
+    import_count = 0
     function_count = 0
     parse_steps = 0
     slice_work = 0
@@ -197,42 +156,14 @@ fn ParseProgram(source: str): ParseOutput! {
         return ok(node_base + parsed.root)
     }
 
-    fn ReadSignatureType(start: int): SignatureType! {
+    fn ReadTypeAt(start: int): SignatureType! {
         if (start < 0 || start >= tokens.len()) {
             RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "function signature type starts outside the token stream")?
         }
-        token = tokens[start].clone()
-        type_text = ""
-        if (token.kind == "Ident" && (token.lexeme == "int" || token.lexeme == "float" || token.lexeme == "bool" || token.lexeme == "str")) {
-            type_text = token.lexeme.clone()
-        } else if (token.kind == "Null") {
-            type_text = "null"
-        } else if (token.kind == "Ident" && (token.lexeme == "string" || token.lexeme == "nil")) {
-            RejectAt(token.clone(), "unexpected_token", "expected type name")?
-        } else if (token.kind == "Ident" || token.kind == "LBracket" || token.kind == "Fn" || token.kind == "Async") {
-            RejectAt(token.clone(), "unsupported_type", "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms")?
-        } else {
-            RejectAt(token.clone(), "unexpected_token", "expected type name")?
-        }
-        next = start + 1
-        if (next >= tokens.len()) {
-            RejectAt(token.clone(), "invalid_token_stream", "function signature type is missing final EOF")?
-        }
-        end = token.clone()
-        if (tokens[next].kind == "Bang") {
-            type_text = type_text + "!"
-            end = tokens[next].clone()
-            next = next + 1
-        }
-        span = Span {
-            line: token.line,
-            column: token.column,
-            offset: token.offset,
-            end_line: end.end_line,
-            end_column: end.end_column,
-            end_offset: end.end_offset
-        }
-        return ok(SignatureType { text: type_text, span: span, next: next })
+        next = start
+        has_next = start + 1 < tokens.len()
+        if (has_next) { next = start + 1 }
+        return ReadSignatureType(tokens[start].clone(), tokens[next].clone(), has_next)
     }
 
     fn ExpressionEnd(start: int): int! {
@@ -273,17 +204,86 @@ fn ParseProgram(source: str): ParseOutput! {
 
     while (tokens[cursor].kind != "Eof") {
         parse_steps = parse_steps + 1
+        parsed_import = false
         if (parse_steps > 16384) {
             RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
         }
-        if (function_count >= 64) {
-            RejectAt(tokens[cursor].clone(), "function_limit", "stage-3 parser accepts at most 64 functions")?
+        if (tokens[cursor].kind == "Import") {
+            if (import_count >= 64) {
+                RejectAt(tokens[cursor].clone(), "import_limit", "stage-3 parser accepts at most 64 imports")?
+            }
+            import_window: [Token] = []
+            window_cursor = cursor
+            collecting_import = true
+            after_path = false
+            while (collecting_import) {
+                if (window_cursor >= tokens.len()) {
+                    RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "import inspection escaped the token stream")?
+                }
+                // 265 source tokens cover the complete 65-name all-alias
+                // boundary; one appended EOF sentinel keeps every lookahead
+                // safe while the 64-name grammar limit remains authoritative.
+                if (import_window.len() >= 265) {
+                    RejectAt(tokens[window_cursor].clone(), "work_limit", "stage-3 import inspection budget exceeded")?
+                }
+                window_token = tokens[window_cursor].clone()
+                import_window = import_window.push(window_token.clone())
+                window_cursor = window_cursor + 1
+                if (after_path || window_token.kind == "Eof") {
+                    collecting_import = false
+                } else if (window_token.kind == "String") {
+                    after_path = true
+                }
+            }
+            if (import_window[import_window.len() - 1].kind != "Eof") {
+                import_window = import_window.push(tokens[tokens.len() - 1].clone())
+            }
+            parsed = ReadImport(import_window)?
+            parse_steps = parse_steps + parsed.work
+            if (parse_steps > 16384) {
+                RejectAt(parsed.start.clone(), "work_limit", "stage-3 parser work budget exceeded")?
+            }
+            import_children: [int] = []
+            if (parsed.has_namespace) {
+                namespace = AddNode("ImportNamespace", parsed.namespace.lexeme.clone(), 0, SpanFromToken(parsed.namespace.clone()), [], parsed.namespace.clone())?
+                import_children = import_children.push(namespace)
+            }
+            imported_names = parsed.names.clone()
+            for imported in imported_names {
+                imported_has_alias = imported.has_alias
+                name_children: [int] = []
+                if (imported_has_alias) {
+                    alias = AddNode("ImportAlias", imported.alias.lexeme.clone(), 0, SpanFromToken(imported.alias.clone()), [], imported.alias.clone())?
+                    name_children = name_children.push(alias)
+                }
+                name = AddNode("ImportName", imported.source.lexeme.clone(), 0, SpanFromToken(imported.source.clone()), name_children, imported.source.clone())?
+                import_children = import_children.push(name)
+            }
+            cursor = cursor + parsed.consumed
+            import_node = AddNode("Import", parsed.path.lexeme.clone(), 0, Span {
+                line: parsed.start.line,
+                column: parsed.start.column,
+                offset: parsed.start.offset,
+                end_line: parsed.path.end_line,
+                end_column: parsed.path.end_column,
+                end_offset: parsed.path.end_offset
+            }, import_children, parsed.start.clone())?
+            items = items.push(import_node)
+            import_count = import_count + 1
+            parsed_import = true
         }
+        if (!parsed_import) {
         if (tokens[cursor].kind == "Return") {
             RejectAt(tokens[cursor].clone(), "return_outside_function", "return outside function")?
         }
+        if (tokens[cursor].kind == "Struct" || tokens[cursor].kind == "Enum" || tokens[cursor].kind == "Module" || tokens[cursor].kind == "Async") {
+            RejectAt(tokens[cursor].clone(), "unsupported_item", "stage-3 supports import and ordinary function items only")?
+        }
         if (tokens[cursor].kind != "Fn") {
-            RejectAt(tokens[cursor].clone(), "expected_item", "expected a function declaration")?
+            RejectAt(tokens[cursor].clone(), "expected_item", "expected top-level item: import, fn, struct, enum, or module")?
+        }
+        if (function_count >= 64) {
+            RejectAt(tokens[cursor].clone(), "function_limit", "stage-3 parser accepts at most 64 functions")?
         }
         function_start = tokens[cursor].clone()
         cursor = cursor + 1
@@ -313,8 +313,8 @@ fn ParseProgram(source: str): ParseOutput! {
             cursor = cursor + 1
             parameter_children: [int] = []
             if (tokens[cursor].kind == "Colon") {
-                parsed_type = ReadSignatureType(cursor + 1)?
-                cursor = parsed_type.next
+                parsed_type = ReadTypeAt(cursor + 1)?
+                cursor = cursor + 1 + parsed_type.consumed
                 if (tokens[cursor].kind == "Pipe") {
                     RejectAt(tokens[cursor].clone(), "unsupported_type", "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms")?
                 }
@@ -337,9 +337,9 @@ fn ParseProgram(source: str): ParseOutput! {
         return_type = 0
         has_return_type = false
         if (tokens[cursor].kind == "Colon") {
-            parsed_type = ReadSignatureType(cursor + 1)?
+            parsed_type = ReadTypeAt(cursor + 1)?
             has_return_type = true
-            cursor = parsed_type.next
+            cursor = cursor + 1 + parsed_type.consumed
             if (tokens[cursor].kind == "Pipe") {
                 RejectAt(tokens[cursor].clone(), "unsupported_type", "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms")?
             }
@@ -474,14 +474,15 @@ fn ParseProgram(source: str): ParseOutput! {
             end_column: function_end.end_column,
             end_offset: function_end.end_offset
         }, function_children, function_start.clone())?
-        functions = functions.push(function)
+        items = items.push(function)
         function_count = function_count + 1
+        }
     }
 
     program_span = SpanFromToken(tokens[tokens.len() - 1].clone())
-    if (functions.len() > 0) {
-        first = arena.nodes[functions[0] - 1].clone()
-        last = arena.nodes[functions[functions.len() - 1] - 1].clone()
+    if (items.len() > 0) {
+        first = arena.nodes[items[0] - 1].clone()
+        last = arena.nodes[items[items.len() - 1] - 1].clone()
         program_span = Span {
             line: first.line,
             column: first.column,
@@ -491,7 +492,7 @@ fn ParseProgram(source: str): ParseOutput! {
             end_offset: last.end_offset
         }
     }
-    root = AddNode("Program", "", 0, program_span, functions, tokens[tokens.len() - 1].clone())?
+    root = AddNode("Program", "", 0, program_span, items, tokens[tokens.len() - 1].clone())?
     // Local helpers capture the arena; one final bounded clone is required to
     // move the complete graph out of the shared local-helper environment.
     return ok(ParseOutput { arena: arena.clone(), root: root })
