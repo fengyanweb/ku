@@ -32,7 +32,7 @@ use crate::{
         MAX_REGISTRY_INDEX_BYTES, MAX_REGISTRY_INDEX_VERSIONS, MAX_REGISTRY_LINE_BYTES,
         PACKAGE_CONTENT_TYPE,
     },
-    registry_admin::parse_credential_records,
+    registry_admin::{self, parse_credential_records},
     span::Span,
 };
 
@@ -62,6 +62,7 @@ const REGISTRY_TLS_INPUT_BUFFER_BYTES: usize = 8 * 1024;
 const MAX_BUFFERED_REJECT_BODY_BYTES: usize = 8 * 1024;
 const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SECRET_FILE_BYTES: u64 = 16 * 1024;
+const MAX_CREDENTIALS_FILE_BYTES: u64 = registry_admin::MAX_CREDENTIAL_FILE_BYTES;
 const MAX_TLS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ENTRY_METADATA_BYTES: u64 = 256 * 1024;
 const MAX_INDEX_ITEMS: usize = 65_536;
@@ -2649,12 +2650,12 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 }
 
 fn read_credentials(path: &Path) -> KuResult<Vec<PublishCredential>> {
-    let bytes = read_bounded_regular_file(path, MAX_SECRET_FILE_BYTES, "credentials")?;
+    let bytes = read_bounded_regular_file(path, MAX_CREDENTIALS_FILE_BYTES, "credentials")?;
     let credentials = parse_credential_records(&bytes)?;
     if credentials.is_empty() {
         return Err(server_config_error(
             "invalid_registry_credentials",
-            "registry credentials file must contain at least one token hash and exact package name",
+            "registry credentials file must contain at least one active token-to-owned-package authorization",
         ));
     }
     Ok(credentials
@@ -7264,6 +7265,9 @@ mod tests {
         let symlink_created = false;
         if symlink_created {
             assert!(validate_yank_marker_directory(&symlink_marker, &yanks_root).is_err());
+            #[cfg(windows)]
+            fs::remove_dir(&symlink_marker).expect("remove yank marker directory symlink");
+            #[cfg(not(windows))]
             fs::remove_file(&symlink_marker).expect("remove yank marker symlink");
         }
 

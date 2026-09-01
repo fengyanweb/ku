@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env,
     ffi::OsString,
     fs,
@@ -21,13 +21,17 @@ use crate::{
 };
 
 pub const REGISTRY_CREDENTIALS_FILE_ENV: &str = "KU_REGISTRY_CREDENTIALS_FILE";
-pub const REGISTRY_USAGE: &str = "ku-registry\nku-registry token issue <exact-package-name>\nku-registry token revoke <exact-package-name>\nku-registry --help";
+pub const REGISTRY_USAGE: &str = "ku-registry\nku-registry governance init <developer>\nku-registry governance migrate <developer>\nku-registry developer create <developer>\nku-registry developer token-issue <developer>\nku-registry developer token-revoke <developer>\nku-registry developer token-revoke-hash <developer> <sha256-hash>\nku-registry team create <team>\nku-registry team member-add <team> <developer>\nku-registry team member-remove <team> <developer>\nku-registry package claim <package> <developer:name|team:name>\nku-registry package transfer <package> <developer:name|team:name>\nku-registry audit verify\nku-registry token issue <exact-package-name>\nku-registry token revoke <exact-package-name>\nku-registry --help";
 
-const MAX_CREDENTIAL_FILE_BYTES: u64 = 16 * 1024;
+pub(crate) const MAX_CREDENTIAL_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_GOVERNANCE_RECORDS: usize = 4_096;
+const MAX_GOVERNANCE_AUDITS: usize = 32_768;
 const TOKEN_RANDOM_BYTES: usize = 32;
 const ADMIN_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const ADMIN_LOCK_POLL: Duration = Duration::from_millis(10);
 const TOKEN_GENERATION_ATTEMPTS: usize = 16;
+const GOVERNANCE_SCHEMA: &str = "schema 2";
+const GOVERNANCE_AUDIT_ROOT: &str = "root";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CredentialRecord {
@@ -39,8 +43,51 @@ pub(crate) struct CredentialRecord {
 pub enum RegistryCommand {
     Serve,
     Help,
-    Issue { package_name: String },
-    Revoke { package_name: String },
+    Issue {
+        package_name: String,
+    },
+    Revoke {
+        package_name: String,
+    },
+    GovernanceInit {
+        developer: String,
+    },
+    GovernanceMigrate {
+        developer: String,
+    },
+    DeveloperCreate {
+        developer: String,
+    },
+    DeveloperTokenIssue {
+        developer: String,
+    },
+    DeveloperTokenRevoke {
+        developer: String,
+    },
+    DeveloperTokenRevokeHash {
+        developer: String,
+        token_hash: [u8; 32],
+    },
+    TeamCreate {
+        team: String,
+    },
+    TeamMemberAdd {
+        team: String,
+        developer: String,
+    },
+    TeamMemberRemove {
+        team: String,
+        developer: String,
+    },
+    PackageClaim {
+        package_name: String,
+        owner: String,
+    },
+    PackageTransfer {
+        package_name: String,
+        owner: String,
+    },
+    AuditVerify,
 }
 
 pub fn parse_registry_command(
@@ -54,25 +101,103 @@ pub fn parse_registry_command(
         return Ok(RegistryCommand::Help);
     }
     let usage = format!("usage:\n{REGISTRY_USAGE}");
-    if arguments.len() != 3 || arguments[0] != "token" {
-        return Err(admin_error("invalid_registry_command", &usage));
-    }
-    let action = arguments[1]
-        .to_str()
+    let text = arguments
+        .iter()
+        .map(|value| value.to_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
         .ok_or_else(|| admin_error("invalid_registry_command", &usage))?;
-    let package_name = arguments[2]
-        .to_str()
-        .ok_or_else(|| {
-            admin_error(
-                "invalid_registry_package_name",
-                "registry package name must be valid UTF-8",
-            )
-        })?
-        .to_string();
-    validate_admin_package_name(&package_name)?;
-    match action {
-        "issue" => Ok(RegistryCommand::Issue { package_name }),
-        "revoke" => Ok(RegistryCommand::Revoke { package_name }),
+    match text.as_slice() {
+        [group, action, value] if group == "token" && action == "issue" => {
+            validate_admin_package_name(value)?;
+            Ok(RegistryCommand::Issue {
+                package_name: value.clone(),
+            })
+        }
+        [group, action, value] if group == "token" && action == "revoke" => {
+            validate_admin_package_name(value)?;
+            Ok(RegistryCommand::Revoke {
+                package_name: value.clone(),
+            })
+        }
+        [group, action, developer] if group == "governance" && action == "migrate" => {
+            validate_governance_name(developer, "developer")?;
+            Ok(RegistryCommand::GovernanceMigrate {
+                developer: developer.clone(),
+            })
+        }
+        [group, action, developer] if group == "governance" && action == "init" => {
+            validate_governance_name(developer, "developer")?;
+            Ok(RegistryCommand::GovernanceInit {
+                developer: developer.clone(),
+            })
+        }
+        [group, action, developer] if group == "developer" && action == "create" => {
+            validate_governance_name(developer, "developer")?;
+            Ok(RegistryCommand::DeveloperCreate {
+                developer: developer.clone(),
+            })
+        }
+        [group, action, developer] if group == "developer" && action == "token-issue" => {
+            validate_governance_name(developer, "developer")?;
+            Ok(RegistryCommand::DeveloperTokenIssue {
+                developer: developer.clone(),
+            })
+        }
+        [group, action, developer] if group == "developer" && action == "token-revoke" => {
+            validate_governance_name(developer, "developer")?;
+            Ok(RegistryCommand::DeveloperTokenRevoke {
+                developer: developer.clone(),
+            })
+        }
+        [group, action, developer, token_hash]
+            if group == "developer" && action == "token-revoke-hash" =>
+        {
+            validate_governance_name(developer, "developer")?;
+            Ok(RegistryCommand::DeveloperTokenRevokeHash {
+                developer: developer.clone(),
+                token_hash: parse_admin_token_hash(token_hash)?,
+            })
+        }
+        [group, action, team] if group == "team" && action == "create" => {
+            validate_governance_name(team, "team")?;
+            Ok(RegistryCommand::TeamCreate { team: team.clone() })
+        }
+        [group, action, team, developer] if group == "team" && action == "member-add" => {
+            validate_governance_name(team, "team")?;
+            validate_governance_name(developer, "developer")?;
+            Ok(RegistryCommand::TeamMemberAdd {
+                team: team.clone(),
+                developer: developer.clone(),
+            })
+        }
+        [group, action, team, developer] if group == "team" && action == "member-remove" => {
+            validate_governance_name(team, "team")?;
+            validate_governance_name(developer, "developer")?;
+            Ok(RegistryCommand::TeamMemberRemove {
+                team: team.clone(),
+                developer: developer.clone(),
+            })
+        }
+        [group, action, package_name, owner]
+            if group == "package" && (action == "claim" || action == "transfer") =>
+        {
+            validate_admin_package_name(package_name)?;
+            parse_owner(owner)?;
+            if action == "claim" {
+                Ok(RegistryCommand::PackageClaim {
+                    package_name: package_name.clone(),
+                    owner: owner.clone(),
+                })
+            } else {
+                Ok(RegistryCommand::PackageTransfer {
+                    package_name: package_name.clone(),
+                    owner: owner.clone(),
+                })
+            }
+        }
+        [group, action] if group == "audit" && action == "verify" => {
+            Ok(RegistryCommand::AuditVerify)
+        }
         _ => Err(admin_error("invalid_registry_command", usage)),
     }
 }
@@ -99,17 +224,309 @@ pub fn revoke_token_from_env(package_name: &str) -> KuResult<()> {
     )
 }
 
+pub fn initialize_governance_from_env(developer: &str) -> KuResult<()> {
+    validate_governance_name(developer, "developer")?;
+    let path = normalize_credentials_path(&required_credentials_path()?)?;
+    let deadline = absolute_deadline(ADMIN_LOCK_TIMEOUT)?;
+    let _lock = CredentialFileLock::acquire(&path, deadline)?;
+    let original = read_credentials_if_present(&path)?;
+    if first_registry_record(&original)?.is_some() {
+        return Err(admin_error(
+            "registry_governance_already_initialized",
+            "registry credentials are not empty; migrate a legacy file or continue using schema 2",
+        ));
+    }
+    let mut state = GovernanceState::default();
+    state.developers.insert(developer.to_string());
+    append_governance_audit(&mut state, "init", developer);
+    let replacement = serialize_governance_state(&state)?;
+    write_credentials_atomically(&path, &replacement)
+}
+
+pub fn migrate_governance_from_env(developer: &str) -> KuResult<()> {
+    validate_governance_name(developer, "developer")?;
+    let path = normalize_credentials_path(&required_credentials_path()?)?;
+    let deadline = absolute_deadline(ADMIN_LOCK_TIMEOUT)?;
+    let _lock = CredentialFileLock::acquire(&path, deadline)?;
+    let original = read_credentials_if_present(&path)?;
+    if first_registry_record(&original)? == Some(GOVERNANCE_SCHEMA) {
+        return Err(admin_error(
+            "registry_governance_already_migrated",
+            "registry credentials already use governance schema 2",
+        ));
+    }
+    let legacy = parse_credential_records(&original)?;
+    if legacy.is_empty() {
+        return Err(admin_error(
+            "invalid_registry_credentials",
+            "legacy credentials must contain at least one authorization before migration",
+        ));
+    }
+    let state = migrate_legacy_credentials(legacy, developer);
+    let replacement = serialize_governance_state(&state)?;
+    write_credentials_atomically(&path, &replacement)
+}
+
+pub fn create_developer_from_env(developer: &str) -> KuResult<()> {
+    validate_governance_name(developer, "developer")?;
+    mutate_governance_from_env("developer-create", developer, |state| {
+        if !state.developers.insert(developer.to_string()) {
+            return Err(admin_error(
+                "registry_developer_exists",
+                "registry developer already exists",
+            ));
+        }
+        Ok(())
+    })
+}
+
+pub fn create_team_from_env(team: &str) -> KuResult<()> {
+    validate_governance_name(team, "team")?;
+    mutate_governance_from_env("team-create", team, |state| {
+        if !state.teams.insert(team.to_string()) {
+            return Err(admin_error(
+                "registry_team_exists",
+                "registry team already exists",
+            ));
+        }
+        Ok(())
+    })
+}
+
+pub fn add_team_member_from_env(team: &str, developer: &str) -> KuResult<()> {
+    validate_governance_name(team, "team")?;
+    validate_governance_name(developer, "developer")?;
+    let subject = format!("{team}:{developer}");
+    mutate_governance_from_env("team-member-add", &subject, |state| {
+        if !state.teams.contains(team) || !state.developers.contains(developer) {
+            return Err(admin_error(
+                "registry_governance_not_found",
+                "team membership requires an existing team and developer",
+            ));
+        }
+        if !state
+            .members
+            .insert((team.to_string(), developer.to_string()))
+        {
+            return Err(admin_error(
+                "registry_team_member_exists",
+                "registry team membership already exists",
+            ));
+        }
+        Ok(())
+    })
+}
+
+pub fn remove_team_member_from_env(team: &str, developer: &str) -> KuResult<()> {
+    validate_governance_name(team, "team")?;
+    validate_governance_name(developer, "developer")?;
+    let subject = format!("{team}:{developer}");
+    mutate_governance_from_env("team-member-remove", &subject, |state| {
+        if !state
+            .members
+            .remove(&(team.to_string(), developer.to_string()))
+        {
+            return Err(admin_error(
+                "registry_team_member_not_found",
+                "registry team membership does not exist",
+            ));
+        }
+        Ok(())
+    })
+}
+
+pub fn claim_package_from_env(package_name: &str, owner: &str) -> KuResult<()> {
+    change_package_owner_from_env(package_name, owner, false)
+}
+
+pub fn transfer_package_from_env(package_name: &str, owner: &str) -> KuResult<()> {
+    change_package_owner_from_env(package_name, owner, true)
+}
+
+pub fn issue_developer_token_from_env(developer: &str) -> KuResult<String> {
+    validate_governance_name(developer, "developer")?;
+    let path = normalize_credentials_path(&required_credentials_path()?)?;
+    let deadline = absolute_deadline(ADMIN_LOCK_TIMEOUT)?;
+    let _lock = CredentialFileLock::acquire(&path, deadline)?;
+    let original = read_credentials_if_present(&path)?;
+    let mut state = require_governance_state(&original)?;
+    if !state.developers.contains(developer) {
+        return Err(admin_error(
+            "registry_developer_not_found",
+            "registry developer does not exist",
+        ));
+    }
+    for _ in 0..TOKEN_GENERATION_ATTEMPTS {
+        let token = generate_token()?;
+        let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        if state
+            .tokens
+            .iter()
+            .any(|existing| existing.token_hash == token_hash)
+        {
+            continue;
+        }
+        let issued = GovernanceToken {
+            token_hash,
+            developer: developer.to_string(),
+            scope: GovernanceTokenScope::All,
+        };
+        state.tokens.insert(issued.clone());
+        let audit_subject = token_audit_subject(&issued);
+        append_governance_audit(&mut state, "developer-token-issue", &audit_subject);
+        let replacement = serialize_governance_state(&state)?;
+        write_credentials_atomically(&path, &replacement).map_err(|error| {
+            annotate_committed_credential_error(
+                error,
+                "issued",
+                "developer",
+                developer,
+                &token_hash,
+            )
+        })?;
+        return Ok(token);
+    }
+    Err(admin_error(
+        "registry_random_failed",
+        "failed to generate a unique registry developer token",
+    ))
+}
+
+pub fn revoke_developer_token_from_env(developer: &str) -> KuResult<()> {
+    validate_governance_name(developer, "developer")?;
+    let token = env::var(REGISTRY_TOKEN_ENV).map_err(|_| {
+        admin_error(
+            "missing_registry_token",
+            format!("required registry environment variable {REGISTRY_TOKEN_ENV} is not set"),
+        )
+    })?;
+    validate_presented_token(&token)?;
+    let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let audit_subject = format!("{developer}:sha256-{}", encode_hex(&token_hash));
+    revoke_developer_token_hash_from_env_inner(
+        developer,
+        token_hash,
+        "developer-token-revoke",
+        &audit_subject,
+    )
+}
+
+pub fn revoke_developer_token_hash_from_env(developer: &str, token_hash: [u8; 32]) -> KuResult<()> {
+    validate_governance_name(developer, "developer")?;
+    let hash_text = format!("sha256-{}", encode_hex(&token_hash));
+    let subject = format!("{developer}:{hash_text}");
+    revoke_developer_token_hash_from_env_inner(
+        developer,
+        token_hash,
+        "developer-token-revoke-hash",
+        &subject,
+    )
+}
+
+fn revoke_developer_token_hash_from_env_inner(
+    developer: &str,
+    token_hash: [u8; 32],
+    audit_action: &str,
+    audit_subject: &str,
+) -> KuResult<()> {
+    validate_governance_name(developer, "developer")?;
+    validate_governance_name(audit_action, "audit action")?;
+    validate_audit_subject(audit_subject)?;
+    let path = normalize_credentials_path(&required_credentials_path()?)?;
+    let deadline = absolute_deadline(ADMIN_LOCK_TIMEOUT)?;
+    let _lock = CredentialFileLock::acquire(&path, deadline)?;
+    let original = read_credentials_if_present(&path)?;
+    let mut state = require_governance_state(&original)?;
+    let before = state.tokens.len();
+    state
+        .tokens
+        .retain(|token| token.token_hash != token_hash || token.developer != developer);
+    if state.tokens.len() == before {
+        return Err(admin_error(
+            "registry_credential_not_found",
+            "the supplied token is not active for that developer",
+        ));
+    }
+    if !all_packages_remain_authorized(&state) {
+        return Err(admin_error(
+            "registry_last_credential",
+            "cannot revoke a developer token while it is the last authorization for any package",
+        ));
+    }
+    append_governance_audit(&mut state, audit_action, audit_subject);
+    let replacement = serialize_governance_state(&state)?;
+    write_credentials_atomically(&path, &replacement).map_err(|error| {
+        annotate_committed_credential_error(error, "revoked", "developer", developer, &token_hash)
+    })
+}
+
+pub fn verify_governance_from_env() -> KuResult<()> {
+    let path = normalize_credentials_path(&required_credentials_path()?)?;
+    let bytes = read_credentials_if_present(&path)?;
+    require_governance_state(&bytes).map(|_| ())
+}
+
 pub fn write_issued_token(token: &str, output: &mut impl Write) -> KuResult<()> {
     validate_presented_token(token)?;
     let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-    writeln!(output, "{token}")
+    write_token_line(token, output).map_err(|err| {
+        admin_error(
+            "registry_token_output_failed",
+            format!(
+                "issued credential sha256-{} was committed, but token output failed ({:?}); inspect and revoke this exact hash from the credentials file before retrying; the plaintext token is not available in diagnostics",
+                encode_hex(&token_hash), err.kind()
+            ),
+        )
+    })
+}
+
+pub fn write_developer_issued_token(
+    developer: &str,
+    token: &str,
+    output: &mut impl Write,
+) -> KuResult<()> {
+    validate_governance_name(developer, "developer")?;
+    validate_presented_token(token)?;
+    let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let hash_text = format!("sha256-{}", encode_hex(&token_hash));
+    write_token_line(token, output).map_err(|err| {
+        admin_error(
+            "registry_token_output_failed",
+            format!(
+                "issued developer credential {hash_text} was committed, but token output failed ({:?}); run 'ku-registry developer token-revoke-hash {developer} {hash_text}' before retrying; the plaintext token is not available in diagnostics",
+                err.kind()
+            ),
+        )
+    })
+}
+
+fn write_token_line(token: &str, output: &mut impl Write) -> io::Result<()> {
+    writeln!(output, "{token}").and_then(|()| output.flush())
+}
+
+pub fn write_governance_confirmation(confirmation: &str, output: &mut impl Write) -> KuResult<()> {
+    writeln!(output, "{confirmation}")
         .and_then(|()| output.flush())
         .map_err(|err| {
             admin_error(
-                "registry_token_output_failed",
+                "registry_governance_output_failed",
                 format!(
-                    "issued credential sha256-{} was committed, but token output failed ({:?}); inspect and revoke this exact hash from the credentials file before retrying; the plaintext token is not available in diagnostics",
-                    encode_hex(&token_hash), err.kind()
+                    "registry governance mutation was committed, but confirmation output failed ({:?}); the state is already effective on disk and a retry may return an already-exists or already-applied error; inspect the audit chain before retrying",
+                    err.kind()
+                ),
+            )
+        })
+}
+
+pub fn write_audit_verification_confirmation(output: &mut impl Write) -> KuResult<()> {
+    writeln!(output, "registry governance audit verified")
+        .and_then(|()| output.flush())
+        .map_err(|err| {
+            admin_error(
+                "registry_audit_output_failed",
+                format!(
+                    "registry governance audit verification succeeded, but output failed ({:?})",
+                    err.kind()
                 ),
             )
         })
@@ -130,6 +547,1179 @@ pub fn write_revocation_confirmation(package_name: &str, output: &mut impl Write
         })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum GovernanceOwner {
+    Developer(String),
+    Team(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum GovernanceTokenScope {
+    All,
+    Package(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GovernanceToken {
+    token_hash: [u8; 32],
+    developer: String,
+    scope: GovernanceTokenScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GovernanceAudit {
+    sequence: u64,
+    previous_hash: String,
+    event_hash: String,
+    before_transition_hash: String,
+    transition_hash: String,
+    action: String,
+    subject: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GovernanceAuditPhase {
+    Empty,
+    Migrating,
+    Normal,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GovernanceState {
+    developers: BTreeSet<String>,
+    teams: BTreeSet<String>,
+    members: BTreeSet<(String, String)>,
+    owners: BTreeMap<String, GovernanceOwner>,
+    tokens: BTreeSet<GovernanceToken>,
+    audits: Vec<GovernanceAudit>,
+}
+
+fn migrate_legacy_credentials(legacy: Vec<CredentialRecord>, developer: &str) -> GovernanceState {
+    let mut state = GovernanceState::default();
+    state.developers.insert(developer.to_string());
+    append_governance_audit(&mut state, "migration-init", developer);
+    for record in legacy {
+        let package_name = record.package_name;
+        let token = GovernanceToken {
+            token_hash: record.token_hash,
+            developer: developer.to_string(),
+            scope: GovernanceTokenScope::Package(package_name.clone()),
+        };
+        if state.tokens.insert(token.clone()) {
+            let subject = token_audit_subject(&token);
+            append_governance_audit(&mut state, "migration-token-import", &subject);
+        }
+        if !state.owners.contains_key(&package_name) {
+            state.owners.insert(
+                package_name.clone(),
+                GovernanceOwner::Developer(developer.to_string()),
+            );
+            let subject = format!("{package_name}:developer:{developer}");
+            append_governance_audit(&mut state, "package-claim", &subject);
+        }
+    }
+    append_governance_audit(&mut state, "migration-complete", developer);
+    state
+}
+
+fn validate_governance_name(value: &str, kind: &str) -> KuResult<()> {
+    validate_package_name(value, Span::default()).map_err(|_| {
+        admin_error(
+            "invalid_registry_governance_name",
+            format!("registry {kind} name must use the package-name character set"),
+        )
+    })
+}
+
+fn parse_owner(value: &str) -> KuResult<GovernanceOwner> {
+    let (kind, name) = value.split_once(':').ok_or_else(|| {
+        admin_error(
+            "invalid_registry_owner",
+            "registry owner must be exactly developer:<name> or team:<name>",
+        )
+    })?;
+    validate_governance_name(name, kind)?;
+    match kind {
+        "developer" => Ok(GovernanceOwner::Developer(name.to_string())),
+        "team" => Ok(GovernanceOwner::Team(name.to_string())),
+        _ => Err(admin_error(
+            "invalid_registry_owner",
+            "registry owner must be exactly developer:<name> or team:<name>",
+        )),
+    }
+}
+
+fn owner_text(owner: &GovernanceOwner) -> String {
+    match owner {
+        GovernanceOwner::Developer(name) => format!("developer:{name}"),
+        GovernanceOwner::Team(name) => format!("team:{name}"),
+    }
+}
+
+fn governance_audit_hash(
+    sequence: u64,
+    previous_hash: &str,
+    before_transition_hash: &str,
+    transition_hash: &str,
+    action: &str,
+    subject: &str,
+) -> String {
+    let canonical = format!(
+        "{sequence}\n{previous_hash}\n{before_transition_hash}\n{transition_hash}\n{action}\n{subject}\n"
+    );
+    encode_hex(&Sha256::digest(canonical.as_bytes()))
+}
+
+fn governance_transition_root() -> String {
+    encode_hex(&Sha256::digest(
+        b"ku-registry-governance-transition-root-v1",
+    ))
+}
+
+fn governance_transition_hash(previous: &str, action: &str, subject: &str) -> String {
+    let canonical = format!("{previous}\n{action}\n{subject}\n");
+    encode_hex(&Sha256::digest(canonical.as_bytes()))
+}
+
+fn append_governance_audit(state: &mut GovernanceState, action: &str, subject: &str) {
+    let sequence = state.audits.len() as u64 + 1;
+    let previous_hash = state
+        .audits
+        .last()
+        .map(|event| event.event_hash.clone())
+        .unwrap_or_else(|| GOVERNANCE_AUDIT_ROOT.to_string());
+    let before_transition_hash = state
+        .audits
+        .last()
+        .map(|event| event.transition_hash.clone())
+        .unwrap_or_else(governance_transition_root);
+    let transition_hash = governance_transition_hash(&before_transition_hash, action, subject);
+    let event_hash = governance_audit_hash(
+        sequence,
+        &previous_hash,
+        &before_transition_hash,
+        &transition_hash,
+        action,
+        subject,
+    );
+    state.audits.push(GovernanceAudit {
+        sequence,
+        previous_hash,
+        event_hash,
+        before_transition_hash,
+        transition_hash,
+        action: action.to_string(),
+        subject: subject.to_string(),
+    });
+}
+
+fn invalid_audit_transition(message: impl Into<String>) -> KuError {
+    admin_error(
+        "invalid_registry_audit",
+        format!(
+            "registry governance audit transition is invalid: {}",
+            message.into()
+        ),
+    )
+}
+
+fn parse_audit_owner_subject(subject: &str) -> KuResult<(&str, GovernanceOwner)> {
+    let mut fields = subject.split(':');
+    let (Some(package), Some(kind), Some(name), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err(invalid_audit_transition(
+            "package audit subject must be '<package>:<developer|team>:<name>'",
+        ));
+    };
+    validate_admin_package_name(package)?;
+    Ok((package, parse_owner(&format!("{kind}:{name}"))?))
+}
+
+fn parse_audit_member_subject(subject: &str) -> KuResult<(&str, &str)> {
+    let mut fields = subject.split(':');
+    let (Some(team), Some(developer), None) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(invalid_audit_transition(
+            "team membership audit subject must be '<team>:<developer>'",
+        ));
+    };
+    validate_governance_name(team, "team")?;
+    validate_governance_name(developer, "developer")?;
+    Ok((team, developer))
+}
+
+fn token_audit_subject(token: &GovernanceToken) -> String {
+    let scope = match &token.scope {
+        GovernanceTokenScope::All => "all".to_string(),
+        GovernanceTokenScope::Package(package) => format!("package:{package}"),
+    };
+    format!(
+        "{}:sha256-{}:{scope}",
+        token.developer,
+        encode_hex(&token.token_hash)
+    )
+}
+
+fn parse_audit_token_subject(subject: &str) -> KuResult<GovernanceToken> {
+    let fields = subject.split(':').collect::<Vec<_>>();
+    let (developer, hash, scope) = match fields.as_slice() {
+        [developer, hash, "all"] => (*developer, *hash, GovernanceTokenScope::All),
+        [developer, hash, "package", package] => {
+            validate_admin_package_name(package)?;
+            (
+                *developer,
+                *hash,
+                GovernanceTokenScope::Package((*package).to_string()),
+            )
+        }
+        _ => {
+            return Err(invalid_audit_transition(
+                "token issue audit subject has an invalid shape",
+            ));
+        }
+    };
+    validate_governance_name(developer, "developer")?;
+    let token = GovernanceToken {
+        token_hash: parse_admin_token_hash(hash)?,
+        developer: developer.to_string(),
+        scope,
+    };
+    if token_audit_subject(&token) != subject {
+        return Err(invalid_audit_transition(
+            "token issue audit subject is not canonically encoded",
+        ));
+    }
+    Ok(token)
+}
+
+fn parse_audit_revoke_subject(subject: &str) -> KuResult<(&str, [u8; 32])> {
+    let mut fields = subject.split(':');
+    let (Some(developer), Some(hash), None) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(invalid_audit_transition(
+            "token revoke audit subject must be '<developer>:<sha256-hash>'",
+        ));
+    };
+    validate_governance_name(developer, "developer")?;
+    let token_hash = parse_admin_token_hash(hash)?;
+    if format!("{developer}:sha256-{}", encode_hex(&token_hash)) != subject {
+        return Err(invalid_audit_transition(
+            "token revoke audit subject is not canonically encoded",
+        ));
+    }
+    Ok((developer, token_hash))
+}
+
+fn insert_replayed_governance_token(state: &mut GovernanceState, token: GovernanceToken) -> bool {
+    if !state.developers.contains(&token.developer)
+        || state.tokens.iter().any(|existing| {
+            existing.token_hash == token.token_hash
+                && (existing.developer != token.developer
+                    || matches!(existing.scope, GovernanceTokenScope::All)
+                    || matches!(token.scope, GovernanceTokenScope::All))
+        })
+    {
+        return false;
+    }
+    state.tokens.insert(token)
+}
+
+fn apply_governance_audit_event(
+    state: &mut GovernanceState,
+    phase: &mut GovernanceAuditPhase,
+    action: &str,
+    subject: &str,
+) -> KuResult<()> {
+    match action {
+        "init" => {
+            validate_governance_name(subject, "developer")?;
+            if *phase != GovernanceAuditPhase::Empty
+                || state != &GovernanceState::default()
+                || !state.developers.insert(subject.to_string())
+            {
+                return Err(invalid_audit_transition(
+                    "init must be the first event and create one developer",
+                ));
+            }
+            *phase = GovernanceAuditPhase::Normal;
+        }
+        "migration-init" => {
+            validate_governance_name(subject, "developer")?;
+            if *phase != GovernanceAuditPhase::Empty
+                || state != &GovernanceState::default()
+                || !state.developers.insert(subject.to_string())
+            {
+                return Err(invalid_audit_transition(
+                    "migration-init must be the first event and create one developer",
+                ));
+            }
+            *phase = GovernanceAuditPhase::Migrating;
+        }
+        "developer-create" => {
+            validate_governance_name(subject, "developer")?;
+            if *phase != GovernanceAuditPhase::Normal
+                || !state.developers.insert(subject.to_string())
+            {
+                return Err(invalid_audit_transition(
+                    "developer-create must add a new developer after bootstrap",
+                ));
+            }
+        }
+        "team-create" => {
+            validate_governance_name(subject, "team")?;
+            if *phase != GovernanceAuditPhase::Normal || !state.teams.insert(subject.to_string()) {
+                return Err(invalid_audit_transition("team-create must add a new team"));
+            }
+        }
+        "team-member-add" => {
+            let (team, developer) = parse_audit_member_subject(subject)?;
+            if *phase != GovernanceAuditPhase::Normal
+                || !state.teams.contains(team)
+                || !state.developers.contains(developer)
+                || !state
+                    .members
+                    .insert((team.to_string(), developer.to_string()))
+            {
+                return Err(invalid_audit_transition(
+                    "team-member-add must add an existing developer to an existing team",
+                ));
+            }
+        }
+        "team-member-remove" => {
+            let (team, developer) = parse_audit_member_subject(subject)?;
+            if *phase != GovernanceAuditPhase::Normal
+                || !state
+                    .members
+                    .remove(&(team.to_string(), developer.to_string()))
+                || !all_packages_remain_authorized(state)
+            {
+                return Err(invalid_audit_transition(
+                    "team-member-remove must remove a membership without orphaning a package",
+                ));
+            }
+        }
+        "package-claim" | "package-transfer" => {
+            let (package, owner) = parse_audit_owner_subject(subject)?;
+            if *phase == GovernanceAuditPhase::Empty
+                || (*phase == GovernanceAuditPhase::Migrating && action != "package-claim")
+            {
+                return Err(invalid_audit_transition(
+                    "package ownership actions must follow bootstrap and migration cannot transfer",
+                ));
+            }
+            let owner_exists = match &owner {
+                GovernanceOwner::Developer(name) => state.developers.contains(name),
+                GovernanceOwner::Team(name) => state.teams.contains(name),
+            };
+            if !owner_exists || !owner_has_active_token(state, package, &owner) {
+                return Err(invalid_audit_transition(
+                    "package ownership audit requires an existing authorized owner",
+                ));
+            }
+            match (action, state.owners.get(package)) {
+                ("package-claim", None) => {}
+                ("package-transfer", Some(existing)) if existing != &owner => {}
+                _ => {
+                    return Err(invalid_audit_transition(
+                        "package ownership audit does not describe a valid state change",
+                    ));
+                }
+            }
+            state.owners.insert(package.to_string(), owner);
+        }
+        "developer-token-issue" => {
+            let token = parse_audit_token_subject(subject)?;
+            if *phase != GovernanceAuditPhase::Normal
+                || !matches!(token.scope, GovernanceTokenScope::All)
+                || !insert_replayed_governance_token(state, token)
+            {
+                return Err(invalid_audit_transition(
+                    "developer-token-issue must add one nonconflicting all-scoped token after bootstrap",
+                ));
+            }
+        }
+        "migration-token-import" => {
+            let token = parse_audit_token_subject(subject)?;
+            if *phase != GovernanceAuditPhase::Migrating
+                || !matches!(token.scope, GovernanceTokenScope::Package(_))
+                || !insert_replayed_governance_token(state, token)
+            {
+                return Err(invalid_audit_transition(
+                    "migration-token-import must add one nonconflicting package-scoped token during migration",
+                ));
+            }
+        }
+        "migration-complete" => {
+            validate_governance_name(subject, "developer")?;
+            if *phase != GovernanceAuditPhase::Migrating
+                || state.developers.len() != 1
+                || !state.developers.contains(subject)
+                || state.tokens.is_empty()
+                || state.owners.is_empty()
+                || state
+                    .tokens
+                    .iter()
+                    .any(|token| !matches!(token.scope, GovernanceTokenScope::Package(_)))
+                || !all_packages_remain_authorized(state)
+            {
+                return Err(invalid_audit_transition(
+                    "migration-complete must close one nonempty exact-scope legacy import",
+                ));
+            }
+            *phase = GovernanceAuditPhase::Normal;
+        }
+        "developer-token-revoke" | "developer-token-revoke-hash" => {
+            let (developer, token_hash) = parse_audit_revoke_subject(subject)?;
+            let before = state.tokens.len();
+            state
+                .tokens
+                .retain(|token| token.token_hash != token_hash || token.developer != developer);
+            if *phase != GovernanceAuditPhase::Normal
+                || state.tokens.len() == before
+                || !all_packages_remain_authorized(state)
+            {
+                return Err(invalid_audit_transition(
+                    "developer token revoke must remove an active token without orphaning a package",
+                ));
+            }
+        }
+        _ => {
+            return Err(invalid_audit_transition(format!(
+                "unknown registry governance audit action '{action}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_governance_state(state: &GovernanceState) -> KuResult<()> {
+    if state.developers.len() > MAX_GOVERNANCE_RECORDS
+        || state.teams.len() > MAX_GOVERNANCE_RECORDS
+        || state.members.len() > MAX_GOVERNANCE_RECORDS
+        || state.owners.len() > MAX_GOVERNANCE_RECORDS
+        || state.tokens.len() > MAX_GOVERNANCE_RECORDS
+        || state.audits.len() > MAX_GOVERNANCE_AUDITS
+    {
+        return Err(admin_error(
+            "invalid_registry_governance",
+            "registry governance file exceeds its bounded record limit",
+        ));
+    }
+    for (team, developer) in &state.members {
+        if !state.teams.contains(team) || !state.developers.contains(developer) {
+            return Err(admin_error(
+                "invalid_registry_governance",
+                "team membership references an unknown team or developer",
+            ));
+        }
+    }
+    for owner in state.owners.values() {
+        let present = match owner {
+            GovernanceOwner::Developer(name) => state.developers.contains(name),
+            GovernanceOwner::Team(name) => state.teams.contains(name),
+        };
+        if !present {
+            return Err(admin_error(
+                "invalid_registry_governance",
+                "package ownership references an unknown developer or team",
+            ));
+        }
+    }
+    let mut token_identities = BTreeMap::new();
+    let mut all_scoped_hashes = BTreeSet::new();
+    for token in &state.tokens {
+        if !state.developers.contains(&token.developer) {
+            return Err(admin_error(
+                "invalid_registry_governance",
+                "developer token references an unknown developer",
+            ));
+        }
+        if let Some(existing) = token_identities.insert(token.token_hash, &token.developer) {
+            if existing != &token.developer {
+                return Err(admin_error(
+                    "invalid_registry_governance",
+                    "one developer token hash cannot belong to multiple developers",
+                ));
+            }
+        }
+        match &token.scope {
+            GovernanceTokenScope::All => {
+                if !all_scoped_hashes.insert(token.token_hash) {
+                    return Err(admin_error(
+                        "invalid_registry_governance",
+                        "developer token contains redundant scopes",
+                    ));
+                }
+            }
+            GovernanceTokenScope::Package(package_name) => {
+                validate_admin_package_name(package_name)?;
+                if !state.owners.contains_key(package_name) {
+                    return Err(admin_error(
+                        "invalid_registry_governance",
+                        "package-scoped developer token references an unknown package",
+                    ));
+                }
+            }
+        }
+    }
+    for token in &state.tokens {
+        if matches!(token.scope, GovernanceTokenScope::Package(_))
+            && all_scoped_hashes.contains(&token.token_hash)
+        {
+            return Err(admin_error(
+                "invalid_registry_governance",
+                "developer token cannot combine all and package-specific scopes",
+            ));
+        }
+    }
+    if state.audits.is_empty() {
+        return Err(admin_error(
+            "invalid_registry_audit",
+            "registry governance audit chain must contain at least one event",
+        ));
+    }
+    let effective_credentials = governance_credentials(state)?;
+    if effective_credentials
+        .iter()
+        .map(|credential| credential.package_name.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != state.owners.len()
+    {
+        return Err(admin_error(
+            "invalid_registry_governance",
+            "every package owner must have at least one active publishing token",
+        ));
+    }
+    let mut previous = GOVERNANCE_AUDIT_ROOT.to_string();
+    let mut transition = governance_transition_root();
+    let mut phase = GovernanceAuditPhase::Empty;
+    let mut replayed = GovernanceState::default();
+    for (index, event) in state.audits.iter().enumerate() {
+        let expected_sequence = index as u64 + 1;
+        if event.before_transition_hash != transition {
+            return Err(invalid_audit_transition(
+                "registry governance audit transition hash is not continuous",
+            ));
+        }
+        apply_governance_audit_event(&mut replayed, &mut phase, &event.action, &event.subject)?;
+        let expected_transition =
+            governance_transition_hash(&transition, &event.action, &event.subject);
+        if event.transition_hash != expected_transition
+            || event.transition_hash == event.before_transition_hash
+        {
+            return Err(invalid_audit_transition(
+                "registry governance audit event has an invalid transition hash",
+            ));
+        }
+        let expected_hash = governance_audit_hash(
+            expected_sequence,
+            &previous,
+            &event.before_transition_hash,
+            &event.transition_hash,
+            &event.action,
+            &event.subject,
+        );
+        if event.sequence != expected_sequence
+            || event.previous_hash != previous
+            || event.event_hash != expected_hash
+        {
+            return Err(admin_error(
+                "invalid_registry_audit",
+                "registry governance audit hash chain is invalid",
+            ));
+        }
+        previous.clone_from(&event.event_hash);
+        transition.clone_from(&event.transition_hash);
+    }
+    if phase != GovernanceAuditPhase::Normal {
+        return Err(invalid_audit_transition(
+            "registry governance audit bootstrap or migration is incomplete",
+        ));
+    }
+    if !governance_state_data_equal(&replayed, state) {
+        return Err(admin_error(
+            "invalid_registry_audit",
+            "registry governance audit replay does not equal the current state",
+        ));
+    }
+    Ok(())
+}
+
+fn governance_state_data_equal(left: &GovernanceState, right: &GovernanceState) -> bool {
+    left.developers == right.developers
+        && left.teams == right.teams
+        && left.members == right.members
+        && left.owners == right.owners
+        && left.tokens == right.tokens
+}
+
+fn ensure_governance_parse_capacity(
+    current_len: usize,
+    limit: usize,
+    record_kind: &str,
+    line_number: usize,
+) -> KuResult<()> {
+    if current_len >= limit {
+        return Err(admin_error(
+            "invalid_registry_governance",
+            format!(
+                "registry governance {record_kind} record limit {limit} exceeded at line {line_number}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_governance_state(bytes: &[u8]) -> KuResult<GovernanceState> {
+    let source = std::str::from_utf8(bytes).map_err(|_| {
+        admin_error(
+            "invalid_registry_governance",
+            "registry governance file must be valid UTF-8",
+        )
+    })?;
+    let mut state = GovernanceState::default();
+    let mut saw_schema = false;
+    for (index, raw) in source.lines().enumerate() {
+        if raw.len() > MAX_REGISTRY_LINE_BYTES {
+            return Err(admin_error(
+                "invalid_registry_governance",
+                format!("registry governance line {} is too long", index + 1),
+            ));
+        }
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !saw_schema {
+            if line != GOVERNANCE_SCHEMA {
+                return Err(admin_error(
+                    "invalid_registry_governance",
+                    format!(
+                        "registry governance line {} must be '{GOVERNANCE_SCHEMA}'",
+                        index + 1
+                    ),
+                ));
+            }
+            saw_schema = true;
+            continue;
+        }
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        match fields.as_slice() {
+            ["developer", name] => {
+                ensure_governance_parse_capacity(
+                    state.developers.len(),
+                    MAX_GOVERNANCE_RECORDS,
+                    "developer",
+                    index + 1,
+                )?;
+                validate_governance_name(name, "developer")?;
+                if !state.developers.insert((*name).to_string()) {
+                    return Err(admin_error(
+                        "invalid_registry_governance",
+                        "duplicate developer",
+                    ));
+                }
+            }
+            ["team", name] => {
+                ensure_governance_parse_capacity(
+                    state.teams.len(),
+                    MAX_GOVERNANCE_RECORDS,
+                    "team",
+                    index + 1,
+                )?;
+                validate_governance_name(name, "team")?;
+                if !state.teams.insert((*name).to_string()) {
+                    return Err(admin_error("invalid_registry_governance", "duplicate team"));
+                }
+            }
+            ["member", team, developer] => {
+                ensure_governance_parse_capacity(
+                    state.members.len(),
+                    MAX_GOVERNANCE_RECORDS,
+                    "member",
+                    index + 1,
+                )?;
+                validate_governance_name(team, "team")?;
+                validate_governance_name(developer, "developer")?;
+                if !state
+                    .members
+                    .insert(((*team).to_string(), (*developer).to_string()))
+                {
+                    return Err(admin_error(
+                        "invalid_registry_governance",
+                        "duplicate team membership",
+                    ));
+                }
+            }
+            ["owner", package, owner] => {
+                ensure_governance_parse_capacity(
+                    state.owners.len(),
+                    MAX_GOVERNANCE_RECORDS,
+                    "owner",
+                    index + 1,
+                )?;
+                validate_admin_package_name(package)?;
+                if state
+                    .owners
+                    .insert((*package).to_string(), parse_owner(owner)?)
+                    .is_some()
+                {
+                    return Err(admin_error(
+                        "invalid_registry_governance",
+                        "duplicate package owner",
+                    ));
+                }
+            }
+            ["token", hash, developer, scope] => {
+                ensure_governance_parse_capacity(
+                    state.tokens.len(),
+                    MAX_GOVERNANCE_RECORDS,
+                    "token",
+                    index + 1,
+                )?;
+                let hash = hash
+                    .strip_prefix("sha256-")
+                    .ok_or_else(|| invalid_hash_error(index + 1))?;
+                if !is_canonical_sha256_hex(hash) {
+                    return Err(invalid_hash_error(index + 1));
+                }
+                let token_hash =
+                    decode_hex_array::<32>(hash).map_err(|_| invalid_hash_error(index + 1))?;
+                validate_governance_name(developer, "developer")?;
+                let scope = if scope == &"all" {
+                    GovernanceTokenScope::All
+                } else if let Some(package_name) = scope.strip_prefix("package:") {
+                    validate_admin_package_name(package_name)?;
+                    GovernanceTokenScope::Package(package_name.to_string())
+                } else {
+                    return Err(admin_error(
+                        "invalid_registry_governance",
+                        "developer token scope must be 'all' or 'package:<name>'",
+                    ));
+                };
+                if !state.tokens.insert(GovernanceToken {
+                    token_hash,
+                    developer: (*developer).to_string(),
+                    scope,
+                }) {
+                    return Err(admin_error(
+                        "invalid_registry_governance",
+                        "duplicate developer token",
+                    ));
+                }
+            }
+            ["audit", sequence, previous_hash, event_hash, before_transition_hash, transition_hash, action, subject] =>
+            {
+                ensure_governance_parse_capacity(
+                    state.audits.len(),
+                    MAX_GOVERNANCE_AUDITS,
+                    "audit",
+                    index + 1,
+                )?;
+                let sequence_text = *sequence;
+                let sequence = sequence_text
+                    .parse::<u64>()
+                    .map_err(|_| admin_error("invalid_registry_audit", "invalid audit sequence"))?;
+                if sequence.to_string() != sequence_text {
+                    return Err(admin_error(
+                        "invalid_registry_audit",
+                        "audit sequence must use canonical unsigned decimal encoding",
+                    ));
+                }
+                if !is_canonical_sha256_hex(event_hash) {
+                    return Err(admin_error(
+                        "invalid_registry_audit",
+                        "invalid audit event hash",
+                    ));
+                }
+                if !is_canonical_sha256_hex(before_transition_hash)
+                    || !is_canonical_sha256_hex(transition_hash)
+                {
+                    return Err(admin_error(
+                        "invalid_registry_audit",
+                        "invalid audit transition hash",
+                    ));
+                }
+                if previous_hash != &GOVERNANCE_AUDIT_ROOT
+                    && !is_canonical_sha256_hex(previous_hash)
+                {
+                    return Err(admin_error(
+                        "invalid_registry_audit",
+                        "invalid previous audit hash",
+                    ));
+                }
+                validate_governance_name(action, "audit action")?;
+                if subject.len() > 256
+                    || !subject.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_' | b'.')
+                    })
+                {
+                    return Err(admin_error(
+                        "invalid_registry_audit",
+                        "invalid audit subject",
+                    ));
+                }
+                state.audits.push(GovernanceAudit {
+                    sequence,
+                    previous_hash: (*previous_hash).to_string(),
+                    event_hash: (*event_hash).to_string(),
+                    before_transition_hash: (*before_transition_hash).to_string(),
+                    transition_hash: (*transition_hash).to_string(),
+                    action: (*action).to_string(),
+                    subject: (*subject).to_string(),
+                });
+            }
+            _ => {
+                return Err(admin_error(
+                    "invalid_registry_governance",
+                    format!(
+                        "registry governance line {} has an invalid record",
+                        index + 1
+                    ),
+                ))
+            }
+        }
+    }
+    if !saw_schema {
+        return Err(admin_error(
+            "invalid_registry_governance",
+            "registry governance schema is missing",
+        ));
+    }
+    validate_governance_state(&state)?;
+    Ok(state)
+}
+
+fn serialize_governance_state(state: &GovernanceState) -> KuResult<Vec<u8>> {
+    validate_governance_state(state)?;
+    let mut output = format!("{GOVERNANCE_SCHEMA}\n");
+    for developer in &state.developers {
+        output.push_str(&format!("developer {developer}\n"));
+    }
+    for team in &state.teams {
+        output.push_str(&format!("team {team}\n"));
+    }
+    for (team, developer) in &state.members {
+        output.push_str(&format!("member {team} {developer}\n"));
+    }
+    for (package, owner) in &state.owners {
+        output.push_str(&format!("owner {package} {}\n", owner_text(owner)));
+    }
+    for token in &state.tokens {
+        let scope = match &token.scope {
+            GovernanceTokenScope::All => "all".to_string(),
+            GovernanceTokenScope::Package(package_name) => format!("package:{package_name}"),
+        };
+        output.push_str(&format!(
+            "token sha256-{} {} {scope}\n",
+            encode_hex(&token.token_hash),
+            token.developer
+        ));
+    }
+    for event in &state.audits {
+        output.push_str(&format!(
+            "audit {} {} {} {} {} {} {}\n",
+            event.sequence,
+            event.previous_hash,
+            event.event_hash,
+            event.before_transition_hash,
+            event.transition_hash,
+            event.action,
+            event.subject
+        ));
+    }
+    if output.len() as u64 > MAX_CREDENTIAL_FILE_BYTES {
+        return Err(admin_error(
+            "registry_credentials_full",
+            "registry governance file reached its size limit",
+        ));
+    }
+    Ok(output.into_bytes())
+}
+
+struct GovernanceCredentialIndexes<'a> {
+    all_hashes_by_developer: HashMap<&'a str, Vec<[u8; 32]>>,
+    package_tokens: Vec<(&'a GovernanceToken, &'a str)>,
+    members_by_team: HashMap<&'a str, HashSet<&'a str>>,
+    all_token_members_by_team: HashMap<&'a str, Vec<&'a str>>,
+}
+
+fn governance_credential_indexes(state: &GovernanceState) -> GovernanceCredentialIndexes<'_> {
+    let mut all_hashes_by_developer = HashMap::<&str, Vec<[u8; 32]>>::new();
+    let mut package_tokens = Vec::new();
+    for token in &state.tokens {
+        match &token.scope {
+            GovernanceTokenScope::All => all_hashes_by_developer
+                .entry(token.developer.as_str())
+                .or_default()
+                .push(token.token_hash),
+            GovernanceTokenScope::Package(package) => {
+                package_tokens.push((token, package.as_str()));
+            }
+        }
+    }
+
+    let mut members_by_team = HashMap::<&str, HashSet<&str>>::new();
+    for (team, developer) in &state.members {
+        members_by_team
+            .entry(team.as_str())
+            .or_default()
+            .insert(developer.as_str());
+    }
+    let mut all_token_members_by_team = HashMap::<&str, Vec<&str>>::new();
+    for (team, developer) in &state.members {
+        if all_hashes_by_developer.contains_key(developer.as_str()) {
+            all_token_members_by_team
+                .entry(team.as_str())
+                .or_default()
+                .push(developer.as_str());
+        }
+    }
+
+    GovernanceCredentialIndexes {
+        all_hashes_by_developer,
+        package_tokens,
+        members_by_team,
+        all_token_members_by_team,
+    }
+}
+
+fn governance_credentials(state: &GovernanceState) -> KuResult<Vec<CredentialRecord>> {
+    let GovernanceCredentialIndexes {
+        all_hashes_by_developer,
+        package_tokens,
+        members_by_team,
+        all_token_members_by_team,
+    } = governance_credential_indexes(state);
+
+    let mut records = Vec::new();
+    let mut seen_records = HashSet::new();
+    for (package, owner) in &state.owners {
+        match owner {
+            GovernanceOwner::Developer(developer) => {
+                if let Some(hashes) = all_hashes_by_developer.get(developer.as_str()) {
+                    for token_hash in hashes {
+                        push_governance_record(
+                            &mut records,
+                            &mut seen_records,
+                            *token_hash,
+                            package,
+                        )?;
+                    }
+                }
+            }
+            GovernanceOwner::Team(team) => {
+                if let Some(members) = all_token_members_by_team.get(team.as_str()) {
+                    for developer in members {
+                        if let Some(hashes) = all_hashes_by_developer.get(developer) {
+                            for token_hash in hashes {
+                                push_governance_record(
+                                    &mut records,
+                                    &mut seen_records,
+                                    *token_hash,
+                                    package,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (token, package) in package_tokens {
+        let Some(owner) = state.owners.get(package) else {
+            continue;
+        };
+        let allowed = match owner {
+            GovernanceOwner::Developer(developer) => developer == &token.developer,
+            GovernanceOwner::Team(team) => members_by_team
+                .get(team.as_str())
+                .is_some_and(|members| members.contains(token.developer.as_str())),
+        };
+        if allowed {
+            push_governance_record(&mut records, &mut seen_records, token.token_hash, package)?;
+        }
+    }
+    Ok(records)
+}
+
+fn push_governance_record<'a>(
+    records: &mut Vec<CredentialRecord>,
+    seen_records: &mut HashSet<([u8; 32], &'a str)>,
+    token_hash: [u8; 32],
+    package_name: &'a str,
+) -> KuResult<()> {
+    if !seen_records.insert((token_hash, package_name)) {
+        return Ok(());
+    }
+    if records.len() >= MAX_REGISTRY_INDEX_VERSIONS {
+        return Err(admin_error(
+            "invalid_registry_governance",
+            "registry governance expands beyond the bounded effective ACL limit",
+        ));
+    }
+    records.push(CredentialRecord {
+        token_hash,
+        package_name: package_name.to_string(),
+    });
+    Ok(())
+}
+
+fn first_registry_record(bytes: &[u8]) -> KuResult<Option<&str>> {
+    let source = std::str::from_utf8(bytes).map_err(|_| {
+        admin_error(
+            "invalid_registry_credentials",
+            "registry credentials file must be valid UTF-8",
+        )
+    })?;
+    Ok(source
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#')))
+}
+
+fn require_governance_state(bytes: &[u8]) -> KuResult<GovernanceState> {
+    if first_registry_record(bytes)? != Some(GOVERNANCE_SCHEMA) {
+        return Err(admin_error(
+            "registry_governance_migration_required",
+            "registry credentials must be migrated to governance schema 2 first",
+        ));
+    }
+    parse_governance_state(bytes)
+}
+
+fn owner_has_active_token(
+    state: &GovernanceState,
+    package_name: &str,
+    owner: &GovernanceOwner,
+) -> bool {
+    let scope_matches = |token: &GovernanceToken| match &token.scope {
+        GovernanceTokenScope::All => true,
+        GovernanceTokenScope::Package(scoped_package) => scoped_package == package_name,
+    };
+    match owner {
+        GovernanceOwner::Developer(owner) => state
+            .tokens
+            .iter()
+            .any(|token| owner == &token.developer && scope_matches(token)),
+        GovernanceOwner::Team(team) => {
+            let members = state
+                .members
+                .iter()
+                .filter_map(|(member_team, developer)| {
+                    (member_team == team).then_some(developer.as_str())
+                })
+                .collect::<HashSet<_>>();
+            state
+                .tokens
+                .iter()
+                .any(|token| members.contains(token.developer.as_str()) && scope_matches(token))
+        }
+    }
+}
+
+fn all_packages_remain_authorized(state: &GovernanceState) -> bool {
+    governance_credentials(state)
+        .map(|credentials| {
+            credentials
+                .iter()
+                .map(|credential| credential.package_name.as_str())
+                .collect::<BTreeSet<_>>()
+                .len()
+                == state.owners.len()
+        })
+        .unwrap_or(false)
+}
+
+fn validate_audit_subject(subject: &str) -> KuResult<()> {
+    if subject.is_empty()
+        || subject.len() > 256
+        || !subject
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_' | b'.'))
+    {
+        return Err(admin_error(
+            "invalid_registry_audit",
+            "invalid registry governance audit subject",
+        ));
+    }
+    Ok(())
+}
+
+fn mutate_governance_from_env(
+    action: &str,
+    subject: &str,
+    mutation: impl FnOnce(&mut GovernanceState) -> KuResult<()>,
+) -> KuResult<()> {
+    validate_governance_name(action, "audit action")?;
+    validate_audit_subject(subject)?;
+    let path = normalize_credentials_path(&required_credentials_path()?)?;
+    let deadline = absolute_deadline(ADMIN_LOCK_TIMEOUT)?;
+    let _lock = CredentialFileLock::acquire(&path, deadline)?;
+    let original = read_credentials_if_present(&path)?;
+    let mut state = require_governance_state(&original)?;
+    mutation(&mut state)?;
+    if !all_packages_remain_authorized(&state) {
+        return Err(admin_error(
+            "registry_owner_has_no_active_token",
+            "every package owner must retain at least one active publishing token",
+        ));
+    }
+    append_governance_audit(&mut state, action, subject);
+    let replacement = serialize_governance_state(&state)?;
+    write_credentials_atomically(&path, &replacement)
+}
+
+fn change_package_owner_from_env(package_name: &str, owner: &str, transfer: bool) -> KuResult<()> {
+    validate_admin_package_name(package_name)?;
+    let owner = parse_owner(owner)?;
+    let subject = format!("{package_name}:{}", owner_text(&owner));
+    mutate_governance_from_env(
+        if transfer {
+            "package-transfer"
+        } else {
+            "package-claim"
+        },
+        &subject,
+        move |state| {
+            let owner_exists = match &owner {
+                GovernanceOwner::Developer(name) => state.developers.contains(name),
+                GovernanceOwner::Team(name) => state.teams.contains(name),
+            };
+            if !owner_exists {
+                return Err(admin_error(
+                    "registry_owner_not_found",
+                    "package owner does not exist",
+                ));
+            }
+            if !owner_has_active_token(state, package_name, &owner) {
+                return Err(admin_error(
+                    "registry_owner_has_no_active_token",
+                    "package owner must have at least one active publishing token",
+                ));
+            }
+            match state.owners.get(package_name) {
+                None if transfer => Err(admin_error(
+                    "registry_package_not_owned",
+                    "package must be claimed before it can be transferred",
+                )),
+                Some(_) if !transfer => Err(admin_error(
+                    "registry_package_owned",
+                    "package is already owned; use package transfer",
+                )),
+                Some(existing) if existing == &owner => Err(admin_error(
+                    "registry_package_owner_unchanged",
+                    "package already has the requested owner",
+                )),
+                _ => {
+                    state.owners.insert(package_name.to_string(), owner);
+                    Ok(())
+                }
+            }
+        },
+    )
+}
+
 pub(crate) fn parse_credential_records(bytes: &[u8]) -> KuResult<Vec<CredentialRecord>> {
     if bytes.len() as u64 > MAX_CREDENTIAL_FILE_BYTES {
         return Err(admin_error(
@@ -145,6 +1735,14 @@ pub(crate) fn parse_credential_records(bytes: &[u8]) -> KuResult<Vec<CredentialR
             "registry credentials file must be valid UTF-8",
         )
     })?;
+    if source
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        == Some(GOVERNANCE_SCHEMA)
+    {
+        return parse_governance_state(bytes).and_then(|state| governance_credentials(&state));
+    }
     let mut credentials = Vec::new();
     let mut seen = HashSet::new();
     for (index, raw_line) in source.lines().enumerate() {
@@ -227,6 +1825,12 @@ fn issue_token_with_writer(
     let deadline = absolute_deadline(timeout)?;
     let _lock = CredentialFileLock::acquire(&path, deadline)?;
     let original = read_credentials_if_present(&path)?;
+    if first_registry_record(&original)? == Some(GOVERNANCE_SCHEMA) {
+        return Err(admin_error(
+            "registry_governance_command_required",
+            "use developer token-issue after governance migration",
+        ));
+    }
     let records = parse_credential_records(&original)?;
     if records.len() >= MAX_REGISTRY_INDEX_VERSIONS {
         return Err(admin_error(
@@ -249,7 +1853,7 @@ fn issue_token_with_writer(
         replacement.extend_from_slice(line.as_bytes());
         validate_replacement(&replacement)?;
         writer(&path, &replacement).map_err(|err| {
-            annotate_committed_credential_error(err, "issued", package_name, &token_hash)
+            annotate_committed_credential_error(err, "issued", "package", package_name, &token_hash)
         })?;
         return Ok(token);
     }
@@ -281,6 +1885,12 @@ fn revoke_token_with_writer(
     let deadline = absolute_deadline(timeout)?;
     let _lock = CredentialFileLock::acquire(&path, deadline)?;
     let original = read_credentials_if_present(&path)?;
+    if first_registry_record(&original)? == Some(GOVERNANCE_SCHEMA) {
+        return Err(admin_error(
+            "registry_governance_command_required",
+            "use developer token-revoke after governance migration",
+        ));
+    }
     parse_credential_records(&original)?;
     let token_hash: [u8; 32] = Sha256::digest(token).into();
     let source = std::str::from_utf8(&original).map_err(|_| {
@@ -317,19 +1927,20 @@ fn revoke_token_with_writer(
     }
     validate_replacement(&replacement)?;
     writer(&path, &replacement).map_err(|err| {
-        annotate_committed_credential_error(err, "revoked", package_name, &token_hash)
+        annotate_committed_credential_error(err, "revoked", "package", package_name, &token_hash)
     })
 }
 
 fn annotate_committed_credential_error(
     mut error: KuError,
     action: &str,
-    package_name: &str,
+    subject_kind: &str,
+    subject: &str,
     token_hash: &[u8; 32],
 ) -> KuError {
     if error.code.as_deref() == Some("registry_credentials_commit_uncertain") {
         error.message.push_str(&format!(
-            "; {action} credential sha256-{} for package {package_name}; inspect this exact hash before retrying, since the replacement is already visible and its durable state is uncertain",
+            "; {action} credential sha256-{} for {subject_kind} {subject}; inspect this exact hash before retrying, since the replacement is already visible and its durable state is uncertain",
             encode_hex(token_hash)
         ));
     }
@@ -373,6 +1984,28 @@ fn validate_presented_token(token: &str) -> KuResult<()> {
         ));
     }
     Ok(())
+}
+
+fn parse_admin_token_hash(value: &str) -> KuResult<[u8; 32]> {
+    let encoded = value.strip_prefix("sha256-").ok_or_else(|| {
+        admin_error(
+            "invalid_registry_token_hash",
+            "registry token recovery requires exactly sha256-<64 hex digits>",
+        )
+    })?;
+    decode_hex_array::<32>(encoded).map_err(|_| {
+        admin_error(
+            "invalid_registry_token_hash",
+            "registry token recovery requires exactly sha256-<64 hex digits>",
+        )
+    })
+}
+
+fn is_canonical_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_admin_package_name(package_name: &str) -> KuResult<()> {
@@ -1021,6 +2654,8 @@ mod credential_dacl {
     use std::{ffi::c_void, fs, io, mem, os::windows::io::AsRawHandle, ptr};
 
     const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 1;
+    const GROUP_SECURITY_INFORMATION: u32 = 2;
     const DACL_SECURITY_INFORMATION: u32 = 4;
     const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
     const UNPROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x2000_0000;
@@ -1065,6 +2700,18 @@ mod credential_dacl {
             dacl: *mut *mut c_void,
             defaulted: *mut i32,
         ) -> i32;
+        fn GetSecurityDescriptorOwner(
+            descriptor: *const c_void,
+            owner: *mut *mut c_void,
+            defaulted: *mut i32,
+        ) -> i32;
+        fn GetSecurityDescriptorGroup(
+            descriptor: *const c_void,
+            group: *mut *mut c_void,
+            defaulted: *mut i32,
+        ) -> i32;
+        fn IsValidSid(sid: *const c_void) -> i32;
+        fn GetLengthSid(sid: *const c_void) -> u32;
         fn GetAclInformation(
             acl: *const c_void,
             information: *mut c_void,
@@ -1084,6 +2731,8 @@ mod credential_dacl {
     #[derive(Debug, PartialEq, Eq)]
     pub(super) struct Snapshot {
         protected: bool,
+        owner: Option<Vec<u8>>,
+        group: Option<Vec<u8>>,
         bytes: Option<Vec<u8>>,
     }
 
@@ -1128,7 +2777,9 @@ mod credential_dacl {
                 GetSecurityInfo(
                     file.as_raw_handle(),
                     SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION,
+                    OWNER_SECURITY_INFORMATION
+                        | GROUP_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION,
                     ptr::null_mut(),
                     ptr::null_mut(),
                     ptr::null_mut(),
@@ -1144,19 +2795,34 @@ mod credential_dacl {
                     "Windows returned a null security descriptor",
                 ));
             }
-            Ok(Self { descriptor })
+            let security = Self { descriptor };
+            let (_, owner, group, dacl_present, _) = security.parts()?;
+            if owner.is_null() || group.is_null() || !dacl_present {
+                return Err(io::Error::other(
+                    "Windows security descriptor omitted owner, group, or DACL",
+                ));
+            }
+            Ok(security)
         }
 
-        fn parts(&self) -> io::Result<(bool, *mut c_void)> {
+        fn parts(&self) -> io::Result<(bool, *mut c_void, *mut c_void, bool, *mut c_void)> {
             let mut control = 0u16;
             let mut revision = 0u32;
             let mut present = 0i32;
             let mut defaulted = 0i32;
+            let mut owner = ptr::null_mut();
+            let mut group = ptr::null_mut();
             let mut dacl = ptr::null_mut();
             // SAFETY: self owns the valid Windows-allocated descriptor and all
             // output pointers refer to initialized, correctly typed locals.
             if unsafe { GetSecurityDescriptorControl(self.descriptor, &mut control, &mut revision) }
                 == 0
+                || unsafe {
+                    GetSecurityDescriptorOwner(self.descriptor, &mut owner, &mut defaulted)
+                } == 0
+                || unsafe {
+                    GetSecurityDescriptorGroup(self.descriptor, &mut group, &mut defaulted)
+                } == 0
                 || unsafe {
                     GetSecurityDescriptorDacl(
                         self.descriptor,
@@ -1170,12 +2836,36 @@ mod credential_dacl {
             }
             Ok((
                 control & SE_DACL_PROTECTED != 0,
+                owner,
+                group,
+                present != 0,
                 if present == 0 { ptr::null_mut() } else { dacl },
             ))
         }
 
+        fn sid_bytes(sid: *const c_void) -> io::Result<Option<Vec<u8>>> {
+            if sid.is_null() {
+                return Ok(None);
+            }
+            if unsafe { IsValidSid(sid) } == 0 {
+                return Err(io::Error::other("Windows returned an invalid SID"));
+            }
+            let length = unsafe { GetLengthSid(sid) };
+            if !(8..=68).contains(&length) {
+                return Err(io::Error::other("Windows returned an invalid SID length"));
+            }
+            Ok(Some(
+                unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length as usize) }.to_vec(),
+            ))
+        }
+
         pub(super) fn snapshot(&self) -> io::Result<Snapshot> {
-            let (protected, dacl) = self.parts()?;
+            let (protected, owner, group, dacl_present, dacl) = self.parts()?;
+            if !dacl_present {
+                return Err(io::Error::other(
+                    "Windows security descriptor omitted the DACL",
+                ));
+            }
             let bytes = if dacl.is_null() {
                 None
             } else {
@@ -1211,27 +2901,44 @@ mod credential_dacl {
                     .to_vec(),
                 )
             };
-            Ok(Snapshot { protected, bytes })
+            Ok(Snapshot {
+                protected,
+                owner: Self::sid_bytes(owner)?,
+                group: Self::sid_bytes(group)?,
+                bytes,
+            })
         }
 
         pub(super) fn apply(&self, file: &fs::File) -> io::Result<()> {
             let expected = self.snapshot()?;
-            let (protected, dacl) = self.parts()?;
-            let information = DACL_SECURITY_INFORMATION
+            let (protected, owner, group, dacl_present, dacl) = self.parts()?;
+            if !dacl_present {
+                return Err(io::Error::other(
+                    "Windows security descriptor omitted the DACL",
+                ));
+            }
+            let mut information = DACL_SECURITY_INFORMATION
                 | if protected {
                     PROTECTED_DACL_SECURITY_INFORMATION
                 } else {
                     UNPROTECTED_DACL_SECURITY_INFORMATION
                 };
-            // SAFETY: the staging handle has WRITE_DAC. The borrowed ACL stays
-            // live for the call. No ignore-ACL-error behavior is enabled.
+            if !owner.is_null() {
+                information |= OWNER_SECURITY_INFORMATION;
+            }
+            if !group.is_null() {
+                information |= GROUP_SECURITY_INFORMATION;
+            }
+            // SAFETY: the staging handle has WRITE_OWNER and WRITE_DAC. The
+            // borrowed owner/group/DACL stay live for the call. No
+            // ignore-security-error behavior is enabled.
             let error = unsafe {
                 SetSecurityInfo(
                     file.as_raw_handle(),
                     SE_FILE_OBJECT,
                     information,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
+                    owner,
+                    group,
                     dacl,
                     ptr::null_mut(),
                 )
@@ -1239,7 +2946,12 @@ mod credential_dacl {
             if error != 0 {
                 return Err(io::Error::from_raw_os_error(error as i32));
             }
-            if Self::read(file)?.snapshot()? != expected {
+            let actual = Self::read(file)?.snapshot()?;
+            if actual.protected != expected.protected
+                || actual.bytes != expected.bytes
+                || expected.owner.is_some() && actual.owner != expected.owner
+                || expected.group.is_some() && actual.group != expected.group
+            {
                 return Err(io::Error::other(
                     "staging DACL did not exactly match the original",
                 ));
@@ -1549,10 +3261,11 @@ fn open_new_private_file(path: &Path) -> io::Result<fs::File> {
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+        .access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER)
         .open(path)
 }
 
@@ -1690,13 +3403,567 @@ mod tests {
                 package_name: "math".to_string()
             }
         );
+        assert_eq!(
+            parse_registry_command(
+                ["package", "transfer", "math", "team:core"].map(OsString::from)
+            )
+            .unwrap(),
+            RegistryCommand::PackageTransfer {
+                package_name: "math".to_string(),
+                owner: "team:core".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_registry_command(["audit", "verify"].map(OsString::from)).unwrap(),
+            RegistryCommand::AuditVerify
+        );
+        assert_eq!(
+            parse_registry_command(
+                [
+                    "developer",
+                    "token-revoke-hash",
+                    "alice",
+                    &format!("sha256-{}", "ab".repeat(32)),
+                ]
+                .map(OsString::from)
+            )
+            .unwrap(),
+            RegistryCommand::DeveloperTokenRevokeHash {
+                developer: "alice".to_string(),
+                token_hash: [0xab; 32],
+            }
+        );
         for invalid in [
             vec!["issue", "math"],
             vec!["token", "add", "math"],
             vec!["token", "issue", "math", "secret"],
+            vec!["developer", "token-revoke-hash", "alice"],
+            vec!["developer", "token-revoke-hash", "alice", "ab"],
+            vec![
+                "developer",
+                "token-revoke-hash",
+                "alice",
+                "sha256-not-a-token-hash",
+            ],
         ] {
             assert!(parse_registry_command(invalid.into_iter().map(OsString::from)).is_err());
         }
+    }
+
+    fn governance_fixture() -> (GovernanceState, [u8; 32], [u8; 32], [u8; 32]) {
+        let alice_hash: [u8; 32] = Sha256::digest(b"alice-token").into();
+        let bob_hash: [u8; 32] = Sha256::digest(b"bob-token").into();
+        let outsider_hash: [u8; 32] = Sha256::digest(b"outsider-token").into();
+        let mut state = GovernanceState::default();
+        for (index, developer) in ["alice", "bob", "outsider"].into_iter().enumerate() {
+            state.developers.insert(developer.to_string());
+            append_governance_audit(
+                &mut state,
+                if index == 0 {
+                    "init"
+                } else {
+                    "developer-create"
+                },
+                developer,
+            );
+        }
+        state.teams.insert("core".to_string());
+        append_governance_audit(&mut state, "team-create", "core");
+        state
+            .members
+            .insert(("core".to_string(), "bob".to_string()));
+        append_governance_audit(&mut state, "team-member-add", "core:bob");
+        for (developer, token_hash) in [
+            ("alice", alice_hash),
+            ("bob", bob_hash),
+            ("outsider", outsider_hash),
+        ] {
+            let token = GovernanceToken {
+                token_hash,
+                developer: developer.to_string(),
+                scope: GovernanceTokenScope::All,
+            };
+            state.tokens.insert(token.clone());
+            append_governance_audit(
+                &mut state,
+                "developer-token-issue",
+                &token_audit_subject(&token),
+            );
+        }
+        state.owners.insert(
+            "math".to_string(),
+            GovernanceOwner::Developer("alice".to_string()),
+        );
+        append_governance_audit(&mut state, "package-claim", "math:developer:alice");
+        state.owners.insert(
+            "tools".to_string(),
+            GovernanceOwner::Team("core".to_string()),
+        );
+        append_governance_audit(&mut state, "package-claim", "tools:team:core");
+        (state, alice_hash, bob_hash, outsider_hash)
+    }
+
+    #[test]
+    fn governance_schema_flattens_exact_owner_and_team_member_authorizations() {
+        let (state, alice_hash, bob_hash, outsider_hash) = governance_fixture();
+        let encoded = serialize_governance_state(&state).unwrap();
+        let parsed = parse_governance_state(&encoded).unwrap();
+        assert_eq!(parsed, state);
+        let credentials = parse_credential_records(&encoded).unwrap();
+        assert_eq!(credentials.len(), 2);
+        assert!(credentials.iter().any(|credential| {
+            credential.token_hash == alice_hash && credential.package_name == "math"
+        }));
+        assert!(credentials.iter().any(|credential| {
+            credential.token_hash == bob_hash && credential.package_name == "tools"
+        }));
+        assert!(credentials
+            .iter()
+            .all(|credential| credential.token_hash != outsider_hash));
+    }
+
+    #[test]
+    fn migration_scopes_preserve_legacy_acl_without_cartesian_permission_expansion() {
+        let math_hash: [u8; 32] = Sha256::digest(b"math-token").into();
+        let tools_hash: [u8; 32] = Sha256::digest(b"tools-token").into();
+        let legacy = vec![
+            CredentialRecord {
+                token_hash: math_hash,
+                package_name: "math".to_string(),
+            },
+            CredentialRecord {
+                token_hash: tools_hash,
+                package_name: "tools".to_string(),
+            },
+        ];
+        let state = migrate_legacy_credentials(legacy, "alice");
+        let credentials = parse_credential_records(&serialize_governance_state(&state).unwrap())
+            .expect("migration state remains a valid server credential snapshot");
+        assert_eq!(credentials.len(), 2);
+        assert!(credentials.iter().any(|credential| {
+            credential.token_hash == math_hash && credential.package_name == "math"
+        }));
+        assert!(credentials.iter().any(|credential| {
+            credential.token_hash == tools_hash && credential.package_name == "tools"
+        }));
+        assert!(!credentials.iter().any(|credential| {
+            (credential.token_hash == math_hash && credential.package_name == "tools")
+                || (credential.token_hash == tools_hash && credential.package_name == "math")
+        }));
+    }
+
+    #[test]
+    fn migration_preserves_one_legacy_token_authorized_for_multiple_packages() {
+        let shared_hash: [u8; 32] = Sha256::digest(b"shared-token").into();
+        let legacy = vec![
+            CredentialRecord {
+                token_hash: shared_hash,
+                package_name: "math".to_string(),
+            },
+            CredentialRecord {
+                token_hash: shared_hash,
+                package_name: "tools".to_string(),
+            },
+        ];
+        let state = migrate_legacy_credentials(legacy.clone(), "alice");
+        let encoded = serialize_governance_state(&state).unwrap();
+        let migrated = parse_credential_records(&encoded).unwrap();
+        assert_eq!(
+            migrated
+                .into_iter()
+                .map(|record| (record.token_hash, record.package_name))
+                .collect::<BTreeSet<_>>(),
+            legacy
+                .into_iter()
+                .map(|record| (record.token_hash, record.package_name))
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn migration_preserves_the_maximum_bounded_legacy_acl() {
+        let developer = format!("d{}", "x".repeat(63));
+        let mut legacy = Vec::with_capacity(MAX_GOVERNANCE_RECORDS);
+        for index in 0..MAX_GOVERNANCE_RECORDS {
+            let package_name = format!("p{index:04}{}", "x".repeat(59));
+            assert_eq!(package_name.len(), 64);
+            let mut token_hash = [0u8; 32];
+            token_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            legacy.push(CredentialRecord {
+                token_hash,
+                package_name,
+            });
+        }
+
+        let state = migrate_legacy_credentials(legacy.clone(), &developer);
+        assert_eq!(state.audits.len(), 2 + 2 * MAX_GOVERNANCE_RECORDS);
+        let encoded = serialize_governance_state(&state)
+            .expect("the maximum accepted legacy ACL must fit the governance snapshot bound");
+        assert!(encoded.len() > 1024 * 1024);
+        assert!(encoded.len() as u64 <= MAX_CREDENTIAL_FILE_BYTES);
+
+        let migrated = parse_credential_records(&encoded)
+            .expect("the maximum migrated snapshot must remain replayable");
+        let expected = legacy
+            .iter()
+            .map(|record| (record.token_hash, record.package_name.as_str()))
+            .collect::<BTreeSet<_>>();
+        let actual = migrated
+            .iter()
+            .map(|record| (record.token_hash, record.package_name.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn governance_transfer_revokes_old_owner_and_audit_tampering_is_rejected() {
+        let (mut state, alice_hash, bob_hash, _) = governance_fixture();
+        state.owners.insert(
+            "math".to_string(),
+            GovernanceOwner::Developer("bob".to_string()),
+        );
+        append_governance_audit(&mut state, "package-transfer", "math:developer:bob");
+        let encoded = serialize_governance_state(&state).unwrap();
+        let credentials = parse_credential_records(&encoded).unwrap();
+        assert!(!credentials.iter().any(|credential| {
+            credential.token_hash == alice_hash && credential.package_name == "math"
+        }));
+        assert!(credentials.iter().any(|credential| {
+            credential.token_hash == bob_hash && credential.package_name == "math"
+        }));
+
+        let tampered = String::from_utf8(encoded)
+            .unwrap()
+            .replace("math:developer:bob", "math:developer:eve");
+        let error = parse_governance_state(tampered.as_bytes())
+            .expect_err("changing an audit subject must break the hash chain");
+        assert_eq!(error.code.as_deref(), Some("invalid_registry_audit"));
+    }
+
+    #[test]
+    fn governance_audit_binds_owner_member_and_token_state() {
+        let (state, _, _, outsider_hash) = governance_fixture();
+        let encoded = String::from_utf8(serialize_governance_state(&state).unwrap()).unwrap();
+        let token_line = format!("token sha256-{} outsider all", encode_hex(&outsider_hash));
+        let mutations = [
+            encoded.replacen(
+                "owner math developer:alice",
+                "owner math developer:outsider",
+                1,
+            ),
+            encoded.replacen("member core bob", "member core outsider", 1),
+            encoded.replacen(
+                &token_line,
+                &token_line.replace(" outsider all", " alice all"),
+                1,
+            ),
+        ];
+        for tampered in mutations {
+            assert_ne!(tampered, encoded);
+            let error = parse_governance_state(tampered.as_bytes())
+                .expect_err("governance state changes require a new audit event");
+            assert_eq!(error.code.as_deref(), Some("invalid_registry_audit"));
+        }
+    }
+
+    #[test]
+    fn governance_audit_replay_rejects_unknown_fictitious_and_noop_events() {
+        let (state, _, bob_hash, _) = governance_fixture();
+        let encoded = String::from_utf8(serialize_governance_state(&state).unwrap()).unwrap();
+        let previous = state.audits.last().unwrap();
+        for (action, subject) in [
+            ("unknown-action", "registry".to_string()),
+            ("developer-create", "mallory".to_string()),
+            ("developer-create", "alice".to_string()),
+            ("package-transfer", "math:developer:bob".to_string()),
+            (
+                "developer-token-revoke",
+                format!("bob:sha256-{}", encode_hex(&bob_hash)),
+            ),
+        ] {
+            let sequence = previous.sequence + 1;
+            let before = previous.transition_hash.clone();
+            let after = before.clone();
+            let event_hash = governance_audit_hash(
+                sequence,
+                &previous.event_hash,
+                &before,
+                &after,
+                action,
+                &subject,
+            );
+            let forged = format!(
+                "{encoded}audit {sequence} {} {event_hash} {before} {after} {action} {subject}\n",
+                previous.event_hash
+            );
+            let error = parse_governance_state(forged.as_bytes())
+                .expect_err("a forged or no-op audit event must fail semantic replay");
+            assert_eq!(error.code.as_deref(), Some("invalid_registry_audit"));
+        }
+    }
+
+    #[test]
+    fn governance_audit_phase_rejects_fictitious_bootstrap_and_scope_transitions() {
+        let mut state = GovernanceState::default();
+        let mut phase = GovernanceAuditPhase::Empty;
+        assert!(
+            apply_governance_audit_event(&mut state, &mut phase, "developer-create", "alice")
+                .is_err()
+        );
+        assert!(state.developers.is_empty());
+
+        apply_governance_audit_event(&mut state, &mut phase, "migration-init", "alice").unwrap();
+        let all_token = GovernanceToken {
+            token_hash: [1u8; 32],
+            developer: "alice".to_string(),
+            scope: GovernanceTokenScope::All,
+        };
+        assert!(apply_governance_audit_event(
+            &mut state,
+            &mut phase,
+            "migration-token-import",
+            &token_audit_subject(&all_token)
+        )
+        .is_err());
+        let package_token = GovernanceToken {
+            token_hash: [2u8; 32],
+            developer: "alice".to_string(),
+            scope: GovernanceTokenScope::Package("math".to_string()),
+        };
+        assert!(apply_governance_audit_event(
+            &mut state,
+            &mut phase,
+            "developer-token-issue",
+            &token_audit_subject(&package_token)
+        )
+        .is_err());
+        apply_governance_audit_event(
+            &mut state,
+            &mut phase,
+            "migration-token-import",
+            &token_audit_subject(&package_token),
+        )
+        .unwrap();
+        assert!(apply_governance_audit_event(
+            &mut state,
+            &mut phase,
+            "migration-complete",
+            "alice"
+        )
+        .is_err());
+        apply_governance_audit_event(
+            &mut state,
+            &mut phase,
+            "package-claim",
+            "math:developer:alice",
+        )
+        .unwrap();
+        apply_governance_audit_event(&mut state, &mut phase, "migration-complete", "alice")
+            .unwrap();
+        assert_eq!(phase, GovernanceAuditPhase::Normal);
+        assert!(apply_governance_audit_event(
+            &mut state,
+            &mut phase,
+            "migration-token-import",
+            &token_audit_subject(&GovernanceToken {
+                token_hash: [3u8; 32],
+                developer: "alice".to_string(),
+                scope: GovernanceTokenScope::Package("math".to_string()),
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn governance_audit_rejects_noncanonical_hash_encodings() {
+        let token_hash = [0xabu8; 32];
+        let uppercase_hash = encode_hex(&token_hash).to_ascii_uppercase();
+        let token_subject = format!("alice:sha256-{uppercase_hash}:all");
+        let token_error = parse_audit_token_subject(&token_subject)
+            .expect_err("audit token subjects must use canonical lowercase hex");
+        assert_eq!(token_error.code.as_deref(), Some("invalid_registry_audit"));
+
+        let revoke_subject = format!("alice:sha256-{uppercase_hash}");
+        let revoke_error = parse_audit_revoke_subject(&revoke_subject)
+            .expect_err("audit revoke subjects must use canonical lowercase hex");
+        assert_eq!(revoke_error.code.as_deref(), Some("invalid_registry_audit"));
+
+        let (state, _, _, _) = governance_fixture();
+        let encoded = String::from_utf8(serialize_governance_state(&state).unwrap()).unwrap();
+        let mut changed = false;
+        let noncanonical = encoded
+            .lines()
+            .map(|line| {
+                if !changed && line.starts_with("audit ") {
+                    let mut fields = line
+                        .split_ascii_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    fields[3] = fields[3].to_ascii_uppercase();
+                    changed = true;
+                    fields.join(" ")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(changed);
+        let error = parse_governance_state(noncanonical.as_bytes())
+            .expect_err("governance audit hash fields must use canonical lowercase hex");
+        assert_eq!(error.code.as_deref(), Some("invalid_registry_audit"));
+
+        let noncanonical_sequence = encoded.replacen("audit 1 ", "audit 01 ", 1);
+        assert_ne!(noncanonical_sequence, encoded);
+        let error = parse_governance_state(noncanonical_sequence.as_bytes())
+            .expect_err("audit sequence text must use canonical unsigned decimal encoding");
+        assert_eq!(error.code.as_deref(), Some("invalid_registry_audit"));
+
+        let mut changed_token = false;
+        let noncanonical_token = encoded
+            .lines()
+            .map(|line| {
+                if !changed_token && line.starts_with("token sha256-") {
+                    let mut fields = line
+                        .split_ascii_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    let hash = fields[1].strip_prefix("sha256-").unwrap();
+                    fields[1] = format!("sha256-{}", hash.to_ascii_uppercase());
+                    changed_token = true;
+                    fields.join(" ")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(changed_token);
+        let error = parse_governance_state(noncanonical_token.as_bytes())
+            .expect_err("governance token hashes must use canonical lowercase hex");
+        assert_eq!(error.code.as_deref(), Some("invalid_registry_credentials"));
+    }
+
+    #[test]
+    fn governance_acl_expansion_scales_with_effective_records_not_token_owner_product() {
+        let mut state = GovernanceState::default();
+        for index in 0..MAX_GOVERNANCE_RECORDS {
+            let developer = format!("d{index:04}");
+            let package = format!("p{index:04}");
+            let mut token_hash = [0u8; 32];
+            token_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            state.developers.insert(developer.clone());
+            state
+                .owners
+                .insert(package, GovernanceOwner::Developer(developer.clone()));
+            state.tokens.insert(GovernanceToken {
+                token_hash,
+                developer,
+                scope: GovernanceTokenScope::All,
+            });
+        }
+        let credentials = governance_credentials(&state).unwrap();
+        assert_eq!(credentials.len(), MAX_GOVERNANCE_RECORDS);
+        assert!(all_packages_remain_authorized(&state));
+        assert_eq!(
+            credentials
+                .iter()
+                .map(|record| (&record.token_hash, &record.package_name))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            MAX_GOVERNANCE_RECORDS
+        );
+    }
+
+    #[test]
+    fn governance_team_acl_rejects_before_materializing_team_token_product() {
+        let mut state = GovernanceState::default();
+        let developer = "alice".to_string();
+        state.developers.insert(developer.clone());
+        for index in 0..MAX_GOVERNANCE_RECORDS {
+            let team = format!("t{index:04}");
+            let package = format!("p{index:04}");
+            state.teams.insert(team.clone());
+            state.members.insert((team.clone(), developer.clone()));
+            state.owners.insert(package, GovernanceOwner::Team(team));
+
+            let mut token_hash = [0u8; 32];
+            token_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            state.tokens.insert(GovernanceToken {
+                token_hash,
+                developer: developer.clone(),
+                scope: GovernanceTokenScope::All,
+            });
+        }
+
+        let error = governance_credentials(&state)
+            .expect_err("team ACL expansion must stop at the effective record cap");
+        assert_eq!(error.code.as_deref(), Some("invalid_registry_governance"));
+    }
+
+    #[test]
+    fn governance_team_acl_does_not_rescan_members_without_all_tokens_per_owner() {
+        let mut state = GovernanceState::default();
+        let team = "core".to_string();
+        state.teams.insert(team.clone());
+        for index in 0..MAX_GOVERNANCE_RECORDS {
+            let developer = format!("d{index:04}");
+            let package = format!("p{index:04}");
+            state.developers.insert(developer.clone());
+            state.members.insert((team.clone(), developer.clone()));
+            state
+                .owners
+                .insert(package, GovernanceOwner::Team(team.clone()));
+        }
+        let mut token_hash = [0u8; 32];
+        token_hash[..8].copy_from_slice(&1u64.to_be_bytes());
+        state.tokens.insert(GovernanceToken {
+            token_hash,
+            developer: "d0000".to_string(),
+            scope: GovernanceTokenScope::Package("p0000".to_string()),
+        });
+
+        let indexes = governance_credential_indexes(&state);
+        assert_eq!(
+            indexes.members_by_team.get("core").map(HashSet::len),
+            Some(MAX_GOVERNANCE_RECORDS)
+        );
+        assert!(
+            !indexes.all_token_members_by_team.contains_key("core"),
+            "members without all-scoped tokens must not enter the per-owner iteration index"
+        );
+        let credentials = governance_credentials(&state).unwrap();
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].token_hash, token_hash);
+        assert_eq!(credentials[0].package_name, "p0000");
+    }
+
+    #[test]
+    fn governance_rejects_an_owner_without_an_effective_token() {
+        let (mut state, alice_hash, _, _) = governance_fixture();
+        state.tokens.retain(|token| token.token_hash != alice_hash);
+        let error = validate_governance_state(&state)
+            .expect_err("an owner without a publishing credential is not a valid snapshot");
+        assert_eq!(error.code.as_deref(), Some("invalid_registry_governance"));
+    }
+
+    #[test]
+    fn governance_rejects_duplicate_token_identity_and_dangling_references() {
+        let (mut duplicate, alice_hash, _, _) = governance_fixture();
+        duplicate.tokens.insert(GovernanceToken {
+            token_hash: alice_hash,
+            developer: "bob".to_string(),
+            scope: GovernanceTokenScope::All,
+        });
+        let error = serialize_governance_state(&duplicate)
+            .expect_err("one bearer token cannot authenticate two identities");
+        assert_eq!(error.code.as_deref(), Some("invalid_registry_governance"));
+
+        let (mut dangling, _, _, _) = governance_fixture();
+        dangling
+            .members
+            .insert(("missing".to_string(), "alice".to_string()));
+        assert!(serialize_governance_state(&dangling).is_err());
     }
 
     #[test]
@@ -1807,6 +4074,7 @@ mod tests {
             "issued credential sha256-{}",
             encode_hex(&issued_hash)
         )));
+        assert!(error.message.contains("for package math"));
         assert!(error.message.contains("durability is uncertain"));
         assert!(!error.message.contains(old_token));
         assert!(
@@ -1839,6 +4107,7 @@ mod tests {
             "revoked credential sha256-{}",
             encode_hex(&old_hash)
         )));
+        assert!(error.message.contains("for package math"));
         assert!(!error.message.contains(old_token));
         let after_revoke = fs::read(&path).unwrap();
         let remaining = parse_credential_records(&after_revoke).unwrap();
@@ -1849,6 +4118,19 @@ mod tests {
         assert_eq!(retry.code.as_deref(), Some("registry_credential_not_found"));
         assert!(retry.message.contains("already have been revoked"));
         assert_eq!(fs::read(&path).unwrap(), after_revoke);
+
+        let developer_error = annotate_committed_credential_error(
+            admin_error(
+                "registry_credentials_commit_uncertain",
+                "replacement is visible",
+            ),
+            "issued",
+            "developer",
+            "alice",
+            &issued_hash,
+        );
+        assert!(developer_error.message.contains("for developer alice"));
+        assert!(!developer_error.message.contains("for package alice"));
     }
 
     #[test]
@@ -1903,9 +4185,41 @@ mod tests {
             );
             assert!(error.message.contains("committed"));
             assert!(!error.to_string().contains(&token));
+
+            let error = write_developer_issued_token("alice", &token, &mut output)
+                .expect_err("developer token output failure must expose hash recovery only");
+            assert_eq!(error.code.as_deref(), Some("registry_token_output_failed"));
+            let hash_text = format!("sha256-{}", encode_hex(&hash));
+            assert!(error.message.contains(&hash_text));
+            assert!(error
+                .message
+                .contains(&format!("developer token-revoke-hash alice {hash_text}")));
+            assert!(error.message.contains("committed"));
+            assert!(!error.to_string().contains(&token));
+
+            let error = write_governance_confirmation("created developer alice", &mut output)
+                .expect_err("governance confirmation failure must be structured");
+            assert_eq!(
+                error.code.as_deref(),
+                Some("registry_governance_output_failed")
+            );
+            assert!(error.message.contains("committed"));
+            assert!(error.message.contains("already-exists or already-applied"));
+            assert!(!error.to_string().contains(&token));
+
+            let error = write_audit_verification_confirmation(&mut output)
+                .expect_err("audit output failure must be structured");
+            assert_eq!(error.code.as_deref(), Some("registry_audit_output_failed"));
+            assert!(error.message.contains("verification succeeded"));
+            assert!(!error.message.contains("committed"));
+            assert!(!error.to_string().contains(&token));
         }
         let mut success = Vec::new();
         write_issued_token(&token, &mut success).unwrap();
+        assert_eq!(success, format!("{token}\n").as_bytes());
+
+        let mut success = Vec::new();
+        write_developer_issued_token("alice", &token, &mut success).unwrap();
         assert_eq!(success, format!("{token}\n").as_bytes());
     }
 
@@ -1978,6 +4292,31 @@ mod tests {
                 .unwrap(),
             expected
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_foreign_owner_group_are_preserved_or_fail_before_content_write() {
+        let root = TestDirectory::new("windows-foreign-owner-group");
+        let staging_path = root.0.join("staging.txt");
+        let staging = open_new_private_file(&staging_path).unwrap();
+        let foreign = credential_dacl::Dacl::from_sddl("O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)")
+            .expect("create a descriptor with explicit non-operator owner and group");
+        let expected = foreign.snapshot().unwrap();
+        match foreign.apply(&staging) {
+            Ok(()) => assert_eq!(
+                credential_dacl::Dacl::read(&staging)
+                    .unwrap()
+                    .snapshot()
+                    .unwrap(),
+                expected
+            ),
+            Err(_) => assert_eq!(
+                staging.metadata().unwrap().len(),
+                0,
+                "an unprivileged owner/group failure must happen before credential content is written"
+            ),
+        }
     }
 
     fn linux_acl_bytes(entries: &[(u16, u16, u32)]) -> Vec<u8> {
@@ -2681,6 +5020,84 @@ mod tests {
         }
         assert!(issue_token(&second_credentials, "math", Duration::from_secs(1)).is_err());
         assert_eq!(fs::read(&lock_target).unwrap(), b"lock-target-untouched");
+    }
+
+    #[test]
+    fn governance_parser_stops_on_the_first_developer_over_the_record_limit() {
+        let mut bounded = String::from("schema 2\n");
+        for index in 0..MAX_GOVERNANCE_RECORDS {
+            bounded.push_str(&format!("developer d{index}\n"));
+        }
+
+        let mut at_limit = bounded.clone();
+        at_limit.push_str(&"x".repeat(MAX_REGISTRY_LINE_BYTES + 1));
+        at_limit.push('\n');
+        let error = parse_governance_state(at_limit.as_bytes())
+            .expect_err("the parser must accept the bounded record count before reading on");
+        assert!(error
+            .message
+            .contains(&format!("line {} is too long", MAX_GOVERNANCE_RECORDS + 2)));
+
+        bounded.push_str(&format!("developer d{}\n", MAX_GOVERNANCE_RECORDS));
+        bounded.push_str(&"x".repeat(MAX_REGISTRY_LINE_BYTES + 1));
+        bounded.push('\n');
+        let error = parse_governance_state(bounded.as_bytes())
+            .expect_err("the first excess developer must stop parsing before later input");
+        assert_eq!(error.code.as_deref(), Some("invalid_registry_governance"));
+        assert!(error.message.contains(&format!(
+            "developer record limit {MAX_GOVERNANCE_RECORDS} exceeded at line {}",
+            MAX_GOVERNANCE_RECORDS + 2
+        )));
+        assert!(!error.message.contains("too long"));
+    }
+
+    #[test]
+    fn governance_parser_enforces_every_record_category_limit_during_parsing() {
+        fn assert_limit(record_kind: &str, limit: usize, mut record: impl FnMut(usize) -> String) {
+            let mut source = String::from("schema 2\n");
+            for index in 0..=limit {
+                source.push_str(&record(index));
+            }
+            source.push_str(&"x".repeat(MAX_REGISTRY_LINE_BYTES + 1));
+            source.push('\n');
+            let error = parse_governance_state(source.as_bytes()).unwrap_err();
+            assert_eq!(
+                error.code.as_deref(),
+                Some("invalid_registry_governance"),
+                "{record_kind} records must use the bounded parser error"
+            );
+            assert!(
+                error.message.contains(&format!(
+                    "{record_kind} record limit {limit} exceeded at line {}",
+                    limit + 2
+                )),
+                "unexpected {record_kind} limit diagnostic: {}",
+                error.message
+            );
+            assert!(
+                !error.message.contains("too long"),
+                "{record_kind} overflow must stop before parsing trailing input"
+            );
+        }
+
+        assert_limit("team", MAX_GOVERNANCE_RECORDS, |index| {
+            format!("team t{index}\n")
+        });
+        assert_limit("member", MAX_GOVERNANCE_RECORDS, |index| {
+            format!("member t{index} d{index}\n")
+        });
+        assert_limit("owner", MAX_GOVERNANCE_RECORDS, |index| {
+            format!("owner p{index} developer:d\n")
+        });
+        assert_limit("token", MAX_GOVERNANCE_RECORDS, |index| {
+            let mut token_hash = [0u8; 32];
+            token_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            format!("token sha256-{} d all\n", encode_hex(&token_hash))
+        });
+        let zero_hash = "0".repeat(64);
+        assert_limit("audit", MAX_GOVERNANCE_AUDITS, |_| {
+            format!("audit 1 root {zero_hash} {zero_hash} {zero_hash} init a\n")
+        });
     }
 
     #[test]

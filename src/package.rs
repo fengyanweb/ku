@@ -12973,7 +12973,10 @@ checksum = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
             OsString::from(format!("{REGISTRY_QUARANTINE_PREFIX}unrecognized")),
             OsString::from(format!("{REGISTRY_QUARANTINE_PREFIX}unknown.file-copy")),
         ];
-        #[cfg(unix)]
+        // Linux filesystems accept arbitrary non-NUL filename bytes. Darwin's
+        // filesystem APIs reject this fixture with EILSEQ, so its portable
+        // reserved-name behavior remains covered there by the ASCII cases.
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::ffi::OsStringExt;
             let mut non_utf8 = REGISTRY_QUARANTINE_PREFIX.as_bytes().to_vec();
