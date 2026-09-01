@@ -418,8 +418,6 @@ fn http_get_with_timeout(
         stream,
         "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     )?;
-    stream.shutdown(Shutdown::Write)?;
-
     let mut response = Vec::new();
     let mut buffer = [0_u8; 1024];
     let mut header_parsed = false;

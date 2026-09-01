@@ -36,6 +36,7 @@ pub const NATIVE_THREAD_LIFECYCLE_HARNESS: &str = r#"
 #include <windows.h>
 #else
 #include <stdatomic.h>
+#include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
 #endif
