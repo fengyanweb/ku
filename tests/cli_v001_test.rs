@@ -107,10 +107,19 @@ fn connect_with_retry(address: &str, timeout: Duration) -> TcpStream {
     );
 }
 
-fn read_http_stream(mut stream: TcpStream, timeout: Duration) -> String {
+fn connect_with_read_timeout(
+    address: &str,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> TcpStream {
+    let stream = connect_with_retry(address, connect_timeout);
     stream
-        .set_read_timeout(Some(timeout))
+        .set_read_timeout(Some(read_timeout))
         .expect("set http test read timeout");
+    stream
+}
+
+fn read_http_stream(mut stream: TcpStream) -> String {
     let mut response = Vec::new();
     let mut buffer = [0_u8; 1024];
     loop {
@@ -544,7 +553,8 @@ fn main(): null! {
 
     // Split the final CRLF across reads, then send its LF with the body. Strict
     // delimiter state must span chunks while the coalesced body remains intact.
-    let mut fragmented = connect_with_retry(&address, Duration::from_secs(2));
+    let mut fragmented =
+        connect_with_read_timeout(&address, Duration::from_secs(2), Duration::from_secs(2));
     fragmented.set_nodelay(true).expect("set TCP_NODELAY");
     fragmented
         .write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r")
@@ -556,7 +566,7 @@ fn main(): null! {
     fragmented
         .shutdown(Shutdown::Write)
         .expect("half-close fragmented request");
-    let fragmented_response = read_http_stream(fragmented, Duration::from_secs(2));
+    let fragmented_response = read_http_stream(fragmented);
     assert_http_status(&fragmented_response, "HTTP/1.1 200 OK");
     assert!(
         fragmented_response.ends_with("\r\n\r\nfrag"),
@@ -725,11 +735,12 @@ fn main(): null! {
     );
     assert_http_status(&ready, "HTTP/1.1 200 OK");
 
-    let idle = connect_with_retry(&address, Duration::from_secs(2));
-    let idle_response = read_http_stream(idle, Duration::from_secs(2));
+    let idle = connect_with_read_timeout(&address, Duration::from_secs(2), Duration::from_secs(2));
+    let idle_response = read_http_stream(idle);
     assert_http_status(&idle_response, "HTTP/1.1 408 Request Timeout");
 
-    let mut drip = connect_with_retry(&address, Duration::from_secs(2));
+    let mut drip =
+        connect_with_read_timeout(&address, Duration::from_secs(2), Duration::from_secs(2));
     for (index, byte) in b"GET ".iter().enumerate() {
         if drip.write_all(&[*byte]).is_err() {
             break;
@@ -738,14 +749,15 @@ fn main(): null! {
             thread::sleep(Duration::from_millis(80));
         }
     }
-    let drip_response = read_http_stream(drip, Duration::from_secs(2));
+    let drip_response = read_http_stream(drip);
     assert_http_status(&drip_response, "HTTP/1.1 408 Request Timeout");
 
-    let mut partial_body = connect_with_retry(&address, Duration::from_secs(2));
+    let mut partial_body =
+        connect_with_read_timeout(&address, Duration::from_secs(2), Duration::from_secs(2));
     partial_body
         .write_all(b"POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\na")
         .expect("write partial body");
-    let body_response = read_http_stream(partial_body, Duration::from_secs(2));
+    let body_response = read_http_stream(partial_body);
     assert_http_status(&body_response, "HTTP/1.1 408 Request Timeout");
 
     let slow = http_response_or_stop(
@@ -812,12 +824,13 @@ fn main(): null! {
         )
         .expect("occupy pending request slot");
     thread::sleep(Duration::from_millis(300));
-    let mut rejected = connect_with_retry(&address, Duration::from_secs(2));
+    let mut rejected =
+        connect_with_read_timeout(&address, Duration::from_secs(2), Duration::from_secs(2));
     rejected
         .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .expect("write rejected probe");
     let _ = rejected.shutdown(Shutdown::Write);
-    let rejected_response = read_http_stream(rejected, Duration::from_secs(2));
+    let rejected_response = read_http_stream(rejected);
     assert_http_status(&rejected_response, "HTTP/1.1 503 Service Unavailable");
 
     drop(active);
