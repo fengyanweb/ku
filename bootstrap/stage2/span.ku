@@ -1,0 +1,38 @@
+import { Token } from "../stage1/token.ku"
+
+// Parser spans use the same coordinates as the stage-1 lexer: one-based
+// Unicode-scalar line/column, zero-based UTF-8 byte offset, exclusive end.
+struct Span {
+    line: int
+    column: int
+    offset: int
+    end_line: int
+    end_column: int
+    end_offset: int
+}
+
+fn SpanFromToken(token: Token): Span {
+    return Span {
+        line: token.line,
+        column: token.column,
+        offset: token.offset,
+        end_line: token.end_line,
+        end_column: token.end_column,
+        end_offset: token.end_offset
+    }
+}
+
+fn SpanMerge(left: Span, right: Span): Span {
+    return Span {
+        line: left.line,
+        column: left.column,
+        offset: left.offset,
+        end_line: right.end_line,
+        end_column: right.end_column,
+        end_offset: right.end_offset
+    }
+}
+
+fn SpanCanonical(span: Span): str {
+    return str(span.line) + ":" + str(span.column) + "@" + str(span.offset) + ".." + str(span.end_line) + ":" + str(span.end_column) + "@" + str(span.end_offset)
+}

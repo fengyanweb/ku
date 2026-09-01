@@ -1,0 +1,23 @@
+import { Parse } from "./parser.ku"
+
+fn RunCase(label: str, source: str): null! {
+    println("CASE|" + label)
+    try {
+        output = Parse(source)?
+        root = output.arena.nodes[output.root - 1].clone()
+        println("ROOT|" + str(output.root) + "|" + root.kind + "|" + root.text + "|" + str(output.arena.nodes.len()) + "|" + str(output.arena.edges.len()))
+    } catch(err) {
+        println("ERR|" + err.domain + "|" + err.code + "|" + err.message)
+    }
+    return ok(null)
+}
+
+fn main(): null! {
+    RunCase("precedence", "1 + 2 * 3")?
+    RunCase("unary-float", "!-1.250")?
+    RunCase("empty-call-array", "apply([])")?
+    RunCase("postfix", "user.items[0]?.name?")?
+    RunCase("call-array", "apply([true, null, 1.250], -value)")?
+    RunCase("diagnostic", "value +")?
+    return ok(null)
+}

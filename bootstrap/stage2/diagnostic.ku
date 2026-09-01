@@ -1,0 +1,18 @@
+import { EscapeCanonical } from "../stage1/token.ku"
+// Syntax failures keep a stable machine code and the complete offending span.
+// Ku errors cannot yet carry typed payloads, so Reject serializes this model
+// into the error message without losing any coordinate.
+struct Diagnostic {
+    code: str
+    message: str
+    line: int
+    column: int
+    offset: int
+    end_line: int
+    end_column: int
+    end_offset: int
+}
+
+fn DiagnosticCanonical(diagnostic: Diagnostic): str {
+    return EscapeCanonical(diagnostic.message) + "|" + str(diagnostic.line) + ":" + str(diagnostic.column) + "@" + str(diagnostic.offset) + ".." + str(diagnostic.end_line) + ":" + str(diagnostic.end_column) + "@" + str(diagnostic.end_offset)
+}

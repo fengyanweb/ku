@@ -1,0 +1,477 @@
+import { Token } from "../stage1/token.ku"
+import { Scan } from "../stage1/lexer.ku"
+import { Span, SpanFromToken, SpanMerge } from "./span.ku"
+import { Diagnostic, DiagnosticCanonical } from "./diagnostic.ku"
+import { Node, ParseOutput, EmptyArena } from "./ast.ku"
+
+// Stage 2B uses append-only operator/value stacks and integer links. Flat
+// binary and postfix chains are iterative; nested delimiters and unary prefixes
+// consume the explicit depth budget. Every loop either consumes a token, pops
+// an operator, or walks a value chain bounded by the 4096-token contract.
+
+struct OperatorEntry {
+    marker: str
+    text: str
+    precedence: int
+    unary: bool
+    line: int
+    column: int
+    offset: int
+    end_line: int
+    end_column: int
+    end_offset: int
+    previous: int
+    base_value: int
+    depth_active: bool
+}
+
+struct ValueEntry {
+    node: int
+    previous: int
+}
+
+fn RejectAt(token: Token, code: str, message: str): null! {
+    diagnostic = Diagnostic {
+        code: code.clone(),
+        message: message,
+        line: token.line,
+        column: token.column,
+        offset: token.offset,
+        end_line: token.end_line,
+        end_column: token.end_column,
+        end_offset: token.end_offset
+    }
+    canonical = DiagnosticCanonical(diagnostic)
+    fail { domain: "bootstrap.parser", code: code, message: canonical }
+}
+
+fn MakeOperator(marker: str, text: str, precedence: int, unary: bool, token: Token, previous: int, base_value: int, depth_active: bool): OperatorEntry {
+    return OperatorEntry {
+        marker: marker,
+        text: text,
+        precedence: precedence,
+        unary: unary,
+        line: token.line,
+        column: token.column,
+        offset: token.offset,
+        end_line: token.end_line,
+        end_column: token.end_column,
+        end_offset: token.end_offset,
+        previous: previous,
+        base_value: base_value,
+        depth_active: depth_active
+    }
+}
+
+fn Parse(source: str): ParseOutput! {
+    tokens = Scan(source)?
+    if (tokens.len() == 0) {
+        fail {
+            domain: "bootstrap.parser",
+            code: "invalid_token_stream",
+            message: "token stream must end in exactly one EOF|0:0@0..0:0@0"
+        }
+    }
+    if (tokens.len() > 4096) {
+        RejectAt(tokens[0].clone(), "invalid_token_stream", "stage-2 parser accepts at most 4096 tokens")?
+    }
+    cursor = 0
+    while (cursor < tokens.len() - 1) {
+        if (tokens[cursor].kind == "Eof") {
+            RejectAt(tokens[cursor].clone(), "invalid_token_stream", "EOF must be the final token")?
+        }
+        cursor = cursor + 1
+    }
+    if (tokens[tokens.len() - 1].kind != "Eof") {
+        RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "token stream is missing EOF")?
+    }
+
+    cursor = 0
+    depth = 1
+    arena = EmptyArena()
+    operators: [OperatorEntry] = []
+    values: [ValueEntry] = []
+    operator_top = 0
+    value_top = 0
+
+    fn AddNode(kind: str, text: str, int_value: int, span: Span, children: [int]): int! {
+        if (arena.nodes.len() >= 4096) {
+            RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes")?
+        }
+        if (children.len() > 8192 - arena.edges.len()) {
+            RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges")?
+        }
+        first_edge = arena.edges.len()
+        for child in children {
+            if (child <= 0 || child > arena.nodes.len()) {
+                RejectAt(tokens[cursor].clone(), "invalid_node_id", "AST edge references an invalid NodeId")?
+            }
+            arena.edges = arena.edges.push(child)
+        }
+        node = Node {
+            kind: kind,
+            text: text,
+            int_value: int_value,
+            line: span.line,
+            column: span.column,
+            offset: span.offset,
+            end_line: span.end_line,
+            end_column: span.end_column,
+            end_offset: span.end_offset,
+            first_edge: first_edge,
+            edge_count: arena.edges.len() - first_edge
+        }
+        arena.nodes = arena.nodes.push(node)
+        return ok(arena.nodes.len())
+    }
+
+    // This helper is deliberately self-contained. Local helpers share one
+    // captured environment, so calling another local helper from here would
+    // create a rejected local-RC ownership cycle.
+    fn ReduceTop(): null! {
+        if (operator_top == 0 || operators[operator_top - 1].marker != "" || value_top == 0) {
+            RejectAt(tokens[cursor].clone(), "invalid_expression", "operator has no operand")?
+        }
+        operator = operators[operator_top - 1].clone()
+        operator_top = operator.previous
+        right_entry = values[value_top - 1].clone()
+        value_top = right_entry.previous
+        if (operator.unary) {
+            child = arena.nodes[right_entry.node - 1].clone()
+            if (arena.nodes.len() >= 4096) {
+                RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes")?
+            }
+            if (arena.edges.len() >= 8192) {
+                RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges")?
+            }
+            first_edge = arena.edges.len()
+            arena.edges = arena.edges.push(right_entry.node)
+            arena.nodes = arena.nodes.push(Node {
+                kind: "Unary",
+                text: operator.text,
+                int_value: 0,
+                line: operator.line,
+                column: operator.column,
+                offset: operator.offset,
+                end_line: child.end_line,
+                end_column: child.end_column,
+                end_offset: child.end_offset,
+                first_edge: first_edge,
+                edge_count: 1
+            })
+            combined = arena.nodes.len()
+            values = values.push(ValueEntry { node: combined, previous: value_top })
+            value_top = values.len()
+            depth = depth - 1
+            return ok(null)
+        }
+        if (value_top == 0) {
+            RejectAt(tokens[cursor].clone(), "invalid_expression", "binary operator has no left operand")?
+        }
+        left_entry = values[value_top - 1].clone()
+        value_top = left_entry.previous
+        left = arena.nodes[left_entry.node - 1].clone()
+        right = arena.nodes[right_entry.node - 1].clone()
+        if (arena.nodes.len() >= 4096) {
+            RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes")?
+        }
+        if (arena.edges.len() > 8190) {
+            RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges")?
+        }
+        first_edge = arena.edges.len()
+        arena.edges = arena.edges.push(left_entry.node)
+        arena.edges = arena.edges.push(right_entry.node)
+        arena.nodes = arena.nodes.push(Node {
+            kind: "Binary",
+            text: operator.text,
+            int_value: 0,
+            line: left.line,
+            column: left.column,
+            offset: left.offset,
+            end_line: right.end_line,
+            end_column: right.end_column,
+            end_offset: right.end_offset,
+            first_edge: first_edge,
+            edge_count: 2
+        })
+        combined = arena.nodes.len()
+        values = values.push(ValueEntry { node: combined, previous: value_top })
+        value_top = values.len()
+        return ok(null)
+    }
+
+    expect_operand = true
+    steps = 0
+    parsing = true
+    while (parsing) {
+        steps = steps + 1
+        if (steps > 16384) {
+            RejectAt(tokens[cursor].clone(), "work_limit", "stage-2 parser work budget exceeded")?
+        }
+        token = tokens[cursor].clone()
+        closing = token.kind == "RParen" || token.kind == "RBracket"
+        if (closing) {
+            reducing = true
+            while (reducing) {
+                if (operator_top == 0 || operators[operator_top - 1].marker != "") {
+                    reducing = false
+                } else {
+                    ReduceTop()?
+                }
+            }
+            if (operator_top == 0) {
+                RejectAt(token.clone(), "unexpected_token", "closing delimiter has no matching opener")?
+            }
+            marker = operators[operator_top - 1].clone()
+            expected_close = "RParen"
+            if (marker.marker == "array" || marker.marker == "index") { expected_close = "RBracket" }
+            if (token.kind != expected_close) {
+                RejectAt(token.clone(), "unexpected_token", "closing delimiter does not match opener")?
+            }
+            if (expect_operand && (marker.depth_active || (marker.marker != "array" && marker.marker != "call"))) {
+                RejectAt(token.clone(), "unexpected_token", "expected expression before closing delimiter")?
+            }
+            operator_top = marker.previous
+            if (marker.depth_active) { depth = depth - 1 }
+
+            reversed: [int] = []
+            walk = value_top
+            while (walk != marker.base_value) {
+                if (walk == 0) {
+                    RejectAt(token.clone(), "invalid_expression", "delimiter lost its value stack base")?
+                }
+                entry = values[walk - 1].clone()
+                reversed = reversed.push(entry.node)
+                walk = entry.previous
+            }
+            count = reversed.len()
+            if ((marker.marker == "group" || marker.marker == "index") && count != 1) {
+                RejectAt(token.clone(), "invalid_expression", "delimiter requires exactly one expression")?
+            }
+
+            if (marker.marker == "group") {
+                // Parentheses do not change the Rust AST node or its span.
+            } else {
+                children: [int] = []
+                start_node = 0
+                previous_value = marker.base_value
+                if (marker.marker == "call" || marker.marker == "index") {
+                    target_entry = values[marker.base_value - 1].clone()
+                    start_node = target_entry.node
+                    previous_value = target_entry.previous
+                    children = children.push(start_node)
+                }
+                reverse_index = reversed.len()
+                while (reverse_index > 0) {
+                    reverse_index = reverse_index - 1
+                    children = children.push(reversed[reverse_index])
+                }
+                value_top = previous_value
+                end_span = SpanFromToken(token.clone())
+                node = 0
+                if (marker.marker == "array") {
+                    start_span = Span {
+                        line: marker.line,
+                        column: marker.column,
+                        offset: marker.offset,
+                        end_line: marker.end_line,
+                        end_column: marker.end_column,
+                        end_offset: marker.end_offset
+                    }
+                    node = AddNode("Array", "", 0, SpanMerge(start_span, end_span), children)?
+                } else if (marker.marker == "call") {
+                    node = AddNode("Call", "", 0, SpanMerge(Span {
+                        line: arena.nodes[start_node - 1].line,
+                        column: arena.nodes[start_node - 1].column,
+                        offset: arena.nodes[start_node - 1].offset,
+                        end_line: arena.nodes[start_node - 1].end_line,
+                        end_column: arena.nodes[start_node - 1].end_column,
+                        end_offset: arena.nodes[start_node - 1].end_offset
+                    }, end_span), children)?
+                } else {
+                    node = AddNode("Index", "", 0, SpanMerge(Span {
+                        line: arena.nodes[start_node - 1].line,
+                        column: arena.nodes[start_node - 1].column,
+                        offset: arena.nodes[start_node - 1].offset,
+                        end_line: arena.nodes[start_node - 1].end_line,
+                        end_column: arena.nodes[start_node - 1].end_column,
+                        end_offset: arena.nodes[start_node - 1].end_offset
+                    }, end_span), children)?
+                }
+                values = values.push(ValueEntry { node: node, previous: value_top })
+                value_top = values.len()
+            }
+            cursor = cursor + 1
+            expect_operand = false
+        } else if (token.kind == "Eof") {
+            if (expect_operand) {
+                RejectAt(token.clone(), "unexpected_eof", "expected expression")?
+            }
+            while (operator_top != 0 && operators[operator_top - 1].marker == "") {
+                ReduceTop()?
+            }
+            if (operator_top != 0) {
+                RejectAt(token.clone(), "unexpected_eof", "expected closing delimiter")?
+            }
+            parsing = false
+        } else if (expect_operand) {
+            if (token.kind == "Bang" || token.kind == "Minus") {
+                if (depth >= 32) {
+                    RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested")?
+                }
+                depth = depth + 1
+                operators = operators.push(MakeOperator("", token.lexeme.clone(), 7, true, token, operator_top, 0, false))
+                operator_top = operators.len()
+                cursor = cursor + 1
+            } else if (token.kind == "LParen" || token.kind == "LBracket") {
+                marker_kind = "group"
+                expected_close = "RParen"
+                if (token.kind == "LBracket") { marker_kind = "array" expected_close = "RBracket" }
+                active = tokens[cursor + 1].kind != expected_close
+                if (active) {
+                    if (depth >= 32) {
+                        RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested")?
+                    }
+                    depth = depth + 1
+                }
+                operators = operators.push(MakeOperator(marker_kind, "", 0, false, token, operator_top, value_top, active))
+                operator_top = operators.len()
+                cursor = cursor + 1
+            } else {
+                span = SpanFromToken(token.clone())
+                node = 0
+                if (token.kind == "Int") {
+                    node = AddNode("Int", "", token.int_value, span, [])?
+                } else if (token.kind == "Float") {
+                    node = AddNode("Float", token.lexeme, 0, span, [])?
+                } else if (token.kind == "String") {
+                    node = AddNode("String", token.lexeme, 0, span, [])?
+                } else if (token.kind == "TemplateString") {
+                    node = AddNode("TemplateString", token.lexeme, 0, span, [])?
+                } else if (token.kind == "True") {
+                    node = AddNode("Bool", "true", 0, span, [])?
+                } else if (token.kind == "False") {
+                    node = AddNode("Bool", "false", 0, span, [])?
+                } else if (token.kind == "Null") {
+                    node = AddNode("Null", "", 0, span, [])?
+                } else if (token.kind == "Ident") {
+                    node = AddNode("Variable", token.lexeme, 0, span, [])?
+                } else {
+                    RejectAt(token.clone(), "unsupported_expression", "expression form is outside the stage-2 bootstrap subset")?
+                }
+                values = values.push(ValueEntry { node: node, previous: value_top })
+                value_top = values.len()
+                cursor = cursor + 1
+                expect_operand = false
+            }
+        } else if (token.kind == "Comma") {
+            while (operator_top != 0 && operators[operator_top - 1].marker == "") {
+                ReduceTop()?
+            }
+            if (operator_top == 0 || (operators[operator_top - 1].marker != "array" && operators[operator_top - 1].marker != "call")) {
+                RejectAt(token.clone(), "unexpected_token", "comma is only valid in an array or call")?
+            }
+            marker = operators[operator_top - 1].clone()
+            if (value_top == marker.base_value) {
+                RejectAt(token.clone(), "unexpected_token", "expected expression before comma")?
+            }
+            cursor = cursor + 1
+            expect_operand = true
+        } else if (token.kind == "LParen" || token.kind == "LBracket") {
+            marker_kind = "call"
+            expected_close = "RParen"
+            if (token.kind == "LBracket") { marker_kind = "index" expected_close = "RBracket" }
+            active = tokens[cursor + 1].kind != expected_close
+            if (marker_kind == "index" && !active) {
+                RejectAt(tokens[cursor + 1].clone(), "unexpected_token", "expected expression before closing delimiter")?
+            }
+            if (active) {
+                if (depth >= 32) {
+                    RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested")?
+                }
+                depth = depth + 1
+            }
+            operators = operators.push(MakeOperator(marker_kind, "", 0, false, token, operator_top, value_top, active))
+            operator_top = operators.len()
+            cursor = cursor + 1
+            expect_operand = active
+        } else if (token.kind == "Dot" || token.kind == "QuestionDot") {
+            optional = token.kind == "QuestionDot"
+            cursor = cursor + 1
+            field = tokens[cursor].clone()
+            if (field.kind != "Ident") {
+                RejectAt(field.clone(), "unexpected_token", "expected field name after field operator")?
+            }
+            target_entry = values[value_top - 1].clone()
+            value_top = target_entry.previous
+            target = arena.nodes[target_entry.node - 1].clone()
+            merged = SpanMerge(Span {
+                line: target.line, column: target.column, offset: target.offset,
+                end_line: target.end_line, end_column: target.end_column, end_offset: target.end_offset
+            }, SpanFromToken(field.clone()))
+            node = 0
+            if (optional && target.kind == "Index") {
+                unwrapped = AddNode("TryUnwrap", "", 0, merged.clone(), [target_entry.node])?
+                node = AddNode("Field", field.lexeme, 0, merged, [unwrapped])?
+            } else if (optional) {
+                node = AddNode("OptionalField", field.lexeme, 0, merged, [target_entry.node])?
+            } else {
+                node = AddNode("Field", field.lexeme, 0, merged, [target_entry.node])?
+            }
+            values = values.push(ValueEntry { node: node, previous: value_top })
+            value_top = values.len()
+            cursor = cursor + 1
+        } else if (token.kind == "Question") {
+            target_entry = values[value_top - 1].clone()
+            value_top = target_entry.previous
+            target = arena.nodes[target_entry.node - 1].clone()
+            merged = SpanMerge(Span {
+                line: target.line, column: target.column, offset: target.offset,
+                end_line: target.end_line, end_column: target.end_column, end_offset: target.end_offset
+            }, SpanFromToken(token.clone()))
+            node = AddNode("TryUnwrap", "", 0, merged, [target_entry.node])?
+            values = values.push(ValueEntry { node: node, previous: value_top })
+            value_top = values.len()
+            cursor = cursor + 1
+        } else {
+            precedence = 0
+            text = ""
+            if (token.kind == "OrOr") { precedence = 1 text = "||" }
+            if (token.kind == "AndAnd") { precedence = 2 text = "&&" }
+            if (token.kind == "BangEqual") { precedence = 3 text = "!=" }
+            if (token.kind == "EqualEqual") { precedence = 3 text = "==" }
+            if (token.kind == "Less") { precedence = 4 text = "<" }
+            if (token.kind == "LessEqual") { precedence = 4 text = "<=" }
+            if (token.kind == "Greater") { precedence = 4 text = ">" }
+            if (token.kind == "GreaterEqual") { precedence = 4 text = ">=" }
+            if (token.kind == "Minus") { precedence = 5 text = "-" }
+            if (token.kind == "Plus") { precedence = 5 text = "+" }
+            if (token.kind == "Slash") { precedence = 6 text = "/" }
+            if (token.kind == "Star") { precedence = 6 text = "*" }
+            if (token.kind == "Percent") { precedence = 6 text = "%" }
+            if (precedence == 0) {
+                RejectAt(token.clone(), "trailing_token", "expected end of expression")?
+            }
+            reducing = true
+            while (reducing) {
+                if (operator_top == 0 || operators[operator_top - 1].marker != "" || operators[operator_top - 1].precedence < precedence) {
+                    reducing = false
+                } else {
+                    ReduceTop()?
+                }
+            }
+            operators = operators.push(MakeOperator("", text, precedence, false, token, operator_top, 0, false))
+            operator_top = operators.len()
+            cursor = cursor + 1
+            expect_operand = true
+        }
+    }
+
+    if (value_top == 0 || values[value_top - 1].previous != 0) {
+        RejectAt(tokens[cursor].clone(), "invalid_expression", "expression did not reduce to one root")?
+    }
+    root = values[value_top - 1].node
+    // Local helpers capture the arena; returning an owned captured value needs
+    // one explicit bounded clone after parsing, never one clone per token.
+    return ok(ParseOutput { arena: arena.clone(), root: root })
+}
