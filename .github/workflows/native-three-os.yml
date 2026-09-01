@@ -39,11 +39,11 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
-      - name: Check every Cargo target
-        run: cargo check --locked --all-targets
+      - name: Check every workspace Cargo target
+        run: cargo check --locked --workspace --all-targets
 
-      - name: Reject clippy warnings in every Cargo target
-        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Reject clippy warnings in every workspace Cargo target
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Install VS Code extension dependencies from lockfile
         working-directory: editors/vscode-ku
@@ -54,7 +54,7 @@ jobs:
         run: npm test
 
   full-tests:
-    name: ${{ matrix.os }} unfiltered test suite
+    name: ${{ matrix.os }} unfiltered workspace test suite
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -235,6 +235,9 @@ jobs:
       - name: Build Ku CLI
         run: cargo build --locked --release --bin ku
 
+      - name: Build the native TLS C ABI archive
+        run: cargo build --locked --release -p ku-native-tls
+
       - name: Require native PostgreSQL client linking and startup
         shell: bash
         run: |
@@ -265,7 +268,7 @@ jobs:
 
       - name: Run every default test target without stopping at the first failure
         run: >-
-          cargo test --locked --release --no-fail-fast
+          cargo test --locked --release --workspace --no-fail-fast
           -- --nocapture --test-threads=2
 
   native:
