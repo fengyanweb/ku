@@ -111,6 +111,9 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
         "mysql_get_client_info()",
         "KU_MYSQL_LIBRARY_ABI_MISMATCH",
         "client_abi_mismatch",
+        "#if defined(KU_MYSQL_SELECTED_HEADER)",
+        "# include KU_MYSQL_SELECTED_HEADER",
+        "KU_MYSQL_EXPECT_HEADER_FAMILY != KU_MYSQL_HEADER_FAMILY_MARIADB",
     ] {
         assert!(
             generated.contains(required),
@@ -122,6 +125,7 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
         "mysql_query(",
         "ku_mysql_query_params",
         "ku_mysql_connect(",
+        "mysql_options(connection, MYSQL_OPT_RECONNECT",
     ] {
         assert!(
             !generated.contains(forbidden),
@@ -1408,6 +1412,7 @@ int main(void) {
       || fake_atomic_load(&ku_fake_thread_active) != 0
       || fake_atomic_load(&ku_fake_mysql_init_calls) != 1
       || fake_atomic_load(&ku_fake_real_connect_calls) != 1
+      || fake_atomic_load(&ku_fake_reconnect_option_calls) != 0
       || fake_atomic_load(&ku_fake_connections_live) != 0
       || fake_atomic_load(&ku_fake_statements_live) != 0) return 12;
   puts("mysql-abi-match-ok");
@@ -1890,6 +1895,7 @@ int main(void) {
   ku_mysql_thread_shutdown();
   if (fake_atomic_load(&ku_fake_connections_live) != 0
       || fake_atomic_load(&ku_fake_statements_live) != 0
+      || fake_atomic_load(&ku_fake_reconnect_option_calls) != 0
       || fake_atomic_load(&ku_fake_thread_active) != 0
       || fake_atomic_load(&ku_fake_thread_init_calls)
           != fake_atomic_load(&ku_fake_thread_end_calls)) return 21;
@@ -2093,6 +2099,7 @@ static KuFakeAtomicLong ku_fake_connections_opened = 0;
 static KuFakeAtomicLong ku_fake_real_connect_calls = 0;
 static KuFakeAtomicLong ku_fake_fail_real_connect = 0;
 static KuFakeAtomicLong ku_fake_local_infile_disabled = 0;
+static KuFakeAtomicLong ku_fake_reconnect_option_calls = 0;
 static KuFakeAtomicLong ku_fake_statements_live = 0;
 static KuFakeAtomicLong ku_fake_stmt_init_calls = 0;
 static KuFakeAtomicLong ku_fake_stmt_prepare_calls = 0;
@@ -2191,6 +2198,10 @@ void mysql_thread_end(void) {
 }
 int mysql_options(MYSQL* c, enum mysql_option o, const void* v) {
   (void)c;
+  if (o == MYSQL_OPT_RECONNECT) {
+    fake_atomic_add(&ku_fake_reconnect_option_calls, 1);
+    return 1;
+  }
   if (o == MYSQL_OPT_LOCAL_INFILE) {
     if (!v || *(const unsigned int*)v != 0) return 1;
     fake_atomic_add(&ku_fake_local_infile_disabled, 1);

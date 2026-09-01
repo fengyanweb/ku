@@ -7083,7 +7083,8 @@ fn emit_mysql_types(out: &mut String, program: &IrProgram) {
         return;
     }
     out.push_str(concat!(
-        "#if defined(KU_MYSQL_FAKE_CLIENT)\n# include \"mysql.h\"\n",
+        "#if defined(KU_MYSQL_SELECTED_HEADER)\n# include KU_MYSQL_SELECTED_HEADER\n",
+        "#elif defined(KU_MYSQL_FAKE_CLIENT)\n# include \"mysql.h\"\n",
         "#elif defined(__has_include)\n",
         "# if __has_include(<mysql.h>)\n#  include <mysql.h>\n",
         "# elif __has_include(<mysql/mysql.h>)\n#  include <mysql/mysql.h>\n",
@@ -7108,6 +7109,17 @@ fn emit_mysql_types(out: &mut String, program: &IrProgram) {
         "# endif\n",
         "# define KU_MYSQL_HEADER_FAMILY_MARIADB 0\n",
         "# define KU_MYSQL_HEADER_ABI_MAJOR (MYSQL_VERSION_ID / 10000UL)\n",
+        "#endif\n",
+        "#if defined(KU_MYSQL_SELECTED_HEADER) && !defined(KU_MYSQL_EXPECT_HEADER_FAMILY)\n",
+        "# error \"selected MySQL header is missing its client-family contract\"\n",
+        "#elif !defined(KU_MYSQL_SELECTED_HEADER) && defined(KU_MYSQL_EXPECT_HEADER_FAMILY)\n",
+        "# error \"MySQL client-family contract is missing its selected header\"\n",
+        "#elif defined(KU_MYSQL_EXPECT_HEADER_FAMILY)\n",
+        "# if KU_MYSQL_EXPECT_HEADER_FAMILY != 0 && KU_MYSQL_EXPECT_HEADER_FAMILY != 1\n",
+        "#  error \"invalid MySQL client-family contract\"\n",
+        "# elif KU_MYSQL_EXPECT_HEADER_FAMILY != KU_MYSQL_HEADER_FAMILY_MARIADB\n",
+        "#  error \"selected MySQL/MariaDB client library conflicts with the selected development header\"\n",
+        "# endif\n",
         "#endif\n",
         "typedef struct KuMysqlClient KuMysqlClient;\n",
         "typedef struct KuMysqlResult KuMysqlResult;\n",
@@ -7935,12 +7947,14 @@ static MYSQL* ku_mysql_open_connection(
   unsigned int connect_seconds = (connect_ms + 999U) / 1000U;
   unsigned int query_seconds = (query_ms + 999U) / 1000U;
   unsigned int local_infile = 0;
-  KuMysqlBool reconnect = 0;
+  /* Supported Oracle and MariaDB clients initialize automatic reconnect off.
+     Do not call deprecated MYSQL_OPT_RECONNECT even to write false: current
+     Oracle clients warn to stderr for any use of that option. Ku never enables
+     reconnect and treats a broken pooled connection as contaminated instead. */
   if (mysql_options(connection, MYSQL_OPT_CONNECT_TIMEOUT, &connect_seconds) != 0
       || mysql_options(connection, MYSQL_OPT_READ_TIMEOUT, &query_seconds) != 0
       || mysql_options(connection, MYSQL_OPT_WRITE_TIMEOUT, &query_seconds) != 0
       || mysql_options(connection, MYSQL_OPT_LOCAL_INFILE, &local_infile) != 0
-      || mysql_options(connection, MYSQL_OPT_RECONNECT, &reconnect) != 0
       || mysql_options(connection, MYSQL_SET_CHARSET_NAME, "utf8mb4") != 0) {
     mysql_close(connection);
     *error = ku_mysql_error(
