@@ -172,6 +172,43 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
             "unbounded/unsafe PG call: {forbidden}"
         );
     }
+    let client_constructor = generated
+        .split_once("static KuResult_pg_client ku_pg_client(KuObject* config) {")
+        .expect("PG client constructor")
+        .1
+        .split_once("static void ku_pg_client_handoff_available_locked(")
+        .expect("PG client constructor end")
+        .0;
+    assert!(
+        !client_constructor.contains("malloc(")
+            && !client_constructor.contains("calloc(")
+            && !client_constructor.contains("realloc(")
+            && !client_constructor.contains("PQ"),
+        "pg.client(config) must finish all object-shape validation without allocation or libpq access"
+    );
+    let client_open = generated
+        .split_once("static KuResult_pg_client ku_pg_client_open(")
+        .expect("PG client open")
+        .1
+        .split_once("static KuResult_pg_client ku_pg_client(KuObject* config)")
+        .expect("PG client open end")
+        .0;
+    let range_validation = client_open
+        .find("size < 1 || size > 256")
+        .expect("PG client numeric validation");
+    let conninfo_validation = client_open
+        .find("conninfo.len == SIZE_MAX")
+        .expect("PG client conninfo validation");
+    let first_allocation = client_open.find("calloc(").expect("PG client allocation");
+    let first_connection = client_open
+        .find("ku_pg_connect_until(")
+        .expect("PG initial connection");
+    assert!(
+        range_validation < first_allocation
+            && conninfo_validation < first_allocation
+            && first_allocation < first_connection,
+        "PG client configuration must be fully rejected before pool allocation and libpq connection work"
+    );
     assert!(
         !generated.contains("ku_clone_pg_client(client)"),
         "a PG query with an owned params literal must borrow, not clone, its client"
@@ -277,6 +314,7 @@ static void* ku_test_pg_realloc(void*, size_t);
 static void ku_test_pg_free(void*);
 static int ku_test_pg_pool_lock_depth = 0;
 static int ku_test_pg_finishes_while_pool_locked = 0;
+static int ku_test_pg_acquire_calls = 0;
 #define malloc ku_test_pg_malloc
 #define calloc ku_test_pg_calloc
 #define realloc ku_test_pg_realloc
@@ -328,6 +366,10 @@ static int ku_test_pg_finishes_while_pool_locked = 0;
         .replace(
             "static int ku_pg_cond_wait_ms(KuPgCond* cond, KuPgMutex* mutex, unsigned long long timeout_ms) {",
             "static int ku_test_pg_wait_failure = 0;\nstatic int ku_pg_cond_wait_ms(KuPgCond* cond, KuPgMutex* mutex, unsigned long long timeout_ms) { if (ku_test_pg_wait_failure) { ku_test_pg_wait_failure = 0; return -1; }",
+        )
+        .replace(
+            "static int ku_pg_client_acquire(KuPgClient* p, PGconn** out, KuError* err, unsigned long long operation_deadline) {",
+            "static int ku_pg_client_acquire(KuPgClient* p, PGconn** out, KuError* err, unsigned long long operation_deadline) { ku_test_pg_acquire_calls++;",
         );
     harness.push_str("\n#undef malloc\n#undef calloc\n#undef realloc\n#undef free\n");
     harness.push_str(QUERY_STUB);
@@ -911,6 +953,36 @@ static KuObject* pg_config_with_conninfo(KuValue conninfo) {
   ku_object_set(config, text("conninfo"), conninfo);
   return config;
 }
+static int invalid_pg_config_rejected_without_side_effects(KuObject* config) {
+  int before_connect_attempts = connect_attempts, before_starts = starts;
+  int before_finishes = finishes, before_sends = sends, before_clears = clears;
+  int before_single_row_calls = single_row_calls;
+  int before_acquire_calls = ku_test_pg_acquire_calls;
+  int before_allocation_failures = injected_allocation_failures;
+  int before_live_allocations = live_runtime_allocations;
+  size_t before_runtime_bytes = runtime_bytes;
+  fail_runtime_allocation_after = 1;
+  track_runtime_allocations = 1;
+  KuResult_pg_client rejected = ku_pg_client(config);
+  track_runtime_allocations = 0;
+  int valid = !rejected.ok && !rejected.value
+      && equals(rejected.error.domain, "pg")
+      && equals(rejected.error.code, "invalid_config")
+      && rejected.error.domain.storage == KU_STRING_STATIC
+      && rejected.error.code.storage == KU_STRING_STATIC
+      && rejected.error.message.storage == KU_STRING_STATIC
+      && fail_runtime_allocation_after == 1
+      && injected_allocation_failures == before_allocation_failures
+      && live_runtime_allocations == before_live_allocations
+      && runtime_bytes == before_runtime_bytes
+      && connect_attempts == before_connect_attempts && starts == before_starts
+      && finishes == before_finishes && sends == before_sends
+      && clears == before_clears && single_row_calls == before_single_row_calls;
+  valid = valid && ku_test_pg_acquire_calls == before_acquire_calls;
+  fail_runtime_allocation_after = 0;
+  if (!rejected.ok) ku_error_drop(&rejected.error);
+  return valid;
+}
 static PGconn* open_connection(void) {
   KuPgConnectAttempt result = ku_pg_connect_until("hostaddr=127.0.0.1", clock_ms + 10000);
   if (!result.conn) abort();
@@ -1160,32 +1232,35 @@ int main(void) {
   CHECK(error_is(result, "query_error") && sends == before_sends); ku_error_drop(&result.error); close_connection(&conn);
 
   int before_invalid_config_starts = starts;
-  KuResult_pg_client invalid_client = ku_pg_client(0);
-  CHECK(!invalid_client.ok && !invalid_client.value && equals(invalid_client.error.code, "invalid_config"));
-  ku_error_drop(&invalid_client.error);
-  KuObject* invalid_config = pg_config_with_conninfo(ku_v_int(1));
-  invalid_client = ku_pg_client(invalid_config);
-  CHECK(!invalid_client.ok && !invalid_client.value && equals(invalid_client.error.code, "invalid_config"));
-  ku_error_drop(&invalid_client.error); ku_object_drop(invalid_config);
+  CHECK(invalid_pg_config_rejected_without_side_effects(0));
+  KuObject* invalid_config = ku_object_new(0);
+  CHECK(invalid_pg_config_rejected_without_side_effects(invalid_config));
+  ku_object_drop(invalid_config);
+  invalid_config = pg_config_with_conninfo(ku_v_int(1));
+  CHECK(invalid_pg_config_rejected_without_side_effects(invalid_config));
+  ku_object_drop(invalid_config);
   invalid_config = pg_config_with_conninfo(ku_v_str(text("hostaddr=127.0.0.1")));
   ku_object_set(invalid_config, text("unknown"), ku_v_int(1));
-  invalid_client = ku_pg_client(invalid_config);
-  CHECK(!invalid_client.ok && !invalid_client.value && equals(invalid_client.error.code, "invalid_config"));
-  ku_error_drop(&invalid_client.error); ku_object_drop(invalid_config);
+  CHECK(invalid_pg_config_rejected_without_side_effects(invalid_config));
+  ku_object_drop(invalid_config);
   invalid_config = pg_config_with_conninfo(ku_v_str(text("hostaddr=127.0.0.1")));
   ku_object_set(invalid_config, text("max_connections"), ku_v_int(0));
-  invalid_client = ku_pg_client(invalid_config);
-  CHECK(!invalid_client.ok && !invalid_client.value && equals(invalid_client.error.code, "invalid_config"));
-  ku_error_drop(&invalid_client.error); ku_object_drop(invalid_config);
+  CHECK(invalid_pg_config_rejected_without_side_effects(invalid_config));
+  ku_object_drop(invalid_config);
+  invalid_config = pg_config_with_conninfo(ku_v_str(text("hostaddr=127.0.0.1")));
+  ku_object_set(invalid_config, text("query_timeout_ms"), ku_v_str(text("fast")));
+  CHECK(invalid_pg_config_rejected_without_side_effects(invalid_config));
+  ku_object_drop(invalid_config);
   uint8_t embedded_nul[] = { 'h', 'o', 's', 't', 0, 'x' };
   invalid_config = pg_config_with_conninfo(ku_v_str((KuString){ embedded_nul, sizeof(embedded_nul), 0, KU_STRING_STATIC }));
-  invalid_client = ku_pg_client(invalid_config);
-  CHECK(!invalid_client.ok && !invalid_client.value && equals(invalid_client.error.code, "invalid_config")
-      && invalid_client.error.domain.storage == KU_STRING_STATIC && invalid_client.error.code.storage == KU_STRING_STATIC
-      && invalid_client.error.message.storage == KU_STRING_STATIC && starts == before_invalid_config_starts);
-  ku_error_drop(&invalid_client.error); ku_object_drop(invalid_config);
+  CHECK(invalid_pg_config_rejected_without_side_effects(invalid_config)
+      && starts == before_invalid_config_starts);
+  ku_object_drop(invalid_config);
   KuString oversized_conninfo = { (uint8_t*)"x", (size_t)KU_PG_MAX_CONNINFO_BYTES + 1, 0, KU_STRING_STATIC };
-  invalid_client = ku_pg_client_open(oversized_conninfo, 1, 64, 5000, 5000, 30000);
+  invalid_config = pg_config_with_conninfo(ku_v_str(oversized_conninfo));
+  CHECK(invalid_pg_config_rejected_without_side_effects(invalid_config));
+  ku_object_drop(invalid_config);
+  KuResult_pg_client invalid_client = ku_pg_client_open(oversized_conninfo, 1, 64, 5000, 5000, 30000);
   CHECK(!invalid_client.ok && !invalid_client.value && equals(invalid_client.error.code, "invalid_config")
       && starts == before_invalid_config_starts);
   ku_error_drop(&invalid_client.error);
@@ -1208,6 +1283,7 @@ int main(void) {
   KuResult_pg_client opened = ku_pg_client_open(text("hostaddr=127.0.0.1"), 1, 64, 5000, 5000, 30000);
   CHECK(opened.ok); KuPgClient* pool = opened.value; KuArray_str empty_params = {0};
   int before_session_sends = sends, before_session_connects = connect_attempts;
+  int before_session_acquires = ku_test_pg_acquire_calls;
   /* Dialect rules are intentionally separate. PostgreSQL does not treat `#`
      as a line comment, while MySQL executable comments are ordinary nested
      block comments here. Only an explicit top-level control token is blocked. */
@@ -1270,7 +1346,8 @@ int main(void) {
       && sends == before_session_sends && connect_attempts == before_session_connects);
   ku_error_drop(&result.error);
   CHECK(pool->active == 0 && pool->waiters == 0 && !pool->in_use[0]
-      && pool->conns[0] != 0 && !pool->closing);
+      && pool->conns[0] != 0 && !pool->closing
+      && ku_test_pg_acquire_calls == before_session_acquires);
 
   /* Scanner work itself has both a byte cap (validated by the caller) and an
      absolute deadline checked at most 4096 input bytes apart. Exercise long
