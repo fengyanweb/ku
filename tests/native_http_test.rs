@@ -20,7 +20,7 @@ pub mod bounded_process;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -494,9 +494,10 @@ fn read_http_stream(mut stream: TcpStream, timeout: Duration) -> String {
     String::from_utf8_lossy(&response).into_owned()
 }
 
-/// Same methodology as cli_v001's `wait_for_http_response`: connect (retrying
-/// until the server is up), send the request, half-close the write side, then
-/// read the whole response until the server closes.
+/// Connect (retrying until the server is up), send one complete HTTP request,
+/// then read the bounded response. Keep the write side open while reading:
+/// macOS rejects socket-option changes after a write-side shutdown, and HTTP
+/// request framing does not require a half-close.
 fn http_response(address: &str, request: &str, timeout: Duration) -> String {
     http_response_bytes(address, request.as_bytes(), timeout)
 }
@@ -522,7 +523,6 @@ fn http_response_bytes(address: &str, request: &[u8], timeout: Duration) -> Stri
                     thread::sleep(Duration::from_millis(30));
                     continue;
                 }
-                let _ = stream.shutdown(Shutdown::Write);
                 match read_http_stream_bytes_until(&mut stream, deadline) {
                     Ok(response) if !response.is_empty() => {
                         return String::from_utf8_lossy(&response).into_owned();
@@ -755,7 +755,7 @@ fn main(): null! {
     stream
         .write_all(&vec![b'x'; 1_000_000])
         .expect("write peer-close body");
-    let _ = stream.shutdown(Shutdown::Both);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     drop(stream);
     thread::sleep(Duration::from_millis(250));
 
@@ -928,9 +928,6 @@ fn native_http_error_statuses_match_interpreter() {
     fragmented
         .write_all(b"\nfrag")
         .expect("write fragmented delimiter and body");
-    fragmented
-        .shutdown(Shutdown::Write)
-        .expect("half-close fragmented request");
     let fragmented_response = read_http_stream(fragmented, Duration::from_secs(2));
     assert_status(&fragmented_response, "HTTP/1.1 200 OK");
     assert!(
@@ -1236,7 +1233,6 @@ fn native_http_backpressure_matches_interpreter() {
     rejected
         .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .expect("write rejected probe");
-    let _ = rejected.shutdown(Shutdown::Write);
     let rejected_response = read_http_stream(rejected, Duration::from_secs(2));
     assert_status(&rejected_response, "HTTP/1.1 503 Service Unavailable");
 
@@ -1807,7 +1803,6 @@ fn native_handler_timeout_bounds_infinite_finally_and_releases_worker() {
     stuck
         .write_all(b"GET /stuck HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .expect("write infinite-finally request");
-    let _ = stuck.shutdown(Shutdown::Write);
     let stuck_response = read_http_stream(stuck, Duration::from_secs(12));
     assert!(
         !watchdog.timed_out(),
