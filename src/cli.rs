@@ -12651,6 +12651,8 @@ fn main(): null! {
             .expect("write new versioned libpq fixture");
         let archive = dir.join("libpq.a");
         fs::write(&archive, b"static fixture").expect("write static libpq fixture");
+        let canonical_archive =
+            fs::canonicalize(&archive).expect("canonicalize static libpq fixture");
         assert_eq!(
             find_libpq_library(&dir, LibpqLibraryFormat::Linux)
                 .expect("inspect versioned libpq fixture"),
@@ -12669,7 +12671,7 @@ fn main(): null! {
         let err = libpq_library_in_dir(&dir, LibpqLibraryFormat::Linux)
             .expect_err("a static-only libpq directory must fail closed");
         let message = err.to_string();
-        assert!(message.contains(&archive.display().to_string()));
+        assert!(message.contains(&canonical_archive.display().to_string()));
         assert!(message.contains("transitive libraries"));
         assert!(message.contains("shared libpq"));
         assert!(message.contains("link the emitted C yourself"));
