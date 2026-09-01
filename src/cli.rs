@@ -3,16 +3,20 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
         Arc,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
+
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
@@ -40,13 +44,810 @@ const MAX_IMPORT_CLONED_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_IMPORT_EDGES: usize = 16_384;
 const MAX_IMPORT_BINDINGS: usize = 16_384;
 const MAX_RLIB_DIRECTORY_ENTRIES: usize = 16_384;
+const MAX_LIBPQ_LIBRARY_DIRECTORY_ENTRIES: usize = 128;
+const MAX_PINNED_LINK_LIBRARY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_NATIVE_LINK_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_IMPORT_LIBRARY_INSPECTION_BYTES: u64 = 64 * 1024 * 1024;
 const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const C_COMPILER_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
+const NATIVE_LINK_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+const RUSTC_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
+const BUILD_TOOL_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const COMPILER_TARGET_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const BUILD_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const BUILD_PROCESS_CLEANUP_GRACE: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const WINDOWS_BUILD_THREAD_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const MAX_WINDOWS_BUILD_THREAD_SCAN_ENTRIES: usize = 65_536;
+const MAX_BUILD_TOOL_CAPTURE_BYTES: usize = 1024 * 1024;
+const MAX_COMPILER_TARGET_BYTES: usize = 4 * 1024;
+const BUILD_PROCESS_CLEANUP_UNCONFIRMED: &str = "build subprocess cleanup could not be confirmed";
 // Large enough that the MAX_CALL_DEPTH=512 guard trips (a clean Ku runtime
 // error) before the interpreter's own Rust eval recursion overflows the OS
 // thread stack. ~16KB of Rust stack per Ku call frame; 64MB clears 512 with
 // wide margin. Reserved address space on Windows, not committed memory.
 const INTERPRETER_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+fn remaining_build_phase_timeout(
+    deadline: Instant,
+    phase_limit: Duration,
+    phase: &str,
+) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining == Duration::ZERO {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("native link total deadline expired before {phase}"),
+        ));
+    }
+    Ok(remaining.min(phase_limit))
+}
+
+fn run_build_process_bounded(command: &mut Command, timeout: Duration) -> io::Result<ExitStatus> {
+    if timeout == Duration::ZERO {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "build subprocess timeout must be positive",
+        ));
+    }
+    let command_text = format!("{command:?}");
+    command.stdin(Stdio::null());
+    let (mut child, process_tree) = spawn_contained_build_process(command)?;
+    let started = Instant::now();
+    let deadline = started.checked_add(timeout).unwrap_or(started);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if let Err(detail) = process_tree.terminate_descendants() {
+                    return Err(io::Error::other(format!(
+                        "{BUILD_PROCESS_CLEANUP_UNCONFIRMED}: {detail}"
+                    )));
+                }
+                return Ok(status);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = merge_build_cleanup(
+                    process_tree.terminate(&mut child),
+                    reap_build_process(&mut child),
+                );
+                return Err(with_build_cleanup_error(error, cleanup));
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let cleanup = merge_build_cleanup(
+                process_tree.terminate(&mut child),
+                reap_build_process(&mut child),
+            );
+            let cleanup = build_cleanup_suffix(cleanup);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("build subprocess exceeded {timeout:?}: {command_text}{cleanup}"),
+            ));
+        }
+        thread::sleep(BUILD_PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn reap_build_process(child: &mut std::process::Child) -> Result<(), String> {
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(BUILD_PROCESS_CLEANUP_GRACE)
+        .unwrap_or(started);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(BUILD_PROCESS_POLL_INTERVAL);
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                return match child.try_wait() {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err("child was still running after the cleanup grace".to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+            }
+        }
+    }
+}
+
+fn build_cleanup_suffix(cleanup: Result<(), String>) -> String {
+    cleanup.map_or_else(
+        |detail| format!("; {BUILD_PROCESS_CLEANUP_UNCONFIRMED}: {detail}"),
+        |()| String::new(),
+    )
+}
+
+fn with_build_cleanup_error(error: io::Error, cleanup: Result<(), String>) -> io::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(detail) => io::Error::new(
+            error.kind(),
+            format!("{error}; {BUILD_PROCESS_CLEANUP_UNCONFIRMED}: {detail}"),
+        ),
+    }
+}
+
+fn build_cleanup_is_unconfirmed(error: &io::Error) -> bool {
+    error
+        .to_string()
+        .contains(BUILD_PROCESS_CLEANUP_UNCONFIRMED)
+}
+
+fn unique_build_tool_path(label: &str, extension: &str) -> io::Result<PathBuf> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| io::Error::other(format!("secure random failed: {error}")))?;
+    let nonce = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(env::temp_dir().join(format!(
+        ".ku-{label}-{}-{nonce}.{extension}",
+        std::process::id()
+    )))
+}
+
+struct BuildTemporaryPath {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl BuildTemporaryPath {
+    fn new(label: &str, extension: &str) -> io::Result<Self> {
+        Ok(Self {
+            path: unique_build_tool_path(label, extension)?,
+            armed: false,
+        })
+    }
+
+    fn as_path(&self) -> &Path {
+        &self.path
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+}
+
+impl Drop for BuildTemporaryPath {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn run_build_process_capture_stdout(
+    command: &mut Command,
+    timeout: Duration,
+    max_bytes: usize,
+) -> io::Result<(ExitStatus, Vec<u8>)> {
+    if timeout == Duration::ZERO || max_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "captured build subprocess requires positive timeout and output limit",
+        ));
+    }
+    let command_text = format!("{command:?}");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let (mut child, process_tree) = spawn_contained_build_process(command)?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let cleanup = merge_build_cleanup(
+                process_tree.terminate(&mut child),
+                reap_build_process(&mut child),
+            );
+            return Err(with_build_cleanup_error(
+                io::Error::other("captured build subprocess did not expose its stdout pipe"),
+                cleanup,
+            ));
+        }
+    };
+    let (capture_rx, output_limit_exceeded) =
+        match spawn_bounded_build_output_reader(stdout, max_bytes) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let cleanup = merge_build_cleanup(
+                    process_tree.terminate(&mut child),
+                    reap_build_process(&mut child),
+                );
+                return Err(with_build_cleanup_error(error, cleanup));
+            }
+        };
+    let started = Instant::now();
+    let deadline = started.checked_add(timeout).unwrap_or(started);
+    loop {
+        if output_limit_exceeded.load(Ordering::Acquire) {
+            let cleanup = merge_build_cleanup(
+                merge_build_cleanup(
+                    process_tree.terminate(&mut child),
+                    reap_build_process(&mut child),
+                ),
+                receive_bounded_build_output(&capture_rx).map(|_| ()),
+            );
+            let cleanup = build_cleanup_suffix(cleanup);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("build tool output exceeded {max_bytes} bytes: {command_text}{cleanup}"),
+            ));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let descendants = process_tree.terminate_descendants();
+                let captured = receive_bounded_build_output(&capture_rx);
+                if let Err(detail) = merge_build_cleanup(
+                    descendants,
+                    captured.as_ref().map(|_| ()).map_err(Clone::clone),
+                ) {
+                    return Err(io::Error::other(format!(
+                        "{BUILD_PROCESS_CLEANUP_UNCONFIRMED}: {detail}"
+                    )));
+                }
+                let captured = captured.expect("successful capture cleanup has output");
+                if captured.exceeded_limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("build tool output exceeded {max_bytes} bytes: {command_text}"),
+                    ));
+                }
+                return Ok((status, captured.bytes));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = merge_build_cleanup(
+                    merge_build_cleanup(
+                        process_tree.terminate(&mut child),
+                        reap_build_process(&mut child),
+                    ),
+                    receive_bounded_build_output(&capture_rx).map(|_| ()),
+                );
+                return Err(with_build_cleanup_error(error, cleanup));
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let cleanup = merge_build_cleanup(
+                merge_build_cleanup(
+                    process_tree.terminate(&mut child),
+                    reap_build_process(&mut child),
+                ),
+                receive_bounded_build_output(&capture_rx).map(|_| ()),
+            );
+            let cleanup = build_cleanup_suffix(cleanup);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("captured build subprocess exceeded {timeout:?}: {command_text}{cleanup}"),
+            ));
+        }
+        thread::sleep(BUILD_PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+struct BoundedBuildOutput {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+fn spawn_bounded_build_output_reader(
+    mut stdout: std::process::ChildStdout,
+    max_bytes: usize,
+) -> io::Result<(Receiver<io::Result<BoundedBuildOutput>>, Arc<AtomicBool>)> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let exceeded_limit = Arc::new(AtomicBool::new(false));
+    let reader_exceeded_limit = Arc::clone(&exceeded_limit);
+    thread::Builder::new()
+        .name("ku-build-output".to_string())
+        .spawn(move || {
+            let result = (|| -> io::Result<BoundedBuildOutput> {
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve(max_bytes.min(8 * 1024))
+                    .map_err(|error| {
+                        io::Error::other(format!("failed to reserve build output buffer: {error}"))
+                    })?;
+                let mut buffer = [0_u8; 8 * 1024];
+                let mut exceeded = false;
+                loop {
+                    let read = stdout.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    let remaining = max_bytes.saturating_sub(bytes.len());
+                    let kept = remaining.min(read);
+                    bytes.try_reserve(kept).map_err(|error| {
+                        io::Error::other(format!("failed to grow build output buffer: {error}"))
+                    })?;
+                    bytes.extend_from_slice(&buffer[..kept]);
+                    if kept < read {
+                        exceeded = true;
+                        reader_exceeded_limit.store(true, Ordering::Release);
+                    }
+                }
+                Ok(BoundedBuildOutput {
+                    bytes,
+                    exceeded_limit: exceeded,
+                })
+            })();
+            let _ = sender.send(result);
+        })?;
+    Ok((receiver, exceeded_limit))
+}
+
+fn receive_bounded_build_output(
+    receiver: &Receiver<io::Result<BoundedBuildOutput>>,
+) -> Result<BoundedBuildOutput, String> {
+    match receiver.recv_timeout(BUILD_PROCESS_CLEANUP_GRACE) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(format!("stdout reader failed: {error}")),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err("stdout reader was still blocked after the cleanup grace".to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("stdout reader stopped without returning output".to_string())
+        }
+    }
+}
+
+fn merge_build_cleanup(
+    first: Result<(), String>,
+    second: Result<(), String>,
+) -> Result<(), String> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(format!("{first}; {second}")),
+    }
+}
+
+fn terminate_direct_build_child(child: &mut std::process::Child) -> Result<(), String> {
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(kill_error) => match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(format!("failed to terminate build child: {kill_error}")),
+            Err(wait_error) => Err(format!(
+                "failed to terminate build child: {kill_error}; status check failed: {wait_error}"
+            )),
+        },
+    }
+}
+
+fn spawn_contained_build_process(
+    command: &mut Command,
+) -> io::Result<(std::process::Child, BuildProcessTree)> {
+    #[cfg(all(test, windows))]
+    let delay_before_job_attach = command.get_envs().any(|(name, value)| {
+        name == "KU_TEST_DELAY_BUILD_JOB_ATTACH" && value.is_some_and(|value| value == "1")
+    });
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+        // std continues to own argument quoting, environment, cwd, and stdio;
+        // the primary thread cannot execute compiler code before Job assignment.
+        command.creation_flags(CREATE_SUSPENDED);
+    }
+
+    let mut child = command.spawn()?;
+    #[cfg(all(test, windows))]
+    if delay_before_job_attach {
+        // A deterministic regression window: CREATE_SUSPENDED must prevent the
+        // fixture from running even though Job assignment is deliberately late.
+        thread::sleep(Duration::from_millis(150));
+    }
+    match BuildProcessTree::attach(&child) {
+        Ok(process_tree) => {
+            #[cfg(windows)]
+            if let Err(resume_error) = process_tree.resume_suspended_child(&child) {
+                let cleanup = merge_build_cleanup(
+                    process_tree.terminate(&mut child),
+                    reap_build_process(&mut child),
+                );
+                return Err(io::Error::other(format!(
+                    "build subprocess containment failed while resuming its assigned thread: {resume_error}{}",
+                    build_cleanup_suffix(cleanup)
+                )));
+            }
+            Ok((child, process_tree))
+        }
+        Err(attach_error) => {
+            let cleanup = merge_build_cleanup(
+                terminate_direct_build_child(&mut child),
+                reap_build_process(&mut child),
+            );
+            Err(io::Error::other(format!(
+                "build subprocess containment failed: {attach_error}{}",
+                build_cleanup_suffix(cleanup)
+            )))
+        }
+    }
+}
+
+#[cfg(unix)]
+struct BuildProcessTree {
+    process_group: Option<i32>,
+}
+
+#[cfg(unix)]
+impl BuildProcessTree {
+    fn attach(child: &std::process::Child) -> Result<Self, String> {
+        let process_group = i32::try_from(child.id())
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| "child process group could not be represented".to_string())?;
+        Ok(Self {
+            process_group: Some(process_group),
+        })
+    }
+
+    fn terminate(&self, child: &mut std::process::Child) -> Result<(), String> {
+        merge_build_cleanup(
+            self.terminate_descendants(),
+            terminate_direct_build_child(child),
+        )
+    }
+
+    fn terminate_descendants(&self) -> Result<(), String> {
+        let process_group = self
+            .process_group
+            .ok_or_else(|| "child process group could not be represented".to_string())?;
+        // SAFETY: the child was placed in its own process group and the
+        // validated negative pid targets that group only.
+        let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(format!("failed to terminate build process group: {error}"))
+        }
+    }
+}
+
+#[cfg(windows)]
+struct BuildProcessTree {
+    job: Option<BuildWindowsJob>,
+    attach_error: Option<String>,
+}
+
+#[cfg(windows)]
+impl BuildProcessTree {
+    fn attach(child: &std::process::Child) -> Result<Self, String> {
+        BuildWindowsJob::attach(child).map(|job| Self {
+            job: Some(job),
+            attach_error: None,
+        })
+    }
+
+    fn terminate(&self, child: &mut std::process::Child) -> Result<(), String> {
+        merge_build_cleanup(
+            self.terminate_descendants(),
+            terminate_direct_build_child(child),
+        )
+    }
+
+    fn resume_suspended_child(&self, child: &std::process::Child) -> Result<(), String> {
+        self.job
+            .as_ref()
+            .ok_or_else(|| {
+                "Windows Job assignment was unavailable before compiler resume".to_string()
+            })?
+            .resume_suspended_child(child.id())
+    }
+
+    fn terminate_descendants(&self) -> Result<(), String> {
+        if let Some(job) = &self.job {
+            job.terminate()
+        } else {
+            Err(self.attach_error.clone().unwrap_or_else(|| {
+                "Windows Job assignment was unavailable, so descendant cleanup is unconfirmed"
+                    .to_string()
+            }))
+        }
+    }
+}
+
+#[cfg(windows)]
+struct BuildWindowsJob {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+struct BuildWindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for BuildWindowsHandle {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        // SAFETY: each guard is created only for one newly owned Windows handle.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl BuildWindowsJob {
+    fn attach(child: &std::process::Child) -> Result<Self, String> {
+        use std::mem::{size_of, zeroed};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let information_size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+            .map_err(|_| "Windows Job information size overflowed u32".to_string())?;
+        // SAFETY: every pointer is null or points to a correctly sized value
+        // for the duration of the call. The owned handle closes on every path.
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle == 0 {
+                return Err(format!(
+                    "CreateJobObjectW failed: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                information_size,
+            ) == 0
+            {
+                let error = io::Error::last_os_error();
+                CloseHandle(handle);
+                return Err(format!("SetInformationJobObject failed: {error}"));
+            }
+            if AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
+                let error = io::Error::last_os_error();
+                CloseHandle(handle);
+                return Err(format!("AssignProcessToJobObject failed: {error}"));
+            }
+            Ok(Self { handle })
+        }
+    }
+
+    fn terminate(&self) -> Result<(), String> {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject, TerminateJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        // SAFETY: this value owns a valid job handle until Drop.
+        let result = unsafe { TerminateJobObject(self.handle, 1) };
+        if result == 0 {
+            return Err(format!(
+                "TerminateJobObject failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let information_size =
+            u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                .map_err(|_| "Windows Job accounting size overflowed u32".to_string())?;
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(BUILD_PROCESS_CLEANUP_GRACE)
+            .unwrap_or(started);
+        loop {
+            let mut information: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
+            // SAFETY: the buffer matches the requested Job information class.
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.handle,
+                    JobObjectBasicAccountingInformation,
+                    (&mut information as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    information_size,
+                    std::ptr::null_mut(),
+                )
+            };
+            if queried == 0 {
+                return Err(format!(
+                    "QueryInformationJobObject failed after termination: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            if information.ActiveProcesses == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Windows Job still reported {} active build processes after termination",
+                    information.ActiveProcesses
+                ));
+            }
+            thread::sleep(BUILD_PROCESS_POLL_INTERVAL);
+        }
+    }
+
+    fn resume_suspended_child(&self, process_id: u32) -> Result<(), String> {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetProcessIdOfThread, OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION,
+            THREAD_SUSPEND_RESUME,
+        };
+
+        let entry_size = u32::try_from(size_of::<THREADENTRY32>())
+            .map_err(|_| "Windows thread snapshot entry size overflowed u32".to_string())?;
+        let scan_started = Instant::now();
+        let scan_deadline = scan_started
+            .checked_add(WINDOWS_BUILD_THREAD_SCAN_TIMEOUT)
+            .unwrap_or(scan_started);
+        // ToolHelp is synchronous and Windows exposes no cancellation handle
+        // for these calls. Bound the entry count and fail closed after every
+        // syscall returns if total observed elapsed time exceeded the deadline;
+        // this does not claim to preempt a kernel call that itself stalls.
+        // SAFETY: this creates a new snapshot handle, owned by the guard below.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "CreateToolhelp32Snapshot failed before compiler resume: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if Instant::now() >= scan_deadline {
+            return Err("Windows thread snapshot creation exceeded its 5 second bound".to_string());
+        }
+        let snapshot = BuildWindowsHandle(snapshot);
+        let mut entry: THREADENTRY32 = unsafe { zeroed() };
+        entry.dwSize = entry_size;
+        // SAFETY: the snapshot is valid and entry has the required size.
+        if unsafe { Thread32First(snapshot.0, &mut entry) } == 0 {
+            return Err(format!(
+                "Thread32First failed before compiler resume: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if Instant::now() >= scan_deadline {
+            return Err("Windows first thread lookup exceeded its 5 second bound".to_string());
+        }
+        let mut thread_id = None;
+        let mut scanned_entries = 0_usize;
+        loop {
+            scanned_entries += 1;
+            if scanned_entries > MAX_WINDOWS_BUILD_THREAD_SCAN_ENTRIES
+                || Instant::now() >= scan_deadline
+            {
+                return Err(format!(
+                    "suspended compiler thread lookup exceeded its {} entry / {} second bound",
+                    MAX_WINDOWS_BUILD_THREAD_SCAN_ENTRIES,
+                    WINDOWS_BUILD_THREAD_SCAN_TIMEOUT.as_secs()
+                ));
+            }
+            if entry.th32OwnerProcessID == process_id
+                && thread_id.replace(entry.th32ThreadID).is_some()
+            {
+                return Err(
+                    "suspended compiler unexpectedly exposed multiple threads before Job-contained resume"
+                        .to_string(),
+                );
+            }
+            entry.dwSize = entry_size;
+            // SAFETY: the snapshot remains valid and entry size is reset for
+            // every iteration as required by ToolHelp.
+            let next = unsafe { Thread32Next(snapshot.0, &mut entry) };
+            if Instant::now() >= scan_deadline {
+                return Err("Windows thread enumeration exceeded its 5 second bound".to_string());
+            }
+            if next == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    break;
+                }
+                return Err(format!(
+                    "Thread32Next failed before compiler resume: {error}"
+                ));
+            }
+        }
+        let thread_id = thread_id.ok_or_else(|| {
+            "suspended compiler thread was absent from the bounded ToolHelp snapshot".to_string()
+        })?;
+        // SAFETY: OpenThread validates the snapshot-provided id. The handle is
+        // closed by the guard on every path.
+        let thread = unsafe {
+            OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                thread_id,
+            )
+        };
+        if thread == 0 {
+            return Err(format!(
+                "OpenThread failed before compiler resume: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let thread = BuildWindowsHandle(thread);
+        if Instant::now() >= scan_deadline {
+            return Err("Windows compiler thread open exceeded its 5 second bound".to_string());
+        }
+        // SAFETY: the opened handle has query access. Rechecking the owner
+        // narrows the snapshot-to-open thread-id reuse window.
+        let owner = unsafe { GetProcessIdOfThread(thread.0) };
+        if Instant::now() >= scan_deadline {
+            return Err(
+                "Windows compiler thread owner verification exceeded its 5 second bound"
+                    .to_string(),
+            );
+        }
+        if owner != process_id {
+            return Err(format!(
+                "suspended compiler thread owner changed before resume (expected {process_id}, got {owner})"
+            ));
+        }
+        // SAFETY: the thread handle has suspend/resume access. CREATE_SUSPENDED
+        // establishes an exact initial suspend count of one for the primary
+        // thread; every other result fails closed and the Job is terminated.
+        let previous_count = unsafe { ResumeThread(thread.0) };
+        if Instant::now() >= scan_deadline {
+            return Err("Windows compiler thread resume exceeded its 5 second bound".to_string());
+        }
+        if previous_count != 1 {
+            return Err(format!(
+                "ResumeThread returned unexpected suspend count {previous_count}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for BuildWindowsJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        // SAFETY: the handle is owned here and closed exactly once.
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct BuildProcessTree;
+
+#[cfg(not(any(unix, windows)))]
+impl BuildProcessTree {
+    fn attach(_child: &std::process::Child) -> Result<Self, String> {
+        Err("process-tree containment is unavailable on this host".to_string())
+    }
+
+    fn terminate(&self, child: &mut std::process::Child) -> Result<(), String> {
+        merge_build_cleanup(
+            self.terminate_descendants(),
+            terminate_direct_build_child(child),
+        )
+    }
+
+    fn terminate_descendants(&self) -> Result<(), String> {
+        Err("process-tree containment is unavailable on this host".to_string())
+    }
+}
 const HELP: &str = "\
 ku - simple, small, fast language tool
 
@@ -1048,7 +1849,7 @@ fn acquire_build_file_lock_until(
 #[derive(Clone, Copy, Debug)]
 struct RunnerBuildConfig<'a> {
     profile: BuildProfile,
-    target: Option<&'a str>,
+    target: Option<&'a BuildTarget>,
     lto: bool,
     strip: bool,
     verbose: bool,
@@ -1165,7 +1966,7 @@ fn run_build_command(args: &[String]) -> Result<(), KuError> {
                 &plan.output,
                 RunnerBuildConfig {
                     profile: options.profile,
-                    target: plan.target.as_ref().map(|target| target.rust_triple),
+                    target: plan.target.as_ref(),
                     lto: options.lto,
                     strip: options.strip,
                     verbose: options.verbose,
@@ -1529,6 +2330,19 @@ fn resolve_build_target(target: Option<&str>) -> Result<Option<BuildTarget>, KuE
     Ok(Some(target))
 }
 
+fn supported_host_build_target() -> Option<BuildTarget> {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return resolve_build_target(Some("x86_64-linux")).ok().flatten();
+    }
+    if cfg!(all(windows, target_arch = "x86_64")) {
+        return resolve_build_target(Some("x86_64-windows")).ok().flatten();
+    }
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return resolve_build_target(Some("aarch64-darwin")).ok().flatten();
+    }
+    None
+}
+
 fn is_ku_path(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("ku"))
@@ -1801,40 +2615,48 @@ fn build_executable_to(
     config: RunnerBuildConfig<'_>,
 ) -> Result<PathBuf, KuError> {
     check_source_with_dependency_mode(path, source, config.dependency_mode)?;
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            KuError::message(format!(
-                "failed to create output directory '{}': {err}",
-                parent.display()
-            ))
-        })?;
-    }
+    validate_native_output_name(output)?;
+    let output_directory = link_output_directory(output);
+    fs::create_dir_all(output_directory).map_err(|err| {
+        KuError::message(format!(
+            "failed to create output directory '{}': {err}",
+            output_directory.display()
+        ))
+    })?;
+    let output_staging = LinkOutputStaging::create(output)?;
+    let temporary_output = output_staging.path();
     let embedded_path = fs::canonicalize(path)
         .unwrap_or_else(|_| Path::new(path).to_path_buf())
         .to_string_lossy()
         .to_string();
     let rust_source = build_runner_source(&embedded_path, source, config.dependency_mode);
-    let temp_dir = env::temp_dir().join(format!(
-        "ku-build-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|err| KuError::message(format!("failed to create build timestamp: {err}")))?
-            .as_nanos()
-    ));
-    let temp_guard = TempBuildDir::new(temp_dir.clone());
-    fs::create_dir_all(&temp_dir).map_err(|err| {
-        KuError::message(format!(
-            "failed to create build directory {}: {err}",
-            temp_dir.display()
-        ))
+    let temp_guard = TempBuildDir::create_private("runner").map_err(|err| {
+        KuError::message(format!("failed to create private build directory: {err}"))
     })?;
+    let temp_dir = temp_guard.path().to_path_buf();
     let runner = temp_dir.join("runner.rs");
-    fs::write(&runner, rust_source).map_err(|err| {
+    let mut runner_options = fs::OpenOptions::new();
+    runner_options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        runner_options.mode(0o600);
+    }
+    let mut runner_file = runner_options.open(&runner).map_err(|err| {
         KuError::message(format!(
-            "failed to write build runner {}: {err}",
+            "failed to create private build runner {}: {err}",
             runner.display()
         ))
     })?;
+    runner_file
+        .write_all(rust_source.as_bytes())
+        .map_err(|err| {
+            KuError::message(format!(
+                "failed to write build runner {}: {err}",
+                runner.display()
+            ))
+        })?;
+    drop(runner_file);
 
     let exe_dir = env::current_exe()
         .map_err(|err| KuError::message(format!("failed to locate ku executable: {err}")))?
@@ -1858,14 +2680,14 @@ fn build_executable_to(
         .arg("--extern")
         .arg(format!("ku={}", lib.display()))
         .arg("-o")
-        .arg(output);
+        .arg(temporary_output);
     for deps in &dependency_dirs {
         command
             .arg("-L")
             .arg(format!("dependency={}", deps.display()));
     }
     if let Some(target) = config.target {
-        command.arg("--target").arg(target);
+        command.arg("--target").arg(target.rust_triple);
     }
     if let Some(opt_level) = config.profile.rustc_opt_level() {
         command.arg("-C").arg(format!("opt-level={opt_level}"));
@@ -1880,15 +2702,22 @@ fn build_executable_to(
     if config.verbose {
         println!("rustc command: {command:?}");
     }
-    let status = command
-        .status()
-        .map_err(|err| KuError::message(format!("failed to run rustc for ku build: {err}")))?;
+    let status = match run_build_process_bounded(&mut command, RUSTC_PROCESS_TIMEOUT) {
+        Ok(status) => status,
+        Err(err) => {
+            return Err(KuError::message(format!(
+                "failed to run bounded rustc for ku build: {err}"
+            )));
+        }
+    };
     temp_guard.cleanup();
     if !status.success() {
         return Err(KuError::message(format!(
             "ku build failed: rustc exited with {status}\nhelp: make sure Rust is installed and libku.rlib plus its dependency directory match the selected target"
         )));
     }
+    let verified = validate_runner_output_candidate(temporary_output, config.target)?;
+    install_verified_link_output(verified, &output_staging)?;
     Ok(output.to_path_buf())
 }
 
@@ -1975,8 +2804,12 @@ impl CSourceFeatures {
         Ok(Self {
             winsock: text.contains("#include <winsock2.h>"),
             pthreads: text.contains("#include <pthread.h>"),
-            libpq: text.contains("#pragma comment(lib, \"libpq.lib\")"),
-            libmysql: text.contains("#pragma comment(lib, \"libmysql.lib\")"),
+            libpq: text
+                .lines()
+                .any(|line| line == "#define KU_FEATURE_LIBPQ 1"),
+            libmysql: text
+                .lines()
+                .any(|line| line == "#define KU_FEATURE_LIBMYSQL 1"),
         })
     }
 }
@@ -1997,76 +2830,138 @@ fn validate_c_target_features(
     Ok(())
 }
 
-fn libmysql_library_in(dir: &Path) -> Option<PathBuf> {
-    [
-        "libmysql.lib",
-        "libmysqlclient.so",
-        "libmysqlclient.dylib",
-        "libmysqlclient.a",
-        "libmariadb.so",
-        "libmariadb.dylib",
-        "libmariadb.a",
-    ]
-    .into_iter()
-    .map(|name| dir.join(name))
-    .find(|path| path.is_file())
-}
-
 /// Locate a host libmysqlclient/MariaDB client library. `KU_MYSQL_LIB` is the
 /// explicit portable contract; Windows also discovers conventional installs.
-fn detect_libmysql_dir() -> Option<PathBuf> {
-    if let Ok(dir) = env::var("KU_MYSQL_LIB") {
-        let dir = PathBuf::from(dir);
-        if libmysql_library_in(&dir).is_some() {
-            return Some(dir);
-        }
+/// Selection remains deferred until the compiler ABI is known.
+fn explicit_libmysql_directory(
+    configured: Option<OsString>,
+) -> Result<Option<LibmysqlDirectorySnapshot>, KuError> {
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    if configured.is_empty() {
+        return Err(KuError::message(
+            "KU_MYSQL_LIB is set but empty\nhelp: set it to an absolute, dedicated directory containing the target-compatible shared/import MySQL client library",
+        ));
+    }
+    let configured = PathBuf::from(configured);
+    if !configured.is_absolute() {
+        return Err(KuError::message(format!(
+            "KU_MYSQL_LIB must name an absolute directory, got '{}'",
+            configured.display()
+        )));
+    }
+    let dir = fs::canonicalize(&configured).map_err(|error| {
+        KuError::message(format!(
+            "failed to resolve KU_MYSQL_LIB directory '{}': {error}",
+            configured.display()
+        ))
+    })?;
+    if !path_is_plain_directory(&dir) {
+        return Err(KuError::message(format!(
+            "KU_MYSQL_LIB must name a plain directory, got '{}'",
+            configured.display()
+        )));
+    }
+    snapshot_libmysql_directory(&dir)?.map_or_else(
+        || {
+            Err(KuError::message(format!(
+                "KU_MYSQL_LIB directory '{}' changed while being inspected; refusing to fall back",
+                configured.display()
+            )))
+        },
+        |snapshot| Ok(Some(snapshot)),
+    )
+}
+
+fn detect_libmysql_directory() -> Result<Option<LibmysqlDirectorySnapshot>, KuError> {
+    if let Some(snapshot) = explicit_libmysql_directory(env::var_os("KU_MYSQL_LIB"))? {
+        return Ok(Some(snapshot));
     }
     for base in [r"C:\Program Files\MySQL", r"D:\Program Files\MySQL"] {
         if let Ok(entries) = fs::read_dir(base) {
             let mut dirs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path().join("lib"))
-                .filter(|lib| lib.join("libmysql.lib").exists())
+                .take(MAX_LIBPQ_LIBRARY_DIRECTORY_ENTRIES)
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().join("lib"))
+                .filter(|dir| path_is_plain_directory(dir))
                 .collect();
             sort_install_dirs_by_version(&mut dirs);
-            if let Some(dir) = dirs.pop() {
-                return Some(dir);
+            while let Some(dir) = dirs.pop() {
+                let dir = fs::canonicalize(&dir).map_err(|error| {
+                    KuError::message(format!(
+                        "failed to canonicalize discovered MySQL library directory '{}': {error}",
+                        dir.display()
+                    ))
+                })?;
+                if let Some(snapshot) = snapshot_libmysql_directory(&dir)? {
+                    if find_libmysql_library_in_snapshot(&snapshot, LibpqLibraryFormat::WindowsMsvc)
+                        .is_some()
+                    {
+                        return Ok(Some(snapshot));
+                    }
+                }
             }
         }
     }
-    None
+    Ok(None)
 }
 
 fn mysql_header_in(dir: &Path) -> bool {
-    dir.join("mysql.h").is_file()
-        || dir.join("mysql").join("mysql.h").is_file()
-        || dir.join("mariadb").join("mysql.h").is_file()
+    path_is_plain_regular_file(&dir.join("mysql.h"))
+        || path_is_plain_regular_file(&dir.join("mysql").join("mysql.h"))
+        || path_is_plain_regular_file(&dir.join("mariadb").join("mysql.h"))
 }
 
 /// MYSQL_BIND is a versioned public struct and must come from the matching
 /// development header. Never synthesize its layout in generated C.
-fn detect_libmysql_include_dir(library_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(dir) = env::var("KU_MYSQL_INCLUDE") {
+fn explicit_libmysql_include_dir(configured: Option<OsString>) -> Result<Option<PathBuf>, KuError> {
+    if let Some(dir) = configured {
         let dir = PathBuf::from(dir);
-        if mysql_header_in(&dir) {
-            return Some(dir);
+        if !dir.is_absolute() || !path_is_plain_directory(&dir) || !mysql_header_in(&dir) {
+            return Err(KuError::message(format!(
+                "KU_MYSQL_INCLUDE must name an absolute plain directory containing mysql.h, got '{}'",
+                dir.display()
+            )));
         }
+        return fs::canonicalize(&dir).map(Some).map_err(|error| {
+            KuError::message(format!(
+                "failed to canonicalize KU_MYSQL_INCLUDE '{}': {error}",
+                dir.display()
+            ))
+        });
+    }
+    Ok(None)
+}
+
+fn detect_libmysql_include_dir(library_dir: Option<&Path>) -> Result<Option<PathBuf>, KuError> {
+    if let Some(dir) = explicit_libmysql_include_dir(env::var_os("KU_MYSQL_INCLUDE"))? {
+        return Ok(Some(dir));
     }
     if let Some(root) = library_dir.and_then(Path::parent) {
         for candidate in [root.join("include"), root.join("include").join("mysql")] {
-            if mysql_header_in(&candidate) {
-                return Some(candidate);
+            if path_is_plain_directory(&candidate) && mysql_header_in(&candidate) {
+                return fs::canonicalize(&candidate).map(Some).map_err(|error| {
+                    KuError::message(format!(
+                        "failed to canonicalize MySQL include directory '{}': {error}",
+                        candidate.display()
+                    ))
+                });
             }
         }
+        return Err(KuError::message(format!(
+            "MySQL library directory '{}' has no matching sibling include/mysql.h\nhelp: set KU_MYSQL_INCLUDE to the absolute include directory from the same client installation",
+            library_dir.expect("library root exists").display()
+        )));
     }
-    [
+    Ok([
         PathBuf::from("/usr/include/mysql"),
         PathBuf::from("/usr/include/mariadb"),
         PathBuf::from("/usr/local/include/mysql"),
         PathBuf::from("/usr/local/include/mariadb"),
     ]
     .into_iter()
-    .find(|candidate| mysql_header_in(candidate))
+    .find(|candidate| path_is_plain_directory(candidate) && mysql_header_in(candidate)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2089,33 +2984,6 @@ impl LibpqLibraryPlatform {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LibpqArchitecture {
-    X86_64,
-    Aarch64,
-    Other,
-}
-
-impl LibpqArchitecture {
-    fn host() -> Self {
-        match env::consts::ARCH {
-            "x86_64" => Self::X86_64,
-            "aarch64" => Self::Aarch64,
-            _ => Self::Other,
-        }
-    }
-
-    fn from_rust_triple(triple: &str) -> Self {
-        if triple.starts_with("x86_64-") {
-            Self::X86_64
-        } else if triple.starts_with("aarch64-") {
-            Self::Aarch64
-        } else {
-            Self::Other
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LibpqLibraryFormat {
     WindowsMsvc,
     WindowsMingw,
@@ -2123,36 +2991,14 @@ enum LibpqLibraryFormat {
     Darwin,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LibpqLinkTarget {
-    platform: LibpqLibraryPlatform,
-    architecture: LibpqArchitecture,
-    allow_host_discovery: bool,
-}
-
-fn libpq_link_target(target: Option<&BuildTarget>) -> LibpqLinkTarget {
-    let host_platform = LibpqLibraryPlatform::host();
-    let host_architecture = LibpqArchitecture::host();
-    let platform = match target {
-        None => host_platform,
+fn libpq_link_platform(target: Option<&BuildTarget>) -> LibpqLibraryPlatform {
+    match target {
+        None => LibpqLibraryPlatform::host(),
         Some(target) if target.is_windows => LibpqLibraryPlatform::Windows,
         Some(target) if target.rust_triple.ends_with("-apple-darwin") => {
             LibpqLibraryPlatform::Darwin
         }
         Some(_) => LibpqLibraryPlatform::Linux,
-    };
-    let architecture = target
-        .map(|target| LibpqArchitecture::from_rust_triple(target.rust_triple))
-        .unwrap_or(host_architecture);
-    LibpqLinkTarget {
-        platform,
-        architecture,
-        // pg_config and conventional installation directories describe both the
-        // host OS and host architecture. Any mismatch must use an explicitly
-        // supplied KU_PG_LIB directory or let the target compiler resolve `-lpq`
-        // from its sysroot.
-        allow_host_discovery: target.is_none()
-            || (platform == host_platform && architecture == host_architecture),
     }
 }
 
@@ -2191,6 +3037,52 @@ fn libpq_library_format(
     }
 }
 
+fn windows_libpq_format_from_target(target: &str) -> Result<LibpqLibraryFormat, KuError> {
+    let target = target.to_ascii_lowercase();
+    if target.contains("windows-gnu") || target.contains("mingw") {
+        return Ok(LibpqLibraryFormat::WindowsMingw);
+    }
+    if target.contains("windows-msvc") {
+        return Ok(LibpqLibraryFormat::WindowsMsvc);
+    }
+    Err(KuError::message(format!(
+        "Windows clang reported unsupported target triple '{target}'\nhelp: set KU_CC to clang with an explicit x86_64 windows-msvc or windows-gnu target",
+    )))
+}
+
+fn libpq_library_format_for_compiler(
+    platform: LibpqLibraryPlatform,
+    candidate: &CCompilerCandidate,
+    target: Option<&BuildTarget>,
+    probed_clang_target: Option<&str>,
+) -> Result<LibpqLibraryFormat, KuError> {
+    let default = libpq_library_format(platform, candidate);
+    if platform == LibpqLibraryPlatform::Windows {
+        if let Some(declared_target) = compiler_declared_target(candidate)? {
+            return windows_libpq_format_from_target(declared_target);
+        }
+        if target.is_some() {
+            return Ok(match candidate.kind {
+                CCompilerKind::Clang => LibpqLibraryFormat::WindowsMsvc,
+                CCompilerKind::ZigCc => LibpqLibraryFormat::WindowsMingw,
+                CCompilerKind::Preconfigured => default,
+            });
+        }
+    }
+    let unqualified_host_clang = platform == LibpqLibraryPlatform::Windows
+        && target.is_none()
+        && candidate.kind == CCompilerKind::Clang;
+    if !unqualified_host_clang {
+        return Ok(default);
+    }
+    let reported = probed_clang_target.ok_or_else(|| {
+        KuError::message(
+            "Windows clang ABI could not be determined\nhelp: set KU_CC to clang with an explicit --target ending in windows-msvc or windows-gnu",
+        )
+    })?;
+    windows_libpq_format_from_target(reported)
+}
+
 fn numeric_library_version(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -2198,19 +3090,445 @@ fn numeric_library_version(value: &str) -> bool {
             .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-/// Rank linkable libpq filenames for deterministic directory discovery. Unix
+fn libpq_library_version(name: &str, format: LibpqLibraryFormat) -> Option<&str> {
+    match format {
+        LibpqLibraryFormat::Linux => name.strip_prefix("libpq.so."),
+        LibpqLibraryFormat::Darwin => name
+            .strip_prefix("libpq.")
+            .and_then(|value| value.strip_suffix(".dylib")),
+        LibpqLibraryFormat::WindowsMsvc | LibpqLibraryFormat::WindowsMingw => None,
+    }
+}
+
+fn normalize_numeric_component(part: &str) -> &str {
+    let trimmed = part.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0"
+    } else {
+        trimmed
+    }
+}
+
+fn compare_numeric_dotted(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_parts = left.split('.');
+    let mut right_parts = right.split('.');
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (Some(left), Some(right)) => {
+                let left = normalize_numeric_component(left);
+                let right = normalize_numeric_component(right);
+                let order = left.len().cmp(&right.len()).then_with(|| left.cmp(right));
+                if order != std::cmp::Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (None, None) => return std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkLibraryIdentity {
+    identity_high: u64,
+    identity_low: u64,
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+fn same_open_link_library_contents(
+    left: &LinkLibraryIdentity,
+    right: &LinkLibraryIdentity,
+) -> bool {
+    left.identity_high == right.identity_high
+        && left.identity_low == right.identity_low
+        && left.length == right.length
+        && left.modified == right.modified
+}
+
+#[derive(Debug, Clone)]
+struct PinnedLinkLibrary {
+    path: PathBuf,
+    identity: LinkLibraryIdentity,
+    handle: Arc<fs::File>,
+}
+
+struct StagedLinkLibrary {
+    _directory: TempBuildDir,
+    path: PathBuf,
+}
+
+impl StagedLinkLibrary {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl PinnedLinkLibrary {
+    fn capture(path: &Path, library: &str) -> Result<Self, KuError> {
+        let canonical = fs::canonicalize(path).map_err(|error| {
+            KuError::message(format!(
+                "failed to resolve selected {library} library '{}': {error}",
+                path.display()
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(&canonical).map_err(|error| {
+            KuError::message(format!(
+                "failed to inspect selected {library} library '{}': {error}",
+                canonical.display()
+            ))
+        })?;
+        if !is_plain_regular_file(&metadata) || metadata.len() == 0 {
+            return Err(KuError::message(format!(
+                "selected {library} library '{}' must resolve to a non-empty plain regular file",
+                path.display()
+            )));
+        }
+        let file = fs::File::open(&canonical).map_err(|error| {
+            KuError::message(format!(
+                "failed to open selected {library} library '{}': {error}",
+                canonical.display()
+            ))
+        })?;
+        let identity = link_library_identity(&file).map_err(|error| {
+            KuError::message(format!(
+                "failed to identify selected {library} library '{}': {error}",
+                canonical.display()
+            ))
+        })?;
+        if identity.length > MAX_PINNED_LINK_LIBRARY_BYTES {
+            return Err(KuError::message(format!(
+                "selected {library} library '{}' exceeds the {MAX_PINNED_LINK_LIBRARY_BYTES}-byte link-input limit",
+                canonical.display()
+            )));
+        }
+        Ok(Self {
+            path: canonical,
+            identity,
+            handle: Arc::new(file),
+        })
+    }
+
+    fn has_ar_archive_magic(&self, library: &str) -> Result<bool, KuError> {
+        let mut file = self.handle.try_clone().map_err(|error| {
+            KuError::message(format!(
+                "failed to inspect selected {library} library '{}': {error}",
+                self.path.display()
+            ))
+        })?;
+        file.seek(SeekFrom::Start(0)).map_err(|error| {
+            KuError::message(format!(
+                "failed to inspect selected {library} library '{}': {error}",
+                self.path.display()
+            ))
+        })?;
+        let mut magic = [0u8; 8];
+        match file.read_exact(&mut magic) {
+            Ok(()) => Ok(matches!(&magic, b"!<arch>\n" | b"!<thin>\n")),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(error) => Err(KuError::message(format!(
+                "failed to inspect selected {library} library '{}': {error}",
+                self.path.display()
+            ))),
+        }
+    }
+
+    fn stage_for_link(&self, library: &str) -> Result<StagedLinkLibrary, KuError> {
+        let before = link_library_identity(&self.handle).map_err(|error| {
+            KuError::message(format!(
+                "failed to re-identify selected {library} library '{}': {error}",
+                self.path.display()
+            ))
+        })?;
+        if !same_open_link_library_contents(&before, &self.identity) || before.length == 0 {
+            return Err(KuError::message(format!(
+                "selected {library} library '{}' changed before its private link copy; refusing to fall back",
+                self.path.display()
+            )));
+        }
+        if before.length > MAX_PINNED_LINK_LIBRARY_BYTES {
+            return Err(KuError::message(format!(
+                "selected {library} library '{}' exceeds the {MAX_PINNED_LINK_LIBRARY_BYTES}-byte link-input limit",
+                self.path.display()
+            )));
+        }
+
+        let directory = TempBuildDir::create_private("link-library").map_err(|error| {
+            KuError::message(format!(
+                "failed to create private {library} link-input directory: {error}"
+            ))
+        })?;
+        let file_name = self.path.file_name().ok_or_else(|| {
+            KuError::message(format!(
+                "selected {library} library '{}' has no file name",
+                self.path.display()
+            ))
+        })?;
+        let staged_path = directory.path().join(file_name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut staged = options.open(&staged_path).map_err(|error| {
+            KuError::message(format!(
+                "failed to reserve private {library} link input '{}': {error}",
+                staged_path.display()
+            ))
+        })?;
+        let mut source = self.handle.try_clone().map_err(|error| {
+            KuError::message(format!(
+                "failed to duplicate selected {library} library handle '{}': {error}",
+                self.path.display()
+            ))
+        })?;
+        source.seek(SeekFrom::Start(0)).map_err(|error| {
+            KuError::message(format!(
+                "failed to rewind selected {library} library '{}': {error}",
+                self.path.display()
+            ))
+        })?;
+
+        let mut source_digest = Sha256::new();
+        let mut remaining = before.length;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining != 0 {
+            let chunk = usize::try_from(remaining.min(buffer.len() as u64))
+                .expect("bounded link-copy chunk fits usize");
+            source.read_exact(&mut buffer[..chunk]).map_err(|error| {
+                KuError::message(format!(
+                    "selected {library} library '{}' changed while creating its private link copy: {error}",
+                    self.path.display()
+                ))
+            })?;
+            staged.write_all(&buffer[..chunk]).map_err(|error| {
+                KuError::message(format!(
+                    "failed to write private {library} link input '{}': {error}",
+                    staged_path.display()
+                ))
+            })?;
+            source_digest.update(&buffer[..chunk]);
+            remaining -= chunk as u64;
+        }
+        let mut trailing = [0u8; 1];
+        if source.read(&mut trailing).map_err(|error| {
+            KuError::message(format!(
+                "failed to finish reading selected {library} library '{}': {error}",
+                self.path.display()
+            ))
+        })? != 0
+        {
+            return Err(KuError::message(format!(
+                "selected {library} library '{}' grew while creating its private link copy",
+                self.path.display()
+            )));
+        }
+        staged.flush().map_err(|error| {
+            KuError::message(format!(
+                "failed to flush private {library} link input '{}': {error}",
+                staged_path.display()
+            ))
+        })?;
+        drop(staged);
+
+        let after = link_library_identity(&self.handle).map_err(|error| {
+            KuError::message(format!(
+                "failed to re-identify selected {library} library '{}': {error}",
+                self.path.display()
+            ))
+        })?;
+        if !same_open_link_library_contents(&after, &before) {
+            return Err(KuError::message(format!(
+                "selected {library} library '{}' changed while creating its private link copy",
+                self.path.display()
+            )));
+        }
+
+        let mut reopened = fs::File::open(&staged_path).map_err(|error| {
+            KuError::message(format!(
+                "failed to reopen private {library} link input '{}': {error}",
+                staged_path.display()
+            ))
+        })?;
+        let staged_metadata = reopened.metadata().map_err(|error| {
+            KuError::message(format!(
+                "failed to inspect private {library} link input '{}': {error}",
+                staged_path.display()
+            ))
+        })?;
+        if !staged_metadata.is_file() || staged_metadata.len() != before.length {
+            return Err(KuError::message(format!(
+                "private {library} link input '{}' failed its size verification",
+                staged_path.display()
+            )));
+        }
+        let mut staged_digest = Sha256::new();
+        let mut verified = 0u64;
+        loop {
+            let read = reopened.read(&mut buffer).map_err(|error| {
+                KuError::message(format!(
+                    "failed to verify private {library} link input '{}': {error}",
+                    staged_path.display()
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            verified = verified.checked_add(read as u64).ok_or_else(|| {
+                KuError::message(format!(
+                    "private {library} link input '{}' exceeds its verified size",
+                    staged_path.display()
+                ))
+            })?;
+            if verified > before.length {
+                return Err(KuError::message(format!(
+                    "private {library} link input '{}' grew during verification",
+                    staged_path.display()
+                )));
+            }
+            staged_digest.update(&buffer[..read]);
+        }
+        if verified != before.length || staged_digest.finalize() != source_digest.finalize() {
+            return Err(KuError::message(format!(
+                "private {library} link input '{}' failed its content verification",
+                staged_path.display()
+            )));
+        }
+
+        Ok(StagedLinkLibrary {
+            _directory: directory,
+            path: staged_path,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn link_library_identity(file: &fs::File) -> io::Result<LinkLibraryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened library is not a regular file",
+        ));
+    }
+    Ok(LinkLibraryIdentity {
+        identity_high: metadata.dev(),
+        identity_low: metadata.ino(),
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+#[cfg(windows)]
+fn link_library_identity(file: &fs::File) -> io::Result<LinkLibraryIdentity> {
+    use std::{
+        mem::MaybeUninit,
+        os::windows::io::{AsRawHandle, RawHandle},
+    };
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    struct FileInformation {
+        attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(handle: RawHandle, information: *mut FileInformation) -> i32;
+    }
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened library is not a regular file",
+        ));
+    }
+    let mut information = MaybeUninit::<FileInformation>::uninit();
+    // SAFETY: the file owns a valid handle and Windows initializes the complete
+    // structure when GetFileInformationByHandle succeeds.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the preceding call returned success.
+    let information = unsafe { information.assume_init() };
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if information.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened library is a Windows reparse point",
+        ));
+    }
+    Ok(LinkLibraryIdentity {
+        identity_high: u64::from(information.volume_serial_number),
+        identity_low: (u64::from(information.file_index_high) << 32)
+            | u64::from(information.file_index_low),
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn link_library_identity(file: &fs::File) -> io::Result<LinkLibraryIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened library is not a regular file",
+        ));
+    }
+    Ok(LinkLibraryIdentity {
+        identity_high: 0,
+        identity_low: 0,
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn canonical_target_is_static_archive(library: &PinnedLinkLibrary) -> bool {
+    library
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".a"))
+}
+
+/// Rank linkable libpq filenames in an explicit `KU_PG_LIB` directory. Unix
 /// installations may expose only the runtime SONAME (for example `libpq.so.5`),
 /// while development packages normally add the unversioned `libpq.so` symlink.
+/// On Windows, configuring the conventional `libpq.lib` filename is an explicit
+/// caller assertion that it is an import library rather than a static archive.
 fn libpq_library_name_priority(name: &str, format: LibpqLibraryFormat) -> Option<usize> {
     match format {
-        LibpqLibraryFormat::WindowsMsvc => name.eq_ignore_ascii_case("libpq.lib").then_some(0),
+        LibpqLibraryFormat::WindowsMsvc => {
+            if name.eq_ignore_ascii_case("libpqdll.lib") {
+                Some(0)
+            } else if name.eq_ignore_ascii_case("libpq.lib") {
+                Some(1)
+            } else {
+                None
+            }
+        }
         LibpqLibraryFormat::WindowsMingw => {
             if name.eq_ignore_ascii_case("libpq.dll.a") {
                 Some(0)
-            } else if name.eq_ignore_ascii_case("libpq.lib") {
-                // COFF import libraries are accepted by lld and modern MinGW
-                // linkers. Prefer the GNU-named archive when both are present.
-                Some(1)
             } else {
                 None
             }
@@ -2240,100 +3558,839 @@ fn libpq_library_name_priority(name: &str, format: LibpqLibraryFormat) -> Option
 }
 
 /// Return an existing shared/import library (or a symlink to one), never merely
-/// a caller-provided directory. Passing the selected file directly to Unix
-/// linkers also supports runtime-only directories that contain `libpq.so.N`
-/// without an unversioned `libpq.so` linker name. Static archives are
-/// deliberately excluded because their transitive dependency closure is not
-/// portable across libpq builds.
-fn find_libpq_library(dir: &Path, format: LibpqLibraryFormat) -> Option<PathBuf> {
-    let mut candidates = fs::read_dir(dir)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_file() {
+/// a caller-provided directory. Passing the selected file directly to the
+/// target linker also makes that linker the authority for linkable structure
+/// and architecture instead of duplicating partial ELF/Mach-O/COFF parsers here.
+/// Static Unix archives are deliberately excluded because their transitive
+/// dependency closure is not portable across libpq builds.
+#[derive(Debug)]
+struct LibpqSnapshotFile {
+    name: String,
+    library: PinnedLinkLibrary,
+}
+
+#[derive(Debug)]
+struct LibpqDirectorySnapshot {
+    dir: PathBuf,
+    files: Vec<LibpqSnapshotFile>,
+    static_archive: Option<PathBuf>,
+}
+
+fn known_libpq_directory_entry(name: &str) -> bool {
+    name == "libpq.a"
+        || [
+            LibpqLibraryFormat::WindowsMsvc,
+            LibpqLibraryFormat::WindowsMingw,
+            LibpqLibraryFormat::Linux,
+            LibpqLibraryFormat::Darwin,
+        ]
+        .into_iter()
+        .any(|format| libpq_library_name_priority(name, format).is_some())
+}
+
+fn snapshot_libpq_directory(dir: &Path) -> Result<Option<LibpqDirectorySnapshot>, KuError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(KuError::message(format!(
+                "failed to inspect libpq directory '{}': {error}",
+                dir.display()
+            )))
+        }
+    };
+    let mut files = Vec::new();
+    let mut static_archive = None;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_LIBPQ_LIBRARY_DIRECTORY_ENTRIES {
+            return Err(KuError::message(format!(
+                "libpq directory '{}' exceeds the {MAX_LIBPQ_LIBRARY_DIRECTORY_ENTRIES}-entry discovery limit\nhelp: set KU_PG_LIB to a small dedicated directory containing only the target-compatible shared/import libpq library",
+                dir.display()
+            )));
+        }
+        let entry = entry.map_err(|error| {
+            KuError::message(format!(
+                "failed to inspect an entry in libpq directory '{}': {error}",
+                dir.display()
+            ))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !known_libpq_directory_entry(name) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            KuError::message(format!(
+                "failed to inspect libpq directory entry '{}': {error}",
+                entry.path().display()
+            ))
+        })?;
+        if !file_type.is_file() && !file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if name == "libpq.a" {
+            static_archive = Some(path.clone());
+        }
+        let library = PinnedLinkLibrary::capture(&path, "libpq")?;
+        if canonical_target_is_static_archive(&library) && !name.eq_ignore_ascii_case("libpq.dll.a")
+        {
+            static_archive = Some(library.path.clone());
+        }
+        files.push(LibpqSnapshotFile {
+            name: name.to_string(),
+            library,
+        });
+    }
+    Ok(Some(LibpqDirectorySnapshot {
+        dir: dir.to_path_buf(),
+        files,
+        static_archive,
+    }))
+}
+
+fn find_libpq_library_in_snapshot(
+    snapshot: &LibpqDirectorySnapshot,
+    format: LibpqLibraryFormat,
+) -> Option<PinnedLinkLibrary> {
+    let mut candidates = snapshot
+        .files
+        .iter()
+        .filter_map(|file| {
+            let priority = libpq_library_name_priority(&file.name, format)?;
+            if matches!(
+                format,
+                LibpqLibraryFormat::Linux | LibpqLibraryFormat::Darwin
+            ) && canonical_target_is_static_archive(&file.library)
+            {
                 return None;
             }
-            let name = entry.file_name();
-            let name = name.to_str()?;
-            let priority = libpq_library_name_priority(name, format)?;
-            Some((priority, name.len(), name.to_string(), path))
+            Some((priority, file.name.len(), &file.name, &file.library))
         })
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| (left.0, left.1, &left.2).cmp(&(right.0, right.1, &right.2)));
-    candidates.into_iter().next().map(|(_, _, _, path)| path)
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| {
+                match (
+                    libpq_library_version(left.2, format),
+                    libpq_library_version(right.2, format),
+                ) {
+                    // Prefer the newest runtime SONAME when an unversioned
+                    // development symlink is unavailable.
+                    (Some(left), Some(right)) => compare_numeric_dotted(right, left),
+                    _ => std::cmp::Ordering::Equal,
+                }
+            })
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(right.2))
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, _, _, library)| library.clone())
 }
 
-fn libpq_dir_has_supported_library(
-    dir: &Path,
-    format: LibpqLibraryFormat,
-) -> Result<bool, KuError> {
-    if find_libpq_library(dir, format).is_some() {
-        return Ok(true);
-    }
-    let static_archive = dir.join("libpq.a");
-    if static_archive.is_file() {
-        return Err(KuError::message(format!(
-            "cannot automatically link static libpq archive '{}': its target-specific transitive libraries cannot be inferred portably\nhelp: install a target-compatible shared libpq in KU_PG_LIB, or link the emitted C yourself with the complete dependency list reported by your libpq installation",
-            static_archive.display()
-        )));
-    }
-    Ok(false)
+#[cfg(test)]
+fn find_libpq_library(dir: &Path, format: LibpqLibraryFormat) -> Result<Option<PathBuf>, KuError> {
+    Ok(snapshot_libpq_directory(dir)?
+        .as_ref()
+        .and_then(|snapshot| find_libpq_library_in_snapshot(snapshot, format))
+        .map(|library| library.path))
 }
 
-/// Locate a directory containing a libpq library for `format`. `KU_PG_LIB` is
-/// always considered; host-derived `pg_config` and conventional install paths
-/// are considered only when `allow_host_discovery` is true. Missing paths and
-/// directories without an actual target-format library are ignored.
-fn detect_libpq_dir(
+fn static_libpq_error(static_archive: &Path) -> KuError {
+    KuError::message(format!(
+        "cannot link static libpq archive '{}': its target-specific transitive libraries cannot be inferred portably\nhelp: install a target-compatible shared libpq in KU_PG_LIB, or link the emitted C yourself with the complete dependency list reported by your libpq installation",
+        static_archive.display()
+    ))
+}
+
+fn libpq_library_in_snapshot(
+    snapshot: &LibpqDirectorySnapshot,
     format: LibpqLibraryFormat,
-    allow_host_discovery: bool,
-) -> Result<Option<PathBuf>, KuError> {
-    if let Ok(dir) = env::var("KU_PG_LIB") {
-        let dir = PathBuf::from(dir);
-        if libpq_dir_has_supported_library(&dir, format)? {
-            return Ok(Some(dir));
+) -> Result<Option<PinnedLinkLibrary>, KuError> {
+    if let Some(library) = find_libpq_library_in_snapshot(snapshot, format) {
+        if matches!(
+            format,
+            LibpqLibraryFormat::Linux | LibpqLibraryFormat::Darwin
+        ) && library.has_ar_archive_magic("libpq")?
+        {
+            return Err(static_libpq_error(&library.path));
         }
+        return Ok(Some(library));
     }
-    if !allow_host_discovery {
-        return Ok(None);
-    }
-    if let Ok(output) = Command::new("pg_config").arg("--libdir").output() {
-        if output.status.success() {
-            let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !dir.is_empty() {
-                let dir = PathBuf::from(dir);
-                if libpq_dir_has_supported_library(&dir, format)? {
-                    return Ok(Some(dir));
-                }
-            }
-        }
-    }
-    for candidate in [
-        r"C:\Program Files\PostgreSQL",
-        r"D:\Program Files\PostgreSQL",
-    ] {
-        if let Ok(entries) = fs::read_dir(candidate) {
-            // Prefer the highest version directory that actually has libpq.lib.
-            let mut dirs = Vec::new();
-            for entry in entries.flatten() {
-                let lib = entry.path().join("lib");
-                if libpq_dir_has_supported_library(&lib, format)? {
-                    dirs.push(lib);
-                }
-            }
-            sort_install_dirs_by_version(&mut dirs);
-            if let Some(dir) = dirs.pop() {
-                return Ok(Some(dir));
-            }
-        }
+    if let Some(static_archive) = &snapshot.static_archive {
+        return Err(static_libpq_error(static_archive));
     }
     Ok(None)
 }
 
+#[cfg(test)]
+fn libpq_library_in_dir(
+    dir: &Path,
+    format: LibpqLibraryFormat,
+) -> Result<Option<PathBuf>, KuError> {
+    let Some(snapshot) = snapshot_libpq_directory(dir)? else {
+        return Ok(None);
+    };
+    libpq_library_in_snapshot(&snapshot, format).map(|library| library.map(|library| library.path))
+}
+
+fn explicit_libpq_directory(
+    configured: Option<OsString>,
+) -> Result<Option<LibpqDirectorySnapshot>, KuError> {
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    if configured.is_empty() {
+        return Err(KuError::message(
+            "KU_PG_LIB is set but empty\nhelp: set it to an absolute, dedicated directory containing the target-compatible shared/import libpq library",
+        ));
+    }
+    let configured = PathBuf::from(configured);
+    if !configured.is_absolute() {
+        return Err(KuError::message(format!(
+            "KU_PG_LIB must be an absolute directory, got '{}'",
+            configured.display()
+        )));
+    }
+    let dir = fs::canonicalize(&configured).map_err(|error| {
+        KuError::message(format!(
+            "failed to resolve KU_PG_LIB directory '{}': {error}",
+            configured.display()
+        ))
+    })?;
+    if !dir.is_dir() {
+        return Err(KuError::message(format!(
+            "KU_PG_LIB must name a directory, got '{}'",
+            configured.display()
+        )));
+    }
+    snapshot_libpq_directory(&dir)?.map_or_else(
+        || {
+            Err(KuError::message(format!(
+                "KU_PG_LIB directory '{}' changed while being inspected; refusing to fall back",
+                configured.display()
+            )))
+        },
+        |snapshot| Ok(Some(snapshot)),
+    )
+}
+
+fn libpq_library_from_explicit_directory(
+    snapshot: &LibpqDirectorySnapshot,
+    format: LibpqLibraryFormat,
+) -> Result<PinnedLinkLibrary, KuError> {
+    match libpq_library_in_snapshot(snapshot, format)? {
+        Some(library) => Ok(library),
+        None => Err(KuError::message(format!(
+            "KU_PG_LIB directory '{}' does not contain a target-compatible shared/import libpq library",
+            snapshot.dir.display()
+        ))),
+    }
+}
+
+#[cfg(test)]
+fn explicit_libpq_library(
+    configured: Option<OsString>,
+    format: LibpqLibraryFormat,
+) -> Result<Option<PathBuf>, KuError> {
+    let Some(snapshot) = explicit_libpq_directory(configured)? else {
+        return Ok(None);
+    };
+    libpq_library_from_explicit_directory(&snapshot, format).map(|library| Some(library.path))
+}
+
+fn libmysql_library_version(name: &str, format: LibpqLibraryFormat) -> Option<&str> {
+    match format {
+        LibpqLibraryFormat::Linux => ["libmysqlclient.so.", "libmariadb.so."]
+            .into_iter()
+            .find_map(|prefix| name.strip_prefix(prefix)),
+        LibpqLibraryFormat::Darwin => {
+            ["libmysqlclient.", "libmariadb."]
+                .into_iter()
+                .find_map(|prefix| {
+                    name.strip_prefix(prefix)
+                        .and_then(|value| value.strip_suffix(".dylib"))
+                })
+        }
+        LibpqLibraryFormat::WindowsMsvc | LibpqLibraryFormat::WindowsMingw => None,
+    }
+}
+
+fn libmysql_library_name_priority(name: &str, format: LibpqLibraryFormat) -> Option<usize> {
+    match format {
+        LibpqLibraryFormat::WindowsMsvc => {
+            if name.eq_ignore_ascii_case("libmysql.lib") {
+                Some(0)
+            } else if name.eq_ignore_ascii_case("libmariadb.lib") {
+                Some(1)
+            } else {
+                None
+            }
+        }
+        LibpqLibraryFormat::WindowsMingw => {
+            if name.eq_ignore_ascii_case("libmysql.dll.a") {
+                Some(0)
+            } else if name.eq_ignore_ascii_case("libmariadb.dll.a") {
+                Some(1)
+            } else {
+                None
+            }
+        }
+        LibpqLibraryFormat::Linux => {
+            if name == "libmysqlclient.so" {
+                Some(0)
+            } else if name
+                .strip_prefix("libmysqlclient.so.")
+                .is_some_and(numeric_library_version)
+            {
+                Some(1)
+            } else if name == "libmariadb.so" {
+                Some(2)
+            } else if name
+                .strip_prefix("libmariadb.so.")
+                .is_some_and(numeric_library_version)
+            {
+                Some(3)
+            } else {
+                None
+            }
+        }
+        LibpqLibraryFormat::Darwin => {
+            if name == "libmysqlclient.dylib" {
+                Some(0)
+            } else if name
+                .strip_prefix("libmysqlclient.")
+                .and_then(|value| value.strip_suffix(".dylib"))
+                .is_some_and(numeric_library_version)
+            {
+                Some(1)
+            } else if name == "libmariadb.dylib" {
+                Some(2)
+            } else if name
+                .strip_prefix("libmariadb.")
+                .and_then(|value| value.strip_suffix(".dylib"))
+                .is_some_and(numeric_library_version)
+            {
+                Some(3)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn known_libmysql_directory_entry(name: &str) -> bool {
+    ["libmysqlclient.a", "libmysql.a", "libmariadb.a"].contains(&name)
+        || [
+            LibpqLibraryFormat::WindowsMsvc,
+            LibpqLibraryFormat::WindowsMingw,
+            LibpqLibraryFormat::Linux,
+            LibpqLibraryFormat::Darwin,
+        ]
+        .into_iter()
+        .any(|format| libmysql_library_name_priority(name, format).is_some())
+}
+
+fn mysql_client_family_from_canonical_path(path: &Path) -> Result<MysqlClientFamily, KuError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            KuError::message(format!(
+                "selected MySQL client library '{}' has no portable canonical file name",
+                path.display()
+            ))
+        })?;
+    let lower = name.to_ascii_lowercase();
+    let matches_stem = |stem: &str| {
+        dynamic_library_basename_matches(&lower, stem)
+            || [".lib", ".dll.a", ".a"]
+                .iter()
+                .any(|suffix| lower == format!("{stem}{suffix}"))
+    };
+    let mariadb = ["libmariadbclient", "libmariadb", "mariadbclient", "mariadb"]
+        .iter()
+        .any(|stem| matches_stem(stem));
+    let mysql = ["libmysqlclient", "libmysql", "mysqlclient"]
+        .iter()
+        .any(|stem| matches_stem(stem));
+    if mariadb {
+        Ok(MysqlClientFamily::Mariadb)
+    } else if mysql {
+        Ok(MysqlClientFamily::Mysql)
+    } else {
+        Err(KuError::message(format!(
+            "cannot determine MySQL/MariaDB family from canonical library target '{}'\nhelp: point KU_MYSQL_LIB at a library whose resolved file name identifies libmysqlclient/libmysql or libmariadb; Ku does not trust a symlink alias as ABI evidence",
+            path.display()
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct LibmysqlSnapshotFile {
+    name: String,
+    library: PinnedLinkLibrary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MysqlClientFamily {
+    Mysql,
+    Mariadb,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlRuntimeDependency {
+    family: MysqlClientFamily,
+    loader_name: Vec<u8>,
+}
+
+fn mysql_runtime_dependency(
+    library: &PinnedLinkLibrary,
+    format: LibpqLibraryFormat,
+) -> Result<MysqlRuntimeDependency, KuError> {
+    let before = link_library_identity(&library.handle).map_err(|error| {
+        KuError::message(format!(
+            "failed to identify selected MySQL client library '{}': {error}",
+            library.path.display()
+        ))
+    })?;
+    if !same_open_link_library_contents(&before, &library.identity) {
+        return Err(KuError::message(format!(
+            "selected MySQL client library '{}' changed before loader identity inspection",
+            library.path.display()
+        )));
+    }
+    let mut file = library.handle.try_clone().map_err(|error| {
+        KuError::message(format!(
+            "failed to inspect selected MySQL client library '{}': {error}",
+            library.path.display()
+        ))
+    })?;
+    let loader_name = match format {
+        LibpqLibraryFormat::Linux => read_elf_dynamic_metadata(&mut file, before.length)
+            .map_err(|error| {
+                KuError::message(format!(
+                    "selected MySQL client library '{}' has invalid ELF loader metadata: {error}",
+                    library.path.display()
+                ))
+            })?
+            .soname
+            .ok_or_else(|| {
+                KuError::message(format!(
+                    "selected MySQL client library '{}' has no bounded DT_SONAME; refusing a private staging path runtime dependency",
+                    library.path.display()
+                ))
+            })?,
+        LibpqLibraryFormat::Darwin => read_macho_dynamic_metadata(&mut file, before.length)
+            .map_err(|error| {
+                KuError::message(format!(
+                    "selected MySQL client library '{}' has invalid Mach-O loader metadata: {error}",
+                    library.path.display()
+                ))
+            })?
+            .install_name
+            .ok_or_else(|| {
+                KuError::message(format!(
+                    "selected MySQL client library '{}' has no bounded LC_ID_DYLIB install name; refusing a private staging path runtime dependency",
+                    library.path.display()
+                ))
+            })?,
+        LibpqLibraryFormat::WindowsMsvc | LibpqLibraryFormat::WindowsMingw => {
+            read_database_import_loader_name(
+                &mut file,
+                before.length,
+                &[DynamicLibraryFamily::Mysql, DynamicLibraryFamily::Mariadb],
+                "MySQL/MariaDB",
+            )
+            .map_err(|error| {
+                KuError::message(format!(
+                    "selected MySQL client import library '{}' is invalid: {error}",
+                    library.path.display()
+                ))
+            })?
+        }
+    };
+    let after = link_library_identity(&library.handle).map_err(|error| {
+        KuError::message(format!(
+            "failed to re-identify selected MySQL client library '{}': {error}",
+            library.path.display()
+        ))
+    })?;
+    if !same_open_link_library_contents(&after, &before) {
+        return Err(KuError::message(format!(
+            "selected MySQL client library '{}' changed during loader identity inspection",
+            library.path.display()
+        )));
+    }
+    if dynamic_dependency_references_private_staging(&loader_name) {
+        return Err(KuError::message(format!(
+            "selected MySQL client library '{}' records a private Ku staging path as its loader identity",
+            library.path.display()
+        )));
+    }
+    let loader_family = if dynamic_library_matches(&loader_name, DynamicLibraryFamily::Mariadb) {
+        MysqlClientFamily::Mariadb
+    } else if dynamic_library_matches(&loader_name, DynamicLibraryFamily::Mysql) {
+        MysqlClientFamily::Mysql
+    } else {
+        return Err(KuError::message(format!(
+            "selected MySQL client library '{}' has an unsupported loader identity '{}'",
+            library.path.display(),
+            String::from_utf8_lossy(&loader_name)
+        )));
+    };
+    let canonical_family = mysql_client_family_from_canonical_path(&library.path)?;
+    if loader_family != canonical_family {
+        return Err(KuError::message(format!(
+            "selected MySQL client library '{}' has conflicting canonical and loader families",
+            library.path.display()
+        )));
+    }
+    Ok(MysqlRuntimeDependency {
+        family: loader_family,
+        loader_name,
+    })
+}
+
+fn read_database_import_loader_name(
+    file: &mut fs::File,
+    file_len: u64,
+    families: &[DynamicLibraryFamily],
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    if !(8..=MAX_IMPORT_LIBRARY_INSPECTION_BYTES).contains(&file_len) {
+        return Err(format!(
+            "Windows import library size is outside the 8..={MAX_IMPORT_LIBRARY_INSPECTION_BYTES} byte inspection bound"
+        ));
+    }
+    let size = usize::try_from(file_len)
+        .map_err(|_| "Windows import library does not fit this host".to_string())?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|error| format!("failed to reserve bounded import library bytes: {error}"))?;
+    bytes.resize(size, 0);
+    read_binary_at(file, 0, &mut bytes, "Windows import library")?;
+    if !matches!(bytes.get(..8), Some(b"!<arch>\n" | b"!<thin>\n")) {
+        return Err(
+            "expected a COFF import archive, not a static or renamed raw library".to_string(),
+        );
+    }
+    let mut names = Vec::<Vec<u8>>::new();
+    for value in bytes.split(|byte| *byte == 0) {
+        let basename = value
+            .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+            .next()
+            .unwrap_or(value);
+        let Some(lower) = std::str::from_utf8(basename)
+            .ok()
+            .map(str::to_ascii_lowercase)
+        else {
+            continue;
+        };
+        if !lower.ends_with(".dll")
+            || !families
+                .iter()
+                .any(|family| dynamic_library_matches(lower.as_bytes(), *family))
+        {
+            continue;
+        }
+        if !names.iter().any(|name| name == lower.as_bytes()) {
+            names.push(lower.into_bytes());
+            if names.len() > 1 {
+                return Err(format!(
+                    "Windows import library names multiple {label} loader targets"
+                ));
+            }
+        }
+    }
+    names
+        .pop()
+        .ok_or_else(|| format!("Windows import library has no bounded {label} DLL target"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LibpqRuntimeDependency {
+    loader_name: Vec<u8>,
+}
+
+fn libpq_runtime_dependency(
+    library: &PinnedLinkLibrary,
+    format: LibpqLibraryFormat,
+) -> Result<LibpqRuntimeDependency, KuError> {
+    let before = link_library_identity(&library.handle).map_err(|error| {
+        KuError::message(format!(
+            "failed to identify selected libpq library '{}': {error}",
+            library.path.display()
+        ))
+    })?;
+    if !same_open_link_library_contents(&before, &library.identity) {
+        return Err(KuError::message(format!(
+            "selected libpq library '{}' changed before loader identity inspection",
+            library.path.display()
+        )));
+    }
+    let mut file = library.handle.try_clone().map_err(|error| {
+        KuError::message(format!(
+            "failed to inspect selected libpq library '{}': {error}",
+            library.path.display()
+        ))
+    })?;
+    let loader_name = match format {
+        LibpqLibraryFormat::Linux => read_elf_dynamic_metadata(&mut file, before.length)
+            .map_err(|error| {
+                KuError::message(format!(
+                    "selected libpq library '{}' has invalid ELF loader metadata: {error}",
+                    library.path.display()
+                ))
+            })?
+            .soname
+            .ok_or_else(|| {
+                KuError::message(format!(
+                    "selected libpq library '{}' has no bounded DT_SONAME; refusing a private staging path runtime dependency",
+                    library.path.display()
+                ))
+            })?,
+        LibpqLibraryFormat::Darwin => read_macho_dynamic_metadata(&mut file, before.length)
+            .map_err(|error| {
+                KuError::message(format!(
+                    "selected libpq library '{}' has invalid Mach-O loader metadata: {error}",
+                    library.path.display()
+                ))
+            })?
+            .install_name
+            .ok_or_else(|| {
+                KuError::message(format!(
+                    "selected libpq library '{}' has no bounded LC_ID_DYLIB install name; refusing a private staging path runtime dependency",
+                    library.path.display()
+                ))
+            })?,
+        LibpqLibraryFormat::WindowsMsvc | LibpqLibraryFormat::WindowsMingw => {
+            read_database_import_loader_name(
+                &mut file,
+                before.length,
+                &[DynamicLibraryFamily::Libpq],
+                "libpq",
+            )
+            .map_err(|error| {
+                KuError::message(format!(
+                    "selected libpq import library '{}' is invalid: {error}",
+                    library.path.display()
+                ))
+            })?
+        }
+    };
+    let after = link_library_identity(&library.handle).map_err(|error| {
+        KuError::message(format!(
+            "failed to re-identify selected libpq library '{}': {error}",
+            library.path.display()
+        ))
+    })?;
+    if !same_open_link_library_contents(&after, &before) {
+        return Err(KuError::message(format!(
+            "selected libpq library '{}' changed during loader identity inspection",
+            library.path.display()
+        )));
+    }
+    if dynamic_dependency_references_private_staging(&loader_name)
+        || !dynamic_library_matches(&loader_name, DynamicLibraryFamily::Libpq)
+    {
+        return Err(KuError::message(format!(
+            "selected libpq library '{}' has an unsafe or unsupported loader identity '{}'",
+            library.path.display(),
+            String::from_utf8_lossy(&loader_name)
+        )));
+    }
+    let canonical_name = library
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| {
+            KuError::message(format!(
+                "selected libpq library '{}' has no portable canonical file name",
+                library.path.display()
+            ))
+        })?;
+    let canonical_matches = match format {
+        LibpqLibraryFormat::Linux | LibpqLibraryFormat::Darwin => {
+            dynamic_library_matches(canonical_name.as_bytes(), DynamicLibraryFamily::Libpq)
+        }
+        LibpqLibraryFormat::WindowsMsvc => {
+            matches!(canonical_name.as_str(), "libpqdll.lib" | "libpq.lib")
+        }
+        LibpqLibraryFormat::WindowsMingw => canonical_name == "libpq.dll.a",
+    };
+    if !canonical_matches {
+        return Err(KuError::message(format!(
+            "selected libpq library '{}' has a canonical target name that conflicts with its requested ABI",
+            library.path.display()
+        )));
+    }
+    Ok(LibpqRuntimeDependency { loader_name })
+}
+
+#[derive(Debug, Clone)]
+struct SelectedMysqlLibrary {
+    library: PinnedLinkLibrary,
+}
+
+#[derive(Debug)]
+struct LibmysqlDirectorySnapshot {
+    dir: PathBuf,
+    files: Vec<LibmysqlSnapshotFile>,
+    static_archives: Vec<PathBuf>,
+}
+
+fn snapshot_libmysql_directory(dir: &Path) -> Result<Option<LibmysqlDirectorySnapshot>, KuError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(KuError::message(format!(
+                "failed to inspect MySQL client library directory '{}': {error}",
+                dir.display()
+            )))
+        }
+    };
+    let mut files = Vec::new();
+    let mut static_archives = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_LIBPQ_LIBRARY_DIRECTORY_ENTRIES {
+            return Err(KuError::message(format!(
+                "MySQL client library directory '{}' exceeds the {MAX_LIBPQ_LIBRARY_DIRECTORY_ENTRIES}-entry discovery limit\nhelp: set KU_MYSQL_LIB to a small dedicated directory containing only target-compatible shared/import client libraries",
+                dir.display()
+            )));
+        }
+        let entry = entry.map_err(|error| {
+            KuError::message(format!(
+                "failed to inspect an entry in MySQL client library directory '{}': {error}",
+                dir.display()
+            ))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !known_libmysql_directory_entry(name) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            KuError::message(format!(
+                "failed to inspect MySQL client library entry '{}': {error}",
+                entry.path().display()
+            ))
+        })?;
+        if !file_type.is_file() && !file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let library = PinnedLinkLibrary::capture(&path, "MySQL client")?;
+        mysql_client_family_from_canonical_path(&library.path)?;
+        if (name.ends_with(".a") && !name.ends_with(".dll.a"))
+            || (canonical_target_is_static_archive(&library) && !name.ends_with(".dll.a"))
+        {
+            static_archives.push(library.path.clone());
+        }
+        files.push(LibmysqlSnapshotFile {
+            name: name.to_string(),
+            library,
+        });
+    }
+    static_archives.sort();
+    static_archives.dedup();
+    Ok(Some(LibmysqlDirectorySnapshot {
+        dir: dir.to_path_buf(),
+        files,
+        static_archives,
+    }))
+}
+
+fn find_libmysql_library_in_snapshot(
+    snapshot: &LibmysqlDirectorySnapshot,
+    format: LibpqLibraryFormat,
+) -> Option<SelectedMysqlLibrary> {
+    let mut candidates = snapshot
+        .files
+        .iter()
+        .filter_map(|file| {
+            let priority = libmysql_library_name_priority(&file.name, format)?;
+            if matches!(
+                format,
+                LibpqLibraryFormat::Linux | LibpqLibraryFormat::Darwin
+            ) && canonical_target_is_static_archive(&file.library)
+            {
+                return None;
+            }
+            Some((priority, file.name.len(), &file.name, file))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| {
+                match (
+                    libmysql_library_version(left.2, format),
+                    libmysql_library_version(right.2, format),
+                ) {
+                    (Some(left), Some(right)) => compare_numeric_dotted(right, left),
+                    _ => std::cmp::Ordering::Equal,
+                }
+            })
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(right.2))
+    });
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, _, _, file)| SelectedMysqlLibrary {
+            library: file.library.clone(),
+        })
+}
+
+fn static_libmysql_error(static_archive: &Path) -> KuError {
+    KuError::message(format!(
+        "cannot link static MySQL client archive '{}': its target-specific transitive libraries cannot be inferred portably\nhelp: install a target-compatible shared MySQL/MariaDB client library in KU_MYSQL_LIB, or link the emitted C yourself with the complete dependency list",
+        static_archive.display()
+    ))
+}
+
+fn libmysql_library_from_directory(
+    snapshot: &LibmysqlDirectorySnapshot,
+    format: LibpqLibraryFormat,
+) -> Result<SelectedMysqlLibrary, KuError> {
+    if let Some(library) = find_libmysql_library_in_snapshot(snapshot, format) {
+        if matches!(
+            format,
+            LibpqLibraryFormat::Linux | LibpqLibraryFormat::Darwin
+        ) && library.library.has_ar_archive_magic("MySQL client")?
+        {
+            return Err(static_libmysql_error(&library.library.path));
+        }
+        return Ok(library);
+    }
+    if let Some(static_archive) = snapshot.static_archives.first() {
+        return Err(static_libmysql_error(static_archive));
+    }
+    Err(KuError::message(format!(
+        "MySQL client library directory '{}' does not contain a target-compatible shared/import library",
+        snapshot.dir.display()
+    )))
+}
+
+fn missing_shared_libmysql_error() -> KuError {
+    KuError::message(
+        "native MySQL linking requires an exact shared/import client library\nhelp: set KU_MYSQL_LIB to an absolute, dedicated directory containing the target-compatible shared/import library; Ku does not fall back to an unverified compiler search path",
+    )
+}
+
 /// Sort installation library directories by the numeric components in their
-/// parent directory name. Plain lexical sorting makes PostgreSQL 9.6 appear
-/// newer than PostgreSQL 17 and can link an ABI-incompatible import library.
+/// parent directory name. Plain lexical sorting can select an older client ABI.
 fn sort_install_dirs_by_version(dirs: &mut [PathBuf]) {
     dirs.sort_by(|left, right| {
         let key = |path: &Path| {
@@ -2362,174 +4419,261 @@ fn validate_libpq_link_mode(needs_libpq: bool, static_link: bool) -> Result<(), 
     Ok(())
 }
 
-static NEXT_LINK_OUTPUT: AtomicU64 = AtomicU64::new(0);
-const LINK_STAGING_PREFIX: &str = ".ku-link-";
-const LINK_STAGING_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
-const MAX_LINK_STAGING_SCAN_ENTRIES: usize = 256;
-const MAX_LINK_STAGING_DELETE_FILES: usize = 16;
-
-fn temporary_link_output(output: &Path) -> PathBuf {
-    let sequence = NEXT_LINK_OUTPUT.fetch_add(1, Ordering::Relaxed);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut name = format!(
-        "{LINK_STAGING_PREFIX}{}-{sequence}-{timestamp}",
-        std::process::id()
-    );
-    if let Some(extension) = output.extension().and_then(|value| value.to_str()) {
-        name.push('.');
-        name.push_str(extension);
+fn validate_libmysql_link_mode(needs_libmysql: bool, static_link: bool) -> Result<(), KuError> {
+    if needs_libmysql && static_link {
+        return Err(KuError::message(
+            "native C build cannot safely link std.mysql with --static: MySQL/MariaDB static archives require target-specific transitive libraries that Ku cannot infer portably\nhelp: omit --static and provide a target-compatible shared/import client library through KU_MYSQL_LIB, or link the emitted C yourself with the complete dependency list",
+        ));
     }
-    output.with_file_name(name)
+    Ok(())
 }
 
-fn is_native_link_staging_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix(LINK_STAGING_PREFIX) else {
-        return false;
-    };
-    let mut components = rest.splitn(3, '-');
-    let Some(pid) = components.next() else {
-        return false;
-    };
-    let Some(sequence) = components.next() else {
-        return false;
-    };
-    let Some(timestamp_and_extension) = components.next() else {
-        return false;
-    };
-    if pid.is_empty()
-        || !pid.bytes().all(|byte| byte.is_ascii_digit())
-        || sequence.is_empty()
-        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return false;
-    }
-    let mut suffix = timestamp_and_extension.splitn(2, '.');
-    let timestamp = suffix.next().unwrap_or_default();
-    let extension_is_valid = suffix.next().is_none_or(|extension| !extension.is_empty());
-    !timestamp.is_empty()
-        && timestamp.bytes().all(|byte| byte.is_ascii_digit())
-        && extension_is_valid
-}
-
-fn cleanup_stale_link_outputs_with_policy(
-    directory: &Path,
-    now: SystemTime,
-    stale_after: Duration,
-    max_scan: usize,
-    max_delete: usize,
-) -> Result<usize, KuError> {
-    if max_scan == 0 || max_delete == 0 {
-        return Ok(0);
-    }
-    let entries = fs::read_dir(directory).map_err(|err| {
-        KuError::message(format!(
-            "failed to scan native output directory '{}': {err}",
-            directory.display()
-        ))
-    })?;
-    let mut deleted = 0usize;
-    for entry in entries.take(max_scan) {
-        let entry = entry.map_err(|err| {
-            KuError::message(format!(
-                "failed to inspect native output directory '{}': {err}",
-                directory.display()
-            ))
-        })?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !is_native_link_staging_name(name) {
-            continue;
-        }
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path).map_err(|err| {
-            KuError::message(format!(
-                "failed to inspect native link staging '{}': {err}",
-                path.display()
-            ))
-        })?;
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        let Ok(age) = now.duration_since(modified) else {
-            continue;
-        };
-        if age < stale_after {
-            continue;
-        }
-        fs::remove_file(&path).map_err(|err| {
-            KuError::message(format!(
-                "failed to remove stale native link staging '{}': {err}",
-                path.display()
-            ))
-        })?;
-        deleted += 1;
-        if deleted == max_delete {
-            break;
-        }
-    }
-    Ok(deleted)
-}
-
-fn cleanup_stale_link_outputs(directory: &Path) -> Result<usize, KuError> {
-    cleanup_stale_link_outputs_with_policy(
-        directory,
-        SystemTime::now(),
-        LINK_STAGING_STALE_AFTER,
-        MAX_LINK_STAGING_SCAN_ENTRIES,
-        MAX_LINK_STAGING_DELETE_FILES,
+fn missing_shared_libpq_error() -> KuError {
+    KuError::message(
+        "native PostgreSQL linking requires an exact shared/import libpq library\nhelp: set KU_PG_LIB to an absolute, dedicated directory containing the target-compatible shared/import library; Ku does not fall back to an unverified compiler search path",
     )
 }
 
-fn prepare_link_output_staging(path: &Path) -> Result<(), KuError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(path).map_err(|err| {
+const LINK_STAGING_PREFIX: &str = ".ku-link-";
+const MAX_LINK_STAGING_ATTEMPTS: usize = 8;
+
+struct LinkOutputStaging {
+    directory: PathBuf,
+    artifact: PathBuf,
+    marker: PathBuf,
+    marker_identity: LinkLibraryIdentity,
+    output: PathBuf,
+    initial_destination: Option<LinkLibraryIdentity>,
+}
+
+impl LinkOutputStaging {
+    fn create(output: &Path) -> Result<Self, KuError> {
+        let parent = link_output_directory(output);
+        let file_name = output.file_name().ok_or_else(|| {
             KuError::message(format!(
-                "failed to remove stale native link staging '{}': {err}",
-                path.display()
+                "native output '{}' has no file name",
+                output.display()
             ))
-        }),
+        })?;
+        let initial_destination = capture_link_destination(output)?;
+        for _ in 0..MAX_LINK_STAGING_ATTEMPTS {
+            let mut random = [0_u8; 16];
+            getrandom::fill(&mut random).map_err(|error| {
+                KuError::message(format!(
+                    "failed to reserve private native link staging: secure random failed: {error}"
+                ))
+            })?;
+            let nonce = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let directory = parent.join(format!(
+                "{LINK_STAGING_PREFIX}{}-{nonce}",
+                std::process::id()
+            ));
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+            };
+            #[cfg(not(unix))]
+            let builder = fs::DirBuilder::new();
+            match builder.create(&directory) {
+                Ok(()) => {
+                    let artifact = directory.join(file_name);
+                    let marker = directory.join(".owner");
+                    let marker_result = (|| -> io::Result<LinkLibraryIdentity> {
+                        let mut options = fs::OpenOptions::new();
+                        options.create_new(true).write(true).read(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            options.mode(0o600);
+                        }
+                        let mut file = options.open(&marker)?;
+                        file.write_all(&random)?;
+                        file.flush()?;
+                        link_library_identity(&file)
+                    })();
+                    let marker_identity = match marker_result {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            let _ = fs::remove_file(&marker);
+                            let _ = fs::remove_dir(&directory);
+                            return Err(KuError::message(format!(
+                                "failed to establish private native link staging ownership in '{}': {error}",
+                                parent.display()
+                            )));
+                        }
+                    };
+                    return Ok(Self {
+                        directory,
+                        artifact,
+                        marker,
+                        marker_identity,
+                        output: output.to_path_buf(),
+                        initial_destination,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(KuError::message(format!(
+                        "failed to create private native link staging in '{}': {error}",
+                        parent.display()
+                    )));
+                }
+            }
+        }
+        Err(KuError::message(format!(
+            "failed to reserve a unique private native link staging directory in '{}'",
+            parent.display()
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        &self.artifact
+    }
+}
+
+fn capture_link_destination(output: &Path) -> Result<Option<LinkLibraryIdentity>, KuError> {
+    match fs::symlink_metadata(output) {
+        Ok(metadata) if is_plain_regular_file(&metadata) => {
+            let file = fs::File::open(output).map_err(|error| {
+                KuError::message(format!(
+                    "failed to open previous native output '{}': {error}",
+                    output.display()
+                ))
+            })?;
+            let identity = link_library_identity(&file).map_err(|error| {
+                KuError::message(format!(
+                    "failed to identify previous native output '{}': {error}",
+                    output.display()
+                ))
+            })?;
+            if identity.length != metadata.len() {
+                return Err(KuError::message(format!(
+                    "previous native output '{}' changed while it was inspected",
+                    output.display()
+                )));
+            }
+            Ok(Some(identity))
+        }
         Ok(_) => Err(KuError::message(format!(
-            "native link staging path '{}' is not a regular file",
-            path.display()
+            "native output destination '{}' is not a regular file",
+            output.display()
         ))),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(KuError::message(format!(
-            "failed to inspect native link staging '{}': {err}",
-            path.display()
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(KuError::message(format!(
+            "failed to inspect previous native output '{}': {error}",
+            output.display()
         ))),
     }
 }
 
-fn install_link_output(temporary: &Path, output: &Path) -> Result<(), KuError> {
-    match fs::rename(temporary, output) {
-        Ok(()) => Ok(()),
-        Err(_first_error) if cfg!(windows) && output.is_file() => {
-            fs::remove_file(output).map_err(|err| {
-                KuError::message(format!(
-                    "failed to replace previous native output '{}': {err}",
-                    output.display()
-                ))
-            })?;
-            fs::rename(temporary, output).map_err(|err| {
-                KuError::message(format!(
-                    "failed to install verified native output '{}': {err}",
-                    output.display()
-                ))
-            })
-        }
-        Err(err) => Err(KuError::message(format!(
-            "failed to install verified native output '{}': {err}",
+fn verify_link_destination_unchanged(
+    output: &Path,
+    expected: &Option<LinkLibraryIdentity>,
+) -> Result<(), KuError> {
+    let current = capture_link_destination(output)?;
+    let unchanged = match (expected, current) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => same_open_link_library_contents(expected, &current),
+        _ => false,
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err(KuError::message(format!(
+            "native output destination '{}' changed while the artifact was being built; refusing to overwrite it",
             output.display()
-        ))),
+        )))
     }
+}
+
+impl Drop for LinkOutputStaging {
+    fn drop(&mut self) {
+        // Recursively clean only the exact random directory whose private
+        // marker still names the file created by this guard. If an untrusted
+        // output owner replaces the directory or marker, fail closed and leave
+        // it untouched; never scan the surrounding user output directory.
+        let owned = path_is_plain_directory(&self.directory)
+            && fs::symlink_metadata(&self.marker)
+                .is_ok_and(|metadata| is_plain_regular_file(&metadata))
+            && fs::File::open(&self.marker)
+                .ok()
+                .and_then(|file| link_library_identity(&file).ok())
+                .is_some_and(|identity| {
+                    same_open_link_library_contents(&identity, &self.marker_identity)
+                });
+        if owned {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
+fn is_plain_regular_file(metadata: &fs::Metadata) -> bool {
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+fn path_is_plain_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| is_plain_regular_file(&metadata))
+}
+
+fn path_is_plain_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        if !metadata.file_type().is_dir() {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    })
+}
+
+fn validate_native_output_name(output: &Path) -> Result<(), KuError> {
+    let reserved = output
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .is_some_and(|name| {
+            name.get(..LINK_STAGING_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(LINK_STAGING_PREFIX))
+        });
+    if reserved {
+        return Err(KuError::message(format!(
+            "native output '{}' uses the reserved {LINK_STAGING_PREFIX} staging namespace",
+            output.display()
+        )));
+    }
+    Ok(())
+}
+
+fn link_output_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn binary_range_end(offset: u64, size: u64, file_len: u64, what: &str) -> Result<u64, String> {
@@ -2580,6 +4724,20 @@ fn le_u64(bytes: &[u8], offset: usize) -> u64 {
     ])
 }
 
+fn verify_native_binary_target_file(
+    file: &mut fs::File,
+    file_len: u64,
+    target: &BuildTarget,
+) -> Result<(), String> {
+    match target.binary_format {
+        NativeBinaryFormat::ElfX86_64 => verify_elf_x86_64(file, file_len)?,
+        NativeBinaryFormat::PeX86_64 => verify_pe_x86_64(file, file_len)?,
+        NativeBinaryFormat::MachOArm64 => verify_macho_arm64_macos(file, file_len)?,
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn verify_native_binary_target(output: &Path, target: &BuildTarget) -> Result<(), String> {
     let mut file =
         fs::File::open(output).map_err(|err| format!("failed to open linked output: {err}"))?;
@@ -2589,14 +4747,740 @@ fn verify_native_binary_target(output: &Path, target: &BuildTarget) -> Result<()
     if !metadata.is_file() {
         return Err("linked output is not a regular file".to_string());
     }
+    verify_native_binary_target_file(&mut file, metadata.len(), target)
+}
 
-    let file_len = metadata.len();
-    match target.binary_format {
-        NativeBinaryFormat::ElfX86_64 => verify_elf_x86_64(&mut file, file_len)?,
-        NativeBinaryFormat::PeX86_64 => verify_pe_x86_64(&mut file, file_len)?,
-        NativeBinaryFormat::MachOArm64 => verify_macho_arm64_macos(&mut file, file_len)?,
+const MAX_DYNAMIC_DEPENDENCIES: usize = 4_096;
+const MAX_DYNAMIC_STRING_TABLE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_DYNAMIC_DEPENDENCY_NAME_BYTES: usize = 4_096;
+const MAX_PE_OPTIONAL_HEADER_BYTES: u64 = 4 * 1024;
+
+fn verify_native_binary_dynamic_dependencies_file(
+    file: &mut fs::File,
+    file_len: u64,
+    target: &BuildTarget,
+    features: CSourceFeatures,
+    libpq_requirement: Option<&LibpqRuntimeDependency>,
+    mysql_requirement: Option<&MysqlRuntimeDependency>,
+) -> Result<(), String> {
+    if !features.libpq && !features.libmysql {
+        return Ok(());
+    }
+    let names = match target.binary_format {
+        NativeBinaryFormat::ElfX86_64 => read_elf_dynamic_dependencies(file, file_len)?,
+        NativeBinaryFormat::PeX86_64 => read_pe_dynamic_dependencies(file, file_len)?,
+        NativeBinaryFormat::MachOArm64 => read_macho_dynamic_dependencies(file, file_len)?,
+    };
+    if names
+        .iter()
+        .any(|name| dynamic_dependency_references_private_staging(name))
+    {
+        return Err(
+            "linked output records a private Ku staging path as a runtime dependency".to_string(),
+        );
+    }
+    if features.libpq {
+        let requirement = libpq_requirement.ok_or_else(|| {
+            "native PostgreSQL dependency verification has no selected libpq loader identity"
+                .to_string()
+        })?;
+        let libpq_names = names
+            .iter()
+            .filter(|name| dynamic_library_matches(name, DynamicLibraryFamily::Libpq))
+            .collect::<Vec<_>>();
+        if libpq_names.is_empty() {
+            return Err(
+                "linked output has no dynamic libpq dependency; refusing a static or unresolved fallback"
+                    .to_string(),
+            );
+        }
+        if libpq_names.iter().any(|name| {
+            !dynamic_dependency_matches_selected_loader(
+                name,
+                &requirement.loader_name,
+                target.binary_format,
+            )
+        }) {
+            return Err(format!(
+                "linked output imports a libpq loader target that differs from the selected library '{}'",
+                String::from_utf8_lossy(&requirement.loader_name)
+            ));
+        }
+    }
+    if features.libmysql {
+        let requirement = mysql_requirement.ok_or_else(|| {
+            "native MySQL dependency verification has no selected client family".to_string()
+        })?;
+        let (expected, other, label) = match requirement.family {
+            MysqlClientFamily::Mysql => (
+                DynamicLibraryFamily::Mysql,
+                DynamicLibraryFamily::Mariadb,
+                "MySQL",
+            ),
+            MysqlClientFamily::Mariadb => (
+                DynamicLibraryFamily::Mariadb,
+                DynamicLibraryFamily::Mysql,
+                "MariaDB",
+            ),
+        };
+        if names
+            .iter()
+            .any(|name| dynamic_library_matches(name, other))
+        {
+            return Err(
+                "linked output mixes MySQL and MariaDB dynamic client dependencies".to_string(),
+            );
+        }
+        let client_names = names
+            .iter()
+            .filter(|name| dynamic_library_matches(name, expected))
+            .collect::<Vec<_>>();
+        if client_names.is_empty() {
+            return Err(format!(
+                "linked output has no dynamic {label} client dependency matching the selected import library; refusing a static, cross-family, or unresolved fallback"
+            ));
+        }
+        if client_names.iter().any(|name| {
+            !dynamic_dependency_matches_selected_loader(
+                name,
+                &requirement.loader_name,
+                target.binary_format,
+            )
+        }) {
+            return Err(format!(
+                "linked output imports a {label} loader target that differs from the selected client library '{}'",
+                String::from_utf8_lossy(&requirement.loader_name)
+            ));
+        }
     }
     Ok(())
+}
+
+fn dynamic_dependency_matches_selected_loader(
+    actual: &[u8],
+    expected: &[u8],
+    format: NativeBinaryFormat,
+) -> bool {
+    match format {
+        NativeBinaryFormat::PeX86_64 => {
+            let actual = actual
+                .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+                .next()
+                .unwrap_or(actual);
+            let expected = expected
+                .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+                .next()
+                .unwrap_or(expected);
+            actual.eq_ignore_ascii_case(expected)
+        }
+        NativeBinaryFormat::ElfX86_64 | NativeBinaryFormat::MachOArm64 => actual == expected,
+    }
+}
+
+fn dynamic_dependency_references_private_staging(name: &[u8]) -> bool {
+    name.split(|byte| matches!(byte, b'/' | b'\\'))
+        .any(|component| {
+            component
+                .get(..LINK_STAGING_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(LINK_STAGING_PREFIX.as_bytes()))
+        })
+}
+
+#[cfg(test)]
+fn verify_native_binary_dynamic_dependencies(
+    output: &Path,
+    target: &BuildTarget,
+    features: CSourceFeatures,
+    libpq_requirement: Option<&LibpqRuntimeDependency>,
+    mysql_requirement: Option<&MysqlRuntimeDependency>,
+) -> Result<(), String> {
+    let mut file =
+        fs::File::open(output).map_err(|err| format!("failed to open linked output: {err}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("failed to inspect linked output: {err}"))?;
+    if !metadata.is_file() {
+        return Err("linked output is not a regular file".to_string());
+    }
+    verify_native_binary_dynamic_dependencies_file(
+        &mut file,
+        metadata.len(),
+        target,
+        features,
+        libpq_requirement,
+        mysql_requirement,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DynamicLibraryFamily {
+    Libpq,
+    Mysql,
+    Mariadb,
+}
+
+fn dynamic_library_matches(name: &[u8], family: DynamicLibraryFamily) -> bool {
+    let basename = name
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or(name);
+    let Ok(basename) = std::str::from_utf8(basename) else {
+        return false;
+    };
+    let lower = basename.to_ascii_lowercase();
+    let stems: &[&str] = match family {
+        DynamicLibraryFamily::Libpq => &["libpq"],
+        DynamicLibraryFamily::Mysql => &["libmysqlclient", "libmysql", "mysqlclient"],
+        DynamicLibraryFamily::Mariadb => {
+            &["libmariadbclient", "libmariadb", "mariadbclient", "mariadb"]
+        }
+    };
+    stems
+        .iter()
+        .any(|stem| dynamic_library_basename_matches(&lower, stem))
+}
+
+fn dynamic_library_basename_matches(basename: &str, stem: &str) -> bool {
+    let Some(suffix) = basename.strip_prefix(stem) else {
+        return false;
+    };
+    if matches!(suffix, ".dll" | ".so" | ".dylib") {
+        return true;
+    }
+    if let Some(version) = suffix.strip_prefix(".so.") {
+        return numeric_library_version(version);
+    }
+    suffix
+        .strip_prefix('.')
+        .and_then(|value| value.strip_suffix(".dylib"))
+        .is_some_and(numeric_library_version)
+}
+
+#[derive(Clone, Copy)]
+struct ElfFileSegment {
+    virtual_address: u64,
+    file_offset: u64,
+    file_size: u64,
+}
+
+struct ElfDynamicMetadata {
+    dependencies: Vec<Vec<u8>>,
+    soname: Option<Vec<u8>>,
+}
+
+fn read_elf_dynamic_dependencies(
+    file: &mut fs::File,
+    file_len: u64,
+) -> Result<Vec<Vec<u8>>, String> {
+    Ok(read_elf_dynamic_metadata(file, file_len)?.dependencies)
+}
+
+fn read_elf_dynamic_metadata(
+    file: &mut fs::File,
+    file_len: u64,
+) -> Result<ElfDynamicMetadata, String> {
+    const ELF_HEADER_SIZE: usize = 64;
+    const ELF_PROGRAM_HEADER_SIZE: u64 = 56;
+    const MAX_PROGRAM_HEADERS: u16 = 4_096;
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
+    const DT_NULL: u64 = 0;
+    const DT_NEEDED: u64 = 1;
+    const DT_STRTAB: u64 = 5;
+    const DT_STRSZ: u64 = 10;
+    const DT_SONAME: u64 = 14;
+
+    let mut header = [0u8; ELF_HEADER_SIZE];
+    read_binary_at(file, 0, &mut header, "ELF64 header")?;
+    if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 {
+        return Err("expected a little-endian ELF64 executable".to_string());
+    }
+    let program_offset = le_u64(&header, 32);
+    let program_entry_size = le_u16(&header, 54) as u64;
+    let program_count = le_u16(&header, 56);
+    if program_entry_size != ELF_PROGRAM_HEADER_SIZE
+        || program_count == 0
+        || program_count > MAX_PROGRAM_HEADERS
+    {
+        return Err("ELF program-header table is invalid".to_string());
+    }
+    let table_size = program_entry_size
+        .checked_mul(program_count as u64)
+        .ok_or_else(|| "ELF program table size overflows".to_string())?;
+    binary_range_end(program_offset, table_size, file_len, "ELF program table")?;
+
+    let mut loads = Vec::new();
+    let mut dynamic = None;
+    for index in 0..program_count as u64 {
+        let offset = program_offset + index * program_entry_size;
+        let mut program = [0u8; ELF_PROGRAM_HEADER_SIZE as usize];
+        read_binary_at(file, offset, &mut program, "ELF program header")?;
+        let kind = le_u32(&program, 0);
+        let file_offset = le_u64(&program, 8);
+        let virtual_address = le_u64(&program, 16);
+        let file_size = le_u64(&program, 32);
+        if matches!(kind, PT_LOAD | PT_DYNAMIC) {
+            binary_range_end(file_offset, file_size, file_len, "ELF segment")?;
+        }
+        match kind {
+            PT_LOAD => loads.push(ElfFileSegment {
+                virtual_address,
+                file_offset,
+                file_size,
+            }),
+            PT_DYNAMIC => {
+                if dynamic.replace((file_offset, file_size)).is_some() {
+                    return Err("ELF executable has multiple PT_DYNAMIC segments".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some((dynamic_offset, dynamic_size)) = dynamic else {
+        return Ok(ElfDynamicMetadata {
+            dependencies: Vec::new(),
+            soname: None,
+        });
+    };
+    if dynamic_size == 0
+        || dynamic_size > MAX_DYNAMIC_STRING_TABLE_BYTES
+        || !dynamic_size.is_multiple_of(16)
+    {
+        return Err("ELF PT_DYNAMIC size is invalid or exceeds the parser limit".to_string());
+    }
+
+    let mut string_address = None;
+    let mut string_size = None;
+    let mut needed = Vec::new();
+    let mut soname = None;
+    let mut terminated = false;
+    for index in 0..dynamic_size / 16 {
+        let mut entry = [0u8; 16];
+        read_binary_at(
+            file,
+            dynamic_offset + index * 16,
+            &mut entry,
+            "ELF dynamic entry",
+        )?;
+        let tag = le_u64(&entry, 0);
+        let value = le_u64(&entry, 8);
+        match tag {
+            DT_NULL => {
+                terminated = true;
+                break;
+            }
+            DT_NEEDED => {
+                if needed.len() >= MAX_DYNAMIC_DEPENDENCIES {
+                    return Err("ELF dependency table exceeds the parser limit".to_string());
+                }
+                needed.push(value);
+            }
+            DT_STRTAB => match string_address {
+                Some(previous) if previous != value => {
+                    return Err("ELF dynamic table has conflicting DT_STRTAB values".to_string())
+                }
+                _ => string_address = Some(value),
+            },
+            DT_STRSZ => match string_size {
+                Some(previous) if previous != value => {
+                    return Err("ELF dynamic table has conflicting DT_STRSZ values".to_string())
+                }
+                _ => string_size = Some(value),
+            },
+            DT_SONAME => match soname {
+                Some(previous) if previous != value => {
+                    return Err("ELF dynamic table has conflicting DT_SONAME values".to_string())
+                }
+                _ => soname = Some(value),
+            },
+            _ => {}
+        }
+    }
+    if !terminated {
+        return Err("ELF dynamic table has no bounded DT_NULL terminator".to_string());
+    }
+    if needed.is_empty() && soname.is_none() {
+        return Ok(ElfDynamicMetadata {
+            dependencies: Vec::new(),
+            soname: None,
+        });
+    }
+    let string_address = string_address
+        .ok_or_else(|| "ELF dynamic dependencies are missing the DT_STRTAB address".to_string())?;
+    let string_size = string_size
+        .ok_or_else(|| "ELF dynamic dependencies are missing the DT_STRSZ bound".to_string())?;
+    if string_size == 0 || string_size > MAX_DYNAMIC_STRING_TABLE_BYTES {
+        return Err("ELF dynamic string table exceeds the parser limit".to_string());
+    }
+    let string_offset = elf_virtual_file_offset(string_address, string_size, &loads, file_len)?;
+    let string_size = usize::try_from(string_size)
+        .map_err(|_| "ELF dynamic string table does not fit this host".to_string())?;
+    let mut strings = Vec::new();
+    strings
+        .try_reserve_exact(string_size)
+        .map_err(|error| format!("failed to reserve bounded ELF string table: {error}"))?;
+    strings.resize(string_size, 0);
+    read_binary_at(
+        file,
+        string_offset,
+        &mut strings,
+        "ELF dynamic string table",
+    )?;
+    let read_string = |offset: u64, kind: &str| -> Result<Vec<u8>, String> {
+        let start = usize::try_from(offset)
+            .ok()
+            .filter(|offset| *offset < strings.len())
+            .ok_or_else(|| format!("ELF {kind} offset is outside DT_STRSZ"))?;
+        let available = &strings[start..];
+        let end = available
+            .iter()
+            .take(MAX_DYNAMIC_DEPENDENCY_NAME_BYTES + 1)
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| format!("ELF {kind} is unterminated or too long"))?;
+        if end == 0 {
+            return Err(format!("ELF {kind} is empty"));
+        }
+        Ok(available[..end].to_vec())
+    };
+    let mut names = Vec::with_capacity(needed.len());
+    for needed_offset in needed {
+        names.push(read_string(needed_offset, "DT_NEEDED name")?);
+    }
+    let soname = soname
+        .map(|offset| read_string(offset, "DT_SONAME name"))
+        .transpose()?;
+    Ok(ElfDynamicMetadata {
+        dependencies: names,
+        soname,
+    })
+}
+
+fn elf_virtual_file_offset(
+    address: u64,
+    size: u64,
+    loads: &[ElfFileSegment],
+    file_len: u64,
+) -> Result<u64, String> {
+    let mut selected = None;
+    for segment in loads {
+        let Some(delta) = address.checked_sub(segment.virtual_address) else {
+            continue;
+        };
+        let Some(end) = delta.checked_add(size) else {
+            continue;
+        };
+        if end > segment.file_size {
+            continue;
+        }
+        let offset = segment
+            .file_offset
+            .checked_add(delta)
+            .ok_or_else(|| "ELF virtual-to-file mapping overflows".to_string())?;
+        binary_range_end(offset, size, file_len, "ELF dynamic string table")?;
+        if selected.is_some_and(|previous| previous != offset) {
+            return Err("ELF dynamic string table has an ambiguous file mapping".to_string());
+        }
+        selected = Some(offset);
+    }
+    selected.ok_or_else(|| "ELF dynamic string table is not backed by PT_LOAD bytes".to_string())
+}
+
+#[derive(Clone, Copy)]
+struct PeSectionMapping {
+    virtual_address: u64,
+    virtual_size: u64,
+    raw_offset: u64,
+    raw_size: u64,
+}
+
+fn read_pe_dynamic_dependencies(
+    file: &mut fs::File,
+    file_len: u64,
+) -> Result<Vec<Vec<u8>>, String> {
+    const COFF_HEADER_SIZE: u64 = 24;
+    const SECTION_HEADER_SIZE: u64 = 40;
+    const MAX_SECTIONS: u16 = 1_024;
+    const IMPORT_DESCRIPTOR_SIZE: u64 = 20;
+
+    let mut dos = [0u8; 64];
+    read_binary_at(file, 0, &mut dos, "PE DOS header")?;
+    if dos[..2] != *b"MZ" {
+        return Err("expected a PE executable".to_string());
+    }
+    let pe_offset = le_u32(&dos, 60) as u64;
+    binary_range_end(pe_offset, COFF_HEADER_SIZE, file_len, "PE COFF header")?;
+    let mut coff = [0u8; COFF_HEADER_SIZE as usize];
+    read_binary_at(file, pe_offset, &mut coff, "PE COFF header")?;
+    if coff[..4] != *b"PE\0\0" {
+        return Err("expected a PE executable signature".to_string());
+    }
+    let section_count = le_u16(&coff, 6);
+    let optional_size = le_u16(&coff, 20) as u64;
+    if section_count == 0
+        || section_count > MAX_SECTIONS
+        || !(128..=MAX_PE_OPTIONAL_HEADER_BYTES).contains(&optional_size)
+    {
+        return Err("PE headers cannot contain a bounded import directory".to_string());
+    }
+    let optional_offset = pe_offset + COFF_HEADER_SIZE;
+    binary_range_end(
+        optional_offset,
+        optional_size,
+        file_len,
+        "PE optional header",
+    )?;
+    let mut optional = vec![0u8; optional_size as usize];
+    read_binary_at(file, optional_offset, &mut optional, "PE optional header")?;
+    if le_u16(&optional, 0) != 0x020b {
+        return Err("expected a PE32+ optional header".to_string());
+    }
+    let directory_count = le_u32(&optional, 108);
+    if directory_count < 2 {
+        return Ok(Vec::new());
+    }
+    let import_rva = le_u32(&optional, 120) as u64;
+    let import_size = le_u32(&optional, 124) as u64;
+    if import_rva == 0 || import_size == 0 {
+        return Ok(Vec::new());
+    }
+    if !(IMPORT_DESCRIPTOR_SIZE..=MAX_DYNAMIC_STRING_TABLE_BYTES).contains(&import_size) {
+        return Err("PE import directory size is invalid or exceeds the parser limit".to_string());
+    }
+
+    let section_offset = optional_offset + optional_size;
+    let section_table_size = SECTION_HEADER_SIZE
+        .checked_mul(section_count as u64)
+        .ok_or_else(|| "PE section-table size overflows".to_string())?;
+    binary_range_end(
+        section_offset,
+        section_table_size,
+        file_len,
+        "PE section table",
+    )?;
+    let mut sections = Vec::with_capacity(section_count as usize);
+    for index in 0..section_count as u64 {
+        let mut section = [0u8; SECTION_HEADER_SIZE as usize];
+        read_binary_at(
+            file,
+            section_offset + index * SECTION_HEADER_SIZE,
+            &mut section,
+            "PE section header",
+        )?;
+        let raw_offset = le_u32(&section, 20) as u64;
+        let raw_size = le_u32(&section, 16) as u64;
+        if raw_size != 0 {
+            binary_range_end(raw_offset, raw_size, file_len, "PE section data")?;
+        }
+        sections.push(PeSectionMapping {
+            virtual_address: le_u32(&section, 12) as u64,
+            virtual_size: le_u32(&section, 8) as u64,
+            raw_offset,
+            raw_size,
+        });
+    }
+    let header_size = le_u32(&optional, 60) as u64;
+    let (import_offset, import_available) =
+        pe_rva_to_file_range(import_rva, import_size, header_size, &sections, file_len)?;
+    if import_available < import_size {
+        return Err("PE import directory extends beyond its file-backed range".to_string());
+    }
+
+    let mut names = Vec::new();
+    let mut terminated = false;
+    for index in 0..import_size / IMPORT_DESCRIPTOR_SIZE {
+        let mut descriptor = [0u8; IMPORT_DESCRIPTOR_SIZE as usize];
+        read_binary_at(
+            file,
+            import_offset + index * IMPORT_DESCRIPTOR_SIZE,
+            &mut descriptor,
+            "PE import descriptor",
+        )?;
+        if descriptor.iter().all(|byte| *byte == 0) {
+            terminated = true;
+            break;
+        }
+        if names.len() >= MAX_DYNAMIC_DEPENDENCIES {
+            return Err("PE import table exceeds the parser limit".to_string());
+        }
+        let name_rva = le_u32(&descriptor, 12) as u64;
+        if name_rva == 0 {
+            return Err("PE import descriptor has no DLL name".to_string());
+        }
+        names.push(read_pe_rva_c_string(
+            file,
+            name_rva,
+            header_size,
+            &sections,
+            file_len,
+        )?);
+    }
+    if !terminated {
+        return Err("PE import directory has no bounded null descriptor".to_string());
+    }
+    Ok(names)
+}
+
+fn pe_rva_to_file_range(
+    rva: u64,
+    minimum_size: u64,
+    header_size: u64,
+    sections: &[PeSectionMapping],
+    file_len: u64,
+) -> Result<(u64, u64), String> {
+    let mut selected = None;
+    if rva < header_size {
+        let available = header_size
+            .min(file_len)
+            .checked_sub(rva)
+            .ok_or_else(|| "PE header RVA mapping underflows".to_string())?;
+        if available >= minimum_size {
+            selected = Some((rva, available));
+        }
+    }
+    for section in sections {
+        let span = section.virtual_size.max(section.raw_size);
+        let Some(delta) = rva.checked_sub(section.virtual_address) else {
+            continue;
+        };
+        if delta >= span || delta >= section.raw_size {
+            continue;
+        }
+        let available = section.raw_size - delta;
+        if available < minimum_size {
+            continue;
+        }
+        let offset = section
+            .raw_offset
+            .checked_add(delta)
+            .ok_or_else(|| "PE RVA mapping overflows".to_string())?;
+        binary_range_end(offset, minimum_size, file_len, "PE RVA mapping")?;
+        let candidate = (offset, available.min(file_len - offset));
+        if selected.is_some_and(|previous| previous != candidate) {
+            return Err("PE RVA has an ambiguous file mapping".to_string());
+        }
+        selected = Some(candidate);
+    }
+    selected.ok_or_else(|| "PE RVA is not backed by bounded file bytes".to_string())
+}
+
+fn read_pe_rva_c_string(
+    file: &mut fs::File,
+    rva: u64,
+    header_size: u64,
+    sections: &[PeSectionMapping],
+    file_len: u64,
+) -> Result<Vec<u8>, String> {
+    let (offset, available) = pe_rva_to_file_range(rva, 1, header_size, sections, file_len)?;
+    let read_len = available.min((MAX_DYNAMIC_DEPENDENCY_NAME_BYTES + 1) as u64) as usize;
+    let mut bytes = vec![0u8; read_len];
+    read_binary_at(file, offset, &mut bytes, "PE imported DLL name")?;
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| "PE imported DLL name is unterminated or too long".to_string())?;
+    if end == 0 {
+        return Err("PE imported DLL name is empty".to_string());
+    }
+    bytes.truncate(end);
+    Ok(bytes)
+}
+
+struct MachODynamicMetadata {
+    dependencies: Vec<Vec<u8>>,
+    install_name: Option<Vec<u8>>,
+}
+
+fn read_macho_dynamic_dependencies(
+    file: &mut fs::File,
+    file_len: u64,
+) -> Result<Vec<Vec<u8>>, String> {
+    Ok(read_macho_dynamic_metadata(file, file_len)?.dependencies)
+}
+
+fn read_macho_dynamic_metadata(
+    file: &mut fs::File,
+    file_len: u64,
+) -> Result<MachODynamicMetadata, String> {
+    const MACH_HEADER_SIZE: u64 = 32;
+    const MAX_LOAD_COMMANDS: u32 = 4_096;
+    const MAX_LOAD_COMMAND_BYTES: u32 = 16 * 1024 * 1024;
+    let mut header = [0u8; MACH_HEADER_SIZE as usize];
+    read_binary_at(file, 0, &mut header, "Mach-O 64-bit header")?;
+    if header[..4] != [0xcf, 0xfa, 0xed, 0xfe] {
+        return Err("expected a little-endian Mach-O executable".to_string());
+    }
+    let command_count = le_u32(&header, 16);
+    let command_bytes = le_u32(&header, 20);
+    if command_count == 0
+        || command_count > MAX_LOAD_COMMANDS
+        || command_bytes == 0
+        || command_bytes > MAX_LOAD_COMMAND_BYTES
+    {
+        return Err("Mach-O load-command table exceeds the parser limit".to_string());
+    }
+    let commands_end = binary_range_end(
+        MACH_HEADER_SIZE,
+        command_bytes as u64,
+        file_len,
+        "Mach-O load-command table",
+    )?;
+    let mut cursor = MACH_HEADER_SIZE;
+    let mut names = Vec::new();
+    let mut install_name = None;
+    for _ in 0..command_count {
+        let mut command_header = [0u8; 8];
+        read_binary_at(file, cursor, &mut command_header, "Mach-O load command")?;
+        let command = le_u32(&command_header, 0);
+        let command_size = le_u32(&command_header, 4) as u64;
+        if command_size < 8 || !command_size.is_multiple_of(8) {
+            return Err("Mach-O load command has an invalid size".to_string());
+        }
+        let next = binary_range_end(cursor, command_size, commands_end, "Mach-O load command")?;
+        let command_kind = command & !0x8000_0000;
+        let is_dependency = matches!(command_kind, 0x0c | 0x18 | 0x1f | 0x20 | 0x23);
+        let is_install_name = command_kind == 0x0d;
+        if is_dependency || is_install_name {
+            if command_size < 24 {
+                return Err("Mach-O dylib load command is truncated".to_string());
+            }
+            if is_dependency && names.len() >= MAX_DYNAMIC_DEPENDENCIES {
+                return Err("Mach-O dependency table exceeds the parser limit".to_string());
+            }
+            let mut dylib = [0u8; 24];
+            read_binary_at(file, cursor, &mut dylib, "Mach-O dylib load command")?;
+            let name_offset = le_u32(&dylib, 8) as u64;
+            if name_offset < 24 || name_offset >= command_size {
+                return Err("Mach-O dylib name offset is outside its load command".to_string());
+            }
+            let available = command_size - name_offset;
+            let read_len = available.min((MAX_DYNAMIC_DEPENDENCY_NAME_BYTES + 1) as u64) as usize;
+            let mut name = vec![0u8; read_len];
+            read_binary_at(file, cursor + name_offset, &mut name, "Mach-O dylib name")?;
+            let end = name
+                .iter()
+                .position(|byte| *byte == 0)
+                .ok_or_else(|| "Mach-O dylib name is unterminated or too long".to_string())?;
+            if end == 0 {
+                return Err("Mach-O dylib name is empty".to_string());
+            }
+            name.truncate(end);
+            if is_install_name {
+                if install_name.replace(name).is_some() {
+                    return Err("Mach-O image has multiple LC_ID_DYLIB commands".to_string());
+                }
+            } else {
+                names.push(name);
+            }
+        }
+        cursor = next;
+    }
+    if cursor != commands_end {
+        return Err("Mach-O load-command count does not consume sizeofcmds".to_string());
+    }
+    Ok(MachODynamicMetadata {
+        dependencies: names,
+        install_name,
+    })
 }
 
 fn verify_elf_x86_64(file: &mut fs::File, file_len: u64) -> Result<(), String> {
@@ -2664,7 +5548,6 @@ fn verify_elf_x86_64(file: &mut fs::File, file_len: u64) -> Result<(), String> {
 fn verify_pe_x86_64(file: &mut fs::File, file_len: u64) -> Result<(), String> {
     const COFF_HEADER_SIZE: u64 = 24;
     const MIN_PE32_PLUS_SIZE: usize = 112;
-    const MAX_OPTIONAL_HEADER_SIZE: u16 = 4_096;
     const SECTION_HEADER_SIZE: u64 = 40;
     const MAX_SECTIONS: u16 = 1_024;
     let mut dos = [0u8; 64];
@@ -2687,7 +5570,7 @@ fn verify_pe_x86_64(file: &mut fs::File, file_len: u64) -> Result<(), String> {
         || section_count == 0
         || section_count > MAX_SECTIONS
         || (optional_size as usize) < MIN_PE32_PLUS_SIZE
-        || optional_size > MAX_OPTIONAL_HEADER_SIZE
+        || u64::from(optional_size) > MAX_PE_OPTIONAL_HEADER_BYTES
         || characteristics & 0x0002 == 0
         || characteristics & 0x2000 != 0
     {
@@ -2863,27 +5746,295 @@ fn verify_macho_arm64_macos(file: &mut fs::File, file_len: u64) -> Result<(), St
     Ok(())
 }
 
-fn finalize_explicit_target_output(
+#[derive(Debug)]
+struct VerifiedLinkOutput {
+    path: PathBuf,
+    file: fs::File,
+    identity: LinkLibraryIdentity,
+}
+
+fn open_link_output_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    options.open(path)
+}
+
+impl VerifiedLinkOutput {
+    fn open(path: &Path) -> Result<Self, String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("failed to inspect linked output: {error}"))?;
+        if !is_plain_regular_file(&metadata) || metadata.len() == 0 {
+            return Err("linked output is not a non-empty plain regular file".to_string());
+        }
+        let file = open_link_output_file(path)
+            .map_err(|error| format!("failed to open linked output: {error}"))?;
+        let identity = link_library_identity(&file)
+            .map_err(|error| format!("failed to identify linked output: {error}"))?;
+        if identity.length == 0 || identity.length != metadata.len() {
+            return Err("linked output changed while it was being opened".to_string());
+        }
+        if identity.length > MAX_NATIVE_LINK_OUTPUT_BYTES {
+            return Err(format!(
+                "linked output exceeds the {MAX_NATIVE_LINK_OUTPUT_BYTES}-byte artifact limit"
+            ));
+        }
+        let verified = Self {
+            path: path.to_path_buf(),
+            file,
+            identity,
+        };
+        verified.verify_current_path()?;
+        Ok(verified)
+    }
+
+    fn verify_open_identity(&self) -> Result<(), String> {
+        let current = link_library_identity(&self.file)
+            .map_err(|error| format!("failed to re-identify linked output: {error}"))?;
+        if !same_open_link_library_contents(&current, &self.identity) {
+            return Err("linked output changed after it was opened".to_string());
+        }
+        Ok(())
+    }
+
+    fn verify_current_path(&self) -> Result<(), String> {
+        self.verify_open_identity()?;
+        let metadata = fs::symlink_metadata(&self.path)
+            .map_err(|error| format!("failed to re-inspect linked output path: {error}"))?;
+        if !is_plain_regular_file(&metadata) || metadata.len() != self.identity.length {
+            return Err("linked output path no longer names the verified regular file".to_string());
+        }
+        let reopened = open_link_output_file(&self.path)
+            .map_err(|error| format!("failed to reopen linked output path: {error}"))?;
+        let reopened_identity = link_library_identity(&reopened)
+            .map_err(|error| format!("failed to identify reopened linked output: {error}"))?;
+        if !same_open_link_library_contents(&reopened_identity, &self.identity) {
+            return Err("linked output path was replaced after verification".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn validate_link_output_candidate(
     temporary: &Path,
-    output: &Path,
     source: &Path,
-    target: &BuildTarget,
+    target: Option<&BuildTarget>,
     compiler: &str,
-) -> Result<(), KuError> {
-    if let Err(reason) = verify_native_binary_target(temporary, target) {
-        let _ = fs::remove_file(temporary);
-        return Err(KuError::message(format!(
-            "native C compiler '{compiler}' produced an invalid '{}' artifact: {reason}\nhelp: configure a compiler/sysroot for {}, or use the target-specific C artifact at {}",
-            target.slug,
-            target.rust_triple,
+    features: CSourceFeatures,
+    libpq_requirement: Option<&LibpqRuntimeDependency>,
+    mysql_requirement: Option<&MysqlRuntimeDependency>,
+) -> Result<VerifiedLinkOutput, KuError> {
+    let mut verified = VerifiedLinkOutput::open(temporary).map_err(|reason| {
+        KuError::message(format!(
+            "native C compiler '{compiler}' did not produce a safe staging artifact '{}': {reason}\nhelp: inspect generated source at {}",
+            temporary.display(),
             source.display()
+        ))
+    })?;
+    let host_target = target.is_none().then(supported_host_build_target).flatten();
+    if let Some(target) = target.or(host_target.as_ref()) {
+        verify_native_binary_target_file(&mut verified.file, verified.identity.length, target)
+            .map_err(|reason| {
+            KuError::message(format!(
+                "native C compiler '{compiler}' produced an invalid '{}' artifact: {reason}\nhelp: configure a compiler/sysroot for {}, or use the target-specific C artifact at {}",
+                target.slug,
+                target.rust_triple,
+                source.display()
+            ))
+        })?;
+        verify_native_binary_dynamic_dependencies_file(
+            &mut verified.file,
+            verified.identity.length,
+            target,
+            features,
+            libpq_requirement,
+            mysql_requirement,
+        )
+            .map_err(|reason| {
+                KuError::message(format!(
+                    "native C compiler '{compiler}' produced an unsafe '{}' dependency graph: {reason}\nhelp: install a matching shared/import database client library and inspect the target-specific C artifact at {}",
+                    target.slug,
+                    source.display()
+                ))
+            })?;
+    }
+    verified.verify_current_path().map_err(|reason| {
+        KuError::message(format!(
+            "native C compiler '{compiler}' staging artifact changed during verification: {reason}\nhelp: inspect generated source at {}",
+            source.display()
+        ))
+    })?;
+    Ok(verified)
+}
+
+fn validate_runner_output_candidate(
+    temporary: &Path,
+    target: Option<&BuildTarget>,
+) -> Result<VerifiedLinkOutput, KuError> {
+    let mut verified = VerifiedLinkOutput::open(temporary).map_err(|reason| {
+        KuError::message(format!(
+            "rustc did not produce a safe staging artifact '{}': {reason}",
+            temporary.display()
+        ))
+    })?;
+    let host_target = target.is_none().then(supported_host_build_target).flatten();
+    if let Some(target) = target.or(host_target.as_ref()) {
+        verify_native_binary_target_file(&mut verified.file, verified.identity.length, target)
+            .map_err(|reason| {
+            KuError::message(format!(
+                "rustc produced an invalid '{}' artifact: {reason}\nhelp: install the '{}' Rust target and matching linker",
+                target.slug, target.rust_triple
+            ))
+        })?;
+    }
+    verified.verify_current_path().map_err(|reason| {
+        KuError::message(format!(
+            "rustc staging artifact changed during verification: {reason}"
+        ))
+    })?;
+    Ok(verified)
+}
+
+fn finalize_link_output(
+    output_staging: &LinkOutputStaging,
+    source: &Path,
+    target: Option<&BuildTarget>,
+    compiler: &str,
+    features: CSourceFeatures,
+    libpq_requirement: Option<&LibpqRuntimeDependency>,
+    mysql_requirement: Option<&MysqlRuntimeDependency>,
+) -> Result<(), KuError> {
+    let verified = validate_link_output_candidate(
+        output_staging.path(),
+        source,
+        target,
+        compiler,
+        features,
+        libpq_requirement,
+        mysql_requirement,
+    )?;
+    install_verified_link_output(verified, output_staging)
+}
+
+fn install_verified_link_output(
+    verified: VerifiedLinkOutput,
+    staging: &LinkOutputStaging,
+) -> Result<(), KuError> {
+    if verified.path != staging.artifact {
+        return Err(KuError::message(
+            "failed to install native output: verified artifact is outside its private staging directory",
+        ));
+    }
+    verified.verify_current_path().map_err(|reason| {
+        KuError::message(format!(
+            "failed to install native output: verified staging changed before installation: {reason}"
+        ))
+    })?;
+    verify_link_destination_unchanged(&staging.output, &staging.initial_destination)?;
+    // The private staging directory shares the destination filesystem. Existing
+    // outputs use the platform replacement primitive; initially absent Unix
+    // outputs use hard-link create-if-absent before unlinking the staging name.
+    // Never delete a previous output as a fallback: a failed install must leave
+    // the last verified artifact intact.
+    replace_link_output_atomically(
+        &verified.path,
+        &staging.output,
+        staging.initial_destination.is_some(),
+    )
+    .map_err(|error| {
+        KuError::message(format!(
+            "failed to atomically install verified native output '{}': {error}",
+            staging.output.display()
+        ))
+    })?;
+    let installed = fs::File::open(&staging.output).map_err(|error| {
+        KuError::message(format!(
+            "failed to reopen installed native output '{}': {error}",
+            staging.output.display()
+        ))
+    })?;
+    let installed_identity = link_library_identity(&installed).map_err(|error| {
+        KuError::message(format!(
+            "failed to identify installed native output '{}': {error}",
+            staging.output.display()
+        ))
+    })?;
+    if !same_open_link_library_contents(&installed_identity, &verified.identity) {
+        return Err(KuError::message(format!(
+            "installed native output '{}' does not match the verified artifact",
+            staging.output.display()
         )));
     }
-    if let Err(error) = install_link_output(temporary, output) {
-        let _ = fs::remove_file(temporary);
-        return Err(error);
-    }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_link_output_atomically(
+    temporary: &Path,
+    output: &Path,
+    destination_existed: bool,
+) -> io::Result<()> {
+    if destination_existed {
+        fs::rename(temporary, output)
+    } else {
+        // hard_link provides same-filesystem create-if-absent semantics: a
+        // destination created after the identity check is never overwritten.
+        fs::hard_link(temporary, output)?;
+        fs::remove_file(temporary)
+    }
+}
+
+#[cfg(windows)]
+fn replace_link_output_atomically(
+    temporary: &Path,
+    output: &Path,
+    destination_existed: bool,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+        let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if value.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native output path contains an embedded NUL",
+            ));
+        }
+        value.push(0);
+        Ok(value)
+    }
+
+    let temporary = wide_path(temporary)?;
+    let output = wide_path(output)?;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if destination_existed {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    // Same-volume MoveFileExW is the Windows rename/replace primitive. Omitting
+    // REPLACE_EXISTING for an initially missing destination also fails closed
+    // if another writer wins the destination race after our identity check.
+    let result = unsafe { MoveFileExW(temporary.as_ptr(), output.as_ptr(), flags) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn compile_c_source(
@@ -2894,14 +6045,23 @@ fn compile_c_source(
     static_link: bool,
     verbose: bool,
 ) -> Result<(), KuError> {
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            KuError::message(format!(
-                "failed to create output directory '{}': {err}",
-                parent.display()
-            ))
-        })?;
+    let link_started = Instant::now();
+    let link_deadline = link_started
+        .checked_add(NATIVE_LINK_TOTAL_TIMEOUT)
+        .unwrap_or(link_started);
+    validate_native_output_name(output)?;
+    if target.is_none() && supported_host_build_target().is_none() {
+        return Err(KuError::message(
+            "native C linking is not validated for this host architecture\nhelp: emit C only, or use an explicit supported target: x86_64-linux, x86_64-windows, aarch64-darwin",
+        ));
     }
+    let output_directory = link_output_directory(output);
+    fs::create_dir_all(output_directory).map_err(|err| {
+        KuError::message(format!(
+            "failed to create output directory '{}': {err}",
+            output_directory.display()
+        ))
+    })?;
     let features = CSourceFeatures::inspect(source)?;
     validate_c_target_features(features, target)?;
     // Native HTTP/Redis use a portable socket layer. Its Windows branch needs
@@ -2913,49 +6073,230 @@ fn compile_c_source(
         .unwrap_or(cfg!(windows));
     let needs_winsock = target_is_windows && features.winsock;
     let needs_pthreads = !target_is_windows && features.pthreads;
-    // `#pragma comment(lib, ...)` is MSVC-specific.  The generic clang/gcc/zig
-    // path must pass database libraries explicitly or a valid std.pg/std.mysql
-    // program compiles to C and then fails at the final link step.
+    // Every compiler receives one exact libpq path. This prevents an implicit
+    // search path from selecting a static or wrong-target archive.
     let needs_libpq = features.libpq;
     validate_libpq_link_mode(needs_libpq, static_link)?;
     let needs_libmysql = features.libmysql && target.is_none_or(BuildTarget::matches_host);
-    let libmysql_dir = needs_libmysql.then(detect_libmysql_dir).flatten();
-    let libmysql_include = needs_libmysql
-        .then(|| detect_libmysql_include_dir(libmysql_dir.as_deref()))
-        .flatten();
-    let libpq_target = libpq_link_target(target);
+    validate_libmysql_link_mode(needs_libmysql, static_link)?;
+    let libmysql_directory = if needs_libmysql {
+        Some(detect_libmysql_directory()?.ok_or_else(missing_shared_libmysql_error)?)
+    } else {
+        None
+    };
+    let libmysql_include = if needs_libmysql {
+        detect_libmysql_include_dir(
+            libmysql_directory
+                .as_ref()
+                .map(|snapshot| snapshot.dir.as_path()),
+        )?
+    } else {
+        None
+    };
+    let libpq_platform = libpq_link_platform(target);
+    let explicit_libpq_dir = if needs_libpq {
+        Some(
+            explicit_libpq_directory(env::var_os("KU_PG_LIB"))?
+                .ok_or_else(missing_shared_libpq_error)?,
+        )
+    } else {
+        None
+    };
+    let mut deferred_libpq_error = None;
+    let mut deferred_libmysql_error = None;
+    let mut compiler_failures = Vec::new();
     let mut tried = Vec::new();
-    let env_cc = env::var("KU_CC").ok();
-    let temporary_output = target.map(|_| temporary_link_output(output));
-    if let Some(temporary) = &temporary_output {
-        if let Some(parent) = temporary.parent() {
-            cleanup_stale_link_outputs(parent)?;
-        }
-        prepare_link_output_staging(temporary)?;
-    }
+    let env_cc = configured_c_compiler(env::var_os("KU_CC"))?;
     for candidate in c_compiler_candidates(env_cc.as_deref()) {
+        let declared_target = match compiler_declared_target(&candidate) {
+            Ok(target) => target,
+            Err(error) => {
+                if candidate.explicitly_configured {
+                    return Err(error);
+                }
+                compiler_failures.push(format!("{}: {error}", candidate.label));
+                continue;
+            }
+        };
         if let Some(target) = target {
             if !c_compiler_supports_explicit_target(&candidate, target) {
                 continue;
             }
+        } else if let (Some(host), Some(declared)) =
+            (supported_host_build_target(), declared_target)
+        {
+            if !compiler_target_matches_build(declared, &host) {
+                let error = KuError::message(format!(
+                    "configured compiler target '{declared}' conflicts with this host"
+                ));
+                if candidate.explicitly_configured {
+                    return Err(error);
+                }
+                compiler_failures.push(format!("{}: {error}", candidate.label));
+                continue;
+            }
         }
+        let target_arguments = if let Some(target) = target {
+            match c_compiler_target_arguments(&candidate, target) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    compiler_failures.push(format!("{}: {error}", candidate.label));
+                    continue;
+                }
+            }
+        } else {
+            Vec::new()
+        };
         tried.push(candidate.label.clone());
-        let libpq_format = libpq_library_format(libpq_target.platform, &candidate);
-        let libpq_dir = if needs_libpq {
-            detect_libpq_dir(libpq_format, libpq_target.allow_host_discovery)?
+        let probed_clang_target = if (needs_libpq || needs_libmysql)
+            && libpq_platform == LibpqLibraryPlatform::Windows
+            && target.is_none()
+            && candidate.kind == CCompilerKind::Clang
+            && declared_target.is_none()
+        {
+            match probe_clang_default_target(&candidate, link_deadline) {
+                Ok(target) => Some(target),
+                Err(error) if build_cleanup_is_unconfirmed(&error) => {
+                    return Err(KuError::message(format!(
+                        "compiler target probe cleanup failed closed: {error}"
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if candidate.explicitly_configured {
+                        return Err(KuError::message(format!(
+                            "failed to run configured C compiler '{}' target probe: {error}",
+                            candidate.label
+                        )));
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(KuError::message(format!(
+                            "failed to determine configured C compiler '{}' target: {error}",
+                            candidate.label
+                        )));
+                    }
+                    compiler_failures
+                        .push(format!("{} target probe failed: {error}", candidate.label));
+                    continue;
+                }
+            }
         } else {
             None
         };
+        let database_library_format = if needs_libpq || needs_libmysql {
+            match libpq_library_format_for_compiler(
+                libpq_platform,
+                &candidate,
+                target,
+                probed_clang_target.as_deref(),
+            ) {
+                Ok(format) => Some(format),
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    if needs_libpq && deferred_libpq_error.is_none() {
+                        deferred_libpq_error = Some(error.clone());
+                    }
+                    if needs_libmysql && deferred_libmysql_error.is_none() {
+                        deferred_libmysql_error = Some(error);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let libpq_library = if needs_libpq {
+            let snapshot = explicit_libpq_dir
+                .as_ref()
+                .expect("std.pg requires an explicit KU_PG_LIB snapshot");
+            match libpq_library_from_explicit_directory(
+                snapshot,
+                database_library_format.expect("database library format was resolved"),
+            ) {
+                Ok(library) => Some(library),
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    if deferred_libpq_error.is_none() {
+                        deferred_libpq_error = Some(error);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let libmysql_library = if needs_libmysql {
+            let snapshot = libmysql_directory
+                .as_ref()
+                .expect("std.mysql requires an exact client library snapshot");
+            match libmysql_library_from_directory(
+                snapshot,
+                database_library_format.expect("database library format was resolved"),
+            ) {
+                Ok(library) => Some(library),
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    if deferred_libmysql_error.is_none() {
+                        deferred_libmysql_error = Some(error);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let libpq_requirement = libpq_library
+            .as_ref()
+            .map(|library| {
+                libpq_runtime_dependency(
+                    library,
+                    database_library_format.expect("database library format was resolved"),
+                )
+            })
+            .transpose()?;
+        let staged_libpq_library = libpq_library
+            .as_ref()
+            .map(|library| library.stage_for_link("libpq"))
+            .transpose()?;
+        let staged_libmysql_library = libmysql_library
+            .as_ref()
+            .map(|library| library.library.stage_for_link("MySQL client"))
+            .transpose()?;
+        let mysql_requirement = libmysql_library
+            .as_ref()
+            .map(|library| {
+                mysql_runtime_dependency(
+                    &library.library,
+                    database_library_format.expect("database library format was resolved"),
+                )
+            })
+            .transpose()?;
+        // A failed compiler may leave a partial file. Each automatic fallback
+        // starts from a fresh staging path and can never touch the old output.
+        let output_staging = LinkOutputStaging::create(output)?;
+        let temporary_output = output_staging.path();
         let mut command = Command::new(&candidate.program);
         for arg in &candidate.args {
             command.arg(arg);
         }
-        if let Some(target) = target {
-            for argument in c_compiler_target_arguments(candidate.kind, target) {
-                command.arg(argument);
-            }
+        for argument in target_arguments {
+            command.arg(argument);
         }
-        let compiler_output = temporary_output.as_deref().unwrap_or(output);
+        if let Some(probed_target) = &probed_clang_target {
+            command.arg(format!("--target={probed_target}"));
+        }
+        let compiler_output = temporary_output;
         command
             .arg(source)
             .arg("-std=c11")
@@ -2977,85 +6318,82 @@ fn compile_c_source(
             command.arg("-pthread");
         }
         if needs_libpq {
-            if let Some(dir) = &libpq_dir {
-                if matches!(
-                    libpq_format,
-                    LibpqLibraryFormat::WindowsMsvc | LibpqLibraryFormat::WindowsMingw
-                ) {
-                    if let Some(library) = find_libpq_library(dir, libpq_format) {
-                        command.arg(library);
-                    } else {
-                        // The library can disappear between discovery and command
-                        // construction. Let the linker report that race normally.
-                        command.arg("-lpq");
-                    }
-                } else {
-                    command.arg(format!("-L{}", dir.display()));
-                    if let Some(library) = find_libpq_library(dir, libpq_format) {
-                        command.arg(library);
-                    } else {
-                        // The library can disappear between discovery and command
-                        // construction. Let the linker report that race normally.
-                        command.arg("-lpq");
-                    }
-                }
-            } else {
-                command.arg("-lpq");
-            }
+            let library = staged_libpq_library
+                .as_ref()
+                .expect("a PG compiler candidate has a private libpq link copy");
+            command.arg(strip_verbatim(library.path()));
         }
         if needs_libmysql {
-            if let Some(dir) = &libmysql_dir {
-                if cfg!(windows) {
-                    command.arg(dir.join("libmysql.lib"));
-                } else if let Some(library) = libmysql_library_in(dir) {
-                    command.arg(library);
-                } else {
-                    command
-                        .arg(format!("-L{}", dir.display()))
-                        .arg("-lmysqlclient");
-                }
-            } else {
-                command.arg("-lmysqlclient");
+            if let Some(library) = &staged_libmysql_library {
+                command.arg(strip_verbatim(library.path()));
             }
         }
         if verbose {
             println!("c compiler command: {command:?}");
         }
-        match command.status() {
+        let compiler_timeout = remaining_build_phase_timeout(
+            link_deadline,
+            C_COMPILER_PROCESS_TIMEOUT,
+            "C compiler execution",
+        )
+        .map_err(|error| KuError::message(error.to_string()))?;
+        match run_build_process_bounded(&mut command, compiler_timeout) {
             Ok(status) if status.success() => {
-                if let Some(target) = target {
-                    let temporary = temporary_output
-                        .as_deref()
-                        .expect("an explicit target always links to staging");
-                    finalize_explicit_target_output(
-                        temporary,
-                        output,
-                        source,
-                        target,
-                        &candidate.label,
-                    )?;
-                }
+                let verified = match validate_link_output_candidate(
+                    temporary_output,
+                    source,
+                    target,
+                    &candidate.label,
+                    features,
+                    libpq_requirement.as_ref(),
+                    mysql_requirement.as_ref(),
+                ) {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        if candidate.explicitly_configured {
+                            return Err(error);
+                        }
+                        compiler_failures.push(format!("{}: {error}", candidate.label));
+                        continue;
+                    }
+                };
+                install_verified_link_output(verified, &output_staging)?;
                 return Ok(());
             }
             Ok(status) => {
-                if let Some(temporary) = &temporary_output {
-                    let _ = fs::remove_file(temporary);
+                if candidate.explicitly_configured {
+                    return Err(KuError::message(format!(
+                        "native C build failed: configured compiler '{}' exited with {status}\nhelp: inspect generated source at {} and repair KU_CC or its target sysroot",
+                        candidate.label,
+                        source.display()
+                    )));
                 }
+                compiler_failures.push(format!("{} exited with {status}", candidate.label));
+                continue;
+            }
+            Err(err) if build_cleanup_is_unconfirmed(&err) => {
                 return Err(KuError::message(format!(
-                    "native C build failed: {} exited with {status}\nhelp: inspect generated source at {} and install the selected target's compiler/sysroot; Ku never falls back to a host binary",
-                    candidate.label,
-                    source.display()
+                    "native compiler cleanup failed closed: {err}"
                 )));
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                if let Some(temporary) = &temporary_output {
-                    let _ = fs::remove_file(temporary);
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if candidate.explicitly_configured {
+                    return Err(KuError::message(format!(
+                        "failed to run configured C compiler '{}': {err}\nhelp: set KU_CC to an installed compiler command",
+                        candidate.label
+                    )));
                 }
-                return Err(KuError::message(format!(
-                    "failed to run C compiler '{}': {err}\nhelp: set KU_CC to clang, gcc, or 'zig cc', or use default `ku build`",
-                    candidate.label
-                )));
+                continue;
+            }
+            Err(err) => {
+                if candidate.explicitly_configured {
+                    return Err(KuError::message(format!(
+                        "failed to run configured C compiler '{}': {err}\nhelp: repair KU_CC or use a different installed compiler command",
+                        candidate.label
+                    )));
+                }
+                compiler_failures.push(format!("{} could not run: {err}", candidate.label));
+                continue;
             }
         }
     }
@@ -3063,39 +6401,128 @@ fn compile_c_source(
     // toolchain located via vswhere and driven through vcvars64.bat. Only for the
     // native target. An explicit target that exactly matches this host may use
     // the same fallback; a real cross build still requires zig/clang or KU_CC.
-    if target.is_none() || target.is_some_and(BuildTarget::matches_host) {
-        if let Some(vcvars) = detect_msvc_vcvars() {
+    if cfg!(windows) && (target.is_none() || target.is_some_and(BuildTarget::matches_host)) {
+        let vcvars = match detect_msvc_vcvars(link_deadline) {
+            Ok(vcvars) => vcvars,
+            Err(error) => {
+                compiler_failures.push(format!("MSVC discovery failed: {error}"));
+                None
+            }
+        };
+        if let Some(vcvars) = vcvars {
             tried.push("cl (MSVC)".to_string());
-            let compiler_output = temporary_output.as_deref().unwrap_or(output);
-            let result = compile_with_msvc(
-                &vcvars,
-                source,
-                compiler_output,
-                features,
-                profile,
-                static_link,
-                verbose,
-            );
-            if let Err(error) = result {
-                if let Some(temporary) = &temporary_output {
-                    let _ = fs::remove_file(temporary);
-                }
-                return Err(error);
-            }
-            if let Some(target) = target {
-                finalize_explicit_target_output(
-                    compiler_output,
-                    output,
+            let output_staging = LinkOutputStaging::create(output)?;
+            let compiler_output = output_staging.path();
+            let result = (|| -> Result<
+                (
+                    Option<LibpqRuntimeDependency>,
+                    Option<MysqlRuntimeDependency>,
+                ),
+                KuError,
+            > {
+                let msvc_libpq_library = if needs_libpq {
+                    Some(libpq_library_from_explicit_directory(
+                        explicit_libpq_dir
+                            .as_ref()
+                            .expect("std.pg requires an explicit KU_PG_LIB snapshot"),
+                        LibpqLibraryFormat::WindowsMsvc,
+                    )?)
+                } else {
+                    None
+                };
+                let msvc_libmysql_library = if needs_libmysql {
+                    Some(libmysql_library_from_directory(
+                        libmysql_directory
+                            .as_ref()
+                            .expect("std.mysql requires an exact client library snapshot"),
+                        LibpqLibraryFormat::WindowsMsvc,
+                    )?)
+                } else {
+                    None
+                };
+                let staged_msvc_libpq_library = msvc_libpq_library
+                    .as_ref()
+                    .map(|library| library.stage_for_link("libpq"))
+                    .transpose()?;
+                let staged_msvc_libmysql_library = msvc_libmysql_library
+                    .as_ref()
+                    .map(|library| library.library.stage_for_link("MySQL client"))
+                    .transpose()?;
+                let libpq_requirement = msvc_libpq_library
+                    .as_ref()
+                    .map(|library| {
+                        libpq_runtime_dependency(library, LibpqLibraryFormat::WindowsMsvc)
+                    })
+                    .transpose()?;
+                let mysql_requirement = msvc_libmysql_library
+                    .as_ref()
+                    .map(|library| {
+                        mysql_runtime_dependency(&library.library, LibpqLibraryFormat::WindowsMsvc)
+                    })
+                    .transpose()?;
+                compile_with_msvc(
+                    &vcvars,
                     source,
-                    target,
-                    "cl (MSVC)",
+                    compiler_output,
+                    MsvcDatabaseLinks {
+                        libpq: staged_msvc_libpq_library
+                            .as_ref()
+                            .map(StagedLinkLibrary::path),
+                        libmysql: staged_msvc_libmysql_library
+                            .as_ref()
+                            .map(StagedLinkLibrary::path),
+                        libmysql_include: libmysql_include.as_deref(),
+                    },
+                    MsvcCompileOptions {
+                        profile,
+                        static_link,
+                        verbose,
+                        deadline: link_deadline,
+                    },
                 )?;
+                Ok((libpq_requirement, mysql_requirement))
+            })();
+            match result {
+                Err(error) => {
+                    if error
+                        .to_string()
+                        .contains(BUILD_PROCESS_CLEANUP_UNCONFIRMED)
+                    {
+                        return Err(error);
+                    }
+                    compiler_failures.push(format!("cl (MSVC): {error}"));
+                }
+                Ok((libpq_requirement, mysql_requirement)) => {
+                    finalize_link_output(
+                        &output_staging,
+                        source,
+                        target,
+                        "cl (MSVC)",
+                        features,
+                        libpq_requirement.as_ref(),
+                        mysql_requirement.as_ref(),
+                    )?;
+                    return Ok(());
+                }
             }
-            return Ok(());
         }
     }
-    if let Some(temporary) = &temporary_output {
-        let _ = fs::remove_file(temporary);
+    if !compiler_failures.is_empty() {
+        return Err(KuError::message(format!(
+            "native C build failed with every available automatic compiler: {}\nhelp: inspect generated source at {} and set KU_CC to one known-good compiler command",
+            compiler_failures.join("; "),
+            source.display()
+        )));
+    }
+    if let Some(error) = deferred_libpq_error {
+        return Err(KuError::message(format!(
+            "native C build found no runnable compiler paired with a compatible libpq import/shared library: {error}\nhelp: keep one target ABI in KU_PG_LIB and set KU_CC to the matching compiler when automatic discovery is unavailable"
+        )));
+    }
+    if let Some(error) = deferred_libmysql_error {
+        return Err(KuError::message(format!(
+            "native C build found no runnable compiler paired with a compatible MySQL import/shared library: {error}\nhelp: keep one target ABI in KU_MYSQL_LIB and set KU_CC to the matching compiler when automatic discovery is unavailable"
+        )));
     }
     let target_help = target.map_or_else(
         || "install clang/gcc/zig or Visual Studio (MSVC)".to_string(),
@@ -3121,56 +6548,193 @@ fn c_compiler_supports_explicit_target(
         || candidate.explicitly_configured
 }
 
-fn c_compiler_target_arguments(kind: CCompilerKind, target: &BuildTarget) -> Vec<String> {
-    match kind {
+fn compiler_declared_target(candidate: &CCompilerCandidate) -> Result<Option<&str>, KuError> {
+    let mut declared = None;
+    let mut index = 0usize;
+    while index < candidate.args.len() {
+        let argument = candidate.args[index].as_str();
+        let value = if argument == "--target" || argument == "-target" {
+            index += 1;
+            Some(
+                candidate
+                    .args
+                    .get(index)
+                    .ok_or_else(|| {
+                        KuError::message(format!(
+                            "configured compiler '{}' has a target flag without a triple",
+                            candidate.label
+                        ))
+                    })?
+                    .as_str(),
+            )
+        } else {
+            argument
+                .strip_prefix("--target=")
+                .or_else(|| argument.strip_prefix("-target="))
+        };
+        if let Some(value) = value {
+            if value.is_empty() {
+                return Err(KuError::message(format!(
+                    "configured compiler '{}' has an empty target triple",
+                    candidate.label
+                )));
+            }
+            if declared.is_some_and(|previous: &str| !previous.eq_ignore_ascii_case(value)) {
+                return Err(KuError::message(format!(
+                    "configured compiler '{}' declares conflicting target triples",
+                    candidate.label
+                )));
+            }
+            declared = Some(value);
+        }
+        index += 1;
+    }
+    Ok(declared)
+}
+
+fn compiler_target_matches_build(value: &str, target: &BuildTarget) -> bool {
+    let value = value.to_ascii_lowercase();
+    let architecture_matches = match target.binary_format {
+        NativeBinaryFormat::ElfX86_64 | NativeBinaryFormat::PeX86_64 => {
+            value.contains("x86_64") || value.contains("amd64")
+        }
+        NativeBinaryFormat::MachOArm64 => value.contains("aarch64") || value.contains("arm64"),
+    };
+    let operating_system_matches = match target.binary_format {
+        NativeBinaryFormat::ElfX86_64 => value.contains("linux"),
+        NativeBinaryFormat::PeX86_64 => value.contains("windows") || value.contains("mingw"),
+        NativeBinaryFormat::MachOArm64 => {
+            value.contains("darwin") || value.contains("apple") || value.contains("macos")
+        }
+    };
+    architecture_matches && operating_system_matches
+}
+
+fn probe_clang_default_target(
+    candidate: &CCompilerCandidate,
+    deadline: Instant,
+) -> io::Result<String> {
+    let mut command = Command::new(&candidate.program);
+    command.args(&candidate.args).arg("-dumpmachine");
+    let timeout = remaining_build_phase_timeout(
+        deadline,
+        COMPILER_TARGET_PROBE_TIMEOUT,
+        "clang target probe",
+    )?;
+    let (status, stdout) =
+        run_build_process_capture_stdout(&mut command, timeout, MAX_COMPILER_TARGET_BYTES)?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "compiler target probe exited with {status}"
+        )));
+    }
+    let target = std::str::from_utf8(&stdout)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "compiler target is not UTF-8"))?
+        .trim();
+    if target.is_empty() || target.chars().any(char::is_whitespace) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compiler target probe returned an empty or malformed triple",
+        ));
+    }
+    Ok(target.to_string())
+}
+
+fn c_compiler_target_arguments(
+    candidate: &CCompilerCandidate,
+    target: &BuildTarget,
+) -> Result<Vec<String>, KuError> {
+    if let Some(declared) = compiler_declared_target(candidate)? {
+        if !compiler_target_matches_build(declared, target) {
+            return Err(KuError::message(format!(
+                "configured compiler target '{declared}' conflicts with Ku build target '{}'",
+                target.slug
+            )));
+        }
+        return Ok(Vec::new());
+    }
+    Ok(match candidate.kind {
         CCompilerKind::ZigCc => vec!["-target".to_string(), target.c_triple.to_string()],
         // Clang accepts the GNU-style target option only in its joined form.
         // Passing `--target` and the triple as separate argv entries is rejected
         // by both Apple Clang and the LLVM Clang shipped on GitHub runners.
         CCompilerKind::Clang => vec![format!("--target={}", target.rust_triple)],
         CCompilerKind::Preconfigured => Vec::new(),
-    }
+    })
 }
 
 /// Locate a native MSVC toolchain by asking vswhere for the latest install that
 /// carries the VC C/C++ tools, then returning its `vcvars64.bat`. Returns `None`
 /// when vswhere or Visual Studio is absent (e.g. non-Windows hosts).
-fn detect_msvc_vcvars() -> Option<PathBuf> {
+fn detect_msvc_vcvars(deadline: Instant) -> Result<Option<PathBuf>, KuError> {
     let program_files_x86 = env::var("ProgramFiles(x86)")
         .or_else(|_| env::var("ProgramFiles"))
-        .ok()?;
+        .ok();
+    let Some(program_files_x86) = program_files_x86 else {
+        return Ok(None);
+    };
+    if !Path::new(&program_files_x86).is_absolute() {
+        return Err(KuError::message(
+            "Visual Studio discovery root is not absolute; refusing to execute vswhere",
+        ));
+    }
     let vswhere = Path::new(&program_files_x86)
         .join("Microsoft Visual Studio")
         .join("Installer")
         .join("vswhere.exe");
-    if !vswhere.exists() {
-        return None;
+    if !path_is_plain_regular_file(&vswhere) {
+        return Ok(None);
     }
-    let output = Command::new(&vswhere)
-        .args([
-            "-latest",
-            "-products",
-            "*",
-            "-requires",
-            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-            "-property",
-            "installationPath",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    let mut command = Command::new(&vswhere);
+    command.args([
+        "-utf8",
+        "-latest",
+        "-products",
+        "*",
+        "-requires",
+        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+        "-property",
+        "installationPath",
+    ]);
+    let timeout = remaining_build_phase_timeout(
+        deadline,
+        BUILD_TOOL_PROBE_TIMEOUT,
+        "Visual Studio discovery",
+    )
+    .map_err(|error| KuError::message(error.to_string()))?;
+    let (status, stdout) =
+        run_build_process_capture_stdout(&mut command, timeout, MAX_BUILD_TOOL_CAPTURE_BYTES)
+            .map_err(|error| {
+                KuError::message(format!(
+                    "failed to run bounded Visual Studio discovery '{}': {error}",
+                    vswhere.display()
+                ))
+            })?;
+    if !status.success() {
+        return Err(KuError::message(format!(
+            "Visual Studio discovery '{}' exited with {status}",
+            vswhere.display()
+        )));
     }
-    let install = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let install = std::str::from_utf8(&stdout)
+        .map_err(|_| KuError::message("vswhere returned a non-UTF-8 installation path"))?
+        .trim()
+        .to_string();
     if install.is_empty() {
-        return None;
+        return Ok(None);
     }
     let vcvars = Path::new(&install)
         .join("VC")
         .join("Auxiliary")
         .join("Build")
         .join("vcvars64.bat");
-    vcvars.exists().then_some(vcvars)
+    if !path_is_plain_regular_file(&vcvars) {
+        return Err(KuError::message(format!(
+            "Visual Studio discovery returned '{}', but vcvars64.bat is missing",
+            install
+        )));
+    }
+    Ok(Some(vcvars))
 }
 
 /// Compile a generated C source with MSVC `cl.exe`. cl needs INCLUDE/LIB/PATH
@@ -3178,16 +6742,29 @@ fn detect_msvc_vcvars() -> Option<PathBuf> {
 /// the cl process directly (no `cmd`, which cannot handle the `\\?\` verbatim
 /// paths that `fs::canonicalize` produces). `/utf-8` keeps diagnostics readable
 /// regardless of the console code page.
+#[derive(Clone, Copy)]
+struct MsvcDatabaseLinks<'a> {
+    libpq: Option<&'a Path>,
+    libmysql: Option<&'a Path>,
+    libmysql_include: Option<&'a Path>,
+}
+
+#[derive(Clone, Copy)]
+struct MsvcCompileOptions {
+    profile: BuildProfile,
+    static_link: bool,
+    verbose: bool,
+    deadline: Instant,
+}
+
 fn compile_with_msvc(
     vcvars: &Path,
     source: &Path,
     output: &Path,
-    features: CSourceFeatures,
-    profile: BuildProfile,
-    static_link: bool,
-    verbose: bool,
+    database: MsvcDatabaseLinks<'_>,
+    options: MsvcCompileOptions,
 ) -> Result<(), KuError> {
-    let env = load_vcvars_env(vcvars)?;
+    let env = load_vcvars_env(vcvars, options.deadline)?;
     let cl = find_cl_in_env(&env).ok_or_else(|| {
         KuError::message(
             "located Visual Studio but cl.exe was not on the vcvars PATH\nhelp: repair the \"Desktop development with C++\" workload, or install clang/gcc/zig and set KU_CC",
@@ -3205,57 +6782,61 @@ fn compile_with_msvc(
         command.env(key, value);
     }
     command.arg("/nologo").arg("/std:c11").arg("/utf-8");
-    if let Some(opt) = profile.msvc_opt_flag() {
+    if let Some(opt) = options.profile.msvc_opt_flag() {
         command.arg(opt);
     }
-    if static_link {
+    if options.static_link {
         command.arg("/MT");
     }
-    let libmysql_dir = features.libmysql.then(detect_libmysql_dir).flatten();
-    if features.libmysql {
-        if let Some(include) = detect_libmysql_include_dir(libmysql_dir.as_deref()) {
-            command.arg(format!("/I{}", include.display()));
+    if let Some(include) = database.libmysql_include {
+        command.arg(format!("/I{}", strip_verbatim(include).display()));
+    }
+    if let Some(library) = database.libpq {
+        if !path_is_plain_regular_file(library) {
+            return Err(KuError::message(format!(
+                "selected libpq library '{}' changed before linking; refusing to fall back",
+                library.display()
+            )));
         }
     }
     command.arg(&source);
     command.arg(format!("/Fe:{}", output.display()));
     command.arg(format!("/Fo:{}", obj.display()));
-    // A `std.pg` program links libpq.lib (named via a pragma). MSVC needs its search
-    // path since libpq is not on the default lib path.
-    if features.libpq {
-        validate_libpq_link_mode(true, static_link)?;
-        if let Some(dir) = detect_libpq_dir(LibpqLibraryFormat::WindowsMsvc, true)? {
-            command
-                .arg("/link")
-                .arg(format!("/LIBPATH:{}", dir.display()));
+    // Keep a single `/link` boundary: every following argument is consumed by
+    // link.exe, so emitting another `/link` for a second database is invalid.
+    if database.libpq.is_some() || database.libmysql.is_some() {
+        command.arg("/link");
+        if let Some(library) = database.libpq {
+            command.arg(strip_verbatim(library));
+        }
+        if let Some(library) = database.libmysql {
+            if !path_is_plain_regular_file(library) {
+                return Err(KuError::message(format!(
+                    "selected MySQL client library '{}' changed before linking; refusing to fall back",
+                    library.display()
+                )));
+            }
+            command.arg(strip_verbatim(library));
         }
     }
-    if features.libmysql {
-        if let Some(dir) = libmysql_dir {
-            command
-                .arg("/link")
-                .arg(format!("/LIBPATH:{}", dir.display()));
-        }
-    }
-    if verbose {
+    if options.verbose {
         println!("msvc: {} (env from {})", cl.display(), vcvars.display());
     }
 
-    let result = command.output();
+    let timeout = remaining_build_phase_timeout(
+        options.deadline,
+        C_COMPILER_PROCESS_TIMEOUT,
+        "MSVC compiler execution",
+    )
+    .map_err(|error| KuError::message(error.to_string()))?;
+    let result = run_build_process_bounded(&mut command, timeout);
     let _ = fs::remove_file(&obj);
     match result {
-        Ok(done) if done.status.success() => Ok(()),
-        Ok(done) => {
-            let stdout = String::from_utf8_lossy(&done.stdout);
-            let stderr = String::from_utf8_lossy(&done.stderr);
-            Err(KuError::message(format!(
-                "native C build failed: MSVC cl exited with {}\n{}{}help: inspect generated source at {}",
-                done.status,
-                stdout,
-                stderr,
-                source.display()
-            )))
-        }
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(KuError::message(format!(
+            "native C build failed: MSVC cl exited with {status}\nhelp: inspect generated source at {}",
+            source.display()
+        ))),
         Err(err) => Err(KuError::message(format!(
             "failed to run MSVC cl.exe: {err}\nhelp: repair Visual Studio C++ tools, or install clang/gcc/zig and set KU_CC"
         ))),
@@ -3264,29 +6845,83 @@ fn compile_with_msvc(
 
 /// Run `vcvars64.bat` and capture the resulting environment as key/value pairs.
 /// We write a throwaway bat into a plain temp dir (not the `\\?\` build dir) and
-/// run it as `cmd /C <bat>` — passing the vcvars path inside the bat body avoids
-/// the `cmd /C "..."` inner-quote escaping that mangles spaced paths. A marker
-/// line separates any residual vcvars banner from the `set` dump.
-fn load_vcvars_env(vcvars: &Path) -> Result<Vec<(String, String)>, KuError> {
+/// pass the vcvars path as the script's first argument. Keeping that path out of
+/// the ASCII script body preserves non-ASCII Visual Studio install paths. A
+/// marker line separates any residual vcvars banner from the `set` dump.
+fn windows_system_cmd_path() -> Result<PathBuf, KuError> {
+    let root = env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .ok_or_else(|| KuError::message("SystemRoot is missing; cannot locate system cmd.exe"))?;
+    if !root.is_absolute() {
+        return Err(KuError::message(
+            "SystemRoot is not absolute; refusing to search for cmd.exe",
+        ));
+    }
+    let cmd = root.join("System32").join("cmd.exe");
+    if !path_is_plain_regular_file(&cmd) {
+        return Err(KuError::message(format!(
+            "system cmd.exe is missing at '{}'",
+            cmd.display()
+        )));
+    }
+    Ok(cmd)
+}
+
+fn decode_utf16le(bytes: &[u8], what: &str) -> Result<String, KuError> {
+    if bytes.len() % 2 != 0 {
+        return Err(KuError::message(format!(
+            "{what} returned truncated UTF-16LE output"
+        )));
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units)
+        .map_err(|_| KuError::message(format!("{what} returned invalid UTF-16LE output")))
+}
+
+fn load_vcvars_env(vcvars: &Path, deadline: Instant) -> Result<Vec<(String, String)>, KuError> {
     const MARKER: &str = "___KU_VCVARS_ENV___";
-    let bat = env::temp_dir().join(format!("ku_vcvars_probe_{}.bat", std::process::id()));
+    let mut bat = BuildTemporaryPath::new("vcvars-probe", "bat")
+        .map_err(|err| KuError::message(format!("failed to reserve a vcvars probe path: {err}")))?;
     let script = format!(
-        "@echo off\r\ncall \"{}\" >nul 2>&1\r\necho {}\r\nset\r\n",
-        vcvars.display(),
-        MARKER
+        "@echo off\r\ncall \"%~1\" >nul 2>&1\r\nif errorlevel 1 exit /b 1\r\nif not errorlevel 0 exit /b 1\r\necho {MARKER}\r\nset\r\n"
     );
-    fs::write(&bat, script)
-        .map_err(|err| KuError::message(format!("failed to write vcvars probe script: {err}")))?;
-    let result = Command::new("cmd").arg("/C").arg(&bat).output();
-    let _ = fs::remove_file(&bat);
-    let output =
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(bat.as_path())
+        .map_err(|err| KuError::message(format!("failed to create vcvars probe script: {err}")))?;
+    bat.arm();
+    if let Err(err) = file.write_all(script.as_bytes()) {
+        drop(file);
+        return Err(KuError::message(format!(
+            "failed to write vcvars probe script: {err}"
+        )));
+    }
+    drop(file);
+    let mut command = Command::new(windows_system_cmd_path()?);
+    command
+        .args(["/D", "/U", "/C"])
+        .arg(bat.as_path())
+        .arg(vcvars);
+    let timeout = remaining_build_phase_timeout(
+        deadline,
+        BUILD_TOOL_PROBE_TIMEOUT,
+        "vcvars64 environment probe",
+    )
+    .map_err(|error| KuError::message(error.to_string()))?;
+    let result =
+        run_build_process_capture_stdout(&mut command, timeout, MAX_BUILD_TOOL_CAPTURE_BYTES);
+    let (status, stdout) =
         result.map_err(|err| KuError::message(format!("failed to run vcvars64.bat: {err}")))?;
-    if !output.status.success() {
+    if !status.success() {
         return Err(KuError::message(
             "vcvars64.bat failed to initialize the MSVC build environment",
         ));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = decode_utf16le(&stdout, "vcvars64.bat")?;
     let mut vars = Vec::new();
     let mut seen_marker = false;
     for line in text.lines() {
@@ -3319,7 +6954,7 @@ fn find_cl_in_env(env: &[(String, String)]) -> Option<PathBuf> {
             continue;
         }
         let candidate = Path::new(dir).join("cl.exe");
-        if candidate.exists() {
+        if path_is_plain_regular_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -3339,12 +6974,12 @@ fn strip_verbatim(path: &Path) -> PathBuf {
 }
 
 fn c_compiler_candidates(env_cc: Option<&str>) -> Vec<CCompilerCandidate> {
-    let mut candidates = Vec::new();
     if let Some(env_cc) = env_cc {
-        if let Some(candidate) = parse_c_compiler_candidate(env_cc, true) {
-            candidates.push(candidate);
-        }
+        return parse_c_compiler_candidate(env_cc, true)
+            .into_iter()
+            .collect();
     }
+    let mut candidates: Vec<CCompilerCandidate> = Vec::new();
     for fallback in ["zig cc", "clang", "cc", "gcc"] {
         if let Some(candidate) = parse_c_compiler_candidate(fallback, false) {
             if !candidates
@@ -3358,20 +6993,52 @@ fn c_compiler_candidates(env_cc: Option<&str>) -> Vec<CCompilerCandidate> {
     candidates
 }
 
+fn configured_c_compiler(value: Option<OsString>) -> Result<Option<String>, KuError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|_| {
+        KuError::message("KU_CC must be valid Unicode and name exactly one compiler command")
+    })?;
+    let words = split_command_words(&value).map_err(KuError::message)?;
+    if words.is_empty() {
+        return Err(KuError::message(
+            "KU_CC is set but empty; unset it for automatic compiler discovery or set one compiler command",
+        ));
+    }
+    let program_name = Path::new(&words[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&words[0])
+        .to_ascii_lowercase();
+    if matches!(
+        program_name.as_str(),
+        "cl" | "cl.exe" | "clang-cl" | "clang-cl.exe"
+    ) {
+        return Err(KuError::message(
+            "KU_CC requires a GCC-compatible driver command; use clang/zig cc/gcc, or unset KU_CC for automatic MSVC discovery",
+        ));
+    }
+    Ok(Some(value))
+}
+
 fn parse_c_compiler_candidate(
     value: &str,
     explicitly_configured: bool,
 ) -> Option<CCompilerCandidate> {
-    let parts = split_command_words(value);
+    let parts = split_command_words(value).ok()?;
     let (program, args) = parts.split_first()?;
     let label = parts.join(" ");
-    let kind = if program == "zig" && args.first().is_some_and(|arg| arg == "cc") {
-        CCompilerKind::ZigCc
-    } else if Path::new(program)
+    let program_name = Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.to_ascii_lowercase().contains("clang"))
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let kind = if matches!(program_name.as_str(), "zig" | "zig.exe")
+        && args.first().is_some_and(|arg| arg == "cc")
     {
+        CCompilerKind::ZigCc
+    } else if program_name.contains("clang") {
         CCompilerKind::Clang
     } else {
         CCompilerKind::Preconfigured
@@ -3385,12 +7052,28 @@ fn parse_c_compiler_candidate(
     })
 }
 
-fn split_command_words(value: &str) -> Vec<String> {
-    value
-        .split_whitespace()
-        .filter(|part| !part.is_empty())
-        .map(ToString::to_string)
-        .collect()
+fn split_command_words(value: &str) -> Result<Vec<String>, &'static str> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in value.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            character if character.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            character => current.push(character),
+        }
+    }
+    if quoted {
+        return Err("KU_CC contains an unmatched double quote");
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
 }
 
 fn reject_native_async(program: &Program) -> Result<(), KuError> {
@@ -3520,8 +7203,38 @@ struct TempBuildDir {
 }
 
 impl TempBuildDir {
+    #[cfg(test)]
     fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    fn create_private(label: &str) -> io::Result<Self> {
+        const MAX_ATTEMPTS: usize = 8;
+        for _ in 0..MAX_ATTEMPTS {
+            let path = unique_build_tool_path(label, "dir")?;
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+            };
+            #[cfg(not(unix))]
+            let builder = fs::DirBuilder::new();
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a unique private build directory",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 
     fn cleanup(self) {
@@ -5939,6 +9652,176 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_build_process_child_fixture() {
+        #[cfg(windows)]
+        if let Some(started) = env::var_os("KU_TEST_BUILD_GRANDCHILD_STARTED") {
+            let escaped = env::var_os("KU_TEST_BUILD_GRANDCHILD_ESCAPED")
+                .expect("grandchild escaped sentinel path");
+            fs::write(&started, b"started").expect("write grandchild started sentinel");
+            thread::sleep(Duration::from_millis(750));
+            fs::write(&escaped, b"escaped").expect("write grandchild escaped sentinel");
+            return;
+        }
+        #[cfg(windows)]
+        if env::var_os("KU_TEST_SPAWN_BUILD_GRANDCHILD").is_some() {
+            let started = env::var_os("KU_TEST_BUILD_GRANDCHILD_STARTED_PATH")
+                .expect("started sentinel path");
+            let escaped = env::var_os("KU_TEST_BUILD_GRANDCHILD_ESCAPED_PATH")
+                .expect("escaped sentinel path");
+            let mut grandchild = Command::new(env::current_exe().expect("resolve test executable"));
+            grandchild
+                .args([
+                    "--exact",
+                    "cli::tests::bounded_build_process_child_fixture",
+                    "--nocapture",
+                ])
+                .env_remove("KU_TEST_SPAWN_BUILD_GRANDCHILD")
+                .env("KU_TEST_BUILD_GRANDCHILD_STARTED", &started)
+                .env("KU_TEST_BUILD_GRANDCHILD_ESCAPED", &escaped)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let grandchild_process = grandchild
+                .spawn()
+                .expect("spawn immediate build grandchild");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !Path::new(&started).exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                Path::new(&started).is_file(),
+                "grandchild did not start within its bounded fixture window"
+            );
+            // Closing the direct handle without waiting is intentional: the
+            // outer Windows Job must own and terminate this still-live child.
+            drop(grandchild_process);
+            return;
+        }
+        if env::var_os("KU_TEST_HANG_BUILD_CHILD").is_some() {
+            thread::sleep(Duration::from_secs(30));
+        }
+        if env::var_os("KU_TEST_FLOOD_BUILD_CHILD").is_some() {
+            let chunk = [b'x'; 8 * 1024];
+            let mut stdout = io::stdout().lock();
+            for _ in 0..1024 {
+                if stdout.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_process_deadline_terminates_a_hung_child() {
+        let mut command = Command::new(env::current_exe().expect("resolve unit test executable"));
+        command
+            .args([
+                "--exact",
+                "cli::tests::bounded_build_process_child_fixture",
+                "--nocapture",
+            ])
+            .env("KU_TEST_HANG_BUILD_CHILD", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        let error = run_build_process_bounded(&mut command, Duration::from_millis(150))
+            .expect_err("hung build child must hit its absolute deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout cleanup exceeded its bounded grace"
+        );
+    }
+
+    #[test]
+    fn build_process_capture_enforces_its_memory_limit() {
+        let mut command = Command::new(env::current_exe().expect("resolve unit test executable"));
+        command
+            .args([
+                "--exact",
+                "cli::tests::bounded_build_process_child_fixture",
+                "--nocapture",
+            ])
+            .env("KU_TEST_FLOOD_BUILD_CHILD", "1");
+        let started = Instant::now();
+        let error = run_build_process_capture_stdout(&mut command, Duration::from_secs(5), 1024)
+            .expect_err("flooding build child must hit the output cap");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "output-limit cleanup exceeded its deadline"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_build_child_cannot_spawn_before_job_assignment_or_escape_after_exit() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("ku-build-job-race-{}-{nonce}", std::process::id()));
+        fs::create_dir(&dir).expect("create build Job fixture");
+        let started = dir.join("grandchild-started");
+        let escaped = dir.join("grandchild-escaped");
+        let mut command = Command::new(env::current_exe().expect("resolve unit test executable"));
+        command
+            .args([
+                "--exact",
+                "cli::tests::bounded_build_process_child_fixture",
+                "--nocapture",
+            ])
+            .env("KU_TEST_DELAY_BUILD_JOB_ATTACH", "1")
+            .env("KU_TEST_SPAWN_BUILD_GRANDCHILD", "1")
+            .env("KU_TEST_BUILD_GRANDCHILD_STARTED_PATH", &started)
+            .env("KU_TEST_BUILD_GRANDCHILD_ESCAPED_PATH", &escaped)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = run_build_process_bounded(&mut command, Duration::from_secs(3))
+            .expect("Job-contained child fixture must complete");
+        assert!(status.success());
+        assert!(started.is_file(), "contained grandchild must have started");
+        thread::sleep(Duration::from_millis(900));
+        assert!(
+            !escaped.exists(),
+            "grandchild escaped the build Job during the spawn-to-assign window"
+        );
+        fs::remove_dir_all(dir).expect("remove build Job fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vcvars_probe_handles_unicode_paths_and_every_nonzero_exit() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("ku-vcvars-工具链-{}-{nonce}", std::process::id()));
+        let guard = TempBuildDir::new(dir.clone());
+        fs::create_dir(&dir).expect("create Unicode vcvars fixture directory");
+
+        let success = dir.join("vcvars-成功.bat");
+        fs::write(
+            &success,
+            b"@echo off\r\nset KU_TEST_VCVARS_UNICODE_PATH=ok\r\nexit /b 0\r\n",
+        )
+        .expect("write successful vcvars fixture");
+        let deadline = Instant::now() + BUILD_TOOL_PROBE_TIMEOUT;
+        let vars = load_vcvars_env(&success, deadline).expect("load vcvars from a Unicode path");
+        assert!(vars.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("KU_TEST_VCVARS_UNICODE_PATH") && value == "ok"
+        }));
+
+        let failure = dir.join("vcvars-失败.bat");
+        fs::write(&failure, b"@echo off\r\nexit /b -1\r\n").expect("write failing vcvars fixture");
+        let error = load_vcvars_env(&failure, Instant::now() + BUILD_TOOL_PROBE_TIMEOUT)
+            .expect_err("a negative vcvars exit code must fail closed")
+            .to_string();
+        assert!(error.contains("failed to initialize"));
+        guard.cleanup();
+    }
+
+    #[test]
     fn package_yank_has_one_cli_shape_and_bounded_arguments() {
         assert!(HELP.contains("ku package yank [path]"));
         assert!(!HELP.contains("ku yank "));
@@ -6555,6 +10438,606 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    fn dependency_elf(names: &[&str]) -> Vec<u8> {
+        dependency_elf_with_soname(names, None)
+    }
+
+    fn dependency_elf_with_soname(names: &[&str], soname: Option<&str>) -> Vec<u8> {
+        let mut elf = vec![0u8; 0x500];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[7] = 3;
+        elf[16..18].copy_from_slice(&3u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x400080u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+
+        let file_len = elf.len() as u64;
+        let load = 64usize;
+        elf[load..load + 4].copy_from_slice(&1u32.to_le_bytes());
+        elf[load + 4..load + 8].copy_from_slice(&5u32.to_le_bytes());
+        elf[load + 16..load + 24].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[load + 24..load + 32].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[load + 32..load + 40].copy_from_slice(&file_len.to_le_bytes());
+        elf[load + 40..load + 48].copy_from_slice(&file_len.to_le_bytes());
+        elf[load + 48..load + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        let mut strings = vec![0u8];
+        let mut offsets = Vec::new();
+        for name in names {
+            offsets.push(strings.len() as u64);
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+        }
+        let soname_offset = soname.map(|name| {
+            let offset = strings.len() as u64;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            offset
+        });
+        let dynamic_size = ((names.len() + 3 + usize::from(soname.is_some())) * 16) as u64;
+        let dynamic_header = load + 56;
+        elf[dynamic_header..dynamic_header + 4].copy_from_slice(&2u32.to_le_bytes());
+        elf[dynamic_header + 4..dynamic_header + 8].copy_from_slice(&4u32.to_le_bytes());
+        elf[dynamic_header + 8..dynamic_header + 16].copy_from_slice(&0x200u64.to_le_bytes());
+        elf[dynamic_header + 16..dynamic_header + 24].copy_from_slice(&0x400200u64.to_le_bytes());
+        elf[dynamic_header + 24..dynamic_header + 32].copy_from_slice(&0x400200u64.to_le_bytes());
+        elf[dynamic_header + 32..dynamic_header + 40].copy_from_slice(&dynamic_size.to_le_bytes());
+        elf[dynamic_header + 40..dynamic_header + 48].copy_from_slice(&dynamic_size.to_le_bytes());
+        elf[dynamic_header + 48..dynamic_header + 56].copy_from_slice(&8u64.to_le_bytes());
+
+        let mut dynamic = 0x200usize;
+        for offset in offsets {
+            elf[dynamic..dynamic + 8].copy_from_slice(&1u64.to_le_bytes());
+            elf[dynamic + 8..dynamic + 16].copy_from_slice(&offset.to_le_bytes());
+            dynamic += 16;
+        }
+        if let Some(offset) = soname_offset {
+            elf[dynamic..dynamic + 8].copy_from_slice(&14u64.to_le_bytes());
+            elf[dynamic + 8..dynamic + 16].copy_from_slice(&offset.to_le_bytes());
+            dynamic += 16;
+        }
+        elf[dynamic..dynamic + 8].copy_from_slice(&5u64.to_le_bytes());
+        elf[dynamic + 8..dynamic + 16].copy_from_slice(&0x400300u64.to_le_bytes());
+        dynamic += 16;
+        elf[dynamic..dynamic + 8].copy_from_slice(&10u64.to_le_bytes());
+        elf[dynamic + 8..dynamic + 16].copy_from_slice(&(strings.len() as u64).to_le_bytes());
+        elf[0x300..0x300 + strings.len()].copy_from_slice(&strings);
+        elf
+    }
+
+    fn dependency_pe(names: &[&str]) -> Vec<u8> {
+        let mut pe = vec![0u8; 0x800];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[60..64].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        pe[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
+        pe[0x96..0x98].copy_from_slice(&0x0022u16.to_le_bytes());
+        pe[0x98..0x9a].copy_from_slice(&0x020bu16.to_le_bytes());
+        pe[0xa8..0xac].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[0xb8..0xbc].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[0xbc..0xc0].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[0xd0..0xd4].copy_from_slice(&0x2000u32.to_le_bytes());
+        pe[0xd4..0xd8].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[0x104..0x108].copy_from_slice(&16u32.to_le_bytes());
+        pe[0x110..0x114].copy_from_slice(&0x1100u32.to_le_bytes());
+        pe[0x114..0x118].copy_from_slice(&(((names.len() + 1) * 20) as u32).to_le_bytes());
+        let section = 0x188usize;
+        pe[section..section + 6].copy_from_slice(b".rdata");
+        pe[section + 8..section + 12].copy_from_slice(&0x600u32.to_le_bytes());
+        pe[section + 12..section + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[section + 16..section + 20].copy_from_slice(&0x600u32.to_le_bytes());
+        pe[section + 20..section + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        pe[section + 36..section + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+
+        let mut string_offset = 0x400usize;
+        for (index, name) in names.iter().enumerate() {
+            let descriptor = 0x300 + index * 20;
+            let name_rva = 0x1000 + (string_offset - 0x200);
+            pe[descriptor + 12..descriptor + 16].copy_from_slice(&(name_rva as u32).to_le_bytes());
+            pe[string_offset..string_offset + name.len()].copy_from_slice(name.as_bytes());
+            string_offset += name.len();
+            pe[string_offset] = 0;
+            string_offset += 1;
+        }
+        pe
+    }
+
+    fn dependency_macho(names: &[&str]) -> Vec<u8> {
+        let mut commands = vec![0u8; 96];
+        commands[..4].copy_from_slice(&0x19u32.to_le_bytes());
+        commands[4..8].copy_from_slice(&72u32.to_le_bytes());
+        commands[32..40].copy_from_slice(&0x1000u64.to_le_bytes());
+        commands[60..64].copy_from_slice(&5u32.to_le_bytes());
+        commands[72..76].copy_from_slice(&0x32u32.to_le_bytes());
+        commands[76..80].copy_from_slice(&24u32.to_le_bytes());
+        commands[80..84].copy_from_slice(&1u32.to_le_bytes());
+        for name in names {
+            let command_size = (24 + name.len() + 1).next_multiple_of(8);
+            let start = commands.len();
+            commands.resize(start + command_size, 0);
+            commands[start..start + 4].copy_from_slice(&0x0cu32.to_le_bytes());
+            commands[start + 4..start + 8].copy_from_slice(&(command_size as u32).to_le_bytes());
+            commands[start + 8..start + 12].copy_from_slice(&24u32.to_le_bytes());
+            commands[start + 24..start + 24 + name.len()].copy_from_slice(name.as_bytes());
+        }
+        let mut macho = vec![0u8; 32 + commands.len()];
+        macho[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        macho[4..8].copy_from_slice(&0x0100_000cu32.to_le_bytes());
+        macho[12..16].copy_from_slice(&2u32.to_le_bytes());
+        macho[16..20].copy_from_slice(&((2 + names.len()) as u32).to_le_bytes());
+        macho[20..24].copy_from_slice(&(commands.len() as u32).to_le_bytes());
+        let file_len = macho.len() as u64;
+        commands[48..56].copy_from_slice(&file_len.to_le_bytes());
+        macho[32..].copy_from_slice(&commands);
+        macho
+    }
+
+    fn mysql_runtime(family: MysqlClientFamily, loader_name: &str) -> MysqlRuntimeDependency {
+        MysqlRuntimeDependency {
+            family,
+            loader_name: loader_name.as_bytes().to_vec(),
+        }
+    }
+
+    fn libpq_runtime(loader_name: &str) -> LibpqRuntimeDependency {
+        LibpqRuntimeDependency {
+            loader_name: loader_name.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn dynamic_dependency_names_require_exact_loader_families_and_numeric_versions() {
+        for name in [b"libpq.dll".as_slice(), b"LIBPQ.SO.5", b"libpq.5.16.dylib"] {
+            assert!(dynamic_library_matches(name, DynamicLibraryFamily::Libpq));
+        }
+        for name in [
+            b"libmysql.dll".as_slice(),
+            b"libmysqlclient.so.21",
+            b"libmysqlclient.21.dylib",
+        ] {
+            assert!(dynamic_library_matches(name, DynamicLibraryFamily::Mysql));
+        }
+        assert!(dynamic_library_matches(
+            b"libmariadb.so.3",
+            DynamicLibraryFamily::Mariadb
+        ));
+        for name in [
+            b"libpq-evil.so".as_slice(),
+            b"libpq_evil.dll",
+            b"libpq.so.evil",
+            b"libpq.5evil.dylib",
+            b"notlibpq.dll",
+        ] {
+            assert!(!dynamic_library_matches(name, DynamicLibraryFamily::Libpq));
+        }
+        for name in [
+            b"libmysql_fake.dll".as_slice(),
+            b"libmysqlclient.so.latest",
+            b"libmysqlclient-evil.dylib",
+            b"libmariadb-evil.dll",
+        ] {
+            assert!(!dynamic_library_matches(name, DynamicLibraryFamily::Mysql));
+            assert!(!dynamic_library_matches(
+                name,
+                DynamicLibraryFamily::Mariadb
+            ));
+        }
+        assert!(dynamic_dependency_references_private_staging(
+            b"/tmp/.ku-link-library-1-deadbeef.dir/libpq.so.5"
+        ));
+        assert!(dynamic_dependency_references_private_staging(
+            b"C:\\temp\\.KU-LINK-1-deadbeef\\libmysql.dll"
+        ));
+        assert!(!dynamic_dependency_references_private_staging(
+            b"@rpath/libmysqlclient.21.dylib"
+        ));
+    }
+
+    #[test]
+    fn mysql_loader_identity_is_bounded_and_format_specific() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "ku-mysql-loader-identity-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create MySQL loader identity fixture");
+
+        let elf_path = dir.join("libmysqlclient.so.21");
+        fs::write(
+            &elf_path,
+            dependency_elf_with_soname(&[], Some("libmysqlclient.so.21")),
+        )
+        .expect("write ELF SONAME fixture");
+        let elf = PinnedLinkLibrary::capture(&elf_path, "MySQL client")
+            .expect("capture ELF SONAME fixture");
+        assert_eq!(
+            mysql_runtime_dependency(&elf, LibpqLibraryFormat::Linux)
+                .expect("read ELF SONAME")
+                .loader_name,
+            b"libmysqlclient.so.21"
+        );
+
+        let macho_path = dir.join("libmysqlclient.21.dylib");
+        let mut macho = dependency_macho(&["@rpath/libmysqlclient.21.dylib"]);
+        let first_dylib = 32 + 96;
+        macho[first_dylib..first_dylib + 4].copy_from_slice(&0x0du32.to_le_bytes());
+        fs::write(&macho_path, macho).expect("write Mach-O install-name fixture");
+        let macho = PinnedLinkLibrary::capture(&macho_path, "MySQL client")
+            .expect("capture Mach-O install-name fixture");
+        assert_eq!(
+            mysql_runtime_dependency(&macho, LibpqLibraryFormat::Darwin)
+                .expect("read Mach-O LC_ID_DYLIB")
+                .loader_name,
+            b"@rpath/libmysqlclient.21.dylib"
+        );
+
+        let import_path = dir.join("libmariadb.lib");
+        let mut import = b"!<arch>\nfixture\0".to_vec();
+        import.extend_from_slice(b"libmariadb.dll\0");
+        fs::write(&import_path, import).expect("write bounded import archive fixture");
+        let import = PinnedLinkLibrary::capture(&import_path, "MySQL client")
+            .expect("capture import archive fixture");
+        let requirement = mysql_runtime_dependency(&import, LibpqLibraryFormat::WindowsMsvc)
+            .expect("read import DLL target");
+        assert_eq!(requirement.family, MysqlClientFamily::Mariadb);
+        assert_eq!(requirement.loader_name, b"libmariadb.dll");
+
+        let conflict_path = dir.join("libmysql.lib");
+        let mut conflict = b"!<arch>\nfixture\0".to_vec();
+        conflict.extend_from_slice(b"libmariadb.dll\0");
+        fs::write(&conflict_path, conflict).expect("write conflicting import archive fixture");
+        let conflict = PinnedLinkLibrary::capture(&conflict_path, "MySQL client")
+            .expect("capture conflicting import archive fixture");
+        let error = mysql_runtime_dependency(&conflict, LibpqLibraryFormat::WindowsMsvc)
+            .expect_err("canonical import alias cannot override the DLL target family")
+            .to_string();
+        assert!(error.contains("conflicting canonical and loader families"));
+        fs::remove_dir_all(dir).expect("remove MySQL loader identity fixture");
+    }
+
+    #[test]
+    fn libpq_loader_identity_is_bounded_and_format_specific() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "ku-libpq-loader-identity-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create libpq loader identity fixture");
+
+        let elf_path = dir.join("libpq.so.5");
+        fs::write(
+            &elf_path,
+            dependency_elf_with_soname(&[], Some("libpq.so.5")),
+        )
+        .expect("write libpq ELF SONAME fixture");
+        let elf = PinnedLinkLibrary::capture(&elf_path, "libpq")
+            .expect("capture libpq ELF SONAME fixture");
+        assert_eq!(
+            libpq_runtime_dependency(&elf, LibpqLibraryFormat::Linux)
+                .expect("read libpq ELF SONAME")
+                .loader_name,
+            b"libpq.so.5"
+        );
+
+        let no_soname_path = dir.join("libpq.so.6");
+        fs::write(&no_soname_path, dependency_elf_with_soname(&[], None))
+            .expect("write libpq ELF fixture without SONAME");
+        let no_soname = PinnedLinkLibrary::capture(&no_soname_path, "libpq")
+            .expect("capture libpq ELF fixture without SONAME");
+        let error = libpq_runtime_dependency(&no_soname, LibpqLibraryFormat::Linux)
+            .expect_err("libpq ELF without SONAME must fail closed")
+            .to_string();
+        assert!(error.contains("no bounded DT_SONAME"));
+
+        let macho_path = dir.join("libpq.5.dylib");
+        let mut macho = dependency_macho(&["@rpath/libpq.5.dylib"]);
+        let first_dylib = 32 + 96;
+        macho[first_dylib..first_dylib + 4].copy_from_slice(&0x0du32.to_le_bytes());
+        fs::write(&macho_path, macho).expect("write libpq Mach-O install-name fixture");
+        let macho = PinnedLinkLibrary::capture(&macho_path, "libpq")
+            .expect("capture libpq Mach-O install-name fixture");
+        assert_eq!(
+            libpq_runtime_dependency(&macho, LibpqLibraryFormat::Darwin)
+                .expect("read libpq Mach-O LC_ID_DYLIB")
+                .loader_name,
+            b"@rpath/libpq.5.dylib"
+        );
+
+        let import_path = dir.join("libpq.lib");
+        let mut import = b"!<arch>\nfixture\0".to_vec();
+        import.extend_from_slice(b"libpq.dll\0");
+        fs::write(&import_path, import).expect("write libpq import archive fixture");
+        let import = PinnedLinkLibrary::capture(&import_path, "libpq")
+            .expect("capture libpq import archive fixture");
+        assert_eq!(
+            libpq_runtime_dependency(&import, LibpqLibraryFormat::WindowsMsvc)
+                .expect("read libpq import DLL target")
+                .loader_name,
+            b"libpq.dll"
+        );
+
+        let preferred_import_path = dir.join("libpqdll.lib");
+        let mut preferred_import = b"!<arch>\nfixture\0".to_vec();
+        preferred_import.extend_from_slice(b"libpq.dll\0");
+        fs::write(&preferred_import_path, preferred_import)
+            .expect("write preferred libpq import archive fixture");
+        let preferred_import = PinnedLinkLibrary::capture(&preferred_import_path, "libpq")
+            .expect("capture preferred libpq import archive fixture");
+        assert_eq!(
+            libpq_runtime_dependency(&preferred_import, LibpqLibraryFormat::WindowsMsvc)
+                .expect("read preferred libpq import DLL target")
+                .loader_name,
+            b"libpq.dll"
+        );
+
+        fs::remove_dir_all(dir).expect("remove libpq loader identity fixture");
+    }
+
+    #[test]
+    fn database_features_require_bounded_dynamic_dependencies_in_every_binary_format() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "ku-dynamic-dependency-format-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create dependency-format fixture");
+        let linux = resolve_build_target(Some("x86_64-linux"))
+            .expect("linux target")
+            .expect("explicit linux target");
+        let windows = resolve_build_target(Some("x86_64-windows"))
+            .expect("windows target")
+            .expect("explicit windows target");
+        let darwin = resolve_build_target(Some("aarch64-darwin"))
+            .expect("darwin target")
+            .expect("explicit darwin target");
+        let features = CSourceFeatures {
+            libpq: true,
+            libmysql: true,
+            ..CSourceFeatures::default()
+        };
+        let fixtures = [
+            (
+                dir.join("app-linux"),
+                linux,
+                dependency_elf(&["libpq.so.5", "libmysqlclient.so.21"]),
+                "libpq.so.5",
+                "libmysqlclient.so.21",
+            ),
+            (
+                dir.join("app.exe"),
+                windows,
+                dependency_pe(&["LIBPQ.dll", "libmysql.dll"]),
+                "libpq.dll",
+                "libmysql.dll",
+            ),
+            (
+                dir.join("app-darwin"),
+                darwin,
+                dependency_macho(&["@rpath/libpq.5.dylib", "/opt/lib/libmysqlclient.21.dylib"]),
+                "@rpath/libpq.5.dylib",
+                "/opt/lib/libmysqlclient.21.dylib",
+            ),
+        ];
+        for (path, target, bytes, libpq_loader_name, mysql_loader_name) in fixtures {
+            fs::write(&path, bytes).expect("write dynamic-dependency fixture");
+            verify_native_binary_target(&path, &target).unwrap_or_else(|error| {
+                panic!("target fixture {:?}: {error}", target.binary_format)
+            });
+            verify_native_binary_dynamic_dependencies(
+                &path,
+                &target,
+                features,
+                Some(&libpq_runtime(libpq_loader_name)),
+                Some(&mysql_runtime(MysqlClientFamily::Mysql, mysql_loader_name)),
+            )
+            .unwrap_or_else(|error| {
+                panic!("dependency fixture {:?}: {error}", target.binary_format)
+            });
+        }
+
+        let missing = dir.join("missing-mysql");
+        fs::write(&missing, dependency_elf(&["libpq.so.5"])).expect("write missing MySQL fixture");
+        let error = verify_native_binary_dynamic_dependencies(
+            &missing,
+            &fixtures_target_linux(),
+            features,
+            Some(&libpq_runtime("libpq.so.5")),
+            Some(&mysql_runtime(
+                MysqlClientFamily::Mysql,
+                "libmysqlclient.so.21",
+            )),
+        )
+        .expect_err("a static/missing MySQL client dependency must fail closed");
+        assert!(error.contains("no dynamic MySQL client"));
+
+        let cross_family = dir.join("cross-family.exe");
+        fs::write(
+            &cross_family,
+            dependency_pe(&["LIBPQ.dll", "libmariadb.dll"]),
+        )
+        .expect("write cross-family MySQL fixture");
+        let windows_target = resolve_build_target(Some("x86_64-windows"))
+            .expect("windows target")
+            .expect("explicit windows target");
+        let error = verify_native_binary_dynamic_dependencies(
+            &cross_family,
+            &windows_target,
+            features,
+            Some(&libpq_runtime("libpq.dll")),
+            Some(&mysql_runtime(MysqlClientFamily::Mysql, "libmysql.dll")),
+        )
+        .expect_err("a MariaDB import cannot satisfy a selected MySQL library");
+        assert!(error.contains("mixes MySQL and MariaDB"));
+        verify_native_binary_dynamic_dependencies(
+            &cross_family,
+            &windows_target,
+            features,
+            Some(&libpq_runtime("libpq.dll")),
+            Some(&mysql_runtime(MysqlClientFamily::Mariadb, "libmariadb.dll")),
+        )
+        .expect("a selected MariaDB import must match its MariaDB runtime dependency");
+
+        let wrong_loader = dir.join("wrong-loader.exe");
+        fs::write(&wrong_loader, dependency_pe(&["LIBPQ.dll", "libmysql.dll"]))
+            .expect("write wrong exact loader fixture");
+        let error = verify_native_binary_dynamic_dependencies(
+            &wrong_loader,
+            &windows_target,
+            features,
+            Some(&libpq_runtime("libpq.dll")),
+            Some(&mysql_runtime(
+                MysqlClientFamily::Mysql,
+                "libmysqlclient.dll",
+            )),
+        )
+        .expect_err("same-family but different DLL target must fail closed");
+        assert!(error.contains("differs from the selected client library"));
+
+        let wrong_libpq_loader = dir.join("wrong-libpq-loader");
+        fs::write(
+            &wrong_libpq_loader,
+            dependency_elf(&["libpq.so.5", "libmysqlclient.so.21"]),
+        )
+        .expect("write wrong exact libpq loader fixture");
+        let error = verify_native_binary_dynamic_dependencies(
+            &wrong_libpq_loader,
+            &fixtures_target_linux(),
+            features,
+            Some(&libpq_runtime("libpq.so.6")),
+            Some(&mysql_runtime(
+                MysqlClientFamily::Mysql,
+                "libmysqlclient.so.21",
+            )),
+        )
+        .expect_err("same-family but different libpq loader target must fail closed");
+        assert!(error.contains("differs from the selected library"));
+
+        let mixed_family = dir.join("mixed-family.exe");
+        fs::write(
+            &mixed_family,
+            dependency_pe(&["LIBPQ.dll", "libmysql.dll", "libmariadb.dll"]),
+        )
+        .expect("write mixed-family fixture");
+        let error = verify_native_binary_dynamic_dependencies(
+            &mixed_family,
+            &windows_target,
+            features,
+            Some(&libpq_runtime("libpq.dll")),
+            Some(&mysql_runtime(MysqlClientFamily::Mysql, "libmysql.dll")),
+        )
+        .expect_err("mixed MySQL and MariaDB imports must fail closed");
+        assert!(error.contains("mixes MySQL and MariaDB"));
+
+        let malformed_elf = dir.join("malformed-elf");
+        let mut elf = dependency_elf(&["libpq.so.5", "libmysqlclient.so.21"]);
+        elf[0x238..0x240].copy_from_slice(&(MAX_DYNAMIC_STRING_TABLE_BYTES + 1).to_le_bytes());
+        fs::write(&malformed_elf, elf).expect("write malformed ELF dependency fixture");
+        assert!(verify_native_binary_dynamic_dependencies(
+            &malformed_elf,
+            &fixtures_target_linux(),
+            features,
+            Some(&libpq_runtime("libpq.so.5")),
+            Some(&mysql_runtime(
+                MysqlClientFamily::Mysql,
+                "libmysqlclient.so.21"
+            ))
+        )
+        .is_err());
+
+        let malformed_pe = dir.join("malformed-pe.exe");
+        let mut pe = dependency_pe(&["LIBPQ.dll", "libmysql.dll"]);
+        pe[0x30c..0x310].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&malformed_pe, pe).expect("write malformed PE dependency fixture");
+        assert!(verify_native_binary_dynamic_dependencies(
+            &malformed_pe,
+            &resolve_build_target(Some("x86_64-windows"))
+                .expect("windows target")
+                .expect("explicit windows target"),
+            features,
+            Some(&libpq_runtime("libpq.dll")),
+            Some(&mysql_runtime(MysqlClientFamily::Mysql, "libmysql.dll"))
+        )
+        .is_err());
+
+        let oversized_optional_pe = dir.join("oversized-optional.exe");
+        let mut pe = dependency_pe(&["LIBPQ.dll", "libmysql.dll"]);
+        pe.resize(16 * 1024, 0);
+        pe[0x94..0x96].copy_from_slice(&((MAX_PE_OPTIONAL_HEADER_BYTES + 1) as u16).to_le_bytes());
+        fs::write(&oversized_optional_pe, pe).expect("write oversized PE optional header fixture");
+        let mut file = fs::File::open(&oversized_optional_pe).expect("open oversized PE fixture");
+        let length = file.metadata().expect("inspect oversized PE fixture").len();
+        let error = read_pe_dynamic_dependencies(&mut file, length)
+            .expect_err("PE dependency parser must independently cap the optional header");
+        assert!(error.contains("bounded import directory"));
+
+        let staged_dependency = dir.join("staged-dependency");
+        fs::write(
+            &staged_dependency,
+            dependency_elf(&[
+                "libpq.so.5",
+                "/tmp/.ku-link-library-1-deadbeef.dir/libmysqlclient.so.21",
+            ]),
+        )
+        .expect("write staged runtime dependency fixture");
+        let error = verify_native_binary_dynamic_dependencies(
+            &staged_dependency,
+            &fixtures_target_linux(),
+            features,
+            Some(&libpq_runtime("libpq.so.5")),
+            Some(&mysql_runtime(
+                MysqlClientFamily::Mysql,
+                "libmysqlclient.so.21",
+            )),
+        )
+        .expect_err("private staging paths must never become runtime dependencies");
+        assert!(error.contains("private Ku staging path"));
+
+        let malformed_macho = dir.join("malformed-macho");
+        let mut macho = dependency_macho(&["libpq.dylib", "libmariadb.dylib"]);
+        let first_dylib = 32 + 96;
+        let command_size = le_u32(&macho, first_dylib + 4);
+        macho[first_dylib + 8..first_dylib + 12].copy_from_slice(&command_size.to_le_bytes());
+        fs::write(&malformed_macho, macho).expect("write malformed Mach-O dependency fixture");
+        assert!(verify_native_binary_dynamic_dependencies(
+            &malformed_macho,
+            &resolve_build_target(Some("aarch64-darwin"))
+                .expect("darwin target")
+                .expect("explicit darwin target"),
+            features,
+            Some(&libpq_runtime("libpq.dylib")),
+            Some(&mysql_runtime(
+                MysqlClientFamily::Mysql,
+                "libmysqlclient.dylib"
+            ))
+        )
+        .is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn fixtures_target_linux() -> BuildTarget {
+        resolve_build_target(Some("x86_64-linux"))
+            .expect("linux target")
+            .expect("explicit linux target")
+    }
+
     #[test]
     fn non_main_package_entries_require_an_explicit_output() {
         let nonce = SystemTime::now()
@@ -6737,90 +11220,195 @@ mod tests {
         let dir = env::temp_dir().join(format!("ku-target-staging-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&dir).expect("create link staging fixture");
         let final_output = dir.join("app.exe");
-        let staging = temporary_link_output(&final_output);
-        assert_eq!(staging.parent(), Some(dir.as_path()));
+        assert_eq!(link_output_directory(Path::new("app.exe")), Path::new("."));
+        assert_eq!(link_output_directory(&final_output), dir.as_path());
+        let reserved_output = dir.join(".ku-link-1-2-3.exe");
+        let error = validate_native_output_name(&reserved_output)
+            .expect_err("final output must not overlap the staging namespace")
+            .to_string();
+        assert!(error.contains("reserved .ku-link-"));
+        let uppercase_reserved = dir.join(".KU-LINK-future-format.exe");
+        assert!(
+            validate_native_output_name(&uppercase_reserved).is_err(),
+            "reserved staging prefix must be rejected case-insensitively"
+        );
+
+        let stale_file = dir.join(".ku-link-stale.exe");
+        let stale_directory = dir.join(".ku-link-stale-dir");
+        fs::write(&stale_file, b"unowned stale artifact").expect("write unowned stale file");
+        fs::create_dir(&stale_directory).expect("create unowned stale directory");
+
+        let first =
+            LinkOutputStaging::create(&final_output).expect("reserve first private staging");
+        let first_directory = first.directory.clone();
+        let first_artifact = first.path().to_path_buf();
+        assert_eq!(first_directory.parent(), Some(dir.as_path()));
+        assert_eq!(first_artifact.parent(), Some(first_directory.as_path()));
         assert_eq!(
-            staging.extension().and_then(|value| value.to_str()),
+            first_artifact.extension().and_then(|value| value.to_str()),
             Some("exe")
         );
-
-        fs::write(&staging, b"old artifact from an interrupted build")
-            .expect("write stale link staging fixture");
-        prepare_link_output_staging(&staging).expect("remove stale regular staging file");
-        assert!(!staging.exists());
-        prepare_link_output_staging(&staging).expect("missing staging is already clean");
-
-        fs::create_dir(&staging).expect("create non-file staging fixture");
-        let error = prepare_link_output_staging(&staging)
-            .expect_err("a non-file staging path must fail closed")
-            .to_string();
-        assert!(error.contains("not a regular file"));
-        assert!(staging.is_dir(), "preparation must not delete a directory");
-        fs::remove_dir(&staging).expect("remove non-file staging fixture");
-
-        let windows = resolve_build_target(Some("x86_64-windows"))
-            .expect("windows target")
-            .expect("explicit windows target");
-        assert!(
-            verify_native_binary_target(&staging, &windows).is_err(),
-            "a successful compiler exit without a new file must not reuse old output"
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&first_directory)
+                .expect("inspect private staging permissions")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "private staging must be owner-only");
+        }
+        fs::write(&first_artifact, b"partial compiler artifact")
+            .expect("write owned staging artifact");
+        let second =
+            LinkOutputStaging::create(&final_output).expect("reserve second private staging");
+        assert_ne!(
+            second.directory, first.directory,
+            "each compiler fallback must receive a fresh random private directory"
         );
+        drop(first);
+        assert!(
+            !first_directory.exists(),
+            "RAII must remove only its private staging directory"
+        );
+        assert!(stale_file.is_file(), "unowned stale file must be preserved");
+        assert!(
+            stale_directory.is_dir(),
+            "unowned stale directory must be preserved"
+        );
+        drop(second);
+
+        let poisoned =
+            LinkOutputStaging::create(&final_output).expect("reserve marker-replacement staging");
+        let poisoned_directory = poisoned.directory.clone();
+        fs::remove_file(&poisoned.marker).expect("remove owned staging marker");
+        fs::write(&poisoned.marker, b"replacement marker").expect("replace owned staging marker");
+        drop(poisoned);
+        assert!(
+            poisoned_directory.is_dir(),
+            "RAII must not recursively delete a directory after its ownership marker is replaced"
+        );
+        fs::remove_dir_all(&poisoned_directory).expect("remove poisoned staging fixture");
+
+        let oversized =
+            LinkOutputStaging::create(&final_output).expect("reserve oversized staging");
+        let file = fs::File::create(oversized.path()).expect("create sparse oversized artifact");
+        file.set_len(MAX_NATIVE_LINK_OUTPUT_BYTES + 1)
+            .expect("extend sparse oversized artifact");
+        drop(file);
+        let error = VerifiedLinkOutput::open(oversized.path())
+            .expect_err("oversized native artifact must fail closed");
+        assert!(error.contains("artifact limit"));
+
+        let invalid_output = dir.join("output-directory.exe");
+        fs::create_dir(&invalid_output).expect("create invalid output directory");
+        assert!(LinkOutputStaging::create(&invalid_output).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn stale_link_cleanup_is_bounded_and_preserves_non_regular_or_recent_entries() {
+    fn native_link_install_is_atomic_and_preserves_the_previous_output_on_failure() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before Unix epoch")
             .as_nanos();
-        let dir = env::temp_dir().join(format!("ku-stale-link-{}-{nonce}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create stale link fixture");
-        let old_one = dir.join(".ku-link-1-1-1.exe");
-        let old_two = dir.join(".ku-link-1-2-2.exe");
-        fs::write(&old_one, b"old").expect("write old staging one");
-        fs::write(&old_two, b"old").expect("write old staging two");
-        std::thread::sleep(Duration::from_millis(30));
-        let now = SystemTime::now();
-        let recent = dir.join(".ku-link-1-3-3.exe");
-        fs::write(&recent, b"recent").expect("write recent staging");
-        let unrelated = dir.join(".ku-link-invalid.exe");
-        fs::write(&unrelated, b"unrelated").expect("write unrelated file");
-        let directory = dir.join(".ku-link-1-4-4.exe");
-        fs::create_dir(&directory).expect("create matching directory");
-
-        #[cfg(unix)]
-        let symlink = {
-            let path = dir.join(".ku-link-1-5-5.exe");
-            std::os::unix::fs::symlink(&old_one, &path).expect("create staging symlink");
-            Some(path)
-        };
-        #[cfg(windows)]
-        let symlink = {
-            let path = dir.join(".ku-link-1-5-5.exe");
-            std::os::windows::fs::symlink_file(&old_one, &path)
-                .ok()
-                .map(|()| path)
-        };
-
-        let deleted =
-            cleanup_stale_link_outputs_with_policy(&dir, now, Duration::from_millis(20), 256, 1)
-                .expect("clean stale staging");
-        assert_eq!(deleted, 1, "deletion cap must be enforced");
+        let dir = env::temp_dir().join(format!("ku-link-install-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create native install fixture");
+        let output = dir.join("app.exe");
+        fs::write(&output, b"old verified output").expect("write old native output");
+        let staging = LinkOutputStaging::create(&output).expect("reserve native staging");
+        fs::write(staging.path(), b"new verified output").expect("write new native staging");
+        let verified = VerifiedLinkOutput::open(staging.path()).expect("open verified staging");
+        install_verified_link_output(verified, &staging)
+            .expect("atomically install new native output");
         assert_eq!(
-            usize::from(old_one.exists()) + usize::from(old_two.exists()),
-            1
+            fs::read(&output).expect("read installed output"),
+            b"new verified output"
         );
-        assert!(recent.exists(), "recent staging must remain active");
-        assert!(unrelated.exists(), "non-matching names must remain");
-        assert!(directory.is_dir(), "matching directories must remain");
-        if let Some(symlink) = symlink {
+        assert!(
+            !staging.path().exists(),
+            "successful install must consume staging artifact"
+        );
+
+        let replaced = LinkOutputStaging::create(&output).expect("reserve replacement staging");
+        fs::write(replaced.path(), b"verified artifact A").expect("write artifact A");
+        let verified = VerifiedLinkOutput::open(replaced.path()).expect("verify artifact A");
+        let displaced = replaced.directory.join("displaced.exe");
+        fs::rename(replaced.path(), &displaced).expect("displace verified staging path");
+        fs::write(replaced.path(), b"unverified artifact B").expect("replace staging path with B");
+        let error = install_verified_link_output(verified, &replaced)
+            .expect_err("verified staging path replacement must fail closed")
+            .to_string();
+        assert!(error.contains("replaced") || error.contains("changed"));
+        assert_eq!(
+            fs::read(&output).expect("read preserved output"),
+            b"new verified output",
+            "staging replacement must never overwrite the previous output"
+        );
+
+        let raced = LinkOutputStaging::create(&output).expect("reserve destination-race staging");
+        fs::write(raced.path(), b"new candidate output").expect("write raced candidate");
+        let verified = VerifiedLinkOutput::open(raced.path()).expect("verify raced candidate");
+        let previous = dir.join("previous-output.exe");
+        fs::rename(&output, &previous).expect("replace destination identity");
+        fs::write(&output, b"concurrent user output").expect("write concurrent destination");
+        let error = install_verified_link_output(verified, &raced)
+            .expect_err("destination replacement must fail closed")
+            .to_string();
+        assert!(error.contains("changed while"));
+        assert_eq!(
+            fs::read(&output).expect("read concurrent output"),
+            b"concurrent user output",
+            "a concurrent destination must never be overwritten"
+        );
+
+        let missing_output = dir.join("initially-missing.exe");
+        let missing =
+            LinkOutputStaging::create(&missing_output).expect("reserve missing-output staging");
+        fs::write(missing.path(), b"verified missing-output candidate")
+            .expect("write missing-output candidate");
+        let verified =
+            VerifiedLinkOutput::open(missing.path()).expect("verify missing-output candidate");
+        fs::write(&missing_output, b"concurrent creator won")
+            .expect("create destination after staging reservation");
+        let error = install_verified_link_output(verified, &missing)
+            .expect_err("initially missing destination creation must fail closed")
+            .to_string();
+        assert!(error.contains("changed while"));
+        assert_eq!(
+            fs::read(&missing_output).expect("read concurrently created destination"),
+            b"concurrent creator won"
+        );
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            let locked = LinkOutputStaging::create(&output).expect("reserve locked staging");
+            fs::write(locked.path(), b"replacement blocked by destination lock")
+                .expect("write locked replacement staging");
+            let verified =
+                VerifiedLinkOutput::open(locked.path()).expect("verify locked replacement");
+            let locked_output = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2)
+                .open(&output)
+                .expect("lock previous native output against replacement");
+            let error = install_verified_link_output(verified, &locked)
+                .expect_err("locked destination must make atomic rename fail")
+                .to_string();
+            assert!(error.contains("atomically install"));
             assert!(
-                fs::symlink_metadata(symlink).is_ok(),
-                "matching symlinks must remain"
+                locked.path().is_file(),
+                "failed atomic rename must preserve verified staging"
+            );
+            drop(locked_output);
+            assert_eq!(
+                fs::read(&output).expect("read output preserved through locked failure"),
+                b"concurrent user output"
             );
         }
-        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(dir).expect("remove native install fixture");
     }
 
     #[test]
@@ -6909,7 +11497,7 @@ mod tests {
         validate_c_target_features(features, Some(&darwin))
             .expect("portable HTTP and Redis are valid for a macOS target");
 
-        fs::write(&source, "#pragma comment(lib, \"libmysql.lib\")\n")
+        fs::write(&source, "#define KU_FEATURE_LIBMYSQL 1\n")
             .expect("write libmysql feature fixture");
         let features = CSourceFeatures::inspect(&source).expect("inspect libmysql fixture");
         let non_host = [linux.clone(), windows.clone(), darwin]
@@ -6924,13 +11512,321 @@ mod tests {
     }
 
     #[test]
-    fn c_compiler_candidates_use_ku_cc_then_bounded_fallbacks() {
+    fn explicit_mysql_toolchain_paths_are_authoritative_and_fail_closed() {
+        let empty = explicit_libmysql_directory(Some(OsString::new()))
+            .expect_err("empty KU_MYSQL_LIB must be rejected")
+            .to_string();
+        assert!(empty.contains("set but empty"));
+        let relative = explicit_libmysql_directory(Some(OsString::from("relative/mysql/lib")))
+            .expect_err("relative KU_MYSQL_LIB must be rejected")
+            .to_string();
+        assert!(relative.contains("absolute directory"));
+        let relative =
+            explicit_libmysql_include_dir(Some(OsString::from("relative/mysql/include")))
+                .expect_err("relative KU_MYSQL_INCLUDE must be rejected")
+                .to_string();
+        assert!(relative.contains("absolute plain directory"));
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let root =
+            env::temp_dir().join(format!("ku-mysql-toolchain-{}-{nonce}", std::process::id()));
+        let guard = TempBuildDir::new(root.clone());
+        let library_dir = root.join("lib");
+        let include_dir = root.join("include");
+        fs::create_dir_all(&library_dir).expect("create MySQL library fixture");
+        fs::create_dir(&include_dir).expect("create MySQL include fixture");
+        fs::write(library_dir.join("libmysql.lib"), b"fixture")
+            .expect("write MySQL library fixture");
+        fs::write(include_dir.join("mysql.h"), b"/* fixture */")
+            .expect("write MySQL header fixture");
+
+        assert_eq!(
+            explicit_libmysql_directory(Some(library_dir.clone().into_os_string()))
+                .expect("validate explicit MySQL library directory")
+                .expect("explicit library directory")
+                .dir,
+            fs::canonicalize(&library_dir).expect("canonicalize MySQL library fixture")
+        );
+        assert_eq!(
+            explicit_libmysql_include_dir(Some(include_dir.clone().into_os_string()))
+                .expect("validate explicit MySQL include directory")
+                .expect("explicit include directory"),
+            fs::canonicalize(&include_dir).expect("canonicalize MySQL include fixture")
+        );
+        guard.cleanup();
+    }
+
+    #[test]
+    fn mysql_library_selection_is_platform_specific_and_never_falls_back_to_static() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "ku-mysql-library-selection-{}-{nonce}",
+            std::process::id()
+        ));
+        let guard = TempBuildDir::new(root.clone());
+        fs::create_dir_all(&root).expect("create MySQL library selection fixture");
+        let static_archive = root.join("libmysqlclient.a");
+        fs::write(&static_archive, b"static fixture").expect("write static MySQL fixture");
+        let static_snapshot = snapshot_libmysql_directory(&root)
+            .expect("inspect static MySQL fixture")
+            .expect("static MySQL directory exists");
+        let error = libmysql_library_from_directory(&static_snapshot, LibpqLibraryFormat::Linux)
+            .expect_err("static MySQL archive must not be selected")
+            .to_string();
+        assert!(error.contains("cannot link static MySQL client archive"));
+        assert!(error.contains("transitive libraries"));
+
+        let fixtures = [
+            ("libmysql.lib", LibpqLibraryFormat::WindowsMsvc),
+            ("libmysql.dll.a", LibpqLibraryFormat::WindowsMingw),
+            ("libmysqlclient.so.21", LibpqLibraryFormat::Linux),
+            ("libmysqlclient.21.dylib", LibpqLibraryFormat::Darwin),
+        ];
+        for (name, _) in fixtures {
+            fs::write(root.join(name), b"shared or import fixture")
+                .expect("write ABI-specific MySQL fixture");
+        }
+        let snapshot = snapshot_libmysql_directory(&root)
+            .expect("inspect mixed MySQL fixture")
+            .expect("mixed MySQL directory exists");
+        for (name, format) in fixtures {
+            let selected = libmysql_library_from_directory(&snapshot, format)
+                .unwrap_or_else(|error| panic!("select {name}: {error}"));
+            assert_eq!(
+                selected.library.path,
+                fs::canonicalize(root.join(name)).expect("canonicalize selected MySQL fixture"),
+                "{format:?} must not select a library from another platform/ABI"
+            );
+            assert_eq!(
+                mysql_client_family_from_canonical_path(&selected.library.path)
+                    .expect("canonical MySQL family"),
+                MysqlClientFamily::Mysql
+            );
+        }
+        assert_eq!(
+            libmysql_library_name_priority("libmysql.lib", LibpqLibraryFormat::WindowsMingw),
+            None
+        );
+        assert_eq!(
+            libmysql_library_name_priority("libmysql.dll.a", LibpqLibraryFormat::WindowsMsvc),
+            None
+        );
+        assert_eq!(
+            libmysql_library_name_priority("libmysqlclient.a", LibpqLibraryFormat::Linux),
+            None
+        );
+        let mariadb_root = root.join("mariadb-only");
+        fs::create_dir(&mariadb_root).expect("create MariaDB-only fixture");
+        fs::write(
+            mariadb_root.join("libmariadb.lib"),
+            b"MariaDB import fixture",
+        )
+        .expect("write MariaDB import fixture");
+        let mariadb_snapshot = snapshot_libmysql_directory(&mariadb_root)
+            .expect("inspect MariaDB-only fixture")
+            .expect("MariaDB-only directory exists");
+        let mariadb =
+            libmysql_library_from_directory(&mariadb_snapshot, LibpqLibraryFormat::WindowsMsvc)
+                .expect("select MariaDB import library");
+        assert_eq!(
+            mysql_client_family_from_canonical_path(&mariadb.library.path)
+                .expect("canonical MariaDB family"),
+            MysqlClientFamily::Mariadb
+        );
+        #[cfg(unix)]
+        {
+            let alias_root = root.join("mysql-alias-to-mariadb");
+            fs::create_dir(&alias_root).expect("create MySQL alias fixture");
+            let target = alias_root.join("libmariadb.so.3");
+            let alias = alias_root.join("libmysqlclient.so");
+            fs::write(
+                &target,
+                dependency_elf_with_soname(&[], Some("libmariadb.so.3")),
+            )
+            .expect("write MariaDB compatibility target");
+            std::os::unix::fs::symlink(&target, &alias)
+                .expect("create libmysqlclient compatibility symlink");
+            let alias_snapshot = snapshot_libmysql_directory(&alias_root)
+                .expect("inspect MySQL-to-MariaDB alias")
+                .expect("alias directory exists");
+            let selected =
+                libmysql_library_from_directory(&alias_snapshot, LibpqLibraryFormat::Linux)
+                    .expect("select compatibility symlink");
+            assert_eq!(
+                selected.library.path,
+                fs::canonicalize(&target).expect("canonicalize MariaDB target")
+            );
+            assert_eq!(
+                mysql_client_family_from_canonical_path(&selected.library.path)
+                    .expect("canonical alias target family"),
+                MysqlClientFamily::Mariadb,
+                "the canonical target, not the libmysqlclient alias, defines the family"
+            );
+            let requirement =
+                mysql_runtime_dependency(&selected.library, LibpqLibraryFormat::Linux)
+                    .expect("derive MariaDB family from the canonical target and DT_SONAME");
+            assert_eq!(requirement.family, MysqlClientFamily::Mariadb);
+            assert_eq!(requirement.loader_name, b"libmariadb.so.3");
+
+            let conflict_path = alias_root.join("libmysqlclient.so.21");
+            fs::write(
+                &conflict_path,
+                dependency_elf_with_soname(&[], Some("libmariadb.so.3")),
+            )
+            .expect("write conflicting loader identity fixture");
+            let conflict = PinnedLinkLibrary::capture(&conflict_path, "MySQL client")
+                .expect("capture conflicting loader fixture");
+            let error = mysql_runtime_dependency(&conflict, LibpqLibraryFormat::Linux)
+                .expect_err("canonical and DT_SONAME families must agree")
+                .to_string();
+            assert!(error.contains("conflicting canonical and loader families"));
+
+            let missing_soname_path = alias_root.join("libmysqlclient.so.22");
+            fs::write(&missing_soname_path, dependency_elf(&[]))
+                .expect("write missing SONAME fixture");
+            let missing_soname = PinnedLinkLibrary::capture(&missing_soname_path, "MySQL client")
+                .expect("capture missing SONAME fixture");
+            let error = mysql_runtime_dependency(&missing_soname, LibpqLibraryFormat::Linux)
+                .expect_err("a private linked ELF without DT_SONAME must fail closed")
+                .to_string();
+            assert!(error.contains("no bounded DT_SONAME"));
+        }
+        guard.cleanup();
+    }
+
+    #[test]
+    fn shared_library_handles_feed_private_copies_after_symlink_targets_are_replaced() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "ku-shared-library-symlink-{}-{nonce}",
+            std::process::id()
+        ));
+        let guard = TempBuildDir::new(root.clone());
+        fs::create_dir_all(&root).expect("create shared library symlink fixture");
+        let target = root.join("libpq.so.5");
+        let link = root.join("libpq.so");
+        let original = b"original shared library identity";
+        fs::write(&target, original).expect("write shared library target");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        let linked = false;
+        let selected = if linked {
+            let snapshot = snapshot_libpq_directory(&root)
+                .expect("inspect symlinked libpq fixture")
+                .expect("symlinked libpq directory exists");
+            libpq_library_from_explicit_directory(&snapshot, LibpqLibraryFormat::Linux)
+                .expect("select symlinked libpq")
+        } else {
+            eprintln!("note: symlink creation is unavailable; exercising direct-path replacement");
+            PinnedLinkLibrary::capture(&target, "libpq").expect("capture direct libpq fixture")
+        };
+        assert_eq!(
+            selected.path,
+            fs::canonicalize(&target).expect("canonicalize symlink target"),
+            "the linker must receive the resolved target, not the mutable symlink"
+        );
+        let retired = root.join("retired-libpq.so.5");
+        fs::rename(&target, &retired).expect("retire original symlink target");
+        fs::write(&target, b"replacement with a different identity and length")
+            .expect("replace symlink target");
+        let staged = selected
+            .stage_for_link("libpq")
+            .expect("copy from the already-open original library handle");
+        assert_eq!(
+            fs::read(staged.path()).expect("read private libpq link copy"),
+            original,
+            "path replacement must not change the bytes supplied to the linker"
+        );
+        assert!(
+            !staged.path().starts_with(&root),
+            "the linker input must live in a separate private directory"
+        );
+        let staging_directory = staged
+            .path()
+            .parent()
+            .expect("private link input has a parent")
+            .to_path_buf();
+        drop(staged);
+        assert!(
+            !staging_directory.exists(),
+            "the private link-input directory must be removed by RAII"
+        );
+        guard.cleanup();
+    }
+
+    #[test]
+    fn renamed_archives_and_oversized_link_inputs_fail_before_the_linker() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "ku-disguised-link-input-{}-{nonce}",
+            std::process::id()
+        ));
+        let guard = TempBuildDir::new(root.clone());
+        let pg = root.join("pg");
+        let mysql = root.join("mysql");
+        fs::create_dir_all(&pg).expect("create disguised libpq fixture");
+        fs::create_dir(&mysql).expect("create disguised MySQL fixture");
+        fs::write(pg.join("libpq.so"), b"!<arch>\nrenamed static archive")
+            .expect("write disguised libpq archive");
+        fs::write(
+            mysql.join("libmysqlclient.so"),
+            b"!<thin>\nrenamed thin archive",
+        )
+        .expect("write disguised MySQL archive");
+
+        let pg_snapshot = snapshot_libpq_directory(&pg)
+            .expect("snapshot disguised libpq")
+            .expect("libpq directory exists");
+        let pg_error =
+            libpq_library_from_explicit_directory(&pg_snapshot, LibpqLibraryFormat::Linux)
+                .expect_err("renamed libpq archive must be rejected")
+                .to_string();
+        assert!(pg_error.contains("cannot link static libpq archive"));
+
+        let mysql_snapshot = snapshot_libmysql_directory(&mysql)
+            .expect("snapshot disguised MySQL client")
+            .expect("MySQL directory exists");
+        let mysql_error =
+            libmysql_library_from_directory(&mysql_snapshot, LibpqLibraryFormat::Linux)
+                .expect_err("renamed MySQL archive must be rejected")
+                .to_string();
+        assert!(mysql_error.contains("cannot link static MySQL client archive"));
+
+        let oversized = root.join("oversized.so");
+        let oversized_file = fs::File::create(&oversized).expect("create sparse oversized input");
+        oversized_file
+            .set_len(MAX_PINNED_LINK_LIBRARY_BYTES + 1)
+            .expect("size sparse oversized input");
+        let oversized_error = PinnedLinkLibrary::capture(&oversized, "test")
+            .expect_err("oversized link input must fail closed")
+            .to_string();
+        assert!(oversized_error.contains("link-input limit"));
+        guard.cleanup();
+    }
+
+    #[test]
+    fn c_compiler_candidates_treat_ku_cc_as_the_only_configured_driver() {
         let candidates = c_compiler_candidates(Some("zig cc"));
         let labels = candidates
             .iter()
             .map(|candidate| candidate.label.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(labels, vec!["zig cc", "clang", "cc", "gcc"]);
+        assert_eq!(labels, vec!["zig cc"]);
         assert_eq!(candidates[0].program, "zig");
         assert_eq!(candidates[0].args, vec!["cc"]);
         assert_eq!(candidates[0].kind, CCompilerKind::ZigCc);
@@ -6942,11 +11838,20 @@ mod tests {
             .iter()
             .map(|candidate| candidate.label.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(labels, vec!["clang", "zig cc", "cc", "gcc"]);
+        assert_eq!(labels, vec!["clang"]);
         assert_eq!(candidates[0].kind, CCompilerKind::Clang);
         assert!(candidates[0].explicitly_configured);
-        assert_eq!(candidates[2].kind, CCompilerKind::Preconfigured);
-        assert!(!candidates[2].explicitly_configured);
+
+        let automatic = c_compiler_candidates(None);
+        let automatic_labels = automatic
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(automatic_labels, vec!["zig cc", "clang", "cc", "gcc"]);
+        assert!(automatic
+            .iter()
+            .all(|candidate| !candidate.explicitly_configured));
+        assert_eq!(automatic[2].kind, CCompilerKind::Preconfigured);
         let cross_target = ["x86_64-linux", "x86_64-windows", "aarch64-darwin"]
             .into_iter()
             .map(|name| {
@@ -6961,15 +11866,19 @@ mod tests {
             &cross_target
         ));
         assert!(c_compiler_supports_explicit_target(
-            &candidates[1],
+            &automatic[0],
+            &cross_target
+        ));
+        assert!(c_compiler_supports_explicit_target(
+            &automatic[1],
             &cross_target
         ));
         assert!(!c_compiler_supports_explicit_target(
-            &candidates[2],
+            &automatic[2],
             &cross_target
         ));
         assert!(!c_compiler_supports_explicit_target(
-            &candidates[3],
+            &automatic[3],
             &cross_target
         ));
 
@@ -6983,28 +11892,110 @@ mod tests {
     }
 
     #[test]
+    fn configured_c_compiler_rejects_ambiguous_environment_values() {
+        assert_eq!(
+            configured_c_compiler(None).expect("unset KU_CC uses discovery"),
+            None
+        );
+        for value in ["", " ", "\t\r\n"] {
+            let error = configured_c_compiler(Some(OsString::from(value)))
+                .expect_err("empty KU_CC must fail closed")
+                .to_string();
+            assert!(error.contains("KU_CC is set but empty"));
+        }
+        let spaced = configured_c_compiler(Some(OsString::from(
+            r#""C:\Program Files\LLVM\bin\clang.exe" --target=x86_64-pc-windows-msvc"#,
+        )))
+        .expect("quoted compiler path is valid")
+        .expect("configured compiler");
+        let candidate = c_compiler_candidates(Some(&spaced))
+            .into_iter()
+            .next()
+            .expect("parse quoted compiler path");
+        assert_eq!(candidate.program, r"C:\Program Files\LLVM\bin\clang.exe");
+        assert_eq!(candidate.args, vec!["--target=x86_64-pc-windows-msvc"]);
+
+        let error = configured_c_compiler(Some(OsString::from(r#""clang"#)))
+            .expect_err("unmatched KU_CC quote must fail closed")
+            .to_string();
+        assert!(error.contains("unmatched double quote"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let error = configured_c_compiler(Some(OsString::from_vec(vec![0xff])))
+                .expect_err("non-Unicode KU_CC must fail closed")
+                .to_string();
+            assert!(error.contains("valid Unicode"));
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let error = configured_c_compiler(Some(OsString::from_wide(&[0xd800])))
+                .expect_err("ill-formed UTF-16 KU_CC must fail closed")
+                .to_string();
+            assert!(error.contains("valid Unicode"));
+        }
+    }
+
+    #[test]
     fn explicit_target_arguments_match_each_compiler_driver() {
         let linux = resolve_build_target(Some("x86_64-linux"))
             .expect("supported Linux target")
             .expect("explicit Linux target");
+        let clang = parse_c_compiler_candidate("clang", false).expect("parse clang");
         assert_eq!(
-            c_compiler_target_arguments(CCompilerKind::Clang, &linux),
+            c_compiler_target_arguments(&clang, &linux).expect("clang target arguments"),
             vec!["--target=x86_64-unknown-linux-gnu"]
         );
+        #[cfg(windows)]
+        let zig_command = r#""C:\Program Files\zig\zig.exe" cc"#;
+        #[cfg(unix)]
+        let zig_command = r#""/opt/Program Files/zig/zig" cc"#;
+        #[cfg(not(any(unix, windows)))]
+        let zig_command = "zig cc";
+        let zig =
+            parse_c_compiler_candidate(zig_command, true).expect("parse absolute Zig command");
+        assert_eq!(zig.kind, CCompilerKind::ZigCc);
         assert_eq!(
-            c_compiler_target_arguments(CCompilerKind::ZigCc, &linux),
+            c_compiler_target_arguments(&zig, &linux).expect("Zig target arguments"),
             vec!["-target", "x86_64-linux-gnu"]
         );
-        assert!(c_compiler_target_arguments(CCompilerKind::Preconfigured, &linux).is_empty());
+        let preconfigured =
+            parse_c_compiler_candidate("x86_64-linux-gnu-gcc", true).expect("parse configured GCC");
+        assert!(c_compiler_target_arguments(&preconfigured, &linux)
+            .expect("preconfigured target arguments")
+            .is_empty());
+
+        let windows = resolve_build_target(Some("x86_64-windows"))
+            .expect("supported Windows target")
+            .expect("explicit Windows target");
+        let gnu_clang = parse_c_compiler_candidate("clang --target=x86_64-w64-windows-gnu", true)
+            .expect("parse configured GNU clang");
+        assert!(
+            c_compiler_target_arguments(&gnu_clang, &windows)
+                .expect("declared compatible target is preserved")
+                .is_empty(),
+            "Ku must not append a conflicting MSVC target"
+        );
+        assert_eq!(
+            libpq_library_format(LibpqLibraryPlatform::Windows, &gnu_clang),
+            LibpqLibraryFormat::WindowsMingw
+        );
+        let conflict = c_compiler_target_arguments(&gnu_clang, &linux)
+            .expect_err("declared Windows target must conflict with Linux build")
+            .to_string();
+        assert!(conflict.contains("conflicts"));
     }
 
     #[test]
     fn libpq_library_names_are_platform_specific() {
-        for name in ["libpq.lib", "LIBPQ.LIB"] {
+        for (name, priority) in [("libpqdll.lib", 0), ("libpq.lib", 1), ("LIBPQ.LIB", 1)] {
             assert_eq!(
                 libpq_library_name_priority(name, LibpqLibraryFormat::WindowsMsvc),
-                Some(0),
-                "MSVC should accept {name}"
+                Some(priority),
+                "explicit MSVC configuration should accept {name}"
             );
         }
         assert_eq!(
@@ -7018,9 +12009,14 @@ mod tests {
             "MinGW should accept its import archive"
         );
         assert_eq!(
+            libpq_library_name_priority("libpqdll.lib", LibpqLibraryFormat::WindowsMingw),
+            None,
+            "MinGW must not guess that an MSVC-style .lib has a compatible ABI"
+        );
+        assert_eq!(
             libpq_library_name_priority("libpq.lib", LibpqLibraryFormat::WindowsMingw),
-            Some(1),
-            "MinGW may use a COFF import library when no dll.a is available"
+            None,
+            "MinGW must require an explicit .dll.a import archive"
         );
         for (name, priority) in [("libpq.so", 0), ("libpq.so.5", 1), ("libpq.so.5.17", 1)] {
             assert_eq!(
@@ -7078,46 +12074,64 @@ mod tests {
     }
 
     #[test]
-    fn libpq_link_target_uses_target_os_arch_and_only_matching_host_discovery() {
+    fn explicit_libpq_selection_is_deterministic_across_supported_names() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir =
+            env::temp_dir().join(format!("ku-libpq-selection-{}-{nonce}", std::process::id()));
+        fs::create_dir(&dir).expect("create libpq selection fixture");
+
+        let ambiguous = dir.join("libpq.lib");
+        fs::write(&ambiguous, b"target linker validates this file")
+            .expect("write ambiguous Windows library fixture");
+        assert_eq!(
+            find_libpq_library(&dir, LibpqLibraryFormat::WindowsMsvc)
+                .expect("inspect explicit Windows selection fixture"),
+            Some(fs::canonicalize(&ambiguous).expect("canonicalize Windows library fixture")),
+            "an authoritative KU_PG_LIB may select the conventional filename"
+        );
+
+        let import = dir.join("libpqdll.lib");
+        fs::write(&import, b"target linker validates this file")
+            .expect("write import-specific Windows library fixture");
+        assert_eq!(
+            find_libpq_library(&dir, LibpqLibraryFormat::WindowsMsvc)
+                .expect("inspect explicit Windows import fixture"),
+            Some(fs::canonicalize(&import).expect("canonicalize Windows import fixture"))
+        );
+
+        let old = dir.join("libpq.9.dylib");
+        let new = dir.join("libpq.10.dylib");
+        fs::write(&old, b"target linker validates this file")
+            .expect("write old Darwin library fixture");
+        fs::write(&new, b"target linker validates this file")
+            .expect("write new Darwin library fixture");
+        assert_eq!(
+            find_libpq_library(&dir, LibpqLibraryFormat::Darwin)
+                .expect("inspect Darwin library fixtures"),
+            Some(fs::canonicalize(&new).expect("canonicalize Darwin library fixture")),
+            "the newest numeric dylib name must win"
+        );
+
+        fs::remove_dir_all(dir).expect("remove libpq selection fixture");
+    }
+
+    #[test]
+    fn libpq_link_platform_uses_the_requested_target_os() {
         let host_platform = LibpqLibraryPlatform::host();
-        let host_architecture = LibpqArchitecture::host();
-        for (name, platform, architecture) in [
-            (
-                "x86_64-linux",
-                LibpqLibraryPlatform::Linux,
-                LibpqArchitecture::X86_64,
-            ),
-            (
-                "x86_64-windows",
-                LibpqLibraryPlatform::Windows,
-                LibpqArchitecture::X86_64,
-            ),
-            (
-                "aarch64-darwin",
-                LibpqLibraryPlatform::Darwin,
-                LibpqArchitecture::Aarch64,
-            ),
+        for (name, platform) in [
+            ("x86_64-linux", LibpqLibraryPlatform::Linux),
+            ("x86_64-windows", LibpqLibraryPlatform::Windows),
+            ("aarch64-darwin", LibpqLibraryPlatform::Darwin),
         ] {
             let target = resolve_build_target(Some(name))
                 .expect("supported target")
                 .expect("explicit target");
-            let link_target = libpq_link_target(Some(&target));
-            assert_eq!(link_target.platform, platform);
-            assert_eq!(link_target.architecture, architecture);
-            assert_eq!(
-                link_target.allow_host_discovery,
-                platform == host_platform && architecture == host_architecture
-            );
+            assert_eq!(libpq_link_platform(Some(&target)), platform);
         }
-
-        assert_eq!(
-            libpq_link_target(None),
-            LibpqLinkTarget {
-                platform: host_platform,
-                architecture: host_architecture,
-                allow_host_discovery: true,
-            }
-        );
+        assert_eq!(libpq_link_platform(None), host_platform);
     }
 
     #[test]
@@ -7158,6 +12172,38 @@ mod tests {
     }
 
     #[test]
+    fn libpq_feature_marker_must_be_a_standalone_generated_line() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "ku-libpq-feature-marker-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create libpq marker fixture");
+        let source = dir.join("main.c");
+        fs::write(
+            &source,
+            "static const char *user_text = \"#define KU_FEATURE_LIBPQ 1\";\n",
+        )
+        .expect("write user-text marker fixture");
+        assert!(
+            !CSourceFeatures::inspect(&source)
+                .expect("inspect user-text marker fixture")
+                .libpq,
+            "marker text inside a C string must not enable PostgreSQL linking"
+        );
+        fs::write(&source, "#define KU_FEATURE_LIBPQ 1\n").expect("write generated marker fixture");
+        assert!(
+            CSourceFeatures::inspect(&source)
+                .expect("inspect generated marker fixture")
+                .libpq
+        );
+        fs::remove_dir_all(dir).expect("remove libpq marker fixture");
+    }
+
+    #[test]
     fn static_std_pg_linking_fails_closed_with_actionable_help() {
         validate_libpq_link_mode(false, true).expect("non-PG static builds remain supported");
         validate_libpq_link_mode(true, false).expect("dynamic PG builds remain supported");
@@ -7168,8 +12214,7 @@ mod tests {
         let dir = env::temp_dir().join(format!("ku-static-libpq-{}-{nonce}", std::process::id()));
         fs::create_dir(&dir).expect("create static libpq fixture");
         let source = dir.join("main.c");
-        fs::write(&source, "#pragma comment(lib, \"libpq.lib\")\n")
-            .expect("write static libpq fixture");
+        fs::write(&source, "#define KU_FEATURE_LIBPQ 1\n").expect("write static libpq fixture");
         let err = compile_c_source(
             &source,
             &dir.join("app"),
@@ -7188,7 +12233,36 @@ mod tests {
     }
 
     #[test]
-    fn libpq_directory_discovery_requires_an_existing_library_file() {
+    fn static_std_mysql_linking_fails_before_library_discovery() {
+        validate_libmysql_link_mode(false, true).expect("non-MySQL static builds remain supported");
+        validate_libmysql_link_mode(true, false).expect("dynamic MySQL builds remain supported");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir =
+            env::temp_dir().join(format!("ku-static-libmysql-{}-{nonce}", std::process::id()));
+        fs::create_dir(&dir).expect("create static MySQL fixture");
+        let source = dir.join("main.c");
+        fs::write(&source, "#define KU_FEATURE_LIBMYSQL 1\n").expect("write static MySQL fixture");
+        let error = compile_c_source(
+            &source,
+            &dir.join("app"),
+            None,
+            BuildProfile::Debug,
+            true,
+            false,
+        )
+        .expect_err("static MySQL must fail before library discovery")
+        .to_string();
+        assert!(error.contains("cannot safely link std.mysql with --static"));
+        assert!(error.contains("transitive libraries"));
+        assert!(error.contains("omit --static"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn libpq_directory_selection_requires_an_existing_library_file() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before Unix epoch")
@@ -7196,7 +12270,8 @@ mod tests {
         let dir =
             env::temp_dir().join(format!("ku-libpq-discovery-{}-{nonce}", std::process::id()));
         assert_eq!(
-            find_libpq_library(&dir, LibpqLibraryFormat::Linux),
+            find_libpq_library(&dir, LibpqLibraryFormat::Linux)
+                .expect("inspect missing libpq directory"),
             None,
             "a missing directory must not be trusted"
         );
@@ -7205,37 +12280,247 @@ mod tests {
         fs::write(dir.join("README"), b"not a library").expect("write unrelated discovery fixture");
         fs::create_dir(dir.join("libpq.so")).expect("create misleading library directory");
         assert_eq!(
-            find_libpq_library(&dir, LibpqLibraryFormat::Linux),
+            find_libpq_library(&dir, LibpqLibraryFormat::Linux)
+                .expect("inspect unrelated libpq directory"),
             None,
             "a directory or unrelated file must not count as libpq"
         );
 
-        let versioned = dir.join("libpq.so.5");
-        fs::write(&versioned, b"link fixture").expect("write versioned libpq fixture");
+        let versioned_old = dir.join("libpq.so.5");
+        let versioned_new = dir.join("libpq.so.10");
+        fs::write(&versioned_old, b"linker-validated fixture")
+            .expect("write old versioned libpq fixture");
+        fs::write(&versioned_new, b"linker-validated fixture")
+            .expect("write new versioned libpq fixture");
         let archive = dir.join("libpq.a");
         fs::write(&archive, b"static fixture").expect("write static libpq fixture");
         assert_eq!(
-            find_libpq_library(&dir, LibpqLibraryFormat::Linux),
-            Some(versioned.clone())
+            find_libpq_library(&dir, LibpqLibraryFormat::Linux)
+                .expect("inspect versioned libpq fixture"),
+            Some(fs::canonicalize(&versioned_new).expect("canonicalize versioned libpq fixture")),
+            "the newest numeric SONAME must win when no unversioned symlink exists"
         );
 
-        fs::remove_file(versioned).expect("remove versioned libpq fixture");
+        fs::remove_file(versioned_old).expect("remove old versioned libpq fixture");
+        fs::remove_file(versioned_new).expect("remove new versioned libpq fixture");
         assert_eq!(
-            find_libpq_library(&dir, LibpqLibraryFormat::Linux),
+            find_libpq_library(&dir, LibpqLibraryFormat::Linux)
+                .expect("inspect static-only libpq fixture"),
             None,
-            "automatic discovery must not select a static archive"
+            "explicit selection must not select a static archive"
         );
-        let err = libpq_dir_has_supported_library(&dir, LibpqLibraryFormat::Linux)
+        let err = libpq_library_in_dir(&dir, LibpqLibraryFormat::Linux)
             .expect_err("a static-only libpq directory must fail closed");
         let message = err.to_string();
         assert!(message.contains(&archive.display().to_string()));
         assert!(message.contains("transitive libraries"));
         assert!(message.contains("shared libpq"));
         assert!(message.contains("link the emitted C yourself"));
+
         fs::remove_file(archive).expect("remove static libpq fixture");
         fs::remove_dir(dir.join("libpq.so")).expect("remove misleading library directory");
         fs::remove_file(dir.join("README")).expect("remove unrelated discovery fixture");
         fs::remove_dir(dir).expect("remove libpq discovery fixture");
+    }
+
+    #[test]
+    fn explicit_libpq_configuration_is_authoritative_and_exact() {
+        assert_eq!(
+            explicit_libpq_library(None, LibpqLibraryFormat::Linux)
+                .expect("an unset KU_PG_LIB must remain distinguishable"),
+            None
+        );
+
+        let empty = explicit_libpq_library(Some(OsString::new()), LibpqLibraryFormat::Linux)
+            .expect_err("an empty KU_PG_LIB must fail closed");
+        assert!(empty.to_string().contains("set but empty"));
+
+        let relative = explicit_libpq_library(
+            Some(OsString::from("relative-libpq")),
+            LibpqLibraryFormat::Linux,
+        )
+        .expect_err("a relative KU_PG_LIB must fail closed");
+        assert!(relative
+            .to_string()
+            .contains("must be an absolute directory"));
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("ku-explicit-libpq-{}-{nonce}", std::process::id()));
+        let missing = explicit_libpq_library(
+            Some(dir.clone().into_os_string()),
+            LibpqLibraryFormat::Linux,
+        )
+        .expect_err("a missing KU_PG_LIB must fail closed");
+        assert!(missing.to_string().contains("failed to resolve KU_PG_LIB"));
+
+        fs::create_dir(&dir).expect("create explicit libpq fixture");
+        fs::write(dir.join("README"), b"not a library").expect("write unrelated explicit fixture");
+        let unsupported = explicit_libpq_library(
+            Some(dir.clone().into_os_string()),
+            LibpqLibraryFormat::Linux,
+        )
+        .expect_err("an incompatible KU_PG_LIB must fail closed");
+        assert!(unsupported
+            .to_string()
+            .contains("does not contain a target-compatible"));
+
+        let library = dir.join("libpq.so.5");
+        fs::write(&library, b"linker-validated fixture").expect("write explicit libpq fixture");
+        let selected = explicit_libpq_library(
+            Some(dir.clone().into_os_string()),
+            LibpqLibraryFormat::Linux,
+        )
+        .expect("select explicit libpq")
+        .expect("explicit libpq must return an exact file");
+        assert_eq!(
+            selected,
+            fs::canonicalize(&library).expect("canonicalize explicit libpq fixture")
+        );
+        fs::remove_dir_all(dir).expect("remove explicit libpq fixture");
+    }
+
+    #[test]
+    fn explicit_libpq_directory_can_match_a_later_compiler_abi() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "ku-libpq-abi-fallback-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create libpq ABI fixture");
+        let library = dir.join("libpq.dll.a");
+        fs::write(&library, b"linker-validated fixture").expect("write libpq ABI fixture");
+        let canonical = fs::canonicalize(&dir).expect("canonicalize libpq ABI fixture");
+        let snapshot = snapshot_libpq_directory(&canonical)
+            .expect("inspect libpq ABI fixture")
+            .expect("libpq ABI fixture must exist");
+
+        libpq_library_from_explicit_directory(&snapshot, LibpqLibraryFormat::WindowsMsvc)
+            .expect_err("an MSVC candidate must reject a MinGW-only import library");
+        assert_eq!(
+            libpq_library_from_explicit_directory(&snapshot, LibpqLibraryFormat::WindowsMingw)
+                .expect("a later MinGW candidate must remain eligible")
+                .path,
+            fs::canonicalize(&library).expect("canonicalize MinGW import fixture")
+        );
+
+        let automatic_clang = parse_c_compiler_candidate("clang", false)
+            .expect("parse automatic Windows clang candidate");
+        assert_eq!(
+            libpq_library_format_for_compiler(
+                LibpqLibraryPlatform::Windows,
+                &automatic_clang,
+                None,
+                Some("x86_64-w64-windows-gnu"),
+            )
+            .expect("probed GNU clang selects MinGW import ABI"),
+            LibpqLibraryFormat::WindowsMingw
+        );
+        assert_eq!(
+            libpq_library_format_for_compiler(
+                LibpqLibraryPlatform::Windows,
+                &automatic_clang,
+                None,
+                Some("x86_64-pc-windows-msvc"),
+            )
+            .expect("probed MSVC clang selects MSVC import ABI"),
+            LibpqLibraryFormat::WindowsMsvc
+        );
+        assert!(
+            libpq_library_format_for_compiler(
+                LibpqLibraryPlatform::Windows,
+                &automatic_clang,
+                None,
+                None,
+            )
+            .is_err(),
+            "unqualified host clang must never guess its ABI"
+        );
+
+        #[cfg(windows)]
+        let misleading_clang_command = r#""C:\mingw64\bin\clang.exe""#;
+        #[cfg(unix)]
+        let misleading_clang_command = "/opt/mingw64/bin/clang";
+        #[cfg(not(any(unix, windows)))]
+        let misleading_clang_command = "clang";
+        let misleading_clang = parse_c_compiler_candidate(misleading_clang_command, false)
+            .expect("parse clang below a misleading MinGW path");
+        assert_eq!(misleading_clang.kind, CCompilerKind::Clang);
+        assert_eq!(
+            libpq_library_format_for_compiler(
+                LibpqLibraryPlatform::Windows,
+                &misleading_clang,
+                None,
+                Some("x86_64-pc-windows-msvc"),
+            )
+            .expect("a probed host clang target is the ABI authority"),
+            LibpqLibraryFormat::WindowsMsvc
+        );
+        let windows_target = resolve_build_target(Some("x86_64-windows"))
+            .expect("resolve Windows target")
+            .expect("explicit Windows target");
+        assert_eq!(
+            libpq_library_format_for_compiler(
+                LibpqLibraryPlatform::Windows,
+                &misleading_clang,
+                Some(&windows_target),
+                None,
+            )
+            .expect("the target injected for clang is the ABI authority"),
+            LibpqLibraryFormat::WindowsMsvc
+        );
+
+        let declared_msvc = parse_c_compiler_candidate("cc --target=x86_64-pc-windows-msvc", true)
+            .expect("parse explicitly targeted cc");
+        assert_eq!(
+            libpq_library_format_for_compiler(
+                LibpqLibraryPlatform::Windows,
+                &declared_msvc,
+                Some(&windows_target),
+                None,
+            )
+            .expect("an explicit compiler target is the ABI authority"),
+            LibpqLibraryFormat::WindowsMsvc
+        );
+
+        fs::write(dir.join("libpq.lib"), b"MSVC import fixture")
+            .expect("write second ABI-specific import fixture");
+        let both = snapshot_libpq_directory(&canonical)
+            .expect("inspect dual-ABI libpq fixture")
+            .expect("dual-ABI libpq fixture must exist");
+        assert!(
+            libpq_library_from_explicit_directory(&both, LibpqLibraryFormat::WindowsMsvc).is_ok()
+        );
+        assert!(
+            libpq_library_from_explicit_directory(&both, LibpqLibraryFormat::WindowsMingw).is_ok()
+        );
+        fs::remove_dir_all(dir).expect("remove libpq ABI fixture");
+    }
+
+    #[test]
+    fn explicit_libpq_selection_rejects_unbounded_directories() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let library_dir = env::temp_dir().join(format!(
+            "ku-libpq-entry-limit-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&library_dir).expect("create bounded libpq fixture");
+        for index in 0..=MAX_LIBPQ_LIBRARY_DIRECTORY_ENTRIES {
+            fs::write(library_dir.join(format!("entry-{index}")), b"fixture")
+                .expect("write bounded libpq entry");
+        }
+        let library_error = find_libpq_library(&library_dir, LibpqLibraryFormat::Linux)
+            .expect_err("an oversized libpq directory must fail closed");
+        assert!(library_error.to_string().contains("entry discovery limit"));
+        fs::remove_dir_all(&library_dir).expect("remove bounded libpq fixture");
     }
 
     #[test]
@@ -7245,15 +12530,13 @@ mod tests {
             numeric_version_key("MySQL Server 8.0.12") > numeric_version_key("MySQL Server 5.7")
         );
 
+        let install_root = PathBuf::from("install").join("MySQL");
         let mut dirs = vec![
-            PathBuf::from(r"C:\Program Files\PostgreSQL\9.6\lib"),
-            PathBuf::from(r"C:\Program Files\PostgreSQL\17\lib"),
-            PathBuf::from(r"C:\Program Files\PostgreSQL\10\lib"),
+            install_root.join("9.6").join("lib"),
+            install_root.join("17").join("lib"),
+            install_root.join("10").join("lib"),
         ];
         sort_install_dirs_by_version(&mut dirs);
-        assert_eq!(
-            dirs.last(),
-            Some(&PathBuf::from(r"C:\Program Files\PostgreSQL\17\lib"))
-        );
+        assert_eq!(dirs.last(), Some(&install_root.join("17").join("lib")));
     }
 }

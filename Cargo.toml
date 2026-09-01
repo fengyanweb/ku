@@ -20,10 +20,11 @@ zstd = "0.13"
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 
-[target.'cfg(windows)'.dev-dependencies]
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }

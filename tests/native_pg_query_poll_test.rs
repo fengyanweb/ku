@@ -137,8 +137,11 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
         "shutdown(fd, SHUT_RDWR)",
         "operation_deadline < deadline",
         "ku_pg_validate_query_params(params, &param_bytes, &param_error, deadline)",
+        "ku_pg_validate_sql_input(sql, &sql_error, deadline)",
+        "ku_pg_sql_has_explicit_session_control(sql, deadline)",
+        "next_deadline_check = SIZE_MAX - index < 4096",
         "ku_pg_result_append(&query.value, next, deadline)",
-        "PostgreSQL query timed out; execution outcome may be unknown; close and reconnect",
+        "PostgreSQL query budget expired before the requested statement was sent",
         "PostgreSQL statement may have executed; outcome is unknown; never retry automatically; close and reconnect",
         "PostgreSQL statement completed but its result could not be delivered; never retry automatically",
         "DISCARD ALL",
@@ -161,6 +164,8 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
         "PQerrorMessage(",
         "PQresultErrorMessage(",
         "ku_pg_copy_libpq_error(",
+        "ku_mysql_sql_next_top_token(",
+        "ku_sql_session_state_unsupported(",
     ] {
         assert!(
             !generated.contains(forbidden),
@@ -278,7 +283,6 @@ static int ku_test_pg_finishes_while_pool_locked = 0;
 #define free ku_test_pg_free
 "#;
     let mut harness = generated
-        .replacen("#pragma comment(lib, \"libpq.lib\")\n", "", 1)
         .replacen(
             "typedef struct pg_conn PGconn;",
             &format!("{hook}\ntypedef struct pg_conn PGconn;"),
@@ -1203,6 +1207,93 @@ int main(void) {
 
   KuResult_pg_client opened = ku_pg_client_open(text("hostaddr=127.0.0.1"), 1, 64, 5000, 5000, 30000);
   CHECK(opened.ok); KuPgClient* pool = opened.value; KuArray_str empty_params = {0};
+  int before_session_sends = sends, before_session_connects = connect_attempts;
+  /* Dialect rules are intentionally separate. PostgreSQL does not treat `#`
+     as a line comment, while MySQL executable comments are ordinary nested
+     block comments here. Only an explicit top-level control token is blocked. */
+  CHECK(ku_pg_sql_has_explicit_session_control(
+      text(" # not a PostgreSQL comment\nSET ROLE app"), clock_ms + 50) == 0);
+  CHECK(ku_pg_sql_has_explicit_session_control(
+      text("/*!40101 SET search_path = hidden */ SELECT 1"), clock_ms + 50) == 0);
+  CHECK(ku_pg_sql_has_explicit_session_control(
+      text("/*M!100100 SET search_path = hidden */ SELECT 1"), clock_ms + 50) == 0);
+  CHECK(ku_pg_sql_has_explicit_session_control(
+      text("/*! harmless in PostgreSQL */ SET ROLE app"), clock_ms + 50) == 1);
+  result = ku_pg_client_query(
+      pool, text(" /* outer /* nested */ */ SeT ROLE app"), empty_params);
+  CHECK(!result.ok && equals(result.error.code, "session_state_unsupported")
+      && sends == before_session_sends && connect_attempts == before_session_connects);
+  ku_error_drop(&result.error);
+  result = ku_pg_client_query(
+      pool, text("LOAD 'untrusted_backend_library'"), empty_params);
+  CHECK(!result.ok && equals(result.error.code, "session_state_unsupported")
+      && sends == before_session_sends && connect_attempts == before_session_connects);
+  ku_error_drop(&result.error);
+  result = ku_pg_client_query(
+      pool, text("CREATE GLOBAL TEMPORARY TABLE transient_a(id int)"), empty_params);
+  CHECK(!result.ok && equals(result.error.code, "session_state_unsupported")
+      && sends == before_session_sends && connect_attempts == before_session_connects);
+  ku_error_drop(&result.error);
+  result = ku_pg_client_query(
+      pool, text("CREATE LOCAL TEMP TABLE transient_b(id int)"), empty_params);
+  CHECK(!result.ok && equals(result.error.code, "session_state_unsupported")
+      && sends == before_session_sends && connect_attempts == before_session_connects);
+  ku_error_drop(&result.error);
+  result = ku_pg_client_query(
+      pool, text("CREATE OR REPLACE TEMP VIEW transient_v AS SELECT 1"), empty_params);
+  CHECK(!result.ok && equals(result.error.code, "session_state_unsupported")
+      && sends == before_session_sends && connect_attempts == before_session_connects);
+  ku_error_drop(&result.error);
+  result = ku_pg_client_query(pool, text("/* unclosed"), empty_params);
+  CHECK(!result.ok && equals(result.error.code, "session_state_unsupported")
+      && sends == before_session_sends && connect_attempts == before_session_connects);
+  ku_error_drop(&result.error);
+
+  /* Input validity and the 16 MiB cap precede policy scanning. A hostile ABI
+     caller cannot turn an oversized, invalid or NUL-containing string into a
+     full preflight walk, a pool acquisition, or a send. */
+  KuString preflight_oversized_sql = { (uint8_t*)" ", (size_t)KU_PG_MAX_SQL_BYTES + 1, 0, KU_STRING_STATIC };
+  result = ku_pg_client_query(pool, preflight_oversized_sql, empty_params);
+  CHECK(!result.ok && equals(result.error.code, "query_too_large")
+      && sends == before_session_sends && connect_attempts == before_session_connects);
+  ku_error_drop(&result.error);
+  uint8_t nul_then_set[] = { ' ', 0, 'S', 'E', 'T', ' ', 'R', 'O', 'L', 'E' };
+  result = ku_pg_client_query(
+      pool, (KuString){ nul_then_set, sizeof(nul_then_set), 0, KU_STRING_STATIC }, empty_params);
+  CHECK(!result.ok && equals(result.error.code, "query_error")
+      && sends == before_session_sends && connect_attempts == before_session_connects);
+  ku_error_drop(&result.error);
+  uint8_t invalid_utf8_then_set[] = { 0xff, 'S', 'E', 'T', ' ', 'R', 'O', 'L', 'E' };
+  result = ku_pg_client_query(
+      pool, (KuString){ invalid_utf8_then_set, sizeof(invalid_utf8_then_set), 0, KU_STRING_STATIC }, empty_params);
+  CHECK(!result.ok && equals(result.error.code, "invalid_utf8")
+      && sends == before_session_sends && connect_attempts == before_session_connects);
+  ku_error_drop(&result.error);
+  CHECK(pool->active == 0 && pool->waiters == 0 && !pool->in_use[0]
+      && pool->conns[0] != 0 && !pool->closing);
+
+  /* Scanner work itself has both a byte cap (validated by the caller) and an
+     absolute deadline checked at most 4096 input bytes apart. Exercise long
+     whitespace and a long nested-comment prefix directly so the test isolates
+     policy scanning from the preceding UTF-8 validation pass. */
+  size_t scan_len = 128 * 1024;
+  uint8_t* scan_sql = (uint8_t*)malloc(scan_len);
+  CHECK(scan_sql != 0);
+  memset(scan_sql, ' ', scan_len);
+  unsigned long long scan_started = clock_ms;
+  clock_step = 1;
+  CHECK(ku_pg_sql_has_explicit_session_control(
+      (KuString){ scan_sql, scan_len, scan_len, KU_STRING_OWNED }, scan_started + 4) == -2
+      && clock_ms <= scan_started + 5);
+  clock_step = 0;
+  memset(scan_sql, ' ', scan_len);
+  scan_sql[0] = '/'; scan_sql[1] = '*';
+  scan_started = clock_ms; clock_step = 1;
+  CHECK(ku_pg_sql_has_explicit_session_control(
+      (KuString){ scan_sql, scan_len, scan_len, KU_STRING_OWNED }, scan_started + 4) == -2
+      && clock_ms <= scan_started + 5);
+  clock_step = 0;
+  free(scan_sql);
   int before_handoff_signals = ku_test_pg_signal_calls;
   pool->waiters = 1;
   ku_pg_client_handoff_available_locked(pool);
@@ -1276,14 +1367,13 @@ int main(void) {
       && pool->active == 0 && pool->conns[0]);
   ku_drop_pg_result(&result.value);
 
-  /* A transaction/session that is not IDLE is never handed to another user;
-     cleanup must evict it without attempting a potentially blocking reset. */
+  /* A transaction/session that is not IDLE must fail loudly: returning a
+     success that is immediately rolled back would violate the client API. */
   next_user_transaction_status = 2; before_resets = reset_sends;
   result = ku_pg_client_query(pool, text("SELECT leaves_transaction_open"), empty_params);
-  CHECK(result.ok && reset_sends == before_resets && !pool->conns[0] && pool->active == 0);
-  KuResult_str detached_non_idle = ku_pg_value(result.value, 0, 0);
-  CHECK(detached_non_idle.ok && equals(detached_non_idle.value, "last"));
-  ku_drop_pg_result(&result.value); ku_string_drop(&detached_non_idle.value);
+  CHECK(!result.ok && equals(result.error.code, "session_state_unsupported")
+      && reset_sends == before_resets && !pool->conns[0] && pool->active == 0);
+  ku_error_drop(&result.error);
 
   /* Reset uses the original query deadline, not a fresh timeout. A timeout in
      hidden cleanup evicts the slot but does not consume the detached result. */

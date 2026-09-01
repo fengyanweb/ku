@@ -2505,6 +2505,7 @@ fn package_internal_relative_import_cannot_escape_its_owner_root() {
     let _ = fs::remove_dir_all(dir);
 }
 
+#[cfg(windows)]
 #[test]
 fn package_file_url_accepts_triple_slash_windows_path() {
     let dir = unique_temp_path("package-file-url-triple");

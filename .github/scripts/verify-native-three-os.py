@@ -30,6 +30,8 @@ MAX_ARCHIVE_BYTES = MAX_BINARY_BYTES + 1024 * 1024
 MAX_CLEANUP_ENTRIES = 4096
 CLEANUP_TIMEOUT_SECONDS = 10
 COMMAND_TIMEOUT_SECONDS = 300
+MAX_WINDOWS_THREAD_SCAN = 65536
+WINDOWS_PROCESS_SETUP_TIMEOUT_SECONDS = 5
 
 TARGET_HOSTS = {
     "x86_64-windows": ("Windows", {"AMD64", "x86_64"}),
@@ -75,8 +77,20 @@ if os.name == "nt":
         ]
 
 
+    class _ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD),
+            ("usage_count", wintypes.DWORD),
+            ("thread_id", wintypes.DWORD),
+            ("owner_process_id", wintypes.DWORD),
+            ("base_priority", wintypes.LONG),
+            ("priority_delta", wintypes.LONG),
+            ("flags", wintypes.DWORD),
+        ]
+
+
 class WindowsJob:
-    """Best-effort Windows child-tree containment with kill-on-close semantics."""
+    """Windows child-tree containment with kill-on-close semantics."""
 
     _KILL_ON_JOB_CLOSE = 0x00002000
     _EXTENDED_LIMIT_INFORMATION = 9
@@ -136,6 +150,114 @@ class WindowsJob:
         kernel32.CloseHandle.restype = wintypes.BOOL
         kernel32.CloseHandle(self.handle)
         self.handle = 0
+
+
+def resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
+    """Resume the CREATE_SUSPENDED initial thread after Job assignment."""
+    if os.name != "nt":
+        return
+
+    snapshot_flag = 0x00000004  # TH32CS_SNAPTHREAD
+    suspend_resume_access = 0x0002  # THREAD_SUSPEND_RESUME
+    query_limited_access = 0x0800  # THREAD_QUERY_LIMITED_INFORMATION
+    resume_failed = 0xFFFFFFFF
+    no_more_files = 18  # ERROR_NO_MORE_FILES
+    invalid_handle = ctypes.c_void_p(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+    kernel32.Thread32First.restype = wintypes.BOOL
+    kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+    kernel32.Thread32Next.restype = wintypes.BOOL
+    kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.GetProcessIdOfThread.argtypes = [wintypes.HANDLE]
+    kernel32.GetProcessIdOfThread.restype = wintypes.DWORD
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    # ToolHelp calls are synchronous Win32 syscalls and cannot be preempted by
+    # this Python deadline.  Start the clock before the first call and fail
+    # closed on both the entry bound and observed elapsed time after every
+    # syscall returns.
+    deadline = time.monotonic() + WINDOWS_PROCESS_SETUP_TIMEOUT_SECONDS
+    snapshot = kernel32.CreateToolhelp32Snapshot(snapshot_flag, 0)
+    if not snapshot or snapshot == invalid_handle:
+        raise RuntimeError(
+            f"could not enumerate suspended Windows child threads: {ctypes.get_last_error()}"
+        )
+    if time.monotonic() > deadline:
+        kernel32.CloseHandle(snapshot)
+        raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
+    thread_handle = None
+    thread_id = None
+    scanned_threads = 0
+    try:
+        entry = _ThreadEntry32()
+        entry.size = ctypes.sizeof(entry)
+        has_entry = bool(kernel32.Thread32First(snapshot, ctypes.byref(entry)))
+        if time.monotonic() > deadline:
+            raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
+        while has_entry:
+            scanned_threads += 1
+            if (
+                scanned_threads > MAX_WINDOWS_THREAD_SCAN
+                or time.monotonic() > deadline
+            ):
+                raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
+            if entry.owner_process_id == process.pid:
+                if thread_id is not None:
+                    raise RuntimeError(
+                        "suspended Windows child unexpectedly exposed multiple threads"
+                    )
+                thread_id = entry.thread_id
+            entry.size = ctypes.sizeof(entry)
+            ctypes.set_last_error(0)
+            has_entry = bool(kernel32.Thread32Next(snapshot, ctypes.byref(entry)))
+            if time.monotonic() > deadline:
+                raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
+            if not has_entry and ctypes.get_last_error() not in (0, no_more_files):
+                raise RuntimeError(
+                    "could not continue suspended Windows child thread enumeration: "
+                    f"{ctypes.get_last_error()}"
+                )
+        if thread_id is None:
+            raise RuntimeError("suspended Windows child has no resumable initial thread")
+        thread_handle = kernel32.OpenThread(
+            suspend_resume_access | query_limited_access, False, thread_id
+        )
+        if not thread_handle:
+            raise RuntimeError(
+                "could not open the suspended Windows child thread: "
+                f"{ctypes.get_last_error()}"
+            )
+        if time.monotonic() > deadline:
+            raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
+        owner_process_id = kernel32.GetProcessIdOfThread(thread_handle)
+        if time.monotonic() > deadline:
+            raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
+        if owner_process_id != process.pid:
+            raise RuntimeError(
+                "suspended Windows child thread owner changed before resume"
+            )
+        previous_count = kernel32.ResumeThread(thread_handle)
+        if time.monotonic() > deadline:
+            raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
+        if previous_count == resume_failed:
+            raise RuntimeError(
+                f"could not resume the suspended Windows child: {ctypes.get_last_error()}"
+            )
+        if previous_count != 1:
+            raise RuntimeError(
+                "Windows child did not have the expected single CREATE_SUSPENDED count"
+            )
+    finally:
+        if thread_handle:
+            kernel32.CloseHandle(thread_handle)
+        kernel32.CloseHandle(snapshot)
 
 
 def fail(message: str) -> NoReturn:
@@ -198,6 +320,12 @@ def close_finished_output_streams(
 
 
 def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.CompletedProcess[bytes]:
+    creation_flags = 0
+    if os.name == "nt":
+        # No child/compiler code may run before the kill-on-close Job owns it.
+        # Popen closes the initial thread handle, so resume it below through a
+        # bounded ToolHelp lookup only after successful Job assignment.
+        creation_flags = 0x00000200 | 0x00000004  # NEW_PROCESS_GROUP | SUSPENDED
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -205,10 +333,24 @@ def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.Complet
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        creationflags=creation_flags,
         start_new_session=os.name != "nt",
     )
-    windows_job = WindowsJob.attach(process)
+    try:
+        windows_job = WindowsJob.attach(process)
+    except BaseException:
+        # Popen has already created the child.  On Windows it is still
+        # suspended here, so an unexpected ctypes/Job setup exception must not
+        # strand a process that never reaches the ordinary cleanup block.
+        kill_process_tree(process, None)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        assert process.stdout is not None and process.stderr is not None
+        process.stdout.close()
+        process.stderr.close()
+        raise
     output = [bytearray(), bytearray()]
     output_bytes = 0
     overflow = threading.Event()
@@ -249,6 +391,10 @@ def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.Complet
     for reader in readers:
         reader.start()
     try:
+        if os.name == "nt":
+            if windows_job is None:
+                fail("could not assign suspended Windows child to a Job Object")
+            resume_suspended_windows_process(process)
         return_code = process.wait(timeout=COMMAND_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         kill_process_tree(process, windows_job)

@@ -34,6 +34,7 @@ fn native_pg_connect_poller_is_portable_bounded_and_lean() {
 
     for expected in [
         "extern PGconn* PQconnectStartParams",
+        "#define KU_FEATURE_LIBPQ 1",
         "extern int PQconnectPoll(PGconn*)",
         "extern int PQsocket(const PGconn*)",
         "#define KU_PGRES_POLLING_FAILED 0",
@@ -62,6 +63,8 @@ fn native_pg_connect_poller_is_portable_bounded_and_lean() {
         "KuPgConnectAttempt connect_attempt = ku_pg_connect_until(p->conninfo, connect_deadline)",
         "if (__ku_handler_deadline != 0 && __ku_handler_deadline < deadline)",
         "#include <winsock2.h>",
+        "#include <limits.h>",
+        "#include <sys/socket.h>",
         "#include <poll.h>",
         "#include <pthread.h>",
     ] {
@@ -74,6 +77,7 @@ fn native_pg_connect_poller_is_portable_bounded_and_lean() {
         "PQconnectdb(",
         "PQconnectdbParams(",
         "PQerrorMessage",
+        "#pragma comment(lib, \"libpq.lib\")",
         "PGconn* initial = ku_pg_connectdb_timeout",
         "PGconn* h = ku_pg_connectdb_timeout",
     ] {
@@ -103,7 +107,6 @@ static unsigned long long ku_test_pg_now_ms(void);
 #define KU_PG_MONOTONIC_MS() ku_test_pg_now_ms()
 "#;
     let mut harness = generated
-        .replacen("#pragma comment(lib, \"libpq.lib\")\n", "", 1)
         .replacen(
             "typedef struct pg_conn PGconn;",
             &format!("{hook}\ntypedef struct pg_conn PGconn;"),

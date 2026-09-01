@@ -8,7 +8,9 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -24,6 +26,15 @@ SPEC.loader.exec_module(VERIFIER)
 
 
 class BoundedProcessTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp deadline contract")
+    def test_windows_thread_scan_deadline_includes_snapshot_creation(self) -> None:
+        process = mock.Mock(pid=os.getpid())
+        with (
+            mock.patch.object(VERIFIER.time, "monotonic", side_effect=[100.0, 106.0]),
+            self.assertRaisesRegex(RuntimeError, "thread lookup exceeded its bound"),
+        ):
+            VERIFIER.resume_suspended_windows_process(process)
+
     def test_main_emits_one_escaped_actions_annotation(self) -> None:
         stderr = io.StringIO()
         failure = SystemExit("bad % value\r\nnext line")
@@ -85,6 +96,88 @@ class BoundedProcessTests(unittest.TestCase):
             "inherited pipe self-test",
         )
         self.assertEqual(result.stdout.replace(b"\r\n", b"\n"), b"parent-exited\n")
+
+    @unittest.skipUnless(os.name == "nt", "Windows suspended-start contract")
+    def test_windows_child_cannot_execute_before_job_assignment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ku-native-job-order-") as raw:
+            directory = Path(raw)
+            started = directory / "started"
+            assigned = directory / "assigned"
+            original_attach = VERIFIER.WindowsJob.attach
+            observed_execution_before_assignment = False
+
+            def attach_after_probe(process: subprocess.Popen[bytes]):
+                nonlocal observed_execution_before_assignment
+                deadline = time.monotonic() + 0.25
+                while time.monotonic() < deadline and not started.exists():
+                    time.sleep(0.005)
+                observed_execution_before_assignment = started.exists()
+                job = original_attach(process)
+                assigned.write_text("assigned", encoding="utf-8")
+                return job
+
+            child = (
+                "from pathlib import Path; import sys; "
+                f"started=Path({str(started)!r}); assigned=Path({str(assigned)!r}); "
+                "started.write_text('started',encoding='utf-8'); "
+                "sys.exit(91) if not assigned.exists() else print('assigned-first')"
+            )
+            with mock.patch.object(
+                VERIFIER.WindowsJob, "attach", side_effect=attach_after_probe
+            ):
+                result = VERIFIER.run_bounded(
+                    [sys.executable, "-B", "-c", child],
+                    directory,
+                    "suspended Windows child ordering self-test",
+                )
+            self.assertFalse(observed_execution_before_assignment)
+            self.assertEqual(
+                result.stdout.replace(b"\r\n", b"\n"), b"assigned-first\n"
+            )
+
+    @unittest.skipUnless(os.name == "nt", "Windows suspended-start contract")
+    def test_windows_job_assignment_failure_never_runs_child(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ku-native-job-failure-") as raw:
+            directory = Path(raw)
+            marker = directory / "executed"
+            child = (
+                "from pathlib import Path; "
+                f"Path({str(marker)!r}).write_text('executed',encoding='utf-8')"
+            )
+            with (
+                mock.patch.object(VERIFIER.WindowsJob, "attach", return_value=None),
+                self.assertRaisesRegex(SystemExit, "could not assign suspended Windows child"),
+            ):
+                VERIFIER.run_bounded(
+                    [sys.executable, "-B", "-c", child],
+                    directory,
+                    "failed Windows Job assignment self-test",
+                )
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows suspended-start contract")
+    def test_windows_job_assignment_exception_never_runs_child(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ku-native-job-exception-") as raw:
+            directory = Path(raw)
+            marker = directory / "executed"
+            child = (
+                "from pathlib import Path; "
+                f"Path({str(marker)!r}).write_text('executed',encoding='utf-8')"
+            )
+            with (
+                mock.patch.object(
+                    VERIFIER.WindowsJob,
+                    "attach",
+                    side_effect=RuntimeError("synthetic Job setup failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "synthetic Job setup failure"),
+            ):
+                VERIFIER.run_bounded(
+                    [sys.executable, "-B", "-c", child],
+                    directory,
+                    "exceptional Windows Job assignment self-test",
+                )
+            self.assertFalse(marker.exists())
 
     def test_output_overflow_is_a_bounded_failure(self) -> None:
         previous = VERIFIER.MAX_CAPTURE_BYTES
