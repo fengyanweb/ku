@@ -1,0 +1,8 @@
+import { ParseOutput, AstCanonical } from "../stage2/ast.ku"
+
+// Stage 3 deliberately reuses the Stage 2 append-only NodeId/edge arenas.
+// Statement and module nodes use the same canonical format, so every accepted
+// program has one stable, source-positioned tree instead of a second AST ABI.
+fn ProgramCanonical(output: ParseOutput): str {
+    return AstCanonical(output)
+}
