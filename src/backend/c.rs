@@ -1097,7 +1097,7 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
                 // The element must itself be an "early" type (primitive/struct/nested
                 // array of those); an array of closures/objects is not supported as a
                 // struct field.
-                IrType::Array(element) if is_early_array_element(element) => {}
+                IrType::Array(element) if is_early_array_element(element, program) => {}
                 IrType::Array(_) => {
                     return Err(unsupported(format!(
                         "native C struct '{}.{}' supports array fields of int/float/bool/str/struct only for now",
@@ -1427,11 +1427,18 @@ fn emit_struct_forward_decls(out: &mut String, program: &IrProgram) {
 /// only holds a pointer to it), or a nested array of such. Closure/object/http/value
 /// elements are NOT early — their tags are declared here, but their C type bodies
 /// are completed later by `emit_late_array_typedefs`.
-fn is_early_array_element(element: &IrType) -> bool {
+fn is_early_array_element(element: &IrType, program: &IrProgram) -> bool {
     match element {
         IrType::Int | IrType::Float | IrType::Bool | IrType::Str => true,
-        IrType::Array(inner) => is_early_array_element(inner),
-        IrType::Named(name) => enum_type_name(name).is_none() && !name.starts_with("__ku_"),
+        IrType::Array(inner) => is_early_array_element(inner, program),
+        IrType::Named(name) => {
+            enum_type_name(name).is_none()
+                && program
+                    .layouts
+                    .structs
+                    .iter()
+                    .any(|layout| layout.name == *name)
+        }
         _ => false,
     }
 }
@@ -1450,7 +1457,7 @@ fn emit_array_typedefs(out: &mut String, program: &IrProgram) -> KuResult<()> {
         "static void ku_array_bounds_fail(int64_t index, size_t len) {\n  fprintf(stderr, \"array/index_out_of_bounds: index %lld out of bounds for length %zu\\n\", (long long)index, len);\n  exit(1);\n}\n\n",
     );
     for element in &element_types {
-        if !is_early_array_element(element) {
+        if !is_early_array_element(element, program) {
             continue;
         }
         let array_type = c_array_type(element)?;
@@ -1471,7 +1478,7 @@ fn emit_array_helper_prototypes(out: &mut String, program: &IrProgram) -> KuResu
     collect_all_array_elements(program, &mut element_types);
     let mut any = false;
     for element in &element_types {
-        if !is_early_array_element(element) {
+        if !is_early_array_element(element, program) {
             continue;
         }
         let array_type = c_array_type(element)?;
@@ -1497,7 +1504,7 @@ fn emit_late_array_typedefs(out: &mut String, program: &IrProgram) -> KuResult<(
     collect_all_array_elements(program, &mut element_types);
     let mut any = false;
     for element in &element_types {
-        if is_early_array_element(element) {
+        if is_early_array_element(element, program) {
             continue;
         }
         let array_type = c_array_type(element)?;
@@ -1508,7 +1515,7 @@ fn emit_late_array_typedefs(out: &mut String, program: &IrProgram) -> KuResult<(
         any = true;
     }
     for element in &element_types {
-        if is_early_array_element(element) {
+        if is_early_array_element(element, program) {
             continue;
         }
         let array_type = c_array_type(element)?;

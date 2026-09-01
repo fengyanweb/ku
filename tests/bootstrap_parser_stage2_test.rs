@@ -18,6 +18,7 @@ use ku::lexer::Lexer;
 use ku::parser::Parser;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
+const NATIVE_BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 const PROCESS_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -173,13 +174,6 @@ fn rust_canonical(source: &str) -> String {
     output
 }
 
-fn module_path(path: &Path) -> String {
-    path.canonicalize()
-        .expect("canonical stage-2 module path")
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
 fn ku_binary() -> PathBuf {
     if let Ok(path) = std::env::var("KU_BIN") {
         let candidate = PathBuf::from(path);
@@ -259,21 +253,9 @@ fn bootstrap_parser_stage2_matches_rust_and_has_stable_diagnostics() {
     ];
     cases.push(format!("{}1{}", "(".repeat(30), ")".repeat(30)));
     let long_flat = (0..256).map(|_| "1").collect::<Vec<_>>().join(" + ");
-    let parser = module_path(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("bootstrap/stage2/parser.ku")
-            .as_path(),
-    );
-    let ast = module_path(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("bootstrap/stage2/ast.ku")
-            .as_path(),
-    );
-    let mut body = format!(
-        "import {{ Parse }} from {}\nimport {{ AstCanonical }} from {}\n\n",
-        ku_string(&parser),
-        ku_string(&ast)
-    );
+    let mut body =
+        "import { Parse } from \"./parser.ku\"\nimport { AstCanonical } from \"./ast.ku\"\n\n"
+            .to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(Parse(source.clone())?)\n    if (actual != expected) { panic(\"stage-2 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
@@ -293,7 +275,7 @@ fn bootstrap_parser_stage2_matches_rust_and_has_stable_diagnostics() {
         ku_string(&long_flat)
     ));
     body.push_str(
-        "    ExpectError(\"\", \"unexpected_eof\", \"expected expression|1:1@0..1:1@0\")?\n    ExpectError(\"1 +\", \"unexpected_eof\", \"expected expression|1:4@3..1:4@3\")?\n    ExpectError(\"()\", \"unexpected_token\", \"expected expression before closing delimiter|1:2@1..1:3@2\")?\n",
+        "    ExpectError(\"\", \"unexpected_eof\", \"expected expression|1:1@0..1:1@0\")?\n    ExpectError(\"1 +\", \"unexpected_eof\", \"expected expression|1:4@3..1:4@3\")?\n    ExpectError(\"()\", \"unexpected_token\", \"expected expression before closing delimiter|1:2@1..1:3@2\")?\n    ExpectError(\"a.\", \"unexpected_token\", \"expected field name after field operator|1:3@2..1:3@2\")?\n    ExpectError(\"a)\", \"unexpected_token\", \"closing delimiter has no matching opener|1:2@1..1:3@2\")?\n    ExpectError(\"[1)\", \"unexpected_token\", \"closing delimiter does not match opener|1:3@2..1:4@3\")?\n    ExpectError(\"a[]\", \"unexpected_token\", \"expected expression before closing delimiter|1:3@2..1:4@3\")?\n    ExpectError(\"f(1,)\", \"unexpected_token\", \"expected expression before closing delimiter|1:5@4..1:6@5\")?\n",
     );
     body.push_str(&format!(
         "    ExpectError({}, \"depth_exceeded\", \"maximum parse depth exceeded; expression is too deeply nested|1:32@31..1:33@32\")?\n    return ok(null)\n}}\n",
@@ -301,11 +283,68 @@ fn bootstrap_parser_stage2_matches_rust_and_has_stable_diagnostics() {
     ));
 
     let dir = unique_temp_dir("bootstrap-parser-stage2");
-    fs::create_dir_all(&dir).expect("create stage-2 temp directory");
-    let entry = dir.join("main.ku");
+    let source_root = dir.join("source");
+    let stage1 = source_root.join("stage1");
+    let stage2 = source_root.join("stage2");
+    fs::create_dir_all(&stage1).expect("create copied stage-1 directory");
+    fs::create_dir_all(&stage2).expect("create copied stage-2 directory");
+    let repository_bootstrap = Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap");
+    for name in ["token.ku", "lexer.ku"] {
+        fs::copy(
+            repository_bootstrap.join("stage1").join(name),
+            stage1.join(name),
+        )
+        .expect("copy stage-1 parser dependency");
+    }
+    for name in ["span.ku", "diagnostic.ku", "ast.ku", "parser.ku"] {
+        fs::copy(
+            repository_bootstrap.join("stage2").join(name),
+            stage2.join(name),
+        )
+        .expect("copy stage-2 parser module");
+    }
+    let entry = stage2.join("main.ku");
     fs::write(&entry, body).expect("write stage-2 differential harness");
     let entry_arg = entry.to_string_lossy().to_string();
     run_ku(&["check", &entry_arg]);
     run_ku(&["run", &entry_arg]);
+    run_ku(&["build", "--native", &entry_arg]);
+    let native_c = fs::read_to_string(entry.with_extension("c"))
+        .expect("stage-2 native build must emit a C artifact");
+    assert!(native_c.contains("int main("));
+    assert!(!native_c.contains("const SOURCE"));
+    assert!(!native_c.contains("run_source"));
+
+    let native_name = if cfg!(windows) {
+        "stage2-native.exe"
+    } else {
+        "stage2-native"
+    };
+    let native_path = dir.join(native_name);
+    let native_arg = native_path.to_string_lossy().to_string();
+    let mut build = Command::new(ku_binary());
+    build.args(["build", "--backend", "c", "-o", &native_arg, &entry_arg]);
+    let built = run_bounded(&mut build, NATIVE_BUILD_TIMEOUT, PROCESS_OUTPUT_LIMITS)
+        .expect("stage-2 native link must remain bounded");
+    let build_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if built.status.success() {
+        fs::remove_dir_all(&source_root).expect("remove complete stage-2 source graph");
+        let mut native = Command::new(&native_path);
+        let ran = run_bounded(&mut native, PROCESS_TIMEOUT, PROCESS_OUTPUT_LIMITS)
+            .expect("stage-2 native executable must remain bounded");
+        assert!(
+            ran.status.success(),
+            "stage-2 native executable failed with {:?}:\n{}{}",
+            ran.status.code(),
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr)
+        );
+    } else if !build_log.contains("C compiler not found") {
+        panic!("stage-2 native link failed unexpectedly:\n{build_log}");
+    }
     fs::remove_dir_all(&dir).ok();
 }
