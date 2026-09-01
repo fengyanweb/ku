@@ -21,23 +21,39 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
             let Value::String(text) = &args[0] else {
                 return Err(expected_type("str", &args[0], span));
             };
-            Ok(Some(parse_json(text, span)?))
+            Ok(Some(parse_result(text, span)))
         }
         "try_parse" => {
             expect_arg_count("json.try_parse", args.len(), 1, span)?;
             let Value::String(text) = &args[0] else {
                 return Err(expected_type("str", &args[0], span));
             };
-            match parse_json(text, span) {
-                Ok(value) => Ok(Some(errors::ok(value))),
-                Err(err) => Ok(Some(errors::err("json", "parse_error", err.message))),
-            }
+            Ok(Some(parse_result(text, span)))
         }
         "stringify" => {
             expect_arg_count("json.stringify", args.len(), 1, span)?;
-            Ok(Some(Value::String(stringify_value(&args[0], span)?)))
+            let result = match stringify_value(&args[0], span) {
+                Ok(text) => errors::ok(Value::String(text)),
+                Err(err) => errors::err(
+                    err.domain.as_deref().unwrap_or("json"),
+                    err.code.as_deref().unwrap_or("stringify_error"),
+                    err.message,
+                ),
+            };
+            Ok(Some(result))
         }
         _ => Ok(None),
+    }
+}
+
+fn parse_result(text: &str, span: Span) -> Value {
+    match parse_json(text, span) {
+        Ok(value) => errors::ok(value),
+        Err(err) => errors::err(
+            err.domain.as_deref().unwrap_or("json"),
+            err.code.as_deref().unwrap_or("parse_error"),
+            err.message,
+        ),
     }
 }
 
@@ -171,7 +187,9 @@ impl<'a> JsonParser<'a> {
                         _ => return Err(self.error("invalid json escape")),
                     }
                 }
-                ch if ch.is_control() => return Err(self.error("control character in json string")),
+                ch if (ch as u32) < 0x20 => {
+                    return Err(self.error("control character in json string"));
+                }
                 _ => output.push(ch),
             }
         }
@@ -179,6 +197,25 @@ impl<'a> JsonParser<'a> {
     }
 
     fn unicode_escape(&mut self) -> KuResult<char> {
+        let high = self.unicode_code_unit()?;
+        let scalar = if (0xD800..=0xDBFF).contains(&high) {
+            if self.advance() != Some('\\') || self.advance() != Some('u') {
+                return Err(self.error("high surrogate must be followed by a low surrogate"));
+            }
+            let low = self.unicode_code_unit()?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return Err(self.error("high surrogate must be followed by a low surrogate"));
+            }
+            0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+        } else if (0xDC00..=0xDFFF).contains(&high) {
+            return Err(self.error("unexpected low surrogate"));
+        } else {
+            high
+        };
+        char::from_u32(scalar).ok_or_else(|| self.error("invalid unicode scalar"))
+    }
+
+    fn unicode_code_unit(&mut self) -> KuResult<u32> {
         let mut value = 0u32;
         for _ in 0..4 {
             let Some(ch) = self.advance() else {
@@ -189,7 +226,7 @@ impl<'a> JsonParser<'a> {
             };
             value = value * 16 + digit;
         }
-        char::from_u32(value).ok_or_else(|| self.error("invalid unicode scalar"))
+        Ok(value)
     }
 
     fn number(&mut self) -> KuResult<Value> {
@@ -213,9 +250,13 @@ impl<'a> JsonParser<'a> {
         }
         let text = self.chars[start..self.current].iter().collect::<String>();
         if is_float {
-            text.parse::<f64>()
-                .map(Value::Float)
-                .map_err(|_| self.error("invalid json number"))
+            let value = text
+                .parse::<f64>()
+                .map_err(|_| self.error("invalid json number"))?;
+            if !value.is_finite() {
+                return Err(self.error("json number must be finite"));
+            }
+            Ok(Value::Float(value))
         } else {
             text.parse::<i64>()
                 .map(Value::Int)
@@ -302,7 +343,15 @@ fn write_json(value: &Value, output: &mut String, depth: usize, span: Span) -> K
         Value::Null => output.push_str("null"),
         Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
         Value::Int(value) => output.push_str(&value.to_string()),
-        Value::Float(value) => output.push_str(&value.to_string()),
+        Value::Float(value) => {
+            if !value.is_finite() {
+                return Err(KuError::runtime(
+                    "json.stringify does not support non-finite float",
+                    span,
+                ));
+            }
+            output.push_str(&value.to_string());
+        }
         Value::String(value) => write_json_string(value, output),
         Value::Array(values) => {
             output.push('[');
@@ -328,7 +377,11 @@ fn write_json(value: &Value, output: &mut String, depth: usize, span: Span) -> K
             }
             output.push('}');
         }
-        Value::Enum { .. } | Value::Result { .. } | Value::Function { .. } | Value::Task(_) => {
+        Value::Enum { .. }
+        | Value::Result { .. }
+        | Value::Function { .. }
+        | Value::Task(_)
+        | Value::HttpListenerLease(_) => {
             return Err(KuError::runtime(
                 format!("json.stringify does not support {}", value.type_name()),
                 span,
@@ -350,9 +403,47 @@ fn write_json_string(value: &str, output: &mut String) {
             '\n' => output.push_str("\\n"),
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
-            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch if (ch as u32) < 0x20 => output.push_str(&format!("\\u{:04x}", ch as u32)),
             _ => output.push(ch),
         }
     }
     output.push('"');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stringify_rejects_every_non_finite_float() {
+        for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let error = stringify_value(&Value::Float(value), Span::default())
+                .expect_err("non-finite floats must not produce invalid JSON");
+            assert!(
+                error.message.contains("non-finite float"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn strings_accept_json_legal_del_and_c1_controls() {
+        for character in ['\u{007f}', '\u{0085}'] {
+            let text = format!("\"{character}\"");
+            let parsed = parse_json(&text, Span::default())
+                .expect("JSON permits unescaped code points above U+001F");
+            assert_eq!(parsed, Value::String(character.to_string()));
+            assert_eq!(
+                stringify_value(&parsed, Span::default()).expect("stringify legal control"),
+                text
+            );
+        }
+
+        let error = parse_json("\"\u{001f}\"", Span::default())
+            .expect_err("JSON forbids unescaped U+0000 through U+001F");
+        assert!(
+            error.message.contains("control character"),
+            "unexpected error: {error}"
+        );
+    }
 }

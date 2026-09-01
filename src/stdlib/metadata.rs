@@ -19,7 +19,7 @@ pub(crate) enum TypePattern {
     /// An opaque native handle owned by a C-library binding (e.g. a `pg` connection
     /// or result). Maps to `Type::Native(name)` — owned, move-tracked, dropped by the
     /// backend (which closes/frees the underlying C resource). The name carries the
-    /// backend's synthetic type id (e.g. `__ku_pg_conn`).
+    /// backend's synthetic type id (e.g. `__ku_pg_client`).
     Native(&'static str),
 }
 
@@ -85,9 +85,10 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("fs", "try_read") => vec![str_arg()],
         ("fs", "write") => vec![str_arg(), str_arg()],
         ("fs", "try_write") => vec![str_arg(), str_arg()],
+        ("fs", "exists" | "read_dir") => vec![str_arg()],
         ("lexer", "scan") => vec![str_arg()],
         ("parser", "parse") => vec![ArgRule::Is(TypePattern::StringOrStringArray)],
-        ("string", "len" | "trim" | "lower" | "upper") => vec![str_arg()],
+        ("string", "len" | "byte_len" | "chars" | "trim" | "lower" | "upper") => vec![str_arg()],
         ("string", "contains" | "starts_with" | "ends_with") => vec![str_arg(), str_arg()],
         ("string", "replace") => vec![str_arg(), str_arg(), str_arg()],
         ("string", "slice") => vec![str_arg(), int_arg(), int_arg()],
@@ -106,7 +107,10 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("config", "env") => vec![],
         ("config", "env_file") => vec![str_arg()],
         ("config", "yaml") => vec![str_arg()],
-        ("time", "now" | "unix" | "millis" | "date") => vec![],
+        ("time", "now" | "instant" | "unix" | "millis" | "steady_millis" | "date") => {
+            vec![]
+        }
+        ("time", "elapsed") => vec![ArgRule::Is(TypePattern::ObjectAny)],
         ("time", "from_unix" | "from_millis" | "is_leap") => vec![int_arg()],
         ("time", "days_in_month") => vec![int_arg(), int_arg()],
         ("time", "sleep") => vec![ArgRule::Is(TypePattern::Any)],
@@ -122,67 +126,45 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("http", "empty") => vec![],
         ("http", "redirect") => vec![str_arg()],
         ("http", "statusText") => vec![int_arg()],
-        // std.pg — thin libpq binding. Conn/result are opaque owned native handles.
-        ("pg", "connect") => vec![str_arg()],
-        ("pg", "query") => vec![ArgRule::Is(TypePattern::Native(PG_CONN)), str_arg()],
-        ("pg", "query_params") => vec![
-            ArgRule::Is(TypePattern::Native(PG_CONN)),
+        // std.pg exposes one ordinary business path: client(config), followed by
+        // receiver methods. The client owns a bounded pool internally; raw
+        // libpq connections are intentionally not part of the public API.
+        ("pg", "client") => vec![ArgRule::Is(TypePattern::ObjectAny)],
+        ("pg_client", "query") => vec![
+            ArgRule::Is(TypePattern::Native(PG_CLIENT)),
             str_arg(),
             ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
         ],
-        ("pg", "rows" | "cols") => vec![ArgRule::Is(TypePattern::Native(PG_RESULT))],
-        ("pg", "value") => vec![
+        ("pg_result", "rows" | "cols") => vec![ArgRule::Is(TypePattern::Native(PG_RESULT))],
+        ("pg_result", "value" | "is_null") => vec![
             ArgRule::Is(TypePattern::Native(PG_RESULT)),
             int_arg(),
             int_arg(),
         ],
-        ("pg", "close") => vec![ArgRule::Is(TypePattern::Native(PG_CONN))],
-        // Connection pool: the pool owns the connections; queries borrow one
-        // internally and return it, so a caller can never leak a connection.
-        ("pg", "pool") => vec![str_arg(), int_arg()],
-        ("pg", "pool_query") => vec![ArgRule::Is(TypePattern::Native(PG_POOL)), str_arg()],
-        ("pg", "pool_query_params") => vec![
-            ArgRule::Is(TypePattern::Native(PG_POOL)),
-            str_arg(),
-            ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
-        ],
-        ("pg", "pool_close") => vec![ArgRule::Is(TypePattern::Native(PG_POOL))],
-        // std.mysql — thin libmysqlclient binding. Conn/result are opaque owned handles.
-        ("mysql", "connect") => vec![str_arg(), int_arg(), str_arg(), str_arg(), str_arg()],
-        ("mysql", "query") => vec![ArgRule::Is(TypePattern::Native(MYSQL_CONN)), str_arg()],
-        ("mysql", "query_params") => vec![
-            ArgRule::Is(TypePattern::Native(MYSQL_CONN)),
-            str_arg(),
-            ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
-        ],
-        ("mysql", "rows" | "cols") => vec![ArgRule::Is(TypePattern::Native(MYSQL_RESULT))],
-        ("mysql", "value") => vec![
-            ArgRule::Is(TypePattern::Native(MYSQL_RESULT)),
-            int_arg(),
-            int_arg(),
-        ],
-        ("mysql", "close") => vec![ArgRule::Is(TypePattern::Native(MYSQL_CONN))],
-        // std.redis — thin RESP-over-socket binding. Conn is an opaque owned handle.
-        ("redis", "connect") => vec![str_arg(), int_arg()],
-        ("redis", "auth") => vec![ArgRule::Is(TypePattern::Native(REDIS_CONN)), str_arg()],
-        ("redis", "get") => vec![ArgRule::Is(TypePattern::Native(REDIS_CONN)), str_arg()],
-        ("redis", "set") => vec![
-            ArgRule::Is(TypePattern::Native(REDIS_CONN)),
-            str_arg(),
-            str_arg(),
-        ],
-        ("redis", "del") => vec![ArgRule::Is(TypePattern::Native(REDIS_CONN)), str_arg()],
-        ("redis", "close") => vec![ArgRule::Is(TypePattern::Native(REDIS_CONN))],
+        ("pg_client", "close") => vec![ArgRule::Is(TypePattern::Native(PG_CLIENT))],
+        // std.mysql exposes one pooled client constructor. Queries are receiver
+        // methods described under private synthetic modules so module-level
+        // mysql.query/connect compatibility paths cannot be selected.
+        ("mysql", "client") => vec![ArgRule::Is(TypePattern::ObjectAny)],
+        // std.redis exposes one ordinary entry point. The returned client owns a
+        // bounded, lazy connection pool; commands are receiver methods described
+        // by `redis_client_method_signature`, not duplicate module functions.
+        ("redis", "client") => vec![ArgRule::Is(TypePattern::ObjectAny)],
         _ => return None,
     };
     let returns = match (module, function) {
-        ("fs", "read") => TypePattern::String,
+        ("fs", "read") => TypePattern::ResultOf(Box::new(TypePattern::String)),
         ("fs", "try_read") => TypePattern::ResultOf(Box::new(TypePattern::String)),
-        ("fs", "write") => TypePattern::Null,
+        ("fs", "write") => TypePattern::ResultOf(Box::new(TypePattern::Null)),
         ("fs", "try_write") => TypePattern::ResultOf(Box::new(TypePattern::Null)),
+        ("fs", "exists") => TypePattern::Bool,
+        ("fs", "read_dir") => TypePattern::ResultOf(Box::new(TypePattern::ArrayOf(Box::new(
+            TypePattern::String,
+        )))),
         ("lexer", "scan") => TypePattern::ArrayOf(Box::new(TypePattern::String)),
         ("parser", "parse") => TypePattern::String,
-        ("string", "len") => TypePattern::Int,
+        ("string", "len" | "byte_len") => TypePattern::Int,
+        ("string", "chars") => TypePattern::ArrayOf(Box::new(TypePattern::String)),
         ("string", "contains" | "starts_with" | "ends_with") => TypePattern::Bool,
         ("string", "slice") => TypePattern::ResultOf(Box::new(TypePattern::String)),
         ("string", "trim" | "lower" | "upper" | "replace") => TypePattern::String,
@@ -194,13 +176,13 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("object", "get_or") => TypePattern::Unknown,
         ("kuvalue", "as_int") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
         ("kuvalue", "as_str") => TypePattern::ResultOf(Box::new(TypePattern::String)),
-        ("json", "parse") => TypePattern::KuValue,
+        ("json", "parse") => TypePattern::ResultOf(Box::new(TypePattern::KuValue)),
         ("json", "try_parse") => TypePattern::ResultOf(Box::new(TypePattern::KuValue)),
-        ("json", "stringify") => TypePattern::String,
+        ("json", "stringify") => TypePattern::ResultOf(Box::new(TypePattern::String)),
         ("config", "env" | "env_file") => TypePattern::ObjectAny,
         ("config", "yaml") => TypePattern::ResultOf(Box::new(TypePattern::ObjectAny)),
-        ("time", "now" | "date" | "from_unix" | "from_millis") => TypePattern::ObjectAny,
-        ("time", "unix" | "millis") => TypePattern::Int,
+        ("time", "instant" | "date" | "from_unix" | "from_millis") => TypePattern::ObjectAny,
+        ("time", "now" | "elapsed" | "unix" | "millis" | "steady_millis") => TypePattern::Int,
         ("time", "is_leap") => TypePattern::Bool,
         ("time", "days_in_month") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
         ("time", "sleep") => TypePattern::ResultOf(Box::new(TypePattern::Null)),
@@ -213,30 +195,14 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("http", "service" | "server") => http_service_pattern(),
         ("http", "text" | "html" | "json" | "empty" | "redirect") => http_response_pattern(),
         ("http", "statusText") => TypePattern::String,
-        ("pg", "connect") => TypePattern::ResultOf(Box::new(TypePattern::Native(PG_CONN))),
-        ("pg", "query" | "query_params") => {
-            TypePattern::ResultOf(Box::new(TypePattern::Native(PG_RESULT)))
-        }
-        ("pg", "rows" | "cols") => TypePattern::Int,
-        ("pg", "value") => TypePattern::String,
-        ("pg", "close") => TypePattern::Null,
-        ("pg", "pool") => TypePattern::ResultOf(Box::new(TypePattern::Native(PG_POOL))),
-        ("pg", "pool_query" | "pool_query_params") => {
-            TypePattern::ResultOf(Box::new(TypePattern::Native(PG_RESULT)))
-        }
-        ("pg", "pool_close") => TypePattern::Null,
-        ("mysql", "connect") => TypePattern::ResultOf(Box::new(TypePattern::Native(MYSQL_CONN))),
-        ("mysql", "query" | "query_params") => {
-            TypePattern::ResultOf(Box::new(TypePattern::Native(MYSQL_RESULT)))
-        }
-        ("mysql", "rows" | "cols") => TypePattern::Int,
-        ("mysql", "value") => TypePattern::String,
-        ("mysql", "close") => TypePattern::Null,
-        ("redis", "connect") => TypePattern::ResultOf(Box::new(TypePattern::Native(REDIS_CONN))),
-        ("redis", "auth" | "set") => TypePattern::ResultOf(Box::new(TypePattern::Null)),
-        ("redis", "get") => TypePattern::ResultOf(Box::new(TypePattern::String)),
-        ("redis", "del") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
-        ("redis", "close") => TypePattern::Null,
+        ("pg", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(PG_CLIENT))),
+        ("pg_client", "query") => TypePattern::ResultOf(Box::new(TypePattern::Native(PG_RESULT))),
+        ("pg_result", "rows" | "cols") => TypePattern::Int,
+        ("pg_result", "value") => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        ("pg_result", "is_null") => TypePattern::ResultOf(Box::new(TypePattern::Bool)),
+        ("pg_client", "close") => TypePattern::Null,
+        ("mysql", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(MYSQL_CLIENT))),
+        ("redis", "client") => TypePattern::ResultOf(Box::new(TypePattern::Native(REDIS_CLIENT))),
         _ => return None,
     };
     Some(Signature {
@@ -251,39 +217,150 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
     })
 }
 
+/// Receiver-only API for the bounded MySQL client and detached result. Keeping
+/// this out of `dotted_signature("mysql", ...)` makes the removed module-level
+/// connect/query/query_params/close spellings hard errors.
+pub(crate) fn mysql_method_signature(native: &str, function: &str) -> Option<Signature> {
+    let (args, returns) = if native == MYSQL_CLIENT {
+        match function {
+            "query" => (
+                vec![
+                    ArgRule::Is(TypePattern::Native(MYSQL_CLIENT)),
+                    str_arg(),
+                    ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
+                ],
+                TypePattern::ResultOf(Box::new(TypePattern::Native(MYSQL_RESULT))),
+            ),
+            "execute" => (
+                vec![
+                    ArgRule::Is(TypePattern::Native(MYSQL_CLIENT)),
+                    str_arg(),
+                    ArgRule::Is(TypePattern::ArrayOf(Box::new(TypePattern::String))),
+                ],
+                TypePattern::ResultOf(Box::new(TypePattern::Int)),
+            ),
+            "close" => (
+                vec![ArgRule::Is(TypePattern::Native(MYSQL_CLIENT))],
+                TypePattern::Null,
+            ),
+            _ => return None,
+        }
+    } else if native == MYSQL_RESULT {
+        match function {
+            "rows" | "cols" => (
+                vec![ArgRule::Is(TypePattern::Native(MYSQL_RESULT))],
+                TypePattern::Int,
+            ),
+            "value" => (
+                vec![
+                    ArgRule::Is(TypePattern::Native(MYSQL_RESULT)),
+                    int_arg(),
+                    int_arg(),
+                ],
+                TypePattern::ResultOf(Box::new(TypePattern::String)),
+            ),
+            "is_null" => (
+                vec![
+                    ArgRule::Is(TypePattern::Native(MYSQL_RESULT)),
+                    int_arg(),
+                    int_arg(),
+                ],
+                TypePattern::ResultOf(Box::new(TypePattern::Bool)),
+            ),
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    Some(Signature {
+        name: format!("mysql.{function}"),
+        args,
+        returns,
+        abi: CallAbi::DottedBuiltin {
+            module: "mysql".to_string(),
+            function: function.to_string(),
+        },
+        failure: if matches!(function, "query" | "execute" | "value" | "is_null") {
+            FailureMode::ReturnsResult
+        } else {
+            FailureMode::Never
+        },
+    })
+}
+
+/// Receiver-only API for the bounded Redis client. Keeping these signatures out
+/// of `dotted_signature("redis", ...)` intentionally makes
+/// `redis.get(client, key)` and the old raw-connection API unknown stdlib calls;
+/// ordinary code has one path: `redis.client(config)?` followed by
+/// `client.get(key)?` / `client.set(key, value)?`.
+pub(crate) fn redis_client_method_signature(function: &str) -> Option<Signature> {
+    let client = || ArgRule::Is(TypePattern::Native(REDIS_CLIENT));
+    let args = match function {
+        "ping" | "close" => vec![client()],
+        "get" | "del" | "exists" => vec![client(), str_arg()],
+        "set" => vec![client(), str_arg(), str_arg()],
+        _ => return None,
+    };
+    let returns = match function {
+        "ping" | "set" => TypePattern::ResultOf(Box::new(TypePattern::Null)),
+        // GET is strict: RESP nil is redis/key_not_found. There is deliberately
+        // no second `get_required` spelling and no nil-to-empty compatibility.
+        "get" => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        "del" => TypePattern::ResultOf(Box::new(TypePattern::Int)),
+        "exists" => TypePattern::ResultOf(Box::new(TypePattern::Bool)),
+        "close" => TypePattern::Null,
+        _ => return None,
+    };
+    Some(Signature {
+        name: format!("redis.{function}"),
+        args,
+        returns,
+        abi: CallAbi::DottedBuiltin {
+            module: "redis".to_string(),
+            function: function.to_string(),
+        },
+        failure: if function == "close" {
+            FailureMode::Never
+        } else {
+            FailureMode::ReturnsResult
+        },
+    })
+}
+
 fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
     match (module, function) {
-        ("fs", "try_read" | "try_write")
+        ("fs", "read" | "try_read" | "write" | "try_write" | "read_dir")
         | ("string", "slice")
         | ("array", "try_get")
         | ("kuvalue", "as_int" | "as_str")
-        | ("json", "try_parse")
+        | ("json", "parse" | "try_parse" | "stringify")
         | ("config", "yaml")
         | ("time", "days_in_month" | "sleep")
         | ("http", "get" | "post" | "request")
-        | ("pg", "connect" | "query" | "query_params" | "pool" | "pool_query" | "pool_query_params")
-        | ("mysql", "connect" | "query" | "query_params")
-        | ("redis", "connect" | "auth" | "get" | "set" | "del") => FailureMode::ReturnsResult,
-        ("fs", "read" | "write")
-        | ("json", "parse")
-        | ("config", "env_file")
-        | ("task", "stats" | "stress") => FailureMode::MayPanic,
+        | ("pg", "client")
+        | ("pg_client", "query")
+        | ("pg_result", "value" | "is_null")
+        | ("mysql", "client")
+        | ("redis", "client") => FailureMode::ReturnsResult,
+        ("config", "env_file") | ("task", "stats" | "stress") => FailureMode::MayPanic,
         _ => FailureMode::Never,
     }
 }
 
 /// Backend synthetic type ids for the opaque `pg` native handles.
-pub(crate) const PG_CONN: &str = "__ku_pg_conn";
 pub(crate) const PG_RESULT: &str = "__ku_pg_result";
-pub(crate) const PG_POOL: &str = "__ku_pg_pool";
-/// Backend synthetic type id for the opaque `redis` connection handle.
-pub(crate) const REDIS_CONN: &str = "__ku_redis_conn";
-/// Backend synthetic type ids for the opaque `mysql` handles.
-pub(crate) const MYSQL_CONN: &str = "__ku_mysql_conn";
+pub(crate) const PG_CLIENT: &str = "__ku_pg_client";
+/// Backend synthetic type id for the opaque, bounded `redis` client/pool handle.
+pub(crate) const REDIS_CLIENT: &str = "__ku_redis_client";
+/// Backend synthetic type ids for the pooled `mysql` client and detached result.
+pub(crate) const MYSQL_CLIENT: &str = "__ku_mysql_client";
 pub(crate) const MYSQL_RESULT: &str = "__ku_mysql_result";
 
 pub(crate) fn module_requires_import(module: &str) -> bool {
-    matches!(module, "fs" | "http" | "config" | "task" | "pg" | "redis" | "mysql")
+    matches!(
+        module,
+        "fs" | "http" | "config" | "task" | "pg" | "redis" | "mysql"
+    )
 }
 
 pub(crate) fn is_std_module(module: &str) -> bool {

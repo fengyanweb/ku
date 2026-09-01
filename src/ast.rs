@@ -205,6 +205,26 @@ impl Expr {
     }
 }
 
+/// A deliberately small effect-free subset used by the interpreter and native
+/// lowering for local array self-appends. Calls (including clone), templates,
+/// captures and Result propagation must keep the ordinary evaluation path.
+pub(crate) fn is_pure_append_argument(expr: &Expr, receiver: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(literal) => !matches!(literal, Literal::TemplateString(_)),
+        ExprKind::Variable(name) => name != receiver,
+        ExprKind::Unary { expr, .. } | ExprKind::Field { target: expr, .. } => {
+            is_pure_append_argument(expr, receiver)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            is_pure_append_argument(left, receiver) && is_pure_append_argument(right, receiver)
+        }
+        ExprKind::Index { target, index } => {
+            is_pure_append_argument(target, receiver) && is_pure_append_argument(index, receiver)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssignTarget {
     Variable(String),

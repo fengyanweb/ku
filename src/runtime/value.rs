@@ -1,8 +1,29 @@
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use crate::ast::Stmt;
 use crate::env::Env;
 use crate::runtime::task::TaskHandle;
+
+/// Opaque ownership token stored only in an interpreter HTTP-listener object.
+/// Cloning a `Value` clones this `Arc`; the final owner releases an unconsumed
+/// socket from the process registry.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct HttpListenerLease {
+    id: i64,
+}
+
+impl HttpListenerLease {
+    pub(crate) fn new(id: i64) -> Arc<Self> {
+        Arc::new(Self { id })
+    }
+}
+
+impl Drop for HttpListenerLease {
+    fn drop(&mut self) {
+        crate::runtime::http_listener_registry::release_best_effort(self.id);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -33,6 +54,8 @@ pub enum Value {
         is_async: bool,
     },
     Task(TaskHandle),
+    #[doc(hidden)]
+    HttpListenerLease(Arc<HttpListenerLease>),
     Null,
 }
 
@@ -63,6 +86,7 @@ impl Value {
             Value::Result { .. } => "result",
             Value::Function { .. } => "function",
             Value::Task(_) => "task",
+            Value::HttpListenerLease(_) => "http_listener_lease",
             Value::Null => "null",
         }
     }
@@ -136,6 +160,7 @@ impl fmt::Display for Value {
             }
             Value::Function { .. } => write!(f, "<function>"),
             Value::Task(task) => write!(f, "<task:{}>", task.id()),
+            Value::HttpListenerLease(_) => write!(f, "<http-listener-lease>"),
             Value::Null => write!(f, "null"),
         }
     }
@@ -188,6 +213,9 @@ impl PartialEq for Value {
             ) => left_ok == right_ok && left_value == right_value,
             (Value::Function { .. }, Value::Function { .. }) => false,
             (Value::Task(left), Value::Task(right)) => left == right,
+            (Value::HttpListenerLease(left), Value::HttpListenerLease(right)) => {
+                Arc::ptr_eq(left, right)
+            }
             (Value::Null, Value::Null) => true,
             _ => false,
         }

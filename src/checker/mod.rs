@@ -32,9 +32,9 @@ enum Type {
     Struct(String),
     Enum(String),
     /// An opaque owned handle from a C-library binding (e.g. a `pg` connection or
-    /// result). The string is the backend's synthetic type id (`__ku_pg_conn`). It is
-    /// owned (move-tracked, dropped so the backend can close the C resource) but has
-    /// no user-visible fields or methods — only the module functions accept it.
+    /// result). The string is the backend's synthetic type id (`__ku_pg_client`). It is
+    /// owned (move-tracked, dropped so the backend can close the C resource) and can
+    /// expose only checker-recognized receiver methods; it has no user-visible fields.
     Native(String),
     Generic(String),
     Void,
@@ -42,6 +42,10 @@ enum Type {
         params: Vec<FunctionValueParam>,
         return_type: Option<Box<Type>>,
         body: Vec<Stmt>,
+        /// Checker-local lexical identity for an available function body. Type
+        /// annotations carry `None`; concrete top-level/local functions and
+        /// closure literals carry a fresh id that survives `Type::clone`.
+        body_id: Option<FunctionBodyId>,
         is_async: bool,
     },
     /// A tagged dynamic value read out of a dynamic object (`obj[key]?`,
@@ -129,8 +133,144 @@ fn move_of_moved_error(root: &str, path: &[String], span: Span) -> KuError {
     }
 }
 
+type BindingId = u64;
+
+/// The binding cells reachable from closures contained in a value. `complete`
+/// distinguishes a proven empty dependency set (for example a top-level
+/// function) from a value whose provenance the checker could not recover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosureProvenance {
+    dependencies: HashSet<BindingId>,
+    complete: bool,
+}
+
+impl ClosureProvenance {
+    fn empty() -> Self {
+        Self {
+            dependencies: HashSet::new(),
+            complete: true,
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            dependencies: HashSet::new(),
+            complete: false,
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.dependencies.extend(other.dependencies.iter().copied());
+        self.complete &= other.complete;
+    }
+}
+
+#[derive(Debug)]
+struct ClosureReturnFlow {
+    returned: Option<ClosureProvenance>,
+    fallthrough: Option<HashMap<String, ClosureProvenance>>,
+    complete: bool,
+}
+
 #[derive(Debug, Clone)]
+struct ClosureWriteEffect {
+    target: BindingId,
+    provenance: ClosureProvenance,
+}
+
+#[derive(Clone)]
+struct ClosureEffectSummary {
+    effects: Vec<ClosureWriteEffect>,
+    complete: bool,
+}
+
+#[derive(Clone)]
+struct ClosureEffectEnvironment {
+    symbolic: HashMap<String, ClosureProvenance>,
+    /// Concrete call-site types for higher-order parameters and aliases. The
+    /// annotation alone has no body, while the actual FunctionValue may carry a
+    /// checker body id and a captured environment that must be followed for
+    /// write-effect analysis.
+    types: HashMap<String, Type>,
+    locals: HashSet<String>,
+}
+
+struct ClosureEffectFlow {
+    environment: ClosureEffectEnvironment,
+    effects: Vec<ClosureWriteEffect>,
+    complete: bool,
+    falls_through: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ClosureBodyView<'a> {
+    params: &'a [FunctionValueParam],
+    body: &'a [Stmt],
+    body_id: FunctionBodyId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClosureProvenanceKey {
+    dependencies: Vec<BindingId>,
+    complete: bool,
+}
+
+impl From<&ClosureProvenance> for ClosureProvenanceKey {
+    fn from(provenance: &ClosureProvenance) -> Self {
+        let mut dependencies = provenance.dependencies.iter().copied().collect::<Vec<_>>();
+        dependencies.sort_unstable();
+        Self {
+            dependencies,
+            complete: provenance.complete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClosureReturnSummaryKey {
+    body_id: FunctionBodyId,
+    captured_environment: ClosureProvenanceKey,
+    arguments: Vec<ClosureProvenanceKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClosureEffectSummaryKey {
+    body_id: FunctionBodyId,
+    captured_environment: ClosureProvenanceKey,
+    arguments: Vec<ClosureProvenanceKey>,
+    /// Provenance can be identical for two function values with different
+    /// bodies (for example Discard and a setter). Keep their summaries apart.
+    argument_bodies: Vec<Option<FunctionBodyId>>,
+}
+
+// Keep this below the default Windows test-thread stack's practical recursive
+// depth. Cache hits make ordinary DAGs near-linear; the budget converts a deep
+// unique chain to conservative provenance before Rust call-stack exhaustion.
+const MAX_CLOSURE_SUMMARY_STATES: usize = 96;
+
+struct ClosureSummaryContext {
+    active_bodies: HashSet<FunctionBodyId>,
+    return_cache: HashMap<ClosureReturnSummaryKey, ClosureProvenance>,
+    active_effect_bodies: HashSet<FunctionBodyId>,
+    effect_cache: HashMap<ClosureEffectSummaryKey, ClosureEffectSummary>,
+    remaining_states: usize,
+}
+
+impl ClosureSummaryContext {
+    fn new() -> Self {
+        Self {
+            active_bodies: HashSet::new(),
+            return_cache: HashMap::new(),
+            active_effect_bodies: HashSet::new(),
+            effect_cache: HashMap::new(),
+            remaining_states: MAX_CLOSURE_SUMMARY_STATES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct VarType {
+    binding_id: BindingId,
     ty: Type,
     mutable: bool,
     /// Move state at struct-field-path granularity. A key is a projection path
@@ -153,16 +293,26 @@ struct VarType {
     /// A closure captured this binding, so its value now lives in a shared cell
     /// that the closure reads on every call. Moving it would empty that cell.
     captured: bool,
+    /// Dependencies owned by closures currently stored in this binding. These
+    /// form a checker-only graph used to reject local-RC cycles before lowering.
+    closure_provenance: ClosureProvenance,
 }
 
 impl VarType {
-    fn live(ty: Type, mutable: bool) -> Self {
+    fn live(
+        binding_id: BindingId,
+        ty: Type,
+        mutable: bool,
+        closure_provenance: ClosureProvenance,
+    ) -> Self {
         Self {
+            binding_id,
             ty,
             mutable,
             moves: BTreeMap::new(),
             struct_backed: false,
             captured: false,
+            closure_provenance,
         }
     }
 
@@ -199,10 +349,57 @@ impl VarType {
     }
 }
 
+type MoveScopes = Vec<HashMap<String, VarType>>;
+
+/// Abrupt exits captured while checking one lexical `try`. Recording them at
+/// the actual `return` / `fail` / `?` site is important: an `if` deliberately
+/// removes diverging branches from its fallthrough join, and an assignment can
+/// re-initialize its target after a throwable RHS has already consumed it.
+#[derive(Debug)]
+struct TryExitCollector {
+    /// Only bindings visible before the try body are visible to catch/finally.
+    outer_scope_len: usize,
+    returns: Vec<MoveScopes>,
+    throws: Vec<MoveScopes>,
+}
+
+impl TryExitCollector {
+    fn new(outer_scope_len: usize) -> Self {
+        Self {
+            outer_scope_len,
+            returns: Vec::new(),
+            throws: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TryExitKind {
+    Return,
+    Throw,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TryPathKind {
+    Normal,
+    Return,
+    Throw,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct FunctionValueParam {
     name: String,
     ty: Option<Type>,
+}
+
+type FunctionBodyId = u64;
+
+#[derive(Clone, Copy)]
+struct FunctionValueBodyRef<'a> {
+    params: &'a [FunctionValueParam],
+    return_type: Option<&'a Type>,
+    body: &'a [Stmt],
+    body_id: Option<FunctionBodyId>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +410,7 @@ struct FunctionType {
     return_type: Option<Type>,
     returns: Type,
     body: Vec<Stmt>,
+    body_id: FunctionBodyId,
     is_async: bool,
 }
 
@@ -247,11 +445,26 @@ pub struct Checker {
     async_depth: usize,
     readonly_capture: Option<ReadonlyCapture>,
     std_modules: HashSet<String>,
-    function_value_inference_stack: Vec<(usize, usize, usize)>,
+    function_value_inference_stack: Vec<FunctionBodyId>,
+    /// Bodies currently re-audited below an outer read-only execution boundary.
+    /// This guard is independent from return inference because annotated direct
+    /// and mutually recursive FunctionValues must terminate too.
+    readonly_function_body_stack: Vec<FunctionBodyId>,
+    next_function_body_id: FunctionBodyId,
+    next_binding_id: BindingId,
+    /// Lexical binding identities visible when a concrete local function or
+    /// closure body was created. Effect summaries use this table to distinguish
+    /// an outer-cell write from an implicit/local binding, even after aliases or
+    /// same-name shadowing appear at the call site.
+    function_body_outer_bindings: HashMap<FunctionBodyId, HashMap<String, BindingId>>,
     /// Stage 6c-str: scope-index boundaries of the closure bodies currently being
     /// checked (one per nesting level). Moving an owned value found in a scope
     /// below the active boundary out of the closure is rejected (E0904).
     closure_capture_boundaries: Vec<usize>,
+    /// One frame per active lexical `try`. Only the innermost frame records an
+    /// exit; after its finally is checked, still-pending exits are forwarded to
+    /// the parent so nested try/finally chains preserve execution order.
+    try_exit_collectors: Vec<TryExitCollector>,
 }
 
 impl Checker {
@@ -272,8 +485,54 @@ impl Checker {
             readonly_capture: None,
             std_modules: HashSet::new(),
             function_value_inference_stack: Vec::new(),
+            readonly_function_body_stack: Vec::new(),
+            next_function_body_id: 1,
+            next_binding_id: 1,
+            function_body_outer_bindings: HashMap::new(),
             closure_capture_boundaries: Vec::new(),
+            try_exit_collectors: Vec::new(),
         }
+    }
+
+    fn fresh_function_body_id(&mut self) -> FunctionBodyId {
+        let body_id = self.next_function_body_id;
+        self.next_function_body_id = self
+            .next_function_body_id
+            .checked_add(1)
+            .expect("checker function body id space exhausted");
+        body_id
+    }
+
+    fn fresh_binding_id(&mut self) -> BindingId {
+        let binding_id = self.next_binding_id;
+        self.next_binding_id = self
+            .next_binding_id
+            .checked_add(1)
+            .expect("checker binding id space exhausted");
+        binding_id
+    }
+
+    fn visible_binding_ids(&self) -> HashMap<String, BindingId> {
+        let mut bindings = HashMap::new();
+        for scope in &self.scopes {
+            for (name, binding) in scope {
+                bindings.insert(name.clone(), binding.binding_id);
+            }
+        }
+        bindings
+    }
+
+    fn record_function_body_outer_bindings(
+        &mut self,
+        body_id: FunctionBodyId,
+        captured_names: &HashSet<String>,
+    ) {
+        let bindings = self
+            .visible_binding_ids()
+            .into_iter()
+            .filter(|(name, _)| captured_names.contains(name))
+            .collect();
+        self.function_body_outer_bindings.insert(body_id, bindings);
     }
 
     pub fn check(mut self, program: &Program) -> KuResult<()> {
@@ -354,6 +613,7 @@ impl Checker {
 
         for item in &program.items {
             if let Item::Function(function) = item {
+                let body_id = self.fresh_function_body_id();
                 self.functions.insert(
                     function.name.clone(),
                     FunctionType {
@@ -413,6 +673,7 @@ impl Checker {
                             .transpose()?
                             .unwrap_or(Type::Unknown),
                         body: function.body.clone(),
+                        body_id,
                         is_async: function.is_async,
                     },
                 );
@@ -609,6 +870,7 @@ impl Checker {
                     generics,
                 )?)),
                 body: Vec::new(),
+                body_id: None,
                 is_async: *is_async,
             }),
             TypeName::Union(types) => {
@@ -651,6 +913,56 @@ impl Checker {
         }
     }
 
+    /// Capture the state that exists at an abrupt exit from the innermost try.
+    /// This is called only after the exit expression has been consumed, and
+    /// therefore before an enclosing assignment can re-initialize its target.
+    fn capture_try_exit(&mut self, kind: TryExitKind) {
+        let Some(outer_scope_len) = self
+            .try_exit_collectors
+            .last()
+            .map(|collector| collector.outer_scope_len)
+        else {
+            return;
+        };
+        let state = self.scopes[..outer_scope_len.min(self.scopes.len())].to_vec();
+        let collector = self
+            .try_exit_collectors
+            .last_mut()
+            .expect("try exit collector disappeared while capturing an exit");
+        match kind {
+            TryExitKind::Return => collector.returns.push(state),
+            TryExitKind::Throw => collector.throws.push(state),
+        }
+    }
+
+    fn take_current_try_exits(&mut self) -> (Vec<MoveScopes>, Vec<MoveScopes>) {
+        let collector = self
+            .try_exit_collectors
+            .last_mut()
+            .expect("try exit collection requires an active try");
+        (
+            std::mem::take(&mut collector.returns),
+            std::mem::take(&mut collector.throws),
+        )
+    }
+
+    /// Forward exits that remain pending after an inner finally to the parent
+    /// try. Truncation removes scopes local to the nested construct.
+    fn forward_try_exits(&mut self, returns: Vec<MoveScopes>, throws: Vec<MoveScopes>) {
+        let Some(parent) = self.try_exit_collectors.last_mut() else {
+            return;
+        };
+        let parent_len = parent.outer_scope_len;
+        parent.returns.extend(returns.into_iter().map(|mut state| {
+            state.truncate(parent_len);
+            state
+        }));
+        parent.throws.extend(throws.into_iter().map(|mut state| {
+            state.truncate(parent_len);
+            state
+        }));
+    }
+
     fn check_stmt(&mut self, stmt: &Stmt) -> KuResult<()> {
         match stmt {
             Stmt::VarDecl {
@@ -665,18 +977,34 @@ impl Checker {
                     .map(|ty| self.resolve_type_name(ty, *span))
                     .transpose()?;
                 let actual = self.consume_expr_expecting(value, declared.as_ref())?;
+                let closure_provenance = if self.type_may_contain_function_value(&actual) {
+                    self.expression_closure_provenance(value)
+                } else {
+                    ClosureProvenance::empty()
+                };
                 let expected = declared.unwrap_or_else(|| actual.clone());
                 if !type_matches(&expected, &actual) {
                     return Err(type_error(*span, &expected, &actual));
                 }
+                let stored_type = if matches!(expected, Type::FunctionValue { .. })
+                    && matches!(actual, Type::FunctionValue { .. })
+                {
+                    actual.clone()
+                } else {
+                    expected
+                };
                 self.define(
                     name.clone(),
-                    expected,
+                    stored_type,
                     *mutable && !is_constant_name(name),
                     *span,
-                )
+                )?;
+                self.set_closure_provenance(name, closure_provenance, *span)
             }
             Stmt::Assign { name, value, span } => {
+                if self.contains(name) {
+                    reject_direct_closure_cycle(name, value, *span)?;
+                }
                 // A closure assigned to an already-declared function-typed
                 // variable takes that binding as its expected function type.
                 let expected = if self.contains(name) {
@@ -685,8 +1013,14 @@ impl Checker {
                     None
                 };
                 let actual = self.consume_expr_expecting(value, expected.as_ref())?;
+                let closure_provenance = if self.type_may_contain_function_value(&actual) {
+                    self.expression_closure_provenance(value)
+                } else {
+                    ClosureProvenance::empty()
+                };
                 if !self.contains(name) {
-                    return self.define(name.clone(), actual, !is_constant_name(name), *span);
+                    self.define(name.clone(), actual, !is_constant_name(name), *span)?;
+                    return self.set_closure_provenance(name, closure_provenance, *span);
                 }
                 self.reject_readonly_capture_assignment(name, *span)?;
                 let binding = self.get_allow_moved(name, *span)?;
@@ -699,6 +1033,9 @@ impl Checker {
                 if !type_matches(&binding.ty, &actual) {
                     return Err(type_error(*span, &binding.ty, &actual));
                 }
+                self.reject_closure_reference_cycle(name, &closure_provenance, *span)?;
+                self.set_closure_provenance(name, closure_provenance, *span)?;
+                self.update_function_value_binding_type(name, &actual);
                 self.mark_initialized(name);
                 Ok(())
             }
@@ -709,11 +1046,30 @@ impl Checker {
             } => {
                 if let Some(name) = assign_target_root_name(target) {
                     self.reject_readonly_capture_assignment(name, *span)?;
+                    if self.contains(name) {
+                        reject_direct_closure_cycle(name, value, *span)?;
+                    }
                 }
-                let expected = self.check_assign_target(target, *span)?;
+                // Assignment evaluates its RHS before resolving the destination
+                // (the interpreter and IR both follow this order). Consume first
+                // so a later target read observes any move performed by the RHS:
+                // `obj["self"] = obj` and `obj[key] = key` must not read a moved
+                // receiver/key in native code.
                 let actual = self.consume_expr(value)?;
+                let expected = self.check_assign_target(target, *span)?;
                 if !type_matches(&expected, &actual) {
                     return Err(type_error(*span, &expected, &actual));
+                }
+                if self.type_may_contain_function_value(&actual) {
+                    let closure_provenance = self.expression_closure_provenance(value);
+                    if let Some(name) = assign_target_root_name(target) {
+                        self.reject_closure_reference_cycle(name, &closure_provenance, *span)?;
+                        // Field/index writes update only one unknown slot. Without a
+                        // path-sensitive container graph, retain the union of old and
+                        // new edges; whole-variable assignment still replaces it and
+                        // therefore clears stale edges precisely.
+                        self.merge_closure_provenance(name, &closure_provenance, *span)?;
+                    }
                 }
                 // Assigning a moved place re-initializes it (`user.name = x` after
                 // `user.name` was moved makes it live again).
@@ -731,6 +1087,11 @@ impl Checker {
                 if let Some(name) = assign_target_root_name(target) {
                     self.reject_readonly_capture_assignment(name, *span)?;
                 }
+                // Compound assignment has the same RHS-before-target evaluation
+                // order as ordinary projection assignment. Checking the target
+                // after consuming the RHS lets the normal moved-place diagnostic
+                // reject a receiver/key that the RHS just moved.
+                let right = self.consume_expr(value)?;
                 let left = self.check_assign_target(target, *span)?;
                 // `a += b` reads the target before writing it, so the target place
                 // must still be live — a compound-assign to a moved field is a
@@ -738,7 +1099,6 @@ impl Checker {
                 if let Some(place) = self.assign_target_place(target) {
                     self.check_place_readable(&place, *span)?;
                 }
-                let right = self.consume_expr(value)?;
                 let actual = self.check_binary(*op, &left, &right, *span)?;
                 if !type_matches(&left, &actual) {
                     return Err(type_error(*span, &left, &actual));
@@ -763,30 +1123,26 @@ impl Checker {
                         *span,
                     ));
                 }
+                for (name, value) in names.iter().zip(values) {
+                    if let Some(name) = name {
+                        if self.contains(name) {
+                            reject_direct_closure_cycle(name, value, *span)?;
+                        }
+                    }
+                }
+                let provenances = values
+                    .iter()
+                    .map(|value| self.expression_closure_provenance(value))
+                    .collect::<Vec<_>>();
                 let actuals = values
                     .iter()
                     .map(|value| self.consume_expr(value))
                     .collect::<KuResult<Vec<_>>>()?;
-                for (name, actual) in names.iter().zip(actuals) {
+                for ((name, actual), provenance) in names.iter().zip(actuals).zip(provenances) {
                     let Some(name) = name else {
                         continue;
                     };
-                    if !self.contains(name) {
-                        self.define(name.clone(), actual, !is_constant_name(name), *span)?;
-                        continue;
-                    }
-                    self.reject_readonly_capture_assignment(name, *span)?;
-                    let binding = self.get_allow_moved(name, *span)?;
-                    if !binding.mutable {
-                        return Err(KuError::runtime(
-                            format!("cannot assign to immutable variable '{name}'"),
-                            *span,
-                        ));
-                    }
-                    if !type_matches(&binding.ty, &actual) {
-                        return Err(type_error(*span, &binding.ty, &actual));
-                    }
-                    self.mark_initialized(name);
+                    self.assign_or_define_destructured(name, actual, provenance, *span)?;
                 }
                 Ok(())
             }
@@ -841,6 +1197,7 @@ impl Checker {
                 body,
                 span,
             } => {
+                let iterable_provenance = self.expression_closure_provenance(iterable);
                 let iterable = self.check_expr(iterable)?;
                 let element = match iterable {
                     Type::Array(element) => *element,
@@ -856,8 +1213,17 @@ impl Checker {
                         ));
                     }
                 };
+                let element_provenance = if self.type_may_contain_function_value(&element) {
+                    iterable_provenance
+                } else {
+                    ClosureProvenance::empty()
+                };
                 let before = self.scopes.clone();
-                let top = self.compute_loop_top(&before, body, Some((name, &element)));
+                let top = self.compute_loop_top(
+                    &before,
+                    body,
+                    Some((name, &element, &element_provenance)),
+                );
                 self.scopes = top;
                 self.push_scope();
                 self.loop_depth += 1;
@@ -865,6 +1231,7 @@ impl Checker {
                 self.loop_continue_states.push(Vec::new());
                 let result = (|| -> KuResult<()> {
                     self.define(name.clone(), element, true, *span)?;
+                    self.set_closure_provenance(name, element_provenance, *span)?;
                     for stmt in body {
                         self.check_stmt(stmt)?;
                     }
@@ -912,33 +1279,15 @@ impl Checker {
                 span,
             } => {
                 let before = self.scopes.clone();
-                // Only a body that can actually throw (a `fail` or a `?`) can
-                // divert to the catch/finally partway through. When it cannot, the
-                // catch is dead code and the value flow is fully linear, so the
-                // conservative "moved on the throw path" reasoning below would only
-                // reject valid code (a value moved then re-initialized in the body).
-                let can_throw = block_can_throw(body);
-                // Walk the body accumulating every move seen at any point: a throw
-                // can happen right after any statement, so the catch/finally must
-                // treat anything moved in the body as MaybeMoved even if a later
-                // statement re-initialized it (at the throw point the re-init had
-                // not run yet).
+                self.try_exit_collectors
+                    .push(TryExitCollector::new(before.len()));
                 self.recoverable_depth += 1;
                 self.push_scope();
-                let mut throw_state = before.clone();
                 let mut body_result = Ok(());
-                for (index, stmt) in body.iter().enumerate() {
+                for stmt in body {
                     body_result = self.check_stmt(stmt);
                     if body_result.is_err() {
                         break;
-                    }
-                    // The catch can only observe this point if a throw can still
-                    // happen from here — either inside this statement (its moves
-                    // precede the throw) or in a later one. Folding in every point
-                    // unconditionally poisoned values moved only after the last
-                    // throwing statement, which the catch could still read.
-                    if body[index..].iter().any(stmt_can_throw) {
-                        accumulate_throw_moves(&mut throw_state, &self.scopes);
                     }
                     if stmt_stops_fallthrough(stmt) {
                         break;
@@ -946,42 +1295,138 @@ impl Checker {
                 }
                 self.pop_scope();
                 self.recoverable_depth -= 1;
-                body_result?;
+                if let Err(error) = body_result {
+                    self.try_exit_collectors.pop();
+                    self.scopes = before;
+                    return Err(error);
+                }
                 let end_state = self.scopes.clone();
-                // The state reaching the code after the try (before `finally`).
-                let mut after = end_state.clone();
+                let body_falls = !block_stops_fallthrough(body);
+                let (mut pending_returns, body_throws) = self.take_current_try_exits();
+
+                // These are the only paths that can reach code after the try if a
+                // finally completes normally. Abrupt paths are kept separately so
+                // an `if (...) { move; return }` does not poison ordinary
+                // fallthrough, while still being validated by finally.
+                let mut normal_paths = Vec::new();
+                if body_falls {
+                    normal_paths.push(end_state);
+                }
+
+                let mut pending_throws = Vec::new();
                 if let Some(name) = catch_name {
-                    // Check the catch against the throw state (anything moved in the
-                    // body is MaybeMoved); if the body cannot throw this is dead code.
-                    self.scopes = throw_state.clone();
+                    // A catch begins at the join of the actual `fail` / `?` exit
+                    // snapshots. In particular, do not merge the raw throw state
+                    // into finally after a catch has re-initialized a value.
+                    let catch_reachable = !body_throws.is_empty();
+                    self.scopes = if catch_reachable {
+                        merge_moved_scope_paths(before.clone(), &body_throws)
+                    } else {
+                        // Keep checking dead catch code for ordinary type/name
+                        // errors, matching the checker’s existing behavior.
+                        before.clone()
+                    };
                     self.push_scope();
-                    self.define(name.clone(), error_type(), false, *span)?;
-                    // Flag the binding so its (struct-backed) fields stay movable,
-                    // unlike a same-shaped user object literal.
-                    if let Some(scope) = self.scopes.last_mut() {
-                        if let Some(var) = scope.get_mut(name) {
-                            var.struct_backed = true;
+                    let catch_result = (|| -> KuResult<()> {
+                        self.define(name.clone(), error_type(), false, *span)?;
+                        // Flag the binding so its (struct-backed) fields stay movable,
+                        // unlike a same-shaped user object literal.
+                        if let Some(scope) = self.scopes.last_mut() {
+                            if let Some(var) = scope.get_mut(name) {
+                                var.struct_backed = true;
+                            }
                         }
-                    }
-                    for stmt in catch_body {
-                        self.check_stmt(stmt)?;
-                    }
+                        for stmt in catch_body {
+                            self.check_stmt(stmt)?;
+                            if stmt_stops_fallthrough(stmt) {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    })();
                     self.pop_scope();
                     let catch_end = self.scopes.clone();
-                    if can_throw {
-                        // Reached by the body completing OR the catch handling a throw.
-                        after = merge_moved_scopes(before.clone(), end_state.clone(), catch_end);
+                    if let Err(error) = catch_result {
+                        self.try_exit_collectors.pop();
+                        self.scopes = before;
+                        return Err(error);
+                    }
+                    let (catch_returns, catch_throws) = self.take_current_try_exits();
+                    if catch_reachable {
+                        pending_returns.extend(catch_returns);
+                        pending_throws = catch_throws;
+                        if !block_stops_fallthrough(catch_body) {
+                            normal_paths.push(catch_end);
+                        }
+                    }
+                } else {
+                    pending_throws = body_throws;
+                }
+
+                let normal_input = (!normal_paths.is_empty())
+                    .then(|| merge_moved_scope_paths(before.clone(), &normal_paths));
+
+                if finally_body.is_empty() {
+                    self.scopes = normal_input.unwrap_or_else(|| before.clone());
+                    self.try_exit_collectors.pop();
+                    self.forward_try_exits(pending_returns, pending_throws);
+                    return Ok(());
+                }
+
+                // Native lowering emits a normal, error and return copy of finally.
+                // Check the same three path classes independently: every copy must
+                // be safe, but a move on an exiting path must not leak into the
+                // normal state after the try.
+                let mut finally_paths = Vec::new();
+                if let Some(state) = normal_input {
+                    finally_paths.push((TryPathKind::Normal, state));
+                }
+                if !pending_returns.is_empty() {
+                    finally_paths.push((
+                        TryPathKind::Return,
+                        merge_moved_scope_paths(before.clone(), &pending_returns),
+                    ));
+                }
+                if !pending_throws.is_empty() {
+                    finally_paths.push((
+                        TryPathKind::Throw,
+                        merge_moved_scope_paths(before.clone(), &pending_throws),
+                    ));
+                }
+                // Unreachable finally code is still checked for type/name errors.
+                if finally_paths.is_empty() {
+                    finally_paths.push((TryPathKind::Normal, before.clone()));
+                }
+
+                let finally_falls = !block_stops_fallthrough(finally_body);
+                let mut normal_after = None;
+                let mut outgoing_returns = Vec::new();
+                let mut outgoing_throws = Vec::new();
+                for (path_kind, input) in finally_paths {
+                    self.scopes = input;
+                    let finally_result = self.check_block(finally_body);
+                    if let Err(error) = finally_result {
+                        self.try_exit_collectors.pop();
+                        self.scopes = before;
+                        return Err(error);
+                    }
+                    let finally_end = self.scopes.clone();
+                    let (new_returns, new_throws) = self.take_current_try_exits();
+                    outgoing_returns.extend(new_returns);
+                    outgoing_throws.extend(new_throws);
+                    if finally_falls {
+                        match path_kind {
+                            TryPathKind::Normal => normal_after = Some(finally_end),
+                            TryPathKind::Return => outgoing_returns.push(finally_end),
+                            TryPathKind::Throw => outgoing_throws.push(finally_end),
+                        }
                     }
                 }
-                // `finally` runs on every exit path. If the body can throw it also
-                // runs after a throw (before any re-initialization), so it — and the
-                // code after it — must see the throw state joined in.
-                self.scopes = if can_throw && !finally_body.is_empty() {
-                    merge_moved_scopes(before, after, throw_state)
-                } else {
-                    after
-                };
-                self.check_block(finally_body)
+
+                self.scopes = normal_after.unwrap_or_else(|| before.clone());
+                self.try_exit_collectors.pop();
+                self.forward_try_exits(outgoing_returns, outgoing_throws);
+                Ok(())
             }
             Stmt::Fail { value, span } => {
                 let actual = self.consume_expr(value)?;
@@ -989,8 +1434,14 @@ impl Checker {
                     return Err(type_error(*span, &error_type(), &actual));
                 }
                 match &self.current_return {
-                    Type::Result(_) => Ok(()),
-                    _ if self.recoverable_depth > 0 => Ok(()),
+                    Type::Result(_) => {
+                        self.capture_try_exit(TryExitKind::Throw);
+                        Ok(())
+                    }
+                    _ if self.recoverable_depth > 0 => {
+                        self.capture_try_exit(TryExitKind::Throw);
+                        Ok(())
+                    }
                     other => Err(KuError::runtime(
                         format!(
                             "fail requires a Result return type or an enclosing try block, got {}",
@@ -1013,6 +1464,7 @@ impl Checker {
                 if !type_matches(&self.current_return, &actual) {
                     return Err(type_error(*span, &self.current_return, &actual));
                 }
+                self.capture_try_exit(TryExitKind::Return);
                 Ok(())
             }
             Stmt::Print { value, .. } => {
@@ -1045,6 +1497,7 @@ impl Checker {
         value: &Expr,
         span: Span,
     ) -> KuResult<()> {
+        let source_provenance = self.expression_closure_provenance(value);
         let source_type = self.check_object_destructure_source(value)?;
         let mut consumed = HashSet::new();
         match source_type {
@@ -1064,7 +1517,22 @@ impl Checker {
                         },
                     };
                     if let Some(local) = &binding.local {
-                        self.assign_or_define_destructured(local, actual, binding.span)?;
+                        let provenance = if fields.contains_key(&binding.field) {
+                            source_provenance.clone()
+                        } else {
+                            binding
+                                .default
+                                .as_ref()
+                                .map_or_else(ClosureProvenance::empty, |default| {
+                                    self.expression_closure_provenance(default)
+                                })
+                        };
+                        self.assign_or_define_destructured(
+                            local,
+                            actual,
+                            provenance,
+                            binding.span,
+                        )?;
                     }
                 }
                 if let Some(rest) =
@@ -1077,6 +1545,7 @@ impl Checker {
                     self.assign_or_define_destructured(
                         rest.1,
                         Type::Object(rest_fields),
+                        source_provenance.clone(),
                         rest.0.span,
                     )?;
                 }
@@ -1088,13 +1557,27 @@ impl Checker {
                         self.consume_expr(default)?;
                     }
                     if let Some(local) = &binding.local {
-                        self.assign_or_define_destructured(local, Type::Unknown, binding.span)?;
+                        let mut provenance = source_provenance.clone();
+                        if let Some(default) = &binding.default {
+                            provenance.merge(&self.expression_closure_provenance(default));
+                        }
+                        self.assign_or_define_destructured(
+                            local,
+                            Type::Unknown,
+                            provenance,
+                            binding.span,
+                        )?;
                     }
                 }
                 if let Some(rest) =
                     rest.and_then(|rest| rest.local.as_ref().map(|name| (rest, name)))
                 {
-                    self.assign_or_define_destructured(rest.1, Type::DynamicObject, rest.0.span)?;
+                    self.assign_or_define_destructured(
+                        rest.1,
+                        Type::DynamicObject,
+                        source_provenance.clone(),
+                        rest.0.span,
+                    )?;
                 }
                 Ok(())
             }
@@ -1124,11 +1607,15 @@ impl Checker {
         &mut self,
         name: &str,
         actual: Type,
+        mut provenance: ClosureProvenance,
         span: Span,
     ) -> KuResult<()> {
+        if !self.type_may_contain_function_value(&actual) {
+            provenance = ClosureProvenance::empty();
+        }
         if !self.contains(name) {
             self.define(name.to_string(), actual, !is_constant_name(name), span)?;
-            return Ok(());
+            return self.set_closure_provenance(name, provenance, span);
         }
         self.reject_readonly_capture_assignment(name, span)?;
         let binding = self.get_allow_moved(name, span)?;
@@ -1141,6 +1628,9 @@ impl Checker {
         if !type_matches(&binding.ty, &actual) {
             return Err(type_error(span, &binding.ty, &actual));
         }
+        self.reject_closure_reference_cycle(name, &provenance, span)?;
+        self.set_closure_provenance(name, provenance, span)?;
+        self.update_function_value_binding_type(name, &actual);
         self.mark_initialized(name);
         Ok(())
     }
@@ -1221,14 +1711,21 @@ impl Checker {
                                     expr.span,
                                 ));
                             }
+                            let argument_provenance = args
+                                .iter()
+                                .map(|arg| self.expression_closure_provenance(arg))
+                                .collect::<Vec<_>>();
                             let mut generic_bindings = HashMap::new();
+                            let mut actual_arg_types = Vec::with_capacity(args.len());
                             for (arg, expected) in args.iter().zip(function.params.iter()) {
-                                let actual = self.consume_arg_expr_expecting(arg, Some(expected))?;
+                                let actual =
+                                    self.consume_arg_expr_expecting(arg, Some(expected))?;
                                 if !bind_generic_type(expected, &actual, &mut generic_bindings)
                                     || !type_matches(expected, &actual)
                                 {
                                     return Err(type_error(arg.span, expected, &actual));
                                 }
+                                actual_arg_types.push(actual);
                             }
                             if !function
                                 .type_params
@@ -1241,6 +1738,38 @@ impl Checker {
                                 ));
                             }
                             let returns = substitute_generics(&function.returns, &generic_bindings);
+                            let effect_params = function
+                                .value_params
+                                .iter()
+                                .map(|param| FunctionValueParam {
+                                    name: param.name.clone(),
+                                    ty: param
+                                        .ty
+                                        .as_ref()
+                                        .map(|ty| substitute_generics(ty, &generic_bindings)),
+                                })
+                                .collect::<Vec<_>>();
+                            if self.readonly_capture.is_some() {
+                                let audited_return = function.return_type.as_ref().map(|ty| {
+                                    substitute_generics(ty, &generic_bindings)
+                                });
+                                self.check_function_value_body(
+                                    &effect_params,
+                                    audited_return.as_ref(),
+                                    &function.body,
+                                    Some(function.body_id),
+                                    &actual_arg_types,
+                                    expr.span,
+                                )?;
+                            }
+                            self.apply_top_level_function_closure_effects(
+                                &effect_params,
+                                &function.body,
+                                function.body_id,
+                                &actual_arg_types,
+                                &argument_provenance,
+                                expr.span,
+                            )?;
                             return Ok(if function.is_async {
                                 Type::Task(Box::new(returns))
                             } else {
@@ -1248,22 +1777,50 @@ impl Checker {
                             });
                         }
                         if self.contains(name) {
+                            let argument_provenance = args
+                                .iter()
+                                .map(|arg| self.expression_closure_provenance(arg))
+                                .collect::<Vec<_>>();
                             let callee_type = self.get(name, callee.span)?.ty;
                             if let Type::FunctionValue {
                                 params,
                                 return_type,
                                 body,
+                                body_id,
                                 is_async,
                             } = callee_type
                             {
-                                let returns = self.check_function_value_call(
-                                    &params,
-                                    return_type.as_deref(),
-                                    &body,
+                                let (returns, actual_arg_types) = self.check_function_value_call(
+                                    FunctionValueBodyRef {
+                                        params: &params,
+                                        return_type: return_type.as_deref(),
+                                        body: &body,
+                                        body_id,
+                                    },
                                     args,
                                     expr.span,
                                     Some(name),
                                 )?;
+                                if let Some(body_id) = body_id {
+                                    self.apply_known_function_closure_effects(
+                                        name,
+                                        ClosureBodyView {
+                                            params: &params,
+                                            body: &body,
+                                            body_id,
+                                        },
+                                        &argument_provenance,
+                                        &actual_arg_types,
+                                        expr.span,
+                                    )?;
+                                } else {
+                                    self.reject_erased_function_value_call_cycle(
+                                        name,
+                                        &params,
+                                        &argument_provenance,
+                                        expr.span,
+                                    )?;
+                                }
                                 return Ok(if is_async {
                                     Type::Task(Box::new(returns))
                                 } else {
@@ -1293,22 +1850,53 @@ impl Checker {
                         {
                             return Ok(ty);
                         }
+                        let argument_provenance = args
+                            .iter()
+                            .map(|arg| self.expression_closure_provenance(arg))
+                            .collect::<Vec<_>>();
+                        let callee_root = expr_root_name(callee).map(str::to_string);
                         let callee_type = self.check_expr(callee)?;
                         if let Type::FunctionValue {
                             params,
                             return_type,
                             body,
+                            body_id,
                             is_async,
                         } = callee_type
                         {
-                            let returns = self.check_function_value_call(
-                                &params,
-                                return_type.as_deref(),
-                                &body,
+                            let (returns, actual_arg_types) = self.check_function_value_call(
+                                FunctionValueBodyRef {
+                                    params: &params,
+                                    return_type: return_type.as_deref(),
+                                    body: &body,
+                                    body_id,
+                                },
                                 args,
                                 expr.span,
                                 None,
                             )?;
+                            if let Some(callee_root) = callee_root {
+                                if let Some(body_id) = body_id {
+                                    self.apply_known_function_closure_effects(
+                                        &callee_root,
+                                        ClosureBodyView {
+                                            params: &params,
+                                            body: &body,
+                                            body_id,
+                                        },
+                                        &argument_provenance,
+                                        &actual_arg_types,
+                                        expr.span,
+                                    )?;
+                                } else {
+                                    self.reject_erased_function_value_call_cycle(
+                                        &callee_root,
+                                        &params,
+                                        &argument_provenance,
+                                        expr.span,
+                                    )?;
+                                }
+                            }
                             Ok(if is_async {
                                 Type::Task(Box::new(returns))
                             } else {
@@ -1567,10 +2155,7 @@ impl Checker {
                         let target_type = self.check_expr(target)?;
                         if matches!(
                             target_type,
-                            Type::Object(_)
-                                | Type::StringMap
-                                | Type::DynamicObject
-                                | Type::KuValue
+                            Type::Object(_) | Type::StringMap | Type::DynamicObject | Type::KuValue
                         ) {
                             let index_type = self.check_expr(index)?;
                             // A KuValue index accepts a str key (object member) or
@@ -1602,6 +2187,7 @@ impl Checker {
                                     expr.span,
                                 ));
                             }
+                            self.capture_try_exit(TryExitKind::Throw);
                             return Ok(value_type);
                         }
                     }
@@ -1615,6 +2201,10 @@ impl Checker {
                                     expr.span,
                                 ));
                             }
+                            // `inner` has already been consumed, but the statement
+                            // containing this `?` has not yet run its store/re-init.
+                            // This is the precise error edge for ownership flow.
+                            self.capture_try_exit(TryExitKind::Throw);
                             Ok(*value)
                         }
                         other => Err(KuError::runtime(
@@ -1627,9 +2217,15 @@ impl Checker {
                     params,
                     return_type,
                     body,
-                } => self.check_closure_literal(params, return_type.as_ref(), body, expr.span, None),
+                } => {
+                    self.check_closure_literal(params, return_type.as_ref(), body, expr.span, None)
+                }
             }
-        })();
+        })()
+        .and_then(|ty| {
+            self.reject_readonly_http_native_capture_read(expr, &ty)?;
+            Ok(ty)
+        });
         self.check_depth = self.check_depth.saturating_sub(1);
         result
     }
@@ -1723,10 +2319,18 @@ impl Checker {
 
         let saved_async_depth = self.async_depth;
         self.async_depth = 0;
+        let body_id = self.fresh_function_body_id();
+        let visible_names = self
+            .visible_binding_ids()
+            .into_keys()
+            .collect::<HashSet<_>>();
+        let captured_names = checker_closure_capture_names(params, body, &visible_names);
+        self.record_function_body_outer_bindings(body_id, &captured_names);
         let inferred = self.check_function_value_body(
             &resolved_params,
             own_return.as_deref(),
             body,
+            Some(body_id),
             &arg_types,
             span,
         );
@@ -1748,6 +2352,7 @@ impl Checker {
             params: resolved_params,
             return_type: result_return,
             body: body.to_vec(),
+            body_id: Some(body_id),
             is_async: false,
         })
     }
@@ -1761,7 +2366,13 @@ impl Checker {
             body,
         } = &expr.kind
         {
-            return self.check_closure_literal(params, return_type.as_ref(), body, expr.span, expected);
+            return self.check_closure_literal(
+                params,
+                return_type.as_ref(),
+                body,
+                expr.span,
+                expected,
+            );
         }
         self.check_expr(expr)
     }
@@ -1960,6 +2571,7 @@ impl Checker {
         }
         let target_type = self.check_expr(target)?;
         if (name == "run" || name == "close") && is_http_listener_type(&target_type) {
+            self.reject_http_handler_control_call(target, &target_type, name, span)?;
             if !args.is_empty() {
                 return Err(KuError::runtime(
                     format!(
@@ -1977,6 +2589,7 @@ impl Checker {
         if name == "run" || name == "close" {
             return Ok(None);
         }
+        self.reject_http_handler_control_call(target, &target_type, name, span)?;
         if name == "listen" || name == "bind" {
             if args.len() != 1 {
                 return Err(KuError::runtime(
@@ -1990,6 +2603,12 @@ impl Checker {
             let address = self.check_expr(&args[0])?;
             if !type_matches(&Type::String, &address) {
                 return Err(type_error(args[0].span, &Type::String, &address));
+            }
+            if name == "listen" {
+                // Native listen owns and frees the server on every return path.
+                // Model that ownership transfer so a caught listen error cannot
+                // reuse a dangling server pointer.
+                self.consume_expr(target)?;
             }
             return Ok(Some(if name == "bind" {
                 Type::Result(Box::new(http_listener_type()))
@@ -2035,11 +2654,13 @@ impl Checker {
                 .as_ref()
                 .map(|ty| self.resolve_type_name(ty, handler_arg.span).map(Box::new))
                 .transpose()?;
+            let body_id = self.fresh_function_body_id();
             self.check_http_handler(
                 name,
                 &params,
                 return_type.as_deref(),
                 body,
+                Some(body_id),
                 handler_arg.span,
             )?;
         } else {
@@ -2049,6 +2670,7 @@ impl Checker {
                     params,
                     return_type,
                     body,
+                    body_id,
                     ..
                 } => {
                     self.check_http_handler(
@@ -2056,10 +2678,16 @@ impl Checker {
                         &params,
                         return_type.as_deref(),
                         &body,
+                        body_id,
                         handler_arg.span,
                     )?;
                 }
-                Type::Unknown => {}
+                Type::Unknown => {
+                    return Err(KuError::runtime(
+                        "http handler cannot prove a function value is read-only because its type or body is unavailable",
+                        handler_arg.span,
+                    ));
+                }
                 _ => {
                     return Err(KuError::runtime(
                         format!("http service {name} handler must be a function"),
@@ -2068,7 +2696,9 @@ impl Checker {
                 }
             }
         }
-        Ok(Some(target_type))
+        // Route registration mutates the named service in place. Returning the
+        // service would create an untracked second owner of native's raw pointer.
+        Ok(Some(Type::Null))
     }
 
     fn check_http_config_constructor_call(
@@ -2110,9 +2740,12 @@ impl Checker {
                     &config_type,
                 ));
             }
-            if matches!(name.as_str(), "service" | "server") {
-                validate_http_service_config_fields(&config_type, config.span)?;
-            }
+            let allowed = if name == "client" {
+                &HTTP_CLIENT_CONFIG_FIELDS[..]
+            } else {
+                &HTTP_SERVICE_CONFIG_FIELDS[..]
+            };
+            validate_http_config_fields(&config_type, allowed, config.span)?;
         }
         Ok(Some(if name == "client" {
             http_client_type()
@@ -2148,9 +2781,12 @@ impl Checker {
                     &config_type,
                 ));
             }
-            if name != "http.client" {
-                validate_http_service_config_fields(&config_type, config.span)?;
-            }
+            let allowed = if name == "http.client" {
+                &HTTP_CLIENT_CONFIG_FIELDS[..]
+            } else {
+                &HTTP_SERVICE_CONFIG_FIELDS[..]
+            };
+            validate_http_config_fields(&config_type, allowed, config.span)?;
         }
         Ok(if name == "http.client" {
             http_client_type()
@@ -2159,12 +2795,149 @@ impl Checker {
         })
     }
 
+    fn apply_redis_client_constructor_signature(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Type> {
+        expect_arg_count("redis.client", args.len(), 1, span)?;
+        let config = &args[0];
+        let config_type = self.check_expr(config)?;
+        if !matches!(
+            config_type,
+            Type::Object(_) | Type::DynamicObject | Type::Unknown
+        ) {
+            return Err(type_error(
+                config.span,
+                &Type::Object(HashMap::new()),
+                &config_type,
+            ));
+        }
+        validate_redis_client_config(&config_type, config.span)?;
+        Ok(Type::Result(Box::new(Type::Native(
+            metadata::REDIS_CLIENT.to_string(),
+        ))))
+    }
+
+    fn apply_mysql_client_constructor_signature(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Type> {
+        expect_arg_count("mysql.client", args.len(), 1, span)?;
+        let config = &args[0];
+        let config_type = self.check_expr(config)?;
+        if !matches!(
+            config_type,
+            Type::Object(_) | Type::DynamicObject | Type::Unknown
+        ) {
+            return Err(type_error(
+                config.span,
+                &Type::Object(HashMap::new()),
+                &config_type,
+            ));
+        }
+        validate_mysql_client_config(&config_type, config.span)?;
+        Ok(Type::Result(Box::new(Type::Native(
+            metadata::MYSQL_CLIENT.to_string(),
+        ))))
+    }
+
+    fn apply_pg_client_signature(&mut self, args: &[Expr], span: Span) -> KuResult<Type> {
+        expect_arg_count("pg.client", args.len(), 1, span)?;
+        let config_type = self.check_expr(&args[0])?;
+        match &config_type {
+            Type::Object(fields) => {
+                const ALLOWED: [&str; 6] = [
+                    "conninfo",
+                    "max_connections",
+                    "max_waiters",
+                    "connect_timeout_ms",
+                    "acquire_timeout_ms",
+                    "query_timeout_ms",
+                ];
+                let mut unknown = fields
+                    .keys()
+                    .filter(|key| !ALLOWED.contains(&key.as_str()))
+                    .collect::<Vec<_>>();
+                unknown.sort();
+                if let Some(key) = unknown.first() {
+                    return Err(KuError::runtime(
+                        format!("unknown pg client config field '{key}'"),
+                        args[0].span,
+                    ));
+                }
+                let Some(conninfo) = fields.get("conninfo") else {
+                    return Err(KuError::runtime(
+                        "pg.client config requires string field 'conninfo'",
+                        args[0].span,
+                    ));
+                };
+                if !type_matches(&Type::String, conninfo) {
+                    return Err(KuError::runtime(
+                        "pg.client config field 'conninfo' must be str",
+                        args[0].span,
+                    ));
+                }
+                for field in ALLOWED.iter().skip(1) {
+                    if let Some(actual) = fields.get(*field) {
+                        if !type_matches(&Type::Int, actual) {
+                            return Err(KuError::runtime(
+                                format!("pg.client config field '{field}' must be int"),
+                                args[0].span,
+                            ));
+                        }
+                    }
+                }
+            }
+            Type::DynamicObject | Type::Unknown => {}
+            actual => {
+                return Err(type_error(
+                    args[0].span,
+                    &Type::Object(HashMap::new()),
+                    actual,
+                ));
+            }
+        }
+        Ok(Type::Result(Box::new(Type::Native(
+            metadata::PG_CLIENT.to_string(),
+        ))))
+    }
+
+    fn apply_pg_client_query_signature(&mut self, args: &[Expr], span: Span) -> KuResult<Type> {
+        if args.len() != 3 {
+            return Err(KuError::runtime(
+                "PostgreSQL client query requires query(sql, params); pass [] when there are no parameters",
+                span,
+            ));
+        }
+        let client = self.check_expr(&args[0])?;
+        let expected_client = Type::Native(metadata::PG_CLIENT.to_string());
+        if client != expected_client {
+            return Err(type_error(args[0].span, &expected_client, &client));
+        }
+        let sql = self.check_expr(&args[1])?;
+        if sql != Type::String {
+            return Err(type_error(args[1].span, &Type::String, &sql));
+        }
+        let params = self.check_expr(&args[2])?;
+        let empty_literal = matches!(&args[2].kind, ExprKind::Array(values) if values.is_empty());
+        let expected_params = Type::Array(Box::new(Type::String));
+        if params != expected_params && !empty_literal {
+            return Err(type_error(args[2].span, &expected_params, &params));
+        }
+        Ok(Type::Result(Box::new(Type::Native(
+            metadata::PG_RESULT.to_string(),
+        ))))
+    }
+
     fn check_http_handler(
         &mut self,
         method: &str,
         params: &[FunctionValueParam],
         return_type: Option<&Type>,
         body: &[Stmt],
+        body_id: Option<FunctionBodyId>,
         span: Span,
     ) -> KuResult<()> {
         if params.len() > 1 {
@@ -2172,6 +2945,12 @@ impl Checker {
                 format!(
                     "ordinary HTTP route handler for {method} accepts fn() or fn(req); fn(req, res) is not allowed"
                 ),
+                span,
+            ));
+        }
+        if body.is_empty() || body_id.is_none() {
+            return Err(KuError::runtime(
+                "http handler cannot prove a function value is read-only because its body is unavailable",
                 span,
             ));
         }
@@ -2214,9 +2993,12 @@ impl Checker {
             return Err(http_handler_return_error(span, &Type::Null));
         }
         let actual = self.check_function_value_call_with_types_readonly_captures(
-            params,
-            return_type,
-            body,
+            FunctionValueBodyRef {
+                params,
+                return_type,
+                body,
+                body_id,
+            },
             &arg_types,
             span,
         )?;
@@ -2471,6 +3253,22 @@ impl Checker {
         if module == "time" {
             return Ok(Some(self.check_time_call(&function, args, span)?));
         }
+        if module == "pg" && function != "client" {
+            return Err(KuError::runtime(
+                format!(
+                    "PostgreSQL module API 'pg.{function}' is not public; construct one pooled client with 'pg.client(config)?' and call receiver methods"
+                ),
+                span,
+            ));
+        }
+        if matches!(module.as_str(), "pg_client" | "pg_result") {
+            return Err(KuError::runtime(
+                format!(
+                    "PostgreSQL compiler-internal API '{module}.{function}' is not public; call the receiver method instead"
+                ),
+                span,
+            ));
+        }
         let Some(signature) = metadata::dotted_signature(&module, &function) else {
             if metadata::is_std_module(&module) && self.std_modules.contains(&module) {
                 return Err(KuError::runtime(
@@ -2495,16 +3293,22 @@ impl Checker {
             .map(|arg| self.check_expr(arg))
             .collect::<KuResult<Vec<_>>>()?;
         match function {
+            "steady_millis" => {
+                expect_arg_count("time.steady_millis", args.len(), 0, span)?;
+                Ok(Type::Int)
+            }
             "now" => {
-                expect_arg_count_range("time.now", args.len(), 0, 1, span)?;
-                if let Some(actual) = actuals.first() {
-                    expect_dynamic_object_arg("time.now", actual, args[0].span)?;
-                }
-                Ok(if args.is_empty() {
-                    Type::DynamicObject
-                } else {
-                    Type::Int
-                })
+                expect_arg_count("time.now", args.len(), 0, span)?;
+                Ok(Type::Int)
+            }
+            "instant" => {
+                expect_arg_count("time.instant", args.len(), 0, span)?;
+                Ok(Type::DynamicObject)
+            }
+            "elapsed" => {
+                expect_arg_count("time.elapsed", args.len(), 1, span)?;
+                expect_dynamic_object_arg("time.elapsed", &actuals[0], args[0].span)?;
+                Ok(Type::Int)
             }
             "unix" => {
                 expect_arg_count_range("time.unix", args.len(), 0, 1, span)?;
@@ -2703,6 +3507,12 @@ impl Checker {
         let target_type = self.check_expr(target)?;
         if name == "clone" {
             expect_arg_count("clone", args.len(), 0, span)?;
+            if is_http_service_type(&target_type) {
+                return Err(KuError::runtime(
+                    "http service values cannot be cloned",
+                    span,
+                ));
+            }
             if contains_task_type(&target_type) {
                 return Err(KuError::runtime("task values cannot be cloned", span));
             }
@@ -2715,6 +3525,17 @@ impl Checker {
                     .unwrap_or(Type::Unknown),
                 other => other,
             };
+            // Native values own process-external resources (sockets, database
+            // connections/results, pools, ...).  They are move-only: the native
+            // backends deliberately have no meaningful clone operation.  Letting
+            // this reach code generation used to turn otherwise valid Ku source
+            // into an unconditional process exit at runtime.
+            if self.type_contains_native_resource(&target_type) {
+                return Err(KuError::runtime(
+                    "native resource handles cannot be cloned",
+                    span,
+                ));
+            }
             if self.is_owned_type(&target_type) {
                 // Cloning reads the WHOLE value, so it must be fully live: a
                 // partially-moved struct would clone an already-emptied field.
@@ -2730,6 +3551,45 @@ impl Checker {
                 ),
                 span,
             ));
+        }
+        let is_database_resource = matches!(
+            &target_type,
+            Type::Native(native)
+                if native == metadata::PG_CLIENT
+                    || native == metadata::PG_RESULT
+                    || native == metadata::REDIS_CLIENT
+                    || native == metadata::MYSQL_CLIENT
+                    || native == metadata::MYSQL_RESULT
+        );
+        if is_database_resource && !matches!(self.classify_place(target), PlaceClass::Movable(_)) {
+            return Err(KuError::runtime(
+                "database client/result method receivers must be assigned to a binding before use",
+                span,
+            ));
+        }
+        if matches!(&target_type, Type::Native(native) if native == metadata::REDIS_CLIENT) {
+            let Some(signature) = metadata::redis_client_method_signature(name) else {
+                return Ok(None);
+            };
+            let mut method_args = Vec::with_capacity(args.len() + 1);
+            method_args.push((**target).clone());
+            method_args.extend(args.iter().cloned());
+            return self
+                .apply_stdlib_signature(&signature, &method_args, span)
+                .map(Some);
+        }
+        if let Type::Native(native) = &target_type {
+            if native == metadata::MYSQL_CLIENT || native == metadata::MYSQL_RESULT {
+                let Some(signature) = metadata::mysql_method_signature(native, name) else {
+                    return Ok(None);
+                };
+                let mut method_args = Vec::with_capacity(args.len() + 1);
+                method_args.push((**target).clone());
+                method_args.extend(args.iter().cloned());
+                return self
+                    .apply_stdlib_signature(&signature, &method_args, span)
+                    .map(Some);
+            }
         }
         if let Type::Task(value) = target_type {
             let _ = value;
@@ -2762,11 +3622,22 @@ impl Checker {
                 _ => Ok(None),
             };
         }
-        let module = match target_type {
+        let module = match &target_type {
             Type::String => "string",
             Type::Array(_) if name != "map" => "array",
             Type::Object(_) | Type::StringMap | Type::DynamicObject if name == "get_or" => "object",
             Type::KuValue if name == "as_int" || name == "as_str" => "kuvalue",
+            Type::Native(native)
+                if native == metadata::PG_CLIENT && matches!(name.as_str(), "query" | "close") =>
+            {
+                "pg_client"
+            }
+            Type::Native(native)
+                if native == metadata::PG_RESULT
+                    && matches!(name.as_str(), "rows" | "cols" | "value" | "is_null") =>
+            {
+                "pg_result"
+            }
             _ => return Ok(None),
         };
         let Some(signature) = metadata::dotted_signature(module, name) else {
@@ -2790,6 +3661,30 @@ impl Checker {
             "http.client" | "http.service" | "http.server"
         ) {
             return self.apply_http_config_constructor_signature(&signature.name, args, span);
+        }
+        if signature.name == "http.request" {
+            expect_arg_count("http.request", args.len(), 1, span)?;
+            let config_type = self.check_expr(&args[0])?;
+            if !matches!(
+                config_type,
+                Type::Object(_) | Type::StringMap | Type::DynamicObject
+            ) {
+                return Err(type_error(args[0].span, &Type::DynamicObject, &config_type));
+            }
+            validate_http_config_fields(&config_type, &HTTP_REQUEST_CONFIG_FIELDS, args[0].span)?;
+            return Ok(Type::Result(Box::new(http_response_type())));
+        }
+        if signature.name == "redis.client" {
+            return self.apply_redis_client_constructor_signature(args, span);
+        }
+        if signature.name == "mysql.client" {
+            return self.apply_mysql_client_constructor_signature(args, span);
+        }
+        if signature.name == "pg.client" {
+            return self.apply_pg_client_signature(args, span);
+        }
+        if signature.name == "pg_client.query" {
+            return self.apply_pg_client_query_signature(args, span);
         }
         if matches!(
             signature.name.as_str(),
@@ -3020,6 +3915,7 @@ impl Checker {
                 actual == &Type::String || actual == &Type::Array(Box::new(Type::String))
             }
             TypePattern::ArrayOf(inner) => match actual {
+                Type::Array(element) if **element == Type::Unknown => true,
                 Type::Array(element) => self.type_matches_pattern(element, inner),
                 _ => false,
             },
@@ -3138,6 +4034,7 @@ impl Checker {
             }],
             return_type: None,
             body: Vec::new(),
+            body_id: None,
             is_async: false,
         };
         let mapper_type = self.check_expr_expecting(&args[0], Some(&expected_mapper))?;
@@ -3145,6 +4042,7 @@ impl Checker {
             params,
             return_type,
             body,
+            body_id,
             ..
         } = mapper_type
         else {
@@ -3157,9 +4055,12 @@ impl Checker {
             ));
         };
         let mapped = self.check_function_value_call_with_types(
-            &params,
-            return_type.as_deref(),
-            &body,
+            FunctionValueBodyRef {
+                params: &params,
+                return_type: return_type.as_deref(),
+                body: &body,
+                body_id,
+            },
             &[*element],
             span,
         )?;
@@ -3168,21 +4069,19 @@ impl Checker {
 
     fn check_function_value_call(
         &mut self,
-        params: &[FunctionValueParam],
-        return_type: Option<&Type>,
-        body: &[Stmt],
+        function: FunctionValueBodyRef<'_>,
         args: &[Expr],
         span: Span,
         name: Option<&str>,
-    ) -> KuResult<Type> {
-        if params.len() != args.len() {
+    ) -> KuResult<(Type, Vec<Type>)> {
+        if function.params.len() != args.len() {
             let subject = name
                 .map(|name| format!("function value '{name}'"))
                 .unwrap_or_else(|| "function value".to_string());
             return Err(KuError::runtime(
                 format!(
                     "{subject} expects {} arguments but got {}",
-                    params.len(),
+                    function.params.len(),
                     args.len()
                 ),
                 span,
@@ -3190,53 +4089,53 @@ impl Checker {
         }
         let actual_arg_types = args
             .iter()
-            .zip(params.iter())
+            .zip(function.params.iter())
             .map(|(arg, param)| self.consume_arg_expr_expecting(arg, param.ty.as_ref()))
             .collect::<KuResult<Vec<_>>>()?;
         let mut arg_types = Vec::new();
-        for ((param, actual), arg) in params.iter().zip(actual_arg_types.iter()).zip(args.iter()) {
+        for ((param, actual), arg) in function
+            .params
+            .iter()
+            .zip(actual_arg_types.iter())
+            .zip(args.iter())
+        {
             if let Some(expected) = &param.ty {
                 if !type_matches(expected, actual) {
                     return Err(type_error(arg.span, expected, actual));
                 }
-                arg_types.push(expected.clone());
+                if self.readonly_capture.is_some() && matches!(actual, Type::FunctionValue { .. }) {
+                    // Preserve the concrete body through a typed higher-order
+                    // parameter so the handler audit can follow the call instead
+                    // of seeing only the annotation's empty signature body.
+                    arg_types.push(actual.clone());
+                } else {
+                    arg_types.push(expected.clone());
+                }
             } else {
                 arg_types.push(actual.clone());
             }
         }
-        self.check_function_value_call_with_types(params, return_type, body, &arg_types, span)
+        let returns = self.check_function_value_call_with_types(function, &arg_types, span)?;
+        Ok((returns, actual_arg_types))
     }
 
     fn check_function_value_call_with_types(
         &mut self,
-        params: &[FunctionValueParam],
-        return_type: Option<&Type>,
-        body: &[Stmt],
+        function: FunctionValueBodyRef<'_>,
         arg_types: &[Type],
         span: Span,
     ) -> KuResult<Type> {
-        self.check_function_value_call_with_types_inner(
-            params,
-            return_type,
-            body,
-            arg_types,
-            span,
-            None,
-        )
+        self.check_function_value_call_with_types_inner(function, arg_types, span, None)
     }
 
     fn check_function_value_call_with_types_readonly_captures(
         &mut self,
-        params: &[FunctionValueParam],
-        return_type: Option<&Type>,
-        body: &[Stmt],
+        function: FunctionValueBodyRef<'_>,
         arg_types: &[Type],
         span: Span,
     ) -> KuResult<Type> {
         self.check_function_value_call_with_types_inner(
-            params,
-            return_type,
-            body,
+            function,
             arg_types,
             span,
             Some("http handler"),
@@ -3245,24 +4144,22 @@ impl Checker {
 
     fn check_function_value_call_with_types_inner(
         &mut self,
-        params: &[FunctionValueParam],
-        return_type: Option<&Type>,
-        body: &[Stmt],
+        function: FunctionValueBodyRef<'_>,
         arg_types: &[Type],
         span: Span,
         readonly_capture_owner: Option<&'static str>,
     ) -> KuResult<Type> {
-        if params.len() != arg_types.len() {
+        if function.params.len() != arg_types.len() {
             return Err(KuError::runtime(
                 format!(
                     "function value expects {} arguments but got {}",
-                    params.len(),
+                    function.params.len(),
                     arg_types.len()
                 ),
                 span,
             ));
         }
-        for (param, actual) in params.iter().zip(arg_types.iter()) {
+        for (param, actual) in function.params.iter().zip(arg_types.iter()) {
             if let Some(expected) = &param.ty {
                 if !type_matches(expected, actual) {
                     return Err(type_error(span, expected, actual));
@@ -3270,19 +4167,25 @@ impl Checker {
             }
         }
         if let Some(owner) = readonly_capture_owner {
-            self.check_function_value_body_readonly_captures(
-                params,
-                return_type,
-                body,
+            self.check_function_value_body_readonly_captures(function, arg_types, span, owner)
+        } else {
+            // An annotated FunctionValue is normally already checked. When a
+            // read-only handler/task audit is active, its body must still be
+            // traversed because it may mutate bindings captured outside the
+            // outer execution boundary.
+            if self.readonly_capture.is_none() {
+                if let Some(return_type) = function.return_type {
+                    return Ok(return_type.clone());
+                }
+            }
+            self.check_function_value_body(
+                function.params,
+                function.return_type,
+                function.body,
+                function.body_id,
                 arg_types,
                 span,
-                owner,
             )
-        } else {
-            if let Some(return_type) = return_type {
-                return Ok(return_type.clone());
-            }
-            self.check_function_value_body(params, return_type, body, arg_types, span)
         }
     }
 
@@ -3291,21 +4194,51 @@ impl Checker {
         params: &[FunctionValueParam],
         return_type: Option<&Type>,
         body: &[Stmt],
+        body_id: Option<FunctionBodyId>,
         arg_types: &[Type],
         span: Span,
     ) -> KuResult<Type> {
-        let inference_key = function_body_key(body);
         let guard_inference = return_type.is_none();
-        if guard_inference && self.function_value_inference_stack.contains(&inference_key) {
-            return Ok(Type::Unknown);
-        }
         if guard_inference {
-            self.function_value_inference_stack.push(inference_key);
+            let Some(body_id) = body_id else {
+                return Ok(Type::Unknown);
+            };
+            if self.function_value_inference_stack.contains(&body_id) {
+                return Ok(Type::Unknown);
+            }
+        }
+        let readonly_body_key = if let Some(capture) = self.readonly_capture {
+            if capture.owner == "http handler" && (body.is_empty() || body_id.is_none()) {
+                return Err(KuError::runtime(
+                    "http handler cannot prove a captured function value is read-only because its body is unavailable",
+                    span,
+                ));
+            }
+            if let Some(body_id) = body_id {
+                if self.readonly_function_body_stack.contains(&body_id) {
+                    return Ok(return_type.cloned().unwrap_or(Type::Unknown));
+                }
+                self.readonly_function_body_stack.push(body_id);
+                Some(body_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let inference_body_key = guard_inference.then_some(body_id).flatten();
+        if let Some(body_id) = inference_body_key {
+            self.function_value_inference_stack.push(body_id);
         }
         let saved_return = self.current_return.clone();
         let saved_loop_depth = self.loop_depth;
+        let saved_recoverable_depth = self.recoverable_depth;
+        // A closure executes later; its return/fail/? edges do not enter a try
+        // surrounding the closure literal's creation.
+        let saved_try_exit_collectors = std::mem::take(&mut self.try_exit_collectors);
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
         self.loop_depth = 0;
+        self.recoverable_depth = 0;
         self.push_scope();
         // Stage 6c-str: everything defined at or above this scope index is local to
         // the closure body; anything below it is captured from an enclosing scope
@@ -3359,34 +4292,61 @@ impl Checker {
         self.pop_scope();
         self.current_return = saved_return;
         self.loop_depth = saved_loop_depth;
-        if guard_inference {
+        self.recoverable_depth = saved_recoverable_depth;
+        self.try_exit_collectors = saved_try_exit_collectors;
+        if inference_body_key.is_some() {
             self.function_value_inference_stack.pop();
+        }
+        if let Some(expected_key) = readonly_body_key {
+            let popped = self.readonly_function_body_stack.pop();
+            debug_assert_eq!(popped, Some(expected_key));
         }
         result
     }
 
     fn check_function_value_body_readonly_captures(
         &mut self,
-        params: &[FunctionValueParam],
-        return_type: Option<&Type>,
-        body: &[Stmt],
+        function: FunctionValueBodyRef<'_>,
         arg_types: &[Type],
         span: Span,
         owner: &'static str,
     ) -> KuResult<Type> {
         let saved_capture = self.readonly_capture;
-        self.push_scope();
-        self.readonly_capture = Some(ReadonlyCapture {
-            boundary: self.scopes.len() - 1,
+        let effective_capture = saved_capture.unwrap_or(ReadonlyCapture {
+            // This is the index of the function scope pushed below. If a
+            // boundary already exists, keep it so nested bodies inherit the
+            // outermost handler/task execution boundary.
+            boundary: self.scopes.len(),
             owner,
         });
+        if effective_capture.owner == "http handler"
+            && (function.body.is_empty() || function.body_id.is_none())
+        {
+            return Err(KuError::runtime(
+                "http handler cannot prove a function value is read-only because its body is unavailable",
+                span,
+            ));
+        }
+        if let Some(body_id) = function.body_id {
+            if self.readonly_function_body_stack.contains(&body_id) {
+                return Ok(function.return_type.cloned().unwrap_or(Type::Unknown));
+            }
+            self.readonly_function_body_stack.push(body_id);
+        }
+        self.push_scope();
+        self.readonly_capture = Some(effective_capture);
         let saved_return = self.current_return.clone();
         let saved_loop_depth = self.loop_depth;
-        self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
+        let saved_recoverable_depth = self.recoverable_depth;
+        // Handler/async bodies are separate executions too; do not report their
+        // abrupt exits to a try active where the function value is checked.
+        let saved_try_exit_collectors = std::mem::take(&mut self.try_exit_collectors);
+        self.current_return = function.return_type.cloned().unwrap_or(Type::Unknown);
         self.loop_depth = 0;
+        self.recoverable_depth = 0;
 
         let result = (|| -> KuResult<Type> {
-            for (param, ty) in params.iter().zip(arg_types.iter()) {
+            for (param, ty) in function.params.iter().zip(arg_types.iter()) {
                 self.define(param.name.clone(), ty.clone(), false, span)?;
                 // An HTTP handler's request is a native struct in the IR, so its
                 // fields are movable individually -- `http.text(req.body)` is the
@@ -3402,13 +4362,13 @@ impl Checker {
             }
 
             let mut inferred_return = Type::Null;
-            for stmt in body {
+            for stmt in function.body {
                 if let Some(return_type) = self.check_stmt_and_infer_return(stmt)? {
                     inferred_return = merge_return_types(&inferred_return, &return_type, span)?;
                 }
             }
-            if let Some(expected) = return_type {
-                if expected != &Type::Void && !block_may_return(body) {
+            if let Some(expected) = function.return_type {
+                if expected != &Type::Void && !block_may_return(function.body) {
                     return Err(KuError::runtime(
                         format!("function value must return {}", type_name(expected)),
                         span,
@@ -3423,8 +4383,14 @@ impl Checker {
 
         self.current_return = saved_return;
         self.loop_depth = saved_loop_depth;
+        self.recoverable_depth = saved_recoverable_depth;
+        self.try_exit_collectors = saved_try_exit_collectors;
         self.readonly_capture = saved_capture;
         self.pop_scope();
+        if let Some(expected_body_id) = function.body_id {
+            let popped = self.readonly_function_body_stack.pop();
+            debug_assert_eq!(popped, Some(expected_body_id));
+        }
         result
     }
 
@@ -3461,17 +4427,35 @@ impl Checker {
                 self.resolve_type_name_with_generics(ty, function.span, &function.type_params)
             })
             .transpose()?;
+        let body_id = self.fresh_function_body_id();
+        let visible_names = self
+            .visible_binding_ids()
+            .into_keys()
+            .collect::<HashSet<_>>();
+        let captured_names = checker_local_function_capture_names(function, &visible_names);
+        self.record_function_body_outer_bindings(body_id, &captured_names);
         self.define(
             function.name.clone(),
             Type::FunctionValue {
                 params: params.clone(),
                 return_type: return_type.clone().map(Box::new),
                 body: function.body.clone(),
+                body_id: Some(body_id),
                 is_async,
             },
             false,
             function.span,
         )?;
+        let mut closure_provenance = ClosureProvenance::empty();
+        for binding_id in self
+            .function_body_outer_bindings
+            .get(&body_id)
+            .into_iter()
+            .flat_map(|bindings| bindings.values())
+        {
+            closure_provenance.dependencies.insert(*binding_id);
+        }
+        self.set_closure_provenance(&function.name, closure_provenance, function.span)?;
         let arg_types = params
             .iter()
             .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
@@ -3480,9 +4464,12 @@ impl Checker {
         self.async_depth = usize::from(is_async);
         let result = if is_async {
             self.check_function_value_body_readonly_captures(
-                &params,
-                return_type.as_ref(),
-                &function.body,
+                FunctionValueBodyRef {
+                    params: &params,
+                    return_type: return_type.as_ref(),
+                    body: &function.body,
+                    body_id: Some(body_id),
+                },
                 &arg_types,
                 function.span,
                 "async task",
@@ -3492,6 +4479,7 @@ impl Checker {
                 &params,
                 return_type.as_ref(),
                 &function.body,
+                Some(body_id),
                 &arg_types,
                 function.span,
             )
@@ -3543,15 +4531,17 @@ impl Checker {
                 if !type_matches(&self.current_return, &actual) {
                     return Err(type_error(*span, &self.current_return, &actual));
                 }
+                self.capture_try_exit(TryExitKind::Return);
                 Ok(Some(actual))
             }
             Stmt::Fail { value, span } => {
-                let actual = self.check_expr(value)?;
+                let actual = self.consume_expr(value)?;
                 if actual != Type::String && !matches!(actual, Type::Object(_)) {
                     return Err(type_error(*span, &error_type(), &actual));
                 }
                 if !matches!(self.current_return, Type::Result(_)) {
                     if self.recoverable_depth > 0 {
+                        self.capture_try_exit(TryExitKind::Throw);
                         return Ok(None);
                     }
                     return Err(KuError::runtime(
@@ -3562,6 +4552,7 @@ impl Checker {
                         *span,
                     ));
                 }
+                self.capture_try_exit(TryExitKind::Throw);
                 Ok(Some(self.current_return.clone()))
             }
             Stmt::If {
@@ -3655,14 +4646,25 @@ impl Checker {
 
     fn define(&mut self, name: String, ty: Type, mutable: bool, span: Span) -> KuResult<()> {
         reject_reserved_name(&name, span)?;
-        let scope = self.scopes.last_mut().expect("checker always has a scope");
-        if scope.contains_key(&name) {
+        if self
+            .scopes
+            .last()
+            .expect("checker always has a scope")
+            .contains_key(&name)
+        {
             return Err(KuError::runtime(
                 format!("variable '{name}' is already defined in this scope"),
                 span,
             ));
         }
-        scope.insert(name, VarType::live(ty, mutable));
+        let binding_id = self.fresh_binding_id();
+        self.scopes
+            .last_mut()
+            .expect("checker always has a scope")
+            .insert(
+                name,
+                VarType::live(binding_id, ty, mutable, ClosureProvenance::unknown()),
+            );
         Ok(())
     }
 
@@ -3707,6 +4709,1530 @@ impl Checker {
             format!("undefined variable '{name}'"),
             span,
         ))
+    }
+
+    fn set_closure_provenance(
+        &mut self,
+        name: &str,
+        provenance: ClosureProvenance,
+        span: Span,
+    ) -> KuResult<()> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(var) = scope.get_mut(name) {
+                var.closure_provenance = provenance;
+                return Ok(());
+            }
+        }
+        Err(KuError::runtime(
+            format!("undefined variable '{name}'"),
+            span,
+        ))
+    }
+
+    fn merge_closure_provenance(
+        &mut self,
+        name: &str,
+        provenance: &ClosureProvenance,
+        span: Span,
+    ) -> KuResult<()> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(var) = scope.get_mut(name) {
+                var.closure_provenance.merge(provenance);
+                return Ok(());
+            }
+        }
+        Err(KuError::runtime(
+            format!("undefined variable '{name}'"),
+            span,
+        ))
+    }
+
+    fn update_function_value_binding_type(&mut self, name: &str, actual: &Type) {
+        if !matches!(actual, Type::FunctionValue { .. }) {
+            return;
+        }
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(var) = scope.get_mut(name) {
+                if matches!(var.ty, Type::FunctionValue { .. }) {
+                    var.ty = actual.clone();
+                }
+                return;
+            }
+        }
+    }
+
+    fn binding_by_id(&self, binding_id: BindingId) -> Option<&VarType> {
+        self.scopes
+            .iter()
+            .flat_map(|scope| scope.values())
+            .find(|var| var.binding_id == binding_id)
+    }
+
+    fn reject_closure_reference_cycle(
+        &self,
+        target: &str,
+        provenance: &ClosureProvenance,
+        span: Span,
+    ) -> KuResult<()> {
+        let target_binding = self.get_allow_moved(target, span)?;
+        let mut visited = HashSet::new();
+        let creates_cycle = provenance.dependencies.iter().copied().any(|dependency| {
+            self.closure_dependency_reaches(dependency, target_binding.binding_id, &mut visited)
+        });
+        if creates_cycle {
+            return Err(KuError::runtime(
+                format!(
+                    "E0904 cannot create closure reference cycle involving '{target}'; use a named local function for recursion or break the captured ownership path"
+                ),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn closure_dependency_reaches(
+        &self,
+        current: BindingId,
+        target: BindingId,
+        visited: &mut HashSet<BindingId>,
+    ) -> bool {
+        if current == target {
+            return true;
+        }
+        if !visited.insert(current) {
+            return false;
+        }
+        self.binding_by_id(current).is_some_and(|binding| {
+            binding
+                .closure_provenance
+                .dependencies
+                .iter()
+                .copied()
+                .any(|dependency| self.closure_dependency_reaches(dependency, target, visited))
+        })
+    }
+
+    fn expression_closure_provenance(&self, expr: &Expr) -> ClosureProvenance {
+        self.expression_closure_provenance_inner(
+            expr,
+            &HashMap::new(),
+            &mut ClosureSummaryContext::new(),
+            true,
+        )
+    }
+
+    fn expression_closure_provenance_inner(
+        &self,
+        expr: &Expr,
+        symbolic: &HashMap<String, ClosureProvenance>,
+        summaries: &mut ClosureSummaryContext,
+        allow_checker_bindings: bool,
+    ) -> ClosureProvenance {
+        match &expr.kind {
+            ExprKind::Literal(_) | ExprKind::Unary { .. } | ExprKind::Binary { .. } => {
+                ClosureProvenance::empty()
+            }
+            ExprKind::Variable(name) => {
+                if let Some(provenance) = symbolic.get(name) {
+                    return provenance.clone();
+                }
+                if allow_checker_bindings {
+                    if let Ok(binding) = self.get_allow_moved(name, expr.span) {
+                        return binding.closure_provenance;
+                    }
+                }
+                if self.functions.contains_key(name) {
+                    return ClosureProvenance::empty();
+                }
+                ClosureProvenance::unknown()
+            }
+            ExprKind::Function { params, body, .. } => {
+                let mut provenance = ClosureProvenance::empty();
+                let mut visible_names = symbolic.keys().cloned().collect::<HashSet<_>>();
+                if allow_checker_bindings {
+                    visible_names.extend(self.visible_binding_ids().into_keys());
+                }
+                for name in checker_closure_capture_names(params, body, &visible_names) {
+                    if let Some(captured) = symbolic.get(&name) {
+                        provenance.merge(captured);
+                    } else if allow_checker_bindings {
+                        if let Ok(binding) = self.get_allow_moved(&name, expr.span) {
+                            provenance.dependencies.insert(binding.binding_id);
+                        } else if !self.functions.contains_key(&name) {
+                            provenance.complete = false;
+                        }
+                    } else if !self.functions.contains_key(&name) {
+                        provenance.complete = false;
+                    }
+                }
+                provenance
+            }
+            ExprKind::Array(values) => {
+                let mut provenance = ClosureProvenance::empty();
+                for value in values {
+                    provenance.merge(&self.expression_closure_provenance_inner(
+                        value,
+                        symbolic,
+                        summaries,
+                        allow_checker_bindings,
+                    ));
+                }
+                provenance
+            }
+            ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+                let mut provenance = ClosureProvenance::empty();
+                for (_, value) in fields {
+                    provenance.merge(&self.expression_closure_provenance_inner(
+                        value,
+                        symbolic,
+                        summaries,
+                        allow_checker_bindings,
+                    ));
+                }
+                provenance
+            }
+            ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => self
+                .expression_closure_provenance_inner(
+                    expr,
+                    symbolic,
+                    summaries,
+                    allow_checker_bindings,
+                ),
+            ExprKind::Match { value, arms } => {
+                let selected = self.expression_closure_provenance_inner(
+                    value,
+                    symbolic,
+                    summaries,
+                    allow_checker_bindings,
+                );
+                let mut provenance = ClosureProvenance::empty();
+                for arm in arms {
+                    let mut arm_symbolic = symbolic.clone();
+                    bind_match_pattern_closure_provenance(
+                        &arm.pattern,
+                        &selected,
+                        &mut arm_symbolic,
+                    );
+                    provenance.merge(&self.expression_closure_provenance_inner(
+                        &arm.value,
+                        &arm_symbolic,
+                        summaries,
+                        allow_checker_bindings,
+                    ));
+                }
+                provenance
+            }
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    if name == "clone" && args.is_empty() {
+                        return self.expression_closure_provenance_inner(
+                            target,
+                            symbolic,
+                            summaries,
+                            allow_checker_bindings,
+                        );
+                    }
+                }
+                let argument_provenance = args
+                    .iter()
+                    .map(|arg| {
+                        self.expression_closure_provenance_inner(
+                            arg,
+                            symbolic,
+                            summaries,
+                            allow_checker_bindings,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if let ExprKind::Variable(name) = &callee.kind {
+                    if let Some(function) = self.functions.get(name) {
+                        return self.known_function_body_return_provenance(
+                            ClosureBodyView {
+                                params: &function.value_params,
+                                body: &function.body,
+                                body_id: function.body_id,
+                            },
+                            &function.params,
+                            &argument_provenance,
+                            &ClosureProvenance::empty(),
+                            summaries,
+                        );
+                    }
+                    if allow_checker_bindings {
+                        if let Ok(binding) = self.get_allow_moved(name, callee.span) {
+                            if let Type::FunctionValue {
+                                params,
+                                body,
+                                body_id: Some(body_id),
+                                ..
+                            } = &binding.ty
+                            {
+                                if !body.is_empty() {
+                                    let parameter_types = params
+                                        .iter()
+                                        .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
+                                        .collect::<Vec<_>>();
+                                    return self.known_function_body_return_provenance(
+                                        ClosureBodyView {
+                                            params,
+                                            body,
+                                            body_id: *body_id,
+                                        },
+                                        &parameter_types,
+                                        &argument_provenance,
+                                        &binding.closure_provenance,
+                                        summaries,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut unknown = self.expression_closure_provenance_inner(
+                    callee,
+                    symbolic,
+                    summaries,
+                    allow_checker_bindings,
+                );
+                for argument in &argument_provenance {
+                    unknown.merge(argument);
+                }
+                unknown.complete = false;
+                unknown
+            }
+            // Until provenance is field/index-sensitive, preserve every known
+            // container dependency when selecting a member. Mark it incomplete so
+            // callers do not mistake the union for an exact selected-field value.
+            ExprKind::Index { target, .. }
+            | ExprKind::Field { target, .. }
+            | ExprKind::OptionalField { target, .. } => {
+                let mut provenance = self.expression_closure_provenance_inner(
+                    target,
+                    symbolic,
+                    summaries,
+                    allow_checker_bindings,
+                );
+                provenance.complete = false;
+                provenance
+            }
+        }
+    }
+
+    fn known_function_body_return_provenance(
+        &self,
+        function: ClosureBodyView<'_>,
+        parameter_types: &[Type],
+        arguments: &[ClosureProvenance],
+        captured_environment: &ClosureProvenance,
+        summaries: &mut ClosureSummaryContext,
+    ) -> ClosureProvenance {
+        let ClosureBodyView {
+            params,
+            body,
+            body_id,
+        } = function;
+        if params.len() != arguments.len() {
+            return ClosureProvenance::unknown();
+        }
+
+        let key = ClosureReturnSummaryKey {
+            body_id,
+            captured_environment: captured_environment.into(),
+            arguments: arguments.iter().map(Into::into).collect(),
+        };
+        if let Some(cached) = summaries.return_cache.get(&key) {
+            return cached.clone();
+        }
+
+        let conservative = || {
+            let mut unknown = captured_environment.clone();
+            for (parameter_type, argument) in parameter_types.iter().zip(arguments) {
+                if self.type_may_contain_function_value(parameter_type) {
+                    unknown.merge(argument);
+                }
+            }
+            unknown.complete = false;
+            unknown
+        };
+        if summaries.remaining_states == 0 || !summaries.active_bodies.insert(body_id) {
+            return conservative();
+        }
+        summaries.remaining_states -= 1;
+
+        // A concrete local FunctionValue carries an environment. Seed every
+        // lexically-free name with that environment's aggregate dependency set;
+        // parameters then override it. This preserves returned closures that
+        // capture an outer binding, and remains valid when the function value was
+        // cloned or passed through an alias whose original lexical cells are no
+        // longer present in the checker's current scope.
+        let mut symbolic = self
+            .function_body_outer_bindings
+            .get(&body_id)
+            .into_iter()
+            .flat_map(|bindings| bindings.keys().cloned())
+            .map(|name| (name, captured_environment.clone()))
+            .collect::<HashMap<_, _>>();
+        symbolic.extend(
+            params
+                .iter()
+                .zip(arguments)
+                .map(|(param, provenance)| (param.name.clone(), provenance.clone())),
+        );
+        let flow = self.function_return_provenance_flow(body, symbolic, summaries);
+        summaries.active_bodies.remove(&body_id);
+        let had_return = flow.returned.is_some();
+        let mut result = flow.returned.unwrap_or_else(ClosureProvenance::unknown);
+        let fully_proven =
+            flow.complete && flow.fallthrough.is_none() && had_return && result.complete;
+        if !fully_proven {
+            // An incomplete concrete summary is not treated as empty. Preserve
+            // every function-owning argument as a possible returned dependency;
+            // a proven straight-line Discard remains complete and avoids this.
+            for (parameter_type, argument) in parameter_types.iter().zip(arguments) {
+                if self.type_may_contain_function_value(parameter_type) {
+                    result.merge(argument);
+                }
+            }
+            result.merge(captured_environment);
+            result.complete = false;
+        }
+        summaries.return_cache.insert(key, result.clone());
+        result
+    }
+
+    fn function_return_provenance_flow(
+        &self,
+        body: &[Stmt],
+        mut symbolic: HashMap<String, ClosureProvenance>,
+        summaries: &mut ClosureSummaryContext,
+    ) -> ClosureReturnFlow {
+        let mut returned = None;
+        let mut complete = true;
+        for stmt in body {
+            match stmt {
+                Stmt::VarDecl { name, value, .. } => {
+                    let provenance = self
+                        .expression_closure_provenance_inner(value, &symbolic, summaries, false);
+                    symbolic.insert(name.clone(), provenance);
+                }
+                Stmt::Assign { name, value, .. } => {
+                    if symbolic.contains_key(name) {
+                        let provenance = self.expression_closure_provenance_inner(
+                            value, &symbolic, summaries, false,
+                        );
+                        symbolic.insert(name.clone(), provenance);
+                    } else {
+                        complete = false;
+                    }
+                }
+                Stmt::Return { value, .. } => {
+                    let provenance =
+                        value
+                            .as_ref()
+                            .map_or_else(ClosureProvenance::empty, |value| {
+                                self.expression_closure_provenance_inner(
+                                    value, &symbolic, summaries, false,
+                                )
+                            });
+                    merge_optional_closure_provenance(&mut returned, Some(provenance));
+                    return ClosureReturnFlow {
+                        returned,
+                        fallthrough: None,
+                        complete,
+                    };
+                }
+                Stmt::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    let then_flow = restore_symbolic_block_scope(
+                        self.function_return_provenance_flow(
+                            then_branch,
+                            symbolic.clone(),
+                            summaries,
+                        ),
+                        &symbolic,
+                        then_branch,
+                    );
+                    let else_flow = if else_branch.is_empty() {
+                        ClosureReturnFlow {
+                            returned: None,
+                            fallthrough: Some(symbolic.clone()),
+                            complete: true,
+                        }
+                    } else {
+                        restore_symbolic_block_scope(
+                            self.function_return_provenance_flow(
+                                else_branch,
+                                symbolic.clone(),
+                                summaries,
+                            ),
+                            &symbolic,
+                            else_branch,
+                        )
+                    };
+                    merge_optional_closure_provenance(&mut returned, then_flow.returned);
+                    merge_optional_closure_provenance(&mut returned, else_flow.returned);
+                    complete &= then_flow.complete && else_flow.complete;
+                    match merge_symbolic_fallthrough(then_flow.fallthrough, else_flow.fallthrough) {
+                        Some(merged) => symbolic = merged,
+                        None => {
+                            return ClosureReturnFlow {
+                                returned,
+                                fallthrough: None,
+                                complete,
+                            };
+                        }
+                    }
+                }
+                Stmt::Expr { expr, .. } if expr_may_call_function(expr) => complete = false,
+                Stmt::Print { value, .. } if expr_may_call_function(value) => complete = false,
+                Stmt::Expr { .. } | Stmt::Print { .. } => {}
+                Stmt::Fail { .. }
+                | Stmt::Panic { .. }
+                | Stmt::Break { .. }
+                | Stmt::Continue { .. } => {
+                    return ClosureReturnFlow {
+                        returned,
+                        fallthrough: None,
+                        complete,
+                    };
+                }
+                // Loops, try/finally and mutation through projections need a
+                // richer flow model. Mark the summary incomplete so the caller
+                // conservatively propagates function-owning arguments.
+                _ => complete = false,
+            }
+        }
+        ClosureReturnFlow {
+            returned,
+            fallthrough: Some(symbolic),
+            complete,
+        }
+    }
+
+    fn apply_known_function_closure_effects(
+        &mut self,
+        callee_name: &str,
+        function: ClosureBodyView<'_>,
+        arguments: &[ClosureProvenance],
+        argument_types: &[Type],
+        span: Span,
+    ) -> KuResult<()> {
+        let ClosureBodyView {
+            params,
+            body,
+            body_id,
+        } = function;
+        if params.len() != arguments.len()
+            || params.len() != argument_types.len()
+            || body.is_empty()
+        {
+            return Ok(());
+        }
+        let callee = self.get_allow_moved(callee_name, span)?;
+        let mut summaries = ClosureSummaryContext::new();
+        let mut summary = self.known_function_body_effect_summary(
+            ClosureBodyView {
+                params,
+                body,
+                body_id,
+            },
+            arguments,
+            argument_types,
+            &callee.closure_provenance,
+            &mut summaries,
+        );
+        if !summary.complete {
+            // Unsupported calls/loops must never erase known ownership. Retain
+            // the callee environment and every function-capable argument as a
+            // possible write to each captured function-capable cell.
+            let mut conservative = callee.closure_provenance.clone();
+            for (param, argument) in params.iter().zip(arguments) {
+                if param
+                    .ty
+                    .as_ref()
+                    .is_none_or(|ty| self.type_may_contain_function_value(ty))
+                {
+                    conservative.merge(argument);
+                }
+            }
+            conservative.complete = false;
+            for target in self
+                .function_body_outer_bindings
+                .get(&body_id)
+                .into_iter()
+                .flat_map(|bindings| bindings.values().copied())
+            {
+                if self
+                    .binding_by_id(target)
+                    .is_some_and(|binding| self.type_may_contain_function_value(&binding.ty))
+                {
+                    let mut provenance = conservative.clone();
+                    // Merely owning the target cell is not itself a write-back;
+                    // remove that tautological edge so an opaque but harmless
+                    // call does not immediately self-cycle its callee capture.
+                    provenance.dependencies.remove(&target);
+                    summary
+                        .effects
+                        .push(ClosureWriteEffect { target, provenance });
+                }
+            }
+        }
+
+        let mut environment_effect = ClosureProvenance::empty();
+        for effect in summary.effects {
+            environment_effect.merge(&effect.provenance);
+            let Some((target_name, target_type)) = self.binding_name_and_type_by_id(effect.target)
+            else {
+                continue;
+            };
+            if !self.type_may_contain_function_value(&target_type) {
+                continue;
+            }
+            self.reject_closure_reference_cycle(&target_name, &effect.provenance, span)?;
+            self.merge_closure_provenance(&target_name, &effect.provenance, span)?;
+        }
+        if !environment_effect.dependencies.is_empty() || !environment_effect.complete {
+            // A FunctionValue owns every cell in its environment. A write through
+            // any captured cell therefore updates what aliases of this callee can
+            // reach; retaining the aggregate edge also catches hidden cells whose
+            // lexical binding has left the checker scope.
+            self.reject_closure_reference_cycle(callee_name, &environment_effect, span)?;
+            self.merge_closure_provenance(callee_name, &environment_effect, span)?;
+        }
+        Ok(())
+    }
+
+    fn apply_top_level_function_closure_effects(
+        &mut self,
+        params: &[FunctionValueParam],
+        body: &[Stmt],
+        body_id: FunctionBodyId,
+        argument_types: &[Type],
+        arguments: &[ClosureProvenance],
+        span: Span,
+    ) -> KuResult<()> {
+        if params.len() != arguments.len()
+            || params.len() != argument_types.len()
+            || body.is_empty()
+        {
+            return Ok(());
+        }
+        let mut summaries = ClosureSummaryContext::new();
+        let mut summary = self.known_function_body_effect_summary(
+            ClosureBodyView {
+                params,
+                body,
+                body_id,
+            },
+            arguments,
+            argument_types,
+            &ClosureProvenance::empty(),
+            &mut summaries,
+        );
+        if !summary.complete {
+            // If a wrapper exceeded the bounded analysis or contains an opaque
+            // call, a concrete callable argument may still write through any
+            // cell it captures. Preserve those possible targets and all
+            // function-owning argument dependencies. A proven Discard body
+            // remains complete and never enters this fallback.
+            let mut conservative = ClosureProvenance::empty();
+            for (ty, argument) in argument_types.iter().zip(arguments) {
+                if self.type_may_contain_function_value(ty) {
+                    conservative.merge(argument);
+                }
+            }
+            conservative.complete = false;
+            let possible_targets = argument_types
+                .iter()
+                .zip(arguments)
+                .filter(|(ty, _)| matches!(ty, Type::FunctionValue { .. }))
+                .flat_map(|(_, argument)| argument.dependencies.iter().copied())
+                .collect::<HashSet<_>>();
+            for target in possible_targets {
+                if self
+                    .binding_by_id(target)
+                    .is_some_and(|binding| self.type_may_contain_function_value(&binding.ty))
+                {
+                    summary.effects.push(ClosureWriteEffect {
+                        target,
+                        provenance: conservative.clone(),
+                    });
+                }
+            }
+        }
+
+        for effect in summary.effects {
+            let Some((target_name, target_type)) = self.binding_name_and_type_by_id(effect.target)
+            else {
+                continue;
+            };
+            if !self.type_may_contain_function_value(&target_type) {
+                continue;
+            }
+            self.reject_closure_reference_cycle(&target_name, &effect.provenance, span)?;
+            self.merge_closure_provenance(&target_name, &effect.provenance, span)?;
+        }
+        Ok(())
+    }
+
+    fn reject_erased_function_value_call_cycle(
+        &self,
+        callee_name: &str,
+        params: &[FunctionValueParam],
+        arguments: &[ClosureProvenance],
+        span: Span,
+    ) -> KuResult<()> {
+        let callee = self.get_allow_moved(callee_name, span)?;
+        let captured_targets = callee
+            .closure_provenance
+            .dependencies
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for (param, argument) in params.iter().zip(arguments) {
+            if param
+                .ty
+                .as_ref()
+                .is_some_and(|ty| !self.type_may_contain_function_value(ty))
+            {
+                continue;
+            }
+            let mut visited = HashSet::new();
+            let reaches_callee = argument.dependencies.iter().copied().any(|dependency| {
+                self.closure_dependency_reaches(dependency, callee.binding_id, &mut visited)
+            });
+            let reaches_environment = captured_targets.iter().copied().any(|target| {
+                let mut visited = HashSet::new();
+                argument.dependencies.iter().copied().any(|dependency| {
+                    self.closure_dependency_reaches(dependency, target, &mut visited)
+                })
+            });
+            if reaches_callee || reaches_environment {
+                return Err(KuError::runtime(
+                    format!(
+                        "E0904 cannot create closure reference cycle involving '{callee_name}': the function body is unavailable and may retain a back-referencing function argument"
+                    ),
+                    span,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn known_function_body_effect_summary(
+        &self,
+        function: ClosureBodyView<'_>,
+        arguments: &[ClosureProvenance],
+        argument_types: &[Type],
+        captured_environment: &ClosureProvenance,
+        summaries: &mut ClosureSummaryContext,
+    ) -> ClosureEffectSummary {
+        let ClosureBodyView {
+            params,
+            body,
+            body_id,
+        } = function;
+        if params.len() != arguments.len()
+            || params.len() != argument_types.len()
+            || body.is_empty()
+        {
+            return ClosureEffectSummary {
+                effects: Vec::new(),
+                complete: false,
+            };
+        }
+        // Top-level functions have no lexical capture table; they still need
+        // their parameter-mediated calls analysed at each concrete call site.
+        let outer_bindings = self
+            .function_body_outer_bindings
+            .get(&body_id)
+            .cloned()
+            .unwrap_or_default();
+        let key = ClosureEffectSummaryKey {
+            body_id,
+            captured_environment: captured_environment.into(),
+            arguments: arguments.iter().map(Into::into).collect(),
+            argument_bodies: argument_types
+                .iter()
+                .map(|ty| match ty {
+                    Type::FunctionValue { body_id, .. } => *body_id,
+                    _ => None,
+                })
+                .collect(),
+        };
+        if let Some(cached) = summaries.effect_cache.get(&key) {
+            return cached.clone();
+        }
+        if summaries.remaining_states == 0 || !summaries.active_effect_bodies.insert(body_id) {
+            return ClosureEffectSummary {
+                effects: Vec::new(),
+                complete: false,
+            };
+        }
+        summaries.remaining_states -= 1;
+
+        let mut symbolic = HashMap::new();
+        for (name, binding_id) in &outer_bindings {
+            let provenance = self
+                .binding_by_id(*binding_id)
+                .map(|binding| binding.closure_provenance.clone())
+                .unwrap_or_else(|| captured_environment.clone());
+            symbolic.insert(name.clone(), provenance);
+        }
+        let mut locals = HashSet::new();
+        let mut types = HashMap::new();
+        for ((param, provenance), argument_type) in params.iter().zip(arguments).zip(argument_types)
+        {
+            locals.insert(param.name.clone());
+            symbolic.insert(param.name.clone(), provenance.clone());
+            types.insert(param.name.clone(), argument_type.clone());
+        }
+        let flow = self.function_closure_effect_flow(
+            body,
+            &outer_bindings,
+            ClosureEffectEnvironment {
+                symbolic,
+                types,
+                locals,
+            },
+            summaries,
+        );
+        summaries.active_effect_bodies.remove(&body_id);
+        let summary = ClosureEffectSummary {
+            effects: flow.effects,
+            complete: flow.complete,
+        };
+        summaries.effect_cache.insert(key, summary.clone());
+        summary
+    }
+
+    fn expression_call_effect_summary(
+        &self,
+        expr: &Expr,
+        outer_bindings: &HashMap<String, BindingId>,
+        environment: &ClosureEffectEnvironment,
+        summaries: &mut ClosureSummaryContext,
+    ) -> Option<ClosureEffectSummary> {
+        let ExprKind::Call { callee, args } = &expr.kind else {
+            return None;
+        };
+        let ExprKind::Variable(name) = &callee.kind else {
+            return None;
+        };
+        let (params, body, body_id, captured_environment) =
+            if let Some(actual_type) = environment.types.get(name) {
+                let Type::FunctionValue {
+                    params,
+                    body,
+                    body_id: Some(body_id),
+                    ..
+                } = actual_type
+                else {
+                    return None;
+                };
+                (
+                    params.clone(),
+                    body.clone(),
+                    *body_id,
+                    environment
+                        .symbolic
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(ClosureProvenance::unknown),
+                )
+            } else if let Some(binding_id) = outer_bindings.get(name) {
+                let binding = self.binding_by_id(*binding_id)?;
+                let Type::FunctionValue {
+                    params,
+                    body,
+                    body_id: Some(body_id),
+                    ..
+                } = &binding.ty
+                else {
+                    return None;
+                };
+                (
+                    params.clone(),
+                    body.clone(),
+                    *body_id,
+                    environment
+                        .symbolic
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| binding.closure_provenance.clone()),
+                )
+            } else if let Some(function) = self.functions.get(name) {
+                (
+                    function.value_params.clone(),
+                    function.body.clone(),
+                    function.body_id,
+                    ClosureProvenance::empty(),
+                )
+            } else {
+                return None;
+            };
+        if body.is_empty() {
+            return None;
+        }
+        let arguments = args
+            .iter()
+            .map(|arg| {
+                self.effect_expression_closure_provenance(
+                    arg,
+                    outer_bindings,
+                    environment,
+                    summaries,
+                )
+            })
+            .collect::<Vec<_>>();
+        let argument_types = args
+            .iter()
+            .map(|arg| self.effect_expression_type(arg, outer_bindings, environment))
+            .collect::<Vec<_>>();
+        Some(self.known_function_body_effect_summary(
+            ClosureBodyView {
+                params: &params,
+                body: &body,
+                body_id,
+            },
+            &arguments,
+            &argument_types,
+            &captured_environment,
+            summaries,
+        ))
+    }
+
+    fn effect_expression_type(
+        &self,
+        expr: &Expr,
+        outer_bindings: &HashMap<String, BindingId>,
+        environment: &ClosureEffectEnvironment,
+    ) -> Type {
+        match &expr.kind {
+            ExprKind::Variable(name) => {
+                if let Some(ty) = environment.types.get(name) {
+                    return ty.clone();
+                }
+                if let Some(binding_id) = outer_bindings.get(name) {
+                    if let Some(binding) = self.binding_by_id(*binding_id) {
+                        return binding.ty.clone();
+                    }
+                }
+                self.functions
+                    .get(name)
+                    .and_then(|function| function_value_type(name, function, expr.span).ok())
+                    .unwrap_or(Type::Unknown)
+            }
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    if name == "clone" && args.is_empty() {
+                        return self.effect_expression_type(target, outer_bindings, environment);
+                    }
+                }
+                let callee_type = self.effect_expression_type(callee, outer_bindings, environment);
+                match callee_type {
+                    Type::FunctionValue { return_type, .. } => {
+                        return_type.map_or(Type::Null, |ty| *ty)
+                    }
+                    _ => Type::Unknown,
+                }
+            }
+            _ => Type::Unknown,
+        }
+    }
+
+    fn effect_expression_closure_provenance(
+        &self,
+        expr: &Expr,
+        outer_bindings: &HashMap<String, BindingId>,
+        environment: &ClosureEffectEnvironment,
+        summaries: &mut ClosureSummaryContext,
+    ) -> ClosureProvenance {
+        if let ExprKind::Call { callee, args } = &expr.kind {
+            if let ExprKind::Field { target, name } = &callee.kind {
+                if name == "clone" && args.is_empty() {
+                    return self.effect_expression_closure_provenance(
+                        target,
+                        outer_bindings,
+                        environment,
+                        summaries,
+                    );
+                }
+            }
+            let arguments = args
+                .iter()
+                .map(|arg| {
+                    self.effect_expression_closure_provenance(
+                        arg,
+                        outer_bindings,
+                        environment,
+                        summaries,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let ExprKind::Variable(name) = &callee.kind {
+                if let Some(Type::FunctionValue {
+                    params,
+                    body,
+                    body_id: Some(body_id),
+                    ..
+                }) = environment.types.get(name)
+                {
+                    if !body.is_empty() {
+                        let parameter_types = params
+                            .iter()
+                            .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
+                            .collect::<Vec<_>>();
+                        let captured_environment = environment
+                            .symbolic
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_else(ClosureProvenance::unknown);
+                        return self.known_function_body_return_provenance(
+                            ClosureBodyView {
+                                params,
+                                body,
+                                body_id: *body_id,
+                            },
+                            &parameter_types,
+                            &arguments,
+                            &captured_environment,
+                            summaries,
+                        );
+                    }
+                }
+                // A parameter/local shadows a same-named top-level function. If
+                // its concrete body is unavailable, retain the unknown call
+                // below instead of analysing the unrelated top-level body.
+                if !environment.locals.contains(name) {
+                    if let Some(binding_id) = outer_bindings.get(name) {
+                        if let Some(binding) = self.binding_by_id(*binding_id) {
+                            if let Type::FunctionValue {
+                                params,
+                                body,
+                                body_id: Some(body_id),
+                                ..
+                            } = &binding.ty
+                            {
+                                if !body.is_empty() {
+                                    let parameter_types = params
+                                        .iter()
+                                        .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
+                                        .collect::<Vec<_>>();
+                                    let captured_environment = environment
+                                        .symbolic
+                                        .get(name)
+                                        .unwrap_or(&binding.closure_provenance);
+                                    return self.known_function_body_return_provenance(
+                                        ClosureBodyView {
+                                            params,
+                                            body,
+                                            body_id: *body_id,
+                                        },
+                                        &parameter_types,
+                                        &arguments,
+                                        captured_environment,
+                                        summaries,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if environment.locals.contains(name) || outer_bindings.contains_key(name) {
+                    let mut unknown = environment
+                        .symbolic
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(ClosureProvenance::unknown);
+                    for argument in &arguments {
+                        unknown.merge(argument);
+                    }
+                    unknown.complete = false;
+                    return unknown;
+                }
+                if let Some(function) = self.functions.get(name) {
+                    return self.known_function_body_return_provenance(
+                        ClosureBodyView {
+                            params: &function.value_params,
+                            body: &function.body,
+                            body_id: function.body_id,
+                        },
+                        &function.params,
+                        &arguments,
+                        &ClosureProvenance::empty(),
+                        summaries,
+                    );
+                }
+            }
+            let mut unknown = self.expression_closure_provenance_inner(
+                callee,
+                &environment.symbolic,
+                summaries,
+                false,
+            );
+            for argument in &arguments {
+                unknown.merge(argument);
+            }
+            unknown.complete = false;
+            return unknown;
+        }
+        let mut provenance =
+            self.expression_closure_provenance_inner(expr, &environment.symbolic, summaries, false);
+        collect_effect_expression_outer_capture_ids(expr, outer_bindings, &mut provenance);
+        provenance
+    }
+
+    fn extend_expression_closure_effects(
+        &self,
+        expr: &Expr,
+        outer_bindings: &HashMap<String, BindingId>,
+        environment: &ClosureEffectEnvironment,
+        effects: &mut Vec<ClosureWriteEffect>,
+        complete: &mut bool,
+        summaries: &mut ClosureSummaryContext,
+    ) {
+        if !expr_may_call_function(expr) {
+            return;
+        }
+        if let Some(summary) =
+            self.expression_call_effect_summary(expr, outer_bindings, environment, summaries)
+        {
+            effects.extend(summary.effects);
+            *complete &= summary.complete;
+        } else {
+            // A nested or dynamically selected call is not proven effect-free.
+            // The bounded caller fallback will retain its callable arguments.
+            *complete = false;
+        }
+    }
+
+    fn function_closure_effect_flow(
+        &self,
+        body: &[Stmt],
+        outer_bindings: &HashMap<String, BindingId>,
+        mut environment: ClosureEffectEnvironment,
+        summaries: &mut ClosureSummaryContext,
+    ) -> ClosureEffectFlow {
+        let mut effects = Vec::new();
+        let mut complete = true;
+        let mut falls_through = true;
+        for stmt in body {
+            if !falls_through {
+                break;
+            }
+            match stmt {
+                Stmt::VarDecl { name, value, .. } => {
+                    self.extend_expression_closure_effects(
+                        value,
+                        outer_bindings,
+                        &environment,
+                        &mut effects,
+                        &mut complete,
+                        summaries,
+                    );
+                    let actual_type =
+                        self.effect_expression_type(value, outer_bindings, &environment);
+                    let provenance = self.effect_expression_closure_provenance(
+                        value,
+                        outer_bindings,
+                        &environment,
+                        summaries,
+                    );
+                    environment.locals.insert(name.clone());
+                    environment.symbolic.insert(name.clone(), provenance);
+                    environment.types.insert(name.clone(), actual_type);
+                }
+                Stmt::Assign { name, value, .. } => {
+                    self.extend_expression_closure_effects(
+                        value,
+                        outer_bindings,
+                        &environment,
+                        &mut effects,
+                        &mut complete,
+                        summaries,
+                    );
+                    let actual_type =
+                        self.effect_expression_type(value, outer_bindings, &environment);
+                    let provenance = self.effect_expression_closure_provenance(
+                        value,
+                        outer_bindings,
+                        &environment,
+                        summaries,
+                    );
+                    if environment.locals.contains(name) {
+                        environment.symbolic.insert(name.clone(), provenance);
+                        environment.types.insert(name.clone(), actual_type);
+                    } else if let Some(target) = outer_bindings.get(name) {
+                        effects.push(ClosureWriteEffect {
+                            target: *target,
+                            provenance: provenance.clone(),
+                        });
+                        environment.symbolic.insert(name.clone(), provenance);
+                        environment.types.insert(name.clone(), actual_type);
+                    } else {
+                        environment.locals.insert(name.clone());
+                        environment.symbolic.insert(name.clone(), provenance);
+                        environment.types.insert(name.clone(), actual_type);
+                    }
+                }
+                Stmt::AssignTarget { target, value, .. } => {
+                    self.extend_expression_closure_effects(
+                        value,
+                        outer_bindings,
+                        &environment,
+                        &mut effects,
+                        &mut complete,
+                        summaries,
+                    );
+                    let provenance = self.effect_expression_closure_provenance(
+                        value,
+                        outer_bindings,
+                        &environment,
+                        summaries,
+                    );
+                    if let Some(name) = assign_target_root_name(target) {
+                        if !environment.locals.contains(name) {
+                            if let Some(target) = outer_bindings.get(name) {
+                                effects.push(ClosureWriteEffect {
+                                    target: *target,
+                                    provenance,
+                                });
+                            }
+                        }
+                    }
+                }
+                Stmt::DestructureAssign { names, values, .. } => {
+                    for (name, value) in names.iter().zip(values) {
+                        let Some(name) = name else {
+                            continue;
+                        };
+                        self.extend_expression_closure_effects(
+                            value,
+                            outer_bindings,
+                            &environment,
+                            &mut effects,
+                            &mut complete,
+                            summaries,
+                        );
+                        let provenance = self.effect_expression_closure_provenance(
+                            value,
+                            outer_bindings,
+                            &environment,
+                            summaries,
+                        );
+                        let actual_type =
+                            self.effect_expression_type(value, outer_bindings, &environment);
+                        if environment.locals.contains(name) {
+                            environment.symbolic.insert(name.clone(), provenance);
+                            environment.types.insert(name.clone(), actual_type);
+                        } else if let Some(target) = outer_bindings.get(name) {
+                            effects.push(ClosureWriteEffect {
+                                target: *target,
+                                provenance: provenance.clone(),
+                            });
+                            environment.symbolic.insert(name.clone(), provenance);
+                            environment.types.insert(name.clone(), actual_type);
+                        } else {
+                            environment.locals.insert(name.clone());
+                            environment.symbolic.insert(name.clone(), provenance);
+                            environment.types.insert(name.clone(), actual_type);
+                        }
+                    }
+                }
+                Stmt::ObjectDestructureAssign {
+                    bindings,
+                    rest,
+                    value,
+                    ..
+                } => {
+                    self.extend_expression_closure_effects(
+                        value,
+                        outer_bindings,
+                        &environment,
+                        &mut effects,
+                        &mut complete,
+                        summaries,
+                    );
+                    let provenance = self.effect_expression_closure_provenance(
+                        value,
+                        outer_bindings,
+                        &environment,
+                        summaries,
+                    );
+                    let mut names = bindings
+                        .iter()
+                        .filter_map(|binding| binding.local.as_ref())
+                        .collect::<Vec<_>>();
+                    names.extend(rest.iter().filter_map(|rest| rest.local.as_ref()));
+                    for name in names {
+                        if environment.locals.contains(name) {
+                            environment
+                                .symbolic
+                                .insert(name.clone(), provenance.clone());
+                        } else if let Some(target) = outer_bindings.get(name) {
+                            effects.push(ClosureWriteEffect {
+                                target: *target,
+                                provenance: provenance.clone(),
+                            });
+                            environment
+                                .symbolic
+                                .insert(name.clone(), provenance.clone());
+                        } else {
+                            environment.locals.insert(name.clone());
+                            environment
+                                .symbolic
+                                .insert(name.clone(), provenance.clone());
+                        }
+                    }
+                }
+                Stmt::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    self.extend_expression_closure_effects(
+                        condition,
+                        outer_bindings,
+                        &environment,
+                        &mut effects,
+                        &mut complete,
+                        summaries,
+                    );
+                    let then_flow = self.function_closure_effect_flow(
+                        then_branch,
+                        outer_bindings,
+                        environment.clone(),
+                        summaries,
+                    );
+                    let else_flow = self.function_closure_effect_flow(
+                        else_branch,
+                        outer_bindings,
+                        environment.clone(),
+                        summaries,
+                    );
+                    let reachable = [&then_flow, &else_flow]
+                        .into_iter()
+                        .filter(|flow| flow.falls_through)
+                        .map(|flow| flow.environment.clone())
+                        .collect::<Vec<_>>();
+                    if reachable.is_empty() {
+                        falls_through = false;
+                    } else {
+                        for (name, current) in environment.symbolic.iter_mut() {
+                            let mut merged = ClosureProvenance::empty();
+                            for branch in &reachable {
+                                merged.merge(branch.symbolic.get(name).unwrap_or(current));
+                            }
+                            *current = merged;
+                        }
+                        for (name, current) in environment.types.iter_mut() {
+                            let mut branch_types = reachable
+                                .iter()
+                                .map(|branch| {
+                                    branch.types.get(name).cloned().unwrap_or(Type::Unknown)
+                                })
+                                .collect::<Vec<_>>();
+                            let first = branch_types.pop().unwrap_or(Type::Unknown);
+                            *current = if branch_types.iter().all(|ty| ty == &first) {
+                                first
+                            } else {
+                                // A later call must not reuse one branch's body
+                                // summary for another branch's FunctionValue.
+                                Type::Unknown
+                            };
+                        }
+                    }
+                    complete &= then_flow.complete && else_flow.complete;
+                    effects.extend(then_flow.effects);
+                    effects.extend(else_flow.effects);
+                }
+                Stmt::While { body, .. } | Stmt::For { body, .. } => {
+                    let loop_flow = self.function_closure_effect_flow(
+                        body,
+                        outer_bindings,
+                        environment.clone(),
+                        summaries,
+                    );
+                    effects.extend(loop_flow.effects);
+                    for (name, current) in environment.symbolic.iter_mut() {
+                        if let Some(loop_value) = loop_flow.environment.symbolic.get(name) {
+                            current.merge(loop_value);
+                        }
+                    }
+                    for (name, current) in environment.types.iter_mut() {
+                        if loop_flow.environment.types.get(name) != Some(current) {
+                            *current = Type::Unknown;
+                        }
+                    }
+                    complete = false;
+                }
+                Stmt::Try {
+                    body,
+                    catch_body,
+                    finally_body,
+                    ..
+                } => {
+                    for block in [
+                        body.as_slice(),
+                        catch_body.as_slice(),
+                        finally_body.as_slice(),
+                    ] {
+                        let flow = self.function_closure_effect_flow(
+                            block,
+                            outer_bindings,
+                            environment.clone(),
+                            summaries,
+                        );
+                        effects.extend(flow.effects);
+                    }
+                    complete = false;
+                }
+                Stmt::Function(function) => {
+                    let mut provenance = ClosureProvenance::empty();
+                    for name in crate::runtime::interpreter::function_capture_names(function) {
+                        if let Some(captured) = environment.symbolic.get(&name) {
+                            provenance.merge(captured);
+                        }
+                    }
+                    environment.locals.insert(function.name.clone());
+                    environment
+                        .symbolic
+                        .insert(function.name.clone(), provenance);
+                }
+                Stmt::Expr { expr, .. } | Stmt::Print { value: expr, .. } => {
+                    self.extend_expression_closure_effects(
+                        expr,
+                        outer_bindings,
+                        &environment,
+                        &mut effects,
+                        &mut complete,
+                        summaries,
+                    );
+                }
+                Stmt::Return { value, .. } => {
+                    if let Some(value) = value {
+                        self.extend_expression_closure_effects(
+                            value,
+                            outer_bindings,
+                            &environment,
+                            &mut effects,
+                            &mut complete,
+                            summaries,
+                        );
+                    }
+                    falls_through = false;
+                }
+                Stmt::Fail { value, .. } | Stmt::Panic { value, .. } => {
+                    self.extend_expression_closure_effects(
+                        value,
+                        outer_bindings,
+                        &environment,
+                        &mut effects,
+                        &mut complete,
+                        summaries,
+                    );
+                    falls_through = false;
+                }
+                Stmt::Break { .. } | Stmt::Continue { .. } => falls_through = false,
+                Stmt::CompoundAssign { value, .. } => {
+                    self.extend_expression_closure_effects(
+                        value,
+                        outer_bindings,
+                        &environment,
+                        &mut effects,
+                        &mut complete,
+                        summaries,
+                    );
+                }
+            }
+        }
+        ClosureEffectFlow {
+            environment,
+            effects,
+            complete,
+            falls_through,
+        }
+    }
+
+    fn binding_name_and_type_by_id(&self, binding_id: BindingId) -> Option<(String, Type)> {
+        self.scopes.iter().rev().find_map(|scope| {
+            scope.iter().find_map(|(name, binding)| {
+                (binding.binding_id == binding_id).then(|| (name.clone(), binding.ty.clone()))
+            })
+        })
+    }
+
+    fn type_may_contain_function_value(&self, ty: &Type) -> bool {
+        self.type_may_contain_function_value_inner(ty, &mut HashSet::new(), &mut HashSet::new())
+    }
+
+    fn type_may_contain_function_value_inner(
+        &self,
+        ty: &Type,
+        visiting_structs: &mut HashSet<String>,
+        visiting_enums: &mut HashSet<String>,
+    ) -> bool {
+        match ty {
+            Type::FunctionValue { .. }
+            | Type::DynamicObject
+            | Type::KuValue
+            | Type::Generic(_)
+            | Type::Unknown => true,
+            Type::Array(inner) | Type::Result(inner) | Type::Task(inner) => {
+                self.type_may_contain_function_value_inner(inner, visiting_structs, visiting_enums)
+            }
+            Type::Union(types) => types.iter().any(|ty| {
+                self.type_may_contain_function_value_inner(ty, visiting_structs, visiting_enums)
+            }),
+            Type::Object(fields) => fields.values().any(|ty| {
+                self.type_may_contain_function_value_inner(ty, visiting_structs, visiting_enums)
+            }),
+            Type::Struct(name) => {
+                if !visiting_structs.insert(name.clone()) {
+                    return false;
+                }
+                let contains = self.structs.get(name).is_some_and(|layout| {
+                    layout.fields.values().any(|field| {
+                        self.type_may_contain_function_value_inner(
+                            field,
+                            visiting_structs,
+                            visiting_enums,
+                        )
+                    })
+                });
+                visiting_structs.remove(name);
+                contains
+            }
+            Type::Enum(name) => {
+                if !visiting_enums.insert(name.clone()) {
+                    return false;
+                }
+                let contains = self.enums.get(name).is_some_and(|layout| {
+                    layout.variants.values().flatten().any(|field| {
+                        self.type_may_contain_function_value_inner(
+                            field,
+                            visiting_structs,
+                            visiting_enums,
+                        )
+                    })
+                });
+                visiting_enums.remove(name);
+                contains
+            }
+            Type::Int
+            | Type::Float
+            | Type::Bool
+            | Type::String
+            | Type::Null
+            | Type::StringMap
+            | Type::Native(_)
+            | Type::Void => false,
+        }
     }
 
     fn mark_initialized(&mut self, name: &str) {
@@ -3764,12 +6290,10 @@ impl Checker {
     ///     literal, constructor, or `.clone()`); moving it tracks nothing.
     fn classify_place(&self, expr: &Expr) -> PlaceClass {
         match &expr.kind {
-            ExprKind::Variable(name) if self.contains(name) => {
-                PlaceClass::Movable(PlacePath {
-                    root: name.clone(),
-                    path: Vec::new(),
-                })
-            }
+            ExprKind::Variable(name) if self.contains(name) => PlaceClass::Movable(PlacePath {
+                root: name.clone(),
+                path: Vec::new(),
+            }),
             ExprKind::Field { target, name } => {
                 // `EnumName.Variant` is a constructor, not a projection.
                 if let ExprKind::Variable(enum_name) = &target.kind {
@@ -3892,6 +6416,7 @@ impl Checker {
     /// closure capture boundary (E0904) on the root and that the place is still
     /// live (a double move / move-through-moved-parent is rejected).
     fn record_move(&mut self, place: &PlacePath, span: Span) -> KuResult<()> {
+        self.reject_readonly_capture_move(place, span)?;
         let boundary = self.closure_capture_boundaries.last().copied();
         for (index, scope) in self.scopes.iter_mut().enumerate().rev() {
             if let Some(var) = scope.get_mut(&place.root) {
@@ -3975,6 +6500,7 @@ impl Checker {
             | Type::Object(_)
             | Type::StringMap
             | Type::DynamicObject
+            | Type::KuValue
             // A native handle owns a C resource; it must be move-tracked and dropped.
             | Type::Native(_) => true,
             Type::Struct(name) => {
@@ -4003,6 +6529,77 @@ impl Checker {
             Type::FunctionValue { .. } => true,
             Type::Union(types) => types.iter().any(|ty| self.is_owned_type(ty)),
             _ => false,
+        }
+    }
+
+    /// Native handles are move-only even when nested inside another owned value.
+    /// Walk named layouts recursively, but break cycles so an invalid/self-recursive
+    /// user type cannot overflow the checker while clone eligibility is decided.
+    fn type_contains_native_resource(&self, ty: &Type) -> bool {
+        self.type_contains_native_resource_inner(ty, &mut HashSet::new(), &mut HashSet::new())
+    }
+
+    fn type_contains_native_resource_inner(
+        &self,
+        ty: &Type,
+        visiting_structs: &mut HashSet<String>,
+        visiting_enums: &mut HashSet<String>,
+    ) -> bool {
+        match ty {
+            Type::Native(_) => true,
+            Type::Array(inner) | Type::Result(inner) | Type::Task(inner) => {
+                self.type_contains_native_resource_inner(inner, visiting_structs, visiting_enums)
+            }
+            Type::Union(types) => types.iter().any(|ty| {
+                self.type_contains_native_resource_inner(ty, visiting_structs, visiting_enums)
+            }),
+            Type::Object(fields) => fields.values().any(|ty| {
+                self.type_contains_native_resource_inner(ty, visiting_structs, visiting_enums)
+            }),
+            Type::Struct(name) => {
+                if !visiting_structs.insert(name.clone()) {
+                    return false;
+                }
+                let contains = self.structs.get(name).is_some_and(|layout| {
+                    layout.fields.values().any(|ty| {
+                        self.type_contains_native_resource_inner(
+                            ty,
+                            visiting_structs,
+                            visiting_enums,
+                        )
+                    })
+                });
+                visiting_structs.remove(name);
+                contains
+            }
+            Type::Enum(name) => {
+                if !visiting_enums.insert(name.clone()) {
+                    return false;
+                }
+                let contains = self.enums.get(name).is_some_and(|layout| {
+                    layout.variants.values().flatten().any(|ty| {
+                        self.type_contains_native_resource_inner(
+                            ty,
+                            visiting_structs,
+                            visiting_enums,
+                        )
+                    })
+                });
+                visiting_enums.remove(name);
+                contains
+            }
+            Type::Int
+            | Type::Float
+            | Type::Bool
+            | Type::String
+            | Type::Null
+            | Type::StringMap
+            | Type::DynamicObject
+            | Type::Generic(_)
+            | Type::Void
+            | Type::FunctionValue { .. }
+            | Type::KuValue
+            | Type::Unknown => false,
         }
     }
 
@@ -4035,26 +6632,85 @@ impl Checker {
         &mut self,
         before: &[HashMap<String, VarType>],
         body: &[Stmt],
-        loop_var: Option<(&str, &Type)>,
+        loop_var: Option<(&str, &Type, &ClosureProvenance)>,
     ) -> Vec<HashMap<String, VarType>> {
         if !loop_body_has_backedge(body) {
             return before.to_vec();
         }
-        let saved = self.scopes.clone();
+        let saved_scopes = self.scopes.clone();
+        // This is a speculative ownership pass. Abrupt exits are recorded by the
+        // authoritative pass below, not by this throwaway scan.
+        let saved_try_exit_collectors = std::mem::take(&mut self.try_exit_collectors);
+        let saved_next_binding_id = self.next_binding_id;
+        let saved_next_function_body_id = self.next_function_body_id;
+        let saved_body_bindings = self.function_body_outer_bindings.clone();
+        let outer_binding_count = before.iter().map(HashMap::len).sum::<usize>();
+        // Each iteration can add at least one edge along a simple BindingId path;
+        // N+2 passes therefore cover an N-node chain. The hard cap prevents an
+        // adversarial body from multiplying full checker passes without bound.
+        let max_iterations = outer_binding_count.saturating_add(2).clamp(2, 128);
+        let mut top = before.to_vec();
+        let mut converged = false;
+        for _ in 0..max_iterations {
+            // Speculative locals and closure bodies must receive the same ids on
+            // every pass; otherwise Type/body-id churn would prevent convergence.
+            self.next_binding_id = saved_next_binding_id;
+            self.next_function_body_id = saved_next_function_body_id;
+            self.function_body_outer_bindings = saved_body_bindings.clone();
+            let candidate = self.speculative_loop_transfer(before, &top, body, loop_var);
+            if candidate == top {
+                top = candidate;
+                converged = true;
+                break;
+            }
+            top = candidate;
+        }
+        if !converged {
+            // Fail closed after the explicit budget: every function-capable loop
+            // binding may reach every other one. The authoritative pass then
+            // reports E0904 at the first write that could close such a cycle.
+            let possible_targets = top
+                .iter()
+                .flat_map(|scope| scope.values())
+                .filter(|binding| self.type_may_contain_function_value(&binding.ty))
+                .map(|binding| binding.binding_id)
+                .collect::<HashSet<_>>();
+            for binding in top.iter_mut().flat_map(|scope| scope.values_mut()) {
+                if self.type_may_contain_function_value(&binding.ty) {
+                    binding
+                        .closure_provenance
+                        .dependencies
+                        .extend(possible_targets.iter().copied());
+                    binding.closure_provenance.complete = false;
+                }
+            }
+        }
+        self.scopes = saved_scopes;
+        self.try_exit_collectors = saved_try_exit_collectors;
+        top
+    }
+
+    fn speculative_loop_transfer(
+        &mut self,
+        before: &[HashMap<String, VarType>],
+        iteration_top: &[HashMap<String, VarType>],
+        body: &[Stmt],
+        loop_var: Option<(&str, &Type, &ClosureProvenance)>,
+    ) -> Vec<HashMap<String, VarType>> {
+        self.scopes = iteration_top.to_vec();
         self.push_scope();
-        if let Some((name, ty)) = loop_var {
+        if let Some((name, ty, provenance)) = loop_var {
             let _ = self.define(name.to_string(), ty.clone(), true, Span::default());
+            let _ = self.set_closure_provenance(name, provenance.clone(), Span::default());
         }
         // The scan must run inside a loop context: without it `break`/`continue`
-        // fail as "outside loop", and treating that as the end of the body hides
-        // every move after them — which is how a loop-carried move slipped past.
+        // fail as "outside loop", hiding ownership changes after those exits.
         self.loop_depth += 1;
         self.loop_break_states.push(Vec::new());
         self.loop_continue_states.push(Vec::new());
         for stmt in body {
-            // A statement that fails to check may still have been a move, and the
-            // statements after it certainly can be, so keep scanning. Errors here
-            // are not reported; the authoritative pass re-checks the body.
+            // Errors are surfaced by the authoritative pass. Continue scanning so
+            // an earlier speculative error cannot hide later graph edges.
             let _ = self.check_stmt(stmt);
             if stmt_stops_fallthrough(stmt) {
                 break;
@@ -4065,13 +6721,6 @@ impl Checker {
         self.loop_depth -= 1;
         self.pop_scope();
         let end_of_body = self.scopes.clone();
-        self.scopes = saved;
-        // The top of an iteration is reached either on the first iteration
-        // (pre-loop state) or via the back-edge (end-of-body state). Join them:
-        // a value moved in the body without re-initialization is MaybeMoved at the
-        // top (a loop-carried move); a value re-initialized before the end of the
-        // body is live again at the top, so re-using it next iteration is fine.
-        // `continue` paths reach the top too, so they join in the same way.
         let mut top = merge_moved_scopes(before.to_vec(), before.to_vec(), end_of_body);
         for state in continues {
             top = merge_moved_scopes(before.to_vec(), top, state);
@@ -4106,22 +6755,19 @@ impl Checker {
         Ok(())
     }
 
+    fn readonly_capture_for_outer_binding(&self, name: &str) -> Option<ReadonlyCapture> {
+        let capture = self.readonly_capture?;
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, scope)| scope.contains_key(name).then_some(index))
+            .filter(|index| *index < capture.boundary)
+            .map(|_| capture)
+    }
+
     fn reject_readonly_capture_assignment(&self, name: &str, span: Span) -> KuResult<()> {
-        let Some(capture) = self.readonly_capture else {
-            return Ok(());
-        };
-        if self.scopes[capture.boundary..]
-            .iter()
-            .rev()
-            .any(|scope| scope.contains_key(name))
-        {
-            return Ok(());
-        }
-        if self.scopes[..capture.boundary]
-            .iter()
-            .rev()
-            .any(|scope| scope.contains_key(name))
-        {
+        if let Some(capture) = self.readonly_capture_for_outer_binding(name) {
             return Err(KuError::runtime(
                 format!("{} cannot modify captured variable '{name}'", capture.owner),
                 span,
@@ -4129,12 +6775,103 @@ impl Checker {
         }
         Ok(())
     }
+
+    fn reject_readonly_capture_move(&self, place: &PlacePath, span: Span) -> KuResult<()> {
+        if let Some(capture) = self.readonly_capture_for_outer_binding(&place.root) {
+            return Err(KuError::runtime(
+                format!(
+                    "{} cannot move captured owned value '{}'",
+                    capture.owner,
+                    place_display(&place.root, &place.path)
+                ),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_readonly_http_native_capture_read(&self, expr: &Expr, ty: &Type) -> KuResult<()> {
+        let Type::Native(native) = ty else {
+            return Ok(());
+        };
+        if native != metadata::PG_RESULT && native != metadata::MYSQL_RESULT {
+            return Ok(());
+        }
+        let Some(root) = expr_root_variable(expr) else {
+            return Ok(());
+        };
+        let Some(capture) = self.readonly_capture_for_outer_binding(root) else {
+            return Ok(());
+        };
+        if capture.owner != "http handler" {
+            return Ok(());
+        }
+        Err(KuError::runtime(
+            format!(
+                "http handler cannot share captured native resource '{}' across concurrent workers; keep only a pooled client outside the handler and create each result inside the handler",
+                type_name(ty)
+            ),
+            expr.span,
+        ))
+    }
+
+    /// HTTP control calls are not assignments, but route handlers execute later
+    /// on concurrent workers. Reject them throughout the handler's reachable call
+    /// tree: captured controls race the live server, while per-request controls
+    /// can leak servers/sockets or block a worker.
+    fn reject_http_handler_control_call(
+        &self,
+        target: &Expr,
+        target_type: &Type,
+        method: &str,
+        span: Span,
+    ) -> KuResult<()> {
+        let resource = if is_http_service_type(target_type) {
+            "service"
+        } else if is_http_listener_type(target_type) {
+            "listener"
+        } else {
+            return Ok(());
+        };
+        let Some(capture) = self.readonly_capture else {
+            return Ok(());
+        };
+        if capture.owner != "http handler" {
+            return Ok(());
+        }
+        if let Some(root) = expr_root_variable(target) {
+            if self.readonly_capture_for_outer_binding(root).is_some() {
+                return Err(KuError::runtime(
+                    format!(
+                        "http handler cannot call '{method}' on captured http {resource} rooted at '{root}'; handlers cannot modify, start, run, or close captured services/listeners"
+                    ),
+                    span,
+                ));
+            }
+        }
+        Err(KuError::runtime(
+            format!(
+                "http handler cannot call '{method}' on http {resource}; HTTP control-plane calls are forbidden in handlers because they can mutate server lifecycle, leak per-request resources, or block a worker"
+            ),
+            span,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ReadonlyCapture {
     boundary: usize,
     owner: &'static str,
+}
+
+fn expr_root_variable(expr: &Expr) -> Option<&str> {
+    match &expr.kind {
+        ExprKind::Variable(name) => Some(name),
+        ExprKind::Field { target, .. }
+        | ExprKind::OptionalField { target, .. }
+        | ExprKind::Index { target, .. } => expr_root_variable(target),
+        _ => None,
+    }
 }
 
 fn expect_arg_count(name: &str, actual: usize, expected: usize, span: Span) -> KuResult<()> {
@@ -4300,13 +7037,6 @@ fn union_or_single(types: Vec<Type>) -> Type {
     }
 }
 
-fn string_literal_value(expr: &Expr) -> Option<String> {
-    match &expr.kind {
-        ExprKind::Literal(Literal::String(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
 /// Identifiers starting with `__ku_` belong to the native C backend, which emits
 /// helpers and block-scoped temporaries under that prefix. A user binding of the
 /// same name is silently shadowed in the generated C — `__ku_p` printed an empty
@@ -4325,9 +7055,8 @@ fn stdlib_consuming_args(name: &str) -> &'static [usize] {
         "ok" | "err" => &[0],
         "json.stringify" => &[0],
         "kuvalue.as_int" | "kuvalue.as_str" => &[0],
-        // Closing consumes (and frees) the connection; a later use must be rejected.
-        // pg.query / pg.rows / pg.value only borrow their handle.
-        "pg.close" | "pg.pool_close" | "redis.close" | "mysql.close" => &[0],
+        // Closing consumes (and frees) the client; receiver reads borrow their handle.
+        "pg_client.close" | "redis.close" | "mysql.close" => &[0],
         _ => &[],
     }
 }
@@ -4872,7 +7601,6 @@ fn error_type() -> Type {
     ]))
 }
 
-
 fn type_name(ty: &Type) -> String {
     match ty {
         Type::Int => "int".to_string(),
@@ -4955,22 +7683,9 @@ fn function_value_type(name: &str, function: &FunctionType, span: Span) -> KuRes
         params: function.value_params.clone(),
         return_type: function.return_type.clone().map(Box::new),
         body: function.body.clone(),
+        body_id: Some(function.body_id),
         is_async: function.is_async,
     })
-}
-
-fn function_body_key(body: &[Stmt]) -> (usize, usize, usize) {
-    let start = body
-        .first()
-        .map(stmt_span)
-        .map(|span| span.start.offset)
-        .unwrap_or(0);
-    let end = body
-        .last()
-        .map(stmt_span)
-        .map(|span| span.end.offset)
-        .unwrap_or(0);
-    (start, end, body.len())
 }
 
 fn can_template_concat(left: &Type, right: &Type) -> bool {
@@ -4999,14 +7714,480 @@ fn join_move_marks(branch_marks: &[Option<MoveMark>]) -> Option<MoveMark> {
     if present == 0 {
         return None;
     }
-    if present == branch_count
-        && branch_marks
-            .iter()
-            .all(|m| *m == Some(MoveMark::Moved))
-    {
+    if present == branch_count && branch_marks.iter().all(|m| *m == Some(MoveMark::Moved)) {
         Some(MoveMark::Moved)
     } else {
         Some(MoveMark::MaybeMoved)
+    }
+}
+
+fn merge_optional_closure_provenance(
+    target: &mut Option<ClosureProvenance>,
+    incoming: Option<ClosureProvenance>,
+) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+    if let Some(existing) = target {
+        existing.merge(&incoming);
+    } else {
+        *target = Some(incoming);
+    }
+}
+
+fn checker_closure_capture_names(
+    params: &[FunctionParam],
+    body: &[Stmt],
+    visible_names: &HashSet<String>,
+) -> HashSet<String> {
+    let mut bound = params
+        .iter()
+        .map(|param| param.name.clone())
+        .collect::<HashSet<_>>();
+    let mut captures = HashSet::new();
+    collect_checker_capture_block(body, &mut bound, visible_names, &mut captures);
+    captures
+}
+
+fn checker_local_function_capture_names(
+    function: &FnDecl,
+    visible_names: &HashSet<String>,
+) -> HashSet<String> {
+    let mut bound = function
+        .params
+        .iter()
+        .map(|param| param.name.clone())
+        .collect::<HashSet<_>>();
+    bound.insert(function.name.clone());
+    let mut captures = HashSet::new();
+    collect_checker_capture_block(&function.body, &mut bound, visible_names, &mut captures);
+    captures
+}
+
+fn collect_checker_capture_block(
+    body: &[Stmt],
+    bound: &mut HashSet<String>,
+    visible_names: &HashSet<String>,
+    captures: &mut HashSet<String>,
+) {
+    for stmt in body {
+        collect_checker_capture_stmt(stmt, bound, visible_names, captures);
+    }
+}
+
+fn capture_checker_name(
+    name: &str,
+    bound: &HashSet<String>,
+    visible_names: &HashSet<String>,
+    captures: &mut HashSet<String>,
+) {
+    if !bound.contains(name) && visible_names.contains(name) {
+        captures.insert(name.to_string());
+    }
+}
+
+fn bind_or_capture_checker_name(
+    name: &str,
+    bound: &mut HashSet<String>,
+    visible_names: &HashSet<String>,
+    captures: &mut HashSet<String>,
+) {
+    if bound.contains(name) {
+        return;
+    }
+    if visible_names.contains(name) {
+        captures.insert(name.to_string());
+    } else {
+        bound.insert(name.to_string());
+    }
+}
+
+fn collect_checker_capture_stmt(
+    stmt: &Stmt,
+    bound: &mut HashSet<String>,
+    visible_names: &HashSet<String>,
+    captures: &mut HashSet<String>,
+) {
+    match stmt {
+        Stmt::VarDecl { name, value, .. } => {
+            collect_checker_capture_expr(value, bound, visible_names, captures);
+            bound.insert(name.clone());
+        }
+        Stmt::Assign { name, value, .. } => {
+            collect_checker_capture_expr(value, bound, visible_names, captures);
+            bind_or_capture_checker_name(name, bound, visible_names, captures);
+        }
+        Stmt::AssignTarget { target, value, .. } | Stmt::CompoundAssign { target, value, .. } => {
+            collect_checker_capture_assign_target(target, bound, visible_names, captures);
+            collect_checker_capture_expr(value, bound, visible_names, captures);
+        }
+        Stmt::DestructureAssign { names, values, .. } => {
+            for value in values {
+                collect_checker_capture_expr(value, bound, visible_names, captures);
+            }
+            for name in names.iter().flatten() {
+                bind_or_capture_checker_name(name, bound, visible_names, captures);
+            }
+        }
+        Stmt::ObjectDestructureAssign {
+            bindings,
+            rest,
+            value,
+            ..
+        } => {
+            collect_checker_capture_expr(value, bound, visible_names, captures);
+            for binding in bindings {
+                if let Some(default) = &binding.default {
+                    collect_checker_capture_expr(default, bound, visible_names, captures);
+                }
+                if let Some(local) = &binding.local {
+                    bind_or_capture_checker_name(local, bound, visible_names, captures);
+                }
+            }
+            if let Some(local) = rest.as_ref().and_then(|rest| rest.local.as_ref()) {
+                bind_or_capture_checker_name(local, bound, visible_names, captures);
+            }
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_checker_capture_expr(condition, bound, visible_names, captures);
+            collect_checker_capture_block(then_branch, &mut bound.clone(), visible_names, captures);
+            collect_checker_capture_block(else_branch, &mut bound.clone(), visible_names, captures);
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            collect_checker_capture_expr(condition, bound, visible_names, captures);
+            collect_checker_capture_block(body, &mut bound.clone(), visible_names, captures);
+        }
+        Stmt::For {
+            name,
+            iterable,
+            body,
+            ..
+        } => {
+            collect_checker_capture_expr(iterable, bound, visible_names, captures);
+            let mut nested = bound.clone();
+            nested.insert(name.clone());
+            collect_checker_capture_block(body, &mut nested, visible_names, captures);
+        }
+        Stmt::Function(function) => {
+            let mut nested = bound.clone();
+            nested.insert(function.name.clone());
+            nested.extend(function.params.iter().map(|param| param.name.clone()));
+            collect_checker_capture_block(&function.body, &mut nested, visible_names, captures);
+            bound.insert(function.name.clone());
+        }
+        Stmt::Try {
+            body,
+            catch_name,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            collect_checker_capture_block(body, &mut bound.clone(), visible_names, captures);
+            let mut catch_bound = bound.clone();
+            if let Some(name) = catch_name {
+                catch_bound.insert(name.clone());
+            }
+            collect_checker_capture_block(catch_body, &mut catch_bound, visible_names, captures);
+            collect_checker_capture_block(
+                finally_body,
+                &mut bound.clone(),
+                visible_names,
+                captures,
+            );
+        }
+        Stmt::Fail { value, .. } | Stmt::Panic { value, .. } | Stmt::Print { value, .. } => {
+            collect_checker_capture_expr(value, bound, visible_names, captures);
+        }
+        Stmt::Return { value, .. } => {
+            if let Some(value) = value {
+                collect_checker_capture_expr(value, bound, visible_names, captures);
+            }
+        }
+        Stmt::Expr { expr, .. } => {
+            collect_checker_capture_expr(expr, bound, visible_names, captures);
+        }
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
+    }
+}
+
+fn collect_checker_capture_assign_target(
+    target: &AssignTarget,
+    bound: &HashSet<String>,
+    visible_names: &HashSet<String>,
+    captures: &mut HashSet<String>,
+) {
+    match target {
+        AssignTarget::Variable(name) => {
+            capture_checker_name(name, bound, visible_names, captures);
+        }
+        AssignTarget::Index { target, index } => {
+            collect_checker_capture_expr(target, bound, visible_names, captures);
+            collect_checker_capture_expr(index, bound, visible_names, captures);
+        }
+        AssignTarget::Field { target, .. } => {
+            collect_checker_capture_expr(target, bound, visible_names, captures);
+        }
+    }
+}
+
+fn collect_checker_capture_expr(
+    expr: &Expr,
+    bound: &HashSet<String>,
+    visible_names: &HashSet<String>,
+    captures: &mut HashSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::Variable(name) => {
+            capture_checker_name(name, bound, visible_names, captures);
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => {
+            collect_checker_capture_expr(expr, bound, visible_names, captures);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_checker_capture_expr(left, bound, visible_names, captures);
+            collect_checker_capture_expr(right, bound, visible_names, captures);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_checker_capture_expr(callee, bound, visible_names, captures);
+            for arg in args {
+                collect_checker_capture_expr(arg, bound, visible_names, captures);
+            }
+        }
+        ExprKind::Array(values) => {
+            for value in values {
+                collect_checker_capture_expr(value, bound, visible_names, captures);
+            }
+        }
+        ExprKind::Index { target, index } => {
+            collect_checker_capture_expr(target, bound, visible_names, captures);
+            collect_checker_capture_expr(index, bound, visible_names, captures);
+        }
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            collect_checker_capture_expr(target, bound, visible_names, captures);
+        }
+        ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+            for (_, value) in fields {
+                collect_checker_capture_expr(value, bound, visible_names, captures);
+            }
+        }
+        ExprKind::Match { value, arms } => {
+            collect_checker_capture_expr(value, bound, visible_names, captures);
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                bind_match_pattern_names(&arm.pattern, &mut arm_bound);
+                if let Some(guard) = &arm.guard {
+                    collect_checker_capture_expr(guard, &arm_bound, visible_names, captures);
+                }
+                collect_checker_capture_expr(&arm.value, &arm_bound, visible_names, captures);
+            }
+        }
+        ExprKind::Function { params, body, .. } => {
+            let mut nested = bound.clone();
+            nested.extend(params.iter().map(|param| param.name.clone()));
+            collect_checker_capture_block(body, &mut nested, visible_names, captures);
+        }
+        ExprKind::Literal(_) => {}
+    }
+}
+
+fn bind_match_pattern_names(pattern: &MatchPattern, bound: &mut HashSet<String>) {
+    match pattern {
+        MatchPattern::Binding(name) => {
+            bound.insert(name.clone());
+        }
+        MatchPattern::EnumVariant { fields, .. } => {
+            for field in fields {
+                bind_match_pattern_names(field, bound);
+            }
+        }
+        MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
+    }
+}
+
+fn collect_effect_expression_outer_capture_ids(
+    expr: &Expr,
+    outer_bindings: &HashMap<String, BindingId>,
+    provenance: &mut ClosureProvenance,
+) {
+    match &expr.kind {
+        ExprKind::Function { params, body, .. } => {
+            let visible_names = outer_bindings.keys().cloned().collect::<HashSet<_>>();
+            for name in checker_closure_capture_names(params, body, &visible_names) {
+                if let Some(binding_id) = outer_bindings.get(&name) {
+                    provenance.dependencies.insert(*binding_id);
+                }
+            }
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => {
+            collect_effect_expression_outer_capture_ids(expr, outer_bindings, provenance);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_effect_expression_outer_capture_ids(left, outer_bindings, provenance);
+            collect_effect_expression_outer_capture_ids(right, outer_bindings, provenance);
+        }
+        ExprKind::Array(values) => {
+            for value in values {
+                collect_effect_expression_outer_capture_ids(value, outer_bindings, provenance);
+            }
+        }
+        ExprKind::Index { target, index } => {
+            collect_effect_expression_outer_capture_ids(target, outer_bindings, provenance);
+            collect_effect_expression_outer_capture_ids(index, outer_bindings, provenance);
+        }
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            collect_effect_expression_outer_capture_ids(target, outer_bindings, provenance);
+        }
+        ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+            for (_, value) in fields {
+                collect_effect_expression_outer_capture_ids(value, outer_bindings, provenance);
+            }
+        }
+        ExprKind::Match { value, arms } => {
+            collect_effect_expression_outer_capture_ids(value, outer_bindings, provenance);
+            for arm in arms {
+                collect_effect_expression_outer_capture_ids(&arm.value, outer_bindings, provenance);
+            }
+        }
+        // Calls are handled by `effect_expression_closure_provenance`, which can
+        // distinguish Identity from Discard instead of retaining every argument.
+        ExprKind::Call { .. } | ExprKind::Literal(_) | ExprKind::Variable(_) => {}
+    }
+}
+
+fn bind_match_pattern_closure_provenance(
+    pattern: &MatchPattern,
+    selected: &ClosureProvenance,
+    symbolic: &mut HashMap<String, ClosureProvenance>,
+) {
+    match pattern {
+        MatchPattern::Binding(name) => {
+            symbolic.insert(name.clone(), selected.clone());
+        }
+        MatchPattern::EnumVariant { fields, .. } => {
+            for field in fields {
+                bind_match_pattern_closure_provenance(field, selected, symbolic);
+            }
+        }
+        MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
+    }
+}
+
+fn expr_may_call_function(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Call { .. } | ExprKind::Await(_) => true,
+        ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } => expr_may_call_function(expr),
+        ExprKind::Binary { left, right, .. } => {
+            expr_may_call_function(left) || expr_may_call_function(right)
+        }
+        ExprKind::Array(values) => values.iter().any(expr_may_call_function),
+        ExprKind::Index { target, index } => {
+            expr_may_call_function(target) || expr_may_call_function(index)
+        }
+        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+            expr_may_call_function(target)
+        }
+        ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => fields
+            .iter()
+            .any(|(_, value)| expr_may_call_function(value)),
+        ExprKind::Match { value, arms } => {
+            expr_may_call_function(value)
+                || arms.iter().any(|arm| {
+                    arm.guard.as_ref().is_some_and(expr_may_call_function)
+                        || expr_may_call_function(&arm.value)
+                })
+        }
+        // Creating a closure does not execute its body.
+        ExprKind::Function { .. } | ExprKind::Literal(_) | ExprKind::Variable(_) => false,
+    }
+}
+
+fn merge_symbolic_fallthrough(
+    left: Option<HashMap<String, ClosureProvenance>>,
+    right: Option<HashMap<String, ClosureProvenance>>,
+) -> Option<HashMap<String, ClosureProvenance>> {
+    match (left, right) {
+        (None, None) => None,
+        (Some(environment), None) | (None, Some(environment)) => Some(environment),
+        (Some(left), Some(right)) => {
+            let mut merged = HashMap::new();
+            for (name, mut provenance) in left {
+                if let Some(right_provenance) = right.get(&name) {
+                    provenance.merge(right_provenance);
+                    merged.insert(name, provenance);
+                }
+            }
+            Some(merged)
+        }
+    }
+}
+
+fn restore_symbolic_block_scope(
+    mut flow: ClosureReturnFlow,
+    entry: &HashMap<String, ClosureProvenance>,
+    body: &[Stmt],
+) -> ClosureReturnFlow {
+    let Some(fallthrough) = flow.fallthrough.as_mut() else {
+        return flow;
+    };
+    for stmt in body {
+        let Stmt::VarDecl { name, .. } = stmt else {
+            continue;
+        };
+        if let Some(previous) = entry.get(name) {
+            fallthrough.insert(name.clone(), previous.clone());
+        } else {
+            fallthrough.remove(name);
+        }
+    }
+    flow
+}
+
+fn merge_function_value_branch_types(base: &Type, branches: &[Option<&Type>]) -> Type {
+    let Type::FunctionValue {
+        params,
+        return_type,
+        body_id: base_body_id,
+        is_async,
+        ..
+    } = base
+    else {
+        return base.clone();
+    };
+    let branch_types = branches
+        .iter()
+        .map(|branch| (*branch).unwrap_or(base))
+        .collect::<Vec<_>>();
+    let first_body_id = branch_types.first().and_then(|ty| match ty {
+        Type::FunctionValue { body_id, .. } => Some(*body_id),
+        _ => None,
+    });
+    let same_body = first_body_id.is_some()
+        && branch_types.iter().all(|ty| {
+            matches!(ty, Type::FunctionValue { body_id, .. } if Some(*body_id) == first_body_id)
+        });
+    if same_body {
+        return branch_types[0].clone();
+    }
+    // Different runtime call targets reach the join. Keep the checked signature,
+    // but erase the concrete body so an indirect-call provenance query takes its
+    // conservative unknown+arguments path instead of auditing the wrong branch.
+    Type::FunctionValue {
+        params: params.clone(),
+        return_type: return_type.clone(),
+        body: Vec::new(),
+        body_id: if branches.is_empty() {
+            *base_body_id
+        } else {
+            None
+        },
+        is_async: *is_async,
     }
 }
 
@@ -5027,29 +8208,6 @@ fn merge_var_moves(var: &mut VarType, branch_moves: &[Option<&BTreeMap<Vec<Strin
         }
     }
     var.moves = merged;
-}
-
-/// Fold every move seen so far in a `try` body into the throw state: a throw can
-/// occur after any statement, so any path moved at any point is `MaybeMoved` for
-/// the catch (a later re-initialization in the body had not run yet at the throw
-/// point). `acc` holds the outer scopes only (the try body's own scope is not
-/// merged — its locals do not escape).
-fn accumulate_throw_moves(
-    acc: &mut [HashMap<String, VarType>],
-    current: &[HashMap<String, VarType>],
-) {
-    for (index, scope) in acc.iter_mut().enumerate() {
-        for (name, var) in scope.iter_mut() {
-            let Some(cur) = current.get(index).and_then(|s| s.get(name)) else {
-                continue;
-            };
-            for path in cur.moves.keys() {
-                var.moves
-                    .entry(path.clone())
-                    .or_insert(MoveMark::MaybeMoved);
-            }
-        }
-    }
 }
 
 /// Merge the two branch states of an `if` into the state that reaches the code
@@ -5082,15 +8240,37 @@ fn merge_moved_scopes(
 ) -> Vec<HashMap<String, VarType>> {
     for (index, scope) in base.iter_mut().enumerate() {
         for (name, var) in scope.iter_mut() {
-            let then_moves = then_scopes
-                .get(index)
-                .and_then(|scope| scope.get(name))
-                .map(|value| &value.moves);
-            let else_moves = else_scopes
-                .get(index)
-                .and_then(|scope| scope.get(name))
-                .map(|value| &value.moves);
+            let then_var = then_scopes.get(index).and_then(|scope| scope.get(name));
+            let else_var = else_scopes.get(index).and_then(|scope| scope.get(name));
+            let then_moves = then_var.map(|value| &value.moves);
+            let else_moves = else_var.map(|value| &value.moves);
             merge_var_moves(var, &[then_moves, else_moves]);
+            var.ty = merge_function_value_branch_types(
+                &var.ty,
+                &[
+                    then_var.map(|value| &value.ty),
+                    else_var.map(|value| &value.ty),
+                ],
+            );
+            let mut provenance = ClosureProvenance::empty();
+            if let Some(then_var) = then_var {
+                debug_assert_eq!(then_var.binding_id, var.binding_id);
+                provenance.merge(&then_var.closure_provenance);
+            } else {
+                provenance.merge(&var.closure_provenance);
+            }
+            if let Some(else_var) = else_var {
+                debug_assert_eq!(else_var.binding_id, var.binding_id);
+                provenance.merge(&else_var.closure_provenance);
+            } else {
+                provenance.merge(&var.closure_provenance);
+            }
+            var.closure_provenance = provenance;
+            // A closure created on either reachable path may escape that path and
+            // continue reading the shared cell. Unlike a move mark, capture is
+            // monotonic: assignment cannot make the captured binding unboxed.
+            var.captured |= then_var.is_some_and(|value| value.captured)
+                || else_var.is_some_and(|value| value.captured);
         }
     }
     base
@@ -5102,6 +8282,11 @@ fn merge_moved_scope_paths(
 ) -> Vec<HashMap<String, VarType>> {
     for (index, scope) in base.iter_mut().enumerate() {
         for (name, var) in scope.iter_mut() {
+            let captured = paths.iter().any(|path| {
+                path.get(index)
+                    .and_then(|scope| scope.get(name))
+                    .is_some_and(|value| value.captured)
+            });
             let branch_moves: Vec<Option<&BTreeMap<Vec<String>, MoveMark>>> = paths
                 .iter()
                 .map(|path| {
@@ -5111,6 +8296,26 @@ fn merge_moved_scope_paths(
                 })
                 .collect();
             merge_var_moves(var, &branch_moves);
+            let branch_types = paths
+                .iter()
+                .map(|path| {
+                    path.get(index)
+                        .and_then(|scope| scope.get(name))
+                        .map(|value| &value.ty)
+                })
+                .collect::<Vec<_>>();
+            var.ty = merge_function_value_branch_types(&var.ty, &branch_types);
+            let mut provenance = ClosureProvenance::empty();
+            for path in paths {
+                if let Some(path_var) = path.get(index).and_then(|scope| scope.get(name)) {
+                    debug_assert_eq!(path_var.binding_id, var.binding_id);
+                    provenance.merge(&path_var.closure_provenance);
+                } else {
+                    provenance.merge(&var.closure_provenance);
+                }
+            }
+            var.closure_provenance = provenance;
+            var.captured |= captured;
         }
     }
     base
@@ -5183,90 +8388,12 @@ fn stmt_stops_fallthrough(stmt: &Stmt) -> bool {
                 && block_stops_fallthrough(else_branch)
         }
         // `while (true) { ... }` with no `break` that exits it never falls through.
-        Stmt::While { condition, body, .. } => {
+        Stmt::While {
+            condition, body, ..
+        } => {
             matches!(&condition.kind, ExprKind::Literal(Literal::Bool(true)))
                 && !block_has_own_break(body)
         }
-        _ => false,
-    }
-}
-
-/// True when executing `body` can throw a recoverable error (a `fail` statement
-/// or a `?` on a Result) that would reach an enclosing `catch`. A `?`/`fail`
-/// inside a nested `try` that has its own `catch` is absorbed there; one inside a
-/// nested closure belongs to that closure, not here.
-fn block_can_throw(body: &[Stmt]) -> bool {
-    body.iter().any(stmt_can_throw)
-}
-
-fn stmt_can_throw(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Fail { .. } => true,
-        Stmt::VarDecl { value, .. } | Stmt::Assign { value, .. } => expr_can_throw(value),
-        Stmt::AssignTarget { value, .. } | Stmt::CompoundAssign { value, .. } => {
-            expr_can_throw(value)
-        }
-        Stmt::Expr { expr, .. } | Stmt::Print { value: expr, .. } | Stmt::Panic { value: expr, .. } => {
-            expr_can_throw(expr)
-        }
-        Stmt::Return { value, .. } => value.as_ref().is_some_and(expr_can_throw),
-        Stmt::DestructureAssign { values, .. } => values.iter().any(expr_can_throw),
-        Stmt::ObjectDestructureAssign { value, .. } => expr_can_throw(value),
-        Stmt::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            expr_can_throw(condition)
-                || block_can_throw(then_branch)
-                || block_can_throw(else_branch)
-        }
-        Stmt::While { condition, body, .. } => {
-            expr_can_throw(condition) || block_can_throw(body)
-        }
-        Stmt::For { iterable, body, .. } => expr_can_throw(iterable) || block_can_throw(body),
-        // A nested `try` absorbs its body's throws only when it has a catch; its
-        // catch and finally can still throw onward.
-        Stmt::Try {
-            body,
-            catch_name,
-            catch_body,
-            finally_body,
-            ..
-        } => {
-            (catch_name.is_none() && block_can_throw(body))
-                || block_can_throw(catch_body)
-                || block_can_throw(finally_body)
-        }
-        _ => false,
-    }
-}
-
-fn expr_can_throw(expr: &Expr) -> bool {
-    match &expr.kind {
-        ExprKind::TryUnwrap { .. } => true,
-        ExprKind::Unary { expr, .. } => expr_can_throw(expr),
-        ExprKind::Binary { left, right, .. } => expr_can_throw(left) || expr_can_throw(right),
-        ExprKind::Call { callee, args } => {
-            expr_can_throw(callee) || args.iter().any(expr_can_throw)
-        }
-        ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
-            expr_can_throw(target)
-        }
-        ExprKind::Index { target, index } => expr_can_throw(target) || expr_can_throw(index),
-        ExprKind::Array(values) => values.iter().any(expr_can_throw),
-        ExprKind::ObjectLiteral { fields } => fields.iter().any(|(_, v)| expr_can_throw(v)),
-        ExprKind::StructLiteral { fields, .. } => fields.iter().any(|(_, v)| expr_can_throw(v)),
-        ExprKind::Match { value, arms } => {
-            expr_can_throw(value)
-                || arms.iter().any(|arm| {
-                    expr_can_throw(&arm.value)
-                        || arm.guard.as_ref().is_some_and(expr_can_throw)
-                })
-        }
-        ExprKind::Await(inner) => expr_can_throw(inner),
-        // A closure body's `?` belongs to the closure, not to the enclosing try.
         _ => false,
     }
 }
@@ -5426,9 +8553,155 @@ fn http_client_type() -> Type {
     ]))
 }
 
-/// The config fields `http.server`/`http.service` accepts, kept in one place so the
-/// checker's unknown-field rejection stays aligned with the interpreter's
-/// `server_config_value` reader and the native backend's `ku_http_server_new_cfg`.
+const REDIS_CLIENT_CONFIG_FIELDS: [&str; 9] = [
+    "host",
+    "port",
+    "username",
+    "password",
+    "max_connections",
+    "max_waiters",
+    "connect_timeout_ms",
+    "acquire_timeout_ms",
+    "command_timeout_ms",
+];
+
+fn validate_redis_client_config(config_type: &Type, span: Span) -> KuResult<()> {
+    let Type::Object(fields) = config_type else {
+        // Dynamic configuration is validated again by the native constructor.
+        return Ok(());
+    };
+    let mut unknown = fields
+        .keys()
+        .filter(|key| !REDIS_CLIENT_CONFIG_FIELDS.contains(&key.as_str()))
+        .collect::<Vec<_>>();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(KuError::runtime(
+            format!("unknown redis client config field '{key}'"),
+            span,
+        ));
+    }
+    let Some(host) = fields.get("host") else {
+        return Err(KuError::runtime(
+            "redis.client config requires string field 'host'",
+            span,
+        ));
+    };
+    if *host != Type::String {
+        return Err(type_error(span, &Type::String, host));
+    }
+    for name in [
+        "port",
+        "max_connections",
+        "max_waiters",
+        "connect_timeout_ms",
+        "acquire_timeout_ms",
+        "command_timeout_ms",
+    ] {
+        if let Some(actual) = fields.get(name) {
+            if *actual != Type::Int {
+                return Err(KuError::runtime(
+                    format!("redis.client config field '{name}' must be int"),
+                    span,
+                ));
+            }
+        }
+    }
+    for name in ["username", "password"] {
+        if let Some(actual) = fields.get(name) {
+            if *actual != Type::String {
+                return Err(KuError::runtime(
+                    format!("redis.client config field '{name}' must be str"),
+                    span,
+                ));
+            }
+        }
+    }
+    if fields.contains_key("username") && !fields.contains_key("password") {
+        return Err(KuError::runtime(
+            "redis.client config field 'username' requires 'password'",
+            span,
+        ));
+    }
+    Ok(())
+}
+
+const MYSQL_CLIENT_CONFIG_FIELDS: [&str; 10] = [
+    "host",
+    "port",
+    "user",
+    "password",
+    "database",
+    "max_connections",
+    "max_waiters",
+    "connect_timeout_ms",
+    "acquire_timeout_ms",
+    "query_timeout_ms",
+];
+
+fn validate_mysql_client_config(config_type: &Type, span: Span) -> KuResult<()> {
+    let Type::Object(fields) = config_type else {
+        // Values flowing from a dynamic object are checked by the native
+        // constructor with the same field names and bounds.
+        return Ok(());
+    };
+    let mut unknown = fields
+        .keys()
+        .filter(|key| !MYSQL_CLIENT_CONFIG_FIELDS.contains(&key.as_str()))
+        .collect::<Vec<_>>();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(KuError::runtime(
+            format!("unknown mysql client config field '{key}'"),
+            span,
+        ));
+    }
+    for name in ["host", "user", "password", "database"] {
+        let Some(actual) = fields.get(name) else {
+            return Err(KuError::runtime(
+                format!("mysql.client config requires string field '{name}'"),
+                span,
+            ));
+        };
+        if *actual != Type::String {
+            return Err(KuError::runtime(
+                format!("mysql.client config field '{name}' must be str"),
+                span,
+            ));
+        }
+    }
+    for name in [
+        "port",
+        "max_connections",
+        "max_waiters",
+        "connect_timeout_ms",
+        "acquire_timeout_ms",
+        "query_timeout_ms",
+    ] {
+        if let Some(actual) = fields.get(name) {
+            if *actual != Type::Int {
+                return Err(KuError::runtime(
+                    format!("mysql.client config field '{name}' must be int"),
+                    span,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fixed HTTP config shapes. Dynamic objects are checked again by the runtime;
+/// these lists keep object-literal diagnostics aligned with those readers.
+const HTTP_CLIENT_CONFIG_FIELDS: [&str; 3] =
+    ["timeout_ms", "max_body_bytes", "max_idle_connections"];
+const HTTP_REQUEST_CONFIG_FIELDS: [&str; 6] = [
+    "method",
+    "url",
+    "headers",
+    "body",
+    "timeout_ms",
+    "max_body_bytes",
+];
 const HTTP_SERVICE_CONFIG_FIELDS: [&str; 10] = [
     "read_header_timeout_ms",
     "read_body_timeout_ms",
@@ -5442,16 +8715,16 @@ const HTTP_SERVICE_CONFIG_FIELDS: [&str; 10] = [
     "max_pending_requests",
 ];
 
-/// Reject an `http.server({...})` / `http.service({...})` config object literal that
-/// carries a field the server does not understand. Only statically-known object
-/// shapes are checked; `DynamicObject`/`Unknown` are passed through unchecked.
-fn validate_http_service_config_fields(config_type: &Type, span: Span) -> KuResult<()> {
+/// Reject a statically-known HTTP config field that the selected API does not
+/// understand. `DynamicObject`/`Unknown` are validated by the interpreter/native
+/// reader after their keys become available.
+fn validate_http_config_fields(config_type: &Type, allowed: &[&str], span: Span) -> KuResult<()> {
     let Type::Object(fields) = config_type else {
         return Ok(());
     };
     let mut unknown: Vec<&String> = fields
         .keys()
-        .filter(|key| !HTTP_SERVICE_CONFIG_FIELDS.contains(&key.as_str()))
+        .filter(|key| !allowed.contains(&key.as_str()))
         .collect();
     unknown.sort();
     if let Some(key) = unknown.first() {
@@ -5628,6 +8901,55 @@ fn expr_root_name(expr: &Expr) -> Option<&str> {
     }
 }
 
+/// Reject the directly visible strong-reference cycles that local RC cannot
+/// collect: assigning a closure (or a closure nested in an array/object value)
+/// back into the same captured binding. Named local functions have a dedicated
+/// self-recursion lowering that threads `__env` without capturing themselves, so
+/// the diagnostic points recursive code to that cycle-free form.
+fn reject_direct_closure_cycle(target: &str, value: &Expr, span: Span) -> KuResult<()> {
+    if expression_contains_closure_capturing(value, target) {
+        return Err(KuError::runtime(
+            format!(
+                "cannot store a closure that captures '{target}' back into '{target}': this would create a reference cycle; use a named local function for recursion"
+            ),
+            span,
+        ));
+    }
+    Ok(())
+}
+
+fn expression_contains_closure_capturing(expr: &Expr, target: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Function { params, body, .. } => {
+            crate::runtime::interpreter::closure_capture_names(params, body).contains(target)
+        }
+        ExprKind::TryUnwrap { expr } => expression_contains_closure_capturing(expr, target),
+        ExprKind::Array(values) => values
+            .iter()
+            .any(|value| expression_contains_closure_capturing(value, target)),
+        ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => fields
+            .iter()
+            .any(|(_, value)| expression_contains_closure_capturing(value, target)),
+        ExprKind::Match { arms, .. } => arms
+            .iter()
+            .any(|arm| expression_contains_closure_capturing(&arm.value, target)),
+        // Calls and projections do not structurally preserve their input. A
+        // closure passed to a function may be consumed and dropped before the
+        // returned value is assigned, so recursively rejecting call arguments
+        // would reject acyclic code. Alias-mediated cycles require a fuller
+        // ownership graph and are intentionally outside this direct containment.
+        ExprKind::Unary { .. }
+        | ExprKind::Binary { .. }
+        | ExprKind::Call { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::Field { .. }
+        | ExprKind::OptionalField { .. }
+        | ExprKind::Await(_)
+        | ExprKind::Variable(_)
+        | ExprKind::Literal(_) => false,
+    }
+}
+
 struct TemplateInterpolation {
     source: String,
     span: Span,
@@ -5730,5 +9052,61 @@ fn advance_position(mut position: crate::span::Position, text: &str) -> crate::s
 impl Default for Checker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_resource_detection_is_recursive_and_cycle_safe() {
+        let mut checker = Checker::new();
+        checker.structs.insert(
+            "Recursive".to_string(),
+            StructType {
+                fields: HashMap::from([(
+                    "next".to_string(),
+                    Type::Struct("Recursive".to_string()),
+                )]),
+            },
+        );
+        assert!(!checker.type_contains_native_resource(&Type::Struct("Recursive".into())));
+
+        checker
+            .structs
+            .get_mut("Recursive")
+            .expect("recursive layout")
+            .fields
+            .insert(
+                "connection".to_string(),
+                Type::Native(metadata::PG_RESULT.to_string()),
+            );
+        assert!(checker.type_contains_native_resource(&Type::Struct("Recursive".into())));
+
+        checker.enums.insert(
+            "RecursiveEnum".to_string(),
+            EnumType {
+                variants: HashMap::from([
+                    (
+                        "Next".to_string(),
+                        vec![Type::Enum("RecursiveEnum".to_string())],
+                    ),
+                    (
+                        "Connection".to_string(),
+                        vec![Type::Native(metadata::MYSQL_CLIENT.to_string())],
+                    ),
+                ]),
+            },
+        );
+        assert!(checker.type_contains_native_resource(&Type::Enum("RecursiveEnum".into())));
+
+        let nested = Type::Union(vec![
+            Type::Int,
+            Type::Result(Box::new(Type::Array(Box::new(Type::Native(
+                metadata::REDIS_CLIENT.to_string(),
+            ))))),
+        ]);
+        assert!(checker.type_contains_native_resource(&nested));
     }
 }

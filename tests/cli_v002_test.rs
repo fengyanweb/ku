@@ -1,7 +1,15 @@
+#[path = "support/bounded_process.rs"]
+pub mod bounded_process;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{env, fs, thread};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{env, fs};
+
+use bounded_process::{run_bounded, FailureKind, OutputLimits};
+
+const SHORT_PROCESS_OUTPUT_LIMITS: OutputLimits =
+    OutputLimits::new(4 * 1024 * 1024, 6 * 1024 * 1024);
 
 #[derive(Debug)]
 struct RunResult {
@@ -39,46 +47,22 @@ fn run_with_timeout(bin: &Path, args: &[&str], timeout: Duration) -> RunResult {
 }
 
 fn run_with_timeout_in(cwd: PathBuf, bin: &Path, args: &[&str], timeout: Duration) -> RunResult {
-    let mut child = Command::new(bin)
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn ku binary");
-
-    let started = Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .expect("failed to poll ku process")
-            .is_some()
-        {
-            let output = child
-                .wait_with_output()
-                .expect("failed to collect ku output");
-            return RunResult {
-                code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                timed_out: false,
-            };
-        }
-
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .expect("failed to collect timed-out ku output");
-            return RunResult {
-                code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                timed_out: true,
-            };
-        }
-
-        thread::sleep(Duration::from_millis(20));
+    let mut command = Command::new(bin);
+    command.args(args).current_dir(cwd);
+    match run_bounded(&mut command, timeout, SHORT_PROCESS_OUTPUT_LIMITS) {
+        Ok(output) => RunResult {
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            timed_out: false,
+        },
+        Err(error) if error.kind() == FailureKind::Timeout => RunResult {
+            code: None,
+            stdout: String::from_utf8_lossy(error.stdout()).into_owned(),
+            stderr: String::from_utf8_lossy(error.stderr()).into_owned(),
+            timed_out: true,
+        },
+        Err(error) => panic!("ku command did not complete safely: {error}"),
     }
 }
 

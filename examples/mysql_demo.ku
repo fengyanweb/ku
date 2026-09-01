@@ -9,26 +9,37 @@
 //   ku build --native examples/mysql_demo.ku -o mysql_demo.exe
 //   ./mysql_demo.exe
 //
-// 演示要点:连接、查询、参数化查询(mysql_real_escape_string 防注入)、读取结果、自动关闭。
+// 演示要点:统一 client、内部有界池、MYSQL_STMT 服务端参数绑定、读取结果和自动关闭。
 
 import mysql from "std.mysql"
 import "std.fs"
 
 fn main(): null! {
-    pw = fs.read("mysql.pw")
-    conn = mysql.connect("127.0.0.1", 3306, "root", pw, "mysql")?
+    pw = fs.read("mysql.pw")?
+    client = mysql.client({
+        host: "127.0.0.1",
+        port: 3306,
+        user: "root",
+        password: pw,
+        database: "mysql",
+        max_connections: 8,
+        max_waiters: 64,
+        connect_timeout_ms: 5000,
+        acquire_timeout_ms: 5000,
+        query_timeout_ms: 30000
+    })?
 
-    // 普通查询
-    res = mysql.query(conn, "SELECT VERSION(), DATABASE(), 1 + 1")?
-    println("version = " + mysql.value(res, 0, 0))
-    println("database = " + mysql.value(res, 0, 1))
-    println("calc = " + mysql.value(res, 0, 2))
+    // 所有 SQL 都走同一个 prepared 路径,无参数时传 []
+    res = client.query("SELECT VERSION(), DATABASE(), 1 + 1", [])?
+    println("version = " + res.value(0, 0)?)
+    println("database = " + res.value(0, 1)?)
+    println("calc = " + res.value(0, 2)?)
 
-    // 参数化查询:? 占位,值经转义,注入 payload 只会被当作纯文本
+    // 参数化查询:? 占位由 MYSQL_STMT 绑定,注入 payload 只会被当作纯文本
     payload = "x'; DROP TABLE users; --"
-    res2 = mysql.query_params(conn, "SELECT CONCAT('[', ?, ']')", [payload])?
-    println("echoed = " + mysql.value(res2, 0, 0))   // [x'; DROP TABLE users; --]
+    res2 = client.query("SELECT CONCAT('[', ?, ']')", [payload])?
+    println("echoed = " + res2.value(0, 0)?)   // [x'; DROP TABLE users; --]
 
-    mysql.close(conn)
+    client.close()
     return ok(null)
 }

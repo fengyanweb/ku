@@ -8,6 +8,8 @@ pub mod ir;
 pub mod lexer;
 pub mod package;
 pub mod parser;
+pub mod registry_admin;
+pub mod registry_server;
 pub mod runtime;
 pub mod span;
 pub mod stdlib;

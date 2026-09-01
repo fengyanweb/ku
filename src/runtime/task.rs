@@ -744,10 +744,21 @@ impl TaskRuntime {
 
     fn help_one(&self) -> KuResult<bool> {
         let job = {
-            let receiver =
-                self.inner.task_rx.lock().map_err(|_| {
-                    KuError::runtime("async task queue is poisoned", Span::default())
-                })?;
+            // An idle worker blocks in `recv()` while holding the single-consumer
+            // receiver lock. In that case it will wake for the queued job itself,
+            // so an awaiting worker must not block behind it. When every worker is
+            // busy (notably the one-worker nested-await case), the lock is free and
+            // this helper can execute one queued child to avoid starvation.
+            let receiver = match self.inner.task_rx.try_lock() {
+                Ok(receiver) => receiver,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(KuError::runtime(
+                        "async task queue is poisoned",
+                        Span::default(),
+                    ));
+                }
+            };
             match receiver.try_recv() {
                 Ok(job) => Some(job),
                 Err(TryRecvError::Empty) => None,
@@ -984,7 +995,7 @@ fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<T
             let Ok(receiver) = receiver.lock() else {
                 return;
             };
-            receiver.try_recv()
+            receiver.recv()
         };
         match job {
             Ok(job) => {
@@ -994,8 +1005,7 @@ fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<T
                 inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
                 execute_task_job(&inner, job)
             }
-            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(2)),
-            Err(TryRecvError::Disconnected) => return,
+            Err(_) => return,
         }
     }
 }
@@ -1088,7 +1098,7 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
             let Ok(receiver) = receiver.lock() else {
                 return;
             };
-            receiver.try_recv()
+            receiver.recv()
         };
         match job {
             Ok(job) => {
@@ -1124,8 +1134,7 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                 let _ = job.response.send(result);
                 inner.running_blocking_jobs.fetch_sub(1, Ordering::AcqRel);
             }
-            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(2)),
-            Err(TryRecvError::Disconnected) => return,
+            Err(_) => return,
         }
     }
 }
@@ -1235,6 +1244,23 @@ mod tests {
         assert_eq!(
             fields.get("code"),
             Some(&Value::String("already_awaited".to_string()))
+        );
+    }
+
+    #[test]
+    fn one_worker_nested_await_executes_the_queued_child() {
+        let runtime = TaskRuntime::with_limits(1, 4, 1, 1, 4);
+        let nested_runtime = runtime.clone();
+        let parent = runtime.spawn(move || {
+            let child = nested_runtime.spawn(|| Ok(Value::Int(7)));
+            child.await_timeout(Duration::from_secs(1))
+        });
+
+        assert_eq!(
+            parent
+                .await_timeout(Duration::from_secs(1))
+                .expect("one-worker nested await should not starve"),
+            Value::Int(7)
         );
     }
 

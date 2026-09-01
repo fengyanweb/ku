@@ -1,8 +1,10 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.16`，重点是补齐 native 标准库(str()/字符串方法/struct 复杂字段/模板字符串)并接入数据库驱动(PostgreSQL / Redis / MySQL,含连接池)。实验性语言，目前不可用于生产，欢迎围观讨论。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.16`，重点是补齐 native 标准库，并把 PostgreSQL / Redis / MySQL 收敛为统一、自动池化的数据库 client。Ku 仍处于实验阶段，0.0.x 会主动删除重复 API，目前不可用于生产。
 
-> **0.0.16 数据库驱动均为 native-only(`ku build --native`),解释器 `ku run` 暂不支持连库**:`std.pg`、`std.redis` 已对真实数据库端到端跑通并做 CRT 循环压测 0 泄漏;`std.mysql` 已对真实 MySQL(server 8.0.12)端到端验证 query/value 与 query_params 注入安全,目前只在这一个版本/平台验证过。详见 [0.0.16 版本记录](docs/v0.0.16.md)。
+> **0.0.16 数据库驱动均为 native-only（`ku build --native`），解释器 `ku run` 暂不支持连库。** 旧驱动底层曾分别通过 PostgreSQL / Redis / MySQL 实库验证；本次统一 client 与 MySQL `MYSQL_STMT` 路径必须以新的自动化和实库验收结果为准，不能沿用旧结果冒充新 API 已验证。详见 [0.0.16 版本记录](docs/v0.0.16.md)。
+
+第一层协议的真实完成度、生产部署边界和通用 TLS 落地顺序见 [协议地基状态](docs/protocol-foundation.md)。
 
 ## 快速开始
 
@@ -43,10 +45,10 @@ ku init               Initialize the current directory as a Ku project
 ku init --template <template>
                       Initialize the current directory from a template
 ku template list      List built-in project templates
-ku run                Run the nearest ku.mod package entry
-ku run <file.ku>      Run a Ku source file
-ku check              Check the nearest ku.mod package entry
-ku check <file.ku>    Check a Ku source file without running
+ku run [--locked|--offline] [file.ku]
+                      Run a package entry or Ku source file
+ku check [--locked|--offline] [file.ku]
+                      Check a package entry or Ku source file without running
 ku check --deny-unused [file.ku]
                       Treat unused local bindings as errors
 ku check --json       Check nearest ku.mod package and emit JSON Lines diagnostics
@@ -65,12 +67,22 @@ ku build --emit-c [file.ku]
                       Also emit prototype native C under .ku/build
 ku build --emit-ir [file.ku]
                       Also emit checked Ku IR under .ku/build
-ku build --backend c [file.ku]
-                      Build the native C prototype with a C compiler
-ku build --native <file.ku>
-                      Compatibility form: emit prototype native C source beside file
-ku package gc <file.ku>
+ku build --backend c [--target <target>] [file.ku]
+                      Build one native binary for host, x86_64-linux,
+                      x86_64-windows, or aarch64-darwin
+ku build --native [--locked|--offline] <file.ku>
+                      Without -o, emit native C beside the source; with -o,
+                      compile and link the native binary
+ku package gc [path]
                       Remove unused package cache entries for a package
+ku package pack [path]
+                      Create a deterministic source package artifact
+ku package publish [path]
+                      Publish through the configured HTTPS registry
+ku package yank [path]
+                      Withdraw one version without deleting its immutable artifact
+ku package resolve [path] [--locked|--offline]
+                      Resolve and cache the complete dependency graph
 ku version            Print version
 ku -h | -help         Print help
 ```
@@ -154,7 +166,7 @@ Ku 不使用 `let` / `let mut`。首次赋值即声明变量，带类型写作 `
 **native 标准库补齐**(以下均已对齐解释器 + 通过 CRT/ASan 验证):
 
 - `str()`:整数/布尔/字符串/null 转字符串。
-- 字符串方法 6/9:`len`(Unicode 码点)/`contains`/`starts_with`/`ends_with`/`replace`/`slice`;`trim`/`lower`/`upper` 因需 Unicode 表暂以明确错误提示,不静默偏离。
+- 字符串方法 7/10:`len`(Unicode 码点)/`chars`(按 Unicode 标量拆分)/`contains`/`starts_with`/`ends_with`/`replace`/`slice`;`trim`/`lower`/`upper` 因需 Unicode 表暂以明确错误提示,不静默偏离。
 - struct 复杂字段:`[int]`/`[str]` 基本数组、`[Person]` 结构体数组、`[[int]]` 嵌套数组、`enum` 字段。
 - 模板字符串 `` `Hello {name}` `` 在 native 下正确插值。
 - 修复非 ASCII/非打印字符字面量在 native 下的错误转义。
@@ -164,17 +176,31 @@ Ku 不使用 `let` / `let mut`。首次赋值即声明变量，带类型写作 `
 ```ku
 import pg from "std.pg"
 fn main(): null! {
-    conn = pg.connect("host=... dbname=... user=... password=...")?
-    res = pg.query_params(conn, "SELECT name FROM users WHERE id = $1", ["42"])?
-    println(pg.value(res, 0, 0))
-    pg.close(conn)
+    client = pg.client({
+        conninfo: "host=... dbname=... user=... password=...",
+        max_connections: 8,
+        max_waiters: 64,
+        connect_timeout_ms: 5000,
+        acquire_timeout_ms: 5000,
+        query_timeout_ms: 30000
+    })?
+    res = client.query("SELECT name FROM users WHERE id = $1", ["42"])?
+    println(res.value(0, 0)?)
+    client.close()
     return ok(null)
 }
 ```
 
-- **std.pg**(libpq):connect/query/参数化 query_params(防注入)/结果读取/close + 有界阻塞连接池 pool/pool_query/pool_query_params/pool_close。**已对真实 PostgreSQL 端到端验证 + CRT 0 泄漏**。
-- **std.redis**(自实现 RESP-over-Winsock,零外部依赖):connect/auth/get/set/del/close。**已对真实 Redis 端到端验证 + CRT 0 泄漏**。
-- **std.mysql**(libmysqlclient):API 与 pg 对齐,query_params 用 `mysql_real_escape_string` 防注入。**已对真实 MySQL(server 8.0.12)端到端验证 query/rows/cols/value 与 query_params 注入安全,单连接 500 次查询循环干净完成**(目前只在这一个版本/平台验证过)。
+- **统一写法**：三个驱动都只公开 `module.client(config)?`，client 内部自动维护有界连接池；业务代码只调用 receiver 方法。连接数和等待者数有硬上限，所有操作共享绝对预算；同步 DNS、libpq/SSL 内部调用和 libmysqlclient FFI 不能被 portable C 硬抢占，只能在返回后复核 deadline 并淘汰过期连接。0.0.x 直接删除旧 raw connection、手动 pool 和模块级 query 入口，不提供兼容别名。
+- **std.pg**（libpq 9.2+）：`client.query(sql, params)` 始终走服务端参数绑定，无参数也传 `[]`；`result.rows()` / `cols()` / `value()` / `is_null()` 读取与连接脱钩的 owned 结果。内部复用 nonblocking poll、单行增量聚合、严格 UTF-8/NULL/边界与 64 MiB 文本上限；每次归还前在原 query deadline 内执行 `DISCARD ALL`，非 IDLE、reset 失败、超时或协议失步只淘汰对应连接，不自动重放 SQL。
+- **std.redis**（自实现 RESP2-over-socket，零外部依赖）：client 配置中的用户名/密码会应用到每条懒创建连接；提供 `ping/get/set/exists/del`。`get` 只有一种严格语义：缺键返回 `redis/key_not_found`，不再把缺键折叠为空串。坏帧或 I/O 超时只淘汰对应连接；AUTH 拒绝与 transport/OOM/timeout 保持不同错误，服务端文本不直接进入诊断。
+- **std.mysql**（libmysqlclient）：`client.query(sql, params)` 和 `client.execute(sql, params)` 都使用真正的 `MYSQL_STMT` 参数绑定，不再做 escape 后的 SQL 拼接；结果复制到 Ku owned、有上限的表后再归还连接。statement 清理后调用 `mysql_reset_connection()` 清除事务、临时表、锁和 session 变量，清理/reset 失败即淘汰单槽；自动 reconnect 与 `LOCAL INFILE` 都显式关闭。当前不支持 SQL NULL 输入参数和任意 binary 列。
+
+SQL 错误有一条必须遵守的重试边界：语句发送前的配置、连接和借用失败保留各自错误；语句发送后无法确认终态返回 `execution_unknown`，已收到成功终态但本地结果无法交付返回 `execution_completed_without_result`。这两个错误都表示不能自动重试，否则 INSERT/UPDATE 可能重复执行。驱动自身从不重放 SQL。各结果上限是单次结果的防护，不是进程总内存硬上限；并发持有多个 detached result 时仍应使用进程级资源限制。
+
+Redis 当前是明文 TCP，MySQL 当前也没有跨 Oracle/MariaDB 一致、fail-closed 的证书和主机名验证配置；二者只能直连 loopback/受控私网或已验证的 TLS tunnel。PostgreSQL 远程连接必须在 conninfo 中显式使用 `sslmode=verify-full` 和可信 `sslrootcert`。
+
+client 的 `close()` 消费 Ku owned 句柄并立即拒绝新借用；已有借用由最后一个归还者完成延迟销毁，不用无界等待来“关池”。该保证以 Ku checker/closure 生命周期为边界；当前生成的数据库 helper 是 translation-unit 内部实现，不是第三方 C ABI，外部 C 调用方不能绕过所有权和 MySQL thread attach 规则并发 close/use 裸指针。
 
 **稳定与安全**:路径级所有权 checker(部分 move 分析)作为第一道防线;对抗式审计发现并修复了循环内 `catch` 错误绑定、`?` 借用解包、`array.push` 字面量的内存泄漏。
 
@@ -200,7 +226,7 @@ fn main() {
 }
 ```
 
-有 `ku.mod` 时可以固定本地 package import root，也可以声明 `file://` 依赖：
+有 `ku.mod` 时可以固定 package import root。推荐且唯一的依赖声明是：本地开发覆盖写绝对 `file://` URL；第三方 registry 依赖省略 `source`，并由项目固定 HTTPS origin 与 Ed25519 公钥：
 
 ```txt
 name = "demo_pkg"
@@ -210,16 +236,26 @@ cache = ".ku/cache"
 
 dep.util = "1.0.0"
 dep.util.source = "file://C:/work/util"
-dep.util.checksum = "ku-fnv64-..."
+
+registry.url = "https://packages.example/v1/"
+registry.public_key = "ed25519-<64 hex digits>"
+dep.math = "^1.2.0"
 ```
 
 ```ku
-import { Value } from "util"
 import { Value } from "@util/util"
 ```
 
-`ku check` / `ku run` 会把 file dependency 放进 `<package>/.ku/cache/packages/<name>/<version>/`，并把 package dependency 写进 `ku.lock`。`ku package gc <file.ku>` 会清理 manifest 当前依赖之外的缓存版本。
-`dep.<name>.checksum` 必须是 `ku-fnv64-` 加 16 位十六进制；未写 checksum 的 file dependency 会在 source 内容变化后刷新 cache。
+包内 root import 使用 `"util"`，相对 import 使用 `"./util.ku"`，跨包 import 只使用 `"@<包名>/<路径>"`；不提供另一套 package import 别名。
+
+`ku check` / `ku run` / `ku build` 共用同一个 resolver，并且都直接接受一个可选的 `--locked` 或 `--offline`；两个选项不能同时或重复出现。默认模式可求解并原子更新 `ku.lock`；`--locked` 只接受 lock 固定图且不改写 lock，缺少 registry cache 时仍可按 lock 的 exact HTTPS URL/checksum 下载；`--offline` 进一步禁止 registry 网络和 `file://` source 回读，只使用已校验 cache，也不改写 lock。file dependency 使用实际版本与快照 checksum，放进 `<package>/.ku/cache/packages/<name>/<name>-<version>-fnv64-<digest>/`；registry package 使用精确版本与 SHA-256 的内容寻址目录。refresh 只安装新的 immutable cache root，不覆盖或顺手删除旧 root；`ku package gc .` 才会清理当前 lock/manifest 之外的缓存和过期 staging。
+file dependency 的常规写法只需要版本和绝对 `file://` source；resolver 会计算 `ku-fnv64-` 快照 checksum 并写入 lock。只有需要在 manifest 额外固定本地快照时才写 `dep.<name>.checksum`。运行快照只包含根 `ku.mod`（bare package 可无）和 `src/`，并递归排除 VCS、`.ku`、`target`、`node_modules`、`ku.lock`、`.env` 与 `.env.*`；未显式固定 checksum 时，快照变化会生成新的内容寻址 cache。
+
+第三方作者使用 `ku package pack .` 生成确定性 `.tar.zst`；由交互输入或 CI secret store 设置 `KU_REGISTRY_TOKEN` 后运行 `ku package publish .`，不要把 token 字面量写进命令。问题版本只用 `ku package yank .` 单向撤回：签名 index 不再展示它，但不可变 artifact 和已有 lock 仍保留，不提供 delete/unyank。`ku package resolve .` 刷新兼容版本；消费者用 `--locked` 或 `--offline` 做可重复/无网络验收。协议见 [Registry API v1](docs/registry-api.md)。
+
+仓库已提供可自行部署的有界参考服务 `ku-registry`，并用真实 TLS listener 验证作者 publish、消费者 resolve/check/run/native、locked/offline、ACL、幂等、冲突、并发竞争和重启恢复。它不是官方托管 registry，也没有生产吞吐量或“超级高并发”基准结论。联网解析、相关锁等待、分块校验和重试共享一个 300 秒绝对预算；单次内核文件 I/O 与同步 DNS 不能硬取消，但返回后会再次检查且超时后不会开始 cache quarantine/安装。依赖图最多 256 个包、求解最多 20000 步，同一 package cache 根的全进程全局下载槽固定为 8 个。artifact 只接受稳定、无 query 的 HTTPS `.tar.zst` URL；签名不匹配时 index 与 `.sig` 最多重新配对获取 3 次。部署配置和掉电持久性边界见 [Registry API v1](docs/registry-api.md)。
+
+自托管 registry 的作者凭据只用离线运维命令：`ku-registry token issue <exact-package-name>` 生成 32-byte OS 随机 token、只保存 SHA-256 并把明文向 stdout 输出一次；撤销时把旧 token 放入 `KU_REGISTRY_TOKEN`，执行 `ku-registry token revoke <exact-package-name>`，不接受 token 命令行参数。凭据修改采用跨进程锁与同目录原子替换；运行中的服务不会热加载，修改后必须重启。它不是注册/登录、团队、包名认领或官方托管身份系统，完整边界见 [Registry API v1](docs/registry-api.md#启动自托管服务)。
 
 ## 示例
 
@@ -280,7 +316,7 @@ http_pg_frontend.html # http_pg 的前端页面
 - [0.0.9 版本记录](docs/v0.0.9.md)
 - [0.0.8 版本记录](docs/v0.0.8.md)
 - [0.0.7 版本记录](docs/v0.0.7.md)
-- [Package 草案](docs/package.md)
+- [Package 管理与 registry 客户端](docs/package.md)
 - [IR 草案](docs/ir.md)
 - [版本和解释器历史](docs/history.md)
 - [待决策问题与路线草案](docs/roadmap-decisions.md)
@@ -291,11 +327,15 @@ http_pg_frontend.html # http_pg 的前端页面
 
 ## 当前边界
 
-`ku build` 当前生成解释器打包型可执行文件。单文件默认输出到源文件旁的 `.ku/build/<profile>/<name>`；有 `ku.mod` 时可以直接 `ku build` 或 `ku build .`，入口来自 `root + main`，默认 `src/main.ku`，输出目录来自 `out`，默认 `.ku/build`。支持 `-o` 指定输出、`--debug` / `--release` / `--profile debug|release|small|fast`、`--target` 目标目录分层、`--emit-ir`、`--emit-c`、`--emit-llvm` 和 `--backend c` 原型。`ku run build` 保留兼容，但会提示改用 `ku build`。
+`ku build` 当前生成解释器打包型可执行文件。单文件默认输出到源文件旁的 `.ku/build/<profile>/<name>`；有 `ku.mod` 时可以直接 `ku build` 或 `ku build .`，入口来自 `root + main`，默认 `src/main.ku`，输出目录来自 `out`，默认 `.ku/build`。支持 `-o` 指定输出、`--debug` / `--release` / `--profile debug|release|small|fast`、`--target` 目标目录分层、`--emit-ir`、`--emit-c`、`--emit-llvm` 和 `--backend c`。
 
-注意：0.0.15 的默认 build 是“解释器打包型二进制”，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于最终 native ABI。带 import 的程序仍应保持源码依赖路径可访问。完整 native binary 目标仍在执行队列：native closure、正式 `KuString`、dynamic object、async state machine runtime、增量缓存和真正不依赖源码的 import graph 打包。
+跨系统 native 发布只有一种构建方式：从同一份源码分别执行 `ku build --backend c --release --target x86_64-windows .`、`ku build --backend c --release --target x86_64-linux .`、`ku build --backend c --release --target aarch64-darwin .`，得到三个独立产物；不存在同时兼容三个系统的“万能二进制”。默认输出分别位于 `.ku/build/<target>/release/`，只有 Windows target 自动加 `.exe`。IR/C/LLVM 中间产物统一位于 `.ku/build/[<target>/]<profile>/{ir,c,llvm}/<binary-stem>.<ext>`；Windows 的 `app.exe` 对应 `app.ir`、`app.c`、`app.ll`。显式 `-o` 时三类目录都会增加完整输出路径的 SHA-256 层，即 `{ir,c,llvm}/<output-path-sha256>/<binary-stem>.<ext>`。这样同目录多入口、不同目录同名输出都不共享中间产物，也不会覆盖用户输出目录里的 `.c` 文件。缺 compiler、sysroot 或目标库时链接明确失败并保留 C artifact，不会降级生成 host 二进制。显式 target 的链接结果还会检查完整的 PE32+ x86_64、Linux ELF x86_64 或 macOS Mach-O arm64 头、表和可加载段，不匹配不会安装到最终路径。链接使用同目录的唯一 `.ku-link-*` 临时文件；每次最多扫描 256 个目录项、删除 16 个超过 24 小时的严格匹配普通文件，不会删除目录、符号链接或近期活动文件。`KU_CC` 可指定 `zig cc`、Clang，或已经配置好目标的交叉 compiler；普通 host `cc/gcc` 不会被当作自动支持 `--target`。
 
-`ku build --native` 可用 MSVC 直接编译成独立二进制,覆盖 `int` / `bool` / `str`(正式 `KuString` owned ABI,支持拼接与 `str()`/`len`/`contains`/`slice` 等方法)、struct(含数组/嵌套/enum 字段)、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包(env 引用计数)、native HTTP 服务、以及数据库驱动(std.pg/redis/mysql)。array/named/Result/struct/闭包均按默认 move、显式 `clone()`、自动 drop 生成所有权代码,并由 checker 做路径级 move 分析。仍明确报不支持的:动态 object 的部分复杂场景、async native lowering、str 的 `trim`/`lower`/`upper`(需 Unicode 表)。
+注意：不带 `--native` 的默认 build 仍是解释器打包型二进制，会把入口源码嵌入 Rust wrapper；它用于稳定生成可运行 exe，不等价于 native ABI，带 import 的程序仍应保持源码依赖路径可访问。`ku build --native` 已通过本地 import graph 展开生成不依赖源码目录的 C/二进制，并已具备正式 `KuString`、array、dynamic object、Result/Error、closure/函数值以及 fs/json/time native ABI；剩余边界见下段，不再把这些已完成项列入待办。
+
+`ku build --native <file.ku>` 不带 `-o` 时保留旧的单文件兼容模式，只在源码旁写出 `.c`，不执行链接；`ku build --native -o <path> <file.ku>` 则进入与 `--backend c` 相同的生成、编译、链接和产物校验流程。普通跨系统发布使用上面的 `--backend c --target` 命令，避免把“只生成 C”误认为已经得到目标二进制。
+
+native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制，覆盖 `int` / `bool` / `str`（正式 `KuString` owned ABI，支持拼接与 `str()`/`len`/`chars`/`contains`/`slice` 等方法）、struct（含数组/嵌套/enum 字段）、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包（env 引用计数）、native HTTP 服务以及数据库驱动（std.pg/redis/mysql）。array/named/Result/struct/闭包均按默认 move、显式 `clone()`、自动 drop 生成所有权代码，并由 checker 做路径级 move 分析。核心同步 ABI 与 `std.fs/std.json/std.time` 的 C 路径面向 Windows/Linux/macOS；native HTTP 与 Redis 也已有 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支，其中 Windows 已本地验证，Linux/macOS 仍待对应真机 CI 首次跑绿。`std.mysql` 尚无跨 target 自动链接约定，`std.pg` 跨 target 需要匹配目标的 shared libpq/sysroot。仍明确报不支持的：动态 object 的部分复杂场景、async native lowering、str 的 `trim`/`lower`/`upper`（需 Unicode 表）。
 
 已完成到 0.0.15 的关键前置：
 
@@ -316,14 +356,13 @@ http_pg_frontend.html # http_pg 的前端页面
 运行时闭包使用精确 capture map，不再把整个 Env 存进函数值。
 IR 已有 ResultBranch / BindOk / JumpErr / PropagateErr。
 native C 后端已有统一 Error 对象 ABI、复杂 Result payload 和 try/catch/finally。
-package 已有 ku.mod、file:// dependency、checksum、ku.lock 和 cache GC。
-registry 执行层已有 HTTPS-only 下载、SHA-256、内容寻址 cache、有界安装锁和 Ed25519 detached signature verifier；根公钥/轮换/吊销/归档决策前 CLI 保持 fail-closed，未配置 dependency source 时不会读取旧 cache 绕过信任。
+package 已有 ku.mod、绝对 file:// 开发覆盖、确定性 pack、HTTPS publish/resolve、签名 index、传递依赖、有界回溯、portable registry ku.lock、完整性校验和 cache GC；绝对 file source 是显式的本地覆盖例外。registry 公钥由项目显式 pin；未配置 trust、签名不符、lock/cache 缺失或内容篡改都会 fail-closed。仓库提供 `ku-registry` 自托管有界参考实现并有真实 TLS 闭环测试；它不等于官方托管服务，也不据此声明生产并发能力。
 async runtime 已有 blocking shutdown drain、累计指标和内部百万并发需求压力测试；开发者侧提供 HTTP 千万请求压测 demo。
 仓库根目录的 `test.ku` 和 `run-test.ps1` 是 runtime 内部诊断入口，前者通过 `std.task` 打印百万并发需求测试的前后时间与 runtime 指标，后者额外采集进程 CPU、峰值内存和线程数。普通开发者示例使用 `examples/http_capacity_10m.ku`：业务代码只写 HTTP handler 和返回值，不直接管理 task；压测由 `examples/http_bench.ps1` 发起。
-`std.time` 已按第一版文档实现 Time/Date/Duration object、format/parse/date/datetime/duration/add/sub/diff/compare/parts/weekday/is_leap/days_in_month/sleep 和固定偏移 zone。
+`std.time` 的 `time.now()` 返回 Unix epoch 毫秒整数，`time.steady_millis()` 提供进程内单调毫秒；Time object 由 `time.instant()` 创建，`time.elapsed(previous)` 计算到当前的毫秒差。日期、格式化、解析、时间段和固定偏移 zone API 继续使用 Time/Date/Duration object。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
 match 支持嵌套 enum payload 模式、绑定、字面量和 `_` 的递归检查。
-标准库可以用 `import { fs, http, time } from "std"` 一次导入多个模块。std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.html/http.json/http.empty/http.redirect/http.status/http.statusText/http.service()/http.server() 配置与响应 helper。`http.text/html/json(body)` 默认 200，`http.text/html/json(status, body)` 显式协议状态码，`http.empty()` 默认 204，`http.redirect(location)` 默认 302；业务 `body.code/msg/data` 由开发者自己维护。必须用 `app = http.service()` 创建 HTTP service；旧的 `http.service` 属性式写法不再兼容。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes，路径参数使用 `{id}`，`del` 对应 HTTP `DELETE`，不提供 `delete` 别名。handler 支持顶层函数名、`fn(){...}` 和 `fn(req){...}`；普通 handler 不读请求时写 `fn()`，读取请求时写 `fn(req)`，`_req` 只保留给适配器/测试 mock 等签名必须带参数但暂时不用它的场景；不允许第二个 `res/writer` 参数，也不允许 `res.write/res.end/reply.send/writer.write` 这类副作用式响应 API。handler 返回 `{ status, headers, body }` 或 `{ status, headers, body }!`，常规写法直接 `return http.text/json/html/empty/redirect(...)`。bind/listen 只接收 address，配置来自 service/server 对象，会先真实绑定端口并编译运行时路由表，listen/run 会阻塞处理基础 HTTP 请求，listener.close 可显式关闭未运行的 listener。fs 需要 `import "std.fs"` 或 `import { fs } from "std"` 后使用，并提供 read/write 与 try_read/try_write。std.config 需要显式导入后使用，并提供 env/env_file/yaml 第一版配置读取。VS Code formatter 已支持 4 空格缩进、空行压缩、运算符/逗号空格、`++/--`、复合赋值和 `} else/catch/finally` 合并。
+标准库可以用 `import { fs, http, time } from "std"` 一次导入多个模块。std.http 必须显式 import，当前提供 http.get/post/request，返回 `{ status, headers, body }` Response 对象；默认 client 复用连接，并提供 http.client/http.text/http.html/http.json/http.empty/http.redirect/http.status/http.statusText/http.service()/http.server() 配置与响应 helper。`http.text/html/json(body)` 默认 200，`http.text/html/json(status, body)` 显式协议状态码，`http.empty()` 默认 204，`http.redirect(location)` 默认 302；业务 `body.code/msg/data` 由开发者自己维护。必须用 `app = http.service()` 创建 HTTP service；旧的 `http.service` 属性式写法不再兼容。service.get/post/put/del(path, handler) 已支持注册路由并写入 service.routes，路径参数使用 `{id}`，`del` 对应 HTTP `DELETE`，不提供 `delete` 别名。handler 支持顶层函数名、`fn(){...}` 和 `fn(req){...}`；普通 handler 不读请求时写 `fn()`，读取请求时写 `fn(req)`，`_req` 只保留给适配器/测试 mock 等签名必须带参数但暂时不用它的场景；不允许第二个 `res/writer` 参数，也不允许 `res.write/res.end/reply.send/writer.write` 这类副作用式响应 API。handler 返回 `{ status, headers, body }` 或 `{ status, headers, body }!`，常规写法直接 `return http.text/json/html/empty/redirect(...)`。bind/listen 只接收 address，配置来自 service/server 对象，会先真实绑定端口并编译运行时路由表。解释器支持 `bind`、`listener.run` 与 `listener.close`；native C 三平台分支只支持会消费 service 句柄的阻塞式 `listen`，native 编译 `bind` 会提前报错。fs 需要 `import "std.fs"` 或 `import { fs } from "std"` 后使用，`read/write` 返回 Result，`try_read/try_write` 是同类型兼容别名。`json.parse` 返回 `KuValue!`，`json.stringify` 返回 `str!`。std.config 需要显式导入后使用，并提供 env/env_file/yaml 第一版配置读取。VS Code formatter 已支持 4 空格缩进、空行压缩、运算符/逗号空格、`++/--`、复合赋值和 `} else/catch/finally` 合并。
 工具链新增 `ku create <name> --template <template>`、`ku init --template <template>` 和 `ku template list`；内置 basic/cli/http/json/fs/lib 模板。项目目录名允许大小写字母、数字、`_`、`-`，但 `ku.mod` 的 package `name` 仍保持小写。`ku run` / `ku check` 无参数时读取当前 `ku.mod` 的入口，带 `.ku` 文件路径时仍运行/检查指定文件。
 
 `print(value)` 不自动换行；需要逐行输出时使用 `println(value)`。
@@ -338,7 +377,7 @@ native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wr
 async fn 调用会立即启动一次性 task 句柄，必须显式返回 T!；await task? 等价于 (await task)?，并且 await 会消费 task，普通 task 只能 await 一次。
 Ku 不提供 task.spawn、Task.new、runtime.schedule 或 thread.spawn；HTTP server 内部可以使用 task，但 handler 用户不需要手动管理。
 async runtime 默认最多 1024 个 task；blocking worker 为 min(32, max(4, CPU 核心数))，blocking queue 最多 1024，超限返回结构化 task Err。
-registry resolver 支持精确版本和 caret 范围、最高兼容版本选择和冲突诊断；HTTPS-only 获取、SHA-256、Ed25519 index verifier、内容寻址 cache 和安装锁已实现，根公钥配置、key rotation/revocation、归档格式、受限解包和 CLI 远程 import 串联前仍保持 fail-closed。
+registry resolver 支持 exact/caret、签名传递依赖元数据和有界回溯；`check/run/build/package resolve` 已统一接入 HTTPS-only 获取、Ed25519 验签、SHA-256、受限 `.tar.zst`、内容树校验、内容寻址 cache 和单飞安装租约。联网解析、锁等待、重试与分块校验共用 300 秒绝对预算（同步 DNS/已进入内核的文件操作不能硬取消），依赖图上限 256、求解上限 20000 步；同一 package cache 根跨进程共享 8 个下载槽，index 与 `.sig` 最多获取 3 个完整配对。
 LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 标准库 root import 允许小写导出，例如 `import { task, time } from "std"`；用户自定义文件的顶层 `fn/struct/enum` 仍必须首字母大写才对外导出。import/export 诊断会给出位置、问题描述和修改方向。
 `std.time` 会拒绝超出 chrono 支持范围的毫秒值，不再静默回退到当前时间。
@@ -349,11 +388,11 @@ LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 
 ```txt
 LLVM array/enum、闭包和高级控制流 lowering
-registry 根公钥配置、key rotation/revocation、归档格式、受限解包和 CLI 远程 import 串联
+registry v2 自动 signed-roots、在线 key 吊销和透明轮换（v1 使用项目显式公钥 pin）
 完整 match guard 模式矩阵和跨 guard 的穷尽性证明
 native C 动态 object 的部分复杂场景、str 的 trim/lower/upper(需 Unicode 表)
 native async ABI
-数据库驱动的解释器(`ku run`)支持;std.mysql 成功查询路径的实测;连接池扩展到 redis/mysql
+数据库驱动的解释器(`ku run`)支持；Redis/MySQL 新 client 的真实服务与三系统实测；Redis/MySQL 可强制证书与主机名验证的 TLS 配置
 ```
 
 ## VS Code 插件

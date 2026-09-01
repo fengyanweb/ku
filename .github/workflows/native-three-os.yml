@@ -1,0 +1,157 @@
+name: Native three-OS gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-three-os-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Rust format, check and clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain and lint components
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+          rustup component add rustfmt clippy --toolchain 1.89.0
+          rustc --version --verbose
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check every Cargo target
+        run: cargo check --locked --all-targets
+
+      - name: Reject clippy warnings in every Cargo target
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Install VS Code extension dependencies from lockfile
+        working-directory: editors/vscode-ku
+        run: npm ci
+
+      - name: Test VS Code extension models and formatter
+        working-directory: editors/vscode-ku
+        run: npm test
+
+  full-tests:
+    name: ${{ matrix.os }} unfiltered test suite
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2025
+          - ubuntu-24.04
+          - macos-15
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+          rustc --version --verbose
+
+      - name: Build Ku CLI
+        run: cargo build --locked --release --bin ku
+
+      - name: Run every default test target without stopping at the first failure
+        run: >-
+          cargo test --locked --release --no-fail-fast
+          -- --nocapture --test-threads=2
+
+  native:
+    name: ${{ matrix.target }} native build and run
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-windows
+            ku_binary: target/release/ku.exe
+            python: python
+            artifact: native_ci-x86_64-windows.exe
+          - os: ubuntu-24.04
+            target: x86_64-linux
+            ku_binary: target/release/ku
+            python: python3
+            artifact: native_ci-x86_64-linux.tar
+          - os: macos-15
+            target: aarch64-darwin
+            ku_binary: target/release/ku
+            python: python3
+            artifact: native_ci-aarch64-darwin.tar
+    env:
+      CARGO_INCREMENTAL: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+          rustc --version --verbose
+
+      - name: Build Ku CLI
+        run: cargo build --locked --release --bin ku
+
+      - name: Test bounded native verification harness
+        run: ${{ matrix.python }} -B .github/scripts/test-verify-native-three-os.py
+
+      - name: Test isolated PostgreSQL fixture safety
+        run: ${{ matrix.python }} -B .github/scripts/test-pg-loopback-fixture.py
+
+      - name: Build and run target-native fixture
+        run: >-
+          ${{ matrix.python }} .github/scripts/verify-native-three-os.py
+          --ku "${{ matrix.ku_binary }}"
+          --target "${{ matrix.target }}"
+          --artifact-dir "${{ runner.temp }}/ku-native-${{ matrix.target }}"
+
+      - name: Upload verified portable native file
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ runner.temp }}/ku-native-${{ matrix.target }}/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7
+          archive: false

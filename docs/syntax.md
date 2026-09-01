@@ -586,7 +586,7 @@ fn main() {
 }
 ```
 
-函数类型只描述参数类型、返回类型和 async 标志，不包含参数名、函数体或捕获环境。当前 checker 保持严格：赋给显式函数类型的箭头函数 / 匿名函数需要自己写清参数和返回类型，例如 `f: fn(int): int = (x: int): int => x + 1`。`f: fn(int): int = (x) => x + 1` 暂不做上下文类型推导。
+函数类型只描述参数类型、返回类型和 async 标志，不包含参数名、函数体或捕获环境。同步函数类型上下文可以补齐省略的参数类型，例如 `f: fn(int): int = (x) => x + 1`；高阶函数参数和 `array.map` 也会提供上下文。省略的返回类型由函数体推导并与上下文校验；没有可用上下文时仍需参数类型注解，参数数量或显式类型冲突仍会报错。
 
 ### 6.4 闭包捕获
 
@@ -596,7 +596,7 @@ fn main() {
 fn main() {
     prefix = "Hello "
 
-    greet = (name) => {
+    greet = (name: str) => {
         return prefix + name
     }
 
@@ -1332,13 +1332,13 @@ import "std.fs"
 ```
 
 ```txt
-fs.read(path:str): str
+fs.read(path:str): str!
 fs.try_read(path:str): str!
-fs.write(path:str, text:str): null
+fs.write(path:str, text:str): null!
 fs.try_write(path:str, text:str): null!
 ```
 
-`fs.read` / `fs.write` 失败会产生不可恢复运行时错误。`fs.try_read` / `fs.try_write` 在文件不存在、读取或写入失败时返回 Result。
+`fs.read` / `fs.write` 在文件不存在、读取或写入失败时返回 Result。`fs.try_read` / `fs.try_write` 是保留的同类型兼容别名。
 
 相对路径按当前 `.ku` 文件所在目录解析。
 
@@ -1355,6 +1355,8 @@ parser.parse(input:str | [str]): str
 
 ```txt
 string.len(text:str): int
+string.byte_len(text:str): int
+string.chars(text:str): [str]
 string.contains(text:str, needle:str): bool
 string.starts_with(text:str, prefix:str): bool
 string.ends_with(text:str, suffix:str): bool
@@ -1365,7 +1367,7 @@ string.replace(text:str, from:str, to:str): str
 string.slice(text:str, start:int, end:int): str!
 ```
 
-`string.slice` 按字符下标切片，越界返回 `Err(Error)`。
+`string.len` / `text.len()` 仍计 Unicode 标量值；`text.byte_len()` 返回 UTF-8 字节数，直接读取长度，不扫描字符串、不消费接收者。解释器的本地字符串和 native 路径均无需为计数字节复制正文。例如 `"中😀".len()` 为 2，`"中😀".byte_len()` 为 7。`string.chars` 按 Unicode 标量值线性拆分字符串，返回生命周期独立的字符串数组，且不消费接收者。native 的 ASCII 字符引用只读静态表（包括 NUL），不逐字符分配；非 ASCII 字符使用独立 owned 缓冲，释放原字符串不会影响数组。`string.slice` 按字符下标切片，越界返回 `Err(Error)`。
 
 字符串函数也可以作为实例方法调用：
 
@@ -1414,18 +1416,19 @@ obj.get_or(key:str, default:any): any
 ### 12.7 json
 
 ```txt
-json.stringify(value:any): str
-json.parse(text:str): Unknown
-json.try_parse(text:str): Unknown!
+json.stringify(value:any): str!
+json.parse(text:str): KuValue!
+json.try_parse(text:str): KuValue!
 ```
 
-`json.parse` 失败是不可恢复运行时错误；`json.try_parse` 失败返回 `Err(Error)`。
+`json.parse` 和 `json.stringify` 失败时返回 `Err(Error)`。`json.try_parse` 是 `json.parse` 的同类型兼容别名。解析结果是 tagged `KuValue`，可以承载 JSON object、array、string、number、bool 和 null；使用具体类型前需显式转换。
 
 ### 12.8 time
 
 ```txt
-time.now(): Time
-time.now(value: Time): int
+time.now(): int
+time.instant(): Time
+time.elapsed(value: Time): int
 time.unix(): int
 time.unix(value: Time): int
 time.millis(): int
@@ -1463,10 +1466,12 @@ time.sleep(duration: Duration): null!
 第一版不新增独立 VM 值类型，`Time` / `Date` / `Duration` 用普通 object 承载：
 
 ```ku
-now = time.now()
+now = time.instant()
 print(now.kind)   // "time.time"
 print(now.millis) // Unix 毫秒时间戳
 ```
+
+`time.now()` 直接返回 Unix epoch 毫秒整数；`time.instant()` 返回可供日期、格式化和时间差 API 使用的 `Time` object。`time.elapsed(previous)` 返回从 `previous` 到当前墙上时间的毫秒差。`time.steady_millis()` 是进程内单调时钟，只用于计算时长。
 
 `Date` 形如 `{ kind:"time.date", year, month, day }`，`Duration` 形如 `{ kind:"time.duration", millis }`。
 
@@ -1496,7 +1501,7 @@ SSS  毫秒 000-999
 import { time } from "std"
 
 fn main(): null! {
-    now = time.now()
+    now = time.instant()
     text = time.format(now, "yyyy-MM-dd HH:mm:ss", "+08:00")?
     println(text)
 
@@ -1619,7 +1624,7 @@ print(res.status)
 print(res.body)
 ```
 
-`http.request` 支持 `{ method, url, headers, body, timeout_ms, max_body_bytes }`。网络、协议、URL 和 body 限制错误返回结构化 `Err({ domain, code, message })`；HTTP 非 2xx 状态仍返回 `Ok(HttpResponse)`，由调用者检查 `res.status`。
+`http.request` 只支持 `{ method, url, headers, body, timeout_ms, max_body_bytes }`，其中 `url` 必填。字段名固定使用 snake_case；未知字段、camelCase 和拼写错误会在对象形状静态可见时由 checker 拒绝，动态配置对象则在发起网络请求前拒绝，不会静默使用默认值。网络、协议、URL 和 body 限制错误返回结构化 `Err({ domain, code, message })`；HTTP 非 2xx 状态仍返回 `Ok(HttpResponse)`，由调用者检查 `res.status`。
 
 HTTP client 使用全局默认 client/agent，底层复用连接；`http.get` / `http.post` / `http.request` 是默认 client 的快捷方式。默认限制：
 
@@ -1628,7 +1633,7 @@ timeout_ms: 5000
 max_body_bytes: 1000000
 ```
 
-`http.client(config?)` 返回 client 配置对象，当前支持 `timeout_ms` 和 `max_body_bytes`。它适合后续扩展 cookie、默认 header、代理、认证 token、重试策略和连接池参数。当前 `http.get/post/request` 仍使用默认全局 client。
+`http.client(config?)` 返回 client 配置对象，当前只支持 `timeout_ms`、`max_body_bytes` 和 `max_idle_connections`。字段名固定使用 snake_case，未知字段、camelCase 和拼写错误都会被拒绝。它适合后续扩展 cookie、默认 header、代理、认证 token、重试策略和连接池参数。当前 `http.get/post/request` 仍使用默认全局 client。
 
 响应 helper：
 
@@ -1718,6 +1723,8 @@ print(service.routes[0].method)
 
 `http.service()` / `http.server(config?)` 返回 service 配置对象。`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。
 
+上述 `bind` / `listener.run` / `listener.close` 生命周期当前仅由解释器实现。Windows native C 后端使用 `service.listen(address)?` 直接进入阻塞 accept loop；尝试 native 编译 `bind` 会提前报能力边界错误。`listen` 会消费 service，调用后不能再复用该句柄。
+
 普通 HTTP handler 可以接收 0 或 1 个请求参数：
 
 ```ku
@@ -1760,7 +1767,7 @@ HTTP handler 会在类型检查阶段按 0/1 参数 Return 模型复查参数和
 - `max_connections` 表示同时在线连接上限；超过时立即返回 503。
 - `max_active_requests` 控制同时工作的连接/handler worker 数。
 - `max_pending_requests` 是有界等待队列；队列满时立即返回 503，不无限排队。
-- `handler_timeout_ms` 到时返回 504。解释器执行会检查 deadline；响应线程不会在超时后继续无限等待。
+- `handler_timeout_ms` 到时返回 504。解释器逐步检查 deadline；native 在循环回边和 Ku 调用返回点插入协作式 safepoint。
 - `idle_timeout_ms` 限制连接在发送首字节前的空闲等待。
 - header/body/write 分别使用自己的 timeout，网络错误不自动无限重试。
 
@@ -1772,9 +1779,9 @@ Ku runtime 自动维护自己能判断的协议错误：路由未命中返回 40
 
 `ku build --native` 编译出的二进制与解释器跑同一套 HTTP 规则，可观测响应一致：路由（exact 优先于 `{param}`、404/405）、`req` 的 method/path/params/query/headers/body、`http.text/html/empty/redirect` 响应、有界接纳（`max_connections`/`max_active_requests`/`max_pending_requests` 超限返回 503）、以及请求级限制 400/413/414/431/408 都与解释器逐一对齐；命名函数 handler（`service.get("/x", index)`）和内联 `fn(req)` 都支持。native 用真 worker 线程并行跑 handler（解释器 handler 串行），并行只是内部实现差异，不改变单个请求的可观测响应。
 
-native 与解释器的已知差异只有两条：
+native 与解释器的主要已知差异：
 
-- **`handler_timeout_ms` / 504 在 native 上不生效**。编译后的 compute-bound handler 无法被安全抢占，所以 native 不会返回 504；一个死循环 handler 会一直占住它那个 worker（其余 worker 仍正常服务）。需要 handler 超时保护时用解释器运行。
+- **native 的 `handler_timeout_ms` 是协作式，不是线程抢占**。`while` / `for` 回边及 Ku 调用返回点会检查 deadline；到期后沿正常清理路径展开并返回 504。同步系统调用、libpq/其他 FFI 阻塞期间不能被它中断，必须给下游单独配置 timeout。为避免超时重入，展开期间不会在 `finally` 内再次轮询，所以 `finally` 必须有限且非阻塞；如果 deadline 首次在正常执行的 `finally` 中被观察到，该 `finally` 的剩余语句可能被跳过，外层清理仍继续。
 - 响应头**顺序**不同。两边头名都是小写且语义相同，但解释器遍历 HashMap（顺序本身不确定），native 用固定顺序输出。HTTP 头与顺序无关，不影响客户端。
 
 可直接运行的 HTTP 示例：
@@ -1869,7 +1876,10 @@ cache = ".ku/cache"
 
 dep.util = "1.0.0"
 dep.util.source = "file://C:/work/util"
-dep.util.checksum = "ku-fnv64-0123456789abcdef"
+
+registry.url = "https://packages.example/v1/"
+registry.public_key = "ed25519-<64 hex digits>"
+dep.math = "^1.2.0"
 ```
 
 字段：
@@ -1883,6 +1893,8 @@ out        build 输出目录，默认 .ku/build
 cache      cache 目录，默认 .ku/cache
 template   create/init 使用的内置模板名，可选
 type       package 类型，例如 lib，可选
+registry.url
+registry.public_key
 dep.NAME   dependency 版本
 dep.NAME.source
 dep.NAME.checksum
@@ -1891,24 +1903,18 @@ dep.NAME.checksum
 package import：
 
 ```ku
-import { Value } from "util"
 import { Value } from "@util/util"
 ```
 
 `@util/util` 表示从 dependency cache 的 `util` 包里导入 `util.ku`。
 
-当前 CLI package import 仍只启用 `file://` 目录 source。registry 的执行层已经实现 HTTPS-only 获取、静态 index 解析、SHA-256 流式校验、有界重试/超时/下载大小、唯一临时目录和内容寻址 cache；在签名信任根与归档格式完成决策前，CLI 不会绕过验证直接启用远程包：
+`dep.NAME.source = "file://..."` 只用于本地开发覆盖；省略 source 时，`check/run/build/package resolve` 从项目固定的 registry 解析。没有第二套 registry dependency/import 写法。
 
-```toml
-name = "math"
-version = "0.1.0"
-source = "https://registry.example/ku/math/0.1.0.tar.zst"
-checksum = "sha256-<64 hex digits>"
-```
+registry index 和 detached signature 均走 HTTPS；Ed25519 签名覆盖 exact index bytes。每个版本的 URL、SHA-256 和 `dep.*` 传递依赖元数据都在签名范围内。resolver 支持 exact/caret 与有界回溯，最多 256 个包、20000 个步骤；下载/解包/并发/整图大小均有硬上限。归档身份、签名依赖、artifact SHA-256、archive 文件树和解包文件树必须全部一致，否则 fail-closed。
 
-registry lock 使用一个或多个 `[[package]]`，要求 `name/version/source/url/checksum/cache_key` 齐全；`source` 必须是 `registry`，版本必须是 `major.minor.patch`，checksum 必须是 `sha256-` 加 64 位十六进制。`cache_key` 必须由 name、精确版本和完整 SHA-256 确定，不能自行填写任意值。
+`ku.lock` 写入直接和传递 registry package 的精确版本、registry、URL、checksum 与 cache key；解析时不信任旧绝对 cache 路径。`ku package resolve` 默认刷新兼容版本；`check/run/build/package resolve` 都可直接选择一个 `--locked` 或 `--offline`。`--locked` 禁止重新求解和 lock 改写，`--offline` 还禁止联网或回读 file source；两个模式不能同时或重复使用。
 
-resolver 支持精确版本 `1.2.3` 和 caret 范围 `^1.2.3`。同名依赖的全部约束会合并，选择满足全部约束的最高可用版本；没有共同版本时返回 `package/dependency_conflict`，不做无限回溯或 SAT 搜索。远程请求最多 8 次，连接/读取超时均有上限，单个压缩归档最多 32 MB；只对明确瞬时错误有限退避。下载 staging 与 GC 隔离，SHA-256 通过后会按受限 `.tar.zst` 规则解包并安装到不可覆盖的内容寻址 cache；并发安装锁和旧锁恢复均有界。当前已实现 `Ed25519RegistryIndexVerifier`，可验证 registry index 的 detached signature；未配置 verifier、缺少 dependency source 或签名不匹配都会 fail-closed，不会读取旧 cache 绕过信任边界。内置官方根公钥、自定义 registry 公钥配置、key rotation/revocation 仍在后续队列。
+打包/发布只有 `ku package` 命名空间。包是确定性 `.tar.zst` Ku 源码包，不执行安装脚本或第三方本机二进制。完整协议见 [registry-api.md](registry-api.md)。
 
 ## 16. CLI 相关语法
 
@@ -1922,10 +1928,8 @@ ku create --list
 ku init
 ku init --template <template>
 ku template list
-ku run
-ku run <file.ku>
-ku check
-ku check <file.ku>
+ku run [--locked|--offline] [file.ku]
+ku check [--locked|--offline] [file.ku]
 ku check --deny-unused [file.ku]
 ku check --json
 ku check --json [--deny-unused] <file.ku>
@@ -1942,8 +1946,12 @@ ku build --emit-c [file.ku]
 ku build --emit-ir [file.ku]
 ku build --emit-llvm [file.ku]
 ku build --backend c [file.ku]
-ku build --native <file.ku>
-ku package gc <file.ku>
+ku build --native [--locked|--offline] <file.ku>
+ku package gc [path]
+ku package pack [path]
+ku package publish [path]
+ku package yank [path]
+ku package resolve [path] [--locked|--offline]
 ku version
 ku -v
 ku -h
@@ -2027,16 +2035,22 @@ ku build --release -o dist/app.exe
 调试产物：
 
 ```txt
---emit-ir      写入 .ku/build/<profile>/ir/main.ir
---emit-c       写入 .ku/build/<profile>/c/main.c
---emit-llvm    写入 .ku/build/<profile>/llvm/main.ll
+--emit-ir      写入 .ku/build/[<target>/]<profile>/ir/<binary-stem>.ir
+--emit-c       写入 .ku/build/[<target>/]<profile>/c/<binary-stem>.c
+--emit-llvm    写入 .ku/build/[<target>/]<profile>/llvm/<binary-stem>.ll
 ```
 
-`--target` 第一阶段只接受 `host`、`x86_64-linux`、`x86_64-windows`、`aarch64-darwin`；包含路径分隔符、Windows drive prefix 或未知 target 会直接报错，避免输出路径逃逸。`--backend c` 会使用 prototype C 后端生成 C 后再调用 C 编译器。查找顺序为 `KU_CC`、`zig cc`、`clang`、`cc`、`gcc`；找不到或编译失败会给出修改方向。跨 target 会把 resolver 输出的三元组传给 `zig cc -target` 或 `clang/cc/gcc --target`，实际是否可链接取决于本机工具链。默认 backend 仍是解释器 wrapper，因为完整 native closure / KuString / dynamic object / async ABI 尚未完成。`ku run build` 仅作为兼容别名保留，会提示改用 `ku build`。
+方括号表示只有显式非 host target 时才存在该目录层。`<binary-stem>` 是最终二进制文件名去掉平台可执行扩展后的名称；例如 Windows 的 `app.exe` 对应 `app.ir`、`app.c`、`app.ll`。
 
-0.0.15 build 的重要边界：默认生成的是“解释器打包型二进制”，入口源码会嵌入 wrapper；带 import 的程序仍会按原源码路径读取依赖，因此还不是最终“不依赖 Ku 源码文件”的 native binary。最终 native build 仍需要 import graph 打包、runtime ABI lowering、closure/native string/object/async lowering 和增量缓存继续补齐。
+显式 `-o` 时，IR/C/LLVM 都增加输出路径哈希层，写入 `.ku/build/[<target>/]<profile>/{ir,c,llvm}/<output-path-sha256>/<binary-stem>.<ext>`；完整输出路径参与 SHA-256，仅用于隔离中间产物，不是安全签名。不同目录下的同名输出不会争用中间文件，也不会在用户输出目录旁创建或覆盖 `.c`。
 
-`ku build --native` 当前输出 prototype C 源码，支持：
+`--target` 第一阶段只接受 `host`、`x86_64-linux`、`x86_64-windows`、`aarch64-darwin`；包含路径分隔符、Windows drive prefix 或未知 target 会直接报错，避免输出路径逃逸。`--backend c` 会使用 native C 后端生成 C 后再调用 C 编译器。查找顺序为 `KU_CC`、`zig cc`、`clang`、`cc`、`gcc`；找不到或编译失败会给出修改方向。显式跨 target 时，Ku 自动给 Zig 传 `-target`、给 Clang 传 `--target`；普通 fallback `cc/gcc` 只用于 host，不会假装支持 cross。需要使用已配置好的交叉 GCC 时，通过 `KU_CC` 显式指定。链接成功后仍校验目标产物的 PE/ELF/Mach-O 格式和 CPU 架构，不匹配就拒绝安装，且不会降级成 host binary。默认 backend 仍保留解释器 wrapper 以兼容尚未进入 native lowering 的 async 程序；同步程序的 KuString、array、dynamic object、Result/Error 和 closure ABI 已由 native C 后端实现。
+
+0.0.15 的历史边界是：默认生成“解释器打包型二进制”，带 import 的程序仍会按原路径读取依赖。当前 native C 路径已经在生成期展开完整 import graph，生成物不包含 runner 的 `run_source` / `const SOURCE`，移动原源码目录后仍能运行；async native lowering 和增量缓存仍未宣称完成。
+
+`ku build --native <file.ku>` 不带 `-o` 时是单文件兼容模式：在源码旁写出 `.c`，不调用 linker。带 `-o` 时进入完整 native 链接模式，使用上述 build 目录中的隔离中间产物并校验最终二进制。跨系统发布推荐使用 `ku build --backend c --target <target>`，因为“生成目标 C”本身不等于已生成该目标的可执行文件。
+
+native C 后端当前支持：
 
 ```txt
 int / bool / str
@@ -2065,7 +2079,7 @@ native C 当前仍是 prototype，但同步所有权和错误流已闭环：Copy
 `.clone()` 规则：
 
 - Copy 类型 `int/bool/float/null` 可以写 `.clone()`，语义等同复制，优化阶段应直接消掉。
-- `str.clone()` 语义是得到独立字符串值；解释器当前用 host String 深拷贝，native 后续固定为 `KuString { ptr, len, capacity, storage }`，字面量 `static` clone 零分配，运行时 `owned` clone 复制 UTF-8 bytes。
+- `str.clone()` 语义是得到独立字符串值；解释器使用 host String 深拷贝，native 使用 `KuString { ptr, len, capacity, storage }`，字面量 `static` clone 零分配，运行时 `owned` clone 复制 UTF-8 bytes。
 - `[T].clone()` 生成新数组并递归 clone 元素；如果中途失败，已经 clone 的元素必须按 drop 路径清理。
 - `object.clone()` 生成新动态对象并递归 clone key/value；第一阶段禁止 native 自引用/cycle，后续如需要再设计 cycle 策略。
 - `struct.clone()` 按字段递归 clone；字段不可 clone 时错误定位到字段。
@@ -2088,6 +2102,11 @@ native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error�
 最大执行步数: 无固定硬上限；仍受取消、timeout、调用深度和宿主环境限制
 最大函数调用深度: 16
 源码文件最大读取: 1000000 bytes
+import graph 最大源码模块数（含入口）: 4096
+import graph 最大递归深度: 32
+import graph 最大累计源码: 32 MiB
+import 展开最大顶层 item: 65536
+import source-equivalent AST 克隆预算: 32 MiB
 fs.read 最大读取: 1000000 bytes
 compiler builtin 最大输入: 1000000 bytes
 compiler builtin 最大 token 数: 100000
@@ -2128,10 +2147,10 @@ CPU time: 2312 ms
 ```txt
 LLVM 数组、enum、闭包、HTTP、async lowering
 LLVM 递归 struct 和更复杂 Result payload
-完整 native C 后端
-registry 根公钥配置、key rotation/revocation、归档格式、受限解包和 CLI 远程 import 串联
+覆盖全部语言特性（尤其 async/递归值类型）的完整 native C 后端
+registry v2 自动 signed-roots、在线 key 吊销和透明轮换（v1 使用项目显式公钥 pin）
 native async 函数值 / async lowering；闭包捕获 struct/enum/Result/Task 等 owned 类型；从 dynamic object 取回闭包后再调用（KuValue 不可 call）
-native C HTTP 的 handler_timeout_ms / 504（编译后的 compute-bound handler 无法安全抢占；解释器支持）
+native C HTTP 对阻塞系统/FFI 调用的可取消 transport，以及超时首次发生在 `finally` 中时的完整剩余清理语义
 match guard 模式矩阵和跨 guard 的完整穷尽性检查
 顶层脚本语句
 方法 / trait / interface

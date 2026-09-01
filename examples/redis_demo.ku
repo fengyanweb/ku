@@ -4,38 +4,51 @@
 //
 // 准备:
 //   1. 把下面的 HOST / PORT 改成你的 Redis 地址(非机密,可直接写在源码里)。
-//   2. 在“运行目录”放一个 redis.pw 文件,内容是 Redis 密码(已在 .gitignore)。
-//      若你的 Redis 无密码,把 redis.pw 留空或删掉 auth 这一行。
+//   2. 在“运行目录”放一个 redis.pw 文件,内容是 Redis 密码且末尾不要换行(已在 .gitignore)。
+//      示例把 password 放进 client 配置,每条池连接都会自动认证。
 //
 // 构建运行:
 //   ku build --native examples/redis_demo.ku -o redis_demo.exe
 //   ./redis_demo.exe
 //
-// 演示要点:AUTH / SET / GET / DEL,含 \r\n 二进制值的安全往返(长度前缀帧,不会被当协议注入)。
+// 演示要点:统一 client、有界连接池、自动 AUTH、SET/GET/DEL 和严格缺键错误。
 
 import redis from "std.redis"
 import "std.fs"
 
 fn main(): null! {
-    pw = fs.read("redis.pw")
-    conn = redis.connect("127.0.0.1", 6379)?
-    redis.auth(conn, pw)?
+    pw = fs.read("redis.pw")?
+    client = redis.client({
+        host: "127.0.0.1",
+        port: 6379,
+        password: pw,
+        max_connections: 8,
+        max_waiters: 64,
+        connect_timeout_ms: 5000,
+        acquire_timeout_ms: 5000,
+        command_timeout_ms: 5000
+    })?
+    client.ping()?
 
     // 普通键往返
-    redis.set(conn, "ku:demo:greeting", "hello from ku")?
-    println("greeting = " + redis.get(conn, "ku:demo:greeting")?)
+    client.set("ku:demo:greeting", "hello from ku")?
+    println("greeting = " + client.get("ku:demo:greeting")?)
 
     // 含 \r\n 的值:RESP 用长度前缀编码,可安全往返,不会被当作协议注入
-    redis.set(conn, "ku:demo:crlf", "line1\r\nline2\r\nline3")?
-    v = redis.get(conn, "ku:demo:crlf")?
+    client.set("ku:demo:crlf", "line1\r\nline2\r\nline3")?
+    v = client.get("ku:demo:crlf")?
     println("crlf value length = " + str(v.len()))
 
     // 清理测试键
-    redis.del(conn, "ku:demo:greeting")?
-    redis.del(conn, "ku:demo:crlf")?
-    after = redis.get(conn, "ku:demo:greeting")?
-    println("deleted, missing key now returns empty = " + str(after.len() == 0))
+    client.del("ku:demo:greeting")?
+    client.del("ku:demo:crlf")?
+    try {
+        ignored = client.get("ku:demo:greeting")?
+        println(ignored)
+    } catch (err) {
+        println("deleted key error = " + err.domain + "/" + err.code)
+    }
 
-    redis.close(conn)
+    client.close()
     return ok(null)
 }

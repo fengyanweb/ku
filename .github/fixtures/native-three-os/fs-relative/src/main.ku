@@ -1,0 +1,20 @@
+import fs from "std.fs"
+
+fn main(): null! {
+    if (fs.read("asset.txt")? != "asset-data\n") {
+        panic("source-relative fs.read failed")
+    }
+
+    fs.write("native-fs-output.txt", "fs-ok")?
+    if (!fs.exists("native-fs-output.txt") || fs.read("native-fs-output.txt")? != "fs-ok") {
+        panic("source-relative fs.write/exists failed")
+    }
+
+    entries = fs.read_dir(".")?
+    if (entries.len() < 3) {
+        panic("source-relative fs.read_dir failed")
+    }
+
+    println("native-fs-relative-ok")
+    return ok(null)
+}

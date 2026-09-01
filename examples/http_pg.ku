@@ -4,51 +4,72 @@
 //   浏览器 → HTTP → Ku 服务 → libpq → PostgreSQL → JSON → 前端渲染
 //
 // 准备(与 pg_demo 相同):
-//   1. 在“运行目录”放一个 db.conn 文件,内容是 libpq 连接串(已在 .gitignore)。
-//   2. 运行时需要 libpq.dll 在 PATH。
+//   1. 在仓库根目录放一个 db.conn 文件,内容是 libpq 连接串(已在 .gitignore)。
+//   2. 运行时需要同一 PostgreSQL 安装目录中的 libpq.dll 及其依赖 DLL 在 PATH。
 //
 // 构建运行(从仓库根目录运行,以便读到 examples/http_pg_frontend.html):
 //   ku build --native examples/http_pg.ku -o http_pg.exe
 //   ./http_pg.exe
 //   然后浏览器打开 http://127.0.0.1:8090/
 //
-// 说明:当前 native 后端的 http.json 尚不可用,这里用 http.text 返回手工拼的 JSON 字符串;
-// 数据库查询会失败时,返回一个错误 JSON。查询只读元数据,不碰任何业务表。
+// 说明:http.text 只负责响应类型，JSON 内容统一由 json.stringify 生成，不能把数据库
+// 文本直接拼进 JSON。数据库查询失败时返回固定错误 JSON；查询只读元数据。
 
 import http from "std.http"
 import pg from "std.pg"
+import json from "std.json"
 import "std.fs"
 
-// 连 PostgreSQL 查一行元数据(只读),拼成 JSON 字符串;出错返回错误 JSON。
-// DB 逻辑放在返回 str 的顶层函数里,handler 只负责 return http.text(...)。
-fn db_json(): str {
-    body = "{\"code\":1,\"msg\":\"init\"}"
+fn frontend_html(): str {
+    body = "frontend file error"
     try {
-        conninfo = fs.read("db.conn")
-        conn = pg.connect(conninfo)?
-        res = pg.query(conn, "SELECT version(), current_database(), now()::text, (SELECT count(*)::text FROM information_schema.tables WHERE table_schema = 'public')")?
-        ver = pg.value(res, 0, 0)
-        db = pg.value(res, 0, 1)
-        now = pg.value(res, 0, 2)
-        cnt = pg.value(res, 0, 3)
-        body = "{\"code\":0,\"msg\":\"ok\",\"data\":{\"version\":\"" + ver + "\",\"database\":\"" + db + "\",\"now\":\"" + now + "\",\"public_tables\":" + cnt + "}}"
+        body = fs.read("examples/http_pg_frontend.html")?
     } catch (err) {
-        body = "{\"code\":1,\"msg\":\"db error\"}"
+        body = "frontend file error"
     }
     return body
 }
 
 fn main(): null! {
+    conninfo = fs.read("db.conn")?
+    db_client = pg.client({
+        conninfo: conninfo,
+        max_connections: 16,
+        max_waiters: 256,
+        connect_timeout_ms: 5000,
+        acquire_timeout_ms: 5000,
+        query_timeout_ms: 30000
+    })?
     app = http.service()
 
     // 前端页面
     app.get("/", fn() {
-        return http.html(fs.read("examples/http_pg_frontend.html"))
+        return http.html(frontend_html())
     })
 
-    // 收到 HTTP 请求 → 连 PostgreSQL → 查数据 → JSON 返回给前端
+    // 所有 handler 共享线程安全的有界 client；每次查询自动借还连接。
     app.get("/db/info", fn() {
-        return http.text(db_json())
+        body = "{\"code\":1,\"msg\":\"db error\"}"
+        try {
+            res = db_client.query("SELECT version(), current_database(), now()::text, (SELECT count(*)::text FROM information_schema.tables WHERE table_schema = 'public')", [])?
+            ver = res.value(0, 0)?
+            database = res.value(0, 1)?
+            now = res.value(0, 2)?
+            count = res.value(0, 3)?
+            body = json.stringify({
+                code: 0,
+                msg: "ok",
+                data: {
+                    version: ver,
+                    database: database,
+                    now: now,
+                    public_tables: count
+                }
+            })?
+        } catch (err) {
+            body = "{\"code\":1,\"msg\":\"db error\"}"
+        }
+        return http.text(body)
     })
 
     println("Ku HTTP+PG demo listening on http://127.0.0.1:8090")

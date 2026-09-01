@@ -1,0 +1,42 @@
+// Self-hosted lexical token model. Line/column are one-based Unicode-scalar
+// coordinates; offsets are zero-based UTF-8 bytes and ends are exclusive.
+// Float retains its exact decimal spelling in lexeme. Converting that spelling
+// to a rounded numeric value belongs to the later parser, not this lexer.
+struct Token {
+    kind: str
+    lexeme: str
+    int_value: int
+    line: int
+    column: int
+    offset: int
+    end_line: int
+    end_column: int
+    end_offset: int
+}
+
+fn EscapeCanonical(text: str): str {
+    escaped = text.replace("\\", "\\\\")
+    escaped = escaped.replace("\r", "\\r")
+    escaped = escaped.replace("\n", "\\n")
+    escaped = escaped.replace("\t", "\\t")
+    escaped = escaped.replace("|", "\\p")
+    return escaped
+}
+
+fn TokenCanonical(token: Token): str {
+    return token.kind + "|" + EscapeCanonical(token.lexeme) + "|" + str(token.int_value) + "|" + str(token.line) + "|" + str(token.column) + "|" + str(token.offset) + "|" + str(token.end_line) + "|" + str(token.end_column) + "|" + str(token.end_offset)
+}
+
+fn Canonical(tokens: [Token]): str {
+    output = ""
+    first = true
+    for token in tokens {
+        if (!first) {
+            output += "\n"
+        }
+        line = TokenCanonical(token)
+        output += line
+        first = false
+    }
+    return output
+}

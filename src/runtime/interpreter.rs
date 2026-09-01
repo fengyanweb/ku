@@ -4,9 +4,9 @@ use std::{
     net::{Shutdown, TcpListener, TcpStream},
     path::PathBuf,
     sync::{
-        atomic::{AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -14,26 +14,29 @@ use std::{
 
 use crate::{
     ast::{
-        AssignTarget, BinaryOp, Expr, ExprKind, FnDecl, FunctionParam, Item, Literal, MatchPattern,
-        Program, Stmt, UnaryOp,
+        is_pure_append_argument, AssignTarget, BinaryOp, Expr, ExprKind, FnDecl, FunctionParam,
+        Item, Literal, MatchPattern, Program, Stmt, UnaryOp,
     },
     env::Env,
     error::{KuError, KuResult},
     lexer::Lexer,
     parser::Parser,
-    runtime::task::{current_task_cancelled, TaskRuntime, TaskRuntimeSnapshot, TaskStressReport},
+    runtime::{
+        http_listener_registry,
+        task::{current_task_cancelled, TaskRuntime, TaskRuntimeSnapshot, TaskStressReport},
+    },
     span::{Position, Span},
     stdlib,
-    value::Value,
+    value::{HttpListenerLease, Value},
 };
 
 const MAX_CALL_DEPTH: usize = 512;
 const HTTP_HANDLER_TIMEOUT_MESSAGE: &str = "http handler timeout";
 const HTTP_ACCEPT_BATCH: usize = 64;
 const HTTP_EVENT_LOOP_SLEEP: Duration = Duration::from_millis(1);
+const HTTP_MAX_METHOD_BYTES: usize = 32;
 
-static HTTP_LISTENERS: OnceLock<Mutex<HashMap<i64, TcpListener>>> = OnceLock::new();
-static NEXT_HTTP_LISTENER_ID: AtomicI64 = AtomicI64::new(1);
+const HTTP_LISTENER_LEASE_FIELD: &str = "\0ku.http.listener.lease";
 
 enum Flow {
     Continue,
@@ -424,6 +427,9 @@ impl Interpreter {
                 Ok(Flow::Continue)
             }
             Stmt::Assign { name, value, span } => {
+                if self.try_self_array_push(name, value, env, depth, *span)? {
+                    return Ok(self.take_pending_fail().map_or(Flow::Continue, Flow::Fail));
+                }
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
                     return Ok(Flow::Fail(value));
@@ -790,12 +796,57 @@ impl Interpreter {
         };
         if let ExprKind::Variable(module) = &target.kind {
             if stdlib::metadata::is_std_module(module) && !env.contains(module) {
+                // Keep the dotted spelling as cheap as the method spelling:
+                // evaluating a string variable normally clones all its bytes.
+                if module == "string" && name == "byte_len" {
+                    if let [arg] = args {
+                        if let ExprKind::Variable(local) = &arg.kind {
+                            if env.contains(local) {
+                                let length = env.with_value(local, arg.span, |value| {
+                                    Ok(match value {
+                                        Value::String(text) => Some(Value::Int(text.len() as i64)),
+                                        _ => None,
+                                    })
+                                })?;
+                                if length.is_some() {
+                                    self.tick(arg.span)?;
+                                    return Ok(length);
+                                }
+                            }
+                        }
+                    }
+                }
                 return Ok(None);
             }
         }
         if let Some((enum_name, _)) = enum_variant_path(callee) {
             if self.enums.contains_key(&enum_name) {
                 return Ok(None);
+            }
+        }
+        if args.is_empty() && matches!(name.as_str(), "len" | "byte_len" | "is_empty") {
+            if let ExprKind::Variable(local) = &target.kind {
+                if env.contains(local) {
+                    let length = env.with_value(local, target.span, |value| {
+                        Ok(match (value, name.as_str()) {
+                            (Value::Array(values), "len") => Some(Value::Int(values.len() as i64)),
+                            (Value::Array(values), "is_empty") => {
+                                Some(Value::Bool(values.is_empty()))
+                            }
+                            (Value::String(text), "len") => {
+                                Some(Value::Int(text.chars().count() as i64))
+                            }
+                            (Value::String(text), "byte_len") => {
+                                Some(Value::Int(text.len() as i64))
+                            }
+                            _ => None,
+                        })
+                    })?;
+                    if length.is_some() {
+                        self.tick(target.span)?;
+                        return Ok(length);
+                    }
+                }
             }
         }
         let target_value = self.eval(target, env, depth)?;
@@ -1107,17 +1158,7 @@ impl Interpreter {
                 }
                 Ok(Value::Array(result))
             }
-            ExprKind::Index { target, index } => {
-                let target = self.eval(target, env, depth)?;
-                if self.pending_fail.is_some() {
-                    return Ok(Value::Null);
-                }
-                let index = self.eval(index, env, depth)?;
-                if self.pending_fail.is_some() {
-                    return Ok(Value::Null);
-                }
-                eval_index_value(target, index, expr.span, false)
-            }
+            ExprKind::Index { .. } => self.eval_index_expr(expr, env, depth, false),
             ExprKind::Field { target, name } => {
                 if let ExprKind::Variable(enum_name) = &target.kind {
                     if enum_name == "http"
@@ -1149,29 +1190,18 @@ impl Interpreter {
                             fields: Vec::new(),
                         });
                     }
+                    if env.contains(enum_name) {
+                        self.tick(target.span)?;
+                        return env.with_value(enum_name, target.span, |value| {
+                            field_value(value, name, expr.span)
+                        });
+                    }
                 }
                 let target = self.eval(target, env, depth)?;
                 if self.pending_fail.is_some() {
                     return Ok(Value::Null);
                 }
-                match target {
-                    Value::Struct {
-                        name: struct_name,
-                        fields,
-                    } => fields.get(name).cloned().ok_or_else(|| {
-                        KuError::runtime(
-                            format!("struct '{struct_name}' has no field '{name}'"),
-                            expr.span,
-                        )
-                    }),
-                    Value::Object(fields) => fields.get(name).cloned().ok_or_else(|| {
-                        KuError::runtime(format!("object has no field '{name}'"), expr.span)
-                    }),
-                    other => Err(KuError::runtime(
-                        format!("type error: {} has no fields", other.type_name()),
-                        expr.span,
-                    )),
-                }
+                field_value(&target, name, expr.span)
             }
             ExprKind::OptionalField { target, name } => {
                 let target = self.eval(target, env, depth)?;
@@ -1244,18 +1274,10 @@ impl Interpreter {
                 ))
             }
             ExprKind::TryUnwrap { expr: inner } => {
-                let value = if let ExprKind::Index { target, index } = &inner.kind {
-                    let target = self.eval(target, env, depth)?;
-                    if self.pending_fail.is_some() {
-                        return Ok(Value::Null);
-                    }
-                    let index = self.eval(index, env, depth)?;
-                    if self.pending_fail.is_some() {
-                        return Ok(Value::Null);
-                    }
+                let value = if matches!(&inner.kind, ExprKind::Index { .. }) {
                     // Object indexing under `?` yields Result(ok / err missing_key);
                     // `?` then unwraps or propagates it like any other Result.
-                    eval_index_value(target, index, inner.span, true)?
+                    self.eval_index_expr(inner, env, depth, true)?
                 } else {
                     self.eval(inner, env, depth)?
                 };
@@ -1279,6 +1301,85 @@ impl Interpreter {
                 }
             }
         }
+    }
+
+    fn eval_index_expr(
+        &mut self,
+        expr: &Expr,
+        env: &mut Env,
+        depth: usize,
+        optional_object: bool,
+    ) -> KuResult<Value> {
+        let ExprKind::Index { target, index } = &expr.kind else {
+            unreachable!("index evaluator only accepts index expressions")
+        };
+        if let ExprKind::Variable(name) = &target.kind {
+            // No other task/capture may change the target and the index cannot
+            // run user code. Otherwise preserve the old receiver snapshot taken
+            // before evaluating the index (e.g. xs[change_xs()]).
+            if env.is_unshared(name) && is_pure_append_argument(index, "") {
+                self.tick(target.span)?;
+                env.with_value(name, target.span, |_| Ok(()))?;
+                let index = self.eval(index, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
+                return env.with_value(name, target.span, |target| {
+                    eval_index_value(target, index, expr.span, optional_object)
+                });
+            }
+        }
+        let target = self.eval(target, env, depth)?;
+        if self.pending_fail.is_some() {
+            return Ok(Value::Null);
+        }
+        let index = self.eval(index, env, depth)?;
+        if self.pending_fail.is_some() {
+            return Ok(Value::Null);
+        }
+        eval_index_value(&target, index, expr.span, optional_object)
+    }
+
+    fn try_self_array_push(
+        &mut self,
+        name: &str,
+        value: &Expr,
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<bool> {
+        let ExprKind::Call { callee, args } = &value.kind else {
+            return Ok(false);
+        };
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &callee.kind
+        else {
+            return Ok(false);
+        };
+        if method != "push"
+            || !matches!(&target.kind, ExprKind::Variable(receiver) if receiver == name)
+            || args.len() != 1
+            || !is_pure_append_argument(&args[0], name)
+            || !env.is_unshared(name)
+            || self.enums.contains_key(name)
+            || !env.with_value(name, target.span, |value| {
+                Ok(matches!(value, Value::Array(_)))
+            })?
+        {
+            return Ok(false);
+        }
+        // Account for the same call/receiver evaluation steps as the ordinary
+        // method path, without cloning the receiver. Never hold its lock while
+        // evaluating even the restricted argument expression.
+        self.tick(value.span)?;
+        self.tick(target.span)?;
+        let piece = self.eval(&args[0], env, depth)?;
+        if self.pending_fail.is_none() {
+            env.append_array(name, piece, span)?;
+        }
+        Ok(true)
     }
 
     fn take_pending_fail(&mut self) -> Option<Value> {
@@ -1509,6 +1610,13 @@ impl Interpreter {
     ) -> KuResult<()> {
         match target {
             AssignTarget::Variable(name) => {
+                if op == BinaryOp::Add {
+                    if let Value::String(text) = &right {
+                        if env.append_string(name, text, span)? {
+                            return Ok(());
+                        }
+                    }
+                }
                 let left = env.get(name, span)?;
                 let value = eval_binary(op, left, right, span)?;
                 env.assign(name, value, span)
@@ -1556,7 +1664,7 @@ impl Interpreter {
                 if self.pending_fail.is_some() {
                     return Ok(());
                 }
-                let left = eval_index_value(container.clone(), index.clone(), span, false)?;
+                let left = eval_index_value(container, index.clone(), span, false)?;
                 let value = eval_binary(op, left, right, span)?;
                 assign_index_value(container, index, value, span)
             }
@@ -1662,6 +1770,10 @@ impl Interpreter {
                 ));
             };
             let compiled_router = compile_http_routes(&target_value, span)?;
+            // Validate field assignments before opening a socket. Otherwise an
+            // invalid post-construction limit would fail inside listener.run and
+            // leave the just-bound listener stranded in the registry.
+            HttpServerRuntimeLimits::from_service(&target_value, span)?;
             let (listener_id, bound_address) = match bind_http_address(&address) {
                 Ok(bound) => bound,
                 Err(message) => return Ok(Some(http_error_result("bind_failed", message))),
@@ -1730,7 +1842,7 @@ impl Interpreter {
             ));
         };
         env.assign(&root, service.clone(), span)?;
-        Ok(Some(service))
+        Ok(Some(Value::Null))
     }
 
     fn run_http_listener(&mut self, listener: Value, span: Span) -> KuResult<()> {
@@ -1747,8 +1859,8 @@ impl Interpreter {
         let compiled_router = fields
             .remove("compiled_router")
             .ok_or_else(|| KuError::runtime("http listener missing compiled_router", span))?;
+        let limits = HttpServerRuntimeLimits::from_service(&service, span)?;
         let tcp = take_http_listener(listener_id, span)?;
-        let limits = HttpServerRuntimeLimits::from_service(&service);
         tcp.set_nonblocking(true).map_err(|err| {
             KuError::runtime(
                 format!("http listener nonblocking setup failed: {err}"),
@@ -1871,7 +1983,7 @@ impl Interpreter {
     ) -> HttpWireResponse {
         let route = match find_http_route(compiled_router, &request, span) {
             Ok(route) => route,
-            Err(err) => return status_response(500, &err.message),
+            Err(_) => return status_response(500, "Internal Server Error"),
         };
         match route {
             RouteLookup::Found(handler, params) => {
@@ -1883,7 +1995,7 @@ impl Interpreter {
                     Err(err) if err.message == HTTP_HANDLER_TIMEOUT_MESSAGE => {
                         status_response(504, "Gateway Timeout")
                     }
-                    Err(err) => status_response(500, &err.message),
+                    Err(_) => status_response(500, "Internal Server Error"),
                 }
             }
             RouteLookup::MethodNotAllowed => status_response(405, "Method Not Allowed"),
@@ -2129,11 +2241,35 @@ fn eval_kuvalue_method(name: &str, values: &[Value]) -> Option<Value> {
 }
 
 fn eval_index_value(
-    target: Value,
+    target: &Value,
     index: Value,
     span: Span,
     optional_object: bool,
 ) -> KuResult<Value> {
+    if optional_object {
+        // Under `?`, the checker has classified the target as KuValue. The
+        // index type selects the tagged native operation: str -> object lookup,
+        // int -> array lookup. Keep interpreter errors recoverable and identical
+        // to those helpers even when the runtime tag is String/Object/Array/etc.
+        match (target, &index) {
+            (Value::Object(_), Value::String(_)) | (Value::Array(_), Value::Int(_)) => {}
+            (_, Value::String(_)) => {
+                return Ok(crate::stdlib::errors::err(
+                    "object",
+                    "type_unsupported",
+                    "expected object value",
+                ));
+            }
+            (_, Value::Int(_)) => {
+                return Ok(crate::stdlib::errors::err(
+                    "array",
+                    "not_an_array",
+                    "expected array value",
+                ));
+            }
+            _ => {}
+        }
+    }
     match target {
         Value::Array(values) => {
             let Value::Int(index) = index else {
@@ -2463,6 +2599,10 @@ fn http_listener_value(
         ("address".to_string(), Value::String(address)),
         ("service".to_string(), service),
         ("compiled_router".to_string(), compiled_router),
+        (
+            HTTP_LISTENER_LEASE_FIELD.to_string(),
+            Value::HttpListenerLease(HttpListenerLease::new(listener_id)),
+        ),
     ]))
 }
 
@@ -2477,20 +2617,12 @@ fn bind_http_address(address: &str) -> Result<(i64, String), String> {
     let local = listener
         .local_addr()
         .map_err(|err| format!("http service bind({address}) failed: {err}"))?;
-    let id = NEXT_HTTP_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
-    http_listeners()
-        .lock()
-        .map_err(|_| "http listener registry is poisoned".to_string())?
-        .insert(id, listener);
+    let id = http_listener_registry::insert(listener)?;
     Ok((id, local.to_string()))
 }
 
 fn take_http_listener(id: i64, span: Span) -> KuResult<TcpListener> {
-    http_listeners()
-        .lock()
-        .map_err(|_| KuError::runtime("http listener registry is poisoned", span))?
-        .remove(&id)
-        .ok_or_else(|| KuError::runtime("http listener was already consumed", span))
+    http_listener_registry::take(id, span)
 }
 
 fn close_http_listener_value(listener: Value, span: Span) -> KuResult<()> {
@@ -2505,16 +2637,7 @@ fn close_http_listener_value(listener: Value, span: Span) -> KuResult<()> {
 }
 
 fn close_http_listener(id: i64, span: Span) -> KuResult<()> {
-    http_listeners()
-        .lock()
-        .map_err(|_| KuError::runtime("http listener registry is poisoned", span))?
-        .remove(&id)
-        .map(|_| ())
-        .ok_or_else(|| KuError::runtime("http listener was already consumed", span))
-}
-
-fn http_listeners() -> &'static Mutex<HashMap<i64, TcpListener>> {
-    HTTP_LISTENERS.get_or_init(|| Mutex::new(HashMap::new()))
+    http_listener_registry::close(id, span)
 }
 
 fn compile_http_routes(service: &Value, span: Span) -> KuResult<Value> {
@@ -2561,9 +2684,27 @@ fn compile_http_routes(service: &Value, span: Span) -> KuResult<Value> {
 }
 
 fn normalized_route_key(method: &str, path: &str, span: Span) -> KuResult<String> {
+    if method.is_empty()
+        || method.len() > HTTP_MAX_METHOD_BYTES
+        || !method.bytes().all(is_http_token_byte)
+    {
+        return Err(KuError::runtime(
+            "http route method must be a valid HTTP token of at most 32 bytes",
+            span,
+        ));
+    }
     if !path.starts_with('/') {
         return Err(KuError::runtime(
             "http route path must start with '/'",
+            span,
+        ));
+    }
+    if path.len() > stdlib::http::MAX_REQUEST_TARGET_BYTES {
+        return Err(KuError::runtime(
+            format!(
+                "http route path must be at most {} bytes",
+                stdlib::http::MAX_REQUEST_TARGET_BYTES
+            ),
             span,
         ));
     }
@@ -2594,7 +2735,22 @@ fn normalized_route_key(method: &str, path: &str, span: Span) -> KuResult<String
             }
             segments.push("{}".to_string());
         } else {
+            if !is_valid_uri_pchar_sequence(segment.as_bytes()) {
+                return Err(KuError::runtime(
+                    format!("invalid http route segment '{segment}'"),
+                    span,
+                ));
+            }
             segments.push(segment.to_string());
+        }
+        if segments.len() > stdlib::http::MAX_REQUEST_PATH_SEGMENTS {
+            return Err(KuError::runtime(
+                format!(
+                    "http route path must contain at most {} segments",
+                    stdlib::http::MAX_REQUEST_PATH_SEGMENTS
+                ),
+                span,
+            ));
         }
     }
     Ok(format!(
@@ -2644,19 +2800,49 @@ struct HttpServerRuntimeLimits {
 }
 
 impl HttpServerRuntimeLimits {
-    fn from_service(service: &Value) -> Self {
-        Self {
-            read_header_timeout: duration_from_service(service, "read_header_timeout_ms"),
-            read_body_timeout: duration_from_service(service, "read_body_timeout_ms"),
-            write_timeout: duration_from_service(service, "write_timeout_ms"),
-            idle_timeout: duration_from_service(service, "idle_timeout_ms"),
-            handler_timeout: duration_from_service(service, "handler_timeout_ms"),
-            max_header_bytes: service_int(service, "max_header_bytes").unwrap_or(16 * 1024),
-            max_body_bytes: service_int(service, "max_body_bytes").unwrap_or(1_000_000),
-            max_connections: service_int(service, "max_connections").unwrap_or(1024),
-            max_active_requests: service_int(service, "max_active_requests").unwrap_or(256),
-            max_pending_requests: service_int(service, "max_pending_requests").unwrap_or(1024),
-        }
+    fn from_service(service: &Value, span: Span) -> KuResult<Self> {
+        Ok(Self {
+            read_header_timeout: service_duration(service, "read_header_timeout_ms", 5_000, span)?,
+            read_body_timeout: service_duration(service, "read_body_timeout_ms", 10_000, span)?,
+            write_timeout: service_duration(service, "write_timeout_ms", 10_000, span)?,
+            idle_timeout: service_duration(service, "idle_timeout_ms", 5_000, span)?,
+            handler_timeout: service_duration(service, "handler_timeout_ms", 15_000, span)?,
+            max_header_bytes: bounded_service_int(
+                service,
+                "max_header_bytes",
+                16 * 1024,
+                stdlib::http::MAX_HEADER_BYTES,
+                span,
+            )?,
+            max_body_bytes: bounded_service_int(
+                service,
+                "max_body_bytes",
+                1_000_000,
+                stdlib::http::MAX_BODY_BYTES,
+                span,
+            )?,
+            max_connections: bounded_service_int(
+                service,
+                "max_connections",
+                1024,
+                stdlib::http::MAX_CONNECTIONS,
+                span,
+            )?,
+            max_active_requests: bounded_service_int(
+                service,
+                "max_active_requests",
+                256,
+                stdlib::http::MAX_ACTIVE_REQUESTS,
+                span,
+            )?,
+            max_pending_requests: bounded_service_int(
+                service,
+                "max_pending_requests",
+                1024,
+                stdlib::http::MAX_PENDING_REQUESTS,
+                span,
+            )?,
+        })
     }
 }
 
@@ -2748,10 +2934,13 @@ fn http_worker_loop(
 }
 
 fn reject_http_connection(stream: &mut TcpStream, limits: HttpServerRuntimeLimits) {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(10)));
+    let drain_deadline = http_deadline(Duration::from_millis(50));
     let mut buffer = [0_u8; 1024];
     let mut received = Vec::new();
     while received.len() < limits.max_header_bytes {
+        if set_http_read_deadline(stream, drain_deadline).is_err() {
+            break;
+        }
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
@@ -2765,8 +2954,11 @@ fn reject_http_connection(stream: &mut TcpStream, limits: HttpServerRuntimeLimit
             Err(_) => break,
         }
     }
-    let _ = stream.set_write_timeout(Some(limits.write_timeout));
-    let _ = write_http_response(stream, status_response(503, "Service Unavailable"));
+    let _ = write_http_response(
+        stream,
+        status_response(503, "Service Unavailable"),
+        limits.write_timeout,
+    );
     let _ = stream.shutdown(Shutdown::Write);
 }
 
@@ -2778,8 +2970,8 @@ fn handle_http_connection(
     let request = match read_http_request(&mut pending.stream, limits, entry_span()) {
         Ok(request) => request,
         Err(response) => {
-            let _ = pending.stream.set_write_timeout(Some(limits.write_timeout));
-            let _ = write_http_response(&mut pending.stream, response);
+            let _ = write_http_response(&mut pending.stream, response, limits.write_timeout);
+            let _ = pending.stream.shutdown(Shutdown::Write);
             return;
         }
     };
@@ -2793,21 +2985,25 @@ fn handle_http_connection(
         })
         .is_err()
     {
+        let _ = pending.stream.shutdown(Shutdown::Write);
         return;
     }
 
     let response = match response_rx.recv_timeout(limits.handler_timeout) {
         Ok(response) => response,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            let _ = pending.stream.set_write_timeout(Some(limits.write_timeout));
-            let _ =
-                write_http_response(&mut pending.stream, status_response(504, "Gateway Timeout"));
+            let _ = write_http_response(
+                &mut pending.stream,
+                status_response(504, "Gateway Timeout"),
+                limits.write_timeout,
+            );
+            let _ = pending.stream.shutdown(Shutdown::Write);
             return;
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => status_response(500, "Internal Server Error"),
     };
-    let _ = pending.stream.set_write_timeout(Some(limits.write_timeout));
-    let _ = write_http_response(&mut pending.stream, response);
+    let _ = write_http_response(&mut pending.stream, response, limits.write_timeout);
+    let _ = pending.stream.shutdown(Shutdown::Write);
 }
 
 #[derive(Debug)]
@@ -2830,7 +3026,24 @@ fn read_http_request(
     limits: HttpServerRuntimeLimits,
     span: Span,
 ) -> Result<ParsedHttpRequest, HttpWireResponse> {
-    let header = read_http_header(
+    stream
+        .set_nonblocking(true)
+        .map_err(|_| status_response(500, "Internal Server Error"))?;
+    let result = read_http_request_nonblocking(stream, limits, span);
+    let restored = stream.set_nonblocking(false);
+    match (result, restored) {
+        (Ok(request), Ok(())) => Ok(request),
+        (Err(response), _) => Err(response),
+        (Ok(_), Err(_)) => Err(status_response(500, "Internal Server Error")),
+    }
+}
+
+fn read_http_request_nonblocking(
+    stream: &mut TcpStream,
+    limits: HttpServerRuntimeLimits,
+    span: Span,
+) -> Result<ParsedHttpRequest, HttpWireResponse> {
+    let (header, body_prefix) = read_http_header(
         stream,
         limits.max_header_bytes,
         limits.idle_timeout,
@@ -2844,47 +3057,108 @@ fn read_http_request(
     let Some(first_line) = lines.next() else {
         return Err(status_response(400, "Bad Request"));
     };
-    let parts = first_line.split_whitespace().collect::<Vec<_>>();
-    if parts.len() != 3 {
+    let mut parts = first_line.split(' ');
+    let Some(method) = parts.next() else {
+        return Err(status_response(400, "Bad Request"));
+    };
+    let Some(target) = parts.next() else {
+        return Err(status_response(400, "Bad Request"));
+    };
+    let Some(version) = parts.next() else {
+        return Err(status_response(400, "Bad Request"));
+    };
+    if parts.next().is_some()
+        || method.is_empty()
+        || method.len() > HTTP_MAX_METHOD_BYTES
+        || !method.bytes().all(is_http_token_byte)
+        || version != "HTTP/1.1"
+        || !is_valid_request_target(target)
+    {
         return Err(status_response(400, "Bad Request"));
     }
     // Checked before the target is copied or routed: an over-long target is 414,
     // never truncated. Truncating would let two distinct paths that share a long
     // prefix resolve to the same route.
-    if parts[1].len() > stdlib::http::MAX_REQUEST_TARGET_BYTES {
+    if target.len() > stdlib::http::MAX_REQUEST_TARGET_BYTES {
         return Err(status_response(414, "URI Too Long"));
     }
-    let method = parts[0].to_ascii_uppercase();
-    let target = parts[1].to_string();
+    let method = method.to_string();
+    let target = target.to_string();
     let mut headers = HashMap::new();
+    let mut saw_host = false;
+    let mut content_length = None;
     for line in lines {
         if line.is_empty() {
             continue;
         }
-        let Some((name, value)) = line.split_once(':') else {
+        if line.starts_with([' ', '\t']) {
+            return Err(status_response(400, "Bad Request"));
+        }
+        let Some(colon) = line.find(':') else {
             return Err(status_response(400, "Bad Request"));
         };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        let name = &line[..colon];
+        let raw_value = &line[colon + 1..];
+        if name.is_empty()
+            || !name.bytes().all(is_http_token_byte)
+            || !is_safe_http_field_value(raw_value)
+        {
+            return Err(status_response(400, "Bad Request"));
+        }
+        let name = name.to_ascii_lowercase();
+        let value = raw_value.trim_matches([' ', '\t']).to_string();
+        match name.as_str() {
+            "host" => {
+                if saw_host || value.is_empty() {
+                    return Err(status_response(400, "Bad Request"));
+                }
+                saw_host = true;
+            }
+            "transfer-encoding" => return Err(status_response(400, "Bad Request")),
+            "expect" => return Err(status_response(417, "Expectation Failed")),
+            "content-length" => {
+                if content_length.is_some()
+                    || value.is_empty()
+                    || !value.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return Err(status_response(400, "Bad Request"));
+                }
+                content_length = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| status_response(400, "Bad Request"))?,
+                );
+            }
+            _ => {}
+        }
+        headers.insert(name, value);
     }
-    let content_length = match headers.get("content-length") {
-        Some(value) => value
-            .parse::<usize>()
-            .map_err(|_| status_response(400, "Bad Request"))?,
-        None => 0,
-    };
+    if !saw_host {
+        return Err(status_response(400, "Bad Request"));
+    }
+    let content_length = content_length.unwrap_or(0);
     if content_length > limits.max_body_bytes {
         return Err(status_response(413, "Content Too Large"));
     }
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        let _ = stream.set_read_timeout(Some(limits.read_body_timeout));
-        stream
-            .read_exact(&mut body)
-            .map_err(|_| status_response(408, "Request Timeout"))?;
-    }
-    let body = String::from_utf8(body).map_err(|_| status_response(400, "Bad Request"))?;
     let (path, query) =
         split_path_query(&target, span).map_err(|_| status_response(400, "Bad Request"))?;
+    if path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
+        > stdlib::http::MAX_REQUEST_PATH_SEGMENTS
+    {
+        return Err(status_response(414, "URI Too Long"));
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        let prefix_len = body_prefix.len().min(content_length);
+        body[..prefix_len].copy_from_slice(&body_prefix[..prefix_len]);
+        if prefix_len < content_length {
+            read_http_body(stream, &mut body[prefix_len..], limits.read_body_timeout)?;
+        }
+    }
+    let body = String::from_utf8(body).map_err(|_| status_response(400, "Bad Request"))?;
     Ok(ParsedHttpRequest {
         method,
         path,
@@ -2899,34 +3173,209 @@ fn read_http_header(
     max_header_bytes: usize,
     idle_timeout: Duration,
     read_header_timeout: Duration,
-) -> Result<Vec<u8>, HttpWireResponse> {
+) -> Result<(Vec<u8>, Vec<u8>), HttpWireResponse> {
+    const READ_CHUNK_BYTES: usize = 8192;
     let mut bytes = Vec::new();
-    let mut one = [0u8; 1];
-    let _ = stream.set_read_timeout(Some(idle_timeout));
+    let mut incoming = [0u8; READ_CHUNK_BYTES];
+    let idle_deadline = http_deadline(idle_timeout);
+    let mut header_deadline = None;
     loop {
-        let read = stream
-            .read(&mut one)
-            .map_err(|_| status_response(408, "Request Timeout"))?;
+        let read = read_http_with_deadline(
+            stream,
+            &mut incoming,
+            header_deadline.unwrap_or(idle_deadline),
+        )?;
         if read == 0 {
             break;
         }
-        bytes.push(one[0]);
-        if bytes.len() == 1 {
-            let _ = stream.set_read_timeout(Some(read_header_timeout));
+        let scan_from = bytes.len();
+        bytes.extend_from_slice(&incoming[..read]);
+        if scan_from == 0 {
+            header_deadline = Some(http_deadline(read_header_timeout));
         }
-        if bytes.len() > max_header_bytes {
-            return Err(status_response(431, "Request Header Fields Too Large"));
-        }
-        if bytes.ends_with(b"\r\n\r\n") {
-            bytes.truncate(bytes.len() - 4);
-            return Ok(bytes);
-        }
-        if bytes.ends_with(b"\n\n") {
-            bytes.truncate(bytes.len() - 2);
-            return Ok(bytes);
+        for index in scan_from..bytes.len() {
+            if index + 1 > max_header_bytes {
+                return Err(status_response(431, "Request Header Fields Too Large"));
+            }
+            if bytes[index] == b'\n' && (index < 1 || bytes[index - 1] != b'\r') {
+                return Err(status_response(400, "Bad Request"));
+            }
+            if index >= 1 && bytes[index - 1] == b'\r' && bytes[index] != b'\n' {
+                return Err(status_response(400, "Bad Request"));
+            }
+            if index >= 3 && &bytes[index - 3..=index] == b"\r\n\r\n" {
+                let body_prefix = bytes.split_off(index + 1);
+                bytes.truncate(index - 3);
+                return Ok((bytes, body_prefix));
+            }
         }
     }
     Err(status_response(400, "Bad Request"))
+}
+
+fn read_http_body(
+    stream: &mut TcpStream,
+    body: &mut [u8],
+    timeout: Duration,
+) -> Result<(), HttpWireResponse> {
+    let deadline = http_deadline(timeout);
+    let mut offset = 0usize;
+    while offset < body.len() {
+        match read_http_with_deadline(stream, &mut body[offset..], deadline)? {
+            0 => return Err(status_response(408, "Request Timeout")),
+            read => offset += read,
+        }
+    }
+    Ok(())
+}
+
+fn http_deadline(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout).unwrap_or(now)
+}
+
+fn set_http_read_deadline(stream: &TcpStream, deadline: Instant) -> Result<(), HttpWireResponse> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(status_response(408, "Request Timeout"));
+    };
+    if remaining.is_zero() {
+        return Err(status_response(408, "Request Timeout"));
+    }
+    stream
+        .set_read_timeout(Some(remaining))
+        .map_err(|_| status_response(408, "Request Timeout"))
+}
+
+fn read_http_with_deadline(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> Result<usize, HttpWireResponse> {
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(status_response(408, "Request Timeout"));
+        };
+        if remaining.is_zero() {
+            return Err(status_response(408, "Request Timeout"));
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| status_response(408, "Request Timeout"))?;
+        match stream.read(buffer) {
+            Ok(read) => return Ok(read),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(remaining.min(Duration::from_millis(2)));
+            }
+            Err(_) => return Err(status_response(408, "Request Timeout")),
+        }
+    }
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_valid_request_target(target: &str) -> bool {
+    let bytes = target.as_bytes();
+    if bytes.first() != Some(&b'/') {
+        return false;
+    }
+    let mut in_query = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'?' && !in_query {
+            in_query = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'/' || (in_query && byte == b'?') {
+            index += 1;
+            continue;
+        }
+        if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        if !is_uri_pchar_byte(byte) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn is_valid_uri_pchar_sequence(bytes: &[u8]) -> bool {
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else if is_uri_pchar_byte(bytes[index]) {
+            index += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_uri_pchar_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+        )
+}
+
+fn is_safe_http_field_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
 }
 
 fn split_path_query(target: &str, _span: Span) -> KuResult<(String, HashMap<String, String>)> {
@@ -3108,7 +3557,7 @@ fn value_to_http_response(value: Value) -> Option<HttpWireResponse> {
         if ok {
             return value_to_http_response(*value);
         }
-        return Some(status_response(500, &http_error_message(*value)));
+        return Some(status_response(500, "Internal Server Error"));
     }
     let Value::Object(fields) = value else {
         return None;
@@ -3138,15 +3587,6 @@ fn value_to_http_response(value: Value) -> Option<HttpWireResponse> {
     })
 }
 
-fn http_error_message(value: Value) -> String {
-    if let Value::Object(fields) = &value {
-        if let Some(Value::String(message)) = fields.get("message") {
-            return message.clone();
-        }
-    }
-    value.to_string()
-}
-
 fn status_response(status: i64, message: &str) -> HttpWireResponse {
     HttpWireResponse {
         status,
@@ -3158,29 +3598,107 @@ fn status_response(status: i64, message: &str) -> HttpWireResponse {
     }
 }
 
-fn write_http_response(stream: &mut TcpStream, response: HttpWireResponse) -> KuResult<()> {
+fn write_http_response(
+    stream: &mut TcpStream,
+    response: HttpWireResponse,
+    timeout: Duration,
+) -> KuResult<()> {
+    let response = prepare_http_response(response);
     let reason = stdlib::http::status_text(response.status);
     let mut headers = response.headers;
-    headers
-        .entry("content-length".to_string())
-        .or_insert_with(|| response.body.len().to_string());
-    headers
-        .entry("connection".to_string())
-        .or_insert_with(|| "close".to_string());
+    if !((100..200).contains(&response.status) || matches!(response.status, 204 | 304)) {
+        headers.insert(
+            "content-length".to_string(),
+            response.body.len().to_string(),
+        );
+    }
+    headers.insert("connection".to_string(), "close".to_string());
     let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason);
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
-    stream
-        .write_all(head.as_bytes())
-        .and_then(|_| stream.write_all(response.body.as_bytes()))
-        .map_err(|err| {
+    let deadline = http_deadline(timeout);
+    write_http_all(stream, head.as_bytes(), deadline)?;
+    write_http_all(stream, response.body.as_bytes(), deadline)
+}
+
+fn write_http_all(stream: &mut TcpStream, bytes: &[u8], deadline: Instant) -> KuResult<()> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(KuError::runtime(
+                "http response write timed out",
+                Span::default(),
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(KuError::runtime(
+                "http response write timed out",
+                Span::default(),
+            ));
+        }
+        stream.set_write_timeout(Some(remaining)).map_err(|err| {
             KuError::runtime(
-                format!("http response write failed: {err}"),
+                format!("http response write timeout setup failed: {err}"),
                 Span::default(),
             )
-        })
+        })?;
+        match stream.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(KuError::runtime(
+                    "http response connection closed during write",
+                    Span::default(),
+                ))
+            }
+            Ok(written) => offset += written,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                return Err(KuError::runtime(
+                    format!("http response write failed: {err}"),
+                    Span::default(),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepare_http_response(mut response: HttpWireResponse) -> HttpWireResponse {
+    if !(100..=599).contains(&response.status) {
+        return status_response(500, "Internal Server Error");
+    }
+    let mut headers = HashMap::new();
+    for (name, value) in response.headers {
+        if name.is_empty()
+            || !name.bytes().all(is_http_token_byte)
+            || !is_safe_http_field_value(&value)
+        {
+            return status_response(500, "Internal Server Error");
+        }
+        let name = name.to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "connection"
+                | "content-length"
+                | "keep-alive"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        ) {
+            continue;
+        }
+        if headers.insert(name, value).is_some() {
+            return status_response(500, "Internal Server Error");
+        }
+    }
+    if (100..200).contains(&response.status) || matches!(response.status, 204 | 304) {
+        response.body.clear();
+    }
+    response.headers = headers;
+    response
 }
 
 fn result_from_listener_operation(result: KuResult<()>, code: &str) -> Value {
@@ -3193,18 +3711,55 @@ fn result_from_listener_operation(result: KuResult<()>, code: &str) -> Value {
     }
 }
 
-fn service_int(service: &Value, name: &str) -> Option<usize> {
+fn bounded_service_int(
+    service: &Value,
+    name: &str,
+    default: usize,
+    maximum: usize,
+    span: Span,
+) -> KuResult<usize> {
     let Value::Object(fields) = service else {
-        return None;
+        return Err(KuError::runtime("http service must be an object", span));
     };
-    match fields.get(name) {
+    let value = match fields.get(name) {
         Some(Value::Int(value)) => usize::try_from(*value).ok(),
-        _ => None,
+        Some(Value::Null) | None => return Ok(default),
+        Some(other) => {
+            return Err(KuError::runtime(
+                format!(
+                    "type error: http config field '{name}' must be int but got {}",
+                    other.type_name()
+                ),
+                span,
+            ))
+        }
+    };
+    match value {
+        Some(value) if value > 0 && value <= maximum => Ok(value),
+        Some(0) => Err(KuError::runtime(
+            format!("http config field '{name}' must be a positive int"),
+            span,
+        )),
+        _ => Err(KuError::runtime(
+            format!("http config field '{name}' must be at most {maximum}"),
+            span,
+        )),
     }
 }
 
-fn duration_from_service(service: &Value, name: &str) -> Duration {
-    Duration::from_millis(service_int(service, name).unwrap_or(5_000) as u64)
+fn service_duration(
+    service: &Value,
+    name: &str,
+    default_ms: usize,
+    span: Span,
+) -> KuResult<Duration> {
+    Ok(Duration::from_millis(bounded_service_int(
+        service,
+        name,
+        default_ms,
+        stdlib::http::MAX_TIMEOUT_MS as usize,
+        span,
+    )? as u64))
 }
 
 fn http_error_result(code: &str, message: impl Into<String>) -> Value {
@@ -3634,8 +4189,10 @@ fn is_blocking_dotted_builtin(expr: &Expr) -> bool {
     };
     matches!(
         (module.as_str(), name.as_str()),
-        ("fs", "read" | "try_read" | "write" | "try_write")
-            | ("config", "env" | "env_file" | "yaml")
+        (
+            "fs",
+            "read" | "try_read" | "write" | "try_write" | "exists" | "read_dir",
+        ) | ("config", "env" | "env_file" | "yaml")
             | ("time", "sleep")
             | ("http", "get" | "post" | "request")
     )
@@ -3684,9 +4241,13 @@ fn collect_free_block(body: &[Stmt], bound: &mut HashSet<String>, free: &mut Has
 
 fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSet<String>) {
     match stmt {
-        Stmt::VarDecl { name, value, .. } | Stmt::Assign { name, value, .. } => {
+        Stmt::VarDecl { name, value, .. } => {
             collect_free_expr(value, bound, free);
             bound.insert(name.clone());
+        }
+        Stmt::Assign { name, value, .. } => {
+            collect_free_expr(value, bound, free);
+            collect_free_assignment_name(name, bound, free);
         }
         Stmt::AssignTarget { target, value, .. } => {
             collect_free_assign_target(target, bound, free);
@@ -3701,7 +4262,7 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
                 collect_free_expr(value, bound, free);
             }
             for name in names.iter().flatten() {
-                bound.insert(name.clone());
+                collect_free_assignment_name(name, bound, free);
             }
         }
         Stmt::ObjectDestructureAssign {
@@ -3716,11 +4277,11 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
                     collect_free_expr(default, bound, free);
                 }
                 if let Some(local) = &binding.local {
-                    bound.insert(local.clone());
+                    collect_free_assignment_name(local, bound, free);
                 }
             }
             if let Some(local) = rest.as_ref().and_then(|rest| rest.local.as_ref()) {
-                bound.insert(local.clone());
+                collect_free_assignment_name(local, bound, free);
             }
         }
         Stmt::If {
@@ -3751,6 +4312,10 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             collect_free_block(body, &mut scoped, free);
         }
         Stmt::Function(function) => {
+            let mut nested = bound.clone();
+            nested.insert(function.name.clone());
+            nested.extend(function.params.iter().map(|param| param.name.clone()));
+            collect_free_block(&function.body, &mut nested, free);
             bound.insert(function.name.clone());
         }
         Stmt::Try {
@@ -3779,6 +4344,17 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
         Stmt::Expr { expr, .. } => collect_free_expr(expr, bound, free),
     }
+}
+
+fn collect_free_assignment_name(
+    name: &str,
+    bound: &mut HashSet<String>,
+    free: &mut HashSet<String>,
+) {
+    if !bound.contains(name) {
+        free.insert(name.to_string());
+    }
+    bound.insert(name.to_string());
 }
 
 fn collect_free_assign_target(
@@ -3869,10 +4445,12 @@ fn collect_free_expr(expr: &Expr, bound: &HashSet<String>, free: &mut HashSet<St
         ExprKind::Match { value, arms } => {
             collect_free_expr(value, bound, free);
             for arm in arms {
+                let mut arm_bound = bound.clone();
+                bind_match_pattern_names(&arm.pattern, &mut arm_bound);
                 if let Some(guard) = &arm.guard {
-                    collect_free_expr(guard, bound, free);
+                    collect_free_expr(guard, &arm_bound, free);
                 }
-                collect_free_expr(&arm.value, bound, free);
+                collect_free_expr(&arm.value, &arm_bound, free);
             }
         }
         ExprKind::Function { params, body, .. } => {
@@ -3886,8 +4464,88 @@ fn collect_free_expr(expr: &Expr, bound: &HashSet<String>, free: &mut HashSet<St
     }
 }
 
+fn bind_match_pattern_names(pattern: &MatchPattern, bound: &mut HashSet<String>) {
+    match pattern {
+        MatchPattern::Binding(name) => {
+            bound.insert(name.clone());
+        }
+        MatchPattern::EnumVariant { fields, .. } => {
+            for field in fields {
+                bind_match_pattern_names(field, bound);
+            }
+        }
+        MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
+    }
+}
+
 impl Default for Interpreter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+
+    #[test]
+    fn failed_pure_append_argument_leaves_the_receiver_unchanged() {
+        let span = Span::default();
+        let integer = |value| Expr::new(ExprKind::Literal(Literal::Int(value)), span);
+        let variable = |name: &str| Expr::new(ExprKind::Variable(name.into()), span);
+        let failures = [
+            Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(integer(1)),
+                    op: BinaryOp::Divide,
+                    right: Box::new(integer(0)),
+                },
+                span,
+            ),
+            Expr::new(
+                ExprKind::Index {
+                    target: Box::new(variable("other")),
+                    index: Box::new(integer(9)),
+                },
+                span,
+            ),
+        ];
+        for piece in failures {
+            let mut env = Env::new();
+            env.define(
+                "values".into(),
+                Value::Array(vec![Value::Int(42)]),
+                true,
+                span,
+            )
+            .unwrap();
+            env.define("other".into(), Value::Array(Vec::new()), true, span)
+                .unwrap();
+            let assignment = Stmt::Assign {
+                name: "values".into(),
+                value: Expr::new(
+                    ExprKind::Call {
+                        callee: Box::new(Expr::new(
+                            ExprKind::Field {
+                                target: Box::new(variable("values")),
+                                name: "push".into(),
+                            },
+                            span,
+                        )),
+                        args: vec![piece],
+                    },
+                    span,
+                ),
+                span,
+            };
+            assert!(Interpreter::new()
+                .exec_stmt(&assignment, &mut env, 0)
+                .is_err());
+            env.with_value("values", span, |value| {
+                assert!(matches!(value, Value::Array(values) if values.len() == 1 && matches!(values[0], Value::Int(42))));
+                Ok(())
+            })
+            .unwrap();
+        }
     }
 }

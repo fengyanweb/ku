@@ -1,0 +1,52 @@
+import { Add, LoadName } from "./support.ku"
+import json from "std.json"
+import time from "std.time"
+
+fn main(): null! {
+    name = LoadName()?
+    greeting = "Hello " + name
+    greeting_copy = greeting.clone()
+    if (greeting_copy != "Hello Ku") {
+        panic("KuString clone/concat failed")
+    }
+
+    numbers = [1, 2, 3]
+    extended = numbers.push(4)
+    if (numbers.len() != 3 || extended.len() != 4 || extended[3] != 4) {
+        panic("array ABI failed")
+    }
+
+    value = { name: "Ku", count: extended.len(), active: true }
+    encoded = json.stringify(value)?
+    decoded = json.parse(encoded)?
+    if (decoded["name"]?.as_str()? != "Ku") {
+        panic("object/json ABI failed")
+    }
+
+    operation: fn(int, int): int = Add
+    if (operation(1, 2) != 3) {
+        panic("function value ABI failed")
+    }
+
+    count = 0
+    increment = () => {
+        count = count + 1
+        return count
+    }
+    first = increment()
+    second = increment()
+    if (first != 1 || second != 2 || count != 2) {
+        panic("closure ABI failed")
+    }
+
+    wall = time.now()
+    wall_millis = time.millis()
+    steady_before = time.steady_millis()
+    steady_after = time.steady_millis()
+    if (wall <= 0 || wall_millis <= 0 || steady_after < steady_before) {
+        panic("time ABI failed")
+    }
+
+    println("native-ci-ok")
+    return ok(null)
+}

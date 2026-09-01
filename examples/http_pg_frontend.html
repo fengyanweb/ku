@@ -65,9 +65,20 @@
       const ms = Math.round(performance.now() - t0);
       document.getElementById('lat').textContent = ms + ' ms';
       if (j.code !== 0) throw new Error(j.msg || '查询失败');
-      document.getElementById('data').innerHTML = F.map(([label, key, num]) =>
-        `<div class="row"><span class="k">${label}</span><span class="v ${num?'num':''}">${j.data[key]}</span></div>`
-      ).join('');
+      if (!j.data || typeof j.data !== 'object') throw new Error('响应缺少 data');
+      const rows = F.map(([label, key, num]) => {
+        const row = document.createElement('div');
+        row.className = 'row';
+        const name = document.createElement('span');
+        name.className = 'k';
+        name.textContent = label;
+        const value = document.createElement('span');
+        value.className = num ? 'v num' : 'v';
+        value.textContent = String(j.data[key] ?? '');
+        row.append(name, value);
+        return row;
+      });
+      document.getElementById('data').replaceChildren(...rows);
     } catch (e) {
       err.textContent = '错误:' + e.message;
     } finally {

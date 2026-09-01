@@ -910,10 +910,11 @@ cli
 示例：
 
 ```ku
-fn main() {
-    let text = fs.read("config.json")
-    let config = json.parse(text)
+fn main(): null! {
+    let text = fs.read("config.json")?
+    let config = json.parse(text)?
     print(config)
+    return ok(null)
 }
 ```
 

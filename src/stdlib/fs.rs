@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    error::{KuError, KuResult},
+    error::KuResult,
     span::Span,
     stdlib::{
         core::{expect_arg_count, expected_type},
@@ -15,6 +15,9 @@ use crate::{
 
 const MAX_READ_BYTES: u64 = 1_000_000;
 const MAX_WRITE_BYTES: usize = 1_000_000;
+const MAX_PATH_BYTES: usize = 32 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 10_000;
+const MAX_DIRECTORY_OUTPUT_BYTES: usize = 1_000_000;
 
 pub fn eval(
     function: &str,
@@ -27,32 +30,104 @@ pub fn eval(
         "try_read" => try_read(args, span, base_dir).map(Some),
         "write" => write(args, span, base_dir).map(Some),
         "try_write" => try_write(args, span, base_dir).map(Some),
+        "exists" => exists(args, span, base_dir).map(Some),
+        "read_dir" => read_dir(args, span, base_dir).map(Some),
         _ => Ok(None),
     }
 }
 
-fn read(args: &[Value], span: Span, base_dir: &Path) -> KuResult<Value> {
-    expect_arg_count("fs.read", args.len(), 1, span)?;
+fn exists(args: &[Value], span: Span, base_dir: &Path) -> KuResult<Value> {
+    expect_arg_count("fs.exists", args.len(), 1, span)?;
     let Value::String(path) = &args[0] else {
         return Err(expected_type("str", &args[0], span));
     };
-    let resolved = resolve_read_path(base_dir, path);
-    let display_path = resolved.display().to_string();
-    let metadata = fs::metadata(&resolved)
-        .map_err(|err| KuError::runtime(format!("failed to read '{display_path}': {err}"), span))?;
-    if metadata.len() > MAX_READ_BYTES {
-        return Err(KuError::runtime(
-            format!("failed to read '{display_path}': file is too large"),
-            span,
-        ));
+    if path.len() > MAX_PATH_BYTES {
+        return Ok(Value::Bool(false));
     }
-    let text = fs::read_to_string(&resolved)
-        .map_err(|err| KuError::runtime(format!("failed to read '{display_path}': {err}"), span))?;
-    Ok(Value::String(text))
+    let resolved = resolve_path(base_dir, path);
+    if resolved.to_string_lossy().len() > MAX_PATH_BYTES {
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::Bool(fs::metadata(resolved).is_ok()))
+}
+
+fn read_dir(args: &[Value], span: Span, base_dir: &Path) -> KuResult<Value> {
+    expect_arg_count("fs.read_dir", args.len(), 1, span)?;
+    let Value::String(path) = &args[0] else {
+        return Err(expected_type("str", &args[0], span));
+    };
+    let resolved = resolve_path(base_dir, path);
+    let display_path = resolved.display().to_string();
+    if path.len() > MAX_PATH_BYTES || display_path.len() > MAX_PATH_BYTES {
+        return Ok(read_dir_error(&display_path, "directory path is too long"));
+    }
+    let entries = match fs::read_dir(&resolved) {
+        Ok(entries) => entries,
+        Err(err) => return Ok(read_dir_error(&display_path, err)),
+    };
+    let mut paths = Vec::new();
+    let mut output_bytes = 0_usize;
+    for entry in entries {
+        if paths.len() >= MAX_DIRECTORY_ENTRIES {
+            return Ok(read_dir_error(
+                &display_path,
+                "directory has too many entries",
+            ));
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => return Ok(read_dir_error(&display_path, err)),
+        };
+        let entry_display = match entry.path().into_os_string().into_string() {
+            Ok(path) => path,
+            Err(_) => {
+                return Ok(read_dir_error(
+                    &display_path,
+                    "directory entry path is not valid UTF-8",
+                ));
+            }
+        };
+        if entry_display.len() > MAX_PATH_BYTES {
+            return Ok(read_dir_error(
+                &display_path,
+                "directory entry path is too long",
+            ));
+        }
+        output_bytes = match output_bytes.checked_add(entry_display.len()) {
+            Some(bytes) if bytes <= MAX_DIRECTORY_OUTPUT_BYTES => bytes,
+            _ => {
+                return Ok(read_dir_error(
+                    &display_path,
+                    "directory listing is too large",
+                ));
+            }
+        };
+        paths.push(entry_display);
+    }
+    paths.sort();
+    Ok(errors::ok(Value::Array(
+        paths.into_iter().map(Value::String).collect(),
+    )))
+}
+
+fn read_dir_error(path: &str, cause: impl std::fmt::Display) -> Value {
+    errors::err(
+        "fs",
+        "read_dir_failed",
+        format!("failed to read directory '{path}': {cause}"),
+    )
+}
+
+fn read(args: &[Value], span: Span, base_dir: &Path) -> KuResult<Value> {
+    read_result("fs.read", args, span, base_dir)
 }
 
 fn try_read(args: &[Value], span: Span, base_dir: &Path) -> KuResult<Value> {
-    expect_arg_count("fs.try_read", args.len(), 1, span)?;
+    read_result("fs.try_read", args, span, base_dir)
+}
+
+fn read_result(operation: &str, args: &[Value], span: Span, base_dir: &Path) -> KuResult<Value> {
+    expect_arg_count(operation, args.len(), 1, span)?;
     let Value::String(path) = &args[0] else {
         return Err(expected_type("str", &args[0], span));
     };
@@ -86,24 +161,15 @@ fn try_read(args: &[Value], span: Span, base_dir: &Path) -> KuResult<Value> {
 }
 
 fn write(args: &[Value], span: Span, base_dir: &Path) -> KuResult<Value> {
-    expect_arg_count("fs.write", args.len(), 2, span)?;
-    let (path, text) = expect_write_args(args, span)?;
-    let resolved = resolve_path(base_dir, path);
-    let display_path = resolved.display().to_string();
-    if text.len() > MAX_WRITE_BYTES {
-        return Err(KuError::runtime(
-            format!("failed to write '{display_path}': content is too large"),
-            span,
-        ));
-    }
-    fs::write(&resolved, text).map_err(|err| {
-        KuError::runtime(format!("failed to write '{display_path}': {err}"), span)
-    })?;
-    Ok(Value::Null)
+    write_result("fs.write", args, span, base_dir)
 }
 
 fn try_write(args: &[Value], span: Span, base_dir: &Path) -> KuResult<Value> {
-    expect_arg_count("fs.try_write", args.len(), 2, span)?;
+    write_result("fs.try_write", args, span, base_dir)
+}
+
+fn write_result(operation: &str, args: &[Value], span: Span, base_dir: &Path) -> KuResult<Value> {
+    expect_arg_count(operation, args.len(), 2, span)?;
     let (path, text) = expect_write_args(args, span)?;
     let resolved = resolve_path(base_dir, path);
     let display_path = resolved.display().to_string();
