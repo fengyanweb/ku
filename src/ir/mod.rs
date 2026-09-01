@@ -7,12 +7,12 @@ use std::{
 
 use crate::{
     ast::{
-        AssignTarget, BinaryOp, EnumDecl, Expr, ExprKind, Item, Literal, MatchArm, MatchPattern,
-        Program, Stmt, StructDecl, TypeName, UnaryOp,
+        is_pure_append_argument, AssignTarget, BinaryOp, EnumDecl, Expr, ExprKind, Item, Literal,
+        MatchArm, MatchPattern, Program, Stmt, StructDecl, TypeName, UnaryOp,
     },
     error::{KuError, KuResult},
     span::Span,
-    stdlib::metadata::{self, Signature, TypePattern},
+    stdlib::metadata::{self, ArgRule, Signature, TypePattern},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +181,14 @@ pub enum IrTerminator {
         target: BlockId,
     },
     PropagateErr(IrExpr),
+    /// Cooperative native-handler cancellation branch. The backend only polls a
+    /// thread-local deadline and chooses one edge; the explicit timeout edge is
+    /// lowered through `return_terminator`, so every enclosing `finally` keeps
+    /// its normal structured-control-flow semantics.
+    Safepoint {
+        continue_block: BlockId,
+        timeout_block: BlockId,
+    },
     Return(Option<IrExpr>),
     Unreachable,
 }
@@ -234,10 +242,12 @@ pub enum IrExprKind {
     /// A closure value (Stage 6a): a function pointer paired with an env. In 6a
     /// `captures` is always empty and the env is NULL at runtime. `function_id`
     /// points either at a lifted closure body or at a top-level function (reached
-    /// through a `__thunk`).
+    /// through a `__thunk`). Each captured cell records whether its pointer comes
+    /// from a local cell variable or the current closure body's enclosing env;
+    /// nested closures must not emit a nonexistent bare local for the latter.
     MakeClosure {
         function_id: FunctionId,
-        captures: Vec<(String, IrType)>,
+        captures: Vec<(String, IrType, IrCaptureSource)>,
     },
     /// Stage 6b: read a cell's payload (`cell->value`). The inner expr evaluates
     /// to a `KuCell*`; the result type is the payload type.
@@ -245,6 +255,12 @@ pub enum IrExprKind {
     /// Stage 6b: inside a closure body, the captured cell pointer for `name`
     /// (resolves to `__e->{name}`). Its type is `Cell(payload)`.
     CapturedCell(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrCaptureSource {
+    Local,
+    EnclosingEnvironment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,14 +318,13 @@ fn ir_expr_is_place(expr: &IrExpr) -> bool {
 /// (rather than being a trivially-copyable Copy value). Matches the set of types
 /// `c_clone_expr` / `c_drop_value` know how to handle in the backend.
 fn ir_type_is_owned(ty: &IrType) -> bool {
-    matches!(
-        ty,
-        IrType::Str
-            | IrType::Array(_)
-            | IrType::Result(_)
-            | IrType::Named(_)
-            | IrType::Closure { .. }
-    )
+    match ty {
+        IrType::Str | IrType::Array(_) | IrType::Result(_) | IrType::Closure { .. } => true,
+        // The native Time ABI is a tagged, by-value pair. It is intentionally
+        // distinct from a dynamic object and carries no heap ownership.
+        IrType::Named(name) => name != TIME_TYPE,
+        _ => false,
+    }
 }
 
 pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
@@ -368,8 +383,7 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
         }
         let saved_id = next_function_id.get();
         let inferred = {
-            let throwaway_lifted: Rc<RefCell<Vec<IrFunction>>> =
-                Rc::new(RefCell::new(Vec::new()));
+            let throwaway_lifted: Rc<RefCell<Vec<IrFunction>>> = Rc::new(RefCell::new(Vec::new()));
             let mut probe = FunctionLowerer::new(
                 &signatures,
                 &layouts,
@@ -539,6 +553,7 @@ fn optimize_terminator(terminator: &mut IrTerminator) {
         }
         IrTerminator::Next
         | IrTerminator::Jump(_)
+        | IrTerminator::Safepoint { .. }
         | IrTerminator::Return(None)
         | IrTerminator::Unreachable => {}
     }
@@ -732,6 +747,10 @@ fn terminator_successors(terminator: &IrTerminator, next: Option<BlockId>) -> Ve
             ok_block: body_block,
             err_block: after_block,
             ..
+        }
+        | IrTerminator::Safepoint {
+            continue_block: body_block,
+            timeout_block: after_block,
         } => vec![*body_block, *after_block],
         IrTerminator::PropagateErr(_) | IrTerminator::Return(_) | IrTerminator::Unreachable => {
             Vec::new()
@@ -931,6 +950,14 @@ impl fmt::Display for IrTerminator {
                 write!(f, "jump_err {result} block{}", target.0)
             }
             IrTerminator::PropagateErr(value) => write!(f, "propagate_err {value}"),
+            IrTerminator::Safepoint {
+                continue_block,
+                timeout_block,
+            } => write!(
+                f,
+                "safepoint continue block{} timeout block{}",
+                continue_block.0, timeout_block.0
+            ),
             IrTerminator::Return(Some(value)) => write!(f, "return {value}"),
             IrTerminator::Return(None) => write!(f, "return"),
             IrTerminator::Unreachable => write!(f, "unreachable"),
@@ -1004,6 +1031,12 @@ struct FunctionLowerer<'a> {
     layouts: &'a IrLayoutTable,
     return_type: IrType,
     locals: HashMap<String, IrType>,
+    /// Source spellings resolve to unique C/IR names while a lexical binding is
+    /// visible. The type table keeps emitted bindings for place/cleanup typing.
+    local_names: HashMap<String, String>,
+    /// Undo only aliases introduced by a lexical scope, rather than copying the
+    /// whole function's local table at every block.
+    local_scopes: Vec<Vec<(String, Option<String>)>>,
     blocks: Vec<IrBlock>,
     current: IrBlock,
     next_block_id: usize,
@@ -1016,9 +1049,11 @@ struct FunctionLowerer<'a> {
     /// Closure bodies lifted out of expressions, appended to the program's
     /// functions once every top-level function has been lowered.
     lifted_functions: Rc<RefCell<Vec<IrFunction>>>,
-    /// Stage 6b: names declared in this function body that some closure literal
-    /// captures, so their first `Let`/`Assign` boxes them into a `KuCell`.
-    boxed: HashSet<String>,
+    /// Stage 6b: binding sites declared in this function body that a closure
+    /// created while that exact binding is visible captures. Keeping the source
+    /// binding site (rather than only its spelling) prevents a closure-local or
+    /// later same-named binding from boxing an unrelated local.
+    boxed: HashSet<BoxedBindingSite>,
     /// Stage 6b: for a closure-body lowerer, the cells captured from the
     /// enclosing scope (`name` -> `Cell(payload)`). Reads become
     /// `CellLoad(CapturedCell(name))`; writes become
@@ -1032,12 +1067,37 @@ struct FunctionLowerer<'a> {
     self_recurse: Option<(String, FunctionId, IrType)>,
 }
 
+/// The source definition that owns a local binding. Statement offsets are
+/// stable within one parsed program, and `name` disambiguates the multiple
+/// bindings introduced by a destructuring assignment at the same statement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BoxedBindingSite {
+    name: String,
+    start_offset: usize,
+    end_offset: usize,
+}
+
+impl BoxedBindingSite {
+    fn new(name: &str, span: Span) -> Self {
+        Self {
+            name: name.to_string(),
+            start_offset: span.start.offset,
+            end_offset: span.end.offset,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct IrTryHandler {
     error_block: BlockId,
     error_name: String,
     return_block: Option<BlockId>,
     return_name: Option<String>,
+}
+
+struct LoweredCaptureBindings {
+    values: Vec<(String, IrType, IrCaptureSource)>,
+    aliases: HashMap<String, String>,
 }
 
 impl<'a> FunctionLowerer<'a> {
@@ -1053,6 +1113,8 @@ impl<'a> FunctionLowerer<'a> {
             layouts,
             return_type,
             locals: HashMap::new(),
+            local_names: HashMap::new(),
+            local_scopes: Vec::new(),
             blocks: Vec::new(),
             current: IrBlock {
                 id: BlockId(0),
@@ -1074,10 +1136,17 @@ impl<'a> FunctionLowerer<'a> {
 
     fn lower_block_body(&mut self, name: &str, body: &[Stmt], span: Span) -> KuResult<()> {
         // Stage 6b: any local this body declares that a nested closure literal
-        // captures must be boxed into a shared `KuCell` at its declaration.
-        let mut boxed = HashSet::new();
-        collect_boxed_candidates(body, &mut boxed);
-        self.boxed = boxed;
+        // captures must be boxed into a shared `KuCell` at its declaration. The
+        // scan is sequential and lexical: parameters/enclosing captures shadow
+        // assignment-only locals, but are not declarations owned by this body.
+        let lexical_bindings = self
+            .locals
+            .keys()
+            .chain(self.captures.keys())
+            .chain(self.local_names.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        self.boxed = collect_boxed_candidates(body, &lexical_bindings);
         self.current.name = name.to_string();
         for stmt in body {
             self.lower_stmt(stmt)?;
@@ -1092,76 +1161,128 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
+    fn local_ir_name<'b>(&'b self, name: &'b str) -> &'b str {
+        self.local_names
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
+    }
+
+    fn define_local(&mut self, name: &str, ty: IrType) -> String {
+        let visible_name = self.local_ir_name(name);
+        let needs_unique_name = !self.local_scopes.is_empty()
+            || self.locals.contains_key(visible_name)
+            || self.captures.contains_key(visible_name);
+        let ir_name = if needs_unique_name {
+            loop {
+                let candidate = format!("__ku_local_{}_{}", self.next_temp_id, name);
+                self.next_temp_id += 1;
+                if !self.locals.contains_key(&candidate) && !self.captures.contains_key(&candidate)
+                {
+                    break candidate;
+                }
+            }
+        } else {
+            name.to_string()
+        };
+        if let Some(scope) = self.local_scopes.last_mut() {
+            scope.push((name.to_string(), self.local_names.get(name).cloned()));
+        }
+        if ir_name != name {
+            self.local_names.insert(name.to_string(), ir_name.clone());
+        }
+        self.locals.insert(ir_name.clone(), ty);
+        ir_name
+    }
+
+    fn with_local_scope<T>(&mut self, lower: impl FnOnce(&mut Self) -> KuResult<T>) -> KuResult<T> {
+        self.local_scopes.push(Vec::new());
+        let result = lower(self);
+        for (name, previous) in self
+            .local_scopes
+            .pop()
+            .expect("IR lexical scope was pushed")
+            .into_iter()
+            .rev()
+        {
+            if let Some(previous) = previous {
+                self.local_names.insert(name, previous);
+            } else {
+                self.local_names.remove(&name);
+            }
+        }
+        result
+    }
+
+    fn lower_statements(&mut self, body: &[Stmt]) -> KuResult<()> {
+        for stmt in body {
+            self.lower_stmt(stmt)?;
+            if self.current.terminator != IrTerminator::Next {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_scoped_statements(&mut self, body: &[Stmt]) -> KuResult<()> {
+        self.with_local_scope(|lower| lower.lower_statements(body))
+    }
+
     fn lower_stmt(&mut self, stmt: &Stmt) -> KuResult<()> {
         match stmt {
             Stmt::VarDecl {
-                name, ty, value, ..
+                name,
+                ty,
+                value,
+                span: stmt_span,
+                ..
             } => {
                 let span = value.span;
                 let declared = ty.as_ref().map(|ty| lower_type(ty, self.layouts));
                 let value = self.lower_expr_with_expected(value, declared.as_ref())?;
                 let ty = declared.unwrap_or_else(|| value.ty.clone());
-                if self.boxed.contains(name) {
+                if self.binding_is_boxed(name, *stmt_span) {
                     self.push_cell_new(name.clone(), ty, value, span)?;
                 } else {
-                    self.locals.insert(name.clone(), ty.clone());
-                    self.current.instructions.push(IrInst::Let {
-                        name: name.clone(),
-                        ty,
-                        value,
-                    });
+                    let name = self.define_local(name, ty.clone());
+                    self.current
+                        .instructions
+                        .push(IrInst::Let { name, ty, value });
                 }
             }
-            Stmt::Assign { name, value, .. } => {
+            Stmt::Assign {
+                name,
+                value,
+                span: stmt_span,
+            } => {
                 let span = value.span;
                 // A closure assigned to an already-declared function-typed local
                 // takes that local's type as its expected function type.
-                let expected = match self.locals.get(name) {
+                let ir_name = self.local_ir_name(name);
+                let expected = match self.locals.get(ir_name) {
                     Some(IrType::Cell(inner)) => Some((**inner).clone()),
                     Some(ty) => Some(ty.clone()),
-                    None => self.captures.get(name).and_then(|ty| match ty {
-                        IrType::Cell(inner) => Some((**inner).clone()),
-                        other => Some(other.clone()),
+                    None => self.captures.get(ir_name).map(|ty| match ty {
+                        IrType::Cell(inner) => (**inner).clone(),
+                        other => other.clone(),
                     }),
                 };
-                let value = self.lower_expr_with_expected(value, expected.as_ref())?;
-                if self.captures.contains_key(name) {
-                    // Closure body writing a cell captured from the outer scope.
-                    let cell = self.captured_cell_expr(name);
-                    self.current
-                        .instructions
-                        .push(IrInst::CellStore { cell, value });
-                } else if let Some(inner) = self.boxed_local_inner(name) {
-                    // Write through an already-boxed local's cell.
-                    let cell = IrExpr {
-                        kind: IrExprKind::Local(name.clone()),
-                        ty: IrType::Cell(Box::new(inner)),
-                    };
-                    self.current
-                        .instructions
-                        .push(IrInst::CellStore { cell, value });
-                } else if self.boxed.contains(name) && !self.locals.contains_key(name) {
-                    // First assignment to a to-be-boxed local: allocate its cell.
-                    let inner = value.ty.clone();
-                    self.push_cell_new(name.clone(), inner, value, span)?;
-                } else if self.locals.contains_key(name) {
-                    self.current.instructions.push(IrInst::Store {
-                        target: IrLValue::Local(name.clone()),
-                        value,
-                    });
+                let value = if let Some(value) = self.lower_local_array_append(name, value)? {
+                    value
                 } else {
-                    let ty = value.ty.clone();
-                    self.locals.insert(name.clone(), ty.clone());
-                    self.current.instructions.push(IrInst::Let {
-                        name: name.clone(),
-                        ty,
-                        value,
-                    });
-                }
+                    self.lower_expr_with_expected(value, expected.as_ref())?
+                };
+                let define_boxed = self.binding_is_boxed(name, *stmt_span);
+                self.store_or_define_name(name, value, span, define_boxed)?;
             }
             Stmt::AssignTarget { target, value, .. } => {
-                let target = self.lower_lvalue(target)?;
                 let value = self.lower_expr(value)?;
+                // Match the interpreter: evaluate the RHS completely before any
+                // index expression in the destination. Materializing here also
+                // prevents a later target-side effect from changing a local/field
+                // that the RHS merely referenced.
+                let value = self.emit_temp(value)?;
+                let target = self.lower_lvalue(target)?;
                 self.current
                     .instructions
                     .push(IrInst::Store { target, value });
@@ -1169,9 +1290,54 @@ impl<'a> FunctionLowerer<'a> {
             Stmt::CompoundAssign {
                 target, op, value, ..
             } => {
+                // Compound assignment follows the same RHS-first rule as the
+                // interpreter. Keep it in a temp while the destination place and
+                // its indexes are resolved exactly once.
+                let right = self.lower_expr(value)?;
+                let right = self.emit_temp(right)?;
+                if let AssignTarget::Variable(name) = target {
+                    if *op == BinaryOp::Add
+                        && right.ty == IrType::Str
+                        && self.locals.get(self.local_ir_name(name)) == Some(&IrType::Str)
+                        && self.assignment_cell(name).is_none()
+                    {
+                        let value = self.emit_local_collection_reuse(
+                            "__ku_string_concat_reuse",
+                            name,
+                            IrType::Str,
+                            right,
+                        )?;
+                        self.current.instructions.push(IrInst::Store {
+                            target: IrLValue::Local(self.local_ir_name(name).to_string()),
+                            value,
+                        });
+                        return Ok(());
+                    }
+                    if let Some(cell) = self.assignment_cell(name) {
+                        let inner = match &cell.ty {
+                            IrType::Cell(inner) => (**inner).clone(),
+                            _ => IrType::Unknown,
+                        };
+                        let left = IrExpr {
+                            kind: IrExprKind::CellLoad(Box::new(cell.clone())),
+                            ty: inner,
+                        };
+                        let value = self.emit_temp(IrExpr {
+                            ty: binary_type(*op, &left.ty, &right.ty),
+                            kind: IrExprKind::Binary {
+                                left: Box::new(left),
+                                op: *op,
+                                right: Box::new(right),
+                            },
+                        })?;
+                        self.current
+                            .instructions
+                            .push(IrInst::CellStore { cell, value });
+                        return Ok(());
+                    }
+                }
                 let target = self.lower_lvalue_cached(target)?;
                 let left = self.lvalue_read_expr(&target);
-                let right = self.lower_expr(value)?;
                 let value = self.emit_temp(IrExpr {
                     ty: binary_type(*op, &left.ty, &right.ty),
                     kind: IrExprKind::Binary {
@@ -1210,20 +1376,8 @@ impl<'a> FunctionLowerer<'a> {
                     let Some(name) = name else {
                         continue;
                     };
-                    if self.locals.contains_key(name) {
-                        self.current.instructions.push(IrInst::Store {
-                            target: IrLValue::Local(name.clone()),
-                            value,
-                        });
-                    } else {
-                        let ty = value.ty.clone();
-                        self.locals.insert(name.clone(), ty.clone());
-                        self.current.instructions.push(IrInst::Let {
-                            name: name.clone(),
-                            ty,
-                            value,
-                        });
-                    }
+                    let define_boxed = self.binding_is_boxed(name, *span);
+                    self.store_or_define_name(name, value, *span, define_boxed)?;
                 }
             }
             Stmt::ObjectDestructureAssign { span, .. } => {
@@ -1245,10 +1399,10 @@ impl<'a> FunctionLowerer<'a> {
                 name,
                 iterable,
                 body,
-                ..
+                span,
             } => {
                 let iterable = self.lower_expr(iterable)?;
-                self.lower_for(name, iterable, body)?;
+                self.lower_for(name, iterable, body, *span)?;
             }
             Stmt::Break { span } | Stmt::Continue { span } => {
                 return Err(KuError::runtime(
@@ -1277,14 +1431,18 @@ impl<'a> FunctionLowerer<'a> {
                     let result = IrExpr {
                         kind: IrExprKind::Call {
                             callee: Box::new(IrExpr {
-                                kind: IrExprKind::Local("err".to_string()),
+                                kind: IrExprKind::Local("fail".to_string()),
                                 ty: IrType::Function,
                             }),
                             args: vec![value],
-                            kind: IrCallKind::Intrinsic("err".to_string()),
+                            kind: IrCallKind::Intrinsic("fail".to_string()),
                         },
                         ty: result_ty,
                     };
+                    // The catch slot takes this Result's error before JumpErr
+                    // reads it again. Keep one owner, not a constructor rvalue
+                    // that would move the same payload twice.
+                    let result = self.emit_temp(result)?;
                     self.current.terminator = self.err_terminator(result);
                 }
             }
@@ -1307,7 +1465,13 @@ impl<'a> FunctionLowerer<'a> {
             }
             Stmt::Expr { expr: value, .. } => {
                 let value = self.lower_expr(value)?;
+                let needs_safepoint = ir_expr_needs_post_call_safepoint(&value);
                 self.current.instructions.push(IrInst::Expr(value));
+                // A void-returning call is not materialized by `emit_temp`, so
+                // statement position appends its post-call cancellation edge.
+                if needs_safepoint {
+                    self.emit_safepoint();
+                }
             }
         }
         Ok(())
@@ -1331,24 +1495,14 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current();
 
         self.start_block(then_id, "then");
-        for stmt in then_branch {
-            self.lower_stmt(stmt)?;
-            if self.current.terminator != IrTerminator::Next {
-                break;
-            }
-        }
+        self.lower_scoped_statements(then_branch)?;
         if self.current.terminator == IrTerminator::Next {
             self.current.terminator = IrTerminator::Jump(after_id);
         }
         self.finish_current();
 
         self.start_block(else_id, "else");
-        for stmt in else_branch {
-            self.lower_stmt(stmt)?;
-            if self.current.terminator != IrTerminator::Next {
-                break;
-            }
-        }
+        self.lower_scoped_statements(else_branch)?;
         if self.current.terminator == IrTerminator::Next {
             self.current.terminator = IrTerminator::Jump(after_id);
         }
@@ -1375,13 +1529,12 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current();
 
         self.start_block(body_id, "while_body");
-        for stmt in body {
-            self.lower_stmt(stmt)?;
-            if self.current.terminator != IrTerminator::Next {
-                break;
-            }
-        }
+        self.lower_scoped_statements(body)?;
         if self.current.terminator == IrTerminator::Next {
+            // A tight compute loop remains cancellable even when its body has no
+            // calls. `emit_safepoint` creates an explicit timeout return edge, so
+            // an enclosing try/finally sees the same structured return route.
+            self.emit_safepoint();
             self.current.terminator = IrTerminator::Jump(cond_id);
         }
         self.finish_current();
@@ -1390,38 +1543,76 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
-    fn lower_for(&mut self, name: &str, iterable: IrExpr, body: &[Stmt]) -> KuResult<()> {
-        let iter_id = self.current.id;
+    fn lower_for(
+        &mut self,
+        name: &str,
+        iterable: IrExpr,
+        body: &[Stmt],
+        span: Span,
+    ) -> KuResult<()> {
+        let element = match &iterable.ty {
+            IrType::Array(element) => (**element).clone(),
+            IrType::Int => IrType::Int,
+            IrType::Unknown => IrType::Unknown,
+            other => {
+                return Err(KuError::runtime(
+                    format!("IR/native for expects array or int but got {other}"),
+                    span,
+                ));
+            }
+        };
+        // A loop iterator is a fresh lexical binding on every interpreter
+        // iteration. The current native closure ABI boxes declaration sites,
+        // while `ForEach` binds its value in a terminator, so silently treating
+        // this as an ordinary local would either miss the capture or make all
+        // iterations share the wrong cell. Reject this one unsupported corner
+        // until the IR can model per-iteration cells explicitly.
+        if self.binding_is_boxed(name, span) {
+            return Err(KuError::runtime(
+                "IR/native lowering does not support closure capture of a for loop variable yet",
+                span,
+            ));
+        }
+
+        self.with_local_scope(|lower| lower.lower_for_body(name, element, iterable, body))
+    }
+
+    fn lower_for_body(
+        &mut self,
+        name: &str,
+        element: IrType,
+        iterable: IrExpr,
+        body: &[Stmt],
+    ) -> KuResult<()> {
+        // `iterable` has already been lowered into the current block. Put the
+        // actual iterator terminator in a fresh header block: the loop backedge
+        // must not re-run calls/array construction used to compute the iterable.
+        let iter_id = self.next_block("for_iter");
         let body_id = self.next_block("for_body");
         let after_id = self.next_block("for_after");
+        self.current.terminator = IrTerminator::Jump(iter_id);
+        self.finish_current();
+
+        self.start_block(iter_id, "for_iter");
+        let ir_name = self.define_local(name, element);
         self.current.terminator = IrTerminator::ForEach {
-            name: name.to_string(),
+            name: ir_name,
             iterable,
             body_block: body_id,
             after_block: after_id,
         };
         self.finish_current();
 
-        let previous = self.locals.insert(name.to_string(), IrType::Unknown);
         self.start_block(body_id, "for_body");
-        for stmt in body {
-            self.lower_stmt(stmt)?;
-            if self.current.terminator != IrTerminator::Next {
-                break;
-            }
-        }
+        self.lower_statements(body)?;
         if self.current.terminator == IrTerminator::Next {
+            // `for` can iterate up to the full i64/array range. Poll on every
+            // back-edge just like `while`, otherwise a handler with a call-free
+            // loop can ignore its cooperative deadline indefinitely.
+            self.emit_safepoint();
             self.current.terminator = IrTerminator::Jump(iter_id);
         }
         self.finish_current();
-        match previous {
-            Some(ty) => {
-                self.locals.insert(name.to_string(), ty);
-            }
-            None => {
-                self.locals.remove(name);
-            }
-        }
 
         self.start_block(after_id, "for_after");
         Ok(())
@@ -1464,13 +1655,9 @@ impl<'a> FunctionLowerer<'a> {
             return_block: finally_return_id,
             return_name: return_name.clone(),
         });
-        for stmt in body {
-            self.lower_stmt(stmt)?;
-            if self.current.terminator != IrTerminator::Next {
-                break;
-            }
-        }
+        let body_result = self.lower_scoped_statements(body);
         self.try_handlers.pop();
+        body_result?;
         if self.current.terminator == IrTerminator::Next {
             self.current.instructions.push(IrInst::EndTry);
             self.current.terminator = IrTerminator::Jump(finally_id.unwrap_or(after_id));
@@ -1479,63 +1666,44 @@ impl<'a> FunctionLowerer<'a> {
 
         if let Some(catch_id) = catch_id {
             self.start_block(catch_id, "catch");
-            let previous = catch_name
-                .as_ref()
-                .map(|name| self.locals.insert(name.clone(), error_ir_type()));
-            if let Some(name) = catch_name {
-                self.current.instructions.push(IrInst::BindError {
-                    name: name.clone(),
-                    result: IrExpr {
-                        kind: IrExprKind::Local(error_name.clone()),
-                        ty: self
-                            .locals
-                            .get(&error_name)
-                            .cloned()
-                            .unwrap_or_else(|| IrType::Result(Box::new(IrType::Null))),
-                    },
-                });
-            }
-            if let Some(finally_err_id) = finally_err_id {
-                self.try_handlers.push(IrTryHandler {
-                    error_block: finally_err_id,
-                    error_name: error_name.clone(),
-                    return_block: finally_return_id,
-                    return_name: return_name.clone(),
-                });
-            }
-            for stmt in catch_body {
-                self.lower_stmt(stmt)?;
-                if self.current.terminator != IrTerminator::Next {
-                    break;
+            self.with_local_scope(|lower| {
+                if let Some(name) = catch_name {
+                    let name = lower.define_local(name, error_ir_type());
+                    lower.current.instructions.push(IrInst::BindError {
+                        name,
+                        result: IrExpr {
+                            kind: IrExprKind::Local(error_name.clone()),
+                            ty: lower
+                                .locals
+                                .get(&error_name)
+                                .cloned()
+                                .unwrap_or_else(|| IrType::Result(Box::new(IrType::Null))),
+                        },
+                    });
                 }
-            }
-            if finally_err_id.is_some() {
-                self.try_handlers.pop();
-            }
+                if let Some(finally_err_id) = finally_err_id {
+                    lower.try_handlers.push(IrTryHandler {
+                        error_block: finally_err_id,
+                        error_name: error_name.clone(),
+                        return_block: finally_return_id,
+                        return_name: return_name.clone(),
+                    });
+                }
+                let result = lower.lower_statements(catch_body);
+                if finally_err_id.is_some() {
+                    lower.try_handlers.pop();
+                }
+                result
+            })?;
             if self.current.terminator == IrTerminator::Next {
                 self.current.terminator = IrTerminator::Jump(finally_id.unwrap_or(after_id));
             }
             self.finish_current();
-            if let Some(name) = catch_name {
-                match previous.flatten() {
-                    Some(ty) => {
-                        self.locals.insert(name.clone(), ty);
-                    }
-                    None => {
-                        self.locals.remove(name);
-                    }
-                }
-            }
         }
 
         if let Some(finally_id) = finally_id {
             self.start_block(finally_id, "finally");
-            for stmt in finally_body {
-                self.lower_stmt(stmt)?;
-                if self.current.terminator != IrTerminator::Next {
-                    break;
-                }
-            }
+            self.lower_scoped_statements(finally_body)?;
             if self.current.terminator == IrTerminator::Next {
                 self.current.terminator = IrTerminator::Jump(after_id);
             }
@@ -1544,12 +1712,7 @@ impl<'a> FunctionLowerer<'a> {
 
         if let Some(finally_err_id) = finally_err_id {
             self.start_block(finally_err_id, "finally_err");
-            for stmt in finally_body {
-                self.lower_stmt(stmt)?;
-                if self.current.terminator != IrTerminator::Next {
-                    break;
-                }
-            }
+            self.lower_scoped_statements(finally_body)?;
             if self.current.terminator == IrTerminator::Next {
                 let result = IrExpr {
                     kind: IrExprKind::Local(error_name.clone()),
@@ -1566,12 +1729,7 @@ impl<'a> FunctionLowerer<'a> {
 
         if let Some(finally_return_id) = finally_return_id {
             self.start_block(finally_return_id, "finally_return");
-            for stmt in finally_body {
-                self.lower_stmt(stmt)?;
-                if self.current.terminator != IrTerminator::Next {
-                    break;
-                }
-            }
+            self.lower_scoped_statements(finally_body)?;
             if self.current.terminator == IrTerminator::Next {
                 let value = return_name.as_ref().map(|name| IrExpr {
                     kind: IrExprKind::Local(name.clone()),
@@ -1588,9 +1746,14 @@ impl<'a> FunctionLowerer<'a> {
 
     fn lower_lvalue(&mut self, target: &AssignTarget) -> KuResult<IrLValue> {
         match target {
-            AssignTarget::Variable(name) => Ok(IrLValue::Local(name.clone())),
+            AssignTarget::Variable(name) => {
+                Ok(IrLValue::Local(self.local_ir_name(name).to_string()))
+            }
             AssignTarget::Index { target, index } => Ok(IrLValue::Index {
-                target: self.lower_expr(target)?,
+                // A field-held array is a writable place, not a value read.
+                // lower_expr would clone its field and silently store into that
+                // temporary instead of updating the containing struct.
+                target: self.lower_lvalue_target_expr(target)?,
                 index: self.lower_expr(index)?,
             }),
             AssignTarget::Field { target, name } => Ok(IrLValue::Field {
@@ -1602,16 +1765,20 @@ impl<'a> FunctionLowerer<'a> {
 
     fn lower_lvalue_cached(&mut self, target: &AssignTarget) -> KuResult<IrLValue> {
         match target {
-            AssignTarget::Variable(name) => Ok(IrLValue::Local(name.clone())),
+            AssignTarget::Variable(name) => {
+                Ok(IrLValue::Local(self.local_ir_name(name).to_string()))
+            }
             AssignTarget::Index { target, index } => {
-                let target = self.lower_expr(target)?;
-                let target = self.emit_temp(target)?;
+                // Preserve the container as a place. Materializing an owned array
+                // local here would move it into a temp and clear the actual
+                // assignment root. Only index expressions need caching.
+                let target = self.lower_lvalue_target_expr_cached(target)?;
                 let index = self.lower_expr(index)?;
                 let index = self.emit_temp(index)?;
                 Ok(IrLValue::Index { target, index })
             }
             AssignTarget::Field { target, name } => Ok(IrLValue::Field {
-                target: self.lower_lvalue_target_expr(target)?,
+                target: self.lower_lvalue_target_expr_cached(target)?,
                 name: name.clone(),
             }),
         }
@@ -1692,7 +1859,10 @@ impl<'a> FunctionLowerer<'a> {
                 source.push(inner);
             }
             if !found_end {
-                return Err(KuError::runtime("unterminated template interpolation", span));
+                return Err(KuError::runtime(
+                    "unterminated template interpolation",
+                    span,
+                ));
             }
             if source.trim().is_empty() {
                 return Err(KuError::runtime("empty template interpolation", span));
@@ -1713,9 +1883,9 @@ impl<'a> FunctionLowerer<'a> {
             parts.push(Expr::new(ExprKind::Literal(Literal::String(text)), span));
         }
         let mut iter = parts.into_iter();
-        let mut acc = iter.next().unwrap_or_else(|| {
-            Expr::new(ExprKind::Literal(Literal::String(String::new())), span)
-        });
+        let mut acc = iter
+            .next()
+            .unwrap_or_else(|| Expr::new(ExprKind::Literal(Literal::String(String::new())), span));
         for part in iter {
             acc = Expr::new(
                 ExprKind::Binary {
@@ -1756,25 +1926,41 @@ impl<'a> FunctionLowerer<'a> {
         self.lower_expr(expr)
     }
 
-    /// The static type of a variable / struct-field-chain place, without emitting
-    /// anything. `None` for anything that is not a plain projection.
+    /// The readable type of a literal or plain place, without emitting anything.
+    /// Cells expose their payload type here; taking a snapshot is a separate step.
     fn static_place_type(&self, expr: &Expr) -> Option<IrType> {
         match &expr.kind {
-            ExprKind::Variable(name) => self.locals.get(name).cloned(),
+            ExprKind::Literal(literal) => Some(literal_type(literal)),
+            ExprKind::Variable(name) => self
+                .pattern_bindings
+                .get(name)
+                .map(|value| value.ty.clone())
+                .or_else(|| {
+                    let name = self.local_ir_name(name);
+                    self.locals
+                        .get(name)
+                        .or_else(|| self.captures.get(name))
+                        .cloned()
+                })
+                .map(|ty| match ty {
+                    IrType::Cell(inner) => *inner,
+                    other => other,
+                }),
             ExprKind::Field { target, name } => {
                 let target_ty = self.static_place_type(target)?;
                 Some(self.field_type(&target_ty, name))
             }
+            ExprKind::Index { target, .. } => match self.static_place_type(target)? {
+                IrType::Array(element) => Some(*element),
+                _ => None,
+            },
             _ => None,
         }
     }
 
     fn lower_lvalue_target_expr(&mut self, expr: &Expr) -> KuResult<IrExpr> {
         match &expr.kind {
-            ExprKind::Variable(name) => Ok(IrExpr {
-                kind: IrExprKind::Local(name.clone()),
-                ty: self.locals.get(name).cloned().unwrap_or(IrType::Unknown),
-            }),
+            ExprKind::Variable(_) => self.lower_expr(expr),
             ExprKind::Field { target, name } => {
                 let target = self.lower_lvalue_target_expr(target)?;
                 let ty = self.field_type(&target.ty, name);
@@ -1786,6 +1972,62 @@ impl<'a> FunctionLowerer<'a> {
                     ty,
                 })
             }
+            ExprKind::Index { target, index } => {
+                // Keep an indexed projection as a place instead of lowering it to
+                // a value copy. The C backend can then address the real array slot
+                // for targets such as `values[i].field` and nested indexes.
+                let target = self.lower_lvalue_target_expr(target)?;
+                let index = self.lower_expr(index)?;
+                let ty = match &target.ty {
+                    IrType::Array(element) => *element.clone(),
+                    _ => IrType::Unknown,
+                };
+                Ok(IrExpr {
+                    kind: IrExprKind::Index {
+                        target: Box::new(target),
+                        index: Box::new(index),
+                    },
+                    ty,
+                })
+            }
+            _ => self.lower_expr(expr),
+        }
+    }
+
+    /// Cached variant used by compound assignment. It preserves every container
+    /// projection as an addressable place while materializing each user-supplied
+    /// index exactly once. In particular, it never moves an owned array root into
+    /// a temporary merely to cache its header.
+    fn lower_lvalue_target_expr_cached(&mut self, expr: &Expr) -> KuResult<IrExpr> {
+        match &expr.kind {
+            ExprKind::Variable(_) => self.lower_expr(expr),
+            ExprKind::Field { target, name } => {
+                let target = self.lower_lvalue_target_expr_cached(target)?;
+                let ty = self.field_type(&target.ty, name);
+                Ok(IrExpr {
+                    kind: IrExprKind::Field {
+                        target: Box::new(target),
+                        name: name.clone(),
+                    },
+                    ty,
+                })
+            }
+            ExprKind::Index { target, index } => {
+                let target = self.lower_lvalue_target_expr_cached(target)?;
+                let index = self.lower_expr(index)?;
+                let index = self.emit_temp(index)?;
+                let ty = match &target.ty {
+                    IrType::Array(element) => *element.clone(),
+                    _ => IrType::Unknown,
+                };
+                Ok(IrExpr {
+                    kind: IrExprKind::Index {
+                        target: Box::new(target),
+                        index: Box::new(index),
+                    },
+                    ty,
+                })
+            }
             _ => self.lower_expr(expr),
         }
     }
@@ -1793,32 +2035,43 @@ impl<'a> FunctionLowerer<'a> {
     /// Lower a `fail` payload. An object literal `{domain, code, message}` becomes
     /// a native `__ku_error_make` intrinsic (a fixed three-KuString `KuError`),
     /// not a generic object — so Error stays representable without dynamic objects.
-    /// Other payloads (a string message, or an existing Error value) lower normally.
+    /// String messages remain strings here so every backend can represent them;
+    /// direct/try lowering tells its backend that this is `fail`, not `err`.
+    /// An existing Error keeps its original domain and code.
     fn lower_error_expr(&mut self, value: &Expr) -> KuResult<IrExpr> {
         if let ExprKind::ObjectLiteral { fields } = &value.kind {
             let mut domain = None;
             let mut code = None;
             let mut message = None;
-            for (name, expr) in fields {
+            for (index, (name, _)) in fields.iter().enumerate() {
                 match name.as_str() {
-                    "domain" => domain = Some(expr),
-                    "code" => code = Some(expr),
-                    "message" => message = Some(expr),
+                    "domain" => domain = Some(index),
+                    "code" => code = Some(index),
+                    "message" => message = Some(index),
                     _ => {}
                 }
             }
             if let (Some(domain), Some(code), Some(message)) = (domain, code, message) {
                 if fields.len() == 3 {
-                    let domain = self.lower_expr(domain)?;
-                    let code = self.lower_expr(code)?;
-                    let message = self.lower_expr(message)?;
+                    // Object fields evaluate in source order. Freeze each value
+                    // before later callbacks, then arrange the already-owned
+                    // temps for the fixed domain/code/message ABI.
+                    let mut values = Vec::with_capacity(fields.len());
+                    for (_, value) in fields {
+                        let value = self.lower_expr(value)?;
+                        values.push(self.emit_temp(value)?);
+                    }
                     return Ok(IrExpr {
                         kind: IrExprKind::Call {
                             callee: Box::new(IrExpr {
                                 kind: IrExprKind::Local("__ku_error_make".to_string()),
                                 ty: IrType::Function,
                             }),
-                            args: vec![domain, code, message],
+                            args: vec![
+                                values[domain].clone(),
+                                values[code].clone(),
+                                values[message].clone(),
+                            ],
                             kind: IrCallKind::Intrinsic("__ku_error_make".to_string()),
                         },
                         ty: error_ir_type(),
@@ -1842,10 +2095,19 @@ impl<'a> FunctionLowerer<'a> {
         args: &[Expr],
         span: Span,
     ) -> KuResult<IrExpr> {
+        if method == "bind" {
+            return Err(KuError::runtime(
+                "http service bind/listener run/close are interpreter-only; the native C backend supports app.listen(address)",
+                span,
+            ));
+        }
         if method == "listen" {
             if args.len() != 1 {
                 return Err(KuError::runtime(
-                    format!("http service listen expects 1 argument but got {}", args.len()),
+                    format!(
+                        "http service listen expects 1 argument but got {}",
+                        args.len()
+                    ),
                     span,
                 ));
             }
@@ -1864,7 +2126,10 @@ impl<'a> FunctionLowerer<'a> {
         }
         if args.len() != 2 {
             return Err(KuError::runtime(
-                format!("http service {method} expects 2 arguments but got {}", args.len()),
+                format!(
+                    "http service {method} expects 2 arguments but got {}",
+                    args.len()
+                ),
                 span,
             ));
         }
@@ -1875,10 +2140,9 @@ impl<'a> FunctionLowerer<'a> {
         };
         let handler = self.lower_expr_with_expected(&args[1], Some(&expected))?;
         let (arity, returns_result) = match &handler.ty {
-            IrType::Closure { params, ret } => (
-                params.len(),
-                matches!(ret.as_ref(), IrType::Result(_)),
-            ),
+            IrType::Closure { params, ret } => {
+                (params.len(), matches!(ret.as_ref(), IrType::Result(_)))
+            }
             _ => {
                 return Err(KuError::runtime(
                     format!("http service {method} handler must be a function"),
@@ -1906,7 +2170,7 @@ impl<'a> FunctionLowerer<'a> {
                 args: vec![server, path, handler],
                 kind: IrCallKind::Intrinsic(intrinsic),
             },
-            ty: IrType::Named(HTTP_SERVER_TYPE.to_string()),
+            ty: IrType::Null,
         })
     }
 
@@ -1917,6 +2181,13 @@ impl<'a> FunctionLowerer<'a> {
         if struct_name == "__ku_error_type" && matches!(field_name, "domain" | "code" | "message") {
             return IrType::Str;
         }
+        if struct_name == TIME_TYPE {
+            return match field_name {
+                "kind" => IrType::Str,
+                "millis" => IrType::Int,
+                _ => IrType::Unknown,
+            };
+        }
         if struct_name == HTTP_REQUEST_TYPE && matches!(field_name, "method" | "path" | "body") {
             return IrType::Str;
         }
@@ -1924,8 +2195,7 @@ impl<'a> FunctionLowerer<'a> {
         // maps backed by the native `KuObject` ABI. Typing them as `__ku_object`
         // lets `req.query.get_or(...)` dispatch and marks the program as using the
         // object runtime (see `program_uses_object`).
-        if struct_name == HTTP_REQUEST_TYPE
-            && matches!(field_name, "params" | "query" | "headers")
+        if struct_name == HTTP_REQUEST_TYPE && matches!(field_name, "params" | "query" | "headers")
         {
             return IrType::Named("__ku_object".to_string());
         }
@@ -1936,6 +2206,246 @@ impl<'a> FunctionLowerer<'a> {
             .and_then(|layout| layout.fields.iter().find(|field| field.name == field_name))
             .map(|field| field.ty.clone())
             .unwrap_or(IrType::Unknown)
+    }
+
+    /// Reuse storage only in an ordinary local's exact self-push assignment.
+    /// The general array.push operation remains pure. The shared AST predicate
+    /// rules out callbacks, fallible calls and references to this receiver, so
+    /// lowering the argument first cannot change the receiver snapshot.
+    fn lower_local_array_append(&mut self, name: &str, expr: &Expr) -> KuResult<Option<IrExpr>> {
+        let Some(ty @ IrType::Array(_)) = self.locals.get(self.local_ir_name(name)).cloned() else {
+            return Ok(None);
+        };
+        if self.assignment_cell(name).is_some() {
+            return Ok(None);
+        }
+        let ExprKind::Call { callee, args } = &expr.kind else {
+            return Ok(None);
+        };
+        let ExprKind::Field {
+            target,
+            name: method,
+        } = &callee.kind
+        else {
+            return Ok(None);
+        };
+        if method != "push"
+            || !matches!(&target.kind, ExprKind::Variable(receiver) if receiver == name)
+            || args.len() != 1
+            || !is_pure_append_argument(&args[0], name)
+        {
+            return Ok(None);
+        }
+        let mut value = self.lower_expr(&args[0])?;
+        // As with ordinary push, the appended value is cloned, not consumed.
+        // Fresh owned rvalues need a cleanup temp, while places stay borrowed.
+        if ir_type_is_owned(&value.ty) && !ir_expr_is_place(&value) {
+            value = self.emit_temp(value)?;
+        }
+        self.emit_local_collection_reuse("__ku_array_push_reuse", name, ty, value)
+            .map(Some)
+    }
+
+    fn emit_local_collection_reuse(
+        &mut self,
+        intrinsic: &str,
+        name: &str,
+        ty: IrType,
+        value: IrExpr,
+    ) -> KuResult<IrExpr> {
+        self.emit_temp(IrExpr {
+            kind: IrExprKind::Call {
+                callee: Box::new(IrExpr {
+                    kind: IrExprKind::Local(intrinsic.to_string()),
+                    ty: IrType::Function,
+                }),
+                args: vec![
+                    IrExpr {
+                        kind: IrExprKind::Local(self.local_ir_name(name).to_string()),
+                        ty: ty.clone(),
+                    },
+                    value,
+                ],
+                kind: IrCallKind::Intrinsic(intrinsic.to_string()),
+            },
+            ty,
+        })
+    }
+
+    fn snapshot_receiver_before_effects(
+        &mut self,
+        receiver: IrExpr,
+        has_effects: bool,
+    ) -> KuResult<IrExpr> {
+        if !has_effects || !ir_type_is_owned(&receiver.ty) {
+            return Ok(receiver);
+        }
+        // Merely materializing a CellLoad/header would still alias storage that
+        // an argument callback can overwrite or free. This temp is a full owner
+        // and participates in ordinary cleanup, including a later argument's ?.
+        self.emit_temp(IrExpr {
+            ty: receiver.ty.clone(),
+            kind: IrExprKind::Call {
+                callee: Box::new(IrExpr {
+                    kind: IrExprKind::Local("__ku_clone".to_string()),
+                    ty: IrType::Function,
+                }),
+                args: vec![receiver],
+                kind: IrCallKind::Intrinsic("__ku_clone".to_string()),
+            },
+        })
+    }
+
+    /// Copy arguments and borrowed function bindings must be read before later
+    /// callbacks run. Owned arguments retain their existing consuming path;
+    /// eagerly moving a function binding would violate its borrowed-call ABI.
+    fn lower_call_arguments(
+        &mut self,
+        args: &[Expr],
+        expected: Option<&[IrType]>,
+        callee_has_effects: bool,
+    ) -> KuResult<Vec<IrExpr>> {
+        let effects = args
+            .iter()
+            .map(|arg| !is_pure_append_argument(arg, ""))
+            .collect::<Vec<_>>();
+        let mut remaining_effects = effects.iter().filter(|effects| **effects).count();
+        let mut values = Vec::with_capacity(args.len());
+        for (index, (arg, has_effects)) in args.iter().zip(effects).enumerate() {
+            remaining_effects -= usize::from(has_effects);
+            let mut value =
+                self.lower_expr_with_expected(arg, expected.and_then(|params| params.get(index)))?;
+            if remaining_effects != 0 || callee_has_effects {
+                if matches!(value.ty, IrType::Closure { .. }) {
+                    value = self.snapshot_receiver_before_effects(value, true)?;
+                } else if !ir_type_is_owned(&value.ty) {
+                    value = self.emit_temp(value)?;
+                }
+            }
+            values.push(value);
+        }
+        Ok(values)
+    }
+
+    /// Recognize receiver-typed stdlib methods without executing a prospective
+    /// callee. User functions and module-qualified calls retain their old path.
+    fn lower_builtin_method(&mut self, callee: &Expr, args: &[Expr]) -> KuResult<Option<IrExpr>> {
+        let ExprKind::Field { target, name } = &callee.kind else {
+            return Ok(None);
+        };
+        let force_kuvalue = matches!(name.as_str(), "as_int" | "as_str");
+        let module = if force_kuvalue {
+            // The checker guarantees these converters have a KuValue receiver,
+            // including a fallible index expression whose static type is absent.
+            "kuvalue"
+        } else if is_pure_path(target) {
+            match self.static_place_type(target) {
+                Some(IrType::Array(_)) => "array",
+                Some(IrType::Str) => "string",
+                Some(IrType::Named(n)) if n == "__ku_object" => "object",
+                Some(IrType::Named(n)) if n == "__ku_value" => "kuvalue",
+                Some(IrType::Named(n)) if n == metadata::REDIS_CLIENT => "redis",
+                Some(IrType::Named(n))
+                    if n == "__ku_pg_client" && matches!(name.as_str(), "query" | "close") =>
+                {
+                    "pg_client"
+                }
+                Some(IrType::Named(n))
+                    if n == "__ku_pg_result"
+                        && matches!(name.as_str(), "rows" | "cols" | "value" | "is_null") =>
+                {
+                    "pg_result"
+                }
+                Some(IrType::Named(n))
+                    if (n == metadata::MYSQL_CLIENT
+                        && matches!(name.as_str(), "query" | "execute" | "close"))
+                        || (n == metadata::MYSQL_RESULT
+                            && matches!(name.as_str(), "rows" | "cols" | "value" | "is_null")) =>
+                {
+                    "mysql"
+                }
+                _ => return Ok(None),
+            }
+        } else {
+            return Ok(None);
+        };
+        let signature = if module == "redis" {
+            metadata::redis_client_method_signature(name)
+        } else if module == "mysql" {
+            let Some(IrType::Named(native)) = self.static_place_type(target) else {
+                return Ok(None);
+            };
+            metadata::mysql_method_signature(&native, name)
+        } else {
+            metadata::dotted_signature(module, name)
+        };
+        let Some(signature) = signature else {
+            return Ok(None);
+        };
+        let receiver = self.lower_field_target(target)?;
+        let argument_effects = args
+            .iter()
+            .map(|arg| !is_pure_append_argument(arg, ""))
+            .collect::<Vec<_>>();
+        let mut remaining_effects = argument_effects.iter().filter(|effects| **effects).count();
+        // Database receiver methods borrow move-only native handles. Cloning a
+        // client/result merely to freeze its pointer before an effectful argument
+        // would duplicate ownership and reaches the backend's forbidden-clone
+        // trap. The checker requires these receivers to be bound places.
+        let receiver = if matches!(module, "redis" | "mysql" | "pg_client" | "pg_result") {
+            receiver
+        } else {
+            self.snapshot_receiver_before_effects(receiver, remaining_effects != 0)?
+        };
+        let mut lowered_args = Vec::with_capacity(args.len());
+        for (index, (arg, has_effects)) in args.iter().zip(argument_effects).enumerate() {
+            remaining_effects -= usize::from(has_effects);
+            let expected = match signature.args.get(index + 1) {
+                Some(ArgRule::Is(pattern)) => pattern_to_ir_type(pattern, &[]),
+                _ => None,
+            };
+            let mut value = self.lower_expr_with_expected(arg, expected.as_ref())?;
+            if remaining_effects != 0 {
+                // Later callbacks may also replace an earlier argument's
+                // binding. Freeze each evaluated value left-to-right, not just
+                // the receiver. Pure argument lists need no extra copies.
+                value = if ir_type_is_owned(&value.ty) {
+                    self.snapshot_receiver_before_effects(value, true)?
+                } else {
+                    self.emit_temp(value)?
+                };
+            }
+            lowered_args.push(value);
+        }
+        // push clones its argument, so a fresh owned value needs a cleanup temp
+        // while a borrowed variable/field must remain live in its own binding.
+        if module == "array" && name == "push" {
+            if let Some(value) = lowered_args.first() {
+                if ir_type_is_owned(&value.ty) && !ir_expr_is_place(value) {
+                    lowered_args[0] = self.emit_temp(value.clone())?;
+                }
+            }
+        }
+        let mut all_args = Vec::with_capacity(lowered_args.len() + 1);
+        all_args.push(receiver);
+        all_args.extend(lowered_args);
+        let ty = if module == "object" {
+            IrType::Named("__ku_value".to_string())
+        } else {
+            signature_return_type(&signature, &all_args)
+        };
+        self.emit_temp(IrExpr {
+            kind: IrExprKind::Call {
+                callee: Box::new(IrExpr {
+                    kind: IrExprKind::Local(format!("{module}.{name}")),
+                    ty: IrType::Function,
+                }),
+                args: all_args,
+                kind: IrCallKind::Intrinsic(format!("{module}.{name}")),
+            },
+            ty,
+        })
+        .map(Some)
     }
 
     fn lower_expr(&mut self, expr: &Expr) -> KuResult<IrExpr> {
@@ -1953,15 +2463,20 @@ impl<'a> FunctionLowerer<'a> {
                 if let Some(value) = self.pattern_bindings.get(name) {
                     return Ok(value.clone());
                 }
-                // Stage 6b: a captured cell read inside a closure body.
-                if let Some(IrType::Cell(inner)) = self.captures.get(name) {
-                    let inner = (**inner).clone();
-                    return Ok(self.cell_load(IrExprKind::CapturedCell(name.clone()), inner));
-                }
+                let name = self.local_ir_name(name);
                 // Stage 6b: a boxed local read in the scope that owns the cell.
                 if let Some(IrType::Cell(inner)) = self.locals.get(name) {
                     let inner = (**inner).clone();
-                    return Ok(self.cell_load(IrExprKind::Local(name.clone()), inner));
+                    return Ok(self.cell_load(IrExprKind::Local(name.to_string()), inner));
+                }
+                // A local declaration shadows an identically spelled capture.
+                if !self.locals.contains_key(name) {
+                    if let Some(IrType::Cell(inner)) = self.captures.get(name) {
+                        let inner = (**inner).clone();
+                        return Ok(
+                            self.cell_load(IrExprKind::CapturedCell(name.to_string()), inner)
+                        );
+                    }
                 }
                 // A top-level function name used as a value (not as a direct call
                 // callee — those are intercepted in Call lowering) lowers to a
@@ -1980,7 +2495,7 @@ impl<'a> FunctionLowerer<'a> {
                     }
                 }
                 Ok(IrExpr {
-                    kind: IrExprKind::Local(name.clone()),
+                    kind: IrExprKind::Local(name.to_string()),
                     ty: self.locals.get(name).cloned().unwrap_or(IrType::Unknown),
                 })
             }
@@ -1998,8 +2513,18 @@ impl<'a> FunctionLowerer<'a> {
                     ty,
                 })
             }
+            ExprKind::Binary { left, op, right } if matches!(op, BinaryOp::And | BinaryOp::Or) => {
+                self.lower_logical_expr(left, *op, right)
+            }
             ExprKind::Binary { left, op, right } => {
-                let left = self.lower_expr(left)?;
+                let mut left = self.lower_expr(left)?;
+                if !is_pure_append_argument(right, "") {
+                    if left.ty == IrType::Str {
+                        left = self.snapshot_receiver_before_effects(left, true)?;
+                    } else if !ir_type_is_owned(&left.ty) {
+                        left = self.emit_temp(left)?;
+                    }
+                }
                 let right = self.lower_expr(right)?;
                 let ty = binary_type(*op, &left.ty, &right.ty);
                 self.emit_temp(IrExpr {
@@ -2024,9 +2549,7 @@ impl<'a> FunctionLowerer<'a> {
                             kind: IrExprKind::Local("__env".to_string()),
                             ty: IrType::Unknown,
                         });
-                        for arg in args {
-                            lowered_args.push(self.lower_expr(arg)?);
-                        }
+                        lowered_args.extend(self.lower_call_arguments(args, None, false)?);
                         return self.emit_temp(IrExpr {
                             kind: IrExprKind::Call {
                                 callee: Box::new(IrExpr {
@@ -2071,6 +2594,10 @@ impl<'a> FunctionLowerer<'a> {
                 if let ExprKind::Field { target, name } = &callee.kind {
                     if name == "map" && args.len() == 1 {
                         let receiver = self.lower_expr(target)?;
+                        // A mapper (or its factory) can replace a captured source
+                        // binding. Keep an owned snapshot until iteration and its
+                        // callbacks finish instead of borrowing a freed buffer.
+                        let receiver = self.snapshot_receiver_before_effects(receiver, true)?;
                         let IrType::Array(element) = receiver.ty.clone() else {
                             return Err(KuError::runtime(
                                 "array.map requires an array receiver",
@@ -2110,7 +2637,7 @@ impl<'a> FunctionLowerer<'a> {
                 if let ExprKind::Field { target, name } = &callee.kind {
                     if matches!(
                         name.as_str(),
-                        "get" | "post" | "put" | "del" | "listen"
+                        "get" | "post" | "put" | "del" | "listen" | "bind"
                     ) && is_pure_path(target)
                     {
                         let receiver = self.lower_expr(target)?;
@@ -2119,26 +2646,31 @@ impl<'a> FunctionLowerer<'a> {
                         }
                     }
                 }
-                // For a direct call to a known top-level function, thread each
-                // parameter's type into the argument so a closure argument's
-                // unannotated parameters are filled from the expected function
-                // type (e.g. `Apply((x) => x + 1, 41)`).
-                let expected_param_types = match &callee.kind {
-                    ExprKind::Variable(name) => {
-                        self.signatures.get(name).map(|sig| sig.params.clone())
-                    }
+                if let Some(value) = self.lower_builtin_method(callee, args)? {
+                    return Ok(value);
+                }
+                // A lexical function binding takes precedence over a builtin
+                // or top-level function with the same name. Its parameters also
+                // provide context for closure/Result constructor arguments.
+                let bound_callee = match &callee.kind {
+                    ExprKind::Variable(_) => self.static_place_type(callee),
                     _ => None,
                 };
-                let mut lowered_args = args
-                    .iter()
-                    .enumerate()
-                    .map(|(index, arg)| {
-                        let expected = expected_param_types
-                            .as_ref()
-                            .and_then(|params| params.get(index));
-                        self.lower_expr_with_expected(arg, expected)
-                    })
-                    .collect::<KuResult<Vec<_>>>()?;
+                let expected_param_types = match &bound_callee {
+                    Some(IrType::Closure { params, .. }) => Some(params.clone()),
+                    Some(_) => None,
+                    None => match &callee.kind {
+                        ExprKind::Variable(name) => {
+                            self.signatures.get(name).map(|sig| sig.params.clone())
+                        }
+                        _ => None,
+                    },
+                };
+                let lowered_args = self.lower_call_arguments(
+                    args,
+                    expected_param_types.as_deref(),
+                    !is_pure_append_argument(callee, ""),
+                )?;
                 if let Some((layout, variant)) = self.enum_variant(callee) {
                     let fields = variant
                         .fields
@@ -2170,68 +2702,11 @@ impl<'a> FunctionLowerer<'a> {
                         ty: enum_ir_type(&layout.name),
                     });
                 }
-                // Receiver-typed builtin method dispatch: `<array>.push(x)` /
-                // `<array>.len()`. Resolve by the lowered receiver's type so it
-                // becomes a typed `array.*` intrinsic instead of an unknown-typed
-                // indirect call. Restricted to pure-path receivers so the
-                // fall-through never re-lowers a side-effecting expression.
-                if let ExprKind::Field { target, name } = &callee.kind {
-                    // KuValue converters (as_int/as_str) dispatch even when the
-                    // receiver is a `?` expression (not a pure path); the checker
-                    // guarantees the receiver is a KuValue so it always matches.
-                    let force_kuvalue = matches!(name.as_str(), "as_int" | "as_str");
-                    if is_pure_path(target) || force_kuvalue {
-                        let receiver = self.lower_expr(target)?;
-                        let module = match &receiver.ty {
-                            IrType::Array(_) => Some("array"),
-                            IrType::Str => Some("string"),
-                            IrType::Named(n) if n == "__ku_object" => Some("object"),
-                            IrType::Named(n) if n == "__ku_value" => Some("kuvalue"),
-                            _ => None,
-                        };
-                        if let Some(module) = module {
-                            if let Some(signature) = metadata::dotted_signature(module, name) {
-                                // `array.push` CLONES its value into the new array
-                                // (matching the interpreter, which leaves the source
-                                // usable). A fresh owned rvalue — e.g. a struct literal
-                                // — is otherwise never dropped and leaks its owned
-                                // fields, so materialize it into a temp that cleanup
-                                // frees. A place (variable/field) is left alone: it is
-                                // borrowed, and its own binding still owns it.
-                                if module == "array" && name == "push" {
-                                    let needs_temp = lowered_args.first().is_some_and(|value| {
-                                        ir_type_is_owned(&value.ty) && !ir_expr_is_place(value)
-                                    });
-                                    if needs_temp {
-                                        let value = lowered_args[0].clone();
-                                        lowered_args[0] = self.emit_temp(value)?;
-                                    }
-                                }
-                                let mut all_args = Vec::with_capacity(lowered_args.len() + 1);
-                                all_args.push(receiver);
-                                all_args.extend(lowered_args.iter().cloned());
-                                // Dynamic-object methods (`get_or`) yield a KuValue.
-                                let ty = if module == "object" {
-                                    IrType::Named("__ku_value".to_string())
-                                } else {
-                                    signature_return_type(&signature, &all_args)
-                                };
-                                return self.emit_temp(IrExpr {
-                                    kind: IrExprKind::Call {
-                                        callee: Box::new(IrExpr {
-                                            kind: IrExprKind::Local(format!("{module}.{name}")),
-                                            ty: IrType::Function,
-                                        }),
-                                        args: all_args,
-                                        kind: IrCallKind::Intrinsic(format!("{module}.{name}")),
-                                    },
-                                    ty,
-                                });
-                            }
-                        }
-                    }
-                }
-                let (kind, mut ty) = call_kind_and_type(callee, &lowered_args, self.signatures);
+                let (kind, mut ty) = if bound_callee.is_some() {
+                    (IrCallKind::Indirect, IrType::Unknown)
+                } else {
+                    call_kind_and_type(callee, &lowered_args, self.signatures)
+                };
                 // For intrinsics the backend dispatches by name and ignores the
                 // callee, so avoid lowering a dotted callee (e.g. `time.millis`)
                 // into an unknown-typed Field temp — use a Function placeholder.
@@ -2293,6 +2768,10 @@ impl<'a> FunctionLowerer<'a> {
             }
             ExprKind::Index { target, index } => {
                 let target = self.lower_expr(target)?;
+                let target = self.snapshot_receiver_before_effects(
+                    target,
+                    !is_pure_append_argument(index, ""),
+                )?;
                 let index = self.lower_expr(index)?;
                 // `obj[key]` on a dynamic object yields Result<KuValue>: Ok(value)
                 // when present, Err{object, missing_key} when absent. `?` unwraps
@@ -2487,7 +2966,10 @@ impl<'a> FunctionLowerer<'a> {
                     .iter()
                     .map(|(field, value)| {
                         let expected = field_types.get(field);
-                        Ok((field.clone(), self.lower_expr_with_expected(value, expected)?))
+                        Ok((
+                            field.clone(),
+                            self.lower_expr_with_expected(value, expected)?,
+                        ))
                     })
                     .collect::<KuResult<Vec<_>>>()?;
                 Ok(IrExpr {
@@ -2531,15 +3013,111 @@ impl<'a> FunctionLowerer<'a> {
         }
     }
 
-    /// Like [`lower_expr`], but threads an expected type from context into a
-    /// closure literal so an unannotated parameter can be filled from the
-    /// expected function type. Mirrors the checker's `check_expr_expecting` so
-    /// every closure the checker accepts also lowers to native code (rule 8).
+    /// Lower source `&&` / `||` into control flow instead of first materializing
+    /// both operands as ordinary expression temporaries. Calls, indexes and `?`
+    /// on the right can emit instructions (and even their own blocks), so leaving
+    /// the logical operator as a final C expression would evaluate those effects
+    /// before C ever reached its built-in short-circuit operator.
+    fn lower_logical_expr(&mut self, left: &Expr, op: BinaryOp, right: &Expr) -> KuResult<IrExpr> {
+        debug_assert!(matches!(op, BinaryOp::And | BinaryOp::Or));
+
+        let left = self.lower_expr(left)?;
+        let result_name = format!("__ku_logical_{}", self.next_temp_id);
+        self.next_temp_id += 1;
+        let right_id = self.next_block("logical_right");
+        let after_id = self.next_block("logical_after");
+        let short_value = op == BinaryOp::Or;
+
+        // This declaration dominates both successors. The skipped edge keeps the
+        // operator's decisive value (`false` for &&, `true` for ||); only the RHS
+        // edge overwrites it with the value it actually evaluates.
+        self.current.instructions.push(IrInst::Let {
+            name: result_name.clone(),
+            ty: IrType::Bool,
+            value: bool_literal(short_value),
+        });
+        let (then_block, else_block) = if op == BinaryOp::And {
+            (right_id, after_id)
+        } else {
+            (after_id, right_id)
+        };
+        self.current.terminator = IrTerminator::Branch {
+            condition: left,
+            then_block,
+            else_block,
+        };
+        self.finish_current();
+
+        self.start_block(right_id, "logical_right");
+        let right = self.lower_expr(right)?;
+        self.current.instructions.push(IrInst::Store {
+            target: IrLValue::Local(result_name.clone()),
+            value: right,
+        });
+        if self.current.terminator == IrTerminator::Next {
+            self.current.terminator = IrTerminator::Jump(after_id);
+        }
+        self.finish_current();
+
+        self.start_block(after_id, "logical_after");
+        Ok(IrExpr {
+            kind: IrExprKind::Local(result_name),
+            ty: IrType::Bool,
+        })
+    }
+
+    /// Like [`lower_expr`], but threads an expected type from context into
+    /// aggregate and closure literals, including the payload of Result
+    /// constructors. This preserves the element type of an empty array, the
+    /// success type of `err(message)`, and unannotated closure parameter types.
+    /// Mirrors the checker's `check_expr_expecting` so values the checker
+    /// accepts keep the same concrete type in native IR (rule 8).
     fn lower_expr_with_expected(
         &mut self,
         expr: &Expr,
         expected: Option<&IrType>,
     ) -> KuResult<IrExpr> {
+        if let (ExprKind::Call { callee, args }, Some(IrType::Result(expected_inner))) =
+            (&expr.kind, expected)
+        {
+            if let ExprKind::Variable(name) = &callee.kind {
+                if matches!(name.as_str(), "ok" | "err")
+                    && args.len() == 1
+                    && **expected_inner != IrType::Unknown
+                    && !self.signatures.contains_key(name)
+                    && self.static_place_type(callee).is_none()
+                {
+                    let value = if name == "ok" {
+                        self.lower_expr_with_expected(&args[0], Some(expected_inner))?
+                    } else {
+                        self.lower_expr(&args[0])?
+                    };
+                    return self.emit_temp(IrExpr {
+                        kind: IrExprKind::Call {
+                            callee: Box::new(IrExpr {
+                                kind: IrExprKind::Local(name.clone()),
+                                ty: IrType::Function,
+                            }),
+                            args: vec![value],
+                            kind: IrCallKind::Intrinsic(name.clone()),
+                        },
+                        ty: IrType::Result(expected_inner.clone()),
+                    });
+                }
+            }
+        }
+        if let (ExprKind::Array(values), Some(IrType::Array(expected_element))) =
+            (&expr.kind, expected)
+        {
+            let values = values
+                .iter()
+                .map(|value| self.lower_expr_with_expected(value, Some(expected_element)))
+                .collect::<KuResult<Vec<_>>>()?;
+            return self.emit_temp(IrExpr {
+                kind: IrExprKind::Array(values),
+                ty: IrType::Array(expected_element.clone()),
+            });
+        }
         if let ExprKind::Function { params, body, .. } = &expr.kind {
             let expected_params = match expected {
                 Some(IrType::Closure { params, .. }) => Some(params.as_slice()),
@@ -2548,6 +3126,37 @@ impl<'a> FunctionLowerer<'a> {
             return self.lower_closure_literal(params, body, expr.span, expected_params);
         }
         self.lower_expr(expr)
+    }
+
+    /// Resolve the cell pointer a newly-created nested closure must retain.
+    /// Locals take lexical precedence over an identically named outer capture;
+    /// otherwise a closure body forwards the cell already stored in its `__env`.
+    fn capture_binding(&self, name: &str) -> Option<(IrType, IrCaptureSource)> {
+        let name = self.local_ir_name(name);
+        if let Some(local) = self.locals.get(name) {
+            return matches!(local, IrType::Cell(_))
+                .then(|| (local.clone(), IrCaptureSource::Local));
+        }
+        self.captures.get(name).and_then(|capture| {
+            matches!(capture, IrType::Cell(_))
+                .then(|| (capture.clone(), IrCaptureSource::EnclosingEnvironment))
+        })
+    }
+
+    fn lower_capture_bindings(&self, names: HashSet<String>) -> LoweredCaptureBindings {
+        let mut values = Vec::with_capacity(names.len());
+        let mut aliases = HashMap::with_capacity(names.len());
+        for name in names {
+            if let Some((ty, source)) = self.capture_binding(&name) {
+                let ir_name = self.local_ir_name(&name).to_string();
+                if ir_name != name {
+                    aliases.insert(name, ir_name.clone());
+                }
+                values.push((ir_name, ty, source));
+            }
+        }
+        values.sort_by(|left, right| left.0.cmp(&right.0));
+        LoweredCaptureBindings { values, aliases }
     }
 
     /// Lower a closure literal into a lifted, globally-unique IrFunction plus a
@@ -2591,25 +3200,15 @@ impl<'a> FunctionLowerer<'a> {
         // are boxed cells in the enclosing scope (a boxed local, or — for nested
         // closures — a cell already captured here). Sorted for a stable env-field
         // and argument order shared by the body and every `MakeClosure`.
-        let mut capture_names = crate::runtime::interpreter::closure_capture_names(params, body)
-            .into_iter()
-            .filter(|name| {
-                matches!(self.locals.get(name), Some(IrType::Cell(_)))
-                    || matches!(self.captures.get(name), Some(IrType::Cell(_)))
-            })
-            .collect::<Vec<_>>();
-        capture_names.sort();
-        let captures = capture_names
-            .into_iter()
-            .map(|name| {
-                let ty = self
-                    .locals
-                    .get(&name)
-                    .or_else(|| self.captures.get(&name))
-                    .cloned()
-                    .unwrap_or(IrType::Cell(Box::new(IrType::Unknown)));
-                (name, ty)
-            })
+        let LoweredCaptureBindings {
+            values: captures,
+            aliases,
+        } = self.lower_capture_bindings(crate::runtime::interpreter::closure_capture_names(
+            params, body,
+        ));
+        let function_captures = captures
+            .iter()
+            .map(|(name, ty, _)| (name.clone(), ty.clone()))
             .collect::<Vec<_>>();
 
         let mut child = FunctionLowerer::new(
@@ -2619,23 +3218,28 @@ impl<'a> FunctionLowerer<'a> {
             self.next_function_id.clone(),
             self.lifted_functions.clone(),
         );
-        child.captures = captures.iter().cloned().collect();
+        child.captures = function_captures.iter().cloned().collect();
+        child.local_names = aliases;
         for param in &ir_params {
             child.locals.insert(param.name.clone(), param.ty.clone());
         }
         child.lower_block_body("entry", body, span)?;
 
-        // Recover the real return type from the first `return <value>` the body
-        // produced (6a closure bodies contain no `?`, so the Unknown seed above
-        // never leaks into a Return terminator).
+        // Recover the real return type from a source return. Cooperative timeout
+        // blocks are lowered while this child still has an Unknown seed, so their
+        // synthetic zero returns must not win inference over the closure body's
+        // concrete return.
         let return_type = child
             .blocks
             .iter()
             .find_map(|block| match &block.terminator {
-                IrTerminator::Return(Some(value)) => Some(value.ty.clone()),
+                IrTerminator::Return(Some(value)) if value.ty != IrType::Unknown => {
+                    Some(value.ty.clone())
+                }
                 _ => None,
             })
             .unwrap_or(IrType::Null);
+        resolve_closure_safepoint_return_type(&mut child.blocks, &return_type);
 
         let cid = FunctionId(self.next_function_id.get());
         self.next_function_id.set(cid.0 + 1);
@@ -2647,7 +3251,7 @@ impl<'a> FunctionLowerer<'a> {
             return_type: return_type.clone(),
             blocks: child.blocks,
             is_closure_body: true,
-            captures: captures.clone(),
+            captures: function_captures,
         });
 
         self.emit_temp(IrExpr {
@@ -2709,25 +3313,15 @@ impl<'a> FunctionLowerer<'a> {
         // Captures = the function's free variables (its own name excluded) that
         // are boxed cells in the enclosing scope. Sorted for a stable env layout,
         // matching `lower_closure_literal`.
-        let mut capture_names = crate::runtime::interpreter::function_capture_names(function)
-            .into_iter()
-            .filter(|name| {
-                matches!(self.locals.get(name), Some(IrType::Cell(_)))
-                    || matches!(self.captures.get(name), Some(IrType::Cell(_)))
-            })
-            .collect::<Vec<_>>();
-        capture_names.sort();
-        let captures = capture_names
-            .into_iter()
-            .map(|name| {
-                let ty = self
-                    .locals
-                    .get(&name)
-                    .or_else(|| self.captures.get(&name))
-                    .cloned()
-                    .unwrap_or(IrType::Cell(Box::new(IrType::Unknown)));
-                (name, ty)
-            })
+        let LoweredCaptureBindings {
+            values: captures,
+            aliases,
+        } = self.lower_capture_bindings(crate::runtime::interpreter::function_capture_names(
+            function,
+        ));
+        let function_captures = captures
+            .iter()
+            .map(|(name, ty, _)| (name.clone(), ty.clone()))
             .collect::<Vec<_>>();
 
         let mut child = FunctionLowerer::new(
@@ -2737,7 +3331,8 @@ impl<'a> FunctionLowerer<'a> {
             self.next_function_id.clone(),
             self.lifted_functions.clone(),
         );
-        child.captures = captures.iter().cloned().collect();
+        child.captures = function_captures.iter().cloned().collect();
+        child.local_names = aliases;
         for param in &ir_params {
             child.locals.insert(param.name.clone(), param.ty.clone());
         }
@@ -2752,7 +3347,7 @@ impl<'a> FunctionLowerer<'a> {
             return_type: return_type.clone(),
             blocks: child.blocks,
             is_closure_body: true,
-            captures: captures.clone(),
+            captures: function_captures,
         });
 
         // Bind the name in the enclosing scope as a first-class closure value.
@@ -2767,7 +3362,7 @@ impl<'a> FunctionLowerer<'a> {
             },
             ty: closure_ty.clone(),
         })?;
-        self.locals.insert(name.clone(), closure_ty.clone());
+        let name = self.define_local(&name, closure_ty.clone());
         self.current.instructions.push(IrInst::Let {
             name,
             ty: closure_ty,
@@ -2797,15 +3392,44 @@ impl<'a> FunctionLowerer<'a> {
         let id = TempId(self.next_temp_id);
         self.next_temp_id += 1;
         let ty = value.ty.clone();
+        let needs_safepoint = ir_expr_needs_post_call_safepoint(&value);
         self.current.instructions.push(IrInst::Temp {
             id,
             ty: ty.clone(),
             value,
         });
+        if needs_safepoint {
+            self.emit_safepoint();
+        }
         Ok(IrExpr {
             kind: IrExprKind::Temp(id),
             ty,
         })
+    }
+
+    /// Split the current block into a deadline branch, an internal timeout-return
+    /// block, and a continuation block. Crucially, the timeout edge is produced by
+    /// `return_terminator`: if lowering is currently inside a try with finally,
+    /// the zero return payload is stored in the existing return slot and control
+    /// visits `finally_return` (and then any enclosing finally) before leaving the
+    /// frame. The TLS timeout flag remains set so callers repeat this structured
+    /// unwind and the HTTP worker alone emits 504.
+    fn emit_safepoint(&mut self) {
+        let continue_block = self.next_block("safepoint_continue");
+        let timeout_block = self.next_block("safepoint_timeout");
+        self.current.terminator = IrTerminator::Safepoint {
+            continue_block,
+            timeout_block,
+        };
+        self.finish_current();
+
+        self.start_block(timeout_block, "safepoint_timeout");
+        let timeout_value =
+            (self.return_type != IrType::Void).then(|| zero_expr(self.return_type.clone()));
+        self.current.terminator = self.return_terminator(timeout_value);
+        self.finish_current();
+
+        self.start_block(continue_block, "safepoint_continue");
     }
 
     /// Stage 6b: build a `CellLoad` over `pointer` (a `Local`/`CapturedCell`
@@ -2822,6 +3446,7 @@ impl<'a> FunctionLowerer<'a> {
 
     /// Stage 6b: the `CapturedCell` pointer expression for a captured name.
     fn captured_cell_expr(&self, name: &str) -> IrExpr {
+        let name = self.local_ir_name(name);
         let ty = self
             .captures
             .get(name)
@@ -2835,14 +3460,67 @@ impl<'a> FunctionLowerer<'a> {
 
     /// Stage 6b: the payload type if `name` is a boxed local cell in this scope.
     fn boxed_local_inner(&self, name: &str) -> Option<IrType> {
-        match self.locals.get(name) {
+        match self.locals.get(self.local_ir_name(name)) {
             Some(IrType::Cell(inner)) => Some((**inner).clone()),
             _ => None,
         }
     }
 
-    /// Stage 6b: box a captured Copy local into a fresh cell (rc=1), recording
-    /// its `Cell(inner)` type. Owned payloads are rejected (Stage 6c).
+    fn assignment_cell(&self, name: &str) -> Option<IrExpr> {
+        let name = self.local_ir_name(name);
+        if self.locals.contains_key(name) {
+            self.boxed_local_inner(name).map(|inner| IrExpr {
+                kind: IrExprKind::Local(name.to_string()),
+                ty: IrType::Cell(Box::new(inner)),
+            })
+        } else if self.captures.contains_key(name) {
+            Some(self.captured_cell_expr(name))
+        } else {
+            None
+        }
+    }
+
+    fn binding_is_boxed(&self, name: &str, span: Span) -> bool {
+        self.boxed.contains(&BoxedBindingSite::new(name, span))
+    }
+
+    /// Store an assignment result using the same binding/cell rules for plain
+    /// and parallel destructuring assignment. Callers decide when to materialize
+    /// the RHS; destructuring evaluates every RHS temp before invoking this
+    /// helper, preserving its parallel-assignment semantics.
+    fn store_or_define_name(
+        &mut self,
+        name: &str,
+        value: IrExpr,
+        span: Span,
+        define_boxed: bool,
+    ) -> KuResult<()> {
+        if let Some(cell) = self.assignment_cell(name) {
+            self.current
+                .instructions
+                .push(IrInst::CellStore { cell, value });
+        } else if define_boxed && !self.locals.contains_key(self.local_ir_name(name)) {
+            // First assignment to a to-be-boxed local: allocate its cell.
+            let inner = value.ty.clone();
+            self.push_cell_new(name.to_string(), inner, value, span)?;
+        } else if self.locals.contains_key(self.local_ir_name(name)) {
+            self.current.instructions.push(IrInst::Store {
+                target: IrLValue::Local(self.local_ir_name(name).to_string()),
+                value,
+            });
+        } else {
+            let ty = value.ty.clone();
+            let name = self.define_local(name, ty.clone());
+            self.current
+                .instructions
+                .push(IrInst::Let { name, ty, value });
+        }
+        Ok(())
+    }
+
+    /// Box a captured local into a fresh cell (rc=1), recording its
+    /// `Cell(inner)` type. The native cell owns every payload whose ABI already
+    /// has move/drop support, including aggregate/Result/function/KuValue values.
     fn push_cell_new(
         &mut self,
         name: String,
@@ -2850,22 +3528,14 @@ impl<'a> FunctionLowerer<'a> {
         init: IrExpr,
         span: Span,
     ) -> KuResult<()> {
-        // Stage 6c: str/array/object captures are boxed into a shared cell (the
-        // cell owns the payload and drops it exactly once). Other owned payloads
-        // (struct/enum/Result/function/KuValue) remain unsupported.
-        let is_dynamic_object = matches!(&inner, IrType::Named(name) if name == "__ku_object");
-        let supported = is_copy_ir_type(&inner)
-            || inner == IrType::Str
-            || matches!(&inner, IrType::Array(_))
-            || is_dynamic_object;
+        let supported = is_copy_ir_type(&inner) || ir_type_is_owned(&inner);
         if !supported {
             return Err(KuError::runtime(
-                format!("native closure capture of {inner} not supported yet (Stage 6c)"),
+                format!("native closure capture of {inner} is not supported"),
                 span,
             ));
         }
-        self.locals
-            .insert(name.clone(), IrType::Cell(Box::new(inner.clone())));
+        let name = self.define_local(&name, IrType::Cell(Box::new(inner.clone())));
         self.current.instructions.push(IrInst::CellNew {
             name,
             ty: inner,
@@ -3203,6 +3873,75 @@ impl<'a> FunctionLowerer<'a> {
     }
 }
 
+/// Calls into Ku code can discover a cooperative handler timeout in a deeper
+/// frame, so their caller must poll immediately afterward and continue the
+/// structured unwind. `array.map` is an intrinsic, but invokes a Ku closure from
+/// its generated loop and participates in the same protocol.
+fn ir_expr_needs_post_call_safepoint(expr: &IrExpr) -> bool {
+    match &expr.kind {
+        IrExprKind::Call {
+            kind: IrCallKind::Direct(_) | IrCallKind::Indirect,
+            ..
+        } => true,
+        IrExprKind::Call {
+            kind: IrCallKind::Intrinsic(name),
+            ..
+        } => name == "array.map",
+        _ => false,
+    }
+}
+
+/// Closure bodies are initially lowered with an Unknown return seed so their
+/// source returns can drive inference. Safepoint timeout paths created during
+/// that pass therefore contain Unknown-typed zero payloads (and a try/finally
+/// return slot may be Unknown too). Once inference succeeds, make only those
+/// synthetic return artifacts concrete; ordinary Unknown expressions retain
+/// their diagnostic meaning.
+fn resolve_closure_safepoint_return_type(blocks: &mut [IrBlock], return_type: &IrType) {
+    const RETURN_SLOT_PREFIX: &str = "__ku_return_";
+
+    for block in blocks {
+        for instruction in &mut block.instructions {
+            match instruction {
+                IrInst::Let { name, ty, value }
+                    if name.starts_with(RETURN_SLOT_PREFIX) && *ty == IrType::Unknown =>
+                {
+                    *ty = return_type.clone();
+                    if is_unknown_native_zero(value) {
+                        *value = zero_expr(return_type.clone());
+                    }
+                }
+                IrInst::Store {
+                    target: IrLValue::Local(name),
+                    value,
+                } if name.starts_with(RETURN_SLOT_PREFIX) && is_unknown_native_zero(value) => {
+                    *value = zero_expr(return_type.clone());
+                }
+                _ => {}
+            }
+        }
+
+        if let IrTerminator::Return(Some(value)) = &mut block.terminator {
+            let timeout_zero =
+                block.name.starts_with("safepoint_timeout") && is_unknown_native_zero(value);
+            let return_slot = matches!(
+                &value.kind,
+                IrExprKind::Local(name) if name.starts_with(RETURN_SLOT_PREFIX)
+            ) && value.ty == IrType::Unknown;
+            if timeout_zero {
+                *value = zero_expr(return_type.clone());
+            } else if return_slot {
+                value.ty = return_type.clone();
+            }
+        }
+    }
+}
+
+fn is_unknown_native_zero(expr: &IrExpr) -> bool {
+    expr.ty == IrType::Unknown
+        && matches!(&expr.kind, IrExprKind::Literal(value) if value == "<native-zero>")
+}
+
 fn lower_type(ty: &TypeName, layouts: &IrLayoutTable) -> IrType {
     match ty {
         TypeName::Int => IrType::Int,
@@ -3454,6 +4193,13 @@ fn call_kind_and_type(
     if let Some(name) = dotted_name(callee) {
         if let Some((module, function)) = name.split_once('.') {
             if let Some(signature) = metadata::dotted_signature(module, function) {
+                // The checker exposes Time as a dynamic object, but native needs a
+                // dedicated type so an unrelated `{ kind, millis }` object cannot
+                // accidentally enter the Time ABI. Stage 7 reserves now() for an
+                // epoch-millisecond int; instant() constructs the native Time.
+                if let Some(ty) = time_builtin_ir_type(module, function, args) {
+                    return (IrCallKind::Intrinsic(name), ty);
+                }
                 // Stage 8a: give native HTTP builtins concrete synthetic types so
                 // the server/response values flow through the backend as dedicated
                 // C structs rather than the unknown-typed dynamic objects the
@@ -3481,6 +4227,21 @@ const HTTP_RESPONSE_TYPE: &str = "__ku_http_response";
 /// Stage 8a: the synthetic IR type of the request struct passed to `fn(req)`
 /// route handlers (fields `method`/`path`/`body`).
 const HTTP_REQUEST_TYPE: &str = "__ku_http_request";
+/// Dedicated by-value native Time ABI. Kept separate from `__ku_object` so
+/// ordinary dynamic objects with fields named `kind`/`millis` are never
+/// misclassified as values returned by `time.instant()`.
+const TIME_TYPE: &str = "__ku_time";
+
+fn time_builtin_ir_type(module: &str, function: &str, args: &[IrExpr]) -> Option<IrType> {
+    if module != "time" {
+        return None;
+    }
+    match function {
+        "instant" if args.is_empty() => Some(IrType::Named(TIME_TYPE.to_string())),
+        "now" | "elapsed" | "millis" | "steady_millis" => Some(IrType::Int),
+        _ => None,
+    }
+}
 
 /// The synthetic native IR type for a native-lowered HTTP builtin, or `None` for
 /// builtins that keep their metadata-derived type.
@@ -3547,55 +4308,122 @@ fn dotted_name(expr: &Expr) -> Option<String> {
     Some(format!("{module}.{name}"))
 }
 
-fn unsupported_expr(reason: impl Into<String>) -> IrExpr {
-    IrExpr {
-        kind: IrExprKind::Literal(format!("<unsupported {}>", reason.into())),
-        ty: IrType::Unknown,
-    }
-}
-
 /// Stage 6b: only Copy scalars can be boxed into a shared cell for now; owned
 /// payloads (str/array/object/struct/enum) are deferred to Stage 6c.
 fn is_copy_ir_type(ty: &IrType) -> bool {
     matches!(
         ty,
         IrType::Int | IrType::Float | IrType::Bool | IrType::Null
-    )
+    ) || matches!(ty, IrType::Named(name) if name == TIME_TYPE)
 }
 
-/// Stage 6b: collect the names captured by every closure literal (arrow function
-/// or nested named function) reachable in `body`. Their intersection with the
-/// locals a function declares is what must be boxed. Reuses the interpreter's
-/// free-variable analysis so the native capture set matches the interpreter's
-/// exactly.
-fn collect_boxed_candidates(body: &[Stmt], out: &mut HashSet<String>) {
+/// A visible name either resolves to a body-owned binding site (`Some`) or to a
+/// lexical binding that this lowerer does not introduce/box (`None`), such as a
+/// parameter, enclosing capture, loop iterator, catch variable, or match arm
+/// binding. The latter still matters because it shadows an outer homonym.
+type VisibleBoxBindings = HashMap<String, Option<BoxedBindingSite>>;
+
+/// Stage 6b: find the exact body-owned bindings captured by closures at their
+/// creation points. The scan follows statement order and block scope. It must
+/// not recursively merge a closure body's own boxed locals into its parent: the
+/// child FunctionLowerer scans that body separately, while the interpreter's
+/// free-variable analysis already propagates any genuine transitive capture.
+fn collect_boxed_candidates(
+    body: &[Stmt],
+    lexical_bindings: &HashSet<String>,
+) -> HashSet<BoxedBindingSite> {
+    let mut visible = lexical_bindings
+        .iter()
+        .cloned()
+        .map(|name| (name, None))
+        .collect::<VisibleBoxBindings>();
+    let mut out = HashSet::new();
+    collect_boxed_candidates_block(body, &mut visible, &mut out);
+    out
+}
+
+fn collect_boxed_candidates_block(
+    body: &[Stmt],
+    visible: &mut VisibleBoxBindings,
+    out: &mut HashSet<BoxedBindingSite>,
+) {
     for stmt in body {
-        collect_boxed_candidates_stmt(stmt, out);
+        collect_boxed_candidates_stmt(stmt, visible, out);
     }
 }
 
-fn collect_boxed_candidates_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
+fn record_visible_captures(
+    captures: HashSet<String>,
+    visible: &VisibleBoxBindings,
+    out: &mut HashSet<BoxedBindingSite>,
+) {
+    for name in captures {
+        if let Some(Some(binding)) = visible.get(&name) {
+            out.insert(binding.clone());
+        }
+    }
+}
+
+fn define_assignment_binding(name: &str, span: Span, visible: &mut VisibleBoxBindings) {
+    visible
+        .entry(name.to_string())
+        .or_insert_with(|| Some(BoxedBindingSite::new(name, span)));
+}
+
+fn collect_boxed_candidates_stmt(
+    stmt: &Stmt,
+    visible: &mut VisibleBoxBindings,
+    out: &mut HashSet<BoxedBindingSite>,
+) {
     match stmt {
-        Stmt::VarDecl { value, .. } | Stmt::Assign { value, .. } => {
-            collect_boxed_candidates_expr(value, out)
+        Stmt::VarDecl {
+            name, value, span, ..
+        } => {
+            collect_boxed_candidates_expr(value, visible, out);
+            // A declaration always creates a new binding in the current block,
+            // shadowing any parameter/capture/outer-block homonym.
+            visible.insert(name.clone(), Some(BoxedBindingSite::new(name, *span)));
+        }
+        Stmt::Assign { name, value, span } => {
+            collect_boxed_candidates_expr(value, visible, out);
+            // Plain assignment defines a local only when no lexical binding is
+            // visible. This mirrors Env::contains/assign-or-define.
+            define_assignment_binding(name, *span, visible);
         }
         Stmt::AssignTarget { target, value, .. } | Stmt::CompoundAssign { target, value, .. } => {
-            collect_boxed_candidates_assign_target(target, out);
-            collect_boxed_candidates_expr(value, out);
+            // Assignment evaluates its RHS before resolving the destination.
+            collect_boxed_candidates_expr(value, visible, out);
+            collect_boxed_candidates_assign_target(target, visible, out);
         }
-        Stmt::DestructureAssign { values, .. } => {
+        Stmt::DestructureAssign {
+            names,
+            values,
+            span,
+        } => {
             for value in values {
-                collect_boxed_candidates_expr(value, out);
+                collect_boxed_candidates_expr(value, visible, out);
+            }
+            for name in names.iter().flatten() {
+                define_assignment_binding(name, *span, visible);
             }
         }
         Stmt::ObjectDestructureAssign {
-            bindings, value, ..
+            bindings,
+            rest,
+            value,
+            span,
         } => {
-            collect_boxed_candidates_expr(value, out);
+            collect_boxed_candidates_expr(value, visible, out);
             for binding in bindings {
                 if let Some(default) = &binding.default {
-                    collect_boxed_candidates_expr(default, out);
+                    collect_boxed_candidates_expr(default, visible, out);
                 }
+                if let Some(local) = &binding.local {
+                    define_assignment_binding(local, *span, visible);
+                }
+            }
+            if let Some(local) = rest.as_ref().and_then(|rest| rest.local.as_ref()) {
+                define_assignment_binding(local, *span, visible);
             }
         }
         Stmt::If {
@@ -3604,106 +4432,153 @@ fn collect_boxed_candidates_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
             else_branch,
             ..
         } => {
-            collect_boxed_candidates_expr(condition, out);
-            collect_boxed_candidates(then_branch, out);
-            collect_boxed_candidates(else_branch, out);
+            collect_boxed_candidates_expr(condition, visible, out);
+            collect_boxed_candidates_block(then_branch, &mut visible.clone(), out);
+            collect_boxed_candidates_block(else_branch, &mut visible.clone(), out);
         }
         Stmt::While {
             condition, body, ..
         } => {
-            collect_boxed_candidates_expr(condition, out);
-            collect_boxed_candidates(body, out);
+            collect_boxed_candidates_expr(condition, visible, out);
+            collect_boxed_candidates_block(body, &mut visible.clone(), out);
         }
-        Stmt::For { iterable, body, .. } => {
-            collect_boxed_candidates_expr(iterable, out);
-            collect_boxed_candidates(body, out);
+        Stmt::For {
+            name,
+            iterable,
+            body,
+            span,
+        } => {
+            collect_boxed_candidates_expr(iterable, visible, out);
+            let mut scoped = visible.clone();
+            // The iterator is created by lower_for rather than a body statement,
+            // but still has a stable binding site. Recording it lets lower_for
+            // reject closure capture explicitly instead of emitting a closure
+            // that reads an unbound C local.
+            scoped.insert(name.clone(), Some(BoxedBindingSite::new(name, *span)));
+            collect_boxed_candidates_block(body, &mut scoped, out);
         }
         Stmt::Function(function) => {
-            out.extend(crate::runtime::interpreter::function_capture_names(function));
-            collect_boxed_candidates(&function.body, out);
+            record_visible_captures(
+                crate::runtime::interpreter::function_capture_names(function),
+                visible,
+                out,
+            );
+            // A named local function comes into scope only after its closure is
+            // created. Self-recursion is handled by self_recurse, not a cell.
+            visible.insert(function.name.clone(), None);
         }
         Stmt::Try {
             body,
+            catch_name,
             catch_body,
             finally_body,
             ..
         } => {
-            collect_boxed_candidates(body, out);
-            collect_boxed_candidates(catch_body, out);
-            collect_boxed_candidates(finally_body, out);
+            collect_boxed_candidates_block(body, &mut visible.clone(), out);
+            let mut catch_visible = visible.clone();
+            if let Some(name) = catch_name {
+                catch_visible.insert(name.clone(), None);
+            }
+            collect_boxed_candidates_block(catch_body, &mut catch_visible, out);
+            collect_boxed_candidates_block(finally_body, &mut visible.clone(), out);
         }
         Stmt::Fail { value, .. } | Stmt::Panic { value, .. } | Stmt::Print { value, .. } => {
-            collect_boxed_candidates_expr(value, out)
+            collect_boxed_candidates_expr(value, visible, out)
         }
         Stmt::Return { value, .. } => {
             if let Some(value) = value {
-                collect_boxed_candidates_expr(value, out);
+                collect_boxed_candidates_expr(value, visible, out);
             }
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
-        Stmt::Expr { expr, .. } => collect_boxed_candidates_expr(expr, out),
+        Stmt::Expr { expr, .. } => collect_boxed_candidates_expr(expr, visible, out),
     }
 }
 
-fn collect_boxed_candidates_assign_target(target: &AssignTarget, out: &mut HashSet<String>) {
+fn collect_boxed_candidates_assign_target(
+    target: &AssignTarget,
+    visible: &VisibleBoxBindings,
+    out: &mut HashSet<BoxedBindingSite>,
+) {
     match target {
         AssignTarget::Variable(_) => {}
         AssignTarget::Index { target, index } => {
-            collect_boxed_candidates_expr(target, out);
-            collect_boxed_candidates_expr(index, out);
+            collect_boxed_candidates_expr(target, visible, out);
+            collect_boxed_candidates_expr(index, visible, out);
         }
-        AssignTarget::Field { target, .. } => collect_boxed_candidates_expr(target, out),
+        AssignTarget::Field { target, .. } => collect_boxed_candidates_expr(target, visible, out),
     }
 }
 
-fn collect_boxed_candidates_expr(expr: &Expr, out: &mut HashSet<String>) {
+fn collect_boxed_candidates_expr(
+    expr: &Expr,
+    visible: &VisibleBoxBindings,
+    out: &mut HashSet<BoxedBindingSite>,
+) {
     match &expr.kind {
         ExprKind::Function { params, body, .. } => {
-            out.extend(crate::runtime::interpreter::closure_capture_names(
-                params, body,
-            ));
-            collect_boxed_candidates(body, out);
+            record_visible_captures(
+                crate::runtime::interpreter::closure_capture_names(params, body),
+                visible,
+                out,
+            );
         }
         ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => {
-            collect_boxed_candidates_expr(expr, out)
+            collect_boxed_candidates_expr(expr, visible, out)
         }
         ExprKind::Binary { left, right, .. } => {
-            collect_boxed_candidates_expr(left, out);
-            collect_boxed_candidates_expr(right, out);
+            collect_boxed_candidates_expr(left, visible, out);
+            collect_boxed_candidates_expr(right, visible, out);
         }
         ExprKind::Call { callee, args } => {
-            collect_boxed_candidates_expr(callee, out);
+            collect_boxed_candidates_expr(callee, visible, out);
             for arg in args {
-                collect_boxed_candidates_expr(arg, out);
+                collect_boxed_candidates_expr(arg, visible, out);
             }
         }
         ExprKind::Array(values) => {
             for value in values {
-                collect_boxed_candidates_expr(value, out);
+                collect_boxed_candidates_expr(value, visible, out);
             }
         }
         ExprKind::Index { target, index } => {
-            collect_boxed_candidates_expr(target, out);
-            collect_boxed_candidates_expr(index, out);
+            collect_boxed_candidates_expr(target, visible, out);
+            collect_boxed_candidates_expr(index, visible, out);
         }
         ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
-            collect_boxed_candidates_expr(target, out)
+            collect_boxed_candidates_expr(target, visible, out)
         }
         ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
             for (_, value) in fields {
-                collect_boxed_candidates_expr(value, out);
+                collect_boxed_candidates_expr(value, visible, out);
             }
         }
         ExprKind::Match { value, arms } => {
-            collect_boxed_candidates_expr(value, out);
+            collect_boxed_candidates_expr(value, visible, out);
             for arm in arms {
+                let mut arm_visible = visible.clone();
+                bind_non_boxable_pattern_names(&arm.pattern, &mut arm_visible);
                 if let Some(guard) = &arm.guard {
-                    collect_boxed_candidates_expr(guard, out);
+                    collect_boxed_candidates_expr(guard, &arm_visible, out);
                 }
-                collect_boxed_candidates_expr(&arm.value, out);
+                collect_boxed_candidates_expr(&arm.value, &arm_visible, out);
             }
         }
         ExprKind::Literal(_) | ExprKind::Variable(_) => {}
+    }
+}
+
+fn bind_non_boxable_pattern_names(pattern: &MatchPattern, visible: &mut VisibleBoxBindings) {
+    match pattern {
+        MatchPattern::Binding(name) => {
+            visible.insert(name.clone(), None);
+        }
+        MatchPattern::EnumVariant { fields, .. } => {
+            for field in fields {
+                bind_non_boxable_pattern_names(field, visible);
+            }
+        }
+        MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
     }
 }
 

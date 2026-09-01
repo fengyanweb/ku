@@ -1,14 +1,23 @@
+#[path = "support/bounded_process.rs"]
+pub mod bounded_process;
+
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    process::Command,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use bounded_process::{run_bounded, OutputLimits};
 
 use ku::{
     backend, checker::Checker, cli::check_source, cli::run_cli, cli::run_source, ir, lexer::Lexer,
     package, parser::Parser,
 };
+
+const NATIVE_RUN_TIMEOUT: Duration = Duration::from_secs(20);
+const NATIVE_RUN_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(4 * 1024 * 1024, 6 * 1024 * 1024);
 
 fn unique_temp_path(name: &str) -> PathBuf {
     env::temp_dir().join(format!(
@@ -89,6 +98,10 @@ fn assert_ir_cfg_acyclic(program: &ir::IrProgram) {
                     err_block,
                     ..
                 } => vec![*ok_block, *err_block],
+                ir::IrTerminator::Safepoint {
+                    continue_block,
+                    timeout_block,
+                } => vec![*continue_block, *timeout_block],
                 ir::IrTerminator::JumpErr { target, .. } => vec![*target],
                 ir::IrTerminator::Next
                 | ir::IrTerminator::PropagateErr(_)
@@ -175,8 +188,20 @@ fn main(): int! {
     );
 
     assert!(text.contains("jump_err"), "unexpected IR:\n{text}");
+    let (catch_name, error_source) = text
+        .lines()
+        .find_map(|line| {
+            line.trim_start()
+                .strip_prefix("bind_error ")?
+                .split_once(" from ")
+        })
+        .expect("catch must bind the propagated error");
     assert!(
-        text.contains("bind_error err from"),
+        catch_name.starts_with("__ku_local_") && catch_name.ends_with("_err"),
+        "unexpected IR:\n{text}"
+    );
+    assert!(
+        error_source.starts_with("__ku_error_"),
         "unexpected IR:\n{text}"
     );
     assert!(!text.contains("fail \"bad\""), "unexpected IR:\n{text}");
@@ -343,7 +368,7 @@ async fn main() {
 }
 
 #[test]
-fn native_build_emit_c_includes_local_import_graph_without_runner_source_loader() {
+fn native_build_native_emits_local_import_graph_without_runner_source_loader() {
     let dir = unique_temp_path("native-import-graph");
     let src = dir.join("src");
     fs::create_dir_all(&src).expect("create temp src");
@@ -373,22 +398,585 @@ fn main(): null! {
     run_cli(vec![
         "ku".to_string(),
         "build".to_string(),
-        "--emit-c".to_string(),
+        "--native".to_string(),
         main.display().to_string(),
     ])
-    .expect("native C artifact should include import graph");
+    .expect("ku build --native C artifact should include import graph");
 
-    let c_path = src.join(".ku").join("build").join("debug").join("c").join("main.c");
+    // `ku build --native <file>` without `-o` is the no-link compatibility path:
+    // it must emit this adjacent C artifact even when no C compiler is installed.
+    let c_path = main.with_extension("c");
     let c = fs::read_to_string(&c_path).expect("read generated C");
     assert!(
-        c.contains("int64_t Add(int64_t a, int64_t b)"),
+        c.lines().any(|line| {
+            line.starts_with("int64_t __ku_import") && line.contains("_Add(int64_t a, int64_t b)")
+        }),
         "imported Add missing:\n{c}"
     );
-    assert!(c.contains("KuResult_null ku_main()"), "entry main missing:\n{c}");
+    assert!(
+        c.contains("KuResult_null ku_main()"),
+        "entry main missing:\n{c}"
+    );
     assert!(
         !c.contains("run_source") && !c.contains("const SOURCE"),
         "native C artifact must not use runner source loader:\n{c}"
     );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn import_graph_depth_fails_with_a_bounded_structured_error() {
+    let dir = unique_temp_path("import-depth-budget");
+    fs::create_dir_all(&dir).expect("create import depth directory");
+    let module_count = 140usize;
+    for index in (0..module_count).rev() {
+        let source = if index + 1 == module_count {
+            format!("fn F{index}(): int {{ return {index} }}\n")
+        } else {
+            format!(
+                "import {{ F{} }} from \"./m{}\"\nfn F{index}(): int {{ return F{}() }}\n",
+                index + 1,
+                index + 1,
+                index + 1
+            )
+        };
+        fs::write(dir.join(format!("m{index}.ku")), source).expect("write depth module");
+    }
+    let main = dir.join("main.ku");
+    fs::write(
+        &main,
+        "import { F0 } from \"./m0\"\nfn main() { println(F0()) }\n",
+    )
+    .expect("write depth entry");
+
+    let started = Instant::now();
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--native".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect_err("deep import graph must fail before exhausting the Rust stack");
+    assert_eq!(
+        err.domain.as_deref(),
+        Some("import"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        err.code.as_deref(),
+        Some("depth_limit"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "deep import rejection was not prompt: {:?}",
+        started.elapsed()
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn import_graph_width_fails_at_the_unique_module_budget() {
+    let dir = unique_temp_path("import-module-budget");
+    fs::create_dir_all(&dir).expect("create import width directory");
+    let imported_modules = 4_096usize;
+    let mut main_source = String::new();
+    for index in 0..imported_modules {
+        fs::write(
+            dir.join(format!("m{index}.ku")),
+            format!("fn F{index}(): int {{ return {index} }}\n"),
+        )
+        .expect("write width module");
+        main_source.push_str(&format!(
+            "import {{ F{index} as _F{index} }} from \"./m{index}\"\n"
+        ));
+    }
+    main_source.push_str("fn main() {}\n");
+    let main = dir.join("main.ku");
+    fs::write(&main, main_source).expect("write width entry");
+
+    let started = Instant::now();
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--native".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect_err("wide import graph must fail at the unique module budget");
+    assert_eq!(
+        err.domain.as_deref(),
+        Some("import"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        err.code.as_deref(),
+        Some("module_limit"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "wide import rejection was not bounded: {:?}",
+        started.elapsed()
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repeated_namespace_imports_materialize_each_module_once() {
+    let dir = unique_temp_path("import-clone-budget");
+    fs::create_dir_all(&dir).expect("create import clone directory");
+    fs::write(dir.join("layer0.ku"), "fn Value0(): int { return 1 }\n").expect("write base layer");
+    let layers = 18usize;
+    for index in 1..=layers {
+        fs::write(
+            dir.join(format!("layer{index}.ku")),
+            format!(
+                "import left{index} from \"./layer{}\"\nimport right{index} from \"./layer{}\"\nfn Value{index}(): int {{ return left{index}.Value{}() + right{index}.Value{}() }}\n",
+                index - 1,
+                index - 1,
+                index - 1,
+                index - 1
+            ),
+        )
+        .expect("write repeated namespace layer");
+    }
+    let main = dir.join("main.ku");
+    fs::write(
+        &main,
+        format!(
+            "import root from \"./layer{layers}\"\nfn main() {{ println(root.Value{layers}()) }}\n"
+        ),
+    )
+    .expect("write repeated namespace entry");
+
+    let started = Instant::now();
+    run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--native".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("diamond namespace edges should reuse canonical module declarations");
+    let c = fs::read_to_string(main.with_extension("c")).expect("read canonical import C");
+    let definitions = c
+        .lines()
+        .filter(|line| line.starts_with("int64_t __ku_import") && line.ends_with(" {"))
+        .count();
+    assert!(
+        definitions == layers + 1,
+        "expected one function definition per source module, got {definitions}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "canonical import expansion was not prompt: {:?}",
+        started.elapsed()
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn diamond_imports_share_one_nominal_type_and_emit_deterministic_native_c() {
+    let dir = unique_temp_path("diamond-type-identity");
+    let shared = dir.join("shared");
+    fs::create_dir_all(&shared).expect("create diamond import directory");
+    fs::write(
+        shared.join("token.ku"),
+        r#"
+struct Token { value: int }
+fn Make(value: int): Token { return Token { value: value } }
+fn Canonical(token: Token): int { return token.value }
+"#,
+    )
+    .expect("write shared token module");
+    fs::write(
+        dir.join("lexer.ku"),
+        r#"
+import { Token, Make } from "./shared/token"
+fn Scan(): [Token] { return [Make(7)] }
+"#,
+    )
+    .expect("write lexer module");
+    let main = dir.join("main.ku");
+    fs::write(
+        &main,
+        r#"
+import { Scan } from "./lexer"
+import { Token as DirectToken, Canonical as CanonicalA } from "./shared/token"
+import { Make as MakeAgain, Canonical as CanonicalB } from "./shared/../shared/token"
+
+fn main(): null! {
+    tokens = Scan()
+    first: DirectToken = tokens[0].clone()
+    if (CanonicalA(first) != 7) { panic("diamond type identity split") }
+    second = MakeAgain(8)
+    if (CanonicalB(second) != 8) { panic("same-module aliases split") }
+    return ok(null)
+}
+"#,
+    )
+    .expect("write diamond entry");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("diamond nominal type must check");
+    run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("diamond nominal type must run");
+    let build = || {
+        run_cli(vec![
+            "ku".to_string(),
+            "build".to_string(),
+            "--native".to_string(),
+            main.to_string_lossy().to_string(),
+        ])
+        .expect("diamond nominal type must lower to native C");
+        fs::read(main.with_extension("c")).expect("read diamond native C")
+    };
+    let first_c = build();
+    let second_c = build();
+    assert_eq!(
+        first_c, second_c,
+        "native import symbols must be deterministic"
+    );
+    let c = String::from_utf8(first_c).expect("native C is UTF-8");
+    let token_definitions = c
+        .lines()
+        .filter(|line| line.starts_with("struct KuStruct___ku_import") && line.contains("_Token {"))
+        .count();
+    assert_eq!(
+        token_definitions, 1,
+        "the canonical Token declaration must be materialized once:\n{c}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn namespace_function_values_respect_local_shadowing() {
+    let dir = unique_temp_path("namespace-function-value-shadow");
+    fs::create_dir_all(&dir).expect("create namespace shadow directory");
+    fs::write(
+        dir.join("math.ku"),
+        "fn Add(a: int, b: int): int { return a + b }\n",
+    )
+    .expect("write namespace module");
+    let main = dir.join("main.ku");
+    fs::write(
+        &main,
+        r#"
+import math from "./math"
+struct Holder { Add: int }
+fn Shadow(math: Holder): int { return math.Add }
+fn main() {
+    op: fn(int, int): int = math.Add
+    if (op(2, 3) != 5) { panic("namespace function value was not rewritten") }
+    math = Holder { Add: 9 }
+    if (math.Add != 9) { panic("local namespace shadow was rewritten") }
+    if (Shadow(math) != 9) { panic("parameter namespace shadow was rewritten") }
+}
+"#,
+    )
+    .expect("write namespace shadow entry");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("namespace function values and shadows must check");
+    run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("namespace function values and shadows must run");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn imports_are_private_bindings_not_implicit_reexports() {
+    let dir = unique_temp_path("import-no-reexport");
+    fs::create_dir_all(&dir).expect("create import privacy directory");
+    fs::write(dir.join("origin.ku"), "fn Value(): int { return 1 }\n")
+        .expect("write origin module");
+    fs::write(
+        dir.join("named.ku"),
+        "import { Value } from \"./origin\"\nfn Named(): int { return Value() }\n",
+    )
+    .expect("write named relay");
+    fs::write(
+        dir.join("glob.ku"),
+        "import \"./origin\"\nfn Glob(): int { return Value() }\n",
+    )
+    .expect("write glob relay");
+    fs::write(
+        dir.join("namespace.ku"),
+        "import origin from \"./origin\"\nfn Namespace(): int { return origin.Value() }\n",
+    )
+    .expect("write namespace relay");
+
+    for relay in ["named", "glob", "namespace"] {
+        let main = dir.join(format!("bad-{relay}.ku"));
+        fs::write(
+            &main,
+            format!("import {{ Value }} from \"./{relay}\"\nfn main() {{ println(Value()) }}\n"),
+        )
+        .expect("write reexport probe");
+        let err = run_cli(vec![
+            "ku".to_string(),
+            "check".to_string(),
+            main.to_string_lossy().to_string(),
+        ])
+        .expect_err("an imported binding must not be reexported")
+        .to_string();
+        assert!(
+            err.contains("'Value' is not exported"),
+            "unexpected {relay} reexport diagnostic: {err}"
+        );
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn same_named_types_from_different_modules_remain_nominally_distinct() {
+    let dir = unique_temp_path("distinct-import-types");
+    fs::create_dir_all(&dir).expect("create distinct type directory");
+    fs::write(
+        dir.join("left.ku"),
+        "struct Token { value: int }\nfn MakeLeft(): Token { return Token { value: 1 } }\n",
+    )
+    .expect("write left type module");
+    fs::write(
+        dir.join("right.ku"),
+        "struct Token { value: int }\nfn AcceptRight(token: Token): int { return token.value }\n",
+    )
+    .expect("write right type module");
+    let main = dir.join("main.ku");
+    fs::write(
+        &main,
+        "import { MakeLeft } from \"./left\"\nimport { AcceptRight } from \"./right\"\nfn main() { println(AcceptRight(MakeLeft())) }\n",
+    )
+    .expect("write distinct type entry");
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--native".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect_err("different modules' Token declarations must stay distinct")
+    .to_string();
+    assert!(
+        err.contains("type error"),
+        "unexpected nominal error: {err}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repeated_import_edges_hit_a_structured_hard_limit() {
+    let dir = unique_temp_path("import-edge-budget");
+    fs::create_dir_all(&dir).expect("create import edge budget directory");
+    fs::write(dir.join("empty.ku"), "fn hidden(): int { return 1 }\n")
+        .expect("write private dependency");
+    let mut source = String::new();
+    for _ in 0..16_385 {
+        source.push_str("import \"./empty\"\n");
+    }
+    source.push_str("fn main() {}\n");
+    let main = dir.join("main.ku");
+    fs::write(&main, source).expect("write import edge budget entry");
+    let started = Instant::now();
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--native".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect_err("excessive repeated import edges must fail");
+    assert_eq!(
+        err.domain.as_deref(),
+        Some("import"),
+        "unexpected import edge error: {err}"
+    );
+    assert_eq!(
+        err.code.as_deref(),
+        Some("edge_limit"),
+        "unexpected import edge error: {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "import edge rejection was not prompt: {:?}",
+        started.elapsed()
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn diamond_std_imports_are_deduplicated() {
+    let dir = unique_temp_path("diamond-std-import");
+    fs::create_dir_all(&dir).expect("create diamond std directory");
+    for (name, function) in [("left", "Left"), ("right", "Right")] {
+        fs::write(
+            dir.join(format!("{name}.ku")),
+            format!(
+                "import time from \"std.time\"\nfn {function}(): int {{ return time.millis() }}\n"
+            ),
+        )
+        .expect("write std dependency branch");
+    }
+    let main = dir.join("main.ku");
+    fs::write(
+        &main,
+        "import { Left } from \"./left\"\nimport { Right } from \"./right\"\nfn main() { println(Left() <= Right()) }\n",
+    )
+    .expect("write diamond std entry");
+    run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("the same std module imported on two branches must be deduplicated");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn named_imports_keep_internal_dependency_closure_without_export_leaks() {
+    let dir = unique_temp_path("named-import-closure");
+    fs::create_dir_all(&dir).expect("create named import directory");
+    fs::write(
+        dir.join("left.ku"),
+        r#"
+struct Box {
+    value: int
+}
+
+fn Shared(): int { return 100 }
+fn MakeBox(): Box { return Box { value: 40 } }
+fn Pick(): int { return MakeBox().value + Shared() }
+"#,
+    )
+    .expect("write left module");
+    fs::write(
+        dir.join("right.ku"),
+        r#"
+fn Shared(): int { return 200 }
+fn Use(): int { return Shared() }
+"#,
+    )
+    .expect("write right module");
+    let main = dir.join("main.ku");
+    fs::write(
+        &main,
+        r#"
+import { Pick } from "./left"
+import { Use } from "./right"
+
+fn main() {
+    if (Pick() != 140) { panic("left dependency closure was not preserved") }
+    if (Use() != 200) { panic("right dependency closure was not preserved") }
+}
+"#,
+    )
+    .expect("write named import entry");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("selected functions must retain unselected helper and type dependencies");
+    run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("independent modules with same-named unselected exports must run");
+
+    let leak = dir.join("leak.ku");
+    fs::write(
+        &leak,
+        "import { Pick } from \"./left\"\nfn main() { println(Pick()); println(Shared()) }\n",
+    )
+    .expect("write export leak probe");
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        leak.to_string_lossy().to_string(),
+    ])
+    .expect_err("an unselected public helper must not remain visible")
+    .to_string();
+    assert!(
+        err.contains("undefined function 'Shared'"),
+        "unexpected leak error: {err}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn named_import_rewrites_top_level_function_values_but_respects_local_shadowing() {
+    let dir = unique_temp_path("named-import-function-values");
+    fs::create_dir_all(&dir).expect("create function value import directory");
+    fs::write(
+        dir.join("ops.ku"),
+        r#"
+fn Add(a: int, b: int): int { return a + b }
+fn Apply(op: fn(int, int): int, a: int, b: int): int { return op(a, b) }
+
+fn Run(): int {
+    first = Apply(Add, 1, 2)
+    op: fn(int, int): int = Add
+    closure = () => { return Add(3, 4) }
+    return first + op(2, 3) + closure()
+}
+
+fn Shadow(Add: int): int { return Add + 1 }
+
+fn Branch(flag: bool): int {
+    if (flag) {
+        Add = 10
+        if (Add != 10) { panic("then-branch local was rewritten") }
+    } else {
+        Add = 20
+        if (Add != 20) { panic("else-branch local was rewritten") }
+    }
+    return Add(4, 5)
+}
+"#,
+    )
+    .expect("write function value module");
+    let main = dir.join("main.ku");
+    fs::write(
+        &main,
+        r#"
+import { Run, Shadow, Branch } from "./ops"
+
+fn main() {
+    if (Run() != 15) { panic("top-level function value references were not rewritten") }
+    if (Shadow(5) != 6) { panic("local shadow was rewritten as a top-level helper") }
+    if (Branch(true) != 9) { panic("then-branch scope escaped or hid the helper") }
+    if (Branch(false) != 9) { panic("else-branch scope escaped or hid the helper") }
+}
+"#,
+    )
+    .expect("write function value entry");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("function value and local shadow import must check");
+    run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect("function value and local shadow import must run");
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -425,6 +1013,78 @@ fn main() {
 }
 
 #[test]
+fn native_ir_rejects_closure_capture_of_for_binding_explicitly() {
+    let tokens = Lexer::new(
+        r#"
+fn main() {
+    for value in [1, 2] {
+        get: fn(): int = () => value
+        println(get())
+    }
+}
+"#,
+    )
+    .tokenize()
+    .expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let err = ir::lower_program(&program)
+        .expect_err("native for-binding capture must be rejected until per-iteration cells exist")
+        .to_string();
+    assert!(
+        err.contains("closure capture of a for loop variable"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn compiler_reserved_namespace_prevents_for_state_name_collision() {
+    let tokens = Lexer::new(
+        r#"
+fn main() {
+    __ku_for_1_array = 7
+    for value in [1, 2] { println(value) }
+}
+"#,
+    )
+    .tokenize()
+    .expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    let err = Checker::new()
+        .check(&program)
+        .expect_err("compiler-reserved for state names must reject user bindings")
+        .to_string();
+    assert!(
+        err.contains("identifiers starting with '__ku_' are used by the compiler"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn native_int_for_uses_non_wrapping_64_bit_counter() {
+    let tokens = Lexer::new(
+        r#"
+fn main() {
+    for value in 3 { println(value) }
+}
+"#,
+    )
+    .tokenize()
+    .expect("lex");
+    let program = Parser::new(tokens).parse().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let ir = ir::lower_program(&program).expect("lower ir");
+    let c = backend::c::generate_c_source(&ir).expect("generate native for C");
+    assert!(
+        c.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("uint64_t __ku_for_") && line.ends_with("_index = 0;")
+        }),
+        "int for must use a 64-bit counter on 32-bit targets"
+    );
+}
+
+#[test]
 fn native_c_backend_lowers_kustring_static_clone_concat_and_drop() {
     let tokens = Lexer::new(
         r#"
@@ -442,10 +1102,19 @@ fn main() {
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate C with KuString");
-    assert!(c.contains("typedef struct KuString"), "missing KuString ABI:\n{c}");
-    assert!(c.contains("ku_string_static"), "missing static string literal:\n{c}");
+    assert!(
+        c.contains("typedef struct KuString"),
+        "missing KuString ABI:\n{c}"
+    );
+    assert!(
+        c.contains("ku_string_static"),
+        "missing static string literal:\n{c}"
+    );
     assert!(c.contains("ku_string_clone"), "missing string clone:\n{c}");
-    assert!(c.contains("ku_string_concat"), "missing string concat:\n{c}");
+    assert!(
+        c.contains("ku_string_concat"),
+        "missing string concat:\n{c}"
+    );
     assert!(c.contains("ku_string_drop"), "missing string drop:\n{c}");
 }
 
@@ -502,7 +1171,8 @@ fn main(): int! {
 
     assert!(c.contains("KuResult_int ku_main("));
     assert!(c.contains("int main(void)"));
-    assert!(c.contains("typedef struct { bool ok; int64_t value; KuError error; } KuResult_int"));
+    assert!(c.contains("typedef struct KuResult_int KuResult_int;"));
+    assert!(c.contains("struct KuResult_int { bool ok; int64_t value; KuError error; };"));
     assert!(c.contains("if (t0.ok) goto block"));
     assert!(c.contains("ku_result_take_int(&t0)"));
     assert!(c.contains("int64_t item = "));
@@ -528,9 +1198,8 @@ fn main() {
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate array Result C");
-    assert!(c.contains(
-        "typedef struct { bool ok; KuArray_int value; KuError error; } KuResult_array_int"
-    ));
+    assert!(c.contains("typedef struct KuResult_array_int KuResult_array_int;"));
+    assert!(c.contains("struct KuResult_array_int { bool ok; KuArray_int value; KuError error; };"));
     assert!(c.contains("ku_result_move_array_int"));
     assert!(c.contains("ku_result_take_array_int"));
     assert!(c.contains("ku_result_drop_array_int"));
@@ -572,8 +1241,19 @@ fn main(): int! {
     assert!(text.contains("__ku_error_"), "unexpected IR:\n{text}");
 
     let c = backend::c::generate_c_source(&ir).expect("generate try/finally C");
+    let catch_name = ir
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match instruction {
+            ir::IrInst::BindError { name, .. } => Some(name),
+            _ => None,
+        })
+        .expect("try/catch must have an error binding");
     assert!(c.contains("typedef struct KuError"));
-    assert!(c.contains("KuError err = "));
+    assert!(c.contains(&format!("KuError {catch_name} = ")));
+    assert!(c.contains(&format!("ku_error_drop(&{catch_name})")));
     assert!(c.contains("ku_error_move(&"));
     assert!(c.contains("goto block"));
     assert!(c.contains("ku_result_move_int"));
@@ -614,7 +1294,9 @@ fn main() {
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate c");
 
-    assert!(c.contains("typedef struct { size_t len; int64_t* data; } KuArray_int"));
+    assert!(
+        c.contains("typedef struct { size_t len; int64_t* data; size_t capacity; } KuArray_int")
+    );
     assert!(c.contains("ku_array_make_int(3"));
     assert!(c.contains("ku_array_clone_int(values)"));
     assert!(c.contains("replace(ku_array_move_int(&t"));
@@ -896,6 +1578,32 @@ fn main() {
         err.contains("expected int"),
         "task.stress argument types must be checked: {err}"
     );
+}
+
+#[test]
+fn ordinary_code_cannot_schedule_runtime_tasks_manually() {
+    for (api, source) in [
+        (
+            "task.spawn",
+            r#"import "std.task" fn main() { task.spawn(() => { return null }) }"#,
+        ),
+        (
+            "Task.new",
+            r#"fn main() { Task.new(() => { return null }) }"#,
+        ),
+        (
+            "runtime.schedule",
+            r#"fn main() { runtime.schedule(() => { return null }) }"#,
+        ),
+    ] {
+        let error = check_source("inline.ku", source)
+            .expect_err("manual task scheduling must stay outside the user API")
+            .to_string();
+        assert!(
+            error.contains("unknown stdlib function") || error.contains("undefined variable"),
+            "{api} unexpectedly reached a callable user API: {error}"
+        );
+    }
 }
 
 #[test]
@@ -1348,7 +2056,7 @@ fn main(): null! {
         .expect_err("invalid url should be a recoverable http error")
         .to_string();
     assert!(
-        err.contains("http url must start with http:// or https://"),
+        err.contains("http url must be an absolute http:// or https:// URL"),
         "unexpected error: {err}"
     );
     fs::remove_dir_all(dir).expect("remove temp dir");
@@ -1494,18 +2202,180 @@ fn main() { print(Value()) }
     );
     assert!(lock.contains("name = \"util\""), "unexpected lock:\n{lock}");
     assert!(lock.contains(&checksum), "unexpected lock:\n{lock}");
+    let util_cache = dir
+        .join("app")
+        .join(".ku")
+        .join("cache")
+        .join("packages")
+        .join("util");
+    let cached_roots = fs::read_dir(&util_cache)
+        .expect("read util cache")
+        .map(|entry| entry.expect("read cache entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(cached_roots.len(), 1, "unexpected cache roots");
     assert!(
-        dir.join("app")
-            .join(".ku")
-            .join("cache")
-            .join("packages")
-            .join("util")
-            .join("1.0.0")
-            .join("src")
-            .join("util.ku")
-            .exists(),
+        cached_roots[0].join("src").join("util.ku").exists(),
         "dependency should be cached"
     );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn package_multifile_dependency_imports_work_for_author_consumer_and_native_build() {
+    let dir = unique_temp_path("package-multifile-import");
+    let util = dir.join("util");
+    let util_src = util.join("src");
+    let app = dir.join("app");
+    let app_src = app.join("src");
+    fs::create_dir_all(util_src.join("internal")).expect("create util source");
+    fs::create_dir_all(&app_src).expect("create app source");
+    fs::write(
+        util.join("ku.mod"),
+        "name = \"util\"\nversion = \"1.0.0\"\n",
+    )
+    .expect("write util manifest");
+    fs::write(
+        util_src.join("internal").join("base.ku"),
+        "fn Base(): int { return 40 }\n",
+    )
+    .expect("write util base module");
+    fs::write(
+        util_src.join("layer.ku"),
+        "import { Base } from \"internal/base\"\nfn AddTwo(): int { return Base() + 2 }\n",
+    )
+    .expect("write util layer module");
+    fs::write(
+        util_src.join("entry.ku"),
+        "import { AddTwo } from \"./layer\"\nfn Value(): int { return AddTwo() }\n",
+    )
+    .expect("write util public entry module");
+    let util_main = util_src.join("main.ku");
+    fs::write(
+        &util_main,
+        "import { Value } from \"entry\"\nfn main() { if (Value() != 42) { panic(\"bad author import\") } }\n",
+    )
+    .expect("write util author entry");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        util_main.to_string_lossy().to_string(),
+    ])
+    .expect("author package check");
+    run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        util_main.to_string_lossy().to_string(),
+    ])
+    .expect("author package run");
+    run_cli(vec![
+        "ku".to_string(),
+        "package".to_string(),
+        "pack".to_string(),
+        util.to_string_lossy().to_string(),
+    ])
+    .expect("author package pack");
+
+    let checksum = package::package_source_checksum(&util).expect("util checksum");
+    fs::write(
+        app.join("ku.mod"),
+        format!(
+            "name = \"app\"\nversion = \"0.1.0\"\ndep.util = \"1.0.0\"\ndep.util.source = \"file://{}\"\ndep.util.checksum = \"{}\"\n",
+            util.to_string_lossy().replace('\\', "/"),
+            checksum
+        ),
+    )
+    .expect("write app manifest");
+    let app_main = app_src.join("main.ku");
+    fs::write(
+        &app_main,
+        "import { Value } from \"@util/entry\"\nfn main() { if (Value() != 42) { panic(\"bad consumer import\") } }\n",
+    )
+    .expect("write app entry");
+
+    run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        app_main.to_string_lossy().to_string(),
+    ])
+    .expect("consumer package check");
+    let app_lock = fs::read_to_string(app.join("ku.lock")).expect("read app lock");
+    for dependency_path in ["@util/entry.ku", "@util/layer.ku", "@util/internal/base.ku"] {
+        assert!(
+            app_lock.contains(&format!("path = \"{dependency_path}\"")),
+            "portable dependency path missing from lock:\n{app_lock}"
+        );
+    }
+    assert!(
+        !app_lock.contains("path = \".ku/cache/"),
+        "lock must not expose the local cache layout:\n{app_lock}"
+    );
+    run_cli(vec![
+        "ku".to_string(),
+        "package".to_string(),
+        "resolve".to_string(),
+        app.to_string_lossy().to_string(),
+        "--offline".to_string(),
+    ])
+    .expect("consumer offline resolution from lock and cache");
+    run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        app_main.to_string_lossy().to_string(),
+    ])
+    .expect("consumer package run");
+    run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--native".to_string(),
+        app_main.to_string_lossy().to_string(),
+    ])
+    .expect("consumer native C build");
+    let c = fs::read_to_string(app_main.with_extension("c")).expect("read native C");
+    assert!(c.contains("Base("), "internal base function missing:\n{c}");
+    assert!(
+        c.contains("AddTwo("),
+        "relative layer function missing:\n{c}"
+    );
+    assert!(
+        c.contains("Value("),
+        "dependency entry function missing:\n{c}"
+    );
+    assert!(!c.contains("run_source") && !c.contains("const SOURCE"));
+
+    let binary = app.join(if cfg!(windows) {
+        "multifile.exe"
+    } else {
+        "multifile"
+    });
+    match run_cli(vec![
+        "ku".to_string(),
+        "build".to_string(),
+        "--native".to_string(),
+        app_main.to_string_lossy().to_string(),
+        "-o".to_string(),
+        binary.to_string_lossy().to_string(),
+    ]) {
+        Ok(()) => {
+            let mut command = Command::new(&binary);
+            let output = run_bounded(&mut command, NATIVE_RUN_TIMEOUT, NATIVE_RUN_OUTPUT_LIMITS)
+                .unwrap_or_else(|error| {
+                    panic!("native dependency binary was not bounded: {error}")
+                });
+            assert!(
+                output.status.success(),
+                "native dependency binary failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Err(err) if err.to_string().contains("C compiler not found") => {
+            eprintln!("skip linked native package test: no C compiler available");
+        }
+        Err(err) => panic!("consumer linked native build failed: {err}"),
+    }
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -1603,6 +2473,39 @@ fn main() { print(Value()) }
 }
 
 #[test]
+fn package_internal_relative_import_cannot_escape_its_owner_root() {
+    let dir = unique_temp_path("package-local-import-escape");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).expect("create package src");
+    fs::write(
+        dir.join("ku.mod"),
+        "name = \"demo_pkg\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write package manifest");
+    fs::write(dir.join("secret.ku"), "fn Secret(): int { return 1 }\n")
+        .expect("write outside-root module");
+    let main = src.join("main.ku");
+    fs::write(
+        &main,
+        "import { Secret } from \"../secret\"\nfn main() { print(Secret()) }\n",
+    )
+    .expect("write package entry");
+
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "check".to_string(),
+        main.to_string_lossy().to_string(),
+    ])
+    .expect_err("relative import outside the owner root must fail")
+    .to_string();
+    assert!(
+        err.contains("outside package 'demo_pkg' import root"),
+        "unexpected error: {err}"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn package_file_url_accepts_triple_slash_windows_path() {
     let dir = unique_temp_path("package-file-url-triple");
     let app_src = dir.join("app").join("src");
@@ -1681,26 +2584,111 @@ fn main() { print(Value()) }
         main.to_string_lossy().to_string(),
     ])
     .expect("first package check");
+    let first_lock = fs::read_to_string(dir.join("app").join("ku.lock")).expect("read first lock");
+    let first_cache_key = first_lock
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("cache_key = \"")?
+                .strip_suffix('"')
+        })
+        .expect("file cache key in lock")
+        .to_string();
     fs::write(&dep_file, "fn Value(): int { return 2 }").expect("update dep util");
+    run_cli(vec![
+        "ku".to_string(),
+        "package".to_string(),
+        "resolve".to_string(),
+        dir.join("app").to_string_lossy().to_string(),
+        "--offline".to_string(),
+    ])
+    .expect("offline resolve must reuse the locked cache without reading changed file source");
+    let cached_path = dir
+        .join("app")
+        .join(".ku")
+        .join("cache")
+        .join("packages")
+        .join("util")
+        .join(&first_cache_key);
+    let cached_before_refresh =
+        fs::read_to_string(cached_path.join("src").join("util.ku")).expect("read locked cache");
+    assert!(cached_before_refresh.contains("return 1"));
+    fs::remove_dir_all(&cached_path).expect("remove locked cache to exercise locked refill");
+    let locked_error = run_cli(vec![
+        "ku".to_string(),
+        "package".to_string(),
+        "resolve".to_string(),
+        dir.join("app").to_string_lossy().to_string(),
+        "--locked".to_string(),
+    ])
+    .expect_err("locked resolve must not refresh a changed file dependency");
+    assert_eq!(
+        locked_error.code.as_deref(),
+        Some("locked_source_changed"),
+        "unexpected error: {locked_error:?}"
+    );
     run_cli(vec![
         "ku".to_string(),
         "check".to_string(),
         main.to_string_lossy().to_string(),
     ])
     .expect("second package check");
+    let second_lock =
+        fs::read_to_string(dir.join("app").join("ku.lock")).expect("read second lock");
+    let second_cache_key = second_lock
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("cache_key = \"")?
+                .strip_suffix('"')
+        })
+        .expect("refreshed file cache key in lock");
+    assert_ne!(first_cache_key, second_cache_key);
     let cached = fs::read_to_string(
         dir.join("app")
             .join(".ku")
             .join("cache")
             .join("packages")
             .join("util")
-            .join("1.0.0")
+            .join(second_cache_key)
             .join("src")
             .join("util.ku"),
     )
     .expect("read cached util");
     assert!(cached.contains("return 2"), "unexpected cache:\n{cached}");
 
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn package_file_dependency_rejects_source_containing_consumer_cache() {
+    let dir = unique_temp_path("package-dep-self-source");
+    let app = dir.join("app");
+    fs::create_dir_all(app.join("src")).expect("create app source");
+    fs::write(app.join("src").join("main.ku"), "fn main() {}").expect("write app source");
+    fs::write(
+        app.join("ku.mod"),
+        format!(
+            "name = \"demo_pkg\"\nversion = \"0.1.0\"\ndep.self_dep = \"1.0.0\"\ndep.self_dep.source = \"file://{}\"\n",
+            app.to_string_lossy().replace('\\', "/")
+        ),
+    )
+    .expect("write manifest");
+
+    let err = run_cli(vec![
+        "ku".to_string(),
+        "package".to_string(),
+        "resolve".to_string(),
+        app.to_string_lossy().to_string(),
+    ])
+    .expect_err("a file source containing its destination cache must fail quickly");
+    assert_eq!(
+        err.code.as_deref(),
+        Some("unsafe_file_dependency_source"),
+        "unexpected error: {err:?}"
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1757,120 +2745,6 @@ dep.bad.checksum = "bad"
 }
 
 #[test]
-fn registry_manifest_and_lock_schema_parse_strictly() {
-    let checksum = format!("sha256-{}", "a".repeat(64));
-    let manifest = package::parse_registry_manifest(
-        &format!(
-            r#"
-name = "math"
-version = "0.1.0"
-source = "https://registry.example/ku/math/0.1.0.tar.zst"
-checksum = "{checksum}"
-"#
-        ),
-        Default::default(),
-    )
-    .expect("registry manifest");
-    assert_eq!(manifest.name, "math");
-    assert_eq!(manifest.version, "0.1.0");
-
-    let packages = package::parse_registry_lock(
-        &format!(
-            r#"
-[[package]]
-name = "math"
-version = "0.1.0"
-source = "registry"
-url = "https://registry.example/ku/math/0.1.0.tar.zst"
-checksum = "{checksum}"
-cache_key = "math-0.1.0-sha256-{}"
-"#,
-            "a".repeat(64)
-        ),
-        Default::default(),
-    )
-    .expect("registry lock");
-    assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0].source, "registry");
-}
-
-#[test]
-fn registry_schema_rejects_missing_bad_semver_and_checksum() {
-    let err = package::parse_registry_manifest(
-        r#"
-name = "math"
-version = "latest"
-source = "https://registry.example/math.tar.zst"
-checksum = "bad"
-"#,
-        Default::default(),
-    )
-    .expect_err("bad semver should fail");
-    assert_eq!(err.code.as_deref(), Some("invalid_version"));
-
-    let err = package::parse_registry_manifest(
-        r#"
-name = "math"
-version = "0.1.0"
-source = "https://registry.example/math.tar.zst"
-"#,
-        Default::default(),
-    )
-    .expect_err("missing checksum should fail");
-    assert_eq!(err.code.as_deref(), Some("missing_registry_field"));
-
-    let err = package::parse_registry_lock(
-        r#"
-[[package]]
-name = "math"
-version = "0.1.0"
-source = "registry"
-url = "https://registry.example/math.tar.zst"
-checksum = "sha256-deadbeef"
-cache_key = "math-0.1.0"
-"#,
-        Default::default(),
-    )
-    .expect_err("short sha256 should fail");
-    assert_eq!(err.code.as_deref(), Some("invalid_registry_checksum"));
-}
-
-#[test]
-fn registry_index_ed25519_verifier_accepts_signed_bytes_and_rejects_tampering() {
-    use ed25519_dalek::{Signer, SigningKey};
-    use ku::package::RegistryIndexVerifier;
-
-    let index_url = "https://registry.example/ku/index";
-    let checksum = format!("sha256-{}", "a".repeat(64));
-    let source = format!(
-        "name = \"math\"\nversion = \"0.1.0\"\nsource = \"https://registry.example/ku/math/0.1.0.tar.zst\"\nchecksum = \"{checksum}\"\n"
-    );
-    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
-    let signature = signing_key.sign(source.as_bytes()).to_bytes();
-    let verifier = package::Ed25519RegistryIndexVerifier::new(
-        signing_key.verifying_key().to_bytes(),
-        signature,
-    );
-
-    verifier
-        .verify(index_url, source.as_bytes(), Default::default())
-        .expect("signed registry index should verify");
-
-    let err = verifier
-        .verify(
-            index_url,
-            source.replace("0.1.0", "0.1.1").as_bytes(),
-            Default::default(),
-        )
-        .expect_err("tampered registry index should fail")
-        .to_string();
-    assert!(
-        err.contains("signature") || err.contains("registry_signature_mismatch"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
 fn registry_version_requirements_support_exact_and_caret_boundaries() {
     let exact =
         package::parse_version_requirement("1.2.3", Default::default()).expect("exact requirement");
@@ -1922,116 +2796,6 @@ fn registry_version_requirements_support_exact_and_caret_boundaries() {
 }
 
 #[test]
-fn registry_resolver_selects_highest_shared_version_and_reports_conflicts() {
-    let checksum = format!("sha256-{}", "a".repeat(64));
-    let manifest = |version: &str| package::RegistryManifest {
-        name: "math".to_string(),
-        version: version.to_string(),
-        source: format!("https://registry.example/math/{version}.tar.zst"),
-        checksum: checksum.clone(),
-    };
-    let dependency = |requirement: &str| package::PackageDependency {
-        name: "math".to_string(),
-        version: requirement.to_string(),
-        source: None,
-        checksum: None,
-    };
-    let manifests = vec![manifest("1.2.3"), manifest("1.8.0"), manifest("2.0.0")];
-
-    let resolved = package::resolve_registry_dependencies(
-        &[dependency("^1.2.0"), dependency("^1.7.0")],
-        &manifests,
-        Default::default(),
-    )
-    .expect("compatible requirements");
-    assert_eq!(resolved.len(), 1);
-    assert_eq!(resolved[0].version, "1.8.0");
-
-    let err = package::resolve_registry_dependencies(
-        &[dependency("1.2.3"), dependency("^2.0.0")],
-        &manifests,
-        Default::default(),
-    )
-    .expect_err("incompatible requirements should fail");
-    assert_eq!(err.code.as_deref(), Some("dependency_conflict"));
-}
-
-#[test]
-fn registry_download_plan_is_offline_bounded_and_cache_aware() {
-    let manifest = package::RegistryManifest {
-        name: "math".to_string(),
-        version: "1.2.3".to_string(),
-        source: "https://registry.example/math/1.2.3.tar.zst".to_string(),
-        checksum: format!("sha256-{}", "b".repeat(64)),
-    };
-    let cache = unique_temp_path("registry-plan");
-    let policy = package::RegistryFetchPolicy::default();
-    let reuse = package::plan_registry_download(
-        &cache,
-        &manifest,
-        Some(&manifest.checksum),
-        policy,
-        Default::default(),
-    )
-    .expect("reuse plan");
-    assert_eq!(reuse.action, package::RegistryCacheAction::ReuseVerified);
-    assert_eq!(reuse.policy.max_attempts, 3);
-    assert!(reuse.target_dir.ends_with(
-        PathBuf::from("packages")
-            .join("math")
-            .join(format!("math-1.2.3-sha256-{}", "b".repeat(64)))
-    ));
-    assert!(reuse
-        .temporary_dir
-        .starts_with(cache.join(".registry-downloads")));
-
-    let refresh =
-        package::plan_registry_download(&cache, &manifest, None, policy, Default::default())
-            .expect("refresh plan");
-    assert_eq!(
-        refresh.action,
-        package::RegistryCacheAction::DownloadAndReplace
-    );
-    assert_ne!(refresh.target_dir, refresh.temporary_dir);
-    let second_refresh =
-        package::plan_registry_download(&cache, &manifest, None, policy, Default::default())
-            .expect("second refresh plan");
-    assert_ne!(
-        refresh.temporary_dir, second_refresh.temporary_dir,
-        "concurrent registry downloads must not share a temporary directory"
-    );
-
-    let err = package::plan_registry_download(
-        &cache,
-        &manifest,
-        None,
-        package::RegistryFetchPolicy {
-            max_attempts: 0,
-            ..policy
-        },
-        Default::default(),
-    )
-    .expect_err("zero retry attempts should fail");
-    assert_eq!(err.code.as_deref(), Some("invalid_fetch_policy"));
-
-    for policy in [
-        package::RegistryFetchPolicy {
-            max_attempts: 9,
-            ..policy
-        },
-        package::RegistryFetchPolicy {
-            max_download_bytes: 32_000_001,
-            ..policy
-        },
-    ] {
-        let err =
-            package::plan_registry_download(&cache, &manifest, None, policy, Default::default())
-                .expect_err("excessive registry resource policy should fail");
-        assert_eq!(err.code.as_deref(), Some("invalid_fetch_policy"));
-    }
-}
-
-#[test]
 fn package_file_dependency_checksum_mismatch_is_rejected() {
     let dir = unique_temp_path("package-remote-dep-bad-checksum");
     let app_src = dir.join("app").join("src");
@@ -2079,9 +2843,10 @@ fn main() { print(Value()) }
 fn package_source_checksum_rejects_symlink_entries() {
     let dir = unique_temp_path("package-symlink");
     let root = dir.join("dep");
-    fs::create_dir_all(&root).expect("create dep root");
-    fs::write(root.join("lib.ku"), "fn value(): int { return 1 }\n").expect("write dep");
-    let link = root.join("loop");
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create dep root");
+    fs::write(src.join("lib.ku"), "fn value(): int { return 1 }\n").expect("write dep");
+    let link = src.join("loop");
     if create_dir_symlink(&root, &link).is_err() {
         let _ = fs::remove_dir_all(&dir);
         return;
@@ -2111,31 +2876,52 @@ fn create_dir_symlink(target: &PathBuf, link: &PathBuf) -> std::io::Result<()> {
 fn package_gc_removes_stale_dependency_versions_only() {
     let dir = unique_temp_path("package-gc");
     let app_src = dir.join("app").join("src");
+    let util = dir.join("util");
     fs::create_dir_all(&app_src).expect("create app src");
+    fs::create_dir_all(util.join("src")).expect("create util src");
     fs::write(app_src.join("main.ku"), "fn main() { print(\"ok\") }").expect("write main");
     fs::write(
+        util.join("ku.mod"),
+        "name = \"util\"\nversion = \"1.0.0\"\n",
+    )
+    .expect("write util manifest");
+    fs::write(
+        util.join("src").join("util.ku"),
+        "fn Value(): int { return 1 }",
+    )
+    .expect("write util source");
+    fs::write(
         dir.join("app").join("ku.mod"),
-        r#"
-name = "demo_pkg"
-dep.util = "1.0.0"
-dep.util.source = "file://C:/tmp/util"
-"#,
+        format!(
+            "name = \"demo_pkg\"\ndep.util = \"1.0.0\"\ndep.util.source = \"file://{}\"\n",
+            util.to_string_lossy().replace('\\', "/")
+        ),
     )
     .expect("write ku.mod");
     let cache = dir.join("app").join(".ku").join("cache").join("packages");
-    fs::create_dir_all(cache.join("util").join("1.0.0")).expect("create current cache");
     fs::create_dir_all(cache.join("util").join("0.9.0")).expect("create stale version cache");
     fs::create_dir_all(cache.join("old").join("1.0.0")).expect("create stale package cache");
-    let package = package::discover_for_file(&app_src.join("main.ku"))
+    let mut package = package::discover_for_file(&app_src.join("main.ku"))
         .expect("discover")
         .expect("package");
+    package::resolve_remote_dependencies(&mut package).expect("resolve file dependency");
+    package::write_lock(&package).expect("write file dependency lock");
+    let current_cache = package.resolved_file_dependencies[0].package_root.clone();
 
     let removed = package::gc_cache(&package, 64).expect("gc cache");
 
     assert_eq!(removed, 2);
-    assert!(cache.join("util").join("1.0.0").exists());
+    assert!(current_cache.exists());
     assert!(!cache.join("util").join("0.9.0").exists());
     assert!(!cache.join("old").exists());
+
+    run_cli(vec![
+        "ku".to_string(),
+        "package".to_string(),
+        "gc".to_string(),
+        dir.join("app").to_string_lossy().to_string(),
+    ])
+    .expect("package gc must accept the same package directory form as other package commands");
 
     let _ = fs::remove_dir_all(dir);
 }

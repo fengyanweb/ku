@@ -5,7 +5,7 @@ import * as vscode from "vscode";
 import { builtins, keywords, memberCompletionLabels, stdFunctions, stdImportPathLabels, stdModules, stdRootModules, types } from "./completionModel";
 import { defaultModuleName, parseImports, resolveImportUri } from "./imports";
 
-const KU_VERSION = "0.0.15";
+const KU_VERSION = "0.0.16";
 const KU_MODE: vscode.DocumentSelector = [{ language: "ku", scheme: "file" }];
 const diagnosticCollection = vscode.languages.createDiagnosticCollection("ku");
 const output = vscode.window.createOutputChannel("Ku");

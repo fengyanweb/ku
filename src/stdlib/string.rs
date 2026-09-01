@@ -14,6 +14,19 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
             let value = one_string("string.len", args, span)?;
             Ok(Some(Value::Int(value.chars().count() as i64)))
         }
+        "byte_len" => {
+            let value = one_string("string.byte_len", args, span)?;
+            Ok(Some(Value::Int(value.len() as i64)))
+        }
+        "chars" => {
+            let value = one_string("string.chars", args, span)?;
+            Ok(Some(Value::Array(
+                value
+                    .chars()
+                    .map(|scalar| Value::String(scalar.to_string()))
+                    .collect(),
+            )))
+        }
         "contains" => {
             let (value, needle) = two_strings("string.contains", args, span)?;
             Ok(Some(Value::Bool(value.contains(needle))))

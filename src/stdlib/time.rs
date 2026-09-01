@@ -1,4 +1,9 @@
-use std::{collections::HashMap, thread, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::OnceLock,
+    thread,
+    time::{Duration, Instant},
+};
 
 use chrono::{
     DateTime, Datelike, FixedOffset, Local, LocalResult, NaiveDate, NaiveDateTime, Offset,
@@ -20,17 +25,27 @@ const MILLIS_PER_SECOND: i64 = 1_000;
 const MILLIS_PER_MINUTE: i64 = 60 * MILLIS_PER_SECOND;
 const MILLIS_PER_HOUR: i64 = 60 * MILLIS_PER_MINUTE;
 const MILLIS_PER_DAY: i64 = 24 * MILLIS_PER_HOUR;
+static STEADY_START: OnceLock<Instant> = OnceLock::new();
 
 pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value>> {
     let value = match function {
         "now" => {
-            if args.is_empty() {
-                time_value(now_millis(span)?)
-            } else {
-                expect_arg_count("time.now", args.len(), 1, span)?;
-                let millis = now_millis(span)? - expect_time(&args[0], span)?;
-                Value::Int(millis)
-            }
+            expect_arg_count("time.now", args.len(), 0, span)?;
+            Value::Int(now_millis(span)?)
+        }
+        "instant" => {
+            expect_arg_count("time.instant", args.len(), 0, span)?;
+            time_value(now_millis(span)?)
+        }
+        "elapsed" => {
+            expect_arg_count("time.elapsed", args.len(), 1, span)?;
+            let previous = expect_time(&args[0], span)?;
+            Value::Int(checked_sub(
+                now_millis(span)?,
+                previous,
+                "invalid_time",
+                span,
+            )?)
         }
         "unix" => match args.len() {
             0 => Value::Int(now_millis(span)? / MILLIS_PER_SECOND),
@@ -58,6 +73,11 @@ pub fn eval(function: &str, args: &[Value], span: Span) -> KuResult<Option<Value
                 ))
             }
         },
+        "steady_millis" => {
+            expect_arg_count("time.steady_millis", args.len(), 0, span)?;
+            let elapsed = STEADY_START.get_or_init(Instant::now).elapsed().as_millis();
+            Value::Int(i64::try_from(elapsed).unwrap_or(i64::MAX))
+        }
         "from_unix" => {
             expect_arg_count("time.from_unix", args.len(), 1, span)?;
             let seconds = expect_int(&args[0], span)?;

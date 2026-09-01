@@ -1,9 +1,10 @@
 import "std.fs"
 
-fn main() {
-    text = fs.read("hello.ku")
+fn main(): null! {
+    text = fs.read("hello.ku")?
     tokens = lexer.scan(text)
     ast = parser.parse(tokens)
     println(len(tokens))
     println(ast)
+    return ok(null)
 }

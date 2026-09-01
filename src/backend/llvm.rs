@@ -260,6 +260,7 @@ impl<'a> Generator<'a> {
                     | IrTerminator::Return(Some(result)) => self.collect_expr_strings(result)?,
                     IrTerminator::Next
                     | IrTerminator::Jump(_)
+                    | IrTerminator::Safepoint { .. }
                     | IrTerminator::Return(None)
                     | IrTerminator::Unreachable => {}
                 }
@@ -814,6 +815,21 @@ impl<'a> FunctionEmitter<'a> {
                     value.text
                 ));
             }
+            IrTerminator::Safepoint {
+                continue_block,
+                timeout_block,
+            } => {
+                // The LLVM text prototype has no native HTTP worker or thread-local
+                // handler deadline, so its condition is always false. Keep both
+                // successors in the emitted terminator: predecessor/phi analysis
+                // also records both IR edges, and a one-edge `br` here would make
+                // that analysis disagree with the LLVM text CFG.
+                out.push_str(&format!(
+                    "  br i1 false, label %{}, label %{}\n",
+                    block_label(*timeout_block),
+                    block_label(*continue_block)
+                ));
+            }
             IrTerminator::ForEach { .. } => {
                 return Err(unsupported(format!(
                     "LLVM text prototype cannot lower terminator '{terminator}'"
@@ -969,8 +985,8 @@ impl<'a> FunctionEmitter<'a> {
                 ensure_same_type(inner, &value.ty, "ok payload")?;
                 self.emit_result_value(out, inner, true, Some(value), None)
             }
-            "err" => {
-                ensure_same_type(&IrType::Str, &value.ty, "err payload")?;
+            "err" | "fail" => {
+                ensure_same_type(&IrType::Str, &value.ty, "error payload")?;
                 self.emit_result_value(out, inner, false, None, Some(value))
             }
             _ => Err(unsupported(format!(
@@ -1103,6 +1119,12 @@ impl<'a> FunctionEmitter<'a> {
     }
 
     fn literal_operand(&self, value: &str, ty: &IrType) -> KuResult<Operand> {
+        if value == "<native-zero>" {
+            return Ok(Operand {
+                ty: ty.clone(),
+                text: zero_value(ty)?,
+            });
+        }
         let text = match ty {
             IrType::Int => value
                 .parse::<i64>()
@@ -1216,7 +1238,7 @@ fn zero_value(ty: &IrType) -> KuResult<String> {
     match ty {
         IrType::Int | IrType::Bool => Ok("0".to_string()),
         IrType::Str => Ok("null".to_string()),
-        IrType::Named(_) => Ok("zeroinitializer".to_string()),
+        IrType::Named(_) | IrType::Result(_) => Ok("zeroinitializer".to_string()),
         _ => Err(unsupported(format!(
             "LLVM text prototype does not support zero value for {ty}"
         ))),
@@ -1276,6 +1298,13 @@ fn validate_cfg(function: &IrFunction) -> KuResult<()> {
             } => {
                 targets.push(*ok_block);
                 targets.push(*err_block);
+            }
+            IrTerminator::Safepoint {
+                continue_block,
+                timeout_block,
+            } => {
+                targets.push(*continue_block);
+                targets.push(*timeout_block);
             }
             IrTerminator::JumpErr { target, .. } => targets.push(*target),
             IrTerminator::Next

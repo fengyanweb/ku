@@ -11,24 +11,54 @@ use crate::{
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
-const MIN_TIMEOUT_MS: u64 = 1;
-const MAX_TIMEOUT_MS: u64 = 60_000;
+pub const MAX_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_MAX_BODY_BYTES: usize = 1_000_000;
+pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_HEADER_BYTES: i64 = 16 * 1024;
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_CONNECTIONS: i64 = 1024;
+pub const MAX_CONNECTIONS: usize = 4096;
 const DEFAULT_READ_HEADER_TIMEOUT_MS: i64 = 5_000;
 const DEFAULT_READ_BODY_TIMEOUT_MS: i64 = 10_000;
 const DEFAULT_WRITE_TIMEOUT_MS: i64 = 10_000;
 const DEFAULT_IDLE_TIMEOUT_MS: i64 = 5_000;
 const DEFAULT_HANDLER_TIMEOUT_MS: i64 = 15_000;
 const DEFAULT_MAX_ACTIVE_REQUESTS: i64 = 256;
+pub const MAX_ACTIVE_REQUESTS: usize = 1024;
 const DEFAULT_MAX_PENDING_REQUESTS: i64 = 1024;
+pub const MAX_PENDING_REQUESTS: usize = 8192;
+pub const MAX_CLIENT_IDLE_CONNECTIONS: usize = 1024;
+const CLIENT_CONFIG_FIELDS: [&str; 3] = ["timeout_ms", "max_body_bytes", "max_idle_connections"];
+const REQUEST_CONFIG_FIELDS: [&str; 6] = [
+    "method",
+    "url",
+    "headers",
+    "body",
+    "timeout_ms",
+    "max_body_bytes",
+];
+const SERVER_CONFIG_FIELDS: [&str; 10] = [
+    "read_header_timeout_ms",
+    "read_body_timeout_ms",
+    "write_timeout_ms",
+    "idle_timeout_ms",
+    "handler_timeout_ms",
+    "max_body_bytes",
+    "max_header_bytes",
+    "max_connections",
+    "max_active_requests",
+    "max_pending_requests",
+];
 /// Longest accepted request target (the `/path?query` token of the request line).
 /// A target over this is answered with 414 before it is copied or routed -- it is
 /// never truncated, because truncating would let two distinct long paths collide
 /// on the same route. Deliberately a fixed limit, not a service config field.
 /// The native backend pins the same value (`KU_HTTP_MAX_TARGET`).
 pub const MAX_REQUEST_TARGET_BYTES: usize = 8192;
+/// Maximum non-empty path segments accepted by both HTTP runtimes. Native uses a
+/// fixed routing scratch array; requests beyond the bound are rejected, never
+/// truncated into a shorter route.
+pub const MAX_REQUEST_PATH_SEGMENTS: usize = 64;
 
 static DEFAULT_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
@@ -202,7 +232,7 @@ pub fn status_text(status: i64) -> &'static str {
         .iter()
         .find(|(_, code, _)| *code == status)
         .map(|(_, _, text)| *text)
-        .unwrap_or("OK")
+        .unwrap_or("Unknown")
 }
 
 const HTTP_STATUS_CODES: &[(&str, i64, &str)] = &[
@@ -229,6 +259,7 @@ const HTTP_STATUS_CODES: &[(&str, i64, &str)] = &[
     ("uriTooLong", 414, "URI Too Long"),
     ("unsupportedMedia", 415, "Unsupported Media Type"),
     ("rangeNotSatisfiable", 416, "Range Not Satisfiable"),
+    ("expectationFailed", 417, "Expectation Failed"),
     ("unprocessable", 422, "Unprocessable Content"),
     ("tooManyRequests", 429, "Too Many Requests"),
     ("headerTooLarge", 431, "Request Header Fields Too Large"),
@@ -270,10 +301,18 @@ fn http_request(config: HttpRequest) -> Result<HttpResponse, HttpError> {
             format!("http method '{method}' is not supported yet"),
         ));
     }
-    if !config.url.starts_with("http://") && !config.url.starts_with("https://") {
+    if config.url.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
         return Err(http_error(
             "invalid_url",
-            "http url must start with http:// or https://",
+            "http url must not contain whitespace or control characters",
+        ));
+    }
+    let parsed_url = url::Url::parse(&config.url)
+        .map_err(|err| http_error("invalid_url", format!("invalid http url: {err}")))?;
+    if !matches!(parsed_url.scheme(), "http" | "https") || parsed_url.host().is_none() {
+        return Err(http_error(
+            "invalid_url",
+            "http url must be an absolute http:// or https:// URL",
         ));
     }
 
@@ -345,25 +384,25 @@ fn request_from_value(value: &Value, span: Span) -> KuResult<HttpRequest> {
     let Value::Object(fields) = value else {
         return Err(expected_type("object", value, span));
     };
+    reject_unknown_config_fields(fields, &REQUEST_CONFIG_FIELDS, span)?;
     let url = required_string(fields, "url", span)?;
     let method = optional_string(fields, "method", "GET", span)?;
     let body = optional_string_value(fields, "body", span)?;
     let headers = optional_headers(fields, span)?;
-    let timeout_ms = optional_int(fields, "timeout_ms", DEFAULT_TIMEOUT_MS as i64, span)?;
-    let timeout_ms = u64::try_from(timeout_ms)
-        .ok()
-        .unwrap_or(DEFAULT_TIMEOUT_MS)
-        .clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
-    let max_body_bytes = optional_int(
+    let timeout_ms = optional_bounded_int(
+        fields,
+        "timeout_ms",
+        DEFAULT_TIMEOUT_MS as i64,
+        MAX_TIMEOUT_MS as i64,
+        span,
+    )? as u64;
+    let max_body_bytes = optional_bounded_int(
         fields,
         "max_body_bytes",
         DEFAULT_MAX_BODY_BYTES as i64,
+        MAX_BODY_BYTES as i64,
         span,
-    )?;
-    let max_body_bytes = usize::try_from(max_body_bytes)
-        .ok()
-        .filter(|value| *value > 0 && *value <= DEFAULT_MAX_BODY_BYTES)
-        .unwrap_or(DEFAULT_MAX_BODY_BYTES);
+    )? as usize;
     Ok(HttpRequest {
         method,
         url,
@@ -471,7 +510,43 @@ fn optional_headers(
                 span,
             ));
         };
-        output.insert(name.clone(), value.clone());
+        if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+            return Err(KuError::runtime(
+                format!("http.request header name '{name}' is not a valid HTTP token"),
+                span,
+            ));
+        }
+        if !is_safe_http_field_value(value) {
+            return Err(KuError::runtime(
+                format!("http.request header '{name}' contains control characters"),
+                span,
+            ));
+        }
+        let normalized = name.to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "proxy-connection"
+                | "keep-alive"
+                | "te"
+                | "trailer"
+                | "upgrade"
+                | "expect"
+        ) {
+            return Err(KuError::runtime(
+                format!("http.request header '{name}' is managed by the HTTP transport"),
+                span,
+            ));
+        }
+        if output.insert(normalized, value.clone()).is_some() {
+            return Err(KuError::runtime(
+                format!("duplicate http.request header '{name}'"),
+                span,
+            ));
+        }
     }
     Ok(output)
 }
@@ -519,8 +594,8 @@ fn json_response_args(args: &[Value], span: Span) -> KuResult<(i64, &Value)> {
 }
 
 fn redirect_response_args(args: &[Value], span: Span) -> KuResult<(i64, String)> {
-    match args {
-        [Value::String(location)] => Ok((302, location.clone())),
+    let (status, location) = match args {
+        [Value::String(location)] => (302, location.clone()),
         [Value::Int(status), Value::String(location)] => {
             let status = validate_status(*status, span)?;
             if !matches!(status, 301 | 302 | 303 | 307 | 308) {
@@ -529,22 +604,77 @@ fn redirect_response_args(args: &[Value], span: Span) -> KuResult<(i64, String)>
                     span,
                 ));
             }
-            Ok((status, location.clone()))
+            (status, location.clone())
         }
-        [first, _] => Err(expected_type(
-            "int redirect status as the first argument",
-            first,
+        [first, _] => {
+            return Err(expected_type(
+                "int redirect status as the first argument",
+                first,
+                span,
+            ))
+        }
+        [other] => return Err(expected_type("str", other, span)),
+        _ => {
+            return Err(KuError::runtime(
+                format!(
+                    "http.redirect expects 1 or 2 arguments but got {}",
+                    args.len()
+                ),
+                span,
+            ))
+        }
+    };
+    if !is_safe_http_field_value(&location) {
+        return Err(KuError::runtime(
+            "http redirect location must not contain control characters",
             span,
-        )),
-        [other] => Err(expected_type("str", other, span)),
-        _ => Err(KuError::runtime(
-            format!(
-                "http.redirect expects 1 or 2 arguments but got {}",
-                args.len()
-            ),
-            span,
-        )),
+        ));
     }
+    Ok((status, location))
+}
+
+fn optional_bounded_int(
+    fields: &HashMap<String, Value>,
+    name: &str,
+    default: i64,
+    maximum: i64,
+    span: Span,
+) -> KuResult<i64> {
+    let value = optional_int(fields, name, default, span)?;
+    if value > maximum {
+        return Err(KuError::runtime(
+            format!("http config field '{name}' must be at most {maximum}"),
+            span,
+        ));
+    }
+    Ok(value)
+}
+
+fn is_safe_http_field_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7f))
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 fn optional_status(value: Option<&Value>, default: i64, span: Span) -> KuResult<i64> {
@@ -604,10 +734,28 @@ fn client_value(config: Option<&Value>, span: Span) -> KuResult<Value> {
         let Value::Object(fields) = config else {
             return Err(expected_type("object", config, span));
         };
-        timeout_ms = optional_int(fields, "timeout_ms", timeout_ms, span)?;
-        max_body_bytes = optional_int(fields, "max_body_bytes", max_body_bytes, span)?;
-        max_idle_connections =
-            optional_int(fields, "max_idle_connections", max_idle_connections, span)?;
+        reject_unknown_config_fields(fields, &CLIENT_CONFIG_FIELDS, span)?;
+        timeout_ms = optional_bounded_int(
+            fields,
+            "timeout_ms",
+            timeout_ms,
+            MAX_TIMEOUT_MS as i64,
+            span,
+        )?;
+        max_body_bytes = optional_bounded_int(
+            fields,
+            "max_body_bytes",
+            max_body_bytes,
+            MAX_BODY_BYTES as i64,
+            span,
+        )?;
+        max_idle_connections = optional_bounded_int(
+            fields,
+            "max_idle_connections",
+            max_idle_connections,
+            MAX_CLIENT_IDLE_CONNECTIONS as i64,
+            span,
+        )?;
     }
     Ok(Value::Object(HashMap::from([
         ("kind".to_string(), Value::String("http.client".to_string())),
@@ -635,24 +783,77 @@ fn server_config_value(config: Option<&Value>, span: Span) -> KuResult<Value> {
         let Value::Object(fields) = config else {
             return Err(expected_type("object", config, span));
         };
-        read_header_timeout_ms = optional_int(
+        reject_unknown_config_fields(fields, &SERVER_CONFIG_FIELDS, span)?;
+        read_header_timeout_ms = optional_bounded_int(
             fields,
             "read_header_timeout_ms",
             read_header_timeout_ms,
+            MAX_TIMEOUT_MS as i64,
             span,
         )?;
-        read_body_timeout_ms =
-            optional_int(fields, "read_body_timeout_ms", read_body_timeout_ms, span)?;
-        write_timeout_ms = optional_int(fields, "write_timeout_ms", write_timeout_ms, span)?;
-        idle_timeout_ms = optional_int(fields, "idle_timeout_ms", idle_timeout_ms, span)?;
-        handler_timeout_ms = optional_int(fields, "handler_timeout_ms", handler_timeout_ms, span)?;
-        max_body_bytes = optional_int(fields, "max_body_bytes", max_body_bytes, span)?;
-        max_header_bytes = optional_int(fields, "max_header_bytes", max_header_bytes, span)?;
-        max_connections = optional_int(fields, "max_connections", max_connections, span)?;
-        max_active_requests =
-            optional_int(fields, "max_active_requests", max_active_requests, span)?;
-        max_pending_requests =
-            optional_int(fields, "max_pending_requests", max_pending_requests, span)?;
+        read_body_timeout_ms = optional_bounded_int(
+            fields,
+            "read_body_timeout_ms",
+            read_body_timeout_ms,
+            MAX_TIMEOUT_MS as i64,
+            span,
+        )?;
+        write_timeout_ms = optional_bounded_int(
+            fields,
+            "write_timeout_ms",
+            write_timeout_ms,
+            MAX_TIMEOUT_MS as i64,
+            span,
+        )?;
+        idle_timeout_ms = optional_bounded_int(
+            fields,
+            "idle_timeout_ms",
+            idle_timeout_ms,
+            MAX_TIMEOUT_MS as i64,
+            span,
+        )?;
+        handler_timeout_ms = optional_bounded_int(
+            fields,
+            "handler_timeout_ms",
+            handler_timeout_ms,
+            MAX_TIMEOUT_MS as i64,
+            span,
+        )?;
+        max_body_bytes = optional_bounded_int(
+            fields,
+            "max_body_bytes",
+            max_body_bytes,
+            MAX_BODY_BYTES as i64,
+            span,
+        )?;
+        max_header_bytes = optional_bounded_int(
+            fields,
+            "max_header_bytes",
+            max_header_bytes,
+            MAX_HEADER_BYTES as i64,
+            span,
+        )?;
+        max_connections = optional_bounded_int(
+            fields,
+            "max_connections",
+            max_connections,
+            MAX_CONNECTIONS as i64,
+            span,
+        )?;
+        max_active_requests = optional_bounded_int(
+            fields,
+            "max_active_requests",
+            max_active_requests,
+            MAX_ACTIVE_REQUESTS as i64,
+            span,
+        )?;
+        max_pending_requests = optional_bounded_int(
+            fields,
+            "max_pending_requests",
+            max_pending_requests,
+            MAX_PENDING_REQUESTS as i64,
+            span,
+        )?;
     }
     Ok(Value::Object(HashMap::from([
         (
@@ -686,6 +887,25 @@ fn server_config_value(config: Option<&Value>, span: Span) -> KuResult<Value> {
         ),
         ("routes".to_string(), Value::Array(Vec::new())),
     ])))
+}
+
+fn reject_unknown_config_fields(
+    fields: &HashMap<String, Value>,
+    allowed: &[&str],
+    span: Span,
+) -> KuResult<()> {
+    let mut unknown = fields
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .collect::<Vec<_>>();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(KuError::runtime(
+            format!("unknown http config field '{key}'"),
+            span,
+        ));
+    }
+    Ok(())
 }
 
 fn response_value(response: HttpResponse) -> Value {

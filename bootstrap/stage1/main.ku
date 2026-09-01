@@ -1,0 +1,21 @@
+import { Scan, Canonical, EscapeCanonical } from "./lexer.ku"
+
+fn RunCase(label: str, source: str): null! {
+    println("CASE|" + label)
+    try {
+        tokens = Scan(source)?
+        println(Canonical(tokens))
+    } catch(err) {
+        println("ERR|" + err.domain + "|" + err.code + "|" + EscapeCanonical(err.message))
+    }
+    return ok(null)
+}
+
+fn main(): null! {
+    RunCase("function", "fn Add(a: int, b: int): int { return a + b }\r\n")?
+    RunCase("unicode-span", "\"中😀\" next")?
+    RunCase("float", "9223372036854775808.125")?
+    RunCase("single-string", "'it\\'s'")?
+    RunCase("unknown-escape", "\"oops\\q\"")?
+    return ok(null)
+}

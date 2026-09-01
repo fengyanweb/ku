@@ -4,7 +4,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ku::{backend, checker::Checker, cli::run_cli, ir, lexer::Lexer, package, parser::Parser};
+use ku::{
+    backend,
+    checker::Checker,
+    cli::{check_source, run_cli, run_source},
+    ir,
+    lexer::Lexer,
+    package,
+    parser::Parser,
+};
 
 fn unique_temp_path(name: &str) -> PathBuf {
     env::temp_dir().join(format!(
@@ -101,6 +109,228 @@ fn main() {
 }
 
 #[test]
+fn runtime_assignment_targets_capture_outer_cells_and_keep_missing_names_local() {
+    let source = r#"
+fn main() {
+    direct = 1
+    set_direct = () => {
+        direct = 7
+        return null
+    }
+    set_direct()
+    if (direct != 7) {
+        panic("plain assignment did not update the outer cell")
+    }
+
+    left = 2
+    right = 3
+    set_pair = () => {
+        left, right = 8, 9
+        return null
+    }
+    set_pair()
+    if (left != 8 || right != 9) {
+        panic("destructuring assignment did not update outer cells")
+    }
+
+    object_code = 4
+    object_default = 5
+    set_object = () => {
+        { code: object_code, missing: object_default = 11 } = { code: 10 }
+        return null
+    }
+    set_object()
+    if (object_code != 10 || object_default != 11) {
+        panic("object destructuring did not update outer cells")
+    }
+
+    named_value = 6
+    run_named = () => {
+        fn set_named() {
+            named_value = 12
+        }
+        set_named()
+        return null
+    }
+    run_named()
+    if (named_value != 12) {
+        panic("nested local function did not forward its outer capture")
+    }
+
+    literal_value = 7
+    run_literal = () => {
+        set_literal = () => {
+            literal_value = 13
+            return null
+        }
+        set_literal()
+        return null
+    }
+    run_literal()
+    if (literal_value != 13) {
+        panic("nested closure did not forward its outer capture")
+    }
+
+    named_parent_local = () => {
+        state: int = 14
+        fn set_state() {
+            state = 22
+            return null
+        }
+        set_state()
+        return state
+    }
+    if (named_parent_local() != 22) {
+        panic("nested local function did not update its immediate parent's local")
+    }
+
+    literal_parent_local = () => {
+        state: int = 15
+        set_state = () => {
+            state = 23
+            return null
+        }
+        set_state()
+        return state
+    }
+    if (literal_parent_local() != 23) {
+        panic("nested closure did not update its immediate parent's local")
+    }
+
+    use_local = (seed: int) => {
+        local: int = seed
+        fn bump(): int {
+            local = local + 1
+            return local
+        }
+        return bump()
+    }
+    if (use_local(40) != 41) {
+        panic("nested function parameter or local was misclassified as an outer capture")
+    }
+
+    local_writer = () => {
+        fresh = 21
+        return fresh
+    }
+    if (local_writer() != 21) {
+        panic("missing capture candidate was not created locally")
+    }
+    fresh = 34
+    if (fresh != 34) {
+        panic("closure-local assignment contaminated its caller")
+    }
+}
+"#;
+
+    check_source("capture-assignment.ku", source).expect("assignment captures should check");
+    run_source("capture-assignment.ku", source).expect("assignment captures should run");
+}
+
+#[test]
+fn ir_boxing_uses_the_binding_visible_at_closure_creation() {
+    let source = r#"
+fn main() {
+    captured = 1
+    set_captured = () => {
+        captured = 2
+        return captured
+    }
+
+    local_writer = () => {
+        fresh = 21
+        return fresh
+    }
+
+    // `fresh` does not exist when local_writer is created. A later homonym,
+    // including an IR-unsupported union payload, must remain an ordinary local.
+    fresh: str | int = 34
+
+    parameter_shadow = (captured: int) => {
+        return captured
+    }
+    local_shadow = () => {
+        captured: int = 41
+        return captured
+    }
+
+    fn countdown(n: int): int {
+        local = n
+        if (n <= 0) {
+            return local
+        }
+        return countdown(n - 1)
+    }
+
+    if (set_captured() != 2 || captured != 2) {
+        panic("outer assignment-only capture lost its shared cell")
+    }
+    if (local_writer() != 21 || parameter_shadow(7) != 7 || local_shadow() != 41) {
+        panic("a closure-local binding escaped its lexical scope")
+    }
+    if (countdown(3) != 0) {
+        panic("local function self recursion was treated as a capture")
+    }
+}
+"#;
+
+    check_source("lexical-boxing.ku", source).expect("lexical boxing source should check");
+    run_source("lexical-boxing.ku", source).expect("lexical boxing source should run");
+
+    // Before the scope-aware scan, `fresh` from local_writer's assignment was
+    // merged into main's name-only candidate set. Lowering then tried to box the
+    // later union-typed `fresh` and failed with an unsupported `unknown` cell.
+    let text = lower_ir(source);
+    assert_eq!(
+        text.matches("cell_new captured").count(),
+        1,
+        "the genuine outer capture must be boxed exactly once:\n{text}"
+    );
+    assert!(
+        text.contains("captured_cell captured"),
+        "the genuine outer capture must be forwarded:\n{text}"
+    );
+    assert!(
+        !text.contains("cell_new fresh") && text.contains("let fresh: unknown = 34"),
+        "a closure-local assignment must not box a later outer homonym:\n{text}"
+    );
+    assert!(
+        !text.contains("captured_cell fresh")
+            && !text.contains("captured_cell n")
+            && !text.contains("captured_cell local")
+            && !text.contains("captured_cell countdown"),
+        "parameters, locals, and a local function's self name are not captures:\n{text}"
+    );
+}
+
+#[test]
+fn match_pattern_bindings_are_scoped_out_of_closure_captures() {
+    let source = r#"
+fn main() {
+    shadow = 99
+    choose = () => {
+        return match 1 {
+            shadow if shadow == 1 => shadow
+            _ => 0
+        }
+    }
+    if (choose() != 1 || shadow != 99) {
+        panic("match pattern binding escaped its arm scope")
+    }
+}
+"#;
+
+    check_source("match-capture.ku", source).expect("match capture should check");
+    run_source("match-capture.ku", source).expect("match capture should run");
+
+    let text = lower_ir(source);
+    assert!(
+        !text.contains("cell_new shadow") && !text.contains("captured_cell shadow"),
+        "an arm-local pattern binding must not capture or box the outer homonym:\n{text}"
+    );
+}
+
+#[test]
 fn package_version_writes_lock_file() {
     let dir = unique_temp_path("package-lock");
     let src = dir.join("src");
@@ -192,7 +422,9 @@ fn main() {
     ))
     .expect("generate bounded array C");
     assert!(complex.contains("[1, 2]"));
-    assert!(c.contains("typedef struct { size_t len; int64_t* data; } KuArray_int;"));
+    assert!(
+        c.contains("typedef struct { size_t len; int64_t* data; size_t capacity; } KuArray_int;")
+    );
     assert!(c.contains("ku_array_bounds_fail"));
     assert!(c.contains("ku_array_get_int"));
 }
@@ -382,5 +614,227 @@ fn main() {
     assert!(
         loop_err.contains("unconditional self-jump"),
         "unexpected error: {loop_err}"
+    );
+}
+
+#[test]
+fn llvm_backend_lowers_inactive_safepoint_to_continue_and_validates_both_edges() {
+    let valid = ir::IrProgram {
+        functions: vec![ir::IrFunction {
+            id: ir::FunctionId(0),
+            name: "main".to_string(),
+            params: Vec::new(),
+            return_type: ir::IrType::Void,
+            blocks: vec![
+                ir::IrBlock {
+                    id: ir::BlockId(0),
+                    name: "entry".to_string(),
+                    instructions: Vec::new(),
+                    terminator: ir::IrTerminator::Safepoint {
+                        continue_block: ir::BlockId(1),
+                        timeout_block: ir::BlockId(2),
+                    },
+                },
+                ir::IrBlock {
+                    id: ir::BlockId(1),
+                    name: "continue".to_string(),
+                    instructions: Vec::new(),
+                    terminator: ir::IrTerminator::Return(None),
+                },
+                ir::IrBlock {
+                    id: ir::BlockId(2),
+                    name: "timeout".to_string(),
+                    instructions: Vec::new(),
+                    terminator: ir::IrTerminator::Return(None),
+                },
+            ],
+            is_closure_body: false,
+            captures: Vec::new(),
+        }],
+        layouts: ir::IrLayoutTable {
+            structs: Vec::new(),
+            enums: Vec::new(),
+        },
+    };
+    let llvm = backend::llvm::generate_llvm_ir(&valid).expect("lower inactive safepoint");
+    assert!(
+        llvm.contains("b0:\n  br i1 false, label %b2, label %b1\n"),
+        "LLVM must preserve both safepoint CFG successors while taking the inactive continuation edge:\n{llvm}"
+    );
+
+    let missing_timeout = ir::IrProgram {
+        functions: vec![ir::IrFunction {
+            id: ir::FunctionId(0),
+            name: "main".to_string(),
+            params: Vec::new(),
+            return_type: ir::IrType::Void,
+            blocks: vec![
+                ir::IrBlock {
+                    id: ir::BlockId(0),
+                    name: "entry".to_string(),
+                    instructions: Vec::new(),
+                    terminator: ir::IrTerminator::Safepoint {
+                        continue_block: ir::BlockId(1),
+                        timeout_block: ir::BlockId(99),
+                    },
+                },
+                ir::IrBlock {
+                    id: ir::BlockId(1),
+                    name: "continue".to_string(),
+                    instructions: Vec::new(),
+                    terminator: ir::IrTerminator::Return(None),
+                },
+            ],
+            is_closure_body: false,
+            captures: Vec::new(),
+        }],
+        layouts: ir::IrLayoutTable {
+            structs: Vec::new(),
+            enums: Vec::new(),
+        },
+    };
+    let error = backend::llvm::generate_llvm_ir(&missing_timeout)
+        .expect_err("CFG validation must retain the timeout successor")
+        .to_string();
+    assert!(
+        error.contains("branches to missing block 99"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn c_backend_validates_both_safepoint_cfg_edges_before_emission() {
+    fn program(continue_block: ir::BlockId, timeout_block: ir::BlockId) -> ir::IrProgram {
+        ir::IrProgram {
+            functions: vec![ir::IrFunction {
+                id: ir::FunctionId(0),
+                name: "main".to_string(),
+                params: Vec::new(),
+                return_type: ir::IrType::Void,
+                blocks: vec![
+                    ir::IrBlock {
+                        id: ir::BlockId(0),
+                        name: "entry".to_string(),
+                        instructions: Vec::new(),
+                        terminator: ir::IrTerminator::Safepoint {
+                            continue_block,
+                            timeout_block,
+                        },
+                    },
+                    ir::IrBlock {
+                        id: ir::BlockId(1),
+                        name: "continue".to_string(),
+                        instructions: Vec::new(),
+                        terminator: ir::IrTerminator::Return(None),
+                    },
+                    ir::IrBlock {
+                        id: ir::BlockId(2),
+                        name: "timeout".to_string(),
+                        instructions: Vec::new(),
+                        terminator: ir::IrTerminator::Return(None),
+                    },
+                ],
+                is_closure_body: false,
+                captures: Vec::new(),
+            }],
+            layouts: ir::IrLayoutTable {
+                structs: Vec::new(),
+                enums: Vec::new(),
+            },
+        }
+    }
+
+    let c = backend::c::generate_c_source(&program(ir::BlockId(1), ir::BlockId(2)))
+        .expect("lower valid C safepoint");
+    assert!(
+        c.contains("goto block2; } else goto block1;"),
+        "C must lower both valid safepoint successors"
+    );
+
+    for (continue_block, timeout_block, missing) in [
+        (ir::BlockId(99), ir::BlockId(2), 99),
+        (ir::BlockId(1), ir::BlockId(100), 100),
+    ] {
+        let error = backend::c::generate_c_source(&program(continue_block, timeout_block))
+            .expect_err("C CFG validation must reject either missing safepoint successor")
+            .to_string();
+        assert!(
+            error.contains(&format!("branches to missing block {missing}")),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn llvm_backend_keeps_ordinary_calls_working_with_inserted_safepoints() {
+    let ir = lower_checked_ir(
+        r#"
+fn double(value:int): int {
+    return value * 2
+}
+
+fn main() {
+    value = 0
+    while (value < 1) {
+        value = double(3)
+    }
+    print(value)
+}
+"#,
+    );
+    assert!(
+        ir.functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .any(|block| matches!(&block.terminator, ir::IrTerminator::Safepoint { .. })),
+        "direct call lowering must exercise the safepoint path"
+    );
+
+    let llvm = backend::llvm::generate_llvm_ir(&ir).expect("generate LLVM after direct call");
+    assert!(llvm.contains("call i64 @ku_fn0_double(i64 3)"));
+    assert!(llvm.contains("br i1 false"));
+}
+
+#[test]
+fn ir_for_backedge_contains_cooperative_safepoint() {
+    let ir = lower_checked_ir(
+        r#"
+fn main() {
+    for value in 3 {
+    }
+}
+"#,
+    );
+    let function = ir
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main IR function");
+    let (loop_block, body_block) = function
+        .blocks
+        .iter()
+        .find_map(|block| match &block.terminator {
+            ir::IrTerminator::ForEach { body_block, .. } => Some((block.id, *body_block)),
+            _ => None,
+        })
+        .expect("for loop terminator");
+    let body = function
+        .blocks
+        .iter()
+        .find(|block| block.id == body_block)
+        .expect("for body block");
+    let continue_block = match &body.terminator {
+        ir::IrTerminator::Safepoint { continue_block, .. } => *continue_block,
+        ref other => panic!("for back-edge must poll before iterating again, got {other:?}"),
+    };
+    let continuation = function
+        .blocks
+        .iter()
+        .find(|block| block.id == continue_block)
+        .expect("safepoint continuation block");
+    assert_eq!(
+        continuation.terminator,
+        ir::IrTerminator::Jump(loop_block),
+        "the successful poll must resume the ForEach terminator"
     );
 }

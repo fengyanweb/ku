@@ -190,7 +190,7 @@ fn main() { print(Value()) }
     .expect_err("outside package import should fail")
     .to_string();
     assert!(
-        err.contains("outside package import root"),
+        err.contains("is outside package 'demo_pkg' import root"),
         "unexpected error: {err}"
     );
 
@@ -240,7 +240,10 @@ fn main() {
 
     assert!(text.contains("%t0: [int] = [1, 2]"));
     assert!(text.contains("let values: [int] = %t0"));
-    assert!(text.contains("store values[0] = 9"));
+    // Assignment lowering intentionally materializes the RHS before resolving
+    // the destination, so target-side effects cannot change a borrowed RHS.
+    assert!(text.contains("%t1: int = 9"));
+    assert!(text.contains("store values[0] = %t1"));
     assert!(text.contains("branch %t"));
     assert!(text.contains("jump block"));
 }

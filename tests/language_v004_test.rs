@@ -1,15 +1,23 @@
+#[path = "support/bounded_process.rs"]
+pub mod bounded_process;
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use bounded_process::{run_bounded, OutputLimits};
 
 use ku::ast::{ExprKind, Item, Stmt};
 use ku::cli::{check_source, run_cli, run_source};
 use ku::lexer::Lexer;
 use ku::parser::Parser;
 use ku::token::TokenKind;
+
+const RUN_TIMEOUT: Duration = Duration::from_secs(20);
+const RUN_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(4 * 1024 * 1024, 6 * 1024 * 1024);
 
 fn unique_temp_path(name: &str) -> PathBuf {
     env::temp_dir().join(format!(
@@ -295,12 +303,13 @@ fn builtin_compiler_pipeline_and_fs_read_work() {
         r#"
 import "std.fs"
 
-fn main() {{
-    text = fs.read("{}")
+fn main(): null! {{
+    text = fs.read("{}")?
     tokens = lexer.scan(text)
     ast = parser.parse(tokens)
     print(len(tokens))
     print(ast)
+    return ok(null)
 }}
 "#,
         ku_string(&path)
@@ -323,8 +332,9 @@ fn fs_read_resolves_paths_relative_to_source_file() {
         r#"
 import "std.fs"
 
-fn main() {
-    print(fs.read("data.txt"))
+fn main(): null! {
+    print(fs.read("data.txt")?)
+    return ok(null)
 }
 "#,
     )
@@ -350,7 +360,9 @@ fn runtime_rejects_array_bounds_and_missing_files() {
         "unexpected error: {err}"
     );
 
-    let err = run_err(r#"import "std.fs" fn main() { print(fs.read("definitely-missing.ku")) }"#);
+    let err = run_err(
+        r#"import "std.fs" fn main(): null! { print(fs.read("definitely-missing.ku")?) return ok(null) }"#,
+    );
     assert!(err.contains("failed to read"), "unexpected error: {err}");
 }
 
@@ -1251,7 +1263,9 @@ fn ku_build_creates_runnable_executable_wrapper() {
         exe.set_extension("exe");
     }
     assert!(exe.exists(), "expected built exe at {}", exe.display());
-    let output = Command::new(&exe).output().expect("run built exe");
+    let mut command = Command::new(&exe);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("built executable was not bounded: {error}"));
     assert!(output.status.success(), "built exe should run");
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("built"),
@@ -1262,25 +1276,39 @@ fn ku_build_creates_runnable_executable_wrapper() {
 }
 
 #[test]
-fn ku_build_supports_output_path_alias_and_package_manifest_entry() {
+fn ku_build_supports_output_path_and_package_manifest_entry() {
     let dir = unique_temp_path("build-options");
     fs::create_dir_all(&dir).expect("create temp build dir");
     let source = dir.join("single.ku");
     fs::write(&source, "fn main() { print(\"single\") }").expect("write ku source");
+    let removed = run_cli(vec![
+        "ku".to_string(),
+        "run".to_string(),
+        "build".to_string(),
+        source.to_string_lossy().to_string(),
+    ])
+    .expect_err("removed ku run build syntax must not remain a second build command");
+    assert!(
+        removed
+            .to_string()
+            .contains("`ku run build` was removed; use the single build command `ku build`"),
+        "unexpected removed build syntax error: {removed}"
+    );
     let mut explicit = dir.join("dist").join("single-bin");
     if cfg!(windows) {
         explicit.set_extension("exe");
     }
     run_cli(vec![
         "ku".to_string(),
-        "run".to_string(),
         "build".to_string(),
         "-o".to_string(),
         explicit.to_string_lossy().to_string(),
         source.to_string_lossy().to_string(),
     ])
-    .expect("ku run build alias should build");
-    let output = Command::new(&explicit).output().expect("run explicit exe");
+    .expect("ku build should support an explicit output path");
+    let mut command = Command::new(&explicit);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("explicit executable was not bounded: {error}"));
     assert!(output.status.success(), "explicit exe should run");
     assert!(String::from_utf8_lossy(&output.stdout).contains("single"));
 
@@ -1315,13 +1343,13 @@ fn ku_build_supports_output_path_alias_and_package_manifest_entry() {
             .join("dist")
             .join("release")
             .join("ir")
-            .join("main.ir")
+            .join("build_pkg.ir")
             .exists(),
         "expected emitted Ku IR artifact"
     );
-    let output = Command::new(&package_exe)
-        .output()
-        .expect("run package exe");
+    let mut command = Command::new(&package_exe);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("package executable was not bounded: {error}"));
     assert!(output.status.success(), "package exe should run");
     assert!(String::from_utf8_lossy(&output.stdout).contains("package"));
 
@@ -1484,7 +1512,8 @@ fn main() {
     print(xs[1]())
 }
 "#;
-    check_source("inline.ku", source).expect("clone before storing should keep the original usable");
+    check_source("inline.ku", source)
+        .expect("clone before storing should keep the original usable");
 }
 
 #[test]

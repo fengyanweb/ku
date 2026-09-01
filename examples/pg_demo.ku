@@ -1,33 +1,41 @@
 // PostgreSQL 示例(native-only:ku build --native）
 //
 // 准备:
-//   1. 在“运行目录”放一个 db.conn 文件,内容是 libpq 连接串,例如:
-//        postgresql://user:password@host:5432/dbname?sslmode=require
+//   1. 在仓库根目录放一个 db.conn 文件,内容是 libpq 连接串,例如:
+//        host=... hostaddr=... dbname=... user=... password=... sslmode=verify-full sslrootcert=C:/certs/root.crt
 //      (URL 或 key=value 形式都可;db.conn 已在 .gitignore,不会误提交密码)
-//   2. 运行时需要 libpq.dll 在 PATH（PostgreSQL 的 bin 目录）。
+//      连接、获取和查询预算由下方 pg.client 配置统一设置。
+//   2. 运行时需要同一 PostgreSQL 安装目录 bin 中的 libpq.dll 及其依赖 DLL 在 PATH。
 //
 // 构建运行:
 //   ku build --native examples/pg_demo.ku -o pg_demo.exe
 //   ./pg_demo.exe
 //
-// 演示要点:连接、参数化查询（防注入）、读取结果、自动关闭。
+// 演示要点:统一 client、内部有界池、服务端参数绑定、Result 读取和自动关闭。
 
 import pg from "std.pg"
 import "std.fs"
 
 fn main(): null! {
-    conninfo = fs.read("db.conn")
-    conn = pg.connect(conninfo)?
+    conninfo = fs.read("db.conn")?
+    client = pg.client({
+        conninfo: conninfo,
+        max_connections: 8,
+        max_waiters: 64,
+        connect_timeout_ms: 5000,
+        acquire_timeout_ms: 5000,
+        query_timeout_ms: 30000
+    })?
 
     // 参数化查询:$1 是占位符,值作为参数传入,注入 payload 只会被当作纯文本
     payload = "1'; DROP TABLE users; --"
-    res = pg.query_params(conn, "SELECT $1::text AS echoed, 1 + 1 AS calc", [payload])?
+    res = client.query("SELECT $1::text AS echoed, 1 + 1 AS calc", [payload])?
 
-    println("rows = " + str(pg.rows(res)))
-    println("cols = " + str(pg.cols(res)))
-    println("echoed = " + pg.value(res, 0, 0))   // payload 原样返回,未破坏 SQL
-    println("calc = " + pg.value(res, 0, 1))      // 2
+    println("rows = " + str(res.rows()))
+    println("cols = " + str(res.cols()))
+    println("echoed = " + res.value(0, 0)?)   // payload 原样返回,未破坏 SQL
+    println("calc = " + res.value(0, 1)?)      // 2
 
-    pg.close(conn)
+    client.close()
     return ok(null)
 }

@@ -1,0 +1,7 @@
+fn Add(a: int, b: int): int {
+    return a + b
+}
+
+fn LoadName(): str! {
+    return ok("Ku")
+}

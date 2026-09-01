@@ -1,3 +1,6 @@
+#[path = "support/bounded_process.rs"]
+pub mod bounded_process;
+
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -7,6 +10,13 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use bounded_process::{run_bounded, FailureKind, OutputLimits};
+
+const SHORT_PROCESS_OUTPUT_LIMITS: OutputLimits =
+    OutputLimits::new(4 * 1024 * 1024, 6 * 1024 * 1024);
+const SERVER_STREAM_CAPTURE_LIMIT: usize = 1024 * 1024;
+const SERVER_READER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 struct RunResult {
@@ -115,46 +125,22 @@ fn read_http_stream(mut stream: TcpStream, timeout: Duration) -> String {
 }
 
 fn run_with_timeout(bin: &Path, args: &[&str], timeout: Duration) -> RunResult {
-    let mut child = Command::new(bin)
-        .args(args)
-        .current_dir(repo_root())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn ku binary");
-
-    let started = Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .expect("failed to poll ku process")
-            .is_some()
-        {
-            let output = child
-                .wait_with_output()
-                .expect("failed to collect ku output");
-            return RunResult {
-                code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                timed_out: false,
-            };
-        }
-
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .expect("failed to collect timed-out ku output");
-            return RunResult {
-                code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                timed_out: true,
-            };
-        }
-
-        thread::sleep(Duration::from_millis(20));
+    let mut command = Command::new(bin);
+    command.args(args).current_dir(repo_root());
+    match run_bounded(&mut command, timeout, SHORT_PROCESS_OUTPUT_LIMITS) {
+        Ok(output) => RunResult {
+            code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            timed_out: false,
+        },
+        Err(error) if error.kind() == FailureKind::Timeout => RunResult {
+            code: None,
+            stdout: String::from_utf8_lossy(error.stdout()).into_owned(),
+            stderr: String::from_utf8_lossy(error.stderr()).into_owned(),
+            timed_out: true,
+        },
+        Err(error) => panic!("ku command did not complete safely: {error}"),
     }
 }
 
@@ -247,7 +233,65 @@ fn http_response_or_stop(
 
 struct KuServerProcess {
     child: Option<Child>,
+    stdout: Option<thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<thread::JoinHandle<Vec<u8>>>,
     source_path: PathBuf,
+}
+
+fn append_server_capture_marker(captured: &mut Vec<u8>, marker: &[u8]) {
+    let marker = &marker[..marker.len().min(SERVER_STREAM_CAPTURE_LIMIT)];
+    captured.truncate(SERVER_STREAM_CAPTURE_LIMIT - marker.len());
+    captured.extend_from_slice(marker);
+}
+
+fn drain_server_stream<R>(mut reader: R) -> thread::JoinHandle<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut captured = Vec::new();
+        let mut truncated = false;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    if truncated {
+                        append_server_capture_marker(
+                            &mut captured,
+                            b"\n[server output truncated at fixed capture limit]",
+                        );
+                    }
+                    return captured;
+                }
+                Ok(read) => {
+                    let room = SERVER_STREAM_CAPTURE_LIMIT.saturating_sub(captured.len());
+                    captured.extend_from_slice(&buffer[..read.min(room)]);
+                    truncated |= read > room;
+                }
+                Err(error) => {
+                    let marker = format!("\n[server output read failed: {error}]");
+                    append_server_capture_marker(&mut captured, marker.as_bytes());
+                    return captured;
+                }
+            }
+        }
+    })
+}
+
+fn finish_server_stream(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    let Some(reader) = reader else {
+        return Vec::new();
+    };
+    let deadline = Instant::now() + SERVER_READER_CLEANUP_TIMEOUT;
+    while !reader.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if !reader.is_finished() {
+        return b"[server output reader did not finish after process cleanup]".to_vec();
+    }
+    reader
+        .join()
+        .unwrap_or_else(|_| b"[server output reader panicked]".to_vec())
 }
 
 impl KuServerProcess {
@@ -255,15 +299,27 @@ impl KuServerProcess {
         let path = unique_temp_path("http-service");
         fs::write(&path, source).expect("write temporary Ku source");
         let path_text = path_arg(&path);
-        let child = Command::new(ku_binary())
+        let mut child = Command::new(ku_binary())
             .args(["run", &path_text])
             .current_dir(repo_root())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("failed to spawn ku http server");
+        let stdout = child
+            .stdout
+            .take()
+            .map(drain_server_stream)
+            .expect("piped ku http server stdout");
+        let stderr = child
+            .stderr
+            .take()
+            .map(drain_server_stream)
+            .expect("piped ku http server stderr");
         Self {
             child: Some(child),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
             source_path: path,
         }
     }
@@ -271,9 +327,12 @@ impl KuServerProcess {
     fn stop(mut self) -> Output {
         let mut child = self.child.take().expect("server process should exist");
         let _ = child.kill();
-        let output = child
-            .wait_with_output()
-            .expect("failed to collect ku http server output");
+        let status = child.wait().expect("failed to reap ku http server");
+        let output = Output {
+            status,
+            stdout: finish_server_stream(self.stdout.take()),
+            stderr: finish_server_stream(self.stderr.take()),
+        };
         let _ = fs::remove_file(&self.source_path);
         output
     }
@@ -285,6 +344,8 @@ impl Drop for KuServerProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
+        let _ = finish_server_stream(self.stdout.take());
+        let _ = finish_server_stream(self.stderr.take());
         let _ = fs::remove_file(&self.source_path);
     }
 }
@@ -349,7 +410,7 @@ fn main() {
 
 #[test]
 fn run_http_service_handles_local_request() {
-    let _guard = HTTP_TEST_LOCK.lock().expect("http test lock poisoned");
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let address = unused_local_address();
     let source = r#"
 import "std.http"
@@ -415,13 +476,22 @@ fn main(): null! {
         "DELETE /gone HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
     assert_http_status(&deleted, "HTTP/1.1 204 No Content");
+    assert!(!deleted.to_ascii_lowercase().contains("content-length:"));
+    assert!(deleted.ends_with("\r\n\r\n"));
+
+    let too_many_segments = format!(
+        "GET /{} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        (0..65).map(|_| "s").collect::<Vec<_>>().join("/")
+    );
+    let segmented = http_response_or_stop(&mut server, &address, &too_many_segments);
+    assert_http_status(&segmented, "HTTP/1.1 414 URI Too Long");
 
     let _ = server.take().expect("server should exist").stop();
 }
 
 #[test]
 fn run_http_service_handles_error_statuses_and_limits() {
-    let _guard = HTTP_TEST_LOCK.lock().expect("http test lock poisoned");
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let address = unused_local_address();
     let source = r#"
 import "std.http"
@@ -435,6 +505,12 @@ fn main(): null! {
     app.write_timeout_ms = 500
     app.get("/ok", fn() {
         return http.text("ok")
+    })
+    app.get("/bad-redirect", fn() {
+        return http.redirect("/next\r\nx-injected: yes")
+    })
+    app.get("/unknown-status", fn() {
+        return http.text(418, "teapot")
     })
     app.post("/echo", fn(req) {
         return http.text(req.body)
@@ -452,6 +528,40 @@ fn main(): null! {
         "GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
     assert_http_status(&missing, "HTTP/1.1 404 Not Found");
+
+    // The bounded header reader may receive bytes beyond \r\n\r\n in the same
+    // read. Those bytes must become the body prefix instead of being discarded.
+    let coalesced_body = http_response_or_stop(
+        &mut server,
+        &address,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nsame",
+    );
+    assert_http_status(&coalesced_body, "HTTP/1.1 200 OK");
+    assert!(
+        coalesced_body.ends_with("\r\n\r\nsame"),
+        "header/body coalescing lost or changed the body prefix:\n{coalesced_body}"
+    );
+
+    // Split the final CRLF across reads, then send its LF with the body. Strict
+    // delimiter state must span chunks while the coalesced body remains intact.
+    let mut fragmented = connect_with_retry(&address, Duration::from_secs(2));
+    fragmented.set_nodelay(true).expect("set TCP_NODELAY");
+    fragmented
+        .write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r")
+        .expect("write fragmented header prefix");
+    thread::sleep(Duration::from_millis(30));
+    fragmented
+        .write_all(b"\nfrag")
+        .expect("write fragmented delimiter and body");
+    fragmented
+        .shutdown(Shutdown::Write)
+        .expect("half-close fragmented request");
+    let fragmented_response = read_http_stream(fragmented, Duration::from_secs(2));
+    assert_http_status(&fragmented_response, "HTTP/1.1 200 OK");
+    assert!(
+        fragmented_response.ends_with("\r\n\r\nfrag"),
+        "fragmented delimiter lost or changed the body prefix:\n{fragmented_response}"
+    );
 
     let wrong_method = http_response_or_stop(
         &mut server,
@@ -474,6 +584,95 @@ fn main(): null! {
     );
     assert_http_status(&bad_header, "HTTP/1.1 400 Bad Request");
 
+    for (label, request) in [
+        (
+            "missing Host",
+            "GET /ok HTTP/1.1\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "duplicate Host",
+            "GET /ok HTTP/1.1\r\nHost: one\r\nHost: two\r\n\r\n",
+        ),
+        (
+            "Transfer-Encoding",
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        ),
+        (
+            "duplicate Content-Length",
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        ),
+        (
+            "signed Content-Length",
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: +2\r\n\r\nab",
+        ),
+        (
+            "whitespace before colon",
+            "GET /ok HTTP/1.1\r\nHost : localhost\r\n\r\n",
+        ),
+        (
+            "obs-fold",
+            "GET /ok HTTP/1.1\r\nHost: localhost\r\n folded\r\n\r\n",
+        ),
+        ("bare LF", "GET /ok HTTP/1.1\nHost: localhost\n\n"),
+        (
+            "wrong HTTP version",
+            "GET /ok HTTP/1.0\r\nHost: localhost\r\n\r\n",
+        ),
+        (
+            "invalid method token",
+            "GE[T /ok HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        (
+            "NUL request target",
+            "GET /ok\0hidden HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        (
+            "malformed percent escape",
+            "GET /ok%2 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        (
+            "non-hex percent escape",
+            "GET /ok%GG HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        (
+            "backslash request target",
+            "GET /ok\\hidden HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+        (
+            "fragment request target",
+            "GET /ok#fragment HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ),
+    ] {
+        let response = http_response_or_stop(&mut server, &address, request);
+        assert_http_status(&response, "HTTP/1.1 400 Bad Request");
+        assert!(
+            !response.contains("x-injected"),
+            "{label} response contained injected data: {response}"
+        );
+    }
+
+    let expect = http_response_or_stop(
+        &mut server,
+        &address,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n",
+    );
+    assert_http_status(&expect, "HTTP/1.1 417 Expectation Failed");
+
+    let bad_redirect = http_response_or_stop(
+        &mut server,
+        &address,
+        "GET /bad-redirect HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_http_status(&bad_redirect, "HTTP/1.1 500 Internal Server Error");
+    assert!(!bad_redirect.contains("x-injected"));
+
+    let unknown = http_response_or_stop(
+        &mut server,
+        &address,
+        "GET /unknown-status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert_http_status(&unknown, "HTTP/1.1 418 Unknown");
+
     let too_large_header = http_response_or_stop(
         &mut server,
         &address,
@@ -489,7 +688,7 @@ fn main(): null! {
 
 #[test]
 fn run_http_service_enforces_idle_and_handler_timeouts() {
-    let _guard = HTTP_TEST_LOCK.lock().expect("http test lock poisoned");
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let address = unused_local_address();
     let source = r#"
 import "std.http"
@@ -499,6 +698,7 @@ fn main(): null! {
         idle_timeout_ms: 150,
         handler_timeout_ms: 100,
         read_header_timeout_ms: 500,
+        read_body_timeout_ms: 500,
         max_connections: 8,
         max_active_requests: 2,
         max_pending_requests: 4
@@ -529,6 +729,25 @@ fn main(): null! {
     let idle_response = read_http_stream(idle, Duration::from_secs(2));
     assert_http_status(&idle_response, "HTTP/1.1 408 Request Timeout");
 
+    let mut drip = connect_with_retry(&address, Duration::from_secs(2));
+    for (index, byte) in b"GET ".iter().enumerate() {
+        if drip.write_all(&[*byte]).is_err() {
+            break;
+        }
+        if index + 1 < b"GET ".len() {
+            thread::sleep(Duration::from_millis(80));
+        }
+    }
+    let drip_response = read_http_stream(drip, Duration::from_secs(2));
+    assert_http_status(&drip_response, "HTTP/1.1 408 Request Timeout");
+
+    let mut partial_body = connect_with_retry(&address, Duration::from_secs(2));
+    partial_body
+        .write_all(b"POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\na")
+        .expect("write partial body");
+    let body_response = read_http_stream(partial_body, Duration::from_secs(2));
+    assert_http_status(&body_response, "HTTP/1.1 408 Request Timeout");
+
     let slow = http_response_or_stop(
         &mut server,
         &address,
@@ -547,7 +766,7 @@ fn main(): null! {
 
 #[test]
 fn run_http_service_bounds_active_pending_and_connections() {
-    let _guard = HTTP_TEST_LOCK.lock().expect("http test lock poisoned");
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let address = unused_local_address();
     let source = r#"
 import "std.http"

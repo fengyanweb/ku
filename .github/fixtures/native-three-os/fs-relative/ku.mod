@@ -1,0 +1,5 @@
+name = "native_fs_relative"
+version = "0.1.0"
+root = "src"
+main = "main.ku"
+out = ".ku/build"

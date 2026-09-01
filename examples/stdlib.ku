@@ -1,6 +1,6 @@
 import { time } from "std"
 
-fn main() {
+fn main(): null! {
     text = string.trim("  Ku Lang  ")
     println(string.upper(text))
     println(string.replace(text, "Lang", "0.0.8"))
@@ -13,9 +13,12 @@ fn main() {
     println(array.last(nums))
 
     data = { name: "Ku", version: 6, ok: true }
-    json_text = json.stringify(data)
+    json_text = json.stringify(data)?
     println(json_text)
-    println(json.stringify(json.parse(json_text)))
+    println(json.stringify(json.parse(json_text)?)?)
 
     println(time.now())
+    instant = time.instant()
+    println(time.elapsed(instant))
+    return ok(null)
 }

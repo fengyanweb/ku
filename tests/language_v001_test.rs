@@ -375,12 +375,12 @@ fn main() {
         "unexpected error: {err}"
     );
 
-    // json.parse yields a KuValue (a first-class tagged dynamic value), not a
-    // static object, so destructuring it is a compile-time error — dynamic reads
-    // must go through obj["key"]? instead.
+    // json.parse unwraps to a KuValue (a first-class tagged dynamic value), not
+    // a static object, so destructuring it is a compile-time error — dynamic
+    // reads must go through obj["key"]? instead.
     let err = check_source(
         "inline.ku",
-        "fn main() { obj = json.parse(\"{}\") { missing } = obj }",
+        "fn main(): null! { obj = json.parse(\"{}\")? { missing } = obj return ok(null) }",
     )
     .expect_err("a KuValue cannot be destructured");
     assert!(
