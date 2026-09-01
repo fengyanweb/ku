@@ -110,6 +110,139 @@ fn native_pg_owned_container_comparisons_do_not_clone_opaque_payloads() {
 }
 
 #[test]
+fn native_pg_posix_sync_destroy_failures_stop_before_pool_free() {
+    let directory = TempDir::new("sync-destroy");
+    let generated = emit_c(directory.path(), fixture());
+    let signature = "static void ku_pg_sync_destroy(KuPgMutex* mutex, KuPgCond* cond) {";
+    let destroy_start = generated
+        .rfind(signature)
+        .expect("generated POSIX PG synchronization destructor");
+    let destroy_suffix = &generated[destroy_start..];
+    let destroy_end = destroy_suffix
+        .find("\n}\n")
+        .expect("generated POSIX PG synchronization destructor end")
+        + 3;
+    let destroy = &destroy_suffix[..destroy_end];
+
+    let condition_call = destroy
+        .find("pthread_cond_destroy(cond)")
+        .expect("PG condition destructor call");
+    let condition_failure = destroy
+        .find("pg client condition destroy failed")
+        .expect("PG condition destruction failure guard");
+    let mutex_call = destroy
+        .find("pthread_mutex_destroy(mutex)")
+        .expect("PG mutex destructor call");
+    let mutex_failure = destroy
+        .find("pg client mutex destroy failed")
+        .expect("PG mutex destruction failure guard");
+    assert!(
+        condition_call < condition_failure
+            && condition_failure < mutex_call
+            && mutex_call < mutex_failure,
+        "PG must validate condition destruction before attempting mutex destruction"
+    );
+    let client_dispose = generated
+        .split_once("static void ku_pg_client_dispose(KuPgClient* p) {")
+        .expect("generated PG client disposer")
+        .1
+        .split_once("static void ku_pg_client_close_owned(KuPgClient* p)")
+        .expect("generated PG client disposer end")
+        .0;
+    let sync_destroy = client_dispose
+        .find("ku_pg_sync_destroy(&p->lock, &p->cv)")
+        .expect("PG synchronization destruction before pool free");
+    let first_pool_free = client_dispose
+        .find("free(p->conns)")
+        .expect("PG connection-array free");
+    let owner_free = client_dispose.rfind("free(p)").expect("PG pool owner free");
+    assert!(
+        sync_destroy < first_pool_free && first_pool_free < owner_free,
+        "PG synchronization must be destroyed before freeing enclosing pool allocations"
+    );
+
+    let harness = directory.path().join("pg_sync_destroy_harness.c");
+    fs::write(
+        &harness,
+        format!(
+            r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef int KuPgMutex;
+typedef int KuPgCond;
+static int ku_test_condition_result = 0;
+static int ku_test_mutex_result = 0;
+static int pthread_cond_destroy(int* condition) {{
+  (void)condition;
+  fputs("condition\n", stdout);
+  return ku_test_condition_result;
+}}
+static int pthread_mutex_destroy(int* mutex) {{
+  (void)mutex;
+  fputs("mutex\n", stdout);
+  return ku_test_mutex_result;
+}}
+{destroy}
+int main(int argc, char** argv) {{
+  if (argc != 2) return 64;
+  if (strcmp(argv[1], "condition") == 0) ku_test_condition_result = 1;
+  else if (strcmp(argv[1], "mutex") == 0) ku_test_mutex_result = 1;
+  else if (strcmp(argv[1], "ok") != 0) return 65;
+  KuPgMutex mutex = 0;
+  KuPgCond condition = 0;
+  ku_pg_sync_destroy(&mutex, &condition);
+  fputs("free\n", stdout);
+  return 0;
+}}
+"#
+        ),
+    )
+    .expect("write PG synchronization destruction harness");
+
+    let Some(executable) = compile_harness(directory.path(), &harness, "pg-sync-destroy") else {
+        eprintln!("skip: no C compiler available for PG synchronization destruction test");
+        return;
+    };
+    for (case, success, stdout, stderr) in [
+        (
+            "condition",
+            false,
+            "condition\n",
+            "pg client condition destroy failed\n",
+        ),
+        (
+            "mutex",
+            false,
+            "condition\nmutex\n",
+            "pg client mutex destroy failed\n",
+        ),
+        ("ok", true, "condition\nmutex\nfree\n", ""),
+    ] {
+        let mut command = Command::new(&executable);
+        command.current_dir(directory.path()).arg(case);
+        let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS).unwrap_or_else(|error| {
+            panic!("PG synchronization destruction case {case} was not bounded: {error}")
+        });
+        assert_eq!(
+            output.status.success(),
+            success,
+            "unexpected PG synchronization destruction status for {case}"
+        );
+        let actual_stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+        let actual_stderr = String::from_utf8_lossy(&output.stderr).replace('\r', "");
+        assert_eq!(actual_stdout, stdout);
+        assert_eq!(actual_stderr, stderr);
+        if !success {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                !actual_stdout.contains("free\n"),
+                "PG synchronization destruction failure continued to pool free"
+            );
+        }
+    }
+}
+
+#[test]
 fn native_pg_queries_have_one_nonblocking_deadline_path() {
     let directory = TempDir::new("query-source");
     let generated = emit_c(directory.path(), fixture());

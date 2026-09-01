@@ -12,6 +12,222 @@ use std::process::Command;
 use native_pg_harness::{compile_harness, emit_c, run_bounded, TempDir, RUN_LIMITS, RUN_TIMEOUT};
 
 #[test]
+fn native_redis_posix_destroy_failures_stop_before_connection_or_pool_free() {
+    let directory = TempDir::new("redis-sync-destroy");
+    let generated = emit_c(
+        directory.path(),
+        r#"import redis from "std.redis"
+fn main(): null! {
+    client = redis.client({ host: "127.0.0.1", port: 6379, max_connections: 1 })?
+    client.close()
+    return ok(null)
+}
+"#,
+    );
+    let gate_signature = "static void ku_redis_gate_destroy(KuRedisGate* gate) {";
+    let gate_start = generated
+        .find(gate_signature)
+        .expect("generated Redis command-gate destructor");
+    let gate_suffix = &generated[gate_start..];
+    let gate_end = gate_suffix
+        .find("\n}\n")
+        .expect("generated Redis command-gate destructor end")
+        + 3;
+    let gate_destroy = &gate_suffix[..gate_end];
+    let pool_signature = "static void ku_redis_pool_sync_destroy(KuRedisPoolSync* sync) {";
+    let pool_start = generated
+        .find(pool_signature)
+        .expect("generated Redis pool synchronization destructor");
+    let pool_suffix = &generated[pool_start..];
+    let pool_end = pool_suffix
+        .find("\n}\n")
+        .expect("generated Redis pool synchronization destructor end")
+        + 3;
+    let pool_destroy = &pool_suffix[..pool_end];
+
+    for (label, destroy, condition_call, condition_failure, mutex_call, mutex_failure) in [
+        (
+            "command gate",
+            gate_destroy,
+            "pthread_cond_destroy(&gate->condition)",
+            "redis command gate condition destroy failed",
+            "pthread_mutex_destroy(&gate->mutex)",
+            "redis command gate mutex destroy failed",
+        ),
+        (
+            "pool",
+            pool_destroy,
+            "pthread_cond_destroy(&sync->condition)",
+            "redis client condition destroy failed",
+            "pthread_mutex_destroy(&sync->mutex)",
+            "redis client mutex destroy failed",
+        ),
+    ] {
+        let condition_call = destroy
+            .find(condition_call)
+            .unwrap_or_else(|| panic!("Redis {label} condition destructor call"));
+        let condition_failure = destroy
+            .find(condition_failure)
+            .unwrap_or_else(|| panic!("Redis {label} condition destruction failure guard"));
+        let mutex_call = destroy
+            .find(mutex_call)
+            .unwrap_or_else(|| panic!("Redis {label} mutex destructor call"));
+        let mutex_failure = destroy
+            .find(mutex_failure)
+            .unwrap_or_else(|| panic!("Redis {label} mutex destruction failure guard"));
+        assert!(
+            condition_call < condition_failure
+                && condition_failure < mutex_call
+                && mutex_call < mutex_failure,
+            "Redis {label} must validate condition destruction before attempting mutex destruction"
+        );
+    }
+    let connection_destroy = generated
+        .split_once("static void ku_redis_connection_destroy(KuRedis* connection) {")
+        .expect("generated Redis connection destructor")
+        .1
+        .split_once("#if defined(_WIN32)\nstatic INIT_ONCE")
+        .expect("generated Redis connection destructor end")
+        .0;
+    assert!(
+        connection_destroy
+            .find("ku_redis_gate_destroy(&connection->command_gate)")
+            .expect("Redis command-gate destruction before connection free")
+            < connection_destroy
+                .find("free(connection)")
+                .expect("Redis connection free"),
+        "Redis command gate must be destroyed before its enclosing connection"
+    );
+    let pool_destroy_path = generated
+        .split_once(
+            "static void ku_redis_client_free_unpublished(KuRedisClient* client, int sync_ready) {",
+        )
+        .expect("generated Redis pool destructor")
+        .1
+        .split_once("static int ku_redis_client_ready_to_dispose")
+        .expect("generated Redis pool destructor end")
+        .0;
+    let sync_destroy = pool_destroy_path
+        .find("ku_redis_pool_sync_destroy(&client->sync)")
+        .expect("Redis pool synchronization destruction before pool free");
+    let first_pool_free = pool_destroy_path
+        .find("free(client->idle)")
+        .expect("Redis idle-array free");
+    let owner_free = pool_destroy_path
+        .rfind("free(client)")
+        .expect("Redis pool owner free");
+    assert!(
+        sync_destroy < first_pool_free && first_pool_free < owner_free,
+        "Redis pool synchronization must be destroyed before freeing enclosing pool allocations"
+    );
+
+    let harness = directory.path().join("redis_sync_destroy_harness.c");
+    fs::write(
+        &harness,
+        format!(
+            r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#if defined(_WIN32)
+#undef _WIN32
+#endif
+typedef struct KuRedisGate {{ int mutex; int condition; int available; }} KuRedisGate;
+typedef struct KuRedisPoolSync {{ int mutex; int condition; }} KuRedisPoolSync;
+static int ku_test_condition_result = 0;
+static int ku_test_mutex_result = 0;
+static int pthread_cond_destroy(int* condition) {{
+  (void)condition;
+  fputs("condition\n", stdout);
+  return ku_test_condition_result;
+}}
+static int pthread_mutex_destroy(int* mutex) {{
+  (void)mutex;
+  fputs("mutex\n", stdout);
+  return ku_test_mutex_result;
+}}
+{gate_destroy}
+{pool_destroy}
+int main(int argc, char** argv) {{
+  if (argc != 2) return 64;
+  int use_pool = strncmp(argv[1], "pool-", sizeof("pool-") - 1) == 0;
+  const char* failure = strchr(argv[1], '-');
+  if (!failure) return 65;
+  failure++;
+  if (strcmp(failure, "condition") == 0) ku_test_condition_result = 1;
+  else if (strcmp(failure, "mutex") == 0) ku_test_mutex_result = 1;
+  else if (strcmp(failure, "ok") != 0) return 66;
+  if (use_pool) {{
+    KuRedisPoolSync sync = {{0}};
+    ku_redis_pool_sync_destroy(&sync);
+  }} else {{
+    KuRedisGate gate = {{0}};
+    ku_redis_gate_destroy(&gate);
+  }}
+  fputs("free\n", stdout);
+  return 0;
+}}
+"#
+        ),
+    )
+    .expect("write Redis synchronization destruction harness");
+
+    let Some(executable) = compile_harness(directory.path(), &harness, "redis-sync-destroy") else {
+        eprintln!("skip: no C compiler available for Redis synchronization destruction test");
+        return;
+    };
+    for (case, success, stdout, stderr) in [
+        (
+            "gate-condition",
+            false,
+            "condition\n",
+            "redis command gate condition destroy failed\n",
+        ),
+        (
+            "gate-mutex",
+            false,
+            "condition\nmutex\n",
+            "redis command gate mutex destroy failed\n",
+        ),
+        ("gate-ok", true, "condition\nmutex\nfree\n", ""),
+        (
+            "pool-condition",
+            false,
+            "condition\n",
+            "redis client condition destroy failed\n",
+        ),
+        (
+            "pool-mutex",
+            false,
+            "condition\nmutex\n",
+            "redis client mutex destroy failed\n",
+        ),
+        ("pool-ok", true, "condition\nmutex\nfree\n", ""),
+    ] {
+        let mut command = Command::new(&executable);
+        command.current_dir(directory.path()).arg(case);
+        let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS).unwrap_or_else(|error| {
+            panic!("Redis synchronization destruction case {case} was not bounded: {error}")
+        });
+        assert_eq!(
+            output.status.success(),
+            success,
+            "unexpected Redis synchronization destruction status for {case}"
+        );
+        let actual_stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+        let actual_stderr = String::from_utf8_lossy(&output.stderr).replace('\r', "");
+        assert_eq!(actual_stdout, stdout);
+        assert_eq!(actual_stderr, stderr);
+        if !success {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                !actual_stdout.contains("free\n"),
+                "Redis synchronization destruction failure continued to enclosing free"
+            );
+        }
+    }
+}
+
+#[test]
 fn native_redis_failures_are_catchable_bounded_and_release_resources() {
     let directory = TempDir::new("redis-failures");
     let generated = emit_c(

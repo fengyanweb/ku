@@ -185,6 +185,142 @@ fn native_mysql_uses_only_server_prepared_statements_and_one_public_path() {
 }
 
 #[test]
+fn native_mysql_posix_sync_destroy_failures_stop_before_client_free() {
+    let directory = TempDir::new("mysql-sync-destroy");
+    let generated = emit_c(directory.path(), fixture());
+    let signature = "static void ku_mysql_sync_destroy(KuMysqlClient* client) {";
+    let destroy_start = generated
+        .find(signature)
+        .expect("generated MySQL synchronization destructor");
+    let destroy_suffix = &generated[destroy_start..];
+    let destroy_end = destroy_suffix
+        .find("\n}\n")
+        .expect("generated MySQL synchronization destructor end")
+        + 3;
+    let destroy = &destroy_suffix[..destroy_end];
+
+    let condition_call = destroy
+        .find("pthread_cond_destroy(&client->condition)")
+        .expect("MySQL condition destructor call");
+    let condition_failure = destroy
+        .find("mysql client condition destroy failed")
+        .expect("MySQL condition destruction failure guard");
+    let mutex_call = destroy
+        .find("pthread_mutex_destroy(&client->mutex)")
+        .expect("MySQL mutex destructor call");
+    let mutex_failure = destroy
+        .find("mysql client mutex destroy failed")
+        .expect("MySQL mutex destruction failure guard");
+    assert!(
+        condition_call < condition_failure
+            && condition_failure < mutex_call
+            && mutex_call < mutex_failure,
+        "MySQL must validate condition destruction before attempting mutex destruction"
+    );
+    let client_destroy = generated
+        .split_once("static void ku_mysql_client_destroy(KuMysqlClient* client) {")
+        .expect("generated MySQL client destructor")
+        .1
+        .split_once("/* Called with the mutex held.")
+        .expect("generated MySQL client destructor end")
+        .0;
+    let sync_destroy = client_destroy
+        .find("ku_mysql_sync_destroy(client)")
+        .expect("MySQL synchronization destruction before client free");
+    let fields_free = client_destroy
+        .find("ku_mysql_client_free_fields(client)")
+        .expect("MySQL client field free");
+    let owner_free = client_destroy
+        .find("ku_mysql_free(client)")
+        .expect("MySQL client owner free");
+    assert!(
+        sync_destroy < fields_free && fields_free < owner_free,
+        "MySQL synchronization must be destroyed before freeing enclosing client allocations"
+    );
+
+    let harness = directory.path().join("mysql_sync_destroy_harness.c");
+    fs::write(
+        &harness,
+        format!(
+            r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#if defined(_WIN32)
+#undef _WIN32
+#endif
+typedef struct KuMysqlClient {{ int mutex; int condition; }} KuMysqlClient;
+static int ku_test_condition_result = 0;
+static int ku_test_mutex_result = 0;
+static int pthread_cond_destroy(int* condition) {{
+  (void)condition;
+  fputs("condition\n", stdout);
+  return ku_test_condition_result;
+}}
+static int pthread_mutex_destroy(int* mutex) {{
+  (void)mutex;
+  fputs("mutex\n", stdout);
+  return ku_test_mutex_result;
+}}
+{destroy}
+int main(int argc, char** argv) {{
+  if (argc != 2) return 64;
+  if (strcmp(argv[1], "condition") == 0) ku_test_condition_result = 1;
+  else if (strcmp(argv[1], "mutex") == 0) ku_test_mutex_result = 1;
+  else if (strcmp(argv[1], "ok") != 0) return 65;
+  KuMysqlClient client = {{0}};
+  ku_mysql_sync_destroy(&client);
+  fputs("free\n", stdout);
+  return 0;
+}}
+"#
+        ),
+    )
+    .expect("write MySQL synchronization destruction harness");
+
+    let Some(executable) = compile_harness(directory.path(), &harness, "mysql-sync-destroy") else {
+        eprintln!("skip: no C compiler available for MySQL synchronization destruction test");
+        return;
+    };
+    for (case, success, stdout, stderr) in [
+        (
+            "condition",
+            false,
+            "condition\n",
+            "mysql client condition destroy failed\n",
+        ),
+        (
+            "mutex",
+            false,
+            "condition\nmutex\n",
+            "mysql client mutex destroy failed\n",
+        ),
+        ("ok", true, "condition\nmutex\nfree\n", ""),
+    ] {
+        let mut command = Command::new(&executable);
+        command.current_dir(directory.path()).arg(case);
+        let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS).unwrap_or_else(|error| {
+            panic!("MySQL synchronization destruction case {case} was not bounded: {error}")
+        });
+        assert_eq!(
+            output.status.success(),
+            success,
+            "unexpected MySQL synchronization destruction status for {case}"
+        );
+        let actual_stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+        let actual_stderr = String::from_utf8_lossy(&output.stderr).replace('\r', "");
+        assert_eq!(actual_stdout, stdout);
+        assert_eq!(actual_stderr, stderr);
+        if !success {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                !actual_stdout.contains("free\n"),
+                "MySQL synchronization destruction failure continued to client free"
+            );
+        }
+    }
+}
+
+#[test]
 fn native_mysql_fake_stmt_roundtrip_and_recovery() {
     let directory = TempDir::new("mysql-fake");
     let generated = emit_c(directory.path(), fixture());
