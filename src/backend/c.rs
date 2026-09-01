@@ -249,7 +249,8 @@ pub fn generate_c_source_with_options(
     // The pg connection poller also needs WSAPoll/poll and shutdown(2). Keep a
     // PG-only artifact lean: it does not need the HTTP/Redis resolver, atomic,
     // or thread headers unless it also uses one of those runtimes.
-    let uses_native_socket_runtime = program_uses_http(program) || program_uses_redis(program);
+    let uses_native_socket_runtime =
+        program_uses_http(program) || program_uses_redis(program) || program_uses_net(program);
     if uses_native_socket_runtime {
         out.push_str(
             "#if defined(_WIN32)\n\
@@ -371,6 +372,8 @@ pub fn generate_c_source_with_options(
     emit_pg_types(&mut out, program);
     emit_redis_types(&mut out, program);
     emit_mysql_types(&mut out, program);
+    emit_bytes_types(&mut out, program);
+    emit_net_types(&mut out, program);
     emit_layouts(&mut out, program)?;
     emit_named_ownership_helpers(&mut out, program)?;
     register_closure_invoke_symbols(program);
@@ -416,6 +419,8 @@ pub fn generate_c_source_with_options(
     // signature closure elements are complete only at this point. Result helper
     // bodies can already refer to the earlier clone/drop prototypes.
     emit_array_helper_bodies(&mut out, program)?;
+    emit_bytes_runtime(&mut out, program);
+    emit_net_runtime(&mut out, program);
     emit_string_chars_helper(&mut out, program)?;
     emit_kuvalue_array_wrappers(&mut out, program)?;
     emit_kuvalue_typed_array_equality_helpers(&mut out, program)?;
@@ -3057,6 +3062,8 @@ fn c_type(ty: &IrType) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_pg_result" => Ok("KuPgResult*".to_string()),
         IrType::Named(name) if name == "__ku_pg_client" => Ok("KuPgClient*".to_string()),
         IrType::Named(name) if name == "__ku_redis_client" => Ok("KuRedisClient*".to_string()),
+        IrType::Named(name) if name == "__ku_bytes" => Ok("KuBytes".to_string()),
+        IrType::Named(name) if name == "__ku_net_client" => Ok("KuNetClient*".to_string()),
         IrType::Named(name) if name == "__ku_mysql_client" => Ok("KuMysqlClient*".to_string()),
         IrType::Named(name) if name == "__ku_mysql_result" => Ok("KuMysqlResult*".to_string()),
         IrType::Named(name) => Ok(match enum_type_name(name) {
@@ -3187,6 +3194,16 @@ fn emit_result_abi_phase(
         forced.push(IrType::Str);
         forced.push(IrType::Int);
         forced.push(IrType::Bool);
+    }
+    if program_uses_bytes(program) {
+        forced.push(IrType::Named("__ku_bytes".to_string()));
+        forced.push(IrType::Str);
+        forced.push(IrType::Int);
+    }
+    if program_uses_net(program) {
+        forced.push(IrType::Named("__ku_net_client".to_string()));
+        forced.push(IrType::Named("__ku_bytes".to_string()));
+        forced.push(IrType::Null);
     }
     if program_uses_mysql(program) {
         forced.push(IrType::Named("__ku_mysql_client".to_string()));
@@ -9159,6 +9176,923 @@ static KuResult_bool ku_mysql_result_is_null(
     );
 }
 
+fn program_uses_native_named(program: &IrProgram, wanted: &str) -> bool {
+    fn ty(t: &IrType, wanted: &str) -> bool {
+        match t {
+            IrType::Named(name) => name == wanted,
+            IrType::Array(inner) | IrType::Result(inner) | IrType::Cell(inner) => ty(inner, wanted),
+            IrType::Closure { params, ret } => {
+                params.iter().any(|param| ty(param, wanted)) || ty(ret, wanted)
+            }
+            _ => false,
+        }
+    }
+    program.functions.iter().any(|function| {
+        if ty(&function.return_type, wanted)
+            || function.params.iter().any(|param| ty(&param.ty, wanted))
+        {
+            return true;
+        }
+        function.blocks.iter().any(|block| {
+            let mut used = false;
+            for instruction in &block.instructions {
+                walk_inst_types(instruction, &mut |candidate| {
+                    if ty(candidate, wanted) {
+                        used = true;
+                    }
+                });
+            }
+            walk_terminator_exprs(&block.terminator, &mut |expr| {
+                walk_expr_types(expr, &mut |candidate| {
+                    if ty(candidate, wanted) {
+                        used = true;
+                    }
+                });
+            });
+            used
+        })
+    })
+}
+
+fn program_uses_net(program: &IrProgram) -> bool {
+    program_uses_native_named(program, "__ku_net_client")
+}
+
+fn program_uses_bytes(program: &IrProgram) -> bool {
+    program_uses_net(program) || program_uses_native_named(program, "__ku_bytes")
+}
+
+fn emit_bytes_types(out: &mut String, program: &IrProgram) {
+    if !program_uses_bytes(program) {
+        return;
+    }
+    out.push_str(
+        "typedef struct KuBytes {\n  uint8_t* ptr;\n  size_t len;\n  size_t capacity;\n  uint8_t storage;\n} KuBytes;\n\
+         enum { KU_BYTES_STATIC = 0, KU_BYTES_OWNED = 1 };\n\
+         static KuBytes ku_move_bytes(KuBytes* value);\n\
+         static KuBytes ku_clone_bytes(KuBytes value);\n\
+         static void ku_drop_bytes(KuBytes* value);\n\n",
+    );
+}
+
+fn emit_net_types(out: &mut String, program: &IrProgram) {
+    if !program_uses_net(program) {
+        return;
+    }
+    out.push_str(concat!(
+        "typedef struct KuNetClient KuNetClient;\n",
+        "static KuNetClient* ku_move_net_client(KuNetClient** value);\n",
+        "static KuNetClient* ku_clone_net_client(KuNetClient* value);\n",
+        "static void ku_drop_net_client(KuNetClient** value);\n\n",
+    ));
+}
+
+fn emit_bytes_runtime(out: &mut String, program: &IrProgram) {
+    if !program_uses_bytes(program) {
+        return;
+    }
+    out.push_str(
+        r#"
+#define KU_BYTES_MAX_LENGTH (64ULL * 1024ULL * 1024ULL)
+
+static KuError ku_bytes_error(const char* code, const char* message) {
+  return ku_error_make(
+      ku_string_static((const uint8_t*)"bytes", 5),
+      ku_string_static((const uint8_t*)code, strlen(code)),
+      ku_string_static((const uint8_t*)message, strlen(message)));
+}
+
+static int ku_bytes_try_copy(const uint8_t* data, size_t len, KuBytes* out) {
+  if (!out || (len != 0 && !data) || len > (size_t)KU_BYTES_MAX_LENGTH) return -1;
+  *out = (KuBytes){0};
+  if (len == 0) return 1;
+  uint8_t* copy = (uint8_t*)malloc(len);
+  if (!copy) return 0;
+  memcpy(copy, data, len);
+  *out = (KuBytes){ copy, len, len, KU_BYTES_OWNED };
+  return 1;
+}
+
+static KuBytes ku_move_bytes(KuBytes* value) {
+  if (!value) return (KuBytes){0};
+  KuBytes moved = *value;
+  *value = (KuBytes){0};
+  return moved;
+}
+
+static KuBytes ku_clone_bytes(KuBytes value) {
+  if (value.storage == KU_BYTES_STATIC) return value;
+  KuBytes copy = (KuBytes){0};
+  int copied = ku_bytes_try_copy(value.ptr, value.len, &copy);
+  if (copied != 1) {
+    fputs(copied == 0 ? "bytes clone allocation failed\n" : "invalid bytes clone source\n", stderr);
+    exit(1);
+  }
+  return copy;
+}
+
+static void ku_drop_bytes(KuBytes* value) {
+  if (!value) return;
+  if (value->storage == KU_BYTES_OWNED && value->ptr) free(value->ptr);
+  *value = (KuBytes){0};
+}
+
+static KuResult_bytes ku_bytes_from_str(KuString text) {
+  if ((text.len != 0 && !text.ptr) || text.len > (size_t)KU_BYTES_MAX_LENGTH) {
+    return (KuResult_bytes){ false, (KuBytes){0},
+      ku_bytes_error("too_large", "bytes input is invalid or exceeds 64 MiB") };
+  }
+  KuBytes value = (KuBytes){0};
+  int copied = ku_bytes_try_copy(text.ptr, text.len, &value);
+  if (copied != 1) {
+    return (KuResult_bytes){ false, (KuBytes){0},
+      ku_bytes_error("out_of_memory", "bytes allocation failed") };
+  }
+  return (KuResult_bytes){ true, value, (KuError){0} };
+}
+
+static int ku_bytes_utf8_valid(const uint8_t* data, size_t len) {
+  if (len != 0 && !data) return 0;
+  size_t i = 0;
+  while (i < len) {
+    uint8_t c = data[i];
+    if (c <= 0x7f) { i++; continue; }
+    if (c >= 0xc2 && c <= 0xdf) {
+      if (i + 1 >= len || (data[i + 1] & 0xc0) != 0x80) return 0;
+      i += 2; continue;
+    }
+    if (c == 0xe0) {
+      if (i + 2 >= len || data[i + 1] < 0xa0 || data[i + 1] > 0xbf || (data[i + 2] & 0xc0) != 0x80) return 0;
+      i += 3; continue;
+    }
+    if ((c >= 0xe1 && c <= 0xec) || (c >= 0xee && c <= 0xef)) {
+      if (i + 2 >= len || (data[i + 1] & 0xc0) != 0x80 || (data[i + 2] & 0xc0) != 0x80) return 0;
+      i += 3; continue;
+    }
+    if (c == 0xed) {
+      if (i + 2 >= len || data[i + 1] < 0x80 || data[i + 1] > 0x9f || (data[i + 2] & 0xc0) != 0x80) return 0;
+      i += 3; continue;
+    }
+    if (c == 0xf0) {
+      if (i + 3 >= len || data[i + 1] < 0x90 || data[i + 1] > 0xbf || (data[i + 2] & 0xc0) != 0x80 || (data[i + 3] & 0xc0) != 0x80) return 0;
+      i += 4; continue;
+    }
+    if (c >= 0xf1 && c <= 0xf3) {
+      if (i + 3 >= len || (data[i + 1] & 0xc0) != 0x80 || (data[i + 2] & 0xc0) != 0x80 || (data[i + 3] & 0xc0) != 0x80) return 0;
+      i += 4; continue;
+    }
+    if (c == 0xf4) {
+      if (i + 3 >= len || data[i + 1] < 0x80 || data[i + 1] > 0x8f || (data[i + 2] & 0xc0) != 0x80 || (data[i + 3] & 0xc0) != 0x80) return 0;
+      i += 4; continue;
+    }
+    return 0;
+  }
+  return 1;
+}
+
+static int64_t ku_bytes_len(KuBytes value) {
+  if (value.len > (size_t)INT64_MAX) {
+    fputs("bytes length is outside Ku int range\n", stderr);
+    exit(1);
+  }
+  return (int64_t)value.len;
+}
+
+static KuResult_int ku_bytes_get(KuBytes value, int64_t index) {
+  if (index < 0 || (uint64_t)index >= (uint64_t)value.len || !value.ptr) {
+    return (KuResult_int){ false, 0,
+      ku_bytes_error("index_out_of_bounds", "bytes index is out of bounds") };
+  }
+  return (KuResult_int){ true, (int64_t)value.ptr[(size_t)index], (KuError){0} };
+}
+
+static KuResult_str ku_bytes_to_str(KuBytes value) {
+  if (!ku_bytes_utf8_valid(value.ptr, value.len)) {
+    return (KuResult_str){ false, (KuString){0},
+      ku_bytes_error("invalid_utf8", "bytes value is not valid UTF-8") };
+  }
+  if (value.len == 0) return (KuResult_str){ true, (KuString){0}, (KuError){0} };
+  uint8_t* copy = (uint8_t*)malloc(value.len);
+  if (!copy) {
+    return (KuResult_str){ false, (KuString){0},
+      ku_bytes_error("out_of_memory", "string allocation failed") };
+  }
+  memcpy(copy, value.ptr, value.len);
+  return (KuResult_str){ true,
+    (KuString){ copy, value.len, value.len, KU_STRING_OWNED }, (KuError){0} };
+}
+"#,
+    );
+    if program_uses_intrinsic(program, "bytes.from_array") {
+        out.push_str(
+            r#"
+static KuResult_bytes ku_bytes_from_array(KuArray_int values) {
+  if (values.len > (size_t)KU_BYTES_MAX_LENGTH || (values.len != 0 && !values.data)) {
+    return (KuResult_bytes){ false, (KuBytes){0},
+      ku_bytes_error("too_large", "byte array is invalid or exceeds 64 MiB") };
+  }
+  for (size_t index = 0; index < values.len; index++) {
+    if (values.data[index] < 0 || values.data[index] > 255) {
+      return (KuResult_bytes){ false, (KuBytes){0},
+        ku_bytes_error("invalid_byte", "byte values must be between 0 and 255") };
+    }
+  }
+  KuBytes result = (KuBytes){0};
+  if (values.len != 0) {
+    result.ptr = (uint8_t*)malloc(values.len);
+    if (!result.ptr) {
+      return (KuResult_bytes){ false, (KuBytes){0},
+        ku_bytes_error("out_of_memory", "bytes allocation failed") };
+    }
+    for (size_t index = 0; index < values.len; index++)
+      result.ptr[index] = (uint8_t)values.data[index];
+    result.len = values.len;
+    result.capacity = values.len;
+    result.storage = KU_BYTES_OWNED;
+  }
+  return (KuResult_bytes){ true, result, (KuError){0} };
+}
+"#,
+        );
+    }
+    out.push('\n');
+}
+
+fn emit_net_runtime(out: &mut String, program: &IrProgram) {
+    if !program_uses_net(program) {
+        return;
+    }
+    out.push_str(
+        r#"
+#define KU_NATIVE_RUNTIME_NET_SOCKET 1
+#define KU_NET_DEFAULT_TIMEOUT_MS 5000U
+#define KU_NET_MAX_TIMEOUT_MS 300000U
+#define KU_NET_DEFAULT_MAX_READ_BYTES (1024U * 1024U)
+#define KU_NET_MAX_READ_BYTES (16U * 1024U * 1024U)
+#define KU_NET_MAX_HOST_BYTES 253U
+#define KU_NET_MAX_RESOLVED_ADDRESSES 64U
+#define KU_NET_SOCKET_CHUNK 1073741824U
+
+#if defined(_WIN32)
+typedef SOCKET KuNetSocket;
+#define KU_NET_INVALID_SOCKET INVALID_SOCKET
+typedef struct { HANDLE semaphore; } KuNetGate;
+#else
+typedef int KuNetSocket;
+#define KU_NET_INVALID_SOCKET (-1)
+typedef struct { pthread_mutex_t mutex; pthread_cond_t condition; int available; } KuNetGate;
+#endif
+
+struct KuNetClient {
+  KuNetSocket socket_value;
+  KuNetGate gate;
+  uint32_t read_timeout_ms;
+  uint32_t write_timeout_ms;
+  uint32_t max_read_bytes;
+};
+
+static KuError ku_net_error(const char* code, const char* message) {
+  return ku_error_make(
+      ku_string_static((const uint8_t*)"net", 3),
+      ku_string_static((const uint8_t*)code, strlen(code)),
+      ku_string_static((const uint8_t*)message, strlen(message)));
+}
+
+static unsigned long long ku_net_now_ms(void) { return __ku_handler_now_ms(); }
+
+static unsigned long long ku_net_deadline_after_ms(uint32_t timeout_ms) {
+  unsigned long long now = ku_net_now_ms();
+  unsigned long long deadline = (~0ULL - now < (unsigned long long)timeout_ms)
+      ? ~0ULL : now + (unsigned long long)timeout_ms;
+  if (__ku_handler_deadline != 0 && __ku_handler_deadline < deadline)
+    deadline = __ku_handler_deadline;
+  return deadline;
+}
+
+static int ku_net_socket_last_error(void) {
+#if defined(_WIN32)
+  return WSAGetLastError();
+#else
+  return errno;
+#endif
+}
+
+static int ku_net_socket_error_interrupted(int error) {
+#if defined(_WIN32)
+  return error == WSAEINTR;
+#else
+  return error == EINTR;
+#endif
+}
+
+static int ku_net_socket_error_would_block(int error) {
+#if defined(_WIN32)
+  return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
+#else
+  return error == EAGAIN || error == EWOULDBLOCK || error == EINPROGRESS;
+#endif
+}
+
+static int ku_net_socket_error_connecting(int error) {
+#if defined(_WIN32)
+  return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS
+      || error == WSAEINVAL || error == WSAEINTR;
+#else
+  return error == EINPROGRESS || error == EALREADY
+      || error == EWOULDBLOCK || error == EINTR;
+#endif
+}
+
+static void ku_net_socket_close(KuNetSocket socket_value) {
+  if (socket_value == KU_NET_INVALID_SOCKET) return;
+#if defined(_WIN32)
+  closesocket(socket_value);
+#else
+  (void)close(socket_value);
+#endif
+}
+
+static int ku_net_socket_set_nonblocking(KuNetSocket socket_value) {
+#if defined(_WIN32)
+  u_long mode = 1UL;
+  return ioctlsocket(socket_value, FIONBIO, &mode) == 0 ? 0 : -1;
+#else
+  int flags = fcntl(socket_value, F_GETFL, 0);
+  if (flags < 0) return -1;
+  return fcntl(socket_value, F_SETFL, flags | O_NONBLOCK) == 0 ? 0 : -1;
+#endif
+}
+
+static int ku_net_socket_suppress_sigpipe(KuNetSocket socket_value) {
+#if defined(__APPLE__)
+  int enabled = 1;
+  return setsockopt(socket_value, SOL_SOCKET, SO_NOSIGPIPE,
+      &enabled, (socklen_t)sizeof(enabled)) == 0 ? 0 : -1;
+#else
+  (void)socket_value;
+  return 0;
+#endif
+}
+
+static int ku_net_socket_connect(KuNetSocket socket_value,
+    const struct sockaddr* address, size_t address_len) {
+#if defined(_WIN32)
+  if (address_len > (size_t)INT_MAX) return SOCKET_ERROR;
+  return connect(socket_value, address, (int)address_len);
+#else
+  if (address_len > (size_t)((socklen_t)-1)) { errno = EINVAL; return -1; }
+  return connect(socket_value, address, (socklen_t)address_len);
+#endif
+}
+
+static int ku_net_socket_pending_error(KuNetSocket socket_value, int* out_error) {
+  int socket_error = 0;
+#if defined(_WIN32)
+  int length = (int)sizeof(socket_error);
+  int rc = getsockopt(socket_value, SOL_SOCKET, SO_ERROR,
+      (char*)&socket_error, &length);
+#else
+  socklen_t length = (socklen_t)sizeof(socket_error);
+  int rc = getsockopt(socket_value, SOL_SOCKET, SO_ERROR,
+      &socket_error, &length);
+#endif
+  if (rc != 0) return -1;
+  *out_error = socket_error;
+  return 0;
+}
+
+/* 1=ready (including EOF/error for recv/send to classify), 0=deadline, -1=OS error. */
+static int ku_net_socket_wait(KuNetSocket socket_value, int writing,
+    unsigned long long deadline) {
+  for (;;) {
+    unsigned long long now = ku_net_now_ms();
+    if (now >= deadline) return 0;
+    unsigned long long remaining = deadline - now;
+#if defined(_WIN32)
+    struct timeval wait;
+    unsigned long long seconds = remaining / 1000ULL;
+    wait.tv_sec = seconds > (unsigned long long)LONG_MAX ? LONG_MAX : (long)seconds;
+    wait.tv_usec = (long)((remaining % 1000ULL) * 1000ULL);
+    fd_set readable, writable, exceptional;
+    FD_ZERO(&readable); FD_ZERO(&writable); FD_ZERO(&exceptional);
+    if (writing) FD_SET(socket_value, &writable); else FD_SET(socket_value, &readable);
+    FD_SET(socket_value, &exceptional);
+    int selected = select(0, writing ? NULL : &readable,
+        writing ? &writable : NULL, &exceptional, &wait);
+    if (selected > 0) return 1;
+#else
+    int wait_ms = remaining > (unsigned long long)INT_MAX ? INT_MAX : (int)remaining;
+    if (wait_ms == 0) wait_ms = 1;
+    struct pollfd descriptor;
+    descriptor.fd = socket_value;
+    descriptor.events = writing ? POLLOUT : POLLIN;
+    descriptor.revents = 0;
+    int selected = poll(&descriptor, 1, wait_ms);
+    if (selected > 0) {
+      if (descriptor.revents & POLLNVAL) return -1;
+      return 1;
+    }
+#endif
+    if (selected == 0) return 0;
+    if (!ku_net_socket_error_interrupted(ku_net_socket_last_error())) return -1;
+  }
+}
+
+static int ku_net_socket_send(KuNetSocket socket_value, const uint8_t* data, size_t len) {
+  size_t chunk = len > KU_NET_SOCKET_CHUNK ? KU_NET_SOCKET_CHUNK : len;
+#if defined(_WIN32)
+  return send(socket_value, (const char*)data, (int)chunk, 0);
+#elif defined(__APPLE__)
+  ssize_t sent = send(socket_value, data, chunk, 0);
+  return sent > (ssize_t)INT_MAX ? INT_MAX : (int)sent;
+#elif defined(MSG_NOSIGNAL)
+  ssize_t sent = send(socket_value, data, chunk, MSG_NOSIGNAL);
+  return sent > (ssize_t)INT_MAX ? INT_MAX : (int)sent;
+#else
+#error "std.net POSIX transport requires MSG_NOSIGNAL or SO_NOSIGPIPE"
+#endif
+}
+
+static int ku_net_socket_recv(KuNetSocket socket_value, uint8_t* data, size_t len) {
+  size_t chunk = len > KU_NET_SOCKET_CHUNK ? KU_NET_SOCKET_CHUNK : len;
+#if defined(_WIN32)
+  return recv(socket_value, (char*)data, (int)chunk, 0);
+#else
+  ssize_t received = recv(socket_value, data, chunk, 0);
+  return received > (ssize_t)INT_MAX ? INT_MAX : (int)received;
+#endif
+}
+
+#if defined(_WIN32)
+static INIT_ONCE ku_net_wsa_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK ku_net_wsa_init(PINIT_ONCE once, PVOID parameter, PVOID* context) {
+  (void)once; (void)parameter; (void)context;
+  WSADATA data;
+  return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+}
+static int ku_net_socket_startup(void) {
+  return InitOnceExecuteOnce(&ku_net_wsa_once, ku_net_wsa_init, NULL, NULL) ? 0 : -1;
+}
+#else
+static int ku_net_socket_startup(void) { return 0; }
+#endif
+
+static int ku_net_gate_init(KuNetGate* gate) {
+#if defined(_WIN32)
+  gate->semaphore = CreateSemaphoreW(NULL, 1, 1, NULL);
+  return gate->semaphore ? 0 : -1;
+#else
+  gate->available = 1;
+  if (pthread_mutex_init(&gate->mutex, NULL) != 0) return -1;
+  int result;
+#if defined(__APPLE__)
+  result = pthread_cond_init(&gate->condition, NULL);
+#else
+  pthread_condattr_t attributes;
+  result = pthread_condattr_init(&attributes);
+  if (result == 0) {
+    result = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+    if (result == 0) result = pthread_cond_init(&gate->condition, &attributes);
+    pthread_condattr_destroy(&attributes);
+  }
+#endif
+  if (result != 0) pthread_mutex_destroy(&gate->mutex);
+  return result == 0 ? 0 : -1;
+#endif
+}
+
+/* 1=owned, 0=deadline, -1=synchronization error. */
+static int ku_net_gate_acquire(KuNetGate* gate, unsigned long long deadline) {
+  if (!gate || deadline == 0) return -1;
+#if defined(_WIN32)
+  unsigned long long now = ku_net_now_ms();
+  if (now >= deadline) return 0;
+  unsigned long long remaining = deadline - now;
+  DWORD wait_ms = remaining > (unsigned long long)UINT32_MAX
+      ? UINT32_MAX : (DWORD)remaining;
+  DWORD result = WaitForSingleObject(gate->semaphore, wait_ms);
+  if (result != WAIT_OBJECT_0) return result == WAIT_TIMEOUT ? 0 : -1;
+  if (ku_net_now_ms() >= deadline) {
+    return ReleaseSemaphore(gate->semaphore, 1, NULL) ? 0 : -1;
+  }
+  return 1;
+#else
+  if (pthread_mutex_lock(&gate->mutex) != 0) return -1;
+  while (!gate->available) {
+    unsigned long long now = ku_net_now_ms();
+    if (now >= deadline)
+      return pthread_mutex_unlock(&gate->mutex) == 0 ? 0 : -1;
+    unsigned long long remaining = deadline - now;
+    int result;
+#if defined(__APPLE__)
+    struct timespec relative = {
+      (time_t)(remaining / 1000ULL),
+      (long)((remaining % 1000ULL) * 1000000ULL)
+    };
+    result = pthread_cond_timedwait_relative_np(
+        &gate->condition, &gate->mutex, &relative);
+#else
+    struct timespec absolute = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &absolute) != 0) {
+      pthread_mutex_unlock(&gate->mutex); return -1;
+    }
+    absolute.tv_sec += (time_t)(remaining / 1000ULL);
+    long extra = (long)((remaining % 1000ULL) * 1000000ULL);
+    if (absolute.tv_nsec > 999999999L - extra) {
+      absolute.tv_sec++; absolute.tv_nsec -= 1000000000L - extra;
+    } else {
+      absolute.tv_nsec += extra;
+    }
+    result = pthread_cond_timedwait(&gate->condition, &gate->mutex, &absolute);
+#endif
+    if (result == ETIMEDOUT)
+      return pthread_mutex_unlock(&gate->mutex) == 0 ? 0 : -1;
+    if (result != 0) { pthread_mutex_unlock(&gate->mutex); return -1; }
+  }
+  if (ku_net_now_ms() >= deadline) {
+    return pthread_mutex_unlock(&gate->mutex) == 0 ? 0 : -1;
+  }
+  gate->available = 0;
+  if (pthread_mutex_unlock(&gate->mutex) != 0) return -1;
+  return 1;
+#endif
+}
+
+static int ku_net_gate_release(KuNetGate* gate) {
+#if defined(_WIN32)
+  return gate && ReleaseSemaphore(gate->semaphore, 1, NULL) ? 0 : -1;
+#else
+  if (!gate || pthread_mutex_lock(&gate->mutex) != 0) return -1;
+  if (gate->available) { pthread_mutex_unlock(&gate->mutex); return -1; }
+  gate->available = 1;
+  int signal_result = pthread_cond_signal(&gate->condition);
+  int unlock_result = pthread_mutex_unlock(&gate->mutex);
+  return signal_result == 0 && unlock_result == 0 ? 0 : -1;
+#endif
+}
+
+static void ku_net_gate_destroy(KuNetGate* gate) {
+  if (!gate) return;
+#if defined(_WIN32)
+  if (gate->semaphore) CloseHandle(gate->semaphore);
+  gate->semaphore = NULL;
+#else
+  pthread_cond_destroy(&gate->condition);
+  pthread_mutex_destroy(&gate->mutex);
+#endif
+}
+
+static void ku_net_poison(KuNetClient* client) {
+  if (client && client->socket_value != KU_NET_INVALID_SOCKET) {
+    ku_net_socket_close(client->socket_value);
+    client->socket_value = KU_NET_INVALID_SOCKET;
+  }
+}
+
+static KuValue* ku_net_config_get(KuObject* config, const char* key) {
+  return config ? ku_object_get(config,
+      ku_string_static((const uint8_t*)key, strlen(key))) : NULL;
+}
+
+static int ku_net_config_key_known(KuString key) {
+  static const char* fields[] = {
+    "host", "port", "connect_timeout_ms", "read_timeout_ms",
+    "write_timeout_ms", "max_read_bytes"
+  };
+  for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); index++) {
+    size_t len = strlen(fields[index]);
+    if (key.len == len && key.ptr && memcmp(key.ptr, fields[index], len) == 0) return 1;
+  }
+  return 0;
+}
+
+static int ku_net_config_int(KuObject* config, const char* key,
+    uint32_t default_value, uint32_t min, uint32_t max,
+    uint32_t* out, KuError* error) {
+  KuValue* value = ku_net_config_get(config, key);
+  if (!value) { *out = default_value; return 1; }
+  if (value->tag != KU_INT || value->as.i < (int64_t)min || value->as.i > (int64_t)max) {
+    *error = ku_net_error("invalid_config", "net client integer config is outside its supported range");
+    return 0;
+  }
+  *out = (uint32_t)value->as.i;
+  return 1;
+}
+
+static int ku_net_host_valid(KuString host) {
+  if (!host.ptr || host.len == 0 || host.len > KU_NET_MAX_HOST_BYTES) return 0;
+  for (size_t index = 0; index < host.len; index++) {
+    /* Native transports accept one portable ASCII spelling. International
+       domain names must be supplied as ASCII-compatible (punycode) labels. */
+    if (host.ptr[index] < 0x21 || host.ptr[index] > 0x7e) return 0;
+  }
+  return 1;
+}
+
+static KuResult_net_client ku_net_client(KuObject* config) {
+  if (!config) return (KuResult_net_client){ false, NULL,
+    ku_net_error("invalid_config", "net.client requires a config object") };
+  for (size_t index = 0; index < config->cap; index++) {
+    if (config->entries[index].used
+        && !ku_net_config_key_known(config->entries[index].key)) {
+      return (KuResult_net_client){ false, NULL,
+        ku_net_error("invalid_config", "net.client config contains an unknown field") };
+    }
+  }
+  KuValue* host_value = ku_net_config_get(config, "host");
+  KuValue* port_value = ku_net_config_get(config, "port");
+  if (!host_value || host_value->tag != KU_STR
+      || !ku_net_host_valid(host_value->as.s)) {
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("invalid_config", "net.client requires a valid non-empty string host") };
+  }
+  if (!port_value || port_value->tag != KU_INT
+      || port_value->as.i < 1 || port_value->as.i > 65535) {
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("invalid_config", "net.client requires port between 1 and 65535") };
+  }
+  KuError config_error = (KuError){0};
+  uint32_t connect_timeout_ms, read_timeout_ms, write_timeout_ms, max_read_bytes;
+  if (!ku_net_config_int(config, "connect_timeout_ms", KU_NET_DEFAULT_TIMEOUT_MS,
+          1, KU_NET_MAX_TIMEOUT_MS, &connect_timeout_ms, &config_error)
+      || !ku_net_config_int(config, "read_timeout_ms", KU_NET_DEFAULT_TIMEOUT_MS,
+          1, KU_NET_MAX_TIMEOUT_MS, &read_timeout_ms, &config_error)
+      || !ku_net_config_int(config, "write_timeout_ms", KU_NET_DEFAULT_TIMEOUT_MS,
+          1, KU_NET_MAX_TIMEOUT_MS, &write_timeout_ms, &config_error)
+      || !ku_net_config_int(config, "max_read_bytes", KU_NET_DEFAULT_MAX_READ_BYTES,
+          1, KU_NET_MAX_READ_BYTES, &max_read_bytes, &config_error)) {
+    return (KuResult_net_client){ false, NULL, config_error };
+  }
+
+  unsigned long long deadline = ku_net_deadline_after_ms(connect_timeout_ms);
+  if (deadline == 0 || ku_net_now_ms() >= deadline) {
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("connect_timeout", "net connect timed out") };
+  }
+  if (ku_net_socket_startup() != 0) {
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("transport_error", "network runtime initialization failed") };
+  }
+  size_t hostname_bytes = host_value->as.s.len + 1;
+  char* hostname = (char*)malloc(hostname_bytes);
+  if (!hostname) return (KuResult_net_client){ false, NULL,
+    ku_net_error("out_of_memory", "net host allocation failed") };
+  memcpy(hostname, host_value->as.s.ptr, host_value->as.s.len);
+  hostname[host_value->as.s.len] = '\0';
+  char port_text[6];
+  int port_length = snprintf(port_text, sizeof(port_text), "%lld",
+      (long long)port_value->as.i);
+  if (port_length <= 0 || (size_t)port_length >= sizeof(port_text)) {
+    free(hostname);
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("invalid_config", "net.client port is invalid") };
+  }
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+  struct addrinfo* addresses = NULL;
+  int resolver_status = getaddrinfo(hostname, port_text, &hints, &addresses);
+  free(hostname);
+  if (ku_net_now_ms() >= deadline) {
+    if (addresses) freeaddrinfo(addresses);
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("connect_timeout", "net connect timed out") };
+  }
+  if (resolver_status != 0 || !addresses) {
+    if (addresses) freeaddrinfo(addresses);
+    return (KuResult_net_client){ false, NULL,
+      resolver_status == EAI_MEMORY
+        ? ku_net_error("out_of_memory", "net host resolution allocation failed")
+        : ku_net_error("connect_error", "net host resolution failed") };
+  }
+
+  KuNetSocket connected = KU_NET_INVALID_SOCKET;
+  int deadline_expired = 0;
+  uint32_t attempted_addresses = 0;
+  for (struct addrinfo* address = addresses; address; address = address->ai_next) {
+    if (attempted_addresses >= KU_NET_MAX_RESOLVED_ADDRESSES) break;
+    attempted_addresses++;
+    if (ku_net_now_ms() >= deadline) { deadline_expired = 1; break; }
+    KuNetSocket candidate = socket(address->ai_family, address->ai_socktype,
+        address->ai_protocol);
+    if (candidate == KU_NET_INVALID_SOCKET) continue;
+    if (ku_net_socket_suppress_sigpipe(candidate) != 0
+        || ku_net_socket_set_nonblocking(candidate) != 0) {
+      ku_net_socket_close(candidate); continue;
+    }
+    int connect_status = ku_net_socket_connect(candidate, address->ai_addr,
+        (size_t)address->ai_addrlen);
+    int ready = connect_status == 0;
+    if (!ready) {
+      int connect_error = ku_net_socket_last_error();
+      if (ku_net_socket_error_connecting(connect_error)) {
+        int waited = ku_net_socket_wait(candidate, 1, deadline);
+        if (waited == 0) deadline_expired = 1;
+        if (waited == 1) {
+          int pending_error = 0;
+          ready = ku_net_socket_pending_error(candidate, &pending_error) == 0
+              && pending_error == 0;
+        }
+      }
+    }
+    if (ready && ku_net_now_ms() < deadline) { connected = candidate; break; }
+    ku_net_socket_close(candidate);
+    if (deadline_expired || ku_net_now_ms() >= deadline) {
+      deadline_expired = 1; break;
+    }
+  }
+  freeaddrinfo(addresses);
+  if (connected == KU_NET_INVALID_SOCKET) {
+    return (KuResult_net_client){ false, NULL,
+      deadline_expired
+        ? ku_net_error("connect_timeout", "net connect timed out")
+        : ku_net_error("connect_error", "net connection failed") };
+  }
+  if (ku_net_now_ms() >= deadline) {
+    ku_net_socket_close(connected);
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("connect_timeout", "net connect timed out") };
+  }
+  KuNetClient* client = (KuNetClient*)malloc(sizeof(KuNetClient));
+  if (!client) {
+    ku_net_socket_close(connected);
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("out_of_memory", "net client allocation failed") };
+  }
+  memset(client, 0, sizeof(*client));
+  client->socket_value = connected;
+  client->read_timeout_ms = read_timeout_ms;
+  client->write_timeout_ms = write_timeout_ms;
+  client->max_read_bytes = max_read_bytes;
+  if (ku_net_gate_init(&client->gate) != 0) {
+    ku_net_socket_close(connected); free(client);
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("sync_error", "net client synchronization initialization failed") };
+  }
+  return (KuResult_net_client){ true, client, (KuError){0} };
+}
+
+static KuResult_null ku_net_write(KuNetClient* client, KuBytes data) {
+  if (!client || client->socket_value == KU_NET_INVALID_SOCKET) {
+    return (KuResult_null){ false, 0,
+      ku_net_error("client_closed", "net client is closed") };
+  }
+  if ((data.len != 0 && !data.ptr) || data.len > (size_t)KU_BYTES_MAX_LENGTH) {
+    return (KuResult_null){ false, 0,
+      ku_net_error("invalid_bytes", "net write received invalid or oversized bytes") };
+  }
+  unsigned long long deadline = ku_net_deadline_after_ms(client->write_timeout_ms);
+  int acquired = ku_net_gate_acquire(&client->gate, deadline);
+  if (acquired != 1) {
+    if (acquired < 0) ku_net_poison(client);
+    return (KuResult_null){ false, 0, acquired == 0
+      ? ku_net_error("write_timeout", "net write timed out")
+      : ku_net_error("sync_error", "net client synchronization failed") };
+  }
+  if (client->socket_value == KU_NET_INVALID_SOCKET) {
+    if (ku_net_gate_release(&client->gate) != 0) {
+      ku_net_poison(client);
+      return (KuResult_null){ false, 0,
+        ku_net_error("sync_error", "net client synchronization failed") };
+    }
+    return (KuResult_null){ false, 0,
+      ku_net_error("client_closed", "net client is closed") };
+  }
+  KuError error = (KuError){0};
+  size_t sent = 0;
+  while (sent < data.len) {
+    int waited = ku_net_socket_wait(client->socket_value, 1, deadline);
+    if (waited != 1) {
+      error = waited == 0
+        ? ku_net_error("write_timeout", "net write timed out")
+        : ku_net_error("transport_error", "net write readiness failed");
+      ku_net_poison(client); break;
+    }
+    int amount = ku_net_socket_send(client->socket_value, data.ptr + sent,
+        data.len - sent);
+    if (amount > 0) { sent += (size_t)amount; continue; }
+    if (amount < 0) {
+      int socket_error = ku_net_socket_last_error();
+      if (ku_net_socket_error_interrupted(socket_error)
+          || ku_net_socket_error_would_block(socket_error)) continue;
+    }
+    error = ku_net_error("transport_error", "net write failed");
+    ku_net_poison(client); break;
+  }
+  if (ku_net_gate_release(&client->gate) != 0) {
+    ku_net_poison(client);
+    if (error.code.len == 0)
+      error = ku_net_error("sync_error", "net client synchronization failed");
+  }
+  if (error.code.len != 0) return (KuResult_null){ false, 0, error };
+  return (KuResult_null){ true, 0, (KuError){0} };
+}
+
+static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
+  if (!client || client->socket_value == KU_NET_INVALID_SOCKET) {
+    return (KuResult_bytes){ false, (KuBytes){0},
+      ku_net_error("client_closed", "net client is closed") };
+  }
+  if (requested < 1 || (uint64_t)requested > (uint64_t)client->max_read_bytes) {
+    return (KuResult_bytes){ false, (KuBytes){0},
+      ku_net_error("invalid_read_size", "net read size is outside the configured bound") };
+  }
+  unsigned long long deadline = ku_net_deadline_after_ms(client->read_timeout_ms);
+  int acquired = ku_net_gate_acquire(&client->gate, deadline);
+  if (acquired != 1) {
+    if (acquired < 0) ku_net_poison(client);
+    return (KuResult_bytes){ false, (KuBytes){0}, acquired == 0
+      ? ku_net_error("read_timeout", "net read timed out")
+      : ku_net_error("sync_error", "net client synchronization failed") };
+  }
+  if (client->socket_value == KU_NET_INVALID_SOCKET) {
+    if (ku_net_gate_release(&client->gate) != 0) {
+      ku_net_poison(client);
+      return (KuResult_bytes){ false, (KuBytes){0},
+        ku_net_error("sync_error", "net client synchronization failed") };
+    }
+    return (KuResult_bytes){ false, (KuBytes){0},
+      ku_net_error("client_closed", "net client is closed") };
+  }
+  KuBytes result = (KuBytes){0};
+  result.ptr = (uint8_t*)malloc((size_t)requested);
+  if (!result.ptr) {
+    if (ku_net_gate_release(&client->gate) != 0) {
+      ku_net_poison(client);
+      return (KuResult_bytes){ false, (KuBytes){0},
+        ku_net_error("sync_error", "net client synchronization failed") };
+    }
+    return (KuResult_bytes){ false, (KuBytes){0},
+      ku_net_error("out_of_memory", "net read allocation failed") };
+  }
+  result.capacity = (size_t)requested;
+  result.storage = KU_BYTES_OWNED;
+  KuError error = (KuError){0};
+  for (;;) {
+    int waited = ku_net_socket_wait(client->socket_value, 0, deadline);
+    if (waited != 1) {
+      error = waited == 0
+        ? ku_net_error("read_timeout", "net read timed out")
+        : ku_net_error("transport_error", "net read readiness failed");
+      ku_net_poison(client); break;
+    }
+    int amount = ku_net_socket_recv(client->socket_value, result.ptr,
+        (size_t)requested);
+    if (amount > 0) { result.len = (size_t)amount; break; }
+    if (amount == 0) {
+      error = ku_net_error("end_of_stream", "net peer closed the stream");
+      ku_net_poison(client); break;
+    }
+    int socket_error = ku_net_socket_last_error();
+    if (ku_net_socket_error_interrupted(socket_error)
+        || ku_net_socket_error_would_block(socket_error)) continue;
+    error = ku_net_error("transport_error", "net read failed");
+    ku_net_poison(client); break;
+  }
+  if (ku_net_gate_release(&client->gate) != 0) {
+    ku_net_poison(client);
+    if (error.code.len == 0)
+      error = ku_net_error("sync_error", "net client synchronization failed");
+  }
+  if (error.code.len != 0) {
+    ku_drop_bytes(&result);
+    return (KuResult_bytes){ false, (KuBytes){0}, error };
+  }
+  return (KuResult_bytes){ true, result, (KuError){0} };
+}
+
+static uint8_t ku_net_close(KuNetClient* client) {
+  if (!client) return 0;
+  ku_net_poison(client);
+  ku_net_gate_destroy(&client->gate);
+  free(client);
+  return 0;
+}
+
+static KuNetClient* ku_move_net_client(KuNetClient** value) {
+  KuNetClient* moved = value ? *value : NULL;
+  if (value) *value = NULL;
+  return moved;
+}
+
+static KuNetClient* ku_clone_net_client(KuNetClient* value) {
+  (void)value;
+  fputs("net client handles cannot be cloned\n", stderr);
+  exit(1);
+}
+
+static void ku_drop_net_client(KuNetClient** value) {
+  if (!value || !*value) return;
+  ku_net_close(*value);
+  *value = NULL;
+}
+
+"#,
+    );
+}
+
 /// True when the program uses a `redis` connection handle (needs the RESP runtime).
 fn program_uses_redis(program: &IrProgram) -> bool {
     fn ty(t: &IrType) -> bool {
@@ -14644,6 +15578,51 @@ fn c_redis_intrinsic_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
     }
 }
 
+fn c_bytes_intrinsic_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
+    let arg = |i: usize| -> KuResult<&IrExpr> {
+        args.get(i)
+            .ok_or_else(|| unsupported(format!("bytes.{method} missing argument")))
+    };
+    match method {
+        "from_str" => Ok(format!("ku_bytes_from_str({})", c_expr(arg(0)?)?)),
+        "from_array" => Ok(format!("ku_bytes_from_array({})", c_expr(arg(0)?)?)),
+        "len" => Ok(format!("ku_bytes_len({})", c_expr(arg(0)?)?)),
+        "get" => Ok(format!(
+            "ku_bytes_get({}, {})",
+            c_expr(arg(0)?)?,
+            c_expr(arg(1)?)?
+        )),
+        "to_str" => Ok(format!("ku_bytes_to_str({})", c_expr(arg(0)?)?)),
+        other => Err(unsupported(format!(
+            "native C bytes.{other}() is not implemented"
+        ))),
+    }
+}
+
+fn c_net_intrinsic_expr(method: &str, args: &[IrExpr]) -> KuResult<String> {
+    let arg = |i: usize| -> KuResult<&IrExpr> {
+        args.get(i)
+            .ok_or_else(|| unsupported(format!("net.{method} missing argument")))
+    };
+    match method {
+        "client" => Ok(format!("ku_net_client({})", c_expr(arg(0)?)?)),
+        "read" => Ok(format!(
+            "ku_net_read({}, {})",
+            c_expr(arg(0)?)?,
+            c_expr(arg(1)?)?
+        )),
+        "write" => Ok(format!(
+            "ku_net_write({}, {})",
+            c_expr(arg(0)?)?,
+            c_expr(arg(1)?)?
+        )),
+        "close" => Ok(format!("ku_net_close({})", c_value_expr(arg(0)?)?)),
+        other => Err(unsupported(format!(
+            "native C net.{other}() is not implemented"
+        ))),
+    }
+}
+
 /// Lower a `string.<method>` intrinsic. The receiver and any string arguments are
 /// read as borrows (`c_expr`): the helpers only read them, so the caller's cleanup
 /// still owns and drops the originals. Byte/codepoint-exact to the interpreter's
@@ -15117,6 +16096,12 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
     if let Some(method) = name.strip_prefix("redis.") {
         return c_redis_intrinsic_expr(method, args);
     }
+    if let Some(method) = name.strip_prefix("bytes.") {
+        return c_bytes_intrinsic_expr(method, args);
+    }
+    if let Some(method) = name.strip_prefix("net.") {
+        return c_net_intrinsic_expr(method, args);
+    }
     if let Some(method) = name.strip_prefix("mysql.") {
         return c_mysql_intrinsic_expr(method, args);
     }
@@ -15404,6 +16389,7 @@ fn c_type_suffix(ty: &IrType) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_value" => Ok("kuvalue".to_string()),
         IrType::Named(name) if name == "__ku_time" => Ok("time".to_string()),
         IrType::Named(name) if name == "__ku_http_server" => Ok("http_server".to_string()),
+        IrType::Named(name) if name == "__ku_bytes" => Ok("bytes".to_string()),
         IrType::Named(name) if pg_native_suffix(name).is_some() => {
             Ok(pg_native_suffix(name).unwrap().to_string())
         }
@@ -15782,6 +16768,7 @@ fn pg_native_suffix(name: &str) -> Option<&'static str> {
         "__ku_pg_result" => Some("pg_result"),
         "__ku_pg_client" => Some("pg_client"),
         "__ku_redis_client" => Some("redis_client"),
+        "__ku_net_client" => Some("net_client"),
         "__ku_mysql_client" => Some("mysql_client"),
         "__ku_mysql_result" => Some("mysql_result"),
         _ => None,
@@ -15789,6 +16776,9 @@ fn pg_native_suffix(name: &str) -> Option<&'static str> {
 }
 
 fn c_named_suffix(name: &str) -> String {
+    if name == "__ku_bytes" {
+        return "bytes".to_string();
+    }
     if let Some(suffix) = pg_native_suffix(name) {
         return suffix.to_string();
     }

@@ -2345,6 +2345,8 @@ impl<'a> FunctionLowerer<'a> {
                 Some(IrType::Named(n)) if n == "__ku_object" => "object",
                 Some(IrType::Named(n)) if n == "__ku_value" => "kuvalue",
                 Some(IrType::Named(n)) if n == metadata::REDIS_CLIENT => "redis",
+                Some(IrType::Named(n)) if n == metadata::BYTES => "bytes",
+                Some(IrType::Named(n)) if n == metadata::NET_CLIENT => "net",
                 Some(IrType::Named(n))
                     if n == "__ku_pg_client" && matches!(name.as_str(), "query" | "close") =>
                 {
@@ -2371,6 +2373,10 @@ impl<'a> FunctionLowerer<'a> {
         };
         let signature = if module == "redis" {
             metadata::redis_client_method_signature(name)
+        } else if module == "bytes" {
+            metadata::bytes_method_signature(name)
+        } else if module == "net" {
+            metadata::net_client_method_signature(name)
         } else if module == "mysql" {
             let Some(IrType::Named(native)) = self.static_place_type(target) else {
                 return Ok(None);
@@ -2392,7 +2398,10 @@ impl<'a> FunctionLowerer<'a> {
         // client/result merely to freeze its pointer before an effectful argument
         // would duplicate ownership and reaches the backend's forbidden-clone
         // trap. The checker requires these receivers to be bound places.
-        let receiver = if matches!(module, "redis" | "mysql" | "pg_client" | "pg_result") {
+        let receiver = if matches!(
+            module,
+            "redis" | "net" | "mysql" | "pg_client" | "pg_result"
+        ) {
             receiver
         } else {
             self.snapshot_receiver_before_effects(receiver, remaining_effects != 0)?

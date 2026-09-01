@@ -2819,6 +2819,30 @@ impl Checker {
         ))))
     }
 
+    fn apply_net_client_constructor_signature(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<Type> {
+        expect_arg_count("net.client", args.len(), 1, span)?;
+        let config = &args[0];
+        let config_type = self.check_expr(config)?;
+        if !matches!(
+            config_type,
+            Type::Object(_) | Type::DynamicObject | Type::Unknown
+        ) {
+            return Err(type_error(
+                config.span,
+                &Type::Object(HashMap::new()),
+                &config_type,
+            ));
+        }
+        validate_net_client_config(&config_type, config.span)?;
+        Ok(Type::Result(Box::new(Type::Native(
+            metadata::NET_CLIENT.to_string(),
+        ))))
+    }
+
     fn apply_mysql_client_constructor_signature(
         &mut self,
         args: &[Expr],
@@ -2926,6 +2950,12 @@ impl Checker {
         if params != expected_params && !empty_literal {
             return Err(type_error(args[2].span, &expected_params, &params));
         }
+        self.reject_effectful_args_on_captured_native_receiver(
+            &args[0],
+            &client,
+            &args[1..],
+            span,
+        )?;
         Ok(Type::Result(Box::new(Type::Native(
             metadata::PG_RESULT.to_string(),
         ))))
@@ -3567,6 +3597,39 @@ impl Checker {
                 span,
             ));
         }
+        if matches!(&target_type, Type::Native(native) if native == metadata::NET_CLIENT)
+            && !matches!(self.classify_place(target), PlaceClass::Movable(_))
+        {
+            return Err(KuError::runtime(
+                "net client method receivers must be assigned to a binding before use",
+                span,
+            ));
+        }
+        if matches!(&target_type, Type::Native(native) if native == metadata::BYTES)
+            && !matches!(self.classify_place(target), PlaceClass::Movable(_))
+        {
+            return Err(KuError::runtime(
+                "bytes method receivers must be assigned to a binding before use",
+                span,
+            ));
+        }
+        self.reject_effectful_args_on_captured_native_receiver(target, &target_type, args, span)?;
+        if let Type::Array(element) = &target_type {
+            // These APIs return a fresh element/array or pass an element by value,
+            // so native lowering must clone the element. Move-only handles have no
+            // valid clone operation; reject the source instead of reaching the
+            // backend's defensive forbidden-clone trap.
+            if matches!(
+                name.as_str(),
+                "first" | "last" | "try_get" | "push" | "concat"
+            ) && self.type_contains_native_resource(element)
+            {
+                return Err(KuError::runtime(
+                    format!("array.{name} cannot clone move-only native resource elements"),
+                    span,
+                ));
+            }
+        }
         if matches!(&target_type, Type::Native(native) if native == metadata::REDIS_CLIENT) {
             let Some(signature) = metadata::redis_client_method_signature(name) else {
                 return Ok(None);
@@ -3579,6 +3642,28 @@ impl Checker {
                 .map(Some);
         }
         if let Type::Native(native) = &target_type {
+            if native == metadata::BYTES {
+                let Some(signature) = metadata::bytes_method_signature(name) else {
+                    return Ok(None);
+                };
+                let mut method_args = Vec::with_capacity(args.len() + 1);
+                method_args.push((**target).clone());
+                method_args.extend(args.iter().cloned());
+                return self
+                    .apply_stdlib_signature(&signature, &method_args, span)
+                    .map(Some);
+            }
+            if native == metadata::NET_CLIENT {
+                let Some(signature) = metadata::net_client_method_signature(name) else {
+                    return Ok(None);
+                };
+                let mut method_args = Vec::with_capacity(args.len() + 1);
+                method_args.push((**target).clone());
+                method_args.extend(args.iter().cloned());
+                return self
+                    .apply_stdlib_signature(&signature, &method_args, span)
+                    .map(Some);
+            }
             if native == metadata::MYSQL_CLIENT || native == metadata::MYSQL_RESULT {
                 let Some(signature) = metadata::mysql_method_signature(native, name) else {
                     return Ok(None);
@@ -3677,6 +3762,9 @@ impl Checker {
         if signature.name == "redis.client" {
             return self.apply_redis_client_constructor_signature(args, span);
         }
+        if signature.name == "net.client" {
+            return self.apply_net_client_constructor_signature(args, span);
+        }
         if signature.name == "mysql.client" {
             return self.apply_mysql_client_constructor_signature(args, span);
         }
@@ -3713,6 +3801,14 @@ impl Checker {
                 }
             })
             .collect::<KuResult<Vec<_>>>()?;
+        if let Some(receiver_type) = actuals.first() {
+            self.reject_effectful_args_on_captured_native_receiver(
+                &args[0],
+                receiver_type,
+                &args[1..],
+                span,
+            )?;
+        }
         for (index, rule) in signature.args.iter().enumerate() {
             self.check_stdlib_arg(rule, index, args, &actuals)?;
         }
@@ -4026,6 +4122,12 @@ impl Checker {
                 target.span,
             ));
         };
+        if self.type_contains_native_resource(&element) {
+            return Err(KuError::runtime(
+                "array.map cannot clone move-only native resource elements",
+                span,
+            ));
+        }
         // The mapper is called with one element, so an unannotated closure
         // parameter is filled from the array's element type (the HOF context).
         let expected_mapper = Type::FunctionValue {
@@ -4066,6 +4168,45 @@ impl Checker {
             span,
         )?;
         Ok(Some(Type::Array(Box::new(mapped))))
+    }
+
+    /// A captured binding is backed by a shared cell. Evaluating a callback
+    /// argument can replace that cell after the receiver expression has been
+    /// selected but before the native call executes. Copying the raw owning
+    /// pointer is not a snapshot, and cloning it would duplicate ownership, so
+    /// conservatively reject effectful arguments on captured move-only native
+    /// receivers. Pure literals/paths remain valid.
+    fn reject_effectful_args_on_captured_native_receiver(
+        &self,
+        target: &Expr,
+        target_type: &Type,
+        args: &[Expr],
+        span: Span,
+    ) -> KuResult<()> {
+        if !matches!(target_type, Type::Native(name) if name != metadata::BYTES)
+            || !args.iter().any(|arg| !is_pure_append_argument(arg, ""))
+        {
+            return Ok(());
+        }
+        let PlaceClass::Movable(place) = self.classify_place(target) else {
+            return Ok(());
+        };
+        let captured = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&place.root))
+            .is_some_and(|binding| binding.captured);
+        if !captured {
+            return Ok(());
+        }
+        Err(KuError::runtime(
+            format!(
+                "cannot call a move-only native receiver rooted at '{}' with an effectful argument after that binding was captured; evaluate the argument into a local first",
+                place.root
+            ),
+            span,
+        ))
     }
 
     fn check_function_value_call(
@@ -6547,7 +6688,10 @@ impl Checker {
         visiting_enums: &mut HashSet<String>,
     ) -> bool {
         match ty {
-            Type::Native(_) => true,
+            // `bytes` is an ordinary cloneable owned value. Other native types
+            // carry external resource identity and remain move-only, including
+            // when nested inside arrays/results/user aggregates.
+            Type::Native(name) => name != metadata::BYTES,
             Type::Array(inner) | Type::Result(inner) | Type::Task(inner) => {
                 self.type_contains_native_resource_inner(inner, visiting_structs, visiting_enums)
             }
@@ -7057,7 +7201,7 @@ fn stdlib_consuming_args(name: &str) -> &'static [usize] {
         "json.stringify" => &[0],
         "kuvalue.as_int" | "kuvalue.as_str" => &[0],
         // Closing consumes (and frees) the client; receiver reads borrow their handle.
-        "pg_client.close" | "redis.close" | "mysql.close" => &[0],
+        "pg_client.close" | "redis.close" | "mysql.close" | "net.close" => &[0],
         _ => &[],
     }
 }
@@ -7200,9 +7344,12 @@ fn function_body_uses_name(body: &[Stmt], name: &str) -> bool {
 
 fn stmt_uses_name(stmt: &Stmt, name: &str, shadowed: bool) -> bool {
     match stmt {
-        Stmt::VarDecl { value, .. } | Stmt::Assign { value, .. } => {
-            expr_uses_name(value, name, shadowed)
-        }
+        Stmt::VarDecl { value, .. } => expr_uses_name(value, name, shadowed),
+        Stmt::Assign {
+            name: assigned,
+            value,
+            ..
+        } => (!shadowed && assigned == name) || expr_uses_name(value, name, shadowed),
         Stmt::AssignTarget { target, value, .. } | Stmt::CompoundAssign { target, value, .. } => {
             assign_target_uses_name(target, name, shadowed) || expr_uses_name(value, name, shadowed)
         }
@@ -8623,6 +8770,70 @@ fn validate_redis_client_config(config_type: &Type, span: Span) -> KuResult<()> 
             "redis.client config field 'username' requires 'password'",
             span,
         ));
+    }
+    Ok(())
+}
+
+const NET_CLIENT_CONFIG_FIELDS: [&str; 6] = [
+    "host",
+    "port",
+    "connect_timeout_ms",
+    "read_timeout_ms",
+    "write_timeout_ms",
+    "max_read_bytes",
+];
+
+fn validate_net_client_config(config_type: &Type, span: Span) -> KuResult<()> {
+    let Type::Object(fields) = config_type else {
+        // Dynamic configuration is validated again by the native constructor.
+        return Ok(());
+    };
+    let mut unknown = fields
+        .keys()
+        .filter(|key| !NET_CLIENT_CONFIG_FIELDS.contains(&key.as_str()))
+        .collect::<Vec<_>>();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(KuError::runtime(
+            format!("unknown net client config field '{key}'"),
+            span,
+        ));
+    }
+    let Some(host) = fields.get("host") else {
+        return Err(KuError::runtime(
+            "net.client config requires string field 'host'",
+            span,
+        ));
+    };
+    if *host != Type::String {
+        return Err(type_error(span, &Type::String, host));
+    }
+    let Some(port) = fields.get("port") else {
+        return Err(KuError::runtime(
+            "net.client config requires int field 'port'",
+            span,
+        ));
+    };
+    if *port != Type::Int {
+        return Err(KuError::runtime(
+            "net.client config field 'port' must be int",
+            span,
+        ));
+    }
+    for name in [
+        "connect_timeout_ms",
+        "read_timeout_ms",
+        "write_timeout_ms",
+        "max_read_bytes",
+    ] {
+        if let Some(actual) = fields.get(name) {
+            if *actual != Type::Int {
+                return Err(KuError::runtime(
+                    format!("net.client config field '{name}' must be int"),
+                    span,
+                ));
+            }
+        }
     }
     Ok(())
 }
