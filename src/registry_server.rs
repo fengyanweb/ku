@@ -58,6 +58,7 @@ const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_LINE_BYTES: usize = 2 * 1024;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_REQUESTS_PER_CONNECTION: usize = 8;
+const REGISTRY_TLS_INPUT_BUFFER_BYTES: usize = 8 * 1024;
 const MAX_BUFFERED_REJECT_BODY_BYTES: usize = 8 * 1024;
 const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SECRET_FILE_BYTES: u64 = 16 * 1024;
@@ -716,7 +717,7 @@ fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant
     };
     let stream = DeadlineTcpStream::new(stream, deadline);
     let tls = StreamOwned::new(connection, stream);
-    let mut reader = BufReader::with_capacity(8 * 1024, tls);
+    let mut reader = BufReader::with_capacity(REGISTRY_TLS_INPUT_BUFFER_BYTES, tls);
     for request_number in 1..=MAX_REQUESTS_PER_CONNECTION {
         if Instant::now() >= deadline {
             break;
@@ -4944,24 +4945,131 @@ mod tests {
         artifact: &PackageArtifact,
         body: &[u8],
     ) {
-        let mut request = format!(
-            "PUT /v1/packages/{}/{} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: {PACKAGE_CONTENT_TYPE}\r\nContent-Length: {}\r\nX-Ku-Checksum: {}\r\nIdempotency-Key: {}-{}-{}\r\nConnection: close\r\n\r\n",
-            artifact.name,
-            artifact.version,
-            artifact.size,
-            artifact.checksum,
-            artifact.name,
-            artifact.version,
-            artifact.checksum,
-        )
-        .into_bytes();
-        request.extend_from_slice(body);
+        write_test_publish_with_checksum(writer, token, artifact, &artifact.checksum, body);
+    }
+
+    fn write_test_publish_with_checksum(
+        writer: &mut impl Write,
+        token: &str,
+        artifact: &PackageArtifact,
+        checksum: &str,
+        body: &[u8],
+    ) {
+        let request = test_publish_request(token, artifact, checksum, body);
         // One TLS write makes the small rejected-body regression deterministic:
         // the request head and complete body can share the server's input buffer.
         writer
             .write_all(&request)
             .expect("write test publish request");
         writer.flush().expect("flush test publish request");
+    }
+
+    fn test_publish_request(
+        token: &str,
+        artifact: &PackageArtifact,
+        checksum: &str,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut request = format!(
+            "PUT /v1/packages/{}/{} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: {PACKAGE_CONTENT_TYPE}\r\nContent-Length: {}\r\nX-Ku-Checksum: {}\r\nIdempotency-Key: {}-{}-{}\r\nConnection: close\r\n\r\n",
+            artifact.name,
+            artifact.version,
+            artifact.size,
+            checksum,
+            artifact.name,
+            artifact.version,
+            checksum,
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        request
+    }
+
+    fn read_closed_test_status(
+        reader: &mut BufReader<StreamOwned<ClientConnection, TcpStream>>,
+    ) -> u16 {
+        let (status, headers, _) =
+            read_test_http_response(reader).expect("read closed registry test response");
+        assert_eq!(headers.get("connection").map(String::as_str), Some("close"));
+        assert!(
+            reader
+                .fill_buf()
+                .expect("read registry TLS close notification")
+                .is_empty(),
+            "Connection: close must end the registry TLS stream cleanly"
+        );
+        status
+    }
+
+    fn put_buffered_artifact(
+        base_url: &str,
+        certificate: rustls::pki_types::CertificateDer<'static>,
+        token: &str,
+        artifact: &PackageArtifact,
+        checksum: &str,
+    ) -> u16 {
+        let body = fs::read(&artifact.path).expect("read buffered test package artifact");
+        assert_eq!(
+            u64::try_from(body.len()).expect("test package length fits u64"),
+            artifact.size
+        );
+        assert!(
+            body.len() <= MAX_BUFFERED_REJECT_BODY_BYTES,
+            "buffered rejection fixture exceeds the server's bounded discard limit"
+        );
+        let request = test_publish_request(token, artifact, checksum, &body);
+        assert!(
+            request.len() <= REGISTRY_TLS_INPUT_BUFFER_BYTES,
+            "buffered rejection fixture exceeds the server TLS input buffer"
+        );
+        let mut reader = connect_test_tls(base_url, certificate);
+        reader
+            .get_mut()
+            .write_all(&request)
+            .expect("write buffered test publish request");
+        reader
+            .get_mut()
+            .flush()
+            .expect("flush buffered test publish request");
+        read_closed_test_status(&mut reader)
+    }
+
+    fn put_buffered_yank(
+        base_url: &str,
+        certificate: rustls::pki_types::CertificateDer<'static>,
+        token: &str,
+        name: &str,
+        version: &str,
+        idempotency_key: Option<&str>,
+        body: &[u8],
+    ) -> u16 {
+        assert!(
+            body.len() <= MAX_BUFFERED_REJECT_BODY_BYTES,
+            "buffered yank fixture exceeds the server's bounded discard limit"
+        );
+        let idempotency_header = idempotency_key
+            .map(|key| format!("Idempotency-Key: {key}\r\n"))
+            .unwrap_or_default();
+        let mut request = format!(
+            "PUT /v1/packages/{name}/{version}/yank HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n{idempotency_header}Connection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        assert!(
+            request.len() <= REGISTRY_TLS_INPUT_BUFFER_BYTES,
+            "buffered yank fixture exceeds the server TLS input buffer"
+        );
+        let mut reader = connect_test_tls(base_url, certificate);
+        reader
+            .get_mut()
+            .write_all(&request)
+            .expect("write buffered test yank request");
+        reader
+            .get_mut()
+            .flush()
+            .expect("flush buffered test yank request");
+        read_closed_test_status(&mut reader)
     }
 
     fn wait_for_mutation_names(server: &TestServer, names: &[&str]) {
@@ -5420,6 +5528,7 @@ mod tests {
             &[("token-math", "math"), ("token-race", "race")],
             Duration::from_secs(5),
         );
+        let certificate = files.certificate.clone();
         let mut server = TestServer::start(files.config.clone(), files.certificate.clone());
         assert_eq!(
             response_status(
@@ -5451,9 +5560,9 @@ mod tests {
             "fn Value(): int { return 11 }\n",
         );
         assert_eq!(
-            put_artifact(
-                &server.agent,
+            put_buffered_artifact(
                 &server.base_url,
+                certificate.clone(),
                 "wrong-token",
                 &artifact,
                 &artifact.checksum,
@@ -5461,9 +5570,9 @@ mod tests {
             401
         );
         assert_eq!(
-            put_artifact(
-                &server.agent,
+            put_buffered_artifact(
                 &server.base_url,
+                certificate.clone(),
                 "token-math",
                 &PackageArtifact {
                     name: "other".to_string(),
@@ -5475,9 +5584,9 @@ mod tests {
         );
         let bad_checksum = format!("sha256-{}", "00".repeat(32));
         assert_eq!(
-            put_artifact(
-                &server.agent,
+            put_buffered_artifact(
                 &server.base_url,
+                certificate.clone(),
                 "token-math",
                 &artifact,
                 &bad_checksum,
@@ -5595,9 +5704,9 @@ mod tests {
             .expect("changed math exists");
         let changed_artifact = pack_package(&changed_math).expect("pack changed math");
         assert_eq!(
-            put_artifact(
-                &server.agent,
+            put_buffered_artifact(
                 &server.base_url,
+                certificate.clone(),
                 "token-math",
                 &changed_artifact,
                 &changed_artifact.checksum,
@@ -5629,13 +5738,13 @@ mod tests {
         let mut publishers = Vec::new();
         for artifact in artifacts {
             let barrier = Arc::clone(&barrier);
-            let agent = server.agent.clone();
             let base_url = server.base_url.clone();
+            let certificate = certificate.clone();
             publishers.push(thread::spawn(move || {
                 barrier.wait();
-                let status = put_artifact(
-                    &agent,
+                let status = put_buffered_artifact(
                     &base_url,
+                    certificate,
                     "token-race",
                     &artifact,
                     &artifact.checksum,
@@ -5654,9 +5763,9 @@ mod tests {
             .into_iter()
             .map(|(artifact, status)| {
                 if status == 429 {
-                    put_artifact(
-                        &server.agent,
+                    put_buffered_artifact(
                         &server.base_url,
+                        certificate.clone(),
                         "token-race",
                         &artifact,
                         &artifact.checksum,
@@ -6241,6 +6350,7 @@ mod tests {
     fn registry_yank_is_monotonic_and_preserves_locked_artifacts() {
         let root = TestRoot::new("yank-e2e");
         let files = test_server_files(&root.0, &[("token-math", "math")], Duration::from_secs(5));
+        let certificate = files.certificate.clone();
         let mut server = TestServer::start(files.config, files.certificate);
         let math = write_test_package(
             &root.0.join("math-1"),
@@ -6314,9 +6424,9 @@ mod tests {
             400
         );
         assert_eq!(
-            put_yank(
-                &server.agent,
+            put_buffered_yank(
                 &server.base_url,
+                certificate.clone(),
                 "token-math",
                 "math",
                 "1.1.0",
@@ -6405,9 +6515,9 @@ mod tests {
         }
 
         assert_eq!(
-            put_artifact(
-                &server.agent,
+            put_buffered_artifact(
                 &server.base_url,
+                certificate,
                 "token-math",
                 &next_artifact,
                 &next_artifact.checksum,

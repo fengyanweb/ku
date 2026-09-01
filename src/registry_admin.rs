@@ -2429,6 +2429,7 @@ mod tests {
 
     const CRASH_FIXTURE_MODE: &str = "KU_TEST_REGISTRY_ADMIN_CRASH_STAGE";
     const CRASH_FIXTURE_PATH: &str = "KU_TEST_REGISTRY_ADMIN_CRASH_PATH";
+    const CRASH_FIXTURE_EXIT_CODE: i32 = 86;
 
     #[test]
     fn atomic_crash_fixture_child() {
@@ -2440,13 +2441,16 @@ mod tests {
         let new_hash: [u8; 32] = Sha256::digest(b"crash-new").into();
         let replacement = format!("sha256-{} math\n", encode_hex(&new_hash));
         write_credentials_atomically_with_hook(&path, replacement.as_bytes(), |point| {
-            let should_abort = matches!(
+            let should_exit = matches!(
                 (mode.as_str(), point),
                 ("before", AtomicWriteCheckpoint::BeforeReplace)
                     | ("after", AtomicWriteCheckpoint::AfterReplace)
             );
-            if should_abort {
-                std::process::abort();
+            if should_exit {
+                // This boundary needs a real process stop without Rust stack
+                // unwinding. A non-zero exit preserves that property while
+                // avoiding OS crash-reporting/debugger latency from abort().
+                std::process::exit(CRASH_FIXTURE_EXIT_CODE);
             }
             Ok(())
         })
@@ -2517,7 +2521,11 @@ mod tests {
                 }
             }
         };
-        assert!(!status.success(), "crash fixture must terminate abnormally");
+        assert_eq!(
+            status.code(),
+            Some(CRASH_FIXTURE_EXIT_CODE),
+            "crash fixture must reach the selected non-unwinding exit"
+        );
     }
 
     #[test]

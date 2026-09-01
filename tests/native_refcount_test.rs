@@ -10,15 +10,21 @@ pub mod bounded_process;
 
 use std::env;
 use std::fs;
+#[cfg(windows)]
 use std::io::{Read, Write};
+#[cfg(windows)]
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+#[cfg(windows)]
+use std::process::{Child, Stdio};
 #[cfg(windows)]
 use std::sync::{Arc, Barrier};
 #[cfg(windows)]
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bounded_process::{run_bounded, OutputLimits};
 
