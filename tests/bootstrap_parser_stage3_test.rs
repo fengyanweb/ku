@@ -328,6 +328,25 @@ fn diagnostic_for_kind(source: &str, kind: TokenKind, message: &str) -> String {
     )
 }
 
+fn rust_error_canonical(source: &str) -> String {
+    let tokens = Lexer::new(source)
+        .lex()
+        .expect("Rust diagnostic fixture lex");
+    let error = Parser::new(tokens)
+        .parse_program()
+        .expect_err("Rust diagnostic fixture must fail");
+    format!(
+        "{}|{}:{}@{}..{}:{}@{}",
+        escape_canonical(&error.message),
+        error.span.start.line,
+        error.span.start.column,
+        error.span.start.offset,
+        error.span.end.line,
+        error.span.end.column,
+        error.span.end.offset
+    )
+}
+
 fn ku_binary() -> PathBuf {
     if let Ok(path) = std::env::var("KU_BIN") {
         let candidate = PathBuf::from(path);
@@ -387,6 +406,9 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         ")".repeat(32)
     );
     let broken_expression = "fn main(){ value = 1 + ; }";
+    let empty_rhs_expression = "fn main(){ value = ; }";
+    let unicode_broken_expression =
+        "// 前😀\r\nfn main() {\r\n  text:str = \"中😀\"\r\n  value = 1 + ;\r\n}";
     let large_program = format!("fn main(){{{}}}", "x;".repeat(128));
     let over_statement_limit = format!("fn main(){{{}}}", "x;".repeat(129));
     let function_boundary = "fn f(){}".repeat(64);
@@ -491,22 +513,12 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         + 1;
     let deep_message = diagnostic_at(
         &deep_expression,
-        deep_origin,
-        "stage-2 expression parser rejected statement: depth_exceeded",
+        deep_origin + 31,
+        "maximum parse depth exceeded; expression is too deeply nested",
     );
-    let broken_tokens = Lexer::new(broken_expression)
-        .lex()
-        .expect("broken expression fixture lex");
-    let broken_origin = broken_tokens
-        .iter()
-        .position(|token| token.kind == TokenKind::Equal)
-        .expect("broken assignment")
-        + 1;
-    let broken_message = diagnostic_at(
-        broken_expression,
-        broken_origin,
-        "stage-2 expression parser rejected statement: unexpected_eof",
-    );
+    let broken_message = rust_error_canonical(broken_expression);
+    let empty_rhs_message = rust_error_canonical(empty_rhs_expression);
+    let unicode_broken_message = rust_error_canonical(unicode_broken_expression);
     let statement_tokens = Lexer::new(&over_statement_limit)
         .lex()
         .expect("statement limit fixture lex");
@@ -546,8 +558,14 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         ),
         (top_level_expression, "expected_item", top_level_message),
         (unsupported_type, "unsupported_type", type_message),
-        (&deep_expression, "invalid_expression", deep_message),
-        (broken_expression, "invalid_expression", broken_message),
+        (&deep_expression, "depth_exceeded", deep_message),
+        (broken_expression, "unexpected_eof", broken_message),
+        (empty_rhs_expression, "unexpected_eof", empty_rhs_message),
+        (
+            unicode_broken_expression,
+            "unexpected_eof",
+            unicode_broken_message,
+        ),
         (&over_statement_limit, "statement_limit", statement_message),
         (&over_function_limit, "function_limit", function_message),
         (&over_token_limit, "invalid_token_stream", token_message),
@@ -582,7 +600,13 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         )
         .expect("copy stage-1 parser dependency");
     }
-    for name in ["span.ku", "diagnostic.ku", "ast.ku", "parser.ku"] {
+    for name in [
+        "span.ku",
+        "diagnostic.ku",
+        "ast.ku",
+        "context.ku",
+        "parser.ku",
+    ] {
         fs::copy(
             repository_bootstrap.join("stage2").join(name),
             stage2.join(name),

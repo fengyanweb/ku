@@ -253,14 +253,18 @@ fn bootstrap_parser_stage2_matches_rust_and_has_stable_diagnostics() {
     ];
     cases.push(format!("{}1{}", "(".repeat(30), ")".repeat(30)));
     let long_flat = (0..256).map(|_| "1").collect::<Vec<_>>().join(" + ");
-    let mut body =
-        "import { Parse } from \"./parser.ku\"\nimport { AstCanonical } from \"./ast.ku\"\n\n"
-            .to_string();
+    let mut body = "import { Parse, ParseWithContext } from \"./parser.ku\"\nimport { ParseContext } from \"./context.ku\"\nimport { AstCanonical } from \"./ast.ku\"\nimport { Span } from \"./span.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(Parse(source.clone())?)\n    if (actual != expected) { panic(\"stage-2 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
     body.push_str(
-        "fn ExpectError(source: str, expected_code: str, expected_message: str): null! {\n    caught = false\n    try { Parse(source)? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected parser error\") }\n    return ok(null)\n}\n\nfn main(): null! {\n",
+        "fn ExpectError(source: str, expected_code: str, expected_message: str): null! {\n    caught = false\n    try { Parse(source)? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected parser error\") }\n    return ok(null)\n}\n\nfn ExpectContextError(source: str, origin: Span, boundary: Span, has_boundary: bool): null! {\n    caught = false\n    try { ParseWithContext(source, ParseContext { origin: origin, boundary: boundary, has_boundary: has_boundary })? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser\" || err.code != \"invalid_parse_context\") { panic(\"wrong context diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected invalid parse context\") }\n    return ok(null)\n}\n\nfn main(): null! {\n",
+    );
+    body.push_str(
+        "    context_origin = Span { line: 7, column: 5, offset: 40, end_line: 7, end_column: 5, end_offset: 40 }\n    context_boundary = Span { line: 7, column: 12, offset: 47, end_line: 7, end_column: 13, end_offset: 48 }\n    context_caught = false\n    try { ParseWithContext(\"1 +\", ParseContext { origin: context_origin.clone(), boundary: context_boundary, has_boundary: true })? } catch(err) {\n        context_caught = true\n        if (err.domain != \"bootstrap.parser\" || err.code != \"unexpected_eof\" || err.message != \"expected expression|7:12@47..7:13@48\") { panic(\"wrong relocated diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!context_caught) { panic(\"expected relocated parser error\") }\n",
+    );
+    body.push_str(
+        "    point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }\n    max_line = Span { line: 9223372036854775807, column: 1, offset: 0, end_line: 9223372036854775807, end_column: 1, end_offset: 0 }\n    max_column = Span { line: 1, column: 9223372036854775807, offset: 0, end_line: 1, end_column: 9223372036854775807, end_offset: 0 }\n    max_offset = Span { line: 1, column: 1, offset: 9223372036854775807, end_line: 1, end_column: 1, end_offset: 9223372036854775807 }\n    ExpectContextError(\"1\", max_line, point.clone(), false)?\n    ExpectContextError(\"1\", max_column, point.clone(), false)?\n    ExpectContextError(\"1\", max_offset, point.clone(), false)?\n    overlap = Span { line: 7, column: 7, offset: 42, end_line: 7, end_column: 8, end_offset: 43 }\n    ExpectContextError(\"1 +\", context_origin.clone(), overlap, true)?\n    malformed_end = Span { line: 7, column: 12, offset: 47, end_line: 0, end_column: 0, end_offset: 48 }\n    ExpectContextError(\"1 +\", context_origin.clone(), malformed_end, true)?\n    no_boundary_caught = false\n    try { ParseWithContext(\"1 +\", ParseContext { origin: context_origin.clone(), boundary: point.clone(), has_boundary: false })? } catch(err) {\n        no_boundary_caught = true\n        if (err.code != \"unexpected_eof\" || err.message != \"expected expression|7:8@43..7:8@43\") { panic(\"wrong mathematical EOF relocation: \" + err.code + \"/\" + err.message) }\n    }\n    if (!no_boundary_caught) { panic(\"expected mathematical EOF diagnostic\") }\n    exact_boundary = Span { line: 7, column: 8, offset: 43, end_line: 7, end_column: 8, end_offset: 43 }\n    exact_boundary_caught = false\n    try { ParseWithContext(\"1 +\", ParseContext { origin: context_origin.clone(), boundary: exact_boundary, has_boundary: true })? } catch(err) {\n        exact_boundary_caught = true\n        if (err.code != \"unexpected_eof\" || err.message != \"expected expression|7:8@43..7:8@43\") { panic(\"wrong exact boundary relocation: \" + err.code + \"/\" + err.message) }\n    }\n    if (!exact_boundary_caught) { panic(\"expected exact boundary diagnostic\") }\n",
     );
     for source in &cases {
         body.push_str(&format!(
@@ -296,7 +300,13 @@ fn bootstrap_parser_stage2_matches_rust_and_has_stable_diagnostics() {
         )
         .expect("copy stage-1 parser dependency");
     }
-    for name in ["span.ku", "diagnostic.ku", "ast.ku", "parser.ku"] {
+    for name in [
+        "span.ku",
+        "diagnostic.ku",
+        "ast.ku",
+        "context.ku",
+        "parser.ku",
+    ] {
         fs::copy(
             repository_bootstrap.join("stage2").join(name),
             stage2.join(name),
