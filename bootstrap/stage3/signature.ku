@@ -1,0 +1,46 @@
+import { Token } from "../stage1/token.ku"
+import { Span } from "../stage2/span.ku"
+import { RejectAt } from "./support.ku"
+
+struct SignatureType {
+    text: str
+    span: Span
+    consumed: int
+}
+
+fn ReadSignatureType(token: Token, next: Token, has_next: bool): SignatureType! {
+    type_text = ""
+    if (token.kind == "Ident" && (token.lexeme == "int" || token.lexeme == "float" || token.lexeme == "bool" || token.lexeme == "str")) {
+        type_text = token.lexeme.clone()
+    } else if (token.kind == "Null") {
+        type_text = "null"
+    } else if (token.kind == "Ident" && (token.lexeme == "string" || token.lexeme == "nil")) {
+        RejectAt(token.clone(), "unexpected_token", "expected type name")?
+    } else if (token.kind == "Ident" || token.kind == "LBracket" || token.kind == "Fn" || token.kind == "Async") {
+        RejectAt(token.clone(), "unsupported_type", "stage-3 function signatures accept only int, float, bool, str, null, or their Result forms")?
+    } else {
+        RejectAt(token.clone(), "unexpected_token", "expected type name")?
+    }
+    if (!has_next) {
+        RejectAt(token.clone(), "invalid_token_stream", "function signature type is missing final EOF")?
+    }
+    end = token.clone()
+    consumed = 1
+    if (next.kind == "Bang") {
+        type_text = type_text + "!"
+        end = next
+        consumed = 2
+    }
+    return ok(SignatureType {
+        text: type_text,
+        span: Span {
+            line: token.line,
+            column: token.column,
+            offset: token.offset,
+            end_line: end.end_line,
+            end_column: end.end_column,
+            end_offset: end.end_offset
+        },
+        consumed: consumed
+    })
+}

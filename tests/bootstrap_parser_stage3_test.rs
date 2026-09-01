@@ -8,7 +8,10 @@
 pub mod bounded_process;
 
 use bounded_process::{run_bounded, OutputLimits};
-use ku::ast::{BinaryOp, Expr, ExprKind, FnDecl, Item, Literal, Stmt, TypeName, UnaryOp};
+use ku::ast::{
+    BinaryOp, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item, Literal, Stmt, TypeName,
+    UnaryOp,
+};
 use ku::lexer::Lexer;
 use ku::parser::Parser;
 use ku::span::Span;
@@ -245,6 +248,88 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
     }
 }
 
+fn project_import(source: &str, import: &ImportDecl, arena: &mut ProjectedArena) -> usize {
+    let tokens = Lexer::new(source).lex().expect("import projection lex");
+    let mut cursor = tokens
+        .iter()
+        .position(|token| {
+            matches!(token.kind, TokenKind::Import)
+                && token.span.start.offset == import.span.start.offset
+        })
+        .expect("import start token");
+    cursor += 1;
+    let mut children = Vec::new();
+    match &import.kind {
+        ImportKind::Glob => {}
+        ImportKind::Namespace(namespace) => {
+            assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+            children.push(push_node(
+                arena,
+                "ImportNamespace",
+                namespace.clone(),
+                0,
+                tokens[cursor].span,
+                &[],
+            ));
+            cursor += 1;
+            assert!(matches!(tokens[cursor].kind, TokenKind::From));
+            cursor += 1;
+        }
+        ImportKind::Named(names) => {
+            assert!(matches!(tokens[cursor].kind, TokenKind::LBrace));
+            cursor += 1;
+            for name in names {
+                assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+                cursor += 1;
+                let name_children = if let Some(alias) = &name.alias {
+                    assert!(matches!(
+                        &tokens[cursor].kind,
+                        TokenKind::Ident(marker) if marker == "as"
+                    ));
+                    cursor += 1;
+                    assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+                    let child = push_node(
+                        arena,
+                        "ImportAlias",
+                        alias.clone(),
+                        0,
+                        tokens[cursor].span,
+                        &[],
+                    );
+                    cursor += 1;
+                    vec![child]
+                } else {
+                    Vec::new()
+                };
+                children.push(push_node(
+                    arena,
+                    "ImportName",
+                    name.source.clone(),
+                    0,
+                    name.span,
+                    &name_children,
+                ));
+                if matches!(tokens[cursor].kind, TokenKind::Comma) {
+                    cursor += 1;
+                }
+            }
+            assert!(matches!(tokens[cursor].kind, TokenKind::RBrace));
+            cursor += 1;
+            assert!(matches!(tokens[cursor].kind, TokenKind::From));
+            cursor += 1;
+        }
+    }
+    assert!(matches!(&tokens[cursor].kind, TokenKind::String(path) if path == &import.path));
+    push_node(
+        arena,
+        "Import",
+        import.path.clone(),
+        0,
+        import.span,
+        &children,
+    )
+}
+
 fn project_function(source: &str, function: &FnDecl, arena: &mut ProjectedArena) -> usize {
     assert!(!function.is_async, "stage-3 fixture must be synchronous");
     assert!(function.type_params.is_empty());
@@ -317,15 +402,16 @@ fn rust_canonical(source: &str) -> String {
         .parse_program()
         .expect("Rust oracle parse");
     let mut arena = ProjectedArena::default();
-    let functions = program
+    let items = program
         .items
         .iter()
         .map(|item| match item {
+            Item::Import(import) => project_import(source, import, &mut arena),
             Item::Function(function) => project_function(source, function, &mut arena),
             other => panic!("stage-3 oracle received unsupported item: {other:?}"),
         })
         .collect::<Vec<_>>();
-    let program_span = match (functions.first(), functions.last()) {
+    let program_span = match (items.first(), items.last()) {
         (Some(first), Some(last)) => Span::new(
             arena.nodes[*first - 1].span.start,
             arena.nodes[*last - 1].span.end,
@@ -338,7 +424,7 @@ fn rust_canonical(source: &str) -> String {
         String::new(),
         0,
         program_span,
-        &functions,
+        &items,
     );
     let mut output = format!("ROOT|{root}");
     for (index, node) in arena.nodes.iter().enumerate() {
@@ -454,6 +540,8 @@ fn run_ku(arguments: &[&str]) {
 fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let cases = [
         "",
+        "import \"./setup.ku\";\nfn before() {}\nimport math from \"./math.ku\"\nimport { Add, User as Person } from \"./api.ku\"\nfn main() { return Add(1, 2) }",
+        "// 导入😀\r\nimport { Add as Plus } from \"./中😀.ku\"\r\nimport \"./tab\\tname.ku\"\r\nfn main() {}",
         "fn main() {}",
         "fn typed(): int { return 1 }",
         "fn add(left: int, right: int): int { return left + right }\nfn echo(value): str { return \"ok\" }",
@@ -491,6 +579,24 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let unicode_broken_signature = "// 前😀\r\nfn f(value: str, : int): null! {}";
     let unsupported_signature_type = "fn f(values: [int]) {}";
     let unsupported_union_type = "fn f(value: int | str) {}";
+    let empty_named_import = "import {} from \"./math.ku\"";
+    let trailing_import_comma = "import { Add, } from \"./math.ku\"";
+    let missing_import_alias = "import { Add as } from \"./math.ku\"";
+    let missing_named_from = "import { Add } \"./math.ku\"";
+    let missing_namespace_from = "import math \"./math.ku\"";
+    let legacy_import_from = "import from \"./math.ku\"";
+    let invalid_import_namespace = "import 1";
+    let invalid_import_path = "import math from 1";
+    let missing_import_path = "import math from";
+    let missing_import_target = "import";
+    let missing_import_alias_at_eof = "import { Add as";
+    let unicode_broken_import = "// 前😀\r\nimport { Add as } from \"./中.ku\"";
+    let early_import_name_string = "import { \"early\"";
+    let early_import_alias_string = "import { Add as \"early\"";
+    let early_namespace_path = "import ns \"early\"";
+    let second_string_item = "import \"first\" \"second\"";
+    let second_missing_import = "import { A } from \"first\"; import";
+    let unsupported_item = "struct User {}";
     let parameter_boundary = format!(
         "fn many({}): null {{ return null }}",
         (0..32)
@@ -505,10 +611,58 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    let import_boundary = "import \"m\"\n".repeat(64);
+    let over_import_limit = "import \"m\"\n".repeat(65);
+    let imports_then_function = format!("{import_boundary}fn tail() {{}}");
+    let named_import_boundary = format!(
+        "import {{ {} }} from \"m\";",
+        (0..64)
+            .map(|index| format!("N{index}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let named_import_alias_boundary = format!(
+        "import {{ {} }} from \"m\";",
+        (0..64)
+            .map(|index| format!("N{index} as A{index}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let over_import_name_limit = format!(
+        "import {{ {} }} from \"m\"",
+        (0..65)
+            .map(|index| format!("N{index}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let over_import_alias_name_limit = format!(
+        "import {{ {} }} from \"m\";",
+        (0..65)
+            .map(|index| format!("N{index} as A{index}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert_eq!(
+        Lexer::new(&named_import_alias_boundary)
+            .lex()
+            .expect("64-name alias import lex")
+            .len(),
+        262,
+        "64 aliases must fit the bounded import window"
+    );
+    assert_eq!(
+        Lexer::new(&over_import_alias_name_limit)
+            .lex()
+            .expect("65-name alias import lex")
+            .len(),
+        266,
+        "65 aliases must reach the name-limit diagnostic before the window limit"
+    );
     let large_program = format!("fn main(){{{}}}", "x;".repeat(128));
     let over_statement_limit = format!("fn main(){{{}}}", "x;".repeat(129));
     let function_boundary = "fn f(){}".repeat(64);
     let over_function_limit = "fn f(){}".repeat(65);
+    let functions_then_import = format!("{function_boundary}import \"tail\"");
     let over_token_limit = format!("fn main(){{ value = {}1 }}", "1 + ".repeat(252));
     let comment_chunk = "x".repeat(3750);
     let near_limit_source = format!(
@@ -542,7 +696,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "fn AssertCase(source: str, expected: str): null! {\n    actual = ProgramCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
     body.push_str(
-        "fn ExpectError(source: str, expected_code: str, expected_message: str): null! {\n    caught = false\n    try { ParseProgram(source)? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong stage-3 diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected stage-3 parser error\") }\n    return ok(null)\n}\n\nfn main(): null! {\n",
+        "fn ExpectError(source: str, expected_code: str, expected_message: str): null! {\n    caught = false\n    try { ParseProgram(source.clone())? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong stage-3 diagnostic for \" + source + \": \" + err.domain + \"/\" + err.code + \"/\" + err.message + \" EXPECTED \" + expected_code + \"/\" + expected_message) }\n    }\n    if (!caught) { panic(\"expected stage-3 parser error\") }\n    return ok(null)\n}\n\nfn main(): null! {\n",
     );
     for source in accepted {
         body.push_str(&format!(
@@ -569,6 +723,19 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         ku_string(&parameter_boundary),
         ku_string(&rust_canonical(&parameter_boundary))
     ));
+    for source in [
+        &import_boundary,
+        &named_import_boundary,
+        &named_import_alias_boundary,
+        &imports_then_function,
+        &functions_then_import,
+    ] {
+        body.push_str(&format!(
+            "    AssertCase({}, {})?\n",
+            ku_string(source),
+            ku_string(&rust_canonical(source))
+        ));
+    }
     body.push_str(
         "    budget_gap = comment_chunk.clone() + comment_chunk.clone()\n    budget_source = \"fn main(){/*\" + budget_gap + \"*/\\n\"\n    budget_index = 0\n    while (budget_index < 32) {\n        budget_source += \"x\\n\"\n        budget_index = budget_index + 1\n    }\n    budget_source += \"}\"\n",
     );
@@ -579,6 +746,18 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     body.push_str(&format!(
         "    many_functions = ParseProgram({})?\n    if (many_functions.root != 65 || many_functions.arena.nodes.len() != 65 || many_functions.arena.edges.len() != 64) {{ panic(\"stage-3 function boundary mismatch\") }}\n",
         ku_string(&function_boundary)
+    ));
+    body.push_str(&format!(
+        "    many_imports = ParseProgram({})?\n    if (many_imports.root != 65 || many_imports.arena.nodes.len() != 65 || many_imports.arena.edges.len() != 64) {{ panic(\"stage-3 import boundary mismatch\") }}\n",
+        ku_string(&import_boundary)
+    ));
+    body.push_str(&format!(
+        "    many_names = ParseProgram({})?\n    if (many_names.root != 66 || many_names.arena.nodes.len() != 66 || many_names.arena.edges.len() != 65) {{ panic(\"stage-3 import-name arena boundary mismatch\") }}\n",
+        ku_string(&named_import_boundary)
+    ));
+    body.push_str(&format!(
+        "    many_aliases = ParseProgram({})?\n    if (many_aliases.root != 130 || many_aliases.arena.nodes.len() != 130 || many_aliases.arena.edges.len() != 129) {{ panic(\"stage-3 import-alias arena boundary mismatch\") }}\n",
+        ku_string(&named_import_alias_boundary)
     ));
 
     let let_message = diagnostic_for_kind(
@@ -592,8 +771,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "expected '}' after function body",
     );
     let return_outside_message = diagnostic_at(return_outside, 0, "return outside function");
-    let top_level_message =
-        diagnostic_at(top_level_expression, 0, "expected a function declaration");
+    let top_level_message = rust_error_canonical(top_level_expression);
     let type_message = diagnostic_for_kind(
         unsupported_type,
         TokenKind::LBracket,
@@ -623,6 +801,28 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let missing_signature_body_message = rust_error_canonical(missing_signature_body);
     let legacy_type_alias_message = rust_error_canonical(legacy_type_alias);
     let unicode_broken_signature_message = rust_error_canonical(unicode_broken_signature);
+    let empty_named_import_message = rust_error_canonical(empty_named_import);
+    let trailing_import_comma_message = rust_error_canonical(trailing_import_comma);
+    let missing_import_alias_message = rust_error_canonical(missing_import_alias);
+    let missing_named_from_message = rust_error_canonical(missing_named_from);
+    let missing_namespace_from_message = rust_error_canonical(missing_namespace_from);
+    let legacy_import_from_message = rust_error_canonical(legacy_import_from);
+    let invalid_import_namespace_message = rust_error_canonical(invalid_import_namespace);
+    let invalid_import_path_message = rust_error_canonical(invalid_import_path);
+    let missing_import_path_message = rust_error_canonical(missing_import_path);
+    let missing_import_target_message = rust_error_canonical(missing_import_target);
+    let missing_import_alias_at_eof_message = rust_error_canonical(missing_import_alias_at_eof);
+    let unicode_broken_import_message = rust_error_canonical(unicode_broken_import);
+    let early_import_name_string_message = rust_error_canonical(early_import_name_string);
+    let early_import_alias_string_message = rust_error_canonical(early_import_alias_string);
+    let early_namespace_path_message = rust_error_canonical(early_namespace_path);
+    let second_string_item_message = rust_error_canonical(second_string_item);
+    let second_missing_import_message = rust_error_canonical(second_missing_import);
+    let unsupported_item_message = diagnostic_for_kind(
+        unsupported_item,
+        TokenKind::Struct,
+        "stage-3 supports import and ordinary function items only",
+    );
     let unsupported_signature_type_message = diagnostic_for_kind(
         unsupported_signature_type,
         TokenKind::LBracket,
@@ -637,6 +837,21 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         &over_parameter_limit,
         3 + 32 * 2,
         "stage-3 functions accept at most 32 parameters",
+    );
+    let import_limit_message = diagnostic_at(
+        &over_import_limit,
+        64 * 2,
+        "stage-3 parser accepts at most 64 imports",
+    );
+    let import_name_limit_message = diagnostic_at(
+        &over_import_name_limit,
+        2 + 64 * 2,
+        "stage-3 named imports accept at most 64 names",
+    );
+    let import_alias_name_limit_message = diagnostic_at(
+        &over_import_alias_name_limit,
+        2 + 64 * 4,
+        "stage-3 named imports accept at most 64 names",
     );
     let statement_tokens = Lexer::new(&over_statement_limit)
         .lex()
@@ -721,6 +936,96 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             unicode_broken_signature_message,
         ),
         (
+            empty_named_import,
+            "unexpected_token",
+            empty_named_import_message,
+        ),
+        (
+            trailing_import_comma,
+            "unexpected_token",
+            trailing_import_comma_message,
+        ),
+        (
+            missing_import_alias,
+            "unexpected_token",
+            missing_import_alias_message,
+        ),
+        (
+            missing_named_from,
+            "unexpected_token",
+            missing_named_from_message,
+        ),
+        (
+            missing_namespace_from,
+            "unexpected_token",
+            missing_namespace_from_message,
+        ),
+        (
+            legacy_import_from,
+            "unexpected_token",
+            legacy_import_from_message,
+        ),
+        (
+            invalid_import_namespace,
+            "unexpected_token",
+            invalid_import_namespace_message,
+        ),
+        (
+            invalid_import_path,
+            "unexpected_token",
+            invalid_import_path_message,
+        ),
+        (
+            missing_import_path,
+            "unexpected_token",
+            missing_import_path_message,
+        ),
+        (
+            missing_import_target,
+            "unexpected_token",
+            missing_import_target_message,
+        ),
+        (
+            missing_import_alias_at_eof,
+            "unexpected_token",
+            missing_import_alias_at_eof_message,
+        ),
+        (
+            unicode_broken_import,
+            "unexpected_token",
+            unicode_broken_import_message,
+        ),
+        (
+            early_import_name_string,
+            "unexpected_token",
+            early_import_name_string_message,
+        ),
+        (
+            early_import_alias_string,
+            "unexpected_token",
+            early_import_alias_string_message,
+        ),
+        (
+            early_namespace_path,
+            "unexpected_token",
+            early_namespace_path_message,
+        ),
+        (
+            second_string_item,
+            "expected_item",
+            second_string_item_message,
+        ),
+        (
+            second_missing_import,
+            "unexpected_token",
+            second_missing_import_message,
+        ),
+        (
+            unsupported_item,
+            "unsupported_item",
+            unsupported_item_message,
+        ),
+        (
             unsupported_signature_type,
             "unsupported_type",
             unsupported_signature_type_message,
@@ -734,6 +1039,17 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             &over_parameter_limit,
             "parameter_limit",
             parameter_limit_message,
+        ),
+        (&over_import_limit, "import_limit", import_limit_message),
+        (
+            &over_import_name_limit,
+            "import_name_limit",
+            import_name_limit_message,
+        ),
+        (
+            &over_import_alias_name_limit,
+            "import_name_limit",
+            import_alias_name_limit_message,
         ),
         (&over_statement_limit, "statement_limit", statement_message),
         (&over_function_limit, "function_limit", function_message),
@@ -782,7 +1098,13 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         )
         .expect("copy stage-2 parser dependency");
     }
-    for name in ["ast.ku", "parser.ku", "support.ku"] {
+    for name in [
+        "ast.ku",
+        "imports.ku",
+        "parser.ku",
+        "signature.ku",
+        "support.ku",
+    ] {
         fs::copy(
             repository_bootstrap.join("stage3").join(name),
             stage3.join(name),
