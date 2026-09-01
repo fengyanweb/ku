@@ -545,7 +545,7 @@ fn main(): null! {
         "timed out connecting a PostgreSQL client connection",
         "int connect_expired = ku_pg_now_ms() >= deadline",
         "if (p->closing || connect_expired)",
-        "p->closing && p->active == 0 && p->waiters == 0",
+        "static int ku_pg_client_take_dispose_locked",
         "PostgreSQL client waiter limit reached",
         "p->waiters >= p->max_waiters",
         "timed out waiting for a PostgreSQL client connection",
@@ -553,13 +553,18 @@ fn main(): null! {
         "ku_pg_client_cleanup_connection",
         "if (tx != KU_PQTRANS_IDLE) return 1",
         "p->closing = 1",
-        "p->active == 0 && p->waiters == 0",
+        "p->finalizing || p->active != 0 || p->waiters != 0",
         "static void ku_pg_client_dispose",
         "int broken = 0; KuResult_pg_result r = ku_pg_query_params_all_validated_impl(c, sql, params, param_bytes, deadline, &broken)",
         "ku_pg_client_release(p, slot, broken || PQstatus(c) != KU_PG_CONNECTION_OK, deadline)",
     ] {
         assert!(c.contains(expected), "generated PG runtime missed: {expected}");
     }
+    assert_eq!(
+        c.matches("ku_pg_client_take_dispose_locked(p)").count(),
+        5,
+        "every PG close/release/acquire rollback path must use the one-finalizer arbiter"
+    );
     assert_eq!(
         c.matches("return ku_pg_finish_query(conn, result, deadline, broken)")
             .count(),
