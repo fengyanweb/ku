@@ -114,6 +114,7 @@ fn main(): null! {
         "stage2-failure",
         "stage3-success",
         "stage3-module-success",
+        "stage3-named-import-success",
         "stage3-struct-success",
         "stage3-struct-union-success",
         "stage3-struct-failure",
@@ -352,6 +353,31 @@ static KuParserInput ku_stage3_module_input(size_t items) {
   input.data = (uint8_t*)malloc(input.len ? input.len : 1);
   if (!input.data) return input;
   for (size_t i = 0; i < items; i++) memcpy(input.data + i * item_len, item, item_len);
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
+static KuParserInput ku_stage3_named_import_input(size_t names) {
+  static const char prefix[] = "import {";
+  static const char entry[] = "A as B";
+  static const char suffix[] = "} from \"./types.ku\";\n";
+  size_t prefix_len = sizeof(prefix) - 1, entry_len = sizeof(entry) - 1;
+  size_t suffix_len = sizeof(suffix) - 1;
+  size_t fixed_len = prefix_len + suffix_len - 1;
+  KuParserInput input = {0};
+  if (!names || names > (SIZE_MAX - fixed_len) / (entry_len + 1)) return input;
+  input.len = fixed_len + names * (entry_len + 1);
+  input.data = (uint8_t*)malloc(input.len);
+  if (!input.data) return input;
+  memcpy(input.data, prefix, prefix_len);
+  size_t cursor = prefix_len;
+  for (size_t i = 0; i < names; i++) {
+    memcpy(input.data + cursor, entry, entry_len);
+    cursor += entry_len;
+    if (i + 1 < names) input.data[cursor++] = ',';
+  }
+  memcpy(input.data + cursor, suffix, suffix_len);
+  cursor += suffix_len;
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
   input.hash = ku_parser_fingerprint(input.data, input.len);
   return input;
 }
@@ -634,6 +660,13 @@ int main(void) {
       ku_stage3_input(96, 0), ku_stage3_input(192, 0), 1, "", "", "") == 0);
   CHECK(ku_check_scale("stage3-module-success", @KU_STAGE3_PARSE@,
       ku_stage3_module_input(96), ku_stage3_module_input(192), 1, "", "", "") == 0);
+  /* Full-alias lists are the longest accepted named-import shape. The 32/64
+     fixtures consume 134/262 tokens including semicolon and EOF, keeping the
+     larger case below the independent 266-token inspection bound. A 2.25x
+     gate rejects copying the growing ImportNameRead array on every pure push. */
+  CHECK(ku_check_scale_bounded("stage3-named-import-success", @KU_STAGE3_PARSE@,
+      ku_stage3_named_import_input(32), ku_stage3_named_import_input(64),
+      1, "", "", "", 9, 4, 64, 16 * 1024, 8 * 1024) == 0);
   /* Each one-field struct is seven tokens, three nodes and three edges once
      linked by Program. Thus 32/64 items consume 225/449 tokens including EOF,
      97/193 nodes and 96/192 edges, all strictly inside the Stage 3 gates.
