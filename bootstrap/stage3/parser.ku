@@ -1,14 +1,15 @@
 import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
-import { Span, SpanFromToken } from "../stage2/span.ku"
+import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
-import { RejectAt, RejectAtPoint, ParseExpressionAt, CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, MapTokenCharacters } from "./support.ku"
+import { RejectAt, RejectAtPoint, ParseExpressionAt, CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, MapTokenCharacters, SpanFromNode } from "./support.ku"
 import { SignatureType, EmptyTypeWindow, PushTypeWindow, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { ReadImport } from "./imports.ku"
 
 // Stage 3 is intentionally a strict, useful subset of the production Rust
-// parser. It accepts ordinary functions whose bodies contain explicitly typed
-// declarations, variable assignments, expression statements and return statements.
+// parser. It accepts top-level module metadata and ordinary functions whose
+// bodies contain explicitly typed declarations, variable assignments,
+// expression statements and return statements.
 // Parameters may be untyped; parameter, return and local-declaration types share
 // source-positioned TypeName, TypeArray, TypeResult and TypeUnion arena nodes. Statement
 // boundaries follow the production token
@@ -219,7 +220,7 @@ fn ParseProgram(source: str): ParseOutput! {
 
     while (tokens[cursor].kind != "Eof") {
         parse_steps = parse_steps + 1
-        parsed_import = false
+        parsed_item = false
         if (parse_steps > 16384) {
             RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
         }
@@ -275,24 +276,33 @@ fn ParseProgram(source: str): ParseOutput! {
                 import_children = import_children.push(name)
             }
             cursor = cursor + parsed.consumed
-            import_node = AddNode("Import", parsed.path.lexeme.clone(), 0, Span {
-                line: parsed.start.line,
-                column: parsed.start.column,
-                offset: parsed.start.offset,
-                end_line: parsed.path.end_line,
-                end_column: parsed.path.end_column,
-                end_offset: parsed.path.end_offset
-            }, import_children, parsed.start.clone())?
+            import_node = AddNode("Import", parsed.path.lexeme.clone(), 0, SpanMerge(SpanFromToken(parsed.start.clone()), SpanFromToken(parsed.path.clone())), import_children, parsed.start.clone())?
             items = items.push(import_node)
             import_count = import_count + 1
-            parsed_import = true
+            parsed_item = true
         }
-        if (!parsed_import) {
+        if (!parsed_item && tokens[cursor].kind == "Module") {
+            module_start = tokens[cursor].clone()
+            cursor = cursor + 1
+            if (tokens[cursor].kind == "Eof") {
+                RejectAt(module_start.clone(), "unexpected_token", "expected module name")?
+            }
+            module_name = tokens[cursor].clone()
+            if (module_name.kind != "Ident") {
+                RejectAt(module_name.clone(), "unexpected_token", "expected module name")?
+            }
+            module_node = AddNode("Module", module_name.lexeme.clone(), 0, SpanMerge(SpanFromToken(module_start.clone()), SpanFromToken(module_name.clone())), [], module_start.clone())?
+            items = items.push(module_node)
+            cursor = cursor + 1
+            if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
+            parsed_item = true
+        }
+        if (!parsed_item) {
         if (tokens[cursor].kind == "Return") {
             RejectAt(tokens[cursor].clone(), "return_outside_function", "return outside function")?
         }
-        if (tokens[cursor].kind == "Struct" || tokens[cursor].kind == "Enum" || tokens[cursor].kind == "Module" || tokens[cursor].kind == "Async") {
-            RejectAt(tokens[cursor].clone(), "unsupported_item", "stage-3 supports import and ordinary function items only")?
+        if (tokens[cursor].kind == "Struct" || tokens[cursor].kind == "Enum" || tokens[cursor].kind == "Async") {
+            RejectAt(tokens[cursor].clone(), "unsupported_item", "stage-3 supports import, module, and ordinary function items only")?
         }
         if (tokens[cursor].kind != "Fn") {
             RejectAt(tokens[cursor].clone(), "expected_item", "expected top-level item: import, fn, struct, enum, or module")?
@@ -395,25 +405,11 @@ fn ParseProgram(source: str): ParseOutput! {
                     expression = AddExpression(cursor, expression_end)?
                     children = children.push(expression)
                     expression_node = arena_nodes[expression - 1].clone()
-                    end_span = Span {
-                        line: expression_node.line,
-                        column: expression_node.column,
-                        offset: expression_node.offset,
-                        end_line: expression_node.end_line,
-                        end_column: expression_node.end_column,
-                        end_offset: expression_node.end_offset
-                    }
+                    end_span = SpanFromNode(expression_node)
                     cursor = expression_end
                     if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
                 }
-                statement = AddNode("Return", "", 0, Span {
-                    line: statement_start.line,
-                    column: statement_start.column,
-                    offset: statement_start.offset,
-                    end_line: end_span.end_line,
-                    end_column: end_span.end_column,
-                    end_offset: end_span.end_offset
-                }, children, statement_start.clone())?
+                statement = AddNode("Return", "", 0, SpanMerge(SpanFromToken(statement_start.clone()), end_span), children, statement_start.clone())?
             } else if (statement_start.kind == "Ident" && tokens[cursor + 1].kind == "Colon") {
                 name = statement_start.lexeme.clone()
                 cursor = cursor + 2
@@ -432,14 +428,7 @@ fn ParseProgram(source: str): ParseOutput! {
                 expression_end = ExpressionEnd(cursor)?
                 expression = AddExpression(cursor, expression_end)?
                 expression_node = arena_nodes[expression - 1].clone()
-                statement = AddNode("VarDecl", name, 0, Span {
-                    line: statement_start.line,
-                    column: statement_start.column,
-                    offset: statement_start.offset,
-                    end_line: expression_node.end_line,
-                    end_column: expression_node.end_column,
-                    end_offset: expression_node.end_offset
-                }, [type_node, expression], statement_start.clone())?
+                statement = AddNode("VarDecl", name, 0, SpanMerge(SpanFromToken(statement_start.clone()), SpanFromNode(expression_node)), [type_node, expression], statement_start.clone())?
                 cursor = expression_end
                 if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
             } else if (statement_start.kind == "Ident" && tokens[cursor + 1].kind == "Equal") {
@@ -448,28 +437,14 @@ fn ParseProgram(source: str): ParseOutput! {
                 expression_end = ExpressionEnd(cursor)?
                 expression = AddExpression(cursor, expression_end)?
                 expression_node = arena_nodes[expression - 1].clone()
-                statement = AddNode("Assign", name, 0, Span {
-                    line: statement_start.line,
-                    column: statement_start.column,
-                    offset: statement_start.offset,
-                    end_line: expression_node.end_line,
-                    end_column: expression_node.end_column,
-                    end_offset: expression_node.end_offset
-                }, [expression], statement_start.clone())?
+                statement = AddNode("Assign", name, 0, SpanMerge(SpanFromToken(statement_start.clone()), SpanFromNode(expression_node)), [expression], statement_start.clone())?
                 cursor = expression_end
                 if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
             } else {
                 expression_end = ExpressionEnd(cursor)?
                 expression = AddExpression(cursor, expression_end)?
                 expression_node = arena_nodes[expression - 1].clone()
-                statement = AddNode("ExprStmt", "", 0, Span {
-                    line: expression_node.line,
-                    column: expression_node.column,
-                    offset: expression_node.offset,
-                    end_line: expression_node.end_line,
-                    end_column: expression_node.end_column,
-                    end_offset: expression_node.end_offset
-                }, [expression], statement_start.clone())?
+                statement = AddNode("ExprStmt", "", 0, SpanFromNode(expression_node), [expression], statement_start.clone())?
                 cursor = expression_end
                 if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
             }
@@ -481,14 +456,7 @@ fn ParseProgram(source: str): ParseOutput! {
         function_children: [int] = parameters
         if (has_return_type) { function_children = function_children.push(return_type) }
         for statement in statements { function_children = function_children.push(statement) }
-        function = AddNode("Function", function_name, 0, Span {
-            line: function_start.line,
-            column: function_start.column,
-            offset: function_start.offset,
-            end_line: function_end.end_line,
-            end_column: function_end.end_column,
-            end_offset: function_end.end_offset
-        }, function_children, function_start.clone())?
+        function = AddNode("Function", function_name, 0, SpanMerge(SpanFromToken(function_start.clone()), SpanFromToken(function_end)), function_children, function_start.clone())?
         items = items.push(function)
         function_count = function_count + 1
         }
@@ -498,14 +466,7 @@ fn ParseProgram(source: str): ParseOutput! {
     if (items.len() > 0) {
         first = arena_nodes[items[0] - 1].clone()
         last = arena_nodes[items[items.len() - 1] - 1].clone()
-        program_span = Span {
-            line: first.line,
-            column: first.column,
-            offset: first.offset,
-            end_line: last.end_line,
-            end_column: last.end_column,
-            end_offset: last.end_offset
-        }
+        program_span = SpanMerge(SpanFromNode(first), SpanFromNode(last))
     }
     root = AddNode("Program", "", 0, program_span, items, tokens[tokens.len() - 1].clone())?
     // Local helpers retain the shared cells until this frame exits. Clone each

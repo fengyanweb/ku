@@ -113,6 +113,7 @@ fn main(): null! {
         "stage2-wide-success",
         "stage2-failure",
         "stage3-success",
+        "stage3-module-success",
         "stage3-failure",
         "stage3-expression-failure",
         "invalid-domain",
@@ -329,6 +330,18 @@ static KuParserInput ku_stage3_expression_failure_input(size_t items) {
   input.hash = ku_parser_fingerprint(input.data, input.len);
   return input;
 }
+static KuParserInput ku_stage3_module_input(size_t items) {
+  static const char item[] = "module M\n";
+  size_t item_len = sizeof(item) - 1;
+  KuParserInput input = {0};
+  if (items && item_len > SIZE_MAX / items) return input;
+  input.len = item_len * items;
+  input.data = (uint8_t*)malloc(input.len ? input.len : 1);
+  if (!input.data) return input;
+  for (size_t i = 0; i < items; i++) memcpy(input.data + i * item_len, item, item_len);
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
 static KuParserInput ku_invalid_domain_input(size_t bytes) {
   static const char marker[] = "attacker-owned-domain";
   KuParserInput input = {0};
@@ -475,6 +488,8 @@ int main(void) {
       "error|bootstrap.parser|unexpected_eof|<source>|expected expression|") == 0);
   CHECK(ku_check_scale("stage3-success", @KU_STAGE3_PARSE@,
       ku_stage3_input(96, 0), ku_stage3_input(192, 0), 1, "", "", "") == 0);
+  CHECK(ku_check_scale("stage3-module-success", @KU_STAGE3_PARSE@,
+      ku_stage3_module_input(96), ku_stage3_module_input(192), 1, "", "", "") == 0);
   CHECK(ku_check_scale("stage3-failure", @KU_STAGE3_PARSE@,
       ku_stage3_input(96, 1), ku_stage3_input(192, 1), 0,
       "bootstrap.parser.stage3", "unexpected_eof",
