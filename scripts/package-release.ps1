@@ -207,11 +207,11 @@ namespace Ku.Release {
         private static extern int kill(int pid, int signal);
 
         private sealed class Budget {
-            internal readonly Process Process; internal readonly long Maximum;
+            internal readonly Process Process; internal readonly long Maximum; internal readonly string GroupReadyPath;
             internal long Total; internal int Exceeded; internal int StopPumps;
-            internal Budget(Process process, long maximum) { Process = process; Maximum = maximum; }
+            internal Budget(Process process, long maximum, string groupReadyPath) { Process = process; Maximum = maximum; GroupReadyPath = groupReadyPath; }
         }
-        private static void KillTree(Process process) { try { if (!process.HasExited) process.Kill(true); } catch (InvalidOperationException) { } }
+        private static void KillLeader(Process process) { try { if (!process.HasExited) process.Kill(); } catch (InvalidOperationException) { } }
 
         private static IntPtr AssignKillOnCloseJob(Process process) {
             IntPtr job = CreateJobObject(IntPtr.Zero, null);
@@ -219,7 +219,7 @@ namespace Ku.Release {
             var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref info, (uint)Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()) || !AssignProcessToJobObject(job, process.Handle)) {
-                int error = Marshal.GetLastWin32Error(); CloseHandle(job); KillTree(process);
+                int error = Marshal.GetLastWin32Error(); CloseHandle(job); KillLeader(process);
                 throw new Win32Exception(error, "failed to place release subprocess in its kill-on-close Job Object");
             }
             return job;
@@ -236,6 +236,15 @@ namespace Ku.Release {
                 if (error != 3) throw new Win32Exception(error, "failed to terminate release subprocess group");
             }
         }
+        private static void StopForOutputLimit(Budget budget) {
+            try {
+                if (!OperatingSystem.IsWindows() && File.Exists(budget.GroupReadyPath)) KillUnixProcessGroup(budget.Process.Id, budget.GroupReadyPath);
+                else KillLeader(budget.Process);
+            } catch {
+                // The bounded wait below remains authoritative and retries cleanup.
+                try { KillLeader(budget.Process); } catch { }
+            }
+        }
         private static async Task Pump(Stream input, string path, Budget budget) {
             using (var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 8192, true)) {
                 var buffer = new byte[8192];
@@ -245,10 +254,13 @@ namespace Ku.Release {
                         long after = Interlocked.Add(ref budget.Total, read); long before = after - read;
                         int permitted = before >= budget.Maximum ? 0 : (int)Math.Min(read, budget.Maximum - before);
                         if (permitted != 0) await output.WriteAsync(buffer, 0, permitted).ConfigureAwait(false);
-                        if (after > budget.Maximum) { Interlocked.Exchange(ref budget.Exceeded, 1); KillTree(budget.Process); }
+                        if (after > budget.Maximum && Interlocked.CompareExchange(ref budget.Exceeded, 1, 0) == 0) {
+                            Interlocked.Exchange(ref budget.StopPumps, 1);
+                            StopForOutputLimit(budget);
+                        }
                     }
-                } catch (ObjectDisposedException) when (Volatile.Read(ref budget.StopPumps) != 0) { }
-                  catch (IOException) when (Volatile.Read(ref budget.StopPumps) != 0) { }
+                } catch (ObjectDisposedException) when (Volatile.Read(ref budget.StopPumps) != 0 || Volatile.Read(ref budget.Exceeded) != 0) { }
+                  catch (IOException) when (Volatile.Read(ref budget.StopPumps) != 0 || Volatile.Read(ref budget.Exceeded) != 0) { }
                 await output.FlushAsync().ConfigureAwait(false);
             }
         }
@@ -260,16 +272,16 @@ namespace Ku.Release {
                 IntPtr job = IntPtr.Zero;
                 try {
                     if (OperatingSystem.IsWindows()) { job = AssignKillOnCloseJob(process); SignalStart(startGatePath); }
-                    var budget = new Budget(process, maximumOutputBytes);
+                    var budget = new Budget(process, maximumOutputBytes, groupReadyPath);
                     Task stdout = Pump(process.StandardOutput.BaseStream, stdoutPath, budget); Task stderr = Pump(process.StandardError.BaseStream, stderrPath, budget);
                     bool timedOut = !process.WaitForExit(timeoutMilliseconds);
                     if (OperatingSystem.IsWindows()) { if (job != IntPtr.Zero) { CloseHandle(job); job = IntPtr.Zero; } }
                     else { KillUnixProcessGroup(process.Id, groupReadyPath); }
-                    if (timedOut) KillTree(process);
-                    if (!process.WaitForExit(10000)) { KillTree(process); throw new TimeoutException("release subprocess tree cleanup was not confirmed"); }
+                    if (timedOut) KillLeader(process);
+                    if (!process.WaitForExit(10000)) { KillLeader(process); throw new TimeoutException("release subprocess tree cleanup was not confirmed"); }
                     Task allOutput = Task.WhenAll(stdout, stderr); bool heldPipe = !allOutput.Wait(10000);
                     if (heldPipe) {
-                        Interlocked.Exchange(ref budget.StopPumps, 1); KillTree(process); process.StandardOutput.Close(); process.StandardError.Close();
+                        Interlocked.Exchange(ref budget.StopPumps, 1); KillLeader(process); process.StandardOutput.Close(); process.StandardError.Close();
                         if (!allOutput.Wait(10000)) throw new TimeoutException("release subprocess output cleanup was not confirmed");
                     }
                     if (allOutput.IsFaulted) throw new IOException("release subprocess output capture failed", allOutput.Exception);
@@ -913,10 +925,14 @@ function Invoke-ReleaseSelfTest([string]$Repo, [string]$BuilderPath, [string]$He
         if ($clock.ElapsedMilliseconds -gt 15000) { throw "orphan process self-test exceeded its fixed cleanup bound" }
 
         $outputPidFile = Join-Path $processRoot 'output-child.pid'
-        $outputProgram = 'import subprocess,sys; p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"]); open(sys.argv[1],"w").write(str(p.pid)); sys.stdout.buffer.write(b"x"*(5*1024*1024)); sys.stdout.flush()'
+        $outputProgram = 'import subprocess,sys; p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"]); open(sys.argv[1],"w").write(str(p.pid)); sys.stdout.buffer.write((b"x"*8191+b"\n")*640); sys.stdout.flush()'
         $outputRejected = $false
-        try { [void](Invoke-BoundedTool ([string]$python.Source) @('-c', $outputProgram, $outputPidFile) $processRoot $processRoot 'output-budget' 10000 $wrapper) } catch { $outputRejected = $_.Exception.Message -like '*output exceeded*' }
-        if (-not $outputRejected) { throw "release output-budget self-test was not rejected" }
+        $outputFailure = $null
+        try { [void](Invoke-BoundedTool ([string]$python.Source) @('-c', $outputProgram, $outputPidFile) $processRoot $processRoot 'output-budget' 10000 $wrapper) } catch { $outputFailure = $_.Exception.Message; $outputRejected = $outputFailure -like '*output exceeded*' }
+        if (-not $outputRejected) {
+            $observed = if ($null -eq $outputFailure) { 'no rejection' } else { "unexpected rejection: $outputFailure" }
+            throw "release output-budget self-test did not report the bounded-output contract ($observed)"
+        }
         Assert-SelfTestChildGone $outputPidFile 'output-budget process'
         $captured = 0L; foreach ($log in Get-ChildItem -LiteralPath $processRoot -File | Where-Object Name -Like 'output-budget-*.std*') { $captured += $log.Length }
         if ($captured -gt $processOutputLimit) { throw "release output-budget self-test captured more than its configured limit" }
