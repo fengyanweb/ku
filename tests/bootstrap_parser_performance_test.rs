@@ -114,6 +114,9 @@ fn main(): null! {
         "stage2-failure",
         "stage3-success",
         "stage3-module-success",
+        "stage3-struct-success",
+        "stage3-struct-union-success",
+        "stage3-struct-failure",
         "stage3-failure",
         "stage3-expression-failure",
         "invalid-domain",
@@ -202,7 +205,13 @@ fn copy_bootstrap_sources(directory: &std::path::Path) {
         ),
         (
             "stage3",
-            &["support.ku", "signature.ku", "imports.ku", "parser.ku"][..],
+            &[
+                "support.ku",
+                "signature.ku",
+                "imports.ku",
+                "structs.ku",
+                "parser.ku",
+            ][..],
         ),
     ] {
         let destination = directory.join(stage);
@@ -342,6 +351,64 @@ static KuParserInput ku_stage3_module_input(size_t items) {
   input.hash = ku_parser_fingerprint(input.data, input.len);
   return input;
 }
+static KuParserInput ku_stage3_struct_input(size_t items) {
+  static const char item[] = "struct S { value: int }\n";
+  size_t item_len = sizeof(item) - 1;
+  KuParserInput input = {0};
+  if (items && item_len > SIZE_MAX / items) return input;
+  input.len = item_len * items;
+  input.data = (uint8_t*)malloc(input.len ? input.len : 1);
+  if (!input.data) return input;
+  size_t cursor = 0;
+  for (size_t i = 0; i < items; i++) {
+    memcpy(input.data + cursor, item, item_len);
+    cursor += item_len;
+  }
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
+static KuParserInput ku_stage3_struct_union_input(size_t arms) {
+  static const char prefix[] = "struct S { value: ";
+  static const char suffix[] = " }\n";
+  size_t prefix_len = sizeof(prefix) - 1, suffix_len = sizeof(suffix) - 1;
+  size_t fixed_len = prefix_len + suffix_len - 1;
+  KuParserInput input = {0};
+  if (!arms || arms > (SIZE_MAX - fixed_len) / 2) return input;
+  input.len = fixed_len + arms * 2;
+  input.data = (uint8_t*)malloc(input.len);
+  if (!input.data) return input;
+  memcpy(input.data, prefix, prefix_len);
+  size_t cursor = prefix_len;
+  for (size_t i = 0; i < arms; i++) {
+    input.data[cursor++] = 'T';
+    if (i + 1 < arms) input.data[cursor++] = '|';
+  }
+  memcpy(input.data + cursor, suffix, suffix_len);
+  cursor += suffix_len;
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
+static KuParserInput ku_stage3_struct_failure_input(size_t fields) {
+  static const char prefix[] = "struct S { ";
+  static const char field[] = "value:T|U ";
+  size_t prefix_len = sizeof(prefix) - 1, field_len = sizeof(field) - 1;
+  KuParserInput input = {0};
+  if (!fields || fields > (SIZE_MAX - prefix_len) / field_len) return input;
+  input.len = prefix_len + fields * field_len;
+  input.data = (uint8_t*)malloc(input.len);
+  if (!input.data) return input;
+  memcpy(input.data, prefix, prefix_len);
+  size_t cursor = prefix_len;
+  for (size_t i = 0; i < fields; i++) {
+    memcpy(input.data + cursor, field, field_len);
+    cursor += field_len;
+  }
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
 static KuParserInput ku_invalid_domain_input(size_t bytes) {
   static const char marker[] = "attacker-owned-domain";
   KuParserInput input = {0};
@@ -438,13 +505,18 @@ static int ku_measure_invalid_domain(
   metric->elapsed_ms = finished >= started ? finished - started : 0;
   return 0;
 }
-static int ku_linear_upper(size_t larger, size_t smaller, size_t allowance) {
-  return smaller <= (SIZE_MAX - allowance) / 3 && larger <= smaller * 3 + allowance;
+static int ku_scale_upper(
+    size_t larger, size_t smaller, size_t numerator, size_t denominator,
+    size_t allowance) {
+  if (!numerator || !denominator || smaller > (SIZE_MAX - allowance) / numerator) return 0;
+  return larger <= smaller * numerator / denominator + allowance;
 }
-static int ku_check_scale(
+static int ku_check_scale_bounded(
     const char* label, KuParserFunction parser,
     KuParserInput small, KuParserInput large, int succeeds,
-    const char* domain, const char* code, const char* message) {
+    const char* domain, const char* code, const char* message,
+    size_t numerator, size_t denominator, size_t call_allowance,
+    size_t total_allowance, size_t peak_allowance) {
   KuParserMetric a = {0}, b = {0};
   CHECK(small.data && large.data && small.len < large.len);
   CHECK(ku_measure_parser(parser, small, succeeds, domain, code, message, &a) == 0);
@@ -454,11 +526,18 @@ static int ku_check_scale(
   printf("parser %s rounds=%d small_allocs=%zu large_allocs=%zu small_total=%zu large_total=%zu small_peak=%zu large_peak=%zu elapsed_ms=%llu/%llu\n",
       label, ROUNDS, a.max_calls, b.max_calls, a.max_total, b.max_total,
       a.max_peak, b.max_peak, a.elapsed_ms, b.elapsed_ms);
-  CHECK(ku_linear_upper(b.max_calls, a.max_calls, 64));
-  CHECK(ku_linear_upper(b.max_total, a.max_total, 256 * 1024));
-  CHECK(ku_linear_upper(b.max_peak, a.max_peak, 128 * 1024));
+  CHECK(ku_scale_upper(b.max_calls, a.max_calls, numerator, denominator, call_allowance));
+  CHECK(ku_scale_upper(b.max_total, a.max_total, numerator, denominator, total_allowance));
+  CHECK(ku_scale_upper(b.max_peak, a.max_peak, numerator, denominator, peak_allowance));
   free(small.data); free(large.data);
   return 0;
+}
+static int ku_check_scale(
+    const char* label, KuParserFunction parser,
+    KuParserInput small, KuParserInput large, int succeeds,
+    const char* domain, const char* code, const char* message) {
+  return ku_check_scale_bounded(label, parser, small, large, succeeds,
+      domain, code, message, 3, 1, 64, 256 * 1024, 128 * 1024);
 }
 static int ku_check_invalid_domain_scale(
     KuParserFunction parser, KuParserInput small, KuParserInput large) {
@@ -471,9 +550,9 @@ static int ku_check_invalid_domain_scale(
   printf("parser invalid-domain rounds=%d small_allocs=%zu large_allocs=%zu small_total=%zu large_total=%zu small_peak=%zu large_peak=%zu elapsed_ms=%llu/%llu\n",
       ROUNDS, a.max_calls, b.max_calls, a.max_total, b.max_total,
       a.max_peak, b.max_peak, a.elapsed_ms, b.elapsed_ms);
-  CHECK(ku_linear_upper(b.max_calls, a.max_calls, 64));
-  CHECK(ku_linear_upper(b.max_total, a.max_total, 256 * 1024));
-  CHECK(ku_linear_upper(b.max_peak, a.max_peak, 128 * 1024));
+  CHECK(ku_scale_upper(b.max_calls, a.max_calls, 3, 1, 64));
+  CHECK(ku_scale_upper(b.max_total, a.max_total, 3, 1, 256 * 1024));
+  CHECK(ku_scale_upper(b.max_peak, a.max_peak, 3, 1, 128 * 1024));
   free(small.data); free(large.data);
   return 0;
 }
@@ -490,6 +569,29 @@ int main(void) {
       ku_stage3_input(96, 0), ku_stage3_input(192, 0), 1, "", "", "") == 0);
   CHECK(ku_check_scale("stage3-module-success", @KU_STAGE3_PARSE@,
       ku_stage3_module_input(96), ku_stage3_module_input(192), 1, "", "", "") == 0);
+  /* Each one-field struct is seven tokens, three nodes and three edges once
+     linked by Program. Thus 32/64 items consume 225/449 tokens including EOF,
+     97/193 nodes and 96/192 edges, all strictly inside the Stage 3 gates.
+     The tighter 2.5x bound rejects cloning the complete token table once per
+     struct while retaining small fixed allowances for allocator bookkeeping. */
+  CHECK(ku_check_scale_bounded("stage3-struct-success", @KU_STAGE3_PARSE@,
+      ku_stage3_struct_input(32), ku_stage3_struct_input(64), 1, "", "", "",
+      5, 2, 64, 64 * 1024, 32 * 1024) == 0);
+  /* A single 16/32-arm custom union consumes 38/70 tokens including EOF,
+     20/36 nodes and 19/35 edges. This isolates type-plan flattening from the
+     many-declaration token-window gate above; its 2.25x bound retains only
+     small fixed allowances so repeated growing-array reads cannot hide. */
+  CHECK(ku_check_scale_bounded("stage3-struct-union-success", @KU_STAGE3_PARSE@,
+      ku_stage3_struct_union_input(16), ku_stage3_struct_union_input(32),
+      1, "", "", "", 9, 4, 32, 8 * 1024, 4 * 1024) == 0);
+  /* Missing '}' is detected only after all 32/64 complex fields have allocated
+     their type and field nodes (164/324 tokens including EOF). The 2.25x gate
+     covers both successful allocation and structured-error cleanup paths. */
+  CHECK(ku_check_scale_bounded("stage3-struct-failure", @KU_STAGE3_PARSE@,
+      ku_stage3_struct_failure_input(32), ku_stage3_struct_failure_input(64),
+      0, "bootstrap.parser.stage3", "unexpected_token",
+      "error|bootstrap.parser.stage3|unexpected_token|<source>|expected '}' after struct fields|",
+      9, 4, 64, 16 * 1024, 8 * 1024) == 0);
   CHECK(ku_check_scale("stage3-failure", @KU_STAGE3_PARSE@,
       ku_stage3_input(96, 1), ku_stage3_input(192, 1), 0,
       "bootstrap.parser.stage3", "unexpected_eof",

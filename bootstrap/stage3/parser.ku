@@ -3,11 +3,12 @@ import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { RejectAt, RejectAtPoint, ParseExpressionAt, CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, MapTokenCharacters, SpanFromNode } from "./support.ku"
-import { SignatureType, EmptyTypeWindow, PushTypeWindow, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
+import { SignatureType, TypeWindowContinues, PushTypeToken, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { ReadImport } from "./imports.ku"
+import { ReadModule, ReadStruct } from "./structs.ku"
 
 // Stage 3 is intentionally a strict, useful subset of the production Rust
-// parser. It accepts top-level module metadata and ordinary functions whose
+// parser. It accepts top-level module/struct declarations and ordinary functions whose
 // bodies contain explicitly typed declarations, variable assignments,
 // expression statements and return statements.
 // Parameters may be untyped; parameter, return and local-declaration types share
@@ -43,7 +44,7 @@ fn ParseProgram(source: str): ParseOutput! {
     }
     eof = tokens[tokens.len() - 1].clone()
     if (eof.kind != "Eof") {
-        RejectAt(eof, "invalid_token_stream", "token stream is missing EOF")?
+        RejectAt(eof.clone(), "invalid_token_stream", "token stream is missing EOF")?
     }
 
     // The source moves through the mapper and back; only the bounded token
@@ -94,29 +95,9 @@ fn ParseProgram(source: str): ParseOutput! {
         return ok(arena_nodes.len())
     }
 
-    fn AddExpression(start: int, end: int): int! {
-        if (start > end || start < 0 || end > tokens.len() - 1) {
-            diagnostic_index = tokens.len() - 1
-            if (start >= 0 && start < tokens.len()) { diagnostic_index = start }
-            RejectAt(tokens[diagnostic_index].clone(), "invalid_expression_range", "statement expression token range is invalid")?
-        }
-        origin = tokens[start].clone()
-        boundary = tokens[end].clone()
-        // string.slice may scan the complete source. Keep an explicit aggregate
-        // budget so comment-heavy modules cannot multiply that scan by every
-        // statement. This also avoids interpreter per-character concatenation.
-        source_length = source_chars.len()
-        if (source_length > 131072 - slice_work) {
-            RejectAt(origin.clone(), "work_limit", "stage-3 expression slicing budget exceeded")?
-        }
-        slice_work = slice_work + source_length
-        slice_end = token_char_starts[start]
-        if (end > start) { slice_end = token_char_ends[end - 1] }
-        expression_source = expression_source_text.slice(token_char_starts[start], slice_end)?
-        parsed = ParseExpressionAt(expression_source, origin.clone(), boundary)?
+    fn AddArena(parsed: ParseOutput, origin: Token): int! {
         // Owned field reads clone today. Flatten the Stage 2 result once before
-        // walking it so repeated nested projections cannot copy its whole arena
-        // once per node.
+        // walking it so repeated nested projections cannot copy the whole arena.
         parsed_root = parsed.root
         parsed_arena = parsed.arena
         parsed_nodes = parsed_arena.nodes
@@ -136,7 +117,7 @@ fn ParseProgram(source: str): ParseOutput! {
             while (edge_index < input.edge_count) {
                 child = parsed_edges[input.first_edge + edge_index]
                 if (child <= 0 || child > parsed_nodes.len()) {
-                    RejectAt(origin.clone(), "invalid_node_id", "stage-2 AST contains an invalid NodeId")?
+                    RejectAt(origin.clone(), "invalid_node_id", "nested AST contains an invalid NodeId")?
                 }
                 arena_edges = arena_edges.push(node_base + child)
                 edge_index = edge_index + 1
@@ -158,38 +139,68 @@ fn ParseProgram(source: str): ParseOutput! {
             index = index + 1
         }
         if (parsed_root <= 0 || parsed_root > parsed_nodes.len()) {
-            RejectAt(origin, "invalid_node_id", "stage-2 AST root is invalid")?
+            RejectAt(origin, "invalid_node_id", "nested AST root is invalid")?
         }
         return ok(node_base + parsed_root)
     }
+    append_arena: fn(ParseOutput, Token): int! = AddArena
+
+    fn AddExpression(start: int, end: int): int! {
+        if (start > end || start < 0 || end > tokens.len() - 1) {
+            diagnostic_index = tokens.len() - 1
+            if (start >= 0 && start < tokens.len()) { diagnostic_index = start }
+            RejectAt(tokens[diagnostic_index].clone(), "invalid_expression_range", "statement expression token range is invalid")?
+        }
+        origin = tokens[start].clone()
+        boundary = tokens[end].clone()
+        // string.slice may scan the complete source. Keep an explicit aggregate
+        // budget so comment-heavy modules cannot multiply that scan by every
+        // statement. This also avoids interpreter per-character concatenation.
+        source_length = source_chars.len()
+        if (source_length > 131072 - slice_work) {
+            RejectAt(origin.clone(), "work_limit", "stage-3 expression slicing budget exceeded")?
+        }
+        slice_work = slice_work + source_length
+        slice_end = token_char_starts[start]
+        if (end > start) { slice_end = token_char_ends[end - 1] }
+        expression_source = expression_source_text.slice(token_char_starts[start], slice_end)?
+        parsed = ParseExpressionAt(expression_source, origin.clone(), boundary)?
+        return append_arena(parsed, origin)
+    }
 
     fn ReadTypeAt(start: int): SignatureType! {
-        window = EmptyTypeWindow()
+        type_tokens: [Token] = []
         probe = start
-        while (!window.complete) {
+        complete = false
+        while (!complete) {
             if (probe >= tokens.len()) { RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "type inspection escaped its bounded token window")? }
-            window = PushTypeWindow(window, tokens[probe].clone())?
+            type_token = tokens[probe].clone()
+            complete = !TypeWindowContinues(type_token.kind.clone())
+            type_tokens = PushTypeToken(type_tokens, type_token)?
             probe = probe + 1
         }
-        parsed = ParseTypeWindow(window.tokens)?
+        parsed = ParseTypeWindow(type_tokens)?
         parsed.work = parsed.work + probe - start
         return ok(parsed)
     }
 
     fn AddParsedType(parsed: SignatureType, error_token: Token): int! {
+        parsed_root = parsed.root
+        parsed_parts = parsed.parts
+        parsed_edges = parsed.edges
         node_base = arena_nodes.len()
         part_index = 0
-        while (part_index < parsed.parts.len()) {
-            part = parsed.parts[part_index].clone()
+        while (part_index < parsed_parts.len()) {
+            part = parsed_parts[part_index].clone()
             CheckTypeArenaCapacity(arena_nodes.len(), arena_edges.len(), part.edge_count, error_token.clone())?
             first_edge = arena_edges.len()
             edge_index = 0
             while (edge_index < part.edge_count) {
                 plan_edge = part.first_edge + edge_index
-                if (plan_edge < 0 || plan_edge >= parsed.edges.len()) {
+                if (plan_edge < 0 || plan_edge >= parsed_edges.len()) {
                     RejectAt(error_token.clone(), "invalid_node_id", "type plan edge lies outside its arena")?
                 }
-                child = parsed.edges[plan_edge]
+                child = parsed_edges[plan_edge]
                 if (child <= 0 || child > part_index) {
                     RejectAt(error_token.clone(), "invalid_node_id", "type plan edge must reference an earlier NodeId")?
                 }
@@ -200,10 +211,10 @@ fn ParseProgram(source: str): ParseOutput! {
             arena_nodes = arena_nodes.push(type_node)
             part_index = part_index + 1
         }
-        if (parsed.root <= 0 || parsed.root > parsed.parts.len()) {
+        if (parsed_root <= 0 || parsed_root > parsed_parts.len()) {
             RejectAt(error_token, "invalid_node_id", "type plan root is invalid")?
         }
-        return ok(node_base + parsed.root)
+        return ok(node_base + parsed_root)
     }
 
     fn ExpressionEnd(start: int): int! {
@@ -220,7 +231,6 @@ fn ParseProgram(source: str): ParseOutput! {
 
     while (tokens[cursor].kind != "Eof") {
         parse_steps = parse_steps + 1
-        parsed_item = false
         if (parse_steps > 16384) {
             RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
         }
@@ -252,7 +262,7 @@ fn ParseProgram(source: str): ParseOutput! {
                 }
             }
             if (import_window[import_window.len() - 1].kind != "Eof") {
-                import_window = import_window.push(tokens[tokens.len() - 1].clone())
+                import_window = import_window.push(eof.clone())
             }
             parsed = ReadImport(import_window)?
             parse_steps = parse_steps + parsed.work
@@ -279,30 +289,42 @@ fn ParseProgram(source: str): ParseOutput! {
             import_node = AddNode("Import", parsed.path.lexeme.clone(), 0, SpanMerge(SpanFromToken(parsed.start.clone()), SpanFromToken(parsed.path.clone())), import_children, parsed.start.clone())?
             items = items.push(import_node)
             import_count = import_count + 1
-            parsed_item = true
-        }
-        if (!parsed_item && tokens[cursor].kind == "Module") {
+        } else if (tokens[cursor].kind == "Module") {
             module_start = tokens[cursor].clone()
-            cursor = cursor + 1
-            if (tokens[cursor].kind == "Eof") {
-                RejectAt(module_start.clone(), "unexpected_token", "expected module name")?
-            }
-            module_name = tokens[cursor].clone()
-            if (module_name.kind != "Ident") {
-                RejectAt(module_name.clone(), "unexpected_token", "expected module name")?
-            }
-            module_node = AddNode("Module", module_name.lexeme.clone(), 0, SpanMerge(SpanFromToken(module_start.clone()), SpanFromToken(module_name.clone())), [], module_start.clone())?
+            module_node = append_arena(ReadModule(module_start.clone(), tokens[cursor + 1].clone())?, module_start)?
             items = items.push(module_node)
-            cursor = cursor + 1
+            cursor = cursor + 2
             if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
-            parsed_item = true
-        }
-        if (!parsed_item) {
+        } else if (tokens[cursor].kind == "Struct") {
+            struct_window: [Token] = []
+            window_cursor = cursor
+            while (tokens[window_cursor].kind != "RBrace" && tokens[window_cursor].kind != "Eof") {
+                struct_token = tokens[window_cursor].clone()
+                struct_window = struct_window.push(struct_token)
+                window_cursor = window_cursor + 1
+            }
+            struct_token = tokens[window_cursor].clone()
+            needs_sentinel = struct_token.kind != "Eof"
+            struct_window = struct_window.push(struct_token)
+            if (needs_sentinel) {
+                struct_eof = eof.clone()
+                struct_window = struct_window.push(struct_eof)
+            }
+            struct_read = ReadStruct(struct_window)?
+            parse_steps = parse_steps + struct_read.work
+            if (parse_steps > 16384) {
+                RejectAt(struct_read.start.clone(), "work_limit", "stage-3 parser work budget exceeded")?
+            }
+            struct_start = struct_read.start.clone()
+            cursor = cursor + struct_read.consumed
+            struct_node = append_arena(struct_read.output, struct_start)?
+            items = items.push(struct_node)
+        } else {
         if (tokens[cursor].kind == "Return") {
             RejectAt(tokens[cursor].clone(), "return_outside_function", "return outside function")?
         }
-        if (tokens[cursor].kind == "Struct" || tokens[cursor].kind == "Enum" || tokens[cursor].kind == "Async") {
-            RejectAt(tokens[cursor].clone(), "unsupported_item", "stage-3 supports import, module, and ordinary function items only")?
+        if (tokens[cursor].kind == "Enum" || tokens[cursor].kind == "Async") {
+            RejectAt(tokens[cursor].clone(), "unsupported_item", "stage-3 supports import, module, struct, and ordinary function items only")?
         }
         if (tokens[cursor].kind != "Fn") {
             RejectAt(tokens[cursor].clone(), "expected_item", "expected top-level item: import, fn, struct, enum, or module")?
@@ -462,13 +484,13 @@ fn ParseProgram(source: str): ParseOutput! {
         }
     }
 
-    program_span = SpanFromToken(tokens[tokens.len() - 1].clone())
+    program_span = SpanFromToken(eof.clone())
     if (items.len() > 0) {
         first = arena_nodes[items[0] - 1].clone()
         last = arena_nodes[items[items.len() - 1] - 1].clone()
         program_span = SpanMerge(SpanFromNode(first), SpanFromNode(last))
     }
-    root = AddNode("Program", "", 0, program_span, items, tokens[tokens.len() - 1].clone())?
+    root = AddNode("Program", "", 0, program_span, items, eof.clone())?
     // Local helpers retain the shared cells until this frame exits. Clone each
     // completed flat arena once; self-push no longer clones per node.
     return ValidateParseOutput(ParseOutput {

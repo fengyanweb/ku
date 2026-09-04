@@ -1,4 +1,4 @@
-//! Stage-3 self-hosted statement/module parser differential gate.
+//! Stage-3 self-hosted statement/declaration parser differential gate.
 //!
 //! Stage 3 deliberately accepts a strict subset of production Ku syntax. Every
 //! accepted fixture is parsed by the Rust frontend and projected into the same
@@ -10,7 +10,7 @@ pub mod bounded_process;
 use bounded_process::{run_bounded, OutputLimits};
 use ku::ast::{
     BinaryOp, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item, Literal, ModuleDecl, Stmt,
-    TypeName, UnaryOp,
+    StructDecl, TypeName, UnaryOp,
 };
 use ku::lexer::Lexer;
 use ku::parser::Parser;
@@ -61,6 +61,28 @@ const MODULE_GOLDEN: &str = concat!(
     "NODE|3|Program||0|2:1@12..3:13@37|0|2\n",
     "EDGE|0|1\n",
     "EDGE|1|2",
+);
+const STRUCT_GOLDEN_SOURCE: &str =
+    "// 前😀\r\nstruct User {\r\n  name: str,\r\n  tags: [pkg.Tag!]!\r\n}";
+const STRUCT_GOLDEN: &str = concat!(
+    "ROOT|9\n",
+    "NODE|1|TypeName|str|0|3:9@35..3:12@38|0|0\n",
+    "NODE|2|StructField|name|0|3:3@29..3:7@33|0|1\n",
+    "NODE|3|TypeName|pkg.Tag|0|4:10@50..4:17@57|1|0\n",
+    "NODE|4|TypeResult||0|4:10@50..4:18@58|1|1\n",
+    "NODE|5|TypeArray||0|4:9@49..4:19@59|2|1\n",
+    "NODE|6|TypeResult||0|4:9@49..4:20@60|3|1\n",
+    "NODE|7|StructField|tags|0|4:3@43..4:7@47|4|1\n",
+    "NODE|8|Struct|User|0|2:1@12..5:2@63|5|2\n",
+    "NODE|9|Program||0|2:1@12..5:2@63|7|1\n",
+    "EDGE|0|1\n",
+    "EDGE|1|3\n",
+    "EDGE|2|4\n",
+    "EDGE|3|5\n",
+    "EDGE|4|6\n",
+    "EDGE|5|2\n",
+    "EDGE|6|7\n",
+    "EDGE|7|8",
 );
 const UNICODE_CRLF_ERROR_SOURCE: &str =
     "// 前😀\r\nfn main() {\r\n  text:str = \"中😀\"\r\n  value = 1 + ;\r\n}";
@@ -507,6 +529,58 @@ fn project_module(module: &ModuleDecl, arena: &mut ProjectedArena) -> usize {
     push_node(arena, "Module", module.name.clone(), 0, module.span, &[])
 }
 
+fn project_struct(source: &str, structure: &StructDecl, arena: &mut ProjectedArena) -> usize {
+    let tokens = Lexer::new(source).lex().expect("struct projection lex");
+    let mut cursor = tokens
+        .iter()
+        .position(|token| {
+            matches!(token.kind, TokenKind::Struct)
+                && token.span.start.offset == structure.span.start.offset
+        })
+        .expect("struct start token");
+    cursor += 1;
+    assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+    cursor += 1;
+    assert!(matches!(tokens[cursor].kind, TokenKind::LBrace));
+    cursor += 1;
+
+    let mut children = Vec::with_capacity(structure.fields.len());
+    for field in &structure.fields {
+        assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+        assert_eq!(tokens[cursor].span, field.span);
+        let field_span = tokens[cursor].span;
+        cursor += 1;
+        assert!(matches!(tokens[cursor].kind, TokenKind::Colon));
+        cursor += 1;
+        let ty = project_type(
+            &tokens,
+            &mut cursor,
+            field.ty.as_ref().expect("struct field type"),
+            arena,
+        );
+        children.push(push_node(
+            arena,
+            "StructField",
+            field.name.clone(),
+            0,
+            field_span,
+            &[ty],
+        ));
+        if matches!(tokens[cursor].kind, TokenKind::Comma) {
+            cursor += 1;
+        }
+    }
+    assert!(matches!(tokens[cursor].kind, TokenKind::RBrace));
+    push_node(
+        arena,
+        "Struct",
+        structure.name.clone(),
+        0,
+        structure.span,
+        &children,
+    )
+}
+
 fn rust_canonical(source: &str) -> String {
     let tokens = Lexer::new(source).lex().expect("Rust oracle lex");
     let eof_span = tokens.last().expect("EOF token").span;
@@ -520,6 +594,7 @@ fn rust_canonical(source: &str) -> String {
         .map(|item| match item {
             Item::Import(import) => project_import(source, import, &mut arena),
             Item::Function(function) => project_function(source, function, &mut arena),
+            Item::Struct(structure) => project_struct(source, structure, &mut arena),
             Item::Module(module) => project_module(module, &mut arena),
             other => panic!("stage-3 oracle received unsupported item: {other:?}"),
         })
@@ -630,6 +705,7 @@ fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
         TYPED_UNION_GOLDEN
     );
     assert_eq!(rust_canonical(MODULE_GOLDEN_SOURCE), MODULE_GOLDEN);
+    assert_eq!(rust_canonical(STRUCT_GOLDEN_SOURCE), STRUCT_GOLDEN);
     assert_eq!(
         rust_diagnostic_canonical(UNICODE_CRLF_ERROR_SOURCE),
         UNICODE_CRLF_ERROR_CANONICAL
@@ -700,6 +776,15 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         MODULE_GOLDEN_SOURCE,
         "import \"./setup.ku\"\nmodule App;\nfn main() {}",
         "module Same\nmodule Same;",
+        "struct Empty {}",
+        "struct WithoutCommas { id:int name:str active:bool }",
+        "struct WithCommas { id:int, name:str }",
+        "struct WithTrailingComma { id:int, }",
+        "struct Complex { dotted:pkg.model.User, unioned:int | str, arrayed:[pkg.Item!]!, nested:[[int | pkg.Value!]!]! }",
+        "struct Adjacent { dotted:pkg.model.User unioned:int | str arrayed:[pkg.Item!]! tail:bool }",
+        "struct Duplicate { value:int value:str }",
+        "module App\nimport \"./types.ku\"\nstruct User { id:int }\nfn main() {}",
+        STRUCT_GOLDEN_SOURCE,
         "fn main() {}",
         "fn typed(): int { return 1 }",
         "fn add(left: int, right: int): int { return left + right }\nfn echo(value): str { return \"ok\" }",
@@ -781,7 +866,15 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let module_alias = "module App as Other";
     let double_module_semicolon = "module App;;";
     let nested_module = "fn main() { module Inner }";
-    let unsupported_item = "struct User {}";
+    let missing_struct_name = "struct";
+    let missing_struct_open = "struct User";
+    let missing_struct_field_name = "struct User { : int }";
+    let missing_struct_field_colon = "struct User { age int }";
+    let missing_struct_field_type = "struct User { age: }";
+    let missing_struct_close = "struct User { age: int";
+    let double_struct_field_comma = "struct User { age: int,, name: str }";
+    let struct_semicolon = "struct User {};";
+    let unsupported_item = "enum State { Ready }";
     let parameter_boundary = format!(
         "fn many({}): null {{ return null }}",
         (0..32)
@@ -894,6 +987,39 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         513,
         "256 modules must exceed the complete Stage-3 token budget"
     );
+    let struct_boundary = format!("{}module Tail;", "struct S {}\n".repeat(127));
+    let over_struct_token_limit = "struct S {}\n".repeat(128);
+    assert_eq!(
+        Lexer::new(&struct_boundary)
+            .lex()
+            .expect("complete struct token boundary lex")
+            .len(),
+        512,
+        "127 empty structs plus one terminated module must exactly fill the Stage-3 token budget"
+    );
+    assert_eq!(
+        Lexer::new(&over_struct_token_limit)
+            .lex()
+            .expect("struct token over-limit lex")
+            .len(),
+        513,
+        "128 empty structs must exceed the complete Stage-3 token budget"
+    );
+    let struct_field_window_boundary = format!(
+        "struct Wide {{ {} }}",
+        (0..169)
+            .map(|index| format!("field{index}: int"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    assert_eq!(
+        Lexer::new(&struct_field_window_boundary)
+            .lex()
+            .expect("complete struct-field token boundary lex")
+            .len(),
+        512,
+        "169 unseparated fields must exactly fill the direct struct token window"
+    );
     let over_token_limit = format!("fn main(){{ value = {}1 }}", "1 + ".repeat(252));
     let comment_chunk = "x".repeat(3750);
     let near_limit_source = format!(
@@ -964,8 +1090,44 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         0,
         "stage-3 parser accepts at most 512 tokens",
     );
+    let direct_struct_source = "struct S {}";
+    let direct_struct_tokens = Lexer::new(direct_struct_source)
+        .lex()
+        .expect("direct struct-window fixture lex");
+    assert_eq!(direct_struct_tokens.len(), 5);
+    let wrong_struct_start = "fn f() {}";
+    let direct_struct_over_source = format!("struct {}", "x ".repeat(511));
+    assert_eq!(
+        Lexer::new(&direct_struct_over_source)
+            .lex()
+            .expect("direct struct-window over-limit fixture lex")
+            .len(),
+        513,
+        "direct ReadStruct fixture must exceed its token window by one"
+    );
+    let direct_struct_early_eof_message = diagnostic_at(
+        direct_struct_source,
+        direct_struct_tokens.len() - 1,
+        "EOF must be final in struct window",
+    );
+    let direct_struct_missing_eof_message = diagnostic_at(
+        direct_struct_source,
+        0,
+        "struct window must start with struct and end with EOF",
+    );
+    let direct_struct_wrong_start_message = diagnostic_at(
+        wrong_struct_start,
+        0,
+        "struct window must start with struct and end with EOF",
+    );
+    let direct_struct_trailing_source = "struct S {} struct T {}";
+    let direct_struct_trailing_message = diagnostic_at(
+        direct_struct_trailing_source,
+        4,
+        "struct window must contain exactly one declaration before EOF",
+    );
 
-    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { AstCanonical } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { MapTokenCharacters } from \"./support.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { AstCanonical } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { MapTokenCharacters } from \"./support.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
@@ -1000,6 +1162,19 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     return ok(null)
 }
 
+fn ExpectStructWindowError(tokens: [Token], expected_detail: str): null! {
+    expected_message = "error|bootstrap.parser.stage3|invalid_token_stream|<source>|" + expected_detail
+    caught = false
+    try { ReadStruct(tokens)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.parser.stage3" || err.code != "invalid_token_stream" || err.message != expected_message) {
+            panic("wrong direct struct-window diagnostic: " + err.domain + "/" + err.code + "/" + err.message + " EXPECTED " + expected_message)
+        }
+    }
+    if (!caught) { panic("expected direct struct-window error") }
+    return ok(null)
+}
+
 fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expected_detail: str): null! {
     expected_message = "error|bootstrap.parser.stage3|" + expected_code.clone() + "|<source>|" + expected_detail
     caught = false
@@ -1021,6 +1196,17 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     body.push_str(&format!(
         "    ExpectEmptyImportWindowError()?\n    direct_tokens = Scan(\"int\")?\n    direct = ParseTypeWindow(direct_tokens.clone())?\n    if (direct.work != 4) {{ panic(\"type-window validation work was not counted\") }}\n    empty_window: [Token] = []\n    ExpectTypeWindowError(empty_window, \"type window must contain one final non-type boundary token|1:1@0..1:1@0\")?\n    missing_boundary: [Token] = [direct_tokens[0].clone()]\n    ExpectTypeWindowError(missing_boundary, \"type window is missing its final non-type boundary|1:1@0..1:4@3\")?\n    early_boundary = direct_tokens.push(direct_tokens[direct_tokens.len() - 1].clone())\n    ExpectTypeWindowError(early_boundary, \"type window boundary must be final|1:4@3..1:4@3\")?\n    too_many_type_tokens = Scan({})?\n    ExpectTypeWindowError(too_many_type_tokens, \"type window accepts at most 512 tokens|1:1@0..1:2@1\")?\n",
         ku_string(&over_type_window_source)
+    ));
+    body.push_str(&format!(
+        "    empty_struct_window: [Token] = []\n    ExpectStructWindowError(empty_struct_window, \"struct window must start with struct and end with EOF|1:1@0..1:1@0\")?\n    direct_struct_tokens = Scan({})?\n    missing_struct_eof: [Token] = [direct_struct_tokens[0].clone(), direct_struct_tokens[1].clone(), direct_struct_tokens[2].clone(), direct_struct_tokens[3].clone()]\n    ExpectStructWindowError(missing_struct_eof, {})?\n    early_struct_eof: [Token] = [direct_struct_tokens[0].clone(), direct_struct_tokens[1].clone(), direct_struct_tokens[2].clone(), direct_struct_tokens[4].clone(), direct_struct_tokens[3].clone(), direct_struct_tokens[4].clone()]\n    ExpectStructWindowError(early_struct_eof, {})?\n    wrong_struct_start = Scan({})?\n    ExpectStructWindowError(wrong_struct_start, {})?\n    trailing_struct_tokens = Scan({})?\n    ExpectStructWindowError(trailing_struct_tokens, {})?\n    struct_window_over = Scan({})?\n    ExpectStructWindowError(struct_window_over, \"struct window accepts at most 512 tokens|1:1@0..1:1@0\")?\n",
+        ku_string(direct_struct_source),
+        ku_string(&direct_struct_missing_eof_message),
+        ku_string(&direct_struct_early_eof_message),
+        ku_string(wrong_struct_start),
+        ku_string(&direct_struct_wrong_start_message),
+        ku_string(direct_struct_trailing_source),
+        ku_string(&direct_struct_trailing_message),
+        ku_string(&direct_struct_over_source),
     ));
     body.push_str(&format!(
         "    AssertCase({}, {})?\n",
@@ -1191,6 +1377,19 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     let module_body_message = rust_error_canonical(module_body);
     let module_alias_message = rust_error_canonical(module_alias);
     let double_module_semicolon_message = rust_error_canonical(double_module_semicolon);
+    let missing_struct_name_message = rust_error_canonical(missing_struct_name);
+    assert_eq!(
+        missing_struct_name_message,
+        diagnostic_at(missing_struct_name, 0, "expected struct name"),
+        "the Rust parser currently relocates a missing struct name to the consumed struct token"
+    );
+    let missing_struct_open_message = rust_error_canonical(missing_struct_open);
+    let missing_struct_field_name_message = rust_error_canonical(missing_struct_field_name);
+    let missing_struct_field_colon_message = rust_error_canonical(missing_struct_field_colon);
+    let missing_struct_field_type_message = rust_error_canonical(missing_struct_field_type);
+    let missing_struct_close_message = rust_error_canonical(missing_struct_close);
+    let double_struct_field_comma_message = rust_error_canonical(double_struct_field_comma);
+    let struct_semicolon_message = rust_error_canonical(struct_semicolon);
     let nested_module_message = diagnostic_for_kind(
         nested_module,
         TokenKind::Module,
@@ -1198,8 +1397,8 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     );
     let unsupported_item_message = diagnostic_for_kind(
         unsupported_item,
-        TokenKind::Struct,
-        "stage-3 supports import, module, and ordinary function items only",
+        TokenKind::Enum,
+        "stage-3 supports import, module, struct, and ordinary function items only",
     );
     let unsupported_signature_type_message = diagnostic_at(
         unsupported_signature_type,
@@ -1289,6 +1488,11 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     );
     let module_token_limit_message = diagnostic_at(
         &over_module_token_limit,
+        0,
+        "stage-3 parser accepts at most 512 tokens",
+    );
+    let struct_token_limit_message = diagnostic_at(
+        &over_struct_token_limit,
         0,
         "stage-3 parser accepts at most 512 tokens",
     );
@@ -1473,6 +1677,42 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
             nested_module_message,
         ),
         (
+            missing_struct_name,
+            "unexpected_token",
+            missing_struct_name_message,
+        ),
+        (
+            missing_struct_open,
+            "unexpected_token",
+            missing_struct_open_message,
+        ),
+        (
+            missing_struct_field_name,
+            "unexpected_token",
+            missing_struct_field_name_message,
+        ),
+        (
+            missing_struct_field_colon,
+            "unexpected_token",
+            missing_struct_field_colon_message,
+        ),
+        (
+            missing_struct_field_type,
+            "unexpected_token",
+            missing_struct_field_type_message,
+        ),
+        (
+            missing_struct_close,
+            "unexpected_token",
+            missing_struct_close_message,
+        ),
+        (
+            double_struct_field_comma,
+            "unexpected_token",
+            double_struct_field_comma_message,
+        ),
+        (struct_semicolon, "expected_item", struct_semicolon_message),
+        (
             unsupported_item,
             "unsupported_item",
             unsupported_item_message,
@@ -1627,7 +1867,13 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         )
         .expect("copy stage-2 parser dependency");
     }
-    for name in ["imports.ku", "parser.ku", "signature.ku", "support.ku"] {
+    for name in [
+        "imports.ku",
+        "parser.ku",
+        "signature.ku",
+        "structs.ku",
+        "support.ku",
+    ] {
         fs::copy(
             repository_bootstrap.join("stage3").join(name),
             stage3.join(name),
@@ -1665,6 +1911,45 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     let module_boundary_arg = module_boundary_entry.to_string_lossy().to_string();
     run_ku(&["check", &module_boundary_arg]);
     run_ku(&["run", &module_boundary_arg]);
+
+    // Exercise the exact complete-token boundary with more than 64 struct
+    // declarations in a focused process. Keeping this out of the broad
+    // differential harness preserves the fixed per-process watchdog while
+    // proving there is no second, struct-specific item-count limit.
+    let mut struct_boundary_body =
+        "import { ParseProgram } from \"./parser.ku\"\n\nfn main(): null! {\n".to_string();
+    struct_boundary_body.push_str(&format!(
+        "    parsed = ParseProgram({})?\n    if (parsed.root != 129 || parsed.arena.nodes.len() != 129 || parsed.arena.edges.len() != 128) {{ panic(\"stage-3 struct arena boundary mismatch\") }}\n",
+        ku_string(&struct_boundary)
+    ));
+    struct_boundary_body.push_str(&format!(
+        "    caught = false\n    try {{ ParseProgram({})? }} catch(err) {{\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != \"invalid_token_stream\" || err.message != {}) {{ panic(\"wrong stage-3 struct token-limit diagnostic\") }}\n    }}\n    if (!caught) {{ panic(\"expected stage-3 struct token-limit error\") }}\n    return ok(null)\n}}\n",
+        ku_string(&over_struct_token_limit),
+        ku_string(&format!(
+            "error|bootstrap.parser.stage3|invalid_token_stream|<source>|{struct_token_limit_message}"
+        ))
+    ));
+    let struct_boundary_entry = stage3.join("struct_boundary.ku");
+    fs::write(&struct_boundary_entry, struct_boundary_body)
+        .expect("write focused stage-3 struct boundary harness");
+    let struct_boundary_arg = struct_boundary_entry.to_string_lossy().to_string();
+    run_ku(&["check", &struct_boundary_arg]);
+    run_ku(&["run", &struct_boundary_arg]);
+
+    // The same global token ceiling permits 169 no-comma fields in a single
+    // valid helper window. This focused gate catches accidental field-count
+    // limits and boundary scans that absorb the following field identifier.
+    let mut struct_field_boundary_body = "import { Scan } from \"../stage1/lexer.ku\"\nimport { ReadStruct } from \"./structs.ku\"\n\nfn main(): null! {\n".to_string();
+    struct_field_boundary_body.push_str(&format!(
+        "    parsed = ReadStruct(Scan({})?)?\n    if (parsed.output.root != 339 || parsed.output.arena.nodes.len() != 339 || parsed.output.arena.edges.len() != 338 || parsed.consumed != 511) {{ panic(\"direct struct-field token boundary mismatch\") }}\n    return ok(null)\n}}\n",
+        ku_string(&struct_field_window_boundary)
+    ));
+    let struct_field_boundary_entry = stage3.join("struct_field_boundary.ku");
+    fs::write(&struct_field_boundary_entry, struct_field_boundary_body)
+        .expect("write focused direct struct-field boundary harness");
+    let struct_field_boundary_arg = struct_field_boundary_entry.to_string_lossy().to_string();
+    run_ku(&["check", &struct_field_boundary_arg]);
+    run_ku(&["run", &struct_field_boundary_arg]);
 
     run_ku(&["build", "--native", &entry_arg]);
     let native_c = fs::read_to_string(entry.with_extension("c"))
