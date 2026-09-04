@@ -1364,10 +1364,90 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         5,
         "enum window must contain exactly one declaration before EOF",
     );
+    let direct_function_source = "fn f() {}";
+    let direct_function_tokens = Lexer::new(direct_function_source)
+        .lex()
+        .expect("direct function-window fixture lex");
+    assert_eq!(direct_function_tokens.len(), 7);
+    let wrong_function_start = "struct S {}";
+    let direct_function_over_source = format!("fn {}", "x ".repeat(511));
+    assert_eq!(
+        Lexer::new(&direct_function_over_source)
+            .lex()
+            .expect("direct function-window over-limit fixture lex")
+            .len(),
+        513,
+        "direct ReadFunction fixture must exceed its token window by one"
+    );
+    let direct_function_early_eof_message = diagnostic_at(
+        direct_function_source,
+        direct_function_tokens.len() - 1,
+        "EOF must be final in function window",
+    );
+    let direct_function_missing_eof_message = diagnostic_at(
+        direct_function_source,
+        0,
+        "function window must start with fn and end with EOF",
+    );
+    let direct_function_wrong_start_message = diagnostic_at(
+        wrong_function_start,
+        0,
+        "function window must start with fn and end with EOF",
+    );
+    let direct_function_trailing_source = "fn f() {} fn g() {}";
+    let direct_function_trailing_message = diagnostic_at(
+        direct_function_trailing_source,
+        6,
+        "function window must contain exactly one declaration before EOF",
+    );
 
-    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { AstCanonical } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { MapTokenCharacters } from \"./support.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { MapTokenCharacters } from \"./support.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
+    );
+    body.push_str(
+        r#"fn RejectFunctionExpression(start: int, end: int): ParseOutput! {
+    fail { domain: "bootstrap.parser.stage3.test", code: "unexpected_callback", message: "ReadFunction invoked its expression callback before validating the window" }
+}
+
+fn MalformedFunctionExpression(start: int, end: int): ParseOutput! {
+    node = Node {
+        kind: "Invalid", text: "", int_value: 0,
+        line: 1, column: 1, offset: 0,
+        end_line: 1, end_column: 2, end_offset: 1,
+        first_edge: 0, edge_count: 1
+    }
+    nodes: [Node] = [node]
+    edges: [int] = []
+    return ok(ParseOutput { arena: Arena { nodes: nodes, edges: edges }, root: 1 })
+}
+
+fn ExpectFunctionWindowError(tokens: [Token], expected_detail: str): null! {
+    expected_message = "error|bootstrap.parser.stage3|invalid_token_stream|<source>|" + expected_detail
+    caught = false
+    try { ReadFunction(tokens, 0, RejectFunctionExpression)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.parser.stage3" || err.code != "invalid_token_stream" || err.message != expected_message) {
+            panic("wrong direct function-window diagnostic: " + err.domain + "/" + err.code + "/" + err.message + " EXPECTED " + expected_message)
+        }
+    }
+    if (!caught) { panic("expected direct function-window error") }
+    return ok(null)
+}
+
+fn ExpectFunctionCallbackOutputError(tokens: [Token]): null! {
+    caught = false
+    try { ReadFunction(tokens, 0, MalformedFunctionExpression)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.ast" || err.code != "invalid_edge_slice" || err.message != "bootstrap AST node edge slice lies outside the edge arena") {
+            panic("wrong function callback-output diagnostic: " + err.domain + "/" + err.code + "/" + err.message)
+        }
+    }
+    if (!caught) { panic("expected malformed function callback output to be rejected") }
+    return ok(null)
+}
+
+"#,
     );
     body.push_str(
         r#"fn ExpectEmptyImportWindowError(): null! {
@@ -1470,6 +1550,20 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         ku_string(&direct_enum_trailing_message),
         ku_string(&direct_enum_over_source),
     ));
+    body.push_str(&format!(
+        "    empty_function_window: [Token] = []\n    ExpectFunctionWindowError(empty_function_window, \"function window must start with fn and end with EOF|1:1@0..1:1@0\")?\n    direct_function_tokens = Scan({})?\n    direct_function = ReadFunction(direct_function_tokens.clone(), 0, RejectFunctionExpression)?\n    if (direct_function.output.root != 1 || direct_function.output.arena.nodes.len() != 1 || direct_function.output.arena.edges.len() != 0 || direct_function.consumed != 6) {{ panic(\"direct empty function-window mismatch\") }}\n    missing_function_eof: [Token] = [direct_function_tokens[0].clone(), direct_function_tokens[1].clone(), direct_function_tokens[2].clone(), direct_function_tokens[3].clone(), direct_function_tokens[4].clone(), direct_function_tokens[5].clone()]\n    ExpectFunctionWindowError(missing_function_eof, {})?\n    early_function_eof: [Token] = [direct_function_tokens[0].clone(), direct_function_tokens[1].clone(), direct_function_tokens[2].clone(), direct_function_tokens[3].clone(), direct_function_tokens[4].clone(), direct_function_tokens[6].clone(), direct_function_tokens[5].clone(), direct_function_tokens[6].clone()]\n    ExpectFunctionWindowError(early_function_eof, {})?\n    wrong_function_start = Scan({})?\n    ExpectFunctionWindowError(wrong_function_start, {})?\n    trailing_function_tokens = Scan({})?\n    ExpectFunctionWindowError(trailing_function_tokens, {})?\n    function_window_over = Scan({})?\n    ExpectFunctionWindowError(function_window_over, \"function window accepts at most 512 tokens|1:1@0..1:1@0\")?\n",
+        ku_string(direct_function_source),
+        ku_string(&direct_function_missing_eof_message),
+        ku_string(&direct_function_early_eof_message),
+        ku_string(wrong_function_start),
+        ku_string(&direct_function_wrong_start_message),
+        ku_string(direct_function_trailing_source),
+        ku_string(&direct_function_trailing_message),
+        ku_string(&direct_function_over_source),
+    ));
+    body.push_str(
+        "    callback_function_tokens = Scan(\"fn f() { x }\")?\n    ExpectFunctionCallbackOutputError(callback_function_tokens)?\n",
+    );
     body.push_str(&format!(
         "    AssertCase({}, {})?\n",
         ku_string(TYPED_UNION_GOLDEN_SOURCE),
@@ -2296,6 +2390,7 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     }
     for name in [
         "enums.ku",
+        "functions.ku",
         "imports.ku",
         "parser.ku",
         "signature.ku",

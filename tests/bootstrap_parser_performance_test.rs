@@ -115,6 +115,8 @@ fn main(): null! {
         "stage3-success",
         "stage3-module-success",
         "stage3-named-import-success",
+        "stage3-function-statements-success",
+        "stage3-function-statements-failure",
         "stage3-struct-success",
         "stage3-struct-union-success",
         "stage3-struct-failure",
@@ -215,6 +217,7 @@ fn copy_bootstrap_sources(directory: &std::path::Path) {
                 "imports.ku",
                 "structs.ku",
                 "enums.ku",
+                "functions.ku",
                 "parser.ku",
             ][..],
         ),
@@ -340,6 +343,32 @@ static KuParserInput ku_stage3_expression_failure_input(size_t items) {
   }
   memcpy(input.data + cursor, suffix, suffix_len);
   cursor += suffix_len;
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
+static KuParserInput ku_stage3_function_statements_input(size_t statements, int failure) {
+  static const char prefix[] = "fn main(){\n";
+  static const char statement[] = "x=1\n";
+  static const char suffix[] = "}\n";
+  size_t prefix_len = sizeof(prefix) - 1, statement_len = sizeof(statement) - 1;
+  size_t suffix_len = failure ? 0 : sizeof(suffix) - 1;
+  size_t fixed_len = prefix_len + suffix_len;
+  KuParserInput input = {0};
+  if (!statements || statements > (SIZE_MAX - fixed_len) / statement_len) return input;
+  input.len = fixed_len + statements * statement_len;
+  input.data = (uint8_t*)malloc(input.len);
+  if (!input.data) return input;
+  memcpy(input.data, prefix, prefix_len);
+  size_t cursor = prefix_len;
+  for (size_t i = 0; i < statements; i++) {
+    memcpy(input.data + cursor, statement, statement_len);
+    cursor += statement_len;
+  }
+  if (!failure) {
+    memcpy(input.data + cursor, suffix, suffix_len);
+    cursor += suffix_len;
+  }
   if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
   input.hash = ku_parser_fingerprint(input.data, input.len);
   return input;
@@ -667,6 +696,23 @@ int main(void) {
   CHECK(ku_check_scale_bounded("stage3-named-import-success", @KU_STAGE3_PARSE@,
       ku_stage3_named_import_input(32), ku_stage3_named_import_input(64),
       1, "", "", "", 9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  /* A single function containing 32/64 flat assignments consumes 103/199
+     tokens including EOF. This isolates the extracted function reader's
+     statement loop: cloning its complete token window once per statement or
+     copying the growing statement/arena arrays must exceed the 2.25x gate. */
+  CHECK(ku_check_scale_bounded("stage3-function-statements-success", @KU_STAGE3_PARSE@,
+      ku_stage3_function_statements_input(32, 0),
+      ku_stage3_function_statements_input(64, 0), 1, "", "", "",
+      9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  /* The matching unterminated functions contain 102/198 tokens including EOF.
+     All statement nodes are allocated before the missing-RBrace diagnostic,
+     so the same bound also covers cleanup of the reader's partial arena. */
+  CHECK(ku_check_scale_bounded("stage3-function-statements-failure", @KU_STAGE3_PARSE@,
+      ku_stage3_function_statements_input(32, 1),
+      ku_stage3_function_statements_input(64, 1), 0,
+      "bootstrap.parser.stage3", "unexpected_eof",
+      "error|bootstrap.parser.stage3|unexpected_eof|<source>|expected '}' after function body|",
+      9, 4, 64, 16 * 1024, 8 * 1024) == 0);
   /* Each one-field struct is seven tokens, three nodes and three edges once
      linked by Program. Thus 32/64 items consume 225/449 tokens including EOF,
      97/193 nodes and 96/192 edges, all strictly inside the Stage 3 gates.
