@@ -2,7 +2,8 @@ use ku::ast::{BinaryOp, ExprKind, Item, Stmt};
 use ku::cli::{check_source, run_source};
 use ku::lexer::Lexer;
 use ku::parser::Parser;
-use ku::token::TokenKind;
+use ku::span::{Position, Span};
+use ku::token::{Token, TokenKind};
 
 fn check_err(source: &str) -> String {
     check_source("inline.ku", source)
@@ -152,6 +153,103 @@ fn null_equality_is_allowed_but_null_math_is_rejected() {
         .expect("null equality should pass");
     let err = check_err("fn main() { print(null + null) }");
     assert!(err.contains("type error"), "unexpected error: {err}");
+}
+
+#[test]
+fn parser_expression_only_reports_eof_without_panicking() {
+    let empty_tokens = Lexer::new("").tokenize().expect("empty source should lex");
+    let empty_eof = empty_tokens.last().expect("lexer must emit EOF").span;
+    let empty_error = Parser::new(empty_tokens)
+        .parse_expression_only()
+        .expect_err("empty expression must fail");
+    assert_eq!(empty_error.message, "expected expression");
+    assert_eq!(empty_error.span, empty_eof);
+
+    let explicit_eof = Span::point(Position::new(7, 3, 42));
+    let explicit_error = Parser::new(vec![Token::new(TokenKind::Eof, explicit_eof)])
+        .parse_expression_only()
+        .expect_err("an EOF-only token stream must fail");
+    assert_eq!(explicit_error.message, "expected expression");
+    assert_eq!(explicit_error.span, explicit_eof);
+
+    let trailing_operator_tokens = Lexer::new("1 +")
+        .tokenize()
+        .expect("trailing operator fixture should lex");
+    let trailing_eof = trailing_operator_tokens
+        .last()
+        .expect("lexer must emit EOF")
+        .span;
+    let trailing_error = Parser::new(trailing_operator_tokens)
+        .parse_expression_only()
+        .expect_err("operator followed by EOF must fail");
+    assert_eq!(trailing_error.message, "expected expression");
+    assert_eq!(trailing_error.span, trailing_eof);
+}
+
+#[test]
+fn parser_rejects_invalid_token_streams_without_panicking() {
+    let program_error = Parser::new(Vec::new())
+        .parse()
+        .expect_err("empty program token stream must fail");
+    assert_eq!(program_error.message, "token stream is empty");
+    assert_eq!(program_error.span, Span::default());
+
+    let expression_error = Parser::new(Vec::new())
+        .parse_expression_only()
+        .expect_err("empty expression token stream must fail");
+    assert_eq!(expression_error.message, "token stream is empty");
+    assert_eq!(expression_error.span, Span::default());
+
+    let value_span = Span::point(Position::new(2, 4, 9));
+    let missing_program_eof = Parser::new(vec![Token::new(TokenKind::Int(1), value_span)])
+        .parse()
+        .expect_err("program token stream missing EOF must fail closed");
+    assert_eq!(missing_program_eof.message, "token stream is missing EOF");
+    assert_eq!(missing_program_eof.span, value_span);
+
+    let missing_expression_eof = Parser::new(vec![Token::new(TokenKind::Int(1), value_span)])
+        .parse_expression_only()
+        .expect_err("expression token stream missing EOF must fail closed");
+    assert_eq!(
+        missing_expression_eof.message,
+        "token stream is missing EOF"
+    );
+    assert_eq!(missing_expression_eof.span, value_span);
+
+    let eof_span = Span::point(Position::new(1, 1, 0));
+    let early_eof = Parser::new(vec![
+        Token::new(TokenKind::Eof, eof_span),
+        Token::new(TokenKind::Int(1), value_span),
+    ])
+    .parse()
+    .expect_err("non-final EOF must fail closed");
+    assert_eq!(early_eof.message, "EOF must be the final token");
+    assert_eq!(early_eof.span, eof_span);
+
+    let final_eof_span = Span::point(Position::new(2, 5, 10));
+    let early_eof_with_final_eof = Parser::new(vec![
+        Token::new(TokenKind::Eof, eof_span),
+        Token::new(TokenKind::Int(1), value_span),
+        Token::new(TokenKind::Eof, final_eof_span),
+    ])
+    .parse_expression_only()
+    .expect_err("an EOF before the final EOF must fail closed");
+    assert_eq!(
+        early_eof_with_final_eof.message,
+        "EOF must be the final token"
+    );
+    assert_eq!(early_eof_with_final_eof.span, eof_span);
+
+    let oversized_span = Span::point(Position::new(3, 2, 11));
+    let oversized_broken_stream = vec![Token::new(TokenKind::Int(1), oversized_span); 100_001];
+    let oversized_error = Parser::new(oversized_broken_stream)
+        .parse_expression_only()
+        .expect_err("token limit must take priority over malformed stream shape");
+    assert_eq!(
+        oversized_error.message,
+        "too many tokens; input is too large for Ku"
+    );
+    assert_eq!(oversized_error.span, oversized_span);
 }
 
 #[test]

@@ -22,7 +22,7 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> KuResult<Program> {
-        self.check_token_limit()?;
+        self.check_token_stream()?;
         let mut items = Vec::new();
         while !self.check(&TokenKind::Eof) {
             items.push(self.item()?);
@@ -35,21 +35,38 @@ impl Parser {
     }
 
     pub fn parse_expression_only(&mut self) -> KuResult<Expr> {
-        self.check_token_limit()?;
+        self.check_token_stream()?;
         let expr = self.expression()?;
         self.consume(&TokenKind::Eof, "expected end of expression")?;
         Ok(expr)
     }
 
-    fn check_token_limit(&self) -> KuResult<()> {
+    fn check_token_stream(&self) -> KuResult<()> {
         if self.tokens.len() > MAX_TOKENS {
-            Err(KuError::parse(
+            return Err(KuError::parse(
                 "too many tokens; input is too large for Ku",
-                self.peek().span,
-            ))
-        } else {
-            Ok(())
+                self.tokens
+                    .first()
+                    .map_or_else(Span::default, |token| token.span),
+            ));
         }
+
+        let Some(last) = self.tokens.last() else {
+            return Err(KuError::parse("token stream is empty", Span::default()));
+        };
+        if let Some(early_eof) = self.tokens[..self.tokens.len() - 1]
+            .iter()
+            .find(|token| matches!(token.kind, TokenKind::Eof))
+        {
+            return Err(KuError::parse(
+                "EOF must be the final token",
+                early_eof.span,
+            ));
+        }
+        if !matches!(last.kind, TokenKind::Eof) {
+            return Err(KuError::parse("token stream is missing EOF", last.span));
+        }
+        Ok(())
     }
 
     fn item(&mut self) -> KuResult<Item> {
@@ -1167,6 +1184,9 @@ impl Parser {
     }
 
     fn primary(&mut self) -> KuResult<Expr> {
+        if self.check(&TokenKind::Eof) {
+            return Err(KuError::parse("expected expression", self.peek().span));
+        }
         if self.is_arrow_function_start() {
             return self.arrow_function();
         }
