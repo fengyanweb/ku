@@ -342,6 +342,9 @@ impl Parser {
     }
 
     fn type_atom(&mut self) -> KuResult<TypeName> {
+        if self.check(&TokenKind::Eof) {
+            return Err(KuError::parse("expected type name", self.peek().span));
+        }
         if self.match_kind(&TokenKind::LBracket) {
             let inner = self.type_name()?;
             self.consume(&TokenKind::RBracket, "expected ']' after array type")?;

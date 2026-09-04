@@ -187,6 +187,36 @@ fn parser_expression_only_reports_eof_without_panicking() {
 }
 
 #[test]
+fn parser_type_atom_reports_eof_and_boundary_spans_without_panicking() {
+    for source in ["fn f(value: int |", "fn f(value: fn(int |"] {
+        let tokens = Lexer::new(source)
+            .tokenize()
+            .expect("incomplete type fixture should lex");
+        let eof_span = tokens.last().expect("lexer must emit EOF").span;
+        let error = Parser::new(tokens)
+            .parse()
+            .expect_err("a union arm missing at EOF must fail");
+        assert_eq!(error.message, "expected type name");
+        assert_eq!(error.span, eof_span);
+    }
+
+    let boundary_source = "fn f(value: int |) {}";
+    let boundary_tokens = Lexer::new(boundary_source)
+        .tokenize()
+        .expect("bounded incomplete type fixture should lex");
+    let boundary_span = boundary_tokens
+        .iter()
+        .find(|token| matches!(token.kind, TokenKind::RParen))
+        .expect("fixture must contain a parameter boundary")
+        .span;
+    let boundary_error = Parser::new(boundary_tokens)
+        .parse()
+        .expect_err("a union arm missing before ')' must fail");
+    assert_eq!(boundary_error.message, "expected type name");
+    assert_eq!(boundary_error.span, boundary_span);
+}
+
+#[test]
 fn parser_rejects_invalid_token_streams_without_panicking() {
     let program_error = Parser::new(Vec::new())
         .parse()
