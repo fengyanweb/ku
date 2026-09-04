@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
-import { SpanFromToken } from "../stage2/span.ku"
+import { Span, SpanFromToken } from "../stage2/span.ku"
 import { MakeDiagnostic, DiagnosticCanonical } from "../stage2/diagnostic.ku"
-import { ParseOutput } from "../stage2/ast.ku"
+import { Node, ParseOutput } from "../stage2/ast.ku"
 import { ParseWithContext } from "../stage2/parser.ku"
 import { ParseContext } from "../stage2/context.ku"
 
@@ -10,6 +10,17 @@ struct SourceMap {
     characters: [str]
     starts: [int]
     ends: [int]
+}
+
+fn SpanFromNode(node: Node): Span {
+    return Span {
+        line: node.line,
+        column: node.column,
+        offset: node.offset,
+        end_line: node.end_line,
+        end_column: node.end_column,
+        end_offset: node.end_offset
+    }
 }
 
 // Pure Stage 3 helpers live outside parser.ku so each self-hosted source file

@@ -9,8 +9,8 @@ pub mod bounded_process;
 
 use bounded_process::{run_bounded, OutputLimits};
 use ku::ast::{
-    BinaryOp, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item, Literal, Stmt, TypeName,
-    UnaryOp,
+    BinaryOp, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item, Literal, ModuleDecl, Stmt,
+    TypeName, UnaryOp,
 };
 use ku::lexer::Lexer;
 use ku::parser::Parser;
@@ -52,6 +52,15 @@ const TYPED_UNION_GOLDEN: &str = concat!(
     "EDGE|7|7\n",
     "EDGE|8|9\n",
     "EDGE|9|10",
+);
+const MODULE_GOLDEN_SOURCE: &str = "// 前😀\r\nmodule App;\r\nfn main() {}";
+const MODULE_GOLDEN: &str = concat!(
+    "ROOT|3\n",
+    "NODE|1|Module|App|0|2:1@12..2:11@22|0|0\n",
+    "NODE|2|Function|main|0|3:1@25..3:13@37|0|0\n",
+    "NODE|3|Program||0|2:1@12..3:13@37|0|2\n",
+    "EDGE|0|1\n",
+    "EDGE|1|2",
 );
 const UNICODE_CRLF_ERROR_SOURCE: &str =
     "// 前😀\r\nfn main() {\r\n  text:str = \"中😀\"\r\n  value = 1 + ;\r\n}";
@@ -494,6 +503,10 @@ fn project_function(source: &str, function: &FnDecl, arena: &mut ProjectedArena)
     )
 }
 
+fn project_module(module: &ModuleDecl, arena: &mut ProjectedArena) -> usize {
+    push_node(arena, "Module", module.name.clone(), 0, module.span, &[])
+}
+
 fn rust_canonical(source: &str) -> String {
     let tokens = Lexer::new(source).lex().expect("Rust oracle lex");
     let eof_span = tokens.last().expect("EOF token").span;
@@ -507,6 +520,7 @@ fn rust_canonical(source: &str) -> String {
         .map(|item| match item {
             Item::Import(import) => project_import(source, import, &mut arena),
             Item::Function(function) => project_function(source, function, &mut arena),
+            Item::Module(module) => project_module(module, &mut arena),
             other => panic!("stage-3 oracle received unsupported item: {other:?}"),
         })
         .collect::<Vec<_>>();
@@ -615,6 +629,7 @@ fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
         rust_canonical(TYPED_UNION_GOLDEN_SOURCE),
         TYPED_UNION_GOLDEN
     );
+    assert_eq!(rust_canonical(MODULE_GOLDEN_SOURCE), MODULE_GOLDEN);
     assert_eq!(
         rust_diagnostic_canonical(UNICODE_CRLF_ERROR_SOURCE),
         UNICODE_CRLF_ERROR_CANONICAL
@@ -680,6 +695,11 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "",
         "import \"./setup.ku\";\nfn before() {}\nimport math from \"./math.ku\"\nimport { Add, User as Person } from \"./api.ku\"\nfn main() { return Add(1, 2) }",
         "// 导入😀\r\nimport { Add as Plus } from \"./中😀.ku\"\r\nimport \"./tab\\tname.ku\"\r\nfn main() {}",
+        "module App",
+        "module App;",
+        MODULE_GOLDEN_SOURCE,
+        "import \"./setup.ku\"\nmodule App;\nfn main() {}",
+        "module Same\nmodule Same;",
         "fn main() {}",
         "fn typed(): int { return 1 }",
         "fn add(left: int, right: int): int { return left + right }\nfn echo(value): str { return \"ok\" }",
@@ -754,6 +774,13 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let early_namespace_path = "import ns \"early\"";
     let second_string_item = "import \"first\" \"second\"";
     let second_missing_import = "import { A } from \"first\"; import";
+    let missing_module_name = "module";
+    let keyword_module_name = "module fn";
+    let dotted_module_name = "module pkg.name";
+    let module_body = "module App {}";
+    let module_alias = "module App as Other";
+    let double_module_semicolon = "module App;;";
+    let nested_module = "fn main() { module Inner }";
     let unsupported_item = "struct User {}";
     let parameter_boundary = format!(
         "fn many({}): null {{ return null }}",
@@ -849,6 +876,24 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let function_boundary = "fn f(){}".repeat(64);
     let over_function_limit = "fn f(){}".repeat(65);
     let functions_then_import = format!("{function_boundary}import \"tail\"");
+    let module_boundary = "module M\n".repeat(255);
+    let over_module_token_limit = "module M\n".repeat(256);
+    assert_eq!(
+        Lexer::new(&module_boundary)
+            .lex()
+            .expect("255-module boundary lex")
+            .len(),
+        511,
+        "255 modules must fit the complete Stage-3 token budget"
+    );
+    assert_eq!(
+        Lexer::new(&over_module_token_limit)
+            .lex()
+            .expect("256-module over-limit lex")
+            .len(),
+        513,
+        "256 modules must exceed the complete Stage-3 token budget"
+    );
     let over_token_limit = format!("fn main(){{ value = {}1 }}", "1 + ".repeat(252));
     let comment_chunk = "x".repeat(3750);
     let near_limit_source = format!(
@@ -1135,10 +1180,26 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     let early_namespace_path_message = rust_error_canonical(early_namespace_path);
     let second_string_item_message = rust_error_canonical(second_string_item);
     let second_missing_import_message = rust_error_canonical(second_missing_import);
+    let missing_module_name_message = rust_error_canonical(missing_module_name);
+    assert_eq!(
+        missing_module_name_message,
+        diagnostic_at(missing_module_name, 0, "expected module name"),
+        "the Rust parser currently relocates a missing module name to the consumed module token"
+    );
+    let keyword_module_name_message = rust_error_canonical(keyword_module_name);
+    let dotted_module_name_message = rust_error_canonical(dotted_module_name);
+    let module_body_message = rust_error_canonical(module_body);
+    let module_alias_message = rust_error_canonical(module_alias);
+    let double_module_semicolon_message = rust_error_canonical(double_module_semicolon);
+    let nested_module_message = diagnostic_for_kind(
+        nested_module,
+        TokenKind::Module,
+        "expression form is outside the stage-2 bootstrap subset",
+    );
     let unsupported_item_message = diagnostic_for_kind(
         unsupported_item,
         TokenKind::Struct,
-        "stage-3 supports import and ordinary function items only",
+        "stage-3 supports import, module, and ordinary function items only",
     );
     let unsupported_signature_type_message = diagnostic_at(
         unsupported_signature_type,
@@ -1223,6 +1284,11 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     );
     let token_message = diagnostic_at(
         &over_token_limit,
+        0,
+        "stage-3 parser accepts at most 512 tokens",
+    );
+    let module_token_limit_message = diagnostic_at(
+        &over_module_token_limit,
         0,
         "stage-3 parser accepts at most 512 tokens",
     );
@@ -1378,6 +1444,33 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
             second_missing_import,
             "unexpected_token",
             second_missing_import_message,
+        ),
+        (
+            missing_module_name,
+            "unexpected_token",
+            missing_module_name_message,
+        ),
+        (
+            keyword_module_name,
+            "unexpected_token",
+            keyword_module_name_message,
+        ),
+        (
+            dotted_module_name,
+            "expected_item",
+            dotted_module_name_message,
+        ),
+        (module_body, "expected_item", module_body_message),
+        (module_alias, "expected_item", module_alias_message),
+        (
+            double_module_semicolon,
+            "expected_item",
+            double_module_semicolon_message,
+        ),
+        (
+            nested_module,
+            "unsupported_expression",
+            nested_module_message,
         ),
         (
             unsupported_item,
@@ -1546,6 +1639,33 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     let entry_arg = entry.to_string_lossy().to_string();
     run_ku(&["check", &entry_arg]);
     run_ku(&["run", &entry_arg]);
+
+    // Keep the exact complete-module token boundary out of the already broad
+    // differential process. The interpreter's captured-array implementation
+    // makes the 255-node arena materially more expensive than the small
+    // semantic cases, and combining both workloads leaves no watchdog margin
+    // on slower CI hosts. This focused process still exercises both sides of
+    // the boundary through the same self-hosted ParseProgram implementation.
+    let mut module_boundary_body =
+        "import { ParseProgram } from \"./parser.ku\"\n\nfn main(): null! {\n".to_string();
+    module_boundary_body.push_str(&format!(
+        "    parsed = ParseProgram({})?\n    if (parsed.root != 256 || parsed.arena.nodes.len() != 256 || parsed.arena.edges.len() != 255) {{ panic(\"stage-3 module arena boundary mismatch\") }}\n",
+        ku_string(&module_boundary)
+    ));
+    module_boundary_body.push_str(&format!(
+        "    caught = false\n    try {{ ParseProgram({})? }} catch(err) {{\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != \"invalid_token_stream\" || err.message != {}) {{ panic(\"wrong stage-3 module token-limit diagnostic\") }}\n    }}\n    if (!caught) {{ panic(\"expected stage-3 module token-limit error\") }}\n    return ok(null)\n}}\n",
+        ku_string(&over_module_token_limit),
+        ku_string(&format!(
+            "error|bootstrap.parser.stage3|invalid_token_stream|<source>|{module_token_limit_message}"
+        ))
+    ));
+    let module_boundary_entry = stage3.join("module_boundary.ku");
+    fs::write(&module_boundary_entry, module_boundary_body)
+        .expect("write focused stage-3 module boundary harness");
+    let module_boundary_arg = module_boundary_entry.to_string_lossy().to_string();
+    run_ku(&["check", &module_boundary_arg]);
+    run_ku(&["run", &module_boundary_arg]);
+
     run_ku(&["build", "--native", &entry_arg]);
     let native_c = fs::read_to_string(entry.with_extension("c"))
         .expect("stage-3 native build must emit a C artifact");
