@@ -243,6 +243,7 @@ fn ParseProgram(source: str): ParseOutput! {
             window_cursor = cursor
             collecting_import = true
             after_path = false
+            window_is_eof = false
             while (collecting_import) {
                 if (window_cursor >= tokens.len()) {
                     RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "import inspection escaped the token stream")?
@@ -254,16 +255,19 @@ fn ParseProgram(source: str): ParseOutput! {
                     RejectAt(tokens[window_cursor].clone(), "work_limit", "stage-3 import inspection budget exceeded")?
                 }
                 window_token = tokens[window_cursor].clone()
-                import_window = import_window.push(window_token.clone())
+                window_is_eof = window_token.kind == "Eof"
+                window_is_string = window_token.kind == "String"
+                import_window = import_window.push(window_token)
                 window_cursor = window_cursor + 1
-                if (after_path || window_token.kind == "Eof") {
+                if (after_path || window_is_eof) {
                     collecting_import = false
-                } else if (window_token.kind == "String") {
+                } else if (window_is_string) {
                     after_path = true
                 }
             }
-            if (import_window[import_window.len() - 1].kind != "Eof") {
-                import_window = import_window.push(eof.clone())
+            if (!window_is_eof) {
+                import_eof = eof.clone()
+                import_window = import_window.push(import_eof)
             }
             parsed = ReadImport(import_window)?
             parse_steps = parse_steps + parsed.work

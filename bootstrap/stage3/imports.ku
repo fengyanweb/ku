@@ -86,7 +86,8 @@ fn ReadImport(tokens: [Token]): ImportRead! {
                 has_alias = true
                 if (tokens[cursor].kind != "Eof") { cursor = cursor + 1 }
             }
-            names = names.push(ImportNameRead { source: source, alias: alias, has_alias: has_alias })
+            import_name = ImportNameRead { source: source, alias: alias, has_alias: has_alias }
+            names = names.push(import_name)
             if (tokens[cursor].kind == "Comma") {
                 cursor = cursor + 1
             } else {
