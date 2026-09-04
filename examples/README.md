@@ -21,7 +21,7 @@ ku package pack examples/package
 
 `pg_demo.ku` / `redis_demo.ku` / `mysql_demo.ku` / `http_pg.ku` 使用 `std.pg` / `std.redis` / `std.mysql`。三者只有一种普通业务写法：`module.client(config)?` 创建内部自动池化的 client，随后调用 receiver 方法；旧的 raw connection / 手动 pool 模块函数不再支持。这些驱动目前**只支持 native 后端**(`ku build --native`),解释器 `ku run` 暂不支持连库。
 
-三个驱动的构造前配置错误统一为 `invalid_config`。业务 `catch(err)` 可以跨驱动统一处理 client/池阶段的 `client_closed`、`pool_busy`、`acquire_timeout`、`connect_timeout`、`connect_error`、`sync_error`、`out_of_memory`。命令或 SQL 已发送后的 `execution_unknown` / `execution_completed_without_result` 等错误不属于该集合，禁止自动重试。
+三个驱动的构造前配置错误统一为 `invalid_config`。业务 `catch(err)` 可以跨驱动统一处理 client/池阶段的 `client_closed`、`pool_busy`、`acquire_timeout`、`connect_timeout`、`connect_error`、`sync_error`、`out_of_memory`。命令或 SQL 已发送后的 `execution_unknown` / `execution_completed_without_result` 等错误不属于该集合，禁止自动重试。PG/MySQL 的 `session_state_unsupported` 也不能仅凭 code 自动重试：前置固定消息表示 SQL 尚未发送，后置固定消息表示语句已经或可能已经执行且 payload 已丢弃。
 
 ### 凭据放在 gitignore 的本地文件里
 
@@ -66,7 +66,7 @@ ku build --native examples/http_pg.ku -o http_pg.exe
 ### 说明
 
 - **注入安全**:`pg_demo` 使用 `PQsendQueryParams`，`mysql_demo` 使用 `MYSQL_STMT`；两者的参数都由服务端绑定，不做 SQL 字符串替换。注入 payload(如 `'; DROP TABLE users; --`)只会被当作值。
-- **池内会话隔离**：PG 每次归还前执行 `DISCARD ALL`，MySQL 使用 `mysql_reset_connection()`；reset/statement 清理失败会淘汰该连接。安全隔离会为每次 SQL 增加一次协议往返，示例不依赖跨查询 session 状态。
-- **禁止盲目重试**：PG/MySQL 的 `execution_unknown` 表示语句可能已执行，`execution_completed_without_result` 表示服务端已成功但结果无法交付；两者都不能自动重试非幂等写入。
+- **池内会话隔离**：PG 每次归还前执行 `DISCARD ALL`，MySQL 使用 `mysql_reset_connection()`；reset/statement 清理失败会淘汰该连接。安全隔离会为每次 SQL 增加一次协议往返，示例不依赖跨查询 session 状态。MySQL 顶层 `CALL` 在实现有界的全结果消费前会在借连接前拒绝。
+- **禁止盲目重试**：PG/MySQL 的 `execution_unknown` 表示语句可能已执行，`execution_completed_without_result` 只用于已确认终态后本地结果无法交付；两者都不能自动重试非幂等写入。MySQL 有列 prepared result 只有读到 `MYSQL_NO_DATA` 才确认当前结果终态，`mysql_stmt_execute()==0` 本身不够。
 - **http_pg 的 JSON 输出**：`http.text` 只设置文本响应，body 必须由 `json.stringify` 生成；数据库返回文本禁止直接拼进 JSON。前端只用 `textContent` 创建数据节点，不把响应值写入 `innerHTML`。
 - 查询只读元数据(版本、库名、表数量等),不改动任何数据。

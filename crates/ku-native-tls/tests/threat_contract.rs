@@ -4,7 +4,9 @@ use std::ptr;
 use std::sync::Arc;
 
 use ku_native_tls::*;
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use rcgen::{
+    generate_simple_self_signed, CertificateParams, CertifiedKey, CustomExtension, KeyPair,
+};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection, SupportedProtocolVersion};
 
@@ -19,6 +21,26 @@ impl Fixture {
         let CertifiedKey { cert, key_pair } =
             generate_simple_self_signed(vec!["localhost".to_string()])
                 .expect("generate test certificate");
+        Self {
+            certificate_pem: cert.pem(),
+            certificate_der: cert.der().clone(),
+            private_key_der: key_pair.serialize_der(),
+        }
+    }
+
+    fn with_large_noncritical_extension(extension_bytes: usize) -> Self {
+        let key_pair = KeyPair::generate().expect("generate large-fixture key");
+        let mut params = CertificateParams::new(vec!["localhost".to_string()])
+            .expect("create large-fixture certificate parameters");
+        params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 55555, 1],
+                vec![0x42; extension_bytes],
+            ));
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("generate large-fixture certificate");
         Self {
             certificate_pem: cert.pem(),
             certificate_der: cert.der().clone(),
@@ -337,6 +359,20 @@ fn tls12_and_tls13_handshake_and_binary_plaintext_round_trip() {
             assert_eq!(received, response);
         }
     }
+}
+
+#[test]
+fn one_byte_fragmentation_of_large_valid_server_flight_completes() {
+    let fixture = Fixture::with_large_noncritical_extension(8 * 1024);
+    assert!(
+        fixture.certificate_der.len() > KU_TLS_MAX_HANDSHAKE_ITERATIONS as usize,
+        "fixture must exceed the old per-feed iteration limit"
+    );
+    let client = Client::custom(fixture.certificate_pem.as_bytes(), b"localhost")
+        .expect("create custom-root client");
+    let mut server = fixture.server(&rustls::version::TLS13);
+    handshake(&client, &mut server, 1)
+        .expect("a valid large TLS flight must survive one-byte fragmentation");
 }
 
 #[test]

@@ -28,6 +28,7 @@ use crate::{
     interpreter::Interpreter,
     ir,
     lexer::Lexer,
+    native_tls_archive::{self, NativeTlsArchiveFormat},
     package::{self, DependencyResolveMode, PackageContext},
     parser::Parser,
     span::Span,
@@ -46,6 +47,9 @@ const MAX_IMPORT_BINDINGS: usize = 16_384;
 const MAX_RLIB_DIRECTORY_ENTRIES: usize = 16_384;
 const MAX_LIBPQ_LIBRARY_DIRECTORY_ENTRIES: usize = 128;
 const MAX_PINNED_LINK_LIBRARY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_NATIVE_TLS_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_NATIVE_TLS_HEADER_BYTES: u64 = 64 * 1024;
+const MAX_NATIVE_TLS_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_NATIVE_LINK_OUTPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_IMPORT_LIBRARY_INSPECTION_BYTES: u64 = 64 * 1024 * 1024;
 const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2791,6 +2795,7 @@ struct CSourceFeatures {
     pthreads: bool,
     libpq: bool,
     libmysql: bool,
+    native_tls: bool,
 }
 
 impl CSourceFeatures {
@@ -2810,6 +2815,9 @@ impl CSourceFeatures {
             libmysql: text
                 .lines()
                 .any(|line| line == "#define KU_FEATURE_LIBMYSQL 1"),
+            native_tls: text
+                .lines()
+                .any(|line| line == "#define KU_FEATURE_NATIVE_TLS 1"),
         })
     }
 }
@@ -3222,6 +3230,7 @@ struct PinnedLinkLibrary {
 struct StagedLinkLibrary {
     _directory: TempBuildDir,
     path: PathBuf,
+    sha256: [u8; 32],
 }
 
 impl StagedLinkLibrary {
@@ -3456,7 +3465,9 @@ impl PinnedLinkLibrary {
             }
             staged_digest.update(&buffer[..read]);
         }
-        if verified != before.length || staged_digest.finalize() != source_digest.finalize() {
+        let staged_digest: [u8; 32] = staged_digest.finalize().into();
+        let source_digest: [u8; 32] = source_digest.finalize().into();
+        if verified != before.length || staged_digest != source_digest {
             return Err(KuError::message(format!(
                 "private {library} link input '{}' failed its content verification",
                 staged_path.display()
@@ -3466,8 +3477,648 @@ impl PinnedLinkLibrary {
         Ok(StagedLinkLibrary {
             _directory: directory,
             path: staged_path,
+            sha256: staged_digest,
         })
     }
+}
+
+const NATIVE_TLS_BUILD_ID: &str = "ku-native-tls/0.1.0;abi=1;rustls=0.23.40;ring=0.17.14;webpki-roots=1.0.7;buffer=65536;handshake=1048576;record-staging=65540;resumption=disabled";
+const NATIVE_TLS_MANIFEST_FIELDS: [&str; 13] = [
+    "format",
+    "target",
+    "flavor",
+    "object_format",
+    "abi_version",
+    "panic",
+    "build_id",
+    "archive_size",
+    "archive_sha256",
+    "header_size",
+    "header_sha256",
+    "link_contract",
+    "crt",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeTlsLinkContract {
+    target: &'static str,
+    flavor: &'static str,
+    object_format: &'static str,
+    archive_name: &'static str,
+    link_contract: &'static str,
+    crt: &'static str,
+    native_libraries: &'static [&'static str],
+}
+
+const NATIVE_TLS_LINUX_LIBRARIES: &[&str] = &[
+    "-lgcc_s",
+    "-lutil",
+    "-lrt",
+    "-lpthread",
+    "-lm",
+    "-ldl",
+    "-lc",
+];
+const NATIVE_TLS_WINDOWS_GNU_LIBRARIES: &[&str] = &[
+    "-lbcrypt",
+    "-ladvapi32",
+    "-lkernel32",
+    "-lntdll",
+    "-luserenv",
+    "-lws2_32",
+    "-ldbghelp",
+];
+const NATIVE_TLS_WINDOWS_MSVC_LIBRARIES: &[&str] = &[
+    "bcrypt.lib",
+    "advapi32.lib",
+    "kernel32.lib",
+    "ntdll.lib",
+    "userenv.lib",
+    "ws2_32.lib",
+    "dbghelp.lib",
+    "/defaultlib:msvcrt",
+];
+const NATIVE_TLS_DARWIN_LIBRARIES: &[&str] = &["-lSystem", "-lc", "-lm"];
+
+const NATIVE_TLS_LINUX_CONTRACT: NativeTlsLinkContract = NativeTlsLinkContract {
+    target: "x86_64-unknown-linux-gnu",
+    flavor: "gnu",
+    object_format: "elf-x86_64",
+    archive_name: "libku_native_tls.a",
+    link_contract: "rust-1.89.0-linux-gnu-v1",
+    crt: "system-dynamic",
+    native_libraries: NATIVE_TLS_LINUX_LIBRARIES,
+};
+const NATIVE_TLS_WINDOWS_GNU_CONTRACT: NativeTlsLinkContract = NativeTlsLinkContract {
+    target: "x86_64-pc-windows-gnu",
+    flavor: "gnu",
+    object_format: "coff-x86_64",
+    archive_name: "libku_native_tls.a",
+    link_contract: "rust-1.89.0-windows-gnu-v1",
+    crt: "mingw-dynamic",
+    native_libraries: NATIVE_TLS_WINDOWS_GNU_LIBRARIES,
+};
+const NATIVE_TLS_WINDOWS_MSVC_CONTRACT: NativeTlsLinkContract = NativeTlsLinkContract {
+    target: "x86_64-pc-windows-msvc",
+    flavor: "msvc",
+    object_format: "coff-x86_64",
+    archive_name: "ku_native_tls.lib",
+    link_contract: "rust-1.89.0-windows-msvc-v1",
+    crt: "msvc-dynamic",
+    native_libraries: NATIVE_TLS_WINDOWS_MSVC_LIBRARIES,
+};
+const NATIVE_TLS_DARWIN_CONTRACT: NativeTlsLinkContract = NativeTlsLinkContract {
+    target: "aarch64-apple-darwin",
+    flavor: "apple",
+    object_format: "macho-arm64",
+    archive_name: "libku_native_tls.a",
+    link_contract: "rust-1.89.0-darwin-v1",
+    crt: "system-dynamic",
+    native_libraries: NATIVE_TLS_DARWIN_LIBRARIES,
+};
+
+#[derive(Debug)]
+struct NativeTlsPackRoot {
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct NativeTlsPack {
+    contract: NativeTlsLinkContract,
+    archive: PinnedLinkLibrary,
+    archive_sha256: [u8; 32],
+    _header: PinnedLinkLibrary,
+    _manifest: PinnedLinkLibrary,
+}
+
+struct StagedNativeTlsPack {
+    contract: NativeTlsLinkContract,
+    archive: StagedLinkLibrary,
+}
+
+impl NativeTlsPack {
+    fn stage_for_link(&self) -> Result<StagedNativeTlsPack, KuError> {
+        let archive = self.archive.stage_for_link("native TLS archive")?;
+        if archive.sha256 != self.archive_sha256 {
+            return Err(KuError::message(
+                "native TLS archive changed before its private link copy; refusing to link",
+            ));
+        }
+        Ok(StagedNativeTlsPack {
+            contract: self.contract,
+            archive,
+        })
+    }
+}
+
+fn resolve_native_tls_pack_root(
+    configured: Option<OsString>,
+) -> Result<NativeTlsPackRoot, KuError> {
+    let executable = env::current_exe().map_err(|error| {
+        KuError::message(format!(
+            "failed to locate the Ku executable for native TLS target-pack discovery: {error}"
+        ))
+    })?;
+    resolve_native_tls_pack_root_from(configured, &executable)
+}
+
+fn resolve_native_tls_pack_root_from(
+    configured: Option<OsString>,
+    executable: &Path,
+) -> Result<NativeTlsPackRoot, KuError> {
+    let requested = if let Some(configured) = configured {
+        if configured.is_empty() {
+            return Err(KuError::message(
+                "KU_NATIVE_TLS_PACK is set but empty\nhelp: set it to the absolute native TLS v1 target-pack root, or unset it to use the pack beside the Ku executable",
+            ));
+        }
+        let path = PathBuf::from(configured);
+        if !path.is_absolute() {
+            return Err(KuError::message(
+                "KU_NATIVE_TLS_PACK must be an absolute directory; relative target-pack lookup is forbidden",
+            ));
+        }
+        path
+    } else {
+        let parent = executable.parent().ok_or_else(|| {
+            KuError::message("the Ku executable has no parent directory for native TLS discovery")
+        })?;
+        parent.join("native-tls").join("v1")
+    };
+    let canonical = fs::canonicalize(&requested).map_err(|error| {
+        KuError::message(format!(
+            "failed to resolve native TLS target-pack root '{}': {error}\nhelp: install the v1 target pack or set KU_NATIVE_TLS_PACK to its absolute root",
+            requested.display()
+        ))
+    })?;
+    if !path_is_plain_directory(&canonical) {
+        return Err(KuError::message(format!(
+            "native TLS target-pack root '{}' must resolve to a plain directory",
+            requested.display()
+        )));
+    }
+    Ok(NativeTlsPackRoot { path: canonical })
+}
+
+fn native_tls_contract_for_compiler(
+    target: &BuildTarget,
+    candidate: &CCompilerCandidate,
+    effective_target: Option<&str>,
+) -> Result<NativeTlsLinkContract, KuError> {
+    let effective_target = effective_target.ok_or_else(|| {
+        KuError::message(format!(
+            "cannot determine the effective target of compiler '{}' for native TLS",
+            candidate.label
+        ))
+    })?;
+    let value = effective_target.to_ascii_lowercase();
+    let x86_64 = value.contains("x86_64") || value.contains("amd64");
+    let arm64 = value.contains("aarch64") || value.contains("arm64");
+    let contract = match target.binary_format {
+        NativeBinaryFormat::ElfX86_64
+            if x86_64
+                && value.contains("linux")
+                && value.contains("gnu")
+                && !value.contains("musl")
+                && !value.contains("android")
+                && !value.contains("uclibc") =>
+        {
+            NATIVE_TLS_LINUX_CONTRACT
+        }
+        NativeBinaryFormat::MachOArm64
+            if arm64
+                && value.contains("apple")
+                && (value.contains("darwin") || value.contains("macos"))
+                && !value.contains("ios")
+                && !value.contains("tvos")
+                && !value.contains("watchos") =>
+        {
+            NATIVE_TLS_DARWIN_CONTRACT
+        }
+        NativeBinaryFormat::PeX86_64 if x86_64 && value.contains("msvc") => {
+            NATIVE_TLS_WINDOWS_MSVC_CONTRACT
+        }
+        NativeBinaryFormat::PeX86_64
+            if x86_64 && (value.contains("windows-gnu") || value.contains("mingw")) =>
+        {
+            NATIVE_TLS_WINDOWS_GNU_CONTRACT
+        }
+        _ => {
+            return Err(KuError::message(format!(
+                "compiler '{}' effective target '{effective_target}' does not match native TLS target-pack contract '{}'",
+                candidate.label, target.rust_triple
+            )))
+        }
+    };
+    Ok(contract)
+}
+
+fn native_tls_contract_for_msvc(target: &BuildTarget) -> Result<NativeTlsLinkContract, KuError> {
+    if target.binary_format != NativeBinaryFormat::PeX86_64 {
+        return Err(KuError::message(
+            "MSVC native TLS linking was requested for a non-Windows target",
+        ));
+    }
+    Ok(NATIVE_TLS_WINDOWS_MSVC_CONTRACT)
+}
+
+fn pinned_file_bytes(
+    file: &PinnedLinkLibrary,
+    limit: u64,
+    label: &str,
+) -> Result<Vec<u8>, KuError> {
+    let before = link_library_identity(&file.handle).map_err(|error| {
+        KuError::message(format!(
+            "failed to identify {label} '{}': {error}",
+            file.path.display()
+        ))
+    })?;
+    if !same_open_link_library_contents(&before, &file.identity) || before.length == 0 {
+        return Err(KuError::message(format!(
+            "{label} '{}' changed while it was being validated",
+            file.path.display()
+        )));
+    }
+    if before.length > limit {
+        return Err(KuError::message(format!(
+            "{label} '{}' exceeds the {limit}-byte limit",
+            file.path.display()
+        )));
+    }
+    let length = usize::try_from(before.length)
+        .map_err(|_| KuError::message(format!("{label} length does not fit this host")))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| KuError::message(format!("not enough memory to validate {label}")))?;
+    bytes.resize(length, 0);
+    let mut source = file.handle.try_clone().map_err(|error| {
+        KuError::message(format!("failed to duplicate {label} handle: {error}"))
+    })?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| KuError::message(format!("failed to rewind {label}: {error}")))?;
+    source
+        .read_exact(&mut bytes)
+        .map_err(|error| KuError::message(format!("failed to read complete {label}: {error}")))?;
+    let mut trailing = [0u8; 1];
+    if source
+        .read(&mut trailing)
+        .map_err(|error| KuError::message(format!("failed to finish reading {label}: {error}")))?
+        != 0
+    {
+        return Err(KuError::message(format!(
+            "{label} '{}' grew while it was being validated",
+            file.path.display()
+        )));
+    }
+    let after = link_library_identity(&file.handle)
+        .map_err(|error| KuError::message(format!("failed to re-identify {label}: {error}")))?;
+    if !same_open_link_library_contents(&after, &before) {
+        return Err(KuError::message(format!(
+            "{label} '{}' changed while it was being read",
+            file.path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn pinned_file_sha256(
+    file: &PinnedLinkLibrary,
+    limit: u64,
+    label: &str,
+) -> Result<[u8; 32], KuError> {
+    let before = link_library_identity(&file.handle)
+        .map_err(|error| KuError::message(format!("failed to identify {label}: {error}")))?;
+    if !same_open_link_library_contents(&before, &file.identity) || before.length == 0 {
+        return Err(KuError::message(format!(
+            "{label} '{}' changed while it was being validated",
+            file.path.display()
+        )));
+    }
+    if before.length > limit {
+        return Err(KuError::message(format!(
+            "{label} '{}' exceeds the {limit}-byte limit",
+            file.path.display()
+        )));
+    }
+    let mut source = file.handle.try_clone().map_err(|error| {
+        KuError::message(format!("failed to duplicate {label} handle: {error}"))
+    })?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| KuError::message(format!("failed to rewind {label}: {error}")))?;
+    let mut digest = Sha256::new();
+    let mut remaining = before.length;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining != 0 {
+        let chunk = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded native TLS digest chunk fits usize");
+        source.read_exact(&mut buffer[..chunk]).map_err(|error| {
+            KuError::message(format!("failed to read complete {label}: {error}"))
+        })?;
+        digest.update(&buffer[..chunk]);
+        remaining -= chunk as u64;
+    }
+    let mut trailing = [0u8; 1];
+    if source
+        .read(&mut trailing)
+        .map_err(|error| KuError::message(format!("failed to finish reading {label}: {error}")))?
+        != 0
+    {
+        return Err(KuError::message(format!(
+            "{label} '{}' grew while it was being validated",
+            file.path.display()
+        )));
+    }
+    let after = link_library_identity(&file.handle)
+        .map_err(|error| KuError::message(format!("failed to re-identify {label}: {error}")))?;
+    if !same_open_link_library_contents(&after, &before) {
+        return Err(KuError::message(format!(
+            "{label} '{}' changed while it was being hashed",
+            file.path.display()
+        )));
+    }
+    Ok(digest.finalize().into())
+}
+
+fn parse_manifest_u64(value: &str, field: &str) -> Result<u64, KuError> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(KuError::message(format!(
+            "native TLS manifest field '{field}' must be a canonical decimal integer"
+        )));
+    }
+    value.parse::<u64>().map_err(|_| {
+        KuError::message(format!(
+            "native TLS manifest field '{field}' is outside the supported integer range"
+        ))
+    })
+}
+
+fn parse_manifest_sha256(value: &str, field: &str) -> Result<[u8; 32], KuError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(KuError::message(format!(
+            "native TLS manifest field '{field}' must be 64 lowercase hexadecimal digits"
+        )));
+    }
+    let mut output = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |byte: u8| -> u8 {
+            if byte.is_ascii_digit() {
+                byte - b'0'
+            } else {
+                byte - b'a' + 10
+            }
+        };
+        output[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    Ok(output)
+}
+
+fn parse_native_tls_manifest(
+    bytes: &[u8],
+    contract: NativeTlsLinkContract,
+) -> Result<(u64, [u8; 32], u64, [u8; 32]), KuError> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_NATIVE_TLS_MANIFEST_BYTES {
+        return Err(KuError::message(
+            "native TLS manifest must be non-empty and no larger than 64 KiB",
+        ));
+    }
+    if !bytes.is_ascii() || bytes.contains(&b'\r') || bytes.contains(&0) {
+        return Err(KuError::message(
+            "native TLS manifest must be canonical ASCII with LF line endings",
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| KuError::message("native TLS manifest is not valid ASCII"))?;
+    let text = text
+        .strip_suffix('\n')
+        .ok_or_else(|| KuError::message("native TLS manifest must end with exactly one LF"))?;
+    if text.ends_with('\n') {
+        return Err(KuError::message(
+            "native TLS manifest must not contain a trailing blank line",
+        ));
+    }
+    let mut fields = BTreeMap::new();
+    let mut order = Vec::new();
+    for line in text.split('\n') {
+        let (name, value) = line.split_once('=').ok_or_else(|| {
+            KuError::message("native TLS manifest lines must use name=value syntax")
+        })?;
+        if !NATIVE_TLS_MANIFEST_FIELDS.contains(&name) && name != "runtime_dependency" {
+            return Err(KuError::message(format!(
+                "native TLS manifest contains unknown field '{name}'"
+            )));
+        }
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte == b' ' || (0x21..=0x7e).contains(&byte))
+            || value.starts_with(' ')
+            || value.ends_with(' ')
+        {
+            return Err(KuError::message(format!(
+                "native TLS manifest field '{name}' has a non-canonical value"
+            )));
+        }
+        if fields.insert(name, value).is_some() {
+            return Err(KuError::message(format!(
+                "native TLS manifest contains duplicate field '{name}'"
+            )));
+        }
+        order.push(name);
+    }
+    let expected_order = NATIVE_TLS_MANIFEST_FIELDS
+        .iter()
+        .copied()
+        .chain(std::iter::once("runtime_dependency"))
+        .collect::<Vec<_>>();
+    if order != expected_order {
+        return Err(KuError::message(
+            "native TLS manifest fields are missing or not in canonical order",
+        ));
+    }
+    let require = |name: &str| -> Result<&str, KuError> {
+        fields.get(name).copied().ok_or_else(|| {
+            KuError::message(format!("native TLS manifest is missing field '{name}'"))
+        })
+    };
+    let exact = |name: &str, expected: &str| -> Result<(), KuError> {
+        let actual = require(name)?;
+        if actual != expected {
+            return Err(KuError::message(format!(
+                "native TLS manifest field '{name}' is '{actual}', expected '{expected}'"
+            )));
+        }
+        Ok(())
+    };
+    exact("format", "ku-native-tls-pack-v1")?;
+    exact("target", contract.target)?;
+    exact("flavor", contract.flavor)?;
+    exact("object_format", contract.object_format)?;
+    exact("abi_version", "1")?;
+    exact("panic", "unwind")?;
+    exact("build_id", NATIVE_TLS_BUILD_ID)?;
+    exact("link_contract", contract.link_contract)?;
+    exact("crt", contract.crt)?;
+    exact("runtime_dependency", "none")?;
+    let archive_size = parse_manifest_u64(require("archive_size")?, "archive_size")?;
+    let archive_sha256 = parse_manifest_sha256(require("archive_sha256")?, "archive_sha256")?;
+    let header_size = parse_manifest_u64(require("header_size")?, "header_size")?;
+    let header_sha256 = parse_manifest_sha256(require("header_sha256")?, "header_sha256")?;
+    Ok((archive_size, archive_sha256, header_size, header_sha256))
+}
+
+fn require_native_tls_pack_file(path: &Path, label: &str) -> Result<PinnedLinkLibrary, KuError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        KuError::message(format!("missing {label} '{}': {error}", path.display()))
+    })?;
+    if !is_plain_regular_file(&metadata) {
+        return Err(KuError::message(format!(
+            "{label} '{}' must be a plain regular file; symlinks and reparse points are forbidden",
+            path.display()
+        )));
+    }
+    PinnedLinkLibrary::capture(path, label)
+}
+
+fn load_native_tls_pack(
+    root: &NativeTlsPackRoot,
+    contract: NativeTlsLinkContract,
+) -> Result<NativeTlsPack, KuError> {
+    let leaf = root.path.join(contract.target);
+    if !path_is_plain_directory(&leaf) {
+        return Err(KuError::message(format!(
+            "native TLS target pack for '{}' is missing at '{}'",
+            contract.target,
+            leaf.display()
+        )));
+    }
+    let include = leaf.join("include");
+    let library = leaf.join("lib");
+    if !path_is_plain_directory(&include) || !path_is_plain_directory(&library) {
+        return Err(KuError::message(format!(
+            "native TLS target pack '{}' must contain plain include and lib directories",
+            leaf.display()
+        )));
+    }
+    let manifest =
+        require_native_tls_pack_file(&leaf.join("manifest.kutls"), "native TLS manifest")?;
+    let manifest_bytes = pinned_file_bytes(
+        &manifest,
+        MAX_NATIVE_TLS_MANIFEST_BYTES,
+        "native TLS manifest",
+    )?;
+    let (archive_size, archive_sha256, header_size, header_sha256) =
+        parse_native_tls_manifest(&manifest_bytes, contract)?;
+    let archive =
+        require_native_tls_pack_file(&library.join(contract.archive_name), "native TLS archive")?;
+    let header =
+        require_native_tls_pack_file(&include.join("ku_native_tls.h"), "native TLS header")?;
+    if archive.identity.length != archive_size
+        || archive_size == 0
+        || archive_size > MAX_NATIVE_TLS_ARCHIVE_BYTES
+    {
+        return Err(KuError::message(
+            "native TLS archive size does not match manifest.kutls or exceeds 128 MiB",
+        ));
+    }
+    if header.identity.length != header_size
+        || header_size == 0
+        || header_size > MAX_NATIVE_TLS_HEADER_BYTES
+    {
+        return Err(KuError::message(
+            "native TLS header size does not match manifest.kutls or exceeds 64 KiB",
+        ));
+    }
+    if pinned_file_sha256(&archive, MAX_NATIVE_TLS_ARCHIVE_BYTES, "native TLS archive")?
+        != archive_sha256
+    {
+        return Err(KuError::message(
+            "native TLS archive SHA-256 does not match manifest.kutls",
+        ));
+    }
+    if pinned_file_sha256(&header, MAX_NATIVE_TLS_HEADER_BYTES, "native TLS header")?
+        != header_sha256
+    {
+        return Err(KuError::message(
+            "native TLS header SHA-256 does not match manifest.kutls",
+        ));
+    }
+    let mut magic = [0u8; 8];
+    let mut archive_reader = archive.handle.try_clone().map_err(|error| {
+        KuError::message(format!("failed to inspect native TLS archive: {error}"))
+    })?;
+    archive_reader
+        .seek(SeekFrom::Start(0))
+        .and_then(|_| archive_reader.read_exact(&mut magic))
+        .map_err(|error| {
+            KuError::message(format!("failed to read native TLS archive header: {error}"))
+        })?;
+    if &magic == b"!<thin>\n" {
+        return Err(KuError::message(
+            "native TLS archive is a thin archive; external member paths are forbidden",
+        ));
+    }
+    if &magic != b"!<arch>\n" {
+        return Err(KuError::message(
+            "native TLS archive is not a complete static archive",
+        ));
+    }
+    let archive_format = match contract.object_format {
+        "coff-x86_64" => NativeTlsArchiveFormat::CoffX86_64,
+        "elf-x86_64" => NativeTlsArchiveFormat::ElfX86_64,
+        "macho-arm64" => NativeTlsArchiveFormat::MachOArm64,
+        unsupported => {
+            return Err(KuError::message(format!(
+                "native TLS target pack declares unsupported object format '{unsupported}'"
+            )))
+        }
+    };
+    native_tls_archive::validate(
+        &mut archive_reader,
+        archive.identity.length,
+        archive_format,
+        NATIVE_TLS_BUILD_ID.as_bytes(),
+    )
+    .map_err(|error| {
+        KuError::message(format!(
+            "native TLS archive failed static object validation: {error}"
+        ))
+    })?;
+    let validated_identity = link_library_identity(&archive.handle).map_err(|error| {
+        KuError::message(format!(
+            "failed to re-identify validated native TLS archive: {error}"
+        ))
+    })?;
+    if !same_open_link_library_contents(&validated_identity, &archive.identity) {
+        return Err(KuError::message(
+            "native TLS archive changed during static object validation",
+        ));
+    }
+    Ok(NativeTlsPack {
+        contract,
+        archive,
+        archive_sha256,
+        _header: header,
+        _manifest: manifest,
+    })
+}
+
+fn validate_native_tls_link_mode(needs_native_tls: bool, static_link: bool) -> Result<(), KuError> {
+    if needs_native_tls && static_link {
+        return Err(KuError::message(
+            "native C build cannot safely combine native TLS with --static: the verified target-pack contract requires the target's dynamic CRT/system runtime\nhelp: omit --static; native TLS itself remains linked from the verified static archive",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -4876,7 +5527,7 @@ fn verify_native_binary_dynamic_dependencies_file(
     libpq_requirement: Option<&LibpqRuntimeDependency>,
     mysql_requirement: Option<&MysqlRuntimeDependency>,
 ) -> Result<(), String> {
-    if !features.libpq && !features.libmysql {
+    if !features.libpq && !features.libmysql && !features.native_tls {
         return Ok(());
     }
     let names = match target.binary_format {
@@ -4890,6 +5541,16 @@ fn verify_native_binary_dynamic_dependencies_file(
     {
         return Err(
             "linked output records a private Ku staging path as a runtime dependency".to_string(),
+        );
+    }
+    if features.native_tls
+        && names
+            .iter()
+            .any(|name| dynamic_dependency_is_native_tls_library(name))
+    {
+        return Err(
+            "linked output records a dynamic ku-native-tls dependency; the v1 contract requires the verified static archive"
+                .to_string(),
         );
     }
     if features.libpq {
@@ -4967,6 +5628,25 @@ fn verify_native_binary_dynamic_dependencies_file(
         }
     }
     Ok(())
+}
+
+fn dynamic_dependency_is_native_tls_library(name: &[u8]) -> bool {
+    let name = name
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .unwrap_or(name);
+    let lower = name.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let dynamic_suffix = lower.ends_with(b".dll")
+        || lower.ends_with(b".dylib")
+        || lower.ends_with(b".so")
+        || lower.windows(4).any(|window| window == b".so.");
+    dynamic_suffix
+        && (lower
+            .windows(b"ku_native_tls".len())
+            .any(|window| window == b"ku_native_tls")
+            || lower
+                .windows(b"ku-native-tls".len())
+                .any(|window| window == b"ku-native-tls"))
 }
 
 fn dynamic_dependency_matches_selected_loader(
@@ -6177,6 +6857,12 @@ fn compile_c_source(
     })?;
     let features = CSourceFeatures::inspect(source)?;
     validate_c_target_features(features, target)?;
+    let needs_native_tls = features.native_tls;
+    validate_native_tls_link_mode(needs_native_tls, static_link)?;
+    let native_tls_root = needs_native_tls
+        .then(|| resolve_native_tls_pack_root(env::var_os("KU_NATIVE_TLS_PACK")))
+        .transpose()?;
+    let native_output_target = target.cloned().or_else(supported_host_build_target);
     // Native HTTP/Redis use a portable socket layer. Its Windows branch needs
     // Winsock: MSVC auto-links through the emitted pragma, while gcc/clang/zig
     // need `-lws2_32`. Base the decision on the output target, not the build host,
@@ -6264,11 +6950,14 @@ fn compile_c_source(
             Vec::new()
         };
         tried.push(candidate.label.clone());
-        let probed_clang_target = if (needs_libpq || needs_libmysql)
+        let needs_database_clang_probe = (needs_libpq || needs_libmysql)
             && libpq_platform == LibpqLibraryPlatform::Windows
             && target.is_none()
-            && candidate.kind == CCompilerKind::Clang
-            && declared_target.is_none()
+            && candidate.kind == CCompilerKind::Clang;
+        let needs_native_tls_probe = needs_native_tls
+            && (target.is_none() || candidate.kind == CCompilerKind::Preconfigured);
+        let probed_compiler_target = if declared_target.is_none()
+            && (needs_database_clang_probe || needs_native_tls_probe)
         {
             match probe_clang_default_target(&candidate, link_deadline) {
                 Ok(target) => Some(target),
@@ -6306,7 +6995,7 @@ fn compile_c_source(
                 libpq_platform,
                 &candidate,
                 target,
-                probed_clang_target.as_deref(),
+                probed_compiler_target.as_deref(),
             ) {
                 Ok(format) => Some(format),
                 Err(error) => {
@@ -6369,6 +7058,52 @@ fn compile_c_source(
         } else {
             None
         };
+        let native_tls_pack = if needs_native_tls {
+            let output_target = native_output_target
+                .as_ref()
+                .expect("supported native TLS output has a validated target");
+            let injected_target = if target.is_some() && declared_target.is_none() {
+                match candidate.kind {
+                    CCompilerKind::Clang => Some(output_target.rust_triple),
+                    CCompilerKind::ZigCc => Some(output_target.c_triple),
+                    CCompilerKind::Preconfigured => None,
+                }
+            } else {
+                None
+            };
+            let effective_target = declared_target
+                .or(injected_target)
+                .or(probed_compiler_target.as_deref());
+            let contract =
+                match native_tls_contract_for_compiler(output_target, &candidate, effective_target)
+                {
+                    Ok(contract) => contract,
+                    Err(error) => {
+                        if candidate.explicitly_configured {
+                            return Err(error);
+                        }
+                        compiler_failures.push(format!("{}: {error}", candidate.label));
+                        continue;
+                    }
+                };
+            match load_native_tls_pack(
+                native_tls_root
+                    .as_ref()
+                    .expect("native TLS feature resolved a target-pack root"),
+                contract,
+            ) {
+                Ok(pack) => Some(pack),
+                Err(error) => {
+                    if candidate.explicitly_configured {
+                        return Err(error);
+                    }
+                    compiler_failures.push(format!("{}: {error}", candidate.label));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let libpq_requirement = libpq_library
             .as_ref()
             .map(|library| {
@@ -6385,6 +7120,10 @@ fn compile_c_source(
         let staged_libmysql_library = libmysql_library
             .as_ref()
             .map(|library| library.library.stage_for_link("MySQL client"))
+            .transpose()?;
+        let staged_native_tls_pack = native_tls_pack
+            .as_ref()
+            .map(NativeTlsPack::stage_for_link)
             .transpose()?;
         let mysql_requirement = libmysql_library
             .as_ref()
@@ -6406,8 +7145,10 @@ fn compile_c_source(
         for argument in target_arguments {
             command.arg(argument);
         }
-        if let Some(probed_target) = &probed_clang_target {
-            command.arg(format!("--target={probed_target}"));
+        if needs_database_clang_probe && target.is_none() {
+            if let Some(probed_target) = &probed_compiler_target {
+                command.arg(format!("--target={probed_target}"));
+            }
         }
         let compiler_output = temporary_output;
         command
@@ -6415,6 +7156,9 @@ fn compile_c_source(
             .arg("-std=c11")
             .arg("-o")
             .arg(compiler_output);
+        if needs_native_tls {
+            command.arg("-DKU_NATIVE_TLS_ENABLED=1");
+        }
         if needs_libmysql {
             let header = libmysql_include
                 .as_ref()
@@ -6446,6 +7190,12 @@ fn compile_c_source(
         if needs_libmysql {
             if let Some(library) = &staged_libmysql_library {
                 command.arg(strip_verbatim(library.path()));
+            }
+        }
+        if let Some(pack) = &staged_native_tls_pack {
+            command.arg(strip_verbatim(pack.archive.path()));
+            for library in pack.contract.native_libraries {
+                command.arg(library);
             }
         }
         if verbose {
@@ -6568,6 +7318,23 @@ fn compile_c_source(
                     .as_ref()
                     .map(|library| library.library.stage_for_link("MySQL client"))
                     .transpose()?;
+                let msvc_native_tls_pack = if needs_native_tls {
+                    let output_target = native_output_target
+                        .as_ref()
+                        .expect("supported native TLS output has a validated target");
+                    Some(load_native_tls_pack(
+                        native_tls_root
+                            .as_ref()
+                            .expect("native TLS feature resolved a target-pack root"),
+                        native_tls_contract_for_msvc(output_target)?,
+                    )?)
+                } else {
+                    None
+                };
+                let staged_msvc_native_tls_pack = msvc_native_tls_pack
+                    .as_ref()
+                    .map(NativeTlsPack::stage_for_link)
+                    .transpose()?;
                 let libpq_requirement = msvc_libpq_library
                     .as_ref()
                     .map(|library| {
@@ -6595,6 +7362,12 @@ fn compile_c_source(
                         libmysql_family: mysql_requirement
                             .as_ref()
                             .map(|requirement| requirement.family),
+                        native_tls: staged_msvc_native_tls_pack.as_ref().map(|pack| {
+                            MsvcNativeTlsLink {
+                                archive: pack.archive.path(),
+                                native_libraries: pack.contract.native_libraries,
+                            }
+                        }),
                     },
                     MsvcCompileOptions {
                         profile,
@@ -6871,6 +7644,13 @@ struct MsvcDatabaseLinks<'a> {
     libmysql: Option<&'a Path>,
     libmysql_header: Option<&'a MysqlHeaderSelection>,
     libmysql_family: Option<MysqlClientFamily>,
+    native_tls: Option<MsvcNativeTlsLink<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct MsvcNativeTlsLink<'a> {
+    archive: &'a Path,
+    native_libraries: &'static [&'static str],
 }
 
 #[derive(Clone, Copy)]
@@ -6906,10 +7686,17 @@ fn compile_with_msvc(
         command.env(key, value);
     }
     command.arg("/nologo").arg("/std:c11").arg("/utf-8");
+    if database.native_tls.is_some() {
+        command.arg("/DKU_NATIVE_TLS_ENABLED=1");
+    }
     if let Some(opt) = options.profile.msvc_opt_flag() {
         command.arg(opt);
     }
-    if options.static_link {
+    if database.native_tls.is_some() {
+        // ku-native-tls is built against the dynamic MSVC CRT. Make the
+        // choice explicit so a project-wide default cannot silently mix CRTs.
+        command.arg("/MD");
+    } else if options.static_link {
         command.arg("/MT");
     }
     match (database.libmysql_header, database.libmysql_family) {
@@ -6941,7 +7728,7 @@ fn compile_with_msvc(
     command.arg(format!("/Fo:{}", obj.display()));
     // Keep a single `/link` boundary: every following argument is consumed by
     // link.exe, so emitting another `/link` for a second database is invalid.
-    if database.libpq.is_some() || database.libmysql.is_some() {
+    if database.libpq.is_some() || database.libmysql.is_some() || database.native_tls.is_some() {
         command.arg("/link");
         if let Some(library) = database.libpq {
             command.arg(strip_verbatim(library));
@@ -6954,6 +7741,17 @@ fn compile_with_msvc(
                 )));
             }
             command.arg(strip_verbatim(library));
+        }
+        if let Some(native_tls) = database.native_tls {
+            if !path_is_plain_regular_file(native_tls.archive) {
+                return Err(KuError::message(
+                    "private native TLS archive changed before MSVC linking",
+                ));
+            }
+            command.arg(strip_verbatim(native_tls.archive));
+            for library in native_tls.native_libraries {
+                command.arg(library);
+            }
         }
     }
     if options.verbose {
@@ -7143,6 +7941,15 @@ fn configured_c_compiler(value: Option<OsString>) -> Result<Option<String>, KuEr
             "KU_CC is set but empty; unset it for automatic compiler discovery or set one compiler command",
         ));
     }
+    if let Some(argument) = words
+        .iter()
+        .skip(1)
+        .find(|argument| compiler_argument_overrides_runtime_linkage(argument))
+    {
+        return Err(KuError::message(format!(
+            "KU_CC argument '{argument}' changes the runtime linkage contract and is forbidden\nhelp: keep linker mode under ku build control; use KU_CC only for the compiler, target and sysroot",
+        )));
+    }
     let program_name = Path::new(&words[0])
         .file_name()
         .and_then(|name| name.to_str())
@@ -7157,6 +7964,37 @@ fn configured_c_compiler(value: Option<OsString>) -> Result<Option<String>, KuEr
         ));
     }
     Ok(Some(value))
+}
+
+fn compiler_argument_overrides_runtime_linkage(argument: &str) -> bool {
+    let lower = argument.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "-static"
+            | "--static"
+            | "-static-pie"
+            | "-bstatic"
+            | "--bstatic"
+            | "-nostdlib"
+            | "-nodefaultlibs"
+            | "-nolibc"
+    ) {
+        return true;
+    }
+    if lower
+        .strip_prefix("-xlinker=")
+        .is_some_and(|value| matches!(value, "-bstatic" | "--bstatic" | "-static" | "--static"))
+    {
+        return true;
+    }
+    lower.strip_prefix("-wl,").is_some_and(|arguments| {
+        arguments.split(',').any(|value| {
+            matches!(
+                value,
+                "-bstatic" | "--bstatic" | "-static" | "--static" | "-static-pie" | "--static-pie"
+            )
+        })
+    })
 }
 
 fn parse_c_compiler_candidate(
@@ -12260,6 +13098,19 @@ fn main(): null! {
                 .to_string();
             assert!(error.contains("KU_CC is set but empty"));
         }
+        for value in [
+            "clang -static",
+            "clang -static-pie",
+            "clang -Wl,-Bstatic",
+            "clang -Xlinker -Bstatic",
+            "clang -Xlinker=-Bstatic",
+            "gcc -nostdlib",
+        ] {
+            let error = configured_c_compiler(Some(OsString::from(value)))
+                .expect_err("KU_CC must not override the verified runtime linkage mode")
+                .to_string();
+            assert!(error.contains("runtime linkage contract"), "{error}");
+        }
         let spaced = configured_c_compiler(Some(OsString::from(
             r#""C:\Program Files\LLVM\bin\clang.exe" --target=x86_64-pc-windows-msvc"#,
         )))
@@ -12558,6 +13409,325 @@ fn main(): null! {
                 .libpq
         );
         fs::remove_dir_all(dir).expect("remove libpq marker fixture");
+    }
+
+    fn test_sha256_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = Sha256::digest(bytes);
+        let mut output = String::with_capacity(64);
+        for byte in digest {
+            output.push(char::from(HEX[(byte >> 4) as usize]));
+            output.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+        output
+    }
+
+    fn native_tls_manifest_fixture(
+        contract: NativeTlsLinkContract,
+        archive: &[u8],
+        header: &[u8],
+    ) -> String {
+        format!(
+            "format=ku-native-tls-pack-v1\ntarget={}\nflavor={}\nobject_format={}\nabi_version=1\npanic=unwind\nbuild_id={}\narchive_size={}\narchive_sha256={}\nheader_size={}\nheader_sha256={}\nlink_contract={}\ncrt={}\nruntime_dependency=none\n",
+            contract.target,
+            contract.flavor,
+            contract.object_format,
+            NATIVE_TLS_BUILD_ID,
+            archive.len(),
+            test_sha256_hex(archive),
+            header.len(),
+            test_sha256_hex(header),
+            contract.link_contract,
+            contract.crt,
+        )
+    }
+
+    fn write_native_tls_pack_fixture(
+        root: &Path,
+        contract: NativeTlsLinkContract,
+        archive: &[u8],
+        manifest: &str,
+    ) {
+        let leaf = root.join(contract.target);
+        fs::create_dir_all(leaf.join("include")).expect("create TLS include fixture");
+        fs::create_dir_all(leaf.join("lib")).expect("create TLS library fixture");
+        fs::write(leaf.join("include").join("ku_native_tls.h"), b"header")
+            .expect("write TLS header fixture");
+        fs::write(leaf.join("lib").join(contract.archive_name), archive)
+            .expect("write TLS archive fixture");
+        fs::write(leaf.join("manifest.kutls"), manifest).expect("write TLS manifest fixture");
+    }
+
+    #[test]
+    fn native_tls_feature_marker_is_standalone_and_static_mode_fails_closed() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "ku-native-tls-marker-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create native TLS marker fixture");
+        let source = dir.join("main.c");
+        fs::write(
+            &source,
+            "static const char *text = \"#define KU_FEATURE_NATIVE_TLS 1\";\n",
+        )
+        .expect("write marker string fixture");
+        assert!(
+            !CSourceFeatures::inspect(&source)
+                .expect("inspect marker string")
+                .native_tls
+        );
+        fs::write(&source, "#define KU_FEATURE_NATIVE_TLS 1\n").expect("write standalone marker");
+        assert!(
+            CSourceFeatures::inspect(&source)
+                .expect("inspect standalone marker")
+                .native_tls
+        );
+        validate_native_tls_link_mode(false, true)
+            .expect("unrelated static build remains supported");
+        let error = validate_native_tls_link_mode(true, true)
+            .expect_err("native TLS plus --static must fail closed")
+            .to_string();
+        assert!(error.contains("dynamic CRT/system runtime"));
+        assert!(error.contains("omit --static"));
+        fs::remove_dir_all(dir).expect("remove native TLS marker fixture");
+    }
+
+    #[test]
+    fn native_tls_pack_root_is_authoritative_absolute_and_has_bounded_fallback() {
+        let relative = resolve_native_tls_pack_root_from(
+            Some(OsString::from("relative-pack")),
+            Path::new("/ignored/ku"),
+        )
+        .expect_err("relative native TLS roots must fail closed")
+        .to_string();
+        assert!(relative.contains("must be an absolute directory"));
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let dir =
+            env::temp_dir().join(format!("ku-native-tls-root-{}-{nonce}", std::process::id()));
+        fs::create_dir(&dir).expect("create native TLS root fixture");
+        let missing = dir.join("missing");
+        let error = resolve_native_tls_pack_root_from(
+            Some(missing.clone().into_os_string()),
+            &dir.join("bin").join("ku"),
+        )
+        .expect_err("missing authoritative native TLS root must fail")
+        .to_string();
+        assert!(error.contains(&missing.display().to_string()));
+
+        let fallback = dir.join("bin").join("native-tls").join("v1");
+        fs::create_dir_all(&fallback).expect("create sibling target-pack root");
+        let resolved = resolve_native_tls_pack_root_from(None, &dir.join("bin").join("ku"))
+            .expect("resolve sibling target-pack root");
+        assert_eq!(
+            resolved.path,
+            fs::canonicalize(&fallback).expect("canonicalize sibling target-pack root")
+        );
+        fs::remove_dir_all(dir).expect("remove native TLS root fixture");
+    }
+
+    #[test]
+    fn native_tls_pack_manifest_and_archive_validation_fail_closed() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let base =
+            env::temp_dir().join(format!("ku-native-tls-pack-{}-{nonce}", std::process::id()));
+        fs::create_dir(&base).expect("create native TLS pack fixtures");
+        let archive = native_tls_archive::fixture_archive(
+            NativeTlsArchiveFormat::ElfX86_64,
+            NATIVE_TLS_BUILD_ID.as_bytes(),
+        );
+        let thin = b"!<thin>\nfixture";
+        let header = b"header";
+
+        let valid_root = base.join("valid");
+        fs::create_dir(&valid_root).expect("create valid TLS root");
+        let valid_manifest =
+            native_tls_manifest_fixture(NATIVE_TLS_LINUX_CONTRACT, &archive, header);
+        write_native_tls_pack_fixture(
+            &valid_root,
+            NATIVE_TLS_LINUX_CONTRACT,
+            &archive,
+            &valid_manifest,
+        );
+        let valid = load_native_tls_pack(
+            &NativeTlsPackRoot {
+                path: fs::canonicalize(&valid_root).expect("canonicalize valid TLS root"),
+            },
+            NATIVE_TLS_LINUX_CONTRACT,
+        )
+        .expect("load a complete verified native TLS pack");
+        assert_eq!(valid.archive.identity.length, archive.len() as u64);
+
+        let cases = [
+            (
+                "unknown",
+                valid_manifest.replace(
+                    "runtime_dependency=none\n",
+                    "link_args=-Wl,--untrusted\nruntime_dependency=none\n",
+                ),
+                archive.as_slice(),
+                "unknown field 'link_args'",
+            ),
+            (
+                "duplicate",
+                valid_manifest.replace(
+                    "runtime_dependency=none\n",
+                    "crt=system-dynamic\nruntime_dependency=none\n",
+                ),
+                archive.as_slice(),
+                "duplicate field 'crt'",
+            ),
+            (
+                "hash",
+                valid_manifest.replace(&test_sha256_hex(&archive), &"0".repeat(64)),
+                archive.as_slice(),
+                "SHA-256",
+            ),
+            (
+                "thin",
+                native_tls_manifest_fixture(NATIVE_TLS_LINUX_CONTRACT, thin, header),
+                thin.as_slice(),
+                "thin archive",
+            ),
+            (
+                "target",
+                valid_manifest.replace(
+                    "target=x86_64-unknown-linux-gnu",
+                    "target=aarch64-apple-darwin",
+                ),
+                archive.as_slice(),
+                "field 'target'",
+            ),
+            (
+                "flavor",
+                valid_manifest.replace("flavor=gnu", "flavor=msvc"),
+                archive.as_slice(),
+                "field 'flavor'",
+            ),
+        ];
+        for (name, manifest, archive_bytes, expected) in cases {
+            let root = base.join(name);
+            fs::create_dir(&root).expect("create invalid TLS root");
+            write_native_tls_pack_fixture(
+                &root,
+                NATIVE_TLS_LINUX_CONTRACT,
+                archive_bytes,
+                &manifest,
+            );
+            let error = load_native_tls_pack(
+                &NativeTlsPackRoot {
+                    path: fs::canonicalize(&root).expect("canonicalize invalid TLS root"),
+                },
+                NATIVE_TLS_LINUX_CONTRACT,
+            )
+            .expect_err("invalid native TLS pack must fail closed")
+            .to_string();
+            assert!(
+                error.contains(expected),
+                "case {name} expected {expected:?}, got {error:?}"
+            );
+        }
+
+        let missing_root = base.join("missing-leaf");
+        fs::create_dir(&missing_root).expect("create missing leaf root");
+        let error = load_native_tls_pack(
+            &NativeTlsPackRoot {
+                path: fs::canonicalize(&missing_root).expect("canonicalize missing leaf root"),
+            },
+            NATIVE_TLS_LINUX_CONTRACT,
+        )
+        .expect_err("missing target leaf must fail closed")
+        .to_string();
+        assert!(error.contains("target pack"));
+
+        fs::remove_dir_all(base).expect("remove native TLS pack fixtures");
+    }
+
+    #[test]
+    fn native_tls_contract_is_selected_by_target_and_compiler_abi() {
+        let windows = resolve_build_target(Some("x86_64-windows"))
+            .expect("windows target")
+            .expect("explicit windows target");
+        let clang = CCompilerCandidate {
+            label: "clang".to_string(),
+            program: "clang".to_string(),
+            args: Vec::new(),
+            kind: CCompilerKind::Clang,
+            explicitly_configured: false,
+        };
+        assert_eq!(
+            native_tls_contract_for_compiler(&windows, &clang, Some("x86_64-pc-windows-msvc"),)
+                .expect("select MSVC TLS contract"),
+            NATIVE_TLS_WINDOWS_MSVC_CONTRACT
+        );
+        let zig = CCompilerCandidate {
+            label: "zig cc".to_string(),
+            program: "zig".to_string(),
+            args: vec!["cc".to_string()],
+            kind: CCompilerKind::ZigCc,
+            explicitly_configured: false,
+        };
+        assert_eq!(
+            native_tls_contract_for_compiler(&windows, &zig, Some("x86_64-windows-gnu"))
+                .expect("select GNU TLS contract"),
+            NATIVE_TLS_WINDOWS_GNU_CONTRACT
+        );
+        assert!(native_tls_contract_for_compiler(&windows, &clang, None).is_err());
+
+        let linux = resolve_build_target(Some("x86_64-linux"))
+            .expect("linux target")
+            .expect("explicit linux target");
+        assert_eq!(
+            native_tls_contract_for_compiler(&linux, &clang, Some("x86_64-unknown-linux-gnu"))
+                .expect("select glibc TLS contract"),
+            NATIVE_TLS_LINUX_CONTRACT
+        );
+        assert!(native_tls_contract_for_compiler(
+            &linux,
+            &clang,
+            Some("x86_64-unknown-linux-musl")
+        )
+        .is_err());
+
+        let darwin = resolve_build_target(Some("aarch64-darwin"))
+            .expect("darwin target")
+            .expect("explicit darwin target");
+        assert_eq!(
+            native_tls_contract_for_compiler(&darwin, &clang, Some("arm64-apple-darwin24"))
+                .expect("select macOS TLS contract"),
+            NATIVE_TLS_DARWIN_CONTRACT
+        );
+        assert!(
+            native_tls_contract_for_compiler(&darwin, &clang, Some("arm64-apple-ios17")).is_err()
+        );
+    }
+
+    #[test]
+    fn native_tls_dynamic_runtime_dependency_names_are_rejected() {
+        for name in [
+            b"ku_native_tls.dll".as_slice(),
+            b"libku_native_tls.so.1".as_slice(),
+            b"@rpath/libku-native-tls.dylib".as_slice(),
+        ] {
+            assert!(dynamic_dependency_is_native_tls_library(name));
+        }
+        for name in [
+            b"libc.so.6".as_slice(),
+            b"ku_native_tls.lib".as_slice(),
+            b"libku_native_tls.a".as_slice(),
+        ] {
+            assert!(!dynamic_dependency_is_native_tls_library(name));
+        }
     }
 
     #[test]

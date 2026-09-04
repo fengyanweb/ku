@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { builtins, keywords, memberCompletionLabels, stdFunctions, stdImportPathLabels, stdModules, stdRootModules, types } from "./completionModel";
+import { execFileExitCode, firstWorkingExecutable } from "./executableModel";
 import { defaultModuleName, parseImports, resolveImportUri } from "./imports";
 
 const KU_VERSION = "0.0.16";
@@ -371,17 +372,6 @@ async function buildNativeC() {
     void vscode.window.showWarningMessage("当前文件不是 Ku 源文件。");
     return;
   }
-  const unsupported = detectNativeUnsupported(editor.document.getText());
-  if (unsupported.length > 0) {
-    const answer = await vscode.window.showWarningMessage(
-      `当前 native C prototype 不支持：${unsupported.join(", ")}。是否仍然继续构建？`,
-      "继续构建",
-      "取消",
-    );
-    if (answer !== "继续构建") {
-      return;
-    }
-  }
   const exe = await findKuExecutable(editor.document.uri);
   if (!exe) {
     return;
@@ -390,18 +380,6 @@ async function buildNativeC() {
   const terminal = vscode.window.createTerminal({ name: "Ku Native C", cwd });
   terminal.show();
   terminal.sendText(terminalCommand(exe, ["build", "--native", editor.document.uri.fsPath], cwd));
-}
-
-function detectNativeUnsupported(source: string): string[] {
-  const checks: Array<[string, RegExp]> = [
-    ["array", /\[[^\]\n,]+(?:,[^\]\n]+)+\]/],
-    ["struct", /\bstruct\b|\b[A-Z][A-Za-z0-9_]*\s*\{/],
-    ["enum", /\benum\b|[A-Z][A-Za-z0-9_]*\.[A-Z][A-Za-z0-9_]*\(/],
-    ["closure", /=>/],
-    ["match", /\bmatch\b/],
-    ["try/catch", /\btry\b|\bcatch\b|\bfinally\b/],
-  ];
-  return checks.filter(([, re]) => re.test(source)).map(([name]) => name);
 }
 
 async function showVersion() {
@@ -441,17 +419,15 @@ async function findKuExecutable(uri?: vscode.Uri, notify = true): Promise<string
   candidates.push("ku");
   const folder = workspaceFolder(uri);
   if (folder) {
-    candidates.push(
-      path.join(folder, "release", exeName()),
-      path.join(folder, "target", "release", exeName()),
-      path.join(folder, "target", "debug", exeName()),
-    );
-  }
-  for (const candidate of [...new Set(candidates)]) {
-    const result = await execFile(candidate, ["version"], folder, 3000);
-    if (result.code === 0) {
-      return candidate;
+    const releaseTarget = hostReleaseTarget();
+    if (releaseTarget) {
+      candidates.push(path.join(folder, "release", releaseTarget, exeName()));
     }
+    candidates.push(path.join(folder, "target", "release", exeName()), path.join(folder, "target", "debug", exeName()));
+  }
+  const found = await firstWorkingExecutable(candidates, (candidate) => execFile(candidate, ["version"], folder, 3000));
+  if (found) {
+    return found;
   }
   if (notify) {
     void vscode.window.showErrorMessage("找不到 ku 解释器。请设置 ku.executablePath，或把 ku.exe 加入 PATH。");
@@ -461,6 +437,19 @@ async function findKuExecutable(uri?: vscode.Uri, notify = true): Promise<string
 
 function exeName(): string {
   return process.platform === "win32" ? "ku.exe" : "ku";
+}
+
+function hostReleaseTarget(): string | undefined {
+  if (process.platform === "win32" && process.arch === "x64") {
+    return "x86_64-pc-windows-msvc";
+  }
+  if (process.platform === "linux" && process.arch === "x64") {
+    return "x86_64-unknown-linux-gnu";
+  }
+  if (process.platform === "darwin" && process.arch === "arm64") {
+    return "aarch64-apple-darwin";
+  }
+  return undefined;
 }
 
 function workspaceFolder(uri?: vscode.Uri): string | undefined {
@@ -475,7 +464,7 @@ function terminalCwd(uri: vscode.Uri): string {
 function execFile(file: string, args: string[], cwd?: string, timeoutMs = 15000): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     cp.execFile(file, args, { cwd, timeout: timeoutMs, windowsHide: true }, (error, stdout, stderr) => {
-      const code = typeof (error as cp.ExecFileException | null)?.code === "number" ? ((error as cp.ExecFileException).code as number) : 0;
+      const code = execFileExitCode(error);
       resolve({ code, stdout: stdout.toString(), stderr: stderr.toString() });
     });
   });

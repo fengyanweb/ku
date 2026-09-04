@@ -33,7 +33,6 @@ extern "C" {
 #define KU_TLS_MAX_HANDSHAKE_BYTES 1048576u
 #define KU_TLS_MAX_HANDSHAKE_ITERATIONS 4096u
 #define KU_TLS_MAX_SERVER_NAME_BYTES 253u
-#define KU_TLS_RESUMPTION_CACHE_ENTRIES 64u
 
 typedef struct KuTlsConfig KuTlsConfig;
 typedef struct KuTlsClientSession KuTlsClientSession;

@@ -29,12 +29,13 @@
   "categories": ["Programming Languages"],
   "scripts": {
     "compile": "tsc --target ES2020 --module commonjs --lib ES2020 --rootDir src --outDir out --strict --esModuleInterop --skipLibCheck src/language.ts src/imports.ts",
-    "test": "npm run compile && node -e \"for (const f of ['package.json','language-configuration.json','snippets/ku.json','syntaxes/ku.tmLanguage.json','syntaxes/ku-mod.tmLanguage.json']) JSON.parse(require('fs').readFileSync(f,'utf8')); console.log('ku vscode extension json ok')\" && node test-completion-model.js && node test-formatter.js",
+    "test": "npm run compile && node -e \"for (const f of ['package.json','language-configuration.json','snippets/ku.json','syntaxes/ku.tmLanguage.json','syntaxes/ku-mod.tmLanguage.json']) JSON.parse(require('fs').readFileSync(f,'utf8')); console.log('ku vscode extension json ok')\" && node test-completion-model.js && node test-formatter.js && node test-executable-model.js",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "3.9.2",
     "typescript": "^5.4.0"
   },
   "contributes": {
@@ -53,7 +54,7 @@
         "ku.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Path to ku executable. Empty means use PATH ku first, then workspace release/target fallback."
+          "description": "Path to ku executable. Empty means use PATH ku first, then workspace release/<rust-target>/ku[.exe]."
         },
         "ku.checkOnSave": {
           "type": "boolean",

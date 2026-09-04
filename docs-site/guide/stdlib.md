@@ -171,11 +171,11 @@ fn main(): null! {
 }
 ```
 
-配置字段固定为必填的 `host`、`user`、`password`、`database`，以及可选的 `port`、`max_connections`、`max_waiters`、`connect_timeout_ms`、`acquire_timeout_ms`、`query_timeout_ms`。client receiver 只有 `query(sql, params)`、`execute(sql, params)`、`close()`；result receiver 是 `rows()`、`cols()`、`value(row, col)`、`is_null(row, col)`。参数占位符使用 `?`，参数值放入 `[str]`；无参数调用也必须传 `[]`。所有 SQL 都走 prepared statement，不提供字符串拼接查询的第二套接口。
+配置字段固定为必填的 `host`、`user`、`password`、`database`，以及可选的 `port`、`max_connections`、`max_waiters`、`connect_timeout_ms`、`acquire_timeout_ms`、`query_timeout_ms`。client receiver 只有 `query(sql, params)`、`execute(sql, params)`、`close()`；result receiver 是 `rows()`、`cols()`、`value(row, col)`、`is_null(row, col)`。参数占位符使用 `?`，参数值放入 `[str]`；无参数调用也必须传 `[]`。所有 SQL 都走 prepared statement，不提供字符串拼接查询的第二套接口。顶层 `CALL` 在驱动实现有界的全结果消费前会在借连接前拒绝。
 
 Redis 和 MySQL 当前没有内建、可配置并可验证证书与主机名的 TLS。它们只应连接 loopback、可信内网，或通过已验证的受控 TLS tunnel/proxy；不要直接暴露在不可信公网。此限制不能由连接池或 timeout 替代。
 
-数据库操作返回 `execution_unknown` 或 `execution_completed_without_result` 时，语句可能已经执行，禁止自动重试。调用方必须先按业务幂等键、事务记录或人工对账确认结果，再决定补偿动作；驱动不会自动重放 SQL。
+数据库操作返回 `execution_unknown` 或 `execution_completed_without_result` 时，语句可能已经执行，禁止自动重试。MySQL 有列 prepared result 只有读到 `MYSQL_NO_DATA` 才确认当前结果终态，`mysql_stmt_execute()==0` 本身不够；终态前的 deadline、metadata、分配、bind、fetch、上限或 UTF-8 失败均为 `execution_unknown`。PG/MySQL 的 `session_state_unsupported` 也不能仅凭 code 自动重试：前置固定消息表示 SQL 尚未发送，后置固定消息表示语句已经或可能已经执行且 payload 已丢弃。调用方必须先按业务幂等键、事务记录或人工对账确认结果，再决定补偿动作；驱动不会自动重放 SQL。
 
 ## http
 

@@ -1723,7 +1723,7 @@ print(service.routes[0].method)
 
 `http.service()` / `http.server(config?)` 返回 service 配置对象。`service.bind(address)?` 会在 `bind/listen` 前检查并编译 method 分组的路由形状表，`:0` 会让系统分配空闲端口；请求匹配使用这个 `compiled_router`，不会在每次请求时扫描 `service.routes`。`bind/listen` 的配置只来自 `http.service(config?)` / `http.server(config?)` 创建出的 service 对象，不接受第二个 config 参数。`listener.run()?` 会阻塞处理 HTTP 请求，`listener.close()?` 会显式关闭还没 run 的 listener。
 
-上述 `bind` / `listener.run` / `listener.close` 生命周期当前仅由解释器实现。native C 的 Windows Winsock 与 Linux/macOS POSIX 分支都使用 `service.listen(address)?` 直接进入阻塞 accept loop；尝试 native 编译 `bind` 会提前报能力边界错误。`listen` 会消费 service，调用后不能再复用该句柄。Windows 已本地验证，Linux/macOS 仍待对应真机 CI 首次跑绿。
+上述 `bind` / `listener.run` / `listener.close` 生命周期当前仅由解释器实现。native C 的 Windows Winsock 与 Linux/macOS POSIX 分支都使用 `service.listen(address)?` 直接进入阻塞 accept loop；尝试 native 编译 `bind` 会提前报能力边界错误。`listen` 会消费 service，调用后不能再复用该句柄。Windows 已本地验证，Windows 2025、Ubuntu 24.04、macOS 15 的完整 workspace CI 也已在此前提交跑绿；当前未发布修改仍必须重新通过同一三系统门槛，旧结果不能替代本次验证。
 
 普通 HTTP handler 可以接收 0 或 1 个请求参数：
 
@@ -1797,6 +1797,40 @@ powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127
 ```
 
 `examples/http_bench.ps1` 使用内嵌 C# `HttpClient` 并发发送请求，输出开始/结束时间、总耗时、RPS、错误数、状态码分布和粗略延迟分位；脚本有外部 deadline，不会无限等待。
+
+### 12.12 bytes 和 net
+
+native 二进制的 TCP client 只使用一套 `net.client(config)` 写法；默认是明文，需要 TLS 时在同一 config 中设置 `tls: true`，不提供另一个 `tls.connect`。例如：
+
+```ku
+import bytes from "std.bytes"
+import net from "std.net"
+
+fn main(): null! {
+    payload = bytes.from_array([65, 0, 255])?
+    client = net.client({
+        host: "example.com",
+        port: 443,
+        tls: true,
+        tls_server_name: "example.com",
+        connect_timeout_ms: 5000,
+        read_timeout_ms: 5000,
+        write_timeout_ms: 5000,
+        max_read_bytes: 1048576
+    })?
+    client.write(payload)?
+    reply = client.read(1024)?
+    println(reply.len())
+    client.close()
+    return ok(null)
+}
+```
+
+config 字段固定为 `host`、`port`、`connect_timeout_ms`、`read_timeout_ms`、`write_timeout_ms`、`max_read_bytes`、`tls`、`tls_server_name`、`tls_ca_pem`。`tls_server_name` 缺省时使用 `host`；一旦提供 `tls_ca_pem`，它会完全替换内置 WebPKI roots。TLS-only 字段不能和 `tls: false` 一起使用。没有 skip-verify/insecure 开关，证书、主机名或 runtime 校验失败会返回结构化错误，不会回退明文。
+
+`client.read(n)` 是“最多读 n bytes”，不是 read-exact 或消息分帧；TLS 下单次返回还受 64 KiB runtime 上限约束。`read/write` 借用 client，`close()` 消费 move-only client，close 后再 use 由 checker 拒绝。生成 helper 是 translation-unit 内部实现，不是稳定第三方 C ABI；如果绕过 Ku 直接调用生成 C，必须外部串行化同一 client 的 close/use，close 不得与 read/write 并发。
+
+这条 TLS 路径当前只在 generated native C 中实现；解释器 `ku run`、HTTP 与 Redis 还没有复用它。启用 TLS 的 native 构建需要匹配 target/compiler ABI 的 v1 target pack。pack manifest 的 SHA-256 只是内部一致性检查，不是发布者签名；pack 来源、compiler 和构建环境是信任边界。TLS archive 静态链入最终产物，不需 `ku-native-tls` shared-library sidecar，但目标系统 CRT/系统网络库依赖仍存在。
 
 ## 13. struct
 
@@ -2074,7 +2108,7 @@ unit / payload / nested enum match lowering
 系统 int main(void) wrapper
 ```
 
-native C 当前仍是 prototype，但同步所有权和错误流已闭环：Copy 类型是 `int/bool/float/null`；`str/array/object/struct/enum/Result/task` 在语言检查层按 Owned 处理，赋值和传参默认 move。`str/array/object/struct/enum/Result` 的复制必须显式 `.clone()`，`Task<T>` 是 move-only，不能 clone，`await` 会消费 task。checker 会拒绝 use-after-move、重复消费 Result、重复 await task、match 分支漏合并和循环回边重复 move。C 后端为 array、named value 和 Result 生成 move/clone/drop，赋值先物化 RHS 再 drop 旧值，解构交换先物化全部 RHS；嵌套 owned array 递归 clone/drop。
+native C 当前是受测试约束的同步后端；尚未实现的递归值和 async 语法会在生成 C 前明确拒绝。同步所有权和错误流已闭环：Copy 类型是 `int/bool/float/null`；`str/array/object/struct/enum/Result/task` 在语言检查层按 Owned 处理，赋值和传参默认 move。`str/array/object/struct/enum/Result` 的复制必须显式 `.clone()`，`Task<T>` 是 move-only，不能 clone，`await` 会消费 task。checker 会拒绝 use-after-move、重复消费 Result、重复 await task、match 分支漏合并和循环回边重复 move。C 后端为 array、named value 和 Result 生成 move/clone/drop，赋值先物化 RHS 再 drop 旧值，解构交换先物化全部 RHS；嵌套 owned array 递归 clone/drop。
 
 `.clone()` 规则：
 

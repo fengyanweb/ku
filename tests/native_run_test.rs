@@ -8,11 +8,20 @@ pub mod bounded_process;
 
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bounded_process::{run_bounded, FailureKind, OutputLimits};
+use rcgen::{
+    generate_simple_self_signed, CertificateParams, CertifiedKey, CustomExtension, KeyPair,
+};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::{ServerConfig, ServerConnection, StreamOwned, SupportedProtocolVersion};
 
 const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 const RUN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -64,6 +73,173 @@ fn unique_temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+#[derive(Default)]
+struct CopyTestTreeBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+fn copy_test_tree_inner(
+    source: &Path,
+    destination: &Path,
+    depth: usize,
+    budget: &mut CopyTestTreeBudget,
+) {
+    assert!(depth <= 8, "TLS pack test fixture exceeded its depth bound");
+    budget.entries = budget
+        .entries
+        .checked_add(1)
+        .expect("TLS pack test fixture entry count overflowed");
+    assert!(
+        budget.entries <= 128,
+        "TLS pack test fixture exceeded its total entry bound"
+    );
+    let metadata = fs::symlink_metadata(source).expect("inspect TLS pack test input");
+    assert!(
+        !metadata.file_type().is_symlink(),
+        "TLS pack test input must not contain symlinks"
+    );
+    if metadata.is_file() {
+        budget.bytes = budget
+            .bytes
+            .checked_add(metadata.len())
+            .expect("TLS pack test fixture byte count overflowed");
+        assert!(
+            metadata.len() <= 128 * 1024 * 1024 && budget.bytes <= 129 * 1024 * 1024,
+            "TLS pack test fixture exceeded its file or total byte bound"
+        );
+        let copied = fs::copy(source, destination).expect("copy TLS pack test file");
+        assert_eq!(
+            copied,
+            metadata.len(),
+            "TLS pack test copy changed file length"
+        );
+        return;
+    }
+    assert!(
+        metadata.is_dir(),
+        "TLS pack test input must be a file or directory"
+    );
+    fs::create_dir(destination).expect("create TLS pack test directory");
+    let entries = fs::read_dir(source)
+        .expect("read TLS pack test directory")
+        .take(65)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect TLS pack test entries");
+    assert!(
+        entries.len() <= 64,
+        "TLS pack test directory exceeded its entry bound"
+    );
+    for entry in entries {
+        copy_test_tree_inner(
+            &entry.path(),
+            &destination.join(entry.file_name()),
+            depth + 1,
+            budget,
+        );
+    }
+}
+
+fn copy_test_tree(source: &Path, destination: &Path, depth: usize) {
+    let mut budget = CopyTestTreeBudget::default();
+    copy_test_tree_inner(source, destination, depth, &mut budget);
+}
+
+fn test_tls_server_config(
+    version: &'static SupportedProtocolVersion,
+) -> (String, Arc<ServerConfig>) {
+    let CertifiedKey { cert, key_pair } =
+        generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate native TLS test certificate");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[version])
+        .expect("native TLS test protocol must be supported")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+        )
+        .expect("build native TLS test server config");
+    (cert.pem(), Arc::new(config))
+}
+
+fn large_tls13_server_config() -> (String, Arc<ServerConfig>) {
+    let key_pair = KeyPair::generate().expect("generate fragmented TLS server key");
+    let mut params = CertificateParams::new(vec!["localhost".to_string()])
+        .expect("create fragmented TLS certificate parameters");
+    params
+        .custom_extensions
+        .push(CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 55555, 2],
+            vec![0x42; 5 * 1024],
+        ));
+    let cert = params
+        .self_signed(&key_pair)
+        .expect("generate fragmented TLS certificate");
+    assert!(
+        cert.der().len() > 4096,
+        "fragmented TLS fixture must exceed the former driver-step limit"
+    );
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 must be supported")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+        )
+        .expect("build fragmented TLS server config");
+    (cert.pem(), Arc::new(config))
+}
+
+fn finish_tls_server_handshake(
+    connection: &mut ServerConnection,
+    stream: &mut std::net::TcpStream,
+    fragment_output: bool,
+) {
+    stream
+        .set_nodelay(true)
+        .expect("disable Nagle for fragmented TLS fixture");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while connection.is_handshaking() {
+        assert!(
+            Instant::now() < deadline,
+            "fragmented TLS server handshake exceeded its deadline"
+        );
+        if connection.wants_read() {
+            let read = connection
+                .read_tls(stream)
+                .expect("read fragmented TLS client flight");
+            assert_ne!(read, 0, "fragmented TLS client closed during handshake");
+            connection
+                .process_new_packets()
+                .expect("process fragmented TLS client flight");
+        }
+        while connection.wants_write() {
+            let mut ciphertext = Vec::new();
+            let written = connection
+                .write_tls(&mut ciphertext)
+                .expect("encode fragmented TLS server flight");
+            assert_eq!(written, ciphertext.len());
+            assert_ne!(written, 0, "fragmented TLS server made no write progress");
+            if fragment_output {
+                for byte in ciphertext {
+                    stream
+                        .write_all(&[byte])
+                        .expect("write one fragmented TLS byte");
+                    thread::sleep(Duration::from_micros(200));
+                }
+            } else {
+                stream
+                    .write_all(&ciphertext)
+                    .expect("write TLS server flight");
+            }
+        }
+    }
+}
+
 fn exe_name(stem: &str) -> String {
     if cfg!(windows) {
         format!("{stem}.exe")
@@ -72,8 +248,51 @@ fn exe_name(stem: &str) -> String {
     }
 }
 
+fn configured_runtime_directory(name: &str) -> Option<PathBuf> {
+    let configured = env::var_os(name)?;
+    let directory = PathBuf::from(configured);
+    assert!(
+        directory.is_absolute() && directory.is_dir(),
+        "{name} must name an existing absolute runtime directory, got '{}'",
+        directory.display()
+    );
+    Some(directory)
+}
+
+fn configure_runtime_search(command: &mut Command, mut directories: Vec<PathBuf>) {
+    directories.retain(|path| path.is_dir());
+    let variable = if cfg!(windows) {
+        "PATH"
+    } else if cfg!(target_os = "macos") {
+        "DYLD_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
+    if let Some(existing) = env::var_os(variable) {
+        directories.extend(env::split_paths(&existing));
+    }
+    if !directories.is_empty() {
+        let joined = env::join_paths(directories)
+            .expect("runtime search directories must form a valid loader path");
+        command.env(variable, joined);
+    }
+}
+
+fn configure_pg_runtime_search(command: &mut Command) {
+    let mut directories = Vec::new();
+    if let Some(directory) = configured_runtime_directory("KU_PG_RUNTIME_DIR") {
+        directories.push(directory);
+    }
+    configure_runtime_search(command, directories);
+}
+
 fn configure_mysql_runtime_search(command: &mut Command) {
     let mut directories = Vec::new();
+    for name in ["KU_MYSQL_RUNTIME_LIB", "KU_MYSQL_RUNTIME_BIN"] {
+        if let Some(directory) = configured_runtime_directory(name) {
+            directories.push(directory);
+        }
+    }
     if let Some(configured) = env::var_os("KU_MYSQL_LIB") {
         let library_dir = PathBuf::from(configured);
         directories.push(library_dir.clone());
@@ -103,22 +322,7 @@ fn configure_mysql_runtime_search(command: &mut Command) {
         }
     }
 
-    directories.retain(|path| path.is_dir());
-    let variable = if cfg!(windows) {
-        "PATH"
-    } else if cfg!(target_os = "macos") {
-        "DYLD_LIBRARY_PATH"
-    } else {
-        "LD_LIBRARY_PATH"
-    };
-    if let Some(existing) = env::var_os(variable) {
-        directories.extend(env::split_paths(&existing));
-    }
-    if !directories.is_empty() {
-        let joined = env::join_paths(directories)
-            .expect("MySQL runtime search directories must form a valid loader path");
-        command.env(variable, joined);
-    }
+    configure_runtime_search(command, directories);
 }
 
 /// Build `entry_rel` (relative to `dir`) into a native binary at `dir/out`.
@@ -1081,6 +1285,174 @@ int main(void) {
 }
 
 #[test]
+fn native_net_tls_c_links_runs_without_source_or_pack_and_preserves_binary() {
+    let Some(configured_pack) = env::var_os("KU_NATIVE_TLS_PACK") else {
+        if env::var("KU_NATIVE_TLS_LINK_REQUIRED").is_ok_and(|value| value == "1") {
+            panic!("KU_NATIVE_TLS_LINK_REQUIRED=1 requires KU_NATIVE_TLS_PACK");
+        }
+        eprintln!("skip: KU_NATIVE_TLS_PACK is not configured");
+        return;
+    };
+    let configured_pack = PathBuf::from(configured_pack);
+    assert!(
+        configured_pack.is_absolute(),
+        "KU_NATIVE_TLS_PACK must be absolute"
+    );
+
+    for (label, version, fragment_server_flight) in [
+        ("tls12", &rustls::version::TLS12, false),
+        ("tls13", &rustls::version::TLS13, false),
+        ("tls13-fragmented", &rustls::version::TLS13, true),
+    ] {
+        let dir = unique_temp_dir(&format!("net-{label}-consumer"));
+        let private_pack = dir.join("native-tls-pack");
+        copy_test_tree(&configured_pack, &private_pack, 0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind native TLS loopback listener");
+        let port = listener
+            .local_addr()
+            .expect("read native TLS loopback address")
+            .port();
+        let (certificate_pem, server_config) = if fragment_server_flight {
+            large_tls13_server_config()
+        } else {
+            test_tls_server_config(version)
+        };
+        let connect_timeout_ms = if fragment_server_flight {
+            15_000
+        } else {
+            3_000
+        };
+        fs::write(
+            dir.join("main.ku"),
+            format!(
+                r#"import bytes from "std.bytes"
+import net from "std.net"
+fn main(): null! {{
+    payload = bytes.from_array([65, 0, 255])?
+    client = net.client({{
+        host: "127.0.0.1",
+        port: {port},
+        tls: true,
+        tls_server_name: "localhost",
+        tls_ca_pem: {certificate_pem:?},
+        connect_timeout_ms: {connect_timeout_ms},
+        read_timeout_ms: 3000,
+        write_timeout_ms: 3000,
+        max_read_bytes: 32
+    }})?
+    client.write(payload)?
+    reply = client.read(3)?
+    println(reply.len())
+    println(reply.get(0)?)
+    println(reply.get(1)?)
+    println(reply.get(2)?)
+    client.close()
+    return ok(null)
+}}
+"#
+            ),
+        )
+        .expect("write native TLS Ku fixture");
+
+        let executable_name = exe_name(&format!("net-{label}-consumer"));
+        let mut build = Command::new(ku_binary());
+        build
+            .current_dir(&dir)
+            .env("KU_NATIVE_TLS_PACK", &private_pack)
+            .args(["build", "--native", "main.ku", "-o", &executable_name]);
+        let output = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+            .unwrap_or_else(|error| panic!("native TLS consumer build was not bounded: {error}"));
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success()
+            && env::var("KU_NATIVE_TLS_LINK_REQUIRED").is_err()
+            && combined.contains("C compiler not found")
+        {
+            eprintln!("skip: host C compiler is unavailable: {combined}");
+            fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "native TLS consumer failed to compile/link:\n{combined}"
+        );
+
+        fs::remove_file(dir.join("main.ku")).expect("remove native TLS source before run");
+        let generated = dir.join(".ku");
+        if generated.exists() {
+            fs::rename(&generated, dir.join("retired-generated-source"))
+                .expect("retire generated native TLS source before run");
+        }
+        fs::remove_dir_all(&private_pack).expect("remove native TLS pack before run");
+
+        let peer = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("make native TLS listener accept bounded");
+            let accept_deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < accept_deadline,
+                            "native TLS client did not connect before the server deadline"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept native TLS client: {error}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("restore blocking native TLS server stream");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("bound native TLS server read");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("bound native TLS server write");
+            let mut connection =
+                ServerConnection::new(server_config).expect("create native TLS server connection");
+            finish_tls_server_handshake(&mut connection, &mut stream, fragment_server_flight);
+            let mut tls = StreamOwned::new(connection, stream);
+            let mut request = [0u8; 3];
+            tls.read_exact(&mut request)
+                .expect("read native TLS binary request");
+            assert_eq!(request, [65, 0, 255]);
+            tls.write_all(&[66, 0, 254])
+                .expect("write native TLS binary response");
+            tls.conn.send_close_notify();
+            tls.flush()
+                .expect("flush native TLS response and close notify");
+        });
+
+        let executable = dir.join(&executable_name);
+        let mut run = Command::new(&executable);
+        run.current_dir(&dir)
+            .env_remove("KU_NATIVE_TLS_PACK")
+            .env_remove("KU_NATIVE_TLS_LINK_REQUIRED");
+        let started = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+            .unwrap_or_else(|error| panic!("native TLS consumer did not finish safely: {error}"));
+        let stdout = String::from_utf8_lossy(&started.stdout).replace('\r', "");
+        let stderr = String::from_utf8_lossy(&started.stderr);
+        assert_eq!(stdout, "3\n66\n0\n254\n");
+        assert!(stderr.is_empty(), "native TLS consumer stderr: {stderr}");
+        assert!(
+            started.status.success(),
+            "native TLS consumer exited with {:?}",
+            started.status.code()
+        );
+        peer.join().expect("native TLS loopback peer");
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
 fn native_pg_client_c_links_and_starts_when_toolchain_and_libpq_are_available() {
     let dir = unique_temp_dir("pg-client-host-compile");
     fs::write(
@@ -1138,6 +1510,7 @@ fn main(): null! {
     let executable = dir.join(exe_name("pg-client"));
     let mut run = Command::new(&executable);
     run.current_dir(&dir);
+    configure_pg_runtime_search(&mut run);
     let started = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
         .unwrap_or_else(|error| panic!("linked PG client could not start safely: {error}"));
     let stdout = String::from_utf8_lossy(&started.stdout).replace('\r', "");

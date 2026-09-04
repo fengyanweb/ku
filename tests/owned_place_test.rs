@@ -2512,6 +2512,26 @@ fn redis_static_client_config_is_strict() {
             "{ host: \"127.0.0.1\", username: \"alice\" }",
             "field 'username' requires 'password'",
         ),
+        (
+            "redis-config-tls-unavailable.ku",
+            "{ host: \"127.0.0.1\", tls: true }",
+            "unknown redis client config field 'tls'",
+        ),
+        (
+            "redis-config-tls-name-unavailable.ku",
+            "{ host: \"127.0.0.1\", tls_server_name: \"localhost\" }",
+            "unknown redis client config field 'tls_server_name'",
+        ),
+        (
+            "redis-config-tls-ca-unavailable.ku",
+            "{ host: \"127.0.0.1\", tls_ca_pem: \"ca\" }",
+            "unknown redis client config field 'tls_ca_pem'",
+        ),
+        (
+            "redis-config-skip-verify.ku",
+            "{ host: \"127.0.0.1\", tls: true, skip_verify: true }",
+            "unknown redis client config field 'skip_verify'",
+        ),
     ] {
         rejects(
             name,

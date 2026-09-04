@@ -1,44 +1,27 @@
-# Ku 解释器历史
+# Ku 发布与历史
 
-这个目录记录每个公开版本对应的解释器程序，避免只保留最新 `release/ku.exe`。
+当前发布合同按操作系统/CPU target 隔离，避免 Windows、Linux 和 macOS 产物互相覆盖。一个 bundle 只对应一个 target，不宣称存在三系统通用二进制。
 
 ## 文件位置
 
 ```txt
+release/
+  <target>/
+    ku[.exe]
+    libku.rlib
+    ku-language-<version>.vsix
+    ku.pdb                         # 仅 Windows，存在时包含
+    native-tls/v1/<target>/
+      manifest.kutls
+      include/ku_native_tls.h
+      lib/<target-specific archive>
+
 history/
-  v0.0.5/
-    ku.exe
-    libku.rlib
-  v0.0.6/
-    ku.exe
-    libku.rlib
-  v0.0.7/
-    ku.exe
-    libku.rlib
-  v0.0.8/
-    ku.exe
-    libku.rlib
-  v0.0.9/
-    ku.exe
-    libku.rlib
-  v0.0.10/
-    ku.exe
-    libku.rlib
-  v0.0.11/
-    ku.exe
-    libku.rlib
-  v0.0.12/
-    ku.exe
-    libku.rlib
-  v0.0.13/
-    ku.exe
-    libku.rlib
-  v0.0.15/
-    ku.exe
-    libku.rlib
+  v<version>/
+    <target>/                      # 与 release/<target>/ 相同的完整 bundle
 ```
 
-`release/ku.exe` 始终是当前最新版本；`history/v*/ku.exe` 是对应历史版本快照。
+`target` 是精确 Rust triple，当前支持 `x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu` 和 `aarch64-apple-darwin`。仓库中早期版本仍可能使用 `release/ku.exe` 或 `history/vX.Y.Z/ku.exe` 旧布局；它们只是历史记录，不是新发布脚本的输出合同。
 
 ## 当前记录
 
@@ -54,50 +37,35 @@ history/
 | 0.0.12 | 已归档 | 嵌套 match 模式、std.http Response API、HTTP client 连接复用和 helper、fs 写入、严格 bool 条件、native C main wrapper |
 | 0.0.13 | 已归档 | build 命令入口、ku.mod main/out、std root 小写导入诊断、std.time 边界、VS Code/release 同步 |
 | 0.0.14 | 已归档 | create/init/template 项目模板、HTTP status helper、匿名 fn handler、VS Code/release 同步 |
-| 0.0.15 | 当前 | 对象解构、HTTP service 调用严格化、示例重写、clone/IR/native 路线同步 |
+| 0.0.15 | 已归档 | 对象解构、HTTP service 调用严格化、示例重写、clone/IR/native 路线同步 |
+| 0.0.16 | 当前 | native 标准库、统一数据库 client、package/registry 与 target-scoped 发布合同 |
 
 ## 自动化
 
-发布或本地更新解释器时，在项目根目录运行：
+脚本要求 PowerShell 7。先做不发布 bundle 的完整构建/合同检查：
 
 ```powershell
-.\scripts\archive-release.ps1
+pwsh -NoLogo -NoProfile -File scripts\package-release.ps1 -CheckOnly
+pwsh -NoLogo -NoProfile -File scripts\archive-release.ps1 -CheckOnly
 ```
 
-脚本会自动执行：
+生成当前 host target 的 release bundle：
 
 ```powershell
-cargo build --release
-Copy-Item -LiteralPath target\release\ku.exe -Destination release\ku.exe -Force
-Copy-Item -LiteralPath target\release\libku.rlib -Destination release\libku.rlib -Force
-Copy-Item -LiteralPath target\release\ku.pdb -Destination release\ku.pdb -Force
-Copy-Item -LiteralPath target\release\ku.exe -Destination history\v$version\ku.exe -Force
-Copy-Item -LiteralPath target\release\libku.rlib -Destination history\v$version\libku.rlib -Force
-Copy-Item -LiteralPath target\release\ku.pdb -Destination history\v$version\ku.pdb -Force
+pwsh -NoLogo -NoProfile -File scripts\package-release.ps1
 ```
 
-其中 `$version` 来自 `Cargo.toml` 的 `package.version`，例如当前版本会写入 `history\v0.0.15\`。
-
-只检查产物和版本路径：
+生成 release bundle 后再发布不可变历史快照：
 
 ```powershell
-.\scripts\archive-release.ps1 -CheckOnly -SkipBuild
+pwsh -NoLogo -NoProfile -File scripts\archive-release.ps1
 ```
 
-如果只想手动更新当前本地解释器，可以运行：
-
-```powershell
-cargo build --release
-Copy-Item -LiteralPath target\release\ku.exe -Destination release\ku.exe -Force
-Copy-Item -LiteralPath target\release\libku.rlib -Destination release\libku.rlib -Force
-Copy-Item -LiteralPath target\release\ku.pdb -Destination release\ku.pdb -Force
-Copy-Item -LiteralPath target\release\ku.exe -Destination history\v0.0.15\ku.exe -Force
-Copy-Item -LiteralPath target\release\libku.rlib -Destination history\v0.0.15\libku.rlib -Force
-Copy-Item -LiteralPath target\release\ku.pdb -Destination history\v0.0.15\ku.pdb -Force
-```
+`package-release.ps1` 使用当前 host 对应的显式 Cargo target 目录，构建固定版本 TLS pack 与 lockfile-backed VSIX，并在私有 staging 中校验文件集、目标架构和 pack 合同后，以 per-target 单写者锁、完整目录切换和 journal 崩溃恢复发布 `release/<target>/`。替换既有目录需要两次目录移动，无锁读者在切换窗口可能短暂看不到 current target，不能把它称为原子可见。`archive-release.ps1` 复验该 bundle，再以不可变目标发布 `history/v<version>/<target>/`；该目标已存在时拒绝覆盖。`-CheckOnly` 仍执行实际构建与验证，但不发布 release/history bundle；没有跳过构建的 `-SkipBuild` 逃生门。
 
 ## 规则
 
-- 每次版本发布都复制当前 `release/ku.exe`、`release/libku.rlib` 和可用的 `release/ku.pdb` 到 `history/vX.Y.Z/`。
-- 如果未来 release 文件变多，按版本目录一起归档。
+- 每个 target 必须使用匹配的 host/toolchain 独立构建和验收；不从一个 host bundle 推导其他两个系统已通过。
+- `release/<target>/` 以 per-target 锁串行替换为同 target 的完整已验 bundle，并用 journal 恢复中断切换；替换窗口对无锁读者不保证 current target 始终可见。`history/v<version>/<target>/` 不可变，已存在时不覆盖。
+- bundle 目录和内容必须是有界的普通文件/目录，不接受 symlink/reparse point。
 - 文档中必须说明该版本做了什么、没做什么、下一步做什么。

@@ -277,6 +277,8 @@ fn native_pg_queries_have_one_nonblocking_deadline_path() {
         "PostgreSQL query budget expired before the requested statement was sent",
         "PostgreSQL statement may have executed; outcome is unknown; never retry automatically; close and reconnect",
         "PostgreSQL statement completed but its result could not be delivered; never retry automatically",
+        "PostgreSQL statement was not sent because explicit transaction or session-control SQL is unsupported by the pooled client",
+        "PostgreSQL statement completed or may have completed; session state is unsupported and its payload was discarded; never retry automatically",
         "DISCARD ALL",
         "ku_pg_client_cleanup_connection(connection, broken, deadline)",
         "ku_pg_client_release(p, slot, broken || PQstatus(c) != KU_PG_CONNECTION_OK, deadline)",
@@ -1662,6 +1664,12 @@ int main(void) {
       && sends == before_session_sends && connect_attempts == before_session_connects);
   ku_error_drop(&result.error);
   result = ku_pg_client_query(
+      pool, text("\v \t\r\n\fSET ROLE app"), empty_params);
+  CHECK(!result.ok && equals(result.error.code, "session_state_unsupported")
+      && sends == before_session_sends && connect_attempts == before_session_connects
+      && ku_test_pg_acquire_calls == before_session_acquires);
+  ku_error_drop(&result.error);
+  result = ku_pg_client_query(
       pool, text("LOAD 'untrusted_backend_library'"), empty_params);
   CHECK(!result.ok && equals(result.error.code, "session_state_unsupported")
       && sends == before_session_sends && connect_attempts == before_session_connects);
@@ -1810,6 +1818,7 @@ int main(void) {
   next_user_transaction_status = 2; before_resets = reset_sends;
   result = ku_pg_client_query(pool, text("SELECT leaves_transaction_open"), empty_params);
   CHECK(!result.ok && equals(result.error.code, "session_state_unsupported")
+      && equals(result.error.message, "PostgreSQL statement completed or may have completed; session state is unsupported and its payload was discarded; never retry automatically")
       && reset_sends == before_resets && !pool->conns[0] && pool->active == 0);
   ku_error_drop(&result.error);
 

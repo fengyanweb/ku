@@ -26,7 +26,6 @@ fn abi_version_build_id_and_status_numbers_are_stable() {
         assert_eq!(KU_TLS_MAX_HANDSHAKE_BYTES, 1024 * 1024);
         assert_eq!(KU_TLS_MAX_HANDSHAKE_ITERATIONS, 4096);
         assert_eq!(KU_TLS_MAX_SERVER_NAME_BYTES, 253);
-        assert_eq!(KU_TLS_RESUMPTION_CACHE_ENTRIES, 64);
 
         let mut data = ptr::null();
         let mut len = 0usize;
@@ -35,7 +34,7 @@ fn abi_version_build_id_and_status_numbers_are_stable() {
         let build_id = std::slice::from_raw_parts(data, len);
         assert_eq!(
             build_id,
-            b"ku-native-tls/0.1.0;abi=1;rustls=0.23.40;ring=0.17.14;webpki-roots=1.0.7;buffer=65536;handshake=1048576;resumption=64"
+            b"ku-native-tls/0.1.0;abi=1;rustls=0.23.40;ring=0.17.14;webpki-roots=1.0.7;buffer=65536;handshake=1048576;record-staging=65540;resumption=disabled"
         );
     }
 }

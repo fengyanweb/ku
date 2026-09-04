@@ -45,6 +45,13 @@ jobs:
       - name: Reject clippy warnings in every workspace Cargo target
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: Install the editor test Node runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: editors/vscode-ku/package-lock.json
+
       - name: Install VS Code extension dependencies from lockfile
         working-directory: editors/vscode-ku
         run: npm ci
@@ -60,14 +67,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - windows-2025
-          - ubuntu-24.04
-          - macos-15
+        include:
+          - os: windows-2025
+            tls_target: x86_64-pc-windows-msvc
+          - os: ubuntu-24.04
+            tls_target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            tls_target: aarch64-apple-darwin
     env:
       CARGO_INCREMENTAL: "0"
-      KU_MYSQL_LINK_REQUIRED: "1"
-      KU_PG_LINK_REQUIRED: "1"
+      KU_NATIVE_TLS_LINK_REQUIRED: "1"
       RUST_BACKTRACE: "1"
 
     steps:
@@ -179,7 +188,8 @@ jobs:
             throw 'Failed to create the private libpq import-library copy'
           }
           "KU_PG_LIB=$privateLib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          $runtimeDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "KU_PG_RUNTIME_DIR=$runtimeDirectory" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Locate the exact MySQL client import library on Windows
         if: runner.os == 'Windows'
@@ -224,11 +234,13 @@ jobs:
           }
           "KU_MYSQL_LIB=$privateMysql" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "KU_MYSQL_INCLUDE=$mysqlInclude" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          $mysqlLib | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "KU_MYSQL_RUNTIME_LIB=$mysqlLib" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $mysqlBin = Join-Path $selected.FullName 'bin'
           if (Test-Path -LiteralPath $mysqlBin -PathType Container) {
-            (Resolve-Path -LiteralPath $mysqlBin).Path |
-              Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            $mysqlBin = (Resolve-Path -LiteralPath $mysqlBin).Path
+            "KU_MYSQL_RUNTIME_BIN=$mysqlBin" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
           (Get-Item -LiteralPath (Join-Path $mysqlLib 'libmysql.dll')).VersionInfo |
             Format-List FileVersion,ProductVersion
@@ -236,11 +248,34 @@ jobs:
       - name: Build Ku CLI
         run: cargo build --locked --release --bin ku
 
-      - name: Build the native TLS C ABI archive
-        run: cargo build --locked --release -p ku-native-tls
+      - name: Build and verify the native TLS target pack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packRoot = Join-Path $env:RUNNER_TEMP 'ku-native-tls-pack-v1'
+          & ./scripts/build-native-tls-pack.ps1 `
+            -Target '${{ matrix.tls_target }}' `
+            -OutputRoot $packRoot
+          "KU_NATIVE_TLS_PACK=$packRoot" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Require a source-free native TLS C consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_log="$(mktemp)"
+          trap 'rm -f "$test_log"' EXIT
+          cargo test --locked --release \
+            --test native_run_test \
+            native_net_tls_c_links_runs_without_source_or_pack_and_preserves_binary \
+            -- --exact --nocapture --test-threads=1 2>&1 | tee "$test_log"
+          grep -F "test result: ok. 1 passed; 0 failed" "$test_log"
 
       - name: Require native PostgreSQL client linking and startup
+        if: runner.os != 'Windows'
         shell: bash
+        env:
+          KU_PG_LINK_REQUIRED: "1"
         run: |
           set -euo pipefail
           if [ "$RUNNER_OS" = Linux ]; then export LD_BIND_NOW=1; fi
@@ -253,8 +288,26 @@ jobs:
             -- --exact --nocapture --test-threads=1 2>&1 | tee "$test_log"
           grep -F "test result: ok. 1 passed; 0 failed" "$test_log"
 
+      - name: Require native PostgreSQL client linking and startup on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          KU_PG_LINK_REQUIRED: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & cargo test --locked --release `
+            --test native_run_test `
+            native_pg_client_c_links_and_starts_when_toolchain_and_libpq_are_available `
+            -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            throw "native PostgreSQL exact-link test failed with exit code $LASTEXITCODE"
+          }
+
       - name: Require native MySQL client linking and startup
+        if: runner.os != 'Windows'
         shell: bash
+        env:
+          KU_MYSQL_LINK_REQUIRED: "1"
         run: |
           set -euo pipefail
           if [ "$RUNNER_OS" = Linux ]; then export LD_BIND_NOW=1; fi
@@ -267,6 +320,21 @@ jobs:
             -- --exact --nocapture --test-threads=1 2>&1 | tee "$test_log"
           grep -F "test result: ok. 1 passed; 0 failed" "$test_log"
 
+      - name: Require native MySQL client linking and startup on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          KU_MYSQL_LINK_REQUIRED: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & cargo test --locked --release `
+            --test native_run_test `
+            native_mysql_client_c_links_and_starts_when_toolchain_and_library_are_available `
+            -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            throw "native MySQL exact-link test failed with exit code $LASTEXITCODE"
+          }
+
       - name: Reject platform-specific clippy warnings
         if: runner.os != 'Linux'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -275,6 +343,85 @@ jobs:
         run: >-
           cargo test --locked --release --workspace --no-fail-fast
           -- --nocapture --test-threads=2
+
+  release-contract:
+    name: ${{ matrix.os }} release scripts and clean CheckOnly
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2025
+          - ubuntu-24.04
+          - macos-15
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+          rustc --version --verbose
+
+      - name: Install the release packaging Node runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: editors/vscode-ku/package-lock.json
+
+      - name: Record the release packaging Node runtime
+        run: |
+          node --version
+          npm --version
+          node -e "if (Number(process.versions.node.split('.')[0]) !== 22) process.exit(1)"
+
+      - name: Snapshot the clean checkout including ignored paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          before="$RUNNER_TEMP/ku-release-checkout-before.txt"
+          git -c core.quotepath=false status \
+            --porcelain=v1 --untracked-files=all --ignored=matching > "$before"
+          if [ -s "$before" ]; then
+            cat "$before" >&2
+            exit 1
+          fi
+
+      - name: Exercise bounded release-process and crash-recovery contracts
+        shell: pwsh
+        run: >-
+          pwsh -NoLogo -NoProfile -NonInteractive
+          -File scripts/package-release.ps1 -SelfTest
+
+      - name: Build and validate the archive path without publishing
+        shell: pwsh
+        run: >-
+          pwsh -NoLogo -NoProfile -NonInteractive
+          -File scripts/archive-release.ps1 -CheckOnly
+
+      - name: Require CheckOnly to leave tracked, untracked and ignored paths unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          before="$RUNNER_TEMP/ku-release-checkout-before.txt"
+          after="$RUNNER_TEMP/ku-release-checkout-after.txt"
+          git -c core.quotepath=false status \
+            --porcelain=v1 --untracked-files=all --ignored=matching > "$after"
+          if ! cmp -s "$before" "$after"; then
+            diff -u "$before" "$after" >&2
+            exit 1
+          fi
 
   native:
     name: ${{ matrix.target }} native build and run

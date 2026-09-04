@@ -2838,6 +2838,7 @@ impl Checker {
             ));
         }
         validate_net_client_config(&config_type, config.span)?;
+        validate_net_tls_literal(config)?;
         Ok(Type::Result(Box::new(Type::Native(
             metadata::NET_CLIENT.to_string(),
         ))))
@@ -8774,13 +8775,16 @@ fn validate_redis_client_config(config_type: &Type, span: Span) -> KuResult<()> 
     Ok(())
 }
 
-const NET_CLIENT_CONFIG_FIELDS: [&str; 6] = [
+const NET_CLIENT_CONFIG_FIELDS: [&str; 9] = [
     "host",
     "port",
     "connect_timeout_ms",
     "read_timeout_ms",
     "write_timeout_ms",
     "max_read_bytes",
+    "tls",
+    "tls_server_name",
+    "tls_ca_pem",
 ];
 
 fn validate_net_client_config(config_type: &Type, span: Span) -> KuResult<()> {
@@ -8833,6 +8837,50 @@ fn validate_net_client_config(config_type: &Type, span: Span) -> KuResult<()> {
                     span,
                 ));
             }
+        }
+    }
+    if let Some(actual) = fields.get("tls") {
+        if *actual != Type::Bool {
+            return Err(KuError::runtime(
+                "net.client config field 'tls' must be bool",
+                span,
+            ));
+        }
+    }
+    for name in ["tls_server_name", "tls_ca_pem"] {
+        if let Some(actual) = fields.get(name) {
+            if *actual != Type::String {
+                return Err(KuError::runtime(
+                    format!("net.client config field '{name}' must be str"),
+                    span,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_net_tls_literal(config: &Expr) -> KuResult<()> {
+    let ExprKind::ObjectLiteral { fields } = &config.kind else {
+        return Ok(());
+    };
+    let tls = fields
+        .iter()
+        .find(|(name, _)| name == "tls")
+        .map(|(_, value)| value);
+    let tls_is_disabled = match tls {
+        None => true,
+        Some(value) => matches!(value.kind, ExprKind::Literal(Literal::Bool(false))),
+    };
+    if !tls_is_disabled {
+        return Ok(());
+    }
+    for name in ["tls_server_name", "tls_ca_pem"] {
+        if fields.iter().any(|(field_name, _)| field_name == name) {
+            return Err(KuError::runtime(
+                format!("net.client config field '{name}' requires 'tls' to be true"),
+                config.span,
+            ));
         }
     }
     Ok(())

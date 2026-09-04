@@ -6,6 +6,7 @@ pub mod env;
 pub mod error;
 pub mod ir;
 pub mod lexer;
+mod native_tls_archive;
 pub mod package;
 pub mod parser;
 pub mod registry_admin;
