@@ -217,6 +217,100 @@ fn parser_type_atom_reports_eof_and_boundary_spans_without_panicking() {
 }
 
 #[test]
+fn parser_bounds_structural_type_depth_across_all_type_forms() {
+    let parse = |source: &str| {
+        let tokens = Lexer::new(source).tokenize().expect("fixture should lex");
+        Parser::new(tokens).parse()
+    };
+    let assert_depth_error = |source: &str| {
+        let error = parse(source).expect_err("type nesting above the limit must fail");
+        assert_eq!(
+            error.message,
+            "maximum type depth exceeded; type is too deeply nested"
+        );
+    };
+
+    let array_at_limit = format!("fn f(value: {}int{}) {{}}", "[".repeat(32), "]".repeat(32));
+    parse(&array_at_limit).expect("32 nested array types must remain valid");
+    let array_over_limit = format!("fn f(value: {}int{}) {{}}", "[".repeat(33), "]".repeat(33));
+    assert_depth_error(&array_over_limit);
+
+    let result_at_limit = format!("fn f(value: {}int!{}) {{}}", "[".repeat(31), "]".repeat(31));
+    parse(&result_at_limit).expect("31 arrays around one result must have depth 32");
+    let result_over_limit = format!("fn f(value: {}int!{}) {{}}", "[".repeat(32), "]".repeat(32));
+    assert_depth_error(&result_over_limit);
+
+    let nested_function_type = |depth: usize| {
+        let mut ty = "int".to_string();
+        for _ in 0..depth {
+            ty = format!("fn(): {ty}");
+        }
+        ty
+    };
+    parse(&format!("fn f(value: {}) {{}}", nested_function_type(32)))
+        .expect("32 nested function types must remain valid");
+    assert_depth_error(&format!("fn f(value: {}) {{}}", nested_function_type(33)));
+
+    let branch = format!("{}int{}", "[".repeat(31), "]".repeat(31));
+    parse(&format!(
+        "fn f(value: fn({branch}, {branch}): {branch}) {{}}"
+    ))
+    .expect("function type sibling branches must not accumulate parse depth");
+
+    let mixed_at_limit = format!(
+        "fn f(value: {}fn(): int! | str{} | bool) {{}}",
+        "[".repeat(30),
+        "]".repeat(30)
+    );
+    parse(&mixed_at_limit)
+        .expect("array, result, function, and union nesting at depth 32 must parse");
+    let mixed_over_limit = format!(
+        "fn f(value: {}fn(): int! | str{}! | bool) {{}}",
+        "[".repeat(30),
+        "]".repeat(30)
+    );
+    assert_depth_error(&mixed_over_limit);
+
+    let arrow_at_limit = format!(
+        "fn main() {{ op = (value: {}int{}) => value }}",
+        "[".repeat(32),
+        "]".repeat(32)
+    );
+    parse(&arrow_at_limit).expect("arrow lookahead must accept the type-depth boundary");
+    let arrow_over_limit = format!(
+        "fn main() {{ op = (value: {}int{}) => value }}",
+        "[".repeat(33),
+        "]".repeat(33)
+    );
+    assert_depth_error(&arrow_over_limit);
+
+    let arrow_return_at_limit = format!(
+        "fn main() {{ op = (): {}int{} => 0 }}",
+        "[".repeat(32),
+        "]".repeat(32)
+    );
+    parse(&arrow_return_at_limit)
+        .expect("arrow lookahead must accept the return-type depth boundary");
+    let arrow_return_over_limit = format!(
+        "fn main() {{ op = (): {}int{} => 0 }}",
+        "[".repeat(33),
+        "]".repeat(33)
+    );
+    assert_depth_error(&arrow_return_over_limit);
+
+    let incomplete = format!("fn f(value: {}int |", "[".repeat(32));
+    let tokens = Lexer::new(&incomplete)
+        .tokenize()
+        .expect("incomplete type fixture should lex");
+    let eof_span = tokens.last().expect("lexer must emit EOF").span;
+    let error = Parser::new(tokens)
+        .parse()
+        .expect_err("EOF inside a depth-limited type must fail cleanly");
+    assert_eq!(error.message, "expected type name");
+    assert_eq!(error.span, eof_span);
+}
+
+#[test]
 fn parser_rejects_invalid_token_streams_without_panicking() {
     let program_error = Parser::new(Vec::new())
         .parse()
