@@ -48,7 +48,9 @@ fn add(a: int, b: int): int {
 }
 "#;
     let tokens = Lexer::new(source).tokenize().expect("lex should pass");
-    let program = Parser::new(tokens).parse().expect("parse should pass");
+    let program = Parser::new(tokens)
+        .parse_program()
+        .expect("parse should pass");
 
     let Item::Function(function) = &program.items[0] else {
         panic!("expected function item");
@@ -194,7 +196,7 @@ fn parser_type_atom_reports_eof_and_boundary_spans_without_panicking() {
             .expect("incomplete type fixture should lex");
         let eof_span = tokens.last().expect("lexer must emit EOF").span;
         let error = Parser::new(tokens)
-            .parse()
+            .parse_program()
             .expect_err("a union arm missing at EOF must fail");
         assert_eq!(error.message, "expected type name");
         assert_eq!(error.span, eof_span);
@@ -210,7 +212,7 @@ fn parser_type_atom_reports_eof_and_boundary_spans_without_panicking() {
         .expect("fixture must contain a parameter boundary")
         .span;
     let boundary_error = Parser::new(boundary_tokens)
-        .parse()
+        .parse_program()
         .expect_err("a union arm missing before ')' must fail");
     assert_eq!(boundary_error.message, "expected type name");
     assert_eq!(boundary_error.span, boundary_span);
@@ -220,7 +222,7 @@ fn parser_type_atom_reports_eof_and_boundary_spans_without_panicking() {
 fn parser_bounds_structural_type_depth_across_all_type_forms() {
     let parse = |source: &str| {
         let tokens = Lexer::new(source).tokenize().expect("fixture should lex");
-        Parser::new(tokens).parse()
+        Parser::new(tokens).parse_program()
     };
     let assert_depth_error = |source: &str| {
         let error = parse(source).expect_err("type nesting above the limit must fail");
@@ -304,7 +306,7 @@ fn parser_bounds_structural_type_depth_across_all_type_forms() {
         .expect("incomplete type fixture should lex");
     let eof_span = tokens.last().expect("lexer must emit EOF").span;
     let error = Parser::new(tokens)
-        .parse()
+        .parse_program()
         .expect_err("EOF inside a depth-limited type must fail cleanly");
     assert_eq!(error.message, "expected type name");
     assert_eq!(error.span, eof_span);
@@ -313,7 +315,7 @@ fn parser_bounds_structural_type_depth_across_all_type_forms() {
 #[test]
 fn parser_rejects_invalid_token_streams_without_panicking() {
     let program_error = Parser::new(Vec::new())
-        .parse()
+        .parse_program()
         .expect_err("empty program token stream must fail");
     assert_eq!(program_error.message, "token stream is empty");
     assert_eq!(program_error.span, Span::default());
@@ -326,7 +328,7 @@ fn parser_rejects_invalid_token_streams_without_panicking() {
 
     let value_span = Span::point(Position::new(2, 4, 9));
     let missing_program_eof = Parser::new(vec![Token::new(TokenKind::Int(1), value_span)])
-        .parse()
+        .parse_program()
         .expect_err("program token stream missing EOF must fail closed");
     assert_eq!(missing_program_eof.message, "token stream is missing EOF");
     assert_eq!(missing_program_eof.span, value_span);
@@ -345,7 +347,7 @@ fn parser_rejects_invalid_token_streams_without_panicking() {
         Token::new(TokenKind::Eof, eof_span),
         Token::new(TokenKind::Int(1), value_span),
     ])
-    .parse()
+    .parse_program()
     .expect_err("non-final EOF must fail closed");
     assert_eq!(early_eof.message, "EOF must be the final token");
     assert_eq!(early_eof.span, eof_span);

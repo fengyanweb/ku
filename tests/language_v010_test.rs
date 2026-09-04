@@ -31,14 +31,14 @@ fn unique_temp_path(name: &str) -> PathBuf {
 
 fn lower_ir(source: &str) -> String {
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     ir::lower_program(&program).expect("lower ir").to_string()
 }
 
 fn check_err(source: &str) -> String {
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new()
         .check(&program)
         .expect_err("program should fail")
@@ -223,7 +223,7 @@ fn main() {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let lowered = ir::lower_program(&program).expect("lower ir");
     let optimized = ir::optimize_program(&lowered);
@@ -311,7 +311,7 @@ fn main() {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate c");
@@ -1026,7 +1026,7 @@ fn main() {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let err = ir::lower_program(&program)
         .expect_err("native for-binding capture must be rejected until per-iteration cells exist")
@@ -1049,7 +1049,7 @@ fn main() {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     let err = Checker::new()
         .check(&program)
         .expect_err("compiler-reserved for state names must reject user bindings")
@@ -1071,7 +1071,7 @@ fn main() {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower ir");
     let c = backend::c::generate_c_source(&ir).expect("generate native for C");
@@ -1098,7 +1098,7 @@ fn main() {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate C with KuString");
@@ -1164,7 +1164,7 @@ fn main(): int! {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate c");
@@ -1194,7 +1194,7 @@ fn main() {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate array Result C");
@@ -1232,7 +1232,7 @@ fn main(): int! {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let text = ir.to_string();
@@ -1289,7 +1289,7 @@ fn main() {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate c");
@@ -1322,7 +1322,7 @@ fn main() {
 }
 "#;
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     let err = Checker::new().check(&program).expect_err("should fail");
     let diagnostic = err.diagnostic("main.ku", source);
     assert!(
@@ -1384,7 +1384,7 @@ fn main() {
 }
 "#;
     let tokens = Lexer::new(cloned).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new()
         .check(&program)
         .expect("explicit clone should check");
@@ -1419,7 +1419,7 @@ fn main() {
     let tokens = Lexer::new(object_destructure_reinit)
         .tokenize()
         .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new()
         .check(&program)
         .expect("object destructuring assignment should reinitialize moved locals");
@@ -1460,7 +1460,7 @@ fn main() {
 }
 "#;
     let tokens = Lexer::new(break_move).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new()
         .check(&program)
         .expect("a move followed by unconditional break has no loop backedge");
@@ -1528,7 +1528,7 @@ fn main(): null! {
 }
 "#;
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate c");
@@ -1722,7 +1722,7 @@ fn main() {
 }
 "#;
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let ir_text = ir.to_string();
@@ -1767,7 +1767,7 @@ fn main() {
     )
     .tokenize()
     .expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower");
     let c = backend::c::generate_c_source(&ir).expect("generate c");
@@ -1797,7 +1797,7 @@ fn main() {
 "#;
 
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
 }
 
@@ -1862,7 +1862,7 @@ fn main() {
 "#;
 
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
 }
 

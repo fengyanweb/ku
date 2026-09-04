@@ -24,17 +24,13 @@ impl Parser {
         }
     }
 
-    pub fn parse(&mut self) -> KuResult<Program> {
+    pub fn parse_program(&mut self) -> KuResult<Program> {
         self.check_token_stream()?;
         let mut items = Vec::new();
         while !self.check(&TokenKind::Eof) {
             items.push(self.item()?);
         }
         Ok(Program { items })
-    }
-
-    pub fn parse_program(&mut self) -> KuResult<Program> {
-        self.parse()
     }
 
     pub fn parse_expression_only(&mut self) -> KuResult<Expr> {

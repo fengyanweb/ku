@@ -76,7 +76,9 @@ fn main() {
 }
 "#;
     let tokens = Lexer::new(source).tokenize().expect("lex should pass");
-    let program = Parser::new(tokens).parse().expect("parse should pass");
+    let program = Parser::new(tokens)
+        .parse_program()
+        .expect("parse should pass");
 
     let Item::Function(load) = &program.items[0] else {
         panic!("expected load function");

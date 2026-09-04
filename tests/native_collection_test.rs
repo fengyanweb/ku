@@ -110,7 +110,7 @@ fn checked_ir(source: &str) -> ir::IrProgram {
         .tokenize()
         .expect("lex collection fixture");
     let ast = Parser::new(tokens)
-        .parse()
+        .parse_program()
         .expect("parse collection fixture");
     Checker::new()
         .check(&ast)

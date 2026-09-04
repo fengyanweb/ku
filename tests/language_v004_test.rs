@@ -108,7 +108,9 @@ fn main() {
 }
 "#;
     let tokens = Lexer::new(source).tokenize().expect("lex should pass");
-    let program = Parser::new(tokens).parse().expect("parse should pass");
+    let program = Parser::new(tokens)
+        .parse_program()
+        .expect("parse should pass");
 
     assert!(matches!(program.items[0], Item::Module(_)));
     assert!(matches!(program.items[1], Item::Struct(_)));

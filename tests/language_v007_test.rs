@@ -210,7 +210,7 @@ fn main() {
 }
 "#;
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower ir");
     let text = ir.to_string();
@@ -234,7 +234,7 @@ fn main() {
 }
 "#;
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let text = ir::lower_program(&program).expect("lower ir").to_string();
 
