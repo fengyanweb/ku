@@ -2208,15 +2208,24 @@ impl<'a> FunctionLowerer<'a> {
             .unwrap_or(IrType::Unknown)
     }
 
-    /// Reuse storage only in an ordinary local's exact self-push assignment.
-    /// The general array.push operation remains pure. The shared AST predicate
+    /// Reuse storage only in an exact local/cell self-push assignment. The
+    /// general array.push operation remains pure. The shared AST predicate
     /// rules out callbacks, fallible calls and references to this receiver, so
-    /// lowering the argument first cannot change the receiver snapshot.
+    /// lowering the argument first cannot change the receiver snapshot. A cell
+    /// payload is cleared by the reuse helper before the following CellStore,
+    /// which then stores the returned sole owner into that same cell.
     fn lower_local_array_append(&mut self, name: &str, expr: &Expr) -> KuResult<Option<IrExpr>> {
-        let Some(ty @ IrType::Array(_)) = self.locals.get(self.local_ir_name(name)).cloned() else {
-            return Ok(None);
+        let cell = self.assignment_cell(name);
+        let ty = match cell.as_ref().map(|cell| &cell.ty) {
+            Some(IrType::Cell(inner)) => (**inner).clone(),
+            Some(_) => IrType::Unknown,
+            None => self
+                .locals
+                .get(self.local_ir_name(name))
+                .cloned()
+                .unwrap_or(IrType::Unknown),
         };
-        if self.assignment_cell(name).is_some() {
+        if !matches!(ty, IrType::Array(_)) {
             return Ok(None);
         }
         let ExprKind::Call { callee, args } = &expr.kind else {
@@ -2242,7 +2251,17 @@ impl<'a> FunctionLowerer<'a> {
         if ir_type_is_owned(&value.ty) && !ir_expr_is_place(&value) {
             value = self.emit_temp(value)?;
         }
-        self.emit_local_collection_reuse("__ku_array_push_reuse", name, ty, value)
+        let receiver = cell.map_or_else(
+            || IrExpr {
+                kind: IrExprKind::Local(self.local_ir_name(name).to_string()),
+                ty: ty.clone(),
+            },
+            |cell| IrExpr {
+                kind: IrExprKind::CellLoad(Box::new(cell)),
+                ty: ty.clone(),
+            },
+        );
+        self.emit_collection_reuse("__ku_array_push_reuse", receiver, ty, value)
             .map(Some)
     }
 
@@ -2253,19 +2272,31 @@ impl<'a> FunctionLowerer<'a> {
         ty: IrType,
         value: IrExpr,
     ) -> KuResult<IrExpr> {
+        self.emit_collection_reuse(
+            intrinsic,
+            IrExpr {
+                kind: IrExprKind::Local(self.local_ir_name(name).to_string()),
+                ty: ty.clone(),
+            },
+            ty,
+            value,
+        )
+    }
+
+    fn emit_collection_reuse(
+        &mut self,
+        intrinsic: &str,
+        receiver: IrExpr,
+        ty: IrType,
+        value: IrExpr,
+    ) -> KuResult<IrExpr> {
         self.emit_temp(IrExpr {
             kind: IrExprKind::Call {
                 callee: Box::new(IrExpr {
                     kind: IrExprKind::Local(intrinsic.to_string()),
                     ty: IrType::Function,
                 }),
-                args: vec![
-                    IrExpr {
-                        kind: IrExprKind::Local(self.local_ir_name(name).to_string()),
-                        ty: ty.clone(),
-                    },
-                    value,
-                ],
+                args: vec![receiver, value],
                 kind: IrCallKind::Intrinsic(intrinsic.to_string()),
             },
             ty,

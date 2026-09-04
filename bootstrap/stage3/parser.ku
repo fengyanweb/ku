@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken } from "../stage2/span.ku"
-import { Node, ParseOutput, EmptyArena, ValidateParseOutput } from "../stage2/ast.ku"
+import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { RejectAt, ParseExpressionAt, CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, MapTokenCharacters } from "./support.ku"
 import { SignatureType, EmptyTypeWindow, PushTypeWindow, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { ReadImport } from "./imports.ku"
@@ -57,7 +57,8 @@ fn ParseProgram(source: str): ParseOutput! {
     source_chars: [str] = mapped.characters
     expression_source_text: str = mapped.source
 
-    arena = EmptyArena()
+    arena_nodes: [Node] = []
+    arena_edges: [int] = []
     cursor = 0
     items: [int] = []
     import_count = 0
@@ -66,20 +67,20 @@ fn ParseProgram(source: str): ParseOutput! {
     slice_work = 0
 
     fn AddNode(kind: str, text: str, int_value: int, span: Span, children: [int], error_token: Token): int! {
-        if (arena.nodes.len() >= 4096) {
+        if (arena_nodes.len() >= 4096) {
             RejectAt(error_token.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")?
         }
-        if (children.len() > 8192 - arena.edges.len()) {
+        if (children.len() > 8192 - arena_edges.len()) {
             RejectAt(error_token.clone(), "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
         }
-        first_edge = arena.edges.len()
+        first_edge = arena_edges.len()
         for child in children {
-            if (child <= 0 || child > arena.nodes.len()) {
+            if (child <= 0 || child > arena_nodes.len()) {
                 RejectAt(error_token.clone(), "invalid_node_id", "AST edge references an invalid NodeId")?
             }
-            arena.edges = arena.edges.push(child)
+            arena_edges = arena_edges.push(child)
         }
-        arena.nodes = arena.nodes.push(Node {
+        node = Node {
             kind: kind,
             text: text,
             int_value: int_value,
@@ -90,9 +91,10 @@ fn ParseProgram(source: str): ParseOutput! {
             end_column: span.end_column,
             end_offset: span.end_offset,
             first_edge: first_edge,
-            edge_count: arena.edges.len() - first_edge
-        })
-        return ok(arena.nodes.len())
+            edge_count: arena_edges.len() - first_edge
+        }
+        arena_nodes = arena_nodes.push(node)
+        return ok(arena_nodes.len())
     }
 
     fn AddExpression(start: int, end: int): int! {
@@ -115,27 +117,34 @@ fn ParseProgram(source: str): ParseOutput! {
         if (end > start) { slice_end = token_char_ends[end - 1] }
         expression_source = expression_source_text.slice(token_char_starts[start], slice_end)?
         parsed = ParseExpressionAt(expression_source, origin.clone(), boundary)?
-        if (parsed.arena.nodes.len() > 4096 - arena.nodes.len()) {
+        // Owned field reads clone today. Flatten the Stage 2 result once before
+        // walking it so repeated nested projections cannot copy its whole arena
+        // once per node.
+        parsed_root = parsed.root
+        parsed_arena = parsed.arena
+        parsed_nodes = parsed_arena.nodes
+        parsed_edges = parsed_arena.edges
+        if (parsed_nodes.len() > 4096 - arena_nodes.len()) {
             RejectAt(origin.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")?
         }
-        if (parsed.arena.edges.len() > 8192 - arena.edges.len()) {
+        if (parsed_edges.len() > 8192 - arena_edges.len()) {
             RejectAt(origin.clone(), "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
         }
-        node_base = arena.nodes.len()
+        node_base = arena_nodes.len()
         index = 0
-        while (index < parsed.arena.nodes.len()) {
-            input = parsed.arena.nodes[index].clone()
-            first_edge = arena.edges.len()
+        while (index < parsed_nodes.len()) {
+            input = parsed_nodes[index].clone()
+            first_edge = arena_edges.len()
             edge_index = 0
             while (edge_index < input.edge_count) {
-                child = parsed.arena.edges[input.first_edge + edge_index]
-                if (child <= 0 || child > parsed.arena.nodes.len()) {
+                child = parsed_edges[input.first_edge + edge_index]
+                if (child <= 0 || child > parsed_nodes.len()) {
                     RejectAt(origin.clone(), "invalid_node_id", "stage-2 AST contains an invalid NodeId")?
                 }
-                arena.edges = arena.edges.push(node_base + child)
+                arena_edges = arena_edges.push(node_base + child)
                 edge_index = edge_index + 1
             }
-            arena.nodes = arena.nodes.push(Node {
+            relocated = Node {
                 kind: input.kind,
                 text: input.text,
                 int_value: input.int_value,
@@ -146,14 +155,15 @@ fn ParseProgram(source: str): ParseOutput! {
                 end_column: input.end_column,
                 end_offset: input.end_offset,
                 first_edge: first_edge,
-                edge_count: arena.edges.len() - first_edge
-            })
+                edge_count: arena_edges.len() - first_edge
+            }
+            arena_nodes = arena_nodes.push(relocated)
             index = index + 1
         }
-        if (parsed.root <= 0 || parsed.root > parsed.arena.nodes.len()) {
+        if (parsed_root <= 0 || parsed_root > parsed_nodes.len()) {
             RejectAt(origin, "invalid_node_id", "stage-2 AST root is invalid")?
         }
-        return ok(node_base + parsed.root)
+        return ok(node_base + parsed_root)
     }
 
     fn ReadTypeAt(start: int): SignatureType! {
@@ -170,12 +180,12 @@ fn ParseProgram(source: str): ParseOutput! {
     }
 
     fn AddParsedType(parsed: SignatureType, error_token: Token): int! {
-        node_base = arena.nodes.len()
+        node_base = arena_nodes.len()
         part_index = 0
         while (part_index < parsed.parts.len()) {
             part = parsed.parts[part_index].clone()
-            CheckTypeArenaCapacity(arena.nodes.len(), arena.edges.len(), part.edge_count, error_token.clone())?
-            first_edge = arena.edges.len()
+            CheckTypeArenaCapacity(arena_nodes.len(), arena_edges.len(), part.edge_count, error_token.clone())?
+            first_edge = arena_edges.len()
             edge_index = 0
             while (edge_index < part.edge_count) {
                 plan_edge = part.first_edge + edge_index
@@ -186,10 +196,11 @@ fn ParseProgram(source: str): ParseOutput! {
                 if (child <= 0 || child > part_index) {
                     RejectAt(error_token.clone(), "invalid_node_id", "type plan edge must reference an earlier NodeId")?
                 }
-                arena.edges = arena.edges.push(node_base + child)
+                arena_edges = arena_edges.push(node_base + child)
                 edge_index = edge_index + 1
             }
-            arena.nodes = arena.nodes.push(TypePartToNode(part, first_edge))
+            type_node = TypePartToNode(part, first_edge)
+            arena_nodes = arena_nodes.push(type_node)
             part_index = part_index + 1
         }
         if (parsed.root <= 0 || parsed.root > parsed.parts.len()) {
@@ -387,7 +398,7 @@ fn ParseProgram(source: str): ParseOutput! {
                     expression_end = ExpressionEnd(cursor)?
                     expression = AddExpression(cursor, expression_end)?
                     children = children.push(expression)
-                    expression_node = arena.nodes[expression - 1].clone()
+                    expression_node = arena_nodes[expression - 1].clone()
                     end_span = Span {
                         line: expression_node.line,
                         column: expression_node.column,
@@ -424,7 +435,7 @@ fn ParseProgram(source: str): ParseOutput! {
                 cursor = cursor + 1
                 expression_end = ExpressionEnd(cursor)?
                 expression = AddExpression(cursor, expression_end)?
-                expression_node = arena.nodes[expression - 1].clone()
+                expression_node = arena_nodes[expression - 1].clone()
                 statement = AddNode("VarDecl", name, 0, Span {
                     line: statement_start.line,
                     column: statement_start.column,
@@ -440,7 +451,7 @@ fn ParseProgram(source: str): ParseOutput! {
                 cursor = cursor + 2
                 expression_end = ExpressionEnd(cursor)?
                 expression = AddExpression(cursor, expression_end)?
-                expression_node = arena.nodes[expression - 1].clone()
+                expression_node = arena_nodes[expression - 1].clone()
                 statement = AddNode("Assign", name, 0, Span {
                     line: statement_start.line,
                     column: statement_start.column,
@@ -454,7 +465,7 @@ fn ParseProgram(source: str): ParseOutput! {
             } else {
                 expression_end = ExpressionEnd(cursor)?
                 expression = AddExpression(cursor, expression_end)?
-                expression_node = arena.nodes[expression - 1].clone()
+                expression_node = arena_nodes[expression - 1].clone()
                 statement = AddNode("ExprStmt", "", 0, Span {
                     line: expression_node.line,
                     column: expression_node.column,
@@ -489,8 +500,8 @@ fn ParseProgram(source: str): ParseOutput! {
 
     program_span = SpanFromToken(tokens[tokens.len() - 1].clone())
     if (items.len() > 0) {
-        first = arena.nodes[items[0] - 1].clone()
-        last = arena.nodes[items[items.len() - 1] - 1].clone()
+        first = arena_nodes[items[0] - 1].clone()
+        last = arena_nodes[items[items.len() - 1] - 1].clone()
         program_span = Span {
             line: first.line,
             column: first.column,
@@ -501,7 +512,10 @@ fn ParseProgram(source: str): ParseOutput! {
         }
     }
     root = AddNode("Program", "", 0, program_span, items, tokens[tokens.len() - 1].clone())?
-    // Local helpers capture the arena; one final bounded clone is required to
-    // move the complete graph out of the shared local-helper environment.
-    return ValidateParseOutput(ParseOutput { arena: arena.clone(), root: root })
+    // Local helpers retain the shared cells until this frame exits. Clone each
+    // completed flat arena once; self-push no longer clones per node.
+    return ValidateParseOutput(ParseOutput {
+        arena: Arena { nodes: arena_nodes.clone(), edges: arena_edges.clone() },
+        root: root
+    })
 }

@@ -499,13 +499,16 @@ fn main() {}
         intrinsic_count(&program, "Pure", "__ku_array_push_reuse"),
         1
     );
+    assert_eq!(
+        intrinsic_count(&program, "Captured", "__ku_array_push_reuse"),
+        1
+    );
     for function in [
         "DifferentLocal",
         "SelfReference",
         "CallArgument",
         "CloneArgument",
         "AggregateArgument",
-        "Captured",
     ] {
         assert_eq!(
             intrinsic_count(&program, function, "__ku_array_push_reuse"),
@@ -527,6 +530,7 @@ fn main() {}
     let generated = c::generate_c_source(&program).expect("emit narrow reuse C artifact");
     assert!(generated.contains("int64_t* data; size_t capacity; } KuArray_int;"));
     assert!(generated.contains("ku_array_push_reuse_int(&values,"));
+    assert!(generated.contains("ku_array_push_reuse_int(&(values)->value,"));
     assert!(generated.contains("ku_string_concat_reuse(&text,"));
 }
 

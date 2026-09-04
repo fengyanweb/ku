@@ -2,7 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "./span.ku"
 import { Diagnostic, DiagnosticCanonical } from "./diagnostic.ku"
-import { Node, ParseOutput, EmptyArena, ValidateParseOutput } from "./ast.ku"
+import { Node, Arena, ParseOutput, ValidateParseOutput } from "./ast.ku"
 import { ParseContext, DefaultParseContext, ParseContextError, RelocateTokens } from "./context.ku"
 
 // Stage 2B uses append-only operator/value stacks and integer links. Flat
@@ -94,25 +94,26 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
 
     cursor = 0
     depth = 1
-    arena = EmptyArena()
+    arena_nodes: [Node] = []
+    arena_edges: [int] = []
     operators: [OperatorEntry] = []
     values: [ValueEntry] = []
     operator_top = 0
     value_top = 0
 
     fn AddNode(kind: str, text: str, int_value: int, span: Span, children: [int]): int! {
-        if (arena.nodes.len() >= 4096) {
+        if (arena_nodes.len() >= 4096) {
             RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes")?
         }
-        if (children.len() > 8192 - arena.edges.len()) {
+        if (children.len() > 8192 - arena_edges.len()) {
             RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges")?
         }
-        first_edge = arena.edges.len()
+        first_edge = arena_edges.len()
         for child in children {
-            if (child <= 0 || child > arena.nodes.len()) {
+            if (child <= 0 || child > arena_nodes.len()) {
                 RejectAt(tokens[cursor].clone(), "invalid_node_id", "AST edge references an invalid NodeId")?
             }
-            arena.edges = arena.edges.push(child)
+            arena_edges = arena_edges.push(child)
         }
         node = Node {
             kind: kind,
@@ -125,10 +126,10 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             end_column: span.end_column,
             end_offset: span.end_offset,
             first_edge: first_edge,
-            edge_count: arena.edges.len() - first_edge
+            edge_count: arena_edges.len() - first_edge
         }
-        arena.nodes = arena.nodes.push(node)
-        return ok(arena.nodes.len())
+        arena_nodes = arena_nodes.push(node)
+        return ok(arena_nodes.len())
     }
 
     // This helper is deliberately self-contained. Local helpers share one
@@ -143,16 +144,16 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
         right_entry = values[value_top - 1].clone()
         value_top = right_entry.previous
         if (operator.unary) {
-            child = arena.nodes[right_entry.node - 1].clone()
-            if (arena.nodes.len() >= 4096) {
+            child = arena_nodes[right_entry.node - 1].clone()
+            if (arena_nodes.len() >= 4096) {
                 RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes")?
             }
-            if (arena.edges.len() >= 8192) {
+            if (arena_edges.len() >= 8192) {
                 RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges")?
             }
-            first_edge = arena.edges.len()
-            arena.edges = arena.edges.push(right_entry.node)
-            arena.nodes = arena.nodes.push(Node {
+            first_edge = arena_edges.len()
+            arena_edges = arena_edges.push(right_entry.node)
+            unary_node = Node {
                 kind: "Unary",
                 text: operator.text,
                 int_value: 0,
@@ -164,9 +165,11 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                 end_offset: child.end_offset,
                 first_edge: first_edge,
                 edge_count: 1
-            })
-            combined = arena.nodes.len()
-            values = values.push(ValueEntry { node: combined, previous: value_top })
+            }
+            arena_nodes = arena_nodes.push(unary_node)
+            combined = arena_nodes.len()
+            combined_entry = ValueEntry { node: combined, previous: value_top }
+            values = values.push(combined_entry)
             value_top = values.len()
             depth = depth - 1
             return ok(null)
@@ -176,18 +179,18 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
         }
         left_entry = values[value_top - 1].clone()
         value_top = left_entry.previous
-        left = arena.nodes[left_entry.node - 1].clone()
-        right = arena.nodes[right_entry.node - 1].clone()
-        if (arena.nodes.len() >= 4096) {
+        left = arena_nodes[left_entry.node - 1].clone()
+        right = arena_nodes[right_entry.node - 1].clone()
+        if (arena_nodes.len() >= 4096) {
             RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes")?
         }
-        if (arena.edges.len() > 8190) {
+        if (arena_edges.len() > 8190) {
             RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges")?
         }
-        first_edge = arena.edges.len()
-        arena.edges = arena.edges.push(left_entry.node)
-        arena.edges = arena.edges.push(right_entry.node)
-        arena.nodes = arena.nodes.push(Node {
+        first_edge = arena_edges.len()
+        arena_edges = arena_edges.push(left_entry.node)
+        arena_edges = arena_edges.push(right_entry.node)
+        binary_node = Node {
             kind: "Binary",
             text: operator.text,
             int_value: 0,
@@ -199,9 +202,11 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             end_offset: right.end_offset,
             first_edge: first_edge,
             edge_count: 2
-        })
-        combined = arena.nodes.len()
-        values = values.push(ValueEntry { node: combined, previous: value_top })
+        }
+        arena_nodes = arena_nodes.push(binary_node)
+        combined = arena_nodes.len()
+        combined_entry = ValueEntry { node: combined, previous: value_top }
+        values = values.push(combined_entry)
         value_top = values.len()
         return ok(null)
     }
@@ -287,24 +292,25 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                     node = AddNode("Array", "", 0, SpanMerge(start_span, end_span), children)?
                 } else if (marker.marker == "call") {
                     node = AddNode("Call", "", 0, SpanMerge(Span {
-                        line: arena.nodes[start_node - 1].line,
-                        column: arena.nodes[start_node - 1].column,
-                        offset: arena.nodes[start_node - 1].offset,
-                        end_line: arena.nodes[start_node - 1].end_line,
-                        end_column: arena.nodes[start_node - 1].end_column,
-                        end_offset: arena.nodes[start_node - 1].end_offset
+                        line: arena_nodes[start_node - 1].line,
+                        column: arena_nodes[start_node - 1].column,
+                        offset: arena_nodes[start_node - 1].offset,
+                        end_line: arena_nodes[start_node - 1].end_line,
+                        end_column: arena_nodes[start_node - 1].end_column,
+                        end_offset: arena_nodes[start_node - 1].end_offset
                     }, end_span), children)?
                 } else {
                     node = AddNode("Index", "", 0, SpanMerge(Span {
-                        line: arena.nodes[start_node - 1].line,
-                        column: arena.nodes[start_node - 1].column,
-                        offset: arena.nodes[start_node - 1].offset,
-                        end_line: arena.nodes[start_node - 1].end_line,
-                        end_column: arena.nodes[start_node - 1].end_column,
-                        end_offset: arena.nodes[start_node - 1].end_offset
+                        line: arena_nodes[start_node - 1].line,
+                        column: arena_nodes[start_node - 1].column,
+                        offset: arena_nodes[start_node - 1].offset,
+                        end_line: arena_nodes[start_node - 1].end_line,
+                        end_column: arena_nodes[start_node - 1].end_column,
+                        end_offset: arena_nodes[start_node - 1].end_offset
                     }, end_span), children)?
                 }
-                values = values.push(ValueEntry { node: node, previous: value_top })
+                value_entry = ValueEntry { node: node, previous: value_top }
+                values = values.push(value_entry)
                 value_top = values.len()
             }
             cursor = cursor + 1
@@ -326,7 +332,8 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                     RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested")?
                 }
                 depth = depth + 1
-                operators = operators.push(MakeOperator("", token.lexeme.clone(), 7, true, token, operator_top, 0, false))
+                operator_entry = MakeOperator("", token.lexeme.clone(), 7, true, token, operator_top, 0, false)
+                operators = operators.push(operator_entry)
                 operator_top = operators.len()
                 cursor = cursor + 1
             } else if (token.kind == "LParen" || token.kind == "LBracket") {
@@ -340,7 +347,8 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                     }
                     depth = depth + 1
                 }
-                operators = operators.push(MakeOperator(marker_kind, "", 0, false, token, operator_top, value_top, active))
+                operator_entry = MakeOperator(marker_kind, "", 0, false, token, operator_top, value_top, active)
+                operators = operators.push(operator_entry)
                 operator_top = operators.len()
                 cursor = cursor + 1
             } else {
@@ -365,7 +373,8 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                 } else {
                     RejectAt(token.clone(), "unsupported_expression", "expression form is outside the stage-2 bootstrap subset")?
                 }
-                values = values.push(ValueEntry { node: node, previous: value_top })
+                value_entry = ValueEntry { node: node, previous: value_top }
+                values = values.push(value_entry)
                 value_top = values.len()
                 cursor = cursor + 1
                 expect_operand = false
@@ -397,7 +406,8 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                 }
                 depth = depth + 1
             }
-            operators = operators.push(MakeOperator(marker_kind, "", 0, false, token, operator_top, value_top, active))
+            operator_entry = MakeOperator(marker_kind, "", 0, false, token, operator_top, value_top, active)
+            operators = operators.push(operator_entry)
             operator_top = operators.len()
             cursor = cursor + 1
             expect_operand = active
@@ -410,7 +420,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             }
             target_entry = values[value_top - 1].clone()
             value_top = target_entry.previous
-            target = arena.nodes[target_entry.node - 1].clone()
+            target = arena_nodes[target_entry.node - 1].clone()
             merged = SpanMerge(Span {
                 line: target.line, column: target.column, offset: target.offset,
                 end_line: target.end_line, end_column: target.end_column, end_offset: target.end_offset
@@ -424,19 +434,21 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             } else {
                 node = AddNode("Field", field.lexeme, 0, merged, [target_entry.node])?
             }
-            values = values.push(ValueEntry { node: node, previous: value_top })
+            value_entry = ValueEntry { node: node, previous: value_top }
+            values = values.push(value_entry)
             value_top = values.len()
             cursor = cursor + 1
         } else if (token.kind == "Question") {
             target_entry = values[value_top - 1].clone()
             value_top = target_entry.previous
-            target = arena.nodes[target_entry.node - 1].clone()
+            target = arena_nodes[target_entry.node - 1].clone()
             merged = SpanMerge(Span {
                 line: target.line, column: target.column, offset: target.offset,
                 end_line: target.end_line, end_column: target.end_column, end_offset: target.end_offset
             }, SpanFromToken(token.clone()))
             node = AddNode("TryUnwrap", "", 0, merged, [target_entry.node])?
-            values = values.push(ValueEntry { node: node, previous: value_top })
+            value_entry = ValueEntry { node: node, previous: value_top }
+            values = values.push(value_entry)
             value_top = values.len()
             cursor = cursor + 1
         } else {
@@ -466,7 +478,8 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                     ReduceTop()?
                 }
             }
-            operators = operators.push(MakeOperator("", text, precedence, false, token, operator_top, 0, false))
+            operator_entry = MakeOperator("", text, precedence, false, token, operator_top, 0, false)
+            operators = operators.push(operator_entry)
             operator_top = operators.len()
             cursor = cursor + 1
             expect_operand = true
@@ -477,9 +490,12 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
         RejectAt(tokens[cursor].clone(), "invalid_expression", "expression did not reduce to one root")?
     }
     root = values[value_top - 1].node
-    // Local helpers capture the arena; returning an owned captured value needs
-    // one explicit bounded clone after parsing, never one clone per token.
-    return ValidateParseOutput(ParseOutput { arena: arena.clone(), root: root })
+    // AddNode/ReduceTop retain the shared cells until this frame exits. Clone
+    // each completed flat arena once; self-push no longer clones per node.
+    return ValidateParseOutput(ParseOutput {
+        arena: Arena { nodes: arena_nodes.clone(), edges: arena_edges.clone() },
+        root: root
+    })
 }
 
 fn Parse(source: str): ParseOutput! {

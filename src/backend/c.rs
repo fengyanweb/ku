@@ -16633,26 +16633,34 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
                 "native collection reuse requires a local and value",
             ));
         };
-        // These internal operations are emitted only for an unboxed local. Take
-        // its address without moving it in a C argument: C does not specify the
-        // evaluation order of arguments. The helper clears the receiver only
-        // after the RHS has been evaluated and its new payload prepared.
-        if !matches!(receiver.kind, IrExprKind::Local(_)) {
+        // These internal operations are emitted only for an exact local or cell
+        // self-assignment. Take the address of its payload without moving it in
+        // a C argument: C does not specify argument evaluation order. The helper
+        // clears the receiver only after the RHS and its new payload are ready.
+        let exact_binding_place = matches!(&receiver.kind, IrExprKind::Local(_))
+            || matches!(
+                &receiver.kind,
+                IrExprKind::CellLoad(cell)
+                    if matches!(cell.kind, IrExprKind::Local(_) | IrExprKind::CapturedCell(_))
+            );
+        if !exact_binding_place {
             return Err(unsupported(
-                "native collection reuse requires an unboxed local",
+                "native collection reuse requires an exact local or cell binding",
             ));
         }
-        let receiver_expr = c_expr(receiver)?;
+        let receiver_place = c_move_place(receiver)?.ok_or_else(|| {
+            unsupported("native collection reuse requires a local or cell payload")
+        })?;
         let value_expr = c_expr(value)?;
         return match (&receiver.ty, name) {
             (IrType::Array(element), "__ku_array_push_reuse") => Ok(format!(
                 "ku_array_push_reuse_{}(&{}, {})",
                 c_type_suffix(element)?,
-                receiver_expr,
+                receiver_place,
                 value_expr
             )),
             (IrType::Str, "__ku_string_concat_reuse") if value.ty == IrType::Str => Ok(format!(
-                "ku_string_concat_reuse(&{receiver_expr}, {value_expr})"
+                "ku_string_concat_reuse(&{receiver_place}, {value_expr})"
             )),
             _ => Err(unsupported(
                 "native collection reuse has incompatible types",
@@ -17739,4 +17747,32 @@ fn c_named_clone_function(name: &str) -> String {
 
 fn c_named_drop_function(name: &str) -> String {
     format!("ku_drop_{}", c_named_suffix(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::TempId;
+
+    #[test]
+    fn collection_reuse_rejects_non_binding_places() {
+        let array_type = IrType::Array(Box::new(IrType::Int));
+        let receiver = IrExpr {
+            kind: IrExprKind::Temp(TempId(7)),
+            ty: array_type.clone(),
+        };
+        let value = IrExpr {
+            kind: IrExprKind::Literal("1".to_string()),
+            ty: IrType::Int,
+        };
+
+        let error = c_intrinsic_expr("__ku_array_push_reuse", &[receiver, value], &array_type)
+            .expect_err("a temp must never become a collection reuse receiver");
+        assert!(
+            error
+                .to_string()
+                .contains("requires an exact local or cell binding"),
+            "unexpected rejection: {error}"
+        );
+    }
 }
