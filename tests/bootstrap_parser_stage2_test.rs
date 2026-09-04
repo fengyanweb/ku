@@ -174,6 +174,23 @@ fn rust_canonical(source: &str) -> String {
     output
 }
 
+fn rust_error_canonical(source: &str) -> String {
+    let tokens = Lexer::new(source).lex().expect("Rust oracle lex");
+    let error = Parser::new(tokens)
+        .parse_expression_only()
+        .expect_err("Rust oracle expression must fail");
+    format!(
+        "{}|{}:{}@{}..{}:{}@{}",
+        escape_canonical(&error.message),
+        error.span.start.line,
+        error.span.start.column,
+        error.span.start.offset,
+        error.span.end.line,
+        error.span.end.column,
+        error.span.end.offset
+    )
+}
+
 fn ku_binary() -> PathBuf {
     if let Ok(path) = std::env::var("KU_BIN") {
         let candidate = PathBuf::from(path);
@@ -278,9 +295,11 @@ fn bootstrap_parser_stage2_matches_rust_and_has_stable_diagnostics() {
         "    large = Parse({})?\n    if (large.root != 511 || large.arena.nodes.len() != 511 || large.arena.edges.len() != 510) {{ panic(\"flat binary parser is not iterative/bounded\") }}\n",
         ku_string(&long_flat)
     ));
-    body.push_str(
-        "    ExpectError(\"\", \"unexpected_eof\", \"expected expression|1:1@0..1:1@0\")?\n    ExpectError(\"1 +\", \"unexpected_eof\", \"expected expression|1:4@3..1:4@3\")?\n    ExpectError(\"()\", \"unexpected_token\", \"expected expression before closing delimiter|1:2@1..1:3@2\")?\n    ExpectError(\"a.\", \"unexpected_token\", \"expected field name after field operator|1:3@2..1:3@2\")?\n    ExpectError(\"a)\", \"unexpected_token\", \"closing delimiter has no matching opener|1:2@1..1:3@2\")?\n    ExpectError(\"[1)\", \"unexpected_token\", \"closing delimiter does not match opener|1:3@2..1:4@3\")?\n    ExpectError(\"a[]\", \"unexpected_token\", \"expected expression before closing delimiter|1:3@2..1:4@3\")?\n    ExpectError(\"f(1,)\", \"unexpected_token\", \"expected expression before closing delimiter|1:5@4..1:6@5\")?\n",
-    );
+    body.push_str(&format!(
+        "    ExpectError(\"\", \"unexpected_eof\", {})?\n    ExpectError(\"1 +\", \"unexpected_eof\", {})?\n    ExpectError(\"()\", \"unexpected_token\", \"expected expression before closing delimiter|1:2@1..1:3@2\")?\n    ExpectError(\"a.\", \"unexpected_token\", \"expected field name after field operator|1:3@2..1:3@2\")?\n    ExpectError(\"a)\", \"unexpected_token\", \"closing delimiter has no matching opener|1:2@1..1:3@2\")?\n    ExpectError(\"[1)\", \"unexpected_token\", \"closing delimiter does not match opener|1:3@2..1:4@3\")?\n    ExpectError(\"a[]\", \"unexpected_token\", \"expected expression before closing delimiter|1:3@2..1:4@3\")?\n    ExpectError(\"f(1,)\", \"unexpected_token\", \"expected expression before closing delimiter|1:5@4..1:6@5\")?\n",
+        ku_string(&rust_error_canonical("")),
+        ku_string(&rust_error_canonical("1 +"))
+    ));
     body.push_str(&format!(
         "    ExpectError({}, \"depth_exceeded\", \"maximum parse depth exceeded; expression is too deeply nested|1:32@31..1:33@32\")?\n    return ok(null)\n}}\n",
         ku_string(&too_deep)
