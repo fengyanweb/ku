@@ -184,12 +184,32 @@ fn run_with_closed_stdout(command: &mut Command, credentials: &Path) -> Output {
     let lock = options.open(credentials.with_file_name(name)).unwrap();
     lock.try_lock()
         .expect("fixture owns a fresh uncontended admin lock");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("RUST_BACKTRACE", "0");
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+
+        // Closing the parent's pipe reader is normally enough to make the
+        // child's first write fail.  A concurrently spawned process can briefly
+        // retain that reader between fork and exec, though, which made this
+        // fault injection racy in the two-thread Linux CI suite. close(2) is
+        // async-signal-safe, and running it after Command's stdio setup makes
+        // the child observe a deterministic EBADF without adding a production
+        // test hook.
+        command.pre_exec(|| {
+            if libc::close(libc::STDOUT_FILENO) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
     let mut child = ClosingStdoutChild(
         command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("RUST_BACKTRACE", "0")
             .spawn()
             .expect("start closed-output registry process"),
     );
