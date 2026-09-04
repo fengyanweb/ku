@@ -32,6 +32,122 @@ fn EmptyArena(): Arena {
     return Arena { nodes: nodes, edges: edges }
 }
 
+fn rejectParseOutput(code: str, message: str): null! {
+    fail {
+        domain: "bootstrap.ast",
+        code: code,
+        message: message
+    }
+}
+
+// The bootstrap AST ABI uses positive, one-based integer NodeIds; zero is
+// permanently reserved for "none". A completed ParseOutput is a post-order
+// arena: the root is the final node, every edge slice is contiguous, and every
+// child precedes its parent. Children are in source order and each subtree is a
+// contiguous post-order range, so the arena reduces to exactly one tree. Source
+// AST does not share nodes; sharing/interning belongs in later semantic arenas.
+// Validate at producer boundaries so later checker stages never need to trust
+// malformed integer indexes. All arithmetic stays inside the fixed node/edge
+// caps; slice bounds use subtraction before walking. Current value-position
+// field reads clone owned payloads, so flattening the graph here guarantees
+// bounded linear work but is not yet a zero-copy ownership path.
+fn ValidateParseOutput(output: ParseOutput): ParseOutput! {
+    // Project the graph into flat locals once. This avoids repeating nested
+    // ParseOutput/Arena projections for every node, which would make the
+    // interpreter path quadratic even though the remaining owned copies are
+    // linear and bounded by the ABI caps.
+    root = output.root
+    arena = output.arena
+    nodes = arena.nodes
+    edges = arena.edges
+    node_count = nodes.len()
+    edge_count = edges.len()
+    if (node_count > 4096) {
+        rejectParseOutput("node_limit", "bootstrap AST accepts at most 4096 nodes")?
+    }
+    if (edge_count > 8192) {
+        rejectParseOutput("edge_limit", "bootstrap AST accepts at most 8192 edges")?
+    }
+    if (node_count == 0 || root <= 0 || root != node_count) {
+        rejectParseOutput("invalid_root", "bootstrap AST root must be the final one-based NodeId")?
+    }
+
+    node_index = 0
+    edge_cursor = 0
+    forest_nodes: [int] = []
+    forest_previous: [int] = []
+    forest_top = 0
+    while (node_index < node_count) {
+        // Materialize one bounded node, rather than repeatedly projecting
+        // through the owned graph for every scalar field in the interpreter.
+        node = nodes[node_index].clone()
+        node_line = node.line
+        node_column = node.column
+        node_offset = node.offset
+        node_end_line = node.end_line
+        node_end_column = node.end_column
+        node_end_offset = node.end_offset
+        node_first_edge = node.first_edge
+        node_edge_count = node.edge_count
+        ordered_position = node_end_line > node_line || (node_end_line == node_line && node_end_column >= node_column)
+        if (node_line < 1 || node_column < 1 || node_offset < 0 || node_end_line < 1 || node_end_column < 1 || node_end_offset < node_offset || !ordered_position) {
+            rejectParseOutput("invalid_span", "bootstrap AST node span must use positive ordered coordinates and non-negative ordered byte offsets")?
+        }
+        if (node_first_edge < 0 || node_edge_count < 0 || node_first_edge != edge_cursor || node_first_edge > edge_count) {
+            rejectParseOutput("invalid_edge_slice", "bootstrap AST node edge slices must be non-negative and contiguous")?
+        }
+        remaining_edges = edge_count - node_first_edge
+        if (node_edge_count > remaining_edges) {
+            rejectParseOutput("invalid_edge_slice", "bootstrap AST node edge slice lies outside the edge arena")?
+        }
+
+        slice_cursor = node_first_edge
+        slice_remaining = node_edge_count
+        parent_id = node_index + 1
+        while (slice_remaining > 0) {
+            child = edges[slice_cursor]
+            if (child <= 0 || child >= parent_id) {
+                rejectParseOutput("invalid_node_id", "bootstrap AST child must be a positive NodeId that precedes its parent")?
+            }
+            slice_cursor = slice_cursor + 1
+            slice_remaining = slice_remaining - 1
+        }
+
+        // Post-order tree construction consumes the most recent child roots in
+        // source order. Walk the append-only forest backwards instead of
+        // mutating an indegree array; indexed assignment would copy the whole
+        // array in the interpreter and turn validation quadratic.
+        forest_walk = forest_top
+        reverse_edge = slice_cursor
+        tree_remaining = node_edge_count
+        while (tree_remaining > 0) {
+            if (forest_walk == 0) {
+                rejectParseOutput("invalid_tree", "bootstrap AST must be one contiguous post-order tree")?
+            }
+            reverse_edge = reverse_edge - 1
+            forest_entry = forest_walk - 1
+            if (edges[reverse_edge] != forest_nodes[forest_entry]) {
+                rejectParseOutput("invalid_tree", "bootstrap AST must be one contiguous post-order tree")?
+            }
+            forest_walk = forest_previous[forest_entry]
+            tree_remaining = tree_remaining - 1
+        }
+        forest_nodes = forest_nodes.push(parent_id)
+        forest_previous = forest_previous.push(forest_walk)
+        forest_top = forest_nodes.len()
+        edge_cursor = slice_cursor
+        node_index = node_index + 1
+    }
+    if (edge_cursor != edge_count) {
+        rejectParseOutput("invalid_edge_slice", "bootstrap AST edge arena contains unclaimed edges")?
+    }
+    root_entry = forest_top - 1
+    if (forest_nodes[root_entry] != root || forest_previous[root_entry] != 0) {
+        rejectParseOutput("invalid_tree", "bootstrap AST must be one contiguous post-order tree")?
+    }
+    return ok(ParseOutput { arena: Arena { nodes: nodes, edges: edges }, root: root })
+}
+
 fn AstCanonical(output: ParseOutput): str {
     text = "ROOT|" + str(output.root)
     index = 0
