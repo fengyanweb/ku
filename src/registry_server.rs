@@ -4246,6 +4246,7 @@ mod tests {
         base_url: String,
         public_key: String,
         agent: ureq::Agent,
+        client_config: Arc<ClientConfig>,
         state: std::sync::Weak<RegistryState>,
         accepted_connections: Arc<AtomicUsize>,
         artifact_verifications: Arc<ArtifactVerificationCache>,
@@ -4268,16 +4269,12 @@ mod tests {
             roots
                 .add(certificate)
                 .expect("trust registry test certificate");
-            let client_config = ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-            let agent = ureq::AgentBuilder::new()
-                .tls_config(Arc::new(client_config))
-                .timeout_connect(Duration::from_secs(2))
-                .timeout(Duration::from_secs(8))
-                .timeout_read(Duration::from_secs(8))
-                .redirects(0)
-                .build();
+            let client_config = Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            );
+            let agent = test_registry_agent(Arc::clone(&client_config));
             let shutdown = Arc::new(AtomicBool::new(false));
             let thread_shutdown = Arc::clone(&shutdown);
             let thread = thread::spawn(move || server.serve_until(thread_shutdown));
@@ -4285,12 +4282,17 @@ mod tests {
                 base_url: format!("https://localhost:{}/v1/", address.port()),
                 public_key,
                 agent,
+                client_config,
                 state,
                 accepted_connections,
                 artifact_verifications,
                 shutdown,
                 thread: Some(thread),
             }
+        }
+
+        fn fresh_agent(&self) -> ureq::Agent {
+            test_registry_agent(Arc::clone(&self.client_config))
         }
 
         fn stop(&mut self) {
@@ -4310,6 +4312,25 @@ mod tests {
                     .expect("registry server stopped with an error");
             }
         }
+    }
+
+    fn test_registry_agent(client_config: Arc<ClientConfig>) -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .tls_config(client_config)
+            .timeout_connect(Duration::from_secs(2))
+            .timeout(Duration::from_secs(8))
+            .timeout_read(Duration::from_secs(8))
+            .redirects(0)
+            .build()
+    }
+
+    // Production registry operations create their own HTTP agent. Keep the TLS
+    // test override operation-scoped too, so unrelated calls cannot share a
+    // connection-wide server deadline or request-count budget.
+    fn with_fresh_registry_http_agent<T>(server: &TestServer, operation: impl FnOnce() -> T) -> T {
+        let _agent =
+            TestRegistryHttpAgentGuard::install(server.base_url.clone(), server.fresh_agent());
+        operation()
     }
 
     impl Drop for TestServer {
@@ -5810,15 +5831,14 @@ mod tests {
             400
         );
 
-        {
-            let _agent =
-                TestRegistryHttpAgentGuard::install(server.base_url.clone(), server.agent.clone());
-            let receipt = publish_package(&math, "token-math").expect("publish through Ku client");
-            assert_eq!(receipt.checksum, artifact.checksum);
-            publish_package(&math, "token-math").expect("idempotent Ku publish");
-            publish_package(&math_next, "token-math")
-                .expect("second version publishes from cached signed history metadata");
-        }
+        let receipt =
+            with_fresh_registry_http_agent(&server, || publish_package(&math, "token-math"))
+                .expect("publish through Ku client");
+        assert_eq!(receipt.checksum, artifact.checksum);
+        with_fresh_registry_http_agent(&server, || publish_package(&math, "token-math"))
+            .expect("idempotent Ku publish");
+        with_fresh_registry_http_agent(&server, || publish_package(&math_next, "token-math"))
+            .expect("second version publishes from cached signed history metadata");
 
         let consumer_root = root.0.join("consumer");
         fs::create_dir_all(consumer_root.join("src")).expect("create consumer source");
@@ -5836,31 +5856,35 @@ mod tests {
             "import { Value } from \"@math/main\"\nfn main() { print(Value()) }\n",
         )
         .expect("write consumer entry");
-        {
-            let _agent =
-                TestRegistryHttpAgentGuard::install(server.base_url.clone(), server.agent.clone());
+        with_fresh_registry_http_agent(&server, || {
             run_cli(vec![
                 "ku".to_string(),
                 "package".to_string(),
                 "resolve".to_string(),
                 consumer_root.to_string_lossy().to_string(),
             ])
-            .expect("consumer resolves and writes a lock from the real registry");
-            let main = consumer_main.to_string_lossy().to_string();
+        })
+        .expect("consumer resolves and writes a lock from the real registry");
+        let main = consumer_main.to_string_lossy().to_string();
+        with_fresh_registry_http_agent(&server, || {
             run_cli(vec![
                 "ku".to_string(),
                 "check".to_string(),
                 "--locked".to_string(),
                 main.clone(),
             ])
-            .expect("consumer check --locked");
+        })
+        .expect("consumer check --locked");
+        with_fresh_registry_http_agent(&server, || {
             run_cli(vec![
                 "ku".to_string(),
                 "run".to_string(),
                 "--locked".to_string(),
                 main.clone(),
             ])
-            .expect("consumer run --locked");
+        })
+        .expect("consumer run --locked");
+        with_fresh_registry_http_agent(&server, || {
             run_cli(vec![
                 "ku".to_string(),
                 "build".to_string(),
@@ -5868,8 +5892,8 @@ mod tests {
                 "--locked".to_string(),
                 main,
             ])
-            .expect("consumer native build --locked");
-        }
+        })
+        .expect("consumer native build --locked");
 
         let index = server
             .agent
@@ -6035,12 +6059,10 @@ mod tests {
                 &restarted.public_key,
                 "fn Value(): int { return 1 }\n",
             );
-            let _agent = TestRegistryHttpAgentGuard::install(
-                restarted.base_url.clone(),
-                restarted.agent.clone(),
-            );
-            publish_package(&recovered_math, "token-math")
-                .expect("idempotent publish and signed-index verification survive restart");
+            with_fresh_registry_http_agent(&restarted, || {
+                publish_package(&recovered_math, "token-math")
+            })
+            .expect("idempotent publish and signed-index verification survive restart");
         }
         restarted.stop();
         drop(restarted);
@@ -6584,10 +6606,10 @@ mod tests {
         );
         let artifact = pack_package(&math).expect("pack first yank test version");
         let next_artifact = pack_package(&math_next).expect("pack second yank test version");
-        let _agent =
-            TestRegistryHttpAgentGuard::install(server.base_url.clone(), server.agent.clone());
-        publish_package(&math, "token-math").expect("publish first yank test version");
-        publish_package(&math_next, "token-math").expect("publish second yank test version");
+        with_fresh_registry_http_agent(&server, || publish_package(&math, "token-math"))
+            .expect("publish first yank test version");
+        with_fresh_registry_http_agent(&server, || publish_package(&math_next, "token-math"))
+            .expect("publish second yank test version");
 
         assert_eq!(
             put_yank(
@@ -6673,8 +6695,10 @@ mod tests {
         let mut consumer = discover_from_dir(&consumer_root)
             .expect("discover yank consumer")
             .expect("yank consumer package");
-        resolve_remote_dependencies_with_mode(&mut consumer, DependencyResolveMode::Refresh)
-            .expect("initial refresh selects newest version");
+        with_fresh_registry_http_agent(&server, || {
+            resolve_remote_dependencies_with_mode(&mut consumer, DependencyResolveMode::Refresh)
+        })
+        .expect("initial refresh selects newest version");
         assert_eq!(consumer.resolved_registry_dependencies[0].version, "1.1.0");
         write_lock(&consumer).expect("write pre-yank lock");
         let locked_cache_target = consumer.resolved_registry_dependencies[0]
@@ -6683,9 +6707,12 @@ mod tests {
             .expect("registry package root has cache target")
             .to_path_buf();
 
-        let receipt = yank_package(&math_next, "token-math").expect("first yank succeeds");
+        let receipt =
+            with_fresh_registry_http_agent(&server, || yank_package(&math_next, "token-math"))
+                .expect("first yank succeeds");
         assert_eq!(receipt.version, "1.1.0");
-        yank_package(&math_next, "token-math").expect("repeated yank succeeds");
+        with_fresh_registry_http_agent(&server, || yank_package(&math_next, "token-math"))
+            .expect("repeated yank succeeds");
 
         let barrier = Arc::new(Barrier::new(3));
         let mut repeated_yanks = Vec::new();
@@ -6766,8 +6793,13 @@ mod tests {
         let mut update_consumer = discover_from_dir(&consumer_root)
             .expect("rediscover default-update consumer")
             .expect("default-update consumer package");
-        resolve_remote_dependencies_with_mode(&mut update_consumer, DependencyResolveMode::Update)
-            .expect("default update redownloads the yanked version fixed by the existing lock");
+        with_fresh_registry_http_agent(&server, || {
+            resolve_remote_dependencies_with_mode(
+                &mut update_consumer,
+                DependencyResolveMode::Update,
+            )
+        })
+        .expect("default update redownloads the yanked version fixed by the existing lock");
         assert_eq!(
             update_consumer.resolved_registry_dependencies[0].version,
             "1.1.0"
@@ -6777,8 +6809,13 @@ mod tests {
         let mut locked_consumer = discover_from_dir(&consumer_root)
             .expect("rediscover locked consumer")
             .expect("locked consumer package");
-        resolve_remote_dependencies_with_mode(&mut locked_consumer, DependencyResolveMode::Locked)
-            .expect("locked resolution redownloads the yanked immutable artifact directly");
+        with_fresh_registry_http_agent(&server, || {
+            resolve_remote_dependencies_with_mode(
+                &mut locked_consumer,
+                DependencyResolveMode::Locked,
+            )
+        })
+        .expect("locked resolution redownloads the yanked immutable artifact directly");
         assert_eq!(
             locked_consumer.resolved_registry_dependencies[0].version,
             "1.1.0"
@@ -6799,10 +6836,12 @@ mod tests {
         let mut refreshed_consumer = discover_from_dir(&consumer_root)
             .expect("rediscover refresh consumer")
             .expect("refresh consumer package");
-        resolve_remote_dependencies_with_mode(
-            &mut refreshed_consumer,
-            DependencyResolveMode::Refresh,
-        )
+        with_fresh_registry_http_agent(&server, || {
+            resolve_remote_dependencies_with_mode(
+                &mut refreshed_consumer,
+                DependencyResolveMode::Refresh,
+            )
+        })
         .expect("refresh excludes the yanked version");
         assert_eq!(
             refreshed_consumer.resolved_registry_dependencies[0].version,
@@ -6824,15 +6863,19 @@ mod tests {
         let mut exact_consumer = discover_from_dir(&exact_root)
             .expect("discover exact consumer")
             .expect("exact consumer package");
-        let error = resolve_remote_dependencies_with_mode(
-            &mut exact_consumer,
-            DependencyResolveMode::Refresh,
-        )
+        let error = with_fresh_registry_http_agent(&server, || {
+            resolve_remote_dependencies_with_mode(
+                &mut exact_consumer,
+                DependencyResolveMode::Refresh,
+            )
+        })
         .expect_err("fresh exact resolution must not select a yanked version");
         assert_eq!(error.code.as_deref(), Some("dependency_conflict"));
 
-        yank_package(&math, "token-math").expect("yank the last visible version");
-        yank_package(&math, "token-math").expect("repeat the last-version yank");
+        with_fresh_registry_http_agent(&server, || yank_package(&math, "token-math"))
+            .expect("yank the last visible version");
+        with_fresh_registry_http_agent(&server, || yank_package(&math, "token-math"))
+            .expect("repeat the last-version yank");
         let empty_index = server
             .agent
             .get(&format!("{}packages/math/index.toml", server.base_url))
@@ -7060,7 +7103,7 @@ mod tests {
         assert_eq!(server.accepted_connections.load(Ordering::Relaxed), 0);
         {
             let agent_guard =
-                TestRegistryHttpAgentGuard::install(server.base_url.clone(), server.agent.clone());
+                TestRegistryHttpAgentGuard::install(server.base_url.clone(), server.fresh_agent());
             publish_package(&package, "token-math")
                 .expect("real package client publishes and verifies the signed index");
             assert_eq!(
