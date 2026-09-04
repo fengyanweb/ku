@@ -2,7 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
-import { RejectAt, ParseExpressionAt, CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, MapTokenCharacters } from "./support.ku"
+import { RejectAt, RejectAtPoint, ParseExpressionAt, CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, MapTokenCharacters } from "./support.ku"
 import { SignatureType, EmptyTypeWindow, PushTypeWindow, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { ReadImport } from "./imports.ku"
 
@@ -25,11 +25,7 @@ import { ReadImport } from "./imports.ku"
 fn ParseProgram(source: str): ParseOutput! {
     tokens = Scan(source.clone())?
     if (tokens.len() == 0) {
-        fail {
-            domain: "bootstrap.parser.stage3",
-            code: "invalid_token_stream",
-            message: "token stream must contain exactly one final EOF"
-        }
+        RejectAtPoint("invalid_token_stream", "token stream must contain exactly one final EOF")?
     }
     // Stage 3 still stores token-to-character indexes in captured bounded
     // arrays. Keep this first module slice below Stage 2's expression-only

@@ -1,18 +1,29 @@
 import { EscapeCanonical } from "../stage1/token.ku"
+import { Span, SpanCanonical } from "./span.ku"
+
 // Syntax failures keep a stable machine code and the complete offending span.
 // Ku errors cannot yet carry typed payloads, so Reject serializes this model
 // into the error message without losing any coordinate.
 struct Diagnostic {
+    severity: str
+    domain: str
     code: str
     message: str
-    line: int
-    column: int
-    offset: int
-    end_line: int
-    end_column: int
-    end_offset: int
+    source: str
+    span: Span
+}
+
+fn MakeDiagnostic(severity: str, domain: str, code: str, message: str, source: str, span: Span): Diagnostic {
+    return Diagnostic {
+        severity: severity,
+        domain: domain,
+        code: code,
+        message: message,
+        source: source,
+        span: span
+    }
 }
 
 fn DiagnosticCanonical(diagnostic: Diagnostic): str {
-    return EscapeCanonical(diagnostic.message) + "|" + str(diagnostic.line) + ":" + str(diagnostic.column) + "@" + str(diagnostic.offset) + ".." + str(diagnostic.end_line) + ":" + str(diagnostic.end_column) + "@" + str(diagnostic.end_offset)
+    return EscapeCanonical(diagnostic.severity) + "|" + EscapeCanonical(diagnostic.domain) + "|" + EscapeCanonical(diagnostic.code) + "|" + EscapeCanonical(diagnostic.source) + "|" + EscapeCanonical(diagnostic.message) + "|" + SpanCanonical(diagnostic.span)
 }

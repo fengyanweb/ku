@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Span } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
-import { RejectAt } from "./support.ku"
+import { RejectAt, RejectAtPoint } from "./support.ku"
 
 // Type parts form a bounded, append-only post-order plan. Child NodeIds refer
 // to earlier parts through the separate edge table, matching the final AST
@@ -135,11 +135,7 @@ fn CheckUnionWidth(count: int, token: Token): null! {
 
 fn ParseTypeWindow(tokens: [Token]): SignatureType! {
     if (tokens.len() == 0) {
-        fail {
-            domain: "bootstrap.parser.stage3",
-            code: "invalid_token_stream",
-            message: "type window must contain one final non-type boundary token"
-        }
+        RejectAtPoint("invalid_token_stream", "type window must contain one final non-type boundary token")?
     }
     if (tokens.len() > 512) {
         RejectAt(tokens[0].clone(), "invalid_token_stream", "type window accepts at most 512 tokens")?
