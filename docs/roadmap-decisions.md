@@ -56,7 +56,8 @@ ku build --backend c --release --target <target> .
 
 - 核心同步 ABI 与 `std.fs/std.json/std.time` 的 Windows/POSIX C 分支已在 Windows 2025、Ubuntu 24.04、macOS 15 完整 workspace CI 跑绿，三个目标的 native build/run 门槛也已通过；这仍不是生产负载 soak。
 - native `std.http`、plain `std.net` 和 `std.redis` 的 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支已在上述三系统 workspace CI 跑绿；Redis 新 client 的真实服务复验仍未完成。
-- socket-free `ku-native-tls` runtime ABI 已固定 rustls/ring、WebPKI/显式 PEM CA 和资源上限，并在三系统 workspace CI 完成 crate 构建/测试；它尚未接入 generated C 的 `std.net`、HTTP 或 Redis，也没有最终消费者链接门槛，不能写成通用 TLS 已完成。
+- socket-free `ku-native-tls` runtime ABI 已固定 rustls/ring、WebPKI/显式 PEM CA 和资源上限，并已由 generated C 的同一 `net.client(config)` 路径驱动；用户只增加 `tls: true`，不新增第二套 TLS API。证书/主机名验证不可关闭，TLS 错误不会回退明文。当前精确 target pack/build-id 组合的三系统最终消费者 CI 仍待跑绿；解释器 parity、HTTP 和 Redis TLS 尚未接入，不能写成通用 TLS 已完成。
+- native TLS target pack 按 target/compiler ABI 分类，CLI 有界校验 manifest、archive/header 尺寸与 SHA-256、对象格式、必需 ABI symbols 和 build id，再从固定句柄复制到私有 staging 链接。这是一致性检查，不是发布者签名；pack 来源、compiler 和构建环境仍是可信输入。TLS archive 静态链入，没有 `ku-native-tls` shared-library sidecar，但最终产物仍依赖目标系统 CRT/系统网络库和 loader 合同。
 - `std.mysql` Unix host build 使用绝对 `KU_MYSQL_LIB`/`KU_MYSQL_INCLUDE`；Windows 可使用同一显式配置，也可发现常见的完整安装。候选 symlink 必须先解析为 canonical 非空普通文件，family、archive magic 和 loader identity 从 canonical target 与固定句柄判定；编译器只读取该句柄的私有副本。最终产物必须精确动态导入所选 loader identity，并完成 header/runtime ABI 握手；显式 non-host target 仍明确拒绝自动链接，可在目标系统分别构建，或自行链接保留的 C artifact。
 - `std.pg` 已有 Windows/POSIX 同步与目标库格式处理；三系统统一通过绝对路径 `KU_PG_LIB` 的专用小目录提供匹配 target 的 shared/import libpq，不再扫描系统安装目录或走隐式 linker 搜索。候选 symlink 必须先解析为 canonical 非空普通文件；Windows import library 由有界解析器提取目标 `libpq.dll`，ELF/Mach-O 分别读取 `DT_SONAME`/`LC_ID_DYLIB`，链接字节从固定句柄复制。最终产物必须包含与本次选中库完全一致的 loader identity；缺失、静态回退、路径替换或同族不同 loader 都拒绝安装。PG/MySQL 的三系统精确动态库链接/启动门槛现已通过；identity 指最终直接依赖记录的 loader name，不证明部署时解析到同一文件 hash/path，也不验证传递依赖。
 - native async lowering 仍未完成。

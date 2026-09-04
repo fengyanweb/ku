@@ -8477,7 +8477,7 @@ static int ku_mysql_sql_next_top_token(
       uint8_t value = sql.ptr[index];
       if (value != (uint8_t)' ' && value != (uint8_t)'\t'
           && value != (uint8_t)'\r' && value != (uint8_t)'\n'
-          && value != (uint8_t)'\f') break;
+          && value != (uint8_t)'\f' && value != (uint8_t)'\v') break;
       index++;
     }
     if (index == 0 && sql.len >= 3 && sql.ptr[0] == 0xef
@@ -8552,8 +8552,8 @@ static int ku_mysql_sql_next_top_token(
 }
 
 /* This is deliberately a narrow policy guard, not a proof of session purity:
-   SQL can call stored routines or vendor extensions. Protocol state is checked
-   again after execution, and every reusable connection is reset. */
+   SQL can still invoke stored functions or vendor extensions. Protocol state
+   is checked again after execution, and every reusable connection is reset. */
 static int ku_mysql_sql_has_explicit_session_control(
     KuString sql, unsigned long long deadline) {
   size_t cursor = 0, start = 0, len = 0;
@@ -8563,7 +8563,7 @@ static int ku_mysql_sql_has_explicit_session_control(
   static const char* const forbidden[] = {
     "begin", "start", "commit", "rollback", "savepoint", "release",
     "set", "reset", "lock", "unlock", "use", "xa", "prepare",
-    "execute", "deallocate", "handler", "flush"
+    "execute", "deallocate", "handler", "flush", "call"
   };
   for (size_t index = 0;
        index < sizeof(forbidden) / sizeof(forbidden[0]); index++) {
@@ -8592,7 +8592,13 @@ static int ku_mysql_sql_has_explicit_session_control(
 static KuError ku_mysql_session_state_error(void) {
   return ku_mysql_error(
       "session_state_unsupported",
-      "MySQL client operations cannot retain transaction or session state; use a future exclusive transaction API");
+      "MySQL statement was not sent because its SQL is unsupported by the pooled client session-safety policy");
+}
+
+static KuError ku_mysql_post_execution_session_state_error(void) {
+  return ku_mysql_error(
+      "session_state_unsupported",
+      "MySQL statement completed or may have completed; session state is unsupported and its payload was discarded; never retry automatically");
 }
 
 static bool ku_mysql_validate_statement_input(
@@ -8808,12 +8814,14 @@ static bool ku_mysql_binary_field(const MYSQL_FIELD* field) {
 static KuMysqlResult* ku_mysql_fetch_result(
     MYSQL_STMT* statement, KuError* error, bool* broken,
     unsigned long long deadline) {
+  unsigned int column_count = mysql_stmt_field_count(statement);
   if (__ku_handler_now_ms() >= deadline) {
     *broken = true;
-    *error = ku_mysql_execution_unknown_error();
+    *error = column_count
+        ? ku_mysql_execution_unknown_error()
+        : ku_mysql_execution_completed_without_result_error();
     return NULL;
   }
-  unsigned int column_count = mysql_stmt_field_count(statement);
   MYSQL_RES* metadata = mysql_stmt_result_metadata(statement);
   if (column_count && !metadata) {
     unsigned int code = mysql_stmt_errno(statement);
@@ -8916,14 +8924,19 @@ static KuMysqlResult* ku_mysql_fetch_result(
     memset(nulls, 0, (size_t)column_count * sizeof(KuMysqlBool));
     memset(errors, 0, (size_t)column_count * sizeof(KuMysqlBool));
     int status = mysql_stmt_fetch(statement);
+    if (status == MYSQL_NO_DATA) {
+      fully_read = true;
+      if (__ku_handler_now_ms() >= deadline) {
+        *broken = true;
+        *error = ku_mysql_execution_completed_without_result_error();
+        failed = true;
+      }
+      break;
+    }
     if (__ku_handler_now_ms() >= deadline) {
       *broken = true;
       *error = ku_mysql_execution_unknown_error();
       failed = true;
-      break;
-    }
-    if (status == MYSQL_NO_DATA) {
-      fully_read = true;
       break;
     }
     if (status != 0 && status != MYSQL_DATA_TRUNCATED) {
@@ -9074,7 +9087,7 @@ static KuResult_mysql_result ku_mysql_client_query(
   if (result && !ku_mysql_session_state_is_supported(connection)) {
     ku_mysql_result_free(result);
     result = NULL;
-    error = ku_mysql_session_state_error();
+    error = ku_mysql_post_execution_session_state_error();
     broken = true;
   }
   ku_mysql_release(client, slot_index, broken, deadline);
@@ -9144,7 +9157,7 @@ static KuResult_int ku_mysql_client_execute(
   }
   if (ok && !ku_mysql_session_state_is_supported(connection)) {
     affected = 0;
-    error = ku_mysql_session_state_error();
+    error = ku_mysql_post_execution_session_state_error();
     broken = true;
     ok = false;
   }
@@ -9530,6 +9543,9 @@ fn emit_net_runtime(out: &mut String, program: &IrProgram) {
     if !program_uses_net(program) {
         return;
     }
+    if program_mentions_native_tls_config(program) {
+        out.push_str("#define KU_FEATURE_NATIVE_TLS 1\n");
+    }
     out.push_str(
         r#"
 #define KU_NATIVE_RUNTIME_NET_SOCKET 1
@@ -9538,22 +9554,103 @@ fn emit_net_runtime(out: &mut String, program: &IrProgram) {
 #define KU_NET_DEFAULT_MAX_READ_BYTES (1024U * 1024U)
 #define KU_NET_MAX_READ_BYTES (16U * 1024U * 1024U)
 #define KU_NET_MAX_HOST_BYTES 253U
+#define KU_NET_MAX_TLS_CA_PEM_BYTES 4194304U
 #define KU_NET_MAX_RESOLVED_ADDRESSES 64U
 #define KU_NET_SOCKET_CHUNK 1073741824U
+#define KU_NET_TLS_MAX_RECORD_BYTES 65540ULL
+#define KU_NET_TLS_MAX_HANDSHAKE_CIPHERTEXT_BYTES 1048576ULL
+#define KU_NET_TLS_MAX_NO_PROGRESS_CALLS 64U
+#define KU_NET_TLS_MAX_HANDSHAKE_DRIVER_CALLS 1048640ULL
+#define KU_NET_TLS_MAX_OPERATION_CIPHERTEXT_BYTES 524320ULL
+#define KU_NET_TLS_MAX_OPERATION_DRIVER_CALLS 524384ULL
+#define KU_NET_TLS_MAX_DRAIN_STEPS 1024U
+
+#if defined(KU_NATIVE_TLS_ENABLED)
+#define KU_TLS_ABI_VERSION 1u
+#define KU_TLS_STATUS_OK 0u
+#define KU_TLS_STATUS_NULL_POINTER 1u
+#define KU_TLS_STATUS_INVALID_ARGUMENT 2u
+#define KU_TLS_STATUS_LIMIT_EXCEEDED 3u
+#define KU_TLS_STATUS_INVALID_DNS_NAME 4u
+#define KU_TLS_STATUS_INVALID_CA 5u
+#define KU_TLS_STATUS_TLS_ERROR 6u
+#define KU_TLS_STATUS_SESSION_FAILED 7u
+#define KU_TLS_STATUS_TRUNCATED 8u
+#define KU_TLS_STATUS_WOULD_BLOCK 9u
+#define KU_TLS_STATUS_IO_ERROR 10u
+#define KU_TLS_STATUS_PANIC 255u
+#define KU_TLS_ROOTS_WEBPKI 0u
+#define KU_TLS_ROOTS_CUSTOM_PEM 1u
+#define KU_TLS_MAX_CA_PEM_BYTES 4194304u
+#define KU_TLS_MAX_IO_BYTES 65536u
+#define KU_TLS_MAX_SERVER_NAME_BYTES 253u
+typedef struct KuTlsConfig KuTlsConfig;
+typedef struct KuTlsClientSession KuTlsClientSession;
+extern uint32_t ku_tls_abi_version(void);
+extern uint32_t ku_tls_v1_build_id(const uint8_t**, size_t*);
+extern uint32_t ku_tls_v1_config_new(uint32_t, const uint8_t*, size_t, KuTlsConfig**);
+extern uint32_t ku_tls_v1_config_drop(KuTlsConfig*);
+extern uint32_t ku_tls_v1_client_new(const KuTlsConfig*, const uint8_t*, size_t,
+    KuTlsClientSession**);
+extern uint32_t ku_tls_v1_client_drop(KuTlsClientSession*);
+extern uint32_t ku_tls_v1_client_wants_read(const KuTlsClientSession*, uint32_t*);
+extern uint32_t ku_tls_v1_client_wants_write(const KuTlsClientSession*, uint32_t*);
+extern uint32_t ku_tls_v1_client_is_handshaking(const KuTlsClientSession*, uint32_t*);
+extern uint32_t ku_tls_v1_client_peer_closed(const KuTlsClientSession*, uint32_t*);
+extern uint32_t ku_tls_v1_client_feed_ciphertext(KuTlsClientSession*,
+    const uint8_t*, size_t, size_t*);
+extern uint32_t ku_tls_v1_client_process(KuTlsClientSession*);
+extern uint32_t ku_tls_v1_client_drain_ciphertext(KuTlsClientSession*,
+    uint8_t*, size_t, size_t*);
+extern uint32_t ku_tls_v1_client_write_plaintext(KuTlsClientSession*,
+    const uint8_t*, size_t, size_t*);
+extern uint32_t ku_tls_v1_client_read_plaintext(KuTlsClientSession*,
+    uint8_t*, size_t, size_t*);
+extern uint32_t ku_tls_v1_client_send_close_notify(KuTlsClientSession*);
+extern uint32_t ku_tls_v1_client_notify_eof(KuTlsClientSession*);
+#endif
 
 #if defined(_WIN32)
 typedef SOCKET KuNetSocket;
 #define KU_NET_INVALID_SOCKET INVALID_SOCKET
 typedef struct { HANDLE semaphore; } KuNetGate;
+typedef volatile LONG KuNetAtomicFlag;
+static void ku_net_atomic_flag_init(KuNetAtomicFlag* flag) {
+  (void)InterlockedExchange(flag, 0);
+}
+static int ku_net_atomic_flag_load(KuNetAtomicFlag* flag) {
+  return InterlockedCompareExchange(flag, 0, 0) != 0;
+}
+static void ku_net_atomic_flag_set(KuNetAtomicFlag* flag) {
+  (void)InterlockedExchange(flag, 1);
+}
 #else
 typedef int KuNetSocket;
 #define KU_NET_INVALID_SOCKET (-1)
 typedef struct { pthread_mutex_t mutex; pthread_cond_t condition; int available; } KuNetGate;
+typedef _Atomic int KuNetAtomicFlag;
+static void ku_net_atomic_flag_init(KuNetAtomicFlag* flag) {
+  atomic_init(flag, 0);
+}
+static int ku_net_atomic_flag_load(KuNetAtomicFlag* flag) {
+  return atomic_load_explicit(flag, memory_order_acquire) != 0;
+}
+static void ku_net_atomic_flag_set(KuNetAtomicFlag* flag) {
+  atomic_store_explicit(flag, 1, memory_order_release);
+}
 #endif
 
 struct KuNetClient {
   KuNetSocket socket_value;
   KuNetGate gate;
+  KuNetAtomicFlag poison_requested;
+#if defined(KU_NATIVE_TLS_ENABLED)
+  KuTlsClientSession* tls_session;
+  uint8_t* tls_pending;
+  size_t tls_pending_len;
+  size_t tls_pending_offset;
+#endif
+  uint8_t tls_enabled;
   uint32_t read_timeout_ms;
   uint32_t write_timeout_ms;
   uint32_t max_read_bytes;
@@ -9735,6 +9832,485 @@ static int ku_net_socket_startup(void) {
   return ku_winsock_runtime_startup();
 }
 
+#if defined(KU_NATIVE_TLS_ENABLED)
+static const uint8_t ku_net_tls_expected_build_id[] =
+    "ku-native-tls/0.1.0;abi=1;rustls=0.23.40;ring=0.17.14;"
+    "webpki-roots=1.0.7;buffer=65536;handshake=1048576;"
+    "record-staging=65540;resumption=disabled";
+static int ku_net_tls_abi_status = 0;
+#if defined(_WIN32)
+static INIT_ONCE ku_net_tls_abi_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK ku_net_tls_check_abi_once(
+    PINIT_ONCE once, PVOID parameter, PVOID* context) {
+  (void)once; (void)parameter; (void)context;
+#else
+static pthread_once_t ku_net_tls_abi_once = PTHREAD_ONCE_INIT;
+static void ku_net_tls_check_abi_once(void) {
+#endif
+  const uint8_t* build_id = NULL;
+  size_t build_id_len = 0;
+  uint32_t status = ku_tls_v1_build_id(&build_id, &build_id_len);
+  ku_net_tls_abi_status = ku_tls_abi_version() == KU_TLS_ABI_VERSION
+      && status == KU_TLS_STATUS_OK && build_id
+      && build_id_len == sizeof(ku_net_tls_expected_build_id) - 1
+      && memcmp(build_id, ku_net_tls_expected_build_id, build_id_len) == 0 ? 1 : -1;
+#if defined(_WIN32)
+  return TRUE;
+#endif
+}
+
+static int ku_net_tls_check_abi(void) {
+#if defined(_WIN32)
+  if (!InitOnceExecuteOnce(&ku_net_tls_abi_once, ku_net_tls_check_abi_once,
+          NULL, NULL)) return 0;
+#else
+  if (pthread_once(&ku_net_tls_abi_once, ku_net_tls_check_abi_once) != 0) return 0;
+#endif
+  return ku_net_tls_abi_status == 1;
+}
+
+static KuError ku_net_tls_status_error(uint32_t status, const char* operation) {
+  (void)operation;
+  if (status == KU_TLS_STATUS_TRUNCATED)
+    return ku_net_error("tls_truncated", "net TLS peer closed without close_notify");
+  if (status == KU_TLS_STATUS_INVALID_CA)
+    return ku_net_error("invalid_config", "net TLS custom CA bundle is invalid");
+  if (status == KU_TLS_STATUS_INVALID_DNS_NAME)
+    return ku_net_error("invalid_config", "net TLS server name is invalid");
+  if (status == KU_TLS_STATUS_LIMIT_EXCEEDED)
+    return ku_net_error("tls_limit_exceeded", "native TLS safety limit was exceeded");
+  if (status == KU_TLS_STATUS_PANIC)
+    return ku_net_error("tls_error", "native TLS runtime panicked");
+  return ku_net_error("tls_error", "native TLS operation failed");
+}
+
+static void ku_net_tls_session_drop(KuNetClient* client) {
+  if (!client) return;
+  if (client->tls_session) {
+    KuTlsClientSession* session = client->tls_session;
+    client->tls_session = NULL;
+    (void)ku_tls_v1_client_drop(session);
+  }
+  if (client->tls_pending) {
+    free(client->tls_pending);
+    client->tls_pending = NULL;
+  }
+  client->tls_pending_len = 0;
+  client->tls_pending_offset = 0;
+}
+
+static int ku_net_tls_send_ciphertext(KuNetClient* client,
+    const uint8_t* ciphertext, size_t length,
+    unsigned long long deadline, const char* timeout_code,
+    const char* timeout_message, KuError* error) {
+  size_t offset = 0;
+  while (offset < length) {
+    int waited = ku_net_socket_wait(client->socket_value, 1, deadline);
+    if (waited != 1) {
+      *error = waited == 0 ? ku_net_error(timeout_code, timeout_message)
+          : ku_net_error("transport_error", "net TLS write readiness failed");
+      return 0;
+    }
+    int amount = ku_net_socket_send(client->socket_value,
+        ciphertext + offset, length - offset);
+    if (amount > 0) { offset += (size_t)amount; continue; }
+    if (amount < 0) {
+      int socket_error = ku_net_socket_last_error();
+      if (ku_net_socket_error_interrupted(socket_error)
+          || ku_net_socket_error_would_block(socket_error)) continue;
+    }
+    *error = ku_net_error("transport_error", "net TLS ciphertext write failed");
+    return 0;
+  }
+  return 1;
+}
+
+static int ku_net_tls_drain(KuNetClient* client, unsigned long long deadline,
+    const char* timeout_code, const char* timeout_message, KuError* error) {
+  uint8_t ciphertext[KU_TLS_MAX_IO_BYTES];
+  for (uint32_t step = 0; step < KU_NET_TLS_MAX_DRAIN_STEPS; step++) {
+    if (ku_net_now_ms() >= deadline) {
+      *error = ku_net_error(timeout_code, timeout_message); return 0;
+    }
+    uint32_t wants_write = 0;
+    uint32_t status = ku_tls_v1_client_wants_write(
+        client->tls_session, &wants_write);
+    if (status != KU_TLS_STATUS_OK) {
+      *error = ku_net_tls_status_error(status, "wants_write"); return 0;
+    }
+    if (!wants_write) {
+      if (ku_net_now_ms() >= deadline) {
+        *error = ku_net_error(timeout_code, timeout_message); return 0;
+      }
+      return 1;
+    }
+    size_t written = 0;
+    status = ku_tls_v1_client_drain_ciphertext(client->tls_session,
+        ciphertext, sizeof(ciphertext), &written);
+    if (status != KU_TLS_STATUS_OK || written == 0
+        || written > KU_TLS_MAX_IO_BYTES) {
+      *error = status == KU_TLS_STATUS_OK
+          ? ku_net_error("tls_error", "native TLS drain made no valid progress")
+          : ku_net_tls_status_error(status, "drain");
+      return 0;
+    }
+    if (!ku_net_tls_send_ciphertext(client, ciphertext, written, deadline,
+            timeout_code, timeout_message, error)) return 0;
+  }
+  if (ku_net_now_ms() >= deadline) {
+    *error = ku_net_error(timeout_code, timeout_message); return 0;
+  }
+  uint32_t wants_write = 0;
+  uint32_t status = ku_tls_v1_client_wants_write(
+      client->tls_session, &wants_write);
+  if (status != KU_TLS_STATUS_OK) {
+    *error = ku_net_tls_status_error(status, "wants_write"); return 0;
+  }
+  if (!wants_write) return 1;
+  *error = ku_net_error("tls_limit_exceeded", "native TLS drain exceeded its progress bound");
+  return 0;
+}
+
+/* Returns 1 after ciphertext/process progress, 2 after authenticated peer
+   close, 3 for a bounded retry without progress, and 0 on error. Every
+   successful feed is followed by process exactly once before another feed.
+   out_wire_bytes counts only bytes newly read from the socket; pending bytes
+   were already charged when their original recv completed. */
+static int ku_net_tls_receive_process(KuNetClient* client,
+    unsigned long long deadline, const char* timeout_code,
+    const char* timeout_message, size_t max_new_wire_bytes,
+    size_t* out_wire_bytes, KuError* error) {
+  *out_wire_bytes = 0;
+  uint32_t wants_read = 0;
+  uint32_t status = ku_tls_v1_client_wants_read(client->tls_session, &wants_read);
+  if (status != KU_TLS_STATUS_OK) {
+    *error = ku_net_tls_status_error(status, "wants_read"); return 0;
+  }
+  if (!wants_read) {
+    *error = ku_net_error("tls_error", "native TLS requested no bounded I/O progress");
+    return 0;
+  }
+  if (client->tls_pending) {
+    size_t remaining = client->tls_pending_len - client->tls_pending_offset;
+    size_t consumed = 0;
+    status = ku_tls_v1_client_feed_ciphertext(client->tls_session,
+        client->tls_pending + client->tls_pending_offset, remaining, &consumed);
+    if (status != KU_TLS_STATUS_OK || consumed == 0 || consumed > remaining) {
+      *error = status == KU_TLS_STATUS_OK
+          ? ku_net_error("tls_error", "native TLS pending feed made no valid progress")
+          : ku_net_tls_status_error(status, "feed");
+      return 0;
+    }
+    client->tls_pending_offset += consumed;
+    status = ku_tls_v1_client_process(client->tls_session);
+    if (status != KU_TLS_STATUS_OK) {
+      *error = ku_net_tls_status_error(status, "process"); return 0;
+    }
+    if (client->tls_pending_offset == client->tls_pending_len) {
+      free(client->tls_pending);
+      client->tls_pending = NULL;
+      client->tls_pending_len = 0;
+      client->tls_pending_offset = 0;
+    }
+    return 1;
+  }
+  if (max_new_wire_bytes == 0) {
+    *error = ku_net_error("tls_limit_exceeded",
+        "native TLS ciphertext budget is exhausted"); return 0;
+  }
+  int waited = ku_net_socket_wait(client->socket_value, 0, deadline);
+  if (waited != 1) {
+    *error = waited == 0 ? ku_net_error(timeout_code, timeout_message)
+        : ku_net_error("transport_error", "net TLS read readiness failed");
+    return 0;
+  }
+  uint8_t ciphertext[KU_TLS_MAX_IO_BYTES];
+  size_t receive_capacity = max_new_wire_bytes < sizeof(ciphertext)
+      ? max_new_wire_bytes : sizeof(ciphertext);
+  int received = ku_net_socket_recv(client->socket_value,
+      ciphertext, receive_capacity);
+  if (received == 0) {
+    status = ku_tls_v1_client_notify_eof(client->tls_session);
+    if (status == KU_TLS_STATUS_OK) return 2;
+    *error = ku_net_tls_status_error(status, "notify_eof");
+    return 0;
+  }
+  if (received < 0) {
+    int socket_error = ku_net_socket_last_error();
+    if (ku_net_socket_error_interrupted(socket_error)
+        || ku_net_socket_error_would_block(socket_error)) return 3;
+    *error = ku_net_error("transport_error", "net TLS ciphertext read failed");
+    return 0;
+  }
+  *out_wire_bytes = (size_t)received;
+  size_t offset = 0;
+  uint32_t feed_steps = 0;
+  while (offset < (size_t)received) {
+    if (feed_steps >= KU_TLS_MAX_IO_BYTES) {
+      size_t pending_len = (size_t)received - offset;
+      client->tls_pending = (uint8_t*)malloc(pending_len);
+      if (!client->tls_pending) {
+        *error = ku_net_error("out_of_memory", "net TLS pending input allocation failed");
+        return 0;
+      }
+      memcpy(client->tls_pending, ciphertext + offset, pending_len);
+      client->tls_pending_len = pending_len;
+      client->tls_pending_offset = 0;
+      return 1;
+    }
+    feed_steps++;
+    status = ku_tls_v1_client_wants_read(client->tls_session, &wants_read);
+    if (status != KU_TLS_STATUS_OK || !wants_read) {
+      *error = status == KU_TLS_STATUS_OK
+          ? ku_net_error("tls_error", "native TLS left ciphertext unconsumed")
+          : ku_net_tls_status_error(status, "wants_read");
+      return 0;
+    }
+    size_t consumed = 0;
+    status = ku_tls_v1_client_feed_ciphertext(client->tls_session,
+        ciphertext + offset, (size_t)received - offset, &consumed);
+    if (status != KU_TLS_STATUS_OK || consumed == 0
+        || consumed > (size_t)received - offset) {
+      *error = status == KU_TLS_STATUS_OK
+          ? ku_net_error("tls_error", "native TLS feed made no valid progress")
+          : ku_net_tls_status_error(status, "feed");
+      return 0;
+    }
+    offset += consumed;
+    status = ku_tls_v1_client_process(client->tls_session);
+    if (status != KU_TLS_STATUS_OK) {
+      *error = ku_net_tls_status_error(status, "process"); return 0;
+    }
+    if (offset < (size_t)received) {
+      status = ku_tls_v1_client_wants_read(client->tls_session, &wants_read);
+      if (status != KU_TLS_STATUS_OK) {
+        *error = ku_net_tls_status_error(status, "wants_read"); return 0;
+      }
+      if (!wants_read) {
+        size_t pending_len = (size_t)received - offset;
+        client->tls_pending = (uint8_t*)malloc(pending_len);
+        if (!client->tls_pending) {
+          *error = ku_net_error("out_of_memory", "net TLS pending input allocation failed");
+          return 0;
+        }
+        memcpy(client->tls_pending, ciphertext + offset, pending_len);
+        client->tls_pending_len = pending_len;
+        client->tls_pending_offset = 0;
+        return 1;
+      }
+    }
+  }
+  return 1;
+}
+
+static int ku_net_tls_handshake_until(KuNetClient* client,
+    unsigned long long deadline, KuError* error) {
+  unsigned long long driver_calls = 0;
+  unsigned long long wire_bytes = 0;
+  uint32_t no_progress_calls = 0;
+  for (;;) {
+    if (ku_net_now_ms() >= deadline) {
+      *error = ku_net_error("connect_timeout", "net TLS handshake timed out"); return 0;
+    }
+    if (!ku_net_tls_drain(client, deadline, "connect_timeout",
+            "net TLS handshake timed out", error)) return 0;
+    uint32_t handshaking = 0;
+    uint32_t status = ku_tls_v1_client_is_handshaking(
+        client->tls_session, &handshaking);
+    if (status != KU_TLS_STATUS_OK) {
+      *error = ku_net_tls_status_error(status, "is_handshaking"); return 0;
+    }
+    if (!handshaking) {
+      if (ku_net_now_ms() >= deadline) {
+        *error = ku_net_error("connect_timeout", "net TLS handshake timed out"); return 0;
+      }
+      return 1;
+    }
+    if (driver_calls >= KU_NET_TLS_MAX_HANDSHAKE_DRIVER_CALLS) {
+      *error = ku_net_error("tls_limit_exceeded",
+          "native TLS handshake exceeded its driver-call bound"); return 0;
+    }
+    if (!client->tls_pending
+        && wire_bytes >= KU_NET_TLS_MAX_HANDSHAKE_CIPHERTEXT_BYTES) {
+      *error = ku_net_error("tls_limit_exceeded",
+          "native TLS handshake exceeded its ciphertext bound"); return 0;
+    }
+    size_t newly_received = 0;
+    size_t receive_budget = client->tls_pending ? 0
+        : (size_t)(KU_NET_TLS_MAX_HANDSHAKE_CIPHERTEXT_BYTES - wire_bytes);
+    int progressed = ku_net_tls_receive_process(client, deadline,
+        "connect_timeout", "net TLS handshake timed out", receive_budget,
+        &newly_received, error);
+    driver_calls++;
+    if (progressed == 0) return 0;
+    if (progressed == 2) {
+      *error = ku_net_error("tls_truncated", "net TLS peer closed during handshake");
+      return 0;
+    }
+    if (progressed == 3) {
+      no_progress_calls++;
+      if (no_progress_calls > KU_NET_TLS_MAX_NO_PROGRESS_CALLS) {
+        *error = ku_net_error("tls_limit_exceeded",
+            "native TLS handshake made no bounded input progress"); return 0;
+      }
+      continue;
+    }
+    if ((unsigned long long)newly_received
+        > KU_NET_TLS_MAX_HANDSHAKE_CIPHERTEXT_BYTES - wire_bytes) {
+      *error = ku_net_error("tls_limit_exceeded",
+          "native TLS handshake exceeded its ciphertext bound"); return 0;
+    }
+    wire_bytes += (unsigned long long)newly_received;
+  }
+}
+
+static int ku_net_tls_write_until(KuNetClient* client, const uint8_t* data,
+    size_t len, unsigned long long deadline, KuError* error) {
+  size_t offset = 0;
+  unsigned long long driver_calls = 0;
+  unsigned long long wire_bytes = 0;
+  uint32_t no_progress_calls = 0;
+  while (offset < len) {
+    if (ku_net_now_ms() >= deadline) {
+      *error = ku_net_error("write_timeout", "net write timed out"); return 0;
+    }
+    size_t chunk = len - offset > KU_TLS_MAX_IO_BYTES
+        ? KU_TLS_MAX_IO_BYTES : len - offset;
+    size_t written = 0;
+    uint32_t status = ku_tls_v1_client_write_plaintext(client->tls_session,
+        data + offset, chunk, &written);
+    if (status == KU_TLS_STATUS_OK) {
+      if (written == 0 || written > chunk) {
+        *error = ku_net_error("tls_error", "native TLS plaintext write made no valid progress");
+        return 0;
+      }
+      offset += written;
+    } else if (status != KU_TLS_STATUS_WOULD_BLOCK) {
+      *error = ku_net_tls_status_error(status, "write_plaintext"); return 0;
+    }
+    if (!ku_net_tls_drain(client, deadline, "write_timeout",
+            "net write timed out", error)) return 0;
+    if (status == KU_TLS_STATUS_WOULD_BLOCK) {
+      if (driver_calls >= KU_NET_TLS_MAX_OPERATION_DRIVER_CALLS) {
+        *error = ku_net_error("tls_limit_exceeded",
+            "native TLS write exceeded its driver-call bound"); return 0;
+      }
+      if (!client->tls_pending
+          && wire_bytes >= KU_NET_TLS_MAX_OPERATION_CIPHERTEXT_BYTES) {
+        *error = ku_net_error("tls_limit_exceeded",
+            "native TLS write exceeded its ciphertext bound"); return 0;
+      }
+      size_t newly_received = 0;
+      size_t receive_budget = client->tls_pending ? 0
+          : (size_t)(KU_NET_TLS_MAX_OPERATION_CIPHERTEXT_BYTES - wire_bytes);
+      int progressed = ku_net_tls_receive_process(client, deadline,
+          "write_timeout", "net write timed out", receive_budget,
+          &newly_received, error);
+      driver_calls++;
+      if (progressed == 0) return 0;
+      if (progressed == 2) {
+        *error = ku_net_error("end_of_stream", "net TLS peer closed the stream");
+        return 0;
+      }
+      if (progressed == 3) {
+        no_progress_calls++;
+        if (no_progress_calls > KU_NET_TLS_MAX_NO_PROGRESS_CALLS) {
+          *error = ku_net_error("tls_limit_exceeded",
+              "native TLS write made no bounded input progress"); return 0;
+        }
+        continue;
+      }
+      if ((unsigned long long)newly_received
+          > KU_NET_TLS_MAX_OPERATION_CIPHERTEXT_BYTES - wire_bytes) {
+        *error = ku_net_error("tls_limit_exceeded",
+            "native TLS write exceeded its ciphertext bound"); return 0;
+      }
+      wire_bytes += (unsigned long long)newly_received;
+    }
+  }
+  if (ku_net_now_ms() >= deadline) {
+    *error = ku_net_error("write_timeout", "net write timed out"); return 0;
+  }
+  return 1;
+}
+
+static int ku_net_tls_read_until(KuNetClient* client, uint8_t* data,
+    size_t capacity, unsigned long long deadline, size_t* out_read,
+    KuError* error) {
+  *out_read = 0;
+  size_t bounded_capacity = capacity > KU_TLS_MAX_IO_BYTES
+      ? KU_TLS_MAX_IO_BYTES : capacity;
+  unsigned long long driver_calls = 0;
+  unsigned long long wire_bytes = 0;
+  uint32_t no_progress_calls = 0;
+  for (;;) {
+    if (ku_net_now_ms() >= deadline) {
+      *error = ku_net_error("read_timeout", "net read timed out"); return 0;
+    }
+    size_t amount = 0;
+    uint32_t status = ku_tls_v1_client_read_plaintext(client->tls_session,
+        data, bounded_capacity, &amount);
+    if (status == KU_TLS_STATUS_OK) {
+      if (amount > bounded_capacity) {
+        *error = ku_net_error("tls_error", "native TLS reported an invalid plaintext length");
+        return 0;
+      }
+      if (amount > 0) {
+        if (ku_net_now_ms() >= deadline) {
+          *error = ku_net_error("read_timeout", "net read timed out"); return 0;
+        }
+        *out_read = amount; return 1;
+      }
+      uint32_t peer_closed = 0;
+      status = ku_tls_v1_client_peer_closed(client->tls_session, &peer_closed);
+      if (status != KU_TLS_STATUS_OK) {
+        *error = ku_net_tls_status_error(status, "peer_closed"); return 0;
+      }
+      if (peer_closed) {
+        *error = ku_net_error("end_of_stream", "net TLS peer closed the stream");
+        return 0;
+      }
+    } else if (status != KU_TLS_STATUS_WOULD_BLOCK) {
+      *error = ku_net_tls_status_error(status, "read_plaintext"); return 0;
+    }
+    if (!ku_net_tls_drain(client, deadline, "read_timeout",
+            "net read timed out", error)) return 0;
+    if (driver_calls >= KU_NET_TLS_MAX_OPERATION_DRIVER_CALLS) {
+      *error = ku_net_error("tls_limit_exceeded",
+          "native TLS read exceeded its driver-call bound"); return 0;
+    }
+    if (!client->tls_pending
+        && wire_bytes >= KU_NET_TLS_MAX_OPERATION_CIPHERTEXT_BYTES) {
+      *error = ku_net_error("tls_limit_exceeded",
+          "native TLS read exceeded its ciphertext bound"); return 0;
+    }
+    size_t newly_received = 0;
+    size_t receive_budget = client->tls_pending ? 0
+        : (size_t)(KU_NET_TLS_MAX_OPERATION_CIPHERTEXT_BYTES - wire_bytes);
+    int progressed = ku_net_tls_receive_process(client, deadline,
+        "read_timeout", "net read timed out", receive_budget,
+        &newly_received, error);
+    driver_calls++;
+    if (progressed == 0) return 0;
+    if (progressed == 2) continue;
+    if (progressed == 3) {
+      no_progress_calls++;
+      if (no_progress_calls > KU_NET_TLS_MAX_NO_PROGRESS_CALLS) {
+        *error = ku_net_error("tls_limit_exceeded",
+            "native TLS read made no bounded input progress"); return 0;
+      }
+      continue;
+    }
+    if ((unsigned long long)newly_received
+        > KU_NET_TLS_MAX_OPERATION_CIPHERTEXT_BYTES - wire_bytes) {
+      *error = ku_net_error("tls_limit_exceeded",
+          "native TLS read exceeded its ciphertext bound"); return 0;
+    }
+    wire_bytes += (unsigned long long)newly_received;
+  }
+}
+#endif
+
 static int ku_net_gate_init(KuNetGate* gate) {
 #if defined(_WIN32)
   gate->semaphore = CreateSemaphoreW(NULL, 1, 1, NULL);
@@ -9841,6 +10417,11 @@ static void ku_net_gate_destroy(KuNetGate* gate) {
 }
 
 static void ku_net_poison(KuNetClient* client) {
+  if (!client) return;
+  ku_net_atomic_flag_set(&client->poison_requested);
+#if defined(KU_NATIVE_TLS_ENABLED)
+  ku_net_tls_session_drop(client);
+#endif
   if (client && client->socket_value != KU_NET_INVALID_SOCKET) {
     ku_net_socket_close(client->socket_value);
     client->socket_value = KU_NET_INVALID_SOCKET;
@@ -9855,13 +10436,41 @@ static KuValue* ku_net_config_get(KuObject* config, const char* key) {
 static int ku_net_config_key_known(KuString key) {
   static const char* fields[] = {
     "host", "port", "connect_timeout_ms", "read_timeout_ms",
-    "write_timeout_ms", "max_read_bytes"
+    "write_timeout_ms", "max_read_bytes", "tls", "tls_server_name",
+    "tls_ca_pem"
   };
   for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); index++) {
     size_t len = strlen(fields[index]);
     if (key.len == len && key.ptr && memcmp(key.ptr, fields[index], len) == 0) return 1;
   }
   return 0;
+}
+
+static int ku_net_config_bool(KuObject* config, const char* key,
+    int default_value, int* out, KuError* error) {
+  KuValue* value = ku_net_config_get(config, key);
+  if (!value) { *out = default_value; return 1; }
+  if (value->tag != KU_BOOL) {
+    *error = ku_net_error("invalid_config", "net client boolean config must be bool");
+    return 0;
+  }
+  *out = value->as.b ? 1 : 0;
+  return 1;
+}
+
+static int ku_net_config_tls_string(KuObject* config, const char* key,
+    size_t max_len, KuString* out, KuError* error) {
+  KuValue* value = ku_net_config_get(config, key);
+  *out = (KuString){0};
+  if (!value) return 1;
+  if (value->tag != KU_STR || !value->as.s.ptr || value->as.s.len == 0
+      || value->as.s.len > max_len
+      || memchr(value->as.s.ptr, 0, value->as.s.len) != NULL) {
+    *error = ku_net_error("invalid_config", "net client TLS string config is invalid or too large");
+    return 0;
+  }
+  *out = value->as.s;
+  return 1;
 }
 
 static int ku_net_config_int(KuObject* config, const char* key,
@@ -9911,6 +10520,9 @@ static KuResult_net_client ku_net_client(KuObject* config) {
   }
   KuError config_error = (KuError){0};
   uint32_t connect_timeout_ms, read_timeout_ms, write_timeout_ms, max_read_bytes;
+  int tls_enabled = 0;
+  KuString tls_server_name = (KuString){0};
+  KuString tls_ca_pem = (KuString){0};
   if (!ku_net_config_int(config, "connect_timeout_ms", KU_NET_DEFAULT_TIMEOUT_MS,
           1, KU_NET_MAX_TIMEOUT_MS, &connect_timeout_ms, &config_error)
       || !ku_net_config_int(config, "read_timeout_ms", KU_NET_DEFAULT_TIMEOUT_MS,
@@ -9918,9 +10530,34 @@ static KuResult_net_client ku_net_client(KuObject* config) {
       || !ku_net_config_int(config, "write_timeout_ms", KU_NET_DEFAULT_TIMEOUT_MS,
           1, KU_NET_MAX_TIMEOUT_MS, &write_timeout_ms, &config_error)
       || !ku_net_config_int(config, "max_read_bytes", KU_NET_DEFAULT_MAX_READ_BYTES,
-          1, KU_NET_MAX_READ_BYTES, &max_read_bytes, &config_error)) {
+          1, KU_NET_MAX_READ_BYTES, &max_read_bytes, &config_error)
+      || !ku_net_config_bool(config, "tls", 0, &tls_enabled, &config_error)
+      || !ku_net_config_tls_string(config, "tls_server_name", KU_NET_MAX_HOST_BYTES,
+          &tls_server_name, &config_error)
+      || !ku_net_config_tls_string(config, "tls_ca_pem", KU_NET_MAX_TLS_CA_PEM_BYTES,
+          &tls_ca_pem, &config_error)) {
     return (KuResult_net_client){ false, NULL, config_error };
   }
+  if (!tls_enabled && (tls_server_name.len != 0 || tls_ca_pem.len != 0)) {
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("invalid_config", "net TLS fields require tls to be true") };
+  }
+  if (tls_enabled && tls_server_name.len == 0) tls_server_name = host_value->as.s;
+  if (tls_enabled && !ku_net_host_valid(tls_server_name)) {
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("invalid_config", "net TLS server name is invalid") };
+  }
+#if !defined(KU_NATIVE_TLS_ENABLED)
+  if (tls_enabled) {
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("tls_unavailable", "native TLS is unavailable for this target") };
+  }
+#else
+  if (tls_enabled && !ku_net_tls_check_abi()) {
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("tls_unavailable", "native TLS ABI or build identifier mismatch") };
+  }
+#endif
 
   unsigned long long deadline = ku_net_deadline_after_ms(connect_timeout_ms);
   if (deadline == 0 || ku_net_now_ms() >= deadline) {
@@ -10020,20 +10657,64 @@ static KuResult_net_client ku_net_client(KuObject* config) {
       ku_net_error("out_of_memory", "net client allocation failed") };
   }
   memset(client, 0, sizeof(*client));
+  ku_net_atomic_flag_init(&client->poison_requested);
   client->socket_value = connected;
+  client->tls_enabled = tls_enabled ? 1 : 0;
   client->read_timeout_ms = read_timeout_ms;
   client->write_timeout_ms = write_timeout_ms;
   client->max_read_bytes = max_read_bytes;
+#if defined(KU_NATIVE_TLS_ENABLED)
+  if (tls_enabled) {
+    KuTlsConfig* tls_config = NULL;
+    uint32_t root_mode = tls_ca_pem.len == 0
+        ? KU_TLS_ROOTS_WEBPKI : KU_TLS_ROOTS_CUSTOM_PEM;
+    uint32_t status = ku_tls_v1_config_new(root_mode,
+        tls_ca_pem.len == 0 ? NULL : tls_ca_pem.ptr, tls_ca_pem.len,
+        &tls_config);
+    if (status != KU_TLS_STATUS_OK || !tls_config) {
+      if (tls_config) (void)ku_tls_v1_config_drop(tls_config);
+      ku_net_poison(client); free(client);
+      return (KuResult_net_client){ false, NULL,
+        ku_net_tls_status_error(status, "config_new") };
+    }
+    status = ku_tls_v1_client_new(tls_config, tls_server_name.ptr,
+        tls_server_name.len, &client->tls_session);
+    uint32_t config_drop_status = ku_tls_v1_config_drop(tls_config);
+    tls_config = NULL;
+    if (status != KU_TLS_STATUS_OK || config_drop_status != KU_TLS_STATUS_OK
+        || !client->tls_session) {
+      KuError tls_error = status != KU_TLS_STATUS_OK
+          ? ku_net_tls_status_error(status, "client_new")
+          : config_drop_status != KU_TLS_STATUS_OK
+              ? ku_net_tls_status_error(config_drop_status, "config_drop")
+              : ku_net_error("tls_error", "native TLS returned no session");
+      ku_net_poison(client); free(client);
+      return (KuResult_net_client){ false, NULL, tls_error };
+    }
+    KuError tls_error = (KuError){0};
+    if (!ku_net_tls_handshake_until(client, deadline, &tls_error)) {
+      ku_net_poison(client); free(client);
+      return (KuResult_net_client){ false, NULL, tls_error };
+    }
+  }
+#endif
   if (ku_net_gate_init(&client->gate) != 0) {
-    ku_net_socket_close(connected); free(client);
+    ku_net_poison(client); free(client);
     return (KuResult_net_client){ false, NULL,
       ku_net_error("sync_error", "net client synchronization initialization failed") };
+  }
+  if (ku_net_now_ms() >= deadline) {
+    ku_net_poison(client);
+    ku_net_gate_destroy(&client->gate);
+    free(client);
+    return (KuResult_net_client){ false, NULL,
+      ku_net_error("connect_timeout", "net connect timed out") };
   }
   return (KuResult_net_client){ true, client, (KuError){0} };
 }
 
 static KuResult_null ku_net_write(KuNetClient* client, KuBytes data) {
-  if (!client || client->socket_value == KU_NET_INVALID_SOCKET) {
+  if (!client || ku_net_atomic_flag_load(&client->poison_requested)) {
     return (KuResult_null){ false, 0,
       ku_net_error("client_closed", "net client is closed") };
   }
@@ -10044,14 +10725,15 @@ static KuResult_null ku_net_write(KuNetClient* client, KuBytes data) {
   unsigned long long deadline = ku_net_deadline_after_ms(client->write_timeout_ms);
   int acquired = ku_net_gate_acquire(&client->gate, deadline);
   if (acquired != 1) {
-    if (acquired < 0) ku_net_poison(client);
+    if (acquired < 0) ku_net_atomic_flag_set(&client->poison_requested);
     return (KuResult_null){ false, 0, acquired == 0
       ? ku_net_error("write_timeout", "net write timed out")
       : ku_net_error("sync_error", "net client synchronization failed") };
   }
-  if (client->socket_value == KU_NET_INVALID_SOCKET) {
+  if (ku_net_atomic_flag_load(&client->poison_requested)
+      || client->socket_value == KU_NET_INVALID_SOCKET) {
+    ku_net_poison(client);
     if (ku_net_gate_release(&client->gate) != 0) {
-      ku_net_poison(client);
       return (KuResult_null){ false, 0,
         ku_net_error("sync_error", "net client synchronization failed") };
     }
@@ -10059,6 +10741,13 @@ static KuResult_null ku_net_write(KuNetClient* client, KuBytes data) {
       ku_net_error("client_closed", "net client is closed") };
   }
   KuError error = (KuError){0};
+#if defined(KU_NATIVE_TLS_ENABLED)
+  if (client->tls_enabled) {
+    if (!client->tls_session
+        || !ku_net_tls_write_until(client, data.ptr, data.len, deadline, &error))
+      ku_net_poison(client);
+  } else {
+#endif
   size_t sent = 0;
   while (sent < data.len) {
     int waited = ku_net_socket_wait(client->socket_value, 1, deadline);
@@ -10079,8 +10768,15 @@ static KuResult_null ku_net_write(KuNetClient* client, KuBytes data) {
     error = ku_net_error("transport_error", "net write failed");
     ku_net_poison(client); break;
   }
-  if (ku_net_gate_release(&client->gate) != 0) {
+#if defined(KU_NATIVE_TLS_ENABLED)
+  }
+#endif
+  if (error.code.len == 0 && ku_net_now_ms() >= deadline) {
+    error = ku_net_error("write_timeout", "net write timed out");
     ku_net_poison(client);
+  }
+  if (ku_net_gate_release(&client->gate) != 0) {
+    ku_net_atomic_flag_set(&client->poison_requested);
     if (error.code.len == 0)
       error = ku_net_error("sync_error", "net client synchronization failed");
   }
@@ -10089,7 +10785,7 @@ static KuResult_null ku_net_write(KuNetClient* client, KuBytes data) {
 }
 
 static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
-  if (!client || client->socket_value == KU_NET_INVALID_SOCKET) {
+  if (!client || ku_net_atomic_flag_load(&client->poison_requested)) {
     return (KuResult_bytes){ false, (KuBytes){0},
       ku_net_error("client_closed", "net client is closed") };
   }
@@ -10100,14 +10796,15 @@ static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
   unsigned long long deadline = ku_net_deadline_after_ms(client->read_timeout_ms);
   int acquired = ku_net_gate_acquire(&client->gate, deadline);
   if (acquired != 1) {
-    if (acquired < 0) ku_net_poison(client);
+    if (acquired < 0) ku_net_atomic_flag_set(&client->poison_requested);
     return (KuResult_bytes){ false, (KuBytes){0}, acquired == 0
       ? ku_net_error("read_timeout", "net read timed out")
       : ku_net_error("sync_error", "net client synchronization failed") };
   }
-  if (client->socket_value == KU_NET_INVALID_SOCKET) {
+  if (ku_net_atomic_flag_load(&client->poison_requested)
+      || client->socket_value == KU_NET_INVALID_SOCKET) {
+    ku_net_poison(client);
     if (ku_net_gate_release(&client->gate) != 0) {
-      ku_net_poison(client);
       return (KuResult_bytes){ false, (KuBytes){0},
         ku_net_error("sync_error", "net client synchronization failed") };
     }
@@ -10115,19 +10812,37 @@ static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
       ku_net_error("client_closed", "net client is closed") };
   }
   KuBytes result = (KuBytes){0};
-  result.ptr = (uint8_t*)malloc((size_t)requested);
+  result.capacity = (size_t)requested;
+#if defined(KU_NATIVE_TLS_ENABLED)
+  if (client->tls_enabled && result.capacity > KU_TLS_MAX_IO_BYTES)
+    result.capacity = KU_TLS_MAX_IO_BYTES;
+#endif
+  result.ptr = (uint8_t*)malloc(result.capacity);
   if (!result.ptr) {
     if (ku_net_gate_release(&client->gate) != 0) {
-      ku_net_poison(client);
+      ku_net_atomic_flag_set(&client->poison_requested);
       return (KuResult_bytes){ false, (KuBytes){0},
         ku_net_error("sync_error", "net client synchronization failed") };
     }
     return (KuResult_bytes){ false, (KuBytes){0},
       ku_net_error("out_of_memory", "net read allocation failed") };
   }
-  result.capacity = (size_t)requested;
   result.storage = KU_BYTES_OWNED;
   KuError error = (KuError){0};
+#if defined(KU_NATIVE_TLS_ENABLED)
+  if (client->tls_enabled) {
+    size_t amount = 0;
+    if (client->tls_session
+        && ku_net_tls_read_until(client, result.ptr, result.capacity,
+            deadline, &amount, &error)) {
+      result.len = amount;
+    } else {
+      if (error.code.len == 0)
+        error = ku_net_error("tls_error", "native TLS session is unavailable");
+      ku_net_poison(client);
+    }
+  } else {
+#endif
   for (;;) {
     int waited = ku_net_socket_wait(client->socket_value, 0, deadline);
     if (waited != 1) {
@@ -10137,7 +10852,7 @@ static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
       ku_net_poison(client); break;
     }
     int amount = ku_net_socket_recv(client->socket_value, result.ptr,
-        (size_t)requested);
+        result.capacity);
     if (amount > 0) { result.len = (size_t)amount; break; }
     if (amount == 0) {
       error = ku_net_error("end_of_stream", "net peer closed the stream");
@@ -10149,8 +10864,15 @@ static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
     error = ku_net_error("transport_error", "net read failed");
     ku_net_poison(client); break;
   }
-  if (ku_net_gate_release(&client->gate) != 0) {
+#if defined(KU_NATIVE_TLS_ENABLED)
+  }
+#endif
+  if (error.code.len == 0 && ku_net_now_ms() >= deadline) {
+    error = ku_net_error("read_timeout", "net read timed out");
     ku_net_poison(client);
+  }
+  if (ku_net_gate_release(&client->gate) != 0) {
+    ku_net_atomic_flag_set(&client->poison_requested);
     if (error.code.len == 0)
       error = ku_net_error("sync_error", "net client synchronization failed");
   }
@@ -10163,6 +10885,30 @@ static KuResult_bytes ku_net_read(KuNetClient* client, int64_t requested) {
 
 static uint8_t ku_net_close(KuNetClient* client) {
   if (!client) return 0;
+  /* Exclusive-owner boundary: callers must join all read/write users before
+     close. Ku's Owned handle rules enforce this path; raw generated-C callers
+     must provide the same lifetime guarantee because close consumes and frees
+     the handle. */
+#if defined(KU_NATIVE_TLS_ENABLED)
+  /* Queue, drain once, and attempt one nonblocking send. Shutdown never waits
+     and unconditional session/socket release follows even after partial send. */
+  if (client->tls_session && client->socket_value != KU_NET_INVALID_SOCKET) {
+    uint32_t status = ku_tls_v1_client_send_close_notify(client->tls_session);
+    if (status == KU_TLS_STATUS_OK) {
+      uint32_t wants_write = 0;
+      status = ku_tls_v1_client_wants_write(client->tls_session, &wants_write);
+      if (status == KU_TLS_STATUS_OK && wants_write) {
+        uint8_t ciphertext[KU_TLS_MAX_IO_BYTES];
+        size_t written = 0;
+        status = ku_tls_v1_client_drain_ciphertext(client->tls_session,
+            ciphertext, sizeof(ciphertext), &written);
+        if (status == KU_TLS_STATUS_OK && written > 0
+            && written <= sizeof(ciphertext))
+          (void)ku_net_socket_send(client->socket_value, ciphertext, written);
+      }
+    }
+  }
+#endif
   ku_net_poison(client);
   ku_net_gate_destroy(&client->gate);
   free(client);
@@ -12403,7 +13149,7 @@ static int ku_pg_sql_next_top_token(
       uint8_t value = sql.ptr[index];
       if (value != (uint8_t)' ' && value != (uint8_t)'\t'
           && value != (uint8_t)'\r' && value != (uint8_t)'\n'
-          && value != (uint8_t)'\f') break;
+          && value != (uint8_t)'\f' && value != (uint8_t)'\v') break;
       index++;
     }
     if (index == 0 && sql.len >= 3 && sql.ptr[0] == 0xef
@@ -13184,6 +13930,7 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "}\n",
             "static void ku_pg_client_record_connect_success_locked(KuPgClient* p) { p->consecutive_connect_failures = 0; p->reconnect_not_before_ms = 0; }\n",
             "static KuError ku_pg_invalid_config(const char* message, size_t len) { return ku_pg_client_error(\"invalid_config\", sizeof(\"invalid_config\") - 1, message, len); }\n",
+            "static KuError ku_pg_post_execution_session_state_error(void) { return ku_pg_client_error(\"session_state_unsupported\", sizeof(\"session_state_unsupported\") - 1, \"PostgreSQL statement completed or may have completed; session state is unsupported and its payload was discarded; never retry automatically\", sizeof(\"PostgreSQL statement completed or may have completed; session state is unsupported and its payload was discarded; never retry automatically\") - 1); }\n",
             "static KuValue* ku_pg_client_config_get(KuObject* config, const char* key, size_t len) { return config ? ku_object_get(config, ku_string_static((const uint8_t*)key, len)) : 0; }\n",
             "static int ku_pg_client_config_int(KuObject* config, const char* key, size_t key_len, int64_t fallback, int64_t minimum, int64_t maximum, int64_t* out, KuError* error) {\n",
             "  KuValue* value = ku_pg_client_config_get(config, key, key_len);\n",
@@ -13338,14 +14085,14 @@ static KuResult_pg_result ku_pg_query_params(PGconn* conn, KuString sql, KuArray
             "  KuError sql_error = (KuError){0}; if (!ku_pg_validate_sql_input(sql, &sql_error, deadline)) return (KuResult_pg_result){ false, 0, sql_error };\n",
             "  int session_control = ku_pg_sql_has_explicit_session_control(sql, deadline);\n",
             "  if (session_control == -2) return (KuResult_pg_result){ false, 0, ku_pg_query_timeout_error() };\n",
-            "  if (session_control != 0) return (KuResult_pg_result){ false, 0, ku_pg_client_error(\"session_state_unsupported\", sizeof(\"session_state_unsupported\") - 1, \"PostgreSQL client.query does not accept explicit transaction or session-control SQL; use a future exclusive transaction API\", sizeof(\"PostgreSQL client.query does not accept explicit transaction or session-control SQL; use a future exclusive transaction API\") - 1) };\n",
+            "  if (session_control != 0) return (KuResult_pg_result){ false, 0, ku_pg_client_error(\"session_state_unsupported\", sizeof(\"session_state_unsupported\") - 1, \"PostgreSQL statement was not sent because explicit transaction or session-control SQL is unsupported by the pooled client\", sizeof(\"PostgreSQL statement was not sent because explicit transaction or session-control SQL is unsupported by the pooled client\") - 1) };\n",
             "  size_t param_bytes = 0; KuError param_error = (KuError){0};\n",
             "  if (!ku_pg_validate_query_params(params, &param_bytes, &param_error, deadline)) return (KuResult_pg_result){ false, 0, param_error };\n",
             "  PGconn* c = 0; KuError err = (KuError){0};\n",
             "  int slot = ku_pg_client_acquire(p, &c, &err, deadline);\n",
             "  if (slot < 0) return (KuResult_pg_result){ false, 0, err };\n",
             "  int broken = 0; KuResult_pg_result r = ku_pg_query_params_all_validated_impl(c, sql, params, param_bytes, deadline, &broken);\n",
-            "  if (r.ok && PQtransactionStatus(c) != KU_PQTRANS_IDLE) { ku_drop_pg_result(&r.value); r = (KuResult_pg_result){ false, 0, ku_pg_client_error(\"session_state_unsupported\", sizeof(\"session_state_unsupported\") - 1, \"PostgreSQL client.query cannot retain transaction or COPY state; use a future exclusive transaction API\", sizeof(\"PostgreSQL client.query cannot retain transaction or COPY state; use a future exclusive transaction API\") - 1) }; broken = 1; }\n",
+            "  if (r.ok && PQtransactionStatus(c) != KU_PQTRANS_IDLE) { ku_drop_pg_result(&r.value); r = (KuResult_pg_result){ false, 0, ku_pg_post_execution_session_state_error() }; broken = 1; }\n",
             "  ku_pg_client_release(p, slot, broken || PQstatus(c) != KU_PG_CONNECTION_OK, deadline);\n",
             "  return r;\n",
             "}\n",
@@ -15198,6 +15945,63 @@ fn program_uses_intrinsic(program: &IrProgram, intrinsic: &str) -> bool {
             used
         })
     })
+}
+
+/// Native TLS is an opt-in target-pack feature. Keep ordinary TCP artifacts
+/// lean by emitting its standalone linker marker only when a lowered object
+/// literal can enable TLS (`tls: false` alone is compile-time disabled) and the
+/// program actually calls `net.client`. A wholly dynamic object assembled
+/// outside the visible IR remains fail-closed at runtime with `tls_unavailable`.
+fn program_mentions_native_tls_config(program: &IrProgram) -> bool {
+    if !program_uses_intrinsic(program, "net.client") {
+        return false;
+    }
+    program.functions.iter().any(|function| {
+        function.blocks.iter().any(|block| {
+            let mut mentioned = false;
+            for inst in &block.instructions {
+                walk_inst_exprs(inst, &mut |expr| {
+                    if expr_mentions_native_tls_config(expr) {
+                        mentioned = true;
+                    }
+                });
+            }
+            walk_terminator_exprs(&block.terminator, &mut |expr| {
+                if expr_mentions_native_tls_config(expr) {
+                    mentioned = true;
+                }
+            });
+            mentioned
+        })
+    })
+}
+
+fn expr_mentions_native_tls_config(expr: &IrExpr) -> bool {
+    if let IrExprKind::Call {
+        kind: IrCallKind::Intrinsic(name),
+        args,
+        ..
+    } = &expr.kind
+    {
+        if name == "__ku_object"
+            && args.chunks_exact(2).any(|field| match &field[0].kind {
+                IrExprKind::Literal(key) if key == "\"tls\"" => {
+                    !matches!(&field[1].kind, IrExprKind::Literal(value) if value == "false")
+                }
+                IrExprKind::Literal(key)
+                    if key == "\"tls_server_name\"" || key == "\"tls_ca_pem\"" =>
+                {
+                    true
+                }
+                _ => false,
+            })
+        {
+            return true;
+        }
+    }
+    expr_children(expr)
+        .into_iter()
+        .any(expr_mentions_native_tls_config)
 }
 
 fn expr_uses_intrinsic(expr: &IrExpr, intrinsic: &str) -> bool {

@@ -38,10 +38,13 @@ pub const KU_TLS_MAX_IO_BYTES: usize = 64 * 1024;
 pub const KU_TLS_MAX_HANDSHAKE_BYTES: u64 = 1024 * 1024;
 pub const KU_TLS_MAX_HANDSHAKE_ITERATIONS: u32 = 4096;
 pub const KU_TLS_MAX_SERVER_NAME_BYTES: usize = 253;
-pub const KU_TLS_RESUMPTION_CACHE_ENTRIES: usize = 64;
+const KU_TLS_RECORD_HEADER_BYTES: usize = 5;
+const KU_TLS_MAX_RECORD_PAYLOAD_BYTES: usize = u16::MAX as usize;
+const KU_TLS_MAX_RECORD_STAGING_BYTES: usize =
+    KU_TLS_RECORD_HEADER_BYTES + KU_TLS_MAX_RECORD_PAYLOAD_BYTES;
 
 const BUILD_ID: &[u8] = b"ku-native-tls/0.1.0;abi=1;rustls=0.23.40;ring=0.17.14;\
-webpki-roots=1.0.7;buffer=65536;handshake=1048576;resumption=64";
+webpki-roots=1.0.7;buffer=65536;handshake=1048576;record-staging=65540;resumption=disabled";
 
 pub struct KuTlsConfig {
     config: Arc<ClientConfig>,
@@ -49,6 +52,7 @@ pub struct KuTlsConfig {
 
 pub struct KuTlsClientSession {
     connection: ClientConnection,
+    ciphertext_staging: Vec<u8>,
     handshake_bytes: u64,
     handshake_iterations: u32,
     needs_process: bool,
@@ -201,8 +205,10 @@ fn make_client_config(root_mode: u32, custom_pem: &[u8]) -> Result<ClientConfig,
         .with_safe_default_protocol_versions()
         .map_err(|_| KU_TLS_STATUS_TLS_ERROR)?;
     let mut config = builder.with_root_certificates(roots).with_no_client_auth();
-    config.resumption =
-        rustls::client::Resumption::in_memory_sessions(KU_TLS_RESUMPTION_CACHE_ENTRIES);
+    // A KuNetClient owns exactly one non-reconnecting TLS session, so a
+    // per-client ticket cache can never be reused and only adds mutex/cache
+    // state to every connection.
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(config)
 }
 
@@ -297,6 +303,7 @@ pub unsafe extern "C" fn ku_tls_v1_client_new(
 
         let session = Box::new(KuTlsClientSession {
             connection,
+            ciphertext_staging: Vec::new(),
             handshake_bytes: 0,
             handshake_iterations: 0,
             needs_process: false,
@@ -370,6 +377,7 @@ pub unsafe extern "C" fn ku_tls_v1_client_wants_read(
             !session.failed
                 && !session.transport_eof
                 && !session.needs_process
+                && session.ciphertext_staging.len() < KU_TLS_MAX_RECORD_STAGING_BYTES
                 && session.connection.wants_read(),
         )
     })
@@ -461,37 +469,35 @@ pub unsafe extern "C" fn ku_tls_v1_client_feed_ciphertext(
             return Err(KU_TLS_STATUS_WOULD_BLOCK);
         }
 
-        let was_handshaking = session.connection.is_handshaking();
-        if was_handshaking {
+        let available = KU_TLS_MAX_RECORD_STAGING_BYTES
+            .checked_sub(session.ciphertext_staging.len())
+            .ok_or(KU_TLS_STATUS_LIMIT_EXCEEDED)?;
+        let accepted = available.min(input.len());
+        if accepted == 0 {
+            session.failed = true;
+            return Err(KU_TLS_STATUS_LIMIT_EXCEEDED);
+        }
+        session
+            .ciphertext_staging
+            .try_reserve(accepted)
+            .map_err(|_| KU_TLS_STATUS_LIMIT_EXCEEDED)?;
+        if session.connection.is_handshaking() {
             let projected = session
                 .handshake_bytes
-                .checked_add(input.len() as u64)
+                .checked_add(accepted as u64)
                 .ok_or(KU_TLS_STATUS_LIMIT_EXCEEDED)?;
             if projected > KU_TLS_MAX_HANDSHAKE_BYTES {
                 session.failed = true;
                 return Err(KU_TLS_STATUS_LIMIT_EXCEEDED);
             }
+            session.handshake_bytes = projected;
         }
-
-        let mut cursor = io::Cursor::new(input);
-        let consumed =
-            session
-                .connection
-                .read_tls(&mut cursor)
-                .map_err(|error| match error.kind() {
-                    io::ErrorKind::WouldBlock => KU_TLS_STATUS_WOULD_BLOCK,
-                    _ => KU_TLS_STATUS_IO_ERROR,
-                })?;
-        if consumed == 0 {
-            session.failed = true;
-            return Err(KU_TLS_STATUS_IO_ERROR);
-        }
-        if was_handshaking {
-            session.handshake_bytes += consumed as u64;
-        }
-        session.needs_process = consumed != 0;
+        session
+            .ciphertext_staging
+            .extend_from_slice(&input[..accepted]);
+        session.needs_process = true;
         // SAFETY: The output pointer was checked above.
-        unsafe { ptr::write(out_consumed, consumed) };
+        unsafe { ptr::write(out_consumed, accepted) };
         Ok(())
     })
 }
@@ -510,28 +516,72 @@ pub unsafe extern "C" fn ku_tls_v1_client_process(session: *mut KuTlsClientSessi
         if !session.needs_process {
             return Err(KU_TLS_STATUS_WOULD_BLOCK);
         }
-        if session.connection.is_handshaking() {
-            let next = session
-                .handshake_iterations
-                .checked_add(1)
+        session.needs_process = false;
+        let mut processed = 0usize;
+        loop {
+            let remaining = session.ciphertext_staging.len() - processed;
+            if remaining < KU_TLS_RECORD_HEADER_BYTES {
+                break;
+            }
+            let payload_len = usize::from(u16::from_be_bytes([
+                session.ciphertext_staging[processed + 3],
+                session.ciphertext_staging[processed + 4],
+            ]));
+            let record_len = KU_TLS_RECORD_HEADER_BYTES
+                .checked_add(payload_len)
                 .ok_or(KU_TLS_STATUS_LIMIT_EXCEEDED)?;
-            if next > KU_TLS_MAX_HANDSHAKE_ITERATIONS {
+            if record_len > KU_TLS_MAX_RECORD_STAGING_BYTES {
                 session.failed = true;
                 return Err(KU_TLS_STATUS_LIMIT_EXCEEDED);
             }
-            session.handshake_iterations = next;
-        }
-        session.needs_process = false;
-        match session.connection.process_new_packets() {
-            Ok(state) => {
-                session.peer_closed |= state.peer_has_closed();
-                Ok(())
+            if remaining < record_len {
+                break;
             }
-            Err(_) => {
-                session.failed = true;
-                Err(KU_TLS_STATUS_TLS_ERROR)
+
+            let was_handshaking = session.connection.is_handshaking();
+            if was_handshaking {
+                let next = session
+                    .handshake_iterations
+                    .checked_add(1)
+                    .ok_or(KU_TLS_STATUS_LIMIT_EXCEEDED)?;
+                if next > KU_TLS_MAX_HANDSHAKE_ITERATIONS {
+                    session.failed = true;
+                    return Err(KU_TLS_STATUS_LIMIT_EXCEEDED);
+                }
+                session.handshake_iterations = next;
+            }
+            let mut cursor =
+                io::Cursor::new(&session.ciphertext_staging[processed..processed + record_len]);
+            let mut consumed_total = 0usize;
+            while consumed_total < record_len {
+                let consumed =
+                    session.connection.read_tls(&mut cursor).map_err(|error| {
+                        match error.kind() {
+                            io::ErrorKind::WouldBlock => KU_TLS_STATUS_WOULD_BLOCK,
+                            _ => KU_TLS_STATUS_IO_ERROR,
+                        }
+                    })?;
+                if consumed == 0 || consumed > record_len - consumed_total {
+                    session.failed = true;
+                    return Err(KU_TLS_STATUS_IO_ERROR);
+                }
+                consumed_total += consumed;
+            }
+            processed += record_len;
+            match session.connection.process_new_packets() {
+                Ok(state) => session.peer_closed |= state.peer_has_closed(),
+                Err(_) => {
+                    session.failed = true;
+                    return Err(KU_TLS_STATUS_TLS_ERROR);
+                }
             }
         }
+        if processed != 0 {
+            let remaining = session.ciphertext_staging.len() - processed;
+            session.ciphertext_staging.copy_within(processed.., 0);
+            session.ciphertext_staging.truncate(remaining);
+        }
+        Ok(())
     })
 }
 
@@ -850,11 +900,17 @@ mod tests {
             let (config, session) = new_webpki_session();
             drain_initial_client_hello(session);
             (*session).handshake_iterations = KU_TLS_MAX_HANDSHAKE_ITERATIONS;
+            let complete_empty_handshake_record = [22u8, 3, 3, 0, 0];
             assert_eq!(
-                ku_tls_v1_client_feed_ciphertext(session, b"x".as_ptr(), 1, &mut consumed),
+                ku_tls_v1_client_feed_ciphertext(
+                    session,
+                    complete_empty_handshake_record.as_ptr(),
+                    complete_empty_handshake_record.len(),
+                    &mut consumed,
+                ),
                 KU_TLS_STATUS_OK
             );
-            assert_eq!(consumed, 1);
+            assert_eq!(consumed, complete_empty_handshake_record.len());
             assert_eq!(
                 ku_tls_v1_client_process(session),
                 KU_TLS_STATUS_LIMIT_EXCEEDED

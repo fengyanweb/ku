@@ -1,4 +1,4 @@
-//! Native binary-data and plain-TCP foundation tests. Local loopback peers keep
+//! Native binary-data and network foundation tests. Local loopback peers keep
 //! protocol, timeout and EOF behavior deterministic and offline.
 
 #[allow(dead_code)]
@@ -142,7 +142,7 @@ fn native_net_write_borrows_bytes_and_read_preserves_binary() {
 import net from "std.net"
 fn main(): null! {{
     payload = bytes.from_array([65, 0, 255])?
-    client = net.client({{ host: "127.0.0.1", port: {port}, connect_timeout_ms: 1000,
+    client = net.client({{ host: "127.0.0.1", port: {port}, tls: false, connect_timeout_ms: 1000,
         read_timeout_ms: 1000, write_timeout_ms: 1000, max_read_bytes: 32 }})?
     client.write(payload)?
     println(payload.get(2)?)
@@ -165,6 +165,10 @@ fn main(): null! {{
     assert!(generated.contains("typedef SOCKET KuNetSocket;"));
     assert!(generated.contains("typedef int KuNetSocket;"));
     assert!(generated.contains("static int ku_net_gate_acquire("));
+    assert!(
+        !generated.contains("#define KU_FEATURE_NATIVE_TLS 1"),
+        "plain TCP must not require the native TLS target pack"
+    );
     let Some(executable) = compile_generated(&directory, &generated, "net-binary") else {
         drop(peer);
         return;
@@ -174,6 +178,24 @@ fn main(): null! {{
         "255\n1\n255\nbytes\ninvalid_utf8\n",
     );
     peer.join().expect("native net peer");
+}
+
+#[test]
+fn tls_shaped_objects_without_net_client_do_not_link_the_tls_pack() {
+    let directory = TempDir::new("net-unrelated-tls-config");
+    let generated = emit_c(
+        directory.path(),
+        r#"fn main() {
+    config = { tls: true, tls_server_name: "example.com", tls_ca_pem: "test-ca" }
+    println("ok")
+}
+"#,
+    );
+    assert!(
+        !generated.contains("#define KU_FEATURE_NATIVE_TLS 1"),
+        "an unrelated TLS-shaped object must not add a target-pack dependency"
+    );
+    assert!(!generated.contains("ku_tls_v1_client_new"));
 }
 
 #[test]
@@ -269,7 +291,7 @@ fn main(): null! {{
 "#
         ),
     );
-    let allocation = "result.ptr = (uint8_t*)malloc((size_t)requested);";
+    let allocation = "result.ptr = (uint8_t*)malloc(result.capacity);";
     assert_eq!(
         generated.matches(allocation).count(),
         1,
@@ -369,10 +391,12 @@ fn main(): null! {
     assert!(generated.contains("return pthread_mutex_unlock(&gate->mutex) == 0 ? 0 : -1;"));
     assert_eq!(
         generated
-            .matches("if (acquired < 0) ku_net_poison(client);")
+            .matches(
+                "if (acquired < 0) ku_net_atomic_flag_set(&client->poison_requested);",
+            )
             .count(),
         2,
-        "read and write must both make synchronization failure terminal"
+        "read and write must make synchronization failure terminal without touching an unowned transport"
     );
     let mut harness = generated.replacen(
         "int main(void) {",
@@ -461,7 +485,7 @@ fn main(): null! {
         .expect("net read helper");
     harness.insert_str(
         read_start,
-        "static volatile int ku_test_read_gate_acquired = 0;\n",
+        "static KuNetAtomicFlag ku_test_read_gate_acquired;\n",
     );
     let read_start = harness
         .find("static KuResult_bytes ku_net_read(")
@@ -473,7 +497,7 @@ fn main(): null! {
             .expect("net read gate acquisition");
     harness.insert_str(
         acquire + acquire_marker.len(),
-        "\n  ku_test_read_gate_acquired = acquired == 1;",
+        "\n  if (acquired == 1) ku_net_atomic_flag_set(&ku_test_read_gate_acquired);",
     );
     harness.push_str(&format!(
         r#"
@@ -493,6 +517,7 @@ static KuNetClient* ku_test_connect(uint16_t port) {{
   }}
   KuNetClient* client = (KuNetClient*)calloc(1, sizeof(*client));
   if (!client) {{ ku_net_socket_close(socket_value); return NULL; }}
+  ku_net_atomic_flag_init(&client->poison_requested);
   client->socket_value = socket_value;
   client->read_timeout_ms = 250;
   client->write_timeout_ms = 50;
@@ -523,6 +548,7 @@ static void* ku_test_reader(void* ignored) {{
 }}
 
 int main(void) {{
+  ku_net_atomic_flag_init(&ku_test_read_gate_acquired);
   ku_test_client = ku_test_connect({port});
   if (!ku_test_client) return 20;
 #if defined(_WIN32)
@@ -533,7 +559,8 @@ int main(void) {{
   if (pthread_create(&worker, NULL, ku_test_reader, NULL) != 0) return 21;
 #endif
   unsigned long long wait_deadline = ku_net_deadline_after_ms(1000);
-  while (!ku_test_read_gate_acquired && ku_net_now_ms() < wait_deadline) {{
+  while (!ku_net_atomic_flag_load(&ku_test_read_gate_acquired)
+      && ku_net_now_ms() < wait_deadline) {{
 #if defined(_WIN32)
     Sleep(1);
 #else
@@ -541,7 +568,7 @@ int main(void) {{
     nanosleep(&pause, NULL);
 #endif
   }}
-  if (!ku_test_read_gate_acquired) return 22;
+  if (!ku_net_atomic_flag_load(&ku_test_read_gate_acquired)) return 22;
   uint8_t byte = 65;
   KuBytes payload = {{ &byte, 1, 0, KU_BYTES_STATIC }};
   KuResult_null write_result = ku_net_write(ku_test_client, payload);
@@ -646,6 +673,7 @@ static KuNetClient* ku_test_connect(uint16_t port) {{
   }}
   KuNetClient* client = (KuNetClient*)calloc(1, sizeof(*client));
   if (!client) {{ ku_net_socket_close(socket_value); return NULL; }}
+  ku_net_atomic_flag_init(&client->poison_requested);
   client->socket_value = socket_value;
   client->read_timeout_ms = 1000;
   client->write_timeout_ms = 10;
@@ -694,6 +722,151 @@ int main(void) {{
 }
 
 #[test]
+fn native_net_tls_artifact_and_unavailable_runtime_are_fail_closed() {
+    let directory = TempDir::new("net-tls-contract");
+    let generated = emit_c(
+        directory.path(),
+        r#"import net from "std.net"
+fn main(): null! {
+    enabled = false
+    try {
+        client = net.client({ host: "127.0.0.1", port: 9, tls: enabled, tls_server_name: "localhost" })?
+        client.close()
+    } catch(err) {
+        println(err.code)
+    }
+    try {
+        client = net.client({ host: "127.0.0.1", port: 9, tls: true, tls_ca_pem: "test-ca" })?
+        client.close()
+    } catch(err) {
+        println(err.code)
+    }
+    return ok(null)
+}
+"#,
+    );
+    for marker in [
+        "#define KU_FEATURE_NATIVE_TLS 1",
+        "#if defined(KU_NATIVE_TLS_ENABLED)",
+        "typedef struct KuTlsConfig KuTlsConfig;",
+        "typedef struct KuTlsClientSession KuTlsClientSession;",
+        "extern uint32_t ku_tls_abi_version(void);",
+        "extern uint32_t ku_tls_v1_build_id(",
+        "extern uint32_t ku_tls_v1_config_new(",
+        "extern uint32_t ku_tls_v1_config_drop(",
+        "extern uint32_t ku_tls_v1_client_new(",
+        "extern uint32_t ku_tls_v1_client_drop(",
+        "extern uint32_t ku_tls_v1_client_wants_read(",
+        "extern uint32_t ku_tls_v1_client_wants_write(",
+        "extern uint32_t ku_tls_v1_client_is_handshaking(",
+        "extern uint32_t ku_tls_v1_client_peer_closed(",
+        "extern uint32_t ku_tls_v1_client_feed_ciphertext(",
+        "extern uint32_t ku_tls_v1_client_process(",
+        "extern uint32_t ku_tls_v1_client_drain_ciphertext(",
+        "extern uint32_t ku_tls_v1_client_write_plaintext(",
+        "extern uint32_t ku_tls_v1_client_read_plaintext(",
+        "extern uint32_t ku_tls_v1_client_send_close_notify(",
+        "extern uint32_t ku_tls_v1_client_notify_eof(",
+        "KU_TLS_MAX_IO_BYTES 65536u",
+        "#if !defined(KU_NATIVE_TLS_ENABLED)",
+        "ku_net_error(\"tls_unavailable\"",
+        "KU_TLS_ROOTS_WEBPKI : KU_TLS_ROOTS_CUSTOM_PEM",
+        "if (tls_enabled && tls_server_name.len == 0) tls_server_name = host_value->as.s;",
+        "KU_NET_TLS_MAX_HANDSHAKE_CIPHERTEXT_BYTES 1048576ULL",
+        "KU_NET_TLS_MAX_NO_PROGRESS_CALLS 64U",
+        "KU_NET_TLS_MAX_HANDSHAKE_DRIVER_CALLS 1048640ULL",
+        "KU_NET_TLS_MAX_OPERATION_CIPHERTEXT_BYTES 524320ULL",
+        "KU_NET_TLS_MAX_OPERATION_DRIVER_CALLS 524384ULL",
+        "net TLS peer closed without close_notify",
+        "ku-native-tls/0.1.0;abi=1;rustls=0.23.40;ring=0.17.14;",
+        "record-staging=65540;resumption=disabled",
+        "uint8_t ciphertext[KU_TLS_MAX_IO_BYTES];",
+        "client->tls_pending = (uint8_t*)malloc(pending_len);",
+        "feed_steps >= KU_TLS_MAX_IO_BYTES",
+        "raw generated-C callers\n     must provide the same lifetime guarantee",
+        "Queue, drain once, and attempt one nonblocking send.",
+    ] {
+        assert!(
+            generated.contains(marker),
+            "missing TLS contract marker {marker:?}"
+        );
+    }
+    assert!(!generated.contains("skip_verify"));
+    assert!(!generated.contains("insecure"));
+    assert!(!generated.contains("KuTlsV1Session"));
+    assert!(!generated.contains("ku_tls_v1_handshake"));
+    assert_eq!(
+        generated
+            .matches("if (error.code.len == 0 && ku_net_now_ms() >= deadline)")
+            .count(),
+        2,
+        "plain and TLS read/write success must share a final deadline fence"
+    );
+
+    let handshake_start = generated
+        .find("static int ku_net_tls_handshake_until(")
+        .expect("TLS handshake driver must be emitted");
+    let handshake_end = generated[handshake_start..]
+        .find("static int ku_net_tls_write_until(")
+        .map(|offset| handshake_start + offset)
+        .expect("TLS write driver must follow the handshake driver");
+    let handshake = &generated[handshake_start..handshake_end];
+    assert!(
+        handshake
+            .find("if (!handshaking)")
+            .expect("handshake completion check")
+            < handshake
+                .find("if (driver_calls >= KU_NET_TLS_MAX_HANDSHAKE_DRIVER_CALLS)")
+                .expect("handshake call budget check"),
+        "completion must win over an exactly exhausted handshake budget"
+    );
+    assert_eq!(
+        handshake.matches("no_progress_calls = 0").count(),
+        1,
+        "handshake no-progress calls must accumulate instead of resetting after progress"
+    );
+
+    let write_start = handshake_end;
+    let write_end = generated[write_start..]
+        .find("static int ku_net_tls_read_until(")
+        .map(|offset| write_start + offset)
+        .expect("TLS read driver must follow the write driver");
+    let write_driver = &generated[write_start..write_end];
+    assert_eq!(write_driver.matches("no_progress_calls = 0").count(), 1);
+    assert!(
+        write_driver
+            .find("ku_tls_v1_client_write_plaintext(")
+            .expect("write must first try buffered TLS state")
+            < write_driver
+                .find("if (driver_calls >= KU_NET_TLS_MAX_OPERATION_DRIVER_CALLS)")
+                .expect("write driver call budget")
+    );
+
+    let read_start = write_end;
+    let read_end = generated[read_start..]
+        .find("static int ku_net_gate_init(")
+        .map(|offset| read_start + offset)
+        .expect("net gate runtime must follow the TLS read driver");
+    let read_driver = &generated[read_start..read_end];
+    assert_eq!(read_driver.matches("no_progress_calls = 0").count(), 1);
+    assert!(
+        read_driver
+            .find("ku_tls_v1_client_read_plaintext(")
+            .expect("read must first try buffered TLS state")
+            < read_driver
+                .find("if (driver_calls >= KU_NET_TLS_MAX_OPERATION_DRIVER_CALLS)")
+                .expect("read driver call budget")
+    );
+    let Some(executable) = compile_generated(&directory, &generated, "net-tls-contract") else {
+        return;
+    };
+    assert_success(
+        &run_native(&executable),
+        "invalid_config\ntls_unavailable\n",
+    );
+}
+
+#[test]
 fn bytes_and_net_checker_enforce_one_api_and_ownership_path() {
     let valid = r#"import bytes from "std.bytes"
 import net from "std.net"
@@ -710,6 +883,20 @@ fn main(): null! {
 "#;
     check_source("net-valid.ku", valid).expect("single bytes/net API should check");
 
+    for (label, field) in [
+        ("net-tls.ku", "tls: true"),
+        (
+            "net-tls-name.ku",
+            "tls: true, tls_server_name: \"localhost\"",
+        ),
+        ("net-tls-ca.ku", "tls: true, tls_ca_pem: \"test-ca\""),
+    ] {
+        let source = format!(
+            "import net from \"std.net\"\nfn main(): null! {{ client = net.client({{ host: \"127.0.0.1\", port: 9, {field} }})? client.close() return ok(null) }}\n"
+        );
+        check_source(label, &source).expect("strict TLS net config should check");
+    }
+
     for (label, source, expected) in [
         (
             "net-camel-case.ku",
@@ -717,6 +904,48 @@ fn main(): null! {
 fn main(): null! { client = net.client({ host: "127.0.0.1", port: 9, readTimeoutMs: 1 })? return ok(null) }
 "#,
             "unknown net client config field 'readTimeoutMs'",
+        ),
+        (
+            "net-insecure-option.ku",
+            r#"import net from "std.net"
+fn main(): null! { client = net.client({ host: "127.0.0.1", port: 9, insecure: true })? return ok(null) }
+"#,
+            "unknown net client config field 'insecure'",
+        ),
+        (
+            "net-wrong-tls-type.ku",
+            r#"import net from "std.net"
+fn main(): null! { client = net.client({ host: "127.0.0.1", port: 9, tls: "yes" })? return ok(null) }
+"#,
+            "net.client config field 'tls' must be bool",
+        ),
+        (
+            "net-wrong-tls-ca-type.ku",
+            r#"import net from "std.net"
+fn main(): null! { client = net.client({ host: "127.0.0.1", port: 9, tls: true, tls_ca_pem: 1 })? return ok(null) }
+"#,
+            "net.client config field 'tls_ca_pem' must be str",
+        ),
+        (
+            "net-wrong-tls-name-type.ku",
+            r#"import net from "std.net"
+fn main(): null! { client = net.client({ host: "127.0.0.1", port: 9, tls: true, tls_server_name: 1 })? return ok(null) }
+"#,
+            "net.client config field 'tls_server_name' must be str",
+        ),
+        (
+            "net-tls-name-while-disabled.ku",
+            r#"import net from "std.net"
+fn main(): null! { client = net.client({ host: "127.0.0.1", port: 9, tls: false, tls_server_name: "localhost" })? return ok(null) }
+"#,
+            "field 'tls_server_name' requires 'tls' to be true",
+        ),
+        (
+            "net-tls-ca-without-tls.ku",
+            r#"import net from "std.net"
+fn main(): null! { client = net.client({ host: "127.0.0.1", port: 9, tls_ca_pem: "test-ca" })? return ok(null) }
+"#,
+            "field 'tls_ca_pem' requires 'tls' to be true",
         ),
         (
             "net-clone.ku",

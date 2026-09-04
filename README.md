@@ -192,17 +192,21 @@ fn main(): null! {
 ```
 
 - **统一写法**：三个驱动都只公开 `module.client(config)?`，client 内部自动维护有界连接池；业务代码只调用 receiver 方法。连接数和等待者数有硬上限，所有操作共享绝对预算；同步 DNS、libpq/SSL 内部调用和 libmysqlclient FFI 不能被 portable C 硬抢占，只能在返回后复核 deadline 并淘汰过期连接。0.0.x 直接删除旧 raw connection、手动 pool 和模块级 query 入口，不提供兼容别名。构造前配置校验统一返回 `invalid_config`；client/池层跨驱动统一为 `client_closed`、`pool_busy`、`acquire_timeout`、`connect_timeout`、`connect_error`、`sync_error`、`out_of_memory`，阶段和重试边界见[版本记录](docs/v0.0.16.md#数据库驱动stdpg--stdredis--stdmysql)。
-- **std.pg**（libpq 9.2+）：`client.query(sql, params)` 始终走服务端参数绑定，无参数也传 `[]`；`result.rows()` / `cols()` / `value()` / `is_null()` 读取与连接脱钩的 owned 结果。内部复用 nonblocking poll、单行增量聚合、严格 UTF-8/NULL/边界与 64 MiB 文本上限。明确识别出的 transaction/session-control SQL 在借连接前返回 `pg/session_state_unsupported`；成功响应若留下非 IDLE 状态会丢弃 payload、返回同一错误并淘汰连接。其余成功查询在原 deadline 内执行 `DISCARD ALL`，reset 失败、超时或协议失步淘汰对应连接，不自动重放 SQL。
+- **std.pg**（libpq 9.2+）：`client.query(sql, params)` 始终走服务端参数绑定，无参数也传 `[]`；`result.rows()` / `cols()` / `value()` / `is_null()` 读取与连接脱钩的 owned 结果。内部复用 nonblocking poll、单行增量聚合、严格 UTF-8/NULL/边界与 64 MiB 文本上限。明确识别出的 transaction/session-control SQL 在借连接前返回 `pg/session_state_unsupported`；成功响应若留下非 IDLE 状态会丢弃 payload、返回同一 code 且用独立固定消息说明语句已经或可能已经执行、禁止自动重试，然后淘汰连接。其余成功查询在原 deadline 内执行 `DISCARD ALL`，reset 失败、超时或协议失步淘汰对应连接，不自动重放 SQL。
 - **std.redis**（自实现 RESP2-over-socket，零外部依赖）：client 配置中的用户名/密码会应用到每条懒创建连接；提供 `ping/get/set/exists/del`。`get` 只有一种严格语义：缺键返回 `redis/key_not_found`，不再把缺键折叠为空串。坏帧或 I/O 超时只淘汰对应连接；AUTH 拒绝、建连 transport、建连 timeout、池 timeout、命令 timeout 和 OOM 分阶段返回固定错误，服务端文本不直接进入诊断。
-- **std.mysql**（libmysqlclient）：`client.query(sql, params)` 和 `client.execute(sql, params)` 都使用真正的 `MYSQL_STMT` 参数绑定，不再做 escape 后的 SQL 拼接；结果复制到 Ku owned、有上限的表后再归还连接。明确识别出的 transaction/session-control SQL 在执行前返回 `mysql/session_state_unsupported`；执行后若 server status 显示事务未结束或 autocommit 被关闭，会丢弃 payload、返回同一错误并淘汰单槽。普通完成路径仍调用 `mysql_reset_connection()`，清理/reset 失败也淘汰单槽；自动 reconnect 与 `LOCAL INFILE` 都显式关闭。编译期先把精确 header 路径及 header family 绑定到所选动态库 family；一次性 `mysql_library_init()` 成功后再核对 runtime numeric/string major。错配会立即 `mysql_library_end()` 并返回 `mysql/client_abi_mismatch`，且不进入 thread、连接或 statement API。当前不支持 SQL NULL 输入参数和任意 binary 列。
+- **std.mysql**（libmysqlclient）：`client.query(sql, params)` 和 `client.execute(sql, params)` 都使用真正的 `MYSQL_STMT` 参数绑定，不再做 escape 后的 SQL 拼接；结果复制到 Ku owned、有上限的表后再归还连接。明确识别出的 transaction/session-control SQL 以及顶层 `CALL` 在执行前返回 `mysql/session_state_unsupported`；执行后若 server status 显示事务未结束或 autocommit 被关闭，会丢弃 payload、返回同一 code 且用独立固定消息说明语句已经或可能已经执行、禁止自动重试，然后淘汰单槽。普通完成路径仍调用 `mysql_reset_connection()`，清理/reset 失败也淘汰单槽；自动 reconnect 与 `LOCAL INFILE` 都显式关闭。编译期先把精确 header 路径及 header family 绑定到所选动态库 family；一次性 `mysql_library_init()` 成功后再核对 runtime numeric/string major。错配会立即 `mysql_library_end()` 并返回 `mysql/client_abi_mismatch`，且不进入 thread、连接或 statement API。当前不支持 SQL NULL 输入参数和任意 binary 列。
 
-前置 SQL 识别是 fail-closed 的有限语法防线，不是任意 SQL “session purity”的证明。存储过程、扩展函数或表达式仍可能产生驱动无法从 SQL 文本完整判定的会话、全局或外部副作用；普通 pooled client 不支持依赖跨调用保留的 session 状态，也不提供 transaction/exclusive 逃生门。后置状态检查和 reset 负责保护下一位借用者，但不能把已执行 SQL 的副作用回滚成“从未发生”。共享 client 不接受不受信任方提供的任意 SQL；生产账号必须最小权限，PG 不使用 superuser，MySQL/MariaDB 不授予 `SYSTEM_VARIABLES_ADMIN`、`RELOAD`、`FILE` 等业务查询不需要的管理权限。
+前置 SQL 识别是 fail-closed 的有限语法防线，不是任意 SQL “session purity”的证明。MySQL 顶层 `CALL` 已在借连接前拒绝，但存储函数、PG 过程/函数、扩展函数或表达式仍可能产生驱动无法从 SQL 文本完整判定的会话、全局或外部副作用；普通 pooled client 不支持依赖跨调用保留的 session 状态，也不提供 transaction/exclusive 逃生门。后置状态检查和 reset 负责保护下一位借用者，但不能把已执行 SQL 的副作用回滚成“从未发生”。共享 client 不接受不受信任方提供的任意 SQL；生产账号必须最小权限，PG 不使用 superuser，MySQL/MariaDB 不授予 `SYSTEM_VARIABLES_ADMIN`、`RELOAD`、`FILE` 等业务查询不需要的管理权限。
 
-SQL 错误有一条必须遵守的重试边界：语句发送前的配置、连接和借用失败保留各自错误；语句发送后无法确认终态返回 `execution_unknown`，已收到成功终态但本地结果无法交付返回 `execution_completed_without_result`。这两个错误都表示不能自动重试，否则 INSERT/UPDATE 可能重复执行。驱动自身从不重放 SQL。各结果上限是单次结果的防护，不是进程总内存硬上限；并发持有多个 detached result 时仍应使用进程级资源限制。
+SQL 错误有一条必须遵守的重试边界：语句发送前的配置、连接和借用失败保留各自错误；语句发送后无法确认终态返回 `execution_unknown`，已收到成功终态但本地结果无法交付返回 `execution_completed_without_result`。对有结果列的 MySQL prepared statement，`mysql_stmt_execute()==0` 不是结果集终态，只有 `mysql_stmt_fetch()` 返回 `MYSQL_NO_DATA` 才确认当前结果完整；在此之前的 deadline、metadata、分配、bind、fetch、上限或 UTF-8 失败都属于 `execution_unknown`。顶层 `CALL` 在前置阶段拒绝，直到驱动实现并验证有界的 `mysql_stmt_next_result()` 全结果循环。上述两个 code 都不能自动重试；`session_state_unsupported` 也不能仅凭 code 自动重试：前置固定消息表示尚未发送，后置固定消息则明确语句已经或可能已经执行且 payload 已丢弃。驱动自身从不重放 SQL。各结果上限是单次结果的防护，不是进程总内存硬上限；并发持有多个 detached result 时仍应使用进程级资源限制。
 
 Redis 当前是明文 TCP，MySQL 当前也没有跨 Oracle/MariaDB 一致、fail-closed 的证书和主机名验证配置；二者只能直连 loopback/受控私网或已验证的 TLS tunnel。PostgreSQL 远程连接必须在 conninfo 中显式使用 `sslmode=verify-full` 和可信 `sslrootcert`。
 
-client 的 `close()` 消费 Ku owned 句柄并立即拒绝新借用；已经在池内登记的借用由最后一个归还者完成延迟销毁，不用无界等待来“关池”。该保证以 Ku checker/closure 生命周期为边界：client 不可 clone、close 后源值清空、只读 HTTP handler 不能消费外层 client。生成的数据库 helper 全部是 translation-unit 内部 `static` 实现，不是第三方 C ABI。内部 `finalizing` 仲裁只保证尚存活 allocation 上已进入的 close/release 路径最多选出一个销毁者；它不让已释放裸指针重新有效。绕过 checker 后重复 close、close 返回后继续使用，或让尚未登记的裸指针调用与 consuming close 同时开始，都属于明确不支持的调用方式。
+native C 的 `std.net` 已在原有 `net.client(config)` 中接入 TLS：写 `tls: true`，可选的 `tls_server_name` 默认为 `host`，`tls_ca_pem` 一旦提供就完全替代内置 WebPKI roots。证书和主机名验证不能关闭，错证书、错主机名或 TLS runtime 不可用都 fail closed，不会降级到明文。这条 generated-C 路径不代表解释器 `ku run`、HTTP 或 Redis 已复用它；这三项仍未完成。
+
+TLS native 构建要求与目标/compiler ABI 精确匹配的 v1 target pack，由绝对 `KU_NATIVE_TLS_PACK` 根目录指定，或从 Ku 可执行文件旁的 `native-tls/v1` 加载。该根目录下面必须是 `<target>/manifest.kutls`，因此环境变量指向 pack root，不要指向某个 `<target>` 子目录。CLI 会校验 manifest 字段、archive/header 大小与 SHA-256、目标对象格式、必需 ABI symbols 和 build id，再从已固定句柄复制到私有 staging 链接。这些 hash 只证明 pack 内部一致，不是发布者签名；pack 来源、compiler 与构建环境仍是可信输入。`ku-native-tls` archive 静态进入最终产物，不需额外的 Ku TLS shared-library sidecar；产物仍依赖目标系统的 CRT/系统网络库及其 loader 合同，不是完全静态、与系统无关的二进制。
+
+client 的 `close()` 消费 Ku owned 句柄并立即拒绝新借用；已经在池内登记的借用由最后一个归还者完成延迟销毁，不用无界等待来“关池”。该保证以 Ku checker/closure 生命周期为边界：client 不可 clone、close 后源值清空、只读 HTTP handler 不能消费外层 client，因而正常 Ku 路径不允许新 use 与 consuming close 竞争。生成的数据库与 `std.net` helper 全部是 translation-unit 内部 `static` 实现，不是第三方 C ABI。如果绕过 Ku 直接调用生成 C，调用方必须在外部串行化同一 client 的 close/use，且 close 不得与 read/write/query/release 并发。内部 `finalizing` 仲裁只保证尚存活 allocation 上已进入的 close/release 路径最多选出一个销毁者；它不让已释放裸指针重新有效。重复 close、close 返回后继续使用，或让尚未登记的裸指针调用与 consuming close 同时开始，都属于明确不支持的调用方式。
 
 连接恢复不会形成重拨风暴：一个 client 同时只执行一次懒建探测；失败退避窗口从 25ms 指数增长并封顶 1000ms，实际 equal-jitter 延迟落在 `ceil(window/2)..window`（首次 13～25ms）；健康空闲连接仍可立即借用。新请求必须先进入等待集合，不能以未排队身份直接夺取空闲槽；集合内由平台 condition variable 无序选择，不保证 FIFO 或无饥饿。`close()` 线性化前已开始的归还清理可能继续到完成，活动借用计数保证底层 client 不会被提前释放。
 
@@ -341,7 +345,7 @@ http_pg_frontend.html # http_pg 的前端页面
 
 `ku build --native <file.ku>` 不带 `-o` 时保留旧的单文件兼容模式，只在源码旁写出 `.c`，不执行链接；`ku build --native -o <path> <file.ku>` 则进入与 `--backend c` 相同的生成、编译、链接和产物校验流程。普通跨系统发布使用上面的 `--backend c --target` 命令，避免把“只生成 C”误认为已经得到目标二进制。
 
-native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制，覆盖 `int` / `bool` / `str`（正式 `KuString` owned ABI，支持拼接与 `str()`/`len`/`chars`/`contains`/`slice` 等方法）、struct（含数组/嵌套/enum 字段）、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包（env 引用计数）、native HTTP 服务以及数据库驱动（std.pg/redis/mysql）的已实现子集。array/named/Result/struct/闭包按默认 move、显式 `clone()`、自动 drop 生成所有权代码，并由 checker 做路径级 move 分析。核心同步 ABI、`std.fs/std.json/std.time`、native HTTP、plain `std.net` 与 Redis 的 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支均已在 Windows 2025、Ubuntu 24.04、macOS 15 的完整 workspace CI 中跑绿；三个目标的独立 native build/run 门槛也已通过。这证明当前自动化覆盖的三系统分支，不等于 Redis/MySQL 实服查询或 PG 的 Linux/macOS 实库往返已经完成。`std.mysql` 目前只在 host build 自动配对 client library，显式 non-host target 会提前拒绝；三系统发布因此应在各目标系统分别构建。`std.pg` 构建必须通过绝对、专用的 `KU_PG_LIB` 目录提供匹配目标的 shared/import libpq；compiler/sysroot 还必须满足其传递依赖。仍明确报不支持的：动态 object 的部分复杂场景、从 dynamic object 取回闭包后调用、闭包捕获 struct/enum/Result/Task 等 owned 类型、async native lowering，以及 str 的 `trim`/`lower`/`upper`（需 Unicode 表）。
+native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制，覆盖 `int` / `bool` / `str`（正式 `KuString` owned ABI，支持拼接与 `str()`/`len`/`chars`/`contains`/`slice` 等方法）、struct（含数组/嵌套/enum 字段）、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包（env 引用计数）、native HTTP 服务以及数据库驱动（std.pg/redis/mysql）的已实现子集。array/named/Result/struct/闭包按默认 move、显式 `clone()`、自动 drop 生成所有权代码，并由 checker 做路径级 move 分析。核心同步 ABI、`std.fs/std.json/std.time`、native HTTP、`std.net` 明文与 Redis 的 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支均已在 Windows 2025、Ubuntu 24.04、macOS 15 的完整 workspace CI 中跑绿；三个目标的独立 native build/run 门槛也已通过。`std.net` 的可选 TLS 已接入 generated C 与 target-pack 链接门槛，但当前精确 pack/build-id 组合的三系统最终消费者 CI 仍是发布阻断项，不沿用旧 pack 或只跑 runtime crate 的结果冒充通过。这些证据也不等于 Redis/MySQL 实服查询或 PG 的 Linux/macOS 实库往返已经完成。`std.mysql` 目前只在 host build 自动配对 client library，显式 non-host target 会提前拒绝；三系统发布因此应在各目标系统分别构建。`std.pg` 构建必须通过绝对、专用的 `KU_PG_LIB` 目录提供匹配目标的 shared/import libpq；compiler/sysroot 还必须满足其传递依赖。仍明确报不支持的：动态 object 的部分复杂场景、从 dynamic object 取回闭包后调用、闭包捕获 struct/enum/Result/Task 等 owned 类型、async native lowering，以及 str 的 `trim`/`lower`/`upper`（需 Unicode 表）。
 
 已完成到 0.0.15 的关键前置：
 
@@ -413,9 +417,12 @@ editors/vscode-ku
 统一打包解释器和 VS Code 插件：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1
-powershell -ExecutionPolicy Bypass -File scripts\package-release.ps1 -InstallExtension
+pwsh -NoLogo -NoProfile -File scripts\package-release.ps1 -CheckOnly
+pwsh -NoLogo -NoProfile -File scripts\package-release.ps1
+pwsh -NoLogo -NoProfile -File scripts\package-release.ps1 -InstallExtension
 ```
+
+发布脚本要求 PowerShell 7，并且只打包当前 host 对应的一个明确 Rust target：`x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu` 或 `aarch64-apple-darwin`。当前 bundle 合同为 `release/<target>/`，内含该 target 的 Ku 可执行文件、`libku.rlib`、固定版本 VSIX 和 `native-tls/v1/<target>/` pack（Windows 可额外带 `ku.pdb`）。三系统发布是三个独立 bundle，不会互相覆盖，也不存在一个通用二进制。`-CheckOnly` 执行构建与合同校验，但不发布 `release/<target>/` bundle；只有脚本成功且相应三系统 CI 跑绿才能将该 target 标记为可发布。
 
 已提供：
 
@@ -426,13 +433,13 @@ ku.mod / ku.lock 高亮
 命令面板：Run / Check / Show IR / Build / Build Native C / Package GC / Show Version
 编辑器右上角 Run / Check / IR / Build 按钮
 右键菜单：编辑器和文件列表里的 .ku 文件都会显示 Ku Run；没有 fn main() 时点击会提示
-解释器查找：优先使用 PATH 里的 ku，找不到再回退到工作区 release/target
+解释器查找：优先使用 PATH 里的 ku，找不到再回退到工作区 `release/<rust-target>/ku[.exe]`
 状态栏解释器版本检查
 Hover、补全、定义跳转、Outline、Quick Fix、基础格式化
 Ku 文件默认保存时格式化；import path 补全会替换引号内路径，避免 `std.std.fs`；成员补全会识别 `http.` / `fs.` / `json.` 等上下文，只插入成员名，避免 `http.http.server`。
 ```
 
-> 说明:`editors/vscode-ku/ku-language-0.0.16.vsix` 已打包(含 pg/redis/mysql 高亮与补全、0.0.16 版本号)。需要自行重打时用 `npx @vscode/vsce package`(会先跑 `npm run compile`)。仓库同时保留了旧的 `ku-language-0.0.15.vsix`。
+> 说明:`editors/vscode-ku/ku-language-0.0.16.vsix` 已打包(含 pg/redis/mysql 高亮与补全、0.0.16 版本号)。重打时先在 `editors/vscode-ku` 执行 `npm ci --ignore-scripts`、`npm test`，再用 lockfile 中精确版本的 `npx --no-install vsce package`；不从网络临时解析浮动版本的 vsce。旧版本 VSIX 不再与当前版本重复保留。
 
 图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择 `editors/vscode-ku/ku-language-0.0.16.vsix`。
 
@@ -453,7 +460,8 @@ cargo build --release
 更新本地解释器和历史版本快照：
 
 ```powershell
-.\scripts\archive-release.ps1
+pwsh -NoLogo -NoProfile -File scripts\archive-release.ps1 -CheckOnly
+pwsh -NoLogo -NoProfile -File scripts\archive-release.ps1
 ```
 
-该脚本会把 `target\release\ku.exe` / `libku.rlib` 同步到 `release\`，并归档到 `history\v当前版本\`。详细规则见 [版本和解释器历史](docs/history.md)。
+该脚本先生成并校验 `release/<target>/` bundle，再以不可变目录归档到 `history/v<version>/<target>/`；目标目录已存在时拒绝覆盖。详细规则见 [版本和解释器历史](docs/history.md)。

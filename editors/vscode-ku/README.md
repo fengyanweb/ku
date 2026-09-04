@@ -4,7 +4,7 @@ This extension contributes syntax highlighting, snippets, diagnostics, commands,
 
 ## Features
 
-- Syntax highlighting for Ku 0.0.15 keywords including `async` / `await`, strings, template strings, numbers, built-in types, stdlib calls, and unsupported `let` / `mut` / `const`.
+- Syntax highlighting for Ku 0.0.16 keywords including `async` / `await`, strings, template strings, numbers, built-in types, stdlib calls, and unsupported `let` / `mut` / `const`.
 - `ku.mod` / `ku.lock` syntax highlighting.
 - Language configuration for comments, brackets, auto-closing pairs, and surrounding pairs.
 - Snippets for sync/async main, sync/async functions, `await task?`, generic functions, struct, enum, match, try/catch/finally, `std.fs`, `std.http`, `std.config`, `std.task`, bounded task stress, HTTP response usage, array map, string methods, and `array.try_get`.
@@ -30,8 +30,10 @@ From the repository root:
 
 ```powershell
 cd editors\vscode-ku
-npx @vscode/vsce package --out ku-language-0.0.15.vsix
-code --install-extension .\ku-language-0.0.15.vsix
+npm ci --ignore-scripts
+npm test
+npx --no-install vsce package --out ku-language-0.0.16.vsix
+code --install-extension .\ku-language-0.0.16.vsix
 ```
 
 Then reload VS Code from the Command Palette with `Developer: Reload Window`, or restart VS Code, and open any `.ku` file.
@@ -42,7 +44,7 @@ Then reload VS Code from the Command Palette with `Developer: Reload Window`, or
 2. Open the Extensions view.
 3. Click `...`.
 4. Choose `Install from VSIX...`.
-5. Pick `editors/vscode-ku/ku-language-0.0.15.vsix`.
+5. Pick `editors/vscode-ku/ku-language-0.0.16.vsix`.
 6. Reload VS Code from the Command Palette with `Developer: Reload Window`, or restart VS Code.
 
 ## Install By Copying The Extension Folder
@@ -50,7 +52,7 @@ Then reload VS Code from the Command Palette with `Developer: Reload Window`, or
 If you do not want to use `vsce`, copy this folder into the VS Code extensions directory:
 
 ```powershell
-$target = "$env:USERPROFILE\.vscode\extensions\ku-lang.ku-language-0.0.15"
+$target = "$env:USERPROFILE\.vscode\extensions\ku-lang.ku-language-0.0.16"
 New-Item -ItemType Directory -Force -Path $target | Out-Null
 Copy-Item -LiteralPath .\editors\vscode-ku\* -Destination $target -Recurse -Force
 ```
@@ -63,6 +65,6 @@ Open `editors/vscode-ku` in VS Code and press `F5` to launch an Extension Develo
 
 ## Interpreter Path
 
-The extension uses `ku` from PATH first, then falls back to `release/ku.exe`, `target/release/ku.exe`, or `target/debug/ku.exe` in the workspace.
+The extension uses `ku` from PATH first, then falls back to the matching workspace bundle under `release/<rust-target>/ku[.exe]`, followed by `target/release/ku[.exe]` and `target/debug/ku[.exe]`. Published target bundles currently map Windows x64 to `x86_64-pc-windows-msvc`, Linux x64 to `x86_64-unknown-linux-gnu`, and Apple Silicon macOS to `aarch64-apple-darwin`; unsupported host architectures must use `ku.executablePath` or PATH.
 
 If needed, set `ku.executablePath` in VS Code settings.
