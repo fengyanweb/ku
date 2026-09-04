@@ -9,8 +9,8 @@ pub mod bounded_process;
 
 use bounded_process::{run_bounded, OutputLimits};
 use ku::ast::{
-    BinaryOp, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item, Literal, ModuleDecl, Stmt,
-    StructDecl, TypeName, UnaryOp,
+    BinaryOp, EnumDecl, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item, Literal, ModuleDecl,
+    Stmt, StructDecl, TypeName, UnaryOp,
 };
 use ku::lexer::Lexer;
 use ku::parser::Parser;
@@ -81,6 +81,28 @@ const STRUCT_GOLDEN: &str = concat!(
     "EDGE|3|5\n",
     "EDGE|4|6\n",
     "EDGE|5|2\n",
+    "EDGE|6|7\n",
+    "EDGE|7|8",
+);
+const ENUM_GOLDEN_SOURCE: &str =
+    "// 前😀\r\nenum Maybe {\r\n  None,\r\n  Some(value: [pkg.Item!]!)\r\n}";
+const ENUM_GOLDEN: &str = concat!(
+    "ROOT|9\n",
+    "NODE|1|EnumVariant|None|0|3:3@28..3:7@32|0|0\n",
+    "NODE|2|TypeName|pkg.Item|0|4:16@50..4:24@58|0|0\n",
+    "NODE|3|TypeResult||0|4:16@50..4:25@59|0|1\n",
+    "NODE|4|TypeArray||0|4:15@49..4:26@60|1|1\n",
+    "NODE|5|TypeResult||0|4:15@49..4:27@61|2|1\n",
+    "NODE|6|EnumVariantField|value|0|4:8@42..4:13@47|3|1\n",
+    "NODE|7|EnumVariant|Some|0|4:3@37..4:28@62|4|1\n",
+    "NODE|8|Enum|Maybe|0|2:1@12..5:2@65|5|2\n",
+    "NODE|9|Program||0|2:1@12..5:2@65|7|1\n",
+    "EDGE|0|2\n",
+    "EDGE|1|3\n",
+    "EDGE|2|4\n",
+    "EDGE|3|5\n",
+    "EDGE|4|6\n",
+    "EDGE|5|1\n",
     "EDGE|6|7\n",
     "EDGE|7|8",
 );
@@ -581,6 +603,89 @@ fn project_struct(source: &str, structure: &StructDecl, arena: &mut ProjectedAre
     )
 }
 
+fn project_enum(source: &str, declaration: &EnumDecl, arena: &mut ProjectedArena) -> usize {
+    let tokens = Lexer::new(source).lex().expect("enum projection lex");
+    let mut cursor = tokens
+        .iter()
+        .position(|token| {
+            matches!(token.kind, TokenKind::Enum)
+                && token.span.start.offset == declaration.span.start.offset
+        })
+        .expect("enum start token");
+    cursor += 1;
+    assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+    cursor += 1;
+    assert!(matches!(tokens[cursor].kind, TokenKind::LBrace));
+    cursor += 1;
+
+    let mut variants = Vec::with_capacity(declaration.variants.len());
+    for variant in &declaration.variants {
+        assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+        let variant_start = tokens[cursor].span;
+        assert_eq!(variant_start.start, variant.span.start);
+        cursor += 1;
+
+        let mut fields = Vec::with_capacity(variant.fields.len());
+        let variant_span = if matches!(tokens[cursor].kind, TokenKind::LParen) {
+            cursor += 1;
+            for (index, field) in variant.fields.iter().enumerate() {
+                assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
+                assert_eq!(tokens[cursor].span, field.span);
+                let field_span = tokens[cursor].span;
+                cursor += 1;
+                assert!(matches!(tokens[cursor].kind, TokenKind::Colon));
+                cursor += 1;
+                let ty = project_type(
+                    &tokens,
+                    &mut cursor,
+                    field.ty.as_ref().expect("enum variant field type"),
+                    arena,
+                );
+                fields.push(push_node(
+                    arena,
+                    "EnumVariantField",
+                    field.name.clone(),
+                    0,
+                    field_span,
+                    &[ty],
+                ));
+                if index + 1 < variant.fields.len() {
+                    assert!(matches!(tokens[cursor].kind, TokenKind::Comma));
+                    cursor += 1;
+                }
+            }
+            assert!(matches!(tokens[cursor].kind, TokenKind::RParen));
+            let span = Span::new(variant_start.start, tokens[cursor].span.end);
+            cursor += 1;
+            span
+        } else {
+            variant_start
+        };
+        assert_eq!(variant_span, variant.span);
+        variants.push(push_node(
+            arena,
+            "EnumVariant",
+            variant.name.clone(),
+            0,
+            variant_span,
+            &fields,
+        ));
+        if matches!(tokens[cursor].kind, TokenKind::Comma) {
+            cursor += 1;
+        }
+    }
+    assert!(matches!(tokens[cursor].kind, TokenKind::RBrace));
+    assert_eq!(tokens[cursor].span.end, declaration.span.end);
+    push_node(
+        arena,
+        "Enum",
+        declaration.name.clone(),
+        0,
+        declaration.span,
+        &variants,
+    )
+}
+
 fn rust_canonical(source: &str) -> String {
     let tokens = Lexer::new(source).lex().expect("Rust oracle lex");
     let eof_span = tokens.last().expect("EOF token").span;
@@ -595,8 +700,8 @@ fn rust_canonical(source: &str) -> String {
             Item::Import(import) => project_import(source, import, &mut arena),
             Item::Function(function) => project_function(source, function, &mut arena),
             Item::Struct(structure) => project_struct(source, structure, &mut arena),
+            Item::Enum(declaration) => project_enum(source, declaration, &mut arena),
             Item::Module(module) => project_module(module, &mut arena),
-            other => panic!("stage-3 oracle received unsupported item: {other:?}"),
         })
         .collect::<Vec<_>>();
     let program_span = match (items.first(), items.last()) {
@@ -706,6 +811,7 @@ fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
     );
     assert_eq!(rust_canonical(MODULE_GOLDEN_SOURCE), MODULE_GOLDEN);
     assert_eq!(rust_canonical(STRUCT_GOLDEN_SOURCE), STRUCT_GOLDEN);
+    assert_eq!(rust_canonical(ENUM_GOLDEN_SOURCE), ENUM_GOLDEN);
     assert_eq!(
         rust_diagnostic_canonical(UNICODE_CRLF_ERROR_SOURCE),
         UNICODE_CRLF_ERROR_CANONICAL
@@ -783,8 +889,16 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "struct Complex { dotted:pkg.model.User, unioned:int | str, arrayed:[pkg.Item!]!, nested:[[int | pkg.Value!]!]! }",
         "struct Adjacent { dotted:pkg.model.User unioned:int | str arrayed:[pkg.Item!]! tail:bool }",
         "struct Duplicate { value:int value:str }",
-        "module App\nimport \"./types.ku\"\nstruct User { id:int }\nfn main() {}",
+        "enum Empty {}",
+        "enum Unit { Ready Pending }",
+        "enum Commas { First, Second, }",
+        "enum EmptyPayload { Bare Empty() }",
+        "enum Payload { Number(value:int) Pair(left:int, right:int) }",
+        "enum Complex { Value(value:[pkg.Item!]! | null), Other(flag:bool, text:str) }",
+        "enum Duplicate { Same Same(value:int, value:str) }",
+        "module App\nimport \"./types.ku\"\nstruct User { id:int }\nenum State { Ready User(value:User) }\nfn main() {}",
         STRUCT_GOLDEN_SOURCE,
+        ENUM_GOLDEN_SOURCE,
         "fn main() {}",
         "fn typed(): int { return 1 }",
         "fn add(left: int, right: int): int { return left + right }\nfn echo(value): str { return \"ok\" }",
@@ -842,6 +956,30 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         format!("fn f(value: {}int!{}) {{}}", "[".repeat(31), "]".repeat(31));
     let rejected_mixed_type_depth =
         format!("fn f(value: {}int!{}) {{}}", "[".repeat(32), "]".repeat(32));
+    let accepted_enum_type_depth = format!(
+        "enum Deep {{ Value(value: {}int{}) }}",
+        "[".repeat(32),
+        "]".repeat(32)
+    );
+    let rejected_enum_type_depth = format!(
+        "enum Deep {{ Value(value: {}int{}) }}",
+        "[".repeat(33),
+        "]".repeat(33)
+    );
+    let enum_union_boundary = format!(
+        "enum Choice {{ Value(value: {}) }}",
+        (0..64)
+            .map(|index| format!("T{index}"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    let over_enum_union_limit = format!(
+        "enum Choice {{ Value(value: {}) }}",
+        (0..65)
+            .map(|index| format!("T{index}"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
     let empty_named_import = "import {} from \"./math.ku\"";
     let trailing_import_comma = "import { Add, } from \"./math.ku\"";
     let missing_import_alias = "import { Add as } from \"./math.ku\"";
@@ -874,7 +1012,23 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let missing_struct_close = "struct User { age: int";
     let double_struct_field_comma = "struct User { age: int,, name: str }";
     let struct_semicolon = "struct User {};";
-    let unsupported_item = "enum State { Ready }";
+    let missing_enum_name = "enum";
+    let missing_enum_open = "enum State";
+    let missing_enum_variant_name = "enum State { : }";
+    let missing_enum_field_name = "enum State { Ready(: int) }";
+    let missing_enum_field_name_at_eof = "enum State { Ready(";
+    let missing_enum_field_name_after_comma_at_eof = "enum State { Ready(value:int,";
+    let missing_enum_field_colon = "enum State { Ready(value int) }";
+    let missing_enum_field_type = "enum State { Ready(value:) }";
+    let missing_enum_payload_comma = "enum State { Ready(left:int right:int) }";
+    let trailing_enum_payload_comma = "enum State { Ready(value:int,) }";
+    let missing_enum_payload_close = "enum State { Ready(value:int }";
+    let missing_enum_close = "enum State { Ready";
+    let double_enum_variant_comma = "enum State { Ready,, Pending }";
+    let enum_semicolon = "enum State {};";
+    let unsupported_enum_type = "enum State { Ready(op: fn(int): int) }";
+    let unsupported_async_enum_type = "enum State { Ready(op: async fn(int): int) }";
+    let unsupported_item = "async fn main(): null! { return ok(null) }";
     let parameter_boundary = format!(
         "fn many({}): null {{ return null }}",
         (0..32)
@@ -1020,6 +1174,54 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         512,
         "169 unseparated fields must exactly fill the direct struct token window"
     );
+    let enum_boundary = format!("{}module Tail;", "enum E {}\n".repeat(127));
+    let over_enum_token_limit = "enum E {}\n".repeat(128);
+    assert_eq!(
+        Lexer::new(&enum_boundary)
+            .lex()
+            .expect("complete enum token boundary lex")
+            .len(),
+        512,
+        "127 empty enums plus one terminated module must exactly fill the Stage-3 token budget"
+    );
+    assert_eq!(
+        Lexer::new(&over_enum_token_limit)
+            .lex()
+            .expect("enum token over-limit lex")
+            .len(),
+        513,
+        "128 empty enums must exceed the complete Stage-3 token budget"
+    );
+    let enum_variant_window_boundary = format!(
+        "enum Wide {{ {} }}",
+        (0..507)
+            .map(|index| format!("V{index}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    assert_eq!(
+        Lexer::new(&enum_variant_window_boundary)
+            .lex()
+            .expect("complete enum-variant token boundary lex")
+            .len(),
+        512,
+        "507 unseparated unit variants must exactly fill the direct enum token window"
+    );
+    let enum_field_window_boundary = format!(
+        "enum Wide {{ Only({}), }}",
+        (0..126)
+            .map(|index| format!("field{index}: int"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert_eq!(
+        Lexer::new(&enum_field_window_boundary)
+            .lex()
+            .expect("complete enum-field token boundary lex")
+            .len(),
+        512,
+        "126 payload fields plus the outer trailing comma must exactly fill the direct enum token window"
+    );
     let over_token_limit = format!("fn main(){{ value = {}1 }}", "1 + ".repeat(252));
     let comment_chunk = "x".repeat(3750);
     let near_limit_source = format!(
@@ -1126,8 +1328,44 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         4,
         "struct window must contain exactly one declaration before EOF",
     );
+    let direct_enum_source = "enum E { A }";
+    let direct_enum_tokens = Lexer::new(direct_enum_source)
+        .lex()
+        .expect("direct enum-window fixture lex");
+    assert_eq!(direct_enum_tokens.len(), 6);
+    let wrong_enum_start = "struct S {}";
+    let direct_enum_over_source = format!("enum {}", "x ".repeat(511));
+    assert_eq!(
+        Lexer::new(&direct_enum_over_source)
+            .lex()
+            .expect("direct enum-window over-limit fixture lex")
+            .len(),
+        513,
+        "direct ReadEnum fixture must exceed its token window by one"
+    );
+    let direct_enum_early_eof_message = diagnostic_at(
+        direct_enum_source,
+        direct_enum_tokens.len() - 1,
+        "EOF must be final in enum window",
+    );
+    let direct_enum_missing_eof_message = diagnostic_at(
+        direct_enum_source,
+        0,
+        "enum window must start with enum and end with EOF",
+    );
+    let direct_enum_wrong_start_message = diagnostic_at(
+        wrong_enum_start,
+        0,
+        "enum window must start with enum and end with EOF",
+    );
+    let direct_enum_trailing_source = "enum E { A } enum F { B }";
+    let direct_enum_trailing_message = diagnostic_at(
+        direct_enum_trailing_source,
+        5,
+        "enum window must contain exactly one declaration before EOF",
+    );
 
-    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { AstCanonical } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { MapTokenCharacters } from \"./support.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { AstCanonical } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { MapTokenCharacters } from \"./support.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
@@ -1175,6 +1413,19 @@ fn ExpectStructWindowError(tokens: [Token], expected_detail: str): null! {
     return ok(null)
 }
 
+fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
+    expected_message = "error|bootstrap.parser.stage3|invalid_token_stream|<source>|" + expected_detail
+    caught = false
+    try { ReadEnum(tokens)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.parser.stage3" || err.code != "invalid_token_stream" || err.message != expected_message) {
+            panic("wrong direct enum-window diagnostic: " + err.domain + "/" + err.code + "/" + err.message + " EXPECTED " + expected_message)
+        }
+    }
+    if (!caught) { panic("expected direct enum-window error") }
+    return ok(null)
+}
+
 fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expected_detail: str): null! {
     expected_message = "error|bootstrap.parser.stage3|" + expected_code.clone() + "|<source>|" + expected_detail
     caught = false
@@ -1209,9 +1460,25 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         ku_string(&direct_struct_over_source),
     ));
     body.push_str(&format!(
+        "    empty_enum_window: [Token] = []\n    ExpectEnumWindowError(empty_enum_window, \"enum window must start with enum and end with EOF|1:1@0..1:1@0\")?\n    direct_enum_tokens = Scan({})?\n    missing_enum_eof: [Token] = [direct_enum_tokens[0].clone(), direct_enum_tokens[1].clone(), direct_enum_tokens[2].clone(), direct_enum_tokens[3].clone(), direct_enum_tokens[4].clone()]\n    ExpectEnumWindowError(missing_enum_eof, {})?\n    early_enum_eof: [Token] = [direct_enum_tokens[0].clone(), direct_enum_tokens[1].clone(), direct_enum_tokens[2].clone(), direct_enum_tokens[3].clone(), direct_enum_tokens[5].clone(), direct_enum_tokens[4].clone(), direct_enum_tokens[5].clone()]\n    ExpectEnumWindowError(early_enum_eof, {})?\n    wrong_enum_start = Scan({})?\n    ExpectEnumWindowError(wrong_enum_start, {})?\n    trailing_enum_tokens = Scan({})?\n    ExpectEnumWindowError(trailing_enum_tokens, {})?\n    enum_window_over = Scan({})?\n    ExpectEnumWindowError(enum_window_over, \"enum window accepts at most 512 tokens|1:1@0..1:1@0\")?\n",
+        ku_string(direct_enum_source),
+        ku_string(&direct_enum_missing_eof_message),
+        ku_string(&direct_enum_early_eof_message),
+        ku_string(wrong_enum_start),
+        ku_string(&direct_enum_wrong_start_message),
+        ku_string(direct_enum_trailing_source),
+        ku_string(&direct_enum_trailing_message),
+        ku_string(&direct_enum_over_source),
+    ));
+    body.push_str(&format!(
         "    AssertCase({}, {})?\n",
         ku_string(TYPED_UNION_GOLDEN_SOURCE),
         ku_string(TYPED_UNION_GOLDEN)
+    ));
+    body.push_str(&format!(
+        "    AssertCase({}, {})?\n",
+        ku_string(ENUM_GOLDEN_SOURCE),
+        ku_string(ENUM_GOLDEN)
     ));
     for source in accepted {
         body.push_str(&format!(
@@ -1229,6 +1496,16 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         "    AssertCase({}, {})?\n",
         ku_string(&accepted_mixed_type_depth),
         ku_string(&rust_canonical(&accepted_mixed_type_depth))
+    ));
+    body.push_str(&format!(
+        "    AssertCase({}, {})?\n",
+        ku_string(&accepted_enum_type_depth),
+        ku_string(&rust_canonical(&accepted_enum_type_depth))
+    ));
+    body.push_str(&format!(
+        "    AssertCase({}, {})?\n",
+        ku_string(&enum_union_boundary),
+        ku_string(&rust_canonical(&enum_union_boundary))
     ));
     body.push_str(&format!(
         "    comment_chunk = {}\n",
@@ -1390,6 +1667,55 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     let missing_struct_close_message = rust_error_canonical(missing_struct_close);
     let double_struct_field_comma_message = rust_error_canonical(double_struct_field_comma);
     let struct_semicolon_message = rust_error_canonical(struct_semicolon);
+    let missing_enum_name_message = rust_error_canonical(missing_enum_name);
+    assert_eq!(
+        missing_enum_name_message,
+        diagnostic_at(missing_enum_name, 0, "expected enum name"),
+        "the Rust parser currently relocates a missing enum name to the consumed enum token"
+    );
+    let missing_enum_open_message = rust_error_canonical(missing_enum_open);
+    let missing_enum_variant_name_message = rust_error_canonical(missing_enum_variant_name);
+    let missing_enum_field_name_message = rust_error_canonical(missing_enum_field_name);
+    let missing_enum_field_name_at_eof_message =
+        rust_error_canonical(missing_enum_field_name_at_eof);
+    assert_eq!(
+        missing_enum_field_name_at_eof_message,
+        diagnostic_for_kind(
+            missing_enum_field_name_at_eof,
+            TokenKind::LParen,
+            "expected enum variant field name"
+        ),
+        "the Rust parser currently relocates a missing enum field name to the consumed opening parenthesis"
+    );
+    let missing_enum_field_name_after_comma_at_eof_message =
+        rust_error_canonical(missing_enum_field_name_after_comma_at_eof);
+    assert_eq!(
+        missing_enum_field_name_after_comma_at_eof_message,
+        diagnostic_for_kind(
+            missing_enum_field_name_after_comma_at_eof,
+            TokenKind::Comma,
+            "expected enum variant field name"
+        ),
+        "the Rust parser currently relocates a missing enum field name to the consumed field comma"
+    );
+    let missing_enum_field_colon_message = rust_error_canonical(missing_enum_field_colon);
+    let missing_enum_field_type_message = rust_error_canonical(missing_enum_field_type);
+    let missing_enum_payload_comma_message = rust_error_canonical(missing_enum_payload_comma);
+    let trailing_enum_payload_comma_message = rust_error_canonical(trailing_enum_payload_comma);
+    let missing_enum_payload_close_message = rust_error_canonical(missing_enum_payload_close);
+    let missing_enum_close_message = rust_error_canonical(missing_enum_close);
+    let double_enum_variant_comma_message = rust_error_canonical(double_enum_variant_comma);
+    let enum_semicolon_message = rust_error_canonical(enum_semicolon);
+    let unsupported_enum_type_message = diagnostic_for_kind(
+        unsupported_enum_type,
+        TokenKind::Fn,
+        "stage-3 types do not support function or async function types",
+    );
+    let unsupported_async_enum_type_message = diagnostic_for_kind(
+        unsupported_async_enum_type,
+        TokenKind::Async,
+        "stage-3 types do not support function or async function types",
+    );
     let nested_module_message = diagnostic_for_kind(
         nested_module,
         TokenKind::Module,
@@ -1397,8 +1723,8 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     );
     let unsupported_item_message = diagnostic_for_kind(
         unsupported_item,
-        TokenKind::Enum,
-        "stage-3 supports import, module, struct, and ordinary function items only",
+        TokenKind::Async,
+        "stage-3 supports import, module, struct, enum, and ordinary function items only",
     );
     let unsupported_signature_type_message = diagnostic_at(
         unsupported_signature_type,
@@ -1433,6 +1759,11 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         5,
         "stage-3 type nesting exceeds 32 levels",
     );
+    let rejected_enum_type_depth_message = diagnostic_at(
+        &rejected_enum_type_depth,
+        7 + 32,
+        "stage-3 type nesting exceeds 32 levels",
+    );
     let parameter_limit_message = diagnostic_at(
         &over_parameter_limit,
         3 + 32 * 2,
@@ -1446,6 +1777,11 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     let array_union_limit_message = diagnostic_at(
         &over_array_union_limit,
         5 + 64 * 4,
+        "stage-3 union types accept at most 64 members",
+    );
+    let enum_union_limit_message = diagnostic_at(
+        &over_enum_union_limit,
+        7 + 64 * 2,
         "stage-3 union types accept at most 64 members",
     );
     let import_limit_message = diagnostic_at(
@@ -1493,6 +1829,11 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     );
     let struct_token_limit_message = diagnostic_at(
         &over_struct_token_limit,
+        0,
+        "stage-3 parser accepts at most 512 tokens",
+    );
+    let enum_token_limit_message = diagnostic_at(
+        &over_enum_token_limit,
         0,
         "stage-3 parser accepts at most 512 tokens",
     );
@@ -1713,9 +2054,85 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         ),
         (struct_semicolon, "expected_item", struct_semicolon_message),
         (
+            missing_enum_name,
+            "unexpected_token",
+            missing_enum_name_message,
+        ),
+        (
+            missing_enum_open,
+            "unexpected_token",
+            missing_enum_open_message,
+        ),
+        (
+            missing_enum_variant_name,
+            "unexpected_token",
+            missing_enum_variant_name_message,
+        ),
+        (
+            missing_enum_field_name,
+            "unexpected_token",
+            missing_enum_field_name_message,
+        ),
+        (
+            missing_enum_field_name_at_eof,
+            "unexpected_token",
+            missing_enum_field_name_at_eof_message,
+        ),
+        (
+            missing_enum_field_name_after_comma_at_eof,
+            "unexpected_token",
+            missing_enum_field_name_after_comma_at_eof_message,
+        ),
+        (
+            missing_enum_field_colon,
+            "unexpected_token",
+            missing_enum_field_colon_message,
+        ),
+        (
+            missing_enum_field_type,
+            "unexpected_token",
+            missing_enum_field_type_message,
+        ),
+        (
+            missing_enum_payload_comma,
+            "unexpected_token",
+            missing_enum_payload_comma_message,
+        ),
+        (
+            trailing_enum_payload_comma,
+            "unexpected_token",
+            trailing_enum_payload_comma_message,
+        ),
+        (
+            missing_enum_payload_close,
+            "unexpected_token",
+            missing_enum_payload_close_message,
+        ),
+        (
+            missing_enum_close,
+            "unexpected_token",
+            missing_enum_close_message,
+        ),
+        (
+            double_enum_variant_comma,
+            "unexpected_token",
+            double_enum_variant_comma_message,
+        ),
+        (enum_semicolon, "expected_item", enum_semicolon_message),
+        (
             unsupported_item,
             "unsupported_item",
             unsupported_item_message,
+        ),
+        (
+            unsupported_enum_type,
+            "unsupported_type",
+            unsupported_enum_type_message,
+        ),
+        (
+            unsupported_async_enum_type,
+            "unsupported_type",
+            unsupported_async_enum_type_message,
         ),
         (
             unsupported_signature_type,
@@ -1799,6 +2216,11 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
             "type_union_limit",
             array_union_limit_message,
         ),
+        (
+            &over_enum_union_limit,
+            "type_union_limit",
+            enum_union_limit_message,
+        ),
         (&over_import_limit, "import_limit", import_limit_message),
         (
             &over_import_name_limit,
@@ -1830,6 +2252,11 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         "    ExpectError({}, \"type_depth_exceeded\", {})?\n",
         ku_string(&rejected_mixed_type_depth),
         ku_string(&rejected_mixed_type_depth_message)
+    ));
+    body.push_str(&format!(
+        "    ExpectError({}, \"type_depth_exceeded\", {})?\n",
+        ku_string(&rejected_enum_type_depth),
+        ku_string(&rejected_enum_type_depth_message)
     ));
     body.push_str(&format!(
         "    ExpectError(budget_source, \"work_limit\", {})?\n",
@@ -1868,6 +2295,7 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         .expect("copy stage-2 parser dependency");
     }
     for name in [
+        "enums.ku",
         "imports.ku",
         "parser.ku",
         "signature.ku",
@@ -1950,6 +2378,56 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     let struct_field_boundary_arg = struct_field_boundary_entry.to_string_lossy().to_string();
     run_ku(&["check", &struct_field_boundary_arg]);
     run_ku(&["run", &struct_field_boundary_arg]);
+
+    // Empty enums consume the same four declaration tokens as empty structs.
+    // Keep the exact module token boundary in its own process so the broad
+    // differential gate retains watchdog margin while still proving that enum
+    // declarations do not acquire a hidden item-count limit.
+    let mut enum_boundary_body =
+        "import { ParseProgram } from \"./parser.ku\"\n\nfn main(): null! {\n".to_string();
+    enum_boundary_body.push_str(&format!(
+        "    parsed = ParseProgram({})?\n    if (parsed.root != 129 || parsed.arena.nodes.len() != 129 || parsed.arena.edges.len() != 128) {{ panic(\"stage-3 enum arena boundary mismatch\") }}\n",
+        ku_string(&enum_boundary)
+    ));
+    enum_boundary_body.push_str(&format!(
+        "    caught = false\n    try {{ ParseProgram({})? }} catch(err) {{\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != \"invalid_token_stream\" || err.message != {}) {{ panic(\"wrong stage-3 enum token-limit diagnostic\") }}\n    }}\n    if (!caught) {{ panic(\"expected stage-3 enum token-limit error\") }}\n    return ok(null)\n}}\n",
+        ku_string(&over_enum_token_limit),
+        ku_string(&format!(
+            "error|bootstrap.parser.stage3|invalid_token_stream|<source>|{enum_token_limit_message}"
+        ))
+    ));
+    let enum_boundary_entry = stage3.join("enum_boundary.ku");
+    fs::write(&enum_boundary_entry, enum_boundary_body)
+        .expect("write focused stage-3 enum boundary harness");
+    let enum_boundary_arg = enum_boundary_entry.to_string_lossy().to_string();
+    run_ku(&["check", &enum_boundary_arg]);
+    run_ku(&["run", &enum_boundary_arg]);
+
+    // Direct helper boundaries independently pin the absence of variant and
+    // payload-field limits. Both inputs fill all 512 tokens including EOF.
+    let mut enum_variant_boundary_body = "import { Scan } from \"../stage1/lexer.ku\"\nimport { ReadEnum } from \"./enums.ku\"\n\nfn main(): null! {\n".to_string();
+    enum_variant_boundary_body.push_str(&format!(
+        "    parsed = ReadEnum(Scan({})?)?\n    if (parsed.output.root != 508 || parsed.output.arena.nodes.len() != 508 || parsed.output.arena.edges.len() != 507 || parsed.consumed != 511) {{ panic(\"direct enum-variant token boundary mismatch\") }}\n    return ok(null)\n}}\n",
+        ku_string(&enum_variant_window_boundary)
+    ));
+    let enum_variant_boundary_entry = stage3.join("enum_variant_boundary.ku");
+    fs::write(&enum_variant_boundary_entry, enum_variant_boundary_body)
+        .expect("write focused direct enum-variant boundary harness");
+    let enum_variant_boundary_arg = enum_variant_boundary_entry.to_string_lossy().to_string();
+    run_ku(&["check", &enum_variant_boundary_arg]);
+    run_ku(&["run", &enum_variant_boundary_arg]);
+
+    let mut enum_field_boundary_body = "import { Scan } from \"../stage1/lexer.ku\"\nimport { ReadEnum } from \"./enums.ku\"\n\nfn main(): null! {\n".to_string();
+    enum_field_boundary_body.push_str(&format!(
+        "    parsed = ReadEnum(Scan({})?)?\n    if (parsed.output.root != 254 || parsed.output.arena.nodes.len() != 254 || parsed.output.arena.edges.len() != 253 || parsed.consumed != 511) {{ panic(\"direct enum-field token boundary mismatch\") }}\n    return ok(null)\n}}\n",
+        ku_string(&enum_field_window_boundary)
+    ));
+    let enum_field_boundary_entry = stage3.join("enum_field_boundary.ku");
+    fs::write(&enum_field_boundary_entry, enum_field_boundary_body)
+        .expect("write focused direct enum-field boundary harness");
+    let enum_field_boundary_arg = enum_field_boundary_entry.to_string_lossy().to_string();
+    run_ku(&["check", &enum_field_boundary_arg]);
+    run_ku(&["run", &enum_field_boundary_arg]);
 
     run_ku(&["build", "--native", &entry_arg]);
     let native_c = fs::read_to_string(entry.with_extension("c"))
