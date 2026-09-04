@@ -1,9 +1,9 @@
 import { ParseProgram } from "./parser.ku"
-import { ProgramCanonical } from "./ast.ku"
+import { AstCanonical } from "../stage2/ast.ku"
 
 fn main(): null! {
     source = "fn main() {\n    value:int = 40 + 2\n    println(value)\n    return\n}"
     output = ParseProgram(source)?
-    println(ProgramCanonical(output))
+    println(AstCanonical(output))
     return ok(null)
 }
