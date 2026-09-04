@@ -134,6 +134,12 @@ fn decimal(bytes: &[u8], what: &str) -> Result<u64, String> {
 }
 fn safe_name(name: &[u8]) -> Result<Vec<u8>, String> {
     let name = name.strip_suffix(b"/").unwrap_or(name);
+    if name.iter().any(u8::is_ascii_control) {
+        return Err(format!(
+            "archive member name is unsafe: {:?}",
+            String::from_utf8_lossy(name)
+        ));
+    }
     /* Rust staticlibs may retain source paths (notably ring's pregenerated
     assembly). Members are never extracted; retain only the basename. */
     let name = name
@@ -152,6 +158,27 @@ fn safe_name(name: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(name.to_vec())
+}
+
+fn trim_bsd_name_padding(name: &[u8]) -> Result<&[u8], String> {
+    /* BSD #1/<length> counts trailing NUL bytes that align the following
+    object. Strip only that suffix; safe_name still rejects embedded NULs and
+    every other control byte. */
+    let end = name
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |i| i + 1);
+    if name.len() - end > 7 {
+        return Err("BSD member name padding exceeds alignment maximum".into());
+    }
+    Ok(&name[..end])
+}
+
+fn is_bsd_symbol_table(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"__.SYMDEF" | b"__.SYMDEF SORTED" | b"__.SYMDEF_64" | b"__.SYMDEF_64 SORTED"
+    )
 }
 
 fn members(file: &mut File, file_len: u64) -> Result<Vec<Member>, String> {
@@ -192,7 +219,10 @@ fn members(file: &mut File, file_len: u64) -> Result<Vec<Member>, String> {
         let (name, payload_len) = if raw == b"//" {
             names = bounded_vec(file, data, size, MAX_NAME_TABLE, "GNU archive name table")?;
             (None, size)
-        } else if raw == b"/" || raw == b"/SYM64/" || raw.starts_with(b"__.SYMDEF") {
+        } else if raw == b"/"
+            || raw == b"/SYM64/"
+            || (member_count == 1 && is_bsd_symbol_table(trim_bsd_name_padding(&raw)?))
+        {
             (None, size)
         } else if let Some(rest) = raw.strip_prefix(b"#1/") {
             let n = decimal(rest, "BSD member name length")?;
@@ -201,7 +231,12 @@ fn members(file: &mut File, file_len: u64) -> Result<Vec<Member>, String> {
             }
             let v = bounded_vec(file, data, n, MAX_NAME, "BSD member name")?;
             data = add(data, n, "BSD payload")?;
-            (Some(safe_name(&v)?), size - n)
+            let name = trim_bsd_name_padding(&v)?;
+            if member_count == 1 && is_bsd_symbol_table(name) {
+                (None, size - n)
+            } else {
+                (Some(safe_name(name)?), size - n)
+            }
         } else if raw.starts_with(b"/") && raw.len() > 1 {
             let off = usize::try_from(decimal(&raw[1..], "GNU member name offset")?)
                 .map_err(|_| "name offset does not fit host")?;
@@ -823,6 +858,28 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn append_bsd_member(archive: &mut Vec<u8>, name: &[u8], data: &[u8]) {
+        let name_end = archive.len() + 60 + name.len();
+        let name_padding = (8 - name_end % 8) % 8;
+        let encoded_name_len = name.len() + name_padding;
+        let encoded = format!("#1/{encoded_name_len}");
+        assert!(encoded.len() <= 16);
+
+        let mut header_name = [b' '; 16];
+        header_name[..encoded.len()].copy_from_slice(encoded.as_bytes());
+        let payload_len = encoded_name_len + data.len();
+        archive.extend_from_slice(&header_name);
+        archive
+            .extend(format!("{:<12}{:<6}{:<6}{:<8}{:<10}`\n", 0, 0, 0, 0, payload_len).as_bytes());
+        archive.extend_from_slice(name);
+        archive.resize(archive.len() + name_padding, 0);
+        archive.extend_from_slice(data);
+        if payload_len % 2 != 0 {
+            archive.push(b'\n');
+        }
+    }
+
     fn ar(name: &str, data: &[u8]) -> Vec<u8> {
         let mut v = b"!<arch>\n".to_vec();
         let mut n = [b' '; 16];
@@ -1070,6 +1127,122 @@ mod tests {
             drop(file);
             std::fs::remove_file(path).ok();
         }
+    }
+
+    #[test]
+    fn validates_bsd_extended_names_with_alignment_padding() {
+        let id = b"fixture-build-id";
+        let mut extended = b"!<arch>\n".to_vec();
+        append_bsd_member(&mut extended, b"__.SYMDEF", &[]);
+        append_bsd_member(
+            &mut extended,
+            b"ku_native_tls.fixture.rcgu.o",
+            &macho_fixture(id),
+        );
+        let mut raw = ar("__.SYMDEF", &[]);
+        raw.extend_from_slice(&ar("ku_native_tls.fixture.rcgu.o", &macho_fixture(id))[8..]);
+
+        for bytes in [extended, raw] {
+            let (path, mut file) = temp(&bytes);
+            validate(
+                &mut file,
+                bytes.len() as u64,
+                NativeTlsArchiveFormat::MachOArm64,
+                id,
+            )
+            .unwrap();
+            drop(file);
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn rejects_bsd_symbol_table_names_after_the_first_member() {
+        let id = b"fixture-build-id";
+        for extended_name in [false, true] {
+            let mut bytes = b"!<arch>\n".to_vec();
+            append_bsd_member(
+                &mut bytes,
+                b"ku_native_tls.fixture.rcgu.o",
+                &macho_fixture(id),
+            );
+            if extended_name {
+                append_bsd_member(&mut bytes, b"__.SYMDEF", &[]);
+            } else {
+                bytes.extend_from_slice(&ar("__.SYMDEF", &[])[8..]);
+            }
+
+            let (path, mut file) = temp(&bytes);
+            let error = validate(
+                &mut file,
+                bytes.len() as u64,
+                NativeTlsArchiveFormat::MachOArm64,
+                id,
+            )
+            .unwrap_err();
+            assert!(error.contains("Mach-O header"), "{error}");
+            drop(file);
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn recognizes_only_exact_bsd_symbol_table_names_after_trailing_padding() {
+        for name in [
+            b"__.SYMDEF".as_slice(),
+            b"__.SYMDEF SORTED".as_slice(),
+            b"__.SYMDEF_64".as_slice(),
+            b"__.SYMDEF_64 SORTED".as_slice(),
+        ] {
+            let mut padded = name.to_vec();
+            padded.extend_from_slice(&[0, 0, 0]);
+            assert!(is_bsd_symbol_table(trim_bsd_name_padding(&padded).unwrap()));
+        }
+        for name in [
+            b"__.SYMDEF.evil".as_slice(),
+            b"prefix__.SYMDEF".as_slice(),
+            b"__.SYMDEF\0evil".as_slice(),
+        ] {
+            assert!(!is_bsd_symbol_table(trim_bsd_name_padding(name).unwrap()));
+        }
+        assert!(trim_bsd_name_padding(b"name\0\0\0\0\0\0\0\0").is_err());
+    }
+
+    #[test]
+    fn bsd_name_padding_does_not_hide_unsafe_or_fake_special_names() {
+        for name in [
+            b"ku_native\0_tls.rcgu.o".as_slice(),
+            b"ku_native_tls\n.rcgu.o".as_slice(),
+            b"..".as_slice(),
+        ] {
+            let mut bytes = b"!<arch>\n".to_vec();
+            append_bsd_member(&mut bytes, name, &[]);
+            let (path, mut file) = temp(&bytes);
+            let error = match members(&mut file, bytes.len() as u64) {
+                Ok(_) => panic!("unsafe BSD member name was accepted"),
+                Err(error) => error,
+            };
+            assert!(error.contains("member name is unsafe"), "{error}");
+            drop(file);
+            std::fs::remove_file(path).ok();
+        }
+
+        let mut bytes = b"!<arch>\n".to_vec();
+        append_bsd_member(&mut bytes, b"__.SYMDEF.evil", &[]);
+        let (path, mut file) = temp(&bytes);
+        let parsed = members(&mut file, bytes.len() as u64).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, b"__.SYMDEF.evil");
+        drop(file);
+        std::fs::remove_file(path).ok();
+
+        let bytes = ar("__.SYMDEF/", &[]);
+        let (path, mut file) = temp(&bytes);
+        let parsed = members(&mut file, bytes.len() as u64).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, b"__.SYMDEF");
+        drop(file);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
