@@ -10,7 +10,7 @@ import { ReadImport } from "./imports.ku"
 // parser. It accepts ordinary functions whose bodies contain explicitly typed
 // declarations, variable assignments, expression statements and return statements.
 // Parameters may be untyped; parameter, return and local-declaration types share
-// source-positioned TypeName, TypeArray and TypeResult arena nodes. Statement
+// source-positioned TypeName, TypeArray, TypeResult and TypeUnion arena nodes. Statement
 // boundaries follow the production token
 // grammar, including Ku's ordinary newline/whitespace-separated style; an
 // existing optional semicolon is also accepted. Unsupported production syntax
@@ -170,16 +170,32 @@ fn ParseProgram(source: str): ParseOutput! {
     }
 
     fn AddParsedType(parsed: SignatureType, error_token: Token): int! {
-        root = 0
-        for part in parsed.parts {
-            has_child = root > 0
-            CheckTypeArenaCapacity(arena.nodes.len(), arena.edges.len(), has_child, error_token.clone())?
+        node_base = arena.nodes.len()
+        part_index = 0
+        while (part_index < parsed.parts.len()) {
+            part = parsed.parts[part_index].clone()
+            CheckTypeArenaCapacity(arena.nodes.len(), arena.edges.len(), part.edge_count, error_token.clone())?
             first_edge = arena.edges.len()
-            if (has_child) { arena.edges = arena.edges.push(root) }
-            arena.nodes = arena.nodes.push(TypePartToNode(part, first_edge, has_child))
-            root = arena.nodes.len()
+            edge_index = 0
+            while (edge_index < part.edge_count) {
+                plan_edge = part.first_edge + edge_index
+                if (plan_edge < 0 || plan_edge >= parsed.edges.len()) {
+                    RejectAt(error_token.clone(), "invalid_node_id", "type plan edge lies outside its arena")?
+                }
+                child = parsed.edges[plan_edge]
+                if (child <= 0 || child > part_index) {
+                    RejectAt(error_token.clone(), "invalid_node_id", "type plan edge must reference an earlier NodeId")?
+                }
+                arena.edges = arena.edges.push(node_base + child)
+                edge_index = edge_index + 1
+            }
+            arena.nodes = arena.nodes.push(TypePartToNode(part, first_edge))
+            part_index = part_index + 1
         }
-        return ok(root)
+        if (parsed.root <= 0 || parsed.root > parsed.parts.len()) {
+            RejectAt(error_token, "invalid_node_id", "type plan root is invalid")?
+        }
+        return ok(node_base + parsed.root)
     }
 
     fn ExpressionEnd(start: int): int! {
