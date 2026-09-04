@@ -205,6 +205,27 @@ fn project_type(
             *cursor += 1;
             push_node(arena, "TypeResult", String::new(), 0, span, &[child])
         }
+        TypeName::Union(types) => {
+            assert!(
+                types.len() > 1,
+                "Rust union oracle must have at least two arms"
+            );
+            let mut children = Vec::with_capacity(types.len());
+            for (index, ty) in types.iter().enumerate() {
+                children.push(project_type(tokens, cursor, ty, arena));
+                if index + 1 < types.len() {
+                    assert!(matches!(tokens[*cursor].kind, TokenKind::Pipe));
+                    *cursor += 1;
+                }
+            }
+            let span = Span::new(
+                arena.nodes[children[0] - 1].span.start,
+                arena.nodes[*children.last().expect("union child") - 1]
+                    .span
+                    .end,
+            );
+            push_node(arena, "TypeUnion", String::new(), 0, span, &children)
+        }
         TypeName::Int
         | TypeName::Float
         | TypeName::Bool
@@ -576,6 +597,10 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "fn add(left: int, right: int): int { return left + right }\nfn echo(value): str { return \"ok\" }",
         "// 签名😀\r\nfn load(path: str, cached: bool, prior: int!): str! {\r\n  return path\r\n}",
         "fn typed(values: [pkg.model.User!]!): [[int]!]! { local:[pkg.Item!] = [] return values }",
+        "fn choose(value: int | str): int | str { local:int | str = value return local }",
+        "fn nested(value: [int | str], other: [int] | str!): [int | str]! { local:[int] | str! = other return value }",
+        "fn duplicate(value: int | int | null): int | int | null { return value }",
+        "// 前😀\r\nfn dotted(value: pkg.model.User | other.Type!): [pkg.model.User | other.Type!]! {\r\n  local:pkg.model.User | other.Type! = value\r\n  return local\r\n}",
         "fn helper() { return 7 }\nfn main() {\n  answer:int = 40 + 2\n  answer = answer + 1\n  println(answer)\n  return\n}",
         "fn main(){\n  a:float = 1.250\n  b:bool = true\n  c:str = \"中😀\"\n  d:null = null\n  return c\n}",
         "// 前置😀\nfn main() {\n  // gap 中\n  text:str = \"中😀\"\n  text = text + \"!\"\n  println(text)\n}",
@@ -605,10 +630,14 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let legacy_type_alias = "fn f(value: string) {}";
     let unicode_broken_signature = "// 前😀\r\nfn f(value: str, : int): null! {}";
     let unsupported_signature_type = "fn f(op: fn(int): int) {}";
-    let unsupported_union_type = "fn f(value: int | str) {}";
-    let unsupported_return_union = "fn f(): int | str {}";
-    let unsupported_local_union = "fn f() { value:int | str = 1 }";
-    let unsupported_nested_union = "fn f(value: [int | str]) {}";
+    let leading_union_pipe = "fn f(value: | int) {}";
+    let trailing_union_pipe = "fn f(value: int |) {}";
+    let nested_trailing_union_pipe = "fn f(value: [int |]) {}";
+    let return_trailing_union_pipe = "fn f(): int | {}";
+    let trailing_union_at_eof = "fn f(value: int |";
+    let nested_trailing_union_at_eof = "fn f(value: [int |";
+    let double_pipe_union = "fn f(value: int || str) {}";
+    let repeated_result_union = "fn f(value: T!! | U) {}";
     let primitive_dotted_parameter = "fn f(value: int.foo) {}";
     let primitive_dotted_return = "fn f(): str.X {}";
     let primitive_dotted_local = "fn f() { value:null.Y = null }";
@@ -617,6 +646,10 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let repeated_result = "fn f(value: int!!) {}";
     let accepted_type_depth = format!("fn f(value: {}int{}) {{}}", "[".repeat(32), "]".repeat(32));
     let rejected_type_depth = format!("fn f(value: {}int{}) {{}}", "[".repeat(33), "]".repeat(33));
+    let accepted_mixed_type_depth =
+        format!("fn f(value: {}int!{}) {{}}", "[".repeat(31), "]".repeat(31));
+    let rejected_mixed_type_depth =
+        format!("fn f(value: {}int!{}) {{}}", "[".repeat(32), "]".repeat(32));
     let empty_named_import = "import {} from \"./math.ku\"";
     let trailing_import_comma = "import { Add, } from \"./math.ku\"";
     let missing_import_alias = "import { Add as } from \"./math.ku\"";
@@ -648,6 +681,34 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             .map(|index| format!("p{index}"))
             .collect::<Vec<_>>()
             .join(", ")
+    );
+    let union_boundary = format!(
+        "fn choose(value: {}) {{}}",
+        (0..64)
+            .map(|index| format!("T{index}"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    let over_union_limit = format!(
+        "fn choose(value: {}) {{}}",
+        (0..65)
+            .map(|index| format!("T{index}"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    let array_union_boundary = format!(
+        "fn choose(value: {}) {{}}",
+        (0..64)
+            .map(|index| format!("[T{index}]"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    let over_array_union_limit = format!(
+        "fn choose(value: {}) {{}}",
+        (0..65)
+            .map(|index| format!("[T{index}]"))
+            .collect::<Vec<_>>()
+            .join(" | ")
     );
     let import_boundary = "import \"m\"\n".repeat(64);
     let over_import_limit = "import \"m\"\n".repeat(65);
@@ -728,14 +789,19 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         slice_budget_token_index,
         "stage-3 expression slicing budget exceeded",
     );
+    let over_type_window_source = "T ".repeat(512);
 
-    let mut body = "import { ParseProgram } from \"./parser.ku\"\nimport { ProgramCanonical } from \"./ast.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\nimport { ProgramCanonical } from \"./ast.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = ProgramCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
     body.push_str(
-        "fn ExpectError(source: str, expected_code: str, expected_message: str): null! {\n    caught = false\n    try { ParseProgram(source.clone())? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong stage-3 diagnostic for \" + source + \": \" + err.domain + \"/\" + err.code + \"/\" + err.message + \" EXPECTED \" + expected_code + \"/\" + expected_message) }\n    }\n    if (!caught) { panic(\"expected stage-3 parser error\") }\n    return ok(null)\n}\n\nfn main(): null! {\n",
+        "fn ExpectError(source: str, expected_code: str, expected_message: str): null! {\n    caught = false\n    try { ParseProgram(source.clone())? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong stage-3 diagnostic for \" + source + \": \" + err.domain + \"/\" + err.code + \"/\" + err.message + \" EXPECTED \" + expected_code + \"/\" + expected_message) }\n    }\n    if (!caught) { panic(\"expected stage-3 parser error\") }\n    return ok(null)\n}\n\nfn ExpectTypeWindowError(tokens: [Token], expected_message: str): null! {\n    caught = false\n    try { ParseTypeWindow(tokens)? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != \"invalid_token_stream\" || err.message != expected_message) { panic(\"wrong type-window diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected type-window error\") }\n    return ok(null)\n}\n\nfn main(): null! {\n",
     );
+    body.push_str(&format!(
+        "    direct_tokens = Scan(\"int\")?\n    direct = ParseTypeWindow(direct_tokens.clone())?\n    if (direct.work != 4) {{ panic(\"type-window validation work was not counted\") }}\n    empty_window: [Token] = []\n    ExpectTypeWindowError(empty_window, \"type window must contain one final non-type boundary token\")?\n    missing_boundary: [Token] = [direct_tokens[0].clone()]\n    ExpectTypeWindowError(missing_boundary, \"type window is missing its final non-type boundary|1:1@0..1:4@3\")?\n    early_boundary = direct_tokens.push(direct_tokens[direct_tokens.len() - 1].clone())\n    ExpectTypeWindowError(early_boundary, \"type window boundary must be final|1:4@3..1:4@3\")?\n    too_many_type_tokens = Scan({})?\n    ExpectTypeWindowError(too_many_type_tokens, \"type window accepts at most 512 tokens|1:1@0..1:2@1\")?\n",
+        ku_string(&over_type_window_source)
+    ));
     for source in accepted {
         body.push_str(&format!(
             "    AssertCase({}, {})?\n",
@@ -747,6 +813,11 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "    AssertCase({}, {})?\n",
         ku_string(&accepted_type_depth),
         ku_string(&rust_canonical(&accepted_type_depth))
+    ));
+    body.push_str(&format!(
+        "    AssertCase({}, {})?\n",
+        ku_string(&accepted_mixed_type_depth),
+        ku_string(&rust_canonical(&accepted_mixed_type_depth))
     ));
     body.push_str(&format!(
         "    comment_chunk = {}\n",
@@ -765,6 +836,16 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "    AssertCase({}, {})?\n",
         ku_string(&parameter_boundary),
         ku_string(&rust_canonical(&parameter_boundary))
+    ));
+    body.push_str(&format!(
+        "    AssertCase({}, {})?\n",
+        ku_string(&union_boundary),
+        ku_string(&rust_canonical(&union_boundary))
+    ));
+    body.push_str(&format!(
+        "    AssertCase({}, {})?\n",
+        ku_string(&array_union_boundary),
+        ku_string(&rust_canonical(&array_union_boundary))
     ));
     for source in [
         &import_boundary,
@@ -864,20 +945,16 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let unsupported_signature_type_message = diagnostic_at(
         unsupported_signature_type,
         5,
-        "stage-3 types do not support function, async, or union types",
+        "stage-3 types do not support function or async function types",
     );
-    let unsupported_union_type_message = diagnostic_for_kind(
-        unsupported_union_type,
-        TokenKind::Pipe,
-        "stage-3 types do not support function, async, or union types",
-    );
-    let union_message = |source| {
-        diagnostic_for_kind(
-            source,
-            TokenKind::Pipe,
-            "stage-3 types do not support function, async, or union types",
-        )
-    };
+    let leading_union_pipe_message = rust_error_canonical(leading_union_pipe);
+    let trailing_union_pipe_message = rust_error_canonical(trailing_union_pipe);
+    let nested_trailing_union_pipe_message = rust_error_canonical(nested_trailing_union_pipe);
+    let return_trailing_union_pipe_message = rust_error_canonical(return_trailing_union_pipe);
+    let trailing_union_at_eof_message = rust_error_canonical(trailing_union_at_eof);
+    let nested_trailing_union_at_eof_message = rust_error_canonical(nested_trailing_union_at_eof);
+    let double_pipe_union_message = rust_error_canonical(double_pipe_union);
+    let repeated_result_union_message = rust_error_canonical(repeated_result_union);
     let dotted_message = |source| {
         diagnostic_for_kind(
             source,
@@ -893,10 +970,25 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         5 + 32,
         "stage-3 type nesting exceeds 32 levels",
     );
+    let rejected_mixed_type_depth_message = diagnostic_at(
+        &rejected_mixed_type_depth,
+        5,
+        "stage-3 type nesting exceeds 32 levels",
+    );
     let parameter_limit_message = diagnostic_at(
         &over_parameter_limit,
         3 + 32 * 2,
         "stage-3 functions accept at most 32 parameters",
+    );
+    let union_limit_message = diagnostic_at(
+        &over_union_limit,
+        5 + 64 * 2,
+        "stage-3 union types accept at most 64 members",
+    );
+    let array_union_limit_message = diagnostic_at(
+        &over_array_union_limit,
+        5 + 64 * 4,
+        "stage-3 union types accept at most 64 members",
     );
     let import_limit_message = diagnostic_at(
         &over_import_limit,
@@ -1090,24 +1182,44 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             unsupported_signature_type_message,
         ),
         (
-            unsupported_union_type,
-            "unsupported_type",
-            unsupported_union_type_message,
+            leading_union_pipe,
+            "unexpected_token",
+            leading_union_pipe_message,
         ),
         (
-            unsupported_return_union,
-            "unsupported_type",
-            union_message(unsupported_return_union),
+            trailing_union_pipe,
+            "unexpected_token",
+            trailing_union_pipe_message,
         ),
         (
-            unsupported_local_union,
-            "unsupported_type",
-            union_message(unsupported_local_union),
+            nested_trailing_union_pipe,
+            "unexpected_token",
+            nested_trailing_union_pipe_message,
         ),
         (
-            unsupported_nested_union,
-            "unsupported_type",
-            union_message(unsupported_nested_union),
+            return_trailing_union_pipe,
+            "unexpected_token",
+            return_trailing_union_pipe_message,
+        ),
+        (
+            trailing_union_at_eof,
+            "unexpected_token",
+            trailing_union_at_eof_message,
+        ),
+        (
+            nested_trailing_union_at_eof,
+            "unexpected_token",
+            nested_trailing_union_at_eof_message,
+        ),
+        (
+            double_pipe_union,
+            "unexpected_token",
+            double_pipe_union_message,
+        ),
+        (
+            repeated_result_union,
+            "unexpected_token",
+            repeated_result_union_message,
         ),
         (
             primitive_dotted_parameter,
@@ -1140,6 +1252,12 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             "parameter_limit",
             parameter_limit_message,
         ),
+        (&over_union_limit, "type_union_limit", union_limit_message),
+        (
+            &over_array_union_limit,
+            "type_union_limit",
+            array_union_limit_message,
+        ),
         (&over_import_limit, "import_limit", import_limit_message),
         (
             &over_import_name_limit,
@@ -1166,6 +1284,11 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "    ExpectError({}, \"type_depth_exceeded\", {})?\n",
         ku_string(&rejected_type_depth),
         ku_string(&rejected_type_depth_message)
+    ));
+    body.push_str(&format!(
+        "    ExpectError({}, \"type_depth_exceeded\", {})?\n",
+        ku_string(&rejected_mixed_type_depth),
+        ku_string(&rejected_mixed_type_depth_message)
     ));
     body.push_str(&format!(
         "    ExpectError(budget_source, \"work_limit\", {})?\n",

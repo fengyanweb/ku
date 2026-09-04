@@ -3,14 +3,22 @@ import { Span } from "../stage2/span.ku"
 import { Node } from "../stage2/ast.ku"
 import { RejectAt } from "./support.ku"
 
+// Type parts form a bounded, append-only post-order plan. Child NodeIds refer
+// to earlier parts through the separate edge table, matching the final AST
+// arena without introducing recursive values or a second type representation.
 struct TypePart {
     kind: str
     text: str
     span: Span
+    first_edge: int
+    edge_count: int
+    depth: int
 }
 
 struct SignatureType {
     parts: [TypePart]
+    edges: [int]
+    root: int
     consumed: int
     work: int
 }
@@ -18,6 +26,18 @@ struct SignatureType {
 struct TypeWindow {
     tokens: [Token]
     complete: bool
+}
+
+struct TypeValueEntry {
+    node: int
+    previous: int
+}
+
+struct TypeFrame {
+    opener: Token
+    previous: int
+    value_base: int
+    outer_member_count: int
 }
 
 fn EmptyTypeWindow(): TypeWindow {
@@ -36,96 +56,276 @@ fn PushTypeWindow(window: TypeWindow, token: Token): TypeWindow! {
 }
 
 fn TypeNamePart(text: str, start: Token, end: Token): TypePart {
-    return TypePart { kind: "TypeName", text: text, span: Span { line: start.line, column: start.column, offset: start.offset, end_line: end.end_line, end_column: end.end_column, end_offset: end.end_offset } }
+    return TypePart {
+        kind: "TypeName",
+        text: text,
+        span: Span { line: start.line, column: start.column, offset: start.offset, end_line: end.end_line, end_column: end.end_column, end_offset: end.end_offset },
+        first_edge: 0,
+        edge_count: 0,
+        depth: 0
+    }
 }
 
-fn TypeArrayPart(start: Token, end: Token): TypePart {
-    return TypePart { kind: "TypeArray", text: "", span: Span { line: start.line, column: start.column, offset: start.offset, end_line: end.end_line, end_column: end.end_column, end_offset: end.end_offset } }
+fn TypeArrayPart(start: Token, end: Token, first_edge: int, depth: int): TypePart {
+    return TypePart {
+        kind: "TypeArray",
+        text: "",
+        span: Span { line: start.line, column: start.column, offset: start.offset, end_line: end.end_line, end_column: end.end_column, end_offset: end.end_offset },
+        first_edge: first_edge,
+        edge_count: 1,
+        depth: depth
+    }
 }
 
-fn TypeResultPart(inner: Span, bang: Token): TypePart {
-    return TypePart { kind: "TypeResult", text: "", span: Span { line: inner.line, column: inner.column, offset: inner.offset, end_line: bang.end_line, end_column: bang.end_column, end_offset: bang.end_offset } }
+fn TypeResultPart(inner: Span, bang: Token, first_edge: int, depth: int): TypePart {
+    return TypePart {
+        kind: "TypeResult",
+        text: "",
+        span: Span { line: inner.line, column: inner.column, offset: inner.offset, end_line: bang.end_line, end_column: bang.end_column, end_offset: bang.end_offset },
+        first_edge: first_edge,
+        edge_count: 1,
+        depth: depth
+    }
 }
 
-fn CheckTypeArenaCapacity(node_count: int, edge_count: int, has_child: bool, error_token: Token): null! {
+fn TypeUnionPart(first: Span, last: Span, first_edge: int, edge_count: int, depth: int): TypePart {
+    return TypePart {
+        kind: "TypeUnion",
+        text: "",
+        span: Span { line: first.line, column: first.column, offset: first.offset, end_line: last.end_line, end_column: last.end_column, end_offset: last.end_offset },
+        first_edge: first_edge,
+        edge_count: edge_count,
+        depth: depth
+    }
+}
+
+fn CheckTypeArenaCapacity(node_count: int, edge_count: int, additional_edges: int, error_token: Token): null! {
     if (node_count >= 4096) { RejectAt(error_token.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")? }
-    if (has_child && edge_count >= 8192) { RejectAt(error_token, "edge_limit", "stage-3 parser accepts at most 8192 AST edges")? }
+    if (additional_edges < 0 || edge_count < 0 || edge_count > 8192 || additional_edges > 8192 - edge_count) {
+        RejectAt(error_token, "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
+    }
     return ok(null)
 }
 
-fn TypePartToNode(part: TypePart, first_edge: int, has_child: bool): Node {
-    edge_count = 0
-    if (has_child) { edge_count = 1 }
-    return Node { kind: part.kind, text: part.text, int_value: 0, line: part.span.line, column: part.span.column, offset: part.span.offset, end_line: part.span.end_line, end_column: part.span.end_column, end_offset: part.span.end_offset, first_edge: first_edge, edge_count: edge_count }
+fn TypePartToNode(part: TypePart, first_edge: int): Node {
+    return Node {
+        kind: part.kind,
+        text: part.text,
+        int_value: 0,
+        line: part.span.line,
+        column: part.span.column,
+        offset: part.span.offset,
+        end_line: part.span.end_line,
+        end_column: part.span.end_column,
+        end_offset: part.span.end_offset,
+        first_edge: first_edge,
+        edge_count: part.edge_count
+    }
 }
 
-fn CheckTypeDepth(count: int, token: Token): null! {
-    if (count > 32) { RejectAt(token, "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
+fn CheckTypeDepth(depth: int, token: Token): null! {
+    if (depth > 32) { RejectAt(token, "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
+    return ok(null)
+}
+
+fn CheckUnionWidth(count: int, token: Token): null! {
+    if (count > 64) { RejectAt(token, "type_union_limit", "stage-3 union types accept at most 64 members")? }
     return ok(null)
 }
 
 fn ParseTypeWindow(tokens: [Token]): SignatureType! {
-    cursor = 0
+    if (tokens.len() == 0) {
+        fail {
+            domain: "bootstrap.parser.stage3",
+            code: "invalid_token_stream",
+            message: "type window must contain one final non-type boundary token"
+        }
+    }
+    if (tokens.len() > 512) {
+        RejectAt(tokens[0].clone(), "invalid_token_stream", "type window accepts at most 512 tokens")?
+    }
     work = 0
-    wrappers = 0
-    openers: [Token] = []
-    while (tokens[cursor].kind == "LBracket") {
-        if (openers.len() >= 32) { RejectAt(tokens[cursor].clone(), "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
-        openers = openers.push(tokens[cursor].clone())
-        cursor = cursor + 1
+    validation_index = 0
+    while (validation_index < tokens.len()) {
+        validation_token = tokens[validation_index].clone()
+        final_token = validation_index == tokens.len() - 1
+        if (final_token && TypeWindowContinues(validation_token.kind.clone())) {
+            RejectAt(validation_token.clone(), "invalid_token_stream", "type window is missing its final non-type boundary")?
+        }
+        if (!final_token && !TypeWindowContinues(validation_token.kind.clone())) {
+            RejectAt(validation_token.clone(), "invalid_token_stream", "type window boundary must be final")?
+        }
+        validation_index = validation_index + 1
         work = work + 1
     }
-    atom = tokens[cursor].clone()
-    name = ""
-    end = atom.clone()
-    custom = false
-    if (atom.kind == "Ident" && (atom.lexeme == "int" || atom.lexeme == "float" || atom.lexeme == "bool" || atom.lexeme == "str")) { name = atom.lexeme.clone() }
-    else if (atom.kind == "Null") { name = "null" }
-    else if (atom.kind == "Ident" && (atom.lexeme == "string" || atom.lexeme == "nil")) { RejectAt(atom.clone(), "unexpected_token", "expected type name")? }
-    else if (atom.kind == "Ident") { name = atom.lexeme.clone(); custom = true }
-    else if (atom.kind == "Fn" || atom.kind == "Async") { RejectAt(atom.clone(), "unsupported_type", "stage-3 types do not support function, async, or union types")? }
-    else { RejectAt(atom.clone(), "unexpected_token", "expected type name")? }
-    cursor = cursor + 1
-    work = work + 1
-    if (!custom && tokens[cursor].kind == "Dot") { RejectAt(tokens[cursor].clone(), "unsupported_type", "dotted type names must start with a custom identifier")? }
-    while (custom && tokens[cursor].kind == "Dot") {
-        cursor = cursor + 1
-        work = work + 1
-        part = tokens[cursor].clone()
-        if (part.kind != "Ident") { RejectAt(part.clone(), "unexpected_token", "expected type name after '.'")? }
-        name = name + "." + part.lexeme.clone()
-        end = part
-        cursor = cursor + 1
-        work = work + 1
-    }
-    parts: [TypePart] = [TypeNamePart(name, atom, end)]
-    if (tokens[cursor].kind == "Bang") {
-        bang = tokens[cursor].clone()
-        wrappers = wrappers + 1
-        parts = parts.push(TypeResultPart(parts[parts.len() - 1].span.clone(), bang))
-        cursor = cursor + 1
-        work = work + 1
-    }
-    if (tokens[cursor].kind == "Pipe") { RejectAt(tokens[cursor].clone(), "unsupported_type", "stage-3 types do not support function, async, or union types")? }
-    opener_index = openers.len()
-    while (opener_index > 0) {
-        opener_index = opener_index - 1
-        if (tokens[cursor].kind != "RBracket") { RejectAt(tokens[cursor].clone(), "unexpected_token", "expected ']' after array type")? }
-        close = tokens[cursor].clone()
-        wrappers = wrappers + 1
-        CheckTypeDepth(wrappers, openers[opener_index].clone())?
-        parts = parts.push(TypeArrayPart(openers[opener_index].clone(), close))
-        cursor = cursor + 1
-        work = work + 1
-        if (tokens[cursor].kind == "Bang") {
-            bang = tokens[cursor].clone()
-            wrappers = wrappers + 1
-            CheckTypeDepth(wrappers, bang.clone())?
-            parts = parts.push(TypeResultPart(parts[parts.len() - 1].span.clone(), bang))
+
+    cursor = 0
+    parts: [TypePart] = []
+    edges: [int] = []
+    values: [TypeValueEntry] = []
+    frames: [TypeFrame] = []
+    value_top = 0
+    frame_top = 0
+    array_depth = 0
+    member_count = 0
+    expect_atom = true
+    root = 0
+    parsing = true
+
+    while (parsing) {
+        token = tokens[cursor].clone()
+        if (expect_atom) {
+            if (token.kind == "LBracket") {
+                if (array_depth >= 32) { RejectAt(token.clone(), "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
+                frames = frames.push(TypeFrame {
+                    opener: token,
+                    previous: frame_top,
+                    value_base: value_top,
+                    outer_member_count: member_count
+                })
+                frame_top = frames.len()
+                array_depth = array_depth + 1
+                member_count = 0
+                cursor = cursor + 1
+                work = work + 1
+            } else {
+                atom = token.clone()
+                name = ""
+                end = atom.clone()
+                custom = false
+                if (atom.kind == "Ident" && (atom.lexeme == "int" || atom.lexeme == "float" || atom.lexeme == "bool" || atom.lexeme == "str")) { name = atom.lexeme.clone() }
+                else if (atom.kind == "Null") { name = "null" }
+                else if (atom.kind == "Ident" && (atom.lexeme == "string" || atom.lexeme == "nil")) { RejectAt(atom.clone(), "unexpected_token", "expected type name")? }
+                else if (atom.kind == "Ident") { name = atom.lexeme.clone(); custom = true }
+                else if (atom.kind == "Fn" || atom.kind == "Async") { RejectAt(atom.clone(), "unsupported_type", "stage-3 types do not support function or async function types")? }
+                else { RejectAt(atom.clone(), "unexpected_token", "expected type name")? }
+                cursor = cursor + 1
+                work = work + 1
+                if (!custom && tokens[cursor].kind == "Dot") { RejectAt(tokens[cursor].clone(), "unsupported_type", "dotted type names must start with a custom identifier")? }
+                while (custom && tokens[cursor].kind == "Dot") {
+                    cursor = cursor + 1
+                    work = work + 1
+                    part = tokens[cursor].clone()
+                    if (part.kind != "Ident") { RejectAt(part.clone(), "unexpected_token", "expected type name after '.'")? }
+                    name = name + "." + part.lexeme.clone()
+                    end = part
+                    cursor = cursor + 1
+                    work = work + 1
+                }
+
+                CheckTypeArenaCapacity(parts.len(), edges.len(), 0, atom.clone())?
+                parts = parts.push(TypeNamePart(name, atom.clone(), end))
+                member_root = parts.len()
+                if (tokens[cursor].kind == "Bang") {
+                    bang = tokens[cursor].clone()
+                    result_depth = parts[member_root - 1].depth + 1
+                    CheckTypeDepth(result_depth, bang.clone())?
+                    CheckTypeArenaCapacity(parts.len(), edges.len(), 1, bang.clone())?
+                    first_edge = edges.len()
+                    edges = edges.push(member_root)
+                    inner_span = parts[member_root - 1].span.clone()
+                    parts = parts.push(TypeResultPart(inner_span, bang, first_edge, result_depth))
+                    member_root = parts.len()
+                    cursor = cursor + 1
+                    work = work + 1
+                }
+                values = values.push(TypeValueEntry { node: member_root, previous: value_top })
+                value_top = values.len()
+                member_count = member_count + 1
+                CheckUnionWidth(member_count, atom)?
+                expect_atom = false
+            }
+        } else if (token.kind == "Pipe") {
             cursor = cursor + 1
             work = work + 1
+            expect_atom = true
+        } else {
+            value_base = 0
+            closing_array = frame_top > 0
+            frame = TypeFrame { opener: token.clone(), previous: 0, value_base: 0, outer_member_count: 0 }
+            if (closing_array) {
+                frame = frames[frame_top - 1].clone()
+                value_base = frame.value_base
+                if (token.kind != "RBracket") { RejectAt(token.clone(), "unexpected_token", "expected ']' after array type")? }
+            }
+
+            reversed: [int] = []
+            walk = value_top
+            remaining = member_count
+            while (remaining > 0) {
+                if (walk == 0 || walk == value_base) { RejectAt(token.clone(), "invalid_node_id", "type value stack lost its level boundary")? }
+                entry = values[walk - 1].clone()
+                if (entry.node <= 0 || entry.node > parts.len()) { RejectAt(token.clone(), "invalid_node_id", "type value stack contains an invalid NodeId")? }
+                reversed = reversed.push(entry.node)
+                walk = entry.previous
+                remaining = remaining - 1
+                work = work + 1
+            }
+            if (walk != value_base || reversed.len() == 0) { RejectAt(token.clone(), "invalid_node_id", "type value stack does not match its level")? }
+
+            level_root = reversed[0]
+            if (reversed.len() > 1) {
+                CheckTypeArenaCapacity(parts.len(), edges.len(), reversed.len(), token.clone())?
+                union_first_edge = edges.len()
+                reverse_index = reversed.len()
+                union_depth = 0
+                first_child = 0
+                last_child = 0
+                while (reverse_index > 0) {
+                    reverse_index = reverse_index - 1
+                    child = reversed[reverse_index]
+                    if (first_child == 0) { first_child = child }
+                    last_child = child
+                    child_depth = parts[child - 1].depth
+                    if (child_depth > union_depth) { union_depth = child_depth }
+                    edges = edges.push(child)
+                    work = work + 1
+                }
+                first_span = parts[first_child - 1].span.clone()
+                last_span = parts[last_child - 1].span.clone()
+                parts = parts.push(TypeUnionPart(first_span, last_span, union_first_edge, reversed.len(), union_depth))
+                level_root = parts.len()
+            }
+
+            if (!closing_array) {
+                root = level_root
+                parsing = false
+            } else {
+                value_top = value_base
+                frame_top = frame.previous
+                array_depth = array_depth - 1
+                member_count = frame.outer_member_count
+                array_node_depth = parts[level_root - 1].depth + 1
+                CheckTypeDepth(array_node_depth, frame.opener.clone())?
+                CheckTypeArenaCapacity(parts.len(), edges.len(), 1, frame.opener.clone())?
+                first_edge = edges.len()
+                edges = edges.push(level_root)
+                parts = parts.push(TypeArrayPart(frame.opener.clone(), token, first_edge, array_node_depth))
+                member_root = parts.len()
+                cursor = cursor + 1
+                work = work + 1
+                if (tokens[cursor].kind == "Bang") {
+                    bang = tokens[cursor].clone()
+                    result_depth = parts[member_root - 1].depth + 1
+                    CheckTypeDepth(result_depth, bang.clone())?
+                    CheckTypeArenaCapacity(parts.len(), edges.len(), 1, bang.clone())?
+                    first_edge = edges.len()
+                    edges = edges.push(member_root)
+                    inner_span = parts[member_root - 1].span.clone()
+                    parts = parts.push(TypeResultPart(inner_span, bang, first_edge, result_depth))
+                    member_root = parts.len()
+                    cursor = cursor + 1
+                    work = work + 1
+                }
+                values = values.push(TypeValueEntry { node: member_root, previous: value_top })
+                value_top = values.len()
+                member_count = member_count + 1
+                CheckUnionWidth(member_count, frame.opener)?
+                expect_atom = false
+            }
         }
-        if (tokens[cursor].kind == "Pipe") { RejectAt(tokens[cursor].clone(), "unsupported_type", "stage-3 types do not support function, async, or union types")? }
     }
-    return ok(SignatureType { parts: parts, consumed: cursor, work: work })
+
+    if (root <= 0 || root > parts.len()) { RejectAt(tokens[cursor].clone(), "invalid_node_id", "type plan root is invalid")? }
+    return ok(SignatureType { parts: parts, edges: edges, root: root, consumed: cursor, work: work })
 }
