@@ -5825,11 +5825,10 @@ fn read_elf_dynamic_metadata(
                 file_offset,
                 file_size,
             }),
-            PT_DYNAMIC => {
-                if dynamic.replace((file_offset, file_size)).is_some() {
-                    return Err("ELF executable has multiple PT_DYNAMIC segments".to_string());
-                }
+            PT_DYNAMIC if dynamic.replace((file_offset, file_size)).is_some() => {
+                return Err("ELF executable has multiple PT_DYNAMIC segments".to_string());
             }
+            PT_DYNAMIC => {}
             _ => {}
         }
     }
@@ -7807,7 +7806,7 @@ fn windows_system_cmd_path() -> Result<PathBuf, KuError> {
 }
 
 fn decode_utf16le(bytes: &[u8], what: &str) -> Result<String, KuError> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(KuError::message(format!(
             "{what} returned truncated UTF-16LE output"
         )));

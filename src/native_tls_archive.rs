@@ -879,7 +879,7 @@ mod tests {
         archive.extend_from_slice(name);
         archive.resize(archive.len() + name_padding, 0);
         archive.extend_from_slice(data);
-        if payload_len % 2 != 0 {
+        if !payload_len.is_multiple_of(2) {
             archive.push(b'\n');
         }
     }
