@@ -834,9 +834,9 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     );
     let over_type_window_source = "T ".repeat(512);
 
-    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\nimport { ProgramCanonical } from \"./ast.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { AstCanonical } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
-        "fn AssertCase(source: str, expected: str): null! {\n    actual = ProgramCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
+        "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
     body.push_str(
         "fn ExpectError(source: str, expected_code: str, expected_message: str): null! {\n    caught = false\n    try { ParseProgram(source.clone())? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong stage-3 diagnostic for \" + source + \": \" + err.domain + \"/\" + err.code + \"/\" + err.message + \" EXPECTED \" + expected_code + \"/\" + expected_message) }\n    }\n    if (!caught) { panic(\"expected stage-3 parser error\") }\n    return ok(null)\n}\n\nfn ExpectTypeWindowError(tokens: [Token], expected_message: str): null! {\n    caught = false\n    try { ParseTypeWindow(tokens)? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != \"invalid_token_stream\" || err.message != expected_message) { panic(\"wrong type-window diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected type-window error\") }\n    return ok(null)\n}\n\nfn main(): null! {\n",
@@ -1374,13 +1374,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         )
         .expect("copy stage-2 parser dependency");
     }
-    for name in [
-        "ast.ku",
-        "imports.ku",
-        "parser.ku",
-        "signature.ku",
-        "support.ku",
-    ] {
+    for name in ["imports.ku", "parser.ku", "signature.ku", "support.ku"] {
         fs::copy(
             repository_bootstrap.join("stage3").join(name),
             stage3.join(name),
