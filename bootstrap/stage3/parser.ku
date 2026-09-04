@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken } from "../stage2/span.ku"
-import { Node, ParseOutput, EmptyArena } from "../stage2/ast.ku"
+import { Node, ParseOutput, EmptyArena, ValidateParseOutput } from "../stage2/ast.ku"
 import { RejectAt, ParseExpressionAt, CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, MapTokenCharacters } from "./support.ku"
 import { SignatureType, EmptyTypeWindow, PushTypeWindow, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { ReadImport } from "./imports.ku"
@@ -503,5 +503,5 @@ fn ParseProgram(source: str): ParseOutput! {
     root = AddNode("Program", "", 0, program_span, items, tokens[tokens.len() - 1].clone())?
     // Local helpers capture the arena; one final bounded clone is required to
     // move the complete graph out of the shared local-helper environment.
-    return ok(ParseOutput { arena: arena.clone(), root: root })
+    return ValidateParseOutput(ParseOutput { arena: arena.clone(), root: root })
 }

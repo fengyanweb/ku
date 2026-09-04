@@ -270,15 +270,168 @@ fn bootstrap_parser_stage2_matches_rust_and_has_stable_diagnostics() {
     ];
     cases.push(format!("{}1{}", "(".repeat(30), ")".repeat(30)));
     let long_flat = (0..256).map(|_| "1").collect::<Vec<_>>().join(" + ");
-    let mut body = "import { Parse, ParseWithContext } from \"./parser.ku\"\nimport { ParseContext } from \"./context.ku\"\nimport { AstCanonical } from \"./ast.ku\"\nimport { Span } from \"./span.ku\"\n\n".to_string();
+    let mut body = "import { Parse, ParseWithContext } from \"./parser.ku\"\nimport { ParseContext } from \"./context.ku\"\nimport { Node, Arena, ParseOutput, AstCanonical, ValidateParseOutput } from \"./ast.ku\"\nimport { Span } from \"./span.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(Parse(source.clone())?)\n    if (actual != expected) { panic(\"stage-2 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
     body.push_str(
-        "fn ExpectError(source: str, expected_code: str, expected_message: str): null! {\n    caught = false\n    try { Parse(source)? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected parser error\") }\n    return ok(null)\n}\n\nfn ExpectContextError(source: str, origin: Span, boundary: Span, has_boundary: bool): null! {\n    caught = false\n    try { ParseWithContext(source, ParseContext { origin: origin, boundary: boundary, has_boundary: has_boundary })? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser\" || err.code != \"invalid_parse_context\") { panic(\"wrong context diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected invalid parse context\") }\n    return ok(null)\n}\n\nfn main(): null! {\n",
+        "fn ExpectError(source: str, expected_code: str, expected_message: str): null! {\n    caught = false\n    try { Parse(source)? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected parser error\") }\n    return ok(null)\n}\n\nfn ExpectContextError(source: str, origin: Span, boundary: Span, has_boundary: bool): null! {\n    caught = false\n    try { ParseWithContext(source, ParseContext { origin: origin, boundary: boundary, has_boundary: has_boundary })? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser\" || err.code != \"invalid_parse_context\") { panic(\"wrong context diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected invalid parse context\") }\n    return ok(null)\n}\n\n",
     );
     body.push_str(
-        "    context_origin = Span { line: 7, column: 5, offset: 40, end_line: 7, end_column: 5, end_offset: 40 }\n    context_boundary = Span { line: 7, column: 12, offset: 47, end_line: 7, end_column: 13, end_offset: 48 }\n    context_caught = false\n    try { ParseWithContext(\"1 +\", ParseContext { origin: context_origin.clone(), boundary: context_boundary, has_boundary: true })? } catch(err) {\n        context_caught = true\n        if (err.domain != \"bootstrap.parser\" || err.code != \"unexpected_eof\" || err.message != \"expected expression|7:12@47..7:13@48\") { panic(\"wrong relocated diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!context_caught) { panic(\"expected relocated parser error\") }\n",
+        r#"fn ArenaNode(first_edge: int, edge_count: int): Node {
+    return Node {
+        kind: "Test", text: "", int_value: 0,
+        line: 1, column: 1, offset: 0,
+        end_line: 1, end_column: 2, end_offset: 1,
+        first_edge: first_edge, edge_count: edge_count
+    }
+}
+
+fn ArenaSpanNode(line: int, column: int, offset: int, end_line: int, end_column: int, end_offset: int): Node {
+    return Node {
+        kind: "Test", text: "", int_value: 0,
+        line: line, column: column, offset: offset,
+        end_line: end_line, end_column: end_column, end_offset: end_offset,
+        first_edge: 0, edge_count: 0
+    }
+}
+
+fn ExpectArenaError(output: ParseOutput, expected_code: str, expected_message: str): null! {
+    caught = false
+    try { ValidateParseOutput(output)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.ast" || err.code != expected_code || err.message != expected_message) {
+            panic("wrong arena diagnostic: " + err.domain + "/" + err.code + "/" + err.message)
+        }
+    }
+    if (!caught) { panic("expected invalid bootstrap AST") }
+    return ok(null)
+}
+
+fn ValidateArenaContracts(): null! {
+    leaf = ArenaNode(0, 0)
+    ValidateParseOutput(ParseOutput { arena: Arena { nodes: [leaf.clone()], edges: [] }, root: 1 })?
+    ValidateParseOutput(ParseOutput { arena: Arena { nodes: [leaf.clone(), ArenaNode(0, 1)], edges: [1] }, root: 2 })?
+
+    empty_nodes: [Node] = []
+    empty_edges: [int] = []
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: empty_nodes, edges: empty_edges }, root: 0 },
+        "invalid_root", "bootstrap AST root must be the final one-based NodeId"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [leaf.clone()], edges: [] }, root: 0 },
+        "invalid_root", "bootstrap AST root must be the final one-based NodeId"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [leaf.clone()], edges: [] }, root: 2 },
+        "invalid_root", "bootstrap AST root must be the final one-based NodeId"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [leaf.clone(), leaf.clone()], edges: [] }, root: 1 },
+        "invalid_root", "bootstrap AST root must be the final one-based NodeId"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [leaf.clone(), leaf.clone()], edges: [] }, root: 2 },
+        "invalid_tree", "bootstrap AST must be one contiguous post-order tree"
+    )?
+
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [ArenaNode(-1, 0)], edges: [] }, root: 1 },
+        "invalid_edge_slice", "bootstrap AST node edge slices must be non-negative and contiguous"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [ArenaNode(0, -1)], edges: [] }, root: 1 },
+        "invalid_edge_slice", "bootstrap AST node edge slices must be non-negative and contiguous"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [ArenaNode(0, 2)], edges: [1] }, root: 1 },
+        "invalid_edge_slice", "bootstrap AST node edge slice lies outside the edge arena"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [ArenaNode(0, 0)], edges: [1] }, root: 1 },
+        "invalid_edge_slice", "bootstrap AST edge arena contains unclaimed edges"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [leaf.clone(), ArenaNode(0, 1)], edges: [0] }, root: 2 },
+        "invalid_node_id", "bootstrap AST child must be a positive NodeId that precedes its parent"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [leaf.clone(), ArenaNode(0, 1)], edges: [2] }, root: 2 },
+        "invalid_node_id", "bootstrap AST child must be a positive NodeId that precedes its parent"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [leaf.clone(), ArenaNode(0, 1), ArenaNode(1, 0)], edges: [3] }, root: 3 },
+        "invalid_node_id", "bootstrap AST child must be a positive NodeId that precedes its parent"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [leaf.clone(), ArenaNode(0, 1), ArenaNode(1, 1)], edges: [1, 1] }, root: 3 },
+        "invalid_tree", "bootstrap AST must be one contiguous post-order tree"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [leaf.clone(), leaf.clone(), ArenaNode(0, 2)], edges: [2, 1] }, root: 3 },
+        "invalid_tree", "bootstrap AST must be one contiguous post-order tree"
+    )?
+
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [ArenaSpanNode(0, 1, 0, 1, 2, 1)], edges: [] }, root: 1 },
+        "invalid_span", "bootstrap AST node span must use positive ordered coordinates and non-negative ordered byte offsets"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [ArenaSpanNode(1, 1, -1, 1, 2, 1)], edges: [] }, root: 1 },
+        "invalid_span", "bootstrap AST node span must use positive ordered coordinates and non-negative ordered byte offsets"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [ArenaSpanNode(2, 2, 0, 1, 9, 1)], edges: [] }, root: 1 },
+        "invalid_span", "bootstrap AST node span must use positive ordered coordinates and non-negative ordered byte offsets"
+    )?
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: [ArenaSpanNode(1, 2, 2, 1, 3, 1)], edges: [] }, root: 1 },
+        "invalid_span", "bootstrap AST node span must use positive ordered coordinates and non-negative ordered byte offsets"
+    )?
+
+    node_boundary: [Node] = [leaf.clone()]
+    node_edges: [int] = []
+    node_index = 1
+    while (node_index < 4096) {
+        next_node = ArenaNode(node_edges.len(), 1)
+        node_boundary = node_boundary.push(next_node)
+        node_edges = node_edges.push(node_index)
+        node_index = node_index + 1
+    }
+    ValidateParseOutput(ParseOutput { arena: Arena { nodes: node_boundary.clone(), edges: node_edges.clone() }, root: 4096 })?
+    over_limit_node = ArenaNode(node_edges.len(), 1)
+    node_boundary = node_boundary.push(over_limit_node)
+    node_edges = node_edges.push(4096)
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: node_boundary, edges: node_edges }, root: 4097 },
+        "node_limit", "bootstrap AST accepts at most 4096 nodes"
+    )?
+
+    edge_boundary: [int] = []
+    edge_index = 0
+    while (edge_index < 8192) {
+        edge_boundary = edge_boundary.push(1)
+        edge_index = edge_index + 1
+    }
+    edge_nodes: [Node] = [leaf.clone(), ArenaNode(0, 8192)]
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: edge_nodes.clone(), edges: edge_boundary.clone() }, root: 2 },
+        "invalid_tree", "bootstrap AST must be one contiguous post-order tree"
+    )?
+    edge_boundary = edge_boundary.push(1)
+    ExpectArenaError(
+        ParseOutput { arena: Arena { nodes: edge_nodes, edges: edge_boundary }, root: 2 },
+        "edge_limit", "bootstrap AST accepts at most 8192 edges"
+    )?
+    return ok(null)
+}
+
+fn main(): null! {
+"#,
+    );
+    body.push_str(
+        "    ValidateArenaContracts()?\n    context_origin = Span { line: 7, column: 5, offset: 40, end_line: 7, end_column: 5, end_offset: 40 }\n    context_boundary = Span { line: 7, column: 12, offset: 47, end_line: 7, end_column: 13, end_offset: 48 }\n    context_caught = false\n    try { ParseWithContext(\"1 +\", ParseContext { origin: context_origin.clone(), boundary: context_boundary, has_boundary: true })? } catch(err) {\n        context_caught = true\n        if (err.domain != \"bootstrap.parser\" || err.code != \"unexpected_eof\" || err.message != \"expected expression|7:12@47..7:13@48\") { panic(\"wrong relocated diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!context_caught) { panic(\"expected relocated parser error\") }\n",
     );
     body.push_str(
         "    point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }\n    max_line = Span { line: 9223372036854775807, column: 1, offset: 0, end_line: 9223372036854775807, end_column: 1, end_offset: 0 }\n    max_column = Span { line: 1, column: 9223372036854775807, offset: 0, end_line: 1, end_column: 9223372036854775807, end_offset: 0 }\n    max_offset = Span { line: 1, column: 1, offset: 9223372036854775807, end_line: 1, end_column: 1, end_offset: 9223372036854775807 }\n    ExpectContextError(\"1\", max_line, point.clone(), false)?\n    ExpectContextError(\"1\", max_column, point.clone(), false)?\n    ExpectContextError(\"1\", max_offset, point.clone(), false)?\n    overlap = Span { line: 7, column: 7, offset: 42, end_line: 7, end_column: 8, end_offset: 43 }\n    ExpectContextError(\"1 +\", context_origin.clone(), overlap, true)?\n    malformed_end = Span { line: 7, column: 12, offset: 47, end_line: 0, end_column: 0, end_offset: 48 }\n    ExpectContextError(\"1 +\", context_origin.clone(), malformed_end, true)?\n    no_boundary_caught = false\n    try { ParseWithContext(\"1 +\", ParseContext { origin: context_origin.clone(), boundary: point.clone(), has_boundary: false })? } catch(err) {\n        no_boundary_caught = true\n        if (err.code != \"unexpected_eof\" || err.message != \"expected expression|7:8@43..7:8@43\") { panic(\"wrong mathematical EOF relocation: \" + err.code + \"/\" + err.message) }\n    }\n    if (!no_boundary_caught) { panic(\"expected mathematical EOF diagnostic\") }\n    exact_boundary = Span { line: 7, column: 8, offset: 43, end_line: 7, end_column: 8, end_offset: 43 }\n    exact_boundary_caught = false\n    try { ParseWithContext(\"1 +\", ParseContext { origin: context_origin.clone(), boundary: exact_boundary, has_boundary: true })? } catch(err) {\n        exact_boundary_caught = true\n        if (err.code != \"unexpected_eof\" || err.message != \"expected expression|7:8@43..7:8@43\") { panic(\"wrong exact boundary relocation: \" + err.code + \"/\" + err.message) }\n    }\n    if (!exact_boundary_caught) { panic(\"expected exact boundary diagnostic\") }\n",

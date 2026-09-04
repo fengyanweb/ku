@@ -2,7 +2,7 @@ import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "./span.ku"
 import { Diagnostic, DiagnosticCanonical } from "./diagnostic.ku"
-import { Node, ParseOutput, EmptyArena } from "./ast.ku"
+import { Node, ParseOutput, EmptyArena, ValidateParseOutput } from "./ast.ku"
 import { ParseContext, DefaultParseContext, ParseContextError, RelocateTokens } from "./context.ku"
 
 // Stage 2B uses append-only operator/value stacks and integer links. Flat
@@ -479,7 +479,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
     root = values[value_top - 1].node
     // Local helpers capture the arena; returning an owned captured value needs
     // one explicit bounded clone after parsing, never one clone per token.
-    return ok(ParseOutput { arena: arena.clone(), root: root })
+    return ValidateParseOutput(ParseOutput { arena: arena.clone(), root: root })
 }
 
 fn Parse(source: str): ParseOutput! {
