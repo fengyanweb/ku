@@ -4,12 +4,14 @@ use crate::span::{Position, Span};
 use crate::token::{Token, TokenKind};
 
 const MAX_PARSE_DEPTH: usize = 32;
+const MAX_TYPE_DEPTH: usize = 32;
 const MAX_TOKENS: usize = 100_000;
 
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
     parse_depth: usize,
+    type_parse_depth: usize,
 }
 
 impl Parser {
@@ -18,6 +20,7 @@ impl Parser {
             tokens,
             current: 0,
             parse_depth: 0,
+            type_parse_depth: 0,
         }
     }
 
@@ -346,19 +349,34 @@ impl Parser {
             return Err(KuError::parse("expected type name", self.peek().span));
         }
         if self.match_kind(&TokenKind::LBracket) {
-            let inner = self.type_name()?;
-            self.consume(&TokenKind::RBracket, "expected ']' after array type")?;
-            return Ok(TypeName::Array(Box::new(inner)));
+            let opener = self.previous().span;
+            return self.with_type_parse_depth(opener, |parser| {
+                let inner = parser.type_name()?;
+                parser.consume(&TokenKind::RBracket, "expected ']' after array type")?;
+                let ty = TypeName::Array(Box::new(inner));
+                parser.ensure_type_depth(&ty, opener)?;
+                Ok(ty)
+            });
         }
         if self.match_kind(&TokenKind::Async) {
+            let opener = self.previous().span;
             self.consume(
                 &TokenKind::Fn,
                 "expected 'fn' after 'async' in function type",
             )?;
-            return self.function_type(true);
+            return self.with_type_parse_depth(opener, |parser| {
+                let ty = parser.function_type(true)?;
+                parser.ensure_type_depth(&ty, opener)?;
+                Ok(ty)
+            });
         }
         if self.match_kind(&TokenKind::Fn) {
-            return self.function_type(false);
+            let opener = self.previous().span;
+            return self.with_type_parse_depth(opener, |parser| {
+                let ty = parser.function_type(false)?;
+                parser.ensure_type_depth(&ty, opener)?;
+                Ok(ty)
+            });
         }
         let token = self.advance().clone();
         let ty = match token.kind {
@@ -416,7 +434,10 @@ impl Parser {
 
     fn finish_type_name(&mut self, ty: TypeName) -> KuResult<TypeName> {
         if self.match_kind(&TokenKind::Bang) {
-            Ok(TypeName::Result(Box::new(ty)))
+            let bang = self.previous().span;
+            let ty = TypeName::Result(Box::new(ty));
+            self.ensure_type_depth(&ty, bang)?;
+            Ok(ty)
         } else {
             Ok(ty)
         }
@@ -1190,7 +1211,7 @@ impl Parser {
         if self.check(&TokenKind::Eof) {
             return Err(KuError::parse("expected expression", self.peek().span));
         }
-        if self.is_arrow_function_start() {
+        if self.is_arrow_function_start()? {
             return self.arrow_function();
         }
         if self.check(&TokenKind::Fn) {
@@ -1509,11 +1530,12 @@ impl Parser {
         }
     }
 
-    fn is_arrow_function_start(&self) -> bool {
+    fn is_arrow_function_start(&self) -> KuResult<bool> {
         if !self.check(&TokenKind::LParen) {
-            return false;
+            return Ok(false);
         }
         let mut index = self.current + 1;
+        let mut depth_error_span = None;
         if matches!(
             self.tokens.get(index).map(|token| &token.kind),
             Some(TokenKind::RParen)
@@ -1525,7 +1547,7 @@ impl Parser {
                     self.tokens.get(index).map(|token| &token.kind),
                     Some(TokenKind::Ident(_))
                 ) {
-                    return false;
+                    return Ok(false);
                 }
                 index += 1;
                 if matches!(
@@ -1533,8 +1555,11 @@ impl Parser {
                     Some(TokenKind::Colon)
                 ) {
                     index += 1;
-                    if !scan_arrow_type(&self.tokens, &mut index, true) {
-                        return false;
+                    if !scan_arrow_type(&self.tokens, &mut index, true, &mut depth_error_span) {
+                        if let Some(span) = depth_error_span {
+                            return Err(type_depth_error(span));
+                        }
+                        return Ok(false);
                     }
                 }
                 match self.tokens.get(index).map(|token| &token.kind) {
@@ -1543,7 +1568,7 @@ impl Parser {
                         index += 1;
                         break;
                     }
-                    _ => return false,
+                    _ => return Ok(false),
                 }
             }
         }
@@ -1552,14 +1577,17 @@ impl Parser {
             Some(TokenKind::Colon)
         ) {
             index += 1;
-            if !scan_arrow_type(&self.tokens, &mut index, false) {
-                return false;
+            if !scan_arrow_type(&self.tokens, &mut index, false, &mut depth_error_span) {
+                if let Some(span) = depth_error_span {
+                    return Err(type_depth_error(span));
+                }
+                return Ok(false);
             }
         }
-        matches!(
+        Ok(matches!(
             self.tokens.get(index).map(|token| &token.kind),
             Some(TokenKind::Arrow)
-        )
+        ))
     }
 
     fn is_struct_literal_after_lbrace(&self) -> bool {
@@ -1667,6 +1695,61 @@ impl Parser {
     fn leave_parse_depth(&mut self) {
         self.parse_depth = self.parse_depth.saturating_sub(1);
     }
+
+    fn with_type_parse_depth<T>(
+        &mut self,
+        span: Span,
+        parse: impl FnOnce(&mut Self) -> KuResult<T>,
+    ) -> KuResult<T> {
+        if self.type_parse_depth >= MAX_TYPE_DEPTH {
+            return Err(type_depth_error(span));
+        }
+        self.type_parse_depth += 1;
+        let result = parse(self);
+        self.type_parse_depth -= 1;
+        result
+    }
+
+    fn ensure_type_depth(&self, ty: &TypeName, span: Span) -> KuResult<()> {
+        if type_nesting_depth(ty) > MAX_TYPE_DEPTH {
+            Err(type_depth_error(span))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn type_depth_error(span: Span) -> KuError {
+    KuError::parse(
+        "maximum type depth exceeded; type is too deeply nested",
+        span,
+    )
+}
+
+fn type_nesting_depth(ty: &TypeName) -> usize {
+    match ty {
+        TypeName::Array(inner) | TypeName::Result(inner) => type_nesting_depth(inner) + 1,
+        TypeName::Function {
+            params,
+            return_type,
+            ..
+        } => {
+            let child_depth = params
+                .iter()
+                .map(type_nesting_depth)
+                .chain(std::iter::once(type_nesting_depth(return_type)))
+                .max()
+                .unwrap_or(0);
+            child_depth + 1
+        }
+        TypeName::Union(types) => types.iter().map(type_nesting_depth).max().unwrap_or(0),
+        TypeName::Int
+        | TypeName::Float
+        | TypeName::Bool
+        | TypeName::String
+        | TypeName::Null
+        | TypeName::Custom(_) => 0,
+    }
 }
 
 fn token_kind_eq(left: &TokenKind, right: &TokenKind) -> bool {
@@ -1701,7 +1784,12 @@ fn attach_await(value: Expr, await_start: Position) -> Expr {
     }
 }
 
-fn scan_arrow_type(tokens: &[Token], index: &mut usize, parameter: bool) -> bool {
+fn scan_arrow_type(
+    tokens: &[Token],
+    index: &mut usize,
+    parameter: bool,
+    depth_error_span: &mut Option<Span>,
+) -> bool {
     scan_type(
         tokens,
         index,
@@ -1710,6 +1798,8 @@ fn scan_arrow_type(tokens: &[Token], index: &mut usize, parameter: bool) -> bool
         } else {
             TypeScanStop::ArrowReturn
         },
+        0,
+        depth_error_span,
     )
 }
 
@@ -1721,8 +1811,14 @@ enum TypeScanStop {
     Array,
 }
 
-fn scan_type(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -> bool {
-    if !scan_type_atom(tokens, index, stop) {
+fn scan_type(
+    tokens: &[Token],
+    index: &mut usize,
+    stop: TypeScanStop,
+    depth: usize,
+    depth_error_span: &mut Option<Span>,
+) -> bool {
+    if !scan_type_atom(tokens, index, stop, depth, depth_error_span) {
         return false;
     }
     while let Some(token) = tokens.get(*index) {
@@ -1730,7 +1826,7 @@ fn scan_type(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -> bool {
             TokenKind::Bang => *index += 1,
             TokenKind::Pipe => {
                 *index += 1;
-                if !scan_type_atom(tokens, index, stop) {
+                if !scan_type_atom(tokens, index, stop, depth, depth_error_span) {
                     return false;
                 }
             }
@@ -1741,9 +1837,27 @@ fn scan_type(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -> bool {
     false
 }
 
-fn scan_type_atom(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -> bool {
-    match tokens.get(*index).map(|token| &token.kind) {
-        Some(TokenKind::Ident(_)) => {
+fn scan_type_atom(
+    tokens: &[Token],
+    index: &mut usize,
+    stop: TypeScanStop,
+    depth: usize,
+    depth_error_span: &mut Option<Span>,
+) -> bool {
+    match tokens.get(*index) {
+        Some(token)
+            if matches!(
+                &token.kind,
+                TokenKind::LBracket | TokenKind::Async | TokenKind::Fn
+            ) && depth >= MAX_TYPE_DEPTH =>
+        {
+            *depth_error_span = Some(token.span);
+            false
+        }
+        Some(Token {
+            kind: TokenKind::Ident(_),
+            ..
+        }) => {
             *index += 1;
             while matches!(
                 tokens.get(*index).map(|token| &token.kind),
@@ -1760,13 +1874,25 @@ fn scan_type_atom(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -> bo
             }
             true
         }
-        Some(TokenKind::Null) => {
+        Some(Token {
+            kind: TokenKind::Null,
+            ..
+        }) => {
             *index += 1;
             true
         }
-        Some(TokenKind::LBracket) => {
+        Some(Token {
+            kind: TokenKind::LBracket,
+            ..
+        }) => {
             *index += 1;
-            if !scan_type(tokens, index, TypeScanStop::Array) {
+            if !scan_type(
+                tokens,
+                index,
+                TypeScanStop::Array,
+                depth + 1,
+                depth_error_span,
+            ) {
                 return false;
             }
             if !matches!(
@@ -1778,16 +1904,28 @@ fn scan_type_atom(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -> bo
             *index += 1;
             true
         }
-        Some(TokenKind::Async) => {
+        Some(Token {
+            kind: TokenKind::Async,
+            ..
+        }) => {
             *index += 1;
-            scan_function_type(tokens, index, stop)
+            scan_function_type(tokens, index, stop, depth + 1, depth_error_span)
         }
-        Some(TokenKind::Fn) => scan_function_type(tokens, index, stop),
+        Some(Token {
+            kind: TokenKind::Fn,
+            ..
+        }) => scan_function_type(tokens, index, stop, depth + 1, depth_error_span),
         _ => false,
     }
 }
 
-fn scan_function_type(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -> bool {
+fn scan_function_type(
+    tokens: &[Token],
+    index: &mut usize,
+    stop: TypeScanStop,
+    depth: usize,
+    depth_error_span: &mut Option<Span>,
+) -> bool {
     if !matches!(
         tokens.get(*index).map(|token| &token.kind),
         Some(TokenKind::Fn)
@@ -1809,7 +1947,13 @@ fn scan_function_type(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -
         *index += 1;
     } else {
         loop {
-            if !scan_type(tokens, index, TypeScanStop::FunctionParameter) {
+            if !scan_type(
+                tokens,
+                index,
+                TypeScanStop::FunctionParameter,
+                depth,
+                depth_error_span,
+            ) {
                 return false;
             }
             match tokens.get(*index).map(|token| &token.kind) {
@@ -1829,7 +1973,7 @@ fn scan_function_type(tokens: &[Token], index: &mut usize, stop: TypeScanStop) -
         return false;
     }
     *index += 1;
-    scan_type(tokens, index, stop)
+    scan_type(tokens, index, stop, depth, depth_error_span)
 }
 
 fn is_type_stop(kind: &TokenKind, stop: TypeScanStop) -> bool {
