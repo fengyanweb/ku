@@ -4,7 +4,7 @@ import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
 import { TypeWindowContinues, PushTypeToken, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { RejectAt, RejectAtPoint } from "./support.ku"
 
-struct StructRead {
+struct DeclarationRead {
     start: Token
     output: ParseOutput
     consumed: int
@@ -43,7 +43,7 @@ fn ReadModule(start: Token, name: Token): ParseOutput! {
 // The caller supplies exactly one struct declaration followed by one EOF
 // sentinel. Keeping declarations in disjoint windows means a module with many
 // structs is still scanned linearly instead of cloning each remaining tail.
-fn ReadStruct(tokens: [Token]): StructRead! {
+fn ReadStruct(tokens: [Token]): DeclarationRead! {
     // Bound the independently importable entry point before any token clone or
     // index. ParseProgram enforces the same limit on the complete module.
     if (tokens.len() > 512) {
@@ -245,5 +245,5 @@ fn ReadStruct(tokens: [Token]): StructRead! {
         arena: Arena { nodes: arena_nodes, edges: arena_edges },
         root: root
     })?
-    return ok(StructRead { start: start, output: output, consumed: cursor, work: work })
+    return ok(DeclarationRead { start: start, output: output, consumed: cursor, work: work })
 }

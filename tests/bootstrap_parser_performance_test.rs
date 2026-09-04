@@ -117,6 +117,9 @@ fn main(): null! {
         "stage3-struct-success",
         "stage3-struct-union-success",
         "stage3-struct-failure",
+        "stage3-enum-success",
+        "stage3-enum-payload-success",
+        "stage3-enum-failure",
         "stage3-failure",
         "stage3-expression-failure",
         "invalid-domain",
@@ -210,6 +213,7 @@ fn copy_bootstrap_sources(directory: &std::path::Path) {
                 "signature.ku",
                 "imports.ku",
                 "structs.ku",
+                "enums.ku",
                 "parser.ku",
             ][..],
         ),
@@ -409,6 +413,67 @@ static KuParserInput ku_stage3_struct_failure_input(size_t fields) {
   input.hash = ku_parser_fingerprint(input.data, input.len);
   return input;
 }
+static KuParserInput ku_stage3_enum_input(size_t items) {
+  static const char item[] = "enum E { A }\n";
+  size_t item_len = sizeof(item) - 1;
+  KuParserInput input = {0};
+  if (items && item_len > SIZE_MAX / items) return input;
+  input.len = item_len * items;
+  input.data = (uint8_t*)malloc(input.len ? input.len : 1);
+  if (!input.data) return input;
+  size_t cursor = 0;
+  for (size_t i = 0; i < items; i++) {
+    memcpy(input.data + cursor, item, item_len);
+    cursor += item_len;
+  }
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
+static KuParserInput ku_stage3_enum_payload_input(size_t fields) {
+  static const char prefix[] = "enum E { V(";
+  static const char field[] = "v:T|U";
+  static const char suffix[] = ") }\n";
+  size_t prefix_len = sizeof(prefix) - 1, field_len = sizeof(field) - 1;
+  size_t suffix_len = sizeof(suffix) - 1;
+  size_t fixed_len = prefix_len + suffix_len - 1;
+  KuParserInput input = {0};
+  if (!fields || fields > (SIZE_MAX - fixed_len) / (field_len + 1)) return input;
+  input.len = fixed_len + fields * (field_len + 1);
+  input.data = (uint8_t*)malloc(input.len);
+  if (!input.data) return input;
+  memcpy(input.data, prefix, prefix_len);
+  size_t cursor = prefix_len;
+  for (size_t i = 0; i < fields; i++) {
+    memcpy(input.data + cursor, field, field_len);
+    cursor += field_len;
+    if (i + 1 < fields) input.data[cursor++] = ',';
+  }
+  memcpy(input.data + cursor, suffix, suffix_len);
+  cursor += suffix_len;
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
+static KuParserInput ku_stage3_enum_failure_input(size_t variants) {
+  static const char prefix[] = "enum E { ";
+  static const char variant[] = "V(v:T),";
+  size_t prefix_len = sizeof(prefix) - 1, variant_len = sizeof(variant) - 1;
+  KuParserInput input = {0};
+  if (!variants || variants > (SIZE_MAX - prefix_len) / variant_len) return input;
+  input.len = prefix_len + variants * variant_len;
+  input.data = (uint8_t*)malloc(input.len);
+  if (!input.data) return input;
+  memcpy(input.data, prefix, prefix_len);
+  size_t cursor = prefix_len;
+  for (size_t i = 0; i < variants; i++) {
+    memcpy(input.data + cursor, variant, variant_len);
+    cursor += variant_len;
+  }
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
 static KuParserInput ku_invalid_domain_input(size_t bytes) {
   static const char marker[] = "attacker-owned-domain";
   KuParserInput input = {0};
@@ -591,6 +656,26 @@ int main(void) {
       ku_stage3_struct_failure_input(32), ku_stage3_struct_failure_input(64),
       0, "bootstrap.parser.stage3", "unexpected_token",
       "error|bootstrap.parser.stage3|unexpected_token|<source>|expected '}' after struct fields|",
+      9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  /* Each unit enum is five tokens. The 32/64 declaration fixtures therefore
+     consume 161/321 tokens including EOF, so both exercise repeated enum
+     window/arena integration without approaching the 512-token hard limit. */
+  CHECK(ku_check_scale_bounded("stage3-enum-success", @KU_STAGE3_PARSE@,
+      ku_stage3_enum_input(32), ku_stage3_enum_input(64), 1, "", "", "",
+      5, 2, 64, 64 * 1024, 32 * 1024) == 0);
+  /* One variant with 32/64 union-typed payload fields consumes 199/391 tokens
+     including EOF. This isolates payload field/type-plan growth while leaving
+     a strict margin below every Stage 3 token, node, edge, and work budget. */
+  CHECK(ku_check_scale_bounded("stage3-enum-payload-success", @KU_STAGE3_PARSE@,
+      ku_stage3_enum_payload_input(32), ku_stage3_enum_payload_input(64),
+      1, "", "", "", 9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  /* Missing '}' is reached only after 32/64 payload-bearing variants have
+     allocated their type, field, and variant nodes (228/452 tokens including
+     EOF). The structured-error path must release the complete partial arena. */
+  CHECK(ku_check_scale_bounded("stage3-enum-failure", @KU_STAGE3_PARSE@,
+      ku_stage3_enum_failure_input(32), ku_stage3_enum_failure_input(64),
+      0, "bootstrap.parser.stage3", "unexpected_token",
+      "error|bootstrap.parser.stage3|unexpected_token|<source>|expected '}' after enum variants|",
       9, 4, 64, 16 * 1024, 8 * 1024) == 0);
   CHECK(ku_check_scale("stage3-failure", @KU_STAGE3_PARSE@,
       ku_stage3_input(96, 1), ku_stage3_input(192, 1), 0,
