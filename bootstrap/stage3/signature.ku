@@ -23,11 +23,6 @@ struct SignatureType {
     work: int
 }
 
-struct TypeWindow {
-    tokens: [Token]
-    complete: bool
-}
-
 struct TypeValueEntry {
     node: int
     previous: int
@@ -40,19 +35,15 @@ struct TypeFrame {
     outer_member_count: int
 }
 
-fn EmptyTypeWindow(): TypeWindow {
-    return TypeWindow { tokens: [], complete: false }
-}
-
 fn TypeWindowContinues(kind: str): bool {
     return kind == "LBracket" || kind == "RBracket" || kind == "Ident" || kind == "Null" || kind == "Dot" || kind == "Bang" || kind == "Pipe" || kind == "Fn" || kind == "Async"
 }
 
-fn PushTypeWindow(window: TypeWindow, token: Token): TypeWindow! {
-    if (window.complete) { RejectAt(token.clone(), "invalid_token_stream", "type inspection continued past its boundary")? }
-    if (window.tokens.len() >= 512) { RejectAt(token.clone(), "invalid_token_stream", "type inspection escaped its bounded token window")? }
-    boundary = !TypeWindowContinues(token.kind.clone())
-    return ok(TypeWindow { tokens: window.tokens.push(token), complete: boundary })
+fn PushTypeToken(tokens: [Token], token: Token): [Token]! {
+    if (tokens.len() >= 512) { RejectAt(token.clone(), "invalid_token_stream", "type inspection escaped its bounded token window")? }
+    appended: [Token] = tokens
+    appended = appended.push(token)
+    return ok(appended)
 }
 
 fn TypeNamePart(text: str, start: Token, end: Token): TypePart {
@@ -173,12 +164,13 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
         if (expect_atom) {
             if (token.kind == "LBracket") {
                 if (array_depth >= 32) { RejectAt(token.clone(), "type_depth_exceeded", "stage-3 type nesting exceeds 32 levels")? }
-                frames = frames.push(TypeFrame {
+                type_frame = TypeFrame {
                     opener: token,
                     previous: frame_top,
                     value_base: value_top,
                     outer_member_count: member_count
-                })
+                }
+                frames = frames.push(type_frame)
                 frame_top = frames.len()
                 array_depth = array_depth + 1
                 member_count = 0
@@ -210,7 +202,8 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
                 }
 
                 CheckTypeArenaCapacity(parts.len(), edges.len(), 0, atom.clone())?
-                parts = parts.push(TypeNamePart(name, atom.clone(), end))
+                name_part = TypeNamePart(name, atom.clone(), end)
+                parts = parts.push(name_part)
                 member_root = parts.len()
                 if (tokens[cursor].kind == "Bang") {
                     bang = tokens[cursor].clone()
@@ -220,12 +213,14 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
                     first_edge = edges.len()
                     edges = edges.push(member_root)
                     inner_span = parts[member_root - 1].span.clone()
-                    parts = parts.push(TypeResultPart(inner_span, bang, first_edge, result_depth))
+                    result_part = TypeResultPart(inner_span, bang, first_edge, result_depth)
+                    parts = parts.push(result_part)
                     member_root = parts.len()
                     cursor = cursor + 1
                     work = work + 1
                 }
-                values = values.push(TypeValueEntry { node: member_root, previous: value_top })
+                value_entry = TypeValueEntry { node: member_root, previous: value_top }
+                values = values.push(value_entry)
                 value_top = values.len()
                 member_count = member_count + 1
                 CheckUnionWidth(member_count, atom)?
@@ -279,7 +274,8 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
                 }
                 first_span = parts[first_child - 1].span.clone()
                 last_span = parts[last_child - 1].span.clone()
-                parts = parts.push(TypeUnionPart(first_span, last_span, union_first_edge, reversed.len(), union_depth))
+                union_part = TypeUnionPart(first_span, last_span, union_first_edge, reversed.len(), union_depth)
+                parts = parts.push(union_part)
                 level_root = parts.len()
             }
 
@@ -296,7 +292,8 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
                 CheckTypeArenaCapacity(parts.len(), edges.len(), 1, frame.opener.clone())?
                 first_edge = edges.len()
                 edges = edges.push(level_root)
-                parts = parts.push(TypeArrayPart(frame.opener.clone(), token, first_edge, array_node_depth))
+                array_part = TypeArrayPart(frame.opener.clone(), token, first_edge, array_node_depth)
+                parts = parts.push(array_part)
                 member_root = parts.len()
                 cursor = cursor + 1
                 work = work + 1
@@ -308,12 +305,14 @@ fn ParseTypeWindow(tokens: [Token]): SignatureType! {
                     first_edge = edges.len()
                     edges = edges.push(member_root)
                     inner_span = parts[member_root - 1].span.clone()
-                    parts = parts.push(TypeResultPart(inner_span, bang, first_edge, result_depth))
+                    array_result_part = TypeResultPart(inner_span, bang, first_edge, result_depth)
+                    parts = parts.push(array_result_part)
                     member_root = parts.len()
                     cursor = cursor + 1
                     work = work + 1
                 }
-                values = values.push(TypeValueEntry { node: member_root, previous: value_top })
+                array_value_entry = TypeValueEntry { node: member_root, previous: value_top }
+                values = values.push(array_value_entry)
                 value_top = values.len()
                 member_count = member_count + 1
                 CheckUnionWidth(member_count, frame.opener)?
