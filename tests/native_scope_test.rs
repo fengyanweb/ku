@@ -259,7 +259,9 @@ fn main(): null! {
 
 fn generated_c(source: &str) -> String {
     let tokens = Lexer::new(source).tokenize().expect("lex scope fixture");
-    let program = Parser::new(tokens).parse().expect("parse scope fixture");
+    let program = Parser::new(tokens)
+        .parse_program()
+        .expect("parse scope fixture");
     Checker::new().check(&program).expect("check scope fixture");
     let lowered = ir::lower_program(&program).expect("lower scope fixture");
     let bindings = lowered
@@ -290,7 +292,7 @@ fn generated_owned_fail_c(source: &str) -> String {
         .tokenize()
         .expect("lex owned fail fixture");
     let program = Parser::new(tokens)
-        .parse()
+        .parse_program()
         .expect("parse owned fail fixture");
     Checker::new()
         .check(&program)

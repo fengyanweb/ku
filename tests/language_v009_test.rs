@@ -26,14 +26,14 @@ fn unique_temp_path(name: &str) -> PathBuf {
 
 fn lower_ir(source: &str) -> String {
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     ir::lower_program(&program).expect("lower ir").to_string()
 }
 
 fn lower_checked_ir(source: &str) -> ir::IrProgram {
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     ir::lower_program(&program).expect("lower ir")
 }
@@ -42,7 +42,9 @@ fn generate_llvm(source: &str) -> Result<String, String> {
     let tokens = Lexer::new(source)
         .tokenize()
         .map_err(|err| err.to_string())?;
-    let program = Parser::new(tokens).parse().map_err(|err| err.to_string())?;
+    let program = Parser::new(tokens)
+        .parse_program()
+        .map_err(|err| err.to_string())?;
     Checker::new()
         .check(&program)
         .map_err(|err| err.to_string())?;
@@ -397,7 +399,7 @@ fn main() {
 }
 "#;
     let tokens = Lexer::new(source).tokenize().expect("lex");
-    let program = Parser::new(tokens).parse().expect("parse");
+    let program = Parser::new(tokens).parse_program().expect("parse");
     Checker::new().check(&program).expect("check");
     let ir = ir::lower_program(&program).expect("lower ir");
     let c = backend::c::generate_c_source(&ir).expect("generate c");

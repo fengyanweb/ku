@@ -8473,7 +8473,7 @@ fn source_base_dir(file: &str) -> PathBuf {
 
 fn parse_source(source: &str) -> Result<Program, KuError> {
     let tokens = Lexer::new(source).tokenize()?;
-    Parser::new(tokens).parse()
+    Parser::new(tokens).parse_program()
 }
 
 fn parse_and_check(file: &str, source: &str) -> Result<Program, KuError> {
