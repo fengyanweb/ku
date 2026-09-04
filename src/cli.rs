@@ -3511,6 +3511,10 @@ struct NativeTlsLinkContract {
 }
 
 const NATIVE_TLS_LINUX_LIBRARIES: &[&str] = &[
+    "-lc",
+    "-lm",
+    "-lrt",
+    "-lpthread",
     "-lgcc_s",
     "-lutil",
     "-lrt",
@@ -3538,7 +3542,7 @@ const NATIVE_TLS_WINDOWS_MSVC_LIBRARIES: &[&str] = &[
     "dbghelp.lib",
     "/defaultlib:msvcrt",
 ];
-const NATIVE_TLS_DARWIN_LIBRARIES: &[&str] = &["-lSystem", "-lc", "-lm"];
+const NATIVE_TLS_DARWIN_LIBRARIES: &[&str] = &["-lc", "-lm", "-liconv", "-lSystem", "-lc", "-lm"];
 
 const NATIVE_TLS_LINUX_CONTRACT: NativeTlsLinkContract = NativeTlsLinkContract {
     target: "x86_64-unknown-linux-gnu",

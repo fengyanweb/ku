@@ -36,10 +36,9 @@ fallback, system-root lookup, or verification-bypass path. See
 
 The archive is not the complete final link input. Target-pack creation must run
 `cargo rustc --release -p ku-native-tls -- --print native-static-libs` with the
-exact target toolchain and preserve the reported library order. Do not guess or
-silently omit that platform list. With Rust 1.89 on `x86_64-pc-windows-msvc`,
-the reported inputs are `bcrypt.lib`, `advapi32.lib`, `kernel32.lib`,
-`ntdll.lib`, `userenv.lib`, `ws2_32.lib`, `dbghelp.lib`, and
-`/defaultlib:msvcrt`; the C consumer must use the matching dynamic MSVC CRT.
-Linux and macOS have different lists and require native CI evidence before their
-target packs can be called verified.
+exact target toolchain and preserve the reported library order, including
+duplicates. Do not guess or silently omit that platform list. The checked
+Rust 1.89 contracts are encoded in `scripts/build-native-tls-pack.ps1` and
+`src/cli.rs`; the target-pack builder rejects any different report before it
+publishes a pack. The Windows MSVC consumer must use the matching dynamic MSVC
+CRT, while Linux and macOS retain their recorded system-library dependencies.
