@@ -403,7 +403,7 @@ registry v2 自动 signed-roots、在线 key 吊销和透明轮换（v1 使用�
 native C 动态 object 的部分复杂场景、str 的 trim/lower/upper(需 Unicode 表)
 native closure 捕获 struct/enum/Result/Task 等 owned 类型，以及从 dynamic object 取回闭包后调用
 native async ABI / async 函数值
-数据库驱动的解释器(`ku run`)支持；Redis/MySQL 新 client 的真实服务与三系统实测；Redis/MySQL 可强制证书与主机名验证的 TLS 配置
+数据库驱动的解释器(`ku run`)支持；Redis/MySQL 新 client 的三系统真实服务查询；PG 的 Linux/macOS 实库往返；Redis/MySQL 可强制证书与主机名验证的 TLS 配置
 ```
 
 ## VS Code 插件
