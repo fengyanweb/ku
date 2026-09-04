@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use crate::span::Span;
 
@@ -11,7 +11,7 @@ pub enum KuErrorKind {
     Runtime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct KuError {
     pub kind: KuErrorKind,
     pub message: String,
@@ -21,10 +21,25 @@ pub struct KuError {
     diagnostic_context: Option<Box<DiagnosticContext>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct DiagnosticContext {
     file: String,
     source: String,
+}
+
+struct DiagnosticContextSummary<'a> {
+    file: &'a str,
+    source_bytes: usize,
+}
+
+impl fmt::Debug for DiagnosticContextSummary<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiagnosticContext")
+            .field("file", &self.file)
+            .field("source_bytes", &self.source_bytes)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +54,127 @@ pub struct DiagnosticData {
     pub end_column: usize,
     pub notes: Vec<&'static str>,
     pub helps: Vec<&'static str>,
+}
+
+const MAX_DIAGNOSTIC_MARKER_INDENT: usize = 256;
+const MAX_DIAGNOSTIC_MARKER_CARETS: usize = 256;
+const MAX_DIAGNOSTIC_LINE_CHARS: usize =
+    MAX_DIAGNOSTIC_MARKER_INDENT + MAX_DIAGNOSTIC_MARKER_CARETS;
+const DIAGNOSTIC_LINE_TRUNCATION: &str = "… [line truncated]";
+const MAX_DIAGNOSTIC_INLINE_CHARS: usize = 1024;
+const DIAGNOSTIC_INLINE_TRUNCATION: &str = "… [text truncated]";
+
+impl fmt::Debug for KuError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let diagnostic_context =
+            self.diagnostic_context
+                .as_deref()
+                .map(|context| DiagnosticContextSummary {
+                    file: &context.file,
+                    source_bytes: context.source.len(),
+                });
+        formatter
+            .debug_struct("KuError")
+            .field("kind", &self.kind)
+            .field("message", &self.message)
+            .field("span", &self.span)
+            .field("domain", &self.domain)
+            .field("code", &self.code)
+            .field("diagnostic_context", &diagnostic_context)
+            .finish()
+    }
+}
+
+fn diagnostic_marker(column: usize, caret_len: usize) -> String {
+    let indent = column.saturating_sub(1);
+    let caret_len = caret_len.max(1);
+    if indent > MAX_DIAGNOSTIC_MARKER_INDENT {
+        return format!("... [marker omitted: column={column}, width={caret_len}]");
+    }
+
+    if caret_len > MAX_DIAGNOSTIC_MARKER_CARETS {
+        return format!(
+            "{}{}... [span truncated: width={caret_len}]",
+            " ".repeat(indent),
+            "^".repeat(MAX_DIAGNOSTIC_MARKER_CARETS),
+        );
+    }
+
+    format!("{}{}", " ".repeat(indent), "^".repeat(caret_len))
+}
+
+fn unsafe_diagnostic_char(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn sanitized_diagnostic_preview(text: &str, max_chars: usize) -> (Cow<'_, str>, bool) {
+    let max_chars = max_chars.min(MAX_DIAGNOSTIC_INLINE_CHARS);
+    let mut sanitized = None;
+    let mut end = 0;
+    let mut truncated = false;
+    for (index, (offset, character)) in text.char_indices().enumerate() {
+        if index == max_chars {
+            truncated = true;
+            break;
+        }
+        end = offset + character.len_utf8();
+        let replacement = if character == '\t' {
+            Some(' ')
+        } else if unsafe_diagnostic_char(character) {
+            Some('\u{fffd}')
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            let output = sanitized.get_or_insert_with(|| {
+                let capacity = max_chars.saturating_mul(4);
+                let mut output = String::with_capacity(capacity);
+                output.push_str(&text[..offset]);
+                output
+            });
+            output.push(replacement);
+        } else if let Some(output) = sanitized.as_mut() {
+            output.push(character);
+        }
+    }
+
+    match sanitized {
+        Some(output) => (Cow::Owned(output), truncated),
+        None if truncated => (Cow::Borrowed(&text[..end]), true),
+        None => (Cow::Borrowed(text), false),
+    }
+}
+
+fn diagnostic_line_preview(line: &str) -> (Cow<'_, str>, &'static str) {
+    let (preview, truncated) = sanitized_diagnostic_preview(line, MAX_DIAGNOSTIC_LINE_CHARS);
+    (
+        preview,
+        if truncated {
+            DIAGNOSTIC_LINE_TRUNCATION
+        } else {
+            ""
+        },
+    )
+}
+
+fn diagnostic_inline_preview(text: &str) -> (Cow<'_, str>, &'static str) {
+    let (preview, truncated) = sanitized_diagnostic_preview(text, MAX_DIAGNOSTIC_INLINE_CHARS);
+    (
+        preview,
+        if truncated {
+            DIAGNOSTIC_INLINE_TRUNCATION
+        } else {
+            ""
+        },
+    )
 }
 
 impl KuError {
@@ -117,34 +253,32 @@ impl KuError {
     }
 
     pub fn diagnostic(&self, file: &str, source: &str) -> String {
-        let data = self.diagnostic_data(file, source);
-        let (_, source) = self
+        let (file, source) = self
             .diagnostic_context
             .as_ref()
             .map(|context| (context.file.as_str(), context.source.as_str()))
             .unwrap_or((file, source));
-        let line = data.line;
-        let column = data.column;
+        let (line, column, end_line, end_column) = self.diagnostic_location();
+        let info = self.diagnostic_info();
         let line_text = source.lines().nth(line.saturating_sub(1)).unwrap_or("");
-        let caret_len = if data.end_line == line {
-            data.end_column.saturating_sub(column).max(1)
+        let (line_text, line_suffix) = diagnostic_line_preview(line_text);
+        let caret_len = if end_line == line {
+            end_column.saturating_sub(column).max(1)
         } else {
             1
         };
-        let marker = format!(
-            "{}{}",
-            " ".repeat(column.saturating_sub(1)),
-            "^".repeat(caret_len)
-        );
+        let marker = diagnostic_marker(column, caret_len);
+        let (message, message_suffix) = diagnostic_inline_preview(&self.message);
+        let (file, file_suffix) = diagnostic_inline_preview(file);
 
         let mut output = format!(
-            "error[{}]: error: {}\n  --> {}:{line}:{column}\n   |\n{line:>3} | {line_text}\n   | {marker}",
-            data.code, data.message, data.file
+            "error[{}]: error: {message}{message_suffix}\n  --> {file}{file_suffix}:{line}:{column}\n   |\n{line:>3} | {line_text}{line_suffix}\n   | {marker}",
+            info.code
         );
-        for note in data.notes {
+        for note in info.notes {
             output.push_str(&format!("\n   |\nnote: {note}"));
         }
-        for help in data.helps {
+        for help in info.helps {
             output.push_str(&format!("\nhelp: {help}"));
         }
         output
@@ -156,16 +290,7 @@ impl KuError {
             .as_ref()
             .map(|context| context.file.as_str())
             .unwrap_or(file);
-        let line = self.line().max(1);
-        let column = self.column().max(1);
-        let mut end_line = self.span.end.line.max(line);
-        let mut end_column = self.span.end.column.max(1);
-        if end_line == line {
-            end_column = end_column.max(column.saturating_add(1));
-        } else if self.span.end.line == 0 {
-            end_line = line;
-            end_column = column.saturating_add(1);
-        }
+        let (line, column, end_line, end_column) = self.diagnostic_location();
         let info = self.diagnostic_info();
         DiagnosticData {
             level: "error",
@@ -179,6 +304,20 @@ impl KuError {
             notes: info.notes,
             helps: info.helps,
         }
+    }
+
+    fn diagnostic_location(&self) -> (usize, usize, usize, usize) {
+        let line = self.line().max(1);
+        let column = self.column().max(1);
+        let mut end_line = self.span.end.line.max(line);
+        let mut end_column = self.span.end.column.max(1);
+        if end_line == line {
+            end_column = end_column.max(column.saturating_add(1));
+        } else if self.span.end.line == 0 {
+            end_line = line;
+            end_column = column.saturating_add(1);
+        }
+        (line, column, end_line, end_column)
     }
 
     fn diagnostic_info(&self) -> DiagnosticInfo {
@@ -356,3 +495,152 @@ impl fmt::Display for KuError {
 }
 
 impl std::error::Error for KuError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::span::Position;
+
+    #[test]
+    fn debug_redacts_diagnostic_source_text() {
+        let secret_source = "token = \"do-not-log-this\"";
+        let error = KuError::parse("expected expression", Span::default())
+            .with_diagnostic_context("secret.ku", secret_source);
+
+        let debug = format!("{error:?}");
+        assert!(debug.contains("secret.ku"));
+        assert!(debug.contains(&format!("source_bytes: {}", secret_source.len())));
+        assert!(!debug.contains(secret_source));
+        assert!(!debug.contains("do-not-log-this"));
+    }
+
+    #[test]
+    fn ordinary_diagnostic_rendering_is_unchanged() {
+        let error = KuError::parse(
+            "expected expression",
+            Span::new(Position::new(2, 5, 16), Position::new(2, 10, 21)),
+        );
+
+        assert_eq!(
+            error.diagnostic("sample.ku", "fn main() {\n    value = 1\n}\n"),
+            "error[E0101]: error: expected expression\n  --> sample.ku:2:5\n   |\n  2 |     value = 1\n   |     ^^^^^"
+        );
+    }
+
+    #[test]
+    fn extreme_diagnostic_marker_is_bounded_and_explicit() {
+        let extreme_column = KuError::parse(
+            "bad column",
+            Span::new(
+                Position::new(1, usize::MAX, 0),
+                Position::new(1, usize::MAX, 0),
+            ),
+        )
+        .diagnostic("sample.ku", "x");
+        assert!(extreme_column.len() < 1024);
+        assert!(extreme_column.contains(&format!(
+            "... [marker omitted: column={}, width=1]",
+            usize::MAX
+        )));
+
+        let extreme_width = KuError::parse(
+            "bad width",
+            Span::new(Position::new(1, 1, 0), Position::new(1, usize::MAX, 1)),
+        )
+        .diagnostic("sample.ku", "x");
+        assert!(extreme_width.len() < 1024);
+        assert!(extreme_width.contains(&format!(
+            "{}... [span truncated: width={}]",
+            "^".repeat(MAX_DIAGNOSTIC_MARKER_CARETS),
+            usize::MAX - 1
+        )));
+    }
+
+    #[test]
+    fn diagnostic_marker_limits_have_no_off_by_one_gap() {
+        let visible = diagnostic_marker(
+            MAX_DIAGNOSTIC_MARKER_INDENT + 1,
+            MAX_DIAGNOSTIC_MARKER_CARETS,
+        );
+        assert_eq!(
+            visible,
+            format!(
+                "{}{}",
+                " ".repeat(MAX_DIAGNOSTIC_MARKER_INDENT),
+                "^".repeat(MAX_DIAGNOSTIC_MARKER_CARETS)
+            )
+        );
+
+        let omitted = diagnostic_marker(MAX_DIAGNOSTIC_MARKER_INDENT + 2, 1);
+        assert_eq!(
+            omitted,
+            format!(
+                "... [marker omitted: column={}, width=1]",
+                MAX_DIAGNOSTIC_MARKER_INDENT + 2
+            )
+        );
+    }
+
+    #[test]
+    fn diagnostic_line_preview_is_unicode_safe_and_bounded() {
+        let exact = "界".repeat(MAX_DIAGNOSTIC_LINE_CHARS);
+        let (preview, suffix) = diagnostic_line_preview(&exact);
+        assert_eq!(preview.as_ref(), exact);
+        assert_eq!(suffix, "");
+
+        let long = format!("{}🦀", exact);
+        let error = KuError::parse(
+            "long line",
+            Span::new(Position::new(1, 1, 0), Position::new(1, 2, 1)),
+        );
+        let diagnostic = error.diagnostic("sample.ku", &long);
+        assert!(diagnostic.contains(&format!("{exact}{DIAGNOSTIC_LINE_TRUNCATION}")));
+        assert!(!diagnostic.contains('🦀'));
+        assert!(diagnostic.len() < exact.len() + 256);
+    }
+
+    #[test]
+    fn diagnostic_line_preview_neutralizes_terminal_controls() {
+        let source = "\u{1b}\t";
+        let error = crate::lexer::Lexer::new(source)
+            .lex()
+            .expect_err("ESC must be rejected by the lexer");
+        let diagnostic = error.diagnostic("bad\u{7}\u{2028}\u{202e}.ku", source);
+        for unsafe_character in ['\t', '\u{1b}', '\u{7}', '\u{2028}', '\u{202e}'] {
+            assert!(
+                !diagnostic.contains(unsafe_character),
+                "diagnostic retained unsafe {unsafe_character:?}: {diagnostic:?}"
+            );
+        }
+        assert_eq!(diagnostic.matches('\u{fffd}').count(), 5);
+    }
+
+    #[test]
+    fn diagnostic_inline_text_has_a_unicode_safe_hard_limit() {
+        let exact = "界".repeat(MAX_DIAGNOSTIC_INLINE_CHARS);
+        let message = format!("{exact}🦀");
+        let file = format!("{exact}🦀");
+        let error = KuError::parse(
+            message,
+            Span::new(Position::new(1, 1, 0), Position::new(1, 2, 1)),
+        );
+        let diagnostic = error.diagnostic(&file, "x");
+        assert_eq!(
+            diagnostic
+                .matches(&format!("{exact}{DIAGNOSTIC_INLINE_TRUNCATION}"))
+                .count(),
+            2
+        );
+        assert!(!diagnostic.contains('🦀'));
+        assert!(diagnostic.len() < exact.len() * 2 + 512);
+    }
+
+    #[test]
+    fn debug_without_context_keeps_the_stable_field_shape() {
+        let error = KuError::parse("expected expression", Span::default());
+        assert_eq!(
+            format!("{error:?}"),
+            "KuError { kind: Parse, message: \"expected expression\", span: Span { start: Position { line: 0, column: 0, offset: 0 }, end: Position { line: 0, column: 0, offset: 0 } }, domain: None, code: None, diagnostic_context: None }"
+        );
+    }
+}
