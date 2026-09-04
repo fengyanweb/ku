@@ -26,6 +26,38 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 const PROCESS_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
 
+// Static ABI goldens are not produced by the Rust projector during the test.
+// Both parser implementations are checked against these reviewed bytes.
+const TYPED_UNION_GOLDEN_SOURCE: &str = "fn choose(value: int | str): int | null { return value }";
+const TYPED_UNION_GOLDEN: &str = concat!(
+    "ROOT|11\n",
+    "NODE|1|TypeName|int|0|1:18@17..1:21@20|0|0\n",
+    "NODE|2|TypeName|str|0|1:24@23..1:27@26|0|0\n",
+    "NODE|3|TypeUnion||0|1:18@17..1:27@26|0|2\n",
+    "NODE|4|Parameter|value|0|1:11@10..1:16@15|2|1\n",
+    "NODE|5|TypeName|int|0|1:30@29..1:33@32|3|0\n",
+    "NODE|6|TypeName|null|0|1:36@35..1:40@39|3|0\n",
+    "NODE|7|TypeUnion||0|1:30@29..1:40@39|3|2\n",
+    "NODE|8|Variable|value|0|1:50@49..1:55@54|5|0\n",
+    "NODE|9|Return||0|1:43@42..1:55@54|5|1\n",
+    "NODE|10|Function|choose|0|1:1@0..1:57@56|6|3\n",
+    "NODE|11|Program||0|1:1@0..1:57@56|9|1\n",
+    "EDGE|0|1\n",
+    "EDGE|1|2\n",
+    "EDGE|2|3\n",
+    "EDGE|3|5\n",
+    "EDGE|4|6\n",
+    "EDGE|5|8\n",
+    "EDGE|6|4\n",
+    "EDGE|7|7\n",
+    "EDGE|8|9\n",
+    "EDGE|9|10",
+);
+const UNICODE_CRLF_ERROR_SOURCE: &str =
+    "// 前😀\r\nfn main() {\r\n  text:str = \"中😀\"\r\n  value = 1 + ;\r\n}";
+const UNICODE_CRLF_ERROR_CODE: &str = "unexpected_eof";
+const UNICODE_CRLF_ERROR_CANONICAL: &str = "expected expression|4:15@63..4:16@64";
+
 fn unique_temp_dir(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -553,6 +585,18 @@ fn rust_error_canonical(source: &str) -> String {
     )
 }
 
+#[test]
+fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
+    assert_eq!(
+        rust_canonical(TYPED_UNION_GOLDEN_SOURCE),
+        TYPED_UNION_GOLDEN
+    );
+    assert_eq!(
+        rust_error_canonical(UNICODE_CRLF_ERROR_SOURCE),
+        UNICODE_CRLF_ERROR_CANONICAL
+    );
+}
+
 fn ku_binary() -> PathBuf {
     if let Ok(path) = std::env::var("KU_BIN") {
         let candidate = PathBuf::from(path);
@@ -619,8 +663,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     );
     let broken_expression = "fn main(){ value = 1 + ; }";
     let empty_rhs_expression = "fn main(){ value = ; }";
-    let unicode_broken_expression =
-        "// 前😀\r\nfn main() {\r\n  text:str = \"中😀\"\r\n  value = 1 + ;\r\n}";
+    let unicode_broken_expression = UNICODE_CRLF_ERROR_SOURCE;
     let missing_param_name = "fn f(: int) {}";
     let missing_param_type = "fn f(value:) {}";
     let missing_param_comma = "fn f(left:int right:int) {}";
@@ -802,6 +845,11 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "    direct_tokens = Scan(\"int\")?\n    direct = ParseTypeWindow(direct_tokens.clone())?\n    if (direct.work != 4) {{ panic(\"type-window validation work was not counted\") }}\n    empty_window: [Token] = []\n    ExpectTypeWindowError(empty_window, \"type window must contain one final non-type boundary token\")?\n    missing_boundary: [Token] = [direct_tokens[0].clone()]\n    ExpectTypeWindowError(missing_boundary, \"type window is missing its final non-type boundary|1:1@0..1:4@3\")?\n    early_boundary = direct_tokens.push(direct_tokens[direct_tokens.len() - 1].clone())\n    ExpectTypeWindowError(early_boundary, \"type window boundary must be final|1:4@3..1:4@3\")?\n    too_many_type_tokens = Scan({})?\n    ExpectTypeWindowError(too_many_type_tokens, \"type window accepts at most 512 tokens|1:1@0..1:2@1\")?\n",
         ku_string(&over_type_window_source)
     ));
+    body.push_str(&format!(
+        "    AssertCase({}, {})?\n",
+        ku_string(TYPED_UNION_GOLDEN_SOURCE),
+        ku_string(TYPED_UNION_GOLDEN)
+    ));
     for source in accepted {
         body.push_str(&format!(
             "    AssertCase({}, {})?\n",
@@ -911,7 +959,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     );
     let broken_message = rust_error_canonical(broken_expression);
     let empty_rhs_message = rust_error_canonical(empty_rhs_expression);
-    let unicode_broken_message = rust_error_canonical(unicode_broken_expression);
+    let unicode_broken_message = UNICODE_CRLF_ERROR_CANONICAL.to_string();
     let missing_param_name_message = rust_error_canonical(missing_param_name);
     let missing_param_type_message = rust_error_canonical(missing_param_type);
     let missing_param_comma_message = rust_error_canonical(missing_param_comma);
@@ -1043,7 +1091,7 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         (empty_rhs_expression, "unexpected_eof", empty_rhs_message),
         (
             unicode_broken_expression,
-            "unexpected_eof",
+            UNICODE_CRLF_ERROR_CODE,
             unicode_broken_message,
         ),
         (

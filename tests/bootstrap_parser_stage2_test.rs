@@ -21,6 +21,38 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
 const NATIVE_BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 const PROCESS_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
 
+// These checked-in goldens are deliberately independent of `project_expr`.
+// The Rust projector and the Ku parser must each continue to match them, so a
+// coordinated implementation drift cannot silently redefine the AST ABI.
+const BINARY_GOLDEN_SOURCE: &str = "1 + 2 * 3";
+const BINARY_GOLDEN: &str = concat!(
+    "ROOT|5\n",
+    "NODE|1|Int||1|1:1@0..1:2@1|0|0\n",
+    "NODE|2|Int||2|1:5@4..1:6@5|0|0\n",
+    "NODE|3|Int||3|1:9@8..1:10@9|0|0\n",
+    "NODE|4|Binary|*|0|1:5@4..1:10@9|0|2\n",
+    "NODE|5|Binary|+|0|1:1@0..1:10@9|2|2\n",
+    "EDGE|0|2\n",
+    "EDGE|1|3\n",
+    "EDGE|2|1\n",
+    "EDGE|3|4",
+);
+const CALL_GOLDEN_SOURCE: &str = "apply(1, 2 + 3)";
+const CALL_GOLDEN: &str = concat!(
+    "ROOT|6\n",
+    "NODE|1|Variable|apply|0|1:1@0..1:6@5|0|0\n",
+    "NODE|2|Int||1|1:7@6..1:8@7|0|0\n",
+    "NODE|3|Int||2|1:10@9..1:11@10|0|0\n",
+    "NODE|4|Int||3|1:14@13..1:15@14|0|0\n",
+    "NODE|5|Binary|+|0|1:10@9..1:15@14|0|2\n",
+    "NODE|6|Call||0|1:1@0..1:16@15|2|3\n",
+    "EDGE|0|3\n",
+    "EDGE|1|4\n",
+    "EDGE|2|1\n",
+    "EDGE|3|2\n",
+    "EDGE|4|5",
+);
+
 fn unique_temp_dir(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -189,6 +221,12 @@ fn rust_error_canonical(source: &str) -> String {
         error.span.end.column,
         error.span.end.offset
     )
+}
+
+#[test]
+fn checked_in_stage2_ast_goldens_pin_the_rust_projector() {
+    assert_eq!(rust_canonical(BINARY_GOLDEN_SOURCE), BINARY_GOLDEN);
+    assert_eq!(rust_canonical(CALL_GOLDEN_SOURCE), CALL_GOLDEN);
 }
 
 fn ku_binary() -> PathBuf {
@@ -436,6 +474,16 @@ fn main(): null! {
     body.push_str(
         "    point = Span { line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }\n    max_line = Span { line: 9223372036854775807, column: 1, offset: 0, end_line: 9223372036854775807, end_column: 1, end_offset: 0 }\n    max_column = Span { line: 1, column: 9223372036854775807, offset: 0, end_line: 1, end_column: 9223372036854775807, end_offset: 0 }\n    max_offset = Span { line: 1, column: 1, offset: 9223372036854775807, end_line: 1, end_column: 1, end_offset: 9223372036854775807 }\n    ExpectContextError(\"1\", max_line, point.clone(), false)?\n    ExpectContextError(\"1\", max_column, point.clone(), false)?\n    ExpectContextError(\"1\", max_offset, point.clone(), false)?\n    overlap = Span { line: 7, column: 7, offset: 42, end_line: 7, end_column: 8, end_offset: 43 }\n    ExpectContextError(\"1 +\", context_origin.clone(), overlap, true)?\n    malformed_end = Span { line: 7, column: 12, offset: 47, end_line: 0, end_column: 0, end_offset: 48 }\n    ExpectContextError(\"1 +\", context_origin.clone(), malformed_end, true)?\n    no_boundary_caught = false\n    try { ParseWithContext(\"1 +\", ParseContext { origin: context_origin.clone(), boundary: point.clone(), has_boundary: false })? } catch(err) {\n        no_boundary_caught = true\n        if (err.code != \"unexpected_eof\" || err.message != \"expected expression|7:8@43..7:8@43\") { panic(\"wrong mathematical EOF relocation: \" + err.code + \"/\" + err.message) }\n    }\n    if (!no_boundary_caught) { panic(\"expected mathematical EOF diagnostic\") }\n    exact_boundary = Span { line: 7, column: 8, offset: 43, end_line: 7, end_column: 8, end_offset: 43 }\n    exact_boundary_caught = false\n    try { ParseWithContext(\"1 +\", ParseContext { origin: context_origin.clone(), boundary: exact_boundary, has_boundary: true })? } catch(err) {\n        exact_boundary_caught = true\n        if (err.code != \"unexpected_eof\" || err.message != \"expected expression|7:8@43..7:8@43\") { panic(\"wrong exact boundary relocation: \" + err.code + \"/\" + err.message) }\n    }\n    if (!exact_boundary_caught) { panic(\"expected exact boundary diagnostic\") }\n",
     );
+    for (source, expected) in [
+        (BINARY_GOLDEN_SOURCE, BINARY_GOLDEN),
+        (CALL_GOLDEN_SOURCE, CALL_GOLDEN),
+    ] {
+        body.push_str(&format!(
+            "    AssertCase({}, {})?\n",
+            ku_string(source),
+            ku_string(expected)
+        ));
+    }
     for source in &cases {
         body.push_str(&format!(
             "    AssertCase({}, {})?\n",
