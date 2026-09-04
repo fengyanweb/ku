@@ -68,7 +68,7 @@ fn RelocateTokens(tokens: [Token], context: ParseContext): [Token] {
             end_column = context.boundary.end_column
             end_offset = context.boundary.end_offset
         }
-        relocated = relocated.push(Token {
+        relocated_token = Token {
             kind: input.kind,
             lexeme: input.lexeme,
             int_value: input.int_value,
@@ -78,7 +78,8 @@ fn RelocateTokens(tokens: [Token], context: ParseContext): [Token] {
             end_line: end_line,
             end_column: end_column,
             end_offset: end_offset
-        })
+        }
+        relocated = relocated.push(relocated_token)
         relocate_index = relocate_index + 1
     }
     return relocated

@@ -189,8 +189,10 @@ impl Env {
         Ok(true)
     }
 
-    /// Only used for a proven unshared `xs = xs.push(piece)` after `piece` has
-    /// been evaluated. General `push` remains a pure operation producing a copy.
+    /// Only used for a proven exact `xs = xs.push(piece)` after an effect-free
+    /// `piece` has been evaluated. The binding lock and owner-task check make
+    /// this equally safe for a locally captured cell; general `push` remains a
+    /// pure operation producing a copy.
     pub(crate) fn append_array(&mut self, name: &str, value: Value, span: Span) -> KuResult<()> {
         let cell = self
             .find_cell(name)
@@ -338,15 +340,22 @@ mod collection_tests {
     }
 
     #[test]
-    fn captured_bindings_are_not_eligible_for_unshared_array_reuse() {
+    fn captured_bindings_share_append_updates_across_environments() {
         let span = Span::default();
         let mut env = Env::new();
         env.define("values".into(), Value::Array(Vec::new()), true, span)
             .unwrap();
         assert!(env.is_unshared("values"));
-        let captured = env.capture(&HashSet::from(["values".into()]));
+        let mut captured = env.capture(&HashSet::from(["values".into()]));
         assert!(!env.is_unshared("values"));
         assert!(!captured.is_unshared("values"));
+        captured
+            .append_array("values", Value::Int(7), span)
+            .unwrap();
+        assert!(matches!(
+            env.get("values", span).unwrap(),
+            Value::Array(values) if values == vec![Value::Int(7)]
+        ));
         drop(captured);
         assert!(env.is_unshared("values"));
     }

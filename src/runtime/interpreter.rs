@@ -1362,7 +1362,6 @@ impl Interpreter {
             || !matches!(&target.kind, ExprKind::Variable(receiver) if receiver == name)
             || args.len() != 1
             || !is_pure_append_argument(&args[0], name)
-            || !env.is_unshared(name)
             || self.enums.contains_key(name)
             || !env.with_value(name, target.span, |value| {
                 Ok(matches!(value, Value::Array(_)))
