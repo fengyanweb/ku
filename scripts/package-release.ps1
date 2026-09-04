@@ -588,7 +588,7 @@ function Copy-ExtensionSource([string]$Source, [string]$Destination) {
             if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "VS Code extension source contains a symlink/reparse point: '$entry'" }
             $target = Join-Path $Destination $relative
             if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) { Ensure-PlainDirectory $target; $pending.Push($entry) }
-            else { $length = (Get-Item -LiteralPath $entry).Length; $total += $length; if ($total -gt 64MB) { throw "VS Code extension source exceeds 64 MiB" }; Copy-PlainFile $entry $target 64MB }
+            else { $length = (Get-Item -LiteralPath $entry -Force).Length; $total += $length; if ($total -gt 64MB) { throw "VS Code extension source exceeds 64 MiB" }; Copy-PlainFile $entry $target 64MB }
         }
     }
 }
@@ -974,6 +974,12 @@ function Invoke-ReleaseSelfTest([string]$Repo, [string]$BuilderPath, [string]$He
     try {
         $wrapper = New-ToolWrapper $workRoot; $script:releaseWorkRoot = $workRoot; $script:toolWrapper = $wrapper
         [void](Invoke-CheckedTool 'pwsh' @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $BuilderPath, '-Target', $contract.Target, '-OutputRoot', $workRoot, '-SelfTest') $Repo $workRoot 'builder-selftest' 60000 $wrapper)
+        $extensionProbeSource = Join-Path $workRoot 'extension-source-probe'; Ensure-PlainDirectory $extensionProbeSource
+        $extensionProbeFile = Join-Path $extensionProbeSource '.vscodeignore'; [IO.File]::WriteAllText($extensionProbeFile, 'hidden release input', [Text.Encoding]::ASCII)
+        if ($IsWindows) { [IO.File]::SetAttributes($extensionProbeFile, [IO.FileAttributes]::Hidden) }
+        $extensionProbeDestination = Join-Path $workRoot 'extension-destination-probe'; Copy-ExtensionSource $extensionProbeSource $extensionProbeDestination
+        $copiedExtensionProbe = Join-Path $extensionProbeDestination '.vscodeignore'
+        if (-not (Test-PlainFile $copiedExtensionProbe) -or [IO.File]::ReadAllText($copiedExtensionProbe, [Text.Encoding]::ASCII) -cne 'hidden release input') { throw "release extension copy did not preserve a hidden source file" }
         if (-not $IsWindows) {
             $modeDirectory = Join-Path $workRoot 'mode-directory'; Ensure-PlainDirectory $modeDirectory
             $expectedDirectoryMode = [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute -bor [IO.UnixFileMode]::GroupRead -bor [IO.UnixFileMode]::GroupExecute -bor [IO.UnixFileMode]::OtherRead -bor [IO.UnixFileMode]::OtherExecute
