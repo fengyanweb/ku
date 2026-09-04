@@ -56,7 +56,24 @@ const TYPED_UNION_GOLDEN: &str = concat!(
 const UNICODE_CRLF_ERROR_SOURCE: &str =
     "// 前😀\r\nfn main() {\r\n  text:str = \"中😀\"\r\n  value = 1 + ;\r\n}";
 const UNICODE_CRLF_ERROR_CODE: &str = "unexpected_eof";
-const UNICODE_CRLF_ERROR_CANONICAL: &str = "expected expression|4:15@63..4:16@64";
+const UNICODE_CRLF_ERROR_DETAIL: &str = "expected expression|4:15@63..4:16@64";
+const UNICODE_CRLF_ERROR_CANONICAL: &str = concat!(
+    "error|bootstrap.parser.stage3|unexpected_eof|<source>|",
+    "expected expression|4:15@63..4:16@64",
+);
+const MULTILINE_RELOCATED_ERROR_SOURCE: &str =
+    "// 前😀\r\nfn main() {\r\n  value = 1 +\r\n  );\r\n}";
+const MULTILINE_RELOCATED_ERROR_DETAIL: &str = "binary operator has no left operand|4:3@42..4:4@43";
+const MULTILINE_RELOCATED_ERROR_CANONICAL: &str = concat!(
+    "error|bootstrap.parser.stage3|invalid_expression|<source>|",
+    "binary operator has no left operand|4:3@42..4:4@43",
+);
+const MULTILINE_BOUNDARY_ERROR_SOURCE: &str = "fn main() {\r\n  value = 1 +\r\n  ;\r\n}";
+const MULTILINE_BOUNDARY_ERROR_DETAIL: &str = "expected expression|3:3@30..3:4@31";
+const MULTILINE_BOUNDARY_ERROR_CANONICAL: &str = concat!(
+    "error|bootstrap.parser.stage3|unexpected_eof|<source>|",
+    "expected expression|3:3@30..3:4@31",
+);
 
 fn unique_temp_dir(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -585,6 +602,13 @@ fn rust_error_canonical(source: &str) -> String {
     )
 }
 
+fn rust_diagnostic_canonical(source: &str) -> String {
+    format!(
+        "error|bootstrap.parser.stage3|unexpected_eof|<source>|{}",
+        rust_error_canonical(source)
+    )
+}
+
 #[test]
 fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
     assert_eq!(
@@ -592,8 +616,28 @@ fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
         TYPED_UNION_GOLDEN
     );
     assert_eq!(
-        rust_error_canonical(UNICODE_CRLF_ERROR_SOURCE),
+        rust_diagnostic_canonical(UNICODE_CRLF_ERROR_SOURCE),
         UNICODE_CRLF_ERROR_CANONICAL
+    );
+    assert_eq!(
+        format!(
+            "error|bootstrap.parser.stage3|invalid_expression|<source>|{}",
+            diagnostic_at(
+                MULTILINE_RELOCATED_ERROR_SOURCE,
+                Lexer::new(MULTILINE_RELOCATED_ERROR_SOURCE)
+                    .lex()
+                    .expect("multiline relocation fixture lex")
+                    .iter()
+                    .rposition(|token| token.kind == TokenKind::RParen)
+                    .expect("multiline relocation closing parenthesis"),
+                "binary operator has no left operand"
+            )
+        ),
+        MULTILINE_RELOCATED_ERROR_CANONICAL
+    );
+    assert_eq!(
+        rust_diagnostic_canonical(MULTILINE_BOUNDARY_ERROR_SOURCE),
+        MULTILINE_BOUNDARY_ERROR_CANONICAL
     );
 }
 
@@ -833,16 +877,104 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "stage-3 expression slicing budget exceeded",
     );
     let over_type_window_source = "T ".repeat(512);
+    let direct_import_over_window = "x ".repeat(266);
+    let direct_import_over_tokens = Lexer::new(&direct_import_over_window)
+        .lex()
+        .expect("direct import over-window fixture lex");
+    assert_eq!(
+        direct_import_over_tokens.len(),
+        267,
+        "direct ReadImport fixture must exceed its 266-token window by one"
+    );
+    let direct_import_limit_message = diagnostic_at(
+        &over_import_alias_name_limit,
+        2 + 64 * 4,
+        "stage-3 named imports accept at most 64 names",
+    );
+    let direct_import_over_message = diagnostic_at(
+        &direct_import_over_window,
+        265,
+        "stage-3 import inspection budget exceeded",
+    );
+    let direct_map_token_limit_source = "x ".repeat(511);
+    assert_eq!(
+        Lexer::new(&direct_map_token_limit_source)
+            .lex()
+            .expect("direct token-map boundary fixture lex")
+            .len(),
+        512,
+        "direct MapTokenCharacters fixture must reach its exact token limit"
+    );
+    let direct_map_token_over_source = "x ".repeat(512);
+    assert_eq!(
+        Lexer::new(&direct_map_token_over_source)
+            .lex()
+            .expect("direct token-map over-limit fixture lex")
+            .len(),
+        513,
+        "direct MapTokenCharacters fixture must exceed its token limit by one"
+    );
+    let direct_map_token_over_message = diagnostic_at(
+        &direct_map_token_over_source,
+        0,
+        "stage-3 parser accepts at most 512 tokens",
+    );
 
-    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { AstCanonical } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { AstCanonical } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { MapTokenCharacters } from \"./support.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
     body.push_str(
-        "fn ExpectError(source: str, expected_code: str, expected_message: str): null! {\n    caught = false\n    try { ParseProgram(source.clone())? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong stage-3 diagnostic for \" + source + \": \" + err.domain + \"/\" + err.code + \"/\" + err.message + \" EXPECTED \" + expected_code + \"/\" + expected_message) }\n    }\n    if (!caught) { panic(\"expected stage-3 parser error\") }\n    return ok(null)\n}\n\nfn ExpectTypeWindowError(tokens: [Token], expected_message: str): null! {\n    caught = false\n    try { ParseTypeWindow(tokens)? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != \"invalid_token_stream\" || err.message != expected_message) { panic(\"wrong type-window diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message) }\n    }\n    if (!caught) { panic(\"expected type-window error\") }\n    return ok(null)\n}\n\nfn main(): null! {\n",
+        r#"fn ExpectEmptyImportWindowError(): null! {
+    empty: [Token] = []
+    caught = false
+    try { ReadImport(empty)? } catch(err) {
+        caught = true
+        expected = "error|bootstrap.parser.stage3|invalid_token_stream|<source>|import window must start with import and end with EOF|1:1@0..1:1@0"
+        if (err.domain != "bootstrap.parser.stage3" || err.code != "invalid_token_stream" || err.message != expected) {
+            panic("wrong empty import-window diagnostic: " + err.domain + "/" + err.code + "/" + err.message)
+        }
+    }
+    if (!caught) { panic("expected empty import-window error") }
+    return ok(null)
+}
+
+"#,
+    );
+    body.push_str(
+        r#"fn ExpectImportWindowError(tokens: [Token], expected_code: str, expected_detail: str): null! {
+    expected_message = "error|bootstrap.parser.stage3|" + expected_code.clone() + "|<source>|" + expected_detail
+    caught = false
+    try { ReadImport(tokens)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.parser.stage3" || err.code != expected_code || err.message != expected_message) {
+            panic("wrong direct import-window diagnostic: " + err.domain + "/" + err.code + "/" + err.message + " EXPECTED " + expected_message)
+        }
+    }
+    if (!caught) { panic("expected direct import-window error") }
+    return ok(null)
+}
+
+fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expected_detail: str): null! {
+    expected_message = "error|bootstrap.parser.stage3|" + expected_code.clone() + "|<source>|" + expected_detail
+    caught = false
+    try { MapTokenCharacters(source, tokens)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.parser.stage3" || err.code != expected_code || err.message != expected_message) {
+            panic("wrong direct token-map diagnostic: " + err.domain + "/" + err.code + "/" + err.message + " EXPECTED " + expected_message)
+        }
+    }
+    if (!caught) { panic("expected direct token-map error") }
+    return ok(null)
+}
+
+"#,
+    );
+    body.push_str(
+        "fn ExpectError(source: str, expected_code: str, expected_detail: str): null! {\n    expected_message = \"error|bootstrap.parser.stage3|\" + expected_code.clone() + \"|<source>|\" + expected_detail\n    caught = false\n    try { ParseProgram(source.clone())? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong stage-3 diagnostic for \" + source + \": \" + err.domain + \"/\" + err.code + \"/\" + err.message + \" EXPECTED \" + expected_code + \"/\" + expected_message) }\n    }\n    if (!caught) { panic(\"expected stage-3 parser error\") }\n    return ok(null)\n}\n\nfn ExpectTypeWindowError(tokens: [Token], expected_detail: str): null! {\n    expected_message = \"error|bootstrap.parser.stage3|invalid_token_stream|<source>|\" + expected_detail\n    caught = false\n    try { ParseTypeWindow(tokens)? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != \"invalid_token_stream\" || err.message != expected_message) { panic(\"wrong type-window diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message + \" EXPECTED \" + expected_message) }\n    }\n    if (!caught) { panic(\"expected type-window error\") }\n    return ok(null)\n}\n\nfn main(): null! {\n",
     );
     body.push_str(&format!(
-        "    direct_tokens = Scan(\"int\")?\n    direct = ParseTypeWindow(direct_tokens.clone())?\n    if (direct.work != 4) {{ panic(\"type-window validation work was not counted\") }}\n    empty_window: [Token] = []\n    ExpectTypeWindowError(empty_window, \"type window must contain one final non-type boundary token\")?\n    missing_boundary: [Token] = [direct_tokens[0].clone()]\n    ExpectTypeWindowError(missing_boundary, \"type window is missing its final non-type boundary|1:1@0..1:4@3\")?\n    early_boundary = direct_tokens.push(direct_tokens[direct_tokens.len() - 1].clone())\n    ExpectTypeWindowError(early_boundary, \"type window boundary must be final|1:4@3..1:4@3\")?\n    too_many_type_tokens = Scan({})?\n    ExpectTypeWindowError(too_many_type_tokens, \"type window accepts at most 512 tokens|1:1@0..1:2@1\")?\n",
+        "    ExpectEmptyImportWindowError()?\n    direct_tokens = Scan(\"int\")?\n    direct = ParseTypeWindow(direct_tokens.clone())?\n    if (direct.work != 4) {{ panic(\"type-window validation work was not counted\") }}\n    empty_window: [Token] = []\n    ExpectTypeWindowError(empty_window, \"type window must contain one final non-type boundary token|1:1@0..1:1@0\")?\n    missing_boundary: [Token] = [direct_tokens[0].clone()]\n    ExpectTypeWindowError(missing_boundary, \"type window is missing its final non-type boundary|1:1@0..1:4@3\")?\n    early_boundary = direct_tokens.push(direct_tokens[direct_tokens.len() - 1].clone())\n    ExpectTypeWindowError(early_boundary, \"type window boundary must be final|1:4@3..1:4@3\")?\n    too_many_type_tokens = Scan({})?\n    ExpectTypeWindowError(too_many_type_tokens, \"type window accepts at most 512 tokens|1:1@0..1:2@1\")?\n",
         ku_string(&over_type_window_source)
     ));
     body.push_str(&format!(
@@ -931,6 +1063,22 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "    many_aliases = ParseProgram({})?\n    if (many_aliases.root != 130 || many_aliases.arena.nodes.len() != 130 || many_aliases.arena.edges.len() != 129) {{ panic(\"stage-3 import-alias arena boundary mismatch\") }}\n",
         ku_string(&named_import_alias_boundary)
     ));
+    body.push_str(&format!(
+        "    direct_import_limit = Scan({})?\n    ExpectImportWindowError(direct_import_limit, \"import_name_limit\", {})?\n    direct_import_over = Scan({})?\n    ExpectImportWindowError(direct_import_over, \"work_limit\", {})?\n",
+        ku_string(&over_import_alias_name_limit),
+        ku_string(&direct_import_limit_message),
+        ku_string(&direct_import_over_window),
+        ku_string(&direct_import_over_message),
+    ));
+    body.push_str(&format!(
+        "    direct_map_limit_source = {}\n    direct_map_limit_tokens = Scan(direct_map_limit_source.clone())?\n    direct_map_limit = MapTokenCharacters(direct_map_limit_source.clone(), direct_map_limit_tokens)?\n    if (direct_map_limit.characters.len() != direct_map_limit_source.len() || direct_map_limit.starts.len() != 512 || direct_map_limit.ends.len() != 512) {{ panic(\"direct token-map exact token boundary mismatch\") }}\n    direct_map_over_source = {}\n    direct_map_over_tokens = Scan(direct_map_over_source.clone())?\n    ExpectTokenMapError(direct_map_over_source, direct_map_over_tokens, \"invalid_token_stream\", {})?\n",
+        ku_string(&direct_map_token_limit_source),
+        ku_string(&direct_map_token_over_source),
+        ku_string(&direct_map_token_over_message),
+    ));
+    body.push_str(
+        "    map_source = \" \"\n    map_source_round = 0\n    while (map_source_round < 15) {\n        map_source_copy = map_source.clone()\n        map_source += map_source_copy\n        map_source_round = map_source_round + 1\n    }\n    if (map_source.len() != 32768 || map_source.byte_len() != 32768) { panic(\"direct token-map source boundary fixture mismatch\") }\n    map_source_tokens = Scan(map_source.clone())?\n    map_source_limit = MapTokenCharacters(map_source.clone(), map_source_tokens)?\n    if (map_source_limit.characters.len() != 32768 || map_source_limit.starts.len() != 1 || map_source_limit.starts[0] != 32768) { panic(\"direct token-map exact source boundary mismatch\") }\n    map_source_over = map_source + \" \"\n    map_point_tokens = Scan(\"\")?\n    ExpectTokenMapError(map_source_over, map_point_tokens, \"work_limit\", \"stage-3 token mapping budget exceeded|1:1@0..1:1@0\")?\n    wide_source = \"😀\"\n    wide_source_round = 0\n    while (wide_source_round < 15) {\n        wide_source_copy = wide_source.clone()\n        wide_source += wide_source_copy\n        wide_source_round = wide_source_round + 1\n    }\n    if (wide_source.len() != 32768 || wide_source.byte_len() != 131072) { panic(\"direct token-map byte boundary fixture mismatch\") }\n    wide_point_tokens = Scan(\"\")?\n    wide_source_limit = MapTokenCharacters(wide_source.clone(), wide_point_tokens.clone())?\n    if (wide_source_limit.characters.len() != 32768) { panic(\"direct token-map exact byte boundary mismatch\") }\n    wide_source_over = wide_source + \"😀\"\n    ExpectTokenMapError(wide_source_over, wide_point_tokens, \"work_limit\", \"stage-3 token mapping budget exceeded|1:1@0..1:1@0\")?\n",
+    );
 
     let let_message = diagnostic_for_kind(
         let_source,
@@ -959,7 +1107,9 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     );
     let broken_message = rust_error_canonical(broken_expression);
     let empty_rhs_message = rust_error_canonical(empty_rhs_expression);
-    let unicode_broken_message = UNICODE_CRLF_ERROR_CANONICAL.to_string();
+    let unicode_broken_message = UNICODE_CRLF_ERROR_DETAIL.to_string();
+    let multiline_relocated_message = MULTILINE_RELOCATED_ERROR_DETAIL.to_string();
+    let multiline_boundary_message = MULTILINE_BOUNDARY_ERROR_DETAIL.to_string();
     let missing_param_name_message = rust_error_canonical(missing_param_name);
     let missing_param_type_message = rust_error_canonical(missing_param_type);
     let missing_param_comma_message = rust_error_canonical(missing_param_comma);
@@ -1093,6 +1243,16 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
             unicode_broken_expression,
             UNICODE_CRLF_ERROR_CODE,
             unicode_broken_message,
+        ),
+        (
+            MULTILINE_RELOCATED_ERROR_SOURCE,
+            "invalid_expression",
+            multiline_relocated_message,
+        ),
+        (
+            MULTILINE_BOUNDARY_ERROR_SOURCE,
+            "unexpected_eof",
+            multiline_boundary_message,
         ),
         (
             missing_param_name,

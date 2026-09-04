@@ -1,5 +1,5 @@
 import { Token } from "../stage1/token.ku"
-import { RejectAt } from "./support.ku"
+import { RejectAt, RejectAtPoint } from "./support.ku"
 
 struct ImportNameRead {
     source: Token
@@ -28,12 +28,19 @@ fn ConsumedImportToken(tokens: [Token], index: int): Token {
 // after the first string. Every accepted grammar path therefore has the path
 // token and optional semicolon lookahead without copying the complete module.
 fn ReadImport(tokens: [Token]): ImportRead! {
+    // ParseProgram can hand this helper at most 265 source tokens plus its
+    // appended EOF sentinel. Keep the independently importable entry point on
+    // the same boundary before its validation walk or any prefix-copying
+    // helper call. Token 265 is the token ParseProgram would reject while
+    // attempting to grow an already-full source window.
+    if (tokens.len() > 266) {
+        RejectAt(tokens[265].clone(), "work_limit", "stage-3 import inspection budget exceeded")?
+    }
+    if (tokens.len() == 0) {
+        RejectAtPoint("invalid_token_stream", "import window must start with import and end with EOF")?
+    }
     if (tokens.len() < 2 || tokens[0].kind != "Import" || tokens[tokens.len() - 1].kind != "Eof") {
-        fail {
-            domain: "bootstrap.parser.stage3",
-            code: "invalid_token_stream",
-            message: "import window must start with import and end with EOF"
-        }
+        RejectAt(tokens[0].clone(), "invalid_token_stream", "import window must start with import and end with EOF")?
     }
     check_index = 0
     while (check_index < tokens.len() - 1) {

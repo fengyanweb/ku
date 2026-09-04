@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Scan } from "../stage1/lexer.ku"
 import { Span, SpanFromToken, SpanMerge } from "./span.ku"
-import { Diagnostic, DiagnosticCanonical } from "./diagnostic.ku"
+import { MakeDiagnostic, DiagnosticCanonical } from "./diagnostic.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "./ast.ku"
 import { ParseContext, DefaultParseContext, ParseContextError, RelocateTokens } from "./context.ku"
 
@@ -31,19 +31,18 @@ struct ValueEntry {
     previous: int
 }
 
-fn RejectAt(token: Token, code: str, message: str): null! {
-    diagnostic = Diagnostic {
-        code: code.clone(),
-        message: message,
-        line: token.line,
-        column: token.column,
-        offset: token.offset,
-        end_line: token.end_line,
-        end_column: token.end_column,
-        end_offset: token.end_offset
-    }
+fn RejectAt(token: Token, code: str, message: str, stage3_domain: bool): null! {
+    domain = "bootstrap.parser"
+    if (stage3_domain) { domain = "bootstrap.parser.stage3" }
+    diagnostic = MakeDiagnostic("error", domain.clone(), code.clone(), message, "<source>", SpanFromToken(token))
     canonical = DiagnosticCanonical(diagnostic)
-    fail { domain: "bootstrap.parser", code: code, message: canonical }
+    fail { domain: domain, code: code, message: canonical }
+}
+
+fn RejectAtPoint(code: str, message: str, stage3_domain: bool): null! {
+    point = Token { kind: "Eof", lexeme: "", int_value: 0, line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    RejectAt(point, code, message, stage3_domain)?
+    return ok(null)
 }
 
 fn MakeOperator(marker: str, text: str, precedence: int, unary: bool, token: Token, previous: int, base_value: int, depth_active: bool): OperatorEntry {
@@ -65,31 +64,33 @@ fn MakeOperator(marker: str, text: str, precedence: int, unary: bool, token: Tok
 }
 
 fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
+    // Reject caller-controlled diagnostic identity before inspecting source.
+    // The payload always uses the fixed logical source name <source>.
+    stage3_domain = context.diagnostic_domain == "bootstrap.parser.stage3"
+    if (!stage3_domain && context.diagnostic_domain != "bootstrap.parser") {
+        RejectAtPoint("invalid_parse_context", "parse diagnostic domain is not permitted", false)?
+    }
     source_characters = source.len()
     source_bytes = source.byte_len()
     tokens = Scan(source)?
     if (tokens.len() == 0) {
-        fail {
-            domain: "bootstrap.parser",
-            code: "invalid_token_stream",
-            message: "token stream must end in exactly one EOF|0:0@0..0:0@0"
-        }
+        RejectAtPoint("invalid_token_stream", "token stream must end in exactly one EOF", stage3_domain)?
     }
     context_error = ParseContextError(source_characters, source_bytes, tokens[tokens.len() - 1].clone(), context.clone())
-    if (context_error != "") { RejectAt(tokens[0].clone(), "invalid_parse_context", context_error)? }
+    if (context_error != "") { RejectAt(tokens[0].clone(), "invalid_parse_context", context_error, stage3_domain)? }
     tokens = RelocateTokens(tokens, context)
     if (tokens.len() > 4096) {
-        RejectAt(tokens[0].clone(), "invalid_token_stream", "stage-2 parser accepts at most 4096 tokens")?
+        RejectAt(tokens[0].clone(), "invalid_token_stream", "stage-2 parser accepts at most 4096 tokens", stage3_domain)?
     }
     cursor = 0
     while (cursor < tokens.len() - 1) {
         if (tokens[cursor].kind == "Eof") {
-            RejectAt(tokens[cursor].clone(), "invalid_token_stream", "EOF must be the final token")?
+            RejectAt(tokens[cursor].clone(), "invalid_token_stream", "EOF must be the final token", stage3_domain)?
         }
         cursor = cursor + 1
     }
     if (tokens[tokens.len() - 1].kind != "Eof") {
-        RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "token stream is missing EOF")?
+        RejectAt(tokens[tokens.len() - 1].clone(), "invalid_token_stream", "token stream is missing EOF", stage3_domain)?
     }
 
     cursor = 0
@@ -103,15 +104,15 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
 
     fn AddNode(kind: str, text: str, int_value: int, span: Span, children: [int]): int! {
         if (arena_nodes.len() >= 4096) {
-            RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes")?
+            RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes", stage3_domain)?
         }
         if (children.len() > 8192 - arena_edges.len()) {
-            RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges")?
+            RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges", stage3_domain)?
         }
         first_edge = arena_edges.len()
         for child in children {
             if (child <= 0 || child > arena_nodes.len()) {
-                RejectAt(tokens[cursor].clone(), "invalid_node_id", "AST edge references an invalid NodeId")?
+                RejectAt(tokens[cursor].clone(), "invalid_node_id", "AST edge references an invalid NodeId", stage3_domain)?
             }
             arena_edges = arena_edges.push(child)
         }
@@ -137,7 +138,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
     // create a rejected local-RC ownership cycle.
     fn ReduceTop(): null! {
         if (operator_top == 0 || operators[operator_top - 1].marker != "" || value_top == 0) {
-            RejectAt(tokens[cursor].clone(), "invalid_expression", "operator has no operand")?
+            RejectAt(tokens[cursor].clone(), "invalid_expression", "operator has no operand", stage3_domain)?
         }
         operator = operators[operator_top - 1].clone()
         operator_top = operator.previous
@@ -146,10 +147,10 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
         if (operator.unary) {
             child = arena_nodes[right_entry.node - 1].clone()
             if (arena_nodes.len() >= 4096) {
-                RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes")?
+                RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes", stage3_domain)?
             }
             if (arena_edges.len() >= 8192) {
-                RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges")?
+                RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges", stage3_domain)?
             }
             first_edge = arena_edges.len()
             arena_edges = arena_edges.push(right_entry.node)
@@ -175,17 +176,17 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             return ok(null)
         }
         if (value_top == 0) {
-            RejectAt(tokens[cursor].clone(), "invalid_expression", "binary operator has no left operand")?
+            RejectAt(tokens[cursor].clone(), "invalid_expression", "binary operator has no left operand", stage3_domain)?
         }
         left_entry = values[value_top - 1].clone()
         value_top = left_entry.previous
         left = arena_nodes[left_entry.node - 1].clone()
         right = arena_nodes[right_entry.node - 1].clone()
         if (arena_nodes.len() >= 4096) {
-            RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes")?
+            RejectAt(tokens[cursor].clone(), "node_limit", "stage-2 parser accepts at most 4096 AST nodes", stage3_domain)?
         }
         if (arena_edges.len() > 8190) {
-            RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges")?
+            RejectAt(tokens[cursor].clone(), "edge_limit", "stage-2 parser accepts at most 8192 AST edges", stage3_domain)?
         }
         first_edge = arena_edges.len()
         arena_edges = arena_edges.push(left_entry.node)
@@ -217,7 +218,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
     while (parsing) {
         steps = steps + 1
         if (steps > 16384) {
-            RejectAt(tokens[cursor].clone(), "work_limit", "stage-2 parser work budget exceeded")?
+            RejectAt(tokens[cursor].clone(), "work_limit", "stage-2 parser work budget exceeded", stage3_domain)?
         }
         token = tokens[cursor].clone()
         closing = token.kind == "RParen" || token.kind == "RBracket"
@@ -231,16 +232,16 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                 }
             }
             if (operator_top == 0) {
-                RejectAt(token.clone(), "unexpected_token", "closing delimiter has no matching opener")?
+                RejectAt(token.clone(), "unexpected_token", "closing delimiter has no matching opener", stage3_domain)?
             }
             marker = operators[operator_top - 1].clone()
             expected_close = "RParen"
             if (marker.marker == "array" || marker.marker == "index") { expected_close = "RBracket" }
             if (token.kind != expected_close) {
-                RejectAt(token.clone(), "unexpected_token", "closing delimiter does not match opener")?
+                RejectAt(token.clone(), "unexpected_token", "closing delimiter does not match opener", stage3_domain)?
             }
             if (expect_operand && (marker.depth_active || (marker.marker != "array" && marker.marker != "call"))) {
-                RejectAt(token.clone(), "unexpected_token", "expected expression before closing delimiter")?
+                RejectAt(token.clone(), "unexpected_token", "expected expression before closing delimiter", stage3_domain)?
             }
             operator_top = marker.previous
             if (marker.depth_active) { depth = depth - 1 }
@@ -249,7 +250,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             walk = value_top
             while (walk != marker.base_value) {
                 if (walk == 0) {
-                    RejectAt(token.clone(), "invalid_expression", "delimiter lost its value stack base")?
+                    RejectAt(token.clone(), "invalid_expression", "delimiter lost its value stack base", stage3_domain)?
                 }
                 entry = values[walk - 1].clone()
                 reversed = reversed.push(entry.node)
@@ -257,7 +258,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             }
             count = reversed.len()
             if ((marker.marker == "group" || marker.marker == "index") && count != 1) {
-                RejectAt(token.clone(), "invalid_expression", "delimiter requires exactly one expression")?
+                RejectAt(token.clone(), "invalid_expression", "delimiter requires exactly one expression", stage3_domain)?
             }
 
             if (marker.marker == "group") {
@@ -317,19 +318,19 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             expect_operand = false
         } else if (token.kind == "Eof") {
             if (expect_operand) {
-                RejectAt(token.clone(), "unexpected_eof", "expected expression")?
+                RejectAt(token.clone(), "unexpected_eof", "expected expression", stage3_domain)?
             }
             while (operator_top != 0 && operators[operator_top - 1].marker == "") {
                 ReduceTop()?
             }
             if (operator_top != 0) {
-                RejectAt(token.clone(), "unexpected_eof", "expected closing delimiter")?
+                RejectAt(token.clone(), "unexpected_eof", "expected closing delimiter", stage3_domain)?
             }
             parsing = false
         } else if (expect_operand) {
             if (token.kind == "Bang" || token.kind == "Minus") {
                 if (depth >= 32) {
-                    RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested")?
+                    RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested", stage3_domain)?
                 }
                 depth = depth + 1
                 operator_entry = MakeOperator("", token.lexeme.clone(), 7, true, token, operator_top, 0, false)
@@ -343,7 +344,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                 active = tokens[cursor + 1].kind != expected_close
                 if (active) {
                     if (depth >= 32) {
-                        RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested")?
+                        RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested", stage3_domain)?
                     }
                     depth = depth + 1
                 }
@@ -371,7 +372,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                 } else if (token.kind == "Ident") {
                     node = AddNode("Variable", token.lexeme, 0, span, [])?
                 } else {
-                    RejectAt(token.clone(), "unsupported_expression", "expression form is outside the stage-2 bootstrap subset")?
+                    RejectAt(token.clone(), "unsupported_expression", "expression form is outside the stage-2 bootstrap subset", stage3_domain)?
                 }
                 value_entry = ValueEntry { node: node, previous: value_top }
                 values = values.push(value_entry)
@@ -384,11 +385,11 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
                 ReduceTop()?
             }
             if (operator_top == 0 || (operators[operator_top - 1].marker != "array" && operators[operator_top - 1].marker != "call")) {
-                RejectAt(token.clone(), "unexpected_token", "comma is only valid in an array or call")?
+                RejectAt(token.clone(), "unexpected_token", "comma is only valid in an array or call", stage3_domain)?
             }
             marker = operators[operator_top - 1].clone()
             if (value_top == marker.base_value) {
-                RejectAt(token.clone(), "unexpected_token", "expected expression before comma")?
+                RejectAt(token.clone(), "unexpected_token", "expected expression before comma", stage3_domain)?
             }
             cursor = cursor + 1
             expect_operand = true
@@ -398,11 +399,11 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             if (token.kind == "LBracket") { marker_kind = "index" expected_close = "RBracket" }
             active = tokens[cursor + 1].kind != expected_close
             if (marker_kind == "index" && !active) {
-                RejectAt(tokens[cursor + 1].clone(), "unexpected_token", "expected expression before closing delimiter")?
+                RejectAt(tokens[cursor + 1].clone(), "unexpected_token", "expected expression before closing delimiter", stage3_domain)?
             }
             if (active) {
                 if (depth >= 32) {
-                    RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested")?
+                    RejectAt(token.clone(), "depth_exceeded", "maximum parse depth exceeded; expression is too deeply nested", stage3_domain)?
                 }
                 depth = depth + 1
             }
@@ -416,7 +417,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             cursor = cursor + 1
             field = tokens[cursor].clone()
             if (field.kind != "Ident") {
-                RejectAt(field.clone(), "unexpected_token", "expected field name after field operator")?
+                RejectAt(field.clone(), "unexpected_token", "expected field name after field operator", stage3_domain)?
             }
             target_entry = values[value_top - 1].clone()
             value_top = target_entry.previous
@@ -468,7 +469,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
             if (token.kind == "Star") { precedence = 6 text = "*" }
             if (token.kind == "Percent") { precedence = 6 text = "%" }
             if (precedence == 0) {
-                RejectAt(token.clone(), "trailing_token", "expected end of expression")?
+                RejectAt(token.clone(), "trailing_token", "expected end of expression", stage3_domain)?
             }
             reducing = true
             while (reducing) {
@@ -487,7 +488,7 @@ fn ParseWithContext(source: str, context: ParseContext): ParseOutput! {
     }
 
     if (value_top == 0 || values[value_top - 1].previous != 0) {
-        RejectAt(tokens[cursor].clone(), "invalid_expression", "expression did not reduce to one root")?
+        RejectAt(tokens[cursor].clone(), "invalid_expression", "expression did not reduce to one root", stage3_domain)?
     }
     root = values[value_top - 1].node
     // AddNode/ReduceTop retain the shared cells until this frame exits. Clone

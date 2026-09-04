@@ -1,6 +1,6 @@
 import { Token } from "../stage1/token.ku"
 import { SpanFromToken } from "../stage2/span.ku"
-import { Diagnostic, DiagnosticCanonical } from "../stage2/diagnostic.ku"
+import { MakeDiagnostic, DiagnosticCanonical } from "../stage2/diagnostic.ku"
 import { ParseOutput } from "../stage2/ast.ku"
 import { ParseWithContext } from "../stage2/parser.ku"
 import { ParseContext } from "../stage2/context.ku"
@@ -15,39 +15,24 @@ struct SourceMap {
 // Pure Stage 3 helpers live outside parser.ku so each self-hosted source file
 // remains below Stage 1's fixed per-file token ceiling.
 fn RejectAt(token: Token, code: str, message: str): null! {
-    diagnostic = Diagnostic {
-        code: code.clone(),
-        message: message,
-        line: token.line,
-        column: token.column,
-        offset: token.offset,
-        end_line: token.end_line,
-        end_column: token.end_column,
-        end_offset: token.end_offset
-    }
+    diagnostic = MakeDiagnostic("error", "bootstrap.parser.stage3", code.clone(), message, "<source>", SpanFromToken(token))
     canonical = DiagnosticCanonical(diagnostic)
     fail { domain: "bootstrap.parser.stage3", code: code, message: canonical }
 }
 
+fn RejectAtPoint(code: str, message: str): null! {
+    point = Token { kind: "Eof", lexeme: "", int_value: 0, line: 1, column: 1, offset: 0, end_line: 1, end_column: 1, end_offset: 0 }
+    RejectAt(point, code, message)?
+    return ok(null)
+}
+
 fn ParseExpressionAt(source: str, origin: Token, boundary: Token): ParseOutput! {
-    try {
-        return ok(ParseWithContext(source, ParseContext {
-            origin: SpanFromToken(origin),
-            boundary: SpanFromToken(boundary),
-            has_boundary: true
-        })?)
-    } catch(err) {
-        fail {
-            domain: "bootstrap.parser.stage3",
-            code: err.code.clone(),
-            message: err.message
-        }
-    }
-    fail {
-        domain: "bootstrap.parser.stage3",
-        code: "unreachable_expression_error",
-        message: "stage-3 expression error path did not terminate"
-    }
+    return ok(ParseWithContext(source, ParseContext {
+        diagnostic_domain: "bootstrap.parser.stage3",
+        origin: SpanFromToken(origin),
+        boundary: SpanFromToken(boundary),
+        has_boundary: true
+    })?)
 }
 
 fn CanEndExpression(kind: str): bool {
@@ -86,6 +71,20 @@ fn PushExpressionBoundary(state: ExpressionBoundary, token: Token, previous_can_
 }
 
 fn MapTokenCharacters(source: str, tokens: [Token]): SourceMap! {
+    // Match the source and token bounds enforced by Scan + ParseProgram even
+    // when this helper is imported directly. The byte check is the cheap
+    // UTF-8 prefilter; source.len() is bounded by it and does not materialize
+    // the character array. Do all guards before source.chars() or the mapping
+    // loop's first token clone.
+    if (source.byte_len() > 131072) {
+        RejectAtPoint("work_limit", "stage-3 token mapping budget exceeded")?
+    }
+    if (source.len() > 32768) {
+        RejectAtPoint("work_limit", "stage-3 token mapping budget exceeded")?
+    }
+    if (tokens.len() > 512) {
+        RejectAt(tokens[0].clone(), "invalid_token_stream", "stage-3 parser accepts at most 512 tokens")?
+    }
     characters: [str] = source.chars()
     starts: [int] = []
     ends: [int] = []
