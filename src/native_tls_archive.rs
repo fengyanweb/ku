@@ -857,7 +857,11 @@ pub(crate) use tests::fixture_archive;
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
     fn append_bsd_member(archive: &mut Vec<u8>, name: &[u8], data: &[u8]) {
         let name_end = archive.len() + 60 + name.len();
@@ -900,18 +904,28 @@ mod tests {
         }
         v
     }
-    fn temp(bytes: &[u8]) -> (std::path::PathBuf, File) {
+    fn temp_with_clock(bytes: &[u8], clock: u128) -> (std::path::PathBuf, File) {
+        let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
-            "ku-tls-ar-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "ku-tls-ar-{}-{clock}-{sequence}",
+            std::process::id()
         ));
-        std::fs::write(&p, bytes).unwrap();
-        let f = OpenOptions::new().read(true).open(&p).unwrap();
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&p)
+            .unwrap();
+        f.write_all(bytes).unwrap();
         (p, f)
+    }
+
+    fn temp(bytes: &[u8]) -> (std::path::PathBuf, File) {
+        let clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        temp_with_clock(bytes, clock)
     }
     fn names() -> (Vec<u8>, Vec<u32>) {
         let mut table = vec![0];
@@ -1057,6 +1071,25 @@ mod tests {
         assert!(!scan(&mut file, 0, adversarial.len() as u64, &adversarial_needle,).unwrap());
         drop(file);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn temp_archives_are_distinct_when_the_clock_does_not_advance() {
+        let clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (first_path, first_file) = temp_with_clock(b"first archive", clock);
+        let (second_path, second_file) = temp_with_clock(b"second archive", clock);
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(std::fs::read(&first_path).unwrap(), b"first archive");
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"second archive");
+
+        drop(first_file);
+        drop(second_file);
+        std::fs::remove_file(first_path).ok();
+        std::fs::remove_file(second_path).ok();
     }
 
     #[test]
