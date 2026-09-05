@@ -5660,6 +5660,249 @@ fn main(): null! {
 }
 
 #[test]
+fn native_parameters_captured_by_deeper_functions_keep_types_and_ownership() {
+    let dir = unique_temp_dir("captured-parameters");
+    fs::write(
+        dir.join("main.ku"),
+        r#"struct CapturedBox {
+    text: str
+}
+
+enum CapturedChoice {
+    Text(value: str)
+    None
+}
+
+fn CopyParameter(copy_parameter: int): int {
+    counter = copy_parameter
+    fn read_parameter(): int {
+        return copy_parameter
+    }
+    fn bump(): int {
+        counter = counter + 1
+        return counter
+    }
+    return read_parameter() * 100 + bump() * 10 + bump()
+}
+
+fn CaptureText(text: str): str {
+    fn snapshot(): str {
+        return text.clone()
+    }
+    first = snapshot()
+    second = snapshot()
+    return first + "|" + second
+}
+
+fn CaptureArray(values: [int]): int {
+    fn snapshot(): [int] {
+        return values.clone()
+    }
+    first = snapshot()
+    second = snapshot()
+    return first[0] * 10 + second[1]
+}
+
+fn WriteOnlyArrayParameter(values_to_write: [int]): int {
+    setter = () => {
+        values_to_write[0] = 9
+        return 0
+    }
+    setter()
+    return values_to_write[0]
+}
+
+fn CaptureFunction(operation: fn(): int): int {
+    fn invoke(): int {
+        return operation()
+    }
+    return invoke() + operation()
+}
+
+fn MakeTextReader(text: str): fn(): str {
+    return () => { return text.clone() }
+}
+
+fn MakeArrayReader(values: [int]): fn(): [int] {
+    return () => { return values.clone() }
+}
+
+fn WrapFunction(operation: fn(): int): fn(): int {
+    return () => { return operation() }
+}
+
+fn CaptureStruct(box_value: CapturedBox): str {
+    fn snapshot(): CapturedBox {
+        return box_value.clone()
+    }
+    first = snapshot()
+    second = snapshot()
+    return first.text + "|" + second.text
+}
+
+fn CaptureResult(saved_result: str!): str! {
+    fn snapshot(): str! {
+        return saved_result.clone()
+    }
+    first = snapshot()?
+    second = snapshot()?
+    return ok(first + "|" + second)
+}
+
+fn CaptureEnum(choice: CapturedChoice): str {
+    fn snapshot(): CapturedChoice {
+        return choice.clone()
+    }
+    first = match snapshot() {
+        CapturedChoice.Text(value) => value
+        CapturedChoice.None => "none"
+    }
+    second = match snapshot() {
+        CapturedChoice.Text(value) => value
+        CapturedChoice.None => "none"
+    }
+    return first + "|" + second
+}
+
+fn DeepNamed(root_value: int): int {
+    fn middle(local_parameter: int): int {
+        fn deepest(): int {
+            return root_value + local_parameter
+        }
+        return deepest() + deepest()
+    }
+    return middle(2)
+}
+
+fn DeepClosure(root_value: int): int {
+    runner: fn(int): int = (closure_parameter) => {
+        nested = () => {
+            return root_value + closure_parameter
+        }
+        return nested() + nested()
+    }
+    return runner(3)
+}
+
+fn Shadow(shadowed: int, untouched: int): int {
+    fn child(shadowed: int): int {
+        return shadowed
+    }
+    return shadowed * 10 + child(untouched)
+}
+
+fn main(): null! {
+    base = 39
+    operation = () => { return base + 1 }
+    println(CopyParameter(4))
+    println(CaptureText("owned" + " parameter"))
+    println(CaptureArray([5, 6]))
+    println(WriteOnlyArrayParameter([1]))
+    println(CaptureFunction(operation))
+    println(operation())
+    text_reader = MakeTextReader("escaped" + " text")
+    println(text_reader())
+    println(text_reader())
+    array_reader = MakeArrayReader([8, 9])
+    first_array = array_reader()
+    second_array = array_reader()
+    println(first_array[0] + second_array[1])
+    wrapped = WrapFunction(operation)
+    println(wrapped())
+    println(wrapped())
+    println(operation())
+    println(CaptureStruct(CapturedBox { text: "struct" + " parameter" }))
+    println(CaptureResult(ok("result" + " parameter"))?)
+    println(CaptureEnum(CapturedChoice.Text("enum" + " parameter")))
+    println(DeepNamed(7))
+    println(DeepClosure(7))
+    println(Shadow(4, 2))
+    return ok(null)
+}
+"#,
+    )
+    .expect("write captured-parameter native source");
+
+    // C emission is the hard gate on hosts without a compiler. Captured
+    // parameters need distinct cells for every payload family, and no missing
+    // capture may silently degrade to the IR backend's `unknown` placeholder.
+    let c = native_emit_c(&dir, "main.ku");
+    for cell_type in [
+        "KuCell_int",
+        "KuCell_str",
+        "KuCell_array_int",
+        "KuCell_fn__to_int",
+        "KuCell_struct_CapturedBox",
+        "KuCell_result_str",
+        "KuCell_enum_CapturedChoice",
+    ] {
+        assert!(
+            c.contains(cell_type),
+            "generated C omitted captured-parameter cell type {cell_type}"
+        );
+    }
+    for (parameter, construction) in [
+        ("copy_parameter", "ku_cell_int_new(copy_parameter)"),
+        ("text", "ku_cell_str_new(ku_string_move(&text))"),
+        (
+            "values",
+            "ku_cell_array_int_new(ku_array_move_int(&values))",
+        ),
+        (
+            "values_to_write",
+            "ku_cell_array_int_new(ku_array_move_int(&values_to_write))",
+        ),
+        (
+            "operation",
+            "ku_cell_fn__to_int_new(ku_closure_move_fn__to_int(&operation))",
+        ),
+        (
+            "box_value",
+            "ku_cell_struct_CapturedBox_new(ku_move_struct_CapturedBox(&box_value))",
+        ),
+        (
+            "saved_result",
+            "ku_cell_result_str_new(ku_result_move_str(&saved_result))",
+        ),
+        (
+            "choice",
+            "ku_cell_enum_CapturedChoice_new(ku_move_enum_CapturedChoice(&choice))",
+        ),
+        ("root_value", "ku_cell_int_new(root_value)"),
+        ("local_parameter", "ku_cell_int_new(local_parameter)"),
+        ("closure_parameter", "ku_cell_int_new(closure_parameter)"),
+    ] {
+        assert!(
+            c.contains(construction),
+            "generated C did not box captured parameter {parameter} with ownership-safe construction {construction}"
+        );
+    }
+    for parameter in ["shadowed", "untouched"] {
+        assert!(
+            !c.contains(&format!("ku_cell_int_new({parameter})")),
+            "generated C must not box uncaptured or shadowed parameter {parameter}"
+        );
+    }
+    assert!(
+        !c.contains("KuCell_unknown") && !c.contains("KuClosure_unknown"),
+        "generated C must not contain unknown capture ABI types"
+    );
+
+    let Some(exe) = native_build(&dir, "main.ku", "capturedparameters") else {
+        fs::remove_dir_all(&dir).ok();
+        return;
+    };
+    let (stdout, code) = run_binary(&exe);
+    assert_eq!(
+        stdout.replace('\r', ""),
+        "456\nowned parameter|owned parameter\n56\n9\n80\n40\nescaped text\nescaped text\n17\n40\n40\n40\nstruct parameter|struct parameter\nresult parameter|result parameter\nenum parameter|enum parameter\n18\n20\n42\n"
+    );
+    assert_eq!(code, Some(0));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_closure_capture_array_clone_returns_owned() {
     // Stage 6c-array: `.clone()` on a captured array borrows the cell and produces
     // a fresh owned array that can be returned/stored; native matches interp.

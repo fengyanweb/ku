@@ -397,7 +397,7 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                 }
             }
             if probe
-                .lower_block_body("entry", &function.body, function.span)
+                .lower_block_body("entry", &function.body, function.span, &function.params)
                 .is_ok()
             {
                 // Fold the body's `return <value>` types the way the checker's
@@ -467,7 +467,7 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
             for param in &params {
                 lower.locals.insert(param.name.clone(), param.ty.clone());
             }
-            lower.lower_block_body("entry", &function.body, function.span)?;
+            lower.lower_block_body("entry", &function.body, function.span, &function.params)?;
             functions.push(IrFunction {
                 id: signature.id,
                 name: function.name.clone(),
@@ -1087,6 +1087,34 @@ impl BoxedBindingSite {
     }
 }
 
+/// The parser has separate parameter node types for declarations and closure
+/// literals. Lowering only needs their shared binding identity, so use a small
+/// borrowed adapter instead of allocating a parallel parameter-site vector.
+trait BodyParameter {
+    fn binding_name(&self) -> &str;
+    fn binding_span(&self) -> Span;
+}
+
+impl BodyParameter for crate::ast::Param {
+    fn binding_name(&self) -> &str {
+        &self.name
+    }
+
+    fn binding_span(&self) -> Span {
+        self.span
+    }
+}
+
+impl BodyParameter for crate::ast::FunctionParam {
+    fn binding_name(&self) -> &str {
+        &self.name
+    }
+
+    fn binding_span(&self) -> Span {
+        self.span
+    }
+}
+
 #[derive(Debug, Clone)]
 struct IrTryHandler {
     error_block: BlockId,
@@ -1134,11 +1162,17 @@ impl<'a> FunctionLowerer<'a> {
         }
     }
 
-    fn lower_block_body(&mut self, name: &str, body: &[Stmt], span: Span) -> KuResult<()> {
+    fn lower_block_body<P: BodyParameter>(
+        &mut self,
+        name: &str,
+        body: &[Stmt],
+        span: Span,
+        parameters: &[P],
+    ) -> KuResult<()> {
         // Stage 6b: any local this body declares that a nested closure literal
-        // captures must be boxed into a shared `KuCell` at its declaration. The
-        // scan is sequential and lexical: parameters/enclosing captures shadow
-        // assignment-only locals, but are not declarations owned by this body.
+        // captures must be boxed into a shared `KuCell` at its declaration. A
+        // captured parameter is owned by this function too, so box it once at
+        // entry; enclosing captures only shadow assignment-created locals.
         let lexical_bindings = self
             .locals
             .keys()
@@ -1146,8 +1180,33 @@ impl<'a> FunctionLowerer<'a> {
             .chain(self.local_names.keys())
             .cloned()
             .collect::<HashSet<_>>();
-        self.boxed = collect_boxed_candidates(body, &lexical_bindings);
+        self.boxed = collect_boxed_candidates(body, &lexical_bindings, parameters);
         self.current.name = name.to_string();
+        for parameter in parameters {
+            let parameter_name = parameter.binding_name();
+            let parameter_span = parameter.binding_span();
+            if !self
+                .boxed
+                .contains(&BoxedBindingSite::new(parameter_name, parameter_span))
+            {
+                continue;
+            }
+            let ty = self.locals.get(parameter_name).cloned().ok_or_else(|| {
+                KuError::runtime(
+                    format!("missing IR type for captured parameter '{parameter_name}'"),
+                    parameter_span,
+                )
+            })?;
+            self.push_cell_new(
+                parameter_name.to_string(),
+                ty.clone(),
+                IrExpr {
+                    kind: IrExprKind::Local(parameter_name.to_string()),
+                    ty,
+                },
+                parameter_span,
+            )?;
+        }
         for stmt in body {
             self.lower_stmt(stmt)?;
             if self.current.terminator != IrTerminator::Next {
@@ -1212,6 +1271,31 @@ impl<'a> FunctionLowerer<'a> {
             }
         }
         result
+    }
+
+    /// Overlay one match arm's bindings while preserving any bindings from an
+    /// enclosing match expression. The undo log is proportional only to the
+    /// inner pattern, avoiding a clone of the whole outer overlay for every arm.
+    fn push_pattern_bindings(
+        &mut self,
+        bindings: HashMap<String, IrExpr>,
+    ) -> Vec<(String, Option<IrExpr>)> {
+        let mut undo = Vec::with_capacity(bindings.len());
+        for (name, value) in bindings {
+            let previous = self.pattern_bindings.insert(name.clone(), value);
+            undo.push((name, previous));
+        }
+        undo
+    }
+
+    fn pop_pattern_bindings(&mut self, undo: Vec<(String, Option<IrExpr>)>) {
+        for (name, previous) in undo.into_iter().rev() {
+            if let Some(previous) = previous {
+                self.pattern_bindings.insert(name, previous);
+            } else {
+                self.pattern_bindings.remove(&name);
+            }
+        }
     }
 
     fn lower_statements(&mut self, body: &[Stmt]) -> KuResult<()> {
@@ -3171,23 +3255,80 @@ impl<'a> FunctionLowerer<'a> {
     /// Resolve the cell pointer a newly-created nested closure must retain.
     /// Locals take lexical precedence over an identically named outer capture;
     /// otherwise a closure body forwards the cell already stored in its `__env`.
-    fn capture_binding(&self, name: &str) -> Option<(IrType, IrCaptureSource)> {
-        let name = self.local_ir_name(name);
-        if let Some(local) = self.locals.get(name) {
-            return matches!(local, IrType::Cell(_))
-                .then(|| (local.clone(), IrCaptureSource::Local));
+    fn capture_binding(
+        &self,
+        name: &str,
+        span: Span,
+    ) -> KuResult<Option<(IrType, IrCaptureSource)>> {
+        let source_name = name;
+        // Match bindings live in their own expression overlay rather than the
+        // ordinary local/type table, and they lexically shadow every homonym.
+        // Check that overlay first: otherwise an outer boxed local with the same
+        // spelling would be captured and the native program would return the
+        // wrong value instead of rejecting this not-yet-supported capture form.
+        if self.pattern_bindings.contains_key(source_name) {
+            return Err(KuError::runtime(
+                format!(
+                    "IR/native lowering does not support closure capture of match binding '{source_name}' yet"
+                ),
+                span,
+            ));
         }
-        self.captures.get(name).and_then(|capture| {
-            matches!(capture, IrType::Cell(_))
-                .then(|| (capture.clone(), IrCaptureSource::EnclosingEnvironment))
-        })
+        let name = self.local_ir_name(source_name);
+        if let Some(local) = self.locals.get(name) {
+            return match local {
+                IrType::Cell(_) => Ok(Some((local.clone(), IrCaptureSource::Local))),
+                _ => Err(KuError::runtime(
+                    format!(
+                        "IR/native lowering cannot capture lexical local '{source_name}' without a shared cell"
+                    ),
+                    span,
+                )),
+            };
+        }
+        if let Some(capture) = self.captures.get(name) {
+            return match capture {
+                IrType::Cell(_) => Ok(Some((
+                    capture.clone(),
+                    IrCaptureSource::EnclosingEnvironment,
+                ))),
+                _ => Err(KuError::runtime(
+                    format!(
+                        "IR/native lowering cannot forward lexical capture '{source_name}' without a shared cell"
+                    ),
+                    span,
+                )),
+            };
+        }
+        if self
+            .self_recurse
+            .as_ref()
+            .is_some_and(|(self_name, _, _)| self_name == source_name)
+        {
+            return Err(KuError::runtime(
+                format!(
+                    "IR/native lowering does not support nested closure capture of local function self '{source_name}' yet"
+                ),
+                span,
+            ));
+        }
+        Ok(None)
     }
 
-    fn lower_capture_bindings(&self, names: HashSet<String>) -> LoweredCaptureBindings {
+    fn lower_capture_bindings(
+        &self,
+        names: HashSet<String>,
+        span: Span,
+    ) -> KuResult<LoweredCaptureBindings> {
         let mut values = Vec::with_capacity(names.len());
         let mut aliases = HashMap::with_capacity(names.len());
+        // Free-name discovery returns a HashSet. Resolve in sorted order too,
+        // not only emit in sorted order, so the first fail-closed diagnostic is
+        // stable across processes and platforms when several names are invalid.
+        let mut names = names.into_iter().collect::<Vec<_>>();
+        names.sort();
         for name in names {
-            if let Some((ty, source)) = self.capture_binding(&name) {
+            if let Some((ty, source)) = self.capture_binding(&name, span)? {
                 let ir_name = self.local_ir_name(&name).to_string();
                 if ir_name != name {
                     aliases.insert(name, ir_name.clone());
@@ -3195,8 +3336,10 @@ impl<'a> FunctionLowerer<'a> {
                 values.push((ir_name, ty, source));
             }
         }
+        // Aliases can change the IR spelling, so retain the existing ABI order
+        // sort after resolution as well.
         values.sort_by(|left, right| left.0.cmp(&right.0));
-        LoweredCaptureBindings { values, aliases }
+        Ok(LoweredCaptureBindings { values, aliases })
     }
 
     /// Lower a closure literal into a lifted, globally-unique IrFunction plus a
@@ -3243,9 +3386,10 @@ impl<'a> FunctionLowerer<'a> {
         let LoweredCaptureBindings {
             values: captures,
             aliases,
-        } = self.lower_capture_bindings(crate::runtime::interpreter::closure_capture_names(
-            params, body,
-        ));
+        } = self.lower_capture_bindings(
+            crate::runtime::interpreter::closure_capture_names(params, body),
+            span,
+        )?;
         let function_captures = captures
             .iter()
             .map(|(name, ty, _)| (name.clone(), ty.clone()))
@@ -3263,7 +3407,7 @@ impl<'a> FunctionLowerer<'a> {
         for param in &ir_params {
             child.locals.insert(param.name.clone(), param.ty.clone());
         }
-        child.lower_block_body("entry", body, span)?;
+        child.lower_block_body("entry", body, span, params)?;
 
         // Recover the real return type from a source return. Cooperative timeout
         // blocks are lowered while this child still has an Unknown seed, so their
@@ -3356,9 +3500,10 @@ impl<'a> FunctionLowerer<'a> {
         let LoweredCaptureBindings {
             values: captures,
             aliases,
-        } = self.lower_capture_bindings(crate::runtime::interpreter::function_capture_names(
-            function,
-        ));
+        } = self.lower_capture_bindings(
+            crate::runtime::interpreter::function_capture_names(function),
+            function.span,
+        )?;
         let function_captures = captures
             .iter()
             .map(|(name, ty, _)| (name.clone(), ty.clone()))
@@ -3378,7 +3523,7 @@ impl<'a> FunctionLowerer<'a> {
         }
         // Wire self-recursion: a call to `name` in the body reuses the running env.
         child.self_recurse = Some((name.clone(), cid, return_type.clone()));
-        child.lower_block_body("entry", &function.body, function.span)?;
+        child.lower_block_body("entry", &function.body, function.span, &function.params)?;
 
         self.lifted_functions.borrow_mut().push(IrFunction {
             id: cid,
@@ -3625,12 +3770,13 @@ impl<'a> FunctionLowerer<'a> {
             self.finish_current();
 
             self.start_block(arm_id, "match_arm");
-            let saved_bindings = std::mem::replace(&mut self.pattern_bindings, bindings);
+            let mut binding_names = bindings.keys().cloned().collect::<Vec<_>>();
+            binding_names.sort();
+            let pattern_undo = self.push_pattern_bindings(bindings);
             // Materialize each binding that is a computed projection (an enum
             // payload access, which moves-and-clears the slot when its type is
             // owned) into a single temp, so using the binding more than once reads
             // that temp instead of re-moving the value out of the enum each time.
-            let binding_names: Vec<String> = self.pattern_bindings.keys().cloned().collect();
             for name in binding_names {
                 let bound = self.pattern_bindings[&name].clone();
                 if matches!(
@@ -3656,7 +3802,7 @@ impl<'a> FunctionLowerer<'a> {
             let arm_value = self.lower_expr(&arm.value)?;
             if let Some(expected) = &result_ty {
                 if expected != &arm_value.ty {
-                    self.pattern_bindings = saved_bindings;
+                    self.pop_pattern_bindings(pattern_undo);
                     return Err(KuError::runtime(
                         "match arm result types changed after checking",
                         arm.span,
@@ -3680,7 +3826,7 @@ impl<'a> FunctionLowerer<'a> {
                 self.current.terminator = IrTerminator::Jump(after_id);
             }
             self.finish_current();
-            self.pattern_bindings = saved_bindings;
+            self.pop_pattern_bindings(pattern_undo);
             self.start_block(next_id, "match_next");
         }
 
@@ -4348,8 +4494,9 @@ fn dotted_name(expr: &Expr) -> Option<String> {
     Some(format!("{module}.{name}"))
 }
 
-/// Stage 6b: only Copy scalars can be boxed into a shared cell for now; owned
-/// payloads (str/array/object/struct/enum) are deferred to Stage 6c.
+/// Copy scalar payloads need no ownership helper when moved into a shared cell.
+/// `push_cell_new` separately admits owned ABI types, whose generated cell
+/// helpers move/drop the payload.
 fn is_copy_ir_type(ty: &IrType) -> bool {
     matches!(
         ty,
@@ -4357,10 +4504,13 @@ fn is_copy_ir_type(ty: &IrType) -> bool {
     ) || matches!(ty, IrType::Named(name) if name == TIME_TYPE)
 }
 
-/// A visible name either resolves to a body-owned binding site (`Some`) or to a
-/// lexical binding that this lowerer does not introduce/box (`None`), such as a
-/// parameter, enclosing capture, loop iterator, catch variable, or match arm
-/// binding. The latter still matters because it shadows an outer homonym.
+/// A visible name either resolves to a binding site owned and boxable by this
+/// function body (`Some`) or to a lexical binding this scan cannot box (`None`).
+/// Body declarations and this function's parameters are `Some`; enclosing
+/// captures and catch/match bindings are `None`. A loop iterator uses a stable
+/// `Some` sentinel only so `lower_for` can reject its unsupported per-iteration
+/// capture explicitly. Non-boxable bindings still matter because they shadow an
+/// outer homonym.
 type VisibleBoxBindings = HashMap<String, Option<BoxedBindingSite>>;
 
 /// Stage 6b: find the exact body-owned bindings captured by closures at their
@@ -4368,15 +4518,26 @@ type VisibleBoxBindings = HashMap<String, Option<BoxedBindingSite>>;
 /// not recursively merge a closure body's own boxed locals into its parent: the
 /// child FunctionLowerer scans that body separately, while the interpreter's
 /// free-variable analysis already propagates any genuine transitive capture.
-fn collect_boxed_candidates(
+fn collect_boxed_candidates<P: BodyParameter>(
     body: &[Stmt],
     lexical_bindings: &HashSet<String>,
+    parameters: &[P],
 ) -> HashSet<BoxedBindingSite> {
     let mut visible = lexical_bindings
         .iter()
         .cloned()
         .map(|name| (name, None))
         .collect::<VisibleBoxBindings>();
+    // Parameters shadow every enclosing homonym, but unlike an enclosing
+    // capture they belong to this function and have a stable binding site. A
+    // deeper closure that names one must therefore cause an entry CellNew.
+    for parameter in parameters {
+        let name = parameter.binding_name();
+        visible.insert(
+            name.to_string(),
+            Some(BoxedBindingSite::new(name, parameter.binding_span())),
+        );
+    }
     let mut out = HashSet::new();
     collect_boxed_candidates_block(body, &mut visible, &mut out);
     out
@@ -4389,6 +4550,22 @@ fn collect_boxed_candidates_block(
 ) {
     for stmt in body {
         collect_boxed_candidates_stmt(stmt, visible, out);
+        // Follow source-level static fallthrough: these statements terminate
+        // the current block, so later declarations/closures are unreachable
+        // and must not add entry-time cell allocations to a hot function.
+        // Break/continue are still rejected by native lowering today, but
+        // treating them as terminators here keeps this pre-scan correct when
+        // that lowering is added.
+        if matches!(
+            stmt,
+            Stmt::Return { .. }
+                | Stmt::Fail { .. }
+                | Stmt::Panic { .. }
+                | Stmt::Break { .. }
+                | Stmt::Continue { .. }
+        ) {
+            break;
+        }
     }
 }
 

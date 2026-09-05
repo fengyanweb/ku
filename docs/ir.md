@@ -60,18 +60,18 @@ ku ir examples\function.ku
 - native C 已支持非递归 struct、带长度 array、enum tag/payload 和嵌套 match CFG。
 - native C 已支持 array/named/Result 的 move、clone、drop；解构赋值先物化全部 RHS，避免 owned swap 丢值。
 - LLVM 文本后端已支持非递归 struct 和 `Result<int|bool|str|struct>`。
-- 闭包 native ABI 和 async native ABI 仍是待完成边界。
+- 闭包/function value native ABI 已具备 typed invoke pointer、局部 RC env 和按需共享 cell。参数路径直接覆盖 Copy、`str`、array、函数值、struct、enum 与 Result，普通局部路径另覆盖 object 与 KuValue；catch/match binding、local-function self、`for` 迭代变量和 Task/async native ABI 仍是明确拒绝的边界。dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同。
 - 暂不做 SSA、寄存器分配和完整 native ABI lowering。
 
-## Result ABI 草案
+## Result ABI
 
 当前 native C Result 使用统一 Error 对象，并按 payload 类型生成结构：
 
 ```c
 typedef struct KuError {
-    const char* domain;
-    const char* code;
-    const char* message;
+    KuString domain;
+    KuString code;
+    KuString message;
 } KuError;
 
 typedef struct {
@@ -83,14 +83,14 @@ typedef struct {
 
 `ok(value)` 会 move payload 进入 Result。`err(message)` 和 `fail message` 构造 KuError。`?` 会变成 `if (result.ok) goto ok_block; else goto err_block;`，成功分支 take payload 并清空来源 Result；错误分支只取出 KuError，再按当前函数的 Result payload 构造 Err，因此 `[int]!` 可以安全传播到 `null!`，不会错误复制不同 C struct。
 
-native C 当前覆盖 `Result<int|bool|str|null|array|struct|enum>`；owned payload 的 clone/drop 会递归调用对应 ABI。动态 object、closure 和泛型实例化 Result 仍不支持。LLVM 文本后端继续保持较小子集。
+native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的已实现组合；owned payload 的 clone/drop 会递归调用对应 ABI。并非任意动态 object/closure 组合或泛型实例化 Result 都已支持。LLVM 文本后端继续保持较小子集。
 
 ## 后续 native 前置任务
 
-1. 固定闭包 ABI，包括 typed invoke pointer、捕获 binding、env 生命周期和逃逸规则。
-2. 固定 owned string 和动态 object ABI，使语言层 Owned 分类与 native 资源释放完全一致。
+1. 逐项补齐闭包尚未支持的 binding/payload 捕获，并为每一种 owned payload 固定逃逸与失败清理测试。
+2. 继续收窄动态 object 与 Result 的组合边界，不把单项 ABI 存在等同于任意嵌套组合已完成。
 3. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
-4. async native lowering继续拒绝，直到状态机 task ABI、调度器嵌入方式和取消语义单独决策。
+4. async native lowering 继续拒绝，直到状态机 task ABI、调度器嵌入方式和取消语义单独决策。
 
 ## IR 优化队列
 
