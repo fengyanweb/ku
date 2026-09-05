@@ -41,10 +41,13 @@ fn ParseWithInvalidDomain(source: str): ParseOutput! {
 }
 
 fn main(): null! {
+    expression = Parse("1")?
+    program = ParseProgram("fn main() {}")?
     return ok(null)
 }
 "#,
     );
+    assert_control_append_ir(directory.path());
     let abi = parser_native_abi(&generated);
     for required in [
         "typedef struct KuString {".to_string(),
@@ -119,6 +122,10 @@ fn main(): null! {
         "stage3-function-statements-failure",
         "stage3-if-statements-success",
         "stage3-if-statements-failure",
+        "stage3-while-statements-success",
+        "stage3-while-statements-failure",
+        "stage3-while-depth-success",
+        "stage3-mixed-control-depth-success",
         "stage3-struct-success",
         "stage3-struct-union-success",
         "stage3-struct-failure",
@@ -148,6 +155,36 @@ fn main(): null! {
         output.stderr.is_empty(),
         "unexpected parser benchmark stderr"
     );
+}
+
+fn assert_control_append_ir(directory: &std::path::Path) {
+    // Inspect the lowered, import-expanded program rather than matching Ku
+    // source spelling. Allocation ratios alone can hide a small quadratic
+    // term, so both growing control tables must retain the reuse intrinsic.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ku"));
+    command.current_dir(directory).args(["ir", "main.ku"]);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_LIMITS)
+        .unwrap_or_else(|error| panic!("bootstrap parser IR gate was not bounded: {error}"));
+    assert!(
+        output.status.success(),
+        "bootstrap parser IR emission failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8(output.stdout).expect("UTF-8 bootstrap parser IR");
+    for receiver in ["control_frames", "cell_load captured_cell statement_links"] {
+        let reuse = format!("__ku_array_push_reuse({receiver}, ");
+        assert_eq!(
+            ir.matches(&reuse).count(),
+            1,
+            "control-table append must reuse its receiver: {receiver}"
+        );
+        assert!(
+            !ir.contains(&format!("__ku_clone({receiver})")),
+            "control-table append must not clone the whole growing table: {receiver}"
+        );
+    }
+    assert!(output.stderr.is_empty(), "unexpected parser IR stderr");
 }
 
 struct ParserNativeAbi {
@@ -399,6 +436,71 @@ static KuParserInput ku_stage3_if_statements_input(size_t statements, int failur
     memcpy(input.data + cursor, suffix, suffix_len);
     cursor += suffix_len;
   }
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
+static KuParserInput ku_stage3_while_statements_input(size_t statements, int failure) {
+  static const char prefix[] = "fn main(){while(true){\n";
+  static const char statement[] = "x=1\n";
+  static const char suffix[] = "}\n}\n";
+  size_t prefix_len = sizeof(prefix) - 1, statement_len = sizeof(statement) - 1;
+  size_t suffix_len = failure ? 0 : sizeof(suffix) - 1;
+  size_t fixed_len = prefix_len + suffix_len;
+  KuParserInput input = {0};
+  if (!statements || statements > (SIZE_MAX - fixed_len) / statement_len) return input;
+  input.len = fixed_len + statements * statement_len;
+  input.data = (uint8_t*)malloc(input.len);
+  if (!input.data) return input;
+  memcpy(input.data, prefix, prefix_len);
+  size_t cursor = prefix_len;
+  for (size_t i = 0; i < statements; i++) {
+    memcpy(input.data + cursor, statement, statement_len);
+    cursor += statement_len;
+  }
+  if (!failure) {
+    memcpy(input.data + cursor, suffix, suffix_len);
+    cursor += suffix_len;
+  }
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
+static KuParserInput ku_stage3_nested_control_input(size_t depth, int mixed) {
+  static const char prefix[] = "fn main(){";
+  static const char while_open[] = "while(true){";
+  static const char if_open[] = "if(true){";
+  static const char leaf[] = "x=1";
+  static const char close[] = "}";
+  static const char suffix[] = "}\n";
+  size_t prefix_len = sizeof(prefix) - 1, while_len = sizeof(while_open) - 1;
+  size_t if_len = sizeof(if_open) - 1;
+  size_t leaf_len = sizeof(leaf) - 1, close_len = sizeof(close) - 1;
+  size_t suffix_len = sizeof(suffix) - 1;
+  KuParserInput input = {0};
+  if (!depth || depth > 32) return input;
+  size_t if_count = mixed ? depth / 2 : 0;
+  size_t while_count = depth - if_count;
+  input.len = prefix_len + while_count * while_len + if_count * if_len
+      + leaf_len + depth * close_len + suffix_len;
+  input.data = (uint8_t*)malloc(input.len);
+  if (!input.data) return input;
+  memcpy(input.data, prefix, prefix_len);
+  size_t cursor = prefix_len;
+  for (size_t i = 0; i < depth; i++) {
+    const char* opener = mixed && (i & 1) ? if_open : while_open;
+    size_t opener_len = mixed && (i & 1) ? if_len : while_len;
+    memcpy(input.data + cursor, opener, opener_len);
+    cursor += opener_len;
+  }
+  memcpy(input.data + cursor, leaf, leaf_len);
+  cursor += leaf_len;
+  for (size_t i = 0; i < depth; i++) {
+    memcpy(input.data + cursor, close, close_len);
+    cursor += close_len;
+  }
+  memcpy(input.data + cursor, suffix, suffix_len);
+  cursor += suffix_len;
   if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
   input.hash = ku_parser_fingerprint(input.data, input.len);
   return input;
@@ -759,6 +861,38 @@ int main(void) {
       "bootstrap.parser.stage3", "unexpected_eof",
       "error|bootstrap.parser.stage3|unexpected_eof|<source>|expected '}' after if body|",
       9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  /* A braced while containing 32/64 assignments consumes 109/205 tokens
+     including EOF, matching the if control-frame shape. The 2.25x gate and
+     per-round zero-live checks reject growing-list copies and leaked frames. */
+  CHECK(ku_check_scale_bounded("stage3-while-statements-success", @KU_STAGE3_PARSE@,
+      ku_stage3_while_statements_input(32, 0),
+      ku_stage3_while_statements_input(64, 0), 1, "", "", "",
+      9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  /* Missing the while body close is diagnosed only after all assignments have
+     been allocated. Repeating both sizes eight times proves structured-error
+     cleanup and keeps the same 2.25x ceiling as the successful path. */
+  CHECK(ku_check_scale_bounded("stage3-while-statements-failure", @KU_STAGE3_PARSE@,
+      ku_stage3_while_statements_input(32, 1),
+      ku_stage3_while_statements_input(64, 1), 0,
+      "bootstrap.parser.stage3", "unexpected_eof",
+      "error|bootstrap.parser.stage3|unexpected_eof|<source>|expected '}' after while body|",
+      9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  /* Pure while chains at 16/32 levels consume 106/202 tokens and end exactly
+     at the parser's 32-level depth contract. Requested bytes receive only a
+     1 KiB fixed allowance to constrain total growth. The separate lowered-IR
+     contract also rejects a whole-table clone when its quadratic coefficient
+     is too small for these finite allocation samples to distinguish. */
+  CHECK(ku_check_scale_bounded("stage3-while-depth-success", @KU_STAGE3_PARSE@,
+      ku_stage3_nested_control_input(16, 0),
+      ku_stage3_nested_control_input(32, 0), 1, "", "", "",
+      2, 1, 32, 1024, 4 * 1024) == 0);
+  /* Alternating if/while chains use the same 106/202-token and 16/32-depth
+     boundaries. This independently exercises frame-kind restoration without
+     weakening any existing flat-body allocation gate. */
+  CHECK(ku_check_scale_bounded("stage3-mixed-control-depth-success", @KU_STAGE3_PARSE@,
+      ku_stage3_nested_control_input(16, 1),
+      ku_stage3_nested_control_input(32, 1), 1, "", "", "",
+      2, 1, 32, 1024, 4 * 1024) == 0);
   /* Each one-field struct is seven tokens, three nodes and three edges once
      linked by Program. Thus 32/64 items consume 225/449 tokens including EOF,
      97/193 nodes and 96/192 edges, all strictly inside the Stage 3 gates.

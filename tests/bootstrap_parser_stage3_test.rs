@@ -141,6 +141,30 @@ const IF_GOLDEN: &str = concat!(
     "EDGE|8|9\n",
     "EDGE|9|10",
 );
+const WHILE_GOLDEN_SOURCE: &str = concat!(
+    "// 前😀\r\n",
+    "fn main() {\r\n",
+    "  while (true) {\r\n",
+    "    text:str = \"中😀\"\r\n",
+    "  };\r\n",
+    "}",
+);
+const WHILE_GOLDEN: &str = concat!(
+    "ROOT|7\n",
+    "NODE|1|Bool|true|0|3:10@34..3:14@38|0|0\n",
+    "NODE|2|TypeName|str|0|4:10@52..4:13@55|0|0\n",
+    "NODE|3|String|中😀|0|4:16@58..4:20@67|0|0\n",
+    "NODE|4|VarDecl|text|0|4:5@47..4:20@67|0|2\n",
+    "NODE|5|While||0|3:3@27..5:4@72|2|2\n",
+    "NODE|6|Function|main|0|2:1@12..6:2@76|4|1\n",
+    "NODE|7|Program||0|2:1@12..6:2@76|5|1\n",
+    "EDGE|0|2\n",
+    "EDGE|1|3\n",
+    "EDGE|2|1\n",
+    "EDGE|3|4\n",
+    "EDGE|4|5\n",
+    "EDGE|5|6",
+);
 const UNICODE_CRLF_ERROR_SOURCE: &str =
     "// 前😀\r\nfn main() {\r\n  text:str = \"中😀\"\r\n  value = 1 + ;\r\n}";
 const UNICODE_CRLF_ERROR_CODE: &str = "unexpected_eof";
@@ -457,6 +481,19 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
                 *span,
                 &children,
             )
+        }
+        Stmt::While {
+            condition,
+            body,
+            span,
+        } => {
+            let mut children = Vec::with_capacity(1 + body.len());
+            children.push(project_expr(source, condition, arena));
+            children.extend(
+                body.iter()
+                    .map(|statement| project_stmt(source, statement, arena)),
+            );
+            push_node(arena, "While", String::new(), 0, *span, &children)
         }
         other => panic!("stage-3 oracle received unsupported Rust statement: {other:?}"),
     }
@@ -875,6 +912,7 @@ fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
     assert_eq!(rust_canonical(STRUCT_GOLDEN_SOURCE), STRUCT_GOLDEN);
     assert_eq!(rust_canonical(ENUM_GOLDEN_SOURCE), ENUM_GOLDEN);
     assert_eq!(rust_canonical(IF_GOLDEN_SOURCE), IF_GOLDEN);
+    assert_eq!(rust_canonical(WHILE_GOLDEN_SOURCE), WHILE_GOLDEN);
     assert_eq!(
         rust_diagnostic_canonical(UNICODE_CRLF_ERROR_SOURCE),
         UNICODE_CRLF_ERROR_CANONICAL
@@ -1006,8 +1044,19 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "fn main() { if (outer) { before = 0 if (inner) {} after = 1 } else { fallback = 2 } }",
         "fn main() {\r\n  if (\"中😀\" == \"中😀\") {}\r\n}",
         IF_GOLDEN_SOURCE,
+        WHILE_GOLDEN_SOURCE,
     ];
     let accepted = &cases;
+    let while_cases = [
+        "fn main() { while (true) {} }",
+        "fn main() { while (ready) { left = 1 right = 2 } }",
+        "fn main() { while (((left + 1) < limit) && Check((ready))) { return left } }",
+        "fn main() { before = 0 while (left) {} middle = 1 while (right) {} after = 2 }",
+        "fn main() { while (outer) { while (inner) { value = 1 } } }",
+        "fn main() { while (outer) { if (inner) { value = 1 } else { value = 2 } } }",
+        "fn main() { if (outer) { while (inner) { value = 1 } } else { while (fallback) { value = 2 } } }",
+        "fn main() { while (Check(1, (2 + 3))) {}; }",
+    ];
 
     let let_source = "fn main() { let value = 1; }";
     let missing_body = "fn main() {";
@@ -1031,6 +1080,17 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let unsupported_else_if = "fn main() { if (true) {} else if (false) {} }";
     let separated_else = "fn main() { if (true) {}; else {} }";
     let stray_else = "fn main() { else {} }";
+    let missing_while_lparen = "fn main() { while true {} }";
+    let missing_while_rparen = "fn main() { while (true {} }";
+    let empty_while_condition = "fn main() { while () {} }";
+    let separated_while_condition = "fn main() { while (true; false) {} }";
+    let missing_while_close = "fn main() { while (true) { value = 1";
+    let single_while_body = "fn main() { while (true) value = 1 }";
+    let else_after_while = "fn main() { while (true) {} else {} }";
+    let separated_else_after_while = "fn main() { while (true) {}; else {} }";
+    let else_after_nested_while = "fn main() { if (outer) { while (inner) {} else {} } }";
+    let innermost_while_eof = "fn main() { if (outer) { while (inner) { value = 1";
+    let innermost_if_eof = "fn main() { while (outer) { if (inner) { value = 1";
     let accepted_if_depth = format!(
         "fn main() {{{}value = 1{}}}",
         "if (true) {".repeat(32),
@@ -1041,10 +1101,54 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "if (true) {".repeat(33),
         "}".repeat(33)
     );
+    let accepted_while_depth = format!(
+        "fn main() {{{}value = 1{}}}",
+        "while (true) {".repeat(32),
+        "}".repeat(32)
+    );
+    let rejected_while_depth = format!(
+        "fn main() {{{}value = 1{}}}",
+        "while (true) {".repeat(33),
+        "}".repeat(33)
+    );
+    let accepted_mixed_control_depth = format!(
+        "fn main() {{{}value = 1{}}}",
+        (0..32)
+            .map(|index| {
+                if index % 2 == 0 {
+                    "while (true) {"
+                } else {
+                    "if (true) {"
+                }
+            })
+            .collect::<String>(),
+        "}".repeat(32)
+    );
+    let rejected_mixed_control_depth = format!(
+        "fn main() {{{}value = 1{}}}",
+        (0..33)
+            .map(|index| {
+                if index % 2 == 0 {
+                    "if (true) {"
+                } else {
+                    "while (true) {"
+                }
+            })
+            .collect::<String>(),
+        "}".repeat(33)
+    );
     let aggregate_statement_boundary =
         format!("fn main() {{ if (true) {{ {} }} }}", "value;".repeat(127));
     let over_aggregate_statement_limit =
         format!("fn main() {{ if (true) {{ {} }} }}", "value;".repeat(128));
+    let aggregate_while_statement_boundary = format!(
+        "fn main() {{ while (true) {{ {} }} }}",
+        "value;".repeat(127)
+    );
+    let over_aggregate_while_statement_limit = format!(
+        "fn main() {{ while (true) {{ {} }} }}",
+        "value;".repeat(128)
+    );
     let missing_param_name = "fn f(: int) {}";
     let missing_param_type = "fn f(value:) {}";
     let missing_param_comma = "fn f(left:int right:int) {}";
@@ -1556,8 +1660,10 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let direct_body_multiple_source = "fn f() { first; second; }";
     let direct_body_nested_source =
         "fn f() { before; if (true) { inner; } else { other; } after; }";
+    let direct_body_while_source =
+        "fn f() { before; while (looping) { if (ready) { inner; } } after; }";
 
-    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { MapTokenCharacters } from \"./support.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
+    let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
         "fn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\n",
     );
@@ -1662,19 +1768,6 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
     return ok(null)
 }
 
-fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expected_detail: str): null! {
-    expected_message = "error|bootstrap.parser.stage3|" + expected_code.clone() + "|<source>|" + expected_detail
-    caught = false
-    try { MapTokenCharacters(source, tokens)? } catch(err) {
-        caught = true
-        if (err.domain != "bootstrap.parser.stage3" || err.code != expected_code || err.message != expected_message) {
-            panic("wrong direct token-map diagnostic: " + err.domain + "/" + err.code + "/" + err.message + " EXPECTED " + expected_message)
-        }
-    }
-    if (!caught) { panic("expected direct token-map error") }
-    return ok(null)
-}
-
 "#,
     );
     body.push_str(
@@ -1730,6 +1823,7 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         ku_string(ENUM_GOLDEN_SOURCE),
         ku_string(ENUM_GOLDEN)
     ));
+    body.push_str("    return ok(null)\n}\n\nfn MainGrammar(): null! {\n");
     for source in accepted {
         body.push_str(&format!(
             "    AssertCase({}, {})?\n",
@@ -1754,14 +1848,10 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     ));
     body.push_str(&format!(
         "    AssertCase({}, {})?\n",
-        ku_string(&accepted_if_depth),
-        ku_string(&rust_canonical(&accepted_if_depth))
-    ));
-    body.push_str(&format!(
-        "    AssertCase({}, {})?\n",
         ku_string(&enum_union_boundary),
         ku_string(&rust_canonical(&enum_union_boundary))
     ));
+    body.push_str("    return ok(null)\n}\n\nfn MainSourceBudgets(): null! {\n");
     body.push_str(&format!(
         "    comment_chunk = {}\n",
         ku_string(&comment_chunk)
@@ -1775,6 +1865,14 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         "    AssertCase(near_limit_source, {})?\n",
         ku_string(&rust_canonical(&near_limit_source))
     ));
+    body.push_str(
+        "    budget_gap = comment_chunk.clone() + comment_chunk.clone()\n    budget_source = \"fn main(){/*\" + budget_gap + \"*/\\n\"\n    budget_index = 0\n    while (budget_index < 32) {\n        budget_source += \"x\\n\"\n        budget_index = budget_index + 1\n    }\n    budget_source += \"}\"\n",
+    );
+    body.push_str(&format!(
+        "    ExpectError(budget_source, \"work_limit\", {})?\n",
+        ku_string(&slice_budget_message)
+    ));
+    body.push_str("    return ok(null)\n}\n\nfn MainBoundaries(): null! {\n");
     body.push_str(&format!(
         "    AssertCase({}, {})?\n",
         ku_string(&parameter_boundary),
@@ -1803,9 +1901,6 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
             ku_string(&rust_canonical(source))
         ));
     }
-    body.push_str(
-        "    budget_gap = comment_chunk.clone() + comment_chunk.clone()\n    budget_source = \"fn main(){/*\" + budget_gap + \"*/\\n\"\n    budget_index = 0\n    while (budget_index < 32) {\n        budget_source += \"x\\n\"\n        budget_index = budget_index + 1\n    }\n    budget_source += \"}\"\n",
-    );
     body.push_str(&format!(
         "    large = ParseProgram({})?\n    if (large.root != 258 || large.arena.nodes.len() != 258 || large.arena.edges.len() != 257) {{ panic(\"stage-3 statement arena boundary mismatch\") }}\n",
         ku_string(&large_program)
@@ -1837,16 +1932,6 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         ku_string(&direct_import_over_window),
         ku_string(&direct_import_over_message),
     ));
-    body.push_str(&format!(
-        "    direct_map_limit_source = {}\n    direct_map_limit_tokens = Scan(direct_map_limit_source.clone())?\n    direct_map_limit = MapTokenCharacters(direct_map_limit_source.clone(), direct_map_limit_tokens)?\n    if (direct_map_limit.characters.len() != direct_map_limit_source.len() || direct_map_limit.starts.len() != 512 || direct_map_limit.ends.len() != 512) {{ panic(\"direct token-map exact token boundary mismatch\") }}\n    direct_map_over_source = {}\n    direct_map_over_tokens = Scan(direct_map_over_source.clone())?\n    ExpectTokenMapError(direct_map_over_source, direct_map_over_tokens, \"invalid_token_stream\", {})?\n",
-        ku_string(&direct_map_token_limit_source),
-        ku_string(&direct_map_token_over_source),
-        ku_string(&direct_map_token_over_message),
-    ));
-    body.push_str(
-        "    map_source = \" \"\n    map_source_round = 0\n    while (map_source_round < 15) {\n        map_source_copy = map_source.clone()\n        map_source += map_source_copy\n        map_source_round = map_source_round + 1\n    }\n    if (map_source.len() != 32768 || map_source.byte_len() != 32768) { panic(\"direct token-map source boundary fixture mismatch\") }\n    map_source_tokens = Scan(map_source.clone())?\n    map_source_limit = MapTokenCharacters(map_source.clone(), map_source_tokens)?\n    if (map_source_limit.characters.len() != 32768 || map_source_limit.starts.len() != 1 || map_source_limit.starts[0] != 32768) { panic(\"direct token-map exact source boundary mismatch\") }\n    map_source_over = map_source + \" \"\n    map_point_tokens = Scan(\"\")?\n    ExpectTokenMapError(map_source_over, map_point_tokens, \"work_limit\", \"stage-3 token mapping budget exceeded|1:1@0..1:1@0\")?\n    wide_source = \"😀\"\n    wide_source_round = 0\n    while (wide_source_round < 15) {\n        wide_source_copy = wide_source.clone()\n        wide_source += wide_source_copy\n        wide_source_round = wide_source_round + 1\n    }\n    if (wide_source.len() != 32768 || wide_source.byte_len() != 131072) { panic(\"direct token-map byte boundary fixture mismatch\") }\n    wide_point_tokens = Scan(\"\")?\n    wide_source_limit = MapTokenCharacters(wide_source.clone(), wide_point_tokens.clone())?\n    if (wide_source_limit.characters.len() != 32768) { panic(\"direct token-map exact byte boundary mismatch\") }\n    wide_source_over = wide_source + \"😀\"\n    ExpectTokenMapError(wide_source_over, wide_point_tokens, \"work_limit\", \"stage-3 token mapping budget exceeded|1:1@0..1:1@0\")?\n",
-    );
-
     let let_message = diagnostic_for_kind(
         let_source,
         TokenKind::Let,
@@ -1910,6 +1995,52 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         5,
         "stage-3 else must immediately follow an if body",
     );
+    let missing_while_lparen_message =
+        diagnostic_at(missing_while_lparen, 6, "expected '(' after 'while'");
+    let missing_while_rparen_message = diagnostic_at(
+        missing_while_rparen,
+        8,
+        "expected ')' after while condition",
+    );
+    let empty_while_condition_message =
+        diagnostic_at(empty_while_condition, 7, "expected expression");
+    let separated_while_condition_message = diagnostic_at(
+        separated_while_condition,
+        8,
+        "expected ')' after while condition",
+    );
+    let missing_while_close_message = diagnostic_for_kind(
+        missing_while_close,
+        TokenKind::Eof,
+        "expected '}' after while body",
+    );
+    let single_while_body_message =
+        diagnostic_at(single_while_body, 9, "stage-3 while bodies must use braces");
+    let else_after_while_message = diagnostic_at(
+        else_after_while,
+        11,
+        "stage-3 else must immediately follow an if body",
+    );
+    let separated_else_after_while_message = diagnostic_at(
+        separated_else_after_while,
+        12,
+        "stage-3 else must immediately follow an if body",
+    );
+    let else_after_nested_while_message = diagnostic_at(
+        else_after_nested_while,
+        16,
+        "stage-3 else must immediately follow an if body",
+    );
+    let innermost_while_eof_message = diagnostic_for_kind(
+        innermost_while_eof,
+        TokenKind::Eof,
+        "expected '}' after while body",
+    );
+    let innermost_if_eof_message = diagnostic_for_kind(
+        innermost_if_eof,
+        TokenKind::Eof,
+        "expected '}' after if body",
+    );
     let rejected_if_depth_token = Lexer::new(&rejected_if_depth)
         .lex()
         .expect("statement-depth fixture lex")
@@ -1924,6 +2055,34 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         rejected_if_depth_token,
         "stage-3 statement nesting exceeds 32 levels",
     );
+    let rejected_while_depth_token = Lexer::new(&rejected_while_depth)
+        .lex()
+        .expect("while-depth fixture lex")
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| token.kind == TokenKind::While)
+        .nth(32)
+        .map(|(index, _)| index)
+        .expect("33rd nested while token");
+    let rejected_while_depth_message = diagnostic_at(
+        &rejected_while_depth,
+        rejected_while_depth_token,
+        "stage-3 statement nesting exceeds 32 levels",
+    );
+    let rejected_mixed_depth_token = Lexer::new(&rejected_mixed_control_depth)
+        .lex()
+        .expect("mixed control-depth fixture lex")
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| matches!(token.kind, TokenKind::If | TokenKind::While))
+        .nth(32)
+        .map(|(index, _)| index)
+        .expect("33rd mixed nested control token");
+    let rejected_mixed_depth_message = diagnostic_at(
+        &rejected_mixed_control_depth,
+        rejected_mixed_depth_token,
+        "stage-3 statement nesting exceeds 32 levels",
+    );
     let over_aggregate_token = Lexer::new(&over_aggregate_statement_limit)
         .lex()
         .expect("aggregate statement-limit fixture lex")
@@ -1936,6 +2095,20 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     let over_aggregate_statement_message = diagnostic_at(
         &over_aggregate_statement_limit,
         over_aggregate_token,
+        "stage-3 parser accepts at most 128 statements per function",
+    );
+    let over_aggregate_while_token = Lexer::new(&over_aggregate_while_statement_limit)
+        .lex()
+        .expect("aggregate while statement-limit fixture lex")
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| matches!(&token.kind, TokenKind::Ident(name) if name == "value"))
+        .nth(127)
+        .map(|(index, _)| index)
+        .expect("128th nested while-body statement token");
+    let over_aggregate_while_statement_message = diagnostic_at(
+        &over_aggregate_while_statement_limit,
+        over_aggregate_while_token,
         "stage-3 parser accepts at most 128 statements per function",
     );
     let missing_param_name_message = rust_error_canonical(missing_param_name);
@@ -2158,6 +2331,7 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         "stage-3 parser accepts at most 512 tokens",
     );
 
+    body.push_str("    return ok(null)\n}\n\nfn MainDiagnostics(): null! {\n");
     for (source, code, message) in [
         (let_source, "unsupported_statement", let_message),
         (missing_body, "unexpected_eof", missing_message),
@@ -2630,11 +2804,8 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         ku_string(&rejected_enum_type_depth),
         ku_string(&rejected_enum_type_depth_message)
     ));
-    body.push_str(&format!(
-        "    ExpectError(budget_source, \"work_limit\", {})?\n",
-        ku_string(&slice_budget_message)
-    ));
     body.push_str("    return ok(null)\n}\n");
+    let body = body.replacen("fn main(): null! {\n", "fn MainWindows(): null! {\n", 1);
 
     let dir = unique_temp_dir("bootstrap-parser-stage3");
     let _cleanup = TempDirGuard::new(dir.clone());
@@ -2684,10 +2855,181 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         .expect("copy stage-3 parser module");
     }
     let entry = stage3.join("main.ku");
-    fs::write(&entry, body).expect("write stage-3 differential harness");
+    fs::write(stage3.join("suite.ku"), body).expect("write complete stage-3 differential suite");
+    fs::write(&entry, "import { MainWindows, MainGrammar, MainSourceBudgets, MainBoundaries, MainDiagnostics } from \"./suite.ku\"\nfn main(): null! { MainWindows()? MainGrammar()? MainSourceBudgets()? MainBoundaries()? MainDiagnostics()? return ok(null) }\n").expect("write stage-3 differential harness");
     let entry_arg = entry.to_string_lossy().to_string();
     run_ku(&["check", &entry_arg]);
-    run_ku(&["run", &entry_arg]);
+    // Fixed semantic batches retain every case and the original watchdog.
+    // Native still runs the complete suite, including every batch.
+    for (file, function) in [
+        ("windows.ku", "MainWindows"),
+        ("grammar.ku", "MainGrammar"),
+        ("source-budgets.ku", "MainSourceBudgets"),
+        ("boundaries.ku", "MainBoundaries"),
+        ("diagnostics.ku", "MainDiagnostics"),
+    ] {
+        let batch = stage3.join(file);
+        fs::write(&batch, format!("import {{ {function} }} from \"./suite.ku\"\nfn main(): null! {{ {function}()? return ok(null) }}\n")).expect("write bounded semantic batch");
+        let started = std::time::Instant::now();
+        run_ku(&["run", &batch.to_string_lossy()]);
+        eprintln!(
+            "stage3 interpreter batch={function} elapsed={:?}",
+            started.elapsed()
+        );
+    }
+
+    // Token-to-character mapping exercises the largest bounded source owned by
+    // this test. Give its exact token, character, and UTF-8 byte boundaries a
+    // dedicated process so those allocation-heavy contracts cannot consume
+    // the broad differential/native representative's fixed watchdog margin.
+    let mut token_map_body = r#"import { Token } from "../stage1/token.ku"
+import { Scan } from "../stage1/lexer.ku"
+import { MapTokenCharacters } from "./support.ku"
+
+fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expected_detail: str): null! {
+    expected_message = "error|bootstrap.parser.stage3|" + expected_code.clone() + "|<source>|" + expected_detail
+    caught = false
+    try { MapTokenCharacters(source, tokens)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.parser.stage3" || err.code != expected_code || err.message != expected_message) {
+            panic("wrong direct token-map diagnostic: " + err.domain + "/" + err.code + "/" + err.message + " EXPECTED " + expected_message)
+        }
+    }
+    if (!caught) { panic("expected direct token-map error") }
+    return ok(null)
+}
+
+fn main(): null! {
+"#
+    .to_string();
+    token_map_body.push_str(&format!(
+        "    direct_map_limit_source = {}\n    direct_map_limit_tokens = Scan(direct_map_limit_source.clone())?\n    direct_map_limit = MapTokenCharacters(direct_map_limit_source.clone(), direct_map_limit_tokens)?\n    if (direct_map_limit.characters.len() != direct_map_limit_source.len() || direct_map_limit.starts.len() != 512 || direct_map_limit.ends.len() != 512) {{ panic(\"direct token-map exact token boundary mismatch\") }}\n    direct_map_over_source = {}\n    direct_map_over_tokens = Scan(direct_map_over_source.clone())?\n    ExpectTokenMapError(direct_map_over_source, direct_map_over_tokens, \"invalid_token_stream\", {})?\n",
+        ku_string(&direct_map_token_limit_source),
+        ku_string(&direct_map_token_over_source),
+        ku_string(&direct_map_token_over_message),
+    ));
+    token_map_body.push_str(
+        "    map_source = \" \"\n    map_source_round = 0\n    while (map_source_round < 15) {\n        map_source_copy = map_source.clone()\n        map_source += map_source_copy\n        map_source_round = map_source_round + 1\n    }\n    if (map_source.len() != 32768 || map_source.byte_len() != 32768) { panic(\"direct token-map source boundary fixture mismatch\") }\n    map_source_tokens = Scan(map_source.clone())?\n    map_source_limit = MapTokenCharacters(map_source.clone(), map_source_tokens)?\n    if (map_source_limit.characters.len() != 32768 || map_source_limit.starts.len() != 1 || map_source_limit.starts[0] != 32768) { panic(\"direct token-map exact source boundary mismatch\") }\n    map_source_over = map_source + \" \"\n    map_point_tokens = Scan(\"\")?\n    ExpectTokenMapError(map_source_over, map_point_tokens, \"work_limit\", \"stage-3 token mapping budget exceeded|1:1@0..1:1@0\")?\n    wide_source = \"😀\"\n    wide_source_round = 0\n    while (wide_source_round < 15) {\n        wide_source_copy = wide_source.clone()\n        wide_source += wide_source_copy\n        wide_source_round = wide_source_round + 1\n    }\n    if (wide_source.len() != 32768 || wide_source.byte_len() != 131072) { panic(\"direct token-map byte boundary fixture mismatch\") }\n    wide_point_tokens = Scan(\"\")?\n    wide_source_limit = MapTokenCharacters(wide_source.clone(), wide_point_tokens.clone())?\n    if (wide_source_limit.characters.len() != 32768) { panic(\"direct token-map exact byte boundary mismatch\") }\n    wide_source_over = wide_source + \"😀\"\n    ExpectTokenMapError(wide_source_over, wide_point_tokens, \"work_limit\", \"stage-3 token mapping budget exceeded|1:1@0..1:1@0\")?\n    return ok(null)\n}\n",
+    );
+    let token_map_entry = stage3.join("token_map_boundary.ku");
+    fs::write(&token_map_entry, token_map_body)
+        .expect("write focused stage-3 token-map boundary harness");
+    let token_map_arg = token_map_entry.to_string_lossy().to_string();
+    run_ku(&["check", &token_map_arg]);
+    run_ku(&["run", &token_map_arg]);
+
+    // Keep the while semantic matrix and shared control-stack boundaries in a
+    // focused process. The depth cases build large canonical strings and the
+    // aggregate case builds a large arena; separation preserves the fixed
+    // watchdog without weakening the 32-level or 128-statement contracts.
+    let mut while_boundary_body = "import { AstCanonical } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\n\nfn AssertCase(source: str, expected: str): null! {\n    actual = AstCanonical(ParseProgram(source.clone())?)\n    if (actual != expected) { panic(\"stage-3 while boundary differential mismatch: \" + source + \"\\n\" + actual + \"\\nEXPECTED\\n\" + expected) }\n    return ok(null)\n}\n\nfn ExpectError(source: str, expected_code: str, expected_detail: str): null! {\n    expected_message = \"error|bootstrap.parser.stage3|\" + expected_code.clone() + \"|<source>|\" + expected_detail\n    caught = false\n    try { ParseProgram(source.clone())? } catch(err) {\n        caught = true\n        if (err.domain != \"bootstrap.parser.stage3\" || err.code != expected_code || err.message != expected_message) { panic(\"wrong focused while diagnostic: \" + err.domain + \"/\" + err.code + \"/\" + err.message + \" EXPECTED \" + expected_code + \"/\" + expected_message) }\n    }\n    if (!caught) { panic(\"expected focused while parser error\") }\n    return ok(null)\n}\n\nfn main(): null! {\n".to_string();
+    for source in &while_cases {
+        while_boundary_body.push_str(&format!(
+            "    AssertCase({}, {})?\n",
+            ku_string(source),
+            ku_string(&rust_canonical(source))
+        ));
+    }
+    for (source, code, message) in [
+        (
+            missing_while_lparen,
+            "unexpected_token",
+            &missing_while_lparen_message,
+        ),
+        (
+            missing_while_rparen,
+            "unexpected_token",
+            &missing_while_rparen_message,
+        ),
+        (
+            empty_while_condition,
+            "unexpected_eof",
+            &empty_while_condition_message,
+        ),
+        (
+            separated_while_condition,
+            "unexpected_token",
+            &separated_while_condition_message,
+        ),
+        (
+            missing_while_close,
+            "unexpected_eof",
+            &missing_while_close_message,
+        ),
+        (
+            single_while_body,
+            "unsupported_statement",
+            &single_while_body_message,
+        ),
+        (
+            else_after_while,
+            "unsupported_statement",
+            &else_after_while_message,
+        ),
+        (
+            separated_else_after_while,
+            "unsupported_statement",
+            &separated_else_after_while_message,
+        ),
+        (
+            else_after_nested_while,
+            "unsupported_statement",
+            &else_after_nested_while_message,
+        ),
+        (
+            innermost_while_eof,
+            "unexpected_eof",
+            &innermost_while_eof_message,
+        ),
+        (
+            innermost_if_eof,
+            "unexpected_eof",
+            &innermost_if_eof_message,
+        ),
+    ] {
+        while_boundary_body.push_str(&format!(
+            "    ExpectError({}, {}, {})?\n",
+            ku_string(source),
+            ku_string(code),
+            ku_string(message)
+        ));
+    }
+    for source in [
+        &accepted_if_depth,
+        &accepted_while_depth,
+        &accepted_mixed_control_depth,
+    ] {
+        while_boundary_body.push_str(&format!(
+            "    AssertCase({}, {})?\n",
+            ku_string(source),
+            ku_string(&rust_canonical(source))
+        ));
+    }
+    for (source, message) in [
+        (&rejected_while_depth, &rejected_while_depth_message),
+        (&rejected_mixed_control_depth, &rejected_mixed_depth_message),
+    ] {
+        while_boundary_body.push_str(&format!(
+            "    ExpectError({}, \"statement_depth_exceeded\", {})?\n",
+            ku_string(source),
+            ku_string(message)
+        ));
+    }
+    while_boundary_body.push_str(&format!(
+        "    parsed = ParseProgram({})?\n    if (parsed.root != 258 || parsed.arena.nodes.len() != 258 || parsed.arena.edges.len() != 257) {{ panic(\"stage-3 while aggregate statement boundary mismatch\") }}\n",
+        ku_string(&aggregate_while_statement_boundary)
+    ));
+    while_boundary_body.push_str(&format!(
+        "    ExpectError({}, \"statement_limit\", {})?\n    return ok(null)\n}}\n",
+        ku_string(&over_aggregate_while_statement_limit),
+        ku_string(&over_aggregate_while_statement_message)
+    ));
+    let while_boundary_entry = stage3.join("while_boundary.ku");
+    fs::write(&while_boundary_entry, while_boundary_body)
+        .expect("write focused stage-3 while boundary harness");
+    let while_boundary_arg = while_boundary_entry.to_string_lossy().to_string();
+    run_ku(&["check", &while_boundary_arg]);
+    run_ku(&["run", &while_boundary_arg]);
 
     // Keep the directly importable body-reader contract out of the already
     // broad differential main. A separate interpreter process gives malformed
@@ -2773,10 +3115,11 @@ fn ExpectBodyCallbackOutputError(tokens: [Token], body_start: int): null! {
         ku_string(&direct_body_exhausted_work_message),
     ));
     body_contract.push_str(&format!(
-        "fn CheckBodyTransport(): null! {{\n    direct = Scan({})?\n    empty_body = ValidateParseOutput(ReadFunctionBody(direct, 5, 0, 7, RejectBodyExpression)?)?\n    empty_root_id = empty_body.root\n    empty_arena = empty_body.arena\n    empty_nodes = empty_arena.nodes\n    empty_edges = empty_arena.edges\n    if (empty_root_id != 1 || empty_nodes.len() != 1 || empty_edges.len() != 0) {{ panic(\"empty function-body transport shape mismatch\") }}\n    empty_root = empty_nodes[0].clone()\n    if (empty_root.kind != \"FunctionBodyTransport\" || empty_root.int_value != 8 || empty_root.offset != 7 || empty_root.end_offset != 9 || empty_root.edge_count != 0) {{ panic(\"empty function-body transport metadata mismatch\") }}\n    multiple_tokens = Scan({})?\n    multiple = ValidateParseOutput(ReadFunctionBody(multiple_tokens, 5, 7, 3, SyntheticBodyExpression)?)?\n    multiple_root_id = multiple.root\n    multiple_arena = multiple.arena\n    multiple_nodes = multiple_arena.nodes\n    multiple_edges = multiple_arena.edges\n    if (multiple_root_id != 5 || multiple_nodes.len() != 5 || multiple_edges.len() != 4) {{ panic(\"multi-root function-body transport arena mismatch\") }}\n    multiple_root = multiple_nodes[multiple_root_id - 1].clone()\n    if (multiple_root.kind != \"FunctionBodyTransport\" || multiple_root.edge_count != 2 || multiple_edges[multiple_root.first_edge] != 2 || multiple_edges[multiple_root.first_edge + 1] != 4) {{ panic(\"multi-root function-body transport children mismatch\") }}\n    nested_tokens = Scan({})?\n    nested = ValidateParseOutput(ReadFunctionBody(nested_tokens, 5, 0, 0, SyntheticBodyExpression)?)?\n    nested_root_id = nested.root\n    nested_arena = nested.arena\n    nested_nodes = nested_arena.nodes\n    nested_edges = nested_arena.edges\n    nested_root = nested_nodes[nested_root_id - 1].clone()\n    if (nested_root.kind != \"FunctionBodyTransport\" || nested_root.edge_count != 3) {{ panic(\"nested-if function-body transport root mismatch\") }}\n    nested_first = nested_edges[nested_root.first_edge]\n    nested_if = nested_edges[nested_root.first_edge + 1]\n    nested_last = nested_edges[nested_root.first_edge + 2]\n    if (nested_nodes[nested_first - 1].kind != \"ExprStmt\" || nested_nodes[nested_if - 1].kind != \"If\" || nested_nodes[nested_if - 1].int_value != 1 || nested_nodes[nested_if - 1].edge_count != 3 || nested_nodes[nested_last - 1].kind != \"ExprStmt\") {{ panic(\"nested-if function-body transport ordering mismatch\") }}\n    public_body = AstCanonical(ParseProgram({})?)\n    if (public_body.contains(\"FunctionBodyTransport\")) {{ panic(\"private function-body transport escaped into the public AST\") }}\n    return ok(null)\n}}\n\nfn main(): null! {{\n    CheckBodyWindowContracts()?\n    CheckBodyTransport()?\n    return ok(null)\n}}\n",
+        "fn CheckBodyTransport(): null! {{\n    direct = Scan({})?\n    empty_body = ValidateParseOutput(ReadFunctionBody(direct, 5, 0, 7, RejectBodyExpression)?)?\n    empty_root_id = empty_body.root\n    empty_arena = empty_body.arena\n    empty_nodes = empty_arena.nodes\n    empty_edges = empty_arena.edges\n    if (empty_root_id != 1 || empty_nodes.len() != 1 || empty_edges.len() != 0) {{ panic(\"empty function-body transport shape mismatch\") }}\n    empty_root = empty_nodes[0].clone()\n    if (empty_root.kind != \"FunctionBodyTransport\" || empty_root.int_value != 8 || empty_root.offset != 7 || empty_root.end_offset != 9 || empty_root.edge_count != 0) {{ panic(\"empty function-body transport metadata mismatch\") }}\n    multiple_tokens = Scan({})?\n    multiple = ValidateParseOutput(ReadFunctionBody(multiple_tokens, 5, 7, 3, SyntheticBodyExpression)?)?\n    multiple_root_id = multiple.root\n    multiple_arena = multiple.arena\n    multiple_nodes = multiple_arena.nodes\n    multiple_edges = multiple_arena.edges\n    if (multiple_root_id != 5 || multiple_nodes.len() != 5 || multiple_edges.len() != 4) {{ panic(\"multi-root function-body transport arena mismatch\") }}\n    multiple_root = multiple_nodes[multiple_root_id - 1].clone()\n    if (multiple_root.kind != \"FunctionBodyTransport\" || multiple_root.edge_count != 2 || multiple_edges[multiple_root.first_edge] != 2 || multiple_edges[multiple_root.first_edge + 1] != 4) {{ panic(\"multi-root function-body transport children mismatch\") }}\n    nested_tokens = Scan({})?\n    nested = ValidateParseOutput(ReadFunctionBody(nested_tokens, 5, 0, 0, SyntheticBodyExpression)?)?\n    nested_root_id = nested.root\n    nested_arena = nested.arena\n    nested_nodes = nested_arena.nodes\n    nested_edges = nested_arena.edges\n    nested_root = nested_nodes[nested_root_id - 1].clone()\n    if (nested_root.kind != \"FunctionBodyTransport\" || nested_root.edge_count != 3) {{ panic(\"nested-if function-body transport root mismatch\") }}\n    nested_first = nested_edges[nested_root.first_edge]\n    nested_if = nested_edges[nested_root.first_edge + 1]\n    nested_last = nested_edges[nested_root.first_edge + 2]\n    if (nested_nodes[nested_first - 1].kind != \"ExprStmt\" || nested_nodes[nested_if - 1].kind != \"If\" || nested_nodes[nested_if - 1].int_value != 1 || nested_nodes[nested_if - 1].edge_count != 3 || nested_nodes[nested_last - 1].kind != \"ExprStmt\") {{ panic(\"nested-if function-body transport ordering mismatch\") }}\n    while_tokens = Scan({})?\n    while_body = ValidateParseOutput(ReadFunctionBody(while_tokens, 5, 0, 0, SyntheticBodyExpression)?)?\n    while_root = while_body.arena.nodes[while_body.root - 1].clone()\n    while_children = while_body.arena.edges\n    if (while_body.root != 11 || while_root.kind != \"FunctionBodyTransport\" || while_root.edge_count != 3) {{ panic(\"nested-while function-body transport root mismatch\") }}\n    while_first = while_children[while_root.first_edge]\n    while_control = while_children[while_root.first_edge + 1]\n    while_last = while_children[while_root.first_edge + 2]\n    while_node = while_body.arena.nodes[while_control - 1].clone()\n    if (while_body.arena.nodes[while_first - 1].kind != \"ExprStmt\" || while_node.kind != \"While\" || while_node.int_value != 0 || while_node.edge_count != 2 || while_body.arena.nodes[while_children[while_node.first_edge + 1] - 1].kind != \"If\" || while_body.arena.nodes[while_last - 1].kind != \"ExprStmt\") {{ panic(\"nested-while function-body transport ordering mismatch\") }}\n    public_body = AstCanonical(ParseProgram({})?)\n    if (public_body.contains(\"FunctionBodyTransport\")) {{ panic(\"private function-body transport escaped into the public AST\") }}\n    return ok(null)\n}}\n\nfn main(): null! {{\n    CheckBodyWindowContracts()?\n    CheckBodyTransport()?\n    return ok(null)\n}}\n",
         ku_string(direct_function_source),
         ku_string(direct_body_multiple_source),
         ku_string(direct_body_nested_source),
+        ku_string(direct_body_while_source),
         ku_string(direct_body_multiple_source),
     ));
     let body_contract_entry = stage3.join("body_contract.ku");

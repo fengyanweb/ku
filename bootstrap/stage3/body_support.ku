@@ -1,5 +1,6 @@
 import { Token } from "../stage1/token.ku"
 import { Node, Arena, ParseOutput } from "../stage2/ast.ku"
+import { SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { RejectAt, RejectAtPoint } from "./support.ku"
 import { SignatureType, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 
@@ -8,15 +9,20 @@ struct StatementLink {
     previous: int
 }
 
-struct IfFrame {
-    start: Token
+struct ControlFrame {
+    is_while: bool
+    start: int
     condition: int
-    then_top: int
-    then_count: int
+    body_top: int
+    body_count: int
     else_top: int
     else_count: int
     phase: int
     previous: int
+}
+
+fn NewControlFrame(is_while: bool, start: int, condition: int, previous: int): ControlFrame {
+    return ControlFrame { is_while: is_while, start: start, condition: condition, body_top: 0, body_count: 0, else_top: 0, else_count: 0, phase: 0, previous: previous }
 }
 
 fn NextBodyWork(current: int, amount: int, error_token: Token): int! {
@@ -26,15 +32,97 @@ fn NextBodyWork(current: int, amount: int, error_token: Token): int! {
     return ok(current + amount)
 }
 
-fn RejectBodyEof(if_depth: int, phase: int, error_token: Token): null! {
-    if (if_depth > 0 && phase == 0) {
+fn RejectBodyEof(control_depth: int, is_while: bool, phase: int, error_token: Token): null! {
+    if (control_depth > 0 && is_while) {
+        RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after while body")?
+    }
+    if (control_depth > 0 && phase == 0) {
         RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after if body")?
     }
-    if (if_depth > 0) {
+    if (control_depth > 0) {
         RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after else body")?
     }
     RejectAt(error_token, "unexpected_eof", "expected '}' after function body")?
     return ok(null)
+}
+
+fn RejectControlOpen(is_while: bool, error_token: Token): null! {
+    if (!is_while) { RejectAt(error_token.clone(), "unexpected_token", "expected '(' after 'if'")? }
+    RejectAt(error_token, "unexpected_token", "expected '(' after 'while'")?
+    return ok(null)
+}
+
+fn RejectControlClose(is_while: bool, error_token: Token): null! {
+    if (!is_while) { RejectAt(error_token.clone(), "unexpected_token", "expected ')' after if condition")? }
+    RejectAt(error_token, "unexpected_token", "expected ')' after while condition")?
+    return ok(null)
+}
+
+fn RejectControlBody(is_while: bool, error_token: Token): null! {
+    if (!is_while) { RejectAt(error_token.clone(), "unsupported_statement", "stage-3 if bodies must use braces")? }
+    RejectAt(error_token, "unsupported_statement", "stage-3 while bodies must use braces")?
+    return ok(null)
+}
+
+fn RejectBodyNodeLimit(token: Token): null! { RejectAt(token, "node_limit", "stage-3 parser accepts at most 4096 AST nodes")? return ok(null) }
+fn RejectBodyEdgeLimit(token: Token): null! { RejectAt(token, "edge_limit", "stage-3 parser accepts at most 8192 AST edges")? return ok(null) }
+fn RejectBodyEdgeId(token: Token): null! { RejectAt(token, "invalid_node_id", "AST edge references an invalid NodeId")? return ok(null) }
+fn RejectNestedNodeId(token: Token): null! { RejectAt(token, "invalid_node_id", "nested AST contains an invalid NodeId")? return ok(null) }
+fn RejectNestedRoot(token: Token): null! { RejectAt(token, "invalid_node_id", "nested AST root is invalid")? return ok(null) }
+fn RejectTypeInspection(token: Token): null! { RejectAt(token, "invalid_token_stream", "type inspection escaped its bounded token window")? return ok(null) }
+fn RejectExpressionTerminator(token: Token): null! { RejectAt(token, "unexpected_eof", "expression is missing a terminator")? return ok(null) }
+fn RejectBodyWorkLimit(token: Token): null! { RejectAt(token, "work_limit", "stage-3 parser work budget exceeded")? return ok(null) }
+fn RejectStatementLink(token: Token): null! { RejectAt(token, "invalid_node_id", "statement list contains an invalid link")? return ok(null) }
+fn RejectStatementNode(token: Token): null! { RejectAt(token, "invalid_node_id", "statement list contains an invalid NodeId")? return ok(null) }
+fn RejectStatementLength(token: Token): null! { RejectAt(token, "invalid_node_id", "statement list length is inconsistent")? return ok(null) }
+fn RejectElseIf(token: Token): null! { RejectAt(token, "unsupported_statement", "stage-3 does not support else-if yet; use 'else { if (...) { ... } }'")? return ok(null) }
+fn RejectElseBody(token: Token): null! { RejectAt(token, "unsupported_statement", "stage-3 else bodies must use braces")? return ok(null) }
+fn RejectStrayElse(token: Token): null! { RejectAt(token, "unsupported_statement", "stage-3 else must immediately follow an if body")? return ok(null) }
+fn RejectStatementLimit(token: Token): null! { RejectAt(token, "statement_limit", "stage-3 parser accepts at most 128 statements per function")? return ok(null) }
+fn RejectStatementDepth(token: Token): null! { RejectAt(token, "statement_depth_exceeded", "stage-3 statement nesting exceeds 32 levels")? return ok(null) }
+fn RejectLetStatement(token: Token): null! { RejectAt(token, "unsupported_statement", "'let' is not supported in Ku; use a typed declaration or assignment")? return ok(null) }
+fn RejectDeclarationInitializer(token: Token): null! { RejectAt(token, "unsupported_statement", "stage-3 typed declarations require an initializer")? return ok(null) }
+fn RejectTrailingDeclaration(token: Token): null! { RejectAt(token, "invalid_token_stream", "function window must contain exactly one declaration before EOF")? return ok(null) }
+
+// Finish the internal body transport in one owned transfer. Keeping this cold
+// path outside statements.ku preserves lexer headroom without wrapping each
+// parsed node or token at a module boundary.
+fn FinishFunctionBodyOutput(input_nodes: [Node], input_edges: [int], parse_steps: int, body_open: Token, function_end: Token, statements: [int]): ParseOutput! {
+    nodes: [Node] = input_nodes
+    edges: [int] = input_edges
+    if (parse_steps < 0 || parse_steps > 16384) {
+        RejectAt(body_open.clone(), "work_limit", "stage-3 parser work budget exceeded")?
+    }
+    if (nodes.len() >= 4096) {
+        RejectAt(body_open.clone(), "node_limit", "stage-3 parser accepts at most 4096 AST nodes")?
+    }
+    if (statements.len() > 8192 - edges.len()) {
+        RejectAt(body_open.clone(), "edge_limit", "stage-3 parser accepts at most 8192 AST edges")?
+    }
+    first_edge = edges.len()
+    for child in statements {
+        if (child <= 0 || child > nodes.len()) {
+            RejectAt(body_open.clone(), "invalid_node_id", "AST edge references an invalid NodeId")?
+        }
+        edges = edges.push(child)
+    }
+    span = SpanMerge(SpanFromToken(body_open), SpanFromToken(function_end))
+    transport = Node {
+        kind: "FunctionBodyTransport",
+        text: "",
+        int_value: parse_steps,
+        line: span.line,
+        column: span.column,
+        offset: span.offset,
+        end_line: span.end_line,
+        end_column: span.end_column,
+        end_offset: span.end_offset,
+        first_edge: first_edge,
+        edge_count: edges.len() - first_edge
+    }
+    nodes = nodes.push(transport)
+    root = nodes.len()
+    return ok(ParseOutput { arena: Arena { nodes: nodes, edges: edges }, root: root })
 }
 
 // Validate and return the owned token window so the body reader never needs a
