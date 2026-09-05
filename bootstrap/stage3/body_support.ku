@@ -1,0 +1,112 @@
+import { Token } from "../stage1/token.ku"
+import { Node, Arena, ParseOutput } from "../stage2/ast.ku"
+import { RejectAt, RejectAtPoint } from "./support.ku"
+import { SignatureType, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
+
+struct StatementLink {
+    node: int
+    previous: int
+}
+
+struct IfFrame {
+    start: Token
+    condition: int
+    then_top: int
+    then_count: int
+    else_top: int
+    else_count: int
+    phase: int
+    previous: int
+}
+
+fn NextBodyWork(current: int, amount: int, error_token: Token): int! {
+    if (current < 0 || current > 16384 || amount < 0 || amount > 16384 - current) {
+        RejectAt(error_token, "work_limit", "stage-3 parser work budget exceeded")?
+    }
+    return ok(current + amount)
+}
+
+fn RejectBodyEof(if_depth: int, phase: int, error_token: Token): null! {
+    if (if_depth > 0 && phase == 0) {
+        RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after if body")?
+    }
+    if (if_depth > 0) {
+        RejectAt(error_token.clone(), "unexpected_eof", "expected '}' after else body")?
+    }
+    RejectAt(error_token, "unexpected_eof", "expected '}' after function body")?
+    return ok(null)
+}
+
+// Validate and return the owned token window so the body reader never needs a
+// full-array clone merely to cross this internal module boundary.
+fn ValidateFunctionBodyWindow(input_tokens: [Token], body_start: int, token_base: int, initial_work: int): [Token]! {
+    tokens: [Token] = input_tokens
+    if (tokens.len() > 512) {
+        RejectAtPoint("invalid_token_stream", "function body window accepts at most 512 tokens")?
+    }
+    if (tokens.len() == 0) {
+        RejectAtPoint("invalid_token_stream", "function body window must start with fn and end with EOF")?
+    }
+    if (token_base < 0 || token_base > 512 - tokens.len()) {
+        RejectAtPoint("invalid_token_stream", "function body token base lies outside stage-3 token bounds")?
+    }
+    if (initial_work < 0 || initial_work > 16384) {
+        RejectAtPoint("work_limit", "stage-3 parser work budget exceeded")?
+    }
+    last_index = tokens.len() - 1
+    last = tokens[last_index].clone()
+    if (last.kind != "Eof" || tokens[0].kind != "Fn") {
+        RejectAt(tokens[0].clone(), "invalid_token_stream", "function body window must start with fn and end with EOF")?
+    }
+    validation_index = 0
+    while (validation_index < last_index) {
+        if (tokens[validation_index].kind == "Eof") {
+            RejectAt(tokens[validation_index].clone(), "invalid_token_stream", "EOF must be final in function body window")?
+        }
+        validation_index = validation_index + 1
+    }
+    if (body_start < 1 || body_start > last_index) {
+        RejectAt(last.clone(), "invalid_token_stream", "function body start lies outside its bounded token window")?
+    }
+    body_open = tokens[body_start - 1].clone()
+    if (body_open.kind != "LBrace") {
+        RejectAt(body_open.clone(), "invalid_token_stream", "function body start must immediately follow '{'")?
+    }
+    return ok(tokens)
+}
+
+// Materialize a bounded signature plan as an internal subtree. The body reader's
+// AddArena consumer validates it before relocation, keeping one NodeId contract
+// for both expression callbacks and declaration types without a duplicate pass.
+fn SignatureTypeOutput(parsed: SignatureType, error_token: Token): ParseOutput! {
+    parsed_root = parsed.root
+    parsed_parts = parsed.parts
+    parsed_edges = parsed.edges
+    nodes: [Node] = []
+    edges: [int] = []
+    part_index = 0
+    while (part_index < parsed_parts.len()) {
+        part = parsed_parts[part_index].clone()
+        CheckTypeArenaCapacity(nodes.len(), edges.len(), part.edge_count, error_token.clone())?
+        first_edge = edges.len()
+        edge_index = 0
+        while (edge_index < part.edge_count) {
+            plan_edge = part.first_edge + edge_index
+            if (plan_edge < 0 || plan_edge >= parsed_edges.len()) {
+                RejectAt(error_token.clone(), "invalid_node_id", "type plan edge lies outside its arena")?
+            }
+            child = parsed_edges[plan_edge]
+            if (child <= 0 || child > part_index) {
+                RejectAt(error_token.clone(), "invalid_node_id", "type plan edge must reference an earlier NodeId")?
+            }
+            edges = edges.push(child)
+            edge_index = edge_index + 1
+        }
+        nodes = nodes.push(TypePartToNode(part, first_edge))
+        part_index = part_index + 1
+    }
+    if (parsed_root <= 0 || parsed_root > parsed_parts.len()) {
+        RejectAt(error_token, "invalid_node_id", "type plan root is invalid")?
+    }
+    return ok(ParseOutput { arena: Arena { nodes: nodes, edges: edges }, root: parsed_root })
+}

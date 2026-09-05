@@ -25,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 const PROCESS_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
+const FUNCTION_MODULE_TOKEN_LIMIT: usize = 3072;
 
 // Static ABI goldens are not produced by the Rust projector during the test.
 // Both parser implementations are checked against these reviewed bytes.
@@ -900,6 +901,28 @@ fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
     );
 }
 
+#[test]
+fn bootstrap_stage3_function_modules_retain_lexer_headroom() {
+    let stage3 = Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/stage3");
+    for name in ["functions.ku", "statements.ku", "body_support.ku"] {
+        let path = stage3.join(name);
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let token_count = Lexer::new(&source)
+            .lex()
+            .unwrap_or_else(|error| panic!("lex {}: {error}", path.display()))
+            .len();
+        eprintln!(
+            "stage3 function module headroom file={name} tokens={token_count} ceiling={FUNCTION_MODULE_TOKEN_LIMIT}"
+        );
+        assert!(
+            token_count <= FUNCTION_MODULE_TOKEN_LIMIT,
+            "{} consumes {token_count} lexer tokens including EOF; split it before exceeding the {FUNCTION_MODULE_TOKEN_LIMIT}-token maintenance ceiling",
+            path.display()
+        );
+    }
+}
+
 fn ku_binary() -> PathBuf {
     if let Ok(path) = std::env::var("KU_BIN") {
         let candidate = PathBuf::from(path);
@@ -1495,6 +1518,44 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         6,
         "function window must contain exactly one declaration before EOF",
     );
+    let direct_body_start_message = diagnostic_at(
+        direct_function_source,
+        6,
+        "function body start lies outside its bounded token window",
+    );
+    let direct_body_opener_message = diagnostic_at(
+        direct_function_source,
+        3,
+        "function body start must immediately follow '{'",
+    );
+    let direct_body_missing_eof_message = diagnostic_at(
+        direct_function_source,
+        0,
+        "function body window must start with fn and end with EOF",
+    );
+    let direct_body_early_eof_message = diagnostic_at(
+        direct_function_source,
+        6,
+        "EOF must be final in function body window",
+    );
+    let direct_body_wrong_start_message = diagnostic_at(
+        wrong_function_start,
+        0,
+        "function body window must start with fn and end with EOF",
+    );
+    let direct_body_trailing_message = diagnostic_at(
+        direct_function_trailing_source,
+        6,
+        "function window must contain exactly one declaration before EOF",
+    );
+    let direct_body_exhausted_work_message = diagnostic_at(
+        direct_function_source,
+        5,
+        "stage-3 parser work budget exceeded",
+    );
+    let direct_body_multiple_source = "fn f() { first; second; }";
+    let direct_body_nested_source =
+        "fn f() { before; if (true) { inner; } else { other; } after; }";
 
     let mut body = "import { Token } from \"../stage1/token.ku\"\nimport { Scan } from \"../stage1/lexer.ku\"\nimport { Node, Arena, AstCanonical, ParseOutput } from \"../stage2/ast.ku\"\nimport { ParseProgram } from \"./parser.ku\"\nimport { ReadEnum } from \"./enums.ku\"\nimport { ReadFunction } from \"./functions.ku\"\nimport { ReadImport } from \"./imports.ku\"\nimport { ReadStruct } from \"./structs.ku\"\nimport { MapTokenCharacters } from \"./support.ku\"\nimport { ParseTypeWindow } from \"./signature.ku\"\n\n".to_string();
     body.push_str(
@@ -2606,11 +2667,13 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         .expect("copy stage-2 parser dependency");
     }
     for name in [
+        "body_support.ku",
         "enums.ku",
         "functions.ku",
         "imports.ku",
         "parser.ku",
         "signature.ku",
+        "statements.ku",
         "structs.ku",
         "support.ku",
     ] {
@@ -2625,6 +2688,103 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     let entry_arg = entry.to_string_lossy().to_string();
     run_ku(&["check", &entry_arg]);
     run_ku(&["run", &entry_arg]);
+
+    // Keep the directly importable body-reader contract out of the already
+    // broad differential main. A separate interpreter process gives malformed
+    // producer inputs their own watchdog and avoids growing the native main's
+    // fixed stack frame merely to test this internal transport boundary.
+    let mut body_contract = r#"import { Token } from "../stage1/token.ku"
+import { Scan } from "../stage1/lexer.ku"
+import { Node, Arena, AstCanonical, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
+import { ParseProgram } from "./parser.ku"
+import { ReadFunctionBody } from "./statements.ku"
+
+fn RejectBodyExpression(start: int, end: int): ParseOutput! {
+    fail { domain: "bootstrap.parser.stage3.test", code: "unexpected_callback", message: "ReadFunctionBody invoked its expression callback before validating the window" }
+}
+
+fn MalformedBodyExpression(start: int, end: int): ParseOutput! {
+    node = Node {
+        kind: "Invalid", text: "", int_value: 0,
+        line: 1, column: 1, offset: 0,
+        end_line: 1, end_column: 2, end_offset: 1,
+        first_edge: 0, edge_count: 1
+    }
+    nodes: [Node] = [node]
+    edges: [int] = []
+    return ok(ParseOutput { arena: Arena { nodes: nodes, edges: edges }, root: 1 })
+}
+
+fn SyntheticBodyExpression(start: int, end: int): ParseOutput! {
+    if (start < 0 || end <= start) {
+        fail { domain: "bootstrap.parser.stage3.test", code: "invalid_range", message: "synthetic expression callback received an invalid range" }
+    }
+    node = Node {
+        kind: "Variable", text: "synthetic", int_value: 0,
+        line: 1, column: 1, offset: 0,
+        end_line: 1, end_column: 1, end_offset: 0,
+        first_edge: 0, edge_count: 0
+    }
+    nodes: [Node] = [node]
+    edges: [int] = []
+    return ok(ParseOutput { arena: Arena { nodes: nodes, edges: edges }, root: 1 })
+}
+
+fn ExpectBodyWindowError(tokens: [Token], body_start: int, token_base: int, initial_work: int, expected_code: str, expected_detail: str): null! {
+    expected_message = "error|bootstrap.parser.stage3|" + expected_code.clone() + "|<source>|" + expected_detail
+    caught = false
+    try { ReadFunctionBody(tokens, body_start, token_base, initial_work, RejectBodyExpression)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.parser.stage3" || err.code != expected_code || err.message != expected_message) {
+            panic("wrong direct function-body diagnostic: " + err.domain + "/" + err.code + "/" + err.message + " EXPECTED " + expected_code + "/" + expected_message)
+        }
+    }
+    if (!caught) { panic("expected direct function-body error") }
+    return ok(null)
+}
+
+fn ExpectBodyCallbackOutputError(tokens: [Token], body_start: int): null! {
+    caught = false
+    try { ReadFunctionBody(tokens, body_start, 0, 0, MalformedBodyExpression)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.ast" || err.code != "invalid_edge_slice" || err.message != "bootstrap AST node edge slice lies outside the edge arena") {
+            panic("wrong function-body callback-output diagnostic: " + err.domain + "/" + err.code + "/" + err.message)
+        }
+    }
+    if (!caught) { panic("expected malformed function-body callback output to be rejected") }
+    return ok(null)
+}
+
+"#
+    .to_string();
+    body_contract.push_str(&format!(
+        "fn CheckBodyWindowContracts(): null! {{\n    direct = Scan({})?\n    empty: [Token] = []\n    ExpectBodyWindowError(empty, 1, 0, 0, \"invalid_token_stream\", \"function body window must start with fn and end with EOF|1:1@0..1:1@0\")?\n    ExpectBodyWindowError(direct.clone(), 0, 0, 0, \"invalid_token_stream\", {})?\n    ExpectBodyWindowError(direct.clone(), direct.len(), 0, 0, \"invalid_token_stream\", {})?\n    ExpectBodyWindowError(direct.clone(), 4, 0, 0, \"invalid_token_stream\", {})?\n    missing_eof: [Token] = [direct[0].clone(), direct[1].clone(), direct[2].clone(), direct[3].clone(), direct[4].clone(), direct[5].clone()]\n    ExpectBodyWindowError(missing_eof, 5, 0, 0, \"invalid_token_stream\", {})?\n    early_eof: [Token] = [direct[0].clone(), direct[1].clone(), direct[2].clone(), direct[3].clone(), direct[4].clone(), direct[6].clone(), direct[5].clone(), direct[6].clone()]\n    ExpectBodyWindowError(early_eof, 5, 0, 0, \"invalid_token_stream\", {})?\n    wrong_start = Scan({})?\n    ExpectBodyWindowError(wrong_start, 3, 0, 0, \"invalid_token_stream\", {})?\n    trailing = Scan({})?\n    ExpectBodyWindowError(trailing, 5, 0, 0, \"invalid_token_stream\", {})?\n    over = Scan({})?\n    ExpectBodyWindowError(over, 1, 0, 0, \"invalid_token_stream\", \"function body window accepts at most 512 tokens|1:1@0..1:1@0\")?\n    ExpectBodyWindowError(direct.clone(), 5, -1, 0, \"invalid_token_stream\", \"function body token base lies outside stage-3 token bounds|1:1@0..1:1@0\")?\n    ExpectBodyWindowError(direct.clone(), 5, 506, 0, \"invalid_token_stream\", \"function body token base lies outside stage-3 token bounds|1:1@0..1:1@0\")?\n    ExpectBodyWindowError(direct.clone(), 5, 0, -1, \"work_limit\", \"stage-3 parser work budget exceeded|1:1@0..1:1@0\")?\n    ExpectBodyWindowError(direct.clone(), 5, 0, 16385, \"work_limit\", \"stage-3 parser work budget exceeded|1:1@0..1:1@0\")?\n    ExpectBodyWindowError(direct.clone(), 5, 0, 16384, \"work_limit\", {})?\n    callback = Scan(\"fn f() {{ x }}\")?\n    ExpectBodyCallbackOutputError(callback, 5)?\n    return ok(null)\n}}\n\n",
+        ku_string(direct_function_source),
+        ku_string(&direct_body_start_message),
+        ku_string(&direct_body_start_message),
+        ku_string(&direct_body_opener_message),
+        ku_string(&direct_body_missing_eof_message),
+        ku_string(&direct_body_early_eof_message),
+        ku_string(wrong_function_start),
+        ku_string(&direct_body_wrong_start_message),
+        ku_string(direct_function_trailing_source),
+        ku_string(&direct_body_trailing_message),
+        ku_string(&direct_function_over_source),
+        ku_string(&direct_body_exhausted_work_message),
+    ));
+    body_contract.push_str(&format!(
+        "fn CheckBodyTransport(): null! {{\n    direct = Scan({})?\n    empty_body = ValidateParseOutput(ReadFunctionBody(direct, 5, 0, 7, RejectBodyExpression)?)?\n    empty_root_id = empty_body.root\n    empty_arena = empty_body.arena\n    empty_nodes = empty_arena.nodes\n    empty_edges = empty_arena.edges\n    if (empty_root_id != 1 || empty_nodes.len() != 1 || empty_edges.len() != 0) {{ panic(\"empty function-body transport shape mismatch\") }}\n    empty_root = empty_nodes[0].clone()\n    if (empty_root.kind != \"FunctionBodyTransport\" || empty_root.int_value != 8 || empty_root.offset != 7 || empty_root.end_offset != 9 || empty_root.edge_count != 0) {{ panic(\"empty function-body transport metadata mismatch\") }}\n    multiple_tokens = Scan({})?\n    multiple = ValidateParseOutput(ReadFunctionBody(multiple_tokens, 5, 7, 3, SyntheticBodyExpression)?)?\n    multiple_root_id = multiple.root\n    multiple_arena = multiple.arena\n    multiple_nodes = multiple_arena.nodes\n    multiple_edges = multiple_arena.edges\n    if (multiple_root_id != 5 || multiple_nodes.len() != 5 || multiple_edges.len() != 4) {{ panic(\"multi-root function-body transport arena mismatch\") }}\n    multiple_root = multiple_nodes[multiple_root_id - 1].clone()\n    if (multiple_root.kind != \"FunctionBodyTransport\" || multiple_root.edge_count != 2 || multiple_edges[multiple_root.first_edge] != 2 || multiple_edges[multiple_root.first_edge + 1] != 4) {{ panic(\"multi-root function-body transport children mismatch\") }}\n    nested_tokens = Scan({})?\n    nested = ValidateParseOutput(ReadFunctionBody(nested_tokens, 5, 0, 0, SyntheticBodyExpression)?)?\n    nested_root_id = nested.root\n    nested_arena = nested.arena\n    nested_nodes = nested_arena.nodes\n    nested_edges = nested_arena.edges\n    nested_root = nested_nodes[nested_root_id - 1].clone()\n    if (nested_root.kind != \"FunctionBodyTransport\" || nested_root.edge_count != 3) {{ panic(\"nested-if function-body transport root mismatch\") }}\n    nested_first = nested_edges[nested_root.first_edge]\n    nested_if = nested_edges[nested_root.first_edge + 1]\n    nested_last = nested_edges[nested_root.first_edge + 2]\n    if (nested_nodes[nested_first - 1].kind != \"ExprStmt\" || nested_nodes[nested_if - 1].kind != \"If\" || nested_nodes[nested_if - 1].int_value != 1 || nested_nodes[nested_if - 1].edge_count != 3 || nested_nodes[nested_last - 1].kind != \"ExprStmt\") {{ panic(\"nested-if function-body transport ordering mismatch\") }}\n    public_body = AstCanonical(ParseProgram({})?)\n    if (public_body.contains(\"FunctionBodyTransport\")) {{ panic(\"private function-body transport escaped into the public AST\") }}\n    return ok(null)\n}}\n\nfn main(): null! {{\n    CheckBodyWindowContracts()?\n    CheckBodyTransport()?\n    return ok(null)\n}}\n",
+        ku_string(direct_function_source),
+        ku_string(direct_body_multiple_source),
+        ku_string(direct_body_nested_source),
+        ku_string(direct_body_multiple_source),
+    ));
+    let body_contract_entry = stage3.join("body_contract.ku");
+    fs::write(&body_contract_entry, body_contract)
+        .expect("write focused direct function-body contract harness");
+    let body_contract_arg = body_contract_entry.to_string_lossy().to_string();
+    run_ku(&["check", &body_contract_arg]);
+    run_ku(&["run", &body_contract_arg]);
 
     // Keep the exact complete-module token boundary out of the already broad
     // differential process. The interpreter's captured-array implementation
