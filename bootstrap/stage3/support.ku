@@ -12,6 +12,25 @@ struct SourceMap {
     ends: [int]
 }
 
+// Control-flow parser state is defined here so the function reader keeps
+// enough room below Stage 1's fixed per-file token ceiling. These are passive,
+// bounded records; parsing and mutation remain in functions.ku.
+struct StatementLink {
+    node: int
+    previous: int
+}
+
+struct IfFrame {
+    start: Token
+    condition: int
+    then_top: int
+    then_count: int
+    else_top: int
+    else_count: int
+    phase: int
+    previous: int
+}
+
 fn SpanFromNode(node: Node): Span {
     return Span {
         line: node.line,
