@@ -92,8 +92,8 @@ def json_object(value: bytes):
 
 def repo_version(repo: Path, version: str) -> str:
     EXPORTER.plain(repo, directory=True)
-    cargo = tomllib.loads(read_file(repo / "Cargo.toml", MAX_JSON).decode("utf-8"))
-    lock = tomllib.loads(read_file(repo / "Cargo.lock", MAX_JSON).decode("utf-8"))
+    cargo = tomllib.loads(read_file(repo / "Cargo.toml", MAX_JSON).decode("utf-8-sig"))
+    lock = tomllib.loads(read_file(repo / "Cargo.lock", MAX_JSON).decode("utf-8-sig"))
     packages = [item for item in lock.get("package", []) if item.get("name") == "ku"]
     if (cargo.get("package", {}).get("name") != "ku"
             or cargo["package"].get("version") != version

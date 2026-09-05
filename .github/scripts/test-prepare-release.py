@@ -157,6 +157,38 @@ class PrepareReleaseTests(unittest.TestCase):
                 self.rejected()
                 path.write_bytes(original)
 
+    def test_single_leading_bom_in_cargo_files_is_accepted_without_rewriting(self):
+        originals = {}
+        for name in ("Cargo.toml", "Cargo.lock"):
+            path = self.repo / name
+            originals[path] = b"\xef\xbb\xbf" + path.read_bytes()
+            path.write_bytes(originals[path])
+        self.assertEqual(self.prepare()["version"], VERSION)
+        for path, original in originals.items():
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_repeated_leading_bom_in_cargo_files_is_rejected(self):
+        for name in ("Cargo.toml", "Cargo.lock"):
+            with self.subTest(name=name):
+                path = self.repo / name
+                original = path.read_bytes()
+                path.write_bytes(b"\xef\xbb\xbf" * 2 + original)
+                with self.assertRaises(PREPARE.tomllib.TOMLDecodeError):
+                    PREPARE.repo_version(self.repo, VERSION)
+                self.rejected()
+                path.write_bytes(original)
+
+    def test_bom_between_cargo_statements_is_rejected(self):
+        for name in ("Cargo.toml", "Cargo.lock"):
+            with self.subTest(name=name):
+                path = self.repo / name
+                original = path.read_bytes()
+                path.write_bytes(original.replace(b"\n", b"\n\xef\xbb\xbf", 1))
+                with self.assertRaises(PREPARE.tomllib.TOMLDecodeError):
+                    PREPARE.repo_version(self.repo, VERSION)
+                self.rejected()
+                path.write_bytes(original)
+
     def test_embedded_release_identity_is_independently_verified(self):
         for key in ("version", "target", "commit"):
             release = {"version": VERSION, "target": PREPARE.TARGETS[0], "commit": COMMIT}
