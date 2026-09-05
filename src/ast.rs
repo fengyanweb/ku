@@ -52,8 +52,16 @@ pub struct FnDecl {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ParamMode {
+    #[default]
+    Owned,
+    View,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
+    pub mode: ParamMode,
     pub name: String,
     pub ty: Option<TypeName>,
     pub span: Span,
@@ -97,6 +105,8 @@ pub enum TypeName {
     Result(Box<TypeName>),
     Function {
         params: Vec<TypeName>,
+        /// One mode per parameter slot; this is not a first-class reference type.
+        param_modes: Vec<ParamMode>,
         return_type: Box<TypeName>,
         is_async: bool,
     },
@@ -320,6 +330,7 @@ pub enum MatchPattern {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionParam {
+    pub mode: ParamMode,
     pub name: String,
     pub ty: Option<TypeName>,
     pub span: Span,

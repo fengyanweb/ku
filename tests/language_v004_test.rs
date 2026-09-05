@@ -1520,10 +1520,10 @@ fn main() {
 
 #[test]
 fn closure_passed_to_higher_order_is_borrowed_not_moved() {
-    // Stage 6d: passing a function value as a call argument borrows it, so the
-    // caller's binding stays usable for a later direct call.
+    // An explicitly borrowed function parameter keeps the caller's function
+    // value usable for a later direct call.
     let source = r#"
-fn Apply(op: fn(int, int): int, a: int, b: int): int {
+fn Apply(&op: fn(int, int): int, a: int, b: int): int {
     return op(a, b)
 }
 fn Add(a: int, b: int): int {

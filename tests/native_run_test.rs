@@ -3973,7 +3973,7 @@ fn main(): null! {
 }
 
 #[test]
-fn native_typed_array_oom_is_structured_result_and_cleans_owned_values() {
+fn native_json_typed_array_does_not_allocate_a_consuming_box() {
     let dir = unique_temp_dir("typed-array-result-oom");
     fs::write(
         dir.join("main.ku"),
@@ -4000,13 +4000,11 @@ fn main(): null! {
     let generated_c = fs::read_to_string(native_generated_c(&dir, "typedarrayoom"))
         .expect("read typed array Result generated C");
     assert!(generated_c.contains("ku_json_stringify_typed_array_str"));
-    assert!(generated_c.contains("ku_try_v_typed_array_str"));
+    assert!(!generated_c.contains("ku_try_v_typed_array_str"));
+    assert!(generated_c.contains("ku_json_write_typed_array_str"));
 
     let (stdout, stderr, code) = run_binary_with_object_oom(&exe, "value_array_data", 1);
-    assert_eq!(
-        stdout.replace('\r', ""),
-        "json\nout_of_memory\njson allocation failed\n"
-    );
+    assert_eq!(stdout.replace('\r', ""), "[\"ab\",\"cd\"]\n");
     assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
     assert_eq!(code, Some(0));
 
@@ -4135,8 +4133,22 @@ fn main(): null! {
     let c = native_emit_c(&dir, "main.ku");
     assert!(c.contains("ku_json_stringify_typed_result_str"));
     assert!(c.contains("ku_json_stringify_typed_enum_State"));
-    assert!(c.contains("ku_result_drop_str(&value);"));
-    assert!(c.contains("ku_drop_enum_State(&value);"));
+    for suffix in ["result_str", "enum_State"] {
+        let helper = c
+            .split(&format!(
+                "static KuResult_str ku_json_stringify_typed_{suffix}("
+            ))
+            .nth(1)
+            .expect("borrowed stringify helper")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(
+            !helper.contains("ku_result_drop_str(&value);")
+                && !helper.contains("ku_drop_enum_State(&value);"),
+            "borrowed input must not be dropped: {helper}"
+        );
+    }
     assert!(c.contains("json.stringify does not support result"));
     assert!(c.contains("json.stringify does not support enum"));
 
@@ -4204,13 +4216,16 @@ fn native_kuvalue_array_bridge_is_emitted_only_for_wrapped_types() {
     let dir = unique_temp_dir("json-array-helper-gating");
     fs::write(
         dir.join("main.ku"),
-        "import json from \"std.json\"\n\nfn main(): null! {\n    unboxed = [true, false]\n    println(unboxed.len())\n    println(json.stringify([1, 2])?)\n    return ok(null)\n}\n",
+        "import json from \"std.json\"\n\nfn main(): null! {\n    unboxed = [true, false]\n    println(unboxed.len())\n    println(json.stringify([1.5, 2.5])?)\n    wrapped = { nums: [1, 2] }\n    println(json.stringify(wrapped)?)\n    return ok(null)\n}\n",
     )
     .expect("write main.ku");
 
     let c = native_emit_c(&dir, "main.ku");
     assert!(c.contains("static KuValue ku_v_typed_array_int("));
     assert!(!c.contains("static KuValue ku_v_typed_array_bool("));
+    // Readonly stringify writes the typed array directly. A dynamic object
+    // field still needs its owning KuValue bridge, but unrelated arrays do not.
+    assert!(!c.contains("static KuValue ku_v_typed_array_float("));
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -5218,7 +5233,7 @@ fn native_function_value_as_parameter() {
     let dir = unique_temp_dir("fn-param");
     fs::write(
         dir.join("main.ku"),
-        "fn Add(a: int, b: int): int {\n    return a + b\n}\n\nfn Apply(op: fn(int, int): int, a: int, b: int): int {\n    return op(a, b)\n}\n\nfn main(): null! {\n    op: fn(int, int): int = Add\n    println(op(1, 2))\n    println(Apply(op, 3, 4))\n    println(op(5, 6))\n    return ok(null)\n}\n",
+        "fn Add(a: int, b: int): int {\n    return a + b\n}\n\nfn Apply(&op: fn(int, int): int, a: int, b: int): int {\n    return op(a, b)\n}\n\nfn main(): null! {\n    op: fn(int, int): int = Add\n    println(op(1, 2))\n    println(Apply(op, 3, 4))\n    println(op(5, 6))\n    return ok(null)\n}\n",
     )
     .expect("write main.ku");
 
@@ -5627,7 +5642,7 @@ fn native_captured_function_argument_is_borrowed_across_calls() {
     let dir = unique_temp_dir("capture-function-borrow");
     fs::write(
         dir.join("main.ku"),
-        r#"fn Apply(op: fn(): int): int {
+        r#"fn Apply(&op: fn(): int): int {
     return op()
 }
 
@@ -5646,7 +5661,7 @@ fn main(): null! {
 
     let c = native_emit_c(&dir, "main.ku");
     assert!(c.contains("ku_refcount_retain(&c->rc, \"closure cell\")"));
-    assert!(c.contains("ku_closure_clone_fn__to_int((__e->inner)->value)"));
+    assert!(!c.contains("ku_closure_clone_fn__to_int((__e->inner)->value)"));
 
     let Some(exe) = native_build(&dir, "main.ku", "capturefunctionborrow") else {
         fs::remove_dir_all(&dir).ok();
@@ -5798,7 +5813,7 @@ fn main(): null! {
     println(CaptureText("owned" + " parameter"))
     println(CaptureArray([5, 6]))
     println(WriteOnlyArrayParameter([1]))
-    println(CaptureFunction(operation))
+    println(CaptureFunction(operation.clone()))
     println(operation())
     text_reader = MakeTextReader("escaped" + " text")
     println(text_reader())
@@ -5807,7 +5822,7 @@ fn main(): null! {
     first_array = array_reader()
     second_array = array_reader()
     println(first_array[0] + second_array[1])
-    wrapped = WrapFunction(operation)
+    wrapped = WrapFunction(operation.clone())
     println(wrapped())
     println(wrapped())
     println(operation())
@@ -6129,14 +6144,14 @@ fn native_closure_stored_in_dynamic_object() {
 
 #[test]
 fn native_closure_argument_is_borrowed_not_moved() {
-    // Stage 6d: passing a capturing closure to a higher-order function borrows it
-    // (a plain struct copy sharing the env); the callee does not release it, so
+    // An explicitly borrowed closure parameter keeps its caller-owned env; the
+    // callee does not release it, so
     // the caller's binding stays live for a later direct call. `CallTwice(f)`
     // yields 3 (1+2) and the following `f()` yields 3, matching the interpreter.
     let dir = unique_temp_dir("closure-borrow-arg");
     fs::write(
         dir.join("main.ku"),
-        "fn CallTwice(op: fn(): int): int {\n    return op() + op()\n}\n\nfn main(): null! {\n    n = 0\n    f = () => { n = n + 1  return n }\n    println(CallTwice(f))\n    println(f())\n    return ok(null)\n}\n",
+        "fn CallTwice(&op: fn(): int): int {\n    return op() + op()\n}\n\nfn main(): null! {\n    n = 0\n    f = () => { n = n + 1  return n }\n    println(CallTwice(f))\n    println(f())\n    return ok(null)\n}\n",
     )
     .expect("write main.ku");
 

@@ -171,6 +171,8 @@ impl Parser {
         let mut params = Vec::new();
         if !self.check(&TokenKind::RParen) {
             loop {
+                let mode_start = self.peek().span.start;
+                let mode = self.parameter_mode();
                 let (param_name, param_span) = self.consume_ident("expected parameter name")?;
                 let ty = if self.match_kind(&TokenKind::Colon) {
                     Some(self.type_name()?)
@@ -178,9 +180,10 @@ impl Parser {
                     None
                 };
                 params.push(Param {
+                    mode,
                     name: param_name,
                     ty,
-                    span: param_span,
+                    span: Span::new(mode_start, param_span.end),
                 });
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
@@ -244,6 +247,7 @@ impl Parser {
             self.consume(&TokenKind::Colon, "expected ':' after struct field name")?;
             let ty = self.type_name()?;
             fields.push(Param {
+                mode: ParamMode::Owned,
                 name: field_name,
                 ty: Some(ty),
                 span: field_span,
@@ -281,6 +285,7 @@ impl Parser {
                         self.consume(&TokenKind::Colon, "expected ':' after variant field name")?;
                         let ty = self.type_name()?;
                         fields.push(Param {
+                            mode: ParamMode::Owned,
                             name: field_name,
                             ty: Some(ty),
                             span: field_span,
@@ -341,6 +346,12 @@ impl Parser {
     }
 
     fn type_atom(&mut self) -> KuResult<TypeName> {
+        if self.check(&TokenKind::Ampersand) {
+            return Err(KuError::parse(
+                "single '&' is only allowed before a function parameter; Ku does not provide reference types",
+                self.peek().span,
+            ));
+        }
         if self.check(&TokenKind::Eof) {
             return Err(KuError::parse("expected type name", self.peek().span));
         }
@@ -404,8 +415,10 @@ impl Parser {
             "expected '(' after 'fn' in function type",
         )?;
         let mut params = Vec::new();
+        let mut param_modes = Vec::new();
         if !self.check(&TokenKind::RParen) {
             loop {
+                param_modes.push(self.parameter_mode());
                 params.push(self.type_name()?);
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
@@ -423,6 +436,7 @@ impl Parser {
         let return_type = self.type_name()?;
         Ok(TypeName::Function {
             params,
+            param_modes,
             return_type: Box::new(return_type),
             is_async,
         })
@@ -662,6 +676,7 @@ impl Parser {
     fn print_statement(&mut self) -> KuResult<Stmt> {
         let start = self.previous().span.start;
         let value = if self.match_kind(&TokenKind::LParen) {
+            self.reject_call_site_ampersand()?;
             let expr = self.expression()?;
             self.consume(&TokenKind::RParen, "expected ')' after print argument")?;
             expr
@@ -1112,6 +1127,7 @@ impl Parser {
                 let mut args = Vec::new();
                 if !self.check(&TokenKind::RParen) {
                     loop {
+                        self.reject_call_site_ampersand()?;
                         args.push(self.expression()?);
                         if !self.match_kind(&TokenKind::Comma) {
                             break;
@@ -1210,6 +1226,23 @@ impl Parser {
         if self.is_arrow_function_start()? {
             return self.arrow_function();
         }
+        if self.check(&TokenKind::Ampersand) {
+            let is_typed_arrow = matches!(
+                self.tokens.get(self.current + 1).map(|token| &token.kind),
+                Some(TokenKind::Ident(_))
+            ) && matches!(
+                self.tokens.get(self.current + 2).map(|token| &token.kind),
+                Some(TokenKind::Colon | TokenKind::Arrow)
+            );
+            return Err(KuError::parse(
+                if is_typed_arrow {
+                    "single '&' is only allowed before a function parameter; use parentheses for a borrowed arrow function"
+                } else {
+                    "single '&' is only allowed before a function parameter; Ku does not provide an address-of expression"
+                },
+                self.peek().span,
+            ));
+        }
         if self.check(&TokenKind::Fn) {
             return self.anonymous_function();
         }
@@ -1243,6 +1276,7 @@ impl Parser {
                     return Ok(Expr::new(
                         ExprKind::Function {
                             params: vec![FunctionParam {
+                                mode: ParamMode::Owned,
                                 name,
                                 ty: Some(ty),
                                 span,
@@ -1258,6 +1292,7 @@ impl Parser {
                     return Ok(Expr::new(
                         ExprKind::Function {
                             params: vec![FunctionParam {
+                                mode: ParamMode::Owned,
                                 name,
                                 ty: None,
                                 span,
@@ -1413,18 +1448,43 @@ impl Parser {
             return Ok(params);
         }
         loop {
+            let start = self.peek().span.start;
+            let mode = self.parameter_mode();
             let (name, span) = self.consume_ident(&format!("expected {context} parameter"))?;
             let ty = if self.match_kind(&TokenKind::Colon) {
                 Some(self.type_name()?)
             } else {
                 None
             };
-            params.push(FunctionParam { name, ty, span });
+            params.push(FunctionParam {
+                mode,
+                name,
+                ty,
+                span: Span::new(start, span.end),
+            });
             if !self.match_kind(&TokenKind::Comma) {
                 break;
             }
         }
         Ok(params)
+    }
+
+    fn parameter_mode(&mut self) -> ParamMode {
+        if self.match_kind(&TokenKind::Ampersand) {
+            ParamMode::View
+        } else {
+            ParamMode::Owned
+        }
+    }
+
+    fn reject_call_site_ampersand(&self) -> KuResult<()> {
+        if self.check(&TokenKind::Ampersand) {
+            return Err(KuError::parse(
+                "'&' is not written at the call site",
+                self.peek().span,
+            ));
+        }
+        Ok(())
     }
 
     fn arrow_body(&mut self) -> KuResult<(Vec<Stmt>, Span)> {
@@ -1539,6 +1599,12 @@ impl Parser {
             index += 1;
         } else {
             loop {
+                if matches!(
+                    self.tokens.get(index).map(|token| &token.kind),
+                    Some(TokenKind::Ampersand)
+                ) {
+                    index += 1;
+                }
                 if !matches!(
                     self.tokens.get(index).map(|token| &token.kind),
                     Some(TokenKind::Ident(_))
@@ -1943,6 +2009,12 @@ fn scan_function_type(
         *index += 1;
     } else {
         loop {
+            if matches!(
+                tokens.get(*index).map(|token| &token.kind),
+                Some(TokenKind::Ampersand)
+            ) {
+                *index += 1;
+            }
             if !scan_type(
                 tokens,
                 index,

@@ -424,6 +424,7 @@ fn Scan(source: str): [Token]! {
                     if (ch == "=") { kind = "Equal" }
                     if (ch == "<") { kind = "Less" }
                     if (ch == ">") { kind = "Greater" }
+                    if (ch == "&") { kind = "Ampersand" }
                     if (ch == "|") { kind = "Pipe" }
                     if (ch == ".") { kind = "Dot" }
                     if (ch == "(") { kind = "LParen" }
@@ -437,13 +438,6 @@ fn Scan(source: str): [Token]! {
                     if (ch == ";") { kind = "Semicolon" }
                 }
                 if (kind == "") {
-                    if (ch == "&") {
-                        fail {
-                            domain: "bootstrap.lexer",
-                            code: "invalid_character",
-                            message: At("expected '&' after '&'", start_line, start_column, start_offset)
-                        }
-                    }
                     fail {
                         domain: "bootstrap.lexer",
                         code: "invalid_character",

@@ -50,7 +50,8 @@ fn main(): null! {
         text = "after"
         return "before!"
     }
-    matched = text.contains(pattern())
+    snapshot = text.clone()
+    matched = snapshot.contains(pattern())
     if (!matched || text != "after") panic("string method evaluated arguments first")
 
     needle = "before"
@@ -168,7 +169,7 @@ fn main() {
     seed = 10
     operation = () => { return seed }
     replace = () => { operation = () => { return 20 }; return 0 }
-    println(Invoke(operation, replace()))
+    println(Invoke(operation.clone(), replace()))
     println(operation())
 }
 "#;
@@ -267,13 +268,13 @@ fn OrderSnapshotCleanup(): int {
     caught = 0
     finalized = 0
     try {
-        ignored = OrderInvoke(operation, OrderMissing()?)
+        ignored = OrderInvoke(operation.clone(), OrderMissing()?)
     } catch (err) {
         caught += 1
     } finally {
         finalized += 1
     }
-    if (calls != 0 || operation() != 1) panic("failed argument invoked or consumed a borrowed closure")
+    if (calls != 0 || operation() != 1) panic("failed argument invoked or consumed the original closure")
     text = "owned" + " value"
     try {
         ignored = text + OrderMissingText()?

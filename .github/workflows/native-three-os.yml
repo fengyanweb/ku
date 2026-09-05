@@ -60,6 +60,34 @@ jobs:
         working-directory: editors/vscode-ku
         run: npm test
 
+  borrow-sanitizers:
+    name: Native borrow ASan, UBSan and leak checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+      KU_CC: "clang -fsanitize=address,undefined -fno-omit-frame-pointer -g -DKU_BORROW_REQUIRE_ASAN"
+      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+      UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain and require Clang
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+          clang --version
+
+      - name: Verify borrowed lifetimes, allocation ledger and source-free execution
+        run: cargo test --locked --test borrow_allocation_test --test borrow_native_test -- --nocapture
+
   full-tests:
     name: ${{ matrix.os }} unfiltered workspace test suite
     runs-on: ${{ matrix.os }}

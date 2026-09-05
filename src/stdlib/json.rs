@@ -340,6 +340,9 @@ fn write_json(value: &Value, output: &mut String, depth: usize, span: Span) -> K
         return Err(KuError::runtime("json value nesting is too deep", span));
     }
     match value {
+        Value::Borrowed(value) => {
+            return value.with_read(span, |value| write_json(value, output, depth, span))
+        }
         Value::Null => output.push_str("null"),
         Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
         Value::Int(value) => output.push_str(&value.to_string()),

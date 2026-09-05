@@ -78,7 +78,6 @@ fn canonical_error(error: &KuError) -> String {
         "unterminated template string" => "unterminated_template",
         "unterminated template string escape" => "unterminated_template_escape",
         "expected third '.' for '...'" => "invalid_ellipsis",
-        "expected '&' after '&'" => "invalid_character",
         message if message.starts_with("unknown string escape '") => "unknown_escape",
         message if message.starts_with("unexpected character '") => "invalid_character",
         other => panic!("unmapped Rust lexical diagnostic: {other}"),
@@ -133,7 +132,7 @@ fn grammar_cases() -> Vec<(String, String)> {
         ("identifiers", "abc ABC_1 _ _0 truex let_ Fn println"),
         (
             "punctuation",
-            "+ ++ += - -- -= * *= / /= % %= ! != ? ?. = == < <= > >= && || | . ... ( ) { } [ ] , : ;",
+            "+ ++ += - -- -= * *= / /= % %= ! != ? ?. = == < <= > >= & && || | . ... ( ) { } [ ] , : ;",
         ),
         ("arrows", "=> ->"),
         ("adjacent-punctuation", "a+++b---c?...=>d||e&&f"),
@@ -182,7 +181,12 @@ fn grammar_cases() -> Vec<(String, String)> {
         ("unknown-newline-escape", "\"中\\\n\""),
         ("invalid-ellipsis", ".."),
         ("invalid-ellipsis-after-prefix", "x ....."),
-        ("invalid-ampersand", "&x"),
+        ("ampersand", "&"),
+        ("ampersand-longest-match", "&& &&& &&&& a & b"),
+        ("borrow-parameter", "fn f(&x: T) {} fn f(&x) {}"),
+        ("borrow-function-type", "fn(&T): R"),
+        ("ampersand-string", "\"&\" '&' `value & text`"),
+        ("ampersand-comments", "// &\n/* & */ view page.view ui.view()"),
         ("invalid-character", "@"),
         ("non-whitespace-unicode", "\u{a0}"),
     ]
@@ -366,6 +370,7 @@ fn differential_cases() -> Vec<(String, String)> {
         "LessEqual",
         "Greater",
         "GreaterEqual",
+        "Ampersand",
         "AndAnd",
         "OrOr",
         "Pipe",
@@ -478,14 +483,41 @@ fn boundary_expected() -> String {
          BOUNDARY|tokens-at-limit\nOK|4096\nCANONICAL|{canonical_length}\n\
          BOUNDARY|tokens-over-limit\nERR|too_many_tokens\n"
     );
-    for (label, _, result) in additional_boundaries() {
+    for (label, source, result) in additional_boundaries() {
         expected.push_str(&format!("BOUNDARY|{label}\n{result}\n"));
+        if result == "OK|4096" {
+            let tokens = Lexer::new(&source)
+                .lex()
+                .expect("token-boundary source lexes");
+            let canonical_length = canonical_tokens(&source, &tokens).chars().count();
+            expected.push_str(&format!("CANONICAL|{canonical_length}\n"));
+        }
     }
     expected
 }
 
 fn additional_boundaries() -> Vec<(&'static str, String, &'static str)> {
     vec![
+        (
+            "ampersand-tokens-at-limit",
+            "& ".repeat(MAX_TOKENS - 1),
+            "OK|4096",
+        ),
+        (
+            "ampersand-tokens-over-limit",
+            "& ".repeat(MAX_TOKENS),
+            "ERR|too_many_tokens",
+        ),
+        (
+            "and-and-tokens-at-limit",
+            "&".repeat((MAX_TOKENS - 1) * 2),
+            "OK|4096",
+        ),
+        (
+            "and-and-tokens-over-limit",
+            "&".repeat((MAX_TOKENS - 1) * 2 + 1),
+            "ERR|too_many_tokens",
+        ),
         (
             "unicode-comment-at-limit",
             format!("//{}", "😀".repeat(MAX_CHARACTERS - 2)),

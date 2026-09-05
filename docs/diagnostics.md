@@ -23,7 +23,37 @@ fn main(): null! {
 }
 ```
 
-需要保留原值时显式 `a.clone()`。同类错误还包括从 owned 字段 / 索引元素直接 move、以及在循环体内 move 外层 owned 值。
+需要保留原值时显式 `a.clone()`；只读取参数的同步函数也可以声明 `&a: T`，调用处仍写普通实参。同类错误还包括从 owned 字段 / 索引元素直接 move、以及在循环体内 move 外层 owned 值。新增借用不会取消普通 owning 参数的 E0901。
+
+### E0910–E0919 只读借用参数
+
+这些诊断对应源码 `&name: T` 的参数模式。`&` 不是普通引用类型或调用处的地址运算符。文本输出继续给出文件、起止位置和源码标记；JSON Lines 保持本文开头的字段集合，新诊断的 `helps` 包含可执行修改方向，成功时保持静默。
+
+| code | 含义 | 修改方向 |
+| --- | --- | --- |
+| E0910 | `cannot modify through borrowed parameter`：直接修改 borrowed 根、字段或元素 | 确实需要取得所有权并修改时，删除声明处 `&` |
+| E0911 | `cannot move out of borrowed value`：把 borrowed owned 值移出、保存或返回 | 对需要独立拥有的值显式 `.clone()` |
+| E0912 | `borrowed value escapes current call`：闭包捕获 borrowed 参数 | 在创建闭包前先 clone 到 owned 局部变量 |
+| E0913 | `async functions cannot declare borrowed parameters` | 让 async 函数拥有参数，需要保留来源时由调用者显式 clone |
+| E0914 | `callable parameter mode mismatch`：函数值的 owned / borrowed 槽位不一致 | 使声明与期望函数类型的 `&` 模式精确匹配 |
+| E0915 | `cannot pass borrowed value`：borrowed owned 值传给 owning 参数 | 显式 `.clone()`，或把接收参数声明为只读借用 |
+| E0916 | `borrow conflicts with move or mutation in the same call` | 先完成借用调用，再 move / 修改同一根；不要只调整参数顺序 |
+| E0917 | `borrowed operation is not supported`：当前没有安全 borrowed 路径的操作 | 先显式 clone 为 owned 值，再执行该操作 |
+| E0918 | `'&' is not written at the call site` | 写 `inspect(value)`，由函数签名决定 borrow / move |
+| E0919 | 单独 `&` 出现在参数槽位以外 | 声明写 `&name: T`，函数类型参数写 `fn(&T): R`；借用箭头加括号 |
+
+例如返回 Copy 字段合法，返回 owned 字段需要 clone：
+
+```ku
+struct User { name: str, age: int }
+fn Age(&user: User): int { return user.age }
+fn Name(&user: User): str { return user.name } // E0911
+fn CopyName(&user: User): str { return user.name.clone() }
+```
+
+E0916 按根绑定保守判断，包括借用父对象同时消费其字段、以及可触及同一来源的 callback 捕获。多个只读借用同一根合法。字符串拼接、clone 或已完成的嵌套读取产生独立结果，不会把已结束的短期读取当作仍在借用。
+
+当前 E0917 包括 borrowed array 的 `for`、borrowed match 的 owned payload binding、fallible object lookup，以及尚未迁移的 stdlib borrowed 路径（如 `array.first`、`array.map`、`string.chars`）。这是能力边界，编译器不会隐式 clone。消费式对象解构或直接对 borrowed Result 使用 `?` 也必须先取得 owned 副本。
 
 ## Unused
 
