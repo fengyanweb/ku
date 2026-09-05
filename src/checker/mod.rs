@@ -273,6 +273,7 @@ struct VarType {
     binding_id: BindingId,
     ty: Type,
     mutable: bool,
+    borrowed: bool,
     /// Move state at struct-field-path granularity. A key is a projection path
     /// from this variable (`[]` = the whole variable, `["name"]` = the `name`
     /// field, `["user", "name"]` = a nested field). A present key means that path
@@ -309,6 +310,7 @@ impl VarType {
             binding_id,
             ty,
             mutable,
+            borrowed: false,
             moves: BTreeMap::new(),
             struct_backed: false,
             captured: false,
@@ -389,6 +391,7 @@ enum TryPathKind {
 #[derive(Debug, Clone, PartialEq)]
 struct FunctionValueParam {
     name: String,
+    mode: ParamMode,
     ty: Option<Type>,
 }
 
@@ -635,6 +638,7 @@ impl Checker {
                             .map(|p| {
                                 Ok(FunctionValueParam {
                                     name: p.name.clone(),
+                                    mode: p.mode,
                                     ty: p
                                         .ty
                                         .as_ref()
@@ -758,6 +762,7 @@ impl Checker {
 
     fn check_function(&mut self, function: &FnDecl) -> KuResult<()> {
         reject_duplicate_params(function)?;
+        reject_async_borrowed_params(function)?;
         let is_async = function.is_async;
         if is_async {
             self.require_async_result_return(function)?;
@@ -784,6 +789,7 @@ impl Checker {
                 false,
                 param.span,
             )?;
+            self.set_parameter_mode(&param.name, param.mode);
         }
         let mut inferred_return = Type::Null;
         for stmt in &function.body {
@@ -851,28 +857,44 @@ impl Checker {
             ))),
             TypeName::Function {
                 params,
+                param_modes,
                 return_type,
                 is_async,
-            } => Ok(Type::FunctionValue {
-                params: params
-                    .iter()
-                    .enumerate()
-                    .map(|(index, ty)| {
-                        Ok(FunctionValueParam {
-                            name: format!("arg{index}"),
-                            ty: Some(self.resolve_type_name_with_generics(ty, span, generics)?),
+            } => {
+                if params.len() != param_modes.len() {
+                    return Err(KuError::runtime(
+                        "invalid function type parameter mode count",
+                        span,
+                    ));
+                }
+                if *is_async && param_modes.contains(&ParamMode::View) {
+                    return Err(KuError::runtime(
+                        "async functions cannot declare borrowed parameters",
+                        span,
+                    ));
+                }
+                Ok(Type::FunctionValue {
+                    params: params
+                        .iter()
+                        .enumerate()
+                        .map(|(index, ty)| {
+                            Ok(FunctionValueParam {
+                                name: format!("arg{index}"),
+                                mode: param_modes[index],
+                                ty: Some(self.resolve_type_name_with_generics(ty, span, generics)?),
+                            })
                         })
-                    })
-                    .collect::<KuResult<Vec<_>>>()?,
-                return_type: Some(Box::new(self.resolve_type_name_with_generics(
-                    return_type,
-                    span,
-                    generics,
-                )?)),
-                body: Vec::new(),
-                body_id: None,
-                is_async: *is_async,
-            }),
+                        .collect::<KuResult<Vec<_>>>()?,
+                    return_type: Some(Box::new(self.resolve_type_name_with_generics(
+                        return_type,
+                        span,
+                        generics,
+                    )?)),
+                    body: Vec::new(),
+                    body_id: None,
+                    is_async: *is_async,
+                })
+            }
             TypeName::Union(types) => {
                 let mut resolved = Vec::with_capacity(types.len());
                 for ty in types {
@@ -1197,6 +1219,12 @@ impl Checker {
                 body,
                 span,
             } => {
+                if self.borrowed_expr_root(iterable).is_some() {
+                    return Err(KuError::runtime(
+                        "borrowed operation is not supported: for iteration; clone the array first",
+                        iterable.span,
+                    ));
+                }
                 let iterable_provenance = self.expression_closure_provenance(iterable);
                 let iterable = self.check_expr(iterable)?;
                 let element = match iterable {
@@ -1716,10 +1744,11 @@ impl Checker {
                                 .map(|arg| self.expression_closure_provenance(arg))
                                 .collect::<Vec<_>>();
                             let mut generic_bindings = HashMap::new();
+                            self.check_call_borrow_conflicts(args, &function.value_params, expr.span, None)?;
                             let mut actual_arg_types = Vec::with_capacity(args.len());
-                            for (arg, expected) in args.iter().zip(function.params.iter()) {
+                            for ((arg, expected), param) in args.iter().zip(function.params.iter()).zip(&function.value_params) {
                                 let actual =
-                                    self.consume_arg_expr_expecting(arg, Some(expected))?;
+                                    self.check_arg_mode(arg, Some(expected), param.mode)?;
                                 if !bind_generic_type(expected, &actual, &mut generic_bindings)
                                     || !type_matches(expected, &actual)
                                 {
@@ -1743,6 +1772,7 @@ impl Checker {
                                 .iter()
                                 .map(|param| FunctionValueParam {
                                     name: param.name.clone(),
+                                    mode: param.mode,
                                     ty: param
                                         .ty
                                         .as_ref()
@@ -1800,6 +1830,7 @@ impl Checker {
                                     args,
                                     expr.span,
                                     Some(name),
+                                    Some(callee),
                                 )?;
                                 if let Some(body_id) = body_id {
                                     self.apply_known_function_closure_effects(
@@ -1874,6 +1905,7 @@ impl Checker {
                                 args,
                                 expr.span,
                                 None,
+                                Some(callee),
                             )?;
                             if let Some(callee_root) = callee_root {
                                 if let Some(body_id) = body_id {
@@ -2152,6 +2184,9 @@ impl Checker {
                 }
                 ExprKind::TryUnwrap { expr: inner } => {
                     if let ExprKind::Index { target, index } = &inner.kind {
+                        if self.borrowed_expr_root(target).is_some() {
+                            return Err(KuError::runtime("borrowed operation is not supported: fallible object lookup; clone the object first", inner.span));
+                        }
                         let target_type = self.check_expr(target)?;
                         if matches!(
                             target_type,
@@ -2277,6 +2312,15 @@ impl Checker {
 
         let mut resolved_params = Vec::with_capacity(params.len());
         for (index, param) in params.iter().enumerate() {
+            if expected_fn
+                .and_then(|params| params.get(index))
+                .is_some_and(|expected| expected.mode != param.mode)
+            {
+                return Err(KuError::runtime(
+                    "callable parameter mode mismatch",
+                    param.span,
+                ));
+            }
             let expected_param = expected_fn
                 .and_then(|expected_params| expected_params.get(index))
                 .and_then(|param| param.ty.clone());
@@ -2304,6 +2348,7 @@ impl Checker {
             };
             resolved_params.push(FunctionValueParam {
                 name: param.name.clone(),
+                mode: param.mode,
                 ty,
             });
         }
@@ -2325,6 +2370,7 @@ impl Checker {
             .into_keys()
             .collect::<HashSet<_>>();
         let captured_names = checker_closure_capture_names(params, body, &visible_names);
+        self.reject_borrowed_captures(&captured_names, span)?;
         self.record_function_body_outer_bindings(body_id, &captured_names);
         let inferred = self.check_function_value_body(
             &resolved_params,
@@ -2387,24 +2433,21 @@ impl Checker {
         self.consume_expr(expr)
     }
 
-    /// Consume a call argument, but *borrow* function values instead of moving
-    /// them (Stage 6d: "call/pass borrows, store moves"). Handing a closure to a
-    /// higher-order function or invoking it must not consume the caller's binding
-    /// — only an explicit store (binding/field/array element/return) does. Every
-    /// other owned type keeps the normal move-on-pass behaviour.
-    fn consume_arg_expr_expecting(
+    /// Argument ownership is declared by the callee, including function values.
+    /// Invoking a function value itself remains a non-consuming read.
+    fn check_arg_mode(
         &mut self,
         expr: &Expr,
         expected: Option<&Type>,
+        mode: ParamMode,
     ) -> KuResult<Type> {
-        if let ExprKind::Variable(name) = &expr.kind {
-            if self.contains(name) {
-                let bound = self.get_allow_moved(name, expr.span)?.ty;
-                if matches!(bound, Type::FunctionValue { .. }) {
-                    // Borrow: verify the binding is still live (not moved-from)
-                    // but leave it usable for later calls/passes.
-                    return self.check_expr_expecting(expr, expected);
-                }
+        if mode == ParamMode::View {
+            return self.check_expr_expecting(expr, expected);
+        }
+        if let Some(root) = self.borrowed_expr_root(expr) {
+            let ty = self.check_expr(expr)?;
+            if self.is_owned_type(&ty) || matches!(ty, Type::Generic(_) | Type::Unknown) {
+                return Err(KuError::runtime(format!("cannot pass borrowed value rooted at '{root}' to owning parameter; use '.clone()' to create an owned value"), expr.span));
             }
         }
         self.consume_expr_expecting(expr, expected)
@@ -2642,6 +2685,7 @@ impl Checker {
                 .map(|param| {
                     Ok(FunctionValueParam {
                         name: param.name.clone(),
+                        mode: param.mode,
                         ty: param
                             .ty
                             .as_ref()
@@ -3088,6 +3132,9 @@ impl Checker {
         // match, a clone, passing it on) are rejected instead of silently reading
         // an emptied payload.
         let consumes_scrutinee = self.match_consumes_scrutinee(&value_type, arms);
+        if consumes_scrutinee && self.borrowed_expr_root(value).is_some() {
+            return Err(KuError::runtime("borrowed operation is not supported: match with owned payload binding; clone the scrutinee first", value.span));
+        }
         let before_arms = self.scopes.clone();
         let mut arm_scopes = Vec::with_capacity(arms.len());
         let mut result_type = Type::Unknown;
@@ -3742,6 +3789,34 @@ impl Checker {
         args: &[Expr],
         span: Span,
     ) -> KuResult<Type> {
+        if !metadata::supports_borrowed_call(&signature.name) {
+            for (arg, mode) in args
+                .iter()
+                .zip(metadata::argument_modes(&signature.name, args.len()))
+            {
+                if mode == ParamMode::View && self.borrowed_expr_root(arg).is_some() {
+                    let ty = self.check_expr(arg)?;
+                    if self.is_owned_type(&ty) || matches!(ty, Type::Generic(_) | Type::Unknown) {
+                        return Err(KuError::runtime(
+                            format!(
+                                "borrowed operation is not supported: {}; clone the argument first",
+                                signature.name
+                            ),
+                            arg.span,
+                        ));
+                    }
+                }
+            }
+        }
+        // Only migrated APIs establish call-scoped loans. Other stdlib paths
+        // retain their existing snapshot/evaluation semantics (notably push).
+        if metadata::supports_borrowed_call(&signature.name) {
+            self.check_argument_modes_conflicts(
+                args,
+                &metadata::argument_modes(&signature.name, args.len()),
+                span,
+            )?;
+        }
         if matches!(
             signature.name.as_str(),
             "http.client" | "http.service" | "http.server"
@@ -3790,17 +3865,10 @@ impl Checker {
             return self.apply_object_get_or_signature(args, span);
         }
         expect_arg_count(&signature.name, args.len(), signature.args.len(), span)?;
-        let consuming = stdlib_consuming_args(&signature.name);
         let actuals = args
             .iter()
-            .enumerate()
-            .map(|(index, arg)| {
-                if consuming.contains(&index) {
-                    self.consume_expr(arg)
-                } else {
-                    self.check_expr(arg)
-                }
-            })
+            .zip(&signature.arg_modes)
+            .map(|(arg, mode)| self.check_arg_mode(arg, None, *mode))
             .collect::<KuResult<Vec<_>>>()?;
         if let Some(receiver_type) = actuals.first() {
             self.reject_effectful_args_on_captured_native_receiver(
@@ -4112,6 +4180,12 @@ impl Checker {
         if name != "map" {
             return Ok(None);
         }
+        if self.borrowed_expr_root(target).is_some() {
+            return Err(KuError::runtime(
+                "borrowed operation is not supported: array.map; clone the array first",
+                target.span,
+            ));
+        }
         expect_arg_count("array.map", args.len(), 1, span)?;
         let target_type = self.check_expr(target)?;
         let Type::Array(element) = target_type else {
@@ -4134,6 +4208,7 @@ impl Checker {
         let expected_mapper = Type::FunctionValue {
             params: vec![FunctionValueParam {
                 name: "arg0".to_string(),
+                mode: ParamMode::Owned,
                 ty: Some((*element).clone()),
             }],
             return_type: None,
@@ -4216,6 +4291,7 @@ impl Checker {
         args: &[Expr],
         span: Span,
         name: Option<&str>,
+        callee: Option<&Expr>,
     ) -> KuResult<(Type, Vec<Type>)> {
         if function.params.len() != args.len() {
             let subject = name
@@ -4230,10 +4306,11 @@ impl Checker {
                 span,
             ));
         }
+        self.check_call_borrow_conflicts(args, function.params, span, callee)?;
         let actual_arg_types = args
             .iter()
             .zip(function.params.iter())
-            .map(|(arg, param)| self.consume_arg_expr_expecting(arg, param.ty.as_ref()))
+            .map(|(arg, param)| self.check_arg_mode(arg, param.ty.as_ref(), param.mode))
             .collect::<KuResult<Vec<_>>>()?;
         let mut arg_types = Vec::new();
         for ((param, actual), arg) in function
@@ -4391,6 +4468,7 @@ impl Checker {
         let result = (|| -> KuResult<Type> {
             for (param, ty) in params.iter().zip(arg_types.iter()) {
                 self.define(param.name.clone(), ty.clone(), false, span)?;
+                self.set_parameter_mode(&param.name, param.mode);
             }
 
             let mut inferred_return = Type::Null;
@@ -4491,6 +4569,7 @@ impl Checker {
         let result = (|| -> KuResult<Type> {
             for (param, ty) in function.params.iter().zip(arg_types.iter()) {
                 self.define(param.name.clone(), ty.clone(), false, span)?;
+                self.set_parameter_mode(&param.name, param.mode);
                 // An HTTP handler's request is a native struct in the IR, so its
                 // fields are movable individually -- `http.text(req.body)` is the
                 // idiomatic handler body. Keying on `owner` keeps a user object of
@@ -4539,6 +4618,7 @@ impl Checker {
 
     fn check_local_function(&mut self, function: &FnDecl) -> KuResult<()> {
         reject_duplicate_params(function)?;
+        reject_async_borrowed_params(function)?;
         let is_async = function.is_async;
         if is_async {
             self.require_async_result_return(function)?;
@@ -4549,6 +4629,7 @@ impl Checker {
             .map(|param| {
                 Ok(FunctionValueParam {
                     name: param.name.clone(),
+                    mode: param.mode,
                     ty: param
                         .ty
                         .as_ref()
@@ -4576,6 +4657,7 @@ impl Checker {
             .into_keys()
             .collect::<HashSet<_>>();
         let captured_names = checker_local_function_capture_names(function, &visible_names);
+        self.reject_borrowed_captures(&captured_names, function.span)?;
         self.record_function_body_outer_bindings(body_id, &captured_names);
         self.define(
             function.name.clone(),
@@ -6595,6 +6677,11 @@ impl Checker {
 
     fn consume_expr(&mut self, expr: &Expr) -> KuResult<Type> {
         let ty = self.check_expr(expr)?;
+        if let Some(root) = self.borrowed_expr_root(expr) {
+            if self.is_owned_type(&ty) || matches!(ty, Type::Generic(_) | Type::Unknown) {
+                return Err(KuError::runtime(format!("cannot move out of borrowed value rooted at '{root}'; use '.clone()' to create an owned value"), expr.span));
+            }
+        }
         if !self.is_owned_type(&ty) {
             // Copy types (int/float/bool/null) and other non-owned reads never
             // move, whatever place they come from.
@@ -6606,6 +6693,358 @@ impl Checker {
             PlaceClass::Fresh => {}
         }
         Ok(ty)
+    }
+
+    fn set_parameter_mode(&mut self, name: &str, mode: ParamMode) {
+        if let Some(binding) = self.scopes.last_mut().and_then(|scope| scope.get_mut(name)) {
+            binding.borrowed = mode == ParamMode::View;
+        }
+    }
+
+    fn borrowed_expr_root(&self, expr: &Expr) -> Option<String> {
+        if let ExprKind::TryUnwrap { expr: inner } = &expr.kind {
+            return self.borrowed_expr_root(inner);
+        }
+        let root = expr_root_variable(expr)?;
+        self.get_allow_moved(root, expr.span)
+            .ok()?
+            .borrowed
+            .then(|| root.to_string())
+    }
+
+    fn reject_borrowed_captures(&self, names: &HashSet<String>, span: Span) -> KuResult<()> {
+        let mut names = names.iter().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            if self
+                .get_allow_moved(name, span)
+                .is_ok_and(|binding| binding.borrowed)
+            {
+                return Err(KuError::runtime(format!("borrowed value escapes current call: cannot capture borrowed parameter '{name}'; clone into an owned local first"), span));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_call_borrow_conflicts(
+        &self,
+        args: &[Expr],
+        params: &[FunctionValueParam],
+        span: Span,
+        callee: Option<&Expr>,
+    ) -> KuResult<()> {
+        ensure_argument_scan_depth(args)?;
+        let modes = params.iter().map(|param| param.mode).collect::<Vec<_>>();
+        let mut uses = HashMap::<String, u8>::new();
+        for (arg, mode) in args.iter().zip(&modes) {
+            self.collect_argument_uses(arg, *mode, &mut uses);
+            self.collect_callback_mutation_uses(arg, &mut uses);
+        }
+        if let Some(callee) = callee {
+            self.collect_callback_mutation_uses(callee, &mut uses);
+        }
+        self.reject_conflicting_argument_uses(&uses, span)
+    }
+
+    fn check_argument_modes_conflicts(
+        &self,
+        args: &[Expr],
+        modes: &[ParamMode],
+        span: Span,
+    ) -> KuResult<()> {
+        ensure_argument_scan_depth(args)?;
+        let mut uses = HashMap::<String, u8>::new();
+        for (arg, mode) in args.iter().zip(modes) {
+            self.collect_argument_uses(arg, *mode, &mut uses);
+        }
+        self.reject_conflicting_argument_uses(&uses, span)
+    }
+
+    fn reject_conflicting_argument_uses(
+        &self,
+        uses: &HashMap<String, u8>,
+        span: Span,
+    ) -> KuResult<()> {
+        if let Some(root) = uses
+            .iter()
+            .filter(|(_, usage)| **usage & 1 != 0 && **usage & 6 != 0)
+            .map(|(root, _)| root)
+            .min()
+        {
+            return Err(KuError::runtime(format!("borrow conflicts with move or mutation in the same call for '{root}'; evaluate arguments into separate owned locals first"), span));
+        }
+        Ok(())
+    }
+
+    /// Root-level aliasing is deliberately conservative. Nested argument calls
+    /// keep their own parameter modes, and captured callables are considered
+    /// potentially mutating the bindings they can reach.
+    fn collect_argument_uses(&self, expr: &Expr, mode: ParamMode, uses: &mut HashMap<String, u8>) {
+        self.collect_argument_uses_inner(expr, mode, true, uses);
+    }
+
+    fn collect_evaluation_uses(
+        &self,
+        expr: &Expr,
+        mode: ParamMode,
+        uses: &mut HashMap<String, u8>,
+    ) {
+        self.collect_argument_uses_inner(expr, mode, false, uses);
+    }
+
+    fn collect_argument_uses_inner(
+        &self,
+        expr: &Expr,
+        mode: ParamMode,
+        retain_borrow: bool,
+        uses: &mut HashMap<String, u8>,
+    ) {
+        if let Some(root) = expr_root_variable(expr) {
+            if let Some(ty) = self.argument_place_type(expr) {
+                if (mode == ParamMode::Owned || retain_borrow)
+                    && (self.is_owned_type(&ty) || matches!(ty, Type::Generic(_) | Type::Unknown))
+                {
+                    *uses.entry(root.to_string()).or_default() |=
+                        if mode == ParamMode::View { 1 } else { 2 };
+                }
+            }
+            self.collect_projection_index_uses(expr, uses);
+            return;
+        }
+        match &expr.kind {
+            ExprKind::Literal(Literal::TemplateString(raw)) => {
+                if let Ok(parts) = template_interpolations(raw, expr.span) {
+                    for part in parts {
+                        if let Ok(tokens) = crate::lexer::Lexer::new(&part.source).tokenize() {
+                            if let Ok(interpolation) =
+                                crate::parser::Parser::new(tokens).parse_expression_only()
+                            {
+                                if ensure_argument_scan_depth(std::slice::from_ref(&interpolation))
+                                    .is_ok()
+                                {
+                                    self.collect_evaluation_uses(
+                                        &interpolation,
+                                        ParamMode::View,
+                                        uses,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                let modes = match &callee.kind {
+                    ExprKind::Variable(name) => self
+                        .functions
+                        .get(name)
+                        .map(|f| f.value_params.iter().map(|p| p.mode).collect::<Vec<_>>())
+                        .or_else(|| {
+                            self.get_allow_moved(name, callee.span)
+                                .ok()
+                                .and_then(|binding| match binding.ty {
+                                    Type::FunctionValue { params, .. } => {
+                                        Some(params.iter().map(|p| p.mode).collect())
+                                    }
+                                    _ => None,
+                                })
+                        })
+                        .or_else(|| metadata::builtin_signature(name).map(|s| s.arg_modes)),
+                    ExprKind::Field { target, name } => {
+                        self.collect_method_argument_uses(target, name, args.len(), uses)
+                    }
+                    _ => None,
+                };
+                // Resolved builtin methods (including clone) do not carry a
+                // user closure capture graph. A field with an unresolved method
+                // signature may still be a stored callback and must be checked.
+                if !matches!(callee.kind, ExprKind::Field { .. }) || modes.is_none() {
+                    self.collect_callback_mutation_uses(callee, uses);
+                }
+                for (index, argument) in args.iter().enumerate() {
+                    self.collect_evaluation_uses(
+                        argument,
+                        modes
+                            .as_ref()
+                            .and_then(|m| m.get(index))
+                            .copied()
+                            .unwrap_or(ParamMode::Owned),
+                        uses,
+                    );
+                    self.collect_callback_mutation_uses(argument, uses);
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.collect_evaluation_uses(left, ParamMode::View, uses);
+                self.collect_evaluation_uses(right, ParamMode::View, uses);
+            }
+            ExprKind::Unary { expr, .. } => {
+                self.collect_evaluation_uses(expr, ParamMode::View, uses)
+            }
+            ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => {
+                self.collect_evaluation_uses(expr, ParamMode::Owned, uses)
+            }
+            ExprKind::Array(values) => {
+                for value in values {
+                    self.collect_evaluation_uses(value, ParamMode::Owned, uses);
+                }
+            }
+            ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+                for (_, value) in fields {
+                    self.collect_evaluation_uses(value, ParamMode::Owned, uses);
+                }
+            }
+            ExprKind::Match { value, arms } => {
+                self.collect_evaluation_uses(value, ParamMode::Owned, uses);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        self.collect_evaluation_uses(guard, ParamMode::View, uses);
+                    }
+                    self.collect_evaluation_uses(&arm.value, mode, uses);
+                }
+            }
+            ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+                self.collect_evaluation_uses(target, ParamMode::View, uses)
+            }
+            ExprKind::Index { target, index } => {
+                self.collect_evaluation_uses(target, ParamMode::View, uses);
+                self.collect_evaluation_uses(index, ParamMode::View, uses);
+            }
+            _ => {}
+        }
+    }
+
+    fn argument_place_type(&self, expr: &Expr) -> Option<Type> {
+        match &expr.kind {
+            ExprKind::Variable(name) => self
+                .get_allow_moved(name, expr.span)
+                .ok()
+                .map(|binding| binding.ty),
+            ExprKind::Field { target, name } | ExprKind::OptionalField { target, name } => {
+                match self.argument_place_type(target)? {
+                    Type::Struct(struct_name) => {
+                        self.structs.get(&struct_name)?.fields.get(name).cloned()
+                    }
+                    Type::Object(fields) => fields.get(name).cloned(),
+                    Type::Array(_) | Type::String if name == "len" => Some(Type::Int),
+                    _ => Some(Type::Unknown),
+                }
+            }
+            ExprKind::Index { target, .. } => match self.argument_place_type(target)? {
+                Type::Array(element) => Some(*element),
+                Type::String | Type::StringMap => Some(Type::String),
+                _ => Some(Type::Unknown),
+            },
+            _ => None,
+        }
+    }
+
+    /// A callable passed into another function may be invoked during that call.
+    /// Its capture graph therefore participates in argument alias checking.
+    /// Unknown function values cannot prove disjointness from other owned roots.
+    fn collect_callback_mutation_uses(&self, expr: &Expr, uses: &mut HashMap<String, u8>) {
+        let may_hold_callback = matches!(expr.kind, ExprKind::Function { .. })
+            || self
+                .argument_place_type(expr)
+                .is_some_and(|ty| self.type_may_contain_function_value(&ty));
+        if !may_hold_callback {
+            return;
+        }
+        let callback_root = expr_root_variable(expr);
+        let callback_binding =
+            callback_root.and_then(|name| self.get_allow_moved(name, expr.span).ok());
+        // A container's complete union is a safe upper bound on the captures
+        // of any selected function field/element. We need disjointness, not an
+        // exact selected-function identity; do not discard that known evidence.
+        let provenance = callback_binding
+            .as_ref()
+            .map(|binding| binding.closure_provenance.clone())
+            .unwrap_or_else(|| self.expression_closure_provenance(expr));
+        let callback_binding_id = callback_binding.map(|binding| binding.binding_id);
+        for scope in &self.scopes {
+            for (name, binding) in scope {
+                let reachable = provenance.dependencies.iter().any(|dependency| {
+                    self.closure_dependency_reaches(
+                        *dependency,
+                        binding.binding_id,
+                        &mut HashSet::new(),
+                    )
+                });
+                let unknown_alias = !provenance.complete
+                    && callback_root != Some(name.as_str())
+                    // Loans received as parameters were checked against the
+                    // callback capture graph at the caller boundary. Reborrow
+                    // preserves that contract. An older unknown callback also
+                    // cannot capture a fresh owned local created afterwards.
+                    && !binding.borrowed
+                    && callback_binding_id.is_none_or(|callback| binding.binding_id < callback)
+                    && (self.is_owned_type(&binding.ty)
+                        || matches!(binding.ty, Type::Generic(_) | Type::Unknown));
+                if reachable || unknown_alias {
+                    *uses.entry(name.clone()).or_default() |= 4;
+                }
+            }
+        }
+    }
+
+    fn collect_projection_index_uses(&self, expr: &Expr, uses: &mut HashMap<String, u8>) {
+        match &expr.kind {
+            ExprKind::Index { target, index } => {
+                self.collect_evaluation_uses(index, ParamMode::View, uses);
+                self.collect_projection_index_uses(target, uses);
+            }
+            ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+                self.collect_projection_index_uses(target, uses);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_method_argument_uses(
+        &self,
+        target: &Expr,
+        name: &str,
+        count: usize,
+        uses: &mut HashMap<String, u8>,
+    ) -> Option<Vec<ParamMode>> {
+        if let ExprKind::Variable(module) = &target.kind {
+            if !self.contains(module) {
+                if let Some(signature) = metadata::dotted_signature(module, name) {
+                    return Some(metadata::argument_modes(&signature.name, count));
+                }
+            }
+        }
+        if name == "clone" {
+            self.collect_evaluation_uses(target, ParamMode::View, uses);
+            return Some(Vec::new());
+        }
+        let signature = match self.argument_place_type(target) {
+            Some(Type::String) => metadata::dotted_signature("string", name),
+            Some(Type::Array(_)) => metadata::dotted_signature("array", name),
+            Some(Type::Object(_) | Type::StringMap | Type::DynamicObject) => {
+                metadata::dotted_signature("object", name)
+            }
+            Some(Type::KuValue) => metadata::dotted_signature("kuvalue", name),
+            Some(Type::Native(native)) => match native.as_str() {
+                metadata::PG_CLIENT => metadata::dotted_signature("pg_client", name),
+                metadata::PG_RESULT => metadata::dotted_signature("pg_result", name),
+                metadata::MYSQL_CLIENT | metadata::MYSQL_RESULT => {
+                    metadata::mysql_method_signature(&native, name)
+                }
+                metadata::REDIS_CLIENT => metadata::redis_client_method_signature(name),
+                metadata::BYTES => metadata::bytes_method_signature(name),
+                metadata::NET_CLIENT => metadata::net_client_method_signature(name),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(signature) = signature {
+            self.collect_evaluation_uses(target, signature.arg_modes[0], uses);
+            Some(signature.arg_modes.into_iter().skip(1).collect())
+        } else {
+            self.collect_evaluation_uses(target, ParamMode::View, uses);
+            None
+        }
     }
 
     /// The declared type of `obj["key"]` when both the object's shape and the key
@@ -6664,11 +7103,7 @@ impl Checker {
                 }) || self.enums.contains_key(name)
             }
             Type::Result(_) | Type::Task(_) => true,
-            // Stage 6d: a function value owns its captured environment (a
-            // ref-counted cell chain), so it is an owned type: `.clone()` bumps
-            // the env refcount, and storing one into a binding/field/array/return
-            // moves it. Calling or passing it as an argument only borrows (see
-            // `consume_arg_expr_expecting`).
+            // Calling a function value reads it; passing it follows its parameter mode.
             Type::FunctionValue { .. } => true,
             Type::Union(types) => types.iter().any(|ty| self.is_owned_type(ty)),
             _ => false,
@@ -6913,6 +7348,15 @@ impl Checker {
     }
 
     fn reject_readonly_capture_assignment(&self, name: &str, span: Span) -> KuResult<()> {
+        if self
+            .get_allow_moved(name, span)
+            .is_ok_and(|binding| binding.borrowed)
+        {
+            return Err(KuError::runtime(
+                format!("cannot modify through borrowed parameter '{name}'"),
+                span,
+            ));
+        }
         if let Some(capture) = self.readonly_capture_for_outer_binding(name) {
             return Err(KuError::runtime(
                 format!("{} cannot modify captured variable '{name}'", capture.owner),
@@ -7008,6 +7452,57 @@ impl Checker {
 struct ReadonlyCapture {
     boundary: usize,
     owner: &'static str,
+}
+
+/// Call alias scanning happens before argument type checking. Bound its
+/// traversal independently so a long left-associated expression or projection
+/// cannot recurse past the checker's normal expression-depth limit.
+fn ensure_argument_scan_depth(args: &[Expr]) -> KuResult<()> {
+    let mut pending = args.iter().map(|expr| (expr, 1usize)).collect::<Vec<_>>();
+    while let Some((expr, depth)) = pending.pop() {
+        if depth > MAX_CHECK_DEPTH {
+            return Err(KuError::runtime(
+                "maximum check depth exceeded; expression is too deeply nested",
+                expr.span,
+            ));
+        }
+        let next = depth + 1;
+        match &expr.kind {
+            ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => {
+                pending.push((expr, next))
+            }
+            ExprKind::Binary { left, right, .. } => {
+                pending.push((left, next));
+                pending.push((right, next));
+            }
+            ExprKind::Call { callee, args } => {
+                pending.push((callee, next));
+                pending.extend(args.iter().map(|arg| (arg, next)));
+            }
+            ExprKind::Index { target, index } => {
+                pending.push((target, next));
+                pending.push((index, next));
+            }
+            ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+                pending.push((target, next))
+            }
+            ExprKind::Array(values) => pending.extend(values.iter().map(|value| (value, next))),
+            ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+                pending.extend(fields.iter().map(|(_, value)| (value, next)))
+            }
+            ExprKind::Match { value, arms } => {
+                pending.push((value, next));
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        pending.push((guard, next));
+                    }
+                    pending.push((&arm.value, next));
+                }
+            }
+            ExprKind::Literal(_) | ExprKind::Variable(_) | ExprKind::Function { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn expr_root_variable(expr: &Expr) -> Option<&str> {
@@ -7132,7 +7627,8 @@ fn type_matches(expected: &Type, actual: &Type) -> bool {
                     .iter()
                     .zip(right_params.iter())
                     .all(|(left, right)| {
-                        function_param_matches(left.ty.as_ref(), right.ty.as_ref())
+                        left.mode == right.mode
+                            && function_param_matches(left.ty.as_ref(), right.ty.as_ref())
                     })
                 && function_return_matches(left_return.as_deref(), right_return.as_deref())
         }
@@ -7148,6 +7644,22 @@ fn type_matches(expected: &Type, actual: &Type) -> bool {
         }
         _ => expected == actual,
     }
+}
+
+fn reject_async_borrowed_params(function: &FnDecl) -> KuResult<()> {
+    if function.is_async {
+        if let Some(param) = function
+            .params
+            .iter()
+            .find(|param| param.mode == ParamMode::View)
+        {
+            return Err(KuError::runtime(
+                "async functions cannot declare borrowed parameters",
+                param.span,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn function_param_matches(expected: Option<&Type>, actual: Option<&Type>) -> bool {
@@ -7187,26 +7699,6 @@ fn union_or_single(types: Vec<Type>) -> Type {
 /// helpers and block-scoped temporaries under that prefix. A user binding of the
 /// same name is silently shadowed in the generated C — `__ku_p` printed an empty
 /// string and `__ku_store` crashed — so the checker reserves the prefix outright.
-/// Argument positions where a stdlib/builtin call takes ownership of its argument,
-/// mirroring the `c_value_expr` (move-and-clear) sites in the native C backend. The
-/// checker must record a move at exactly these positions: recording none let the
-/// backend move a value the checker still believed live (silent emptying), and let
-/// an array/object element be moved out by indexing (aliasing double free).
-///
-/// Everything absent from this table borrows — `println(x)`, `len(x)`, `x.trim()`,
-/// and every read-only receiver keep their argument usable.
-fn stdlib_consuming_args(name: &str) -> &'static [usize] {
-    match name {
-        // The value is wrapped into the Result and handed to the caller.
-        "ok" | "err" => &[0],
-        "json.stringify" => &[0],
-        "kuvalue.as_int" | "kuvalue.as_str" => &[0],
-        // Closing consumes (and frees) the client; receiver reads borrow their handle.
-        "pg_client.close" | "redis.close" | "mysql.close" | "net.close" => &[0],
-        _ => &[],
-    }
-}
-
 /// An owned element cannot be moved out of an array by indexing: `ku_array_get_*`
 /// returns a shallow copy that still aliases the container's buffer, and there is
 /// no way to clear the slot it came from.
@@ -7675,6 +8167,18 @@ fn http_side_effect_response_call_name(callee: &Expr) -> Option<String> {
 }
 
 fn type_error(span: Span, expected: &Type, actual: &Type) -> KuError {
+    if let (Type::FunctionValue { params: left, .. }, Type::FunctionValue { params: right, .. }) =
+        (expected, actual)
+    {
+        if left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .any(|(left, right)| left.mode != right.mode)
+        {
+            return KuError::runtime("callable parameter mode mismatch", span);
+        }
+    }
     KuError::runtime(
         format!(
             "type error: expected {} but got {}",
@@ -7779,11 +8283,16 @@ fn type_name(ty: &Type) -> String {
             let params = params
                 .iter()
                 .map(|param| {
-                    param
+                    let name = param
                         .ty
                         .as_ref()
                         .map(type_name)
-                        .unwrap_or_else(|| "unknown".to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    if param.mode == ParamMode::View {
+                        format!("&{name}")
+                    } else {
+                        name
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", ");

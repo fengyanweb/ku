@@ -11,6 +11,15 @@ use crate::{
 };
 
 pub fn generate_llvm_ir(program: &IrProgram) -> KuResult<String> {
+    if program.functions.iter().any(|f| {
+        f.params
+            .iter()
+            .any(|p| p.mode == crate::ast::ParamMode::View)
+    }) {
+        return Err(unsupported(
+            "LLVM text prototype does not support borrowed parameters; use the C backend",
+        ));
+    }
     Generator::new(program)?.generate()
 }
 
@@ -278,9 +287,9 @@ impl<'a> Generator<'a> {
                     .entry(bytes)
                     .or_insert_with(|| format!(".ku.str.{next}"));
             }
-            IrExprKind::Unary { expr, .. } | IrExprKind::TryUnwrap(expr) => {
-                self.collect_expr_strings(expr)?
-            }
+            IrExprKind::Borrow(expr)
+            | IrExprKind::Unary { expr, .. }
+            | IrExprKind::TryUnwrap(expr) => self.collect_expr_strings(expr)?,
             IrExprKind::Binary { left, right, .. } => {
                 self.collect_expr_strings(left)?;
                 self.collect_expr_strings(right)?;
@@ -308,6 +317,8 @@ impl<'a> Generator<'a> {
             }
             IrExprKind::CellLoad(inner) => self.collect_expr_strings(inner)?,
             IrExprKind::Literal(_)
+            | IrExprKind::BorrowedTemp(_)
+            | IrExprKind::BorrowedParam(_)
             | IrExprKind::Local(_)
             | IrExprKind::Temp(_)
             | IrExprKind::MakeClosure { .. }
@@ -929,6 +940,9 @@ impl<'a> FunctionEmitter<'a> {
             ))),
             IrExprKind::Array(_)
             | IrExprKind::Index { .. }
+            | IrExprKind::BorrowedTemp(_)
+            | IrExprKind::BorrowedParam(_)
+            | IrExprKind::Borrow(_)
             | IrExprKind::TryUnwrap(_)
             | IrExprKind::MakeClosure { .. }
             | IrExprKind::CellLoad(_)

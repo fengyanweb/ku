@@ -148,7 +148,7 @@ impl<'a> Lexer<'a> {
                     if self.match_char('&') {
                         TokenKind::AndAnd
                     } else {
-                        return Err(KuError::lex("expected '&' after '&'", Span::point(start)));
+                        TokenKind::Ampersand
                     }
                 }
                 '|' => {

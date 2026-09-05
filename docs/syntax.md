@@ -1,13 +1,13 @@
-# Ku 0.0.15 Syntax
+# Ku 0.0.16 Syntax
 
-本文档固定 Ku 0.0.15 当前真实支持的全部语法和边界。CLI 版本应显示：
+本文档固定 Ku 0.0.16 当前语法合同和实现边界。CLI 版本应显示：
 
 ```powershell
 ku version
-# ku 0.0.15
+# ku 0.0.16
 ```
 
-Ku 当前是解释器优先的语言实现。文档只记录已经能被 lexer / parser / checker / runtime 闭环处理的语法；仍在设计中的能力放在文末“不支持 / 未完成”。
+Ku 当前是解释器优先的语言实现。本文记录真实实现的语法及各后端边界；实验性增量的验收状态见版本记录，仍在设计中的能力放在文末“不支持 / 未完成”。
 
 ## 0. 专题文档入口
 
@@ -586,7 +586,66 @@ fn main() {
 }
 ```
 
-函数类型只描述参数类型、返回类型和 async 标志，不包含参数名、函数体或捕获环境。同步函数类型上下文可以补齐省略的参数类型，例如 `f: fn(int): int = (x) => x + 1`；高阶函数参数和 `array.map` 也会提供上下文。省略的返回类型由函数体推导并与上下文校验；没有可用上下文时仍需参数类型注解，参数数量或显式类型冲突仍会报错。
+函数类型描述每个参数的类型和所有权模式、返回类型和 async 标志，不包含参数名、函数体或捕获环境。同步函数类型上下文可以补齐省略的参数类型，例如 `f: fn(int): int = (x) => x + 1`；高阶函数参数和 `array.map` 也会提供上下文。省略的返回类型由函数体推导并与上下文校验；没有可用上下文时仍需参数类型注解，参数数量或显式类型冲突仍会报错。
+
+### 函数参数所有权：普通参数与 `&` 只读借用参数
+
+0.0.16 的实验实现固定以下合同。Lexer、Parser、checker、解释器与 C backend 已接入参数模式，验收状态见 [v0.0.16.md](v0.0.16.md)。LLVM 文本后端暂不支持借用参数，不能把 C backend 的覆盖视为所有后端等宽。
+
+`name: T` 取得 owned 实参的所有权，调用时默认 move；Copy 值仍按值复制。`&name: T` 表示当前同步调用期间的只读、非拥有借用，不消费或隐式 clone 实参。调用处统一写普通表达式：
+
+```ku
+struct User { name: str, age: int }
+
+fn inspect(&user: User): int {
+    println(user.name)
+    return user.age
+}
+
+fn copy_name(&user: User): str {
+    return user.name.clone()
+}
+
+fn main() {
+    user = User { name: "Ku", age: 1 }
+    println(inspect(user))
+    println(inspect(user))
+    println(copy_name(user))
+    println(user.name)
+}
+```
+
+`&` 只放在参数声明槽位或函数类型参数槽位。顶层函数、局部函数、匿名 `fn(&value: T) { ... }`、泛型 `fn inspect<T>(&value: T)` 和带括号箭头 `(&value: T): str => value.name.clone()` 使用同一种参数模式。借用箭头必须加括号；`&value: T => ...` 会得到明确的加括号提示。参数类型省略规则与普通参数一致。
+
+函数类型写 `fn(&User): str`，普通 owning 槽位写 `fn(User): str`。两种函数类型精确区分，不做隐式 adapter，也不依据函数体推断参数模式。`async fn(fn(&User): str): null!` 中的 callback 是一个 owned 同步函数值，内部的借用参数不会使外层 async 参数变成 borrowed。
+
+native 支持调用函数数组元素，并保留其参数模式。struct 函数字段目前仅在 IR 中保留类型与模式，C backend 尚不支持该字段布局；两者是不同的存储路径。
+
+借用遵循这些边界：
+
+- 允许字段、索引、长度、比较、字符串拼接、模板等读取；Copy 字段可以直接返回，owned 字段必须显式 `.clone()` 才能保存或返回。
+- 派生字段可继续传给另一个 `&` 参数；传给 owning 参数需要 `.clone()`。临时 owned 表达式可以借用，调用者让临时值存活到同步调用返回后再 drop。
+- 不能通过借用根或字段、索引执行赋值、复合赋值、自增等直接修改，不能 move 出 owned 子值，也不能把借用值存入 owned 变量、容器、Result、全局或闭包环境。
+- 同一调用可以多次借用同一根；同一根的借用与 move 或修改不能同时出现在该次调用参数中，包括父对象与字段之间的重叠。
+- 第一版禁止 `async fn` 直接声明 `&` 参数，也禁止闭包捕获 borrowed 参数。async 函数内部仍可调用同步借用函数，借用不会进入 task frame。
+- 当前明确拒绝 borrowed array 的 `for`、borrowed match 的 owned payload binding，以及 fallible object lookup；可先显式 `.clone()` 再执行。match 的 tag 检查与 Copy payload 不因此获得 owned 子值。消费式对象解构与 borrowed Result 的 `?` 也需要先显式 `.clone()`。
+
+首批接受用户 borrowed 参数的标准库包括 `len`、`str`、`print`、`println`、字符串 `len` / `byte_len` / `contains` / `starts_with` / `ends_with`、数组 `len` / `is_empty` 和 `json.stringify`。例如 `text.len()` 和 `items.len()` 的 receiver 不消费来源。这不是所有标准库 API 都能接收 borrowed 参数的承诺：`string.chars`、`array.first`、`array.map` 等尚未迁移的路径会明确拒绝，不能隐式 clone；已有普通 owned 调用按原合同处理。容器插入、Task/await、transaction、`listen` 等操作仍按各自的所有权合同处理。`&` 只约束直接读写和所有权，不表示纯函数，也不禁止 opaque client 在内部更新连接池状态。
+
+已迁移的 `contains` 等读取方法也执行同次调用的借用冲突检查：`text.contains(ChangeText())` 若后一个表达式修改 `text`，会被拒绝。需要修改前快照时先显式保存独立副本，再调用：
+
+```ku
+fn main() {
+    text = "old"
+    fn ChangeText(): str { text = "new" return "o" }
+    snapshot = text.clone()
+    println(snapshot.contains(ChangeText()))
+}
+```
+
+未迁移的 `array.push` 普通 owned 调用仍保留既有参数求值快照语义，不能据此推导用户 borrowed array 已可传入。`json.stringify(value)` 只读取输入并返回新的 owned 字符串 Result；生成 C 对 typed array 直接使用只读 writer，调用后原数组仍有效，输出 buffer 的分配不属于输入 clone。
+
+不支持 `inspect(&user)`、`value: &User`、`[&User]`、`&mut`、地址获取或一等引用。`view` 仍是普通 identifier；`fn f(view value: User)` 和 `fn f(ref value: User)` 都不是参数语法。规范格式固定为 `&name: Type` / `fn(&Type): R`，`&` 后不加空格。
 
 ### 6.4 闭包捕获
 
@@ -1306,11 +1365,11 @@ fn main() {
 ### 12.1 基础内置函数
 
 ```txt
-len(value:any): int
-str(value:any): str
+len(&value:any): int
+str(&value:any): str
 ok(value:T): T!
 err(message:str): Unknown!
-println(value:any): null
+println(&value:any): null
 ```
 
 示例：
@@ -1354,12 +1413,12 @@ parser.parse(input:str | [str]): str
 ### 12.4 string
 
 ```txt
-string.len(text:str): int
-string.byte_len(text:str): int
+string.len(&text:str): int
+string.byte_len(&text:str): int
 string.chars(text:str): [str]
-string.contains(text:str, needle:str): bool
-string.starts_with(text:str, prefix:str): bool
-string.ends_with(text:str, suffix:str): bool
+string.contains(&text:str, &needle:str): bool
+string.starts_with(&text:str, &prefix:str): bool
+string.ends_with(&text:str, &suffix:str): bool
 string.trim(text:str): str
 string.lower(text:str): str
 string.upper(text:str): str
@@ -1380,8 +1439,8 @@ print(text.slice(1, 3)?)
 ### 12.5 array
 
 ```txt
-array.len(values:[T]): int
-array.is_empty(values:[T]): bool
+array.len(&values:[T]): int
+array.is_empty(&values:[T]): bool
 array.first(values:[T]): T
 array.last(values:[T]): T
 array.try_get(values:[T], index:int): T!
@@ -1416,7 +1475,7 @@ obj.get_or(key:str, default:any): any
 ### 12.7 json
 
 ```txt
-json.stringify(value:any): str!
+json.stringify(&value:any): str!
 json.parse(text:str): KuValue!
 json.try_parse(text:str): KuValue!
 ```
@@ -2036,7 +2095,7 @@ VS Code 扩展优先读取 JSON diagnostics；面对旧版 Ku CLI 时只回退�
 
 未使用 import 默认报 `E0901`，named import 和 namespace import 都会检查；用 `_` 或 `_name` alias 表示明确丢弃。glob / side-effect import 暂不做 unused 判断，避免误伤副作用导入。`ku check --deny-unused` 继续开启严格 unused 本地绑定检查：本文件局部变量/常量如果声明后没有被读取，会报 `E0905`；用 `_` 或 `_name` 表示明确丢弃。普通函数参数当前仍不纳入全局 unused 错误。HTTP handler 读取请求时写 `fn(req)`；不读取请求时主写法是 `fn()`，`fn(_req)` 只保留给适配器/测试 mock 等必须带参数的场景。
 
-`ku llvm file.ku` 在源文件旁输出 `.ll`，不要求本机安装 LLVM。当前文本后端支持 `int/bool/str`、普通函数、局部变量、直接调用、`return`、`if/while`、`print`、非递归 struct 值与字段读写，以及 `Result<int|bool|str|struct>` 的 `ok`、`fail`、`?` 和错误传播。数组、enum、闭包、HTTP 和 async 仍会明确报不支持。后端会拒绝递归值 struct、缺失/重复 CFG block 和无条件自跳，避免生成明显错误或永久循环的 `.ll`。golden test 不依赖外部工具；检测到 `llvm-as` 时会额外验证生成文本。
+`ku llvm file.ku` 在源文件旁输出 `.ll`，不要求本机安装 LLVM。当前文本后端支持 `int/bool/str`、普通函数、局部变量、直接调用、`return`、`if/while`、`print`、非递归 struct 值与字段读写，以及 `Result<int|bool|str|struct>` 的 `ok`、`fail`、`?` 和错误传播。数组、enum、闭包、HTTP、async 和 `&` 借用参数仍会明确报不支持。后端会拒绝递归值 struct、缺失/重复 CFG block 和无条件自跳，避免生成明显错误或永久循环的 `.ll`。golden test 不依赖外部工具；检测到 `llvm-as` 时会额外验证生成文本。
 
 `ku build` 当前生成解释器打包型可执行文件。
 
@@ -2179,7 +2238,7 @@ CPU time: 2312 ms
 ## 18. 当前不支持 / 未完成
 
 ```txt
-LLVM 数组、enum、闭包、HTTP、async lowering
+LLVM 数组、enum、闭包、HTTP、async lowering、& 借用参数
 LLVM 递归 struct 和更复杂 Result payload
 覆盖全部语言特性（尤其 async/递归值类型）的完整 native C 后端
 registry v2 自动 signed-roots、在线 key 吊销和透明轮换（v1 使用项目显式公钥 pin）
@@ -2209,13 +2268,17 @@ import_name   ::= IDENT ('as' IDENT)?
 module        ::= 'module' IDENT
 fn            ::= 'fn' IDENT '(' params? ')' (':' type)? block
 async_fn      ::= 'async' 'fn' IDENT '(' params? ')' (':' type)? block
-params        ::= IDENT (':' type)? (',' IDENT (':' type)?)*
+params        ::= param (',' param)*
+param         ::= '&'? IDENT (':' type)?
 struct        ::= 'struct' IDENT '{' fields* '}'
 enum          ::= 'enum' IDENT '{' variants* '}'
 type          ::= union
 union         ::= result ('|' result)*
 result        ::= atom '!'?
 atom          ::= 'int' | 'float' | 'bool' | 'str' | 'null' | '[' type ']' | IDENT ('.' IDENT)*
+                | fn_type
+fn_type       ::= 'async'? 'fn' '(' (fn_type_param (',' fn_type_param)*)? ')' ':' type
+fn_type_param ::= '&'? type
 block         ::= '{' stmt* '}'
 stmt          ::= var | assign | compound_assign | destructure | object_destructure | inc | if | while | for | break | continue | try | fail | panic | return | print | expr
 var           ::= IDENT ':' type ('=' expr)?

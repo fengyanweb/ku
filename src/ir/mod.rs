@@ -8,12 +8,15 @@ use std::{
 use crate::{
     ast::{
         is_pure_append_argument, AssignTarget, BinaryOp, EnumDecl, Expr, ExprKind, Item, Literal,
-        MatchArm, MatchPattern, Program, Stmt, StructDecl, TypeName, UnaryOp,
+        MatchArm, MatchPattern, ParamMode, Program, Stmt, StructDecl, TypeName, UnaryOp,
     },
     error::{KuError, KuResult},
     span::Span,
     stdlib::metadata::{self, ArgRule, Signature, TypePattern},
 };
+
+mod borrow;
+pub use borrow::verify_borrow_contract;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrProgram {
@@ -85,6 +88,7 @@ pub struct IrFieldLayout {
 pub struct IrParam {
     pub name: String,
     pub ty: IrType,
+    pub mode: ParamMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +214,12 @@ pub struct IrExpr {
 pub enum IrExprKind {
     Literal(String),
     Local(String),
+    /// A synchronous read of a non-owning parameter. This is never a move place.
+    BorrowedParam(String),
+    /// A shallow projected temporary whose owner remains outside this frame.
+    BorrowedTemp(TempId),
+    /// An argument passed to a View parameter. The operand remains caller-owned.
+    Borrow(Box<IrExpr>),
     Temp(TempId),
     StructLiteral {
         name: String,
@@ -283,6 +293,7 @@ pub enum IrType {
     Function,
     Closure {
         params: Vec<IrType>,
+        param_modes: Vec<ParamMode>,
         ret: Box<IrType>,
     },
     /// Stage 6b: a heap-boxed Copy local shared with the closures that capture
@@ -296,6 +307,7 @@ pub enum IrType {
 struct FunctionSig {
     id: FunctionId,
     params: Vec<IrType>,
+    param_modes: Vec<ParamMode>,
     returns: IrType,
 }
 
@@ -312,6 +324,33 @@ fn ir_expr_is_place(expr: &IrExpr) -> bool {
             | IrExprKind::CapturedCell(_)
             | IrExprKind::CellLoad(_)
     )
+}
+
+/// A fresh root created while evaluating this call must outlive its borrowed
+/// projection, but not an argument evaluation that exits through `?`.
+fn borrow_temporary_owner(expr: &IrExpr, first_argument_temp: usize) -> Option<&IrExpr> {
+    let mut owner = expr;
+    while let IrExprKind::Field { target, .. } | IrExprKind::Index { target, .. } = &owner.kind {
+        owner = target;
+    }
+    match owner.kind {
+        IrExprKind::Temp(id) if id.0 >= first_argument_temp && ir_type_is_owned(&owner.ty) => {
+            Some(owner)
+        }
+        _ => None,
+    }
+}
+
+/// Read-only provenance follows transparent projections, never an owning call
+/// result (including an explicit clone).
+pub(crate) fn ir_expr_is_borrowed(expr: &IrExpr) -> bool {
+    match &expr.kind {
+        IrExprKind::BorrowedParam(_) | IrExprKind::BorrowedTemp(_) | IrExprKind::Borrow(_) => true,
+        IrExprKind::Field { target, .. } | IrExprKind::Index { target, .. } => {
+            ir_expr_is_borrowed(target)
+        }
+        _ => false,
+    }
 }
 
 /// Whether a value of this type owns heap memory and therefore needs a clone/drop
@@ -339,6 +378,7 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                 function.name.clone(),
                 FunctionSig {
                     id,
+                    param_modes: function.params.iter().map(|p| p.mode).collect(),
                     params: function
                         .params
                         .iter()
@@ -455,6 +495,7 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                 .map(|(param, ty)| IrParam {
                     name: param.name.clone(),
                     ty: ty.clone(),
+                    mode: param.mode,
                 })
                 .collect::<Vec<_>>();
             let mut lower = FunctionLowerer::new(
@@ -480,7 +521,9 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
         }
     }
     functions.append(&mut lifted_functions.borrow_mut());
-    Ok(IrProgram { functions, layouts })
+    let program = IrProgram { functions, layouts };
+    verify_borrow_contract(&program)?;
+    Ok(program)
 }
 
 pub fn optimize_program(program: &IrProgram) -> IrProgram {
@@ -631,7 +674,13 @@ fn optimize_expr(expr: IrExpr) -> IrExpr {
             ty: expr.ty,
             kind: IrExprKind::CellLoad(Box::new(optimize_expr(*inner))),
         },
+        IrExprKind::Borrow(inner) => IrExpr {
+            ty: expr.ty,
+            kind: IrExprKind::Borrow(Box::new(optimize_expr(*inner))),
+        },
         IrExprKind::Literal(_)
+        | IrExprKind::BorrowedParam(_)
+        | IrExprKind::BorrowedTemp(_)
         | IrExprKind::Local(_)
         | IrExprKind::Temp(_)
         | IrExprKind::MakeClosure { .. }
@@ -825,7 +874,17 @@ impl fmt::Display for IrProgram {
                 if index > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "{}: {}", param.name, param.ty)?;
+                write!(
+                    f,
+                    "{}{}: {}",
+                    if param.mode == ParamMode::View {
+                        "&"
+                    } else {
+                        ""
+                    },
+                    param.name,
+                    param.ty
+                )?;
             }
             writeln!(f, ") -> {} {{", function.return_type)?;
             for block in &function.blocks {
@@ -1021,6 +1080,9 @@ impl fmt::Display for IrExpr {
                 write!(f, "make_closure fn#{}", function_id.0)
             }
             IrExprKind::CellLoad(inner) => write!(f, "cell_load {inner}"),
+            IrExprKind::BorrowedParam(name) => write!(f, "borrowed {name}"),
+            IrExprKind::BorrowedTemp(id) => write!(f, "borrowed %t{}", id.0),
+            IrExprKind::Borrow(inner) => write!(f, "borrow({inner})"),
             IrExprKind::CapturedCell(name) => write!(f, "captured_cell {name}"),
         }
     }
@@ -1031,6 +1093,7 @@ struct FunctionLowerer<'a> {
     layouts: &'a IrLayoutTable,
     return_type: IrType,
     locals: HashMap<String, IrType>,
+    borrowed_params: HashSet<String>,
     /// Source spellings resolve to unique C/IR names while a lexical binding is
     /// visible. The type table keeps emitted bindings for place/cleanup typing.
     local_names: HashMap<String, String>,
@@ -1042,6 +1105,7 @@ struct FunctionLowerer<'a> {
     next_block_id: usize,
     next_temp_id: usize,
     try_handlers: Vec<IrTryHandler>,
+    pending_borrow_temporaries: Vec<PendingBorrowTemporary>,
     pattern_bindings: HashMap<String, IrExpr>,
     /// Program-global FunctionId allocator, shared between the top-level lowerer
     /// and every child lowerer that lifts a closure body (Stage 6a).
@@ -1065,6 +1129,7 @@ struct FunctionLowerer<'a> {
     /// running `__env` (rather than capturing the function into its own env,
     /// which would form a reference cycle). `None` everywhere else.
     self_recurse: Option<(String, FunctionId, IrType)>,
+    self_param_modes: Vec<ParamMode>,
 }
 
 /// The source definition that owns a local binding. Statement offsets are
@@ -1093,9 +1158,13 @@ impl BoxedBindingSite {
 trait BodyParameter {
     fn binding_name(&self) -> &str;
     fn binding_span(&self) -> Span;
+    fn mode(&self) -> ParamMode;
 }
 
 impl BodyParameter for crate::ast::Param {
+    fn mode(&self) -> ParamMode {
+        self.mode
+    }
     fn binding_name(&self) -> &str {
         &self.name
     }
@@ -1106,6 +1175,9 @@ impl BodyParameter for crate::ast::Param {
 }
 
 impl BodyParameter for crate::ast::FunctionParam {
+    fn mode(&self) -> ParamMode {
+        self.mode
+    }
     fn binding_name(&self) -> &str {
         &self.name
     }
@@ -1121,6 +1193,13 @@ struct IrTryHandler {
     error_name: String,
     return_block: Option<BlockId>,
     return_name: Option<String>,
+}
+
+struct PendingBorrowTemporary {
+    owner: IrExpr,
+    /// Only an error reaching the handler outside this argument evaluation
+    /// aborts it. A nested handler that catches its own error must not drop it.
+    error_block: Option<BlockId>,
 }
 
 struct LoweredCaptureBindings {
@@ -1141,6 +1220,7 @@ impl<'a> FunctionLowerer<'a> {
             layouts,
             return_type,
             locals: HashMap::new(),
+            borrowed_params: HashSet::new(),
             local_names: HashMap::new(),
             local_scopes: Vec::new(),
             blocks: Vec::new(),
@@ -1153,12 +1233,14 @@ impl<'a> FunctionLowerer<'a> {
             next_block_id: 1,
             next_temp_id: 0,
             try_handlers: Vec::new(),
+            pending_borrow_temporaries: Vec::new(),
             pattern_bindings: HashMap::new(),
             next_function_id,
             lifted_functions,
             boxed: HashSet::new(),
             captures: HashMap::new(),
             self_recurse: None,
+            self_param_modes: Vec::new(),
         }
     }
 
@@ -1181,6 +1263,24 @@ impl<'a> FunctionLowerer<'a> {
             .cloned()
             .collect::<HashSet<_>>();
         self.boxed = collect_boxed_candidates(body, &lexical_bindings, parameters);
+        self.borrowed_params = parameters
+            .iter()
+            .filter(|p| p.mode() == ParamMode::View)
+            .map(|p| p.binding_name().to_owned())
+            .collect();
+        for parameter in parameters {
+            if parameter.mode() == ParamMode::View
+                && self.boxed.contains(&BoxedBindingSite::new(
+                    parameter.binding_name(),
+                    parameter.binding_span(),
+                ))
+            {
+                return Err(KuError::runtime(
+                    "cannot capture borrowed parameter",
+                    parameter.binding_span(),
+                ));
+            }
+        }
         self.current.name = name.to_string();
         for parameter in parameters {
             let parameter_name = parameter.binding_name();
@@ -2220,11 +2320,12 @@ impl<'a> FunctionLowerer<'a> {
         let path = self.lower_expr(&args[0])?;
         let expected = IrType::Closure {
             params: vec![IrType::Named(HTTP_REQUEST_TYPE.to_string())],
+            param_modes: vec![ParamMode::Owned],
             ret: Box::new(IrType::Unknown),
         };
         let handler = self.lower_expr_with_expected(&args[1], Some(&expected))?;
         let (arity, returns_result) = match &handler.ty {
-            IrType::Closure { params, ret } => {
+            IrType::Closure { params, ret, .. } => {
                 (params.len(), matches!(ret.as_ref(), IrType::Result(_)))
             }
             _ => {
@@ -2392,7 +2493,7 @@ impl<'a> FunctionLowerer<'a> {
         receiver: IrExpr,
         has_effects: bool,
     ) -> KuResult<IrExpr> {
-        if !has_effects || !ir_type_is_owned(&receiver.ty) {
+        if !has_effects || !ir_type_is_owned(&receiver.ty) || ir_expr_is_borrowed(&receiver) {
             return Ok(receiver);
         }
         // Merely materializing a CellLoad/header would still alias storage that
@@ -2411,6 +2512,78 @@ impl<'a> FunctionLowerer<'a> {
         })
     }
 
+    /// Resolve only the projections whose native layouts are known, without
+    /// evaluating their owner. This also covers a temporary returned by a call.
+    fn borrow_projection_type(&self, expr: &Expr) -> Option<IrType> {
+        match &expr.kind {
+            ExprKind::Call { callee, .. } => match &callee.kind {
+                ExprKind::Variable(name) => match self.static_place_type(callee) {
+                    Some(IrType::Closure { ret, .. }) => Some(*ret),
+                    Some(_) => None,
+                    None => self.signatures.get(name).map(|s| s.returns.clone()),
+                },
+                _ => None,
+            },
+            ExprKind::StructLiteral { name, .. } => Some(IrType::Named(name.clone())),
+            ExprKind::Field { target, name } => {
+                Some(self.field_type(&self.borrow_projection_type(target)?, name))
+            }
+            ExprKind::Index { target, .. } => match self.borrow_projection_type(target)? {
+                IrType::Array(element) => Some(*element),
+                _ => None,
+            },
+            _ => self.static_place_type(expr),
+        }
+    }
+
+    fn lower_borrow_argument(
+        &mut self,
+        expr: &Expr,
+        expected: Option<&IrType>,
+        deferred_safepoint: &mut bool,
+    ) -> KuResult<IrExpr> {
+        match &expr.kind {
+            ExprKind::Field { target, name } if matches!(self.borrow_projection_type(target), Some(IrType::Named(ref n)) if self.layouts.structs.iter().any(|s| &s.name == n)) =>
+            {
+                let mut target = self.lower_borrow_argument(target, None, deferred_safepoint)?;
+                if !ir_expr_is_place(&target) && !ir_expr_is_borrowed(&target) {
+                    target = self.emit_temp(target)?;
+                }
+                let ty = self.field_type(&target.ty, name);
+                Ok(IrExpr {
+                    kind: IrExprKind::Field {
+                        target: Box::new(target),
+                        name: name.clone(),
+                    },
+                    ty,
+                })
+            }
+            ExprKind::Index { target, index }
+                if matches!(self.borrow_projection_type(target), Some(IrType::Array(_)))
+                    && is_pure_append_argument(index, "") =>
+            {
+                let mut target = self.lower_borrow_argument(target, None, deferred_safepoint)?;
+                if !ir_expr_is_place(&target) && !ir_expr_is_borrowed(&target) {
+                    target = self.emit_temp(target)?;
+                }
+                let IrType::Array(element) = &target.ty else {
+                    unreachable!()
+                };
+                let ty = *element.clone();
+                let index = self.lower_expr(index)?;
+                let index = self.emit_temp(index)?;
+                Ok(IrExpr {
+                    kind: IrExprKind::Index {
+                        target: Box::new(target),
+                        index: Box::new(index),
+                    },
+                    ty,
+                })
+            }
+            _ => self.lower_expr_with_expected_impl(expr, expected, Some(deferred_safepoint)),
+        }
+    }
+
     /// Copy arguments and borrowed function bindings must be read before later
     /// callbacks run. Owned arguments retain their existing consuming path;
     /// eagerly moving a function binding would violate its borrowed-call ABI.
@@ -2418,8 +2591,10 @@ impl<'a> FunctionLowerer<'a> {
         &mut self,
         args: &[Expr],
         expected: Option<&[IrType]>,
+        modes: Option<&[ParamMode]>,
         callee_has_effects: bool,
     ) -> KuResult<Vec<IrExpr>> {
+        let first_argument_temp = self.next_temp_id;
         let effects = args
             .iter()
             .map(|arg| !is_pure_append_argument(arg, ""))
@@ -2428,8 +2603,57 @@ impl<'a> FunctionLowerer<'a> {
         let mut values = Vec::with_capacity(args.len());
         for (index, (arg, has_effects)) in args.iter().zip(effects).enumerate() {
             remaining_effects -= usize::from(has_effects);
-            let mut value =
-                self.lower_expr_with_expected(arg, expected.and_then(|params| params.get(index)))?;
+            let view = modes.and_then(|m| m.get(index)) == Some(&ParamMode::View);
+            let mut deferred_safepoint = false;
+            let mut value = if view {
+                self.lower_borrow_argument(
+                    arg,
+                    expected.and_then(|params| params.get(index)),
+                    &mut deferred_safepoint,
+                )?
+            } else {
+                self.lower_expr_with_expected(arg, expected.and_then(|params| params.get(index)))?
+            };
+            if view {
+                if !ir_type_is_owned(&value.ty) && (remaining_effects != 0 || callee_has_effects) {
+                    value = self.emit_temp(value)?;
+                }
+                // Non-place expressions need a real owner until the call returns.
+                // Owned temps are cleaned on normal, Result and finally exits.
+                if !ir_expr_is_place(&value)
+                    && !ir_expr_is_borrowed(&value)
+                    && ir_type_is_owned(&value.ty)
+                {
+                    value = self.emit_temp(value)?;
+                }
+                if let Some(owner) = borrow_temporary_owner(&value, first_argument_temp) {
+                    if !self
+                        .pending_borrow_temporaries
+                        .iter()
+                        .any(|pending| pending.owner.kind == owner.kind)
+                    {
+                        self.pending_borrow_temporaries
+                            .push(PendingBorrowTemporary {
+                                owner: owner.clone(),
+                                error_block: self
+                                    .try_handlers
+                                    .last()
+                                    .map(|handler| handler.error_block),
+                            });
+                    }
+                }
+                if deferred_safepoint {
+                    // The root-returning call has completed, but its result was
+                    // not registered while that call was being lowered. Poll
+                    // only after registration so timeout-finally also drops it.
+                    self.emit_safepoint();
+                }
+                values.push(IrExpr {
+                    ty: value.ty.clone(),
+                    kind: IrExprKind::Borrow(Box::new(value)),
+                });
+                continue;
+            }
             if remaining_effects != 0 || callee_has_effects {
                 if matches!(value.ty, IrType::Closure { .. }) {
                     value = self.snapshot_receiver_before_effects(value, true)?;
@@ -2442,9 +2666,81 @@ impl<'a> FunctionLowerer<'a> {
         Ok(values)
     }
 
+    fn finish_borrowing_call(
+        &mut self,
+        call: IrExpr,
+        first_argument_temp: usize,
+        deferred_safepoint: Option<&mut bool>,
+    ) -> KuResult<IrExpr> {
+        // The call is fully evaluated now. Nested calls remove only their own
+        // newer roots; an outer call's earlier arguments remain pending.
+        self.pending_borrow_temporaries.retain(|pending| {
+            matches!(pending.owner.kind, IrExprKind::Temp(id) if id.0 < first_argument_temp)
+        });
+        let mut cleanup = Vec::new();
+        if let IrExprKind::Call { args, .. } = &call.kind {
+            for arg in args {
+                let IrExprKind::Borrow(value) = &arg.kind else {
+                    continue;
+                };
+                if let Some(owner) = borrow_temporary_owner(value, first_argument_temp) {
+                    if !cleanup
+                        .iter()
+                        .any(|existing: &IrExpr| existing.kind == owner.kind)
+                    {
+                        cleanup.push(owner.clone());
+                    }
+                }
+            }
+        }
+        if cleanup.is_empty() {
+            return self.emit_temp_for_borrow_result(call, deferred_safepoint);
+        }
+        let needs_safepoint = call.ty == IrType::Void || ir_expr_needs_post_call_safepoint(&call);
+        let result = if call.ty == IrType::Void {
+            self.current.instructions.push(IrInst::Expr(call));
+            IrExpr {
+                kind: IrExprKind::Literal("0".into()),
+                ty: IrType::Void,
+            }
+        } else {
+            self.emit_temp_with_safepoint(call, false)?
+        };
+        for owner in cleanup {
+            self.emit_borrow_temporary_drop(owner);
+        }
+        if needs_safepoint {
+            if let Some(deferred) = deferred_safepoint {
+                *deferred = true;
+            } else {
+                self.emit_safepoint();
+            }
+        }
+        Ok(result)
+    }
+
+    fn emit_borrow_temporary_drop(&mut self, owner: IrExpr) {
+        self.current.instructions.push(IrInst::Expr(IrExpr {
+            ty: IrType::Void,
+            kind: IrExprKind::Call {
+                callee: Box::new(IrExpr {
+                    kind: IrExprKind::Local("__ku_drop_borrow_temp".into()),
+                    ty: IrType::Function,
+                }),
+                args: vec![owner],
+                kind: IrCallKind::Intrinsic("__ku_drop_borrow_temp".into()),
+            },
+        }));
+    }
+
     /// Recognize receiver-typed stdlib methods without executing a prospective
     /// callee. User functions and module-qualified calls retain their old path.
-    fn lower_builtin_method(&mut self, callee: &Expr, args: &[Expr]) -> KuResult<Option<IrExpr>> {
+    fn lower_builtin_method(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        deferred_safepoint: Option<&mut bool>,
+    ) -> KuResult<Option<IrExpr>> {
         let ExprKind::Field { target, name } = &callee.kind else {
             return Ok(None);
         };
@@ -2558,21 +2854,32 @@ impl<'a> FunctionLowerer<'a> {
         } else {
             signature_return_type(&signature, &all_args)
         };
-        self.emit_temp(IrExpr {
-            kind: IrExprKind::Call {
-                callee: Box::new(IrExpr {
-                    kind: IrExprKind::Local(format!("{module}.{name}")),
-                    ty: IrType::Function,
-                }),
-                args: all_args,
-                kind: IrCallKind::Intrinsic(format!("{module}.{name}")),
+        self.emit_temp_for_borrow_result(
+            IrExpr {
+                kind: IrExprKind::Call {
+                    callee: Box::new(IrExpr {
+                        kind: IrExprKind::Local(format!("{module}.{name}")),
+                        ty: IrType::Function,
+                    }),
+                    args: all_args,
+                    kind: IrCallKind::Intrinsic(format!("{module}.{name}")),
+                },
+                ty,
             },
-            ty,
-        })
+            deferred_safepoint,
+        )
         .map(Some)
     }
 
     fn lower_expr(&mut self, expr: &Expr) -> KuResult<IrExpr> {
+        self.lower_expr_impl(expr, None)
+    }
+
+    fn lower_expr_impl(
+        &mut self,
+        expr: &Expr,
+        mut deferred_safepoint: Option<&mut bool>,
+    ) -> KuResult<IrExpr> {
         match &expr.kind {
             // A backtick template must be desugared, not emitted as a literal: the
             // interpreter interpolates `{expr}` at run time, so native must too.
@@ -2588,6 +2895,12 @@ impl<'a> FunctionLowerer<'a> {
                     return Ok(value.clone());
                 }
                 let name = self.local_ir_name(name);
+                if self.borrowed_params.contains(name) {
+                    return Ok(IrExpr {
+                        kind: IrExprKind::BorrowedParam(name.to_string()),
+                        ty: self.locals.get(name).cloned().unwrap_or(IrType::Unknown),
+                    });
+                }
                 // Stage 6b: a boxed local read in the scope that owns the cell.
                 if let Some(IrType::Cell(inner)) = self.locals.get(name) {
                     let inner = (**inner).clone();
@@ -2608,13 +2921,18 @@ impl<'a> FunctionLowerer<'a> {
                 if !self.locals.contains_key(name) {
                     if let Some(signature) = self.signatures.get(name) {
                         let params = signature.params.clone();
+                        let param_modes = signature.param_modes.clone();
                         let ret = Box::new(signature.returns.clone());
                         return Ok(IrExpr {
                             kind: IrExprKind::MakeClosure {
                                 function_id: signature.id,
                                 captures: Vec::new(),
                             },
-                            ty: IrType::Closure { params, ret },
+                            ty: IrType::Closure {
+                                params,
+                                param_modes,
+                                ret,
+                            },
                         });
                     }
                 }
@@ -2668,23 +2986,37 @@ impl<'a> FunctionLowerer<'a> {
                 // reference cycle). Mirrors the interpreter's `self_name` binding.
                 if let ExprKind::Variable(name) = &callee.kind {
                     if let Some((self_id, ret_ty)) = self.self_recurse_target(name) {
+                        let first_argument_temp = self.next_temp_id;
                         let mut lowered_args = Vec::with_capacity(args.len() + 1);
                         lowered_args.push(IrExpr {
                             kind: IrExprKind::Local("__env".to_string()),
                             ty: IrType::Unknown,
                         });
-                        lowered_args.extend(self.lower_call_arguments(args, None, false)?);
-                        return self.emit_temp(IrExpr {
-                            kind: IrExprKind::Call {
-                                callee: Box::new(IrExpr {
-                                    kind: IrExprKind::Local(format!("__ku_closure_{}", self_id.0)),
-                                    ty: IrType::Function,
-                                }),
-                                args: lowered_args,
-                                kind: IrCallKind::Direct(self_id),
+                        let modes = self.self_param_modes.clone();
+                        lowered_args.extend(self.lower_call_arguments(
+                            args,
+                            None,
+                            Some(&modes),
+                            false,
+                        )?);
+                        return self.finish_borrowing_call(
+                            IrExpr {
+                                kind: IrExprKind::Call {
+                                    callee: Box::new(IrExpr {
+                                        kind: IrExprKind::Local(format!(
+                                            "__ku_closure_{}",
+                                            self_id.0
+                                        )),
+                                        ty: IrType::Function,
+                                    }),
+                                    args: lowered_args,
+                                    kind: IrCallKind::Direct(self_id),
+                                },
+                                ty: ret_ty,
                             },
-                            ty: ret_ty,
-                        });
+                            first_argument_temp,
+                            deferred_safepoint,
+                        );
                     }
                 }
                 if let ExprKind::Field { target, name } = &callee.kind {
@@ -2733,6 +3065,7 @@ impl<'a> FunctionLowerer<'a> {
                         // closure body (no body-driven inference of the parameter).
                         let expected = IrType::Closure {
                             params: vec![*element],
+                            param_modes: vec![ParamMode::Owned],
                             ret: Box::new(IrType::Unknown),
                         };
                         let mapper = self.lower_expr_with_expected(&args[0], Some(&expected))?;
@@ -2770,7 +3103,9 @@ impl<'a> FunctionLowerer<'a> {
                         }
                     }
                 }
-                if let Some(value) = self.lower_builtin_method(callee, args)? {
+                if let Some(value) =
+                    self.lower_builtin_method(callee, args, deferred_safepoint.as_deref_mut())?
+                {
                     return Ok(value);
                 }
                 // A lexical function binding takes precedence over a builtin
@@ -2778,6 +3113,9 @@ impl<'a> FunctionLowerer<'a> {
                 // provide context for closure/Result constructor arguments.
                 let bound_callee = match &callee.kind {
                     ExprKind::Variable(_) => self.static_place_type(callee),
+                    ExprKind::Field { .. } | ExprKind::Index { .. } => self
+                        .static_place_type(callee)
+                        .filter(|ty| matches!(ty, IrType::Closure { .. })),
                     _ => None,
                 };
                 let expected_param_types = match &bound_callee {
@@ -2790,9 +3128,28 @@ impl<'a> FunctionLowerer<'a> {
                         _ => None,
                     },
                 };
+                let first_argument_temp = self.next_temp_id;
                 let lowered_args = self.lower_call_arguments(
                     args,
                     expected_param_types.as_deref(),
+                    match &bound_callee {
+                        Some(IrType::Closure { param_modes, .. }) => Some(param_modes.clone()),
+                        Some(_) => None,
+                        None => match &callee.kind {
+                            ExprKind::Variable(name) => self
+                                .signatures
+                                .get(name)
+                                .map(|s| s.param_modes.clone())
+                                .or_else(|| metadata::builtin_signature(name).map(|s| s.arg_modes)),
+                            ExprKind::Field { .. } => dotted_name(callee).and_then(|n| {
+                                n.split_once('.')
+                                    .and_then(|(m, f)| metadata::dotted_signature(m, f))
+                                    .map(|s| s.arg_modes)
+                            }),
+                            _ => None,
+                        },
+                    }
+                    .as_deref(),
                     !is_pure_append_argument(callee, ""),
                 )?;
                 if let Some((layout, variant)) = self.enum_variant(callee) {
@@ -2867,14 +3224,18 @@ impl<'a> FunctionLowerer<'a> {
                         lowered
                     }
                 };
-                self.emit_temp(IrExpr {
-                    kind: IrExprKind::Call {
-                        callee: Box::new(callee),
-                        args: lowered_args,
-                        kind,
+                self.finish_borrowing_call(
+                    IrExpr {
+                        kind: IrExprKind::Call {
+                            callee: Box::new(callee),
+                            args: lowered_args,
+                            kind,
+                        },
+                        ty,
                     },
-                    ty,
-                })
+                    first_argument_temp,
+                    deferred_safepoint,
+                )
             }
             ExprKind::Array(values) => {
                 let values = values
@@ -3029,7 +3390,9 @@ impl<'a> FunctionLowerer<'a> {
                     },
                     ty: ty.clone(),
                 };
-                if ir_type_is_owned(&ty) {
+                if ir_expr_is_borrowed(&field) {
+                    Ok(field)
+                } else if ir_type_is_owned(&ty) {
                     // A value-position field read is a BORROW: it must leave the
                     // struct intact for later reads and for the struct's own drop.
                     // Cloning yields an independent value that satisfies both. A
@@ -3201,6 +3564,15 @@ impl<'a> FunctionLowerer<'a> {
         expr: &Expr,
         expected: Option<&IrType>,
     ) -> KuResult<IrExpr> {
+        self.lower_expr_with_expected_impl(expr, expected, None)
+    }
+
+    fn lower_expr_with_expected_impl(
+        &mut self,
+        expr: &Expr,
+        expected: Option<&IrType>,
+        deferred_safepoint: Option<&mut bool>,
+    ) -> KuResult<IrExpr> {
         if let (ExprKind::Call { callee, args }, Some(IrType::Result(expected_inner))) =
             (&expr.kind, expected)
         {
@@ -3216,17 +3588,20 @@ impl<'a> FunctionLowerer<'a> {
                     } else {
                         self.lower_expr(&args[0])?
                     };
-                    return self.emit_temp(IrExpr {
-                        kind: IrExprKind::Call {
-                            callee: Box::new(IrExpr {
-                                kind: IrExprKind::Local(name.clone()),
-                                ty: IrType::Function,
-                            }),
-                            args: vec![value],
-                            kind: IrCallKind::Intrinsic(name.clone()),
+                    return self.emit_temp_for_borrow_result(
+                        IrExpr {
+                            kind: IrExprKind::Call {
+                                callee: Box::new(IrExpr {
+                                    kind: IrExprKind::Local(name.clone()),
+                                    ty: IrType::Function,
+                                }),
+                                args: vec![value],
+                                kind: IrCallKind::Intrinsic(name.clone()),
+                            },
+                            ty: IrType::Result(expected_inner.clone()),
                         },
-                        ty: IrType::Result(expected_inner.clone()),
-                    });
+                        deferred_safepoint,
+                    );
                 }
             }
         }
@@ -3249,7 +3624,7 @@ impl<'a> FunctionLowerer<'a> {
             };
             return self.lower_closure_literal(params, body, expr.span, expected_params);
         }
-        self.lower_expr(expr)
+        self.lower_expr_impl(expr, deferred_safepoint)
     }
 
     /// Resolve the cell pointer a newly-created nested closure must retain.
@@ -3376,6 +3751,7 @@ impl<'a> FunctionLowerer<'a> {
             ir_params.push(IrParam {
                 name: param.name.clone(),
                 ty,
+                mode: param.mode,
             });
         }
 
@@ -3428,6 +3804,7 @@ impl<'a> FunctionLowerer<'a> {
         let cid = FunctionId(self.next_function_id.get());
         self.next_function_id.set(cid.0 + 1);
         let param_types = ir_params.iter().map(|param| param.ty.clone()).collect();
+        let param_modes = ir_params.iter().map(|param| param.mode).collect();
         self.lifted_functions.borrow_mut().push(IrFunction {
             id: cid,
             name: format!("__ku_closure_{}", cid.0),
@@ -3445,6 +3822,7 @@ impl<'a> FunctionLowerer<'a> {
             },
             ty: IrType::Closure {
                 params: param_types,
+                param_modes,
                 ret: Box::new(return_type),
             },
         })
@@ -3480,6 +3858,7 @@ impl<'a> FunctionLowerer<'a> {
             ir_params.push(IrParam {
                 name: param.name.clone(),
                 ty: lower_optional_type(&param.ty, self.layouts),
+                mode: param.mode,
             });
         }
         let param_types = ir_params
@@ -3523,8 +3902,10 @@ impl<'a> FunctionLowerer<'a> {
         }
         // Wire self-recursion: a call to `name` in the body reuses the running env.
         child.self_recurse = Some((name.clone(), cid, return_type.clone()));
+        child.self_param_modes = ir_params.iter().map(|p| p.mode).collect();
         child.lower_block_body("entry", &function.body, function.span, &function.params)?;
 
+        let param_modes = ir_params.iter().map(|p| p.mode).collect();
         self.lifted_functions.borrow_mut().push(IrFunction {
             id: cid,
             name: format!("__ku_closure_{}", cid.0),
@@ -3538,6 +3919,7 @@ impl<'a> FunctionLowerer<'a> {
         // Bind the name in the enclosing scope as a first-class closure value.
         let closure_ty = IrType::Closure {
             params: param_types,
+            param_modes,
             ret: Box::new(return_type),
         };
         let value = self.emit_temp(IrExpr {
@@ -3567,6 +3949,27 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn emit_temp(&mut self, value: IrExpr) -> KuResult<IrExpr> {
+        self.emit_temp_with_safepoint(value, true)
+    }
+
+    fn emit_temp_for_borrow_result(
+        &mut self,
+        value: IrExpr,
+        deferred_safepoint: Option<&mut bool>,
+    ) -> KuResult<IrExpr> {
+        if let Some(deferred) = deferred_safepoint {
+            *deferred |= ir_expr_needs_post_call_safepoint(&value);
+            self.emit_temp_with_safepoint(value, false)
+        } else {
+            self.emit_temp(value)
+        }
+    }
+
+    fn emit_temp_with_safepoint(
+        &mut self,
+        value: IrExpr,
+        post_call_safepoint: bool,
+    ) -> KuResult<IrExpr> {
         // A void value (a call to a function with no return) has no result to
         // bind — binding it would emit invalid `void t0 = f(...)`. Hand the value
         // straight back; its only consumer is a statement position, which emits it
@@ -3577,7 +3980,8 @@ impl<'a> FunctionLowerer<'a> {
         let id = TempId(self.next_temp_id);
         self.next_temp_id += 1;
         let ty = value.ty.clone();
-        let needs_safepoint = ir_expr_needs_post_call_safepoint(&value);
+        let borrowed = ir_expr_is_borrowed(&value) && ir_type_is_owned(&ty);
+        let needs_safepoint = post_call_safepoint && ir_expr_needs_post_call_safepoint(&value);
         self.current.instructions.push(IrInst::Temp {
             id,
             ty: ty.clone(),
@@ -3587,7 +3991,11 @@ impl<'a> FunctionLowerer<'a> {
             self.emit_safepoint();
         }
         Ok(IrExpr {
-            kind: IrExprKind::Temp(id),
+            kind: if borrowed {
+                IrExprKind::BorrowedTemp(id)
+            } else {
+                IrExprKind::Temp(id)
+            },
             ty,
         })
     }
@@ -3609,6 +4017,18 @@ impl<'a> FunctionLowerer<'a> {
         self.finish_current();
 
         self.start_block(timeout_block, "safepoint_timeout");
+        // A timeout abandons every active argument evaluation in this frame.
+        // Release only its fresh borrowed roots before entering user finally;
+        // the ordinary success edge still keeps those roots until its call.
+        let abandoned = self
+            .pending_borrow_temporaries
+            .iter()
+            .rev()
+            .map(|pending| pending.owner.clone())
+            .collect::<Vec<_>>();
+        for owner in abandoned {
+            self.emit_borrow_temporary_drop(owner);
+        }
         let timeout_value =
             (self.return_type != IrType::Void).then(|| zero_expr(self.return_type.clone()));
         self.current.terminator = self.return_terminator(timeout_value);
@@ -3972,6 +4392,19 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn err_terminator(&mut self, result: IrExpr) -> IrTerminator {
+        let error_block = self.try_handlers.last().map(|handler| handler.error_block);
+        let aborted = self
+            .pending_borrow_temporaries
+            .iter()
+            .rev()
+            .filter(|pending| pending.error_block == error_block)
+            .map(|pending| pending.owner.clone())
+            .collect::<Vec<_>>();
+        for owner in aborted {
+            self.emit_borrow_temporary_drop(owner);
+        }
+        // Do not remove compile-time records here: the sibling success edge
+        // still owns them and emits its normal post-call cleanup.
         // The try error slot stores just the bare KuError — the part shared by
         // every Result type — so `?` operators unwrapping different Result types
         // inside one try block all target a single, consistently-typed slot
@@ -4142,10 +4575,12 @@ fn lower_type(ty: &TypeName, layouts: &IrLayoutTable) -> IrType {
         // bindings and function-typed parameters share one representation.
         TypeName::Function {
             params,
+            param_modes,
             return_type,
             ..
         } => IrType::Closure {
             params: params.iter().map(|p| lower_type(p, layouts)).collect(),
+            param_modes: param_modes.clone(),
             ret: Box::new(lower_type(return_type, layouts)),
         },
         TypeName::Union(_) => IrType::Unknown,
@@ -4236,10 +4671,12 @@ fn lower_layout_type(ty: &Option<TypeName>, enum_names: &HashSet<String>) -> IrT
             TypeName::Result(inner) => IrType::Result(Box::new(lower(inner, enum_names))),
             TypeName::Function {
                 params,
+                param_modes,
                 return_type,
                 ..
             } => IrType::Closure {
                 params: params.iter().map(|p| lower(p, enum_names)).collect(),
+                param_modes: param_modes.clone(),
                 ret: Box::new(lower(return_type, enum_names)),
             },
             TypeName::Union(_) => IrType::Unknown,

@@ -11,6 +11,24 @@ Ku 的用户级并发模型保持简单：业务代码通过 `async fn` 启动�
 - `await task?` 等价于 `(await task)?`。
 - HTTP server 内部可以使用 task，但普通 handler 不需要管理 task。
 
+## 同步只读借用与 async
+
+`&name: T` 的借用期只覆盖当前同步调用。第一版 `async fn` 不能直接声明 borrowed 参数，checker 返回 E0913；不会根据参数是否出现在第一个 `await` 之前放宽规则。借用值也不能进入闭包捕获或 task frame。
+
+async 函数可以拥有普通参数，并在函数内部调用同步借用函数。例如解释器可执行：
+
+```ku
+fn Count(&text: str): int { return text.len() }
+
+async fn CountLater(text: str): int! {
+    return ok(Count(text))
+}
+```
+
+同步调用结束后借用即结束；后续 `await` 不会携带这份借用。async 函数也可以拥有 `fn(&str): int` 类型的同步 callback 值，这与 async 函数自身声明 `&` 参数不同。callback 的捕获与同次调用的重叠仍接受普通借用冲突检查。
+
+`&` 保证不消费句柄及不通过 borrowed 根直接写透明值，不表示函数没有 I/O 或 opaque client 内部状态变化。解释器对 borrowed 读取还检查调用所在线程和 task，跨线程 / task 使用会被拒绝。它不增加用户线程、spawn、detach 或手动调度 API，Task 仍为 move-only，`await` 仍消费一次。native async ABI 的既有不支持边界保持不变。
+
 ## runtime 有界策略
 
 当前解释器 runtime 的默认边界：

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
-    ast::{BinaryOp, UnaryOp},
+    ast::{BinaryOp, ParamMode, UnaryOp},
     error::{KuError, KuResult},
     ir::{
         FunctionId, IrBlock, IrCallKind, IrCaptureSource, IrEnumLayout, IrExpr, IrExprKind,
@@ -29,15 +29,40 @@ fn closure_invoke_symbol(id: FunctionId) -> Option<String> {
 /// closure returning int is `fn__to_int`, a `(int) -> int` closure is
 /// `fn_int__to_int`. Used for both the `KuClosure_<suffix>` struct name and the
 /// `c_type` mapping.
-fn closure_signature_suffix(params: &[IrType], ret: &IrType) -> KuResult<String> {
+fn closure_signature_suffix(
+    params: &[IrType],
+    param_modes: &[ParamMode],
+    ret: &IrType,
+) -> KuResult<String> {
+    if params.len() != param_modes.len() {
+        return Err(unsupported(
+            "function parameter mode count does not match signature",
+        ));
+    }
     let mut suffix = String::from("fn");
-    for param in params {
+    for (param, mode) in params.iter().zip(param_modes) {
         suffix.push('_');
+        if *mode == ParamMode::View {
+            suffix.push_str("view_");
+        }
         suffix.push_str(&c_type_suffix(param)?);
     }
     suffix.push_str("__to_");
     suffix.push_str(&c_type_suffix(ret)?);
     Ok(suffix)
+}
+
+fn c_param_type(ty: &IrType, mode: ParamMode) -> KuResult<String> {
+    let value = c_type(ty)?;
+    if mode == ParamMode::View && is_c_owned_type(ty) {
+        Ok(if value.ends_with('*') {
+            format!("{value} const*")
+        } else {
+            format!("const {value}*")
+        })
+    } else {
+        Ok(value)
+    }
 }
 
 struct OwnedLocal {
@@ -177,6 +202,7 @@ pub fn generate_c_source_with_options(
     program: &IrProgram,
     options: &CBackendOptions,
 ) -> KuResult<String> {
+    crate::ir::verify_borrow_contract(program)?;
     for function in &program.functions {
         validate_cfg(function)?;
     }
@@ -493,10 +519,15 @@ fn emit_closure_forward_decls(out: &mut String, program: &IrProgram) -> KuResult
     collect_closure_types_program(program, &mut types);
     let mut emitted = std::collections::HashSet::new();
     for ty in &types {
-        let IrType::Closure { params, ret } = ty else {
+        let IrType::Closure {
+            params,
+            param_modes,
+            ret,
+        } = ty
+        else {
             continue;
         };
-        let suffix = closure_signature_suffix(params, ret)?;
+        let suffix = closure_signature_suffix(params, param_modes, ret)?;
         if emitted.insert(suffix.clone()) {
             out.push_str(&format!(
                 "typedef struct KuClosure_{suffix} KuClosure_{suffix};\n"
@@ -620,7 +651,7 @@ fn emit_closure_types(
     let selected: Vec<&IrType> = types
         .iter()
         .filter(|ty| match ty {
-            IrType::Closure { params, ret } => {
+            IrType::Closure { params, ret, .. } => {
                 closure_signature_is_self_contained(params, ret) == self_contained_only
             }
             _ => false,
@@ -638,17 +669,22 @@ fn emit_closure_types(
         *header_done = true;
     }
     for ty in selected {
-        let IrType::Closure { params, ret } = ty else {
+        let IrType::Closure {
+            params,
+            param_modes,
+            ret,
+        } = ty
+        else {
             continue;
         };
-        let suffix = closure_signature_suffix(params, ret)?;
+        let suffix = closure_signature_suffix(params, param_modes, ret)?;
         if !emitted.insert(suffix.clone()) {
             continue;
         }
         let mut param_list = String::from("void*");
-        for param in params {
+        for (param, mode) in params.iter().zip(param_modes) {
             param_list.push_str(", ");
-            param_list.push_str(&c_type(param)?);
+            param_list.push_str(&c_param_type(param, *mode)?);
         }
         out.push_str(&format!(
             "struct KuClosure_{suffix} {{ {} (*invoke)({}); void* env; }};\n",
@@ -783,7 +819,11 @@ fn closure_body_signature(function: &IrFunction) -> KuResult<String> {
     let mut params = String::from("void* __env");
     for param in &function.params {
         params.push_str(", ");
-        params.push_str(&format!("{} {}", c_type(&param.ty)?, c_ident(&param.name)));
+        params.push_str(&format!(
+            "{} {}",
+            c_param_type(&param.ty, param.mode)?,
+            c_ident(&param.name)
+        ));
     }
     Ok(format!(
         "{} {}({})",
@@ -841,7 +881,11 @@ fn thunk_signature(function: &IrFunction) -> KuResult<String> {
     let mut params = String::from("void* __env");
     for param in &function.params {
         params.push_str(", ");
-        params.push_str(&format!("{} {}", c_type(&param.ty)?, c_ident(&param.name)));
+        params.push_str(&format!(
+            "{} {}",
+            c_param_type(&param.ty, param.mode)?,
+            c_ident(&param.name)
+        ));
     }
     Ok(format!(
         "static {} {}__thunk({})",
@@ -895,8 +939,8 @@ fn emit_array_map_helpers(out: &mut String, program: &IrProgram) -> KuResult<()>
     let mut calls = Vec::new();
     collect_array_map_calls_program(program, &mut calls);
     let mut emitted = std::collections::HashSet::new();
-    for (in_element, params, ret) in calls {
-        let cl_suffix = closure_signature_suffix(&params, &ret)?;
+    for (in_element, params, param_modes, ret) in calls {
+        let cl_suffix = closure_signature_suffix(&params, &param_modes, &ret)?;
         if !emitted.insert(cl_suffix.clone()) {
             continue;
         }
@@ -907,7 +951,11 @@ fn emit_array_map_helpers(out: &mut String, program: &IrProgram) -> KuResult<()>
         // Each element is cloned before being handed to the mapper (identity for
         // Copy types like int): the input array keeps ownership of its elements
         // while the closure body owns the value it receives.
-        let arg = c_clone_value(&in_element, "array.data[index]")?;
+        let arg = if param_modes.first() == Some(&ParamMode::View) && is_c_owned_type(&in_element) {
+            "&array.data[index]".to_string()
+        } else {
+            c_clone_value(&in_element, "array.data[index]")?
+        };
         out.push_str(&format!(
             "static {out_array} ku_array_map_{cl_suffix}({in_array} array, KuClosure_{cl_suffix} mapper) {{\n\
              \x20 {out_array} result = {{ 0, NULL }};\n\
@@ -934,7 +982,7 @@ fn emit_array_map_helpers(out: &mut String, program: &IrProgram) -> KuResult<()>
 
 fn collect_array_map_calls_program(
     program: &IrProgram,
-    calls: &mut Vec<(IrType, Vec<IrType>, IrType)>,
+    calls: &mut Vec<(IrType, Vec<IrType>, Vec<ParamMode>, IrType)>,
 ) {
     for function in &program.functions {
         for block in &function.blocks {
@@ -948,7 +996,10 @@ fn collect_array_map_calls_program(
     }
 }
 
-fn collect_array_map_calls_expr(expr: &IrExpr, calls: &mut Vec<(IrType, Vec<IrType>, IrType)>) {
+fn collect_array_map_calls_expr(
+    expr: &IrExpr,
+    calls: &mut Vec<(IrType, Vec<IrType>, Vec<ParamMode>, IrType)>,
+) {
     if let IrExprKind::Call {
         kind: IrCallKind::Intrinsic(name),
         args,
@@ -957,10 +1008,21 @@ fn collect_array_map_calls_expr(expr: &IrExpr, calls: &mut Vec<(IrType, Vec<IrTy
     {
         if name == "array.map" {
             if let (Some(receiver), Some(mapper)) = (args.first(), args.get(1)) {
-                if let (IrType::Array(element), IrType::Closure { params, ret }) =
-                    (&receiver.ty, &mapper.ty)
+                if let (
+                    IrType::Array(element),
+                    IrType::Closure {
+                        params,
+                        param_modes,
+                        ret,
+                    },
+                ) = (&receiver.ty, &mapper.ty)
                 {
-                    calls.push(((**element).clone(), params.clone(), (**ret).clone()));
+                    calls.push((
+                        (**element).clone(),
+                        params.clone(),
+                        param_modes.clone(),
+                        (**ret).clone(),
+                    ));
                 }
             }
         }
@@ -989,7 +1051,7 @@ fn collect_closure_types_program(program: &IrProgram, types: &mut Vec<IrType>) {
 
 fn collect_closure_type(ty: &IrType, types: &mut Vec<IrType>) {
     match ty {
-        IrType::Closure { params, ret } => {
+        IrType::Closure { params, ret, .. } => {
             if !types.contains(ty) {
                 types.push(ty.clone());
             }
@@ -1062,7 +1124,9 @@ fn walk_terminator_exprs(terminator: &IrTerminator, visit: &mut dyn FnMut(&IrExp
 
 fn expr_children(expr: &IrExpr) -> Vec<&IrExpr> {
     match &expr.kind {
-        IrExprKind::Unary { expr, .. } | IrExprKind::TryUnwrap(expr) => vec![expr],
+        IrExprKind::Borrow(expr) | IrExprKind::Unary { expr, .. } | IrExprKind::TryUnwrap(expr) => {
+            vec![expr]
+        }
         IrExprKind::Binary { left, right, .. } => vec![left, right],
         IrExprKind::Call { callee, args, .. } => {
             let mut children = vec![callee.as_ref()];
@@ -1075,6 +1139,8 @@ fn expr_children(expr: &IrExpr) -> Vec<&IrExpr> {
         IrExprKind::StructLiteral { fields, .. } => fields.iter().map(|(_, v)| v).collect(),
         IrExprKind::CellLoad(inner) => vec![inner],
         IrExprKind::Literal(_)
+        | IrExprKind::BorrowedTemp(_)
+        | IrExprKind::BorrowedParam(_)
         | IrExprKind::Local(_)
         | IrExprKind::Temp(_)
         | IrExprKind::MakeClosure { .. }
@@ -1647,7 +1713,7 @@ fn collect_array_element_type(ty: &IrType, output: &mut Vec<IrType>) {
 fn collect_array_expr_types(expr: &IrExpr, output: &mut Vec<IrType>) {
     collect_array_element_type(&expr.ty, output);
     match &expr.kind {
-        IrExprKind::Unary { expr, .. } | IrExprKind::TryUnwrap(expr) => {
+        IrExprKind::Borrow(expr) | IrExprKind::Unary { expr, .. } | IrExprKind::TryUnwrap(expr) => {
             collect_array_expr_types(expr, output)
         }
         IrExprKind::Binary { left, right, .. } => {
@@ -1677,6 +1743,8 @@ fn collect_array_expr_types(expr: &IrExpr, output: &mut Vec<IrType>) {
         }
         IrExprKind::CellLoad(inner) => collect_array_expr_types(inner, output),
         IrExprKind::Literal(_)
+        | IrExprKind::BorrowedTemp(_)
+        | IrExprKind::BorrowedParam(_)
         | IrExprKind::Local(_)
         | IrExprKind::Temp(_)
         | IrExprKind::MakeClosure { .. }
@@ -1782,7 +1850,11 @@ fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
         if index > 0 || function.is_closure_body {
             out.push_str(", ");
         }
-        out.push_str(&format!("{} {}", c_type(&param.ty)?, c_ident(&param.name)));
+        out.push_str(&format!(
+            "{} {}",
+            c_param_type(&param.ty, param.mode)?,
+            c_ident(&param.name)
+        ));
     }
     out.push_str(") {\n");
     out.push_str("  if (++__ku_call_depth > KU_MAX_CALL_DEPTH) { fprintf(stderr, \"maximum call depth exceeded: %d\\n\", KU_MAX_CALL_DEPTH); exit(1); }\n");
@@ -1912,10 +1984,11 @@ fn emit_inst(
                 // value before overwriting, or a temp reused across loop iterations
                 // leaks the previous value (at first use the temp is zero-init, so
                 // the drop is a no-op).
-                let borrowed = matches!(
-                    value.kind,
-                    IrExprKind::Field { .. } | IrExprKind::Index { .. }
-                ) && c_move_place(value).ok().flatten().is_none();
+                let borrowed = crate::ir::ir_expr_is_borrowed(value)
+                    || matches!(
+                        value.kind,
+                        IrExprKind::Field { .. } | IrExprKind::Index { .. }
+                    ) && c_move_place(value).ok().flatten().is_none();
                 if borrowed {
                     out.push_str(&format!("  t{} = {};\n", id.0, c_value_expr(value)?));
                 } else {
@@ -2152,6 +2225,19 @@ fn emit_inst(
 }
 
 fn emit_expr_statement(out: &mut String, value: &IrExpr) -> KuResult<()> {
+    if let IrExprKind::Call {
+        kind: IrCallKind::Intrinsic(name),
+        args,
+        ..
+    } = &value.kind
+    {
+        if name == "__ku_drop_borrow_temp" {
+            let [owner] = args.as_slice() else {
+                return Err(unsupported("borrow temporary cleanup expects one owner"));
+            };
+            return emit_drop_expr(out, &owner.ty, &c_addressable_expr(owner)?);
+        }
+    }
     if emit_statement_intrinsic(out, value)? {
         return Ok(());
     }
@@ -2443,7 +2529,13 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
             }
         }
         IrExprKind::Local(name) => Ok(c_symbol(name)),
-        IrExprKind::Temp(id) => Ok(format!("t{}", id.0)),
+        IrExprKind::BorrowedParam(name) => Ok(if is_c_owned_type(&expr.ty) {
+            format!("(*{})", c_symbol(name))
+        } else {
+            c_symbol(name)
+        }),
+        IrExprKind::Borrow(value) => c_expr(value),
+        IrExprKind::Temp(id) | IrExprKind::BorrowedTemp(id) => Ok(format!("t{}", id.0)),
         IrExprKind::StructLiteral { name, fields } => {
             // The struct TAKES OWNERSHIP of each field value, so move it in
             // (clearing the source) rather than shallow-copying: `c_expr` would
@@ -2798,31 +2890,36 @@ fn c_value_expr(expr: &IrExpr) -> KuResult<String> {
     c_expr(expr)
 }
 
-/// Lower a call argument. Identical to [`c_value_expr`] except for how a function
-/// value is handed to the callee (Stage 6d, matching the interpreter's shared
-/// ownership):
-///   * A **named** closure binding (`Local`) is passed by *retain* — the callee
-///     receives its own ref-counted reference (`ku_closure_clone`, env rc++),
-///     while the caller keeps its binding usable for later calls and releases its
-///     own reference at scope end. The callee owns and releases its copy. This
-///     stays sound even when the callee returns/stores the argument.
-///   * A **temporary** closure (`Temp`, e.g. a fresh `(x) => ...` literal) has no
-///     other owner, so it is moved (transferred) via `c_value_expr`.
-///
-/// Every non-closure type keeps `c_value_expr`'s move/clone semantics.
+/// Borrowed arguments pass a const pointer (Copy scalars remain by value).
+/// Every Owned slot, including a function value, uses the usual move semantics.
+fn c_borrow_is_addressable(expr: &IrExpr) -> bool {
+    match &expr.kind {
+        IrExprKind::Local(_)
+        | IrExprKind::Temp(_)
+        | IrExprKind::BorrowedTemp(_)
+        | IrExprKind::BorrowedParam(_)
+        | IrExprKind::CellLoad(_) => true,
+        IrExprKind::Field { target, .. } => c_borrow_is_addressable(target),
+        _ => false,
+    }
+}
+
 fn c_arg_value_expr(expr: &IrExpr) -> KuResult<String> {
-    if let IrType::Closure { params, ret } = &expr.ty {
-        if matches!(&expr.kind, IrExprKind::Local(_) | IrExprKind::CellLoad(_)) {
-            // Checker semantics borrow a function-valued variable when it is
-            // passed. Captured variables lower to CellLoad rather than Local;
-            // retain the shared env in both cases instead of moving it out of
-            // the cell and making the next call/use dangling.
-            return Ok(format!(
-                "ku_closure_clone_{}({})",
-                closure_signature_suffix(params, ret)?,
-                c_expr(expr)?
-            ));
+    if let IrExprKind::Borrow(value) = &expr.kind {
+        if !is_c_owned_type(&value.ty) {
+            return c_expr(value);
         }
+        return match &value.kind {
+            IrExprKind::BorrowedParam(name) => Ok(c_symbol(name)),
+            _ if c_borrow_is_addressable(value) => Ok(format!("&({})", c_expr(value)?)),
+            // A lookup returns a shallow header. Its C11 compound-literal slot
+            // remains valid throughout this synchronous call, without ownership.
+            _ => Ok(format!(
+                "&(({}[]){{ {} }})[0]",
+                c_type(&value.ty)?,
+                c_expr(value)?
+            )),
+        };
     }
     c_value_expr(expr)
 }
@@ -3071,9 +3168,13 @@ fn c_type(ty: &IrType) -> KuResult<String> {
             Some(name) => c_enum_type(name),
             None => c_struct_type(name),
         }),
-        IrType::Closure { params, ret } => Ok(format!(
+        IrType::Closure {
+            params,
+            param_modes,
+            ret,
+        } => Ok(format!(
             "KuClosure_{}",
-            closure_signature_suffix(params, ret)?
+            closure_signature_suffix(params, param_modes, ret)?
         )),
         IrType::Cell(inner) => Ok(format!("KuCell_{}*", c_type_suffix(inner)?)),
         IrType::Void => Ok("void".to_string()),
@@ -4069,7 +4170,7 @@ fn collect_kuvalue_equality_array_elements_expr(expr: &IrExpr, output: &mut Vec<
 }
 
 /// Find the exact types passed to `ku_value_wrap`: object-literal values,
-/// `object.get_or` defaults, and `json.stringify` inputs. Nested array element
+/// and `object.get_or` defaults. JSON uses borrowed typed writers. Nested array element
 /// types are recorded post-order so an outer converter can call an already
 /// declared inner converter without forward declarations.
 fn collect_kuvalue_array_elements_program(program: &IrProgram, output: &mut Vec<IrType>) {
@@ -4112,19 +4213,6 @@ fn collect_kuvalue_array_elements_expr(expr: &IrExpr, output: &mut Vec<IrType>) 
             "object.get_or" => {
                 if let Some(default) = args.get(2) {
                     collect_kuvalue_array_element_type(&default.ty, output);
-                }
-            }
-            "json.stringify" => {
-                if let Some(value) = args.first() {
-                    // JSON has a borrow-only typed writer for arrays whose
-                    // elements cannot inhabit KuValue (notably user structs,
-                    // Result, enum, and closure). Only request the allocating
-                    // KuValue bridge when every nested element is boxable.
-                    if let IrType::Array(element) = &value.ty {
-                        if kuvalue_array_element_supported(element) {
-                            collect_kuvalue_array_element_type(&value.ty, output);
-                        }
-                    }
                 }
             }
             _ => {}
@@ -4507,10 +4595,9 @@ fn emit_json_typed_writer(out: &mut String, ty: &IrType, program: &IrProgram) ->
     Ok(())
 }
 
-/// Emit consuming Result wrappers for every statically-typed JSON input. Arrays
-/// already representable as KuValue retain the existing fallible boxing bridge;
-/// user structs and unsupported aggregate elements use allocation-free borrowed
-/// writers, so nested structs/arrays cannot fail code generation or double-free.
+/// Emit non-consuming Result wrappers for every statically-typed JSON input.
+/// Reuse the borrowed writers for arrays as well as structs: boxing an array
+/// here would transfer its elements and free storage still owned by the caller.
 fn emit_json_typed_stringify_helpers(out: &mut String, program: &IrProgram) -> KuResult<()> {
     let mut roots = Vec::new();
     collect_json_stringify_root_types(program, &mut roots);
@@ -4543,30 +4630,12 @@ fn emit_json_typed_stringify_helpers(out: &mut String, program: &IrProgram) -> K
     for root in &roots {
         let suffix = c_type_suffix(root)?;
         let value_type = c_type(root)?;
-        if let IrType::Array(element) = root {
-            if kuvalue_array_element_supported(element) {
-                out.push_str(&format!(
-                    "static KuResult_str ku_json_stringify_typed_{suffix}({value_type} value) {{\n\
-                     \x20 KuValue boxed = ku_v_null();\n\
-                     \x20 if (!ku_try_v_typed_array_{}(value, &boxed)) {{\n\
-                     \x20   return (KuResult_str){{ false, (KuString){{0}}, ku_json_error(\"out_of_memory\", \"json allocation failed\") }};\n\
-                     \x20 }}\n\
-                     \x20 return ku_json_stringify(boxed);\n\
-                     }}\n",
-                    c_type_suffix(element)?
-                ));
-                continue;
-            }
-        }
-
         let write_call = json_typed_write_call(root, "value", "0", "&output", "&error", program)?;
-        let drop_value = c_drop_value(root, "value")?;
         out.push_str(&format!(
             "static KuResult_str ku_json_stringify_typed_{suffix}({value_type} value) {{\n\
              \x20 KuJsonBuffer output = {{0}};\n\
              \x20 KuError error = (KuError){{0}};\n\
              \x20 bool ok = {write_call};\n\
-             \x20 {drop_value}\n\
              \x20 if (!ok) {{\n\
              \x20   ku_json_buffer_drop(&output);\n\
              \x20   if (!error.code.ptr) error = ku_json_error(\"stringify_error\", \"json stringify failed\");\n\
@@ -5724,7 +5793,6 @@ static KuResult_str ku_json_stringify(KuValue value) {
   KuJsonBuffer output = {0};
   KuError error = (KuError){0};
   bool ok = ku_json_write_value(&output, value, 0, &error);
-  ku_value_drop(&value);
   if (!ok) {
     ku_json_buffer_drop(&output);
     if (!error.code.ptr) error = ku_json_error("stringify_error", "json stringify failed");
@@ -5818,9 +5886,13 @@ fn ku_value_wrap(ty: &IrType, expr: &str) -> KuResult<String> {
         // Stage 6e-4: a function value boxed into a dynamic object is a
         // KU_FUNCTION KuValue that owns the moved closure's env reference. The
         // per-signature wrapper evaluates `expr` once (it is usually a move).
-        IrType::Closure { params, ret } => Ok(format!(
+        IrType::Closure {
+            params,
+            param_modes,
+            ret,
+        } => Ok(format!(
             "ku_v_closure_{}({expr})",
-            closure_signature_suffix(params, ret)?
+            closure_signature_suffix(params, param_modes, ret)?
         )),
         _ => Err(unsupported(format!(
             "native dynamic object cannot hold a value of type {ty}"
@@ -5845,9 +5917,13 @@ fn ku_value_borrow_wrap(ty: &IrType, expr: &str) -> KuResult<Option<String>> {
         IrType::Null => "ku_v_null()".to_string(),
         IrType::Named(name) if name == "__ku_object" => format!("ku_v_object({expr})"),
         IrType::Named(name) if name == "__ku_value" => expr.to_string(),
-        IrType::Closure { params, ret } => format!(
+        IrType::Closure {
+            params,
+            param_modes,
+            ret,
+        } => format!(
             "ku_v_closure_{}({expr})",
-            closure_signature_suffix(params, ret)?
+            closure_signature_suffix(params, param_modes, ret)?
         ),
         IrType::Array(_) => return Ok(None),
         _ => return Ok(None),
@@ -5866,10 +5942,15 @@ fn emit_closure_value_wrappers(out: &mut String, program: &IrProgram) -> KuResul
     collect_closure_types_program(program, &mut types);
     let mut emitted = false;
     for ty in &types {
-        let IrType::Closure { params, ret } = ty else {
+        let IrType::Closure {
+            params,
+            param_modes,
+            ret,
+        } = ty
+        else {
             continue;
         };
-        let suffix = closure_signature_suffix(params, ret)?;
+        let suffix = closure_signature_suffix(params, param_modes, ret)?;
         out.push_str(&format!(
             "static KuValue ku_v_closure_{suffix}(KuClosure_{suffix} c) {{ return ku_v_function((void*)c.invoke, c.env); }}\n"
         ));
@@ -5930,6 +6011,7 @@ fn collect_fs_usage_expr(expr: &IrExpr, usage: &mut FsUsage) {
             }
         }
         IrExprKind::Unary { expr, .. }
+        | IrExprKind::Borrow(expr)
         | IrExprKind::TryUnwrap(expr)
         | IrExprKind::CellLoad(expr) => collect_fs_usage_expr(expr, usage),
         IrExprKind::Binary { left, right, .. }
@@ -5947,6 +6029,8 @@ fn collect_fs_usage_expr(expr: &IrExpr, usage: &mut FsUsage) {
             }
         }
         IrExprKind::Literal(_)
+        | IrExprKind::BorrowedTemp(_)
+        | IrExprKind::BorrowedParam(_)
         | IrExprKind::Local(_)
         | IrExprKind::Temp(_)
         | IrExprKind::MakeClosure { .. }
@@ -7017,7 +7101,7 @@ fn program_uses_pg(program: &IrProgram) -> bool {
         match ty {
             IrType::Named(name) => name.starts_with("__ku_pg_"),
             IrType::Array(inner) | IrType::Result(inner) | IrType::Cell(inner) => ty_uses_pg(inner),
-            IrType::Closure { params, ret } => params.iter().any(ty_uses_pg) || ty_uses_pg(ret),
+            IrType::Closure { params, ret, .. } => params.iter().any(ty_uses_pg) || ty_uses_pg(ret),
             _ => false,
         }
     }
@@ -7051,7 +7135,7 @@ fn program_uses_mysql(program: &IrProgram) -> bool {
         match t {
             IrType::Named(name) => name.starts_with("__ku_mysql_"),
             IrType::Array(i) | IrType::Result(i) | IrType::Cell(i) => ty(i),
-            IrType::Closure { params, ret } => params.iter().any(ty) || ty(ret),
+            IrType::Closure { params, ret, .. } => params.iter().any(ty) || ty(ret),
             _ => false,
         }
     }
@@ -9242,7 +9326,7 @@ fn program_uses_native_named(program: &IrProgram, wanted: &str) -> bool {
         match t {
             IrType::Named(name) => name == wanted,
             IrType::Array(inner) | IrType::Result(inner) | IrType::Cell(inner) => ty(inner, wanted),
-            IrType::Closure { params, ret } => {
+            IrType::Closure { params, ret, .. } => {
                 params.iter().any(|param| ty(param, wanted)) || ty(ret, wanted)
             }
             _ => false,
@@ -10943,7 +11027,7 @@ fn program_uses_redis(program: &IrProgram) -> bool {
         match t {
             IrType::Named(name) => name == "__ku_redis_client",
             IrType::Array(i) | IrType::Result(i) | IrType::Cell(i) => ty(i),
-            IrType::Closure { params, ret } => params.iter().any(ty) || ty(ret),
+            IrType::Closure { params, ret, .. } => params.iter().any(ty) || ty(ret),
             _ => false,
         }
     }
@@ -12917,7 +13001,7 @@ fn program_uses_pg_client(program: &IrProgram) -> bool {
         match t {
             IrType::Named(name) => name == "__ku_pg_client",
             IrType::Array(i) | IrType::Result(i) | IrType::Cell(i) => ty(i),
-            IrType::Closure { params, ret } => params.iter().any(ty) || ty(ret),
+            IrType::Closure { params, ret, .. } => params.iter().any(ty) || ty(ret),
             _ => false,
         }
     }
@@ -14123,7 +14207,7 @@ fn ir_type_uses_http(ty: &IrType) -> bool {
         IrType::Array(inner) | IrType::Result(inner) | IrType::Cell(inner) => {
             ir_type_uses_http(inner)
         }
-        IrType::Closure { params, ret } => {
+        IrType::Closure { params, ret, .. } => {
             params.iter().any(ir_type_uses_http) || ir_type_uses_http(ret)
         }
         _ => false,
@@ -16853,12 +16937,17 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
                 let mapper = args
                     .get(1)
                     .ok_or_else(|| unsupported("native C array.map requires a mapper closure"))?;
-                let IrType::Closure { params, ret } = &mapper.ty else {
+                let IrType::Closure {
+                    params,
+                    param_modes,
+                    ret,
+                } = &mapper.ty
+                else {
                     return Err(unsupported(
                         "native C array.map requires a closure argument",
                     ));
                 };
-                let cl_suffix = closure_signature_suffix(params, ret)?;
+                let cl_suffix = closure_signature_suffix(params, param_modes, ret)?;
                 return Ok(format!(
                     "ku_array_map_{}({}, {})",
                     cl_suffix,
@@ -16976,14 +17065,14 @@ fn c_intrinsic_expr(name: &str, args: &[IrExpr], ty: &IrType) -> KuResult<String
             return Ok(format!(
                 "ku_json_stringify_typed_{}({})",
                 c_type_suffix(&value.ty)?,
-                c_value_expr(value)?
+                c_expr(value)?
             ));
         }
         // A KuValue is already boxed; other types get wrapped into one.
         let arg = if matches!(&value.ty, IrType::Named(n) if n == "__ku_value") {
-            c_value_expr(value)?
+            c_expr(value)?
         } else {
-            ku_value_wrap(&value.ty, &c_value_expr(value)?)?
+            ku_value_wrap(&value.ty, &c_expr(value)?)?
         };
         return Ok(format!("ku_json_stringify({})", arg));
     }
@@ -17197,9 +17286,13 @@ fn c_move_value(ty: &IrType, place: &str) -> KuResult<String> {
         IrType::Named(name) if name == "__ku_http_server" => Ok(place.to_string()),
         IrType::Named(name) if name == "__ku_error_type" => Ok(format!("ku_error_move(&{place})")),
         IrType::Named(name) => Ok(format!("{}(&{place})", c_named_move_function(name))),
-        IrType::Closure { params, ret } => Ok(format!(
+        IrType::Closure {
+            params,
+            param_modes,
+            ret,
+        } => Ok(format!(
             "ku_closure_move_{}(&{place})",
-            closure_signature_suffix(params, ret)?
+            closure_signature_suffix(params, param_modes, ret)?
         )),
         IrType::Int | IrType::Float | IrType::Bool | IrType::Null => Ok(place.to_string()),
         _ => Err(unsupported(format!(
@@ -17233,9 +17326,13 @@ fn c_clone_value(ty: &IrType, expression: &str) -> KuResult<String> {
         // Stage 6e: cloning a stored closure shares its captured environment by
         // bumping the env refcount (env==NULL for a Stage 6a no-capture closure
         // makes this a plain struct copy).
-        IrType::Closure { params, ret } => Ok(format!(
+        IrType::Closure {
+            params,
+            param_modes,
+            ret,
+        } => Ok(format!(
             "ku_closure_clone_{}({expression})",
-            closure_signature_suffix(params, ret)?
+            closure_signature_suffix(params, param_modes, ret)?
         )),
         IrType::Int | IrType::Float | IrType::Bool | IrType::Null => Ok(expression.to_string()),
         _ => Err(unsupported(format!(
@@ -17350,7 +17447,11 @@ fn c_type_suffix(ty: &IrType) -> KuResult<String> {
         // Stage 8a: a closure returning `Result<T>` (e.g. an HTTP handler) needs a
         // stable suffix for its ABI struct name.
         IrType::Result(inner) => Ok(format!("result_{}", c_type_suffix(inner)?)),
-        IrType::Closure { params, ret } => closure_signature_suffix(params, ret),
+        IrType::Closure {
+            params,
+            param_modes,
+            ret,
+        } => closure_signature_suffix(params, param_modes, ret),
         IrType::Cell(inner) => Ok(format!("cell_{}", c_type_suffix(inner)?)),
         _ => Err(unsupported(format!(
             "native C prototype does not support arrays of {ty}"
@@ -17380,7 +17481,7 @@ fn collect_owned_locals(
 ) -> Vec<OwnedLocal> {
     let mut locals = Vec::new();
     for param in &function.params {
-        if is_c_owned_type(&param.ty) {
+        if param.mode == ParamMode::Owned && is_c_owned_type(&param.ty) {
             locals.push(OwnedLocal {
                 source_name: param.name.clone(),
                 name: c_ident(&param.name),
@@ -17405,10 +17506,11 @@ fn collect_owned_locals(
                     // own deep-drop will skip the cleared field). Only reads the
                     // backend leaves as shallow copies — array/object index reads —
                     // are true aliases whose drop must be skipped.
-                    borrowed: matches!(
-                        value.kind,
-                        IrExprKind::Index { .. } | IrExprKind::Field { .. }
-                    ) && c_move_place(value).ok().flatten().is_none(),
+                    borrowed: crate::ir::ir_expr_is_borrowed(value)
+                        || matches!(
+                            value.kind,
+                            IrExprKind::Index { .. } | IrExprKind::Field { .. }
+                        ) && c_move_place(value).ok().flatten().is_none(),
                 }),
                 IrInst::BindOk { id, ty, .. } if is_c_owned_type(ty) => locals.push(OwnedLocal {
                     source_name: format!("%t{}", id.0),

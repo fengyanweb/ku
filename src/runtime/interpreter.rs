@@ -15,9 +15,9 @@ use std::{
 use crate::{
     ast::{
         is_pure_append_argument, AssignTarget, BinaryOp, Expr, ExprKind, FnDecl, FunctionParam,
-        Item, Literal, MatchPattern, Program, Stmt, UnaryOp,
+        Item, Literal, MatchPattern, ParamMode, Program, Stmt, UnaryOp,
     },
-    env::Env,
+    env::{BorrowLease, Env},
     error::{KuError, KuResult},
     lexer::Lexer,
     parser::Parser,
@@ -27,7 +27,7 @@ use crate::{
     },
     span::{Position, Span},
     stdlib,
-    value::{HttpListenerLease, Value},
+    value::{BorrowProjection, HttpListenerLease, Value},
 };
 
 const MAX_CALL_DEPTH: usize = 512;
@@ -48,6 +48,7 @@ enum Flow {
 
 struct FunctionValueCall<'a> {
     params: &'a [String],
+    param_modes: &'a [ParamMode],
     body: &'a [Stmt],
     captures: &'a Env,
     self_name: &'a Option<String>,
@@ -211,9 +212,20 @@ impl Interpreter {
                 ));
             }
 
+            let mut leases = Vec::new();
             let mut env = Env::new();
             for (param, value) in function.params.iter().zip(args) {
-                env.define(param.name.clone(), value, false, param.span)?;
+                if param.mode == ParamMode::Owned {
+                    value.require_owned_root(param.span)?;
+                }
+                let value = if param.mode == ParamMode::View {
+                    let (view, lease) = BorrowLease::temporary(value);
+                    leases.extend(lease);
+                    view
+                } else {
+                    value
+                };
+                env.define_parameter(param.name.clone(), value, false, param.span)?;
             }
 
             match self.exec_block(&function.body, &mut env, depth)? {
@@ -239,6 +251,19 @@ impl Interpreter {
         args: Vec<Value>,
         span: Span,
     ) -> KuResult<Value> {
+        if function
+            .params
+            .iter()
+            .any(|param| param.mode == ParamMode::View)
+        {
+            return Err(KuError::runtime(
+                "async functions cannot declare borrowed parameters",
+                span,
+            ));
+        }
+        for value in &args {
+            value.require_owned_root(span)?;
+        }
         let runtime = self
             .task_runtime
             .clone()
@@ -283,12 +308,22 @@ impl Interpreter {
 
     fn call_function_value(&mut self, call: FunctionValueCall<'_>) -> KuResult<Value> {
         if call.is_async {
+            if call.param_modes.contains(&ParamMode::View) {
+                return Err(KuError::runtime(
+                    "async functions cannot declare borrowed parameters",
+                    call.span,
+                ));
+            }
+            for value in &call.args {
+                value.require_owned_root(call.span)?;
+            }
             let runtime = self.task_runtime.clone().ok_or_else(|| {
                 KuError::runtime("async task runtime is not initialized", call.span)
             })?;
             let template = self.template();
             let child_runtime = runtime.clone();
             let params = call.params.to_vec();
+            let param_modes = call.param_modes.to_vec();
             let body = call.body.to_vec();
             let captures = call.captures.clone();
             let self_name = call.self_name.clone();
@@ -299,6 +334,7 @@ impl Interpreter {
                 interpreter.call_function_value_direct(
                     FunctionValueCall {
                         params: &params,
+                        param_modes: &param_modes,
                         body: &body,
                         captures: &captures,
                         self_name: &self_name,
@@ -322,6 +358,7 @@ impl Interpreter {
     ) -> KuResult<Value> {
         let FunctionValueCall {
             params,
+            param_modes,
             body,
             captures,
             self_name,
@@ -341,7 +378,7 @@ impl Interpreter {
         }
         self.call_depth += 1;
         let result = (|| -> KuResult<Value> {
-            if params.len() != args.len() {
+            if params.len() != args.len() || params.len() != param_modes.len() {
                 return Err(KuError::runtime(
                     format!(
                         "function value expects {} arguments but got {}",
@@ -352,13 +389,15 @@ impl Interpreter {
                 ));
             }
 
+            let mut leases = Vec::new();
             let mut env = captures.clone();
             env.push_scope();
             if let Some(name) = self_name {
-                env.define(
+                env.define_owned(
                     name.clone(),
                     Value::Function {
                         params: params.to_vec(),
+                        param_modes: param_modes.to_vec(),
                         body: body.to_vec(),
                         captures: captures.clone(),
                         self_name: self_name.clone(),
@@ -368,8 +407,18 @@ impl Interpreter {
                     span,
                 )?;
             }
-            for (param, value) in params.iter().zip(args) {
-                env.define(param.clone(), value, false, span)?;
+            for ((param, mode), value) in params.iter().zip(param_modes).zip(args) {
+                if *mode == ParamMode::Owned {
+                    value.require_owned_root(span)?;
+                }
+                let value = if *mode == ParamMode::View {
+                    let (view, lease) = BorrowLease::temporary(value);
+                    leases.extend(lease);
+                    view
+                } else {
+                    value
+                };
+                env.define_parameter(param.clone(), value, false, span)?;
             }
 
             let result = match self.exec_block(body, &mut env, depth)? {
@@ -418,7 +467,7 @@ impl Interpreter {
                 if let Some(value) = self.take_pending_fail() {
                     return Ok(Flow::Fail(value));
                 }
-                env.define(
+                env.define_owned(
                     name.clone(),
                     value,
                     *mutable && !is_constant_name(name),
@@ -435,9 +484,9 @@ impl Interpreter {
                     return Ok(Flow::Fail(value));
                 }
                 if env.contains(name) {
-                    env.assign(name, value, *span)?;
+                    env.assign_owned(name, value, *span)?;
                 } else {
-                    env.define(name.clone(), value, !is_constant_name(name), *span)?;
+                    env.define_owned(name.clone(), value, !is_constant_name(name), *span)?;
                 }
                 Ok(Flow::Continue)
             }
@@ -499,9 +548,9 @@ impl Interpreter {
                         continue;
                     };
                     if env.contains(name) {
-                        env.assign(name, value, *span)?;
+                        env.assign_owned(name, value, *span)?;
                     } else {
-                        env.define(name.clone(), value, !is_constant_name(name), *span)?;
+                        env.define_owned(name.clone(), value, !is_constant_name(name), *span)?;
                     }
                 }
                 Ok(Flow::Continue)
@@ -572,6 +621,7 @@ impl Interpreter {
                     return Ok(Flow::Fail(value));
                 }
                 match iterable {
+                    Value::Borrowed(_) => return Err(KuError::runtime("for over a borrowed value is not supported; clone to create an owned iterable", *span)),
                     Value::Array(values) => {
                         for value in values {
                             self.tick(*span)?;
@@ -629,11 +679,13 @@ impl Interpreter {
                     .collect::<Vec<_>>();
                 let body = function.body.clone();
                 let capture_names = function_capture_names(function);
+                env.check_capture(&capture_names, function.span)?;
                 let captures = env.capture(&capture_names);
-                env.define(
+                env.define_owned(
                     function.name.clone(),
                     Value::Function {
                         params,
+                        param_modes: function.params.iter().map(|param| param.mode).collect(),
                         body,
                         captures,
                         self_name: Some(function.name.clone()),
@@ -655,7 +707,7 @@ impl Interpreter {
                 if let Flow::Fail(value) = flow {
                     if let Some(name) = catch_name {
                         env.push_scope();
-                        env.define(name.clone(), value, false, *span)?;
+                        env.define_owned(name.clone(), value, false, *span)?;
                         flow = Flow::Continue;
                         for stmt in catch_body {
                             flow = self.exec_stmt(stmt, env, depth)?;
@@ -674,11 +726,12 @@ impl Interpreter {
                 }
                 Ok(flow)
             }
-            Stmt::Fail { value, .. } => {
+            Stmt::Fail { value, span } => {
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
                     return Ok(Flow::Fail(value));
                 }
+                value.require_owned_root(*span)?;
                 Ok(Flow::Fail(normalize_error_value(value)))
             }
             Stmt::Panic { value, span } => {
@@ -688,7 +741,7 @@ impl Interpreter {
                 }
                 Err(KuError::runtime(format!("panic: {value}"), *span))
             }
-            Stmt::Return { value, .. } => {
+            Stmt::Return { value, span } => {
                 let value = match value {
                     Some(value) => self.eval(value, env, depth)?,
                     None => Value::Null,
@@ -696,10 +749,12 @@ impl Interpreter {
                 if let Some(value) = self.take_pending_fail() {
                     return Ok(Flow::Fail(value));
                 }
+                value.require_owned_root(*span)?;
                 Ok(Flow::Return(value))
             }
             Stmt::Print { value, span } => {
-                let value = self.eval(value, env, depth)?;
+                let mut leases = Vec::new();
+                let value = self.eval_read_argument(value, env, depth, &mut leases)?;
                 if let Some(value) = self.take_pending_fail() {
                     return Ok(Flow::Fail(value));
                 }
@@ -752,6 +807,7 @@ impl Interpreter {
         }
         let Value::Function {
             params,
+            param_modes,
             body,
             captures,
             self_name,
@@ -771,6 +827,7 @@ impl Interpreter {
             self.tick(span)?;
             mapped.push(self.call_function_value(FunctionValueCall {
                 params: &params,
+                param_modes: &param_modes,
                 body: &body,
                 captures: &captures,
                 self_name: &self_name,
@@ -781,6 +838,268 @@ impl Interpreter {
             })?);
         }
         Ok(Value::Array(mapped))
+    }
+
+    fn eval_borrow_argument(
+        &mut self,
+        expr: &Expr,
+        env: &mut Env,
+        depth: usize,
+        leases: &mut Vec<BorrowLease>,
+    ) -> KuResult<Value> {
+        match &expr.kind {
+            ExprKind::Variable(name) if env.contains(name) => {
+                self.tick(expr.span)?;
+                let (value, lease) = env.borrow(name, expr.span)?;
+                leases.extend(lease);
+                return Ok(value);
+            }
+            ExprKind::Field { target, name } if !matches!(&target.kind, ExprKind::Variable(name) if !env.contains(name)) =>
+            {
+                self.tick(expr.span)?;
+                let target = self.eval_borrow_argument(target, env, depth, leases)?;
+                return field_value(&target, name, expr.span);
+            }
+            ExprKind::Index { target, index } => {
+                self.tick(expr.span)?;
+                let target = self.eval_borrow_argument(target, env, depth, leases)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
+                let index = self.eval(index, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
+                return eval_index_value(&target, index, expr.span, false);
+            }
+            _ => {}
+        }
+        let value = self.eval(expr, env, depth)?;
+        let (value, lease) = BorrowLease::temporary(value);
+        leases.extend(lease);
+        Ok(value)
+    }
+
+    /// Builtin read helpers run synchronously and cannot retain their arguments.
+    /// An owned temporary can therefore stay directly in the argument vector;
+    /// only addressable sources/projections need a guarded read view.
+    fn eval_read_argument(
+        &mut self,
+        expr: &Expr,
+        env: &mut Env,
+        depth: usize,
+        leases: &mut Vec<BorrowLease>,
+    ) -> KuResult<Value> {
+        if matches!(&expr.kind, ExprKind::Variable(name) if env.contains(name))
+            || matches!(expr.kind, ExprKind::Field { .. } | ExprKind::Index { .. })
+        {
+            return self.eval_borrow_argument(expr, env, depth, leases);
+        }
+        self.eval(expr, env, depth)
+    }
+
+    fn eval_call_arguments(
+        &mut self,
+        args: &[Expr],
+        modes: &[ParamMode],
+        env: &mut Env,
+        depth: usize,
+        leases: &mut Vec<BorrowLease>,
+    ) -> KuResult<Vec<Value>> {
+        // Reject either argument order before evaluating effects. Paths are
+        // deliberately conservative at the root, matching the checker contract.
+        if modes.contains(&ParamMode::View) && modes.contains(&ParamMode::Owned) {
+            let mut roots = HashMap::<String, u8>::new();
+            for (index, arg) in args.iter().enumerate() {
+                if let Some(root) = assignment_expr_root(arg) {
+                    let mode = if modes.get(index) == Some(&ParamMode::View) {
+                        1
+                    } else {
+                        2
+                    };
+                    let previous = roots.entry(root.clone()).or_default();
+                    *previous |= mode;
+                    if *previous == 3
+                        && env.contains(&root)
+                        && env
+                            .with_value(&root, arg.span, |value| Ok(value.copy_value().is_none()))?
+                    {
+                        return Err(KuError::runtime(
+                            "borrow conflicts with move in the same call",
+                            arg.span,
+                        ));
+                    }
+                }
+            }
+        }
+        let mut values = Vec::with_capacity(args.len());
+        for (index, arg) in args.iter().enumerate() {
+            let value = if modes.get(index) == Some(&ParamMode::View) {
+                self.eval_borrow_argument(arg, env, depth, leases)?
+            } else {
+                let value = self.eval(arg, env, depth)?;
+                value.require_owned_root(arg.span)?;
+                value
+            };
+            values.push(value);
+            if self.pending_fail.is_some() {
+                break;
+            }
+        }
+        Ok(values)
+    }
+
+    fn eval_readonly_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        env: &mut Env,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<Option<Value>> {
+        // These direct helpers cannot execute Ku code or acquire another
+        // binding. Keep bootstrap length and character tests allocation-free.
+        if let ExprKind::Variable(name) = &callee.kind {
+            if name == "len" && !env.contains(name) && !self.functions.contains_key(name) {
+                if let [arg] = args {
+                    if let ExprKind::Variable(local) = &arg.kind {
+                        if env.contains(local) {
+                            self.tick(arg.span)?;
+                            return env.with_value(local, arg.span, |value| {
+                                value.with_read(span, |value| {
+                                    stdlib::eval_builtin(name, std::slice::from_ref(value), span)
+                                })
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if let ExprKind::Field { target, name } = &callee.kind {
+            if let ExprKind::Variable(local) = &target.kind {
+                if env.contains(local) && args.is_empty() {
+                    let result = env.with_value(local, target.span, |value| {
+                        value.with_read(span, |value| Ok(readonly_length(value, name)))
+                    })?;
+                    if result.is_some() {
+                        self.tick(target.span)?;
+                        return Ok(result);
+                    }
+                }
+                if !env.contains(local) && stdlib::metadata::is_std_module(local) {
+                    if let Some(full_name) = readonly_dotted_name(local, name) {
+                        if let [arg] = args {
+                            if let ExprKind::Variable(argument) = &arg.kind {
+                                if env.contains(argument) {
+                                    if stdlib::metadata::module_requires_import(local)
+                                        && !self.std_modules.contains(local)
+                                    {
+                                        return Err(KuError::runtime(
+                                            format!(
+                                                "std module '{local}' must be imported before use"
+                                            ),
+                                            span,
+                                        ));
+                                    }
+                                    self.tick(arg.span)?;
+                                    return env.with_value(argument, arg.span, |value| {
+                                        eval_readonly_builtin(
+                                            full_name,
+                                            std::slice::from_ref(value),
+                                            span,
+                                        )
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let ExprKind::Literal(Literal::String(text)) = &target.kind {
+                if matches!(name.as_str(), "contains" | "starts_with" | "ends_with") {
+                    if let [arg] = args {
+                        if let ExprKind::Variable(local) = &arg.kind {
+                            if env.contains(local) {
+                                self.tick(target.span)?;
+                                self.tick(arg.span)?;
+                                return env.with_value(local, arg.span, |value| {
+                                    value.with_read(span, |value| {
+                                        readonly_string_predicate(name, text, value, span).map(Some)
+                                    })
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut leases = Vec::new();
+        let mut values = Vec::new();
+        let name = match &callee.kind {
+            ExprKind::Variable(name)
+                if !env.contains(name)
+                    && !self.functions.contains_key(name)
+                    && stdlib::metadata::supports_borrowed_call(name) =>
+            {
+                name.as_str()
+            }
+            ExprKind::Field { target, name } => {
+                let module = match &target.kind {
+                    ExprKind::Variable(module)
+                        if !env.contains(module) && stdlib::metadata::is_std_module(module) =>
+                    {
+                        Some(module)
+                    }
+                    _ => None,
+                };
+                if let Some(module) = module {
+                    let Some(full_name) = readonly_dotted_name(module, name) else {
+                        return Ok(None);
+                    };
+                    if stdlib::metadata::module_requires_import(module)
+                        && !self.std_modules.contains(module)
+                    {
+                        return Err(KuError::runtime(
+                            format!("std module '{module}' must be imported before use"),
+                            span,
+                        ));
+                    }
+                    full_name
+                } else {
+                    if !matches!(
+                        name.as_str(),
+                        "len" | "byte_len" | "is_empty" | "contains" | "starts_with" | "ends_with"
+                    ) {
+                        return Ok(None);
+                    }
+                    let value = self.eval_read_argument(target, env, depth, &mut leases)?;
+                    if self.pending_fail.is_some() {
+                        return Ok(Some(Value::Null));
+                    }
+                    let full_name = value.with_read(span, |value| {
+                        Ok(match value {
+                            Value::String(_) => readonly_dotted_name("string", name),
+                            Value::Array(_) => readonly_dotted_name("array", name),
+                            _ => None,
+                        })
+                    })?;
+                    let Some(full_name) = full_name else {
+                        return Ok(None);
+                    };
+                    values.push(value);
+                    full_name
+                }
+            }
+            _ => return Ok(None),
+        };
+        for arg in args {
+            values.push(self.eval_read_argument(arg, env, depth, &mut leases)?);
+            if self.pending_fail.is_some() {
+                return Ok(Some(Value::Null));
+            }
+        }
+        eval_readonly_builtin(name, &values, span)
     }
 
     fn eval_std_method_call(
@@ -796,26 +1115,6 @@ impl Interpreter {
         };
         if let ExprKind::Variable(module) = &target.kind {
             if stdlib::metadata::is_std_module(module) && !env.contains(module) {
-                // Keep the dotted spelling as cheap as the method spelling:
-                // evaluating a string variable normally clones all its bytes.
-                if module == "string" && name == "byte_len" {
-                    if let [arg] = args {
-                        if let ExprKind::Variable(local) = &arg.kind {
-                            if env.contains(local) {
-                                let length = env.with_value(local, arg.span, |value| {
-                                    Ok(match value {
-                                        Value::String(text) => Some(Value::Int(text.len() as i64)),
-                                        _ => None,
-                                    })
-                                })?;
-                                if length.is_some() {
-                                    self.tick(arg.span)?;
-                                    return Ok(length);
-                                }
-                            }
-                        }
-                    }
-                }
                 return Ok(None);
             }
         }
@@ -824,37 +1123,20 @@ impl Interpreter {
                 return Ok(None);
             }
         }
-        if args.is_empty() && matches!(name.as_str(), "len" | "byte_len" | "is_empty") {
-            if let ExprKind::Variable(local) = &target.kind {
-                if env.contains(local) {
-                    let length = env.with_value(local, target.span, |value| {
-                        Ok(match (value, name.as_str()) {
-                            (Value::Array(values), "len") => Some(Value::Int(values.len() as i64)),
-                            (Value::Array(values), "is_empty") => {
-                                Some(Value::Bool(values.is_empty()))
-                            }
-                            (Value::String(text), "len") => {
-                                Some(Value::Int(text.chars().count() as i64))
-                            }
-                            (Value::String(text), "byte_len") => {
-                                Some(Value::Int(text.len() as i64))
-                            }
-                            _ => None,
-                        })
-                    })?;
-                    if length.is_some() {
-                        self.tick(target.span)?;
-                        return Ok(length);
-                    }
-                }
-            }
-        }
         let target_value = self.eval(target, env, depth)?;
         if self.pending_fail.is_some() {
             return Ok(Some(Value::Null));
         }
         if name == "clone" {
             expect_runtime_arg_count("clone", args.len(), 0, span)?;
+            if matches!(target_value, Value::Borrowed(_)) {
+                return target_value.with_read(span, |value| {
+                    if value_contains_task(value) {
+                        return Err(KuError::runtime("task values cannot be cloned", span));
+                    }
+                    Ok(Some(value.clone()))
+                });
+            }
             if value_contains_task(&target_value) {
                 return Err(KuError::runtime("task values cannot be cloned", span));
             }
@@ -892,20 +1174,28 @@ impl Interpreter {
                 }
             }
         }
-        let module = match &target_value {
-            // KuValue converters win over the concrete-type modules: a value read
-            // from an object may carry any tag, so `.as_int()`/`.as_str()` must
-            // dispatch to the kuvalue path regardless of the runtime tag.
-            _ if name == "as_int" || name == "as_str" => "kuvalue",
-            Value::String(_) => "string",
-            Value::Array(_) if name != "map" => "array",
-            Value::Object(_) if name == "get_or" => "object",
-            _ => return Ok(None),
-        };
+        let module = target_value.with_read(span, |target| {
+            Ok(match target {
+                // KuValue converters win over the concrete-type modules: a value read
+                // from an object may carry any tag, so `.as_int()`/`.as_str()` must
+                // dispatch to the kuvalue path regardless of the runtime tag.
+                _ if name == "as_int" || name == "as_str" => "kuvalue",
+                Value::String(_) => "string",
+                Value::Array(_) if name != "map" => "array",
+                Value::Object(_) if name == "get_or" => "object",
+                _ => "",
+            })
+        })?;
+        if module.is_empty() {
+            return Ok(None);
+        }
+        target_value.require_owned_root(span)?;
         let mut values = Vec::with_capacity(args.len() + 1);
         values.push(target_value);
         for arg in args {
-            values.push(self.eval(arg, env, depth)?);
+            let value = self.eval(arg, env, depth)?;
+            value.require_owned_root(arg.span)?;
+            values.push(value);
             if self.pending_fail.is_some() {
                 return Ok(Some(Value::Null));
             }
@@ -1061,6 +1351,21 @@ impl Interpreter {
                 eval_binary(*op, left, right, expr.span)
             }
             ExprKind::Call { callee, args } => {
+                if let Some(value) = self.eval_readonly_call(callee, args, env, depth, expr.span)? {
+                    return Ok(value);
+                }
+                if let ExprKind::Variable(name) = &callee.kind {
+                    if let Some(function) = self.functions.get(name) {
+                        let modes = explicit_borrow_modes(function);
+                        let mut leases = Vec::new();
+                        let values =
+                            self.eval_call_arguments(args, &modes, env, depth, &mut leases)?;
+                        if self.pending_fail.is_some() {
+                            return Ok(Value::Null);
+                        }
+                        return self.call_function(name, values, expr.span, depth + 1);
+                    }
+                }
                 if let ExprKind::Field { target, name } = &callee.kind {
                     if name == "map" {
                         return self.eval_array_map(target, args, env, depth, expr.span);
@@ -1076,9 +1381,52 @@ impl Interpreter {
                 {
                     return Ok(value);
                 }
+                // Resolve a first-class callable before its arguments so the
+                // declared modes, including imported/local closures, drive reads.
+                if !matches!(&callee.kind, ExprKind::Variable(name) if !env.contains(name))
+                    && (dotted_builtin_is_shadowed(callee, env)
+                        || dotted_builtin_module(callee).is_none())
+                {
+                    let callable = self.eval(callee, env, depth)?;
+                    return callable.with_read(expr.span, |callable| {
+                        let Value::Function {
+                            params,
+                            param_modes,
+                            body,
+                            captures,
+                            self_name,
+                            is_async,
+                        } = callable
+                        else {
+                            return Err(KuError::runtime(
+                                format!("cannot call {}", callable.type_name()),
+                                callee.span,
+                            ));
+                        };
+                        let mut leases = Vec::new();
+                        let values =
+                            self.eval_call_arguments(args, param_modes, env, depth, &mut leases)?;
+                        if self.pending_fail.is_some() {
+                            return Ok(Value::Null);
+                        }
+                        self.call_function_value(FunctionValueCall {
+                            params,
+                            param_modes,
+                            body,
+                            captures,
+                            self_name,
+                            is_async: *is_async,
+                            args: values,
+                            span: expr.span,
+                            depth: depth + 1,
+                        })
+                    });
+                }
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args {
-                    values.push(self.eval(arg, env, depth)?);
+                    let value = self.eval(arg, env, depth)?;
+                    value.require_owned_root(arg.span)?;
+                    values.push(value);
                     if self.pending_fail.is_some() {
                         return Ok(Value::Null);
                     }
@@ -1121,12 +1469,14 @@ impl Interpreter {
                 match callee_value {
                     Value::Function {
                         params,
+                        param_modes,
                         body,
                         captures,
                         self_name,
                         is_async,
                     } => self.call_function_value(FunctionValueCall {
                         params: &params,
+                        param_modes: &param_modes,
                         body: &body,
                         captures: &captures,
                         self_name: &self_name,
@@ -1141,17 +1491,24 @@ impl Interpreter {
                     )),
                 }
             }
-            ExprKind::Function { params, body, .. } => Ok(Value::Function {
-                params: params.iter().map(|param| param.name.clone()).collect(),
-                body: body.clone(),
-                captures: env.capture(&closure_capture_names(params, body)),
-                self_name: None,
-                is_async: false,
-            }),
+            ExprKind::Function { params, body, .. } => {
+                let names = closure_capture_names(params, body);
+                env.check_capture(&names, expr.span)?;
+                Ok(Value::Function {
+                    params: params.iter().map(|param| param.name.clone()).collect(),
+                    param_modes: params.iter().map(|param| param.mode).collect(),
+                    body: body.clone(),
+                    captures: env.capture(&names),
+                    self_name: None,
+                    is_async: false,
+                })
+            }
             ExprKind::Array(values) => {
                 let mut result = Vec::with_capacity(values.len());
                 for value in values {
-                    result.push(self.eval(value, env, depth)?);
+                    let evaluated = self.eval(value, env, depth)?;
+                    evaluated.require_owned_root(value.span)?;
+                    result.push(evaluated);
                     if self.pending_fail.is_some() {
                         return Ok(Value::Null);
                     }
@@ -1209,6 +1566,23 @@ impl Interpreter {
                     return Ok(Value::Null);
                 }
                 match target {
+                    Value::Borrowed(view) => {
+                        let present = view.with_read(expr.span, |value| match value {
+                            Value::Null => Ok(false),
+                            Value::Struct { fields, .. } | Value::Object(fields) => {
+                                Ok(fields.contains_key(name))
+                            }
+                            value => Err(KuError::runtime(
+                                format!("type error: {} has no fields", value.type_name()),
+                                expr.span,
+                            )),
+                        })?;
+                        if present {
+                            view.project(BorrowProjection::Field(name.clone()), expr.span)
+                        } else {
+                            Ok(Value::Null)
+                        }
+                    }
                     Value::Null => Ok(Value::Null),
                     Value::Struct { fields, .. } | Value::Object(fields) => {
                         Ok(fields.get(name).cloned().unwrap_or(Value::Null))
@@ -1222,7 +1596,9 @@ impl Interpreter {
             ExprKind::StructLiteral { name, fields } => {
                 let mut values = HashMap::new();
                 for (field, value) in fields {
-                    values.insert(field.clone(), self.eval(value, env, depth)?);
+                    let evaluated = self.eval(value, env, depth)?;
+                    evaluated.require_owned_root(value.span)?;
+                    values.insert(field.clone(), evaluated);
                     if self.pending_fail.is_some() {
                         return Ok(Value::Null);
                     }
@@ -1235,7 +1611,9 @@ impl Interpreter {
             ExprKind::ObjectLiteral { fields } => {
                 let mut values = HashMap::new();
                 for (field, value) in fields {
-                    values.insert(field.clone(), self.eval(value, env, depth)?);
+                    let evaluated = self.eval(value, env, depth)?;
+                    evaluated.require_owned_root(value.span)?;
+                    values.insert(field.clone(), evaluated);
                     if self.pending_fail.is_some() {
                         return Ok(Value::Null);
                     }
@@ -1289,6 +1667,10 @@ impl Interpreter {
                     return Ok(Value::Null);
                 }
                 match value {
+                    Value::Borrowed(_) => Err(KuError::runtime(
+                        "cannot unwrap a borrowed Result; clone to create an owned value",
+                        expr.span,
+                    )),
                     Value::Result { ok: true, value } => Ok(*value),
                     Value::Result { ok: false, value } => {
                         self.pending_fail = Some(*value);
@@ -1411,6 +1793,7 @@ impl Interpreter {
         depth: usize,
         span: Span,
     ) -> KuResult<()> {
+        source.require_owned_root(span)?;
         let Value::Object(mut fields) = source else {
             return Err(KuError::runtime(
                 format!(
@@ -1438,9 +1821,9 @@ impl Interpreter {
             }
             if let Some(local) = &binding.local {
                 if env.contains(local) {
-                    env.assign(local, value, binding.span)?;
+                    env.assign_owned(local, value, binding.span)?;
                 } else {
-                    env.define(local.clone(), value, !is_constant_name(local), binding.span)?;
+                    env.define_owned(local.clone(), value, !is_constant_name(local), binding.span)?;
                 }
             }
         }
@@ -1449,9 +1832,9 @@ impl Interpreter {
         {
             let value = Value::Object(fields);
             if env.contains(local) {
-                env.assign(local, value, rest.span)?;
+                env.assign_owned(local, value, rest.span)?;
             } else {
-                env.define(local.clone(), value, !is_constant_name(local), rest.span)?;
+                env.define_owned(local.clone(), value, !is_constant_name(local), rest.span)?;
             }
         }
         Ok(())
@@ -1503,7 +1886,7 @@ impl Interpreter {
     ) -> KuResult<Flow> {
         env.push_scope();
         let result = (|| -> KuResult<Flow> {
-            env.define(name.to_string(), value, true, span)?;
+            env.define_owned(name.to_string(), value, true, span)?;
             let mut loop_flow = Flow::Continue;
             for stmt in body {
                 loop_flow = self.exec_stmt(stmt, env, depth)?;
@@ -1525,18 +1908,25 @@ impl Interpreter {
         depth: usize,
         span: Span,
     ) -> KuResult<()> {
+        value.require_owned_root(span)?;
         match target {
-            AssignTarget::Variable(name) => env.assign(name, value, span),
+            AssignTarget::Variable(name) => env.assign_owned(name, value, span),
             AssignTarget::Index { .. } | AssignTarget::Field { .. } => {
                 let root = assignment_target_root(target).ok_or_else(|| {
                     KuError::runtime("assignment target must start with a variable", span)
                 })?;
                 let mut root_value = env.get(&root, span)?;
+                if matches!(root_value, Value::Borrowed(_)) {
+                    return Err(KuError::runtime(
+                        "cannot modify through borrowed parameter",
+                        span,
+                    ));
+                }
                 self.assign_into_target(&mut root_value, target, value, env, depth, span)?;
                 if self.pending_fail.is_some() {
                     return Ok(());
                 }
-                env.assign(&root, root_value, span)
+                env.assign_owned(&root, root_value, span)
             }
         }
     }
@@ -1618,7 +2008,7 @@ impl Interpreter {
                 }
                 let left = env.get(name, span)?;
                 let value = eval_binary(op, left, right, span)?;
-                env.assign(name, value, span)
+                env.assign_owned(name, value, span)
             }
             AssignTarget::Index { .. } | AssignTarget::Field { .. } => {
                 let root = assignment_target_root(target).ok_or_else(|| {
@@ -1636,7 +2026,7 @@ impl Interpreter {
                 if self.pending_fail.is_some() {
                     return Ok(());
                 }
-                env.assign(&root, root_value, span)
+                env.assign_owned(&root, root_value, span)
             }
         }
     }
@@ -1687,6 +2077,7 @@ impl Interpreter {
                     .iter()
                     .map(|param| param.name.clone())
                     .collect(),
+                param_modes: function.params.iter().map(|param| param.mode).collect(),
                 body: function.body.clone(),
                 captures: Env::new(),
                 self_name: Some(function.name.clone()),
@@ -1840,7 +2231,7 @@ impl Interpreter {
                 target.span,
             ));
         };
-        env.assign(&root, service.clone(), span)?;
+        env.assign_owned(&root, service.clone(), span)?;
         Ok(Some(Value::Null))
     }
 
@@ -2011,6 +2402,7 @@ impl Interpreter {
     ) -> KuResult<Value> {
         let Value::Function {
             params,
+            param_modes,
             body,
             captures,
             self_name,
@@ -2037,6 +2429,7 @@ impl Interpreter {
         let previous_deadline = self.execution_deadline.replace(deadline);
         let result = self.call_function_value(FunctionValueCall {
             params: &params,
+            param_modes: &param_modes,
             body: &body,
             captures: &captures,
             self_name: &self_name,
@@ -2214,6 +2607,106 @@ fn assignment_expr_root(expr: &Expr) -> Option<String> {
     }
 }
 
+fn explicit_borrow_modes(function: &FnDecl) -> Vec<ParamMode> {
+    if function
+        .params
+        .iter()
+        .any(|param| param.mode == ParamMode::View)
+    {
+        function.params.iter().map(|param| param.mode).collect()
+    } else {
+        // Missing modes mean Owned in eval_call_arguments. Ordinary functions
+        // must not allocate a parallel mode vector on every invocation.
+        Vec::new()
+    }
+}
+
+fn readonly_length(value: &Value, name: &str) -> Option<Value> {
+    match (value, name) {
+        (Value::Array(values), "len") => Some(Value::Int(values.len() as i64)),
+        (Value::Array(values), "is_empty") => Some(Value::Bool(values.is_empty())),
+        (Value::String(text), "len") => Some(Value::Int(text.chars().count() as i64)),
+        (Value::String(text), "byte_len") => Some(Value::Int(text.len() as i64)),
+        _ => None,
+    }
+}
+
+fn readonly_dotted_name(module: &str, method: &str) -> Option<&'static str> {
+    Some(match (module, method) {
+        ("string", "len") => "string.len",
+        ("string", "byte_len") => "string.byte_len",
+        ("string", "contains") => "string.contains",
+        ("string", "starts_with") => "string.starts_with",
+        ("string", "ends_with") => "string.ends_with",
+        ("array", "len") => "array.len",
+        ("array", "is_empty") => "array.is_empty",
+        ("json", "stringify") => "json.stringify",
+        _ => return None,
+    })
+}
+
+fn readonly_string_predicate(
+    method: &str,
+    text: &str,
+    pattern: &Value,
+    span: Span,
+) -> KuResult<Value> {
+    let Value::String(pattern) = pattern else {
+        return Err(KuError::runtime(
+            "string read operation expects str arguments",
+            span,
+        ));
+    };
+    Ok(Value::Bool(match method {
+        "contains" => text.contains(pattern),
+        "starts_with" => text.starts_with(pattern),
+        "ends_with" => text.ends_with(pattern),
+        _ => unreachable!("readonly string predicate metadata"),
+    }))
+}
+
+fn eval_readonly_builtin(name: &str, values: &[Value], span: Span) -> KuResult<Option<Value>> {
+    let count = if matches!(
+        name,
+        "string.contains" | "string.starts_with" | "string.ends_with"
+    ) {
+        2
+    } else {
+        1
+    };
+    expect_runtime_arg_count(name, values.len(), count, span)?;
+    values[0].with_read(span, |first| {
+        if let Some(method) = name.strip_prefix("string.") {
+            if count == 2 {
+                return values[1].with_read(span, |second| {
+                    let Value::String(text) = first else {
+                        return Err(KuError::runtime(
+                            "string read operation expects str arguments",
+                            span,
+                        ));
+                    };
+                    readonly_string_predicate(method, text, second, span).map(Some)
+                });
+            }
+            return stdlib::string::eval(method, std::slice::from_ref(first), span);
+        }
+        if let Some(method) = name.strip_prefix("array.") {
+            return stdlib::array::eval(method, std::slice::from_ref(first), span);
+        }
+        if name == "json.stringify" {
+            return stdlib::json::eval("stringify", std::slice::from_ref(first), span);
+        }
+        if name == "print" {
+            print!("{first}");
+            std::io::stdout()
+                .flush()
+                .map_err(|err| KuError::runtime(format!("failed to flush stdout: {err}"), span))?;
+            return Ok(Some(Value::Null));
+        }
+        stdlib::eval_builtin(name, std::slice::from_ref(first), span)
+    })
+}
+
 /// `KuValue.as_int()` / `.as_str()`: convert a dynamic value read from an object
 /// to a concrete type, returning `T!` (Err on a tag mismatch).
 fn eval_kuvalue_method(name: &str, values: &[Value]) -> Option<Value> {
@@ -2245,6 +2738,34 @@ fn eval_index_value(
     span: Span,
     optional_object: bool,
 ) -> KuResult<Value> {
+    if let Value::Borrowed(view) = target {
+        return view.with_read(span, |target| {
+            let projection = index.with_read(span, |index| match (target, index) {
+                (Value::Array(values), Value::Int(index))
+                    if *index >= 0 && (*index as usize) < values.len() =>
+                {
+                    Ok(Some(BorrowProjection::Index(*index as usize)))
+                }
+                (Value::Object(fields), Value::String(name)) if fields.contains_key(name) => {
+                    Ok(Some(BorrowProjection::Field(name.clone())))
+                }
+                _ => Ok(None),
+            })?;
+            if let Some(projection) = projection {
+                let value = view.project(projection, span)?;
+                if optional_object {
+                    value.require_owned_root(span)?;
+                    return Ok(stdlib::errors::ok(value));
+                }
+                return Ok(value);
+            }
+            // Missing keys, bounds errors and string character reads preserve
+            // the original structured errors without cloning a valid element.
+            index.with_read(span, |index| {
+                eval_index_value(target, index.clone(), span, optional_object)
+            })
+        });
+    }
     if optional_object {
         // Under `?`, the checker has classified the target as KuValue. The
         // index type selects the tagged native operation: str -> object lookup,
@@ -2480,6 +3001,7 @@ fn assign_field_value(target: &mut Value, name: &str, value: Value, span: Span) 
 
 fn field_value(target: &Value, name: &str, span: Span) -> KuResult<Value> {
     match target {
+        Value::Borrowed(view) => view.project(BorrowProjection::Field(name.to_string()), span),
         Value::Struct {
             name: struct_name,
             fields,
@@ -3783,7 +4305,7 @@ fn match_pattern(
         return Ok(false);
     }
     for (name, value) in bindings {
-        env.define(name, value, false, span)?;
+        env.define_owned(name, value, false, span)?;
     }
     Ok(true)
 }
@@ -3794,6 +4316,32 @@ fn collect_match_bindings(
     bindings: &mut Vec<(String, Value)>,
     span: Span,
 ) -> KuResult<bool> {
+    if let Value::Borrowed(view) = value {
+        match pattern {
+            MatchPattern::Wildcard => return Ok(true),
+            MatchPattern::Literal(literal) => return Ok(value == &value_from_literal(literal)),
+            MatchPattern::Binding(_) => return Err(KuError::runtime("binding an owned borrowed match payload is not supported; clone to create an owned value", span)),
+            MatchPattern::EnumVariant { enum_name, variant, fields: patterns } => {
+                let matched = view.with_read(span, |value| match value {
+                    Value::Enum { name, variant: actual, fields } if name == enum_name && actual == variant => {
+                        if fields.len() != patterns.len() { return Err(KuError::runtime("match pattern field count mismatch", span)); }
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                })?;
+                if !matched { return Ok(false); }
+                let snapshot = bindings.len();
+                for (index, pattern) in patterns.iter().enumerate() {
+                    let value = view.project(BorrowProjection::EnumField(index), span)?;
+                    if !collect_match_bindings(pattern, &value, bindings, span)? {
+                        bindings.truncate(snapshot);
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+        }
+    }
     match pattern {
         MatchPattern::Wildcard => Ok(true),
         MatchPattern::Binding(name) => {
@@ -3909,6 +4457,42 @@ fn dotted_builtin_module(expr: &Expr) -> Option<&str> {
 }
 
 fn eval_binary(op: BinaryOp, left: Value, right: Value, span: Span) -> KuResult<Value> {
+    if matches!(left, Value::Borrowed(_)) || matches!(right, Value::Borrowed(_)) {
+        return left.with_read(span, |left| {
+            right.with_read(span, |right| {
+                match op {
+                    BinaryOp::Equal => return Ok(Value::Bool(left == right)),
+                    BinaryOp::NotEqual => return Ok(Value::Bool(left != right)),
+                    BinaryOp::Add => {
+                        if let (Value::String(left), Value::String(right)) = (left, right) {
+                            let mut text = String::new();
+                            let length = left.len().checked_add(right.len()).ok_or_else(|| {
+                                KuError::runtime("string concat out of memory", span)
+                            })?;
+                            text.try_reserve_exact(length).map_err(|_| {
+                                KuError::runtime("string concat out of memory", span)
+                            })?;
+                            text.push_str(left);
+                            text.push_str(right);
+                            return Ok(Value::String(text));
+                        }
+                    }
+                    _ => {}
+                }
+                if let (Some(left), Some(right)) = (left.copy_value(), right.copy_value()) {
+                    return eval_binary(op, left, right, span);
+                }
+                Err(KuError::runtime(
+                    format!(
+                        "type error: cannot apply operator to {} and {}",
+                        left.type_name(),
+                        right.type_name()
+                    ),
+                    span,
+                ))
+            })
+        });
+    }
     match op {
         BinaryOp::Add => match (left, right) {
             (Value::Int(a), Value::Int(b)) => a
@@ -4517,14 +5101,14 @@ mod collection_tests {
         ];
         for piece in failures {
             let mut env = Env::new();
-            env.define(
+            env.define_owned(
                 "values".into(),
                 Value::Array(vec![Value::Int(42)]),
                 true,
                 span,
             )
             .unwrap();
-            env.define("other".into(), Value::Array(Vec::new()), true, span)
+            env.define_owned("other".into(), Value::Array(Vec::new()), true, span)
                 .unwrap();
             let assignment = Stmt::Assign {
                 name: "values".into(),
@@ -4551,6 +5135,141 @@ mod collection_tests {
                 Ok(())
             })
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn borrowed_children_are_rejected_at_each_container_insertion_boundary() {
+        let span = Span::default();
+        for source in [
+            "[value]",
+            "{ item: value }",
+            "other.push(value)",
+            "object.get_or({}, \"missing\", value)",
+            "ok(value)",
+        ] {
+            let mut env = Env::new();
+            let (value, _lease) = BorrowLease::temporary(Value::String("borrowed".into()));
+            env.define_parameter("value".into(), value, false, span)
+                .unwrap();
+            env.define_owned("other".into(), Value::Array(Vec::new()), true, span)
+                .unwrap();
+            let expression = Parser::new(Lexer::new(source).tokenize().unwrap())
+                .parse_expression_only()
+                .unwrap();
+            let error = Interpreter::new()
+                .eval(&expression, &mut env, 0)
+                .expect_err(source);
+            assert!(
+                error.message.contains("borrowed value"),
+                "{source}: {error:?}"
+            );
+            env.with_value("other", span, |value| {
+                assert!(matches!(value, Value::Array(values) if values.is_empty()));
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn ordinary_function_modes_and_readonly_temporaries_create_no_borrow_storage() {
+        let program = Parser::new(
+            Lexer::new("fn ordinary(a: int, b: str) {} fn inspect(&value: str) {}")
+                .tokenize()
+                .unwrap(),
+        )
+        .parse_program()
+        .unwrap();
+        let Item::Function(ordinary) = &program.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(explicit_borrow_modes(ordinary).capacity(), 0);
+        let Item::Function(inspect) = &program.items[1] else {
+            panic!("expected function")
+        };
+        assert_eq!(explicit_borrow_modes(inspect), [ParamMode::View]);
+
+        let mut env = Env::new();
+        env.define_owned(
+            "ch".into(),
+            Value::String("5".into()),
+            true,
+            Span::default(),
+        )
+        .unwrap();
+        for source in [
+            r#"str("Ku")"#,
+            r#""Ku".contains("K")"#,
+            "[1, 2, 3].len()",
+            r#""0123456789".contains(ch)"#,
+        ] {
+            let expression = Parser::new(Lexer::new(source).tokenize().unwrap())
+                .parse_expression_only()
+                .unwrap();
+            let before = crate::value::borrow_roots_created();
+            for _ in 0..64 {
+                Interpreter::new().eval(&expression, &mut env, 0).unwrap();
+            }
+            assert_eq!(
+                crate::value::borrow_roots_created(),
+                before,
+                "readonly temporary/character helper must not create Arc loan roots: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_existing_binding_uses_one_guard_and_keeps_large_storage() {
+        let span = Span::default();
+        let text = "Ku".repeat(500_000);
+        let original = text.as_ptr();
+        let mut env = Env::new();
+        env.define_owned("text".into(), Value::String(text), true, span)
+            .unwrap();
+        let expression = Parser::new(Lexer::new(r#"text.contains("K")"#).tokenize().unwrap())
+            .parse_expression_only()
+            .unwrap();
+        let before = crate::value::borrow_roots_created();
+        for _ in 0..64 {
+            assert_eq!(
+                Interpreter::new().eval(&expression, &mut env, 0).unwrap(),
+                Value::Bool(true)
+            );
+            env.with_value("text", span, |value| {
+                let Value::String(text) = value else {
+                    panic!("source not restored")
+                };
+                assert_eq!(text.as_ptr(), original);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            crate::value::borrow_roots_created() - before,
+            64,
+            "borrow existing source once; keep literal needle owned without a loan"
+        );
+    }
+
+    #[test]
+    fn readonly_runtime_routes_match_the_borrow_metadata() {
+        for module in ["string", "array", "json"] {
+            for method in [
+                "len",
+                "byte_len",
+                "is_empty",
+                "contains",
+                "starts_with",
+                "ends_with",
+                "stringify",
+                "push",
+            ] {
+                assert_eq!(
+                    readonly_dotted_name(module, method).is_some(),
+                    stdlib::metadata::supports_borrowed_call(&format!("{module}.{method}"))
+                );
+            }
         }
     }
 }

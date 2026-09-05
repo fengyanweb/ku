@@ -322,6 +322,52 @@ impl KuError {
 
     fn diagnostic_info(&self) -> DiagnosticInfo {
         let message = self.message.as_str();
+        if message.contains("cannot modify through borrowed parameter") {
+            return DiagnosticInfo::new("E0910")
+                .note("borrowed parameters are read-only")
+                .help(
+                    "remove '&' if this function should take ownership and modify its parameter",
+                );
+        }
+        if message.contains("cannot move out of borrowed value") {
+            return DiagnosticInfo::new("E0911")
+                .note("a borrowed parameter does not own the value")
+                .help("use '.clone()' to create an owned value before storing or returning it");
+        }
+        if message.contains("borrowed value escapes current call") {
+            return DiagnosticInfo::new("E0912")
+                .help("clone into an owned local before creating the closure");
+        }
+        if message.contains("async functions cannot declare borrowed parameters") {
+            return DiagnosticInfo::new("E0913").help(
+                "let the async function take ownership, or clone the value before calling it",
+            );
+        }
+        if message.contains("callable parameter mode mismatch") {
+            return DiagnosticInfo::new("E0914")
+                .note("owned and borrowed function parameter modes must match exactly")
+                .help("use a function whose parameter declarations match the expected '&' modes");
+        }
+        if message.contains("cannot pass borrowed value") {
+            return DiagnosticInfo::new("E0915")
+                .help("use '.clone()' to create an owned argument, or declare the receiving parameter with '&'");
+        }
+        if message.contains("borrow conflicts with move or mutation in the same call") {
+            return DiagnosticInfo::new("E0916")
+                .help("finish the borrowing call before moving or modifying the same value");
+        }
+        if message.contains("borrowed operation is not supported") {
+            return DiagnosticInfo::new("E0917")
+                .help("call '.clone()' explicitly before this consuming operation");
+        }
+        if message.contains("'&' is not written at the call site") {
+            return DiagnosticInfo::new("E0918")
+                .help("write 'inspect(value)'; the function signature decides whether it borrows or moves");
+        }
+        if message.contains("single '&' is only allowed") || message.contains("'&' is only valid") {
+            return DiagnosticInfo::new("E0919")
+                .help("write '&name: Type' in a function declaration or '&Type' in a function type parameter slot");
+        }
         if message.contains("'let' is not supported") {
             return DiagnosticInfo::new("E0105")
                 .help("Ku declares variables by assignment, so remove `let`");
@@ -500,6 +546,42 @@ impl std::error::Error for KuError {}
 mod tests {
     use super::*;
     use crate::span::Position;
+
+    #[test]
+    fn borrow_diagnostic_codes_are_unique_and_have_actionable_help() {
+        let messages = [
+            "cannot modify through borrowed parameter 'value'",
+            "cannot move out of borrowed value rooted at 'value'",
+            "borrowed value escapes current call: cannot capture borrowed parameter 'value'",
+            "async functions cannot declare borrowed parameters",
+            "callable parameter mode mismatch",
+            "cannot pass borrowed value rooted at 'value' to owning parameter",
+            "borrow conflicts with move or mutation in the same call for 'value'",
+            "borrowed operation is not supported: for iteration",
+            "'&' is not written at the call site",
+            "single '&' is only allowed before a function parameter",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (index, message) in messages.iter().enumerate() {
+            let diagnostic =
+                KuError::runtime(*message, Span::default()).diagnostic_data("borrow.ku", "");
+            assert_eq!(diagnostic.code, format!("E{:04}", 910 + index));
+            assert!(seen.insert(diagnostic.code));
+            assert!(!diagnostic.helps.is_empty());
+        }
+        assert!(!seen.contains("E0901"));
+        assert!(!seen.contains("E0904"));
+    }
+
+    #[test]
+    fn borrow_diagnostic_text_golden_preserves_location_and_help() {
+        let error = KuError::runtime(
+            "cannot modify through borrowed parameter 'x'",
+            Span::new(Position::new(2, 5, 21), Position::new(2, 10, 26)),
+        );
+        assert_eq!(error.diagnostic("borrow.ku", "fn F(&x: int) {\n    x = 1\n}"),
+            "error[E0910]: error: cannot modify through borrowed parameter 'x'\n  --> borrow.ku:2:5\n   |\n  2 |     x = 1\n   |     ^^^^^\n   |\nnote: borrowed parameters are read-only\nhelp: remove '&' if this function should take ownership and modify its parameter");
+    }
 
     #[test]
     fn debug_redacts_diagnostic_source_text() {

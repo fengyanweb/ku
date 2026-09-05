@@ -34,6 +34,7 @@ pub(crate) enum ArgRule {
 pub(crate) struct Signature {
     pub name: String,
     pub args: Vec<ArgRule>,
+    pub arg_modes: Vec<crate::ast::ParamMode>,
     pub returns: TypePattern,
     pub abi: CallAbi,
     pub failure: FailureMode,
@@ -52,6 +53,146 @@ pub(crate) enum FailureMode {
     MayPanic,
 }
 
+/// Shared public ownership modes. Preserve existing stdlib read-only inputs and
+/// owning payload/close slots; HTTP status overloads own their final argument.
+pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamMode> {
+    use crate::ast::ParamMode::{Owned, View};
+    let registered_read_inputs = matches!(
+        name,
+        "len"
+            | "str"
+            | "println"
+            | "print"
+            | "ok"
+            | "err"
+            | "fs.read"
+            | "fs.try_read"
+            | "fs.write"
+            | "fs.try_write"
+            | "fs.exists"
+            | "fs.read_dir"
+            | "lexer.scan"
+            | "parser.parse"
+            | "string.len"
+            | "string.byte_len"
+            | "string.chars"
+            | "string.trim"
+            | "string.lower"
+            | "string.upper"
+            | "string.contains"
+            | "string.starts_with"
+            | "string.ends_with"
+            | "string.replace"
+            | "string.slice"
+            | "array.len"
+            | "array.is_empty"
+            | "array.first"
+            | "array.last"
+            | "array.try_get"
+            | "array.push"
+            | "array.concat"
+            | "object.get_or"
+            | "kuvalue.as_int"
+            | "kuvalue.as_str"
+            | "json.parse"
+            | "json.try_parse"
+            | "json.stringify"
+            | "config.env"
+            | "config.env_file"
+            | "config.yaml"
+            | "time.now"
+            | "time.instant"
+            | "time.unix"
+            | "time.millis"
+            | "time.steady_millis"
+            | "time.date"
+            | "time.elapsed"
+            | "time.from_unix"
+            | "time.from_millis"
+            | "time.is_leap"
+            | "time.days_in_month"
+            | "time.sleep"
+            | "task.stats"
+            | "task.stress"
+            | "http.get"
+            | "http.post"
+            | "http.request"
+            | "http.client"
+            | "http.service"
+            | "http.server"
+            | "http.text"
+            | "http.html"
+            | "http.json"
+            | "http.empty"
+            | "http.redirect"
+            | "http.statusText"
+            | "pg.client"
+            | "pg_client.query"
+            | "pg_client.close"
+            | "pg_result.rows"
+            | "pg_result.cols"
+            | "pg_result.value"
+            | "pg_result.is_null"
+            | "mysql.client"
+            | "mysql.query"
+            | "mysql.execute"
+            | "mysql.close"
+            | "mysql.rows"
+            | "mysql.cols"
+            | "mysql.value"
+            | "mysql.is_null"
+            | "redis.client"
+            | "redis.ping"
+            | "redis.get"
+            | "redis.del"
+            | "redis.exists"
+            | "redis.set"
+            | "redis.close"
+            | "bytes.from_str"
+            | "bytes.from_array"
+            | "bytes.len"
+            | "bytes.to_str"
+            | "bytes.get"
+            | "net.client"
+            | "net.read"
+            | "net.write"
+            | "net.close"
+    );
+    let mut modes = vec![if registered_read_inputs { View } else { Owned }; count];
+    let owned = match name {
+        "ok" | "err" | "kuvalue.as_int" | "kuvalue.as_str" | "pg_client.close" | "redis.close"
+        | "mysql.close" | "net.close" => Some(0),
+        "object.get_or" => Some(2),
+        "http.text" | "http.html" | "http.json" | "http.redirect" => count.checked_sub(1),
+        _ => None,
+    };
+    if let Some(mode) = owned.and_then(|index| modes.get_mut(index)) {
+        *mode = Owned;
+    }
+    modes
+}
+
+/// APIs audited to accept a value already borrowed from a user parameter.
+/// Existing non-consuming APIs outside this set retain their old ownership
+/// behavior but have not yet proven the no-clone, no-escape borrowed contract.
+pub(crate) fn supports_borrowed_call(name: &str) -> bool {
+    matches!(
+        name,
+        "len"
+            | "str"
+            | "print"
+            | "println"
+            | "string.len"
+            | "string.byte_len"
+            | "string.contains"
+            | "string.starts_with"
+            | "string.ends_with"
+            | "array.len"
+            | "array.is_empty"
+            | "json.stringify"
+    )
+}
+
 pub(crate) fn builtin_signature(name: &str) -> Option<Signature> {
     let args = match name {
         "len" | "str" | "ok" | "println" => vec![ArgRule::Is(TypePattern::Any)],
@@ -68,6 +209,7 @@ pub(crate) fn builtin_signature(name: &str) -> Option<Signature> {
     };
     Some(Signature {
         name: name.to_string(),
+        arg_modes: argument_modes(name, args.len()),
         args,
         returns,
         abi: CallAbi::Builtin,
@@ -220,6 +362,7 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         _ => return None,
     };
     Some(Signature {
+        arg_modes: argument_modes(&name, args.len()),
         name,
         args,
         returns,
@@ -288,6 +431,7 @@ pub(crate) fn mysql_method_signature(native: &str, function: &str) -> Option<Sig
     };
     Some(Signature {
         name: format!("mysql.{function}"),
+        arg_modes: argument_modes(&format!("mysql.{function}"), args.len()),
         args,
         returns,
         abi: CallAbi::DottedBuiltin {
@@ -327,6 +471,7 @@ pub(crate) fn redis_client_method_signature(function: &str) -> Option<Signature>
     };
     Some(Signature {
         name: format!("redis.{function}"),
+        arg_modes: argument_modes(&format!("redis.{function}"), args.len()),
         args,
         returns,
         abi: CallAbi::DottedBuiltin {
@@ -359,6 +504,7 @@ pub(crate) fn bytes_method_signature(function: &str) -> Option<Signature> {
     };
     Some(Signature {
         name: format!("bytes.{function}"),
+        arg_modes: argument_modes(&format!("bytes.{function}"), args.len()),
         args,
         returns,
         abi: CallAbi::DottedBuiltin {
@@ -392,6 +538,7 @@ pub(crate) fn net_client_method_signature(function: &str) -> Option<Signature> {
     };
     Some(Signature {
         name: format!("net.{function}"),
+        arg_modes: argument_modes(&format!("net.{function}"), args.len()),
         args,
         returns,
         abi: CallAbi::DottedBuiltin {
@@ -565,4 +712,62 @@ fn task_stress_pattern() -> TypePattern {
         ("task_workers".to_string(), TypePattern::Int),
         ("blocking_workers".to_string(), TypePattern::Int),
     ])
+}
+
+#[cfg(test)]
+mod borrow_tests {
+    use super::*;
+    use crate::ast::ParamMode::{Owned, View};
+
+    #[test]
+    fn borrow_metadata_required_readonly_modes_and_owning_exceptions() {
+        for name in ["len", "str", "println"] {
+            let signature = builtin_signature(name).unwrap();
+            assert!(supports_borrowed_call(name));
+            assert_eq!(signature.arg_modes, vec![View; signature.args.len()]);
+        }
+        for (module, functions) in [
+            (
+                "string",
+                &["len", "byte_len", "contains", "starts_with", "ends_with"][..],
+            ),
+            ("array", &["len", "is_empty"][..]),
+            ("json", &["stringify"][..]),
+        ] {
+            for function in functions {
+                let signature = dotted_signature(module, function).unwrap();
+                assert!(supports_borrowed_call(&signature.name));
+                assert_eq!(signature.arg_modes, vec![View; signature.args.len()]);
+            }
+        }
+        assert_eq!(builtin_signature("ok").unwrap().arg_modes, [Owned]);
+        assert_eq!(builtin_signature("err").unwrap().arg_modes, [Owned]);
+        assert_eq!(
+            dotted_signature("object", "get_or").unwrap().arg_modes,
+            [View, View, Owned]
+        );
+        assert_eq!(
+            dotted_signature("pg_client", "close").unwrap().arg_modes,
+            [Owned]
+        );
+        assert_eq!(
+            mysql_method_signature(MYSQL_CLIENT, "close")
+                .unwrap()
+                .arg_modes,
+            [Owned]
+        );
+        assert_eq!(
+            redis_client_method_signature("close").unwrap().arg_modes,
+            [Owned]
+        );
+        assert_eq!(
+            net_client_method_signature("close").unwrap().arg_modes,
+            [Owned]
+        );
+        assert_eq!(argument_modes("http.text", 2), [View, Owned]);
+        assert_eq!(argument_modes("unregistered", 2), [Owned, Owned]);
+        assert!(!supports_borrowed_call("array.push"));
+        assert!(!supports_borrowed_call("array.first"));
+        assert!(!supports_borrowed_call("unregistered"));
+    }
 }
