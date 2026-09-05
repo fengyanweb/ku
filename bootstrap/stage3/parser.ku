@@ -9,13 +9,13 @@ import { ReadBracedDeclaration } from "./enums.ku"
 import { ReadFunction } from "./functions.ku"
 
 // Stage 3 is intentionally a strict, useful subset of the production Rust
-// parser. It accepts top-level module/struct/enum declarations and ordinary functions whose
-// bodies contain explicitly typed declarations, variable assignments,
-// expression statements and return statements.
+// parser. It accepts top-level module/struct/enum declarations and ordinary
+// functions whose bodies contain explicitly typed declarations, variable
+// assignments, expression statements, return statements and braced if/else.
 // Parameters may be untyped; parameter, return and local-declaration types share
-// source-positioned TypeName, TypeArray, TypeResult and TypeUnion arena nodes. Statement
-// boundaries follow the production token
-// grammar, including Ku's ordinary newline/whitespace-separated style; an
+// source-positioned TypeName, TypeArray, TypeResult and TypeUnion arena nodes.
+// Statement boundaries follow the production token grammar, including Ku's
+// ordinary newline/whitespace-separated style; an
 // existing optional semicolon is also accepted. Unsupported production syntax
 // is rejected explicitly rather than guessed at or given a second interpretation.
 //

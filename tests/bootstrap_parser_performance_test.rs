@@ -117,6 +117,8 @@ fn main(): null! {
         "stage3-named-import-success",
         "stage3-function-statements-success",
         "stage3-function-statements-failure",
+        "stage3-if-statements-success",
+        "stage3-if-statements-failure",
         "stage3-struct-success",
         "stage3-struct-union-success",
         "stage3-struct-failure",
@@ -351,6 +353,32 @@ static KuParserInput ku_stage3_function_statements_input(size_t statements, int 
   static const char prefix[] = "fn main(){\n";
   static const char statement[] = "x=1\n";
   static const char suffix[] = "}\n";
+  size_t prefix_len = sizeof(prefix) - 1, statement_len = sizeof(statement) - 1;
+  size_t suffix_len = failure ? 0 : sizeof(suffix) - 1;
+  size_t fixed_len = prefix_len + suffix_len;
+  KuParserInput input = {0};
+  if (!statements || statements > (SIZE_MAX - fixed_len) / statement_len) return input;
+  input.len = fixed_len + statements * statement_len;
+  input.data = (uint8_t*)malloc(input.len);
+  if (!input.data) return input;
+  memcpy(input.data, prefix, prefix_len);
+  size_t cursor = prefix_len;
+  for (size_t i = 0; i < statements; i++) {
+    memcpy(input.data + cursor, statement, statement_len);
+    cursor += statement_len;
+  }
+  if (!failure) {
+    memcpy(input.data + cursor, suffix, suffix_len);
+    cursor += suffix_len;
+  }
+  if (cursor != input.len) { free(input.data); return (KuParserInput){0}; }
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
+static KuParserInput ku_stage3_if_statements_input(size_t statements, int failure) {
+  static const char prefix[] = "fn main(){if(true){\n";
+  static const char statement[] = "x=1\n";
+  static const char suffix[] = "}\n}\n";
   size_t prefix_len = sizeof(prefix) - 1, statement_len = sizeof(statement) - 1;
   size_t suffix_len = failure ? 0 : sizeof(suffix) - 1;
   size_t fixed_len = prefix_len + suffix_len;
@@ -712,6 +740,22 @@ int main(void) {
       ku_stage3_function_statements_input(64, 1), 0,
       "bootstrap.parser.stage3", "unexpected_eof",
       "error|bootstrap.parser.stage3|unexpected_eof|<source>|expected '}' after function body|",
+      9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  /* A braced if containing 32/64 assignments consumes 109/205 tokens including
+     EOF. The 2.25x gate covers condition/body projection and flattening into
+     postorder without permitting repeated copies of the growing body list. */
+  CHECK(ku_check_scale_bounded("stage3-if-statements-success", @KU_STAGE3_PARSE@,
+      ku_stage3_if_statements_input(32, 0),
+      ku_stage3_if_statements_input(64, 0), 1, "", "", "",
+      9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  /* The matching unterminated if bodies consume 107/203 tokens including EOF.
+     All partial statement nodes exist before the structured diagnostic, so
+     eight zero-live rounds exercise deterministic error cleanup as well. */
+  CHECK(ku_check_scale_bounded("stage3-if-statements-failure", @KU_STAGE3_PARSE@,
+      ku_stage3_if_statements_input(32, 1),
+      ku_stage3_if_statements_input(64, 1), 0,
+      "bootstrap.parser.stage3", "unexpected_eof",
+      "error|bootstrap.parser.stage3|unexpected_eof|<source>|expected '}' after if body|",
       9, 4, 64, 16 * 1024, 8 * 1024) == 0);
   /* Each one-field struct is seven tokens, three nodes and three edges once
      linked by Program. Thus 32/64 items consume 225/449 tokens including EOF,

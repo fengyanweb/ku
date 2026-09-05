@@ -1,7 +1,7 @@
 import { Token } from "../stage1/token.ku"
 import { Span, SpanFromToken, SpanMerge } from "../stage2/span.ku"
 import { Node, Arena, ParseOutput, ValidateParseOutput } from "../stage2/ast.ku"
-import { RejectAt, RejectAtPoint, CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, SpanFromNode } from "./support.ku"
+import { RejectAt, RejectAtPoint, CanEndExpression, EmptyExpressionBoundary, PushExpressionBoundary, SpanFromNode, StatementLink, IfFrame } from "./support.ku"
 import { SignatureType, TypeWindowContinues, PushTypeToken, ParseTypeWindow, CheckTypeArenaCapacity, TypePartToNode } from "./signature.ku"
 import { DeclarationRead } from "./structs.ku"
 
@@ -40,6 +40,27 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
     arena_nodes: [Node] = []
     arena_edges: [int] = []
     parse_steps = 0
+    statement_links: [StatementLink] = []
+    if_frames: [IfFrame] = []
+    root_top = 0
+    root_count = 0
+    if_depth = 0
+    frame_top = 0
+    current_if_start = last.clone()
+    current_if_condition = 0
+    current_then_top = 0
+    current_then_count = 0
+    current_else_top = 0
+    current_else_count = 0
+    current_if_phase = 0
+
+    fn ChargeWork(amount: int, error_token: Token): null! {
+        parse_steps = parse_steps + amount
+        if (parse_steps > 16384) {
+            RejectAt(error_token, "work_limit", "stage-3 parser work budget exceeded")?
+        }
+        return ok(null)
+    }
 
     fn AddNode(kind: str, text: str, int_value: int, span: Span, children: [int], error_token: Token): int! {
         if (arena_nodes.len() >= 4096) {
@@ -186,6 +207,55 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
         return ok(probe)
     }
 
+    fn AppendStatementList(children: [int], top: int, count: int, error_token: Token): [int]! {
+        output: [int] = children
+        reversed: [int] = []
+        walk = top
+        remaining = count
+        while (remaining > 0) {
+            parse_steps = parse_steps + 1
+            if (parse_steps > 16384) { RejectAt(error_token.clone(), "work_limit", "stage-3 parser work budget exceeded")? }
+            if (walk <= 0 || walk > statement_links.len()) {
+                RejectAt(error_token.clone(), "invalid_node_id", "statement list contains an invalid link")?
+            }
+            entry = statement_links[walk - 1].clone()
+            if (entry.node <= 0 || entry.node > arena_nodes.len()) {
+                RejectAt(error_token.clone(), "invalid_node_id", "statement list contains an invalid NodeId")?
+            }
+            reversed = reversed.push(entry.node)
+            walk = entry.previous
+            remaining = remaining - 1
+        }
+        if (walk != 0) { RejectAt(error_token.clone(), "invalid_node_id", "statement list length is inconsistent")? }
+        reverse_index = reversed.len()
+        while (reverse_index > 0) {
+            reverse_index = reverse_index - 1
+            output = output.push(reversed[reverse_index])
+        }
+        return ok(output)
+    }
+
+    fn RecordStatement(statement: int): null! {
+        previous = root_top
+        if (if_depth > 0) {
+            previous = current_then_top
+            if (current_if_phase == 1) { previous = current_else_top }
+        }
+        statement_links = statement_links.push(StatementLink { node: statement, previous: previous })
+        new_top = statement_links.len()
+        if (if_depth == 0) {
+            root_top = new_top
+            root_count = root_count + 1
+        } else if (current_if_phase == 0) {
+            current_then_top = new_top
+            current_then_count = current_then_count + 1
+        } else {
+            current_else_top = new_top
+            current_else_count = current_else_count + 1
+        }
+        return ok(null)
+    }
+
     function_start = tokens[0].clone()
     cursor = 1
     if (tokens[cursor].kind != "Ident") {
@@ -200,10 +270,7 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
     parameters: [int] = []
     parameter_count = 0
     while (tokens[cursor].kind != "RParen") {
-        parse_steps = parse_steps + 1
-        if (parse_steps > 16384) {
-            RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
-        }
+        ChargeWork(1, tokens[cursor].clone())?
         if (parameter_count >= 32) {
             RejectAt(tokens[cursor].clone(), "parameter_limit", "stage-3 functions accept at most 32 parameters")?
         }
@@ -215,10 +282,7 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
         parameter_children: [int] = []
         if (tokens[cursor].kind == "Colon") {
             parsed_type = ReadTypeAt(cursor + 1)?
-            parse_steps = parse_steps + parsed_type.work
-            if (parse_steps > 16384) {
-                RejectAt(tokens[cursor + 1].clone(), "work_limit", "stage-3 parser work budget exceeded")?
-            }
+            ChargeWork(parsed_type.work, tokens[cursor + 1].clone())?
             cursor = cursor + 1 + parsed_type.consumed
             type_node = AddParsedType(parsed_type, parameter_token.clone())?
             parameter_children = parameter_children.push(type_node)
@@ -240,10 +304,7 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
     has_return_type = false
     if (tokens[cursor].kind == "Colon") {
         parsed_type = ReadTypeAt(cursor + 1)?
-        parse_steps = parse_steps + parsed_type.work
-        if (parse_steps > 16384) {
-            RejectAt(tokens[cursor + 1].clone(), "work_limit", "stage-3 parser work budget exceeded")?
-        }
+        ChargeWork(parsed_type.work, tokens[cursor + 1].clone())?
         has_return_type = true
         cursor = cursor + 1 + parsed_type.consumed
         return_type = AddParsedType(parsed_type, tokens[cursor - 1].clone())?
@@ -252,20 +313,130 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
         RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '{'")?
     }
     cursor = cursor + 1
-    statements: [int] = []
     statement_count = 0
-    while (tokens[cursor].kind != "RBrace") {
-        parse_steps = parse_steps + 1
-        if (parse_steps > 16384) {
-            RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
-        }
+    reading_body = true
+    function_end = tokens[cursor - 1].clone()
+    while (reading_body) {
+        ChargeWork(1, tokens[cursor].clone())?
         if (tokens[cursor].kind == "Eof") {
+            if (if_depth > 0 && current_if_phase == 0) {
+                RejectAt(tokens[cursor].clone(), "unexpected_eof", "expected '}' after if body")?
+            }
+            if (if_depth > 0) {
+                RejectAt(tokens[cursor].clone(), "unexpected_eof", "expected '}' after else body")?
+            }
             RejectAt(tokens[cursor].clone(), "unexpected_eof", "expected '}' after function body")?
+        }
+        if (tokens[cursor].kind == "RBrace") {
+            block_end = tokens[cursor].clone()
+            cursor = cursor + 1
+            if (if_depth == 0) {
+                function_end = block_end
+                reading_body = false
+            } else if (current_if_phase == 0 && tokens[cursor].kind == "Else") {
+                cursor = cursor + 1
+                if (tokens[cursor].kind == "If") {
+                    RejectAt(tokens[cursor].clone(), "unsupported_statement", "stage-3 does not support else-if yet; use 'else { if (...) { ... } }'")?
+                }
+                if (tokens[cursor].kind != "LBrace") {
+                    RejectAt(tokens[cursor].clone(), "unsupported_statement", "stage-3 else bodies must use braces")?
+                }
+                current_if_phase = 1
+                cursor = cursor + 1
+            } else {
+                if_children: [int] = [current_if_condition]
+                if_children = AppendStatementList(if_children, current_then_top, current_then_count, current_if_start.clone())?
+                if_children = AppendStatementList(if_children, current_else_top, current_else_count, current_if_start.clone())?
+                statement = AddNode("If", "", current_then_count, SpanMerge(SpanFromToken(current_if_start.clone()), SpanFromToken(block_end)), if_children, current_if_start.clone())?
+                if_depth = if_depth - 1
+                if (if_depth > 0) {
+                    if (frame_top <= 0 || frame_top > if_frames.len()) {
+                        RejectAt(current_if_start.clone(), "invalid_token_stream", "if frame stack is invalid")?
+                    }
+                    frame = if_frames[frame_top - 1].clone()
+                    frame_top = frame.previous
+                    current_if_start = frame.start
+                    current_if_condition = frame.condition
+                    current_then_top = frame.then_top
+                    current_then_count = frame.then_count
+                    current_else_top = frame.else_top
+                    current_else_count = frame.else_count
+                    current_if_phase = frame.phase
+                } else if (frame_top != 0) {
+                    RejectAt(current_if_start.clone(), "invalid_token_stream", "if frame stack did not unwind")?
+                }
+                RecordStatement(statement)?
+                if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
+            }
+        } else {
+        if (tokens[cursor].kind == "Else") {
+            RejectAt(tokens[cursor].clone(), "unsupported_statement", "stage-3 else must immediately follow an if body")?
         }
         if (statement_count >= 128) {
             RejectAt(tokens[cursor].clone(), "statement_limit", "stage-3 parser accepts at most 128 statements per function")?
         }
         statement_start = tokens[cursor].clone()
+        statement_count = statement_count + 1
+        if (statement_start.kind == "If") {
+            if (if_depth >= 32) {
+                RejectAt(statement_start.clone(), "statement_depth_exceeded", "stage-3 statement nesting exceeds 32 levels")?
+            }
+            cursor = cursor + 1
+            if (tokens[cursor].kind != "LParen") {
+                RejectAt(tokens[cursor].clone(), "unexpected_token", "expected '(' after 'if'")?
+            }
+            cursor = cursor + 1
+            condition_start = cursor
+            condition_depth = 0
+            reading_condition = true
+            while (reading_condition) {
+                ChargeWork(1, tokens[cursor].clone())?
+                condition_token = tokens[cursor].clone()
+                missing_close = condition_token.kind == "Eof" || condition_token.kind == "RBrace" || condition_token.kind == "LBrace" || condition_token.kind == "Semicolon"
+                if (missing_close) {
+                    RejectAt(condition_token.clone(), "unexpected_token", "expected ')' after if condition")?
+                }
+                if (condition_token.kind == "RParen") {
+                    if (condition_depth == 0) { reading_condition = false }
+                    else {
+                        condition_depth = condition_depth - 1
+                        cursor = cursor + 1
+                    }
+                } else {
+                    if (condition_token.kind == "LParen") { condition_depth = condition_depth + 1 }
+                    cursor = cursor + 1
+                }
+            }
+            condition_origin = tokens[condition_start].clone()
+            condition_parsed = parse_expression(token_base + condition_start, token_base + cursor)?
+            condition = append_arena(condition_parsed, condition_origin)?
+            cursor = cursor + 1
+            if (tokens[cursor].kind != "LBrace") {
+                RejectAt(tokens[cursor].clone(), "unsupported_statement", "stage-3 if bodies must use braces")?
+            }
+            if (if_depth > 0) {
+                if_frames = if_frames.push(IfFrame {
+                    start: current_if_start.clone(),
+                    condition: current_if_condition,
+                    then_top: current_then_top,
+                    then_count: current_then_count,
+                    else_top: current_else_top,
+                    else_count: current_else_count,
+                    phase: current_if_phase,
+                    previous: frame_top
+                })
+                frame_top = if_frames.len()
+            }
+            current_if_start = statement_start
+            current_if_condition = condition
+            current_then_top = 0
+            current_then_count = 0
+            current_else_top = 0
+            current_else_count = 0
+            current_if_phase = 0
+            if_depth = if_depth + 1
+            cursor = cursor + 1
+        } else {
         statement = 0
         if (statement_start.kind == "Let") {
             RejectAt(statement_start, "unsupported_statement", "'let' is not supported in Ku; use a typed declaration or assignment")?
@@ -292,10 +463,7 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
             name = statement_start.lexeme.clone()
             cursor = cursor + 2
             parsed_type = ReadTypeAt(cursor)?
-            parse_steps = parse_steps + parsed_type.work
-            if (parse_steps > 16384) {
-                RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
-            }
+            ChargeWork(parsed_type.work, tokens[cursor].clone())?
             type_consumed = parsed_type.consumed
             type_node = AddParsedType(parsed_type, tokens[cursor].clone())?
             cursor = cursor + type_consumed
@@ -332,14 +500,14 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
             cursor = expression_end
             if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }
         }
-        statements = statements.push(statement)
-        statement_count = statement_count + 1
+        RecordStatement(statement)?
+        }
+        }
     }
-    function_end = tokens[cursor].clone()
-    cursor = cursor + 1
     if (cursor != last_index) {
         RejectAt(tokens[cursor].clone(), "invalid_token_stream", "function window must contain exactly one declaration before EOF")?
     }
+    statements = AppendStatementList([], root_top, root_count, function_start.clone())?
     function_children: [int] = parameters
     if (has_return_type) { function_children = function_children.push(return_type) }
     for statement in statements { function_children = function_children.push(statement) }

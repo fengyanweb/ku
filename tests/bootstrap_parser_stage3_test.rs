@@ -106,6 +106,40 @@ const ENUM_GOLDEN: &str = concat!(
     "EDGE|6|7\n",
     "EDGE|7|8",
 );
+const IF_GOLDEN_SOURCE: &str = concat!(
+    "// 前😀\r\n",
+    "fn main() {\r\n",
+    "  if (true) {\r\n",
+    "    text:str = \"中😀\"\r\n",
+    "  } else {\r\n",
+    "    println(text)\r\n",
+    "  };\r\n",
+    "}",
+);
+const IF_GOLDEN: &str = concat!(
+    "ROOT|11\n",
+    "NODE|1|Bool|true|0|3:7@31..3:11@35|0|0\n",
+    "NODE|2|TypeName|str|0|4:10@49..4:13@52|0|0\n",
+    "NODE|3|String|中😀|0|4:16@55..4:20@64|0|0\n",
+    "NODE|4|VarDecl|text|0|4:5@44..4:20@64|0|2\n",
+    "NODE|5|Variable|println|0|6:5@82..6:12@89|2|0\n",
+    "NODE|6|Variable|text|0|6:13@90..6:17@94|2|0\n",
+    "NODE|7|Call||0|6:5@82..6:18@95|2|2\n",
+    "NODE|8|ExprStmt||0|6:5@82..6:18@95|4|1\n",
+    "NODE|9|If||1|3:3@27..7:4@100|5|3\n",
+    "NODE|10|Function|main|0|2:1@12..8:2@104|8|1\n",
+    "NODE|11|Program||0|2:1@12..8:2@104|9|1\n",
+    "EDGE|0|2\n",
+    "EDGE|1|3\n",
+    "EDGE|2|5\n",
+    "EDGE|3|6\n",
+    "EDGE|4|7\n",
+    "EDGE|5|1\n",
+    "EDGE|6|4\n",
+    "EDGE|7|8\n",
+    "EDGE|8|9\n",
+    "EDGE|9|10",
+);
 const UNICODE_CRLF_ERROR_SOURCE: &str =
     "// 前😀\r\nfn main() {\r\n  text:str = \"中😀\"\r\n  value = 1 + ;\r\n}";
 const UNICODE_CRLF_ERROR_CODE: &str = "unexpected_eof";
@@ -395,6 +429,33 @@ fn project_stmt(source: &str, statement: &Stmt, arena: &mut ProjectedArena) -> u
                 .map(|value| vec![project_expr(source, value, arena)])
                 .unwrap_or_default();
             push_node(arena, "Return", String::new(), 0, *span, &children)
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            span,
+        } => {
+            let mut children = Vec::with_capacity(1 + then_branch.len() + else_branch.len());
+            children.push(project_expr(source, condition, arena));
+            children.extend(
+                then_branch
+                    .iter()
+                    .map(|statement| project_stmt(source, statement, arena)),
+            );
+            children.extend(
+                else_branch
+                    .iter()
+                    .map(|statement| project_stmt(source, statement, arena)),
+            );
+            push_node(
+                arena,
+                "If",
+                String::new(),
+                then_branch.len() as i64,
+                *span,
+                &children,
+            )
         }
         other => panic!("stage-3 oracle received unsupported Rust statement: {other:?}"),
     }
@@ -812,6 +873,7 @@ fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
     assert_eq!(rust_canonical(MODULE_GOLDEN_SOURCE), MODULE_GOLDEN);
     assert_eq!(rust_canonical(STRUCT_GOLDEN_SOURCE), STRUCT_GOLDEN);
     assert_eq!(rust_canonical(ENUM_GOLDEN_SOURCE), ENUM_GOLDEN);
+    assert_eq!(rust_canonical(IF_GOLDEN_SOURCE), IF_GOLDEN);
     assert_eq!(
         rust_diagnostic_canonical(UNICODE_CRLF_ERROR_SOURCE),
         UNICODE_CRLF_ERROR_CANONICAL
@@ -912,6 +974,15 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
         "fn main(){\n  a:float = 1.250\n  b:bool = true\n  c:str = \"中😀\"\n  d:null = null\n  return c\n}",
         "// 前置😀\nfn main() {\n  // gap 中\n  text:str = \"中😀\"\n  text = text + \"!\"\n  println(text)\n}",
         "fn main(){ values:[int] = [1] }",
+        "fn main() { if (true) {} }",
+        "fn main() { if (value > 0) { left = 1 right = 2 } else { other = 3 return other } }",
+        "fn main() { if (outer) { if (inner) { value = 1 } else { value = 2 } } else { if (fallback) { value = 3 } } }",
+        "fn main() { if ((left + 1) * 2 >= right && ready || fallback) { return left } else {}; }",
+        "fn main() { if (Check(1, (2 + 3))) {} }",
+        "fn main() { before = 0 if (left) {} middle = 1 if (right) {} after = 2 }",
+        "fn main() { if (outer) { before = 0 if (inner) {} after = 1 } else { fallback = 2 } }",
+        "fn main() {\r\n  if (\"中😀\" == \"中😀\") {}\r\n}",
+        IF_GOLDEN_SOURCE,
     ];
     let accepted = &cases;
 
@@ -927,6 +998,30 @@ fn bootstrap_parser_stage3_matches_rust_and_stays_bounded() {
     let broken_expression = "fn main(){ value = 1 + ; }";
     let empty_rhs_expression = "fn main(){ value = ; }";
     let unicode_broken_expression = UNICODE_CRLF_ERROR_SOURCE;
+    let missing_if_lparen = "fn main() { if true {} }";
+    let missing_if_rparen = "fn main() { if (true {} }";
+    let empty_if_condition = "fn main() { if () {} }";
+    let missing_if_close = "fn main() { if (true) { value = 1";
+    let missing_else_close = "fn main() { if (true) {} else { value = 1";
+    let single_if_body = "fn main() { if (true) value = 1 }";
+    let single_else_body = "fn main() { if (true) {} else value = 1 }";
+    let unsupported_else_if = "fn main() { if (true) {} else if (false) {} }";
+    let separated_else = "fn main() { if (true) {}; else {} }";
+    let stray_else = "fn main() { else {} }";
+    let accepted_if_depth = format!(
+        "fn main() {{{}value = 1{}}}",
+        "if (true) {".repeat(32),
+        "}".repeat(32)
+    );
+    let rejected_if_depth = format!(
+        "fn main() {{{}value = 1{}}}",
+        "if (true) {".repeat(33),
+        "}".repeat(33)
+    );
+    let aggregate_statement_boundary =
+        format!("fn main() {{ if (true) {{ {} }} }}", "value;".repeat(127));
+    let over_aggregate_statement_limit =
+        format!("fn main() {{ if (true) {{ {} }} }}", "value;".repeat(128));
     let missing_param_name = "fn f(: int) {}";
     let missing_param_type = "fn f(value:) {}";
     let missing_param_comma = "fn f(left:int right:int) {}";
@@ -1598,6 +1693,11 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     ));
     body.push_str(&format!(
         "    AssertCase({}, {})?\n",
+        ku_string(&accepted_if_depth),
+        ku_string(&rust_canonical(&accepted_if_depth))
+    ));
+    body.push_str(&format!(
+        "    AssertCase({}, {})?\n",
         ku_string(&enum_union_boundary),
         ku_string(&rust_canonical(&enum_union_boundary))
     ));
@@ -1648,6 +1748,10 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     body.push_str(&format!(
         "    large = ParseProgram({})?\n    if (large.root != 258 || large.arena.nodes.len() != 258 || large.arena.edges.len() != 257) {{ panic(\"stage-3 statement arena boundary mismatch\") }}\n",
         ku_string(&large_program)
+    ));
+    body.push_str(&format!(
+        "    nested_large = ParseProgram({})?\n    if (nested_large.root != 258 || nested_large.arena.nodes.len() != 258 || nested_large.arena.edges.len() != 257) {{ panic(\"stage-3 aggregate nested-statement arena boundary mismatch\") }}\n",
+        ku_string(&aggregate_statement_boundary)
     ));
     body.push_str(&format!(
         "    many_functions = ParseProgram({})?\n    if (many_functions.root != 65 || many_functions.arena.nodes.len() != 65 || many_functions.arena.edges.len() != 64) {{ panic(\"stage-3 function boundary mismatch\") }}\n",
@@ -1712,6 +1816,67 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
     let unicode_broken_message = UNICODE_CRLF_ERROR_DETAIL.to_string();
     let multiline_relocated_message = MULTILINE_RELOCATED_ERROR_DETAIL.to_string();
     let multiline_boundary_message = MULTILINE_BOUNDARY_ERROR_DETAIL.to_string();
+    let missing_if_lparen_message = diagnostic_at(missing_if_lparen, 6, "expected '(' after 'if'");
+    let missing_if_rparen_message =
+        diagnostic_at(missing_if_rparen, 8, "expected ')' after if condition");
+    let empty_if_condition_message = diagnostic_at(empty_if_condition, 7, "expected expression");
+    let missing_if_close_message = diagnostic_for_kind(
+        missing_if_close,
+        TokenKind::Eof,
+        "expected '}' after if body",
+    );
+    let missing_else_close_message = diagnostic_for_kind(
+        missing_else_close,
+        TokenKind::Eof,
+        "expected '}' after else body",
+    );
+    let single_if_body_message =
+        diagnostic_at(single_if_body, 9, "stage-3 if bodies must use braces");
+    let single_else_body_message =
+        diagnostic_at(single_else_body, 12, "stage-3 else bodies must use braces");
+    let unsupported_else_if_message = diagnostic_at(
+        unsupported_else_if,
+        12,
+        "stage-3 does not support else-if yet; use 'else { if (...) { ... } }'",
+    );
+    let separated_else_message = diagnostic_at(
+        separated_else,
+        12,
+        "stage-3 else must immediately follow an if body",
+    );
+    let stray_else_message = diagnostic_at(
+        stray_else,
+        5,
+        "stage-3 else must immediately follow an if body",
+    );
+    let rejected_if_depth_token = Lexer::new(&rejected_if_depth)
+        .lex()
+        .expect("statement-depth fixture lex")
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| token.kind == TokenKind::If)
+        .nth(32)
+        .map(|(index, _)| index)
+        .expect("33rd nested if token");
+    let rejected_if_depth_message = diagnostic_at(
+        &rejected_if_depth,
+        rejected_if_depth_token,
+        "stage-3 statement nesting exceeds 32 levels",
+    );
+    let over_aggregate_token = Lexer::new(&over_aggregate_statement_limit)
+        .lex()
+        .expect("aggregate statement-limit fixture lex")
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| matches!(&token.kind, TokenKind::Ident(name) if name == "value"))
+        .nth(127)
+        .map(|(index, _)| index)
+        .expect("128th nested statement token");
+    let over_aggregate_statement_message = diagnostic_at(
+        &over_aggregate_statement_limit,
+        over_aggregate_token,
+        "stage-3 parser accepts at most 128 statements per function",
+    );
     let missing_param_name_message = rust_error_canonical(missing_param_name);
     let missing_param_type_message = rust_error_canonical(missing_param_type);
     let missing_param_comma_message = rust_error_canonical(missing_param_comma);
@@ -1944,6 +2109,58 @@ fn ExpectTokenMapError(source: str, tokens: [Token], expected_code: str, expecte
         (&deep_expression, "depth_exceeded", deep_message),
         (broken_expression, "unexpected_eof", broken_message),
         (empty_rhs_expression, "unexpected_eof", empty_rhs_message),
+        (
+            missing_if_lparen,
+            "unexpected_token",
+            missing_if_lparen_message,
+        ),
+        (
+            missing_if_rparen,
+            "unexpected_token",
+            missing_if_rparen_message,
+        ),
+        (
+            empty_if_condition,
+            "unexpected_eof",
+            empty_if_condition_message,
+        ),
+        (missing_if_close, "unexpected_eof", missing_if_close_message),
+        (
+            missing_else_close,
+            "unexpected_eof",
+            missing_else_close_message,
+        ),
+        (
+            single_if_body,
+            "unsupported_statement",
+            single_if_body_message,
+        ),
+        (
+            single_else_body,
+            "unsupported_statement",
+            single_else_body_message,
+        ),
+        (
+            unsupported_else_if,
+            "unsupported_statement",
+            unsupported_else_if_message,
+        ),
+        (
+            separated_else,
+            "unsupported_statement",
+            separated_else_message,
+        ),
+        (stray_else, "unsupported_statement", stray_else_message),
+        (
+            &rejected_if_depth,
+            "statement_depth_exceeded",
+            rejected_if_depth_message,
+        ),
+        (
+            &over_aggregate_statement_limit,
+            "statement_limit",
+            over_aggregate_statement_message,
+        ),
         (
             unicode_broken_expression,
             UNICODE_CRLF_ERROR_CODE,
