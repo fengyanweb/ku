@@ -1,6 +1,6 @@
 # Ku 自举状态
 
-结论：Ku 0.0.16 已开始自举第一阶段，但还不能自举完整工具链。
+结论：Ku 0.0.17 已实现有界 Lexer，并推进到 Parser 子集，但还不能自举完整工具链。
 
 这里的“完整自举”指用 Ku 编写 Ku 编译器和工具链的主要部分，并让 Ku 编译器编译出下一代 Ku 工具链。当前 Rust 版编译器仍是 bootstrap compiler；`bootstrap/stage1` 已经是 Ku 编写的完整有界 lexer，`bootstrap/stage2` 已实现有界表达式 parser，`bootstrap/stage3` 又增加了一个可运行的 module/import/struct/enum/函数/基础语句与 braced `if` / `while` 模块切片。它们用于验证语言、native ABI 和源码无关打包是否足以承载真实编译器代码，但都还不能替代完整 Rust parser，更没有替代 checker、IR 或 backend。
 
@@ -14,7 +14,7 @@
 - native `chars()` 的 ASCII 元素复用 128 字节只读静态表，包括 NUL，不逐字符分配；非 ASCII 元素仍独立持有 UTF-8 正文。`bootstrap_lexer_performance_test` 检查原字符串释放后的独立生命周期、clone/concat 语义，以及 2304/4608/9216 字节输入的分配与峰值存活字节线性增长；每组重复 32 次，每轮分配台账必须归零。耗时只作诊断，不把带计量、未优化的 C 测试当作生产吞吐基准，计量也不等于整个进程 RSS。
 - token 先物化为局部值，再写 `tokens = tokens.push(token)`；已去掉会反复复制整张 token 表的 `PushToken` 包装。解释器/native 仅对未捕获普通局部的纯参数 self-push 复用几何增长容量，普通 `more = tokens.push(token)` 仍返回深拷贝的新数组。没有新增另一套 builder 或可变 push API。
 - 差分门槛包含 59 组完整语法/错误案例、256 组固定种子短输入，并递归收集 `bootstrap`/`examples` 下的全部 Ku 源码；新增 corpus 文件会自动扩展门槛，精确数量以测试输出为准。新增固定案例覆盖 `&` / `&&` 最长匹配、参数/函数类型拼写，以及字符串、模板和注释内的 `&`。Rust lexer 作为 token、payload、完整 span 和诊断位置的 oracle。另有 20 项字符、byte、token、字符串和长错误输入边界测试，包括单 `&` 与连续 `&&` 达到/超过 4096-token 上限的边界。
-- 同一差分与边界 fixture 由解释器和 native 二进制运行。native 验收检查生成 C 不含 `run_source` / `const SOURCE`；编译后搬移二进制并删除完整 `.ku` 源码目录，仍能独立运行。此前基线曾在 Windows 本机及 Windows/Linux/macOS 的远端 native target gate 闭环；该历史结果不覆盖新增 `Ampersand` 的 73-token-kind 版本或本轮借用与 while 改动，本次提交的三系统 CI 仍待验证。
+- 同一差分与边界 fixture 由解释器和 native 二进制运行。native 验收检查生成 C 不含 `run_source` / `const SOURCE`；编译后搬移二进制并删除完整 `.ku` 源码目录，仍能独立运行。发布前基线 `11c566b` 已通过 Windows/Linux/macOS CI，其中包含 73-token-kind Lexer、借用与 while 改动；0.0.17 以 `v0.0.17` tag 同一提交的实际三系统 CI 结果为准，不沿用旧提交，最终证据见 Release 正文。
 - `bootstrap/stage2` 使用 append-only `NodeId`/edge arena 实现表达式 parser；`NodeId` 的当前 ABI 固定为正的 1-based `int`，0 永久保留为“无节点”。节点上限 4096、边上限 8192、token 上限 4096、嵌套深度 32、工作步数 16384。成功输出统一经过 `ValidateParseOutput`：root 必须是最后一个节点，edge slice 必须非负、连续且在界内，child 必须严格早于 parent；children 保持源码顺序，每棵 subtree 必须占据连续的后序区间，完整 arena 最终只能归约为一棵 tree（因此也排除 orphan、重复 parent 和共享 child），节点 span 也必须有序。后续语义 arena 才负责共享或驻留。验证使用减法式范围检查，不在不可信元数据上先做加法；tree 检查使用 append-only forest link，不做会让解释器复制整个数组的 indexed assignment。flat-local 投影把重复嵌套 owned 读取造成的 O(n²) 降为 O(nodes + edges)，额外 forest storage 为 O(nodes)；但当前 value-position owned field read 仍会产生受 4096/8192 上限约束的线性副本，尚不能宣称 zero-copy，后续需由 allocation gate 量化并配合 consuming projection 优化。平坦二元/后缀链用显式栈迭代处理，AST 与完整 span 对 Rust parser 做 canonical 差分，错误诊断另有稳定 code/message/span 边界门槛。
 - Stage 2/3 的 source-positioned parser failure 统一使用 `Diagnostic { severity, domain, code, message, source, span }`；wire canonical 固定为 `severity|domain|code|source|message|span`，字符串字段统一转义，缺少 token 的内部输入错误固定使用 `1:1@0..1:1@0` point span。当前公开 parser 入口没有文件名参数，所以 `source` 固定为短标识 `<source>`，不会复制源码正文或开放未完整转义的任意终端文本。`ParseContext` 只传递白名单内的 parser domain，Stage 3 的表达式错误在 Stage 2 构造时就使用 Stage 3 domain，不解析或改写 canonical 字符串。
 - 这仍是临时 transport：Ku `Error`/native `KuError` 只有 `domain/code/message` 三个字段，因此完整 Diagnostic 暂时 canonical 化后放入 `Error.message`。这不是 typed Diagnostic sidecar，也不代表 Rust checker、CLI JSON、VSCode range 或 Stage 1 lexer diagnostic 已统一；后续闭环不能依赖反向解析这段字符串。

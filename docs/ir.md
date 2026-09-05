@@ -63,7 +63,7 @@ ku ir examples\function.ku
 - 闭包/function value native ABI 已具备 typed invoke pointer、局部 RC env 和按需共享 cell。参数路径直接覆盖 Copy、`str`、array、函数值、struct、enum 与 Result，普通局部路径另覆盖 object 与 KuValue；catch/match binding、local-function self、`for` 迭代变量和 Task/async native ABI 仍是明确拒绝的边界。dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同。
 - 暂不做 SSA、寄存器分配和完整 native ABI lowering。
 
-## 同步只读借用参数（0.0.16 实验实现）
+## 同步只读借用参数（0.0.17 首版实验合同）
 
 AST 与 `IrParam` 保存 `ParamMode::Owned` / `ParamMode::View`。`View` 只是编译器内部名称，源码写 `&name: T`。`IrType::Closure` 在参数类型之外保存等长的 `param_modes`；直接调用、typed invoke、局部函数递归和 import 展开都保留槽位模式。函数类型精确匹配模式，不生成 owned / borrowed adapter。
 
@@ -88,7 +88,7 @@ owned 参数仍按对应值 ABI 传递。typed closure 的 invoke prototype 和�
 
 这是 Ku 内部生成 C 的合同，不新增允许外部 C 长期保存 borrowed pointer 的公开 FFI。模式改变了相关生成函数的 prototype，旧 C/FFI 产物必须重新编译。LLVM 文本后端明确拒绝借用参数，使用 C backend；native async lowering 仍沿用原有不支持边界。
 
-当前 checker 明确拒绝 borrowed `for`、带 owned payload binding 的 borrowed match、消费式对象解构、borrowed Result `?` 以及未迁移的 stdlib borrowed 路径；这些不能被写成 native 已支持。`borrow_native_test` 与 `borrow_allocation_test` 分别覆盖可观察行为、源码删除后运行，以及嵌套读取无分配 / 临时生命周期门槛；它们不代表全量回归、三系统或 sanitizer 已完成，实际验证状态见 [v0.0.16.md](v0.0.16.md)。
+当前 checker 明确拒绝 borrowed `for`、带 owned payload binding 的 borrowed match、消费式对象解构、borrowed Result `?` 以及未迁移的 stdlib borrowed 路径；这些不能被写成 native 已支持。`borrow_native_test` 与 `borrow_allocation_test` 分别覆盖可观察行为、源码删除后运行，以及嵌套读取无分配 / 临时生命周期门槛；它们不代表全量回归、三系统或 sanitizer 已完成，实际验证状态见 [v0.0.17.md](v0.0.17.md)。
 
 ## Result ABI
 

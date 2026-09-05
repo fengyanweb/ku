@@ -46,3 +46,8 @@ mysql.pw
 # Python native-CI helper bytecode stays local.
 __pycache__/
 *.pyc
+
+# New release assets are published through GitHub Releases, not source commits.
+/release/
+/history/
+/editors/vscode-ku/*.vsix

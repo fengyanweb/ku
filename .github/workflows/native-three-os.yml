@@ -60,6 +60,11 @@ jobs:
         working-directory: editors/vscode-ku
         run: npm test
 
+      - name: Test release archive validation and license collection
+        run: |
+          python3 -B .github/scripts/test-export-release.py
+          python3 -B .github/scripts/test-prepare-release.py
+
   borrow-sanitizers:
     name: Native borrow ASan, UBSan and leak checks
     runs-on: ubuntu-24.04
@@ -516,3 +521,142 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           archive: false
+
+  release-bundle:
+    name: ${{ matrix.target }} release download bundle
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            python: python
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python: python3
+          - os: macos-15
+            target: aarch64-apple-darwin
+            python: python3
+    env:
+      CARGO_INCREMENTAL: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out the exact release tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+
+      - name: Install the release packaging Node runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: editors/vscode-ku/package-lock.json
+
+      - name: Validate the package version and any release tag
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content -LiteralPath editors/vscode-ku/package.json -Raw -Encoding utf8 | ConvertFrom-Json).version
+          if ($version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'The release package version must be canonical SemVer'
+          }
+          if ($env:GITHUB_REF_TYPE -ceq 'tag' -and $env:GITHUB_REF_NAME -cne "v$version") {
+            throw 'The release tag must exactly match the package version'
+          }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build and verify the actual host bundle
+        shell: pwsh
+        run: >-
+          pwsh -NoLogo -NoProfile -NonInteractive
+          -File scripts/package-release.ps1
+
+      - name: Test the archive exporter on this platform
+        run: ${{ matrix.python }} -B .github/scripts/test-export-release.py
+
+      - name: Export a verified source-free archive and third-party notices
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadataPath = Join-Path $env:RUNNER_TEMP 'ku-release-cargo-metadata.json'
+          $metadata = & cargo metadata --locked --format-version 1 --filter-platform $env:RELEASE_TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot collect locked Cargo dependency metadata' }
+          $metadata | Out-File -FilePath $metadataPath -Encoding utf8
+          $sysroot = & rustc +1.89.0 --print sysroot
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the pinned Rust license materials' }
+          & ${{ matrix.python }} -B .github/scripts/export-release.py `
+            --bundle (Join-Path $env:GITHUB_WORKSPACE "release/$env:RELEASE_TARGET") `
+            --output (Join-Path $env:RUNNER_TEMP 'ku-release-assets') `
+            --repo $env:GITHUB_WORKSPACE --version $env:RELEASE_VERSION `
+            --target $env:RELEASE_TARGET --commit $env:GITHUB_SHA `
+            --metadata $metadataPath --rust-sysroot $sysroot.Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Release archive validation failed' }
+
+      - name: Upload the verified release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ku-release-${{ matrix.target }}
+          path: ${{ runner.temp }}/ku-release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Publish all verified release bundles together
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [quality, borrow-sanitizers, full-tests, release-contract, native, release-bundle]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out the release notes and verification script
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download only the three release bundle artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: ku-release-*
+          path: ${{ runner.temp }}/ku-publish-assets
+          merge-multiple: true
+
+      - name: Verify exact assets and publish an experimental release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -B .github/scripts/prepare-release.py \
+            --assets "$RUNNER_TEMP/ku-publish-assets" \
+            --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" \
+            --repo "$GITHUB_WORKSPACE"
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
+            --title "Ku $GITHUB_REF_NAME (experimental)" \
+            --notes-file "$RUNNER_TEMP/ku-publish-assets/RELEASE-NOTES.md"
+          gh release upload "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/ku-publish-assets/"*.tar.gz \
+            "$RUNNER_TEMP/ku-publish-assets/"*.manifest.json \
+            "$RUNNER_TEMP/ku-publish-assets/SHA256SUMS"
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --draft=false
