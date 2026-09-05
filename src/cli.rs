@@ -10201,12 +10201,15 @@ fn rewrite_type_names_in_function(
     function: &mut FnDecl,
     rename_map: &HashMap<String, String>,
     namespaces: &NamespaceMaps,
+    type_scopes: &[Vec<String>],
 ) {
     for param in &mut function.params {
-        rewrite_optional_type_name(&mut param.ty, rename_map, namespaces);
+        if let Some(ty) = &mut param.ty {
+            rewrite_type_name(ty, rename_map, namespaces, type_scopes);
+        }
     }
     if let Some(return_type) = &mut function.return_type {
-        rewrite_type_name(return_type, rename_map, namespaces);
+        rewrite_type_name(return_type, rename_map, namespaces, type_scopes);
     }
 }
 
@@ -10216,7 +10219,7 @@ fn rewrite_optional_type_name(
     namespaces: &NamespaceMaps,
 ) {
     if let Some(ty) = ty {
-        rewrite_type_name(ty, rename_map, namespaces);
+        rewrite_type_name(ty, rename_map, namespaces, &[]);
     }
 }
 
@@ -10232,10 +10235,11 @@ fn rewrite_type_name(
     ty: &mut TypeName,
     rename_map: &HashMap<String, String>,
     namespaces: &NamespaceMaps,
+    type_scopes: &[Vec<String>],
 ) {
     match ty {
         TypeName::Array(inner) | TypeName::Result(inner) => {
-            rewrite_type_name(inner, rename_map, namespaces)
+            rewrite_type_name(inner, rename_map, namespaces, type_scopes)
         }
         TypeName::Function {
             params,
@@ -10243,16 +10247,26 @@ fn rewrite_type_name(
             ..
         } => {
             for param in params {
-                rewrite_type_name(param, rename_map, namespaces);
+                rewrite_type_name(param, rename_map, namespaces, type_scopes);
             }
-            rewrite_type_name(return_type, rename_map, namespaces);
+            rewrite_type_name(return_type, rename_map, namespaces, type_scopes);
         }
         TypeName::Union(types) => {
             for ty in types {
-                rewrite_type_name(ty, rename_map, namespaces);
+                rewrite_type_name(ty, rename_map, namespaces, type_scopes);
             }
         }
         TypeName::Custom(name) => {
+            // A lexical type parameter also hides a same-named module alias.
+            // Do not turn unsupported T.Member into an unrelated imported type.
+            let root = name.split_once('.').map_or(name.as_str(), |(root, _)| root);
+            if type_scopes
+                .iter()
+                .flatten()
+                .any(|parameter| parameter == root)
+            {
+                return;
+            }
             if let Some(renamed) = rename_map.get(name) {
                 *name = renamed.clone();
             } else if let Some(renamed) = namespace_lookup(name, namespaces) {
@@ -10268,8 +10282,11 @@ fn rewrite_top_level_references_in_function(
     rename_map: &HashMap<String, String>,
     namespaces: &NamespaceMaps,
 ) -> KuResult<()> {
-    rewrite_type_names_in_function(function, rename_map, namespaces);
     let mut rewriter = TopLevelReferenceRewriter::new(rename_map, namespaces);
+    if !function.type_params.is_empty() {
+        rewriter.type_scopes.push(function.type_params.clone());
+    }
+    rewrite_type_names_in_function(function, rename_map, namespaces, &rewriter.type_scopes);
     rewriter.push_scope();
     for param in &function.params {
         rewriter.define(&param.name);
@@ -10283,6 +10300,9 @@ struct TopLevelReferenceRewriter<'a> {
     rename_map: &'a HashMap<String, String>,
     namespaces: &'a NamespaceMaps,
     scopes: Vec<HashSet<String>>,
+    /// Type parameters have a separate namespace from local value bindings.
+    /// Empty for non-generic programs, without copying the module rename map.
+    type_scopes: Vec<Vec<String>>,
 }
 
 impl<'a> TopLevelReferenceRewriter<'a> {
@@ -10291,6 +10311,7 @@ impl<'a> TopLevelReferenceRewriter<'a> {
             rename_map,
             namespaces,
             scopes: Vec::new(),
+            type_scopes: Vec::new(),
         }
     }
 
@@ -10353,7 +10374,7 @@ impl<'a> TopLevelReferenceRewriter<'a> {
                 name, ty, value, ..
             } => {
                 if let Some(ty) = ty {
-                    rewrite_type_name(ty, self.rename_map, self.namespaces);
+                    rewrite_type_name(ty, self.rename_map, self.namespaces, &self.type_scopes);
                 }
                 self.rewrite_expr(value)?;
                 self.define(name);
@@ -10429,7 +10450,16 @@ impl<'a> TopLevelReferenceRewriter<'a> {
             Stmt::Function(function) => {
                 let local_name = function.name.clone();
                 self.define(&local_name);
-                rewrite_type_names_in_function(function, self.rename_map, self.namespaces);
+                let binds_types = !function.type_params.is_empty();
+                if binds_types {
+                    self.type_scopes.push(function.type_params.clone());
+                }
+                rewrite_type_names_in_function(
+                    function,
+                    self.rename_map,
+                    self.namespaces,
+                    &self.type_scopes,
+                );
                 self.push_scope();
                 self.define(&local_name);
                 for param in &function.params {
@@ -10437,6 +10467,9 @@ impl<'a> TopLevelReferenceRewriter<'a> {
                 }
                 let result = self.rewrite_block(&mut function.body);
                 self.pop_scope();
+                if binds_types {
+                    self.type_scopes.pop();
+                }
                 result?;
             }
             Stmt::Try {
@@ -10581,11 +10614,16 @@ impl<'a> TopLevelReferenceRewriter<'a> {
             } => {
                 for param in params.iter_mut() {
                     if let Some(ty) = &mut param.ty {
-                        rewrite_type_name(ty, self.rename_map, self.namespaces);
+                        rewrite_type_name(ty, self.rename_map, self.namespaces, &self.type_scopes);
                     }
                 }
                 if let Some(return_type) = return_type {
-                    rewrite_type_name(return_type, self.rename_map, self.namespaces);
+                    rewrite_type_name(
+                        return_type,
+                        self.rename_map,
+                        self.namespaces,
+                        &self.type_scopes,
+                    );
                 }
                 self.push_scope();
                 for param in params.iter() {
@@ -10628,6 +10666,115 @@ fn namespace_lookup(path: &str, namespaces: &NamespaceMaps) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_type_rewriting_preserves_lexical_generic_parameters() {
+        let source = r#"fn F<T>(&value: [T!], extra: Other): fn(&T): T {
+    local: T = null
+    fn Inner<U>(x: U, y: T): U { return x }
+    fn Plain(x: U): U { return x }
+    callback = fn(&x: T): T { return x }
+    return callback
+}"#;
+        let mut program = Parser::new(Lexer::new(source).tokenize().expect("lex"))
+            .parse_program()
+            .expect("parse generic rewrite fixture");
+        let Item::Function(function) = &mut program.items[0] else {
+            panic!("expected function");
+        };
+        let rename_map = HashMap::from([
+            ("T".to_string(), "__ku_import1_T".to_string()),
+            ("U".to_string(), "__ku_import1_U".to_string()),
+            ("Other".to_string(), "__ku_import1_Other".to_string()),
+        ]);
+        rewrite_top_level_references_in_function(function, &rename_map, &NamespaceMaps::new())
+            .expect("rewrite");
+        let generic_t = TypeName::Custom("T".into());
+        let generic_u = TypeName::Custom("U".into());
+        assert_eq!(function.params[0].mode, ParamMode::View);
+        assert_eq!(
+            function.params[0].ty,
+            Some(TypeName::Array(Box::new(TypeName::Result(Box::new(
+                generic_t.clone()
+            )))))
+        );
+        assert_eq!(
+            function.params[1].ty,
+            Some(TypeName::Custom("__ku_import1_Other".into()))
+        );
+        assert_eq!(
+            function.return_type,
+            Some(TypeName::Function {
+                params: vec![generic_t.clone()],
+                param_modes: vec![ParamMode::View],
+                return_type: Box::new(generic_t.clone()),
+                is_async: false,
+            })
+        );
+        let Stmt::VarDecl { ty, .. } = &function.body[0] else {
+            panic!("local")
+        };
+        assert_eq!(ty.as_ref(), Some(&generic_t));
+        let Stmt::Function(inner) = &function.body[1] else {
+            panic!("inner")
+        };
+        assert_eq!(inner.params[0].ty.as_ref(), Some(&generic_u));
+        assert_eq!(inner.params[1].ty.as_ref(), Some(&generic_t));
+        assert_eq!(inner.return_type.as_ref(), Some(&generic_u));
+        let Stmt::Function(plain) = &function.body[2] else {
+            panic!("plain")
+        };
+        assert_eq!(
+            plain.params[0].ty,
+            Some(TypeName::Custom("__ku_import1_U".into()))
+        );
+        assert_eq!(plain.return_type, plain.params[0].ty);
+        let Stmt::Assign { value, .. } = &function.body[3] else {
+            panic!("callback")
+        };
+        let ExprKind::Function {
+            params,
+            return_type,
+            ..
+        } = &value.kind
+        else {
+            panic!("callback body")
+        };
+        assert_eq!(params[0].ty.as_ref(), Some(&generic_t));
+        assert_eq!(params[0].mode, ParamMode::View);
+        assert_eq!(return_type.as_ref(), Some(&generic_t));
+    }
+
+    #[test]
+    fn import_generic_type_parameter_hides_namespace_but_not_value_names() {
+        let source = "fn F<T>(value: T.Member): T { result = T { value: 1 } return value }";
+        let mut program = Parser::new(Lexer::new(source).tokenize().expect("lex"))
+            .parse_program()
+            .expect("parse");
+        let Item::Function(function) = &mut program.items[0] else {
+            panic!("function")
+        };
+        let rename_map = HashMap::from([("T".into(), "__ku_import1_T".into())]);
+        let namespaces = NamespaceMaps::from([(
+            "T".into(),
+            BTreeMap::from([("Member".into(), "__ku_import2_Member".into())]),
+        )]);
+        rewrite_top_level_references_in_function(function, &rename_map, &namespaces)
+            .expect("rewrite");
+        assert_eq!(
+            function.params[0].ty,
+            Some(TypeName::Custom("T.Member".into()))
+        );
+        assert_eq!(function.return_type, Some(TypeName::Custom("T".into())));
+        // Value/constructor names use their own namespace, not type parameters.
+        let Stmt::Assign { value, .. } = &function.body[0] else {
+            panic!("result")
+        };
+        let ExprKind::StructLiteral { name, .. } = &value.kind else {
+            panic!("constructor")
+        };
+        assert_eq!(name, "__ku_import1_T");
+    }
 
     #[test]
     fn bounded_build_process_child_fixture() {
@@ -11118,7 +11265,7 @@ mod tests {
         fs::remove_dir_all(&source_dir).expect("remove complete Ku source tree");
         for artifact in retained {
             let c = fs::read_to_string(&artifact).expect("read retained source-free C");
-            assert!(c.contains("KuResult_null ku_main()"));
+            assert!(c.contains("KuResult_null ku_main(void)"));
             assert!(!c.contains("run_source"));
             assert!(!c.contains("const SOURCE"));
         }

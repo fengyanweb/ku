@@ -9,6 +9,8 @@ ku version
 
 Ku 当前是解释器优先的语言实现。本文记录真实实现的语法及各后端边界；实验性增量的验收状态见版本记录，仍在设计中的能力放在文末“不支持 / 未完成”。
 
+本文是源码写法的规范性入口；跨执行层的所有权、借用、错误和并发不变量见 [语义合同](semantics.md)。版本记录是历史证据，不能覆盖当前规范。正在实施的内容及尚未验收的范围见 [v0.0.18 实施记录](v0.0.18-worklog.md)，不能将工作计划当作当前支持。
+
 ## 0. 专题文档入口
 
 本文是完整语法总览。需要进入某个具体主题时，从这里跳转：
@@ -280,7 +282,7 @@ import {
 
 ### 4.1 基础类型
 
-Ku 0.0.15 的基础类型：
+Ku 当前的基础类型：
 
 ```txt
 int
@@ -2139,7 +2141,7 @@ ku build --release -o dist/app.exe
 
 `--target` 第一阶段只接受 `host`、`x86_64-linux`、`x86_64-windows`、`aarch64-darwin`；包含路径分隔符、Windows drive prefix 或未知 target 会直接报错，避免输出路径逃逸。`--backend c` 会使用 native C 后端生成 C 后再调用 C 编译器。未设置 `KU_CC` 时，自动候选固定为 `zig cc`、`clang`、`cc`、`gcc`，失败后有界尝试下一个；一旦设置 `KU_CC`，它就是唯一且权威的 compiler，空值、不可执行或编译失败都会直接报错，不会静默换用另一套工具链。显式跨 target 时，Ku 自动给 Zig 传 `-target`、给 Clang 传 `--target`；普通 fallback `cc/gcc` 只用于 host，不会假装支持 cross。需要使用已配置好的交叉 GCC 时，通过 `KU_CC` 显式指定。链接成功后校验目标产物的 PE/ELF/Mach-O 格式和 CPU 架构；使用数据库时还解析最终动态依赖表并要求实际导入 libpq 以及本次选定的 MySQL/MariaDB family，静态、跨 family 或 host 回退都拒绝安装。数据库库文件从已打开句柄复制到私有临时目录后才交给 linker，不扫描或删除用户输出目录中的同名临时文件。默认 backend 仍保留解释器 wrapper 以兼容尚未进入 native lowering 的 async 程序；同步程序的 KuString、array、dynamic object、Result/Error 和 closure ABI 已实现明确列出的子集，不能从 ABI 存在推导为所有 payload、捕获形式和动态组合均已支持。
 
-0.0.15 的历史边界是：默认生成“解释器打包型二进制”，带 import 的程序仍会按原路径读取依赖。当前 native C 路径已经在生成期展开完整 import graph，生成物不包含 runner 的 `run_source` / `const SOURCE`，移动原源码目录后仍能运行；async native lowering 和增量缓存仍未宣称完成。
+默认 runner 当前仍生成“解释器打包型二进制”，只嵌入入口文件，带 import 的程序仍会按原路径读取依赖；这不是已经消失的历史限制。native C 路径在生成期展开完整 import graph，生成物不包含 runner 的 `run_source` / `const SOURCE`，移动原源码目录后仍能运行；async native lowering 和增量缓存仍未宣称完成。
 
 `ku build --native <file.ku>` 不带 `-o` 时是单文件兼容模式：在源码旁写出 `.c`，不调用 linker。带 `-o` 时进入完整 native 链接模式，使用上述 build 目录中的隔离中间产物并校验最终二进制。跨系统发布推荐使用 `ku build --backend c --target <target>`，因为“生成目标 C”本身不等于已生成该目标的可执行文件。
 

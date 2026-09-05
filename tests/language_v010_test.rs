@@ -414,7 +414,7 @@ fn main(): null! {
         "imported Add missing:\n{c}"
     );
     assert!(
-        c.contains("KuResult_null ku_main()"),
+        c.contains("KuResult_null ku_main(void)"),
         "entry main missing:\n{c}"
     );
     assert!(

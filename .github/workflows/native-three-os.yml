@@ -90,8 +90,8 @@ jobs:
           rustup default 1.89.0
           clang --version
 
-      - name: Verify borrowed lifetimes, allocation ledger and source-free execution
-        run: cargo test --locked --test borrow_allocation_test --test borrow_native_test -- --nocapture
+      - name: Verify borrowed lifetimes, generic ABI, allocation ledger and source-free execution
+        run: cargo test --locked --test borrow_allocation_test --test borrow_native_test --test native_generic_test --test native_generic_import_test --test native_forward_call_test -- --nocapture
 
   full-tests:
     name: ${{ matrix.os }} unfiltered workspace test suite

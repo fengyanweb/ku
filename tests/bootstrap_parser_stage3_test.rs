@@ -10,7 +10,7 @@ pub mod bounded_process;
 use bounded_process::{run_bounded, OutputLimits};
 use ku::ast::{
     BinaryOp, EnumDecl, Expr, ExprKind, FnDecl, ImportDecl, ImportKind, Item, Literal, ModuleDecl,
-    Stmt, StructDecl, TypeName, UnaryOp,
+    ParamMode, Stmt, StructDecl, TypeName, UnaryOp,
 };
 use ku::lexer::Lexer;
 use ku::parser::Parser;
@@ -26,6 +26,17 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 const PROCESS_OUTPUT_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
 const FUNCTION_MODULE_TOKEN_LIMIT: usize = 3072;
+
+// Missing-token diagnostics must point at EOF, never replay the last consumed
+// keyword, alias, comma or opening delimiter.
+const EOF_NAME_DIAGNOSTICS: &[(&str, &str)] = &[
+    ("import {", "expected imported name"),
+    ("import { Add,", "expected imported name"),
+    ("import { Add } from", "expected import path string"),
+    ("// 前😀\r\nimport { Add as", "expected import alias"),
+    ("fn", "expected function name"),
+    ("fn f(", "expected parameter name"),
+];
 
 // Static ABI goldens are not produced by the Rust projector during the test.
 // Both parser implementations are checked against these reviewed bytes.
@@ -53,6 +64,21 @@ const TYPED_UNION_GOLDEN: &str = concat!(
     "EDGE|7|7\n",
     "EDGE|8|9\n",
     "EDGE|9|10",
+);
+const BORROWED_PARAMETER_GOLDEN_SOURCE: &str = "// 前😀\r\nfn f(&a: str, b: int) {}";
+const BORROWED_PARAMETER_GOLDEN: &str = concat!(
+    "ROOT|6\n",
+    "NODE|1|TypeName|str|0|2:10@21..2:13@24|0|0\n",
+    "NODE|2|Parameter|a|1|2:6@17..2:8@19|0|1\n",
+    "NODE|3|TypeName|int|0|2:18@29..2:21@32|1|0\n",
+    "NODE|4|Parameter|b|0|2:15@26..2:16@27|1|1\n",
+    "NODE|5|Function|f|0|2:1@12..2:25@36|2|2\n",
+    "NODE|6|Program||0|2:1@12..2:25@36|4|1\n",
+    "EDGE|0|1\n",
+    "EDGE|1|3\n",
+    "EDGE|2|2\n",
+    "EDGE|3|4\n",
+    "EDGE|4|5",
 );
 const MODULE_GOLDEN_SOURCE: &str = "// 前😀\r\nmodule App;\r\nfn main() {}";
 const MODULE_GOLDEN: &str = concat!(
@@ -600,6 +626,10 @@ fn project_function(source: &str, function: &FnDecl, arena: &mut ProjectedArena)
 
     let mut children = Vec::new();
     for param in &function.params {
+        if param.mode == ParamMode::View {
+            assert!(matches!(tokens[cursor].kind, TokenKind::Ampersand));
+            cursor += 1;
+        }
         assert!(matches!(tokens[cursor].kind, TokenKind::Ident(_)));
         cursor += 1;
         let param_children = if let Some(ty) = &param.ty {
@@ -613,7 +643,7 @@ fn project_function(source: &str, function: &FnDecl, arena: &mut ProjectedArena)
             arena,
             "Parameter",
             param.name.clone(),
-            0,
+            i64::from(param.mode == ParamMode::View),
             param.span,
             &param_children,
         ));
@@ -902,8 +932,140 @@ fn rust_diagnostic_canonical(source: &str) -> String {
     )
 }
 
+fn borrowed_parameter_suite() -> String {
+    let mut body = r#"import { Token } from "../stage1/token.ku"
+import { Scan } from "../stage1/lexer.ku"
+import { Node, Arena, ParseOutput, AstCanonical, ValidateParseOutput } from "../stage2/ast.ku"
+import { ParseProgram } from "./parser.ku"
+import { ReadFunction } from "./functions.ku"
+
+fn AssertBorrow(source: str, expected: str): null! {
+    actual = AstCanonical(ParseProgram(source)?)
+    if (actual != expected) { panic("borrowed parameter arena mismatch: " + actual + " EXPECTED " + expected) }
+    return ok(null)
+}
+fn ExpectBorrowError(source: str, code: str, detail: str): null! {
+    caught = false
+    try { ParseProgram(source)? } catch(err) {
+        caught = true
+        expected = "error|bootstrap.parser.stage3|" + code.clone() + "|<source>|" + detail
+        if (err.domain != "bootstrap.parser.stage3" || err.code != code || err.message != expected) { panic("wrong borrowed parameter diagnostic: " + err.message) }
+    }
+    if (!caught) { panic("expected borrowed parameter diagnostic") }
+    return ok(null)
+}
+fn RejectExpression(start: int, end: int): ParseOutput! {
+    fail { domain: "bootstrap.borrow.test", code: "unexpected_callback", message: "invalid signature reached callback" }
+}
+fn ExpectBadWindow(tokens: [Token], base: int): null! {
+    caught = false
+    try { ReadFunction(tokens, base, RejectExpression)? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.parser.stage3" || err.code != "invalid_token_stream") { panic("wrong borrowed window diagnostic: " + err.message) }
+    }
+    if (!caught) { panic("expected borrowed window rejection") }
+    return ok(null)
+}
+fn ExpectInvalidMode(mode: int): null! {
+    node = Node { kind: "Parameter", text: "x", int_value: mode, line: 1, column: 1, offset: 0, end_line: 1, end_column: 2, end_offset: 1, first_edge: 0, edge_count: 0 }
+    caught = false
+    try { ValidateParseOutput(ParseOutput { arena: Arena { nodes: [node], edges: [] }, root: 1 })? } catch(err) {
+        caught = true
+        if (err.domain != "bootstrap.ast" || err.code != "invalid_parameter_mode") { panic("wrong parameter mode validation") }
+    }
+    if (!caught) { panic("invalid parameter mode accepted") }
+    return ok(null)
+}
+fn MainBorrow(): null! {
+"#.to_string();
+    for source in [
+        BORROWED_PARAMETER_GOLDEN_SOURCE,
+        "fn f(&value) {}",
+        "fn f(left: int, &text: str, right: bool) {}",
+        "fn f(&left: [pkg.Value!]!, &right: int | str) {}",
+        "fn f(& /* 前😀 */ value: str): str { return value }",
+        "module App\nimport helper from \"./helper.ku\"\nfn f(&value: helper.User) { helper.Read(value) }",
+    ] {
+        body.push_str(&format!("    AssertBorrow({}, {})?\n", ku_string(source), ku_string(&rust_canonical(source))));
+    }
+    let parameters = |count| {
+        (0..count)
+            .map(|index| format!("&p{index}: str"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let accepted = format!("fn f({}) {{}}", parameters(32));
+    body.push_str(&format!(
+        "    AssertBorrow({}, {})?\n",
+        ku_string(&accepted),
+        ku_string(&rust_canonical(&accepted))
+    ));
+    for source in [
+        "fn f(&) {}",
+        "fn f(&&x: str) {}",
+        "fn f(& &x: str) {}",
+        "fn f(&x: str,) {}",
+        "fn f(&x:) {}",
+        "fn f(&x: str &y: str) {}",
+        "fn f(&",
+        "// 前😀\r\nfn f(&: str) {}",
+    ] {
+        body.push_str(&format!(
+            "    ExpectBorrowError({}, \"unexpected_token\", {})?\n",
+            ku_string(source),
+            ku_string(&rust_error_canonical(source))
+        ));
+    }
+    let rejected = format!("fn f({}) {{}}", parameters(33));
+    let tokens = Lexer::new(&rejected)
+        .lex()
+        .expect("borrow parameter limit lex");
+    let over_index = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| token.kind == TokenKind::Ampersand)
+        .nth(32)
+        .expect("33rd borrowed parameter")
+        .0;
+    body.push_str(&format!(
+        "    ExpectBorrowError({}, \"parameter_limit\", {})?\n",
+        ku_string(&rejected),
+        ku_string(&diagnostic_at(
+            &rejected,
+            over_index,
+            "stage-3 functions accept at most 32 parameters"
+        ))
+    ));
+    body.push_str(r#"    valid = Scan("fn f(&x) {}")?
+    empty: [Token] = []
+    ExpectBadWindow(empty, 0)?
+    ExpectBadWindow(valid.clone(), -1)?
+    missing_eof: [Token] = [valid[0].clone(), valid[1].clone(), valid[2].clone(), valid[3].clone(), valid[4].clone(), valid[5].clone(), valid[6].clone(), valid[7].clone()]
+    ExpectBadWindow(missing_eof, 0)?
+    early_eof: [Token] = [valid[0].clone(), valid[1].clone(), valid[2].clone(), valid[8].clone(), valid[4].clone(), valid[5].clone(), valid[6].clone(), valid[7].clone(), valid[8].clone()]
+    ExpectBadWindow(early_eof, 0)?
+    ExpectBadWindow(Scan("fn f(&x) {} fn g() {}")?, 0)?
+    ExpectInvalidMode(-1)?
+    ExpectInvalidMode(2)?
+    return ok(null)
+}
+"#);
+    body
+}
+
 #[test]
 fn checked_in_stage3_goldens_pin_rust_projection_and_diagnostic_span() {
+    for (source, message) in EOF_NAME_DIAGNOSTICS {
+        assert_eq!(
+            rust_error_canonical(source),
+            diagnostic_for_kind(source, TokenKind::Eof, message),
+            "missing name or path must use the exact EOF point: {source:?}"
+        );
+    }
+    assert_eq!(
+        rust_canonical(BORROWED_PARAMETER_GOLDEN_SOURCE),
+        BORROWED_PARAMETER_GOLDEN
+    );
     assert_eq!(
         rust_canonical(TYPED_UNION_GOLDEN_SOURCE),
         TYPED_UNION_GOLDEN
@@ -2139,8 +2301,8 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
     let missing_module_name_message = rust_error_canonical(missing_module_name);
     assert_eq!(
         missing_module_name_message,
-        diagnostic_at(missing_module_name, 0, "expected module name"),
-        "the Rust parser currently relocates a missing module name to the consumed module token"
+        diagnostic_for_kind(missing_module_name, TokenKind::Eof, "expected module name"),
+        "a missing module name is diagnosed at the exact EOF point"
     );
     let keyword_module_name_message = rust_error_canonical(keyword_module_name);
     let dotted_module_name_message = rust_error_canonical(dotted_module_name);
@@ -2150,8 +2312,8 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
     let missing_struct_name_message = rust_error_canonical(missing_struct_name);
     assert_eq!(
         missing_struct_name_message,
-        diagnostic_at(missing_struct_name, 0, "expected struct name"),
-        "the Rust parser currently relocates a missing struct name to the consumed struct token"
+        diagnostic_for_kind(missing_struct_name, TokenKind::Eof, "expected struct name"),
+        "a missing struct name is diagnosed at the exact EOF point"
     );
     let missing_struct_open_message = rust_error_canonical(missing_struct_open);
     let missing_struct_field_name_message = rust_error_canonical(missing_struct_field_name);
@@ -2163,8 +2325,8 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
     let missing_enum_name_message = rust_error_canonical(missing_enum_name);
     assert_eq!(
         missing_enum_name_message,
-        diagnostic_at(missing_enum_name, 0, "expected enum name"),
-        "the Rust parser currently relocates a missing enum name to the consumed enum token"
+        diagnostic_for_kind(missing_enum_name, TokenKind::Eof, "expected enum name"),
+        "a missing enum name is diagnosed at the exact EOF point"
     );
     let missing_enum_open_message = rust_error_canonical(missing_enum_open);
     let missing_enum_variant_name_message = rust_error_canonical(missing_enum_variant_name);
@@ -2175,10 +2337,10 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         missing_enum_field_name_at_eof_message,
         diagnostic_for_kind(
             missing_enum_field_name_at_eof,
-            TokenKind::LParen,
+            TokenKind::Eof,
             "expected enum variant field name"
         ),
-        "the Rust parser currently relocates a missing enum field name to the consumed opening parenthesis"
+        "a missing enum field name after '(' is diagnosed at the exact EOF point"
     );
     let missing_enum_field_name_after_comma_at_eof_message =
         rust_error_canonical(missing_enum_field_name_after_comma_at_eof);
@@ -2186,10 +2348,10 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
         missing_enum_field_name_after_comma_at_eof_message,
         diagnostic_for_kind(
             missing_enum_field_name_after_comma_at_eof,
-            TokenKind::Comma,
+            TokenKind::Eof,
             "expected enum variant field name"
         ),
-        "the Rust parser currently relocates a missing enum field name to the consumed field comma"
+        "a missing enum field name after ',' is diagnosed at the exact EOF point"
     );
     let missing_enum_field_colon_message = rust_error_canonical(missing_enum_field_colon);
     let missing_enum_field_type_message = rust_error_canonical(missing_enum_field_type);
@@ -2332,6 +2494,15 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
     );
 
     body.push_str("    return ok(null)\n}\n\nfn MainDiagnostics(): null! {\n");
+    for (source, message) in EOF_NAME_DIAGNOSTICS {
+        let expected = diagnostic_for_kind(source, TokenKind::Eof, message);
+        assert_eq!(rust_error_canonical(source), expected);
+        body.push_str(&format!(
+            "    ExpectError({}, \"unexpected_token\", {})?\n",
+            ku_string(source),
+            ku_string(&expected)
+        ));
+    }
     for (source, code, message) in [
         (let_source, "unsupported_statement", let_message),
         (missing_body, "unexpected_eof", missing_message),
@@ -2856,7 +3027,9 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
     }
     let entry = stage3.join("main.ku");
     fs::write(stage3.join("suite.ku"), body).expect("write complete stage-3 differential suite");
-    fs::write(&entry, "import { MainWindows, MainGrammar, MainSourceBudgets, MainBoundaries, MainDiagnostics } from \"./suite.ku\"\nfn main(): null! { MainWindows()? MainGrammar()? MainSourceBudgets()? MainBoundaries()? MainDiagnostics()? return ok(null) }\n").expect("write stage-3 differential harness");
+    fs::write(stage3.join("borrow-suite.ku"), borrowed_parameter_suite())
+        .expect("write borrowed parameter suite");
+    fs::write(&entry, "import { MainWindows, MainGrammar, MainSourceBudgets, MainBoundaries, MainDiagnostics } from \"./suite.ku\"\nimport { MainBorrow } from \"./borrow-suite.ku\"\nfn main(): null! { MainWindows()? MainGrammar()? MainSourceBudgets()? MainBoundaries()? MainDiagnostics()? MainBorrow()? return ok(null) }\n").expect("write stage-3 differential harness");
     let entry_arg = entry.to_string_lossy().to_string();
     run_ku(&["check", &entry_arg]);
     // Fixed semantic batches retain every case and the original watchdog.
@@ -2877,6 +3050,10 @@ fn ExpectEnumWindowError(tokens: [Token], expected_detail: str): null! {
             started.elapsed()
         );
     }
+    let borrowed_batch = stage3.join("borrowed-parameters.ku");
+    fs::write(&borrowed_batch, "import { MainBorrow } from \"./borrow-suite.ku\"\nfn main(): null! { MainBorrow()? return ok(null) }\n").expect("write bounded borrowed parameter batch");
+    run_ku(&["check", &borrowed_batch.to_string_lossy()]);
+    run_ku(&["run", &borrowed_batch.to_string_lossy()]);
 
     // Token-to-character mapping exercises the largest bounded source owned by
     // this test. Give its exact token, character, and UTF-8 byte boundaries a

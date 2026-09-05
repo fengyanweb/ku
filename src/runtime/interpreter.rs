@@ -32,6 +32,7 @@ use crate::{
 
 const MAX_CALL_DEPTH: usize = 512;
 const HTTP_HANDLER_TIMEOUT_MESSAGE: &str = "http handler timeout";
+const HTTP_HANDLER_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const HTTP_ACCEPT_BATCH: usize = 64;
 const HTTP_EVENT_LOOP_SLEEP: Duration = Duration::from_millis(1);
 const HTTP_MAX_METHOD_BYTES: usize = 32;
@@ -44,6 +45,45 @@ enum Flow {
     LoopContinue,
     Return(Value),
     Fail(Value),
+}
+
+struct HttpHandlerDeadline {
+    deadline: Instant,
+    timed_out: bool,
+    cleanup_deadline: Option<Instant>,
+    cleanup_depth: usize,
+}
+
+impl HttpHandlerDeadline {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            timed_out: false,
+            cleanup_deadline: None,
+            cleanup_depth: 0,
+        }
+    }
+
+    fn poll(&mut self, now: Instant) -> bool {
+        self.timed_out |= now >= self.deadline;
+        self.timed_out
+            && (self.cleanup_depth == 0
+                || self
+                    .cleanup_deadline
+                    .is_some_and(|deadline| now >= deadline))
+    }
+
+    fn enter_cleanup(&mut self, now: Instant) {
+        // All nested finally blocks and their helpers share one fixed budget.
+        // Never disable safepoints: an infinite cleanup must release the worker.
+        self.cleanup_deadline
+            .get_or_insert(now + HTTP_HANDLER_CLEANUP_GRACE);
+        self.cleanup_depth += 1;
+    }
+
+    fn leave_cleanup(&mut self) {
+        self.cleanup_depth -= 1;
+    }
 }
 
 struct FunctionValueCall<'a> {
@@ -67,7 +107,7 @@ pub struct Interpreter {
     call_depth: usize,
     pending_fail: Option<Value>,
     std_modules: HashSet<String>,
-    execution_deadline: Option<Instant>,
+    execution_deadline: Option<HttpHandlerDeadline>,
     task_runtime: Option<TaskRuntime>,
     async_execution: bool,
 }
@@ -442,15 +482,17 @@ impl Interpreter {
 
     fn exec_block(&mut self, body: &[Stmt], env: &mut Env, depth: usize) -> KuResult<Flow> {
         env.push_scope();
-        for stmt in body {
-            let flow = self.exec_stmt(stmt, env, depth)?;
-            if !matches!(flow, Flow::Continue) {
-                env.pop_scope();
-                return Ok(flow);
+        let result = (|| {
+            for stmt in body {
+                let flow = self.exec_stmt(stmt, env, depth)?;
+                if !matches!(flow, Flow::Continue) {
+                    return Ok(flow);
+                }
             }
-        }
+            Ok(Flow::Continue)
+        })();
         env.pop_scope();
-        Ok(Flow::Continue)
+        result
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt, env: &mut Env, depth: usize) -> KuResult<Flow> {
@@ -703,28 +745,55 @@ impl Interpreter {
                 finally_body,
                 span,
             } => {
-                let mut flow = self.exec_block(body, env, depth)?;
-                if let Flow::Fail(value) = flow {
-                    if let Some(name) = catch_name {
+                let mut result = self.exec_block(body, env, depth);
+                if let (Ok(Flow::Fail(value)), Some(name)) = (&mut result, catch_name) {
+                    let value = std::mem::replace(value, Value::Null);
+                    result = {
                         env.push_scope();
-                        env.define_owned(name.clone(), value, false, *span)?;
-                        flow = Flow::Continue;
-                        for stmt in catch_body {
-                            flow = self.exec_stmt(stmt, env, depth)?;
-                            if !matches!(flow, Flow::Continue) {
-                                break;
+                        let caught = (|| {
+                            env.define_owned(name.clone(), value, false, *span)?;
+                            for stmt in catch_body {
+                                let flow = self.exec_stmt(stmt, env, depth)?;
+                                if !matches!(flow, Flow::Continue) {
+                                    return Ok(flow);
+                                }
                             }
-                        }
+                            Ok(Flow::Continue)
+                        })();
                         env.pop_scope();
-                    } else {
-                        flow = Flow::Fail(value);
-                    }
+                        caught
+                    };
                 }
-                let finally_flow = self.exec_block(finally_body, env, depth)?;
-                if !matches!(finally_flow, Flow::Continue) {
-                    return Ok(finally_flow);
+                let timed_out = matches!(&result, Err(error)
+                    if error.message == HTTP_HANDLER_TIMEOUT_MESSAGE
+                        && self.execution_deadline.as_ref().is_some_and(|state| state.timed_out));
+                if result.is_err() && !timed_out {
+                    // Fatal errors (including panic) and task cancellation keep
+                    // their existing semantics. Only HTTP timeout unwinds here.
+                    return result;
                 }
-                Ok(flow)
+                if timed_out {
+                    self.execution_deadline
+                        .as_mut()
+                        .expect("active HTTP timeout")
+                        .enter_cleanup(Instant::now());
+                }
+                let finally_result = self.exec_block(finally_body, env, depth);
+                if timed_out {
+                    self.execution_deadline
+                        .as_mut()
+                        .expect("active HTTP timeout")
+                        .leave_cleanup();
+                    // A return/fail in cleanup cannot turn a timed-out request
+                    // into success. The saved error owns the original outcome;
+                    // discarded cleanup payloads are dropped normally.
+                    finally_result?;
+                    return result;
+                }
+                match finally_result? {
+                    Flow::Continue => result,
+                    flow => Ok(flow),
+                }
             }
             Stmt::Fail { value, span } => {
                 let value = self.eval(value, env, depth)?;
@@ -1627,24 +1696,25 @@ impl Interpreter {
                 }
                 for arm in arms {
                     env.push_scope();
-                    let matched = match_pattern(&arm.pattern, &value, env, arm.span)?;
-                    if matched {
+                    let result = (|| {
+                        if !match_pattern(&arm.pattern, &value, env, arm.span)? {
+                            return Ok(None);
+                        }
                         if let Some(guard) = &arm.guard {
                             let guard = self.eval(guard, env, depth)?;
                             if self.pending_fail.is_some() {
-                                env.pop_scope();
-                                return Ok(Value::Null);
+                                return Ok(Some(Value::Null));
                             }
                             if !expect_bool_condition(guard, arm.span)? {
-                                env.pop_scope();
-                                continue;
+                                return Ok(None);
                             }
                         }
-                        let result = self.eval(&arm.value, env, depth);
-                        env.pop_scope();
-                        return result;
-                    }
+                        self.eval(&arm.value, env, depth).map(Some)
+                    })();
                     env.pop_scope();
+                    if let Some(value) = result? {
+                        return Ok(value);
+                    }
                 }
                 Err(KuError::runtime(
                     "match expression did not match any arm",
@@ -2426,7 +2496,9 @@ impl Interpreter {
             )),
         };
         self.steps = 0;
-        let previous_deadline = self.execution_deadline.replace(deadline);
+        let previous_deadline = self
+            .execution_deadline
+            .replace(HttpHandlerDeadline::new(deadline));
         let result = self.call_function_value(FunctionValueCall {
             params: &params,
             param_modes: &param_modes,
@@ -2438,8 +2510,16 @@ impl Interpreter {
             span,
             depth: 0,
         });
+        let timed_out = self.execution_deadline.as_mut().is_some_and(|state| {
+            state.poll(Instant::now());
+            state.timed_out
+        });
         self.execution_deadline = previous_deadline;
-        result
+        if timed_out && result.is_ok() {
+            Err(KuError::runtime(HTTP_HANDLER_TIMEOUT_MESSAGE, span))
+        } else {
+            result
+        }
     }
 
     fn eval_template(
@@ -2572,12 +2652,301 @@ impl Interpreter {
         }
         if self
             .execution_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
+            .as_mut()
+            .is_some_and(|deadline| deadline.poll(Instant::now()))
         {
             return Err(KuError::runtime(HTTP_HANDLER_TIMEOUT_MESSAGE, span));
         }
         self.steps = self.steps.saturating_add(1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+use crate::registry_server::native_test_harness as finally_bounded_process;
+
+#[cfg(test)]
+mod finally_tests {
+    use super::*;
+
+    fn body(source: &str) -> Vec<Stmt> {
+        let source = format!("fn test() {{\n{source}\n}}");
+        let program = Parser::new(Lexer::new(&source).tokenize().expect("lex fixture"))
+            .parse_program()
+            .expect("parse fixture");
+        let Item::Function(function) = program.items.into_iter().next().expect("fixture function")
+        else {
+            panic!("expected fixture function")
+        };
+        function.body
+    }
+
+    fn marker_env() -> Env {
+        let mut env = Env::new();
+        env.define_owned("marker".into(), Value::Int(0), true, Span::default())
+            .unwrap();
+        env
+    }
+
+    fn marker(env: &Env) -> i64 {
+        env.with_value("marker", Span::default(), |value| match value {
+            Value::Int(value) => Ok(*value),
+            _ => panic!("marker must stay int"),
+        })
+        .unwrap()
+    }
+
+    fn handler(source: &str, captures: &Env) -> Value {
+        Value::Function {
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            body: body(source),
+            captures: captures.clone(),
+            self_name: None,
+            is_async: false,
+        }
+    }
+
+    #[test]
+    fn interpreter_finally_preserves_normal_control_flow_and_owned_payloads() {
+        for (source, expected) in [
+            ("try { marker = 1 } finally { marker += 10 }", "continue"),
+            (
+                "try { return [\"saved\"] } finally { marker = 11 }",
+                "return",
+            ),
+            ("try { fail \"saved\" } finally { marker = 11 }", "fail"),
+            ("try { break } finally { marker = 11 }", "break"),
+            ("try { continue } finally { marker = 11 }", "loop"),
+        ] {
+            let mut interpreter = Interpreter::new();
+            let mut env = marker_env();
+            let flow = interpreter.exec_block(&body(source), &mut env, 0).unwrap();
+            let actual = match flow {
+                Flow::Continue => "continue",
+                Flow::Break => "break",
+                Flow::LoopContinue => "loop",
+                Flow::Return(value) => {
+                    assert_eq!(value, Value::Array(vec![Value::String("saved".into())]));
+                    "return"
+                }
+                Flow::Fail(value) => {
+                    assert_eq!(value, normalize_error_value(Value::String("saved".into())));
+                    "fail"
+                }
+            };
+            assert_eq!(actual, expected, "{source}");
+            assert_eq!(marker(&env), 11, "{source}");
+            assert!(interpreter.pending_fail.is_none());
+        }
+    }
+
+    #[test]
+    fn interpreter_finally_preserves_catch_fields_and_finally_override() {
+        let mut interpreter = Interpreter::new();
+        let mut env = marker_env();
+        let flow = interpreter
+            .exec_block(
+                &body(
+                    r#"
+            try { fail { domain: "sample", code: "failed", message: "saved" } }
+            catch (err) {
+                marker = 1
+                return [err.domain, err.code, err.message]
+            } finally { marker += 10 }
+        "#,
+                ),
+                &mut env,
+                0,
+            )
+            .unwrap();
+        let Flow::Return(value) = flow else {
+            panic!("expected saved return")
+        };
+        assert_eq!(
+            value,
+            Value::Array(vec![
+                Value::String("sample".into()),
+                Value::String("failed".into()),
+                Value::String("saved".into()),
+            ])
+        );
+        assert_eq!(marker(&env), 11);
+        assert!(!env.contains("err"));
+        let flow = interpreter
+            .exec_block(
+                &body(
+                    r#"
+            try { return "discarded" } finally { return "replacement" }
+        "#,
+                ),
+                &mut env,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(flow, Flow::Return(Value::String(value)) if value == "replacement"));
+    }
+
+    #[test]
+    fn interpreter_finally_fatal_paths_pop_block_catch_and_match_scopes() {
+        for source in [
+            "local = probe\npanic(\"fatal\")",
+            "try { local = probe\npanic(\"fatal\") } finally { marker = 9 }",
+            "try { fail \"caught\" } catch (err) { local = probe\npanic(\"fatal\") } finally { marker = 9 }",
+            "local = probe\nselected = match 1 { bound if (missing == true) => 0\n_ => 1 }",
+        ] {
+            let mut env = marker_env();
+            let probe = HttpListenerLease::new(-1);
+            env.define_owned("probe".into(), Value::HttpListenerLease(probe.clone()), false, Span::default()).unwrap();
+            let error = Interpreter::new().exec_block(&body(source), &mut env, 0).err().expect("fatal error");
+            assert!(error.message.contains("panic:") || error.message.contains("undefined variable"));
+            assert_eq!(marker(&env), 0, "fatal panic keeps its existing semantics");
+            for name in ["local", "err", "selected", "bound"] {
+                assert!(!env.contains(name), "{name} leaked in {source}");
+            }
+            assert_eq!(Arc::strong_count(&probe), 2, "block-owned references must drop on error");
+        }
+    }
+
+    #[test]
+    fn interpreter_finally_http_cleanup_budget_is_shared_and_never_restarted() {
+        let start = Instant::now();
+        let mut state = HttpHandlerDeadline::new(start);
+        assert!(state.poll(start));
+        state.enter_cleanup(start);
+        let end = start + HTTP_HANDLER_CLEANUP_GRACE;
+        assert!(!state.poll(end - Duration::from_nanos(1)));
+        state.enter_cleanup(end - Duration::from_millis(1));
+        assert_eq!(state.cleanup_deadline, Some(end));
+        assert!(state.poll(end));
+        state.leave_cleanup();
+        state.leave_cleanup();
+        assert_eq!(state.cleanup_depth, 0);
+        state.enter_cleanup(end + Duration::from_secs(1));
+        assert_eq!(state.cleanup_deadline, Some(end));
+        assert!(state.poll(end + Duration::from_secs(1)));
+        state.leave_cleanup();
+    }
+
+    #[test]
+    fn interpreter_finally_http_deadline_is_inactive_outside_handlers() {
+        let mut interpreter = Interpreter::new();
+        interpreter.tick(Span::default()).unwrap();
+        let mut state = HttpHandlerDeadline::new(Instant::now() + Duration::from_secs(10));
+        assert!(!state.poll(Instant::now()));
+        assert!(!state.timed_out);
+    }
+
+    #[test]
+    fn interpreter_finally_http_timeout_cleanup_is_bounded() {
+        const CHILD: &str = "KU_INTERPRETER_FINALLY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "runtime::interpreter::finally_tests::interpreter_finally_http_timeout_cleanup_is_bounded", "--nocapture"])
+                .env(CHILD, "1");
+            let output = finally_bounded_process::run_bounded(
+                &mut command,
+                Duration::from_secs(15),
+                finally_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("infinite finally must not hang the test process");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        for (source, expected) in [
+            (
+                r#"
+                fn helper(value: str): str { return value }
+                try { while (true) {} }
+                catch (err) { marker = 9 }
+                finally {
+                    try { text = helper("owned")\nmarker = 1 }
+                    finally { marker = marker * 10 + 2 }
+                }
+            "#,
+                12,
+            ),
+            (
+                r#"
+                try { fail "caught" } catch (err) { while (true) {} }
+                finally { marker = 1 }
+            "#,
+                1,
+            ),
+            (
+                r#"
+                try { try { while (true) {} } finally { marker = 1 } }
+                finally { marker = marker * 10 + 2 }
+            "#,
+                12,
+            ),
+            (
+                r#"
+                try { while (true) {} }
+                finally { marker = 1\nreturn "cannot swallow timeout" }
+            "#,
+                1,
+            ),
+            (
+                r#"
+                try { while (true) {} }
+                finally { marker = 1\nfail "cannot swallow timeout" }
+            "#,
+                1,
+            ),
+            (
+                r#"
+                try { try { while (true) {} } finally { marker = 1\nwhile (true) {} } }
+                finally { marker = 9 }
+            "#,
+                1,
+            ),
+            // A timeout first encountered in an ordinary finally still exits
+            // that block; this patch does not resume its remaining statements.
+            (
+                r#"
+                try { marker = 1 }
+                finally { marker = 2\nwhile (true) {}\nmarker = 9 }
+            "#,
+                2,
+            ),
+        ] {
+            let source = source.replace("\\n", "\n");
+            let captures = marker_env();
+            let mut interpreter = Interpreter::new();
+            let value = handler(&source, &captures);
+            let error = interpreter
+                .call_http_handler(
+                    value,
+                    Value::Null,
+                    Span::default(),
+                    Instant::now() + Duration::from_millis(200),
+                )
+                .unwrap_err();
+            assert_eq!(error.message, HTTP_HANDLER_TIMEOUT_MESSAGE, "{source}");
+            assert_eq!(marker(&captures), expected, "{source}");
+            assert!(interpreter.execution_deadline.is_none());
+            assert!(interpreter.pending_fail.is_none());
+            assert_eq!(interpreter.call_depth, 0);
+            let healthy = handler("return 42", &captures);
+            assert_eq!(
+                interpreter
+                    .call_http_handler(
+                        healthy,
+                        Value::Null,
+                        Span::default(),
+                        Instant::now() + Duration::from_secs(5)
+                    )
+                    .unwrap(),
+                Value::Int(42)
+            );
+        }
     }
 }
 

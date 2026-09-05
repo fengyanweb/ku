@@ -34,10 +34,6 @@ fn ReadEnum(tokens: [Token]): DeclarationRead! {
     start = tokens[0].clone()
     cursor = 1
     name = tokens[cursor].clone()
-    // Rust consume_ident leaves EOF at the previous token for this position.
-    if (name.kind == "Eof") {
-        RejectAt(start.clone(), "unexpected_token", "expected enum name")?
-    }
     if (name.kind != "Ident") {
         RejectAt(name.clone(), "unexpected_token", "expected enum name")?
     }
@@ -71,11 +67,6 @@ fn ReadEnum(tokens: [Token]): DeclarationRead! {
                     RejectAt(tokens[cursor].clone(), "work_limit", "stage-3 parser work budget exceeded")?
                 }
                 field_name = tokens[cursor].clone()
-                // consume_ident does not advance EOF, so Rust attributes this
-                // particular error to '(' or the preceding comma.
-                if (field_name.kind == "Eof") {
-                    RejectAt(tokens[cursor - 1].clone(), "unexpected_token", "expected enum variant field name")?
-                }
                 if (field_name.kind != "Ident") {
                     RejectAt(field_name.clone(), "unexpected_token", "expected enum variant field name")?
                 }
