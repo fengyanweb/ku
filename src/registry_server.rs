@@ -4198,7 +4198,7 @@ fn server_error(code: &str, message: impl Into<String>) -> KuError {
 #[cfg(test)]
 #[allow(dead_code)]
 #[path = "../tests/support/native_pg_harness.rs"]
-mod native_test_harness;
+pub(crate) mod native_test_harness;
 
 #[cfg(test)]
 mod tests {

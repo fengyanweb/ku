@@ -271,12 +271,12 @@ fn native_result_context_preserves_payload_types_and_owned_error_cleanup() {
     );
     for expected in [
         "KuResult_int ReturnInt(KuString message)",
-        "KuResult_str ReturnStr()",
-        "KuResult_array_str ReturnArray()",
-        "KuResult_struct_Box ReturnStruct()",
-        "KuResult_enum_Choice ReturnEnum()",
+        "KuResult_str ReturnStr(void)",
+        "KuResult_array_str ReturnArray(void)",
+        "KuResult_struct_Box ReturnStruct(void)",
+        "KuResult_enum_Choice ReturnEnum(void)",
         "KuResult_int PassResult(KuResult_int value)",
-        "KuResult_array_str EmptyWords()",
+        "KuResult_array_str EmptyWords(void)",
     ] {
         assert!(
             generated.contains(expected),

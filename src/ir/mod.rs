@@ -16,6 +16,7 @@ use crate::{
 };
 
 mod borrow;
+mod monomorph;
 pub use borrow::verify_borrow_contract;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +368,8 @@ fn ir_type_is_owned(ty: &IrType) -> bool {
 }
 
 pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
+    let specialized = monomorph::specialize(program)?;
+    let program = specialized.as_ref().unwrap_or(program);
     let layouts = lower_layouts(program);
     let mut signatures = HashMap::new();
     let mut next_function_id = 0;

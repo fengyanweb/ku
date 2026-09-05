@@ -8,6 +8,8 @@ Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `
 
 第一层协议的真实完成度、生产部署边界和通用 TLS 落地顺序见 [协议地基状态](docs/protocol-foundation.md)。
 
+规范性规则从 [语义合同](docs/semantics.md) 和 [语法合同](docs/syntax.md) 进入；后端覆盖和测试证据不等于语言规则。[v0.0.18 实施记录](docs/v0.0.18-worklog.md) 是未完成工作，不是已发布能力。
+
 ## 快速开始
 
 ```powershell
@@ -91,7 +93,7 @@ ku -h | -help         Print help
 
 `ku check` 会检查词法、语法和基础语义错误，并输出文件名、行号、列号和源码片段。`--deny-unused` 是严格 unused 第一阶段，会把未读取的本文件局部变量/常量报成 `E0905`；`_` 或 `_name` 表示有意丢弃。
 
-## 0.0.15 支持的核心语法
+## 当前核心语法
 
 ```ku
 struct User {
@@ -357,7 +359,7 @@ http_pg_frontend.html # http_pg 的前端页面
 
 `ku build --native <file.ku>` 不带 `-o` 时保留旧的单文件兼容模式，只在源码旁写出 `.c`，不执行链接；`ku build --native -o <path> <file.ku>` 则进入与 `--backend c` 相同的生成、编译、链接和产物校验流程。普通跨系统发布使用上面的 `--backend c --target` 命令，避免把“只生成 C”误认为已经得到目标二进制。
 
-native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制，覆盖 `int` / `bool` / `str`（正式 `KuString` owned ABI，支持拼接与 `str()`/`len`/`chars`/`contains`/`slice` 等方法）、struct（含数组/嵌套/enum 字段）、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包（env 引用计数）、native HTTP 服务以及数据库驱动（std.pg/redis/mysql）的已实现子集。array/named/Result/struct/闭包按默认 move、显式 `clone()`、自动 drop 生成所有权代码，并由 checker 做路径级 move 分析。深层闭包只为实际被捕获的函数参数创建共享 cell；当前参数路径直接覆盖 Copy、`str`、array、函数值、struct、enum 和 Result，未被捕获的参数不增加 cell/RC 开销，owned 参数 move 进 cell 后会清空原始 ABI 参数；普通局部路径另已覆盖 object 与 KuValue。核心同步 ABI、`std.fs/std.json/std.time`、native HTTP、`std.net` 明文与 Redis 的 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支均已在 Windows 2025、Ubuntu 24.04、macOS 15 的完整 workspace CI 中跑绿；三个目标的独立 native build/run 门槛也已通过。`std.net` 的可选 TLS 已接入 generated C 与 target-pack 链接门槛，但当前精确 pack/build-id 组合的三系统最终消费者 CI 仍是发布阻断项，不沿用旧 pack 或只跑 runtime crate 的结果冒充通过。这些证据也不等于 Redis/MySQL 实服查询或 PG 的 Linux/macOS 实库往返已经完成。`std.mysql` 目前只在 host build 自动配对 client library，显式 non-host target 会提前拒绝；三系统发布因此应在各目标系统分别构建。`std.pg` 构建必须通过绝对、专用的 `KU_PG_LIB` 目录提供匹配目标的 shared/import libpq；compiler/sysroot 还必须满足其传递依赖。仍明确报不支持的：动态 object 的部分复杂场景、从 dynamic object 取回闭包后调用、闭包捕获 catch/match binding、在更深闭包里捕获 local function 的 self、`for` 迭代变量，以及 Task 捕获/async native lowering；dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同，不能按普通局部的证据视为已完成。str 的 `trim`/`lower`/`upper`（需 Unicode 表）也仍未实现。
+native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制，覆盖 `int` / `bool` / `str`（正式 `KuString` owned ABI，支持拼接与 `str()`/`len`/`chars`/`contains`/`slice` 等方法）、struct（含数组/嵌套/enum 字段）、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包（env 引用计数）、native HTTP 服务以及数据库驱动（std.pg/redis/mysql）的已实现子集。array/named/Result/struct/闭包按默认 move、显式 `clone()`、自动 drop 生成所有权代码，并由 checker 做路径级 move 分析。深层闭包只为实际被捕获的函数参数创建共享 cell；当前参数路径直接覆盖 Copy、`str`、array、函数值、struct、enum 和 Result，未被捕获的参数不增加 cell/RC 开销，owned 参数 move 进 cell 后会清空原始 ABI 参数；普通局部路径另已覆盖 object 与 KuValue。核心同步 ABI、`std.fs/std.json/std.time`、native HTTP、`std.net` 明文与 Redis 的 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支均已在 Windows 2025、Ubuntu 24.04、macOS 15 的完整 workspace CI 中跑绿；三个目标的独立 native build/run 门槛也已通过。`std.net` 的可选 TLS 在 v0.0.17 的精确提交 `c66828390eb3124750bca9a9c7e789dd2df70267` 已通过包含最终消费者的[三系统 CI](https://github.com/fengyanweb/ku/actions/runs/33969256015)；此历史证据不代表 v0.0.18 工作分支或后续 pack 已通过，变更后仍须重新验收。这些证据也不等于 Redis/MySQL 实服查询或 PG 的 Linux/macOS 实库往返已经完成。`std.mysql` 目前只在 host build 自动配对 client library，显式 non-host target 会提前拒绝；三系统发布因此应在各目标系统分别构建。`std.pg` 构建必须通过绝对、专用的 `KU_PG_LIB` 目录提供匹配目标的 shared/import libpq；compiler/sysroot 还必须满足其传递依赖。仍明确报不支持的：动态 object 的部分复杂场景、从 dynamic object 取回闭包后调用、闭包捕获 catch/match binding、在更深闭包里捕获 local function 的 self、`for` 迭代变量，以及 Task 捕获/async native lowering；dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同，不能按普通局部的证据视为已完成。str 的 `trim`/`lower`/`upper`（需 Unicode 表）也仍未实现。
 
 已完成到 0.0.15 的关键前置：
 
