@@ -333,6 +333,295 @@ fn main() {
 }
 
 #[test]
+fn match_binding_capture_does_not_fall_back_to_boxed_outer_homonym() {
+    let source = r#"
+fn main() {
+    shadow = 99
+    keep_outer = () => {
+        return shadow
+    }
+    selected = match 1 {
+        shadow => (() => { return shadow })()
+    }
+    keep_outer()
+    selected
+}
+"#;
+    let tokens = Lexer::new(source).tokenize().expect("lex");
+    let program = Parser::new(tokens).parse_program().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let error = ir::lower_program(&program)
+        .expect_err("IR must not capture the boxed outer homonym for a match binding")
+        .to_string();
+
+    assert!(
+        error.contains("does not support closure capture of match binding 'shadow' yet"),
+        "match-binding capture must fail explicitly instead of reading the outer cell: {error}"
+    );
+}
+
+#[test]
+fn nested_match_preserves_outer_pattern_capture_boundary() {
+    let source = r#"
+fn main() {
+    selected = match 1 {
+        outer => match 2 {
+            _ => (() => { return outer })()
+        }
+    }
+    selected
+}
+"#;
+    let tokens = Lexer::new(source).tokenize().expect("lex");
+    let program = Parser::new(tokens).parse_program().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let error = ir::lower_program(&program)
+        .expect_err("a nested match must retain the outer pattern-binding overlay")
+        .to_string();
+
+    assert!(
+        error.contains("does not support closure capture of match binding 'outer' yet"),
+        "nested match must fail on the real outer pattern binding, not emit an unknown local: {error}"
+    );
+}
+
+#[test]
+fn catch_binding_capture_fails_closed_before_c_codegen() {
+    let source = r#"
+fn Fail(): null! {
+    fail { domain: "capture", code: "expected", message: "owned" }
+}
+
+fn main(): null! {
+    try {
+        Fail()?
+    } catch(err) {
+        read_error = () => {
+            return err.message.clone()
+        }
+        println(read_error())
+    }
+    return ok(null)
+}
+"#;
+    let tokens = Lexer::new(source).tokenize().expect("lex");
+    let program = Parser::new(tokens).parse_program().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let error = ir::lower_program(&program)
+        .expect_err("catch bindings need an explicit capture ABI before native lowering")
+        .to_string();
+
+    assert!(
+        error.contains("cannot capture lexical local 'err' without a shared cell"),
+        "catch-binding capture must fail deterministically before emitting unbound C: {error}"
+    );
+}
+
+#[test]
+fn nested_closure_capture_of_local_function_self_fails_closed() {
+    let source = r#"
+fn main(): null! {
+    fn recur(n: int): int {
+        call_again = () => {
+            return recur(n - 1)
+        }
+        if (n <= 0) {
+            return 0
+        }
+        return call_again()
+    }
+    println(recur(1))
+    return ok(null)
+}
+"#;
+    let tokens = Lexer::new(source).tokenize().expect("lex");
+    let program = Parser::new(tokens).parse_program().expect("parse");
+    Checker::new().check(&program).expect("check");
+    let error = ir::lower_program(&program)
+        .expect_err("a nested closure cannot silently lose its local-function self binding")
+        .to_string();
+
+    assert!(
+        error
+            .contains("does not support nested closure capture of local function self 'recur' yet"),
+        "local-function self capture must fail before unknown/unbound C emission: {error}"
+    );
+}
+
+#[test]
+fn ir_boxes_only_parameters_captured_by_deeper_functions() {
+    let source = r#"
+fn Plain(plain: int): int {
+    return plain
+}
+
+fn UnreachableCapture(dead_parameter: int): int {
+    return dead_parameter
+    fn never_lowered(): int {
+        return dead_parameter
+    }
+}
+
+fn CopyCapture(copy_parameter: int): int {
+    counter = copy_parameter
+    fn bump(): int {
+        counter = counter + 1
+        return counter
+    }
+    fn read_parameter(): int {
+        return copy_parameter
+    }
+    return bump() + bump() + read_parameter()
+}
+
+fn OwnedCapture(label: str, values: [int]): str {
+    fn read_label(): str {
+        return label.clone()
+    }
+    fn read_values(): [int] {
+        return values.clone()
+    }
+    copied = read_values()
+    if (copied.len() != 2) {
+        panic("wrong captured array")
+    }
+    return read_label()
+}
+
+fn WriteOnlyParameter(values_to_write: [int]): int {
+    setter = () => {
+        values_to_write[0] = 9
+        return 0
+    }
+    setter()
+    return values_to_write[0]
+}
+
+fn FunctionCapture(operation: fn(): int): int {
+    fn invoke(): int {
+        return operation()
+    }
+    return invoke() + operation()
+}
+
+fn MultiLevel(root_value: int): int {
+    fn middle(local_parameter: int): int {
+        fn deepest(): int {
+            return root_value + local_parameter
+        }
+        return deepest()
+    }
+    literal = (closure_parameter: int) => {
+        nested = () => {
+            return root_value + closure_parameter
+        }
+        return nested()
+    }
+    return middle(2) + literal(3)
+}
+
+fn Shadow(shadowed: int, untouched: int): int {
+    fn child(shadowed: int): int {
+        return shadowed
+    }
+    return shadowed + untouched + child(1)
+}
+
+fn main() {
+    Plain(0)
+}
+"#;
+
+    let text = lower_ir(source);
+
+    for captured in [
+        "copy_parameter",
+        "label",
+        "values",
+        "values_to_write",
+        "operation",
+        "root_value",
+        "local_parameter",
+        "closure_parameter",
+    ] {
+        let initializer = format!(" = {captured}");
+        let suffix = format!("_{captured}");
+        let aliases = text
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let rest = line.strip_prefix("cell_new ")?;
+                let (alias, _) = rest.split_once(':')?;
+                (alias.ends_with(&suffix) && line.ends_with(&initializer))
+                    .then(|| alias.to_string())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aliases.len(),
+            1,
+            "captured parameter must be boxed exactly once without replacing its ABI name: {captured}\n{text}"
+        );
+        let alias = &aliases[0];
+        assert!(
+            alias.starts_with("__ku_local_"),
+            "captured parameter cell must use a distinct local alias: {captured}\n{text}"
+        );
+        assert!(
+            text.contains(&format!("captured_cell {alias}")),
+            "deeper function must receive captured parameter cell: {captured}\n{text}"
+        );
+    }
+    assert_eq!(
+        text.matches("cell_new counter").count(),
+        1,
+        "the mutable Copy local must still share one cell with its writer closure:\n{text}"
+    );
+    assert!(
+        text.contains("captured_cell counter"),
+        "the writer closure must receive the mutable Copy local's cell:\n{text}"
+    );
+    for uncaptured in ["plain", "dead_parameter", "shadowed", "untouched"] {
+        let parameter_initializer = format!(" = {uncaptured}");
+        assert!(
+            !text.lines().any(|line| {
+                line.trim().starts_with("cell_new ")
+                    && line.trim().ends_with(&parameter_initializer)
+            }) && !text.contains(&format!("captured_cell {uncaptured}")),
+            "uncaptured or shadowed parameter must stay an ordinary value: {uncaptured}\n{text}"
+        );
+    }
+    assert!(
+        !text.contains("unknown"),
+        "captured parameter lowering must not leave unknown IR types:\n{text}"
+    );
+}
+
+#[test]
+fn captured_parameters_remain_immutable_language_bindings() {
+    let error = check_source(
+        "captured-parameter-write.ku",
+        r#"
+fn Mutate(value: int): int {
+    fn nested(): int {
+        value = value + 1
+        return value
+    }
+    return nested()
+}
+
+fn main() {}
+"#,
+    )
+    .expect_err("a nested function must not make its outer parameter mutable")
+    .to_string();
+
+    assert!(
+        error.contains("cannot assign to immutable variable 'value'"),
+        "unexpected captured-parameter mutation diagnostic: {error}"
+    );
+}
+
+#[test]
 fn package_version_writes_lock_file() {
     let dir = unique_temp_path("package-lock");
     let src = dir.join("src");

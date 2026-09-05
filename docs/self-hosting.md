@@ -26,7 +26,7 @@
 ## 已可复用的工具链地基
 
 - native build 已先完成 import graph 展开，不依赖原 `.ku` 模块路径。
-- native ABI 已覆盖 `KuString`、array、dynamic object、Result/Error 和 closure/function value 的已实现子集及对应 move/clone/drop。常规局部捕获已验证，`for` 迭代变量捕获仍明确拒绝；这不是全部捕获形式的完成声明。array 现增加 `capacity` 字段，兼容旧两字段 C 初始化写法，但不兼容旧布局的外部二进制 ABI，相关 C/FFI 产物必须重新编译。
+- native ABI 已覆盖 `KuString`、array、dynamic object、Result/Error 和 closure/function value 的已实现子集及对应 move/clone/drop。深层闭包会按需装箱实际被捕获的顶层函数、局部命名函数和 closure literal 参数；参数路径当前直接验证了 Copy、`str`、array、函数值、struct、enum 与 Result，未捕获参数没有额外 cell/RC 开销，owned 参数 move 进 cell 时会清空原始 ABI 参数；普通局部路径另已验证 object 与 KuValue。catch/match binding、在更深闭包里捕获 local function 的 self、`for` 迭代变量和 Task/async 仍明确拒绝；dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同。这不是全部捕获形式的完成声明。array 现增加 `capacity` 字段，兼容旧两字段 C 初始化写法，但不兼容旧布局的外部二进制 ABI，相关 C/FFI 产物必须重新编译。
 - `std.fs`、`std.json`、`std.time` 已有 native 闭环，足够构建有文件输入和结构化输出的小型编译工具。
 - PostgreSQL/Redis/MySQL 是 native-only 生态能力；它们不是自举前端的依赖，数据库稳定工作与编译器迁移保持解耦。
 

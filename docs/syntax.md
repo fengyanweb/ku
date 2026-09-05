@@ -2183,7 +2183,7 @@ LLVM 数组、enum、闭包、HTTP、async lowering
 LLVM 递归 struct 和更复杂 Result payload
 覆盖全部语言特性（尤其 async/递归值类型）的完整 native C 后端
 registry v2 自动 signed-roots、在线 key 吊销和透明轮换（v1 使用项目显式公钥 pin）
-native async 函数值 / async lowering；闭包捕获 struct/enum/Result/Task 等 owned 类型；从 dynamic object 取回闭包后再调用（KuValue 不可 call）
+native async 函数值 / async lowering；闭包捕获 catch/match binding、local-function self、`for` 迭代变量或 Task；dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同；从 dynamic object 取回闭包后再调用（KuValue 不可 call）
 native C HTTP 对阻塞系统/FFI 调用的可取消 transport，以及超时首次发生在 `finally` 中时的完整剩余清理语义
 match guard 模式矩阵和跨 guard 的完整穷尽性检查
 顶层脚本语句
