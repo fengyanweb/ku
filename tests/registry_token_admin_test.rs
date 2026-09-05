@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 #[path = "support/bounded_process.rs"]
 mod bounded_process;
+#[path = "support/disconnected_stdout.rs"]
+mod disconnected_stdout;
 
 use bounded_process::{run_bounded, OutputLimits};
 use sha2::{Digest, Sha256};
@@ -8,7 +10,7 @@ use std::{
     collections::HashSet,
     env, fs,
     io::Read,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Child, Command, Output, Stdio},
     sync::{Arc, Barrier},
     thread,
@@ -171,54 +173,18 @@ impl Drop for ClosingStdoutChild {
     }
 }
 
-fn run_with_closed_stdout(command: &mut Command, credentials: &Path) -> Output {
-    let mut name = credentials.file_name().unwrap().to_os_string();
-    name.push(".lock");
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let lock = options.open(credentials.with_file_name(name)).unwrap();
-    lock.try_lock()
-        .expect("fixture owns a fresh uncontended admin lock");
+fn run_with_closed_stdout(command: &mut Command) -> Output {
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(disconnected_stdout::disconnected_stdout())
         .stderr(Stdio::piped())
         .env("RUST_BACKTRACE", "0");
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-
-        // Closing the parent's pipe reader is normally enough to make the
-        // child's first write fail.  A concurrently spawned process can briefly
-        // retain that reader between fork and exec, though, which made this
-        // fault injection racy in the two-thread Linux CI suite. close(2) is
-        // async-signal-safe, and running it after Command's stdio setup makes
-        // the child observe a deterministic EBADF without adding a production
-        // test hook.
-        command.pre_exec(|| {
-            if libc::close(libc::STDOUT_FILENO) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
     let mut child = ClosingStdoutChild(
         command
             .spawn()
             .expect("start closed-output registry process"),
     );
-    // Hold the same OS lock until the parent's pipe reader has been closed,
-    // so even a fast child cannot print its token before the injected failure.
-    drop(child.0.stdout.take().expect("child stdout pipe"));
     let stderr = child.0.stderr.take().expect("child stderr pipe");
-    lock.unlock().unwrap();
-    drop(lock);
     let deadline = Instant::now() + CHILD_TIMEOUT;
     let status = loop {
         if let Some(status) = child.0.try_wait().expect("poll closed-output process") {
@@ -247,10 +213,8 @@ fn run_with_closed_stdout(command: &mut Command, credentials: &Path) -> Output {
 fn closed_stdout_reports_committed_issue_hash_and_revoke_without_panicking_or_leaking() {
     let root = TestDirectory::new();
     let credentials = root.0.join("credentials.txt");
-    let issue = run_with_closed_stdout(
-        registry_command(&credentials).args(["token", "issue", "math"]),
-        &credentials,
-    );
+    let issue =
+        run_with_closed_stdout(registry_command(&credentials).args(["token", "issue", "math"]));
     assert!(!issue.status.success());
     let diagnostic = String::from_utf8(issue.stderr).unwrap();
     assert!(diagnostic.contains("token output failed"));
@@ -288,7 +252,6 @@ fn closed_stdout_reports_committed_issue_hash_and_revoke_without_panicking_or_le
         registry_command(&credentials)
             .args(["token", "revoke", "math"])
             .env("KU_REGISTRY_TOKEN", &token),
-        &credentials,
     );
     assert!(!revoke.status.success());
     let diagnostic = String::from_utf8(revoke.stderr).unwrap();

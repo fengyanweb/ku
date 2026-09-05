@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 #[path = "support/bounded_process.rs"]
 mod bounded_process;
+#[path = "support/disconnected_stdout.rs"]
+mod disconnected_stdout;
 
 use bounded_process::{run_bounded, BoundedOutput, OutputLimits};
 use sha2::{Digest, Sha256};
@@ -66,16 +68,10 @@ fn run_with_closed_stdout(credentials: &PathBuf, arguments: &[&str]) -> BoundedO
         .env("KU_REGISTRY_CREDENTIALS_FILE", credentials)
         .args(arguments)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(disconnected_stdout::disconnected_stdout())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn registry governance command with piped stdout");
-    drop(
-        child
-            .stdout
-            .take()
-            .expect("child stdout pipe must be available"),
-    );
+        .expect("spawn registry governance command with disconnected stdout");
     let mut stderr = child
         .stderr
         .take()
