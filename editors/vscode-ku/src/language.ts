@@ -6,7 +6,7 @@ import { builtins, keywords, memberCompletionLabels, stdFunctions, stdImportPath
 import { execFileExitCode, firstWorkingExecutable } from "./executableModel";
 import { defaultModuleName, parseImports, resolveImportUri } from "./imports";
 
-const KU_VERSION = "0.0.16";
+const KU_VERSION = "0.0.17";
 const KU_MODE: vscode.DocumentSelector = [{ language: "ku", scheme: "file" }];
 const diagnosticCollection = vscode.languages.createDiagnosticCollection("ku");
 const output = vscode.window.createOutputChannel("Ku");

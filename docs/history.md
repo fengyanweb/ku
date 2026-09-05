@@ -9,6 +9,7 @@ release/
   <target>/
     ku[.exe]
     libku.rlib
+    deps/                          # Rust 运行器编译依赖：RLIB 与匹配平台的 proc-macro 动态库
     ku-language-<version>.vsix
     ku.pdb                         # 仅 Windows，存在时包含
     native-tls/v1/<target>/
@@ -38,7 +39,8 @@ history/
 | 0.0.13 | 已归档 | build 命令入口、ku.mod main/out、std root 小写导入诊断、std.time 边界、VS Code/release 同步 |
 | 0.0.14 | 已归档 | create/init/template 项目模板、HTTP status helper、匿名 fn handler、VS Code/release 同步 |
 | 0.0.15 | 已归档 | 对象解构、HTTP service 调用严格化、示例重写、clone/IR/native 路线同步 |
-| 0.0.16 | 当前 | native 标准库、统一数据库 client、package/registry 与 target-scoped 发布合同 |
+| 0.0.16 | 历史版本 | native 标准库、统一数据库 client、package/registry 与 target-scoped 发布合同 |
+| 0.0.17 | 当前实验版本 | 同步 `&` 只读借用、Stage3 braced `while` 与跨平台测试工具修复；验收状态见 [版本记录](v0.0.17.md) |
 
 ## 自动化
 
@@ -55,13 +57,17 @@ pwsh -NoLogo -NoProfile -File scripts\archive-release.ps1 -CheckOnly
 pwsh -NoLogo -NoProfile -File scripts\package-release.ps1
 ```
 
-生成 release bundle 后再发布不可变历史快照：
+从当前源码重新构建，并同时更新 release bundle 与不可变历史快照（不必先执行上一条命令）：
 
 ```powershell
 pwsh -NoLogo -NoProfile -File scripts\archive-release.ps1
 ```
 
-`package-release.ps1` 使用当前 host 对应的显式 Cargo target 目录，构建固定版本 TLS pack 与 lockfile-backed VSIX，并在私有 staging 中校验文件集、目标架构和 pack 合同后，以 per-target 单写者锁、完整目录切换和 journal 崩溃恢复发布 `release/<target>/`。替换既有目录需要两次目录移动，无锁读者在切换窗口可能短暂看不到 current target，不能把它称为原子可见。`archive-release.ps1` 复验该 bundle，再以不可变目标发布 `history/v<version>/<target>/`；该目标已存在时拒绝覆盖。`-CheckOnly` 仍执行实际构建与验证，但不发布 release/history bundle；没有跳过构建的 `-SkipBuild` 逃生门。
+`package-release.ps1` 使用当前 host 对应的显式 Cargo target 目录，构建固定版本 TLS pack 与 lockfile-backed VSIX，并在私有 staging 中校验文件集、目标架构和 pack 合同后，以 per-target 单写者锁、完整目录切换和 journal 崩溃恢复发布 `release/<target>/`。替换既有目录需要两次目录移动，无锁读者在切换窗口可能短暂看不到 current target，不能把它称为原子可见。`archive-release.ps1` 调用同一构建链路，重新构建后同时更新 release 并发布 `history/v<version>/<target>/`，不会直接复制或信任原有 release；历史目标已存在时拒绝覆盖。两条 `-CheckOnly` 命令各自执行实际构建与验证，但不发布 release/history bundle；通常运行 archive 的检查即可覆盖该完整链路，无需为一次验收重复构建。没有跳过构建的 `-SkipBuild` 逃生门。
+
+`libku.rlib` 不是普通 `ku build` 的完整依赖集：bundle 还携带同次私有 Cargo 构建的 `deps/`，包含 Rust 运行器所需的 RLIB 和匹配平台的 proc-macro 动态库。脚本固定文件名、大小、SHA-256 与对象格式，拒绝缺失、额外或变化的依赖。普通 build 的隔离 consumer 清除开发库搜索环境，固定 Rust 1.89.0；先隐藏 `deps` 并要求缺库失败，再恢复依赖完成带本地 import 的普通 build，在保留源码时运行，并验证隐藏编译依赖后仍能运行；另用无 import 的独立 runner 验证移走源码后运行。默认 runner 只嵌入主文件，含 import 时仍需要原导入源码；需要包含完整 import graph 的独立部署请使用 `ku build --native`。该门槛独立于 native TLS consumer，避免只验证 native build 而遗漏默认 runner 路径。用户执行默认 `ku build` 仍需匹配的 Rust 工具链及系统 linker。
+
+GitHub 安装包使用 `ku-v<version>-<Rust triple>.tar.gz`，以 [Releases](https://github.com/fengyanweb/ku/releases) 中实际列出的版本与 target 资产为准。外层下载资产附带 `README-INSTALL.md`、`RELEASE.json`、逐文件 `SHA256SUMS`、`THIRD_PARTY.json` 与 `THIRD_PARTY/` notices；并列的 `.tar.gz.manifest.json` 记录归档整体和文件清单的 hash。内部严格 bundle 不包含 `ku-registry` 服务端。`Native three-OS gate` 上传的 `native_ci-*` 是源码无关 native 验收样例，不是 Ku CLI 安装包；也不能把 workflow 已配置或某个旧提交通过等同于新版本发布成功。
 
 ## 规则
 

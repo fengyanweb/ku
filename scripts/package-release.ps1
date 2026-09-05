@@ -24,6 +24,7 @@ $script:archiveVerifier = $null
 $script:releaseWorkRoot = $null
 $script:toolWrapper = $null
 $script:expectedTlsHeaderHash = $null
+$script:expectedRustDependencies = $null
 
 function Get-HostContract {
     $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
@@ -340,7 +341,7 @@ function Invoke-BoundedTool([string]$Name, [string[]]$Arguments, [string]$Workin
     if ($result.OutputLimitExceeded) { throw "$Name output exceeded $processOutputLimit bytes; its process tree was terminated" }
     if ($result.TimedOut) { throw "$Name exceeded its $TimeoutMilliseconds-ms deadline; its process tree was terminated" }
     if ($result.DescendantHeldOutputPipe) { throw "$Name left an inherited output pipe open after exit; the release command was rejected" }
-    return [pscustomobject]@{ ExitCode = $result.ExitCode; Output = $output }
+    return [pscustomobject]@{ ExitCode = $result.ExitCode; Output = $output; Stdout = $stdout; Stderr = $stderr }
 }
 
 function Invoke-CheckedTool([string]$Name, [string[]]$Arguments, [string]$WorkingDirectory, [string]$WorkRoot, [string]$LogName, [int]$TimeoutMilliseconds, [string]$Wrapper) {
@@ -359,7 +360,7 @@ function Read-Bytes([IO.FileStream]$Stream, [long]$Offset, [int]$Count) {
 function Get-U16([byte[]]$Bytes, [int]$Offset) { return [uint16](([uint32]$Bytes[$Offset]) -bor (([uint32]$Bytes[$Offset + 1]) -shl 8)) }
 function Get-U32([byte[]]$Bytes, [int]$Offset) { return [uint32](([uint32]$Bytes[$Offset]) -bor (([uint32]$Bytes[$Offset + 1]) -shl 8) -bor (([uint32]$Bytes[$Offset + 2]) -shl 16) -bor (([uint32]$Bytes[$Offset + 3]) -shl 24)) }
 
-function Assert-ExecutableArchitecture([string]$Path, [hashtable]$Contract) {
+function Assert-ExecutableArchitecture([string]$Path, [hashtable]$Contract, [switch]$SharedLibrary) {
     if (-not (Test-PlainFile $Path)) { throw "missing plain release executable: '$Path'" }
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
@@ -370,18 +371,21 @@ function Assert-ExecutableArchitecture([string]$Path, [hashtable]$Contract) {
             if ($peOffset -lt 64 -or $peOffset -gt 1MB -or $peOffset + 24 -gt $stream.Length) { throw "release PE header offset is invalid" }
             $pe = Read-Bytes $stream $peOffset 24
             if ($pe[0] -ne 0x50 -or $pe[1] -ne 0x45 -or $pe[2] -ne 0 -or $pe[3] -ne 0 -or (Get-U16 $pe 4) -ne 0x8664 -or ((Get-U16 $pe 22) -band 0x0002) -eq 0) { throw "release executable is not an x86_64 PE executable" }
+            if ($SharedLibrary -and ((Get-U16 $pe 22) -band 0x2000) -eq 0) { throw "release proc-macro is not an x86_64 PE DLL" }
         }
         elseif ($Contract.ObjectFormat -eq "elf-x86_64") {
             $header = Read-Bytes $stream 0 20
             if ($header[0] -ne 0x7f -or $header[1] -ne 0x45 -or $header[2] -ne 0x4c -or $header[3] -ne 0x46 -or $header[4] -ne 2 -or $header[5] -ne 1 -or $header[6] -ne 1 -or (Get-U16 $header 18) -ne 62 -or (Get-U16 $header 16) -notin @(2, 3)) { throw "release executable is not an x86_64 ELF executable" }
+            if ($SharedLibrary -and (Get-U16 $header 16) -ne 3) { throw "release proc-macro is not an x86_64 ELF shared object" }
         }
         else {
             $header = Read-Bytes $stream 0 16
-            if ($header[0] -ne 0xcf -or $header[1] -ne 0xfa -or $header[2] -ne 0xed -or $header[3] -ne 0xfe -or (Get-U32 $header 4) -ne 0x0100000c -or (Get-U32 $header 12) -ne 2) { throw "release executable is not an arm64 Mach-O executable" }
+            $fileType = if ($SharedLibrary) { 6 } else { 2 }
+            if ($header[0] -ne 0xcf -or $header[1] -ne 0xfa -or $header[2] -ne 0xed -or $header[3] -ne 0xfe -or (Get-U32 $header 4) -ne 0x0100000c -or (Get-U32 $header 12) -ne $fileType) { throw "release artifact is not the required arm64 Mach-O executable or dylib" }
         }
     }
     finally { $stream.Dispose() }
-    if (-not $IsWindows) { $mode = [IO.File]::GetUnixFileMode($Path); $execute = [IO.UnixFileMode]::UserExecute -bor [IO.UnixFileMode]::GroupExecute -bor [IO.UnixFileMode]::OtherExecute; if (($mode -band $execute) -eq 0) { throw "release executable has no Unix execute bit" } }
+    if (-not $IsWindows -and -not $SharedLibrary) { $mode = [IO.File]::GetUnixFileMode($Path); $execute = [IO.UnixFileMode]::UserExecute -bor [IO.UnixFileMode]::GroupExecute -bor [IO.UnixFileMode]::OtherExecute; if (($mode -band $execute) -eq 0) { throw "release executable has no Unix execute bit" } }
 }
 
 function Assert-RlibArchitecture([string]$Path, [hashtable]$Contract) {
@@ -431,6 +435,179 @@ function Get-NativeTlsBuildId([string]$BuilderPath) {
     $matches = [regex]::Matches($text, '(?m)^\$kuTlsBuildId = "(?<value>[^"\r\n]+)"\r?$')
     if ($matches.Count -ne 1) { throw "cannot read exactly one native TLS build id from the pack builder" }
     return $matches[0].Groups['value'].Value
+}
+
+function Get-CargoProcMacroArtifacts([string]$Messages, [string]$CargoTarget, [hashtable]$Contract) {
+    if (-not (Test-PlainDirectory $CargoTarget)) { throw "Cargo artifact root must be the private build directory" }
+    $root = [IO.Path]::GetFullPath($CargoTarget)
+    $hostDependencies = [IO.Path]::GetFullPath((Join-Path $root 'release/deps'))
+    $targetDependencies = [IO.Path]::GetFullPath((Join-Path $root "$($Contract.Target)/release/deps"))
+    $artifacts = [Collections.Generic.List[string]]::new(); $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $finished = $false; $lineCount = 0
+    foreach ($line in $Messages.Split("`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $lineCount++; if ($lineCount -gt 10000 -or $finished) { throw "Cargo artifact stream has too many records or records after build-finished" }
+        try { $record = ConvertFrom-Json -InputObject $line -AsHashtable -Depth 64 } catch { throw "Cargo artifact stdout contains invalid JSON" }
+        if ($record -isnot [Collections.IDictionary] -or -not $record.Contains('reason')) { throw "Cargo artifact stdout contains an invalid message" }
+        if ($record.reason -ceq 'build-finished') {
+            if ($record.success -isnot [bool] -or -not $record.success) { throw "Cargo artifact stream did not report a successful build" }
+            $finished = $true; continue
+        }
+        if ($record.reason -cne 'compiler-artifact') { continue }
+        if ($record.target -isnot [Collections.IDictionary] -or $record.target.kind -isnot [array]) { throw "Cargo compiler-artifact has an invalid target" }
+        if (@($record.target.kind) -cnotcontains 'proc-macro') { continue }
+        if ($record.target.crate_types -isnot [array] -or @($record.target.crate_types) -cnotcontains 'proc-macro' -or $record.filenames -isnot [array] -or $record.filenames.Count -eq 0 -or $record.filenames.Count -gt 8) { throw "Cargo proc-macro artifact has an invalid library contract" }
+        $crate = [string]$record.target.name
+        if ($crate -cnotmatch '^[A-Za-z_][A-Za-z0-9_-]*$') { throw "Cargo proc-macro artifact has an invalid crate name" }
+        $crate = $crate.Replace('-', '_'); $stem = [regex]::Escape($crate) + '-[0-9a-f]{16}'
+        $libraryPattern = switch ($Contract.ObjectFormat) { 'coff-x86_64' { "^$stem\.dll$" }; 'elf-x86_64' { "^lib$stem\.so$" }; 'macho-arm64' { "^lib$stem\.dylib$" }; default { throw "Cargo proc-macro target is unsupported" } }
+        $selected = 0
+        foreach ($filename in $record.filenames) {
+            if ($filename -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($filename)) { throw "Cargo proc-macro artifact path must be absolute" }
+            $path = Assert-PathUnder $filename $root; $parent = [IO.Path]::GetDirectoryName($path)
+            if (-not $parent.Equals($hostDependencies, $pathComparison) -and -not $parent.Equals($targetDependencies, $pathComparison)) { throw "Cargo proc-macro artifact is outside the private host dependency directories" }
+            $ancestor = $parent
+            while (-not $ancestor.Equals($root, $pathComparison)) {
+                if (-not (Test-PlainDirectory $ancestor)) { throw "Cargo proc-macro artifact traverses a non-plain directory" }
+                $ancestor = [IO.Path]::GetDirectoryName($ancestor)
+            }
+            if (-not (Test-PlainFile $path)) { throw "Cargo proc-macro artifact must be a plain file" }
+            $name = [IO.Path]::GetFileName($path)
+            if ($name -cnotmatch $libraryPattern) {
+                # Cargo may report Windows linker sidecars as well. They are
+                # checked for provenance but never copied into the bundle.
+                if ($Contract.ObjectFormat -eq 'coff-x86_64' -and $name -cmatch "^$stem\.(?:pdb|dll\.lib|dll\.exp)$") { continue }
+                throw "Cargo proc-macro artifact has an unexpected filename: '$name'"
+            }
+            $selected++; if ($selected -ne 1 -or -not $names.Add($name) -or $artifacts.Count -ge 1000) { throw "Cargo proc-macro artifact list contains duplicate or excessive libraries" }
+            Assert-ExecutableArchitecture $path $Contract -SharedLibrary
+            $artifacts.Add($path)
+        }
+        if ($selected -ne 1) { throw "Cargo proc-macro artifact did not emit exactly one host library" }
+    }
+    if (-not $finished) { throw "Cargo artifact stream is missing its successful build-finished record" }
+    return ,$artifacts.ToArray()
+}
+
+function Copy-RustDependencies([string]$Source, [string]$Destination, [hashtable]$Contract, [string[]]$ProcMacroArtifacts = @()) {
+    if (-not (Test-PlainDirectory $Source)) { throw "release Rust dependency input must be a plain directory" }
+    if (Test-Path -LiteralPath $Destination) { throw "release Rust dependency destination must be new" }
+    $expected = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $foldedNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $entries = 0; $total = 0L
+    foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($Source)) {
+        $entries++; if ($entries -gt 1000) { throw "release Rust dependency input has too many entries" }
+        $name = [IO.Path]::GetFileName($entry)
+        if (-not $name.EndsWith('.rlib', [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ($name -cnotmatch '^lib(?<crate>[A-Za-z_][A-Za-z0-9_]*)-[0-9a-f]{16}\.rlib$') { throw "release Rust dependency has a noncanonical filename: '$name'" }
+        $crate = [string]$Matches['crate']
+        if (-not (Test-PlainFile $entry)) { throw "release Rust dependency must be a plain file: '$name'" }
+        # libku.rlib is already present at the bundle root. Host proc-macros
+        # are admitted separately from this build's Cargo artifact records.
+        if ($crate -ceq 'ku') { continue }
+        if (-not $foldedNames.Add($name)) { throw "release Rust dependency contains case-colliding filenames: '$name'" }
+        Assert-RlibArchitecture $entry $Contract
+        $length = (Get-Item -LiteralPath $entry).Length; $total += $length
+        if ($total -gt 1GB) { throw "release Rust dependencies exceed the bundle's 1 GiB limit" }
+        $expected.Add($name, [pscustomobject]@{ Kind = 'rlib'; Source = $entry; Size = $length; Sha256 = (Get-FileHash -LiteralPath $entry -Algorithm SHA256).Hash.ToLowerInvariant() })
+    }
+    if ($expected.Count -eq 0) { throw "release Rust dependency input contains no target libraries" }
+    foreach ($entry in $ProcMacroArtifacts) {
+        $name = [IO.Path]::GetFileName($entry)
+        if (-not $foldedNames.Add($name) -or $expected.Count -ge 1000) { throw "release Rust dependency contains duplicate or excessive libraries" }
+        Assert-ExecutableArchitecture $entry $Contract -SharedLibrary
+        $length = (Get-Item -LiteralPath $entry).Length; $total += $length
+        if ($total -gt 1GB) { throw "release Rust dependencies exceed the bundle's 1 GiB limit" }
+        $expected.Add($name, [pscustomobject]@{ Kind = 'proc-macro'; Source = $entry; Size = $length; Sha256 = (Get-FileHash -LiteralPath $entry -Algorithm SHA256).Hash.ToLowerInvariant() })
+    }
+    Ensure-PlainDirectory $Destination
+    foreach ($name in $expected.Keys) { Copy-PlainFile $expected[$name].Source (Join-Path $Destination $name) 512MB }
+    $script:expectedRustDependencies = $expected
+    Assert-RustDependencies $Destination $Contract
+}
+
+function Assert-RustDependencies([string]$Directory, [hashtable]$Contract) {
+    if (-not (Test-PlainDirectory $Directory) -or $null -eq $script:expectedRustDependencies -or $script:expectedRustDependencies.Count -eq 0) { throw "release Rust dependency snapshot is missing" }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $count = 0; $total = 0L
+    foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($Directory)) {
+        $count++; if ($count -gt 1000) { throw "release Rust dependencies have too many entries" }
+        $name = [IO.Path]::GetFileName($entry)
+        if (-not (Test-PlainFile $entry) -or -not $script:expectedRustDependencies.ContainsKey($name) -or -not $seen.Add($name)) { throw "release Rust dependencies contain an unexpected file: '$name'" }
+        $expected = $script:expectedRustDependencies[$name]; $length = (Get-Item -LiteralPath $entry).Length; $total += $length
+        if ($total -gt 1GB -or $length -ne $expected.Size -or (Get-FileHash -LiteralPath $entry -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected.Sha256) { throw "release Rust dependency differs from the private build snapshot: '$name'" }
+        if ($expected.Kind -ceq 'rlib') { Assert-RlibArchitecture $entry $Contract }
+        elseif ($expected.Kind -ceq 'proc-macro') { Assert-ExecutableArchitecture $entry $Contract -SharedLibrary }
+        else { throw "release Rust dependency snapshot contains an unsupported library kind" }
+    }
+    if ($seen.Count -ne $script:expectedRustDependencies.Count) { throw "release Rust dependencies are missing a target library" }
+}
+
+function Test-RustDependencyContracts([string]$WorkRoot, [hashtable]$Contract, [string]$Wrapper) {
+    $savedDependencies = $script:expectedRustDependencies
+    try {
+        $source = Join-Path $WorkRoot 'rust-dependency-source'; Ensure-PlainDirectory $source
+        $rustSource = Join-Path $WorkRoot 'release-dependency-probe.rs'
+        [IO.File]::WriteAllText($rustSource, 'pub fn release_probe() -> usize { 17 }', $utf8)
+        $name = 'librelease_probe-0123456789abcdef.rlib'; $library = Join-Path $source $name
+        [void](Invoke-CheckedTool 'rustc' @('+1.89.0', '--edition=2021', '--crate-name', 'release_probe', '--crate-type', 'rlib', '--target', $Contract.Target, '-o', $library, $rustSource) $WorkRoot $WorkRoot 'rust-dependency-probe-build' 30000 $Wrapper)
+        foreach ($ignoredName in @('release_probe.d', 'release_probe.pdb', 'release_probe.exe', 'release_probe.dll')) { [IO.File]::WriteAllText((Join-Path $source $ignoredName), 'must not enter a release dependency directory', $utf8) }
+        $macroRoot = Join-Path $WorkRoot 'proc-macro-cargo'; $macroDirectory = Join-Path $macroRoot 'release/deps'; Ensure-PlainDirectory $macroDirectory
+        $macroName = switch ($Contract.ObjectFormat) { 'coff-x86_64' { 'release_macro_probe-0123456789abcdef.dll' }; 'elf-x86_64' { 'librelease_macro_probe-0123456789abcdef.so' }; 'macho-arm64' { 'librelease_macro_probe-0123456789abcdef.dylib' } }
+        $macroLibrary = Join-Path $macroDirectory $macroName; $macroSource = Join-Path $WorkRoot 'release-macro-probe.rs'
+        [IO.File]::WriteAllText($macroSource, 'extern crate proc_macro; #[proc_macro] pub fn release_probe(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }', $utf8)
+        [void](Invoke-CheckedTool 'rustc' @('+1.89.0', '--edition=2021', '--crate-name', 'release_macro_probe', '--crate-type', 'proc-macro', '--target', $Contract.Target, '-o', $macroLibrary, $macroSource) $WorkRoot $WorkRoot 'proc-macro-probe-build' 30000 $Wrapper)
+        $macroRecord = @{ reason = 'compiler-artifact'; target = @{ name = 'release_macro_probe'; kind = @('proc-macro'); crate_types = @('proc-macro') }; filenames = @($macroLibrary) }
+        $finish = '{"reason":"build-finished","success":true}'
+        $macroJson = ($macroRecord | ConvertTo-Json -Depth 8 -Compress) + "`n" + $finish + "`n"
+        $macros = Get-CargoProcMacroArtifacts $macroJson $macroRoot $Contract
+        if ($macros.Count -ne 1 -or $macros[0] -cne $macroLibrary) { throw "Cargo proc-macro self-test did not select its exact emitted library" }
+        foreach ($case in @('invalid-json', 'missing-finish', 'duplicate', 'outside-root', 'unexpected-filename')) {
+            $badJson = switch ($case) {
+                'invalid-json' { "not Cargo JSON`n$finish" }
+                'missing-finish' { $macroRecord | ConvertTo-Json -Depth 8 -Compress }
+                'duplicate' { ($macroRecord | ConvertTo-Json -Depth 8 -Compress) + "`n" + $macroJson }
+                'outside-root' { $badRecord = $macroRecord.Clone(); $badRecord.filenames = @($library); ($badRecord | ConvertTo-Json -Depth 8 -Compress) + "`n" + $finish }
+                'unexpected-filename' { $badRecord = $macroRecord.Clone(); $badRecord.target = @{ name = 'another_crate'; kind = @('proc-macro'); crate_types = @('proc-macro') }; ($badRecord | ConvertTo-Json -Depth 8 -Compress) + "`n" + $finish }
+            }
+            $rejected = $false
+            try { [void](Get-CargoProcMacroArtifacts $badJson $macroRoot $Contract) } catch { $rejected = $true }
+            if (-not $rejected) { throw "Cargo proc-macro self-test accepted '$case'" }
+        }
+        $destination = Join-Path $WorkRoot 'rust-dependency-copy'; Copy-RustDependencies $source $destination $Contract $macros
+        if ($script:expectedRustDependencies.Count -ne 2 -or [IO.Directory]::GetFileSystemEntries($destination).Length -ne 2) { throw "Rust dependency self-test copied non-library build artifacts" }
+
+        $wrongContract = $Contract.Clone(); $wrongContract.ObjectFormat = if ($Contract.ObjectFormat -eq 'coff-x86_64') { 'elf-x86_64' } else { 'coff-x86_64' }
+        $rejected = $false
+        try { Assert-RlibArchitecture $library $wrongContract } catch { $rejected = $_.Exception.Message -like '*wrong target*' }
+        if (-not $rejected) { throw "Rust dependency self-test accepted an archive for another target" }
+        $rejected = $false
+        try { Assert-ExecutableArchitecture $macroLibrary $wrongContract -SharedLibrary } catch { $rejected = $true }
+        if (-not $rejected) { throw "Rust dependency self-test accepted a proc-macro for another target" }
+
+        foreach ($case in @('extra-file', 'missing-file', 'changed-file', 'changed-proc-macro', 'nested-directory')) {
+            $bad = Join-Path $WorkRoot "rust-dependency-$case"; Ensure-PlainDirectory $bad
+            if ($case -ne 'missing-file') { Copy-PlainFile $library (Join-Path $bad $name) 512MB }
+            Copy-PlainFile $macroLibrary (Join-Path $bad $macroName) 512MB
+            if ($case -eq 'extra-file') { Copy-PlainFile $library (Join-Path $bad 'libextra-0123456789abcdef.rlib') 512MB }
+            elseif ($case -eq 'changed-file') { [IO.File]::WriteAllText((Join-Path $bad $name), 'changed archive', $utf8) }
+            elseif ($case -eq 'changed-proc-macro') { [IO.File]::WriteAllText((Join-Path $bad $macroName), 'changed proc-macro', $utf8) }
+            elseif ($case -eq 'nested-directory') { Ensure-PlainDirectory (Join-Path $bad 'unexpected') }
+            $rejected = $false
+            try { Assert-RustDependencies $bad $Contract } catch { $rejected = $_.Exception.Message -like 'release Rust dependen*' }
+            if (-not $rejected) { throw "Rust dependency self-test accepted '$case'" }
+        }
+        foreach ($case in @('bad-name', 'directory-as-library', 'no-libraries')) {
+            $bad = Join-Path $WorkRoot "rust-dependency-input-$case"; Ensure-PlainDirectory $bad
+            if ($case -eq 'bad-name') { Copy-PlainFile $library (Join-Path $bad 'librelease_probe.rlib') 512MB }
+            elseif ($case -eq 'directory-as-library') { Ensure-PlainDirectory (Join-Path $bad $name) }
+            $rejected = $false
+            try { Copy-RustDependencies $bad (Join-Path $WorkRoot "rust-dependency-output-$case") $Contract } catch { $rejected = $_.Exception.Message -like 'release Rust dependen*' }
+            if (-not $rejected) { throw "Rust dependency self-test accepted '$case' input" }
+        }
+        Assert-RustDependencies $destination $Contract
+        Write-Output 'Rust dependency self-test ok: exact rlib/proc-macro snapshot, bounded Cargo artifact provenance, rejected extra/missing/changed files, invalid names, directories and wrong architecture'
+    }
+    finally { $script:expectedRustDependencies = $savedDependencies }
 }
 
 function New-NativeTlsArchiveVerifier([string]$Repo, [string]$WorkRoot, [string]$Wrapper) {
@@ -498,6 +675,57 @@ function Assert-TlsPack([string]$Leaf, [hashtable]$Contract, [string]$BuildId) {
     $archiveStream = [IO.File]::OpenRead($archivePath)
     try { if ([Text.Encoding]::ASCII.GetString((Read-Bytes $archiveStream 0 8)) -cne "!<arch>`n") { throw "native TLS library is not a complete archive" } } finally { $archiveStream.Dispose() }
     Invoke-NativeTlsArchiveValidation $archivePath ([string]$Contract.ObjectFormat) $BuildId
+}
+
+function Test-PackagedRunnerConsumer([string]$Bundle, [hashtable]$Contract, [string]$WorkRoot, [string]$Wrapper) {
+    $ku = Join-Path $Bundle $Contract.Executable; $dependencies = Join-Path $Bundle 'deps'
+    $retiredDependencies = Join-Path $WorkRoot 'retired-runner-deps'
+    $consumerRoot = Join-Path $WorkRoot 'packaged-runner-consumer'; Ensure-PlainDirectory $consumerRoot
+    $sourceRoot = Join-Path $consumerRoot 'source'; Ensure-PlainDirectory $sourceRoot
+    $source = Join-Path $sourceRoot 'main.ku'; $support = Join-Path $sourceRoot 'support.ku'
+    [IO.File]::WriteAllText($source, "import { Greeting } from `"./support.ku`"`nfn main() { println(Greeting()) }`n", $utf8)
+    [IO.File]::WriteAllText($support, "fn Greeting(): str { return `"packaged runner consumer ok`" }`n", $utf8)
+    $executable = Join-Path $WorkRoot $(if ($IsWindows) { 'runner-consumer.exe' } else { 'runner-consumer' })
+    $standaloneSource = Join-Path $consumerRoot 'standalone.ku'; $retiredStandaloneSource = Join-Path $WorkRoot 'retired-runner-standalone.ku'
+    [IO.File]::WriteAllText($standaloneSource, "fn main() { println(`"packaged standalone runner ok`") }`n", $utf8)
+    $standaloneExecutable = Join-Path $WorkRoot $(if ($IsWindows) { 'runner-standalone.exe' } else { 'runner-standalone' })
+    $missingOutput = Join-Path $WorkRoot $(if ($IsWindows) { 'runner-missing-deps.exe' } else { 'runner-missing-deps' })
+    # rustc must resolve exactly this bundle's target libraries and the recorded
+    # Rust toolchain, not caller-supplied development search paths or wrappers.
+    $environmentNames = @('RUST_PATH', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'CARGO_TARGET_DIR', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH', 'RUSTUP_TOOLCHAIN')
+    $savedEnvironment = @{}
+    foreach ($name in $environmentNames) { $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+    $dependenciesMoved = $false; $standaloneSourceMoved = $false
+    try {
+        foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+        [Environment]::SetEnvironmentVariable('RUSTUP_TOOLCHAIN', '1.89.0', 'Process')
+        if ([IO.Path]::GetFileName($Bundle) -in @('release', 'debug', 'deps')) { throw "runner consumer bundle path could enable development-library fallback" }
+        if (-not (Test-PlainDirectory $dependencies) -or (Test-Path -LiteralPath $retiredDependencies)) { throw "runner consumer cannot isolate its dependency directory" }
+        [IO.Directory]::Move($dependencies, $retiredDependencies); $dependenciesMoved = $true
+        $missing = Invoke-BoundedTool $ku @('build', '--offline', $source, '-o', $missingOutput) $consumerRoot $WorkRoot 'runner-missing-deps-build' 180000 $Wrapper
+        if ($missing.ExitCode -eq 0 -or (Test-Path -LiteralPath $missingOutput) -or $missing.Output -notmatch 'error\[E0463\]') { throw "packaged runner without dependencies did not fail with the expected missing-crate error: $($missing.Output)" }
+        [IO.Directory]::Move($retiredDependencies, $dependencies); $dependenciesMoved = $false
+        [void](Invoke-CheckedTool $ku @('build', '--offline', $source, '-o', $executable) $consumerRoot $WorkRoot 'packaged-runner-build' 180000 $Wrapper)
+        Assert-ExecutableArchitecture $executable $Contract
+        # Check ordinary local imports without imposing the native backend's
+        # source-independent import-graph contract on the runner backend.
+        $output = Invoke-CheckedTool $executable @() $WorkRoot $WorkRoot 'packaged-runner-import-run' 30000 $Wrapper
+        if ($output.Replace("`r", '').TrimEnd("`n") -cne 'packaged runner consumer ok') { throw "packaged imported runner returned unexpected output: '$output'" }
+        [void](Invoke-CheckedTool $ku @('build', '--offline', $standaloneSource, '-o', $standaloneExecutable) $consumerRoot $WorkRoot 'packaged-standalone-runner-build' 180000 $Wrapper)
+        Assert-ExecutableArchitecture $standaloneExecutable $Contract
+        [IO.Directory]::Move($dependencies, $retiredDependencies); $dependenciesMoved = $true
+        $output = Invoke-CheckedTool $executable @() $WorkRoot $WorkRoot 'packaged-runner-run' 30000 $Wrapper
+        if ($output.Replace("`r", '').TrimEnd("`n") -cne 'packaged runner consumer ok') { throw "packaged runner returned unexpected output: '$output'" }
+        [IO.File]::Move($standaloneSource, $retiredStandaloneSource); $standaloneSourceMoved = $true
+        $output = Invoke-CheckedTool $standaloneExecutable @() $WorkRoot $WorkRoot 'packaged-standalone-runner-run' 30000 $Wrapper
+        if ($output.Replace("`r", '').TrimEnd("`n") -cne 'packaged standalone runner ok') { throw "packaged standalone runner returned unexpected output: '$output'" }
+    }
+    finally {
+        foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process') }
+        if ($standaloneSourceMoved -and -not (Test-Path -LiteralPath $standaloneSource) -and (Test-PlainFile $retiredStandaloneSource)) { [IO.File]::Move($retiredStandaloneSource, $standaloneSource) }
+        if ($dependenciesMoved -and -not (Test-Path -LiteralPath $dependencies) -and (Test-PlainDirectory $retiredDependencies)) { [IO.Directory]::Move($retiredDependencies, $dependencies) }
+    }
+    Assert-RustDependencies $dependencies $Contract
 }
 
 function Test-PackagedTlsConsumer([string]$Bundle, [hashtable]$Contract, [string]$WorkRoot, [string]$Wrapper) {
@@ -681,18 +909,23 @@ function Assert-Vsix([string]$Path, [string]$Version) {
 
 function Assert-Bundle([string]$Bundle, [hashtable]$Contract, [string]$Version, [string]$BuildId) {
     if (-not (Test-PlainDirectory $Bundle)) { throw "release bundle must be a plain directory" }
+    Assert-RustDependencies (Join-Path $Bundle 'deps') $Contract
     $vsixName = "ku-language-$Version.vsix"
     $expectedFiles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($relative in @($Contract.Executable, "libku.rlib", $vsixName, "native-tls/v1/$($Contract.Target)/manifest.kutls", "native-tls/v1/$($Contract.Target)/include/ku_native_tls.h", "native-tls/v1/$($Contract.Target)/lib/$($Contract.Archive)")) { [void]$expectedFiles.Add($relative.Replace('\', '/')) }
+    foreach ($name in $script:expectedRustDependencies.Keys) { [void]$expectedFiles.Add("deps/$name") }
     if ($IsWindows -and (Test-PlainFile (Join-Path $Bundle "ku.pdb"))) { [void]$expectedFiles.Add("ku.pdb") }
-    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $pending = [Collections.Generic.Stack[string]]::new(); $pending.Push($Bundle); $entries = 0
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); $pending = [Collections.Generic.Stack[string]]::new(); $pending.Push($Bundle); $entries = 0; $total = 0L
     while ($pending.Count -ne 0) {
         $directory = $pending.Pop()
         foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
             $entries++; if ($entries -gt 1000) { throw "release bundle has too many entries" }
             $attributes = [IO.File]::GetAttributes($entry)
             if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "release bundle contains a symlink/reparse point: '$entry'" }
-            if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) { $pending.Push($entry) } else { [void]$seen.Add([IO.Path]::GetRelativePath($Bundle, $entry).Replace('\', '/')) }
+            if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) { $pending.Push($entry) } else {
+                [void]$seen.Add([IO.Path]::GetRelativePath($Bundle, $entry).Replace('\', '/'))
+                $total += (Get-Item -LiteralPath $entry).Length; if ($total -gt 1GB) { throw "release bundle exceeds 1 GiB" }
+            }
         }
     }
     if ($seen.Count -ne $expectedFiles.Count -or @($seen | Where-Object { -not $expectedFiles.Contains($_) }).Count -ne 0) { throw "release bundle contains missing or unexpected files" }
@@ -973,6 +1206,7 @@ function Invoke-ReleaseSelfTest([string]$Repo, [string]$BuilderPath, [string]$He
     $owner = [Guid]::NewGuid().ToString('N'); $workRoot = New-OwnedDirectory $temporaryRoot '.ku-release-selftest-' $owner
     try {
         $wrapper = New-ToolWrapper $workRoot; $script:releaseWorkRoot = $workRoot; $script:toolWrapper = $wrapper
+        Test-RustDependencyContracts $workRoot $contract $wrapper
         [void](Invoke-CheckedTool 'pwsh' @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $BuilderPath, '-Target', $contract.Target, '-OutputRoot', $workRoot, '-SelfTest') $Repo $workRoot 'builder-selftest' 60000 $wrapper)
         $extensionProbeSource = Join-Path $workRoot 'extension-source-probe'; Ensure-PlainDirectory $extensionProbeSource
         $extensionProbeFile = Join-Path $extensionProbeSource '.vscodeignore'; [IO.File]::WriteAllText($extensionProbeFile, 'hidden release input', [Text.Encoding]::ASCII)
@@ -1115,7 +1349,9 @@ try {
     $script:archiveVerifier = New-NativeTlsArchiveVerifier $repo $workRoot $wrapper
     Write-Host "Building Ku $version for $($contract.Target)..."
     $cargoTarget = Join-Path $workRoot "cargo"
-    [void](Invoke-CheckedTool "cargo" @("+1.89.0", "build", "--locked", "--release", "--target", $contract.Target, "--target-dir", $cargoTarget, "--color", "never") $repo $workRoot "cargo-build" 900000 $wrapper)
+    $cargoBuild = Invoke-BoundedTool "cargo" @("+1.89.0", "build", "--locked", "--release", "--target", $contract.Target, "--target-dir", $cargoTarget, "--message-format=json-render-diagnostics", "--color", "never") $repo $workRoot "cargo-build" 900000 $wrapper
+    if ($cargoBuild.ExitCode -ne 0) { throw "cargo failed with exit code $($cargoBuild.ExitCode):`n$($cargoBuild.Output)" }
+    $procMacroArtifacts = Get-CargoProcMacroArtifacts $cargoBuild.Stdout $cargoTarget $contract
     $tlsOutputRoot = Join-Path $workRoot "tls-pack"
     [void](Invoke-CheckedTool "pwsh" @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $builderPath, "-Target", $contract.Target, "-OutputRoot", $tlsOutputRoot) $repo $workRoot "tls-pack" 600000 $wrapper)
     $tlsPack = Join-Path $tlsOutputRoot $contract.Target
@@ -1131,10 +1367,12 @@ try {
     $targetRelease = Join-Path $cargoTarget "$($contract.Target)/release"; $candidate = Join-Path $workRoot "bundle"; Ensure-PlainDirectory $candidate
     Copy-ExecutableFile (Join-Path $targetRelease $contract.Executable) (Join-Path $candidate $contract.Executable) 512MB
     Copy-PlainFile (Join-Path $targetRelease "libku.rlib") (Join-Path $candidate "libku.rlib") 512MB
+    Copy-RustDependencies (Join-Path $targetRelease 'deps') (Join-Path $candidate 'deps') $contract $procMacroArtifacts
     $pdb = Join-Path $targetRelease "ku.pdb"; if ($IsWindows -and (Test-PlainFile $pdb)) { Copy-PlainFile $pdb (Join-Path $candidate "ku.pdb") 512MB }
     Copy-PlainFile $vsixPath (Join-Path $candidate $vsixName) 128MB
     Copy-TlsPack $tlsPack (Join-Path $candidate "native-tls/v1/$($contract.Target)") $contract $buildId
     Assert-Bundle $candidate $contract $version $buildId
+    Test-PackagedRunnerConsumer $candidate $contract $workRoot $wrapper
     Test-PackagedTlsConsumer $candidate $contract $workRoot $wrapper
     Assert-Bundle $candidate $contract $version $buildId
     if ($CheckOnly) {

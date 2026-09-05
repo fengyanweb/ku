@@ -1,6 +1,8 @@
 # Ku
 
-Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.16`，重点是补齐 native 标准库，并把 PostgreSQL / Redis / MySQL 收敛为统一、自动池化的数据库 client。Ku 仍处于实验阶段，0.0.x 会主动删除重复 API，目前不可用于生产。
+Ku 是一个正在开发中的小型编程语言和解释器。当前版本是 `0.0.17`，新增同步 `&` 只读借用参数，并推进 Ku 自举 Parser 的有界 `while` 切片。Ku 仍处于实验阶段，0.0.x 会主动删除重复 API，目前不可用于生产。
+
+源码公开可查看，但目前未授予开源许可证；编辑器扩展也保持 `UNLICENSED`。本次发布不新增或变更许可。0.0.17 的实际验证状态和未完成边界见 [版本记录](docs/v0.0.17.md)。
 
 > **0.0.16 数据库驱动均为 native-only（`ku build --native`），解释器 `ku run` 暂不支持连库。** 旧驱动底层曾分别通过 PostgreSQL / Redis / MySQL 实库验证；本次统一 client 与 MySQL `MYSQL_STMT` 路径必须以新的自动化和实库验收结果为准，不能沿用旧结果冒充新 API 已验证。详见 [0.0.16 版本记录](docs/v0.0.16.md)。
 
@@ -161,6 +163,15 @@ null
 
 Ku 不使用 `let` / `let mut`。首次赋值即声明变量，带类型写作 `name:type = value`。
 
+## 0.0.17 新增
+
+- 同步函数用 `&name: T` 声明只读借用，调用仍写 `inspect(value)`；普通 owned 参数继续默认 move，需要独立值时显式 `.clone()`。函数类型用 `fn(&T): R`，不引入普通 `&T` 引用类型或调用处 `&`。
+- 借用模式贯穿 Rust 前端、checker、解释器、IR verifier 和 C ABI；新增临时释放、同调用冲突、源码删除后运行及分配账本测试。首版不支持 async borrowed 参数、borrowed `for` 或带 owned payload binding 的 borrowed match。
+- Ku 自举 Lexer 同步到 73 种 token；Stage3 在已有有界 Parser 子集中增加 braced `while`，但还不是完整 Ku Parser 或自举工具链。
+- 修复跨平台断开 stdout 的测试工具，统一确定性写失败条件，避免依赖平台 socket 关闭时序。版本基线 `11c566b` 的三系统 CI 已通过；0.0.17 以 `v0.0.17` tag 同一提交的实际三系统 CI 结果为准，不沿用旧提交，最终证据见 Release 正文。
+
+完整改动、分配观察和发布边界见 [0.0.17 版本记录](docs/v0.0.17.md)。
+
 ## 0.0.16 新增
 
 **native 标准库补齐**(以下均已对齐解释器 + 通过 CRT/ASan 验证):
@@ -314,6 +325,7 @@ http_pg_frontend.html # http_pg 的前端页面
 - [语法文档](docs/syntax.md)
 - [自举状态与 bootstrap 路线](docs/self-hosting.md)
 - [并发模型与 HTTP 千万请求压测 demo](docs/concurrency.md)
+- [0.0.17 版本记录](docs/v0.0.17.md)
 - [0.0.16 版本记录](docs/v0.0.16.md)
 - [0.0.15 版本记录](docs/v0.0.15.md)
 - [0.0.14 版本记录](docs/v0.0.14.md)
@@ -439,15 +451,17 @@ Hover、补全、定义跳转、Outline、Quick Fix、基础格式化
 Ku 文件默认保存时格式化；import path 补全会替换引号内路径，避免 `std.std.fs`；成员补全会识别 `http.` / `fs.` / `json.` 等上下文，只插入成员名，避免 `http.http.server`。
 ```
 
-> 说明:`editors/vscode-ku/ku-language-0.0.16.vsix` 已打包(含 pg/redis/mysql 高亮与补全、0.0.16 版本号)。重打时先在 `editors/vscode-ku` 执行 `npm ci --ignore-scripts`、`npm test`，再用 lockfile 中精确版本的 `npx --no-install vsce package`；不从网络临时解析浮动版本的 vsce。旧版本 VSIX 不再与当前版本重复保留。
+安装包以 [GitHub Releases](https://github.com/fengyanweb/ku/releases) 中实际发布的 `ku-v0.0.17-<Rust triple>.tar.gz` 为准；选择匹配操作系统/CPU 的 bundle，解压后使用其中的 `ku-language-0.0.17.vsix`。安装说明、`RELEASE.json`、逐文件 hash 与第三方 notices 随资产提供；bundle 不包含 `ku-registry` 服务端。不要把 CI 的 `native_ci-*` 验收样例当作 Ku CLI。尚未列出的 target 不表示已经发布或通过验收。
 
-图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择 `editors/vscode-ku/ku-language-0.0.16.vsix`。
+图形界面安装方式：VS Code 扩展页 `...` -> `Install from VSIX...`，选择解压后的 `ku-language-0.0.17.vsix`。
 
-命令安装方式：
+在 bundle 解压目录中安装：
 
 ```powershell
-code --install-extension editors\vscode-ku\ku-language-0.0.16.vsix --force
+code --install-extension .\ku-language-0.0.17.vsix --force
 ```
+
+从源码重打 VSIX 时，在 `editors/vscode-ku` 执行 `npm ci --ignore-scripts`、`npm test`，再执行 `npx --no-install vsce package --out ku-language-0.0.17.vsix`；只使用 lockfile 中固定的 vsce，不从网络临时解析浮动版本。生成的二进制和 VSIX 是发布资产，不是版本号已更新就自动完成的产物。
 
 ## 开发验证
 
@@ -464,4 +478,4 @@ pwsh -NoLogo -NoProfile -File scripts\archive-release.ps1 -CheckOnly
 pwsh -NoLogo -NoProfile -File scripts\archive-release.ps1
 ```
 
-该脚本先生成并校验 `release/<target>/` bundle，再以不可变目录归档到 `history/v<version>/<target>/`；目标目录已存在时拒绝覆盖。详细规则见 [版本和解释器历史](docs/history.md)。
+该脚本从当前源码重新构建并校验完整 bundle，再切换 `release/<target>/` 并发布不可变 `history/v<version>/<target>/`；它不归档已有的 release 文件，无需先单独运行 package 脚本。历史目标已存在时拒绝覆盖。详细规则见 [版本和解释器历史](docs/history.md)。
