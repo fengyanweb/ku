@@ -214,12 +214,14 @@ fn copy_bootstrap_sources(directory: &std::path::Path) {
         (
             "stage3",
             &[
+                "body_support.ku",
                 "support.ku",
                 "signature.ku",
                 "imports.ku",
                 "structs.ku",
                 "enums.ku",
                 "functions.ku",
+                "statements.ku",
                 "parser.ku",
             ][..],
         ),
