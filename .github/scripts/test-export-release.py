@@ -14,6 +14,7 @@ from pathlib import Path
 import sys
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -305,6 +306,44 @@ class ReleaseExportTests(unittest.TestCase):
                 destination.mkdir()
                 with self.assertRaisesRegex(EXPORT.ExportError, "non-plain USTAR"):
                     EXPORT.verify_archive(archive, expected, destination)
+
+    def test_public_header_entrypoint_owns_read_size_before_any_extension_processor(self):
+        class OneHeader(io.BytesIO):
+            def __init__(self, data):
+                super().__init__(data)
+                self.requests = []
+
+            def read(self, size=-1):
+                self.requests.append(size)
+                if size != tarfile.BLOCKSIZE or self.tell() != 0:
+                    raise AssertionError("extension payload was read before rejection")
+                return super().read(size)
+
+        for typecode in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME,
+                         tarfile.GNUTYPE_LONGLINK, tarfile.GNUTYPE_SPARSE):
+            with self.subTest(typecode=typecode):
+                member = tarfile.TarInfo("payload")
+                member.type, member.size = typecode, 2 * 1024 * 1024 * 1024
+                stream = OneHeader(member.tobuf(format=tarfile.USTAR_FORMAT))
+                archive = SimpleNamespace(fileobj=stream, encoding="utf-8", errors="strict", offset=0)
+                with mock.patch.object(tarfile.TarInfo, "_proc_member", side_effect=AssertionError("unbounded extension dispatch")):
+                    with self.assertRaisesRegex(EXPORT.ExportError, "non-plain USTAR"):
+                        EXPORT.PlainTarInfo.fromtarfile(archive)
+                self.assertEqual(stream.requests, [512])
+                self.assertEqual(archive.offset, 0)
+
+    def test_archive_reader_does_not_inherit_version_specific_header_dispatch(self):
+        # Newer CPython releases bypass the public frombuf hook in their base
+        # fromtarfile implementation. Neither that implementation nor any of its
+        # private extension dispatchers may be part of our verification path.
+        expected = {"payload": {"size": 4, "sha256": hashlib.sha256(b"good").hexdigest(), "mode": 0o644}}
+        archive = self.make_archive([("payload", b"good", tarfile.REGTYPE)])
+        destination = self.root / "own-header-entrypoint"
+        destination.mkdir()
+        with mock.patch.object(tarfile.TarInfo, "fromtarfile", side_effect=AssertionError("inherited header dispatch")), \
+             mock.patch.object(tarfile.TarInfo, "_proc_member", side_effect=AssertionError("private extension dispatch")):
+            EXPORT.verify_archive(archive, expected, destination)
+        self.assertEqual((destination / "payload").read_bytes(), b"good")
 
     def test_gzip_crc_and_nonzero_or_excessive_trailers_rejected(self):
         expected = {"payload": {"size": 4, "sha256": hashlib.sha256(b"good").hexdigest(), "mode": 0o644}}

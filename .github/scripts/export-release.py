@@ -45,9 +45,23 @@ class ExportError(ValueError):
 class PlainTarInfo(tarfile.TarInfo):
     """Reject extension headers before tarfile can parse their declared payload.
 
-The exporter writes USTAR only. In particular, a forged PAX/GNU long-name
-header must never cause tarfile to read an attacker-sized metadata buffer.
-"""
+    The exporter writes USTAR only. In particular, a forged PAX/GNU long-name
+    header must never cause tarfile to read an attacker-sized metadata buffer.
+    """
+
+    @classmethod
+    def fromtarfile(cls, archive):
+        # Security-patched CPython versions route their inherited fromtarfile
+        # through private _frombuf, bypassing a frombuf-only override. Own this
+        # public entry point: consume exactly one header, validate it, and never
+        # dispatch into tarfile's PAX/GNU/sparse extension processors.
+        buf = archive.fileobj.read(tarfile.BLOCKSIZE)
+        member = cls.frombuf(buf, archive.encoding, archive.errors)
+        member.offset_data = archive.fileobj.tell()
+        member.offset = member.offset_data - tarfile.BLOCKSIZE
+        blocks = (member.size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE
+        archive.offset = member.offset_data + blocks * tarfile.BLOCKSIZE
+        return member
 
     @classmethod
     def frombuf(cls, buf, encoding, errors):
