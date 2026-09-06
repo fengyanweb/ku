@@ -43,8 +43,38 @@ catch 处理 recoverable failure，不代表任意 panic、进程级 OOM 或 run
 HTTP timeout 的 native 既有合同是不可恢复的请求超时，超时展开中的 finally
 共用固定一秒清理窗口。若首次超时发生在普通 finally 内，不恢复该块的剩余语句；
 这不是中断阻塞系统调用或 FFI 的线程抢占；解释器必须与其对齐。
-新 Task runtime 的父子 scope、取消传播、finally 优先级和 shutdown 尚待决策及实现，
-不得把未决行为记录成正式已实现合同。
+
+## Task 所有权、取消与清理预算
+
+以下是 v0.0.18 第二阶段已采用的语义决策，不再是待决问题；本轮解释器生命周期切片已通过本机全量回归，具体证据与未覆盖边界见实施记录。
+native async、stackless Task frame、M:N 调度、netpoll 与事件驱动 HTTP 尚未实现，
+不能把这份合同或既有 native HTTP timeout 当成 native Task 取消已经完成的证明。
+
+- 清理责任属于当前真正持有 move-only Task 句柄的所有权作用域；合法 move 同时转移责任，
+  moved-from 位置不得再次取消、等待或 drop。作用域因正常结束、return、错误传播、panic、
+  超时或取消而退出时，请求取消仍持有的未完成 Task；已完成但未 await 的结果或错误 payload 确定性释放。
+  只读闭包捕获和同步 `&` 借用不转移这份责任，callee 的 borrowed 参数不是 owner。
+  原 owner 退出后，只读捕获可以保留 Task 标识的控制块，但不能保留或重新取得已经释放的 payload；
+  这不增加用户级状态查询、cancel 或重复 await API。
+- 兄弟任务失败不直接取消其他兄弟，也不直接改变父任务状态。父任务 await 后处理错误并继续时，
+  兄弟继续运行；若错误传播导致父作用域退出，才按作用域退出规则取消它仍持有的其他任务。
+- 取消和超时是内部控制终止，不是普通 Result/Error，不能被 catch 捕获。
+  completion 与 cancel/timeout 在同一裁决点竞争唯一不可逆终态：已提交完成不能追溯取消；
+  取消先获准后，迟到成功或错误只能安全 drop，不能再作为成功结果返回。
+- 每次根取消以单调时钟建立默认总计一秒的绝对清理截止时间。
+  嵌套 finally、子任务、frame 和作用域清理共享该截止时间，不按层级或任务重置；
+  外层 shutdown 剩余预算更短时取较小值。预算耗尽保留原取消/超时原因并记录清理超时和未完成数量，
+  不得返回成功；main/runtime 关闭仍保留既有 `task/shutdown_timeout` 边界。
+  普通作用域退出的子任务清理超期也报告 `task/shutdown_timeout`，不能仅因清理子任务而把正常父任务标成 Cancelled。
+- 先请求取消当前 frame 仍持有的未完成子任务，再由内向外展开 finally，最后释放各作用域的局部 owner。
+  finally 可访问尚未释放的局部值，但受同一预算约束；清理中的 return、fail、panic 或其他错误不能覆盖主终止原因，
+  只能记录为被压制的清理结果，并在剩余预算内继续外层清理。
+- 取消清理期间禁止新建 Task、await、新提交 sleep/timer、网络等待或 blocking job。
+  同步 close/drop、必要的 runtime 注销与有限同步计算仍允许；safepoint 在预算耗尽后终止继续执行。
+  已进入系统或外部库的阻塞操作不能被硬杀，只能受有界 blocking pool 隔离；迟到结果清理后不得恢复用户任务。
+
+本合同不增加用户级 cancel、detach、spawn、调度入口或新的 Ku 语法；逐项实现和验收状态见
+[v0.0.18 实施记录](v0.0.18-worklog.md)。
 
 ## 并发和协议主路径
 

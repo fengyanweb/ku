@@ -3164,7 +3164,11 @@ impl Checker {
         // Record that move after the arms are checked, so later uses (a second
         // match, a clone, passing it on) are rejected instead of silently reading
         // an emptied payload.
-        let consumes_scrutinee = self.match_consumes_scrutinee(&value_type, arms);
+        // Task-containing match input is itself an owning read. Otherwise a
+        // binding arm could transfer its handle while the original name remained
+        // available for a second await (including through a container wrapper).
+        let consumes_scrutinee = self.match_consumes_scrutinee(&value_type, arms)
+            || self.match_guard_type_contains_task(&value_type);
         if consumes_scrutinee && self.borrowed_expr_root(value).is_some() {
             return Err(KuError::runtime("borrowed operation is not supported: match with owned payload binding; clone the scrutinee first", value.span));
         }
@@ -3219,10 +3223,39 @@ impl Checker {
                 covered_patterns.insert(key);
             }
             if let Some(guard) = &arm.guard {
+                // A guard probes this arm; failure must leave its Task payloads
+                // available to later arms. Track only the newly bound pattern
+                // variables, so creating/awaiting an unrelated Task stays legal.
+                let tentative_tasks = self
+                    .scopes
+                    .last()
+                    .expect("match arm scope")
+                    .iter()
+                    .filter(|(_, binding)| self.match_guard_type_contains_task(&binding.ty))
+                    .map(|(name, binding)| {
+                        (name.clone(), binding.binding_id, binding.moves.clone())
+                    })
+                    .collect::<Vec<_>>();
                 let guard_type = self.check_expr(guard)?;
                 if guard_type != Type::Bool {
                     self.pop_scope();
                     return Err(type_error(guard.span, &Type::Bool, &guard_type));
+                }
+                for (name, id, previous_moves) in tentative_tasks {
+                    let changed = self
+                        .scopes
+                        .last()
+                        .and_then(|scope| scope.get(&name))
+                        .is_some_and(|binding| {
+                            binding.binding_id == id && binding.moves != previous_moves
+                        });
+                    if changed {
+                        self.pop_scope();
+                        return Err(KuError::runtime(
+                            format!("cannot consume tentative Task binding '{name}' in a match guard; await or move it only in the selected arm"),
+                            guard.span,
+                        ).with_diagnostic_id(crate::error::DiagnosticId::TaskGuardMove));
+                    }
                 }
             }
             let actual = self.consume_expr(&arm.value);
@@ -3265,6 +3298,34 @@ impl Checker {
             self.consume_expr(value)?;
         }
         Ok(result_type)
+    }
+
+    fn match_guard_type_contains_task(&self, root: &Type) -> bool {
+        let mut pending = vec![root];
+        let mut structs = HashSet::new();
+        let mut enums = HashSet::new();
+        while let Some(ty) = pending.pop() {
+            match ty {
+                Type::Task(_) => return true,
+                Type::Array(inner) | Type::Result(inner) => pending.push(inner),
+                Type::Union(types) => pending.extend(types),
+                Type::Object(fields) => pending.extend(fields.values()),
+                Type::Struct(name) if structs.insert(name.as_str()) => {
+                    if let Some(layout) = self.structs.get(name) {
+                        pending.extend(layout.fields.values());
+                    }
+                }
+                Type::Enum(name) if enums.insert(name.as_str()) => {
+                    if let Some(layout) = self.enums.get(name) {
+                        pending.extend(layout.variants.values().flatten());
+                    }
+                }
+                // Function signatures do not own their parameter/return types;
+                // captures have their own existing move checks.
+                _ => {}
+            }
+        }
+        false
     }
 
     /// True when matching `value` binds an owned enum payload — the backend moves

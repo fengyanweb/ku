@@ -693,6 +693,9 @@ fn task_stats_pattern() -> TypePattern {
         ("rejected_task_queue".to_string(), TypePattern::Int),
         ("rejected_task_internal".to_string(), TypePattern::Int),
         ("finished_tasks".to_string(), TypePattern::Int),
+        ("suppressed_cleanup_outcomes".to_string(), TypePattern::Int),
+        ("cleanup_timeouts".to_string(), TypePattern::Int),
+        ("cleanup_unfinished_tasks".to_string(), TypePattern::Int),
     ])
 }
 

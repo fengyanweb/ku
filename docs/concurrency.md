@@ -11,6 +11,25 @@ Ku 的用户级并发模型保持简单：业务代码通过 `async fn` 启动�
 - `await task?` 等价于 `(await task)?`。
 - HTTP server 内部可以使用 task，但普通 handler 不需要管理 task。
 
+## Task 作用域与取消合同
+
+v0.0.18 第二阶段已采用以下规则；这不表示所有后端已实现。完整合同见
+[Task 所有权、取消与清理预算](semantics.md#task-所有权取消与清理预算)。
+
+- 当前持有 Task 句柄的所有权作用域负责清理；move 会转移责任，不永久绑定创建位置。
+  作用域正常结束、return、错误传播、panic、超时或取消时，取消仍持有的未完成 Task，释放已完成但未 await 的 payload。
+- 兄弟失败本身不取消其他兄弟。父任务处理错误后可继续；只有父作用域因错误传播退出时，才清理它仍持有的兄弟任务。
+- cancel/timeout 是不可由普通 catch 捕获的内部终止，与完成竞争唯一终态。
+  finally 的 return、fail、panic 和迟到成功均不能覆盖已经获准的取消/超时。
+- 一次根取消只有默认总计一秒的单调时钟绝对预算，所有子任务、嵌套 finally 和 drop 共用，
+  外层 shutdown 剩余预算更短则从短；不能按任务逐个续期。超时记录未完成清理，不能冒充成功。
+- 取消展开先请求 owned 子任务取消，再由内向外执行 finally，随后 drop 本作用域局部。
+  清理期间禁止新建 Task、await 或提交新的 sleep/timer、网络等待和 blocking job；同步 close/drop 与有限计算仍受预算约束。
+
+本轮解释器生命周期切片已通过本机全量回归，具体证据与未覆盖边界见实施记录；native async、stackless frame、M:N、netpoll 和事件驱动 HTTP 尚未实现。
+native C / LLVM 继续明确拒绝 async lowering，不以同步代码或解释器回退冒充支持。
+已经进入系统或外部库的阻塞操作仍不能硬杀，迟到结果只能清理，不得恢复已取消任务。
+
 ## 同步只读借用与 async
 
 `&name: T` 的借用期只覆盖当前同步调用。第一版 `async fn` 不能直接声明 borrowed 参数，checker 返回 E0913；不会根据参数是否出现在第一个 `await` 之前放宽规则。借用值也不能进入闭包捕获或 task frame。
@@ -42,6 +61,8 @@ await 深度上限: 64
 
 超过上限时，Ku 不会无限排队，也不会无限重试；超出的提交会结构化拒绝并进入 runtime 指标。
 空闲 task/blocking worker 阻塞等待有界队列并由新任务唤醒，不做固定间隔轮询；单 worker 内部仍可在 `await` 时执行一个已排队子任务，避免嵌套等待饥饿。这些都是 runtime 内部行为，不增加用户级并发 API。
+但当前 await、blocking completion 等待和 shutdown 路径仍含短间隔检查；取消清理期间不再帮跑用户任务。
+固定 worker 和有界队列不等于已经实现可挂起的 stackless M:N 调度或事件驱动连接管理。
 
 ## 开发者 HTTP 压测 demo
 
