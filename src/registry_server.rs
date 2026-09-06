@@ -4244,6 +4244,7 @@ mod tests {
 
     struct TestServer {
         base_url: String,
+        address: SocketAddr,
         public_key: String,
         agent: ureq::Agent,
         client_config: Arc<ClientConfig>,
@@ -4274,12 +4275,13 @@ mod tests {
                     .with_root_certificates(roots)
                     .with_no_client_auth(),
             );
-            let agent = test_registry_agent(Arc::clone(&client_config));
+            let agent = test_registry_agent(Arc::clone(&client_config), address);
             let shutdown = Arc::new(AtomicBool::new(false));
             let thread_shutdown = Arc::clone(&shutdown);
             let thread = thread::spawn(move || server.serve_until(thread_shutdown));
             Self {
                 base_url: format!("https://localhost:{}/v1/", address.port()),
+                address,
                 public_key,
                 agent,
                 client_config,
@@ -4292,7 +4294,7 @@ mod tests {
         }
 
         fn fresh_agent(&self) -> ureq::Agent {
-            test_registry_agent(Arc::clone(&self.client_config))
+            test_registry_agent(Arc::clone(&self.client_config), self.address)
         }
 
         fn stop(&mut self) {
@@ -4314,14 +4316,73 @@ mod tests {
         }
     }
 
-    fn test_registry_agent(client_config: Arc<ClientConfig>) -> ureq::Agent {
+    fn test_registry_resolver(address: SocketAddr) -> impl ureq::Resolver {
+        assert!(
+            address.is_ipv4() && address.ip().is_loopback() && address.port() != 0,
+            "registry test resolver requires a bound IPv4 loopback address"
+        );
+        let authority = format!("localhost:{}", address.port());
+        move |requested: &str| {
+            if requested != authority {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "registry test resolver rejected a foreign authority",
+                ));
+            }
+            // Only the socket already owned by this fixture is reachable. Do
+            // not consult system DNS or redirect other ports to this server.
+            Ok(vec![address])
+        }
+    }
+
+    fn test_registry_agent(client_config: Arc<ClientConfig>, address: SocketAddr) -> ureq::Agent {
         ureq::AgentBuilder::new()
             .tls_config(client_config)
+            .resolver(test_registry_resolver(address))
             .timeout_connect(Duration::from_secs(2))
             .timeout(Duration::from_secs(8))
             .timeout_read(Duration::from_secs(8))
             .redirects(0)
             .build()
+    }
+
+    #[test]
+    fn registry_test_resolver_accepts_only_its_owned_authority_without_dns() {
+        use ureq::Resolver;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind resolver fixture");
+        let address = listener
+            .local_addr()
+            .expect("read resolver fixture address");
+        let resolver = test_registry_resolver(address);
+        assert_eq!(
+            resolver
+                .resolve(&format!("localhost:{}", address.port()))
+                .expect("resolve exact fixture authority without DNS"),
+            vec![address]
+        );
+        let other_port = if address.port() == u16::MAX {
+            1
+        } else {
+            address.port() + 1
+        };
+        for authority in [
+            format!("localhost:{other_port}"),
+            format!("127.0.0.1:{}", address.port()),
+            format!("[::1]:{}", address.port()),
+            format!("foreign.invalid:{}", address.port()),
+            format!("localhost:{}evil", address.port()),
+            "localhost".to_string(),
+            "localhost:0".to_string(),
+        ] {
+            assert_eq!(
+                resolver
+                    .resolve(&authority)
+                    .expect_err("foreign authorities must not resolve or fall back to DNS")
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
     }
 
     // Production registry operations create their own HTTP agent. Keep the TLS
@@ -6607,7 +6668,12 @@ mod tests {
         let artifact = pack_package(&math).expect("pack first yank test version");
         let next_artifact = pack_package(&math_next).expect("pack second yank test version");
         with_fresh_registry_http_agent(&server, || publish_package(&math, "token-math"))
-            .expect("publish first yank test version");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "publish first yank test version: {error:?}; accepted_connections={}",
+                    server.accepted_connections.load(Ordering::Relaxed)
+                )
+            });
         with_fresh_registry_http_agent(&server, || publish_package(&math_next, "token-math"))
             .expect("publish second yank test version");
 
