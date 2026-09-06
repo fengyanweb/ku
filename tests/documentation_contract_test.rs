@@ -6,11 +6,16 @@ fn documentation_separates_current_contract_from_implementation_evidence() {
     let syntax = include_str!("../docs/syntax.md");
     let semantics = include_str!("../docs/semantics.md");
     let worklog = include_str!("../docs/v0.0.18-worklog.md");
+    let ir = include_str!("../docs/ir.md");
     assert!(readme.contains("docs/semantics.md"));
     assert!(syntax.contains("[语义合同](semantics.md)"));
     assert!(semantics.contains("[syntax.md](syntax.md)"));
     assert!(semantics.contains("v0.0.18-worklog.md"));
     assert!(worklog.contains("不是发行说明"));
+    assert!(ir.contains("取消语义已确定"));
+    assert!(ir.contains("[语义合同](semantics.md)"));
+    assert!(ir.contains("async native lowering 继续拒绝"));
+    assert!(!ir.contains("取消语义单独决策"));
     assert!(!readme.contains("## 0.0.15 支持的核心语法"));
     assert!(!syntax.contains("Ku 0.0.15 的基础类型"));
     assert!(!syntax.contains("0.0.15 的历史边界是"));
