@@ -368,6 +368,10 @@ fn ir_type_is_owned(ty: &IrType) -> bool {
 }
 
 pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
+    crate::ast::reject_compiled_async(
+        program,
+        "async/await is not supported by IR/native lowering yet",
+    )?;
     let specialized = monomorph::specialize(program)?;
     let program = specialized.as_ref().unwrap_or(program);
     let layouts = lower_layouts(program);
@@ -2056,6 +2060,10 @@ impl<'a> FunctionLowerer<'a> {
             }
             let tokens = crate::lexer::Lexer::new(&source).tokenize()?;
             let expr = crate::parser::Parser::new(tokens).parse_expression_only()?;
+            crate::ast::reject_compiled_async_expression(
+                &expr,
+                "async/await is not supported by IR/native lowering yet",
+            )?;
             // `{expr}` -> `str(expr)` so the run-time value is stringified like the
             // interpreter's `to_string()`.
             parts.push(Expr::new(
