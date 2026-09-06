@@ -117,7 +117,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 1. 逐项补齐闭包尚未支持的 binding/payload 捕获，并为每一种 owned payload 固定逃逸与失败清理测试。
 2. 继续收窄动态 object 与 Result 的组合边界，不把单项 ABI 存在等同于任意嵌套组合已完成。
 3. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
-4. async native lowering 继续拒绝，直到状态机 task ABI、调度器嵌入方式和取消语义单独决策。
+4. async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；解释器生命周期验证见 [阶段工作日志](v0.0.18-worklog.md)。typed async IR、task frame ABI、stackless lowering 和调度器仍未实现；只有相应子集通过 IR verifier 与 native 执行测试后才能开放，不能把解释器通过或拒绝门禁当作 native async 完成。
 
 ## IR 优化队列
 
