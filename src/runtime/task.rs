@@ -220,10 +220,13 @@ impl TaskRuntime {
             self.inner
                 .rejected_task_internal
                 .fetch_add(1, Ordering::Relaxed);
-            state.complete(Ok(task_error(
-                "runtime_stopped",
-                "async task runtime has no available workers",
-            )));
+            state.complete(
+                id,
+                Ok(task_error(
+                    "runtime_stopped",
+                    "async task runtime has no available workers",
+                )),
+            );
             return handle;
         }
         if self
@@ -237,10 +240,13 @@ impl TaskRuntime {
             self.inner
                 .rejected_task_limit
                 .fetch_add(1, Ordering::Relaxed);
-            state.complete(Ok(task_error(
-                "too_many_tasks",
-                format!("async task limit {} reached", self.inner.max_tasks),
-            )));
+            state.complete(
+                id,
+                Ok(task_error(
+                    "too_many_tasks",
+                    format!("async task limit {} reached", self.inner.max_tasks),
+                )),
+            );
             return handle;
         }
         if let Ok(mut states) = self.inner.states.lock() {
@@ -250,10 +256,13 @@ impl TaskRuntime {
             self.inner
                 .rejected_task_internal
                 .fetch_add(1, Ordering::Relaxed);
-            state.complete(Err(KuError::runtime(
-                "async task registry is poisoned",
-                Span::default(),
-            )));
+            state.complete(
+                id,
+                Err(KuError::runtime(
+                    "async task registry is poisoned",
+                    Span::default(),
+                )),
+            );
             return handle;
         }
         let run = match catch_unwind(AssertUnwindSafe(build)) {
@@ -264,10 +273,13 @@ impl TaskRuntime {
                     .rejected_task_internal
                     .fetch_add(1, Ordering::Relaxed);
                 self.remove_state(id);
-                state.complete(Ok(task_error(
-                    "spawn_panic",
-                    "async task construction panicked",
-                )));
+                state.complete(
+                    id,
+                    Ok(task_error(
+                        "spawn_panic",
+                        "async task construction panicked",
+                    )),
+                );
                 return handle;
             }
         };
@@ -289,13 +301,16 @@ impl TaskRuntime {
                 self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
                 self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
                 self.remove_state(id);
-                state.complete(Ok(task_error(
-                    "queue_full",
-                    format!(
-                        "async task queue limit {} reached",
-                        self.inner.task_queue_limit
-                    ),
-                )));
+                state.complete(
+                    id,
+                    Ok(task_error(
+                        "queue_full",
+                        format!(
+                            "async task queue limit {} reached",
+                            self.inner.task_queue_limit
+                        ),
+                    )),
+                );
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.inner
@@ -304,10 +319,13 @@ impl TaskRuntime {
                 self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
                 self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
                 self.remove_state(id);
-                state.complete(Ok(task_error(
-                    "runtime_stopped",
-                    "async task runtime is stopped",
-                )));
+                state.complete(
+                    id,
+                    Ok(task_error(
+                        "runtime_stopped",
+                        "async task runtime is stopped",
+                    )),
+                );
             }
         }
         handle
@@ -879,27 +897,39 @@ impl PartialEq for TaskHandle {
 }
 
 impl TaskState {
-    fn complete(&self, result: KuResult<Value>) {
-        self.complete_with_status(result, None);
+    fn complete(&self, id: i64, result: KuResult<Value>) {
+        self.complete_with_status(id, result, None);
     }
 
-    fn complete_with_status(&self, result: KuResult<Value>, status: Option<u8>) {
+    fn complete_with_status(&self, id: i64, result: KuResult<Value>, status: Option<u8>) {
+        // Cancellation and completion use the same lock. The worker's earlier
+        // cancellation check is only advisory: a request may win before commit.
+        // Keep losing payloads here so their destructors run after unlocking.
+        let mut uncommitted = Some(result);
         if let Ok(mut slot) = self.result.lock() {
             if slot.is_none() {
-                let status = status.unwrap_or_else(|| {
-                    if self.cancelled.load(Ordering::Acquire) {
-                        TASK_CANCELLED
-                    } else if result.is_err() {
-                        TASK_FAILED
-                    } else {
-                        TASK_COMPLETED
-                    }
-                });
+                let (result, status) = if self.cancelled.load(Ordering::Acquire) {
+                    (
+                        Ok(task_error("cancelled", format!("task {id} was cancelled"))),
+                        TASK_CANCELLED,
+                    )
+                } else {
+                    let result = uncommitted.take().expect("completion owns its result");
+                    let status = status.unwrap_or_else(|| {
+                        if result.is_err() {
+                            TASK_FAILED
+                        } else {
+                            TASK_COMPLETED
+                        }
+                    });
+                    (result, status)
+                };
                 *slot = Some(result);
                 self.status.store(status, Ordering::Release);
                 self.ready.notify_all();
             }
         }
+        drop(uncommitted);
     }
 
     fn request_cancel(&self) -> bool {
@@ -927,8 +957,12 @@ impl TaskState {
     }
 
     fn set_status(&self, status: u8) {
-        if !self.is_cancelled() {
-            self.status.store(status, Ordering::Release);
+        // Do not overwrite a cancellation or terminal state between a separate
+        // cancelled load and the status store.
+        if let Ok(slot) = self.result.lock() {
+            if slot.is_none() && !self.is_cancelled() {
+                self.status.store(status, Ordering::Release);
+            }
         }
     }
 
@@ -1012,13 +1046,7 @@ fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<T
 
 fn execute_task_job(inner: &TaskRuntimeInner, job: TaskJob) {
     if job.state.is_cancelled() {
-        job.state.complete_with_status(
-            Ok(task_error(
-                "cancelled",
-                format!("task {} was cancelled", job.id),
-            )),
-            Some(TASK_CANCELLED),
-        );
+        job.state.complete(job.id, Ok(Value::Null));
         finish_task_job(inner, job.id);
         return;
     }
@@ -1041,18 +1069,8 @@ fn execute_task_job(inner: &TaskRuntimeInner, job: TaskJob) {
         current.replace(previous_state);
     });
     CURRENT_TASK_ID.with(|current| current.set(previous));
-    if job.state.is_cancelled() {
-        job.state.complete_with_status(
-            Ok(task_error(
-                "cancelled",
-                format!("task {} was cancelled", job.id),
-            )),
-            Some(TASK_CANCELLED),
-        );
-    } else {
-        job.state
-            .complete_with_status(result, panicked.then_some(TASK_PANICKED));
-    }
+    job.state
+        .complete_with_status(job.id, result, panicked.then_some(TASK_PANICKED));
     finish_task_job(inner, job.id);
 }
 
@@ -1178,6 +1196,272 @@ fn task_error(code: &str, message: impl Into<String>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completion_state() -> TaskState {
+        TaskState {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+            cancelled: AtomicBool::new(false),
+            awaited: AtomicBool::new(false),
+            status: AtomicU8::new(TASK_RUNNING),
+        }
+    }
+
+    // Track destruction using actual move-only payload ownership, without a
+    // running job, an OS worker, a real socket, or a timing-dependent allocator.
+    fn tracked_owned_result() -> (KuResult<Value>, Weak<TaskState>, Weak<TaskRuntimeInner>) {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let state = Arc::new(completion_state());
+        let weak_state = Arc::downgrade(&state);
+        let weak_runtime = Arc::downgrade(&runtime.inner);
+        let result = Ok(Value::Result {
+            ok: true,
+            value: Box::new(Value::Array(vec![
+                Value::String("owned completion".repeat(128)),
+                Value::Task(TaskHandle {
+                    id: 99,
+                    state,
+                    runtime,
+                }),
+            ])),
+        });
+        (result, weak_state, weak_runtime)
+    }
+
+    #[test]
+    fn cancel_between_worker_check_and_completion_commits_cancelled_result() {
+        let state = completion_state();
+        // Reproduce the exact reachable ordering in execute_task_job: its
+        // cancellation check has passed, but the result lock is not held yet.
+        assert!(!state.is_cancelled());
+        assert!(state.request_cancel());
+        state.complete_with_status(41, Ok(Value::String("late success".into())), None);
+        assert_eq!(state.status_name(), "cancelled");
+        let result = state.result().unwrap().unwrap().unwrap();
+        let Value::Result { ok: false, value } = result else {
+            panic!("cancelled task published a successful payload: {result:?}");
+        };
+        let Value::Object(fields) = *value else {
+            panic!("task cancellation must retain its structured error");
+        };
+        assert_eq!(fields.get("domain"), Some(&Value::String("task".into())));
+        assert_eq!(fields.get("code"), Some(&Value::String("cancelled".into())));
+        assert_eq!(
+            fields.get("message"),
+            Some(&Value::String("task 41 was cancelled".into()))
+        );
+    }
+
+    #[test]
+    fn task_completion_first_rejects_cancel_and_releases_duplicate_owned_result() {
+        let state = completion_state();
+        let (first, first_state, first_runtime) = tracked_owned_result();
+        state.complete(41, first);
+        assert_eq!(state.status_name(), "completed");
+        assert!(!state.request_cancel());
+        assert!(!state.request_cancel());
+        let (late, late_state, late_runtime) = tracked_owned_result();
+        state.complete_with_status(41, late, Some(TASK_PANICKED));
+        assert_eq!(state.status_name(), "completed");
+        assert!(late_state.upgrade().is_none());
+        assert!(late_runtime.upgrade().is_none());
+        assert!(first_state.upgrade().is_some());
+        assert!(first_runtime.upgrade().is_some());
+        drop(state);
+        assert!(first_state.upgrade().is_none());
+        assert!(first_runtime.upgrade().is_none());
+    }
+
+    #[test]
+    fn task_cancel_first_releases_late_owned_results_and_stays_terminal() {
+        let state = completion_state();
+        assert!(state.request_cancel());
+        assert!(!state.request_cancel());
+        for supplied_status in [None, Some(TASK_PANICKED)] {
+            let (late, late_state, late_runtime) = tracked_owned_result();
+            state.complete_with_status(41, late, supplied_status);
+            assert_eq!(state.status_name(), "cancelled");
+            assert!(late_state.upgrade().is_none());
+            assert!(late_runtime.upgrade().is_none());
+            assert!(!state.request_cancel());
+        }
+        assert!(state.result.try_lock().is_ok());
+    }
+
+    #[test]
+    fn task_status_updates_cannot_overwrite_cancellation_or_terminal_states() {
+        let cancelling = completion_state();
+        assert!(cancelling.request_cancel());
+        for update in [TASK_RUNNING, TASK_WAITING] {
+            cancelling.set_status(update);
+            assert_eq!(cancelling.status_name(), "cancelling");
+        }
+        for (result, supplied_status, expected) in [
+            (Ok(Value::Null), None, "completed"),
+            (
+                Ok(task_error("application", "recoverable Result")),
+                None,
+                "completed",
+            ),
+            (
+                Err(KuError::runtime("runtime failure", Span::default())),
+                None,
+                "failed",
+            ),
+            (
+                Ok(task_error("panic", "async task panicked")),
+                Some(TASK_PANICKED),
+                "panicked",
+            ),
+        ] {
+            let state = completion_state();
+            state.complete_with_status(41, result, supplied_status);
+            assert_eq!(state.status_name(), expected);
+            for update in [TASK_RUNNING, TASK_WAITING] {
+                state.set_status(update);
+                assert_eq!(state.status_name(), expected);
+            }
+            assert!(!state.request_cancel());
+        }
+    }
+
+    #[test]
+    fn task_cancel_before_panicked_completion_keeps_cancellation_result() {
+        let state = completion_state();
+        assert!(state.request_cancel());
+        state.complete_with_status(
+            41,
+            Ok(task_error("panic", "async task panicked")),
+            Some(TASK_PANICKED),
+        );
+        assert_eq!(state.status_name(), "cancelled");
+        assert_eq!(
+            state.result().unwrap().unwrap().unwrap(),
+            task_error("cancelled", "task 41 was cancelled")
+        );
+    }
+
+    #[test]
+    fn task_cancel_and_complete_two_thread_race_keeps_outcome_consistent() {
+        enum Finished {
+            Cancel(bool),
+            Complete,
+        }
+        let timeout = Duration::from_secs(2);
+        for round in 0..32 {
+            let id = 100 + round;
+            let state = Arc::new(completion_state());
+            let (cancel_start, cancel_ready) = mpsc::channel();
+            let (complete_start, complete_ready) = mpsc::channel();
+            let (finished, results) = mpsc::channel();
+            let cancel_state = Arc::clone(&state);
+            let cancel_finished = finished.clone();
+            let canceller = thread::spawn(move || {
+                cancel_ready.recv_timeout(timeout).expect("cancel start");
+                let accepted = cancel_state.request_cancel();
+                cancel_finished
+                    .send(Finished::Cancel(accepted))
+                    .expect("cancel result");
+            });
+            let complete_state = Arc::clone(&state);
+            let completer = thread::spawn(move || {
+                complete_ready
+                    .recv_timeout(timeout)
+                    .expect("complete start");
+                complete_state.complete(id, Ok(Value::Int(round)));
+                finished
+                    .send(Finished::Complete)
+                    .expect("completion result");
+            });
+            // Alternate the launch order, without requiring either race winner.
+            if round % 2 == 0 {
+                cancel_start.send(()).unwrap();
+                complete_start.send(()).unwrap();
+            } else {
+                complete_start.send(()).unwrap();
+                cancel_start.send(()).unwrap();
+            }
+            let mut cancelled = None;
+            let mut completed = false;
+            for _ in 0..2 {
+                match results
+                    .recv_timeout(timeout)
+                    .expect("bounded completion race")
+                {
+                    Finished::Cancel(accepted) => cancelled = Some(accepted),
+                    Finished::Complete => completed = true,
+                }
+            }
+            // Join only after both closures have reported completion; no lock or
+            // unbounded barrier is used to wait for the competing operations.
+            canceller.join().expect("canceller exited");
+            completer.join().expect("completer exited");
+            assert!(completed);
+            let actual = state.result().unwrap().unwrap().unwrap();
+            if cancelled.expect("cancel outcome") {
+                assert_eq!(state.status_name(), "cancelled");
+                assert_eq!(
+                    actual,
+                    task_error("cancelled", format!("task {id} was cancelled"))
+                );
+            } else {
+                assert_eq!(state.status_name(), "completed");
+                assert_eq!(actual, Value::Int(round));
+            }
+            assert!(!state.request_cancel());
+        }
+    }
+
+    #[test]
+    fn task_worker_panic_and_accepted_cancellation_preserve_classification() {
+        let runtime = TaskRuntime::with_limits(1, 2, 1, 1, 2);
+        let timeout = Duration::from_secs(2);
+        for cancel_before_exit in [false, true] {
+            let (started, start_result) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let task = runtime.spawn(move || -> KuResult<Value> {
+                started
+                    .send((
+                        current_task_id(),
+                        thread::current().name().unwrap_or("").to_string(),
+                    ))
+                    .expect("worker start signal");
+                released
+                    .recv_timeout(timeout)
+                    .expect("bounded worker release");
+                panic!("intentional task worker panic");
+            });
+            // No await/helping is entered until the real worker is running.
+            let (running_id, worker_name) =
+                start_result.recv_timeout(timeout).expect("worker start");
+            assert_eq!(running_id, task.id());
+            assert!(worker_name.starts_with("ku-task-"), "{worker_name}");
+            if cancel_before_exit {
+                assert!(task.cancel());
+                assert_eq!(task.status(), "cancelling");
+                assert!(!task.cancel());
+            }
+            release.send(()).unwrap();
+            let result = task.await_timeout(timeout).expect("worker terminal result");
+            if cancel_before_exit {
+                assert_eq!(task.status(), "cancelled");
+                assert_eq!(
+                    result,
+                    task_error("cancelled", format!("task {} was cancelled", task.id()))
+                );
+            } else {
+                assert_eq!(task.status(), "panicked");
+                assert_eq!(result, task_error("panic", "async task panicked"));
+            }
+            assert!(!task.cancel());
+        }
+        runtime
+            .cancel_all_and_wait(timeout)
+            .expect("worker cleanup");
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.registered_tasks, 0);
+    }
 
     fn wait_until(timeout: Duration, message: &str, mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + timeout;
