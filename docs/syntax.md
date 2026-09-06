@@ -723,7 +723,15 @@ println(value)
 println(value)
 ```
 
-作用域结束时，用户没有 detach/cancel/spawn 入口。当前解释器在 `main` 返回后会请求取消仍未结束的子 task，并在 1 秒有界窗口内排空；未能停止会返回 `task/shutdown_timeout`，不会无限等待。native C / LLVM 仍明确拒绝 async lowering。
+Task 清理采用当前所有权作用域规则：合法 move 会转移清理责任；作用域正常结束、return、错误传播、panic、超时或取消时，请求取消仍持有的未完成 Task，并释放已完成但未 await 的 payload。兄弟失败不直接取消其他兄弟；只有父任务观察错误并传播退出时，才按作用域退出规则清理它仍持有的任务。
+
+只读闭包捕获和同步 `&` 借用不转移 Task 的清理责任，borrowed 参数本身不是 owner。原 owner 退出后，捕获可以保留可打印的 Task 标识控制块，但不能借此保留或重新取得已释放的 payload，也不新增用户级状态查询或取消方法。
+
+取消和超时是普通 catch 不能捕获的内部控制终止，与完成竞争唯一不可逆终态；finally 中的 return、fail、panic 或迟到结果不能将其改成成功。一次根取消建立默认总计 1 秒的单调时钟绝对清理截止时间，嵌套 finally、子任务和 drop 共用，不逐个续期；外层 shutdown 预算更短时从短。清理期间禁止新建 Task、await 或新提交 sleep/timer、网络等待和 blocking job。main/runtime 关闭未能完成时仍使用 `task/shutdown_timeout`。用户没有 detach/cancel/spawn 入口，公开语法不变。详细顺序与预算见 [Task 语义合同](semantics.md#task-所有权取消与清理预算)。
+
+普通作用域退出的子任务清理超期同样报告 `task/shutdown_timeout`，不能把正常父任务伪标为 Cancelled。
+
+上述规则已经决策采用，本轮解释器生命周期切片已通过本机全量回归，具体证据与未覆盖边界见实施记录。native async、stackless Task frame、M:N、netpoll 和事件驱动 HTTP 尚未实现；native C / LLVM 仍明确拒绝 async lowering，不能从既有 native HTTP timeout 推导为 native Task 取消已经支持。
 
 运行时默认边界：
 
@@ -884,7 +892,7 @@ while (i < 10) {
 
 - `int` 运算使用有界整数，溢出会报 `integer overflow`。
 - 函数调用深度有保护，直接或间接递归过深会报错，避免只依赖宿主栈崩溃。
-- async task 的循环会在语句 tick 时检查协作式取消；main 返回后的 shutdown 会取消未完成 task，并在有界窗口内排空。
+- async task 的循环会在语句 tick 时检查协作式取消；Task 按上述所有权作用域规则有界清理，取消展开不为每层 finally 重新获得预算。
 - HTTP handler 有 `handler_timeout_ms`，超时返回 504，不会让请求无限等待。
 - 不断分配内存的循环仍可能触发宿主环境 OOM。
 
@@ -1245,6 +1253,10 @@ ns.Enum.Variant(...)      namespace enum variant
 Result.Ok(value) => str(value)
 ```
 
+Task 或含 Task 的模式绑定在 guard 求值时只是非 owning 的候选绑定，不能在 guard 中 move/await（E0805）；guard 为 false 时，不取消该候选 Task，也不消费后续 arm 所需的 payload。只有选中 arm 后才真正转移对应 payload，guard 自己创建并 await 的独立 Task 不受这条限制。
+
+匹配 Task 或含 Task 的值会消费原 scrutinee。选中 arm 返回的 Task 可以继续转移；arm 内未消费的 Task binding，以及 `_` 等模式留下的残余 Task，必须在 match 表达式返回前完成有界清理，并沿用该次退出的同一绝对清理截止时间。这是解释器 Task 合同，不表示 native async 已支持。
+
 穷尽性规则：
 
 ```txt
@@ -1358,9 +1370,9 @@ fn main() {
 }
 ```
 
-`finally` 无论 try 是否失败都会执行。
+正常完成、可恢复错误和 return 路径都经过对应 `finally`。取消或超时展开也执行有界清理，但全部嵌套 finally 共享根取消的绝对截止时间；不能据此要求预算耗尽后继续执行剩余语句。
 
-`panic` 不会被 `try/catch` 捕获。
+`panic`、Task 取消和超时不会被普通 `try/catch` 捕获。取消清理中的 return、fail、panic 或其他错误不能覆盖原取消/超时原因。
 
 ## 12. 内置函数和标准库
 

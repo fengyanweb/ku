@@ -28,6 +28,9 @@ level code message file line column endLine endColumn notes helps
 
 其余已识别分类保留：E0104 `switch`、E0105 `let`、E0301 类型不匹配、E0302 非 bool 条件、E0401 无效 Result `?`、E0602 构造器缺少调用、E0603 unused import、E0702 handler 返回类型、E0802 非法 task 操作、E0803 task clone、E0804 重复 await，以及下文的 E0901/E0904/E0905/E0910–E0919。
 
+第二阶段增加 E0805：match guard 不能消费仍处于候选状态的 Task binding（包括含 Task
+的 payload），应在确定选中的 arm 内 move/await；guard 自己新建并 await 的任务不受此限制。
+
 通用回退分类明确标记为**未细分**：E0001 runtime、E0101 lexical/syntax、E0600 import、E0606 package、E0700 HTTP。它们不表示所有具体错误均已获得独立 ID；E0001/E0101 也可能没有通用修复 help。可恢复运行时错误的 `domain` / `code`（例如 `array/index_out_of_bounds`）是另一份 Result/Error 合同，不能被编译器的 `E` 编号替代。
 
 ## Ownership
@@ -63,6 +66,8 @@ fn main(): null! {
 | E0917 | `borrowed operation is not supported`：当前没有安全 borrowed 路径的操作 | 先显式 clone 为 owned 值，再执行该操作 |
 | E0918 | `'&' is not written at the call site` | 写 `inspect(value)`，由函数签名决定 borrow / move |
 | E0919 | 单独 `&` 出现在参数槽位以外 | 声明写 `&name: T`，函数类型参数写 `fn(&T): R`；借用箭头加括号 |
+
+表中“先 clone”的修改方向仅适用于可 clone 的类型。Task 及包含 Task payload 的容器不能 clone；应让真正的 owner 在借用结束后消费 Task，或调整所有权与调用边界，不能通过 clone 绕过 borrowed / capture 限制。
 
 例如返回 Copy 字段合法，返回 owned 字段需要 clone：
 

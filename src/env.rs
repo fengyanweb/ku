@@ -1,11 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use crate::error::{KuError, KuResult};
+use crate::runtime::task::TaskHandle;
 use crate::span::Span;
-use crate::value::{BorrowedValue, Value};
+use crate::value::{BorrowedValue, Value, ValueProjection};
 
 #[derive(Debug, Clone)]
 pub struct Binding {
@@ -13,6 +14,7 @@ pub struct Binding {
     pub mutable: bool,
     owner_task_id: i64,
     borrowed_parameter: bool,
+    match_probe: bool,
 }
 
 impl Binding {
@@ -42,6 +44,57 @@ impl Binding {
 }
 
 pub(crate) type BindingCell = Arc<Mutex<Binding>>;
+
+fn collect_binding_owned_tasks(
+    binding: &std::sync::MutexGuard<'_, Binding>,
+    tasks: &mut Vec<TaskHandle>,
+    span: Span,
+) -> KuResult<()> {
+    if binding.borrowed_parameter
+        || binding.match_probe
+        || binding.owner_task_id != crate::runtime::task::current_task_id()
+    {
+        return Ok(());
+    }
+    match &binding.value {
+        // Borrowing an owned caller slot changes its current representation,
+        // not its scope owner. Keep the source lock through this read so lease
+        // restoration cannot race it; never re-lock the same BindingCell.
+        Value::Borrowed(view) => view
+            .with_source_read_locked(binding, span, |root| root.collect_owned_tasks(tasks, span)),
+        value => value.collect_owned_tasks(tasks, span),
+    }
+}
+
+/// A call-scoped, non-owning view of caller binding cells. Values are inspected
+/// when cancellation is observed, not snapshotted before argument side effects.
+#[derive(Debug)]
+pub(crate) struct OwnedBindingObserver {
+    cells: Vec<Weak<Mutex<Binding>>>,
+}
+
+impl OwnedBindingObserver {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    pub(crate) fn collect_owned_tasks(
+        &self,
+        tasks: &mut Vec<TaskHandle>,
+        span: Span,
+    ) -> KuResult<()> {
+        for weak in &self.cells {
+            let Some(cell) = weak.upgrade() else { continue };
+            let binding = cell
+                .lock()
+                .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+            collect_binding_owned_tasks(&binding, tasks, span)?;
+        }
+        // No binding lock survives this method. Cancellation/waiting belongs to
+        // the caller, after every active observer has contributed its handles.
+        Ok(())
+    }
+}
 
 /// Stable call-owned storage. No binding mutex is held while running Ku code.
 pub(crate) struct BorrowLease {
@@ -83,20 +136,43 @@ impl Drop for BorrowLease {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Env {
-    scopes: Vec<HashMap<String, BindingCell>>,
+    scopes: Vec<Scope>,
+}
+
+#[derive(Debug, Default)]
+struct Scope {
+    bindings: HashMap<String, BindingCell>,
+    // Sharing an environment shares cells, not responsibility for their scope
+    // exit. Only bindings defined through this Env appear in this scope's set.
+    owned_bindings: HashSet<String>,
+}
+
+impl Clone for Env {
+    fn clone(&self) -> Self {
+        Self {
+            scopes: self
+                .scopes
+                .iter()
+                .map(|scope| Scope {
+                    bindings: scope.bindings.clone(),
+                    owned_bindings: HashSet::new(),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl Env {
     pub fn new() -> Self {
         Self {
-            scopes: vec![HashMap::new()],
+            scopes: vec![Scope::default()],
         }
     }
 
     pub fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(Scope::default());
     }
 
     pub fn pop_scope(&mut self) {
@@ -138,21 +214,83 @@ impl Env {
             .scopes
             .last_mut()
             .expect("environment always has a scope");
-        if scope.contains_key(&name) {
+        if scope.bindings.contains_key(&name) {
             return Err(KuError::runtime(
                 format!("variable '{}' is already defined in this scope", name),
                 span,
             ));
         }
-        scope.insert(
-            name,
+        scope.bindings.insert(
+            name.clone(),
             Arc::new(Mutex::new(Binding {
                 borrowed_parameter: matches!(value, Value::Borrowed(_)),
                 value,
                 mutable,
                 owner_task_id: crate::runtime::task::current_task_id(),
+                match_probe: false,
             })),
         );
+        scope.owned_bindings.insert(name);
+        Ok(())
+    }
+
+    /// A tentative match binding is a non-owning snapshot until its guard wins.
+    /// It may be read, but must not move/await Task payloads or cancel them when
+    /// a failed guard discards this scope.
+    pub(crate) fn define_task_match_probe(
+        &mut self,
+        name: String,
+        value: Value,
+        span: Span,
+    ) -> KuResult<()> {
+        self.define_owned(name.clone(), value, false, span)?;
+        let cell = self
+            .scopes
+            .last()
+            .and_then(|scope| scope.bindings.get(&name))
+            .expect("new probe binding");
+        cell.lock()
+            .map_err(|_| KuError::runtime("environment binding is poisoned", span))?
+            .match_probe = true;
+        self.scopes
+            .last_mut()
+            .expect("probe scope")
+            .owned_bindings
+            .remove(&name);
+        Ok(())
+    }
+
+    pub(crate) fn commit_task_match_probe(
+        &mut self,
+        name: &str,
+        value: Value,
+        span: Span,
+    ) -> KuResult<()> {
+        value.require_owned_root(span)?;
+        let cell = self
+            .scopes
+            .last()
+            .and_then(|scope| scope.bindings.get(name))
+            .ok_or_else(|| KuError::runtime("missing tentative match binding", span))?;
+        let mut binding = cell
+            .lock()
+            .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+        if !binding.match_probe || binding.owner_task_id != crate::runtime::task::current_task_id()
+        {
+            return Err(KuError::runtime(
+                "invalid tentative match ownership transfer",
+                span,
+            ));
+        }
+        let previous = std::mem::replace(&mut binding.value, value);
+        binding.match_probe = false;
+        drop(binding);
+        drop(previous);
+        self.scopes
+            .last_mut()
+            .expect("probe scope")
+            .owned_bindings
+            .insert(name.to_string());
         Ok(())
     }
 
@@ -209,13 +347,16 @@ impl Env {
             }
         }
         Env {
-            scopes: vec![captured],
+            scopes: vec![Scope {
+                bindings: captured,
+                owned_bindings: HashSet::new(),
+            }],
         }
     }
 
     fn find_cell(&self, name: &str) -> Option<BindingCell> {
         for scope in self.scopes.iter().rev() {
-            if let Some(binding) = scope.get(name) {
+            if let Some(binding) = scope.bindings.get(name) {
                 return Some(binding.clone());
             }
         }
@@ -230,7 +371,7 @@ impl Env {
     pub(crate) fn assign_owned(&mut self, name: &str, value: Value, span: Span) -> KuResult<()> {
         value.require_owned_root(span)?;
         for scope in self.scopes.iter_mut().rev() {
-            if let Some(binding) = scope.get(name) {
+            if let Some(binding) = scope.bindings.get(name) {
                 let mut binding = binding
                     .lock()
                     .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
@@ -249,11 +390,156 @@ impl Env {
         self.scopes
             .iter()
             .rev()
-            .any(|scope| scope.contains_key(name))
+            .any(|scope| scope.bindings.contains_key(name))
     }
 
     pub fn get(&self, name: &str, span: Span) -> KuResult<Value> {
         self.with_value(name, span, |value| Ok(value.clone()))
+    }
+
+    /// Ku owning reads transfer Task-containing values instead of sharing an
+    /// internal handle lease with a moved-from slot. Other values retain get's
+    /// existing transparent snapshot/borrow behavior.
+    pub(crate) fn get_owning(&self, name: &str, span: Span) -> KuResult<Value> {
+        for scope in self.scopes.iter().rev() {
+            let Some(cell) = scope.bindings.get(name) else {
+                continue;
+            };
+            let mut binding = cell
+                .lock()
+                .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+            if binding.value.contains_owned_task(span)? {
+                Self::check_task_move(&binding, scope.owned_bindings.contains(name), name, span)?;
+                return Ok(std::mem::replace(&mut binding.value, Value::Null));
+            }
+            if let Value::Borrowed(view) = &binding.value {
+                if !view.is_current_owner() {
+                    if binding.borrowed_parameter {
+                        view.check_owner(span)?;
+                    }
+                    return view.with_source_read_locked(&binding, span, |value| {
+                        if value.contains_owned_task(span)? {
+                            return Err(KuError::runtime(
+                                format!(
+                                    "cannot move Task from captured or borrowed variable '{name}'"
+                                ),
+                                span,
+                            ));
+                        }
+                        Ok(value.clone())
+                    });
+                }
+            }
+            return Ok(binding.value.clone());
+        }
+        Err(KuError::runtime(
+            format!("undefined variable '{name}'"),
+            span,
+        ))
+    }
+
+    fn check_task_move(binding: &Binding, owned: bool, name: &str, span: Span) -> KuResult<()> {
+        if binding.match_probe {
+            return Err(KuError::runtime(
+                format!("cannot consume tentative Task binding '{name}' in a match guard; await or move it only in the selected arm"),
+                span,
+            ).with_diagnostic_id(crate::error::DiagnosticId::TaskGuardMove));
+        }
+        if !owned
+            || binding.borrowed_parameter
+            || binding.owner_task_id != crate::runtime::task::current_task_id()
+        {
+            return Err(KuError::runtime(
+                format!("cannot move Task from captured or borrowed variable '{name}'"),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Only take the selected Task-containing subtree. No user code, cancellation
+    /// or waiting may run while this binding lock is held. None preserves normal
+    /// lookup diagnostics and leaves all ordinary values and sibling slots intact.
+    pub(crate) fn take_task_projection(
+        &self,
+        name: &str,
+        path: &[ValueProjection],
+        span: Span,
+    ) -> KuResult<Option<Value>> {
+        for scope in self.scopes.iter().rev() {
+            let Some(cell) = scope.bindings.get(name) else {
+                continue;
+            };
+            let mut binding = cell
+                .lock()
+                .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+            if !scope.owned_bindings.contains(name)
+                || binding.borrowed_parameter
+                || binding.owner_task_id != crate::runtime::task::current_task_id()
+            {
+                if binding.value.contains_task_projection(path, span)? {
+                    Self::check_task_move(
+                        &binding,
+                        scope.owned_bindings.contains(name),
+                        name,
+                        span,
+                    )?;
+                }
+                return Ok(None);
+            }
+            return binding.value.take_task_projection(path, span);
+        }
+        Err(KuError::runtime(
+            format!("undefined variable '{name}'"),
+            span,
+        ))
+    }
+
+    pub(crate) fn current_scope_owned_tasks(&self, span: Span) -> KuResult<Vec<TaskHandle>> {
+        let index = self.scopes.len() - 1;
+        self.collect_scope_owned_tasks(index..self.scopes.len(), span)
+    }
+
+    pub(crate) fn all_owned_tasks(&self, span: Span) -> KuResult<Vec<TaskHandle>> {
+        self.collect_scope_owned_tasks(0..self.scopes.len(), span)
+    }
+
+    pub(crate) fn observe_owned_bindings(&self, span: Span) -> KuResult<OwnedBindingObserver> {
+        let mut cells = Vec::new();
+        for scope in &self.scopes {
+            cells.try_reserve(scope.owned_bindings.len()).map_err(|_| {
+                KuError::runtime("caller task ownership observation out of memory", span)
+            })?;
+            for name in &scope.owned_bindings {
+                if let Some(cell) = scope.bindings.get(name) {
+                    cells.push(Arc::downgrade(cell));
+                }
+            }
+        }
+        Ok(OwnedBindingObserver { cells })
+    }
+
+    fn collect_scope_owned_tasks(
+        &self,
+        indices: std::ops::Range<usize>,
+        span: Span,
+    ) -> KuResult<Vec<TaskHandle>> {
+        let mut tasks = Vec::new();
+        for index in indices {
+            let scope = &self.scopes[index];
+            for name in &scope.owned_bindings {
+                let Some(cell) = scope.bindings.get(name) else {
+                    continue;
+                };
+                let binding = cell
+                    .lock()
+                    .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+                collect_binding_owned_tasks(&binding, &mut tasks, span)?;
+            }
+        }
+        // Each binding guard has left scope. Callers may now request cancellation
+        // for the whole batch before waiting with the shared cleanup deadline.
+        Ok(tasks)
     }
 
     /// Project a value without cloning its entire owned container. The callback
@@ -266,7 +552,7 @@ impl Env {
         project: impl FnOnce(&Value) -> KuResult<T>,
     ) -> KuResult<T> {
         for scope in self.scopes.iter().rev() {
-            if let Some(binding) = scope.get(name) {
+            if let Some(binding) = scope.bindings.get(name) {
                 let binding = binding
                     .lock()
                     .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
@@ -296,7 +582,7 @@ impl Env {
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name))
+            .find_map(|scope| scope.bindings.get(name))
             .is_some_and(|cell| Arc::strong_count(cell) == 1)
     }
 
@@ -354,8 +640,283 @@ impl Default for Env {
 }
 
 #[cfg(test)]
+mod task_ownership_tests {
+    use super::*;
+    use crate::runtime::task::TaskRuntime;
+
+    fn task(runtime: &TaskRuntime) -> Value {
+        Value::Task(runtime.spawn(|| Ok(Value::Int(7))).unwrap())
+    }
+
+    fn ids(tasks: Vec<TaskHandle>) -> Vec<i64> {
+        let mut ids: Vec<_> = tasks.iter().map(TaskHandle::id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn caller_owner_observer_reads_rebound_slots_and_does_not_retain_moved_tasks() {
+        let span = Span::default();
+        let runtime = TaskRuntime::new();
+        let mut env = Env::new();
+        env.define("slot".into(), Value::Null, true, span).unwrap();
+        let observer = env.observe_owned_bindings(span).unwrap();
+        let mut captured = env.capture(&HashSet::from(["slot".into()]));
+        assert!(captured.observe_owned_bindings(span).unwrap().is_empty());
+        captured.assign_owned("slot", task(&runtime), span).unwrap();
+        let mut tasks = Vec::new();
+        observer.collect_owned_tasks(&mut tasks, span).unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "observer must see a Task inserted after registration"
+        );
+        let expected = tasks[0].id();
+        tasks.clear();
+        let moved = env.get_owning("slot", span).unwrap();
+        assert!(matches!(&moved, Value::Task(task) if task.id() == expected));
+        observer.collect_owned_tasks(&mut tasks, span).unwrap();
+        assert!(
+            tasks.is_empty(),
+            "moved-from cells must not cancel the transferred Task"
+        );
+        captured.assign_owned("slot", task(&runtime), span).unwrap();
+        observer.collect_owned_tasks(&mut tasks, span).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_ne!(tasks[0].id(), expected);
+        tasks.clear();
+        drop(captured);
+        drop(env);
+        observer.collect_owned_tasks(&mut tasks, span).unwrap();
+        assert!(
+            tasks.is_empty(),
+            "Weak observers must not keep exited bindings alive"
+        );
+    }
+
+    #[test]
+    fn task_owning_read_clears_moved_from_wrapper_and_preserves_plain_reads() {
+        let span = Span::default();
+        let runtime = TaskRuntime::new();
+        let mut env = Env::new();
+        env.define(
+            "source".into(),
+            Value::Array(vec![task(&runtime)]),
+            false,
+            span,
+        )
+        .unwrap();
+        env.define(
+            "text".into(),
+            Value::String("unchanged".into()),
+            false,
+            span,
+        )
+        .unwrap();
+        let expected = ids(env.current_scope_owned_tasks(span).unwrap());
+        let moved = env.get_owning("source", span).unwrap();
+        assert_eq!(env.get("source", span).unwrap(), Value::Null);
+        assert!(env.current_scope_owned_tasks(span).unwrap().is_empty());
+        env.push_scope();
+        env.define("destination".into(), moved, false, span)
+            .unwrap();
+        assert_eq!(ids(env.current_scope_owned_tasks(span).unwrap()), expected);
+        assert_eq!(
+            env.get_owning("text", span).unwrap(),
+            Value::String("unchanged".into())
+        );
+        assert_eq!(
+            env.get("text", span).unwrap(),
+            Value::String("unchanged".into())
+        );
+    }
+
+    #[test]
+    fn task_projection_takes_only_selected_nested_slot() {
+        let span = Span::default();
+        let runtime = TaskRuntime::new();
+        let first = task(&runtime);
+        let second = task(&runtime);
+        let Value::Task(first_handle) = &first else {
+            unreachable!()
+        };
+        let first_id = first_handle.id();
+        let Value::Task(second_handle) = &second else {
+            unreachable!()
+        };
+        let second_id = second_handle.id();
+        let mut env = Env::new();
+        env.define(
+            "root".into(),
+            Value::Object(HashMap::from([
+                ("tasks".into(), Value::Array(vec![first, second])),
+                ("text".into(), Value::String("kept".into())),
+            ])),
+            true,
+            span,
+        )
+        .unwrap();
+        let selected = env
+            .take_task_projection(
+                "root",
+                &[
+                    ValueProjection::Field("tasks".into()),
+                    ValueProjection::Index(0),
+                ],
+                span,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&selected, Value::Task(handle) if handle.id() == first_id));
+        assert_eq!(
+            ids(env.current_scope_owned_tasks(span).unwrap()),
+            vec![second_id]
+        );
+        assert!(env
+            .take_task_projection("root", &[ValueProjection::Field("text".into())], span)
+            .unwrap()
+            .is_none());
+        assert!(env
+            .take_task_projection("root", &[ValueProjection::Field("missing".into())], span)
+            .unwrap()
+            .is_none());
+        assert!(env
+            .take_task_projection(
+                "root",
+                &[
+                    ValueProjection::Field("tasks".into()),
+                    ValueProjection::Index(99),
+                ],
+                span
+            )
+            .unwrap()
+            .is_none());
+        env.with_value("root", span, |value| {
+            let Value::Object(fields) = value else {
+                unreachable!()
+            };
+            let Value::Array(values) = &fields["tasks"] else {
+                unreachable!()
+            };
+            assert_eq!(values[0], Value::Null);
+            assert_eq!(fields["text"], Value::String("kept".into()));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn task_scope_collection_excludes_captures_foreign_owners_and_releases_locks() {
+        let span = Span::default();
+        let runtime = TaskRuntime::new();
+        let mut env = Env::new();
+        env.define("outer".into(), task(&runtime), false, span)
+            .unwrap();
+        let outer = ids(env.current_scope_owned_tasks(span).unwrap());
+        let captured = env.capture(&HashSet::from(["outer".into()]));
+        assert!(captured.all_owned_tasks(span).unwrap().is_empty());
+        assert!(captured.get_owning("outer", span).is_err());
+        let mut clone = env.clone();
+        assert!(clone.all_owned_tasks(span).unwrap().is_empty());
+        clone
+            .define("new".into(), task(&runtime), false, span)
+            .unwrap();
+        assert_eq!(clone.current_scope_owned_tasks(span).unwrap().len(), 1);
+        env.push_scope();
+        env.define("inner".into(), task(&runtime), false, span)
+            .unwrap();
+        assert_eq!(env.current_scope_owned_tasks(span).unwrap().len(), 1);
+        let tasks = env.all_owned_tasks(span).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(env.find_cell("outer").unwrap().try_lock().is_ok());
+        assert!(env.find_cell("inner").unwrap().try_lock().is_ok());
+        let inner = env.find_cell("inner").unwrap();
+        inner.lock().unwrap().owner_task_id =
+            crate::runtime::task::current_task_id().wrapping_add(1);
+        assert!(env.current_scope_owned_tasks(span).unwrap().is_empty());
+        assert_eq!(ids(env.all_owned_tasks(span).unwrap()), outer);
+        assert!(env.get_owning("inner", span).is_err());
+        assert_eq!(ids(env.all_owned_tasks(span).unwrap()), outer);
+    }
+
+    #[test]
+    fn task_collection_observes_owned_borrow_source_but_not_borrowed_parameters() {
+        let span = Span::default();
+        let runtime = TaskRuntime::new();
+        let mut env = Env::new();
+        env.define("source".into(), task(&runtime), false, span)
+            .unwrap();
+        let expected = ids(env.current_scope_owned_tasks(span).unwrap());
+        let observer = env.observe_owned_bindings(span).unwrap();
+        let (view, lease) = env.borrow("source", span).unwrap();
+        let mut parameters = Env::new();
+        parameters
+            .define_parameter("view".into(), view, false, span)
+            .unwrap();
+        assert_eq!(ids(env.all_owned_tasks(span).unwrap()), expected);
+        let mut observed = Vec::new();
+        observer.collect_owned_tasks(&mut observed, span).unwrap();
+        assert_eq!(ids(observed), expected);
+        assert!(env.find_cell("source").unwrap().try_lock().is_ok());
+        assert!(parameters.all_owned_tasks(span).unwrap().is_empty());
+        let mut observed_parameters = Vec::new();
+        parameters
+            .observe_owned_bindings(span)
+            .unwrap()
+            .collect_owned_tasks(&mut observed_parameters, span)
+            .unwrap();
+        assert!(observed_parameters.is_empty());
+        assert!(parameters
+            .take_task_projection("view", &[], span)
+            .unwrap()
+            .is_none());
+        drop(lease);
+        assert_eq!(ids(env.all_owned_tasks(span).unwrap()), expected);
+    }
+}
+
+#[cfg(test)]
 mod collection_tests {
     use super::*;
+
+    #[test]
+    fn environment_scope_metadata_does_not_inflate_value_layout() {
+        assert_eq!(
+            std::mem::size_of::<Env>(),
+            std::mem::size_of::<Vec<Scope>>(),
+            "Env must retain a single vector-sized representation"
+        );
+        assert!(
+            std::mem::size_of::<Value>() <= 128,
+            "environment metadata inflated every Value to {} bytes",
+            std::mem::size_of::<Value>()
+        );
+    }
+
+    #[test]
+    fn cloned_scope_metadata_shares_cells_without_copying_cleanup_ownership() {
+        let span = Span::default();
+        let mut env = Env::new();
+        env.define("outer".into(), Value::Int(1), true, span)
+            .unwrap();
+        env.push_scope();
+        env.define("inner".into(), Value::Int(2), true, span)
+            .unwrap();
+        let clone = env.clone();
+        assert_eq!(clone.scopes.len(), env.scopes.len());
+        for (source, shared) in env.scopes.iter().zip(&clone.scopes) {
+            assert_eq!(source.owned_bindings.len(), 1);
+            assert!(shared.owned_bindings.is_empty());
+            for (name, cell) in &source.bindings {
+                assert!(Arc::ptr_eq(cell, &shared.bindings[name]));
+            }
+        }
+        assert!(clone.observe_owned_bindings(span).unwrap().is_empty());
+        env.pop_scope();
+        assert!(!env.contains("inner"));
+        assert_eq!(clone.get("inner", span).unwrap(), Value::Int(2));
+        assert!(env.scopes[0].owned_bindings.contains("outer"));
+    }
 
     #[test]
     fn borrowed_views_reject_foreign_threads_before_upgrading_the_source() {

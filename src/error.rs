@@ -1,8 +1,21 @@
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, fmt, time::Instant};
 
 use crate::span::Span;
 
 pub type KuResult<T> = Result<T, KuError>;
+
+/// Interpreter/runtime control flow, never a user-created recoverable Result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminationReason {
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeTermination {
+    pub reason: TerminationReason,
+    pub cleanup_deadline: Instant,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KuErrorKind {
@@ -106,6 +119,9 @@ diagnostic_registry! {
     TaskAlreadyAwaited => ("E0804", "Task has already been awaited",
         &["awaiting a task consumes its result"],
         &["store the awaited value if you need to use it again"]),
+    TaskGuardMove => ("E0805", "Cannot consume a tentative Task binding in a match guard",
+        &["a failed guard must leave its tentative Task payload available to later arms"],
+        &["await or move the Task only in the selected match arm"]),
     InvalidOwnedMove => ("E0901", "Invalid move or use of moved owned value",
         &["Ku is move-by-default; str/array/object/struct/enum/function values are owned"],
         &["call `.clone()` to keep the original, or restructure so the value is used once"]),
@@ -148,7 +164,16 @@ pub struct KuError {
     pub domain: Option<Box<str>>,
     pub code: Option<Box<str>>,
     diagnostic_id: Option<DiagnosticId>,
-    diagnostic_context: Option<Box<DiagnosticContext>>,
+    context: Option<Box<ErrorContext>>,
+}
+
+// Keep cold diagnostic/cleanup metadata behind the existing single context
+// pointer. Growing every KuResult by two deadlines penalizes successful code.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct ErrorContext {
+    diagnostic: Option<DiagnosticContext>,
+    cleanup: Option<RuntimeTermination>,
+    terminating: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -196,13 +221,14 @@ const DIAGNOSTIC_INLINE_TRUNCATION: &str = "… [text truncated]";
 
 impl fmt::Debug for KuError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let diagnostic_context =
-            self.diagnostic_context
-                .as_deref()
-                .map(|context| DiagnosticContextSummary {
-                    file: &context.file,
-                    source_bytes: context.source.len(),
-                });
+        let diagnostic_context = self
+            .context
+            .as_ref()
+            .and_then(|context| context.diagnostic.as_ref())
+            .map(|context| DiagnosticContextSummary {
+                file: &context.file,
+                source_bytes: context.source.len(),
+            });
         formatter
             .debug_struct("KuError")
             .field("kind", &self.kind)
@@ -316,7 +342,7 @@ impl KuError {
             domain: None,
             code: None,
             diagnostic_id: None,
-            diagnostic_context: None,
+            context: None,
         }
     }
 
@@ -334,13 +360,49 @@ impl KuError {
             domain: Some(domain.into().into_boxed_str()),
             code: Some(code.into().into_boxed_str()),
             diagnostic_id: None,
-            diagnostic_context: None,
+            context: None,
         }
     }
 
     pub fn package(code: impl Into<String>, message: impl Into<String>, span: Span) -> Self {
         Self::structured(KuErrorKind::Runtime, "package", code, message, span)
             .with_diagnostic_id(DiagnosticId::PackageError)
+    }
+
+    pub(crate) fn termination(context: RuntimeTermination, span: Span) -> Self {
+        let (code, message) = match context.reason {
+            TerminationReason::Cancelled => ("cancelled", "async task was cancelled"),
+            TerminationReason::TimedOut => ("timeout", "async task timed out"),
+        };
+        let mut error = Self::structured(KuErrorKind::Runtime, "task", code, message, span);
+        error.context = Some(Box::new(ErrorContext {
+            cleanup: Some(context),
+            terminating: true,
+            ..ErrorContext::default()
+        }));
+        error
+    }
+
+    pub(crate) fn runtime_termination(&self) -> Option<RuntimeTermination> {
+        self.context
+            .as_ref()
+            .filter(|context| context.terminating)
+            .and_then(|context| context.cleanup)
+    }
+
+    pub(crate) fn scope_cleanup(&self) -> Option<RuntimeTermination> {
+        self.context.as_ref().and_then(|context| context.cleanup)
+    }
+
+    pub(crate) fn remember_scope_cleanup(&mut self, context: RuntimeTermination) {
+        let metadata = self.context.get_or_insert_with(Default::default);
+        metadata.cleanup = Some(match metadata.cleanup {
+            Some(mut existing) => {
+                existing.cleanup_deadline = existing.cleanup_deadline.min(context.cleanup_deadline);
+                existing
+            }
+            None => context,
+        });
     }
 
     pub fn lex(message: impl Into<String>, span: Span) -> Self {
@@ -388,19 +450,21 @@ impl KuError {
         file: impl Into<String>,
         source: impl Into<String>,
     ) -> Self {
-        if self.diagnostic_context.is_none() {
-            self.diagnostic_context = Some(Box::new(DiagnosticContext {
+        let context = self.context.get_or_insert_with(Default::default);
+        if context.diagnostic.is_none() {
+            context.diagnostic = Some(DiagnosticContext {
                 file: file.into(),
                 source: source.into(),
-            }));
+            });
         }
         self
     }
 
     pub fn diagnostic(&self, file: &str, source: &str) -> String {
         let (file, source) = self
-            .diagnostic_context
+            .context
             .as_ref()
+            .and_then(|context| context.diagnostic.as_ref())
             .map(|context| (context.file.as_str(), context.source.as_str()))
             .unwrap_or((file, source));
         let (line, column, end_line, end_column) = self.diagnostic_location();
@@ -431,8 +495,9 @@ impl KuError {
 
     pub fn diagnostic_data(&self, file: &str, _source: &str) -> DiagnosticData {
         let file = self
-            .diagnostic_context
+            .context
             .as_ref()
+            .and_then(|context| context.diagnostic.as_ref())
             .map(|context| context.file.as_str())
             .unwrap_or(file);
         let (line, column, end_line, end_column) = self.diagnostic_location();
