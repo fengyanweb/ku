@@ -689,6 +689,59 @@ mod tests {
     }
 
     #[test]
+    fn native_sync_private_zero_fastpath_preserves_unsupported_type_rejection() {
+        // Start from checked source, then inject deliberately malformed raw IR.
+        // The marker is compiler-private; this is not a legal source program.
+        let reference = lower("fn Value(): int { return 7 } fn main() {}");
+        for ty in [IrType::Unknown, IrType::Function, IrType::Void] {
+            let mut program = reference.clone();
+            let function = program
+                .functions
+                .iter_mut()
+                .find(|function| function.name == "Value")
+                .unwrap();
+            function.blocks[0].terminator = IrTerminator::Return(Some(IrExpr {
+                kind: IrExprKind::Literal("<native-zero>".into()),
+                ty,
+            }));
+            let error = super::super::generate_c_source(&program).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("does not support zero initialization"),
+                "{error}"
+            );
+        }
+
+        // Supported Copy and Owned synthetic zeros still share the same exit;
+        // the validation above must not recreate a separate return expression.
+        for source in [
+            "fn Value(): int { return 7 } fn main() {}",
+            "fn Value(): str { return \"held\" } fn main() {}",
+        ] {
+            let mut program = lower(source);
+            let function = program
+                .functions
+                .iter_mut()
+                .find(|function| function.name == "Value")
+                .unwrap();
+            function.blocks[0].terminator = IrTerminator::Return(Some(IrExpr {
+                kind: IrExprKind::Literal("<native-zero>".into()),
+                ty: function.return_type.clone(),
+            }));
+            let generated = super::super::generate_c_source(&program).unwrap();
+            assert!(generated.contains("  goto __ku_sync_epilogue;\n"));
+        }
+
+        // A source string spelling the tag is ordinary owned data, not an
+        // internal zero. Its surrounding quotes survive source lowering.
+        let program = lower("fn Value(): str { return \"<native-zero>\" } fn main() {}");
+        let generated = super::super::generate_c_source(&program).unwrap();
+        assert!(generated.contains("KuString __ku_return ="));
+        assert!(generated.contains("\"<native-zero>\", 13"));
+    }
+
+    #[test]
     fn native_sync_artifact_caps_include_mailbox_guard_and_owner_epilogue() {
         let program = lower("fn Calc(a: int, b: int): int { owner = \"held-\" + \"owner\" return a / b } fn main() { println(Calc(7, 1)) }");
         let options = super::super::CBackendOptions::default();
