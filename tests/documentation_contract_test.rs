@@ -79,6 +79,28 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
 }
 
 #[test]
+fn native_sync_docs_separate_checked_cleanup_from_all_fatal_and_task_support() {
+    let ir = include_str!("../docs/ir.md");
+    for required in [
+        "SyncGuard { continue_block, cleanup_block }",
+        "普通算术 fatal 不可 catch",
+        "Panic/index/OOM",
+        "foreign callback 重入",
+        "Task 用户 finally",
+        "LLVM 仅保留 SyncGuard",
+        "不提供本片 native C 的 checked 算术与 Owned 清理保证",
+        "原绝对 D、不续期",
+        "精确提交三系统 CI/sanitizer",
+    ] {
+        assert!(
+            ir.contains(required),
+            "missing synchronous boundary: {required}"
+        );
+    }
+    assert!(!ir.contains("该路径仍存在独立的\n溢出/除零 UB 缺陷"));
+}
+
+#[test]
 fn protocol_status_binds_tls_evidence_to_published_commit() {
     let readme = include_str!("../README.md");
     let protocol = include_str!("../docs/protocol-foundation.md");

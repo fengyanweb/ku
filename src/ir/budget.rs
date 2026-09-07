@@ -402,6 +402,59 @@ mod tests {
     }
 
     #[test]
+    fn synchronous_ir_budget_sync_guards_charge_blocks_and_shared_work() {
+        let source = "fn math(a: int, b: int): int { return -(a + b) }";
+        let (reference, budget) = lower(source, LowerLimits::default());
+        let reference = reference.unwrap();
+        let function = &reference.functions[0];
+        assert_eq!(
+            function
+                .blocks
+                .iter()
+                .filter(|block| matches!(block.terminator, ir::IrTerminator::SyncGuard { .. }))
+                .count(),
+            2
+        );
+        let blocks = function.blocks.len();
+        let used = budget.borrow().used;
+        let (exact, _) = lower(
+            source,
+            LowerLimits {
+                max_blocks_per_function: blocks,
+                max_work: used,
+                ..LowerLimits::default()
+            },
+        );
+        assert_eq!(exact.unwrap(), reference);
+        let (over, over_budget) = lower(
+            source,
+            LowerLimits {
+                max_blocks_per_function: blocks - 1,
+                ..LowerLimits::default()
+            },
+        );
+        let error = over.unwrap_err();
+        assert!(error
+            .message
+            .contains("IR lowering limit: function block count"));
+        assert_eq!(over_budget.borrow().check().unwrap_err(), error);
+        let (over, over_budget) = lower(
+            source,
+            LowerLimits {
+                max_work: used - 1,
+                ..LowerLimits::default()
+            },
+        );
+        let error = over.unwrap_err();
+        assert!(error.message.contains("IR lowering limit: expanded work"));
+        assert!(over_budget.borrow().used < used);
+        assert_eq!(over_budget.borrow().check().unwrap_err(), error);
+        assert_eq!(LowerLimits::default().max_work, 262_144);
+        assert_eq!(LowerLimits::default().max_blocks_per_function, 10_000);
+        assert_eq!(LowerLimits::default().max_instructions_per_block, 10_000);
+    }
+
+    #[test]
     fn synchronous_ir_budget_probe_failure_is_not_swallowed_or_replaced_by_later_error() {
         // No Checker: the second function intentionally has a lowering error.
         // Resource refusal in the first inference probe must win before it.

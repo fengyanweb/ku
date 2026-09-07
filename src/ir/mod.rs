@@ -208,6 +208,14 @@ pub enum IrTerminator {
         continue_block: BlockId,
         timeout_block: BlockId,
     },
+    /// Consume a synchronous native return signal before using a fresh result.
+    /// C routes ordinary fatal errors to its structural owner epilogue; only an
+    /// already-selected cleanup abort takes the explicit cleanup edge. LLVM
+    /// preserves this CFG but does not implement the C-only signal guarantee.
+    SyncGuard {
+        continue_block: BlockId,
+        cleanup_block: BlockId,
+    },
     Return(Option<IrExpr>),
     Unreachable,
 }
@@ -640,6 +648,7 @@ fn optimize_terminator(terminator: &mut IrTerminator) {
         IrTerminator::Next
         | IrTerminator::Jump(_)
         | IrTerminator::Safepoint { .. }
+        | IrTerminator::SyncGuard { .. }
         | IrTerminator::Return(None)
         | IrTerminator::Unreachable => {}
     }
@@ -843,6 +852,10 @@ fn terminator_successors(terminator: &IrTerminator, next: Option<BlockId>) -> Ve
         | IrTerminator::Safepoint {
             continue_block: body_block,
             timeout_block: after_block,
+        }
+        | IrTerminator::SyncGuard {
+            continue_block: body_block,
+            cleanup_block: after_block,
         } => vec![*body_block, *after_block],
         IrTerminator::PropagateErr(_) | IrTerminator::Return(_) | IrTerminator::Unreachable => {
             Vec::new()
@@ -1059,6 +1072,14 @@ impl fmt::Display for IrTerminator {
                 f,
                 "safepoint continue block{} timeout block{}",
                 continue_block.0, timeout_block.0
+            ),
+            IrTerminator::SyncGuard {
+                continue_block,
+                cleanup_block,
+            } => write!(
+                f,
+                "sync_guard continue block{} cleanup block{}",
+                continue_block.0, cleanup_block.0
             ),
             IrTerminator::Return(Some(value)) => write!(f, "return {value}"),
             IrTerminator::Return(None) => write!(f, "return"),
@@ -1716,7 +1737,11 @@ impl<'a> FunctionLowerer<'a> {
             Stmt::Expr { expr: value, .. } => {
                 let value = self.lower_expr(value)?;
                 let needs_safepoint = ir_expr_needs_post_call_safepoint(&value);
+                let needs_sync_guard = ir_expr_needs_sync_guard(&value);
                 emit_ir_instruction!(self, IrInst::Expr(value));
+                if needs_sync_guard {
+                    self.emit_sync_guard(None)?;
+                }
                 // A void-returning call is not materialized by `emit_temp`, so
                 // statement position appends its post-call cancellation edge.
                 if needs_safepoint {
@@ -2897,11 +2922,9 @@ impl<'a> FunctionLowerer<'a> {
         first_argument_temp: usize,
         deferred_safepoint: Option<&mut bool>,
     ) -> KuResult<IrExpr> {
-        // The call is fully evaluated now. Nested calls remove only their own
-        // newer roots; an outer call's earlier arguments remain pending.
-        self.pending_borrow_temporaries.retain(|pending| {
-            matches!(pending.owner.kind, IrExprKind::Temp(id) if id.0 < first_argument_temp)
-        });
+        // Keep this call's fresh argument roots pending through the actual call
+        // and its immediate signal guard. A cleanup-abort edge must release
+        // those roots even though the normal post-call drops are not reached.
         let mut cleanup = Vec::new();
         if let IrExprKind::Call { args, .. } = &call.kind {
             for arg in args {
@@ -2919,11 +2942,19 @@ impl<'a> FunctionLowerer<'a> {
             }
         }
         if cleanup.is_empty() {
-            return self.emit_temp_for_borrow_result(call, deferred_safepoint);
+            let result = self.emit_temp_for_borrow_result(call, deferred_safepoint)?;
+            self.pending_borrow_temporaries.retain(|pending| {
+                matches!(pending.owner.kind, IrExprKind::Temp(id) if id.0 < first_argument_temp)
+            });
+            return Ok(result);
         }
         let needs_safepoint = call.ty == IrType::Void || ir_expr_needs_post_call_safepoint(&call);
+        let needs_sync_guard = ir_expr_needs_sync_guard(&call);
         let result = if call.ty == IrType::Void {
             emit_ir_instruction!(self, IrInst::Expr(call));
+            if needs_sync_guard {
+                self.emit_sync_guard(None)?;
+            }
             IrExpr {
                 kind: IrExprKind::Literal("0".into()),
                 ty: IrType::Void,
@@ -2931,6 +2962,11 @@ impl<'a> FunctionLowerer<'a> {
         } else {
             self.emit_temp_with_safepoint(call, false)?
         };
+        // Only the successful call continuation removes these records. Earlier
+        // outer-call argument owners remain pending until that outer call.
+        self.pending_borrow_temporaries.retain(|pending| {
+            matches!(pending.owner.kind, IrExprKind::Temp(id) if id.0 < first_argument_temp)
+        });
         for owner in cleanup {
             self.emit_borrow_temporary_drop(owner)?;
         }
@@ -4232,6 +4268,7 @@ impl<'a> FunctionLowerer<'a> {
         let ty = value.ty.clone();
         let borrowed = ir_expr_is_borrowed(&value) && ir_type_is_owned(&ty);
         let needs_safepoint = post_call_safepoint && ir_expr_needs_post_call_safepoint(&value);
+        let needs_sync_guard = ir_expr_needs_sync_guard(&value);
         emit_ir_instruction!(
             self,
             IrInst::Temp {
@@ -4240,17 +4277,82 @@ impl<'a> FunctionLowerer<'a> {
                 value,
             }
         );
-        if needs_safepoint {
-            self.emit_safepoint()?;
-        }
-        Ok(IrExpr {
+        let result = IrExpr {
             kind: if borrowed {
                 IrExprKind::BorrowedTemp(id)
             } else {
                 IrExprKind::Temp(id)
             },
             ty,
-        })
+        };
+        if needs_sync_guard {
+            // A borrowed-argument result has not been registered as a pending
+            // root yet. Its actual new owner must be visible to the abort edge;
+            // a borrowed alias must never release the caller's source instead.
+            let fresh_owner = (!borrowed && ir_type_is_owned(&result.ty)).then(|| result.clone());
+            self.emit_sync_guard(fresh_owner)?;
+        }
+        if needs_safepoint {
+            self.emit_safepoint()?;
+        }
+        Ok(result)
+    }
+
+    /// Consume a callee/arithmetic signal before any source continuation. This
+    /// is independent of deferred deadline polls during borrowed-argument setup.
+    /// C handles ordinary fatal errors in its all-owned epilogue; this explicit
+    /// edge only abandons fresh temporaries and resumes an existing cleanup.
+    fn emit_sync_guard(&mut self, fresh_owner: Option<IrExpr>) -> KuResult<()> {
+        let continue_block = self.next_block("sync_continue")?;
+        let cleanup_block = self.next_block("sync_cleanup")?;
+        // Charge the pending-root scan before cloning or constructing drops.
+        self.budget
+            .borrow_mut()
+            .spend(self.pending_borrow_temporaries.len(), self.span)?;
+        self.budget
+            .borrow_mut()
+            .spend(usize::from(fresh_owner.is_some()), self.span)?;
+        self.current.terminator = IrTerminator::SyncGuard {
+            continue_block,
+            cleanup_block,
+        };
+        self.finish_current()?;
+
+        self.start_block(cleanup_block, "sync_cleanup");
+        // Pending roots are unique by owner kind. The newly returned owner can
+        // precede registration, so deduplicate it against that same identity.
+        // Typed drops clear headers; later structural frame drops are no-ops.
+        if let Some(owner) = fresh_owner.filter(|owner| {
+            ir_type_is_owned(&owner.ty)
+                && !ir_expr_is_borrowed(owner)
+                && !self
+                    .pending_borrow_temporaries
+                    .iter()
+                    .any(|pending| pending.owner.kind == owner.kind)
+        }) {
+            self.emit_borrow_temporary_drop(owner)?;
+        }
+        let abandoned = self
+            .pending_borrow_temporaries
+            .iter()
+            .rev()
+            .map(|pending| pending.owner.clone())
+            .collect::<Vec<_>>();
+        for owner in abandoned {
+            self.emit_borrow_temporary_drop(owner)?;
+        }
+        let cleanup_value =
+            (self.return_type != IrType::Void).then(|| zero_expr(self.return_type.clone()));
+        self.current.terminator = self.return_with_reason(
+            cleanup_value,
+            IrExpr {
+                kind: IrExprKind::Literal("true".into()),
+                ty: IrType::Bool,
+            },
+        )?;
+        self.finish_current()?;
+        self.start_block(continue_block, "sync_continue");
+        Ok(())
     }
 
     /// Split the current block into a deadline branch, an internal timeout-return
@@ -4762,30 +4864,29 @@ impl<'a> FunctionLowerer<'a> {
         // Materialize before branching: either the ordinary route owns this
         // value or the selected attempt discards it, never both. Do not add a
         // new clock poll while staging an already-selected timeout's zero.
-        let value = if self.cleanup_attempts.is_empty() {
-            value
-        } else if let Some(value) = value {
-            if value.ty == IrType::Void {
-                // A void call has no temp: emit it before suppression rather
-                // than carrying an unevaluated Call across the escape guard.
-                // Preserve statement-call ordering: execute, poll, then route
-                // this source Return as ordinary on the surviving edge.
+        let value = match value {
+            Some(value) if value.ty == IrType::Void => {
+                // A void call has no temp, including outside a finally attempt.
+                // Execute once, consume its signal, then preserve the existing
+                // post-call deadline poll before routing this ordinary Return.
                 let needs_safepoint = ir_expr_needs_post_call_safepoint(&value);
+                let needs_sync_guard = ir_expr_needs_sync_guard(&value);
                 emit_ir_instruction!(self, IrInst::Expr(value));
+                if needs_sync_guard {
+                    self.emit_sync_guard(None)?;
+                }
                 if needs_safepoint {
                     self.emit_safepoint()?;
                 }
                 None
-            } else if is_unknown_native_zero(&value) {
-                // This private inference-time zero is side-effect-free and
-                // carries no allocation. Preserve its tag across attempt-floor
-                // branches for concrete lifted-return resolution below.
-                Some(value)
-            } else {
+            }
+            // The private inference-time zero is side-effect-free and owns no
+            // allocation. Keep its tag visible across attempt-floor branches
+            // so lifted-return resolution can later assign the concrete type.
+            Some(value) if !self.cleanup_attempts.is_empty() && !is_unknown_native_zero(&value) => {
                 Some(self.emit_temp_with_safepoint(value, false)?)
             }
-        } else {
-            None
+            value => value,
         };
         self.guard_cleanup_escape(
             destination.as_ref().map(|(index, _, _)| *index),
@@ -4897,6 +4998,37 @@ impl<'a> FunctionLowerer<'a> {
     }
 }
 
+/// Operations whose fresh native result cannot be used until the synchronous
+/// return mailbox has been consumed. This classifies only typed i64 arithmetic;
+/// float/mixed/dynamic expressions retain their separate existing semantics.
+pub(crate) fn ir_expr_needs_sync_guard(expr: &IrExpr) -> bool {
+    if ir_expr_needs_post_call_safepoint(expr) {
+        return true;
+    }
+    if expr.ty != IrType::Int {
+        return false;
+    }
+    match &expr.kind {
+        IrExprKind::Unary {
+            op: UnaryOp::Negate,
+            expr,
+        } => expr.ty == IrType::Int,
+        IrExprKind::Binary { left, op, right } => {
+            left.ty == IrType::Int
+                && right.ty == IrType::Int
+                && matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Subtract
+                        | BinaryOp::Multiply
+                        | BinaryOp::Divide
+                        | BinaryOp::Remainder
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Calls into Ku code can discover a cooperative handler timeout in a deeper
 /// frame, so their caller must poll immediately afterward and continue the
 /// structured unwind. `array.map` is an intrinsic, but invokes a Ku closure from
@@ -4916,7 +5048,7 @@ fn ir_expr_needs_post_call_safepoint(expr: &IrExpr) -> bool {
 }
 
 /// Closure bodies are initially lowered with an Unknown return seed so their
-/// source returns can drive inference. Safepoint timeout paths created during
+/// source returns can drive inference. Timeout/signal cleanup paths created during
 /// that pass therefore contain Unknown-typed zero payloads (and a try/finally
 /// return slot may be Unknown too). Once inference succeeds, make only those
 /// synthetic return artifacts concrete; ordinary Unknown expressions retain
