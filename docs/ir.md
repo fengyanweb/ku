@@ -53,6 +53,7 @@ ku ir examples\function.ku
 - `for` 已有 `ForEach` terminator。
 - `?` 会降成 `ResultBranch`，ok 分支用 `BindOk` 取值，err 分支用 `PropagateErr` 或 `JumpErr` 跳入 try handler。
 - `try/catch/finally` 已有 `BeginTry` / `EndTry` / `BindError` 标记；可恢复错误、普通完成和 return 使用独立 finally block，return value 先写入隐藏槽，再经过 finally 返回。return 选择最近具有 finally 的 handler 及其对应返回值槽；内层仅有 catch 不能屏蔽外层 finally。错误传播仍选择最近的错误 handler，不共用返回路径的筛选规则。
+- 同步 return-finally 使用每个 pending return 独立的隐藏原因槽：普通 return 为 false，已有 safepoint 选中的 timeout 为 true。只在跨出该清理尝试的 handler 边界时屏蔽新的 fail、`?` 或 return，丢弃新 Owned payload 并接回原 finish；清理内部局部 try/catch 仍按普通规则执行。void return 调用先执行副作用和既有 post-call 检查。保留三份 finally body，不增加第四份；嵌套清理不重置原绝对 deadline。这不涵盖同步算术/Panic/底层 helper 直接退出、跨同步调用传播所有 fatal 原因或 Task 用户 finally。
 - struct / enum 会进入 layout table，enum variant 有稳定 tag 和 payload 字段顺序。
 - array literal/index/assignment 保留元素类型，native C 从 IR 生成带长度的 array ABI。
 - enum 构造、tag、payload 访问和 match 已降低为显式 CFG 与 intrinsic，不再使用 unsupported 占位。
