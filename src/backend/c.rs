@@ -7,6 +7,8 @@ use output::COutput;
 
 #[path = "c_task.rs"]
 mod task;
+#[path = "c_task_adapter.rs"]
+mod task_adapter;
 #[path = "c_task_control.rs"]
 mod task_control;
 #[path = "c_task_driver.rs"]
@@ -241,6 +243,15 @@ pub fn generate_task_frame_c_source(
                 || name.starts_with("ku_task_driver_")
                 || name.starts_with("KuTaskDriver")
                 || name.starts_with("KU_TASK_DRIVER_")
+                || name.starts_with("ku_task_adapter_")
+                || name.starts_with("KuTaskAdapter")
+                || name.starts_with("KU_TASK_ADAPTER_")
+                || name.starts_with("KuTaskInstance_")
+                || name.starts_with("KuTaskHandle_")
+                || name
+                    .strip_prefix("ku_task_")
+                    .and_then(|suffix| suffix.bytes().next())
+                    .is_some_and(|first| first.is_ascii_digit())
         })
     {
         return Err(unsupported(
@@ -18033,7 +18044,39 @@ fn c_named_drop_function(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::task as task_ir;
     use crate::ir::TempId;
+
+    fn task_adapter_output_fixture() -> task_ir::TaskProgram {
+        let result = IrType::Result(Box::new(IrType::Str));
+        task_ir::TaskProgram {
+            functions: vec![task_ir::TaskFunction {
+                id: task_ir::TaskFunctionId(0),
+                name: "OutputBudget".into(),
+                slots: [IrType::Str, result.clone()]
+                    .into_iter()
+                    .map(|ty| task_ir::TaskSlot {
+                        ty: task_ir::TaskSlotType::Value {
+                            ty,
+                            borrowed: false,
+                        },
+                    })
+                    .collect(),
+                parameters: vec![task_ir::SlotId(0)],
+                entry: task_ir::StateId(0),
+                states: vec![task_ir::TaskState {
+                    operations: vec![task_ir::TaskOp::WrapOk {
+                        dst: task_ir::SlotId(1),
+                        src: task_ir::SlotId(0),
+                    }],
+                    terminator: task_ir::TaskTerminator::Complete {
+                        value: task_ir::SlotId(1),
+                    },
+                }],
+                result,
+            }],
+        }
+    }
 
     #[test]
     fn native_c_output_whole_file_limit_counts_runtime_and_generated_code() {
@@ -18082,6 +18125,96 @@ mod tests {
         assert!(
             error.message.contains("native C output limit exceeded"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn native_c_output_task_adapter_artifact_obeys_exact_and_partial_limits() {
+        let ast = crate::parser::Parser::new(
+            crate::lexer::Lexer::new("fn main() {}").tokenize().unwrap(),
+        )
+        .parse_program()
+        .unwrap();
+        let ir = crate::ir::lower_program(&ast).unwrap();
+        let tasks = task_adapter_output_fixture();
+        let plan = task_ir::verify_and_plan(&tasks, Default::default()).unwrap();
+        let expected = generate_task_frame_c_source(&ir, &tasks).unwrap();
+        let options = CBackendOptions::default();
+        let bounded = |limit| {
+            generate_c_source_with_frames_bounded(&ir, &options, limit, Some((&tasks, &plan)))
+        };
+        assert_eq!(bounded(expected.len()).unwrap(), expected);
+
+        let instance = expected
+            .find("typedef struct KuTaskInstance_0 {")
+            .expect("adapter follows the shared ABI");
+        let factory = expected
+            .find("static uint32_t ku_task_0_try_start(")
+            .expect("typed factory is part of the complete artifact");
+        let factory_middle = factory
+            + expected[factory..]
+                .find("KuTaskDriverTicketV1 ticket = {0};")
+                .expect("factory contains its admission transaction")
+            + "KuTaskDriverTicketV1".len();
+        assert!(instance < factory && factory < factory_middle);
+        assert!(factory_middle < expected.len() - 1);
+
+        // These small budgets fail after the ABI, inside the first factory,
+        // and at the final byte. No multi-megabyte stress fixture is needed.
+        for limit in [instance, factory_middle, expected.len() - 1] {
+            let error = bounded(limit).unwrap_err();
+            assert!(
+                error.message.contains("native C output limit exceeded")
+                    && error.message.contains(&format!("maximum {limit} bytes")),
+                "{error}"
+            );
+        }
+        assert_eq!(generate_task_frame_c_source(&ir, &tasks).unwrap(), expected);
+    }
+
+    #[test]
+    fn native_c_output_task_adapter_limit_precedes_later_type_errors() {
+        let tasks = task_adapter_output_fixture();
+        task_ir::verify_and_plan(&tasks, Default::default()).unwrap();
+        let mut reference = COutput::new(64 * 1024);
+        task_adapter::emit_adapters(&mut reference, &tasks).unwrap();
+        let reference = reference.finish().unwrap();
+        let instance = reference.find("typedef struct KuTaskInstance_0 {").unwrap();
+
+        // Deliberately bypass the public verifier ONLY to test emitter stop
+        // order. If visited, this second function has a distinct type error.
+        let mut invalid = tasks.functions[0].clone();
+        invalid.id = task_ir::TaskFunctionId(1);
+        invalid.result = IrType::Unknown;
+        let mut separate = COutput::new(64 * 1024);
+        let type_error = task_adapter::emit_adapters(
+            &mut separate,
+            &task_ir::TaskProgram {
+                functions: vec![invalid.clone()],
+            },
+        )
+        .unwrap_err();
+        assert!(type_error.message.contains("requires a primitive Result"));
+        let mut mixed = tasks;
+        mixed.functions.push(invalid);
+
+        for limit in [0, instance, instance + (reference.len() - instance) / 2] {
+            let mut output = COutput::new(limit);
+            let error = task_adapter::emit_adapters(&mut output, &mixed).unwrap_err();
+            assert!(
+                error.message.contains("native C output limit exceeded"),
+                "{error}"
+            );
+            assert_eq!(output.check().unwrap_err(), error);
+            assert_eq!(output.finish().unwrap_err(), error);
+        }
+
+        let mut failed = COutput::new(0);
+        failed.push('x');
+        let original = failed.check().unwrap_err();
+        assert_eq!(
+            task_adapter::emit_adapters(&mut failed, &mixed).unwrap_err(),
+            original
         );
     }
 
