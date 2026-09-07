@@ -9,8 +9,8 @@ use std::collections::HashSet;
 
 use crate::error::KuResult;
 use crate::ir::task::{
-    SlotId, TaskConstant, TaskFramePlan, TaskFunction, TaskFunctionFrame, TaskOp, TaskProgram,
-    TaskSlotType, TaskTerminator,
+    SlotId, TaskBinaryOp, TaskConstant, TaskFramePlan, TaskFunction, TaskFunctionFrame, TaskOp,
+    TaskProgram, TaskSlotType, TaskTerminator, TaskUnaryOp,
 };
 use crate::ir::IrType;
 
@@ -33,6 +33,29 @@ pub(super) fn emit_frames(
     }
     out.check()?;
     out.push_str(FRAME_ABI);
+    let arithmetic = tasks.functions.iter().any(|function| {
+        function.states.iter().any(|state| {
+            state.operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    TaskOp::Unary {
+                        op: TaskUnaryOp::Negate,
+                        ..
+                    } | TaskOp::Binary {
+                        op: TaskBinaryOp::Add
+                            | TaskBinaryOp::Subtract
+                            | TaskBinaryOp::Multiply
+                            | TaskBinaryOp::Divide
+                            | TaskBinaryOp::Remainder,
+                        ..
+                    }
+                )
+            })
+        })
+    });
+    if arithmetic {
+        super::checked_int::emit_runtime(out)?;
+    }
     super::task_control::emit_runtime(out)?;
     super::task_driver::emit_runtime(out)?;
     super::task_adapter::emit_host(out, tasks)?;
@@ -430,6 +453,65 @@ impl<'a> FrameEmitter<'a> {
 
     fn emit_operation(&self, out: &mut COutput, operation: &TaskOp) -> KuResult<()> {
         match operation {
+            TaskOp::Unary { dst, op, src } => match op {
+                TaskUnaryOp::Not => {
+                    out.push_str(&format!(
+                        "  {} = !{};\n",
+                        self.place(*dst),
+                        self.place(*src)
+                    ));
+                    self.set_init(out, *dst, true);
+                }
+                TaskUnaryOp::Negate => self.emit_checked_integer(
+                    out,
+                    *dst,
+                    &format!("ku_int_neg({}, &{})", self.place(*src), self.place(*dst)),
+                )?,
+            },
+            TaskOp::Binary {
+                dst,
+                op,
+                left,
+                right,
+            } => {
+                let helper = match op {
+                    TaskBinaryOp::Add => Some("ku_int_add"),
+                    TaskBinaryOp::Subtract => Some("ku_int_sub"),
+                    TaskBinaryOp::Multiply => Some("ku_int_mul"),
+                    TaskBinaryOp::Divide => Some("ku_int_div"),
+                    TaskBinaryOp::Remainder => Some("ku_int_rem"),
+                    _ => None,
+                };
+                if let Some(helper) = helper {
+                    self.emit_checked_integer(
+                        out,
+                        *dst,
+                        &format!(
+                            "{helper}({}, {}, &{})",
+                            self.place(*left),
+                            self.place(*right),
+                            self.place(*dst)
+                        ),
+                    )?;
+                } else {
+                    let operator = match op {
+                        TaskBinaryOp::Equal => "==",
+                        TaskBinaryOp::NotEqual => "!=",
+                        TaskBinaryOp::Less => "<",
+                        TaskBinaryOp::LessEqual => "<=",
+                        TaskBinaryOp::Greater => ">",
+                        TaskBinaryOp::GreaterEqual => ">=",
+                        _ => return Err(unsupported("unknown Task comparison")),
+                    };
+                    out.push_str(&format!(
+                        "  {} = ({} {operator} {});\n",
+                        self.place(*dst),
+                        self.place(*left),
+                        self.place(*right)
+                    ));
+                    self.set_init(out, *dst, true);
+                }
+            }
             TaskOp::Init { dst, value } => {
                 out.push_str(&format!(
                     "  {} = {};\n",
@@ -520,6 +602,20 @@ impl<'a> FrameEmitter<'a> {
                 out.push_str("  }\n");
             }
         }
+        Ok(())
+    }
+
+    fn emit_checked_integer(&self, out: &mut COutput, dst: SlotId, call: &str) -> KuResult<()> {
+        // Inputs are already materialized Copy slots. The helper neither exits
+        // nor writes the destination on failure; cleanup follows the same
+        // outer-runtime-failure path as native Task output errors.
+        out.push_str(&format!(
+            "  {{ uint32_t arithmetic_status = {call};\n  if (arithmetic_status != KU_INT_OK) {{\n"
+        ));
+        self.emit_runtime_error(out,
+            "ku_error_make((KuString){0},(KuString){0},arithmetic_status==KU_INT_DIV_ZERO ? ku_string_static((const uint8_t*)\"division by zero\",16) : ku_string_static((const uint8_t*)\"integer overflow\",16))")?;
+        out.push_str("  } }\n");
+        self.set_init(out, dst, true);
         Ok(())
     }
 

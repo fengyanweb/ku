@@ -52,7 +52,7 @@ ku ir examples\function.ku
 - `if` / `while` 已有基础 block 和 `Branch` / `Jump` / `Return` terminator。
 - `for` 已有 `ForEach` terminator。
 - `?` 会降成 `ResultBranch`，ok 分支用 `BindOk` 取值，err 分支用 `PropagateErr` 或 `JumpErr` 跳入 try handler。
-- `try/catch/finally` 已有 `BeginTry` / `EndTry` / `BindError` 标记；错误、普通完成和 return 使用独立 finally block，return value 先写入隐藏槽，再经过 finally 返回。
+- `try/catch/finally` 已有 `BeginTry` / `EndTry` / `BindError` 标记；可恢复错误、普通完成和 return 使用独立 finally block，return value 先写入隐藏槽，再经过 finally 返回。return 选择最近具有 finally 的 handler 及其对应返回值槽；内层仅有 catch 不能屏蔽外层 finally。错误传播仍选择最近的错误 handler，不共用返回路径的筛选规则。
 - struct / enum 会进入 layout table，enum variant 有稳定 tag 和 payload 字段顺序。
 - array literal/index/assignment 保留元素类型，native C 从 IR 生成带长度的 array ABI。
 - enum 构造、tag、payload 访问和 match 已降低为显式 CFG 与 intrinsic，不再使用 unsupported 占位。
@@ -117,7 +117,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 1. 逐项补齐闭包尚未支持的 binding/payload 捕获，并为每一种 owned payload 固定逃逸与失败清理测试。
 2. 继续收窄动态 object 与 Result 的组合边界，不把单项 ABI 存在等同于任意嵌套组合已完成。
 3. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
-4. native C 已接通单 worker 有限源码 Task 子集，其余 async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；执行证据见 [阶段工作日志](v0.0.18-worklog.md)。源码及 CLI 定向运行已通过；R5c 本机回归已通过，但其精确提交的三系统 CI 中 Linux/macOS 与 PR sanitizer 有失败，修复后的完整验证仍未完成。不能把这个子集或内部 frame 夹具通过当作完整 native async、M:N 或生产性能验收完成。
+4. native C 已接通单 worker 有限源码 Task 子集，其余 async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；执行证据见 [阶段工作日志](v0.0.18-worklog.md)。源码及 CLI 定向运行已通过，本轮表达式/清理定向测试与 Rust quality 通过；本轮 native 全集和质量检查通过，workspace 的文档失败与修复证据单列；精确新提交三系统 CI/sanitizer 仍待核实，历史失败和修复结果分别见工作日志。不能把这个子集或内部 frame 夹具通过当作完整 native async、M:N 或生产性能验收完成。
 
 ## Typed Task IR 与有限源码接入（v0.0.18 开发中）
 
@@ -127,7 +127,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 
 当前 frame IR 使用密集 `SlotId` / `StateId`，支持 `int`、`bool`、`null`、`str`
 及对应单层 Result，以及 move-only `Task { result }` 槽。操作显式区分 Init、Copy、Move、
-WrapOk、Read、Drop、DropIfInit、Start、Print；控制边包括 Jump、Branch、Suspend
+WrapOk、Unary、Binary、Read、Drop、DropIfInit、Start、Print；控制边包括 Jump、Branch、Suspend
 （resume / cleanup）、Await、TryResult、Complete 和 Terminate。
 暂不支持 array/object/struct/enum、函数值、Task 参数/返回或借用参数进入 frame。
 
@@ -139,12 +139,17 @@ WrapOk、Read、Drop、DropIfInit、Start、Print；控制边包括 Jump、Branc
 drop，不能为了缩 frame 擅自提前释放资源。借用值不能跨 Suspend；owned 值不能隐式
 Copy、覆盖可能仍初始化的槽或再次消费 moved-from 值。Task 不能普通 Drop/DropIfInit，
 Complete 留存的 Task 只能由生成的 scope drain 处理。取消区域不能回正常区域、
-Complete、Start、Await 或 Suspend；拒绝所有不经过实际 suspension 的环，
+Complete、Start、Await 或 Suspend；本片也拒绝 cleanup 中可能溢出的 Negate 和算术
+Binary，避免算术失败覆盖原取消/超时原因；总是有限且不失败的 Not/比较仍可用于内部
+cleanup IR。拒绝所有不经过实际 suspension 的环，
 包括 cleanup 中的环。它不是完整语言的 finally/异常或任意 Await 组合 verifier。
 
 内部硬限为 64 函数、每函数 64 槽 / 256 状态、全程序 4096 操作、1,000,000 字面量
 字节（含 UTF-8、Error 三字段和函数名）及 1,000,000 分析工作量；测试只能收紧限制。
 这些是已构造 IR 的分析预算，不是整个编译器 RSS 或运行时总内存预算。
+表达式新增的一/二元输入读取也计入分析工作量，没有放宽任何上限。Parser 的解析
+递归上限仍为32；Task lower 对已构造 AST 使用独立的 `depth > 64` 拒绝。raw AST
+预算测试不代表源码可以越过 parser/checker 的更早边界。
 
 R3 前置操作 `WrapOk` 允许把已初始化的 primitive 局部构造为匹配的 Result，
 不再只支持 `Ok` 常量。Copy primitive 保留来源；owned str 移动并清空来源。
@@ -368,7 +373,7 @@ ACK/error 必须在有界 quantum 内处理，不能在耗尽预算后用 Pendin
 AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包含 runner。
 展开后所有顶层 item 必须是非泛型 async 函数；参数和返回限 primitive/单层 Result。
 支持直线绑定、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
-以及静态字符串。重复赋值、if/循环/递归、嵌套 scope、try/catch/finally、闭包、同步调用、
+以及静态字符串；R5e 追加下节的 Copy 表达式。重复赋值、if/循环/递归、嵌套 scope、try/catch/finally、闭包、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -383,10 +388,36 @@ private READY 先保存返回 Result；所有 sibling 先移交到固定 driver 
 仍传递该次原始/收紧后的 D，祖先后续清理只能取更小值，不能重新计时。普通用户
 Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复错误的语义。
 
-源码与两种 CLI native 构建的定向执行已经通过；R5c 本机回归通过，但其精确提交的
-三系统 CI 中 Linux/macOS 与 PR sanitizer 有失败，修复后的完整验证仍未完成，实际结果见工作日志。
+源码与两种 CLI native 构建的定向执行已经通过；本轮表达式/清理定向测试与 Rust
+quality 通过，本轮 native 全集和质量检查通过，workspace 的文档失败与修复证据单列；精确新提交三系统 CI/sanitizer 仍待核实。
+历史失败及修复结果分开记录于工作日志，不从旧 SHA 的通过结果外推。
 Frame ABI 2、Control ABI 1、Driver ABI 4 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
+
+### R5e checked Copy 表达式
+
+`TaskUnaryOp` 只含 Negate/Not；`TaskBinaryOp` 只含 int 算术和 int/bool 的指定比较。
+输入与输出均是显式 int/bool Value 槽，verifier 拒绝 Task/Owned、混合类型、borrowed
+目标、未初始化输入及目标/输入别名；来源保留，目标成功后才初始化。相同左右 Copy
+输入合法。倒推 liveness 同时读取两个操作数，确保左值快照跨右侧 Await 持久化，
+但不把全部 Copy 临时强制存入 frame。
+
+逻辑 And/Or 不进入 eager Binary；source lower 复用 Branch/Jump：默认 bool 结果
+支配两条路径，RHS 仅在选中边执行，再从其真正结束状态到 join。内嵌 Await、`?`
+或另一逻辑式可生成自己的状态，不会把 RHS 指令提前到短路分支之前。未选中 RHS
+仍被 type/budget 检查；条件创建的 Task 按真实 initialized 位参加最终 scope drain。
+
+`src/backend/c_int.rs` 的 checked i64 helper 只在 Task artifact 含算术时发射一次；
+比较和 Not 不需要这些 helper。检查本身避免 signed UB，失败不写目标、无分配或
+exit，不改变 frame/control/driver 布局或版本（仍为2/1/4）。Negate MIN、算术越界、
+MIN/-1 的除/余都报 `integer overflow`；除/余零优先报 `division by zero`，负数
+除/余向零截断。Task emitter 使用空 domain/code 和静态 message，走外层
+RUNTIME_FAILURE、原有 Result/drop/child drain；不是普通 USER_RESULT 或 driver
+INTERNAL，也不是通过进程退出绕过清理。取消已经胜出时保留原原因和既有绝对 D。
+
+本片不把同步 C 现有的直接 signed 算术输出伪装成已修复：该路径仍存在独立的
+溢出/除零 UB 缺陷，必须单独接入 checked 计算及同步 fatal cleanup。不能只因
+Task helper 通过就宣称所有后端已统一；不新增用户错误 code 或可恢复算术 API。
 
 ## IR 优化队列
 

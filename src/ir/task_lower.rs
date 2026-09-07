@@ -6,15 +6,19 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{Expr, ExprKind, FnDecl, Item, Literal, ParamMode, Program, Stmt, TypeName},
+    ast::{
+        BinaryOp, Expr, ExprKind, FnDecl, Item, Literal, ParamMode, Program, Stmt, TypeName,
+        UnaryOp,
+    },
     error::{KuError, KuResult},
     span::Span,
 };
 
 use super::{
     task::{
-        self, SlotId, StateId, TaskConstant, TaskFunction, TaskFunctionId, TaskLimits, TaskOp,
-        TaskProgram, TaskSlot, TaskSlotType, TaskState, TaskTerminator,
+        self, SlotId, StateId, TaskBinaryOp, TaskConstant, TaskFunction, TaskFunctionId,
+        TaskLimits, TaskOp, TaskProgram, TaskSlot, TaskSlotType, TaskState, TaskTerminator,
+        TaskUnaryOp,
     },
     IrType,
 };
@@ -372,6 +376,83 @@ impl<'a> FunctionLowerer<'a> {
     fn expression(&mut self, expression: &Expr, depth: usize) -> KuResult<SlotId> {
         self.budget.expression(depth, expression.span)?;
         match &expression.kind {
+            ExprKind::Unary { op, expr } => {
+                let source = self.expression(expr, depth + 1)?;
+                let (op, ty) = match op {
+                    UnaryOp::Negate => (TaskUnaryOp::Negate, IrType::Int),
+                    UnaryOp::Not => (TaskUnaryOp::Not, IrType::Bool),
+                };
+                if self.function.slots[source.0].ty != value_slot(ty.clone()) {
+                    return Err(unsupported(
+                        "unary operands other than int for - or bool for !",
+                        expression.span,
+                    ));
+                }
+                let destination = self.slot(value_slot(ty))?;
+                self.emit(TaskOp::Unary {
+                    dst: destination,
+                    op,
+                    src: source,
+                })?;
+                Ok(destination)
+            }
+            ExprKind::Binary { left, op, right } if matches!(op, BinaryOp::And | BinaryOp::Or) => {
+                self.logical_expression(left, *op, right, depth, expression.span)
+            }
+            ExprKind::Binary { left, op, right } => {
+                let source = self.expression(left, depth + 1)?;
+                let equality = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
+                let input_type = match &self.function.slots[source.0].ty {
+                    TaskSlotType::Value {
+                        ty: IrType::Int,
+                        borrowed: false,
+                    } => IrType::Int,
+                    TaskSlotType::Value {
+                        ty: IrType::Bool,
+                        borrowed: false,
+                    } if equality => IrType::Bool,
+                    _ => {
+                        return Err(unsupported(
+                            "binary operands other than int or same-type bool equality",
+                            left.span,
+                        ))
+                    }
+                };
+                // Freeze the completed LHS before any RHS Start/Await/TryResult.
+                // Do not rely on C operand order or reread a live source slot.
+                let left = self.copy_or_move(source)?;
+                let right = self.expression(right, depth + 1)?;
+                if self.function.slots[right.0].ty != value_slot(input_type) {
+                    return Err(unsupported(
+                        "mixed binary operand types in a Task frame",
+                        expression.span,
+                    ));
+                }
+                let (op, output_type) = match op {
+                    BinaryOp::Add => (TaskBinaryOp::Add, IrType::Int),
+                    BinaryOp::Subtract => (TaskBinaryOp::Subtract, IrType::Int),
+                    BinaryOp::Multiply => (TaskBinaryOp::Multiply, IrType::Int),
+                    BinaryOp::Divide => (TaskBinaryOp::Divide, IrType::Int),
+                    BinaryOp::Remainder => (TaskBinaryOp::Remainder, IrType::Int),
+                    BinaryOp::Equal => (TaskBinaryOp::Equal, IrType::Bool),
+                    BinaryOp::NotEqual => (TaskBinaryOp::NotEqual, IrType::Bool),
+                    BinaryOp::Less => (TaskBinaryOp::Less, IrType::Bool),
+                    BinaryOp::LessEqual => (TaskBinaryOp::LessEqual, IrType::Bool),
+                    BinaryOp::Greater => (TaskBinaryOp::Greater, IrType::Bool),
+                    BinaryOp::GreaterEqual => (TaskBinaryOp::GreaterEqual, IrType::Bool),
+                    BinaryOp::And | BinaryOp::Or => {
+                        unreachable!("logical expressions lower through branches")
+                    }
+                };
+                let destination = self.slot(value_slot(output_type))?;
+                self.emit(TaskOp::Binary {
+                    dst: destination,
+                    op,
+                    left,
+                    right,
+                })?;
+                Ok(destination)
+            }
             ExprKind::Literal(literal) => match literal {
                 Literal::Int(value) => self.constant(TaskConstant::Int(*value), IrType::Int),
                 Literal::Bool(value) => self.constant(TaskConstant::Bool(*value), IrType::Bool),
@@ -522,6 +603,48 @@ impl<'a> FunctionLowerer<'a> {
                 expression.span,
             )),
         }
+    }
+
+    fn logical_expression(
+        &mut self,
+        left: &Expr,
+        op: BinaryOp,
+        right: &Expr,
+        depth: usize,
+        span: Span,
+    ) -> KuResult<SlotId> {
+        let condition = self.expression(left, depth + 1)?;
+        if self.function.slots[condition.0].ty != value_slot(IrType::Bool) {
+            return Err(unsupported("non-bool logical operands", left.span));
+        }
+        // Dominates both paths. The skipped path owns no RHS Task/header.
+        let destination = self.constant(TaskConstant::Bool(op == BinaryOp::Or), IrType::Bool)?;
+        let right_state = self.state(TaskTerminator::Terminate)?;
+        let join = self.state(TaskTerminator::Terminate)?;
+        let (then_state, else_state) = match op {
+            BinaryOp::And => (right_state, join),
+            BinaryOp::Or => (join, right_state),
+            _ => return Err(unsupported("a non-logical short-circuit operation", span)),
+        };
+        self.terminate(TaskTerminator::Branch {
+            condition,
+            then_state,
+            else_state,
+        })?;
+        self.current = Some(right_state);
+        // Always lower/validate the RHS, even for a constant deciding LHS.
+        // Nested Await/TryResult/logical expressions may replace current state.
+        let right = self.expression(right, depth + 1)?;
+        if self.function.slots[right.0].ty != value_slot(IrType::Bool) {
+            return Err(unsupported("non-bool logical operands", span));
+        }
+        self.emit(TaskOp::Copy {
+            dst: destination,
+            src: right,
+        })?;
+        self.terminate(TaskTerminator::Jump { target: join })?;
+        self.current = Some(join);
+        Ok(destination)
     }
 
     fn bind(

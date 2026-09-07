@@ -69,6 +69,30 @@ pub enum TaskConstant {
     },
 }
 
+/// Copy-only operations: source lowering maps existing syntax to these tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskUnaryOp {
+    Negate,
+    Not,
+}
+
+/// Logical And/Or are intentionally absent: they require Branch/Jump control
+/// flow so a raw producer cannot hide eager side effects in a binary operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskBinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOp {
     Init {
@@ -82,6 +106,17 @@ pub enum TaskOp {
     Move {
         dst: SlotId,
         src: SlotId,
+    },
+    Unary {
+        dst: SlotId,
+        op: TaskUnaryOp,
+        src: SlotId,
+    },
+    Binary {
+        dst: SlotId,
+        op: TaskBinaryOp,
+        left: SlotId,
+        right: SlotId,
     },
     /// Construct ok(source): Copy primitives remain initialized, owned str moves.
     WrapOk {
@@ -509,6 +544,64 @@ fn validate_shape(
                         _ => {}
                     }
                 }
+                TaskOp::Unary { dst, op, src } => {
+                    budget.spend()?;
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                    let (source, _) = slot_type(get_slot(*src)?)?;
+                    let expected = match op {
+                        TaskUnaryOp::Negate => IrType::Int,
+                        TaskUnaryOp::Not => IrType::Bool,
+                    };
+                    if dst == src
+                        || destination_borrowed
+                        || source != &expected
+                        || destination != &expected
+                    {
+                        return Err(invalid(
+                            "Unary requires distinct matching int or bool Value slots",
+                        ));
+                    }
+                }
+                TaskOp::Binary {
+                    dst,
+                    op,
+                    left,
+                    right,
+                } => {
+                    budget.spend_many(2)?;
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                    let (left_type, _) = slot_type(get_slot(*left)?)?;
+                    let (right_type, _) = slot_type(get_slot(*right)?)?;
+                    let valid_types = match op {
+                        TaskBinaryOp::Add
+                        | TaskBinaryOp::Subtract
+                        | TaskBinaryOp::Multiply
+                        | TaskBinaryOp::Divide
+                        | TaskBinaryOp::Remainder => {
+                            left_type == &IrType::Int
+                                && right_type == &IrType::Int
+                                && destination == &IrType::Int
+                        }
+                        TaskBinaryOp::Equal | TaskBinaryOp::NotEqual => {
+                            matches!(left_type, IrType::Int | IrType::Bool)
+                                && left_type == right_type
+                                && destination == &IrType::Bool
+                        }
+                        TaskBinaryOp::Less
+                        | TaskBinaryOp::LessEqual
+                        | TaskBinaryOp::Greater
+                        | TaskBinaryOp::GreaterEqual => {
+                            left_type == &IrType::Int
+                                && right_type == &IrType::Int
+                                && destination == &IrType::Bool
+                        }
+                    };
+                    if dst == left || dst == right || destination_borrowed || !valid_types {
+                        return Err(invalid(
+                            "Binary requires distinct destination and matching int or bool Value types",
+                        ));
+                    }
+                }
                 TaskOp::Read { slot } => {
                     get_slot(*slot)?;
                 }
@@ -692,6 +785,24 @@ fn validate_regions_and_progress(function: &TaskFunction, budget: &mut Budget) -
             if matches!(operation, TaskOp::Start { .. }) {
                 return Err(invalid("cleanup cannot Start a task"));
             }
+            if matches!(
+                operation,
+                TaskOp::Unary {
+                    op: TaskUnaryOp::Negate,
+                    ..
+                } | TaskOp::Binary {
+                    op: TaskBinaryOp::Add
+                        | TaskBinaryOp::Subtract
+                        | TaskBinaryOp::Multiply
+                        | TaskBinaryOp::Divide
+                        | TaskBinaryOp::Remainder,
+                    ..
+                }
+            ) {
+                // A checked arithmetic failure must not replace the cleanup's
+                // original cancellation/timeout with a normal runtime exit.
+                return Err(invalid("cleanup cannot perform trapping arithmetic"));
+            }
         }
         match &function.states[id.0].terminator {
             TaskTerminator::Jump { .. }
@@ -758,7 +869,10 @@ struct Initialized {
 
 fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initialized {
     match operation {
-        TaskOp::Init { dst, .. } | TaskOp::Copy { dst, .. } => {
+        TaskOp::Init { dst, .. }
+        | TaskOp::Copy { dst, .. }
+        | TaskOp::Unary { dst, .. }
+        | TaskOp::Binary { dst, .. } => {
             state.must |= bit(*dst);
             state.may |= bit(*dst);
         }
@@ -787,8 +901,11 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
 
 fn operation_work(operation: &TaskOp, budget: &mut Budget) -> KuResult<()> {
     budget.spend()?;
-    if let TaskOp::Start { arguments, .. } = operation {
-        budget.spend_many(arguments.len())?;
+    match operation {
+        TaskOp::Start { arguments, .. } => budget.spend_many(arguments.len())?,
+        TaskOp::Unary { .. } => budget.spend()?,
+        TaskOp::Binary { .. } => budget.spend_many(2)?,
+        _ => {}
     }
     Ok(())
 }
@@ -917,7 +1034,11 @@ fn live_states(function: &TaskFunction, tasks: u64, budget: &mut Budget) -> KuRe
                     TaskOp::Init { dst, .. } => live &= !bit(*dst),
                     TaskOp::Copy { dst, src }
                     | TaskOp::Move { dst, src }
-                    | TaskOp::WrapOk { dst, src } => live = (live & !bit(*dst)) | bit(*src),
+                    | TaskOp::WrapOk { dst, src }
+                    | TaskOp::Unary { dst, src, .. } => live = (live & !bit(*dst)) | bit(*src),
+                    TaskOp::Binary {
+                        dst, left, right, ..
+                    } => live = (live & !bit(*dst)) | bit(*left) | bit(*right),
                     TaskOp::Read { slot } | TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
                         live |= bit(*slot)
                     }
@@ -963,7 +1084,8 @@ fn validate_ownership_and_plan(
             let source = match operation {
                 TaskOp::Copy { src, .. }
                 | TaskOp::Move { src, .. }
-                | TaskOp::WrapOk { src, .. } => Some(*src),
+                | TaskOp::WrapOk { src, .. }
+                | TaskOp::Unary { src, .. } => Some(*src),
                 TaskOp::Read { slot } | TaskOp::Drop { slot } => Some(*slot),
                 TaskOp::Print { value, .. } => Some(*value),
                 _ => None,
@@ -972,6 +1094,13 @@ fn validate_ownership_and_plan(
                 return Err(invalid(
                     "read, move or drop of a slot that is not definitely initialized",
                 ));
+            }
+            if let TaskOp::Binary { left, right, .. } = operation {
+                if state.must & bit(*left) == 0 || state.must & bit(*right) == 0 {
+                    return Err(invalid(
+                        "Binary reads a slot that is not definitely initialized",
+                    ));
+                }
             }
             if let TaskOp::Start { arguments, .. } = operation {
                 // Initialization checking and the consuming transfer each walk
@@ -988,7 +1117,9 @@ fn validate_ownership_and_plan(
                 | TaskOp::Copy { dst, .. }
                 | TaskOp::Move { dst, .. }
                 | TaskOp::WrapOk { dst, .. }
-                | TaskOp::Start { dst, .. } => Some(*dst),
+                | TaskOp::Start { dst, .. }
+                | TaskOp::Unary { dst, .. }
+                | TaskOp::Binary { dst, .. } => Some(*dst),
                 _ => None,
             };
             if destination.is_some_and(|slot| state.may & masks.owned & bit(slot) != 0) {
