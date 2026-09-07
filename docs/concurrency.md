@@ -26,7 +26,9 @@ v0.0.18 第二阶段已采用以下规则；这不表示所有后端已实现。
 - 取消展开先请求 owned 子任务取消，再由内向外执行 finally，随后 drop 本作用域局部。
   清理期间禁止新建 Task、await 或提交新的 sleep/timer、网络等待和 blocking job；同步 close/drop 与有限计算仍受预算约束。
 
-本轮解释器生命周期切片已通过本机全量回归，具体证据与未覆盖边界见实施记录；native async、stackless frame、M:N、netpoll 和事件驱动 HTTP 尚未实现。
+本轮解释器生命周期切片已通过本机全量回归，具体证据与未覆盖边界见实施记录。
+native 已有独立 typed frame/control 和内部单 worker driver；它们尚未接入源码
+async/await，不等于源码 stackless lowering、M:N、netpoll 或事件驱动 HTTP 已实现。
 native C / LLVM 继续明确拒绝 async lowering，不以同步代码或解释器回退冒充支持。
 已经进入系统或外部库的阻塞操作仍不能硬杀，迟到结果只能清理，不得恢复已取消任务。
 

@@ -321,11 +321,19 @@ fn native_task_frame_emission_preserves_sync_output_and_fail_closed_cli_boundary
         .message
         .contains("async"));
 
-    let collision = sync_program("fn ku_task_frame_0_size(): int { return 1 } fn main() {}");
-    assert!(c::generate_task_frame_c_source(&collision, &tasks)
-        .unwrap_err()
-        .message
-        .contains("collides"));
+    for name in [
+        "ku_task_frame_0_size",
+        "ku_task_control_init",
+        "ku_task_driver_init",
+        "KuTaskDriverV1",
+        "KU_TASK_DRIVER_OK",
+    ] {
+        let collision = sync_program(&format!("fn {name}(): int {{ return 1 }} fn main() {{}}"));
+        assert!(c::generate_task_frame_c_source(&collision, &tasks)
+            .unwrap_err()
+            .message
+            .contains("collides"));
+    }
     let mut invalid = tasks;
     invalid.functions[0].states[0].terminator = TaskTerminator::Jump {
         target: StateId(999),
@@ -570,6 +578,153 @@ int main(void) {
     );
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn native_task_driver_thread_creation_failure_cleans_platform_initialization() {
+    let generated =
+        c::generate_task_frame_c_source(&sync_program("fn main() {}"), &frames()).unwrap();
+    let mut source = generated
+        .replacen(
+            "static uint64_t ku_task_driver_now_ms(void) {",
+            &format!("{DRIVER_INIT_FAULT_HOOK}\nstatic uint64_t ku_task_driver_now_ms(void) {{"),
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int ku_generated_main(void) {",
+            1,
+        );
+    source.push_str(DRIVER_INIT_FAULT_MAIN);
+    let directory = TempDir::new("task-driver-thread-init-failure");
+    let c_file = directory.path().join("driver-init.c");
+    fs::write(&c_file, source).expect("write generated driver initialization fixture");
+    let Some(executable) = compile_harness(directory.path(), &c_file, "driver-init") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute driver initialization fault fixture"
+        );
+        return;
+    };
+    fs::remove_file(&c_file).expect("remove source before native execution");
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "driver initialization fixture failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-driver-init-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+const DRIVER_INIT_FAULT_HOOK: &str = r#"
+/* Inject only the new driver's worker creation, after all platform declarations.
+ * No shared harness or production fallback is changed. */
+static int fixture_driver_fail_create = 1;
+static unsigned fixture_driver_create_attempts;
+#if defined(_WIN32)
+static uintptr_t fixture_driver_beginthreadex(void* security, unsigned stack_size,
+    unsigned (__stdcall *entry)(void*), void* context, unsigned flags, unsigned* id) {
+  fixture_driver_create_attempts++;
+  if (fixture_driver_fail_create) { errno = EAGAIN; return 0; }
+  return _beginthreadex(security, stack_size, entry, context, flags, id);
+}
+#define _beginthreadex fixture_driver_beginthreadex
+#else
+#include <sched.h>
+static unsigned fixture_driver_mutex_inits, fixture_driver_mutex_drops;
+static unsigned fixture_driver_condition_inits, fixture_driver_condition_drops;
+static int fixture_driver_mutex_init(pthread_mutex_t* mutex, const pthread_mutexattr_t* attr) {
+  int result = pthread_mutex_init(mutex, attr);
+  if (!result) fixture_driver_mutex_inits++;
+  return result;
+}
+static int fixture_driver_mutex_destroy(pthread_mutex_t* mutex) {
+  int result = pthread_mutex_destroy(mutex);
+  if (!result) fixture_driver_mutex_drops++;
+  return result;
+}
+static int fixture_driver_condition_init(pthread_cond_t* condition, const pthread_condattr_t* attr) {
+  int result = pthread_cond_init(condition, attr);
+  if (!result) fixture_driver_condition_inits++;
+  return result;
+}
+static int fixture_driver_condition_destroy(pthread_cond_t* condition) {
+  int result = pthread_cond_destroy(condition);
+  if (!result) fixture_driver_condition_drops++;
+  return result;
+}
+static int fixture_driver_pthread_create(pthread_t* thread, const pthread_attr_t* attr,
+                                        void* (*entry)(void*), void* context) {
+  fixture_driver_create_attempts++;
+  if (fixture_driver_fail_create) return EAGAIN;
+  return pthread_create(thread, attr, entry, context);
+}
+#define pthread_mutex_init fixture_driver_mutex_init
+#define pthread_mutex_destroy fixture_driver_mutex_destroy
+#define pthread_cond_init fixture_driver_condition_init
+#define pthread_cond_destroy fixture_driver_condition_destroy
+#define pthread_create fixture_driver_pthread_create
+#endif
+"#;
+
+const DRIVER_INIT_FAULT_MAIN: &str = r#"
+#define INIT_CHECK(c) do { if (!(c)) { fprintf(stderr, "driver init line %d: %s\n", __LINE__, #c); return 1; } } while (0)
+int main(void) {
+  KuTaskDriverV1 driver = {0};
+  KuTaskDriverSlotV1 slots[2] = {0};
+  size_t ring[2] = {0};
+  size_t fixed = sizeof(driver) + sizeof(slots) + sizeof(ring);
+  for (unsigned attempt = 0; attempt < 16; ++attempt) {
+    INIT_CHECK(ku_task_driver_init(&driver, sizeof(driver), KU_TASK_DRIVER_ABI_VERSION,
+        slots, 2, ring, 2, fixed) == KU_TASK_DRIVER_INTERNAL);
+    INIT_CHECK(fixture_driver_create_attempts == attempt + 1);
+    INIT_CHECK(ku_task_frame_zero_bytes(&driver, sizeof(driver)));
+    INIT_CHECK(ku_task_frame_zero_bytes(slots, sizeof(slots)));
+    INIT_CHECK(ku_task_frame_zero_bytes(ring, sizeof(ring)));
+#if !defined(_WIN32)
+    INIT_CHECK(fixture_driver_mutex_inits == attempt + 1);
+    INIT_CHECK(fixture_driver_mutex_drops == fixture_driver_mutex_inits);
+    INIT_CHECK(fixture_driver_condition_inits == attempt + 1);
+    INIT_CHECK(fixture_driver_condition_drops == fixture_driver_condition_inits);
+#endif
+  }
+  fixture_driver_fail_create = 0;
+  INIT_CHECK(ku_task_driver_init(&driver, sizeof(driver), KU_TASK_DRIVER_ABI_VERSION,
+      slots, 2, ring, 2, fixed) == KU_TASK_DRIVER_OK);
+  INIT_CHECK(fixture_driver_create_attempts == 17);
+  uint64_t deadline = ku_task_driver_now_ms() + 2000u;
+  INIT_CHECK(ku_task_driver_wait_idle(&driver, deadline) == KU_TASK_DRIVER_OK);
+  INIT_CHECK(ku_task_driver_shutdown(&driver, deadline) == KU_TASK_DRIVER_OK);
+  uint32_t destroyed = KU_TASK_DRIVER_PENDING;
+  for (unsigned attempt = 0; attempt < 4096 && destroyed == KU_TASK_DRIVER_PENDING; ++attempt) {
+    destroyed = ku_task_driver_destroy(&driver);
+    if (destroyed == KU_TASK_DRIVER_PENDING) {
+      INIT_CHECK(ku_task_driver_now_ms() < deadline);
+#if defined(_WIN32)
+      SwitchToThread();
+#else
+      sched_yield();
+#endif
+    }
+  }
+  INIT_CHECK(destroyed == KU_TASK_DRIVER_OK);
+#if !defined(_WIN32)
+  INIT_CHECK(fixture_driver_mutex_inits == 17 && fixture_driver_mutex_drops == 17);
+  INIT_CHECK(fixture_driver_condition_inits == 17 && fixture_driver_condition_drops == 17);
+#endif
+  puts("task-driver-init-ok");
+  return 0;
+}
+"#;
 
 const C_MAIN: &str = r#"
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "frame check line %d\n", __LINE__); return 1; } } while (0)

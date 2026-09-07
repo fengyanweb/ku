@@ -9,6 +9,8 @@ use output::COutput;
 mod task;
 #[path = "c_task_control.rs"]
 mod task_control;
+#[path = "c_task_driver.rs"]
+mod task_driver;
 
 // Whole generated-file bytes, including shared runtimes and all specializations.
 // This is independent of the checker's generic AST/type admission budget.
@@ -220,7 +222,8 @@ pub fn generate_c_source_with_options(
 
 /// Compile verified internal task frames alongside the existing synchronous
 /// runtime helpers. This is not AST async lowering and is not a CLI capability.
-/// In particular it supplies no scheduler, Task handle or external I/O runtime.
+/// Its single-worker driver is internal; no source Task handle, M:N scheduler
+/// or external I/O runtime is supplied by this entry point.
 pub fn generate_task_frame_c_source(
     program: &IrProgram,
     frames: &crate::ir::task::TaskProgram,
@@ -235,6 +238,9 @@ pub fn generate_task_frame_c_source(
                 || name.starts_with("ku_task_control_")
                 || name.starts_with("KuTaskControl")
                 || name.starts_with("KU_TASK_CONTROL_")
+                || name.starts_with("ku_task_driver_")
+                || name.starts_with("KuTaskDriver")
+                || name.starts_with("KU_TASK_DRIVER_")
         })
     {
         return Err(unsupported(

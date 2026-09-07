@@ -168,7 +168,7 @@ slot 63 / 逆序参数、Ok/Err payload、取消/超期、未取结果销毁和�
 旧 ABI 参数拒绝不等于已经验证不存在的外部旧 Task runtime。现有 native async
 拒绝测试保持不变；测试结果、平台和 sanitizer 状态以阶段工作日志与精确 SHA CI 为准。
 
-### R2 内部控制内核（尚无 scheduler / 源码接入）
+### R2 内部控制内核（内核不自驱动 / 尚无源码接入）
 
 `src/backend/c_task_control.rs` 为上述 frame 提供独立的控制 ABI v1，不改变 frame 的
 串行合同。它复用已有 C 原子表示，使用 acquire/release 发布和单次 strong CAS；
@@ -196,6 +196,44 @@ TaskStart/await、timer/netpoll/blocking 和 M:N 仍未接入，不能将该 pin
 `native_task_control_test` 使用真实 R1 frame 和事件屏障，验证终态竞争、迟到结果、
 owner drop/take、执行者排他、cleanup 期限缩短、引用硬限及资源归零。测试中的
 typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 或压力验收完成。
+
+### R3 内部单 worker driver（尚无源码接入）
+
+`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v1。
+普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
+以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
+这是后续源码 TaskStart/Await 的基础，不是 M:N、netpoll 或事件驱动 HTTP。
+
+接纳顺序为 reserve → 构造 control/frame → commit；内部容量最多 1024，计数和预留
+字节同时限流，失败不消费用户输入。control/pin 尚未安装时才能 rollback；安装后
+失败必须 commit(ABORT)，交给可信 adapter 清理部分初始化 frame。BUILDING 也占用
+resident，shutdown 不能假装它不存在。相同 driver 重复绑定 control 会拒绝；跨 driver
+仍要求可信 builder 提供唯一、尚未发布的 control，这不是开放给 Ku 用户的裸能力。
+
+每个 resident 预留一个队列位置；重复 wake 合并，RUNNING 期间用 notified 位记账。
+回调返回 Pending 必须声明 YIELD 或已有进展来源的 WAIT。没有进展来源则报告内部错误，
+不靠循环 poll 掩盖。take/cancel 的通知发生在 R2 最终发布之后；owner drop 把责任转入
+固定 slot，再由 worker 推进，不能把“责任已转移”当作父作用域清理已经结束。
+
+poll、drop、dispose 均在队列锁外执行。shutdown 在锁保护 registry lease 时仅执行
+无回调、无分配的有界原子取消提交，不临时申请引用而在引用满载时漏取消。
+driver/execution lease 保证 frame 工作期间存活；
+terminal payload、未释放 owner 和迟到 lease 仍占用 resident/bytes。最终 dispose 必须
+先释放实际 task 分配，再用本地 ticket 副本归还预算；generation 检查拒绝复用后的旧通知。
+预留字节包含 adapter 声明的 control/frame/owned capacities；不包含 OS 栈或整个进程 RSS，
+也尚无可增长 payload 的统一预算分配器，不能据此宣称完整低资源门禁通过。
+
+shutdown 关闭接纳，批量取消并共享 min(首次关闭时刻 + 1000 ms, 继承 deadline)，重试
+只能缩短。超期返回失败并保留 worker/storage，不强杀线程或提前 free；调用方必须释放
+仍持有的 owner/注册引用后继续排空。destroy 必须等 resident 归零和 worker 完成访问，
+Windows 还验证线程句柄结束；POSIX 最终 join 不是可硬限时的 portable OS primitive。
+单调时钟失败不是时间零：driver 保持可观察的 INTERNAL/closing 故障，以已到期的
+共享预算批量取消并保留 worker 执行清理。无 runnable 时使用不读时钟的条件等待，
+仍接收后续 owner/BUILDING 归还；不退出后留下无人处理的队列，也不恢复普通 continuation。
+故障即使随后读钟恢复也不能被清成成功，实际排空之后才允许销毁存储。
+
+`native_task_driver_test` 的 adapter 仍是测试夹具。源 Task 句柄、父子 scope drain、
+用户 finally、I/O/timer/blocking、M:N 和压力/soak 需要后续独立执行证据，不能由该测试替代。
 
 ## IR 优化队列
 
