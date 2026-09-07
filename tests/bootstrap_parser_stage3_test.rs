@@ -3449,10 +3449,51 @@ fn ExpectBodyCallbackOutputError(tokens: [Token], body_start: int): null! {
         String::from_utf8_lossy(&built.stderr)
     );
     if built.status.success() {
+        // Explicit opt-in for comparing generated C and its linked executable.
+        // Capture before removing the graph, but still execute without sources.
+        let evidence = std::env::var_os("KU_STAGE3_EVIDENCE_DIR").map(|destination| {
+            let linked_c = build_log
+                .lines()
+                .find_map(|line| line.strip_prefix("native c ok: "))
+                .expect("native build reports the exact linked C path");
+            (
+                PathBuf::from(destination),
+                fs::read(linked_c).expect("read exact linked C evidence"),
+            )
+        });
         fs::remove_dir_all(&source_root).expect("remove complete stage-3 source graph");
         let mut native = Command::new(&native_path);
         let ran = run_bounded(&mut native, PROCESS_TIMEOUT, PROCESS_OUTPUT_LIMITS)
             .expect("stage-3 native executable must remain bounded");
+        // No retention by default and no overwriting prior diagnostic evidence.
+        if let Some((destination, linked_c)) = evidence {
+            use std::io::Write;
+            assert!(
+                destination.is_absolute(),
+                "evidence directory must be absolute"
+            );
+            fs::create_dir_all(&destination).expect("create native evidence directory");
+            let mut source = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination.join("stage3-native.c"))
+                .expect("create new evidence C artifact");
+            source
+                .write_all(&linked_c)
+                .expect("retain linked C artifact");
+            let mut binary = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination.join(native_name))
+                .expect("create new evidence binary");
+            std::io::copy(&mut fs::File::open(&native_path).unwrap(), &mut binary)
+                .expect("retain linked binary");
+            eprintln!(
+                "stage3 native evidence: {} (exit {:?})",
+                destination.display(),
+                ran.status.code()
+            );
+        }
         assert!(
             ran.status.success(),
             "stage-3 native executable failed with {:?}:\n{}{}",

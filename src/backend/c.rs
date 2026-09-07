@@ -2688,6 +2688,18 @@ fn emit_terminator(
             Ok(())
         }
         IrTerminator::Return(Some(value)) => {
+            // Internal unwind placeholders have no payload to evaluate or move.
+            // Sharing the existing cleanup exit also avoids a separate aggregate
+            // return scratch/compound literal for every checked-operation guard
+            // in unoptimized C builds. Source returns keep their move-before-drop
+            // path; applicable finally blocks have already been lowered into IR.
+            if is_native_zero(value) {
+                // Preserve the previous rejection of unsupported raw IR types,
+                // without emitting their per-edge compound initialization.
+                c_zero_initializer(&value.ty)?;
+                out.push_str("  goto __ku_sync_epilogue;\n");
+                return out.check();
+            }
             sync::emit_return_guard(out)?;
             // A Copy payload can still live inside an owned cell. Read it
             // before cleanup releases that cell, just as owned returns must be
