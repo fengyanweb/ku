@@ -16,6 +16,16 @@ use crate::{
 };
 
 mod borrow;
+mod budget;
+use budget::{LowerBudget, LowerLimits};
+
+// Reserve before constructing an instruction payload, including synthetic ones.
+macro_rules! emit_ir_instruction {
+    ($lower:expr, $instruction:expr) => {{
+        $lower.admit_instruction()?;
+        $lower.current.instructions.push($instruction);
+    }};
+}
 mod monomorph;
 /// Internal typed frame IR. This does not open the CLI's native async boundary.
 pub mod task;
@@ -372,6 +382,16 @@ fn ir_type_is_owned(ty: &IrType) -> bool {
 }
 
 pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
+    lower_program_with_budget(
+        program,
+        Rc::new(RefCell::new(LowerBudget::new(LowerLimits::default()))),
+    )
+}
+
+fn lower_program_with_budget(
+    program: &Program,
+    budget: Rc<RefCell<LowerBudget>>,
+) -> KuResult<IrProgram> {
     crate::ast::reject_compiled_async(
         program,
         "async/await is not supported by IR/native lowering yet",
@@ -420,9 +440,10 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
     //
     // Each unannotated body is lowered once in a throwaway probe (Unknown seed,
     // like a closure literal, so `try`/`finally` return slots are still created)
-    // and the first concrete `return` type is recovered. Probe failures and
-    // value-less bodies fall back to `void` — identical to the previous
-    // behaviour — so this is strictly additive. Functions are visited in source
+    // and the first concrete `return` type is recovered. Non-resource probe
+    // failures and value-less bodies retain the previous `void` fallback.
+    // Resource refusal is sticky and aborts before real lowering repeats it.
+    // Functions are visited in source
     // order and their signatures updated in place, so a later function that
     // returns an earlier one's result sees the inferred type.
     for item in &program.items {
@@ -441,16 +462,22 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                 IrType::Unknown,
                 next_function_id.clone(),
                 throwaway_lifted,
-            );
+                budget.clone(),
+                function.span,
+            )?;
             if let Some(sig) = signatures.get(&function.name) {
+                budget
+                    .borrow_mut()
+                    .spend(function.params.len(), function.span)?;
                 for (param, ty) in function.params.iter().zip(sig.params.iter()) {
                     probe.locals.insert(param.name.clone(), ty.clone());
                 }
             }
-            if probe
-                .lower_block_body("entry", &function.body, function.span, &function.params)
-                .is_ok()
-            {
+            let probe_result = probe.lower_block_body("entry", &function.body, &function.params);
+            // Inference may retain its old unsupported-type fallback, but must
+            // never swallow a resource refusal and repeat expensive lowering.
+            budget.borrow().check()?;
+            if probe_result.is_ok() {
                 // Fold the body's `return <value>` types the way the checker's
                 // merge_return_types does: `null` is the identity element, so a
                 // body that returns `null` on one path and a concrete type on
@@ -499,6 +526,9 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
             let signature = signatures
                 .get(&function.name)
                 .ok_or_else(|| KuError::runtime("missing function signature", function.span))?;
+            budget
+                .borrow_mut()
+                .spend(function.params.len(), function.span)?;
             let params = function
                 .params
                 .iter()
@@ -515,11 +545,13 @@ pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
                 signature.returns.clone(),
                 next_function_id.clone(),
                 lifted_functions.clone(),
-            );
+                budget.clone(),
+                function.span,
+            )?;
             for param in &params {
                 lower.locals.insert(param.name.clone(), param.ty.clone());
             }
-            lower.lower_block_body("entry", &function.body, function.span, &function.params)?;
+            lower.lower_block_body("entry", &function.body, &function.params)?;
             functions.push(IrFunction {
                 id: signature.id,
                 name: function.name.clone(),
@@ -1100,6 +1132,8 @@ impl fmt::Display for IrExpr {
 }
 
 struct FunctionLowerer<'a> {
+    budget: Rc<RefCell<LowerBudget>>,
+    span: Span,
     signatures: &'a HashMap<String, FunctionSig>,
     layouts: &'a IrLayoutTable,
     return_type: IrType,
@@ -1225,8 +1259,13 @@ impl<'a> FunctionLowerer<'a> {
         return_type: IrType,
         next_function_id: Rc<Cell<usize>>,
         lifted_functions: Rc<RefCell<Vec<IrFunction>>>,
-    ) -> Self {
-        Self {
+        budget: Rc<RefCell<LowerBudget>>,
+        span: Span,
+    ) -> KuResult<Self> {
+        budget.borrow_mut().block(0, span)?;
+        Ok(Self {
+            budget,
+            span,
             signatures,
             layouts,
             return_type,
@@ -1252,14 +1291,13 @@ impl<'a> FunctionLowerer<'a> {
             captures: HashMap::new(),
             self_recurse: None,
             self_param_modes: Vec::new(),
-        }
+        })
     }
 
     fn lower_block_body<P: BodyParameter>(
         &mut self,
         name: &str,
         body: &[Stmt],
-        span: Span,
         parameters: &[P],
     ) -> KuResult<()> {
         // Stage 6b: any local this body declares that a nested closure literal
@@ -1324,10 +1362,7 @@ impl<'a> FunctionLowerer<'a> {
                 break;
             }
         }
-        if self.current.instructions.len() > 10_000 || self.blocks.len() > 10_000 {
-            return Err(KuError::runtime("ir function is too large", span));
-        }
-        self.finish_current();
+        self.finish_current()?;
         Ok(())
     }
 
@@ -1424,6 +1459,7 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn lower_stmt(&mut self, stmt: &Stmt) -> KuResult<()> {
+        self.budget.borrow_mut().spend(1, self.span)?;
         match stmt {
             Stmt::VarDecl {
                 name,
@@ -1440,9 +1476,7 @@ impl<'a> FunctionLowerer<'a> {
                     self.push_cell_new(name.clone(), ty, value, span)?;
                 } else {
                     let name = self.define_local(name, ty.clone());
-                    self.current
-                        .instructions
-                        .push(IrInst::Let { name, ty, value });
+                    emit_ir_instruction!(self, IrInst::Let { name, ty, value });
                 }
             }
             Stmt::Assign {
@@ -1478,9 +1512,7 @@ impl<'a> FunctionLowerer<'a> {
                 // that the RHS merely referenced.
                 let value = self.emit_temp(value)?;
                 let target = self.lower_lvalue(target)?;
-                self.current
-                    .instructions
-                    .push(IrInst::Store { target, value });
+                emit_ir_instruction!(self, IrInst::Store { target, value });
             }
             Stmt::CompoundAssign {
                 target, op, value, ..
@@ -1502,10 +1534,13 @@ impl<'a> FunctionLowerer<'a> {
                             IrType::Str,
                             right,
                         )?;
-                        self.current.instructions.push(IrInst::Store {
-                            target: IrLValue::Local(self.local_ir_name(name).to_string()),
-                            value,
-                        });
+                        emit_ir_instruction!(
+                            self,
+                            IrInst::Store {
+                                target: IrLValue::Local(self.local_ir_name(name).to_string()),
+                                value,
+                            }
+                        );
                         return Ok(());
                     }
                     if let Some(cell) = self.assignment_cell(name) {
@@ -1525,9 +1560,7 @@ impl<'a> FunctionLowerer<'a> {
                                 right: Box::new(right),
                             },
                         })?;
-                        self.current
-                            .instructions
-                            .push(IrInst::CellStore { cell, value });
+                        emit_ir_instruction!(self, IrInst::CellStore { cell, value });
                         return Ok(());
                     }
                 }
@@ -1541,9 +1574,7 @@ impl<'a> FunctionLowerer<'a> {
                         right: Box::new(right),
                     },
                 })?;
-                self.current
-                    .instructions
-                    .push(IrInst::Store { target, value });
+                emit_ir_instruction!(self, IrInst::Store { target, value });
             }
             Stmt::DestructureAssign {
                 names,
@@ -1616,7 +1647,7 @@ impl<'a> FunctionLowerer<'a> {
             Stmt::Fail { value, .. } => {
                 let value = self.lower_error_expr(value)?;
                 if self.try_handlers.is_empty() {
-                    self.current.instructions.push(IrInst::Fail(value));
+                    emit_ir_instruction!(self, IrInst::Fail(value));
                     self.current.terminator = IrTerminator::Unreachable;
                 } else {
                     let result_ty = match &self.return_type {
@@ -1638,12 +1669,12 @@ impl<'a> FunctionLowerer<'a> {
                     // reads it again. Keep one owner, not a constructor rvalue
                     // that would move the same payload twice.
                     let result = self.emit_temp(result)?;
-                    self.current.terminator = self.err_terminator(result);
+                    self.current.terminator = self.err_terminator(result)?;
                 }
             }
             Stmt::Panic { value, .. } => {
                 let value = self.lower_expr(value)?;
-                self.current.instructions.push(IrInst::Panic(value));
+                emit_ir_instruction!(self, IrInst::Panic(value));
                 self.current.terminator = IrTerminator::Unreachable;
             }
             Stmt::Return { value, .. } => {
@@ -1652,20 +1683,20 @@ impl<'a> FunctionLowerer<'a> {
                     .as_ref()
                     .map(|value| self.lower_expr_with_expected(value, Some(&expected)))
                     .transpose()?;
-                self.current.terminator = self.return_terminator(value);
+                self.current.terminator = self.return_terminator(value)?;
             }
             Stmt::Print { value, .. } => {
                 let value = self.lower_expr(value)?;
-                self.current.instructions.push(IrInst::Print(value));
+                emit_ir_instruction!(self, IrInst::Print(value));
             }
             Stmt::Expr { expr: value, .. } => {
                 let value = self.lower_expr(value)?;
                 let needs_safepoint = ir_expr_needs_post_call_safepoint(&value);
-                self.current.instructions.push(IrInst::Expr(value));
+                emit_ir_instruction!(self, IrInst::Expr(value));
                 // A void-returning call is not materialized by `emit_temp`, so
                 // statement position appends its post-call cancellation edge.
                 if needs_safepoint {
-                    self.emit_safepoint();
+                    self.emit_safepoint()?;
                 }
             }
         }
@@ -1679,40 +1710,40 @@ impl<'a> FunctionLowerer<'a> {
         else_branch: &[Stmt],
     ) -> KuResult<()> {
         let condition = self.lower_expr(condition)?;
-        let then_id = self.next_block("then");
-        let else_id = self.next_block("else");
-        let after_id = self.next_block("after");
+        let then_id = self.next_block("then")?;
+        let else_id = self.next_block("else")?;
+        let after_id = self.next_block("after")?;
         self.current.terminator = IrTerminator::Branch {
             condition,
             then_block: then_id,
             else_block: else_id,
         };
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(then_id, "then");
         self.lower_scoped_statements(then_branch)?;
         if self.current.terminator == IrTerminator::Next {
             self.current.terminator = IrTerminator::Jump(after_id);
         }
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(else_id, "else");
         self.lower_scoped_statements(else_branch)?;
         if self.current.terminator == IrTerminator::Next {
             self.current.terminator = IrTerminator::Jump(after_id);
         }
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(after_id, "after");
         Ok(())
     }
 
     fn lower_while(&mut self, condition: &Expr, body: &[Stmt]) -> KuResult<()> {
-        let cond_id = self.next_block("while_cond");
-        let body_id = self.next_block("while_body");
-        let after_id = self.next_block("while_after");
+        let cond_id = self.next_block("while_cond")?;
+        let body_id = self.next_block("while_body")?;
+        let after_id = self.next_block("while_after")?;
         self.current.terminator = IrTerminator::Jump(cond_id);
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(cond_id, "while_cond");
         let condition = self.lower_expr(condition)?;
@@ -1721,7 +1752,7 @@ impl<'a> FunctionLowerer<'a> {
             then_block: body_id,
             else_block: after_id,
         };
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(body_id, "while_body");
         self.lower_scoped_statements(body)?;
@@ -1729,10 +1760,10 @@ impl<'a> FunctionLowerer<'a> {
             // A tight compute loop remains cancellable even when its body has no
             // calls. `emit_safepoint` creates an explicit timeout return edge, so
             // an enclosing try/finally sees the same structured return route.
-            self.emit_safepoint();
+            self.emit_safepoint()?;
             self.current.terminator = IrTerminator::Jump(cond_id);
         }
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(after_id, "while_after");
         Ok(())
@@ -1782,11 +1813,11 @@ impl<'a> FunctionLowerer<'a> {
         // `iterable` has already been lowered into the current block. Put the
         // actual iterator terminator in a fresh header block: the loop backedge
         // must not re-run calls/array construction used to compute the iterable.
-        let iter_id = self.next_block("for_iter");
-        let body_id = self.next_block("for_body");
-        let after_id = self.next_block("for_after");
+        let iter_id = self.next_block("for_iter")?;
+        let body_id = self.next_block("for_body")?;
+        let after_id = self.next_block("for_after")?;
         self.current.terminator = IrTerminator::Jump(iter_id);
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(iter_id, "for_iter");
         let ir_name = self.define_local(name, element);
@@ -1796,7 +1827,7 @@ impl<'a> FunctionLowerer<'a> {
             body_block: body_id,
             after_block: after_id,
         };
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(body_id, "for_body");
         self.lower_statements(body)?;
@@ -1804,10 +1835,10 @@ impl<'a> FunctionLowerer<'a> {
             // `for` can iterate up to the full i64/array range. Poll on every
             // back-edge just like `while`, otherwise a handler with a call-free
             // loop can ignore its cooperative deadline indefinitely.
-            self.emit_safepoint();
+            self.emit_safepoint()?;
             self.current.terminator = IrTerminator::Jump(iter_id);
         }
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(after_id, "for_after");
         Ok(())
@@ -1820,13 +1851,19 @@ impl<'a> FunctionLowerer<'a> {
         catch_body: &[Stmt],
         finally_body: &[Stmt],
     ) -> KuResult<()> {
-        let catch_id =
-            (!catch_body.is_empty() || catch_name.is_some()).then(|| self.next_block("catch"));
-        let finally_id = (!finally_body.is_empty()).then(|| self.next_block("finally"));
-        let finally_err_id = (!finally_body.is_empty()).then(|| self.next_block("finally_err"));
-        let finally_return_id =
-            (!finally_body.is_empty()).then(|| self.next_block("finally_return"));
-        let after_id = self.next_block("try_after");
+        let catch_id = (!catch_body.is_empty() || catch_name.is_some())
+            .then(|| self.next_block("catch"))
+            .transpose()?;
+        let finally_id = (!finally_body.is_empty())
+            .then(|| self.next_block("finally"))
+            .transpose()?;
+        let finally_err_id = (!finally_body.is_empty())
+            .then(|| self.next_block("finally_err"))
+            .transpose()?;
+        let finally_return_id = (!finally_body.is_empty())
+            .then(|| self.next_block("finally_return"))
+            .transpose()?;
+        let after_id = self.next_block("try_after")?;
         let error_block = catch_id.or(finally_err_id).unwrap_or(after_id);
         let error_name = format!("__ku_error_{}", after_id.0);
         let return_name =
@@ -1838,24 +1875,33 @@ impl<'a> FunctionLowerer<'a> {
         // and every Result payload still shares one zeroed KuError owner.
         let error_ty = error_ir_type();
         self.locals.insert(error_name.clone(), error_ty.clone());
-        self.current.instructions.push(IrInst::Let {
-            name: error_name.clone(),
-            ty: error_ty.clone(),
-            value: zero_expr(error_ty),
-        });
+        emit_ir_instruction!(
+            self,
+            IrInst::Let {
+                name: error_name.clone(),
+                ty: error_ty.clone(),
+                value: zero_expr(error_ty),
+            }
+        );
         if let Some(name) = &return_name {
             self.locals.insert(name.clone(), self.return_type.clone());
-            self.current.instructions.push(IrInst::Let {
-                name: name.clone(),
-                ty: self.return_type.clone(),
-                value: zero_expr(self.return_type.clone()),
-            });
+            emit_ir_instruction!(
+                self,
+                IrInst::Let {
+                    name: name.clone(),
+                    ty: self.return_type.clone(),
+                    value: zero_expr(self.return_type.clone()),
+                }
+            );
         }
-        self.current.instructions.push(IrInst::BeginTry {
-            catch_block: catch_id,
-            finally_block: finally_id,
-            after_block: after_id,
-        });
+        emit_ir_instruction!(
+            self,
+            IrInst::BeginTry {
+                catch_block: catch_id,
+                finally_block: finally_id,
+                after_block: after_id,
+            }
+        );
         self.try_handlers.push(IrTryHandler {
             error_block,
             error_name: error_name.clone(),
@@ -1866,27 +1912,30 @@ impl<'a> FunctionLowerer<'a> {
         self.try_handlers.pop();
         body_result?;
         if self.current.terminator == IrTerminator::Next {
-            self.current.instructions.push(IrInst::EndTry);
+            emit_ir_instruction!(self, IrInst::EndTry);
             self.current.terminator = IrTerminator::Jump(finally_id.unwrap_or(after_id));
         }
-        self.finish_current();
+        self.finish_current()?;
 
         if let Some(catch_id) = catch_id {
             self.start_block(catch_id, "catch");
             self.with_local_scope(|lower| {
                 if let Some(name) = catch_name {
                     let name = lower.define_local(name, error_ir_type());
-                    lower.current.instructions.push(IrInst::BindError {
-                        name,
-                        result: IrExpr {
-                            kind: IrExprKind::Local(error_name.clone()),
-                            ty: lower
-                                .locals
-                                .get(&error_name)
-                                .cloned()
-                                .unwrap_or_else(|| IrType::Result(Box::new(IrType::Null))),
-                        },
-                    });
+                    emit_ir_instruction!(
+                        lower,
+                        IrInst::BindError {
+                            name,
+                            result: IrExpr {
+                                kind: IrExprKind::Local(error_name.clone()),
+                                ty: lower
+                                    .locals
+                                    .get(&error_name)
+                                    .cloned()
+                                    .unwrap_or_else(|| IrType::Result(Box::new(IrType::Null))),
+                            },
+                        }
+                    );
                 }
                 if let Some(finally_err_id) = finally_err_id {
                     lower.try_handlers.push(IrTryHandler {
@@ -1905,7 +1954,7 @@ impl<'a> FunctionLowerer<'a> {
             if self.current.terminator == IrTerminator::Next {
                 self.current.terminator = IrTerminator::Jump(finally_id.unwrap_or(after_id));
             }
-            self.finish_current();
+            self.finish_current()?;
         }
 
         if let Some(finally_id) = finally_id {
@@ -1914,7 +1963,7 @@ impl<'a> FunctionLowerer<'a> {
             if self.current.terminator == IrTerminator::Next {
                 self.current.terminator = IrTerminator::Jump(after_id);
             }
-            self.finish_current();
+            self.finish_current()?;
         }
 
         if let Some(finally_err_id) = finally_err_id {
@@ -1929,9 +1978,9 @@ impl<'a> FunctionLowerer<'a> {
                         .cloned()
                         .unwrap_or_else(|| IrType::Result(Box::new(IrType::Null))),
                 };
-                self.current.terminator = self.err_terminator(result);
+                self.current.terminator = self.err_terminator(result)?;
             }
-            self.finish_current();
+            self.finish_current()?;
         }
 
         if let Some(finally_return_id) = finally_return_id {
@@ -1942,9 +1991,9 @@ impl<'a> FunctionLowerer<'a> {
                     kind: IrExprKind::Local(name.clone()),
                     ty: self.return_type.clone(),
                 });
-                self.current.terminator = self.return_terminator(value);
+                self.current.terminator = self.return_terminator(value)?;
             }
-            self.finish_current();
+            self.finish_current()?;
         }
 
         self.start_block(after_id, "try_after");
@@ -2632,6 +2681,7 @@ impl<'a> FunctionLowerer<'a> {
         expected: Option<&IrType>,
         deferred_safepoint: &mut bool,
     ) -> KuResult<IrExpr> {
+        self.budget.borrow_mut().spend(1, expr.span)?;
         match &expr.kind {
             ExprKind::Field { target, name } if matches!(self.borrow_projection_type(target), Some(IrType::Named(ref n)) if self.layouts.structs.iter().any(|s| &s.name == n)) =>
             {
@@ -2684,6 +2734,8 @@ impl<'a> FunctionLowerer<'a> {
         modes: Option<&[ParamMode]>,
         callee_has_effects: bool,
     ) -> KuResult<Vec<IrExpr>> {
+        // Refuse wide argument staging before allocating the parallel vectors.
+        self.budget.borrow_mut().spend(args.len(), self.span)?;
         let first_argument_temp = self.next_temp_id;
         let effects = args
             .iter()
@@ -2736,7 +2788,7 @@ impl<'a> FunctionLowerer<'a> {
                     // The root-returning call has completed, but its result was
                     // not registered while that call was being lowered. Poll
                     // only after registration so timeout-finally also drops it.
-                    self.emit_safepoint();
+                    self.emit_safepoint()?;
                 }
                 values.push(IrExpr {
                     ty: value.ty.clone(),
@@ -2788,7 +2840,7 @@ impl<'a> FunctionLowerer<'a> {
         }
         let needs_safepoint = call.ty == IrType::Void || ir_expr_needs_post_call_safepoint(&call);
         let result = if call.ty == IrType::Void {
-            self.current.instructions.push(IrInst::Expr(call));
+            emit_ir_instruction!(self, IrInst::Expr(call));
             IrExpr {
                 kind: IrExprKind::Literal("0".into()),
                 ty: IrType::Void,
@@ -2797,30 +2849,34 @@ impl<'a> FunctionLowerer<'a> {
             self.emit_temp_with_safepoint(call, false)?
         };
         for owner in cleanup {
-            self.emit_borrow_temporary_drop(owner);
+            self.emit_borrow_temporary_drop(owner)?;
         }
         if needs_safepoint {
             if let Some(deferred) = deferred_safepoint {
                 *deferred = true;
             } else {
-                self.emit_safepoint();
+                self.emit_safepoint()?;
             }
         }
         Ok(result)
     }
 
-    fn emit_borrow_temporary_drop(&mut self, owner: IrExpr) {
-        self.current.instructions.push(IrInst::Expr(IrExpr {
-            ty: IrType::Void,
-            kind: IrExprKind::Call {
-                callee: Box::new(IrExpr {
-                    kind: IrExprKind::Local("__ku_drop_borrow_temp".into()),
-                    ty: IrType::Function,
-                }),
-                args: vec![owner],
-                kind: IrCallKind::Intrinsic("__ku_drop_borrow_temp".into()),
-            },
-        }));
+    fn emit_borrow_temporary_drop(&mut self, owner: IrExpr) -> KuResult<()> {
+        emit_ir_instruction!(
+            self,
+            IrInst::Expr(IrExpr {
+                ty: IrType::Void,
+                kind: IrExprKind::Call {
+                    callee: Box::new(IrExpr {
+                        kind: IrExprKind::Local("__ku_drop_borrow_temp".into()),
+                        ty: IrType::Function,
+                    }),
+                    args: vec![owner],
+                    kind: IrCallKind::Intrinsic("__ku_drop_borrow_temp".into()),
+                },
+            })
+        );
+        Ok(())
     }
 
     /// Recognize receiver-typed stdlib methods without executing a prospective
@@ -2972,6 +3028,7 @@ impl<'a> FunctionLowerer<'a> {
         expr: &Expr,
         mut deferred_safepoint: Option<&mut bool>,
     ) -> KuResult<IrExpr> {
+        self.budget.borrow_mut().spend(1, expr.span)?;
         match &expr.kind {
             // A backtick template must be desugared, not emitted as a literal: the
             // interpreter interpolates `{expr}` at run time, so native must too.
@@ -3603,18 +3660,21 @@ impl<'a> FunctionLowerer<'a> {
         let left = self.lower_expr(left)?;
         let result_name = format!("__ku_logical_{}", self.next_temp_id);
         self.next_temp_id += 1;
-        let right_id = self.next_block("logical_right");
-        let after_id = self.next_block("logical_after");
+        let right_id = self.next_block("logical_right")?;
+        let after_id = self.next_block("logical_after")?;
         let short_value = op == BinaryOp::Or;
 
         // This declaration dominates both successors. The skipped edge keeps the
         // operator's decisive value (`false` for &&, `true` for ||); only the RHS
         // edge overwrites it with the value it actually evaluates.
-        self.current.instructions.push(IrInst::Let {
-            name: result_name.clone(),
-            ty: IrType::Bool,
-            value: bool_literal(short_value),
-        });
+        emit_ir_instruction!(
+            self,
+            IrInst::Let {
+                name: result_name.clone(),
+                ty: IrType::Bool,
+                value: bool_literal(short_value),
+            }
+        );
         let (then_block, else_block) = if op == BinaryOp::And {
             (right_id, after_id)
         } else {
@@ -3625,18 +3685,21 @@ impl<'a> FunctionLowerer<'a> {
             then_block,
             else_block,
         };
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(right_id, "logical_right");
         let right = self.lower_expr(right)?;
-        self.current.instructions.push(IrInst::Store {
-            target: IrLValue::Local(result_name.clone()),
-            value: right,
-        });
+        emit_ir_instruction!(
+            self,
+            IrInst::Store {
+                target: IrLValue::Local(result_name.clone()),
+                value: right,
+            }
+        );
         if self.current.terminator == IrTerminator::Next {
             self.current.terminator = IrTerminator::Jump(after_id);
         }
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(after_id, "logical_after");
         Ok(IrExpr {
@@ -3665,6 +3728,7 @@ impl<'a> FunctionLowerer<'a> {
         expected: Option<&IrType>,
         deferred_safepoint: Option<&mut bool>,
     ) -> KuResult<IrExpr> {
+        self.budget.borrow_mut().spend(1, expr.span)?;
         if let (ExprKind::Call { callee, args }, Some(IrType::Result(expected_inner))) =
             (&expr.kind, expected)
         {
@@ -3822,6 +3886,7 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
         expected: Option<&[IrType]>,
     ) -> KuResult<IrExpr> {
+        self.budget.borrow_mut().spend(params.len(), span)?;
         let mut ir_params = Vec::with_capacity(params.len());
         for (index, param) in params.iter().enumerate() {
             let ty = if param.ty.is_some() {
@@ -3869,13 +3934,15 @@ impl<'a> FunctionLowerer<'a> {
             IrType::Unknown,
             self.next_function_id.clone(),
             self.lifted_functions.clone(),
-        );
+            self.budget.clone(),
+            span,
+        )?;
         child.captures = function_captures.iter().cloned().collect();
         child.local_names = aliases;
         for param in &ir_params {
             child.locals.insert(param.name.clone(), param.ty.clone());
         }
-        child.lower_block_body("entry", body, span, params)?;
+        child.lower_block_body("entry", body, params)?;
 
         // Recover the real return type from a source return. Cooperative timeout
         // blocks are lowered while this child still has an Unknown seed, so their
@@ -3932,6 +3999,9 @@ impl<'a> FunctionLowerer<'a> {
     /// (see `self_recurse`), keeping the env free of a self-reference — no RC
     /// cycle, no leak.
     fn lower_local_function(&mut self, function: &crate::ast::FnDecl) -> KuResult<()> {
+        self.budget
+            .borrow_mut()
+            .spend(function.params.len(), function.span)?;
         let name = function.name.clone();
         // Allocate the lifted function id first so the body can reference it for
         // self-recursive calls while it is still being lowered.
@@ -3986,7 +4056,9 @@ impl<'a> FunctionLowerer<'a> {
             return_type.clone(),
             self.next_function_id.clone(),
             self.lifted_functions.clone(),
-        );
+            self.budget.clone(),
+            function.span,
+        )?;
         child.captures = function_captures.iter().cloned().collect();
         child.local_names = aliases;
         for param in &ir_params {
@@ -3995,7 +4067,7 @@ impl<'a> FunctionLowerer<'a> {
         // Wire self-recursion: a call to `name` in the body reuses the running env.
         child.self_recurse = Some((name.clone(), cid, return_type.clone()));
         child.self_param_modes = ir_params.iter().map(|p| p.mode).collect();
-        child.lower_block_body("entry", &function.body, function.span, &function.params)?;
+        child.lower_block_body("entry", &function.body, &function.params)?;
 
         let param_modes = ir_params.iter().map(|p| p.mode).collect();
         self.lifted_functions.borrow_mut().push(IrFunction {
@@ -4022,11 +4094,14 @@ impl<'a> FunctionLowerer<'a> {
             ty: closure_ty.clone(),
         })?;
         let name = self.define_local(&name, closure_ty.clone());
-        self.current.instructions.push(IrInst::Let {
-            name,
-            ty: closure_ty,
-            value,
-        });
+        emit_ir_instruction!(
+            self,
+            IrInst::Let {
+                name,
+                ty: closure_ty,
+                value,
+            }
+        );
         Ok(())
     }
 
@@ -4074,13 +4149,16 @@ impl<'a> FunctionLowerer<'a> {
         let ty = value.ty.clone();
         let borrowed = ir_expr_is_borrowed(&value) && ir_type_is_owned(&ty);
         let needs_safepoint = post_call_safepoint && ir_expr_needs_post_call_safepoint(&value);
-        self.current.instructions.push(IrInst::Temp {
-            id,
-            ty: ty.clone(),
-            value,
-        });
+        emit_ir_instruction!(
+            self,
+            IrInst::Temp {
+                id,
+                ty: ty.clone(),
+                value,
+            }
+        );
         if needs_safepoint {
-            self.emit_safepoint();
+            self.emit_safepoint()?;
         }
         Ok(IrExpr {
             kind: if borrowed {
@@ -4099,14 +4177,14 @@ impl<'a> FunctionLowerer<'a> {
     /// visits `finally_return` (and then any enclosing finally) before leaving the
     /// frame. The TLS timeout flag remains set so callers repeat this structured
     /// unwind and the HTTP worker alone emits 504.
-    fn emit_safepoint(&mut self) {
-        let continue_block = self.next_block("safepoint_continue");
-        let timeout_block = self.next_block("safepoint_timeout");
+    fn emit_safepoint(&mut self) -> KuResult<()> {
+        let continue_block = self.next_block("safepoint_continue")?;
+        let timeout_block = self.next_block("safepoint_timeout")?;
         self.current.terminator = IrTerminator::Safepoint {
             continue_block,
             timeout_block,
         };
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(timeout_block, "safepoint_timeout");
         // A timeout abandons every active argument evaluation in this frame.
@@ -4119,14 +4197,15 @@ impl<'a> FunctionLowerer<'a> {
             .map(|pending| pending.owner.clone())
             .collect::<Vec<_>>();
         for owner in abandoned {
-            self.emit_borrow_temporary_drop(owner);
+            self.emit_borrow_temporary_drop(owner)?;
         }
         let timeout_value =
             (self.return_type != IrType::Void).then(|| zero_expr(self.return_type.clone()));
-        self.current.terminator = self.return_terminator(timeout_value);
-        self.finish_current();
+        self.current.terminator = self.return_terminator(timeout_value)?;
+        self.finish_current()?;
 
         self.start_block(continue_block, "safepoint_continue");
+        Ok(())
     }
 
     /// Stage 6b: build a `CellLoad` over `pointer` (a `Local`/`CapturedCell`
@@ -4193,24 +4272,23 @@ impl<'a> FunctionLowerer<'a> {
         define_boxed: bool,
     ) -> KuResult<()> {
         if let Some(cell) = self.assignment_cell(name) {
-            self.current
-                .instructions
-                .push(IrInst::CellStore { cell, value });
+            emit_ir_instruction!(self, IrInst::CellStore { cell, value });
         } else if define_boxed && !self.locals.contains_key(self.local_ir_name(name)) {
             // First assignment to a to-be-boxed local: allocate its cell.
             let inner = value.ty.clone();
             self.push_cell_new(name.to_string(), inner, value, span)?;
         } else if self.locals.contains_key(self.local_ir_name(name)) {
-            self.current.instructions.push(IrInst::Store {
-                target: IrLValue::Local(self.local_ir_name(name).to_string()),
-                value,
-            });
+            emit_ir_instruction!(
+                self,
+                IrInst::Store {
+                    target: IrLValue::Local(self.local_ir_name(name).to_string()),
+                    value,
+                }
+            );
         } else {
             let ty = value.ty.clone();
             let name = self.define_local(name, ty.clone());
-            self.current
-                .instructions
-                .push(IrInst::Let { name, ty, value });
+            emit_ir_instruction!(self, IrInst::Let { name, ty, value });
         }
         Ok(())
     }
@@ -4233,11 +4311,14 @@ impl<'a> FunctionLowerer<'a> {
             ));
         }
         let name = self.define_local(&name, IrType::Cell(Box::new(inner.clone())));
-        self.current.instructions.push(IrInst::CellNew {
-            name,
-            ty: inner,
-            init,
-        });
+        emit_ir_instruction!(
+            self,
+            IrInst::CellNew {
+                name,
+                ty: inner,
+                init,
+            }
+        );
         Ok(())
     }
 
@@ -4265,12 +4346,12 @@ impl<'a> FunctionLowerer<'a> {
         let origin = self.current.id;
         let result_name = format!("__ku_match_{}", self.next_temp_id);
         self.next_temp_id += 1;
-        let after_id = self.next_block("match_after");
+        let after_id = self.next_block("match_after")?;
         let mut result_ty = None;
 
         for arm in arms {
-            let arm_id = self.next_block("match_arm");
-            let next_id = self.next_block("match_next");
+            let arm_id = self.next_block("match_arm")?;
+            let next_id = self.next_block("match_next")?;
             let mut bindings = HashMap::new();
             let condition =
                 self.lower_match_pattern(&arm.pattern, subject.clone(), &mut bindings)?;
@@ -4279,7 +4360,7 @@ impl<'a> FunctionLowerer<'a> {
                 then_block: arm_id,
                 else_block: next_id,
             };
-            self.finish_current();
+            self.finish_current()?;
 
             self.start_block(arm_id, "match_arm");
             let mut binding_names = bindings.keys().cloned().collect::<Vec<_>>();
@@ -4302,13 +4383,13 @@ impl<'a> FunctionLowerer<'a> {
             }
             if let Some(guard) = &arm.guard {
                 let guard = self.lower_expr(guard)?;
-                let value_id = self.next_block("match_value");
+                let value_id = self.next_block("match_value")?;
                 self.current.terminator = IrTerminator::Branch {
                     condition: guard,
                     then_block: value_id,
                     else_block: next_id,
                 };
-                self.finish_current();
+                self.finish_current()?;
                 self.start_block(value_id, "match_value");
             }
             let arm_value = self.lower_expr(&arm.value)?;
@@ -4327,27 +4408,33 @@ impl<'a> FunctionLowerer<'a> {
             // run the arm's expression for its side effects instead of storing it
             // into a (would-be `void`) result local.
             if arm_value.ty == IrType::Void {
-                self.current.instructions.push(IrInst::Expr(arm_value));
+                emit_ir_instruction!(self, IrInst::Expr(arm_value));
             } else {
-                self.current.instructions.push(IrInst::Store {
-                    target: IrLValue::Local(result_name.clone()),
-                    value: arm_value,
-                });
+                emit_ir_instruction!(
+                    self,
+                    IrInst::Store {
+                        target: IrLValue::Local(result_name.clone()),
+                        value: arm_value,
+                    }
+                );
             }
             if self.current.terminator == IrTerminator::Next {
                 self.current.terminator = IrTerminator::Jump(after_id);
             }
-            self.finish_current();
+            self.finish_current()?;
             self.pop_pattern_bindings(pattern_undo);
             self.start_block(next_id, "match_next");
         }
 
-        self.current.instructions.push(IrInst::Panic(IrExpr {
-            kind: IrExprKind::Literal("\"match expression did not match any arm\"".to_string()),
-            ty: IrType::Str,
-        }));
+        emit_ir_instruction!(
+            self,
+            IrInst::Panic(IrExpr {
+                kind: IrExprKind::Literal("\"match expression did not match any arm\"".to_string()),
+                ty: IrType::Str,
+            })
+        );
         self.current.terminator = IrTerminator::Unreachable;
-        self.finish_current();
+        self.finish_current()?;
 
         let ty =
             result_ty.ok_or_else(|| KuError::runtime("match requires at least one arm", span))?;
@@ -4364,6 +4451,10 @@ impl<'a> FunctionLowerer<'a> {
             .iter_mut()
             .find(|block| block.id == origin)
             .ok_or_else(|| KuError::runtime("missing match origin block", span))?;
+        // Match inserts into an already finalized origin, not current.
+        self.budget
+            .borrow_mut()
+            .instruction(origin_block.instructions.len(), span)?;
         origin_block.instructions.push(IrInst::Let {
             name: result_name.clone(),
             ty: ty.clone(),
@@ -4382,6 +4473,7 @@ impl<'a> FunctionLowerer<'a> {
         value: IrExpr,
         bindings: &mut HashMap<String, IrExpr>,
     ) -> KuResult<IrExpr> {
+        self.budget.borrow_mut().spend(1, self.span)?;
         match pattern {
             MatchPattern::Wildcard => Ok(bool_literal(true)),
             MatchPattern::Binding(name) => {
@@ -4458,32 +4550,35 @@ impl<'a> FunctionLowerer<'a> {
         };
         let id = TempId(self.next_temp_id);
         self.next_temp_id += 1;
-        let ok_block = self.next_block("try_ok");
-        let err_block = self.next_block("try_err");
+        let ok_block = self.next_block("try_ok")?;
+        let err_block = self.next_block("try_err")?;
         self.current.terminator = IrTerminator::ResultBranch {
             result: result.clone(),
             ok_block,
             err_block,
         };
-        self.finish_current();
+        self.finish_current()?;
 
         self.start_block(err_block, "try_err");
-        self.current.terminator = self.err_terminator(result.clone());
-        self.finish_current();
+        self.current.terminator = self.err_terminator(result.clone())?;
+        self.finish_current()?;
 
         self.start_block(ok_block, "try_ok");
-        self.current.instructions.push(IrInst::BindOk {
-            id,
-            ty: ty.clone(),
-            result,
-        });
+        emit_ir_instruction!(
+            self,
+            IrInst::BindOk {
+                id,
+                ty: ty.clone(),
+                result,
+            }
+        );
         Ok(IrExpr {
             kind: IrExprKind::Temp(id),
             ty,
         })
     }
 
-    fn err_terminator(&mut self, result: IrExpr) -> IrTerminator {
+    fn err_terminator(&mut self, result: IrExpr) -> KuResult<IrTerminator> {
         let error_block = self.try_handlers.last().map(|handler| handler.error_block);
         let aborted = self
             .pending_borrow_temporaries
@@ -4493,7 +4588,7 @@ impl<'a> FunctionLowerer<'a> {
             .map(|pending| pending.owner.clone())
             .collect::<Vec<_>>();
         for owner in aborted {
-            self.emit_borrow_temporary_drop(owner);
+            self.emit_borrow_temporary_drop(owner)?;
         }
         // Do not remove compile-time records here: the sibling success edge
         // still owns them and emits its normal post-call cleanup.
@@ -4520,28 +4615,34 @@ impl<'a> FunctionLowerer<'a> {
         if let Some(handler) = self.try_handlers.last().cloned() {
             let error_name = handler.error_name;
             if self.locals.contains_key(&error_name) {
-                self.current.instructions.push(IrInst::Store {
-                    target: IrLValue::Local(error_name.clone()),
-                    value: error_value,
-                });
+                emit_ir_instruction!(
+                    self,
+                    IrInst::Store {
+                        target: IrLValue::Local(error_name.clone()),
+                        value: error_value,
+                    }
+                );
             } else {
                 self.locals.insert(error_name.clone(), error_ty.clone());
-                self.current.instructions.push(IrInst::Let {
-                    name: error_name,
-                    ty: error_ty,
-                    value: error_value,
-                });
+                emit_ir_instruction!(
+                    self,
+                    IrInst::Let {
+                        name: error_name,
+                        ty: error_ty,
+                        value: error_value,
+                    }
+                );
             }
-            IrTerminator::JumpErr {
+            Ok(IrTerminator::JumpErr {
                 result,
                 target: handler.error_block,
-            }
+            })
         } else {
-            IrTerminator::PropagateErr(result)
+            Ok(IrTerminator::PropagateErr(result))
         }
     }
 
-    fn return_terminator(&mut self, value: Option<IrExpr>) -> IrTerminator {
+    fn return_terminator(&mut self, value: Option<IrExpr>) -> KuResult<IrTerminator> {
         // A catch-only inner try has no return cleanup of its own, but it
         // cannot hide an enclosing finally. Select the closest actual finally
         // together with its matching return owner slot. Error propagation still
@@ -4552,21 +4653,33 @@ impl<'a> FunctionLowerer<'a> {
             .rev()
             .find_map(|handler| handler.return_block.map(|block| (handler.clone(), block)))
         else {
-            return IrTerminator::Return(value);
+            return Ok(IrTerminator::Return(value));
         };
         if let (Some(name), Some(value)) = (handler.return_name, value) {
-            self.current.instructions.push(IrInst::Store {
-                target: IrLValue::Local(name),
-                value,
-            });
+            emit_ir_instruction!(
+                self,
+                IrInst::Store {
+                    target: IrLValue::Local(name),
+                    value,
+                }
+            );
         }
-        IrTerminator::Jump(return_block)
+        Ok(IrTerminator::Jump(return_block))
     }
 
-    fn next_block(&mut self, _name: &str) -> BlockId {
+    fn admit_instruction(&mut self) -> KuResult<()> {
+        self.budget
+            .borrow_mut()
+            .instruction(self.current.instructions.len(), self.span)
+    }
+
+    fn next_block(&mut self, _name: &str) -> KuResult<BlockId> {
+        self.budget
+            .borrow_mut()
+            .block(self.next_block_id, self.span)?;
         let id = BlockId(self.next_block_id);
         self.next_block_id += 1;
-        id
+        Ok(id)
     }
 
     fn start_block(&mut self, id: BlockId, name: &str) {
@@ -4578,7 +4691,12 @@ impl<'a> FunctionLowerer<'a> {
         };
     }
 
-    fn finish_current(&mut self) {
+    fn finish_current(&mut self) -> KuResult<()> {
+        // next_block already paid for this ID; the placeholder created below is
+        // not an emitted block and must not consume another admission token.
+        self.budget
+            .borrow_mut()
+            .finish_block(self.blocks.len(), self.span)?;
         let mut next = IrBlock {
             id: BlockId(self.next_block_id),
             name: format!("block{}", self.next_block_id),
@@ -4587,6 +4705,7 @@ impl<'a> FunctionLowerer<'a> {
         };
         std::mem::swap(&mut self.current, &mut next);
         self.blocks.push(next);
+        Ok(())
     }
 }
 
