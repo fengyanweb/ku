@@ -7,6 +7,8 @@ use output::COutput;
 
 #[path = "c_task.rs"]
 mod task;
+#[path = "c_task_control.rs"]
+mod task_control;
 
 // Whole generated-file bytes, including shared runtimes and all specializations.
 // This is independent of the checker's generic AST/type admission budget.
@@ -230,6 +232,9 @@ pub fn generate_task_frame_c_source(
             name.starts_with("ku_task_frame_")
                 || name.starts_with("KuTaskFrame")
                 || name.starts_with("KU_TASK_FRAME_")
+                || name.starts_with("ku_task_control_")
+                || name.starts_with("KuTaskControl")
+                || name.starts_with("KU_TASK_CONTROL_")
         })
     {
         return Err(unsupported(
@@ -484,6 +489,8 @@ fn generate_c_source_with_frames_bounded(
     if !closure_types_present.is_empty()
         || program_uses_object(program)
         || program_uses_http(program)
+        // Task controls reuse the atomic representation even with no closures.
+        || frames.is_some_and(|(frames, _)| !frames.functions.is_empty())
     {
         emit_closure_refcount_header(&mut out);
         closure_header_done = true;
