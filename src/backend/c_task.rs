@@ -33,6 +33,7 @@ pub(super) fn emit_frames(
     }
     out.check()?;
     out.push_str(FRAME_ABI);
+    super::task_control::emit_runtime(out)?;
     for function in &tasks.functions {
         out.check()?;
         let frame = plan
