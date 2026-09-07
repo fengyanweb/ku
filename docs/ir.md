@@ -205,8 +205,9 @@ typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 
 这是后续源码 TaskStart/Await 的基础，不是 M:N、netpoll 或事件驱动 HTTP。
 
 接纳顺序为 reserve → 构造 control/frame → commit；内部容量最多 1024，计数和预留
-字节同时限流，失败不消费用户输入。control/pin 尚未安装时才能 rollback；安装后
-失败必须 commit(ABORT)，交给可信 adapter 清理部分初始化 frame。BUILDING 也占用
+字节同时限流，失败不消费用户输入。只有没有活跃 control/pin、没有已登记 control
+时才能 rollback；可信 builder 可先经 R2 完整销毁未发布 control，否则必须
+commit(ABORT)，交给可信 adapter 清理部分初始化 frame。BUILDING 也占用
 resident，shutdown 不能假装它不存在。相同 driver 重复绑定 control 会拒绝；跨 driver
 仍要求可信 builder 提供唯一、尚未发布的 control，这不是开放给 Ku 用户的裸能力。
 
@@ -234,6 +235,32 @@ Windows 还验证线程句柄结束；POSIX 最终 join 不是可硬限时的 po
 
 `native_task_driver_test` 的 adapter 仍是测试夹具。源 Task 句柄、父子 scope drain、
 用户 finally、I/O/timer/blocking、M:N 和压力/soak 需要后续独立执行证据，不能由该测试替代。
+
+### R4 生成的 typed factory/handle（尚无源码接入）
+
+`src/backend/c_task_adapter.rs` 在全部内部 frame 定义之后按需生成每函数的
+`KuTaskInstance_N`、`KuTaskHandle_N` 及创建、取值、move、drop adapter；不是公开
+C FFI，也不新增用户 Task API。普通同步产物和空 Task IR 不生成这些代码。
+
+内部 try_start 先校验输入/输出区间与类型，按 inline instance 和活动 Owned 字符串
+容量 checked 接纳，只分配一个包含 control/frame/payload 的块。STATIC 字符串不计
+Owned 分配；现有空串 concat 的一字节分配按一字节计费。Result 只检查和计费活动
+分支。成功发布前没有 runnable 泄露，普通创建失败保持 Copy 输入、恢复移动参数，
+未发布 control 经 R2 完整清理后再退 BUILDING 预算。关闭与已接纳创建竞争时，
+成功返回的是真实但可能已取消的 Task，不能再把参数恢复给调用者。
+
+take 是非阻塞一次尝试，唯一移动 typed Result，随后仍须处理 owner；drop 只在
+driver 成功接管责任后清空 handle，不代表子任务清理已经完成。两者复用 R3 的
+发布后通知。具体 callback 身份先于 typed instance 转换校验；整个 handle、runtime
+存储及已知活动字符串别名先于输出头部读取拒绝。raw caller 仍须提供独立、有效、
+唯一拥有的完整存储；范围校验不是任意 C 指针安全保证，也不无锁检查运行中的 frame。
+
+cleanup 每个 safepoint 读取 live 最短 deadline，保留取消/超时原因；adapter 单次
+观测到坏钟也进入 driver 的持续故障清理。裸 Suspend 仅映射 YIELD，不伪造没有
+事件源的 WAIT。Task IR 的 Start/Await、等待登记、父子作用域清理及源码 lowering
+仍未接入；这里不提供 array/object/struct/enum/closure Task payload 或增长堆预算。
+生成代码和参数检查沿用现有函数/槽/输出上限，不表示 64 MiB C artifact 上限等于
+编译器 RSS 上限。实际测试证据见 [阶段工作日志](v0.0.18-worklog.md)。
 
 ## IR 优化队列
 

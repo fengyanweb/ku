@@ -18,8 +18,9 @@ const DRIVER_ABI: &str = r#"
  * generation-checked bindings, not unprotected pointers to control objects.
  * Controls may be accessed concurrently only through distinct live R2 leases.
  *
- * reserve consumes no input. rollback is legal ONLY before a control/pin is
- * installed. Once initialized, a failed builder uses commit(ABORT) with a
+ * reserve consumes no input. rollback is legal ONLY with no live control/pin
+ * and no registered control. A trusted builder may first fully dispose an
+ * unpublished control through R2; otherwise it uses commit(ABORT) with a
  * trusted adapter able to clean its partially initialized frame. START preserves
  * owner, ABORT consumes it; neither exposes a control without both registry and
  * execution leases. A builder supplies a unique unpublished control, never a

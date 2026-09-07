@@ -285,10 +285,21 @@ fn sparse_parameters_frame() -> TaskFunction {
 #[test]
 fn native_task_frame_emission_preserves_sync_output_and_fail_closed_cli_boundary() {
     let program = sync_program("fn main() {}");
+    let synchronous = c::generate_c_source(&program).unwrap();
     assert_eq!(
-        c::generate_c_source(&program).unwrap(),
+        synchronous,
         c::generate_task_frame_c_source(&program, &TaskProgram { functions: vec![] }).unwrap()
     );
+    for internal in [
+        "KuTaskAdapter",
+        "KuTaskInstance_",
+        "KuTaskHandle_",
+        "ku_task_driver_",
+        "ku_task_control_",
+        "ku_task_frame_",
+    ] {
+        assert!(!synchronous.contains(internal), "unexpected {internal}");
+    }
     let tasks = frames();
     let plan = verify_and_plan(&tasks, TaskLimits::default()).unwrap();
     assert_eq!(
@@ -327,6 +338,12 @@ fn native_task_frame_emission_preserves_sync_output_and_fail_closed_cli_boundary
         "ku_task_driver_init",
         "KuTaskDriverV1",
         "KU_TASK_DRIVER_OK",
+        "ku_task_adapter_now",
+        "KuTaskAdapterClockV1",
+        "KU_TASK_ADAPTER_OUT_OF_MEMORY",
+        "KuTaskInstance_0",
+        "KuTaskHandle_0",
+        "ku_task_0_try_start",
     ] {
         let collision = sync_program(&format!("fn {name}(): int {{ return 1 }} fn main() {{}}"));
         assert!(c::generate_task_frame_c_source(&collision, &tasks)

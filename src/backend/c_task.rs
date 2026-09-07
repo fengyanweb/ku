@@ -44,6 +44,7 @@ pub(super) fn emit_frames(
             .ok_or_else(|| unsupported("native task frame plan is missing a function"))?;
         FrameEmitter::new(function, frame)?.emit(out)?;
     }
+    super::task_adapter::emit_adapters(out, tasks)?;
     out.check()
 }
 
@@ -549,7 +550,7 @@ fn drop_statement(ty: &IrType, place: &str) -> KuResult<String> {
 
 // Empty typed output is checked by fields, not indeterminate C struct padding.
 // This neither dereferences payload pointers nor drops an existing output.
-fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
+pub(super) fn empty_value_expr(ty: &IrType, place: &str) -> KuResult<String> {
     match ty {
         IrType::Int | IrType::Bool | IrType::Null => Ok(format!("({place}) == 0")),
         IrType::Str => Ok(format!(
