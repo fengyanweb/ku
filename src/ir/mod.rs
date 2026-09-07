@@ -1831,6 +1831,18 @@ impl<'a> FunctionLowerer<'a> {
         let error_name = format!("__ku_error_{}", after_id.0);
         let return_name =
             (self.return_type != IrType::Void).then(|| format!("__ku_return_{}", after_id.0));
+        // The handler's shared bare Error owner must dominate every error edge.
+        // A lazy declaration at the first lowered fail/? can live in a dead
+        // finally copy while another reachable copy only stores into the slot.
+        // Initialize here so CFG pruning cannot remove the sole declaration,
+        // and every Result payload still shares one zeroed KuError owner.
+        let error_ty = error_ir_type();
+        self.locals.insert(error_name.clone(), error_ty.clone());
+        self.current.instructions.push(IrInst::Let {
+            name: error_name.clone(),
+            ty: error_ty.clone(),
+            value: zero_expr(error_ty),
+        });
         if let Some(name) = &return_name {
             self.locals.insert(name.clone(), self.return_type.clone());
             self.current.instructions.push(IrInst::Let {
