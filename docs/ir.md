@@ -199,8 +199,8 @@ typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 
 
 ### R3 内部单 worker driver（尚无源码接入）
 
-`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v2。
-R5a 增加固定等待字段后版本升为 2；内部 C 类型名中的 `V1` 不是旧布局兼容承诺，
+`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v3。
+R5a 固定等待字段采用版本 2，R5b.1 清理水位再升为 3；内部 C 类型名中的 `V1` 不是旧布局兼容承诺，
 初始化明确拒绝旧版本。独立 frame/control ABI 仍为 v1。
 普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
 以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
@@ -283,9 +283,30 @@ slot 锁存，不解引用已经释放或复用的子任务；旧 token 不得�
 不匹配的其他等待。已知 header 别名先于输出内容读取拒绝；raw C 调用者仍须提供
 有效、完整、独立且同步访问的存储，整数范围检查不证明任意指针安全。
 
-本片只实现结果就绪等待，不实现逻辑 cleanup ACK、owner 转交收据、父 scope drain
+本片只实现结果就绪等待，不实现逻辑 cleanup ACK 等待、父 scope drain
 或源码 Await。最终 dispose/预算归还与逻辑清理完成是不同事件，迟到观察 lease
 不能成为未来父作用域清理等待的条件。具体执行证据见阶段工作日志。
+
+### R5b.1 逻辑清理收据（尚无 scope drain）
+
+内部 owner_drop_receipt 复用原 owner-drop 事务；仅在唯一 owner 确实移入固定 deferred
+slot 后，同锁签发完整收据。预检拒绝非空/未对齐输出和已知 header 别名，不取消或
+消费输入。收据不持引用、不分配、不提供用户接口；raw 调用者必须独立保护 driver
+存储，不得从裸 ticket 伪造收据或在 driver 销毁后使用它。
+
+worker 在实际终态 poll 返回后检查 frame 已销毁、pin 已释放、owner 已释放、没有
+活动 wrapper，且 payload 不再 AVAILABLE/TAKING，才发布该 generation 的清理水位。
+此时只确认逻辑清理；迟到 observer 仍使 instance 与 charged bytes 保留，最终实际
+free 之后才归还预算。水位跨 dispose/slot 复用和 BUILDING rollback 保存；rollback
+不推进水位。有效旧收据只读水位即可确认 ACK，无需访问已释放或新占用的 control。
+ABI 标记不认证恶意 raw C；水位也不是任意旧 generation 的历史结果或时间戳日志。
+ACK 校验遇到不可能状态时，该 slot 锁存 INTERNAL；有效收据明确返回错误，任务不再
+重复 poll，也不得归还其 lease/预算。其他任务的有效清理仍可得到 ACK，全局时钟故障
+不会被误当作所有收据均失败。故障隔离不是可恢复取消，也不允许强行 free。
+
+本片只提供收据签发和查询，不添加 ACK park/wake、独立 scope deadline、全部兄弟
+先取消的 drain continuation、Task IR Start/Await 或源码入口。运行验证范围和故障
+处理以阶段工作日志为准，不能把 receipt ACK 当成整个递归子树物理释放或 Task 成功。
 
 ## IR 优化队列
 
