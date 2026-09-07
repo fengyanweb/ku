@@ -379,6 +379,9 @@ private READY 先保存返回 Result；所有 sibling 先移交到固定 driver 
 不逐个续期。正常超期 drop 暂存 Result，返回外层 `task/shutdown_timeout`，不取消正常父；
 取消胜出时 drop 私有结果并保留原取消原因。取消中的 ACK continuation 不放宽用户 cleanup 禁 Await。
 正常 Await 不开启新的 scope deadline；root 通过真实条件等待取值，不递归 poll child。
+外层 `RUNTIME_FAILURE` 跨 Await 传播时，即使内层 final drain 已按期收到全部 ACK，
+仍传递该次原始/收紧后的 D，祖先后续清理只能取更小值，不能重新计时。普通用户
+Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复错误的语义。
 
 源码与两种 CLI native 构建的定向执行已经通过；R5c 本机回归通过，但其精确提交的
 三系统 CI 中 Linux/macOS 与 PR sanitizer 有失败，修复后的完整验证仍未完成，实际结果见工作日志。

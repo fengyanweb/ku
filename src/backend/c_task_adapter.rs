@@ -395,6 +395,13 @@ static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reaso
     instance->drain_started=1;
   }
   if (instance->drain_started) instance->drain_deadline=ku_task_host_deadline(&host,instance->drain_deadline,0);
+  /* Runtime unwind carries its original/minimum scope budget across Await,
+   * even when this scope has already received every cleanup ACK. Ordinary
+   * user Results do not propagate the budget of a successfully ended scope. */
+  if (instance->exit_class==KU_TASK_EXIT_RUNTIME_FAILURE && instance->drain_started) {
+    instance->has_cleanup_deadline=1;
+    instance->cleanup_deadline=instance->drain_deadline;
+  }
 @TRANSFERS@
   /* Every sibling was durably transferred before any Value cleanup/ACK wait. */
   if (instance->drain_started && (!instance->drain_deadline_published
