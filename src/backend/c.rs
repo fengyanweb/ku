@@ -17895,7 +17895,8 @@ fn emit_drop_expr(out: &mut COutput, ty: &IrType, expression: &str) -> KuResult<
             // env header). A NULL env (no captures, or a moved-from closure) is a
             // no-op. env release cascades into releasing each captured cell.
             out.push_str(&format!(
-                "  if (({expression}).env) ((KuEnvHeader*)({expression}).env)->release(({expression}).env);\n"
+                "  if (({expression}).env) ((KuEnvHeader*)({expression}).env)->release(({expression}).env);\n  {expression} = {};\n",
+                c_zero_value(ty)?,
             ));
             Ok(())
         }
