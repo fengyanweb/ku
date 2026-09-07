@@ -63,6 +63,24 @@ ku ir examples\function.ku
 - 闭包/function value native ABI 已具备 typed invoke pointer、局部 RC env 和按需共享 cell。参数路径直接覆盖 Copy、`str`、array、函数值、struct、enum 与 Result，普通局部路径另覆盖 object 与 KuValue；catch/match binding、local-function self、`for` 迭代变量、Task 捕获和 async 函数值仍是明确拒绝的边界。有限源码 Task 不通过 closure ABI 实现。dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同。
 - 暂不做 SSA、寄存器分配和完整 native ABI lowering。
 
+## 同步 IR 构建数量预算（0.0.18 开发中）
+
+同步 lowering 在构建期间接纳块和指令，而不是等 finally 全部展开后才检查大小。
+每函数最多10,000个块（包含入口和最后一个块），每个块最多10,000条指令；全程序
+共享262,144个 construction work token。块、指令、statement/expression 访问和若干
+参数批次计费，同一 AST 因 finally 或推断重复下降会重复计费。无返回注解函数的
+推断 probe 与正式 lowering、提升闭包均共享额度；丢弃 probe 不退款，首次资源错误
+立即返回，不被旧的推断 fallback 吞掉。
+
+这是实验期新增的数量限制：原实现只在结束时检查最后一块指令数，并可能放入
+第10,001个块；现在早期大块及累计大量小函数也会被拒绝。正常错误推断 fallback
+不变，遇到资源上限时错误优先顺序可能收紧。无新用户配置或写法。
+
+此预算不是 CPU 指令计数、字节/RSS 或 OOM 恢复合同。literal/type 的复制字节、
+capture/layout 等只读扫描以及模板旧合成 AST 深度仍是单独的未完成边界；不能宣称
+所有 clone/collect 都已在分配前获得额度。定向边界和自举回归已通过，完整集合和
+精确新提交三系统 CI 仍按 [工作日志](v0.0.18-worklog.md) 单独验收。
+
 ## 同步只读借用参数（0.0.17 首版实验合同）
 
 AST 与 `IrParam` 保存 `ParamMode::Owned` / `ParamMode::View`。`View` 只是编译器内部名称，源码写 `&name: T`。`IrType::Closure` 在参数类型之外保存等长的 `param_modes`；直接调用、typed invoke、局部函数递归和 import 展开都保留槽位模式。函数类型精确匹配模式，不生成 owned / borrowed adapter。
