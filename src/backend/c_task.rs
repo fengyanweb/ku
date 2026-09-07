@@ -369,6 +369,23 @@ impl<'a> FrameEmitter<'a> {
             TaskOp::Read { slot } => {
                 out.push_str(&format!("  (void)({});\n", self.place(*slot)));
             }
+            TaskOp::WrapOk { dst, src } => {
+                let payload = if self.owns_slot(*src) {
+                    c_move_value(self.slot_type(*src)?, &self.place(*src))?
+                } else {
+                    self.place(*src)
+                };
+                out.push_str(&format!(
+                    "  {} = ({}){{ true, {}, (KuError){{0}} }};\n",
+                    self.place(*dst),
+                    c_type(self.slot_type(*dst)?)?,
+                    payload,
+                ));
+                if self.owns_slot(*src) {
+                    self.set_init(out, *src, false);
+                }
+                self.set_init(out, *dst, true);
+            }
             TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
                 self.emit_slot_drop(out, *slot)?;
             }

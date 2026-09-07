@@ -144,6 +144,136 @@ fn native_task_frame_ir_accepts_exact_r1_primitive_results() {
 }
 
 #[test]
+fn native_task_frame_ir_wrap_ok_copies_scalars_and_moves_owned_strings() {
+    for ty in [IrType::Int, IrType::Bool, IrType::Null, IrType::Str] {
+        let mut fixture = program(
+            vec![ty.clone(), result(ty.clone())],
+            &[0],
+            vec![state(
+                vec![TaskOp::WrapOk {
+                    dst: SlotId(1),
+                    src: SlotId(0),
+                }],
+                complete(1),
+            )],
+        );
+        fixture.functions[0].result = result(ty.clone());
+        accepted(&fixture);
+        fixture.functions[0].states[0].operations.push(read(0));
+        if ty == IrType::Str {
+            rejected(&fixture, "owned ok payload has moved from its source");
+        } else {
+            accepted(&fixture);
+        }
+        fixture.functions[0].states[0].operations.pop();
+        fixture.functions[0].parameters.clear();
+        rejected(&fixture, "ok cannot read an uninitialized payload");
+    }
+}
+
+#[test]
+fn native_task_frame_ir_wrap_ok_rejects_type_borrow_and_overwrite_errors() {
+    let mut fixture = program(
+        vec![IrType::Str, result(IrType::Str)],
+        &[0],
+        vec![state(
+            vec![TaskOp::WrapOk {
+                dst: SlotId(1),
+                src: SlotId(0),
+            }],
+            complete(1),
+        )],
+    );
+    fixture.functions[0].result = result(IrType::Str);
+    accepted(&fixture);
+    fixture.functions[0].parameters.push(SlotId(1));
+    rejected(&fixture, "ok must not overwrite an owned Result");
+    fixture.functions[0].parameters.pop();
+    fixture.functions[0].slots[0].ty = TaskSlotType::Value {
+        ty: IrType::Int,
+        borrowed: false,
+    };
+    rejected(&fixture, "ok payload type must match Result");
+    fixture.functions[0].slots[0].ty = TaskSlotType::Value {
+        ty: result(IrType::Str),
+        borrowed: false,
+    };
+    rejected(&fixture, "ok must not add a nested Result layer");
+    fixture.functions[0].slots[0].ty = TaskSlotType::Value {
+        ty: IrType::Str,
+        borrowed: true,
+    };
+    fixture.functions[0].parameters.clear();
+    fixture.functions[0].states[0]
+        .operations
+        .insert(0, init(0, TaskConstant::Str("borrow".into())));
+    rejected(
+        &fixture,
+        "ok must not transfer borrowed owned storage to an owned Result",
+    );
+    fixture.functions[0].slots[0].ty = TaskSlotType::Value {
+        ty: IrType::Str,
+        borrowed: false,
+    };
+    fixture.functions[0].slots[1].ty = TaskSlotType::Value {
+        ty: result(IrType::Str),
+        borrowed: true,
+    };
+    rejected(&fixture, "ok cannot construct into a borrowed destination");
+    fixture.functions[0].slots[1].ty = TaskSlotType::Value {
+        ty: result(IrType::Str),
+        borrowed: false,
+    };
+    fixture.functions[0].states[0].operations[1] = TaskOp::WrapOk {
+        dst: SlotId(usize::MAX),
+        src: SlotId(0),
+    };
+    rejected(&fixture, "ok unknown destination");
+    fixture.functions[0].states[0].operations[1] = TaskOp::WrapOk {
+        dst: SlotId(1),
+        src: SlotId(usize::MAX),
+    };
+    rejected(&fixture, "ok unknown source");
+}
+
+#[test]
+fn native_task_frame_ir_wrap_ok_updates_suspension_liveness_and_cleanup() {
+    for wrap_before in [false, true] {
+        let wrap = TaskOp::WrapOk {
+            dst: SlotId(1),
+            src: SlotId(0),
+        };
+        let mut fixture = program(
+            vec![IrType::Str, result(IrType::Str)],
+            &[0],
+            vec![
+                state(
+                    if wrap_before {
+                        vec![wrap.clone()]
+                    } else {
+                        vec![]
+                    },
+                    suspend(1, 2),
+                ),
+                state(if wrap_before { vec![] } else { vec![wrap] }, complete(1)),
+                state(vec![drop_if(1), drop_if(0)], TaskTerminator::Terminate),
+            ],
+        );
+        fixture.functions[0].result = result(IrType::Str);
+        let plan = accepted(&fixture);
+        assert_eq!(
+            plan.functions[0].suspensions[0].slots,
+            vec![SlotId(usize::from(wrap_before))]
+        );
+        fixture.functions[0].states[2].operations.clear();
+        rejected(
+            &fixture,
+            "the active payload still needs cancellation cleanup",
+        );
+    }
+}
+
+#[test]
 fn native_task_frame_ir_rejects_unknown_ids_without_index_allocation() {
     accepted(&minimal());
     let mut fixture = minimal();
@@ -769,4 +899,136 @@ fn native_task_frame_ir_operation_budget_is_aggregate_across_functions() {
         }
     )
     .is_err());
+}
+
+#[test]
+fn native_task_frame_ir_wrap_ok_checks_must_and_may_at_branch_joins() {
+    let wrap = TaskOp::WrapOk {
+        dst: SlotId(1),
+        src: SlotId(0),
+    };
+    let mut moved = program(
+        vec![IrType::Str, result(IrType::Str), IrType::Bool],
+        &[0, 2],
+        vec![
+            state(vec![], branch(2, 1, 2)),
+            state(vec![wrap.clone(), drop_slot(1)], jump(3)),
+            state(vec![], jump(3)),
+            state(
+                vec![
+                    drop_if(0),
+                    init(
+                        1,
+                        TaskConstant::Ok(Box::new(TaskConstant::Str("joined".into()))),
+                    ),
+                ],
+                complete(1),
+            ),
+        ],
+    );
+    moved.functions[0].result = result(IrType::Str);
+    accepted(&moved);
+    moved.functions[0].states[3].operations = vec![wrap.clone()];
+    let error = verify_and_plan(&moved, TaskLimits::default()).unwrap_err();
+    assert!(
+        error.message.contains("not definitely initialized"),
+        "wrapping an owned source moved on one branch must fail its must check: {error}"
+    );
+
+    let mut overwritten = program(
+        vec![IrType::Int, result(IrType::Int), IrType::Bool],
+        &[0, 2],
+        vec![
+            state(vec![], branch(2, 1, 2)),
+            state(vec![wrap.clone()], jump(3)),
+            state(vec![], jump(3)),
+            state(vec![drop_if(1), wrap.clone()], complete(1)),
+        ],
+    );
+    overwritten.functions[0].result = result(IrType::Int);
+    accepted(&overwritten);
+    overwritten.functions[0].states[3].operations = vec![wrap];
+    let error = verify_and_plan(&overwritten, TaskLimits::default()).unwrap_err();
+    assert!(
+        error.message.contains("possibly initialized owned slot"),
+        "a Result initialized on only one branch must still fail its may-overwrite check: {error}"
+    );
+}
+
+#[test]
+fn native_task_frame_ir_wrap_ok_copies_local_borrows_without_spilling_them() {
+    for (ty, value) in [
+        (IrType::Int, TaskConstant::Int(37)),
+        (IrType::Bool, TaskConstant::Bool(true)),
+        (IrType::Null, TaskConstant::Null),
+    ] {
+        let mut fixture = program(
+            vec![ty.clone(), result(ty.clone())],
+            &[],
+            vec![
+                state(
+                    vec![
+                        init(0, value),
+                        TaskOp::WrapOk {
+                            dst: SlotId(1),
+                            src: SlotId(0),
+                        },
+                        read(0),
+                    ],
+                    suspend(1, 2),
+                ),
+                state(vec![], complete(1)),
+                state(vec![drop_slot(1)], TaskTerminator::Terminate),
+            ],
+        );
+        fixture.functions[0].slots[0].ty = TaskSlotType::Value {
+            ty: ty.clone(),
+            borrowed: true,
+        };
+        fixture.functions[0].result = result(ty);
+        let plan = accepted(&fixture);
+        assert_eq!(plan.functions[0].slots, vec![SlotId(1)]);
+        assert_eq!(plan.functions[0].suspensions[0].slots, vec![SlotId(1)]);
+
+        fixture.functions[0].states[1].operations.push(read(0));
+        let error = verify_and_plan(&fixture, TaskLimits::default()).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("borrowed value cannot cross suspension"),
+            "copying into Result must not permit a later use of the original borrow: {error}"
+        );
+    }
+}
+
+#[test]
+fn native_task_frame_ir_wrap_ok_moves_stack_local_strings_before_suspension() {
+    let mut fixture = program(
+        vec![IrType::Str, IrType::Str, result(IrType::Str)],
+        &[0],
+        vec![
+            state(
+                vec![
+                    TaskOp::Move {
+                        dst: SlotId(1),
+                        src: SlotId(0),
+                    },
+                    TaskOp::WrapOk {
+                        dst: SlotId(2),
+                        src: SlotId(1),
+                    },
+                ],
+                suspend(1, 2),
+            ),
+            state(vec![], complete(2)),
+            state(
+                vec![drop_if(2), drop_if(1), drop_if(0)],
+                TaskTerminator::Terminate,
+            ),
+        ],
+    );
+    fixture.functions[0].result = result(IrType::Str);
+    let plan = accepted(&fixture);
+    assert_eq!(plan.functions[0].slots, vec![SlotId(0), SlotId(2)]);
+    assert_eq!(plan.functions[0].suspensions[0].slots, vec![SlotId(2)]);
 }

@@ -126,7 +126,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 创建、await、I/O 或 scheduler 操作，不能用内部 Rust API 代替用户 async 的验收。
 
 当前 frame IR 使用密集 `SlotId` / `StateId`，支持 `int`、`bool`、`null`、`str`
-及对应单层 Result。操作显式区分 Init、Copy、Move、Read、Drop、DropIfInit；
+及对应单层 Result。操作显式区分 Init、Copy、Move、WrapOk、Read、Drop、DropIfInit；
 控制边区分 Jump、Branch、Suspend（resume / cleanup）、Complete 和 Terminate。
 暂不支持 array/object/struct/enum、函数值、子 Task 或借用参数进入 frame。
 
@@ -141,6 +141,12 @@ Complete 或 Suspend；本片尚无预算轮询 IR，所以拒绝所有不经过
 内部硬限为 64 函数、每函数 64 槽 / 256 状态、全程序 4096 操作、1,000,000 字面量
 字节（含 UTF-8、Error 三字段和函数名）及 1,000,000 分析工作量；测试只能收紧限制。
 这些是已构造 IR 的分析预算，不是整个编译器 RSS 或运行时总内存预算。
+
+R3 前置操作 `WrapOk` 允许把已初始化的 primitive 局部构造为匹配的 Result，
+不再只支持 `Ok` 常量。Copy primitive 保留来源；owned str 移动并清空来源。
+借用 owned、类型不匹配、嵌套 Result、未初始化来源或覆盖仍活跃的 owned 结果
+在 verifier 拒绝。该操作不分配、不改变 frame ABI 布局；初始化分析和跨挂起
+liveness 同步跟踪它的消费行为。它仍不是源码 async lowering。
 
 `src/backend/c_task.rs` 通过统一 C 生成器复用既有 KuString / Result 的 move/drop
 helper，不嵌入 runner 或源码。内部 frame ABI v1 有独立版本、目标 C `sizeof` / alignment、

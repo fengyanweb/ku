@@ -64,12 +64,32 @@ pub enum TaskConstant {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOp {
-    Init { dst: SlotId, value: TaskConstant },
-    Copy { dst: SlotId, src: SlotId },
-    Move { dst: SlotId, src: SlotId },
-    Read { slot: SlotId },
-    Drop { slot: SlotId },
-    DropIfInit { slot: SlotId },
+    Init {
+        dst: SlotId,
+        value: TaskConstant,
+    },
+    Copy {
+        dst: SlotId,
+        src: SlotId,
+    },
+    Move {
+        dst: SlotId,
+        src: SlotId,
+    },
+    /// Construct ok(source): Copy primitives remain initialized, owned str moves.
+    WrapOk {
+        dst: SlotId,
+        src: SlotId,
+    },
+    Read {
+        slot: SlotId,
+    },
+    Drop {
+        slot: SlotId,
+    },
+    DropIfInit {
+        slot: SlotId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,6 +417,20 @@ fn validate_shape(function: &TaskFunction, budget: &mut Budget) -> KuResult<(u64
                 TaskOp::Read { slot } => {
                     get_slot(*slot)?;
                 }
+                TaskOp::WrapOk { dst, src } => {
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?);
+                    let (source, source_borrowed) = slot_type(get_slot(*src)?);
+                    if dst == src
+                        || destination_borrowed
+                        || !primitive(source)
+                        || !matches!(destination, IrType::Result(inner) if inner.as_ref() == source)
+                        || (source_borrowed && !copy_type(source))
+                    {
+                        return Err(invalid(
+                            "ok requires a matching primitive payload without an owned borrow",
+                        ));
+                    }
+                }
                 TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
                     if slot_type(get_slot(*slot)?).1 {
                         return Err(invalid("cannot drop a borrowed slot"));
@@ -523,7 +557,7 @@ struct Initialized {
     may: u64,
 }
 
-fn transfer(mut state: Initialized, operation: &TaskOp) -> Initialized {
+fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initialized {
     match operation {
         TaskOp::Init { dst, .. } | TaskOp::Copy { dst, .. } => {
             state.must |= bit(*dst);
@@ -532,6 +566,11 @@ fn transfer(mut state: Initialized, operation: &TaskOp) -> Initialized {
         TaskOp::Move { dst, src } => {
             state.must = (state.must & !bit(*src)) | bit(*dst);
             state.may = (state.may & !bit(*src)) | bit(*dst);
+        }
+        TaskOp::WrapOk { dst, src } => {
+            let consumed = bit(*src) & owned;
+            state.must = (state.must & !consumed) | bit(*dst);
+            state.may = (state.may & !consumed) | bit(*dst);
         }
         TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
             state.must &= !bit(*slot);
@@ -545,6 +584,7 @@ fn transfer(mut state: Initialized, operation: &TaskOp) -> Initialized {
 fn initialized_states(
     function: &TaskFunction,
     parameters: u64,
+    owned: u64,
     budget: &mut Budget,
 ) -> KuResult<Vec<Option<Initialized>>> {
     let mut inputs = vec![None; function.states.len()];
@@ -561,7 +601,7 @@ fn initialized_states(
         let mut output = inputs[id.0].expect("queued states have input facts");
         for operation in &function.states[id.0].operations {
             budget.spend()?;
-            output = transfer(output, operation);
+            output = transfer(output, operation, owned);
         }
         for target in successors(&function.states[id.0].terminator)
             .into_iter()
@@ -608,9 +648,9 @@ fn live_states(function: &TaskFunction, budget: &mut Budget) -> KuResult<Vec<u64
                 budget.spend()?;
                 match operation {
                     TaskOp::Init { dst, .. } => live &= !bit(*dst),
-                    TaskOp::Copy { dst, src } | TaskOp::Move { dst, src } => {
-                        live = (live & !bit(*dst)) | bit(*src)
-                    }
+                    TaskOp::Copy { dst, src }
+                    | TaskOp::Move { dst, src }
+                    | TaskOp::WrapOk { dst, src } => live = (live & !bit(*dst)) | bit(*src),
                     TaskOp::Read { slot } | TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
                         live |= bit(*slot)
                     }
@@ -645,7 +685,9 @@ fn validate_ownership_and_plan(
         for operation in &block.operations {
             budget.spend()?;
             let source = match operation {
-                TaskOp::Copy { src, .. } | TaskOp::Move { src, .. } => Some(*src),
+                TaskOp::Copy { src, .. }
+                | TaskOp::Move { src, .. }
+                | TaskOp::WrapOk { src, .. } => Some(*src),
                 TaskOp::Read { slot } | TaskOp::Drop { slot } => Some(*slot),
                 _ => None,
             };
@@ -655,9 +697,10 @@ fn validate_ownership_and_plan(
                 ));
             }
             let destination = match operation {
-                TaskOp::Init { dst, .. } | TaskOp::Copy { dst, .. } | TaskOp::Move { dst, .. } => {
-                    Some(*dst)
-                }
+                TaskOp::Init { dst, .. }
+                | TaskOp::Copy { dst, .. }
+                | TaskOp::Move { dst, .. }
+                | TaskOp::WrapOk { dst, .. } => Some(*dst),
                 _ => None,
             };
             if destination.is_some_and(|slot| state.may & owned & bit(slot) != 0) {
@@ -665,7 +708,7 @@ fn validate_ownership_and_plan(
                     "overwriting a possibly initialized owned slot without drop",
                 ));
             }
-            state = transfer(state, operation);
+            state = transfer(state, operation, owned);
         }
         match block.terminator {
             TaskTerminator::Branch { condition, .. } if state.must & bit(condition) == 0 => {
@@ -724,7 +767,7 @@ pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<Ta
         }
         let (parameters, owned, borrowed) = validate_shape(function, &mut budget)?;
         validate_regions_and_progress(function, &mut budget)?;
-        let inputs = initialized_states(function, parameters, &mut budget)?;
+        let inputs = initialized_states(function, parameters, owned, &mut budget)?;
         let live = live_states(function, &mut budget)?;
         functions.push(validate_ownership_and_plan(
             function,
