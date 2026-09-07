@@ -11,7 +11,7 @@ pub(super) fn emit_runtime(out: &mut COutput) -> KuResult<()> {
 }
 
 const DRIVER_ABI: &str = r#"
-/* Internal driver ABI 3, not a public Task API, netpoll, or M:N scheduler.
+/* Internal driver ABI 4, not a public Task API, netpoll, or M:N scheduler.
  * Private V1 type spellings are retained, not their old binary layout/version.
  * Caller-owned zero-filled driver/slot/ring storage remains live until destroy
  * succeeds. Every API caller protects that storage; no call races destroy.
@@ -56,7 +56,13 @@ const DRIVER_ABI: &str = r#"
  * Successful detach supplies one queue/YIELD progress event when needed.
  * Cancelling a parent aborts only its outgoing RESULT wait: its incoming
  * ancestor still waits for that parent's actual cleanup/terminal publication.
- * These waits are not scope-cleanup ACK waits or physical-dispose receipts.
+ * ACK waits use the same single link, not another queue or a retained child.
+ * One final-drain session per task generation holds a finite absolute scope
+ * deadline: never recreate a budget at arm/detach or cancel the normal parent
+ * merely to wake its scope. Runtime cleanup ACK waits do not permit user
+ * cleanup Suspend. A resumed callback reads its existing token and sets WAIT
+ * again if still pending. Immediate ACK/error must be handled in that bounded
+ * quantum; expired cleanup cannot manufacture progress with repeated YIELD.
  * Cleanup receipts are issued only by successful owner transfer. They are
  * non-owning IDs, not leases, result values, or authenticated raw C objects.
  * Do not fabricate receipts from tickets. Their storage is caller-owned and
@@ -82,7 +88,7 @@ const DRIVER_ABI: &str = r#"
  * and keep the worker for deterministic cleanup. Idle faulted workers wait only
  * for OS condition notifications, never retry a failed clock periodically.
  */
-#define KU_TASK_DRIVER_ABI_VERSION 3u
+#define KU_TASK_DRIVER_ABI_VERSION 4u
 #define KU_TASK_DRIVER_MAX_SLOTS ((size_t)1024u)
 enum {
   KU_TASK_DRIVER_OK = 0u, KU_TASK_DRIVER_PENDING = 1u,
@@ -92,6 +98,7 @@ enum {
   KU_TASK_DRIVER_SHUTDOWN_TIMEOUT = 34u, KU_TASK_DRIVER_INTERNAL = 35u,
   KU_TASK_DRIVER_WAIT_READY = 36u, KU_TASK_DRIVER_WAIT_ABORTED = 37u,
   KU_TASK_DRIVER_WAIT_CYCLE = 38u, KU_TASK_DRIVER_CLEANUP_ACK = 39u,
+  KU_TASK_DRIVER_CLEANUP_TIMEOUT = 40u,
   KU_TASK_DRIVER_START = 0u, KU_TASK_DRIVER_ABORT = 1u,
   KU_TASK_DRIVER_YIELD = 1u, KU_TASK_DRIVER_WAIT = 2u
 };
@@ -105,7 +112,9 @@ enum {
 };
 enum {
   KU_TASK_DRIVER_WAIT_EMPTY = 0u, KU_TASK_DRIVER_WAIT_ARMED = 1u,
-  KU_TASK_DRIVER_WAIT_NOTIFIED = 2u
+  KU_TASK_DRIVER_WAIT_NOTIFIED = 2u,
+  KU_TASK_DRIVER_WAIT_KIND_EMPTY = 0u, KU_TASK_DRIVER_WAIT_KIND_RESULT = 1u,
+  KU_TASK_DRIVER_WAIT_KIND_CLEANUP_ACK = 2u
 };
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -143,6 +152,7 @@ typedef struct KuTaskDriverWaitSnapshotV1 {
   uint32_t state, outcome;
   size_t child_slot;
   uint64_t child_generation;
+  uint32_t kind;
 } KuTaskDriverWaitSnapshotV1;
 typedef struct KuTaskDriverSlotV1 {
   uint64_t generation;
@@ -161,6 +171,9 @@ typedef struct KuTaskDriverSlotV1 {
   /* Mutex-owned IDs only: neither edge creates a reference-count cycle. */
   uint64_t wait_epoch;
   uint32_t wait_state, wait_outcome;
+  uint32_t wait_kind;
+  uint32_t scope_wait_started, scope_deadline_fired, scope_wait_failure;
+  uint64_t scope_wait_deadline;
   size_t wait_child_slot;
   uint64_t wait_child_generation;
   size_t waiter_parent_slot;
@@ -293,10 +306,42 @@ static int ku_task_driver_external_storage(
       && !ku_task_frame_ranges_overlap(pointer, size, driver->ring,
                                        driver->capacity * sizeof(*driver->ring));
 }
-static void ku_task_driver_arm_deadline(KuTaskDriverV1* driver, KuTaskDriverSlotV1* slot) {
-  if (!slot->cleanup_fault && !slot->deadline_fired)
-    driver->next_deadline = ku_task_driver_min(driver->next_deadline, slot->cancel_deadline);
+static uint32_t ku_task_driver_check_cleanup_receipt(const KuTaskDriverCleanupReceiptV1* receipt) {
+  if (!ku_task_frame_storage_valid(receipt, sizeof(*receipt), sizeof(*receipt),
+                                   KU_TASK_FRAME_ALIGNOF(KuTaskDriverCleanupReceiptV1)))
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (receipt->abi_version != KU_TASK_DRIVER_ABI_VERSION) return KU_TASK_DRIVER_ABI_MISMATCH;
+  uint32_t checked = ku_task_driver_check(receipt->driver);
+  if (checked != KU_TASK_DRIVER_OK) return checked;
+  KuTaskDriverV1* driver = receipt->driver;
+  if (!ku_task_driver_external_storage(driver, receipt, sizeof(*receipt),
+                                       KU_TASK_FRAME_ALIGNOF(KuTaskDriverCleanupReceiptV1))
+      || !receipt->generation || receipt->slot >= driver->capacity)
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  return KU_TASK_DRIVER_OK;
 }
+/* Mutex-held, non-owning receipt proof. Never dereference a retired binding. */
+static uint32_t ku_task_driver_cleanup_receipt_status_locked(
+    KuTaskDriverV1* driver, size_t index, uint64_t generation) {
+  if (index >= driver->capacity || !generation) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  KuTaskDriverSlotV1* slot = &driver->slots[index];
+  if (slot->cleanup_acked_generation > slot->generation) return KU_TASK_DRIVER_INTERNAL;
+  if (generation > slot->generation) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (slot->cleanup_acked_generation >= generation) return KU_TASK_DRIVER_CLEANUP_ACK;
+  if (slot->generation == generation && slot->cleanup_fault) return slot->cleanup_fault;
+  if (slot->generation == generation && slot->state != KU_TASK_DRIVER_FREE
+      && slot->state != KU_TASK_DRIVER_BUILDING && slot->state != KU_TASK_DRIVER_RETIRING)
+    return KU_TASK_DRIVER_PENDING;
+  return KU_TASK_DRIVER_INTERNAL;
+}
+static void ku_task_driver_arm_deadline(KuTaskDriverV1* driver, KuTaskDriverSlotV1* slot) {
+  if (slot->cleanup_fault) return;
+  if (!slot->deadline_fired)
+    driver->next_deadline = ku_task_driver_min(driver->next_deadline, slot->cancel_deadline);
+  if (slot->scope_wait_started && !slot->scope_deadline_fired && !slot->scope_wait_failure)
+    driver->next_deadline = ku_task_driver_min(driver->next_deadline, slot->scope_wait_deadline);
+}
+static void ku_task_driver_enter_clock_fault(KuTaskDriverV1* driver);
 /* Requires mutex and a protected driver lifetime. */
 static KuTaskDriverSlotV1* ku_task_driver_find(const KuTaskDriverTicketV1* ticket) {
   KuTaskDriverV1* driver = ticket->driver;
@@ -355,12 +400,14 @@ static uint32_t ku_task_driver_wait_clear_locked(KuTaskDriverV1* driver, size_t 
   KuTaskDriverSlotV1* parent = &driver->slots[index];
   uint32_t result = ku_task_driver_wait_unlink_locked(driver, index);
   parent->wait_state = KU_TASK_DRIVER_WAIT_EMPTY; parent->wait_outcome = 0;
+  parent->wait_kind = KU_TASK_DRIVER_WAIT_KIND_EMPTY;
   parent->wait_child_slot = 0; parent->wait_child_generation = 0;
   /* Never reset wait_epoch while this task generation remains resident. */
   return result;
 }
 static void ku_task_driver_wait_abort_locked(KuTaskDriverV1* driver, size_t index) {
   KuTaskDriverSlotV1* parent = &driver->slots[index];
+  if (parent->wait_kind != KU_TASK_DRIVER_WAIT_KIND_RESULT) return;
   if (parent->wait_state == KU_TASK_DRIVER_WAIT_EMPTY
       || (parent->wait_state == KU_TASK_DRIVER_WAIT_NOTIFIED
           && (parent->wait_outcome == KU_TASK_DRIVER_WAIT_ABORTED
@@ -372,17 +419,16 @@ static void ku_task_driver_wait_abort_locked(KuTaskDriverV1* driver, size_t inde
 }
 static void ku_task_driver_wait_cancel_check_locked(KuTaskDriverV1* driver, size_t index) {
   KuTaskDriverSlotV1* slot = &driver->slots[index];
-  if (slot->wait_state == KU_TASK_DRIVER_WAIT_EMPTY || !slot->driver_lease.control) return;
+  if (slot->wait_state == KU_TASK_DRIVER_WAIT_EMPTY
+      || slot->wait_kind != KU_TASK_DRIVER_WAIT_KIND_RESULT || !slot->driver_lease.control) return;
   size_t phase = ku_task_control_atomic_load(&slot->driver_lease.control->phase);
   if (ku_task_control_is_publishing(phase) || ku_task_control_is_requested(phase)
       || phase == KU_TASK_CONTROL_CANCELLED || phase == KU_TASK_CONTROL_TIMED_OUT)
     ku_task_driver_wait_abort_locked(driver, index);
 }
-static void ku_task_driver_wait_publish_locked(KuTaskDriverV1* driver, size_t index) {
+static void ku_task_driver_wait_complete_locked(KuTaskDriverV1* driver, size_t index, uint32_t ready) {
   KuTaskDriverSlotV1* child = &driver->slots[index];
   if (!child->waiter_epoch) return;
-  uint32_t ready = ku_task_driver_wait_ready_locked(child);
-  if (ready == KU_TASK_DRIVER_PENDING) return;
   if (ready == KU_TASK_DRIVER_INTERNAL) driver->fault = KU_TASK_DRIVER_INTERNAL;
   KuTaskDriverSlotV1* parent = child->waiter_parent_slot < driver->capacity
       ? &driver->slots[child->waiter_parent_slot] : NULL;
@@ -392,10 +438,80 @@ static void ku_task_driver_wait_publish_locked(KuTaskDriverV1* driver, size_t in
       || parent->wait_child_slot != index || parent->wait_child_generation != child->generation) {
     driver->fault = KU_TASK_DRIVER_INTERNAL;
   } else {
+    if (parent->wait_kind == KU_TASK_DRIVER_WAIT_KIND_CLEANUP_ACK) {
+      if (!parent->scope_wait_failure
+          && (ready == KU_TASK_DRIVER_INTERNAL || ready == KU_TASK_DRIVER_CLEANUP_TIMEOUT))
+        parent->scope_wait_failure = ready;
+      if (parent->scope_wait_failure) ready = parent->scope_wait_failure;
+    }
     parent->wait_state = KU_TASK_DRIVER_WAIT_NOTIFIED; parent->wait_outcome = ready;
     ku_task_driver_enqueue(driver, child->waiter_parent_slot);
   }
   child->waiter_parent_slot = 0; child->waiter_parent_generation = 0; child->waiter_epoch = 0;
+}
+static void ku_task_driver_wait_publish_locked(KuTaskDriverV1* driver, size_t index) {
+  KuTaskDriverSlotV1* child = &driver->slots[index];
+  if (!child->waiter_epoch) return;
+  KuTaskDriverSlotV1* parent = child->waiter_parent_slot < driver->capacity
+      ? &driver->slots[child->waiter_parent_slot] : NULL;
+  if (!parent || parent->generation != child->waiter_parent_generation
+      || parent->wait_epoch != child->waiter_epoch || parent->wait_state != KU_TASK_DRIVER_WAIT_ARMED
+      || parent->wait_child_slot != index || parent->wait_child_generation != child->generation) {
+    ku_task_driver_wait_complete_locked(driver, index, KU_TASK_DRIVER_INTERNAL); return;
+  }
+  uint32_t ready = parent->wait_kind == KU_TASK_DRIVER_WAIT_KIND_RESULT
+      ? ku_task_driver_wait_ready_locked(child)
+      : parent->wait_kind == KU_TASK_DRIVER_WAIT_KIND_CLEANUP_ACK
+      ? ku_task_driver_cleanup_receipt_status_locked(driver, index, child->generation)
+      : KU_TASK_DRIVER_INTERNAL;
+  if (ready != KU_TASK_DRIVER_PENDING) ku_task_driver_wait_complete_locked(driver, index, ready);
+}
+/* Expiring a budget is not failure without a still-pending child. An ACK that
+ * was already published wins even if the parent was scheduled after its D. */
+static void ku_task_driver_scope_expire_locked(KuTaskDriverV1* driver, size_t index, uint64_t now) {
+  KuTaskDriverSlotV1* parent = &driver->slots[index];
+  if (!parent->scope_wait_started || parent->scope_deadline_fired || parent->scope_wait_failure
+      || parent->cleanup_fault || now < parent->scope_wait_deadline) return;
+  parent->scope_deadline_fired = 1;
+  if (parent->wait_state != KU_TASK_DRIVER_WAIT_ARMED
+      || parent->wait_kind != KU_TASK_DRIVER_WAIT_KIND_CLEANUP_ACK) return;
+  KuTaskDriverSlotV1* child = parent->wait_child_slot < driver->capacity
+      ? &driver->slots[parent->wait_child_slot] : NULL;
+  if (!child || child->generation != parent->wait_child_generation
+      || child->waiter_parent_slot != index || child->waiter_parent_generation != parent->generation
+      || child->waiter_epoch != parent->wait_epoch) {
+    /* A broken pair is not Pending. Keep this parent's durable error latch,
+     * and never clear another parent's unmatched incoming registration. */
+    driver->fault = KU_TASK_DRIVER_INTERNAL; parent->scope_wait_failure = KU_TASK_DRIVER_INTERNAL;
+    parent->wait_state = KU_TASK_DRIVER_WAIT_NOTIFIED; parent->wait_outcome = KU_TASK_DRIVER_INTERNAL;
+    ku_task_driver_enqueue(driver, index); return;
+  }
+  uint32_t ready = ku_task_driver_cleanup_receipt_status_locked(
+      driver, parent->wait_child_slot, parent->wait_child_generation);
+  if (ready == KU_TASK_DRIVER_PENDING) ready = KU_TASK_DRIVER_CLEANUP_TIMEOUT;
+  else if (ready != KU_TASK_DRIVER_CLEANUP_ACK && ready != KU_TASK_DRIVER_INTERNAL)
+    ready = KU_TASK_DRIVER_INTERNAL;
+  ku_task_driver_wait_complete_locked(driver, parent->wait_child_slot, ready);
+}
+/* Existing published cancellation/shutdown budgets may only tighten scope D.
+ * PUBLISHING is deliberately not a license to read an unpublished deadline. */
+static void ku_task_driver_scope_refresh_locked(KuTaskDriverV1* driver, size_t index) {
+  KuTaskDriverSlotV1* slot = &driver->slots[index];
+  if (!slot->scope_wait_started || slot->scope_wait_failure || slot->cleanup_fault) return;
+  uint64_t deadline = ku_task_driver_min(slot->scope_wait_deadline, slot->cancel_deadline);
+  if (driver->closing) deadline = ku_task_driver_min(deadline, driver->shutdown_deadline);
+  if (slot->driver_lease.control) {
+    KuTaskControlV1* control = slot->driver_lease.control;
+    size_t phase = ku_task_control_atomic_load(&control->phase);
+    if (ku_task_control_is_requested(phase) || phase == KU_TASK_CONTROL_CANCELLED
+        || phase == KU_TASK_CONTROL_TIMED_OUT)
+      deadline = ku_task_driver_min(deadline, ku_task_control_cleanup_deadline(control));
+  }
+  slot->scope_wait_deadline = deadline;
+  ku_task_driver_arm_deadline(driver, slot);
+  uint64_t now = driver->clock_fault ? 0 : ku_task_driver_now_ms();
+  if (now == UINT64_MAX) { ku_task_driver_enter_clock_fault(driver); return; }
+  ku_task_driver_scope_expire_locked(driver, index, now);
 }
 static uint32_t ku_task_driver_wait_cycle_locked(
     KuTaskDriverV1* driver, size_t parent_index, size_t child_index) {
@@ -405,6 +521,8 @@ static uint32_t ku_task_driver_wait_cycle_locked(
     KuTaskDriverSlotV1* cursor = &driver->slots[index];
     /* NOTIFIED is a durable event latch, no longer a blocking graph edge. */
     if (cursor->wait_state != KU_TASK_DRIVER_WAIT_ARMED) return KU_TASK_DRIVER_OK;
+    if (cursor->wait_kind != KU_TASK_DRIVER_WAIT_KIND_RESULT
+        && cursor->wait_kind != KU_TASK_DRIVER_WAIT_KIND_CLEANUP_ACK) return KU_TASK_DRIVER_INTERNAL;
     if (cursor->wait_child_slot >= driver->capacity) return KU_TASK_DRIVER_INTERNAL;
     KuTaskDriverSlotV1* next = &driver->slots[cursor->wait_child_slot];
     if (next->state == KU_TASK_DRIVER_FREE || next->state == KU_TASK_DRIVER_BUILDING
@@ -465,6 +583,7 @@ static uint32_t ku_task_driver_wait_arm(
     } else if (result == KU_TASK_DRIVER_PENDING) {
       parent->wait_epoch++;
       parent->wait_state = KU_TASK_DRIVER_WAIT_ARMED; parent->wait_outcome = KU_TASK_DRIVER_PENDING;
+      parent->wait_kind = KU_TASK_DRIVER_WAIT_KIND_RESULT;
       parent->wait_child_slot = child_ticket->slot; parent->wait_child_generation = child_ticket->generation;
       child->waiter_parent_slot = parent_ticket->slot; child->waiter_parent_generation = parent_ticket->generation;
       child->waiter_epoch = parent->wait_epoch;
@@ -474,6 +593,80 @@ static uint32_t ku_task_driver_wait_arm(
        * readiness; later publications must visit their post-store wrapper hook. */
       ku_task_driver_wait_cancel_check_locked(driver, parent_ticket->slot);
       ku_task_driver_wait_publish_locked(driver, child_ticket->slot);
+    }
+  }
+  if (result == KU_TASK_DRIVER_INTERNAL) driver->fault = KU_TASK_DRIVER_INTERNAL;
+  ku_task_driver_unlock(driver);
+  return result;
+}
+static uint32_t ku_task_driver_cleanup_wait_arm(
+    const KuTaskDriverTicketV1* parent_ticket, const KuTaskDriverCleanupReceiptV1* receipt,
+    uint64_t absolute_scope_deadline, KuTaskDriverWaitTokenV1* output) {
+  uint32_t checked = ku_task_driver_check_ticket(parent_ticket);
+  if (checked != KU_TASK_DRIVER_OK) return checked;
+  checked = ku_task_driver_check_cleanup_receipt(receipt);
+  if (checked != KU_TASK_DRIVER_OK) return checked;
+  if (parent_ticket->driver != receipt->driver || absolute_scope_deadline == UINT64_MAX)
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  KuTaskDriverV1* driver = parent_ticket->driver;
+  if (!ku_task_driver_external_storage(driver, output, sizeof(*output), KU_TASK_FRAME_ALIGNOF(KuTaskDriverWaitTokenV1))
+      || ku_task_frame_ranges_overlap(output, sizeof(*output), parent_ticket, sizeof(*parent_ticket))
+      || ku_task_frame_ranges_overlap(output, sizeof(*output), receipt, sizeof(*receipt)))
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* parent = ku_task_driver_find(parent_ticket);
+  uint32_t result = !parent ? KU_TASK_DRIVER_STALE
+      : parent->state != KU_TASK_DRIVER_RUNNING || !parent->driver_lease.control
+      ? KU_TASK_DRIVER_INVALID_STATE : parent->cleanup_fault ? parent->cleanup_fault : KU_TASK_DRIVER_OK;
+  KuTaskDriverSlotV1* child = &driver->slots[receipt->slot];
+  if (result == KU_TASK_DRIVER_OK
+      && (ku_task_frame_ranges_overlap(output, sizeof(*output), parent->driver_lease.control, sizeof(KuTaskControlV1))
+          || (child->generation == receipt->generation && child->binding
+              && ku_task_frame_ranges_overlap(output, sizeof(*output), child->binding, sizeof(KuTaskControlV1)))))
+    result = KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (result == KU_TASK_DRIVER_OK
+      && (output->driver || output->parent_slot || output->parent_generation || output->epoch
+          || parent->wait_state != KU_TASK_DRIVER_WAIT_EMPTY)) result = KU_TASK_DRIVER_INVALID_STATE;
+  if (result == KU_TASK_DRIVER_OK) {
+    size_t phase = ku_task_control_atomic_load(&parent->driver_lease.control->phase);
+    if (phase != KU_TASK_CONTROL_LIVE && !ku_task_control_is_requested(phase)
+        && !ku_task_control_is_publishing(phase)) result = KU_TASK_DRIVER_INVALID_STATE;
+  }
+  if (result == KU_TASK_DRIVER_OK && parent->scope_wait_failure) result = parent->scope_wait_failure;
+  uint32_t ready = KU_TASK_DRIVER_PENDING;
+  if (result == KU_TASK_DRIVER_OK) {
+    ready = ku_task_driver_cleanup_receipt_status_locked(driver, receipt->slot, receipt->generation);
+    if (ready != KU_TASK_DRIVER_PENDING && ready != KU_TASK_DRIVER_CLEANUP_ACK
+        && ready != KU_TASK_DRIVER_INTERNAL) result = ready;
+    if (ready == KU_TASK_DRIVER_PENDING) {
+      if (!child->driver_lease.control || child->waiter_epoch) result = KU_TASK_DRIVER_INVALID_STATE;
+      else if (parent->wait_epoch == UINT64_MAX) result = KU_TASK_DRIVER_LIMIT;
+      else result = ku_task_driver_wait_cycle_locked(driver, parent_ticket->slot, receipt->slot);
+    }
+  }
+  if (result == KU_TASK_DRIVER_OK) {
+    if (!parent->scope_wait_started) {
+      parent->scope_wait_started = 1; parent->scope_wait_deadline = absolute_scope_deadline;
+    } else parent->scope_wait_deadline = ku_task_driver_min(parent->scope_wait_deadline, absolute_scope_deadline);
+    /* Even an immediate ACK binds D before the next sibling can be observed. */
+    ku_task_driver_scope_refresh_locked(driver, parent_ticket->slot);
+    if (ready == KU_TASK_DRIVER_INTERNAL) {
+      parent->scope_wait_failure = KU_TASK_DRIVER_INTERNAL; result = KU_TASK_DRIVER_INTERNAL;
+    } else if (ready == KU_TASK_DRIVER_CLEANUP_ACK) result = ready;
+    else if (parent->scope_deadline_fired) {
+      parent->scope_wait_failure = KU_TASK_DRIVER_CLEANUP_TIMEOUT; result = parent->scope_wait_failure;
+    } else {
+      parent->wait_epoch++;
+      parent->wait_state = KU_TASK_DRIVER_WAIT_ARMED; parent->wait_outcome = KU_TASK_DRIVER_PENDING;
+      parent->wait_kind = KU_TASK_DRIVER_WAIT_KIND_CLEANUP_ACK;
+      parent->wait_child_slot = receipt->slot; parent->wait_child_generation = receipt->generation;
+      child->waiter_parent_slot = parent_ticket->slot; child->waiter_parent_generation = parent->generation;
+      child->waiter_epoch = parent->wait_epoch;
+      *output = (KuTaskDriverWaitTokenV1){ driver, parent_ticket->slot, parent->generation, parent->wait_epoch };
+      parent->intent = KU_TASK_DRIVER_WAIT;
+      ku_task_driver_scope_refresh_locked(driver, parent_ticket->slot);
+      ku_task_driver_wait_publish_locked(driver, receipt->slot);
+      result = KU_TASK_DRIVER_PENDING;
     }
   }
   if (result == KU_TASK_DRIVER_INTERNAL) driver->fault = KU_TASK_DRIVER_INTERNAL;
@@ -512,7 +705,7 @@ static uint32_t ku_task_driver_wait_read(
       result = KU_TASK_DRIVER_INVALID_ARGUMENT;
   }
   if (result == KU_TASK_DRIVER_OK)
-    *output = (KuTaskDriverWaitSnapshotV1){ parent->wait_state, parent->wait_outcome, parent->wait_child_slot, parent->wait_child_generation };
+    *output = (KuTaskDriverWaitSnapshotV1){ parent->wait_state, parent->wait_outcome, parent->wait_child_slot, parent->wait_child_generation, parent->wait_kind };
   ku_task_driver_unlock(driver);
   return result;
 }
@@ -564,6 +757,10 @@ static void ku_task_driver_enter_clock_fault(KuTaskDriverV1* driver) {
           && !ku_task_control_is_terminal(result)) driver->fault = KU_TASK_DRIVER_INTERNAL;
     }
     ku_task_driver_wait_abort_locked(driver, i);
+    if (slot->scope_wait_started) {
+      slot->scope_wait_deadline = 0;
+      ku_task_driver_scope_expire_locked(driver, i, 0);
+    }
     ku_task_driver_enqueue(driver, i);
   }
   ku_task_driver_signal(driver);
@@ -624,6 +821,7 @@ static void ku_task_driver_wrapper_end(const KuTaskDriverTicketV1* ticket) {
   if (!slot || !slot->wrapper_active) driver->fault = KU_TASK_DRIVER_INTERNAL;
   else {
     slot->wrapper_active--;
+    ku_task_driver_scope_refresh_locked(driver, ticket->slot);
     ku_task_driver_wait_cancel_check_locked(driver, ticket->slot);
     ku_task_driver_wait_publish_locked(driver, ticket->slot);
     ku_task_driver_enqueue(driver, ticket->slot);
@@ -644,6 +842,7 @@ static uint32_t ku_task_driver_request_cancel(
       slot->cancel_deadline = ku_task_driver_min(slot->cancel_deadline, deadline);
       ku_task_driver_arm_deadline(driver, slot);
       if (result == KU_TASK_CONTROL_PENDING) slot->cancel_pending = 1;
+      ku_task_driver_scope_refresh_locked(driver, ticket->slot);
     }
     ku_task_driver_unlock(driver);
   }
@@ -720,6 +919,7 @@ static uint32_t ku_task_driver_owner_drop_impl(
       slot->cancel_deadline = ku_task_driver_min(slot->cancel_deadline, deadline);
       ku_task_driver_arm_deadline(driver, slot);
       slot->cancel_pending = 1;
+      ku_task_driver_scope_refresh_locked(driver, ticket->slot);
       ku_task_driver_wait_abort_locked(driver, ticket->slot);
       ku_task_driver_enqueue(driver, ticket->slot);
     }
@@ -739,31 +939,14 @@ static uint32_t ku_task_driver_owner_drop_receipt(
 }
 static uint32_t ku_task_driver_cleanup_receipt_read(
     const KuTaskDriverCleanupReceiptV1* receipt) {
-  if (!ku_task_frame_storage_valid(receipt, sizeof(*receipt), sizeof(*receipt),
-                                   KU_TASK_FRAME_ALIGNOF(KuTaskDriverCleanupReceiptV1)))
-    return KU_TASK_DRIVER_INVALID_ARGUMENT;
-  if (receipt->abi_version != KU_TASK_DRIVER_ABI_VERSION) return KU_TASK_DRIVER_ABI_MISMATCH;
-  uint32_t checked = ku_task_driver_check(receipt->driver);
+  uint32_t checked = ku_task_driver_check_cleanup_receipt(receipt);
   if (checked != KU_TASK_DRIVER_OK) return checked;
   KuTaskDriverV1* driver = receipt->driver;
-  if (!ku_task_driver_external_storage(driver, receipt, sizeof(*receipt),
-                                       KU_TASK_FRAME_ALIGNOF(KuTaskDriverCleanupReceiptV1))
-      || !receipt->generation || receipt->slot >= driver->capacity)
-    return KU_TASK_DRIVER_INVALID_ARGUMENT;
   if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
-  KuTaskDriverSlotV1* slot = &driver->slots[receipt->slot];
-  uint32_t result;
   /* Never dereference binding/control: an old issued receipt remains useful
    * after physical disposal and after a new control occupies this slot.
    * A valid receipt cannot come from BUILDING rollback or a copied ticket. */
-  if (slot->cleanup_acked_generation > slot->generation) result = KU_TASK_DRIVER_INTERNAL;
-  else if (receipt->generation > slot->generation) result = KU_TASK_DRIVER_INVALID_ARGUMENT;
-  else if (slot->cleanup_acked_generation >= receipt->generation) result = KU_TASK_DRIVER_CLEANUP_ACK;
-  else if (slot->generation == receipt->generation && slot->cleanup_fault) result = slot->cleanup_fault;
-  else if (slot->generation == receipt->generation
-      && slot->state != KU_TASK_DRIVER_FREE && slot->state != KU_TASK_DRIVER_BUILDING
-      && slot->state != KU_TASK_DRIVER_RETIRING) result = KU_TASK_DRIVER_PENDING;
-  else result = KU_TASK_DRIVER_INTERNAL;
+  uint32_t result = ku_task_driver_cleanup_receipt_status_locked(driver, receipt->slot, receipt->generation);
   if (result == KU_TASK_DRIVER_INTERNAL) driver->fault = result;
   ku_task_driver_unlock(driver);
   return result;
@@ -796,6 +979,7 @@ static uint32_t ku_task_driver_reserve(
       slot->state = KU_TASK_DRIVER_BUILDING;
       slot->charged_bytes = task_bytes;
       slot->cancel_deadline = UINT64_MAX;
+      slot->scope_wait_deadline = UINT64_MAX;
       driver->resident++; driver->building++; driver->reserved_bytes += task_bytes;
       *output = (KuTaskDriverTicketV1){ driver, i, generation };
       result = KU_TASK_DRIVER_OK; break;
@@ -958,12 +1142,17 @@ static uint64_t ku_task_driver_deadlines_locked(KuTaskDriverV1* driver, uint64_t
   for (size_t i = 0; i < driver->capacity; i++) {
     KuTaskDriverSlotV1* slot = &driver->slots[i];
     if (slot->state == KU_TASK_DRIVER_FREE || slot->state == KU_TASK_DRIVER_BUILDING
-        || slot->state == KU_TASK_DRIVER_RETIRING || slot->deadline_fired || slot->cleanup_fault
-        || slot->cancel_deadline == UINT64_MAX) continue;
-    if (slot->cancel_deadline <= now) {
-      slot->deadline_fired = 1;
-      ku_task_driver_enqueue(driver, i);
-    } else next = ku_task_driver_min(next, slot->cancel_deadline);
+        || slot->state == KU_TASK_DRIVER_RETIRING || slot->cleanup_fault) continue;
+    if (!slot->deadline_fired && slot->cancel_deadline != UINT64_MAX) {
+      if (slot->cancel_deadline <= now) {
+        slot->deadline_fired = 1;
+        ku_task_driver_enqueue(driver, i);
+      } else next = ku_task_driver_min(next, slot->cancel_deadline);
+    }
+    if (slot->scope_wait_started && !slot->scope_deadline_fired && !slot->scope_wait_failure) {
+      if (slot->scope_wait_deadline <= now) ku_task_driver_scope_expire_locked(driver, i, now);
+      else next = ku_task_driver_min(next, slot->scope_wait_deadline);
+    }
   }
   driver->next_deadline = next;
   return next;
@@ -1056,13 +1245,19 @@ static void ku_task_driver_worker(KuTaskDriverV1* driver) {
     if (request == KU_TASK_CONTROL_PENDING) slot->cancel_pending = 1;
     if (dropped != KU_TASK_CONTROL_OK && dropped != KU_TASK_CONTROL_PENDING) driver->fault = KU_TASK_DRIVER_INTERNAL;
     int terminal = ku_task_control_is_terminal(outcome);
+    ku_task_driver_scope_refresh_locked(driver, index);
     ku_task_driver_wait_cancel_check_locked(driver, index);
     ku_task_driver_wait_publish_locked(driver, index);
     if (terminal) (void)ku_task_driver_wait_clear_locked(driver, index);
     KuTaskControlLeaseV1 registry = {0};
     int retire = terminal && slot->owner_location == KU_TASK_DRIVER_OWNER_RELEASED && !slot->wrapper_active;
-    if (retire && ku_task_driver_cleanup_ack_locked(driver, slot, outcome) != KU_TASK_DRIVER_CLEANUP_ACK)
-      retire = 0;
+    if (retire) {
+      uint32_t ack = ku_task_driver_cleanup_ack_locked(driver, slot, outcome);
+      /* Publish BOTH durable ACK and quarantine failure before binding retires.
+       * A faulted child's enqueue is disabled; this wakes its parent instead. */
+      ku_task_driver_wait_publish_locked(driver, index);
+      if (ack != KU_TASK_DRIVER_CLEANUP_ACK) retire = 0;
+    }
     if (retire) {
       registry = slot->driver_lease; slot->driver_lease.control = NULL;
       /* The disposer frees its allocation BEFORE returning this slot's budget.
@@ -1208,6 +1403,10 @@ static uint32_t ku_task_driver_shutdown(KuTaskDriverV1* driver, uint64_t deadlin
           && !ku_task_control_is_terminal(requested)) driver->fault = KU_TASK_DRIVER_INTERNAL;
     }
     ku_task_driver_wait_abort_locked(driver, i);
+    if (slot->scope_wait_started) {
+      slot->scope_wait_deadline = ku_task_driver_min(slot->scope_wait_deadline, cleanup_deadline);
+      ku_task_driver_scope_expire_locked(driver, i, now);
+    }
     ku_task_driver_enqueue(driver, i);
   }
   ku_task_driver_signal(driver);

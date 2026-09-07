@@ -443,7 +443,7 @@ static void fixture_probe(FixtureRole* role, KuTaskInstance_0* instance) {
   CHECK(ku_task_driver_wait_detach(&old) == KU_TASK_DRIVER_STALE);
   CHECK(old.epoch == role->old_wait.epoch && old.driver == role->old_wait.driver);
   fixture_assert_armed(role);
-  KuTaskDriverWaitSnapshotV1 untouched = { 91u, 92u, 93u, 94u };
+  KuTaskDriverWaitSnapshotV1 untouched = { 91u, 92u, 93u, 94u, 0u };
   CHECK(ku_task_driver_wait_read(&old, &untouched) == KU_TASK_DRIVER_STALE);
   CHECK(untouched.state == 91u && untouched.outcome == 92u && untouched.child_slot == 93u && untouched.child_generation == 94u);
   CHECK(ku_task_driver_wait_detach(&role->wait) == KU_TASK_DRIVER_OK);
@@ -773,7 +773,7 @@ static void fixture_headers_and_damaged_pair(void) {
 }
 
 int main(void) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 3u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 4u);
   fixture_ready_before_arm();
   fixture_parked_and_late_child();
   fixture_taking_publication(0, 0); fixture_taking_publication(1, 0);

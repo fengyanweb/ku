@@ -199,8 +199,9 @@ typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 
 
 ### R3 内部单 worker driver（尚无源码接入）
 
-`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v3。
-R5a 固定等待字段采用版本 2，R5b.1 清理水位再升为 3；内部 C 类型名中的 `V1` 不是旧布局兼容承诺，
+`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v4。
+R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 等待类型和独立期限
+升为版本 4；内部 C 类型名中的 `V1` 不是旧布局兼容承诺，
 初始化明确拒绝旧版本。独立 frame/control ABI 仍为 v1。
 普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
 以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
@@ -307,6 +308,31 @@ ACK 校验遇到不可能状态时，该 slot 锁存 INTERNAL；有效收据明�
 本片只提供收据签发和查询，不添加 ACK park/wake、独立 scope deadline、全部兄弟
 先取消的 drain continuation、Task IR Start/Await 或源码入口。运行验证范围和故障
 处理以阶段工作日志为准，不能把 receipt ACK 当成整个递归子树物理释放或 Task 成功。
+
+### R5b.2 内部 ACK 等待与 final-drain 期限（开发检查点）
+
+ACK 等待复用已有单一 slot/link/ring，snapshot 显式区分 RESULT 与 CLEANUP_ACK。
+有效旧收据可在子存储释放/复用后即时得到 ACK，不读取新 control，也不占用新任务
+的 waiter。未完成收据登记后，只有实际清理水位或逐 slot 清理故障才通知父任务；
+单独的 terminal、owner 转交、TAKING 回调或 observer 释放不是这个通知的替代品。
+
+一个 task generation 只支持一个内部 final-drain session。调用方事先建立绝对
+预算；首次调用即使直接 ACK 也绑定该期限，后续只取 min，read/detach 不重置。
+普通父任务到期只唤醒内部清理 continuation，不将其 R2 phase 改为 Cancelled。
+父已取消/超时时只拆普通结果等待，保留内部 ACK 登记并继承更短的已发布预算；
+PUBLISHING 不能读取尚未发布的 control deadline，后置 wrapper 补足收紧。
+
+期限已到和清理失败分别记账：先检查已有 ACK/fault，确实观察到 Pending 才锁存
+CLEANUP_TIMEOUT。没有活动等待或已有 ACK 锁存时，到期只停止 timer，不臆造子任务
+完成时间。已锁存的 timeout/fault 不被迟到 ACK 覆盖，也不因下个收据重新得到一秒。
+两个计时原因沿用最早期限缓存，只有到期才做有界扫描，无周期 poll。
+
+损坏的父子 reciprocal 只给当前父任务错误锁存，不清理其他父任务的新登记。被
+隔离子任务的错误直接通知父队列，不依赖再次 poll 坏任务。raw callback 得到即时
+ACK/error 必须在有界 quantum 内处理，不能在耗尽预算后用 Pending/YIELD 假造进展。
+本片未生成多兄弟 scope drain、源码 Task/Start/Await 或用户 cleanup 挂起能力；
+已通过本机实际 C 定向用例；精确提交的三系统与 sanitizer 验收状态见工作日志，
+不能把内部等待用例当作尚未生成的多子任务作用域清理或源码 async 已完成。
 
 ## IR 优化队列
 
