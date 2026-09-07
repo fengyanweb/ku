@@ -199,7 +199,9 @@ typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 
 
 ### R3 内部单 worker driver（尚无源码接入）
 
-`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v1。
+`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v2。
+R5a 增加固定等待字段后版本升为 2；内部 C 类型名中的 `V1` 不是旧布局兼容承诺，
+初始化明确拒绝旧版本。独立 frame/control ABI 仍为 v1。
 普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
 以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
 这是后续源码 TaskStart/Await 的基础，不是 M:N、netpoll 或事件驱动 HTTP。
@@ -257,10 +259,33 @@ driver 成功接管责任后清空 handle，不代表子任务清理已经完成
 
 cleanup 每个 safepoint 读取 live 最短 deadline，保留取消/超时原因；adapter 单次
 观测到坏钟也进入 driver 的持续故障清理。裸 Suspend 仅映射 YIELD，不伪造没有
-事件源的 WAIT。Task IR 的 Start/Await、等待登记、父子作用域清理及源码 lowering
+事件源的 WAIT。Task IR 的 Start/Await、父子作用域清理及源码 lowering
 仍未接入；这里不提供 array/object/struct/enum/closure Task payload 或增长堆预算。
 生成代码和参数检查沿用现有函数/槽/输出上限，不表示 64 MiB C artifact 上限等于
 编译器 RSS 上限。实际测试证据见 [阶段工作日志](v0.0.18-worklog.md)。
+
+### R5a 结果就绪等待内核（尚无源码接入）
+
+driver 的固定 slot 内包含一份向外等待和一份入向 waiter；没有按等待分配堆内存、
+新引用或线程。内部 arm/read/detach 只服务可信 adapter，不是用户 API。登记要求父
+任务正在同一 driver 执行、子任务仍有真实 owner；每个子任务最多一个等待者，
+有界遍历活动等待链拒绝 self/cycle。父子 generation 和递增 epoch 同时匹配，溢出
+拒绝而不回绕；NOTIFIED 是结果锁存，不再作为活动等待边。
+
+先检查结果，再登记并复检。TAKING 仍属 Pending，必须等 R2 最终发布 TAKEN 或恢复
+AVAILABLE 后由 driver 通知。RUNNING 期间通知记入 notified，PARKED 被入队，重复
+通知合并；正常无事件时 worker 保持条件等待，不靠重复 poll 查结果。read 读取父
+slot 锁存，不解引用已经释放或复用的子任务；旧 token 不得注销新等待。主动 detach
+移除最后进展来源时安排一次恢复，不能把父任务永久留在 PARKED。
+
+父取消注销向外结果等待并锁存 ABORTED，但保留祖先等待该父任务的入向关系；祖先
+在父任务实际发布终态后才获通知。损坏的双向关系报告 INTERNAL，不冒充成功或改动
+不匹配的其他等待。已知 header 别名先于输出内容读取拒绝；raw C 调用者仍须提供
+有效、完整、独立且同步访问的存储，整数范围检查不证明任意指针安全。
+
+本片只实现结果就绪等待，不实现逻辑 cleanup ACK、owner 转交收据、父 scope drain
+或源码 Await。最终 dispose/预算归还与逻辑清理完成是不同事件，迟到观察 lease
+不能成为未来父作用域清理等待的条件。具体执行证据见阶段工作日志。
 
 ## IR 优化队列
 
