@@ -1150,6 +1150,7 @@ struct FunctionLowerer<'a> {
     next_block_id: usize,
     next_temp_id: usize,
     try_handlers: Vec<IrTryHandler>,
+    cleanup_attempts: Vec<IrCleanupAttempt>,
     pending_borrow_temporaries: Vec<PendingBorrowTemporary>,
     pattern_bindings: HashMap<String, IrExpr>,
     /// Program-global FunctionId allocator, shared between the top-level lowerer
@@ -1238,6 +1239,19 @@ struct IrTryHandler {
     error_name: String,
     return_block: Option<BlockId>,
     return_name: Option<String>,
+    /// The reason belongs to this pending return, never the whole frame.
+    /// Every incoming return edge overwrites it, including loop reentry.
+    return_reason: Option<String>,
+}
+
+/// A shared return-finally is a termination cleanup attempt only when its
+/// pending return's reason is true. Handlers introduced inside the attempt
+/// remain ordinary local control, even while an outer timeout is unwinding.
+#[derive(Debug, Clone)]
+struct IrCleanupAttempt {
+    handler_floor: usize,
+    reason: String,
+    finish_block: BlockId,
 }
 
 struct PendingBorrowTemporary {
@@ -1283,6 +1297,7 @@ impl<'a> FunctionLowerer<'a> {
             next_block_id: 1,
             next_temp_id: 0,
             try_handlers: Vec::new(),
+            cleanup_attempts: Vec::new(),
             pending_borrow_temporaries: Vec::new(),
             pattern_bindings: HashMap::new(),
             next_function_id,
@@ -1647,6 +1662,15 @@ impl<'a> FunctionLowerer<'a> {
             Stmt::Fail { value, .. } => {
                 let value = self.lower_error_expr(value)?;
                 if self.try_handlers.is_empty() {
+                    // Even without a catch/finally handler, this may escape an
+                    // executing conditional cleanup attempt. Keep the ordinary
+                    // direct-fail ABI on the false edge, not PropagateErr.
+                    let value = if self.cleanup_attempts.is_empty() {
+                        value
+                    } else {
+                        self.emit_temp_with_safepoint(value, false)?
+                    };
+                    self.guard_cleanup_escape(None, Some(&value))?;
                     emit_ir_instruction!(self, IrInst::Fail(value));
                     self.current.terminator = IrTerminator::Unreachable;
                 } else {
@@ -1868,6 +1892,7 @@ impl<'a> FunctionLowerer<'a> {
         let error_name = format!("__ku_error_{}", after_id.0);
         let return_name =
             (self.return_type != IrType::Void).then(|| format!("__ku_return_{}", after_id.0));
+        let return_reason = finally_return_id.map(|_| format!("__ku_return_reason_{}", after_id.0));
         // The handler's shared bare Error owner must dominate every error edge.
         // A lazy declaration at the first lowered fail/? can live in a dead
         // finally copy while another reachable copy only stores into the slot.
@@ -1894,6 +1919,17 @@ impl<'a> FunctionLowerer<'a> {
                 }
             );
         }
+        if let Some(name) = &return_reason {
+            self.locals.insert(name.clone(), IrType::Bool);
+            emit_ir_instruction!(
+                self,
+                IrInst::Let {
+                    name: name.clone(),
+                    ty: IrType::Bool,
+                    value: zero_expr(IrType::Bool),
+                }
+            );
+        }
         emit_ir_instruction!(
             self,
             IrInst::BeginTry {
@@ -1907,6 +1943,7 @@ impl<'a> FunctionLowerer<'a> {
             error_name: error_name.clone(),
             return_block: finally_return_id,
             return_name: return_name.clone(),
+            return_reason: return_reason.clone(),
         });
         let body_result = self.lower_scoped_statements(body);
         self.try_handlers.pop();
@@ -1943,6 +1980,7 @@ impl<'a> FunctionLowerer<'a> {
                         error_name: error_name.clone(),
                         return_block: finally_return_id,
                         return_name: return_name.clone(),
+                        return_reason: return_reason.clone(),
                     });
                 }
                 let result = lower.lower_statements(catch_body);
@@ -1983,16 +2021,37 @@ impl<'a> FunctionLowerer<'a> {
             self.finish_current()?;
         }
 
-        if let Some(finally_return_id) = finally_return_id {
+        if let (Some(finally_return_id), Some(reason)) = (finally_return_id, return_reason) {
+            let finish_block = self.next_block("finally_return_finish")?;
             self.start_block(finally_return_id, "finally_return");
-            self.lower_scoped_statements(finally_body)?;
+            self.cleanup_attempts.push(IrCleanupAttempt {
+                handler_floor: self.try_handlers.len(),
+                reason: reason.clone(),
+                finish_block,
+            });
+            let result = self.lower_scoped_statements(finally_body);
+            self.cleanup_attempts.pop();
+            result?;
             if self.current.terminator == IrTerminator::Next {
-                let value = return_name.as_ref().map(|name| IrExpr {
-                    kind: IrExprKind::Local(name.clone()),
-                    ty: self.return_type.clone(),
-                });
-                self.current.terminator = self.return_terminator(value)?;
+                self.current.terminator = IrTerminator::Jump(finish_block);
             }
+            self.finish_current()?;
+
+            // An escaping cleanup outcome joins the same finish as normal
+            // completion. Pop this attempt first so forwarding cannot reenter
+            // its own finally, and preserve the original pending reason.
+            self.start_block(finish_block, "finally_return_finish");
+            let value = return_name.as_ref().map(|name| IrExpr {
+                kind: IrExprKind::Local(name.clone()),
+                ty: self.return_type.clone(),
+            });
+            self.current.terminator = self.return_with_reason(
+                value,
+                IrExpr {
+                    kind: IrExprKind::Local(reason),
+                    ty: IrType::Bool,
+                },
+            )?;
             self.finish_current()?;
         }
 
@@ -4201,7 +4260,13 @@ impl<'a> FunctionLowerer<'a> {
         }
         let timeout_value =
             (self.return_type != IrType::Void).then(|| zero_expr(self.return_type.clone()));
-        self.current.terminator = self.return_terminator(timeout_value)?;
+        self.current.terminator = self.return_with_reason(
+            timeout_value,
+            IrExpr {
+                kind: IrExprKind::Literal("true".into()),
+                ty: IrType::Bool,
+            },
+        )?;
         self.finish_current()?;
 
         self.start_block(continue_block, "safepoint_continue");
@@ -4592,6 +4657,7 @@ impl<'a> FunctionLowerer<'a> {
         }
         // Do not remove compile-time records here: the sibling success edge
         // still owns them and emits its normal post-call cleanup.
+        self.guard_cleanup_escape(self.try_handlers.len().checked_sub(1), Some(&result))?;
         // The try error slot stores just the bare KuError — the part shared by
         // every Result type — so `?` operators unwrapping different Result types
         // inside one try block all target a single, consistently-typed slot
@@ -4643,16 +4709,60 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn return_terminator(&mut self, value: Option<IrExpr>) -> KuResult<IrTerminator> {
-        // A catch-only inner try has no return cleanup of its own, but it
-        // cannot hide an enclosing finally. Select the closest actual finally
-        // together with its matching return owner slot. Error propagation still
-        // uses the nearest catch and must not share this selection rule.
-        let Some((handler, return_block)) = self
-            .try_handlers
-            .iter()
-            .rev()
-            .find_map(|handler| handler.return_block.map(|block| (handler.clone(), block)))
-        else {
+        self.return_with_reason(
+            value,
+            IrExpr {
+                kind: IrExprKind::Literal("false".into()),
+                ty: IrType::Bool,
+            },
+        )
+    }
+
+    fn return_with_reason(
+        &mut self,
+        value: Option<IrExpr>,
+        reason: IrExpr,
+    ) -> KuResult<IrTerminator> {
+        // A catch-only inner try cannot hide an enclosing return-finally.
+        // Error propagation intentionally keeps its different nearest-catch rule.
+        let destination =
+            self.try_handlers
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, handler)| {
+                    handler
+                        .return_block
+                        .map(|block| (index, handler.clone(), block))
+                });
+        // Materialize before branching: either the ordinary route owns this
+        // value or the selected attempt discards it, never both. Do not add a
+        // new clock poll while staging an already-selected timeout's zero.
+        let value = if self.cleanup_attempts.is_empty() {
+            value
+        } else if let Some(value) = value {
+            if value.ty == IrType::Void {
+                // A void call has no temp: emit it before suppression rather
+                // than carrying an unevaluated Call across the escape guard.
+                // Preserve statement-call ordering: execute, poll, then route
+                // this source Return as ordinary on the surviving edge.
+                let needs_safepoint = ir_expr_needs_post_call_safepoint(&value);
+                emit_ir_instruction!(self, IrInst::Expr(value));
+                if needs_safepoint {
+                    self.emit_safepoint()?;
+                }
+                None
+            } else {
+                Some(self.emit_temp_with_safepoint(value, false)?)
+            }
+        } else {
+            None
+        };
+        self.guard_cleanup_escape(
+            destination.as_ref().map(|(index, _, _)| *index),
+            value.as_ref(),
+        )?;
+        let Some((_, handler, return_block)) = destination else {
             return Ok(IrTerminator::Return(value));
         };
         if let (Some(name), Some(value)) = (handler.return_name, value) {
@@ -4664,7 +4774,56 @@ impl<'a> FunctionLowerer<'a> {
                 }
             );
         }
+        let reason_name = handler.return_reason.ok_or_else(|| {
+            KuError::runtime("missing pending-return reason in IR finally", self.span)
+        })?;
+        emit_ir_instruction!(
+            self,
+            IrInst::Store {
+                target: IrLValue::Local(reason_name),
+                value: reason,
+            }
+        );
         Ok(IrTerminator::Jump(return_block))
+    }
+
+    /// Guard only transfers crossing a conditional attempt's lexical floor.
+    /// The true branch discards this new escaping outcome and resumes the
+    /// attempt's original pending timeout. A false inner reason may continue to
+    /// a local catch before encountering any true outer boundary.
+    fn guard_cleanup_escape(
+        &mut self,
+        destination: Option<usize>,
+        payload: Option<&IrExpr>,
+    ) -> KuResult<()> {
+        for index in (0..self.cleanup_attempts.len()).rev() {
+            let attempt = self.cleanup_attempts[index].clone();
+            if destination.is_some_and(|destination| destination >= attempt.handler_floor) {
+                break;
+            }
+            let suppress_block = self.next_block("cleanup_escape_suppress")?;
+            let ordinary_block = self.next_block("cleanup_escape_ordinary")?;
+            self.current.terminator = IrTerminator::Branch {
+                condition: IrExpr {
+                    kind: IrExprKind::Local(attempt.reason),
+                    ty: IrType::Bool,
+                },
+                then_block: suppress_block,
+                else_block: ordinary_block,
+            };
+            self.finish_current()?;
+
+            self.start_block(suppress_block, "cleanup_escape_suppress");
+            if let Some(payload) = payload.filter(|payload| ir_type_is_owned(&payload.ty)) {
+                // Reuse the existing typed in-place drop intrinsic: it clears
+                // the owner, making later structural frame cleanup a no-op.
+                self.emit_borrow_temporary_drop(payload.clone())?;
+            }
+            self.current.terminator = IrTerminator::Jump(attempt.finish_block);
+            self.finish_current()?;
+            self.start_block(ordinary_block, "cleanup_escape_ordinary");
+        }
+        Ok(())
     }
 
     fn admit_instruction(&mut self) -> KuResult<()> {

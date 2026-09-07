@@ -66,7 +66,28 @@ fn native_outer_finally_return_selects_matching_handler_and_payload_slot_in_ir()
         })
         .expect("return payload is saved before finally");
     assert_eq!(value.ty, IrType::Int);
-    assert!(matches!(&cleanup.terminator,
+    let reason_slot = format!(
+        "__ku_return_reason_{}",
+        slot.strip_prefix("__ku_return_")
+            .expect("handler return slot")
+    );
+    assert!(
+        entry
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction,
+        IrInst::Store { target: IrLValue::Local(name), value }
+            if name == &reason_slot && value.ty == IrType::Bool
+                && matches!(&value.kind, IrExprKind::Literal(text) if text == "false"))),
+        "ordinary source return must not select timeout cleanup"
+    );
+    let IrTerminator::Jump(finish_id) = cleanup.terminator else {
+        panic!("finally body must join its pending return finish: {cleanup:?}");
+    };
+    let finish = function.blocks.iter().find(|b| b.id == finish_id).unwrap();
+    assert!(finish.name.starts_with("finally_return_finish"));
+    assert_ne!(finish.id, cleanup.id, "cleanup must not reenter itself");
+    assert!(matches!(&finish.terminator,
         IrTerminator::Return(Some(value))
             if matches!(&value.kind, IrExprKind::Local(name) if name == slot)));
     let optimized = ir::optimize_program(&lowered);
@@ -74,6 +95,12 @@ fn native_outer_finally_return_selects_matching_handler_and_payload_slot_in_ir()
     assert!(
         function.blocks.iter().any(|b| b.id == target),
         "optimizer removed required cleanup"
+    );
+    assert!(
+        function.blocks.iter().any(|b| b.id == finish_id
+            && matches!(&b.terminator, IrTerminator::Return(Some(value))
+            if matches!(&value.kind, IrExprKind::Local(name) if name == slot))),
+        "optimizer must retain the matching payload return after cleanup"
     );
     assert!(!function.blocks.iter().any(|b| matches!(&b.terminator,
         IrTerminator::Return(Some(value))
