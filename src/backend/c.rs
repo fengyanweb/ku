@@ -7,6 +7,8 @@ use output::COutput;
 
 #[path = "c_int.rs"]
 mod checked_int;
+#[path = "c_sync.rs"]
+mod sync;
 
 #[path = "c_task.rs"]
 mod task;
@@ -332,6 +334,10 @@ fn generate_c_source_with_frames_bounded(
     )>,
 ) -> KuResult<String> {
     crate::ir::verify_borrow_contract(program)?;
+    sync::validate_program(program)?;
+    let checked_integer_runtime = sync::uses_checked_integer(program)
+        || frames.is_some_and(|(tasks, _, _)| task::uses_checked_integer(tasks));
+    sync::validate_identifiers(program, checked_integer_runtime)?;
     let mut frame_result_types = Vec::new();
     if let Some((frames, _, _)) = frames {
         if !frames.functions.is_empty() {
@@ -533,6 +539,14 @@ fn generate_c_source_with_frames_bounded(
          \x20 return timed_out;\n\
          }\n\n",
     );
+    // Helpers precede synchronous functions and are shared with Task emission.
+    if checked_integer_runtime {
+        checked_int::emit_runtime(&mut out)?;
+        out.push_str("typedef char KuSyncStatusContract[(KU_INT_OK == 0u && KU_INT_OVERFLOW == 1u && KU_INT_DIV_ZERO == 2u) ? 1 : -1];\n");
+    }
+    if !program.functions.is_empty() {
+        sync::emit_runtime(&mut out)?;
+    }
     // Aggregate struct fields (e.g. `[Person]`) need a layered emission so the
     // struct↔array cycle resolves: forward-declare every struct tag, then emit all
     // array typedefs (a `KuArray_KuStruct_X` only needs the struct as a pointer),
@@ -1146,6 +1160,7 @@ fn emit_array_map_helpers(out: &mut COutput, program: &IrProgram) -> KuResult<()
              \x20     if (__ku_handler_timeout_poll()) {{ timed_out = 1; break; }}\n\
              \x20     result.data[index] = mapper.invoke(mapper.env, {arg});\n\
              \x20     result.len = index + 1;\n\
+             \x20     if (__ku_sync_return_signal.kind != KU_SYNC_EXIT_NONE) {{ timed_out = 1; break; }}\n\
              \x20     if (__ku_handler_timeout_poll()) {{ timed_out = 1; break; }}\n\
              \x20   }}\n\
              \x20 }}\n\
@@ -1296,7 +1311,7 @@ fn walk_terminator_exprs(terminator: &IrTerminator, visit: &mut dyn FnMut(&IrExp
         | IrTerminator::Return(None)
         | IrTerminator::Unreachable => {}
         // A safepoint carries only CFG edges; it has no expression/type payload.
-        IrTerminator::Safepoint { .. } => {}
+        IrTerminator::Safepoint { .. } | IrTerminator::SyncGuard { .. } => {}
     }
 }
 
@@ -2003,6 +2018,13 @@ fn validate_cfg(function: &IrFunction) -> KuResult<()> {
                 targets.push(*continue_block);
                 targets.push(*timeout_block);
             }
+            IrTerminator::SyncGuard {
+                continue_block,
+                cleanup_block,
+            } => {
+                targets.push(*continue_block);
+                targets.push(*cleanup_block);
+            }
             IrTerminator::JumpErr { target, .. } => targets.push(*target),
             IrTerminator::Next
             | IrTerminator::PropagateErr(_)
@@ -2035,6 +2057,7 @@ fn emit_function(out: &mut COutput, function: &IrFunction) -> KuResult<()> {
     // expires, the same frame may take another timeout edge, so the local flag
     // also keeps its unwind-depth contribution idempotent and balanced.
     out.push_str("  int __ku_timeout_unwind = 0;\n");
+    out.push_str("  KuSyncExitSignal __ku_sync_deferred = {0};\n");
     if function.is_closure_body {
         if function.captures.is_empty() {
             out.push_str("  (void)__env;\n");
@@ -2090,11 +2113,13 @@ fn emit_function(out: &mut COutput, function: &IrFunction) -> KuResult<()> {
         )?;
     }
     if function.return_type == IrType::Void {
+        sync::emit_return_guard(out)?;
         emit_owned_cleanup(out, &owned_locals)?;
         out.push_str("  if (__ku_timeout_unwind) __ku_handler_timeout_leave();\n");
         out.push_str("  __ku_call_depth--;\n");
         out.push_str("  return;\n");
     }
+    sync::emit_epilogue(out, function, &owned_locals)?;
     out.push_str("}\n");
     Ok(())
 }
@@ -2139,6 +2164,9 @@ fn emit_inst(
     out.check()?;
     match inst {
         IrInst::Temp { id, ty, value } => {
+            if sync::emit_math_temp(out, *id, value)? {
+                return Ok(());
+            }
             if try_emit_object_construction(out, &format!("t{}", id.0), value)? {
                 return Ok(());
             }
@@ -2287,6 +2315,7 @@ fn emit_inst(
         IrInst::Print(value) => emit_print(out, value)?,
         IrInst::Expr(value) => emit_expr_statement(out, value)?,
         IrInst::Fail(value) => {
+            sync::emit_return_guard(out)?;
             let IrType::Result(inner) = return_type else {
                 return Err(unsupported("native C fail requires a Result return type"));
             };
@@ -2613,6 +2642,7 @@ fn emit_terminator(
             Ok(())
         }
         IrTerminator::PropagateErr(value) => {
+            sync::emit_return_guard(out)?;
             let IrType::Result(return_inner) = return_type else {
                 return Err(unsupported(
                     "native C prototype can only propagate errors from Result functions",
@@ -2658,6 +2688,7 @@ fn emit_terminator(
             Ok(())
         }
         IrTerminator::Return(Some(value)) => {
+            sync::emit_return_guard(out)?;
             // A Copy payload can still live inside an owned cell. Read it
             // before cleanup releases that cell, just as owned returns must be
             // moved out before their source owner is dropped.
@@ -2681,11 +2712,24 @@ fn emit_terminator(
             Ok(())
         }
         IrTerminator::Return(None) => {
+            sync::emit_return_guard(out)?;
             emit_owned_cleanup(out, owned_locals)?;
             out.push_str("  if (__ku_timeout_unwind) __ku_handler_timeout_leave();\n");
             out.push_str("  __ku_call_depth--;\n");
             out.push_str("  return;\n");
             Ok(())
+        }
+        IrTerminator::SyncGuard {
+            continue_block,
+            cleanup_block,
+        } => {
+            // Take once before a finally/helper can run. An old frame-local
+            // suppressed failure must not poison healthy cleanup calls.
+            out.push_str(&format!(
+                "  {{ KuSyncExitSignal __ku_observed = __ku_sync_take();\n  if (__ku_observed.kind != KU_SYNC_EXIT_NONE) {{\n    if (__ku_sync_deferred.kind == KU_SYNC_EXIT_NONE) __ku_sync_deferred = __ku_observed;\n    if (__ku_observed.kind == KU_SYNC_EXIT_ARITHMETIC_FATAL) goto __ku_sync_epilogue;\n    if (!__ku_timeout_unwind) {{ __ku_handler_timeout_enter(); __ku_timeout_unwind = 1; }}\n    goto block{};\n  }} goto block{}; }}\n",
+                cleanup_block.0, continue_block.0,
+            ));
+            out.check()
         }
         IrTerminator::Unreachable => {
             out.push_str("  abort();\n");
@@ -2695,6 +2739,11 @@ fn emit_terminator(
 }
 
 fn c_expr(expr: &IrExpr) -> KuResult<String> {
+    if sync::checked_helper(expr).is_some() {
+        return Err(unsupported(
+            "native C dangerous integer expression was not normalized to a guarded Temp",
+        ));
+    }
     match &expr.kind {
         IrExprKind::Literal(value) => {
             if value == "<native-zero>" {
@@ -2703,6 +2752,8 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 Ok("0".to_string())
             } else if expr.ty == IrType::Str {
                 c_str_literal_static(value)
+            } else if expr.ty == IrType::Int && value == "-9223372036854775808" {
+                Ok("INT64_MIN".to_string())
             } else {
                 Ok(value.clone())
             }
@@ -3448,7 +3499,7 @@ fn emit_result_abi_phase(
                 | IrTerminator::Unreachable => {}
                 // The timeout and continuation targets do not introduce a Result
                 // ABI; any timeout return payload lives in its target block.
-                IrTerminator::Safepoint { .. } => {}
+                IrTerminator::Safepoint { .. } | IrTerminator::SyncGuard { .. } => {}
             }
         }
     }
@@ -6296,7 +6347,7 @@ fn program_fs_usage(program: &IrProgram) -> FsUsage {
                 | IrTerminator::Return(None)
                 | IrTerminator::Unreachable => {}
                 // Safepoint polling itself performs no filesystem operation.
-                IrTerminator::Safepoint { .. } => {}
+                IrTerminator::Safepoint { .. } | IrTerminator::SyncGuard { .. } => {}
             }
         }
     }
@@ -15655,6 +15706,8 @@ static void ku_http_handle_connection(KuHttpServer* server, KuHttpSocket cli) {
   if (route) {
     KuStruct___ku_http_response resp = (KuStruct___ku_http_response){0};
     int handler_timed_out = 0;
+    KuSyncExitSignal handler_signal = {0};
+    __ku_sync_reset();
     if (route->arity == 1) {
       KuObject* params = ku_object_new(0);
       for (size_t p = 0; p < route->nparams; p++) {
@@ -15672,34 +15725,35 @@ static void ku_http_handle_connection(KuHttpServer* server, KuHttpSocket cli) {
       if (route->returns_result) {
         __ku_handler_timeout_begin((unsigned long long)server->handler_timeout_ms);
         KuResult_struct___ku_http_response rr = ((KuResult_struct___ku_http_response(*)(void*, KuStruct___ku_http_request))route->invoke)(route->env, req);
-        handler_timed_out = __ku_handler_timeout_finish();
-        if (handler_timed_out) ku_result_drop_struct___ku_http_response(&rr);
+        handler_timed_out = __ku_sync_finish_request(&handler_signal);
+        if (handler_timed_out || handler_signal.kind != KU_SYNC_EXIT_NONE) ku_result_drop_struct___ku_http_response(&rr);
         else resp = ku_http_response_from_result(rr);
       } else {
         __ku_handler_timeout_begin((unsigned long long)server->handler_timeout_ms);
         resp = ((KuStruct___ku_http_response(*)(void*, KuStruct___ku_http_request))route->invoke)(route->env, req);
-        handler_timed_out = __ku_handler_timeout_finish();
+        handler_timed_out = __ku_sync_finish_request(&handler_signal);
       }
     } else {
       if (route->returns_result) {
         __ku_handler_timeout_begin((unsigned long long)server->handler_timeout_ms);
         KuResult_struct___ku_http_response rr = ((KuResult_struct___ku_http_response(*)(void*))route->invoke)(route->env);
-        handler_timed_out = __ku_handler_timeout_finish();
-        if (handler_timed_out) ku_result_drop_struct___ku_http_response(&rr);
+        handler_timed_out = __ku_sync_finish_request(&handler_signal);
+        if (handler_timed_out || handler_signal.kind != KU_SYNC_EXIT_NONE) ku_result_drop_struct___ku_http_response(&rr);
         else resp = ku_http_response_from_result(rr);
       } else {
         __ku_handler_timeout_begin((unsigned long long)server->handler_timeout_ms);
         resp = ((KuStruct___ku_http_response(*)(void*))route->invoke)(route->env);
-        handler_timed_out = __ku_handler_timeout_finish();
+        handler_timed_out = __ku_sync_finish_request(&handler_signal);
       }
     }
-    if (handler_timed_out) {
+    if (handler_timed_out || handler_signal.kind != KU_SYNC_EXIT_NONE) {
       /* The worker owns this socket and is the sole response writer. A plain
          handler may have completed just after its deadline with a real response;
-         drop it before replacing it with 504. A timed-out Result was dropped in
-         its branch above. */
+         drop it before replacing it with 504 (or 500 for arithmetic failure).
+         A failed Result transport was already dropped in its branch above. */
       if (!route->returns_result) ku_drop_struct___ku_http_response(&resp);
-      ku_http_write_status(cli, 504, "Gateway Timeout");
+      if (handler_timed_out) ku_http_write_status(cli, 504, "Gateway Timeout");
+      else ku_http_write_status(cli, 500, "Internal Server Error");
     } else {
       ku_http_write_response(cli, &resp);
       ku_drop_struct___ku_http_response(&resp);
@@ -16437,7 +16491,7 @@ fn collect_result_inners_program(program: &IrProgram, output: &mut Vec<IrType>) 
                 | IrTerminator::Unreachable => {}
                 // Result-bearing timeout returns are collected from the explicit
                 // timeout target block, not from this edge-only terminator.
-                IrTerminator::Safepoint { .. } => {}
+                IrTerminator::Safepoint { .. } | IrTerminator::SyncGuard { .. } => {}
             }
         }
     }
@@ -16495,6 +16549,7 @@ fn emit_main_wrapper(
         ));
     }
     out.push_str("int main(void) {\n");
+    out.push_str("  __ku_sync_reset();\n");
     if fs_usage.any() && matches!(fs_base, NativeFsBase::ExecutableRelative(_)) {
         // Initialization is deliberately non-fatal. Absolute paths remain usable
         // even if the executable-relative source locator cannot be resolved.
@@ -16505,31 +16560,51 @@ fn emit_main_wrapper(
     } else {
         ""
     };
+    // Materialize first, then consume the mailbox before interpreting any
+    // result tag or output. Failed frames returned only a typed transport zero.
+    match &function.return_type {
+        IrType::Void => out.push_str("  ku_main();\n"),
+        IrType::Int | IrType::Bool | IrType::Str | IrType::Result(_) => out.push_str(&format!(
+            "  {} result = ku_main();\n",
+            c_type(&function.return_type)?,
+        )),
+        other => {
+            return Err(unsupported(format!(
+                "native C main wrapper does not support main return type {other}"
+            )))
+        }
+    }
+    out.push_str("  KuSyncExitSignal signal = __ku_sync_take();\n  if (signal.kind != KU_SYNC_EXIT_NONE) {\n");
+    if is_c_owned_type(&function.return_type) {
+        emit_drop_expr(out, &function.return_type, "result")?;
+    }
+    out.push_str(mysql_shutdown);
+    out.push_str(
+        "  fputs(__ku_sync_error_message(signal), stderr); fputc('\\n', stderr); return 1;\n  }\n",
+    );
     match &function.return_type {
         IrType::Void => {
-            out.push_str("  ku_main();\n");
             out.push_str(mysql_shutdown);
             out.push_str("  return 0;\n");
         }
         IrType::Int => {
-            out.push_str("  int exit_code = (int)ku_main();\n");
+            out.push_str("  int exit_code = (int)result;\n");
             out.push_str(mysql_shutdown);
             out.push_str("  return exit_code;\n");
         }
         IrType::Bool => {
-            out.push_str("  int exit_code = ku_main() ? 0 : 1;\n");
+            out.push_str("  int exit_code = result ? 0 : 1;\n");
             out.push_str(mysql_shutdown);
             out.push_str("  return exit_code;\n");
         }
         IrType::Str => {
-            out.push_str("  KuString result = ku_main();\n  ku_string_write(stdout, result);\n  fputc('\\n', stdout);\n  ku_string_drop(&result);\n");
+            out.push_str("  ku_string_write(stdout, result);\n  fputc('\\n', stdout);\n  ku_string_drop(&result);\n");
             out.push_str(mysql_shutdown);
             out.push_str("  return 0;\n");
         }
         IrType::Result(inner) => {
             out.push_str(&format!(
-                "  {} result = ku_main();\n  if (!result.ok) {{ ku_string_write(stderr, result.error.message); fputc('\\n', stderr); ku_result_drop_{}(&result);{}  return 1; }}\n  ku_result_drop_{}(&result);\n{}  return 0;\n",
-                c_type(&function.return_type)?,
+                "  if (!result.ok) {{ ku_string_write(stderr, result.error.message); fputc('\\n', stderr); ku_result_drop_{}(&result);{}  return 1; }}\n  ku_result_drop_{}(&result);\n{}  return 0;\n",
                 c_type_suffix(inner)?,
                 mysql_shutdown,
                 c_type_suffix(inner)?,

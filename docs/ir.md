@@ -53,7 +53,7 @@ ku ir examples\function.ku
 - `for` 已有 `ForEach` terminator。
 - `?` 会降成 `ResultBranch`，ok 分支用 `BindOk` 取值，err 分支用 `PropagateErr` 或 `JumpErr` 跳入 try handler。
 - `try/catch/finally` 已有 `BeginTry` / `EndTry` / `BindError` 标记；可恢复错误、普通完成和 return 使用独立 finally block，return value 先写入隐藏槽，再经过 finally 返回。return 选择最近具有 finally 的 handler 及其对应返回值槽；内层仅有 catch 不能屏蔽外层 finally。错误传播仍选择最近的错误 handler，不共用返回路径的筛选规则。
-- 同步 return-finally 使用每个 pending return 独立的隐藏原因槽：普通 return 为 false，已有 safepoint 选中的 timeout 为 true。只在跨出该清理尝试的 handler 边界时屏蔽新的 fail、`?` 或 return，丢弃新 Owned payload 并接回原 finish；清理内部局部 try/catch 仍按普通规则执行。void return 调用先执行副作用和既有 post-call 检查。保留三份 finally body，不增加第四份；嵌套清理不重置原绝对 deadline。这不涵盖同步算术/Panic/底层 helper 直接退出、跨同步调用传播所有 fatal 原因或 Task 用户 finally。
+- 同步 return-finally 使用每个 pending return 独立的隐藏原因槽：普通 return 为 false，已有 safepoint 选中的 timeout 为 true。只在跨出该清理尝试的 handler 边界时屏蔽新的 fail、`?` 或 return，丢弃新 Owned payload 并接回原 finish；清理内部局部 try/catch 仍按普通规则执行。void return 调用先执行副作用和既有 post-call 检查。保留三份 finally body，不增加第四份；嵌套清理不重置原绝对 deadline。同步整数算术另由下文 SyncGuard 接入；Panic/index/OOM/底层 helper 直接退出、传播所有 fatal 原因或 Task 用户 finally 仍不在已完成边界内。
 - struct / enum 会进入 layout table，enum variant 有稳定 tag 和 payload 字段顺序。
 - array literal/index/assignment 保留元素类型，native C 从 IR 生成带长度的 array ABI。
 - enum 构造、tag、payload 访问和 match 已降低为显式 CFG 与 intrinsic，不再使用 unsupported 占位。
@@ -431,7 +431,7 @@ M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能
 或另一逻辑式可生成自己的状态，不会把 RHS 指令提前到短路分支之前。未选中 RHS
 仍被 type/budget 检查；条件创建的 Task 按真实 initialized 位参加最终 scope drain。
 
-`src/backend/c_int.rs` 的 checked i64 helper 只在 Task artifact 含算术时发射一次；
+`src/backend/c_int.rs` 的 checked i64 helper 在同步或 Task IR 含算术时共享发射一次；
 比较和 Not 不需要这些 helper。检查本身避免 signed UB，失败不写目标、无分配或
 exit，不改变 frame/control/driver 布局或版本（仍为2/1/4）。Negate MIN、算术越界、
 MIN/-1 的除/余都报 `integer overflow`；除/余零优先报 `division by zero`，负数
@@ -439,9 +439,31 @@ MIN/-1 的除/余都报 `integer overflow`；除/余零优先报 `division by ze
 RUNTIME_FAILURE、原有 Result/drop/child drain；不是普通 USER_RESULT 或 driver
 INTERNAL，也不是通过进程退出绕过清理。取消已经胜出时保留原原因和既有绝对 D。
 
-本片不把同步 C 现有的直接 signed 算术输出伪装成已修复：该路径仍存在独立的
-溢出/除零 UB 缺陷，必须单独接入 checked 计算及同步 fatal cleanup。不能只因
-Task helper 通过就宣称所有后端已统一；不新增用户错误 code 或可恢复算术 API。
+R5e 本身没有接入同步算术；后续 R5g 的独立实现与边界如下。不能只因 Task helper
+通过就宣称所有后端已统一；不新增用户错误 code 或可恢复算术 API。
+
+### R5g 同步整数与 SyncGuard（开发中）
+
+同步 int 的 Negate、Add/Subtract/Multiply/Divide/Remainder 调用上述 checked helper。
+typed producer 后立即接 `SyncGuard { continue_block, cleanup_block }`；直接调用、
+函数值调用和 array.map 也先物化结果并检查，再允许后续实参、赋值、print、`?`
+或 timeout poll。raw IR 若把这类操作嵌在未正规化表达式中或缺少紧邻 guard，C
+生成器拒绝，不输出可能先读取失败结果的 C。新块和指令仍按原共享预算接纳。
+
+`src/backend/c_sync.rs` 使用线程局部、无 Owned payload 的私有返回信号。调用者
+立即 take 清空信号，帧内保留首次退出原因；健康的 finally helper 不继承旧 mailbox。
+普通算术 fatal 不可 catch，跳过用户 finally，但通过统一 owner epilogue 释放结构化
+资源后退出；不会伪装为用户 Result.err。已选 timeout 的清理中算术失败只中止本次
+清理尝试，仍尝试外层 finally，保留原绝对 D、不续期。已求值的 fresh borrow 临时
+按逆序 drop，借用来源不消费；map 中止后回收已初始化输出前缀与 env。
+
+main 和 HTTP dispatcher 是消费信号的根：先取信号，再解释返回值。HTTP 普通算术
+失败为500，已经选中的 timeout 仍为504；不能由稍后的时钟检查把500升级为504。
+这不是事件驱动 HTTP、M:N 或完整 fatal 闭环。Panic/index/OOM、call-depth 的直接
+退出、foreign callback 重入、Task 用户 finally 仍未覆盖。LLVM 仅保留 SyncGuard
+两条 CFG 边的结构占位，不提供本片 native C 的 checked 算术与 Owned 清理保证。
+定向实测与失败记录见工作日志；本片完整 workspace、精确提交三系统 CI/sanitizer
+和打包门禁必须独立验收，不能以旧 SHA 的结果替代。
 
 ## IR 优化队列
 

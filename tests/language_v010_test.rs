@@ -102,6 +102,10 @@ fn assert_ir_cfg_acyclic(program: &ir::IrProgram) {
                     continue_block,
                     timeout_block,
                 } => vec![*continue_block, *timeout_block],
+                ir::IrTerminator::SyncGuard {
+                    continue_block,
+                    cleanup_block,
+                } => vec![*continue_block, *cleanup_block],
                 ir::IrTerminator::JumpErr { target, .. } => vec![*target],
                 ir::IrTerminator::Next
                 | ir::IrTerminator::PropagateErr(_)

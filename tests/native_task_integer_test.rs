@@ -173,10 +173,20 @@ fn generated_helpers() -> String {
         .find("/* Private checked int64_t computations.")
         .expect("the actual shared integer runtime was emitted");
     let end = source[start..]
-        .find("/* Internal control ABI v1.")
-        .expect("checked helpers precede the existing Task control runtime")
+        .find("typedef char KuSyncStatusContract[")
+        .expect("shared emitter checks the status contract immediately after integer helpers")
         + start;
     let helpers = &source[start..end];
+    // Task and synchronous functions share this one early helper block. Do not
+    // include intervening user/runtime functions up to the later Task ABI.
+    for helper in HELPERS {
+        assert_eq!(
+            helpers
+                .matches(&format!("static uint32_t {helper}("))
+                .count(),
+            1
+        );
+    }
     for forbidden in [
         "malloc(",
         "calloc(",

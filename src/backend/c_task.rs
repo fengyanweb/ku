@@ -23,17 +23,8 @@ use super::{
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_FRAME_SLOTS: usize = 64;
 
-pub(super) fn emit_frames(
-    out: &mut COutput,
-    tasks: &TaskProgram,
-    plan: &TaskFramePlan,
-) -> KuResult<()> {
-    if tasks.functions.is_empty() {
-        return Ok(());
-    }
-    out.check()?;
-    out.push_str(FRAME_ABI);
-    let arithmetic = tasks.functions.iter().any(|function| {
+pub(super) fn uses_checked_integer(tasks: &TaskProgram) -> bool {
+    tasks.functions.iter().any(|function| {
         function.states.iter().any(|state| {
             state.operations.iter().any(|operation| {
                 matches!(
@@ -52,10 +43,19 @@ pub(super) fn emit_frames(
                 )
             })
         })
-    });
-    if arithmetic {
-        super::checked_int::emit_runtime(out)?;
+    })
+}
+
+pub(super) fn emit_frames(
+    out: &mut COutput,
+    tasks: &TaskProgram,
+    plan: &TaskFramePlan,
+) -> KuResult<()> {
+    if tasks.functions.is_empty() {
+        return Ok(());
     }
+    out.check()?;
+    out.push_str(FRAME_ABI);
     super::task_control::emit_runtime(out)?;
     super::task_driver::emit_runtime(out)?;
     super::task_adapter::emit_host(out, tasks)?;

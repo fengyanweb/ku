@@ -2125,3 +2125,174 @@ fn main(): null! {
         );
     }
 }
+
+// Synchronous arithmetic through all four native HTTP dispatcher shapes.
+// Reuses the real compiler, socket reader, lock and child-process watchdog.
+const SYNC_ARITHMETIC_HTTP_SOURCE: &str = r#"
+import "std.http"
+import fs from "std.fs"
+
+fn Divide(left: int, right: int): int { return left / right }
+fn RecoverableShape(): int! {
+    owned = "fatal-" + "owner"
+    try {
+        return ok(Divide(7, 0))
+    } catch (err) {
+        fs.write("BAD-catch.txt", owned.clone())
+        return ok(99)
+    } finally {
+        fs.write("BAD-finally.txt", "ordinary fatal must skip user finally")
+    }
+    return ok(0)
+}
+fn Mark(): null! {
+    fs.write("cleanup-outer.txt", "healthy-after-failed-callee")?
+    return ok(null)
+}
+fn Timed() {
+    owner = "timed-" + "owner"
+    try { while (true) {} }
+    finally {
+        try {
+            value = Divide(9, 0)
+            fs.write("BAD-after-math.txt", str(value))
+        } finally {
+            Mark()
+            fs.write("cleanup-after-helper.txt", owner.clone())
+        }
+    }
+    return http.text("BAD timeout response")
+}
+fn main(): null! {
+    app = http.server({
+        handler_timeout_ms: 100,
+        read_header_timeout_ms: 2000,
+        max_connections: 8,
+        max_active_requests: 1,
+        max_pending_requests: 2
+    })
+    app.get("/plain-zero", fn() {
+        value = Divide(7, 0)
+        return http.text(str(value))
+    })
+    app.post("/plain-one", fn(req) {
+        owned = req.body.clone()
+        value = Divide(7, 0)
+        return http.text(owned + str(value))
+    })
+    app.get("/result-zero", fn() {
+        try {
+            value = RecoverableShape()?
+            return ok(http.text(str(value)))
+        } catch (err) { fs.write("BAD-handler-catch.txt", err.message.clone()) }
+        return ok(http.text("BAD-handler-fallback"))
+    })
+    app.post("/result-one", fn(req) {
+        owned = req.body.clone()
+        try {
+            value = RecoverableShape()?
+            return ok(http.text(owned + str(value)))
+        } catch (err) { fs.write("BAD-handler-catch.txt", err.message.clone()) }
+        return ok(http.text("BAD-handler-fallback"))
+    })
+    app.get("/timed", Timed)
+    app.get("/ok", fn() { return http.text("clean-worker") })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+
+#[test]
+fn native_sync_arithmetic_http_failure_isolated_and_timeout_keeps_504() {
+    let _guard = HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let address = unused_local_address();
+    let Some(mut server) =
+        spawn_native_server("sync-arithmetic", SYNC_ARITHMETIC_HTTP_SOURCE, &address)
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a real native compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(server.c_source()).expect("generated C");
+    // Reject the old unchecked artifact before sending any arithmetic request.
+    assert_eq!(generated.matches("static uint32_t ku_int_div(").count(), 1);
+    let divide_body = generated
+        .split_once("int64_t Divide(int64_t left, int64_t right) {")
+        .expect("actual Divide definition")
+        .1
+        .split("\n}")
+        .next()
+        .unwrap();
+    assert!(
+        divide_body.contains("ku_int_div("),
+        "actual Divide must call checked helper before any request"
+    );
+    assert!(!generated.contains("run_source") && !generated.contains("const SOURCE"));
+    let directory = server.dir().to_path_buf();
+    // Existing HTTP harness has already started the server. This only verifies
+    // live source removal; cold-start source independence is a separate gate.
+    fs::remove_file(directory.join("server.ku")).unwrap();
+    fs::remove_file(server.c_source()).unwrap();
+    let watchdog = server.arm_kill_watchdog(Duration::from_secs(20));
+    let good_request = "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let ready = http_response(&address, good_request, Duration::from_secs(5));
+    assert_status(&ready, "HTTP/1.1 200 OK");
+    assert!(ready.ends_with("clean-worker"));
+    for _ in 0..3 {
+        for (method, path, body) in [
+            ("GET", "/plain-zero", ""),
+            ("POST", "/plain-one", "owned request"),
+            ("GET", "/result-zero", ""),
+            ("POST", "/result-one", "owned request"),
+        ] {
+            let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let failed = http_response(&address, &request, Duration::from_secs(3));
+            assert_status(&failed, "HTTP/1.1 500 Internal Server Error");
+            assert_eq!(
+                failed.split_once("\r\n\r\n").expect("HTTP headers").1,
+                "Internal Server Error"
+            );
+            let recovered = http_response(&address, good_request, Duration::from_secs(3));
+            assert_status(&recovered, "HTTP/1.1 200 OK");
+            assert!(recovered.ends_with("clean-worker"));
+            assert!(!watchdog.timed_out());
+        }
+    }
+    let timed = http_response(
+        &address,
+        "GET /timed HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&timed, "HTTP/1.1 504 Gateway Timeout");
+    assert_eq!(
+        fs::read_to_string(directory.join("cleanup-outer.txt")).unwrap(),
+        "healthy-after-failed-callee"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.join("cleanup-after-helper.txt")).unwrap(),
+        "timed-owner"
+    );
+    for marker in [
+        "BAD-catch.txt",
+        "BAD-finally.txt",
+        "BAD-after-math.txt",
+        "BAD-handler-catch.txt",
+    ] {
+        assert!(
+            !directory.join(marker).exists(),
+            "unexpected continuation: {marker}"
+        );
+    }
+    let recovered = http_response(&address, good_request, Duration::from_secs(3));
+    assert_status(&recovered, "HTTP/1.1 200 OK");
+    assert!(recovered.ends_with("clean-worker"));
+    assert!(!watchdog.timed_out());
+    // max_active_requests=1 exercises one execution thread reused across roots
+    // (including the legacy inline acceptor fallback if worker creation fails).
+    // Marker writes prove actions occurred, not exactly-once counts or D values.
+    // This is not a multi-worker, allocation-ledger or production-soak claim.
+}
