@@ -17,9 +17,9 @@ use bounded_process::FailureKind;
 pub use bounded_process::{run_bounded, OutputLimits};
 pub type BoundedOutput = bounded_process::BoundedOutput;
 
-const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
+pub const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(20);
-const BUILD_LIMITS: OutputLimits = OutputLimits::new(8 * 1024 * 1024, 12 * 1024 * 1024);
+pub const BUILD_LIMITS: OutputLimits = OutputLimits::new(8 * 1024 * 1024, 12 * 1024 * 1024);
 pub const RUN_LIMITS: OutputLimits = OutputLimits::new(1024 * 1024, 2 * 1024 * 1024);
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 

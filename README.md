@@ -359,7 +359,9 @@ http_pg_frontend.html # http_pg 的前端页面
 
 `ku build --native <file.ku>` 不带 `-o` 时保留旧的单文件兼容模式，只在源码旁写出 `.c`，不执行链接；`ku build --native -o <path> <file.ku>` 则进入与 `--backend c` 相同的生成、编译、链接和产物校验流程。普通跨系统发布使用上面的 `--backend c --target` 命令，避免把“只生成 C”误认为已经得到目标二进制。
 
-native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制，覆盖 `int` / `bool` / `str`（正式 `KuString` owned ABI，支持拼接与 `str()`/`len`/`chars`/`contains`/`slice` 等方法）、struct（含数组/嵌套/enum 字段）、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包（env 引用计数）、native HTTP 服务以及数据库驱动（std.pg/redis/mysql）的已实现子集。array/named/Result/struct/闭包按默认 move、显式 `clone()`、自动 drop 生成所有权代码，并由 checker 做路径级 move 分析。深层闭包只为实际被捕获的函数参数创建共享 cell；当前参数路径直接覆盖 Copy、`str`、array、函数值、struct、enum 和 Result，未被捕获的参数不增加 cell/RC 开销，owned 参数 move 进 cell 后会清空原始 ABI 参数；普通局部路径另已覆盖 object 与 KuValue。核心同步 ABI、`std.fs/std.json/std.time`、native HTTP、`std.net` 明文与 Redis 的 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支均已在 Windows 2025、Ubuntu 24.04、macOS 15 的完整 workspace CI 中跑绿；三个目标的独立 native build/run 门槛也已通过。`std.net` 的可选 TLS 在 v0.0.17 的精确提交 `c66828390eb3124750bca9a9c7e789dd2df70267` 已通过包含最终消费者的[三系统 CI](https://github.com/fengyanweb/ku/actions/runs/33969256015)；此历史证据不代表 v0.0.18 工作分支或后续 pack 已通过，变更后仍须重新验收。这些证据也不等于 Redis/MySQL 实服查询或 PG 的 Linux/macOS 实库往返已经完成。`std.mysql` 目前只在 host build 自动配对 client library，显式 non-host target 会提前拒绝；三系统发布因此应在各目标系统分别构建。`std.pg` 构建必须通过绝对、专用的 `KU_PG_LIB` 目录提供匹配目标的 shared/import libpq；compiler/sysroot 还必须满足其传递依赖。仍明确报不支持的：动态 object 的部分复杂场景、从 dynamic object 取回闭包后调用、闭包捕获 catch/match binding、在更深闭包里捕获 local function 的 self、`for` 迭代变量，以及 Task 捕获/async native lowering；dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同，不能按普通局部的证据视为已完成。str 的 `trim`/`lower`/`upper`（需 Unicode 表）也仍未实现。
+v0.0.18 开发分支已接通 native C 的单 worker 有限源码 Task 子集：import 展开后全部为顶层非泛型 async 函数，入口为 `async fn main(): null!`，参数/返回限 primitive 与单层 Result。支持直线绑定、直接 async 调用、Task move、Await、ok/?、print/println、return、字符串常量 fail 和静态字符串；函数退出先移交全部 sibling，再有界等待逻辑清理 ACK。仍拒绝 if/循环/递归、重复赋值、嵌套 scope、try/catch/finally、闭包、同步用户调用、Task 参数/返回/容器/clone、未绑定 Task 临时及动态堆表达式；LLVM、`ku ir` 和 `--emit-ir` 仍拒绝 async。源码与 CLI 定向运行已通过，本片安全与完整本机回归已通过，精确提交三系统 CI 仍待完成，不是正式发布；M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算与性能/soak 尚未完成。用法与边界见 [并发文档](docs/concurrency.md#当前-native-c-源码子集)。
+
+native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制，覆盖 `int` / `bool` / `str`（正式 `KuString` owned ABI，支持拼接与 `str()`/`len`/`chars`/`contains`/`slice` 等方法）、struct（含数组/嵌套/enum 字段）、带长度和越界检查的 array、enum tag/payload、嵌套 match、基础控制流、统一 `KuError` / Result、`try/catch/finally`、闭包（env 引用计数）、native HTTP 服务以及数据库驱动（std.pg/redis/mysql）的已实现子集。array/named/Result/struct/闭包按默认 move、显式 `clone()`、自动 drop 生成所有权代码，并由 checker 做路径级 move 分析。深层闭包只为实际被捕获的函数参数创建共享 cell；当前参数路径直接覆盖 Copy、`str`、array、函数值、struct、enum 和 Result，未被捕获的参数不增加 cell/RC 开销，owned 参数 move 进 cell 后会清空原始 ABI 参数；普通局部路径另已覆盖 object 与 KuValue。核心同步 ABI、`std.fs/std.json/std.time`、native HTTP、`std.net` 明文与 Redis 的 Windows Winsock、Linux/macOS POSIX socket/poll/pthread 分支均已在 Windows 2025、Ubuntu 24.04、macOS 15 的完整 workspace CI 中跑绿；三个目标的独立 native build/run 门槛也已通过。`std.net` 的可选 TLS 在 v0.0.17 的精确提交 `c66828390eb3124750bca9a9c7e789dd2df70267` 已通过包含最终消费者的[三系统 CI](https://github.com/fengyanweb/ku/actions/runs/33969256015)；此历史证据不代表 v0.0.18 工作分支或后续 pack 已通过，变更后仍须重新验收。这些证据也不等于 Redis/MySQL 实服查询或 PG 的 Linux/macOS 实库往返已经完成。`std.mysql` 目前只在 host build 自动配对 client library，显式 non-host target 会提前拒绝；三系统发布因此应在各目标系统分别构建。`std.pg` 构建必须通过绝对、专用的 `KU_PG_LIB` 目录提供匹配目标的 shared/import libpq；compiler/sysroot 还必须满足其传递依赖。仍明确报不支持的：动态 object 的部分复杂场景、从 dynamic object 取回闭包后调用、闭包捕获 catch/match binding、在更深闭包里捕获 local function 的 self、`for` 迭代变量，以及 Task 捕获和超出上述有限子集的 async native lowering；dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同，不能按普通局部的证据视为已完成。str 的 `trim`/`lower`/`upper`（需 Unicode 表）也仍未实现。
 
 已完成到 0.0.15 的关键前置：
 
@@ -381,7 +383,7 @@ native C 后端可用 MSVC 或匹配目标的 C 工具链编译独立二进制�
 IR 已有 ResultBranch / BindOk / JumpErr / PropagateErr。
 native C 后端已有统一 Error 对象 ABI、复杂 Result payload 和 try/catch/finally。
 package 已有 ku.mod、绝对 file:// 开发覆盖、确定性 pack、HTTPS publish/resolve、签名 index、传递依赖、有界回溯、portable registry ku.lock、完整性校验和 cache GC；绝对 file source 是显式的本地覆盖例外。registry 公钥由项目显式 pin；未配置 trust、签名不符、lock/cache 缺失或内容篡改都会 fail-closed。仓库提供 `ku-registry` 自托管有界参考实现并有真实 TLS 闭环测试；它不等于官方托管服务，也不据此声明生产并发能力。
-async runtime 已有 blocking shutdown drain、累计指标和内部百万并发需求压力测试；开发者侧提供 HTTP 千万请求压测 demo。
+解释器 async runtime 已有 blocking shutdown drain、累计指标和内部百万并发需求压力测试；这些不是 native Task 子集的性能证据。开发者侧提供 HTTP 千万请求压测 demo。
 仓库根目录的 `test.ku` 和 `run-test.ps1` 是 runtime 内部诊断入口，前者通过 `std.task` 打印百万并发需求测试的前后时间与 runtime 指标，后者额外采集进程 CPU、峰值内存和线程数。普通开发者示例使用 `examples/http_capacity_10m.ku`：业务代码只写 HTTP handler 和返回值，不直接管理 task；压测由 `examples/http_bench.ps1` 发起。
 `std.time` 的 `time.now()` 返回 Unix epoch 毫秒整数，`time.steady_millis()` 提供进程内单调毫秒；Time object 由 `time.instant()` 创建，`time.elapsed(previous)` 计算到当前的毫秒差。日期、格式化、解析、时间段和固定偏移 zone API 继续使用 Time/Date/Duration object。
 match 已修正 guarded wildcard 误判，并诊断重复未带 guard 的字面量分支。
@@ -400,7 +402,7 @@ powershell -ExecutionPolicy Bypass -File examples\http_bench.ps1 -Url http://127
 native C 输出会把 Ku main 改成 ku_main，并生成系统 int main(void) wrapper。
 async fn 调用会立即启动一次性 task 句柄，必须显式返回 T!；await task? 等价于 (await task)?，并且 await 会消费 task，普通 task 只能 await 一次。
 Ku 不提供 task.spawn、Task.new、runtime.schedule 或 thread.spawn；HTTP server 内部可以使用 task，但 handler 用户不需要手动管理。
-async runtime 默认最多 1024 个 task；blocking worker 为 min(32, max(4, CPU 核心数))，blocking queue 最多 1024，超限返回结构化 task Err。
+解释器 async runtime 默认最多 1024 个 task；blocking worker 为 min(32, max(4, CPU 核心数))，blocking queue 最多 1024，超限返回结构化 task Err。native Task 子集是单 worker，不包含 blocking pool。
 registry resolver 支持 exact/caret、签名传递依赖元数据和有界回溯；`check/run/build/package resolve` 已统一接入 HTTPS-only 获取、Ed25519 验签、SHA-256、受限 `.tar.zst`、内容树校验、内容寻址 cache 和单飞安装租约。联网解析、锁等待、重试与分块校验共用 300 秒绝对预算（同步 DNS/已进入内核的文件操作不能硬取消），依赖图上限 256、求解上限 20000 步；同一 package cache 根跨进程共享 8 个下载槽，index 与 `.sig` 最多获取 3 个完整配对。
 LLVM 文本后端已支持非递归 struct 和基础/struct Result。
 标准库 root import 允许小写导出，例如 `import { task, time } from "std"`；用户自定义文件的顶层 `fn/struct/enum` 仍必须首字母大写才对外导出。import/export 诊断会给出位置、问题描述和修改方向。
@@ -416,7 +418,7 @@ registry v2 自动 signed-roots、在线 key 吊销和透明轮换（v1 使用�
 完整 match guard 模式矩阵和跨 guard 的穷尽性证明
 native C 动态 object 的部分复杂场景、str 的 trim/lower/upper(需 Unicode 表)
 native closure 捕获 struct/enum/Result/Task 等 owned 类型，以及从 dynamic object 取回闭包后调用
-native async ABI / async 函数值
+完整 native async lowering、async 函数值、M:N/netpoll/事件驱动 HTTP/native blocking、完整 RSS 预算与性能/soak
 数据库驱动的解释器(`ku run`)支持；Redis/MySQL 新 client 的三系统真实服务查询；PG 的 Linux/macOS 实库往返；Redis/MySQL 可强制证书与主机名验证的 TLS 配置
 ```
 

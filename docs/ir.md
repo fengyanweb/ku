@@ -60,7 +60,7 @@ ku ir examples\function.ku
 - native C 已支持非递归 struct、带长度 array、enum tag/payload 和嵌套 match CFG。
 - native C 已支持 array/named/Result 的 move、clone、drop；解构赋值先物化全部 RHS，避免 owned swap 丢值。
 - LLVM 文本后端已支持非递归 struct 和 `Result<int|bool|str|struct>`。
-- 闭包/function value native ABI 已具备 typed invoke pointer、局部 RC env 和按需共享 cell。参数路径直接覆盖 Copy、`str`、array、函数值、struct、enum 与 Result，普通局部路径另覆盖 object 与 KuValue；catch/match binding、local-function self、`for` 迭代变量和 Task/async native ABI 仍是明确拒绝的边界。dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同。
+- 闭包/function value native ABI 已具备 typed invoke pointer、局部 RC env 和按需共享 cell。参数路径直接覆盖 Copy、`str`、array、函数值、struct、enum 与 Result，普通局部路径另覆盖 object 与 KuValue；catch/match binding、local-function self、`for` 迭代变量、Task 捕获和 async 函数值仍是明确拒绝的边界。有限源码 Task 不通过 closure ABI 实现。dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同。
 - 暂不做 SSA、寄存器分配和完整 native ABI lowering。
 
 ## 同步只读借用参数（0.0.17 首版实验合同）
@@ -86,7 +86,7 @@ owned 参数仍按对应值 ABI 传递。typed closure 的 invoke prototype 和�
 
 `json.stringify` 复用只读 writer 遍历输入；typed array 直接写入输出 buffer，不再为了 JSON 转换先装箱为拥有输入的 `KuValue` array。serializer 不消费或 drop 借用输入，输出字符串仍由其 Result 拥有；新建的临时输入仍由 caller 在调用返回后清理。这只消除输入复制/错误清理，不表示 JSON 输出无需分配。
 
-这是 Ku 内部生成 C 的合同，不新增允许外部 C 长期保存 borrowed pointer 的公开 FFI。模式改变了相关生成函数的 prototype，旧 C/FFI 产物必须重新编译。LLVM 文本后端明确拒绝借用参数，使用 C backend；native async lowering 仍沿用原有不支持边界。
+这是 Ku 内部生成 C 的合同，不新增允许外部 C 长期保存 borrowed pointer 的公开 FFI。模式改变了相关生成函数的 prototype，旧 C/FFI 产物必须重新编译。LLVM 文本后端明确拒绝借用参数，使用 C backend；首片 native async 子集不支持 borrowed 参数或同步借用调用。
 
 当前 checker 明确拒绝 borrowed `for`、带 owned payload binding 的 borrowed match、消费式对象解构、borrowed Result `?` 以及未迁移的 stdlib borrowed 路径；这些不能被写成 native 已支持。`borrow_native_test` 与 `borrow_allocation_test` 分别覆盖可观察行为、源码删除后运行，以及嵌套读取无分配 / 临时生命周期门槛；它们不代表全量回归、三系统或 sanitizer 已完成，实际验证状态见 [v0.0.17.md](v0.0.17.md)。
 
@@ -117,26 +117,30 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 1. 逐项补齐闭包尚未支持的 binding/payload 捕获，并为每一种 owned payload 固定逃逸与失败清理测试。
 2. 继续收窄动态 object 与 Result 的组合边界，不把单项 ABI 存在等同于任意嵌套组合已完成。
 3. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
-4. async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；解释器生命周期验证见 [阶段工作日志](v0.0.18-worklog.md)。实验性 frame IR、串行 frame ABI 及控制内核见下节；源码 async lowering、完整 Task 生命周期和调度器仍未实现。只有相应子集通过 IR verifier 与 native 执行测试后才能开放，不能把解释器或内部 frame 夹具通过当作源码 native async 完成。
+4. native C 已接通单 worker 有限源码 Task 子集，其余 async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；执行证据见 [阶段工作日志](v0.0.18-worklog.md)。源码及 CLI 定向运行已通过；本片安全与完整本机回归已通过，精确提交三系统 CI 仍待完成。不能把这个子集或内部 frame 夹具通过当作完整 native async、M:N 或生产性能验收完成。
 
-## 实验性 task frame IR（v0.0.18 R1，未开放源码 async）
+## Typed Task IR 与有限源码接入（v0.0.18 开发中）
 
 `src/ir/task.rs` 是与同步 `IrProgram` 分离的编译器内部中间层，不增加 Ku 写法、
-标准库入口或 CLI 开关。它还没有从 Ku AST 生成 frame 的 lowering，也没有 Task
-创建、await、I/O 或 scheduler 操作，不能用内部 Rust API 代替用户 async 的验收。
+标准库入口或 CLI 开关。`src/ir/task_lower.rs` 从已展开并检查的 AST 生成该 IR，
+仅由 native C 的显式 async main 子集选用；同步 IR、LLVM 不通过清除 async 标志回退。
 
 当前 frame IR 使用密集 `SlotId` / `StateId`，支持 `int`、`bool`、`null`、`str`
-及对应单层 Result。操作显式区分 Init、Copy、Move、WrapOk、Read、Drop、DropIfInit；
-控制边区分 Jump、Branch、Suspend（resume / cleanup）、Complete 和 Terminate。
-暂不支持 array/object/struct/enum、函数值、子 Task 或借用参数进入 frame。
+及对应单层 Result，以及 move-only `Task { result }` 槽。操作显式区分 Init、Copy、Move、
+WrapOk、Read、Drop、DropIfInit、Start、Print；控制边包括 Jump、Branch、Suspend
+（resume / cleanup）、Await、TryResult、Complete 和 Terminate。
+暂不支持 array/object/struct/enum、函数值、Task 参数/返回或借用参数进入 frame。
 
 `verify_and_plan` 先验证形状、类型、资源硬限，再计算跨分支和循环的 must/may
-初始化固定点及包括 cleanup/drop 用途的 liveness。只把入口参数和真正跨挂起存活
-的槽放进 frame；已死亡的 Copy 临时留在 resume 栈上，dead owned 必须在挂起前显式
+初始化固定点及包括 cleanup/drop 用途的 liveness。普通 Value-only frame 保留原有按需
+存储；hosted frame 的所有 Task 槽和 Owned Value 槽固定存储，已死亡的 Copy 临时可留
+在 resume 栈上。Await ready 消费隐藏 owner 并初始化结果，cleanup edge 在 host
+完成全部 Task 移交后清 Task 位；TryResult 的成功/错误边分别初始化不同槽。已死亡的普通 Owned Value 必须在挂起前显式
 drop，不能为了缩 frame 擅自提前释放资源。借用值不能跨 Suspend；owned 值不能隐式
-Copy、覆盖可能仍初始化的槽或再次消费 moved-from 值。取消区域不能回正常区域、
-Complete 或 Suspend；本片尚无预算轮询 IR，所以拒绝所有不经过 Suspend 的环，
-包括 cleanup 中的环。它不是完整语言的 finally/异常/await verifier。
+Copy、覆盖可能仍初始化的槽或再次消费 moved-from 值。Task 不能普通 Drop/DropIfInit，
+Complete 留存的 Task 只能由生成的 scope drain 处理。取消区域不能回正常区域、
+Complete、Start、Await 或 Suspend；拒绝所有不经过实际 suspension 的环，
+包括 cleanup 中的环。它不是完整语言的 finally/异常或任意 Await 组合 verifier。
 
 内部硬限为 64 函数、每函数 64 槽 / 256 状态、全程序 4096 操作、1,000,000 字面量
 字节（含 UTF-8、Error 三字段和函数名）及 1,000,000 分析工作量；测试只能收紧限制。
@@ -146,18 +150,22 @@ R3 前置操作 `WrapOk` 允许把已初始化的 primitive 局部构造为匹�
 不再只支持 `Ok` 常量。Copy primitive 保留来源；owned str 移动并清空来源。
 借用 owned、类型不匹配、嵌套 Result、未初始化来源或覆盖仍活跃的 owned 结果
 在 verifier 拒绝。该操作不分配、不改变 frame ABI 布局；初始化分析和跨挂起
-liveness 同步跟踪它的消费行为。它仍不是源码 async lowering。
+liveness 同步跟踪它的消费行为。源码子集的 `ok(local)` 复用该操作。
 
 `src/backend/c_task.rs` 通过统一 C 生成器复用既有 KuString / Result 的 move/drop
-helper，不嵌入 runner 或源码。内部 frame ABI v1 有独立版本、目标 C `sizeof` / alignment、
-初始化位、状态、结果槽、取消原因和绝对 cleanup deadline；单 frame 存储上限 16 KiB。
+helper，不嵌入 runner 或源码。内部 frame ABI v2 有独立版本、目标 C `sizeof` / alignment、
+初始化位、状态、结果槽、退出 metadata 和绝对 cleanup deadline；单 frame 存储上限 16 KiB。
+host context 只在当前 callback 借用，不保存 callback 栈地址跨 Pending。
 ABI 不兼容、短/未对齐存储、参数 header 别名、重复初始化、重复取结果和非空输出槽
 会前置拒绝；失败不消费输入。entry 的 Copy 参数不清来源，Str/Result 参数才 move。
 
 此 ABI **只允许调用者串行、单执行者** 使用保持存活的零填充对齐存储，不得复制或
 篡改 live frame；owned 深层 payload 必须唯一且互不别名。clock 是可信、单调且不重入
 的内部 hook。取消只能继承调用者提供的同一个绝对 deadline，不能续期；它尚不负责
-创建整棵 Task 取消树的一秒预算。Pending 必须先 terminate 走 cleanup，再 destroy；
+创建整棵 Task 取消树的一秒预算，预算由生成的 host 建立。hosted Task 位必须先完成
+移交，才允许 terminate/destroy；中途取消使用按初始化位清理的隐藏 epilogue，不能重用
+已经过期的 Await pending cleanup CFG。真正 Pending 保留其已验证的 cleanup CFG。
+Pending 必须先 terminate 走 cleanup，再 destroy；
 destroy 不释放 caller 的 frame 存储。完成和终止不可改写，结果只能取一次；未取结果
 由 destroy 释放。这里的 destroy 不是 Ku Task handle drop，亦没有并发原子裁决、
 generation/wake、wait token、父子引用或独立外部 Task runtime 的链接合同。
@@ -165,10 +173,10 @@ generation/wake、wait token、父子引用或独立外部 Task runtime 的链�
 `native_task_frame_ir_test` 验证反例与硬边界；`native_task_frame_c_test` 使用真实目标
 C 编译器，覆盖独立栈上的 Pending→Resume、Move、部分初始化、多次挂起循环、
 slot 63 / 逆序参数、Ok/Err payload、取消/超期、未取结果销毁和分配台账归零。
-旧 ABI 参数拒绝不等于已经验证不存在的外部旧 Task runtime。现有 native async
-拒绝测试保持不变；测试结果、平台和 sanitizer 状态以阶段工作日志与精确 SHA CI 为准。
+旧 ABI 参数拒绝不等于稳定的第三方 Task FFI。源码测试区分已开放子集和继续拒绝的
+语法；测试结果、平台和 sanitizer 状态以阶段工作日志与精确 SHA CI 为准。
 
-### R2 内部控制内核（内核不自驱动 / 尚无源码接入）
+### R2 内部控制内核（内核不自驱动）
 
 `src/backend/c_task_control.rs` 为上述 frame 提供独立的控制 ABI v1，不改变 frame 的
 串行合同。它复用已有 C 原子表示，使用 acquire/release 发布和单次 strong CAS；
@@ -190,25 +198,26 @@ payload 立即与 take 争取唯一所有权并释放，不随内部观察引用
 初始化包含 owner 引用和内部生命周期 pin。**runtime 必须在暴露 owner 前接纳并
 持有 driver lease，安排取消后的唤醒和有界重试**；本内核没有队列、唤醒或注册表，
 不会自行排空任务。pin 仅在清理/结果提交、frame 销毁后由执行者释放；最后一个
-引用销毁控制存储。源 Task 数量/字节接纳、根一秒预算创建、父子取消、wait generation、
-TaskStart/await、timer/netpoll/blocking 和 M:N 仍未接入，不能将该 pin 当作完整调度。
+引用销毁控制存储。源码 Task 的接纳、预算、父子取消和等待由下述 driver/host 协作，
+不能将该 pin 本身当作完整调度。timer/netpoll/blocking 和 M:N 仍未接入。
 
 `native_task_control_test` 使用真实 R1 frame 和事件屏障，验证终态竞争、迟到结果、
 owner drop/take、执行者排他、cleanup 期限缩短、引用硬限及资源归零。测试中的
 typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 或压力验收完成。
 
-### R3 内部单 worker driver（尚无源码接入）
+### R3 内部单 worker driver
 
 `src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v4。
 R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 等待类型和独立期限
 升为版本 4；内部 C 类型名中的 `V1` 不是旧布局兼容承诺，
-初始化明确拒绝旧版本。独立 frame/control ABI 仍为 v1。
+初始化明确拒绝旧版本。当前 Frame ABI 2、Control ABI 1、Driver ABI 4。
 普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
 以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
-这是后续源码 TaskStart/Await 的基础，不是 M:N、netpoll 或事件驱动 HTTP。
+有限源码 TaskStart/Await 已复用它，但它不是 M:N、netpoll 或事件驱动 HTTP。
 
 接纳顺序为 reserve → 构造 control/frame → commit；内部容量最多 1024，计数和预留
-字节同时限流，失败不消费用户输入。只有没有活跃 control/pin、没有已登记 control
+字节同时限流，低层失败不消费输入槽；源码 wrapper 对已 move 的实参另执行失败清理，
+不会恢复用户 moved-from 变量。只有没有活跃 control/pin、没有已登记 control
 时才能 rollback；可信 builder 可先经 R2 完整销毁未发布 control，否则必须
 commit(ABORT)，交给可信 adapter 清理部分初始化 frame。BUILDING 也占用
 resident，shutdown 不能假装它不存在。相同 driver 重复绑定 control 会拒绝；跨 driver
@@ -236,10 +245,10 @@ Windows 还验证线程句柄结束；POSIX 最终 join 不是可硬限时的 po
 仍接收后续 owner/BUILDING 归还；不退出后留下无人处理的队列，也不恢复普通 continuation。
 故障即使随后读钟恢复也不能被清成成功，实际排空之后才允许销毁存储。
 
-`native_task_driver_test` 的 adapter 仍是测试夹具。源 Task 句柄、父子 scope drain、
-用户 finally、I/O/timer/blocking、M:N 和压力/soak 需要后续独立执行证据，不能由该测试替代。
+`native_task_driver_test` 的 adapter 仍是测试夹具；真实源码由独立 source 测试验证。
+用户 finally、I/O/timer/blocking、M:N 和压力/soak 不能由这些测试替代。
 
-### R4 生成的 typed factory/handle（尚无源码接入）
+### R4 生成的 typed factory/handle
 
 `src/backend/c_task_adapter.rs` 在全部内部 frame 定义之后按需生成每函数的
 `KuTaskInstance_N`、`KuTaskHandle_N` 及创建、取值、move、drop adapter；不是公开
@@ -252,7 +261,10 @@ Owned 分配；现有空串 concat 的一字节分配按一字节计费。Result
 未发布 control 经 R2 完整清理后再退 BUILDING 预算。关闭与已接纳创建竞争时，
 成功返回的是真实但可能已取消的 Task，不能再把参数恢复给调用者。
 
-take 是非阻塞一次尝试，唯一移动 typed Result，随后仍须处理 owner；drop 只在
+take 是非阻塞一次尝试，经 `KuTaskAdapterTakeRequestV1` 移动
+`KuTaskAdapterOutcomeV1` 中的 typed Result 和退出 metadata，随后仍须处理 owner；
+这次内部 take ABI 是不兼容变更，旧生成 C 必须重编译，不保留旧输出形状兼容。
+业务 Result.err 与外层 runtime failure 分开；不能仅根据 R2 FAILED 混为一类。drop 只在
 driver 成功接管责任后清空 handle，不代表子任务清理已经完成。两者复用 R3 的
 发布后通知。具体 callback 身份先于 typed instance 转换校验；整个 handle、runtime
 存储及已知活动字符串别名先于输出头部读取拒绝。raw caller 仍须提供独立、有效、
@@ -260,12 +272,18 @@ driver 成功接管责任后清空 handle，不代表子任务清理已经完成
 
 cleanup 每个 safepoint 读取 live 最短 deadline，保留取消/超时原因；adapter 单次
 观测到坏钟也进入 driver 的持续故障清理。裸 Suspend 仅映射 YIELD，不伪造没有
-事件源的 WAIT。Task IR 的 Start/Await、父子作用域清理及源码 lowering
-仍未接入；这里不提供 array/object/struct/enum/closure Task payload 或增长堆预算。
+事件源的 WAIT；真正 Await 使用登记后的 WAIT。源码 host 已接通 Start/Await 和
+父子作用域清理；这里不提供 array/object/struct/enum/closure Task payload 或增长堆预算。
+成功 hosted take 在 payload claim 中先把活动 Owned 容量从 child 转记到 RUNNING parent，
+总 reserved bytes 不变；所有 preflight/转账失败都不 move。root 先 drop 输出再释放 owner。
+当前 Start 仍保守保留父预留，并在 child admission 计入输入容量；宿主提供 owned 堆输入时
+可能提前触发字节拒绝，不能把它说成精确活跃堆计费。首片源码尚不开放动态分配表达式，
+消除这份重复预留属于后续预算工作。普通 Str/Result 局部在正常返回前可先释放；
+取消路径仍先移交 Task，再执行 Value cleanup。首片没有用户可观察的局部析构器。
 生成代码和参数检查沿用现有函数/槽/输出上限，不表示 64 MiB C artifact 上限等于
 编译器 RSS 上限。实际测试证据见 [阶段工作日志](v0.0.18-worklog.md)。
 
-### R5a 结果就绪等待内核（尚无源码接入）
+### R5a 结果就绪等待内核
 
 driver 的固定 slot 内包含一份向外等待和一份入向 waiter；没有按等待分配堆内存、
 新引用或线程。内部 arm/read/detach 只服务可信 adapter，不是用户 API。登记要求父
@@ -284,11 +302,11 @@ slot 锁存，不解引用已经释放或复用的子任务；旧 token 不得�
 不匹配的其他等待。已知 header 别名先于输出内容读取拒绝；raw C 调用者仍须提供
 有效、完整、独立且同步访问的存储，整数范围检查不证明任意指针安全。
 
-本片只实现结果就绪等待，不实现逻辑 cleanup ACK 等待、父 scope drain
-或源码 Await。最终 dispose/预算归还与逻辑清理完成是不同事件，迟到观察 lease
-不能成为未来父作用域清理等待的条件。具体执行证据见阶段工作日志。
+该层只负责结果就绪；源码 Await 与下述 cleanup ACK/drain 分层复用。
+最终 dispose/预算归还与逻辑清理完成是不同事件，迟到观察 lease
+不能成为父作用域清理等待的条件。具体执行证据见阶段工作日志。
 
-### R5b.1 逻辑清理收据（尚无 scope drain）
+### R5b.1 逻辑清理收据
 
 内部 owner_drop_receipt 复用原 owner-drop 事务；仅在唯一 owner 确实移入固定 deferred
 slot 后，同锁签发完整收据。预检拒绝非空/未对齐输出和已知 header 别名，不取消或
@@ -305,8 +323,8 @@ ACK 校验遇到不可能状态时，该 slot 锁存 INTERNAL；有效收据明�
 重复 poll，也不得归还其 lease/预算。其他任务的有效清理仍可得到 ACK，全局时钟故障
 不会被误当作所有收据均失败。故障隔离不是可恢复取消，也不允许强行 free。
 
-本片只提供收据签发和查询，不添加 ACK park/wake、独立 scope deadline、全部兄弟
-先取消的 drain continuation、Task IR Start/Await 或源码入口。运行验证范围和故障
+该层只提供收据签发和查询；ACK park/wake、独立 scope deadline 和全部兄弟
+先取消的生成 drain 在上层复用它。运行验证范围和故障
 处理以阶段工作日志为准，不能把 receipt ACK 当成整个递归子树物理释放或 Task 成功。
 
 ### R5b.2 内部 ACK 等待与 final-drain 期限（开发检查点）
@@ -330,15 +348,36 @@ CLEANUP_TIMEOUT。没有活动等待或已有 ACK 锁存时，到期只停止 ti
 损坏的父子 reciprocal 只给当前父任务错误锁存，不清理其他父任务的新登记。被
 隔离子任务的错误直接通知父队列，不依赖再次 poll 坏任务。raw callback 得到即时
 ACK/error 必须在有界 quantum 内处理，不能在耗尽预算后用 Pending/YIELD 假造进展。
-本片未生成多兄弟 scope drain、源码 Task/Start/Await 或用户 cleanup 挂起能力；
-已通过本机实际 C 定向用例；精确提交的三系统与 sanitizer 验收状态见工作日志，
-不能把内部等待用例当作尚未生成的多子任务作用域清理或源码 async 已完成。
+该层本身不开放用户 cleanup 挂起能力；上层生成多兄弟 scope drain，复用相同 ACK
+合同。精确提交的三系统与 sanitizer 验收状态见工作日志，内部等待用例不能替代源码验收。
+
+### R5c 有限源码 Task 与生成的 scope drain
+
+`ku build --backend c` / `ku build --native` 对显式 `async fn main(): null!` 选择独立
+AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包含 runner。
+展开后所有顶层 item 必须是非泛型 async 函数；参数和返回限 primitive/单层 Result。
+支持直线绑定、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
+以及静态字符串。重复赋值、if/循环/递归、嵌套 scope、try/catch/finally、闭包、同步调用、
+Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
+[并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
+
+`KuTaskValueV1` 是 move-only 内部值；Await 的隐藏 owner 计入64槽和初始化分析。
+接纳/OOM 拒绝清理已 move 的源码实参，产生静态错误的 inline failed Task，不再分配。
+private READY 先保存返回 Result；所有 sibling 先移交到固定 driver 槽，再等待 receipt ACK。
+一个 final-drain session 共用一次绝对 D，后续更短取消预算通过有效 receipt 收紧已移交 child，
+不逐个续期。正常超期 drop 暂存 Result，返回外层 `task/shutdown_timeout`，不取消正常父；
+取消胜出时 drop 私有结果并保留原取消原因。取消中的 ACK continuation 不放宽用户 cleanup 禁 Await。
+正常 Await 不开启新的 scope deadline；root 通过真实条件等待取值，不递归 poll child。
+
+源码与两种 CLI native 构建的定向执行已经通过；本片安全与完整本机回归已通过，精确提交三系统 CI
+仍待完成。Frame ABI 2、Control ABI 1、Driver ABI 4 不等于稳定外部 C FFI。
+M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
 
 ## IR 优化队列
 
 Ku 要做高性能 native binary，IR 不能只做语法翻译。优化 pass 按可验证顺序推进：
 
-当前 `optimize_program` 已接入 `ku ir`、`--emit-ir`、native C 和 LLVM 输出路径。第一阶段只做确定安全的局部优化：整数/布尔纯表达式常量折叠，`if true/false` 分支折叠为 `jump`，以及由此产生的不可达 block 删除。除零、取余零、可能改变错误时机的表达式不会被折叠。
+当前 `optimize_program` 已接入同步 `IrProgram` 的 `ku ir`、`--emit-ir`、native C 和 LLVM 输出路径；独立 Task IR 不冒用该同步优化入口。第一阶段只做确定安全的局部优化：整数/布尔纯表达式常量折叠，`if true/false` 分支折叠为 `jump`，以及由此产生的不可达 block 删除。除零、取余零、可能改变错误时机的表达式不会被折叠。
 
 后续优化继续按队列推进：
 

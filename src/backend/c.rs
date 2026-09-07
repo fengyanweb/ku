@@ -13,6 +13,8 @@ mod task_adapter;
 mod task_control;
 #[path = "c_task_driver.rs"]
 mod task_driver;
+#[path = "c_task_root.rs"]
+mod task_root;
 
 // Whole generated-file bytes, including shared runtimes and all specializations.
 // This is independent of the checker's generic AST/type admission budget.
@@ -246,6 +248,13 @@ pub fn generate_task_frame_c_source(
                 || name.starts_with("ku_task_adapter_")
                 || name.starts_with("KuTaskAdapter")
                 || name.starts_with("KU_TASK_ADAPTER_")
+                || name.starts_with("ku_task_value_")
+                || name.starts_with("KuTaskValue")
+                || name.starts_with("KU_TASK_VALUE_")
+                || name.starts_with("KU_TASK_EXIT_")
+                || name.starts_with("ku_task_outcome_")
+                || name.starts_with("ku_task_host_")
+                || name.starts_with("ku_task_root_")
                 || name.starts_with("KuTaskInstance_")
                 || name.starts_with("KuTaskHandle_")
                 || name
@@ -262,7 +271,40 @@ pub fn generate_task_frame_c_source(
         program,
         &CBackendOptions::default(),
         MAX_GENERATED_C_BYTES,
-        Some((frames, &plan)),
+        Some((frames, &plan, None)),
+    )
+}
+
+/// Generate the verified, restricted Task program and its real external root.
+/// This is not a fallback through the interpreter or synchronous lowering.
+pub fn generate_native_task_c_source(
+    native: &crate::ir::task_lower::NativeTaskProgram,
+    options: &CBackendOptions,
+) -> KuResult<String> {
+    let plan = crate::ir::task::verify_and_plan(&native.tasks, Default::default())?;
+    let entry = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.id == native.entry)
+        .ok_or_else(|| unsupported("native Task entry is missing"))?;
+    if !entry.parameters.is_empty() || entry.result != IrType::Result(Box::new(IrType::Null)) {
+        return Err(unsupported(
+            "native Task entry must return null! without parameters",
+        ));
+    }
+    let sync = IrProgram {
+        functions: Vec::new(),
+        layouts: crate::ir::IrLayoutTable {
+            structs: Vec::new(),
+            enums: Vec::new(),
+        },
+    };
+    generate_c_source_with_frames_bounded(
+        &sync,
+        options,
+        MAX_GENERATED_C_BYTES,
+        Some((&native.tasks, &plan, Some(native.entry))),
     )
 }
 
@@ -281,15 +323,28 @@ fn generate_c_source_with_frames_bounded(
     frames: Option<(
         &crate::ir::task::TaskProgram,
         &crate::ir::task::TaskFramePlan,
+        Option<crate::ir::task::TaskFunctionId>,
     )>,
 ) -> KuResult<String> {
     crate::ir::verify_borrow_contract(program)?;
     let mut frame_result_types = Vec::new();
-    if let Some((frames, _)) = frames {
+    if let Some((frames, _, _)) = frames {
+        if !frames.functions.is_empty() {
+            // The fixed outcome union is shared by all typed Task dispatches.
+            for primitive in [IrType::Int, IrType::Bool, IrType::Null, IrType::Str] {
+                collect_result_type(
+                    &IrType::Result(Box::new(primitive)),
+                    &mut frame_result_types,
+                )?;
+            }
+        }
         for function in &frames.functions {
             collect_result_type(&function.result, &mut frame_result_types)?;
             for slot in &function.slots {
-                let crate::ir::task::TaskSlotType::Value { ty, .. } = &slot.ty;
+                let ty = match &slot.ty {
+                    crate::ir::task::TaskSlotType::Value { ty, .. } => ty,
+                    crate::ir::task::TaskSlotType::Task { result } => result,
+                };
                 collect_result_type(ty, &mut frame_result_types)?;
             }
         }
@@ -507,7 +562,7 @@ fn generate_c_source_with_frames_bounded(
         || program_uses_object(program)
         || program_uses_http(program)
         // Task controls reuse the atomic representation even with no closures.
-        || frames.is_some_and(|(frames, _)| !frames.functions.is_empty())
+        || frames.is_some_and(|(frames, _, _)| !frames.functions.is_empty())
     {
         emit_closure_refcount_header(&mut out);
         closure_header_done = true;
@@ -573,10 +628,14 @@ fn generate_c_source_with_frames_bounded(
         out.push('\n');
     }
     emit_closure_thunks(&mut out, program)?;
-    if let Some((frames, plan)) = frames {
+    if let Some((frames, plan, _)) = frames {
         task::emit_frames(&mut out, frames, plan)?;
     }
-    emit_main_wrapper(&mut out, program, fs_usage, &options.fs_base)?;
+    if let Some((frames, _, Some(entry))) = frames {
+        task_root::emit(&mut out, frames, entry)?;
+    } else {
+        emit_main_wrapper(&mut out, program, fs_usage, &options.fs_base)?;
+    }
     out.finish()
 }
 
@@ -18141,7 +18200,7 @@ mod tests {
         let expected = generate_task_frame_c_source(&ir, &tasks).unwrap();
         let options = CBackendOptions::default();
         let bounded = |limit| {
-            generate_c_source_with_frames_bounded(&ir, &options, limit, Some((&tasks, &plan)))
+            generate_c_source_with_frames_bounded(&ir, &options, limit, Some((&tasks, &plan, None)))
         };
         assert_eq!(bounded(expected.len()).unwrap(), expected);
 

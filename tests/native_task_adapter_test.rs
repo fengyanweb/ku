@@ -221,7 +221,6 @@ fn native_task_adapter_factory_ownership_budget_and_failure_execute_in_c() {
     let adapter_end = generated.find("int main(void) {").expect("generated main");
     let adapter = &generated[adapter_start..adapter_end];
     for forbidden in [
-        "KU_TASK_DRIVER_WAIT",
         "run_source",
         "const SOURCE",
         "task.spawn",
@@ -235,6 +234,21 @@ fn native_task_adapter_factory_ownership_budget_and_failure_execute_in_c() {
         );
     }
     assert!(adapter.contains("KU_TASK_DRIVER_YIELD"));
+    // Shared drain code now supports hosted Tasks, but these Value-only R4
+    // frames still suspend by yielding and cannot register a source wait.
+    for id in 0..11 {
+        let resume_signature = format!("static uint32_t ku_task_{id}_resume(void* raw) {{");
+        let cleanup_signature = format!("static uint32_t ku_task_{id}_cleanup(");
+        let resume = adapter
+            .split_once(resume_signature.as_str())
+            .expect("concrete adapter resume")
+            .1
+            .split_once(cleanup_signature.as_str())
+            .expect("concrete adapter cleanup boundary")
+            .0;
+        assert!(resume.contains("KU_TASK_DRIVER_YIELD"));
+        assert!(!resume.contains("KU_TASK_DRIVER_WAIT"));
+    }
     let factories = &generated[instance_start..adapter_end];
     assert_eq!(
         factories.matches("calloc(").count(),
@@ -588,25 +602,26 @@ static void fixture_events_finish(void) {
   CHECK(ku_test_event_destroy(&fixture_entered)); CHECK(ku_test_event_destroy(&fixture_proceed));
   CHECK(ku_test_event_destroy(&fixture_clock_entered)); CHECK(ku_test_event_destroy(&fixture_clock_proceed));
 }
-#define PRIMITIVE_CASE(id, type, suffix, expected) do { \
+#define PRIMITIVE_CASE(id, type, field, kind, expected) do { \
   FixtureRuntime runtime; fixture_runtime_init(&runtime, sizeof(KuTaskInstance_##id)); \
-  type input = (expected); KuTaskHandle_##id handle = {0}; KuResult_##suffix output = {0}; \
+  type input = (expected); KuTaskHandle_##id handle = {0}; KuTaskAdapterOutcomeV1 output = {0}; \
   FixtureLedger before = fixture_ledger(); \
   CHECK(ku_task_##id##_try_start(&runtime.driver, &input, &handle) == KU_TASK_DRIVER_OK); \
   CHECK(input == (expected)); fixture_idle(&runtime); \
   CHECK(fixture_ledger().attempts == before.attempts + 1); \
   CHECK(fixture_ledger().allocations == 1 && fixture_ledger().bytes == sizeof(KuTaskInstance_##id)); \
   CHECK(fixture_snapshot(&runtime).reserved_bytes == sizeof(KuTaskInstance_##id)); \
-  CHECK(ku_task_##id##_take(&handle, &output) == KU_TASK_CONTROL_OK); CHECK(output.ok && output.value == (expected)); \
-  KuResult_##suffix again = {0}; CHECK(ku_task_##id##_take(&handle, &again) == KU_TASK_CONTROL_RESULT_TAKEN); \
+  CHECK(ku_task_##id##_take(&handle, &output) == KU_TASK_CONTROL_OK); CHECK(output.value.field.ok && output.value.field.value == (expected)); \
+  CHECK(output.result_kind == (kind) && output.exit_class == KU_TASK_EXIT_USER_RESULT && !output.has_cleanup_deadline && !output.cleanup_deadline); \
+  KuTaskAdapterOutcomeV1 again = {0}; CHECK(ku_task_##id##_take(&handle, &again) == KU_TASK_CONTROL_RESULT_TAKEN); \
   CHECK(ku_task_##id##_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK); \
   CHECK(!handle.owner.lease.control && !handle.ticket.driver); \
-  ku_result_drop_##suffix(&output); fixture_runtime_finish(&runtime); fixture_ledger_zero(); \
+  ku_task_outcome_drop(&output); fixture_runtime_finish(&runtime); fixture_ledger_zero(); \
 } while (0)
 static void fixture_primitives(void) {
-  PRIMITIVE_CASE(0, int64_t, int, INT64_C(-37));
-  PRIMITIVE_CASE(1, bool, bool, true);
-  PRIMITIVE_CASE(2, uint8_t, null, 0);
+  PRIMITIVE_CASE(0, int64_t, integer, 1u, INT64_C(-37));
+  PRIMITIVE_CASE(1, bool, boolean, 2u, true);
+  PRIMITIVE_CASE(2, uint8_t, null_value, 3u, 0);
   {
     FixtureRuntime runtime; fixture_runtime_init(&runtime, sizeof(KuTaskInstance_0));
     int64_t zero = 0;
@@ -618,12 +633,12 @@ static void fixture_primitives(void) {
     fixture_runtime_finish(&runtime); fixture_ledger_zero();
   }
   FixtureRuntime runtime; fixture_runtime_init(&runtime, sizeof(KuTaskInstance_9));
-  int64_t input = 41; KuTaskHandle_9 handle = {0}; KuResult_int output = {0};
+  int64_t input = 41; KuTaskHandle_9 handle = {0}; KuTaskAdapterOutcomeV1 output = {0};
   CHECK(ku_task_9_try_start(&runtime.driver, &input, &input, &handle) == KU_TASK_DRIVER_OK);
   CHECK(input == 41); fixture_idle(&runtime);
-  CHECK(ku_task_9_take(&handle, &output) == KU_TASK_CONTROL_OK && output.ok && output.value == 41);
+  CHECK(ku_task_9_take(&handle, &output) == KU_TASK_CONTROL_OK && output.value.integer.ok && output.value.integer.value == 41);
   CHECK(ku_task_9_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
-  fixture_runtime_finish(&runtime); fixture_ledger_zero();
+  fixture_runtime_finish(&runtime); ku_task_outcome_drop(&output); fixture_ledger_zero();
 }
 static void fixture_strings(void) {
   for (unsigned mode = 0; mode < 3; ++mode) {
@@ -634,7 +649,7 @@ static void fixture_strings(void) {
     KuString original = input;
     size_t capacity = mode == 0 ? 0 : mode == 1 ? 64 : 1;
     FixtureRuntime runtime; fixture_runtime_init(&runtime, sizeof(KuTaskInstance_3) + capacity);
-    KuTaskHandle_3 handle = {0}; KuResult_str output = {0};
+    KuTaskHandle_3 handle = {0}; KuTaskAdapterOutcomeV1 output = {0};
     FixtureLedger before = fixture_ledger();
     if (mode == 2) {
       /* The real allocation is one byte, not a readable Handle. Deep alias
@@ -647,34 +662,36 @@ static void fixture_strings(void) {
     CHECK(fixture_ledger().attempts == before.attempts + 1);
     CHECK(fixture_snapshot(&runtime).reserved_bytes == sizeof(KuTaskInstance_3) + capacity);
     CHECK(ku_task_3_take(&handle, &output) == KU_TASK_CONTROL_OK);
-    CHECK(output.ok && fixture_same_string(output.value, original));
+    CHECK(output.result_kind == 4u && output.exit_class == KU_TASK_EXIT_USER_RESULT && !output.has_cleanup_deadline && !output.cleanup_deadline);
+    CHECK(output.value.string.ok && fixture_same_string(output.value.string.value, original));
     CHECK(ku_task_3_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
     fixture_runtime_finish(&runtime);
     CHECK(fixture_ledger().allocations == (capacity ? 1u : 0u));
     CHECK(fixture_ledger().bytes == capacity);
-    ku_result_drop_str(&output); fixture_ledger_zero();
+    ku_task_outcome_drop(&output); fixture_ledger_zero();
   }
 }
-#define RESULT_SCALAR_CASE(id, suffix, expected) do { \
+#define RESULT_SCALAR_CASE(id, suffix, field, kind, expected) do { \
   for (unsigned error = 0; error < 2; ++error) { \
     KuResult_##suffix input = {0}; input.ok = !error; input.value = (expected); \
     if (error) input.error = fixture_error(); \
     else input.error.message = (KuString){ (uint8_t*)(uintptr_t)1, SIZE_MAX, SIZE_MAX, 255 }; \
     FixtureRuntime runtime; size_t charge = sizeof(KuTaskInstance_##id) + (error ? 112 : 0); \
-    fixture_runtime_init(&runtime, charge); KuTaskHandle_##id handle = {0}; KuResult_##suffix output = {0}; \
+    fixture_runtime_init(&runtime, charge); KuTaskHandle_##id handle = {0}; KuTaskAdapterOutcomeV1 output = {0}; \
     FixtureLedger before = fixture_ledger(); \
     CHECK(ku_task_##id##_try_start(&runtime.driver, &input, &handle) == KU_TASK_DRIVER_OK); \
     CHECK(!input.ok && !input.error.message.ptr); fixture_idle(&runtime); \
     CHECK(fixture_ledger().attempts == before.attempts + 1 && fixture_snapshot(&runtime).reserved_bytes == charge); \
     CHECK(ku_task_control_status(&handle.owner.lease) == (error ? KU_TASK_CONTROL_FAILED : KU_TASK_CONTROL_COMPLETED)); \
-    CHECK(ku_task_##id##_take(&handle, &output) == KU_TASK_CONTROL_OK && output.ok == !error); \
-    if (!error) CHECK(output.value == (expected)); else CHECK(output.error.domain.len == 6 && output.error.code.len == 4 && output.error.message.len == 7); \
+    CHECK(ku_task_##id##_take(&handle, &output) == KU_TASK_CONTROL_OK && output.value.field.ok == !error); \
+    CHECK(output.result_kind == (kind) && output.exit_class == KU_TASK_EXIT_USER_RESULT && !output.has_cleanup_deadline && !output.cleanup_deadline); \
+    if (!error) CHECK(output.value.field.value == (expected)); else CHECK(output.value.field.error.domain.len == 6 && output.value.field.error.code.len == 4 && output.value.field.error.message.len == 7); \
     CHECK(ku_task_##id##_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK); \
-    fixture_runtime_finish(&runtime); ku_result_drop_##suffix(&output); fixture_ledger_zero(); \
+    fixture_runtime_finish(&runtime); ku_task_outcome_drop(&output); fixture_ledger_zero(); \
   } \
 } while (0)
 static void fixture_results(void) {
-  RESULT_SCALAR_CASE(4, int, 73); RESULT_SCALAR_CASE(5, bool, true); RESULT_SCALAR_CASE(6, null, 0);
+  RESULT_SCALAR_CASE(4, int, integer, 1u, 73); RESULT_SCALAR_CASE(5, bool, boolean, 2u, true); RESULT_SCALAR_CASE(6, null, null_value, 3u, 0);
   for (unsigned error = 0; error < 2; ++error) {
     KuResult_str input = {0}; input.ok = !error;
     if (error) {
@@ -686,13 +703,14 @@ static void fixture_results(void) {
     }
     size_t charge = sizeof(KuTaskInstance_7) + (error ? 112 : 64);
     FixtureRuntime runtime; fixture_runtime_init(&runtime, charge);
-    KuTaskHandle_7 handle = {0}; KuResult_str output = {0};
+    KuTaskHandle_7 handle = {0}; KuTaskAdapterOutcomeV1 output = {0};
     CHECK(ku_task_7_try_start(&runtime.driver, &input, &handle) == KU_TASK_DRIVER_OK);
     CHECK(!input.value.ptr && !input.error.message.ptr); fixture_idle(&runtime);
     CHECK(fixture_snapshot(&runtime).reserved_bytes == charge);
-    CHECK(ku_task_7_take(&handle, &output) == KU_TASK_CONTROL_OK && output.ok == !error);
+    CHECK(ku_task_7_take(&handle, &output) == KU_TASK_CONTROL_OK && output.value.string.ok == !error);
+    CHECK(output.result_kind == 4u && output.exit_class == KU_TASK_EXIT_USER_RESULT && !output.has_cleanup_deadline && !output.cleanup_deadline);
     CHECK(ku_task_7_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
-    fixture_runtime_finish(&runtime); ku_result_drop_str(&output); fixture_ledger_zero();
+    fixture_runtime_finish(&runtime); ku_task_outcome_drop(&output); fixture_ledger_zero();
   }
 }
 static void fixture_budget_and_oom(void) {
@@ -757,13 +775,13 @@ static void fixture_sparse_and_preflight(void) {
   CHECK(!input.value.ptr && !cleanup.ptr && flag && number == 29 && !nothing);
   fixture_idle(&runtime);
   CHECK(fixture_snapshot(&runtime).reserved_bytes == sizeof(KuTaskInstance_8) + 96);
-  KuResult_str output = {0};
-  CHECK(ku_task_8_take(&handle, &output) == KU_TASK_CONTROL_OK && output.ok && fixture_same_string(output.value, original_value));
+  KuTaskAdapterOutcomeV1 output = {0};
+  CHECK(ku_task_8_take(&handle, &output) == KU_TASK_CONTROL_OK && output.value.string.ok && fixture_same_string(output.value.string.value, original_value));
   CHECK(ku_task_8_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
-  fixture_runtime_finish(&runtime); ku_result_drop_str(&output); fixture_ledger_zero();
+  fixture_runtime_finish(&runtime); ku_task_outcome_drop(&output); fixture_ledger_zero();
 }
 static void fixture_header_shape_and_empty_output(void) {
-  size_t owned_capacity = sizeof(KuResult_str) + 16;
+  size_t owned_capacity = sizeof(KuTaskAdapterOutcomeV1) + 16;
   FixtureRuntime runtime; fixture_runtime_init(&runtime, 2 * sizeof(KuTaskInstance_3) + owned_capacity + 64);
   KuTaskHandle_3 handle = {0};
   for (unsigned variant = 0; variant < 4; ++variant) {
@@ -788,27 +806,27 @@ static void fixture_header_shape_and_empty_output(void) {
   CHECK(handle.ticket.driver == ticket.driver && handle.ticket.generation == ticket.generation && handle.ticket.slot == ticket.slot);
   CHECK(fixture_ledger().attempts == before.attempts);
   KuTaskInstance_3* instance = (KuTaskInstance_3*)control->context;
-  KuResult_int wrong_output = {0};
+  KuTaskAdapterOutcomeV1 wrong_output = {0};
   CHECK(ku_task_0_take((KuTaskHandle_0*)&handle, &wrong_output) == KU_TASK_CONTROL_INVALID_ARGUMENT);
   CHECK(ku_task_0_drop((KuTaskHandle_0*)&handle, fixture_deadline()) == KU_TASK_CONTROL_INVALID_ARGUMENT);
-  CHECK(handle.owner.lease.control == control && !wrong_output.ok);
-  KuResult_str output = {0}; output.ok = true;
-  CHECK(ku_task_3_take(&handle, &output) == KU_TASK_CONTROL_INVALID_ARGUMENT && output.ok);
-  output = (KuResult_str){0};
+  CHECK(handle.owner.lease.control == control && !wrong_output.result_kind && !wrong_output.value.integer.ok);
+  KuTaskAdapterOutcomeV1 output = {0}; output.value.string.ok = true;
+  CHECK(ku_task_3_take(&handle, &output) == KU_TASK_CONTROL_INVALID_ARGUMENT && output.value.string.ok);
+  output = (KuTaskAdapterOutcomeV1){0};
   CHECK(ku_task_3_take(&handle, NULL) == KU_TASK_CONTROL_INVALID_ARGUMENT);
-  CHECK(ku_task_3_take(&handle, &instance->payload) == KU_TASK_CONTROL_INVALID_ARGUMENT);
-  CHECK(ku_task_3_take(&handle, (KuResult_str*)&instance->frame) == KU_TASK_CONTROL_INVALID_ARGUMENT);
-  CHECK(ku_task_3_take(&handle, (KuResult_str*)&handle.ticket) == KU_TASK_CONTROL_INVALID_ARGUMENT);
-  CHECK(ku_task_3_take(&handle, (KuResult_str*)&runtime.driver) == KU_TASK_CONTROL_INVALID_ARGUMENT);
-  CHECK(ku_task_3_take(&handle, (KuResult_str*)runtime.slots) == KU_TASK_CONTROL_INVALID_ARGUMENT);
+  CHECK(ku_task_3_take(&handle, (KuTaskAdapterOutcomeV1*)&instance->payload) == KU_TASK_CONTROL_INVALID_ARGUMENT);
+  CHECK(ku_task_3_take(&handle, (KuTaskAdapterOutcomeV1*)&instance->frame) == KU_TASK_CONTROL_INVALID_ARGUMENT);
+  CHECK(ku_task_3_take(&handle, (KuTaskAdapterOutcomeV1*)&handle.ticket) == KU_TASK_CONTROL_INVALID_ARGUMENT);
+  CHECK(ku_task_3_take(&handle, (KuTaskAdapterOutcomeV1*)&runtime.driver) == KU_TASK_CONTROL_INVALID_ARGUMENT);
+  CHECK(ku_task_3_take(&handle, (KuTaskAdapterOutcomeV1*)runtime.slots) == KU_TASK_CONTROL_INVALID_ARGUMENT);
   /* Real owned backing is large enough for a typed output, but writing its
    * own owning Result there would leave a self-owned/dangling output header. */
-  CHECK(ku_task_3_take(&handle, (KuResult_str*)original.ptr) == KU_TASK_CONTROL_INVALID_ARGUMENT);
+  CHECK(ku_task_3_take(&handle, (KuTaskAdapterOutcomeV1*)original.ptr) == KU_TASK_CONTROL_INVALID_ARGUMENT);
   union { long double alignment; uint8_t bytes[256]; } unaligned = {0};
-  CHECK(ku_task_3_take(&handle, (KuResult_str*)(unaligned.bytes + 1)) == KU_TASK_CONTROL_INVALID_ARGUMENT);
-  CHECK(ku_task_3_take(&handle, &output) == KU_TASK_CONTROL_OK && output.ok && fixture_same_string(output.value, original));
+  CHECK(ku_task_3_take(&handle, (KuTaskAdapterOutcomeV1*)(unaligned.bytes + 1)) == KU_TASK_CONTROL_INVALID_ARGUMENT);
+  CHECK(ku_task_3_take(&handle, &output) == KU_TASK_CONTROL_OK && output.value.string.ok && fixture_same_string(output.value.string.value, original));
   CHECK(ku_task_3_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
-  fixture_runtime_finish(&runtime); ku_string_drop(&second); ku_result_drop_str(&output); fixture_ledger_zero();
+  fixture_runtime_finish(&runtime); ku_string_drop(&second); ku_task_outcome_drop(&output); fixture_ledger_zero();
 }
 static void fixture_private_failure_rollback(void) {
   FixtureRuntime runtime; fixture_runtime_init(&runtime, sizeof(KuTaskInstance_3) + 64);
@@ -829,12 +847,12 @@ static void fixture_private_failure_rollback(void) {
     /* Reusing the restored input proves the failure path did not secretly
      * dispose it while restoring only a dangling header. */
     CHECK(ku_task_3_try_start(&runtime.driver, &input, &handle) == KU_TASK_DRIVER_OK);
-    fixture_idle(&runtime); KuResult_str output = {0};
+    fixture_idle(&runtime); KuTaskAdapterOutcomeV1 output = {0};
     CHECK(ku_task_3_take(&handle, &output) == KU_TASK_CONTROL_OK);
-    CHECK(output.ok && fixture_same_string(output.value, original));
-    CHECK(memcmp(output.value.ptr, "restore after move", output.value.len) == 0);
+    CHECK(output.value.string.ok && fixture_same_string(output.value.string.value, original));
+    CHECK(memcmp(output.value.string.value.ptr, "restore after move", output.value.string.value.len) == 0);
     CHECK(ku_task_3_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
-    fixture_empty(&runtime); ku_result_drop_str(&output); fixture_ledger_zero();
+    fixture_empty(&runtime); ku_task_outcome_drop(&output); fixture_ledger_zero();
   }
   fixture_runtime_finish(&runtime);
 }
@@ -862,8 +880,8 @@ static void fixture_move_and_late_lease(void) {
   KuTaskDriverSnapshotV1 retained = fixture_snapshot(&runtime);
   CHECK(retained.resident == 1 && retained.retiring == 1 && retained.reserved_bytes == sizeof(KuTaskInstance_3) + 64);
   CHECK(fixture_ledger().allocations == 1 && fixture_ledger().bytes == sizeof(KuTaskInstance_3));
-  KuResult_str output = {0};
-  CHECK(ku_task_control_take_result(&late, &output) == KU_TASK_CONTROL_RESULT_TAKEN);
+  KuTaskAdapterOutcomeV1 output = {0}; KuTaskAdapterTakeRequestV1 request = {&output, NULL};
+  CHECK(ku_task_control_take_result(&late, &request) == KU_TASK_CONTROL_RESULT_TAKEN);
   CHECK(ku_task_control_lease_release(&late) == KU_TASK_CONTROL_OK);
   fixture_runtime_finish(&runtime); fixture_ledger_zero();
 }
@@ -894,12 +912,12 @@ static void fixture_sparse_postmove_rollback(void) {
     fixture_empty(&runtime);
     CHECK(ku_task_8_try_start(&runtime.driver, &input, &flag, &cleanup, &number, &nothing, &handle) == KU_TASK_DRIVER_OK);
     CHECK(!input.value.ptr && !input.error.message.ptr && !cleanup.ptr && flag && number == 73 && !nothing);
-    fixture_idle(&runtime); KuResult_str output = {0};
-    CHECK(ku_task_8_take(&handle, &output) == KU_TASK_CONTROL_OK && fixture_same_result(output, original));
-    if (error) CHECK(memcmp(output.error.message.ptr, "message", 7) == 0);
-    else CHECK(memcmp(output.value.ptr, "restored sparse result", output.value.len) == 0);
+    fixture_idle(&runtime); KuTaskAdapterOutcomeV1 output = {0};
+    CHECK(ku_task_8_take(&handle, &output) == KU_TASK_CONTROL_OK && fixture_same_result(output.value.string, original));
+    if (error) CHECK(memcmp(output.value.string.error.message.ptr, "message", 7) == 0);
+    else CHECK(memcmp(output.value.string.value.ptr, "restored sparse result", output.value.string.value.len) == 0);
     CHECK(ku_task_8_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
-    fixture_empty(&runtime); ku_result_drop_str(&output); fixture_ledger_zero();
+    fixture_empty(&runtime); ku_task_outcome_drop(&output); fixture_ledger_zero();
   }
   fixture_runtime_finish(&runtime);
 }
@@ -958,13 +976,13 @@ static void fixture_yield_fairness(void) {
   CHECK(ku_test_event_set(&fixture_proceed)); fixture_idle(&runtime);
   CHECK(fixture_resume_calls == 2 && fixture_other_resume_calls == 2);
   fixture_resume_gate = 0;
-  KuResult_int first_output = {0}; KuResult_bool second_output = {0};
+  KuTaskAdapterOutcomeV1 first_output = {0}, second_output = {0};
   CHECK(ku_task_0_take(&first_handle, &first_output) == KU_TASK_CONTROL_OK);
   CHECK(ku_task_1_take(&second_handle, &second_output) == KU_TASK_CONTROL_OK);
-  CHECK(first_output.ok && first_output.value == 10 && second_output.ok && second_output.value);
+  CHECK(first_output.value.integer.ok && first_output.value.integer.value == 10 && second_output.value.boolean.ok && second_output.value.boolean.value);
   CHECK(ku_task_0_drop(&first_handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
   CHECK(ku_task_1_drop(&second_handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
-  fixture_runtime_finish(&runtime); fixture_events_finish(); fixture_ledger_zero();
+  fixture_runtime_finish(&runtime); ku_task_outcome_drop(&first_output); ku_task_outcome_drop(&second_output); fixture_events_finish(); fixture_ledger_zero();
 }
 static void fixture_private_ready_loses_cancellation(void) {
   FixtureRuntime runtime; fixture_runtime_init(&runtime, sizeof(KuTaskInstance_3) + 64);
@@ -983,8 +1001,8 @@ static void fixture_private_ready_loses_cancellation(void) {
   CHECK(fixture_ledger().allocations == 1 && fixture_ledger().bytes == sizeof(KuTaskInstance_3));
   CHECK(fixture_snapshot(&runtime).reserved_bytes == sizeof(KuTaskInstance_3) + 64);
   fixture_resume_gate = 0;
-  KuResult_str output = {0};
-  CHECK(ku_task_3_take(&handle, &output) == KU_TASK_CONTROL_TIMED_OUT && !output.ok && !output.value.ptr);
+  KuTaskAdapterOutcomeV1 output = {0};
+  CHECK(ku_task_3_take(&handle, &output) == KU_TASK_CONTROL_TIMED_OUT && !output.result_kind && !output.value.string.ok && !output.value.string.value.ptr);
   CHECK(ku_task_3_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
   fixture_runtime_finish(&runtime); fixture_events_finish(); fixture_ledger_zero();
 }
@@ -1011,12 +1029,13 @@ static void fixture_live_deadline_tightening(bool tighten) {
   CHECK(ku_task_control_cleanup_deadline(handle.owner.lease.control) == (tighten ? 0 : original_deadline));
   CHECK(ku_task_control_status(&handle.owner.lease) == KU_TASK_CONTROL_TIMED_OUT);
   fixture_resume_gate = fixture_clock_gate = 0;
-  KuResult_str output = {0};
-  CHECK(ku_task_10_take(&handle, &output) == KU_TASK_CONTROL_TIMED_OUT && !output.ok && !output.value.ptr);
+  KuTaskAdapterOutcomeV1 output = {0};
+  CHECK(ku_task_10_take(&handle, &output) == KU_TASK_CONTROL_TIMED_OUT && !output.result_kind && !output.value.string.ok && !output.value.string.value.ptr);
   CHECK(ku_task_10_drop(&handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
   fixture_runtime_finish(&runtime); fixture_events_finish(); fixture_ledger_zero();
 }
 int main(void) {
+  CHECK(KU_TASK_FRAME_ABI_VERSION == 2u);
   fixture_primitives(); fixture_strings(); fixture_results();
   fixture_budget_and_oom(); fixture_sparse_and_preflight(); fixture_header_shape_and_empty_output();
   fixture_private_failure_rollback(); fixture_sparse_postmove_rollback(); fixture_move_and_late_lease();

@@ -14,7 +14,7 @@ fn documentation_separates_current_contract_from_implementation_evidence() {
     assert!(worklog.contains("不是发行说明"));
     assert!(ir.contains("取消语义已确定"));
     assert!(ir.contains("[语义合同](semantics.md)"));
-    assert!(ir.contains("async native lowering 继续拒绝"));
+    assert!(ir.contains("其余 async native lowering 继续拒绝"));
     assert!(!ir.contains("取消语义单独决策"));
     assert!(!readme.contains("## 0.0.15 支持的核心语法"));
     assert!(!syntax.contains("Ku 0.0.15 的基础类型"));
@@ -39,6 +39,43 @@ fn documentation_separates_current_contract_from_implementation_evidence() {
             "missing semantic invariant: {required}"
         );
     }
+}
+
+#[test]
+fn native_task_docs_limit_source_support_and_separate_error_layers() {
+    let readme = include_str!("../README.md");
+    let syntax = include_str!("../docs/syntax.md");
+    let concurrency = include_str!("../docs/concurrency.md");
+    let ir = include_str!("../docs/ir.md");
+    for document in [readme, syntax, concurrency, ir] {
+        for required in [
+            "单 worker",
+            "async fn main(): null!",
+            "单层 Result",
+            "try/catch/finally",
+            "M:N",
+            "netpoll",
+            "RSS",
+            "soak",
+        ] {
+            assert!(
+                document.contains(required),
+                "native Task scope missing: {required}"
+            );
+        }
+        assert!(document.contains("三系统 CI"));
+        assert!(!document.contains("native C 明确拒绝 async。"));
+    }
+    assert!(ir.contains("Frame ABI 2、Control ABI 1、Driver ABI 4"));
+    assert!(ir.contains("KuTaskAdapterOutcomeV1"));
+    assert!(ir.contains("KuTaskAdapterTakeRequestV1"));
+    assert!(ir.contains("不兼容变更"));
+    assert!(concurrency.contains("外层运行时 `task/shutdown_timeout`"));
+    assert!(concurrency.contains("不同于业务 Result.err"));
+    assert!(concurrency.contains("绝对清理期限只收紧、不续期"));
+    assert!(syntax.contains("用户 cleanup 仍不能 Await"));
+    assert!(ir.contains("成功 hosted take"));
+    assert!(ir.contains("`ku ir` / `--emit-ir` / LLVM 仍拒绝 async"));
 }
 
 #[test]
