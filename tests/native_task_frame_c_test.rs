@@ -394,6 +394,183 @@ fn native_task_frame_pending_resume_cancel_and_payload_drop_execute_in_c() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn native_task_frame_wrap_ok_preserves_payload_without_allocating() {
+    let mut tasks = TaskProgram { functions: vec![] };
+    let mut cases = String::new();
+    let mut local_frames = Vec::new();
+    for before in [false, true] {
+        for (ty, c_ty, suffix, initial, local) in [
+            (IrType::Int, "int64_t", "int", "37", false),
+            (IrType::Bool, "bool", "bool", "true", false),
+            (IrType::Null, "uint8_t", "null", "0", false),
+            (IrType::Str, "KuString", "str", "{0}", false),
+            (IrType::Str, "KuString", "str", "{0}", true),
+        ] {
+            let id = tasks.functions.len();
+            let source_slot = usize::from(local);
+            let result_slot = source_slot + 1;
+            let mut types = vec![slot(ty.clone())];
+            let mut construction = vec![];
+            if local {
+                // A moved intermediate is used within one drive, never spilled.
+                types.push(slot(ty.clone()));
+                construction.push(TaskOp::Move {
+                    dst: SlotId(1),
+                    src: SlotId(0),
+                });
+                local_frames.push(TaskFunctionId(id));
+            }
+            types.push(slot(result(ty.clone())));
+            construction.push(TaskOp::WrapOk {
+                dst: SlotId(result_slot),
+                src: SlotId(source_slot),
+            });
+            let mut resume = if before { vec![] } else { construction.clone() };
+            if ty != IrType::Str {
+                resume.push(TaskOp::Read { slot: SlotId(0) });
+            }
+            tasks.functions.push(TaskFunction {
+                id: TaskFunctionId(id),
+                name: format!("WrapOk{id}"),
+                slots: types,
+                parameters: vec![SlotId(0)],
+                entry: StateId(0),
+                result: result(ty.clone()),
+                states: vec![
+                    TaskState {
+                        operations: if before { construction } else { vec![] },
+                        terminator: TaskTerminator::Suspend {
+                            resume: StateId(1),
+                            cleanup: StateId(2),
+                        },
+                    },
+                    TaskState {
+                        operations: resume,
+                        terminator: TaskTerminator::Complete {
+                            value: SlotId(result_slot),
+                        },
+                    },
+                    TaskState {
+                        operations: (0..=result_slot)
+                            .rev()
+                            .map(|id| TaskOp::DropIfInit { slot: SlotId(id) })
+                            .collect(),
+                        terminator: TaskTerminator::Terminate,
+                    },
+                ],
+            });
+            let setup = if ty == IrType::Str {
+                r#"input = ku_string_alloc(5); memcpy(input.ptr, "A\0\xe4\xb8\xad", 5);
+uint8_t* original = input.ptr;"#
+                    .to_string()
+            } else {
+                String::new()
+            };
+            let input_check = if ty == IrType::Str {
+                "CHECK(!input.ptr && input.len == 0 && input.capacity == 0);".to_string()
+            } else {
+                format!("CHECK(input == {initial});")
+            };
+            let output_check = if ty == IrType::Str {
+                r#"CHECK(output.value.ptr == original && output.value.len == 5);
+CHECK(memcmp(output.value.ptr, "A\0\xe4\xb8\xad", 5) == 0);"#
+                    .to_string()
+            } else {
+                format!("CHECK(output.value == {initial});")
+            };
+            cases.push_str(&format!(r#"
+  for (unsigned mode = 0; mode < 4; ++mode) {{
+    KuTaskFrame_{id} frame = {{0}};
+    {c_ty} input = {initial};
+    {setup}
+    size_t allocated = ku_perf_calls;
+    CHECK(ku_task_frame_{id}_init(&frame, sizeof(frame), ABI, &input) == KU_TASK_FRAME_OK);
+    {input_check}
+    CHECK(ku_task_frame_{id}_resume(&frame, sizeof(frame), ABI, &clock) == KU_TASK_FRAME_PENDING);
+    CHECK(ku_perf_calls == allocated);
+    if (mode < 2) {{
+      CHECK(ku_task_frame_{id}_resume(&frame, sizeof(frame), ABI, &clock) == KU_TASK_FRAME_READY);
+      if (mode == 0) {{
+        KuResult_{suffix} output = {{0}};
+        CHECK(ku_task_frame_{id}_take_result(&frame, sizeof(frame), ABI, &output) == KU_TASK_FRAME_OK);
+        CHECK(output.ok && !output.error.domain.ptr && !output.error.code.ptr && !output.error.message.ptr);
+        {output_check}
+        ku_result_drop_{suffix}(&output);
+      }}
+    }} else {{
+      uint32_t reason = mode == 2 ? KU_TASK_FRAME_CANCELLED : KU_TASK_FRAME_TIMED_OUT;
+      CHECK(ku_task_frame_{id}_terminate(&frame, sizeof(frame), ABI, reason,
+          mode == 2 ? 1000 : 0, &clock) == reason);
+    }}
+    CHECK(ku_task_frame_{id}_destroy(&frame, sizeof(frame), ABI) == KU_TASK_FRAME_OK);
+    CHECK(ku_perf_calls == allocated && ku_perf_live_allocations == 0 && ku_perf_live_bytes == 0);
+  }}
+"#));
+        }
+    }
+    let plan = verify_and_plan(&tasks, TaskLimits::default()).unwrap();
+    for frame in &plan.functions {
+        if local_frames.contains(&frame.function) {
+            assert!(
+                !frame.slots.contains(&SlotId(1)),
+                "intermediate must exercise stack init bits"
+            );
+        }
+    }
+    let generated = c::generate_task_frame_c_source(&sync_program("fn main() {}"), &tasks).unwrap();
+    let mut source = generated
+        .replacen(
+            "typedef struct KuString {",
+            &format!("{ALLOCATION_HOOK}\ntypedef struct KuString {{"),
+            1,
+        )
+        .replacen(
+            "int main(void) {",
+            "static int ku_generated_main(void) {",
+            1,
+        );
+    source.push_str(r#"
+#define CHECK(c) do { if (!(c)) { fprintf(stderr, "wrap check line %d\n", __LINE__); return 1; } } while (0)
+#define ABI KU_TASK_FRAME_ABI_VERSION
+static uint64_t wrap_now(void* context) { (void)context; return 100; }
+int main(void) {
+  KuTaskFrameClockV1 clock = { wrap_now, NULL };
+  for (unsigned round = 0; round < 32; ++round) {
+"#);
+    source.push_str(&cases);
+    source
+        .push_str("  }\n  CHECK(!ku_perf_overflow);\n  puts(\"task-wrap-ok\");\n  return 0;\n}\n");
+    let directory = TempDir::new("task-frame-wrap-ok");
+    let c_file = directory.path().join("wrap.c");
+    fs::write(&c_file, source).expect("write generated WrapOk fixture");
+    let Some(executable) = compile_harness(directory.path(), &c_file, "wrap") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute WrapOk C fixture"
+        );
+        return;
+    };
+    fs::remove_file(&c_file).expect("remove source before native execution");
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "WrapOk execution failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-wrap-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
 const C_MAIN: &str = r#"
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "frame check line %d\n", __LINE__); return 1; } } while (0)
 static uint64_t fixture_now(void* context) { return *(uint64_t*)context; }
