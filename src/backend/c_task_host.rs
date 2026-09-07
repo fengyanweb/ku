@@ -31,17 +31,22 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
     out.push_str(HOST_ABI);
     for function in &tasks.functions {
         out.check()?;
-        out.push_str(&format!(
-            "static uint32_t ku_task_{}_start_value(KuTaskDriverV1* driver",
-            function.id.0
-        ));
-        for (index, parameter) in function.parameters.iter().enumerate() {
-            let TaskSlotType::Value { ty, .. } = &function.slots[parameter.0].ty else {
-                return Err(unsupported("Task parameters cannot be Task values"));
-            };
-            out.push_str(&format!(", {}* arg_{index}", c_type(ty)?));
+        for (entry, context) in [
+            ("start_value", "KuTaskDriverV1* driver"),
+            ("start_hosted", "const KuTaskAdapterHostV1* host"),
+        ] {
+            out.push_str(&format!(
+                "static uint32_t ku_task_{}_{entry}({context}",
+                function.id.0
+            ));
+            for (index, parameter) in function.parameters.iter().enumerate() {
+                let TaskSlotType::Value { ty, .. } = &function.slots[parameter.0].ty else {
+                    return Err(unsupported("Task parameters cannot be Task values"));
+                };
+                out.push_str(&format!(", {}* arg_{index}", c_type(ty)?));
+            }
+            out.push_str(", KuTaskValueV1* output);\n");
         }
-        out.push_str(", KuTaskValueV1* output);\n");
     }
     out.check()
 }
@@ -72,6 +77,7 @@ typedef struct KuTaskAdapterHostV1 {
   const KuTaskDriverTicketV1* ticket;
   KuTaskControlV1* control;
   KuTaskDriverWaitTokenV1* wait;
+  size_t minimum_charge; /* Generated sizeof(parent instance), not user input. */
 } KuTaskAdapterHostV1;
 static uint32_t ku_task_value_check(KuTaskValueV1* value);
 static void ku_task_adapter_fault(KuTaskDriverV1* driver, int clock_fault);

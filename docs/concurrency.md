@@ -29,7 +29,7 @@ v0.0.18 第二阶段已采用以下规则；这不表示所有后端已实现。
 解释器与各 native 切片的执行证据见实施记录；不同切片的测试结果不能互相替代。
 v0.0.18 开发分支已接通 native C 的单 worker 有限源码子集：AST 经独立 Task IR
 生成 Start、Move、Await 和函数级 scope drain，不嵌入解释器或 runner 源码。
-源码及 CLI 定向运行已通过；本片安全与完整本机回归已通过，精确提交三系统 CI 仍待完成，不是正式发布。
+源码及 CLI 定向运行已通过；R5c 本机回归已通过，但其精确提交的三系统 CI 中 Linux/macOS 与 PR sanitizer 有失败，修复后的完整验证仍未完成，不是正式发布。
 结果等待与 ACK 等待复用固定槽位，不按每次等待分配；函数退出先移交全部 sibling，
 再等待逻辑清理 ACK。迟到 observer 可以保留控制存储，但不能保留已丢弃的 payload。
 正常 scope 超期是外层运行时 `task/shutdown_timeout`，不同于业务 Result.err，

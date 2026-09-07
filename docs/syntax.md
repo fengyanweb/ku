@@ -731,7 +731,7 @@ Task 清理采用当前所有权作用域规则：合法 move 会转移清理责
 
 普通作用域退出的子任务清理超期同样报告 `task/shutdown_timeout`，不能把正常父任务伪标为 Cancelled。
 
-上述规则是语言合同，各执行层的范围与证据分别记录。v0.0.18 开发分支已从 AST 经 Task IR 生成 native Start/Move/Await 和函数级多 child scope drain；源码与 CLI 定向运行已通过，本片安全与完整本机回归已通过，精确提交三系统 CI 仍待完成，不是正式发布。M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成。
+上述规则是语言合同，各执行层的范围与证据分别记录。v0.0.18 开发分支已从 AST 经 Task IR 生成 native Start/Move/Await 和函数级多 child scope drain；源码与 CLI 定向运行已通过，R5c 本机回归已通过，但其精确提交的三系统 CI 中 Linux/macOS 与 PR sanitizer 有失败，修复后的完整验证仍未完成，不是正式发布。M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成。
 
 当前 native C 子集要求 import 展开后的函数全部是顶层非泛型 async 函数，入口为无参数 `async fn main(): null!`；参数限 `int/bool/null/str` 或对应单层 Result，返回显式 primitive `T!`。函数体支持直线局部绑定、已知 async 调用、Task move、Await、ok、?、primitive print/println、显式 return 和字符串常量 fail；新字符串表达式限静态字面量。if/循环/递归、重复赋值、嵌套 scope、try/catch/finally、闭包/函数值、同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定 Task 临时、算术和动态堆表达式仍拒绝。示例与完整边界见 [当前 native C 源码子集](concurrency.md#当前-native-c-源码子集)。`ku ir`、`--emit-ir` 和 LLVM 不通过这条 Task lowering 路径。
 

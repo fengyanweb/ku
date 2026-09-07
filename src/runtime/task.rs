@@ -2867,35 +2867,80 @@ mod tests {
     }
 
     #[test]
+    fn blocking_response_delivery_does_not_acknowledge_running_guard_retirement() {
+        let timeout = Duration::from_secs(1);
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let inner = Arc::clone(&runtime.inner);
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            // Exercise the actual accounting guard and publication helper in
+            // their worker order. This channel only holds the guard's lifetime;
+            // receiving a result must not be treated as cleanup acknowledgement.
+            let running = RunningBlockingJob::claim(&inner);
+            send_blocking_result(&response_tx, None, Ok(Value::Int(7)));
+            release_rx
+                .recv_timeout(timeout)
+                .expect("bounded blocking retirement release");
+            drop(running);
+        });
+        assert_eq!(
+            response_rx
+                .recv_timeout(timeout)
+                .expect("blocking response published")
+                .expect("blocking result"),
+            Value::Int(7)
+        );
+        let delivered = runtime.snapshot().expect("delivered result snapshot");
+        assert_eq!(delivered.queued_blocking_jobs, 0);
+        assert_eq!(delivered.running_blocking_jobs, 1);
+        assert_eq!(
+            runtime
+                .cancel_all_and_wait(Duration::ZERO)
+                .expect_err("live blocking guard still owns cleanup")
+                .code
+                .as_deref(),
+            Some("shutdown_timeout")
+        );
+        release_tx.send(()).expect("release blocking retirement");
+        worker.join().expect("blocking guard retired");
+        runtime
+            .cancel_all_and_wait(Duration::ZERO)
+            .expect("retired blocking guard permits shutdown");
+        let reclaimed = runtime.snapshot().expect("retired guard snapshot");
+        assert_eq!(reclaimed.queued_blocking_jobs, 0);
+        assert_eq!(reclaimed.running_blocking_jobs, 0);
+    }
+
+    #[test]
     fn snapshot_tracks_blocking_queue_reclamation() {
         let runtime = TaskRuntime::with_limits(1, 1, 1, 2, 1);
-        let started = Arc::new(AtomicBool::new(false));
-        let release = Arc::new(AtomicBool::new(false));
+        let timeout = Duration::from_secs(1);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
 
         let first_runtime = runtime.clone();
-        let first_started = Arc::clone(&started);
-        let first_release = Arc::clone(&release);
         let first = thread::spawn(move || {
             first_runtime.run_blocking(
                 move || {
-                    first_started.store(true, Ordering::Release);
-                    while !first_release.load(Ordering::Acquire) {
-                        thread::yield_now();
-                    }
+                    started_tx.send(()).expect("blocking start notification");
+                    release_rx
+                        .recv_timeout(timeout)
+                        .expect("bounded blocking job release");
                     Ok(Value::Int(1))
                 },
                 Span::default(),
             )
         });
-        wait_until(Duration::from_secs(1), "blocking job did not start", || {
-            started.load(Ordering::Acquire)
-        });
+        started_rx
+            .recv_timeout(timeout)
+            .expect("blocking job did not start");
 
         let second_runtime = runtime.clone();
         let second = thread::spawn(move || {
             second_runtime.run_blocking(|| Ok(Value::Int(2)), Span::default())
         });
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + timeout;
         loop {
             let snapshot = runtime.snapshot().expect("snapshot blocking queue");
             if snapshot.running_blocking_jobs == 1 && snapshot.queued_blocking_jobs == 1 {
@@ -2908,7 +2953,7 @@ mod tests {
             thread::yield_now();
         }
 
-        release.store(true, Ordering::Release);
+        release_tx.send(()).expect("release first blocking job");
         assert_eq!(
             first
                 .join()
@@ -2923,6 +2968,11 @@ mod tests {
                 .expect("second job"),
             Value::Int(2)
         );
+        // Caller joins prove response delivery, not worker-side cleanup ACK:
+        // send_blocking_result runs before RunningBlockingJob's final drop.
+        runtime
+            .cancel_all_and_wait(timeout)
+            .expect("blocking worker accounting should drain after replies");
         let snapshot = runtime.snapshot().expect("reclaimed blocking queue");
         assert_eq!(snapshot.queued_blocking_jobs, 0);
         assert_eq!(snapshot.running_blocking_jobs, 0);
