@@ -19,7 +19,9 @@ pub mod bounded_process;
 
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+#[cfg(not(unix))]
+use std::io::Read;
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -360,23 +362,10 @@ fn read_http_stream_bytes_until(
     let mut header_parsed = false;
     let mut expected_total = None;
     loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "HTTP test response exceeded its absolute deadline",
-                )
-            })?;
-        let socket_timeout = remaining.min(Duration::from_millis(200));
-        if socket_timeout < Duration::from_millis(1) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "HTTP test response exceeded its absolute deadline",
-            ));
-        }
-        stream.set_read_timeout(Some(socket_timeout))?;
-        match stream.read(&mut buffer) {
+        // A per-read timeout is retryable, but the shared absolute deadline is
+        // not. Keep this check outside the retrying read-result match.
+        http_test_read_timeout(deadline)?;
+        match read_http_chunk_until(stream, &mut buffer, deadline) {
             Ok(0) => return Ok(response),
             Ok(read) => {
                 let previous_len = response.len();
@@ -414,6 +403,134 @@ fn read_http_stream_bytes_until(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn http_test_read_timeout(deadline: Instant) -> std::io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timeout = remaining.min(Duration::from_millis(200));
+    if timeout < Duration::from_millis(1) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "HTTP test response exceeded its absolute deadline",
+        ));
+    }
+    Ok(timeout)
+}
+
+#[cfg(not(unix))]
+fn read_http_chunk_until(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    stream
+        .set_read_timeout(Some(http_test_read_timeout(deadline)?))
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("HTTP test read timeout setup: {error}"),
+            )
+        })?;
+    stream.read(buffer).map_err(|error| {
+        std::io::Error::new(error.kind(), format!("HTTP test response read: {error}"))
+    })
+}
+
+#[cfg(unix)]
+fn poll_http_response(fd: std::os::fd::RawFd, timeout: Duration) -> std::io::Result<libc::c_short> {
+    // Floor rather than round up: waiting never gains time beyond the existing
+    // absolute budget. The caller rejects remaining durations below one ms.
+    let timeout_ms = i32::try_from(timeout.as_millis()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HTTP test poll timeout overflow",
+        )
+    })?;
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialized descriptor is live for the entire call. poll
+    // neither owns nor closes fd; the caller retains its TcpStream.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    if ready < 0 {
+        let error = std::io::Error::last_os_error();
+        // EINTR is retried against the absolute deadline. Other poll errors,
+        // including allocation-related EAGAIN, must not become busy retries.
+        let kind = if error.kind() == std::io::ErrorKind::Interrupted {
+            error.kind()
+        } else {
+            std::io::ErrorKind::Other
+        };
+        return Err(std::io::Error::new(
+            kind,
+            format!("HTTP test readiness poll: {error}"),
+        ));
+    }
+    if ready == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "HTTP test readiness wait expired",
+        ));
+    }
+    if descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HTTP test readiness poll reported an invalid descriptor",
+        ));
+    }
+    if descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+        return Err(std::io::Error::other(
+            "HTTP test readiness poll returned no readable event",
+        ));
+    }
+    Ok(descriptor.revents)
+}
+
+#[cfg(unix)]
+fn read_http_chunk_until(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    // Darwin rejects setsockopt once both halves are shut down, even when the
+    // receive buffer still contains an HTTP response. Readiness + per-call
+    // nonblocking recv needs no socket-option mutation on a disconnected peer.
+    let events = poll_http_response(stream.as_raw_fd(), http_test_read_timeout(deadline)?)?;
+    http_test_read_timeout(deadline)?;
+    // SAFETY: the stream remains owned, buffer is exclusively borrowed and its
+    // exact capacity is passed to recv. MSG_DONTWAIT also bounds spurious wakes.
+    let read = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if read < 0 {
+        let error = std::io::Error::last_os_error();
+        let kind = if error.kind() == std::io::ErrorKind::WouldBlock
+            && events & (libc::POLLHUP | libc::POLLERR) != 0
+        {
+            // A sticky terminal readiness event without readable data or EOF
+            // must fail, not spin until the deadline. Preserve the OS evidence.
+            std::io::ErrorKind::Other
+        } else {
+            error.kind()
+        };
+        return Err(std::io::Error::new(
+            kind,
+            format!("HTTP test response recv: {error}"),
+        ));
+    }
+    usize::try_from(read)
+        .ok()
+        .filter(|read| *read <= buffer.len())
+        .ok_or_else(|| std::io::Error::other("HTTP test response recv returned an invalid length"))
 }
 
 fn http_response_expected_total(
@@ -496,8 +613,8 @@ fn read_http_stream(mut stream: TcpStream, timeout: Duration) -> String {
 
 /// Connect (retrying until the server is up), send one complete HTTP request,
 /// then read the bounded response. Keep the write side open while reading:
-/// macOS rejects socket-option changes after a write-side shutdown, and HTTP
-/// request framing does not require a half-close.
+/// HTTP request framing does not require a half-close, and it can combine with
+/// peer shutdown to prohibit later socket-option changes on macOS.
 fn http_response(address: &str, request: &str, timeout: Duration) -> String {
     http_response_bytes(address, request.as_bytes(), timeout)
 }
@@ -590,6 +707,122 @@ fn native_http_test_reader_bounds_drip_time_and_response_size() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     drop(size_client);
     size_server.join().expect("join size server");
+}
+
+#[cfg(unix)]
+#[test]
+fn native_http_test_reader_drains_response_after_peer_shutdown() {
+    use std::os::fd::AsRawFd;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind shutdown fixture");
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect fixture");
+    let (mut peer, _) = listener.accept().expect("accept shutdown fixture");
+    peer.set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("finish request side");
+    let expected =
+        b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbye";
+    peer.write_all(expected)
+        .expect("buffer complete timeout response");
+    peer.shutdown(std::net::Shutdown::Write)
+        .expect("finish response side");
+    drop(peer);
+
+    // Wait for the actual TCP shutdown event, not a scheduling delay, without
+    // consuming the buffered response. Darwin's poll(events=0) does not install
+    // a read filter, so use its EOF event with a low-water mark above our data.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // SAFETY: kqueue has no arguments and returns a fresh owned descriptor.
+        let raw_queue = unsafe { libc::kqueue() };
+        assert!(raw_queue >= 0, "create shutdown event queue");
+        // SAFETY: the successful kqueue call transfers this sole fd ownership.
+        let queue = unsafe { OwnedFd::from_raw_fd(raw_queue) };
+        let change = libc::kevent {
+            ident: client.as_raw_fd() as usize,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_LOWAT,
+            data: (expected.len() + 1) as isize,
+            udata: std::ptr::null_mut(),
+        };
+        let mut event = libc::kevent {
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let wait = libc::timespec {
+            tv_sec: 2,
+            tv_nsec: 0,
+        };
+        // SAFETY: all descriptors and single-element event buffers remain live;
+        // the timeout bounds waiting and EOF is reported even with unread data.
+        let ready = unsafe { libc::kevent(queue.as_raw_fd(), &change, 1, &mut event, 1, &wait) };
+        assert_eq!(ready, 1, "peer shutdown was not observed");
+        let flags = event.flags;
+        assert_eq!(
+            flags & libc::EV_ERROR,
+            0,
+            "shutdown event registration failed"
+        );
+        assert_ne!(flags & libc::EV_EOF, 0, "expected peer EOF");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut descriptor = libc::pollfd {
+            fd: client.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        // SAFETY: descriptor and the owning client remain live; the wait is bounded.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 2000) };
+        assert_eq!(ready, 1, "peer shutdown was not observed");
+        assert_ne!(
+            descriptor.revents & libc::POLLHUP,
+            0,
+            "expected peer hangup"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // This proves the original reader's failure point on Darwin rather
+        // than accepting EINVAL as a successful or empty HTTP response.
+        let error = client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect_err("Darwin rejects socket options after both halves close");
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    }
+    let actual = read_http_stream_bytes_until(&mut client, Instant::now() + Duration::from_secs(2))
+        .expect("read buffered HTTP after peer shutdown without changing socket options");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn native_http_test_reader_rejects_expired_and_submillisecond_deadlines() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind deadline fixture");
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect fixture");
+    let (_peer, _) = listener.accept().expect("accept deadline fixture");
+    for remaining in [Duration::ZERO, Duration::from_micros(500)] {
+        let error = read_http_stream_bytes_until(&mut client, Instant::now() + remaining)
+            .expect_err("less than one ms must never become an unbounded socket wait");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_http_test_reader_rejects_invalid_poll_descriptor() {
+    let error = poll_http_response(i32::MAX, Duration::from_millis(1))
+        .expect_err("POLLNVAL must fail rather than become a readiness retry");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("invalid descriptor"));
 }
 
 fn assert_status(response: &str, status: &str) {
