@@ -2735,6 +2735,23 @@ impl Interpreter {
 
     fn eval_template_expr(&mut self, expr: &Expr, env: &mut Env, depth: usize) -> KuResult<Value> {
         match &expr.kind {
+            ExprKind::Binary { left, op, right } if *op == BinaryOp::And || *op == BinaryOp::Or => {
+                // Keep template-specific arithmetic/concatenation in operands,
+                // but share ordinary expressions' lazy bool-only semantics.
+                let left = self.eval_template_expr(left, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
+                let left = expect_bool_condition(left, expr.span)?;
+                if (*op == BinaryOp::And && !left) || (*op == BinaryOp::Or && left) {
+                    return Ok(Value::Bool(left));
+                }
+                let right = self.eval_template_expr(right, env, depth)?;
+                if self.pending_fail.is_some() {
+                    return Ok(Value::Null);
+                }
+                Ok(Value::Bool(expect_bool_condition(right, expr.span)?))
+            }
             ExprKind::Binary { left, op, right } if *op == BinaryOp::Add => {
                 let left = self.eval_template_expr(left, env, depth)?;
                 if self.pending_fail.is_some() {
