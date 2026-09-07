@@ -19,6 +19,8 @@ mod borrow;
 mod monomorph;
 /// Internal typed frame IR. This does not open the CLI's native async boundary.
 pub mod task;
+/// Experimental bounded source Task lowering, distinct from synchronous IR.
+pub mod task_lower;
 pub use borrow::verify_borrow_contract;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

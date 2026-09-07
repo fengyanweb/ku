@@ -1,9 +1,9 @@
-//! Internal R1 task-frame emitter, not a scheduler or a public Ku Task ABI.
+//! Internal verified task-frame emitter, not a public Ku Task ABI.
 //!
 //! The caller supplies zeroed, aligned storage and serializes every operation.
 //! A Pending frame must traverse its verified cleanup CFG before destruction.
-//! No user callback, borrowed parameter, child Task, or wait registration is
-//! admitted here. The ordinary source/CLI unsupported-async gate stays separate.
+//! Hosted frames use generated child Start/Await and adapter-owned scope drain.
+//! User cleanup remains finite and cannot await; source admission stays separate.
 
 use std::collections::HashSet;
 
@@ -35,6 +35,7 @@ pub(super) fn emit_frames(
     out.push_str(FRAME_ABI);
     super::task_control::emit_runtime(out)?;
     super::task_driver::emit_runtime(out)?;
+    super::task_adapter::emit_host(out, tasks)?;
     for function in &tasks.functions {
         out.check()?;
         let frame = plan
@@ -53,6 +54,8 @@ struct FrameEmitter<'a> {
     persistent: HashSet<usize>,
     prefix: String,
     frame_type: String,
+    task_mask: u64,
+    hosted: bool,
 }
 
 impl<'a> FrameEmitter<'a> {
@@ -77,12 +80,18 @@ impl<'a> FrameEmitter<'a> {
             ));
         }
         for (index, slot) in function.slots.iter().enumerate() {
-            let TaskSlotType::Value { ty, borrowed } = &slot.ty;
-            require_slot_type(ty)?;
-            if *borrowed && persistent.contains(&index) {
-                return Err(unsupported(
-                    "borrowed values cannot enter a native task frame",
-                ));
+            match &slot.ty {
+                TaskSlotType::Value { ty, borrowed } => {
+                    require_slot_type(ty)?;
+                    if *borrowed && persistent.contains(&index) {
+                        return Err(unsupported(
+                            "borrowed values cannot enter a native task frame",
+                        ));
+                    }
+                }
+                TaskSlotType::Task { result } => {
+                    require_result_type(result)?;
+                }
             }
         }
         require_result_type(&function.result)?;
@@ -91,6 +100,8 @@ impl<'a> FrameEmitter<'a> {
             persistent,
             prefix: format!("ku_task_frame_{}", function.id.0),
             frame_type: format!("KuTaskFrame_{}", function.id.0),
+            task_mask: frame.scope_task_mask,
+            hosted: frame.hosted,
         })
     }
 
@@ -100,13 +111,23 @@ impl<'a> FrameEmitter<'a> {
             .slots
             .get(slot.0)
             .ok_or_else(|| unsupported("native task operation references a missing slot"))?;
-        let TaskSlotType::Value { ty, .. } = &slot.ty;
-        Ok(ty)
+        match &slot.ty {
+            TaskSlotType::Value { ty, .. } => Ok(ty),
+            TaskSlotType::Task { result } => Ok(result),
+        }
     }
 
     fn owns_slot(&self, slot: SlotId) -> bool {
-        let TaskSlotType::Value { ty, borrowed } = &self.function.slots[slot.0].ty;
-        !*borrowed && matches!(ty, IrType::Str | IrType::Result(_))
+        match &self.function.slots[slot.0].ty {
+            TaskSlotType::Task { .. } => true,
+            TaskSlotType::Value { ty, borrowed } => {
+                !*borrowed && matches!(ty, IrType::Str | IrType::Result(_))
+            }
+        }
+    }
+
+    fn task_slot(&self, slot: SlotId) -> bool {
+        self.task_mask & (1u64 << slot.0) != 0
     }
 
     fn place(&self, slot: SlotId) -> String {
@@ -147,8 +168,11 @@ impl<'a> FrameEmitter<'a> {
         for (index, slot) in self.function.slots.iter().enumerate() {
             out.check()?;
             if self.persistent.contains(&index) {
-                let TaskSlotType::Value { ty, .. } = &slot.ty;
-                out.push_str(&format!("  {} s_{index};\n", c_type(ty)?));
+                let ty = match &slot.ty {
+                    TaskSlotType::Value { ty, .. } => c_type(ty)?,
+                    TaskSlotType::Task { .. } => "KuTaskValueV1".to_string(),
+                };
+                out.push_str(&format!("  {ty} s_{index};\n"));
             }
         }
         out.push_str(&format!(
@@ -253,7 +277,9 @@ impl<'a> FrameEmitter<'a> {
         for (index, slot) in self.function.slots.iter().enumerate() {
             out.check()?;
             if !self.persistent.contains(&index) {
-                let TaskSlotType::Value { ty, .. } = &slot.ty;
+                let TaskSlotType::Value { ty, .. } = &slot.ty else {
+                    return Err(unsupported("Task slots must be persistent"));
+                };
                 out.push_str(&format!(
                     "  {} slot_{index} = {};\n",
                     c_type(ty)?,
@@ -266,9 +292,12 @@ impl<'a> FrameEmitter<'a> {
                if (cleanup && clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) {\n\
                  frame->header.cleanup_timed_out = 1;\n\
                  goto ku_task_terminated;\n\
-               }\n\
-               switch (frame->header.state) {\n",
+               }\n",
         );
+        if self.hosted {
+            out.push_str("  if (!cleanup && ku_task_control_atomic_load(&((KuTaskAdapterHostV1*)clock->host)->control->phase)!=KU_TASK_CONTROL_LIVE) { /* Mid-drive facts need bitmap cleanup, not an older suspension CFG. */ frame->header.cleanup_state=UINT32_MAX; frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }\n");
+        }
+        out.push_str("  switch (frame->header.state) {\n");
         for index in 0..self.function.states.len() {
             out.push_str(&format!("  case {index}u: goto ku_task_state_{index};\n"));
         }
@@ -327,6 +356,60 @@ impl<'a> FrameEmitter<'a> {
                            return KU_TASK_FRAME_READY;\n",
                     );
                 }
+                TaskTerminator::TryResult {
+                    src,
+                    ok_value,
+                    err_result,
+                    ok,
+                    err,
+                } => {
+                    let suffix = c_type_suffix(match self.slot_type(*src)? {
+                        IrType::Result(inner) => inner,
+                        _ => return Err(unsupported("TryResult requires Result")),
+                    })?;
+                    out.push_str(&format!(
+                        "  {{ {} taken=ku_result_move_{suffix}(&{});\n",
+                        c_type(self.slot_type(*src)?)?,
+                        self.place(*src)
+                    ));
+                    self.set_init(out, *src, false);
+                    out.push_str("  if (taken.ok) {\n");
+                    out.push_str(&format!(
+                        "    {}={};\n",
+                        self.place(*ok_value),
+                        c_move_value(self.slot_type(*ok_value)?, "taken.value")?
+                    ));
+                    self.set_init(out, *ok_value, true);
+                    out.push_str(&format!("    frame->header.state={}u;\n  }} else {{\n    {}.error=ku_error_move(&taken.error);\n",ok.0,self.place(*err_result)));
+                    self.set_init(out, *err_result, true);
+                    out.push_str(&format!("    frame->header.state={}u;\n  }}\n  ku_result_drop_{suffix}(&taken); }}\n  goto ku_task_dispatch;\n",err.0));
+                }
+                TaskTerminator::Await {
+                    task,
+                    dst,
+                    ready,
+                    cleanup,
+                } => {
+                    let field = super::task_adapter::outcome_field(self.slot_type(*dst)?)?;
+                    let IrType::Result(inner) = self.slot_type(*dst)? else {
+                        return Err(unsupported("Await output must be Result"));
+                    };
+                    let suffix = c_type_suffix(inner)?;
+                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  KuTaskAdapterOutcomeV1 received={{0}};\n  uint32_t awaited=ku_task_host_await((KuTaskAdapterHostV1*)clock->host,&{},&received);\n  if (awaited==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (awaited!=KU_TASK_CONTROL_OK) {{ ku_task_outcome_drop(&received); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",cleanup.0,self.place(*task)));
+                    self.set_init(out, *task, false);
+                    out.push_str("  if (received.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE) {\n    frame->header.has_exit_deadline=received.has_cleanup_deadline;\n    frame->header.exit_deadline=received.cleanup_deadline;\n");
+                    self.emit_runtime_error(
+                        out,
+                        &format!("ku_error_move(&received.value.{field}.error)"),
+                    )?;
+                    out.push_str("  }\n");
+                    out.push_str(&format!("  {}=ku_result_move_{suffix}(&received.value.{field});\n  ku_task_outcome_drop(&received);\n",self.place(*dst)));
+                    self.set_init(out, *dst, true);
+                    out.push_str(&format!(
+                        "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
+                        ready.0
+                    ));
+                }
                 TaskTerminator::Terminate => {
                     out.push_str(
                         "  if (!cleanup) { frame->header.running = 0; return KU_TASK_FRAME_INVALID_STATE; }\n  goto ku_task_terminated;\n",
@@ -360,6 +443,12 @@ impl<'a> FrameEmitter<'a> {
                 self.set_init(out, *dst, true);
             }
             TaskOp::Move { dst, src } => {
+                if self.task_slot(*src) {
+                    out.push_str(&format!("  if (ku_task_value_move(&{}, &{}) != KU_TASK_DRIVER_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",self.place(*dst),self.place(*src)));
+                    self.set_init(out, *src, false);
+                    self.set_init(out, *dst, true);
+                    return Ok(());
+                }
                 out.push_str(&format!(
                     "  {} = {};\n",
                     self.place(*dst),
@@ -391,11 +480,63 @@ impl<'a> FrameEmitter<'a> {
             TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
                 self.emit_slot_drop(out, *slot)?;
             }
+            TaskOp::Start {
+                dst,
+                function,
+                arguments,
+            } => {
+                out.push_str(&format!("  {{ uint32_t started=ku_task_{}_start_value(((KuTaskAdapterHostV1*)clock->host)->ticket->driver",function.0));
+                for argument in arguments {
+                    out.push_str(&format!(", &{}", self.place(*argument)));
+                }
+                out.push_str(&format!(", &{});\n  if (started!=KU_TASK_DRIVER_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }} }}\n",self.place(*dst)));
+                for argument in arguments {
+                    if self.owns_slot(*argument) {
+                        self.set_init(out, *argument, false);
+                    }
+                }
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::Print { value, newline } => {
+                let place = self.place(*value);
+                let expression = match self.slot_type(*value)? {
+                    IrType::Int => format!("printf(\"%lld\",(long long){place}) < 0"),
+                    IrType::Bool => format!("fputs({place} ? \"true\" : \"false\",stdout) == EOF"),
+                    IrType::Null => "fputs(\"null\",stdout) == EOF".to_string(),
+                    IrType::Str => format!(
+                        "({place}.len && fwrite({place}.ptr,1,{place}.len,stdout)!={place}.len)"
+                    ),
+                    _ => return Err(unsupported("Task print requires primitive value")),
+                };
+                out.push_str(&format!(
+                    "  if ({expression}{} || fflush(stdout)==EOF) {{\n",
+                    if *newline {
+                        " || fputc('\\n',stdout)==EOF"
+                    } else {
+                        ""
+                    }
+                ));
+                self.emit_runtime_error(out,"ku_error_make(ku_string_static((const uint8_t*)\"io\",2),ku_string_static((const uint8_t*)\"write_failed\",12),ku_string_static((const uint8_t*)\"output write failed\",19))")?;
+                out.push_str("  }\n");
+            }
         }
         Ok(())
     }
 
+    fn emit_runtime_error(&self, out: &mut COutput, error: &str) -> KuResult<()> {
+        let IrType::Result(inner) = &self.function.result else {
+            return Err(unsupported("runtime exit requires Result"));
+        };
+        out.push_str(&format!("    frame->result=({}){{false,{}, {error}}};\n    frame->header.result_initialized=1;\n    frame->header.exit_class=KU_TASK_EXIT_RUNTIME_FAILURE;\n",c_type(&self.function.result)?,c_zero_initializer(inner)?));
+        self.emit_all_slot_drops(out, true)?;
+        out.push_str("    frame->header.status=KU_TASK_FRAME_READY; frame->header.running=0; return KU_TASK_FRAME_READY;\n");
+        Ok(())
+    }
+
     fn emit_slot_drop(&self, out: &mut COutput, slot: SlotId) -> KuResult<()> {
+        if self.task_slot(slot) {
+            return Ok(());
+        }
         let bitmap = self.bitmap(slot);
         let bit = Self::bit(slot);
         out.push_str(&format!("  if ({bitmap} & {bit}) {{\n"));
@@ -432,10 +573,11 @@ impl<'a> FrameEmitter<'a> {
                if (checked != KU_TASK_FRAME_OK) return checked;\n\
                {frame_type}* frame = ({frame_type}*)storage;\n\
                if (ku_task_frame_is_terminal(frame->header.status)) return frame->header.status;\n\
-               if (!clock || !clock->now_ms) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
+               if (!clock || !clock->now_ms || ({hosted} && !clock->host)) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
                frame->header.running = 1;\n\
                return {prefix}_drive(frame, clock, 0);\n\
-             }}\n"
+             }}\n",
+            hosted=if self.hosted { "1" } else { "0" }
         ));
     }
 
@@ -448,6 +590,7 @@ impl<'a> FrameEmitter<'a> {
                if (checked != KU_TASK_FRAME_OK) return checked;\n\
                if (reason != KU_TASK_FRAME_CANCELLED && reason != KU_TASK_FRAME_TIMED_OUT) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
                {frame_type}* frame = ({frame_type}*)storage;\n\
+               if (frame->header.initialized & UINT64_C({task_mask})) return KU_TASK_FRAME_INVALID_STATE;\n\
                if (ku_task_frame_is_terminal(frame->header.status)) return frame->header.status;\n\
                if (!clock || !clock->now_ms) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
                frame->header.status = reason;\n\
@@ -459,7 +602,7 @@ impl<'a> FrameEmitter<'a> {
                }}\n\
                /* Before the first suspend, only owned entry parameters exist. */\n\
                if (clock->now_ms(clock->context) >= absolute_cleanup_deadline_ms) frame->header.cleanup_timed_out = 1;\n"
-        ));
+        ,task_mask=self.task_mask));
         // Entry parameters are always persistent, so no stack slot exists here.
         self.emit_all_slot_drops(out, false)?;
         out.push_str(
@@ -501,6 +644,10 @@ impl<'a> FrameEmitter<'a> {
                {frame_type}* frame = ({frame_type}*)storage;\n\
                if (!ku_task_frame_is_terminal(frame->header.status)) return KU_TASK_FRAME_INVALID_STATE;\n"
         ));
+        out.push_str(&format!(
+            "  if (frame->header.initialized & UINT64_C({})) return KU_TASK_FRAME_INVALID_STATE;\n",
+            self.task_mask
+        ));
         self.emit_all_slot_drops(out, false)?;
         out.push_str(&format!(
             "  if (frame->header.result_initialized) {{\n\
@@ -537,7 +684,7 @@ fn require_result_type(ty: &IrType) -> KuResult<()> {
     }
 }
 
-fn drop_statement(ty: &IrType, place: &str) -> KuResult<String> {
+pub(super) fn drop_statement(ty: &IrType, place: &str) -> KuResult<String> {
     if let IrType::Result(inner) = ty {
         Ok(format!(
             "ku_result_drop_{}(&{place});",
@@ -615,7 +762,7 @@ fn constant_expr(value: &TaskConstant, ty: &IrType) -> KuResult<String> {
 }
 
 const FRAME_ABI: &str = r#"
-/* Internal frame ABI v1: single owner/executor, externally serialized calls.
+/* Internal frame ABI v2: single owner/executor, externally serialized calls.
  * Storage must be zero-filled, suitably aligned, caller-owned and live until
  * destroy finishes; destroy drops payloads but never frees that storage. Do not
  * mutate/copy a live frame. Owned argument headers and their deep payloads must
@@ -623,8 +770,9 @@ const FRAME_ABI: &str = r#"
  * parameters; failures consume nothing. Result output must be initialized empty and
  * disjoint. Pending -> terminate -> destroy is frame-layer cleanup, NOT a Ku
  * Task handle-drop implementation. Clock callbacks are trusted non-reentrant,
- * monotonic internal hooks; no thread safety or scheduler is supplied here. */
-#define KU_TASK_FRAME_ABI_VERSION 1u
+ * monotonic internal hooks. Hosted child owners must be transferred before
+ * terminate/destroy; host pointers are borrowed only during a callback. */
+#define KU_TASK_FRAME_ABI_VERSION 2u
 #if defined(_MSC_VER)
 #define KU_TASK_FRAME_ALIGNOF(T) __alignof(T)
 #else
@@ -646,6 +794,7 @@ enum {
 typedef struct KuTaskFrameClockV1 {
   uint64_t (*now_ms)(void* context);
   void* context;
+  void* host;
 } KuTaskFrameClockV1;
 typedef struct KuTaskFrameHeaderV1 {
   uint32_t abi_version;
@@ -659,6 +808,9 @@ typedef struct KuTaskFrameHeaderV1 {
   uint32_t running;
   uint32_t result_initialized;
   uint32_t cleanup_timed_out;
+  uint32_t exit_class;
+  uint32_t has_exit_deadline;
+  uint64_t exit_deadline;
 } KuTaskFrameHeaderV1;
 static int ku_task_frame_storage_valid(const void* storage, size_t bytes,
                                      size_t required, size_t alignment) {

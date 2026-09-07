@@ -1,5 +1,6 @@
 //! Internal single-worker driver over the R1 frame/R2 control contracts.
-//! Runtime storage is caller-owned; source async and event polling stay gated.
+//! Caller-owned storage serves the restricted source Task path.
+//! Multi-worker scheduling and event polling remain unimplemented.
 
 use crate::backend::c::output::COutput;
 use crate::error::KuResult;
@@ -857,6 +858,76 @@ static uint32_t ku_task_driver_take_result(
   ku_task_driver_wrapper_end(ticket); /* AFTER final TAKEN/AVAILABLE publication. */
   return result;
 }
+/* Only the current generated callback may use this bound cancellation entry.
+ * Its execution/registry leases already protect control: no invented lease or
+ * extra retain is needed at the reference limit. R2 request_cancel is bounded
+ * atomics only; no frame, payload, dispose or user callback runs under mutex. */
+static uint32_t ku_task_driver_cancel_bound(
+    const KuTaskDriverTicketV1* ticket, uint32_t reason, uint64_t deadline) {
+  uint32_t checked = ku_task_driver_check_ticket(ticket);
+  if (checked != KU_TASK_DRIVER_OK) return checked;
+  if (reason != KU_TASK_CONTROL_CANCELLED && reason != KU_TASK_CONTROL_TIMED_OUT)
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  KuTaskDriverV1* driver = ticket->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* slot = ku_task_driver_find(ticket);
+  uint32_t result = !slot ? KU_TASK_DRIVER_STALE
+      : slot->cleanup_fault ? slot->cleanup_fault
+      : slot->state != KU_TASK_DRIVER_RUNNING || !slot->driver_lease.control
+        || slot->binding != slot->driver_lease.control ? KU_TASK_DRIVER_INVALID_STATE
+      : ku_task_control_request_cancel(&slot->driver_lease, reason, deadline);
+  if (result == KU_TASK_CONTROL_OK || result == KU_TASK_CONTROL_PENDING) {
+    slot->cancel_deadline = ku_task_driver_min(slot->cancel_deadline, deadline);
+    slot->cancel_pending = 1;
+    ku_task_driver_arm_deadline(driver, slot);
+    ku_task_driver_scope_refresh_locked(driver, ticket->slot);
+    ku_task_driver_wait_cancel_check_locked(driver, ticket->slot);
+    ku_task_driver_enqueue(driver, ticket->slot);
+  }
+  ku_task_driver_signal(driver);
+  ku_task_driver_unlock(driver);
+  return result;
+}
+/* Generated typed take glue calls this once, after all output/alias checks and
+ * before its infallible move. `bytes` is the actual active Owned payload charge;
+ * `minimum_from_bytes` is that generated child's sizeof(instance), not user
+ * input. IDs and the TAKING wrapper are checked, not treated as raw-C authority.
+ * This preserves total reserved bytes while the allocation changes owner. */
+static uint32_t ku_task_driver_transfer_charge(
+    const KuTaskDriverTicketV1* from, const KuTaskDriverTicketV1* to,
+    size_t bytes, size_t minimum_from_bytes) {
+  uint32_t checked = ku_task_driver_check_ticket(from);
+  if (checked != KU_TASK_DRIVER_OK) return checked;
+  checked = ku_task_driver_check_ticket(to);
+  if (checked != KU_TASK_DRIVER_OK) return checked;
+  if (from->driver != to->driver || from->slot == to->slot || !minimum_from_bytes)
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  KuTaskDriverV1* driver = from->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* child = ku_task_driver_find(from);
+  KuTaskDriverSlotV1* parent = ku_task_driver_find(to);
+  uint32_t result = !child || !parent ? KU_TASK_DRIVER_STALE
+      : child->cleanup_fault ? child->cleanup_fault
+      : parent->cleanup_fault ? parent->cleanup_fault
+      : parent->state != KU_TASK_DRIVER_RUNNING || !parent->driver_lease.control
+        || parent->binding != parent->driver_lease.control || !child->driver_lease.control
+        || child->binding != child->driver_lease.control || !child->wrapper_active
+        || ku_task_control_atomic_load(&child->binding->payload) != KU_TASK_CONTROL_PAYLOAD_TAKING
+      ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
+  if (result == KU_TASK_DRIVER_OK
+      && (child->charged_bytes < minimum_from_bytes
+          || bytes > child->charged_bytes - minimum_from_bytes
+          || parent->charged_bytes > SIZE_MAX - bytes
+          || child->charged_bytes > driver->reserved_bytes
+          || parent->charged_bytes > driver->reserved_bytes - child->charged_bytes))
+    result = KU_TASK_DRIVER_LIMIT;
+  if (result == KU_TASK_DRIVER_OK) {
+    child->charged_bytes -= bytes;
+    parent->charged_bytes += bytes;
+  }
+  ku_task_driver_unlock(driver);
+  return result;
+}
 static uint32_t ku_task_driver_owner_drop_impl(
     const KuTaskDriverTicketV1* ticket, KuTaskControlOwnerV1* owner, uint64_t deadline,
     KuTaskDriverCleanupReceiptV1* receipt) {
@@ -947,6 +1018,42 @@ static uint32_t ku_task_driver_cleanup_receipt_read(
    * after physical disposal and after a new control occupies this slot.
    * A valid receipt cannot come from BUILDING rollback or a copied ticket. */
   uint32_t result = ku_task_driver_cleanup_receipt_status_locked(driver, receipt->slot, receipt->generation);
+  if (result == KU_TASK_DRIVER_INTERNAL) driver->fault = result;
+  ku_task_driver_unlock(driver);
+  return result;
+}
+/* A scope can be cancelled after every child owner has already been handed
+ * off. Its non-owning receipts may only tighten those outstanding cleanups;
+ * they must never acquire a fresh budget, retain, or target a reused slot.
+ * The registry lease is real and protected by this mutex. R2 cancellation
+ * performs bounded atomics only, with no user/destructor callback here. */
+static uint32_t ku_task_driver_cancel_receipt(
+    const KuTaskDriverCleanupReceiptV1* receipt, uint64_t deadline) {
+  uint32_t checked = ku_task_driver_check_cleanup_receipt(receipt);
+  if (checked != KU_TASK_DRIVER_OK) return checked;
+  if (deadline == UINT64_MAX) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  KuTaskDriverV1* driver = receipt->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  uint32_t result = ku_task_driver_cleanup_receipt_status_locked(driver, receipt->slot, receipt->generation);
+  if (result == KU_TASK_DRIVER_PENDING) {
+    KuTaskDriverSlotV1* slot = &driver->slots[receipt->slot];
+    if (slot->owner_location == KU_TASK_DRIVER_OWNER_USER || !slot->driver_lease.control
+        || slot->binding != slot->driver_lease.control) result = KU_TASK_DRIVER_INTERNAL;
+    else {
+      uint32_t requested = ku_task_control_request_cancel(&slot->driver_lease, KU_TASK_CONTROL_CANCELLED, deadline);
+      if (requested == KU_TASK_CONTROL_OK || requested == KU_TASK_CONTROL_PENDING
+          || ku_task_control_is_terminal(requested)) {
+        slot->cancel_deadline = ku_task_driver_min(slot->cancel_deadline, deadline);
+        slot->cancel_pending = 1;
+        ku_task_driver_arm_deadline(driver, slot);
+        ku_task_driver_scope_refresh_locked(driver, receipt->slot);
+        ku_task_driver_wait_cancel_check_locked(driver, receipt->slot);
+        ku_task_driver_enqueue(driver, receipt->slot);
+        result = KU_TASK_DRIVER_OK;
+        ku_task_driver_signal(driver);
+      } else result = requested;
+    }
+  }
   if (result == KU_TASK_DRIVER_INTERNAL) driver->fault = result;
   ku_task_driver_unlock(driver);
   return result;
@@ -1352,6 +1459,48 @@ static uint32_t ku_task_driver_init(
   }
 #endif
   return KU_TASK_DRIVER_OK;
+}
+/* External root owns this live lease until after take. Readiness is checked
+ * under the publication mutex, then condition-wait atomically releases it.
+ * No callback, recursive child poll, periodic timeout or retain is involved.
+ * UINT64_MAX means wait for actual completion; a finite caller deadline is
+ * absolute and is never restarted by spurious or unrelated notifications. */
+static uint32_t ku_task_driver_wait_result(
+    const KuTaskDriverTicketV1* ticket, const KuTaskControlLeaseV1* lease,
+    uint64_t deadline) {
+  uint32_t checked = ku_task_driver_check_ticket(ticket);
+  if (checked != KU_TASK_DRIVER_OK) return checked;
+  checked = ku_task_control_check_lease(lease);
+  if (checked != KU_TASK_CONTROL_OK) return checked;
+  KuTaskDriverV1* driver = ticket->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  uint32_t result = KU_TASK_DRIVER_PENDING;
+  for (;;) {
+    KuTaskDriverSlotV1* slot = ku_task_driver_find(ticket);
+    if (!slot) { result = KU_TASK_DRIVER_STALE; break; }
+    if (slot->binding != lease->control || !slot->driver_lease.control
+        || slot->state == KU_TASK_DRIVER_BUILDING || slot->state == KU_TASK_DRIVER_RETIRING) {
+      result = KU_TASK_DRIVER_INVALID_STATE; break;
+    }
+    if (slot->cleanup_fault) { result = slot->cleanup_fault; break; }
+    result = ku_task_driver_wait_ready_locked(slot);
+    if (result != KU_TASK_DRIVER_PENDING) break;
+    if (driver->fault || driver->clock_fault) { result = KU_TASK_DRIVER_INTERNAL; break; }
+    uint64_t now = ku_task_driver_now_ms();
+    if (now == UINT64_MAX) {
+      ku_task_driver_enter_clock_fault(driver); result = KU_TASK_DRIVER_INTERNAL; break;
+    }
+    if (deadline != UINT64_MAX && now >= deadline) {
+      result = KU_TASK_DRIVER_SHUTDOWN_TIMEOUT; break;
+    }
+    int waited = ku_task_driver_wait(driver, deadline);
+    if (waited == -2) ku_task_driver_enter_clock_fault(driver);
+    if (waited < 0) { result = KU_TASK_DRIVER_INTERNAL; break; }
+    /* Recheck readiness before time: published completion is not undone just
+     * because the external root was scheduled after its waiting deadline. */
+  }
+  ku_task_driver_unlock(driver);
+  return result;
 }
 static uint32_t ku_task_driver_wait_idle(KuTaskDriverV1* driver, uint64_t deadline) {
   uint32_t checked = ku_task_driver_check(driver);

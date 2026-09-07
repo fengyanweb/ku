@@ -220,7 +220,7 @@ typedef struct FixtureDriver {
 typedef struct FixtureRole {
   KuTaskHandle_0 handle;
   KuTaskDriverWaitTokenV1 wait, old_wait;
-  KuResult_str result;
+  KuTaskAdapterOutcomeV1 result;
   KuTestEvent entered, proceed, armed, cleanup_entered, cleanup_proceed;
   KuTestEvent take_entered, take_proceed, stored, store_proceed;
   KuAtomicRefcount resumes, normal_continuations, cleanups, take_calls;
@@ -259,7 +259,7 @@ static void fixture_roles_finish(void) {
   for (size_t i = 0; i < ROLES; ++i) {
     FixtureRole* role = &fixture_roles[i]; if (!role->initialized) continue;
     CHECK(!role->handle.owner.lease.control);
-    ku_result_drop_str(&role->result);
+    ku_task_outcome_drop(&role->result);
     CHECK(ku_test_event_destroy(&role->entered)); CHECK(ku_test_event_destroy(&role->proceed));
     CHECK(ku_test_event_destroy(&role->armed)); CHECK(ku_test_event_destroy(&role->cleanup_entered));
     CHECK(ku_test_event_destroy(&role->cleanup_proceed)); CHECK(ku_test_event_destroy(&role->take_entered));
@@ -496,7 +496,9 @@ static uint32_t fixture_resume_hook(void* raw) {
     if (role->take_child) {
       role->take_status = ku_task_0_take(&child->handle, &role->result);
       CHECK(role->take_status == KU_TASK_CONTROL_OK);
-      CHECK(role->result.ok && role->result.value.len == 8u && role->result.value.ptr[4] == 0);
+      CHECK(role->result.result_kind == 4u && role->result.exit_class == KU_TASK_EXIT_USER_RESULT);
+      CHECK(!role->result.has_cleanup_deadline && !role->result.cleanup_deadline);
+      CHECK(role->result.value.string.ok && role->result.value.string.value.len == 8u && role->result.value.string.value.ptr[4] == 0);
     }
     fixture_inc(&role->normal_continuations); role->mode = MODE_FINISH;
   }
@@ -533,12 +535,13 @@ static void fixture_after_take_store(void* raw) {
 typedef struct FixtureTake {
   KuTaskDriverTicketV1 ticket;
   KuTaskControlLeaseV1 lease;
-  KuResult_str output;
+  KuTaskAdapterOutcomeV1 output;
   uint32_t status;
 } FixtureTake;
 static int fixture_take_thread(void* raw) {
   FixtureTake* take = (FixtureTake*)raw;
-  take->status = ku_task_driver_take_result(&take->ticket, &take->lease, &take->output);
+  KuTaskAdapterTakeRequestV1 request = {&take->output, NULL};
+  take->status = ku_task_driver_take_result(&take->ticket, &take->lease, &request);
   return 0;
 }
 static void fixture_take_start(FixtureTake* take, KuTestThread* thread, size_t child) {
@@ -551,7 +554,7 @@ static void fixture_take_start(FixtureTake* take, KuTestThread* thread, size_t c
 static void fixture_take_finish(FixtureTake* take, KuTestThread* thread) {
   CHECK(ku_test_thread_join(thread, 2000) && thread->outcome == 0);
   CHECK(ku_task_control_lease_release(&take->lease) == KU_TASK_CONTROL_OK);
-  ku_result_drop_str(&take->output);
+  ku_task_outcome_drop(&take->output);
 }
 
 static void fixture_ready_before_arm(void) {
@@ -774,6 +777,7 @@ static void fixture_headers_and_damaged_pair(void) {
 
 int main(void) {
   CHECK(KU_TASK_DRIVER_ABI_VERSION == 4u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION == 2u);
   fixture_ready_before_arm();
   fixture_parked_and_late_child();
   fixture_taking_publication(0, 0); fixture_taking_publication(1, 0);

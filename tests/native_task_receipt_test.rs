@@ -590,12 +590,13 @@ static void fixture_dispose_reuse_and_rollback(void) {
 typedef struct FixtureTake {
   KuTaskDriverTicketV1 ticket;
   KuTaskControlLeaseV1 lease;
-  KuResult_str output;
+  KuTaskAdapterOutcomeV1 output;
   uint32_t status;
 } FixtureTake;
 static int fixture_take_thread(void* raw) {
   FixtureTake* take = (FixtureTake*)raw;
-  take->status = ku_task_driver_take_result(&take->ticket, &take->lease, &take->output); return 0;
+  KuTaskAdapterTakeRequestV1 request = {&take->output, NULL};
+  take->status = ku_task_driver_take_result(&take->ticket, &take->lease, &request); return 0;
 }
 static void fixture_taking(int reject) {
   FixtureDriver runtime; fixture_driver_init(&runtime, 1); fixture_role_init(0);
@@ -622,7 +623,7 @@ static void fixture_taking(int reject) {
       reject ? KU_TASK_CONTROL_PAYLOAD_DROPPED : KU_TASK_CONTROL_PAYLOAD_TAKEN, 0);
   CHECK(fixture_count(&roles[0].payload_drops) == (reject ? 1u : 0u));
   CHECK(ku_task_control_lease_release(&take.lease) == KU_TASK_CONTROL_OK);
-  ku_result_drop_str(&take.output);
+  ku_task_outcome_drop(&take.output);
   CHECK(!fixture_count(&roles[0].disposes));
   CHECK(ku_task_control_lease_release(&observer) == KU_TASK_CONTROL_OK);
   fixture_wait_disposed(0); fixture_driver_finish(&runtime, 0); fixture_roles_finish();
@@ -733,6 +734,7 @@ static void fixture_corrupt_ack_process(void) {
 }
 int main(int argc, char** argv) {
   CHECK(KU_TASK_DRIVER_ABI_VERSION == 4u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION == 2u);
   ku_task_control_atomic_init(&fixture_bad_clock, 0);
   if (argc == 2 && !strcmp(argv[1], "--corrupt-ack")) { fixture_corrupt_ack_process(); return 0; }
   CHECK(argc == 1);

@@ -473,12 +473,15 @@ static void fixture_completed_parent(FixtureDriver* runtime, size_t i, uint32_t 
   CHECK(ku_test_event_wait(&roles[i].finished, 2000)); fixture_idle(runtime, fault);
   CHECK(roles[i].outcome == expected && fixture_count(&roles[i].continuations) == 1);
   CHECK(ku_task_control_atomic_load(&roles[i].handle.owner.lease.control->phase) == (expected == KU_TASK_DRIVER_CLEANUP_ACK ? KU_TASK_CONTROL_COMPLETED : KU_TASK_CONTROL_FAILED));
-  KuResult_str value = {0}; CHECK(ku_task_driver_take_result(&roles[i].ticket, &roles[i].handle.owner.lease, &value) == KU_TASK_CONTROL_OK);
-  CHECK(value.ok == (expected == KU_TASK_DRIVER_CLEANUP_ACK));
-  if (value.ok) CHECK(value.value.len == 7 && !memcmp(value.value.ptr, "payload", 7));
-  else if (expected == KU_TASK_DRIVER_CLEANUP_TIMEOUT) CHECK(value.error.code.len == 16 && !memcmp(value.error.code.ptr, "shutdown_timeout", 16));
-  else CHECK(value.error.code.len == 21 && !memcmp(value.error.code.ptr, "fixture_cleanup_fault", 21));
-  ku_result_drop_str(&value); fixture_transfer(i, fixture_deadline()); fixture_disposed_wait(i);
+  KuTaskAdapterOutcomeV1 value = {0}; KuTaskAdapterTakeRequestV1 request = {&value, NULL};
+  CHECK(ku_task_driver_take_result(&roles[i].ticket, &roles[i].handle.owner.lease, &request) == KU_TASK_CONTROL_OK);
+  CHECK(value.result_kind == 4u && value.exit_class == KU_TASK_EXIT_USER_RESULT);
+  CHECK(!value.has_cleanup_deadline && !value.cleanup_deadline);
+  CHECK(value.value.string.ok == (expected == KU_TASK_DRIVER_CLEANUP_ACK));
+  if (value.value.string.ok) CHECK(value.value.string.value.len == 7 && !memcmp(value.value.string.value.ptr, "payload", 7));
+  else if (expected == KU_TASK_DRIVER_CLEANUP_TIMEOUT) CHECK(value.value.string.error.code.len == 16 && !memcmp(value.value.string.error.code.ptr, "shutdown_timeout", 16));
+  else CHECK(value.value.string.error.code.len == 21 && !memcmp(value.value.string.error.code.ptr, "fixture_cleanup_fault", 21));
+  ku_task_outcome_drop(&value); fixture_transfer(i, fixture_deadline()); fixture_disposed_wait(i);
 }
 static void fixture_stable(FixtureDriver* runtime, uint32_t fault) {
   fixture_idle(runtime, fault); KuTaskDriverSnapshotV1 before = fixture_snapshot(runtime, fault);
@@ -735,10 +738,11 @@ static void fixture_real_timer(void) {
   fixture_child_release(&runtime, 0); fixture_disposed_wait(0); fixture_finish(&runtime, 0);
 }
 
-typedef struct FixtureTake { KuTaskDriverTicketV1 ticket; KuTaskControlLeaseV1 lease; KuResult_str value; uint32_t status; } FixtureTake;
+typedef struct FixtureTake { KuTaskDriverTicketV1 ticket; KuTaskControlLeaseV1 lease; KuTaskAdapterOutcomeV1 value; uint32_t status; } FixtureTake;
 static int fixture_take_thread(void* raw) {
   FixtureTake* take = (FixtureTake*)raw;
-  take->status = ku_task_driver_take_result(&take->ticket, &take->lease, &take->value); return 0;
+  KuTaskAdapterTakeRequestV1 request = {&take->value, NULL};
+  take->status = ku_task_driver_take_result(&take->ticket, &take->lease, &request); return 0;
 }
 static void fixture_taking(int reject) {
   fixture_clock_begin(); FixtureDriver runtime; fixture_driver_init(&runtime, 2);
@@ -759,7 +763,7 @@ static void fixture_taking(int reject) {
   CHECK(take.status == (reject ? KU_TASK_CONTROL_INVALID_ARGUMENT : KU_TASK_CONTROL_OK));
   fixture_completed_parent(&runtime, 1, KU_TASK_DRIVER_CLEANUP_ACK, 0);
   CHECK(!fixture_count(&roles[0].disposes)); CHECK(fixture_count(&roles[0].payload_drops) == (reject ? 1u : 0u));
-  CHECK(ku_task_control_lease_release(&take.lease) == KU_TASK_CONTROL_OK); ku_result_drop_str(&take.value);
+  CHECK(ku_task_control_lease_release(&take.lease) == KU_TASK_CONTROL_OK); ku_task_outcome_drop(&take.value);
   fixture_disposed_wait(0); fixture_finish(&runtime, 0);
 }
 static void fixture_full_resources(void) {
@@ -909,7 +913,7 @@ static void fixture_corrupt_ack_process(void) {
   puts("task-cleanup-wait-quarantined-not-drained");
 }
 int main(int argc, char** argv) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 4u); ku_task_control_deadline_init(&fixture_clock);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 4u); CHECK(KU_TASK_FRAME_ABI_VERSION == 2u); ku_task_control_deadline_init(&fixture_clock);
   if (argc == 2 && !strcmp(argv[1], "--corrupt-ack")) { fixture_corrupt_ack_process(); return 0; }
   CHECK(argc == 1);
   fixture_basic_wait(0, 0); fixture_basic_wait(0, 1); fixture_basic_wait(1, 0);

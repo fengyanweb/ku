@@ -126,7 +126,9 @@ fn native_task_frame_ir_accepts_exact_r1_primitive_results() {
             )],
         );
         fixture.functions[0].result = result(ty.clone());
-        accepted(&fixture);
+        let plan = accepted(&fixture);
+        assert!(!plan.functions[0].hosted);
+        assert_eq!(plan.functions[0].scope_task_mask, 0);
         fixture.functions[0].states[0].operations = vec![init(
             0,
             TaskConstant::Err {

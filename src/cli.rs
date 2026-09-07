@@ -2748,21 +2748,29 @@ fn write_native_c_to(
     dependency_mode: DependencyResolveMode,
 ) -> Result<PathBuf, KuError> {
     let program = parse_and_expand_with_dependency_mode(path, source, dependency_mode)?;
-    reject_native_async(&program)?;
+    let native_task_entry = ir::task_lower::has_async_entry(&program);
+    if !native_task_entry {
+        reject_native_async(&program)?;
+    }
     Checker::new().check(&program)?;
-    let lowered = ir::lower_program(&program)?;
-    let optimized = ir::optimize_program(&lowered);
-    let c_source = backend::c::generate_c_source_with_options(
-        &optimized,
-        &backend::c::CBackendOptions {
-            fs_base,
-            // Test-only, generation-time opt-in. This environment is read by
-            // the isolated `ku build` child used by native OOM tests; the
-            // backend API itself remains deterministic and defaults to false.
-            object_oom_fault_injection: env::var("KU_NATIVE_TEST_OBJECT_OOM_ENABLE").as_deref()
-                == Ok("1"),
-        },
-    )?;
+    let options = backend::c::CBackendOptions {
+        fs_base,
+        // Test-only, generation-time opt-in. This environment is read by
+        // the isolated `ku build` child used by native OOM tests; the
+        // backend API itself remains deterministic and defaults to false.
+        object_oom_fault_injection: env::var("KU_NATIVE_TEST_OBJECT_OOM_ENABLE").as_deref()
+            == Ok("1"),
+    };
+    let c_source = if native_task_entry {
+        // A separate verified state machine, never synchronous lowering with
+        // erased async flags. Unsupported source fails before artifact writes.
+        let tasks = ir::task_lower::lower_program(&program)?;
+        backend::c::generate_native_task_c_source(&tasks, &options)?
+    } else {
+        let lowered = ir::lower_program(&program)?;
+        let optimized = ir::optimize_program(&lowered);
+        backend::c::generate_c_source_with_options(&optimized, &options)?
+    };
     write_text_artifact(output, c_source)
 }
 

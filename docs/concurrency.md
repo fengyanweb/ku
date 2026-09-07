@@ -26,16 +26,51 @@ v0.0.18 第二阶段已采用以下规则；这不表示所有后端已实现。
 - 取消展开先请求 owned 子任务取消，再由内向外执行 finally，随后 drop 本作用域局部。
   清理期间禁止新建 Task、await 或提交新的 sleep/timer、网络等待和 blocking job；同步 close/drop 与有限计算仍受预算约束。
 
-本轮解释器生命周期切片已通过本机全量回归，具体证据与未覆盖边界见实施记录。
-native 已有独立 typed frame/control、内部单 worker driver、生成的 typed factory 和结果就绪等待内核；它们尚未接入源码
-async/await，不等于源码 stackless lowering、M:N、netpoll 或事件驱动 HTTP 已实现。
-内部等待覆盖登记/发布/取消/旧 token；内部清理收据区分逻辑清理与最终存储释放。
-ACK 等待和独立 final-drain 期限已通过内部本机定向用例：复用固定等待槽，不逐次分配，已确定
-的清理失败不能由迟到 ACK 覆盖，普通父任务不能仅因子清理超期而变成取消。
-这不等于源码 await 或父作用域清理完成；Task IR Start/Await 和全部 owned 子任务
-先转交、再有界等待的 scope drain 仍需独立实现与执行验证。
-native C / LLVM 继续明确拒绝 async lowering，不以同步代码或解释器回退冒充支持。
+解释器与各 native 切片的执行证据见实施记录；不同切片的测试结果不能互相替代。
+v0.0.18 开发分支已接通 native C 的单 worker 有限源码子集：AST 经独立 Task IR
+生成 Start、Move、Await 和函数级 scope drain，不嵌入解释器或 runner 源码。
+源码及 CLI 定向运行已通过；本片安全与完整本机回归已通过，精确提交三系统 CI 仍待完成，不是正式发布。
+结果等待与 ACK 等待复用固定槽位，不按每次等待分配；函数退出先移交全部 sibling，
+再等待逻辑清理 ACK。迟到 observer 可以保留控制存储，但不能保留已丢弃的 payload。
+正常 scope 超期是外层运行时 `task/shutdown_timeout`，不同于业务 Result.err，
+也不会把正常父任务标成 Cancelled；已有取消原因不变，绝对清理期限只收紧、不续期。
+LLVM、`ku ir` 和 `--emit-ir` 的同步 IR 路径仍拒绝 async。
 已经进入系统或外部库的阻塞操作仍不能硬杀，迟到结果只能清理，不得恢复已取消任务。
+
+### 当前 native C 源码子集
+
+import 展开后只能有顶层、非泛型 async 函数；入口必须是无参数的
+`async fn main(): null!`。函数参数为 `int/bool/null/str` 或对应单层 Result，
+返回类型必须显式为 primitive `T!`。函数体支持直线局部绑定、直接 async 调用、
+Task move、Await、`ok`、`?`、primitive print/println、显式 return，以及字符串常量 fail。
+新字符串表达式目前仅支持静态字面量；内部 ABI 仍负责 owned 参数/结果的 move/drop。
+接纳/OOM 拒绝仍消费源码已经移动的实参，返回可 await 的失败 Task，错误不再申请内存。
+
+```ku
+async fn Child(value: int): int! { return ok(value) }
+async fn main(): null! {
+    first = Child(3)
+    second = Child(4)
+    moved = first
+    a = (await moved)?
+    b = (await second)?
+    println(a)
+    println(b)
+    return ok(null)
+}
+```
+
+仍拒绝 if/循环/递归、重复赋值、嵌套拥有 Task 的作用域、try/catch/finally、闭包/函数值、
+同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
+算术和动态堆表达式，以及异步标准库 I/O。未支持形式在生成 artifact 前明确报错。
+用户 cleanup 仍不能 Await；内部 ACK continuation 不是新的用户语法。
+该子集只使用一个真实 OS worker 和条件等待，不递归 poll child。
+root 使用最多 1024 个固定驻留槽；字节接纳按固定存储和生成 instance 大小计费，
+不是操作系统 RSS 限制。编译器的函数/槽/操作硬限也不限制程序累计执行时间：
+无递归调用图仍可产生大量顺序工作。普通计算等待不擅自增加全局超时。
+print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
+M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成；
+不能据此承诺 CPU 并行或高并发吞吐。
 
 ## 同步只读借用与 async
 
@@ -53,7 +88,7 @@ async fn CountLater(text: str): int! {
 
 同步调用结束后借用即结束；后续 `await` 不会携带这份借用。async 函数也可以拥有 `fn(&str): int` 类型的同步 callback 值，这与 async 函数自身声明 `&` 参数不同。callback 的捕获与同次调用的重叠仍接受普通借用冲突检查。
 
-`&` 保证不消费句柄及不通过 borrowed 根直接写透明值，不表示函数没有 I/O 或 opaque client 内部状态变化。解释器对 borrowed 读取还检查调用所在线程和 task，跨线程 / task 使用会被拒绝。它不增加用户线程、spawn、detach 或手动调度 API，Task 仍为 move-only，`await` 仍消费一次。native async ABI 的既有不支持边界保持不变。
+`&` 保证不消费句柄及不通过 borrowed 根直接写透明值，不表示函数没有 I/O 或 opaque client 内部状态变化。解释器对 borrowed 读取还检查调用所在线程和 task，跨线程 / task 使用会被拒绝。它不增加用户线程、spawn、detach 或手动调度 API，Task 仍为 move-only，`await` 仍消费一次。上述同步调用/函数值示例不属于首片 native async 子集，native 构建仍会拒绝。
 
 ## runtime 有界策略
 

@@ -1,12 +1,12 @@
 //! Generated, internal R4 typed factories over the existing R1/R2/R3 contracts.
 //!
-//! This does not enable source async or add a public/manual Task API. A caller
+//! The bounded source Task path uses these adapters, without a manual Task API. A caller
 //! exclusively owns each handle/header it passes, and every deep Owned buffer
 //! remains valid, uniquely owned and disjoint from other live allocations. We
 //! validate representable ranges and header aliases, not arbitrary raw pointers.
-//! All current frame operations have allocation-free/static-value semantics, so
-//! input active capacity plus the single inline instance is a conservative task
-//! charge, not a complete language-wide heap or transferred-result budget.
+//! Source Start/Await and final scope drain reuse the fixed driver registration.
+//! Active result charge follows successful hosted takes; dynamic allocators and
+//! total RSS accounting remain outside this primitive-only implementation.
 
 use crate::error::KuResult;
 use crate::ir::task::{TaskFunction, TaskProgram, TaskSlotType};
@@ -15,6 +15,16 @@ use crate::ir::IrType;
 use super::output::COutput;
 use super::task::empty_value_expr;
 use super::{c_move_value, c_type, c_type_suffix, unsupported};
+
+#[path = "c_task_host.rs"]
+mod host;
+
+pub(super) fn emit_host(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
+    host::emit(out, tasks)
+}
+pub(super) fn outcome_field(ty: &IrType) -> KuResult<&'static str> {
+    host::field(ty)
+}
 
 pub(super) fn emit_adapters(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
     if tasks.functions.is_empty() {
@@ -26,6 +36,18 @@ pub(super) fn emit_adapters(out: &mut COutput, tasks: &TaskProgram) -> KuResult<
         out.check()?;
         emit_function(out, function)?;
     }
+    emit_value_dispatch(out, tasks)?;
+    out.check()
+}
+
+fn emit_value_dispatch(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
+    out.push_str("static uint32_t ku_task_value_check(KuTaskValueV1* value) {\n  if (!ku_task_frame_storage_valid(value,sizeof(*value),sizeof(*value),KU_TASK_FRAME_ALIGNOF(KuTaskValueV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->result_kind<1u || value->result_kind>4u) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  if (value->tag==KU_TASK_VALUE_INLINE_FAILED) return !value->owner.lease.control && !value->ticket.driver ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_INVALID_STATE;\n  if (value->tag!=KU_TASK_VALUE_LIVE) return KU_TASK_DRIVER_INVALID_STATE;\n  uint32_t checked=ku_task_control_check_lease(&value->owner.lease);\n  if (checked!=KU_TASK_CONTROL_OK) return checked;\n  KuTaskControlV1* control=value->owner.lease.control;\n  switch(value->function_id) {\n");
+    for function in &tasks.functions {
+        out.check()?;
+        let id = function.id.0;
+        out.push_str(&format!("  case {id}: if (value->result_kind!={}u || control->context!=(void*)control || control->operations.resume!=ku_task_{id}_resume || control->operations.take_payload!=ku_task_{id}_take_payload) return KU_TASK_DRIVER_INVALID_ARGUMENT; break;\n",host::kind(&function.result)?));
+    }
+    out.push_str("  default: return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  }\n  checked=ku_task_driver_check_ticket(&value->ticket);\n  if (checked!=KU_TASK_DRIVER_OK) return checked;\n  KuTaskDriverV1* driver=value->ticket.driver;\n  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;\n  KuTaskDriverSlotV1* slot=ku_task_driver_find(&value->ticket);\n  checked=slot && slot->binding==control ? KU_TASK_DRIVER_OK : KU_TASK_DRIVER_STALE;\n  ku_task_driver_unlock(driver);\n  return checked;\n}\n");
     out.check()
 }
 
@@ -76,7 +98,9 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         let Some(slot_type) = function.slots.get(slot.0) else {
             return Err(unsupported("native task adapter parameter slot is missing"));
         };
-        let TaskSlotType::Value { ty, borrowed } = &slot_type.ty;
+        let TaskSlotType::Value { ty, borrowed } = &slot_type.ty else {
+            return Err(unsupported("native Task parameters cannot be Task values"));
+        };
         if *borrowed || !supported_type(ty) || slot.0 >= 64 {
             return Err(unsupported("native task adapter parameter is unsupported"));
         }
@@ -90,6 +114,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     let mut preflight = String::new();
     let mut charge = String::new();
     let mut restore = String::new();
+    let mut rejected_drops = String::new();
     for (index, (slot, ty)) in parameters.iter().enumerate() {
         let c_ty = c_type(ty)?;
         declarations.push_str(&format!(", {c_ty}* arg_{index}"));
@@ -127,6 +152,10 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             checks
         }));
         if owned(ty) {
+            rejected_drops.push_str(&format!(
+                "  {}\n",
+                super::task::drop_statement(ty, &format!("(*arg_{index})"))?
+            ));
             restore.push_str(&format!(
                 "  *arg_{index} = {};\n\
                  instance->frame.header.initialized &= ~(UINT64_C(1) << {slot});\n",
@@ -136,9 +165,25 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     }
     let payload_aliases = active_strings(&function.result, "instance->payload", &|place| {
         format!(
-            "  if (ku_task_adapter_string_overlaps({place}, output, sizeof(*output))) return KU_TASK_CONTROL_INVALID_ARGUMENT;\n"
+            "  if (ku_task_adapter_string_overlaps({place}, outcome, sizeof(*outcome)) || ku_task_adapter_string_overlaps({place}, request, sizeof(*request)) || (request->parent && ku_task_adapter_string_overlaps({place},request->parent,sizeof(*request->parent)))) return KU_TASK_CONTROL_INVALID_ARGUMENT;\n"
         )
     });
+    let request_aliases = active_strings(&function.result, "instance->payload", &|place| {
+        format!("  if (ku_task_adapter_string_overlaps({place},request,sizeof(*request))) return KU_TASK_CONTROL_INVALID_ARGUMENT;\n")
+    });
+    let payload_charge = active_strings(&function.result, "instance->payload", &|place| {
+        format!("  checked=ku_task_adapter_string_charge({place},&payload_charge); if (checked!=KU_TASK_DRIVER_OK) return checked;\n")
+    });
+    let mut task_mask = 0u64;
+    let mut task_count = 0usize;
+    let mut transfers = String::new();
+    for (index, slot) in function.slots.iter().enumerate() {
+        if matches!(slot.ty, TaskSlotType::Task { .. }) {
+            task_mask |= 1u64 << index;
+            transfers.push_str(&format!("  if (instance->frame.header.initialized & (UINT64_C(1)<<{index})) {{\n    KuTaskValueV1* child=&instance->frame.s_{index};\n    uint32_t moved=ku_task_value_check(child);\n    if (moved!=KU_TASK_DRIVER_OK) return moved;\n    if (child->tag==KU_TASK_VALUE_LIVE) {{\n      moved=ku_task_driver_owner_drop_receipt(&child->ticket,&child->owner,instance->drain_deadline,&instance->receipts[{task_count}]);\n      if (moved!=KU_TASK_DRIVER_OK) return moved;\n      instance->receipt_mask |= UINT64_C(1)<<{task_count};\n    }}\n    *child=(KuTaskValueV1){{0}};\n    instance->frame.header.initialized &= ~(UINT64_C(1)<<{index});\n  }}\n"));
+            task_count += 1;
+        }
+    }
     let source = ADAPTER_FUNCTION
         .replace("@ID@", &id)
         .replace("@RESULT@", &result_type)
@@ -148,7 +193,16 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@PREFLIGHT@", &preflight)
         .replace("@CHARGE@", &charge)
         .replace("@RESTORE@", &restore)
+        .replace("@REJECTED_DROPS@", &rejected_drops)
+        .replace("@PAYLOAD_CHARGE@", &payload_charge)
+        .replace("@FIELD@", host::field(&function.result)?)
+        .replace("@KIND@", &host::kind(&function.result)?.to_string())
+        .replace("@TASK_MASK@", &task_mask.to_string())
+        .replace("@TASK_COUNT@", &task_count.to_string())
+        .replace("@RECEIPT_SIZE@", &task_count.max(1).to_string())
+        .replace("@TRANSFERS@", &transfers)
         .replace("@PAYLOAD_ALIASES@", &payload_aliases)
+        .replace("@REQUEST_ALIASES@", &request_aliases)
         .replace(
             "@EMPTY_RESULT@",
             &empty_value_expr(&function.result, "(*output)")?,
@@ -168,7 +222,7 @@ const ADAPTER_ABI: &str = r#"
  * known start/take buffer checks are extra guards, not a general alias oracle:
  * move must not inspect a concurrently running frame to guess its deep ranges.
  * Scope drop transfers ownership to R3; it is not a cleanup/retirement ACK.
- * take is a single nonblocking attempt; await registration remains a later IR.
+ * take is a single nonblocking attempt; hosted Await registers the fixed link.
  */
 enum { KU_TASK_ADAPTER_OUT_OF_MEMORY = 48u };
 static uint32_t ku_task_adapter_frame_status(uint32_t status) {
@@ -253,43 +307,143 @@ typedef struct KuTaskInstance_@ID@ {
   @RESULT@ payload;
   KuTaskDriverTicketV1 ticket;
   bool frame_initialized, payload_initialized, registered;
+  uint32_t exit_class, has_cleanup_deadline;
+  uint64_t cleanup_deadline;
+  uint32_t drain_started, values_cleaned, drain_failure;
+  uint64_t drain_deadline, receipt_mask;
+  uint32_t drain_deadline_published;
+  uint64_t drain_published_deadline;
+  KuTaskDriverCleanupReceiptV1 receipts[@RECEIPT_SIZE@];
+  KuTaskDriverWaitTokenV1 wait;
 } KuTaskInstance_@ID@;
 typedef struct KuTaskHandle_@ID@ {
   KuTaskControlOwnerV1 owner;
   KuTaskDriverTicketV1 ticket;
 } KuTaskHandle_@ID@;
 
+static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reason, KuTaskControlV1* budget) {
+  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait};
+  if (instance->wait.driver) {
+    KuTaskDriverWaitSnapshotV1 snapshot={0};
+    uint32_t status=ku_task_driver_wait_read(&instance->wait,&snapshot);
+    if (status!=KU_TASK_DRIVER_OK) return status;
+    if (snapshot.kind==KU_TASK_DRIVER_WAIT_KIND_RESULT) {
+      if (!reason) return KU_TASK_DRIVER_INTERNAL;
+      status=ku_task_driver_wait_detach(&instance->wait);
+      if (status!=KU_TASK_DRIVER_OK) return status;
+    }
+  }
+  if (!instance->drain_started && ((instance->frame.header.initialized & UINT64_C(@TASK_MASK@)) || instance->receipt_mask)) {
+    instance->drain_deadline=ku_task_host_deadline(&host,instance->has_cleanup_deadline ? instance->cleanup_deadline : UINT64_MAX,1);
+    instance->drain_started=1;
+  }
+  if (instance->drain_started) instance->drain_deadline=ku_task_host_deadline(&host,instance->drain_deadline,0);
+@TRANSFERS@
+  /* Every sibling was durably transferred before any Value cleanup/ACK wait. */
+  if (instance->drain_started && (!instance->drain_deadline_published
+      || instance->drain_deadline < instance->drain_published_deadline)) {
+    /* A later ancestor cancellation can tighten an already-transferred scope.
+     * Receipts protect logical identity, and the driver uses its live registry
+     * lease: never reconstruct a child owner or renew its original reason. */
+    for (size_t i=0;i<@TASK_COUNT@u;i++) if (instance->receipt_mask & (UINT64_C(1)<<i)) {
+      uint32_t status=ku_task_driver_cancel_receipt(&instance->receipts[i],instance->drain_deadline);
+      if (status==KU_TASK_DRIVER_CLEANUP_ACK) instance->receipt_mask &= ~(UINT64_C(1)<<i);
+      else if (status!=KU_TASK_DRIVER_OK) { instance->drain_failure=status; return status; }
+    }
+    instance->drain_published_deadline=instance->drain_deadline;
+    instance->drain_deadline_published=1;
+  }
+  if (reason && !instance->values_cleaned && instance->frame_initialized) {
+    KuTaskAdapterClockV1 bridge={instance->ticket.driver,budget};
+    KuTaskFrameClockV1 clock={ku_task_adapter_now,&bridge,&host};
+    uint32_t status;
+    if (instance->frame.header.status==KU_TASK_FRAME_READY) {
+      status=ku_task_frame_@ID@_destroy(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION);
+      if (status!=KU_TASK_FRAME_OK) return KU_TASK_DRIVER_INTERNAL;
+      instance->frame_initialized=false;
+    } else {
+      uint32_t frame_reason=reason==KU_TASK_CONTROL_CANCELLED ? KU_TASK_FRAME_CANCELLED : KU_TASK_FRAME_TIMED_OUT;
+      uint64_t value_deadline=ku_task_control_cleanup_deadline(budget);
+      if (instance->drain_started) value_deadline=ku_task_driver_min(value_deadline,instance->drain_deadline);
+      status=ku_task_frame_@ID@_terminate(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION,frame_reason,value_deadline,&clock);
+      if (status!=KU_TASK_FRAME_CANCELLED && status!=KU_TASK_FRAME_TIMED_OUT) return KU_TASK_DRIVER_INTERNAL;
+    }
+    instance->values_cleaned=1;
+  }
+  if (instance->wait.driver) {
+    KuTaskDriverWaitSnapshotV1 snapshot={0};
+    uint32_t status=ku_task_driver_wait_read(&instance->wait,&snapshot);
+    if (status!=KU_TASK_DRIVER_OK) return status;
+    if (snapshot.state==KU_TASK_DRIVER_WAIT_ARMED) {
+      if (ku_task_driver_set_intent(&instance->ticket,KU_TASK_DRIVER_WAIT)!=KU_TASK_DRIVER_OK) return KU_TASK_DRIVER_INTERNAL;
+      return KU_TASK_DRIVER_PENDING;
+    }
+    status=ku_task_driver_wait_detach(&instance->wait);
+    if (status!=KU_TASK_DRIVER_OK) return status;
+    if (snapshot.outcome!=KU_TASK_DRIVER_CLEANUP_ACK) instance->drain_failure=snapshot.outcome;
+  }
+  if (instance->drain_failure) return instance->drain_failure;
+  /* Bounded by declared Task slots; no repeated polling or recursive child drive. */
+  for (size_t i=0;i<@TASK_COUNT@u;i++) if (instance->receipt_mask & (UINT64_C(1)<<i)) {
+    uint32_t status=ku_task_driver_cleanup_receipt_read(&instance->receipts[i]);
+    if (status==KU_TASK_DRIVER_CLEANUP_ACK) { instance->receipt_mask &= ~(UINT64_C(1)<<i); continue; }
+    if (status!=KU_TASK_DRIVER_PENDING) { instance->drain_failure=status; return status; }
+  }
+  if (!instance->receipt_mask) return KU_TASK_DRIVER_OK;
+  for (size_t i=0;i<@TASK_COUNT@u;i++) if (instance->receipt_mask & (UINT64_C(1)<<i)) {
+    uint32_t status=ku_task_driver_cleanup_wait_arm(&instance->ticket,&instance->receipts[i],instance->drain_deadline,&instance->wait);
+    if (status==KU_TASK_DRIVER_CLEANUP_ACK) { instance->receipt_mask &= ~(UINT64_C(1)<<i); continue; }
+    if (status==KU_TASK_DRIVER_PENDING) return status;
+    instance->drain_failure=status; return status;
+  }
+  return KU_TASK_DRIVER_OK;
+}
 static uint32_t ku_task_@ID@_resume(void* raw) {
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)raw;
   if (!instance->frame_initialized) return KU_TASK_CONTROL_INVALID_STATE;
   KuTaskAdapterClockV1 bridge = { instance->ticket.driver, NULL };
-  KuTaskFrameClockV1 clock = { ku_task_adapter_now, &bridge };
-  uint32_t status = ku_task_frame_@ID@_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);
+  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait};
+  KuTaskFrameClockV1 clock = { ku_task_adapter_now, &bridge, &host };
+  uint32_t status=KU_TASK_FRAME_READY;
+  if (!instance->payload_initialized) {
+    if (ku_task_driver_set_intent(&instance->ticket,KU_TASK_DRIVER_YIELD)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;
+    status = ku_task_frame_@ID@_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);
+  }
   if (status == KU_TASK_FRAME_PENDING) {
-    /* Bare verified Suspend has no event registration: it is explicitly YIELD. */
-    status = ku_task_driver_set_intent(&instance->ticket, KU_TASK_DRIVER_YIELD);
-    if (status == KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_PENDING;
+    return KU_TASK_CONTROL_PENDING;
   } else if (status == KU_TASK_FRAME_READY && !instance->payload_initialized) {
     status = ku_task_frame_@ID@_take_result(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &instance->payload);
     if (status == KU_TASK_FRAME_OK) {
       instance->payload_initialized = true;
-      return instance->payload.ok ? KU_TASK_CONTROL_COMPLETED : KU_TASK_CONTROL_FAILED;
+      instance->exit_class=instance->frame.header.exit_class ? instance->frame.header.exit_class : KU_TASK_EXIT_USER_RESULT;
+      instance->has_cleanup_deadline=instance->frame.header.has_exit_deadline;
+      instance->cleanup_deadline=instance->frame.header.exit_deadline;
     }
+  }
+  if (instance->payload_initialized) {
+    status=ku_task_@ID@_drain(instance,0,NULL);
+    if (status==KU_TASK_DRIVER_PENDING) return KU_TASK_CONTROL_PENDING;
+    if (status==KU_TASK_DRIVER_CLEANUP_TIMEOUT) {
+      ku_result_drop_@SUFFIX@(&instance->payload);
+      instance->payload.error=ku_error_make(ku_string_static((const uint8_t*)"task",4),ku_string_static((const uint8_t*)"shutdown_timeout",16),ku_string_static((const uint8_t*)"owned child cleanup deadline expired",36));
+      instance->exit_class=KU_TASK_EXIT_RUNTIME_FAILURE;
+      instance->has_cleanup_deadline=1; instance->cleanup_deadline=instance->drain_deadline;
+      return KU_TASK_CONTROL_FAILED;
+    }
+    if (status==KU_TASK_DRIVER_OK) return instance->payload.ok ? KU_TASK_CONTROL_COMPLETED : KU_TASK_CONTROL_FAILED;
   }
   ku_task_adapter_fault(instance->ticket.driver, 0);
   return KU_TASK_CONTROL_INVALID_STATE;
 }
 static uint32_t ku_task_@ID@_cleanup(void* raw, uint32_t reason, KuTaskControlV1* budget) {
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)raw;
-  if (!instance->frame_initialized) return KU_TASK_CONTROL_OK;
+  if (instance->payload_initialized) { instance->payload_initialized=false; ku_result_drop_@SUFFIX@(&instance->payload); }
   uint32_t frame_reason = reason == KU_TASK_CONTROL_CANCELLED ? KU_TASK_FRAME_CANCELLED
       : reason == KU_TASK_CONTROL_TIMED_OUT ? KU_TASK_FRAME_TIMED_OUT : KU_TASK_FRAME_INVALID_ARGUMENT;
   if (frame_reason == KU_TASK_FRAME_INVALID_ARGUMENT) return KU_TASK_CONTROL_INVALID_ARGUMENT;
-  KuTaskAdapterClockV1 bridge = { instance->ticket.driver, budget };
-  KuTaskFrameClockV1 clock = { ku_task_adapter_now, &bridge };
-  uint64_t deadline = ku_task_control_cleanup_deadline(budget);
-  uint32_t status = ku_task_frame_@ID@_terminate(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, frame_reason, deadline, &clock);
-  if (status == KU_TASK_FRAME_CANCELLED || status == KU_TASK_FRAME_TIMED_OUT) return KU_TASK_CONTROL_OK;
+  uint32_t status=ku_task_@ID@_drain(instance,reason,budget);
+  if (status==KU_TASK_DRIVER_OK || status==KU_TASK_DRIVER_CLEANUP_TIMEOUT) return KU_TASK_CONTROL_OK;
+  if (status==KU_TASK_DRIVER_PENDING) return KU_TASK_CONTROL_PENDING;
   /* READY is only possible when R2 already staged/dropped the frame itself;
    * it must never be reinterpreted here as cancellation cleanup success. */
   ku_task_adapter_fault(instance->ticket.driver, 0);
@@ -311,15 +465,33 @@ static void ku_task_@ID@_drop_payload(void* raw) {
 }
 static uint32_t ku_task_@ID@_take_payload(void* raw, void* destination) {
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)raw;
-  @RESULT@* output = (@RESULT@*)destination;
-  if (!ku_task_driver_external_storage(instance->ticket.driver, output, sizeof(*output), KU_TASK_FRAME_ALIGNOF(@RESULT@))
-      || ku_task_frame_ranges_overlap(instance, sizeof(*instance), output, sizeof(*output))) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  KuTaskAdapterTakeRequestV1* request=(KuTaskAdapterTakeRequestV1*)destination;
+  if (!ku_task_driver_external_storage(instance->ticket.driver,request,sizeof(*request),KU_TASK_FRAME_ALIGNOF(KuTaskAdapterTakeRequestV1))
+      || ku_task_frame_ranges_overlap(instance,sizeof(*instance),request,sizeof(*request))) return KU_TASK_CONTROL_INVALID_ARGUMENT;
   if (!instance->payload_initialized) return KU_TASK_CONTROL_RESULT_TAKEN;
+@REQUEST_ALIASES@
+  KuTaskAdapterOutcomeV1* outcome=request->outcome;
+  if (!ku_task_driver_external_storage(instance->ticket.driver,outcome,sizeof(*outcome),KU_TASK_FRAME_ALIGNOF(KuTaskAdapterOutcomeV1))
+      || ku_task_frame_ranges_overlap(instance,sizeof(*instance),outcome,sizeof(*outcome))
+      || ku_task_frame_ranges_overlap(request,sizeof(*request),outcome,sizeof(*outcome))) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if (request->parent && (!ku_task_driver_external_storage(instance->ticket.driver,request->parent,sizeof(*request->parent),KU_TASK_FRAME_ALIGNOF(KuTaskDriverTicketV1))
+      || ku_task_frame_ranges_overlap(request->parent,sizeof(*request->parent),outcome,sizeof(*outcome))
+      || ku_task_frame_ranges_overlap(request->parent,sizeof(*request->parent),request,sizeof(*request)))) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  @RESULT@* output=&outcome->value.@FIELD@;
 @PAYLOAD_ALIASES@
   /* Reject deep alias before reading a typed header from that address: the
    * aliased allocation itself may be smaller than sizeof(*output). */
-  if (!(@EMPTY_RESULT@)) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if (outcome->result_kind || outcome->exit_class || outcome->has_cleanup_deadline || outcome->cleanup_deadline || !(@EMPTY_RESULT@)) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  size_t payload_charge=0;
+  uint32_t checked=KU_TASK_DRIVER_OK;
+@PAYLOAD_CHARGE@
+  if (request->parent) {
+    checked=ku_task_driver_transfer_charge(&instance->ticket,request->parent,payload_charge,sizeof(*instance));
+    if (checked!=KU_TASK_DRIVER_OK) return checked;
+  }
   *output = ku_result_move_@SUFFIX@(&instance->payload);
+  outcome->result_kind=@KIND@u; outcome->exit_class=instance->exit_class;
+  outcome->has_cleanup_deadline=instance->has_cleanup_deadline; outcome->cleanup_deadline=instance->cleanup_deadline;
   instance->payload_initialized = false;
   return KU_TASK_CONTROL_OK;
 }
@@ -375,16 +547,17 @@ static uint32_t ku_task_@ID@_move(KuTaskHandle_@ID@* output, KuTaskHandle_@ID@* 
   output->ticket = source->ticket; source->ticket = (KuTaskDriverTicketV1){0};
   return KU_TASK_DRIVER_OK;
 }
-static uint32_t ku_task_@ID@_take(KuTaskHandle_@ID@* handle, @RESULT@* output) {
+static uint32_t ku_task_@ID@_take(KuTaskHandle_@ID@* handle, KuTaskAdapterOutcomeV1* output) {
   uint32_t checked = ku_task_@ID@_check(handle);
   if (checked != KU_TASK_DRIVER_OK) return checked;
-  if (!ku_task_driver_external_storage(handle->ticket.driver, output, sizeof(*output), KU_TASK_FRAME_ALIGNOF(@RESULT@))
+  if (!ku_task_driver_external_storage(handle->ticket.driver, output, sizeof(*output), KU_TASK_FRAME_ALIGNOF(KuTaskAdapterOutcomeV1))
       || ku_task_frame_ranges_overlap(handle, sizeof(*handle), output, sizeof(*output))
       || ku_task_frame_ranges_overlap(handle->owner.lease.control, sizeof(KuTaskInstance_@ID@), output, sizeof(*output)))
     return KU_TASK_DRIVER_INVALID_ARGUMENT;
   /* R3 notifies only AFTER R2 has published TAKEN or restored AVAILABLE. Deep
    * payload aliases are checked inside the exclusive R2 take callback. */
-  return ku_task_driver_take_result(&handle->ticket, &handle->owner.lease, output);
+  KuTaskAdapterTakeRequestV1 request={output,NULL};
+  return ku_task_driver_take_result(&handle->ticket, &handle->owner.lease, &request);
 }
 static uint32_t ku_task_@ID@_drop(KuTaskHandle_@ID@* handle, uint64_t absolute_deadline) {
   uint32_t checked = ku_task_@ID@_check(handle);
@@ -451,6 +624,27 @@ static uint32_t ku_task_@ID@_try_start(KuTaskDriverV1* driver@PARAM_DECLS@, KuTa
   /* No fallible operation remains. Local owner protects a fast completion. */
   output->owner = owner;
   output->ticket = ticket;
+  return KU_TASK_DRIVER_OK;
+}
+static uint32_t ku_task_@ID@_start_value(KuTaskDriverV1* driver@PARAM_DECLS@, KuTaskValueV1* output) {
+  uint32_t checked=ku_task_driver_check(driver);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  if (!ku_task_driver_external_storage(driver,output,sizeof(*output),KU_TASK_FRAME_ALIGNOF(KuTaskValueV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+@PREFLIGHT@
+  size_t charge=0;
+@CHARGE@
+  (void)charge;
+  if (output->tag || output->owner.lease.control || output->ticket.driver) return KU_TASK_DRIVER_INVALID_STATE;
+  KuTaskHandle_@ID@ handle={0};
+  uint32_t status=ku_task_@ID@_try_start(driver@PARAM_ARGS@,&handle);
+  if (status!=KU_TASK_DRIVER_OK) {
+    if (status!=KU_TASK_DRIVER_LIMIT && status!=KU_TASK_DRIVER_CLOSED && status!=KU_TASK_ADAPTER_OUT_OF_MEMORY) return status;
+@REJECTED_DROPS@
+    output->tag=KU_TASK_VALUE_INLINE_FAILED; output->result_kind=@KIND@u; output->function_id=@ID@u; output->rejection_code=status;
+    return KU_TASK_DRIVER_OK;
+  }
+  output->tag=KU_TASK_VALUE_LIVE; output->result_kind=@KIND@u; output->function_id=@ID@u;
+  output->owner=handle.owner; output->ticket=handle.ticket;
   return KU_TASK_DRIVER_OK;
 }
 "#;

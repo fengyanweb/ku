@@ -338,7 +338,7 @@ fn main() {
 }
 
 #[test]
-fn native_build_rejects_async_syntax_with_clear_error() {
+fn native_build_rejects_async_main_without_result_before_artifacts() {
     let dir = unique_temp_path("native-async");
     fs::create_dir_all(&dir).expect("create temp dir");
     let file = dir.join("main.ku");
@@ -358,13 +358,51 @@ async fn main() {
         "--native".to_string(),
         file.display().to_string(),
     ])
-    .expect_err("native async should be rejected")
-    .to_string();
-    assert!(
-        err.contains("native C prototype does not support async/await yet"),
-        "unexpected error: {err}"
+    .expect_err("async main without a Result declaration must be rejected");
+    assert_eq!(
+        err.message,
+        "async fn 'main' must explicitly declare a Result return type such as T!"
     );
+    assert!(!file.with_extension("c").exists());
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_build_rejects_unsupported_async_control_before_artifacts() {
+    for (index, source) in [
+        "async fn main(): null! { while (false) {} return ok(null) }",
+        "async fn main(): null! { try { println(1) } finally { println(2) } return ok(null) }",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        check_source("inline.ku", source).expect("fixture is valid interpreted async source");
+        let dir = unique_temp_path(&format!("native-async-control-{index}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let file = dir.join("main.ku");
+        let binary = dir.join(if cfg!(windows) { "app.exe" } else { "app" });
+        fs::write(&file, source).expect("write source");
+        for link in [false, true] {
+            let mut args = vec![
+                "ku".to_string(),
+                "build".to_string(),
+                "--native".to_string(),
+                file.display().to_string(),
+            ];
+            if link {
+                args.extend(["-o".to_string(), binary.display().to_string()]);
+            }
+            let error = run_cli(args).expect_err("unsupported control must not emit or link C");
+            assert_eq!(
+                error.message,
+                "native async subset does not support this statement; loops, nested scopes and try/catch/finally remain gated"
+            );
+            assert!(!file.with_extension("c").exists());
+            assert!(!binary.exists());
+            assert!(!dir.join(".ku/build/debug/c").exists());
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[test]
