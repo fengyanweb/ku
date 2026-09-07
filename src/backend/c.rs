@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 mod output;
 use output::COutput;
 
+#[path = "c_task.rs"]
+mod task;
+
 // Whole generated-file bytes, including shared runtimes and all specializations.
 // This is independent of the checker's generic AST/type admission budget.
 const MAX_GENERATED_C_BYTES: usize = 64 * 1024 * 1024;
@@ -213,12 +216,62 @@ pub fn generate_c_source_with_options(
     generate_c_source_bounded(program, options, MAX_GENERATED_C_BYTES)
 }
 
+/// Compile verified internal task frames alongside the existing synchronous
+/// runtime helpers. This is not AST async lowering and is not a CLI capability.
+/// In particular it supplies no scheduler, Task handle or external I/O runtime.
+pub fn generate_task_frame_c_source(
+    program: &IrProgram,
+    frames: &crate::ir::task::TaskProgram,
+) -> KuResult<String> {
+    let plan = crate::ir::task::verify_and_plan(frames, Default::default())?;
+    if !frames.functions.is_empty()
+        && program.functions.iter().any(|function| {
+            let name = c_symbol(&function.name);
+            name.starts_with("ku_task_frame_")
+                || name.starts_with("KuTaskFrame")
+                || name.starts_with("KU_TASK_FRAME_")
+        })
+    {
+        return Err(unsupported(
+            "synchronous function collides with internal task frame ABI",
+        ));
+    }
+    generate_c_source_with_frames_bounded(
+        program,
+        &CBackendOptions::default(),
+        MAX_GENERATED_C_BYTES,
+        Some((frames, &plan)),
+    )
+}
+
 fn generate_c_source_bounded(
     program: &IrProgram,
     options: &CBackendOptions,
     byte_limit: usize,
 ) -> KuResult<String> {
+    generate_c_source_with_frames_bounded(program, options, byte_limit, None)
+}
+
+fn generate_c_source_with_frames_bounded(
+    program: &IrProgram,
+    options: &CBackendOptions,
+    byte_limit: usize,
+    frames: Option<(
+        &crate::ir::task::TaskProgram,
+        &crate::ir::task::TaskFramePlan,
+    )>,
+) -> KuResult<String> {
     crate::ir::verify_borrow_contract(program)?;
+    let mut frame_result_types = Vec::new();
+    if let Some((frames, _)) = frames {
+        for function in &frames.functions {
+            collect_result_type(&function.result, &mut frame_result_types)?;
+            for slot in &function.slots {
+                let crate::ir::task::TaskSlotType::Value { ty, .. } = &slot.ty;
+                collect_result_type(ty, &mut frame_result_types)?;
+            }
+        }
+    }
     for function in &program.functions {
         validate_cfg(function)?;
     }
@@ -408,7 +461,7 @@ fn generate_c_source_bounded(
     // complete) Result/closure tag is enough for `[T!]` and `[fn(...): T]`.
     // Their bodies/helpers are completed later, after their by-value
     // dependencies are available.
-    emit_result_forward_decls(&mut out, program)?;
+    emit_result_forward_decls(&mut out, program, &frame_result_types)?;
     emit_closure_forward_decls(&mut out, program)?;
     emit_array_typedefs(&mut out, program)?;
     emit_array_helper_prototypes(&mut out, program)?;
@@ -451,7 +504,7 @@ fn generate_c_source_bounded(
     // their typed KuArray helper bodies call ku_object_{clone,drop,move}.
     emit_late_array_typedefs(&mut out, program)?;
     emit_http_types(&mut out, program)?;
-    emit_result_abi(&mut out, program)?;
+    emit_result_abi(&mut out, program, &frame_result_types)?;
     emit_closure_types(
         &mut out,
         program,
@@ -496,6 +549,9 @@ fn generate_c_source_bounded(
         out.push('\n');
     }
     emit_closure_thunks(&mut out, program)?;
+    if let Some((frames, plan)) = frames {
+        task::emit_frames(&mut out, frames, plan)?;
+    }
     emit_main_wrapper(&mut out, program, fs_usage, &options.fs_base)?;
     out.finish()
 }
@@ -3220,14 +3276,18 @@ fn c_type(ty: &IrType) -> KuResult<String> {
     }
 }
 
-fn emit_result_forward_decls(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn emit_result_forward_decls(
+    out: &mut COutput,
+    program: &IrProgram,
+    extra_types: &[IrType],
+) -> KuResult<()> {
     out.check()?;
-    emit_result_abi_phase(out, program, true)
+    emit_result_abi_phase(out, program, true, extra_types)
 }
 
-fn emit_result_abi(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn emit_result_abi(out: &mut COutput, program: &IrProgram, extra_types: &[IrType]) -> KuResult<()> {
     out.check()?;
-    emit_result_abi_phase(out, program, false)
+    emit_result_abi_phase(out, program, false, extra_types)
 }
 
 /// Collect Result types once per phase through the same path so the early tag
@@ -3236,9 +3296,10 @@ fn emit_result_abi_phase(
     out: &mut COutput,
     program: &IrProgram,
     forward_decls_only: bool,
+    extra_types: &[IrType],
 ) -> KuResult<()> {
     out.check()?;
-    let mut result_types = Vec::new();
+    let mut result_types = extra_types.to_vec();
     for function in &program.functions {
         collect_result_type(&function.return_type, &mut result_types)?;
         for param in &function.params {

@@ -17,6 +17,8 @@ use crate::{
 
 mod borrow;
 mod monomorph;
+/// Internal typed frame IR. This does not open the CLI's native async boundary.
+pub mod task;
 pub use borrow::verify_borrow_contract;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
