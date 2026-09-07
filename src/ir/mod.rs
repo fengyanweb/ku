@@ -4530,10 +4530,16 @@ impl<'a> FunctionLowerer<'a> {
     }
 
     fn return_terminator(&mut self, value: Option<IrExpr>) -> IrTerminator {
-        let Some(handler) = self.try_handlers.last().cloned() else {
-            return IrTerminator::Return(value);
-        };
-        let Some(return_block) = handler.return_block else {
+        // A catch-only inner try has no return cleanup of its own, but it
+        // cannot hide an enclosing finally. Select the closest actual finally
+        // together with its matching return owner slot. Error propagation still
+        // uses the nearest catch and must not share this selection rule.
+        let Some((handler, return_block)) = self
+            .try_handlers
+            .iter()
+            .rev()
+            .find_map(|handler| handler.return_block.map(|block| (handler.clone(), block)))
+        else {
             return IrTerminator::Return(value);
         };
         if let (Some(name), Some(value)) = (handler.return_name, value) {
