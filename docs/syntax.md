@@ -731,9 +731,9 @@ Task 清理采用当前所有权作用域规则：合法 move 会转移清理责
 
 普通作用域退出的子任务清理超期同样报告 `task/shutdown_timeout`，不能把正常父任务伪标为 Cancelled。
 
-上述规则是语言合同，各执行层的范围与证据分别记录。v0.0.18 开发分支已从 AST 经 Task IR 生成 native Start/Move/Await 和函数级多 child scope drain；源码与 CLI 定向运行已通过，R5c 本机回归已通过，但其精确提交的三系统 CI 中 Linux/macOS 与 PR sanitizer 有失败，修复后的完整验证仍未完成，不是正式发布。M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成。
+上述规则是语言合同，各执行层的范围与证据分别记录。v0.0.18 开发分支已从 AST 经 Task IR 生成 native Start/Move/Await 和函数级多 child scope drain；源码与 CLI 定向运行已通过，本轮表达式/清理定向测试与 Rust quality 通过；本轮 native 全集和质量检查通过，workspace 的文档失败与修复证据单列；精确新提交三系统 CI/sanitizer 仍待核实，历史失败及后续修复证据分别见工作日志，不是正式发布。M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成。
 
-当前 native C 子集要求 import 展开后的函数全部是顶层非泛型 async 函数，入口为无参数 `async fn main(): null!`；参数限 `int/bool/null/str` 或对应单层 Result，返回显式 primitive `T!`。函数体支持直线局部绑定、已知 async 调用、Task move、Await、ok、?、primitive print/println、显式 return 和字符串常量 fail；新字符串表达式限静态字面量。if/循环/递归、重复赋值、嵌套 scope、try/catch/finally、闭包/函数值、同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定 Task 临时、算术和动态堆表达式仍拒绝。示例与完整边界见 [当前 native C 源码子集](concurrency.md#当前-native-c-源码子集)。`ku ir`、`--emit-ir` 和 LLVM 不通过这条 Task lowering 路径。
+当前 native C 子集要求 import 展开后的函数全部是顶层非泛型 async 函数，入口为无参数 `async fn main(): null!`；参数限 `int/bool/null/str` 或对应单层 Result，返回显式 primitive `T!`。函数体支持直线局部绑定、已知 async 调用、Task move、Await、ok、?、primitive print/println、显式 return 和字符串常量 fail；Copy 表达式支持 checked int 的一元 `-`、`+ - * / %` 和 `== != < <= > >=`，bool 的 `!`、`== !=` 及 `&& ||` 短路。普通二元式左值先求值并保存，右侧 Await 不会丢失该快照；未选中的逻辑右侧不执行其调用、move 或 Await，但仍静态检查。溢出/除零保持不可恢复 runtime failure，不因 async 返回 `T!` 就改成普通 Err。新字符串表达式限静态字面量。if/循环/递归、重复赋值、嵌套 scope、try/catch/finally、闭包/函数值、同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定 Task 临时、float/混合类型算术、str/null/Result/Task 比较和动态堆表达式仍拒绝。示例与完整边界见 [当前 native C 源码子集](concurrency.md#当前-native-c-源码子集)。`ku ir`、`--emit-ir` 和 LLVM 不通过这条 Task lowering 路径。
 
 该子集的函数退出先移交全部 sibling，再等待逻辑 cleanup ACK，所有 child 共用一个绝对期限；迟到 observer 不延长 payload 生命周期。普通 Result.err 仍是业务值，正常 scope 的 `task/shutdown_timeout` 是外层运行时失败，即使没有 `?` 也展开退出；取消/超时保留原原因。内部清理 continuation 可以等 ACK，但用户 cleanup 仍不能 Await。接纳/OOM 拒绝消费已 move 的源码实参并生成可 await 的静态失败 Task，不在错误路径再次分配。
 
@@ -2200,7 +2200,7 @@ native C 保留既有同步后端，并为第 6.5 节有限 async 子集增加�
 - `Task<T>` 不允许 clone；`await task` 消费 task，普通 task 只能 await 一次。
 - 优化方向包括 Copy clone 消除、源值随后不再使用时的 clone-to-move、临时 clone 消除、return clone-to-move、static string clone 零分配、struct clone inline、array/object 预分配，以及不需要的 drop/clone 消除。
 
-native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、错误和 return 都经过对应 finally block。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。native `KuString`（owned `{ptr,len,cap,storage}`）、动态 object hash、closure/函数值 ABI（`{invoke, env*}` + 引用计数 env、按引用共享 cell、逃逸、clone、局部函数自递归、array.map、深度守卫）均已落地，对已实现子集进行 native 与解释器差分验证。递归值 struct/enum、闭包捕获 catch/match binding、local-function self、`for` 迭代变量、Task 捕获和 async 函数值，以及超出第 6.5 节有限子集的 async native lowering 仍明确拒绝（纯文本报错，不生成错误 C）；不能把已支持的 struct/enum/Result 参数捕获误写成所有对应类型都拒绝。
+native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、可恢复错误和 return 都经过对应 finally block，取消/超时及不可恢复错误仍按第 11.3 节区分。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。native `KuString`（owned `{ptr,len,cap,storage}`）、动态 object hash、closure/函数值 ABI（`{invoke, env*}` + 引用计数 env、按引用共享 cell、逃逸、clone、局部函数自递归、array.map、深度守卫）均已落地，对已实现子集进行 native 与解释器差分验证。递归值 struct/enum、闭包捕获 catch/match binding、local-function self、`for` 迭代变量、Task 捕获和 async 函数值，以及超出第 6.5 节有限子集的 async native lowering 仍明确拒绝（纯文本报错，不生成错误 C）；不能把已支持的 struct/enum/Result 参数捕获误写成所有对应类型都拒绝。
 
 ## 17. 资源保护
 

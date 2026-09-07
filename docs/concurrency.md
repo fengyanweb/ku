@@ -29,7 +29,9 @@ v0.0.18 第二阶段已采用以下规则；这不表示所有后端已实现。
 解释器与各 native 切片的执行证据见实施记录；不同切片的测试结果不能互相替代。
 v0.0.18 开发分支已接通 native C 的单 worker 有限源码子集：AST 经独立 Task IR
 生成 Start、Move、Await 和函数级 scope drain，不嵌入解释器或 runner 源码。
-源码及 CLI 定向运行已通过；R5c 本机回归已通过，但其精确提交的三系统 CI 中 Linux/macOS 与 PR sanitizer 有失败，修复后的完整验证仍未完成，不是正式发布。
+源码及 CLI 定向运行已通过，本轮表达式/清理定向测试与 Rust quality 通过；本轮 native 全集通过，workspace 的文档失败与修复证据单列，
+精确新提交三系统 CI/sanitizer 仍待核实，不是正式发布。历史失败与
+后续修复的分开证据见 [工作日志](v0.0.18-worklog.md)。
 结果等待与 ACK 等待复用固定槽位，不按每次等待分配；函数退出先移交全部 sibling，
 再等待逻辑清理 ACK。迟到 observer 可以保留控制存储，但不能保留已丢弃的 payload。
 正常 scope 超期是外层运行时 `task/shutdown_timeout`，不同于业务 Result.err，
@@ -43,6 +45,16 @@ import 展开后只能有顶层、非泛型 async 函数；入口必须是无参
 `async fn main(): null!`。函数参数为 `int/bool/null/str` 或对应单层 Result，
 返回类型必须显式为 primitive `T!`。函数体支持直线局部绑定、直接 async 调用、
 Task move、Await、`ok`、`?`、primitive print/println、显式 return，以及字符串常量 fail。
+Copy 表达式支持 int 的一元 `-`、`+ - * / %`、`== != < <= > >=`，以及 bool 的
+`!`、`== !=`、`&& ||`；不做 bool/int 隐式转换。整数运算先检查边界，溢出和除/余零
+分别报告 `integer overflow`、`division by zero`；`MIN / -1` 与 `MIN % -1` 均是溢出。
+这些是外层 runtime failure，不是普通 Result.err：即使写 `result = await child`
+而不写 `?`，也不能收到该错误后继续业务语句；仍经原有 owner/child 清理链退出。
+
+普通二元式先完整求值并保存左值，再求右值；左 Copy 值在右侧 Await 挂起期间保活。
+`&& ||` 只执行必要的右侧表达式，未选中的 Start、实参 move、Await、Print 和 `?`
+都不执行，但右侧仍受静态类型与预算检查。若 Task 在逻辑表达式前已经创建，短路
+跳过它的 await 不免除当前 scope 的最终清理责任。
 新字符串表达式目前仅支持静态字面量；内部 ABI 仍负责 owned 参数/结果的 move/drop。
 接纳/OOM 拒绝仍消费源码已经移动的实参，返回可 await 的失败 Task，错误不再申请内存。
 
@@ -62,12 +74,16 @@ async fn main(): null! {
 
 仍拒绝 if/循环/递归、重复赋值、嵌套拥有 Task 的作用域、try/catch/finally、闭包/函数值、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
-算术和动态堆表达式，以及异步标准库 I/O。未支持形式在生成 artifact 前明确报错。
+float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及异步标准库 I/O。
+未支持形式在生成 artifact 前明确报错。
 用户 cleanup 仍不能 Await；内部 ACK continuation 不是新的用户语法。
 该子集只使用一个真实 OS worker 和条件等待，不递归 poll child。
 root 使用最多 1024 个固定驻留槽；字节接纳按固定存储和生成 instance 大小计费，
 不是操作系统 RSS 限制。编译器的函数/槽/操作硬限也不限制程序累计执行时间：
 无递归调用图仍可产生大量顺序工作。普通计算等待不擅自增加全局超时。
+表达式没有提高原有 64 函数、每函数 64 槽/256 状态、全程序 4096 操作及
+1,000,000 字面量字节/分析工作量上限。Parser 的解析递归深度上限仍为32；Task
+lower 对已构造 AST 另有 `depth > 64` 拒绝，这不是允许源码写64层嵌套的承诺。
 print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
 M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成；
 不能据此承诺 CPU 并行或高并发吞吐。

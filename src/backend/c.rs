@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 mod output;
 use output::COutput;
 
+#[path = "c_int.rs"]
+mod checked_int;
+
 #[path = "c_task.rs"]
 mod task;
 #[path = "c_task_adapter.rs"]
@@ -255,6 +258,8 @@ pub fn generate_task_frame_c_source(
                 || name.starts_with("ku_task_outcome_")
                 || name.starts_with("ku_task_host_")
                 || name.starts_with("ku_task_root_")
+                || name.starts_with("ku_int_")
+                || name.starts_with("KU_INT_")
                 || name.starts_with("KuTaskInstance_")
                 || name.starts_with("KuTaskHandle_")
                 || name
@@ -18238,6 +18243,81 @@ mod tests {
             );
         }
         assert_eq!(generate_task_frame_c_source(&ir, &tasks).unwrap(), expected);
+    }
+
+    #[test]
+    fn native_c_output_checked_integer_helper_keeps_exact_and_sticky_limits() {
+        let mut reference = COutput::new(16 * 1024);
+        checked_int::emit_runtime(&mut reference).unwrap();
+        let reference = reference.finish().unwrap();
+        let mut exact = COutput::new(reference.len());
+        checked_int::emit_runtime(&mut exact).unwrap();
+        assert_eq!(exact.finish().unwrap(), reference);
+        for limit in [0, reference.len() / 2, reference.len() - 1] {
+            let mut output = COutput::new(limit);
+            let error = checked_int::emit_runtime(&mut output).unwrap_err();
+            assert!(error.message.contains("native C output limit exceeded"));
+            assert_eq!(checked_int::emit_runtime(&mut output).unwrap_err(), error);
+            assert_eq!(output.finish().unwrap_err(), error);
+        }
+        let mut failed = COutput::new(0);
+        failed.push('x');
+        let original = failed.check().unwrap_err();
+        assert_eq!(
+            checked_int::emit_runtime(&mut failed).unwrap_err(),
+            original
+        );
+    }
+
+    #[test]
+    fn native_c_output_checked_integer_artifact_counts_helper_and_root() {
+        let ast = crate::parser::Parser::new(crate::lexer::Lexer::new(
+            "async fn Calc(a: int, b: int): int! { return ok(a * b) } async fn main(): null! { value = (await Calc(2, 3))? println(value) return ok(null) }"
+        ).tokenize().unwrap()).parse_program().unwrap();
+        crate::checker::Checker::new().check(&ast).unwrap();
+        let native = crate::ir::task_lower::lower_program(&ast).unwrap();
+        let plan = task_ir::verify_and_plan(&native.tasks, Default::default()).unwrap();
+        let sync = IrProgram {
+            functions: Vec::new(),
+            layouts: crate::ir::IrLayoutTable {
+                structs: Vec::new(),
+                enums: Vec::new(),
+            },
+        };
+        let options = CBackendOptions::default();
+        let expected = generate_native_task_c_source(&native, &options).unwrap();
+        let bounded = |limit| {
+            generate_c_source_with_frames_bounded(
+                &sync,
+                &options,
+                limit,
+                Some((&native.tasks, &plan, Some(native.entry))),
+            )
+        };
+        assert_eq!(bounded(expected.len()).unwrap(), expected);
+        let helper_start = expected
+            .find("/* Private checked int64_t computations.")
+            .unwrap();
+        let helper_middle = expected.find("static uint32_t ku_int_mul(").unwrap();
+        let root = expected
+            .find("static KuTaskDriverV1 ku_task_root_driver;")
+            .unwrap();
+        assert!(helper_start < helper_middle && helper_middle < root);
+        for limit in [0, helper_start, helper_middle, root, expected.len() - 1] {
+            let error = bounded(limit).unwrap_err();
+            assert!(
+                error.message.contains("native C output limit exceeded"),
+                "{error}"
+            );
+            assert!(
+                error.message.contains(&format!("maximum {limit} bytes")),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            generate_native_task_c_source(&native, &options).unwrap(),
+            expected
+        );
     }
 
     #[test]

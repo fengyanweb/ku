@@ -60,9 +60,17 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 TaskOp::Init { dst, .. } => map(dst),
                 TaskOp::Copy { dst, src }
                 | TaskOp::Move { dst, src }
-                | TaskOp::WrapOk { dst, src } => {
+                | TaskOp::WrapOk { dst, src }
+                | TaskOp::Unary { dst, src, .. } => {
                     map(dst);
                     map(src);
+                }
+                TaskOp::Binary {
+                    dst, left, right, ..
+                } => {
+                    map(dst);
+                    map(left);
+                    map(right);
                 }
                 TaskOp::Read { slot } | TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
                     map(slot)
