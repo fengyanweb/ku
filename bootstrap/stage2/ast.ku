@@ -81,6 +81,9 @@ fn ValidateParseOutput(output: ParseOutput): ParseOutput! {
         // Materialize one bounded node, rather than repeatedly projecting
         // through the owned graph for every scalar field in the interpreter.
         node = nodes[node_index].clone()
+        if (node.kind == "Parameter" && node.int_value != 0 && node.int_value != 1) {
+            rejectParseOutput("invalid_parameter_mode", "bootstrap parameter mode must be owned (0) or borrowed (1)")?
+        }
         node_line = node.line
         node_column = node.column
         node_offset = node.offset

@@ -1724,10 +1724,13 @@ impl Parser {
     }
 
     fn advance(&mut self) -> &Token {
+        let index = self.current;
         if !self.check(&TokenKind::Eof) {
             self.current += 1;
         }
-        self.previous()
+        // EOF is a real token. Returning previous() here reuses the last
+        // identifier/string and can point incomplete-syntax errors backwards.
+        &self.tokens[index]
     }
 
     fn peek(&self) -> &Token {

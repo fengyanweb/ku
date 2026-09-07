@@ -18,32 +18,91 @@ use crate::{
         Item, Literal, MatchPattern, ParamMode, Program, Stmt, UnaryOp,
     },
     env::{BorrowLease, Env},
-    error::{KuError, KuResult},
+    error::{KuError, KuResult, RuntimeTermination, TerminationReason},
     lexer::Lexer,
     parser::Parser,
     runtime::{
         http_listener_registry,
-        task::{current_task_cancelled, TaskRuntime, TaskRuntimeSnapshot, TaskStressReport},
+        task::{
+            current_cleanup_context, current_task_cancellation, set_execution_termination,
+            CancellationContext, CleanupGuard, ExecutionTerminationGuard, TaskRuntime,
+            TaskRuntimeSnapshot, TaskStressReport,
+        },
     },
     span::{Position, Span},
     stdlib,
-    value::{BorrowProjection, HttpListenerLease, Value},
+    value::{BorrowProjection, HttpListenerLease, Value, ValueProjection},
 };
 
 const MAX_CALL_DEPTH: usize = 512;
 const HTTP_HANDLER_TIMEOUT_MESSAGE: &str = "http handler timeout";
+const HTTP_HANDLER_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const HTTP_ACCEPT_BATCH: usize = 64;
 const HTTP_EVENT_LOOP_SLEEP: Duration = Duration::from_millis(1);
 const HTTP_MAX_METHOD_BYTES: usize = 32;
 
 const HTTP_LISTENER_LEASE_FIELD: &str = "\0ku.http.listener.lease";
 
+mod cancellation;
+
+#[cfg(test)]
+mod task_cleanup_tests;
+
+#[cfg(test)]
+mod match_task_tests;
+
+#[cfg(test)]
+mod caller_owner_tests;
+
 enum Flow {
     Continue,
-    Break,
-    LoopContinue,
-    Return(Value),
-    Fail(Value),
+    Break(Option<RuntimeTermination>),
+    LoopContinue(Option<RuntimeTermination>),
+    Return {
+        value: Value,
+        cleanup: Option<RuntimeTermination>,
+    },
+    Fail {
+        value: Value,
+        cleanup: Option<RuntimeTermination>,
+    },
+}
+
+impl Flow {
+    fn fail(value: Value) -> Self {
+        Self::Fail {
+            value,
+            cleanup: None,
+        }
+    }
+
+    fn returned(value: Value) -> Self {
+        Self::Return {
+            value,
+            cleanup: None,
+        }
+    }
+}
+
+struct HttpHandlerDeadline {
+    deadline: Instant,
+    timed_out: bool,
+    cleanup_deadline: Option<Instant>,
+}
+
+impl HttpHandlerDeadline {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            timed_out: false,
+            cleanup_deadline: None,
+        }
+    }
+
+    fn poll(&mut self, now: Instant) -> bool {
+        self.timed_out |= now >= self.deadline;
+        self.timed_out
+    }
 }
 
 struct FunctionValueCall<'a> {
@@ -67,9 +126,12 @@ pub struct Interpreter {
     call_depth: usize,
     pending_fail: Option<Value>,
     std_modules: HashSet<String>,
-    execution_deadline: Option<Instant>,
+    execution_deadline: Option<HttpHandlerDeadline>,
     task_runtime: Option<TaskRuntime>,
     async_execution: bool,
+    termination: Option<RuntimeTermination>,
+    cleanup_timeout_recorded: bool,
+    caller_owners: Vec<crate::env::OwnedBindingObserver>,
 }
 
 #[derive(Clone)]
@@ -95,6 +157,9 @@ impl Interpreter {
             execution_deadline: None,
             task_runtime: None,
             async_execution: false,
+            termination: None,
+            cleanup_timeout_recorded: false,
+            caller_owners: Vec::new(),
         }
     }
 
@@ -106,6 +171,7 @@ impl Interpreter {
     }
 
     pub fn run(&mut self, program: Program) -> KuResult<()> {
+        let _execution = ExecutionTerminationGuard::enter();
         for item in program.items {
             match item {
                 Item::Function(function) => {
@@ -148,6 +214,12 @@ impl Interpreter {
                 value => Ok(value),
             }
         })();
+        self.observe_termination(&result);
+        let _shutdown_cleanup = result
+            .as_ref()
+            .err()
+            .and_then(KuError::scope_cleanup)
+            .map(CleanupGuard::enter);
         let shutdown = self
             .task_runtime
             .as_ref()
@@ -228,17 +300,19 @@ impl Interpreter {
                 env.define_parameter(param.name.clone(), value, false, param.span)?;
             }
 
-            match self.exec_block(&function.body, &mut env, depth)? {
-                Flow::Continue => Ok(Value::Null),
-                Flow::Return(value) => Ok(value),
-                Flow::Fail(value) => Ok(Value::Result {
+            let result = self.exec_block(&function.body, &mut env, depth);
+            match self.finish_owned_scope(&mut env, result, function.span, false) {
+                Ok(Flow::Continue) => Ok(Value::Null),
+                Ok(Flow::Return { value, .. }) => Ok(value),
+                Ok(Flow::Fail { value, .. }) => Ok(Value::Result {
                     ok: false,
                     value: Box::new(value),
                 }),
-                Flow::Break | Flow::LoopContinue => Err(KuError::runtime(
+                Ok(Flow::Break(_) | Flow::LoopContinue(_)) => Err(KuError::runtime(
                     "loop control escaped function",
                     function.span,
                 )),
+                Err(error) => Err(error),
             }
         })();
         self.call_depth -= 1;
@@ -251,6 +325,7 @@ impl Interpreter {
         args: Vec<Value>,
         span: Span,
     ) -> KuResult<Value> {
+        self.reject_cleanup_submission(span)?;
         if function
             .params
             .iter()
@@ -276,7 +351,7 @@ impl Interpreter {
                 interpreter.async_execution = true;
                 interpreter.call_function_direct(function, args, span, 0)
             }
-        });
+        })?;
         Ok(Value::Task(task))
     }
 
@@ -303,11 +378,15 @@ impl Interpreter {
             execution_deadline: None,
             task_runtime: Some(runtime),
             async_execution: true,
+            termination: None,
+            cleanup_timeout_recorded: false,
+            caller_owners: Vec::new(),
         }
     }
 
     fn call_function_value(&mut self, call: FunctionValueCall<'_>) -> KuResult<Value> {
         if call.is_async {
+            self.reject_cleanup_submission(call.span)?;
             if call.param_modes.contains(&ParamMode::View) {
                 return Err(KuError::runtime(
                     "async functions cannot declare borrowed parameters",
@@ -345,7 +424,7 @@ impl Interpreter {
                     },
                     true,
                 )
-            });
+            })?;
             return Ok(Value::Task(task));
         }
         self.call_function_value_direct(call, false)
@@ -421,20 +500,20 @@ impl Interpreter {
                 env.define_parameter(param.clone(), value, false, span)?;
             }
 
-            let result = match self.exec_block(body, &mut env, depth)? {
-                Flow::Continue => Ok(Value::Null),
-                Flow::Return(value) => Ok(value),
-                Flow::Fail(value) => Ok(Value::Result {
+            let result = self.exec_block(body, &mut env, depth);
+            match self.finish_owned_scope(&mut env, result, span, true) {
+                Ok(Flow::Continue) => Ok(Value::Null),
+                Ok(Flow::Return { value, .. }) => Ok(value),
+                Ok(Flow::Fail { value, .. }) => Ok(Value::Result {
                     ok: false,
                     value: Box::new(value),
                 }),
-                Flow::Break | Flow::LoopContinue => Err(KuError::runtime(
+                Ok(Flow::Break(_) | Flow::LoopContinue(_)) => Err(KuError::runtime(
                     "loop control escaped function value",
                     span,
                 )),
-            };
-            env.pop_scope();
-            result
+                Err(error) => Err(error),
+            }
         })();
         self.call_depth -= 1;
         result
@@ -442,15 +521,21 @@ impl Interpreter {
 
     fn exec_block(&mut self, body: &[Stmt], env: &mut Env, depth: usize) -> KuResult<Flow> {
         env.push_scope();
-        for stmt in body {
-            let flow = self.exec_stmt(stmt, env, depth)?;
-            if !matches!(flow, Flow::Continue) {
-                env.pop_scope();
-                return Ok(flow);
+        let result = (|| {
+            for stmt in body {
+                let flow = self.exec_stmt(stmt, env, depth)?;
+                if !matches!(flow, Flow::Continue) {
+                    return Ok(flow);
+                }
             }
-        }
-        env.pop_scope();
-        Ok(Flow::Continue)
+            Ok(Flow::Continue)
+        })();
+        self.finish_owned_scope(
+            env,
+            result,
+            body.first().map(stmt_span).unwrap_or_default(),
+            true,
+        )
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt, env: &mut Env, depth: usize) -> KuResult<Flow> {
@@ -465,7 +550,7 @@ impl Interpreter {
             } => {
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 env.define_owned(
                     name.clone(),
@@ -477,11 +562,11 @@ impl Interpreter {
             }
             Stmt::Assign { name, value, span } => {
                 if self.try_self_array_push(name, value, env, depth, *span)? {
-                    return Ok(self.take_pending_fail().map_or(Flow::Continue, Flow::Fail));
+                    return Ok(self.take_pending_fail().map_or(Flow::Continue, Flow::fail));
                 }
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 if env.contains(name) {
                     env.assign_owned(name, value, *span)?;
@@ -497,11 +582,11 @@ impl Interpreter {
             } => {
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 self.assign_target(target, value, env, depth, *span)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 Ok(Flow::Continue)
             }
@@ -513,11 +598,11 @@ impl Interpreter {
             } => {
                 let right = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 self.compound_assign_target(target, *op, right, env, depth, *span)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 Ok(Flow::Continue)
             }
@@ -540,7 +625,7 @@ impl Interpreter {
                 for value in values {
                     evaluated.push(self.eval(value, env, depth)?);
                     if let Some(value) = self.take_pending_fail() {
-                        return Ok(Flow::Fail(value));
+                        return Ok(Flow::fail(value));
                     }
                 }
                 for (name, value) in names.iter().zip(evaluated) {
@@ -563,11 +648,11 @@ impl Interpreter {
             } => {
                 let source = self.eval_object_destructure_source(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 self.object_destructure_assign(bindings, rest.as_ref(), source, env, depth, *span)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 Ok(Flow::Continue)
             }
@@ -579,7 +664,7 @@ impl Interpreter {
             } => {
                 let condition = self.eval(condition, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 if expect_bool_condition(condition, *span)? {
                     self.exec_block(then_branch, env, depth)
@@ -595,7 +680,7 @@ impl Interpreter {
                 loop {
                     let condition = self.eval(condition, env, depth)?;
                     if let Some(value) = self.take_pending_fail() {
-                        return Ok(Flow::Fail(value));
+                        return Ok(Flow::fail(value));
                     }
                     if !expect_bool_condition(condition, *span)? {
                         break;
@@ -603,9 +688,9 @@ impl Interpreter {
                     self.tick(*span)?;
                     match self.exec_block(body, env, depth)? {
                         Flow::Continue => {}
-                        Flow::LoopContinue => continue,
-                        Flow::Break => break,
-                        flow @ (Flow::Return(_) | Flow::Fail(_)) => return Ok(flow),
+                        Flow::LoopContinue(_) => continue,
+                        Flow::Break(_) => break,
+                        flow @ (Flow::Return { .. } | Flow::Fail { .. }) => return Ok(flow),
                     }
                 }
                 Ok(Flow::Continue)
@@ -618,7 +703,7 @@ impl Interpreter {
             } => {
                 let iterable = self.eval(iterable, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 match iterable {
                     Value::Borrowed(_) => return Err(KuError::runtime("for over a borrowed value is not supported; clone to create an owned iterable", *span)),
@@ -626,9 +711,9 @@ impl Interpreter {
                         for value in values {
                             self.tick(*span)?;
                             match self.exec_for_iteration(name, value, body, env, depth, *span)? {
-                                Flow::Continue | Flow::LoopContinue => {}
-                                Flow::Break => return Ok(Flow::Continue),
-                                flow @ (Flow::Return(_) | Flow::Fail(_)) => return Ok(flow),
+                                Flow::Continue | Flow::LoopContinue(_) => {}
+                                Flow::Break(_) => return Ok(Flow::Continue),
+                                flow @ (Flow::Return { .. } | Flow::Fail { .. }) => return Ok(flow),
                             }
                         }
                     }
@@ -650,9 +735,9 @@ impl Interpreter {
                                 depth,
                                 *span,
                             )? {
-                                Flow::Continue | Flow::LoopContinue => {}
-                                Flow::Break => return Ok(Flow::Continue),
-                                flow @ (Flow::Return(_) | Flow::Fail(_)) => return Ok(flow),
+                                Flow::Continue | Flow::LoopContinue(_) => {}
+                                Flow::Break(_) => return Ok(Flow::Continue),
+                                flow @ (Flow::Return { .. } | Flow::Fail { .. }) => return Ok(flow),
                             }
                             current += 1;
                         }
@@ -669,8 +754,8 @@ impl Interpreter {
                 }
                 Ok(Flow::Continue)
             }
-            Stmt::Break { .. } => Ok(Flow::Break),
-            Stmt::Continue { .. } => Ok(Flow::LoopContinue),
+            Stmt::Break { .. } => Ok(Flow::Break(None)),
+            Stmt::Continue { .. } => Ok(Flow::LoopContinue(None)),
             Stmt::Function(function) => {
                 let params = function
                     .params
@@ -703,41 +788,87 @@ impl Interpreter {
                 finally_body,
                 span,
             } => {
-                let mut flow = self.exec_block(body, env, depth)?;
-                if let Flow::Fail(value) = flow {
-                    if let Some(name) = catch_name {
+                let mut result = self.exec_block(body, env, depth);
+                if let (Ok(Flow::Fail { value, .. }), Some(name)) = (&mut result, catch_name) {
+                    let value = std::mem::replace(value, Value::Null);
+                    result = {
                         env.push_scope();
-                        env.define_owned(name.clone(), value, false, *span)?;
-                        flow = Flow::Continue;
-                        for stmt in catch_body {
-                            flow = self.exec_stmt(stmt, env, depth)?;
-                            if !matches!(flow, Flow::Continue) {
-                                break;
+                        let caught = (|| {
+                            env.define_owned(name.clone(), value, false, *span)?;
+                            for stmt in catch_body {
+                                let flow = self.exec_stmt(stmt, env, depth)?;
+                                if !matches!(flow, Flow::Continue) {
+                                    return Ok(flow);
+                                }
                             }
+                            Ok(Flow::Continue)
+                        })();
+                        self.finish_owned_scope(env, caught, *span, true)
+                    };
+                }
+                self.observe_termination(&result);
+                let terminating =
+                    matches!(&result, Err(error) if error.runtime_termination().is_some());
+                let cleanup_failure = result.is_err() && current_cleanup_context().is_some();
+                if result.is_err() && !terminating && !cleanup_failure {
+                    // Ordinary fatal errors retain their existing boundary.
+                    return result;
+                }
+                if terminating || cleanup_failure {
+                    let context = self
+                        .termination
+                        .or_else(current_cleanup_context)
+                        .expect("terminating flow has a cancellation context");
+                    if cleanup_failure && !terminating {
+                        self.record_suppressed_cleanup();
+                    }
+                    self.cancel_visible_children(env, context, *span);
+                    let guard = CleanupGuard::enter(context);
+                    let finally_result = self.exec_block(finally_body, env, depth);
+                    if !matches!(finally_result, Ok(Flow::Continue)) {
+                        self.record_suppressed_cleanup();
+                    }
+                    self.discard_flow(finally_result, context, *span);
+                    drop(guard);
+                    // No cleanup return, recoverable failure or panic may
+                    // overwrite the original cancellation/timeout cause.
+                    return Err(self.termination_error(context, *span));
+                }
+                let finally_result = self.exec_block(finally_body, env, depth);
+                match finally_result {
+                    Ok(Flow::Continue) => result,
+                    mut replacement => {
+                        self.observe_termination(&replacement);
+                        let context = self
+                            .termination
+                            .or_else(|| match &result {
+                                Ok(flow) => cancellation::ScopeExit::cleanup_context(flow),
+                                Err(error) => error.scope_cleanup(),
+                            })
+                            .unwrap_or_else(|| {
+                                CancellationContext::new(TerminationReason::Cancelled)
+                            });
+                        match &mut replacement {
+                            Ok(flow) => cancellation::ScopeExit::remember_cleanup(flow, context),
+                            Err(error) => error.remember_scope_cleanup(context),
                         }
-                        env.pop_scope();
-                    } else {
-                        flow = Flow::Fail(value);
+                        self.discard_flow(result, context, *span);
+                        replacement
                     }
                 }
-                let finally_flow = self.exec_block(finally_body, env, depth)?;
-                if !matches!(finally_flow, Flow::Continue) {
-                    return Ok(finally_flow);
-                }
-                Ok(flow)
             }
             Stmt::Fail { value, span } => {
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 value.require_owned_root(*span)?;
-                Ok(Flow::Fail(normalize_error_value(value)))
+                Ok(Flow::fail(normalize_error_value(value)))
             }
             Stmt::Panic { value, span } => {
                 let value = self.eval(value, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 Err(KuError::runtime(format!("panic: {value}"), *span))
             }
@@ -747,16 +878,16 @@ impl Interpreter {
                     None => Value::Null,
                 };
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 value.require_owned_root(*span)?;
-                Ok(Flow::Return(value))
+                Ok(Flow::returned(value))
             }
             Stmt::Print { value, span } => {
                 let mut leases = Vec::new();
                 let value = self.eval_read_argument(value, env, depth, &mut leases)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 print!("{value}");
                 std::io::stdout().flush().map_err(|err| {
@@ -767,7 +898,7 @@ impl Interpreter {
             Stmt::Expr { expr, .. } => {
                 self.eval(expr, env, depth)?;
                 if let Some(value) = self.take_pending_fail() {
-                    return Ok(Flow::Fail(value));
+                    return Ok(Flow::fail(value));
                 }
                 Ok(Flow::Continue)
             }
@@ -1243,6 +1374,9 @@ impl Interpreter {
                 };
             }
         }
+        if is_blocking_dotted_builtin(callee) {
+            self.reject_cleanup_submission(span)?;
+        }
         if !self.async_execution || !is_blocking_dotted_builtin(callee) {
             return stdlib::eval_dotted_builtin(callee, args, span, &self.base_dir);
         }
@@ -1281,6 +1415,7 @@ impl Interpreter {
             ExprKind::Literal(Literal::Null) => Ok(Value::Null),
             ExprKind::Variable(name) => self.eval_variable(name, env, expr.span),
             ExprKind::Await(task) => {
+                self.reject_cleanup_submission(expr.span)?;
                 let value = self.eval(task, env, depth)?;
                 if self.pending_fail.is_some() {
                     return Ok(Value::Null);
@@ -1291,7 +1426,9 @@ impl Interpreter {
                         expr.span,
                     ));
                 };
-                task.await_result()
+                let result = task.await_result();
+                self.observe_termination(&result);
+                result
             }
             ExprKind::Unary { op, expr: right } => {
                 let value = self.eval(right, env, depth)?;
@@ -1351,145 +1488,177 @@ impl Interpreter {
                 eval_binary(*op, left, right, expr.span)
             }
             ExprKind::Call { callee, args } => {
-                if let Some(value) = self.eval_readonly_call(callee, args, env, depth, expr.span)? {
-                    return Ok(value);
+                // Register before even the first argument is evaluated: a later
+                // nested call can observe cancellation before this callee starts.
+                let previous_observers = self.caller_owners.len();
+                if self
+                    .task_runtime
+                    .as_ref()
+                    .is_some_and(TaskRuntime::has_task_submissions)
+                {
+                    let observer = env.observe_owned_bindings(expr.span)?;
+                    if !observer.is_empty() {
+                        self.caller_owners.try_reserve(1).map_err(|_| {
+                            KuError::runtime(
+                                "caller task ownership observation out of memory",
+                                expr.span,
+                            )
+                        })?;
+                        self.caller_owners.push(observer);
+                    }
                 }
-                if let ExprKind::Variable(name) = &callee.kind {
-                    if let Some(function) = self.functions.get(name) {
-                        let modes = explicit_borrow_modes(function);
-                        let mut leases = Vec::new();
-                        let values =
-                            self.eval_call_arguments(args, &modes, env, depth, &mut leases)?;
+                // All existing early returns/? leave this closure first, so an
+                // ordinary error cannot retain an observer past the expression.
+                let result = (|| {
+                    if let Some(value) =
+                        self.eval_readonly_call(callee, args, env, depth, expr.span)?
+                    {
+                        return Ok(value);
+                    }
+                    if let ExprKind::Variable(name) = &callee.kind {
+                        if let Some(function) = self.functions.get(name) {
+                            let modes = explicit_borrow_modes(function);
+                            let mut leases = Vec::new();
+                            let values =
+                                self.eval_call_arguments(args, &modes, env, depth, &mut leases)?;
+                            if self.pending_fail.is_some() {
+                                return Ok(Value::Null);
+                            }
+                            return self.call_function(name, values, expr.span, depth + 1);
+                        }
+                    }
+                    if let ExprKind::Field { target, name } = &callee.kind {
+                        if name == "map" {
+                            return self.eval_array_map(target, args, env, depth, expr.span);
+                        }
+                    }
+                    if let Some(value) =
+                        self.eval_std_method_call(callee, args, env, depth, expr.span)?
+                    {
+                        return Ok(value);
+                    }
+                    if let Some(value) =
+                        self.eval_http_service_method_call(callee, args, env, depth, expr.span)?
+                    {
+                        return Ok(value);
+                    }
+                    // Resolve a first-class callable before its arguments so the
+                    // declared modes, including imported/local closures, drive reads.
+                    if !matches!(&callee.kind, ExprKind::Variable(name) if !env.contains(name))
+                        && (dotted_builtin_is_shadowed(callee, env)
+                            || dotted_builtin_module(callee).is_none())
+                    {
+                        let callable = self.eval(callee, env, depth)?;
+                        return callable.with_read(expr.span, |callable| {
+                            let Value::Function {
+                                params,
+                                param_modes,
+                                body,
+                                captures,
+                                self_name,
+                                is_async,
+                            } = callable
+                            else {
+                                return Err(KuError::runtime(
+                                    format!("cannot call {}", callable.type_name()),
+                                    callee.span,
+                                ));
+                            };
+                            let mut leases = Vec::new();
+                            let values = self.eval_call_arguments(
+                                args,
+                                param_modes,
+                                env,
+                                depth,
+                                &mut leases,
+                            )?;
+                            if self.pending_fail.is_some() {
+                                return Ok(Value::Null);
+                            }
+                            self.call_function_value(FunctionValueCall {
+                                params,
+                                param_modes,
+                                body,
+                                captures,
+                                self_name,
+                                is_async: *is_async,
+                                args: values,
+                                span: expr.span,
+                                depth: depth + 1,
+                            })
+                        });
+                    }
+                    let mut values = Vec::with_capacity(args.len());
+                    for arg in args {
+                        let value = self.eval(arg, env, depth)?;
+                        value.require_owned_root(arg.span)?;
+                        values.push(value);
                         if self.pending_fail.is_some() {
                             return Ok(Value::Null);
                         }
-                        return self.call_function(name, values, expr.span, depth + 1);
                     }
-                }
-                if let ExprKind::Field { target, name } = &callee.kind {
-                    if name == "map" {
-                        return self.eval_array_map(target, args, env, depth, expr.span);
+                    let args = values;
+                    if !dotted_builtin_is_shadowed(callee, env) {
+                        if let Some(module) = dotted_builtin_module(callee) {
+                            if stdlib::metadata::module_requires_import(module)
+                                && !self.std_modules.contains(module)
+                            {
+                                return Err(KuError::runtime(
+                                    format!("std module '{module}' must be imported before use"),
+                                    expr.span,
+                                ));
+                            }
+                        }
+                        if let Some(value) = self.eval_dotted_builtin(callee, &args, expr.span)? {
+                            return Ok(value);
+                        }
                     }
-                }
-                if let Some(value) =
-                    self.eval_std_method_call(callee, args, env, depth, expr.span)?
-                {
-                    return Ok(value);
-                }
-                if let Some(value) =
-                    self.eval_http_service_method_call(callee, args, env, depth, expr.span)?
-                {
-                    return Ok(value);
-                }
-                // Resolve a first-class callable before its arguments so the
-                // declared modes, including imported/local closures, drive reads.
-                if !matches!(&callee.kind, ExprKind::Variable(name) if !env.contains(name))
-                    && (dotted_builtin_is_shadowed(callee, env)
-                        || dotted_builtin_module(callee).is_none())
-                {
-                    let callable = self.eval(callee, env, depth)?;
-                    return callable.with_read(expr.span, |callable| {
-                        let Value::Function {
+                    if let Some((enum_name, variant)) = enum_variant_path(callee) {
+                        if self.enums.contains_key(&enum_name) {
+                            return self.construct_enum(&enum_name, &variant, args, expr.span);
+                        }
+                    }
+                    if let ExprKind::Variable(name) = &callee.kind {
+                        if self.functions.contains_key(name) {
+                            return self.call_function(name, args, expr.span, depth + 1);
+                        }
+                        if !env.contains(name) {
+                            if let Some(value) = stdlib::eval_builtin(name, &args, expr.span)? {
+                                return Ok(value);
+                            }
+                        }
+                    }
+                    let callee_value = self.eval(callee, env, depth)?;
+                    if self.pending_fail.is_some() {
+                        return Ok(Value::Null);
+                    }
+                    match callee_value {
+                        Value::Function {
                             params,
                             param_modes,
                             body,
                             captures,
                             self_name,
                             is_async,
-                        } = callable
-                        else {
-                            return Err(KuError::runtime(
-                                format!("cannot call {}", callable.type_name()),
-                                callee.span,
-                            ));
-                        };
-                        let mut leases = Vec::new();
-                        let values =
-                            self.eval_call_arguments(args, param_modes, env, depth, &mut leases)?;
-                        if self.pending_fail.is_some() {
-                            return Ok(Value::Null);
-                        }
-                        self.call_function_value(FunctionValueCall {
-                            params,
-                            param_modes,
-                            body,
-                            captures,
-                            self_name,
-                            is_async: *is_async,
-                            args: values,
+                        } => self.call_function_value(FunctionValueCall {
+                            params: &params,
+                            param_modes: &param_modes,
+                            body: &body,
+                            captures: &captures,
+                            self_name: &self_name,
+                            is_async,
+                            args,
                             span: expr.span,
                             depth: depth + 1,
-                        })
-                    });
-                }
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    let value = self.eval(arg, env, depth)?;
-                    value.require_owned_root(arg.span)?;
-                    values.push(value);
-                    if self.pending_fail.is_some() {
-                        return Ok(Value::Null);
+                        }),
+                        other => Err(KuError::runtime(
+                            format!("cannot call {}", other.type_name()),
+                            callee.span,
+                        )),
                     }
-                }
-                let args = values;
-                if !dotted_builtin_is_shadowed(callee, env) {
-                    if let Some(module) = dotted_builtin_module(callee) {
-                        if stdlib::metadata::module_requires_import(module)
-                            && !self.std_modules.contains(module)
-                        {
-                            return Err(KuError::runtime(
-                                format!("std module '{module}' must be imported before use"),
-                                expr.span,
-                            ));
-                        }
-                    }
-                    if let Some(value) = self.eval_dotted_builtin(callee, &args, expr.span)? {
-                        return Ok(value);
-                    }
-                }
-                if let Some((enum_name, variant)) = enum_variant_path(callee) {
-                    if self.enums.contains_key(&enum_name) {
-                        return self.construct_enum(&enum_name, &variant, args, expr.span);
-                    }
-                }
-                if let ExprKind::Variable(name) = &callee.kind {
-                    if self.functions.contains_key(name) {
-                        return self.call_function(name, args, expr.span, depth + 1);
-                    }
-                    if !env.contains(name) {
-                        if let Some(value) = stdlib::eval_builtin(name, &args, expr.span)? {
-                            return Ok(value);
-                        }
-                    }
-                }
-                let callee_value = self.eval(callee, env, depth)?;
-                if self.pending_fail.is_some() {
-                    return Ok(Value::Null);
-                }
-                match callee_value {
-                    Value::Function {
-                        params,
-                        param_modes,
-                        body,
-                        captures,
-                        self_name,
-                        is_async,
-                    } => self.call_function_value(FunctionValueCall {
-                        params: &params,
-                        param_modes: &param_modes,
-                        body: &body,
-                        captures: &captures,
-                        self_name: &self_name,
-                        is_async,
-                        args,
-                        span: expr.span,
-                        depth: depth + 1,
-                    }),
-                    other => Err(KuError::runtime(
-                        format!("cannot call {}", other.type_name()),
-                        callee.span,
-                    )),
-                }
+                })();
+                self.caller_owners.truncate(previous_observers);
+                result
             }
             ExprKind::Function { params, body, .. } => {
                 let names = closure_capture_names(params, body);
@@ -1517,6 +1686,9 @@ impl Interpreter {
             }
             ExprKind::Index { .. } => self.eval_index_expr(expr, env, depth, false),
             ExprKind::Field { target, name } => {
+                if let Some(value) = self.take_task_field(expr, env)? {
+                    return Ok(value);
+                }
                 if let ExprKind::Variable(enum_name) = &target.kind {
                     if enum_name == "http"
                         && !env.contains("http")
@@ -1621,35 +1793,63 @@ impl Interpreter {
                 Ok(Value::Object(values))
             }
             ExprKind::Match { value, arms } => {
-                let value = self.eval(value, env, depth)?;
+                let mut value = self.eval(value, env, depth)?;
                 if self.pending_fail.is_some() {
                     return Ok(Value::Null);
                 }
-                for arm in arms {
-                    env.push_scope();
-                    let matched = match_pattern(&arm.pattern, &value, env, arm.span)?;
-                    if matched {
-                        if let Some(guard) = &arm.guard {
-                            let guard = self.eval(guard, env, depth)?;
-                            if self.pending_fail.is_some() {
-                                env.pop_scope();
-                                return Ok(Value::Null);
+                let result = (|| {
+                    for arm in arms {
+                        env.push_scope();
+                        let result = (|| {
+                            let Some(task_bindings) =
+                                match_pattern(&arm.pattern, &value, env, arm.span)?
+                            else {
+                                return Ok(Flow::Continue);
+                            };
+                            if let Some(guard) = &arm.guard {
+                                let guard = self.eval(guard, env, depth)?;
+                                if self.pending_fail.is_some() {
+                                    return Ok(Flow::returned(Value::Null));
+                                }
+                                if !expect_bool_condition(guard, arm.span)? {
+                                    return Ok(Flow::Continue);
+                                }
                             }
-                            if !expect_bool_condition(guard, arm.span)? {
-                                env.pop_scope();
-                                continue;
+                            for (name, path) in task_bindings {
+                                let selected = value.take_task_projection(&path, arm.span)?
+                                    .ok_or_else(|| KuError::runtime("tentative Task match payload was lost before arm selection", arm.span))?;
+                                env.commit_task_match_probe(&name, selected, arm.span)?;
                             }
+                            self.eval(&arm.value, env, depth).map(Flow::returned)
+                        })();
+                        let result = self.finish_owned_scope(env, result, arm.span, true);
+                        let flow = result?;
+                        if !matches!(flow, Flow::Continue) {
+                            return Ok(flow);
                         }
-                        let result = self.eval(&arm.value, env, depth);
-                        env.pop_scope();
-                        return result;
                     }
-                    env.pop_scope();
+                    Err(KuError::runtime(
+                        "match expression did not match any arm",
+                        expr.span,
+                    ))
+                })();
+                // Selected Task payloads have moved out of `value`. Wildcard
+                // and unselected payloads still belong to this expression and
+                // must finish bounded cleanup before its result can escape.
+                let result = if value.contains_owned_task(expr.span)? {
+                    let mut residual = Env::new();
+                    residual.define_owned("\0match.scrutinee".into(), value, false, expr.span)?;
+                    self.finish_owned_scope(&mut residual, result, expr.span, false)
+                } else {
+                    result
+                };
+                match result? {
+                    Flow::Return { value, .. } => Ok(value),
+                    _ => Err(KuError::runtime(
+                        "match expression lost its selected value",
+                        expr.span,
+                    )),
                 }
-                Err(KuError::runtime(
-                    "match expression did not match any arm",
-                    expr.span,
-                ))
             }
             ExprKind::TryUnwrap { expr: inner } => {
                 let value = if matches!(&inner.kind, ExprKind::Index { .. }) {
@@ -1896,8 +2096,7 @@ impl Interpreter {
             }
             Ok(loop_flow)
         })();
-        env.pop_scope();
-        result
+        self.finish_owned_scope(env, result, span, true)
     }
 
     fn assign_target(
@@ -2068,7 +2267,7 @@ impl Interpreter {
 
     fn eval_variable(&self, name: &str, env: &Env, span: Span) -> KuResult<Value> {
         if env.contains(name) {
-            return env.get(name, span);
+            return env.get_owning(name, span);
         }
         if let Some(function) = self.functions.get(name) {
             return Ok(Value::Function {
@@ -2115,6 +2314,9 @@ impl Interpreter {
             return Ok(Some(Value::Null));
         }
         if (name == "run" || name == "close") && is_http_listener_object(&target_value) {
+            if name == "run" {
+                self.reject_cleanup_submission(span)?;
+            }
             if !args.is_empty() {
                 return Err(KuError::runtime(
                     format!(
@@ -2128,12 +2330,12 @@ impl Interpreter {
                 result_from_listener_operation(
                     self.run_http_listener(target_value, span),
                     "run_failed",
-                )
+                )?
             } else {
                 result_from_listener_operation(
                     close_http_listener_value(target_value, span),
                     "close_failed",
-                )
+                )?
             }));
         }
         if !is_http_service_object(&target_value) {
@@ -2159,6 +2361,7 @@ impl Interpreter {
                     args[0].span,
                 ));
             };
+            self.reject_cleanup_submission(span)?;
             let compiled_router = compile_http_routes(&target_value, span)?;
             // Validate field assignments before opening a socket. Otherwise an
             // invalid post-construction limit would fail inside listener.run and
@@ -2186,6 +2389,7 @@ impl Interpreter {
                     span,
                 ) {
                     Ok(()) => "http service listen returned unexpectedly".to_string(),
+                    Err(err) if err.runtime_termination().is_some() => return Err(err),
                     Err(err) => err.message,
                 },
             )));
@@ -2236,6 +2440,7 @@ impl Interpreter {
     }
 
     fn run_http_listener(&mut self, listener: Value, span: Span) -> KuResult<()> {
+        self.reject_cleanup_submission(span)?;
         let Value::Object(mut fields) = listener else {
             return Err(KuError::runtime("http listener must be an object", span));
         };
@@ -2267,6 +2472,7 @@ impl Interpreter {
         let worker_count = Arc::new(AtomicUsize::new(0));
 
         loop {
+            self.poll_termination(span)?;
             let mut made_progress = false;
             for _ in 0..HTTP_ACCEPT_BATCH {
                 match tcp.accept() {
@@ -2294,6 +2500,7 @@ impl Interpreter {
             }
 
             loop {
+                self.poll_termination(span)?;
                 match handler_rx.try_recv() {
                     Ok(job) => {
                         made_progress = true;
@@ -2400,6 +2607,7 @@ impl Interpreter {
         span: Span,
         deadline: Instant,
     ) -> KuResult<Value> {
+        let _execution = ExecutionTerminationGuard::enter();
         let Value::Function {
             params,
             param_modes,
@@ -2426,7 +2634,13 @@ impl Interpreter {
             )),
         };
         self.steps = 0;
-        let previous_deadline = self.execution_deadline.replace(deadline);
+        let previous_caller_owners = std::mem::take(&mut self.caller_owners);
+        let previous_termination = self.termination.take();
+        let previous_cleanup_recorded =
+            std::mem::replace(&mut self.cleanup_timeout_recorded, false);
+        let previous_deadline = self
+            .execution_deadline
+            .replace(HttpHandlerDeadline::new(deadline));
         let result = self.call_function_value(FunctionValueCall {
             params: &params,
             param_modes: &param_modes,
@@ -2438,8 +2652,19 @@ impl Interpreter {
             span,
             depth: 0,
         });
+        let timed_out = self.execution_deadline.as_mut().is_some_and(|state| {
+            state.poll(Instant::now());
+            state.timed_out
+        });
         self.execution_deadline = previous_deadline;
-        result
+        self.caller_owners = previous_caller_owners;
+        self.termination = previous_termination;
+        self.cleanup_timeout_recorded = previous_cleanup_recorded;
+        if timed_out && result.is_ok() {
+            Err(KuError::runtime(HTTP_HANDLER_TIMEOUT_MESSAGE, span))
+        } else {
+            result
+        }
     }
 
     fn eval_template(
@@ -2561,23 +2786,305 @@ impl Interpreter {
     }
 
     fn tick(&mut self, span: Span) -> KuResult<()> {
-        if current_task_cancelled() {
-            return Err(KuError::structured(
-                crate::error::KuErrorKind::Runtime,
-                "task",
-                "cancelled",
-                "async task was cancelled",
-                span,
-            ));
-        }
-        if self
-            .execution_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(KuError::runtime(HTTP_HANDLER_TIMEOUT_MESSAGE, span));
-        }
+        self.poll_termination(span)?;
         self.steps = self.steps.saturating_add(1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+use crate::registry_server::native_test_harness as finally_bounded_process;
+
+#[cfg(test)]
+mod finally_tests {
+    use super::*;
+
+    pub(super) fn body(source: &str) -> Vec<Stmt> {
+        let source = format!("fn test() {{\n{source}\n}}");
+        let program = Parser::new(Lexer::new(&source).tokenize().expect("lex fixture"))
+            .parse_program()
+            .expect("parse fixture");
+        let Item::Function(function) = program.items.into_iter().next().expect("fixture function")
+        else {
+            panic!("expected fixture function")
+        };
+        function.body
+    }
+
+    pub(super) fn marker_env() -> Env {
+        let mut env = Env::new();
+        env.define_owned("marker".into(), Value::Int(0), true, Span::default())
+            .unwrap();
+        env
+    }
+
+    pub(super) fn marker(env: &Env) -> i64 {
+        env.with_value("marker", Span::default(), |value| match value {
+            Value::Int(value) => Ok(*value),
+            _ => panic!("marker must stay int"),
+        })
+        .unwrap()
+    }
+
+    fn handler(source: &str, captures: &Env) -> Value {
+        Value::Function {
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            body: body(source),
+            captures: captures.clone(),
+            self_name: None,
+            is_async: false,
+        }
+    }
+
+    #[test]
+    fn interpreter_finally_preserves_normal_control_flow_and_owned_payloads() {
+        for (source, expected) in [
+            ("try { marker = 1 } finally { marker += 10 }", "continue"),
+            (
+                "try { return [\"saved\"] } finally { marker = 11 }",
+                "return",
+            ),
+            ("try { fail \"saved\" } finally { marker = 11 }", "fail"),
+            ("try { break } finally { marker = 11 }", "break"),
+            ("try { continue } finally { marker = 11 }", "loop"),
+        ] {
+            let mut interpreter = Interpreter::new();
+            let mut env = marker_env();
+            let flow = interpreter.exec_block(&body(source), &mut env, 0).unwrap();
+            let actual = match flow {
+                Flow::Continue => "continue",
+                Flow::Break(_) => "break",
+                Flow::LoopContinue(_) => "loop",
+                Flow::Return { value, .. } => {
+                    assert_eq!(value, Value::Array(vec![Value::String("saved".into())]));
+                    "return"
+                }
+                Flow::Fail { value, .. } => {
+                    assert_eq!(value, normalize_error_value(Value::String("saved".into())));
+                    "fail"
+                }
+            };
+            assert_eq!(actual, expected, "{source}");
+            assert_eq!(marker(&env), 11, "{source}");
+            assert!(interpreter.pending_fail.is_none());
+        }
+    }
+
+    #[test]
+    fn interpreter_finally_preserves_catch_fields_and_finally_override() {
+        let mut interpreter = Interpreter::new();
+        let mut env = marker_env();
+        let flow = interpreter
+            .exec_block(
+                &body(
+                    r#"
+            try { fail { domain: "sample", code: "failed", message: "saved" } }
+            catch (err) {
+                marker = 1
+                return [err.domain, err.code, err.message]
+            } finally { marker += 10 }
+        "#,
+                ),
+                &mut env,
+                0,
+            )
+            .unwrap();
+        let Flow::Return { value, .. } = flow else {
+            panic!("expected saved return")
+        };
+        assert_eq!(
+            value,
+            Value::Array(vec![
+                Value::String("sample".into()),
+                Value::String("failed".into()),
+                Value::String("saved".into()),
+            ])
+        );
+        assert_eq!(marker(&env), 11);
+        assert!(!env.contains("err"));
+        let flow = interpreter
+            .exec_block(
+                &body(
+                    r#"
+            try { return "discarded" } finally { return "replacement" }
+        "#,
+                ),
+                &mut env,
+                0,
+            )
+            .unwrap();
+        assert!(
+            matches!(flow, Flow::Return { value: Value::String(value), .. } if value == "replacement")
+        );
+    }
+
+    #[test]
+    fn interpreter_finally_fatal_paths_pop_block_catch_and_match_scopes() {
+        for source in [
+            "local = probe\npanic(\"fatal\")",
+            "try { local = probe\npanic(\"fatal\") } finally { marker = 9 }",
+            "try { fail \"caught\" } catch (err) { local = probe\npanic(\"fatal\") } finally { marker = 9 }",
+            "local = probe\nselected = match 1 { bound if (missing == true) => 0\n_ => 1 }",
+        ] {
+            let mut env = marker_env();
+            let probe = HttpListenerLease::new(-1);
+            env.define_owned("probe".into(), Value::HttpListenerLease(probe.clone()), false, Span::default()).unwrap();
+            let error = Interpreter::new().exec_block(&body(source), &mut env, 0).err().expect("fatal error");
+            assert!(error.message.contains("panic:") || error.message.contains("undefined variable"));
+            assert_eq!(marker(&env), 0, "fatal panic keeps its existing semantics");
+            for name in ["local", "err", "selected", "bound"] {
+                assert!(!env.contains(name), "{name} leaked in {source}");
+            }
+            assert_eq!(Arc::strong_count(&probe), 2, "block-owned references must drop on error");
+        }
+    }
+
+    #[test]
+    fn interpreter_finally_http_cleanup_budget_is_shared_and_never_restarted() {
+        let start = Instant::now();
+        let end = start + HTTP_HANDLER_CLEANUP_GRACE;
+        let context = CancellationContext::with_deadline(TerminationReason::TimedOut, end);
+        let outer = CleanupGuard::enter(context);
+        let nested = CleanupGuard::enter(RuntimeTermination {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: end + Duration::from_secs(1),
+        });
+        assert_eq!(current_cleanup_context(), Some(context));
+        drop(nested);
+        assert_eq!(current_cleanup_context(), Some(context));
+        let nested = CleanupGuard::enter(RuntimeTermination {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: end - Duration::from_millis(1),
+        });
+        drop(nested);
+        assert_eq!(
+            current_cleanup_context().unwrap().cleanup_deadline,
+            end - Duration::from_millis(1)
+        );
+        drop(outer);
+        assert!(current_cleanup_context().is_none());
+    }
+
+    #[test]
+    fn interpreter_finally_http_deadline_is_inactive_outside_handlers() {
+        let mut interpreter = Interpreter::new();
+        interpreter.tick(Span::default()).unwrap();
+        let mut state = HttpHandlerDeadline::new(Instant::now() + Duration::from_secs(10));
+        assert!(!state.poll(Instant::now()));
+        assert!(!state.timed_out);
+    }
+
+    #[test]
+    fn interpreter_finally_http_timeout_cleanup_is_bounded() {
+        const CHILD: &str = "KU_INTERPRETER_FINALLY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "runtime::interpreter::finally_tests::interpreter_finally_http_timeout_cleanup_is_bounded", "--nocapture"])
+                .env(CHILD, "1");
+            let output = finally_bounded_process::run_bounded(
+                &mut command,
+                Duration::from_secs(15),
+                finally_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("infinite finally must not hang the test process");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        for (source, expected) in [
+            (
+                r#"
+                fn helper(value: str): str { return value }
+                try { while (true) {} }
+                catch (err) { marker = 9 }
+                finally {
+                    try { text = helper("owned")\nmarker = 1 }
+                    finally { marker = marker * 10 + 2 }
+                }
+            "#,
+                12,
+            ),
+            (
+                r#"
+                try { fail "caught" } catch (err) { while (true) {} }
+                finally { marker = 1 }
+            "#,
+                1,
+            ),
+            (
+                r#"
+                try { try { while (true) {} } finally { marker = 1 } }
+                finally { marker = marker * 10 + 2 }
+            "#,
+                12,
+            ),
+            (
+                r#"
+                try { while (true) {} }
+                finally { marker = 1\nreturn "cannot swallow timeout" }
+            "#,
+                1,
+            ),
+            (
+                r#"
+                try { while (true) {} }
+                finally { marker = 1\nfail "cannot swallow timeout" }
+            "#,
+                1,
+            ),
+            (
+                r#"
+                try { try { while (true) {} } finally { marker = 1\nwhile (true) {} } }
+                finally { marker = 9 }
+            "#,
+                1,
+            ),
+            // A timeout first encountered in an ordinary finally still exits
+            // that block; this patch does not resume its remaining statements.
+            (
+                r#"
+                try { marker = 1 }
+                finally { marker = 2\nwhile (true) {}\nmarker = 9 }
+            "#,
+                2,
+            ),
+        ] {
+            let source = source.replace("\\n", "\n");
+            let captures = marker_env();
+            let mut interpreter = Interpreter::new();
+            let value = handler(&source, &captures);
+            let error = interpreter
+                .call_http_handler(
+                    value,
+                    Value::Null,
+                    Span::default(),
+                    Instant::now() + Duration::from_millis(200),
+                )
+                .unwrap_err();
+            assert_eq!(error.message, HTTP_HANDLER_TIMEOUT_MESSAGE, "{source}");
+            assert_eq!(marker(&captures), expected, "{source}");
+            assert!(interpreter.execution_deadline.is_none());
+            assert!(interpreter.pending_fail.is_none());
+            assert_eq!(interpreter.call_depth, 0);
+            let healthy = handler("return 42", &captures);
+            assert_eq!(
+                interpreter
+                    .call_http_handler(
+                        healthy,
+                        Value::Null,
+                        Span::default(),
+                        Instant::now() + Duration::from_secs(5)
+                    )
+                    .unwrap(),
+                Value::Int(42)
+            );
+        }
     }
 }
 
@@ -4222,13 +4729,14 @@ fn prepare_http_response(mut response: HttpWireResponse) -> HttpWireResponse {
     response
 }
 
-fn result_from_listener_operation(result: KuResult<()>, code: &str) -> Value {
+fn result_from_listener_operation(result: KuResult<()>, code: &str) -> KuResult<Value> {
     match result {
-        Ok(()) => Value::Result {
+        Ok(()) => Ok(Value::Result {
             ok: true,
             value: Box::new(Value::Null),
-        },
-        Err(err) => http_error_result(code, err.message),
+        }),
+        Err(err) if err.runtime_termination().is_some() => Err(err),
+        Err(err) => Ok(http_error_result(code, err.message)),
     }
 }
 
@@ -4294,26 +4802,41 @@ fn http_error_result(code: &str, message: impl Into<String>) -> Value {
     }
 }
 
+struct MatchBinding {
+    name: String,
+    value: Value,
+    task_path: Option<Vec<ValueProjection>>,
+}
+
+type TaskMatchBindings = Vec<(String, Vec<ValueProjection>)>;
+
 fn match_pattern(
     pattern: &MatchPattern,
     value: &Value,
     env: &mut Env,
     span: Span,
-) -> KuResult<bool> {
+) -> KuResult<Option<TaskMatchBindings>> {
     let mut bindings = Vec::new();
-    if !collect_match_bindings(pattern, value, &mut bindings, span)? {
-        return Ok(false);
+    if !collect_match_bindings(pattern, value, &mut bindings, &mut Vec::new(), span)? {
+        return Ok(None);
     }
-    for (name, value) in bindings {
-        env.define_owned(name, value, false, span)?;
+    let mut task_bindings = Vec::new();
+    for binding in bindings {
+        if let Some(path) = binding.task_path {
+            env.define_task_match_probe(binding.name.clone(), binding.value, span)?;
+            task_bindings.push((binding.name, path));
+        } else {
+            env.define_owned(binding.name, binding.value, false, span)?;
+        }
     }
-    Ok(true)
+    Ok(Some(task_bindings))
 }
 
 fn collect_match_bindings(
     pattern: &MatchPattern,
     value: &Value,
-    bindings: &mut Vec<(String, Value)>,
+    bindings: &mut Vec<MatchBinding>,
+    path: &mut Vec<ValueProjection>,
     span: Span,
 ) -> KuResult<bool> {
     if let Value::Borrowed(view) = value {
@@ -4333,7 +4856,10 @@ fn collect_match_bindings(
                 let snapshot = bindings.len();
                 for (index, pattern) in patterns.iter().enumerate() {
                     let value = view.project(BorrowProjection::EnumField(index), span)?;
-                    if !collect_match_bindings(pattern, &value, bindings, span)? {
+                    path.push(ValueProjection::EnumField(index));
+                    let matched = collect_match_bindings(pattern, &value, bindings, path, span);
+                    path.pop();
+                    if !matched? {
                         bindings.truncate(snapshot);
                         return Ok(false);
                     }
@@ -4345,7 +4871,11 @@ fn collect_match_bindings(
     match pattern {
         MatchPattern::Wildcard => Ok(true),
         MatchPattern::Binding(name) => {
-            bindings.push((name.clone(), value.clone()));
+            bindings.push(MatchBinding {
+                name: name.clone(),
+                value: value.clone(),
+                task_path: value.contains_owned_task(span)?.then(|| path.clone()),
+            });
             Ok(true)
         }
         MatchPattern::Literal(literal) => Ok(value == &value_from_literal(literal)),
@@ -4376,8 +4906,11 @@ fn collect_match_bindings(
                 ));
             }
             let snapshot = bindings.len();
-            for (pattern, field) in patterns.iter().zip(fields.iter()) {
-                if !collect_match_bindings(pattern, field, bindings, span)? {
+            for (index, (pattern, field)) in patterns.iter().zip(fields.iter()).enumerate() {
+                path.push(ValueProjection::EnumField(index));
+                let matched = collect_match_bindings(pattern, field, bindings, path, span);
+                path.pop();
+                if !matched? {
                     bindings.truncate(snapshot);
                     return Ok(false);
                 }
@@ -4708,6 +5241,18 @@ fn task_runtime_snapshot_value(snapshot: TaskRuntimeSnapshot) -> Value {
         (
             "finished_tasks".to_string(),
             usize_value(snapshot.finished_tasks),
+        ),
+        (
+            "suppressed_cleanup_outcomes".to_string(),
+            usize_value(snapshot.suppressed_cleanup_outcomes),
+        ),
+        (
+            "cleanup_timeouts".to_string(),
+            usize_value(snapshot.cleanup_timeouts),
+        ),
+        (
+            "cleanup_unfinished_tasks".to_string(),
+            usize_value(snapshot.cleanup_unfinished_tasks),
         ),
     ]))
 }

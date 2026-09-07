@@ -16,6 +16,9 @@ use crate::{
 };
 
 mod borrow;
+mod monomorph;
+/// Internal typed frame IR. This does not open the CLI's native async boundary.
+pub mod task;
 pub use borrow::verify_borrow_contract;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +370,12 @@ fn ir_type_is_owned(ty: &IrType) -> bool {
 }
 
 pub fn lower_program(program: &Program) -> KuResult<IrProgram> {
+    crate::ast::reject_compiled_async(
+        program,
+        "async/await is not supported by IR/native lowering yet",
+    )?;
+    let specialized = monomorph::specialize(program)?;
+    let program = specialized.as_ref().unwrap_or(program);
     let layouts = lower_layouts(program);
     let mut signatures = HashMap::new();
     let mut next_function_id = 0;
@@ -2053,6 +2062,10 @@ impl<'a> FunctionLowerer<'a> {
             }
             let tokens = crate::lexer::Lexer::new(&source).tokenize()?;
             let expr = crate::parser::Parser::new(tokens).parse_expression_only()?;
+            crate::ast::reject_compiled_async_expression(
+                &expr,
+                "async/await is not supported by IR/native lowering yet",
+            )?;
             // `{expr}` -> `str(expr)` so the run-time value is stringified like the
             // interpreter's `to_string()`.
             parts.push(Expr::new(
@@ -2138,6 +2151,69 @@ impl<'a> FunctionLowerer<'a> {
                 IrType::Array(element) => Some(*element),
                 _ => None,
             },
+            _ => None,
+        }
+    }
+
+    /// Inspect a prospective method receiver without emitting its effects. This
+    /// intentionally does not turn arbitrary fields into callable values. The
+    /// caller only uses a proven Str to recognize temporary string receivers;
+    /// their real evaluation still goes through the ordinary owned-temp path.
+    fn static_receiver_type(&self, expr: &Expr, depth: usize) -> Option<IrType> {
+        if depth >= 64 {
+            return None;
+        }
+        if let Some(ty) = self.static_place_type(expr) {
+            return Some(ty);
+        }
+        match &expr.kind {
+            ExprKind::TryUnwrap { expr } => match self.static_receiver_type(expr, depth + 1)? {
+                IrType::Result(inner) => Some(*inner),
+                _ => None,
+            },
+            ExprKind::Call { callee, .. } => {
+                if let ExprKind::Variable(_) = &callee.kind {
+                    // A local function value shadows an identically named
+                    // top-level function or builtin, including its return type.
+                    if let Some(bound) = self.static_place_type(callee) {
+                        return match bound {
+                            IrType::Closure { ret, .. } => Some(*ret),
+                            _ => None,
+                        };
+                    }
+                }
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    if let Some(receiver) = self.static_receiver_type(target, depth + 1) {
+                        if name == "clone" {
+                            return Some(receiver);
+                        }
+                        let signature = match &receiver {
+                            IrType::Str => metadata::dotted_signature("string", name),
+                            IrType::Named(native)
+                                if native == metadata::MYSQL_CLIENT
+                                    || native == metadata::MYSQL_RESULT =>
+                            {
+                                metadata::mysql_method_signature(native, name)
+                            }
+                            IrType::Named(native) if native == "__ku_pg_result" => {
+                                metadata::dotted_signature("pg_result", name)
+                            }
+                            IrType::Named(native) if native == "__ku_value" => {
+                                metadata::dotted_signature("kuvalue", name)
+                            }
+                            _ => None,
+                        };
+                        return signature.map(|signature| signature_return_type(&signature, &[]));
+                    }
+                }
+                let (_, ty) = call_kind_and_type(callee, &[], self.signatures);
+                (ty != IrType::Unknown).then_some(ty)
+            }
+            ExprKind::Binary { left, op, right } if *op == BinaryOp::Add => {
+                let left = self.static_receiver_type(left, depth + 1)?;
+                let right = self.static_receiver_type(right, depth + 1)?;
+                (left == IrType::Str && right == IrType::Str).then_some(IrType::Str)
+            }
             _ => None,
         }
     }
@@ -2779,6 +2855,8 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 _ => return Ok(None),
             }
+        } else if self.static_receiver_type(target, 0) == Some(IrType::Str) {
+            "string"
         } else {
             return Ok(None);
         };

@@ -414,7 +414,7 @@ fn main(): null! {
         "imported Add missing:\n{c}"
     );
     assert!(
-        c.contains("KuResult_null ku_main()"),
+        c.contains("KuResult_null ku_main(void)"),
         "entry main missing:\n{c}"
     );
     assert!(
@@ -1557,6 +1557,9 @@ fn main() {
     print(report.peak_active)
     print(report.accepted + report.rejected_limit + report.rejected_queue + report.rejected_internal)
     print(after.finished_tasks - before.finished_tasks)
+    if (after.suppressed_cleanup_outcomes < 0 || after.cleanup_timeouts < 0 || after.cleanup_unfinished_tasks < 0) {
+        panic("cleanup statistics must be nonnegative")
+    }
     print(time.millis() - started)
 }
 "#;
@@ -1578,6 +1581,29 @@ fn main() {
         err.contains("expected int"),
         "task.stress argument types must be checked: {err}"
     );
+}
+
+#[test]
+fn async_task_field_moves_and_handled_sibling_failure_preserve_other_owners() {
+    let source = r#"
+async fn Child(value: int): int! { return ok(value) }
+async fn Broken(): int! { fail "expected child failure" }
+async fn main(): null! {
+    pair = { first: Child(3), second: Child(4) }
+    moved = pair.first
+    sibling = pair.second
+    try { failed = (await Broken())? } catch (err) {
+        if (err.message != "expected child failure") panic("wrong child error")
+    }
+    if (true) { discarded = Child(5) }
+    first = (await moved)?
+    second = (await sibling)?
+    if (first != 3 || second != 4) panic("Task ownership moved or cancelled the wrong child")
+    return ok(null)
+}
+"#;
+    check_source("task-owner.ku", source).expect("Task ownership should check");
+    run_source("task-owner.ku", source).expect("handled child failure must not cancel siblings");
 }
 
 #[test]

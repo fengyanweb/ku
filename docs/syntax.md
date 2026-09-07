@@ -9,6 +9,8 @@ ku version
 
 Ku 当前是解释器优先的语言实现。本文记录真实实现的语法及各后端边界；实验性增量的验收状态见版本记录，仍在设计中的能力放在文末“不支持 / 未完成”。
 
+本文是源码写法的规范性入口；跨执行层的所有权、借用、错误和并发不变量见 [语义合同](semantics.md)。版本记录是历史证据，不能覆盖当前规范。正在实施的内容及尚未验收的范围见 [v0.0.18 实施记录](v0.0.18-worklog.md)，不能将工作计划当作当前支持。
+
 ## 0. 专题文档入口
 
 本文是完整语法总览。需要进入某个具体主题时，从这里跳转：
@@ -280,7 +282,7 @@ import {
 
 ### 4.1 基础类型
 
-Ku 0.0.15 的基础类型：
+Ku 当前的基础类型：
 
 ```txt
 int
@@ -721,7 +723,15 @@ println(value)
 println(value)
 ```
 
-作用域结束时，用户没有 detach/cancel/spawn 入口。当前解释器在 `main` 返回后会请求取消仍未结束的子 task，并在 1 秒有界窗口内排空；未能停止会返回 `task/shutdown_timeout`，不会无限等待。native C / LLVM 仍明确拒绝 async lowering。
+Task 清理采用当前所有权作用域规则：合法 move 会转移清理责任；作用域正常结束、return、错误传播、panic、超时或取消时，请求取消仍持有的未完成 Task，并释放已完成但未 await 的 payload。兄弟失败不直接取消其他兄弟；只有父任务观察错误并传播退出时，才按作用域退出规则清理它仍持有的任务。
+
+只读闭包捕获和同步 `&` 借用不转移 Task 的清理责任，borrowed 参数本身不是 owner。原 owner 退出后，捕获可以保留可打印的 Task 标识控制块，但不能借此保留或重新取得已释放的 payload，也不新增用户级状态查询或取消方法。
+
+取消和超时是普通 catch 不能捕获的内部控制终止，与完成竞争唯一不可逆终态；finally 中的 return、fail、panic 或迟到结果不能将其改成成功。一次根取消建立默认总计 1 秒的单调时钟绝对清理截止时间，嵌套 finally、子任务和 drop 共用，不逐个续期；外层 shutdown 预算更短时从短。清理期间禁止新建 Task、await 或新提交 sleep/timer、网络等待和 blocking job。main/runtime 关闭未能完成时仍使用 `task/shutdown_timeout`。用户没有 detach/cancel/spawn 入口，公开语法不变。详细顺序与预算见 [Task 语义合同](semantics.md#task-所有权取消与清理预算)。
+
+普通作用域退出的子任务清理超期同样报告 `task/shutdown_timeout`，不能把正常父任务伪标为 Cancelled。
+
+上述规则已经决策采用，本轮解释器生命周期切片已通过本机全量回归，具体证据与未覆盖边界见实施记录。native async、stackless Task frame、M:N、netpoll 和事件驱动 HTTP 尚未实现；native C / LLVM 仍明确拒绝 async lowering，不能从既有 native HTTP timeout 推导为 native Task 取消已经支持。
 
 运行时默认边界：
 
@@ -882,7 +892,7 @@ while (i < 10) {
 
 - `int` 运算使用有界整数，溢出会报 `integer overflow`。
 - 函数调用深度有保护，直接或间接递归过深会报错，避免只依赖宿主栈崩溃。
-- async task 的循环会在语句 tick 时检查协作式取消；main 返回后的 shutdown 会取消未完成 task，并在有界窗口内排空。
+- async task 的循环会在语句 tick 时检查协作式取消；Task 按上述所有权作用域规则有界清理，取消展开不为每层 finally 重新获得预算。
 - HTTP handler 有 `handler_timeout_ms`，超时返回 504，不会让请求无限等待。
 - 不断分配内存的循环仍可能触发宿主环境 OOM。
 
@@ -1243,6 +1253,10 @@ ns.Enum.Variant(...)      namespace enum variant
 Result.Ok(value) => str(value)
 ```
 
+Task 或含 Task 的模式绑定在 guard 求值时只是非 owning 的候选绑定，不能在 guard 中 move/await（E0805）；guard 为 false 时，不取消该候选 Task，也不消费后续 arm 所需的 payload。只有选中 arm 后才真正转移对应 payload，guard 自己创建并 await 的独立 Task 不受这条限制。
+
+匹配 Task 或含 Task 的值会消费原 scrutinee。选中 arm 返回的 Task 可以继续转移；arm 内未消费的 Task binding，以及 `_` 等模式留下的残余 Task，必须在 match 表达式返回前完成有界清理，并沿用该次退出的同一绝对清理截止时间。这是解释器 Task 合同，不表示 native async 已支持。
+
 穷尽性规则：
 
 ```txt
@@ -1356,9 +1370,9 @@ fn main() {
 }
 ```
 
-`finally` 无论 try 是否失败都会执行。
+正常完成、可恢复错误和 return 路径都经过对应 `finally`。取消或超时展开也执行有界清理，但全部嵌套 finally 共享根取消的绝对截止时间；不能据此要求预算耗尽后继续执行剩余语句。
 
-`panic` 不会被 `try/catch` 捕获。
+`panic`、Task 取消和超时不会被普通 `try/catch` 捕获。取消清理中的 return、fail、panic 或其他错误不能覆盖原取消/超时原因。
 
 ## 12. 内置函数和标准库
 
@@ -2139,7 +2153,7 @@ ku build --release -o dist/app.exe
 
 `--target` 第一阶段只接受 `host`、`x86_64-linux`、`x86_64-windows`、`aarch64-darwin`；包含路径分隔符、Windows drive prefix 或未知 target 会直接报错，避免输出路径逃逸。`--backend c` 会使用 native C 后端生成 C 后再调用 C 编译器。未设置 `KU_CC` 时，自动候选固定为 `zig cc`、`clang`、`cc`、`gcc`，失败后有界尝试下一个；一旦设置 `KU_CC`，它就是唯一且权威的 compiler，空值、不可执行或编译失败都会直接报错，不会静默换用另一套工具链。显式跨 target 时，Ku 自动给 Zig 传 `-target`、给 Clang 传 `--target`；普通 fallback `cc/gcc` 只用于 host，不会假装支持 cross。需要使用已配置好的交叉 GCC 时，通过 `KU_CC` 显式指定。链接成功后校验目标产物的 PE/ELF/Mach-O 格式和 CPU 架构；使用数据库时还解析最终动态依赖表并要求实际导入 libpq 以及本次选定的 MySQL/MariaDB family，静态、跨 family 或 host 回退都拒绝安装。数据库库文件从已打开句柄复制到私有临时目录后才交给 linker，不扫描或删除用户输出目录中的同名临时文件。默认 backend 仍保留解释器 wrapper 以兼容尚未进入 native lowering 的 async 程序；同步程序的 KuString、array、dynamic object、Result/Error 和 closure ABI 已实现明确列出的子集，不能从 ABI 存在推导为所有 payload、捕获形式和动态组合均已支持。
 
-0.0.15 的历史边界是：默认生成“解释器打包型二进制”，带 import 的程序仍会按原路径读取依赖。当前 native C 路径已经在生成期展开完整 import graph，生成物不包含 runner 的 `run_source` / `const SOURCE`，移动原源码目录后仍能运行；async native lowering 和增量缓存仍未宣称完成。
+默认 runner 当前仍生成“解释器打包型二进制”，只嵌入入口文件，带 import 的程序仍会按原路径读取依赖；这不是已经消失的历史限制。native C 路径在生成期展开完整 import graph，生成物不包含 runner 的 `run_source` / `const SOURCE`，移动原源码目录后仍能运行；async native lowering 和增量缓存仍未宣称完成。
 
 `ku build --native <file.ku>` 不带 `-o` 时是单文件兼容模式：在源码旁写出 `.c`，不调用 linker。带 `-o` 时进入完整 native 链接模式，使用上述 build 目录中的隔离中间产物并校验最终二进制。跨系统发布推荐使用 `ku build --backend c --target <target>`，因为“生成目标 C”本身不等于已生成该目标的可执行文件。
 

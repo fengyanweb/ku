@@ -7,6 +7,9 @@ use crate::{
     stdlib::metadata::{self, ArgRule, Signature, TypePattern},
 };
 
+mod generic;
+pub(crate) use generic::{native_local_generic_span, native_specialization_plan, GenericCallSite};
+
 const MAX_CHECK_DEPTH: usize = 32;
 /// Prefix owned by the compiler's generated C identifiers; see `reject_reserved_name`.
 const RESERVED_NAME_PREFIX: &str = "__ku_";
@@ -468,6 +471,7 @@ pub struct Checker {
     /// exit; after its finally is checked, still-pending exits are forwarded to
     /// the parent so nested try/finally chains preserve execution order.
     try_exit_collectors: Vec<TryExitCollector>,
+    generic_state: generic::GenericState,
 }
 
 impl Checker {
@@ -494,6 +498,7 @@ impl Checker {
             function_body_outer_bindings: HashMap::new(),
             closure_capture_boundaries: Vec::new(),
             try_exit_collectors: Vec::new(),
+            generic_state: generic::GenericState::default(),
         }
     }
 
@@ -539,6 +544,11 @@ impl Checker {
     }
 
     pub fn check(mut self, program: &Program) -> KuResult<()> {
+        self.check_program(program)?;
+        self.check_generic_instances()
+    }
+
+    fn check_program(&mut self, program: &Program) -> KuResult<()> {
         let mut top_level_names = HashMap::new();
         for item in &program.items {
             match item {
@@ -699,9 +709,26 @@ impl Checker {
             }
         }
 
+        let has_generic_functions = self
+            .functions
+            .values()
+            .any(|function| !function.type_params.is_empty());
         for item in &program.items {
             if let Item::Function(function) = item {
-                self.check_function(function)?;
+                if has_generic_functions {
+                    self.generic_state.context.clone_from(&function.name);
+                }
+                // Template variables remain in scope throughout the body, not
+                // only in its signature. Concrete rechecks install actual types.
+                self.generic_state.bindings.extend(
+                    function
+                        .type_params
+                        .iter()
+                        .map(|name| (name.clone(), Type::Generic(name.clone()))),
+                );
+                let checked = self.check_function(function);
+                self.generic_state.bindings.clear();
+                checked?;
             }
         }
         Ok(())
@@ -904,6 +931,9 @@ impl Checker {
                     }
                 }
                 Ok(Type::Union(resolved))
+            }
+            TypeName::Custom(name) if self.generic_state.bindings.contains_key(name) => {
+                Ok(self.generic_state.bindings[name].clone())
             }
             TypeName::Custom(name) if generics.contains(name) => Ok(Type::Generic(name.clone())),
             TypeName::Custom(name) if self.structs.contains_key(name) => {
@@ -1728,7 +1758,7 @@ impl Checker {
                         return Ok(ty);
                     }
                     if let ExprKind::Variable(name) = &callee.kind {
-                        if let Some(function) = self.functions.get(name).cloned() {
+                        if let Some(function) = (!self.contains(name)).then(|| self.functions.get(name).cloned()).flatten() {
                             if function.params.len() != args.len() {
                                 return Err(KuError::runtime(
                                     format!(
@@ -1767,6 +1797,9 @@ impl Checker {
                                 ));
                             }
                             let returns = substitute_generics(&function.returns, &generic_bindings);
+                            if !function.type_params.is_empty() {
+                                self.record_generic_call(name, &function, &generic_bindings, &actual_arg_types, expr.span)?;
+                            }
                             let effect_params = function
                                 .value_params
                                 .iter()
@@ -3131,7 +3164,11 @@ impl Checker {
         // Record that move after the arms are checked, so later uses (a second
         // match, a clone, passing it on) are rejected instead of silently reading
         // an emptied payload.
-        let consumes_scrutinee = self.match_consumes_scrutinee(&value_type, arms);
+        // Task-containing match input is itself an owning read. Otherwise a
+        // binding arm could transfer its handle while the original name remained
+        // available for a second await (including through a container wrapper).
+        let consumes_scrutinee = self.match_consumes_scrutinee(&value_type, arms)
+            || self.match_guard_type_contains_task(&value_type);
         if consumes_scrutinee && self.borrowed_expr_root(value).is_some() {
             return Err(KuError::runtime("borrowed operation is not supported: match with owned payload binding; clone the scrutinee first", value.span));
         }
@@ -3186,10 +3223,39 @@ impl Checker {
                 covered_patterns.insert(key);
             }
             if let Some(guard) = &arm.guard {
+                // A guard probes this arm; failure must leave its Task payloads
+                // available to later arms. Track only the newly bound pattern
+                // variables, so creating/awaiting an unrelated Task stays legal.
+                let tentative_tasks = self
+                    .scopes
+                    .last()
+                    .expect("match arm scope")
+                    .iter()
+                    .filter(|(_, binding)| self.match_guard_type_contains_task(&binding.ty))
+                    .map(|(name, binding)| {
+                        (name.clone(), binding.binding_id, binding.moves.clone())
+                    })
+                    .collect::<Vec<_>>();
                 let guard_type = self.check_expr(guard)?;
                 if guard_type != Type::Bool {
                     self.pop_scope();
                     return Err(type_error(guard.span, &Type::Bool, &guard_type));
+                }
+                for (name, id, previous_moves) in tentative_tasks {
+                    let changed = self
+                        .scopes
+                        .last()
+                        .and_then(|scope| scope.get(&name))
+                        .is_some_and(|binding| {
+                            binding.binding_id == id && binding.moves != previous_moves
+                        });
+                    if changed {
+                        self.pop_scope();
+                        return Err(KuError::runtime(
+                            format!("cannot consume tentative Task binding '{name}' in a match guard; await or move it only in the selected arm"),
+                            guard.span,
+                        ).with_diagnostic_id(crate::error::DiagnosticId::TaskGuardMove));
+                    }
                 }
             }
             let actual = self.consume_expr(&arm.value);
@@ -3232,6 +3298,34 @@ impl Checker {
             self.consume_expr(value)?;
         }
         Ok(result_type)
+    }
+
+    fn match_guard_type_contains_task(&self, root: &Type) -> bool {
+        let mut pending = vec![root];
+        let mut structs = HashSet::new();
+        let mut enums = HashSet::new();
+        while let Some(ty) = pending.pop() {
+            match ty {
+                Type::Task(_) => return true,
+                Type::Array(inner) | Type::Result(inner) => pending.push(inner),
+                Type::Union(types) => pending.extend(types),
+                Type::Object(fields) => pending.extend(fields.values()),
+                Type::Struct(name) if structs.insert(name.as_str()) => {
+                    if let Some(layout) = self.structs.get(name) {
+                        pending.extend(layout.fields.values());
+                    }
+                }
+                Type::Enum(name) if enums.insert(name.as_str()) => {
+                    if let Some(layout) = self.enums.get(name) {
+                        pending.extend(layout.variants.values().flatten());
+                    }
+                }
+                // Function signatures do not own their parameter/return types;
+                // captures have their own existing move checks.
+                _ => {}
+            }
+        }
+        false
     }
 
     /// True when matching `value` binds an owned enum payload — the backend moves
@@ -3614,7 +3708,7 @@ impl Checker {
                     span,
                 ));
             }
-            if self.is_owned_type(&target_type) {
+            if self.is_owned_type(&target_type) || matches!(target_type, Type::Generic(_)) {
                 // Cloning reads the WHOLE value, so it must be fully live: a
                 // partially-moved struct would clone an already-emptied field.
                 if let PlaceClass::Movable(place) = self.classify_place(target) {
@@ -7752,9 +7846,53 @@ fn bind_generic_type(expected: &Type, actual: &Type, bindings: &mut HashMap<Stri
             Type::Result(actual) => bind_generic_type(expected, actual, bindings),
             _ => false,
         },
-        Type::Union(options) => options
-            .iter()
-            .any(|option| bind_generic_type(option, actual, bindings)),
+        Type::Union(options) => options.iter().any(|option| {
+            let mut candidate = bindings.clone();
+            if bind_generic_type(option, actual, &mut candidate) && type_matches(option, actual) {
+                *bindings = candidate;
+                true
+            } else {
+                false
+            }
+        }),
+        Type::FunctionValue {
+            params,
+            return_type,
+            is_async,
+            ..
+        } => {
+            let Type::FunctionValue {
+                params: actual_params,
+                return_type: actual_return,
+                is_async: actual_async,
+                ..
+            } = actual
+            else {
+                return false;
+            };
+            if is_async != actual_async || params.len() != actual_params.len() {
+                return false;
+            }
+            for (expected, actual) in params.iter().zip(actual_params) {
+                if expected.mode != actual.mode {
+                    return false;
+                }
+                if let (Some(expected), Some(actual)) = (&expected.ty, &actual.ty) {
+                    if !bind_generic_type(expected, actual, bindings)
+                        || !type_matches(expected, actual)
+                    {
+                        return false;
+                    }
+                }
+            }
+            match (return_type, actual_return) {
+                (Some(expected), Some(actual)) => {
+                    bind_generic_type(expected, actual, bindings) && type_matches(expected, actual)
+                }
+                (None, None) | (None, Some(_)) => true,
+                (Some(_), None) => false,
+            }
+        }
         _ => true,
     }
 }
@@ -7770,6 +7908,31 @@ fn substitute_generics(ty: &Type, bindings: &HashMap<String, Type>) -> Type {
                 .map(|ty| substitute_generics(ty, bindings))
                 .collect(),
         ),
+        Type::FunctionValue {
+            params,
+            return_type,
+            body,
+            body_id,
+            is_async,
+        } => Type::FunctionValue {
+            params: params
+                .iter()
+                .map(|param| FunctionValueParam {
+                    name: param.name.clone(),
+                    mode: param.mode,
+                    ty: param
+                        .ty
+                        .as_ref()
+                        .map(|ty| substitute_generics(ty, bindings)),
+                })
+                .collect(),
+            return_type: return_type
+                .as_ref()
+                .map(|ty| Box::new(substitute_generics(ty, bindings))),
+            body: body.clone(),
+            body_id: *body_id,
+            is_async: *is_async,
+        },
         other => other.clone(),
     }
 }

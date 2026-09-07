@@ -1,13 +1,17 @@
 # Ku 自举状态
 
-结论：Ku 0.0.17 已实现有界 Lexer，并推进到 Parser 子集，但还不能自举完整工具链。
+发布基线：Ku 0.0.17 已实现有界 Lexer，并推进到 Parser 子集，但还不能自举完整工具链。
+
+本轮参数模式增量：Stage 3 的命名函数参数现在识别既有 `&name: T`（以及原有可省略类型的参数槽位），不新增调用语法。`Parameter.int_value` 固定为 owned `0` / borrowed `1`，参数 span 从 `&` 或名字起点覆盖到名字末尾，类型继续使用独立 child；不改变 arena 布局。`ValidateParseOutput` 拒绝其他模式值并返回 `bootstrap.ast/invalid_parameter_mode`。Rust projector、Unicode/CRLF 静态 golden、32/33 参数及直接 helper 畸形窗口都同步覆盖；借用参数使用独立解释器批次并进入同一删源码 native suite，16/32 参数的成功与缺失 body close 路径检查分配增长和逐轮 zero-live。本轮新增门槛的实际通过状态以对应提交回归为准，不能沿用 0.0.17 结果。
+
+此增量仅同步已有 Stage 3 命名函数的参数槽位，不增加函数类型、泛型、局部/匿名/箭头函数 Parser；这些仍属于自举子集之外。结构化 Diagnostic 模型仍经 `Error.message` 的 canonical 文本传递，不代表完整 typed 诊断 transport 或全 Parser 已自举。
 
 这里的“完整自举”指用 Ku 编写 Ku 编译器和工具链的主要部分，并让 Ku 编译器编译出下一代 Ku 工具链。当前 Rust 版编译器仍是 bootstrap compiler；`bootstrap/stage1` 已经是 Ku 编写的完整有界 lexer，`bootstrap/stage2` 已实现有界表达式 parser，`bootstrap/stage3` 又增加了一个可运行的 module/import/struct/enum/函数/基础语句与 braced `if` / `while` 模块切片。它们用于验证语言、native ABI 和源码无关打包是否足以承载真实编译器代码，但都还不能替代完整 Rust parser，更没有替代 checker、IR 或 backend。
 
 ## 自举第一阶段已落地
 
 - `bootstrap/stage1/token.ku`：Ku `Token` 模型使用 9 个字段记录 kind、lexeme、整数值以及完整的起止行、列和 UTF-8 byte offset；canonical 输出可稳定比较这些字段。
-- `bootstrap/stage1/lexer.ku`：不用 `lexer.scan` / `parser.parse`，由 `Scan` 在 Ku 中实现 Rust lexer 当前全部 73 种 token kind，包括 ASCII identifier/关键字、整数、float、单双引号字符串、模板字符串、BOM/空白、`//`、非嵌套 `/* ... */` 注释和全部标点。新增单独 `Ampersand`，`&&` 仍最长匹配为 `AndAnd`，`&&&` 则为 `AndAnd` 加 `Ampersand`；`view` 不成为关键字。错误通过 Result 返回并参与位置差分。后续 Ku Parser 仍需迁移 `&` 参数模式，这次 Lexer 同步不代表 Parser 自举已完成。
+- `bootstrap/stage1/lexer.ku`：不用 `lexer.scan` / `parser.parse`，由 `Scan` 在 Ku 中实现 Rust lexer 当前全部 73 种 token kind，包括 ASCII identifier/关键字、整数、float、单双引号字符串、模板字符串、BOM/空白、`//`、非嵌套 `/* ... */` 注释和全部标点。新增单独 `Ampersand`，`&&` 仍最长匹配为 `AndAnd`，`&&&` 则为 `AndAnd` 加 `Ampersand`；`view` 不成为关键字。错误通过 Result 返回并参与位置差分。Stage 3 参数模式增量见上文；Lexer token 同步不代表完整 Parser 自举已完成。
 - Float token 在 `lexeme` 中保留未经舍入的原始十进制拼写，`int_value` 固定为 0；将它转换为 `f64` 是后续 parser 的职责，lexer 不自行实现另一套浮点舍入算法。
 - 输入上限 32768 个 Unicode 字符、token 上限 4096（含 EOF）、单个解码字符串上限 4096 个 Unicode 字符。`byte_len() > 131072` 会先行拒绝必定超出字符上限的 UTF-8 输入；这些限制界定当前 Stage 1 工具的资源边界，不是生产服务的全局内存策略。
 - 扫描入口只调用一次 `source.chars()`，新增的 `byte_len()` 读取 `KuString.len`，复杂度为常数；`.len()` 仍保留计算 Unicode 字符数的语义。native 和解释器从未捕获的字符数组读取元素时只复制该元素，不深拷贝整张字符表。lexeme、解码字符串与 canonical 输出用既有 `+=` 收集，避免反复扫描或复制整个前缀。
