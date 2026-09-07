@@ -29,8 +29,9 @@ v0.0.18 第二阶段已采用以下规则；这不表示所有后端已实现。
 本轮解释器生命周期切片已通过本机全量回归，具体证据与未覆盖边界见实施记录。
 native 已有独立 typed frame/control、内部单 worker driver、生成的 typed factory 和结果就绪等待内核；它们尚未接入源码
 async/await，不等于源码 stackless lowering、M:N、netpoll 或事件驱动 HTTP 已实现。
-内部等待覆盖登记/发布/取消/旧 token，不等于源码 await 或父作用域清理完成；
-Task IR Start/Await、逻辑 cleanup ACK 和 scope drain 仍需独立实现与执行验证。
+内部等待覆盖登记/发布/取消/旧 token；内部清理收据只区分逻辑清理与最终存储释放，
+不等于源码 await 或父作用域清理完成。Task IR Start/Await、ACK 等待和 scope drain
+仍需独立实现与执行验证。
 native C / LLVM 继续明确拒绝 async lowering，不以同步代码或解释器回退冒充支持。
 已经进入系统或外部库的阻塞操作仍不能硬杀，迟到结果只能清理，不得恢复已取消任务。
 
