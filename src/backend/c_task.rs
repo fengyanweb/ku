@@ -485,7 +485,7 @@ impl<'a> FrameEmitter<'a> {
                 function,
                 arguments,
             } => {
-                out.push_str(&format!("  {{ uint32_t started=ku_task_{}_start_value(((KuTaskAdapterHostV1*)clock->host)->ticket->driver",function.0));
+                out.push_str(&format!("  {{ uint32_t started=ku_task_{}_start_hosted((const KuTaskAdapterHostV1*)clock->host",function.0));
                 for argument in arguments {
                     out.push_str(&format!(", &{}", self.place(*argument)));
                 }

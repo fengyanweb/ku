@@ -6,12 +6,15 @@ mod native_allocation_harness;
 #[allow(dead_code)]
 #[path = "support/native_pg_harness.rs"]
 mod native_harness;
+#[path = "support/native_task_ledger.rs"]
+mod native_task_ledger;
 
 use ku::{backend::c, checker::Checker, ir::task_lower, lexer::Lexer, parser::Parser};
 use native_allocation_harness::ALLOCATION_HOOK;
 use native_harness::{
     compile_harness, run_bounded, TempDir, NATIVE_THREAD_LIFECYCLE_HARNESS, RUN_LIMITS, RUN_TIMEOUT,
 };
+use native_task_ledger::{LEDGER_LOCK, LOCKED_ALLOCATIONS};
 use std::{fs, process::Command};
 
 const SOURCE: &str = r#"
@@ -59,7 +62,7 @@ fn native_task_source_final_drain_cancel_tightens_all_receipts_and_drops_private
         assert!(generated.contains(required));
     }
     let instrumentation = format!(
-        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic uint32_t fixture_child_cleanup(void*);\nstatic void fixture_worker_exited(void);\n"
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic uint32_t fixture_child_cleanup(void*);\nstatic void fixture_worker_exited(void);\nstatic void fixture_take_notification(void*,const void*);\n"
     );
     let source = replace_once(
         generated,
@@ -71,6 +74,22 @@ fn native_task_source_final_drain_cancel_tightens_all_receipts_and_drops_private
         "static uint64_t ku_task_driver_now_ms(void) {",
         &format!("{CLOCK_HOOK}\nstatic uint64_t fixture_original_now(void) {{"),
     );
+    // Observe the real post-TAKEN notification while its queue mutex still
+    // excludes the worker. This makes the required terminal poll deterministic.
+    let wrapper_start = source
+        .find("static void ku_task_driver_wrapper_end(")
+        .unwrap();
+    let wrapper_end = source[wrapper_start..]
+        .find("static uint32_t ku_task_driver_request_cancel(")
+        .unwrap()
+        + wrapper_start;
+    let wrapper = source[wrapper_start..wrapper_end].to_owned();
+    let observed_wrapper = replace_once(
+        wrapper.clone(),
+        "  ku_task_driver_signal(driver);\n  ku_task_driver_unlock(driver);",
+        "  fixture_take_notification(driver,ticket);\n  ku_task_driver_signal(driver);\n  ku_task_driver_unlock(driver);",
+    );
+    let source = replace_once(source, &wrapper, &observed_wrapper);
     let source = replace_once(
         source,
         "static uint32_t ku_task_1_cleanup(void* raw, uint32_t reason, KuTaskControlV1* budget) {",
@@ -119,39 +138,6 @@ fn native_task_source_final_drain_cancel_tightens_all_receipts_and_drops_private
     assert!(output.stderr.is_empty());
 }
 
-const LEDGER_LOCK: &str = r#"
-#define CHECK(c) do { if (!(c)) { fprintf(stderr,"source scope check line %d: %s\n",__LINE__,#c); abort(); } } while (0)
-#if defined(_WIN32)
-static SRWLOCK fixture_allocation_lock=SRWLOCK_INIT;
-static void fixture_alloc_lock(void) { AcquireSRWLockExclusive(&fixture_allocation_lock); }
-static void fixture_alloc_unlock(void) { ReleaseSRWLockExclusive(&fixture_allocation_lock); }
-#else
-static pthread_mutex_t fixture_allocation_lock=PTHREAD_MUTEX_INITIALIZER;
-static void fixture_alloc_lock(void) { CHECK(!pthread_mutex_lock(&fixture_allocation_lock)); }
-static void fixture_alloc_unlock(void) { CHECK(!pthread_mutex_unlock(&fixture_allocation_lock)); }
-#endif
-"#;
-
-const LOCKED_ALLOCATIONS: &str = r#"
-#undef malloc
-#undef calloc
-#undef realloc
-#undef free
-static void* fixture_malloc(size_t size) { fixture_alloc_lock(); void* p=ku_perf_malloc(size); fixture_alloc_unlock(); return p; }
-static void* fixture_calloc(size_t count,size_t size) { fixture_alloc_lock(); void* p=ku_perf_calloc(count,size); fixture_alloc_unlock(); return p; }
-static void* fixture_realloc(void* old,size_t size) { fixture_alloc_lock(); void* p=ku_perf_realloc(old,size); fixture_alloc_unlock(); return p; }
-static void fixture_free(void* p) { fixture_alloc_lock(); ku_perf_free(p); fixture_alloc_unlock(); }
-typedef struct FixtureLedger { size_t allocations,bytes,calls; int overflow; } FixtureLedger;
-static FixtureLedger fixture_ledger(void) {
-  fixture_alloc_lock(); FixtureLedger out={ku_perf_live_allocations,ku_perf_live_bytes,ku_perf_calls,ku_perf_overflow};
-  fixture_alloc_unlock(); return out;
-}
-#define malloc fixture_malloc
-#define calloc fixture_calloc
-#define realloc fixture_realloc
-#define free fixture_free
-"#;
-
 const CLOCK_HOOK: &str = r#"
 static KuTaskControlDeadlineV1 fixture_clock;
 static uint64_t fixture_original_now(void);
@@ -164,8 +150,29 @@ static uint64_t ku_task_driver_now_ms(void) {
 const C_MAIN: &str = r#"
 static KuAtomicRefcount fixture_hold;
 static KuAtomicRefcount fixture_cleanup_calls;
+static KuAtomicRefcount fixture_observe_take;
+static KuTaskDriverTicketV1 fixture_take_ticket;
+static uint64_t fixture_take_polls_before;
+static unsigned fixture_take_notifications;
 static KuTestEvent fixture_exit_event;
 static int fixture_exit_observing;
+static void fixture_take_notification(void* raw_driver,const void* raw_ticket) {
+  /* Called with the real publication/queue mutex held. No scheduling or
+   * state changes are supplied by this observation hook. */
+  if (!ku_task_control_atomic_load(&fixture_observe_take)) return;
+  KuTaskDriverV1* driver=(KuTaskDriverV1*)raw_driver;
+  const KuTaskDriverTicketV1* ticket=(const KuTaskDriverTicketV1*)raw_ticket;
+  if (ticket->driver!=fixture_take_ticket.driver || ticket->slot!=fixture_take_ticket.slot
+      || ticket->generation!=fixture_take_ticket.generation) return;
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+  CHECK(slot && !fixture_take_notifications && !slot->wrapper_active);
+  CHECK(ku_task_control_atomic_load(&slot->binding->phase)==KU_TASK_CONTROL_FAILED);
+  CHECK(ku_task_control_atomic_load(&slot->binding->payload)==KU_TASK_CONTROL_PAYLOAD_TAKEN);
+  CHECK(slot->state==KU_TASK_DRIVER_QUEUED && driver->queued==1u && !driver->running);
+  CHECK(driver->polls!=UINT64_MAX);
+  fixture_take_polls_before=driver->polls;
+  fixture_take_notifications++;
+}
 static void fixture_worker_exited(void) {
   if (fixture_exit_observing) CHECK(ku_test_event_set(&fixture_exit_event));
 }
@@ -402,12 +409,21 @@ static void fixture_scope_timeout(void) {
   CHECK(expired.allocations+1u==staged.allocations && expired.bytes+31u==staged.bytes && expired.calls==staged.calls);
   for (size_t i=0;i<3;i++) CHECK(ku_task_driver_cleanup_receipt_read(&receipts[i])==KU_TASK_DRIVER_PENDING);
   KuTaskAdapterOutcomeV1 outcome={0};
+  fixture_take_ticket=parent.ticket; fixture_take_notifications=0;
+  ku_task_control_atomic_store(&fixture_observe_take,1);
   CHECK(ku_task_value_take(&parent,NULL,&outcome)==KU_TASK_CONTROL_OK);
+  ku_task_control_atomic_store(&fixture_observe_take,0);
+  CHECK(fixture_take_notifications==1u);
   CHECK(outcome.result_kind==4u && !outcome.value.string.ok && outcome.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE);
   CHECK(outcome.has_cleanup_deadline && outcome.cleanup_deadline==deadline);
   CHECK(outcome.value.string.error.domain.len==4u && !memcmp(outcome.value.string.error.domain.ptr,"task",4u));
   CHECK(outcome.value.string.error.code.len==16u && !memcmp(outcome.value.string.error.code.ptr,"shutdown_timeout",16u));
+  /* take's post-publication wrapper deliberately queues one terminal poll.
+   * Drain that real notification before asserting no unsolicited re-polls;
+   * taking a pre-drain snapshot races the worker, especially on POSIX. */
+  fixture_idle(&runtime);
   size_t stable_polls=fixture_snapshot(&runtime).polls;
+  CHECK(stable_polls==fixture_take_polls_before+1u);
   for (size_t i=0;i<8;i++) { fixture_idle(&runtime); CHECK(fixture_snapshot(&runtime).polls==stable_polls); }
   /* These are LATE cleanups. They permit safe eventual reclamation but cannot
    * turn the already-failed exit into success or renew its absolute budget. */
@@ -451,6 +467,7 @@ int main(void) {
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&fixture_hold,0);
   ku_task_control_atomic_init(&fixture_cleanup_calls,0);
+  ku_task_control_atomic_init(&fixture_observe_take,0);
   fixture_scope(0); fixture_scope(1); fixture_scope(2);
   fixture_scope_timeout();
   puts("task-source-scope-safety-ok");
@@ -480,7 +497,7 @@ async fn main(): null! { return ok(null) }
         assert!(!generated.contains(forbidden));
     }
     let instrumentation = format!(
-        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic void* fixture_text_calloc(size_t,size_t);\nstatic void fixture_observe_charge(int,const void*,const void*,size_t);\n"
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic void* fixture_text_calloc(size_t,size_t);\nstatic void fixture_observe_charge(int,const void*,const void*,size_t);\nstatic void fixture_observe_start(unsigned,const void*,const void*,const void*,const void*);\n"
     );
     let generated = replace_once(
         generated,
@@ -492,8 +509,24 @@ async fn main(): null! { return ok(null) }
     let generated = replace_once(
         generated,
         "KuTaskInstance_1* instance = (KuTaskInstance_1*)calloc(1, sizeof(*instance));",
-        "KuTaskInstance_1* instance = (KuTaskInstance_1*)fixture_text_calloc(1, sizeof(*instance));",
+        "fixture_observe_start(0,source,&ticket,NULL,arg_0);\n  KuTaskInstance_1* instance = (KuTaskInstance_1*)fixture_text_calloc(1, sizeof(*instance));",
     );
+    // Observe the actual shared factory before and after its real atomic
+    // commit. The fixture neither transfers charge nor publishes the child.
+    let factory_start = generated
+        .find("static uint32_t ku_task_1_try_start_impl(")
+        .unwrap();
+    let factory_end = generated[factory_start..]
+        .find("static uint32_t ku_task_1_start_value_impl(")
+        .unwrap()
+        + factory_start;
+    let original_factory = generated[factory_start..factory_end].to_owned();
+    let observed_factory = replace_once(
+        original_factory.clone(),
+        "  checked = source ? ku_task_driver_commit_child(&ticket, &owner, source, sizeof(*instance))\n      : ku_task_driver_commit(&ticket, &owner, KU_TASK_DRIVER_START, UINT64_MAX);",
+        "  fixture_observe_start(1,source,&ticket,instance,arg_0);\n  checked = source ? ku_task_driver_commit_child(&ticket, &owner, source, sizeof(*instance))\n      : ku_task_driver_commit(&ticket, &owner, KU_TASK_DRIVER_START, UINT64_MAX);\n  if (checked==KU_TASK_DRIVER_OK) fixture_observe_start(2,source,&ticket,instance,arg_0);",
+    );
+    let generated = replace_once(generated, &original_factory, &observed_factory);
     let take_start = generated
         .find("static uint32_t ku_task_1_take_payload(void* raw, void* destination) {")
         .unwrap();
@@ -551,6 +584,69 @@ typedef struct FixtureCharge {
   size_t observations;
 } FixtureCharge;
 static FixtureCharge fixture_charge;
+typedef struct FixtureStart {
+  size_t stages,total,parent;
+  uint8_t* buffer;
+} FixtureStart;
+static FixtureStart fixture_start;
+static void fixture_sum_charge(KuTaskDriverV1* driver) {
+  size_t sum=0;
+  for (size_t i=0;i<driver->capacity;i++) {
+    CHECK(driver->slots[i].charged_bytes<=SIZE_MAX-sum);
+    sum+=driver->slots[i].charged_bytes;
+  }
+  CHECK(sum==driver->reserved_bytes);
+}
+static void fixture_observe_start(unsigned stage,const void* raw_source,
+    const void* raw_ticket,const void* raw_instance,const void* raw_argument) {
+  /* NULL is the unchanged external I+A path, not a hosted transfer. */
+  if (!raw_source) return;
+  const KuTaskDriverStartChargeV1* source=(const KuTaskDriverStartChargeV1*)raw_source;
+  const KuTaskDriverTicketV1* ticket=(const KuTaskDriverTicketV1*)raw_ticket;
+  const KuTaskInstance_1* instance=(const KuTaskInstance_1*)raw_instance;
+  const KuString* argument=(const KuString*)raw_argument;
+  KuTaskDriverV1* driver=ticket->driver;
+  CHECK(source->parent.driver==driver && source->owned_bytes==31u);
+  CHECK(source->minimum_parent_bytes==sizeof(KuTaskInstance_0));
+  CHECK(stage==fixture_start.stages && stage<=2u);
+  FixtureLedger ledger=fixture_ledger();
+  CHECK(!ku_task_driver_lock(driver));
+  KuTaskDriverSlotV1* child=ku_task_driver_find(ticket);
+  KuTaskDriverSlotV1* parent=ku_task_driver_find(&source->parent);
+  CHECK(child && parent && child!=parent && parent->state==KU_TASK_DRIVER_RUNNING);
+  CHECK(parent->binding==source->parent_control);
+  fixture_sum_charge(driver);
+  CHECK(driver->resident==2u && driver->running==1u);
+  if (!stage) {
+    fixture_start.total=driver->reserved_bytes;
+    fixture_start.parent=parent->charged_bytes;
+    fixture_start.buffer=argument->ptr;
+    CHECK(fixture_start.parent==sizeof(KuTaskInstance_0)+31u);
+    CHECK(argument->ptr && argument->len==7u && argument->capacity==31u && argument->storage==KU_STRING_OWNED);
+    CHECK(!instance && ledger.allocations==5u);
+    CHECK(ledger.bytes==driver->fixed_bytes+fixture_start.parent);
+  } else {
+    CHECK(instance && !argument->ptr);
+    CHECK(instance->frame.s_0.ptr==fixture_start.buffer && instance->frame.s_0.capacity==31u);
+    CHECK(instance->frame.header.initialized & UINT64_C(1));
+    CHECK(ledger.allocations==6u);
+    CHECK(ledger.bytes==driver->fixed_bytes+fixture_start.total);
+  }
+  CHECK(driver->reserved_bytes==fixture_start.total);
+  if (stage<2u) {
+    CHECK(child->state==KU_TASK_DRIVER_BUILDING && driver->building==1u);
+    CHECK(!child->binding && !child->driver_lease.control && !child->execution_lease.control);
+    CHECK(parent->charged_bytes==fixture_start.parent);
+    CHECK(child->charged_bytes==sizeof(KuTaskInstance_1));
+  } else {
+    CHECK(!driver->building && child->state==KU_TASK_DRIVER_QUEUED);
+    CHECK(child->binding==&instance->control && child->driver_lease.control && child->execution_lease.control);
+    CHECK(parent->charged_bytes+31u==fixture_start.parent);
+    CHECK(child->charged_bytes==sizeof(KuTaskInstance_1)+31u);
+  }
+  fixture_start.stages++;
+  CHECK(!ku_task_driver_unlock(driver));
+}
 static void* fixture_text_calloc(size_t count,size_t size) {
   ku_task_control_atomic_store(&fixture_calloc_attempts,ku_task_control_atomic_load(&fixture_calloc_attempts)+1u);
   if (ku_task_control_atomic_load(&fixture_calloc_failure)) return NULL;
@@ -573,7 +669,7 @@ static void fixture_observe_charge(int after,const void* raw_child,const void* r
     fixture_charge.parent=to->charged_bytes;
     fixture_charge.bytes=bytes;
     CHECK(from->charged_bytes==sizeof(KuTaskInstance_1)+bytes);
-    CHECK(to->charged_bytes==sizeof(KuTaskInstance_0)+bytes);
+    CHECK(to->charged_bytes==sizeof(KuTaskInstance_0));
   } else {
     CHECK(fixture_charge.observations==1u && fixture_charge.bytes==bytes);
     fixture_charge.after=driver->reserved_bytes;
@@ -581,7 +677,9 @@ static void fixture_observe_charge(int after,const void* raw_child,const void* r
     CHECK(from->charged_bytes+bytes==fixture_charge.child);
     CHECK(to->charged_bytes==fixture_charge.parent+bytes);
     CHECK(from->charged_bytes==sizeof(KuTaskInstance_1));
+    CHECK(to->charged_bytes==sizeof(KuTaskInstance_0)+bytes);
   }
+  fixture_sum_charge(driver);
   fixture_charge.observations++;
   CHECK(!ku_task_driver_unlock(driver));
 }
@@ -594,15 +692,19 @@ static void fixture_rejection(int mode) {
   ku_task_control_atomic_store(&fixture_calloc_failure,mode==2);
   ku_task_control_atomic_store(&fixture_calloc_attempts,0);
   fixture_charge=(FixtureCharge){0};
+  fixture_start=(FixtureStart){0};
+  int rejected=mode==1 || mode==2 || mode==3;
   size_t capacity=mode==1 ? 1u : 2u;
   KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(capacity,sizeof(*slots));
   size_t* ring=(size_t*)calloc(capacity,sizeof(*ring)); CHECK(driver && slots && ring);
   size_t fixed=sizeof(*driver)+capacity*(sizeof(*slots)+sizeof(*ring));
-  /* Parent input charge is conservatively retained after source Start. The
-   * child admission separately charges its owned input. This is an admission
-   * upper bound, not exact live allocation bytes or an OS RSS measurement. */
-  size_t charge_limit=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+62u;
+  /* Hosted admission adds only I. A is already charged to Parent, stays there
+   * through construction, and moves atomically at commit. Failed source Start
+   * may conservatively retain A until Parent dispose; this is not exact RSS. */
+  size_t charge_limit=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+31u;
+  if (mode==3) charge_limit--; /* Exactly I-1 incremental room: reject. */
+  if (mode==4) charge_limit++; /* Exactly I+1 incremental room: accept. */
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,
       slots,capacity,ring,capacity,fixed+charge_limit)==KU_TASK_DRIVER_OK);
   uint8_t* text=(uint8_t*)malloc(31u); CHECK(text); memcpy(text,"payload",7u);
@@ -618,23 +720,25 @@ static void fixture_rejection(int mode) {
   CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
   CHECK(!snapshot.fault && snapshot.resident==1u && !snapshot.building && !snapshot.running && !snapshot.queued);
   FixtureLedger ready=fixture_ledger();
-  CHECK(ready.calls==before.calls+(mode ? 1u : 2u));
-  CHECK(ku_task_control_atomic_load(&fixture_calloc_attempts)==(mode==1 ? 0u : 1u));
-  CHECK(fixture_charge.observations==(mode ? 0u : 2u));
-  CHECK(snapshot.reserved_bytes==sizeof(KuTaskInstance_0)+(mode ? 31u : 62u));
-  CHECK(ready.allocations==(mode ? 4u : 5u));
-  CHECK(ready.bytes==fixed+sizeof(KuTaskInstance_0)+(mode ? 0u : 31u));
+  CHECK(ready.calls==before.calls+(rejected ? 1u : 2u));
+  CHECK(ku_task_control_atomic_load(&fixture_calloc_attempts)==(mode==1 || mode==3 ? 0u : 1u));
+  CHECK(fixture_start.stages==(mode==1 || mode==3 ? 0u : mode==2 ? 1u : 3u));
+  CHECK(fixture_charge.observations==(rejected ? 0u : 2u));
+  CHECK(snapshot.reserved_bytes==sizeof(KuTaskInstance_0)+31u);
+  CHECK(ready.allocations==(rejected ? 4u : 5u));
+  CHECK(ready.bytes==fixed+sizeof(KuTaskInstance_0)+(rejected ? 0u : 31u));
+  CHECK(!ku_task_driver_lock(driver)); fixture_sum_charge(driver); CHECK(!ku_task_driver_unlock(driver));
   KuTaskAdapterOutcomeV1 output={0};
   CHECK(ku_task_value_take(&parent,NULL,&output)==KU_TASK_CONTROL_OK);
   CHECK(output.result_kind==4u && output.exit_class==KU_TASK_EXIT_USER_RESULT);
   CHECK(!output.has_cleanup_deadline && !output.cleanup_deadline);
-  if (!mode) {
+  if (!rejected) {
     CHECK(output.value.string.ok && output.value.string.value.ptr==text && output.value.string.value.capacity==31u);
     fixture_text(output.value.string.value,"payload");
   } else {
     CHECK(!output.value.string.ok && !output.value.string.value.ptr);
     fixture_text(output.value.string.error.domain,"task");
-    fixture_text(output.value.string.error.code,mode==1 ? "too_many_tasks" : "out_of_memory");
+    fixture_text(output.value.string.error.code,mode==2 ? "out_of_memory" : "too_many_tasks");
     CHECK(output.value.string.error.domain.storage==KU_STRING_STATIC);
     CHECK(output.value.string.error.code.storage==KU_STRING_STATIC);
     CHECK(output.value.string.error.message.storage==KU_STRING_STATIC);
@@ -655,10 +759,63 @@ static void fixture_rejection(int mode) {
   FixtureLedger final=fixture_ledger();
   CHECK(!final.allocations && !final.bytes && !final.overflow);
 }
+static void fixture_raw_external(int one_byte_short) {
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
+  ku_task_control_atomic_store(&fixture_calloc_failure,0);
+  ku_task_control_atomic_store(&fixture_calloc_attempts,0);
+  fixture_charge=(FixtureCharge){0}; fixture_start=(FixtureStart){0};
+  KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
+  KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(1,sizeof(*slots));
+  size_t* ring=(size_t*)calloc(1,sizeof(*ring)); CHECK(driver && slots && ring);
+  size_t fixed=sizeof(*driver)+sizeof(*slots)+sizeof(*ring);
+  size_t charge=sizeof(KuTaskInstance_1)+31u;
+  CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,
+      slots,1,ring,1,fixed+charge-(one_byte_short ? 1u : 0u))==KU_TASK_DRIVER_OK);
+  uint8_t* text=(uint8_t*)malloc(31u); CHECK(text); memcpy(text,"payload",7u);
+  KuString input={text,7u,31u,KU_STRING_OWNED};
+  FixtureLedger before=fixture_ledger();
+  KuTaskHandle_1 handle={0};
+  uint32_t started=ku_task_1_try_start(driver,&input,&handle);
+  uint64_t deadline=ku_task_driver_now_ms()+2000u;
+  KuTaskDriverSnapshotV1 snapshot={0};
+  if (one_byte_short) {
+    CHECK(started==KU_TASK_DRIVER_LIMIT && !handle.owner.lease.control && !handle.ticket.driver);
+    CHECK(input.ptr==text && input.len==7u && input.capacity==31u && input.storage==KU_STRING_OWNED);
+    CHECK(fixture_ledger().calls==before.calls && !ku_task_control_atomic_load(&fixture_calloc_attempts));
+    CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
+    CHECK(!snapshot.resident && !snapshot.reserved_bytes && !snapshot.building);
+    ku_string_drop(&input);
+  } else {
+    CHECK(started==KU_TASK_DRIVER_OK && !input.ptr);
+    CHECK(ku_task_driver_wait_result(&handle.ticket,&handle.owner.lease,deadline)==KU_TASK_DRIVER_WAIT_READY);
+    CHECK(ku_task_driver_wait_idle(driver,deadline)==KU_TASK_DRIVER_OK);
+    CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
+    CHECK(snapshot.resident==1u && snapshot.reserved_bytes==charge && !snapshot.building);
+    CHECK(fixture_ledger().calls==before.calls+1u && ku_task_control_atomic_load(&fixture_calloc_attempts)==1u);
+    KuTaskAdapterOutcomeV1 output={0};
+    CHECK(ku_task_1_take(&handle,&output)==KU_TASK_CONTROL_OK);
+    CHECK(output.result_kind==4u && output.exit_class==KU_TASK_EXIT_USER_RESULT && output.value.string.ok);
+    CHECK(output.value.string.value.ptr==text && output.value.string.value.capacity==31u);
+    ku_task_outcome_drop(&output);
+    CHECK(ku_task_1_drop(&handle,deadline)==KU_TASK_DRIVER_OK);
+  }
+  CHECK(!fixture_start.stages && !fixture_charge.observations);
+  CHECK(ku_task_driver_shutdown(driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
+  CHECK(!snapshot.fault && !snapshot.resident && !snapshot.reserved_bytes && !snapshot.building && !snapshot.queued && !snapshot.running);
+#if defined(_WIN32)
+  CHECK(WaitForSingleObject(driver->thread,2000)==WAIT_OBJECT_0);
+#endif
+  CHECK(ku_task_driver_destroy(driver)==KU_TASK_DRIVER_OK);
+  free(ring); free(slots); free(driver);
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
+}
 int main(void) {
   ku_task_control_atomic_init(&fixture_calloc_failure,0);
   ku_task_control_atomic_init(&fixture_calloc_attempts,0);
   fixture_rejection(0); fixture_rejection(1); fixture_rejection(2);
+  fixture_rejection(3); fixture_rejection(4);
+  fixture_raw_external(0); fixture_raw_external(1);
   puts("task-source-start-await-safety-ok");
   return 0;
 }

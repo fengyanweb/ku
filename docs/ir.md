@@ -117,7 +117,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 1. 逐项补齐闭包尚未支持的 binding/payload 捕获，并为每一种 owned payload 固定逃逸与失败清理测试。
 2. 继续收窄动态 object 与 Result 的组合边界，不把单项 ABI 存在等同于任意嵌套组合已完成。
 3. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
-4. native C 已接通单 worker 有限源码 Task 子集，其余 async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；执行证据见 [阶段工作日志](v0.0.18-worklog.md)。源码及 CLI 定向运行已通过；本片安全与完整本机回归已通过，精确提交三系统 CI 仍待完成。不能把这个子集或内部 frame 夹具通过当作完整 native async、M:N 或生产性能验收完成。
+4. native C 已接通单 worker 有限源码 Task 子集，其余 async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；执行证据见 [阶段工作日志](v0.0.18-worklog.md)。源码及 CLI 定向运行已通过；R5c 本机回归已通过，但其精确提交的三系统 CI 中 Linux/macOS 与 PR sanitizer 有失败，修复后的完整验证仍未完成。不能把这个子集或内部 frame 夹具通过当作完整 native async、M:N 或生产性能验收完成。
 
 ## Typed Task IR 与有限源码接入（v0.0.18 开发中）
 
@@ -245,6 +245,12 @@ Windows 还验证线程句柄结束；POSIX 最终 join 不是可硬限时的 po
 仍接收后续 owner/BUILDING 归还；不退出后留下无人处理的队列，也不恢复普通 continuation。
 故障即使随后读钟恢复也不能被清成成功，实际排空之后才允许销毁存储。
 
+非 terminal、非 Pending 的执行错误与普通等待不同：driver 保留其引用和额度，
+将 slot 标记为内部 FAULTED（snapshot 计为 parked），不能因 YIELD、普通 wake 或
+失败 take 的通知重放已执行过 move 的 continuation。真实取消/owner 移交/关闭仍可
+恢复清理；若清理自身再报内部错误，不自行忙循环。错误状态保持可观察，不能假造
+业务 Result 或清理 ACK。该状态不新增字段、分配或用户 API。
+
 `native_task_driver_test` 的 adapter 仍是测试夹具；真实源码由独立 source 测试验证。
 用户 finally、I/O/timer/blocking、M:N 和压力/soak 不能由这些测试替代。
 
@@ -276,9 +282,14 @@ cleanup 每个 safepoint 读取 live 最短 deadline，保留取消/超时原因
 父子作用域清理；这里不提供 array/object/struct/enum/closure Task payload 或增长堆预算。
 成功 hosted take 在 payload claim 中先把活动 Owned 容量从 child 转记到 RUNNING parent，
 总 reserved bytes 不变；所有 preflight/转账失败都不 move。root 先 drop 输出再释放 owner。
-当前 Start 仍保守保留父预留，并在 child admission 计入输入容量；宿主提供 owned 堆输入时
-可能提前触发字节拒绝，不能把它说成精确活跃堆计费。首片源码尚不开放动态分配表达式，
-消除这份重复预留属于后续预算工作。普通 Str/Result 局部在正常返回前可先释放；
+成功 hosted Start 现在只接纳 child instance 的新增额度；构建期间输入 Owned 容量仍在
+RUNNING parent 账内，所有可失败步骤结束后，同锁将活动容量从 parent 转给 child 并发布。
+原始外部 factory 仍接纳 instance 加外部输入；两条入口共用一份构造、恢复与销毁实现。
+失败创建或普通局部 drop 后可能保守留额至 instance 销毁，不能称精确活跃堆或 RSS 计费。
+私有 Start 请求只允许在同一个不挂起的父 callback 内使用，不能交给外部异步 builder；
+即使活动容量为零也必须验证真实父 ticket、control 身份和额度下限。新增边界/故障测试与
+精确提交三系统验证状态分别记录在工作日志，未开放源码动态分配表达式。
+普通 Str/Result 局部在正常返回前可先释放；
 取消路径仍先移交 Task，再执行 Value cleanup。首片没有用户可观察的局部析构器。
 生成代码和参数检查沿用现有函数/槽/输出上限，不表示 64 MiB C artifact 上限等于
 编译器 RSS 上限。实际测试证据见 [阶段工作日志](v0.0.18-worklog.md)。
@@ -369,8 +380,9 @@ private READY 先保存返回 Result；所有 sibling 先移交到固定 driver 
 取消胜出时 drop 私有结果并保留原取消原因。取消中的 ACK continuation 不放宽用户 cleanup 禁 Await。
 正常 Await 不开启新的 scope deadline；root 通过真实条件等待取值，不递归 poll child。
 
-源码与两种 CLI native 构建的定向执行已经通过；本片安全与完整本机回归已通过，精确提交三系统 CI
-仍待完成。Frame ABI 2、Control ABI 1、Driver ABI 4 不等于稳定外部 C FFI。
+源码与两种 CLI native 构建的定向执行已经通过；R5c 本机回归通过，但其精确提交的
+三系统 CI 中 Linux/macOS 与 PR sanitizer 有失败，修复后的完整验证仍未完成，实际结果见工作日志。
+Frame ABI 2、Control ABI 1、Driver ABI 4 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
 
 ## IR 优化队列

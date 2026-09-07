@@ -115,6 +115,11 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     let mut charge = String::new();
     let mut restore = String::new();
     let mut rejected_drops = String::new();
+    let mut source_headers = String::new();
+    let mut source_buffers = String::new();
+    let mut hosted_headers = String::new();
+    let mut hosted_charge = String::new();
+    let mut hosted_ticket_aliases = String::new();
     for (index, (slot, ty)) in parameters.iter().enumerate() {
         let c_ty = c_type(ty)?;
         declarations.push_str(&format!(", {c_ty}* arg_{index}"));
@@ -150,6 +155,53 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             }
             checks.push_str(") return KU_TASK_DRIVER_INVALID_ARGUMENT;\n");
             checks
+        }));
+        // Hosted entry cannot read host->ticket until every argument header
+        // and active buffer has been proved disjoint from the complete host.
+        hosted_headers.push_str(&format!(
+            "  if (!ku_task_frame_storage_valid(arg_{index},sizeof(*arg_{index}),sizeof(*arg_{index}),KU_TASK_FRAME_ALIGNOF({c_ty}))\n\
+             || ku_task_frame_ranges_overlap(host,sizeof(*host),arg_{index},sizeof(*arg_{index}))\n\
+             || ku_task_frame_ranges_overlap(output,sizeof(*output),arg_{index},sizeof(*arg_{index}))\n\
+             || ku_task_frame_ranges_overlap(&source,sizeof(source),arg_{index},sizeof(*arg_{index}))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
+        ));
+        for (other, (_, other_ty)) in parameters.iter().enumerate().take(index) {
+            if owned(ty) || owned(other_ty) {
+                hosted_headers.push_str(&format!(
+                    "  if (ku_task_frame_ranges_overlap(arg_{index},sizeof(*arg_{index}),arg_{other},sizeof(*arg_{other}))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
+                ));
+            }
+        }
+        source_headers.push_str(&format!(
+            "  if (source && ku_task_frame_ranges_overlap(source,sizeof(*source),arg_{index},sizeof(*arg_{index}))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
+        ));
+        hosted_ticket_aliases.push_str(&format!(
+            "  if (ku_task_frame_ranges_overlap(parent,sizeof(*parent),arg_{index},sizeof(*arg_{index}))\n\
+             || ku_task_frame_ranges_overlap(host->control,sizeof(KuTaskControlV1),arg_{index},sizeof(*arg_{index}))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
+        ));
+        hosted_charge.push_str(&active_strings(ty, &format!("(*arg_{index})"), &|place| {
+            let mut checks = format!(
+                "  checked=ku_task_adapter_string_charge({place},&charge);\n\
+                 if (checked!=KU_TASK_DRIVER_OK) return checked;\n\
+                 if (ku_task_adapter_string_overlaps({place},host,sizeof(*host))\n\
+                 || ku_task_adapter_string_overlaps({place},output,sizeof(*output))\n\
+                 || ku_task_adapter_string_overlaps({place},&source,sizeof(source))"
+            );
+            for other in 0..parameters.len() {
+                checks.push_str(&format!(
+                    "\n || ku_task_adapter_string_overlaps({place},arg_{other},sizeof(*arg_{other}))"
+                ));
+            }
+            checks.push_str(") return KU_TASK_DRIVER_INVALID_ARGUMENT;\n");
+            checks
+        }));
+        source_buffers.push_str(&active_strings(ty, &format!("(*arg_{index})"), &|place| {
+            format!("  if (source && ku_task_adapter_string_overlaps({place},source,sizeof(*source))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n")
+        }));
+        hosted_ticket_aliases.push_str(&active_strings(ty, &format!("(*arg_{index})"), &|place| {
+            format!(
+                "  if (ku_task_adapter_string_overlaps({place},parent,sizeof(*parent))\n\
+                 || ku_task_adapter_string_overlaps({place},host->control,sizeof(KuTaskControlV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n"
+            )
         }));
         if owned(ty) {
             rejected_drops.push_str(&format!(
@@ -192,6 +244,11 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@PARAM_ARGS@", &arguments)
         .replace("@PREFLIGHT@", &preflight)
         .replace("@CHARGE@", &charge)
+        .replace("@SOURCE_HEADERS@", &source_headers)
+        .replace("@SOURCE_BUFFERS@", &source_buffers)
+        .replace("@HOSTED_HEADERS@", &hosted_headers)
+        .replace("@HOSTED_CHARGE@", &hosted_charge)
+        .replace("@HOSTED_TICKET_ALIASES@", &hosted_ticket_aliases)
         .replace("@RESTORE@", &restore)
         .replace("@REJECTED_DROPS@", &rejected_drops)
         .replace("@PAYLOAD_CHARGE@", &payload_charge)
@@ -322,7 +379,7 @@ typedef struct KuTaskHandle_@ID@ {
 } KuTaskHandle_@ID@;
 
 static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reason, KuTaskControlV1* budget) {
-  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait};
+  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance)};
   if (instance->wait.driver) {
     KuTaskDriverWaitSnapshotV1 snapshot={0};
     uint32_t status=ku_task_driver_wait_read(&instance->wait,&snapshot);
@@ -402,7 +459,7 @@ static uint32_t ku_task_@ID@_resume(void* raw) {
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)raw;
   if (!instance->frame_initialized) return KU_TASK_CONTROL_INVALID_STATE;
   KuTaskAdapterClockV1 bridge = { instance->ticket.driver, NULL };
-  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait};
+  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance)};
   KuTaskFrameClockV1 clock = { ku_task_adapter_now, &bridge, &host };
   uint32_t status=KU_TASK_FRAME_READY;
   if (!instance->payload_initialized) {
@@ -579,20 +636,28 @@ static uint32_t ku_task_@ID@_discard_private(KuTaskControlOwnerV1* owner) {
   if (status != KU_TASK_CONTROL_OK) { ku_task_adapter_fault(driver, 0); return KU_TASK_DRIVER_INTERNAL; }
   return KU_TASK_DRIVER_OK;
 }
-static uint32_t ku_task_@ID@_try_start(KuTaskDriverV1* driver@PARAM_DECLS@, KuTaskHandle_@ID@* output) {
+static uint32_t ku_task_@ID@_try_start_impl(KuTaskDriverV1* driver,
+    const KuTaskDriverStartChargeV1* source@PARAM_DECLS@, KuTaskHandle_@ID@* output) {
   uint32_t checked = ku_task_driver_check(driver);
   if (checked != KU_TASK_DRIVER_OK) return checked;
   if (!ku_task_driver_external_storage(driver, output, sizeof(*output), KU_TASK_FRAME_ALIGNOF(KuTaskHandle_@ID@)))
     return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (source && (!ku_task_driver_external_storage(driver,source,sizeof(*source),KU_TASK_FRAME_ALIGNOF(KuTaskDriverStartChargeV1))
+      || ku_task_frame_ranges_overlap(source,sizeof(*source),output,sizeof(*output))))
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
 @PREFLIGHT@
+@SOURCE_HEADERS@
   size_t charge = sizeof(KuTaskInstance_@ID@);
 @CHARGE@
+@SOURCE_BUFFERS@
+  if (source && source->owned_bytes != charge-sizeof(KuTaskInstance_@ID@)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   /* Header/deep-alias rejection precedes typed output reads. A pointer into
    * an input int/string buffer need not actually contain a full Handle. */
   if (output->owner.lease.control || output->ticket.driver || output->ticket.slot || output->ticket.generation)
     return KU_TASK_DRIVER_INVALID_STATE;
   KuTaskDriverTicketV1 ticket = {0};
-  checked = ku_task_driver_reserve(driver, charge, &ticket);
+  checked = source ? ku_task_driver_reserve_child(driver, source, sizeof(KuTaskInstance_@ID@), &ticket)
+      : ku_task_driver_reserve(driver, charge, &ticket);
   if (checked != KU_TASK_DRIVER_OK) return checked;
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)calloc(1, sizeof(*instance));
   if (!instance) return ku_task_adapter_rollback(&ticket, KU_TASK_ADAPTER_OUT_OF_MEMORY);
@@ -612,7 +677,8 @@ static uint32_t ku_task_@ID@_try_start(KuTaskDriverV1* driver@PARAM_DECLS@, KuTa
   instance->frame_initialized = true;
   /* Publish immutable metadata BEFORE commit can make this instance runnable. */
   instance->registered = true;
-  checked = ku_task_driver_commit(&ticket, &owner, KU_TASK_DRIVER_START, UINT64_MAX);
+  checked = source ? ku_task_driver_commit_child(&ticket, &owner, source, sizeof(*instance))
+      : ku_task_driver_commit(&ticket, &owner, KU_TASK_DRIVER_START, UINT64_MAX);
   if (checked != KU_TASK_DRIVER_OK) {
     /* A failed R3 commit did not publish any registry/execution lease. Restore
      * only Owned entry arguments; Copy caller headers were never consumed. */
@@ -626,17 +692,26 @@ static uint32_t ku_task_@ID@_try_start(KuTaskDriverV1* driver@PARAM_DECLS@, KuTa
   output->ticket = ticket;
   return KU_TASK_DRIVER_OK;
 }
-static uint32_t ku_task_@ID@_start_value(KuTaskDriverV1* driver@PARAM_DECLS@, KuTaskValueV1* output) {
+static uint32_t ku_task_@ID@_try_start(KuTaskDriverV1* driver@PARAM_DECLS@, KuTaskHandle_@ID@* output) {
+  return ku_task_@ID@_try_start_impl(driver,NULL@PARAM_ARGS@,output);
+}
+static uint32_t ku_task_@ID@_start_value_impl(KuTaskDriverV1* driver,
+    const KuTaskDriverStartChargeV1* source@PARAM_DECLS@, KuTaskValueV1* output) {
   uint32_t checked=ku_task_driver_check(driver);
   if (checked!=KU_TASK_DRIVER_OK) return checked;
   if (!ku_task_driver_external_storage(driver,output,sizeof(*output),KU_TASK_FRAME_ALIGNOF(KuTaskValueV1))) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (source && (!ku_task_driver_external_storage(driver,source,sizeof(*source),KU_TASK_FRAME_ALIGNOF(KuTaskDriverStartChargeV1))
+      || ku_task_frame_ranges_overlap(source,sizeof(*source),output,sizeof(*output))))
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
 @PREFLIGHT@
+@SOURCE_HEADERS@
   size_t charge=0;
 @CHARGE@
+@SOURCE_BUFFERS@
   (void)charge;
   if (output->tag || output->owner.lease.control || output->ticket.driver) return KU_TASK_DRIVER_INVALID_STATE;
   KuTaskHandle_@ID@ handle={0};
-  uint32_t status=ku_task_@ID@_try_start(driver@PARAM_ARGS@,&handle);
+  uint32_t status=ku_task_@ID@_try_start_impl(driver,source@PARAM_ARGS@,&handle);
   if (status!=KU_TASK_DRIVER_OK) {
     if (status!=KU_TASK_DRIVER_LIMIT && status!=KU_TASK_DRIVER_CLOSED && status!=KU_TASK_ADAPTER_OUT_OF_MEMORY) return status;
 @REJECTED_DROPS@
@@ -646,5 +721,44 @@ static uint32_t ku_task_@ID@_start_value(KuTaskDriverV1* driver@PARAM_DECLS@, Ku
   output->tag=KU_TASK_VALUE_LIVE; output->result_kind=@KIND@u; output->function_id=@ID@u;
   output->owner=handle.owner; output->ticket=handle.ticket;
   return KU_TASK_DRIVER_OK;
+}
+static uint32_t ku_task_@ID@_start_value(KuTaskDriverV1* driver@PARAM_DECLS@, KuTaskValueV1* output) {
+  return ku_task_@ID@_start_value_impl(driver,NULL@PARAM_ARGS@,output);
+}
+static uint32_t ku_task_@ID@_start_hosted(const KuTaskAdapterHostV1* host@PARAM_DECLS@, KuTaskValueV1* output) {
+  KuTaskDriverStartChargeV1 source={0};
+  /* No host/ticket/output field read before complete known-header and active
+   * buffer overlap rejection. Integer-range validity is not pointer mapping. */
+  if (!ku_task_frame_storage_valid(host,sizeof(*host),sizeof(*host),KU_TASK_FRAME_ALIGNOF(KuTaskAdapterHostV1))
+      || !ku_task_frame_storage_valid(output,sizeof(*output),sizeof(*output),KU_TASK_FRAME_ALIGNOF(KuTaskValueV1))
+      || ku_task_frame_ranges_overlap(host,sizeof(*host),output,sizeof(*output))
+      || ku_task_frame_ranges_overlap(&source,sizeof(source),host,sizeof(*host))
+      || ku_task_frame_ranges_overlap(&source,sizeof(source),output,sizeof(*output)))
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+@HOSTED_HEADERS@
+  uint32_t checked=KU_TASK_DRIVER_OK;
+  size_t charge=0;
+@HOSTED_CHARGE@
+  const KuTaskDriverTicketV1* parent=host->ticket;
+  if (!ku_task_frame_storage_valid(parent,sizeof(*parent),sizeof(*parent),KU_TASK_FRAME_ALIGNOF(KuTaskDriverTicketV1))
+      || !ku_task_frame_storage_valid(host->control,sizeof(KuTaskControlV1),sizeof(KuTaskControlV1),KU_TASK_FRAME_ALIGNOF(KuTaskControlV1))
+      || ku_task_frame_ranges_overlap(parent,sizeof(*parent),host,sizeof(*host))
+      || ku_task_frame_ranges_overlap(parent,sizeof(*parent),output,sizeof(*output))
+      || ku_task_frame_ranges_overlap(parent,sizeof(*parent),&source,sizeof(source))
+      || ku_task_frame_ranges_overlap(host->control,sizeof(KuTaskControlV1),parent,sizeof(*parent))
+      || ku_task_frame_ranges_overlap(host->control,sizeof(KuTaskControlV1),host,sizeof(*host))
+      || ku_task_frame_ranges_overlap(host->control,sizeof(KuTaskControlV1),output,sizeof(*output))
+      || ku_task_frame_ranges_overlap(host->control,sizeof(KuTaskControlV1),&source,sizeof(source))
+      || !host->minimum_charge) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+@HOSTED_TICKET_ALIASES@
+  KuTaskDriverV1* driver=parent->driver;
+  checked=ku_task_driver_check(driver);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  if (!ku_task_driver_external_storage(driver,host,sizeof(*host),KU_TASK_FRAME_ALIGNOF(KuTaskAdapterHostV1))
+      || !ku_task_driver_external_storage(driver,parent,sizeof(*parent),KU_TASK_FRAME_ALIGNOF(KuTaskDriverTicketV1))
+      || !ku_task_driver_external_storage(driver,host->control,sizeof(KuTaskControlV1),KU_TASK_FRAME_ALIGNOF(KuTaskControlV1)))
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  source=(KuTaskDriverStartChargeV1){*parent,host->control,host->minimum_charge,charge};
+  return ku_task_@ID@_start_value_impl(driver,&source@PARAM_ARGS@,output);
 }
 "#;

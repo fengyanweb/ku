@@ -18208,8 +18208,17 @@ mod tests {
             .find("typedef struct KuTaskInstance_0 {")
             .expect("adapter follows the shared ABI");
         let factory = expected
-            .find("static uint32_t ku_task_0_try_start(")
-            .expect("typed factory is part of the complete artifact");
+            .find("static uint32_t ku_task_0_try_start_impl(")
+            .expect("shared typed factory is part of the complete artifact");
+        assert_eq!(
+            expected
+                .matches(
+                    "KuTaskInstance_0* instance = (KuTaskInstance_0*)calloc(1, sizeof(*instance));"
+                )
+                .count(),
+            1,
+            "raw and hosted Start must share one instance allocation body"
+        );
         let factory_middle = factory
             + expected[factory..]
                 .find("KuTaskDriverTicketV1 ticket = {0};")
