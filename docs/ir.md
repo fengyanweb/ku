@@ -117,7 +117,50 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 1. 逐项补齐闭包尚未支持的 binding/payload 捕获，并为每一种 owned payload 固定逃逸与失败清理测试。
 2. 继续收窄动态 object 与 Result 的组合边界，不把单项 ABI 存在等同于任意嵌套组合已完成。
 3. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
-4. async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；解释器生命周期验证见 [阶段工作日志](v0.0.18-worklog.md)。typed async IR、task frame ABI、stackless lowering 和调度器仍未实现；只有相应子集通过 IR verifier 与 native 执行测试后才能开放，不能把解释器通过或拒绝门禁当作 native async 完成。
+4. async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；解释器生命周期验证见 [阶段工作日志](v0.0.18-worklog.md)。实验性 frame IR 与串行 frame ABI 见下节；源码 async lowering、Task 控制块和调度器仍未实现。只有相应子集通过 IR verifier 与 native 执行测试后才能开放，不能把解释器或内部 frame 夹具通过当作源码 native async 完成。
+
+## 实验性 task frame IR（v0.0.18 R1，未开放源码 async）
+
+`src/ir/task.rs` 是与同步 `IrProgram` 分离的编译器内部中间层，不增加 Ku 写法、
+标准库入口或 CLI 开关。它还没有从 Ku AST 生成 frame 的 lowering，也没有 Task
+创建、await、I/O 或 scheduler 操作，不能用内部 Rust API 代替用户 async 的验收。
+
+当前 frame IR 使用密集 `SlotId` / `StateId`，支持 `int`、`bool`、`null`、`str`
+及对应单层 Result。操作显式区分 Init、Copy、Move、Read、Drop、DropIfInit；
+控制边区分 Jump、Branch、Suspend（resume / cleanup）、Complete 和 Terminate。
+暂不支持 array/object/struct/enum、函数值、子 Task 或借用参数进入 frame。
+
+`verify_and_plan` 先验证形状、类型、资源硬限，再计算跨分支和循环的 must/may
+初始化固定点及包括 cleanup/drop 用途的 liveness。只把入口参数和真正跨挂起存活
+的槽放进 frame；已死亡的 Copy 临时留在 resume 栈上，dead owned 必须在挂起前显式
+drop，不能为了缩 frame 擅自提前释放资源。借用值不能跨 Suspend；owned 值不能隐式
+Copy、覆盖可能仍初始化的槽或再次消费 moved-from 值。取消区域不能回正常区域、
+Complete 或 Suspend；本片尚无预算轮询 IR，所以拒绝所有不经过 Suspend 的环，
+包括 cleanup 中的环。它不是完整语言的 finally/异常/await verifier。
+
+内部硬限为 64 函数、每函数 64 槽 / 256 状态、全程序 4096 操作、1,000,000 字面量
+字节（含 UTF-8、Error 三字段和函数名）及 1,000,000 分析工作量；测试只能收紧限制。
+这些是已构造 IR 的分析预算，不是整个编译器 RSS 或运行时总内存预算。
+
+`src/backend/c_task.rs` 通过统一 C 生成器复用既有 KuString / Result 的 move/drop
+helper，不嵌入 runner 或源码。内部 frame ABI v1 有独立版本、目标 C `sizeof` / alignment、
+初始化位、状态、结果槽、取消原因和绝对 cleanup deadline；单 frame 存储上限 16 KiB。
+ABI 不兼容、短/未对齐存储、参数 header 别名、重复初始化、重复取结果和非空输出槽
+会前置拒绝；失败不消费输入。entry 的 Copy 参数不清来源，Str/Result 参数才 move。
+
+此 ABI **只允许调用者串行、单执行者** 使用保持存活的零填充对齐存储，不得复制或
+篡改 live frame；owned 深层 payload 必须唯一且互不别名。clock 是可信、单调且不重入
+的内部 hook。取消只能继承调用者提供的同一个绝对 deadline，不能续期；它尚不负责
+创建整棵 Task 取消树的一秒预算。Pending 必须先 terminate 走 cleanup，再 destroy；
+destroy 不释放 caller 的 frame 存储。完成和终止不可改写，结果只能取一次；未取结果
+由 destroy 释放。这里的 destroy 不是 Ku Task handle drop，亦没有并发原子裁决、
+generation/wake、wait token、父子引用或独立外部 Task runtime 的链接合同。
+
+`native_task_frame_ir_test` 验证反例与硬边界；`native_task_frame_c_test` 使用真实目标
+C 编译器，覆盖独立栈上的 Pending→Resume、Move、部分初始化、多次挂起循环、
+slot 63 / 逆序参数、Ok/Err payload、取消/超期、未取结果销毁和分配台账归零。
+旧 ABI 参数拒绝不等于已经验证不存在的外部旧 Task runtime。现有 native async
+拒绝测试保持不变；测试结果、平台和 sanitizer 状态以阶段工作日志与精确 SHA CI 为准。
 
 ## IR 优化队列
 
