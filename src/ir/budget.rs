@@ -337,6 +337,71 @@ mod tests {
     }
 
     #[test]
+    fn synchronous_ir_budget_template_parts_have_an_exact_shared_work_boundary() {
+        let source = "fn value(): str { return `before{1}{2}{3}after` }";
+        let (reference, budget) = lower(source, LowerLimits::default());
+        let reference = reference.unwrap();
+        let used = budget.borrow().used;
+        let (exact, _) = lower(
+            source,
+            LowerLimits {
+                max_work: used,
+                ..LowerLimits::default()
+            },
+        );
+        assert_eq!(exact.unwrap(), reference);
+        let (over, over_budget) = lower(
+            source,
+            LowerLimits {
+                max_work: used - 1,
+                ..LowerLimits::default()
+            },
+        );
+        let error = over.unwrap_err();
+        assert!(error.message.contains("IR lowering limit: expanded work"));
+        assert_eq!(over_budget.borrow().used, used - 1);
+        assert_eq!(over_budget.borrow().check().unwrap_err(), error);
+    }
+
+    #[test]
+    fn synchronous_ir_budget_template_refusal_precedes_later_interpolation_parsing() {
+        // Deliberately no Checker: the trailing interpolation is malformed.
+        // This small helper-level case proves staging is not all performed
+        // before admission. It is not a claim that malformed source is legal.
+        let (result, budget) = lower(
+            "fn value(): str { return `{1}{}` }",
+            LowerLimits {
+                max_work: 4,
+                ..LowerLimits::default()
+            },
+        );
+        let error = result.unwrap_err();
+        assert!(error.message.contains("IR lowering limit: expanded work"));
+        assert_eq!(budget.borrow().used, 4);
+        assert_eq!(budget.borrow().check().unwrap_err(), error);
+
+        // Also let the complete first interpolation lower before refusing the
+        // next staging step. Derive the cap from a legal single-part template,
+        // not from a guessed number of private lowering operations.
+        let (single, single_budget) =
+            lower("fn value(): str { return `{1}` }", LowerLimits::default());
+        single.unwrap();
+        let cap = single_budget.borrow().used;
+        assert!(cap > 4);
+        let (result, budget) = lower(
+            "fn value(): str { return `{1}{}` }",
+            LowerLimits {
+                max_work: cap,
+                ..LowerLimits::default()
+            },
+        );
+        let error = result.unwrap_err();
+        assert!(error.message.contains("IR lowering limit: expanded work"));
+        assert_eq!(budget.borrow().used, cap);
+        assert_eq!(budget.borrow().check().unwrap_err(), error);
+    }
+
+    #[test]
     fn synchronous_ir_budget_probe_failure_is_not_swallowed_or_replaced_by_later_error() {
         // No Checker: the second function intentionally has a lowering error.
         // Resource refusal in the first inference probe must win before it.

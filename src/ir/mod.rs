@@ -2132,90 +2132,114 @@ impl<'a> FunctionLowerer<'a> {
     /// Interpolations whose type `str()` can't render (e.g. a struct) fail loudly at
     /// build time rather than silently, upholding native==interpreter.
     fn lower_template_string(&mut self, raw: &str, span: Span) -> KuResult<IrExpr> {
-        let mut parts: Vec<Expr> = Vec::new();
-        let mut text = String::new();
+        // Keep only one shallow synthetic part at a time. A left-associated
+        // source AST would have interpolation-count depth before lower_expr
+        // could spend its work budget, including recursive destruction on Err.
+        // This is still the existing pairwise concat ABI, not a linear builder
+        // or a byte/RSS allocation bound.
+        let mut accumulator: Option<IrExpr> = None;
         let mut chars = raw.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\\' {
-                match chars.next() {
-                    Some(next @ ('{' | '}')) => text.push(next),
-                    Some(next) => {
-                        text.push('\\');
+        while let Some(&first) = chars.peek() {
+            // Admit staging before collecting or parsing this part, rather
+            // than collecting all interpolations before the first refusal.
+            self.budget.borrow_mut().spend(1, span)?;
+            let part = if first == '{' {
+                chars.next();
+                let mut source = String::new();
+                let mut found_end = false;
+                while let Some(inner) = chars.next() {
+                    if inner == '\\' {
+                        if let Some(next) = chars.next() {
+                            source.push('\\');
+                            source.push(next);
+                        }
+                        continue;
+                    }
+                    if inner == '}' {
+                        found_end = true;
+                        break;
+                    }
+                    source.push(inner);
+                }
+                if !found_end {
+                    return Err(KuError::runtime(
+                        "unterminated template interpolation",
+                        span,
+                    ));
+                }
+                if source.trim().is_empty() {
+                    return Err(KuError::runtime("empty template interpolation", span));
+                }
+                let tokens = crate::lexer::Lexer::new(&source).tokenize()?;
+                let expr = crate::parser::Parser::new(tokens).parse_expression_only()?;
+                crate::ast::reject_compiled_async_expression(
+                    &expr,
+                    "async/await is not supported by IR/native lowering yet",
+                )?;
+                // Retain ordinary str(...) resolution/conversion and all of
+                // its argument ownership, borrow-root and safepoint handling.
+                Expr::new(
+                    ExprKind::Call {
+                        callee: Box::new(Expr::new(ExprKind::Variable("str".to_string()), span)),
+                        args: vec![expr],
+                    },
+                    span,
+                )
+            } else {
+                let mut text = String::new();
+                while let Some(&next) = chars.peek() {
+                    if next == '{' {
+                        break;
+                    }
+                    chars.next();
+                    if next == '\\' {
+                        match chars.next() {
+                            Some(escaped @ ('{' | '}')) => text.push(escaped),
+                            Some(escaped) => {
+                                text.push('\\');
+                                text.push(escaped);
+                            }
+                            None => text.push('\\'),
+                        }
+                    } else {
                         text.push(next);
                     }
-                    None => text.push('\\'),
                 }
-                continue;
-            }
-            if ch != '{' {
-                text.push(ch);
-                continue;
-            }
-            if !text.is_empty() {
-                parts.push(Expr::new(
-                    ExprKind::Literal(Literal::String(std::mem::take(&mut text))),
-                    span,
-                ));
-            }
-            let mut source = String::new();
-            let mut found_end = false;
-            while let Some(inner) = chars.next() {
-                if inner == '\\' {
-                    if let Some(next) = chars.next() {
-                        source.push('\\');
-                        source.push(next);
+                Expr::new(ExprKind::Literal(Literal::String(text)), span)
+            };
+            accumulator = Some(if let Some(mut left) = accumulator {
+                // Pay for the synthetic Add before its snapshot/IR creation,
+                // preserving the ordinary binary expression's LHS-before-RHS
+                // sequence. A later ? or timeout still uses existing cleanup.
+                self.budget.borrow_mut().spend(1, span)?;
+                if !is_pure_append_argument(&part, "") {
+                    if left.ty == IrType::Str {
+                        left = self.snapshot_receiver_before_effects(left, true)?;
+                    } else if !ir_type_is_owned(&left.ty) {
+                        left = self.emit_temp(left)?;
                     }
-                    continue;
                 }
-                if inner == '}' {
-                    found_end = true;
-                    break;
-                }
-                source.push(inner);
-            }
-            if !found_end {
-                return Err(KuError::runtime(
-                    "unterminated template interpolation",
-                    span,
-                ));
-            }
-            if source.trim().is_empty() {
-                return Err(KuError::runtime("empty template interpolation", span));
-            }
-            let tokens = crate::lexer::Lexer::new(&source).tokenize()?;
-            let expr = crate::parser::Parser::new(tokens).parse_expression_only()?;
-            crate::ast::reject_compiled_async_expression(
-                &expr,
-                "async/await is not supported by IR/native lowering yet",
-            )?;
-            // `{expr}` -> `str(expr)` so the run-time value is stringified like the
-            // interpreter's `to_string()`.
-            parts.push(Expr::new(
-                ExprKind::Call {
-                    callee: Box::new(Expr::new(ExprKind::Variable("str".to_string()), span)),
-                    args: vec![expr],
-                },
+                let right = self.lower_expr(&part)?;
+                let ty = binary_type(BinaryOp::Add, &left.ty, &right.ty);
+                self.emit_temp(IrExpr {
+                    kind: IrExprKind::Binary {
+                        left: Box::new(left),
+                        op: BinaryOp::Add,
+                        right: Box::new(right),
+                    },
+                    ty,
+                })?
+            } else {
+                self.lower_expr(&part)?
+            });
+        }
+        match accumulator {
+            Some(value) => Ok(value),
+            None => self.lower_expr(&Expr::new(
+                ExprKind::Literal(Literal::String(String::new())),
                 span,
-            ));
+            )),
         }
-        if !text.is_empty() {
-            parts.push(Expr::new(ExprKind::Literal(Literal::String(text)), span));
-        }
-        let mut iter = parts.into_iter();
-        let mut acc = iter
-            .next()
-            .unwrap_or_else(|| Expr::new(ExprKind::Literal(Literal::String(String::new())), span));
-        for part in iter {
-            acc = Expr::new(
-                ExprKind::Binary {
-                    left: Box::new(acc),
-                    op: BinaryOp::Add,
-                    right: Box::new(part),
-                },
-                span,
-            );
-        }
-        self.lower_expr(&acc)
     }
 
     /// Lower the target of a value-position field read. A nested `Field` is built
