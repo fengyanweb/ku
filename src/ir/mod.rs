@@ -4776,6 +4776,11 @@ impl<'a> FunctionLowerer<'a> {
                     self.emit_safepoint()?;
                 }
                 None
+            } else if is_unknown_native_zero(&value) {
+                // This private inference-time zero is side-effect-free and
+                // carries no allocation. Preserve its tag across attempt-floor
+                // branches for concrete lifted-return resolution below.
+                Some(value)
             } else {
                 Some(self.emit_temp_with_safepoint(value, false)?)
             }
@@ -4941,8 +4946,9 @@ fn resolve_closure_safepoint_return_type(blocks: &mut [IrBlock], return_type: &I
         }
 
         if let IrTerminator::Return(Some(value)) = &mut block.terminator {
-            let timeout_zero =
-                block.name.starts_with("safepoint_timeout") && is_unknown_native_zero(value);
+            // Attempt-floor guards can change the block name. The private
+            // native-zero tag, not a user Unknown expression, is authoritative.
+            let timeout_zero = is_unknown_native_zero(value);
             let return_slot = matches!(
                 &value.kind,
                 IrExprKind::Local(name) if name.starts_with(RETURN_SLOT_PREFIX)
