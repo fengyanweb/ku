@@ -506,7 +506,7 @@ fn native_task_scope_ir_cleanup_and_unreachable_constructs_are_rejected() {
 }
 
 #[test]
-fn native_task_scope_ir_scoped_cycles_reject_suspend_await_and_empty_drain() {
+fn native_task_scope_ir_scoped_cycles_preserve_ownership_and_require_real_suspend() {
     let mut reentry = scoped();
     reentry.functions[0]
         .states
@@ -515,7 +515,12 @@ fn native_task_scope_ir_scoped_cycles_reject_suspend_await_and_empty_drain() {
         resume: StateId(0),
         cleanup: StateId(2),
     };
-    rejected(&reentry, "scope graph cannot contain a cycle or reentry");
+    // This old fixture also repeats ROOT Start(1) and Result(0) initialization.
+    // The inner drain clears neither: lifting the DAG gate must not accept it.
+    rejected(
+        &reentry,
+        "overwriting a possibly initialized owned slot without drop",
+    );
     let mut active = scoped();
     active.functions[0].states[0].terminator = TaskTerminator::Suspend {
         resume: StateId(3),
@@ -530,7 +535,8 @@ fn native_task_scope_ir_scoped_cycles_reject_suspend_await_and_empty_drain() {
             cleanup: StateId(2),
         },
     ));
-    rejected(&active, "scope graph cannot contain a cycle or reentry");
+    // An earlier Suspend does not guard this later Await-only self-cycle.
+    rejected(&active, "cycle without suspension is not supported");
     let mut empty = scoped();
     empty.functions[0].states[0].operations.truncate(3);
     empty.functions[0].states[0].operations.push(enter(0, &[]));
@@ -538,7 +544,7 @@ fn native_task_scope_ir_scoped_cycles_reject_suspend_await_and_empty_drain() {
     empty.functions[0]
         .states
         .push(state(vec![init_result(0)], exit(0)));
-    rejected(&empty, "scope graph cannot contain a cycle or reentry");
+    rejected(&empty, "cycle without suspension is not supported");
 }
 
 #[test]
@@ -660,4 +666,203 @@ fn native_task_scope_ir_budget_charges_members_scope_edges_and_storage() {
     };
     let error = verify_and_plan(&program, limits).unwrap_err(); // two declared members
     assert!(error.message.contains("operation limit exceeded"));
+}
+
+// Tests for the Suspend-only progress-cut slice. Slot schema is
+// deliberately shared; unused slots never acquire an owner.
+// 0 final Result; 1 Task; 2 Bool parameter; 3/4 Owned str; 5 Await Result.
+fn loop_program(states: Vec<TaskState>) -> TaskProgram {
+    TaskProgram {
+        functions: vec![
+            TaskFunction {
+                id: TaskFunctionId(0),
+                name: "ScopedLoop".into(),
+                parameters: vec![SlotId(2)],
+                slots: vec![
+                    value(result()),
+                    task(),
+                    value(IrType::Bool),
+                    value(IrType::Str),
+                    value(IrType::Str),
+                    value(result()),
+                ],
+                entry: StateId(0),
+                result: result(),
+                states,
+            },
+            leaf(),
+        ],
+    }
+}
+
+fn loop_branch(then_state: usize, else_state: usize) -> TaskTerminator {
+    TaskTerminator::Branch {
+        condition: SlotId(2),
+        then_state: StateId(then_state),
+        else_state: StateId(else_state),
+    }
+}
+
+fn loop_suspend(resume: usize, cleanup: usize) -> TaskTerminator {
+    TaskTerminator::Suspend {
+        resume: StateId(resume),
+        cleanup: StateId(cleanup),
+    }
+}
+
+fn loop_cleanup() -> TaskState {
+    state(
+        vec![drop_if(0), drop_if(3), drop_if(4), drop_if(5)],
+        TaskTerminator::Terminate,
+    )
+}
+
+fn loop_string(dst: usize) -> TaskOp {
+    TaskOp::Init {
+        dst: SlotId(dst),
+        value: TaskConstant::Str("loop-owned".into()),
+    }
+}
+
+#[test]
+fn native_task_scope_ir_loop_reenters_same_scope_and_task_slot_after_drain() {
+    let program = loop_program(vec![
+        state(vec![enter(0, &[1]), start(1)], drain(0, 1, 4)),
+        state(vec![], loop_suspend(2, 4)),
+        state(vec![], loop_branch(0, 3)),
+        state(vec![init_result(0)], exit(0)),
+        loop_cleanup(),
+    ]);
+    let plan = accepted(&program);
+    assert_eq!(
+        plan.functions[0].scopes,
+        vec![TaskScopeFrame {
+            scope: TaskScopeId(0),
+            task_mask: 1u64 << 1,
+        }]
+    );
+    assert_eq!(plan.functions[0].suspensions.len(), 2);
+    assert_eq!(accepted(&program), plan);
+}
+
+#[test]
+fn native_task_scope_ir_loop_rejects_enter_while_same_scope_is_active() {
+    let program = loop_program(vec![
+        state(vec![enter(0, &[])], loop_branch(1, 2)),
+        state(vec![], loop_suspend(0, 3)),
+        state(vec![init_result(0)], exit(0)),
+        loop_cleanup(),
+    ]);
+    rejected(&program, "normal join has different active scope stacks");
+}
+
+#[test]
+fn native_task_scope_ir_loop_rejects_ready_await_cycle_after_earlier_suspend() {
+    let program = loop_program(vec![
+        state(vec![enter(0, &[1])], loop_suspend(1, 5)),
+        state(
+            vec![start(1)],
+            TaskTerminator::Await {
+                task: SlotId(1),
+                dst: SlotId(5),
+                ready: StateId(2),
+                cleanup: StateId(5),
+            },
+        ),
+        state(vec![TaskOp::Drop { slot: SlotId(5) }], loop_branch(1, 3)),
+        state(vec![], drain(0, 4, 5)),
+        state(vec![init_result(0)], exit(0)),
+        loop_cleanup(),
+    ]);
+    // Start/Await/drop balance ownership. Only the lack of a Suspend on the
+    // 1 -> 2 -> 1 cycle should reject it, not an unrelated ownership error.
+    rejected(&program, "cycle without suspension is not supported");
+}
+
+#[test]
+fn native_task_scope_ir_loop_rejects_empty_drain_only_cycle() {
+    let program = loop_program(vec![
+        state(vec![enter(0, &[])], drain(0, 1, 3)),
+        state(vec![], loop_branch(0, 2)),
+        state(vec![init_result(0)], exit(0)),
+        loop_cleanup(),
+    ]);
+    rejected(&program, "cycle without suspension is not supported");
+}
+
+#[test]
+fn native_task_scope_ir_loop_drain_does_not_erase_owned_value_may_facts() {
+    let mut program = loop_program(vec![
+        state(vec![enter(0, &[]), loop_string(3)], drain(0, 1, 4)),
+        state(vec![], loop_suspend(2, 4)),
+        state(vec![], loop_branch(0, 3)),
+        state(vec![init_result(0)], exit(0)),
+        loop_cleanup(),
+    ]);
+    rejected(
+        &program,
+        "overwriting a possibly initialized owned slot without drop",
+    );
+    // Match the source lowerer's normal ready-edge cleanup responsibility.
+    program.functions[0].states[1].operations.push(drop_if(3));
+    accepted(&program);
+}
+
+#[test]
+fn native_task_scope_ir_loop_rejects_task_overwrite_but_can_hold_one_task_across_yields() {
+    let mut program = loop_program(vec![
+        state(vec![enter(0, &[1])], jump(1)),
+        state(vec![start(1)], loop_suspend(2, 5)),
+        state(vec![], loop_branch(1, 3)),
+        state(vec![], drain(0, 4, 5)),
+        state(vec![init_result(0)], exit(0)),
+        loop_cleanup(),
+    ]);
+    rejected(
+        &program,
+        "overwriting a possibly initialized owned slot without drop",
+    );
+    // ScopeEnter/Start once, then repeated suspension inside that scope is
+    // legal; balanced reentry does not imply every yield must pop the scope.
+    program.functions[0].states[0].operations.push(start(1));
+    program.functions[0].states[1].operations.clear();
+    let plan = accepted(&program);
+    let suspension = plan.functions[0]
+        .suspensions
+        .iter()
+        .find(|live| live.state == StateId(1))
+        .expect("loop suspension is planned");
+    assert!(suspension.slots.contains(&SlotId(1)));
+}
+
+#[test]
+fn native_task_scope_ir_loop_must_reaches_fixpoint_after_owned_move() {
+    let mut program = loop_program(vec![
+        state(vec![enter(0, &[])], jump(1)),
+        state(
+            vec![read(3), moved(3, 4), TaskOp::Drop { slot: SlotId(4) }],
+            loop_suspend(2, 5),
+        ),
+        state(vec![], loop_branch(1, 3)),
+        state(vec![], drain(0, 4, 5)),
+        state(vec![init_result(0)], exit(0)),
+        loop_cleanup(),
+    ]);
+    program.functions[0].parameters.push(SlotId(3));
+    rejected(
+        &program,
+        "read, move or drop of a slot that is not definitely initialized",
+    );
+    // The initial parameter is insufficient after a backedge; explicit
+    // regeneration restores MUST and the carried owner is saved at Suspend.
+    program.functions[0].states[1]
+        .operations
+        .push(loop_string(3));
+    let plan = accepted(&program);
+    let suspension = plan.functions[0]
+        .suspensions
+        .iter()
+        .find(|live| live.state == StateId(1))
+        .expect("loop suspension is planned");
+    assert!(suspension.slots.contains(&SlotId(3)));
 }

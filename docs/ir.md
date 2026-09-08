@@ -167,10 +167,11 @@ return/fail/? 统一生成 Exit，清理桥接见下节；Complete 仅保留内�
 取消区域不能回正常区域、Complete、Exit、Start、Await
 或 Suspend；本片也拒绝 cleanup 中可能溢出的 Negate 和算术
 Binary，避免算术失败覆盖原取消/超时原因；总是有限且不失败的 Not/比较仍可用于内部
-cleanup IR。无 Scope 的内部图中，每个环必须经过无条件返回本次 poll 的 `Suspend`；
+cleanup IR。内部图中，每个环必须经过无条件返回本次 poll 的 `Suspend`；
 `Await` 虽然是存储/liveness 边界，但已就绪或 `INLINE_FAILED` 可在同一 poll 内继续，
 不能单独作为协作进度保证。新增遍历的 Await 边计入既有分析预算，不扩大限额。
-带 Scope 的图仍须为 DAG；cleanup 中所有环仍被拒绝。
+带 Scope 的图使用相同进度规则，原图上的作用域栈与所有权不动点仍须验证；cleanup
+中所有环仍被拒绝。这个结构规则不保证任意用户循环最终结束或得到固定性能。
 它不是完整语言的 finally/异常或任意 Await 组合 verifier，也不开放源码循环。
 
 内部硬限为 64 函数、每函数 64 槽 / 256 状态、全程序 4096 操作、1,000,000 字面量
@@ -526,9 +527,11 @@ runtime 栈、不启动期限。Task 集合最多64槽且互不重叠；未声�
 
 `ScopeDrain { scope, ready, cleanup }` 只能关闭当前最内层作用域，ready 只清该集合
 的 Task 初始化事实，取消边清全部 Task，之后才进入有限 Value cleanup。普通汇合
-必须拥有完全相同的作用域栈；Exit 可以保留活动作用域，交最终退出桥接。首片 scoped
-CFG 全图必须是 DAG，即使经过 Suspend/Await 也不允许环；空或立即 ACK 的 ScopeDrain
-不是强制挂起，不能作为无限空作用域循环的进度保证。无 scope 的旧图规则保持不变。
+必须拥有完全相同的作用域栈；Exit 可以保留活动作用域，交最终退出桥接。
+仅切断 Suspend 出边后的 CFG 全图必须是 DAG；Await 与空或立即 ACK 的 ScopeDrain
+不是强制挂起，不能单独作为循环进度保证。作用域可在正常 drain 后经 Suspend 重新
+进入，同一静态 ScopeId 不代表同一运行时 session；活动作用域重入仍拒绝。原图
+继续执行 MUST/MAY 与保存集不动点，不能借 drain 清除仍存活的 Owned Value 事实。
 新边界两侧所需 Copy 值真实持久化，任何可能初始化的 borrowed 槽不得跨界；成员、
 布局、图遍历和保存集扫描均先计入原分析预算，不扩大原硬限。
 

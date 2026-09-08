@@ -919,11 +919,11 @@ fn validate_regions_and_progress(
             _ => return Err(invalid("cleanup cannot complete or suspend")),
         }
     }
-    // Legacy cycles must cross an unconditional frame return: only Suspend
+    // Every cycle must cross an unconditional frame return: only Suspend
     // guarantees that. Await may consume an already-ready/INLINE_FAILED value
     // and continue dispatching in this same poll, so it is not a progress cut.
-    // Scoped graphs stay DAGs even across Suspend: no scope reentry yet.
-    // ScopeDrain therefore remains outside the legacy cycle permission.
+    // ScopeDrain can also be immediately ready and is not a progress cut.
+    // Scope stacks and carried ownership are checked on the original graph.
     if scoped {
         budget.spend_many(count)?;
     }
@@ -932,7 +932,7 @@ fn validate_regions_and_progress(
         if scoped {
             budget.spend()?;
         }
-        if !scoped && matches!(state.terminator, TaskTerminator::Suspend { .. }) {
+        if matches!(state.terminator, TaskTerminator::Suspend { .. }) {
             continue;
         }
         for target in successors(&state.terminator).into_iter().flatten() {
@@ -954,12 +954,10 @@ fn validate_regions_and_progress(
     while let Some(id) = ready.pop_front() {
         budget.spend()?;
         visited += 1;
-        if !scoped
-            && matches!(
-                function.states[id].terminator,
-                TaskTerminator::Suspend { .. }
-            )
-        {
+        if matches!(
+            function.states[id].terminator,
+            TaskTerminator::Suspend { .. }
+        ) {
             continue;
         }
         for target in successors(&function.states[id].terminator)
@@ -979,11 +977,7 @@ fn validate_regions_and_progress(
         }
     }
     if visited != count {
-        return Err(invalid(if scoped {
-            "scope graph cannot contain a cycle or reentry"
-        } else {
-            "cycle without suspension is not supported"
-        }));
+        return Err(invalid("cycle without suspension is not supported"));
     }
     Ok(normal)
 }

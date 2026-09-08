@@ -883,3 +883,611 @@ int main(void) {
   puts("task-scope-adapter-ok"); return 0;
 }
 "#;
+
+fn scope_loop_frames() -> TaskProgram {
+    let mut program = TaskProgram { functions: vec![] };
+    program.functions.push(TaskFunction {
+        id: TaskFunctionId(0),
+        name: "RepeatedScope".into(),
+        entry: StateId(0),
+        parameters: vec![SlotId(0)],
+        result: result(IrType::Null),
+        slots: vec![
+            value(IrType::Str),
+            value(IrType::Int),
+            value(IrType::Int),
+            value(IrType::Int),
+            value(IrType::Bool),
+            task(),
+            task(),
+            value(IrType::Str),
+            value(result(IrType::Null)),
+            value(IrType::Str),
+            value(IrType::Str),
+            value(IrType::Int),
+            value(IrType::Int), // 12: nonpersistent checked-add temporary
+        ],
+        states: vec![
+            state(
+                vec![
+                    init(1, 0),
+                    init(2, 1),
+                    init(3, 2),
+                    init(11, -1),
+                    TaskOp::Init {
+                        dst: SlotId(10),
+                        value: TaskConstant::Str("outer".into()),
+                    },
+                    TaskOp::Start {
+                        dst: SlotId(5),
+                        function: TaskFunctionId(1),
+                        arguments: vec![SlotId(10), SlotId(11)],
+                    },
+                ],
+                TaskTerminator::Jump { target: StateId(1) },
+            ),
+            state(
+                vec![
+                    TaskOp::ScopeEnter {
+                        scope: TaskScopeId(0),
+                        tasks: vec![SlotId(6)],
+                    },
+                    TaskOp::Init {
+                        dst: SlotId(7),
+                        value: TaskConstant::Str("round-child".into()),
+                    },
+                    TaskOp::Init {
+                        dst: SlotId(9),
+                        value: TaskConstant::Str("round-local".into()),
+                    },
+                    TaskOp::Start {
+                        dst: SlotId(6),
+                        function: TaskFunctionId(1),
+                        arguments: vec![SlotId(7), SlotId(1)],
+                    },
+                ],
+                TaskTerminator::ScopeDrain {
+                    scope: TaskScopeId(0),
+                    ready: StateId(2),
+                    cleanup: StateId(5),
+                },
+            ),
+            state(
+                vec![
+                    TaskOp::Drop { slot: SlotId(9) },
+                    TaskOp::Binary {
+                        dst: SlotId(12),
+                        op: TaskBinaryOp::Add,
+                        left: SlotId(1),
+                        right: SlotId(2),
+                    },
+                    TaskOp::Copy {
+                        dst: SlotId(1),
+                        src: SlotId(12),
+                    },
+                ],
+                TaskTerminator::Suspend {
+                    resume: StateId(3),
+                    cleanup: StateId(5),
+                },
+            ),
+            state(
+                vec![TaskOp::Binary {
+                    dst: SlotId(4),
+                    op: TaskBinaryOp::Less,
+                    left: SlotId(1),
+                    right: SlotId(3),
+                }],
+                TaskTerminator::Branch {
+                    condition: SlotId(4),
+                    then_state: StateId(1),
+                    else_state: StateId(4),
+                },
+            ),
+            state(
+                vec![TaskOp::Init {
+                    dst: SlotId(8),
+                    value: TaskConstant::Ok(Box::new(TaskConstant::Null)),
+                }],
+                TaskTerminator::Exit { value: SlotId(8) },
+            ),
+            state(
+                [0, 7, 8, 9, 10]
+                    .map(|slot| TaskOp::DropIfInit { slot: SlotId(slot) })
+                    .to_vec(),
+                TaskTerminator::Terminate,
+            ),
+        ],
+    });
+    program.functions.push(TaskFunction {
+        id: TaskFunctionId(1),
+        name: "RepeatedChild".into(),
+        entry: StateId(0),
+        parameters: vec![SlotId(0), SlotId(1)],
+        result: result(IrType::Null),
+        slots: vec![
+            value(IrType::Str),
+            value(IrType::Int),
+            value(result(IrType::Null)),
+        ],
+        states: vec![state(
+            vec![TaskOp::Init {
+                dst: SlotId(2),
+                value: TaskConstant::Ok(Box::new(TaskConstant::Null)),
+            }],
+            TaskTerminator::Exit { value: SlotId(2) },
+        )],
+    });
+    program
+}
+
+#[test]
+fn native_task_scope_adapter_same_scope_two_rounds_and_second_round_cancel_in_c() {
+    // Internal IR only. This requires the separately reviewed Suspend-only
+    // cycle rule; no source loop syntax or verifier bypass is introduced here.
+    let ast = Parser::new(
+        Lexer::new("fn main(): null! { return ok(null) }")
+            .lex()
+            .unwrap(),
+    )
+    .parse_program()
+    .unwrap();
+    Checker::new().check(&ast).unwrap();
+    let sync = ir::lower_program(&ast).unwrap();
+    let tasks = scope_loop_frames();
+    let plan = verify_and_plan(&tasks, TaskLimits::default()).unwrap();
+    assert_eq!(
+        plan.functions[0].scopes,
+        vec![TaskScopeFrame {
+            scope: TaskScopeId(0),
+            task_mask: 1 << 6,
+        }]
+    );
+    assert_eq!(plan.functions[0].scope_task_mask, (1 << 5) | (1 << 6));
+    for slot in [0, 1, 2, 3, 5, 6, 7, 9] {
+        assert!(plan.functions[0].slots.contains(&SlotId(slot)));
+    }
+    let mut generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
+    assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 4u"));
+    assert!(generated.contains("#define KU_TASK_DRIVER_ABI_VERSION 6u"));
+    for forbidden in ["run_source", "const SOURCE"] {
+        assert!(!generated.contains(forbidden));
+    }
+    let ledger = replace_once(
+        LOCKED_ALLOCATIONS.to_owned(),
+        "ku_perf_free(p);",
+        "loop_record_free(p); ku_perf_free(p);",
+    );
+    let instrumentation = format!(
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n\
+         static void loop_record_free(void*);\n{ledger}\n\
+         static int loop_parent_hold(void*);\nstatic void loop_started(void*);\n\
+         static void loop_latch(void*);\nstatic void loop_continued(void*,uint64_t);\n\
+         static uint32_t loop_child_hold(void*,int);\nstatic void loop_string_drop(void*);\n"
+    );
+    generated = replace_once(
+        generated,
+        "typedef struct KuString {",
+        &format!("{instrumentation}typedef struct KuString {{"),
+    );
+    generated = replace_once(
+        generated,
+        "static uint64_t ku_task_driver_now_ms(void) {",
+        &format!("{CLOCK_HOOK}\nstatic uint64_t fixture_original_now(void) {{"),
+    );
+    let parent = "static uint32_t ku_task_0_resume(void* raw) {";
+    generated = replace_once(
+        generated,
+        parent,
+        &format!("{parent}\n  if (loop_parent_hold(raw)) return KU_TASK_CONTROL_PENDING;"),
+    );
+    let started = "  { uint32_t started=ku_task_1_start_hosted((const KuTaskAdapterHostV1*)clock->host, &frame->s_7, &frame->s_1, &frame->s_6);\n  if (started!=KU_TASK_DRIVER_OK) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; } }";
+    generated = replace_once(
+        generated,
+        started,
+        &format!("{started}\n  loop_started(frame);"),
+    );
+    generated = replace_once(
+        generated,
+        "ku_task_state_3:;",
+        "ku_task_state_3:;\n  loop_latch(frame);",
+    );
+    let continued = "status=ku_task_frame_0_scope_continue(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION,descriptor->scope_id);\n  if (status!=KU_TASK_FRAME_OK) return status;";
+    generated = replace_once(
+        generated,
+        continued,
+        &format!("{continued}\n  loop_continued(instance,descriptor->scope_id);"),
+    );
+    for (entry, cleanup) in [
+        ("static uint32_t ku_task_1_resume(void* raw) {", 0),
+        ("static uint32_t ku_task_1_cleanup(void* raw, uint32_t reason, KuTaskControlV1* budget) {", 1),
+    ] {
+        generated = replace_once(generated, entry, &format!(
+            "{entry}\n  uint32_t held=loop_child_hold(raw,{cleanup});\n  if (held!=UINT32_MAX) return held;"));
+    }
+    generated = replace_once(
+        generated,
+        "static void ku_string_drop(KuString* value) {",
+        "static void ku_string_drop(KuString* value) {\n  loop_string_drop(value);",
+    );
+    generated = replace_once(generated, "static uint32_t ku_task_driver_owner_drop_receipt(\n",
+        "static uint32_t ku_task_driver_owner_drop_receipt(const KuTaskDriverTicketV1*,KuTaskControlOwnerV1*,uint64_t,KuTaskDriverCleanupReceiptV1*);\nstatic uint32_t loop_real_owner_drop_receipt(\n");
+    generated = replace_once(
+        generated,
+        "int main(void) {",
+        "static int loop_original_main(void) {",
+    );
+    generated.push_str(SCOPE_LOOP_C_MAIN);
+    let directory = TempDir::new("native-task-scope-loop");
+    let path = directory.path().join("program.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "program") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must execute real repeated-scope adapter paths"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .expect("scope rounds must finish under the existing process watchdog");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-scope-loop-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+const SCOPE_LOOP_C_MAIN: &str = r#"
+/* Fake time chooses D comparisons, not timer responsiveness. Each event and
+ * OS join retains 2s; frozen-clock wait_idle/shutdown also have the existing
+ * real 20s process watchdog. No scope/phase/receipt/ACK is fabricated. */
+static unsigned loop_mode,loop_starts,loop_closed,loop_latches,loop_local_drops;
+static unsigned loop_child_drops[3],loop_transfers[3],loop_held_free;
+static uintptr_t loop_held_id;
+static KuAtomicRefcount loop_release,loop_allow;
+static KuTestEvent loop_parked[3],loop_closed_event[2];
+static KuTaskInstance_0* loop_parent;
+static KuTaskInstance_1* loop_instances[3];
+static KuTaskDriverTicketV1 loop_children[3];
+static KuTaskControlLeaseV1 loop_observers[3];
+static KuTaskDriverCleanupReceiptV1 loop_receipts[3];
+static KuTaskDriverScopeTokenV1 loop_tokens[2];
+static KuTaskDriverWaitTokenV1 loop_waits[2];
+static uint64_t loop_deadlines[2],loop_cancel_deadline;
+
+static int loop_empty_string(KuString value) {
+  return !value.ptr && !value.len && !value.capacity && !value.storage;
+}
+static int loop_empty_result(KuResult_null value) {
+  return !value.ok && !value.value && loop_empty_string(value.error.domain)
+      && loop_empty_string(value.error.code) && loop_empty_string(value.error.message);
+}
+static void loop_record_free(void* pointer) {
+  if (pointer && (uintptr_t)pointer==loop_held_id) {
+    CHECK(!loop_held_free++);
+    CHECK(loop_transfers[2]==1u); /* Outer owner handed off before Value free. */
+  }
+}
+static void loop_string_drop(void* raw) {
+  if (!raw) return;
+  if (loop_parent && raw==&loop_parent->frame.s_9
+      && !loop_empty_string(loop_parent->frame.s_9)) {
+    CHECK(loop_local_drops<2u);
+    if (loop_mode && loop_starts==2u) CHECK(loop_transfers[2]==1u);
+    else CHECK(loop_closed==loop_local_drops+1u);
+    loop_local_drops++;
+  }
+  for (size_t i=0;i<3u;i++) if (loop_instances[i] && raw==&loop_instances[i]->frame.s_0
+      && !loop_empty_string(loop_instances[i]->frame.s_0)) {
+    CHECK(!loop_child_drops[i]++ && loop_transfers[i]==1u);
+  }
+}
+static unsigned loop_register(KuTaskInstance_1* child) {
+  int64_t id=child->frame.s_1; CHECK(id>=-1 && id<=1);
+  unsigned index=id<0 ? 2u : (unsigned)id;
+  if (!loop_children[index].driver) {
+    loop_children[index]=child->ticket; loop_instances[index]=child;
+    KuTaskDriverV1* driver=child->ticket.driver;
+    CHECK(!ku_task_driver_lock(driver));
+    KuTaskDriverSlotV1* slot=ku_task_driver_find(&child->ticket);
+    CHECK(slot && slot->binding==&child->control && slot->driver_lease.control==&child->control);
+    CHECK(ku_task_control_lease_retain(&slot->driver_lease,&loop_observers[index])==KU_TASK_CONTROL_OK);
+    CHECK(!ku_task_driver_unlock(driver));
+  }
+  CHECK(loop_instances[index]==child); return index;
+}
+static int loop_parent_hold(void* raw) {
+  KuTaskInstance_0* parent=(KuTaskInstance_0*)raw;
+  if (!loop_parent) loop_parent=parent;
+  CHECK(loop_parent==parent);
+  if (parent->frame.header.status==KU_TASK_FRAME_PENDING && parent->frame.header.state==2u
+      && ku_task_control_atomic_load(&loop_allow)<loop_closed) {
+    CHECK(ku_task_driver_set_intent(&parent->ticket,KU_TASK_DRIVER_WAIT)==KU_TASK_DRIVER_OK);
+    return 1;
+  }
+  return 0;
+}
+static void loop_started(void* raw) {
+  KuTaskFrame_0* frame=(KuTaskFrame_0*)raw;
+  CHECK(loop_parent && frame==&loop_parent->frame && loop_starts<2u);
+  CHECK(frame->s_1==(int64_t)loop_starts && loop_closed==loop_starts
+      && loop_latches==loop_starts && loop_local_drops==loop_starts);
+  CHECK(!loop_held_free && !loop_empty_string(frame->s_9) && loop_empty_string(frame->s_7));
+  CHECK(frame->s_5.tag==KU_TASK_VALUE_LIVE
+      && ku_task_control_atomic_load(&frame->s_5.owner.lease.control->phase)==KU_TASK_CONTROL_LIVE);
+  CHECK(frame->s_6.tag==KU_TASK_VALUE_LIVE);
+  unsigned index=loop_register((KuTaskInstance_1*)frame->s_6.owner.lease.control);
+  CHECK(index==loop_starts);
+  if (index) {
+    CHECK(loop_children[1].slot==loop_children[0].slot
+        && loop_children[1].generation>loop_children[0].generation);
+    CHECK(ku_task_driver_cleanup_receipt_read(&loop_receipts[0])==KU_TASK_DRIVER_CLEANUP_ACK);
+  }
+  loop_starts++;
+}
+static void loop_latch(void* raw) {
+  KuTaskFrame_0* frame=(KuTaskFrame_0*)raw;
+  CHECK(frame==&loop_parent->frame && loop_latches<2u);
+  CHECK(frame->s_1==(int64_t)(loop_latches+1u) && loop_closed==loop_latches+1u);
+  CHECK(loop_local_drops==loop_closed && loop_empty_string(frame->s_9)
+      && !(frame->header.initialized&(UINT64_C(1)<<9)));
+  CHECK(!loop_held_free); loop_latches++;
+}
+static uint32_t loop_child_hold(void* raw,int cleanup) {
+  KuTaskInstance_1* child=(KuTaskInstance_1*)raw;
+  unsigned index=loop_register(child);
+  if (cleanup && (ku_task_control_atomic_load(&loop_release)&((size_t)1u<<index)))
+    return UINT32_MAX;
+  CHECK(ku_task_driver_set_intent(&child->ticket,KU_TASK_DRIVER_WAIT)==KU_TASK_DRIVER_OK);
+  if (cleanup) CHECK(ku_test_event_set(&loop_parked[index]));
+  return KU_TASK_CONTROL_PENDING;
+}
+static uint32_t ku_task_driver_owner_drop_receipt(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlOwnerV1* owner,uint64_t deadline,KuTaskDriverCleanupReceiptV1* receipt) {
+  unsigned index=loop_register((KuTaskInstance_1*)owner->lease.control);
+  CHECK(!loop_transfers[index] && loop_parent);
+  CHECK(receipt==&loop_parent->receipts[index==2u ? 0u : 1u]);
+  if (index<2u) {
+    CHECK(loop_parent->scope_mode==1u && loop_parent->scope_expected_mask==2u);
+    loop_tokens[index]=loop_parent->scope_token; loop_deadlines[index]=deadline;
+    CHECK(loop_tokens[index].scope_id==0u && loop_tokens[index].driver==ticket->driver);
+    CHECK(!ku_task_driver_lock(ticket->driver));
+    KuTaskDriverSlotV1* registered=ku_task_driver_find(&loop_parent->ticket);
+    CHECK(registered && registered->scope_session_active && !registered->scope_session_final
+        && registered->scope_receipts==loop_parent->receipts && registered->scope_expected_mask==2u
+        && registered->scope_session_epoch==loop_tokens[index].epoch);
+    CHECK(!ku_task_driver_unlock(ticket->driver));
+    if (index) {
+      CHECK(loop_tokens[1].epoch>loop_tokens[0].epoch
+          && loop_tokens[1].parent_generation==loop_tokens[0].parent_generation);
+      CHECK(deadline>loop_deadlines[0]);
+      KuTaskDriverScopeTokenV1 old=loop_tokens[0];
+      CHECK(ku_task_driver_scope_end(&loop_parent->ticket,&old)==KU_TASK_DRIVER_STALE);
+      CHECK(old.driver==loop_tokens[0].driver && old.epoch==loop_tokens[0].epoch);
+      KuTaskDriverWaitTokenV1 rejected={0};
+      CHECK(ku_task_driver_cleanup_wait_arm(&loop_parent->ticket,&loop_receipts[0],deadline,
+          &rejected)==KU_TASK_DRIVER_INVALID_ARGUMENT && !rejected.driver);
+    }
+  } else if (loop_mode) {
+    CHECK(loop_parent->scope_mode==2u && loop_parent->scope_expected_mask==3u
+        && loop_parent->scope_token.epoch==loop_tokens[1].epoch);
+    CHECK(deadline==loop_cancel_deadline && loop_closed==1u);
+    CHECK(loop_parent->receipts[1].generation==loop_receipts[1].generation);
+  } else CHECK(loop_closed==2u && !loop_parent->scope_mode);
+  uint32_t status=loop_real_owner_drop_receipt(ticket,owner,deadline,receipt);
+  CHECK(status==KU_TASK_DRIVER_OK && !owner->lease.control);
+  loop_receipts[index]=*receipt; loop_transfers[index]++;
+  if (index==1u) {
+    KuTaskControlV1* control=loop_observers[1].control;
+    uint64_t before=ku_task_control_cleanup_deadline(control);
+    CHECK(before==deadline);
+    CHECK(ku_task_driver_cancel_receipt(&loop_receipts[0],deadline-500u)==KU_TASK_DRIVER_CLEANUP_ACK);
+    CHECK(ku_task_control_cleanup_deadline(control)==before);
+  }
+  return status;
+}
+static void loop_continued(void* raw,uint64_t scope) {
+  KuTaskInstance_0* parent=(KuTaskInstance_0*)raw;
+  unsigned index=loop_closed; CHECK(parent==loop_parent && scope==0u && index<2u);
+  CHECK(!loop_mode || !index);
+  CHECK(loop_starts==index+1u && loop_latches==index && loop_local_drops==index);
+  CHECK(parent->frame.header.status==KU_TASK_FRAME_PENDING && parent->frame.header.state==2u);
+  CHECK(!parent->scope_token.driver && !parent->receipt_mask && !parent->wait.driver);
+  CHECK(parent->scope_issued_mask==2u && parent->scope_expected_mask==2u);
+  CHECK(ku_task_driver_cleanup_receipt_read(&loop_receipts[index])==KU_TASK_DRIVER_CLEANUP_ACK);
+  CHECK(loop_child_drops[index]==1u && loop_observers[index].control->frame_destroyed
+      && loop_empty_string(loop_instances[index]->frame.s_0));
+  KuTaskDriverWaitSnapshotV1 untouched={0}; untouched.state=77u;
+  CHECK(ku_task_driver_wait_read(&loop_waits[index],&untouched)==KU_TASK_DRIVER_STALE && untouched.state==77u);
+  CHECK(!loop_held_free && loop_transfers[2]==0u);
+  KuTaskDriverV1* driver=parent->ticket.driver;
+  CHECK(!ku_task_driver_lock(driver));
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(&parent->ticket);
+  CHECK(slot && !slot->scope_session_active && !slot->scope_receipts
+      && !slot->scope_wait_started && slot->scope_wait_deadline==UINT64_MAX);
+  CHECK(!ku_task_driver_unlock(driver));
+  loop_closed++; CHECK(ku_test_event_set(&loop_closed_event[index]));
+}
+static KuTaskDriverSnapshotV1 loop_idle(KuTaskDriverV1* driver) {
+  CHECK(ku_task_driver_wait_idle(driver,ku_task_driver_now_ms()+2000u)==KU_TASK_DRIVER_OK);
+  KuTaskDriverSnapshotV1 out={0};
+  CHECK(ku_task_driver_snapshot(driver,&out)==KU_TASK_DRIVER_OK);
+  CHECK(!out.running && !out.queued && !out.building && !out.fault && !out.clock_fault);
+  CHECK(out.worker_waiting || out.worker_exited); return out;
+}
+static void loop_release_child(unsigned index) {
+  ku_task_control_atomic_store(&loop_release,
+      ku_task_control_atomic_load(&loop_release)|((size_t)1u<<index));
+  CHECK(ku_task_driver_wake(&loop_children[index])==KU_TASK_DRIVER_OK);
+}
+static void loop_pending(KuTaskValueV1* root) {
+  KuTaskAdapterOutcomeV1 outcome={0};
+  CHECK(ku_task_value_take(root,NULL,&outcome)==KU_TASK_CONTROL_PENDING);
+  CHECK(ku_task_outcome_empty(&outcome,3u)); loop_idle(root->ticket.driver);
+}
+static void loop_capture_wait(unsigned index) {
+  loop_waits[index]=loop_parent->wait;
+  CHECK(loop_waits[index].driver && loop_parent->scope_token.epoch==loop_tokens[index].epoch);
+  if (index) CHECK(loop_waits[1].epoch>loop_waits[0].epoch);
+  KuTaskDriverWaitSnapshotV1 wait={0};
+  CHECK(ku_task_driver_wait_read(&loop_waits[index],&wait)==KU_TASK_DRIVER_OK);
+  CHECK(wait.kind==KU_TASK_DRIVER_WAIT_KIND_CLEANUP_ACK && wait.state==KU_TASK_DRIVER_WAIT_ARMED
+      && wait.child_slot==loop_children[index].slot && wait.child_generation==loop_children[index].generation);
+}
+static void loop_case(unsigned mode) {
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
+  loop_mode=mode; loop_starts=loop_closed=loop_latches=loop_local_drops=loop_held_free=0;
+  loop_parent=NULL; loop_held_id=0; loop_cancel_deadline=0;
+  memset(loop_instances,0,sizeof(loop_instances)); memset(loop_children,0,sizeof(loop_children));
+  memset(loop_observers,0,sizeof(loop_observers)); memset(loop_receipts,0,sizeof(loop_receipts));
+  memset(loop_tokens,0,sizeof(loop_tokens)); memset(loop_waits,0,sizeof(loop_waits));
+  memset(loop_deadlines,0,sizeof(loop_deadlines)); memset(loop_transfers,0,sizeof(loop_transfers));
+  memset(loop_child_drops,0,sizeof(loop_child_drops));
+  ku_task_control_atomic_store(&loop_release,0); ku_task_control_atomic_store(&loop_allow,0);
+  for (size_t i=0;i<3u;i++) CHECK(ku_test_event_init(&loop_parked[i]));
+  for (size_t i=0;i<2u;i++) CHECK(ku_test_event_init(&loop_closed_event[i]));
+  uint64_t base=ku_test_real_now_ms()+100000u;
+  ku_task_control_deadline_store(&fixture_clock,base);
+  KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
+  KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(3,sizeof(*slots));
+  size_t* ring=(size_t*)calloc(3,sizeof(*ring)); CHECK(driver && slots && ring);
+  size_t fixed=sizeof(*driver)+3u*(sizeof(*slots)+sizeof(*ring));
+  CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,slots,3,ring,3,
+      fixed+sizeof(KuTaskInstance_0)+2u*sizeof(KuTaskInstance_1)+37u)==KU_TASK_DRIVER_OK);
+  uint8_t* bytes=(uint8_t*)malloc(37u); CHECK(bytes); memcpy(bytes,"carried",7u);
+  loop_held_id=(uintptr_t)bytes; KuString carried={bytes,7u,37u,KU_STRING_OWNED};
+  KuTaskValueV1 root={0};
+  CHECK(ku_task_0_start_value(driver,&carried,&root)==KU_TASK_DRIVER_OK && root.tag==KU_TASK_VALUE_LIVE);
+  CHECK(loop_empty_string(carried));
+  CHECK(ku_test_event_wait(&loop_parked[0],2000u)); loop_idle(driver);
+  CHECK(loop_starts==1u && !loop_closed && !loop_latches && !loop_held_free);
+  CHECK(loop_deadlines[0]==base+1000u); loop_capture_wait(0u); loop_pending(&root);
+  for (unsigned repeat=0;repeat<3u;repeat++) {
+    CHECK(ku_task_driver_wake(&root.ticket)==KU_TASK_DRIVER_OK); loop_idle(driver);
+    CHECK(loop_starts==1u && loop_parent->wait.epoch==loop_waits[0].epoch
+        && loop_parent->scope_token.epoch==loop_tokens[0].epoch && !loop_local_drops);
+  }
+  loop_release_child(0u);
+  CHECK(ku_test_event_wait(&loop_closed_event[0],2000u)); loop_idle(driver);
+  CHECK(loop_closed==1u && !loop_latches && !loop_parent->scope_mode && !loop_parent->drain_started);
+  for (size_t i=0;i<2u;i++) CHECK(ku_task_driver_scope_receipt_empty(&loop_parent->receipts[i]));
+  CHECK(!loop_local_drops && !loop_held_free);
+  /* Real observer release physically returns the only free child slot before
+   * permitting the generated latch/Suspend/backedge, forcing ABA reuse. */
+  loop_instances[0]=NULL;
+  CHECK(ku_task_control_lease_release(&loop_observers[0])==KU_TASK_CONTROL_OK);
+  CHECK(!ku_task_driver_lock(driver));
+  CHECK(!ku_task_driver_find(&loop_children[0]) && driver->resident==2u);
+  CHECK(!ku_task_driver_unlock(driver));
+  ku_task_control_deadline_store(&fixture_clock,base+200u);
+  ku_task_control_atomic_store(&loop_allow,1u);
+  CHECK(ku_task_driver_wake(&root.ticket)==KU_TASK_DRIVER_OK);
+  CHECK(ku_test_event_wait(&loop_parked[1],2000u)); loop_idle(driver);
+  CHECK(loop_starts==2u && loop_closed==1u && loop_latches==1u && loop_local_drops==1u);
+  CHECK(loop_deadlines[1]==base+1200u && !loop_held_free);
+  loop_capture_wait(1u); loop_pending(&root);
+  KuTaskDriverWaitSnapshotV1 old_snapshot={0}; old_snapshot.state=91u;
+  CHECK(ku_task_driver_wait_read(&loop_waits[0],&old_snapshot)==KU_TASK_DRIVER_STALE
+      && old_snapshot.state==91u);
+  KuTaskDriverWaitTokenV1 old_wait=loop_waits[0];
+  CHECK(ku_task_driver_wait_detach(&old_wait)==KU_TASK_DRIVER_STALE);
+  CHECK(loop_parent->wait.epoch==loop_waits[1].epoch);
+  KuTaskControlV1* control=root.owner.lease.control;
+  KuTaskAdapterOutcomeV1 outcome={0};
+  if (!mode) {
+    loop_release_child(1u);
+    CHECK(ku_test_event_wait(&loop_closed_event[1],2000u)); loop_idle(driver);
+    CHECK(loop_closed==2u && loop_latches==1u && loop_local_drops==1u && !loop_held_free);
+    ku_task_control_deadline_store(&fixture_clock,base+400u);
+    ku_task_control_atomic_store(&loop_allow,2u);
+    CHECK(ku_task_driver_wake(&root.ticket)==KU_TASK_DRIVER_OK);
+    CHECK(ku_test_event_wait(&loop_parked[2],2000u)); loop_idle(driver);
+    CHECK(loop_latches==2u && loop_local_drops==2u && loop_held_free==1u);
+    CHECK(loop_parent->payload_initialized && !loop_parent->frame.header.result_initialized);
+    CHECK(ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_LIVE);
+    loop_pending(&root); loop_release_child(2u); loop_idle(driver);
+    CHECK(ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_COMPLETED);
+    CHECK(ku_task_value_take(&root,NULL,&outcome)==KU_TASK_CONTROL_OK);
+    CHECK(outcome.result_kind==3u && outcome.exit_class==KU_TASK_EXIT_USER_RESULT
+        && outcome.value.null_value.ok && !outcome.has_cleanup_deadline && !outcome.cleanup_deadline);
+  } else {
+    loop_cancel_deadline=base+700u;
+    CHECK(ku_task_driver_request_cancel(&root.ticket,&root.owner.lease,KU_TASK_CONTROL_CANCELLED,
+        loop_cancel_deadline)==KU_TASK_CONTROL_OK);
+    CHECK(ku_test_event_wait(&loop_parked[2],2000u)); loop_idle(driver);
+    CHECK(loop_parent->scope_mode==2u && loop_parent->scope_expected_mask==3u
+        && loop_parent->scope_token.epoch==loop_tokens[1].epoch);
+    CHECK(loop_starts==2u && loop_closed==1u && loop_latches==1u
+        && loop_local_drops==2u && loop_held_free==1u);
+    loop_pending(&root);
+    loop_cancel_deadline=base+600u;
+    CHECK(ku_task_driver_request_cancel(&root.ticket,&root.owner.lease,KU_TASK_CONTROL_TIMED_OUT,
+        loop_cancel_deadline)==KU_TASK_CONTROL_OK); loop_idle(driver);
+    CHECK(ku_task_driver_request_cancel(&root.ticket,&root.owner.lease,KU_TASK_CONTROL_TIMED_OUT,
+        base+900u)==KU_TASK_CONTROL_OK); loop_idle(driver);
+    CHECK(ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_REQUESTED_CANCEL
+        && ku_task_control_cleanup_deadline(control)==loop_cancel_deadline
+        && loop_parent->drain_deadline==loop_cancel_deadline);
+    for (size_t i=1;i<3u;i++) CHECK(ku_task_control_cleanup_deadline(loop_observers[i].control)==loop_cancel_deadline
+        && ku_task_control_atomic_load(&loop_observers[i].control->phase)==KU_TASK_CONTROL_REQUESTED_CANCEL);
+    CHECK(loop_parent->scope_token.epoch==loop_tokens[1].epoch && loop_parent->wait.epoch==loop_waits[1].epoch);
+    loop_release_child(1u); loop_release_child(2u); loop_idle(driver);
+    CHECK(ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_CANCELLED);
+    CHECK(ku_task_value_take(&root,NULL,&outcome)==KU_TASK_CONTROL_CANCELLED
+        && ku_task_outcome_empty(&outcome,3u));
+    CHECK(ku_task_control_cleanup_deadline(control)==loop_cancel_deadline);
+  }
+  loop_idle(driver);
+  CHECK(loop_starts==2u && loop_local_drops==2u && loop_held_free==1u);
+  CHECK(control->frame_destroyed && !loop_parent->frame_initialized
+      && !loop_parent->frame.header.initialized && !loop_parent->frame.header.result_initialized
+      && !loop_parent->payload_initialized);
+  CHECK(loop_empty_result(loop_parent->frame.result) && loop_empty_result(loop_parent->payload));
+  for (size_t i=0;i<3u;i++) {
+    CHECK(loop_child_drops[i]==1u && loop_transfers[i]==1u);
+    CHECK(ku_task_driver_cleanup_receipt_read(&loop_receipts[i])==KU_TASK_DRIVER_CLEANUP_ACK);
+    if (loop_observers[i].control) {
+      CHECK(loop_observers[i].control->frame_destroyed
+          && !ku_task_control_atomic_load(&loop_observers[i].control->lifecycle_pin));
+      loop_instances[i]=NULL;
+      CHECK(ku_task_control_lease_release(&loop_observers[i])==KU_TASK_CONTROL_OK);
+    }
+  }
+  ku_task_outcome_drop(&outcome); CHECK(ku_task_outcome_empty(&outcome,3u));
+  loop_parent=NULL;
+  uint64_t finish=ku_task_driver_now_ms()+1000u;
+  CHECK(ku_task_value_drop(&root,finish)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_shutdown(driver,finish)==KU_TASK_DRIVER_OK);
+  KuTaskDriverSnapshotV1 empty=loop_idle(driver);
+  CHECK(!empty.resident && !empty.reserved_bytes);
+#if defined(_WIN32)
+  CHECK(WaitForSingleObject(driver->thread,2000u)==WAIT_OBJECT_0);
+#else
+  alarm(2);
+#endif
+  CHECK(ku_task_driver_destroy(driver)==KU_TASK_DRIVER_OK);
+#if !defined(_WIN32)
+  alarm(0);
+#endif
+  free(ring); free(slots); free(driver);
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
+  for (size_t i=0;i<3u;i++) CHECK(ku_test_event_destroy(&loop_parked[i]));
+  for (size_t i=0;i<2u;i++) CHECK(ku_test_event_destroy(&loop_closed_event[i]));
+}
+int main(void) {
+  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==6u && KU_TASK_CONTROL_ABI_VERSION==2u);
+  ku_task_control_deadline_init(&fixture_clock);
+  ku_task_control_atomic_init(&loop_release,0); ku_task_control_atomic_init(&loop_allow,0);
+  loop_case(0u); loop_case(1u); puts("task-scope-loop-ok"); return 0;
+}
+"#;
