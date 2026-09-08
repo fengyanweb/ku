@@ -1035,7 +1035,7 @@ static void fixture_live_deadline_tightening(bool tighten) {
   fixture_runtime_finish(&runtime); fixture_events_finish(); fixture_ledger_zero();
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION == 3u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION == 4u);
   fixture_primitives(); fixture_strings(); fixture_results();
   fixture_budget_and_oom(); fixture_sparse_and_preflight(); fixture_header_shape_and_empty_output();
   fixture_private_failure_rollback(); fixture_sparse_postmove_rollback(); fixture_move_and_late_lease();

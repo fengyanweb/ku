@@ -66,7 +66,7 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         assert!(document.contains("三系统 CI"));
         assert!(!document.contains("native C 明确拒绝 async。"));
     }
-    assert!(ir.contains("Frame ABI 3、Control ABI 2、Driver ABI 6"));
+    assert!(ir.contains("Frame ABI 4、Control ABI 2、Driver ABI 6"));
     assert!(ir.contains("完成先以单次 CAS 预约内部 `COMMITTING`"));
     assert!(ir.contains("后续期限收紧也须预约同一 phase"));
     for boundary in [
@@ -89,6 +89,13 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         "KU_TASK_FRAME_EXIT_STAGED",
         "finish_exit_values",
         "实际 Task 位全空",
+        "R5h.4 内部 ScopeEnter/ScopeDrain（尚未接入源码）",
+        "每个 Task 目标必须属于当前最内层作用域",
+        "CFG 全图必须是 DAG",
+        "KU_TASK_FRAME_SCOPE_REQUEST",
+        "全量 ACK 后异常 Pending 作为合同错误拒绝",
+        "不伪造 ACK/session end、不创建 D",
+        "先取已发布取消预算的最小 D，再登记或提升 session，最后移交 Task",
     ] {
         assert!(ir.contains(boundary), "scope session boundary: {boundary}");
     }

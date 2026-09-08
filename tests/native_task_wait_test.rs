@@ -837,7 +837,7 @@ static void fixture_headers_and_damaged_pair(void) {
 
 int main(void) {
   CHECK(KU_TASK_DRIVER_ABI_VERSION == 6u);
-  CHECK(KU_TASK_FRAME_ABI_VERSION == 3u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION == 4u);
   fixture_ready_before_arm();
   fixture_parked_and_late_child();
   fixture_committing_keeps_result_wait_pending();

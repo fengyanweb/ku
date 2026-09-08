@@ -829,8 +829,8 @@ static int fixture_owned_round(int mode) {
   KuTaskFrameClockV1 clock = { fixture_now, &now };
   CHECK(ku_task_frame_0_init(frame, sizeof(*frame), 0, &input, &cleanup) == KU_TASK_FRAME_ABI_MISMATCH);
   CHECK(ku_task_frame_0_init(frame, sizeof(*frame) - 1, KU_TASK_FRAME_ABI_VERSION, &input, &cleanup) == KU_TASK_FRAME_INVALID_STORAGE);
-  CHECK(KU_TASK_FRAME_ABI_VERSION == 3u);
-  for (uint32_t old=1u;old<3u;old++) {
+  CHECK(KU_TASK_FRAME_ABI_VERSION == 4u);
+  for (uint32_t old=1u;old<KU_TASK_FRAME_ABI_VERSION;old++) {
     CHECK(ku_task_frame_0_init(frame, sizeof(*frame), old, &input, &cleanup) == KU_TASK_FRAME_ABI_MISMATCH);
     CHECK(ku_task_frame_zero_bytes(frame,sizeof(*frame)));
     CHECK(ku_perf_live_allocations == live && cleanup.ptr != NULL);

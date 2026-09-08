@@ -57,6 +57,11 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
     for state in &mut function.states {
         for operation in &mut state.operations {
             match operation {
+                TaskOp::ScopeEnter { tasks, .. } => {
+                    for task in tasks {
+                        map(task);
+                    }
+                }
                 TaskOp::Init { dst, .. } => map(dst),
                 TaskOp::Copy { dst, src }
                 | TaskOp::Move { dst, src }
@@ -103,6 +108,7 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
             TaskTerminator::Complete { value } | TaskTerminator::Exit { value } => map(value),
             TaskTerminator::Jump { .. }
             | TaskTerminator::Suspend { .. }
+            | TaskTerminator::ScopeDrain { .. }
             | TaskTerminator::Terminate => {}
         }
     }

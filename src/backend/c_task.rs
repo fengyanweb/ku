@@ -9,8 +9,8 @@ use std::collections::HashSet;
 
 use crate::error::KuResult;
 use crate::ir::task::{
-    SlotId, TaskBinaryOp, TaskConstant, TaskFramePlan, TaskFunction, TaskFunctionFrame, TaskOp,
-    TaskProgram, TaskSlotType, TaskTerminator, TaskUnaryOp,
+    SlotId, TaskBinaryOp, TaskConstant, TaskFramePlan, TaskFunction, TaskFunctionFrame, TaskLimits,
+    TaskOp, TaskProgram, TaskScopeFrame, TaskSlotType, TaskTerminator, TaskUnaryOp,
 };
 use crate::ir::IrType;
 
@@ -80,10 +80,11 @@ struct FrameEmitter<'a> {
     task_mask: u64,
     hosted: bool,
     exit_bridge: bool,
+    scopes: &'a [TaskScopeFrame],
 }
 
 impl<'a> FrameEmitter<'a> {
-    fn new(function: &'a TaskFunction, frame: &TaskFunctionFrame) -> KuResult<Self> {
+    fn new(function: &'a TaskFunction, frame: &'a TaskFunctionFrame) -> KuResult<Self> {
         if function.slots.len() > MAX_FRAME_SLOTS {
             return Err(unsupported("native task frame exceeds its 64-slot bitmap"));
         }
@@ -146,6 +147,7 @@ impl<'a> FrameEmitter<'a> {
                 "native task frame plan has inconsistent exit ownership",
             ));
         }
+        Self::validate_scope_plan(function, frame, task_mask, exit_bridge)?;
         require_result_type(&function.result)?;
         Ok(Self {
             function,
@@ -155,7 +157,96 @@ impl<'a> FrameEmitter<'a> {
             task_mask,
             hosted: frame.hosted,
             exit_bridge,
+            scopes: &frame.scopes,
         })
+    }
+
+    fn validate_scope_plan(
+        function: &TaskFunction,
+        frame: &TaskFunctionFrame,
+        task_mask: u64,
+        exit_bridge: bool,
+    ) -> KuResult<()> {
+        // The verifier already bounded these lists. Recheck exported descriptors
+        // before indexing or allocating from a hand-supplied internal plan.
+        if frame.scopes.len() > TaskLimits::default().max_operations {
+            return Err(unsupported(
+                "native task scope plan exceeds its operation bound",
+            ));
+        }
+        if !frame.scopes.is_empty()
+            && (!exit_bridge
+                || function
+                    .states
+                    .iter()
+                    .any(|state| matches!(state.terminator, TaskTerminator::Complete { .. })))
+        {
+            return Err(unsupported("native scoped frames require typed Exit"));
+        }
+        let mut associated = 0u64;
+        for (index, descriptor) in frame.scopes.iter().enumerate() {
+            if descriptor.scope.0 != index
+                || descriptor.task_mask & !task_mask != 0
+                || descriptor.task_mask & associated != 0
+            {
+                return Err(unsupported(
+                    "native task scope plan has invalid ownership masks",
+                ));
+            }
+            associated |= descriptor.task_mask;
+        }
+        let mut declared = vec![false; frame.scopes.len()];
+        for state in &function.states {
+            for operation in &state.operations {
+                if let TaskOp::ScopeEnter { scope, tasks } = operation {
+                    let descriptor = frame.scopes.get(scope.0).ok_or_else(|| {
+                        unsupported("native task scope declaration is missing from its plan")
+                    })?;
+                    if declared[scope.0] || tasks.len() > MAX_FRAME_SLOTS {
+                        return Err(unsupported("native task scope declaration is not unique"));
+                    }
+                    let mut actual = 0u64;
+                    for slot in tasks {
+                        if slot.0 >= function.slots.len()
+                            || task_mask & (1u64 << slot.0) == 0
+                            || actual & (1u64 << slot.0) != 0
+                        {
+                            return Err(unsupported(
+                                "native task scope declaration has invalid members",
+                            ));
+                        }
+                        actual |= 1u64 << slot.0;
+                    }
+                    if actual != descriptor.task_mask {
+                        return Err(unsupported(
+                            "native task scope plan disagrees with its declaration",
+                        ));
+                    }
+                    declared[scope.0] = true;
+                }
+            }
+            if let TaskTerminator::ScopeDrain {
+                scope,
+                ready,
+                cleanup,
+            } = state.terminator
+            {
+                if frame.scopes.get(scope.0).is_none()
+                    || ready.0 >= function.states.len()
+                    || cleanup.0 >= function.states.len()
+                {
+                    return Err(unsupported(
+                        "native task scope request has an invalid descriptor",
+                    ));
+                }
+            }
+        }
+        if declared.iter().any(|seen| !seen) {
+            return Err(unsupported(
+                "native task scope plan contains an undeclared scope",
+            ));
+        }
+        Ok(())
     }
 
     fn slot_type(&self, slot: SlotId) -> KuResult<&IrType> {
@@ -234,7 +325,9 @@ impl<'a> FrameEmitter<'a> {
              static size_t {prefix}_align(void) {{ return KU_TASK_FRAME_ALIGNOF({frame_type}); }}\n",
             c_type(&self.function.result)?
         ));
+        self.emit_scope_descriptors(out)?;
         self.emit_check(out);
+        self.emit_scope_helpers(out)?;
         self.emit_init(out)?;
         self.emit_drive(out)?;
         self.emit_resume(out);
@@ -245,9 +338,137 @@ impl<'a> FrameEmitter<'a> {
         out.check()
     }
 
+    fn emit_scope_descriptors(&self, out: &mut COutput) -> KuResult<()> {
+        if self.scopes.is_empty() {
+            return Ok(());
+        }
+        let prefix = &self.prefix;
+        for (index, state) in self.function.states.iter().enumerate() {
+            out.check()?;
+            if let TaskTerminator::ScopeDrain {
+                scope,
+                ready,
+                cleanup,
+            } = state.terminator
+            {
+                let descriptor = &self.scopes[scope.0];
+                out.push_str(&format!(
+                    "static const KuTaskFrameScopeDescriptorV1 {prefix}_scope_{index} = {{ UINT64_C({scope_id}), UINT64_C({mask}), {index}u, {ready}u, {cleanup}u }};\n",
+                    scope_id = descriptor.scope.0,
+                    mask = descriptor.task_mask,
+                    ready = ready.0,
+                    cleanup = cleanup.0,
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "static const KuTaskFrameScopeDescriptorV1* {prefix}_scope_lookup(uint32_t state) {{\n  switch (state) {{\n"
+        ));
+        for (index, state) in self.function.states.iter().enumerate() {
+            out.check()?;
+            if matches!(state.terminator, TaskTerminator::ScopeDrain { .. }) {
+                out.push_str(&format!(
+                    "    case {index}u: return &{prefix}_scope_{index};\n"
+                ));
+            }
+        }
+        out.push_str("    default: return NULL;\n  }\n}\n");
+        out.check()
+    }
+
+    fn emit_scope_helpers(&self, out: &mut COutput) -> KuResult<()> {
+        if self.scopes.is_empty() {
+            return Ok(());
+        }
+        let prefix = &self.prefix;
+        let frame_type = &self.frame_type;
+        out.check()?;
+        out.push_str(&format!(
+            r#"/* Non-owning static descriptor: output is a complete NULL-initialized
+ * pointer slot. The exclusive raw caller also keeps it disjoint from every
+ * Owned deep allocation; a frame interval check is not a hostile-pointer oracle. */
+static uint32_t {prefix}_scope_request(void* storage, size_t bytes, uint32_t abi,
+    const KuTaskFrameScopeDescriptorV1** output) {{
+  uint32_t checked = {prefix}_check(storage, bytes, abi);
+  if (checked != KU_TASK_FRAME_OK) return checked;
+  if (!ku_task_frame_storage_valid(output, sizeof(*output), sizeof(*output),
+          KU_TASK_FRAME_ALIGNOF(const KuTaskFrameScopeDescriptorV1*))
+      || ku_task_frame_ranges_overlap(storage, bytes, output, sizeof(*output)))
+    return KU_TASK_FRAME_INVALID_ARGUMENT;
+  if (*output) return KU_TASK_FRAME_INVALID_ARGUMENT;
+  {frame_type}* frame = ({frame_type}*)storage;
+  if (frame->header.status != KU_TASK_FRAME_SCOPE_REQUEST) return KU_TASK_FRAME_INVALID_STATE;
+  const KuTaskFrameScopeDescriptorV1* descriptor = {prefix}_scope_lookup(frame->header.state);
+  if (!descriptor) return KU_TASK_FRAME_INVALID_STATE;
+  *output = descriptor;
+  return KU_TASK_FRAME_OK;
+}}
+/* Only the generated adapter supplies the actual successful end/empty witness.
+ * No user code, clock, drop, control transition or recursive drive occurs here. */
+static uint32_t {prefix}_scope_continue(void* storage, size_t bytes, uint32_t abi,
+    uint64_t expected_scope_id) {{
+  const KuTaskFrameScopeDescriptorV1* descriptor = NULL;
+  uint32_t checked = {prefix}_scope_request(storage, bytes, abi, &descriptor);
+  if (checked != KU_TASK_FRAME_OK) return checked;
+  {frame_type}* frame = ({frame_type}*)storage;
+  if (descriptor->scope_id != expected_scope_id
+      || (frame->header.initialized & descriptor->task_mask))
+    return KU_TASK_FRAME_INVALID_STATE;
+  frame->header.state = descriptor->ready_state;
+  frame->header.cleanup_state = UINT32_MAX;
+  frame->header.status = KU_TASK_FRAME_PENDING;
+  return KU_TASK_FRAME_OK;
+}}
+/* The adapter supplies a real scope-timeout witness and its original absolute D.
+ * This helper never reads time or manufactures cancellation authority. */
+static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi,
+    uint64_t expected_scope_id, uint64_t original_deadline) {{
+  const KuTaskFrameScopeDescriptorV1* descriptor = NULL;
+  uint32_t checked = {prefix}_scope_request(storage, bytes, abi, &descriptor);
+  if (checked != KU_TASK_FRAME_OK) return checked;
+  if (original_deadline == UINT64_MAX) return KU_TASK_FRAME_INVALID_ARGUMENT;
+  {frame_type}* frame = ({frame_type}*)storage;
+  if (descriptor->scope_id != expected_scope_id || frame->header.result_initialized)
+    return KU_TASK_FRAME_INVALID_STATE;
+"#
+        ));
+        if !self.exit_bridge {
+            out.push_str("  return KU_TASK_FRAME_INVALID_STATE;\n}\n");
+            return out.check();
+        }
+        let IrType::Result(inner) = &self.function.result else {
+            return Err(unsupported("scope timeout requires Result"));
+        };
+        out.push_str(&format!(
+            "  frame->result = ({}){{ false, {}, ku_error_make(ku_string_static((const uint8_t*)\"task\",4),ku_string_static((const uint8_t*)\"shutdown_timeout\",16),ku_string_static((const uint8_t*)\"owned child cleanup deadline expired\",36)) }};\n",
+            c_type(&self.function.result)?,
+            c_zero_initializer(inner)?,
+        ));
+        out.push_str(
+            "  frame->header.result_initialized = 1;\n\
+               frame->header.exit_class = KU_TASK_EXIT_RUNTIME_FAILURE;\n\
+               frame->header.has_exit_deadline = 1;\n\
+               frame->header.exit_deadline = original_deadline;\n",
+        );
+        self.emit_exit_staged(out);
+        out.push_str("}\n");
+        out.check()
+    }
+
     fn emit_check(&self, out: &mut COutput) {
         let prefix = &self.prefix;
         let frame_type = &self.frame_type;
+        let scope_check = if self.scopes.is_empty() {
+            // No scope helper symbols or lookup are emitted in this function.
+            "if (frame->header.status == KU_TASK_FRAME_SCOPE_REQUEST) return KU_TASK_FRAME_INVALID_STATE;".to_string()
+        } else {
+            format!(
+                "if (frame->header.status == KU_TASK_FRAME_SCOPE_REQUEST) {{\n\
+                   const KuTaskFrameScopeDescriptorV1* descriptor = {prefix}_scope_lookup(frame->header.state);\n\
+                   if (!descriptor || descriptor->request_state != frame->header.state || frame->header.cleanup_state != descriptor->cleanup_state || frame->header.result_initialized || frame->header.exit_class || frame->header.has_exit_deadline || frame->header.exit_deadline || frame->header.cleanup_deadline_ms || frame->header.cleanup_timed_out) return KU_TASK_FRAME_INVALID_STATE;\n\
+                 }}"
+            )
+        };
         out.push_str(&format!(
             "static uint32_t {prefix}_check(void* storage, size_t bytes, uint32_t abi) {{\n\
                if (abi != KU_TASK_FRAME_ABI_VERSION) return KU_TASK_FRAME_ABI_MISMATCH;\n\
@@ -256,9 +477,10 @@ impl<'a> FrameEmitter<'a> {
                {frame_type}* frame = ({frame_type}*)storage;\n\
                if (frame->header.abi_version != KU_TASK_FRAME_ABI_VERSION) return KU_TASK_FRAME_ABI_MISMATCH;\n\
                if (frame->header.storage_size != sizeof({frame_type}) || frame->header.function_id != UINT64_C({id})) return KU_TASK_FRAME_INVALID_STORAGE;\n\
-               if (frame->header.running || (frame->header.status > KU_TASK_FRAME_TIMED_OUT && frame->header.status != KU_TASK_FRAME_EXIT_STAGED)) return KU_TASK_FRAME_INVALID_STATE;\n\
+               if (frame->header.running || (frame->header.status > KU_TASK_FRAME_TIMED_OUT && frame->header.status != KU_TASK_FRAME_EXIT_STAGED && frame->header.status != KU_TASK_FRAME_SCOPE_REQUEST)) return KU_TASK_FRAME_INVALID_STATE;\n\
                if (frame->header.status == KU_TASK_FRAME_EXIT_STAGED && (!{exit_bridge} || frame->header.result_initialized != 1u || frame->header.cleanup_state != UINT32_MAX || (frame->header.exit_class != KU_TASK_EXIT_USER_RESULT && frame->header.exit_class != KU_TASK_EXIT_RUNTIME_FAILURE) || frame->header.has_exit_deadline > 1u || (!frame->header.has_exit_deadline && frame->header.exit_deadline) || (frame->header.has_exit_deadline && frame->header.exit_deadline == UINT64_MAX) || (frame->header.exit_class == KU_TASK_EXIT_USER_RESULT && (frame->header.has_exit_deadline || frame->header.exit_deadline)))) return KU_TASK_FRAME_INVALID_STATE;\n\
                if (frame->header.state >= {states}u || (frame->header.cleanup_state != UINT32_MAX && frame->header.cleanup_state >= {states}u)) return KU_TASK_FRAME_INVALID_STATE;\n\
+               {scope_check}\n\
                return KU_TASK_FRAME_OK;\n\
              }}\n",
             id = self.function.id.0,
@@ -397,6 +619,12 @@ impl<'a> FrameEmitter<'a> {
                         resume.0, cleanup.0
                     ));
                 }
+                TaskTerminator::ScopeDrain { .. } => {
+                    out.push_str(&format!(
+                        "  if (cleanup) goto ku_task_terminated;\n  {{ const KuTaskFrameScopeDescriptorV1* descriptor={}_scope_lookup(frame->header.state);\n  if (!descriptor) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  frame->header.cleanup_state=descriptor->cleanup_state;\n  frame->header.status=KU_TASK_FRAME_SCOPE_REQUEST;\n  frame->header.running=0;\n  return KU_TASK_FRAME_SCOPE_REQUEST;\n  }}\n",
+                        self.prefix
+                    ));
+                }
                 TaskTerminator::Complete { value } => {
                     out.push_str("  if (cleanup) goto ku_task_terminated;\n");
                     out.push_str(&format!(
@@ -501,6 +729,8 @@ impl<'a> FrameEmitter<'a> {
 
     fn emit_operation(&self, out: &mut COutput, operation: &TaskOp) -> KuResult<()> {
         match operation {
+            // Verified lexical ownership annotation; no runtime stack or bits.
+            TaskOp::ScopeEnter { .. } => {}
             TaskOp::Unary { dst, op, src } => match op {
                 TaskUnaryOp::Not => {
                     out.push_str(&format!(
@@ -739,7 +969,7 @@ impl<'a> FrameEmitter<'a> {
                uint32_t checked = {prefix}_check(storage, bytes, abi);\n\
                if (checked != KU_TASK_FRAME_OK) return checked;\n\
                {frame_type}* frame = ({frame_type}*)storage;\n\
-               if (ku_task_frame_is_terminal(frame->header.status) || frame->header.status == KU_TASK_FRAME_EXIT_STAGED) return frame->header.status;\n\
+               if (ku_task_frame_is_terminal(frame->header.status) || frame->header.status == KU_TASK_FRAME_EXIT_STAGED || frame->header.status == KU_TASK_FRAME_SCOPE_REQUEST) return frame->header.status;\n\
                if (!clock || !clock->now_ms || ({hosted} && !clock->host)) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
                frame->header.running = 1;\n\
                return {prefix}_drive(frame, clock, 0);\n\
@@ -970,7 +1200,7 @@ fn constant_expr(value: &TaskConstant, ty: &IrType) -> KuResult<String> {
 }
 
 const FRAME_ABI: &str = r#"
-/* Internal frame ABI v3: single owner/executor, externally serialized calls.
+/* Internal frame ABI v4: single owner/executor, externally serialized calls.
  * Storage must be zero-filled, suitably aligned, caller-owned and live until
  * destroy finishes; destroy drops payloads but never frees that storage. Do not
  * mutate/copy a live frame. Owned argument headers and their deep payloads must
@@ -983,8 +1213,18 @@ const FRAME_ABI: &str = r#"
  * EXIT_STAGED is stopped but nonterminal: resume cannot replay it, take/destroy
  * reject it. After all Task owners are handed off, finish_exit_values drops
  * Values and makes the retained Result READY. Genuine cancellation may instead
- * terminate, dropping both current Values and the staged Result once. */
-#define KU_TASK_FRAME_ABI_VERSION 3u
+ * terminate, dropping both current Values and the staged Result once.
+ * SCOPE_REQUEST is another stopped, nonterminal boundary: repeated resume
+ * returns the same request without replaying source operations. Its static
+ * descriptor comes from the verified current state; no runtime scope stack is
+ * allocated. Continue requires the selected Task bitmap empty and a trusted
+ * adapter end/empty witness, then leaves PENDING for a later dispatch phase
+ * check. Cancellation retains the request cleanup CFG. Only a real scope-timeout
+ * witness stages RuntimeFailure with the supplied original D and invalidates
+ * that CFG. Descriptor outputs are exclusive NULL-initialized pointer slots,
+ * disjoint from frame and every Owned deep allocation; interval guards do not
+ * authenticate arbitrary raw C storage. No helper changes R2 cancellation. */
+#define KU_TASK_FRAME_ABI_VERSION 4u
 #if defined(_MSC_VER)
 #define KU_TASK_FRAME_ALIGNOF(T) __alignof(T)
 #else
@@ -1002,8 +1242,13 @@ enum {
   KU_TASK_FRAME_LIMIT = 8u,
   KU_TASK_FRAME_INVALID_ARGUMENT = 9u,
   KU_TASK_FRAME_DESTROYED = 10u,
-  KU_TASK_FRAME_EXIT_STAGED = 11u
+  KU_TASK_FRAME_EXIT_STAGED = 11u,
+  KU_TASK_FRAME_SCOPE_REQUEST = 12u
 };
+typedef struct KuTaskFrameScopeDescriptorV1 {
+  uint64_t scope_id, task_mask;
+  uint32_t request_state, ready_state, cleanup_state;
+} KuTaskFrameScopeDescriptorV1;
 typedef struct KuTaskFrameClockV1 {
   uint64_t (*now_ms)(void* context);
   void* context;

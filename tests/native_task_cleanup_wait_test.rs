@@ -913,7 +913,7 @@ static void fixture_corrupt_ack_process(void) {
   puts("task-cleanup-wait-quarantined-not-drained");
 }
 int main(int argc, char** argv) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 6u); CHECK(KU_TASK_FRAME_ABI_VERSION == 3u); ku_task_control_deadline_init(&fixture_clock);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 6u); CHECK(KU_TASK_FRAME_ABI_VERSION == 4u); ku_task_control_deadline_init(&fixture_clock);
   if (argc == 2 && !strcmp(argv[1], "--corrupt-ack")) { fixture_corrupt_ack_process(); return 0; }
   CHECK(argc == 1);
   fixture_basic_wait(0, 0); fixture_basic_wait(0, 1); fixture_basic_wait(1, 0);
