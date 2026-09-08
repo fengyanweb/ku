@@ -217,6 +217,7 @@ fn native_task_scope_adapter_normal_sessions_and_timeout_final_handoff_in_c() {
     let instrumentation = format!(
         "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\nstatic void fixture_record_free(void*);\n{ledger}\nstatic int fixture_parent_hold(void*);\nstatic void fixture_parent_drive(void*,int);\nstatic void fixture_frame_return(void*,uint32_t);\nstatic void fixture_continued(void*,uint64_t);\nstatic uint32_t fixture_child_hold(void*,int);\n"
     );
+    let instrumentation = format!("{instrumentation}\nstatic void fixture_request_ready(void*);\nstatic void fixture_before_publish(void*);\nstatic void fixture_before_close(void*);\nstatic void fixture_after_close(void*,uint32_t);\n");
     generated = replace_once(
         generated,
         "typedef struct KuString {",
@@ -251,6 +252,18 @@ fn native_task_scope_adapter_normal_sessions_and_timeout_final_handoff_in_c() {
         continued,
         &format!("{continued}\n  fixture_continued(instance,descriptor->scope_id);"),
     );
+    generated = replace_once(generated,
+        "  uint32_t result = ku_task_control_request_cancel(lease, reason, deadline);",
+        "  fixture_request_ready(lease->control);\n  uint32_t result = ku_task_control_request_cancel(lease, reason, deadline);");
+    generated = replace_once(generated,
+        "      ku_task_control_deadline_store(&control->cleanup_deadline_ms, absolute_deadline_ms);",
+        "      fixture_before_publish(control);\n      ku_task_control_deadline_store(&control->cleanup_deadline_ms, absolute_deadline_ms);");
+    generated = replace_once(generated,
+        "    size_t close_phase = ku_task_control_atomic_load(&parent->driver_lease.control->phase);",
+        "    fixture_before_close(parent->driver_lease.control);\n    size_t close_phase = ku_task_control_atomic_load(&parent->driver_lease.control->phase);");
+    generated = replace_once(generated,
+        "status=ku_task_driver_scope_end(&instance->ticket,&instance->scope_token);",
+        "status=ku_task_driver_scope_end(&instance->ticket,&instance->scope_token);\n    fixture_after_close(instance,status);");
     for (entry, cleanup) in [
         ("static uint32_t ku_task_1_resume(void* raw) {", 0),
         ("static uint32_t ku_task_1_cleanup(void* raw, uint32_t reason, KuTaskControlV1* budget) {", 1),
@@ -290,7 +303,7 @@ fn native_task_scope_adapter_normal_sessions_and_timeout_final_handoff_in_c() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().replace('\r', ""),
-        "101\n202\nscope-cleanup\ntask-scope-adapter-ok\n"
+        "101\n202\nscope-cleanup\nscope-cleanup\ntask-scope-adapter-ok\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -323,6 +336,58 @@ static KuTaskDriverCleanupReceiptV1 fixture_receipts[4];
 static uint64_t fixture_child_deadlines[4], fixture_scope_deadlines[2];
 static KuTaskDriverScopeTokenV1 fixture_first_token;
 static const KuTaskDriverCleanupReceiptV1* fixture_first_span;
+enum {
+  FIXTURE_REQUEST_ENTERED, FIXTURE_REQUEST_PROCEED,
+  FIXTURE_CLOSE_ENTERED, FIXTURE_CLOSE_PROCEED,
+  FIXTURE_PUBLISHING, FIXTURE_PUBLISH_PROCEED, FIXTURE_PUBLICATION_EVENTS
+};
+static KuTestEvent fixture_publication_events[FIXTURE_PUBLICATION_EVENTS];
+static unsigned fixture_publication_enabled, fixture_request_calls, fixture_close_calls, fixture_publish_calls;
+static uint32_t fixture_close_outcome;
+static KuTaskControlV1* fixture_publication_target;
+
+static void fixture_request_ready(void* raw) {
+  if (!fixture_publication_enabled || raw!=fixture_publication_target) return;
+  CHECK(!fixture_request_calls++);
+  CHECK(ku_task_control_atomic_load(&((KuTaskControlV1*)raw)->phase)==KU_TASK_CONTROL_LIVE);
+  /* The real driver wrapper already owns its active registration. No mutex is
+   * held here; its unmodified R2 call will run while scope_end holds the mutex. */
+  CHECK(ku_test_event_set(&fixture_publication_events[FIXTURE_REQUEST_ENTERED]));
+  CHECK(ku_test_event_wait(&fixture_publication_events[FIXTURE_REQUEST_PROCEED],2000u));
+}
+static void fixture_before_close(void* raw) {
+  if (!fixture_publication_enabled || raw!=fixture_publication_target) return;
+  CHECK(!fixture_close_calls++);
+  CHECK(ku_task_control_atomic_load(&((KuTaskControlV1*)raw)->phase)==KU_TASK_CONTROL_LIVE);
+  CHECK(ku_test_event_set(&fixture_publication_events[FIXTURE_CLOSE_ENTERED]));
+  CHECK(ku_test_event_wait(&fixture_publication_events[FIXTURE_CLOSE_PROCEED],2000u));
+}
+static void fixture_after_close(void* raw,uint32_t outcome) {
+  if (!fixture_publication_enabled || raw!=fixture_publication_target) return;
+  CHECK(outcome==KU_TASK_DRIVER_WAIT_ABORTED && !fixture_closed[0]);
+  CHECK(ku_task_control_atomic_load(&((KuTaskControlV1*)raw)->phase)==KU_TASK_CONTROL_PUBLISHING_CANCEL);
+  fixture_close_outcome=outcome;
+}
+static void fixture_before_publish(void* raw) {
+  if (!fixture_publication_enabled || raw!=fixture_publication_target) return;
+  CHECK(!fixture_publish_calls++);
+  CHECK(ku_task_control_atomic_load(&((KuTaskControlV1*)raw)->phase)==KU_TASK_CONTROL_PUBLISHING_CANCEL);
+  CHECK(ku_task_control_cleanup_deadline((KuTaskControlV1*)raw)==UINT64_MAX);
+  CHECK(ku_test_event_set(&fixture_publication_events[FIXTURE_PUBLISHING]));
+  CHECK(ku_test_event_wait(&fixture_publication_events[FIXTURE_PUBLISH_PROCEED],2000u));
+}
+typedef struct FixturePublicationRequest {
+  KuTaskDriverTicketV1 ticket;
+  KuTaskControlLeaseV1 lease;
+  uint64_t deadline;
+  uint32_t status;
+} FixturePublicationRequest;
+static int fixture_publication_thread(void* raw) {
+  FixturePublicationRequest* request=(FixturePublicationRequest*)raw;
+  request->status=ku_task_driver_request_cancel(&request->ticket,&request->lease,
+      KU_TASK_CONTROL_CANCELLED,request->deadline);
+  return 0;
+}
 
 static int fixture_empty_string(KuString value) {
   return !value.ptr && !value.len && !value.capacity && !value.storage;
@@ -535,8 +600,12 @@ static void fixture_timeout_payload(const KuTaskAdapterOutcomeV1* outcome,uint64
 }
 static void fixture_case(unsigned mode) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
-  fixture_mode=mode; fixture_parent=NULL; fixture_transferred=fixture_scope_seen=fixture_staged=fixture_promoted=0;
+  fixture_mode=mode==3u ? 2u : mode; fixture_parent=NULL; fixture_transferred=fixture_scope_seen=fixture_staged=fixture_promoted=0;
   fixture_cleanup_drives=0; fixture_cancel_deadline=0;
+  fixture_publication_enabled=mode==3u; fixture_publication_target=NULL;
+  fixture_request_calls=fixture_close_calls=fixture_publish_calls=0;
+  fixture_close_outcome=UINT32_MAX;
+  for (size_t i=0;i<FIXTURE_PUBLICATION_EVENTS;i++) CHECK(ku_test_event_init(&fixture_publication_events[i]));
   memset(fixture_drives,0,sizeof(fixture_drives)); memset(fixture_closed,0,sizeof(fixture_closed));
   memset(fixture_ids,0,sizeof(fixture_ids)); memset(fixture_frees,0,sizeof(fixture_frees));
   memset(fixture_children,0,sizeof(fixture_children)); memset(fixture_observers,0,sizeof(fixture_observers));
@@ -627,8 +696,7 @@ static void fixture_case(unsigned mode) {
     CHECK(ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_FAILED);
     fixture_timeout_payload(&outcome,fixture_scope_deadlines[0]);
     CHECK(!fixture_drives[1] && !fixture_drives[2] && !fixture_closed[0]);
-  } else {
-    CHECK(mode==2u);
+  } else if (mode==2u) {
     KuTaskDriverWaitTokenV1 original_wait=fixture_parent->wait;
     CHECK(original_wait.driver && fixture_parent->scope_mode==1u);
     fixture_cancel_deadline=base+700u;
@@ -688,6 +756,91 @@ static void fixture_case(unsigned mode) {
     CHECK(ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_CANCELLED);
     CHECK(fixture_cleanup_drives==1u && !fixture_drives[1] && !fixture_drives[2]
         && !fixture_closed[0] && !fixture_closed[1] && !fixture_children[3].driver);
+  } else {
+    CHECK(mode==3u && fixture_publication_enabled);
+    KuTaskDriverWaitTokenV1 original_wait=fixture_parent->wait;
+    CHECK(original_wait.driver && fixture_parent->scope_mode==1u);
+    fixture_cancel_deadline=base+700u;
+    FixturePublicationRequest request={0};
+    request.ticket=root.ticket; request.deadline=fixture_cancel_deadline; request.status=UINT32_MAX;
+    CHECK(ku_task_control_lease_retain(&root.owner.lease,&request.lease)==KU_TASK_CONTROL_OK);
+    fixture_publication_target=control;
+    KuTestThread thread;
+    CHECK(ku_test_thread_start(&thread,fixture_publication_thread,&request));
+    CHECK(ku_test_event_wait(&fixture_publication_events[FIXTURE_REQUEST_ENTERED],2000u));
+    /* Finish the actual last inner child. The normal adapter can now attempt
+     * scope_end, with both real receipts ACKed and the previous wait detached. */
+    fixture_release(2u);
+    CHECK(ku_test_event_wait(&fixture_publication_events[FIXTURE_CLOSE_ENTERED],2000u));
+    CHECK(ku_test_event_set(&fixture_publication_events[FIXTURE_REQUEST_PROCEED]));
+    CHECK(ku_test_event_wait(&fixture_publication_events[FIXTURE_PUBLISHING],2000u));
+    CHECK(ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_PUBLISHING_CANCEL);
+    CHECK(ku_task_control_cleanup_deadline(control)==UINT64_MAX);
+    /* Let the original final acquire observe real PUBLISHING. Do not replace
+     * that atomic read, scope_end's return, its token or any receipt. */
+    CHECK(ku_test_event_set(&fixture_publication_events[FIXTURE_CLOSE_PROCEED]));
+    fixture_idle(driver);
+    CHECK(fixture_request_calls==1u && fixture_close_calls==1u && fixture_publish_calls==1u);
+    CHECK(fixture_close_outcome==KU_TASK_DRIVER_WAIT_ABORTED);
+    CHECK(ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_PUBLISHING_CANCEL);
+    CHECK(ku_task_control_cleanup_deadline(control)==UINT64_MAX);
+    CHECK(fixture_parent->frame.header.status==KU_TASK_FRAME_SCOPE_REQUEST
+        && fixture_parent->frame.header.cleanup_state==3u && !fixture_parent->frame.header.result_initialized);
+    CHECK(fixture_parent->scope_mode==1u && fixture_parent->scope_expected_mask==6u
+        && fixture_parent->scope_issued_mask==6u && !fixture_parent->receipt_mask && !fixture_parent->wait.driver);
+    CHECK(fixture_parent->scope_token.epoch==fixture_first_token.epoch
+        && fixture_parent->scope_token.parent_generation==fixture_first_token.parent_generation
+        && fixture_parent->receipts==fixture_first_span);
+    CHECK(fixture_parent->drain_deadline==fixture_scope_deadlines[0] && !fixture_parent->drain_failure);
+    CHECK(ku_task_driver_cleanup_receipt_read(&fixture_receipts[1])==KU_TASK_DRIVER_CLEANUP_ACK
+        && ku_task_driver_cleanup_receipt_read(&fixture_receipts[2])==KU_TASK_DRIVER_CLEANUP_ACK);
+    CHECK(!ku_task_driver_lock(driver));
+    KuTaskDriverSlotV1* parked=ku_task_driver_find(&root.ticket);
+    CHECK(parked && parked->wrapper_active==1u && parked->scope_session_active
+        && !parked->scope_session_final && parked->scope_expected_mask==6u
+        && parked->scope_receipts==fixture_first_span
+        && parked->scope_wait_deadline==fixture_scope_deadlines[0]);
+    CHECK(!ku_task_driver_unlock(driver));
+    CHECK(fixture_transferred==6u && !fixture_promoted && !fixture_cleanup_drives
+        && !fixture_closed[0] && !fixture_closed[1] && !fixture_drives[1] && !fixture_drives[2]);
+    CHECK(!fixture_frees[0] && !fixture_frees[1]);
+    fixture_pending(&root);
+    KuTaskDriverSnapshotV1 stable=fixture_idle(driver);
+    CHECK(fixture_idle(driver).polls==stable.polls); /* No absent-publication busy polling. */
+    CHECK(!fixture_cleanup_drives && !fixture_drives[1] && !fixture_closed[0]);
+    CHECK(ku_test_event_set(&fixture_publication_events[FIXTURE_PUBLISH_PROCEED]));
+    CHECK(ku_test_thread_join(&thread,2000u));
+    CHECK(!thread.outcome && request.status==KU_TASK_CONTROL_OK);
+    /* The original wrapper publishes D and supplies the actual notification.
+     * The real adapter promotes the retained manifest before moving ROOT. */
+    CHECK(ku_test_event_wait(&fixture_child_events[2],2000u)); fixture_idle(driver);
+    CHECK(fixture_transferred==7u && fixture_promoted==1u && fixture_cleanup_drives==1u);
+    CHECK(fixture_frees[0]==1u && fixture_frees[1]==1u && !fixture_staged);
+    CHECK(ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_REQUESTED_CANCEL
+        && ku_task_control_cleanup_deadline(control)==fixture_cancel_deadline);
+    CHECK(fixture_parent->scope_mode==2u && fixture_parent->scope_expected_mask==7u
+        && fixture_parent->scope_issued_mask==7u && fixture_parent->receipt_mask==1u);
+    CHECK(fixture_parent->scope_token.epoch==fixture_first_token.epoch
+        && fixture_parent->receipts==fixture_first_span);
+    CHECK(fixture_same_receipt(&fixture_parent->receipts[1],&fixture_receipts[1])
+        && fixture_same_receipt(&fixture_parent->receipts[2],&fixture_receipts[2]));
+    CHECK(fixture_parent->wait.driver==original_wait.driver
+        && fixture_parent->wait.parent_generation==original_wait.parent_generation
+        && fixture_parent->wait.epoch>original_wait.epoch);
+    CHECK(ku_task_control_cleanup_deadline(fixture_observers[0].control)==fixture_cancel_deadline
+        && fixture_parent->drain_deadline==fixture_cancel_deadline);
+    CHECK(ku_task_driver_cleanup_receipt_read(&fixture_receipts[0])==KU_TASK_DRIVER_PENDING);
+    fixture_pending(&root);
+    fixture_release(0u); fixture_idle(driver);
+    CHECK(ku_task_driver_cleanup_receipt_read(&fixture_receipts[0])==KU_TASK_DRIVER_CLEANUP_ACK);
+    CHECK(ku_task_control_atomic_load(&control->phase)==KU_TASK_CONTROL_CANCELLED
+        && ku_task_control_cleanup_deadline(control)==fixture_cancel_deadline);
+    CHECK(ku_task_value_take(&root,NULL,&outcome)==KU_TASK_CONTROL_CANCELLED
+        && ku_task_outcome_empty(&outcome,4u));
+    CHECK(ku_task_driver_wake(&root.ticket)==KU_TASK_DRIVER_OK); fixture_idle(driver);
+    CHECK(fixture_cleanup_drives==1u && !fixture_drives[1] && !fixture_drives[2]
+        && !fixture_closed[0] && !fixture_closed[1] && !fixture_children[3].driver);
+    CHECK(ku_task_control_lease_release(&request.lease)==KU_TASK_CONTROL_OK);
   }
   fixture_idle(driver);
   CHECK(control->frame_destroyed && !fixture_parent->frame_initialized);
@@ -719,13 +872,14 @@ static void fixture_case(unsigned mode) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
   for (size_t i=0;i<3u;i++) CHECK(ku_test_event_destroy(&fixture_child_events[i]));
   for (size_t i=0;i<2u;i++) CHECK(ku_test_event_destroy(&fixture_close_events[i]));
+  for (size_t i=0;i<FIXTURE_PUBLICATION_EVENTS;i++) CHECK(ku_test_event_destroy(&fixture_publication_events[i]));
 }
 int main(void) {
   CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==6u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&fixture_release_children,0);
   ku_task_control_atomic_init(&fixture_release_continuations,0);
-  fixture_case(0u); fixture_case(1u); fixture_case(2u);
+  fixture_case(0u); fixture_case(1u); fixture_case(2u); fixture_case(3u);
   puts("task-scope-adapter-ok"); return 0;
 }
 "#;
