@@ -919,9 +919,11 @@ fn validate_regions_and_progress(
             _ => return Err(invalid("cleanup cannot complete or suspend")),
         }
     }
-    // Legacy cycles must cross a suspension. Scoped graphs are deliberately
-    // DAGs even across Suspend/Await: a scope cannot be reentered in this slice.
-    // ScopeDrain is never a progress cut because its ACK can be immediate.
+    // Legacy cycles must cross an unconditional frame return: only Suspend
+    // guarantees that. Await may consume an already-ready/INLINE_FAILED value
+    // and continue dispatching in this same poll, so it is not a progress cut.
+    // Scoped graphs stay DAGs even across Suspend: no scope reentry yet.
+    // ScopeDrain therefore remains outside the legacy cycle permission.
     if scoped {
         budget.spend_many(count)?;
     }
@@ -930,16 +932,11 @@ fn validate_regions_and_progress(
         if scoped {
             budget.spend()?;
         }
-        if !scoped
-            && matches!(
-                state.terminator,
-                TaskTerminator::Suspend { .. } | TaskTerminator::Await { .. }
-            )
-        {
+        if !scoped && matches!(state.terminator, TaskTerminator::Suspend { .. }) {
             continue;
         }
         for target in successors(&state.terminator).into_iter().flatten() {
-            if scoped {
+            if scoped || matches!(state.terminator, TaskTerminator::Await { .. }) {
                 budget.spend()?;
             }
             incoming[target.0] += 1;
@@ -960,7 +957,7 @@ fn validate_regions_and_progress(
         if !scoped
             && matches!(
                 function.states[id].terminator,
-                TaskTerminator::Suspend { .. } | TaskTerminator::Await { .. }
+                TaskTerminator::Suspend { .. }
             )
         {
             continue;
@@ -969,7 +966,7 @@ fn validate_regions_and_progress(
             .into_iter()
             .flatten()
         {
-            if scoped {
+            if scoped || matches!(function.states[id].terminator, TaskTerminator::Await { .. }) {
                 budget.spend()?;
             }
             incoming[target.0] -= 1;
