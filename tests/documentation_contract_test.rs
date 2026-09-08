@@ -70,6 +70,7 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
             "单 worker",
             "async fn main(): null!",
             "单层 Result",
+            "源码 `if` / `else` 及分支词法作用域",
             "try/catch/finally",
             "M:N",
             "netpoll",
@@ -83,12 +84,14 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         }
         assert!(document.contains("三系统 CI"));
         assert!(!document.contains("native C 明确拒绝 async。"));
+        assert!(!document.contains("仍拒绝 if/循环/递归"));
+        assert!(!document.contains("if/循环/递归、重复赋值、嵌套 scope"));
     }
     assert!(ir.contains("Frame ABI 4、Control ABI 2、Driver ABI 6"));
     assert!(ir.contains("完成先以单次 CAS 预约内部 `COMMITTING`"));
     assert!(ir.contains("后续期限收紧也须预约同一 phase"));
     for boundary in [
-        "R5h 内部正常作用域 session（尚未接入源码）",
+        "R5h 正常作用域 session（源码 if 复用的内部协议）",
         "`scope_end` 不接受",
         "替换集合或子集",
         "Pending end 只是观察，不登记唤醒",
@@ -107,7 +110,7 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         "KU_TASK_FRAME_EXIT_STAGED",
         "finish_exit_values",
         "实际 Task 位全空",
-        "R5h.4 内部 ScopeEnter/ScopeDrain（尚未接入源码）",
+        "R5h.4 内部 ScopeEnter/ScopeDrain（源码 if 复用）",
         "每个 Task 目标必须属于当前最内层作用域",
         "CFG 全图必须是 DAG",
         "KU_TASK_FRAME_SCOPE_REQUEST",
@@ -126,6 +129,19 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
     assert!(syntax.contains("用户 cleanup 仍不能 Await"));
     assert!(ir.contains("成功 hosted take"));
     assert!(ir.contains("`ku ir` / `--emit-ir` / LLVM 仍拒绝 async"));
+    assert!(ir.contains("R5h.5 源码 if / else 接入（开发中）"));
+    assert!(!ir.contains("源码 if/loop/finally 尚未接入"));
+    for boundary in [
+        "两臂都必须通过静态类型、所有权和资源预算检查",
+        "普通重复赋值仍不支持",
+        "不能将 Task move 到另一个词法作用域",
+        "只有每条仍会到达汇合点的路径都保有同一",
+    ] {
+        assert!(
+            concurrency.contains(boundary),
+            "source If boundary: {boundary}"
+        );
+    }
 }
 
 #[test]

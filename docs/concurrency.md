@@ -28,10 +28,10 @@ v0.0.18 第二阶段已采用以下规则；这不表示所有后端已实现。
 
 解释器与各 native 切片的执行证据见实施记录；不同切片的测试结果不能互相替代。
 v0.0.18 开发分支已接通 native C 的单 worker 有限源码子集：AST 经独立 Task IR
-生成 Start、Move、Await 和函数级 scope drain，不嵌入解释器或 runner 源码。
-源码及 CLI 定向运行已通过，本轮表达式/清理定向测试与 Rust quality 通过；本轮 native 全集通过，workspace 的文档失败与修复证据单列，
-精确新提交三系统 CI/sanitizer 仍待核实，不是正式发布。历史失败与
-后续修复的分开证据见 [工作日志](v0.0.18-worklog.md)。
+生成 Start、Move、Await、函数退出与 If 分支的正常 scope drain，不嵌入解释器或 runner 源码。
+既有检查点证据与本次源码 If、Owned/Pending 专项分开记录；专项不能替代本次完整
+workspace/native 全集或精确提交三系统 CI/sanitizer 验收，不是正式发布。
+实际结果与历史失败/修复的分开证据见 [工作日志](v0.0.18-worklog.md)。
 结果等待与 ACK 等待复用固定槽位，不按每次等待分配；函数退出先移交全部 sibling，
 再等待逻辑清理 ACK。迟到 observer 可以保留控制存储，但不能保留已丢弃的 payload。
 正常 scope 超期是外层运行时 `task/shutdown_timeout`，不同于业务 Result.err，
@@ -43,7 +43,7 @@ LLVM、`ku ir` 和 `--emit-ir` 的同步 IR 路径仍拒绝 async。
 
 import 展开后只能有顶层、非泛型 async 函数；入口必须是无参数的
 `async fn main(): null!`。函数参数为 `int/bool/null/str` 或对应单层 Result，
-返回类型必须显式为 primitive `T!`。函数体支持直线局部绑定、直接 async 调用、
+返回类型必须显式为 primitive `T!`。函数体支持局部绑定、源码 `if` / `else` 及分支词法作用域、直接 async 调用、
 Task move、Await、`ok`、`?`、primitive print/println、显式 return，以及字符串常量 fail。
 Copy 表达式支持 int 的一元 `-`、`+ - * / %`、`== != < <= > >=`，以及 bool 的
 `!`、`== !=`、`&& ||`；不做 bool/int 隐式转换。整数运算先检查边界，溢出和除/余零
@@ -57,6 +57,16 @@ Copy 表达式支持 int 的一元 `-`、`+ - * / %`、`== != < <= > >=`，以�
 跳过它的 await 不免除当前 scope 的最终清理责任。
 新字符串表达式目前仅支持静态字面量；内部 ABI 仍负责 owned 参数/结果的 move/drop。
 接纳/OOM 拒绝仍消费源码已经移动的实参，返回可 await 的失败 Task，错误不再申请内存。
+
+If 包括嵌套 `else if`，条件必须是 bool，可使用当前子集的 Await、`?` 和短路表达式。
+只执行选中的分支，但两臂都必须通过静态类型、所有权和资源预算检查。非空分支正常
+结束时，先移交并等待它仍拥有的 Task 的真实清理 ACK，再释放本臂局部 Owned Value，
+之后才能进入汇合点。return/fail/`?` 错误退出复用最终退出清理，不执行另一臂或汇合点。
+内层可以用显式类型声明 shadow 外层同名局部；初始化表达式先读取原环境，离开分支
+后恢复外层名字。普通重复赋值仍不支持。分支可以直接 await 尚可用的祖先 Task，
+但不能将 Task move 到另一个词法作用域；只有每条仍会到达汇合点的路径都保有同一
+Task 时，才能在汇合后 await 它。臂内局部不能在臂外访问。
+ScopeEnter 本身不启动期限；空/inline failed 集合不创建不存在的清理 D。
 
 ```ku
 async fn Child(value: int): int! { return ok(value) }
@@ -72,7 +82,7 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝 if/循环/递归、重复赋值、嵌套拥有 Task 的作用域、try/catch/finally、闭包/函数值、
+仍拒绝循环/递归、重复赋值、跨词法作用域 Task move、try/catch/finally、闭包/函数值、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
 float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及异步标准库 I/O。
 未支持形式在生成 artifact 前明确报错。
@@ -82,8 +92,9 @@ root 使用最多 1024 个固定驻留槽；字节接纳按固定存储和生成
 不是操作系统 RSS 限制。编译器的函数/槽/操作硬限也不限制程序累计执行时间：
 无递归调用图仍可产生大量顺序工作。普通计算等待不擅自增加全局超时。
 表达式没有提高原有 64 函数、每函数 64 槽/256 状态、全程序 4096 操作及
-1,000,000 字面量字节/分析工作量上限。Parser 的解析递归深度上限仍为32；Task
-lower 对已构造 AST 另有 `depth > 64` 拒绝，这不是允许源码写64层嵌套的承诺。
+1,000,000 字面量字节/分析工作量上限。Parser/Checker 的语句体嵌套限制为32层；Task
+lower 对已构造 AST 的 If 另限32层，表达式仍受 `depth > 64` 拒绝与共同资源预算约束。
+这些是分别拒绝的边界，不是复杂源码必定能达到32层或源码可写64层的承诺。
 print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
 M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成；
 不能据此承诺 CPU 并行或高并发吞吐。
