@@ -374,7 +374,7 @@ async fn main() {
 #[test]
 fn native_build_rejects_unsupported_async_control_before_artifacts() {
     for (index, source) in [
-        "async fn main(): null! { while (false) {} return ok(null) }",
+        "async fn main(): null! { for item in 0 {} return ok(null) }",
         "async fn main(): null! { try { println(1) } finally { println(2) } return ok(null) }",
     ]
     .into_iter()
@@ -399,7 +399,7 @@ fn native_build_rejects_unsupported_async_control_before_artifacts() {
             let error = run_cli(args).expect_err("unsupported control must not emit or link C");
             assert_eq!(
                 error.message,
-                "native async subset does not support this statement; loops and try/catch/finally remain gated"
+                "native async subset does not support this statement; for/break/continue and try/catch/finally remain gated"
             );
             assert!(!file.with_extension("c").exists());
             assert!(!binary.exists());

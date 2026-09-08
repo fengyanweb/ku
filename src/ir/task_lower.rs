@@ -251,7 +251,7 @@ struct FunctionLowerer<'a> {
     scopes: Vec<TaskScopeId>,
     next_scope: usize,
     current: Option<StateId>,
-    // Await/ScopeDrain cancellation exits receive synthetic Value cleanup. Normal
+    // Suspend/Await/ScopeDrain exits receive synthetic Value cleanup. Normal
     // Exit leaves its current owners for generated all-Task handoff/finish glue.
     // Fill these finite cleanup regions after every slot is known.
     cleanup_exits: Vec<StateId>,
@@ -758,7 +758,7 @@ impl<'a> FunctionLowerer<'a> {
 
     fn lower_block(&mut self, body: &[Stmt], depth: usize) -> KuResult<()> {
         // Charge before traversal; width is not recursion depth. No new AST is
-        // cloned, and lower_if separately checks before each recursive descent.
+        // cloned; lower_if/lower_while check before each recursive descent.
         if body.len() > TaskLimits::default().max_operations {
             return Err(unsupported("statements beyond the Task budget", self.span));
         }
@@ -779,6 +779,11 @@ impl<'a> FunctionLowerer<'a> {
                 } => {
                     self.lower_if(condition, then_branch, else_branch, *span, depth)?;
                 }
+                Stmt::While {
+                    condition,
+                    body,
+                    span,
+                } => self.lower_while(condition, body, *span, depth)?,
                 Stmt::Assign { name, value, span } => {
                     self.bind(name, None, value, *span, false, depth)?
                 }
@@ -840,12 +845,55 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 _ => {
                     return Err(unsupported(
-                        "this statement; loops and try/catch/finally remain gated",
+                        "this statement; for/break/continue and try/catch/finally remain gated",
                         self.span,
                     ))
                 }
             }
         }
+        Ok(())
+    }
+
+    fn lower_while(
+        &mut self,
+        condition: &Expr,
+        body: &[Stmt],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<()> {
+        if depth >= 32 {
+            return Err(unsupported("statement nesting beyond 32 Task levels", span));
+        }
+        // Reenter before evaluating any condition operand, not at an Await
+        // ready edge or the final bool Branch. The preheader runs only once.
+        let header = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::Jump { target: header })?;
+        self.current = Some(header);
+        let condition = self.expression(condition, depth + 1)?;
+        if self.function.slots[condition.0].ty != value_slot(IrType::Bool) {
+            return Err(unsupported("non-bool while conditions", span));
+        }
+        let body_entry = self.state(TaskTerminator::Terminate)?;
+        let after = self.state(TaskTerminator::Terminate)?;
+        // Await, ? and short circuit may have replaced current. Only their
+        // actual successful endpoint decides whether this iteration enters.
+        self.terminate(TaskTerminator::Branch {
+            condition,
+            then_state: body_entry,
+            else_state: after,
+        })?;
+        if let Some(end) = self.lower_arm(body, body_entry, depth + 1)? {
+            // A nonempty body's endpoint follows its real ScopeDrain and
+            // local Value drops. An empty body still needs this forced yield.
+            let cleanup = self.state(TaskTerminator::Terminate)?;
+            self.budget.analysis(1, span)?;
+            self.cleanup_exits.push(cleanup);
+            self.function.states[end.0].terminator = TaskTerminator::Suspend {
+                resume: header,
+                cleanup,
+            };
+        }
+        self.current = Some(after);
         Ok(())
     }
 
