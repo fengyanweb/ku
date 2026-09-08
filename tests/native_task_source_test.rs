@@ -449,7 +449,7 @@ fn native_task_source_subset_rejects_unimplemented_constructs() {
         "async fn main(): null! { while (false) {} return ok(null) }",
         "async fn main(): null! { try { println(1) } finally { println(2) } return ok(null) }",
         "fn Sync(): int { return 1 } async fn main(): null! { return ok(null) }",
-        "async fn main(): null! { value = 1 value = 2 return ok(null) }",
+        "async fn main(): null! { value = \"first\" value = \"second\" return ok(null) }",
         "async fn Child(): int! { return ok(1) } async fn main(): null! { Child() return ok(null) }",
         "async fn main(): int! { return ok(1) }",
         "async fn Child(): int! { value = (await Child())? return ok(value) } async fn main(): null! { return ok(null) }",

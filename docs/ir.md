@@ -411,7 +411,9 @@ ACK/error 必须在有界 quantum 内处理，不能在耗尽预算后用 Pendin
 AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包含 runner。
 展开后所有顶层 item 必须是非泛型 async 函数；参数和返回限 primitive/单层 Result。
 支持局部绑定、源码 `if` / `else` 及分支词法作用域、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
-以及静态字符串；R5e 追加 Copy 表达式，源码 If 见 R5h.5。重复赋值、循环/递归、跨词法作用域 Task move、try/catch/finally、闭包、同步调用、
+以及静态字符串；R5e 追加 Copy 表达式，源码 If 见 R5h.5。已有 int/bool/null 局部的
+普通赋值在 RHS 成功端点 Copy 回原槽；自赋值发 Read，保留 IR 的别名/初始化检查。
+Owned/Task 重赋值、复合赋值与自增/自减、循环/递归、跨词法作用域 Task move、try/catch/finally、闭包、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 

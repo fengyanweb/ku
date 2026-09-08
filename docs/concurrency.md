@@ -63,7 +63,10 @@ If 包括嵌套 `else if`，条件必须是 bool，可使用当前子集的 Awai
 结束时，先移交并等待它仍拥有的 Task 的真实清理 ACK，再释放本臂局部 Owned Value，
 之后才能进入汇合点。return/fail/`?` 错误退出复用最终退出清理，不执行另一臂或汇合点。
 内层可以用显式类型声明 shadow 外层同名局部；初始化表达式先读取原环境，离开分支
-后恢复外层名字。普通重复赋值仍不支持。分支可以直接 await 尚可用的祖先 Task，
+后恢复外层名字。已有 int/bool/null 局部支持普通赋值 `name = expression`：RHS 在原
+环境完整求值后才写回原槽，自赋值只读、不消费；失败的 RHS 不写回。常量和函数参数
+仍不可赋值，由 checker 前置拒绝。Owned/Task 重赋值、复合赋值与自增/自减仍不支持。
+分支可以直接 await 尚可用的祖先 Task，
 但不能将 Task move 到另一个词法作用域；只有每条仍会到达汇合点的路径都保有同一
 Task 时，才能在汇合后 await 它。臂内局部不能在臂外访问。
 ScopeEnter 本身不启动期限；空/inline failed 集合不创建不存在的清理 D。
@@ -82,7 +85,7 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝循环/递归、重复赋值、跨词法作用域 Task move、try/catch/finally、闭包/函数值、
+仍拒绝循环/递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、try/catch/finally、闭包/函数值、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
 float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及异步标准库 I/O。
 未支持形式在生成 artifact 前明确报错。
