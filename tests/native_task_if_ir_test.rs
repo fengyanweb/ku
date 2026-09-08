@@ -1,0 +1,679 @@
+//! Candidate only until normal Scope and frontend-depth gates are applied.
+use ku::{
+    ast::{Expr, ExprKind, FnDecl, Item, Literal, Program, Stmt, TypeName},
+    checker::Checker,
+    ir::{
+        task::{self, SlotId, TaskLimits, TaskOp, TaskSlotType, TaskTerminator},
+        task_lower, IrType,
+    },
+    lexer::Lexer,
+    parser::Parser,
+    span::Span,
+};
+
+fn parsed(source: &str) -> Program {
+    Parser::new(Lexer::new(source).lex().expect("lex"))
+        .parse_program()
+        .expect("parse")
+}
+
+fn checked(source: &str) -> Program {
+    let ast = parsed(source);
+    Checker::new()
+        .check(&ast)
+        .unwrap_or_else(|error| panic!("{error}\n{source}"));
+    ast
+}
+
+#[test]
+fn native_task_if_lexical_names_and_terminating_move_paths_lower() {
+    for body in [
+        "if (true) { println(1) } else { println(2) } return ok(null)",
+        "if (false) { println(1) } return ok(null)",
+        "if (true) { if (false) { println(1) } else { println(2) } } else if (true) { println(3) } return ok(null)",
+        "if (true) { return ok(null) } else { fail \"other\" }",
+        "outer = \"kept\" if (true) { moved = outer return ok(null) } else { println(outer) } println(outer) return ok(null)",
+        "value: int = 1 if (true) { value: int = 2 println(value) } else { value: int = 3 println(value) } println(value) return ok(null)",
+    ] {
+        let native = task_lower::lower_program(&checked(&format!("async fn main(): null! {{ {body} }}"))).unwrap();
+        let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+        assert!(!plan.functions[0].scopes.is_empty());
+        assert!(native.tasks.functions[0].states.iter().all(|state| !matches!(state.terminator, TaskTerminator::Complete { .. })));
+    }
+}
+
+#[test]
+fn native_task_if_condition_uses_real_await_and_short_circuit_endpoints() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn Flag(value: bool): bool! { return ok(value) }
+async fn main(): null! {
+    if ((await Flag(true))? && (await Flag(false))?) { println(1) } else { println(2) }
+    return ok(null)
+}
+"#,
+    ))
+    .unwrap();
+    let main = &native.tasks.functions[native.entry.0];
+    let await_states: Vec<_> = main
+        .states
+        .iter()
+        .filter(|state| matches!(state.terminator, TaskTerminator::Await { .. }))
+        .collect();
+    assert_eq!(await_states.len(), 2);
+    assert!(await_states.iter().all(|state| state.operations.is_empty()));
+    assert_eq!(
+        main.states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .filter(|op| matches!(op, TaskOp::Start { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        main.states
+            .iter()
+            .filter(|state| matches!(state.terminator, TaskTerminator::TryResult { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        main.states
+            .iter()
+            .filter(|state| matches!(state.terminator, TaskTerminator::Branch { .. }))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn native_task_if_outer_await_keeps_original_owner_and_inner_masks_disjoint() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn Child(value: int): int! { return ok(value) }
+async fn main(): null! {
+    outer = Child(1)
+    retained = Child(2)
+    if (true) {
+        value = (await outer)?
+        inner = Child(value)
+        println(value)
+    }
+    return ok(null)
+}
+"#,
+    ))
+    .unwrap();
+    let main = &native.tasks.functions[native.entry.0];
+    let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    let frame = &plan.functions[native.entry.0];
+    assert_eq!(frame.scopes.len(), 1);
+    let mask = frame.scopes[0].task_mask;
+    assert_eq!(
+        mask.count_ones(),
+        2,
+        "Start temporary and inner binding only"
+    );
+    let awaited = main
+        .states
+        .iter()
+        .find_map(|state| match state.terminator {
+            TaskTerminator::Await { task, .. } => Some(task),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        mask & (1u64 << awaited.0),
+        0,
+        "outer Await must not transfer duty into the arm"
+    );
+    let moves_to_awaited = main
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter(|op| matches!(op, TaskOp::Move { dst, .. } if *dst == awaited))
+        .count();
+    assert_eq!(
+        moves_to_awaited, 1,
+        "only the original ROOT binding Move, no hidden cross-scope Move"
+    );
+}
+
+#[test]
+fn native_task_if_nested_task_birth_scopes_form_disjoint_masks() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn Child(value: int): int! { return ok(value) }
+async fn main(): null! {
+    root = Child(1)
+    if (true) {
+        outer = Child(2)
+        if (true) { inner = Child(3) }
+    }
+    return ok(null)
+}
+"#,
+    ))
+    .unwrap();
+    let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    let frame = &plan.functions[native.entry.0];
+    assert_eq!(frame.scopes.len(), 2);
+    let outer = frame.scopes[0].task_mask;
+    let inner = frame.scopes[1].task_mask;
+    assert_eq!(outer.count_ones(), 2);
+    assert_eq!(inner.count_ones(), 2);
+    assert_eq!(outer & inner, 0);
+    let main = &native.tasks.functions[native.entry.0];
+    let all = main
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| matches!(slot.ty, TaskSlotType::Task { .. }))
+        .fold(0u64, |mask, (index, _)| mask | (1u64 << index));
+    assert_eq!(
+        (all & !(outer | inner)).count_ones(),
+        2,
+        "ROOT Start and binding stay outside both scopes"
+    );
+    let drains: Vec<_> = main
+        .states
+        .iter()
+        .filter_map(|state| match state.terminator {
+            TaskTerminator::ScopeDrain { scope, .. } => Some(scope),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(drains.len(), 2);
+    assert!(drains.contains(&frame.scopes[0].scope) && drains.contains(&frame.scopes[1].scope));
+}
+
+#[test]
+fn native_task_if_ready_drops_only_local_values_and_cleanup_drops_all_values() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn main(): null! {
+    outer = "kept"
+    if (true) { local = "arm" wrapped = ok(local) println(outer) }
+    println(outer)
+    return ok(null)
+}
+"#,
+    ))
+    .unwrap();
+    let main = &native.tasks.functions[0];
+    let entry = &main.states[main.entry.0];
+    let outer_values: Vec<_> = entry
+        .operations
+        .iter()
+        .filter_map(|op| match op {
+            TaskOp::Init { dst, .. } | TaskOp::Move { dst, .. }
+                if matches!(
+                    &main.slots[dst.0].ty,
+                    TaskSlotType::Value {
+                        ty: IrType::Str,
+                        ..
+                    }
+                ) =>
+            {
+                Some(*dst)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outer_values.len(), 2);
+    let all_owned: Vec<_> = main
+        .slots
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(index, slot)| {
+            matches!(
+                &slot.ty,
+                TaskSlotType::Value {
+                    ty: IrType::Str | IrType::Result(_),
+                    ..
+                }
+            )
+            .then_some(TaskOp::DropIfInit {
+                slot: SlotId(index),
+            })
+        })
+        .collect();
+    let (ready, cleanup) = main
+        .states
+        .iter()
+        .find_map(|state| match state.terminator {
+            TaskTerminator::ScopeDrain { ready, cleanup, .. } => Some((ready, cleanup)),
+            _ => None,
+        })
+        .unwrap();
+    let drops: Vec<_> = main.states[ready.0]
+        .operations
+        .iter()
+        .filter_map(|op| match op {
+            TaskOp::DropIfInit { slot } => Some(*slot),
+            _ => None,
+        })
+        .collect();
+    assert!(!drops.is_empty());
+    assert!(drops.windows(2).all(|pair| pair[0].0 > pair[1].0));
+    assert!(outer_values.iter().all(|slot| !drops.contains(slot)));
+    assert_eq!(main.states[cleanup.0].operations, all_owned);
+    assert_eq!(main.states[cleanup.0].terminator, TaskTerminator::Terminate);
+}
+
+#[test]
+fn native_task_if_checker_still_rejects_escape_and_falling_path_moves() {
+    for body in [
+        "if (true) { inner = 1 } println(inner) return ok(null)",
+        "outer = \"value\" if (true) { moved = outer } println(outer) return ok(null)",
+        "if (true) { return ok(null) } else { println(missing) } return ok(null)",
+    ] {
+        let ast = parsed(&format!("async fn main(): null! {{ {body} }}"));
+        assert!(Checker::new().check(&ast).is_err(), "{body}");
+    }
+}
+
+#[test]
+fn native_task_if_ancestor_await_may_join_is_rejected_without_checker() {
+    let source = r#"
+async fn Child(): int! { return ok(1) }
+async fn Parent(gate: bool): null! {
+    outer = Child()
+    if (gate) { value = (await outer)? println(value) }
+    again = (await outer)?
+    println(again)
+    return ok(null)
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let ast = parsed(source);
+    let checked_error = Checker::new()
+        .check(&ast)
+        .expect_err("one falling arm consumed outer");
+    assert!(
+        checked_error.message.contains("moved")
+            || checked_error.message.contains("already been awaited"),
+        "{checked_error}"
+    );
+    // Do not call checked(): the lowerer must independently reject the raw AST.
+    // Its post-join hidden Move may detect this before the later Await itself.
+    let raw_error = task_lower::lower_program(&ast).expect_err("MAY is not definitely initialized");
+    assert!(
+        raw_error.message.contains("not definitely initialized"),
+        "{raw_error}"
+    );
+}
+
+#[test]
+fn native_task_if_ancestor_await_both_arms_and_terminating_arm_keep_ownership() {
+    for (body, same_await_slot) in [
+        (
+            "outer = Child() if (gate) { value = (await outer)? println(value) } else { value = (await outer)? println(value) } return ok(null)",
+            true,
+        ),
+        (
+            "outer = Child() if (gate) { value = (await outer)? println(value) return ok(null) } value = (await outer)? println(value) return ok(null)",
+            false,
+        ),
+    ] {
+        let source = format!(
+            "async fn Child(): int! {{ return ok(1) }} async fn Parent(gate: bool): null! {{ {body} }} async fn main(): null! {{ return ok(null) }}"
+        );
+        let native = task_lower::lower_program(&checked(&source)).expect("valid ownership paths");
+        let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+        let parent = native.tasks.functions.iter().find(|f| f.name == "Parent").unwrap();
+        let frame = plan.functions.iter().find(|f| f.function == parent.id).unwrap();
+        let awaited: Vec<_> = parent.states.iter().filter_map(|state| match state.terminator {
+            TaskTerminator::Await { task, .. } => Some(task),
+            _ => None,
+        }).collect();
+        assert_eq!(awaited.len(), 2);
+        assert_eq!(awaited[0] == awaited[1], same_await_slot);
+        assert!(frame.scopes.iter().all(|scope| awaited.iter().all(|slot| scope.task_mask & (1u64 << slot.0) == 0)));
+        for op in parent.states.iter().flat_map(|state| &state.operations) {
+            if let TaskOp::Move { dst, src } = op {
+                if matches!(parent.slots[src.0].ty, TaskSlotType::Task { .. }) {
+                    let owner = |slot: SlotId| frame.scopes.iter().find(|scope| scope.task_mask & (1u64 << slot.0) != 0).map(|scope| scope.scope);
+                    assert_eq!(owner(*src), owner(*dst), "hidden Task Move crossed scope");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_task_if_shadow_initializer_reads_parent_and_global_callee_returns() {
+    let source = r#"
+async fn Child(value: int): int! { return ok(value) }
+async fn Parent(gate: bool): null! {
+    value: int = 4
+    if (gate) {
+        value: int = value + 1
+        println(value)
+        Child: int = 99
+        println(Child)
+    }
+    result = (await Child(value))?
+    println(result)
+    return ok(null)
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let native = task_lower::lower_program(&checked(source)).expect("shadow scope must be popped");
+    let child = native
+        .tasks
+        .functions
+        .iter()
+        .find(|f| f.name == "Child")
+        .unwrap()
+        .id;
+    let parent = native
+        .tasks
+        .functions
+        .iter()
+        .find(|f| f.name == "Parent")
+        .unwrap();
+    let starts: Vec<_> = parent
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|op| match op {
+            TaskOp::Start { function, .. } => Some(*function),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts, [child]);
+
+    let source = "async fn Child(value: int): int! { return ok(value) } async fn main(): null! { if (true) { Child: int = 1 inner = Child(2) } return ok(null) }";
+    let ast = parsed(source);
+    assert!(
+        Checker::new().check(&ast).is_err(),
+        "primitive local cannot be called"
+    );
+    let error = task_lower::lower_program(&ast).expect_err("do not fall back to the global Child");
+    assert!(
+        error.message.contains("a call through a local value"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_task_if_reassignment_cross_scope_task_moves_and_loops_stay_gated() {
+    for source in [
+        "async fn main(): null! { value = 1 if (true) { value = 2 } return ok(null) }",
+        "async fn Child(): int! { return ok(1) } async fn main(): null! { outer = Child() if (true) { inner = outer } return ok(null) }",
+        "async fn main(): null! { while (false) { println(1) } return ok(null) }",
+    ] {
+        let error = task_lower::lower_program(&checked(source)).expect_err("outside the admitted slice");
+        assert!(error.to_string().contains("native async subset"), "{error}");
+    }
+}
+
+#[test]
+fn native_task_if_non_root_grandparent_await_both_arms_keep_the_original_slot() {
+    let source = r#"
+async fn Child(value: int): int! { return ok(value) }
+async fn Grand(gate: bool): null! {
+    if (true) {
+        grand = Child(17)
+        if (true) {
+            if (gate) { value = (await grand)? println(value) }
+            else { value = (await grand)? println(value + 1) }
+        }
+        println(19)
+    }
+    return ok(null)
+}
+async fn main(): null! {
+    first = (await Grand(true))?
+    second = (await Grand(false))?
+    return ok(null)
+}
+"#;
+    let native = task_lower::lower_program(&checked(source)).unwrap();
+    let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    let grand = native
+        .tasks
+        .functions
+        .iter()
+        .find(|f| f.name == "Grand")
+        .unwrap();
+    let frame = &plan.functions[grand.id.0];
+    assert_eq!(frame.scopes.len(), 4, "outer, middle, then and else scopes");
+    assert_eq!(
+        frame.scopes[0].task_mask.count_ones(),
+        2,
+        "Start and binding belong to non-ROOT outer scope"
+    );
+    assert!(frame.scopes[1..].iter().all(|scope| scope.task_mask == 0));
+    let awaited: Vec<_> = grand
+        .states
+        .iter()
+        .filter_map(|state| match state.terminator {
+            TaskTerminator::Await { task, .. } => Some(task),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(awaited.len(), 2);
+    assert_eq!(
+        awaited[0], awaited[1],
+        "neither arm introduces a cross-scope hidden Move"
+    );
+    assert_ne!(frame.scopes[0].task_mask & (1u64 << awaited[0].0), 0);
+    assert_eq!(
+        grand
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .filter(|op| matches!(op, TaskOp::Move { dst, .. } if *dst == awaited[0]))
+            .count(),
+        1
+    );
+    assert_eq!(
+        grand
+            .states
+            .iter()
+            .filter(|state| matches!(state.terminator, TaskTerminator::ScopeDrain { .. }))
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn native_task_if_ancestor_owned_return_survives_inner_normal_drain() {
+    let source = r#"
+async fn NestedText(gate: bool, value: str): str! {
+    if (true) {
+        held = value
+        if (true) {
+            if (gate) { return ok(held) }
+            println(held)
+        }
+        return ok(held)
+    }
+    return ok(value)
+}
+async fn main(): null! {
+    first = (await NestedText(true, "first"))?
+    second = (await NestedText(false, "second"))?
+    println(first)
+    println(second)
+    return ok(null)
+}
+"#;
+    let native = task_lower::lower_program(&checked(source)).unwrap();
+    let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    let text = native
+        .tasks
+        .functions
+        .iter()
+        .find(|f| f.name == "NestedText")
+        .unwrap();
+    let frame = &plan.functions[text.id.0];
+    assert!(frame.exit_bridge && frame.hosted);
+    assert_eq!(
+        frame.scope_task_mask, 0,
+        "Owned cleanup must not depend on having a Task slot"
+    );
+    assert_eq!(frame.scopes.len(), 3);
+    let input = text.parameters[1];
+    let held: Vec<_> = text
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|op| match op {
+            TaskOp::Move { dst, src } if *src == input => Some(*dst),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(held.len(), 1);
+    let held = held[0];
+    assert_eq!(
+        text.states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .filter(|op| matches!(op, TaskOp::WrapOk { src, .. } if *src == held))
+            .count(),
+        2,
+        "deep early Exit and later outer Exit consume the same owner on exclusive paths"
+    );
+    let drains: Vec<_> = text
+        .states
+        .iter()
+        .filter_map(|state| match state.terminator {
+            TaskTerminator::ScopeDrain { ready, .. } => Some(ready),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        drains.len(),
+        1,
+        "only the middle scope falls through; other scopes Exit"
+    );
+    assert!(text.states[drains[0].0]
+        .operations
+        .iter()
+        .all(|op| !matches!(op, TaskOp::DropIfInit { slot } if *slot == held || *slot == input)));
+    for (index, slot) in text.slots.iter().enumerate() {
+        if matches!(
+            slot.ty,
+            TaskSlotType::Value {
+                ty: IrType::Str | IrType::Result(_),
+                ..
+            }
+        ) {
+            assert!(frame.slots.contains(&SlotId(index)));
+        }
+    }
+}
+
+#[test]
+fn native_task_if_consumed_grandparent_is_not_restored_by_two_empty_drains() {
+    for other_arm in ["value = (await grand)? println(value)", "println(0)"] {
+        let source = r#"
+async fn Child(): int! { return ok(17) }
+async fn Grand(gate: bool): null! {
+    if (true) {
+        grand = Child()
+        if (true) {
+            if (gate) { value = (await grand)? println(value) }
+            else { @OTHER_ARM@ }
+        } else { value = (await grand)? println(value) }
+        again = (await grand)?
+        println(again)
+    }
+    return ok(null)
+}
+async fn main(): null! { return ok(null) }
+"#
+        .replace("@OTHER_ARM@", other_arm);
+        let ast = parsed(&source);
+        let error = Checker::new()
+            .check(&ast)
+            .expect_err("BOTH or MAY consumption reaches the later Await");
+        assert!(
+            error
+                .message
+                .contains("task 'grand' has already been awaited"),
+            "{error}"
+        );
+        let raw_error = task_lower::lower_program(&ast)
+            .expect_err("raw AST cannot resurrect an ancestor owner");
+        assert!(
+            raw_error.message.contains("not definitely initialized"),
+            "{raw_error}"
+        );
+    }
+}
+
+fn raw_nested(depth: usize) -> Program {
+    let span = Span::default();
+    let mut body = Vec::new();
+    for _ in 0..depth {
+        body = vec![Stmt::If {
+            condition: Expr::new(ExprKind::Literal(Literal::Bool(true)), span),
+            then_branch: body,
+            else_branch: Vec::new(),
+            span,
+        }];
+    }
+    body.push(Stmt::Return {
+        value: Some(Expr::new(
+            ExprKind::Call {
+                callee: Box::new(Expr::new(ExprKind::Variable("ok".into()), span)),
+                args: vec![Expr::new(ExprKind::Literal(Literal::Null), span)],
+            },
+            span,
+        )),
+        span,
+    });
+    Program {
+        items: vec![Item::Function(FnDecl {
+            name: "main".into(),
+            is_async: true,
+            type_params: Vec::new(),
+            params: Vec::new(),
+            return_type: Some(TypeName::Result(Box::new(TypeName::Null))),
+            body,
+            span,
+        })],
+    }
+}
+
+#[test]
+fn native_task_if_raw_lowerer_depth_is_independent_of_frontend_checks() {
+    task_lower::lower_program(&raw_nested(32)).expect("root does not consume a statement level");
+    let error = task_lower::lower_program(&raw_nested(33)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("statement nesting beyond 32 Task levels"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_task_if_raw_state_budget_rejects_flat_branch_growth() {
+    let mut ast = checked("async fn Probe(gate: bool): null! { return ok(null) } async fn main(): null! { return ok(null) }");
+    let Item::Function(function) = &mut ast.items[0] else {
+        unreachable!()
+    };
+    let last = function.body.pop().unwrap();
+    for _ in 0..86 {
+        function.body.push(Stmt::If {
+            condition: Expr::new(ExprKind::Variable("gate".into()), Span::default()),
+            then_branch: Vec::new(),
+            else_branch: Vec::new(),
+            span: Span::default(),
+        });
+    }
+    function.body.push(last);
+    let error = task_lower::lower_program(&ast).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("more than 256 generated Task states"),
+        "{error}"
+    );
+}

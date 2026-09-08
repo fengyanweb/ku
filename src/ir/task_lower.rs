@@ -17,8 +17,8 @@ use crate::{
 use super::{
     task::{
         self, SlotId, StateId, TaskBinaryOp, TaskConstant, TaskFunction, TaskFunctionId,
-        TaskLimits, TaskOp, TaskProgram, TaskSlot, TaskSlotType, TaskState, TaskTerminator,
-        TaskUnaryOp,
+        TaskLimits, TaskOp, TaskProgram, TaskScopeId, TaskSlot, TaskSlotType, TaskState,
+        TaskTerminator, TaskUnaryOp,
     },
     IrType,
 };
@@ -107,6 +107,15 @@ struct Budget {
 }
 
 impl Budget {
+    fn analysis(&mut self, units: usize, span: Span) -> KuResult<()> {
+        self.expressions = self
+            .expressions
+            .checked_add(units)
+            .filter(|&total| total <= TaskLimits::default().max_analysis_work)
+            .ok_or_else(|| unsupported("work beyond the Task analysis budget", span))?;
+        Ok(())
+    }
+
     fn text(&mut self, bytes: usize, span: Span) -> KuResult<()> {
         self.names_and_literals = self
             .names_and_literals
@@ -235,9 +244,14 @@ struct FunctionLowerer<'a> {
     signatures: &'a HashMap<String, Signature>,
     budget: &'a mut Budget,
     function: TaskFunction,
-    locals: HashMap<String, SlotId>,
+    locals: Vec<HashMap<String, SlotId>>,
+    // ROOT is None. Slots never change their lexical birth scope; Task moves
+    // across these owners are deliberately outside this first scoped subset.
+    slot_owners: [Option<TaskScopeId>; 64],
+    scopes: Vec<TaskScopeId>,
+    next_scope: usize,
     current: Option<StateId>,
-    // Only Await cancellation exits receive synthetic Value cleanup. Normal
+    // Await/ScopeDrain cancellation exits receive synthetic Value cleanup. Normal
     // Exit leaves its current owners for generated all-Task handoff/finish glue.
     // Fill these finite cleanup regions after every slot is known.
     cleanup_exits: Vec<StateId>,
@@ -263,7 +277,10 @@ impl<'a> FunctionLowerer<'a> {
                 states: Vec::new(),
                 result: signature.result.clone(),
             },
-            locals: HashMap::new(),
+            locals: vec![HashMap::new()],
+            slot_owners: [None; 64],
+            scopes: Vec::new(),
+            next_scope: 0,
             current: None,
             cleanup_exits: Vec::new(),
             span: declaration.span,
@@ -271,8 +288,7 @@ impl<'a> FunctionLowerer<'a> {
         lowerer.current = Some(lowerer.state(TaskTerminator::Terminate)?);
         for (parameter, ty) in declaration.params.iter().zip(&signature.parameters) {
             let slot = lowerer.slot(value_slot(ty.clone()))?;
-            if lowerer
-                .locals
+            if lowerer.locals[0]
                 .insert(parameter.name.clone(), slot)
                 .is_some()
             {
@@ -291,6 +307,8 @@ impl<'a> FunctionLowerer<'a> {
             ));
         }
         let slot = SlotId(self.function.slots.len());
+        self.budget.analysis(1, self.span)?;
+        self.slot_owners[slot.0] = self.scopes.last().copied();
         self.function.slots.push(TaskSlot { ty });
         Ok(slot)
     }
@@ -303,6 +321,7 @@ impl<'a> FunctionLowerer<'a> {
             ));
         }
         let state = StateId(self.function.states.len());
+        self.budget.analysis(1, self.span)?;
         self.function.states.push(TaskState {
             operations: Vec::new(),
             terminator,
@@ -341,6 +360,14 @@ impl<'a> FunctionLowerer<'a> {
 
     fn copy_or_move(&mut self, source: SlotId) -> KuResult<SlotId> {
         let ty = self.function.slots[source.0].ty.clone();
+        if matches!(ty, TaskSlotType::Task { .. })
+            && self.slot_owners[source.0] != self.scopes.last().copied()
+        {
+            return Err(unsupported(
+                "moving a Task across lexical scopes",
+                self.span,
+            ));
+        }
         let destination = self.slot(ty.clone())?;
         self.emit(if copy_value(&ty) {
             TaskOp::Copy {
@@ -463,7 +490,7 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 _ => Err(unsupported("this literal in a Task frame", expression.span)),
             },
-            ExprKind::Variable(name) => self.locals.get(name).copied().ok_or_else(|| {
+            ExprKind::Variable(name) => self.local(name).ok_or_else(|| {
                 unsupported(
                     "an unknown local or first-class function value",
                     expression.span,
@@ -473,6 +500,9 @@ impl<'a> FunctionLowerer<'a> {
                 let ExprKind::Variable(name) = &callee.kind else {
                     return Err(unsupported("indirect or method calls", expression.span));
                 };
+                if self.local(name).is_some() {
+                    return Err(unsupported("a call through a local value", expression.span));
+                }
                 // The ordinary checker resolves declared functions before
                 // builtin fallback. Native lowering must preserve that choice.
                 let declared_function = self.signatures.contains_key(name);
@@ -558,7 +588,13 @@ impl<'a> FunctionLowerer<'a> {
                     return Err(unsupported("await of a non-Task value", expression.span));
                 };
                 let result = result.clone();
-                let hidden = self.copy_or_move(source)?;
+                // Await consumes the existing outer owner directly. Introducing
+                // an inner hidden Move would change its cancellation duty.
+                let hidden = if self.slot_owners[source.0] != self.scopes.last().copied() {
+                    source
+                } else {
+                    self.copy_or_move(source)?
+                };
                 let destination = self.slot(value_slot(result))?;
                 let poll = self.state(TaskTerminator::Terminate)?;
                 let ready = self.state(TaskTerminator::Terminate)?;
@@ -598,7 +634,7 @@ impl<'a> FunctionLowerer<'a> {
                 Ok(destination)
             }
             _ => Err(unsupported(
-                "this expression; first native Tasks accept straight-line primitive code",
+                "this expression in the bounded primitive Task subset",
                 expression.span,
             )),
         }
@@ -646,52 +682,88 @@ impl<'a> FunctionLowerer<'a> {
         Ok(destination)
     }
 
+    fn local(&self, name: &str) -> Option<SlotId> {
+        self.locals
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
     fn bind(
         &mut self,
         name: &str,
         annotation: Option<&TypeName>,
         value: &Expr,
         span: Span,
+        declaration: bool,
+        depth: usize,
     ) -> KuResult<()> {
-        if self.locals.contains_key(name) {
+        let already_bound = if declaration {
+            self.locals
+                .last()
+                .expect("ROOT scope exists")
+                .contains_key(name)
+        } else {
+            self.local(name).is_some()
+        };
+        if already_bound {
             return Err(unsupported(
-                "reassignment in the first native Task subset",
+                "reassignment or duplicate local declarations in the native Task subset",
                 span,
             ));
         }
         self.budget.text(name.len(), span)?;
-        let source = self.expression(value, 0)?;
+        let source = self.expression(value, depth)?;
         if let Some(annotation) = annotation {
             if self.function.slots[source.0].ty != value_slot(value_type(annotation, span)?) {
                 return Err(unsupported("a mismatched local annotation", span));
             }
         }
         let destination = self.copy_or_move(source)?;
-        self.locals.insert(name.to_owned(), destination);
+        self.locals
+            .last_mut()
+            .expect("ROOT scope exists")
+            .insert(name.to_owned(), destination);
         Ok(())
     }
 
-    fn lower(mut self, declaration: &FnDecl) -> KuResult<TaskFunction> {
-        for statement in &declaration.body {
+    fn lower_block(&mut self, body: &[Stmt], depth: usize) -> KuResult<()> {
+        // Charge before traversal; width is not recursion depth. No new AST is
+        // cloned, and lower_if separately checks before each recursive descent.
+        if body.len() > TaskLimits::default().max_operations {
+            return Err(unsupported("statements beyond the Task budget", self.span));
+        }
+        self.budget.analysis(body.len(), self.span)?;
+        for statement in body {
             if self.current.is_none() {
                 return Err(unsupported(
                     "statements after unconditional exit",
-                    declaration.span,
+                    self.span,
                 ));
             }
             match statement {
-                Stmt::Assign { name, value, span } => self.bind(name, None, value, *span)?,
+                Stmt::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    span,
+                } => {
+                    self.lower_if(condition, then_branch, else_branch, *span, depth)?;
+                }
+                Stmt::Assign { name, value, span } => {
+                    self.bind(name, None, value, *span, false, depth)?
+                }
                 Stmt::VarDecl {
                     name,
                     ty,
                     value,
                     span,
                     ..
-                } => self.bind(name, ty.as_ref(), value, *span)?,
+                } => self.bind(name, ty.as_ref(), value, *span, true, depth)?,
                 Stmt::Return {
                     value: Some(value), ..
                 } => {
-                    let result = self.expression(value, 0)?;
+                    let result = self.expression(value, depth)?;
                     self.exit_result(result)?;
                 }
                 Stmt::Fail {
@@ -716,7 +788,7 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 Stmt::Print { value, .. } => {
                     let temporary = !matches!(&value.kind, ExprKind::Variable(_));
-                    let slot = self.expression(value, 0)?;
+                    let slot = self.expression(value, depth)?;
                     self.emit(TaskOp::Print {
                         value: slot,
                         newline: false,
@@ -726,7 +798,7 @@ impl<'a> FunctionLowerer<'a> {
                     }
                 }
                 Stmt::Expr { expr, .. } => {
-                    let value = self.expression(expr, 0)?;
+                    let value = self.expression(expr, depth)?;
                     if matches!(&self.function.slots[value.0].ty, TaskSlotType::Task { .. }) {
                         return Err(unsupported("discarding a Task temporary before function-scope cleanup; bind it to a local", expr.span));
                     } else if owned_value(&self.function.slots[value.0].ty)
@@ -739,12 +811,118 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 _ => {
                     return Err(unsupported(
-                        "this statement; loops, nested scopes and try/catch/finally remain gated",
-                        declaration.span,
+                        "this statement; loops and try/catch/finally remain gated",
+                        self.span,
                     ))
                 }
             }
         }
+        Ok(())
+    }
+
+    fn lower_if(
+        &mut self,
+        condition: &Expr,
+        then_branch: &[Stmt],
+        else_branch: &[Stmt],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<()> {
+        if depth >= 32 {
+            return Err(unsupported("statement nesting beyond 32 Task levels", span));
+        }
+        let condition = self.expression(condition, depth + 1)?;
+        if self.function.slots[condition.0].ty != value_slot(IrType::Bool) {
+            return Err(unsupported("non-bool if conditions", span));
+        }
+        let then_state = self.state(TaskTerminator::Terminate)?;
+        let else_state = self.state(TaskTerminator::Terminate)?;
+        // Condition lowering may have changed current through Await, ? or
+        // short circuit. Only its actual endpoint owns this Branch.
+        self.terminate(TaskTerminator::Branch {
+            condition,
+            then_state,
+            else_state,
+        })?;
+        let then_end = self.lower_arm(then_branch, then_state, depth + 1)?;
+        let else_end = self.lower_arm(else_branch, else_state, depth + 1)?;
+        if then_end.is_none() && else_end.is_none() {
+            self.current = None;
+            return Ok(());
+        }
+        let join = self.state(TaskTerminator::Terminate)?;
+        for end in [then_end, else_end].into_iter().flatten() {
+            self.function.states[end.0].terminator = TaskTerminator::Jump { target: join };
+        }
+        self.current = Some(join);
+        Ok(())
+    }
+
+    fn lower_arm(
+        &mut self,
+        body: &[Stmt],
+        entry: StateId,
+        depth: usize,
+    ) -> KuResult<Option<StateId>> {
+        self.current = Some(entry);
+        if body.is_empty() {
+            return Ok(self.current.take());
+        }
+        // IDs are dense declaration order, not the slot interval of an arm:
+        // descendants have their own disjoint ownership mask.
+        self.budget.analysis(1, self.span)?;
+        let scope = TaskScopeId(self.next_scope);
+        self.next_scope += 1; // Bounded by generated states/operations.
+        self.scopes.push(scope);
+        self.locals.push(HashMap::new());
+        let enter_op = self.function.states[entry.0].operations.len();
+        self.emit(TaskOp::ScopeEnter {
+            scope,
+            tasks: Vec::new(),
+        })?;
+        self.lower_block(body, depth)?;
+        // Finish membership from already-lowered slot provenance. Reserve work
+        // before every possible push; never evaluate a statement a second time.
+        let mut tasks = Vec::new();
+        self.budget.analysis(self.function.slots.len(), self.span)?;
+        for (index, slot) in self.function.slots.iter().enumerate() {
+            if self.slot_owners[index] == Some(scope)
+                && matches!(slot.ty, TaskSlotType::Task { .. })
+            {
+                self.budget.analysis(1, self.span)?;
+                tasks.push(SlotId(index));
+            }
+        }
+        self.function.states[entry.0].operations[enter_op] = TaskOp::ScopeEnter { scope, tasks };
+        if self.current.is_some() {
+            let ready = self.state(TaskTerminator::Terminate)?;
+            let cleanup = self.state(TaskTerminator::Terminate)?;
+            self.terminate(TaskTerminator::ScopeDrain {
+                scope,
+                ready,
+                cleanup,
+            })?;
+            self.budget.analysis(1, self.span)?;
+            self.cleanup_exits.push(cleanup);
+            self.current = Some(ready);
+            self.budget.analysis(self.function.slots.len(), self.span)?;
+            for index in (0..self.function.slots.len()).rev() {
+                if self.slot_owners[index] == Some(scope)
+                    && owned_value(&self.function.slots[index].ty)
+                {
+                    self.emit(TaskOp::DropIfInit {
+                        slot: SlotId(index),
+                    })?;
+                }
+            }
+        }
+        self.locals.pop();
+        self.scopes.pop();
+        Ok(self.current.take())
+    }
+
+    fn lower(mut self, declaration: &FnDecl) -> KuResult<TaskFunction> {
+        self.lower_block(&declaration.body, 0)?;
         if self.current.is_some() {
             return Err(unsupported(
                 "an async body without an explicit Result return or fail",

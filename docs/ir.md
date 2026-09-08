@@ -141,7 +141,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 1. 逐项补齐闭包尚未支持的 binding/payload 捕获，并为每一种 owned payload 固定逃逸与失败清理测试。
 2. 继续收窄动态 object 与 Result 的组合边界，不把单项 ABI 存在等同于任意嵌套组合已完成。
 3. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
-4. native C 已接通单 worker 有限源码 Task 子集，其余 async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；执行证据见 [阶段工作日志](v0.0.18-worklog.md)。源码及 CLI 定向运行已通过，本轮表达式/清理定向测试与 Rust quality 通过；本轮 native 全集和质量检查通过，workspace 的文档失败与修复证据单列；精确新提交三系统 CI/sanitizer 仍待核实，历史失败和修复结果分别见工作日志。不能把这个子集或内部 frame 夹具通过当作完整 native async、M:N 或生产性能验收完成。
+4. native C 已接通单 worker 有限源码 Task 子集，其余 async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；执行证据见 [阶段工作日志](v0.0.18-worklog.md)。既有检查点证据与本次源码 If、Owned/Pending 专项分开记录；专项不能替代本次完整 workspace/native 全集或精确提交三系统 CI/sanitizer 验收，历史失败和修复结果分别记录。不能把这个子集或内部 frame 夹具通过当作完整 native async、M:N 或生产性能验收完成。
 
 ## Typed Task IR 与有限源码接入（v0.0.18 开发中）
 
@@ -151,14 +151,14 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 
 当前 frame IR 使用密集 `SlotId` / `StateId`，支持 `int`、`bool`、`null`、`str`
 及对应单层 Result，以及 move-only `Task { result }` 槽。操作显式区分 Init、Copy、Move、
-WrapOk、Unary、Binary、Read、Drop、DropIfInit、Start、Print；控制边包括 Jump、Branch、Suspend
-（resume / cleanup）、Await、TryResult、Complete、内部 Exit 和 Terminate。
+WrapOk、Unary、Binary、Read、Drop、DropIfInit、Start、Print、ScopeEnter；控制边包括 Jump、Branch、Suspend
+（resume / cleanup）、Await、TryResult、ScopeDrain、Complete、内部 Exit 和 Terminate。
 暂不支持 array/object/struct/enum、函数值、Task 参数/返回或借用参数进入 frame。
 
 `verify_and_plan` 先验证形状、类型、资源硬限，再计算跨分支和循环的 must/may
 初始化固定点及包括 cleanup/drop 用途的 liveness。普通 Value-only frame 保留原有按需
 存储；hosted frame 的所有 Task 槽和 Owned Value 槽固定存储，已死亡的 Copy 临时可留
-在 resume 栈上。Await ready 消费隐藏 owner 并初始化结果，cleanup edge 在 host
+在 resume 栈上。Await ready 消费其 owner 并初始化结果，cleanup edge 在 host
 完成全部 Task 移交后清 Task 位；TryResult 的成功/错误边分别初始化不同槽。已死亡的普通 Owned Value 必须在挂起前显式
 drop，不能为了缩 frame 擅自提前释放资源。借用值不能跨 Suspend；owned 值不能隐式
 Copy、覆盖可能仍初始化的槽或再次消费 moved-from 值。Task 不能普通 Drop/DropIfInit，
@@ -173,9 +173,10 @@ cleanup IR。拒绝所有不经过实际 suspension 的环，
 内部硬限为 64 函数、每函数 64 槽 / 256 状态、全程序 4096 操作、1,000,000 字面量
 字节（含 UTF-8、Error 三字段和函数名）及 1,000,000 分析工作量；测试只能收紧限制。
 这些是已构造 IR 的分析预算，不是整个编译器 RSS 或运行时总内存预算。
-表达式新增的一/二元输入读取也计入分析工作量，没有放宽任何上限。Parser 的解析
-递归上限仍为32；Task lower 对已构造 AST 使用独立的 `depth > 64` 拒绝。raw AST
-预算测试不代表源码可以越过 parser/checker 的更早边界。
+表达式新增的一/二元输入读取也计入分析工作量，没有放宽任何上限。Parser/Checker
+的语句体嵌套限制为32层；Task lower 对已构造 AST 的 If 另限32层，表达式仍受
+`depth > 64` 拒绝与共同资源预算约束。raw AST 预算测试不代表源码可以越过
+parser/checker 的更早边界，也不保证复杂源码一定能达到32层。
 
 R3 前置操作 `WrapOk` 允许把已初始化的 primitive 局部构造为匹配的 Result，
 不再只支持 `Ok` 常量。Copy primitive 保留来源；owned str 移动并清空来源。
@@ -406,12 +407,13 @@ ACK/error 必须在有界 quantum 内处理，不能在耗尽预算后用 Pendin
 `ku build --backend c` / `ku build --native` 对显式 `async fn main(): null!` 选择独立
 AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包含 runner。
 展开后所有顶层 item 必须是非泛型 async 函数；参数和返回限 primitive/单层 Result。
-支持直线绑定、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
-以及静态字符串；R5e 追加下节的 Copy 表达式。重复赋值、if/循环/递归、嵌套 scope、try/catch/finally、闭包、同步调用、
+支持局部绑定、源码 `if` / `else` 及分支词法作用域、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
+以及静态字符串；R5e 追加 Copy 表达式，源码 If 见 R5h.5。重复赋值、循环/递归、跨词法作用域 Task move、try/catch/finally、闭包、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
-`KuTaskValueV1` 是 move-only 内部值；Await 的隐藏 owner 计入64槽和初始化分析。
+`KuTaskValueV1` 是 move-only 内部值；同 scope Await 的隐藏 owner 计入64槽和初始化分析。
+直接 Await 祖先 Task 消费原 owner 槽，不借隐藏 Move 转移词法清理责任。
 接纳/OOM 拒绝清理已 move 的源码实参，产生静态错误的 inline failed Task，不再分配。
 源码 Exit 先暂存返回 Result；所有 sibling 先移交到固定 driver 槽，才释放其余
 Value、取入 private READY，然后等待 receipt ACK。
@@ -428,7 +430,7 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 不从旧 SHA 的通过结果外推。Frame ABI 4、Control ABI 2、Driver ABI 6 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
 
-### R5h 内部正常作用域 session（尚未接入源码）
+### R5h 正常作用域 session（源码 if 复用的内部协议）
 
 `ku_task_driver_scope_begin` 由唯一 RUNNING executor 在任何 owner 移交前登记完整
 live-child mask、固定容量1..64的稳定 receipt 存储和绝对 D；零 mask/id 合法。
@@ -448,8 +450,8 @@ manifest 是借用的稳定 instance 存储；完整集合、生命周期、唯�
 该存储；terminal 在释放 registry/执行租约前只注销元数据，不代表替调用方清完子树。
 父 D 缩短不扫描 manifest，adapter 对 pending issued child 调用 cancel_receipt；
 取消后向最终退出提升、外层 child 合并复用下述 driver 原语及内部 typed adapter。
-对应 TaskOp/verifier 和帧协议见 R5h.4；源码 if/loop/finally 尚未接入，不改变前述源码拒绝边界，
-不代表完整 async 或 M:N。
+对应 TaskOp/verifier 和帧协议见 R5h.4；源码 If 分支按 R5h.5 复用该协议，source
+loop/finally 仍未接入，不放宽其余源码边界，不代表完整 async 或 M:N。
 容量和重复检查最多64项/2016次比较，无新增堆分配、队列或 RC 边；测试与精确提交
 验收结果见工作日志，不从接口存在推断真实 C 或 sanitizer 已通过。
 
@@ -474,7 +476,8 @@ timeout/global fault 不单独阻断安全的 outer 登记，失败仍保持；�
 parent cleanup_fault、非法 manifest/token/alias 仍拒绝，输出与原对象不变。
 保留旧 outgoing ACK wait 和 incoming ancestor 关系，不新增分配、RC、队列、
 唤醒、等待或重试。生成 adapter 必须先移交全部 Task，再清理其余 Value；正常
-scope 超时、业务 return/Err 穿作用域及 async finally 的源码闭环仍未完成。
+scope 超时和业务 return/Err 穿 If 作用域使用上述桥接；Owned/Pending、失败与竞态
+的执行证据分开记录，不从接口存在推断通过。async finally 的源码闭环仍未接入。
 
 ### R5h.3 typed Exit 与当前源码子集
 
@@ -505,16 +508,16 @@ staged/私有结果期间胜出，沿原 R2 首赢家裁决，结果只 drop 一
 本片不增加每值分配、线程、重试循环或用户 API；复用原 frame 位图、driver receipt
 与串行 executor。IR 反例、真实 C 退出顺序测试和 ABI 拒绝测试分别记录证据，不从
 artifact 文本存在推断执行通过。内部 normal ScopeEnter/ScopeDrain 与活动 session
-的 final promotion adapter 接入见下节；source if/loop/finally、完整 native async
-与高并发发布门禁仍未完成。具体测试结果以工作日志及精确提交 CI 为准。
+的 final promotion adapter 接入见下节，源码 If 接入见 R5h.5；source loop/finally、
+完整 native async 与高并发发布门禁仍未完成。具体测试结果以工作日志及精确提交 CI 为准。
 
-### R5h.4 内部 ScopeEnter/ScopeDrain（尚未接入源码）
+### R5h.4 内部 ScopeEnter/ScopeDrain（源码 if 复用）
 
 `ScopeEnter { scope, tasks }` 是唯一且稠密的词法所有权声明，不初始化值、不分配
 runtime 栈、不启动期限。Task 集合最多64槽且互不重叠；未声明的 Task 属于隐式 ROOT。
 每个 Task 目标必须属于当前最内层作用域，Task Move 不得跨所有权作用域；不能把
 内层新建 owner 写进未列出的 ROOT 槽来逃过清理。直接 Await 外层 owner 可以消费它，
-但不能借隐藏 Move 跨域。这里没有放开任何新源码写法。
+但不能借隐藏 Move 跨域。源码 If 仅按下节有限范围复用，不新增 scope/Task 管理 API。
 
 `ScopeDrain { scope, ready, cleanup }` 只能关闭当前最内层作用域，ready 只清该集合
 的 Task 初始化事实，取消边清全部 Task，之后才进入有限 Value cleanup。普通汇合
@@ -546,9 +549,23 @@ scope_end；全量 ACK 后异常 Pending 作为合同错误拒绝，不循环 YI
 两次有界 drain；Control ABI 2 在同一 poll 中还可进入一次取消 cleanup，而非循环重试。
 不递归 drive child、增加线程或重试环；新增实例字段继续通过 sizeof 计费。
 
-上述是内部合同和实现边界，不等于所有故障/竞态已实测，也不是完整 lexical Value
-析构或源码 if/loop/finally 实现。真实 C、无副作用 raw 反例、sanitizer、精确 SHA 三系统
+上述是内部合同和实现边界，不等于所有故障/竞态已实测。源码 If 只覆盖已接入的
+primitive/单层 Result，不是任意 Owned payload、loop/finally 或完整 async 实现。
+真实 C、无副作用 raw 反例、sanitizer、精确 SHA 三系统
 结果分开验收；固定硬件性能、RSS、soak、M:N、netpoll 和事件 HTTP 仍未完成。
+
+### R5h.5 源码 if / else 接入（开发中）
+
+`task_lower.rs` 将 bool If 降成真实条件结束点上的 Branch。非空臂按词法出生槽生成
+ScopeEnter，正常落下经 ScopeDrain，再反序 DropIfInit 本臂 Owned Value；Exit 臂不
+加普通 drain，交现有最终退出桥接。只有可继续的臂连接 join，Task must/may 初始化
+事实由既有 verifier 合流。slot owner 在 lowering 中不改变；直接 Await 祖先 owner
+不新建跨域 hidden Move。两臂均静态检查，不以常量条件绕过不支持形式。
+
+If 嵌套另设32层拒绝边界；词法名、臂宽、mask/清理扫描继续计入原分析、slot、state
+和 operation 上限。不引入新的用户 API、ABI 版本、线程、重试环或等待机制。
+源码、原始 IR、Owned/Pending、sanitizer 的测试证据分开记录；专项不能替代本次
+完整 workspace/native 全集或精确提交三系统 CI/sanitizer 验收。
 
 ### R5e checked Copy 表达式
 
