@@ -100,7 +100,7 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 map(ok_value);
                 map(err_result);
             }
-            TaskTerminator::Complete { value } => map(value),
+            TaskTerminator::Complete { value } | TaskTerminator::Exit { value } => map(value),
             TaskTerminator::Jump { .. }
             | TaskTerminator::Suspend { .. }
             | TaskTerminator::Terminate => {}

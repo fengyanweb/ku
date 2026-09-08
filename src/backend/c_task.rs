@@ -79,6 +79,7 @@ struct FrameEmitter<'a> {
     frame_type: String,
     task_mask: u64,
     hosted: bool,
+    exit_bridge: bool,
 }
 
 impl<'a> FrameEmitter<'a> {
@@ -102,6 +103,13 @@ impl<'a> FrameEmitter<'a> {
                 "native task frame plan has invalid storage slots",
             ));
         }
+        // These scans use the verifier's existing bounded slot/state lists;
+        // the bridge adds no per-instance storage or recursive ownership tree.
+        let exit_bridge = function
+            .states
+            .iter()
+            .any(|state| matches!(state.terminator, TaskTerminator::Exit { .. }));
+        let mut task_mask = 0u64;
         for (index, slot) in function.slots.iter().enumerate() {
             match &slot.ty {
                 TaskSlotType::Value { ty, borrowed } => {
@@ -111,11 +119,32 @@ impl<'a> FrameEmitter<'a> {
                             "borrowed values cannot enter a native task frame",
                         ));
                     }
+                    if frame.hosted
+                        && !*borrowed
+                        && matches!(ty, IrType::Str | IrType::Result(_))
+                        && !persistent.contains(&index)
+                    {
+                        return Err(unsupported(
+                            "hosted owned values must remain in native task frame storage",
+                        ));
+                    }
                 }
                 TaskSlotType::Task { result } => {
                     require_result_type(result)?;
+                    task_mask |= 1u64 << index;
+                    if !persistent.contains(&index) {
+                        return Err(unsupported("Task slots must be persistent"));
+                    }
                 }
             }
+        }
+        if frame.scope_task_mask != task_mask
+            || frame.exit_bridge != exit_bridge
+            || frame.hosted != (task_mask != 0 || exit_bridge)
+        {
+            return Err(unsupported(
+                "native task frame plan has inconsistent exit ownership",
+            ));
         }
         require_result_type(&function.result)?;
         Ok(Self {
@@ -123,8 +152,9 @@ impl<'a> FrameEmitter<'a> {
             persistent,
             prefix: format!("ku_task_frame_{}", function.id.0),
             frame_type: format!("KuTaskFrame_{}", function.id.0),
-            task_mask: frame.scope_task_mask,
+            task_mask,
             hosted: frame.hosted,
+            exit_bridge,
         })
     }
 
@@ -208,6 +238,7 @@ impl<'a> FrameEmitter<'a> {
         self.emit_init(out)?;
         self.emit_drive(out)?;
         self.emit_resume(out);
+        self.emit_finish_exit_values(out)?;
         self.emit_terminate(out)?;
         self.emit_take_result(out)?;
         self.emit_destroy(out)?;
@@ -225,12 +256,14 @@ impl<'a> FrameEmitter<'a> {
                {frame_type}* frame = ({frame_type}*)storage;\n\
                if (frame->header.abi_version != KU_TASK_FRAME_ABI_VERSION) return KU_TASK_FRAME_ABI_MISMATCH;\n\
                if (frame->header.storage_size != sizeof({frame_type}) || frame->header.function_id != UINT64_C({id})) return KU_TASK_FRAME_INVALID_STORAGE;\n\
-               if (frame->header.running || frame->header.status > KU_TASK_FRAME_TIMED_OUT) return KU_TASK_FRAME_INVALID_STATE;\n\
+               if (frame->header.running || (frame->header.status > KU_TASK_FRAME_TIMED_OUT && frame->header.status != KU_TASK_FRAME_EXIT_STAGED)) return KU_TASK_FRAME_INVALID_STATE;\n\
+               if (frame->header.status == KU_TASK_FRAME_EXIT_STAGED && (!{exit_bridge} || frame->header.result_initialized != 1u || frame->header.cleanup_state != UINT32_MAX || (frame->header.exit_class != KU_TASK_EXIT_USER_RESULT && frame->header.exit_class != KU_TASK_EXIT_RUNTIME_FAILURE) || frame->header.has_exit_deadline > 1u || (!frame->header.has_exit_deadline && frame->header.exit_deadline) || (frame->header.has_exit_deadline && frame->header.exit_deadline == UINT64_MAX) || (frame->header.exit_class == KU_TASK_EXIT_USER_RESULT && (frame->header.has_exit_deadline || frame->header.exit_deadline)))) return KU_TASK_FRAME_INVALID_STATE;\n\
                if (frame->header.state >= {states}u || (frame->header.cleanup_state != UINT32_MAX && frame->header.cleanup_state >= {states}u)) return KU_TASK_FRAME_INVALID_STATE;\n\
                return KU_TASK_FRAME_OK;\n\
              }}\n",
             id = self.function.id.0,
-            states = self.function.states.len()
+            states = self.function.states.len(),
+            exit_bridge = if self.exit_bridge { "1" } else { "0" }
         ));
     }
 
@@ -378,6 +411,21 @@ impl<'a> FrameEmitter<'a> {
                            frame->header.running = 0;\n\
                            return KU_TASK_FRAME_READY;\n",
                     );
+                }
+                TaskTerminator::Exit { value } => {
+                    out.push_str("  if (cleanup) goto ku_task_terminated;\n");
+                    out.push_str(&format!(
+                        "  frame->result = {};\n",
+                        c_move_value(self.slot_type(*value)?, &self.place(*value))?
+                    ));
+                    self.set_init(out, *value, false);
+                    out.push_str(
+                        "  frame->header.result_initialized = 1;\n\
+                           frame->header.exit_class = KU_TASK_EXIT_USER_RESULT;\n\
+                           frame->header.has_exit_deadline = 0;\n\
+                           frame->header.exit_deadline = 0;\n",
+                    );
+                    self.emit_exit_staged(out);
                 }
                 TaskTerminator::TryResult {
                     src,
@@ -623,10 +671,33 @@ impl<'a> FrameEmitter<'a> {
         let IrType::Result(inner) = &self.function.result else {
             return Err(unsupported("runtime exit requires Result"));
         };
+        if self.exit_bridge {
+            // Cleanup already has a genuine R2 reason. Do not evaluate/consume
+            // a new error expression or replace that reason with a staged exit.
+            out.push_str("    if (cleanup) goto ku_task_terminated;\n");
+        }
         out.push_str(&format!("    frame->result=({}){{false,{}, {error}}};\n    frame->header.result_initialized=1;\n    frame->header.exit_class=KU_TASK_EXIT_RUNTIME_FAILURE;\n",c_type(&self.function.result)?,c_zero_initializer(inner)?));
-        self.emit_all_slot_drops(out, true)?;
-        out.push_str("    frame->header.status=KU_TASK_FRAME_READY; frame->header.running=0; return KU_TASK_FRAME_READY;\n");
+        if self.exit_bridge {
+            // Await has already copied the inherited absolute deadline. Keep
+            // it unchanged here; arithmetic/Print do not create a new budget.
+            self.emit_exit_staged(out);
+        } else {
+            self.emit_all_slot_drops(out, true)?;
+            out.push_str("    frame->header.status=KU_TASK_FRAME_READY; frame->header.running=0; return KU_TASK_FRAME_READY;\n");
+        }
         Ok(())
+    }
+
+    fn emit_exit_staged(&self, out: &mut COutput) {
+        // The Result and current ownership bitmap no longer match any prior
+        // Suspend/Await cleanup edge. Cancellation must use the bitmap fallback
+        // after the adapter has durably handed off every remaining Task owner.
+        out.push_str(
+            "  frame->header.cleanup_state = UINT32_MAX;\n\
+               frame->header.status = KU_TASK_FRAME_EXIT_STAGED;\n\
+               frame->header.running = 0;\n\
+               return KU_TASK_FRAME_EXIT_STAGED;\n",
+        );
     }
 
     fn emit_slot_drop(&self, out: &mut COutput, slot: SlotId) -> KuResult<()> {
@@ -668,13 +739,43 @@ impl<'a> FrameEmitter<'a> {
                uint32_t checked = {prefix}_check(storage, bytes, abi);\n\
                if (checked != KU_TASK_FRAME_OK) return checked;\n\
                {frame_type}* frame = ({frame_type}*)storage;\n\
-               if (ku_task_frame_is_terminal(frame->header.status)) return frame->header.status;\n\
+               if (ku_task_frame_is_terminal(frame->header.status) || frame->header.status == KU_TASK_FRAME_EXIT_STAGED) return frame->header.status;\n\
                if (!clock || !clock->now_ms || ({hosted} && !clock->host)) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
                frame->header.running = 1;\n\
                return {prefix}_drive(frame, clock, 0);\n\
              }}\n",
             hosted=if self.hosted { "1" } else { "0" }
         ));
+    }
+
+    fn emit_finish_exit_values(&self, out: &mut COutput) -> KuResult<()> {
+        let prefix = &self.prefix;
+        let frame_type = &self.frame_type;
+        out.push_str(&format!(
+            "static uint32_t {prefix}_finish_exit_values(void* storage, size_t bytes, uint32_t abi) {{\n\
+               uint32_t checked = {prefix}_check(storage, bytes, abi);\n\
+               if (checked != KU_TASK_FRAME_OK) return checked;\n"
+        ));
+        if !self.exit_bridge {
+            out.push_str("  return KU_TASK_FRAME_INVALID_STATE;\n}\n");
+            return out.check();
+        }
+        out.push_str(&format!(
+            "  {frame_type}* frame = ({frame_type}*)storage;\n\
+               if (frame->header.status != KU_TASK_FRAME_EXIT_STAGED || (frame->header.initialized & UINT64_C({task_mask}))) return KU_TASK_FRAME_INVALID_STATE;\n\
+               frame->header.running = 1;\n",
+            task_mask = self.task_mask
+        ));
+        // All owned Values are persistent in a bridge, including an empty
+        // Task set. Typed drops cannot invoke Ku callbacks or fail halfway;
+        // clear their bits once, retaining the independently staged Result.
+        self.emit_all_slot_drops(out, false)?;
+        out.push_str(
+            "  frame->header.status = KU_TASK_FRAME_READY;\n\
+               frame->header.running = 0;\n\
+               return KU_TASK_FRAME_OK;\n}\n",
+        );
+        out.check()
     }
 
     fn emit_terminate(&self, out: &mut COutput) -> KuResult<()> {
@@ -696,11 +797,22 @@ impl<'a> FrameEmitter<'a> {
                  frame->header.state = frame->header.cleanup_state;\n\
                  return {prefix}_drive(frame, clock, 1);\n\
                }}\n\
-               /* Before the first suspend, only owned entry parameters exist. */\n\
+               /* Entry, mid-drive cancellation and staged exits use current bitmap facts. */\n\
                if (clock->now_ms(clock->context) >= absolute_cleanup_deadline_ms) frame->header.cleanup_timed_out = 1;\n"
         ,task_mask=self.task_mask));
-        // Entry parameters are always persistent, so no stack slot exists here.
+        // Every owned value reaching this fallback is persistent. A staged
+        // Result remains independently owned until the all-Task handoff check
+        // above succeeds; cancellation then discards it exactly once.
         self.emit_all_slot_drops(out, false)?;
+        if self.exit_bridge {
+            out.push_str(&format!(
+                "  if (frame->header.result_initialized) {{\n\
+                     frame->header.result_initialized = 0;\n\
+                     {}\n\
+                   }}\n",
+                drop_statement(&self.function.result, "frame->result")?
+            ));
+        }
         out.push_str(
             "  frame->header.running = 0;\n\
                return frame->header.status;\n}\n",
@@ -858,7 +970,7 @@ fn constant_expr(value: &TaskConstant, ty: &IrType) -> KuResult<String> {
 }
 
 const FRAME_ABI: &str = r#"
-/* Internal frame ABI v2: single owner/executor, externally serialized calls.
+/* Internal frame ABI v3: single owner/executor, externally serialized calls.
  * Storage must be zero-filled, suitably aligned, caller-owned and live until
  * destroy finishes; destroy drops payloads but never frees that storage. Do not
  * mutate/copy a live frame. Owned argument headers and their deep payloads must
@@ -867,8 +979,12 @@ const FRAME_ABI: &str = r#"
  * disjoint. Pending -> terminate -> destroy is frame-layer cleanup, NOT a Ku
  * Task handle-drop implementation. Clock callbacks are trusted non-reentrant,
  * monotonic internal hooks. Hosted child owners must be transferred before
- * terminate/destroy; host pointers are borrowed only during a callback. */
-#define KU_TASK_FRAME_ABI_VERSION 2u
+ * terminate/destroy; host pointers are borrowed only during a callback.
+ * EXIT_STAGED is stopped but nonterminal: resume cannot replay it, take/destroy
+ * reject it. After all Task owners are handed off, finish_exit_values drops
+ * Values and makes the retained Result READY. Genuine cancellation may instead
+ * terminate, dropping both current Values and the staged Result once. */
+#define KU_TASK_FRAME_ABI_VERSION 3u
 #if defined(_MSC_VER)
 #define KU_TASK_FRAME_ALIGNOF(T) __alignof(T)
 #else
@@ -885,7 +1001,8 @@ enum {
   KU_TASK_FRAME_INVALID_STATE = 7u,
   KU_TASK_FRAME_LIMIT = 8u,
   KU_TASK_FRAME_INVALID_ARGUMENT = 9u,
-  KU_TASK_FRAME_DESTROYED = 10u
+  KU_TASK_FRAME_DESTROYED = 10u,
+  KU_TASK_FRAME_EXIT_STAGED = 11u
 };
 typedef struct KuTaskFrameClockV1 {
   uint64_t (*now_ms)(void* context);

@@ -9,7 +9,16 @@ mod native_harness;
 #[path = "support/native_task_ledger.rs"]
 mod native_task_ledger;
 
-use ku::{backend::c, checker::Checker, ir::task_lower, lexer::Lexer, parser::Parser};
+use ku::{
+    backend::c,
+    checker::Checker,
+    ir::{
+        task::{self, SlotId, TaskLimits, TaskOp, TaskSlotType, TaskTerminator},
+        task_lower, IrType,
+    },
+    lexer::Lexer,
+    parser::Parser,
+};
 use native_allocation_harness::ALLOCATION_HOOK;
 use native_harness::{
     compile_harness, run_bounded, TempDir, NATIVE_THREAD_LIFECYCLE_HARNESS, RUN_LIMITS, RUN_TIMEOUT,
@@ -24,6 +33,15 @@ fn replace_once(source: String, anchor: &str, replacement: &str) -> String {
 
 #[test]
 fn native_task_runtime_failure_keeps_original_deadline_through_successful_inner_drains() {
+    run_runtime_deadline_fixture(false);
+}
+
+#[test]
+fn native_task_typed_exit_ir_boundary_inherits_runtime_deadline_and_rejects_raw_metadata() {
+    run_runtime_deadline_fixture(true);
+}
+
+fn run_runtime_deadline_fixture(exit_bridge: bool) {
     let source = r#"
 async fn Grand(value: str): int! {
     held = Held(3)
@@ -48,7 +66,52 @@ async fn main(): null! { return ok(null) }
         .parse_program()
         .unwrap();
     Checker::new().check(&ast).unwrap();
-    let native = task_lower::lower_program(&ast).unwrap();
+    let mut native = task_lower::lower_program(&ast).unwrap();
+    if exit_bridge {
+        // Test-only IR boundary: keep the admitted source lowering unchanged.
+        // Match its exact synthetic cleanup suffix before removing anything;
+        // no body Drop or cancellation-region operation is filtered out.
+        for function in &mut native.tasks.functions {
+            let mut exits = 0;
+            for state in &mut function.states {
+                let TaskTerminator::Complete { value } = state.terminator else {
+                    continue;
+                };
+                let cleanup: Vec<_> = function
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(index, slot)| {
+                        SlotId(*index) != value
+                            && matches!(&slot.ty, TaskSlotType::Value { ty, borrowed: false }
+                                if matches!(ty, IrType::Str | IrType::Result(_)))
+                    })
+                    .map(|(index, _)| TaskOp::DropIfInit {
+                        slot: SlotId(index),
+                    })
+                    .collect();
+                let prefix = state
+                    .operations
+                    .len()
+                    .checked_sub(cleanup.len())
+                    .expect("compiler exit cleanup suffix is present");
+                assert_eq!(&state.operations[prefix..], cleanup.as_slice());
+                state.operations.truncate(prefix);
+                state.terminator = TaskTerminator::Exit { value };
+                exits += 1;
+            }
+            assert!(
+                exits > 0,
+                "fixture function must contain an actual Complete"
+            );
+        }
+        let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+        assert!(plan
+            .functions
+            .iter()
+            .all(|frame| frame.exit_bridge && frame.hosted));
+    }
     for (id, name) in ["Grand", "Parent", "Leaf", "Held", "main"]
         .iter()
         .enumerate()
@@ -59,8 +122,22 @@ async fn main(): null! { return ok(null) }
     for forbidden in ["run_source", "const SOURCE", "Task.new", "task.spawn"] {
         assert!(!generated.contains(forbidden));
     }
+    let ledger = if exit_bridge {
+        replace_once(
+            LOCKED_ALLOCATIONS.to_owned(),
+            "ku_perf_free(p);",
+            "fixture_exit_record_free(p); ku_perf_free(p);",
+        )
+    } else {
+        LOCKED_ALLOCATIONS.to_owned()
+    };
+    let declarations = if exit_bridge {
+        "static void fixture_exit_record_free(void*);\nstatic void fixture_exit_stage(unsigned,void*,uint32_t,const void*);\n"
+    } else {
+        ""
+    };
     let instrumentation = format!(
-        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\n{IO_HOOK}\nstatic uint32_t fixture_hold(void*,int);\nstatic void fixture_worker_exited(void);\n"
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{declarations}{ledger}\n{IO_HOOK}\nstatic uint32_t fixture_hold(void*,int);\nstatic void fixture_worker_exited(void);\n"
     );
     let generated = replace_once(
         generated,
@@ -87,13 +164,51 @@ async fn main(): null! { return ok(null) }
         "  /* No further driver or task storage access after this point. */",
         "  /* No further driver or task storage access after this point. */\n  fixture_worker_exited();",
     );
+    let mut generated = generated;
+    if exit_bridge {
+        assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 3u"));
+        for id in 0..3 {
+            let call = format!(
+                "status = ku_task_frame_{id}_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);"
+            );
+            generated = replace_once(
+                generated,
+                &call,
+                &format!("{call}\n    fixture_exit_stage({id}u,instance,status,&clock);"),
+            );
+        }
+        generated = replace_once(
+            generated,
+            "static uint32_t ku_task_driver_owner_drop_receipt(\n",
+            "static uint32_t ku_task_driver_owner_drop_receipt(const KuTaskDriverTicketV1*,KuTaskControlOwnerV1*,uint64_t,KuTaskDriverCleanupReceiptV1*);\nstatic uint32_t fixture_exit_real_owner_drop_receipt(\n",
+        );
+    }
     let mut generated = replace_once(
         generated,
         "int main(void) {",
         "static int fixture_unmodified_source_main(void) {",
     );
-    generated.push_str(C_MAIN);
-    let directory = TempDir::new("native-task-runtime-deadline");
+    if exit_bridge {
+        generated.push_str(EXIT_PROBES);
+        let body = replace_once(
+            C_MAIN.to_owned(),
+            "  KuString input={buffer,7u,31u,KU_STRING_OWNED};",
+            "  fixture_exit_input=(uintptr_t)buffer;\n  KuString input={buffer,7u,31u,KU_STRING_OWNED};",
+        );
+        let body = replace_once(
+            body,
+            "  puts(\"task-runtime-deadline-ok\"); return 0;",
+            "  CHECK(fixture_exit_input_frees==1u && fixture_exit_invalid_metadata==1u && fixture_exit_original==original);\n  for (size_t i=0;i<3u;i++) CHECK(fixture_exit_stages[i]==1u && fixture_exit_transfers[i]==1u);\n  puts(\"task-runtime-deadline-ok\"); return 0;",
+        );
+        generated.push_str(&body);
+    } else {
+        generated.push_str(C_MAIN);
+    }
+    let directory = TempDir::new(if exit_bridge {
+        "native-task-exit-runtime-deadline"
+    } else {
+        "native-task-runtime-deadline"
+    });
     let path = directory.path().join("program.c");
     fs::write(&path, generated).unwrap();
     let Some(executable) = compile_harness(directory.path(), &path, "program") else {
@@ -121,6 +236,96 @@ async fn main(): null! { return ok(null) }
     );
     assert!(output.stderr.is_empty());
 }
+
+const EXIT_PROBES: &str = r#"
+// Only the Exit IR-boundary variant emits these observers. They do not supply
+// an error, receipt, control phase, deadline choice or cleanup implementation.
+static uintptr_t fixture_exit_input;
+static unsigned fixture_exit_input_frees,fixture_exit_stages[3],fixture_exit_transfers[3];
+static unsigned fixture_exit_invalid_metadata;
+static uint64_t fixture_exit_original;
+static void fixture_exit_record_free(void* pointer) {
+  // The shared allocation lock is held; compare identity before actual free.
+  if (pointer && (uintptr_t)pointer==fixture_exit_input) {
+    CHECK(!fixture_exit_input_frees++);
+    CHECK(fixture_exit_stages[2]==1u && fixture_exit_transfers[0]==1u);
+    CHECK(fixture_exit_invalid_metadata==1u);
+  }
+}
+static uint32_t ku_task_driver_owner_drop_receipt(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlOwnerV1* owner,uint64_t deadline,KuTaskDriverCleanupReceiptV1* receipt) {
+  CHECK(owner->lease.control && owner->lease.control->operations.resume==ku_task_3_resume);
+  KuTaskInstance_3* held=(KuTaskInstance_3*)owner->lease.control;
+  int64_t id=held->frame.s_0; CHECK(id>=1 && id<=3);
+  uint32_t status=fixture_exit_real_owner_drop_receipt(ticket,owner,deadline,receipt);
+  CHECK(status==KU_TASK_DRIVER_OK && !owner->lease.control);
+  CHECK(receipt->driver==ticket->driver && receipt->slot==ticket->slot && receipt->generation==ticket->generation);
+  CHECK(!fixture_exit_transfers[id-1]++);
+  if (id==1) {
+    CHECK(fixture_exit_stages[2]==1u && !fixture_exit_input_frees);
+    CHECK(!fixture_exit_original); fixture_exit_original=deadline;
+  } else {
+    CHECK(fixture_exit_stages[id==2 ? 1 : 0]==1u);
+    CHECK(deadline==fixture_exit_original);
+  }
+  return status;
+}
+static void fixture_exit_stage(unsigned id,void* raw,uint32_t status,const void* raw_clock) {
+  if (status!=KU_TASK_FRAME_EXIT_STAGED) return;
+  CHECK(id<3u && !fixture_exit_stages[id]++);
+  KuTaskFrameHeaderV1* header;
+  KuResult_int* result;
+  if (id==0u) {
+    KuTaskInstance_0* instance=(KuTaskInstance_0*)raw;
+    CHECK(!instance->payload_initialized && !instance->drain_started);
+    header=&instance->frame.header; result=&instance->frame.result;
+  } else if (id==1u) {
+    KuTaskInstance_1* instance=(KuTaskInstance_1*)raw;
+    CHECK(!instance->payload_initialized && !instance->drain_started);
+    header=&instance->frame.header; result=&instance->frame.result;
+  } else {
+    KuTaskInstance_2* instance=(KuTaskInstance_2*)raw;
+    const KuTaskFrameClockV1* clock=(const KuTaskFrameClockV1*)raw_clock;
+    CHECK(!instance->payload_initialized && !instance->drain_started);
+    header=&instance->frame.header; result=&instance->frame.result;
+    CHECK(header->exit_class==KU_TASK_EXIT_RUNTIME_FAILURE && header->result_initialized==1u);
+    CHECK(!header->has_exit_deadline && !header->exit_deadline);
+    CHECK((uintptr_t)instance->frame.s_0.ptr==fixture_exit_input && !fixture_exit_input_frees);
+    CHECK(instance->frame.s_0.storage==KU_STRING_OWNED && fixture_writes==1u);
+    CHECK(!fixture_exit_transfers[0]);
+    // Isolated raw-negative input: stage/class/outcome are the actual I/O
+    // failure. Change only canonical metadata, never a business/control phase.
+    unsigned char before[sizeof(instance->frame)]; memcpy(before,&instance->frame,sizeof(before));
+    KuResult_int untouched={0};
+    header->exit_deadline=1u; // Invalid: has_exit_deadline is still zero.
+    CHECK(ku_task_frame_2_check(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION)==KU_TASK_FRAME_INVALID_STATE);
+    CHECK(ku_task_frame_2_resume(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION,clock)==KU_TASK_FRAME_INVALID_STATE);
+    CHECK(ku_task_frame_2_finish_exit_values(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION)==KU_TASK_FRAME_INVALID_STATE);
+    CHECK(ku_task_frame_2_take_result(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION,&untouched)==KU_TASK_FRAME_INVALID_STATE);
+    CHECK(ku_task_frame_2_destroy(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION)==KU_TASK_FRAME_INVALID_STATE);
+    CHECK(!untouched.ok && !untouched.value && !untouched.error.domain.ptr
+        && !untouched.error.domain.len && !untouched.error.domain.capacity && !untouched.error.domain.storage
+        && !untouched.error.code.ptr && !untouched.error.code.len && !untouched.error.code.capacity && !untouched.error.code.storage
+        && !untouched.error.message.ptr && !untouched.error.message.len && !untouched.error.message.capacity && !untouched.error.message.storage);
+    CHECK(header->exit_deadline==1u && !header->has_exit_deadline);
+    header->exit_deadline=0; // Restore exactly our metadata, not fault recovery.
+    CHECK(!memcmp(before,&instance->frame,sizeof(before)));
+    CHECK(ku_task_frame_2_check(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION)==KU_TASK_FRAME_OK);
+    CHECK(!fixture_exit_input_frees && !fixture_exit_transfers[0] && fixture_writes==1u);
+    fixture_exit_invalid_metadata++;
+  }
+  CHECK(header->status==KU_TASK_FRAME_EXIT_STAGED && header->result_initialized==1u);
+  CHECK(header->exit_class==KU_TASK_EXIT_RUNTIME_FAILURE && header->cleanup_state==UINT32_MAX && !header->running);
+  CHECK(!result->ok && result->error.domain.len==2u && result->error.code.len==12u
+      && result->error.message.len==19u);
+  CHECK(!memcmp(result->error.domain.ptr,"io",2u) && !memcmp(result->error.code.ptr,"write_failed",12u)
+      && !memcmp(result->error.message.ptr,"output write failed",19u));
+  if (id<2u) {
+    CHECK(fixture_exit_original && header->has_exit_deadline==1u && header->exit_deadline==fixture_exit_original);
+    CHECK(header->exit_deadline!=ku_task_driver_now_ms()+1000u);
+  }
+}
+"#;
 
 const IO_HOOK: &str = r#"
 static unsigned fixture_writes;

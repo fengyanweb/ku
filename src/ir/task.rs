@@ -176,6 +176,12 @@ pub enum TaskTerminator {
     Complete {
         value: SlotId,
     },
+    /// Stage a whole-function user Result without publishing or dropping Values.
+    /// The generated adapter must hand off all Task owners before finish-exit
+    /// glue clears remaining Owned Values. This has no normal successor.
+    Exit {
+        value: SlotId,
+    },
     /// Only valid in cancellation regions reached from suspension cleanup.
     Terminate,
 }
@@ -211,8 +217,11 @@ pub struct TaskFramePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskFunctionFrame {
     pub function: TaskFunctionId,
-    /// Requires adapter host services (Task slots, Start, or Await).
+    /// Requires adapter host services (Task slots, Start/Await, or staged Exit).
     pub hosted: bool,
+    /// Derived from actual Exit terminators, never a caller-supplied IR switch.
+    /// The backend must implement staged exit and mandatory finish-exit glue.
+    pub exit_bridge: bool,
     /// Every declared Task slot. The host owns their final-drain responsibility.
     pub scope_task_mask: u64,
     /// Original dense SlotIds: parameters plus live values crossing suspension.
@@ -447,7 +456,9 @@ fn successors(term: &TaskTerminator) -> [Option<StateId>; 2] {
         TaskTerminator::Suspend { resume, cleanup } => [Some(*resume), Some(*cleanup)],
         TaskTerminator::Await { ready, cleanup, .. } => [Some(*ready), Some(*cleanup)],
         TaskTerminator::TryResult { ok, err, .. } => [Some(*ok), Some(*err)],
-        TaskTerminator::Complete { .. } | TaskTerminator::Terminate => [None, None],
+        TaskTerminator::Complete { .. }
+        | TaskTerminator::Exit { .. }
+        | TaskTerminator::Terminate => [None, None],
     }
 }
 
@@ -457,6 +468,7 @@ struct SlotMasks {
     owned: u64,
     borrowed: u64,
     tasks: u64,
+    exit_bridge: bool,
 }
 
 fn validate_shape(
@@ -478,6 +490,8 @@ fn validate_shape(
     let mut owned = 0;
     let mut borrowed = 0;
     let mut tasks = 0;
+    let mut exit_bridge = false;
+    let mut legacy_complete = false;
     for (index, slot) in function.slots.iter().enumerate() {
         match &slot.ty {
             TaskSlotType::Value { borrowed: true, .. } => borrowed |= bit(SlotId(index)),
@@ -689,9 +703,18 @@ fn validate_shape(
                 return Err(invalid("branch condition must be bool"))
             }
             TaskTerminator::Complete { value } => {
+                legacy_complete = true;
                 let (ty, is_borrowed) = slot_type(get_slot(*value)?)?;
                 if ty != &function.result || is_borrowed {
                     return Err(invalid("completion must move the matching owned Result"));
+                }
+            }
+            TaskTerminator::Exit { value } => {
+                // This mode derivation is part of the already charged state walk.
+                exit_bridge = true;
+                let (ty, is_borrowed) = slot_type(get_slot(*value)?)?;
+                if ty != &function.result || is_borrowed {
+                    return Err(invalid("Exit must move the matching owned Result"));
                 }
             }
             TaskTerminator::Await { task, dst, .. } => {
@@ -730,11 +753,15 @@ fn validate_shape(
             _ => {}
         }
     }
+    if exit_bridge && legacy_complete {
+        return Err(invalid("Exit bridge cannot contain legacy Complete"));
+    }
     Ok(SlotMasks {
         parameters,
         owned,
         borrowed,
         tasks,
+        exit_bridge,
     })
 }
 
@@ -813,6 +840,9 @@ fn validate_regions_and_progress(function: &TaskFunction, budget: &mut Budget) -
                     .flatten(),
             ),
             TaskTerminator::Terminate => {}
+            TaskTerminator::Exit { .. } => {
+                return Err(invalid("cleanup cannot stage a normal Exit"))
+            }
             _ => return Err(invalid("cleanup cannot complete or suspend")),
         }
     }
@@ -1023,7 +1053,9 @@ fn live_states(function: &TaskFunction, tasks: u64, budget: &mut Budget) -> KuRe
             let mut live = output;
             match state.terminator {
                 TaskTerminator::Branch { condition, .. } => live |= bit(condition),
-                TaskTerminator::Complete { value } => live |= bit(value),
+                TaskTerminator::Complete { value } | TaskTerminator::Exit { value } => {
+                    live |= bit(value)
+                }
                 TaskTerminator::Await { task, .. } => live |= bit(task),
                 TaskTerminator::TryResult { src, .. } => live |= bit(src),
                 _ => {}
@@ -1068,7 +1100,10 @@ fn validate_ownership_and_plan(
     live_out: &[u64],
     budget: &mut Budget,
 ) -> KuResult<TaskFunctionFrame> {
-    let hosted = masks.tasks != 0;
+    // Exit can return to the adapter even when the function has no Task slots.
+    // Preserve every Owned Value for runtime-error and staged-result cleanup;
+    // ordinary dead Copy temporaries still need no persistent storage.
+    let hosted = masks.tasks != 0 || masks.exit_bridge;
     let mut frame = masks.parameters | masks.tasks;
     if hosted {
         frame |= masks.owned;
@@ -1141,6 +1176,18 @@ fn validate_ownership_and_plan(
                     return Err(invalid("completion leaves owned slots without cleanup"));
                 }
             }
+            TaskTerminator::Exit { value } => {
+                if state.must & bit(value) == 0 {
+                    return Err(invalid("Exit reads an uninitialized Result"));
+                }
+                if state.may & masks.borrowed != 0 {
+                    return Err(invalid("borrowed value cannot cross Exit boundary"));
+                }
+                // There is no successor: the matching Result moves into the
+                // staged exit record, while all other Owned bits remain for
+                // mandatory generated cleanup after Task-owner handoff. They
+                // are already persistent because Exit always requires hosting.
+            }
             TaskTerminator::Terminate if state.may & masks.owned != 0 => {
                 return Err(invalid("termination leaves owned slots without cleanup"))
             }
@@ -1195,6 +1242,7 @@ fn validate_ownership_and_plan(
     Ok(TaskFunctionFrame {
         function: function.id,
         hosted,
+        exit_bridge: masks.exit_bridge,
         scope_task_mask: masks.tasks,
         slots: slots(frame),
         suspensions,

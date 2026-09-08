@@ -66,7 +66,7 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         assert!(document.contains("三系统 CI"));
         assert!(!document.contains("native C 明确拒绝 async。"));
     }
-    assert!(ir.contains("Frame ABI 2、Control ABI 1、Driver ABI 6"));
+    assert!(ir.contains("Frame ABI 3、Control ABI 1、Driver ABI 6"));
     for boundary in [
         "R5h 内部正常作用域 session（尚未接入源码）",
         "`scope_end` 不接受",
@@ -81,6 +81,11 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         "typed 整函数退出见证授权",
         "promotion 的 OK 仅表示元数据登记成功",
         "现有 wrapper 会跳过 scope 期限刷新",
+        "R5h.3a 内部 typed Exit 清理桥接（尚未接入源码）",
+        "源码 lower 当前继续使用 Complete",
+        "KU_TASK_FRAME_EXIT_STAGED",
+        "finish_exit_values",
+        "实际 Task 位全空",
     ] {
         assert!(ir.contains(boundary), "scope session boundary: {boundary}");
     }
