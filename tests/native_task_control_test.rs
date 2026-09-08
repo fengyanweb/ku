@@ -90,10 +90,11 @@ fn native_task_control_frame_arbitration_and_references_execute_in_c() {
         assert!(!generated.contains(forbidden));
     }
     assert!(generated.contains("KuTaskControlV1"));
+    assert!(generated.contains("#define KU_TASK_CONTROL_ABI_VERSION 2u"));
     let mut source = generated
         .replacen(
             "typedef struct KuString {",
-            &format!("{ALLOCATION_HOOK}\ntypedef struct KuString {{"),
+            &format!("{ALLOCATION_HOOK}\nstatic void fixture_tighten_gate(void*,unsigned);\ntypedef struct KuString {{"),
             1,
         )
         .replacen(
@@ -101,9 +102,24 @@ fn native_task_control_frame_arbitration_and_references_execute_in_c() {
             "static int ku_generated_main(void) {",
             1,
         );
+    // Pause the genuine request implementation around its own phase CAS.
+    // No fixture writes a phase, deadline, terminal result or cleanup ACK.
+    for (anchor, replacement) in [
+        (
+            "  size_t requested = phase;",
+            "  fixture_tighten_gate(control,0u);\n  size_t requested = phase;",
+        ),
+        (
+            "  /* Another writer may have published a smaller D before our reservation.",
+            "  fixture_tighten_gate(control,1u);\n  /* Another writer may have published a smaller D before our reservation.",
+        ),
+    ] {
+        assert_eq!(source.matches(anchor).count(), 1, "tighten hook: {anchor}");
+        source = source.replacen(anchor, replacement, 1);
+    }
     source.push_str(NATIVE_THREAD_LIFECYCLE_HARNESS);
     source.push_str(C_MAIN);
-    let directory = TempDir::new("task-control-v1");
+    let directory = TempDir::new("task-control-v2");
     let c_file = directory.path().join("control.c");
     fs::write(&c_file, source).expect("write generated task control harness");
     let Some(executable) = compile_harness(directory.path(), &c_file, "control") else {
@@ -128,7 +144,7 @@ fn native_task_control_frame_arbitration_and_references_execute_in_c() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().replace('\r', ""),
-        "task-control-v1-ok\n"
+        "task-control-v2-ok\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -146,11 +162,13 @@ typedef struct FixtureContext {
   bool pause_ready;
   bool pause_take;
   bool pause_cleanup;
+  bool pause_drop;
   bool defer_cleanup;
   uint64_t now;
   uint64_t observed_deadline;
   unsigned resume_calls;
   unsigned cleanup_calls;
+  unsigned ready_cleanup_calls;
   unsigned frame_drops;
   unsigned payload_drops;
   unsigned takes;
@@ -159,6 +177,40 @@ typedef struct FixtureContext {
   KuTestEvent entered;
   KuTestEvent proceed;
 } FixtureContext;
+
+typedef struct FixtureTightenGate {
+  FixtureContext* context;
+  unsigned point, hits;
+  uint32_t reason;
+  KuTestEvent entered, proceed;
+} FixtureTightenGate;
+/* Published before thread creation, immutable until both workers join. Only
+ * the one request thread increments hits; event publication orders observation.
+ * Old cases leave this NULL and allocate no additional event resources. */
+static FixtureTightenGate* fixture_tighten_active;
+static void fixture_tighten_gate(void* raw,unsigned point) {
+  FixtureTightenGate* gate=fixture_tighten_active;
+  if (!gate || raw!=&gate->context->control || point!=gate->point) return;
+  CHECK(!gate->hits++);
+  size_t expected=point==0u
+      ? (gate->reason==KU_TASK_CONTROL_CANCELLED ? KU_TASK_CONTROL_REQUESTED_CANCEL : KU_TASK_CONTROL_REQUESTED_TIMEOUT)
+      : (gate->reason==KU_TASK_CONTROL_CANCELLED ? KU_TASK_CONTROL_PUBLISHING_CANCEL : KU_TASK_CONTROL_PUBLISHING_TIMEOUT);
+  CHECK(ku_task_control_atomic_load(&gate->context->control.phase)==expected);
+  CHECK(ku_test_event_set(&gate->entered));
+  CHECK(ku_test_event_wait(&gate->proceed,2000));
+}
+static void fixture_tighten_gate_begin(FixtureTightenGate* gate,FixtureContext* context,
+                                     unsigned point,uint32_t reason) {
+  CHECK(!fixture_tighten_active);
+  memset(gate,0,sizeof(*gate)); gate->context=context; gate->point=point; gate->reason=reason;
+  CHECK(ku_test_event_init(&gate->entered)); CHECK(ku_test_event_init(&gate->proceed));
+  fixture_tighten_active=gate;
+}
+static void fixture_tighten_gate_end(FixtureTightenGate* gate) {
+  CHECK(fixture_tighten_active==gate && gate->hits==1u);
+  fixture_tighten_active=NULL;
+  CHECK(ku_test_event_destroy(&gate->entered)); CHECK(ku_test_event_destroy(&gate->proceed));
+}
 
 /* The allocation ledger is deliberately not accessed concurrently: main owns
  * fixture allocation, executor owns callbacks, and main waits for OS join before
@@ -199,6 +251,15 @@ static uint32_t fixture_cleanup(void* raw, uint32_t reason, KuTaskControlV1* bud
     context->observed_deadline = ku_task_control_cleanup_deadline(budget);
   }
   if (context->defer_cleanup && context->cleanup_calls == 1) return KU_TASK_CONTROL_PENDING;
+  if (context->frame->header.status == KU_TASK_FRAME_READY) {
+    /* Completion lost its reservation to cancellation after the actual frame
+     * Result was taken. Do not replay the stale Suspend cleanup on moved
+     * Values: validate the empty READY frame and let drop_frame destroy it. */
+    CHECK(!context->payload_initialized && !context->frame->header.initialized
+        && !context->frame->header.result_initialized);
+    ++context->ready_cleanup_calls;
+    return KU_TASK_CONTROL_OK;
+  }
   KuTaskFrameClockV1 clock = { fixture_now, context };
   uint32_t frame_reason = reason == KU_TASK_CONTROL_TIMED_OUT ? KU_TASK_FRAME_TIMED_OUT : KU_TASK_FRAME_CANCELLED;
   CHECK(ku_task_frame_0_terminate(context->frame, sizeof(*context->frame), FRAME_ABI,
@@ -208,6 +269,12 @@ static uint32_t fixture_cleanup(void* raw, uint32_t reason, KuTaskControlV1* bud
 static void fixture_drop_frame(void* raw) {
   FixtureContext* context = (FixtureContext*)raw;
   CHECK(context->frame && context->frame_drops == 0);
+  if (context->pause_drop) {
+    /* A real callback boundary after R2 has reserved COMMITTING. Main only
+     * reads pre-event immutable witnesses and calls public control APIs. */
+    CHECK(ku_test_event_set(&context->entered));
+    CHECK(ku_test_event_wait(&context->proceed, 2000));
+  }
   CHECK(ku_task_frame_0_destroy(context->frame, sizeof(*context->frame), FRAME_ABI) == KU_TASK_FRAME_OK);
   free(context->frame);
   context->frame = NULL;
@@ -267,6 +334,8 @@ static void fixture_init_with_ops(FixtureContext* context, KuTaskControlOwnerV1*
   KuString cleanup = fixture_owned("cleanup");
   CHECK(ku_task_frame_0_init(context->frame, sizeof(*context->frame), FRAME_ABI, &input, &cleanup) == KU_TASK_FRAME_OK);
   CHECK(ku_task_control_init(&context->control, sizeof(context->control), 0, operations, context, owner) == KU_TASK_CONTROL_ABI_MISMATCH);
+  CHECK(ku_task_control_init(&context->control, sizeof(context->control), 1u, operations, context, owner) == KU_TASK_CONTROL_ABI_MISMATCH);
+  CHECK(!owner->lease.control && ku_task_frame_zero_bytes(&context->control, sizeof(context->control)));
   CHECK(ku_task_control_init(&context->control, sizeof(context->control) - 1, CONTROL_ABI, operations, context, owner) == KU_TASK_CONTROL_INVALID_ARGUMENT);
   KuTaskControlOpsV1 incomplete = *operations;
   incomplete.resume = NULL;
@@ -319,7 +388,7 @@ static void fixture_cancel_beats_private_result(uint32_t outcome, uint32_t reaso
   CHECK(ku_test_thread_join(&thread, 2000) && thread.outcome == 0);
   CHECK(worker.observed == reason && ku_task_control_status(&observer) == reason);
   CHECK(context.frame_drops == 1 && context.payload_drops == 1 && context.takes == 0);
-  CHECK(context.cleanup_calls == 0 && context.resume_calls == 2);
+  CHECK(context.cleanup_calls == 1 && context.ready_cleanup_calls == 1 && context.resume_calls == 2);
   CHECK(ku_perf_live_allocations == 0 && ku_perf_live_bytes == 0);
   KuResult_str output = {0};
   CHECK(ku_task_control_take_result(&observer, &output) != KU_TASK_CONTROL_OK);
@@ -328,6 +397,70 @@ static void fixture_cancel_beats_private_result(uint32_t outcome, uint32_t reaso
   CHECK(context.disposes == 0);
   CHECK(ku_task_control_lease_release(&worker.lease) == KU_TASK_CONTROL_OK);
   CHECK(context.disposes == 0);
+  CHECK(ku_task_control_lease_release(&observer) == KU_TASK_CONTROL_OK);
+  fixture_finish(&context);
+}
+static int fixture_empty_string(KuString value) {
+  return !value.ptr && !value.len && !value.capacity && !value.storage;
+}
+static int fixture_empty_result(KuResult_str value) {
+  return !value.ok && fixture_empty_string(value.value)
+      && fixture_empty_string(value.error.domain) && fixture_empty_string(value.error.code)
+      && fixture_empty_string(value.error.message);
+}
+static void fixture_completion_reservation_hides_terminal(uint32_t outcome, uint32_t attempted_reason) {
+  FixtureContext context;
+  KuTaskControlOwnerV1 owner;
+  fixture_init(&context, &owner, outcome);
+  KuTaskControlLeaseV1 observer = {0};
+  FixtureWorker worker = {0};
+  CHECK(ku_task_control_lease_retain(&owner.lease, &observer) == KU_TASK_CONTROL_OK);
+  CHECK(ku_task_control_lease_retain(&owner.lease, &worker.lease) == KU_TASK_CONTROL_OK);
+  CHECK(ku_task_control_poll(&observer) == KU_TASK_CONTROL_PENDING);
+  context.pause_drop = true;
+  KuTestThread thread;
+  CHECK(ku_test_thread_start(&thread, fixture_worker_poll, &worker));
+  CHECK(ku_test_event_wait(&context.entered, 2000));
+  /* The genuine completion CAS has won, but real destruction has not run.
+   * COMMITTING is neither a cancellation publisher nor any public terminal. */
+  CHECK(ku_task_control_atomic_load(&context.control.phase) == KU_TASK_CONTROL_COMMITTING);
+  CHECK(!ku_task_control_is_terminal(KU_TASK_CONTROL_COMMITTING)
+      && !ku_task_control_is_publishing(KU_TASK_CONTROL_COMMITTING));
+  CHECK(context.resume_calls == 2 && !context.cleanup_calls && !context.frame_drops);
+  CHECK(context.frame && context.payload_initialized && context.control.frame_destroyed);
+  CHECK(ku_task_control_atomic_load(&context.control.payload) == KU_TASK_CONTROL_PAYLOAD_EMPTY);
+  CHECK(ku_task_control_atomic_load(&context.control.lifecycle_pin) == 1);
+  size_t references = ku_task_control_atomic_load(&context.control.references);
+  uint64_t deadline = ku_task_control_cleanup_deadline(&context.control);
+  CHECK(ku_task_control_status(&observer) == KU_TASK_CONTROL_PENDING);
+  CHECK(ku_task_control_poll(&observer) == KU_TASK_CONTROL_PENDING);
+  KuResult_str output = {0};
+  CHECK(ku_task_control_take_result(&observer, &output) == KU_TASK_CONTROL_PENDING);
+  CHECK(fixture_empty_result(output) && !context.takes && !context.payload_drops);
+  CHECK(ku_task_control_request_cancel(&observer, attempted_reason, 50) == KU_TASK_CONTROL_PENDING);
+  CHECK(ku_task_control_owner_drop(&owner, 40) == KU_TASK_CONTROL_PENDING);
+  CHECK(owner.lease.control == &context.control);
+  CHECK(ku_task_control_atomic_load(&context.control.references) == references);
+  CHECK(ku_task_control_cleanup_deadline(&context.control) == deadline);
+  CHECK(ku_task_control_status(&observer) == KU_TASK_CONTROL_PENDING);
+  CHECK(ku_test_event_set(&context.proceed));
+  CHECK(ku_test_thread_join(&thread, 2000) && thread.outcome == 0);
+  CHECK(worker.observed == outcome && ku_task_control_status(&observer) == outcome);
+  CHECK(context.frame_drops == 1 && !context.frame && !context.cleanup_calls);
+  CHECK(context.resume_calls == 2 && context.payload_initialized);
+  CHECK(!ku_task_control_atomic_load(&context.control.lifecycle_pin));
+  CHECK(ku_task_control_request_cancel(&observer, attempted_reason, 1) == outcome);
+  CHECK(ku_task_control_poll(&observer) == outcome && context.resume_calls == 2);
+  CHECK(ku_task_control_take_result(&observer, &output) == KU_TASK_CONTROL_OK);
+  CHECK(output.ok == (outcome == KU_TASK_CONTROL_COMPLETED));
+  if (output.ok) CHECK(output.value.len == 12);
+  else CHECK(output.error.domain.len == 4 && output.error.message.len == 11);
+  CHECK(context.takes == 1 && !context.payload_drops);
+  ku_result_drop_str(&output); CHECK(fixture_empty_result(output));
+  CHECK(ku_task_control_owner_drop(&owner, 1000) == KU_TASK_CONTROL_OK);
+  CHECK(!owner.lease.control && !context.disposes);
+  CHECK(ku_task_control_lease_release(&worker.lease) == KU_TASK_CONTROL_OK);
+  CHECK(!context.disposes);
   CHECK(ku_task_control_lease_release(&observer) == KU_TASK_CONTROL_OK);
   fixture_finish(&context);
 }
@@ -464,11 +597,136 @@ static void fixture_live_cleanup_budget(uint32_t reason) {
   CHECK(ku_task_control_cleanup_deadline(&context.control) == 500);
   CHECK(ku_test_event_set(&context.proceed));
   CHECK(ku_test_thread_join(&thread, 2000) && thread.outcome == 0);
-  CHECK(worker.observed == reason && context.observed_deadline == 500);
-  CHECK(context.cleanup_calls == 1 && context.frame_drops == 1 && context.payload_drops == 0);
+  /* Even though this callback reread 500, the executor's entry snapshot was
+   * 1000. R2 must preserve the frame and perform one more actual cleanup
+   * dispatch instead of acknowledging an obsolete budget. */
+  CHECK(worker.observed == KU_TASK_CONTROL_PENDING && context.observed_deadline == 500);
+  CHECK(ku_task_control_status(&observer) == KU_TASK_CONTROL_PENDING);
+  CHECK(ku_task_control_atomic_load(&context.control.phase) ==
+      (reason == KU_TASK_CONTROL_CANCELLED ? KU_TASK_CONTROL_REQUESTED_CANCEL : KU_TASK_CONTROL_REQUESTED_TIMEOUT));
+  CHECK(context.cleanup_calls == 1 && context.frame_drops == 0 && context.payload_drops == 0);
+  CHECK(context.frame && !context.control.frame_destroyed);
+  CHECK(context.resume_calls == 1 && ku_perf_live_allocations == 1 && ku_perf_live_bytes == sizeof(*context.frame));
+  CHECK(ku_task_control_atomic_load(&context.control.lifecycle_pin) == 1);
+  context.pause_cleanup = false;
+  CHECK(ku_task_control_poll(&observer) == reason);
+  CHECK(context.cleanup_calls == 2 && context.observed_deadline == 500 && !context.ready_cleanup_calls);
+  CHECK(context.frame_drops == 1 && context.payload_drops == 0);
   CHECK(context.disposes == 0 && ku_perf_live_allocations == 0 && ku_perf_live_bytes == 0);
   CHECK(ku_task_control_lease_release(&worker.lease) == KU_TASK_CONTROL_OK);
   CHECK(ku_task_control_lease_release(&observer) == KU_TASK_CONTROL_OK);
+  fixture_finish(&context);
+}
+typedef struct FixtureDeadlineWorker {
+  KuTaskControlLeaseV1 lease;
+  uint32_t attempted_reason, observed;
+  uint64_t deadline;
+} FixtureDeadlineWorker;
+static int fixture_deadline_worker(void* raw) {
+  FixtureDeadlineWorker* worker=(FixtureDeadlineWorker*)raw;
+  worker->observed=ku_task_control_request_cancel(&worker->lease,worker->attempted_reason,worker->deadline);
+  return 0;
+}
+static void fixture_tighten_after_terminal_cannot_write(uint32_t reason) {
+  FixtureContext context;
+  KuTaskControlOwnerV1 owner;
+  fixture_init(&context,&owner,KU_TASK_CONTROL_FAILED);
+  KuTaskControlLeaseV1 observer={0};
+  FixtureDeadlineWorker request={0};
+  CHECK(ku_task_control_lease_retain(&owner.lease,&observer)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_control_lease_retain(&owner.lease,&request.lease)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_control_poll(&observer)==KU_TASK_CONTROL_PENDING);
+  CHECK(ku_task_control_request_cancel(&observer,reason,1000)==KU_TASK_CONTROL_OK);
+  request.attempted_reason=reason==KU_TASK_CONTROL_CANCELLED ? KU_TASK_CONTROL_TIMED_OUT : KU_TASK_CONTROL_CANCELLED;
+  request.deadline=500;
+  FixtureTightenGate gate;
+  fixture_tighten_gate_begin(&gate,&context,0u,reason);
+  KuTestThread thread;
+  CHECK(ku_test_thread_start(&thread,fixture_deadline_worker,&request));
+  CHECK(ku_test_event_wait(&gate.entered,2000));
+  /* Request really observed REQUESTED and D=1000 before reaching its CAS.
+   * The serial executor, not this fixture, now freezes and completes cleanup. */
+  CHECK(ku_task_control_cleanup_deadline(&context.control)==1000 && gate.hits==1u);
+  CHECK(ku_task_control_poll(&observer)==reason);
+  CHECK(ku_task_control_status(&observer)==reason && context.frame_drops==1u);
+  CHECK(context.cleanup_calls==1u && context.resume_calls==1u && !context.ready_cleanup_calls);
+  CHECK(!context.frame && !context.payload_initialized && !context.payload_drops && !context.takes);
+  CHECK(!ku_task_control_atomic_load(&context.control.lifecycle_pin));
+  /* The paused request thread performs no allocation or context callback.
+   * Its live lease keeps the control valid while the real frame has died. */
+  CHECK(ku_perf_live_allocations==0 && ku_perf_live_bytes==0);
+  CHECK(ku_test_event_set(&gate.proceed));
+  CHECK(ku_test_thread_join(&thread,2000) && thread.outcome==0);
+  CHECK(request.observed==reason && ku_task_control_status(&observer)==reason);
+  CHECK(ku_task_control_cleanup_deadline(&context.control)==1000);
+  CHECK(context.frame_drops==1u && context.cleanup_calls==1u);
+  KuResult_str output={0};
+  CHECK(ku_task_control_take_result(&observer,&output)==reason && fixture_empty_result(output));
+  fixture_tighten_gate_end(&gate);
+  CHECK(ku_task_control_owner_drop(&owner,100)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_control_lease_release(&request.lease)==KU_TASK_CONTROL_OK && !context.disposes);
+  CHECK(ku_task_control_lease_release(&observer)==KU_TASK_CONTROL_OK);
+  fixture_finish(&context);
+}
+static void fixture_publishing_blocks_cleanup_commit(uint32_t reason) {
+  FixtureContext context;
+  KuTaskControlOwnerV1 owner;
+  fixture_init(&context,&owner,KU_TASK_CONTROL_FAILED);
+  KuTaskControlLeaseV1 observer={0};
+  FixtureWorker executor={0};
+  FixtureDeadlineWorker request={0};
+  CHECK(ku_task_control_lease_retain(&owner.lease,&observer)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_control_lease_retain(&owner.lease,&executor.lease)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_control_lease_retain(&owner.lease,&request.lease)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_control_poll(&observer)==KU_TASK_CONTROL_PENDING);
+  CHECK(ku_task_control_request_cancel(&observer,reason,1000)==KU_TASK_CONTROL_OK);
+  context.pause_cleanup=true;
+  request.attempted_reason=reason==KU_TASK_CONTROL_CANCELLED ? KU_TASK_CONTROL_TIMED_OUT : KU_TASK_CONTROL_CANCELLED;
+  request.deadline=500;
+  FixtureTightenGate gate;
+  fixture_tighten_gate_begin(&gate,&context,1u,reason);
+  KuTestThread cleanup_thread,request_thread;
+  CHECK(ku_test_thread_start(&cleanup_thread,fixture_worker_poll,&executor));
+  CHECK(ku_test_event_wait(&context.entered,2000));
+  CHECK(ku_test_thread_start(&request_thread,fixture_deadline_worker,&request));
+  CHECK(ku_test_event_wait(&gate.entered,2000));
+  size_t publishing=reason==KU_TASK_CONTROL_CANCELLED ? KU_TASK_CONTROL_PUBLISHING_CANCEL : KU_TASK_CONTROL_PUBLISHING_TIMEOUT;
+  CHECK(ku_task_control_atomic_load(&context.control.phase)==publishing);
+  /* The callback entered under the old published D. Its real cleanup ends
+   * while another thread still owns publication; no fixture rewrites the CAS. */
+  CHECK(ku_test_event_set(&context.proceed));
+  CHECK(ku_test_thread_join(&cleanup_thread,2000) && cleanup_thread.outcome==0);
+  CHECK(executor.observed==KU_TASK_CONTROL_PENDING && context.cleanup_calls==1u);
+  CHECK(context.observed_deadline==1000 && context.resume_calls==1u && !context.ready_cleanup_calls);
+  CHECK(context.frame && !context.frame_drops && !context.control.frame_destroyed);
+  CHECK(!context.payload_initialized && !context.payload_drops && !context.takes);
+  CHECK(ku_task_control_atomic_load(&context.control.phase)==publishing);
+  CHECK(ku_task_control_atomic_load(&context.control.lifecycle_pin)==1u);
+  CHECK(!ku_task_control_atomic_load(&context.control.executor));
+  CHECK(ku_perf_live_allocations==1u && ku_perf_live_bytes==sizeof(*context.frame));
+  KuResult_str output={0};
+  CHECK(ku_task_control_status(&observer)==KU_TASK_CONTROL_PENDING);
+  CHECK(ku_task_control_take_result(&observer,&output)==KU_TASK_CONTROL_PENDING && fixture_empty_result(output));
+  CHECK(ku_task_control_poll(&observer)==KU_TASK_CONTROL_PENDING && context.cleanup_calls==1u);
+  CHECK(ku_task_control_request_cancel(&observer,request.attempted_reason,250)==KU_TASK_CONTROL_PENDING);
+  context.pause_cleanup=false;
+  CHECK(ku_test_event_set(&gate.proceed));
+  CHECK(ku_test_thread_join(&request_thread,2000) && request_thread.outcome==0);
+  CHECK(request.observed==KU_TASK_CONTROL_OK && ku_task_control_cleanup_deadline(&context.control)==500);
+  CHECK(ku_task_control_atomic_load(&context.control.phase)==
+      (reason==KU_TASK_CONTROL_CANCELLED ? KU_TASK_CONTROL_REQUESTED_CANCEL : KU_TASK_CONTROL_REQUESTED_TIMEOUT));
+  CHECK(context.frame && context.frame_drops==0u && context.cleanup_calls==1u);
+  CHECK(ku_task_control_poll(&observer)==reason);
+  CHECK(context.cleanup_calls==2u && context.observed_deadline==500 && context.frame_drops==1u);
+  CHECK(context.resume_calls==1u && !context.ready_cleanup_calls && !context.frame);
+  CHECK(!ku_task_control_atomic_load(&context.control.lifecycle_pin));
+  CHECK(ku_task_control_status(&observer)==reason && ku_task_control_poll(&observer)==reason);
+  CHECK(context.cleanup_calls==2u && context.frame_drops==1u && ku_task_control_cleanup_deadline(&context.control)==500);
+  fixture_tighten_gate_end(&gate);
+  CHECK(ku_task_control_owner_drop(&owner,100)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_control_lease_release(&executor.lease)==KU_TASK_CONTROL_OK);
+  CHECK(ku_task_control_lease_release(&request.lease)==KU_TASK_CONTROL_OK && !context.disposes);
+  CHECK(ku_task_control_lease_release(&observer)==KU_TASK_CONTROL_OK);
   fixture_finish(&context);
 }
 static void fixture_reference_and_init_boundaries(void) {
@@ -585,6 +843,7 @@ static void fixture_heap_last_worker_release(void) {
   CHECK(ku_perf_live_allocations == 0 && ku_perf_live_bytes == 0 && !ku_perf_overflow);
 }
 int main(void) {
+  CHECK(CONTROL_ABI == 2u);
   const uint32_t outcomes[] = { KU_TASK_CONTROL_COMPLETED, KU_TASK_CONTROL_FAILED, KU_TASK_CONTROL_PANICKED };
   for (unsigned round = 0; round < 64; ++round) {
     for (unsigned index = 0; index < 3; ++index) {
@@ -604,8 +863,16 @@ int main(void) {
     fixture_heap_last_worker_release();
   }
   fixture_reference_and_init_boundaries();
+  fixture_tighten_after_terminal_cannot_write(KU_TASK_CONTROL_CANCELLED);
+  fixture_tighten_after_terminal_cannot_write(KU_TASK_CONTROL_TIMED_OUT);
+  fixture_publishing_blocks_cleanup_commit(KU_TASK_CONTROL_CANCELLED);
+  fixture_publishing_blocks_cleanup_commit(KU_TASK_CONTROL_TIMED_OUT);
+  for (unsigned index = 0; index < 3; ++index) {
+    fixture_completion_reservation_hides_terminal(outcomes[index], KU_TASK_CONTROL_CANCELLED);
+    fixture_completion_reservation_hides_terminal(outcomes[index], KU_TASK_CONTROL_TIMED_OUT);
+  }
   CHECK(ku_perf_live_allocations == 0 && ku_perf_live_bytes == 0 && !ku_perf_overflow);
-  puts("task-control-v1-ok");
+  puts("task-control-v2-ok");
   return 0;
 }
 "#;

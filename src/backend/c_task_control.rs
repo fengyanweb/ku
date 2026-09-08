@@ -14,7 +14,7 @@ pub(super) fn emit_runtime(out: &mut COutput) -> KuResult<()> {
 }
 
 const CONTROL_ABI: &str = r#"
-/* Internal control ABI v1. Every concurrent call holds a distinct live lease;
+/* Internal control ABI v2. Every concurrent call holds a distinct live lease;
  * retain is legal only from a protected live lease, never an unprotected raw
  * pointer. Lease/owner tokens are move-only and may not be copied, forged, or
  * concurrently mutated. Control storage and its typed context are stable until
@@ -33,8 +33,13 @@ const CONTROL_ABI: &str = r#"
  * resume returns Pending or stages ONE separately owned result/error/panic
  * payload and returns Completed/Failed/Panicked. Its terminal return means all
  * ordinary frame cleanup has run; drop_frame destroys remaining frame storage,
- * not that staged payload. cleanup returns Pending or OK, preserves the main
- * reason, and reads cleanup_deadline at safepoints. It must not stage a payload.
+ * not that staged payload. If cancellation wins before completion reserves
+ * COMMITTING, the private payload is discarded but the frame remains for cleanup.
+ * cleanup returns Pending or OK, preserves the main reason, and consumes the
+ * live cleanup_deadline at safepoints. An OK callback may be called again if
+ * a shorter deadline was published during it; completed Value cleanup must not
+ * replay, but outstanding child receipts must reconcile the new minimum. It
+ * must also accept a privately finished frame and must not stage a payload.
  * take_payload returns OK after moving, or InvalidArgument without mutation;
  * drop_payload/drop_frame cannot fail. No callback may release its caller's
  * lease or use the unleased budget pointer after cleanup returns. resume,
@@ -59,7 +64,7 @@ const CONTROL_ABI: &str = r#"
  * does not create a fresh budget per task. No I/O generation, wait registration,
  * scheduler, blocking return delivery, source panic lowering, or M:N is here.
  */
-#define KU_TASK_CONTROL_ABI_VERSION 1u
+#define KU_TASK_CONTROL_ABI_VERSION 2u
 #define KU_TASK_CONTROL_MAX_REFERENCES ((size_t)65536u)
 enum {
   KU_TASK_CONTROL_OK = 0u,
@@ -78,7 +83,9 @@ enum {
   KU_TASK_CONTROL_PUBLISHING_CANCEL = 17u,
   KU_TASK_CONTROL_PUBLISHING_TIMEOUT = 18u,
   KU_TASK_CONTROL_REQUESTED_CANCEL = 19u,
-  KU_TASK_CONTROL_REQUESTED_TIMEOUT = 20u
+  KU_TASK_CONTROL_REQUESTED_TIMEOUT = 20u,
+  /* A bounded executor commit, never a public terminal or cancellation reason. */
+  KU_TASK_CONTROL_COMMITTING = 21u
 };
 enum {
   KU_TASK_CONTROL_PAYLOAD_EMPTY = 0u,
@@ -128,14 +135,6 @@ static void ku_task_control_deadline_store(
     KuTaskControlDeadlineV1* value, uint64_t next) {
   (void)_InterlockedExchange64(value, (__int64)next);
 }
-static bool ku_task_control_deadline_cas(
-    KuTaskControlDeadlineV1* value, uint64_t* expected, uint64_t next) {
-  __int64 observed = _InterlockedCompareExchange64(
-      value, (__int64)next, (__int64)*expected);
-  if ((uint64_t)observed == *expected) return true;
-  *expected = (uint64_t)observed;
-  return false;
-}
 #else
 typedef _Atomic uint64_t KuTaskControlDeadlineV1;
 static void ku_task_control_atomic_init(KuAtomicRefcount* value, size_t initial) {
@@ -167,11 +166,6 @@ static uint64_t ku_task_control_deadline_load(KuTaskControlDeadlineV1* value) {
 static void ku_task_control_deadline_store(
     KuTaskControlDeadlineV1* value, uint64_t next) {
   atomic_store_explicit(value, next, memory_order_release);
-}
-static bool ku_task_control_deadline_cas(
-    KuTaskControlDeadlineV1* value, uint64_t* expected, uint64_t next) {
-  return atomic_compare_exchange_strong_explicit(
-      value, expected, next, memory_order_acq_rel, memory_order_acquire);
 }
 #endif
 
@@ -353,16 +347,25 @@ static uint32_t ku_task_control_request_cancel(
     }
   }
   if (ku_task_control_is_terminal(phase)) return (uint32_t)phase;
-  if (ku_task_control_is_publishing(phase)) return KU_TASK_CONTROL_PENDING;
+  if (ku_task_control_is_publishing(phase) || phase == KU_TASK_CONTROL_COMMITTING)
+    return KU_TASK_CONTROL_PENDING;
   if (!ku_task_control_is_requested(phase)) return KU_TASK_CONTROL_INVALID_STATE;
   uint64_t deadline = ku_task_control_deadline_load(&control->cleanup_deadline_ms);
   if (deadline <= absolute_deadline_ms) return KU_TASK_CONTROL_OK;
-  if (ku_task_control_deadline_cas(
-          &control->cleanup_deadline_ms, &deadline, absolute_deadline_ms))
-    return KU_TASK_CONTROL_OK;
-  /* A concurrent shorter budget already satisfies us. Otherwise the caller
-   * retains its lease/owner and must arrange a bounded runtime retry. */
-  return deadline <= absolute_deadline_ms ? KU_TASK_CONTROL_OK : KU_TASK_CONTROL_PENDING;
+  size_t requested = phase;
+  size_t reserved = phase == KU_TASK_CONTROL_REQUESTED_CANCEL
+      ? KU_TASK_CONTROL_PUBLISHING_CANCEL : KU_TASK_CONTROL_PUBLISHING_TIMEOUT;
+  /* Deadline writers and the executor's terminal commit share ONE phase CAS.
+   * Do not accept a new D after the executor has frozen its cleanup witness. */
+  if (!ku_task_control_atomic_cas(&control->phase, &phase, reserved))
+    return ku_task_control_is_terminal(phase) ? (uint32_t)phase : KU_TASK_CONTROL_PENDING;
+  /* Another writer may have published a smaller D before our reservation.
+   * Re-read under this exclusive publication claim; never renew that D. */
+  deadline = ku_task_control_deadline_load(&control->cleanup_deadline_ms);
+  if (absolute_deadline_ms < deadline)
+    ku_task_control_deadline_store(&control->cleanup_deadline_ms, absolute_deadline_ms);
+  ku_task_control_atomic_store(&control->phase, requested);
+  return KU_TASK_CONTROL_OK;
 }
 static uint32_t ku_task_control_owner_drop(
     KuTaskControlOwnerV1* owner, uint64_t absolute_deadline_ms) {
@@ -397,7 +400,8 @@ static uint32_t ku_task_control_status(const KuTaskControlLeaseV1* lease) {
   size_t phase = ku_task_control_atomic_load(&lease->control->phase);
   if (ku_task_control_is_terminal(phase)) return (uint32_t)phase;
   if (phase == KU_TASK_CONTROL_LIVE || ku_task_control_is_requested(phase)
-      || ku_task_control_is_publishing(phase)) return KU_TASK_CONTROL_PENDING;
+      || ku_task_control_is_publishing(phase) || phase == KU_TASK_CONTROL_COMMITTING)
+    return KU_TASK_CONTROL_PENDING;
   return KU_TASK_CONTROL_INVALID_STATE;
 }
 static uint32_t ku_task_control_take_result(
@@ -447,14 +451,17 @@ static uint32_t ku_task_control_poll(const KuTaskControlLeaseV1* lease) {
   if (phase == KU_TASK_CONTROL_LIVE) {
     uint32_t outcome = control->operations.resume(control->context);
     if (ku_task_control_is_payload_terminal(outcome)) {
-      ku_task_control_atomic_store(&control->payload, KU_TASK_CONTROL_PAYLOAD_AVAILABLE);
-      ku_task_control_drop_frame_once(control);
       expected = KU_TASK_CONTROL_LIVE;
-      /* The fully constructed typed payload and destroyed frame precede this
-       * single irreversible completion/error/panic vs cancellation decision.
-       * An acquire terminal observation therefore sees a complete payload. */
-      if (ku_task_control_atomic_cas(&control->phase, &expected, outcome))
+      /* Reserve the irreversible winner BEFORE destructive frame cleanup.
+       * COMMITTING is Pending to observers; payload callbacks cannot overlap
+       * drop_frame. A losing completion leaves the frame available to consume
+       * a cancellation deadline that may not yet have been published. */
+      if (ku_task_control_atomic_cas(&control->phase, &expected, KU_TASK_CONTROL_COMMITTING)) {
+        ku_task_control_drop_frame_once(control);
+        ku_task_control_atomic_store(&control->payload, KU_TASK_CONTROL_PAYLOAD_AVAILABLE);
+        ku_task_control_atomic_store(&control->phase, outcome);
         return ku_task_control_finish_poll(control, outcome);
+      }
       ku_task_control_atomic_store(&control->payload, KU_TASK_CONTROL_PAYLOAD_DROPPED);
       control->operations.drop_payload(control->context);
       phase = expected;
@@ -478,6 +485,7 @@ static uint32_t ku_task_control_poll(const KuTaskControlLeaseV1* lease) {
   }
   uint32_t reason = phase == KU_TASK_CONTROL_REQUESTED_CANCEL
       ? KU_TASK_CONTROL_CANCELLED : KU_TASK_CONTROL_TIMED_OUT;
+  uint64_t observed_deadline = ku_task_control_cleanup_deadline(control);
   if (!control->frame_destroyed) {
     uint32_t cleaned = control->operations.cleanup(control->context, reason, control);
     if (cleaned != KU_TASK_CONTROL_OK) {
@@ -485,8 +493,23 @@ static uint32_t ku_task_control_poll(const KuTaskControlLeaseV1* lease) {
       return cleaned == KU_TASK_CONTROL_PENDING
           ? KU_TASK_CONTROL_PENDING : KU_TASK_CONTROL_INVALID_STATE;
     }
-    ku_task_control_drop_frame_once(control);
   }
+  expected = phase;
+  if (!ku_task_control_atomic_cas(&control->phase, &expected, KU_TASK_CONTROL_COMMITTING)) {
+    /* A real deadline publisher owns the only progress obligation. Its
+     * runtime wrapper must notify after restoring REQUESTED; never spin here. */
+    ku_task_control_atomic_store(&control->executor, 0);
+    return ku_task_control_is_publishing(expected)
+        ? KU_TASK_CONTROL_PENDING : KU_TASK_CONTROL_INVALID_STATE;
+  }
+  if (ku_task_control_cleanup_deadline(control) != observed_deadline) {
+    /* Publication completed while cleanup ran. The frame is still alive;
+     * reconcile on a later notified quantum before freezing a terminal ACK. */
+    ku_task_control_atomic_store(&control->phase, phase);
+    ku_task_control_atomic_store(&control->executor, 0);
+    return KU_TASK_CONTROL_PENDING;
+  }
+  ku_task_control_drop_frame_once(control);
   /* Requested cancellation has already won the decision. Cleanup/error/return
    * cannot overwrite its reason; only this executor acknowledges its terminal
    * state after all frame ownership has ended. */

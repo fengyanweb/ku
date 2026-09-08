@@ -461,7 +461,8 @@ static uint32_t ku_task_driver_wait_ready_locked(KuTaskDriverSlotV1* child) {
   KuTaskControlV1* control = child->driver_lease.control;
   size_t phase = ku_task_control_atomic_load(&control->phase);
   if (phase == KU_TASK_CONTROL_LIVE || ku_task_control_is_requested(phase)
-      || ku_task_control_is_publishing(phase)) return KU_TASK_DRIVER_PENDING;
+      || ku_task_control_is_publishing(phase) || phase == KU_TASK_CONTROL_COMMITTING)
+    return KU_TASK_DRIVER_PENDING;
   if (phase == KU_TASK_CONTROL_CANCELLED || phase == KU_TASK_CONTROL_TIMED_OUT)
     return KU_TASK_DRIVER_WAIT_READY;
   if (!ku_task_control_is_payload_terminal(phase)) return KU_TASK_DRIVER_INTERNAL;

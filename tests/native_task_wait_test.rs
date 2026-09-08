@@ -114,6 +114,11 @@ fn native_task_wait_registration_publication_cancel_and_epoch_execute_in_c() {
     );
     let source = replace_once(
         source,
+        "static void ku_task_0_drop_frame(void* raw) {",
+        "static void ku_task_0_drop_frame(void* raw) {\n  fixture_drop_frame_hook(raw);",
+    );
+    let source = replace_once(
+        source,
         "static uint32_t ku_task_0_take_payload(void* raw, void* destination) {",
         "static uint32_t ku_task_0_take_payload(void* raw, void* destination) {\n  uint32_t fixture_outcome = fixture_take_hook(raw, destination);\n  if (fixture_outcome != UINT32_MAX) return fixture_outcome;",
     );
@@ -203,6 +208,7 @@ static FixtureLedger fixture_ledger(void) {
 const HOOK_DECLARATIONS: &str = r#"
 static uint32_t fixture_resume_hook(void* raw);
 static void fixture_cleanup_hook(void* raw);
+static void fixture_drop_frame_hook(void* raw);
 static uint32_t fixture_take_hook(void* raw, void* destination);
 static void fixture_after_take_store(void* raw);
 "#;
@@ -223,11 +229,12 @@ typedef struct FixtureRole {
   KuTaskAdapterOutcomeV1 result;
   KuTestEvent entered, proceed, armed, cleanup_entered, cleanup_proceed;
   KuTestEvent take_entered, take_proceed, stored, store_proceed;
-  KuAtomicRefcount resumes, normal_continuations, cleanups, take_calls;
+  KuTestEvent drop_entered, drop_proceed;
+  KuAtomicRefcount resumes, normal_continuations, cleanups, take_calls, frame_drops;
   size_t target;
   uint32_t mode, probe, expected_arm, arm_status, take_status;
   int initialized, entry_gate, after_arm_gate, cleanup_gate, take_gate, take_reject, store_gate;
-  int take_child;
+  int take_child, drop_gate;
 } FixtureRole;
 static FixtureRole fixture_roles[ROLES];
 static uint64_t fixture_deadline(void) { return ku_task_driver_now_ms() + 2000u; }
@@ -251,8 +258,10 @@ static void fixture_role_init(size_t index, uint32_t mode) {
   CHECK(ku_test_event_init(&role->cleanup_proceed)); CHECK(ku_test_event_init(&role->take_entered));
   CHECK(ku_test_event_init(&role->take_proceed)); CHECK(ku_test_event_init(&role->stored));
   CHECK(ku_test_event_init(&role->store_proceed));
+  CHECK(ku_test_event_init(&role->drop_entered)); CHECK(ku_test_event_init(&role->drop_proceed));
   ku_task_control_atomic_init(&role->resumes, 0); ku_task_control_atomic_init(&role->normal_continuations, 0);
   ku_task_control_atomic_init(&role->cleanups, 0); ku_task_control_atomic_init(&role->take_calls, 0);
+  ku_task_control_atomic_init(&role->frame_drops, 0);
   role->initialized = 1;
 }
 static void fixture_roles_finish(void) {
@@ -264,7 +273,9 @@ static void fixture_roles_finish(void) {
     CHECK(ku_test_event_destroy(&role->armed)); CHECK(ku_test_event_destroy(&role->cleanup_entered));
     CHECK(ku_test_event_destroy(&role->cleanup_proceed)); CHECK(ku_test_event_destroy(&role->take_entered));
     CHECK(ku_test_event_destroy(&role->take_proceed)); CHECK(ku_test_event_destroy(&role->stored));
-    CHECK(ku_test_event_destroy(&role->store_proceed)); memset(role, 0, sizeof(*role));
+    CHECK(ku_test_event_destroy(&role->store_proceed));
+    CHECK(ku_test_event_destroy(&role->drop_entered)); CHECK(ku_test_event_destroy(&role->drop_proceed));
+    memset(role, 0, sizeof(*role));
   }
 }
 static KuString fixture_owned(void) {
@@ -512,6 +523,18 @@ static void fixture_cleanup_hook(void* raw) {
   }
   if (role->wait.driver) CHECK(ku_task_driver_wait_detach(&role->wait) == KU_TASK_DRIVER_OK);
 }
+static void fixture_drop_frame_hook(void* raw) {
+  KuTaskInstance_0* instance = (KuTaskInstance_0*)raw;
+  FixtureRole* role = fixture_role(raw); fixture_inc(&role->frame_drops);
+  if (role->drop_gate) {
+    /* The actual R2 CAS selected completion before invoking this callback.
+     * Only the event timing is controlled; phase/result/ACK are never forged. */
+    CHECK(ku_task_control_atomic_load(&instance->control.phase) == KU_TASK_CONTROL_COMMITTING);
+    CHECK(ku_task_control_atomic_load(&instance->control.payload) == KU_TASK_CONTROL_PAYLOAD_EMPTY);
+    CHECK(ku_test_event_set(&role->drop_entered));
+    CHECK(ku_test_event_wait(&role->drop_proceed, 2000));
+  }
+}
 static uint32_t fixture_take_hook(void* raw, void* destination) {
   (void)destination; FixtureRole* role = fixture_role(raw); fixture_inc(&role->take_calls);
   if (role->take_gate && fixture_count(&role->take_calls) == 1) {
@@ -598,6 +621,43 @@ static void fixture_parked_and_late_child(void) {
   CHECK(ku_task_driver_wake(&fixture_roles[1].handle.ticket) == KU_TASK_DRIVER_OK);
   fixture_idle(&runtime); CHECK(fixture_count(&fixture_roles[2].normal_continuations) == 1);
   fixture_drop(2); fixture_drop(1); fixture_drop(0); fixture_driver_finish(&runtime); fixture_zero();
+}
+
+static void fixture_committing_keeps_result_wait_pending(void) {
+  FixtureDriver runtime; fixture_driver_init(&runtime, 2);
+  fixture_role_init(0, MODE_HOLD); fixture_start(&runtime, 0); fixture_idle(&runtime);
+  fixture_role_init(1, MODE_WAIT); fixture_roles[1].target = 0; fixture_roles[1].take_child = 1;
+  fixture_start(&runtime, 1); fixture_idle(&runtime); fixture_assert_armed(&fixture_roles[1]);
+  size_t parent_resumes = fixture_count(&fixture_roles[1].resumes);
+  fixture_roles[0].mode = MODE_FINISH; fixture_roles[0].drop_gate = 1;
+  CHECK(ku_task_driver_wake(&fixture_roles[0].handle.ticket) == KU_TASK_DRIVER_OK);
+  CHECK(ku_test_event_wait(&fixture_roles[0].drop_entered, 2000));
+  KuTaskControlV1* control = fixture_roles[0].handle.owner.lease.control;
+  CHECK(ku_task_control_atomic_load(&control->phase) == KU_TASK_CONTROL_COMMITTING);
+  CHECK(ku_task_control_atomic_load(&control->lifecycle_pin) == 1u);
+  CHECK(ku_task_control_status(&fixture_roles[0].handle.owner.lease) == KU_TASK_CONTROL_PENDING);
+  KuTaskAdapterOutcomeV1 output = {0}; uint8_t before[sizeof(output)];
+  memcpy(before, &output, sizeof(output));
+  /* A real take wrapper invokes wait_publish_locked after its Pending return.
+   * The existing incoming result wait forces wait_ready_locked to observe the
+   * genuinely reserved COMMITTING phase under the actual registry mutex. */
+  CHECK(ku_task_0_take(&fixture_roles[0].handle, &output) == KU_TASK_CONTROL_PENDING);
+  CHECK(!memcmp(before, &output, sizeof(output)));
+  CHECK(fixture_snapshot(&runtime).running == 1u);
+  fixture_assert_armed(&fixture_roles[1]);
+  CHECK(fixture_count(&fixture_roles[1].resumes) == parent_resumes);
+  CHECK(!fixture_count(&fixture_roles[1].normal_continuations));
+  CHECK(!fixture_count(&fixture_roles[0].take_calls));
+  CHECK(ku_test_event_set(&fixture_roles[0].drop_proceed)); fixture_idle(&runtime);
+  CHECK(fixture_count(&fixture_roles[1].normal_continuations) == 1u);
+  CHECK(fixture_roles[1].take_status == KU_TASK_CONTROL_OK);
+  CHECK(fixture_count(&fixture_roles[0].take_calls) == 1u);
+  CHECK(fixture_count(&fixture_roles[0].frame_drops) == 1u);
+  CHECK(fixture_count(&fixture_roles[1].frame_drops) == 1u);
+  CHECK(!fixture_count(&fixture_roles[0].cleanups) && !fixture_count(&fixture_roles[1].cleanups));
+  CHECK(ku_task_control_status(&fixture_roles[0].handle.owner.lease) == KU_TASK_CONTROL_COMPLETED);
+  CHECK(ku_task_control_status(&fixture_roles[1].handle.owner.lease) == KU_TASK_CONTROL_COMPLETED);
+  fixture_drop(1); fixture_drop(0); fixture_driver_finish(&runtime); fixture_zero();
 }
 
 static void fixture_taking_publication(int reject, int park_gap) {
@@ -780,6 +840,7 @@ int main(void) {
   CHECK(KU_TASK_FRAME_ABI_VERSION == 3u);
   fixture_ready_before_arm();
   fixture_parked_and_late_child();
+  fixture_committing_keeps_result_wait_pending();
   fixture_taking_publication(0, 0); fixture_taking_publication(1, 0);
   fixture_taking_publication(0, 1); fixture_taking_publication(1, 1);
   fixture_epoch_and_slot_reuse(); fixture_cycle_and_occupied(); fixture_self_and_cross_driver();

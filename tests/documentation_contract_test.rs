@@ -66,7 +66,9 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         assert!(document.contains("三系统 CI"));
         assert!(!document.contains("native C 明确拒绝 async。"));
     }
-    assert!(ir.contains("Frame ABI 3、Control ABI 1、Driver ABI 6"));
+    assert!(ir.contains("Frame ABI 3、Control ABI 2、Driver ABI 6"));
+    assert!(ir.contains("完成先以单次 CAS 预约内部 `COMMITTING`"));
+    assert!(ir.contains("后续期限收紧也须预约同一 phase"));
     for boundary in [
         "R5h 内部正常作用域 session（尚未接入源码）",
         "`scope_end` 不接受",
