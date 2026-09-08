@@ -1245,10 +1245,14 @@ impl Checker {
                 body,
                 span,
             } => {
-                self.expect_condition(condition, *span)?;
+                // A backedge reaches the condition, not the already-consumed
+                // state after its first evaluation.
                 let before = self.scopes.clone();
-                let top = self.compute_loop_top(&before, body, None, *span);
+                let top = self.compute_loop_top(&before, Some(condition), body, None, *span);
                 self.scopes = top;
+                self.check_loop_analysis_budget()?;
+                self.expect_condition(condition, *span)?;
+                let condition_exit = self.scopes.clone();
                 self.loop_depth += 1;
                 self.loop_break_states.push(Vec::new());
                 self.loop_continue_states.push(Vec::new());
@@ -1257,7 +1261,12 @@ impl Checker {
                 self.loop_continue_states.pop();
                 self.loop_depth -= 1;
                 result?;
-                self.scopes = self.after_loop_state(before, self.scopes.clone(), breaks);
+                // Body fallthrough/continue first evaluates the condition again.
+                // Its post-condition state covers the false edge; a body re-init
+                // cannot make a value consumed by that last condition live.
+                let mut exits = vec![condition_exit.clone()];
+                exits.extend(breaks);
+                self.scopes = merge_moved_scope_paths(condition_exit, &exits);
                 Ok(())
             }
             Stmt::For {
@@ -1296,6 +1305,7 @@ impl Checker {
                 let before = self.scopes.clone();
                 let top = self.compute_loop_top(
                     &before,
+                    None,
                     body,
                     Some((name, &element, &element_provenance)),
                     *span,
@@ -7322,12 +7332,15 @@ impl Checker {
     /// the body re-initializes at the top before using it. A loop that cannot
     /// iterate (no back-edge) keeps the pre-loop state.
     ///
-    /// This runs a throwaway pass over the body to discover its moves; its scope
+    /// For while, the header is before the condition, which is included in every
+    /// speculative transfer. For for, there is no repeated condition expression.
+    /// This runs a throwaway condition/body pass to discover its moves; its scope
     /// mutations are rolled back and its errors ignored (the authoritative pass
     /// re-checks the body and surfaces any real error).
     fn compute_loop_top(
         &mut self,
         before: &[HashMap<String, VarType>],
+        condition: Option<&Expr>,
         body: &[Stmt],
         loop_var: Option<(&str, &Type, &ClosureProvenance)>,
         span: Span,
@@ -7364,7 +7377,7 @@ impl Checker {
             self.next_binding_id = saved_next_binding_id;
             self.next_function_body_id = saved_next_function_body_id;
             self.function_body_outer_bindings = saved_body_bindings.clone();
-            let candidate = self.speculative_loop_transfer(before, &top, body, loop_var);
+            let candidate = self.speculative_loop_transfer(before, &top, condition, body, loop_var);
             if self.loop_analysis_exhausted.is_some() {
                 break;
             }
@@ -7404,10 +7417,20 @@ impl Checker {
         &mut self,
         before: &[HashMap<String, VarType>],
         iteration_top: &[HashMap<String, VarType>],
+        condition: Option<&Expr>,
         body: &[Stmt],
         loop_var: Option<(&str, &Type, &ClosureProvenance)>,
     ) -> Vec<HashMap<String, VarType>> {
         self.scopes = iteration_top.to_vec();
+        self.loop_analysis_depth += 1;
+        // Evaluate in the outer scope: a typed body-local shadow must not stand
+        // in for the original binding consumed by the next condition. The
+        // surrounding compute_loop_top already isolated try-exit collectors.
+        if let Some(condition) = condition {
+            if self.charge_loop_analysis(condition.span).is_ok() {
+                let _ = self.expect_condition(condition, condition.span);
+            }
+        }
         self.push_scope();
         if let Some((name, ty, provenance)) = loop_var {
             let _ = self.define(name.to_string(), ty.clone(), true, Span::default());
@@ -7418,7 +7441,6 @@ impl Checker {
         self.loop_depth += 1;
         self.loop_break_states.push(Vec::new());
         self.loop_continue_states.push(Vec::new());
-        self.loop_analysis_depth += 1;
         for stmt in body {
             // Errors are surfaced by the authoritative pass. Continue scanning so
             // an earlier speculative error cannot hide later graph edges.
@@ -7432,8 +7454,12 @@ impl Checker {
         let continues = self.loop_continue_states.pop().unwrap_or_default();
         self.loop_depth -= 1;
         self.pop_scope();
-        let end_of_body = self.scopes.clone();
-        let mut top = merge_moved_scopes(before.to_vec(), before.to_vec(), end_of_body);
+        let mut top = before.to_vec();
+        // In particular, an if whose arms both break/return/continue has no
+        // fallthrough. Its restored pre-if scopes are not a real backedge.
+        if loop_block_flow(body).fallthrough {
+            top = merge_moved_scopes(before.to_vec(), top, self.scopes.clone());
+        }
         for state in continues {
             top = merge_moved_scopes(before.to_vec(), top, state);
         }
@@ -9366,7 +9392,14 @@ fn loop_stmt_flow(stmt: &Stmt) -> LoopBodyFlow {
                 continues: then_flow.continues || else_flow.continues,
             }
         }
-        Stmt::While { .. } | Stmt::For { .. } => LoopBodyFlow {
+        // Nested loops capture their own continue. Reuse the existing precise
+        // literal-true/no-own-break rule: a nonreturning inner while cannot
+        // manufacture a backedge to this outer condition.
+        Stmt::While { .. } => LoopBodyFlow {
+            fallthrough: !stmt_stops_fallthrough(stmt),
+            continues: false,
+        },
+        Stmt::For { .. } => LoopBodyFlow {
             fallthrough: true,
             continues: false,
         },
