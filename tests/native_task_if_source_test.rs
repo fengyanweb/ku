@@ -137,6 +137,99 @@ int main(void) {
 }
 
 #[test]
+fn native_task_copy_assignment_source_values_branches_short_circuit_and_failures() {
+    let cases = [
+        (
+            r#"
+async fn main(): null! {
+    number = 1 flag = true unit = null
+    number = number flag = flag unit = unit
+    number = 7 flag = false unit = null
+    println(number) println(flag) println(unit)
+    return ok(null)
+}
+"#,
+            "7\nfalse\nnull\n",
+            None,
+        ),
+        (
+            r#"
+async fn Right(value: int): int! { println(value) return ok(5) }
+async fn main(): null! {
+    value = 37
+    value = value + (await Right(value))?
+    println(value)
+    return ok(null)
+}
+"#,
+            "37\n42\n",
+            None,
+        ),
+        (
+            r#"
+async fn Probe(gate: bool): int! {
+    value = 10
+    if (gate) { value = value + 1 } else { value = value + 2 }
+    if (gate) { value: int = value + 100 value = value + 1 println(value) }
+    return ok(value)
+}
+async fn main(): null! {
+    first = (await Probe(true))? println(first)
+    second = (await Probe(false))? println(second)
+    return ok(null)
+}
+"#,
+            "112\n11\n12\n",
+            None,
+        ),
+        (
+            r#"
+async fn Unexpected(): bool! { println("unexpected") fail "unexpected RHS" }
+async fn main(): null! {
+    flag = true
+    flag = flag || (await Unexpected())?
+    println(flag)
+    flag = flag && false
+    flag = flag && (await Unexpected())?
+    println(flag)
+    return ok(null)
+}
+"#,
+            "true\nfalse\n",
+            None,
+        ),
+        (
+            r#"
+async fn Broken(value: int): int! { println(value) fail "assignment rhs failed" }
+async fn main(): null! {
+    value = 37 println(value)
+    value = value + (await Broken(value))?
+    println(value)
+    return ok(null)
+}
+"#,
+            "37\n37\n",
+            Some("assignment rhs failed"),
+        ),
+        (
+            r#"
+async fn main(): null! {
+    value = 37 println(value)
+    value = value / 0
+    println(value)
+    return ok(null)
+}
+"#,
+            "37\n",
+            Some("division by zero"),
+        ),
+    ];
+    for (index, (source, stdout, failure)) in cases.into_iter().enumerate() {
+        run_case(100 + index, source, stdout, failure);
+    }
+}
+
+#[test]
 fn native_task_if_real_source_branches_match_interpreter_and_close_runtime_allocations() {
     let cases = [
         (
@@ -419,6 +512,22 @@ fn assert_no_native_artifacts(root: &Path, binary: &Path) {
 #[test]
 fn native_task_if_cli_rejects_unsupported_and_ownership_before_either_artifact_path() {
     let cases = [
+        (
+            "async fn main(): null! { value = \"first\" value = \"second\" return ok(null) }",
+            "native async subset does not support reassignment of Owned or Task values",
+        ),
+        (
+            "async fn Child(): int! { return ok(1) } async fn main(): null! { child = Child() child = Child() return ok(null) }",
+            "native async subset does not support reassignment of Owned or Task values",
+        ),
+        (
+            "async fn main(): null! { LIMIT = 1 LIMIT = 2 return ok(null) }",
+            "cannot assign to immutable variable 'LIMIT'",
+        ),
+        (
+            "async fn main(): null! { value: int = 1 value: int = 2 return ok(null) }",
+            "variable 'value' is already defined in this scope",
+        ),
         (
             "async fn Child(): int! { return ok(17) } async fn Grand(gate: bool): null! { if (true) { grand = Child() if (true) { if (gate) { value = (await grand)? println(value) } else { value = (await grand)? println(value) } } else { value = (await grand)? println(value) } again = (await grand)? println(again) } return ok(null) } async fn main(): null! { return ok(null) }",
             "task 'grand' has already been awaited",

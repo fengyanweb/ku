@@ -31,11 +31,31 @@ fn replace_once(source: String, anchor: &str, replacement: &str) -> String {
 
 #[test]
 fn native_task_expression_repeated_pending_preserves_lhs_and_starts_rhs_once() {
-    let source = r#"
+    run_repeated_pending_expression(
+        r#"
 async fn Parent(base: int): int! { return ok(base + (await Right())?) }
 async fn Right(): int! { return ok(5) }
 async fn main(): null! { return ok(null) }
-"#;
+"#,
+    );
+}
+
+#[test]
+fn native_task_copy_assignment_repeated_pending_preserves_rhs_and_commits_once() {
+    run_repeated_pending_expression(
+        r#"
+async fn Parent(base: int): int! {
+    current = base
+    current = current + (await Right())?
+    return ok(current)
+}
+async fn Right(): int! { return ok(5) }
+async fn main(): null! { return ok(null) }
+"#,
+    );
+}
+
+fn run_repeated_pending_expression(source: &str) {
     let ast = Parser::new(Lexer::new(source).lex().unwrap())
         .parse_program()
         .unwrap();
@@ -59,17 +79,18 @@ async fn main(): null! { return ok(null) }
         .collect();
     assert_eq!(lhs.len(), 1);
     let lhs = lhs[0];
-    let base = parent.parameters[0];
-    assert_ne!(lhs, base);
-    assert_eq!(
-        parent
-            .states
-            .iter()
-            .flat_map(|state| &state.operations)
-            .filter(|op| { matches!(op, TaskOp::Copy { dst, src } if *dst == lhs && *src == base) })
-            .count(),
-        1
-    );
+    let frozen_sources: Vec<_> = parent
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|op| match op {
+            TaskOp::Copy { dst, src } if *dst == lhs => Some(*src),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(frozen_sources.len(), 1);
+    let frozen_source = frozen_sources[0];
+    assert_ne!(lhs, frozen_source);
     let awaits: Vec<_> = parent
         .states
         .iter()
@@ -94,7 +115,12 @@ async fn main(): null! { return ok(null) }
         "typedef struct KuString {",
         &format!("{instrumentation}typedef struct KuString {{"),
     );
-    let lhs_assignment = format!("  frame->s_{} = frame->s_{};\n", lhs.0, base.0);
+    let source_place = if plan.functions[0].slots.contains(&frozen_source) {
+        format!("frame->s_{}", frozen_source.0)
+    } else {
+        format!("slot_{}", frozen_source.0)
+    };
+    let lhs_assignment = format!("  frame->s_{} = {source_place};\n", lhs.0);
     let generated = replace_once(
         generated,
         &lhs_assignment,

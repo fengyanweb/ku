@@ -26,6 +26,234 @@ fn checked(source: &str) -> Program {
 }
 
 #[test]
+fn native_task_copy_assignment_self_reads_and_preserves_ir_alias_rejection() {
+    let native = task_lower::lower_program(&checked(
+        "async fn main(): null! { number = 1 flag = true unit = null number = number flag = flag unit = unit number = 7 flag = false unit = null println(number) println(flag) println(unit) return ok(null) }",
+    ))
+    .expect("Copy locals can be reassigned without new bindings");
+    let main = &native.tasks.functions[native.entry.0];
+    let locals: Vec<_> = main.states[main.entry.0]
+        .operations
+        .iter()
+        .filter_map(|op| match op {
+            TaskOp::Copy { dst, .. } => Some(*dst),
+            _ => None,
+        })
+        .take(3)
+        .collect();
+    assert_eq!(locals.len(), 3);
+    for local in &locals {
+        assert!(main
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .any(|op| matches!(op, TaskOp::Read { slot } if slot == local)));
+    }
+    assert!(main
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .all(|op| !matches!(op, TaskOp::Copy { dst, src } if dst == src)));
+    task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+
+    let mut aliased = native.tasks.clone();
+    aliased.functions[native.entry.0].states[main.entry.0]
+        .operations
+        .push(TaskOp::Copy {
+            dst: locals[0],
+            src: locals[0],
+        });
+    let error = task::verify_and_plan(&aliased, TaskLimits::default()).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("copy or move has invalid source/destination types"),
+        "{error}"
+    );
+
+    let mut uninitialized = native.tasks.clone();
+    let operations = &mut uninitialized.functions[native.entry.0].states[main.entry.0].operations;
+    let first_binding = operations
+        .iter()
+        .position(|op| matches!(op, TaskOp::Copy { dst, .. } if *dst == locals[0]))
+        .unwrap();
+    operations.remove(first_binding);
+    let error = task::verify_and_plan(&uninitialized, TaskLimits::default()).unwrap_err();
+    assert!(
+        error.message.contains("not definitely initialized"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_task_copy_assignment_rhs_await_commits_only_on_success() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn Broken(value: int): int! { println(value) fail "assignment rhs failed" }
+async fn Parent(base: int): int! {
+    current = base
+    current = current + (await Broken(current))?
+    return ok(current)
+}
+async fn main(): null! { return ok(null) }
+"#,
+    ))
+    .expect("the checker accepts the assignment even when its RHS can fail");
+    let parent = native
+        .tasks
+        .functions
+        .iter()
+        .find(|f| f.name == "Parent")
+        .unwrap();
+    let current = parent.states[parent.entry.0]
+        .operations
+        .iter()
+        .find_map(|op| match op {
+            TaskOp::Copy { dst, src } if *src == parent.parameters[0] => Some(*dst),
+            _ => None,
+        })
+        .unwrap();
+    let (ok, err) = parent
+        .states
+        .iter()
+        .find_map(|state| match state.terminator {
+            TaskTerminator::TryResult { ok, err, .. } => Some((ok, err)),
+            _ => None,
+        })
+        .unwrap();
+    let (sum_index, sum, frozen_lhs) = parent.states[ok.0]
+        .operations
+        .iter()
+        .enumerate()
+        .find_map(|(index, op)| match op {
+            TaskOp::Binary { dst, left, .. } => Some((index, *dst, *left)),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(frozen_lhs, current);
+    assert!(parent.states[parent.entry.0].operations.iter().any(
+        |op| matches!(op, TaskOp::Copy { dst, src } if *dst == frozen_lhs && *src == current)
+    ));
+    let writes: Vec<_> = parent
+        .states
+        .iter()
+        .enumerate()
+        .flat_map(|(state, body)| {
+            body.operations
+                .iter()
+                .enumerate()
+                .filter_map(move |(index, op)| match op {
+                    TaskOp::Copy { dst, src } if *dst == current => Some((state, index, *src)),
+                    _ => None,
+                })
+        })
+        .collect();
+    assert_eq!(writes.len(), 2, "initial binding and one successful commit");
+    assert_eq!(
+        (writes[0].0, writes[0].2),
+        (parent.entry.0, parent.parameters[0])
+    );
+    assert_eq!((writes[1].0, writes[1].2), (ok.0, sum));
+    assert!(writes[1].1 > sum_index);
+    assert!(parent.states[err.0].operations.is_empty());
+    assert!(matches!(
+        parent.states[err.0].terminator,
+        TaskTerminator::Exit { .. }
+    ));
+    let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    assert!(plan.functions[parent.id.0].slots.contains(&frozen_lhs));
+}
+
+#[test]
+fn native_task_copy_assignment_updates_outer_binding_but_not_a_shadow() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn Probe(gate: bool): int! {
+    value = 10
+    if (gate) { value = value + 1 } else { value = value + 2 }
+    if (gate) { value: int = value + 100 value = value + 1 println(value) }
+    return ok(value)
+}
+async fn main(): null! { return ok(null) }
+"#,
+    ))
+    .unwrap();
+    let probe = native
+        .tasks
+        .functions
+        .iter()
+        .find(|f| f.name == "Probe")
+        .unwrap();
+    let outer = probe.states[probe.entry.0]
+        .operations
+        .iter()
+        .find_map(|op| match op {
+            TaskOp::Copy { dst, .. } => Some(*dst),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        probe
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .filter(|op| matches!(op, TaskOp::Copy { dst, .. } if *dst == outer))
+            .count(),
+        3,
+        "one initial binding and both first If arms; shadow writes a different slot"
+    );
+    assert!(probe
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .any(|op| matches!(op, TaskOp::WrapOk { src, .. } if *src == outer)));
+    task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+}
+
+#[test]
+fn native_task_copy_assignment_raw_type_owned_task_and_declaration_gates_remain() {
+    let mismatched = parsed("async fn main(): null! { value = 1 value = true return ok(null) }");
+    assert!(Checker::new().check(&mismatched).is_err());
+    let error = task_lower::lower_program(&mismatched).unwrap_err();
+    assert!(
+        error.message.contains("a mismatched Copy reassignment"),
+        "{error}"
+    );
+    for source in [
+        "async fn main(): null! { value = \"first\" value = \"second\" return ok(null) }",
+        "async fn main(): null! { value = ok(1) value = ok(2) return ok(null) }",
+        "async fn Child(): int! { return ok(1) } async fn main(): null! { child = Child() child = Child() return ok(null) }",
+    ] {
+        let error = task_lower::lower_program(&checked(source)).unwrap_err();
+        assert!(error.message.contains("reassignment of Owned or Task values"), "{error}");
+    }
+    let duplicate =
+        parsed("async fn main(): null! { value: int = 1 value: int = 2 return ok(null) }");
+    assert!(Checker::new().check(&duplicate).is_err());
+    let error = task_lower::lower_program(&duplicate).unwrap_err();
+    assert!(
+        error.message.contains("duplicate local declarations"),
+        "{error}"
+    );
+    for source in [
+        "async fn main(): null! { LIMIT = 1 LIMIT = 2 return ok(null) }",
+        "async fn Parent(value: int): null! { value = 2 return ok(null) } async fn main(): null! { return ok(null) }",
+    ] {
+        let error = Checker::new().check(&parsed(source)).unwrap_err();
+        assert!(error.message.contains("cannot assign to immutable variable"), "{error}");
+    }
+    for body in [
+        "value = 1 value += 1",
+        "value = 1 value++",
+        "while (false) {}",
+    ] {
+        let source = format!("async fn main(): null! {{ {body} return ok(null) }}");
+        let error = task_lower::lower_program(&checked(&source)).unwrap_err();
+        assert!(error.message.contains("this statement"), "{error}");
+    }
+}
+
+#[test]
 fn native_task_if_lexical_names_and_terminating_move_paths_lower() {
     for body in [
         "if (true) { println(1) } else { println(2) } return ok(null)",
@@ -399,9 +627,9 @@ async fn main(): null! { return ok(null) }
 }
 
 #[test]
-fn native_task_if_reassignment_cross_scope_task_moves_and_loops_stay_gated() {
+fn native_task_if_owned_reassignment_cross_scope_task_moves_and_loops_stay_gated() {
     for source in [
-        "async fn main(): null! { value = 1 if (true) { value = 2 } return ok(null) }",
+        "async fn main(): null! { value = \"first\" if (true) { value = \"second\" } return ok(null) }",
         "async fn Child(): int! { return ok(1) } async fn main(): null! { outer = Child() if (true) { inner = outer } return ok(null) }",
         "async fn main(): null! { while (false) { println(1) } return ok(null) }",
     ] {

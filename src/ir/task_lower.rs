@@ -698,6 +698,35 @@ impl<'a> FunctionLowerer<'a> {
         declaration: bool,
         depth: usize,
     ) -> KuResult<()> {
+        if !declaration {
+            if let Some(destination) = self.local(name) {
+                let expected = self.function.slots[destination.0].ty.clone();
+                if !copy_value(&expected) {
+                    return Err(unsupported(
+                        "reassignment of Owned or Task values in the native Task subset",
+                        span,
+                    ));
+                }
+                self.budget.text(name.len(), span)?;
+                // Resolve and finish the RHS in the original lexical environment.
+                // Await, ? and short circuit may change the current state; only
+                // their successful endpoint may commit to the existing Copy slot.
+                let source = self.expression(value, depth)?;
+                if self.function.slots[source.0].ty != expected {
+                    return Err(unsupported("a mismatched Copy reassignment", span));
+                }
+                return self.emit(if source == destination {
+                    // Copy's distinct-slot ABI remains unchanged. A self-assignment
+                    // still proves that the source is initialized, without consuming it.
+                    TaskOp::Read { slot: source }
+                } else {
+                    TaskOp::Copy {
+                        dst: destination,
+                        src: source,
+                    }
+                });
+            }
+        }
         let already_bound = if declaration {
             self.locals
                 .last()
