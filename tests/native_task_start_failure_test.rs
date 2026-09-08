@@ -44,7 +44,7 @@ async fn main(): null! { return ok(null) }
     let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
     assert!(!generated.contains("run_source") && !generated.contains("const SOURCE"));
     let instrumentation = format!(
-        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic void fixture_child_cleanup_observe(void*,uint32_t,void*);\nstatic void fixture_child_dispose_observe(void*);\nstatic void fixture_child_resume_observe(void*);\nstatic void fixture_worker_exit(void);\n"
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic void fixture_child_cleanup_observe(void*,uint32_t,void*);\nstatic void fixture_child_dispose_observe(void*);\nstatic void fixture_child_resume_observe(void*);\nstatic void fixture_child_drop_frame_observe(void*);\nstatic void fixture_child_ack_observe(void*);\nstatic void fixture_worker_exit(void);\n"
     );
     let mut generated = replace_once(
         generated,
@@ -91,6 +91,11 @@ async fn main(): null! { return ok(null) }
     );
     generated = replace_once(
         generated,
+        "static void ku_task_1_drop_frame(void* raw) {",
+        "static void ku_task_1_drop_frame(void* raw) {\n  fixture_child_drop_frame_observe(raw);",
+    );
+    generated = replace_once(
+        generated,
         "static uint32_t ku_task_1_cleanup(void* raw, uint32_t reason, KuTaskControlV1* budget) {",
         "static uint32_t ku_task_1_cleanup(void* raw, uint32_t reason, KuTaskControlV1* budget) {\n  fixture_child_cleanup_observe(raw,reason,budget);",
     );
@@ -103,6 +108,11 @@ async fn main(): null! { return ok(null) }
         generated,
         "static void ku_task_1_dispose(KuTaskControlV1* control, void* raw) {",
         "static void ku_task_1_dispose(KuTaskControlV1* control, void* raw) {\n  fixture_child_dispose_observe(raw);",
+    );
+    generated = replace_once(
+        generated,
+        "  slot->cleanup_acked_generation = slot->generation;",
+        "  slot->cleanup_acked_generation = slot->generation;\n  fixture_child_ack_observe(slot);",
     );
     generated = replace_once(
         generated,
@@ -161,6 +171,7 @@ enum { FIXTURE_CANCEL=0, FIXTURE_TIMEOUT=1, FIXTURE_CLOSING=2, FIXTURE_CLOCK=3 }
 static unsigned fixture_fault,fixture_pause,fixture_factory_calls,fixture_reserves;
 static unsigned fixture_commits,fixture_private_polls,fixture_private_drops;
 static unsigned fixture_child_disposes,fixture_child_resumes,fixture_cleanups;
+static unsigned fixture_child_commit_gate;
 static uint32_t fixture_lowlevel_status,fixture_cleanup_reason;
 static uint64_t fixture_cleanup_deadline;
 static size_t fixture_input_buffers,fixture_fixed;
@@ -170,7 +181,7 @@ static KuTaskDriverTicketV1 fixture_stale,fixture_child_ticket;
 static KuTaskControlLeaseV1 fixture_child_observer;
 /* Real, bounded leases, not forged refcount fields and not runtime allocations. */
 static KuTaskControlLeaseV1 fixture_quota[KU_TASK_CONTROL_MAX_REFERENCES];
-static KuTestEvent fixture_entered,fixture_proceed,fixture_parent_terminal,fixture_exited;
+static KuTestEvent fixture_entered,fixture_proceed,fixture_parent_terminal,fixture_child_ack,fixture_child_committing,fixture_child_release,fixture_exited;
 static void fixture_barrier(unsigned point) {
   if (fixture_pause != point) return;
   CHECK(ku_test_event_set(&fixture_entered));
@@ -331,6 +342,17 @@ static uint32_t ku_task_1_try_start_impl(KuTaskDriverV1* driver,
   } else CHECK(fixture_empty_result(*input) && output->owner.lease.control);
   return status;
 }
+static void fixture_child_drop_frame_observe(void* raw) {
+  if (!fixture_child_commit_gate) return;
+  KuTaskInstance_1* instance=(KuTaskInstance_1*)raw;
+  /* The real R2 CAS has reserved cleanup completion. Pause the real drop
+   * callback, never write phase or claim a synthetic terminal outcome. */
+  CHECK(instance->registered && instance->frame_initialized);
+  CHECK(instance->control.frame_destroyed && fixture_cleanup_reason==KU_TASK_CONTROL_CANCELLED);
+  CHECK(ku_task_control_atomic_load(&instance->control.phase)==KU_TASK_CONTROL_COMMITTING);
+  CHECK(ku_test_event_set(&fixture_child_committing));
+  CHECK(ku_test_event_wait(&fixture_child_release,2000));
+}
 static void fixture_child_cleanup_observe(void* raw,uint32_t reason,void* budget) {
   (void)raw; fixture_cleanups++;
   fixture_cleanup_reason=reason;
@@ -341,6 +363,17 @@ static void fixture_child_dispose_observe(void* raw) {
 }
 static void fixture_child_resume_observe(void* raw) {
   (void)raw; fixture_child_resumes++;
+}
+static void fixture_child_ack_observe(void* raw) {
+  /* Test-only observation after the real mutex-held ACK watermark store.
+   * It cannot manufacture ACK, release an owner, or replace any callback. */
+  KuTaskDriverSlotV1* slot=(KuTaskDriverSlotV1*)raw;
+  if (!slot->binding || slot->binding->operations.resume!=ku_task_1_resume) return;
+  CHECK(fixture_child_observer.control==slot->binding);
+  CHECK(slot==&fixture_child_ticket.driver->slots[fixture_child_ticket.slot]);
+  CHECK(slot->generation==fixture_child_ticket.generation
+      && slot->cleanup_acked_generation==slot->generation);
+  CHECK(ku_test_event_set(&fixture_child_ack));
 }
 static KuString fixture_owned(size_t capacity,const char* text) {
   size_t length=strlen(text); CHECK(length<=capacity);
@@ -358,6 +391,7 @@ typedef struct FixtureRuntime { KuTaskDriverV1* driver; KuTaskDriverSlotV1* slot
 static void fixture_begin(FixtureRuntime* runtime,unsigned fault,unsigned pause) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
   fixture_fault=fault; fixture_pause=pause;
+  fixture_child_commit_gate=0;
   fixture_factory_calls=fixture_reserves=fixture_commits=0;
   fixture_private_polls=fixture_private_drops=fixture_child_disposes=0;
   fixture_child_resumes=fixture_cleanups=0; fixture_lowlevel_status=UINT32_MAX;
@@ -366,6 +400,8 @@ static void fixture_begin(FixtureRuntime* runtime,unsigned fault,unsigned pause)
   fixture_child_ticket=(KuTaskDriverTicketV1){0}; fixture_source=(KuTaskDriverStartChargeV1){0};
   CHECK(ku_test_event_init(&fixture_entered)); CHECK(ku_test_event_init(&fixture_proceed));
   CHECK(ku_test_event_init(&fixture_parent_terminal)); CHECK(ku_test_event_init(&fixture_exited));
+  CHECK(ku_test_event_init(&fixture_child_ack));
+  CHECK(ku_test_event_init(&fixture_child_committing)); CHECK(ku_test_event_init(&fixture_child_release));
   runtime->driver=(KuTaskDriverV1*)calloc(1,sizeof(*runtime->driver));
   runtime->slots=(KuTaskDriverSlotV1*)calloc(4,sizeof(*runtime->slots));
   runtime->ring=(size_t*)calloc(4,sizeof(*runtime->ring));
@@ -383,7 +419,20 @@ static void fixture_finish(FixtureRuntime* runtime,KuTaskValueV1* root,
     KuTaskControlLeaseV1* cancel,uint64_t deadline,int expected_fault,int was_closing) {
   CHECK(ku_task_value_drop(root,deadline)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_control_lease_release(cancel)==KU_TASK_CONTROL_OK);
-  if (fixture_child_observer.control) CHECK(ku_task_control_lease_release(&fixture_child_observer)==KU_TASK_CONTROL_OK);
+  if (fixture_child_observer.control) {
+    /* Keep the real observer until both terminal cleanup and durable driver
+     * ACK exist. The event publishes preceding frame writes; it is not a poll. */
+    CHECK(ku_test_event_wait(&fixture_child_ack,2000));
+    KuTaskControlV1* child=fixture_child_observer.control;
+    CHECK(ku_task_control_status(&fixture_child_observer)==KU_TASK_CONTROL_CANCELLED);
+    CHECK(child->frame_destroyed && !ku_task_control_atomic_load(&child->lifecycle_pin)
+        && !ku_task_control_atomic_load(&child->executor));
+    CHECK(ku_task_control_atomic_load(&child->payload)==KU_TASK_CONTROL_PAYLOAD_EMPTY);
+    KuTaskInstance_1* instance=(KuTaskInstance_1*)child->context;
+    CHECK(!instance->frame_initialized && !instance->payload_initialized);
+    CHECK(fixture_empty_result(instance->payload));
+    CHECK(ku_task_control_lease_release(&fixture_child_observer)==KU_TASK_CONTROL_OK);
+  }
   if (!was_closing) {
     uint32_t shutdown=ku_task_driver_shutdown(runtime->driver,deadline);
     CHECK(shutdown==(expected_fault ? KU_TASK_DRIVER_INTERNAL : KU_TASK_DRIVER_OK));
@@ -410,6 +459,8 @@ static void fixture_finish(FixtureRuntime* runtime,KuTaskValueV1* root,
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
   CHECK(ku_test_event_destroy(&fixture_entered)); CHECK(ku_test_event_destroy(&fixture_proceed));
   CHECK(ku_test_event_destroy(&fixture_parent_terminal)); CHECK(ku_test_event_destroy(&fixture_exited));
+  CHECK(ku_test_event_destroy(&fixture_child_ack));
+  CHECK(ku_test_event_destroy(&fixture_child_committing)); CHECK(ku_test_event_destroy(&fixture_child_release));
   ku_task_control_atomic_store(&fixture_bad_clock,0);
 }
 static void fixture_fault_case(unsigned fault,int error) {
@@ -511,6 +562,10 @@ static void fixture_fatal_root_cleanup_case(unsigned fault,int error) {
 }
 static void fixture_cancel_case(unsigned point,unsigned action,int error) {
   FixtureRuntime runtime={0}; fixture_begin(&runtime,FIXTURE_NORMAL,point);
+  /* Reuse the two existing ok/err closing cases. The already-expired parent
+   * scope can terminate before child ACK, so a single worker cannot deadlock
+   * on this gate waiting for the parent's earlier terminal event. */
+  fixture_child_commit_gate=point==FIXTURE_AFTER_COMMIT && action==FIXTURE_CLOSING;
   KuResult_str input=fixture_input(error); KuTaskValueV1 root={0}; KuTaskControlLeaseV1 cancel={0};
   CHECK(ku_task_0_start_value(runtime.driver,&input,&root)==KU_TASK_DRIVER_OK && root.tag==KU_TASK_VALUE_LIVE);
   CHECK(fixture_empty_result(input));
@@ -537,13 +592,24 @@ static void fixture_cancel_case(unsigned point,unsigned action,int error) {
   CHECK(ku_test_event_wait(&fixture_parent_terminal,2000));
   CHECK(ku_task_control_status(&cancel)==reason);
   CHECK(ku_task_control_cleanup_deadline(cancel.control)==deadline);
-  if (fixture_child_observer.control) {
-    /* Parent may finish an expired scope before child ACK. The real registry
-     * and observer keep child alive; final assertions run after worker exit. */
-    KuTaskControlV1* child=fixture_child_observer.control;
-    CHECK(ku_task_control_is_requested(ku_task_control_atomic_load(&child->phase))
-        || ku_task_control_is_terminal(ku_task_control_atomic_load(&child->phase)));
+  if (fixture_child_commit_gate) {
+    CHECK(ku_test_event_wait(&fixture_child_committing,2000));
+    CHECK(fixture_child_observer.control);
+    CHECK(ku_task_control_atomic_load(&fixture_child_observer.control->phase)==KU_TASK_CONTROL_COMMITTING);
+    CHECK(ku_task_control_status(&fixture_child_observer)==KU_TASK_CONTROL_PENDING);
+    CHECK(ku_task_control_cleanup_deadline(fixture_child_observer.control)==deadline);
   }
+  if (fixture_child_observer.control) {
+    /* Parent may finish an expired scope before child ACK. Only one acquire
+     * snapshot is classified: Control2 can be freezing cancellation cleanup,
+     * but LIVE, payload-success and the opposite cancellation reason are wrong.
+     * fixture_finish separately waits for actual ACK before releasing observer. */
+    KuTaskControlV1* child=fixture_child_observer.control;
+    size_t child_phase=ku_task_control_atomic_load(&child->phase);
+    CHECK(child_phase==KU_TASK_CONTROL_REQUESTED_CANCEL
+        || child_phase==KU_TASK_CONTROL_COMMITTING || child_phase==KU_TASK_CONTROL_CANCELLED);
+  }
+  if (fixture_child_commit_gate) CHECK(ku_test_event_set(&fixture_child_release));
   fixture_finish(&runtime,&root,&cancel,deadline,action==FIXTURE_CLOCK ? 2 : 0,action>=FIXTURE_CLOSING);
   CHECK(fixture_factory_calls==1u && fixture_reserves==1u && fixture_commits==1u);
   CHECK(fixture_lowlevel_status==KU_TASK_DRIVER_OK && !fixture_private_polls && !fixture_private_drops);
