@@ -111,7 +111,7 @@ async fn main(): null! { return ok(null) }
         "  /* No further driver or task storage access after this point. */\n  fixture_worker_exited();",
     );
     let mut generated = generated;
-    assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 3u"));
+    assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 4u"));
     for id in 0..3 {
         let call = format!(
             "status = ku_task_frame_{id}_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);"

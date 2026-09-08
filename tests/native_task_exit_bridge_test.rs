@@ -196,7 +196,7 @@ fn native_task_exit_bridge_transfers_before_values_and_cancels_staged_result_in_
         vec![SlotId(0), SlotId(1), SlotId(2)]
     );
     let generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
-    assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 3u"));
+    assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 4u"));
     assert!(generated.contains("#define KU_TASK_DRIVER_ABI_VERSION 6u"));
     assert!(generated.contains("KU_TASK_FRAME_EXIT_STAGED = 11u"));
     for forbidden in ["run_source", "const SOURCE"] {
@@ -621,7 +621,7 @@ static void fixture_case(unsigned mode) {
   CHECK(ku_test_event_destroy(&fixture_staged));
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==3u && KU_TASK_DRIVER_ABI_VERSION==6u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==6u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&fixture_release_children,0);
   for (unsigned mode=0;mode<4u;mode++) fixture_case(mode);

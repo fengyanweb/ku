@@ -184,7 +184,7 @@ R3 前置操作 `WrapOk` 允许把已初始化的 primitive 局部构造为匹�
 liveness 同步跟踪它的消费行为。源码子集的 `ok(local)` 复用该操作。
 
 `src/backend/c_task.rs` 通过统一 C 生成器复用既有 KuString / Result 的 move/drop
-helper，不嵌入 runner 或源码。内部 frame ABI v3 有独立版本、目标 C `sizeof` / alignment、
+helper，不嵌入 runner 或源码。内部 frame ABI v4 有独立版本、目标 C `sizeof` / alignment、
 初始化位、状态、结果槽、退出 metadata 和绝对 cleanup deadline；单 frame 存储上限 16 KiB。
 host context 只在当前 callback 借用，不保存 callback 栈地址跨 Pending。
 ABI 不兼容、短/未对齐存储、参数 header 别名、重复初始化、重复取结果和非空输出槽
@@ -249,7 +249,7 @@ typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 
 R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 等待类型和独立期限
 升为版本 4，R5h 正常作用域登记字段升为版本 5，单向 FINAL 标记升为版本 6；
 内部 C 类型名中的 `V1` 不是旧布局兼容承诺，初始化明确拒绝旧版本（包括5）。
-当前 Frame ABI 3、Control ABI 2、Driver ABI 6。
+当前 Frame ABI 4、Control ABI 2、Driver ABI 6。
 普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
 以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
 有限源码 TaskStart/Await 已复用它，但它不是 M:N、netpoll 或事件驱动 HTTP。
@@ -423,10 +423,9 @@ Value、取入 private READY，然后等待 receipt ACK。
 仍传递该次原始/收紧后的 D，祖先后续清理只能取更小值，不能重新计时。普通用户
 Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复错误的语义。
 
-源码与两种 CLI native 构建的定向执行已经通过；本轮表达式/清理定向测试与 Rust
-quality 通过，本轮 native 全集和质量检查通过，workspace 的文档失败与修复证据单列；精确新提交三系统 CI/sanitizer 仍待核实。
-历史失败及修复结果分开记录于工作日志，不从旧 SHA 的通过结果外推。
-Frame ABI 3、Control ABI 2、Driver ABI 6 不等于稳定外部 C FFI。
+源码与两种 CLI native 构建、表达式和清理测试的实际结果按精确提交记录在工作日志。
+定向验证、完整本机门禁和三系统 CI/sanitizer 分开记录，历史失败及修复结果也分列，
+不从旧 SHA 的通过结果外推。Frame ABI 4、Control ABI 2、Driver ABI 6 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
 
 ### R5h 内部正常作用域 session（尚未接入源码）
@@ -441,15 +440,15 @@ receipt 从空到真实 owner_drop_receipt 签发一次，之后不变。`scope_
 成功 end 仅清除本正常作用域的 D/登记/token，保留递增 epoch、取消和shutdown状态；
 后续独立正常作用域可以建立新 D。已锁存失败不能被迟到 ACK 清除，仅 timer 已触发
 而全体 ACK 的情况仍可成功。最终 acquire LIVE 读取是关闭线性化点：driver mutex
-不阻止外部 control CAS，更晚取消可以与成功 end 重叠。未来生成器必须返回
+不阻止外部 control CAS，更晚取消可以与成功 end 重叠。生成器成功 Continue 后返回
 `ku_task_dispatch` 重新检查 phase 后才执行下一段用户代码，不能直接进入 join。
 
 manifest 是借用的稳定 instance 存储；完整集合、生命周期、唯一写入及真实receipt
 来源是受信 raw C 调用合同，不是恶意指针认证。timer/notify/shutdown/terminal 不读
 该存储；terminal 在释放 registry/执行租约前只注销元数据，不代表替调用方清完子树。
-父 D 缩短不扫描 manifest，未来 adapter 须对 pending issued child 调用 cancel_receipt；
-取消后向最终退出提升、外层 child 合并目前仅有下述 driver 原语，typed adapter
-接入、对应 TaskOp/verifier/源码 if/loop/finally 尚未实现。不改变前述源码拒绝边界，
+父 D 缩短不扫描 manifest，adapter 对 pending issued child 调用 cancel_receipt；
+取消后向最终退出提升、外层 child 合并复用下述 driver 原语及内部 typed adapter。
+对应 TaskOp/verifier 和帧协议见 R5h.4；源码 if/loop/finally 尚未接入，不改变前述源码拒绝边界，
 不代表完整 async 或 M:N。
 容量和重复检查最多64项/2016次比较，无新增堆分配、队列或 RC 边；测试与精确提交
 验收结果见工作日志，不从接口存在推断真实 C 或 sanitizer 已通过。
@@ -464,10 +463,11 @@ control 和 closing shutdown 期限的最小值；不读新时钟、不续期、
 
 该内部命令接受 LIVE、requested 和 PUBLISHING，不改取消首赢家。LIVE 必须由可信
 typed 整函数退出见证授权，不能用它代替普通 Continue；下节内部 Exit 提供退出
-状态及 Value 清理桥接，当前源码已使用 Exit，但尚未接入活动 normal session 的提升。
+状态及 Value 清理桥接，当前源码已使用 Exit，内部 adapter 接入活动 normal session 的提升。
 raw driver 不能认证一条源语句确实已 return/fail。PUBLISHING 不读尚未
 发布的 control D；若此前已有 scope failure，现有 wrapper 会跳过 scope 期限刷新，
-后续 adapter 仍须重新取最小 D 并显式传播给 pending child，不能宣称已自动闭环。
+adapter 在每次 final 重入时显式提升/重新取最小 D，并传播给 pending child。
+这不是任意外部 raw 调用自动获得的保证，具体执行覆盖见工作日志。
 
 promotion 的 OK 仅表示元数据登记成功，不表示清理成功或 Task 完成。已有 scope
 timeout/global fault 不单独阻断安全的 outer 登记，失败仍保持；损坏 binding、
@@ -489,7 +489,7 @@ scope 超时、业务 return/Err 穿作用域及 async finally 的源码闭环�
 不增加每值分配，16 KiB frame/64槽等上限不变。移除合成指令可减少实际 IR 工作，
 不承诺所有旧资源阈值输入仍在同一位置拒绝。
 
-内部 Frame ABI 升为3，新增非终态 `KU_TASK_FRAME_EXIT_STAGED`。Result 先进入
+`KU_TASK_FRAME_EXIT_STAGED` 是 Frame ABI 3 引入并在当前 ABI 4 保留的非终态。Result 先进入
 独立退出槽，剩余 Value 尚不释放，旧 Suspend/Await 的 cleanup_state 清为无效。
 反复 resume 不重放用户状态；take/destroy 不能绕过这个非终态。bridge 的正常执行
 runtime error 也暂存退出，保留真实 Await 继承的绝对 D；已经进入取消 cleanup 的
@@ -504,9 +504,51 @@ staged/私有结果期间胜出，沿原 R2 首赢家裁决，结果只 drop 一
 
 本片不增加每值分配、线程、重试循环或用户 API；复用原 frame 位图、driver receipt
 与串行 executor。IR 反例、真实 C 退出顺序测试和 ABI 拒绝测试分别记录证据，不从
-artifact 文本存在推断执行通过。normal ScopeEnter/ScopeDrain、活动 session 的
-final promotion adapter 接入和 source if/loop/finally 尚未实现，完整 native async
+artifact 文本存在推断执行通过。内部 normal ScopeEnter/ScopeDrain 与活动 session
+的 final promotion adapter 接入见下节；source if/loop/finally、完整 native async
 与高并发发布门禁仍未完成。具体测试结果以工作日志及精确提交 CI 为准。
+
+### R5h.4 内部 ScopeEnter/ScopeDrain（尚未接入源码）
+
+`ScopeEnter { scope, tasks }` 是唯一且稠密的词法所有权声明，不初始化值、不分配
+runtime 栈、不启动期限。Task 集合最多64槽且互不重叠；未声明的 Task 属于隐式 ROOT。
+每个 Task 目标必须属于当前最内层作用域，Task Move 不得跨所有权作用域；不能把
+内层新建 owner 写进未列出的 ROOT 槽来逃过清理。直接 Await 外层 owner 可以消费它，
+但不能借隐藏 Move 跨域。这里没有放开任何新源码写法。
+
+`ScopeDrain { scope, ready, cleanup }` 只能关闭当前最内层作用域，ready 只清该集合
+的 Task 初始化事实，取消边清全部 Task，之后才进入有限 Value cleanup。普通汇合
+必须拥有完全相同的作用域栈；Exit 可以保留活动作用域，交最终退出桥接。首片 scoped
+CFG 全图必须是 DAG，即使经过 Suspend/Await 也不允许环；空或立即 ACK 的 ScopeDrain
+不是强制挂起，不能作为无限空作用域循环的进度保证。无 scope 的旧图规则保持不变。
+新边界两侧所需 Copy 值真实持久化，任何可能初始化的 borrowed 槽不得跨界；成员、
+布局、图遍历和保存集扫描均先计入原分析预算，不扩大原硬限。
+
+Frame ABI 4 的 `KU_TASK_FRAME_SCOPE_REQUEST` 是停止但非终态的请求。只读静态
+descriptor 由真实 StateId 确定，包含 scope/mask/ready/cleanup；同一作用域可有多个
+互斥 drain 状态。重复 resume 不重放，take/destroy 拒绝。Continue 要求所选 Task 位
+为空，只改到 PENDING/ready，再返回调度器检查真实 phase，不能直接执行用户代码。
+真正取消保留请求的 cleanup CFG；scope timeout 则暂存静态 RuntimeFailure 和原绝对
+D，走 Exit 并作废旧 cleanup CFG，不改 R2 取消权。raw helper 不能认证调用方确实
+获得 driver ACK，descriptor 输出也不是任意 C 指针的安全认证。
+
+adapter 仅在 scoped 函数携带 NORMAL/FINAL、固定 token、完整 expected/issued
+集合，复用已有 receipt span 和 drain；无 scope 函数不发射请求 helper 或额外实例字段。
+先预检完整新 LIVE 集合再登记和移交。真实取消 cleanup 已有初次发布的预算，必须
+先取已发布取消预算的最小 D，再登记或提升 session，最后移交 Task；并发再次收紧时
+直接取 `reason && budget` 中已初始化原子预算的 min，Control ABI 2 在提交前复核。
+这不授权首次 PUBLISHING 尚未进入 cleanup 的调用读取未发布期限。正常成功必须
+读取/摘除最后 ACK wait，并实际
+scope_end；全量 ACK 后异常 Pending 作为合同错误拒绝，不循环 YIELD。空/inline failed
+集合用单独空集见证，不伪造 ACK/session end、不创建 D。正常完成才清 receipt/预算缓存，
+后续独立作用域可建新 D；活动 session 提升到 FINAL 后只扩集合和收紧旧 D，先移交
+全部 Task 再清 Value，不因旧 timeout 跳过外层 owner。每个 resume callback 至多
+两次有界 drain；Control ABI 2 在同一 poll 中还可进入一次取消 cleanup，而非循环重试。
+不递归 drive child、增加线程或重试环；新增实例字段继续通过 sizeof 计费。
+
+上述是内部合同和实现边界，不等于所有故障/竞态已实测，也不是完整 lexical Value
+析构或源码 if/loop/finally 实现。真实 C、无副作用 raw 反例、sanitizer、精确 SHA 三系统
+结果分开验收；固定硬件性能、RSS、soak、M:N、netpoll 和事件 HTTP 仍未完成。
 
 ### R5e checked Copy 表达式
 
