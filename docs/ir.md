@@ -162,8 +162,9 @@ WrapOk、Unary、Binary、Read、Drop、DropIfInit、Start、Print；控制边�
 完成全部 Task 移交后清 Task 位；TryResult 的成功/错误边分别初始化不同槽。已死亡的普通 Owned Value 必须在挂起前显式
 drop，不能为了缩 frame 擅自提前释放资源。借用值不能跨 Suspend；owned 值不能隐式
 Copy、覆盖可能仍初始化的槽或再次消费 moved-from 值。Task 不能普通 Drop/DropIfInit，
-Complete 留存的 Task 只能由生成的 scope drain 处理。内部 Exit 的独立清理桥接见下节，
-源码 lower 尚未使用 Exit。取消区域不能回正常区域、Complete、Exit、Start、Await
+legacy Complete 留存的 Task 只能由生成的 scope drain 处理。当前已开放源码的
+return/fail/? 统一生成 Exit，清理桥接见下节；Complete 仅保留内部旧 IR 合同。
+取消区域不能回正常区域、Complete、Exit、Start、Await
 或 Suspend；本片也拒绝 cleanup 中可能溢出的 Negate 和算术
 Binary，避免算术失败覆盖原取消/超时原因；总是有限且不失败的 Not/比较仍可用于内部
 cleanup IR。拒绝所有不经过实际 suspension 的环，
@@ -405,7 +406,8 @@ Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍�
 
 `KuTaskValueV1` 是 move-only 内部值；Await 的隐藏 owner 计入64槽和初始化分析。
 接纳/OOM 拒绝清理已 move 的源码实参，产生静态错误的 inline failed Task，不再分配。
-private READY 先保存返回 Result；所有 sibling 先移交到固定 driver 槽，再等待 receipt ACK。
+源码 Exit 先暂存返回 Result；所有 sibling 先移交到固定 driver 槽，才释放其余
+Value、取入 private READY，然后等待 receipt ACK。
 一个 final-drain session 共用一次绝对 D，后续更短取消预算通过有效 receipt 收紧已移交 child，
 不逐个续期。正常超期 drop 暂存 Result，返回外层 `task/shutdown_timeout`，不取消正常父；
 取消胜出时 drop 私有结果并保留原取消原因。取消中的 ACK continuation 不放宽用户 cleanup 禁 Await。
@@ -455,7 +457,7 @@ control 和 closing shutdown 期限的最小值；不读新时钟、不续期、
 
 该内部命令接受 LIVE、requested 和 PUBLISHING，不改取消首赢家。LIVE 必须由可信
 typed 整函数退出见证授权，不能用它代替普通 Continue；下节内部 Exit 提供退出
-状态及 Value 清理桥接，但尚未接入活动 normal session 的提升，也未接入源码。
+状态及 Value 清理桥接，当前源码已使用 Exit，但尚未接入活动 normal session 的提升。
 raw driver 不能认证一条源语句确实已 return/fail。PUBLISHING 不读尚未
 发布的 control D；若此前已有 scope failure，现有 wrapper 会跳过 scope 期限刷新，
 后续 adapter 仍须重新取最小 D 并显式传播给 pending child，不能宣称已自动闭环。
@@ -467,13 +469,18 @@ parent cleanup_fault、非法 manifest/token/alias 仍拒绝，输出与原对�
 唤醒、等待或重试。生成 adapter 必须先移交全部 Task，再清理其余 Value；正常
 scope 超时、业务 return/Err 穿作用域及 async finally 的源码闭环仍未完成。
 
-### R5h.3a 内部 typed Exit 清理桥接（尚未接入源码）
+### R5h.3 typed Exit 与当前源码子集
 
 `TaskTerminator::Exit { value }` 移动匹配、已初始化且非借用的 Result；一个函数
 不能混用 Exit 与 legacy Complete，即使冲突状态不可达。Exit 不能出现在 cleanup
 区域，不能保留任何可能初始化的 borrowed 槽，也不放宽无实际挂起环和分析硬限。
 含 Exit 的函数即使没有 Task 槽也必须 hosted，所有 Owned Value 持久保存在 frame，
-已死亡的 Copy 临时仍可留在 resume 栈上。源码 lower 当前继续使用 Complete。
+已死亡的 Copy 临时仍可留在 resume 栈上。源码 lower 的普通退出统一使用 Exit，
+不保留另一条源码 Complete 路径，也不新增用户写法。
+仅移除普通退出前合成的 DropIfInit；Await 取消区的反序清理和表达式临时值的
+显式 Drop 保留。零 Task 函数新增持久 Owned 槽仍计入原实例 sizeof 和接纳预算，
+不增加每值分配，16 KiB frame/64槽等上限不变。移除合成指令可减少实际 IR 工作，
+不承诺所有旧资源阈值输入仍在同一位置拒绝。
 
 内部 Frame ABI 升为3，新增非终态 `KU_TASK_FRAME_EXIT_STAGED`。Result 先进入
 独立退出槽，剩余 Value 尚不释放，旧 Suspend/Await 的 cleanup_state 清为无效。
@@ -488,7 +495,7 @@ runtime error 也暂存退出，保留真实 Await 继承的绝对 D；已经进
 staged/私有结果期间胜出，沿原 R2 首赢家裁决，结果只 drop 一次；移交不成功不得
 伪造 ACK 或提前释放剩余值。runtime failure 的既有 D 先导入再 drain，只能收紧。
 
-本片不增加分配、线程、重试循环或用户 API；复用原 frame 位图、driver receipt
+本片不增加每值分配、线程、重试循环或用户 API；复用原 frame 位图、driver receipt
 与串行 executor。IR 反例、真实 C 退出顺序测试和 ABI 拒绝测试分别记录证据，不从
 artifact 文本存在推断执行通过。normal ScopeEnter/ScopeDrain、活动 session 的
 final promotion adapter 接入和 source if/loop/finally 尚未实现，完整 native async

@@ -155,6 +155,295 @@ fn native_task_source_lowering_keeps_pending_away_from_argument_and_move_operati
 }
 
 #[test]
+fn native_task_source_exit_owns_normal_results_without_erasing_await_cleanup() {
+    use ku::ir::{
+        task::{self, SlotId, TaskConstant, TaskLimits, TaskOp, TaskSlotType, TaskTerminator},
+        IrType,
+    };
+
+    let source = r#"
+async fn ReturnText(value: str): str! { local = value return ok(local) }
+async fn FailText(): str! { retained = "held" fail "expected failure" }
+async fn Question(value: str!): str! { local = value? return ok(local) }
+async fn ShortAnd(gate: bool): bool! { return ok(gate && (await Flag())?) }
+async fn ShortOr(gate: bool): bool! { return ok(gate || (await Flag())?) }
+async fn Flag(): bool! { return ok(true) }
+async fn AwaitText(value: str): str! {
+    retained = "held across await"
+    child = ReturnText(value)
+    output = (await child)?
+    println(retained)
+    return ok(output)
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let native = task_lower::lower_program(&checked(source)).unwrap();
+    let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    let mut await_count = 0;
+    for function in &native.tasks.functions {
+        let frame = plan
+            .functions
+            .iter()
+            .find(|frame| frame.function == function.id)
+            .unwrap();
+        assert!(frame.exit_bridge && frame.hosted, "{}", function.name);
+        let owned: Vec<_> = function
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                matches!(&slot.ty, TaskSlotType::Value { ty, borrowed: false }
+                    if matches!(ty, IrType::Str | IrType::Result(_)))
+            })
+            .map(|(index, _)| SlotId(index))
+            .collect();
+        assert!(owned.iter().all(|slot| frame.slots.contains(slot)));
+        let cleanup: Vec<_> = owned
+            .iter()
+            .rev()
+            .map(|slot| TaskOp::DropIfInit { slot: *slot })
+            .collect();
+        let mut exit_count = 0;
+        for state in &function.states {
+            match state.terminator {
+                TaskTerminator::Exit { value } => {
+                    exit_count += 1;
+                    assert_eq!(
+                        function.slots[value.0].ty,
+                        TaskSlotType::Value {
+                            ty: function.result.clone(),
+                            borrowed: false,
+                        }
+                    );
+                    assert!(
+                        state
+                            .operations
+                            .iter()
+                            .all(|operation| { !matches!(operation, TaskOp::DropIfInit { .. }) }),
+                        "{} normal Exit must leave remaining Values for handoff-first glue",
+                        function.name
+                    );
+                }
+                TaskTerminator::Complete { .. } => {
+                    panic!("{} still uses legacy normal completion", function.name)
+                }
+                TaskTerminator::Await {
+                    cleanup: cleanup_state,
+                    ..
+                } => {
+                    await_count += 1;
+                    assert!(state.operations.is_empty(), "Pending must not replay setup");
+                    let block = &function.states[cleanup_state.0];
+                    assert_eq!(block.terminator, TaskTerminator::Terminate);
+                    // Keep every conditional Value drop in reverse declaration
+                    // order, including slots only initialized on another edge.
+                    // Task owners are deliberately absent: the host hands them
+                    // off before entering this cancellation-only successor.
+                    assert_eq!(block.operations, cleanup, "{}", function.name);
+                }
+                _ => {}
+            }
+        }
+        assert!(exit_count > 0, "{} has no normal Exit", function.name);
+    }
+    assert_eq!(await_count, 3);
+
+    let failed = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "FailText")
+        .unwrap();
+    let state = &failed.states[failed.entry.0];
+    let TaskTerminator::Exit { value } = state.terminator else {
+        panic!("fail must stage a normal user Result");
+    };
+    assert!(state.operations.iter().any(|operation| {
+        matches!(operation, TaskOp::Init {
+            dst,
+            value: TaskConstant::Err { domain, code, message, .. },
+        } if *dst == value && domain == "ku" && code == "fail" && message == "expected failure")
+    }));
+
+    let question = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "Question")
+        .unwrap();
+    let TaskTerminator::TryResult {
+        ok_value,
+        err_result,
+        ok,
+        err,
+        ..
+    } = question.states[question.entry.0].terminator
+    else {
+        panic!("? must retain both typed Result successors");
+    };
+    assert_eq!(
+        question.states[err.0].terminator,
+        TaskTerminator::Exit { value: err_result }
+    );
+    let success = &question.states[ok.0];
+    assert!(matches!(success.terminator, TaskTerminator::Exit { .. }));
+    assert!(success
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, TaskOp::Move { src, .. } if *src == ok_value)));
+
+    for (name, right_on_true) in [("ShortAnd", true), ("ShortOr", false)] {
+        let function = native
+            .tasks
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap();
+        let TaskTerminator::Branch {
+            then_state,
+            else_state,
+            ..
+        } = function.states[function.entry.0].terminator
+        else {
+            panic!("{name} lost short-circuit control flow");
+        };
+        let (right, join) = if right_on_true {
+            (then_state, else_state)
+        } else {
+            (else_state, then_state)
+        };
+        let skipped = &function.states[join.0];
+        assert!(matches!(skipped.terminator, TaskTerminator::Exit { .. }));
+        assert!(skipped
+            .operations
+            .iter()
+            .all(|operation| !matches!(operation, TaskOp::Start { .. })));
+        assert_eq!(
+            function.states[right.0]
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation, TaskOp::Start { .. }))
+                .count(),
+            1
+        );
+        let TaskTerminator::Jump { target: poll } = function.states[right.0].terminator else {
+            panic!("{name} RHS must set up its child before a separate Await");
+        };
+        let TaskTerminator::Await { ready, .. } = function.states[poll.0].terminator else {
+            panic!("{name} RHS lost Await");
+        };
+        let TaskTerminator::TryResult {
+            ok,
+            err,
+            err_result,
+            ..
+        } = function.states[ready.0].terminator
+        else {
+            panic!("{name} RHS must propagate the awaited Result");
+        };
+        assert_eq!(
+            function.states[err.0].terminator,
+            TaskTerminator::Exit { value: err_result }
+        );
+        assert_eq!(
+            function.states[ok.0].terminator,
+            TaskTerminator::Jump { target: join }
+        );
+        assert!(function.states[ok.0]
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, TaskOp::Copy { .. })));
+    }
+}
+
+#[test]
+fn native_task_source_zero_task_exit_persists_owned_locals_not_dead_copy_temporaries() {
+    use ku::ir::{
+        task::{self, SlotId, TaskLimits, TaskOp, TaskSlotType, TaskTerminator},
+        IrType,
+    };
+
+    // A legitimate typed host may supply Owned storage for value. This source
+    // only moves it to a local; it does not introduce source heap-allocation syntax.
+    let source = r#"
+async fn Local(value: str): str! {
+    local = value
+    number = 7
+    println(number)
+    return ok(local)
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let native = task_lower::lower_program(&checked(source)).unwrap();
+    let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    let function = &native.tasks.functions[0];
+    assert_eq!(function.name, "Local");
+    let frame = plan
+        .functions
+        .iter()
+        .find(|frame| frame.function == function.id)
+        .unwrap();
+    assert!(frame.exit_bridge && frame.hosted);
+    assert_eq!(frame.scope_task_mask, 0);
+    assert!(frame.suspensions.is_empty());
+    let state = &function.states[function.entry.0];
+    assert!(matches!(state.terminator, TaskTerminator::Exit { .. }));
+    let moved_local = state
+        .operations
+        .iter()
+        .find_map(|operation| match operation {
+            TaskOp::Move { dst, src } if function.parameters.contains(src) => Some(*dst),
+            _ => None,
+        })
+        .expect("source binding must move the owned parameter to a distinct local");
+    assert!(!function.parameters.contains(&moved_local));
+    assert!(frame.slots.contains(&moved_local));
+    let mut dead_copy = 0;
+    let mut dead_null = 0;
+    for (index, slot) in function.slots.iter().enumerate() {
+        let id = SlotId(index);
+        match &slot.ty {
+            TaskSlotType::Value {
+                ty: IrType::Int,
+                borrowed: false,
+            } if !function.parameters.contains(&id) => {
+                dead_copy += 1;
+                assert!(
+                    !frame.slots.contains(&id),
+                    "dead Copy slot {index} was spilled"
+                );
+            }
+            TaskSlotType::Value {
+                ty: IrType::Null,
+                borrowed: false,
+            } => {
+                dead_null += 1;
+                assert!(
+                    !frame.slots.contains(&id),
+                    "unused print result {index} was spilled"
+                );
+                assert!(state.operations.iter().any(|operation| {
+                    matches!(operation, TaskOp::Init { dst, value: task::TaskConstant::Null } if *dst == id)
+                }));
+            }
+            TaskSlotType::Value {
+                ty: IrType::Str | IrType::Result(_),
+                borrowed: false,
+            } => assert!(
+                frame.slots.contains(&id),
+                "Owned slot {index} was not persisted"
+            ),
+            other => panic!("unexpected zero-Task fixture slot: {other:?}"),
+        }
+    }
+    assert_eq!(
+        dead_copy, 2,
+        "literal and local Copy snapshots must both exist"
+    );
+    assert_eq!(dead_null, 1, "println has one unused null result");
+}
+
+#[test]
 fn native_task_source_subset_rejects_unimplemented_constructs() {
     let sources = [
         "async fn main(): null! { while (false) {} return ok(null) }",

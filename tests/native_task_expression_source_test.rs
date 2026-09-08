@@ -76,7 +76,14 @@ fn native_task_copy_expression_source_emits_only_the_exact_typed_operators() {
             .iter()
             .any(|operation| matches!(operation, TaskOp::Copy { dst, .. } if *dst == left)));
         let plan = task::verify_and_plan(&native.tasks, Default::default()).unwrap();
-        assert!(!plan.functions[0].hosted);
+        assert!(plan
+            .functions
+            .iter()
+            .all(|frame| frame.hosted && frame.exit_bridge));
+        assert!(plan
+            .functions
+            .iter()
+            .all(|frame| frame.scope_task_mask == 0));
     }
     for (expression, parameter, result, expected) in [
         ("-x", "x: int", "int", TaskUnaryOp::Negate),
@@ -133,6 +140,31 @@ fn native_task_copy_expression_lhs_snapshot_crosses_rhs_await() {
         .collect::<Vec<_>>();
     assert_eq!(awaits.len(), 2);
     assert!(awaits.iter().all(|state| state.operations.is_empty()));
+    // Source exits use one typed bridge. Only Await cancellation regions keep
+    // the synthetic reverse-order Value cleanup; ordinary Exit must not free
+    // scope Values before the adapter has handed off remaining Task owners.
+    assert!(native.tasks.functions.iter().all(|function| {
+        function.states.iter().all(|state| match state.terminator {
+            TaskTerminator::Complete { .. } => false,
+            TaskTerminator::Exit { .. } => !state
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, TaskOp::DropIfInit { .. })),
+            _ => true,
+        })
+    }));
+    for state in awaits {
+        let TaskTerminator::Await { cleanup, .. } = state.terminator else {
+            unreachable!()
+        };
+        let cleanup = &main.states[cleanup.0];
+        assert!(matches!(cleanup.terminator, TaskTerminator::Terminate));
+        assert!(!cleanup.operations.is_empty());
+        assert!(cleanup
+            .operations
+            .iter()
+            .all(|operation| matches!(operation, TaskOp::DropIfInit { .. })));
+    }
 }
 
 #[test]
