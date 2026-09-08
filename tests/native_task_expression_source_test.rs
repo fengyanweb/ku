@@ -310,14 +310,120 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
     );
 }
 
+fn existing_task_short_circuit_source(expression: &str, continuation: &str) -> String {
+    format!("async fn Broken(): bool! {{ fail \"boom\" }} async fn main(): null! {{ existing = Broken() value = {expression} (await existing)? {continuation} return ok(null) }}")
+}
+
+#[test]
+fn native_task_existing_handle_starts_before_short_circuit_and_awaits_only_on_rhs() {
+    for (expression, skipped_value) in [("false &&", false), ("true ||", true)] {
+        let native = lowered(&existing_task_short_circuit_source(
+            expression,
+            "println(value)",
+        ));
+        let main = &native.tasks.functions[native.entry.0];
+        let entry = &main.states[main.entry.0];
+        let starts = main
+            .states
+            .iter()
+            .enumerate()
+            .flat_map(|(state, block)| {
+                block
+                    .operations
+                    .iter()
+                    .filter_map(move |operation| match operation {
+                        TaskOp::Start { dst, .. } => Some((state, *dst)),
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts.len(),
+            1,
+            "existing Task must not become lazy or duplicate"
+        );
+        assert_eq!(starts[0].0, main.entry.0, "Start precedes the Branch");
+        let existing = entry
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                TaskOp::Move { dst, src } if *src == starts[0].1 => Some(*dst),
+                _ => None,
+            })
+            .expect("entry retains the started Task in its existing owner slot");
+        let TaskTerminator::Branch {
+            condition,
+            then_state,
+            else_state,
+        } = entry.terminator
+        else {
+            panic!("existing Task must start before the logical Branch");
+        };
+        assert!(entry.operations.iter().any(|operation| matches!(
+            operation, TaskOp::Init { dst, value: TaskConstant::Bool(value) }
+                if *dst == condition && *value == skipped_value
+        )));
+        let (rhs, join) = if skipped_value {
+            (else_state, then_state)
+        } else {
+            (then_state, else_state)
+        };
+        let TaskTerminator::Jump { target: poll } = main.states[rhs.0].terminator else {
+            panic!("only the logical RHS enters the Await poll");
+        };
+        let TaskTerminator::Await {
+            task: hidden,
+            dst,
+            ready,
+            ..
+        } = main.states[poll.0].terminator
+        else {
+            panic!("RHS must retain its real Await");
+        };
+        assert!(main.states[rhs.0]
+            .operations
+            .iter()
+            .any(|operation| matches!(
+                operation, TaskOp::Move { dst, src } if *src == existing && *dst == hidden
+            )));
+        assert_eq!(
+            main.states
+                .iter()
+                .filter(|state| matches!(state.terminator, TaskTerminator::Await { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(main.states[ready.0].terminator,
+            TaskTerminator::TryResult { src, .. } if src == dst));
+        let skipped = &main.states[join.0];
+        assert!(matches!(skipped.terminator, TaskTerminator::Exit { .. }));
+        assert!(!skipped.operations.iter().any(|operation| matches!(
+            operation, TaskOp::Move { src, .. } if *src == existing
+        )));
+        let plan = task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+        let frame = &plan.functions[native.entry.0];
+        assert!(
+            frame.exit_bridge && frame.scope_task_mask & (1u64 << existing.0) != 0,
+            "skipped RHS leaves the existing Task for real scope-exit handoff"
+        );
+    }
+}
+
 #[test]
 fn native_task_copy_expression_order_and_short_circuit_execute_without_source() {
+    let existing_and = existing_task_short_circuit_source("false &&", "println(value)");
+    let existing_or = existing_task_short_circuit_source("true ||", "println(value)");
+    let observed_error = existing_task_short_circuit_source("true &&", "println(\"BAD\")");
     let cases = [
         ("async fn Left(): int! { println(\"L\") return ok(7) } async fn Right(): int! { println(\"R\") return ok(2) } async fn Combine(a: int, b: int): int! { println(\"C\") return ok(a + b) } async fn main(): null! { value = (await Combine((await Left())? + 1, (await Right())? * 3))? println(value) return ok(null) }", "L\nR\nC\n14\n", "", true),
         ("async fn Flag(value: bool): bool! { println(\"R\") return ok(value) } async fn main(): null! { a = false && (await Flag(true))? println(a) b = true || (await Flag(false))? println(b) c = true && (await Flag(true))? println(c) d = false || (await Flag(false))? println(d) return ok(null) }", "false\ntrue\nR\ntrue\nR\nfalse\n", "", true),
         ("async fn Broken(): bool! { println(\"BAD\") fail \"boom\" } async fn main(): null! { a = false && (await Broken())? println(a) b = true || ((await Broken())? && ((1 / 0) == 0)) println(b) c = false && ((1 / 0) == 0) println(c) return ok(null) }", "false\ntrue\nfalse\n", "", true),
         ("async fn Broken(): bool! { println(\"B\") fail \"boom\" } async fn main(): null! { value = true && (await Broken())? println(\"BAD\") return ok(null) }", "B\n", "boom\n", false),
-        ("async fn Flag(): bool! { println(\"BAD\") return ok(true) } async fn main(): null! { existing = Flag() value = false && (await existing)? println(value) return ok(null) }", "false\n", "", true),
+        // An already-started child may run before scope exit cancels it. Its
+        // recoverable error has no output and is observed only by a real Await.
+        (existing_and.as_str(), "false\n", "", true),
+        (existing_or.as_str(), "true\n", "", true),
+        (observed_error.as_str(), "", "boom\n", false),
     ];
     for (index, (source, stdout, stderr, success)) in cases.into_iter().enumerate() {
         let native = lowered(source);

@@ -2233,7 +2233,7 @@ static uint32_t ku_task_driver_shutdown(KuTaskDriverV1* driver, uint64_t deadlin
   }
   if (driver->clock_fault) { ku_task_driver_unlock(driver); return KU_TASK_DRIVER_INTERNAL; }
   if (!driver->closing) {
-    uint64_t root = now > UINT64_MAX - 1000u ? UINT64_MAX : now + 1000u;
+    uint64_t root = now > UINT64_MAX - 1001u ? UINT64_MAX - 1u : now + 1000u;
     driver->shutdown_deadline = ku_task_driver_min(root, deadline);
     driver->closing = 1;
   } else driver->shutdown_deadline = ku_task_driver_min(driver->shutdown_deadline, deadline);
