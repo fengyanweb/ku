@@ -305,6 +305,7 @@ impl Checker {
     }
 
     pub(super) fn check_generic_instances(&mut self) -> KuResult<()> {
+        self.check_loop_analysis_budget()?;
         while let Some(request) = self.generic_state.pending.pop_front() {
             let function = self
                 .functions
@@ -350,9 +351,10 @@ impl Checker {
             self.generic_state.bindings = old_bindings;
             self.generic_state.context = old_context;
             self.generic_state.depth = old_depth;
+            self.check_loop_analysis_budget()?;
             result?;
         }
-        Ok(())
+        self.check_loop_analysis_budget()
     }
 }
 

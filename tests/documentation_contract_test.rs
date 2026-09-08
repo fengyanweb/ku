@@ -42,6 +42,24 @@ fn documentation_separates_current_contract_from_implementation_evidence() {
 }
 
 #[test]
+fn frontend_docs_bound_statement_and_loop_analysis_without_claiming_total_safety() {
+    let semantics = include_str!("../docs/semantics.md");
+    for required in [
+        "可执行语句体的嵌套独立限制为 32 层",
+        "每个 Checker 共享的 100,000 工作单位",
+        "嵌套或兄弟循环不重置预算",
+        "被忽略的推演错误不能使不完整分析成为成功结果",
+        "不是限制用户程序运行时的循环次数",
+        "不是完整的编译器内存、总 CPU 或任意 raw AST 安全证明",
+    ] {
+        assert!(
+            semantics.contains(required),
+            "missing frontend boundary: {required}"
+        );
+    }
+}
+
+#[test]
 fn native_task_docs_limit_source_support_and_separate_error_layers() {
     let readme = include_str!("../README.md");
     let syntax = include_str!("../docs/syntax.md");

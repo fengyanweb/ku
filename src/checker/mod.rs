@@ -8,9 +8,14 @@ use crate::{
 };
 
 mod generic;
+#[cfg(test)]
+mod loop_analysis_tests;
+mod statement_depth;
 pub(crate) use generic::{native_local_generic_span, native_specialization_plan, GenericCallSite};
 
 const MAX_CHECK_DEPTH: usize = 32;
+// Shared by nested speculative loop passes, never replenished per loop.
+const MAX_LOOP_ANALYSIS_WORK: usize = 100_000;
 /// Prefix owned by the compiler's generated C identifiers; see `reject_reserved_name`.
 const RESERVED_NAME_PREFIX: &str = "__ku_";
 /// Sub-namespaces the import expander synthesizes inside the reserved prefix. These
@@ -472,6 +477,9 @@ pub struct Checker {
     /// the parent so nested try/finally chains preserve execution order.
     try_exit_collectors: Vec<TryExitCollector>,
     generic_state: generic::GenericState,
+    loop_analysis_remaining: usize,
+    loop_analysis_depth: usize,
+    loop_analysis_exhausted: Option<Span>,
 }
 
 impl Checker {
@@ -499,6 +507,9 @@ impl Checker {
             closure_capture_boundaries: Vec::new(),
             try_exit_collectors: Vec::new(),
             generic_state: generic::GenericState::default(),
+            loop_analysis_remaining: MAX_LOOP_ANALYSIS_WORK,
+            loop_analysis_depth: 0,
+            loop_analysis_exhausted: None,
         }
     }
 
@@ -549,6 +560,7 @@ impl Checker {
     }
 
     fn check_program(&mut self, program: &Program) -> KuResult<()> {
+        statement_depth::check(program)?;
         let mut top_level_names = HashMap::new();
         for item in &program.items {
             match item {
@@ -728,6 +740,7 @@ impl Checker {
                 );
                 let checked = self.check_function(function);
                 self.generic_state.bindings.clear();
+                self.check_loop_analysis_budget()?;
                 checked?;
             }
         }
@@ -1016,6 +1029,10 @@ impl Checker {
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) -> KuResult<()> {
+        self.check_loop_analysis_budget()?;
+        if self.loop_analysis_depth != 0 {
+            self.charge_loop_analysis(stmt_span(stmt))?;
+        }
         match stmt {
             Stmt::VarDecl {
                 name,
@@ -1230,7 +1247,7 @@ impl Checker {
             } => {
                 self.expect_condition(condition, *span)?;
                 let before = self.scopes.clone();
-                let top = self.compute_loop_top(&before, body, None);
+                let top = self.compute_loop_top(&before, body, None, *span);
                 self.scopes = top;
                 self.loop_depth += 1;
                 self.loop_break_states.push(Vec::new());
@@ -1281,6 +1298,7 @@ impl Checker {
                     &before,
                     body,
                     Some((name, &element, &element_provenance)),
+                    *span,
                 );
                 self.scopes = top;
                 self.push_scope();
@@ -4836,6 +4854,10 @@ impl Checker {
     }
 
     fn check_stmt_and_infer_return(&mut self, stmt: &Stmt) -> KuResult<Option<Type>> {
+        self.check_loop_analysis_budget()?;
+        if self.loop_analysis_depth != 0 {
+            self.charge_loop_analysis(stmt_span(stmt))?;
+        }
         match stmt {
             Stmt::Return { value, span } => {
                 let expected = self.current_return.clone();
@@ -7308,8 +7330,15 @@ impl Checker {
         before: &[HashMap<String, VarType>],
         body: &[Stmt],
         loop_var: Option<(&str, &Type, &ClosureProvenance)>,
+        span: Span,
     ) -> Vec<HashMap<String, VarType>> {
-        if !loop_body_has_backedge(body) {
+        // With no outer bindings there is no loop-carried owner/provenance to
+        // discover. The authoritative pass still checks the entire body. This
+        // avoids doubling the work at every level of a pure nested loop.
+        if self.loop_analysis_exhausted.is_some()
+            || before.iter().all(HashMap::is_empty)
+            || !loop_body_has_backedge(body)
+        {
             return before.to_vec();
         }
         let saved_scopes = self.scopes.clone();
@@ -7327,12 +7356,18 @@ impl Checker {
         let mut top = before.to_vec();
         let mut converged = false;
         for _ in 0..max_iterations {
+            if self.charge_loop_analysis(span).is_err() {
+                break;
+            }
             // Speculative locals and closure bodies must receive the same ids on
             // every pass; otherwise Type/body-id churn would prevent convergence.
             self.next_binding_id = saved_next_binding_id;
             self.next_function_body_id = saved_next_function_body_id;
             self.function_body_outer_bindings = saved_body_bindings.clone();
             let candidate = self.speculative_loop_transfer(before, &top, body, loop_var);
+            if self.loop_analysis_exhausted.is_some() {
+                break;
+            }
             if candidate == top {
                 top = candidate;
                 converged = true;
@@ -7340,7 +7375,7 @@ impl Checker {
             }
             top = candidate;
         }
-        if !converged {
+        if !converged && self.loop_analysis_exhausted.is_none() {
             // Fail closed after the explicit budget: every function-capable loop
             // binding may reach every other one. The authoritative pass then
             // reports E0904 at the first write that could close such a cycle.
@@ -7383,14 +7418,16 @@ impl Checker {
         self.loop_depth += 1;
         self.loop_break_states.push(Vec::new());
         self.loop_continue_states.push(Vec::new());
+        self.loop_analysis_depth += 1;
         for stmt in body {
             // Errors are surfaced by the authoritative pass. Continue scanning so
             // an earlier speculative error cannot hide later graph edges.
             let _ = self.check_stmt(stmt);
-            if stmt_stops_fallthrough(stmt) {
+            if self.loop_analysis_exhausted.is_some() || stmt_stops_fallthrough(stmt) {
                 break;
             }
         }
+        self.loop_analysis_depth -= 1;
         self.loop_break_states.pop();
         let continues = self.loop_continue_states.pop().unwrap_or_default();
         self.loop_depth -= 1;
@@ -7401,6 +7438,29 @@ impl Checker {
             top = merge_moved_scopes(before.to_vec(), top, state);
         }
         top
+    }
+
+    fn check_loop_analysis_budget(&self) -> KuResult<()> {
+        match self.loop_analysis_exhausted {
+            Some(span) => Err(KuError::runtime(
+                "maximum check work exceeded; loop ownership analysis budget exhausted",
+                span,
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn charge_loop_analysis(&mut self, span: Span) -> KuResult<()> {
+        self.check_loop_analysis_budget()?;
+        if let Some(remaining) = self.loop_analysis_remaining.checked_sub(1) {
+            self.loop_analysis_remaining = remaining;
+            Ok(())
+        } else {
+            // Sticky: an ignored speculative diagnostic cannot admit a partial
+            // ownership result, and unwinding nested loops never refills it.
+            self.loop_analysis_exhausted = Some(span);
+            self.check_loop_analysis_budget()
+        }
     }
 
     #[allow(dead_code)]
