@@ -934,7 +934,10 @@ static void fixture_shared_deadline_and_blocked_shutdown(void) {
   for (unsigned index = 0; index < 2; ++index) {
     fixture_wait_disposed(&witnesses[index]);
     CHECK(fixture_count(&witnesses[index].resumes) == 1);
-    CHECK(fixture_count(&witnesses[index].cleanups) == 1);
+    /* The blocked first callback entered with owner_deadline. Shutdown
+     * tightened it while running, so R2 must reconcile once more before its
+     * terminal commit. The second task first runs with the final shared D. */
+    CHECK(fixture_count(&witnesses[index].cleanups) == (index == 0 ? 2u : 1u));
     CHECK(witnesses[index].cleanup_deadline == worker.deadline);
     fixture_witness_finish(&witnesses[index]);
   }

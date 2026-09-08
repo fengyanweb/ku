@@ -410,6 +410,12 @@ static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reaso
     instance->drain_started=1;
   }
   if (instance->drain_started) instance->drain_deadline=ku_task_host_deadline(&host,instance->drain_deadline,0);
+  /* R2 entered cleanup only after the original cancellation was published.
+   * A concurrent tightening may now be PUBLISHING again: the already-stored
+   * old/new budget is still valid and must be consumed before child transfer.
+   * R2 retries reconciliation if its pre-callback snapshot subsequently changes. */
+  if (reason && budget && instance->drain_started)
+    instance->drain_deadline=ku_task_driver_min(instance->drain_deadline,ku_task_control_cleanup_deadline(budget));
 @TRANSFERS@
   /* Every sibling was durably transferred before any Value cleanup/ACK wait. */
   if (!reason && instance->frame.header.status==KU_TASK_FRAME_EXIT_STAGED) {

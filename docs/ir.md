@@ -209,7 +209,7 @@ slot 63 / 逆序参数、Ok/Err payload、取消/超期、未取结果销毁和�
 
 ### R2 内部控制内核（内核不自驱动）
 
-`src/backend/c_task_control.rs` 为上述 frame 提供独立的控制 ABI v1，不改变 frame 的
+`src/backend/c_task_control.rs` 为上述 frame 提供独立的控制 ABI v2，不改变 frame 的
 串行合同。它复用已有 C 原子表示，使用 acquire/release 发布和单次 strong CAS；
 竞争时返回 Pending，不用自旋等待。只有取得 executor 的执行者能调用 frame
 resume/cleanup/drop；取消线程只提交控制状态，不访问正在运行的 frame。
@@ -218,6 +218,13 @@ resume/cleanup/drop；取消线程只提交控制状态，不访问正在运行�
 不是 Task 已完成：若取消先赢，已构造结果被 drop，不能被 await 看到。取消先预约
 原因，发布绝对 deadline 后才能进入清理；原因不变，后续 deadline 只能取更短值。
 清理执行者在 safepoint 读取该原子期限，清理确认且 frame 销毁后才发布取消终态。
+完成先以单次 CAS 预约内部 `COMMITTING`，再销毁 frame、发布可见终态；该预约态对
+status/take/cancel/owner drop 仍是 Pending，不能提前消费结果或 owner。取消预约先赢
+时，丢弃私有 payload，但保留 frame，等真实 deadline 发布后核对全部未 ACK 子任务。
+后续期限收紧也须预约同一 phase，不能独立写 D 穿过终态提交。清理调用前采样 D，
+返回 OK 后冻结 phase 并比较 D；若已变短则保留 frame，通过发布者的真实唤醒在下一
+次执行核对。callback 的 OK 不授权重复用户清理：已完成的 Value drop/finally 不能
+重放，只允许幂等核对剩余 receipt 和期限。没有自旋、续期或新增用户配置。
 这里的 panic 只是内核终态及 owned payload 合同，不代表源码 panic 展开已接入。
 
 owner 和内部 lease 分开；每次并发调用必须持有独立有效 lease，禁止从未保护的裸
@@ -242,7 +249,7 @@ typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 
 R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 等待类型和独立期限
 升为版本 4，R5h 正常作用域登记字段升为版本 5，单向 FINAL 标记升为版本 6；
 内部 C 类型名中的 `V1` 不是旧布局兼容承诺，初始化明确拒绝旧版本（包括5）。
-当前 Frame ABI 3、Control ABI 1、Driver ABI 6。
+当前 Frame ABI 3、Control ABI 2、Driver ABI 6。
 普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
 以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
 有限源码 TaskStart/Await 已复用它，但它不是 M:N、netpoll 或事件驱动 HTTP。
@@ -419,7 +426,7 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 源码与两种 CLI native 构建的定向执行已经通过；本轮表达式/清理定向测试与 Rust
 quality 通过，本轮 native 全集和质量检查通过，workspace 的文档失败与修复证据单列；精确新提交三系统 CI/sanitizer 仍待核实。
 历史失败及修复结果分开记录于工作日志，不从旧 SHA 的通过结果外推。
-Frame ABI 3、Control ABI 1、Driver ABI 6 不等于稳定外部 C FFI。
+Frame ABI 3、Control ABI 2、Driver ABI 6 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
 
 ### R5h 内部正常作用域 session（尚未接入源码）
