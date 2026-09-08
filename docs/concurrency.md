@@ -43,7 +43,7 @@ LLVM、`ku ir` 和 `--emit-ir` 的同步 IR 路径仍拒绝 async。
 
 import 展开后只能有顶层、非泛型 async 函数；入口必须是无参数的
 `async fn main(): null!`。函数参数为 `int/bool/null/str` 或对应单层 Result，
-返回类型必须显式为 primitive `T!`。函数体支持局部绑定、源码 `if` / `else` 及分支词法作用域、直接 async 调用、
+返回类型必须显式为 primitive `T!`。函数体支持局部绑定、源码 `if` / `else` / `while` 及词法作用域、直接 async 调用、
 Task move、Await、`ok`、`?`、primitive print/println、显式 return，以及字符串常量 fail。
 Copy 表达式支持 int 的一元 `-`、`+ - * / %`、`== != < <= > >=`，以及 bool 的
 `!`、`== !=`、`&& ||`；不做 bool/int 隐式转换。整数运算先检查边界，溢出和除/余零
@@ -71,6 +71,14 @@ If 包括嵌套 `else if`，条件必须是 bool，可使用当前子集的 Awai
 Task 时，才能在汇合后 await 它。臂内局部不能在臂外访问。
 ScopeEnter 本身不启动期限；空/inline failed 集合不创建不存在的清理 D。
 
+源码 `while` 每轮从条件表达式入口重新求值，条件必须是 bool；支持当前子集的
+Await、`?` 与短路。循环体正常结束先完成本轮 Task drain 与局部 Owned drop，再
+通过强制 Suspend 回到条件；空循环体也保留这条协作让出边。return/fail/`?` 错误
+退出不进入下一轮，取消走原绝对期限下的清理。循环外 Copy 初值不在回边重新初始化，
+body 内 typed shadow 不替代外层值。Owned/Task 的逐轮重复消费仍受 checker 与
+原始 IR MUST/MAY 双重检查；原生尚不支持它们的重赋值。有限用例的实际运行、内部
+Scope 两轮取消与完整发布门禁分别记录，不推断任意循环终止、公平时限或性能。
+
 ```ku
 async fn Child(value: int): int! { return ok(value) }
 async fn main(): null! {
@@ -85,7 +93,7 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝循环/递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、try/catch/finally、闭包/函数值、
+仍拒绝 for、break/continue、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、try/catch/finally、闭包/函数值、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
 float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及异步标准库 I/O。
 未支持形式在生成 artifact 前明确报错。

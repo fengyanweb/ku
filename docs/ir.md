@@ -172,7 +172,7 @@ cleanup IR。内部图中，每个环必须经过无条件返回本次 poll 的 
 不能单独作为协作进度保证。新增遍历的 Await 边计入既有分析预算，不扩大限额。
 带 Scope 的图使用相同进度规则，原图上的作用域栈与所有权不动点仍须验证；cleanup
 中所有环仍被拒绝。这个结构规则不保证任意用户循环最终结束或得到固定性能。
-它不是完整语言的 finally/异常或任意 Await 组合 verifier，也不开放源码循环。
+它不是完整语言的 finally/异常或任意 Await 组合 verifier；源码 while 接入范围见下文。
 
 内部硬限为 64 函数、每函数 64 槽 / 256 状态、全程序 4096 操作、1,000,000 字面量
 字节（含 UTF-8、Error 三字段和函数名）及 1,000,000 分析工作量；测试只能收紧限制。
@@ -411,10 +411,13 @@ ACK/error 必须在有界 quantum 内处理，不能在耗尽预算后用 Pendin
 `ku build --backend c` / `ku build --native` 对显式 `async fn main(): null!` 选择独立
 AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包含 runner。
 展开后所有顶层 item 必须是非泛型 async 函数；参数和返回限 primitive/单层 Result。
-支持局部绑定、源码 `if` / `else` 及分支词法作用域、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
+支持局部绑定、源码 `if` / `else` / `while` 及词法作用域、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
 以及静态字符串；R5e 追加 Copy 表达式，源码 If 见 R5h.5。已有 int/bool/null 局部的
 普通赋值在 RHS 成功端点 Copy 回原槽；自赋值发 Read，保留 IR 的别名/初始化检查。
-Owned/Task 重赋值、复合赋值与自增/自减、循环/递归、跨词法作用域 Task move、try/catch/finally、闭包、同步调用、
+源码 while 的回边指向条件求值入口，而非 Await.ready 或旧 bool Branch；本轮正常
+ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不能省略让出。
+完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
+Owned/Task 重赋值、复合赋值与自增/自减、for、break/continue、递归、跨词法作用域 Task move、try/catch/finally、闭包、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -514,7 +517,7 @@ staged/私有结果期间胜出，沿原 R2 首赢家裁决，结果只 drop 一
 本片不增加每值分配、线程、重试循环或用户 API；复用原 frame 位图、driver receipt
 与串行 executor。IR 反例、真实 C 退出顺序测试和 ABI 拒绝测试分别记录证据，不从
 artifact 文本存在推断执行通过。内部 normal ScopeEnter/ScopeDrain 与活动 session
-的 final promotion adapter 接入见下节，源码 If 接入见 R5h.5；source loop/finally、
+的 final promotion adapter 接入见下节，源码 If 接入见 R5h.5，while复用其body清理；source finally、
 完整 native async 与高并发发布门禁仍未完成。具体测试结果以工作日志及精确提交 CI 为准。
 
 ### R5h.4 内部 ScopeEnter/ScopeDrain（源码 if 复用）

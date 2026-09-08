@@ -245,12 +245,324 @@ fn native_task_copy_assignment_raw_type_owned_task_and_declaration_gates_remain(
     for body in [
         "value = 1 value += 1",
         "value = 1 value++",
-        "while (false) {}",
+        "for item in 0 {}",
     ] {
         let source = format!("async fn main(): null! {{ {body} return ok(null) }}");
         let error = task_lower::lower_program(&checked(&source)).unwrap_err();
         assert!(error.message.contains("this statement"), "{error}");
     }
+}
+
+#[test]
+fn native_task_while_latch_follows_scope_value_cleanup_and_saves_copy_state() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn main(): null! {
+    index = 0
+    outer = "kept"
+    while (index < 3) {
+        text = "body"
+        unused = ok(index)
+        println(text)
+        index = index + 1
+    }
+    println(outer)
+    println(index)
+    return ok(null)
+}
+"#,
+    ))
+    .expect("a bounded Copy loop reuses its lexical body");
+    let main = &native.tasks.functions[native.entry.0];
+    let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    let frame = &plan.functions[native.entry.0];
+    assert_eq!(frame.scopes.len(), 1);
+    let index = main.states[main.entry.0]
+        .operations
+        .iter()
+        .find_map(|op| match op {
+            TaskOp::Copy { dst, .. } => Some(*dst),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        frame.slots.contains(&index),
+        "loop-carried Copy must survive Suspend"
+    );
+    let body = main
+        .states
+        .iter()
+        .find(|state| {
+            state
+                .operations
+                .iter()
+                .any(|op| matches!(op, TaskOp::ScopeEnter { .. }))
+        })
+        .unwrap();
+    let body_owned: Vec<_> = body
+        .operations
+        .iter()
+        .filter_map(|op| {
+            let dst = match op {
+                TaskOp::Init { dst, .. }
+                | TaskOp::Move { dst, .. }
+                | TaskOp::WrapOk { dst, .. } => *dst,
+                _ => return None,
+            };
+            matches!(
+                &main.slots[dst.0].ty,
+                TaskSlotType::Value {
+                    ty: IrType::Str | IrType::Result(_),
+                    ..
+                }
+            )
+            .then_some(dst)
+        })
+        .collect();
+    assert_eq!(
+        body_owned.len(),
+        4,
+        "literal/Result temporaries and both bindings"
+    );
+    let (ready, scope_cleanup) = match body.terminator {
+        TaskTerminator::ScopeDrain { ready, cleanup, .. } => (ready, cleanup),
+        ref other => panic!("body must request scope drain, got {other:?}"),
+    };
+    let (header, latch_cleanup) = match main.states[ready.0].terminator {
+        TaskTerminator::Suspend { resume, cleanup } => (resume, cleanup),
+        ref other => panic!("post-drain endpoint must force Suspend, got {other:?}"),
+    };
+    assert_ne!(header, main.entry, "preheader must not repeat");
+    assert_ne!(scope_cleanup, latch_cleanup);
+    let expected_drops: Vec<_> = body_owned
+        .iter()
+        .rev()
+        .map(|slot| TaskOp::DropIfInit { slot: *slot })
+        .collect();
+    assert_eq!(main.states[ready.0].operations, expected_drops);
+    assert!(
+        matches!(main.states[main.entry.0].terminator, TaskTerminator::Jump { target } if target == header)
+    );
+    assert!(main.states[header.0].operations.iter().any(|op| matches!(
+        op,
+        TaskOp::Binary {
+            op: task::TaskBinaryOp::Less,
+            ..
+        }
+    )));
+    assert!(
+        main.states[header.0].operations.iter().all(|op| !matches!(
+            op, TaskOp::Init { dst, .. } | TaskOp::Copy { dst, .. } if *dst == index
+        )),
+        "header reads the updated binding rather than resetting it"
+    );
+    let all_owned: Vec<_> = main
+        .slots
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(index, slot)| {
+            matches!(
+                &slot.ty,
+                TaskSlotType::Value {
+                    ty: IrType::Str | IrType::Result(_),
+                    ..
+                }
+            )
+            .then_some(TaskOp::DropIfInit {
+                slot: SlotId(index),
+            })
+        })
+        .collect();
+    for cleanup in [scope_cleanup, latch_cleanup] {
+        assert_eq!(main.states[cleanup.0].operations, all_owned);
+        assert_eq!(main.states[cleanup.0].terminator, TaskTerminator::Terminate);
+    }
+    let mut no_yield = native.tasks.clone();
+    no_yield.functions[native.entry.0].states[ready.0].terminator =
+        TaskTerminator::Jump { target: header };
+    let error = task::verify_and_plan(&no_yield, TaskLimits::default()).unwrap_err();
+    assert!(error.message.contains("cycle"), "{error}");
+}
+
+#[test]
+fn native_task_while_condition_reenters_before_short_circuit_await_and_try() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn Text(): str! { return ok("probe") }
+async fn Flag(index: int, text: str): bool! { println(text) return ok(index < 2) }
+async fn main(): null! {
+    index = 0
+    while ((index < 2) && (await Flag(index, (await Text())?))?) {
+        index = index + 1
+    }
+    return ok(null)
+}
+"#,
+    ))
+    .expect("condition temporaries are consumed before the next evaluation");
+    let main = &native.tasks.functions[native.entry.0];
+    let headers: Vec<_> = main
+        .states
+        .iter()
+        .filter_map(|state| match state.terminator {
+            TaskTerminator::Suspend { resume, .. } => Some(resume),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(headers.len(), 1);
+    let header = headers[0];
+    assert_ne!(header, main.entry);
+    assert!(main.states[header.0].operations.iter().any(|op| matches!(
+        op,
+        TaskOp::Binary {
+            op: task::TaskBinaryOp::Less,
+            ..
+        }
+    )));
+    let awaits: Vec<_> = main
+        .states
+        .iter()
+        .filter_map(|state| match state.terminator {
+            TaskTerminator::Await { dst, ready, .. } => {
+                assert!(
+                    state.operations.is_empty(),
+                    "Pending must not replay Start/operands"
+                );
+                Some((dst, ready))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(awaits.len(), 2);
+    for (dst, ready) in awaits {
+        assert_ne!(header, ready, "backedge cannot skip a condition Await");
+        assert!(
+            main.states.iter().any(|state| matches!(state.terminator,
+                TaskTerminator::TryResult { src, .. } if src == dst
+            )),
+            "each successful condition Result is consumed"
+        );
+    }
+    assert_eq!(
+        main.states
+            .iter()
+            .filter(|state| matches!(state.terminator, TaskTerminator::Branch { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        main.states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .filter(|op| matches!(op, TaskOp::Start { .. }))
+            .count(),
+        2
+    );
+    task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+}
+
+#[test]
+fn native_task_while_empty_false_and_no_backedge_owned_consumption_lower() {
+    let empty = task_lower::lower_program(&checked(
+        "async fn main(): null! { while (false) {} return ok(null) }",
+    ))
+    .unwrap();
+    let function = &empty.tasks.functions[empty.entry.0];
+    assert!(function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .all(|op| !matches!(op, TaskOp::ScopeEnter { .. })));
+    assert_eq!(
+        function
+            .states
+            .iter()
+            .filter(|state| matches!(state.terminator, TaskTerminator::Suspend { .. }))
+            .count(),
+        1,
+        "even the statically empty true edge must force yield"
+    );
+    for source in [
+        "async fn main(): null! { result = ok(true) while (result?) { return ok(null) } return ok(null) }",
+        "async fn Flag(): bool! { return ok(true) } async fn main(): null! { pending = Flag() while ((await pending)?) { return ok(null) } return ok(null) }",
+    ] {
+        let native = task_lower::lower_program(&checked(source)).expect("no backedge means one legal consume");
+        let main = &native.tasks.functions[native.entry.0];
+        assert!(main.states.iter().all(|state| !matches!(state.terminator, TaskTerminator::Suspend { .. })),
+            "an exiting body must not acquire a synthetic backedge");
+        task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    }
+}
+
+#[test]
+fn native_task_while_raw_loop_carried_consumes_and_bad_condition_reject() {
+    // Bypass the ordinary checker deliberately: lowering/IR must independently
+    // reject second-iteration consumption, even if frontend checks regress.
+    for source in [
+        "async fn main(): null! { result = ok(true) while (result?) {} return ok(null) }",
+        "async fn Flag(): bool! { return ok(true) } async fn main(): null! { pending = Flag() while ((await pending)?) {} return ok(null) }",
+    ] {
+        let error = task_lower::lower_program(&parsed(source)).unwrap_err();
+        assert!(error.message.contains("not definitely initialized"), "{error}");
+    }
+    let error = task_lower::lower_program(&parsed(
+        "async fn main(): null! { while (1) {} return ok(null) }",
+    ))
+    .unwrap_err();
+    assert!(
+        error.message.contains("non-bool while conditions"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_task_while_raw_depth_and_flat_state_limits_are_unchanged() {
+    let nested = |depth| {
+        let mut ast = raw_nested(0);
+        let Item::Function(function) = &mut ast.items[0] else {
+            unreachable!()
+        };
+        let mut body = Vec::new();
+        for _ in 0..depth {
+            body = vec![Stmt::While {
+                condition: Expr::new(ExprKind::Literal(Literal::Bool(false)), Span::default()),
+                body,
+                span: Span::default(),
+            }];
+        }
+        body.append(&mut function.body);
+        function.body = body;
+        ast
+    };
+    task_lower::lower_program(&nested(32)).expect("root does not consume a statement level");
+    let error = task_lower::lower_program(&nested(33)).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("statement nesting beyond 32 Task levels"),
+        "{error}"
+    );
+    let mut ast = checked("async fn Probe(gate: bool): null! { return ok(null) } async fn main(): null! { return ok(null) }");
+    let Item::Function(function) = &mut ast.items[0] else {
+        unreachable!()
+    };
+    let last = function.body.pop().unwrap();
+    for _ in 0..64 {
+        function.body.push(Stmt::While {
+            condition: Expr::new(ExprKind::Variable("gate".into()), Span::default()),
+            body: Vec::new(),
+            span: Span::default(),
+        });
+    }
+    function.body.push(last);
+    let error = task_lower::lower_program(&ast).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("more than 256 generated Task states"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -627,11 +939,11 @@ async fn main(): null! { return ok(null) }
 }
 
 #[test]
-fn native_task_if_owned_reassignment_cross_scope_task_moves_and_loops_stay_gated() {
+fn native_task_if_owned_reassignment_cross_scope_task_moves_and_for_stay_gated() {
     for source in [
         "async fn main(): null! { value = \"first\" if (true) { value = \"second\" } return ok(null) }",
         "async fn Child(): int! { return ok(1) } async fn main(): null! { outer = Child() if (true) { inner = outer } return ok(null) }",
-        "async fn main(): null! { while (false) { println(1) } return ok(null) }",
+        "async fn main(): null! { for item in 1 { println(item) } return ok(null) }",
     ] {
         let error = task_lower::lower_program(&checked(source)).expect_err("outside the admitted slice");
         assert!(error.to_string().contains("native async subset"), "{error}");

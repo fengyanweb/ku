@@ -446,7 +446,7 @@ async fn main(): null! { return ok(null) }
 #[test]
 fn native_task_source_subset_rejects_unimplemented_constructs() {
     let sources = [
-        "async fn main(): null! { while (false) {} return ok(null) }",
+        "async fn main(): null! { for item in 0 {} return ok(null) }",
         "async fn main(): null! { try { println(1) } finally { println(2) } return ok(null) }",
         "fn Sync(): int { return 1 } async fn main(): null! { return ok(null) }",
         "async fn main(): null! { value = \"first\" value = \"second\" return ok(null) }",
@@ -585,7 +585,7 @@ fn native_task_source_cli_imports_build_and_run_after_source_graph_moves() {
 #[test]
 fn native_task_source_cli_rejects_unsupported_and_moved_values_before_artifacts() {
     let sources = [
-        "async fn main(): null! { while (false) {} return ok(null) }",
+        "async fn main(): null! { while (false) { break } return ok(null) }",
         "async fn Child(): str! { return ok(\"child\") } async fn main(): null! { child = Child() moved = child value = await child return ok(null) }",
         "async fn Child(value: str): str! { return ok(value) } async fn main(): null! { value = \"owned\" child = Child(value) println(value) return ok(null) }",
     ];

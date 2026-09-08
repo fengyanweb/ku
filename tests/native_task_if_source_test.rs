@@ -230,6 +230,173 @@ async fn main(): null! {
 }
 
 #[test]
+fn native_task_while_finite_source_cases_match_interpreter_and_close_allocations() {
+    let cases = [
+        (
+            r#"
+async fn main(): null! {
+    index = 0
+    while (false) {}
+    while (index < 3) { println(index) index = index + 1 }
+    println(index)
+    return ok(null)
+}
+"#,
+            "0\n1\n2\n3\n",
+            None,
+        ),
+        (
+            r#"
+async fn main(): null! {
+    outer = 0
+    while (outer < 2) {
+        inner = 0
+        while (inner < 2) {
+            if (inner == 0) { inner = inner + 1 } else { inner = 2 }
+        }
+        if (true) { outer: int = outer + 10 println(outer) }
+        outer = outer + 1
+    }
+    println(outer)
+    return ok(null)
+}
+"#,
+            "10\n11\n2\n",
+            None,
+        ),
+        (
+            r#"
+async fn Text(): str! { return ok("probe") }
+async fn Flag(index: int, text: str): bool! { println(text) return ok(index < 2) }
+async fn main(): null! {
+    index = 0
+    while ((await Flag(index, (await Text())?))?) {
+        text = "body"
+        unused = ok(index)
+        println(text)
+        index = index + 1
+    }
+    return ok(null)
+}
+"#,
+            "probe\nbody\nprobe\nbody\nprobe\n",
+            None,
+        ),
+        (
+            r#"
+async fn Flag(index: int): bool! { println(index) return ok(true) }
+async fn main(): null! {
+    index = 0
+    while ((index < 2) && (await Flag(index))?) { index = index + 1 }
+    println(index)
+    return ok(null)
+}
+"#,
+            "0\n1\n2\n",
+            None,
+        ),
+        (
+            r#"
+async fn Child(): int! { return ok(7) }
+async fn main(): null! {
+    while (true) { child = Child() return ok(null) }
+    println("unreachable")
+    return ok(null)
+}
+"#,
+            "",
+            None,
+        ),
+        (
+            r#"
+async fn Child(): int! { return ok(7) }
+async fn main(): null! {
+    while (true) { child = Child() println("before fail") fail "while body failed" }
+    println("unreachable")
+    return ok(null)
+}
+"#,
+            "before fail\n",
+            Some("while body failed"),
+        ),
+        (
+            r#"
+async fn Flag(index: int): bool! {
+    println(index)
+    if (index == 1) { fail "while condition failed" }
+    return ok(true)
+}
+async fn main(): null! {
+    index = 0
+    while ((await Flag(index))?) { println("body") index = index + 1 }
+    println("unreachable")
+    return ok(null)
+}
+"#,
+            "0\nbody\n1\n",
+            Some("while condition failed"),
+        ),
+        (
+            r#"
+async fn main(): null! {
+    index = 3
+    while (index > 0) { println(index) index = index / 0 }
+    println("unreachable")
+    return ok(null)
+}
+"#,
+            "3\n",
+            Some("division by zero"),
+        ),
+        (
+            r#"
+async fn main(): null! {
+    result = ok(true)
+    while (result?) { println("once") return ok(null) }
+    return ok(null)
+}
+"#,
+            "once\n",
+            None,
+        ),
+        (
+            r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    pending = Flag()
+    while ((await pending)?) { println("once") return ok(null) }
+    return ok(null)
+}
+"#,
+            "once\n",
+            None,
+        ),
+        (
+            r#"
+async fn Probe(index: int, marker: null): bool! { return ok(index < 2) }
+async fn Parent(held: str): str! {
+    index = 0
+    while ((await Probe(index, println(held)))?) { index = index + 1 }
+    return ok(held)
+}
+async fn main(): null! {
+    value = (await Parent("held"))?
+    println(value)
+    return ok(null)
+}
+"#,
+            "held\nheld\nheld\nheld\n",
+            None,
+        ),
+    ];
+    // All programs terminate or fail after a finite number of iterations.
+    // Infinite-loop cancellation belongs to the separate real host fixture.
+    for (index, (source, stdout, failure)) in cases.into_iter().enumerate() {
+        run_case(200 + index, source, stdout, failure);
+    }
+}
+
+#[test]
 fn native_task_if_real_source_branches_match_interpreter_and_close_runtime_allocations() {
     let cases = [
         (
@@ -537,7 +704,15 @@ fn native_task_if_cli_rejects_unsupported_and_ownership_before_either_artifact_p
             "task 'grand' has already been awaited",
         ),
         (
-            "async fn main(): null! { if (false) { while (false) {} } return ok(null) }",
+            "async fn main(): null! { if (false) { for item in 0 {} } return ok(null) }",
+            "native async subset does not support this statement",
+        ),
+        (
+            "async fn main(): null! { while (false) { break } return ok(null) }",
+            "native async subset does not support this statement",
+        ),
+        (
+            "async fn main(): null! { while (false) { continue } return ok(null) }",
             "native async subset does not support this statement",
         ),
         (

@@ -70,7 +70,7 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
             "单 worker",
             "async fn main(): null!",
             "单层 Result",
-            "源码 `if` / `else` 及分支词法作用域",
+            "源码 `if` / `else` / `while` 及词法作用域",
             "try/catch/finally",
             "M:N",
             "netpoll",
@@ -136,6 +136,8 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         "两臂都必须通过静态类型、所有权和资源预算检查",
         "已有 int/bool/null 局部支持普通赋值",
         "Owned/Task 重赋值、复合赋值与自增/自减仍不支持",
+        "源码 `while` 每轮从条件表达式入口重新求值",
+        "通过强制 Suspend 回到条件",
         "不能将 Task move 到另一个词法作用域",
         "只有每条仍会到达汇合点的路径都保有同一",
     ] {
