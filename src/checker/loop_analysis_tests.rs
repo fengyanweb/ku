@@ -45,8 +45,10 @@ fn loop_analysis_empty_outer_bindings_skip_only_speculation() {
 #[test]
 fn loop_analysis_nested_passes_share_budget_and_restore_speculation_depth() {
     let source = format!(
-        "fn main() {{ value = 1 {} print(value) {} }}",
-        "while (true) {".repeat(6),
+        // Each inner loop can fall through to its enclosing header; a nested
+        // nonreturning while(true) must not manufacture speculative backedges.
+        "fn main() {{ gate = true value = 1 {} print(value) gate = false {} }}",
+        "while (gate) {".repeat(6),
         "}".repeat(6)
     );
     let mut checker = Checker::new();

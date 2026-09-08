@@ -220,6 +220,20 @@ fn statement_depth_parser_32_controls_match_existing_stage3_positive_inputs() {
 }
 
 #[test]
+fn statement_depth_nested_nonreturning_loops_keep_the_32_level_positive() {
+    // Check only: this intentionally nonreturning source must never be run.
+    // Keep the former budget input as a legality control with its outer binding;
+    // each literal-true inner loop prevents its enclosing loop from repeating.
+    let source = in_main(&format!(
+        "value = 1 {} print(value) {}",
+        "while (true) {".repeat(32),
+        "}".repeat(32)
+    ));
+    let program = parse(&source).unwrap();
+    Checker::new().check(&program).unwrap();
+}
+
+#[test]
 fn statement_depth_nested_loop_analysis_cli_is_bounded() {
     use native_harness::{run_bounded, TempDir, RUN_LIMITS, RUN_TIMEOUT};
     use std::{fs, process::Command};
@@ -227,8 +241,11 @@ fn statement_depth_nested_loop_analysis_cli_is_bounded() {
     let directory = TempDir::new("statement-depth-loop-budget");
     let path = directory.path().join("program.ku");
     let source = in_main(&format!(
-        "value = 1 {} print(value) {}",
-        "while (true) {".repeat(32),
+        // The deepest body sets gate=false, then falls through every enclosing
+        // body to re-evaluate each header. These are actual backedges, not a
+        // fictitious return from while(true){}. Keep the same shared work limit.
+        "gate = true value = 1 {} print(value) gate = false {}",
+        "while (gate) {".repeat(32),
         "}".repeat(32)
     ));
     fs::write(&path, source).unwrap();

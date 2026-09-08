@@ -3069,6 +3069,93 @@ fn ordinary_names_are_unaffected_by_the_reserved_prefix() {
     );
 }
 
+#[test]
+fn while_condition_nested_nonreturning_body_consumes_owned_condition_once() {
+    checks(
+        "while-result-before-nonreturning-inner.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) { while (true) {} }
+    return ok(null)
+}
+"#,
+    );
+    checks(
+        "while-task-before-nonreturning-inner.ku",
+        r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    pending = Flag()
+    while ((await pending)?) { while (true) {} }
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
+fn while_condition_inner_own_break_still_returns_to_the_outer_condition() {
+    rejects(
+        "while-result-inner-break-is-a-real-backedge.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) { while (true) { break } }
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+    rejects(
+        "while-task-inner-break-is-a-real-backedge.ku",
+        r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    pending = Flag()
+    while ((await pending)?) { while (true) { break } }
+    return ok(null)
+}
+"#,
+        "error[E0804]: error: task 'pending' has already been awaited",
+    );
+}
+
+#[test]
+fn while_condition_prior_outer_continue_survives_a_nonreturning_sibling_path() {
+    rejects(
+        "while-result-continue-before-nonreturning-inner.ku",
+        r#"
+fn main(): null! {
+    flag = true
+    result = ok(true)
+    while (result?) {
+        if (flag) { continue }
+        while (true) {}
+    }
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+    rejects(
+        "while-task-continue-before-nonreturning-inner.ku",
+        r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    flag = true
+    pending = Flag()
+    while ((await pending)?) {
+        if (flag) { continue }
+        while (true) {}
+    }
+    return ok(null)
+}
+"#,
+        "error[E0804]: error: task 'pending' has already been awaited",
+    );
+}
+
 // ---- runtime parity: a partial move actually runs -----------------------------
 
 #[test]
@@ -3084,4 +3171,224 @@ fn main() {
 "#;
     checks("partial-run.ku", source);
     run_source("partial-run.ku", source).expect("partial move should run");
+}
+
+#[test]
+fn while_condition_owned_consumption_reaches_the_next_condition() {
+    rejects(
+        "while-condition-result-repeat.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) {}
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+    rejects(
+        "while-condition-task-repeat.ku",
+        r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    pending = Flag()
+    while ((await pending)?) {}
+    return ok(null)
+}
+"#,
+        "error[E0804]: error: task 'pending' has already been awaited",
+    );
+}
+
+#[test]
+fn while_condition_one_consumption_without_a_backedge_is_allowed() {
+    for body in ["break", "return ok(null)"] {
+        checks(
+            "while-condition-result-once.ku",
+            &format!(
+                "fn main(): null! {{ result = ok(true)\n\
+                 while (result?) {{ {body} }}\n\
+                 return ok(null) }}"
+            ),
+        );
+        checks(
+            "while-condition-task-once.ku",
+            &format!(
+                "async fn Flag(): bool! {{ return ok(true) }}\n\
+                 async fn main(): null! {{ pending = Flag()\n\
+                 while ((await pending)?) {{ {body} }}\n\
+                 return ok(null) }}"
+            ),
+        );
+    }
+}
+
+#[test]
+fn while_condition_reinitialization_must_update_the_original_binding() {
+    checks(
+        "while-condition-result-reinit.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) { result = ok(false) }
+    return ok(null)
+}
+"#,
+    );
+    checks(
+        "while-condition-task-reinit.ku",
+        r#"
+async fn Flag(): bool! { return ok(true) }
+async fn main(): null! {
+    pending = Flag()
+    while ((await pending)?) { pending = Flag() }
+    return ok(null)
+}
+"#,
+    );
+    rejects(
+        "while-condition-result-shadow-not-reinit.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) { result: bool! = ok(false) }
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+}
+
+#[test]
+fn while_condition_continue_join_excludes_non_backedge_body_states() {
+    for terminal in ["break", "return ok(null)"] {
+        checks(
+            "while-condition-restored-continue-or-terminal.ku",
+            &format!(
+                "fn Test(flag: bool): null! {{ result = ok(true)\n\
+                 while (result?) {{\n\
+                   if (flag) {{ result = ok(false)\ncontinue }}\n\
+                   else {{ {terminal} }}\n\
+                 }}\nreturn ok(null) }}\n\
+                 fn main(): null! {{ return Test(true) }}"
+            ),
+        );
+    }
+    rejects(
+        "while-condition-continue-before-reinit.ku",
+        r#"
+fn Test(flag: bool): null! {
+    result = ok(true)
+    while (result?) {
+        if (flag) { continue }
+        result = ok(false)
+    }
+    return ok(null)
+}
+fn main(): null! { return Test(true) }
+"#,
+        "moved",
+    );
+}
+
+#[test]
+fn while_condition_false_exit_does_not_inherit_the_body_reinitialization() {
+    rejects(
+        "while-condition-false-edge-consumed.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    while (result?) { result = ok(false) }
+    again = result?
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+}
+
+#[test]
+fn while_condition_short_circuit_keeps_conservative_consumption_contract() {
+    for operator in ["&&", "||"] {
+        rejects(
+            "while-short-circuit-condition-repeat.ku",
+            &format!(
+                "fn Test(flag: bool): null! {{ result = ok(true)\n\
+                 while (flag {operator} result?) {{ continue }}\n\
+                 return ok(null) }}\n\
+                 fn main(): null! {{ return Test(true) }}"
+            ),
+            "moved",
+        );
+        for body in ["break", "result = ok(false)\ncontinue"] {
+            checks(
+                "while-short-circuit-condition-once-or-restored.ku",
+                &format!(
+                    "fn Test(flag: bool): null! {{ result = ok(true)\n\
+                     while (flag {operator} result?) {{ {body} }}\n\
+                     return ok(null) }}\n\
+                     fn main(): null! {{ return Test(true) }}"
+                ),
+            );
+        }
+    }
+}
+
+#[test]
+fn while_condition_closure_effects_participate_in_the_loop_fixedpoint() {
+    rejects(
+        "while-condition-closure-provenance-chain.ku",
+        r#"
+fn Noop(): null { return null }
+fn main() {
+    a: fn(): null = Noop
+    b: fn(): null = Noop
+    c: fn(): null = Noop
+    d: fn(): null = Noop
+    fn Shift(): bool {
+        a = b.clone()
+        b = c.clone()
+        c = d.clone()
+        return true
+    }
+    while (Shift()) {
+        d = () => { a()  return null }
+    }
+}
+"#,
+        "E0904 cannot create closure reference cycle",
+    );
+}
+
+#[test]
+fn while_condition_throw_is_captured_before_body_reinitialization() {
+    rejects(
+        "while-condition-throw-consumed-before-body.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    try {
+        while (result?) { result = ok(false) }
+    } catch (error) {
+        again = result?
+    }
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+    checks(
+        "while-condition-catch-reinit.ku",
+        r#"
+fn main(): null! {
+    result = ok(true)
+    try {
+        while (result?) { result = ok(false) }
+    } catch (error) {
+        result = ok(false)
+    }
+    return ok(null)
+}
+"#,
+    );
 }
