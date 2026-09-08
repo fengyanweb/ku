@@ -13,8 +13,8 @@ use ku::{
     backend::c,
     checker::Checker,
     ir::{
-        task::{self, SlotId, TaskLimits, TaskOp, TaskSlotType, TaskTerminator},
-        task_lower, IrType,
+        task::{self, TaskLimits},
+        task_lower,
     },
     lexer::Lexer,
     parser::Parser,
@@ -32,16 +32,7 @@ fn replace_once(source: String, anchor: &str, replacement: &str) -> String {
 }
 
 #[test]
-fn native_task_runtime_failure_keeps_original_deadline_through_successful_inner_drains() {
-    run_runtime_deadline_fixture(false);
-}
-
-#[test]
-fn native_task_typed_exit_ir_boundary_inherits_runtime_deadline_and_rejects_raw_metadata() {
-    run_runtime_deadline_fixture(true);
-}
-
-fn run_runtime_deadline_fixture(exit_bridge: bool) {
+fn native_task_source_runtime_failure_keeps_deadline_and_rejects_raw_staged_metadata() {
     let source = r#"
 async fn Grand(value: str): int! {
     held = Held(3)
@@ -66,52 +57,14 @@ async fn main(): null! { return ok(null) }
         .parse_program()
         .unwrap();
     Checker::new().check(&ast).unwrap();
-    let mut native = task_lower::lower_program(&ast).unwrap();
-    if exit_bridge {
-        // Test-only IR boundary: keep the admitted source lowering unchanged.
-        // Match its exact synthetic cleanup suffix before removing anything;
-        // no body Drop or cancellation-region operation is filtered out.
-        for function in &mut native.tasks.functions {
-            let mut exits = 0;
-            for state in &mut function.states {
-                let TaskTerminator::Complete { value } = state.terminator else {
-                    continue;
-                };
-                let cleanup: Vec<_> = function
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .filter(|(index, slot)| {
-                        SlotId(*index) != value
-                            && matches!(&slot.ty, TaskSlotType::Value { ty, borrowed: false }
-                                if matches!(ty, IrType::Str | IrType::Result(_)))
-                    })
-                    .map(|(index, _)| TaskOp::DropIfInit {
-                        slot: SlotId(index),
-                    })
-                    .collect();
-                let prefix = state
-                    .operations
-                    .len()
-                    .checked_sub(cleanup.len())
-                    .expect("compiler exit cleanup suffix is present");
-                assert_eq!(&state.operations[prefix..], cleanup.as_slice());
-                state.operations.truncate(prefix);
-                state.terminator = TaskTerminator::Exit { value };
-                exits += 1;
-            }
-            assert!(
-                exits > 0,
-                "fixture function must contain an actual Complete"
-            );
-        }
-        let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
-        assert!(plan
-            .functions
-            .iter()
-            .all(|frame| frame.exit_bridge && frame.hosted));
-    }
+    // Use source lowering unchanged: staging, owner handoff and inherited D
+    // must come from the admitted source pipeline, not a test-only IR rewrite.
+    let native = task_lower::lower_program(&ast).unwrap();
+    let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    assert!(plan
+        .functions
+        .iter()
+        .all(|frame| frame.exit_bridge && frame.hosted));
     for (id, name) in ["Grand", "Parent", "Leaf", "Held", "main"]
         .iter()
         .enumerate()
@@ -122,20 +75,13 @@ async fn main(): null! { return ok(null) }
     for forbidden in ["run_source", "const SOURCE", "Task.new", "task.spawn"] {
         assert!(!generated.contains(forbidden));
     }
-    let ledger = if exit_bridge {
-        replace_once(
-            LOCKED_ALLOCATIONS.to_owned(),
-            "ku_perf_free(p);",
-            "fixture_exit_record_free(p); ku_perf_free(p);",
-        )
-    } else {
-        LOCKED_ALLOCATIONS.to_owned()
-    };
-    let declarations = if exit_bridge {
-        "static void fixture_exit_record_free(void*);\nstatic void fixture_exit_stage(unsigned,void*,uint32_t,const void*);\n"
-    } else {
-        ""
-    };
+    let ledger = replace_once(
+        LOCKED_ALLOCATIONS.to_owned(),
+        "ku_perf_free(p);",
+        "fixture_exit_record_free(p); ku_perf_free(p);",
+    );
+    let declarations =
+        "static void fixture_exit_record_free(void*);\nstatic void fixture_exit_stage(unsigned,void*,uint32_t,const void*);\n";
     let instrumentation = format!(
         "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{declarations}{ledger}\n{IO_HOOK}\nstatic uint32_t fixture_hold(void*,int);\nstatic void fixture_worker_exited(void);\n"
     );
@@ -165,50 +111,30 @@ async fn main(): null! { return ok(null) }
         "  /* No further driver or task storage access after this point. */\n  fixture_worker_exited();",
     );
     let mut generated = generated;
-    if exit_bridge {
-        assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 3u"));
-        for id in 0..3 {
-            let call = format!(
-                "status = ku_task_frame_{id}_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);"
-            );
-            generated = replace_once(
-                generated,
-                &call,
-                &format!("{call}\n    fixture_exit_stage({id}u,instance,status,&clock);"),
-            );
-        }
+    assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 3u"));
+    for id in 0..3 {
+        let call = format!(
+            "status = ku_task_frame_{id}_resume(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &clock);"
+        );
         generated = replace_once(
             generated,
-            "static uint32_t ku_task_driver_owner_drop_receipt(\n",
-            "static uint32_t ku_task_driver_owner_drop_receipt(const KuTaskDriverTicketV1*,KuTaskControlOwnerV1*,uint64_t,KuTaskDriverCleanupReceiptV1*);\nstatic uint32_t fixture_exit_real_owner_drop_receipt(\n",
+            &call,
+            &format!("{call}\n    fixture_exit_stage({id}u,instance,status,&clock);"),
         );
     }
+    generated = replace_once(
+        generated,
+        "static uint32_t ku_task_driver_owner_drop_receipt(\n",
+        "static uint32_t ku_task_driver_owner_drop_receipt(const KuTaskDriverTicketV1*,KuTaskControlOwnerV1*,uint64_t,KuTaskDriverCleanupReceiptV1*);\nstatic uint32_t fixture_exit_real_owner_drop_receipt(\n",
+    );
     let mut generated = replace_once(
         generated,
         "int main(void) {",
         "static int fixture_unmodified_source_main(void) {",
     );
-    if exit_bridge {
-        generated.push_str(EXIT_PROBES);
-        let body = replace_once(
-            C_MAIN.to_owned(),
-            "  KuString input={buffer,7u,31u,KU_STRING_OWNED};",
-            "  fixture_exit_input=(uintptr_t)buffer;\n  KuString input={buffer,7u,31u,KU_STRING_OWNED};",
-        );
-        let body = replace_once(
-            body,
-            "  puts(\"task-runtime-deadline-ok\"); return 0;",
-            "  CHECK(fixture_exit_input_frees==1u && fixture_exit_invalid_metadata==1u && fixture_exit_original==original);\n  for (size_t i=0;i<3u;i++) CHECK(fixture_exit_stages[i]==1u && fixture_exit_transfers[i]==1u);\n  puts(\"task-runtime-deadline-ok\"); return 0;",
-        );
-        generated.push_str(&body);
-    } else {
-        generated.push_str(C_MAIN);
-    }
-    let directory = TempDir::new(if exit_bridge {
-        "native-task-exit-runtime-deadline"
-    } else {
-        "native-task-runtime-deadline"
-    });
+    generated.push_str(EXIT_PROBES);
+    generated.push_str(C_MAIN);
+    let directory = TempDir::new("native-task-source-runtime-deadline");
     let path = directory.path().join("program.c");
     fs::write(&path, generated).unwrap();
     let Some(executable) = compile_harness(directory.path(), &path, "program") else {
@@ -238,8 +164,8 @@ async fn main(): null! { return ok(null) }
 }
 
 const EXIT_PROBES: &str = r#"
-// Only the Exit IR-boundary variant emits these observers. They do not supply
-// an error, receipt, control phase, deadline choice or cleanup implementation.
+// Observe the actual source-generated staged exits. These observers do not
+// supply an error, receipt, phase, deadline choice or cleanup implementation.
 static uintptr_t fixture_exit_input;
 static unsigned fixture_exit_input_frees,fixture_exit_stages[3],fixture_exit_transfers[3];
 static unsigned fixture_exit_invalid_metadata;
@@ -407,6 +333,7 @@ int main(void) {
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,
       slots,6,ring,6,fixed+instances+31u)==KU_TASK_DRIVER_OK);
   uint8_t* buffer=(uint8_t*)malloc(31u); CHECK(buffer); memcpy(buffer,"payload",7u);
+  fixture_exit_input=(uintptr_t)buffer;
   KuString input={buffer,7u,31u,KU_STRING_OWNED};
   KuTaskValueV1 root={0};
   CHECK(ku_task_0_start_value(driver,&input,&root)==KU_TASK_DRIVER_OK && !input.ptr);
@@ -523,6 +450,8 @@ int main(void) {
   CHECK(ku_test_event_destroy(&fixture_exit_event));
   free(ring); free(slots); free(driver);
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
+  CHECK(fixture_exit_input_frees==1u && fixture_exit_invalid_metadata==1u && fixture_exit_original==original);
+  for (size_t i=0;i<3u;i++) CHECK(fixture_exit_stages[i]==1u && fixture_exit_transfers[i]==1u);
   puts("task-runtime-deadline-ok"); return 0;
 }
 "#;

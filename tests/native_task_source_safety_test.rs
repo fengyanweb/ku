@@ -148,6 +148,12 @@ static uint64_t ku_task_driver_now_ms(void) {
 "#;
 
 const C_MAIN: &str = r#"
+static int fixture_empty_result(KuResult_str value) {
+  return !value.ok && ku_task_outcome_empty_string(value.value)
+      && ku_task_outcome_empty_string(value.error.domain)
+      && ku_task_outcome_empty_string(value.error.code)
+      && ku_task_outcome_empty_string(value.error.message);
+}
 static KuAtomicRefcount fixture_hold;
 static KuAtomicRefcount fixture_cleanup_calls;
 static KuAtomicRefcount fixture_observe_take;
@@ -297,7 +303,12 @@ static void fixture_scope(int mode) {
     fixture_idle(&runtime);
     fixture_check_children(&runtime,children,tickets,deadline);
     CHECK(instance->drain_deadline==deadline && instance->drain_published_deadline==deadline);
-    CHECK(!instance->payload_initialized && !instance->frame_initialized && instance->values_cleaned);
+    /* Exit already finished Values after handoff. Cancellation discards the
+     * private payload now; R2 destroys the empty READY frame only after ACK. */
+    CHECK(!instance->payload_initialized && instance->frame_initialized && instance->values_cleaned);
+    CHECK(!instance->control.frame_destroyed && instance->frame.header.status==KU_TASK_FRAME_READY);
+    CHECK(!instance->frame.header.initialized && !instance->frame.header.result_initialized);
+    CHECK(fixture_empty_result(instance->payload) && fixture_empty_result(instance->frame.result));
     FixtureLedger cancelled=fixture_ledger();
     CHECK(cancelled.allocations+1u==staged.allocations && cancelled.bytes+31u==staged.bytes);
     CHECK(cancelled.calls==staged.calls);
@@ -335,17 +346,25 @@ static void fixture_scope(int mode) {
     CHECK(ku_task_control_cleanup_deadline(children[i].control)==deadline);
     CHECK(children[i].control->frame_destroyed && !ku_task_control_atomic_load(&children[i].control->lifecycle_pin));
   }
+  CHECK(instance->control.frame_destroyed && !instance->frame_initialized && instance->values_cleaned);
+  CHECK(instance->frame.header.status==KU_TASK_FRAME_DESTROYED);
+  CHECK(!instance->frame.header.initialized && !instance->frame.header.result_initialized);
+  CHECK(fixture_empty_result(instance->frame.result));
+  CHECK(!ku_task_control_atomic_load(&instance->control.lifecycle_pin));
   KuTaskAdapterOutcomeV1 outcome={0};
   uint32_t taken=ku_task_value_take(&parent,NULL,&outcome);
   if (mode) {
-    CHECK(taken==terminal && !outcome.result_kind);
+    CHECK(taken==terminal && ku_task_outcome_empty(&outcome,4u));
     CHECK(ku_task_control_atomic_load(&cancellation.control->phase)==terminal);
   } else {
     CHECK(taken==KU_TASK_CONTROL_OK && outcome.result_kind==4u && outcome.exit_class==KU_TASK_EXIT_USER_RESULT);
     CHECK(outcome.value.string.ok && outcome.value.string.value.ptr==buffer);
     CHECK(!outcome.has_cleanup_deadline && !outcome.cleanup_deadline);
   }
+  fixture_idle(&runtime); /* Drain the real take wrapper's terminal notification. */
+  CHECK(!instance->payload_initialized && fixture_empty_result(instance->payload));
   ku_task_outcome_drop(&outcome);
+  CHECK(ku_task_outcome_empty(&outcome,4u));
   CHECK(ku_task_value_drop(&parent,deadline)==KU_TASK_DRIVER_OK);
   CHECK(!parent.tag && !parent.owner.lease.control);
   CHECK(ku_task_control_lease_release(&cancellation)==KU_TASK_CONTROL_OK);

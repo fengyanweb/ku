@@ -145,6 +145,12 @@ static uint64_t ku_task_driver_now_ms(void) {
 "#;
 
 const C_MAIN: &str = r#"
+static int fixture_empty_result(KuResult_bool value) {
+  return !value.ok && !value.value
+      && ku_task_outcome_empty_string(value.error.domain)
+      && ku_task_outcome_empty_string(value.error.code)
+      && ku_task_outcome_empty_string(value.error.message);
+}
 enum { GATE_ERR=0, GATE_FALSE=1, GATE_TRUE=2, GATE_REJECT=3, GATE_CANCEL=4 };
 static unsigned fixture_mode,fixture_starts,fixture_reserves,fixture_commits,fixture_callocs;
 static uintptr_t fixture_ids[5];
@@ -341,7 +347,12 @@ static void fixture_case(unsigned mode) {
       uint64_t epoch=instance->wait.epoch; deadline=original-300u;
       CHECK(ku_task_driver_request_cancel(&parent.ticket,&observer,KU_TASK_CONTROL_CANCELLED,deadline)==KU_TASK_CONTROL_OK);
       fixture_idle(&runtime);
-      CHECK(!instance->payload_initialized && !instance->frame_initialized && instance->values_cleaned);
+      /* The finished Exit frame is empty but stays READY until the real child
+       * ACK lets R2 destroy it. Its discarded private Err has no owner left. */
+      CHECK(!instance->payload_initialized && instance->frame_initialized && instance->values_cleaned);
+      CHECK(!instance->control.frame_destroyed && instance->frame.header.status==KU_TASK_FRAME_READY);
+      CHECK(!instance->frame.header.initialized && !instance->frame.header.result_initialized);
+      CHECK(fixture_empty_result(instance->payload) && fixture_empty_result(instance->frame.result));
       for (size_t i=2;i<5u;i++) CHECK(fixture_frees[i]==1u);
       CHECK(!fixture_frees[0] && fixture_frees[1]==1u);
       fixture_check_held(&runtime,&receipt,&child_observer,deadline);
@@ -370,6 +381,11 @@ static void fixture_case(unsigned mode) {
     CHECK(ku_task_control_cleanup_deadline(child_observer.control)==deadline);
     CHECK(child_observer.control->frame_destroyed && !ku_task_control_atomic_load(&child_observer.control->lifecycle_pin));
   }
+  CHECK(instance->control.frame_destroyed && !instance->frame_initialized && instance->values_cleaned);
+  CHECK(instance->frame.header.status==KU_TASK_FRAME_DESTROYED);
+  CHECK(!instance->frame.header.initialized && !instance->frame.header.result_initialized);
+  CHECK(fixture_empty_result(instance->frame.result));
+  CHECK(!ku_task_control_atomic_load(&instance->control.lifecycle_pin));
   if (mode==GATE_ERR) {
     CHECK(ku_task_control_atomic_load(&observer.control->phase)==KU_TASK_CONTROL_FAILED);
     /* A private Err is not a winner, but the real post-ACK FAILED publication
@@ -393,7 +409,10 @@ static void fixture_case(unsigned mode) {
       CHECK(error->code.len==14u && !memcmp(error->code.ptr,"too_many_tasks",14u));
     } else CHECK(outcome.value.boolean.ok && outcome.value.boolean.value==(mode==GATE_TRUE));
   }
+  fixture_idle(&runtime); /* Complete the real take wrapper's notification. */
+  CHECK(!instance->payload_initialized && fixture_empty_result(instance->payload));
   ku_task_outcome_drop(&outcome);
+  CHECK(ku_task_outcome_empty(&outcome,2u));
   CHECK(ku_task_value_drop(&parent,deadline)==KU_TASK_DRIVER_OK);
   CHECK(!parent.tag && !parent.owner.lease.control);
   CHECK(ku_task_control_lease_release(&observer)==KU_TASK_CONTROL_OK);

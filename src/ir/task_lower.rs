@@ -237,9 +237,10 @@ struct FunctionLowerer<'a> {
     function: TaskFunction,
     locals: HashMap<String, SlotId>,
     current: Option<StateId>,
-    // Filled only after every slot is known; DropIfInit handles edge-specific
-    // values and never drops Task owners, which belong to the generated host.
-    exits: Vec<(StateId, Option<SlotId>)>,
+    // Only Await cancellation exits receive synthetic Value cleanup. Normal
+    // Exit leaves its current owners for generated all-Task handoff/finish glue.
+    // Fill these finite cleanup regions after every slot is known.
+    cleanup_exits: Vec<StateId>,
     span: Span,
 }
 
@@ -264,7 +265,7 @@ impl<'a> FunctionLowerer<'a> {
             },
             locals: HashMap::new(),
             current: None,
-            exits: Vec::new(),
+            cleanup_exits: Vec::new(),
             span: declaration.span,
         };
         lowerer.current = Some(lowerer.state(TaskTerminator::Terminate)?);
@@ -355,15 +356,14 @@ impl<'a> FunctionLowerer<'a> {
         Ok(destination)
     }
 
-    fn complete(&mut self, value: SlotId) -> KuResult<()> {
+    fn exit_result(&mut self, value: SlotId) -> KuResult<()> {
         if self.function.slots[value.0].ty != value_slot(self.function.result.clone()) {
             return Err(unsupported(
                 "return values that do not match the declared Result",
                 self.span,
             ));
         }
-        let state = self.terminate(TaskTerminator::Complete { value })?;
-        self.exits.push((state, Some(value)));
+        self.terminate(TaskTerminator::Exit { value })?;
         Ok(())
     }
 
@@ -570,7 +570,7 @@ impl<'a> FunctionLowerer<'a> {
                     ready,
                     cleanup,
                 };
-                self.exits.push((cleanup, None));
+                self.cleanup_exits.push(cleanup);
                 self.current = Some(ready);
                 Ok(destination)
             }
@@ -586,7 +586,7 @@ impl<'a> FunctionLowerer<'a> {
                 let destination = self.slot(value_slot(inner.as_ref().clone()))?;
                 let error = self.slot(value_slot(self.function.result.clone()))?;
                 let ok = self.state(TaskTerminator::Terminate)?;
-                let err = self.state(TaskTerminator::Complete { value: error })?;
+                let err = self.state(TaskTerminator::Exit { value: error })?;
                 self.terminate(TaskTerminator::TryResult {
                     src: source,
                     ok_value: destination,
@@ -594,7 +594,6 @@ impl<'a> FunctionLowerer<'a> {
                     ok,
                     err,
                 })?;
-                self.exits.push((err, Some(error)));
                 self.current = Some(ok);
                 Ok(destination)
             }
@@ -693,7 +692,7 @@ impl<'a> FunctionLowerer<'a> {
                     value: Some(value), ..
                 } => {
                     let result = self.expression(value, 0)?;
-                    self.complete(result)?;
+                    self.exit_result(result)?;
                 }
                 Stmt::Fail {
                     value:
@@ -713,7 +712,7 @@ impl<'a> FunctionLowerer<'a> {
                         },
                         self.function.result.clone(),
                     )?;
-                    self.complete(result)?;
+                    self.exit_result(result)?;
                 }
                 Stmt::Print { value, .. } => {
                     let temporary = !matches!(&value.kind, ExprKind::Variable(_));
@@ -752,10 +751,10 @@ impl<'a> FunctionLowerer<'a> {
                 declaration.span,
             ));
         }
-        for (state, returned) in self.exits.clone() {
+        for state in std::mem::take(&mut self.cleanup_exits) {
             for index in (0..self.function.slots.len()).rev() {
                 let slot = SlotId(index);
-                if Some(slot) != returned && owned_value(&self.function.slots[index].ty) {
+                if owned_value(&self.function.slots[index].ty) {
                     self.emit_at(state, TaskOp::DropIfInit { slot })?;
                 }
             }
