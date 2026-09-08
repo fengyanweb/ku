@@ -463,7 +463,7 @@ static void fixture_scope_timeout(void) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==6u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==3u && KU_TASK_DRIVER_ABI_VERSION==6u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&fixture_hold,0);
   ku_task_control_atomic_init(&fixture_cleanup_calls,0);

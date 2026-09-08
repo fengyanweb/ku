@@ -152,7 +152,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 当前 frame IR 使用密集 `SlotId` / `StateId`，支持 `int`、`bool`、`null`、`str`
 及对应单层 Result，以及 move-only `Task { result }` 槽。操作显式区分 Init、Copy、Move、
 WrapOk、Unary、Binary、Read、Drop、DropIfInit、Start、Print；控制边包括 Jump、Branch、Suspend
-（resume / cleanup）、Await、TryResult、Complete 和 Terminate。
+（resume / cleanup）、Await、TryResult、Complete、内部 Exit 和 Terminate。
 暂不支持 array/object/struct/enum、函数值、Task 参数/返回或借用参数进入 frame。
 
 `verify_and_plan` 先验证形状、类型、资源硬限，再计算跨分支和循环的 must/may
@@ -162,8 +162,9 @@ WrapOk、Unary、Binary、Read、Drop、DropIfInit、Start、Print；控制边�
 完成全部 Task 移交后清 Task 位；TryResult 的成功/错误边分别初始化不同槽。已死亡的普通 Owned Value 必须在挂起前显式
 drop，不能为了缩 frame 擅自提前释放资源。借用值不能跨 Suspend；owned 值不能隐式
 Copy、覆盖可能仍初始化的槽或再次消费 moved-from 值。Task 不能普通 Drop/DropIfInit，
-Complete 留存的 Task 只能由生成的 scope drain 处理。取消区域不能回正常区域、
-Complete、Start、Await 或 Suspend；本片也拒绝 cleanup 中可能溢出的 Negate 和算术
+Complete 留存的 Task 只能由生成的 scope drain 处理。内部 Exit 的独立清理桥接见下节，
+源码 lower 尚未使用 Exit。取消区域不能回正常区域、Complete、Exit、Start、Await
+或 Suspend；本片也拒绝 cleanup 中可能溢出的 Negate 和算术
 Binary，避免算术失败覆盖原取消/超时原因；总是有限且不失败的 Not/比较仍可用于内部
 cleanup IR。拒绝所有不经过实际 suspension 的环，
 包括 cleanup 中的环。它不是完整语言的 finally/异常或任意 Await 组合 verifier。
@@ -182,7 +183,7 @@ R3 前置操作 `WrapOk` 允许把已初始化的 primitive 局部构造为匹�
 liveness 同步跟踪它的消费行为。源码子集的 `ok(local)` 复用该操作。
 
 `src/backend/c_task.rs` 通过统一 C 生成器复用既有 KuString / Result 的 move/drop
-helper，不嵌入 runner 或源码。内部 frame ABI v2 有独立版本、目标 C `sizeof` / alignment、
+helper，不嵌入 runner 或源码。内部 frame ABI v3 有独立版本、目标 C `sizeof` / alignment、
 初始化位、状态、结果槽、退出 metadata 和绝对 cleanup deadline；单 frame 存储上限 16 KiB。
 host context 只在当前 callback 借用，不保存 callback 栈地址跨 Pending。
 ABI 不兼容、短/未对齐存储、参数 header 别名、重复初始化、重复取结果和非空输出槽
@@ -240,7 +241,7 @@ typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 
 R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 等待类型和独立期限
 升为版本 4，R5h 正常作用域登记字段升为版本 5，单向 FINAL 标记升为版本 6；
 内部 C 类型名中的 `V1` 不是旧布局兼容承诺，初始化明确拒绝旧版本（包括5）。
-当前 Frame ABI 2、Control ABI 1、Driver ABI 6。
+当前 Frame ABI 3、Control ABI 1、Driver ABI 6。
 普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
 以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
 有限源码 TaskStart/Await 已复用它，但它不是 M:N、netpoll 或事件驱动 HTTP。
@@ -416,7 +417,7 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 源码与两种 CLI native 构建的定向执行已经通过；本轮表达式/清理定向测试与 Rust
 quality 通过，本轮 native 全集和质量检查通过，workspace 的文档失败与修复证据单列；精确新提交三系统 CI/sanitizer 仍待核实。
 历史失败及修复结果分开记录于工作日志，不从旧 SHA 的通过结果外推。
-Frame ABI 2、Control ABI 1、Driver ABI 6 不等于稳定外部 C FFI。
+Frame ABI 3、Control ABI 1、Driver ABI 6 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
 
 ### R5h 内部正常作用域 session（尚未接入源码）
@@ -453,8 +454,9 @@ control 和 closing shutdown 期限的最小值；不读新时钟、不续期、
 只有原终态路径注销元数据，实际子任务清理责任仍由 adapter 履行。
 
 该内部命令接受 LIVE、requested 和 PUBLISHING，不改取消首赢家。LIVE 必须由可信
-typed 整函数退出见证授权，不能用它代替普通 Continue；此见证和 Value 清理桥接
-尚未实现，raw driver 不能认证一条源语句确实已 return/fail。PUBLISHING 不读尚未
+typed 整函数退出见证授权，不能用它代替普通 Continue；下节内部 Exit 提供退出
+状态及 Value 清理桥接，但尚未接入活动 normal session 的提升，也未接入源码。
+raw driver 不能认证一条源语句确实已 return/fail。PUBLISHING 不读尚未
 发布的 control D；若此前已有 scope failure，现有 wrapper 会跳过 scope 期限刷新，
 后续 adapter 仍须重新取最小 D 并显式传播给 pending child，不能宣称已自动闭环。
 
@@ -464,6 +466,33 @@ parent cleanup_fault、非法 manifest/token/alias 仍拒绝，输出与原对�
 保留旧 outgoing ACK wait 和 incoming ancestor 关系，不新增分配、RC、队列、
 唤醒、等待或重试。生成 adapter 必须先移交全部 Task，再清理其余 Value；正常
 scope 超时、业务 return/Err 穿作用域及 async finally 的源码闭环仍未完成。
+
+### R5h.3a 内部 typed Exit 清理桥接（尚未接入源码）
+
+`TaskTerminator::Exit { value }` 移动匹配、已初始化且非借用的 Result；一个函数
+不能混用 Exit 与 legacy Complete，即使冲突状态不可达。Exit 不能出现在 cleanup
+区域，不能保留任何可能初始化的 borrowed 槽，也不放宽无实际挂起环和分析硬限。
+含 Exit 的函数即使没有 Task 槽也必须 hosted，所有 Owned Value 持久保存在 frame，
+已死亡的 Copy 临时仍可留在 resume 栈上。源码 lower 当前继续使用 Complete。
+
+内部 Frame ABI 升为3，新增非终态 `KU_TASK_FRAME_EXIT_STAGED`。Result 先进入
+独立退出槽，剩余 Value 尚不释放，旧 Suspend/Await 的 cleanup_state 清为无效。
+反复 resume 不重放用户状态；take/destroy 不能绕过这个非终态。bridge 的正常执行
+runtime error 也暂存退出，保留真实 Await 继承的绝对 D；已经进入取消 cleanup 的
+错误走原终止路径，不能覆盖原取消原因。非法退出 metadata 前置拒绝。
+
+生成 adapter 先移交全部尚活跃 Task owner，再调用 `finish_exit_values` 按初始化位
+释放其余 Owned Value，最后取入私有 Result 并等待真实 receipt ACK。该 finish
+入口只允许合法 staged frame 且实际 Task 位全空，调用后进入 READY，不能再次释放。
+零 Task 的 bridge 仍经过同一 finish，不为其创建不存在的子树清理预算。取消可在
+staged/私有结果期间胜出，沿原 R2 首赢家裁决，结果只 drop 一次；移交不成功不得
+伪造 ACK 或提前释放剩余值。runtime failure 的既有 D 先导入再 drain，只能收紧。
+
+本片不增加分配、线程、重试循环或用户 API；复用原 frame 位图、driver receipt
+与串行 executor。IR 反例、真实 C 退出顺序测试和 ABI 拒绝测试分别记录证据，不从
+artifact 文本存在推断执行通过。normal ScopeEnter/ScopeDrain、活动 session 的
+final promotion adapter 接入和 source if/loop/finally 尚未实现，完整 native async
+与高并发发布门禁仍未完成。具体测试结果以工作日志及精确提交 CI 为准。
 
 ### R5e checked Copy 表达式
 

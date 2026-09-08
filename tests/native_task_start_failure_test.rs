@@ -551,7 +551,7 @@ static void fixture_cancel_case(unsigned point,unsigned action,int error) {
   CHECK(fixture_cleanup_reason==KU_TASK_CONTROL_CANCELLED && fixture_cleanup_deadline==deadline);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==6u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==3u && KU_TASK_DRIVER_ABI_VERSION==6u);
   ku_task_control_atomic_init(&fixture_bad_clock,0);
   for (int error=0;error<2;error++) {
     for (unsigned fault=FIXTURE_CONTROL_ABI;fault<=FIXTURE_SECOND_RETAIN;fault++) fixture_fault_case(fault,error);

@@ -378,6 +378,21 @@ typedef struct KuTaskHandle_@ID@ {
   KuTaskDriverTicketV1 ticket;
 } KuTaskHandle_@ID@;
 
+/* The sole executor calls this only after a READY frame. A staged bridge
+ * exit is not READY until every Task owner was durably handed off and the
+ * generated finish-exit glue cleaned the remaining typed Values. */
+static uint32_t ku_task_@ID@_take_frame_payload(KuTaskInstance_@ID@* instance) {
+  if (!instance->frame_initialized || instance->payload_initialized) return KU_TASK_FRAME_INVALID_STATE;
+  uint32_t status=ku_task_frame_@ID@_take_result(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION,&instance->payload);
+  if (status==KU_TASK_FRAME_OK) {
+    instance->payload_initialized=true;
+    instance->exit_class=instance->frame.header.exit_class ? instance->frame.header.exit_class : KU_TASK_EXIT_USER_RESULT;
+    instance->has_cleanup_deadline=instance->frame.header.has_exit_deadline;
+    instance->cleanup_deadline=instance->frame.header.exit_deadline;
+  }
+  return status;
+}
+
 static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reason, KuTaskControlV1* budget) {
   KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance)};
   if (instance->wait.driver) {
@@ -395,15 +410,28 @@ static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reaso
     instance->drain_started=1;
   }
   if (instance->drain_started) instance->drain_deadline=ku_task_host_deadline(&host,instance->drain_deadline,0);
-  /* Runtime unwind carries its original/minimum scope budget across Await,
-   * even when this scope has already received every cleanup ACK. Ordinary
-   * user Results do not propagate the budget of a successfully ended scope. */
+@TRANSFERS@
+  /* Every sibling was durably transferred before any Value cleanup/ACK wait. */
+  if (!reason && instance->frame.header.status==KU_TASK_FRAME_EXIT_STAGED) {
+    uint32_t status=ku_task_frame_@ID@_finish_exit_values(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION);
+    if (status!=KU_TASK_FRAME_OK) return KU_TASK_DRIVER_INTERNAL;
+    instance->values_cleaned=1;
+    status=ku_task_@ID@_take_frame_payload(instance);
+    if (status!=KU_TASK_FRAME_OK) return KU_TASK_DRIVER_INTERNAL;
+  }
+  /* Private payload discard obeys the same all-owner handoff checkpoint as
+   * Value cleanup. Never discard it before an unfinished/failed transfer. */
+  if (reason && instance->payload_initialized) {
+    instance->payload_initialized=false;
+    ku_result_drop_@SUFFIX@(&instance->payload);
+  }
+  /* Capture may have copied an older frame deadline. Reapply the actual
+   * drain minimum AFTER capture, even when every receipt is already ACKed.
+   * Ordinary USER_RESULT does not carry this completed scope's D outward. */
   if (instance->exit_class==KU_TASK_EXIT_RUNTIME_FAILURE && instance->drain_started) {
     instance->has_cleanup_deadline=1;
     instance->cleanup_deadline=instance->drain_deadline;
   }
-@TRANSFERS@
-  /* Every sibling was durably transferred before any Value cleanup/ACK wait. */
   if (instance->drain_started && (!instance->drain_deadline_published
       || instance->drain_deadline < instance->drain_published_deadline)) {
     /* A later ancestor cancellation can tighten an already-transferred scope.
@@ -476,15 +504,16 @@ static uint32_t ku_task_@ID@_resume(void* raw) {
   if (status == KU_TASK_FRAME_PENDING) {
     return KU_TASK_CONTROL_PENDING;
   } else if (status == KU_TASK_FRAME_READY && !instance->payload_initialized) {
-    status = ku_task_frame_@ID@_take_result(&instance->frame, sizeof(instance->frame), KU_TASK_FRAME_ABI_VERSION, &instance->payload);
-    if (status == KU_TASK_FRAME_OK) {
-      instance->payload_initialized = true;
-      instance->exit_class=instance->frame.header.exit_class ? instance->frame.header.exit_class : KU_TASK_EXIT_USER_RESULT;
-      instance->has_cleanup_deadline=instance->frame.header.has_exit_deadline;
-      instance->cleanup_deadline=instance->frame.header.exit_deadline;
-    }
+    status=ku_task_@ID@_take_frame_payload(instance);
+  } else if (status==KU_TASK_FRAME_EXIT_STAGED && !instance->payload_initialized) {
+    /* A verified generated frame is stopped with a typed final-exit witness,
+     * not a private/public payload. Import an inherited failure budget before
+     * drain can create any new one; only drain may finish Values and take it. */
+    instance->exit_class=instance->frame.header.exit_class;
+    instance->has_cleanup_deadline=instance->frame.header.has_exit_deadline;
+    instance->cleanup_deadline=instance->frame.header.exit_deadline;
   }
-  if (instance->payload_initialized) {
+  if (instance->payload_initialized || status==KU_TASK_FRAME_EXIT_STAGED) {
     status=ku_task_@ID@_drain(instance,0,NULL);
     if (status==KU_TASK_DRIVER_PENDING) return KU_TASK_CONTROL_PENDING;
     if (status==KU_TASK_DRIVER_CLEANUP_TIMEOUT) {
@@ -501,7 +530,6 @@ static uint32_t ku_task_@ID@_resume(void* raw) {
 }
 static uint32_t ku_task_@ID@_cleanup(void* raw, uint32_t reason, KuTaskControlV1* budget) {
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)raw;
-  if (instance->payload_initialized) { instance->payload_initialized=false; ku_result_drop_@SUFFIX@(&instance->payload); }
   uint32_t frame_reason = reason == KU_TASK_CONTROL_CANCELLED ? KU_TASK_FRAME_CANCELLED
       : reason == KU_TASK_CONTROL_TIMED_OUT ? KU_TASK_FRAME_TIMED_OUT : KU_TASK_FRAME_INVALID_ARGUMENT;
   if (frame_reason == KU_TASK_FRAME_INVALID_ARGUMENT) return KU_TASK_CONTROL_INVALID_ARGUMENT;
