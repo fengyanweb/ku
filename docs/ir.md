@@ -167,8 +167,11 @@ return/fail/? 统一生成 Exit，清理桥接见下节；Complete 仅保留内�
 取消区域不能回正常区域、Complete、Exit、Start、Await
 或 Suspend；本片也拒绝 cleanup 中可能溢出的 Negate 和算术
 Binary，避免算术失败覆盖原取消/超时原因；总是有限且不失败的 Not/比较仍可用于内部
-cleanup IR。拒绝所有不经过实际 suspension 的环，
-包括 cleanup 中的环。它不是完整语言的 finally/异常或任意 Await 组合 verifier。
+cleanup IR。无 Scope 的内部图中，每个环必须经过无条件返回本次 poll 的 `Suspend`；
+`Await` 虽然是存储/liveness 边界，但已就绪或 `INLINE_FAILED` 可在同一 poll 内继续，
+不能单独作为协作进度保证。新增遍历的 Await 边计入既有分析预算，不扩大限额。
+带 Scope 的图仍须为 DAG；cleanup 中所有环仍被拒绝。
+它不是完整语言的 finally/异常或任意 Await 组合 verifier，也不开放源码循环。
 
 内部硬限为 64 函数、每函数 64 槽 / 256 状态、全程序 4096 操作、1,000,000 字面量
 字节（含 UTF-8、Error 三字段和函数名）及 1,000,000 分析工作量；测试只能收紧限制。

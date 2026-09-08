@@ -275,7 +275,20 @@ fn native_task_start_await_ir_await_has_distinct_ready_and_host_cleanup_facts() 
 #[test]
 fn native_task_start_await_ir_repeated_await_and_result_overwrite_are_rejected() {
     let mut repeated = await_program(IrType::Int);
-    repeated.functions[0].states[2] = state(vec![drop(3)], jump(1));
+    // Keep this ownership negative acyclic. A loop must now fail the earlier
+    // progress gate rather than accidentally becoming its only rejection.
+    repeated.functions[0].states[2] = state(
+        vec![drop(3)],
+        TaskTerminator::Await {
+            task: SlotId(2),
+            dst: SlotId(3),
+            ready: StateId(6),
+            cleanup: StateId(5),
+        },
+    );
+    repeated.functions[0]
+        .states
+        .push(state(vec![drop(3), null_result(6)], done(6)));
     rejected(&repeated, "not definitely initialized");
     let mut overwritten = await_program(IrType::Null);
     overwritten.functions[0].states[0]
@@ -474,7 +487,7 @@ fn native_task_start_await_ir_cleanup_cannot_start_await_or_reenter_normal() {
 }
 
 #[test]
-fn native_task_start_await_ir_await_is_a_suspension_but_start_is_not() {
+fn native_task_start_await_ir_only_suspend_guarantees_progress_on_every_cycle() {
     let mut program = TaskProgram {
         functions: vec![
             TaskFunction {
@@ -506,7 +519,26 @@ fn native_task_start_await_ir_await_is_a_suspension_but_start_is_not() {
             leaf(IrType::Int),
         ],
     };
-    accepted(&program);
+    rejected(&program, "cycle without suspension");
+    let mut cooperative = program.clone();
+    cooperative.functions[0].states[2].terminator = TaskTerminator::Suspend {
+        resume: StateId(0),
+        cleanup: StateId(3),
+    };
+    accepted(&cooperative);
+    // A Suspend before entering an inner Await-only cycle is insufficient.
+    let mut leading_suspend = program.clone();
+    leading_suspend.functions[0].states.push(state(
+        vec![],
+        TaskTerminator::Suspend {
+            resume: StateId(0),
+            cleanup: StateId(3),
+        },
+    ));
+    leading_suspend.functions[0].entry = StateId(4);
+    rejected(&leading_suspend, "cycle without suspension");
+    cooperative.functions[0].states[3].terminator = jump(3);
+    rejected(&cooperative, "cycle without suspension");
     program.functions[0].states[1].terminator = jump(2);
     rejected(&program, "cycle without suspension");
 }
