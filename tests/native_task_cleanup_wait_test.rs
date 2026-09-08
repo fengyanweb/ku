@@ -281,13 +281,13 @@ static void fixture_driver_init(FixtureDriver* runtime, size_t capacity) {
   runtime->slots = (KuTaskDriverSlotV1*)calloc(capacity, sizeof(*runtime->slots));
   runtime->ring = (size_t*)calloc(capacity, sizeof(*runtime->ring)); CHECK(runtime->driver && runtime->slots && runtime->ring);
   size_t fixed = sizeof(*runtime->driver) + capacity * (sizeof(*runtime->slots) + sizeof(*runtime->ring));
-  for (uint32_t old = 1; old < 4; ++old) {
+  for (uint32_t old = 1; old < 5; ++old) {
     CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), old, runtime->slots, capacity, runtime->ring, capacity, fixed + 1048576u) == KU_TASK_DRIVER_ABI_MISMATCH);
     CHECK(ku_task_frame_zero_bytes(runtime->driver, sizeof(*runtime->driver)));
     CHECK(ku_task_frame_zero_bytes(runtime->slots, capacity * sizeof(*runtime->slots)));
     CHECK(ku_task_frame_zero_bytes(runtime->ring, capacity * sizeof(*runtime->ring)));
   }
-  CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), 4u, runtime->slots, capacity, runtime->ring, capacity, fixed + 1048576u) == KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), 5u, runtime->slots, capacity, runtime->ring, capacity, fixed + 1048576u) == KU_TASK_DRIVER_OK);
   fixture_idle(runtime, 0); CHECK(fixture_snapshot(runtime, 0).fixed_bytes == fixed);
 }
 static void fixture_clock_begin(void) {
@@ -913,7 +913,7 @@ static void fixture_corrupt_ack_process(void) {
   puts("task-cleanup-wait-quarantined-not-drained");
 }
 int main(int argc, char** argv) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 4u); CHECK(KU_TASK_FRAME_ABI_VERSION == 2u); ku_task_control_deadline_init(&fixture_clock);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 5u); CHECK(KU_TASK_FRAME_ABI_VERSION == 2u); ku_task_control_deadline_init(&fixture_clock);
   if (argc == 2 && !strcmp(argv[1], "--corrupt-ack")) { fixture_corrupt_ack_process(); return 0; }
   CHECK(argc == 1);
   fixture_basic_wait(0, 0); fixture_basic_wait(0, 1); fixture_basic_wait(1, 0);

@@ -236,10 +236,10 @@ typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 
 
 ### R3 内部单 worker driver
 
-`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v4。
+`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v5。
 R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 等待类型和独立期限
-升为版本 4；内部 C 类型名中的 `V1` 不是旧布局兼容承诺，
-初始化明确拒绝旧版本。当前 Frame ABI 2、Control ABI 1、Driver ABI 4。
+升为版本 4，R5h 正常作用域登记字段升为版本 5；内部 C 类型名中的 `V1` 不是旧布局兼容承诺，
+初始化明确拒绝旧版本。当前 Frame ABI 2、Control ABI 1、Driver ABI 5。
 普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
 以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
 有限源码 TaskStart/Await 已复用它，但它不是 M:N、netpoll 或事件驱动 HTTP。
@@ -374,7 +374,7 @@ ACK 等待复用已有单一 slot/link/ring，snapshot 显式区分 RESULT 与 C
 的 waiter。未完成收据登记后，只有实际清理水位或逐 slot 清理故障才通知父任务；
 单独的 terminal、owner 转交、TAKING 回调或 observer 释放不是这个通知的替代品。
 
-一个 task generation 只支持一个内部 final-drain session。调用方事先建立绝对
+既有 final-drain 路径中，一个 task generation 只支持一个内部 final-drain session。调用方事先建立绝对
 预算；首次调用即使直接 ACK 也绑定该期限，后续只取 min，read/detach 不重置。
 普通父任务到期只唤醒内部清理 continuation，不将其 R2 phase 改为 Cancelled。
 父已取消/超时时只拆普通结果等待，保留内部 ACK 登记并继承更短的已发布预算；
@@ -415,8 +415,32 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 源码与两种 CLI native 构建的定向执行已经通过；本轮表达式/清理定向测试与 Rust
 quality 通过，本轮 native 全集和质量检查通过，workspace 的文档失败与修复证据单列；精确新提交三系统 CI/sanitizer 仍待核实。
 历史失败及修复结果分开记录于工作日志，不从旧 SHA 的通过结果外推。
-Frame ABI 2、Control ABI 1、Driver ABI 4 不等于稳定外部 C FFI。
+Frame ABI 2、Control ABI 1、Driver ABI 5 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
+
+### R5h 内部正常作用域 session（尚未接入源码）
+
+`ku_task_driver_scope_begin` 由唯一 RUNNING executor 在任何 owner 移交前登记完整
+live-child mask、固定容量1..64的稳定 receipt 存储和绝对 D；零 mask/id 合法。
+receipt 从空到真实 owner_drop_receipt 签发一次，之后不变。`scope_end` 不接受
+替换集合或子集，检查全部 expected entry 的真实 ACK；未签发项为 Pending，
+不是 ACK。Pending end 只是观察，不登记唤醒，不能循环重试代替有界移交和 ACK wait。
+活动 session 只允许原集合中预期项的精确地址登记清理等待，不允许普通结果等待。
+
+成功 end 仅清除本正常作用域的 D/登记/token，保留递增 epoch、取消和shutdown状态；
+后续独立正常作用域可以建立新 D。已锁存失败不能被迟到 ACK 清除，仅 timer 已触发
+而全体 ACK 的情况仍可成功。最终 acquire LIVE 读取是关闭线性化点：driver mutex
+不阻止外部 control CAS，更晚取消可以与成功 end 重叠。未来生成器必须返回
+`ku_task_dispatch` 重新检查 phase 后才执行下一段用户代码，不能直接进入 join。
+
+manifest 是借用的稳定 instance 存储；完整集合、生命周期、唯一写入及真实receipt
+来源是受信 raw C 调用合同，不是恶意指针认证。timer/notify/shutdown/terminal 不读
+该存储；terminal 在释放 registry/执行租约前只注销元数据，不代表替调用方清完子树。
+父 D 缩短不扫描 manifest，未来 adapter 须对 pending issued child 调用 cancel_receipt；
+取消后向最终退出提升、外层 child 合并、对应 TaskOp/verifier/源码 if/loop/finally
+尚未实现。当前仅 driver 原语，不改变前述源码拒绝边界，不代表完整 async 或 M:N。
+容量和重复检查最多64项/2016次比较，无新增堆分配、队列或 RC 边；测试与精确提交
+验收结果见工作日志，不从接口存在推断真实 C 或 sanitizer 已通过。
 
 ### R5e checked Copy 表达式
 
