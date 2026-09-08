@@ -66,7 +66,18 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         assert!(document.contains("三系统 CI"));
         assert!(!document.contains("native C 明确拒绝 async。"));
     }
-    assert!(ir.contains("Frame ABI 2、Control ABI 1、Driver ABI 4"));
+    assert!(ir.contains("Frame ABI 2、Control ABI 1、Driver ABI 5"));
+    for boundary in [
+        "R5h 内部正常作用域 session（尚未接入源码）",
+        "`scope_end` 不接受",
+        "替换集合或子集",
+        "Pending end 只是观察，不登记唤醒",
+        "不阻止外部 control CAS",
+        "父 D 缩短不扫描 manifest",
+        "取消后向最终退出提升、外层 child 合并",
+    ] {
+        assert!(ir.contains(boundary), "scope session boundary: {boundary}");
+    }
     assert!(ir.contains("KuTaskAdapterOutcomeV1"));
     assert!(ir.contains("KuTaskAdapterTakeRequestV1"));
     assert!(ir.contains("不兼容变更"));
