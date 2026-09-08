@@ -12,7 +12,7 @@ pub(super) fn emit_runtime(out: &mut COutput) -> KuResult<()> {
 }
 
 const DRIVER_ABI: &str = r#"
-/* Internal driver ABI 5, not a public Task API, netpoll, or M:N scheduler.
+/* Internal driver ABI 6, not a public Task API, netpoll, or M:N scheduler.
  * Private V1 type spellings are retained, not their old binary layout/version.
  * Caller-owned zero-filled driver/slot/ring storage remains live until destroy
  * succeeds. Every API caller protects that storage; no call races destroy.
@@ -99,7 +99,7 @@ const DRIVER_ABI: &str = r#"
  * callback's short-lived stack array. The real registry/executor protects the
  * instance; only its sole RUNNING executor calls begin/end/cleanup_wait_arm.
  * Expected entries begin zero, are written once by owner_drop_receipt, and
- * remain immutable through end/terminal. Do not change the span, mask, or an
+ * remain immutable through end/terminal. Do not change the span or an
  * issued receipt, and do not omit an owned child from the initial expected
  * mask. These raw provenance/lifetime/unique-write preconditions do not claim
  * to authenticate arbitrary hostile C pointers or forged old receipts.
@@ -112,8 +112,19 @@ const DRIVER_ABI: &str = r#"
  * latch CLEANUP_TIMEOUT. All ACKs win over a fired timer alone, but never over
  * an already latched scope failure. End certifies this manifest, not a subtree.
  * An active session may arm only ACK waits on its original expected entries.
- * Adding outer children after cancellation requires a later promotion API;
- * this primitive does not silently expand a lexical scope into final drain.
+ * scope_promote_final alone may OR still-live outer children into that same
+ * fixed manifest, before transferring any added owner. It preserves every old
+ * expected bit (including issued ACKs and unissued entries), receipt, token,
+ * wait and epoch. Newly added entries must be empty. This is a one-way FINAL
+ * session, never eligible for normal end or a renewed cleanup budget. LIVE
+ * callers require a trusted typed whole-function exit witness; this raw kernel
+ * cannot authenticate source return/fail/runtime-failure rather than Continue.
+ * Promotion accepts LIVE, requested and PUBLISHING without changing R2 outcome.
+ * It neither waits for publication nor reads an unpublished control deadline.
+ * Its output is a complete exclusive u64 object, not necessarily zero; failure
+ * leaves all objects unchanged. Existing driver/scope failure remains sticky
+ * but does not alone prevent safe structural registration of outer owners.
+ * Metadata OK is not successful cleanup, child ACK or Task completion.
  * Parent D tightening does not scan this span to cancel children: the future
  * adapter must propagate shorter D through cancel_receipt for every pending
  * issued child. Terminal unregister only forgets metadata; it does not ACK or
@@ -137,7 +148,7 @@ const DRIVER_ABI: &str = r#"
  * and keep the worker for deterministic cleanup. Idle faulted workers wait only
  * for OS condition notifications, never retry a failed clock periodically.
  */
-#define KU_TASK_DRIVER_ABI_VERSION 5u
+#define KU_TASK_DRIVER_ABI_VERSION 6u
 #define KU_TASK_DRIVER_MAX_SLOTS ((size_t)1024u)
 enum {
   KU_TASK_DRIVER_OK = 0u, KU_TASK_DRIVER_PENDING = 1u,
@@ -237,7 +248,7 @@ typedef struct KuTaskDriverSlotV1 {
   uint64_t scope_wait_deadline;
   /* Borrowed stable manifest; read only by the sole RUNNING executor.
    * Epoch is never reset by normal close while this generation is resident. */
-  uint32_t scope_session_active;
+  uint32_t scope_session_active, scope_session_final;
   uint64_t scope_session_id, scope_session_epoch;
   const KuTaskDriverCleanupReceiptV1* scope_receipts;
   size_t scope_receipt_capacity;
@@ -595,7 +606,8 @@ static void ku_task_driver_scope_refresh_locked(KuTaskDriverV1* driver, size_t i
  * Do not read or zero a borrowed receipt/token here. The allocation remains
  * protected by the registry until this registration has been forgotten. */
 static void ku_task_driver_scope_unregister_locked(KuTaskDriverSlotV1* parent) {
-  parent->scope_session_active = 0; parent->scope_session_id = 0;
+  parent->scope_session_active = 0; parent->scope_session_final = 0;
+  parent->scope_session_id = 0;
   parent->scope_receipts = NULL; parent->scope_receipt_capacity = 0;
   parent->scope_expected_mask = 0;
 }
@@ -615,6 +627,37 @@ static int ku_task_driver_scope_contains_locked(
 }
 static int ku_task_driver_scope_receipt_empty(const KuTaskDriverCleanupReceiptV1* receipt) {
   return !receipt->driver && !receipt->slot && !receipt->generation && !receipt->abi_version;
+}
+/* Whole-manifest field validation, after callers validate its stable span.
+ * Exact duplicate IDs are not two children; at most 64*63/2 comparisons.
+ * This is not an ACK/status read: a quarantined old child must not prevent
+ * registering still-owned outer children. Old generations may remain valid
+ * after disposal/reuse, but a generation not yet issued cannot be valid. */
+static uint32_t ku_task_driver_scope_manifest_locked(
+    const KuTaskDriverTicketV1* parent_ticket, const KuTaskDriverSlotV1* parent) {
+  KuTaskDriverV1* driver = parent_ticket->driver;
+  size_t capacity = parent->scope_receipt_capacity;
+  const KuTaskDriverCleanupReceiptV1* receipts = parent->scope_receipts;
+  if (capacity < 64u && (parent->scope_expected_mask >> capacity))
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  for (size_t i = 0; i < capacity; i++) {
+    if (!(parent->scope_expected_mask & ((uint64_t)1u << i))) continue;
+    const KuTaskDriverCleanupReceiptV1* receipt = &receipts[i];
+    if (ku_task_driver_scope_receipt_empty(receipt)) continue;
+    if (receipt->driver != driver || receipt->abi_version != KU_TASK_DRIVER_ABI_VERSION
+        || !receipt->generation || receipt->slot >= driver->capacity
+        || (receipt->slot == parent_ticket->slot && receipt->generation == parent_ticket->generation))
+      return KU_TASK_DRIVER_INVALID_ARGUMENT;
+    if (receipt->generation > driver->slots[receipt->slot].generation)
+      return KU_TASK_DRIVER_INVALID_ARGUMENT;
+    for (size_t j = 0; j < i; j++) {
+      if ((parent->scope_expected_mask & ((uint64_t)1u << j))
+          && receipts[j].driver == receipt->driver && receipts[j].slot == receipt->slot
+          && receipts[j].generation == receipt->generation)
+        return KU_TASK_DRIVER_INVALID_ARGUMENT;
+    }
+  }
+  return KU_TASK_DRIVER_OK;
 }
 static uint32_t ku_task_driver_scope_begin(
     const KuTaskDriverTicketV1* parent_ticket, uint64_t scope_id,
@@ -651,7 +694,8 @@ static uint32_t ku_task_driver_scope_begin(
   /* Known shorter-header aliases are rejected before any typed output read. */
   if (result == KU_TASK_DRIVER_OK
       && (output->driver || output->parent_slot || output->parent_generation || output->scope_id || output->epoch
-          || parent->scope_session_active || parent->scope_receipts || parent->scope_receipt_capacity
+          || parent->scope_session_active || parent->scope_session_final
+          || parent->scope_receipts || parent->scope_receipt_capacity
           || parent->scope_expected_mask || parent->scope_wait_started
           || parent->wait_state != KU_TASK_DRIVER_WAIT_EMPTY))
     result = KU_TASK_DRIVER_INVALID_STATE;
@@ -673,7 +717,8 @@ static uint32_t ku_task_driver_scope_begin(
     /* No clocks/callbacks/fallible work after accepting this registration.
      * A later overlapping cancel leaves the successful session registered. */
     parent->scope_session_epoch++;
-    parent->scope_session_active = 1; parent->scope_session_id = scope_id;
+    parent->scope_session_active = 1; parent->scope_session_final = 0;
+    parent->scope_session_id = scope_id;
     parent->scope_receipts = receipts; parent->scope_receipt_capacity = capacity;
     parent->scope_expected_mask = expected_mask;
     parent->scope_wait_started = 1; parent->scope_deadline_fired = 0;
@@ -682,6 +727,98 @@ static uint32_t ku_task_driver_scope_begin(
       driver, parent_ticket->slot, parent_ticket->generation, scope_id, parent->scope_session_epoch
     };
     ku_task_driver_arm_deadline(driver, parent);
+  }
+  ku_task_driver_unlock(driver);
+  return result;
+}
+/* Trusted whole-function exit metadata, never normal Continue. No clock read,
+ * control CAS, owner transfer, ACK consumption, callback or new progress event.
+ * Registry protects atomic control access; sole executor protects the span.
+ * Every rejection precedes any output or runtime mutation. */
+static uint32_t ku_task_driver_scope_promote_final(
+    const KuTaskDriverTicketV1* parent_ticket, const KuTaskDriverScopeTokenV1* token,
+    uint64_t additional_expected_mask, uint64_t requested_deadline, uint64_t* effective_deadline) {
+  uint32_t checked = ku_task_driver_check_ticket(parent_ticket);
+  if (checked != KU_TASK_DRIVER_OK) return checked;
+  if (requested_deadline == UINT64_MAX) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  KuTaskDriverV1* driver = parent_ticket->driver;
+  if (!ku_task_driver_external_storage(driver, parent_ticket, sizeof(*parent_ticket),
+                                       KU_TASK_FRAME_ALIGNOF(KuTaskDriverTicketV1))
+      || !ku_task_driver_external_storage(driver, token, sizeof(*token),
+                                          KU_TASK_FRAME_ALIGNOF(KuTaskDriverScopeTokenV1))
+      || !ku_task_driver_external_storage(driver, effective_deadline, sizeof(*effective_deadline),
+                                          KU_TASK_FRAME_ALIGNOF(uint64_t))
+      || ku_task_frame_ranges_overlap(token, sizeof(*token), parent_ticket, sizeof(*parent_ticket))
+      || ku_task_frame_ranges_overlap(effective_deadline, sizeof(*effective_deadline), token, sizeof(*token))
+      || ku_task_frame_ranges_overlap(effective_deadline, sizeof(*effective_deadline),
+                                      parent_ticket, sizeof(*parent_ticket)))
+    return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* parent = ku_task_driver_find(parent_ticket);
+  uint32_t result = !parent ? KU_TASK_DRIVER_STALE
+      : parent->state != KU_TASK_DRIVER_RUNNING || !parent->driver_lease.control
+          || parent->binding != parent->driver_lease.control ? KU_TASK_DRIVER_INVALID_STATE
+      : parent->cleanup_fault ? parent->cleanup_fault : KU_TASK_DRIVER_OK;
+  size_t capacity = parent ? parent->scope_receipt_capacity : 0;
+  const KuTaskDriverCleanupReceiptV1* receipts = parent ? parent->scope_receipts : NULL;
+  size_t bytes = capacity <= 64u ? capacity * sizeof(*receipts) : 0;
+  if (result == KU_TASK_DRIVER_OK
+      && (!parent->scope_session_active || !parent->scope_wait_started
+          || !capacity || capacity > 64u || !receipts)) result = KU_TASK_DRIVER_STALE;
+  if (result == KU_TASK_DRIVER_OK
+      && (parent->scope_session_active != 1u || parent->scope_session_final > 1u
+          || parent->scope_wait_started != 1u || parent->scope_wait_deadline == UINT64_MAX))
+    result = KU_TASK_DRIVER_INVALID_STATE;
+  if (result == KU_TASK_DRIVER_OK
+      && ((capacity < 64u && (additional_expected_mask >> capacity))
+          || !ku_task_driver_external_storage(driver, receipts, bytes,
+                                              KU_TASK_FRAME_ALIGNOF(KuTaskDriverCleanupReceiptV1))
+          || ku_task_frame_ranges_overlap(token, sizeof(*token), receipts, bytes)
+          || ku_task_frame_ranges_overlap(parent_ticket, sizeof(*parent_ticket), receipts, bytes)
+          || ku_task_frame_ranges_overlap(effective_deadline, sizeof(*effective_deadline), receipts, bytes)
+          || ku_task_frame_ranges_overlap(token, sizeof(*token), parent->driver_lease.control, sizeof(KuTaskControlV1))
+          || ku_task_frame_ranges_overlap(receipts, bytes, parent->driver_lease.control, sizeof(KuTaskControlV1))
+          || ku_task_frame_ranges_overlap(effective_deadline, sizeof(*effective_deadline),
+                                          parent->driver_lease.control, sizeof(KuTaskControlV1))
+          || ku_task_frame_ranges_overlap(parent_ticket, sizeof(*parent_ticket),
+                                          parent->driver_lease.control, sizeof(KuTaskControlV1))))
+    result = KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (result == KU_TASK_DRIVER_OK
+      && (token->driver != driver || token->parent_slot != parent_ticket->slot
+          || token->parent_generation != parent_ticket->generation || !token->epoch
+          || token->epoch != parent->scope_session_epoch || token->scope_id != parent->scope_session_id))
+    result = KU_TASK_DRIVER_STALE;
+  if (result == KU_TASK_DRIVER_OK)
+    result = ku_task_driver_scope_manifest_locked(parent_ticket, parent);
+  if (result == KU_TASK_DRIVER_OK) {
+    uint64_t added = additional_expected_mask & ~parent->scope_expected_mask;
+    for (size_t i = 0; i < capacity; i++) {
+      if ((added & ((uint64_t)1u << i)) && !ku_task_driver_scope_receipt_empty(&receipts[i])) {
+        result = KU_TASK_DRIVER_INVALID_STATE; break;
+      }
+    }
+  }
+  if (result == KU_TASK_DRIVER_OK) {
+    KuTaskControlV1* control = parent->driver_lease.control;
+    size_t phase = ku_task_control_atomic_load(&control->phase);
+    if (phase != KU_TASK_CONTROL_LIVE && !ku_task_control_is_requested(phase)
+        && !ku_task_control_is_publishing(phase)) result = KU_TASK_DRIVER_INVALID_STATE;
+    else {
+      uint64_t deadline = ku_task_driver_min(parent->scope_wait_deadline, requested_deadline);
+      deadline = ku_task_driver_min(deadline, parent->cancel_deadline);
+      if (driver->closing) deadline = ku_task_driver_min(deadline, driver->shutdown_deadline);
+      if (ku_task_control_is_requested(phase))
+        deadline = ku_task_driver_min(deadline, ku_task_control_cleanup_deadline(control));
+      /* No fallible work follows. A concurrent publication/shorter request
+       * must be observed by a later wrapper/adapter deadline-min update.
+       * Preserve fired/failure, old wait links/epochs and cancellation winner.
+       * Neither sticky driver fault nor scope failure hides outer ownership. */
+      parent->scope_expected_mask |= additional_expected_mask;
+      parent->scope_session_final = 1;
+      parent->scope_wait_deadline = deadline;
+      *effective_deadline = deadline;
+      ku_task_driver_arm_deadline(driver, parent);
+    }
   }
   ku_task_driver_unlock(driver);
   return result;
@@ -724,30 +861,12 @@ static uint32_t ku_task_driver_scope_end(
           || token->parent_generation != parent_ticket->generation || !token->epoch
           || token->epoch != parent->scope_session_epoch || token->scope_id != parent->scope_session_id))
     result = KU_TASK_DRIVER_STALE;
-  if (result == KU_TASK_DRIVER_OK && parent->wait_state != KU_TASK_DRIVER_WAIT_EMPTY)
+  if (result == KU_TASK_DRIVER_OK
+      && (parent->scope_session_active != 1u || parent->scope_session_final
+          || parent->wait_state != KU_TASK_DRIVER_WAIT_EMPTY))
     result = KU_TASK_DRIVER_INVALID_STATE;
-  /* Validate the WHOLE registered collection before consulting phase/time.
-   * Exact duplicate IDs are not two children. Bounded at 64*63/2 comparisons.
-   * Old ACKed generations of the parent's reused slot are not current self. */
-  if (result == KU_TASK_DRIVER_OK) {
-    for (size_t i = 0; i < capacity && result == KU_TASK_DRIVER_OK; i++) {
-      if (!(parent->scope_expected_mask & ((uint64_t)1u << i))) continue;
-      const KuTaskDriverCleanupReceiptV1* receipt = &receipts[i];
-      if (ku_task_driver_scope_receipt_empty(receipt)) continue;
-      if (receipt->driver != driver || receipt->abi_version != KU_TASK_DRIVER_ABI_VERSION
-          || !receipt->generation || receipt->slot >= driver->capacity
-          || (receipt->slot == parent_ticket->slot && receipt->generation == parent_ticket->generation)) {
-        result = KU_TASK_DRIVER_INVALID_ARGUMENT; break;
-      }
-      for (size_t j = 0; j < i; j++) {
-        if ((parent->scope_expected_mask & ((uint64_t)1u << j))
-            && receipts[j].driver == receipt->driver && receipts[j].slot == receipt->slot
-            && receipts[j].generation == receipt->generation) {
-          result = KU_TASK_DRIVER_INVALID_ARGUMENT; break;
-        }
-      }
-    }
-  }
+  if (result == KU_TASK_DRIVER_OK)
+    result = ku_task_driver_scope_manifest_locked(parent_ticket, parent);
   int pending = 0;
   if (result == KU_TASK_DRIVER_OK) {
     for (size_t i = 0; i < capacity; i++) {
@@ -1463,7 +1582,7 @@ static uint32_t ku_task_driver_return_slot(KuTaskDriverV1* driver, KuTaskDriverS
    * control; physical disposal must already have logical ACK for this exact
    * generation. Neither operation may carry a wait link into another task. */
   int building = slot->state == KU_TASK_DRIVER_BUILDING;
-  if (slot->cleanup_fault || slot->scope_session_active || slot->scope_receipts
+  if (slot->cleanup_fault || slot->scope_session_active || slot->scope_session_final || slot->scope_receipts
       || slot->scope_receipt_capacity || slot->scope_expected_mask
       || slot->wait_state != KU_TASK_DRIVER_WAIT_EMPTY || slot->waiter_epoch
       || slot->cleanup_acked_generation > slot->generation || !slot->generation

@@ -236,10 +236,11 @@ typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 
 
 ### R3 内部单 worker driver
 
-`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v5。
+`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v6。
 R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 等待类型和独立期限
-升为版本 4，R5h 正常作用域登记字段升为版本 5；内部 C 类型名中的 `V1` 不是旧布局兼容承诺，
-初始化明确拒绝旧版本。当前 Frame ABI 2、Control ABI 1、Driver ABI 5。
+升为版本 4，R5h 正常作用域登记字段升为版本 5，单向 FINAL 标记升为版本 6；
+内部 C 类型名中的 `V1` 不是旧布局兼容承诺，初始化明确拒绝旧版本（包括5）。
+当前 Frame ABI 2、Control ABI 1、Driver ABI 6。
 普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
 以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
 有限源码 TaskStart/Await 已复用它，但它不是 M:N、netpoll 或事件驱动 HTTP。
@@ -415,7 +416,7 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 源码与两种 CLI native 构建的定向执行已经通过；本轮表达式/清理定向测试与 Rust
 quality 通过，本轮 native 全集和质量检查通过，workspace 的文档失败与修复证据单列；精确新提交三系统 CI/sanitizer 仍待核实。
 历史失败及修复结果分开记录于工作日志，不从旧 SHA 的通过结果外推。
-Frame ABI 2、Control ABI 1、Driver ABI 5 不等于稳定外部 C FFI。
+Frame ABI 2、Control ABI 1、Driver ABI 6 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
 
 ### R5h 内部正常作用域 session（尚未接入源码）
@@ -437,10 +438,32 @@ manifest 是借用的稳定 instance 存储；完整集合、生命周期、唯�
 来源是受信 raw C 调用合同，不是恶意指针认证。timer/notify/shutdown/terminal 不读
 该存储；terminal 在释放 registry/执行租约前只注销元数据，不代表替调用方清完子树。
 父 D 缩短不扫描 manifest，未来 adapter 须对 pending issued child 调用 cancel_receipt；
-取消后向最终退出提升、外层 child 合并、对应 TaskOp/verifier/源码 if/loop/finally
-尚未实现。当前仅 driver 原语，不改变前述源码拒绝边界，不代表完整 async 或 M:N。
+取消后向最终退出提升、外层 child 合并目前仅有下述 driver 原语，typed adapter
+接入、对应 TaskOp/verifier/源码 if/loop/finally 尚未实现。不改变前述源码拒绝边界，
+不代表完整 async 或 M:N。
 容量和重复检查最多64项/2016次比较，无新增堆分配、队列或 RC 边；测试与精确提交
 验收结果见工作日志，不从接口存在推断真实 C 或 sanitizer 已通过。
+
+`ku_task_driver_scope_promote_final` 在同一真实 RUNNING executor 上，把活动正常
+session 单向提升为 FINAL。复用原 token/span/capacity/id/epoch，只 OR 完整 expected
+集合，不用会清位的 pending mask 替换它；旧 ACK 和未签发项均保留。新增 expected
+项必须在 owner 移交前登记且为空。有效 D 只取旧 scope、请求、slot cancel、已发布
+control 和 closing shutdown 期限的最小值；不读新时钟、不续期、不清 fired/failure。
+重复提升只扩集合/收紧 D。FINAL 即使父仍 LIVE、全部 ACK，也不能 normal end 清预算；
+只有原终态路径注销元数据，实际子任务清理责任仍由 adapter 履行。
+
+该内部命令接受 LIVE、requested 和 PUBLISHING，不改取消首赢家。LIVE 必须由可信
+typed 整函数退出见证授权，不能用它代替普通 Continue；此见证和 Value 清理桥接
+尚未实现，raw driver 不能认证一条源语句确实已 return/fail。PUBLISHING 不读尚未
+发布的 control D；若此前已有 scope failure，现有 wrapper 会跳过 scope 期限刷新，
+后续 adapter 仍须重新取最小 D 并显式传播给 pending child，不能宣称已自动闭环。
+
+promotion 的 OK 仅表示元数据登记成功，不表示清理成功或 Task 完成。已有 scope
+timeout/global fault 不单独阻断安全的 outer 登记，失败仍保持；损坏 binding、
+parent cleanup_fault、非法 manifest/token/alias 仍拒绝，输出与原对象不变。
+保留旧 outgoing ACK wait 和 incoming ancestor 关系，不新增分配、RC、队列、
+唤醒、等待或重试。生成 adapter 必须先移交全部 Task，再清理其余 Value；正常
+scope 超时、业务 return/Err 穿作用域及 async finally 的源码闭环仍未完成。
 
 ### R5e checked Copy 表达式
 

@@ -1,4 +1,5 @@
-//! Driver-only bounded normal-scope sessions. No source if/loop lowering.
+//! Driver-only bounded normal/final scope sessions. No source if/loop lowering.
+//! Promotion OK is metadata, not a typed/source exit or cleanup completion proof.
 #[path = "support/native_allocation_harness.rs"]
 mod native_allocation_harness;
 #[allow(dead_code)]
@@ -79,9 +80,11 @@ fn native_task_scope_sessions_complete_manifest_and_linearization_execute_in_c()
         assert!(!generated.contains(forbidden));
     }
     for required in [
-        "#define KU_TASK_DRIVER_ABI_VERSION 5u",
+        "#define KU_TASK_DRIVER_ABI_VERSION 6u",
         "ku_task_driver_scope_begin(",
         "ku_task_driver_scope_end(",
+        "ku_task_driver_scope_promote_final(",
+        "scope_session_final",
         "scope_expected_mask",
         "scope_session_epoch",
     ] {
@@ -111,6 +114,15 @@ fn native_task_scope_sessions_complete_manifest_and_linearization_execute_in_c()
     let source = replace_once(source, "  slot->cleanup_acked_generation = slot->generation;\n  return KU_TASK_DRIVER_CLEANUP_ACK;", "  slot->cleanup_acked_generation = slot->generation;\n  fixture_ack(slot->driver_lease.control);\n  return KU_TASK_DRIVER_CLEANUP_ACK;");
     let source = replace_once(source, "static void ku_task_0_dispose(KuTaskControlV1* control, void* raw) {", "static void ku_task_0_dispose(KuTaskControlV1* control, void* raw) {\n  void* witness=fixture_before_dispose(raw);");
     let source = replace_once(source, "    ku_task_adapter_fault(ticket.driver, 0);\n}\nstatic const KuTaskControlOpsV1 ku_task_0_ops", "    ku_task_adapter_fault(ticket.driver, 0);\n  fixture_disposed(witness);\n}\nstatic const KuTaskControlOpsV1 ku_task_0_ops");
+    // Count actual atomic budget loads, without substituting their values.
+    // Both platform definitions stay instrumented; only the compiled one runs.
+    let budget_load =
+        "static uint64_t ku_task_control_deadline_load(KuTaskControlDeadlineV1* value) {";
+    assert_eq!(source.matches(budget_load).count(), 2);
+    let source = source.replace(
+        budget_load,
+        &format!("{budget_load}\n  fixture_promotion_budget_load(value);"),
+    );
     let source = replace_once(source, "      ku_task_control_deadline_store(&control->cleanup_deadline_ms, absolute_deadline_ms);", "      fixture_publishing(control);\n      ku_task_control_deadline_store(&control->cleanup_deadline_ms, absolute_deadline_ms);");
     let source = replace_once(source, "    size_t close_phase = ku_task_control_atomic_load(&parent->driver_lease.control->phase);", "    fixture_close_before(parent->driver_lease.control);\n    size_t close_phase = ku_task_control_atomic_load(&parent->driver_lease.control->phase);\n    fixture_close_after(parent->driver_lease.control);");
     let mut source = replace_once(
@@ -192,6 +204,7 @@ static void fixture_disposed(void*);
 static void fixture_publishing(void*);
 static void fixture_close_before(void*);
 static void fixture_close_after(void*);
+static void fixture_promotion_budget_load(const volatile void*);
 "#;
 
 const CLOCK_HOOK: &str = r#"
@@ -217,7 +230,9 @@ const C_MAIN: &str = r#"
 #define ROLE_COUNT 6u
 #define COMMAND_COUNT 32u
 enum { OP_BEGIN, OP_END, OP_TRANSFER, OP_ARM, OP_DETACH, OP_HEADERS, OP_TOKEN_ERRORS,
-       OP_ACTIVE_ERRORS, OP_BAD_MANIFEST, OP_LEGACY_ARM, OP_EPOCH, OP_REJECTED_BEGIN };
+       OP_ACTIVE_ERRORS, OP_BAD_MANIFEST, OP_LEGACY_ARM, OP_EPOCH, OP_REJECTED_BEGIN,
+       OP_PROMOTE, OP_PROMOTE_ERRORS, OP_PROMOTE_NONEMPTY,
+       OP_PROMOTE_PUBLISHING, OP_PROMOTE_PUBLISHED };
 typedef struct FixtureDriver { KuTaskDriverV1* driver; KuTaskDriverSlotV1* slots; size_t* ring; size_t capacity; } FixtureDriver;
 typedef struct FixtureCommand {
   unsigned op; size_t index, child, capacity; uint64_t mask, deadline, id; uint32_t expected;
@@ -232,9 +247,20 @@ typedef struct FixtureRole {
   KuAtomicRefcount resumes, cleanups, frame_drops, acks, disposes;
   size_t submitted, finished;
   uint32_t last_status, last_reason;
+  uint64_t promoted_deadline;
   int initialized, cleanup_hold, close_gate, publishing_gate;
 } FixtureRole;
 static FixtureRole roles[ROLE_COUNT];
+static KU_THREAD_LOCAL unsigned fixture_promotion_budget_probe,fixture_promotion_budget_reads;
+static KU_THREAD_LOCAL const volatile void* fixture_promotion_budget_address;
+static void fixture_promotion_budget_load(const volatile void* raw) {
+  /* Only this executor and only the actual helper call are observed. Its
+   * before/after fixture diagnostics and the publisher thread are excluded. */
+  if (fixture_promotion_budget_probe) {
+    CHECK(raw==fixture_promotion_budget_address);
+    CHECK(fixture_promotion_budget_reads<1u); fixture_promotion_budget_reads++;
+  }
+}
 static size_t fixture_count(KuAtomicRefcount* value) { return ku_task_control_atomic_load(value); }
 static void fixture_inc(KuAtomicRefcount* value) { ku_task_control_atomic_store(value,fixture_count(value)+1u); }
 static FixtureRole* fixture_role(void* raw) {
@@ -276,14 +302,14 @@ static void fixture_init(FixtureDriver* runtime,size_t capacity) {
   runtime->ring=(size_t*)calloc(capacity,sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
   size_t fixed=sizeof(*runtime->driver)+capacity*(sizeof(*runtime->slots)+sizeof(*runtime->ring));
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==5u && KU_TASK_FRAME_ABI_VERSION==2u);
-  for (uint32_t old=1;old<5;old++) {
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==6u && KU_TASK_FRAME_ABI_VERSION==2u);
+  for (uint32_t old=1;old<6;old++) {
     CHECK(ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),old,runtime->slots,capacity,runtime->ring,capacity,fixed+1048576u)==KU_TASK_DRIVER_ABI_MISMATCH);
     CHECK(ku_task_frame_zero_bytes(runtime->driver,sizeof(*runtime->driver)));
     CHECK(ku_task_frame_zero_bytes(runtime->slots,capacity*sizeof(*runtime->slots)));
     CHECK(ku_task_frame_zero_bytes(runtime->ring,capacity*sizeof(*runtime->ring)));
   }
-  CHECK(!ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),5u,runtime->slots,capacity,runtime->ring,capacity,fixed+1048576u));
+  CHECK(!ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),6u,runtime->slots,capacity,runtime->ring,capacity,fixed+1048576u));
   fixture_idle(runtime);
 }
 static void fixture_start(FixtureDriver* runtime,size_t i) {
@@ -442,7 +468,7 @@ static void fixture_action(FixtureRole* r,KuTaskInstance_0* instance,const Fixtu
       if (!status) {
         CHECK(p->scope_receipts==r->manifest && p->scope_receipt_capacity==c->capacity);
         CHECK(p->scope_expected_mask==c->mask && p->scope_wait_deadline==c->deadline);
-        CHECK(p->scope_session_active && p->scope_wait_started);
+        CHECK(p->scope_session_active && !p->scope_session_final && p->scope_wait_started);
       }
       break;
     }
@@ -534,6 +560,9 @@ static void fixture_action(FixtureRole* r,KuTaskInstance_0* instance,const Fixtu
       CHECK(old.epoch && (old.epoch!=previous.epoch || old.parent_generation!=previous.parent_generation));
       CHECK(ku_task_driver_scope_end(&instance->ticket,&old)==KU_TASK_DRIVER_STALE);
       CHECK(fixture_token_equal(&old,&r->old_scope));
+      uint64_t output=123u;
+      CHECK(ku_task_driver_scope_promote_final(&instance->ticket,&old,0,deadline,&output)==KU_TASK_DRIVER_STALE);
+      CHECK(output==123u);
       bad.scope_id++;
       CHECK(ku_task_driver_scope_end(&instance->ticket,&bad)==KU_TASK_DRIVER_STALE);
       bad=r->scope; bad.parent_generation++;
@@ -575,6 +604,110 @@ static void fixture_action(FixtureRole* r,KuTaskInstance_0* instance,const Fixtu
       status=ku_task_driver_scope_begin(&instance->ticket,0,r->manifest,1,0,c->deadline,&r->scope);
       CHECK(!r->scope.driver && !p->scope_session_active && !p->scope_receipts);
       CHECK(p->scope_session_epoch==UINT64_MAX && p->scope_wait_deadline==UINT64_MAX); break;
+    }
+    case OP_PROMOTE:
+    case OP_PROMOTE_PUBLISHING:
+    case OP_PROMOTE_PUBLISHED:
+    case OP_PROMOTE_NONEMPTY: {
+      if (c->op==OP_PROMOTE_PUBLISHING) {
+        /* R2 already admitted this real callback while LIVE. Only now can
+         * another thread reserve PUBLISHING without preventing callback entry. */
+        CHECK(ku_test_event_set(&r->close_entered));
+        CHECK(ku_test_event_wait(&r->close_proceed,2000u));
+        CHECK(ku_task_control_is_publishing(ku_task_control_atomic_load(&instance->control.phase)));
+      } else if (c->op==OP_PROMOTE_PUBLISHED) {
+        CHECK(ku_task_control_is_requested(ku_task_control_atomic_load(&instance->control.phase)));
+      }
+      if (c->op==OP_PROMOTE_NONEMPTY) {
+        /* An explicitly invalid added entry, written once and never repaired.
+         * Its receipt is genuine; promotion must refuse the late registration. */
+        CHECK(c->index<64u && roles[c->child].receipt.driver);
+        CHECK(!(p->scope_expected_mask & (UINT64_C(1)<<c->index)));
+        r->manifest[c->index]=roles[c->child].receipt;
+      }
+      KuTaskDriverScopeTokenV1 token=r->scope;
+      KuTaskDriverWaitTokenV1 wait=r->wait;
+      uint8_t manifest[sizeof(r->manifest)]; memcpy(manifest,r->manifest,sizeof(manifest));
+      const KuTaskDriverCleanupReceiptV1* span=p->scope_receipts;
+      uint64_t mask=p->scope_expected_mask,deadline=p->scope_wait_deadline,epoch=p->scope_session_epoch;
+      uint64_t wait_epoch=p->wait_epoch,incoming=p->waiter_epoch,incoming_generation=p->waiter_parent_generation;
+      size_t incoming_slot=p->waiter_parent_slot,capacity=p->scope_receipt_capacity;
+      uint32_t final=p->scope_session_final,fired=p->scope_deadline_fired,failure=p->scope_wait_failure;
+      uint32_t wait_state=p->wait_state,wait_kind=p->wait_kind,wait_outcome=p->wait_outcome;
+      uint32_t fault=d->fault,closing=d->closing,clock_fault=d->clock_fault,cancel_pending=p->cancel_pending;
+      uint64_t cancel_deadline=p->cancel_deadline,control_deadline=ku_task_control_cleanup_deadline(&instance->control);
+      size_t phase=ku_task_control_atomic_load(&instance->control.phase),queued=d->queued;
+      size_t charged=p->charged_bytes,reserved=d->reserved_bytes,resident=d->resident;
+      uint64_t output=UINT64_C(0x55aa12345678abcd);
+      /* Promotion must not query a fresh clock. This is this worker's TLS
+       * injection only, restored before any subsequent driver operation. */
+      fixture_promotion_budget_reads=0;
+      fixture_promotion_budget_address=&instance->control.cleanup_deadline_ms;
+      fixture_promotion_budget_probe=c->op==OP_PROMOTE_PUBLISHING || c->op==OP_PROMOTE_PUBLISHED;
+      fixture_failed_clock_reads=0; fixture_fail_clock=1;
+      status=ku_task_driver_scope_promote_final(&instance->ticket,&r->scope,c->mask,c->deadline,&output);
+      fixture_fail_clock=0; fixture_promotion_budget_probe=0; fixture_promotion_budget_address=NULL;
+      CHECK(!fixture_failed_clock_reads);
+      if (c->op==OP_PROMOTE_PUBLISHING) CHECK(!fixture_promotion_budget_reads);
+      if (c->op==OP_PROMOTE_PUBLISHED) CHECK(fixture_promotion_budget_reads==1u);
+      CHECK(fixture_token_equal(&r->scope,&token));
+      CHECK(!memcmp(manifest,r->manifest,sizeof(manifest)) && p->scope_receipts==span);
+      CHECK(p->scope_session_active==1u && p->scope_session_id==token.scope_id
+          && p->scope_receipt_capacity==capacity && p->scope_session_epoch==epoch);
+      CHECK(r->wait.driver==wait.driver && r->wait.parent_slot==wait.parent_slot
+          && r->wait.parent_generation==wait.parent_generation && r->wait.epoch==wait.epoch);
+      CHECK(p->wait_epoch==wait_epoch && p->waiter_epoch==incoming
+          && p->waiter_parent_slot==incoming_slot && p->waiter_parent_generation==incoming_generation);
+      CHECK(p->wait_state==wait_state && p->wait_kind==wait_kind && p->wait_outcome==wait_outcome);
+      CHECK(p->scope_deadline_fired==fired && p->scope_wait_failure==failure);
+      CHECK(d->fault==fault && d->closing==closing && d->clock_fault==clock_fault && d->queued==queued);
+      CHECK(p->charged_bytes==charged && d->reserved_bytes==reserved && d->resident==resident);
+      CHECK(p->cancel_pending==cancel_pending && p->cancel_deadline==cancel_deadline);
+      CHECK(ku_task_control_atomic_load(&instance->control.phase)==phase
+          && ku_task_control_cleanup_deadline(&instance->control)==control_deadline);
+      if (status==KU_TASK_DRIVER_OK) {
+        CHECK(output==c->id && output<=deadline);
+        CHECK(p->scope_expected_mask==(mask|c->mask) && p->scope_session_final==1u);
+        CHECK(p->scope_wait_deadline==output); r->promoted_deadline=output;
+      } else {
+        CHECK(output==UINT64_C(0x55aa12345678abcd));
+        CHECK(p->scope_expected_mask==mask && p->scope_session_final==final && p->scope_wait_deadline==deadline);
+      }
+      break;
+    }
+    case OP_PROMOTE_ERRORS: {
+      KuTaskDriverScopeTokenV1 token=r->scope,bad=r->scope;
+      KuTaskDriverTicketV1 stale=instance->ticket;
+      uint8_t manifest[sizeof(r->manifest)]; memcpy(manifest,r->manifest,sizeof(manifest));
+      uint64_t mask=p->scope_expected_mask,deadline=p->scope_wait_deadline,epoch=p->scope_session_epoch;
+      uint64_t wait_epoch=p->wait_epoch; uint32_t final=p->scope_session_final;
+      size_t charged=p->charged_bytes,reserved=d->reserved_bytes,resident=d->resident;
+      size_t phase=ku_task_control_atomic_load(&instance->control.phase);
+      uint64_t output=UINT64_C(0x55aa12345678abcd);
+      CHECK(p->scope_receipt_capacity<64u);
+      CHECK(ku_task_driver_scope_promote_final(&instance->ticket,&r->scope,0,UINT64_MAX,&output)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+      CHECK(ku_task_driver_scope_promote_final(&instance->ticket,&r->scope,
+          UINT64_C(1)<<p->scope_receipt_capacity,c->deadline,&output)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+      bad.epoch++;
+      CHECK(ku_task_driver_scope_promote_final(&instance->ticket,&bad,0,c->deadline,&output)==KU_TASK_DRIVER_STALE);
+      bad=r->scope; bad.scope_id++;
+      CHECK(ku_task_driver_scope_promote_final(&instance->ticket,&bad,0,c->deadline,&output)==KU_TASK_DRIVER_STALE);
+      stale.generation++;
+      CHECK(ku_task_driver_scope_promote_final(&stale,&r->scope,0,c->deadline,&output)==KU_TASK_DRIVER_STALE);
+      CHECK(ku_task_driver_scope_promote_final(&instance->ticket,(KuTaskDriverScopeTokenV1*)&r->manifest[0],
+          0,c->deadline,&output)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+      CHECK(ku_task_driver_scope_promote_final(&instance->ticket,&r->scope,0,c->deadline,NULL)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+      uint64_t* aliases[]={(uint64_t*)&instance->ticket,(uint64_t*)&r->scope,
+          (uint64_t*)&r->manifest[0],(uint64_t*)&instance->control,(uint64_t*)d,(uint64_t*)d->slots,(uint64_t*)d->ring};
+      for (size_t i=0;i<sizeof(aliases)/sizeof(aliases[0]);i++)
+        CHECK(ku_task_driver_scope_promote_final(&instance->ticket,&r->scope,0,c->deadline,aliases[i])==KU_TASK_DRIVER_INVALID_ARGUMENT);
+      CHECK(output==UINT64_C(0x55aa12345678abcd));
+      CHECK(fixture_token_equal(&r->scope,&token) && !memcmp(manifest,r->manifest,sizeof(manifest)));
+      CHECK(p->scope_expected_mask==mask && p->scope_wait_deadline==deadline && p->scope_session_epoch==epoch);
+      CHECK(p->scope_session_final==final && p->wait_epoch==wait_epoch);
+      CHECK(p->charged_bytes==charged && d->reserved_bytes==reserved && d->resident==resident);
+      CHECK(ku_task_control_atomic_load(&instance->control.phase)==phase);
+      status=KU_TASK_DRIVER_OK; break;
     }
     case OP_BAD_MANIFEST:
       /* Explicit raw-invalid, write-once test inputs, never repaired in-place.
@@ -679,6 +812,8 @@ static void fixture_invalid_manifest(unsigned kind) {
   FixtureCommand bad=fixture_command(OP_BAD_MANIFEST,KU_TASK_DRIVER_INVALID_ARGUMENT);
   bad.index=kind; bad.child=1; bad.deadline=deadline; fixture_do(&rt,0,bad);
   CHECK(roles[0].scope.driver); /* Rejection must not claim normal scope close. */
+  FixtureCommand promotion=fixture_command(OP_PROMOTE,KU_TASK_DRIVER_INVALID_ARGUMENT);
+  promotion.deadline=deadline; fixture_do(&rt,0,promotion);
   fixture_finish(&rt); /* Genuine owner cleanup, not a repair of the invalid manifest. */
 }
 static void fixture_timeout(int unissued) {
@@ -793,11 +928,14 @@ static void fixture_legacy_and_terminal_reuse(void) {
   fixture_clock_begin(); fixture_init(&rt,2); fixture_start(&rt,0); fixture_start(&rt,1);
   deadline=ku_task_driver_now_ms()+60000u;
   fixture_begin(&rt,0,1,0,0,deadline,0);
+  FixtureCommand promotion=fixture_command(OP_PROMOTE,KU_TASK_DRIVER_OK);
+  promotion.deadline=deadline; promotion.id=deadline;
+  fixture_do(&rt,0,promotion);
   KuTaskControlLeaseV1 observer={0}; fixture_retain(&rt,0,&observer);
   fixture_transfer(0,deadline); fixture_idle(&rt); fixture_release(&rt,0);
   CHECK(!ku_task_driver_lock(rt.driver));
   KuTaskDriverSlotV1* old=&rt.slots[roles[0].ticket.slot];
-  CHECK(old->state==KU_TASK_DRIVER_RETIRING && !old->scope_session_active && !old->scope_receipts);
+  CHECK(old->state==KU_TASK_DRIVER_RETIRING && !old->scope_session_active && !old->scope_session_final && !old->scope_receipts);
   CHECK(!old->scope_receipt_capacity && !old->scope_expected_mask && old->scope_session_epoch==1u);
   CHECK(!ku_task_driver_unlock(rt.driver));
   KuTaskDriverScopeTokenV1 token=roles[0].scope;
@@ -807,7 +945,8 @@ static void fixture_legacy_and_terminal_reuse(void) {
   fixture_start(&rt,2);
   CHECK(roles[2].ticket.slot==roles[0].ticket.slot && roles[2].ticket.generation>roles[0].ticket.generation);
   CHECK(!ku_task_driver_lock(rt.driver));
-  CHECK(!rt.slots[roles[2].ticket.slot].scope_session_epoch && !rt.slots[roles[2].ticket.slot].scope_receipts);
+  CHECK(!rt.slots[roles[2].ticket.slot].scope_session_epoch && !rt.slots[roles[2].ticket.slot].scope_session_final
+      && !rt.slots[roles[2].ticket.slot].scope_receipts);
   roles[2].old_scope=roles[0].scope; CHECK(!ku_task_driver_unlock(rt.driver));
   fixture_begin(&rt,2,1,0,0,deadline,0);
   fixture_do(&rt,2,fixture_command(OP_TOKEN_ERRORS,0)); fixture_end(&rt,2,0);
@@ -863,7 +1002,7 @@ static void fixture_rejected_finish(FixtureDriver* runtime,int faulted) {
   CHECK(!snapshot.resident && !snapshot.building && !snapshot.reserved_bytes
       && !snapshot.parked && !snapshot.retiring && !snapshot.terminal_held);
   for (size_t i=0;i<runtime->capacity;i++) {
-    CHECK(!runtime->slots[i].scope_session_active && !runtime->slots[i].scope_receipts
+    CHECK(!runtime->slots[i].scope_session_active && !runtime->slots[i].scope_session_final && !runtime->slots[i].scope_receipts
         && !runtime->slots[i].scope_receipt_capacity && !runtime->slots[i].scope_expected_mask);
   }
   uint64_t deadline=fixture_original_now()+2000u;
@@ -937,6 +1076,223 @@ static void fixture_fault_or_closing_session(int faulted) {
    * no control pin, logical ACK, or sticky error is patched to force success. */
   fixture_rejected_finish(&rt,faulted);
 }
+/* Promotion cases exercise only the raw driver primitive with genuine tasks.
+ * The fixture explicitly provides a trusted whole-function-exit intent. It
+ * does not prove typed return/fail selection, adapter promotion, or source if. */
+static void fixture_promote(FixtureDriver* runtime,size_t parent,uint64_t additional,
+    uint64_t requested,uint64_t effective,uint32_t expected) {
+  FixtureCommand c=fixture_command(OP_PROMOTE,expected);
+  c.mask=additional; c.deadline=requested; c.id=effective; fixture_do(runtime,parent,c);
+}
+static void fixture_promoted_child_budget(FixtureDriver* runtime,size_t child,uint64_t deadline) {
+  CHECK(!ku_task_driver_lock(runtime->driver));
+  KuTaskDriverSlotV1* slot=&runtime->slots[roles[child].ticket.slot];
+  CHECK(slot->generation==roles[child].ticket.generation && slot->driver_lease.control);
+  CHECK(ku_task_control_atomic_load(&slot->driver_lease.control->phase)==KU_TASK_CONTROL_REQUESTED_CANCEL);
+  CHECK(ku_task_control_cleanup_deadline(slot->driver_lease.control)==deadline);
+  CHECK(!ku_task_driver_unlock(runtime->driver));
+}
+static void fixture_promotion_inner_outer(void) {
+  fixture_clock_begin(); FixtureDriver rt; fixture_init(&rt,4);
+  for (size_t i=0;i<4u;i++) fixture_start(&rt,i);
+  uint64_t original=ku_task_driver_now_ms()+60000u,shorter=original-10000u;
+  fixture_begin(&rt,0,2,1,401u,original,KU_TASK_DRIVER_OK);
+  uint64_t output=123u;
+  CHECK(ku_task_driver_scope_promote_final(&roles[0].ticket,&roles[0].scope,2,shorter,&output)==KU_TASK_DRIVER_INVALID_STATE);
+  CHECK(output==123u); /* Public header validation cannot grant a parked executor. */
+  FixtureCommand errors=fixture_command(OP_PROMOTE_ERRORS,KU_TASK_DRIVER_OK);
+  errors.deadline=original; fixture_do(&rt,0,errors);
+  fixture_issue(&rt,0,0,1,original); fixture_arm(&rt,0,0,original,KU_TASK_DRIVER_PENDING);
+  CHECK(!ku_task_driver_request_cancel(&roles[0].ticket,&roles[0].handle.owner.lease,
+      KU_TASK_CONTROL_TIMED_OUT,shorter)); fixture_idle(&rt);
+  fixture_transfer(0,shorter); fixture_idle(&rt);
+  FixtureCommand ancestor=fixture_command(OP_LEGACY_ARM,KU_TASK_DRIVER_PENDING);
+  ancestor.child=0; ancestor.deadline=shorter; fixture_do(&rt,3,ancestor);
+  CHECK(!ku_task_driver_lock(rt.driver));
+  CHECK(rt.slots[roles[0].ticket.slot].waiter_epoch);
+  CHECK(rt.slots[roles[0].ticket.slot].wait_state==KU_TASK_DRIVER_WAIT_ARMED);
+  CHECK(!ku_task_driver_unlock(rt.driver));
+  fixture_promote(&rt,0,2,original+10000u,shorter,KU_TASK_DRIVER_OK);
+  fixture_end(&rt,0,KU_TASK_DRIVER_INVALID_STATE);
+  fixture_promoted_child_budget(&rt,1,original);
+  /* Registration alone does not broadcast a child deadline or create an owner. */
+  fixture_live(2);
+  CHECK(!ku_task_driver_cancel_receipt(&roles[0].manifest[0],shorter)); fixture_idle(&rt);
+  fixture_issue(&rt,0,1,2,shorter); fixture_promoted_child_budget(&rt,1,shorter);
+  fixture_promoted_child_budget(&rt,2,shorter);
+  fixture_promote(&rt,0,2,original+20000u,shorter,KU_TASK_DRIVER_OK);
+  CHECK(roles[0].last_reason==KU_TASK_CONTROL_TIMED_OUT);
+  fixture_stable(&rt);
+  fixture_release(&rt,1);
+  CHECK(fixture_wait(0).outcome==KU_TASK_DRIVER_CLEANUP_ACK);
+  CHECK(ku_task_driver_cleanup_receipt_read(&roles[0].manifest[1])==KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_driver_cleanup_receipt_read(&roles[0].receipt)==KU_TASK_DRIVER_PENDING);
+  fixture_detach(&rt,0); fixture_arm(&rt,0,1,shorter,KU_TASK_DRIVER_PENDING);
+  fixture_release(&rt,2); fixture_detach(&rt,0);
+  fixture_end(&rt,0,KU_TASK_DRIVER_INVALID_STATE); /* FINAL stays FINAL after every ACK. */
+  fixture_release(&rt,0);
+  CHECK(fixture_wait(3).outcome==KU_TASK_DRIVER_CLEANUP_ACK);
+  fixture_detach(&rt,3); fixture_finish(&rt);
+}
+static void fixture_promotion_live_union(void) {
+  fixture_clock_begin(); FixtureDriver rt; fixture_init(&rt,4);
+  for (size_t i=0;i<4u;i++) fixture_start(&rt,i);
+  uint64_t original=ku_task_driver_now_ms()+60000u,shorter=original-10000u;
+  fixture_begin(&rt,0,64,3,402u,original,KU_TASK_DRIVER_OK);
+  fixture_issue(&rt,0,0,1,original); fixture_arm(&rt,0,0,original,KU_TASK_DRIVER_PENDING);
+  fixture_release(&rt,1); fixture_detach(&rt,0);
+  /* Bit 0 is already ACKed, bit 1 is declared but still unissued. Neither may
+   * disappear when bit 63 is added, even though only pending entries need waits. */
+  fixture_promote(&rt,0,UINT64_C(1)<<63,original+10000u,original,KU_TASK_DRIVER_OK);
+  fixture_live(0);
+  fixture_promote(&rt,0,UINT64_C(1)<<63,original+20000u,original,KU_TASK_DRIVER_OK);
+  fixture_promote(&rt,0,0,shorter,shorter,KU_TASK_DRIVER_OK);
+  CHECK(!ku_task_driver_lock(rt.driver));
+  CHECK(rt.slots[roles[0].ticket.slot].scope_expected_mask==(3u|(UINT64_C(1)<<63)));
+  CHECK(ku_task_driver_scope_receipt_empty(&roles[0].manifest[1]));
+  CHECK(!ku_task_driver_unlock(rt.driver));
+  fixture_end(&rt,0,KU_TASK_DRIVER_INVALID_STATE);
+  fixture_issue(&rt,0,1,2,shorter); fixture_issue(&rt,0,63,3,shorter);
+  fixture_arm(&rt,0,1,shorter,KU_TASK_DRIVER_PENDING); fixture_release(&rt,2); fixture_detach(&rt,0);
+  CHECK(ku_task_driver_cleanup_receipt_read(&roles[0].manifest[63])==KU_TASK_DRIVER_PENDING);
+  fixture_arm(&rt,0,63,shorter,KU_TASK_DRIVER_PENDING); fixture_release(&rt,3); fixture_detach(&rt,0);
+  fixture_end(&rt,0,KU_TASK_DRIVER_INVALID_STATE); fixture_live(0); fixture_finish(&rt);
+}
+static void fixture_promotion_nonempty_added(void) {
+  fixture_clock_begin(); FixtureDriver rt; fixture_init(&rt,3);
+  for (size_t i=0;i<3u;i++) fixture_start(&rt,i);
+  uint64_t deadline=ku_task_driver_now_ms()+60000u;
+  fixture_begin(&rt,0,2,1,403u,deadline,KU_TASK_DRIVER_OK);
+  fixture_issue(&rt,0,0,1,deadline); fixture_release(&rt,1);
+  fixture_transfer(2,deadline); fixture_idle(&rt); fixture_release(&rt,2);
+  FixtureCommand c=fixture_command(OP_PROMOTE_NONEMPTY,KU_TASK_DRIVER_INVALID_STATE);
+  c.child=2; c.index=1; c.mask=2; c.deadline=deadline; fixture_do(&rt,0,c);
+  CHECK(!ku_task_driver_lock(rt.driver));
+  CHECK(!rt.slots[roles[0].ticket.slot].scope_session_final
+      && rt.slots[roles[0].ticket.slot].scope_expected_mask==1u);
+  CHECK(!ku_task_driver_unlock(rt.driver));
+  /* Invalid added entry remains unchanged until genuine terminal unregister;
+   * no second attempt repairs it and pretends this was a valid transfer batch. */
+  fixture_finish(&rt);
+}
+static void fixture_promotion_after_scope_timeout(void) {
+  fixture_clock_begin(); FixtureDriver rt; fixture_init(&rt,3);
+  for (size_t i=0;i<3u;i++) fixture_start(&rt,i);
+  uint64_t deadline=ku_task_driver_now_ms()+60000u;
+  fixture_begin(&rt,0,2,1,404u,deadline,KU_TASK_DRIVER_OK);
+  fixture_issue(&rt,0,0,1,deadline); fixture_arm(&rt,0,0,deadline,KU_TASK_DRIVER_PENDING);
+  fixture_advance(&rt,deadline); fixture_idle(&rt);
+  CHECK(fixture_wait(0).outcome==KU_TASK_DRIVER_CLEANUP_TIMEOUT); fixture_live(0);
+  fixture_promote(&rt,0,2,deadline+10000u,deadline,KU_TASK_DRIVER_OK);
+  fixture_issue(&rt,0,1,2,deadline);
+  fixture_promote(&rt,0,0,deadline+20000u,deadline,KU_TASK_DRIVER_OK);
+  fixture_detach(&rt,0);
+  fixture_release(&rt,1); fixture_release(&rt,2);
+  CHECK(!ku_task_driver_lock(rt.driver));
+  CHECK(rt.slots[roles[0].ticket.slot].scope_wait_failure==KU_TASK_DRIVER_CLEANUP_TIMEOUT
+      && rt.slots[roles[0].ticket.slot].scope_deadline_fired);
+  CHECK(!ku_task_driver_unlock(rt.driver));
+  fixture_end(&rt,0,KU_TASK_DRIVER_INVALID_STATE); fixture_live(0);
+  /* Metadata OK did not clear the timeout or publish a successful Task. */
+  fixture_finish(&rt);
+}
+static void fixture_promotion_fault_release(FixtureDriver* runtime,size_t child) {
+  fixture_rejected_idle(runtime,1,0);
+  CHECK(!ku_task_driver_lock(runtime->driver));
+  CHECK(runtime->slots[roles[child].ticket.slot].state!=KU_TASK_DRIVER_RUNNING);
+  roles[child].cleanup_hold=0; CHECK(!ku_task_driver_unlock(runtime->driver));
+  CHECK(!ku_task_driver_wake(&roles[child].ticket));
+  CHECK(ku_test_event_wait(&roles[child].acked,2000u));
+  CHECK(ku_task_driver_cleanup_receipt_read(&roles[child].receipt)==KU_TASK_DRIVER_CLEANUP_ACK);
+  fixture_rejected_idle(runtime,1,0);
+}
+static void fixture_promotion_after_clock_fault(void) {
+  /* A real failed shutdown clock sample selects sticky clock_fault; never
+   * assign fault/phase, restore its flag, or force an ACK to empty accounting. */
+  ku_task_control_deadline_store(&fixture_clock,0);
+  FixtureDriver rt; fixture_init(&rt,3); for (size_t i=0;i<3u;i++) fixture_start(&rt,i);
+  uint64_t original=fixture_original_now()+60000u;
+  fixture_begin(&rt,0,2,1,405u,original,KU_TASK_DRIVER_OK);
+  fixture_issue(&rt,0,0,1,original); fixture_arm(&rt,0,0,original,KU_TASK_DRIVER_PENDING);
+  CHECK(!ku_task_driver_request_cancel(&roles[0].ticket,&roles[0].handle.owner.lease,
+      KU_TASK_CONTROL_TIMED_OUT,original)); fixture_idle(&rt);
+  fixture_failed_clock_reads=0; fixture_fail_clock=1;
+  uint32_t shutdown=ku_task_driver_shutdown(rt.driver,0);
+  fixture_fail_clock=0; CHECK(shutdown==KU_TASK_DRIVER_INTERNAL && fixture_failed_clock_reads==1u);
+  fixture_rejected_idle(&rt,1,0);
+  FixtureCommand c=fixture_command(OP_PROMOTE,KU_TASK_DRIVER_OK);
+  c.mask=2; c.deadline=original; c.id=0;
+  fixture_rejected_do(&rt,0,c,1);
+  CHECK(roles[0].promoted_deadline==0u && roles[0].last_reason==KU_TASK_CONTROL_TIMED_OUT);
+  c=fixture_command(OP_TRANSFER,KU_TASK_DRIVER_OK); c.index=1; c.child=2; c.deadline=0;
+  fixture_rejected_do(&rt,0,c,1);
+  fixture_rejected_do(&rt,0,fixture_command(OP_DETACH,KU_TASK_DRIVER_OK),1);
+  fixture_promotion_fault_release(&rt,1); fixture_promotion_fault_release(&rt,2);
+  fixture_rejected_do(&rt,0,fixture_command(OP_END,KU_TASK_DRIVER_INVALID_STATE),1);
+  CHECK(!ku_task_driver_lock(rt.driver));
+  CHECK(rt.driver->clock_fault && rt.driver->fault==KU_TASK_DRIVER_INTERNAL);
+  CHECK(rt.slots[roles[0].ticket.slot].scope_session_final
+      && rt.slots[roles[0].ticket.slot].scope_wait_deadline==0u);
+  CHECK(!ku_task_driver_unlock(rt.driver));
+  fixture_rejected_finish(&rt,1);
+}
+static void fixture_promotion_publishing(uint32_t reason) {
+  fixture_clock_begin(); FixtureDriver rt; fixture_init(&rt,3);
+  for (size_t i=0;i<3u;i++) fixture_start(&rt,i);
+  uint64_t original=ku_task_driver_now_ms()+60000u,shorter=original-10000u;
+  fixture_begin(&rt,0,2,1,406u,original,KU_TASK_DRIVER_OK);
+  fixture_issue(&rt,0,0,1,original); fixture_arm(&rt,0,0,original,KU_TASK_DRIVER_PENDING);
+  KuTaskControlLeaseV1 observer={0}; fixture_retain(&rt,0,&observer);
+  CHECK(!ku_task_driver_lock(rt.driver));
+  roles[0].publishing_gate=1; CHECK(!ku_task_driver_unlock(rt.driver));
+  size_t resumes=fixture_count(&roles[0].resumes);
+  FixtureCommand command=fixture_command(OP_PROMOTE_PUBLISHING,KU_TASK_DRIVER_OK);
+  command.mask=2; command.deadline=original+10000u; command.id=original;
+  size_t submitted=fixture_submit(&rt,0,command);
+  CHECK(ku_test_event_wait(&roles[0].close_entered,2000u));
+  /* The callback has entered before this genuine external R2 CAS. Otherwise
+   * PUBLISHING could legitimately keep R2 from entering the callback at all. */
+  FixtureCancel cancel={&observer,reason,UINT32_MAX,shorter}; KuTestThread thread;
+  CHECK(ku_test_thread_start(&thread,fixture_cancel_thread,&cancel));
+  CHECK(ku_test_event_wait(&roles[0].publishing,2000u));
+  CHECK(ku_task_control_is_publishing(ku_task_control_atomic_load(&observer.control->phase)));
+  CHECK(ku_test_event_set(&roles[0].close_proceed));
+  /* Success must arrive while the publisher is still held, proving promotion
+   * does not wait for its unpublished D. The helper-scoped atomic-load probe
+   * separately requires zero reads of that unpublished budget. */
+  CHECK(ku_test_event_wait(&roles[0].completed[submitted],2000u));
+  CHECK(roles[0].last_status==KU_TASK_DRIVER_OK && roles[0].promoted_deadline==original);
+  CHECK(ku_task_control_is_publishing(ku_task_control_atomic_load(&observer.control->phase)));
+  CHECK(ku_test_event_set(&roles[0].publish_proceed));
+  CHECK(ku_test_thread_join(&thread,2000u));
+  CHECK(!thread.outcome && cancel.status==KU_TASK_CONTROL_OK);
+  fixture_done(&rt,0,submitted);
+  CHECK(ku_task_control_cleanup_deadline(observer.control)==shorter);
+  uint32_t opposite=reason==KU_TASK_CONTROL_CANCELLED ? KU_TASK_CONTROL_TIMED_OUT : KU_TASK_CONTROL_CANCELLED;
+  CHECK(ku_task_control_request_cancel(&observer,opposite,original+20000u)==KU_TASK_CONTROL_OK);
+  /* Explicitly call promotion again after publication. A real driver wake
+   * reaches requested cleanup, and this call reads the actual published D.
+   * This is not evidence that a missing/faulted wrapper or adapter retries
+   * will automatically deliver a concurrently published shorter budget. */
+  command=fixture_command(OP_PROMOTE_PUBLISHED,KU_TASK_DRIVER_OK);
+  command.mask=2; command.deadline=original+30000u; command.id=shorter;
+  fixture_do(&rt,0,command);
+  CHECK(roles[0].promoted_deadline==shorter && roles[0].last_reason==reason);
+  CHECK(fixture_count(&roles[0].resumes)==resumes+1u);
+  CHECK(ku_task_control_atomic_load(&observer.control->phase)==
+      (reason==KU_TASK_CONTROL_CANCELLED ? KU_TASK_CONTROL_REQUESTED_CANCEL : KU_TASK_CONTROL_REQUESTED_TIMEOUT));
+  CHECK(ku_task_control_cleanup_deadline(observer.control)==shorter);
+  fixture_promoted_child_budget(&rt,1,original); fixture_live(2);
+  CHECK(!ku_task_driver_cancel_receipt(&roles[0].manifest[0],shorter)); fixture_idle(&rt);
+  fixture_issue(&rt,0,1,2,shorter);
+  fixture_promoted_child_budget(&rt,1,shorter); fixture_promoted_child_budget(&rt,2,shorter);
+  fixture_stable(&rt);
+  fixture_release(&rt,1); fixture_detach(&rt,0);
+  fixture_arm(&rt,0,1,shorter,KU_TASK_DRIVER_PENDING);
+  fixture_release(&rt,2); fixture_detach(&rt,0);
+  fixture_end(&rt,0,KU_TASK_DRIVER_INVALID_STATE);
+  CHECK(!ku_task_control_lease_release(&observer)); fixture_finish(&rt);
+}
 int main(void) {
   ku_task_control_deadline_init(&fixture_clock); ku_task_control_deadline_store(&fixture_clock,0);
   fixture_normal_scopes(); fixture_headers_and_high_bit(); fixture_epoch_exhaustion();
@@ -946,6 +1302,11 @@ int main(void) {
   fixture_close_race(0,KU_TASK_CONTROL_TIMED_OUT); fixture_close_race(1,KU_TASK_CONTROL_TIMED_OUT);
   fixture_cancel_tightens_only_explicit_children(); fixture_legacy_and_terminal_reuse();
   fixture_fault_or_closing_session(1); fixture_fault_or_closing_session(0);
+  fixture_promotion_inner_outer(); fixture_promotion_live_union();
+  fixture_promotion_nonempty_added(); fixture_promotion_after_scope_timeout();
+  fixture_promotion_after_clock_fault();
+  fixture_promotion_publishing(KU_TASK_CONTROL_CANCELLED);
+  fixture_promotion_publishing(KU_TASK_CONTROL_TIMED_OUT);
   puts("task-scope-session-v1-ok"); return 0;
 }
 "#;
