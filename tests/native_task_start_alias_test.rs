@@ -260,7 +260,9 @@ static void fixture_reserve_rejections(KuTaskInstance_0* instance) {
     fixture_same(driver,&before,KU_TASK_DRIVER_INTERNAL); fixture_ticket_empty(&output);
     /* The failure is sticky, not repaired. Request the real parent's cleanup
      * after proving no partial admission; the original adapter drops its input. */
-    CHECK(ku_task_driver_cancel_bound(&instance->ticket,KU_TASK_CONTROL_CANCELLED,ku_task_driver_now_ms()+1000u)==KU_TASK_CONTROL_OK);
+    uint64_t cancel_now=ku_task_driver_now_ms();
+    CHECK(cancel_now!=UINT64_MAX && cancel_now<UINT64_MAX-1000u);
+    CHECK(ku_task_driver_cancel_bound(&instance->ticket,KU_TASK_CONTROL_CANCELLED,cancel_now+1000u)==KU_TASK_CONTROL_OK);
   }
 }
 static void fixture_probe(void* raw) {
@@ -338,23 +340,26 @@ static void fixture_init(FixtureRuntime* runtime,size_t capacity) {
   runtime->ring=(size_t*)calloc(capacity,sizeof(*runtime->ring)); CHECK(runtime->driver && runtime->slots && runtime->ring);
   size_t fixed=sizeof(*runtime->driver)+capacity*(sizeof(*runtime->slots)+sizeof(*runtime->ring));
   size_t tasks=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+sizeof(KuTaskInstance_2)+1u;
+  uint64_t startup_now=ku_task_driver_now_ms();
+  CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
+  uint64_t startup_deadline=startup_now+1000u;
+  CHECK(ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),6u,
+      runtime->slots,capacity,runtime->ring,capacity,fixed+tasks,1u,startup_deadline)==KU_TASK_DRIVER_ABI_MISMATCH);
+  CHECK(ku_task_frame_zero_bytes(runtime->driver,sizeof(*runtime->driver))
+      && ku_task_frame_zero_bytes(runtime->slots,(capacity)*sizeof(*runtime->slots))
+      && ku_task_frame_zero_bytes(runtime->ring,(capacity)*sizeof(*runtime->ring)));
   CHECK(ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
-      runtime->slots,capacity,runtime->ring,capacity,fixed+tasks)==KU_TASK_DRIVER_OK);
+      runtime->slots,capacity,runtime->ring,capacity,fixed+tasks,1u,startup_deadline)==KU_TASK_DRIVER_OK);
 }
-static void fixture_finish(FixtureRuntime* runtime,uint32_t fault) {
-  CHECK(ku_task_driver_shutdown(runtime->driver,ku_task_driver_now_ms()+2000u)==fault);
+static void fixture_finish(FixtureRuntime* runtime,uint32_t fault,uint64_t deadline) {
+  CHECK(ku_task_driver_shutdown(runtime->driver,deadline)==fault);
   KuTaskDriverSnapshotV1 snapshot={0};
   CHECK(ku_task_driver_snapshot(runtime->driver,&snapshot)==KU_TASK_DRIVER_OK);
   CHECK(snapshot.fault==fault && !snapshot.resident && !snapshot.reserved_bytes && !snapshot.building && !snapshot.running && !snapshot.queued);
-#if defined(_WIN32)
-  CHECK(WaitForSingleObject(runtime->driver->thread,2000)==WAIT_OBJECT_0);
-#else
-  alarm(2);
-#endif
+  CHECK(ku_task_driver_join(runtime->driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(runtime->driver->worker_target==1u && runtime->driver->workers_created==1u && runtime->driver->workers_exited==1u
+      && runtime->driver->workers_joined==1u && runtime->driver->workers[0].joined && runtime->driver->workers[0].closed);
   CHECK(ku_task_driver_destroy(runtime->driver)==KU_TASK_DRIVER_OK);
-#if !defined(_WIN32)
-  alarm(0);
-#endif
   free(runtime->ring); free(runtime->slots); free(runtime->driver);
 }
 static void fixture_case(int mode) {
@@ -393,9 +398,14 @@ static void fixture_case(int mode) {
     CHECK(ku_task_outcome_empty(&output,4u));
   }
   ku_task_outcome_drop(&output);
-  CHECK(ku_task_value_drop(&parent,deadline)==KU_TASK_DRIVER_OK);
-  CHECK(ku_task_value_drop(&fixture_other_task,deadline)==KU_TASK_DRIVER_OK);
-  fixture_finish(&runtime,fault); fixture_finish(&fixture_other,0);
+  uint64_t cleanup_now=ku_task_driver_now_ms();
+  CHECK(cleanup_now!=UINT64_MAX && cleanup_now<UINT64_MAX-1000u);
+  uint64_t cleanup_deadline=cleanup_now+1000u;
+  if (mode) cleanup_deadline=ku_task_driver_min(cleanup_deadline,
+      ku_task_control_cleanup_deadline(parent.owner.lease.control));
+  CHECK(ku_task_value_drop(&parent,cleanup_deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_value_drop(&fixture_other_task,cleanup_deadline)==KU_TASK_DRIVER_OK);
+  fixture_finish(&runtime,fault,cleanup_deadline); fixture_finish(&fixture_other,0,cleanup_deadline);
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 int main(void) {

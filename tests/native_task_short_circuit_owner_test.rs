@@ -219,6 +219,7 @@ static KuString fixture_string(size_t index,const char* text) {
 static KuTaskDriverSnapshotV1 fixture_snapshot(FixtureDriver* runtime) {
   KuTaskDriverSnapshotV1 snapshot={0};
   CHECK(ku_task_driver_snapshot(runtime->driver,&snapshot)==KU_TASK_DRIVER_OK);
+  CHECK(snapshot.worker_target==1u && snapshot.workers_created==1u);
   CHECK(!snapshot.fault && snapshot.running<=1u && snapshot.resident<=3u);
   return snapshot;
 }
@@ -227,7 +228,7 @@ static void fixture_idle(FixtureDriver* runtime) {
    * the existing real 20-second process watchdog bounds lost progress. */
   CHECK(ku_task_driver_wait_idle(runtime->driver,ku_task_driver_now_ms()+2000u)==KU_TASK_DRIVER_OK);
   KuTaskDriverSnapshotV1 snapshot=fixture_snapshot(runtime);
-  CHECK(!snapshot.running && !snapshot.queued && (snapshot.worker_waiting || snapshot.worker_exited));
+  CHECK(!snapshot.running && !snapshot.queued && (snapshot.workers_waiting + snapshot.workers_exited == snapshot.workers_created));
 }
 static void fixture_init(FixtureDriver* runtime,size_t capacity,size_t input_bytes) {
   memset(runtime,0,sizeof(*runtime));
@@ -239,8 +240,13 @@ static void fixture_init(FixtureDriver* runtime,size_t capacity,size_t input_byt
   /* Exact conservative admission accounting, not a claim about allocator RSS:
    * each hosted Start adds I, transferring the existing A charge once. */
   size_t tasks=sizeof(KuTaskInstance_0)+(capacity-1u)*sizeof(KuTaskInstance_1)+input_bytes;
+  uint64_t startup_now=ku_task_driver_now_ms();
+  CHECK(startup_now<=UINT64_MAX-1000u);
+  uint64_t startup_deadline=startup_now+1000u;
+  CHECK(startup_deadline!=UINT64_MAX);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==7u);
   CHECK(ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
-      runtime->slots,capacity,runtime->ring,capacity,fixed+tasks)==KU_TASK_DRIVER_OK);
+      runtime->slots,capacity,runtime->ring,capacity,fixed+tasks,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   fixture_idle(runtime);
 }
 static void fixture_check_held(FixtureDriver* runtime,const KuTaskDriverCleanupReceiptV1* receipt,
@@ -268,11 +274,14 @@ static void fixture_error_identity(const KuError* error) {
 static void fixture_finish(FixtureDriver* runtime,uint64_t deadline) {
   CHECK(ku_task_driver_shutdown(runtime->driver,deadline)==KU_TASK_DRIVER_OK);
   CHECK(ku_test_event_wait(&fixture_exit,2000));
-#if defined(_WIN32)
-  CHECK(WaitForSingleObject(runtime->driver->thread,2000)==WAIT_OBJECT_0);
-#else
-  alarm(2);
+  KuTaskDriverSnapshotV1 exited=fixture_snapshot(runtime);
+  CHECK(exited.workers_exited==1u && !exited.workers_waiting && !exited.workers_joined);
+  CHECK(!exited.resident && !exited.building && !exited.running && !exited.queued && !exited.reserved_bytes);
+#if !defined(_WIN32)
+  alarm(2); /* Bound the existing POSIX OS-return tail, not a new cleanup D. */
 #endif
+  CHECK(ku_task_driver_join(runtime->driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(runtime->driver->workers_joined==1u && runtime->driver->workers[0].joined && runtime->driver->workers[0].closed);
   CHECK(ku_task_driver_destroy(runtime->driver)==KU_TASK_DRIVER_OK);
 #if !defined(_WIN32)
   alarm(0);

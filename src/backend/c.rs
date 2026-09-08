@@ -231,7 +231,7 @@ pub fn generate_c_source_with_options(
 
 /// Compile verified internal task frames alongside the existing synchronous
 /// runtime helpers. This is not AST async lowering and is not a CLI capability.
-/// Its single-worker driver is internal; no source Task handle, M:N scheduler
+/// Its bounded worker-group driver is internal; no source Task handle, complete M:N scheduler
 /// or external I/O runtime is supplied by this entry point.
 pub fn generate_task_frame_c_source(
     program: &IrProgram,

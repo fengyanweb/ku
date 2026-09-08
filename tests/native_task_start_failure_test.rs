@@ -407,8 +407,16 @@ static void fixture_begin(FixtureRuntime* runtime,unsigned fault,unsigned pause)
   runtime->ring=(size_t*)calloc(4,sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
   fixture_fixed=sizeof(*runtime->driver)+4u*(sizeof(*runtime->slots)+sizeof(*runtime->ring));
+  uint64_t startup_now=ku_task_driver_now_ms();
+  CHECK(startup_now<=UINT64_MAX-1000u);
+  uint64_t startup_deadline=startup_now+1000u;
+  CHECK(startup_deadline!=UINT64_MAX);
   CHECK(ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
-      runtime->slots,4,runtime->ring,4,fixture_fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+31u)==KU_TASK_DRIVER_OK);
+      runtime->slots,4,runtime->ring,4,fixture_fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+31u,
+      1u,startup_deadline)==KU_TASK_DRIVER_OK);
+  KuTaskDriverSnapshotV1 started={0};
+  CHECK(ku_task_driver_snapshot(runtime->driver,&started)==KU_TASK_DRIVER_OK);
+  CHECK(started.worker_target==1u && started.workers_created==1u && !started.workers_exited);
   /* A real historical ticket, invalidated by successful rollback and possibly
    * reused by Parent; never a fabricated generation used to forge success. */
   KuTaskDriverTicketV1 reserve={0};
@@ -443,14 +451,20 @@ static void fixture_finish(FixtureRuntime* runtime,KuTaskValueV1* root,
   CHECK(!snapshot.resident && !snapshot.building && !snapshot.reserved_bytes && !snapshot.running && !snapshot.queued);
   CHECK(snapshot.fault==(expected_fault ? KU_TASK_DRIVER_INTERNAL : 0u));
   CHECK(snapshot.clock_fault==(unsigned)(expected_fault==2));
+  CHECK(snapshot.worker_target==1u && snapshot.workers_created==1u && snapshot.workers_exited==1u);
+  CHECK(!snapshot.workers_waiting && !snapshot.workers_joined);
   CHECK(!ku_task_driver_lock(runtime->driver)); fixture_sum_locked(runtime->driver);
   if (was_closing) CHECK(runtime->driver->shutdown_deadline==deadline);
   CHECK(!ku_task_driver_unlock(runtime->driver));
 #if defined(_WIN32)
-  CHECK(WaitForSingleObject(runtime->driver->thread,2000)==WAIT_OBJECT_0);
+  /* CLOSING/CLOCK intentionally complete after their original D (possibly 0).
+   * Observe only the OS tail after all EXITED/empty; never renew runtime D. */
+  if (was_closing) CHECK(WaitForSingleObject(runtime->driver->workers[0].thread,2000)==WAIT_OBJECT_0);
 #else
   alarm(2);
 #endif
+  CHECK(ku_task_driver_join(runtime->driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(runtime->driver->workers_joined==1u && runtime->driver->workers[0].joined && runtime->driver->workers[0].closed);
   CHECK(ku_task_driver_destroy(runtime->driver)==KU_TASK_DRIVER_OK);
 #if !defined(_WIN32)
   alarm(0);
@@ -505,7 +519,8 @@ static void fixture_fatal_idle(FixtureRuntime* runtime,const KuTaskValueV1* root
   CHECK(ku_task_driver_wait_idle(runtime->driver,fixture_original_now()+2000u)==KU_TASK_DRIVER_INTERNAL);
   KuTaskDriverSnapshotV1 snapshot={0};
   CHECK(ku_task_driver_snapshot(runtime->driver,&snapshot)==KU_TASK_DRIVER_OK);
-  CHECK(snapshot.polls==1u && snapshot.worker_waiting && !snapshot.worker_exited);
+  CHECK(snapshot.worker_target==1u && snapshot.workers_created==1u);
+  CHECK(snapshot.polls==1u && snapshot.workers_waiting==1u && !snapshot.workers_exited);
   CHECK(snapshot.resident==1u && snapshot.parked==1u);
   CHECK(!snapshot.building && !snapshot.running && !snapshot.queued && !snapshot.retiring);
   CHECK(snapshot.reserved_bytes==sizeof(KuTaskInstance_0)+31u);
@@ -617,7 +632,7 @@ static void fixture_cancel_case(unsigned point,unsigned action,int error) {
   CHECK(fixture_cleanup_reason==KU_TASK_CONTROL_CANCELLED && fixture_cleanup_deadline==deadline);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==6u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==7u);
   ku_task_control_atomic_init(&fixture_bad_clock,0);
   for (int error=0;error<2;error++) {
     for (unsigned fault=FIXTURE_CONTROL_ABI;fault<=FIXTURE_SECOND_RETAIN;fault++) fixture_fault_case(fault,error);

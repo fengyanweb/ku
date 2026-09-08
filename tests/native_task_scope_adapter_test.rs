@@ -201,7 +201,7 @@ fn native_task_scope_adapter_normal_sessions_and_timeout_final_handoff_in_c() {
     let mut generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
     for required in [
         "#define KU_TASK_FRAME_ABI_VERSION 4u",
-        "#define KU_TASK_DRIVER_ABI_VERSION 6u",
+        "#define KU_TASK_DRIVER_ABI_VERSION 7u",
         "KU_TASK_FRAME_SCOPE_REQUEST = 12u",
     ] {
         assert!(generated.contains(required));
@@ -319,8 +319,8 @@ static uint64_t ku_task_driver_now_ms(void) {
 
 const C_MAIN: &str = r#"
 /* Virtual time selects deterministic deadline interleavings, not an OS timer
- * timing claim. Event/OS joins retain 2s limits; virtual-clock driver waits
- * additionally rely on the unchanged real 20s process watchdog. */
+ * timing claim. Events retain 2s limits; driver join reuses shutdown D.
+ * Virtual-clock waits also retain the real 20s process watchdog. */
 static unsigned fixture_mode, fixture_transferred, fixture_scope_seen, fixture_staged;
 static unsigned fixture_drives[3], fixture_closed[2], fixture_promoted;
 static unsigned fixture_cleanup_drives;
@@ -567,7 +567,8 @@ static KuTaskDriverSnapshotV1 fixture_idle(KuTaskDriverV1* driver) {
   KuTaskDriverSnapshotV1 snapshot={0};
   CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
   CHECK(!snapshot.fault && !snapshot.running && !snapshot.queued && !snapshot.building);
-  CHECK(snapshot.worker_waiting || snapshot.worker_exited);
+  CHECK(snapshot.worker_target==1u && snapshot.workers_created==1u);
+  CHECK(snapshot.workers_waiting+snapshot.workers_exited==snapshot.workers_created);
   CHECK(!ku_task_driver_lock(driver));
   size_t bytes=0;
   for (size_t i=0;i<driver->capacity;i++) {
@@ -621,8 +622,11 @@ static void fixture_case(unsigned mode) {
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(5,sizeof(*slots));
   size_t* ring=(size_t*)calloc(5,sizeof(*ring)); CHECK(driver && slots && ring);
   size_t fixed=sizeof(*driver)+5u*(sizeof(*slots)+sizeof(*ring));
+  uint64_t startup_now=ku_task_driver_now_ms();
+  CHECK(startup_now<UINT64_MAX-1000u);
+  uint64_t startup_deadline=startup_now+1000u;
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,slots,5,ring,5,
-      fixed+sizeof(KuTaskInstance_0)+4u*sizeof(KuTaskInstance_1)+256u)==KU_TASK_DRIVER_OK);
+      fixed+sizeof(KuTaskInstance_0)+4u*sizeof(KuTaskInstance_1)+256u,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   KuResult_str returned={0}; returned.ok=true; returned.value=fixture_owned(0u,19u,"payload");
   KuString held=fixture_owned(1u,17u,"remaining");
   KuTaskValueV1 root={0};
@@ -859,11 +863,12 @@ static void fixture_case(unsigned mode) {
   CHECK(ku_task_driver_shutdown(driver,finish_deadline)==KU_TASK_DRIVER_OK);
   KuTaskDriverSnapshotV1 empty=fixture_idle(driver);
   CHECK(!empty.resident && !empty.reserved_bytes && !empty.queued && !empty.running && !empty.building);
-#if defined(_WIN32)
-  CHECK(WaitForSingleObject(driver->thread,2000)==WAIT_OBJECT_0);
-#else
-  alarm(2);
+  CHECK(empty.workers_exited==1u && !empty.workers_waiting && !empty.workers_joined);
+#if !defined(_WIN32)
+  alarm(2); /* Independent OS-tail observation, not another cleanup D. */
 #endif
+  CHECK(ku_task_driver_join(driver,finish_deadline)==KU_TASK_DRIVER_OK);
+  CHECK(driver->workers_joined==1u && driver->workers[0].joined && driver->workers[0].closed);
   CHECK(ku_task_driver_destroy(driver)==KU_TASK_DRIVER_OK);
 #if !defined(_WIN32)
   alarm(0);
@@ -875,7 +880,7 @@ static void fixture_case(unsigned mode) {
   for (size_t i=0;i<FIXTURE_PUBLICATION_EVENTS;i++) CHECK(ku_test_event_destroy(&fixture_publication_events[i]));
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==6u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==7u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&fixture_release_children,0);
   ku_task_control_atomic_init(&fixture_release_continuations,0);
@@ -1049,7 +1054,7 @@ fn native_task_scope_adapter_same_scope_two_rounds_and_second_round_cancel_in_c(
     }
     let mut generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
     assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 4u"));
-    assert!(generated.contains("#define KU_TASK_DRIVER_ABI_VERSION 6u"));
+    assert!(generated.contains("#define KU_TASK_DRIVER_ABI_VERSION 7u"));
     for forbidden in ["run_source", "const SOURCE"] {
         assert!(!generated.contains(forbidden));
     }
@@ -1148,8 +1153,8 @@ fn native_task_scope_adapter_same_scope_two_rounds_and_second_round_cancel_in_c(
 }
 
 const SCOPE_LOOP_C_MAIN: &str = r#"
-/* Fake time chooses D comparisons, not timer responsiveness. Each event and
- * OS join retains 2s; frozen-clock wait_idle/shutdown also have the existing
+/* Fake time chooses D comparisons, not timer responsiveness. Events retain
+ * 2s and driver join reuses shutdown D; frozen-clock waits also retain the
  * real 20s process watchdog. No scope/phase/receipt/ACK is fabricated. */
 static unsigned loop_mode,loop_starts,loop_closed,loop_latches,loop_local_drops;
 static unsigned loop_child_drops[3],loop_transfers[3],loop_held_free;
@@ -1323,7 +1328,8 @@ static KuTaskDriverSnapshotV1 loop_idle(KuTaskDriverV1* driver) {
   KuTaskDriverSnapshotV1 out={0};
   CHECK(ku_task_driver_snapshot(driver,&out)==KU_TASK_DRIVER_OK);
   CHECK(!out.running && !out.queued && !out.building && !out.fault && !out.clock_fault);
-  CHECK(out.worker_waiting || out.worker_exited); return out;
+  CHECK(out.worker_target==1u && out.workers_created==1u);
+  CHECK(out.workers_waiting+out.workers_exited==out.workers_created); return out;
 }
 static void loop_release_child(unsigned index) {
   ku_task_control_atomic_store(&loop_release,
@@ -1362,8 +1368,11 @@ static void loop_case(unsigned mode) {
   KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(3,sizeof(*slots));
   size_t* ring=(size_t*)calloc(3,sizeof(*ring)); CHECK(driver && slots && ring);
   size_t fixed=sizeof(*driver)+3u*(sizeof(*slots)+sizeof(*ring));
+  uint64_t startup_now=ku_task_driver_now_ms();
+  CHECK(startup_now<UINT64_MAX-1000u);
+  uint64_t startup_deadline=startup_now+1000u;
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,slots,3,ring,3,
-      fixed+sizeof(KuTaskInstance_0)+2u*sizeof(KuTaskInstance_1)+37u)==KU_TASK_DRIVER_OK);
+      fixed+sizeof(KuTaskInstance_0)+2u*sizeof(KuTaskInstance_1)+37u,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   uint8_t* bytes=(uint8_t*)malloc(37u); CHECK(bytes); memcpy(bytes,"carried",7u);
   loop_held_id=(uintptr_t)bytes; KuString carried={bytes,7u,37u,KU_STRING_OWNED};
   KuTaskValueV1 root={0};
@@ -1470,11 +1479,13 @@ static void loop_case(unsigned mode) {
   CHECK(ku_task_driver_shutdown(driver,finish)==KU_TASK_DRIVER_OK);
   KuTaskDriverSnapshotV1 empty=loop_idle(driver);
   CHECK(!empty.resident && !empty.reserved_bytes);
-#if defined(_WIN32)
-  CHECK(WaitForSingleObject(driver->thread,2000u)==WAIT_OBJECT_0);
-#else
-  alarm(2);
+  CHECK(empty.workers_exited==1u && !empty.workers_waiting && !empty.workers_joined);
+  CHECK(!empty.building && !empty.queued && !empty.running);
+#if !defined(_WIN32)
+  alarm(2); /* Independent OS-tail observation, not another cleanup D. */
 #endif
+  CHECK(ku_task_driver_join(driver,finish)==KU_TASK_DRIVER_OK);
+  CHECK(driver->workers_joined==1u && driver->workers[0].joined && driver->workers[0].closed);
   CHECK(ku_task_driver_destroy(driver)==KU_TASK_DRIVER_OK);
 #if !defined(_WIN32)
   alarm(0);
@@ -1485,7 +1496,7 @@ static void loop_case(unsigned mode) {
   for (size_t i=0;i<2u;i++) CHECK(ku_test_event_destroy(&loop_closed_event[i]));
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==6u && KU_TASK_CONTROL_ABI_VERSION==2u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==7u && KU_TASK_CONTROL_ABI_VERSION==2u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&loop_release,0); ku_task_control_atomic_init(&loop_allow,0);
   loop_case(0u); loop_case(1u); puts("task-scope-loop-ok"); return 0;

@@ -704,7 +704,7 @@ async fn main(): null! {
 - `fn main()` 和 `async fn main()` 不能同时存在。
 - async task 可以读取外层捕获，但不能修改外层捕获；checker 和 runtime 都会拒绝写入。
 - HTTP server 内部可以使用 task 处理并发请求，但 handler 用户不需要手动创建或管理 task。
-- native C 已接通单 worker 有限源码子集；LLVM 和同步 IR 命令仍拒绝 async。
+- native C 已接通有界 worker 组有限源码子集；LLVM 和同步 IR 命令仍拒绝 async。
 
 错误示例：
 

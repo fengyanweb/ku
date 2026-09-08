@@ -141,7 +141,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 1. 逐项补齐闭包尚未支持的 binding/payload 捕获，并为每一种 owned payload 固定逃逸与失败清理测试。
 2. 继续收窄动态 object 与 Result 的组合边界，不把单项 ABI 存在等同于任意嵌套组合已完成。
 3. LLVM 只按真实编译需求继续扩展 array/enum，不追求和解释器一次性等宽。
-4. native C 已接通单 worker 有限源码 Task 子集，其余 async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；执行证据见 [阶段工作日志](v0.0.18-worklog.md)。既有检查点证据与本次源码 If、Owned/Pending 专项分开记录；专项不能替代本次完整 workspace/native 全集或精确提交三系统 CI/sanitizer 验收，历史失败和修复结果分别记录。不能把这个子集或内部 frame 夹具通过当作完整 native async、M:N 或生产性能验收完成。
+4. native C 已接通有界 worker 组有限源码 Task 子集，其余 async native lowering 继续拒绝。取消语义已确定，见 [语义合同](semantics.md)；执行证据见 [阶段工作日志](v0.0.18-worklog.md)。既有检查点证据与本次源码 If、Owned/Pending 专项分开记录；专项不能替代本次完整 workspace/native 全集或精确提交三系统 CI/sanitizer 验收，历史失败和修复结果分别记录。不能把这个子集或内部 frame 夹具通过当作完整 native async、M:N 或生产性能验收完成。
 
 ## Typed Task IR 与有限源码接入（v0.0.18 开发中）
 
@@ -248,16 +248,28 @@ payload 立即与 take 争取唯一所有权并释放，不随内部观察引用
 owner drop/take、执行者排他、cleanup 期限缩短、引用硬限及资源归零。测试中的
 typed adapter 是夹具，不是 AST lowering；race 场景通过不等于 TSan 或压力验收完成。
 
-### R3 内部单 worker driver
+### R3 / R6 内部有界 worker 组 driver
 
-`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v6。
+`src/backend/c_task_driver.rs` 在非空内部 Task IR 的 C artifact 中提供 driver ABI v7。
 R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 等待类型和独立期限
 升为版本 4，R5h 正常作用域登记字段升为版本 5，单向 FINAL 标记升为版本 6；
-内部 C 类型名中的 `V1` 不是旧布局兼容承诺，初始化明确拒绝旧版本（包括5）。
-当前 Frame ABI 4、Control ABI 2、Driver ABI 6。
-普通同步输出和空 Task IR 不附带该实现。它使用一个真实 OS worker、互斥锁、条件变量
-以及调用方提供的固定 slot/ring 存储；不按 Task 创建线程，也没有定时重试忙轮询。
-有限源码 TaskStart/Await 已复用它，但它不是 M:N、netpoll 或事件驱动 HTTP。
+R6 的有界 worker 组、双条件和显式 join 生命周期升为版本 7。
+内部 C 类型名中的 `V1` 不是旧布局兼容承诺，初始化明确拒绝旧版本（包括6）。
+当前 Frame ABI 4、Control ABI 2、Driver ABI 7。
+普通同步输出和空 Task IR 不附带该实现。私有 init 显式接收 1..32 个真实 OS worker
+及有限 startup_deadline；worker 数与 slot 容量独立，使用调用方提供的固定 slot/ring。
+源码 root 在执行目标上按 min(32, max(4, OS 报告的逻辑处理器数)) 选择 worker 数，
+不按 Task 创建线程。所有 worker 共享有界队列，RUNNING/executor 仍保证同一 Task
+不能被重复执行；ACTIVE 包括锁外 lease/dispose 尾部，不能只凭 running=0 判为空闲。
+工作条件负责队列/更短期限/关闭通知，独立状态条件负责观察者；停车通知不唤醒空闲
+worker。没有固定间隔轮询。本地队列、工作窃取、完整 M:N、netpoll 和事件驱动 HTTP
+仍未完成；有限源码 TaskStart/Await 与内部夹具复用本 driver，不代表性能验收。
+
+初始化与 join/destroy 是独占生命周期操作，调用方必须排除其他 API/观察者并发访问，
+不是公开安全 Ku API。预检失败不修改零存储；一旦实际初始化 OS 资源或创建线程，
+失败会保留 LIVE/REAPING 状态、逐线程 handle 和同步资源位，禁止直接 memset/free。
+成功创建的线程在发布锁后才能进入工作循环；部分失败关闭接纳，沿原 startup D
+排空并回收。若无法按期回收，源码 root 保留静态存储并报错，不强杀或假造结束。
 
 接纳顺序为 reserve → 构造 control/frame → commit；内部容量最多 1024，计数和预留
 字节同时限流，低层失败不消费输入槽；源码 wrapper 对已 move 的实参另执行失败清理，
@@ -282,8 +294,12 @@ terminal payload、未释放 owner 和迟到 lease 仍占用 resident/bytes。�
 
 shutdown 关闭接纳，批量取消并共享 min(首次关闭时刻 + 1000 ms, 继承 deadline)，重试
 只能缩短。超期返回失败并保留 worker/storage，不强杀线程或提前 free；调用方必须释放
-仍持有的 owner/注册引用后继续排空。destroy 必须等 resident 归零和 worker 完成访问，
-Windows 还验证线程句柄结束；POSIX 最终 join 不是可硬限时的 portable OS primitive。
+仍持有的 owner/注册引用后继续排空。shutdown 观察者每次条件等待前重取共享最短 D。
+join 必须先确认 resident/预留字节归零且全部实际 worker 完成访问；Windows 先观察
+真实句柄，再仅等待原 D 剩余时间，逐线程记录 joined/closed。POSIX 最终 pthread_join
+不是可硬限时的 portable OS primitive；逻辑 EXITED 不等于 OS-return 尾部已经结束。
+destroy 不隐式 join；只有全部真实 joined/closed 后才进入 REAPING，逐个记录已成功
+析构的同步资源，重试不重复 join/close/析构，也不重新锁已销毁的 mutex。
 单调时钟失败不是时间零：driver 保持可观察的 INTERNAL/closing 故障，以已到期的
 共享预算批量取消并保留 worker 执行清理。无 runnable 时使用不读时钟的条件等待，
 仍接收后续 owner/BUILDING 归还；不退出后留下无人处理的队列，也不恢复普通 continuation。
@@ -436,7 +452,7 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 
 源码与两种 CLI native 构建、表达式和清理测试的实际结果按精确提交记录在工作日志。
 定向验证、完整本机门禁和三系统 CI/sanitizer 分开记录，历史失败及修复结果也分列，
-不从旧 SHA 的通过结果外推。Frame ABI 4、Control ABI 2、Driver ABI 6 不等于稳定外部 C FFI。
+不从旧 SHA 的通过结果外推。Frame ABI 4、Control ABI 2、Driver ABI 7 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
 
 ### R5h 正常作用域 session（源码 if 复用的内部协议）

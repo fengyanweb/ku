@@ -211,7 +211,8 @@ static KuTaskDriverSnapshotV1 fixture_idle(KuTaskDriverV1* driver,uint64_t deadl
   KuTaskDriverSnapshotV1 snapshot={0};
   CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
   CHECK(!snapshot.fault && !snapshot.clock_fault && !snapshot.queued && !snapshot.running && !snapshot.building);
-  CHECK(snapshot.worker_waiting || snapshot.worker_exited);
+  CHECK(snapshot.worker_target==1u && snapshot.workers_created==1u);
+  CHECK(snapshot.workers_waiting+snapshot.workers_exited==snapshot.workers_created);
   return snapshot;
 }
 static void fixture_wait(KuTaskInstance_0* parent,const KuTaskDriverWaitTokenV1* original,
@@ -239,8 +240,16 @@ int main(void) {
   size_t* ring=(size_t*)calloc(2,sizeof(*ring)); CHECK(driver && slots && ring);
   size_t fixed=sizeof(*driver)+2u*(sizeof(*slots)+sizeof(*ring));
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1);
+  uint64_t startup_now=ku_task_driver_now_ms();
+  CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
+  uint64_t startup_deadline=startup_now+1000u;
+  CHECK(ku_task_driver_init(driver,sizeof(*driver),6u,
+      slots,2,ring,2,fixed+instances,1u,startup_deadline)==KU_TASK_DRIVER_ABI_MISMATCH);
+  CHECK(ku_task_frame_zero_bytes(driver,sizeof(*driver))
+      && ku_task_frame_zero_bytes(slots,(2)*sizeof(*slots))
+      && ku_task_frame_zero_bytes(ring,(2)*sizeof(*ring)));
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,
-      slots,2,ring,2,fixed+instances)==KU_TASK_DRIVER_OK);
+      slots,2,ring,2,fixed+instances,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   int64_t base=37; KuTaskValueV1 root={0};
   uint64_t deadline=ku_task_driver_now_ms()+2000u;
   CHECK(ku_task_0_start_value(driver,&base,&root)==KU_TASK_DRIVER_OK && base==37);
@@ -292,20 +301,18 @@ int main(void) {
   CHECK(outcome.result_kind==1u && outcome.exit_class==KU_TASK_EXIT_USER_RESULT && outcome.value.integer.ok && outcome.value.integer.value==42);
   CHECK(!outcome.has_cleanup_deadline && !outcome.cleanup_deadline);
   ku_task_outcome_drop(&outcome);
-  CHECK(ku_task_value_drop(&root,deadline)==KU_TASK_DRIVER_OK);
+  uint64_t cleanup_now=ku_task_driver_now_ms();
+  CHECK(cleanup_now!=UINT64_MAX && cleanup_now<UINT64_MAX-1000u);
+  uint64_t cleanup_deadline=cleanup_now+1000u;
+  CHECK(ku_task_value_drop(&root,cleanup_deadline)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_control_lease_release(&observer)==KU_TASK_CONTROL_OK);
-  CHECK(ku_task_driver_shutdown(driver,deadline)==KU_TASK_DRIVER_OK);
-  KuTaskDriverSnapshotV1 empty=fixture_idle(driver,deadline);
+  CHECK(ku_task_driver_shutdown(driver,cleanup_deadline)==KU_TASK_DRIVER_OK);
+  KuTaskDriverSnapshotV1 empty=fixture_idle(driver,cleanup_deadline);
   CHECK(!empty.resident && !empty.reserved_bytes);
-#if defined(_WIN32)
-  CHECK(WaitForSingleObject(driver->thread,2000)==WAIT_OBJECT_0);
-#else
-  alarm(2);
-#endif
+  CHECK(ku_task_driver_join(driver,cleanup_deadline)==KU_TASK_DRIVER_OK);
+  CHECK(driver->worker_target==1u && driver->workers_created==1u && driver->workers_exited==1u
+      && driver->workers_joined==1u && driver->workers[0].joined && driver->workers[0].closed);
   CHECK(ku_task_driver_destroy(driver)==KU_TASK_DRIVER_OK);
-#if !defined(_WIN32)
-  alarm(0);
-#endif
   free(ring); free(slots); free(driver);
   CHECK(ku_test_event_destroy(&fixture_right_parked));
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
@@ -435,7 +442,7 @@ async fn main(): null! { return ok(null) }
     for required in [
         "#define KU_TASK_FRAME_ABI_VERSION 4u",
         "#define KU_TASK_CONTROL_ABI_VERSION 2u",
-        "#define KU_TASK_DRIVER_ABI_VERSION 6u",
+        "#define KU_TASK_DRIVER_ABI_VERSION 7u",
     ] {
         assert!(generated.contains(required));
     }
@@ -682,7 +689,8 @@ static KuTaskDriverSnapshotV1 if_idle(KuTaskDriverV1* driver) {
   CHECK(ku_task_driver_wait_idle(driver,ku_task_driver_now_ms()+2000u)==KU_TASK_DRIVER_OK);
   KuTaskDriverSnapshotV1 snapshot={0}; CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
   CHECK(!snapshot.fault && !snapshot.clock_fault && !snapshot.running && !snapshot.queued && !snapshot.building);
-  CHECK(snapshot.worker_waiting || snapshot.worker_exited); return snapshot;
+  CHECK(snapshot.worker_target==1u && snapshot.workers_created==1u);
+  CHECK(snapshot.workers_waiting+snapshot.workers_exited==snapshot.workers_created); return snapshot;
 }
 /* wait_idle supplies the worker-to-main happens-before edge, but a real
  * scope timer may subsequently wake it. Hold its queue mutex and check that
@@ -723,8 +731,16 @@ static void if_case(unsigned mode) {
   size_t* ring=(size_t*)calloc(3,sizeof(*ring)); CHECK(driver && slots && ring);
   size_t fixed=sizeof(*driver)+3u*(sizeof(*slots)+sizeof(*ring));
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+sizeof(KuTaskInstance_2);
+  uint64_t startup_now=ku_task_driver_now_ms();
+  CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
+  uint64_t startup_deadline=startup_now+1000u;
+  CHECK(ku_task_driver_init(driver,sizeof(*driver),6u,slots,3,ring,3,
+      fixed+instances+if_caps[0]+if_caps[1]+if_caps[2],1u,startup_deadline)==KU_TASK_DRIVER_ABI_MISMATCH);
+  CHECK(ku_task_frame_zero_bytes(driver,sizeof(*driver))
+      && ku_task_frame_zero_bytes(slots,(3)*sizeof(*slots))
+      && ku_task_frame_zero_bytes(ring,(3)*sizeof(*ring)));
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,slots,3,ring,3,
-      fixed+instances+if_caps[0]+if_caps[1]+if_caps[2])==KU_TASK_DRIVER_OK);
+      fixed+instances+if_caps[0]+if_caps[1]+if_caps[2],1u,startup_deadline)==KU_TASK_DRIVER_OK);
   bool gate=mode!=IF_FALSE;
   KuString local=if_owned(0u,"held"),child_input=if_owned(1u,"child"),returned=if_owned(2u,"returned");
   KuTaskValueV1 root={0};
@@ -852,26 +868,24 @@ static void if_case(unsigned mode) {
     CHECK(!ku_task_control_atomic_load(&if_ready->control.lifecycle_pin));
     CHECK(ku_task_control_lease_release(&if_ready_observer)==KU_TASK_CONTROL_OK);
   }
-  uint64_t deadline=ku_task_driver_now_ms()+2000u;
+  uint64_t cleanup_now=ku_task_driver_now_ms();
+  CHECK(cleanup_now!=UINT64_MAX && cleanup_now<UINT64_MAX-1000u);
+  uint64_t deadline=cleanup_now+1000u;
+  if (mode==IF_CANCEL) deadline=ku_task_driver_min(deadline,if_scope_deadline);
   CHECK(ku_task_value_drop(&root,deadline)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_shutdown(driver,deadline)==KU_TASK_DRIVER_OK);
   KuTaskDriverSnapshotV1 empty=if_idle(driver);
   CHECK(!empty.resident && !empty.reserved_bytes && !empty.queued && !empty.running && !empty.building);
-#if defined(_WIN32)
-  CHECK(WaitForSingleObject(driver->thread,2000)==WAIT_OBJECT_0);
-#else
-  alarm(2);
-#endif
+  CHECK(ku_task_driver_join(driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(driver->worker_target==1u && driver->workers_created==1u && driver->workers_exited==1u
+      && driver->workers_joined==1u && driver->workers[0].joined && driver->workers[0].closed);
   CHECK(ku_task_driver_destroy(driver)==KU_TASK_DRIVER_OK);
-#if !defined(_WIN32)
-  alarm(0);
-#endif
   free(ring); free(slots); free(driver);
   CHECK(ku_test_event_destroy(&if_ready_parked) && ku_test_event_destroy(&if_child_cleanup) && ku_test_event_destroy(&if_scope_closed));
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==6u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==7u);
   ku_task_control_atomic_init(&if_release_ready,0); ku_task_control_atomic_init(&if_release_child,0);
   ku_task_control_atomic_init(&if_release_parent,0);
   if_case(IF_FALSE); if_case(IF_NORMAL); if_case(IF_CANCEL);
