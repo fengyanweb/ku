@@ -27,7 +27,7 @@ v0.0.18 第二阶段已采用以下规则；这不表示所有后端已实现。
   清理期间禁止新建 Task、await 或提交新的 sleep/timer、网络等待和 blocking job；同步 close/drop 与有限计算仍受预算约束。
 
 解释器与各 native 切片的执行证据见实施记录；不同切片的测试结果不能互相替代。
-v0.0.18 开发分支已接通 native C 的单 worker 有限源码子集：AST 经独立 Task IR
+v0.0.18 开发分支已接通 native C 的有界 worker 组有限源码子集：AST 经独立 Task IR
 生成 Start、Move、Await、函数退出与 If 分支的正常 scope drain，不嵌入解释器或 runner 源码。
 既有检查点证据与本次源码 If、Owned/Pending 专项分开记录；专项不能替代本次完整
 workspace/native 全集或精确提交三系统 CI/sanitizer 验收，不是正式发布。
@@ -98,7 +98,11 @@ async fn main(): null! {
 float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及异步标准库 I/O。
 未支持形式在生成 artifact 前明确报错。
 用户 cleanup 仍不能 Await；内部 ACK continuation 不是新的用户语法。
-该子集只使用一个真实 OS worker 和条件等待，不递归 poll child。
+该子集使用有界 worker 组与共享固定队列，不递归 poll child；不同 Task 可以由不同
+OS worker 同时执行，同一 Task 的 RUNNING/executor 仍互斥。源码 root 在执行目标上按
+`min(32, max(4, OS 报告的逻辑处理器数))` 选择 worker 数，不读取编译宿主的 CPU 配置。
+这不是对进程 affinity/cgroup 配额的完整识别，也不是最优性能配置承诺。
+工作条件与状态观察条件分离，停车/退出状态通知不再唤醒其他空闲 worker。
 root 使用最多 1024 个固定驻留槽；字节接纳按固定存储和生成 instance 大小计费，
 不是操作系统 RSS 限制。编译器的函数/槽/操作硬限也不限制程序累计执行时间：
 无递归调用图仍可产生大量顺序工作。普通计算等待不擅自增加全局超时。
@@ -108,7 +112,7 @@ lower 对已构造 AST 的 If 另限32层，表达式仍受 `depth > 64` 拒绝�
 这些是分别拒绝的边界，不是复杂源码必定能达到32层或源码可写64层的承诺。
 print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
 M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成；
-不能据此承诺 CPU 并行或高并发吞吐。
+真实双 worker 重叠执行的定向测试不等于吞吐、扩展性或长期低 CPU 占用验收。
 
 ## 同步只读借用与 async
 

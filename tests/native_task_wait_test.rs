@@ -288,12 +288,13 @@ static KuTaskDriverSnapshotV1 fixture_snapshot(FixtureDriver* runtime) {
   KuTaskDriverSnapshotV1 snapshot = {0};
   CHECK(ku_task_driver_snapshot(runtime->driver, &snapshot) == KU_TASK_DRIVER_OK);
   CHECK(!snapshot.fault && snapshot.running <= 1 && snapshot.queued <= runtime->capacity);
-  CHECK(snapshot.resident <= runtime->capacity); return snapshot;
+  CHECK(snapshot.resident <= runtime->capacity);
+  CHECK(snapshot.worker_target == 1u && snapshot.workers_created == 1u); return snapshot;
 }
 static void fixture_idle(FixtureDriver* runtime) {
   CHECK(ku_task_driver_wait_idle(runtime->driver, fixture_deadline()) == KU_TASK_DRIVER_OK);
   KuTaskDriverSnapshotV1 snapshot = fixture_snapshot(runtime);
-  CHECK(!snapshot.queued && !snapshot.running && (snapshot.worker_waiting || snapshot.worker_exited));
+  CHECK(!snapshot.queued && !snapshot.running && snapshot.workers_waiting + snapshot.workers_exited == snapshot.workers_created);
 }
 static void fixture_driver_init(FixtureDriver* runtime, size_t capacity) {
   memset(runtime, 0, sizeof(*runtime)); runtime->capacity = capacity;
@@ -302,13 +303,19 @@ static void fixture_driver_init(FixtureDriver* runtime, size_t capacity) {
   runtime->ring = (size_t*)calloc(capacity, sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
   size_t fixed = sizeof(*runtime->driver) + capacity * (sizeof(*runtime->slots) + sizeof(*runtime->ring));
-  CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), 1u,
-      runtime->slots, capacity, runtime->ring, capacity, fixed + 1024u * 1024u) == KU_TASK_DRIVER_ABI_MISMATCH);
-  CHECK(ku_task_frame_zero_bytes(runtime->driver, sizeof(*runtime->driver)));
-  CHECK(ku_task_frame_zero_bytes(runtime->slots, capacity * sizeof(*runtime->slots)));
-  CHECK(ku_task_frame_zero_bytes(runtime->ring, capacity * sizeof(*runtime->ring)));
+  uint64_t startup_now = ku_task_driver_now_ms();
+  CHECK(startup_now != UINT64_MAX && startup_now < UINT64_MAX - 1000u);
+  uint64_t startup_deadline = startup_now + 1000u;
+  const uint32_t old_versions[] = {1u, 6u};
+  for (size_t old = 0; old < sizeof(old_versions) / sizeof(old_versions[0]); ++old) {
+    CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), old_versions[old],
+        runtime->slots, capacity, runtime->ring, capacity, fixed + 1024u * 1024u, 1u, startup_deadline) == KU_TASK_DRIVER_ABI_MISMATCH);
+    CHECK(ku_task_frame_zero_bytes(runtime->driver, sizeof(*runtime->driver)));
+    CHECK(ku_task_frame_zero_bytes(runtime->slots, capacity * sizeof(*runtime->slots)));
+    CHECK(ku_task_frame_zero_bytes(runtime->ring, capacity * sizeof(*runtime->ring)));
+  }
   CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), KU_TASK_DRIVER_ABI_VERSION,
-      runtime->slots, capacity, runtime->ring, capacity, fixed + 1024u * 1024u) == KU_TASK_DRIVER_OK);
+      runtime->slots, capacity, runtime->ring, capacity, fixed + 1024u * 1024u, 1u, startup_deadline) == KU_TASK_DRIVER_OK);
   fixture_idle(runtime);
   CHECK(fixture_snapshot(runtime).fixed_bytes == fixed);
 }
@@ -322,19 +329,22 @@ static void fixture_drop(size_t index) {
   if (role->handle.owner.lease.control) CHECK(ku_task_0_drop(&role->handle, fixture_deadline()) == KU_TASK_DRIVER_OK);
 }
 static void fixture_driver_finish_expected(FixtureDriver* runtime, uint32_t expected) {
-  CHECK(ku_task_driver_shutdown(runtime->driver, fixture_deadline()) == expected);
+  uint64_t cleanup_now = ku_task_driver_now_ms();
+  CHECK(cleanup_now != UINT64_MAX && cleanup_now < UINT64_MAX - 1000u);
+  uint64_t cleanup_deadline = cleanup_now + 1000u;
+  CHECK(ku_task_driver_shutdown(runtime->driver, cleanup_deadline) == expected);
   KuTaskDriverSnapshotV1 snapshot = {0};
   CHECK(ku_task_driver_snapshot(runtime->driver, &snapshot) == KU_TASK_DRIVER_OK);
   CHECK(snapshot.fault == expected);
-  CHECK(!snapshot.resident && !snapshot.reserved_bytes && !snapshot.queued && !snapshot.running);
-  CHECK(snapshot.worker_exited);
-  uint32_t status = KU_TASK_DRIVER_PENDING; uint64_t deadline = fixture_deadline();
-  /* Only final Windows OS-thread acknowledgement may lag worker_exited. */
-  for (size_t i = 0; i < 4096 && status == KU_TASK_DRIVER_PENDING; ++i) {
-    status = ku_task_driver_destroy(runtime->driver);
-    if (status == KU_TASK_DRIVER_PENDING) { CHECK(ku_task_driver_now_ms() < deadline); ku_test_thread_yield(); }
-  }
-  CHECK(status == KU_TASK_DRIVER_OK);
+  CHECK(!snapshot.resident && !snapshot.reserved_bytes && !snapshot.building && !snapshot.queued && !snapshot.running);
+  CHECK(snapshot.worker_target == 1u && snapshot.workers_created == 1u);
+  CHECK(!snapshot.workers_waiting && snapshot.workers_exited == snapshot.workers_created);
+  CHECK(!ku_task_driver_lock(runtime->driver));
+  CHECK(runtime->driver->shutdown_deadline == cleanup_deadline);
+  CHECK(!ku_task_driver_unlock(runtime->driver));
+  CHECK(ku_task_driver_join(runtime->driver, cleanup_deadline) == KU_TASK_DRIVER_OK);
+  CHECK(runtime->driver->workers_joined == 1u && runtime->driver->workers[0].joined && runtime->driver->workers[0].closed);
+  CHECK(ku_task_driver_destroy(runtime->driver) == KU_TASK_DRIVER_OK);
   free(runtime->ring); free(runtime->slots); free(runtime->driver); memset(runtime, 0, sizeof(*runtime));
 }
 static void fixture_driver_finish(FixtureDriver* runtime) {
@@ -599,7 +609,7 @@ static void fixture_parked_and_late_child(void) {
   fixture_role_init(2, MODE_WAIT); fixture_roles[2].target = 0;
   fixture_start(&runtime, 2); fixture_idle(&runtime); fixture_assert_armed(&fixture_roles[2]);
   KuTaskDriverSnapshotV1 before = fixture_snapshot(&runtime);
-  CHECK(before.parked == 3u && before.worker_waiting);
+  CHECK(before.parked == 3u && before.workers_waiting == 1u);
   /* Repeated completed idle handshakes inspect the condition predicate, not time.
    * No task-level retry/poll is allowed while no event has happened. */
   for (size_t i = 0; i < 8; ++i) { fixture_idle(&runtime); CHECK(fixture_snapshot(&runtime).polls == before.polls); }
@@ -830,13 +840,13 @@ static void fixture_headers_and_damaged_pair(void) {
   CHECK(fixture_roles[1].arm_status == KU_TASK_DRIVER_INTERNAL);
   KuTaskDriverSnapshotV1 snapshot = {0};
   CHECK(ku_task_driver_snapshot(runtime.driver, &snapshot) == KU_TASK_DRIVER_OK);
-  CHECK(snapshot.fault == KU_TASK_DRIVER_INTERNAL && !snapshot.queued && !snapshot.running && snapshot.worker_waiting);
+  CHECK(snapshot.fault == KU_TASK_DRIVER_INTERNAL && !snapshot.queued && !snapshot.running && snapshot.workers_waiting == 1u);
   fixture_drop(1); fixture_drop(0);
   fixture_driver_finish_expected(&runtime, KU_TASK_DRIVER_INTERNAL); fixture_zero();
 }
 
 int main(void) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 6u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 7u);
   CHECK(KU_TASK_FRAME_ABI_VERSION == 4u);
   fixture_ready_before_arm();
   fixture_parked_and_late_child();

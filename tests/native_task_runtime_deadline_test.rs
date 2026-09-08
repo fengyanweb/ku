@@ -297,8 +297,9 @@ static KuTaskDriverSnapshotV1 fixture_idle(KuTaskDriverV1* driver) {
   CHECK(ku_task_driver_wait_idle(driver,ku_task_driver_now_ms()+2000u)==KU_TASK_DRIVER_OK);
   KuTaskDriverSnapshotV1 snapshot={0};
   CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
+  CHECK(snapshot.worker_target==1u && snapshot.workers_created==1u);
   CHECK(!snapshot.fault && !snapshot.running && !snapshot.queued && !snapshot.building);
-  CHECK(snapshot.worker_waiting || snapshot.worker_exited);
+  CHECK(snapshot.workers_waiting + snapshot.workers_exited == snapshot.workers_created);
   return snapshot;
 }
 static KuTaskDriverCleanupReceiptV1 fixture_receipt(KuTaskDriverCleanupReceiptV1* receipts,
@@ -330,8 +331,13 @@ int main(void) {
   size_t* ring=(size_t*)calloc(6,sizeof(*ring)); CHECK(driver && slots && ring);
   size_t fixed=sizeof(*driver)+6u*(sizeof(*slots)+sizeof(*ring));
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)+sizeof(KuTaskInstance_2)+3u*sizeof(KuTaskInstance_3);
+  uint64_t startup_now=ku_task_driver_now_ms();
+  CHECK(startup_now<=UINT64_MAX-1000u);
+  uint64_t startup_deadline=startup_now+1000u;
+  CHECK(startup_deadline!=UINT64_MAX);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==7u);
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,
-      slots,6,ring,6,fixed+instances+31u)==KU_TASK_DRIVER_OK);
+      slots,6,ring,6,fixed+instances+31u,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   uint8_t* buffer=(uint8_t*)malloc(31u); CHECK(buffer); memcpy(buffer,"payload",7u);
   fixture_exit_input=(uintptr_t)buffer;
   KuString input={buffer,7u,31u,KU_STRING_OWNED};
@@ -438,11 +444,20 @@ int main(void) {
   CHECK(ku_task_driver_shutdown(driver,original)==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
   CHECK(driver->shutdown_deadline==original);
   CHECK(ku_test_event_wait(&fixture_exit_event,2000));
+  KuTaskDriverSnapshotV1 exited={0};
+  CHECK(ku_task_driver_snapshot(driver,&exited)==KU_TASK_DRIVER_OK);
+  CHECK(exited.worker_target==1u && exited.workers_created==1u && exited.workers_exited==1u);
+  CHECK(!exited.workers_waiting && !exited.workers_joined && !exited.resident
+      && !exited.building && !exited.running && !exited.queued && !exited.reserved_bytes);
+  /* Original D already expired. The existing 2-second OS observation only
+   * establishes safe late reaping, not cleanup within D; join keeps that D. */
 #if defined(_WIN32)
-  CHECK(WaitForSingleObject(driver->thread,2000)==WAIT_OBJECT_0);
+  CHECK(WaitForSingleObject(driver->workers[0].thread,2000)==WAIT_OBJECT_0);
 #else
   alarm(2);
 #endif
+  CHECK(ku_task_driver_join(driver,original)==KU_TASK_DRIVER_OK);
+  CHECK(driver->workers_joined==1u && driver->workers[0].joined && driver->workers[0].closed);
   CHECK(ku_task_driver_destroy(driver)==KU_TASK_DRIVER_OK);
 #if !defined(_WIN32)
   alarm(0);

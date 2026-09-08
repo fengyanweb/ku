@@ -47,7 +47,7 @@ HTTP timeout 的 native 既有合同是不可恢复的请求超时，超时展�
 ## Task 所有权、取消与清理预算
 
 以下是 v0.0.18 第二阶段已采用的语义决策，不再是待决问题；本轮解释器生命周期切片已通过本机全量回归，具体证据与未覆盖边界见实施记录。
-内部 stackless frame、控制内核和单 worker driver 的阶段实现见实施记录；源码 native
+内部 stackless frame、控制内核和有界 worker 组 driver 的阶段实现见实施记录；源码 native
 async、M:N 调度、netpoll 与事件驱动 HTTP 尚未完成。不能把这份合同、内部夹具或
 既有 native HTTP timeout 当成源码 native Task 取消已经完成的证明。
 

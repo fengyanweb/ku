@@ -67,7 +67,7 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
     let ir = include_str!("../docs/ir.md");
     for document in [readme, syntax, concurrency, ir] {
         for required in [
-            "单 worker",
+            "有界 worker 组",
             "async fn main(): null!",
             "单层 Result",
             "源码 `if` / `else` / `while` 及词法作用域",
@@ -87,7 +87,25 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         assert!(!document.contains("仍拒绝 if/循环/递归"));
         assert!(!document.contains("if/循环/递归、重复赋值、嵌套 scope"));
     }
-    assert!(ir.contains("Frame ABI 4、Control ABI 2、Driver ABI 6"));
+    assert!(ir.contains("Frame ABI 4、Control ABI 2、Driver ABI 7"));
+    for boundary in [
+        "worker 数与 slot 容量独立",
+        "ACTIVE 包括锁外 lease/dispose 尾部",
+        "初始化与 join/destroy 是独占生命周期操作",
+        "失败会保留 LIVE/REAPING 状态",
+        "禁止直接 memset/free",
+        "shutdown 观察者每次条件等待前重取共享最短 D",
+        "destroy 不隐式 join",
+        "也不重新锁已销毁的 mutex",
+    ] {
+        assert!(
+            ir.contains(boundary),
+            "worker lifecycle boundary: {boundary}"
+        );
+    }
+    assert!(concurrency.contains("工作条件与状态观察条件分离"));
+    assert!(concurrency.contains("这不是对进程 affinity/cgroup 配额的完整识别"));
+    assert!(concurrency.contains("真实双 worker 重叠执行的定向测试不等于吞吐"));
     assert!(ir.contains("完成先以单次 CAS 预约内部 `COMMITTING`"));
     assert!(ir.contains("后续期限收紧也须预约同一 phase"));
     for boundary in [

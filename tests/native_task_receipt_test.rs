@@ -331,12 +331,13 @@ static KuTaskDriverSnapshotV1 fixture_snapshot(FixtureDriver* runtime, uint32_t 
   KuTaskDriverSnapshotV1 snapshot = {0};
   CHECK(ku_task_driver_snapshot(runtime->driver, &snapshot) == KU_TASK_DRIVER_OK);
   CHECK(snapshot.fault == fault && snapshot.running <= 1u && snapshot.resident <= runtime->capacity);
+  CHECK(snapshot.worker_target == 1u && snapshot.workers_created == 1u);
   return snapshot;
 }
 static void fixture_idle(FixtureDriver* runtime) {
   CHECK(ku_task_driver_wait_idle(runtime->driver, fixture_deadline()) == KU_TASK_DRIVER_OK);
   KuTaskDriverSnapshotV1 snapshot = fixture_snapshot(runtime, 0);
-  CHECK(!snapshot.queued && !snapshot.running && (snapshot.worker_waiting || snapshot.worker_exited));
+  CHECK(!snapshot.queued && !snapshot.running && snapshot.workers_waiting + snapshot.workers_exited == snapshot.workers_created);
 }
 static void fixture_driver_init(FixtureDriver* runtime, size_t capacity) {
   memset(runtime, 0, sizeof(*runtime)); runtime->capacity = capacity;
@@ -345,15 +346,20 @@ static void fixture_driver_init(FixtureDriver* runtime, size_t capacity) {
   runtime->ring = (size_t*)calloc(capacity, sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
   size_t fixed = sizeof(*runtime->driver) + capacity * (sizeof(*runtime->slots) + sizeof(*runtime->ring));
-  for (uint32_t old_abi = 1; old_abi <= 2; ++old_abi) {
+  uint64_t startup_now = ku_task_driver_now_ms();
+  CHECK(startup_now != UINT64_MAX && startup_now < UINT64_MAX - 1000u);
+  uint64_t startup_deadline = startup_now + 1000u;
+  const uint32_t old_versions[] = {1u, 2u, 6u};
+  for (size_t old = 0; old < sizeof(old_versions) / sizeof(old_versions[0]); ++old) {
+    uint32_t old_abi = old_versions[old];
     CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), old_abi,
-        runtime->slots, capacity, runtime->ring, capacity, fixed + 1048576u) == KU_TASK_DRIVER_ABI_MISMATCH);
+        runtime->slots, capacity, runtime->ring, capacity, fixed + 1048576u, 1u, startup_deadline) == KU_TASK_DRIVER_ABI_MISMATCH);
     CHECK(ku_task_frame_zero_bytes(runtime->driver, sizeof(*runtime->driver)));
     CHECK(ku_task_frame_zero_bytes(runtime->slots, capacity * sizeof(*runtime->slots)));
     CHECK(ku_task_frame_zero_bytes(runtime->ring, capacity * sizeof(*runtime->ring)));
   }
   CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), KU_TASK_DRIVER_ABI_VERSION,
-      runtime->slots, capacity, runtime->ring, capacity, fixed + 1048576u) == KU_TASK_DRIVER_OK);
+      runtime->slots, capacity, runtime->ring, capacity, fixed + 1048576u, 1u, startup_deadline) == KU_TASK_DRIVER_OK);
   fixture_idle(runtime); CHECK(fixture_snapshot(runtime, 0).fixed_bytes == fixed);
 }
 static void fixture_start(FixtureDriver* runtime, size_t index, int error) {
@@ -381,20 +387,91 @@ static void fixture_wait_disposed(size_t index) {
   CHECK(fixture_count(&roles[index].disposes) == 1u);
   CHECK(ku_task_driver_cleanup_receipt_read(&roles[index].receipt) == KU_TASK_DRIVER_CLEANUP_ACK);
 }
+/* Fixture-only state observation for a sticky clock fault. The native state
+ * condition and mutex are real; this clock is independent of injected time.
+ * This never changes the driver's cleanup D or reports D-within-budget drain. */
+static void fixture_state_wait_real(KuTaskDriverV1* driver, uint64_t observation_deadline) {
+  uint64_t now = ku_test_real_now_ms();
+  CHECK(now && now < observation_deadline);
+#if defined(_WIN32)
+  uint64_t remaining = observation_deadline - now;
+  CHECK(remaining < (uint64_t)INFINITE);
+  if (!SleepConditionVariableSRW(&driver->condition, &driver->mutex, (DWORD)remaining, 0))
+    CHECK(GetLastError() == ERROR_TIMEOUT);
+#else
+  struct timespec timeout;
+#if defined(__APPLE__)
+  uint64_t remaining = observation_deadline - now;
+  timeout.tv_sec = (time_t)(remaining / 1000u);
+  timeout.tv_nsec = (long)((remaining % 1000u) * 1000000u);
+  int waited = pthread_cond_timedwait_relative_np(&driver->condition, &driver->mutex, &timeout);
+#else
+  /* ABI7 initializes this native condition with CLOCK_MONOTONIC. Convert the
+   * original real observation D directly, never the synthetic runtime D. */
+  timeout.tv_sec = (time_t)(observation_deadline / 1000u);
+  CHECK((uint64_t)timeout.tv_sec == observation_deadline / 1000u);
+  timeout.tv_nsec = (long)((observation_deadline % 1000u) * 1000000u);
+  int waited = pthread_cond_timedwait(&driver->condition, &driver->mutex, &timeout);
+#endif
+  CHECK(waited == 0 || waited == ETIMEDOUT);
+#endif
+}
 static void fixture_driver_finish(FixtureDriver* runtime, uint32_t expected) {
-  CHECK(ku_task_driver_shutdown(runtime->driver, fixture_deadline()) == expected);
-  KuTaskDriverSnapshotV1 snapshot = fixture_snapshot(runtime, expected);
-  CHECK(!snapshot.resident && !snapshot.reserved_bytes && !snapshot.building && !snapshot.queued && !snapshot.running);
-  /* With a sticky broken clock shutdown returns INTERNAL without waiting.
-   * All allocations are already disposed; only final worker/OS ACK remains. */
-  uint64_t deadline = fixture_deadline(); uint32_t destroyed = KU_TASK_DRIVER_PENDING;
-  for (size_t i = 0; i < 4096 && destroyed == KU_TASK_DRIVER_PENDING; ++i) {
-    destroyed = ku_task_driver_destroy(runtime->driver);
-    if (destroyed == KU_TASK_DRIVER_PENDING) { CHECK(ku_test_real_now_ms() < deadline); ku_test_thread_yield(); }
+  CHECK(!ku_task_driver_lock(runtime->driver));
+  CHECK(runtime->driver->worker_target == 1u && runtime->driver->workers_created == 1u);
+  int already_closing = runtime->driver->closing;
+  uint64_t cleanup_deadline = runtime->driver->shutdown_deadline;
+  /* Only explicit shutdown(0) and injected clock fault pre-close these cases. */
+  CHECK(!already_closing || cleanup_deadline == 0u);
+  CHECK(!ku_task_driver_unlock(runtime->driver));
+  uint64_t observation_deadline = 0;
+  if (already_closing) {
+    uint64_t real_now = ku_test_real_now_ms();
+    CHECK(real_now && real_now < UINT64_MAX - 2000u);
+    observation_deadline = real_now + 2000u;
+  } else {
+    uint64_t cleanup_now = ku_task_driver_now_ms();
+    CHECK(cleanup_now != UINT64_MAX && cleanup_now < UINT64_MAX - 1000u);
+    cleanup_deadline = cleanup_now + 1000u;
   }
-  CHECK(destroyed == KU_TASK_DRIVER_OK);
-  free(runtime->ring); free(runtime->slots); free(runtime->driver);
-  memset(runtime, 0, sizeof(*runtime));
+  CHECK(ku_task_driver_shutdown(runtime->driver, cleanup_deadline) == expected);
+  CHECK(!ku_task_driver_lock(runtime->driver));
+  CHECK(runtime->driver->fault == expected && runtime->driver->closing);
+  CHECK(runtime->driver->shutdown_deadline == cleanup_deadline);
+  CHECK(runtime->driver->worker_target == 1u && runtime->driver->workers_created == 1u);
+  CHECK(!runtime->driver->resident && !runtime->driver->reserved_bytes && !runtime->driver->building);
+  CHECK(!runtime->driver->queued && !runtime->driver->running);
+  /* INTERNAL from the injected clock can precede the final unlocked worker
+   * tail. Wait on the actual state predicate, not the broken clock API. */
+  while (runtime->driver->workers_exited != runtime->driver->workers_created) {
+    CHECK(already_closing && runtime->driver->clock_fault && expected == KU_TASK_DRIVER_INTERNAL);
+    CHECK(!runtime->driver->workers_exited && runtime->driver->workers_waiting <= 1u);
+    fixture_state_wait_real(runtime->driver, observation_deadline);
+  }
+  CHECK(!runtime->driver->workers_waiting && !runtime->driver->workers_joined);
+  CHECK(runtime->driver->workers[0].state == KU_TASK_DRIVER_WORKER_EXITED);
+  CHECK(!runtime->driver->workers[0].joined && !runtime->driver->workers[0].closed);
+  CHECK(!ku_task_driver_unlock(runtime->driver));
+  if (already_closing) {
+    /* Actual callbacks, Tasks and all logical workers are finished. Observing
+     * OS readiness is not a renewed cleanup budget and does not own the handle.
+     * join(original D=0) below alone records joining/closing, even with fault. */
+    uint64_t real_now = ku_test_real_now_ms();
+    CHECK(real_now && real_now < observation_deadline);
+#if defined(_WIN32)
+    CHECK(observation_deadline - real_now < (uint64_t)INFINITE);
+    CHECK(WaitForSingleObject(runtime->driver->workers[0].thread,
+        (DWORD)(observation_deadline - real_now)) == WAIT_OBJECT_0);
+#endif
+  }
+  CHECK(ku_task_driver_join(runtime->driver, cleanup_deadline) == KU_TASK_DRIVER_OK);
+  KuTaskDriverSnapshotV1 snapshot = fixture_snapshot(runtime, expected);
+  CHECK(snapshot.worker_target == 1u && snapshot.workers_created == 1u);
+  CHECK(!snapshot.resident && !snapshot.reserved_bytes && !snapshot.building && !snapshot.queued && !snapshot.running);
+  CHECK(!snapshot.workers_waiting && snapshot.workers_exited == 1u && snapshot.workers_joined == 1u);
+  CHECK(runtime->driver->workers[0].joined && runtime->driver->workers[0].closed);
+  CHECK(ku_task_driver_destroy(runtime->driver) == KU_TASK_DRIVER_OK);
+  free(runtime->ring); free(runtime->slots); free(runtime->driver); memset(runtime, 0, sizeof(*runtime));
 }
 static void fixture_check_observer(FixtureDriver* runtime, const KuTaskControlLeaseV1* observer,
                                    size_t charge, uint32_t payload, uint32_t fault) {
@@ -702,7 +779,7 @@ static void fixture_corrupt_ack_process(void) {
   CHECK(ku_task_driver_cleanup_receipt_read(&roles[0].receipt) == KU_TASK_DRIVER_INTERNAL);
   KuTaskDriverSnapshotV1 snapshot = fixture_snapshot(runtime, KU_TASK_DRIVER_INTERNAL);
   CHECK(snapshot.resident == 1u && snapshot.reserved_bytes == charge && !snapshot.queued && !snapshot.running);
-  CHECK(snapshot.terminal_held == 1u && snapshot.worker_waiting);
+  CHECK(snapshot.terminal_held == 1u && snapshot.workers_waiting == 1u);
   CHECK(!ku_task_driver_lock(runtime->driver));
   KuTaskDriverSlotV1* slot = &runtime->slots[0];
   CHECK(slot->cleanup_fault == KU_TASK_DRIVER_INTERNAL && !slot->cleanup_acked_generation);
@@ -733,7 +810,7 @@ static void fixture_corrupt_ack_process(void) {
   puts("task-receipt-corruption-quarantined-not-drained");
 }
 int main(int argc, char** argv) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 6u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 7u);
   CHECK(KU_TASK_FRAME_ABI_VERSION == 4u);
   ku_task_control_atomic_init(&fixture_bad_clock, 0);
   if (argc == 2 && !strcmp(argv[1], "--corrupt-ack")) { fixture_corrupt_ack_process(); return 0; }
