@@ -2876,6 +2876,159 @@ fn main(): null! {
 }
 
 #[test]
+fn http_handler_lexical_capture_replay_rejects_shadowed_outer_copy_writes() {
+    for (label, declaration, call) in [
+        (
+            "lambda",
+            "mutate = () => { count = count + 1; return null }",
+            "mutate()",
+        ),
+        (
+            "named",
+            "fn mutate(): null { count += 1; return null }",
+            "mutate()",
+        ),
+        (
+            "alias",
+            "mutate = () => { count += 1; return null }\n    alias = mutate.clone()",
+            "alias()",
+        ),
+    ] {
+        let source = format!(
+            r#"
+import "std.http"
+fn main(): null! {{
+    count = 0
+    {declaration}
+    app = http.service()
+    app.get("/", fn() {{
+        count: int = 0
+        {call}
+        return http.text("ok")
+    }})
+    return ok(null)
+}}
+"#
+        );
+        rejects(
+            &format!("http-lexical-shadow-{label}.ku"),
+            &source,
+            "http handler cannot modify captured variable 'count'",
+        );
+    }
+}
+
+#[test]
+fn http_handler_lexical_capture_replay_allows_handler_local_writes() {
+    checks(
+        "http-lexical-handler-local.ku",
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 10
+    app = http.service()
+    app.get("/", fn() {
+        count: int = 0
+        mutate = () => { count += 1; return count }
+        if (mutate() == 1) { return http.text("local") }
+        return http.text("bad")
+    })
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
+fn http_handler_lexical_capture_replay_preserves_read_types_and_scope_cleanup() {
+    checks(
+        "http-lexical-read-types.ku",
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 7
+    read_count = () => { return count }
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        first = read_count()
+        second = read_count()
+        if (first + second == 14) { return http.text(count.clone()) }
+        return http.text("bad")
+    })
+    return ok(null)
+}
+"#,
+    );
+    // Replaying/popping a read-only helper must not hide a later real write.
+    rejects(
+        "http-lexical-replay-followed-by-write.ku",
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 7
+    read_count = () => { return count }
+    mutate = () => { count += 1; return null }
+    app = http.service()
+    app.get("/", fn() {
+        count: int = 0
+        println(read_count())
+        mutate()
+        return http.text("bad")
+    })
+    return ok(null)
+}
+"#,
+        "http handler cannot modify captured variable 'count'",
+    );
+}
+
+#[test]
+fn http_handler_lexical_capture_replay_does_not_capture_owned_local_homonym() {
+    checks(
+        "http-lexical-local-owner.ku",
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 7
+    read_count = () => { return count }
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        println(read_count())
+        return http.text(count)
+    })
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
+fn http_handler_lexical_capture_replay_preserves_recursive_body_guard() {
+    checks(
+        "http-lexical-recursive-read.ku",
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 7
+    fn down(value: int): int {
+        if (value <= 0) { return count }
+        return down(value - 1)
+    }
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        if (down(2) == 7) { return http.text(count.clone()) }
+        return http.text("bad")
+    })
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
 fn http_handler_allows_readonly_captured_function_value() {
     checks(
         "http-handler-readonly-helper.ku",
