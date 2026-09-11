@@ -25,6 +25,7 @@ SPEC.loader.exec_module(BOUNDS)
 TARGETS = (
     ("native_task_tsan_probe_test", "native_task_tsan_instrumentation_and_runtime_probe", True),
     ("native_task_driver_test", "native_task_driver_two_real_workers_overlap_without_same_task_overlap", False),
+    ("native_task_driver_test", "native_task_driver_hot_yield_services_marker_before_cancellation", False),
     ("native_task_control_test", "native_task_control_frame_arbitration_and_references_execute_in_c", False),
     ("native_task_expression_pending_test", "native_task_expression_repeated_pending_preserves_lhs_and_starts_rhs_once", False),
     ("native_task_publishing_deadline_test", "native_task_publishing_cancel_tightens_unacked_child_after_timeout_result_race", False),
@@ -46,19 +47,25 @@ def require_pass(output: bytes, *, canary: bool = False) -> None:
 
 
 def run_command(command: list[str], logs: Path, label: str, timeout: int) -> bytes:
+    if re.fullmatch(r"[a-z][a-z0-9_-]{0,199}", label) is None:
+        raise ValueError("TSan evidence label must be bounded ASCII without path separators")
+    # Exclusive command creation rejects a duplicate before executing it.
+    with (logs / f"{label}.command.json").open("x", encoding="utf-8") as output:
+        output.write(json.dumps(command))
     previous = BOUNDS.COMMAND_TIMEOUT_SECONDS
     BOUNDS.COMMAND_TIMEOUT_SECONDS = timeout
-    (logs / f"{label}.command.json").write_text(json.dumps(command), encoding="utf-8")
     try:
         completed = BOUNDS.run_bounded(command, REPO, label)
     except (SystemExit, OSError) as error:
         # The reused runner includes bounded stdout/stderr for nonzero exits.
-        (logs / f"{label}.failure.txt").write_text(str(error), encoding="utf-8")
+        with (logs / f"{label}.failure.txt").open("x", encoding="utf-8") as output:
+            output.write(str(error))
         raise RuntimeError(f"{label} failed: {error}") from error
     finally:
         BOUNDS.COMMAND_TIMEOUT_SECONDS = previous
     output = completed.stdout + completed.stderr
-    (logs / f"{label}.log").write_bytes(output)
+    with (logs / f"{label}.log").open("xb") as evidence:
+        evidence.write(output)
     print(output.decode("utf-8", errors="replace"), end="", flush=True)
     return output
 
@@ -98,7 +105,7 @@ def main() -> None:
     ):
         run_command(command, args.logs, label, 30)
     build = ["cargo", "test", "--locked", "--no-run"]
-    for target, _, _ in TARGETS:
+    for target in dict.fromkeys(target for target, _, _ in TARGETS):
         build += ["--test", target]
     run_command(build, args.logs, "build", 300)
     for target, name, canary in TARGETS:
@@ -108,7 +115,7 @@ def main() -> None:
         ]
         if canary:
             command.append("--ignored")
-        output = run_command(command, args.logs, target, 300)
+        output = run_command(command, args.logs, f"{target}--{name}", 300)
         require_pass(output, canary=canary)
     print("Linux Task TSan selected-path gate passed; not full-runtime or performance coverage.", flush=True)
 

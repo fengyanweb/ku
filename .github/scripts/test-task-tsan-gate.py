@@ -72,10 +72,95 @@ class TSanGateContracts(unittest.TestCase):
             self.assertEqual((Path(temporary) / "probe.log").read_bytes(), output)
             self.assertIn("cargo", (Path(temporary) / "probe.command.json").read_text())
 
+    def test_duplicate_label_preserves_evidence_without_running_twice(self) -> None:
+        done = subprocess.CompletedProcess([], 0, PASS, b"")
+        original = GATE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            GATE.BOUNDS, "run_bounded", return_value=done,
+        ) as run, patch("builtins.print"):
+            logs = Path(temporary)
+            GATE.run_command(["first"], logs, "same-target", 20)
+            command_before = (logs / "same-target.command.json").read_bytes()
+            output_before = (logs / "same-target.log").read_bytes()
+            with self.assertRaises(FileExistsError):
+                GATE.run_command(["second"], logs, "same-target", 20)
+            run.assert_called_once_with(["first"], GATE.REPO, "same-target")
+            self.assertEqual((logs / "same-target.command.json").read_bytes(), command_before)
+            self.assertEqual((logs / "same-target.log").read_bytes(), output_before)
+        self.assertEqual(GATE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original)
+
+    def test_invalid_evidence_labels_rejected_before_file_or_process_use(self) -> None:
+        for label in ("", "../outside", "nested/name", r"nested\name", "a" * 201, "é", "a\nb", "Upper"):
+            with self.subTest(label=label), patch.object(Path, "open") as opening, patch.object(
+                GATE.BOUNDS, "run_bounded",
+            ) as run:
+                with self.assertRaises(ValueError):
+                    GATE.run_command(["not-executed"], Path("unused"), label, 20)
+                opening.assert_not_called()
+                run.assert_not_called()
+
+    def test_main_runs_seven_exact_tests_with_unique_logs_and_deduplicated_build(self) -> None:
+        expected = (
+            ("native_task_tsan_probe_test", "native_task_tsan_instrumentation_and_runtime_probe", True),
+            ("native_task_driver_test", "native_task_driver_two_real_workers_overlap_without_same_task_overlap", False),
+            ("native_task_driver_test", "native_task_driver_hot_yield_services_marker_before_cancellation", False),
+            ("native_task_control_test", "native_task_control_frame_arbitration_and_references_execute_in_c", False),
+            ("native_task_expression_pending_test", "native_task_expression_repeated_pending_preserves_lhs_and_starts_rhs_once", False),
+            ("native_task_publishing_deadline_test", "native_task_publishing_cancel_tightens_unacked_child_after_timeout_result_race", False),
+            ("native_task_cleanup_commit_test", "native_task_requested_cancel_tightens_unacked_child_before_cleanup_commit", False),
+        )
+        self.assertEqual(GATE.TARGETS, expected)
+        calls = []
+
+        def record(command, logs, label, timeout):
+            calls.append((command, label, timeout))
+            return PASS
+
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = Path(temporary) / "fresh"
+            with patch.object(
+                GATE.sys, "argv", ["task-tsan-gate.py", "--logs", str(logs)],
+            ), patch.object(GATE, "require_host", return_value="/test/clang"), patch.object(
+                GATE, "run_command", side_effect=record,
+            ), patch.dict(GATE.os.environ, {}, clear=True), patch("builtins.print"):
+                GATE.main()
+                self.assertEqual(GATE.os.environ["KU_NATIVE_REQUIRE_TSAN"], "1")
+                self.assertEqual(GATE.os.environ["TSAN_OPTIONS"], "halt_on_error=1:exitcode=66")
+                self.assertEqual(GATE.os.environ["KU_CC"], "/test/clang")
+
+        self.assertEqual(len(calls), 11)  # Three metadata calls, one build, seven exact tests.
+        self.assertEqual([label for _, label, _ in calls[:4]], [
+            "commit", "rust-version", "clang-version", "build",
+        ])
+        unique_targets = list(dict.fromkeys(target for target, _, _ in expected))
+        self.assertEqual(len(unique_targets), 6)
+        build = ["cargo", "test", "--locked", "--no-run"]
+        for target in unique_targets:
+            build += ["--test", target]
+        self.assertEqual(calls[3], (build, "build", 300))
+        invocations = calls[4:]
+        self.assertEqual(len(invocations), 7)
+        labels = []
+        for (command, label, timeout), (target, name, canary) in zip(invocations, expected):
+            wanted = [
+                "cargo", "test", "--locked", "--test", target, name,
+                "--", "--exact", "--nocapture", "--test-threads=1",
+            ]
+            if canary:
+                wanted.append("--ignored")
+            self.assertEqual(command, wanted)
+            self.assertEqual(label, f"{target}--{name}")
+            self.assertRegex(label, r"^[a-z][a-z0-9_-]{0,199}$")
+            self.assertEqual(timeout, 300)
+            labels.append(label)
+        self.assertEqual(len(set(labels)), 7)
+        self.assertEqual(sum("--ignored" in command for command, _, _ in invocations), 1)
+
     def test_only_detector_probe_is_explicitly_ignored(self) -> None:
-        self.assertEqual(len(GATE.TARGETS), 6)
+        self.assertEqual(len(GATE.TARGETS), 7)
         self.assertEqual(sum(canary for _, _, canary in GATE.TARGETS), 1)
         self.assertEqual(len({target for target, _, _ in GATE.TARGETS}), 6)
+        self.assertEqual(len({(target, name) for target, name, _ in GATE.TARGETS}), 7)
         self.assertEqual(GATE.TSAN_OPTIONS, "halt_on_error=1:exitcode=66")
         self.assertNotIn("suppress", GATE.TSAN_OPTIONS)
         self.assertNotIn("ignore", GATE.TSAN_OPTIONS)
