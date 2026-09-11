@@ -311,14 +311,18 @@ def verify(args: argparse.Namespace) -> None:
              "-o", f"-h 127.0.0.1 -p {port} -c shared_buffers=16MB -c max_connections=10 -c timezone=GMT -c log_timezone=GMT -c logging_collector=off"]
     windows_job = None
     process = None
+    resumed = False
     succeeded = False
     try:
         with (root / "startup.log").open("ab", buffering=0) as log:
+            # Contain pg_ctl before it can launch CMD/postgres descendants.
             process = subprocess.Popen(start, cwd=root, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW)
+                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW | 0x00000004)
             windows_job = BOUNDS.WindowsJob.attach(process)
             if windows_job is None:
                 raise RuntimeError("Could not contain the temporary PostgreSQL server in a Windows Job")
+            BOUNDS.resume_suspended_windows_process(process)
+            resumed = True
             if process.wait(timeout=25) != 0:
                 raise RuntimeError("Temporary PostgreSQL startup failed; inspect its private startup/server log")
         print(f"Started isolated PostgreSQL 17.10 on 127.0.0.1:{port}", flush=True)
@@ -332,7 +336,7 @@ def verify(args: argparse.Namespace) -> None:
         succeeded = True
     finally:
         try:
-            if (root / "data" / "postmaster.pid").exists():
+            if resumed and (root / "data" / "postmaster.pid").exists():
                 run([ctl, "stop", "-D", str(root / "data"), "-m", "immediate", "-w", "-t", "20"],
                     root, "stop isolated PostgreSQL cluster", 25)
         finally:
@@ -340,7 +344,9 @@ def verify(args: argparse.Namespace) -> None:
                 windows_job.terminate()
                 windows_job.close()
             if process is not None and process.poll() is None:
-                BOUNDS.kill_process_tree(process, None)
+                # Retain the actual Job identity even after close; only a failed
+                # pre-resume assignment reaches the helper's no-Job contract.
+                BOUNDS.kill_process_tree(process, windows_job)
                 process.wait(timeout=5)
         if (root / "data" / "postmaster.pid").exists():
             raise RuntimeError("PostgreSQL shutdown was not confirmed; preserve fixture for investigation")

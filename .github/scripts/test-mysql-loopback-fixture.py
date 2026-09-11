@@ -314,6 +314,81 @@ class MysqlFixtureTests(unittest.TestCase):
         kill.assert_called_once()
         process.wait.assert_called_once_with(timeout=10)
 
+    def test_no_job_failure_paths_use_actual_shared_held_handle_cleanup(self) -> None:
+        for stage in ("none", "exception", "wait_timeout"):
+            with self.subTest(stage=stage):
+                process = MagicMock()
+                process.poll.return_value = None
+                if stage == "wait_timeout":
+                    process.wait.side_effect = subprocess.TimeoutExpired("held fixture root", 10)
+                attach_error = OSError("assignment setup failed") if stage == "exception" else None
+                expected = subprocess.TimeoutExpired if stage == "wait_timeout" else OSError if stage == "exception" else RuntimeError
+                try:
+                    with F.operation(self.root), \
+                         patch.object(F.subprocess, "Popen", return_value=process), \
+                         patch.object(F.BOUNDS.WindowsJob, "attach", return_value=None, side_effect=attach_error), \
+                         patch.object(F.BOUNDS, "os", SimpleNamespace(name="nt")), \
+                         patch.object(F.BOUNDS, "resume_suspended_windows_process") as resume, \
+                         patch.object(F.BOUNDS, "kill_process_tree", wraps=F.BOUNDS.kill_process_tree) as held_cleanup, \
+                         patch.object(F.subprocess, "run", side_effect=AssertionError("numeric tree forbidden")) as numeric, \
+                         self.assertRaises(expected):
+                        F.MysqlProcess(self.root, ["not executed"]).start()
+                    resume.assert_not_called()
+                    held_cleanup.assert_called_once_with(process, None)
+                    numeric.assert_not_called()
+                    process.kill.assert_called_once_with()
+                    process.wait.assert_called_once_with(timeout=10)
+                    retained = stage == "wait_timeout"
+                    self.assertEqual(retained, (self.root / "server.active").exists())
+                    self.assertEqual(retained, (self.root / "operation.lock").exists())
+                    if retained:
+                        process.stdout.close.assert_not_called()
+                finally:
+                    # Only inert test-owned leaves: isolate later subtests even
+                    # when a red assertion prevents the production cleanup.
+                    (self.root / "server.active").unlink(missing_ok=True)
+                    (self.root / "operation.lock").unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "real harmless held Windows root")
+    def test_no_job_real_suspended_root_uses_actual_shared_helper(self) -> None:
+        real_popen = subprocess.Popen
+        held = []
+        marker = self.root / "harmless-child-executed"
+        child = "from pathlib import Path; Path(" + repr(str(marker)) + ").write_text('inert', encoding='ascii')"
+
+        def launch(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            held.append(process)
+            return process
+
+        server = F.MysqlProcess(self.root, [sys.executable, "-B", "-c", child])
+        try:
+            with patch.object(F.subprocess, "Popen", side_effect=launch) as popen, \
+                 patch.object(F.BOUNDS.WindowsJob, "attach", return_value=None), \
+                 patch.object(F.BOUNDS, "resume_suspended_windows_process") as resume, \
+                 patch.object(F.BOUNDS, "kill_process_tree", wraps=F.BOUNDS.kill_process_tree) as held_cleanup, \
+                 patch.object(F.subprocess, "run", side_effect=AssertionError("numeric tree forbidden")) as numeric, \
+                 self.assertRaisesRegex(RuntimeError, "contain"):
+                server.start()
+            self.assertEqual(1, len(held))
+            self.assertTrue(popen.call_args.kwargs["creationflags"] & 4)
+            self.assertIsNotNone(held[0].poll())
+            self.assertIsNone(server.reader)
+            self.assertTrue(held[0].stdout.closed)
+            self.assertFalse(marker.exists())
+            self.assertFalse((self.root / "server.active").exists())
+            resume.assert_not_called()
+            held_cleanup.assert_called_once_with(held[0], None)
+            numeric.assert_not_called()
+        finally:
+            # Assignment failure is injected; root creation/kill/wait are real.
+            # This harmless child cannot spawn a descendant or touch a database.
+            for process in held:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+                process.stdout.close()
+
     def test_process_creation_failure_does_not_leave_false_active_marker(self) -> None:
         with patch.object(F.subprocess, "Popen", side_effect=FileNotFoundError("fixture executable")):
             with self.assertRaises(FileNotFoundError):
