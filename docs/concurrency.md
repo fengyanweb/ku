@@ -151,6 +151,9 @@ await 深度上限: 64
 
 ## 开发者 HTTP 压测 demo
 
+native 调度器维护者可使用[固定工作量观察工具](native-task-scheduler-probe.md)。
+它验证实际 Task 回收并记录独立样本，不是 HTTP 吞吐、全量资源预算或发布验收。
+
 启动 HTTP 服务：
 
 ```powershell
