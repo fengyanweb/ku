@@ -273,13 +273,14 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
             resume,
             &format!("{resume}\n  fixture_source_resume(raw);"),
         );
-        // This is AFTER the real control poll, scheduler state publication and
-        // lease release, with no driver mutex held. It adds no fake progress.
-        let returned = "    if (registry.control) ku_task_control_lease_release(&registry);\n    if (ku_task_driver_lock(driver)) return;";
+        // The real R2 poll has returned with no driver mutex held. This quantum
+        // is still RUNNING until the driver's following locked publication;
+        // Pending has not released the control lifecycle pin or execution lease.
+        let returned = "    uint32_t outcome = ku_task_control_poll(&execution);";
         generated = replace_once(
             generated,
             returned,
-            "    if (registry.control) ku_task_control_lease_release(&registry);\n    fixture_source_poll_returned(driver,outcome);\n    if (ku_task_driver_lock(driver)) return;",
+            &format!("{returned}\n    fixture_source_poll_returned(driver,outcome);"),
         );
         generated = replace_once(
             generated,
@@ -311,7 +312,7 @@ static void fixture_source_poll_returned(void* raw,uint32_t outcome) {
     CHECK(outcome==KU_TASK_CONTROL_PENDING && fixture_resumes==2u);
     KuTaskDriverSnapshotV1 snapshot={0};
     CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
-    CHECK(snapshot.polls==2u && snapshot.queued==1u && !snapshot.running);
+    CHECK(snapshot.polls==1u && !snapshot.queued && snapshot.running==1u);
     CHECK(ku_test_event_set(&fixture_two_polls));
     CHECK(ku_test_event_wait(&fixture_release,2000u));
   }
@@ -343,12 +344,12 @@ int main(void) {
       fixed+sizeof(KuTaskInstance_0),1u,startup_deadline)==KU_TASK_DRIVER_OK);
   KuTaskValueV1 root={0}; CHECK(ku_task_0_start_value(driver,&root)==KU_TASK_DRIVER_OK && root.tag==KU_TASK_VALUE_LIVE);
   /* Two-second event bounds only detect missing startup/progress. They are not
-   * cleanup budgets. The hook observes completed polls; it cannot split one. */
+   * cleanup budgets. The hook observes returned R2 polls, before driver publication. */
   CHECK(ku_test_event_wait(&fixture_two_polls,2000u));
   CHECK(fixture_parent==(KuTaskInstance_0*)root.owner.lease.control);
   CHECK(fixture_resumes==2u && fixture_returned_polls==2u);
   KuTaskDriverSnapshotV1 blocked={0}; CHECK(ku_task_driver_snapshot(driver,&blocked)==KU_TASK_DRIVER_OK);
-  CHECK(blocked.polls==2u && blocked.queued==1u && !blocked.running && !blocked.building
+  CHECK(blocked.polls==1u && !blocked.queued && blocked.running==1u && !blocked.building
       && blocked.resident==1u && blocked.reserved_bytes==sizeof(KuTaskInstance_0)
       && !blocked.fault && !blocked.clock_fault);
   CHECK(ku_task_control_atomic_load(&fixture_parent->control.phase)==KU_TASK_CONTROL_LIVE
@@ -358,6 +359,8 @@ int main(void) {
   CHECK(fixture_ledger().allocations==4u && fixture_ledger().bytes==fixed+sizeof(KuTaskInstance_0));
   uint64_t now=ku_task_driver_now_ms(); CHECK(now!=UINT64_MAX && now<UINT64_MAX-1000u);
   uint64_t deadline=now+1000u;
+  /* R2 returned Pending, but this slot is still RUNNING: the real wrapper
+   * records NOTIFIED before the worker publishes this quantum and requeues. */
   CHECK(ku_task_driver_request_cancel(&root.ticket,&root.owner.lease,KU_TASK_CONTROL_CANCELLED,deadline)==KU_TASK_CONTROL_OK);
   CHECK(ku_test_event_set(&fixture_release));
   KuTaskDriverSnapshotV1 terminal=fixture_source_idle(driver,deadline);
@@ -378,8 +381,8 @@ int main(void) {
       && driver->workers_joined==1u && driver->workers[0].joined && driver->workers[0].closed);
   CHECK(ku_task_driver_destroy(driver)==KU_TASK_DRIVER_OK);
   now=ku_task_driver_now_ms(); CHECK(now!=UINT64_MAX && now<=deadline);
-  /* The worker was joined above. Post-poll observations occur outside the
-   * driver mutex, so final ordinary counters are read only after that join. */
+  /* The worker was joined above: every observed R2 return now has its driver
+   * publication, and no hook can race these final ordinary counter reads. */
   CHECK(fixture_resumes==2u && fixture_returned_polls>=3u && empty.polls==fixture_returned_polls);
   free(ring); free(slots); free(driver);
   CHECK(ku_test_event_destroy(&fixture_two_polls) && ku_test_event_destroy(&fixture_release));

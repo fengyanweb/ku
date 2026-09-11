@@ -2117,12 +2117,16 @@ int main(void) {
 fn native_task_driver_hot_yield_services_marker_before_cancellation() {
     let generated = fixture_source_with_backedge(true);
     let clock_entry = "static uint64_t ku_task_driver_now_ms(void) {";
+    let lock_entry = "static int ku_task_driver_lock(KuTaskDriverV1* driver) {";
+    let unlock_entry = "static int ku_task_driver_unlock(KuTaskDriverV1* driver) {";
     let poll = "uint32_t outcome = ku_task_control_poll(&execution);";
     let published = "driver->building--;\n    slot->state = KU_TASK_DRIVER_PARKED;\n    ku_task_driver_enqueue(driver, ticket->slot);";
     for unique in [
         "typedef struct KuString {",
         "int main(void) {",
         clock_entry,
+        lock_entry,
+        unlock_entry,
         poll,
         published,
     ] {
@@ -2141,9 +2145,20 @@ fn native_task_driver_hot_yield_services_marker_before_cancellation() {
         .replacen(
             clock_entry,
             &format!(
-                "static void fixture_service_published(const KuTaskDriverTicketV1*, const KuTaskDriverSlotV1*);\n\
+                "{HOT_YIELD_LOCK_CALLS_TLS}\n\
+                 static void fixture_service_published(const KuTaskDriverTicketV1*, const KuTaskDriverSlotV1*);\n\
                  static void fixture_service_poll_returned(const KuTaskControlLeaseV1*, uint32_t);\n{clock_entry}"
             ),
+            1,
+        )
+        .replacen(
+            lock_entry,
+            &format!("{lock_entry}\n  fixture_service_count_driver_call(&fixture_service_tls_locks);"),
+            1,
+        )
+        .replacen(
+            unlock_entry,
+            &format!("{unlock_entry}\n  fixture_service_count_driver_call(&fixture_service_tls_unlocks);"),
             1,
         )
         .replacen(
@@ -2223,10 +2238,30 @@ fn native_task_driver_hot_yield_services_marker_before_cancellation() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().replace('\r', ""),
-        "task-driver-hot-yield-cleanup-ok\ntask-driver-hot-yield-service-ok\n"
+        "task-driver-hot-yield-cleanup-ok\ntask-driver-hot-yield-lock-calls-ok intervals=3 locks=6 unlocks=6\ntask-driver-hot-yield-service-ok\n"
     );
     assert!(output.stderr.is_empty());
 }
+
+const HOT_YIELD_LOCK_CALLS_TLS: &str = r#"
+#if defined(_MSC_VER)
+#define FIXTURE_SERVICE_THREAD_LOCAL __declspec(thread)
+#else
+#define FIXTURE_SERVICE_THREAD_LOCAL _Thread_local
+#endif
+/* Only this fixture's generated C is instrumented. The real driver helpers
+ * and OS lock/unlock bodies remain unchanged after the counting statement.
+ * Other threads have distinct TLS, so controller and Held calls are excluded. */
+static FIXTURE_SERVICE_THREAD_LOCAL int fixture_service_tls_counting;
+static FIXTURE_SERVICE_THREAD_LOCAL int fixture_service_tls_overflow;
+static FIXTURE_SERVICE_THREAD_LOCAL uint64_t fixture_service_tls_locks;
+static FIXTURE_SERVICE_THREAD_LOCAL uint64_t fixture_service_tls_unlocks;
+static void fixture_service_count_driver_call(uint64_t* count) {
+  if (!fixture_service_tls_counting) return;
+  if (*count == UINT64_MAX) fixture_service_tls_overflow = 1;
+  else ++*count;
+}
+"#;
 
 const HOT_YIELD_SERVICE_MAIN: &str = r#"
 #if defined(_WIN32)
@@ -2253,6 +2288,9 @@ static int fixture_service_counter_fault, fixture_service_warm_sent, fixture_ser
 static int fixture_service_held_open, fixture_service_gate_timeout, fixture_service_cancel_started;
 static int fixture_service_published_marker, fixture_service_valid;
 static uint64_t fixture_service_published_hot, fixture_service_delta;
+enum { SERVICE_LOCK_INTERVALS = 3, SERVICE_PAIRS_PER_YIELD = 2 };
+static int fixture_service_lock_window_valid;
+static uint64_t fixture_service_window_locks, fixture_service_window_unlocks;
 static size_t fixture_service_index(FixtureTask* task) {
   for (size_t i = 0; i < SERVICE_TASKS; i++)
     if (task->witness == &fixture_service_probes[i].witness) return i;
@@ -2331,7 +2369,21 @@ static void fixture_service_poll_returned(const KuTaskControlLeaseV1* execution,
   fixture_alloc_lock();
   FixtureServiceProbe* probe = &fixture_service_probes[index];
   fixture_service_count(&probe->pending_returns);
+  if (index == SERVICE_HOT && probe->pending_returns == 1) {
+    /* First real R2 return starts the window; its earlier intent is excluded. */
+    fixture_service_tls_locks = fixture_service_tls_unlocks = 0;
+    fixture_service_tls_overflow = 0;
+    fixture_service_tls_counting = 1;
+  }
   if (index == SERVICE_HOT && probe->pending_returns >= 4 && !fixture_service_warm_sent) {
+    /* Freeze BEFORE the existing event permits Marker publication. The other
+     * worker is still Held, so these are three Hot-only yield intervals. */
+    fixture_service_lock_window_valid = probe->pending_returns == SERVICE_LOCK_INTERVALS + 1
+        && fixture_service_tls_counting && !fixture_service_tls_overflow
+        && !fixture_service_held_open && !fixture_service_cancel_started && !fixture_service_published_marker;
+    fixture_service_window_locks = fixture_service_tls_locks;
+    fixture_service_window_unlocks = fixture_service_tls_unlocks;
+    fixture_service_tls_counting = 0;
     fixture_service_warm_sent = 1; notify = 1;
   }
   if (index == SERVICE_MARKER && !fixture_service_marker_sent) {
@@ -2464,6 +2516,11 @@ int main(void) {
   free(runtime.ring); free(runtime.slots); free(runtime.driver);
   fixture_alloc_lock();
   int serialized = !fixture_service_counter_fault && !fixture_service_gate_timeout;
+  uint64_t lock_calls = fixture_service_window_locks, unlock_calls = fixture_service_window_unlocks;
+  uint64_t expected_calls = SERVICE_LOCK_INTERVALS * SERVICE_PAIRS_PER_YIELD;
+  int lock_window_valid = fixture_service_lock_window_valid;
+  int lock_calls_valid = lock_window_valid
+      && lock_calls == expected_calls && unlock_calls == expected_calls;
   for (size_t i = 0; i < SERVICE_TASKS; i++)
     serialized = serialized && fixture_service_probes[i].maximum_active == 1 && !fixture_service_probes[i].active;
   fixture_alloc_unlock();
@@ -2480,11 +2537,15 @@ int main(void) {
   puts("task-driver-hot-yield-cleanup-ok");
   /* delta<=1 describes today's private shared FIFO dispatch policy only.
    * It is not public FIFO, a wall-clock fairness promise or a performance gate. */
-  if (!served || !serialized) {
-    fprintf(stderr, "hot-yield service failed after actual cleanup: served=%d serialized=%d delta=%llu\n",
-        served, serialized, (unsigned long long)delta);
+  if (!served || !serialized || !lock_calls_valid) {
+    fprintf(stderr, "hot-yield service failed after actual cleanup: served=%d serialized=%d delta=%llu lock_window=%d intervals=%u locks=%llu unlocks=%llu expected=%llu\n",
+        served, serialized, (unsigned long long)delta, lock_window_valid, (unsigned)SERVICE_LOCK_INTERVALS,
+        (unsigned long long)lock_calls, (unsigned long long)unlock_calls, (unsigned long long)expected_calls);
     return 1;
   }
+  /* Mechanism only: actual helper calls, not timing, contention or throughput. */
+  printf("task-driver-hot-yield-lock-calls-ok intervals=%u locks=%llu unlocks=%llu\n",
+      (unsigned)SERVICE_LOCK_INTERVALS, (unsigned long long)lock_calls, (unsigned long long)unlock_calls);
   puts("task-driver-hot-yield-service-ok");
   return 0;
 }

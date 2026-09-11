@@ -2030,10 +2030,13 @@ static void ku_task_driver_worker(KuTaskDriverWorkerV1* worker) {
       }
     }
     ku_task_driver_signal(driver);
-    ku_task_driver_unlock(driver);
-    if (execution.control) ku_task_control_lease_release(&execution);
-    if (registry.control) ku_task_control_lease_release(&registry);
-    if (ku_task_driver_lock(driver)) return;
+    /* Any local release may dispose/reenter; retained slot leases need no tail gap. */
+    if (execution.control || registry.control) {
+      ku_task_driver_unlock(driver);
+      if (execution.control) ku_task_control_lease_release(&execution);
+      if (registry.control) ku_task_control_lease_release(&registry);
+      if (ku_task_driver_lock(driver)) return;
+    }
   }
   worker->state = KU_TASK_DRIVER_WORKER_EXITED; driver->workers_exited++;
   ku_task_driver_signal(driver);
