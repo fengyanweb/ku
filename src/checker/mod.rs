@@ -4654,9 +4654,15 @@ impl Checker {
                 // A missing lexical map is not proof of an empty capture set.
                 // Preserve the existing conservative path outside known HTTP
                 // replay bodies, including functions without a capture map.
+                let http_audit = self
+                    .readonly_capture
+                    .is_some_and(|capture| capture.owner == "http handler");
                 let captured: Vec<String> = self.scopes[..boundary]
                     .iter()
                     .flat_map(|scope| scope.keys().cloned())
+                    // A top-level parameter is local to that call, even when
+                    // its spelling matches an owned value in the HTTP caller.
+                    .filter(|name| !http_audit || params.iter().all(|param| &param.name != name))
                     .filter(|name| function_body_uses_name(body, name))
                     .collect();
                 for scope in self.scopes[..boundary].iter_mut() {

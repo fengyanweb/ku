@@ -3005,6 +3005,110 @@ fn main(): null! {
 }
 
 #[test]
+fn http_handler_top_level_parameters_do_not_capture_owned_caller_homonyms() {
+    for (label, body) in [
+        ("read", "return count"),
+        ("expression", "return count + 1"),
+        ("nested", "read = () => { return count }; return read()"),
+    ] {
+        checks(
+            &format!("http-top-parameter-{label}.ku"),
+            &format!(
+                r#"
+import "std.http"
+fn Echo(count: int): int {{ {body} }}
+fn main(): null! {{
+    app = http.service()
+    app.get("/", fn() {{
+        count: str = "local"
+        println(Echo(7))
+        println(Echo(8))
+        return http.text(count)
+    }})
+    return ok(null)
+}}
+"#
+            ),
+        );
+    }
+    checks(
+        "http-top-parameter-alias.ku",
+        r#"
+import "std.http"
+fn Echo(count: int): int { return count }
+fn main(): null! {
+    alias = Echo
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        println(alias(7))
+        return http.text(count)
+    })
+    return ok(null)
+}
+"#,
+    );
+}
+
+#[test]
+fn http_handler_top_level_parameter_exclusion_keeps_real_capture_and_move_errors() {
+    rejects(
+        "http-top-parameter-real-capture.ku",
+        r#"
+import "std.http"
+fn Echo(count: int): int { return count }
+fn main(): null! {
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        read = () => { return count.clone() }
+        println(Echo(7))
+        return http.text(count)
+    })
+    return ok(null)
+}
+"#,
+        "captured",
+    );
+    rejects(
+        "http-top-parameter-consumed.ku",
+        r#"
+import "std.http"
+fn Consume(count: str): null { return null }
+fn main(): null! {
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        Consume(count)
+        return http.text(count)
+    })
+    return ok(null)
+}
+"#,
+        "moved",
+    );
+    rejects(
+        "http-top-parameter-callback-write.ku",
+        r#"
+import "std.http"
+fn Invoke(count: int, op: fn(): null): null { op(); return null }
+fn main(): null! {
+    count = 0
+    mutate = () => { count += 1; return null }
+    app = http.service()
+    app.get("/", fn() {
+        count: str = "local"
+        Invoke(7, mutate.clone())
+        return http.text(count)
+    })
+    return ok(null)
+}
+"#,
+        "http handler cannot modify captured variable 'count'",
+    );
+}
+
+#[test]
 fn http_handler_lexical_capture_replay_preserves_recursive_body_guard() {
     checks(
         "http-lexical-recursive-read.ku",
