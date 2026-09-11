@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -26,6 +27,77 @@ SPEC.loader.exec_module(VERIFIER)
 
 
 class BoundedProcessTests(unittest.TestCase):
+    def test_windows_no_job_uses_retained_handle_without_numeric_pid_or_subprocess(self) -> None:
+        for exited in (False, True):
+            with self.subTest(exited=exited):
+                # Accessing process.pid is not part of this held-root contract.
+                process = mock.Mock(spec=["poll", "kill"])
+                process.poll.return_value = 0 if exited else None
+                with mock.patch.object(VERIFIER, "os", SimpleNamespace(name="nt")), \
+                     mock.patch.object(VERIFIER.subprocess, "run") as numeric:
+                    VERIFIER.kill_process_tree(process, None)
+                numeric.assert_not_called()
+                if exited:
+                    process.kill.assert_not_called()
+                else:
+                    process.kill.assert_called_once_with()
+
+    @unittest.skipUnless(os.name == "nt", "real harmless suspended Windows root")
+    def test_windows_no_job_real_held_root_exits_without_ever_resuming(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ku-native-held-root-") as raw:
+            directory = Path(raw)
+            marker = directory / "executed"
+            child = "from pathlib import Path; Path(" + repr(str(marker)) + ").write_text('inert', encoding='ascii')"
+            process = subprocess.Popen([sys.executable, "-B", "-c", child], cwd=directory,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, creationflags=0x08000204)
+            try:
+                self.assertIsNone(process.poll())
+                with mock.patch.object(VERIFIER.subprocess, "run", side_effect=AssertionError("numeric tree forbidden")):
+                    VERIFIER.kill_process_tree(process, None)
+                process.wait(timeout=5)
+                self.assertIsNotNone(process.poll())
+                self.assertFalse(marker.exists())
+            finally:
+                # The exact process handle, no external PID/PPID discovery.
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+
+    @unittest.skipUnless(os.name == "nt", "real harmless closed Windows Job")
+    def test_windows_closed_job_keeps_identity_for_retained_root_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ku-native-closed-job-") as raw:
+            directory = Path(raw)
+            marker = directory / "executed"
+            child = "from pathlib import Path; Path(" + repr(str(marker)) + ").write_text('inert', encoding='ascii')"
+            process = subprocess.Popen([sys.executable, "-B", "-c", child], cwd=directory,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, creationflags=0x08000204)
+            job = None
+            try:
+                job = VERIFIER.WindowsJob.attach(process)
+                self.assertIsNotNone(job, "host cannot establish required Job containment")
+                job.close()
+                self.assertEqual(job.handle, 0)
+                # A closed Job is still the assigned Job object, not the
+                # unassigned None case. Root exit alone cannot prove this branch.
+                with mock.patch.object(job, "terminate", wraps=job.terminate) as terminate, \
+                     mock.patch.object(VERIFIER.subprocess, "run", side_effect=AssertionError("numeric tree forbidden")):
+                    VERIFIER.kill_process_tree(process, job)
+                terminate.assert_called_once_with()
+                process.wait(timeout=5)
+                self.assertIsNotNone(process.poll())
+                self.assertFalse(marker.exists())
+            finally:
+                if job is not None:
+                    try:
+                        job.terminate()
+                    finally:
+                        job.close()
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+
     @unittest.skipUnless(os.name == "nt", "Windows ToolHelp deadline contract")
     def test_windows_thread_scan_deadline_includes_snapshot_creation(self) -> None:
         process = mock.Mock(pid=os.getpid())
