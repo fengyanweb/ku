@@ -1098,6 +1098,8 @@ fn native_http_route_retains_captured_handler_environment() {
 const LEXICAL_CAPTURE_OWNED_RESPONSE_SOURCE: &str = r#"
 import "std.http"
 
+fn Echo(count: int): int { return count }
+
 fn main(): null! {
     count = 7
     read_count = () => { return count }
@@ -1108,7 +1110,7 @@ fn main(): null! {
     })
     app.post("/capture", fn(req) {
         count: str = req.body
-        observed = read_count()
+        observed = read_count() + Echo(0)
         if (observed == 7) { return http.text(count) }
         return http.text("wrong-lexical-capture")
     })
