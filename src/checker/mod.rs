@@ -4560,7 +4560,6 @@ impl Checker {
                 if self.readonly_function_body_stack.contains(&body_id) {
                     return Ok(return_type.cloned().unwrap_or(Type::Unknown));
                 }
-                self.readonly_function_body_stack.push(body_id);
                 Some(body_id)
             } else {
                 None
@@ -4568,6 +4567,19 @@ impl Checker {
         } else {
             None
         };
+        // Re-auditing a captured helper must not resolve its lexical captures
+        // through same-named locals introduced by the HTTP caller.
+        let replay_scope = if self
+            .readonly_capture
+            .is_some_and(|capture| capture.owner == "http handler")
+        {
+            self.http_capture_replay_scope(body_id, span)?
+        } else {
+            None
+        };
+        if let Some(body_id) = readonly_body_key {
+            self.readonly_function_body_stack.push(body_id);
+        }
         let inference_body_key = guard_inference.then_some(body_id).flatten();
         if let Some(body_id) = inference_body_key {
             self.function_value_inference_stack.push(body_id);
@@ -4581,6 +4593,10 @@ impl Checker {
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
         self.loop_depth = 0;
         self.recoverable_depth = 0;
+        let replayed_captures = replay_scope.is_some();
+        if let Some(scope) = replay_scope {
+            self.scopes.push(scope);
+        }
         self.push_scope();
         // Stage 6c-str: everything defined at or above this scope index is local to
         // the closure body; anything below it is captured from an enclosing scope
@@ -4618,21 +4634,45 @@ impl Checker {
         // outer scope empties the cell (the backend moves out of `(cell)->value`),
         // so mark them and let `record_move` require an explicit clone instead.
         if let Some(&boundary) = self.closure_capture_boundaries.last() {
-            let captured: Vec<String> = self.scopes[..boundary]
-                .iter()
-                .flat_map(|scope| scope.keys().cloned())
-                .filter(|name| function_body_uses_name(body, name))
-                .collect();
-            for scope in self.scopes[..boundary].iter_mut() {
-                for name in &captured {
-                    if let Some(var) = scope.get_mut(name) {
-                        var.captured = true;
+            let lexical_capture_ids = self
+                .readonly_capture
+                .filter(|capture| capture.owner == "http handler")
+                .and(body_id)
+                .and_then(|body_id| self.function_body_outer_bindings.get(&body_id))
+                .map(|bindings| bindings.values().copied().collect::<HashSet<_>>());
+            if let Some(captured_ids) = lexical_capture_ids {
+                // Mark both a replay copy and its original binding, but not a
+                // caller-local homonym or a same-named function parameter.
+                for scope in self.scopes[..boundary].iter_mut() {
+                    for var in scope.values_mut() {
+                        if captured_ids.contains(&var.binding_id) {
+                            var.captured = true;
+                        }
+                    }
+                }
+            } else {
+                // A missing lexical map is not proof of an empty capture set.
+                // Preserve the existing conservative path outside known HTTP
+                // replay bodies, including functions without a capture map.
+                let captured: Vec<String> = self.scopes[..boundary]
+                    .iter()
+                    .flat_map(|scope| scope.keys().cloned())
+                    .filter(|name| function_body_uses_name(body, name))
+                    .collect();
+                for scope in self.scopes[..boundary].iter_mut() {
+                    for name in &captured {
+                        if let Some(var) = scope.get_mut(name) {
+                            var.captured = true;
+                        }
                     }
                 }
             }
         }
         self.closure_capture_boundaries.pop();
         self.pop_scope();
+        if replayed_captures {
+            self.pop_scope();
+        }
         self.current_return = saved_return;
         self.loop_depth = saved_loop_depth;
         self.recoverable_depth = saved_recoverable_depth;
@@ -4645,6 +4685,42 @@ impl Checker {
             debug_assert_eq!(popped, Some(expected_key));
         }
         result
+    }
+
+    /// Reuse the creation-time capture identities used by effect summaries.
+    /// Only shadowed captures need an overlay; parameters and body locals are
+    /// defined in the function scope above it and retain ordinary shadowing.
+    /// A stale/missing lexical identity is not permission to use a homonym.
+    fn http_capture_replay_scope(
+        &self,
+        body_id: Option<FunctionBodyId>,
+        span: Span,
+    ) -> KuResult<Option<HashMap<String, VarType>>> {
+        let Some(captures) =
+            body_id.and_then(|body_id| self.function_body_outer_bindings.get(&body_id))
+        else {
+            return Ok(None);
+        };
+        let mut names = captures.keys().collect::<Vec<_>>();
+        names.sort();
+        let mut replay = HashMap::new();
+        for name in names {
+            let binding_id = captures[name];
+            let visible = self.scopes.iter().rev().find_map(|scope| scope.get(name));
+            if visible.is_some_and(|binding| binding.binding_id == binding_id) {
+                continue;
+            }
+            let binding = self.binding_by_id(binding_id).ok_or_else(|| {
+                KuError::runtime(
+                    format!(
+                        "http handler cannot prove captured variable '{name}' is read-only because its lexical binding is unavailable"
+                    ),
+                    span,
+                )
+            })?;
+            replay.insert(name.clone(), binding.clone());
+        }
+        Ok((!replay.is_empty()).then_some(replay))
     }
 
     fn check_function_value_body_readonly_captures(
@@ -4674,7 +4750,18 @@ impl Checker {
             if self.readonly_function_body_stack.contains(&body_id) {
                 return Ok(function.return_type.cloned().unwrap_or(Type::Unknown));
             }
+        }
+        let replay_scope = if effective_capture.owner == "http handler" {
+            self.http_capture_replay_scope(function.body_id, span)?
+        } else {
+            None
+        };
+        if let Some(body_id) = function.body_id {
             self.readonly_function_body_stack.push(body_id);
+        }
+        let replayed_captures = replay_scope.is_some();
+        if let Some(scope) = replay_scope {
+            self.scopes.push(scope);
         }
         self.push_scope();
         self.readonly_capture = Some(effective_capture);
@@ -4731,6 +4818,9 @@ impl Checker {
         self.try_exit_collectors = saved_try_exit_collectors;
         self.readonly_capture = saved_capture;
         self.pop_scope();
+        if replayed_captures {
+            self.pop_scope();
+        }
         if let Some(expected_body_id) = function.body_id {
             let popped = self.readonly_function_body_stack.pop();
             debug_assert_eq!(popped, Some(expected_body_id));
@@ -7518,13 +7608,32 @@ impl Checker {
 
     fn readonly_capture_for_outer_binding(&self, name: &str) -> Option<ReadonlyCapture> {
         let capture = self.readonly_capture?;
-        self.scopes
+        if capture.owner != "http handler" {
+            return self
+                .scopes
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, scope)| scope.contains_key(name).then_some(index))
+                .filter(|index| *index < capture.boundary)
+                .map(|_| capture);
+        }
+        let binding_id = self
+            .scopes
             .iter()
-            .enumerate()
             .rev()
-            .find_map(|(index, scope)| scope.contains_key(name).then_some(index))
-            .filter(|index| *index < capture.boundary)
-            .map(|_| capture)
+            .find_map(|scope| scope.get(name))?
+            .binding_id;
+        // A replay scope is physically inside the handler but contains the
+        // original binding identity. Local homonyms have fresh identities.
+        self.scopes[..capture.boundary]
+            .iter()
+            .any(|scope| {
+                scope
+                    .get(name)
+                    .is_some_and(|binding| binding.binding_id == binding_id)
+            })
+            .then_some(capture)
     }
 
     fn reject_readonly_capture_assignment(&self, name: &str, span: Span) -> KuResult<()> {

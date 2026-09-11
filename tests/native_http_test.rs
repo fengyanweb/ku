@@ -1095,6 +1095,112 @@ fn native_http_route_retains_captured_handler_environment() {
     assert!(response.ends_with("\r\n\r\ncaptured-route"), "{response}");
 }
 
+const LEXICAL_CAPTURE_OWNED_RESPONSE_SOURCE: &str = r#"
+import "std.http"
+
+fn main(): null! {
+    count = 7
+    read_count = () => { return count }
+    app = http.service({
+        max_connections: 4,
+        max_active_requests: 1,
+        max_pending_requests: 2
+    })
+    app.post("/capture", fn(req) {
+        count: str = req.body
+        observed = read_count()
+        if (observed == 7) { return http.text(count) }
+        return http.text("wrong-lexical-capture")
+    })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+
+#[test]
+fn native_http_lexical_capture_replay_preserves_local_owned_response() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let Some(mut server) = spawn_native_server(
+        "lexical-capture-owned-response",
+        LEXICAL_CAPTURE_OWNED_RESPONSE_SOURCE,
+        &address,
+    ) else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a real native compiler"
+        );
+        return;
+    };
+    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
+    // A different owned request body on each call must reach the response
+    // without clone. That branch also requires the helper's outer int capture,
+    // not the same-named handler-local string. This is not a soak/leak proof.
+    for body in ["first-owned", "second-owned", "third-owned"] {
+        let request = format!(
+            "POST /capture HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let response = http_response(&address, &request, Duration::from_secs(5));
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert_eq!(
+            response.split_once("\r\n\r\n").expect("HTTP headers").1,
+            body,
+            "helper must read outer count=7 and move only the per-request string"
+        );
+        assert!(!watchdog.timed_out(), "native HTTP watchdog fired");
+    }
+}
+
+#[test]
+fn native_http_lexical_capture_replay_rejects_shadowed_write_before_c_emission() {
+    let dir = unique_temp_dir("lexical-capture-write-rejected");
+    let entry = "server.ku";
+    fs::write(
+        dir.join(entry),
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 0
+    mutate = () => { count += 1; return null }
+    app = http.service()
+    app.get("/", fn() {
+        count: int = 0
+        mutate()
+        return http.text("bad")
+    })
+    return ok(null)
+}
+"#,
+    )
+    .expect("write rejected HTTP source");
+    let mut command = Command::new(ku_binary());
+    // No -o: the compatibility command stops at checker/C emission, without
+    // linking an executable or starting the rejected handler.
+    command.current_dir(&dir).args(["build", "--native", entry]);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, BUILD_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("HTTP rejection check was not bounded: {error}"));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "shadowed outer write was accepted: {combined}"
+    );
+    assert!(
+        combined.contains("http handler cannot modify captured variable 'count'"),
+        "expected lexical capture rejection, got: {combined}"
+    );
+    assert!(
+        !dir.join("server.c").exists(),
+        "rejected HTTP source emitted C in {}",
+        dir.display()
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
 // Field-assignment config form (`app.max_body_bytes = 4`) — the exact scenario 2
 // source from cli_v001. Exercises 404 / 405 / 413 / 400 / 431 on native.
 const ERRORS_SOURCE: &str = r#"
