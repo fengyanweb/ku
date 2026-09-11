@@ -7,7 +7,15 @@ use crate::{
     stdlib::metadata::{self, ArgRule, Signature, TypePattern},
 };
 
+mod generic;
+#[cfg(test)]
+mod loop_analysis_tests;
+mod statement_depth;
+pub(crate) use generic::{native_local_generic_span, native_specialization_plan, GenericCallSite};
+
 const MAX_CHECK_DEPTH: usize = 32;
+// Shared by nested speculative loop passes, never replenished per loop.
+const MAX_LOOP_ANALYSIS_WORK: usize = 100_000;
 /// Prefix owned by the compiler's generated C identifiers; see `reject_reserved_name`.
 const RESERVED_NAME_PREFIX: &str = "__ku_";
 /// Sub-namespaces the import expander synthesizes inside the reserved prefix. These
@@ -468,6 +476,10 @@ pub struct Checker {
     /// exit; after its finally is checked, still-pending exits are forwarded to
     /// the parent so nested try/finally chains preserve execution order.
     try_exit_collectors: Vec<TryExitCollector>,
+    generic_state: generic::GenericState,
+    loop_analysis_remaining: usize,
+    loop_analysis_depth: usize,
+    loop_analysis_exhausted: Option<Span>,
 }
 
 impl Checker {
@@ -494,6 +506,10 @@ impl Checker {
             function_body_outer_bindings: HashMap::new(),
             closure_capture_boundaries: Vec::new(),
             try_exit_collectors: Vec::new(),
+            generic_state: generic::GenericState::default(),
+            loop_analysis_remaining: MAX_LOOP_ANALYSIS_WORK,
+            loop_analysis_depth: 0,
+            loop_analysis_exhausted: None,
         }
     }
 
@@ -539,6 +555,12 @@ impl Checker {
     }
 
     pub fn check(mut self, program: &Program) -> KuResult<()> {
+        self.check_program(program)?;
+        self.check_generic_instances()
+    }
+
+    fn check_program(&mut self, program: &Program) -> KuResult<()> {
+        statement_depth::check(program)?;
         let mut top_level_names = HashMap::new();
         for item in &program.items {
             match item {
@@ -699,9 +721,27 @@ impl Checker {
             }
         }
 
+        let has_generic_functions = self
+            .functions
+            .values()
+            .any(|function| !function.type_params.is_empty());
         for item in &program.items {
             if let Item::Function(function) = item {
-                self.check_function(function)?;
+                if has_generic_functions {
+                    self.generic_state.context.clone_from(&function.name);
+                }
+                // Template variables remain in scope throughout the body, not
+                // only in its signature. Concrete rechecks install actual types.
+                self.generic_state.bindings.extend(
+                    function
+                        .type_params
+                        .iter()
+                        .map(|name| (name.clone(), Type::Generic(name.clone()))),
+                );
+                let checked = self.check_function(function);
+                self.generic_state.bindings.clear();
+                self.check_loop_analysis_budget()?;
+                checked?;
             }
         }
         Ok(())
@@ -905,6 +945,9 @@ impl Checker {
                 }
                 Ok(Type::Union(resolved))
             }
+            TypeName::Custom(name) if self.generic_state.bindings.contains_key(name) => {
+                Ok(self.generic_state.bindings[name].clone())
+            }
             TypeName::Custom(name) if generics.contains(name) => Ok(Type::Generic(name.clone())),
             TypeName::Custom(name) if self.structs.contains_key(name) => {
                 Ok(Type::Struct(name.clone()))
@@ -986,6 +1029,10 @@ impl Checker {
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) -> KuResult<()> {
+        self.check_loop_analysis_budget()?;
+        if self.loop_analysis_depth != 0 {
+            self.charge_loop_analysis(stmt_span(stmt))?;
+        }
         match stmt {
             Stmt::VarDecl {
                 name,
@@ -1198,10 +1245,14 @@ impl Checker {
                 body,
                 span,
             } => {
-                self.expect_condition(condition, *span)?;
+                // A backedge reaches the condition, not the already-consumed
+                // state after its first evaluation.
                 let before = self.scopes.clone();
-                let top = self.compute_loop_top(&before, body, None);
+                let top = self.compute_loop_top(&before, Some(condition), body, None, *span);
                 self.scopes = top;
+                self.check_loop_analysis_budget()?;
+                self.expect_condition(condition, *span)?;
+                let condition_exit = self.scopes.clone();
                 self.loop_depth += 1;
                 self.loop_break_states.push(Vec::new());
                 self.loop_continue_states.push(Vec::new());
@@ -1210,7 +1261,12 @@ impl Checker {
                 self.loop_continue_states.pop();
                 self.loop_depth -= 1;
                 result?;
-                self.scopes = self.after_loop_state(before, self.scopes.clone(), breaks);
+                // Body fallthrough/continue first evaluates the condition again.
+                // Its post-condition state covers the false edge; a body re-init
+                // cannot make a value consumed by that last condition live.
+                let mut exits = vec![condition_exit.clone()];
+                exits.extend(breaks);
+                self.scopes = merge_moved_scope_paths(condition_exit, &exits);
                 Ok(())
             }
             Stmt::For {
@@ -1249,8 +1305,10 @@ impl Checker {
                 let before = self.scopes.clone();
                 let top = self.compute_loop_top(
                     &before,
+                    None,
                     body,
                     Some((name, &element, &element_provenance)),
+                    *span,
                 );
                 self.scopes = top;
                 self.push_scope();
@@ -1728,7 +1786,7 @@ impl Checker {
                         return Ok(ty);
                     }
                     if let ExprKind::Variable(name) = &callee.kind {
-                        if let Some(function) = self.functions.get(name).cloned() {
+                        if let Some(function) = (!self.contains(name)).then(|| self.functions.get(name).cloned()).flatten() {
                             if function.params.len() != args.len() {
                                 return Err(KuError::runtime(
                                     format!(
@@ -1767,6 +1825,9 @@ impl Checker {
                                 ));
                             }
                             let returns = substitute_generics(&function.returns, &generic_bindings);
+                            if !function.type_params.is_empty() {
+                                self.record_generic_call(name, &function, &generic_bindings, &actual_arg_types, expr.span)?;
+                            }
                             let effect_params = function
                                 .value_params
                                 .iter()
@@ -3131,7 +3192,11 @@ impl Checker {
         // Record that move after the arms are checked, so later uses (a second
         // match, a clone, passing it on) are rejected instead of silently reading
         // an emptied payload.
-        let consumes_scrutinee = self.match_consumes_scrutinee(&value_type, arms);
+        // Task-containing match input is itself an owning read. Otherwise a
+        // binding arm could transfer its handle while the original name remained
+        // available for a second await (including through a container wrapper).
+        let consumes_scrutinee = self.match_consumes_scrutinee(&value_type, arms)
+            || self.match_guard_type_contains_task(&value_type);
         if consumes_scrutinee && self.borrowed_expr_root(value).is_some() {
             return Err(KuError::runtime("borrowed operation is not supported: match with owned payload binding; clone the scrutinee first", value.span));
         }
@@ -3186,10 +3251,39 @@ impl Checker {
                 covered_patterns.insert(key);
             }
             if let Some(guard) = &arm.guard {
+                // A guard probes this arm; failure must leave its Task payloads
+                // available to later arms. Track only the newly bound pattern
+                // variables, so creating/awaiting an unrelated Task stays legal.
+                let tentative_tasks = self
+                    .scopes
+                    .last()
+                    .expect("match arm scope")
+                    .iter()
+                    .filter(|(_, binding)| self.match_guard_type_contains_task(&binding.ty))
+                    .map(|(name, binding)| {
+                        (name.clone(), binding.binding_id, binding.moves.clone())
+                    })
+                    .collect::<Vec<_>>();
                 let guard_type = self.check_expr(guard)?;
                 if guard_type != Type::Bool {
                     self.pop_scope();
                     return Err(type_error(guard.span, &Type::Bool, &guard_type));
+                }
+                for (name, id, previous_moves) in tentative_tasks {
+                    let changed = self
+                        .scopes
+                        .last()
+                        .and_then(|scope| scope.get(&name))
+                        .is_some_and(|binding| {
+                            binding.binding_id == id && binding.moves != previous_moves
+                        });
+                    if changed {
+                        self.pop_scope();
+                        return Err(KuError::runtime(
+                            format!("cannot consume tentative Task binding '{name}' in a match guard; await or move it only in the selected arm"),
+                            guard.span,
+                        ).with_diagnostic_id(crate::error::DiagnosticId::TaskGuardMove));
+                    }
                 }
             }
             let actual = self.consume_expr(&arm.value);
@@ -3232,6 +3326,34 @@ impl Checker {
             self.consume_expr(value)?;
         }
         Ok(result_type)
+    }
+
+    fn match_guard_type_contains_task(&self, root: &Type) -> bool {
+        let mut pending = vec![root];
+        let mut structs = HashSet::new();
+        let mut enums = HashSet::new();
+        while let Some(ty) = pending.pop() {
+            match ty {
+                Type::Task(_) => return true,
+                Type::Array(inner) | Type::Result(inner) => pending.push(inner),
+                Type::Union(types) => pending.extend(types),
+                Type::Object(fields) => pending.extend(fields.values()),
+                Type::Struct(name) if structs.insert(name.as_str()) => {
+                    if let Some(layout) = self.structs.get(name) {
+                        pending.extend(layout.fields.values());
+                    }
+                }
+                Type::Enum(name) if enums.insert(name.as_str()) => {
+                    if let Some(layout) = self.enums.get(name) {
+                        pending.extend(layout.variants.values().flatten());
+                    }
+                }
+                // Function signatures do not own their parameter/return types;
+                // captures have their own existing move checks.
+                _ => {}
+            }
+        }
+        false
     }
 
     /// True when matching `value` binds an owned enum payload — the backend moves
@@ -3614,7 +3736,7 @@ impl Checker {
                     span,
                 ));
             }
-            if self.is_owned_type(&target_type) {
+            if self.is_owned_type(&target_type) || matches!(target_type, Type::Generic(_)) {
                 // Cloning reads the WHOLE value, so it must be fully live: a
                 // partially-moved struct would clone an already-emptied field.
                 if let PlaceClass::Movable(place) = self.classify_place(target) {
@@ -4438,7 +4560,6 @@ impl Checker {
                 if self.readonly_function_body_stack.contains(&body_id) {
                     return Ok(return_type.cloned().unwrap_or(Type::Unknown));
                 }
-                self.readonly_function_body_stack.push(body_id);
                 Some(body_id)
             } else {
                 None
@@ -4446,6 +4567,19 @@ impl Checker {
         } else {
             None
         };
+        // Re-auditing a captured helper must not resolve its lexical captures
+        // through same-named locals introduced by the HTTP caller.
+        let replay_scope = if self
+            .readonly_capture
+            .is_some_and(|capture| capture.owner == "http handler")
+        {
+            self.http_capture_replay_scope(body_id, span)?
+        } else {
+            None
+        };
+        if let Some(body_id) = readonly_body_key {
+            self.readonly_function_body_stack.push(body_id);
+        }
         let inference_body_key = guard_inference.then_some(body_id).flatten();
         if let Some(body_id) = inference_body_key {
             self.function_value_inference_stack.push(body_id);
@@ -4459,6 +4593,10 @@ impl Checker {
         self.current_return = return_type.cloned().unwrap_or(Type::Unknown);
         self.loop_depth = 0;
         self.recoverable_depth = 0;
+        let replayed_captures = replay_scope.is_some();
+        if let Some(scope) = replay_scope {
+            self.scopes.push(scope);
+        }
         self.push_scope();
         // Stage 6c-str: everything defined at or above this scope index is local to
         // the closure body; anything below it is captured from an enclosing scope
@@ -4496,21 +4634,51 @@ impl Checker {
         // outer scope empties the cell (the backend moves out of `(cell)->value`),
         // so mark them and let `record_move` require an explicit clone instead.
         if let Some(&boundary) = self.closure_capture_boundaries.last() {
-            let captured: Vec<String> = self.scopes[..boundary]
-                .iter()
-                .flat_map(|scope| scope.keys().cloned())
-                .filter(|name| function_body_uses_name(body, name))
-                .collect();
-            for scope in self.scopes[..boundary].iter_mut() {
-                for name in &captured {
-                    if let Some(var) = scope.get_mut(name) {
-                        var.captured = true;
+            let lexical_capture_ids = self
+                .readonly_capture
+                .filter(|capture| capture.owner == "http handler")
+                .and(body_id)
+                .and_then(|body_id| self.function_body_outer_bindings.get(&body_id))
+                .map(|bindings| bindings.values().copied().collect::<HashSet<_>>());
+            if let Some(captured_ids) = lexical_capture_ids {
+                // Mark both a replay copy and its original binding, but not a
+                // caller-local homonym or a same-named function parameter.
+                for scope in self.scopes[..boundary].iter_mut() {
+                    for var in scope.values_mut() {
+                        if captured_ids.contains(&var.binding_id) {
+                            var.captured = true;
+                        }
+                    }
+                }
+            } else {
+                // A missing lexical map is not proof of an empty capture set.
+                // Preserve the existing conservative path outside known HTTP
+                // replay bodies, including functions without a capture map.
+                let http_audit = self
+                    .readonly_capture
+                    .is_some_and(|capture| capture.owner == "http handler");
+                let captured: Vec<String> = self.scopes[..boundary]
+                    .iter()
+                    .flat_map(|scope| scope.keys().cloned())
+                    // A top-level parameter is local to that call, even when
+                    // its spelling matches an owned value in the HTTP caller.
+                    .filter(|name| !http_audit || params.iter().all(|param| &param.name != name))
+                    .filter(|name| function_body_uses_name(body, name))
+                    .collect();
+                for scope in self.scopes[..boundary].iter_mut() {
+                    for name in &captured {
+                        if let Some(var) = scope.get_mut(name) {
+                            var.captured = true;
+                        }
                     }
                 }
             }
         }
         self.closure_capture_boundaries.pop();
         self.pop_scope();
+        if replayed_captures {
+            self.pop_scope();
+        }
         self.current_return = saved_return;
         self.loop_depth = saved_loop_depth;
         self.recoverable_depth = saved_recoverable_depth;
@@ -4523,6 +4691,42 @@ impl Checker {
             debug_assert_eq!(popped, Some(expected_key));
         }
         result
+    }
+
+    /// Reuse the creation-time capture identities used by effect summaries.
+    /// Only shadowed captures need an overlay; parameters and body locals are
+    /// defined in the function scope above it and retain ordinary shadowing.
+    /// A stale/missing lexical identity is not permission to use a homonym.
+    fn http_capture_replay_scope(
+        &self,
+        body_id: Option<FunctionBodyId>,
+        span: Span,
+    ) -> KuResult<Option<HashMap<String, VarType>>> {
+        let Some(captures) =
+            body_id.and_then(|body_id| self.function_body_outer_bindings.get(&body_id))
+        else {
+            return Ok(None);
+        };
+        let mut names = captures.keys().collect::<Vec<_>>();
+        names.sort();
+        let mut replay = HashMap::new();
+        for name in names {
+            let binding_id = captures[name];
+            let visible = self.scopes.iter().rev().find_map(|scope| scope.get(name));
+            if visible.is_some_and(|binding| binding.binding_id == binding_id) {
+                continue;
+            }
+            let binding = self.binding_by_id(binding_id).ok_or_else(|| {
+                KuError::runtime(
+                    format!(
+                        "http handler cannot prove captured variable '{name}' is read-only because its lexical binding is unavailable"
+                    ),
+                    span,
+                )
+            })?;
+            replay.insert(name.clone(), binding.clone());
+        }
+        Ok((!replay.is_empty()).then_some(replay))
     }
 
     fn check_function_value_body_readonly_captures(
@@ -4552,7 +4756,18 @@ impl Checker {
             if self.readonly_function_body_stack.contains(&body_id) {
                 return Ok(function.return_type.cloned().unwrap_or(Type::Unknown));
             }
+        }
+        let replay_scope = if effective_capture.owner == "http handler" {
+            self.http_capture_replay_scope(function.body_id, span)?
+        } else {
+            None
+        };
+        if let Some(body_id) = function.body_id {
             self.readonly_function_body_stack.push(body_id);
+        }
+        let replayed_captures = replay_scope.is_some();
+        if let Some(scope) = replay_scope {
+            self.scopes.push(scope);
         }
         self.push_scope();
         self.readonly_capture = Some(effective_capture);
@@ -4609,6 +4824,9 @@ impl Checker {
         self.try_exit_collectors = saved_try_exit_collectors;
         self.readonly_capture = saved_capture;
         self.pop_scope();
+        if replayed_captures {
+            self.pop_scope();
+        }
         if let Some(expected_body_id) = function.body_id {
             let popped = self.readonly_function_body_stack.pop();
             debug_assert_eq!(popped, Some(expected_body_id));
@@ -4742,6 +4960,10 @@ impl Checker {
     }
 
     fn check_stmt_and_infer_return(&mut self, stmt: &Stmt) -> KuResult<Option<Type>> {
+        self.check_loop_analysis_budget()?;
+        if self.loop_analysis_depth != 0 {
+            self.charge_loop_analysis(stmt_span(stmt))?;
+        }
         match stmt {
             Stmt::Return { value, span } => {
                 let expected = self.current_return.clone();
@@ -7206,16 +7428,26 @@ impl Checker {
     /// the body re-initializes at the top before using it. A loop that cannot
     /// iterate (no back-edge) keeps the pre-loop state.
     ///
-    /// This runs a throwaway pass over the body to discover its moves; its scope
+    /// For while, the header is before the condition, which is included in every
+    /// speculative transfer. For for, there is no repeated condition expression.
+    /// This runs a throwaway condition/body pass to discover its moves; its scope
     /// mutations are rolled back and its errors ignored (the authoritative pass
     /// re-checks the body and surfaces any real error).
     fn compute_loop_top(
         &mut self,
         before: &[HashMap<String, VarType>],
+        condition: Option<&Expr>,
         body: &[Stmt],
         loop_var: Option<(&str, &Type, &ClosureProvenance)>,
+        span: Span,
     ) -> Vec<HashMap<String, VarType>> {
-        if !loop_body_has_backedge(body) {
+        // With no outer bindings there is no loop-carried owner/provenance to
+        // discover. The authoritative pass still checks the entire body. This
+        // avoids doubling the work at every level of a pure nested loop.
+        if self.loop_analysis_exhausted.is_some()
+            || before.iter().all(HashMap::is_empty)
+            || !loop_body_has_backedge(body)
+        {
             return before.to_vec();
         }
         let saved_scopes = self.scopes.clone();
@@ -7233,12 +7465,18 @@ impl Checker {
         let mut top = before.to_vec();
         let mut converged = false;
         for _ in 0..max_iterations {
+            if self.charge_loop_analysis(span).is_err() {
+                break;
+            }
             // Speculative locals and closure bodies must receive the same ids on
             // every pass; otherwise Type/body-id churn would prevent convergence.
             self.next_binding_id = saved_next_binding_id;
             self.next_function_body_id = saved_next_function_body_id;
             self.function_body_outer_bindings = saved_body_bindings.clone();
-            let candidate = self.speculative_loop_transfer(before, &top, body, loop_var);
+            let candidate = self.speculative_loop_transfer(before, &top, condition, body, loop_var);
+            if self.loop_analysis_exhausted.is_some() {
+                break;
+            }
             if candidate == top {
                 top = candidate;
                 converged = true;
@@ -7246,7 +7484,7 @@ impl Checker {
             }
             top = candidate;
         }
-        if !converged {
+        if !converged && self.loop_analysis_exhausted.is_none() {
             // Fail closed after the explicit budget: every function-capable loop
             // binding may reach every other one. The authoritative pass then
             // reports E0904 at the first write that could close such a cycle.
@@ -7275,10 +7513,20 @@ impl Checker {
         &mut self,
         before: &[HashMap<String, VarType>],
         iteration_top: &[HashMap<String, VarType>],
+        condition: Option<&Expr>,
         body: &[Stmt],
         loop_var: Option<(&str, &Type, &ClosureProvenance)>,
     ) -> Vec<HashMap<String, VarType>> {
         self.scopes = iteration_top.to_vec();
+        self.loop_analysis_depth += 1;
+        // Evaluate in the outer scope: a typed body-local shadow must not stand
+        // in for the original binding consumed by the next condition. The
+        // surrounding compute_loop_top already isolated try-exit collectors.
+        if let Some(condition) = condition {
+            if self.charge_loop_analysis(condition.span).is_ok() {
+                let _ = self.expect_condition(condition, condition.span);
+            }
+        }
         self.push_scope();
         if let Some((name, ty, provenance)) = loop_var {
             let _ = self.define(name.to_string(), ty.clone(), true, Span::default());
@@ -7293,20 +7541,48 @@ impl Checker {
             // Errors are surfaced by the authoritative pass. Continue scanning so
             // an earlier speculative error cannot hide later graph edges.
             let _ = self.check_stmt(stmt);
-            if stmt_stops_fallthrough(stmt) {
+            if self.loop_analysis_exhausted.is_some() || stmt_stops_fallthrough(stmt) {
                 break;
             }
         }
+        self.loop_analysis_depth -= 1;
         self.loop_break_states.pop();
         let continues = self.loop_continue_states.pop().unwrap_or_default();
         self.loop_depth -= 1;
         self.pop_scope();
-        let end_of_body = self.scopes.clone();
-        let mut top = merge_moved_scopes(before.to_vec(), before.to_vec(), end_of_body);
+        let mut top = before.to_vec();
+        // In particular, an if whose arms both break/return/continue has no
+        // fallthrough. Its restored pre-if scopes are not a real backedge.
+        if loop_block_flow(body).fallthrough {
+            top = merge_moved_scopes(before.to_vec(), top, self.scopes.clone());
+        }
         for state in continues {
             top = merge_moved_scopes(before.to_vec(), top, state);
         }
         top
+    }
+
+    fn check_loop_analysis_budget(&self) -> KuResult<()> {
+        match self.loop_analysis_exhausted {
+            Some(span) => Err(KuError::runtime(
+                "maximum check work exceeded; loop ownership analysis budget exhausted",
+                span,
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn charge_loop_analysis(&mut self, span: Span) -> KuResult<()> {
+        self.check_loop_analysis_budget()?;
+        if let Some(remaining) = self.loop_analysis_remaining.checked_sub(1) {
+            self.loop_analysis_remaining = remaining;
+            Ok(())
+        } else {
+            // Sticky: an ignored speculative diagnostic cannot admit a partial
+            // ownership result, and unwinding nested loops never refills it.
+            self.loop_analysis_exhausted = Some(span);
+            self.check_loop_analysis_budget()
+        }
     }
 
     #[allow(dead_code)]
@@ -7338,13 +7614,32 @@ impl Checker {
 
     fn readonly_capture_for_outer_binding(&self, name: &str) -> Option<ReadonlyCapture> {
         let capture = self.readonly_capture?;
-        self.scopes
+        if capture.owner != "http handler" {
+            return self
+                .scopes
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, scope)| scope.contains_key(name).then_some(index))
+                .filter(|index| *index < capture.boundary)
+                .map(|_| capture);
+        }
+        let binding_id = self
+            .scopes
             .iter()
-            .enumerate()
             .rev()
-            .find_map(|(index, scope)| scope.contains_key(name).then_some(index))
-            .filter(|index| *index < capture.boundary)
-            .map(|_| capture)
+            .find_map(|scope| scope.get(name))?
+            .binding_id;
+        // A replay scope is physically inside the handler but contains the
+        // original binding identity. Local homonyms have fresh identities.
+        self.scopes[..capture.boundary]
+            .iter()
+            .any(|scope| {
+                scope
+                    .get(name)
+                    .is_some_and(|binding| binding.binding_id == binding_id)
+            })
+            .then_some(capture)
     }
 
     fn reject_readonly_capture_assignment(&self, name: &str, span: Span) -> KuResult<()> {
@@ -7752,9 +8047,53 @@ fn bind_generic_type(expected: &Type, actual: &Type, bindings: &mut HashMap<Stri
             Type::Result(actual) => bind_generic_type(expected, actual, bindings),
             _ => false,
         },
-        Type::Union(options) => options
-            .iter()
-            .any(|option| bind_generic_type(option, actual, bindings)),
+        Type::Union(options) => options.iter().any(|option| {
+            let mut candidate = bindings.clone();
+            if bind_generic_type(option, actual, &mut candidate) && type_matches(option, actual) {
+                *bindings = candidate;
+                true
+            } else {
+                false
+            }
+        }),
+        Type::FunctionValue {
+            params,
+            return_type,
+            is_async,
+            ..
+        } => {
+            let Type::FunctionValue {
+                params: actual_params,
+                return_type: actual_return,
+                is_async: actual_async,
+                ..
+            } = actual
+            else {
+                return false;
+            };
+            if is_async != actual_async || params.len() != actual_params.len() {
+                return false;
+            }
+            for (expected, actual) in params.iter().zip(actual_params) {
+                if expected.mode != actual.mode {
+                    return false;
+                }
+                if let (Some(expected), Some(actual)) = (&expected.ty, &actual.ty) {
+                    if !bind_generic_type(expected, actual, bindings)
+                        || !type_matches(expected, actual)
+                    {
+                        return false;
+                    }
+                }
+            }
+            match (return_type, actual_return) {
+                (Some(expected), Some(actual)) => {
+                    bind_generic_type(expected, actual, bindings) && type_matches(expected, actual)
+                }
+                (None, None) | (None, Some(_)) => true,
+                (Some(_), None) => false,
+            }
+        }
         _ => true,
     }
 }
@@ -7770,6 +8109,31 @@ fn substitute_generics(ty: &Type, bindings: &HashMap<String, Type>) -> Type {
                 .map(|ty| substitute_generics(ty, bindings))
                 .collect(),
         ),
+        Type::FunctionValue {
+            params,
+            return_type,
+            body,
+            body_id,
+            is_async,
+        } => Type::FunctionValue {
+            params: params
+                .iter()
+                .map(|param| FunctionValueParam {
+                    name: param.name.clone(),
+                    mode: param.mode,
+                    ty: param
+                        .ty
+                        .as_ref()
+                        .map(|ty| substitute_generics(ty, bindings)),
+                })
+                .collect(),
+            return_type: return_type
+                .as_ref()
+                .map(|ty| Box::new(substitute_generics(ty, bindings))),
+            body: body.clone(),
+            body_id: *body_id,
+            is_async: *is_async,
+        },
         other => other.clone(),
     }
 }
@@ -9143,7 +9507,14 @@ fn loop_stmt_flow(stmt: &Stmt) -> LoopBodyFlow {
                 continues: then_flow.continues || else_flow.continues,
             }
         }
-        Stmt::While { .. } | Stmt::For { .. } => LoopBodyFlow {
+        // Nested loops capture their own continue. Reuse the existing precise
+        // literal-true/no-own-break rule: a nonreturning inner while cannot
+        // manufacture a backedge to this outer condition.
+        Stmt::While { .. } => LoopBodyFlow {
+            fallthrough: !stmt_stops_fallthrough(stmt),
+            continues: false,
+        },
+        Stmt::For { .. } => LoopBodyFlow {
             fallthrough: true,
             continues: false,
         },

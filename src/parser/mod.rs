@@ -5,13 +5,18 @@ use crate::token::{Token, TokenKind};
 
 const MAX_PARSE_DEPTH: usize = 32;
 const MAX_TYPE_DEPTH: usize = 32;
+const MAX_STATEMENT_DEPTH: usize = 32;
 const MAX_TOKENS: usize = 100_000;
+
+#[cfg(test)]
+mod statement_depth_tests;
 
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
     parse_depth: usize,
     type_parse_depth: usize,
+    statement_depth: usize,
 }
 
 impl Parser {
@@ -21,6 +26,7 @@ impl Parser {
             current: 0,
             parse_depth: 0,
             type_parse_depth: 0,
+            statement_depth: 0,
         }
     }
 
@@ -482,6 +488,23 @@ impl Parser {
     }
 
     fn statement(&mut self) -> KuResult<Stmt> {
+        if matches!(
+            &self.peek().kind,
+            TokenKind::If
+                | TokenKind::While
+                | TokenKind::For
+                | TokenKind::Try
+                | TokenKind::Fn
+                | TokenKind::Async
+        ) {
+            let span = self.peek().span;
+            self.with_statement_depth(span, Self::statement_inner)
+        } else {
+            self.statement_inner()
+        }
+    }
+
+    fn statement_inner(&mut self) -> KuResult<Stmt> {
         if self.match_kind(&TokenKind::Let) {
             return Err(KuError::parse(
                 "'let' is not supported in Ku; use 'name = value' or 'name:type = value'",
@@ -489,19 +512,13 @@ impl Parser {
             ));
         }
         if self.match_kind(&TokenKind::If) {
-            let stmt = self.if_statement()?;
-            self.optional_semicolon();
-            return Ok(stmt);
+            return self.terminated_statement(Self::if_statement);
         }
         if self.match_kind(&TokenKind::While) {
-            let stmt = self.while_statement()?;
-            self.optional_semicolon();
-            return Ok(stmt);
+            return self.terminated_statement(Self::while_statement);
         }
         if self.match_kind(&TokenKind::For) {
-            let stmt = self.for_statement()?;
-            self.optional_semicolon();
-            return Ok(stmt);
+            return self.terminated_statement(Self::for_statement);
         }
         if self.match_kind(&TokenKind::Break) {
             let span = self.previous().span;
@@ -517,14 +534,10 @@ impl Parser {
             return self.try_statement();
         }
         if self.match_kind(&TokenKind::Async) {
-            let function = self.function(true)?;
-            self.optional_semicolon();
-            return Ok(Stmt::Function(function));
+            return self.local_function_statement(true);
         }
         if self.check(&TokenKind::Fn) {
-            let function = self.function(false)?;
-            self.optional_semicolon();
-            return Ok(Stmt::Function(function));
+            return self.local_function_statement(false);
         }
         if self.match_kind(&TokenKind::Fail) {
             return self.fail_statement();
@@ -545,6 +558,20 @@ impl Parser {
         self.expression_or_assignment_statement()
     }
 
+    // Keep branch-specific AST temporaries out of the dispatch frame: that
+    // frame remains live while nested function values parse their bodies.
+    fn terminated_statement(&mut self, parse: fn(&mut Self) -> KuResult<Stmt>) -> KuResult<Stmt> {
+        let statement = parse(self)?;
+        self.optional_semicolon();
+        Ok(statement)
+    }
+
+    fn local_function_statement(&mut self, is_async: bool) -> KuResult<Stmt> {
+        let function = self.function(is_async)?;
+        self.optional_semicolon();
+        Ok(Stmt::Function(function))
+    }
+
     fn if_statement(&mut self) -> KuResult<Stmt> {
         let start = self.previous().span.start;
         self.consume(&TokenKind::LParen, "expected '(' after 'if'")?;
@@ -553,7 +580,8 @@ impl Parser {
         let (then_branch, then_span) = self.block_or_single_statement("if")?;
         let (else_branch, end) = if self.match_kind(&TokenKind::Else) {
             if self.match_kind(&TokenKind::If) {
-                let nested = self.if_statement()?;
+                let span = self.previous().span;
+                let nested = self.with_statement_depth(span, Self::if_statement)?;
                 let span = stmt_span(&nested);
                 (vec![nested], span.end)
             } else {
@@ -1121,7 +1149,13 @@ impl Parser {
     }
 
     fn call(&mut self) -> KuResult<Expr> {
-        let mut expr = self.primary()?;
+        let expr = self.primary()?;
+        self.finish_call(expr)
+    }
+
+    // Do not retain postfix construction scratch while primary recursively
+    // parses a function body. The grammar and postfix loop are unchanged.
+    fn finish_call(&mut self, mut expr: Expr) -> KuResult<Expr> {
         loop {
             if self.match_kind(&TokenKind::LParen) {
                 let mut args = Vec::new();
@@ -1255,6 +1289,10 @@ impl Parser {
                 self.previous().span,
             ));
         }
+        self.primary_atom()
+    }
+
+    fn primary_atom(&mut self) -> KuResult<Expr> {
         let token = self.advance().clone();
         let span = token.span;
         let kind = match token.kind {
@@ -1272,7 +1310,7 @@ impl Parser {
                         &TokenKind::Arrow,
                         "expected '=>' after typed arrow function parameter",
                     )?;
-                    let (body, body_span) = self.arrow_body()?;
+                    let (body, body_span) = self.with_statement_depth(span, Self::arrow_body)?;
                     return Ok(Expr::new(
                         ExprKind::Function {
                             params: vec![FunctionParam {
@@ -1288,7 +1326,7 @@ impl Parser {
                     ));
                 }
                 if self.match_kind(&TokenKind::Arrow) {
-                    let (body, body_span) = self.arrow_body()?;
+                    let (body, body_span) = self.with_statement_depth(span, Self::arrow_body)?;
                     return Ok(Expr::new(
                         ExprKind::Function {
                             params: vec![FunctionParam {
@@ -1392,7 +1430,8 @@ impl Parser {
     }
 
     fn arrow_function(&mut self) -> KuResult<Expr> {
-        let start = self.consume(&TokenKind::LParen, "expected '('")?.span.start;
+        let owner_span = self.consume(&TokenKind::LParen, "expected '('")?.span;
+        let start = owner_span.start;
         let params = self.function_value_params("arrow function")?;
         self.consume(
             &TokenKind::RParen,
@@ -1407,7 +1446,7 @@ impl Parser {
             &TokenKind::Arrow,
             "expected '=>' after arrow function parameters",
         )?;
-        let (body, body_span) = self.arrow_body()?;
+        let (body, body_span) = self.with_statement_depth(owner_span, Self::arrow_body)?;
         Ok(Expr::new(
             ExprKind::Function {
                 params,
@@ -1419,7 +1458,8 @@ impl Parser {
     }
 
     fn anonymous_function(&mut self) -> KuResult<Expr> {
-        let start = self.consume(&TokenKind::Fn, "expected 'fn'")?.span.start;
+        let owner_span = self.consume(&TokenKind::Fn, "expected 'fn'")?.span;
+        let start = owner_span.start;
         self.consume(&TokenKind::LParen, "expected '(' after 'fn'")?;
         let params = self.function_value_params("anonymous function")?;
         self.consume(
@@ -1431,7 +1471,7 @@ impl Parser {
         } else {
             None
         };
-        let (body, body_span) = self.block()?;
+        let (body, body_span) = self.with_statement_depth(owner_span, Self::block)?;
         Ok(Expr::new(
             ExprKind::Function {
                 params,
@@ -1724,10 +1764,13 @@ impl Parser {
     }
 
     fn advance(&mut self) -> &Token {
+        let index = self.current;
         if !self.check(&TokenKind::Eof) {
             self.current += 1;
         }
-        self.previous()
+        // EOF is a real token. Returning previous() here reuses the last
+        // identifier/string and can point incomplete-syntax errors backwards.
+        &self.tokens[index]
     }
 
     fn peek(&self) -> &Token {
@@ -1756,6 +1799,25 @@ impl Parser {
 
     fn leave_parse_depth(&mut self) {
         self.parse_depth = self.parse_depth.saturating_sub(1);
+    }
+
+    // Count executable body owners, not braces, leaves, or top-level functions.
+    // Keep this independent of expression/type depth and in step with Checker.
+    fn with_statement_depth<T>(
+        &mut self,
+        span: Span,
+        parse: impl FnOnce(&mut Self) -> KuResult<T>,
+    ) -> KuResult<T> {
+        if self.statement_depth >= MAX_STATEMENT_DEPTH {
+            return Err(KuError::parse(
+                "maximum parse depth exceeded; statement body is too deeply nested",
+                span,
+            ));
+        }
+        self.statement_depth += 1;
+        let result = parse(self);
+        self.statement_depth -= 1;
+        result
     }
 
     fn with_type_parse_depth<T>(

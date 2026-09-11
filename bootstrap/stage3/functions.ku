@@ -209,6 +209,13 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
         if (parameter_count >= 32) {
             RejectAt(tokens[cursor].clone(), "parameter_limit", "stage-3 functions accept at most 32 parameters")?
         }
+        parameter_start = tokens[cursor].clone()
+        parameter_mode = 0
+        if (tokens[cursor].kind == "Ampersand") {
+            parameter_mode = 1
+            cursor = cursor + 1
+            ChargeWork(1, parameter_start.clone())?
+        }
         parameter_token = tokens[cursor].clone()
         if (parameter_token.kind != "Ident") {
             RejectAt(parameter_token.clone(), "unexpected_token", "expected parameter name")?
@@ -234,7 +241,8 @@ fn ReadFunction(input_tokens: [Token], token_base: int, parse_expression: fn(int
             type_node = AddParsedType(parsed_type, parameter_token.clone())?
             parameter_children = parameter_children.push(type_node)
         }
-        parameter = AddNode("Parameter", parameter_token.lexeme.clone(), 0, SpanFromToken(parameter_token.clone()), parameter_children, parameter_token.clone())?
+        parameter_span = SpanMerge(SpanFromToken(parameter_start), SpanFromToken(parameter_token.clone()))
+        parameter = AddNode("Parameter", parameter_token.lexeme.clone(), parameter_mode, parameter_span, parameter_children, parameter_token.clone())?
         parameters = parameters.push(parameter)
         parameter_count = parameter_count + 1
         if (tokens[cursor].kind == "Comma") {

@@ -9,6 +9,8 @@ ku version
 
 Ku 当前是解释器优先的语言实现。本文记录真实实现的语法及各后端边界；实验性增量的验收状态见版本记录，仍在设计中的能力放在文末“不支持 / 未完成”。
 
+本文是源码写法的规范性入口；跨执行层的所有权、借用、错误和并发不变量见 [语义合同](semantics.md)。版本记录是历史证据，不能覆盖当前规范。正在实施的内容及尚未验收的范围见 [v0.0.18 实施记录](v0.0.18-worklog.md)，不能将工作计划当作当前支持。
+
 ## 0. 专题文档入口
 
 本文是完整语法总览。需要进入某个具体主题时，从这里跳转：
@@ -280,7 +282,7 @@ import {
 
 ### 4.1 基础类型
 
-Ku 0.0.15 的基础类型：
+Ku 当前的基础类型：
 
 ```txt
 int
@@ -670,7 +672,7 @@ fn main() {
 
 `async fn` 表示可异步执行的函数。调用一个 `async fn` 会立即启动一个轻量 task，并返回一个一次性 task 句柄；task 不是线程，也不是关键字，用户不能手动创建或调度 task。
 
-普通开发者只需要使用这一种模型：
+普通开发者只需要使用这一种模型；下面含算术的示例可用解释器执行，当前 native 子集见本节后文：
 
 ```ku
 async fn load(value: int): int! {
@@ -702,7 +704,7 @@ async fn main(): null! {
 - `fn main()` 和 `async fn main()` 不能同时存在。
 - async task 可以读取外层捕获，但不能修改外层捕获；checker 和 runtime 都会拒绝写入。
 - HTTP server 内部可以使用 task 处理并发请求，但 handler 用户不需要手动创建或管理 task。
-- native C 明确拒绝 async。
+- native C 已接通有界 worker 组有限源码子集；LLVM 和同步 IR 命令仍拒绝 async。
 
 错误示例：
 
@@ -721,9 +723,21 @@ println(value)
 println(value)
 ```
 
-作用域结束时，用户没有 detach/cancel/spawn 入口。当前解释器在 `main` 返回后会请求取消仍未结束的子 task，并在 1 秒有界窗口内排空；未能停止会返回 `task/shutdown_timeout`，不会无限等待。native C / LLVM 仍明确拒绝 async lowering。
+Task 清理采用当前所有权作用域规则：合法 move 会转移清理责任；作用域正常结束、return、错误传播、panic、超时或取消时，请求取消仍持有的未完成 Task，并释放已完成但未 await 的 payload。兄弟失败不直接取消其他兄弟；只有父任务观察错误并传播退出时，才按作用域退出规则清理它仍持有的任务。
 
-运行时默认边界：
+只读闭包捕获和同步 `&` 借用不转移 Task 的清理责任，borrowed 参数本身不是 owner。原 owner 退出后，捕获可以保留可打印的 Task 标识控制块，但不能借此保留或重新取得已释放的 payload，也不新增用户级状态查询或取消方法。
+
+取消和超时是普通 catch 不能捕获的内部控制终止，与完成竞争唯一不可逆终态；finally 中的 return、fail、panic 或迟到结果不能将其改成成功。一次根取消建立默认总计 1 秒的单调时钟绝对清理截止时间，嵌套 finally、子任务和 drop 共用，不逐个续期；外层 shutdown 预算更短时从短。清理期间禁止新建 Task、await 或新提交 sleep/timer、网络等待和 blocking job。main/runtime 关闭未能完成时仍使用 `task/shutdown_timeout`。用户没有 detach/cancel/spawn 入口，公开语法不变。详细顺序与预算见 [Task 语义合同](semantics.md#task-所有权取消与清理预算)。
+
+普通作用域退出的子任务清理超期同样报告 `task/shutdown_timeout`，不能把正常父任务伪标为 Cancelled。
+
+上述规则是语言合同，各执行层的范围与证据分别记录。v0.0.18 开发分支已从 AST 经 Task IR 生成 native Start/Move/Await、函数级多 child scope drain 及 If 分支的正常 scope drain。既有检查点证据与本次源码 If、Owned/Pending 专项分开记录；专项不能替代本次完整 workspace/native 全集或精确提交三系统 CI/sanitizer 验收，实际结果与历史失败/修复见工作日志，不是正式发布。M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成。
+
+当前 native C 子集要求 import 展开后的函数全部是顶层非泛型 async 函数，入口为无参数 `async fn main(): null!`；参数限 `int/bool/null/str` 或对应单层 Result，返回显式 primitive `T!`。函数体支持局部绑定、已有 int/bool/null 局部的普通赋值、源码 `if` / `else` / `while` 及词法作用域、已知 async 调用、Task move、Await、ok、?、primitive print/println、显式 return 和字符串常量 fail；Copy 表达式支持 checked int 的一元 `-`、`+ - * / %` 和 `== != < <= > >=`，bool 的 `!`、`== !=` 及 `&& ||` 短路。普通二元式左值先求值并保存，右侧 Await 不会丢失该快照；未选中的逻辑右侧或 If 分支不执行其调用、move 或 Await，但仍静态检查。溢出/除零保持不可恢复 runtime failure，不因 async 返回 `T!` 就改成普通 Err。新字符串表达式限静态字面量。for、break/continue、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、try/catch/finally、闭包/函数值、同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定 Task 临时、float/混合类型算术、str/null/Result/Task 比较和动态堆表达式仍拒绝。示例与完整边界见 [当前 native C 源码子集](concurrency.md#当前-native-c-源码子集)。`ku ir`、`--emit-ir` 和 LLVM 不通过这条 Task lowering 路径。
+
+该子集的函数退出先移交全部 sibling，再等待逻辑 cleanup ACK，所有 child 共用一个绝对期限；迟到 observer 不延长 payload 生命周期。普通 Result.err 仍是业务值，正常 scope 的 `task/shutdown_timeout` 是外层运行时失败，即使没有 `?` 也展开退出；取消/超时保留原原因。内部清理 continuation 可以等 ACK，但用户 cleanup 仍不能 Await。接纳/OOM 拒绝消费已 move 的源码实参并生成可 await 的静态失败 Task，不在错误路径再次分配。
+
+解释器运行时默认边界（不是 native Task 子集的 blocking 能力）：
 
 - `max_tasks = 1024`。
 - task 队列有界；超过 task 上限返回 `Err({ domain: "task", code: "too_many_tasks", ... })`。
@@ -882,7 +896,7 @@ while (i < 10) {
 
 - `int` 运算使用有界整数，溢出会报 `integer overflow`。
 - 函数调用深度有保护，直接或间接递归过深会报错，避免只依赖宿主栈崩溃。
-- async task 的循环会在语句 tick 时检查协作式取消；main 返回后的 shutdown 会取消未完成 task，并在有界窗口内排空。
+- async task 的循环会在语句 tick 时检查协作式取消；Task 按上述所有权作用域规则有界清理，取消展开不为每层 finally 重新获得预算。
 - HTTP handler 有 `handler_timeout_ms`，超时返回 504，不会让请求无限等待。
 - 不断分配内存的循环仍可能触发宿主环境 OOM。
 
@@ -1243,6 +1257,10 @@ ns.Enum.Variant(...)      namespace enum variant
 Result.Ok(value) => str(value)
 ```
 
+Task 或含 Task 的模式绑定在 guard 求值时只是非 owning 的候选绑定，不能在 guard 中 move/await（E0805）；guard 为 false 时，不取消该候选 Task，也不消费后续 arm 所需的 payload。只有选中 arm 后才真正转移对应 payload，guard 自己创建并 await 的独立 Task 不受这条限制。
+
+匹配 Task 或含 Task 的值会消费原 scrutinee。选中 arm 返回的 Task 可以继续转移；arm 内未消费的 Task binding，以及 `_` 等模式留下的残余 Task，必须在 match 表达式返回前完成有界清理，并沿用该次退出的同一绝对清理截止时间。这是解释器 Task 合同，首片 native async 子集仍拒绝 match 和 Task 容器。
+
 穷尽性规则：
 
 ```txt
@@ -1356,9 +1374,9 @@ fn main() {
 }
 ```
 
-`finally` 无论 try 是否失败都会执行。
+正常完成、可恢复错误和 return 路径都经过对应 `finally`。取消或超时展开也执行有界清理，但全部嵌套 finally 共享根取消的绝对截止时间；不能据此要求预算耗尽后继续执行剩余语句。
 
-`panic` 不会被 `try/catch` 捕获。
+`panic`、Task 取消和超时不会被普通 `try/catch` 捕获。取消清理中的 return、fail、panic 或其他错误不能覆盖原取消/超时原因。
 
 ## 12. 内置函数和标准库
 
@@ -2139,7 +2157,7 @@ ku build --release -o dist/app.exe
 
 `--target` 第一阶段只接受 `host`、`x86_64-linux`、`x86_64-windows`、`aarch64-darwin`；包含路径分隔符、Windows drive prefix 或未知 target 会直接报错，避免输出路径逃逸。`--backend c` 会使用 native C 后端生成 C 后再调用 C 编译器。未设置 `KU_CC` 时，自动候选固定为 `zig cc`、`clang`、`cc`、`gcc`，失败后有界尝试下一个；一旦设置 `KU_CC`，它就是唯一且权威的 compiler，空值、不可执行或编译失败都会直接报错，不会静默换用另一套工具链。显式跨 target 时，Ku 自动给 Zig 传 `-target`、给 Clang 传 `--target`；普通 fallback `cc/gcc` 只用于 host，不会假装支持 cross。需要使用已配置好的交叉 GCC 时，通过 `KU_CC` 显式指定。链接成功后校验目标产物的 PE/ELF/Mach-O 格式和 CPU 架构；使用数据库时还解析最终动态依赖表并要求实际导入 libpq 以及本次选定的 MySQL/MariaDB family，静态、跨 family 或 host 回退都拒绝安装。数据库库文件从已打开句柄复制到私有临时目录后才交给 linker，不扫描或删除用户输出目录中的同名临时文件。默认 backend 仍保留解释器 wrapper 以兼容尚未进入 native lowering 的 async 程序；同步程序的 KuString、array、dynamic object、Result/Error 和 closure ABI 已实现明确列出的子集，不能从 ABI 存在推导为所有 payload、捕获形式和动态组合均已支持。
 
-0.0.15 的历史边界是：默认生成“解释器打包型二进制”，带 import 的程序仍会按原路径读取依赖。当前 native C 路径已经在生成期展开完整 import graph，生成物不包含 runner 的 `run_source` / `const SOURCE`，移动原源码目录后仍能运行；async native lowering 和增量缓存仍未宣称完成。
+默认 runner 当前仍生成“解释器打包型二进制”，只嵌入入口文件，带 import 的程序仍会按原路径读取依赖；这不是已经消失的历史限制。native C 路径在生成期展开完整 import graph，生成物不包含 runner 的 `run_source` / `const SOURCE`，移动原源码目录后仍能运行。有限 async 子集也使用该展开路径，但完整 async native lowering 和增量缓存仍未完成。
 
 `ku build --native <file.ku>` 不带 `-o` 时是单文件兼容模式：在源码旁写出 `.c`，不调用 linker。带 `-o` 时进入完整 native 链接模式，使用上述 build 目录中的隔离中间产物并校验最终二进制。跨系统发布推荐使用 `ku build --backend c --target <target>`，因为“生成目标 C”本身不等于已生成该目标的可执行文件。
 
@@ -2167,7 +2185,7 @@ unit / payload / nested enum match lowering
 系统 int main(void) wrapper
 ```
 
-native C 当前是受测试约束的同步后端；尚未实现的递归值和 async 语法会在生成 C 前明确拒绝。同步所有权和错误流已闭环：Copy 类型是 `int/bool/float/null`；`str/array/object/struct/enum/Result/task` 在语言检查层按 Owned 处理，赋值和传参默认 move。`str/array/object/struct/enum/Result` 的复制必须显式 `.clone()`，`Task<T>` 是 move-only，不能 clone，`await` 会消费 task。checker 会拒绝 use-after-move、重复消费 Result、重复 await task、match 分支漏合并和循环回边重复 move。C 后端为 array、named value 和 Result 生成 move/clone/drop，赋值先物化 RHS 再 drop 旧值，解构交换先物化全部 RHS；嵌套 owned array 递归 clone/drop。
+native C 保留既有同步后端，并为第 6.5 节有限 async 子集增加独立 Task lowering；未支持的递归值和其余 async 语法仍在生成 C 前明确拒绝。同步所有权和错误流已闭环：Copy 类型是 `int/bool/float/null`；`str/array/object/struct/enum/Result/task` 在语言检查层按 Owned 处理，赋值和传参默认 move。`str/array/object/struct/enum/Result` 的复制必须显式 `.clone()`，`Task<T>` 是 move-only，不能 clone，`await` 会消费 task。checker 会拒绝 use-after-move、重复消费 Result、重复 await task、match 分支漏合并和循环回边重复 move。C 后端为 array、named value 和 Result 生成 move/clone/drop，赋值先物化 RHS 再 drop 旧值，解构交换先物化全部 RHS；嵌套 owned array 递归 clone/drop。
 
 `.clone()` 规则：
 
@@ -2182,7 +2200,7 @@ native C 当前是受测试约束的同步后端；尚未实现的递归值和 a
 - `Task<T>` 不允许 clone；`await task` 消费 task，普通 task 只能 await 一次。
 - 优化方向包括 Copy clone 消除、源值随后不再使用时的 clone-to-move、临时 clone 消除、return clone-to-move、static string clone 零分配、struct clone inline、array/object 预分配，以及不需要的 drop/clone 消除。
 
-native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、错误和 return 都经过对应 finally block。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。native `KuString`（owned `{ptr,len,cap,storage}`）、动态 object hash、closure/函数值 ABI（`{invoke, env*}` + 引用计数 env、按引用共享 cell、逃逸、clone、局部函数自递归、array.map、深度守卫）均已落地，native 与解释器逐字一致。递归值 struct/enum、闭包捕获 struct/enum/Result/Task 等 owned 类型、async native lowering 仍明确拒绝（纯文本报错，不生成错误 C）。
+native Error ABI 是 `KuError { domain, code, message }`。`?` 只传播 Error，不要求来源和目标 Result payload 相同；`try/catch/finally` 的普通完成、可恢复错误和 return 都经过对应 finally block，取消/超时及不可恢复错误仍按第 11.3 节区分。array 所有索引检查负数和 `index >= len`；enum 使用 `tag + union payload`。native `KuString`（owned `{ptr,len,cap,storage}`）、动态 object hash、closure/函数值 ABI（`{invoke, env*}` + 引用计数 env、按引用共享 cell、逃逸、clone、局部函数自递归、array.map、深度守卫）均已落地，对已实现子集进行 native 与解释器差分验证。递归值 struct/enum、闭包捕获 catch/match binding、local-function self、`for` 迭代变量、Task 捕获和 async 函数值，以及超出第 6.5 节有限子集的 async native lowering 仍明确拒绝（纯文本报错，不生成错误 C）；不能把已支持的 struct/enum/Result 参数捕获误写成所有对应类型都拒绝。
 
 ## 17. 资源保护
 
@@ -2215,7 +2233,7 @@ async blocking queue 上限: 1024
 async await 深度上限: 64
 ```
 
-async runtime snapshot 会报告 active/registered/queued task、等待边、blocking queue/running job、worker 数和累计 accepted/rejected/finished。shutdown 同时等待 task 与 blocking job；已经开始且不配合取消的系统调用不能被强杀，超过有界窗口返回 `task/shutdown_timeout`。
+解释器 async runtime snapshot 会报告 active/registered/queued task、等待边、blocking queue/running job、worker 数和累计 accepted/rejected/finished。shutdown 同时等待 task 与 blocking job；已经开始且不配合取消的系统调用不能被强杀，超过有界窗口返回 `task/shutdown_timeout`。这些 blocking 能力和下面的历史压力数据不是首片 native Task 子集的测试结果。
 
 2026-06-22 的 release 压力测试使用 15 个生产者并发提交 1,000,000 个 task demand，并让已接纳任务同时保持 active。结果：
 
@@ -2242,7 +2260,7 @@ LLVM 数组、enum、闭包、HTTP、async lowering、& 借用参数
 LLVM 递归 struct 和更复杂 Result payload
 覆盖全部语言特性（尤其 async/递归值类型）的完整 native C 后端
 registry v2 自动 signed-roots、在线 key 吊销和透明轮换（v1 使用项目显式公钥 pin）
-native async 函数值 / async lowering；闭包捕获 catch/match binding、local-function self、`for` 迭代变量或 Task；dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同；从 dynamic object 取回闭包后再调用（KuValue 不可 call）
+超出直线 primitive/Result 子集的 native async lowering、async 函数值、M:N/netpoll/事件驱动 HTTP/native blocking/完整 RSS 与 soak；闭包捕获 catch/match binding、local-function self、`for` 迭代变量或 Task；dynamic object/KuValue 参数路径尚无可发布的显式用户类型合同；从 dynamic object 取回闭包后再调用（KuValue 不可 call）
 native C HTTP 对阻塞系统/FFI 调用的可取消 transport，以及超时首次发生在 `finally` 中时的完整剩余清理语义
 match guard 模式矩阵和跨 guard 的完整穷尽性检查
 顶层脚本语句

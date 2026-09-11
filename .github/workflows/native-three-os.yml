@@ -66,7 +66,7 @@ jobs:
           python3 -B .github/scripts/test-prepare-release.py
 
   borrow-sanitizers:
-    name: Native borrow ASan, UBSan and leak checks
+    name: Native borrow and Task ASan, UBSan and leak checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -90,8 +90,50 @@ jobs:
           rustup default 1.89.0
           clang --version
 
-      - name: Verify borrowed lifetimes, allocation ledger and source-free execution
-        run: cargo test --locked --test borrow_allocation_test --test borrow_native_test -- --nocapture
+      - name: Verify borrowed lifetimes, checked Task and synchronous arithmetic, source-free cleanup
+        run: cargo test --locked --test borrow_allocation_test --test borrow_native_test --test native_generic_test --test native_generic_import_test --test native_forward_call_test --test native_temporary_string_method_test --test native_task_join_retry_test --test native_task_frame_c_test --test native_task_control_test --test native_task_driver_test --test native_task_adapter_test --test native_task_wait_test --test native_task_receipt_test --test native_task_cleanup_wait_test --test native_task_source_test --test native_task_source_safety_test --test native_task_start_charge_test --test native_task_start_alias_test --test native_task_start_failure_test --test native_task_start_parameters_test --test native_task_runtime_deadline_test --test native_task_integer_test --test native_task_expression_source_test --test native_task_math_source_test --test native_task_expression_safety_test --test native_task_expression_pending_test --test native_outer_finally_test --test native_error_slot_test --test native_cleanup_catch_test --test native_cleanup_escape_test --test native_template_stream_test --test native_first_cleanup_timeout_test --test native_closure_cleanup_zero_test --test native_closure_drop_test --test native_sync_arithmetic_pilot_test --test native_sync_integer_matrix_test --test native_sync_borrow_arguments_test --test native_sync_map_closure_test --test native_sync_tls_isolation_test --test native_sync_aggregate_owners_test --test native_sync_zero_return_test --test native_task_scope_session_test --test native_task_short_circuit_owner_test --test native_task_exit_bridge_test --test native_task_publishing_deadline_test --test native_task_cleanup_commit_test --test bootstrap_ast_canonical_performance_test --test native_task_scope_frame_test --test native_task_scope_adapter_test --test native_task_empty_scope_adapter_test --test native_task_if_ir_test --test native_task_if_source_test --test native_task_await_progress_test -- --nocapture
+
+      - name: Verify synchronous HTTP failure isolation under sanitizers
+        run: cargo test --locked --test native_http_test native_sync_arithmetic_http_failure_isolated_and_timeout_keeps_504 -- --nocapture
+
+      - name: Verify scheduler probe rows and actual cancellation reclamation under sanitizers
+        run: cargo test --locked --example native_task_scheduler_probe -- --nocapture --test-threads=1
+
+  task-tsan:
+    name: Linux native Task selected-path ThreadSanitizer gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify required TSan runner contracts
+        run: python3 -B .github/scripts/test-task-tsan-gate.py
+
+      - name: Install the repository Rust toolchain
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.89.0 --no-self-update
+          rustup default 1.89.0
+
+      - name: Require detector self-test and real Task paths
+        shell: bash
+        run: python3 -B .github/scripts/task-tsan-gate.py --logs "$RUNNER_TEMP/ku-task-tsan"
+
+      - name: Retain exact toolchain, command and bounded diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-task-tsan-evidence
+          path: ${{ runner.temp }}/ku-task-tsan
+          if-no-files-found: error
 
   full-tests:
     name: ${{ matrix.os }} unfiltered workspace test suite
@@ -377,6 +419,9 @@ jobs:
           cargo test --locked --release --workspace --no-fail-fast
           -- --nocapture --test-threads=2
 
+      - name: Verify native scheduler probe correctness, not performance
+        run: cargo test --locked --release --example native_task_scheduler_probe -- --nocapture --test-threads=1
+
   release-contract:
     name: ${{ matrix.os }} release scripts and clean CheckOnly
     runs-on: ${{ matrix.os }}
@@ -506,6 +551,9 @@ jobs:
 
       - name: Test isolated PostgreSQL fixture safety
         run: ${{ matrix.python }} -B .github/scripts/test-pg-loopback-fixture.py
+
+      - name: Test isolated MySQL fixture safety without database access
+        run: ${{ matrix.python }} -B .github/scripts/test-mysql-loopback-fixture.py
 
       - name: Build and run target-native fixture
         run: >-
@@ -649,7 +697,7 @@ jobs:
   publish-release:
     name: Publish all verified release bundles together
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [quality, borrow-sanitizers, full-tests, release-contract, native, release-bundle, verify-release]
+    needs: [quality, borrow-sanitizers, task-tsan, full-tests, release-contract, native, release-bundle, verify-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

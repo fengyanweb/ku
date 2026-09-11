@@ -3627,7 +3627,12 @@ pub fn publish_package(package: &PackageContext, token: &str) -> KuResult<Packag
     let (status, success_response) = match response {
         Ok(response) => (response.status(), Some(response)),
         Err(ureq::Error::Status(status, _)) => (status, None),
-        Err(ureq::Error::Transport(_)) => {
+        Err(ureq::Error::Transport(_transport)) => {
+            #[cfg(test)]
+            eprintln!(
+                "registry publish transport diagnostic: {}",
+                test_registry_transport_diagnostic(&_transport)
+            );
             return Err(KuError::package(
                 "registry_publish_failed",
                 "registry publish transport failed; the server may have received the idempotent upload",
@@ -7733,6 +7738,36 @@ fn registry_http_agent(policy: RegistryFetchPolicy, url: &str) -> ureq::Agent {
         .timeout_read(Duration::from_millis(policy.read_timeout_ms))
         .redirects(0)
         .build()
+}
+
+#[cfg(test)]
+fn test_registry_transport_diagnostic(transport: &ureq::Transport) -> String {
+    let io = std::error::Error::source(transport)
+        .and_then(|source| source.downcast_ref::<std::io::Error>());
+    // Never format Transport/source: those may contain the URL, credentials or
+    // peer-provided bytes. Only closed enum categories and an OS integer escape.
+    format!(
+        "kind={:?} io_kind={:?} os_code={:?}",
+        transport.kind(),
+        io.map(std::io::Error::kind),
+        io.and_then(std::io::Error::raw_os_error)
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn registry_transport_test_diagnostic_excludes_source_text() {
+    let error = ureq::Error::from(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "https://fixture.invalid/?private=do-not-print authorization-do-not-print",
+    ));
+    let ureq::Error::Transport(transport) = error else {
+        panic!("expected a transport fixture")
+    };
+    assert_eq!(
+        test_registry_transport_diagnostic(&transport),
+        "kind=Io io_kind=Some(TimedOut) os_code=None"
+    );
 }
 
 #[cfg(test)]

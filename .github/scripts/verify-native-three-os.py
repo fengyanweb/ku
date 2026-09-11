@@ -281,21 +281,10 @@ def kill_process_tree(
     if os.name == "nt":
         if windows_job is not None:
             windows_job.terminate()
-        elif process.poll() is None:
-            # Fallback for hosts whose outer Job Object rejects assignment.
-            # This reliably contains a still-running direct child; after that
-            # child has exited, Windows offers no process-group kill primitive.
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=10,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+        # Internal Windows callers create SUSPENDED and never resume without
+        # successful Job assignment. None therefore means only an unresumed
+        # retained root; use the held Popen handle below, never PID-tree lookup.
+        # A previously assigned Job stays non-None even after its handle closes.
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
