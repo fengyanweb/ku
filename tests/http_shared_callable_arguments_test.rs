@@ -146,3 +146,39 @@ fn http_shared_arguments_temporary_callee_keeps_old_function_value() {
         "callback.clone()(op.clone(), install())",
     );
 }
+
+#[test]
+fn http_shared_destructure_later_setter_retains_shared_write_effect() {
+    // Keep this installer outside the exact single-assignment/null-return rule.
+    // Reset op again after definition-time checking of the replacement closure.
+    let setup = r#"install = () => {
+        op = setter.clone()
+        marker = 0
+        return null
+    }
+    op = Noop"#;
+    // The existing helper first parses and accepts the otherwise identical
+    // no-registration source, then parses the negative and requires E0704.
+    rejects_later_argument(
+        "http-destructure-setter-after-install.ku",
+        setup,
+        "_, selected = install(), op.clone()\n    selected()",
+    );
+}
+
+#[test]
+fn http_shared_destructure_earlier_callable_keeps_evaluated_value() {
+    let setup = r#"install = () => {
+        op = setter.clone()
+        marker = 0
+        return null
+    }
+    op = Noop"#;
+    // Only RHS/destination order differs from the negative. The selected value
+    // is Noop, not the setter installed into op by the later RHS evaluation.
+    accepts_earlier_argument(
+        "http-destructure-callable-before-install.ku",
+        setup,
+        "selected, _ = op.clone(), install()\n    selected()",
+    );
+}

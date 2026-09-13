@@ -1348,6 +1348,37 @@ fn native_http_shared_callable_writes_reject_before_c_emission() {
     app.get("/", After(install(), route_handler.clone()))
 "#,
         ),
+        (
+            "destructure-stale-body",
+            r#"
+    route_handler = () => { return http.text("safe") }
+    bad = () => { count += 1; return http.text("bad") }
+    install = () => {
+        route_handler = bad.clone()
+        marker = 0
+        return null
+    }
+    route_handler = () => { return http.text("safe") }
+    _, chosen = install(), route_handler.clone()
+    app.get("/", chosen)
+"#,
+        ),
+        (
+            "destructure-hidden-setter",
+            r#"
+    op = Noop
+    setter = () => { render = Other; return null }
+    install = () => {
+        op = setter.clone()
+        marker = 0
+        return null
+    }
+    op = Noop
+    app.get("/", fn() { render(); return http.text("ok") })
+    _, selected = install(), op.clone()
+    selected()
+"#,
+        ),
     ] {
         let source = format!(
             r#"
@@ -1380,6 +1411,38 @@ fn main(): null! {{
         ku::parser::Parser::new(tokens)
             .parse_program()
             .unwrap_or_else(|error| panic!("{label} must parse: {}", error.message));
+
+        // Only the new destructuring rows get these paired checker preflights.
+        // Keep the installation and all RHS evaluations in the no-route control.
+        // The reversed-order source still registers a route, but only the old
+        // safe value was copied; check_source never executes either program.
+        let destructure_controls = match label {
+            "destructure-stale-body" => Some((
+                r#"app.get("/", chosen)"#,
+                "_, chosen = install(), route_handler.clone()",
+                "chosen, _ = route_handler.clone(), install()",
+            )),
+            "destructure-hidden-setter" => Some((
+                r#"app.get("/", fn() { render(); return http.text("ok") })"#,
+                "_, selected = install(), op.clone()",
+                "selected, _ = op.clone(), install()",
+            )),
+            _ => None,
+        };
+        if let Some((registration, later, earlier)) = destructure_controls {
+            assert_eq!(source.matches(registration).count(), 1);
+            let control = source.replace(registration, "");
+            ku::cli::check_source(&format!("control-{label}"), &control).unwrap_or_else(|error| {
+                panic!("{label}: no-registration control rejected: {error}\n{control}")
+            });
+            assert_eq!(source.matches(later).count(), 1);
+            let reversed = source.replace(later, earlier);
+            ku::cli::check_source(&format!("reversed-{label}"), &reversed).unwrap_or_else(
+                |error| {
+                    panic!("{label}: old evaluated value must remain legal: {error}\n{reversed}")
+                },
+            );
+        }
 
         let dir = unique_temp_dir(&format!("shared-callable-{label}"));
         fs::write(dir.join("server.ku"), &source).expect("write rejected HTTP source");
@@ -1454,8 +1517,10 @@ fn main(): null! {{
                 );
                 assert!(
                     code == "E0704"
-                        || (matches!(label, "installed-mutator" | "factory-stale-body")
-                            && code == "E0703"),
+                        || (matches!(
+                            label,
+                            "installed-mutator" | "factory-stale-body" | "destructure-stale-body"
+                        ) && code == "E0703"),
                     "{label}/{entry}: wrong structured diagnostic code: {combined}"
                 );
                 // Do not let notes or embedded source text satisfy the reason.
@@ -1469,12 +1534,14 @@ fn main(): null! {{
                 && diagnostic.contains("cannot prove")
                 && diagnostic.contains("HTTP-shared");
             let expected_reason = match label {
-                // Incomplete transitive/template effects must fail closed, not
-                // be accepted because no concrete write could be recovered.
-                "template-hidden-setter" => shared_reassignment || unproved_shared_effect,
+                // Incomplete transitive/template/alias effects must fail closed,
+                // not be accepted because no concrete write could be recovered.
+                "template-hidden-setter" | "destructure-hidden-setter" => {
+                    shared_reassignment || unproved_shared_effect
+                }
                 // This write precedes registration: E0703 must describe the
                 // actual count mutation; E0704 must explicitly lack proof.
-                "installed-mutator" | "factory-stale-body" => {
+                "installed-mutator" | "factory-stale-body" | "destructure-stale-body" => {
                     (diagnostic.contains("E0703")
                         && diagnostic
                             .contains("http handler cannot modify captured variable 'count'"))

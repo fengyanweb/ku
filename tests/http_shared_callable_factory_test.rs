@@ -191,3 +191,34 @@ fn http_shared_factory_stored_earlier_result_keeps_the_safe_value() {
         ),
     );
 }
+
+#[test]
+fn http_shared_destructure_later_handler_retains_installation_evidence() {
+    let name = "http-destructure-handler-after-install.ku";
+    let registration = r#"app.get("/", chosen)"#;
+    let registered = source(
+        r#"_, chosen = install(), handler.clone()
+    app.get("/", chosen)"#,
+        false,
+    );
+    assert_eq!(registered.matches(registration).count(), 1);
+    // Remove only registration: retain the installer and both RHS evaluations.
+    // accepts/check_raw lex and parse independently before checker assertions.
+    let control = registered.replace(registration, "");
+    accepts(&format!("control-{name}"), &control);
+    rejects_registered(name, &registered);
+}
+
+#[test]
+fn http_shared_destructure_earlier_handler_keeps_evaluated_safe_value() {
+    // Stores happen after all RHS evaluations, but chosen owns the safe value
+    // cloned before install. Do not re-read the later contents of handler.
+    accepts(
+        "http-destructure-handler-before-install.ku",
+        &source(
+            r#"chosen, _ = handler.clone(), install()
+    app.get("/", chosen)"#,
+            false,
+        ),
+    );
+}
