@@ -8,6 +8,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,488 @@ SPEC.loader.exec_module(VERIFIER)
 
 
 class BoundedProcessTests(unittest.TestCase):
+    @contextmanager
+    def inert_toolhelp(self):
+        # Integer values below are fake handles/PIDs. Only this mocked kernel
+        # sees them; no process, OS thread, snapshot or socket is created.
+        kernel = mock.MagicMock()
+        process = SimpleNamespace(pid=301)
+        state = SimpleNamespace(now=100.0, last_error=0)
+        events = []
+        snapshot_handle, thread_handle, thread_id = 73, 83, 201
+
+        def snapshot(flags, pid):
+            self.assertEqual((4, 0), (flags, pid))
+            events.append("snapshot")
+            return snapshot_handle
+
+        def first(handle, entry_pointer):
+            self.assertEqual(snapshot_handle, handle)
+            entry = entry_pointer._obj
+            self.assertEqual(VERIFIER.ctypes.sizeof(entry), entry.size)
+            entry.thread_id = thread_id
+            entry.owner_process_id = process.pid
+            events.append("first")
+            return 1
+
+        def next_entry(handle, entry_pointer):
+            self.assertEqual(snapshot_handle, handle)
+            events.append("next")
+            state.last_error = 18  # Explicit ERROR_NO_MORE_FILES.
+            return 0
+
+        def open_thread(access, inherit, identity):
+            self.assertEqual((0x0802, False, thread_id), (access, inherit, identity))
+            events.append("open")
+            return thread_handle
+
+        def owner(handle):
+            self.assertEqual(thread_handle, handle)
+            events.append("owner")
+            return process.pid
+
+        def resume(handle):
+            self.assertEqual(thread_handle, handle)
+            events.append("resume")
+            return 1
+
+        def close(handle):
+            self.assertIn(handle, (thread_handle, snapshot_handle))
+            events.append("close_thread" if handle == thread_handle else "close_snapshot")
+            state.last_error = 0
+            return 1
+
+        kernel.CreateToolhelp32Snapshot.side_effect = snapshot
+        kernel.Thread32First.side_effect = first
+        kernel.Thread32Next.side_effect = next_entry
+        kernel.OpenThread.side_effect = open_thread
+        kernel.GetProcessIdOfThread.side_effect = owner
+        kernel.ResumeThread.side_effect = resume
+        kernel.CloseHandle.side_effect = close
+        with ExitStack() as stack:
+            dll = stack.enter_context(mock.patch.object(VERIFIER.ctypes, "WinDLL", return_value=kernel))
+            stack.enter_context(mock.patch.object(VERIFIER.ctypes, "get_last_error", side_effect=lambda: state.last_error))
+            stack.enter_context(mock.patch.object(VERIFIER.ctypes, "set_last_error",
+                                                 side_effect=lambda value: setattr(state, "last_error", value)))
+            clock = stack.enter_context(mock.patch.object(VERIFIER.time, "monotonic", side_effect=lambda: state.now))
+            forbidden = []
+            for module, name in ((VERIFIER.subprocess, "Popen"), (VERIFIER.subprocess, "run"),
+                                 (VERIFIER.threading, "Thread"), (socket, "socket")):
+                forbidden.append(stack.enter_context(mock.patch.object(
+                    module, name, side_effect=AssertionError("ToolHelp mock contract forbids real process/thread/network work"))))
+            try:
+                yield SimpleNamespace(kernel=kernel, process=process, state=state, events=events,
+                                      snapshot=snapshot_handle, thread=thread_handle, close=close,
+                                      resume=resume, clock=clock)
+            finally:
+                dll.assert_called_once_with("kernel32", use_last_error=True)
+                for action in forbidden:
+                    action.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_close_false_retains_only_unconfirmed_slots(self) -> None:
+        for failed in ({"thread"}, {"snapshot"}, {"thread", "snapshot"}):
+            with self.subTest(failed=sorted(failed)), self.inert_toolhelp() as run:
+                def close(handle):
+                    run.close(handle)
+                    slot = "thread" if handle == run.thread else "snapshot"
+                    if slot in failed:
+                        run.state.last_error = 5
+                        return 0
+                    return 1
+
+                run.kernel.CloseHandle.side_effect = close
+                with self.assertRaises((OSError, RuntimeError)) as caught:
+                    VERIFIER.resume_suspended_windows_process(run.process)
+                owner = caught.exception.toolhelp_handles
+                self.assertEqual(run.thread if "thread" in failed else None, owner.thread)
+                self.assertEqual(run.snapshot if "snapshot" in failed else None, owner.snapshot)
+                self.assertEqual([mock.call(run.thread), mock.call(run.snapshot)], run.kernel.CloseHandle.call_args_list)
+                run.kernel.ResumeThread.assert_called_once_with(run.thread)
+                self.assertEqual(["snapshot", "first", "next", "open", "owner", "resume",
+                                  "close_thread", "close_snapshot"], run.events)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_thread_close_exception_still_closes_snapshot_and_preserves_primary(self) -> None:
+        for body_fails, snapshot_fails in ((False, False), (True, False), (True, True)):
+            with self.subTest(body_fails=body_fails, snapshot_fails=snapshot_fails), self.inert_toolhelp() as run:
+                close_error = OSError("inert first thread close failure")
+                body_error = RuntimeError("inert first resume failure")
+                snapshot_error = OSError("inert later snapshot close failure")
+
+                def close(handle):
+                    run.close(handle)
+                    if handle == run.thread:
+                        raise close_error
+                    if snapshot_fails:
+                        raise snapshot_error
+                    return 1
+
+                def resume(handle):
+                    run.resume(handle)
+                    raise body_error
+
+                run.kernel.CloseHandle.side_effect = close
+                if body_fails:
+                    run.kernel.ResumeThread.side_effect = resume
+                with self.assertRaises((OSError, RuntimeError)) as caught:
+                    VERIFIER.resume_suspended_windows_process(run.process)
+                primary = body_error if body_fails else close_error
+                if isinstance(caught.exception, VERIFIER.CleanupFailure):
+                    self.assertIs(primary, caught.exception.primary)
+                    self.assertIs(primary, caught.exception.__cause__)
+                else:
+                    self.assertIs(primary, caught.exception)
+                self.assertEqual([mock.call(run.thread), mock.call(run.snapshot)], run.kernel.CloseHandle.call_args_list)
+                self.assertEqual(run.thread, caught.exception.toolhelp_handles.thread)
+                self.assertEqual(run.snapshot if snapshot_fails else None, caught.exception.toolhelp_handles.snapshot)
+                run.kernel.ResumeThread.assert_called_once_with(run.thread)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_clock_exception_still_closes_independent_owned_handles(self) -> None:
+        for stage in ("snapshot", "close_thread"):
+            with self.subTest(stage=stage), self.inert_toolhelp() as run:
+                primary = OSError("inert first " + stage + " clock failure")
+                interrupted = False
+
+                def clock():
+                    nonlocal interrupted
+                    if run.events and run.events[-1] == stage and not interrupted:
+                        interrupted = True
+                        raise primary
+                    return run.state.now
+
+                run.clock.side_effect = clock
+                with self.assertRaises(OSError) as caught:
+                    VERIFIER.resume_suspended_windows_process(run.process)
+                self.assertIs(primary, caught.exception)
+                self.assertTrue(interrupted)
+                if stage == "snapshot":
+                    run.kernel.CloseHandle.assert_called_once_with(run.snapshot)
+                    run.kernel.Thread32First.assert_not_called()
+                    run.kernel.OpenThread.assert_not_called()
+                    run.kernel.ResumeThread.assert_not_called()
+                    self.assertEqual(["snapshot", "close_snapshot"], run.events)
+                else:
+                    self.assertEqual([mock.call(run.thread), mock.call(run.snapshot)], run.kernel.CloseHandle.call_args_list)
+                    run.kernel.ResumeThread.assert_called_once_with(run.thread)
+                    self.assertEqual(["close_thread", "close_snapshot"], run.events[-2:])
+                owner = getattr(caught.exception, "toolhelp_handles", None)
+                if owner is not None:
+                    self.assertIsNone(owner.thread)
+                    self.assertIsNone(owner.snapshot)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_final_close_overrun_fails_after_independent_closes(self) -> None:
+        for slow_slot in ("thread", "snapshot"):
+            with self.subTest(slow_slot=slow_slot), self.inert_toolhelp() as run:
+                def close(handle):
+                    run.close(handle)
+                    slot = "thread" if handle == run.thread else "snapshot"
+                    if slot == slow_slot:
+                        run.state.now = 100.0 + VERIFIER.WINDOWS_PROCESS_SETUP_TIMEOUT_SECONDS + 1.0
+                    return 1
+
+                run.kernel.CloseHandle.side_effect = close
+                with self.assertRaisesRegex(RuntimeError, "bound|deadline") as caught:
+                    VERIFIER.resume_suspended_windows_process(run.process)
+                run.kernel.ResumeThread.assert_called_once_with(run.thread)
+                self.assertEqual([mock.call(run.thread), mock.call(run.snapshot)], run.kernel.CloseHandle.call_args_list)
+                self.assertEqual(["close_thread", "close_snapshot"], run.events[-2:])
+                owner = getattr(caught.exception, "toolhelp_handles", None)
+                if owner is not None:
+                    self.assertIsNone(owner.thread)
+                    self.assertIsNone(owner.snapshot)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_success_resumes_once_then_closes_both_handles(self) -> None:
+        with self.inert_toolhelp() as run:
+            self.assertIsNone(VERIFIER.resume_suspended_windows_process(run.process))
+            self.assertEqual(["snapshot", "first", "next", "open", "owner", "resume",
+                              "close_thread", "close_snapshot"], run.events)
+            run.kernel.Thread32First.assert_called_once()
+            run.kernel.Thread32Next.assert_called_once()
+            run.kernel.OpenThread.assert_called_once_with(0x0802, False, 201)
+            run.kernel.GetProcessIdOfThread.assert_called_once_with(run.thread)
+            run.kernel.ResumeThread.assert_called_once_with(run.thread)
+            self.assertEqual([mock.call(run.thread), mock.call(run.snapshot)], run.kernel.CloseHandle.call_args_list)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_invalid_snapshot_never_claims_or_closes_a_handle(self) -> None:
+        for invalid in (0, VERIFIER.ctypes.c_void_p(-1).value):
+            with self.subTest(invalid=invalid), self.inert_toolhelp() as run:
+                create_snapshot = run.kernel.CreateToolhelp32Snapshot.side_effect
+
+                def snapshot(flags, pid):
+                    create_snapshot(flags, pid)
+                    run.state.last_error = 5
+                    return invalid
+
+                run.kernel.CreateToolhelp32Snapshot.side_effect = snapshot
+                with self.assertRaisesRegex(RuntimeError, "could not enumerate") as caught:
+                    VERIFIER.resume_suspended_windows_process(run.process)
+                run.kernel.Thread32First.assert_not_called()
+                run.kernel.Thread32Next.assert_not_called()
+                run.kernel.OpenThread.assert_not_called()
+                run.kernel.GetProcessIdOfThread.assert_not_called()
+                run.kernel.ResumeThread.assert_not_called()
+                run.kernel.CloseHandle.assert_not_called()
+                self.assertIsNone(getattr(caught.exception, "toolhelp_handles", None))
+                self.assertEqual(["snapshot"], run.events)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_lookup_rejections_keep_scan_finite_and_close_acquired_handles(self) -> None:
+        cases = {
+            "no_thread": "no resumable", "multiple_threads": "multiple threads",
+            "scan_cap": "bound", "next_error": "could not continue",
+            "open_zero": "could not open", "owner_changed": "owner changed",
+            "resume_zero": "single CREATE_SUSPENDED", "resume_failed": "could not resume",
+        }
+        for stage, message in cases.items():
+            with self.subTest(stage=stage), self.inert_toolhelp() as run:
+                first = run.kernel.Thread32First.side_effect
+                open_thread = run.kernel.OpenThread.side_effect
+                query_owner = run.kernel.GetProcessIdOfThread.side_effect
+
+                def enumerate_first(handle, pointer):
+                    first(handle, pointer)
+                    if stage == "no_thread":
+                        run.state.last_error = 18
+                        return 0
+                    if stage == "scan_cap":
+                        pointer._obj.owner_process_id = run.process.pid + 1
+                    return 1
+
+                def next_entry(handle, pointer):
+                    self.assertEqual(run.snapshot, handle)
+                    self.assertEqual(VERIFIER.ctypes.sizeof(pointer._obj), pointer._obj.size)
+                    run.events.append("next")
+                    if stage == "next_error":
+                        run.state.last_error = 5
+                        return 0
+                    pointer._obj.thread_id += 1
+                    pointer._obj.owner_process_id = run.process.pid + (1 if stage == "scan_cap" else 0)
+                    return 1
+
+                def open_zero(access, inherit, identity):
+                    open_thread(access, inherit, identity)
+                    run.state.last_error = 5
+                    return 0
+
+                def wrong_owner(handle):
+                    query_owner(handle)
+                    return run.process.pid + 1
+
+                def wrong_resume_count(handle):
+                    run.resume(handle)
+                    run.state.last_error = 5
+                    return 0 if stage == "resume_zero" else 0xFFFFFFFF
+
+                run.kernel.Thread32First.side_effect = enumerate_first
+                if stage in ("multiple_threads", "scan_cap", "next_error"):
+                    run.kernel.Thread32Next.side_effect = next_entry
+                elif stage == "open_zero":
+                    run.kernel.OpenThread.side_effect = open_zero
+                elif stage == "owner_changed":
+                    run.kernel.GetProcessIdOfThread.side_effect = wrong_owner
+                elif stage in ("resume_zero", "resume_failed"):
+                    run.kernel.ResumeThread.side_effect = wrong_resume_count
+                with mock.patch.object(VERIFIER, "MAX_WINDOWS_THREAD_SCAN", 2), \
+                     self.assertRaisesRegex(RuntimeError, message) as caught:
+                    VERIFIER.resume_suspended_windows_process(run.process)
+                expected_next = 0 if stage == "no_thread" else 2 if stage == "scan_cap" else 1
+                self.assertEqual(expected_next, run.kernel.Thread32Next.call_count)
+                acquired_thread = stage in ("owner_changed", "resume_zero", "resume_failed")
+                expected_close = [mock.call(run.thread)] if acquired_thread else []
+                expected_close.append(mock.call(run.snapshot))
+                self.assertEqual(expected_close, run.kernel.CloseHandle.call_args_list)
+                if stage in ("resume_zero", "resume_failed"):
+                    run.kernel.ResumeThread.assert_called_once_with(run.thread)
+                else:
+                    run.kernel.ResumeThread.assert_not_called()
+                if stage in ("no_thread", "multiple_threads", "scan_cap", "next_error"):
+                    run.kernel.OpenThread.assert_not_called()
+                else:
+                    run.kernel.OpenThread.assert_called_once_with(0x0802, False, 201)
+                self.assertIsNone(getattr(caught.exception, "toolhelp_handles", None))
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_early_snapshot_timeout_preserves_primary_when_close_fails(self) -> None:
+        for close_raises in (False, True):
+            with self.subTest(close_raises=close_raises), self.inert_toolhelp() as run:
+                create_snapshot = run.kernel.CreateToolhelp32Snapshot.side_effect
+                secondary = OSError("inert snapshot close failure")
+
+                def snapshot(flags, pid):
+                    handle = create_snapshot(flags, pid)
+                    run.state.now += VERIFIER.WINDOWS_PROCESS_SETUP_TIMEOUT_SECONDS + 1
+                    return handle
+
+                def close(handle):
+                    run.close(handle)
+                    if close_raises:
+                        raise secondary
+                    run.state.last_error = 5
+                    return 0
+
+                run.kernel.CreateToolhelp32Snapshot.side_effect = snapshot
+                run.kernel.CloseHandle.side_effect = close
+                with self.assertRaises(VERIFIER.CleanupFailure) as caught:
+                    VERIFIER.resume_suspended_windows_process(run.process)
+                self.assertIsInstance(caught.exception.primary, RuntimeError)
+                self.assertRegex(str(caught.exception.primary), "thread lookup exceeded its bound")
+                self.assertIs(caught.exception.primary, caught.exception.__cause__)
+                self.assertIsNot(secondary, caught.exception.primary)
+                self.assertIn("snapshot close", caught.exception.cleanup_summary)
+                self.assertEqual(run.snapshot, caught.exception.toolhelp_handles.snapshot)
+                self.assertIsNone(caught.exception.toolhelp_handles.thread)
+                run.kernel.CloseHandle.assert_called_once_with(run.snapshot)
+                run.kernel.Thread32First.assert_not_called()
+                run.kernel.OpenThread.assert_not_called()
+                run.kernel.ResumeThread.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_keyboard_interrupt_keeps_primary_and_independent_cleanup(self) -> None:
+        for stage in ("snapshot_clock", "thread_close", "post_thread_clock"):
+            with self.subTest(stage=stage), self.inert_toolhelp() as run:
+                primary = KeyboardInterrupt("inert first ToolHelp interruption")
+                secondary = OSError("inert later snapshot close failure")
+                interrupted = False
+
+                def clock():
+                    nonlocal interrupted
+                    event = "snapshot" if stage == "snapshot_clock" else "close_thread"
+                    if stage != "thread_close" and run.events and run.events[-1] == event and not interrupted:
+                        interrupted = True
+                        raise primary
+                    return run.state.now
+
+                def close(handle):
+                    run.close(handle)
+                    if handle == run.snapshot:
+                        raise secondary
+                    if stage == "thread_close":
+                        raise primary
+                    return 1
+
+                run.clock.side_effect = clock
+                run.kernel.CloseHandle.side_effect = close
+                with self.assertRaises(VERIFIER.CleanupFailure) as caught:
+                    VERIFIER.resume_suspended_windows_process(run.process)
+                self.assertIs(primary, caught.exception.primary)
+                self.assertIs(primary, caught.exception.__cause__)
+                self.assertEqual(run.snapshot, caught.exception.toolhelp_handles.snapshot)
+                self.assertEqual(run.thread if stage == "thread_close" else None, caught.exception.toolhelp_handles.thread)
+                expected_close = [] if stage == "snapshot_clock" else [mock.call(run.thread)]
+                expected_close.append(mock.call(run.snapshot))
+                self.assertEqual(expected_close, run.kernel.CloseHandle.call_args_list)
+                if stage == "snapshot_clock":
+                    run.kernel.ResumeThread.assert_not_called()
+                else:
+                    run.kernel.ResumeThread.assert_called_once_with(run.thread)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_thread_close_timeout_precedes_later_snapshot_close_error(self) -> None:
+        with self.inert_toolhelp() as run:
+            secondary = OSError("inert later snapshot close failure")
+
+            def close(handle):
+                run.close(handle)
+                if handle == run.thread:
+                    run.state.now += VERIFIER.WINDOWS_PROCESS_SETUP_TIMEOUT_SECONDS + 1
+                    return 1
+                raise secondary
+
+            run.kernel.CloseHandle.side_effect = close
+            with self.assertRaises(VERIFIER.CleanupFailure) as caught:
+                VERIFIER.resume_suspended_windows_process(run.process)
+            self.assertIsInstance(caught.exception.primary, RuntimeError)
+            self.assertRegex(str(caught.exception.primary), "thread lookup exceeded its bound")
+            self.assertIs(caught.exception.primary, caught.exception.__cause__)
+            self.assertIsNot(secondary, caught.exception.primary)
+            self.assertIn("snapshot close", caught.exception.cleanup_summary)
+            self.assertIsNone(caught.exception.toolhelp_handles.thread)
+            self.assertEqual(run.snapshot, caught.exception.toolhelp_handles.snapshot)
+            self.assertEqual([mock.call(run.thread), mock.call(run.snapshot)], run.kernel.CloseHandle.call_args_list)
+            run.kernel.ResumeThread.assert_called_once_with(run.thread)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_holder_retains_kernel_and_cleared_slot_is_not_closed_again(self) -> None:
+        for failed_slot in ("thread", "snapshot"):
+            with self.subTest(failed_slot=failed_slot), self.inert_toolhelp() as run:
+                def close(handle):
+                    run.close(handle)
+                    slot = "thread" if handle == run.thread else "snapshot"
+                    if slot == failed_slot:
+                        run.state.last_error = 5
+                        return 0
+                    return 1
+
+                run.kernel.CloseHandle.side_effect = close
+                with self.assertRaises(OSError) as caught:
+                    VERIFIER.resume_suspended_windows_process(run.process)
+                owner = caught.exception.toolhelp_handles
+                self.assertIsInstance(owner, VERIFIER._ToolhelpHandles)
+                self.assertIs(run.kernel, owner._kernel32)
+                self.assertIs(VERIFIER.wintypes.BOOL, owner._kernel32.CloseHandle.restype)
+                cleared_slot = "snapshot" if failed_slot == "thread" else "thread"
+                self.assertIsNone(getattr(owner, cleared_slot))
+                owner.close_slot(cleared_slot)
+                owner.close_slot(cleared_slot)
+                self.assertEqual([mock.call(run.thread), mock.call(run.snapshot)], run.kernel.CloseHandle.call_args_list)
+                self.assertEqual(getattr(run, failed_slot), getattr(owner, failed_slot))
+
+    @unittest.skipUnless(os.name == "nt", "Windows ToolHelp structure with pure mocked kernel")
+    def test_toolhelp_owner_survives_clean_and_failed_outer_runner_cleanup(self) -> None:
+        for outer_failure in (None, "job_close", "root_wait"):
+            with self.subTest(outer_failure=outer_failure):
+                with self.inert_toolhelp() as setup:
+                    def close(handle):
+                        setup.close(handle)
+                        if handle == setup.thread:
+                            setup.state.last_error = 5
+                            return 0
+                        return 1
+
+                    setup.kernel.CloseHandle.side_effect = close
+                    with self.assertRaises(OSError) as original:
+                        VERIFIER.resume_suspended_windows_process(setup.process)
+                    primary = original.exception
+                    owner = primary.toolhelp_handles
+                with self.inert_runner() as run, \
+                     mock.patch.object(VERIFIER.subprocess, "run", side_effect=AssertionError("numeric cleanup forbidden")) as numeric, \
+                     mock.patch.object(socket, "socket", side_effect=AssertionError("socket forbidden")) as network:
+                    run.resume.side_effect = primary
+                    if outer_failure == "job_close":
+                        run.job.close.side_effect = OSError("inert outer Job close failure")
+                    elif outer_failure == "root_wait":
+                        run.process.wait.side_effect = OSError("inert outer root wait failure")
+                    with self.assertRaises(OSError if outer_failure is None else SystemExit) as caught:
+                        VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "ToolHelp owner propagation")
+                    if outer_failure is None:
+                        self.assertIs(primary, caught.exception)
+                        retained_primary = caught.exception
+                    else:
+                        self.assertIsInstance(caught.exception.__cause__, VERIFIER.CleanupFailure)
+                        retained_primary = caught.exception.__cause__.primary
+                        self.assertIs(primary, retained_primary)
+                        self.assertIs(run.job, caught.exception.job)
+                        self.assertIs(run.process, caught.exception.process)
+                    self.assertIs(owner, retained_primary.toolhelp_handles)
+                    self.assertIs(setup.kernel, owner._kernel32)
+                    self.assertEqual(setup.thread, owner.thread)
+                    self.assertIsNone(owner.snapshot)
+                    run.job.terminate.assert_called_once_with()
+                    run.job.wait_empty.assert_called_once()
+                    run.job.close.assert_called_once_with()
+                    run.process.wait.assert_called_once()
+                    for reader in run.readers:
+                        reader.join.assert_called_once()
+                    run.process.stdout.close.assert_called_once_with()
+                    run.process.stderr.close.assert_called_once_with()
+                    numeric.assert_not_called()
+                    network.assert_not_called()
+
     @contextmanager
     def inert_runner(self):
         process = mock.Mock(spec=["stdout", "stderr", "wait", "poll", "kill"])
@@ -611,7 +1094,9 @@ class BoundedProcessTests(unittest.TestCase):
     def test_windows_thread_scan_deadline_includes_snapshot_creation(self) -> None:
         process = mock.Mock(pid=os.getpid())
         with (
-            mock.patch.object(VERIFIER.time, "monotonic", side_effect=[100.0, 106.0]),
+            # The third observation is the new post-close check, at the same
+            # expired instant; the original five-second setup budget is intact.
+            mock.patch.object(VERIFIER.time, "monotonic", side_effect=[100.0, 106.0, 106.0]),
             self.assertRaisesRegex(RuntimeError, "thread lookup exceeded its bound"),
         ):
             VERIFIER.resume_suspended_windows_process(process)
