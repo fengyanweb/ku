@@ -433,6 +433,7 @@ class MysqlFixtureTests(unittest.TestCase):
         server.process = MagicMock()
         server.process.wait.side_effect = subprocess.TimeoutExpired("fixture", 10)
         server.job = MagicMock()
+        server.job.wait_empty.return_value = True
         (self.root / "server.pid").write_text("123", encoding="ascii")
         (self.root / "server.active").write_bytes(b"owned server")
         with patch.object(F.BOUNDS, "kill_process_tree"), self.assertRaises(subprocess.TimeoutExpired):
@@ -446,7 +447,7 @@ class MysqlFixtureTests(unittest.TestCase):
         stream = MagicMock(spec=["read", "close"])
         process = SimpleNamespace(stdout=stream, poll=MagicMock(return_value=None),
                                   kill=MagicMock(), wait=MagicMock(return_value=0))
-        job = SimpleNamespace(terminate=MagicMock(), close=MagicMock())
+        job = SimpleNamespace(terminate=MagicMock(), wait_empty=MagicMock(return_value=True), close=MagicMock())
         reader = SimpleNamespace(join=MagicMock(), is_alive=MagicMock(return_value=False), ident=1)
         return process, job, reader
 
@@ -457,6 +458,179 @@ class MysqlFixtureTests(unittest.TestCase):
         for name in ("server.pid", "server.active"):
             (self.root / name).write_bytes(b"inert retained marker")
         return server
+
+    def test_stop_requires_exact_confirmed_job_drain_before_removing_markers(self) -> None:
+        for result in (None, False, 1, "true", MagicMock()):
+            with self.subTest(result_type=type(result).__name__):
+                server = self.marked_server()
+                server.job.wait_empty = MagicMock(return_value=result)
+                with patch.object(F.BOUNDS, "kill_process_tree"), \
+                     self.assertRaisesRegex(RuntimeError, "job_drain"):
+                    server.stop()
+                server.job.wait_empty.assert_called_once()
+                server.process.wait.assert_called_once()
+                server.job.close.assert_called_once()
+                server.reader.join.assert_called_once()
+                server.process.stdout.close.assert_called_once()
+                self.assertFalse(server.stop_complete)
+                self.assertTrue((self.root / "server.pid").exists())
+                self.assertTrue((self.root / "server.active").exists())
+
+    def test_stop_preserves_first_error_and_finishes_independent_steps_after_job_drain_error(self) -> None:
+        for first in (None, RuntimeError("root wait primary")):
+            with self.subTest(with_primary=first is not None):
+                server = self.marked_server()
+                server.process.wait.side_effect = first
+                server.job.wait_empty = MagicMock(side_effect=OSError("drain private detail"))
+                with patch.object(F.BOUNDS, "kill_process_tree"), self.assertRaises(RuntimeError) as caught:
+                    server.stop()
+                server.job.wait_empty.assert_called_once()
+                server.job.close.assert_called_once()
+                server.reader.join.assert_called_once()
+                server.process.stdout.close.assert_called_once()
+                self.assertIn("job_drain", str(caught.exception))
+                if first is not None:
+                    self.assertIn("root wait primary", str(caught.exception))
+                    self.assertNotIn("drain private detail", str(caught.exception))
+                self.assertFalse(server.stop_complete)
+                self.assertTrue((self.root / "server.active").exists())
+
+    def test_stop_drains_before_close_using_existing_absolute_cleanup_deadline(self) -> None:
+        server = self.marked_server()
+        order = []
+        server.process.wait.side_effect = lambda **_: order.append("root_wait")
+        server.job.wait_empty = MagicMock(side_effect=lambda deadline: order.append(("drain", deadline)) or True)
+        server.job.close.side_effect = lambda: order.append("job_close")
+        server.reader.join.side_effect = lambda **_: order.append("reader_join")
+        with patch.object(F.BOUNDS, "kill_process_tree"), \
+             patch.object(F.time, "monotonic", side_effect=[100.0, 101.0, 109.0]):
+            server.stop()
+        self.assertEqual(["root_wait", ("drain", 110.0), "job_close", "reader_join"], order)
+        self.assertEqual(9.0, server.process.wait.call_args.kwargs["timeout"])
+        self.assertEqual(1.0, server.reader.join.call_args.kwargs["timeout"])
+        self.assertTrue(server.stop_complete)
+        self.assertFalse((self.root / "server.active").exists())
+
+    def test_stop_close_failure_after_confirmed_drain_cannot_complete(self) -> None:
+        server = self.marked_server()
+        job = server.job
+        job.wait_empty = MagicMock(return_value=True)
+        job.close.side_effect = OSError("close primary")
+        with patch.object(F.BOUNDS, "kill_process_tree"), self.assertRaisesRegex(OSError, "close primary"):
+            server.stop()
+        job.wait_empty.assert_called_once()
+        self.assertIs(server.job, job)
+        self.assertFalse(server.stop_complete)
+        self.assertTrue(server.cleanup_uncertain)
+        self.assertTrue((self.root / "server.active").exists())
+        server.reader.join.assert_called_once()
+
+    def test_verify_start_failure_double_stop_does_not_requery_completed_owner(self) -> None:
+        server = F.MysqlProcess(self.root, ["not executed"])
+        process, job, reader = self.inert_process()
+        reader.start = MagicMock()
+        job.wait_empty = MagicMock(side_effect=[True, RuntimeError("closed owner cannot be queried")])
+        stack, _, run = self.verification(server=server)
+        with stack, patch.object(F.subprocess, "Popen", return_value=process), \
+             patch.object(F.BOUNDS.WindowsJob, "attach", return_value=job), \
+             patch.object(F.threading, "Thread", return_value=reader), \
+             patch.object(F.BOUNDS, "os", SimpleNamespace(name="nt")), \
+             patch.object(F.BOUNDS, "resume_suspended_windows_process", side_effect=OSError("resume primary")), \
+             patch.object(server, "stop", wraps=server.stop) as stop, \
+             self.assertRaisesRegex(OSError, "resume primary"):
+            F.verify(self.args)
+        self.assertEqual(2, stop.call_count)
+        job.wait_empty.assert_called_once()
+        job.close.assert_called_once()
+        process.wait.assert_called_once()
+        reader.join.assert_called_once()
+        process.stdout.close.assert_called_once()
+        run.assert_not_called()
+        self.assertTrue(server.stop_complete)
+        self.assertIs(server.job, job)
+        for name in ("server.active", "server.pid", "init.sql", "admin.cnf", "verification.json"):
+            self.assertFalse((self.root / name).exists(), name)
+
+    def test_same_supervisor_cannot_restart_an_existing_or_completed_owner(self) -> None:
+        for completed in (False, True):
+            with self.subTest(completed=completed):
+                server = self.marked_server()
+                process = server.process
+                if completed:
+                    with patch.object(F.BOUNDS, "kill_process_tree"):
+                        server.stop()
+                with patch.object(F.subprocess, "Popen") as popen, \
+                     self.assertRaisesRegex(RuntimeError, "cannot be restarted"):
+                    server.start()
+                popen.assert_not_called()
+                self.assertIs(server.process, process)
+                self.assertIs(server.stop_complete, completed)
+
+    def test_marker_unlink_failure_does_not_latch_completed_cleanup(self) -> None:
+        server = self.marked_server()
+        unlink = Path.unlink
+
+        def fail_active_marker(path, *args, **kwargs):
+            if path == self.root / "server.active":
+                raise OSError("active marker unlink primary")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(F.BOUNDS, "kill_process_tree"), patch.object(Path, "unlink", fail_active_marker), \
+             self.assertRaisesRegex(OSError, "active marker unlink primary"):
+            server.stop()
+        self.assertFalse(server.stop_complete)
+        self.assertTrue(server.cleanup_uncertain)
+        self.assertTrue((self.root / "server.active").exists())
+        with patch.object(F.BOUNDS, "kill_process_tree"), \
+             self.assertRaisesRegex(RuntimeError, "previous_cleanup_failure"):
+            server.stop()
+        self.assertTrue((self.root / "server.active").exists())
+
+    def test_verify_uncertain_job_drain_rejects_receipt_and_still_removes_secrets(self) -> None:
+        server = F.MysqlProcess(self.root, [])
+        server.process, server.job, server.reader = self.inert_process()
+        server.reader_start_state = "started"
+        server.job.wait_empty.side_effect = OSError("private query detail")
+        server.start = MagicMock(side_effect=lambda: (self.root / "server.active").write_bytes(b"inert owned marker"))
+        server.wait_ready = MagicMock()
+        stack, _, _ = self.verification(server=server)
+        with stack, patch.object(F.BOUNDS, "os", SimpleNamespace(name="nt")), \
+             self.assertRaisesRegex(RuntimeError, "job_drain"):
+            F.verify(self.args)
+        server.job.wait_empty.assert_called_once()
+        server.job.close.assert_called_once()
+        server.reader.join.assert_called_once()
+        self.assertFalse(server.stop_complete)
+        for name in ("verification.json", "init.sql", "admin.cnf"):
+            self.assertFalse((self.root / name).exists(), name)
+        for name in ("server.active", "operation.lock", "db.json", "admin.json", "data"):
+            self.assertTrue((self.root / name).exists(), name)
+
+    def test_verify_second_stop_cannot_erase_first_job_drain_uncertainty(self) -> None:
+        server = F.MysqlProcess(self.root, ["not executed"])
+        process, job, reader = self.inert_process()
+        reader.start = MagicMock()
+        # Even an inert second observation claiming success cannot erase the
+        # first failed query. Actual closed Job owners must reject a query.
+        job.wait_empty.side_effect = [OSError("query private detail"), True]
+        stack, _, run = self.verification(server=server)
+        with stack, patch.object(F.subprocess, "Popen", return_value=process), \
+             patch.object(F.BOUNDS.WindowsJob, "attach", return_value=job), \
+             patch.object(F.threading, "Thread", return_value=reader), \
+             patch.object(F.BOUNDS, "os", SimpleNamespace(name="nt")), \
+             patch.object(F.BOUNDS, "resume_suspended_windows_process", side_effect=OSError("resume primary")), \
+             self.assertRaises(RuntimeError) as caught:
+            F.verify(self.args)
+        self.assertEqual(2, job.wait_empty.call_count)
+        self.assertIn("resume primary", str(caught.exception))
+        self.assertIn("previous_cleanup_failure", str(caught.exception))
+        self.assertNotIn("query private detail", str(caught.exception))
+        self.assertFalse(server.stop_complete)
+        self.assertTrue(server.cleanup_uncertain)
+        self.assertTrue((self.root / "server.active").exists())
+        run.assert_not_called()
+        for name in ("init.sql", "admin.cnf", "verification.json"):
+            self.assertFalse((self.root / name).exists(), name)
 
     def test_stop_faults_attempt_all_independent_cleanup_and_retain_markers(self) -> None:
         for fault in ("terminate", "wait", "job_close", "reader_join", "stream_close", "late_read"):

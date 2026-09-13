@@ -362,6 +362,9 @@ def verify(args: argparse.Namespace) -> None:
         if process is not None:
             cleanup.attempt("PostgreSQL process termination", lambda: BOUNDS.kill_process_tree(process, windows_job))
         if windows_job is not None:
+            drained = cleanup.attempt("PostgreSQL Job drain", lambda: windows_job.wait_empty(cleanup_deadline))
+            if drained is not True:
+                cleanup.add("PostgreSQL Job drain unconfirmed")
             cleanup.attempt("PostgreSQL Job close", windows_job.close)
         if process is not None:
             cleanup.attempt("PostgreSQL root wait", lambda: process.wait(
@@ -370,7 +373,8 @@ def verify(args: argparse.Namespace) -> None:
         if cleanup.attempt("PostgreSQL final PID check", (root / "data" / "postmaster.pid").exists):
             cleanup.add("PostgreSQL shutdown was not confirmed; preserve fixture for investigation")
         cleanup.raise_if_any(primary)
-        # These local checks are not a proof that all Job descendants drained.
+        # The contained Job was observed empty before close; this does not prove
+        # containment of processes outside the owned Job.
         print("PostgreSQL fixture cleanup checks passed; fixture retained for reproducible reruns", flush=True)
     if succeeded:
         result = {
