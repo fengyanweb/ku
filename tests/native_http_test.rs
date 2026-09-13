@@ -30,6 +30,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bounded_process::service::{spawn_bounded_service, BoundedService};
 use bounded_process::{run_bounded, BoundedOutput, OutputLimits};
 
 // HTTP native tests bind real ports; serialize them so concurrent servers do
@@ -104,6 +105,26 @@ fn unused_local_address() -> String {
 /// Compile `source` (with `__ADDRESS__` replaced) to a native binary and spawn
 /// it. Returns `None` when no C compiler is available (skip the test).
 fn spawn_native_server(name: &str, source: &str, address: &str) -> Option<NativeHttpServer> {
+    spawn_native_server_inner(name, source, address, false)
+}
+
+// Only the lexical positive currently opts into checked completion. Other
+// HTTP fixtures retain their old watchdog behavior and are not covered by its
+// stderr/exit receipt. This does not add a graceful shutdown API to Ku.
+fn spawn_observed_native_server(
+    name: &str,
+    source: &str,
+    address: &str,
+) -> Option<NativeHttpServer> {
+    spawn_native_server_inner(name, source, address, true)
+}
+
+fn spawn_native_server_inner(
+    name: &str,
+    source: &str,
+    address: &str,
+    observed: bool,
+) -> Option<NativeHttpServer> {
     let dir = unique_temp_dir(name);
     let entry = "server.ku";
     fs::write(dir.join(entry), source.replace("__ADDRESS__", address)).expect("write ku source");
@@ -135,6 +156,23 @@ fn spawn_native_server(name: &str, source: &str, address: &str) -> Option<Native
         .filter(|path| path.is_file())
         .unwrap_or_else(|| panic!("native HTTP build did not report C output:\n{combined}"));
     let exe = dir.join(&out);
+    if observed {
+        let mut command = Command::new(&exe);
+        command.current_dir(&dir);
+        let service = match spawn_bounded_service(command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS) {
+            Ok(service) => service,
+            Err(error) => {
+                fs::remove_dir_all(&dir).ok();
+                panic!("spawn native HTTP supervisor: {error}");
+            }
+        };
+        return Some(NativeHttpServer {
+            child: None,
+            service: Some(service),
+            dir: Some(dir),
+            c_source,
+        });
+    }
     let child = match Command::new(&exe)
         .current_dir(&dir)
         // The long-lived server is supervised by `NativeServerWatchdog` and
@@ -152,6 +190,7 @@ fn spawn_native_server(name: &str, source: &str, address: &str) -> Option<Native
     };
     Some(NativeHttpServer {
         child: Some(child),
+        service: None,
         dir: Some(dir),
         c_source,
     })
@@ -244,6 +283,7 @@ fn interpreter_run_output(name: &str, source: &str) -> BoundedOutput {
 
 struct NativeHttpServer {
     child: Option<Child>,
+    service: Option<BoundedService>,
     dir: Option<PathBuf>,
     c_source: PathBuf,
 }
@@ -276,6 +316,20 @@ impl Drop for NativeServerWatchdog {
 }
 
 impl NativeHttpServer {
+    fn finish_checked(mut self) {
+        let receipt = self
+            .service
+            .take()
+            .expect("observed native service")
+            .finish_checked()
+            .unwrap_or_else(|error| panic!("native HTTP checked stop failed: {error}"));
+        assert!(receipt.output.stderr.is_empty());
+        assert!(
+            !receipt.output.status.success(),
+            "forced stop is not natural success"
+        );
+    }
+
     fn dir(&self) -> &std::path::Path {
         self.dir.as_deref().expect("native server directory")
     }
@@ -327,6 +381,9 @@ impl NativeHttpServer {
 
 impl Drop for NativeHttpServer {
     fn drop(&mut self) {
+        // Drop the bounded service before attempting artifact cleanup, also on
+        // request-assertion panic. Only finish_checked validates its receipt.
+        drop(self.service.take());
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -1132,7 +1189,7 @@ fn main(): null! {
 fn native_http_lexical_capture_replay_preserves_local_owned_response() {
     let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let address = unused_local_address();
-    let Some(mut server) = spawn_native_server(
+    let Some(server) = spawn_observed_native_server(
         "lexical-capture-owned-response",
         LEXICAL_CAPTURE_OWNED_RESPONSE_SOURCE,
         &address,
@@ -1143,7 +1200,6 @@ fn native_http_lexical_capture_replay_preserves_local_owned_response() {
         );
         return;
     };
-    let watchdog = server.arm_kill_watchdog(RUN_TIMEOUT);
     // A different owned request body on each call must reach the response
     // without clone. That branch also requires the helper's outer int capture,
     // not the same-named handler-local string. This is not a soak/leak proof.
@@ -1159,7 +1215,6 @@ fn native_http_lexical_capture_replay_preserves_local_owned_response() {
             body,
             "helper must read outer count=7 and move only the per-request string"
         );
-        assert!(!watchdog.timed_out(), "native HTTP watchdog fired");
     }
     // Registration retains the current invoke/env value, not the caller's
     // handler variable cell. Its later replacement must not change this route.
@@ -1174,7 +1229,7 @@ fn native_http_lexical_capture_replay_preserves_local_owned_response() {
         "registered-direct-value",
         "direct handler values must not become aliases of the caller's variable cell"
     );
-    assert!(!watchdog.timed_out(), "native HTTP watchdog fired");
+    server.finish_checked();
 }
 
 #[test]

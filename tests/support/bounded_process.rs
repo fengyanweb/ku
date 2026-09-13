@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[path = "bounded_service.rs"]
+pub mod service;
+
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const CLEANUP_GRACE: Duration = Duration::from_secs(2);
 
@@ -43,6 +46,9 @@ pub enum FailureKind {
     Timeout,
     OutputLimit,
     Reader,
+    UnexpectedExit,
+    Termination,
+    Stderr,
 }
 
 #[derive(Debug)]
@@ -85,6 +91,9 @@ impl fmt::Display for BoundedProcessError {
             FailureKind::Timeout => "exceeded its absolute deadline",
             FailureKind::OutputLimit => "exceeded its bounded output limit",
             FailureKind::Reader => "failed while draining stdout or stderr",
+            FailureKind::UnexpectedExit => "exited before checked service shutdown",
+            FailureKind::Termination => "could not confirm requested service termination",
+            FailureKind::Stderr => "wrote unexpected service diagnostics",
         };
         writeln!(formatter, "bounded process {reason}: {}", self.command)?;
         writeln!(
@@ -194,6 +203,7 @@ struct ReaderThread {
 impl ReaderThread {
     fn is_done(&self) -> bool {
         self.done.load(Ordering::Acquire)
+            && self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     fn join_if_done(&mut self) -> Option<Result<(), String>> {
@@ -218,7 +228,7 @@ impl Drop for DoneOnDrop {
 }
 
 fn spawn_reader<R>(
-    mut reader: R,
+    reader: R,
     stream: Stream,
     capture: Arc<Mutex<CaptureState>>,
     output_exceeded: Arc<AtomicBool>,
@@ -227,9 +237,23 @@ fn spawn_reader<R>(
 where
     R: Read + Send + 'static,
 {
+    try_spawn_reader(reader, stream, capture, output_exceeded, limits)
+        .expect("spawn bounded output reader")
+}
+
+fn try_spawn_reader<R>(
+    mut reader: R,
+    stream: Stream,
+    capture: Arc<Mutex<CaptureState>>,
+    output_exceeded: Arc<AtomicBool>,
+    limits: OutputLimits,
+) -> io::Result<ReaderThread>
+where
+    R: Read + Send + 'static,
+{
     let done = Arc::new(AtomicBool::new(false));
     let thread_done = Arc::clone(&done);
-    let handle = thread::spawn(move || {
+    let handle = thread::Builder::new().spawn(move || {
         let _done = DoneOnDrop(thread_done);
         let mut buffer = [0_u8; 8 * 1024];
         loop {
@@ -242,11 +266,11 @@ where
                 output_exceeded.store(true, Ordering::Release);
             }
         }
-    });
-    ReaderThread {
+    })?;
+    Ok(ReaderThread {
         done,
         handle: Some(handle),
-    }
+    })
 }
 
 fn lock_capture(capture: &Mutex<CaptureState>) -> MutexGuard<'_, CaptureState> {
