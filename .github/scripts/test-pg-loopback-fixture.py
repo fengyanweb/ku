@@ -115,12 +115,16 @@ class PgFixtureTests(unittest.TestCase):
              patch.object(FIXTURE.BOUNDS, "resume_suspended_windows_process", side_effect=lambda p: events.append("resume")), \
              self.assertRaisesRegex(RuntimeError, "inert live boundary"):
             FIXTURE.verify(inputs.args)
-        self.assertEqual(["popen", "attach", "resume", "wait"], events)
+        self.assertEqual(["popen", "attach", "resume", "wait", "wait"], events)
         self.assertTrue(popen.call_args.kwargs["creationflags"] & 4)
-        process.wait.assert_called_once_with(timeout=25)
+        self.assertEqual(2, process.wait.call_count)
+        self.assertEqual(25, process.wait.call_args_list[0].kwargs["timeout"])
+        self.assertGreater(process.wait.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(process.wait.call_args.kwargs["timeout"], 5)
         job.terminate.assert_called_once_with()
         job.close.assert_called_once_with()
-        inputs.tree.assert_not_called()
+        inputs.tree.assert_called_once_with(process, job)
+        process.kill.assert_not_called()
         inputs.numeric.assert_not_called()
         inputs.record.open.assert_not_called()
 
@@ -144,7 +148,9 @@ class PgFixtureTests(unittest.TestCase):
                 inputs.tree.assert_called_once_with(process, None)
                 inputs.numeric.assert_not_called()
                 process.kill.assert_called_once_with()
-                process.wait.assert_called_once_with(timeout=5)
+                self.assertEqual(1, process.wait.call_count)
+                self.assertGreater(process.wait.call_args.kwargs["timeout"], 0)
+                self.assertLessEqual(process.wait.call_args.kwargs["timeout"], 5)
                 inputs.record.open.assert_not_called()
 
     def test_pg_resume_startup_and_reap_failures_do_not_write_success(self) -> None:
@@ -165,13 +171,198 @@ class PgFixtureTests(unittest.TestCase):
                      patch.object(FIXTURE.BOUNDS, "resume_suspended_windows_process", side_effect=resume_error), \
                      self.assertRaises((OSError, RuntimeError, subprocess.TimeoutExpired)):
                     FIXTURE.verify(inputs.args)
-                self.assertEqual(2, job.terminate.call_count)  # second call is through retained closed Job
+                job.terminate.assert_called_once_with()
                 job.close.assert_called_once_with()
                 inputs.tree.assert_called_once_with(process, job)
                 process.kill.assert_called_once_with()
                 inputs.run.assert_not_called()
                 inputs.numeric.assert_not_called()
                 inputs.record.open.assert_not_called()
+
+    def cleanup_inputs(self, failure: str | None = None, *, live_failure: bool = False) -> SimpleNamespace:
+        inputs = self.startup_inputs()
+        inputs.events = []
+        # A numeric PID is deliberately unavailable: only the retained owner
+        # authorizes cleanup. All process and filesystem operations are inert.
+        inputs.process = MagicMock(spec=["poll", "kill", "wait"])
+        inputs.job = MagicMock(spec=["terminate", "close"])
+        pid_checks = waits = 0
+
+        def pid_exists():
+            nonlocal pid_checks
+            pid_checks += 1
+            stage = {1: "initial_pid", 2: "stop_pid", 3: "final_pid"}[pid_checks]
+            inputs.events.append(stage)
+            if failure == stage:
+                raise OSError(stage + " injected failure")
+            return pid_checks == 2
+
+        def operation(stage):
+            def perform(*args, **kwargs):
+                inputs.events.append(stage)
+                if failure == stage:
+                    raise OSError(stage + " injected failure")
+            return perform
+
+        def wait(*, timeout):
+            nonlocal waits
+            waits += 1
+            stage = "startup_wait" if waits == 1 else "root_wait"
+            operation(stage)()
+            return 0
+
+        def run(command, *args, **kwargs):
+            if command[1] == "stop":
+                operation("stop")()
+                return b""
+            inputs.events.append("live")
+            if live_failure:
+                raise RuntimeError("original live failure")
+            return b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n"
+
+        inputs.pid.exists.side_effect = pid_exists
+        inputs.process.poll.side_effect = operation("root_poll")
+        inputs.process.kill.side_effect = operation("root_kill")
+        inputs.process.wait.side_effect = wait
+        inputs.job.terminate.side_effect = operation("job_terminate")
+        inputs.job.close.side_effect = operation("job_close")
+        inputs.live_run = run
+        return inputs
+
+    def cleanup_scope(self, inputs: SimpleNamespace) -> ExitStack:
+        stack = self.startup_scope(inputs)
+        inputs.run.side_effect = inputs.live_run
+        stack.enter_context(patch.object(FIXTURE.subprocess, "Popen", return_value=inputs.process))
+        stack.enter_context(patch.object(FIXTURE.BOUNDS.WindowsJob, "attach", return_value=inputs.job))
+        stack.enter_context(patch.object(FIXTURE.BOUNDS, "resume_suspended_windows_process"))
+        return stack
+
+    def test_pg_cleanup_failures_attempt_independent_steps_and_forbid_receipt(self) -> None:
+        for failure in ("stop_pid", "stop", "job_terminate", "job_close", "root_poll", "root_kill", "root_wait", "final_pid"):
+            with self.subTest(failure=failure):
+                inputs = self.cleanup_inputs(failure)
+                with self.cleanup_scope(inputs), self.assertRaises((OSError, RuntimeError)):
+                    FIXTURE.verify(inputs.args)
+                for step in ("job_terminate", "job_close", "root_kill", "root_wait", "final_pid"):
+                    self.assertIn(step, inputs.events, f"{failure} skipped independent {step}")
+                self.assertEqual(1, inputs.events.count("job_close"))
+                self.assertEqual(1, inputs.events.count("root_wait"))
+                self.assertEqual(1, inputs.events.count("final_pid"))
+                inputs.numeric.assert_not_called()
+                inputs.record.open.assert_not_called()
+
+    def test_pg_cleanup_failure_preserves_original_live_error(self) -> None:
+        for failure in ("stop", "job_terminate", "job_close", "root_wait", "final_pid"):
+            with self.subTest(failure=failure):
+                inputs = self.cleanup_inputs(failure, live_failure=True)
+                with self.cleanup_scope(inputs), self.assertRaisesRegex(RuntimeError, "original live failure"):
+                    FIXTURE.verify(inputs.args)
+                inputs.record.open.assert_not_called()
+                inputs.numeric.assert_not_called()
+
+    def test_pg_cleanup_mock_success_receipt_follows_all_checks(self) -> None:
+        inputs = self.cleanup_inputs()
+        with self.cleanup_scope(inputs):
+            FIXTURE.verify(inputs.args)
+        self.assertEqual([
+            "initial_pid", "startup_wait", "live", "stop_pid", "stop", "job_terminate",
+            "root_poll", "root_kill", "job_close", "root_wait", "final_pid",
+        ], inputs.events)
+        inputs.record.open.assert_called_once_with("w", encoding="utf-8", newline="\n")
+        inputs.numeric.assert_not_called()
+
+    def test_pg_cleanup_held_root_wait_uses_remaining_five_second_budget(self) -> None:
+        inputs = self.cleanup_inputs()
+        with self.cleanup_scope(inputs), patch.object(FIXTURE.time, "monotonic", side_effect=[10.0, 13.0]):
+            FIXTURE.verify(inputs.args)
+        self.assertEqual(2.0, inputs.process.wait.call_args.kwargs["timeout"])
+
+    def test_pg_cleanup_expired_fallback_budget_does_not_reset_wait_timeout(self) -> None:
+        inputs = self.cleanup_inputs()
+        with self.cleanup_scope(inputs), patch.object(FIXTURE.time, "monotonic", side_effect=[10.0, 16.0]):
+            FIXTURE.verify(inputs.args)
+        self.assertEqual(0.0, inputs.process.wait.call_args.kwargs["timeout"])
+
+    def test_pg_clean_cleanup_preserves_original_failure_identity(self) -> None:
+        inputs = self.cleanup_inputs()
+        primary = RuntimeError("original live failure")
+        with self.cleanup_scope(inputs):
+            inputs.run.side_effect = [primary, b""]
+            with self.assertRaises(RuntimeError) as raised:
+                FIXTURE.verify(inputs.args)
+        self.assertIs(primary, raised.exception)
+        inputs.record.open.assert_not_called()
+
+    def test_pg_first_stop_failure_remains_primary_after_independent_cleanup(self) -> None:
+        for close_failure in (False, True):
+            with self.subTest(close_failure=close_failure):
+                inputs = self.cleanup_inputs()
+                primary = OSError("original stop failure")
+                if close_failure:
+                    inputs.job.close.side_effect = OSError("inert close failure")
+                with self.cleanup_scope(inputs):
+                    inputs.run.side_effect = [
+                        b"test result: ok. 1 passed; 0 failed; 0 ignored;\n", primary,
+                    ]
+                    with self.assertRaisesRegex((OSError, RuntimeError), "original stop failure") as raised:
+                        FIXTURE.verify(inputs.args)
+                self.assertIs(primary, raised.exception.primary if close_failure else raised.exception)
+                inputs.job.terminate.assert_called_once_with()
+                inputs.job.close.assert_called_once_with()
+                self.assertIn("root_wait", inputs.events)
+                self.assertIn("final_pid", inputs.events)
+                inputs.record.open.assert_not_called()
+
+    def test_pg_multiple_cleanup_failures_preserve_primary_and_all_attempts(self) -> None:
+        inputs = self.cleanup_inputs(live_failure=True)
+        for operation in (inputs.job.terminate, inputs.job.close, inputs.process.kill):
+            operation.side_effect = OSError("inert cleanup failure")
+        with self.cleanup_scope(inputs), self.assertRaisesRegex(RuntimeError, "original live failure") as raised:
+            FIXTURE.verify(inputs.args)
+        for operation in (inputs.job.terminate, inputs.job.close, inputs.process.kill):
+            operation.assert_called_once_with()
+        self.assertIn("root_wait", inputs.events)
+        self.assertIn("final_pid", inputs.events)
+        self.assertIn("PostgreSQL process termination", str(raised.exception))
+        self.assertIn("PostgreSQL Job close", str(raised.exception))
+        inputs.record.open.assert_not_called()
+
+    def test_pg_failed_setup_retains_actual_job_owner_without_resuming(self) -> None:
+        for failure in (None, "terminate", "close"):
+            with self.subTest(failure=failure):
+                inputs = self.startup_inputs()
+                process = MagicMock(spec=["poll", "kill", "wait"])
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                job = MagicMock(spec=["terminate", "close"])
+                if failure is not None:
+                    getattr(job, failure).side_effect = OSError("inert retained owner failure")
+                primary = FIXTURE.BOUNDS.WindowsJobSetupError(job, OSError("inert assignment"))
+                with self.startup_scope(inputs), \
+                     patch.object(FIXTURE.subprocess, "Popen", return_value=process), \
+                     patch.object(FIXTURE.BOUNDS.WindowsJob, "attach", side_effect=primary), \
+                     patch.object(FIXTURE.BOUNDS, "resume_suspended_windows_process") as resume, \
+                     self.assertRaisesRegex(RuntimeError, "Windows Job setup failed"):
+                    FIXTURE.verify(inputs.args)
+                resume.assert_not_called()
+                inputs.run.assert_not_called()
+                inputs.tree.assert_called_once_with(process, job)
+                job.terminate.assert_called_once_with()
+                job.close.assert_called_once_with()
+                process.kill.assert_called_once_with()
+                self.assertEqual(1, process.wait.call_count)
+                self.assertGreater(process.wait.call_args.kwargs["timeout"], 0)
+                self.assertLessEqual(process.wait.call_args.kwargs["timeout"], 5)
+                inputs.numeric.assert_not_called()
+                inputs.record.open.assert_not_called()
+
+    def test_pg_retained_pid_forbids_receipt_after_other_checks_pass(self) -> None:
+        inputs = self.cleanup_inputs()
+        inputs.pid.exists.side_effect = [False, True, True]
+        with self.cleanup_scope(inputs), self.assertRaisesRegex(RuntimeError, "shutdown was not confirmed"):
+            FIXTURE.verify(inputs.args)
+        self.assertIn("root_wait", inputs.events)
+        inputs.record.open.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "real harmless Windows process / Job contract")
     def test_pg_real_suspended_root_job_order_and_failed_assignment(self) -> None:
@@ -237,7 +428,7 @@ class PgFixtureTests(unittest.TestCase):
                         inputs.run.assert_not_called()
                         inputs.tree.assert_called_once_with(held[0], None)
                     else:
-                        inputs.tree.assert_not_called()
+                        inputs.tree.assert_called_once_with(held[0], jobs[0])
                     inputs.numeric.assert_not_called()
                     inputs.record.open.assert_not_called()
                 finally:
@@ -314,10 +505,24 @@ class PgFixtureTests(unittest.TestCase):
 
     def test_bounded_runner_redacts_secret_and_restores_timeout(self) -> None:
         original = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
-        with patch.object(FIXTURE, "SECRET", "private-credential"):
-            with patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=SystemExit("private-credential")):
+        for error_type in (SystemExit, RuntimeError, OSError):
+            with self.subTest(error_type=error_type), patch.object(FIXTURE, "SECRET", "private-credential"), \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=error_type("private-credential")):
                 with self.assertRaisesRegex(RuntimeError, "^<redacted>$"):
                     FIXTURE.run([], FIXTURE.REPO, "fake", 2)
+            self.assertEqual(original, FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS)
+
+    def test_bounded_runner_redacts_primary_in_combined_cleanup_failure(self) -> None:
+        secret = "private-credential-" + "a" * 2048
+        primary = RuntimeError("command failed: " + secret)
+        failure = FIXTURE.BOUNDS.CleanupFailure("Job close (OSError)", primary)
+        original = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        with patch.object(FIXTURE, "SECRET", secret), \
+             patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=failure):
+            with self.assertRaisesRegex(RuntimeError, "command failed: <redacted>; cleanup failed") as raised:
+                FIXTURE.run([], FIXTURE.REPO, "fake", 2)
+        self.assertNotIn("private-credential", str(raised.exception))
+        self.assertNotIn("a" * 32, str(raised.exception))
         self.assertEqual(original, FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS)
 
     def test_live_requires_exactly_one_executed_test(self) -> None:

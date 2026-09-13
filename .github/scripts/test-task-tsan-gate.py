@@ -61,6 +61,24 @@ class TSanGateContracts(unittest.TestCase):
                 self.assertIn(str(failure), (Path(temporary) / "probe.failure.txt").read_text())
             self.assertEqual(original, GATE.BOUNDS.COMMAND_TIMEOUT_SECONDS)
 
+    def test_runner_runtime_error_writes_failure_receipt_and_restores_bound(self) -> None:
+        original = GATE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        failure = RuntimeError("synthetic Job setup failure")
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            GATE.BOUNDS, "run_bounded", side_effect=failure,
+        ) as run:
+            logs = Path(temporary)
+            with self.assertRaises(RuntimeError) as raised:
+                GATE.run_command(["not-executed"], logs, "setup-probe", 20)
+            self.assertEqual(original, GATE.BOUNDS.COMMAND_TIMEOUT_SECONDS)
+            receipt = logs / "setup-probe.failure.txt"
+            self.assertTrue(receipt.is_file(), "runner failure must have a failure receipt")
+            self.assertEqual(receipt.read_text(encoding="utf-8"), str(failure))
+            self.assertEqual(str(raised.exception), f"setup-probe failed: {failure}")
+            self.assertIs(raised.exception.__cause__, failure)
+            self.assertFalse((logs / "setup-probe.log").exists())
+            run.assert_called_once_with(["not-executed"], GATE.REPO, "setup-probe")
+
     def test_stderr_is_checked_and_command_is_logged(self) -> None:
         done = subprocess.CompletedProcess([], 0, PASS, b"skip: no runtime\n")
         with tempfile.TemporaryDirectory() as temporary, patch.object(

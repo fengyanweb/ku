@@ -364,9 +364,12 @@ class MysqlProcess:
         self.process = None
         self.job = None
         self.reader = None
+        self.reader_start_state = "not_attempted"
         self.output = bytearray()
         self.lock = threading.Lock()
         self.failed = threading.Event()
+        self.reader_error = ""
+        self.cleanup_uncertain = False
         self.ready = False
 
     def start(self) -> None:
@@ -380,19 +383,27 @@ class MysqlProcess:
             self.job = BOUNDS.WindowsJob.attach(self.process)
             if self.job is None:
                 raise RuntimeError("Could not contain the suspended MySQL process")
+            # Retain the owner before start: interruption may happen after the
+            # thread exists but before Thread.start returns normally.
             self.reader = threading.Thread(target=self.drain, daemon=True)
+            self.reader_start_state = "unknown"
             self.reader.start()
+            self.reader_start_state = "started"
             BOUNDS.resume_suspended_windows_process(self.process)
-        except BaseException:
+        except BaseException as primary:
+            if isinstance(primary, BOUNDS.WindowsJobSetupError):
+                self.job = primary.job
+            cleanup = BOUNDS.CleanupErrors()
             if self.process is None:
                 # Popen failed without returning an owned child handle.
-                plain(self.root / "server.active").unlink()
+                cleanup.attempt("active_marker_unlink", lambda: plain(self.root / "server.active").unlink())
             else:
-                self.stop()
-            raise
+                cleanup.attempt("server_stop", self.stop)
+            cleanup.raise_if_any(primary)
 
     def drain(self) -> None:
         assert self.process is not None and self.process.stdout is not None
+        errors = BOUNDS.CleanupErrors()
         try:
             with (self.root / "server.log").open("xb") as log:
                 while chunk := self.process.stdout.read(8192):
@@ -403,11 +414,18 @@ class MysqlProcess:
                     log.write(kept)
                     if len(chunk) > room:
                         self.failed.set()
-                        BOUNDS.kill_process_tree(self.process, self.job)
-                        return
-        except (OSError, ValueError):
+                        errors.add("output_limit")
+                        break
+        except Exception as error:
             self.failed.set()
-            BOUNDS.kill_process_tree(self.process, self.job)
+            errors.add("reader_read", error)
+        finally:
+            if self.failed.is_set():
+                # A failed terminate must reach the supervisor, never escape
+                # only as a daemon-thread traceback containing private output.
+                errors.attempt("reader_terminate", lambda: BOUNDS.kill_process_tree(self.process, self.job))
+                with self.lock:
+                    self.reader_error = errors.summary()
 
     def wait_ready(self) -> None:
         deadline = time.monotonic() + START_TIMEOUT
@@ -428,19 +446,71 @@ class MysqlProcess:
     def stop(self) -> None:
         if self.process is None:
             return
-        try:
-            BOUNDS.kill_process_tree(self.process, self.job)
-            self.process.wait(timeout=10)
-        finally:
-            if self.job is not None:
-                self.job.close()
+        deadline = time.monotonic() + 10
+        cleanup = BOUNDS.CleanupErrors()
+        primary = None
+
+        def attempt(label, action):
+            nonlocal primary
+            try:
+                return action()
+            except BaseException as error:
+                if primary is None:
+                    primary = error
+                else:
+                    cleanup.add(label, error)
+                return None
+
+        attempt("tree_terminate", lambda: BOUNDS.kill_process_tree(self.process, self.job))
+        attempt("root_wait", lambda: self.process.wait(timeout=max(0, deadline - time.monotonic())))
+        if self.job is not None:
+            attempt("job_close", self.job.close)
+        reader_finished = self.reader is None
         if self.reader is not None:
-            self.reader.join(timeout=5)
-            if self.reader.is_alive():
-                raise RuntimeError("Private MySQL output did not close after termination")
-        if self.process.stdout is not None:
-            self.process.stdout.close()
-        # Process exit, not a TCP ping or pid-file disappearance, proves shutdown.
+            joined = False
+            def join_reader():
+                self.reader.join(timeout=min(5, max(0, deadline - time.monotonic())))
+                return True
+
+            if self.reader_start_state == "not_attempted":
+                reader_finished = True
+            elif self.reader_start_state == "unknown":
+                # Thread.start can fail after OS thread creation but before
+                # ident/_started registration. is_alive()==False alone is not
+                # proof the thread cannot later read the pipe. Even an ident
+                # needs a normally returned join before registration is known.
+                ident = attempt("reader_identity", lambda: self.reader.ident)
+                if ident is not None and attempt("reader_join", join_reader) is True:
+                    self.reader_start_state = "started"
+                    joined = True
+                else:
+                    cleanup.add("reader_start_unknown")
+            else:
+                joined = attempt("reader_join", join_reader) is True
+            if self.reader_start_state == "started" and joined:
+                # After any failed join, even is_alive()==False is insufficient
+                # to authorize synchronous close of a possibly locked pipe.
+                reader_finished = attempt("reader_state", self.reader.is_alive) is False
+            if not reader_finished:
+                cleanup.add("reader_unfinished")
+        if reader_finished and self.process.stdout is not None:
+            attempt("stream_close", self.process.stdout.close)
+        with self.lock:
+            reader_error = self.reader_error
+        if self.failed.is_set():
+            cleanup.add("reader_failed")
+            if reader_error:
+                if primary is None:
+                    primary = RuntimeError(reader_error)
+                else:
+                    cleanup.add("reader_failure")
+        if self.cleanup_uncertain:
+            cleanup.add("previous_cleanup_failure")
+        if primary is not None or cleanup.failed:
+            self.cleanup_uncertain = True
+            cleanup.raise_if_any(primary)
+        # These markers certify only the existing retained-root/reader cleanup
+        # contract. Complete Job descendant drain is a separate required gate.
         pid = self.root / "server.pid"
         if pid.exists():
             plain(pid).unlink()
@@ -486,18 +556,23 @@ def verify(args: argparse.Namespace) -> None:
         with socket.socket() as reservation:
             reservation.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             reservation.bind(("127.0.0.1", config["port"]))
-        write_startup_files(root, config, admin)
-        log = root / "server.log"
-        if log.exists() or log.is_symlink():
-            plain(log).unlink()
-        with isolated_environment(root):
-            os.environ["KU_MYSQL_TEST_CONFIG_FILE"] = str(root / "db.json")
-            os.environ["KU_BIN"] = str(ku_binary)
-            os.environ["KU_MYSQL_LIB"] = str(root / "portable" / "lib")
-            os.environ["KU_MYSQL_INCLUDE"] = str(root / "portable" / "include")
-            server = MysqlProcess(root, server_command(root, config["port"]))
-            graceful = False
-            try:
+        server = None
+        graceful = False
+        primary = None
+        cleanup_errors = BOUNDS.CleanupErrors()
+        try:
+            # Include partial startup-file creation and environment setup in
+            # the same secret cleanup transaction as the running server.
+            write_startup_files(root, config, admin)
+            log = root / "server.log"
+            if log.exists() or log.is_symlink():
+                plain(log).unlink()
+            with isolated_environment(root):
+                os.environ["KU_MYSQL_TEST_CONFIG_FILE"] = str(root / "db.json")
+                os.environ["KU_BIN"] = str(ku_binary)
+                os.environ["KU_MYSQL_LIB"] = str(root / "portable" / "lib")
+                os.environ["KU_MYSQL_INCLUDE"] = str(root / "portable" / "include")
+                server = MysqlProcess(root, server_command(root, config["port"]))
                 server.start()
                 server.wait_ready()
                 identity = run(client_command(root, "mysql.exe", "--batch", "--raw", "--skip-column-names", "--default-character-set=utf8mb4",
@@ -514,19 +589,26 @@ def verify(args: argparse.Namespace) -> None:
                 run(client_command(root, "mysqladmin.exe", "shutdown"), root, "stop private MySQL", 15)
                 server.process.wait(timeout=15)
                 graceful = True
-            finally:
-                server.stop()
-                for name in ("init.sql", "admin.cnf"):
+        except BaseException as error:
+            primary = error
+        finally:
+            if server is not None:
+                cleanup_errors.attempt("server_stop", server.stop)
+            for name in ("init.sql", "admin.cnf"):
+                def remove_secret(name=name):
                     path = root / name
-                    if path.exists():
+                    if present(path):
                         plain(path).unlink()
-            if not graceful:
-                raise RuntimeError("Private MySQL shutdown was not confirmed")
-            write_private(root / "live-test.log", text, replace=True)
-            write_json(record, {"format": 1, "version": VERSION, "server_uuid": manifest["server_uuid"],
-                                "test_binary": str(test_binary), "ku_binary": str(ku_binary),
-                                "live_test_passed": True, "server_stopped": True,
-                                "verified_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+
+                cleanup_errors.attempt(name.replace(".", "_") + "_unlink", remove_secret)
+        cleanup_errors.raise_if_any(primary)
+        if not graceful:
+            raise RuntimeError("Private MySQL shutdown was not confirmed")
+        write_private(root / "live-test.log", text, replace=True)
+        write_json(record, {"format": 1, "version": VERSION, "server_uuid": manifest["server_uuid"],
+                            "test_binary": str(test_binary), "ku_binary": str(ku_binary),
+                            "live_test_passed": True, "server_stopped": True,
+                            "verified_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
     print("Live MySQL test passed; owned server stopped. Run cleanup to remove the private fixture.", flush=True)
 
 

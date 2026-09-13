@@ -56,7 +56,7 @@ def run_command(command: list[str], logs: Path, label: str, timeout: int) -> byt
     BOUNDS.COMMAND_TIMEOUT_SECONDS = timeout
     try:
         completed = BOUNDS.run_bounded(command, REPO, label)
-    except (SystemExit, OSError) as error:
+    except (SystemExit, OSError, RuntimeError) as error:
         # The reused runner includes bounded stdout/stderr for nonzero exits.
         with (logs / f"{label}.failure.txt").open("x", encoding="utf-8") as output:
             output.write(str(error))
