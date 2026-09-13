@@ -1887,6 +1887,8 @@ fn main(): null! {
 
 注册前已完成的 setter 调用不因后面的注册被追溯禁止，但注册时必须检查替换后的实际函数值，不能沿用旧函数体的只读结论。对于有关的动态调用、来源丢失或不完整效果等组合，如果不能证明共享捕获规则成立，必须以明确的 E0704 安全原因拒绝（fail closed），不能默认安全。既有 handler 外层写入仍使用 E0703；本项不新增自动解冻或共享状态 API。
 
+多值赋值的右侧仍从左到右求值，全部右侧求值完成后才写入左侧绑定。捕获与调用效果证据必须对应每一项求值时的函数值：`_, chosen = install(), handler.clone()` 不能沿用 `install()` 之前的 handler 证据；相反顺序 `chosen, _ = handler.clone(), install()` 保留先求得的函数值及其原有捕获关系。这里保存的是编译期检查证据，不是新增运行时快照、深拷贝或锁。
+
 ### HTTP 与 native C 后端
 
 `ku build --native` 编译出的二进制与解释器跑同一套 HTTP 规则，可观测响应一致：路由（exact 优先于 `{param}`、404/405）、`req` 的 method/path/params/query/headers/body、`http.text/html/empty/redirect` 响应、有界接纳（`max_connections`/`max_active_requests`/`max_pending_requests` 超限返回 503）、以及请求级限制 400/413/414/431/408 都与解释器逐一对齐；命名函数 handler（`service.get("/x", index)`）和内联 `fn(req)` 都支持。native 用真 worker 线程并行跑 handler（解释器 handler 串行），并行只是内部实现差异，不改变单个请求的可观测响应。

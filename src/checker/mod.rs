@@ -1238,15 +1238,17 @@ impl Checker {
                         }
                     }
                 }
-                let provenances = values
+                let evaluated = values
                     .iter()
-                    .map(|value| self.expression_closure_provenance(value))
-                    .collect::<Vec<_>>();
-                let actuals = values
-                    .iter()
-                    .map(|value| self.consume_expr(value))
+                    .map(|value| {
+                        let actual = self.consume_expr(value)?;
+                        // Preserve each evaluated value before the next RHS
+                        // can replace a callable, but defer all destination stores.
+                        let provenance = self.expression_closure_provenance(value);
+                        Ok((actual, provenance))
+                    })
                     .collect::<KuResult<Vec<_>>>()?;
-                for ((name, actual), provenance) in names.iter().zip(actuals).zip(provenances) {
+                for (name, (actual, provenance)) in names.iter().zip(evaluated) {
                     let Some(name) = name else {
                         continue;
                     };
