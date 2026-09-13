@@ -763,7 +763,7 @@ impl Interpreter {
                     .map(|param| param.name.clone())
                     .collect::<Vec<_>>();
                 let body = function.body.clone();
-                let capture_names = function_capture_names(function);
+                let capture_names = function_capture_names(function)?;
                 env.check_capture(&capture_names, function.span)?;
                 let captures = env.capture(&capture_names);
                 env.define_owned(
@@ -1661,7 +1661,7 @@ impl Interpreter {
                 result
             }
             ExprKind::Function { params, body, .. } => {
-                let names = closure_capture_names(params, body);
+                let names = closure_capture_names(params, body)?;
                 env.check_capture(&names, expr.span)?;
                 Ok(Value::Function {
                     params: params.iter().map(|param| param.name.clone()).collect(),
@@ -5363,57 +5363,142 @@ fn task_error_payload(value: &Value) -> Option<Value> {
     .then(|| value.as_ref().clone())
 }
 
-pub(crate) fn function_capture_names(function: &FnDecl) -> HashSet<String> {
+// Template interpolation is parsed independently of its enclosing function.
+// Keep one budget across that reparsing and the surrounding capture walk; the
+// parser's per-expression nesting guard alone cannot bound this traversal.
+const MAX_CAPTURE_SCAN_DEPTH: usize = 128;
+const MAX_CAPTURE_SCAN_WORK: usize = 262_144;
+const MAX_CAPTURE_TEMPLATE_BYTES: usize = 1_048_576;
+const MAX_CAPTURE_TEMPLATE_TOKENS: usize = 1_024;
+
+struct CaptureScanBudget {
+    remaining_work: usize,
+    remaining_template_bytes: usize,
+}
+
+impl CaptureScanBudget {
+    fn new() -> Self {
+        Self {
+            remaining_work: MAX_CAPTURE_SCAN_WORK,
+            remaining_template_bytes: MAX_CAPTURE_TEMPLATE_BYTES,
+        }
+    }
+
+    fn spend(&mut self, amount: usize, span: Span) -> KuResult<()> {
+        self.remaining_work = self.remaining_work.checked_sub(amount).ok_or_else(|| {
+            KuError::runtime("capture analysis limit: work budget exhausted", span)
+        })?;
+        Ok(())
+    }
+
+    fn enter(&mut self, depth: usize, span: Span) -> KuResult<()> {
+        if depth >= MAX_CAPTURE_SCAN_DEPTH {
+            return Err(KuError::runtime(
+                "capture analysis limit: nesting depth exceeded",
+                span,
+            ));
+        }
+        self.spend(1, span)
+    }
+
+    fn clone_scope(&mut self, bound: &HashSet<String>, span: Span) -> KuResult<HashSet<String>> {
+        self.spend(bound.len(), span)?;
+        Ok(bound.clone())
+    }
+
+    fn template(&mut self, raw: &str, span: Span) -> KuResult<()> {
+        self.remaining_template_bytes = self
+            .remaining_template_bytes
+            .checked_sub(raw.len())
+            .ok_or_else(|| {
+                KuError::runtime(
+                    "capture analysis limit: template byte budget exhausted",
+                    span,
+                )
+            })?;
+        Ok(())
+    }
+}
+
+pub(crate) fn function_capture_names(function: &FnDecl) -> KuResult<HashSet<String>> {
+    let mut budget = CaptureScanBudget::new();
+    budget.spend(function.params.len(), function.span)?;
     let mut bound = HashSet::new();
     bound.insert(function.name.clone());
     for param in &function.params {
         bound.insert(param.name.clone());
     }
     let mut free = HashSet::new();
-    collect_free_block(&function.body, &mut bound, &mut free);
-    free
+    collect_free_block(&function.body, &mut bound, &mut free, &mut budget, 0)?;
+    Ok(free)
 }
 
-pub(crate) fn closure_capture_names(params: &[FunctionParam], body: &[Stmt]) -> HashSet<String> {
+pub(crate) fn closure_capture_names(
+    params: &[FunctionParam],
+    body: &[Stmt],
+) -> KuResult<HashSet<String>> {
+    let mut budget = CaptureScanBudget::new();
+    budget.spend(
+        params.len(),
+        params
+            .first()
+            .map_or_else(Span::default, |param| param.span),
+    )?;
     let mut bound = HashSet::new();
     for param in params {
         bound.insert(param.name.clone());
     }
     let mut free = HashSet::new();
-    collect_free_block(body, &mut bound, &mut free);
-    free
+    collect_free_block(body, &mut bound, &mut free, &mut budget, 0)?;
+    Ok(free)
 }
 
-fn collect_free_block(body: &[Stmt], bound: &mut HashSet<String>, free: &mut HashSet<String>) {
+fn collect_free_block(
+    body: &[Stmt],
+    bound: &mut HashSet<String>,
+    free: &mut HashSet<String>,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+) -> KuResult<()> {
     for stmt in body {
-        collect_free_stmt(stmt, bound, free);
+        collect_free_stmt(stmt, bound, free, budget, depth)?;
     }
+    Ok(())
 }
 
-fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSet<String>) {
+fn collect_free_stmt(
+    stmt: &Stmt,
+    bound: &mut HashSet<String>,
+    free: &mut HashSet<String>,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+) -> KuResult<()> {
+    let span = stmt_span(stmt);
+    budget.enter(depth, span)?;
+    let depth = depth + 1;
     match stmt {
         Stmt::VarDecl { name, value, .. } => {
-            collect_free_expr(value, bound, free);
+            collect_free_expr(value, bound, free, budget, depth)?;
             bound.insert(name.clone());
         }
         Stmt::Assign { name, value, .. } => {
-            collect_free_expr(value, bound, free);
-            collect_free_assignment_name(name, bound, free);
+            collect_free_expr(value, bound, free, budget, depth)?;
+            collect_free_assignment_name(name, bound, free, budget, span)?;
         }
         Stmt::AssignTarget { target, value, .. } => {
-            collect_free_assign_target(target, bound, free);
-            collect_free_expr(value, bound, free);
+            collect_free_assign_target(target, bound, free, budget, depth, span)?;
+            collect_free_expr(value, bound, free, budget, depth)?;
         }
         Stmt::CompoundAssign { target, value, .. } => {
-            collect_free_assign_target(target, bound, free);
-            collect_free_expr(value, bound, free);
+            collect_free_assign_target(target, bound, free, budget, depth, span)?;
+            collect_free_expr(value, bound, free, budget, depth)?;
         }
         Stmt::DestructureAssign { names, values, .. } => {
             for value in values {
-                collect_free_expr(value, bound, free);
+                collect_free_expr(value, bound, free, budget, depth)?;
             }
             for name in names.iter().flatten() {
-                collect_free_assignment_name(name, bound, free);
+                collect_free_assignment_name(name, bound, free, budget, span)?;
             }
         }
         Stmt::ObjectDestructureAssign {
@@ -5422,17 +5507,18 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             value,
             ..
         } => {
-            collect_free_expr(value, bound, free);
+            collect_free_expr(value, bound, free, budget, depth)?;
             for binding in bindings {
+                budget.spend(1, span)?;
                 if let Some(default) = &binding.default {
-                    collect_free_expr(default, bound, free);
+                    collect_free_expr(default, bound, free, budget, depth)?;
                 }
                 if let Some(local) = &binding.local {
-                    collect_free_assignment_name(local, bound, free);
+                    collect_free_assignment_name(local, bound, free, budget, span)?;
                 }
             }
             if let Some(local) = rest.as_ref().and_then(|rest| rest.local.as_ref()) {
-                collect_free_assignment_name(local, bound, free);
+                collect_free_assignment_name(local, bound, free, budget, span)?;
             }
         }
         Stmt::If {
@@ -5441,15 +5527,18 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             else_branch,
             ..
         } => {
-            collect_free_expr(condition, bound, free);
-            collect_free_block(then_branch, &mut bound.clone(), free);
-            collect_free_block(else_branch, &mut bound.clone(), free);
+            collect_free_expr(condition, bound, free, budget, depth)?;
+            let mut then_bound = budget.clone_scope(bound, span)?;
+            collect_free_block(then_branch, &mut then_bound, free, budget, depth)?;
+            let mut else_bound = budget.clone_scope(bound, span)?;
+            collect_free_block(else_branch, &mut else_bound, free, budget, depth)?;
         }
         Stmt::While {
             condition, body, ..
         } => {
-            collect_free_expr(condition, bound, free);
-            collect_free_block(body, &mut bound.clone(), free);
+            collect_free_expr(condition, bound, free, budget, depth)?;
+            let mut scoped = budget.clone_scope(bound, span)?;
+            collect_free_block(body, &mut scoped, free, budget, depth)?;
         }
         Stmt::For {
             name,
@@ -5457,16 +5546,17 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             body,
             ..
         } => {
-            collect_free_expr(iterable, bound, free);
-            let mut scoped = bound.clone();
+            collect_free_expr(iterable, bound, free, budget, depth)?;
+            let mut scoped = budget.clone_scope(bound, span)?;
             scoped.insert(name.clone());
-            collect_free_block(body, &mut scoped, free);
+            collect_free_block(body, &mut scoped, free, budget, depth)?;
         }
         Stmt::Function(function) => {
-            let mut nested = bound.clone();
+            let mut nested = budget.clone_scope(bound, span)?;
+            budget.spend(function.params.len(), span)?;
             nested.insert(function.name.clone());
             nested.extend(function.params.iter().map(|param| param.name.clone()));
-            collect_free_block(&function.body, &mut nested, free);
+            collect_free_block(&function.body, &mut nested, free, budget, depth)?;
             bound.insert(function.name.clone());
         }
         Stmt::Try {
@@ -5476,43 +5566,55 @@ fn collect_free_stmt(stmt: &Stmt, bound: &mut HashSet<String>, free: &mut HashSe
             finally_body,
             ..
         } => {
-            collect_free_block(body, &mut bound.clone(), free);
-            let mut catch_bound = bound.clone();
+            let mut try_bound = budget.clone_scope(bound, span)?;
+            collect_free_block(body, &mut try_bound, free, budget, depth)?;
+            let mut catch_bound = budget.clone_scope(bound, span)?;
             if let Some(name) = catch_name {
                 catch_bound.insert(name.clone());
             }
-            collect_free_block(catch_body, &mut catch_bound, free);
-            collect_free_block(finally_body, &mut bound.clone(), free);
+            collect_free_block(catch_body, &mut catch_bound, free, budget, depth)?;
+            let mut finally_bound = budget.clone_scope(bound, span)?;
+            collect_free_block(finally_body, &mut finally_bound, free, budget, depth)?;
         }
         Stmt::Fail { value, .. } | Stmt::Panic { value, .. } | Stmt::Print { value, .. } => {
-            collect_free_expr(value, bound, free);
+            collect_free_expr(value, bound, free, budget, depth)?;
         }
         Stmt::Return { value, .. } => {
             if let Some(value) = value {
-                collect_free_expr(value, bound, free);
+                collect_free_expr(value, bound, free, budget, depth)?;
             }
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
-        Stmt::Expr { expr, .. } => collect_free_expr(expr, bound, free),
+        Stmt::Expr { expr, .. } => collect_free_expr(expr, bound, free, budget, depth)?,
     }
+    Ok(())
 }
 
 fn collect_free_assignment_name(
     name: &str,
     bound: &mut HashSet<String>,
     free: &mut HashSet<String>,
-) {
+    budget: &mut CaptureScanBudget,
+    span: Span,
+) -> KuResult<()> {
+    budget.spend(1, span)?;
     if !bound.contains(name) {
         free.insert(name.to_string());
     }
     bound.insert(name.to_string());
+    Ok(())
 }
 
 fn collect_free_assign_target(
     target: &AssignTarget,
     bound: &HashSet<String>,
     free: &mut HashSet<String>,
-) {
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+    span: Span,
+) -> KuResult<()> {
+    budget.enter(depth, span)?;
+    let depth = depth + 1;
     match target {
         AssignTarget::Variable(name) => {
             if !bound.contains(name) {
@@ -5520,11 +5622,14 @@ fn collect_free_assign_target(
             }
         }
         AssignTarget::Index { target, index } => {
-            collect_free_expr(target, bound, free);
-            collect_free_expr(index, bound, free);
+            collect_free_expr(target, bound, free, budget, depth)?;
+            collect_free_expr(index, bound, free, budget, depth)?;
         }
-        AssignTarget::Field { target, .. } => collect_free_expr(target, bound, free),
+        AssignTarget::Field { target, .. } => {
+            collect_free_expr(target, bound, free, budget, depth)?
+        }
     }
+    Ok(())
 }
 
 fn expect_bool_condition(value: Value, span: Span) -> KuResult<bool> {
@@ -5556,7 +5661,15 @@ fn expect_runtime_arg_count(
     }
 }
 
-fn collect_free_expr(expr: &Expr, bound: &HashSet<String>, free: &mut HashSet<String>) {
+fn collect_free_expr(
+    expr: &Expr,
+    bound: &HashSet<String>,
+    free: &mut HashSet<String>,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+) -> KuResult<()> {
+    budget.enter(depth, expr.span)?;
+    let depth = depth + 1;
     match &expr.kind {
         ExprKind::Variable(name) => {
             if !bound.contains(name) {
@@ -5564,74 +5677,388 @@ fn collect_free_expr(expr: &Expr, bound: &HashSet<String>, free: &mut HashSet<St
             }
         }
         ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => {
-            collect_free_expr(expr, bound, free);
+            collect_free_expr(expr, bound, free, budget, depth)?;
         }
         ExprKind::Binary { left, right, .. } => {
-            collect_free_expr(left, bound, free);
-            collect_free_expr(right, bound, free);
+            collect_free_expr(left, bound, free, budget, depth)?;
+            collect_free_expr(right, bound, free, budget, depth)?;
         }
         ExprKind::Call { callee, args } => {
-            collect_free_expr(callee, bound, free);
+            collect_free_expr(callee, bound, free, budget, depth)?;
             for arg in args {
-                collect_free_expr(arg, bound, free);
+                collect_free_expr(arg, bound, free, budget, depth)?;
             }
         }
         ExprKind::Array(values) => {
             for value in values {
-                collect_free_expr(value, bound, free);
+                collect_free_expr(value, bound, free, budget, depth)?;
             }
         }
         ExprKind::Index { target, index } => {
-            collect_free_expr(target, bound, free);
-            collect_free_expr(index, bound, free);
+            collect_free_expr(target, bound, free, budget, depth)?;
+            collect_free_expr(index, bound, free, budget, depth)?;
         }
         ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
-            collect_free_expr(target, bound, free)
+            collect_free_expr(target, bound, free, budget, depth)?
         }
         ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
             for (_, value) in fields {
-                collect_free_expr(value, bound, free);
+                collect_free_expr(value, bound, free, budget, depth)?;
             }
         }
         ExprKind::Match { value, arms } => {
-            collect_free_expr(value, bound, free);
+            collect_free_expr(value, bound, free, budget, depth)?;
             for arm in arms {
-                let mut arm_bound = bound.clone();
-                bind_match_pattern_names(&arm.pattern, &mut arm_bound);
+                let mut arm_bound = budget.clone_scope(bound, expr.span)?;
+                bind_match_pattern_names(&arm.pattern, &mut arm_bound, budget, depth, expr.span)?;
                 if let Some(guard) = &arm.guard {
-                    collect_free_expr(guard, &arm_bound, free);
+                    collect_free_expr(guard, &arm_bound, free, budget, depth)?;
                 }
-                collect_free_expr(&arm.value, &arm_bound, free);
+                collect_free_expr(&arm.value, &arm_bound, free, budget, depth)?;
             }
         }
         ExprKind::Function { params, body, .. } => {
-            let mut nested = bound.clone();
+            let mut nested = budget.clone_scope(bound, expr.span)?;
+            budget.spend(params.len(), expr.span)?;
             for param in params {
                 nested.insert(param.name.clone());
             }
-            collect_free_block(body, &mut nested, free);
+            collect_free_block(body, &mut nested, free, budget, depth)?;
+        }
+        ExprKind::Literal(Literal::TemplateString(raw)) => {
+            collect_free_template(raw, expr.span, bound, free, budget, depth)?;
         }
         ExprKind::Literal(_) => {}
     }
+    Ok(())
 }
 
-fn bind_match_pattern_names(pattern: &MatchPattern, bound: &mut HashSet<String>) {
+/// Visit actual interpolation expressions in source order, without retaining
+/// every parsed AST at once. Validate the complete generated expression before
+/// invoking the caller, including nested templates and their shared budget.
+/// An error must never be interpreted as an empty set of captures/effects.
+pub(crate) fn visit_template_capture_expressions(
+    raw: &str,
+    span: Span,
+    mut visitor: impl FnMut(&Expr) -> KuResult<()>,
+) -> KuResult<()> {
+    let bound = HashSet::new();
+    let mut validation_captures = HashSet::new();
+    visit_template_capture_expressions_with_budget(
+        raw,
+        span,
+        &mut CaptureScanBudget::new(),
+        0,
+        &mut |expression, budget, depth| {
+            collect_free_expr(expression, &bound, &mut validation_captures, budget, depth)?;
+            visitor(expression)
+        },
+    )
+}
+
+fn collect_free_template(
+    raw: &str,
+    span: Span,
+    bound: &HashSet<String>,
+    free: &mut HashSet<String>,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+) -> KuResult<()> {
+    visit_template_capture_expressions_with_budget(
+        raw,
+        span,
+        budget,
+        depth,
+        &mut |expression, budget, depth| collect_free_expr(expression, bound, free, budget, depth),
+    )
+}
+
+fn visit_template_capture_expressions_with_budget(
+    raw: &str,
+    span: Span,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+    visitor: &mut impl FnMut(&Expr, &mut CaptureScanBudget, usize) -> KuResult<()>,
+) -> KuResult<()> {
+    budget.enter(depth, span)?;
+    budget.template(raw, span)?;
+    // Match eval_template's streaming splitting and escaping exactly. In
+    // particular the first unescaped '}' ends an interpolation; this scan must
+    // not accept a different nested-brace grammar from actual evaluation.
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            chars.next();
+            continue;
+        }
+        if ch != '{' {
+            continue;
+        }
+        let mut source = String::new();
+        let mut found_end = false;
+        while let Some(inner) = chars.next() {
+            if inner == '\\' {
+                if let Some(next) = chars.next() {
+                    source.push('\\');
+                    source.push(next);
+                }
+                continue;
+            }
+            if inner == '}' {
+                found_end = true;
+                break;
+            }
+            source.push(inner);
+        }
+        if !found_end {
+            return Err(KuError::runtime(
+                "unterminated template interpolation",
+                span,
+            ));
+        }
+        if source.trim().is_empty() {
+            return Err(KuError::runtime("empty template interpolation", span));
+        }
+        let tokens = Lexer::new(&source).tokenize()?;
+        // Long flat binary expressions are constructed iteratively by Parser,
+        // but their AST drops recursively. Bound the newly owned AST before
+        // parsing, including the failure path after a capture-depth rejection.
+        if tokens.len() > MAX_CAPTURE_TEMPLATE_TOKENS {
+            return Err(KuError::parse(
+                "capture analysis limit: template token limit exceeded (too many tokens)",
+                span,
+            ));
+        }
+        budget.spend(tokens.len(), span)?;
+        let expression = Parser::new(tokens).parse_expression_only()?;
+        visitor(&expression, budget, depth + 1)?;
+    }
+    Ok(())
+}
+
+fn bind_match_pattern_names(
+    pattern: &MatchPattern,
+    bound: &mut HashSet<String>,
+    budget: &mut CaptureScanBudget,
+    depth: usize,
+    span: Span,
+) -> KuResult<()> {
+    budget.enter(depth, span)?;
     match pattern {
         MatchPattern::Binding(name) => {
             bound.insert(name.clone());
         }
         MatchPattern::EnumVariant { fields, .. } => {
             for field in fields {
-                bind_match_pattern_names(field, bound);
+                bind_match_pattern_names(field, bound, budget, depth + 1, span)?;
             }
         }
         MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
     }
+    Ok(())
 }
 
 impl Default for Interpreter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod template_capture_tests {
+    use super::*;
+
+    fn expression(source: &str) -> Expr {
+        Parser::new(Lexer::new(source).tokenize().expect("lex fixture"))
+            .parse_expression_only()
+            .expect("parse fixture")
+    }
+
+    fn function(source: &str) -> FnDecl {
+        let program = Parser::new(Lexer::new(source).tokenize().expect("lex fixture"))
+            .parse_program()
+            .expect("parse fixture");
+        let Item::Function(function) = program.items.into_iter().next().expect("one function")
+        else {
+            panic!("expected function fixture");
+        };
+        function
+    }
+
+    #[test]
+    fn named_function_template_capture_respects_self_parameters_and_locals() {
+        let function = function(
+            "fn Render(arg: int): str { local: int = 3; return `{helper(arg + local)} {outer} {Render(arg)}` }",
+        );
+        assert_eq!(
+            function_capture_names(&function).expect("capture analysis"),
+            HashSet::from(["helper".to_string(), "outer".to_string()]),
+        );
+    }
+
+    #[test]
+    fn closure_template_capture_uses_expressions_and_ignores_escaped_braces() {
+        let expression = expression(
+            r#"fn(value: int) { local: str = "owned"; return `\{escaped\} {helper(value)} {local.clone()} {outer}` }"#,
+        );
+        let ExprKind::Function { params, body, .. } = expression.kind else {
+            panic!("expected closure fixture");
+        };
+        assert_eq!(
+            closure_capture_names(&params, &body).expect("capture analysis"),
+            HashSet::from(["helper".to_string(), "outer".to_string()]),
+        );
+    }
+
+    #[test]
+    fn template_nested_arrow_capture_excludes_its_parameter() {
+        let expression = expression("fn() { return `{((local: int) => local + outer)(1)}` }");
+        let ExprKind::Function { params, body, .. } = expression.kind else {
+            panic!("expected closure fixture");
+        };
+        assert_eq!(
+            closure_capture_names(&params, &body).expect("capture analysis"),
+            HashSet::from(["outer".to_string()]),
+        );
+    }
+
+    #[test]
+    fn runtime_named_and_anonymous_functions_retain_template_only_capture() {
+        let span = Span::default();
+        for named in [false, true] {
+            let mut interpreter = Interpreter::new();
+            let mut env = Env::new();
+            env.define_owned("count".into(), Value::Int(42), true, span)
+                .expect("define capture");
+            if named {
+                interpreter
+                    .exec_stmt(
+                        &Stmt::Function(function("fn Render(): str { return `{count}` }")),
+                        &mut env,
+                        0,
+                    )
+                    .expect("create named function");
+            } else {
+                let closure = interpreter
+                    .eval(&expression("fn() { return `{count}` }"), &mut env, 0)
+                    .expect("create closure");
+                env.define_owned("Render".into(), closure, true, span)
+                    .expect("define closure");
+            }
+            let value = interpreter
+                .eval(&expression("Render()"), &mut env, 0)
+                .expect("invoke template closure");
+            assert!(matches!(value, Value::String(text) if text == "42"));
+        }
+    }
+
+    #[test]
+    fn malformed_templates_fail_capture_analysis_instead_of_returning_empty() {
+        for raw in ["{", "{}", "{name +}", "{name other}", "{@}"] {
+            let span = Span::default();
+            let body = [Stmt::Return {
+                value: Some(Expr::new(
+                    ExprKind::Literal(Literal::TemplateString(raw.into())),
+                    span,
+                )),
+                span,
+            }];
+            assert!(closure_capture_names(&[], &body).is_err(), "{raw}");
+            let mut calls = 0;
+            assert!(visit_template_capture_expressions(raw, span, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .is_err());
+            assert_eq!(calls, 0, "invalid interpolation must not reach visitor");
+        }
+    }
+
+    #[test]
+    fn template_capture_visitor_preserves_order_and_propagates_visitor_failure() {
+        let mut names = Vec::new();
+        visit_template_capture_expressions("{first}{second}", Span::default(), |expr| {
+            let ExprKind::Variable(name) = &expr.kind else {
+                panic!("expected variable interpolation");
+            };
+            names.push(name.clone());
+            Ok(())
+        })
+        .expect("visit both interpolations");
+        assert_eq!(names, ["first", "second"]);
+
+        let mut calls = 0;
+        let error = visit_template_capture_expressions("{first}{second}", Span::default(), |_| {
+            calls += 1;
+            Err(KuError::runtime("visitor failure", Span::default()))
+        })
+        .expect_err("visitor failure must propagate");
+        assert_eq!(calls, 1);
+        assert_eq!(error.message, "visitor failure");
+    }
+
+    #[test]
+    fn template_capture_visitor_rejects_deep_generated_ast_before_callback() {
+        // Flat sums bypass Parser's recursive expression guard. Stay below the
+        // token cap to exercise capture-depth validation rather than that cap.
+        let raw = format!("{{{}0}}", "0+".repeat(MAX_CAPTURE_SCAN_DEPTH + 1));
+        let mut calls = 0;
+        let error = visit_template_capture_expressions(&raw, Span::default(), |_| {
+            calls += 1;
+            Ok(())
+        })
+        .expect_err("deep generated AST must be rejected");
+        assert!(error.message.contains("nesting depth exceeded"));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn template_capture_token_limit_precedes_new_ast_construction() {
+        let raw = format!("{{{}0}}", "0+".repeat(MAX_CAPTURE_TEMPLATE_TOKENS));
+        let mut calls = 0;
+        let error = visit_template_capture_expressions(&raw, Span::default(), |_| {
+            calls += 1;
+            Ok(())
+        })
+        .expect_err("oversized token stream must be rejected");
+        assert!(error.message.contains("template token limit exceeded"));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn template_capture_work_is_shared_between_interpolations() {
+        let mut budget = CaptureScanBudget {
+            remaining_work: 5,
+            remaining_template_bytes: 64,
+        };
+        let error = collect_free_template(
+            "{first}{second}",
+            Span::default(),
+            &HashSet::new(),
+            &mut HashSet::new(),
+            &mut budget,
+            0,
+        )
+        .expect_err("second interpolation must not reset work budget");
+        assert!(error.message.contains("work budget exhausted"));
+    }
+
+    #[test]
+    fn template_capture_byte_budget_is_checked_before_lexing() {
+        let mut budget = CaptureScanBudget {
+            remaining_work: MAX_CAPTURE_SCAN_WORK,
+            remaining_template_bytes: 5,
+        };
+        let error = collect_free_template(
+            "{name}",
+            Span::default(),
+            &HashSet::new(),
+            &mut HashSet::new(),
+            &mut budget,
+            0,
+        )
+        .expect_err("template must fit cumulative byte budget");
+        assert!(error.message.contains("template byte budget exhausted"));
     }
 }
 

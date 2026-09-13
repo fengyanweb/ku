@@ -200,3 +200,88 @@ fn protocol_status_binds_tls_evidence_to_published_commit() {
     assert!(readme.contains("c66828390eb3124750bca9a9c7e789dd2df70267"));
     assert!(!readme.contains("三系统最终消费者 CI 仍是发布阻断项"));
 }
+
+#[test]
+fn http_shared_callable_docs_preserve_binding_and_value_boundaries() {
+    let syntax = include_str!("../docs/syntax.md");
+    let concurrency = include_str!("../docs/concurrency.md");
+    let diagnostics = include_str!("../docs/diagnostics.md");
+    for document in [syntax, concurrency, diagnostics] {
+        for required in ["E0704", "BindingId", "同名", "函数值", "clone", "解冻"] {
+            assert!(
+                document.contains(required),
+                "missing HTTP shared-callable boundary: {required}"
+            );
+        }
+    }
+    for required in [
+        "限制的是同一个共享变量绑定，不是某个名字、签名或所有函数值",
+        "换成同签名只读函数也仍是重绑定",
+        "不因此冻结 `handler` 变量本身",
+        "随后给原变量换值不替换已登记的 handler",
+        "不同的 `BindingId`",
+        "普通 Copy 捕获的初始化不被 E0704 一并冻结",
+        "不会因移动或丢弃 service、关闭 listener",
+        "自动解冻仍可访问的共享绑定",
+        "`service.del(path, handler)` 接受两个参数",
+        "注册 HTTP `DELETE` 路由，不是移除已有路由",
+        "不额外提供 `delete` 别名",
+    ] {
+        assert!(
+            syntax.contains(required),
+            "missing HTTP syntax boundary: {required}"
+        );
+    }
+    assert!(concurrency.contains("不把未知效果视为安全，也不自动解冻"));
+    assert!(diagnostics.contains("HttpSharedCallableReassignment"));
+    assert!(diagnostics.contains("限制不是按变量名或函数签名全局冻结"));
+}
+
+#[test]
+fn http_lexical_asan_selection_names_existing_tests() {
+    let workflow = include_str!("../.github/workflows/native-three-os.yml");
+    let native_http = include_str!("native_http_test.rs");
+    let sanitizer_job = workflow
+        .split_once("\n  borrow-sanitizers:")
+        .expect("ASan job must exist")
+        .1
+        .split_once("\n  task-tsan:")
+        .expect("ASan and TSan remain separate jobs")
+        .0;
+    let command = concat!(
+        "run: cargo test --locked --test native_http_test ",
+        "native_http_lexical_capture_replay_ -- --nocapture --test-threads=1"
+    );
+    assert_eq!(
+        sanitizer_job
+            .lines()
+            .filter(|line| line.trim() == command)
+            .count(),
+        1,
+        "ASan must execute the actual HTTP lexical selection once"
+    );
+
+    // These are selection contracts, not two native sanitizer executions:
+    // one test runs the safe server; the other checks rejection before C output.
+    let lines = native_http.lines().collect::<Vec<_>>();
+    let selected = lines
+        .windows(2)
+        .filter(|pair| pair[0].trim() == "#[test]")
+        .filter_map(|pair| pair[1].trim().strip_prefix("fn ")?.strip_suffix("() {"))
+        .filter(|name| name.starts_with("native_http_lexical_capture_replay_"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected.len(),
+        2,
+        "HTTP ASan filter must not silently select zero tests"
+    );
+    for name in [
+        "native_http_lexical_capture_replay_preserves_local_owned_response",
+        "native_http_lexical_capture_replay_rejects_shadowed_write_before_c_emission",
+    ] {
+        assert!(
+            selected.contains(&name),
+            "missing selected HTTP test: {name}"
+        );
+    }
+}

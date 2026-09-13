@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
     ast::*,
-    error::{KuError, KuResult},
+    error::{DiagnosticId, KuError, KuResult},
     span::Span,
     stdlib::metadata::{self, ArgRule, Signature, TypePattern},
 };
@@ -143,6 +143,9 @@ fn move_of_moved_error(root: &str, path: &[String], span: Span) -> KuError {
 
 type BindingId = u64;
 
+mod http_shared;
+use http_shared::HttpSharedCallable;
+
 /// The binding cells reachable from closures contained in a value. `complete`
 /// distinguishes a proven empty dependency set (for example a top-level
 /// function) from a value whose provenance the checker could not recover.
@@ -150,6 +153,12 @@ type BindingId = u64;
 struct ClosureProvenance {
     dependencies: HashSet<BindingId>,
     complete: bool,
+    /// An indirect write may have changed the body. This follows values through
+    /// clone/move/return; a fresh alias cannot validate a stale callable Type.
+    http_callable_body_uncertain: bool,
+    /// Flow-local evidence travels with aliases and escaping environments.
+    /// These are not ownership edges: copying a value does not capture its cell.
+    http_shared: BTreeMap<BindingId, HttpSharedCallable>,
 }
 
 impl ClosureProvenance {
@@ -157,6 +166,8 @@ impl ClosureProvenance {
         Self {
             dependencies: HashSet::new(),
             complete: true,
+            http_callable_body_uncertain: false,
+            http_shared: BTreeMap::new(),
         }
     }
 
@@ -164,12 +175,20 @@ impl ClosureProvenance {
         Self {
             dependencies: HashSet::new(),
             complete: false,
+            http_callable_body_uncertain: false,
+            http_shared: BTreeMap::new(),
         }
     }
 
     fn merge(&mut self, other: &Self) {
         self.dependencies.extend(other.dependencies.iter().copied());
         self.complete &= other.complete;
+        self.http_callable_body_uncertain |= other.http_callable_body_uncertain;
+        for (binding, origin) in &other.http_shared {
+            self.http_shared
+                .entry(*binding)
+                .or_insert_with(|| origin.clone());
+        }
     }
 }
 
@@ -184,6 +203,8 @@ struct ClosureReturnFlow {
 struct ClosureWriteEffect {
     target: BindingId,
     provenance: ClosureProvenance,
+    /// A recovered assignment site; opaque may-writes use the calling site.
+    assignment_span: Option<Span>,
 }
 
 #[derive(Clone)]
@@ -221,6 +242,8 @@ struct ClosureBodyView<'a> {
 struct ClosureProvenanceKey {
     dependencies: Vec<BindingId>,
     complete: bool,
+    http_callable_body_uncertain: bool,
+    http_shared: Vec<BindingId>,
 }
 
 impl From<&ClosureProvenance> for ClosureProvenanceKey {
@@ -230,6 +253,8 @@ impl From<&ClosureProvenance> for ClosureProvenanceKey {
         Self {
             dependencies,
             complete: provenance.complete,
+            http_callable_body_uncertain: provenance.http_callable_body_uncertain,
+            http_shared: provenance.http_shared.keys().copied().collect(),
         }
     }
 }
@@ -442,6 +467,10 @@ pub struct Checker {
     scopes: Vec<HashMap<String, VarType>>,
     current_return: Type,
     check_depth: usize,
+    /// Only the just-completed expression's value evidence, not a scope/span
+    /// cache. Call results retain the arguments as they were evaluated. The
+    /// address is compared for identity only, never dereferenced or persisted.
+    completed_expression_provenance: Option<(usize, Span, ClosureProvenance)>,
     recoverable_depth: usize,
     loop_depth: usize,
     /// One collector per enclosing loop; each holds the move state captured at
@@ -491,6 +520,7 @@ impl Checker {
             scopes: vec![HashMap::new()],
             current_return: Type::Void,
             check_depth: 0,
+            completed_expression_provenance: None,
             recoverable_depth: 0,
             loop_depth: 0,
             loop_break_states: Vec::new(),
@@ -1029,6 +1059,7 @@ impl Checker {
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) -> KuResult<()> {
+        self.completed_expression_provenance = None;
         self.check_loop_analysis_budget()?;
         if self.loop_analysis_depth != 0 {
             self.charge_loop_analysis(stmt_span(stmt))?;
@@ -1072,6 +1103,10 @@ impl Checker {
             }
             Stmt::Assign { name, value, span } => {
                 if self.contains(name) {
+                    self.reject_http_shared_write(
+                        self.get_allow_moved(name, *span)?.binding_id,
+                        *span,
+                    )?;
                     reject_direct_closure_cycle(name, value, *span)?;
                 }
                 // A closure assigned to an already-declared function-typed
@@ -1125,12 +1160,16 @@ impl Checker {
                 // `obj["self"] = obj` and `obj[key] = key` must not read a moved
                 // receiver/key in native code.
                 let actual = self.consume_expr(value)?;
+                let closure_provenance = if self.type_may_contain_function_value(&actual) {
+                    Some(self.expression_closure_provenance(value))
+                } else {
+                    None
+                };
                 let expected = self.check_assign_target(target, *span)?;
                 if !type_matches(&expected, &actual) {
                     return Err(type_error(*span, &expected, &actual));
                 }
-                if self.type_may_contain_function_value(&actual) {
-                    let closure_provenance = self.expression_closure_provenance(value);
+                if let Some(closure_provenance) = closure_provenance {
                     if let Some(name) = assign_target_root_name(target) {
                         self.reject_closure_reference_cycle(name, &closure_provenance, *span)?;
                         // Field/index writes update only one unknown slot. Without a
@@ -1583,8 +1622,8 @@ impl Checker {
         value: &Expr,
         span: Span,
     ) -> KuResult<()> {
-        let source_provenance = self.expression_closure_provenance(value);
         let source_type = self.check_object_destructure_source(value)?;
+        let source_provenance = self.expression_closure_provenance(value);
         let mut consumed = HashSet::new();
         match source_type {
             Type::Object(fields) => {
@@ -1722,6 +1761,8 @@ impl Checker {
     }
 
     fn check_expr(&mut self, expr: &Expr) -> KuResult<Type> {
+        self.completed_expression_provenance = None;
+        let mut evaluated_provenance = None;
         self.check_depth += 1;
         if self.check_depth > MAX_CHECK_DEPTH {
             self.check_depth = self.check_depth.saturating_sub(1);
@@ -1783,6 +1824,13 @@ impl Checker {
                         }
                     }
                     if let Some(ty) = self.check_std_method_call(callee, args, expr.span)? {
+                        if self.type_may_contain_function_value(&ty) {
+                            if let ExprKind::Field { target, name } = &callee.kind {
+                                if name == "clone" && args.is_empty() {
+                                    evaluated_provenance = Some(self.expression_closure_provenance(target));
+                                }
+                            }
+                        }
                         return Ok(ty);
                     }
                     if let ExprKind::Variable(name) = &callee.kind {
@@ -1797,10 +1845,7 @@ impl Checker {
                                     expr.span,
                                 ));
                             }
-                            let argument_provenance = args
-                                .iter()
-                                .map(|arg| self.expression_closure_provenance(arg))
-                                .collect::<Vec<_>>();
+                            let mut argument_provenance = Vec::with_capacity(args.len());
                             let mut generic_bindings = HashMap::new();
                             self.check_call_borrow_conflicts(args, &function.value_params, expr.span, None)?;
                             let mut actual_arg_types = Vec::with_capacity(args.len());
@@ -1813,6 +1858,7 @@ impl Checker {
                                     return Err(type_error(arg.span, expected, &actual));
                                 }
                                 actual_arg_types.push(actual);
+                                argument_provenance.push(self.expression_closure_provenance(arg));
                             }
                             if !function
                                 .type_params
@@ -1861,6 +1907,13 @@ impl Checker {
                                 &argument_provenance,
                                 expr.span,
                             )?;
+                            if self.type_may_contain_function_value(&returns) {
+                                evaluated_provenance = Some(self.evaluated_call_return_provenance(
+                                    &effect_params, &function.body, Some(function.body_id),
+                                    &actual_arg_types, &argument_provenance,
+                                    &ClosureProvenance::empty(),
+                                ));
+                            }
                             return Ok(if function.is_async {
                                 Type::Task(Box::new(returns))
                             } else {
@@ -1868,11 +1921,11 @@ impl Checker {
                             });
                         }
                         if self.contains(name) {
-                            let argument_provenance = args
-                                .iter()
-                                .map(|arg| self.expression_closure_provenance(arg))
-                                .collect::<Vec<_>>();
-                            let callee_type = self.get(name, callee.span)?.ty;
+                            // Like evaluation, retain the callable value before
+                            // checking arguments that may replace its binding.
+                            let callee_binding = self.get(name, callee.span)?;
+                            let captured = callee_binding.closure_provenance;
+                            let callee_type = callee_binding.ty;
                             if let Type::FunctionValue {
                                 params,
                                 return_type,
@@ -1881,7 +1934,7 @@ impl Checker {
                                 is_async,
                             } = callee_type
                             {
-                                let (returns, actual_arg_types) = self.check_function_value_call(
+                                let (returns, actual_arg_types, argument_provenance) = self.check_function_value_call(
                                     FunctionValueBodyRef {
                                         params: &params,
                                         return_type: return_type.as_deref(),
@@ -1895,7 +1948,8 @@ impl Checker {
                                 )?;
                                 if let Some(body_id) = body_id {
                                     self.apply_known_function_closure_effects(
-                                        name,
+                                        Some(name),
+                                        &captured,
                                         ClosureBodyView {
                                             params: &params,
                                             body: &body,
@@ -1912,6 +1966,12 @@ impl Checker {
                                         &argument_provenance,
                                         expr.span,
                                     )?;
+                                }
+                                if self.type_may_contain_function_value(&returns) {
+                                    evaluated_provenance = Some(self.evaluated_call_return_provenance(
+                                        &params, &body, body_id, &actual_arg_types,
+                                        &argument_provenance, &captured,
+                                    ));
                                 }
                                 return Ok(if is_async {
                                     Type::Task(Box::new(returns))
@@ -1942,12 +2002,9 @@ impl Checker {
                         {
                             return Ok(ty);
                         }
-                        let argument_provenance = args
-                            .iter()
-                            .map(|arg| self.expression_closure_provenance(arg))
-                            .collect::<Vec<_>>();
                         let callee_root = expr_root_name(callee).map(str::to_string);
                         let callee_type = self.check_expr(callee)?;
+                        let captured = self.expression_closure_provenance(callee);
                         if let Type::FunctionValue {
                             params,
                             return_type,
@@ -1956,7 +2013,7 @@ impl Checker {
                             is_async,
                         } = callee_type
                         {
-                            let (returns, actual_arg_types) = self.check_function_value_call(
+                            let (returns, actual_arg_types, argument_provenance) = self.check_function_value_call(
                                 FunctionValueBodyRef {
                                     params: &params,
                                     return_type: return_type.as_deref(),
@@ -1968,10 +2025,10 @@ impl Checker {
                                 None,
                                 Some(callee),
                             )?;
-                            if let Some(callee_root) = callee_root {
-                                if let Some(body_id) = body_id {
+                            if let Some(body_id) = body_id {
                                     self.apply_known_function_closure_effects(
-                                        &callee_root,
+                                        callee_root.as_deref(),
+                                        &captured,
                                         ClosureBodyView {
                                             params: &params,
                                             body: &body,
@@ -1981,7 +2038,14 @@ impl Checker {
                                         &actual_arg_types,
                                         expr.span,
                                     )?;
-                                } else {
+                            } else {
+                                self.reject_http_shared_unknown_call(&captured, expr.span)?;
+                                for (param, argument) in params.iter().zip(&argument_provenance) {
+                                    if param.ty.as_ref().is_none_or(|ty| self.type_may_contain_function_value(ty)) {
+                                        self.reject_http_shared_unknown_call(argument, expr.span)?;
+                                    }
+                                }
+                                if let Some(callee_root) = callee_root {
                                     self.reject_erased_function_value_call_cycle(
                                         &callee_root,
                                         &params,
@@ -1989,6 +2053,12 @@ impl Checker {
                                         expr.span,
                                     )?;
                                 }
+                            }
+                            if self.type_may_contain_function_value(&returns) {
+                                evaluated_provenance = Some(self.evaluated_call_return_provenance(
+                                    &params, &body, body_id, &actual_arg_types,
+                                    &argument_provenance, &captured,
+                                ));
                             }
                             Ok(if is_async {
                                 Type::Task(Box::new(returns))
@@ -2005,13 +2075,20 @@ impl Checker {
                 }
                 ExprKind::Array(values) => {
                     let mut element_type = Type::Unknown;
+                    let mut elements_provenance = ClosureProvenance::empty();
                     for value in values {
                         let actual = self.consume_expr(value)?;
+                        if self.type_may_contain_function_value(&actual) {
+                            elements_provenance.merge(&self.expression_closure_provenance(value));
+                        }
                         if element_type == Type::Unknown {
                             element_type = actual;
                         } else if !type_matches(&element_type, &actual) {
                             return Err(type_error(value.span, &element_type, &actual));
                         }
+                    }
+                    if self.type_may_contain_function_value(&element_type) {
+                        evaluated_provenance = Some(elements_provenance);
                     }
                     Ok(Type::Array(Box::new(element_type)))
                 }
@@ -2184,6 +2261,7 @@ impl Checker {
                         ));
                     };
                     let mut seen = HashSet::new();
+                    let mut fields_provenance = ClosureProvenance::empty();
                     for (field_name, value) in fields {
                         if !seen.insert(field_name) {
                             return Err(KuError::runtime(
@@ -2198,6 +2276,9 @@ impl Checker {
                             ));
                         };
                         let actual = self.consume_expr_expecting(value, Some(expected))?;
+                        if self.type_may_contain_function_value(&actual) {
+                            fields_provenance.merge(&self.expression_closure_provenance(value));
+                        }
                         if !type_matches(expected, &actual) {
                             return Err(type_error(value.span, expected, &actual));
                         }
@@ -2210,11 +2291,15 @@ impl Checker {
                             ));
                         }
                     }
+                    if self.type_may_contain_function_value(&Type::Struct(name.clone())) {
+                        evaluated_provenance = Some(fields_provenance);
+                    }
                     Ok(Type::Struct(name.clone()))
                 }
                 ExprKind::ObjectLiteral { fields } => {
                     let mut seen = HashSet::new();
                     let mut object_fields = HashMap::new();
+                    let mut fields_provenance = ClosureProvenance::empty();
                     for (field_name, value) in fields {
                         if !seen.insert(field_name) {
                             return Err(KuError::runtime(
@@ -2222,7 +2307,14 @@ impl Checker {
                                 value.span,
                             ));
                         }
-                        object_fields.insert(field_name.clone(), self.consume_expr(value)?);
+                        let actual = self.consume_expr(value)?;
+                        if self.type_may_contain_function_value(&actual) {
+                            fields_provenance.merge(&self.expression_closure_provenance(value));
+                        }
+                        object_fields.insert(field_name.clone(), actual);
+                    }
+                    if object_fields.values().any(|ty| self.type_may_contain_function_value(ty)) {
+                        evaluated_provenance = Some(fields_provenance);
                     }
                     Ok(Type::Object(object_fields))
                 }
@@ -2235,7 +2327,12 @@ impl Checker {
                         ));
                     }
                     match self.consume_await_task_expr(task, expr.span)? {
-                        Type::Task(value) => Ok(*value),
+                        Type::Task(value) => {
+                            if self.type_may_contain_function_value(&value) {
+                                evaluated_provenance = Some(self.expression_closure_provenance(task));
+                            }
+                            Ok(*value)
+                        }
                         Type::Unknown => Ok(Type::Unknown),
                         other => Err(KuError::runtime(
                             format!("await expects task but got {}", type_name(&other)),
@@ -2289,6 +2386,9 @@ impl Checker {
                     }
                     match self.consume_expr(inner)? {
                         Type::Result(value) => {
+                            if self.type_may_contain_function_value(&value) {
+                                evaluated_provenance = Some(self.expression_closure_provenance(inner));
+                            }
                             if !matches!(self.current_return, Type::Result(_))
                                 && self.recoverable_depth == 0
                             {
@@ -2322,6 +2422,15 @@ impl Checker {
             self.reject_readonly_http_native_capture_read(expr, &ty)?;
             Ok(ty)
         });
+        // Publish only this successful expression. Nested body checking and
+        // argument evaluation may have overwritten the slot; none is this
+        // expression's result. A later check/statement clears it before reuse.
+        self.completed_expression_provenance = match (&result, evaluated_provenance) {
+            (Ok(_), Some(provenance)) => {
+                Some((expr as *const Expr as usize, expr.span, provenance))
+            }
+            _ => None,
+        };
         self.check_depth = self.check_depth.saturating_sub(1);
         result
     }
@@ -2473,6 +2582,7 @@ impl Checker {
             body,
         } = &expr.kind
         {
+            self.completed_expression_provenance = None;
             return self.check_closure_literal(
                 params,
                 return_type.as_ref(),
@@ -2554,18 +2664,46 @@ impl Checker {
     }
 
     fn check_template_string(&mut self, raw: &str, span: Span) -> KuResult<()> {
-        for interpolation in template_interpolations(raw, span)? {
-            let tokens = crate::lexer::Lexer::new(&interpolation.source)
+        // Validate the separately parsed AST before the regular type-checking
+        // pass. Capture analysis and checking must share the same resource bound.
+        let interpolations = template_interpolations(raw, span)?;
+        let mut validated = 0;
+        crate::runtime::interpreter::visit_template_capture_expressions(raw, span, |_| {
+            validated += 1;
+            Ok(())
+        })
+        .map_err(|mut error| {
+            if matches!(
+                error.kind,
+                crate::error::KuErrorKind::Lex | crate::error::KuErrorKind::Parse
+            ) && !error.message.starts_with("capture analysis limit:")
+            {
+                if let Some(interpolation) = interpolations.get(validated) {
+                    return map_template_error(error, interpolation);
+                }
+            }
+            // Capture-budget errors (including the parser token budget) already
+            // carry the enclosing template span, unlike snippet parse errors.
+            // Do not rebase them as if those positions were snippet-relative.
+            error.span = span;
+            error
+        })?;
+        for interpolation in interpolations {
+            let mut tokens = crate::lexer::Lexer::new(&interpolation.source)
                 .tokenize()
                 .map_err(|err| map_template_error(err, &interpolation))?;
-            let expr = crate::parser::Parser::new(tokens)
-                .parse_expression_only()
-                .map_err(|err| map_template_error(err, &interpolation))?;
+            for token in &mut tokens {
+                token.span = Span::new(
+                    template_position(interpolation.span.start, token.span.start),
+                    template_position(interpolation.span.start, token.span.end),
+                );
+            }
+            let expr = crate::parser::Parser::new(tokens).parse_expression_only()?;
             let saved = self.template_mode;
             self.template_mode = true;
             let result = self.check_expr(&expr);
             self.template_mode = saved;
-            result.map_err(|err| map_template_error(err, &interpolation))?;
+            result?;
         }
         Ok(())
     }
@@ -2734,6 +2872,29 @@ impl Checker {
             return Err(type_error(args[0].span, &Type::String, &path_type));
         }
         let handler_arg = &args[1];
+        // A factory call may replace a callable while evaluating its arguments.
+        // Audit/freeze the value actually returned, not pre-evaluation evidence.
+        // Inline handlers retain their HTTP-specific parameter inference below.
+        let handler_type = if matches!(handler_arg.kind, ExprKind::Function { .. }) {
+            None
+        } else {
+            Some(self.check_expr(handler_arg)?)
+        };
+        let handler_provenance = self.expression_closure_provenance(handler_arg);
+        if handler_provenance.http_callable_body_uncertain {
+            return Err(KuError::runtime(
+                "cannot prove HTTP-shared function binding safety after an indirect replacement with an unproven body",
+                handler_arg.span,
+            ).with_diagnostic_id(DiagnosticId::HttpSharedCallableReassignment));
+        }
+        if !self.closure_capture_boundaries.is_empty()
+            && !handler_provenance.dependencies.is_empty()
+        {
+            return Err(KuError::runtime(
+                "cannot prove HTTP-shared function binding registration order inside a deferred closure; register the capturing route directly in its owning scope",
+                span,
+            ).with_diagnostic_id(DiagnosticId::HttpSharedCallableReassignment));
+        }
         if let ExprKind::Function {
             params,
             return_type,
@@ -2741,6 +2902,11 @@ impl Checker {
         } = &handler_arg.kind
         {
             reject_duplicate_function_value_params(params)?;
+            let captures = checker_closure_capture_names(
+                params,
+                body,
+                &self.visible_binding_ids().into_keys().collect(),
+            );
             let params = params
                 .iter()
                 .map(|param| {
@@ -2760,6 +2926,7 @@ impl Checker {
                 .map(|ty| self.resolve_type_name(ty, handler_arg.span).map(Box::new))
                 .transpose()?;
             let body_id = self.fresh_function_body_id();
+            self.record_function_body_outer_bindings(body_id, &captures);
             self.check_http_handler(
                 name,
                 &params,
@@ -2769,8 +2936,7 @@ impl Checker {
                 handler_arg.span,
             )?;
         } else {
-            let handler_type = self.check_expr(handler_arg)?;
-            match handler_type {
+            match handler_type.expect("non-inline HTTP handler was checked above") {
                 Type::FunctionValue {
                     params,
                     return_type,
@@ -2803,6 +2969,7 @@ impl Checker {
         }
         // Route registration mutates the named service in place. Returning the
         // service would create an untracked second owner of native's raw pointer.
+        self.freeze_http_shared_callables(&handler_provenance, span)?;
         Ok(Some(Type::Null))
     }
 
@@ -4414,7 +4581,7 @@ impl Checker {
         span: Span,
         name: Option<&str>,
         callee: Option<&Expr>,
-    ) -> KuResult<(Type, Vec<Type>)> {
+    ) -> KuResult<(Type, Vec<Type>, Vec<ClosureProvenance>)> {
         if function.params.len() != args.len() {
             let subject = name
                 .map(|name| format!("function value '{name}'"))
@@ -4429,11 +4596,14 @@ impl Checker {
             ));
         }
         self.check_call_borrow_conflicts(args, function.params, span, callee)?;
-        let actual_arg_types = args
-            .iter()
-            .zip(function.params.iter())
-            .map(|(arg, param)| self.check_arg_mode(arg, param.ty.as_ref(), param.mode))
-            .collect::<KuResult<Vec<_>>>()?;
+        let mut actual_arg_types = Vec::with_capacity(args.len());
+        let mut argument_provenance = Vec::with_capacity(args.len());
+        for (arg, param) in args.iter().zip(function.params) {
+            actual_arg_types.push(self.check_arg_mode(arg, param.ty.as_ref(), param.mode)?);
+            // Snapshot each evaluated value in order, not all bindings before
+            // the first argument or after the last one's possible writes.
+            argument_provenance.push(self.expression_closure_provenance(arg));
+        }
         let mut arg_types = Vec::new();
         for ((param, actual), arg) in function
             .params
@@ -4458,7 +4628,7 @@ impl Checker {
             }
         }
         let returns = self.check_function_value_call_with_types(function, &arg_types, span)?;
-        Ok((returns, actual_arg_types))
+        Ok((returns, actual_arg_types, argument_provenance))
     }
 
     fn check_function_value_call_with_types(
@@ -4897,6 +5067,11 @@ impl Checker {
             .flat_map(|bindings| bindings.values())
         {
             closure_provenance.dependencies.insert(*binding_id);
+            if let Some(binding) = self.binding_by_id(*binding_id) {
+                closure_provenance
+                    .http_shared
+                    .extend(binding.closure_provenance.http_shared.clone());
+            }
         }
         self.set_closure_provenance(&function.name, closure_provenance, function.span)?;
         let arg_types = params
@@ -5215,6 +5390,88 @@ impl Checker {
             .find(|var| var.binding_id == binding_id)
     }
 
+    fn mark_http_callable_body_uncertain(&mut self, target: BindingId) {
+        for binding in self.scopes.iter_mut().flat_map(|scope| scope.values_mut()) {
+            if binding.binding_id == target && matches!(binding.ty, Type::FunctionValue { .. }) {
+                binding.closure_provenance.http_callable_body_uncertain = true;
+            }
+        }
+    }
+
+    /// This deliberately small exact transfer is ordered and unconditional.
+    /// An unordered may-write summary cannot prove the last assigned body on
+    /// branches/loops. Only one assignment of a non-shadowed top-level function
+    /// or a proven captured function's explicit clone, followed by a literal
+    /// null return, can recover a concrete identity here.
+    fn straight_line_callable_replacement(
+        &self,
+        params: &[FunctionValueParam],
+        body: &[Stmt],
+        body_id: FunctionBodyId,
+    ) -> Option<(BindingId, Type)> {
+        let [Stmt::Assign { name, value, .. }, Stmt::Return {
+            value: Some(returned),
+            ..
+        }] = body
+        else {
+            return None;
+        };
+        if !matches!(returned.kind, ExprKind::Literal(Literal::Null)) {
+            return None;
+        }
+        let bindings = self.function_body_outer_bindings.get(&body_id)?;
+        if params.iter().any(|param| &param.name == name) {
+            return None;
+        }
+        let target = *bindings.get(name)?;
+        if let ExprKind::Call { callee, args } = &value.kind {
+            let ExprKind::Field {
+                target: source,
+                name: method,
+            } = &callee.kind
+            else {
+                return None;
+            };
+            let ExprKind::Variable(source) = &source.kind else {
+                return None;
+            };
+            if method != "clone"
+                || !args.is_empty()
+                || params.iter().any(|param| &param.name == source)
+            {
+                return None;
+            }
+            let binding = self.binding_by_id(*bindings.get(source)?)?;
+            if binding.closure_provenance.complete
+                && !binding.closure_provenance.http_callable_body_uncertain
+                && matches!(
+                    binding.ty,
+                    Type::FunctionValue {
+                        body_id: Some(_),
+                        ..
+                    }
+                )
+            {
+                return Some((target, binding.ty.clone()));
+            }
+            return None;
+        }
+        let ExprKind::Variable(replacement) = &value.kind else {
+            return None;
+        };
+        if params
+            .iter()
+            .any(|param| &param.name == replacement || &param.name == name)
+            || bindings.contains_key(replacement)
+        {
+            return None;
+        }
+        Some((
+            target,
+            function_value_type(replacement, self.functions.get(replacement)?, value.span).ok()?,
+        ))
+    }
+
     fn reject_closure_reference_cycle(
         &self,
         target: &str,
@@ -5260,12 +5517,49 @@ impl Checker {
     }
 
     fn expression_closure_provenance(&self, expr: &Expr) -> ClosureProvenance {
+        if let Some((identity, span, provenance)) = &self.completed_expression_provenance {
+            if *identity == expr as *const Expr as usize && *span == expr.span {
+                return provenance.clone();
+            }
+        }
         self.expression_closure_provenance_inner(
             expr,
             &HashMap::new(),
             &mut ClosureSummaryContext::new(),
             true,
         )
+    }
+
+    fn evaluated_call_return_provenance(
+        &self,
+        params: &[FunctionValueParam],
+        body: &[Stmt],
+        body_id: Option<FunctionBodyId>,
+        argument_types: &[Type],
+        arguments: &[ClosureProvenance],
+        captured: &ClosureProvenance,
+    ) -> ClosureProvenance {
+        if let Some(body_id) = body_id.filter(|_| !captured.http_callable_body_uncertain) {
+            return self.known_function_body_return_provenance(
+                ClosureBodyView {
+                    params,
+                    body,
+                    body_id,
+                },
+                argument_types,
+                arguments,
+                captured,
+                &mut ClosureSummaryContext::new(),
+            );
+        }
+        let mut result = captured.clone();
+        for (ty, argument) in argument_types.iter().zip(arguments) {
+            if self.type_may_contain_function_value(ty) {
+                result.merge(argument);
+            }
+        }
+        result.complete = false;
+        result
     }
 
     fn expression_closure_provenance_inner(
@@ -5305,6 +5599,9 @@ impl Checker {
                     } else if allow_checker_bindings {
                         if let Ok(binding) = self.get_allow_moved(&name, expr.span) {
                             provenance.dependencies.insert(binding.binding_id);
+                            provenance
+                                .http_shared
+                                .extend(binding.closure_provenance.http_shared);
                         } else if !self.functions.contains_key(&name) {
                             provenance.complete = false;
                         }
@@ -5392,7 +5689,10 @@ impl Checker {
                     })
                     .collect::<Vec<_>>();
                 if let ExprKind::Variable(name) = &callee.kind {
-                    if let Some(function) = self.functions.get(name) {
+                    if let Some(function) = self.functions.get(name).filter(|_| {
+                        !symbolic.contains_key(name)
+                            && (!allow_checker_bindings || !self.contains(name))
+                    }) {
                         return self.known_function_body_return_provenance(
                             ClosureBodyView {
                                 params: &function.value_params,
@@ -5405,7 +5705,7 @@ impl Checker {
                             summaries,
                         );
                     }
-                    if allow_checker_bindings {
+                    if allow_checker_bindings && !symbolic.contains_key(name) {
                         if let Ok(binding) = self.get_allow_moved(name, callee.span) {
                             if let Type::FunctionValue {
                                 params,
@@ -5414,7 +5714,9 @@ impl Checker {
                                 ..
                             } = &binding.ty
                             {
-                                if !body.is_empty() {
+                                if !body.is_empty()
+                                    && !binding.closure_provenance.http_callable_body_uncertain
+                                {
                                     let parameter_types = params
                                         .iter()
                                         .map(|param| param.ty.clone().unwrap_or(Type::Unknown))
@@ -5661,7 +5963,8 @@ impl Checker {
 
     fn apply_known_function_closure_effects(
         &mut self,
-        callee_name: &str,
+        callee_name: Option<&str>,
+        captured: &ClosureProvenance,
         function: ClosureBodyView<'_>,
         arguments: &[ClosureProvenance],
         argument_types: &[Type],
@@ -5672,13 +5975,16 @@ impl Checker {
             body,
             body_id,
         } = function;
+        if captured.http_callable_body_uncertain {
+            self.reject_http_shared_unknown_call(captured, span)?;
+        }
         if params.len() != arguments.len()
             || params.len() != argument_types.len()
             || body.is_empty()
         {
             return Ok(());
         }
-        let callee = self.get_allow_moved(callee_name, span)?;
+        let replacement = self.straight_line_callable_replacement(params, body, body_id);
         let mut summaries = ClosureSummaryContext::new();
         let mut summary = self.known_function_body_effect_summary(
             ClosureBodyView {
@@ -5688,14 +5994,21 @@ impl Checker {
             },
             arguments,
             argument_types,
-            &callee.closure_provenance,
+            captured,
             &mut summaries,
         );
+        summary.complete &= !captured.http_callable_body_uncertain;
         if !summary.complete {
+            self.reject_http_shared_unknown_call(captured, span)?;
+            for (ty, argument) in argument_types.iter().zip(arguments) {
+                if self.type_may_contain_function_value(ty) {
+                    self.reject_http_shared_unknown_call(argument, span)?;
+                }
+            }
             // Unsupported calls/loops must never erase known ownership. Retain
             // the callee environment and every function-capable argument as a
             // possible write to each captured function-capable cell.
-            let mut conservative = callee.closure_provenance.clone();
+            let mut conservative = captured.clone();
             for (param, argument) in params.iter().zip(arguments) {
                 if param
                     .ty
@@ -5712,6 +6025,7 @@ impl Checker {
                 .into_iter()
                 .flat_map(|bindings| bindings.values().copied())
             {
+                self.reject_http_shared_write(target, span)?;
                 if self
                     .binding_by_id(target)
                     .is_some_and(|binding| self.type_may_contain_function_value(&binding.ty))
@@ -5721,15 +6035,19 @@ impl Checker {
                     // remove that tautological edge so an opaque but harmless
                     // call does not immediately self-cycle its callee capture.
                     provenance.dependencies.remove(&target);
-                    summary
-                        .effects
-                        .push(ClosureWriteEffect { target, provenance });
+                    summary.effects.push(ClosureWriteEffect {
+                        target,
+                        provenance,
+                        assignment_span: None,
+                    });
                 }
             }
         }
 
         let mut environment_effect = ClosureProvenance::empty();
         for effect in summary.effects {
+            self.reject_http_shared_write(effect.target, effect.assignment_span.unwrap_or(span))?;
+            self.mark_http_callable_body_uncertain(effect.target);
             environment_effect.merge(&effect.provenance);
             let Some((target_name, target_type)) = self.binding_name_and_type_by_id(effect.target)
             else {
@@ -5741,13 +6059,24 @@ impl Checker {
             self.reject_closure_reference_cycle(&target_name, &effect.provenance, span)?;
             self.merge_closure_provenance(&target_name, &effect.provenance, span)?;
         }
-        if !environment_effect.dependencies.is_empty() || !environment_effect.complete {
+        if let Some(callee_name) = callee_name
+            .filter(|_| !environment_effect.dependencies.is_empty() || !environment_effect.complete)
+        {
             // A FunctionValue owns every cell in its environment. A write through
             // any captured cell therefore updates what aliases of this callee can
             // reach; retaining the aggregate edge also catches hidden cells whose
             // lexical binding has left the checker scope.
             self.reject_closure_reference_cycle(callee_name, &environment_effect, span)?;
             self.merge_closure_provenance(callee_name, &environment_effect, span)?;
+        }
+        if let Some((target, ty)) = replacement {
+            for binding in self.scopes.iter_mut().flat_map(|scope| scope.values_mut()) {
+                if binding.binding_id == target && matches!(binding.ty, Type::FunctionValue { .. })
+                {
+                    binding.ty = ty.clone();
+                    binding.closure_provenance.http_callable_body_uncertain = false;
+                }
+            }
         }
         Ok(())
     }
@@ -5764,6 +6093,23 @@ impl Checker {
         if params.len() != arguments.len()
             || params.len() != argument_types.len()
             || body.is_empty()
+        {
+            return Ok(());
+        }
+        // This entry point is only for a resolved top-level function, not a
+        // same-named local FunctionValue. With no lexical captures and no
+        // function-capable actual arguments, it cannot reach a caller's
+        // callable cell. Avoid walking its entire transitive call graph merely
+        // to prove that absence (notably for the self-hosted parser). Argument
+        // checking and any active HTTP read-only body replay already ran at
+        // the call site; neither is bypassed by this write-effect fast path.
+        if self
+            .function_body_outer_bindings
+            .get(&body_id)
+            .is_none_or(HashMap::is_empty)
+            && argument_types
+                .iter()
+                .all(|ty| !self.type_may_contain_function_value(ty))
         {
             return Ok(());
         }
@@ -5788,6 +6134,7 @@ impl Checker {
             let mut conservative = ClosureProvenance::empty();
             for (ty, argument) in argument_types.iter().zip(arguments) {
                 if self.type_may_contain_function_value(ty) {
+                    self.reject_http_shared_unknown_call(argument, span)?;
                     conservative.merge(argument);
                 }
             }
@@ -5799,6 +6146,7 @@ impl Checker {
                 .flat_map(|(_, argument)| argument.dependencies.iter().copied())
                 .collect::<HashSet<_>>();
             for target in possible_targets {
+                self.reject_http_shared_write(target, span)?;
                 if self
                     .binding_by_id(target)
                     .is_some_and(|binding| self.type_may_contain_function_value(&binding.ty))
@@ -5806,12 +6154,15 @@ impl Checker {
                     summary.effects.push(ClosureWriteEffect {
                         target,
                         provenance: conservative.clone(),
+                        assignment_span: None,
                     });
                 }
             }
         }
 
         for effect in summary.effects {
+            self.reject_http_shared_write(effect.target, effect.assignment_span.unwrap_or(span))?;
+            self.mark_http_callable_body_uncertain(effect.target);
             let Some((target_name, target_type)) = self.binding_name_and_type_by_id(effect.target)
             else {
                 continue;
@@ -5833,6 +6184,7 @@ impl Checker {
         span: Span,
     ) -> KuResult<()> {
         let callee = self.get_allow_moved(callee_name, span)?;
+        self.reject_http_shared_unknown_call(&callee.closure_provenance, span)?;
         let captured_targets = callee
             .closure_provenance
             .dependencies
@@ -5847,6 +6199,7 @@ impl Checker {
             {
                 continue;
             }
+            self.reject_http_shared_unknown_call(argument, span)?;
             let mut visited = HashSet::new();
             let reaches_callee = argument.dependencies.iter().copied().any(|dependency| {
                 self.closure_dependency_reaches(dependency, callee.binding_id, &mut visited)
@@ -5966,7 +6319,27 @@ impl Checker {
         let ExprKind::Call { callee, args } = &expr.kind else {
             return None;
         };
-        let ExprKind::Variable(name) = &callee.kind else {
+        if self.closure_effect_noninvoking_call(callee, args, outer_bindings, environment) {
+            return Some(ClosureEffectSummary {
+                effects: Vec::new(),
+                complete: true,
+            });
+        }
+        // clone() copies a function value without invoking its environment.
+        // An immediately following call still executes the original body.
+        let mut callable = callee.as_ref();
+        let mut clone_depth = 0;
+        while let ExprKind::Call { callee, args } = &callable.kind {
+            let ExprKind::Field { target, name } = &callee.kind else {
+                return None;
+            };
+            if name != "clone" || !args.is_empty() || clone_depth >= MAX_CHECK_DEPTH {
+                return None;
+            }
+            clone_depth += 1;
+            callable = target;
+        }
+        let ExprKind::Variable(name) = &callable.kind else {
             return None;
         };
         let (params, body, body_id, captured_environment) =
@@ -5990,6 +6363,9 @@ impl Checker {
                         .cloned()
                         .unwrap_or_else(ClosureProvenance::unknown),
                 )
+            } else if environment.locals.contains(name) {
+                // An untyped local still shadows captured/global callables.
+                return None;
             } else if let Some(binding_id) = outer_bindings.get(name) {
                 let binding = self.binding_by_id(*binding_id)?;
                 let Type::FunctionValue {
@@ -6001,16 +6377,14 @@ impl Checker {
                 else {
                     return None;
                 };
-                (
-                    params.clone(),
-                    body.clone(),
-                    *body_id,
-                    environment
-                        .symbolic
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_else(|| binding.closure_provenance.clone()),
-                )
+                let mut captured = environment
+                    .symbolic
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| binding.closure_provenance.clone());
+                captured.http_callable_body_uncertain |=
+                    binding.closure_provenance.http_callable_body_uncertain;
+                (params.clone(), body.clone(), *body_id, captured)
             } else if let Some(function) = self.functions.get(name) {
                 (
                     function.value_params.clone(),
@@ -6039,7 +6413,7 @@ impl Checker {
             .iter()
             .map(|arg| self.effect_expression_type(arg, outer_bindings, environment))
             .collect::<Vec<_>>();
-        Some(self.known_function_body_effect_summary(
+        let mut summary = self.known_function_body_effect_summary(
             ClosureBodyView {
                 params: &params,
                 body: &body,
@@ -6049,7 +6423,130 @@ impl Checker {
             &argument_types,
             &captured_environment,
             summaries,
-        ))
+        );
+        // Keep known may-writes, but never prove safety from a body whose
+        // identity an indirect replacement may already have changed.
+        summary.complete &= !captured_environment.http_callable_body_uncertain;
+        Some(summary)
+    }
+
+    /// Only operations whose dispatch cannot invoke a user callback belong
+    /// here. Metadata validates the spelling/arity; argument ownership alone
+    /// is not evidence of no callbacks (in particular array.map is excluded).
+    fn closure_effect_noninvoking_call(
+        &self,
+        callee: &Expr,
+        args: &[Expr],
+        outer_bindings: &HashMap<String, BindingId>,
+        environment: &ClosureEffectEnvironment,
+    ) -> bool {
+        let unshadowed = |name: &str| {
+            !environment.locals.contains(name)
+                && !environment.types.contains_key(name)
+                && !outer_bindings.contains_key(name)
+                && !self.functions.contains_key(name)
+        };
+        if let ExprKind::Variable(name) = &callee.kind {
+            return unshadowed(name)
+                && matches!(name.as_str(), "len" | "str" | "ok" | "err" | "println")
+                && metadata::builtin_signature(name)
+                    .is_some_and(|signature| signature.args.len() == args.len());
+        }
+        let ExprKind::Field { target, name } = &callee.kind else {
+            return false;
+        };
+        // check_std_method_call gives the intrinsic clone method precedence;
+        // it cannot be replaced by an object field named clone. Receiver
+        // evaluation is collected separately, even for clone().
+        if name == "clone" && args.is_empty() {
+            return true;
+        }
+        if let ExprKind::Variable(module) = &target.kind {
+            if unshadowed(module)
+                && (!metadata::module_requires_import(module) || self.std_modules.contains(module))
+                && Self::closure_effect_noninvoking_dotted(module, name)
+            {
+                if let Some(signature) = metadata::dotted_signature(module, name) {
+                    return if module == "http" {
+                        match name.as_str() {
+                            "text" | "html" | "json" | "redirect" => {
+                                matches!(args.len(), 1 | 2)
+                            }
+                            "empty" => args.len() <= 1,
+                            _ => signature.args.len() == args.len(),
+                        }
+                    } else {
+                        signature.args.len() == args.len()
+                    };
+                }
+            }
+        }
+        let receiver = match &target.kind {
+            ExprKind::Literal(Literal::String(_) | Literal::TemplateString(_)) => Type::String,
+            ExprKind::Array(_) => Type::Array(Box::new(Type::Unknown)),
+            _ => self.effect_expression_type(target, outer_bindings, environment),
+        };
+        let module = match receiver {
+            Type::String => "string",
+            Type::Array(_) => "array",
+            Type::Object(_) | Type::StringMap | Type::DynamicObject if name == "get_or" => "object",
+            Type::KuValue if name == "as_int" || name == "as_str" => "kuvalue",
+            _ => return false,
+        };
+        Self::closure_effect_noninvoking_dotted(module, name)
+            && metadata::dotted_signature(module, name)
+                .is_some_and(|signature| signature.args.len() == args.len() + 1)
+    }
+
+    fn closure_effect_noninvoking_dotted(module: &str, name: &str) -> bool {
+        matches!(
+            (module, name),
+            (
+                "fs",
+                "read" | "try_read" | "write" | "try_write" | "exists" | "read_dir"
+            ) | ("lexer", "scan")
+                | ("parser", "parse")
+                | (
+                    "string",
+                    "len"
+                        | "byte_len"
+                        | "chars"
+                        | "trim"
+                        | "lower"
+                        | "upper"
+                        | "contains"
+                        | "starts_with"
+                        | "ends_with"
+                        | "replace"
+                        | "slice"
+                )
+                | (
+                    "array",
+                    "len" | "is_empty" | "first" | "last" | "try_get" | "push" | "concat"
+                )
+                | ("object", "get_or")
+                | ("kuvalue", "as_int" | "as_str")
+                | ("json", "parse" | "try_parse" | "stringify")
+                | (
+                    "time",
+                    "now"
+                        | "instant"
+                        | "unix"
+                        | "millis"
+                        | "steady_millis"
+                        | "date"
+                        | "elapsed"
+                        | "from_unix"
+                        | "from_millis"
+                        | "is_leap"
+                        | "days_in_month"
+                        | "sleep"
+                )
+                | (
+                    "http",
+                    "text" | "html" | "json" | "empty" | "redirect" | "statusText"
+                )
+        )
     }
 
     fn effect_expression_type(
@@ -6062,6 +6559,9 @@ impl Checker {
             ExprKind::Variable(name) => {
                 if let Some(ty) = environment.types.get(name) {
                     return ty.clone();
+                }
+                if environment.locals.contains(name) {
+                    return Type::Unknown;
                 }
                 if let Some(binding_id) = outer_bindings.get(name) {
                     if let Some(binding) = self.binding_by_id(*binding_id) {
@@ -6242,18 +6742,148 @@ impl Checker {
         complete: &mut bool,
         summaries: &mut ClosureSummaryContext,
     ) {
-        if !expr_may_call_function(expr) {
+        self.extend_expression_closure_effects_inner(
+            expr,
+            outer_bindings,
+            environment,
+            effects,
+            complete,
+            summaries,
+            0,
+        );
+    }
+
+    // Carry depth separately from the existing function-summary state budget:
+    // forward function bodies may not have reached ordinary expression checking.
+    #[allow(clippy::too_many_arguments)]
+    fn extend_expression_closure_effects_inner(
+        &self,
+        expr: &Expr,
+        outer_bindings: &HashMap<String, BindingId>,
+        environment: &ClosureEffectEnvironment,
+        effects: &mut Vec<ClosureWriteEffect>,
+        complete: &mut bool,
+        summaries: &mut ClosureSummaryContext,
+        depth: usize,
+    ) {
+        if depth >= MAX_CHECK_DEPTH {
+            *complete = false;
             return;
         }
-        if let Some(summary) =
-            self.expression_call_effect_summary(expr, outer_bindings, environment, summaries)
-        {
-            effects.extend(summary.effects);
-            *complete &= summary.complete;
-        } else {
-            // A nested or dynamically selected call is not proven effect-free.
-            // The bounded caller fallback will retain its callable arguments.
-            *complete = false;
+        let initial_effects = effects.len();
+        // Child calls are collected in evaluation order, but this is still a
+        // may-write summary, not an ordered environment transfer. If an earlier
+        // child writes, later call targets may no longer have their old bodies.
+        let mut visit = |child: &Expr, child_environment: &ClosureEffectEnvironment| {
+            if effects.len() != initial_effects {
+                *complete = false;
+            }
+            self.extend_expression_closure_effects_inner(
+                child,
+                outer_bindings,
+                child_environment,
+                effects,
+                complete,
+                summaries,
+                depth + 1,
+            );
+        };
+        match &expr.kind {
+            ExprKind::Literal(Literal::TemplateString(raw)) => {
+                if crate::runtime::interpreter::visit_template_capture_expressions(
+                    raw,
+                    expr.span,
+                    |interpolation| {
+                        visit(interpolation, environment);
+                        Ok(())
+                    },
+                )
+                .is_err()
+                {
+                    *complete = false;
+                }
+            }
+            // Closure creation captures cells; it does not execute its body.
+            ExprKind::Function { .. } | ExprKind::Literal(_) | ExprKind::Variable(_) => {}
+            ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } => {
+                visit(expr, environment);
+            }
+            ExprKind::Await(expr) => {
+                visit(expr, environment);
+                // Task execution requires its own effect proof, not just the
+                // effects of producing a task handle.
+                *complete = false;
+            }
+            ExprKind::Binary { left, op, right } => {
+                visit(left, environment);
+                let skipped = matches!(
+                    (&left.kind, op),
+                    (ExprKind::Literal(Literal::Bool(false)), BinaryOp::And)
+                        | (ExprKind::Literal(Literal::Bool(true)), BinaryOp::Or)
+                );
+                if !skipped {
+                    visit(right, environment);
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                visit(callee, environment);
+                for argument in args {
+                    visit(argument, environment);
+                }
+                if effects.len() != initial_effects {
+                    *complete = false;
+                }
+                if let Some(summary) = self.expression_call_effect_summary(
+                    expr,
+                    outer_bindings,
+                    environment,
+                    summaries,
+                ) {
+                    effects.extend(summary.effects);
+                    *complete &= summary.complete;
+                } else {
+                    *complete = false;
+                }
+            }
+            ExprKind::Array(values) => {
+                for value in values {
+                    visit(value, environment);
+                }
+            }
+            ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
+                for (_, value) in fields {
+                    visit(value, environment);
+                }
+            }
+            ExprKind::Index { target, index } => {
+                visit(target, environment);
+                visit(index, environment);
+            }
+            ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
+                visit(target, environment);
+            }
+            ExprKind::Match { value, arms } => {
+                visit(value, environment);
+                // Pattern bindings shadow functions/modules even when their
+                // concrete selected type cannot be recovered. Keep all arms as
+                // possible executions; never evaluate a nested closure body.
+                for arm in arms {
+                    let mut arm_environment = environment.clone();
+                    let mut names = HashSet::new();
+                    bind_match_pattern_names(&arm.pattern, &mut names);
+                    for name in names {
+                        arm_environment.locals.insert(name.clone());
+                        arm_environment.types.insert(name.clone(), Type::Unknown);
+                        arm_environment
+                            .symbolic
+                            .insert(name, ClosureProvenance::unknown());
+                    }
+                    if let Some(guard) = &arm.guard {
+                        visit(guard, &arm_environment);
+                    }
+                    visit(&arm.value, &arm_environment);
+                }
+            }
         }
     }
 
@@ -6317,6 +6947,7 @@ impl Checker {
                         effects.push(ClosureWriteEffect {
                             target: *target,
                             provenance: provenance.clone(),
+                            assignment_span: Some(stmt_span(stmt)),
                         });
                         environment.symbolic.insert(name.clone(), provenance);
                         environment.types.insert(name.clone(), actual_type);
@@ -6347,6 +6978,7 @@ impl Checker {
                                 effects.push(ClosureWriteEffect {
                                     target: *target,
                                     provenance,
+                                    assignment_span: Some(stmt_span(stmt)),
                                 });
                             }
                         }
@@ -6380,6 +7012,7 @@ impl Checker {
                             effects.push(ClosureWriteEffect {
                                 target: *target,
                                 provenance: provenance.clone(),
+                                assignment_span: Some(stmt_span(stmt)),
                             });
                             environment.symbolic.insert(name.clone(), provenance);
                             environment.types.insert(name.clone(), actual_type);
@@ -6424,6 +7057,7 @@ impl Checker {
                             effects.push(ClosureWriteEffect {
                                 target: *target,
                                 provenance: provenance.clone(),
+                                assignment_span: Some(stmt_span(stmt)),
                             });
                             environment
                                 .symbolic
@@ -6541,9 +7175,17 @@ impl Checker {
                 }
                 Stmt::Function(function) => {
                     let mut provenance = ClosureProvenance::empty();
-                    for name in crate::runtime::interpreter::function_capture_names(function) {
-                        if let Some(captured) = environment.symbolic.get(&name) {
-                            provenance.merge(captured);
+                    match crate::runtime::interpreter::function_capture_names(function) {
+                        Ok(names) => {
+                            for name in names {
+                                if let Some(captured) = environment.symbolic.get(&name) {
+                                    provenance.merge(captured);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            complete = false;
+                            provenance.complete = false;
                         }
                     }
                     environment.locals.insert(function.name.clone());
@@ -7643,6 +8285,9 @@ impl Checker {
     }
 
     fn reject_readonly_capture_assignment(&self, name: &str, span: Span) -> KuResult<()> {
+        if let Ok(binding) = self.get_allow_moved(name, span) {
+            self.reject_http_shared_write(binding.binding_id, span)?;
+        }
         if self
             .get_allow_moved(name, span)
             .is_ok_and(|binding| binding.borrowed)
@@ -8302,6 +8947,18 @@ fn assign_target_uses_name(target: &AssignTarget, name: &str, shadowed: bool) ->
 
 fn expr_uses_name(expr: &Expr, name: &str, shadowed: bool) -> bool {
     match &expr.kind {
+        ExprKind::Literal(Literal::TemplateString(raw)) => {
+            let mut used = false;
+            let result = crate::runtime::interpreter::visit_template_capture_expressions(
+                raw,
+                expr.span,
+                |inner| {
+                    used |= expr_uses_name(inner, name, shadowed);
+                    Ok(())
+                },
+            );
+            used || (result.is_err() && !shadowed)
+        }
         ExprKind::Variable(variable) => !shadowed && variable == name,
         ExprKind::Unary { expr, .. } | ExprKind::Await(expr) | ExprKind::TryUnwrap { expr } => {
             expr_uses_name(expr, name, shadowed)
@@ -8966,6 +9623,22 @@ fn collect_checker_capture_expr(
     captures: &mut HashSet<String>,
 ) {
     match &expr.kind {
+        ExprKind::Literal(Literal::TemplateString(raw)) => {
+            if crate::runtime::interpreter::visit_template_capture_expressions(
+                raw,
+                expr.span,
+                |inner| {
+                    collect_checker_capture_expr(inner, bound, visible_names, captures);
+                    Ok(())
+                },
+            )
+            .is_err()
+            {
+                // A failed scan is never evidence of an empty environment.
+                // check_template_string reports the actual validation error.
+                captures.extend(visible_names.difference(bound).cloned());
+            }
+        }
         ExprKind::Variable(name) => {
             capture_checker_name(name, bound, visible_names, captures);
         }
@@ -9103,6 +9776,18 @@ fn bind_match_pattern_closure_provenance(
 
 fn expr_may_call_function(expr: &Expr) -> bool {
     match &expr.kind {
+        ExprKind::Literal(Literal::TemplateString(raw)) => {
+            let mut calls = false;
+            let result = crate::runtime::interpreter::visit_template_capture_expressions(
+                raw,
+                expr.span,
+                |inner| {
+                    calls |= expr_may_call_function(inner);
+                    Ok(())
+                },
+            );
+            calls || result.is_err()
+        }
         ExprKind::Call { .. } | ExprKind::Await(_) => true,
         ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } => expr_may_call_function(expr),
         ExprKind::Binary { left, right, .. } => {
@@ -10061,7 +10746,8 @@ fn reject_direct_closure_cycle(target: &str, value: &Expr, span: Span) -> KuResu
 fn expression_contains_closure_capturing(expr: &Expr, target: &str) -> bool {
     match &expr.kind {
         ExprKind::Function { params, body, .. } => {
-            crate::runtime::interpreter::closure_capture_names(params, body).contains(target)
+            crate::runtime::interpreter::closure_capture_names(params, body)
+                .map_or(true, |names| names.contains(target))
         }
         ExprKind::TryUnwrap { expr } => expression_contains_closure_capturing(expr, target),
         ExprKind::Array(values) => values
@@ -10152,6 +10838,7 @@ fn map_template_error(err: KuError, interpolation: &TemplateInterpolation) -> Ku
     if err.span == Span::default() {
         return err;
     }
+    let diagnostic = err.diagnostic_id();
     KuError::new(
         err.kind,
         err.message,
@@ -10165,6 +10852,22 @@ fn map_template_error(err: KuError, interpolation: &TemplateInterpolation) -> Ku
                 prefix_by_offset(&interpolation.source, err.span.end.offset),
             ),
         ),
+    )
+    .with_diagnostic_id(diagnostic)
+}
+
+fn template_position(
+    base: crate::span::Position,
+    inner: crate::span::Position,
+) -> crate::span::Position {
+    crate::span::Position::new(
+        base.line + inner.line.saturating_sub(1),
+        if inner.line <= 1 {
+            base.column + inner.column.saturating_sub(1)
+        } else {
+            inner.column
+        },
+        base.offset + inner.offset,
     )
 }
 
