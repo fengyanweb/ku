@@ -36,7 +36,7 @@ level code message file line column endLine endColumn notes helps
 
 ## HTTP 共享函数绑定
 
-E0704 的内部身份为 `HttpSharedCallableReassignment`。本项是 v0.0.18 开发中的安全收口，仍待完整验证，不表示并发运行时或发布门禁已完成。
+E0704 的内部身份为 `HttpSharedCallableReassignment`。本项的编译期安全收口已在 `47a5816` 完成本机及新提交三系统门禁验证；v0.0.18 仍为开发阶段，不表示完整并发运行时或生产发布验收已完成。
 
 路由注册后，handler 直接或间接捕获的函数变量按词法绑定身份（`BindingId`）禁止重绑定，即使新函数同签名且只读也不例外。确定的写入报告 `cannot reassign HTTP-shared function binding 'render'`，并指出注册位置；不能确定相关捕获来源或调用写入效果时，以包含 `cannot prove` 和 `HTTP-shared` 的 E0704 拒绝，不能把未知效果当成只读。
 
