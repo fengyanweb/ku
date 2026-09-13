@@ -668,6 +668,8 @@ fn main() {
 
 当前解释器按共享绑定捕获，读取会看到外层变量最新值，赋值会写回外层可变变量。
 
+捕获依据函数创建时的词法绑定身份（内部 `BindingId`），不是调用位置的同名变量。函数值与保存它的变量绑定是两回事；函数值 `.clone()` 共享既有捕获环境，不会重新按名字捕获，也不会深拷贝环境。普通同步捕获仍遵循原有所有权规则；HTTP handler 另受下文[共享函数绑定规则](#http-共享函数绑定规则)约束，该收口正在实现并等待完整验证。
+
 ### 6.5 async fn、task 句柄和 await
 
 `async fn` 表示可异步执行的函数。调用一个 `async fn` 会立即启动一个轻量 task，并返回一个一次性 task 句柄；task 不是线程，也不是关键字，用户不能手动创建或调度 task。
@@ -1833,7 +1835,7 @@ req.headers: object  // 字段值按 str 检查
 req.body: str
 ```
 
-`req` 是请求对象，提供 method/path、路由参数、query、headers 和 body。`del` 是当前唯一的删除路由 API，对应 HTTP 协议方法 `DELETE`；不额外提供 `delete` 别名。
+`req` 是请求对象，提供 method/path、路由参数、query、headers 和 body。`service.del(path, handler)` 接受两个参数，注册 HTTP `DELETE` 路由，不是移除已有路由；不额外提供 `delete` 别名。
 
 HTTP handler 会在类型检查阶段按 0/1 参数 Return 模型复查参数和返回值。为了给后续并发 runtime 留安全边界，handler 第一版不能修改外层捕获变量；需要共享状态时后续应通过专门的 `std.atomic` / `std.sync` 一类 API 设计。
 
@@ -1851,6 +1853,39 @@ HTTP handler 会在类型检查阶段按 0/1 参数 Return 模型复查参数和
 Ku runtime 自动维护自己能判断的协议错误：路由未命中返回 404，路径存在但 method 不匹配返回 405，body 超过 `max_body_bytes` 返回 413，header 超过 `max_header_bytes` 返回 431，request target 超过内部上限（固定 8192 bytes）返回 414（在复制和路由前判断，绝不截断），坏请求返回 400，handler timeout 返回 504，服务过载返回 503，handler panic/内部失败返回 500。
 
 服务配置字段是固定集合：`read_header_timeout_ms`、`read_body_timeout_ms`、`write_timeout_ms`、`idle_timeout_ms`、`handler_timeout_ms`、`max_body_bytes`、`max_header_bytes`、`max_connections`、`max_active_requests`、`max_pending_requests`。两种写法等价——构造时传 `http.server({ max_body_bytes: 4096 })`，或构造后逐个赋值 `service.max_body_bytes = 4096`。**未定义的配置字段在类型检查阶段报错**，不会被静默忽略：`http.server({ bogus: 1 })` 和 `service.bogus = 1` 都是 checker 错误。
+
+#### HTTP 共享函数绑定规则
+
+以下是 v0.0.18 已确定、正在实现并待完整验证的收口合同，不是已通过生产高并发验收的声明。不增加语法、运行时锁或捕获快照。
+
+从路由注册起，handler 直接或经其它函数间接捕获的函数变量按词法 `BindingId` 禁止重绑定，报告 E0704。限制的是同一个共享变量绑定，不是某个名字、签名或所有函数值；换成同签名只读函数也仍是重绑定。正常调用保留，但调用造成对该绑定的写入同样被拒绝。
+
+```ku
+import "std.http"
+fn Noop(): null { return null }
+fn Other(): null { return null }
+fn main(): null! {
+    render = Noop
+    setter = () => { render = Other; return null }
+    app = http.service()
+    app.get("/", fn() { render(); return http.text("ok") })
+    render()       // 允许：调用不重绑定
+    setter()       // E0704：提前创建 setter 不会绕过注册后的限制
+    return ok(null)
+}
+```
+
+共享关系跟随实际捕获绑定传播。`setter.clone()` 或 move 后的别名仍会写同一个 `render`，不能擦除限制。若注册发生在某个可能到达的分支，汇合后仍保留限制；循环回边也保留此前注册建立的限制，包括源码位置在注册之前、下一轮却发生在注册之后的写入。不会因移动或丢弃 service、关闭 listener，或离开注册所在的内层作用域而自动解冻仍可访问的共享绑定。
+
+下列行为保持既有语义，而不是新增冻结对象：
+
+- 未被 handler 直接或间接共享捕获的函数绑定仍可赋值、调用；handler 内每次调用新建的局部也不因此变成共享绑定。
+- 直接 `app.get("/", handler)` 登记的是当时的函数值，不因此冻结 `handler` 变量本身。随后给原变量换值不替换已登记的 handler；该函数值内部捕获的函数绑定仍受规则约束。这不是对捕获环境做快照。
+- `old = render.clone()` 得到独立保存的函数值，`old` 不是 `render` 变量本身的别名；但两者保留相同的捕获环境。若 route 捕获 `old`，限制 `old` 及其实际捕获链，不会仅因这次 clone 就冻结原 `render` 变量。
+- 同名的显式新局部（例如内层 `render: fn(): null = Noop`）具有不同的 `BindingId`；请求参数也不会因与外层变量同名而捕获它。参数原有不可赋值规则不变。
+- 普通 Copy 捕获的初始化不被 E0704 一并冻结；handler 仍不能写外层捕获。允许初始化不表示任意并发共享状态写入安全。
+
+注册前已完成的 setter 调用不因后面的注册被追溯禁止，但注册时必须检查替换后的实际函数值，不能沿用旧函数体的只读结论。对于有关的动态调用、来源丢失或不完整效果等组合，如果不能证明共享捕获规则成立，必须以明确的 E0704 安全原因拒绝（fail closed），不能默认安全。既有 handler 外层写入仍使用 E0703；本项不新增自动解冻或共享状态 API。
 
 ### HTTP 与 native C 后端
 

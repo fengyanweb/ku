@@ -24,7 +24,7 @@ use crate::{
     ast::*,
     backend,
     checker::Checker,
-    error::{KuError, KuResult},
+    error::{DiagnosticId, KuError, KuResult},
     interpreter::Interpreter,
     ir,
     lexer::Lexer,
@@ -2752,7 +2752,19 @@ fn write_native_c_to(
     if !native_task_entry {
         reject_native_async(&program)?;
     }
-    Checker::new().check(&program)?;
+    Checker::new().check(&program).map_err(|err| {
+        let id = err.diagnostic_id();
+        if matches!(
+            id,
+            DiagnosticId::HttpCapturedMutation | DiagnosticId::HttpSharedCallableReassignment
+        ) {
+            KuError::message(err.diagnostic(path, source)).with_diagnostic_id(id)
+        } else {
+            // Keep unrelated native build API errors unchanged. HTTP needs
+            // the registration/assignment diagnostic at every CLI entry.
+            err
+        }
+    })?;
     let options = backend::c::CBackendOptions {
         fs_base,
         // Test-only, generation-time opt-in. This environment is read by

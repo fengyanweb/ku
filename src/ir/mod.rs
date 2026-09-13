@@ -1347,7 +1347,7 @@ impl<'a> FunctionLowerer<'a> {
             .chain(self.local_names.keys())
             .cloned()
             .collect::<HashSet<_>>();
-        self.boxed = collect_boxed_candidates(body, &lexical_bindings, parameters);
+        self.boxed = collect_boxed_candidates(body, &lexical_bindings, parameters)?;
         self.borrowed_params = parameters
             .iter()
             .filter(|p| p.mode() == ParamMode::View)
@@ -4039,7 +4039,7 @@ impl<'a> FunctionLowerer<'a> {
             values: captures,
             aliases,
         } = self.lower_capture_bindings(
-            crate::runtime::interpreter::closure_capture_names(params, body),
+            crate::runtime::interpreter::closure_capture_names(params, body)?,
             span,
         )?;
         let function_captures = captures
@@ -4161,7 +4161,7 @@ impl<'a> FunctionLowerer<'a> {
             values: captures,
             aliases,
         } = self.lower_capture_bindings(
-            crate::runtime::interpreter::function_capture_names(function),
+            crate::runtime::interpreter::function_capture_names(function)?,
             function.span,
         )?;
         let function_captures = captures
@@ -5497,7 +5497,7 @@ fn collect_boxed_candidates<P: BodyParameter>(
     body: &[Stmt],
     lexical_bindings: &HashSet<String>,
     parameters: &[P],
-) -> HashSet<BoxedBindingSite> {
+) -> KuResult<HashSet<BoxedBindingSite>> {
     let mut visible = lexical_bindings
         .iter()
         .cloned()
@@ -5514,17 +5514,17 @@ fn collect_boxed_candidates<P: BodyParameter>(
         );
     }
     let mut out = HashSet::new();
-    collect_boxed_candidates_block(body, &mut visible, &mut out);
-    out
+    collect_boxed_candidates_block(body, &mut visible, &mut out)?;
+    Ok(out)
 }
 
 fn collect_boxed_candidates_block(
     body: &[Stmt],
     visible: &mut VisibleBoxBindings,
     out: &mut HashSet<BoxedBindingSite>,
-) {
+) -> KuResult<()> {
     for stmt in body {
-        collect_boxed_candidates_stmt(stmt, visible, out);
+        collect_boxed_candidates_stmt(stmt, visible, out)?;
         // Follow source-level static fallthrough: these statements terminate
         // the current block, so later declarations/closures are unreachable
         // and must not add entry-time cell allocations to a hot function.
@@ -5542,6 +5542,7 @@ fn collect_boxed_candidates_block(
             break;
         }
     }
+    Ok(())
 }
 
 fn record_visible_captures(
@@ -5566,26 +5567,26 @@ fn collect_boxed_candidates_stmt(
     stmt: &Stmt,
     visible: &mut VisibleBoxBindings,
     out: &mut HashSet<BoxedBindingSite>,
-) {
+) -> KuResult<()> {
     match stmt {
         Stmt::VarDecl {
             name, value, span, ..
         } => {
-            collect_boxed_candidates_expr(value, visible, out);
+            collect_boxed_candidates_expr(value, visible, out)?;
             // A declaration always creates a new binding in the current block,
             // shadowing any parameter/capture/outer-block homonym.
             visible.insert(name.clone(), Some(BoxedBindingSite::new(name, *span)));
         }
         Stmt::Assign { name, value, span } => {
-            collect_boxed_candidates_expr(value, visible, out);
+            collect_boxed_candidates_expr(value, visible, out)?;
             // Plain assignment defines a local only when no lexical binding is
             // visible. This mirrors Env::contains/assign-or-define.
             define_assignment_binding(name, *span, visible);
         }
         Stmt::AssignTarget { target, value, .. } | Stmt::CompoundAssign { target, value, .. } => {
             // Assignment evaluates its RHS before resolving the destination.
-            collect_boxed_candidates_expr(value, visible, out);
-            collect_boxed_candidates_assign_target(target, visible, out);
+            collect_boxed_candidates_expr(value, visible, out)?;
+            collect_boxed_candidates_assign_target(target, visible, out)?;
         }
         Stmt::DestructureAssign {
             names,
@@ -5593,7 +5594,7 @@ fn collect_boxed_candidates_stmt(
             span,
         } => {
             for value in values {
-                collect_boxed_candidates_expr(value, visible, out);
+                collect_boxed_candidates_expr(value, visible, out)?;
             }
             for name in names.iter().flatten() {
                 define_assignment_binding(name, *span, visible);
@@ -5605,10 +5606,10 @@ fn collect_boxed_candidates_stmt(
             value,
             span,
         } => {
-            collect_boxed_candidates_expr(value, visible, out);
+            collect_boxed_candidates_expr(value, visible, out)?;
             for binding in bindings {
                 if let Some(default) = &binding.default {
-                    collect_boxed_candidates_expr(default, visible, out);
+                    collect_boxed_candidates_expr(default, visible, out)?;
                 }
                 if let Some(local) = &binding.local {
                     define_assignment_binding(local, *span, visible);
@@ -5624,15 +5625,15 @@ fn collect_boxed_candidates_stmt(
             else_branch,
             ..
         } => {
-            collect_boxed_candidates_expr(condition, visible, out);
-            collect_boxed_candidates_block(then_branch, &mut visible.clone(), out);
-            collect_boxed_candidates_block(else_branch, &mut visible.clone(), out);
+            collect_boxed_candidates_expr(condition, visible, out)?;
+            collect_boxed_candidates_block(then_branch, &mut visible.clone(), out)?;
+            collect_boxed_candidates_block(else_branch, &mut visible.clone(), out)?;
         }
         Stmt::While {
             condition, body, ..
         } => {
-            collect_boxed_candidates_expr(condition, visible, out);
-            collect_boxed_candidates_block(body, &mut visible.clone(), out);
+            collect_boxed_candidates_expr(condition, visible, out)?;
+            collect_boxed_candidates_block(body, &mut visible.clone(), out)?;
         }
         Stmt::For {
             name,
@@ -5640,18 +5641,18 @@ fn collect_boxed_candidates_stmt(
             body,
             span,
         } => {
-            collect_boxed_candidates_expr(iterable, visible, out);
+            collect_boxed_candidates_expr(iterable, visible, out)?;
             let mut scoped = visible.clone();
             // The iterator is created by lower_for rather than a body statement,
             // but still has a stable binding site. Recording it lets lower_for
             // reject closure capture explicitly instead of emitting a closure
             // that reads an unbound C local.
             scoped.insert(name.clone(), Some(BoxedBindingSite::new(name, *span)));
-            collect_boxed_candidates_block(body, &mut scoped, out);
+            collect_boxed_candidates_block(body, &mut scoped, out)?;
         }
         Stmt::Function(function) => {
             record_visible_captures(
-                crate::runtime::interpreter::function_capture_names(function),
+                crate::runtime::interpreter::function_capture_names(function)?,
                 visible,
                 out,
             );
@@ -5666,98 +5667,115 @@ fn collect_boxed_candidates_stmt(
             finally_body,
             ..
         } => {
-            collect_boxed_candidates_block(body, &mut visible.clone(), out);
+            collect_boxed_candidates_block(body, &mut visible.clone(), out)?;
             let mut catch_visible = visible.clone();
             if let Some(name) = catch_name {
                 catch_visible.insert(name.clone(), None);
             }
-            collect_boxed_candidates_block(catch_body, &mut catch_visible, out);
-            collect_boxed_candidates_block(finally_body, &mut visible.clone(), out);
+            collect_boxed_candidates_block(catch_body, &mut catch_visible, out)?;
+            collect_boxed_candidates_block(finally_body, &mut visible.clone(), out)?;
         }
         Stmt::Fail { value, .. } | Stmt::Panic { value, .. } | Stmt::Print { value, .. } => {
-            collect_boxed_candidates_expr(value, visible, out)
+            collect_boxed_candidates_expr(value, visible, out)?
         }
         Stmt::Return { value, .. } => {
             if let Some(value) = value {
-                collect_boxed_candidates_expr(value, visible, out);
+                collect_boxed_candidates_expr(value, visible, out)?;
             }
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
-        Stmt::Expr { expr, .. } => collect_boxed_candidates_expr(expr, visible, out),
+        Stmt::Expr { expr, .. } => collect_boxed_candidates_expr(expr, visible, out)?,
     }
+    Ok(())
 }
 
 fn collect_boxed_candidates_assign_target(
     target: &AssignTarget,
     visible: &VisibleBoxBindings,
     out: &mut HashSet<BoxedBindingSite>,
-) {
+) -> KuResult<()> {
     match target {
         AssignTarget::Variable(_) => {}
         AssignTarget::Index { target, index } => {
-            collect_boxed_candidates_expr(target, visible, out);
-            collect_boxed_candidates_expr(index, visible, out);
+            collect_boxed_candidates_expr(target, visible, out)?;
+            collect_boxed_candidates_expr(index, visible, out)?;
         }
-        AssignTarget::Field { target, .. } => collect_boxed_candidates_expr(target, visible, out),
+        AssignTarget::Field { target, .. } => collect_boxed_candidates_expr(target, visible, out)?,
     }
+    Ok(())
 }
 
 fn collect_boxed_candidates_expr(
     expr: &Expr,
     visible: &VisibleBoxBindings,
     out: &mut HashSet<BoxedBindingSite>,
-) {
+) -> KuResult<()> {
     match &expr.kind {
         ExprKind::Function { params, body, .. } => {
             record_visible_captures(
-                crate::runtime::interpreter::closure_capture_names(params, body),
+                crate::runtime::interpreter::closure_capture_names(params, body)?,
                 visible,
                 out,
             );
         }
         ExprKind::Unary { expr, .. } | ExprKind::TryUnwrap { expr } | ExprKind::Await(expr) => {
-            collect_boxed_candidates_expr(expr, visible, out)
+            collect_boxed_candidates_expr(expr, visible, out)?
         }
         ExprKind::Binary { left, right, .. } => {
-            collect_boxed_candidates_expr(left, visible, out);
-            collect_boxed_candidates_expr(right, visible, out);
+            collect_boxed_candidates_expr(left, visible, out)?;
+            collect_boxed_candidates_expr(right, visible, out)?;
         }
         ExprKind::Call { callee, args } => {
-            collect_boxed_candidates_expr(callee, visible, out);
+            collect_boxed_candidates_expr(callee, visible, out)?;
             for arg in args {
-                collect_boxed_candidates_expr(arg, visible, out);
+                collect_boxed_candidates_expr(arg, visible, out)?;
             }
         }
         ExprKind::Array(values) => {
             for value in values {
-                collect_boxed_candidates_expr(value, visible, out);
+                collect_boxed_candidates_expr(value, visible, out)?;
             }
         }
         ExprKind::Index { target, index } => {
-            collect_boxed_candidates_expr(target, visible, out);
-            collect_boxed_candidates_expr(index, visible, out);
+            collect_boxed_candidates_expr(target, visible, out)?;
+            collect_boxed_candidates_expr(index, visible, out)?;
         }
         ExprKind::Field { target, .. } | ExprKind::OptionalField { target, .. } => {
-            collect_boxed_candidates_expr(target, visible, out)
+            collect_boxed_candidates_expr(target, visible, out)?
         }
         ExprKind::StructLiteral { fields, .. } | ExprKind::ObjectLiteral { fields } => {
             for (_, value) in fields {
-                collect_boxed_candidates_expr(value, visible, out);
+                collect_boxed_candidates_expr(value, visible, out)?;
             }
         }
         ExprKind::Match { value, arms } => {
-            collect_boxed_candidates_expr(value, visible, out);
+            collect_boxed_candidates_expr(value, visible, out)?;
             for arm in arms {
                 let mut arm_visible = visible.clone();
                 bind_non_boxable_pattern_names(&arm.pattern, &mut arm_visible);
                 if let Some(guard) = &arm.guard {
-                    collect_boxed_candidates_expr(guard, &arm_visible, out);
+                    collect_boxed_candidates_expr(guard, &arm_visible, out)?;
                 }
-                collect_boxed_candidates_expr(&arm.value, &arm_visible, out);
+                collect_boxed_candidates_expr(&arm.value, &arm_visible, out)?;
+            }
+        }
+        ExprKind::Literal(Literal::TemplateString(raw)) => {
+            // This pre-scan only discovers cells owned by the current body.
+            // Without a boxable parent binding no interpolation can add one;
+            // child closures scan their own locals when lowered. Leave parsing
+            // to budget-admitted template staging instead of pre-empting its
+            // earlier resource refusal with a later interpolation error.
+            if visible.values().any(Option::is_some) {
+                crate::runtime::interpreter::visit_template_capture_expressions(
+                    raw,
+                    expr.span,
+                    |interpolation| collect_boxed_candidates_expr(interpolation, visible, out),
+                )?;
             }
         }
         ExprKind::Literal(_) | ExprKind::Variable(_) => {}
     }
+    Ok(())
 }
 
 fn bind_non_boxable_pattern_names(pattern: &MatchPattern, visible: &mut VisibleBoxBindings) {

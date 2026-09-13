@@ -25,6 +25,7 @@ level code message file line column endLine endColumn notes helps
 | E0605 | std 模块缺少显式 import | 添加对应 import |
 | E0701 | 普通 HTTP handler 签名或响应写法不合法 | 使用返回 HttpResponse 的 `fn()` / `fn(req)` |
 | E0703 | HTTP handler 修改捕获变量 | 移除可能被并发访问的可变捕获 |
+| E0704 | 重绑定 HTTP 共享函数绑定，或无法证明相关共享捕获/调用效果安全 | 保持共享绑定不变；需要另一个函数值时使用独立局部绑定 |
 
 其余已识别分类保留：E0104 `switch`、E0105 `let`、E0301 类型不匹配、E0302 非 bool 条件、E0401 无效 Result `?`、E0602 构造器缺少调用、E0603 unused import、E0702 handler 返回类型、E0802 非法 task 操作、E0803 task clone、E0804 重复 await，以及下文的 E0901/E0904/E0905/E0910–E0919。
 
@@ -32,6 +33,16 @@ level code message file line column endLine endColumn notes helps
 的 payload），应在确定选中的 arm 内 move/await；guard 自己新建并 await 的任务不受此限制。
 
 通用回退分类明确标记为**未细分**：E0001 runtime、E0101 lexical/syntax、E0600 import、E0606 package、E0700 HTTP。它们不表示所有具体错误均已获得独立 ID；E0001/E0101 也可能没有通用修复 help。可恢复运行时错误的 `domain` / `code`（例如 `array/index_out_of_bounds`）是另一份 Result/Error 合同，不能被编译器的 `E` 编号替代。
+
+## HTTP 共享函数绑定
+
+E0704 的内部身份为 `HttpSharedCallableReassignment`。本项是 v0.0.18 开发中的安全收口，仍待完整验证，不表示并发运行时或发布门禁已完成。
+
+路由注册后，handler 直接或间接捕获的函数变量按词法绑定身份（`BindingId`）禁止重绑定，即使新函数同签名且只读也不例外。确定的写入报告 `cannot reassign HTTP-shared function binding 'render'`，并指出注册位置；不能确定相关捕获来源或调用写入效果时，以包含 `cannot prove` 和 `HTTP-shared` 的 E0704 拒绝，不能把未知效果当成只读。
+
+E0703 继续表示 handler 修改外层捕获变量；E0704 则防止注册后从其它路径替换已审计的共享函数绑定。提前创建的 setter、setter 的 move/clone 别名、分支汇合与循环回边都不能绕过此规则；注册前已完成的赋值仍需让注册时的实际函数值通过 handler 检查。
+
+限制不是按变量名或函数签名全局冻结，也不禁止正常调用。未共享绑定和同名的新局部保持既有规则；直接 `app.get("/", handler)` 登记函数值，不因此冻结传入值的原变量。函数值 clone 共享捕获环境，不能用 clone 擦除对同一捕获绑定的限制。完整例子及无自动解冻边界见 [HTTP 共享函数绑定规则](syntax.md#http-共享函数绑定规则)。
 
 ## Ownership
 

@@ -96,6 +96,9 @@ jobs:
       - name: Verify synchronous HTTP failure isolation under sanitizers
         run: cargo test --locked --test native_http_test native_sync_arithmetic_http_failure_isolated_and_timeout_keeps_504 -- --nocapture
 
+      - name: Verify HTTP lexical capture and owned response regression under sanitizers
+        run: cargo test --locked --test native_http_test native_http_lexical_capture_replay_ -- --nocapture --test-threads=1
+
       - name: Verify scheduler probe rows and actual cancellation reclamation under sanitizers
         run: cargo test --locked --example native_task_scheduler_probe -- --nocapture --test-threads=1
 

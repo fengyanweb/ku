@@ -1101,8 +1101,9 @@ import "std.http"
 fn Echo(count: int): int { return count }
 
 fn main(): null! {
-    count = 7
+    count = 0
     read_count = () => { return count }
+    ordinary = () => { return 0 }
     app = http.service({
         max_connections: 4,
         max_active_requests: 1,
@@ -1114,6 +1115,14 @@ fn main(): null! {
         if (observed == 7) { return http.text(count) }
         return http.text("wrong-lexical-capture")
     })
+    ordinary = () => { return 7 }
+    count = ordinary()
+    handler = () => { return http.text("registered-direct-value") }
+    app.get("/direct", handler)
+    handler = () => { return http.text("unregistered-replacement") }
+    template_outer = 41
+    template_text = `{((x: int) => x + template_outer)(1)}`
+    if (template_text != "42") { fail "template closure lost its captured cell" }
     app.listen("__ADDRESS__")?
     return ok(null)
 }
@@ -1152,6 +1161,20 @@ fn native_http_lexical_capture_replay_preserves_local_owned_response() {
         );
         assert!(!watchdog.timed_out(), "native HTTP watchdog fired");
     }
+    // Registration retains the current invoke/env value, not the caller's
+    // handler variable cell. Its later replacement must not change this route.
+    let response = http_response(
+        &address,
+        "GET /direct HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(5),
+    );
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert_eq!(
+        response.split_once("\r\n\r\n").expect("HTTP headers").1,
+        "registered-direct-value",
+        "direct handler values must not become aliases of the caller's variable cell"
+    );
+    assert!(!watchdog.timed_out(), "native HTTP watchdog fired");
 }
 
 #[test]
@@ -1201,6 +1224,216 @@ fn main(): null! {
         dir.display()
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_shared_callable_writes_reject_before_c_emission() {
+    for (label, body) in [
+        (
+            "direct",
+            r#"
+    app.get("/", fn() { render(); return http.text("ok") })
+    render = () => { count += 1; return null }
+"#,
+        ),
+        (
+            "alias-setter",
+            r#"
+    setter = () => { render = Other; return null }
+    alias = setter.clone()
+    app.get("/", fn() { render(); return http.text("ok") })
+    alias()
+"#,
+        ),
+        (
+            "loop",
+            r#"
+    turn = 0
+    while (turn < 2) {
+        render = Other
+        if (turn == 0) {
+            app.get("/", fn() { render(); return http.text("ok") })
+        }
+        turn += 1
+    }
+"#,
+        ),
+        (
+            "template-hidden-setter",
+            r#"
+    setter = () => { render = Other; return 0 }
+    hidden = () => { print(`{setter()}`); return null }
+    app.get("/", fn() { render(); return http.text("ok") })
+    hidden()
+"#,
+        ),
+        (
+            "installed-mutator",
+            r#"
+    fn Set(next: fn(): null): null { render = next.clone(); return null }
+    render = Noop
+    mutator = () => { count += 1; return null }
+    Set(mutator.clone())
+    app.get("/", fn() { render(); return http.text("ok") })
+"#,
+        ),
+        (
+            "factory-stale-body",
+            r#"
+    route_handler = () => { return http.text("safe") }
+    bad = () => { count += 1; return http.text("bad") }
+    install = () => {
+        route_handler = bad.clone()
+        marker = 0
+        return null
+    }
+    // Restore the initial value after definition-time checking. The marker
+    // keeps install outside the exact assignment/literal-null transfer rule.
+    route_handler = () => { return http.text("safe") }
+    app.get("/", After(install(), route_handler.clone()))
+"#,
+        ),
+    ] {
+        let source = format!(
+            r#"
+import "std.http"
+fn Noop(): null {{ return null }}
+fn Other(): null {{ return null }}
+fn After<T>(ignored: null, value: T): T {{ return value }}
+fn main(): null! {{
+    count = 0
+    render = Noop
+    app = http.service()
+    {body}
+    return ok(null)
+}}
+"#
+        );
+        // Overall parser acceptance alone does not parse template expressions.
+        // Validate that call separately; neither preflight executes any source.
+        if label == "template-hidden-setter" {
+            let tokens = ku::lexer::Lexer::new("setter()")
+                .lex()
+                .expect("hidden setter expression must lex");
+            ku::parser::Parser::new(tokens)
+                .parse_expression_only()
+                .expect("hidden setter expression must parse");
+        }
+        let tokens = ku::lexer::Lexer::with_file(label, &source)
+            .lex()
+            .unwrap_or_else(|error| panic!("{label} must lex: {}", error.message));
+        ku::parser::Parser::new(tokens)
+            .parse_program()
+            .unwrap_or_else(|error| panic!("{label} must parse: {}", error.message));
+
+        let dir = unique_temp_dir(&format!("shared-callable-{label}"));
+        fs::write(dir.join("server.ku"), &source).expect("write rejected HTTP source");
+        for (entry, args) in [
+            ("check-json", &["check", "--json", "server.ku"][..]),
+            ("native", &["build", "--native", "server.ku"][..]),
+            ("backend-c", &["build", "--backend", "c", "server.ku"][..]),
+        ] {
+            let mut command = Command::new(ku_binary());
+            // No -o. --native is C-only, but --backend c normally links too.
+            // Empty KU_CC forbids compiler discovery if rejection regresses;
+            // that fallback error cannot satisfy the safety assertions below.
+            command.current_dir(&dir).env("KU_CC", "").args(args);
+            let output = run_bounded(&mut command, RUN_TIMEOUT, BUILD_OUTPUT_LIMITS)
+                .unwrap_or_else(|error| {
+                    panic!("{label}/{entry}: HTTP rejection was not bounded: {error}")
+                });
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !output.status.success(),
+                "{label}/{entry}: unsafe shared callable was accepted: {combined}"
+            );
+            // Assert both the compatibility artifact and the backend's actual
+            // default host/debug artifact, before interpreting diagnostics.
+            for artifact in ["server.c", ".ku/build/debug/c/server.c"] {
+                assert!(
+                    !dir.join(artifact).exists(),
+                    "{label}/{entry}: rejected HTTP source emitted {artifact} in {}",
+                    dir.display()
+                );
+            }
+            let diagnostic = if entry == "check-json" {
+                use ku::value::Value;
+
+                let stdout = std::str::from_utf8(&output.stdout).expect("JSON stdout is UTF-8");
+                let stderr = std::str::from_utf8(&output.stderr).expect("JSON stderr is UTF-8");
+                let lines = stdout
+                    .lines()
+                    .chain(stderr.lines())
+                    .filter(|line| !line.trim().is_empty())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    lines.len(),
+                    1,
+                    "{label}/{entry}: expected exactly one JSON diagnostic: {combined}"
+                );
+                let parsed = ku::stdlib::json::eval(
+                    "parse",
+                    &[Value::String(lines[0].to_string())],
+                    ku::span::Span::default(),
+                )
+                .expect("parse JSON diagnostic with the existing JSON parser");
+                let Some(Value::Result { ok: true, value }) = parsed else {
+                    panic!("{label}/{entry}: invalid JSON diagnostic: {combined}");
+                };
+                let Value::Object(fields) = *value else {
+                    panic!("{label}/{entry}: diagnostic must be a JSON object: {combined}");
+                };
+                let Some(Value::String(code)) = fields.get("code") else {
+                    panic!("{label}/{entry}: missing diagnostic code: {combined}");
+                };
+                let Some(Value::String(message)) = fields.get("message") else {
+                    panic!("{label}/{entry}: missing diagnostic message: {combined}");
+                };
+                assert!(
+                    matches!(fields.get("level"), Some(Value::String(level)) if level == "error"),
+                    "{label}/{entry}: expected error level: {combined}"
+                );
+                assert!(
+                    code == "E0704"
+                        || (matches!(label, "installed-mutator" | "factory-stale-body")
+                            && code == "E0703"),
+                    "{label}/{entry}: wrong structured diagnostic code: {combined}"
+                );
+                // Do not let notes or embedded source text satisfy the reason.
+                format!("{code}: {message}")
+            } else {
+                combined.clone()
+            };
+            let shared_reassignment = diagnostic.contains("E0704")
+                && diagnostic.contains("cannot reassign HTTP-shared function binding 'render'");
+            let unproved_shared_effect = diagnostic.contains("E0704")
+                && diagnostic.contains("cannot prove")
+                && diagnostic.contains("HTTP-shared");
+            let expected_reason = match label {
+                // Incomplete transitive/template effects must fail closed, not
+                // be accepted because no concrete write could be recovered.
+                "template-hidden-setter" => shared_reassignment || unproved_shared_effect,
+                // This write precedes registration: E0703 must describe the
+                // actual count mutation; E0704 must explicitly lack proof.
+                "installed-mutator" | "factory-stale-body" => {
+                    (diagnostic.contains("E0703")
+                        && diagnostic
+                            .contains("http handler cannot modify captured variable 'count'"))
+                        || unproved_shared_effect
+                }
+                _ => shared_reassignment,
+            };
+            assert!(
+                expected_reason,
+                "{label}/{entry}: expected an HTTP shared-state safety rejection, not a syntax/type error: {combined}"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
 }
 
 // Field-assignment config form (`app.max_body_bytes = 4`) — the exact scenario 2
