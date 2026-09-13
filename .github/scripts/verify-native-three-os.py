@@ -282,6 +282,26 @@ class WindowsJob:
         raise RuntimeError("Windows Job drain exceeded its poll bound")
 
 
+class _ToolhelpHandles:
+    """Two temporary owners; uncertainty is retained, never automatically retried."""
+
+    __slots__ = ("_kernel32", "snapshot", "thread")
+
+    def __init__(self, kernel32: ctypes.CDLL) -> None:
+        self._kernel32 = kernel32
+        self.snapshot: int | None = None
+        self.thread: int | None = None
+
+    def close_slot(self, slot: str) -> None:
+        handle = getattr(self, slot)
+        if handle is not None:
+            if not self._kernel32.CloseHandle(handle):
+                raise OSError(ctypes.get_last_error(), "ToolHelp CloseHandle failed")
+            # Clear before any fallible post-close clock read. A raised close
+            # may have an uncertain post-effect outcome: retain, do not retry.
+            setattr(self, slot, None)
+
+
 def resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
     """Resume the CREATE_SUSPENDED initial thread after Job assignment."""
     if os.name != "nt":
@@ -313,19 +333,21 @@ def resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
     # this Python deadline.  Start the clock before the first call and fail
     # closed on both the entry bound and observed elapsed time after every
     # syscall returns.
+    handles = _ToolhelpHandles(kernel32)
+    cleanup = CleanupErrors()
     deadline = time.monotonic() + WINDOWS_PROCESS_SETUP_TIMEOUT_SECONDS
-    snapshot = kernel32.CreateToolhelp32Snapshot(snapshot_flag, 0)
-    if not snapshot or snapshot == invalid_handle:
-        raise RuntimeError(
-            f"could not enumerate suspended Windows child threads: {ctypes.get_last_error()}"
-        )
-    if time.monotonic() > deadline:
-        kernel32.CloseHandle(snapshot)
-        raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
-    thread_handle = None
+    primary = None
     thread_id = None
     scanned_threads = 0
     try:
+        snapshot = kernel32.CreateToolhelp32Snapshot(snapshot_flag, 0)
+        if not snapshot or snapshot == invalid_handle:
+            raise RuntimeError(
+                f"could not enumerate suspended Windows child threads: {ctypes.get_last_error()}"
+            )
+        handles.snapshot = snapshot
+        if time.monotonic() > deadline:
+            raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
         entry = _ThreadEntry32()
         entry.size = ctypes.sizeof(entry)
         has_entry = bool(kernel32.Thread32First(snapshot, ctypes.byref(entry)))
@@ -364,6 +386,7 @@ def resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
                 "could not open the suspended Windows child thread: "
                 f"{ctypes.get_last_error()}"
             )
+        handles.thread = thread_handle
         if time.monotonic() > deadline:
             raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
         owner_process_id = kernel32.GetProcessIdOfThread(thread_handle)
@@ -384,10 +407,34 @@ def resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
             raise RuntimeError(
                 "Windows child did not have the expected single CREATE_SUSPENDED count"
             )
-    finally:
-        if thread_handle:
-            kernel32.CloseHandle(thread_handle)
-        kernel32.CloseHandle(snapshot)
+    except BaseException as error:
+        primary = error
+    for slot in ("thread", "snapshot"):
+        if getattr(handles, slot) is None:
+            continue
+        try:
+            handles.close_slot(slot)
+        except BaseException as error:
+            if primary is None:
+                primary = error
+            else:
+                cleanup.add(f"ToolHelp {slot} close", error)
+        # Keep the original setup deadline, including time spent closing. A
+        # failed close/clock never skips the other independent acquired owner.
+        try:
+            if time.monotonic() > deadline:
+                raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
+        except BaseException as error:
+            if primary is None:
+                primary = error
+            else:
+                cleanup.add(f"ToolHelp {slot} close deadline", error)
+    try:
+        cleanup.raise_if_any(primary)
+    except BaseException as error:
+        if handles.snapshot is not None or handles.thread is not None:
+            error.toolhelp_handles = handles
+        raise
 
 
 def fail(message: str) -> NoReturn:
