@@ -62,7 +62,7 @@ def run(
     try:
         completed = BOUNDS.run_bounded(command, cwd, label)
         return completed.stdout + completed.stderr if include_stderr else completed.stdout
-    except SystemExit as error:
+    except (SystemExit, RuntimeError, OSError) as error:
         message = str(error)
         if SECRET:
             message = message.replace(SECRET, "<redacted>")
@@ -313,12 +313,19 @@ def verify(args: argparse.Namespace) -> None:
     process = None
     resumed = False
     succeeded = False
+    primary = None
     try:
         with (root / "startup.log").open("ab", buffering=0) as log:
             # Contain pg_ctl before it can launch CMD/postgres descendants.
             process = subprocess.Popen(start, cwd=root, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW | 0x00000004)
-            windows_job = BOUNDS.WindowsJob.attach(process)
+            try:
+                windows_job = BOUNDS.WindowsJob.attach(process)
+            except BOUNDS.WindowsJobSetupError as error:
+                # Failed setup may still own a Job whose CloseHandle failed.
+                # Keep that exact owner; the child has not been resumed.
+                windows_job = error.job
+                raise
             if windows_job is None:
                 raise RuntimeError("Could not contain the temporary PostgreSQL server in a Windows Job")
             BOUNDS.resume_suspended_windows_process(process)
@@ -334,23 +341,37 @@ def verify(args: argparse.Namespace) -> None:
             log.write(decoded)
         print(decoded, end="", flush=True)
         succeeded = True
+    except BaseException as error:
+        primary = error
     finally:
+        cleanup = BOUNDS.CleanupErrors()
+        stop_stage = "PostgreSQL stop PID check"
         try:
             if resumed and (root / "data" / "postmaster.pid").exists():
+                stop_stage = "PostgreSQL stop"
                 run([ctl, "stop", "-D", str(root / "data"), "-m", "immediate", "-w", "-t", "20"],
                     root, "stop isolated PostgreSQL cluster", 25)
-        finally:
-            if windows_job is not None:
-                windows_job.terminate()
-                windows_job.close()
-            if process is not None and process.poll() is None:
-                # Retain the actual Job identity even after close; only a failed
-                # pre-resume assignment reaches the helper's no-Job contract.
-                BOUNDS.kill_process_tree(process, windows_job)
-                process.wait(timeout=5)
-        if (root / "data" / "postmaster.pid").exists():
-            raise RuntimeError("PostgreSQL shutdown was not confirmed; preserve fixture for investigation")
-        print("Confirmed isolated PostgreSQL stopped; fixture retained for reproducible reruns", flush=True)
+        except BaseException as error:
+            if primary is None:
+                primary = error
+            else:
+                cleanup.add(stop_stage, error)
+        # Preserve the existing 25-second pg_ctl bound plus a single five-second
+        # fallback budget. Failure of one owner operation cannot skip another.
+        cleanup_deadline = time.monotonic() + 5
+        if process is not None:
+            cleanup.attempt("PostgreSQL process termination", lambda: BOUNDS.kill_process_tree(process, windows_job))
+        if windows_job is not None:
+            cleanup.attempt("PostgreSQL Job close", windows_job.close)
+        if process is not None:
+            cleanup.attempt("PostgreSQL root wait", lambda: process.wait(
+                timeout=max(0.0, cleanup_deadline - time.monotonic()),
+            ))
+        if cleanup.attempt("PostgreSQL final PID check", (root / "data" / "postmaster.pid").exists):
+            cleanup.add("PostgreSQL shutdown was not confirmed; preserve fixture for investigation")
+        cleanup.raise_if_any(primary)
+        # These local checks are not a proof that all Job descendants drained.
+        print("PostgreSQL fixture cleanup checks passed; fixture retained for reproducible reruns", flush=True)
     if succeeded:
         result = {
             "version": VERSION,

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stderr
 import importlib.util
 import io
 import os
@@ -27,6 +27,297 @@ SPEC.loader.exec_module(VERIFIER)
 
 
 class BoundedProcessTests(unittest.TestCase):
+    @contextmanager
+    def inert_runner(self):
+        process = mock.Mock(spec=["stdout", "stderr", "wait", "poll", "kill"])
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        job = mock.Mock()
+        readers = [mock.Mock(), mock.Mock()]
+        for index, reader in enumerate(readers):
+            reader.ident = None
+            reader.is_alive.return_value = False
+            reader.start.side_effect = lambda index=index: setattr(readers[index], "ident", 1)
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(VERIFIER, "os", SimpleNamespace(name="nt")))
+            stack.enter_context(mock.patch.object(VERIFIER.subprocess, "Popen", return_value=process))
+            stack.enter_context(mock.patch.object(VERIFIER.WindowsJob, "attach", return_value=job))
+            resume = stack.enter_context(mock.patch.object(VERIFIER, "resume_suspended_windows_process"))
+            constructor = stack.enter_context(mock.patch.object(VERIFIER.threading, "Thread", side_effect=readers))
+            yield SimpleNamespace(process=process, job=job, readers=readers, resume=resume,
+                                  constructor=constructor)
+
+    def test_partial_reader_creation_and_start_preserve_cleanup(self) -> None:
+        for stage in ("constructor0", "constructor1", "start0", "start1"):
+            with self.subTest(stage=stage), self.inert_runner() as run:
+                failure = RuntimeError("injected " + stage)
+                if stage.startswith("constructor"):
+                    run.constructor.side_effect = [failure] if stage.endswith("0") else [run.readers[0], failure]
+                else:
+                    run.readers[int(stage[-1])].start.side_effect = failure
+                with self.assertRaisesRegex((RuntimeError, SystemExit), "injected " + stage) as caught:
+                    VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "partial readers")
+                run.resume.assert_not_called()
+                run.process.kill.assert_called_once_with()
+                run.process.wait.assert_called_once()
+                run.job.close.assert_called_once_with()
+                for index, stream in enumerate((run.process.stdout, run.process.stderr)):
+                    if stage == f"start{index}":
+                        stream.close.assert_not_called()
+                        self.assertIn("reader start unconfirmed", str(caught.exception))
+                        self.assertIs(run.process, caught.exception.process)
+                    else:
+                        stream.close.assert_called_once_with()
+                for reader in run.readers:
+                    if reader.ident is None:
+                        reader.join.assert_not_called()
+                    else:
+                        reader.join.assert_called_once()
+
+    def test_cleanup_preserves_nonzero_timeout_and_setup_primary(self) -> None:
+        for stage, expected in (("exit", "exited with 23"), ("timeout", "exceeded"),
+                                ("resume", "injected resume")):
+            with self.subTest(stage=stage), self.inert_runner() as run:
+                run.job.close.side_effect = OSError("secondary detail must not escape")
+                if stage == "exit":
+                    run.process.wait.side_effect = [23, 23]
+                elif stage == "timeout":
+                    run.process.wait.side_effect = [subprocess.TimeoutExpired("inert", 1), 0]
+                else:
+                    run.resume.side_effect = RuntimeError("injected resume")
+                with self.assertRaises(SystemExit) as caught:
+                    VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "primary")
+                self.assertIn(expected, str(caught.exception))
+                self.assertIn("Job close", str(caught.exception))
+                self.assertNotIn("secondary detail", str(caught.exception))
+                self.assertIs(run.job, caught.exception.job)
+                self.assertIs(run.process, caught.exception.process)
+                self.assertIsInstance(caught.exception.__cause__, VERIFIER.CleanupFailure)
+                run.process.stderr.close.assert_called_once_with()
+
+    def test_interrupted_reader_ident_does_not_prove_start_registration(self) -> None:
+        with self.inert_runner() as run:
+            def interrupt_start():
+                run.readers[0].ident = 1
+                raise KeyboardInterrupt("inert registration gap")
+            run.readers[0].start.side_effect = interrupt_start
+            run.readers[0].join.side_effect = RuntimeError("not registered yet")
+            with self.assertRaises(SystemExit) as caught:
+                VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "unknown start")
+            self.assertIn("inert registration gap", str(caught.exception))
+            run.process.stdout.close.assert_not_called()
+            run.process.stderr.close.assert_called_once_with()
+
+    def test_failed_join_never_authorizes_pipe_close_from_alive_flag(self) -> None:
+        with self.inert_runner() as run:
+            run.readers[0].join.side_effect = KeyboardInterrupt("inert join interruption")
+            with self.assertRaises(SystemExit):
+                VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "failed join")
+            run.process.stdout.close.assert_not_called()
+            run.process.stderr.close.assert_called_once_with()
+
+    def test_cleanup_wait_and_both_joins_share_one_deadline(self) -> None:
+        with self.inert_runner() as run, \
+             mock.patch.object(VERIFIER.time, "monotonic", side_effect=[100.0, 100.0, 110.0, 110.0]):
+            VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "cleanup budget")
+        self.assertEqual(mock.call(timeout=10.0), run.process.wait.call_args_list[-1])
+        for reader in run.readers:
+            reader.join.assert_called_once_with(timeout=0.0)
+
+    def test_reader_termination_failure_cannot_be_erased_by_later_cleanup(self) -> None:
+        with self.inert_runner() as run:
+            run.process.stdout.fileno.return_value = 1
+            run.process.stderr.fileno.return_value = 2
+
+            def construct(*, target, args, daemon):
+                reader = run.readers[args[1]]
+                def start():
+                    reader.ident = 1
+                    target(*args)
+                reader.start.side_effect = start
+                return reader
+
+            run.constructor.side_effect = construct
+            with mock.patch.object(VERIFIER, "os", SimpleNamespace(name="nt", read=lambda fd, count: b"x" * 32 if fd == 1 else b"")), \
+                 mock.patch.object(VERIFIER, "MAX_CAPTURE_BYTES", 8), \
+                 mock.patch.object(VERIFIER, "kill_process_tree", side_effect=[RuntimeError("inert reader kill"), None, None]) as kill, \
+                 self.assertRaises(SystemExit) as caught:
+                VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "overflow")
+            self.assertIn("more than 8 bytes", str(caught.exception))
+            self.assertIn("output reader failed", str(caught.exception))
+            self.assertEqual(3, kill.call_count)
+            for reader in run.readers:
+                reader.join.assert_called_once()
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job structure with pure mocked kernel")
+    def test_job_setup_failure_keeps_actual_owner_even_if_close_fails(self) -> None:
+        for stage in ("SetInformationJobObject", "AssignProcessToJobObject", "ctypes"):
+            kernel = mock.MagicMock()
+            kernel.CreateJobObjectW.return_value = 73
+            kernel.SetInformationJobObject.return_value = 1
+            kernel.AssignProcessToJobObject.return_value = 1
+            kernel.CloseHandle.side_effect = [0, 1]
+            if stage == "ctypes":
+                kernel.SetInformationJobObject.side_effect = ValueError("inert ctypes fault")
+            else:
+                getattr(kernel, stage).return_value = 0
+            with self.subTest(stage=stage), \
+                 mock.patch.object(VERIFIER.ctypes, "WinDLL", return_value=kernel), \
+                 mock.patch.object(VERIFIER.ctypes, "get_last_error", return_value=5):
+                with self.assertRaises(VERIFIER.WindowsJobSetupError) as caught:
+                    VERIFIER.WindowsJob.attach(SimpleNamespace(_handle=99))
+                owner = caught.exception.job
+                self.assertEqual(73, owner.handle)
+                kernel.CloseHandle.assert_not_called()
+                if stage != "ctypes":
+                    self.assertEqual(5, caught.exception.__cause__.errno)
+                with self.assertRaises(OSError):
+                    owner.close()
+                self.assertEqual(73, owner.handle)
+                owner.close()
+                self.assertEqual(0, owner.handle)
+
+    def test_termination_and_close_serialize_handle_use(self) -> None:
+        entered, release, closing, closed = (threading.Event() for _ in range(4))
+        kernel = mock.MagicMock()
+        failures = []
+        def terminate(handle, status):
+            entered.set()
+            if not release.wait(timeout=2):
+                raise RuntimeError("inert synchronization deadline")
+            return 1
+        def close(handle):
+            closed.set()
+            return 1
+        kernel.TerminateJobObject.side_effect = terminate
+        kernel.CloseHandle.side_effect = close
+        job = VERIFIER.WindowsJob(73)
+        def invoke(action, marker=None):
+            if marker is not None:
+                marker.set()
+            try:
+                action()
+            except BaseException as error:
+                failures.append(error)
+        with mock.patch.object(VERIFIER, "os", SimpleNamespace(name="nt")), \
+             mock.patch.object(VERIFIER.ctypes, "WinDLL", return_value=kernel, create=True):
+            first = threading.Thread(target=invoke, args=(job.terminate,), daemon=True)
+            second = threading.Thread(target=invoke, args=(job.close, closing), daemon=True)
+            try:
+                first.start()
+                self.assertTrue(entered.wait(timeout=1))
+                second.start()
+                self.assertTrue(closing.wait(timeout=1))
+                self.assertFalse(closed.wait(timeout=0.05), "handle closed during termination")
+            finally:
+                release.set()
+                first.join(timeout=2)
+                if second.ident is not None:
+                    second.join(timeout=2)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertFalse(failures)
+            self.assertTrue(closed.is_set())
+            self.assertEqual(0, job.handle)
+
+    def test_unix_kill_failures_report_uncertainty_but_disappearance_is_benign(self) -> None:
+        for stage in ("group", "poll", "root", "gone"):
+            with self.subTest(stage=stage):
+                process = mock.Mock(spec=["pid", "poll", "kill"])
+                process.pid = 42
+                process.poll.return_value = None
+                killpg = mock.Mock()
+                if stage == "group":
+                    killpg.side_effect = PermissionError("inert denial")
+                elif stage == "poll":
+                    process.poll.side_effect = OSError("inert poll failure")
+                elif stage == "root":
+                    process.kill.side_effect = PermissionError("inert denial")
+                else:
+                    killpg.side_effect = ProcessLookupError("already gone")
+                    process.kill.side_effect = ProcessLookupError("already gone")
+                with mock.patch.object(VERIFIER, "os", SimpleNamespace(name="posix", killpg=killpg)), \
+                     mock.patch.object(VERIFIER, "signal", SimpleNamespace(SIGKILL=9)):
+                    if stage == "gone":
+                        VERIFIER.kill_process_tree(process, None)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            VERIFIER.kill_process_tree(process, None)
+                process.kill.assert_called_once_with()
+
+    def test_job_terminate_false_reports_failure_and_retains_handle(self) -> None:
+        kernel = mock.MagicMock()
+        kernel.TerminateJobObject.return_value = 0
+        job = VERIFIER.WindowsJob(73)
+        with mock.patch.object(VERIFIER, "os", SimpleNamespace(name="nt")), \
+             mock.patch.object(VERIFIER.ctypes, "WinDLL", return_value=kernel, create=True), \
+             mock.patch.object(VERIFIER.ctypes, "get_last_error", return_value=5, create=True), \
+             self.assertRaisesRegex(OSError, "TerminateJobObject"):
+            job.terminate()
+        self.assertEqual(73, job.handle)
+
+    def test_job_close_false_retains_handle_then_success_is_idempotent(self) -> None:
+        kernel = mock.MagicMock()
+        kernel.CloseHandle.side_effect = [0, 1]
+        job = VERIFIER.WindowsJob(73)
+        with mock.patch.object(VERIFIER, "os", SimpleNamespace(name="nt")), \
+             mock.patch.object(VERIFIER.ctypes, "WinDLL", return_value=kernel, create=True), \
+             mock.patch.object(VERIFIER.ctypes, "get_last_error", return_value=5, create=True):
+            with self.assertRaisesRegex(OSError, "CloseHandle"):
+                job.close()
+            self.assertEqual(73, job.handle)
+            job.close()
+            self.assertEqual(0, job.handle)
+            job.close()
+        self.assertEqual(2, kernel.CloseHandle.call_count)
+
+    def test_job_terminate_failure_still_kills_retained_root_without_pid(self) -> None:
+        process = mock.Mock(spec=["poll", "kill"])
+        process.poll.return_value = None
+        job = mock.Mock()
+        job.terminate.side_effect = RuntimeError("injected termination failure")
+        with mock.patch.object(VERIFIER, "os", SimpleNamespace(name="nt")), \
+             self.assertRaises(RuntimeError):
+            VERIFIER.kill_process_tree(process, job)
+        process.kill.assert_called_once_with()
+
+    def test_finished_stream_close_failure_does_not_skip_other_stream(self) -> None:
+        streams = (mock.Mock(), mock.Mock())
+        streams[0].close.side_effect = OSError("injected close failure")
+        readers = [mock.Mock(), mock.Mock()]
+        for reader in readers:
+            reader.is_alive.return_value = False
+        with self.assertRaises((OSError, RuntimeError)):
+            VERIFIER.close_finished_output_streams(streams, readers)
+        streams[1].close.assert_called_once_with()
+
+    def test_cleanup_job_failure_attempts_all_independent_steps(self) -> None:
+        # No process, descriptor read, or numeric PID is used in this matrix.
+        for stage in ("terminate", "close"):
+            with self.subTest(stage=stage):
+                process = mock.Mock(spec=["stdout", "stderr", "wait", "poll", "kill"])
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                job = mock.Mock()
+                getattr(job, stage).side_effect = RuntimeError("injected " + stage)
+                readers = [mock.Mock(), mock.Mock()]
+                for reader in readers:
+                    reader.is_alive.return_value = False
+                with mock.patch.object(VERIFIER, "os", SimpleNamespace(name="nt")), \
+                     mock.patch.object(VERIFIER.subprocess, "Popen", return_value=process), \
+                     mock.patch.object(VERIFIER.WindowsJob, "attach", return_value=job), \
+                     mock.patch.object(VERIFIER, "resume_suspended_windows_process"), \
+                     mock.patch.object(VERIFIER.threading, "Thread", side_effect=readers), \
+                     self.assertRaises((RuntimeError, SystemExit)):
+                    VERIFIER.run_bounded(["not executed"], SCRIPT.parent, "inert cleanup")
+                process.kill.assert_called_once_with()
+                self.assertGreaterEqual(process.wait.call_count, 2)
+                job.close.assert_called_once_with()
+                for reader in readers:
+                    reader.join.assert_called_once()
+                process.stdout.close.assert_called_once_with()
+                process.stderr.close.assert_called_once_with()
+
     def test_windows_no_job_uses_retained_handle_without_numeric_pid_or_subprocess(self) -> None:
         for exited in (False, True):
             with self.subTest(exited=exited):
