@@ -370,9 +370,12 @@ class MysqlProcess:
         self.failed = threading.Event()
         self.reader_error = ""
         self.cleanup_uncertain = False
+        self.stop_complete = False
         self.ready = False
 
     def start(self) -> None:
+        if self.process is not None or self.stop_complete:
+            raise RuntimeError("An owned MySQL process cannot be restarted on the same supervisor")
         # A process can fail to terminate before ever writing its pid file.
         # Keep a separate marker until owning-process exit is confirmed.
         write_private(self.root / "server.active", "owned MySQL startup in progress\n")
@@ -444,7 +447,7 @@ class MysqlProcess:
         raise RuntimeError("Private MySQL readiness exceeded its absolute deadline")
 
     def stop(self) -> None:
-        if self.process is None:
+        if self.process is None or self.stop_complete:
             return
         deadline = time.monotonic() + 10
         cleanup = BOUNDS.CleanupErrors()
@@ -464,6 +467,8 @@ class MysqlProcess:
         attempt("tree_terminate", lambda: BOUNDS.kill_process_tree(self.process, self.job))
         attempt("root_wait", lambda: self.process.wait(timeout=max(0, deadline - time.monotonic())))
         if self.job is not None:
+            if attempt("job_drain", lambda: self.job.wait_empty(deadline)) is not True:
+                cleanup.add("job_drain_unconfirmed")
             attempt("job_close", self.job.close)
         reader_finished = self.reader is None
         if self.reader is not None:
@@ -509,14 +514,21 @@ class MysqlProcess:
         if primary is not None or cleanup.failed:
             self.cleanup_uncertain = True
             cleanup.raise_if_any(primary)
-        # These markers certify only the existing retained-root/reader cleanup
-        # contract. Complete Job descendant drain is a separate required gate.
-        pid = self.root / "server.pid"
-        if pid.exists():
-            plain(pid).unlink()
-        marker = self.root / "server.active"
-        if present(marker):
-            plain(marker).unlink()
+        # Marker removal follows the assigned Job's zero-active observation
+        # while open; root exit or pipe EOF cannot replace that observation.
+        try:
+            pid = self.root / "server.pid"
+            if pid.exists():
+                plain(pid).unlink()
+            marker = self.root / "server.active"
+            if present(marker):
+                plain(marker).unlink()
+        except BaseException:
+            self.cleanup_uncertain = True
+            raise
+        # Startup failure and verify's finally may both stop this same owner.
+        # Only a fully successful transaction permits a no-op second stop.
+        self.stop_complete = True
 
 
 def client_command(root: Path, name: str, *arguments: str) -> list[str]:

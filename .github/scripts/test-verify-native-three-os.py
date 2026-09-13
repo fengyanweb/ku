@@ -33,6 +33,7 @@ class BoundedProcessTests(unittest.TestCase):
         process.poll.return_value = None
         process.wait.return_value = 0
         job = mock.Mock()
+        job.wait_empty.return_value = True
         readers = [mock.Mock(), mock.Mock()]
         for index, reader in enumerate(readers):
             reader.ident = None
@@ -46,6 +47,223 @@ class BoundedProcessTests(unittest.TestCase):
             constructor = stack.enter_context(mock.patch.object(VERIFIER.threading, "Thread", side_effect=readers))
             yield SimpleNamespace(process=process, job=job, readers=readers, resume=resume,
                                   constructor=constructor)
+
+    def test_job_drain_unknown_or_failure_cannot_return_success(self) -> None:
+        for result in (None, False, 1, mock.Mock(), OSError("inert query denial")):
+            with self.subTest(result=type(result).__name__), self.inert_runner() as run:
+                if isinstance(result, BaseException):
+                    run.job.wait_empty.side_effect = result
+                else:
+                    run.job.wait_empty.return_value = result
+                with self.assertRaisesRegex(SystemExit, "Job drain") as caught:
+                    VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "drain")
+                self.assertIs(run.job, caught.exception.job)
+                run.job.close.assert_called_once_with()
+                self.assertEqual(2, run.process.wait.call_count)
+                for reader in run.readers:
+                    reader.join.assert_called_once()
+                run.process.stdout.close.assert_called_once_with()
+                run.process.stderr.close.assert_called_once_with()
+
+    def test_job_drain_uses_existing_deadline_before_close(self) -> None:
+        with self.inert_runner() as run:
+            order = []
+            run.job.terminate.side_effect = lambda: order.append("terminate")
+            run.job.wait_empty.side_effect = lambda deadline: order.append(("drain", deadline)) or True
+            run.job.close.side_effect = lambda: order.append("close")
+            with mock.patch.object(VERIFIER.time, "monotonic", side_effect=[100, 104, 106, 108]):
+                result = VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "drain")
+            self.assertEqual(0, result.returncode)
+            self.assertEqual(["terminate", ("drain", 110), "close"], order)
+            self.assertEqual(6, run.process.wait.call_args.kwargs["timeout"])
+            self.assertEqual(4, run.readers[0].join.call_args.kwargs["timeout"])
+            self.assertEqual(2, run.readers[1].join.call_args.kwargs["timeout"])
+
+    def test_job_drain_preserves_first_error_and_failed_close(self) -> None:
+        for stage in ("terminate", "query", "close"):
+            with self.subTest(stage=stage), self.inert_runner() as run:
+                run.process.wait.side_effect = [23, 23]
+                getattr(run.job, {"terminate": "terminate", "query": "wait_empty", "close": "close"}[stage]).side_effect = OSError("inert secondary")
+                with self.assertRaisesRegex(SystemExit, "exited with 23"):
+                    VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "first error")
+                run.job.wait_empty.assert_called_once()
+                run.job.close.assert_called_once_with()
+                self.assertEqual(2, run.process.wait.call_count)
+
+    @unittest.skipUnless(os.name == "nt", "Windows accounting ABI with mocked kernel")
+    def test_job_accounting_checks_fixed_layout_bool_and_exact_length(self) -> None:
+        information_type = VERIFIER._JobBasicAccountingInformation
+        self.assertEqual(48, VERIFIER.ctypes.sizeof(information_type))
+        self.assertEqual(40, information_type.active_processes.offset)
+        for result, written, expected in ((1, 48, 7), (0, 48, None), (0, None, None),
+                                           (1, None, None), (1, 0, None),
+                                           (1, 47, None), (1, 49, None)):
+            kernel = mock.MagicMock()
+            def query(handle, information_class, address, size, returned):
+                self.assertEqual((73, 1, 48), (handle, information_class, size))
+                information = VERIFIER.ctypes.cast(address, VERIFIER.ctypes.POINTER(information_type)).contents
+                if written is not None:
+                    information.active_processes = 7
+                    VERIFIER.ctypes.cast(returned, VERIFIER.ctypes.POINTER(VERIFIER.wintypes.DWORD)).contents.value = written
+                return result
+            kernel.QueryInformationJobObject.side_effect = query
+            with self.subTest(result=result, written=written), \
+                 mock.patch.object(VERIFIER.ctypes, "WinDLL", return_value=kernel), \
+                 mock.patch.object(VERIFIER.ctypes, "get_last_error", return_value=5):
+                job = VERIFIER.WindowsJob(73)
+                if expected is None:
+                    with self.assertRaises((OSError, RuntimeError)):
+                        job.active_processes()
+                else:
+                    self.assertEqual(expected, job.active_processes())
+                kernel.QueryInformationJobObject.assert_called_once()
+                self.assertEqual(73, job.handle)
+
+    def test_job_accounting_never_queries_closed_or_non_windows_owner(self) -> None:
+        for host, handle in (("nt", 0), ("posix", 73)):
+            with self.subTest(host=host), \
+                 mock.patch.object(VERIFIER, "os", SimpleNamespace(name=host)), \
+                 mock.patch.object(VERIFIER.ctypes, "WinDLL", create=True) as load:
+                with self.assertRaisesRegex(RuntimeError, "Job"):
+                    VERIFIER.WindowsJob(handle).active_processes()
+                load.assert_not_called()
+
+    def test_job_wait_empty_counts_active_processes_not_root_or_limits(self) -> None:
+        job = VERIFIER.WindowsJob(73)
+        for counts in ([2, 1, 0], [0]):
+            with self.subTest(counts=counts), \
+                 mock.patch.object(job, "active_processes", side_effect=counts) as query, \
+                 mock.patch.object(VERIFIER.time, "monotonic", return_value=100), \
+                 mock.patch.object(VERIFIER.time, "sleep") as sleep:
+                self.assertIs(True, job.wait_empty(110))
+                self.assertEqual(len(counts), query.call_count)
+                self.assertEqual(len(counts) - 1, sleep.call_count)
+                for call in sleep.call_args_list:
+                    self.assertGreater(call.args[0], 0)
+                    self.assertLessEqual(call.args[0], 0.01)
+
+    def test_job_wait_empty_invalid_expired_and_late_zero_fail(self) -> None:
+        job = VERIFIER.WindowsJob(73)
+        for deadline in (float("nan"), float("inf"), -1, 100):
+            with self.subTest(deadline=deadline), \
+                 mock.patch.object(job, "active_processes", create=True) as query, \
+                 mock.patch.object(VERIFIER.time, "monotonic", return_value=100), \
+                 mock.patch.object(VERIFIER.time, "sleep") as sleep:
+                with self.assertRaises((ValueError, RuntimeError)):
+                    job.wait_empty(deadline)
+                query.assert_not_called()
+                sleep.assert_not_called()
+        with mock.patch.object(job, "active_processes", return_value=0, create=True) as query, \
+             mock.patch.object(VERIFIER.time, "monotonic", side_effect=[100, 111]), \
+             mock.patch.object(VERIFIER.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "deadline"):
+                job.wait_empty(110)
+            query.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_job_wait_empty_never_reuses_zero_and_rejects_invalid_counts(self) -> None:
+        job = VERIFIER.WindowsJob(73)
+        with mock.patch.object(job, "active_processes", side_effect=[0, 1]) as query, \
+             mock.patch.object(VERIFIER, "MAX_WINDOWS_JOB_DRAIN_POLLS", 1), \
+             mock.patch.object(VERIFIER.time, "monotonic", return_value=100):
+            self.assertIs(True, job.wait_empty(110))
+            with self.assertRaisesRegex(RuntimeError, "poll"):
+                job.wait_empty(110)
+            self.assertEqual(2, query.call_count)
+        for count in (None, False, -1, "0", mock.Mock()):
+            with self.subTest(count=type(count).__name__), \
+                 mock.patch.object(job, "active_processes", return_value=count) as query, \
+                 mock.patch.object(VERIFIER.time, "monotonic", return_value=100), \
+                 mock.patch.object(VERIFIER.time, "sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "invalid active count"):
+                    job.wait_empty(110)
+                query.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_job_wait_empty_checks_deadline_each_poll_and_releases_lock_for_sleep(self) -> None:
+        job = VERIFIER.WindowsJob(73)
+        def sleep_unlocked(seconds):
+            self.assertTrue(job._lock.acquire(blocking=False))
+            job._lock.release()
+            self.assertLessEqual(seconds, 0.005001)
+        with mock.patch.object(job, "active_processes", return_value=1) as query, \
+             mock.patch.object(VERIFIER.time, "monotonic", side_effect=[100, 100.995, 101]), \
+             mock.patch.object(VERIFIER.time, "sleep", side_effect=sleep_unlocked) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "deadline"):
+                job.wait_empty(101)
+            query.assert_called_once()
+            sleep.assert_called_once()
+
+    @unittest.skipUnless(os.name == "nt", "Windows accounting lock with mocked kernel")
+    def test_job_accounting_query_and_close_use_same_owner_lock(self) -> None:
+        job = VERIFIER.WindowsJob(73)
+        entered, release, closing, closed = (threading.Event() for _ in range(4))
+        kernel = mock.MagicMock()
+        failures = []
+        def query(handle, information_class, address, size, returned):
+            entered.set()
+            if not release.wait(timeout=2):
+                raise RuntimeError("inert accounting synchronization deadline")
+            VERIFIER.ctypes.cast(returned, VERIFIER.ctypes.POINTER(VERIFIER.wintypes.DWORD)).contents.value = size
+            return 1
+        def close(handle):
+            closed.set()
+            return 1
+        kernel.QueryInformationJobObject.side_effect = query
+        kernel.CloseHandle.side_effect = close
+        def invoke(action, marker=None):
+            if marker is not None:
+                marker.set()
+            try:
+                action()
+            except BaseException as error:
+                failures.append(error)
+        with mock.patch.object(VERIFIER.ctypes, "WinDLL", return_value=kernel):
+            reader = threading.Thread(target=invoke, args=(job.active_processes,), daemon=True)
+            closer = threading.Thread(target=invoke, args=(job.close, closing), daemon=True)
+            reader.start()
+            try:
+                self.assertTrue(entered.wait(timeout=1))
+                closer.start()
+                self.assertTrue(closing.wait(timeout=1))
+                self.assertFalse(closed.wait(timeout=0.05))
+            finally:
+                release.set()
+                reader.join(timeout=2)
+                if closer.ident is not None:
+                    closer.join(timeout=2)
+            self.assertFalse(reader.is_alive())
+            self.assertFalse(closer.is_alive())
+            self.assertFalse(failures)
+            self.assertEqual(0, job.handle)
+            with self.assertRaisesRegex(RuntimeError, "open owned Job"):
+                job.active_processes()
+            kernel.QueryInformationJobObject.assert_called_once()
+
+    def test_job_wait_empty_poll_cap_and_query_failure_do_not_retry_forever(self) -> None:
+        job = VERIFIER.WindowsJob(73)
+        with mock.patch.object(VERIFIER, "MAX_WINDOWS_JOB_DRAIN_POLLS", 3, create=True), \
+             mock.patch.object(job, "active_processes", return_value=1, create=True) as query, \
+             mock.patch.object(VERIFIER.time, "monotonic", return_value=100), \
+             mock.patch.object(VERIFIER.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "poll"):
+                job.wait_empty(110)
+            self.assertEqual(3, query.call_count)
+            self.assertEqual(2, sleep.call_count)
+        for cap in (0, -1):
+            with self.subTest(cap=cap), \
+                 mock.patch.object(VERIFIER, "MAX_WINDOWS_JOB_DRAIN_POLLS", cap, create=True), \
+                 mock.patch.object(job, "active_processes", create=True) as query:
+                with self.assertRaises((ValueError, RuntimeError)):
+                    job.wait_empty(110)
+                query.assert_not_called()
+        with mock.patch.object(job, "active_processes", side_effect=OSError("inert denial"), create=True) as query, \
+             mock.patch.object(VERIFIER.time, "monotonic", return_value=100), \
+             mock.patch.object(VERIFIER.time, "sleep") as sleep:
+            with self.assertRaises(OSError):
+                job.wait_empty(110)
+            query.assert_called_once()
+            sleep.assert_not_called()
 
     def test_partial_reader_creation_and_start_preserve_cleanup(self) -> None:
         for stage in ("constructor0", "constructor1", "start0", "start1"):
@@ -459,6 +677,103 @@ class BoundedProcessTests(unittest.TestCase):
             "inherited pipe self-test",
         )
         self.assertEqual(result.stdout.replace(b"\r\n", b"\n"), b"parent-exited\n")
+
+    @unittest.skipUnless(os.name == "nt", "Windows real owned Job descendant accounting")
+    def test_windows_job_observes_live_descendant_after_launcher_exit_then_drains(self) -> None:
+        # Deliberately not TemporaryDirectory: uncertain cleanup keeps evidence.
+        directory = Path(tempfile.mkdtemp(prefix="ku-job-drain-"))
+        ready, expired = directory / "ready", directory / "expired"
+        descendant = (
+            "from pathlib import Path; import time; "
+            f"Path({str(ready)!r}).write_bytes(b'ready'); "
+            "time.sleep(15); "
+            f"Path({str(expired)!r}).write_bytes(b'expired')"
+        )
+        launcher = (
+            "import subprocess,sys; "
+            f"subprocess.Popen([sys.executable,'-I','-B','-c',{descendant!r}],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+            "close_fds=True,creationflags=0x08000000)"
+        )
+        process = None
+        job = None
+        primary = None
+        observed_before = None
+        observed_after = None
+        cleanup = VERIFIER.CleanupErrors()
+        try:
+            process = subprocess.Popen(
+                # Markers are absolute; their disposable directory need not be
+                # a child CWD whose filesystem lifetime this test does not own.
+                [sys.executable, "-I", "-B", "-c", launcher], cwd=SCRIPT.parent,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                close_fds=True, creationflags=0x08000204,  # NO_WINDOW | NEW_GROUP | SUSPENDED
+            )
+            try:
+                job = VERIFIER.WindowsJob.attach(process)
+            except VERIFIER.WindowsJobSetupError as error:
+                job = error.job
+                raise
+            self.assertIsNotNone(job, "real launcher must be contained before resume")
+            VERIFIER.resume_suspended_windows_process(process)
+            setup_deadline = time.monotonic() + 5
+            self.assertEqual(0, process.wait(timeout=max(0, setup_deadline - time.monotonic())))
+            for _ in range(1000):
+                if time.monotonic() >= setup_deadline:
+                    self.fail("descendant readiness exceeded its setup deadline")
+                if ready.exists():
+                    with ready.open("rb") as marker:
+                        content = marker.read(6)
+                    if content == b"ready":
+                        break
+                    self.assertIn(content, (b"",), "invalid bounded readiness marker")
+                time.sleep(min(0.005, max(0, setup_deadline - time.monotonic())))
+            else:
+                self.fail("descendant readiness exceeded its poll bound")
+            self.assertEqual(0, process.poll())
+            self.assertFalse(expired.exists(), "descendant expired before observation")
+            observed_before = job.active_processes()
+            self.assertGreater(observed_before, 0, "exited launcher must still have a live Job descendant")
+            self.assertLess(time.monotonic(), setup_deadline)
+        except BaseException as error:
+            primary = error
+        finally:
+            deadline = time.monotonic() + 5
+            if process is not None:
+                cleanup.attempt("fixture tree termination", lambda: VERIFIER.kill_process_tree(process, job))
+            if job is not None:
+                if cleanup.attempt("fixture Job drain", lambda: job.wait_empty(deadline)) is not True:
+                    cleanup.add("fixture Job drain unconfirmed")
+                else:
+                    observed_after = cleanup.attempt("fixture final active count", job.active_processes)
+                    if observed_after != 0 or time.monotonic() >= deadline:
+                        cleanup.add("fixture zero-before-close unconfirmed")
+                cleanup.attempt("fixture Job close", job.close)
+            if process is not None:
+                cleanup.attempt("fixture root wait", lambda: process.wait(timeout=max(0, deadline - time.monotonic())))
+            if primary is None and not cleanup.failed:
+                if cleanup.attempt("fixture expiry check", expired.exists) is not False:
+                    cleanup.add("descendant expired rather than being promptly terminated")
+                else:
+                    for marker in (ready, expired):
+                        cleanup.attempt("fixture marker removal", lambda marker=marker: marker.unlink(missing_ok=True))
+                    if not cleanup.failed:
+                        cleanup.attempt("fixture empty directory removal", directory.rmdir)
+        try:
+            cleanup.raise_if_any(primary)
+        except BaseException as error:
+            error.job = job
+            error.process = process
+            error.fixture_directory = directory
+            error.add_note(
+                f"owned Job fixture {directory.name}: active_before={observed_before}, "
+                f"active_after={observed_after}; directory cleanup not confirmed"
+            )
+            raise
+        self.assertGreater(observed_before, 0)
+        self.assertEqual(0, observed_after)
+        self.assertEqual(0, job.handle)
+        print(f"owned Job drain: launcher exited, active_before={observed_before}, active_after=0 before close; fixed markers removed")
 
     @unittest.skipUnless(os.name == "nt", "Windows suspended-start contract")
     def test_windows_child_cannot_execute_before_job_assignment(self) -> None:

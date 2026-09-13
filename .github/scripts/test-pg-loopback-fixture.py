@@ -109,19 +109,21 @@ class PgFixtureTests(unittest.TestCase):
         process.poll.return_value = 0
         events = []
         process.wait.side_effect = lambda **_: events.append("wait") or 0
+        job.wait_empty.side_effect = lambda deadline: events.append("drain") or True
         with self.startup_scope(inputs), \
              patch.object(FIXTURE.subprocess, "Popen", side_effect=lambda *a, **k: events.append("popen") or process) as popen, \
              patch.object(FIXTURE.BOUNDS.WindowsJob, "attach", side_effect=lambda p: events.append("attach") or job), \
              patch.object(FIXTURE.BOUNDS, "resume_suspended_windows_process", side_effect=lambda p: events.append("resume")), \
              self.assertRaisesRegex(RuntimeError, "inert live boundary"):
             FIXTURE.verify(inputs.args)
-        self.assertEqual(["popen", "attach", "resume", "wait", "wait"], events)
+        self.assertEqual(["popen", "attach", "resume", "wait", "drain", "wait"], events)
         self.assertTrue(popen.call_args.kwargs["creationflags"] & 4)
         self.assertEqual(2, process.wait.call_count)
         self.assertEqual(25, process.wait.call_args_list[0].kwargs["timeout"])
         self.assertGreater(process.wait.call_args.kwargs["timeout"], 0)
         self.assertLessEqual(process.wait.call_args.kwargs["timeout"], 5)
         job.terminate.assert_called_once_with()
+        job.wait_empty.assert_called_once()
         job.close.assert_called_once_with()
         inputs.tree.assert_called_once_with(process, job)
         process.kill.assert_not_called()
@@ -158,6 +160,7 @@ class PgFixtureTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 inputs = self.startup_inputs()
                 process, job = MagicMock(), MagicMock()
+                job.wait_empty.return_value = True
                 process.poll.return_value = None
                 process.wait.return_value = 1 if stage == "nonzero" else 0
                 if stage == "startup_timeout":
@@ -172,6 +175,7 @@ class PgFixtureTests(unittest.TestCase):
                      self.assertRaises((OSError, RuntimeError, subprocess.TimeoutExpired)):
                     FIXTURE.verify(inputs.args)
                 job.terminate.assert_called_once_with()
+                job.wait_empty.assert_called_once()
                 job.close.assert_called_once_with()
                 inputs.tree.assert_called_once_with(process, job)
                 process.kill.assert_called_once_with()
@@ -185,7 +189,7 @@ class PgFixtureTests(unittest.TestCase):
         # A numeric PID is deliberately unavailable: only the retained owner
         # authorizes cleanup. All process and filesystem operations are inert.
         inputs.process = MagicMock(spec=["poll", "kill", "wait"])
-        inputs.job = MagicMock(spec=["terminate", "close"])
+        inputs.job = MagicMock(spec=["terminate", "wait_empty", "close"])
         pid_checks = waits = 0
 
         def pid_exists():
@@ -225,6 +229,7 @@ class PgFixtureTests(unittest.TestCase):
         inputs.process.kill.side_effect = operation("root_kill")
         inputs.process.wait.side_effect = wait
         inputs.job.terminate.side_effect = operation("job_terminate")
+        inputs.job.wait_empty.side_effect = lambda deadline: operation("job_drain")() or True
         inputs.job.close.side_effect = operation("job_close")
         inputs.live_run = run
         return inputs
@@ -238,12 +243,12 @@ class PgFixtureTests(unittest.TestCase):
         return stack
 
     def test_pg_cleanup_failures_attempt_independent_steps_and_forbid_receipt(self) -> None:
-        for failure in ("stop_pid", "stop", "job_terminate", "job_close", "root_poll", "root_kill", "root_wait", "final_pid"):
+        for failure in ("stop_pid", "stop", "job_terminate", "job_drain", "job_close", "root_poll", "root_kill", "root_wait", "final_pid"):
             with self.subTest(failure=failure):
                 inputs = self.cleanup_inputs(failure)
                 with self.cleanup_scope(inputs), self.assertRaises((OSError, RuntimeError)):
                     FIXTURE.verify(inputs.args)
-                for step in ("job_terminate", "job_close", "root_kill", "root_wait", "final_pid"):
+                for step in ("job_terminate", "job_drain", "job_close", "root_kill", "root_wait", "final_pid"):
                     self.assertIn(step, inputs.events, f"{failure} skipped independent {step}")
                 self.assertEqual(1, inputs.events.count("job_close"))
                 self.assertEqual(1, inputs.events.count("root_wait"))
@@ -252,7 +257,7 @@ class PgFixtureTests(unittest.TestCase):
                 inputs.record.open.assert_not_called()
 
     def test_pg_cleanup_failure_preserves_original_live_error(self) -> None:
-        for failure in ("stop", "job_terminate", "job_close", "root_wait", "final_pid"):
+        for failure in ("stop", "job_terminate", "job_drain", "job_close", "root_wait", "final_pid"):
             with self.subTest(failure=failure):
                 inputs = self.cleanup_inputs(failure, live_failure=True)
                 with self.cleanup_scope(inputs), self.assertRaisesRegex(RuntimeError, "original live failure"):
@@ -266,7 +271,7 @@ class PgFixtureTests(unittest.TestCase):
             FIXTURE.verify(inputs.args)
         self.assertEqual([
             "initial_pid", "startup_wait", "live", "stop_pid", "stop", "job_terminate",
-            "root_poll", "root_kill", "job_close", "root_wait", "final_pid",
+            "root_poll", "root_kill", "job_drain", "job_close", "root_wait", "final_pid",
         ], inputs.events)
         inputs.record.open.assert_called_once_with("w", encoding="utf-8", newline="\n")
         inputs.numeric.assert_not_called()
@@ -328,13 +333,14 @@ class PgFixtureTests(unittest.TestCase):
         inputs.record.open.assert_not_called()
 
     def test_pg_failed_setup_retains_actual_job_owner_without_resuming(self) -> None:
-        for failure in (None, "terminate", "close"):
+        for failure in (None, "terminate", "wait_empty", "close"):
             with self.subTest(failure=failure):
                 inputs = self.startup_inputs()
                 process = MagicMock(spec=["poll", "kill", "wait"])
                 process.poll.return_value = None
                 process.wait.return_value = 0
-                job = MagicMock(spec=["terminate", "close"])
+                job = MagicMock(spec=["terminate", "wait_empty", "close"])
+                job.wait_empty.return_value = True
                 if failure is not None:
                     getattr(job, failure).side_effect = OSError("inert retained owner failure")
                 primary = FIXTURE.BOUNDS.WindowsJobSetupError(job, OSError("inert assignment"))
@@ -348,6 +354,7 @@ class PgFixtureTests(unittest.TestCase):
                 inputs.run.assert_not_called()
                 inputs.tree.assert_called_once_with(process, job)
                 job.terminate.assert_called_once_with()
+                job.wait_empty.assert_called_once()
                 job.close.assert_called_once_with()
                 process.kill.assert_called_once_with()
                 self.assertEqual(1, process.wait.call_count)
@@ -363,6 +370,77 @@ class PgFixtureTests(unittest.TestCase):
             FIXTURE.verify(inputs.args)
         self.assertIn("root_wait", inputs.events)
         inputs.record.open.assert_not_called()
+
+    def test_pg_job_drain_unknown_result_forbids_receipt_and_preserves_cleanup(self) -> None:
+        for result in (None, False, 0, 1, "true", MagicMock()):
+            with self.subTest(result=repr(result)):
+                inputs = self.cleanup_inputs()
+                inputs.job.wait_empty.side_effect = None
+                inputs.job.wait_empty.return_value = result
+                with self.cleanup_scope(inputs), self.assertRaisesRegex(RuntimeError, "Job drain"):
+                    FIXTURE.verify(inputs.args)
+                inputs.job.wait_empty.assert_called_once()
+                inputs.job.close.assert_called_once_with()
+                self.assertIn("root_wait", inputs.events)
+                self.assertIn("final_pid", inputs.events)
+                inputs.record.open.assert_not_called()
+                inputs.numeric.assert_not_called()
+
+    def test_pg_job_drain_errors_forbid_receipt_even_after_close(self) -> None:
+        for failure in (OSError("inert query failure"), TimeoutError("inert drain deadline")):
+            with self.subTest(failure=type(failure).__name__):
+                inputs = self.cleanup_inputs()
+                inputs.job.wait_empty.side_effect = failure
+                with self.cleanup_scope(inputs), self.assertRaisesRegex(RuntimeError, "Job drain") as raised:
+                    FIXTURE.verify(inputs.args)
+                self.assertIn(type(failure).__name__, str(raised.exception))
+                inputs.job.wait_empty.assert_called_once()
+                inputs.job.close.assert_called_once_with()
+                self.assertIn("root_wait", inputs.events)
+                self.assertIn("final_pid", inputs.events)
+                inputs.record.open.assert_not_called()
+                inputs.numeric.assert_not_called()
+
+    def test_pg_job_drain_true_does_not_erase_termination_failure(self) -> None:
+        inputs = self.cleanup_inputs("job_terminate")
+        with self.cleanup_scope(inputs), self.assertRaisesRegex(RuntimeError, "process termination"):
+            FIXTURE.verify(inputs.args)
+        inputs.job.wait_empty.assert_called_once()
+        inputs.job.close.assert_called_once_with()
+        self.assertIn("root_wait", inputs.events)
+        self.assertIn("final_pid", inputs.events)
+        inputs.record.open.assert_not_called()
+
+    def test_pg_job_drain_failure_preserves_first_live_or_stop_error(self) -> None:
+        for stage in ("live", "stop"):
+            with self.subTest(stage=stage):
+                inputs = self.cleanup_inputs()
+                primary = RuntimeError("original " + stage + " failure")
+                inputs.job.wait_empty.side_effect = OSError("inert query failure")
+                with self.cleanup_scope(inputs):
+                    inputs.run.side_effect = [primary, b""] if stage == "live" else [
+                        b"test result: ok. 1 passed; 0 failed; 0 ignored;\n", primary,
+                    ]
+                    with self.assertRaisesRegex(RuntimeError, "original " + stage) as raised:
+                        FIXTURE.verify(inputs.args)
+                self.assertIsInstance(raised.exception, FIXTURE.BOUNDS.CleanupFailure)
+                self.assertIs(primary, raised.exception.primary)
+                self.assertIn("Job drain", str(raised.exception))
+                inputs.job.close.assert_called_once_with()
+                self.assertIn("root_wait", inputs.events)
+                self.assertIn("final_pid", inputs.events)
+                inputs.record.open.assert_not_called()
+
+    def test_pg_job_drain_uses_existing_deadline_and_precedes_close(self) -> None:
+        inputs = self.cleanup_inputs()
+        with self.cleanup_scope(inputs), patch.object(FIXTURE.time, "monotonic", side_effect=[10.0, 13.0]):
+            FIXTURE.verify(inputs.args)
+        inputs.job.wait_empty.assert_called_once_with(15.0)
+        self.assertLess(inputs.events.index("root_kill"), inputs.events.index("job_drain"))
+        self.assertLess(inputs.events.index("job_drain"), inputs.events.index("job_close"))
+        self.assertEqual(2.0, inputs.process.wait.call_args.kwargs["timeout"])
+        self.assertEqual(25, inputs.run.call_args.args[3])
+        inputs.record.open.assert_called_once_with("w", encoding="utf-8", newline="\n")
 
     @unittest.skipUnless(os.name == "nt", "real harmless Windows process / Job contract")
     def test_pg_real_suspended_root_job_order_and_failed_assignment(self) -> None:

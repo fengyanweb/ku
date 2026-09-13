@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
 import hashlib
+import math
 import os
 import platform
 import re
@@ -33,6 +34,8 @@ COMMAND_TIMEOUT_SECONDS = 300
 MAX_WINDOWS_THREAD_SCAN = 65536
 WINDOWS_PROCESS_SETUP_TIMEOUT_SECONDS = 5
 PROCESS_CLEANUP_TIMEOUT_SECONDS = 10
+MAX_WINDOWS_JOB_DRAIN_POLLS = 1024
+WINDOWS_JOB_DRAIN_POLL_SECONDS = 0.01
 _CleanupValue = TypeVar("_CleanupValue")
 
 
@@ -95,6 +98,19 @@ TARGET_HOSTS = {
 
 
 if os.name == "nt":
+    class _JobBasicAccountingInformation(ctypes.Structure):
+        _fields_ = [
+            ("total_user_time", ctypes.c_longlong),
+            ("total_kernel_time", ctypes.c_longlong),
+            ("this_period_total_user_time", ctypes.c_longlong),
+            ("this_period_total_kernel_time", ctypes.c_longlong),
+            ("total_page_fault_count", wintypes.DWORD),
+            ("total_processes", wintypes.DWORD),
+            ("active_processes", wintypes.DWORD),
+            ("total_terminated_processes", wintypes.DWORD),
+        ]
+
+
     class _JobBasicLimitInformation(ctypes.Structure):
         _fields_ = [
             ("per_process_user_time_limit", ctypes.c_longlong),
@@ -215,6 +231,55 @@ class WindowsJob:
             if not kernel32.CloseHandle(self.handle):
                 raise OSError(ctypes.get_last_error(), "CloseHandle failed")
             self.handle = 0
+
+    def active_processes(self) -> int:
+        """Query this still-owned Job, never the caller's implicit/null Job."""
+        with self._lock:
+            if os.name != "nt" or not self.handle:
+                raise RuntimeError("Windows Job accounting requires an open owned Job")
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.QueryInformationJobObject.argtypes = [
+                wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+            ]
+            kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+            information = _JobBasicAccountingInformation()
+            returned = wintypes.DWORD(0xFFFFFFFF)
+            size = ctypes.sizeof(information)
+            if not kernel32.QueryInformationJobObject(
+                self.handle, 1, ctypes.byref(information), size, ctypes.byref(returned),
+            ):
+                raise OSError(ctypes.get_last_error(), "QueryInformationJobObject failed")
+            if returned.value != size:
+                raise RuntimeError("Windows Job accounting returned an invalid length")
+            return int(information.active_processes)
+
+    def wait_empty(self, deadline: float) -> bool:
+        """Observe zero before close under the caller's existing cleanup budget.
+
+        This observes contained processes, not arbitrary host process creation.
+        The deadline cannot preempt a synchronous kernel call that never returns.
+        No owner lock is held while sleeping, and query errors are never retried.
+        """
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError("Windows Job drain requires a finite deadline")
+        if type(MAX_WINDOWS_JOB_DRAIN_POLLS) is not int or MAX_WINDOWS_JOB_DRAIN_POLLS <= 0:
+            raise ValueError("Windows Job drain requires a positive poll bound")
+        for attempt in range(MAX_WINDOWS_JOB_DRAIN_POLLS):
+            now = time.monotonic()
+            if not math.isfinite(now) or now >= deadline:
+                raise RuntimeError("Windows Job drain exceeded its deadline")
+            count = self.active_processes()
+            now = time.monotonic()
+            if not math.isfinite(now) or now >= deadline:
+                raise RuntimeError("Windows Job drain exceeded its deadline")
+            if type(count) is not int or count < 0:
+                raise RuntimeError("Windows Job drain received an invalid active count")
+            if count == 0:
+                return True
+            if attempt + 1 < MAX_WINDOWS_JOB_DRAIN_POLLS:
+                time.sleep(min(WINDOWS_JOB_DRAIN_POLL_SECONDS, deadline - now))
+        raise RuntimeError("Windows Job drain exceeded its poll bound")
 
 
 def resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
@@ -480,6 +545,8 @@ def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.Complet
     deadline = time.monotonic() + PROCESS_CLEANUP_TIMEOUT_SECONDS
     errors.attempt("process tree termination", lambda: kill_process_tree(process, windows_job))
     if windows_job is not None:
+        if errors.attempt("Job drain", lambda: windows_job.wait_empty(deadline)) is not True:
+            errors.add("Job drain not confirmed")
         errors.attempt("Job close", windows_job.close)
     errors.attempt("root wait", lambda: process.wait(timeout=max(0.0, deadline - time.monotonic())))
     for index, stream in enumerate(streams):
