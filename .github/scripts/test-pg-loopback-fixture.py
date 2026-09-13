@@ -17,7 +17,7 @@ import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 sys.dont_write_bytecode = True
 SPEC = importlib.util.spec_from_file_location(
@@ -29,6 +29,43 @@ SPEC.loader.exec_module(FIXTURE)
 
 
 class PgFixtureTests(unittest.TestCase):
+    @staticmethod
+    def marker_input() -> SimpleNamespace:
+        path = MagicMock(spec=Path)
+        state = SimpleNamespace(present=False, streams=[], text="")
+
+        def metadata():
+            if not state.present:
+                raise FileNotFoundError("inert marker absent")
+            return SimpleNamespace(st_mode=0o100600)
+
+        def open_marker(mode, **kwargs):
+            if mode == "x" and state.present:
+                raise FileExistsError("inert operation already owned")
+            state.present = True
+            state.text = ""
+            stream = MagicMock(spec=io.TextIOBase)
+
+            def write(text):
+                state.text += text
+                return len(text)
+
+            stream.write.side_effect = write
+            stream.__enter__.return_value = stream
+            state.streams.append(stream)
+            return stream
+
+        def unlink(**kwargs):
+            if not state.present:
+                raise FileNotFoundError("inert marker absent")
+            state.present = False
+
+        path.lstat.side_effect = metadata
+        path.exists.side_effect = lambda: state.present
+        path.open.side_effect = open_marker
+        path.unlink.side_effect = unlink
+        return SimpleNamespace(path=path, state=state)
+
     @staticmethod
     def mocked_verification_inputs(record_present: bool = True) -> SimpleNamespace:
         root = MagicMock(spec=Path)
@@ -52,13 +89,44 @@ class PgFixtureTests(unittest.TestCase):
 
         record.unlink.side_effect = unlink
         manifest.read_text.side_effect = read_manifest
-        root.__truediv__.side_effect = {
+        lock = PgFixtureTests.marker_input()
+        active = PgFixtureTests.marker_input()
+        pid = MagicMock(spec=Path)
+        pid.exists.return_value = False
+
+        def pid_metadata():
+            if not pid.exists():
+                raise FileNotFoundError("inert PID absent")
+            return SimpleNamespace(st_mode=0o100600)
+
+        pid.lstat.side_effect = pid_metadata
+        data = MagicMock(spec=Path)
+        data.__truediv__.side_effect = {"postmaster.pid": pid}.__getitem__
+        paths = {
             "verification.json": record,
             "fixture.json": manifest,
-        }.__getitem__
+            "operation.lock": lock.path,
+            "server.active": active.path,
+            "data": data,
+        }
+
+        def publish(destination):
+            if destination is not record or not lock.state.present:
+                raise AssertionError("receipt publication requires this attempt's lease")
+            if active.state.present:
+                raise AssertionError("receipt publication preceded active marker release")
+            if not lock.state.streams or lock.state.streams[-1].close.call_count != 1:
+                raise AssertionError("receipt publication preceded closing its writer")
+            state["receipt_text"] = lock.state.text
+            state["record_present"] = True
+            lock.state.present = False
+            return record
+
+        lock.path.replace.side_effect = publish
+        root.__truediv__.side_effect = paths.__getitem__
         return SimpleNamespace(
             args=argparse.Namespace(fixture=root), target=target, record=record,
-            manifest=manifest, state=state,
+            manifest=manifest, state=state, lock=lock, active=active, pid=pid, paths=paths,
         )
 
     @classmethod
@@ -66,10 +134,6 @@ class PgFixtureTests(unittest.TestCase):
         # Reuse the existing invalidation contract without touching real fixtures.
         inputs = cls.mocked_verification_inputs()
         root = inputs.args.fixture
-        inputs.pid = MagicMock(spec=Path)
-        inputs.pid.exists.return_value = False
-        data = MagicMock(spec=Path)
-        data.__truediv__.side_effect = {"postmaster.pid": inputs.pid}.__getitem__
         password = MagicMock(spec=Path)
         password.read_text.return_value = "inert-contract-password"
         inputs.manifest.read_text.side_effect = None
@@ -77,8 +141,8 @@ class PgFixtureTests(unittest.TestCase):
             "format": 1, "version": FIXTURE.VERSION, "source_sha256": FIXTURE.SOURCE_SHA256,
             "port": 23456,
         })
-        paths = {"verification.json": inputs.record, "fixture.json": inputs.manifest,
-                 "data": data, "password.txt": password}
+        paths = inputs.paths
+        paths["password.txt"] = password
         for name in ("portable", "db.conn", "startup.log", "server.log", "live-test.log"):
             paths[name] = MagicMock(spec=Path)
         root.__truediv__.side_effect = paths.__getitem__
@@ -237,10 +301,668 @@ class PgFixtureTests(unittest.TestCase):
     def cleanup_scope(self, inputs: SimpleNamespace) -> ExitStack:
         stack = self.startup_scope(inputs)
         inputs.run.side_effect = inputs.live_run
-        stack.enter_context(patch.object(FIXTURE.subprocess, "Popen", return_value=inputs.process))
+        inputs.popen = stack.enter_context(patch.object(FIXTURE.subprocess, "Popen", return_value=inputs.process))
         stack.enter_context(patch.object(FIXTURE.BOUNDS.WindowsJob, "attach", return_value=inputs.job))
         stack.enter_context(patch.object(FIXTURE.BOUNDS, "resume_suspended_windows_process"))
         return stack
+
+    @staticmethod
+    def inject_marker_failure(marker: SimpleNamespace, stage: str, primary: BaseException,
+                              *, mode: str | None = None) -> None:
+        open_marker = marker.path.open.side_effect
+
+        def fail_marker(actual_mode, **kwargs):
+            if mode is not None and actual_mode != mode:
+                return open_marker(actual_mode, **kwargs)
+            if stage == "open":
+                raise primary
+            stream = open_marker(actual_mode, **kwargs)
+            marker.failed_stream = stream
+            if stage in ("write", "double"):
+                stream.write.side_effect = primary
+            elif stage == "short":
+                stream.write.side_effect = lambda text: len(text) - 1
+            if stage == "close":
+                stream.close.side_effect = primary
+            elif stage == "double":
+                stream.close.side_effect = OSError("inert secondary marker close failure")
+            return stream
+
+        marker.path.open.side_effect = fail_marker
+
+    def test_pg_marker_write_and_close_failure_preserves_primary_and_stream(self) -> None:
+        for mode in ("x", "w"):
+            with self.subTest(mode=mode):
+                marker = self.marker_input()
+                primary = OSError("inert first marker write failure")
+                self.inject_marker_failure(marker, "double", primary)
+                with self.assertRaises(FIXTURE.BOUNDS.CleanupFailure) as raised:
+                    FIXTURE.write_marker(marker.path, "bounded marker\n", mode=mode)
+                self.assertIs(primary, raised.exception.primary)
+                self.assertIs(primary, raised.exception.__cause__)
+                self.assertIs(marker.failed_stream, raised.exception.marker_stream)
+                self.assertIn("marker close", raised.exception.cleanup_summary)
+                marker.failed_stream.write.assert_called_once_with("bounded marker\n")
+                marker.failed_stream.close.assert_called_once_with()
+                marker.path.unlink.assert_not_called()
+                marker.path.replace.assert_not_called()
+                self.assertTrue(marker.state.present)
+
+    def test_pg_marker_short_or_unknown_write_closes_without_claiming_success(self) -> None:
+        for written in (0, 3, None, True, MagicMock()):
+            with self.subTest(written=repr(written)):
+                marker = self.marker_input()
+                stream = MagicMock(spec=io.TextIOBase)
+                stream.write.return_value = written
+                marker.path.open.side_effect = None
+                marker.path.open.return_value = stream
+                with self.assertRaisesRegex(OSError, "Incomplete") as raised:
+                    FIXTURE.write_marker(marker.path, "owned\n")
+                self.assertIs(stream, raised.exception.marker_stream)
+                stream.close.assert_called_once_with()
+                marker.path.unlink.assert_not_called()
+                marker.path.replace.assert_not_called()
+
+    def test_pg_marker_utf8_byte_bound_precedes_open(self) -> None:
+        marker = self.marker_input()
+        with patch.object(FIXTURE, "MAX_RECEIPT_BYTES", 6):
+            FIXTURE.write_marker(marker.path, "\u4e2d\u6587")
+        marker.path.open.assert_called_once_with("x", encoding="utf-8", newline="\n")
+        marker.state.streams[0].write.assert_called_once_with("\u4e2d\u6587")
+        marker.state.streams[0].close.assert_called_once_with()
+        oversized = self.marker_input()
+        with patch.object(FIXTURE, "MAX_RECEIPT_BYTES", 5), self.assertRaisesRegex(ValueError, "byte bound"):
+            FIXTURE.write_marker(oversized.path, "\u4e2d\u6587")
+        oversized.path.open.assert_not_called()
+
+    def test_pg_exclusive_lease_creation_failure_preserves_receipt_and_blocks_io(self) -> None:
+        for stage in ("open", "write", "close", "double", "short"):
+            with self.subTest(stage=stage):
+                inputs = self.cleanup_inputs()
+                primary = OSError("inert lease " + stage + " failure")
+                self.inject_marker_failure(inputs.lock, stage, primary)
+                with self.cleanup_scope(inputs), self.assertRaises((OSError, RuntimeError)) as raised:
+                    FIXTURE.verify(inputs.args)
+                if stage in ("open", "write"):
+                    self.assertIs(primary, raised.exception)
+                elif stage == "double":
+                    self.assertIs(primary, raised.exception.primary)
+                if stage != "open":
+                    self.assertIs(inputs.lock.failed_stream, raised.exception.marker_stream)
+                    inputs.lock.failed_stream.close.assert_called_once_with()
+                self.assertEqual(stage != "open", inputs.lock.state.present)
+                self.assertTrue(inputs.state["record_present"])
+                self.assertFalse(inputs.active.state.present)
+                inputs.lock.path.unlink.assert_not_called()
+                inputs.lock.path.replace.assert_not_called()
+                inputs.active.path.open.assert_not_called()
+                inputs.record.unlink.assert_not_called()
+                inputs.manifest.read_text.assert_not_called()
+                inputs.paths["password.txt"].read_text.assert_not_called()
+                inputs.paths["startup.log"].open.assert_not_called()
+                inputs.popen.assert_not_called()
+                inputs.run.assert_not_called()
+                inputs.tree.assert_not_called()
+
+    def test_pg_exclusive_active_creation_failure_keeps_lease_and_blocks_start(self) -> None:
+        for stage in ("open", "write", "close", "double", "short"):
+            with self.subTest(stage=stage):
+                inputs = self.cleanup_inputs()
+                primary = OSError("inert active " + stage + " failure")
+                self.inject_marker_failure(inputs.active, stage, primary)
+                with self.cleanup_scope(inputs), self.assertRaises((OSError, RuntimeError)) as raised:
+                    FIXTURE.verify(inputs.args)
+                if stage in ("open", "write"):
+                    self.assertIs(primary, raised.exception)
+                elif stage == "double":
+                    self.assertIs(primary, raised.exception.primary)
+                if stage != "open":
+                    self.assertIs(inputs.active.failed_stream, raised.exception.marker_stream)
+                    inputs.active.failed_stream.close.assert_called_once_with()
+                self.assertTrue(inputs.lock.state.present)
+                self.assertEqual(stage != "open", inputs.active.state.present)
+                self.assertFalse(inputs.state["record_present"])
+                inputs.lock.path.unlink.assert_not_called()
+                inputs.lock.path.replace.assert_not_called()
+                inputs.active.path.unlink.assert_not_called()
+                inputs.record.unlink.assert_called_once_with(missing_ok=True)
+                inputs.manifest.read_text.assert_called_once_with(encoding="utf-8")
+                inputs.paths["startup.log"].open.assert_not_called()
+                inputs.popen.assert_not_called()
+                inputs.run.assert_not_called()
+                inputs.tree.assert_not_called()
+
+    def test_pg_exclusive_marker_lookup_uncertainty_preserves_old_receipt(self) -> None:
+        for name in ("active", "pid"):
+            with self.subTest(name=name):
+                inputs = self.cleanup_inputs()
+                primary = PermissionError("inert marker metadata failure")
+                marker = inputs.active.path if name == "active" else inputs.pid
+                marker.lstat.side_effect = primary
+                with self.cleanup_scope(inputs), self.assertRaises(PermissionError) as raised:
+                    FIXTURE.verify(inputs.args)
+                self.assertIs(primary, raised.exception)
+                self.assertTrue(inputs.lock.state.present)
+                self.assertTrue(inputs.state["record_present"])
+                inputs.lock.path.unlink.assert_not_called()
+                inputs.lock.path.replace.assert_not_called()
+                inputs.record.unlink.assert_not_called()
+                inputs.manifest.read_text.assert_not_called()
+                inputs.paths["password.txt"].read_text.assert_not_called()
+                inputs.popen.assert_not_called()
+                inputs.run.assert_not_called()
+
+    def test_pg_exclusive_stop_failure_stays_sticky_after_confirmed_fallback(self) -> None:
+        for live_failure in (False, True):
+            with self.subTest(live_failure=live_failure):
+                inputs = self.cleanup_inputs()
+                primary = RuntimeError("inert first live failure") if live_failure else OSError("inert first stop failure")
+                stop_error = OSError("inert later stop failure") if live_failure else primary
+                with self.cleanup_scope(inputs):
+                    inputs.run.side_effect = [primary, stop_error] if live_failure else [
+                        b"test result: ok. 1 passed; 0 failed; 0 ignored;\n", stop_error,
+                    ]
+                    with self.assertRaises((OSError, RuntimeError)) as raised:
+                        FIXTURE.verify(inputs.args)
+                self.assertIs(primary, raised.exception.primary if live_failure else raised.exception)
+                self.assertIs(inputs.job, raised.exception.job)
+                self.assertIs(inputs.process, raised.exception.process)
+                self.assertIs(inputs.args.fixture, raised.exception.fixture_root)
+                inputs.job.wait_empty.assert_called_once()
+                inputs.job.close.assert_called_once_with()
+                self.assertIn("root_wait", inputs.events)
+                self.assertIn("final_pid", inputs.events)
+                self.assertTrue(inputs.lock.state.present)
+                self.assertTrue(inputs.active.state.present)
+                inputs.active.path.unlink.assert_not_called()
+                inputs.lock.path.unlink.assert_not_called()
+                inputs.lock.path.replace.assert_not_called()
+                reads = inputs.manifest.read_text.call_count
+                with self.cleanup_scope(inputs), self.assertRaises(FileExistsError):
+                    FIXTURE.verify(inputs.args)
+                self.assertEqual(reads, inputs.manifest.read_text.call_count)
+                inputs.popen.assert_not_called()
+                inputs.run.assert_not_called()
+                inputs.tree.assert_not_called()
+
+    def test_pg_exclusive_active_release_failure_preserves_primary_and_owners(self) -> None:
+        for live_failure in (False, True):
+            with self.subTest(live_failure=live_failure):
+                inputs = self.cleanup_inputs()
+                primary = RuntimeError("inert first live failure") if live_failure else None
+                inputs.active.path.unlink.side_effect = OSError("inert active unlink failure")
+                with self.cleanup_scope(inputs):
+                    if primary is not None:
+                        inputs.run.side_effect = [primary, b""]
+                    with self.assertRaises(FIXTURE.BOUNDS.CleanupFailure) as raised:
+                        FIXTURE.verify(inputs.args)
+                self.assertIs(primary, raised.exception.primary)
+                self.assertIs(inputs.job, raised.exception.job)
+                self.assertIs(inputs.process, raised.exception.process)
+                self.assertIs(inputs.args.fixture, raised.exception.fixture_root)
+                self.assertIn("active marker release", raised.exception.cleanup_summary)
+                inputs.active.path.unlink.assert_called_once_with()
+                self.assertTrue(inputs.lock.state.present)
+                self.assertTrue(inputs.active.state.present)
+                self.assertFalse(inputs.state["record_present"])
+                inputs.lock.path.unlink.assert_not_called()
+                inputs.lock.path.replace.assert_not_called()
+                self.assertIn("final_pid", inputs.events)
+
+    def test_pg_exclusive_receipt_writer_failures_retain_lease_and_stream(self) -> None:
+        for stage in ("open", "write", "close", "double", "short"):
+            with self.subTest(stage=stage):
+                inputs = self.cleanup_inputs()
+                primary = OSError("inert receipt " + stage + " failure")
+                self.inject_marker_failure(inputs.lock, stage, primary, mode="w")
+                with self.cleanup_scope(inputs), self.assertRaises((OSError, RuntimeError)) as raised:
+                    FIXTURE.verify(inputs.args)
+                if stage in ("open", "write"):
+                    self.assertIs(primary, raised.exception)
+                elif stage == "double":
+                    self.assertIs(primary, raised.exception.primary)
+                if stage != "open":
+                    self.assertIs(inputs.lock.failed_stream, raised.exception.marker_stream)
+                    inputs.lock.failed_stream.close.assert_called_once_with()
+                inputs.active.path.unlink.assert_called_once_with()
+                self.assertFalse(inputs.active.state.present)
+                self.assertTrue(inputs.lock.state.present)
+                self.assertFalse(inputs.state["record_present"])
+                inputs.record.open.assert_not_called()
+                inputs.lock.path.replace.assert_not_called()
+                inputs.lock.path.unlink.assert_not_called()
+                self.assertIn("final_pid", inputs.events)
+
+    def test_pg_exclusive_receipt_replace_failure_never_unlinks_or_signs_success(self) -> None:
+        inputs = self.cleanup_inputs()
+        primary = OSError("inert receipt rename failure")
+        inputs.lock.path.replace.side_effect = primary
+        with self.cleanup_scope(inputs), self.assertRaises(OSError) as raised:
+            FIXTURE.verify(inputs.args)
+        self.assertIs(primary, raised.exception)
+        self.assertTrue(inputs.lock.state.present)
+        self.assertFalse(inputs.active.state.present)
+        self.assertFalse(inputs.state["record_present"])
+        inputs.lock.path.replace.assert_called_once_with(inputs.record)
+        inputs.lock.path.unlink.assert_not_called()
+        inputs.record.unlink.assert_called_once_with(missing_ok=True)
+        inputs.record.open.assert_not_called()
+        self.assertEqual(2, len(inputs.lock.state.streams))
+        for stream in inputs.lock.state.streams:
+            stream.close.assert_called_once_with()
+
+    def test_pg_exclusive_operation_release_failure_preserves_body_primary(self) -> None:
+        inputs = self.mocked_verification_inputs()
+        primary = RuntimeError("inert first operation failure")
+        inputs.lock.path.unlink.side_effect = OSError("inert lease release failure")
+        with self.assertRaises(FIXTURE.BOUNDS.CleanupFailure) as raised:
+            with FIXTURE.operation(inputs.args.fixture):
+                raise primary
+        self.assertIs(primary, raised.exception.primary)
+        self.assertIs(primary, raised.exception.__cause__)
+        self.assertIn("operation release", raised.exception.cleanup_summary)
+        self.assertTrue(inputs.lock.state.present)
+        inputs.lock.path.unlink.assert_called_once_with()
+        inputs.lock.path.replace.assert_not_called()
+        inputs.record.unlink.assert_not_called()
+
+    def test_pg_exclusive_post_effect_rename_error_never_rolls_back_new_owner(self) -> None:
+        inputs = self.cleanup_inputs()
+        primary = OSError("inert interruption after rename committed")
+        publish = inputs.lock.path.replace.side_effect
+
+        def committed_then_interrupted(destination):
+            publish(destination)
+            # Model a cooperating next invocation acquiring the freed leaf
+            # before the previous caller observes its interrupted return.
+            inputs.lock.state.present = True
+            inputs.lock.state.text = "next operation owns this leaf\n"
+            raise primary
+
+        inputs.lock.path.replace.side_effect = committed_then_interrupted
+        with self.cleanup_scope(inputs), self.assertRaises(OSError) as raised:
+            FIXTURE.verify(inputs.args)
+        self.assertIs(primary, raised.exception)
+        self.assertTrue(inputs.lock.state.present)
+        self.assertEqual("next operation owns this leaf\n", inputs.lock.state.text)
+        self.assertTrue(inputs.state["record_present"])
+        inputs.lock.path.unlink.assert_not_called()
+        inputs.lock.path.replace.assert_called_once_with(inputs.record)
+        inputs.record.unlink.assert_called_once_with(missing_ok=True)
+        inputs.record.open.assert_not_called()
+
+    def test_pg_exclusive_dangling_fence_is_present_even_when_exists_is_false(self) -> None:
+        for name in ("active", "pid"):
+            with self.subTest(name=name):
+                inputs = self.cleanup_inputs()
+                marker = inputs.active.path if name == "active" else inputs.pid
+                marker.exists.side_effect = None
+                marker.exists.return_value = False
+                marker.lstat.side_effect = None
+                marker.lstat.return_value = SimpleNamespace(st_mode=0o120777)
+                with self.cleanup_scope(inputs), self.assertRaisesRegex(ValueError, "active|running"):
+                    FIXTURE.verify(inputs.args)
+                self.assertTrue(inputs.lock.state.present)
+                self.assertTrue(inputs.state["record_present"])
+                inputs.record.unlink.assert_not_called()
+                inputs.manifest.read_text.assert_not_called()
+                inputs.popen.assert_not_called()
+                inputs.run.assert_not_called()
+
+    def test_pg_exclusive_nested_contender_cannot_disturb_admitted_verification(self) -> None:
+        inputs = self.cleanup_inputs()
+        live_run = inputs.live_run
+        nested = []
+
+        def contend(command, *args, **kwargs):
+            if command[1] != "stop":
+                self.assertTrue(inputs.lock.state.present)
+                self.assertTrue(inputs.active.state.present)
+                before = (inputs.manifest.read_text.call_count, inputs.record.unlink.call_count,
+                          inputs.paths["password.txt"].read_text.call_count, inputs.popen.call_count)
+                with self.assertRaises(FileExistsError):
+                    FIXTURE.verify(inputs.args)
+                after = (inputs.manifest.read_text.call_count, inputs.record.unlink.call_count,
+                         inputs.paths["password.txt"].read_text.call_count, inputs.popen.call_count)
+                self.assertEqual(before, after)
+                inputs.lock.path.unlink.assert_not_called()
+                inputs.active.path.unlink.assert_not_called()
+                inputs.lock.path.replace.assert_not_called()
+                nested.append("rejected")
+            return live_run(command, *args, **kwargs)
+
+        inputs.live_run = contend
+        with self.cleanup_scope(inputs):
+            FIXTURE.verify(inputs.args)
+        self.assertEqual(["rejected"], nested)
+        inputs.popen.assert_called_once()
+        self.assertEqual(2, inputs.run.call_count)
+        self.assertEqual(1, inputs.events.count("stop"))
+        inputs.record.unlink.assert_called_once_with(missing_ok=True)
+        inputs.active.path.unlink.assert_called_once_with()
+        inputs.lock.path.replace.assert_called_once_with(inputs.record)
+        self.assertFalse(inputs.lock.state.present)
+        self.assertFalse(inputs.active.state.present)
+        self.assertTrue(inputs.state["record_present"])
+
+    def test_pg_exclusive_unknown_popen_constructor_keeps_fences_without_pid(self) -> None:
+        for primary in (OSError("inert interrupted constructor"), KeyboardInterrupt("inert interrupted constructor")):
+            with self.subTest(primary=type(primary).__name__):
+                inputs = self.cleanup_inputs()
+                inputs.pid.exists.side_effect = None
+                inputs.pid.exists.return_value = False
+                with self.cleanup_scope(inputs):
+                    inputs.popen.side_effect = primary
+                    with self.assertRaises(FIXTURE.BOUNDS.CleanupFailure) as raised:
+                        FIXTURE.verify(inputs.args)
+                self.assertIs(primary, raised.exception.primary)
+                self.assertIsNone(raised.exception.process)
+                self.assertIsNone(raised.exception.job)
+                self.assertIs(inputs.args.fixture, raised.exception.fixture_root)
+                self.assertTrue(inputs.lock.state.present)
+                self.assertTrue(inputs.active.state.present)
+                self.assertFalse(inputs.state["record_present"])
+                inputs.popen.assert_called_once()
+                inputs.run.assert_not_called()
+                inputs.tree.assert_not_called()
+                inputs.job.terminate.assert_not_called()
+                inputs.job.close.assert_not_called()
+                inputs.active.path.unlink.assert_not_called()
+                inputs.lock.path.unlink.assert_not_called()
+                inputs.lock.path.replace.assert_not_called()
+
+    def test_pg_exclusive_startup_log_open_failure_releases_known_prelaunch_fences(self) -> None:
+        inputs = self.cleanup_inputs()
+        primary = OSError("inert startup log open failure")
+        inputs.paths["startup.log"].open.side_effect = primary
+        inputs.pid.exists.side_effect = None
+        inputs.pid.exists.return_value = False
+        with self.cleanup_scope(inputs), self.assertRaises(OSError) as raised:
+            FIXTURE.verify(inputs.args)
+        self.assertIs(primary, raised.exception)
+        inputs.popen.assert_not_called()
+        inputs.run.assert_not_called()
+        inputs.tree.assert_not_called()
+        inputs.active.path.unlink.assert_called_once_with()
+        inputs.lock.path.unlink.assert_called_once_with()
+        inputs.lock.path.replace.assert_not_called()
+        self.assertFalse(inputs.active.state.present)
+        self.assertFalse(inputs.lock.state.present)
+        self.assertFalse(inputs.state["record_present"])
+
+    @staticmethod
+    def file_only_scope() -> ExitStack:
+        stack = ExitStack()
+        for owner, name in ((FIXTURE.subprocess, "Popen"), (FIXTURE.subprocess, "run"),
+                            (FIXTURE.socket, "socket"), (FIXTURE.BOUNDS, "run_bounded")):
+            stack.enter_context(patch.object(owner, name, side_effect=AssertionError("file-only contract forbids processes and network")))
+        stack.enter_context(patch.object(FIXTURE, "SECRET", ""))
+        return stack
+
+    def test_pg_exclusive_real_files_publish_receipt_and_release_in_one_rename(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ku-pg-lease-files-") as raw, self.file_only_scope():
+            root = Path(raw)
+            lock, record = root / "operation.lock", root / "verification.json"
+            FIXTURE.write_marker(record, "previous receipt\n")
+            with FIXTURE.operation(root) as owned:
+                self.assertTrue(lock.is_file())
+                with self.assertRaises(FileExistsError):
+                    with FIXTURE.operation(root):
+                        self.fail("a nested file lease entered the protected body")
+                self.assertEqual("previous receipt\n", record.read_text(encoding="utf-8"))
+                owned.receipt = {"live_test_passed": True, "server_stopped": True}
+                self.assertTrue(lock.is_file())
+            self.assertFalse(lock.exists())
+            self.assertEqual({"live_test_passed": True, "server_stopped": True},
+                             json.loads(record.read_text(encoding="utf-8")))
+            self.assertEqual({"verification.json"}, {entry.name for entry in root.iterdir()})
+
+    def test_pg_exclusive_real_directory_lock_cannot_be_adopted(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ku-pg-lease-directory-") as raw, self.file_only_scope():
+            root = Path(raw)
+            lock = root / "operation.lock"
+            lock.mkdir()
+            record = root / "verification.json"
+            FIXTURE.write_marker(record, "previous receipt\n")
+            with self.assertRaises(OSError):
+                with FIXTURE.operation(root):
+                    self.fail("a directory is not a newly acquired lease")
+            self.assertTrue(lock.is_dir())
+            self.assertEqual("previous receipt\n", record.read_text(encoding="utf-8"))
+            self.assertEqual({"operation.lock", "verification.json"}, {path.name for path in root.iterdir()})
+
+    def test_pg_exclusive_real_files_distinguish_clean_failure_from_uncertainty(self) -> None:
+        for uncertain in (False, True):
+            with self.subTest(uncertain=uncertain), tempfile.TemporaryDirectory(prefix="ku-pg-lease-failure-") as raw, self.file_only_scope():
+                root = Path(raw)
+                lock, active, record = (root / name for name in ("operation.lock", "server.active", "verification.json"))
+                primary = RuntimeError("inert file operation failure")
+                with self.assertRaises(RuntimeError) as raised:
+                    with FIXTURE.operation(root) as owned:
+                        owned.uncertain = uncertain
+                        if uncertain:
+                            FIXTURE.write_marker(active, "unknown cleanup\n")
+                        raise primary
+                self.assertIs(primary, raised.exception)
+                self.assertEqual(uncertain, lock.exists())
+                self.assertEqual(uncertain, active.exists())
+                self.assertFalse(record.exists())
+                if uncertain:
+                    original = lock.read_bytes()
+                    with self.assertRaises(FileExistsError):
+                        with FIXTURE.operation(root):
+                            self.fail("uncertain file owner was silently adopted")
+                    self.assertEqual(original, lock.read_bytes())
+
+    def test_pg_exclusive_receipt_bound_and_secret_refusal_leave_lease(self) -> None:
+        for secret, value, message in (("", "x" * (FIXTURE.MAX_RECEIPT_BYTES + 1), "byte bound"),
+                                       ("inert-private-credential", "inert-private-credential", "credential-bearing")):
+            with self.subTest(message=message):
+                inputs = self.mocked_verification_inputs()
+                with patch.object(FIXTURE, "SECRET", secret), self.assertRaisesRegex(ValueError, message) as raised:
+                    with FIXTURE.operation(inputs.args.fixture) as owned:
+                        owned.receipt = {"value": value}
+                self.assertTrue(inputs.lock.state.present)
+                self.assertTrue(inputs.state["record_present"])
+                self.assertNotIn("inert-private-credential", str(raised.exception))
+                inputs.lock.path.open.assert_called_once_with("x", encoding="utf-8", newline="\n")
+                inputs.lock.path.replace.assert_not_called()
+                inputs.lock.path.unlink.assert_not_called()
+                inputs.record.unlink.assert_not_called()
+
+    @staticmethod
+    def prepare_inputs() -> argparse.Namespace:
+        installed, perl = MagicMock(spec=Path), MagicMock(spec=Path)
+        installed.resolve.return_value = Path("inert-installed")
+        perl.resolve.return_value = Path("inert-perl")
+        return argparse.Namespace(installed_root=installed, perl=perl, source_archive=None)
+
+    def test_pg_prepare_conservative_assembly_failure_retains_lease_and_blocks_verify(self) -> None:
+        for phase in ("assembly", "initializer_unknown", "manifest"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(prefix="ku-pg-prepare-failure-") as raw, self.file_only_scope():
+                target = Path(raw)
+                root = target / (FIXTURE.PREFIX + "1" * 32)
+                root.mkdir()
+                args = self.prepare_inputs()
+                primary = RuntimeError("inert " + phase + " failure")
+                if phase == "initializer_unknown":
+                    primary = FIXTURE.BOUNDS.CleanupFailure("inert initializer owner unconfirmed")
+                    primary.job = MagicMock()
+                    primary.process = MagicMock()
+
+                def assemble(actual_args, actual_root, installed, perl):
+                    self.assertIs(args, actual_args)
+                    self.assertEqual(root, actual_root)
+                    self.assertEqual(args.installed_root.resolve.return_value, installed)
+                    self.assertEqual(args.perl.resolve.return_value, perl)
+                    self.assertTrue((root / "operation.lock").is_file())
+                    if phase == "manifest":
+                        FIXTURE.write_marker(root / "fixture.json", "{inert partial manifest")
+                    raise primary
+
+                with patch.object(FIXTURE, "os", SimpleNamespace(name="nt")), \
+                     patch.object(FIXTURE, "TARGET", target), \
+                     patch.object(FIXTURE, "private_fixture", return_value=root), \
+                     patch.object(FIXTURE, "prepare_owned", side_effect=assemble) as assembler, \
+                     patch.object(FIXTURE, "run", return_value=b"postgres (PostgreSQL) 17.10\n") as run, \
+                     patch("sys.stdout", new_callable=io.StringIO):
+                    with self.assertRaises(RuntimeError) as raised:
+                        FIXTURE.prepare(args)
+                    self.assertIs(primary, raised.exception)
+                    if phase == "initializer_unknown":
+                        self.assertIs(primary.job, raised.exception.job)
+                        self.assertIs(primary.process, raised.exception.process)
+                    assembler.assert_called_once()
+                    self.assertTrue((root / "operation.lock").is_file())
+                    self.assertEqual(phase == "manifest", (root / "fixture.json").exists())
+                    self.assertFalse((root / "verification.json").exists())
+                    with self.assertRaises(FileExistsError):
+                        FIXTURE.verify(argparse.Namespace(fixture=root))
+                    run.assert_called_once_with(
+                        [str(args.installed_root.resolve.return_value / "bin" / "postgres.exe"), "--version"],
+                        FIXTURE.REPO, "check PostgreSQL version")
+
+    def test_pg_prepare_success_releases_lease_only_after_manifest_closes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ku-pg-prepare-success-") as raw, self.file_only_scope():
+            root = Path(raw)
+            args = self.prepare_inputs()
+            events = []
+            manifest = {"format": 1, "version": FIXTURE.VERSION}
+            original_unlink = Path.unlink
+
+            def assemble(actual_args, actual_root, installed, perl):
+                self.assertIs(args, actual_args)
+                self.assertEqual(root, actual_root)
+                self.assertTrue((root / "operation.lock").is_file())
+                events.append("assembly")
+                FIXTURE.write_marker(root / "fixture.json", json.dumps(manifest) + "\n")
+                events.append("manifest_closed")
+
+            def release(path, *args, **kwargs):
+                self.assertEqual(root / "operation.lock", path)
+                self.assertEqual(["assembly", "manifest_closed"], events)
+                self.assertEqual(manifest, json.loads((root / "fixture.json").read_text(encoding="utf-8")))
+                events.append("lease_release")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(FIXTURE, "os", SimpleNamespace(name="nt")), \
+                 patch.object(FIXTURE, "private_fixture", return_value=root), \
+                 patch.object(FIXTURE, "prepare_owned", side_effect=assemble) as assembler, \
+                 patch.object(FIXTURE, "run", return_value=b"postgres (PostgreSQL) 17.10\n") as run, \
+                 patch.object(Path, "unlink", autospec=True, side_effect=release), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(root, FIXTURE.prepare(args))
+            assembler.assert_called_once()
+            run.assert_called_once()
+            self.assertEqual(["assembly", "manifest_closed", "lease_release"], events)
+            self.assertFalse((root / "operation.lock").exists())
+            self.assertFalse((root / "verification.json").exists())
+            self.assertEqual(manifest, json.loads((root / "fixture.json").read_text(encoding="utf-8")))
+
+    def test_pg_prepare_release_failure_retains_complete_manifest_but_blocks_verify(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ku-pg-prepare-release-") as raw, self.file_only_scope():
+            target = Path(raw)
+            root = target / (FIXTURE.PREFIX + "2" * 32)
+            root.mkdir()
+            args = self.prepare_inputs()
+            manifest = {"format": 1, "version": FIXTURE.VERSION}
+
+            def assemble(*_):
+                self.assertTrue((root / "operation.lock").is_file())
+                FIXTURE.write_marker(root / "fixture.json", json.dumps(manifest) + "\n")
+
+            with patch.object(FIXTURE, "os", SimpleNamespace(name="nt")), \
+                 patch.object(FIXTURE, "TARGET", target), \
+                 patch.object(FIXTURE, "private_fixture", return_value=root), \
+                 patch.object(FIXTURE, "prepare_owned", side_effect=assemble), \
+                 patch.object(FIXTURE, "run", return_value=b"postgres (PostgreSQL) 17.10\n") as run, \
+                 patch.object(Path, "unlink", autospec=True, side_effect=OSError("inert prepare lease release failure")), \
+                 patch("sys.stdout", new_callable=io.StringIO):
+                with self.assertRaisesRegex(FIXTURE.BOUNDS.CleanupFailure, "operation release"):
+                    FIXTURE.prepare(args)
+                self.assertTrue((root / "operation.lock").is_file())
+                self.assertEqual(manifest, json.loads((root / "fixture.json").read_text(encoding="utf-8")))
+                with self.assertRaises(FileExistsError):
+                    FIXTURE.verify(argparse.Namespace(fixture=root))
+                run.assert_called_once()
+            self.assertFalse((root / "verification.json").exists())
+
+    def test_pg_private_fixture_uuid_collision_never_overwrites_existing_owner(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ku-pg-uuid-collision-") as raw, self.file_only_scope():
+            target = Path(raw)
+            token = "3" * 32
+            root = target / (FIXTURE.PREFIX + token)
+            root.mkdir()
+            contents = {"operation.lock": "existing owner\n", "server.active": "unknown server\n",
+                        "fixture.json": "existing manifest\n", "verification.json": "existing receipt\n"}
+            for name, value in contents.items():
+                FIXTURE.write_marker(root / name, value)
+            with patch.object(FIXTURE, "TARGET", target), \
+                 patch.object(FIXTURE.uuid, "uuid4", return_value=SimpleNamespace(hex=token)) as identity, \
+                 patch.object(FIXTURE, "run", side_effect=AssertionError("UUID collision must not reach ACL/process calls")) as run:
+                with self.assertRaises(FileExistsError):
+                    FIXTURE.private_fixture()
+            identity.assert_called_once_with()
+            run.assert_not_called()
+            self.assertEqual(set(contents), {entry.name for entry in root.iterdir()})
+            for name, value in contents.items():
+                self.assertEqual(value, (root / name).read_text(encoding="utf-8"))
+
+    def test_pg_exclusive_contender_does_not_mutate_or_start(self) -> None:
+        inputs = self.cleanup_inputs()
+        inputs.lock.state.present = True
+        with self.cleanup_scope(inputs), self.assertRaises(FileExistsError):
+            FIXTURE.verify(inputs.args)
+        self.assertTrue(inputs.lock.state.present)
+        self.assertTrue(inputs.state["record_present"])
+        inputs.record.unlink.assert_not_called()
+        inputs.manifest.read_text.assert_not_called()
+        inputs.paths["password.txt"].read_text.assert_not_called()
+        inputs.paths["startup.log"].open.assert_not_called()
+        inputs.run.assert_not_called()
+        inputs.tree.assert_not_called()
+
+    def test_pg_exclusive_active_without_pid_refuses_before_receipt_invalidation(self) -> None:
+        inputs = self.cleanup_inputs()
+        inputs.active.state.present = True
+        with self.cleanup_scope(inputs), self.assertRaisesRegex(ValueError, "active|running"):
+            FIXTURE.verify(inputs.args)
+        self.assertTrue(inputs.active.state.present)
+        self.assertTrue(inputs.state["record_present"])
+        inputs.record.unlink.assert_not_called()
+        inputs.manifest.read_text.assert_not_called()
+        inputs.run.assert_not_called()
+        inputs.tree.assert_not_called()
+
+    def test_pg_exclusive_failed_start_with_late_pid_never_authorizes_stop(self) -> None:
+        for startup in (1, subprocess.TimeoutExpired("inert startup", 25)):
+            with self.subTest(startup=type(startup).__name__):
+                inputs = self.cleanup_inputs()
+                inputs.pid.exists.side_effect = [False, True, True]
+                inputs.process.wait.side_effect = [startup, 0]
+                with self.cleanup_scope(inputs), self.assertRaises((RuntimeError, subprocess.TimeoutExpired)):
+                    FIXTURE.verify(inputs.args)
+                inputs.run.assert_not_called()
+                inputs.tree.assert_called_once_with(inputs.process, inputs.job)
+                inputs.job.wait_empty.assert_called_once()
+                inputs.job.close.assert_called_once_with()
+                inputs.record.open.assert_not_called()
+
+    def test_pg_exclusive_cleanup_uncertainty_fences_rerun_without_pid(self) -> None:
+        for failure in ("job_drain", "job_close", "root_wait"):
+            with self.subTest(failure=failure):
+                inputs = self.cleanup_inputs(failure)
+                inputs.pid.exists.side_effect = None
+                inputs.pid.exists.return_value = False
+                with self.cleanup_scope(inputs), self.assertRaises(RuntimeError):
+                    FIXTURE.verify(inputs.args)
+                self.assertTrue(inputs.lock.state.present)
+                self.assertTrue(inputs.active.state.present)
+                inputs.record.open.assert_not_called()
+                with self.cleanup_scope(inputs), self.assertRaises(FileExistsError):
+                    FIXTURE.verify(inputs.args)
+                inputs.tree.assert_not_called()
+                inputs.run.assert_not_called()
 
     def test_pg_cleanup_failures_attempt_independent_steps_and_forbid_receipt(self) -> None:
         for failure in ("stop_pid", "stop", "job_terminate", "job_drain", "job_close", "root_poll", "root_kill", "root_wait", "final_pid"):
@@ -256,6 +978,10 @@ class PgFixtureTests(unittest.TestCase):
                 inputs.numeric.assert_not_called()
                 inputs.record.open.assert_not_called()
 
+                self.assertTrue(inputs.lock.state.present)
+                self.assertTrue(inputs.active.state.present)
+                inputs.lock.path.replace.assert_not_called()
+
     def test_pg_cleanup_failure_preserves_original_live_error(self) -> None:
         for failure in ("stop", "job_terminate", "job_drain", "job_close", "root_wait", "final_pid"):
             with self.subTest(failure=failure):
@@ -267,13 +993,36 @@ class PgFixtureTests(unittest.TestCase):
 
     def test_pg_cleanup_mock_success_receipt_follows_all_checks(self) -> None:
         inputs = self.cleanup_inputs()
-        with self.cleanup_scope(inputs):
-            FIXTURE.verify(inputs.args)
-        self.assertEqual([
+        expected = [
             "initial_pid", "startup_wait", "live", "stop_pid", "stop", "job_terminate",
             "root_poll", "root_kill", "job_drain", "job_close", "root_wait", "final_pid",
-        ], inputs.events)
-        inputs.record.open.assert_called_once_with("w", encoding="utf-8", newline="\n")
+        ]
+        publish = inputs.lock.path.replace.side_effect
+
+        def publish_after_cleanup(destination):
+            self.assertEqual(expected, inputs.events)
+            inputs.active.path.unlink.assert_called_once_with()
+            self.assertFalse(inputs.active.state.present)
+            return publish(destination)
+
+        inputs.lock.path.replace.side_effect = publish_after_cleanup
+        with self.cleanup_scope(inputs):
+            FIXTURE.verify(inputs.args)
+        self.assertEqual(expected, inputs.events)
+        self.assertEqual([
+            call("x", encoding="utf-8", newline="\n"),
+            call("w", encoding="utf-8", newline="\n"),
+        ], inputs.lock.path.open.call_args_list)
+        inputs.lock.path.replace.assert_called_once_with(inputs.record)
+        inputs.lock.path.unlink.assert_not_called()
+        inputs.record.open.assert_not_called()
+        self.assertFalse(inputs.lock.state.present)
+        self.assertTrue(inputs.state["record_present"])
+        receipt = json.loads(inputs.state["receipt_text"])
+        self.assertIs(True, receipt["live_test_passed"])
+        self.assertIs(True, receipt["server_stopped"])
+        self.assertEqual(FIXTURE.SOURCE_SHA256, receipt["source_sha256"])
+        self.assertNotIn("inert-contract-password", inputs.state["receipt_text"])
         inputs.numeric.assert_not_called()
 
     def test_pg_cleanup_held_root_wait_uses_remaining_five_second_budget(self) -> None:
@@ -440,7 +1189,11 @@ class PgFixtureTests(unittest.TestCase):
         self.assertLess(inputs.events.index("job_drain"), inputs.events.index("job_close"))
         self.assertEqual(2.0, inputs.process.wait.call_args.kwargs["timeout"])
         self.assertEqual(25, inputs.run.call_args.args[3])
-        inputs.record.open.assert_called_once_with("w", encoding="utf-8", newline="\n")
+        inputs.record.open.assert_not_called()
+        inputs.lock.path.replace.assert_called_once_with(inputs.record)
+        inputs.lock.path.unlink.assert_not_called()
+        self.assertFalse(inputs.lock.state.present)
+        self.assertTrue(inputs.state["record_present"])
 
     @unittest.skipUnless(os.name == "nt", "real harmless Windows process / Job contract")
     def test_pg_real_suspended_root_job_order_and_failed_assignment(self) -> None:
