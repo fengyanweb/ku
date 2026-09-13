@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import traceback
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, call, patch
@@ -1355,6 +1356,460 @@ class PgFixtureTests(unittest.TestCase):
         self.assertNotIn("private-credential", str(raised.exception))
         self.assertNotIn("a" * 32, str(raised.exception))
         self.assertEqual(original, FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS)
+
+    @staticmethod
+    def run_owner_inputs(message: str = "inert ToolHelp failure") -> SimpleNamespace:
+        job = MagicMock(spec=("terminate", "wait_empty", "close"))
+        process = MagicMock(spec=("poll", "kill", "wait"))
+        stream = MagicMock(spec=("close",))
+        reader = MagicMock(spec=("join", "is_alive"))
+        readers = [(stream, reader, True)]
+        handles = MagicMock(spec=("snapshot", "thread", "close_snapshot", "close_thread"))
+        handles.snapshot, handles.thread = object(), object()
+        toolhelp = RuntimeError(message)
+        toolhelp.toolhelp_handles = handles
+        cleanup = FIXTURE.BOUNDS.CleanupFailure("Job close (OSError)", toolhelp)
+        cleanup.__cause__ = toolhelp
+        shared = SystemExit(f"native CI verification failed: {cleanup}")
+        shared.job, shared.process, shared.readers = job, process, readers
+        shared.__cause__ = cleanup
+        return SimpleNamespace(
+            shared=shared, cleanup=cleanup, toolhelp=toolhelp, handles=handles,
+            job=job, process=process, readers=readers,
+            owners=(job, process, stream, reader, handles),
+        )
+
+    def run_owner_scope(self) -> ExitStack:
+        stack = ExitStack()
+        stack.enter_context(self.file_only_scope())
+        for owner, name in ((FIXTURE.BOUNDS.threading, "Thread"),
+                            (FIXTURE.BOUNDS.WindowsJob, "attach"),
+                            (FIXTURE.BOUNDS, "resume_suspended_windows_process"),
+                            (FIXTURE.BOUNDS, "kill_process_tree")):
+            stack.enter_context(patch.object(owner, name,
+                                            side_effect=AssertionError("adapter-only contract forbids resource operations")))
+        return stack
+
+    def test_pg_run_owner_preserves_immediate_exception(self) -> None:
+        inputs = self.run_owner_inputs()
+        direct = RuntimeError("inert direct failure")
+        direct.primary = object()
+        existing_primary = direct.primary
+        setup = FIXTURE.BOUNDS.WindowsJobSetupError(inputs.job, OSError("inert attach failure"))
+        original_timeout = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        command = ["inert-command"]
+        for primary in (inputs.shared, direct, OSError(5, "inert direct I/O failure"), setup, inputs.cleanup):
+            original_args, original_cause = primary.args, primary.__cause__
+
+            def fail_command(*args):
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 3)
+                raise primary
+
+            with self.subTest(error_type=type(primary).__name__), self.run_owner_scope(), \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=fail_command) as bounded:
+                with self.assertRaises(RuntimeError) as raised:
+                    FIXTURE.run(command, FIXTURE.REPO, "inert adapter", 3)
+                wrapped = raised.exception
+                bounded.assert_called_once_with(command, FIXTURE.REPO, "inert adapter")
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original_timeout)
+                self.assertIs(type(wrapped), RuntimeError)
+                # from None already preserves this suppressed implicit link;
+                # the new requirement is an explicit link, not a leak claim.
+                self.assertIs(wrapped.__context__, primary)
+                self.assertTrue(wrapped.__suppress_context__)
+                self.assertIsNone(wrapped.__cause__)
+                self.assertEqual(primary.args, original_args)
+                self.assertIs(primary.__cause__, original_cause)
+                self.assertIs(direct.primary, existing_primary)
+                self.assertIs(setup.job, inputs.job)
+                for owner in inputs.owners:
+                    self.assertEqual(owner.mock_calls, [])
+                for attribute in ("job", "process", "readers", "toolhelp_handles"):
+                    self.assertFalse(hasattr(wrapped, attribute), "adapter must not flatten owner layers")
+                self.assertIs(getattr(wrapped, "primary", None), primary,
+                              "adapter must explicitly retain its immediate original exception")
+                self.assertIs(inputs.shared.job, inputs.job)
+                self.assertIs(inputs.shared.process, inputs.process)
+                self.assertIs(inputs.shared.readers, inputs.readers)
+                self.assertIs(inputs.shared.__cause__, inputs.cleanup)
+                self.assertIs(inputs.cleanup.primary, inputs.toolhelp)
+                self.assertIs(inputs.cleanup.__cause__, inputs.toolhelp)
+                self.assertIs(inputs.toolhelp.toolhelp_handles, inputs.handles)
+
+    def test_pg_run_owner_redacts_default_traceback(self) -> None:
+        secret = "private-credential-" + "a" * 2048 + "-private-tail"
+        inputs = self.run_owner_inputs(f"command failed: {secret}; repeated: {secret}")
+        original_timeout = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        with self.run_owner_scope(), patch.object(FIXTURE, "SECRET", secret), \
+             patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=inputs.shared) as bounded, \
+             patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            try:
+                FIXTURE.run(["inert-command"], FIXTURE.REPO, "inert redaction", 3)
+            except RuntimeError as error:
+                wrapped = error
+                rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            else:
+                self.fail("inert command failure must not return success")
+            bounded.assert_called_once_with(["inert-command"], FIXTURE.REPO, "inert redaction")
+            self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original_timeout)
+            self.assertEqual(str(wrapped), "native CI verification failed: command failed: <redacted>; "
+                             "repeated: <redacted>; cleanup failed: Job close (OSError)")
+            for output in (str(wrapped), rendered, stdout.getvalue(), stderr.getvalue()):
+                for forbidden in (secret, "private-credential", "a" * 32, "private-tail"):
+                    self.assertNotIn(forbidden, output)
+            self.assertIn("RuntimeError: native CI verification failed:", rendered)
+            self.assertIs(wrapped.__context__, inputs.shared)
+            self.assertTrue(wrapped.__suppress_context__)
+            self.assertIsNone(wrapped.__cause__)
+            self.assertIn(secret, str(inputs.shared))
+            self.assertIn(secret, str(inputs.toolhelp))
+            for owner in inputs.owners:
+                self.assertEqual(owner.mock_calls, [])
+            self.assertIs(getattr(wrapped, "primary", None), inputs.shared,
+                          "redaction must preserve the original node without displaying its raw chain")
+            self.assertIs(inputs.shared.__cause__, inputs.cleanup)
+            self.assertIs(inputs.cleanup.primary, inputs.toolhelp)
+            self.assertIs(inputs.toolhelp.toolhelp_handles, inputs.handles)
+
+    def test_pg_run_owner_main_preserves_adapter_chain(self) -> None:
+        original_timeout = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        secret = "inert-main-private-credential"
+        for mode in ("prepare", "verify"):
+            inputs = self.run_owner_inputs(f"command failed: {secret}")
+            args = argparse.Namespace(command=mode)
+            adapters = []
+
+            def invoke_run(actual_args):
+                self.assertIs(actual_args, args)
+                try:
+                    return FIXTURE.run(["inert-command"], FIXTURE.REPO, "inert main adapter", 3)
+                except RuntimeError as error:
+                    adapters.append(error)
+                    raise
+
+            def fail_command(*args):
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 3)
+                raise inputs.shared
+
+            with self.subTest(mode=mode), self.run_owner_scope(), \
+                 patch.object(FIXTURE, "SECRET", secret), \
+                 patch.object(FIXTURE.argparse.ArgumentParser, "parse_args", return_value=args) as parse_args, \
+                 patch.object(FIXTURE, "prepare", side_effect=invoke_run) as prepare, \
+                 patch.object(FIXTURE, "verify", side_effect=invoke_run) as verify, \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=fail_command) as bounded, \
+                 patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+                 patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                try:
+                    FIXTURE.main()
+                except SystemExit as error:
+                    wrapped = error
+                    rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+                else:
+                    self.fail("main must report the inert command failure")
+                parse_args.assert_called_once_with()
+                (prepare if mode == "prepare" else verify).assert_called_once_with(args)
+                (verify if mode == "prepare" else prepare).assert_not_called()
+                bounded.assert_called_once_with(["inert-command"], FIXTURE.REPO, "inert main adapter")
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original_timeout)
+                self.assertEqual(len(adapters), 1)
+                adapter = adapters[0]
+                self.assertIs(type(wrapped), SystemExit)
+                self.assertEqual(str(wrapped), "PG loopback fixture failed: native CI verification failed: "
+                                 "command failed: <redacted>; cleanup failed: Job close (OSError)")
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertNotIn(secret, rendered)
+                self.assertIs(wrapped.__context__, adapter)
+                self.assertTrue(wrapped.__suppress_context__)
+                self.assertIsNone(wrapped.__cause__)
+                self.assertIs(adapter.__context__, inputs.shared)
+                for owner in inputs.owners:
+                    self.assertEqual(owner.mock_calls, [])
+                for wrapper in (wrapped, adapter):
+                    for attribute in ("job", "process", "readers", "toolhelp_handles"):
+                        self.assertFalse(hasattr(wrapper, attribute), "owner layers must remain distinct")
+                self.assertIs(getattr(wrapped, "primary", None), adapter,
+                              "main must retain the immediate redacted run adapter")
+                self.assertIs(getattr(adapter, "primary", None), inputs.shared)
+                self.assertIs(inputs.shared.job, inputs.job)
+                self.assertIs(inputs.shared.process, inputs.process)
+                self.assertIs(inputs.shared.readers, inputs.readers)
+                self.assertIs(inputs.shared.__cause__, inputs.cleanup)
+                self.assertIs(inputs.cleanup.primary, inputs.toolhelp)
+                self.assertIs(inputs.cleanup.__cause__, inputs.toolhelp)
+                self.assertIs(inputs.toolhelp.toolhelp_handles, inputs.handles)
+
+    def test_pg_run_owner_success_preserves_bytes_and_timeout(self) -> None:
+        original_timeout = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        command = ["inert-command", "--binary"]
+        cwd = MagicMock(spec=Path)
+        secret = "inert-success-credential"
+        raw = b"\x00\xffinert-success-credential\n"
+        for output, diagnostic, include_stderr in (
+            (raw, b"stderr\x00\xfe", False),
+            (raw, b"stderr\x00\xfe", True),
+            (b"", b"stderr\x00\xfe", False),
+            (b"", b"stderr\x00\xfe", True),
+        ):
+            completed = subprocess.CompletedProcess(command, 0, output, diagnostic)
+
+            def complete_command(*args):
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 3)
+                return completed
+
+            with self.subTest(empty=not output, include_stderr=include_stderr), self.run_owner_scope(), \
+                 patch.object(FIXTURE, "SECRET", secret), \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=complete_command) as bounded:
+                actual = FIXTURE.run(command, cwd, "inert binary output", 3, include_stderr=include_stderr)
+                self.assertEqual(actual, output + diagnostic if include_stderr else output)
+                self.assertIsInstance(actual, bytes)
+                self.assertEqual(completed.stdout, output)
+                self.assertEqual(completed.stderr, diagnostic)
+                bounded.assert_called_once_with(command, cwd, "inert binary output")
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original_timeout)
+                if output:
+                    self.assertIn(secret.encode(), actual, "generic successful bytes are not a new redaction boundary")
+
+    def test_pg_run_owner_uncaught_control_flow_restores_timeout(self) -> None:
+        original_timeout = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        command = ["inert-command"]
+        for primary in (KeyboardInterrupt("inert interrupt"), GeneratorExit("inert generator exit"),
+                        ValueError("inert value failure"),
+                        subprocess.TimeoutExpired(command, 3, output=b"out", stderr=b"err")):
+            original_args = primary.args
+
+            def fail_command(*args):
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 3)
+                raise primary
+
+            with self.subTest(error_type=type(primary).__name__), self.run_owner_scope(), \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=fail_command) as bounded:
+                with self.assertRaises(type(primary)) as raised:
+                    FIXTURE.run(command, FIXTURE.REPO, "inert control boundary", 3)
+                self.assertIs(raised.exception, primary)
+                self.assertEqual(primary.args, original_args)
+                self.assertFalse(hasattr(primary, "primary"))
+                bounded.assert_called_once_with(command, FIXTURE.REPO, "inert control boundary")
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original_timeout)
+
+    def test_pg_run_owner_main_keeps_catch_and_parser_boundaries(self) -> None:
+        original_timeout = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        secret = "inert-main-boundary-credential"
+        cases = (
+            ("entry", OSError(5, secret), True),
+            ("entry", RuntimeError(secret), True),
+            ("entry", ValueError(secret), True),
+            ("entry", subprocess.TimeoutExpired(["inert-command", secret], 3), True),
+            ("parser", SystemExit(2), False),
+            ("parser", ValueError("inert parser failure"), False),
+            ("entry", SystemExit(3), False),
+            ("entry", KeyboardInterrupt("inert interrupt"), False),
+            ("entry", GeneratorExit("inert generator exit"), False),
+        )
+        for stage, primary, caught in cases:
+            args = argparse.Namespace(command="prepare")
+            original_args = primary.args
+            with self.subTest(stage=stage, error_type=type(primary).__name__), self.run_owner_scope(), \
+                 patch.object(FIXTURE, "SECRET", secret), \
+                 patch.object(FIXTURE.argparse.ArgumentParser, "parse_args", return_value=args,
+                              side_effect=primary if stage == "parser" else None) as parse_args, \
+                 patch.object(FIXTURE, "prepare", side_effect=primary) as prepare, \
+                 patch.object(FIXTURE, "verify", side_effect=AssertionError("wrong main branch")) as verify, \
+                 patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+                 patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit if caught else type(primary)) as raised:
+                    FIXTURE.main()
+                parse_args.assert_called_once_with()
+                if stage == "parser":
+                    prepare.assert_not_called()
+                else:
+                    prepare.assert_called_once_with(args)
+                verify.assert_not_called()
+                self.assertEqual(primary.args, original_args)
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original_timeout)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+                if caught:
+                    self.assertIs(type(raised.exception), SystemExit)
+                    self.assertIs(raised.exception.primary, primary)
+                    self.assertIs(raised.exception.__context__, primary)
+                    self.assertTrue(raised.exception.__suppress_context__)
+                    self.assertIsNone(raised.exception.__cause__)
+                    self.assertEqual(str(raised.exception),
+                                     "PG loopback fixture failed: " + str(primary).replace(secret, "<redacted>"))
+                else:
+                    self.assertIs(raised.exception, primary, "uncaught parser/control errors must not be adapted")
+                    self.assertFalse(hasattr(primary, "primary"))
+
+    def test_pg_run_owner_prepare_failure_retains_operation_fence(self) -> None:
+        inputs = self.mocked_verification_inputs(record_present=False)
+        command_owner = self.run_owner_inputs("inert initializer failure")
+        root = inputs.args.fixture
+        args = self.prepare_inputs()
+        adapters, events = [], []
+        original_timeout = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+
+        def bounded_command(command, cwd, label):
+            if label == "check PostgreSQL version":
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 45)
+                events.append("version")
+                return subprocess.CompletedProcess(command, 0, b"postgres (PostgreSQL) 17.10\n", b"")
+            self.assertEqual(label, "inert initializer")
+            self.assertEqual(command, ["inert-initdb"])
+            self.assertIs(cwd, root)
+            self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 3)
+            events.append("initializer")
+            raise command_owner.shared
+
+        def assemble(actual_args, actual_root, installed, perl):
+            self.assertIs(actual_args, args)
+            self.assertIs(actual_root, root)
+            self.assertEqual(installed, args.installed_root.resolve.return_value)
+            self.assertEqual(perl, args.perl.resolve.return_value)
+            self.assertTrue(inputs.lock.state.present)
+            events.append("assembly")
+            try:
+                FIXTURE.run(["inert-initdb"], root, "inert initializer", 3)
+            except RuntimeError as error:
+                adapters.append(error)
+                raise
+            self.fail("failed initializer cannot complete assembly")
+
+        with self.run_owner_scope(), patch.object(FIXTURE, "os", SimpleNamespace(name="nt")), \
+             patch.object(FIXTURE, "TARGET", inputs.target), \
+             patch.object(FIXTURE, "private_fixture", return_value=root) as private_fixture, \
+             patch.object(FIXTURE, "prepare_owned", side_effect=assemble) as assembler, \
+             patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=bounded_command) as bounded, \
+             patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            with self.assertRaises(RuntimeError) as raised:
+                FIXTURE.prepare(args)
+            self.assertEqual(events, ["version", "assembly", "initializer"])
+            self.assertEqual(len(adapters), 1)
+            self.assertIs(raised.exception, adapters[0])
+            self.assertIs(raised.exception.primary, command_owner.shared)
+            private_fixture.assert_called_once_with()
+            assembler.assert_called_once_with(args, root, args.installed_root.resolve.return_value,
+                                              args.perl.resolve.return_value)
+            self.assertEqual(bounded.call_args_list, [
+                call([str(args.installed_root.resolve.return_value / "bin" / "postgres.exe"), "--version"],
+                     FIXTURE.REPO, "check PostgreSQL version"),
+                call(["inert-initdb"], root, "inert initializer"),
+            ])
+            self.assertTrue(inputs.lock.state.present)
+            self.assertFalse(inputs.active.state.present)
+            self.assertFalse(inputs.state["record_present"])
+            inputs.lock.path.unlink.assert_not_called()
+            inputs.lock.path.replace.assert_not_called()
+            inputs.record.unlink.assert_not_called()
+            inputs.record.open.assert_not_called()
+            inputs.manifest.read_text.assert_not_called()
+            with self.assertRaises(FileExistsError):
+                FIXTURE.verify(inputs.args)
+            self.assertEqual(bounded.call_count, 2, "a fenced contender must not execute another command")
+            inputs.manifest.read_text.assert_not_called()
+            self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original_timeout)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIs(command_owner.shared.job, command_owner.job)
+            self.assertIs(command_owner.shared.process, command_owner.process)
+            self.assertIs(command_owner.shared.readers, command_owner.readers)
+            self.assertIs(command_owner.shared.__cause__, command_owner.cleanup)
+            self.assertIs(command_owner.cleanup.primary, command_owner.toolhelp)
+            self.assertIs(command_owner.toolhelp.toolhelp_handles, command_owner.handles)
+            for owner in command_owner.owners:
+                self.assertEqual(owner.mock_calls, [])
+
+    def test_pg_run_owner_verify_failure_preserves_command_and_server_owners(self) -> None:
+        real_run = FIXTURE.run
+        original_timeout = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        expected = [
+            "initial_pid", "startup_wait", "live", "stop_pid", "stop", "job_terminate",
+            "root_poll", "root_kill", "job_drain", "job_close", "root_wait", "final_pid",
+        ]
+        for close_failure in (False, True):
+            inputs = self.cleanup_inputs("job_close" if close_failure else None)
+            command_owner = self.run_owner_inputs("command failed: inert-contract-password")
+            adapters = []
+
+            def delegate_run(*args, **kwargs):
+                try:
+                    return real_run(*args, **kwargs)
+                except RuntimeError as error:
+                    adapters.append(error)
+                    raise
+
+            def bounded_command(command, cwd, label):
+                if label == "live PostgreSQL query acceptance":
+                    self.assertEqual(command[1:], ["--exact", "native_pg_query_poller_live_loopback_roundtrip",
+                                                  "--ignored", "--nocapture", "--test-threads=1"])
+                    self.assertIs(cwd, FIXTURE.REPO)
+                    self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 90)
+                    inputs.events.append("live")
+                    raise command_owner.shared
+                self.assertEqual(label, "stop isolated PostgreSQL cluster")
+                self.assertEqual(command[1:], ["stop", "-D", str(inputs.args.fixture / "data"),
+                                              "-m", "immediate", "-w", "-t", "20"])
+                self.assertIs(cwd, inputs.args.fixture)
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 25)
+                inputs.events.append("stop")
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+
+            # cleanup_scope allows only inert Popen/Job/server owners while its
+            # real termination helper operates on those mocks, never a PID.
+            with self.subTest(close_failure=close_failure), self.cleanup_scope(inputs), \
+                 patch.object(FIXTURE.BOUNDS.threading, "Thread", side_effect=AssertionError("no real adapter threads")), \
+                 patch.object(FIXTURE.socket, "socket", side_effect=AssertionError("no real adapter sockets")), \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=bounded_command) as bounded, \
+                 patch.object(FIXTURE.time, "monotonic", side_effect=[100.0, 102.0]):
+                inputs.run.side_effect = delegate_run
+                with self.assertRaises(RuntimeError) as raised:
+                    FIXTURE.verify(inputs.args)
+                self.assertEqual(len(adapters), 1)
+                adapter = adapters[0]
+                self.assertIs(adapter.primary, command_owner.shared)
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original_timeout)
+                self.assertEqual(bounded.call_count, 2)
+                self.assertEqual(inputs.events, expected)
+                inputs.popen.assert_called_once()
+                inputs.tree.assert_called_once_with(inputs.process, inputs.job)
+                inputs.numeric.assert_not_called()
+                inputs.job.terminate.assert_called_once_with()
+                inputs.job.wait_empty.assert_called_once_with(105.0)
+                inputs.job.close.assert_called_once_with()
+                self.assertEqual(inputs.process.wait.call_args_list, [call(timeout=25), call(timeout=3.0)])
+                inputs.process.kill.assert_called_once_with()
+                self.assertIsNot(command_owner.job, inputs.job)
+                self.assertIsNot(command_owner.process, inputs.process)
+                if close_failure:
+                    self.assertIsInstance(raised.exception, FIXTURE.BOUNDS.CleanupFailure)
+                    self.assertIs(raised.exception.primary, adapter)
+                    self.assertIs(raised.exception.__cause__, adapter)
+                    self.assertIs(raised.exception.job, inputs.job)
+                    self.assertIs(raised.exception.process, inputs.process)
+                    self.assertIs(raised.exception.fixture_root, inputs.args.fixture)
+                    inputs.active.path.unlink.assert_not_called()
+                    inputs.lock.path.unlink.assert_not_called()
+                else:
+                    self.assertIs(raised.exception, adapter)
+                    inputs.active.path.unlink.assert_called_once_with()
+                    inputs.lock.path.unlink.assert_called_once_with()
+                self.assertEqual(inputs.active.state.present, close_failure)
+                self.assertEqual(inputs.lock.state.present, close_failure)
+                self.assertFalse(inputs.state["record_present"])
+                inputs.lock.path.replace.assert_not_called()
+                inputs.record.open.assert_not_called()
+                inputs.paths["live-test.log"].open.assert_not_called()
+                self.assertNotIn("inert-contract-password", str(raised.exception))
+                for attribute in ("job", "process", "readers", "toolhelp_handles"):
+                    self.assertFalse(hasattr(adapter, attribute), "server failure must not flatten command owners")
+                self.assertIs(command_owner.shared.job, command_owner.job)
+                self.assertIs(command_owner.shared.process, command_owner.process)
+                self.assertIs(command_owner.shared.readers, command_owner.readers)
+                self.assertIs(command_owner.shared.__cause__, command_owner.cleanup)
+                self.assertIs(command_owner.cleanup.primary, command_owner.toolhelp)
+                self.assertIs(command_owner.toolhelp.toolhelp_handles, command_owner.handles)
+                for owner in command_owner.owners:
+                    self.assertEqual(owner.mock_calls, [])
 
     def test_live_requires_exactly_one_executed_test(self) -> None:
         success = b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n"

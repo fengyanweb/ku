@@ -143,7 +143,10 @@ def run(
         message = str(error)
         if SECRET:
             message = message.replace(SECRET, "<redacted>")
-        raise RuntimeError(message) from None
+        failure = RuntimeError(message)
+        # Keep the immediate owner node private; default traceback stays redacted.
+        failure.primary = error
+        raise failure from None
     finally:
         BOUNDS.COMMAND_TIMEOUT_SECONDS = previous
 
@@ -528,7 +531,9 @@ def main() -> None:
         message = str(error)
         if SECRET:
             message = message.replace(SECRET, "<redacted>")
-        raise SystemExit(f"PG loopback fixture failed: {message}") from None
+        failure = SystemExit(f"PG loopback fixture failed: {message}")
+        failure.primary = error
+        raise failure from None
 
 
 if __name__ == "__main__":
