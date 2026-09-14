@@ -450,6 +450,7 @@ def verify_owned(args: argparse.Namespace, root: Path, owned: FixtureOperation) 
     finally:
         cleanup = BOUNDS.CleanupErrors()
         stop_failed = False
+        stop_error = None
         stop_stage = "PostgreSQL stop PID check"
         try:
             if started_by_attempt and present(root / "data" / "postmaster.pid"):
@@ -461,6 +462,7 @@ def verify_owned(args: argparse.Namespace, root: Path, owned: FixtureOperation) 
             if primary is None:
                 primary = error
             else:
+                stop_error = error
                 cleanup.add(stop_stage, error)
         # Preserve the existing 25-second pg_ctl bound plus a single five-second
         # fallback budget. Failure of one owner operation cannot skip another.
@@ -490,6 +492,9 @@ def verify_owned(args: argparse.Namespace, root: Path, owned: FixtureOperation) 
         try:
             cleanup.raise_if_any(primary)
         except BaseException as error:
+            if stop_error is not None:
+                # Keep the stop command node separate from the server owners.
+                error.pg_stop_error = stop_error
             if owned.uncertain:
                 error.job = windows_job
                 error.process = process
