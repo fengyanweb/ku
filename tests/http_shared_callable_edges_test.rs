@@ -261,6 +261,108 @@ fn http_shared_edges_loop_backedge_rechecks_predeclared_setter_effect() {
 }
 
 #[test]
+fn http_shared_edges_for_backedge_rechecks_predeclared_setter_effect() {
+    rejects_after_sharing(
+        "http-shared-for-setter-backedge.ku",
+        r#"
+    render = Noop
+    setter = () => { render = Other; return null }
+    for turn in [0, 1] {
+        setter()
+        if (turn == 0) {
+            /* HTTP_SHARE_POINT */
+        }
+    }
+"#,
+        false,
+    );
+}
+
+#[test]
+fn http_shared_edges_for_continue_rechecks_predeclared_setter_effect() {
+    rejects_after_sharing(
+        "http-shared-for-setter-continue.ku",
+        r#"
+    render = Noop
+    setter = () => { render = Other; return null }
+    for turn in [0, 1] {
+        setter()
+        if (turn == 0) {
+            /* HTTP_SHARE_POINT */
+            continue
+        }
+        break
+    }
+"#,
+        false,
+    );
+}
+
+#[test]
+fn http_shared_edges_for_break_before_backedge_keeps_prior_setter_legal() {
+    accepts(
+        "http-shared-for-setter-break.ku",
+        r#"
+    render = Noop
+    setter = () => { render = Other; return null }
+    for turn in [0, 1] {
+        setter()
+        app.get("/", fn() { render(); return http.text("ok") })
+        break
+    }
+    render()
+"#,
+    );
+}
+
+#[test]
+fn http_shared_edges_service_move_does_not_thaw_captured_binding() {
+    rejects_after_sharing(
+        "http-shared-after-service-move.ku",
+        r#"
+    render = Noop
+    /* HTTP_SHARE_POINT */
+    moved = app
+    render = Other
+"#,
+        false,
+    );
+}
+
+#[test]
+fn http_shared_edges_service_scope_exit_does_not_thaw_outer_binding() {
+    rejects_after_sharing(
+        "http-shared-after-service-scope.ku",
+        r#"
+    render = Noop
+    if (true) {
+        /* HTTP_SHARE_POINT */
+        scoped = app
+    }
+    render = Other
+"#,
+        false,
+    );
+}
+
+#[test]
+fn http_shared_edges_listener_close_does_not_thaw_captured_binding() {
+    // bind/close is checked only; do not run this fixture or claim native
+    // support for the interpreter-only listener lifecycle API.
+    rejects_after_sharing(
+        "http-shared-after-listener-close.ku",
+        r#"
+    render = Noop
+    /* HTTP_SHARE_POINT */
+    listener = app.bind("127.0.0.1:0")?
+    listener.close()?
+    render = Other
+"#,
+        false,
+    );
+}
+
+#[test]
 fn http_shared_edges_del_route_registration_does_not_clear_prior_freeze() {
     // del is the DELETE-method registration API, not a route-removal API.
     rejects_after_sharing(
