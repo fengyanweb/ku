@@ -1811,6 +1811,555 @@ class PgFixtureTests(unittest.TestCase):
                 for owner in command_owner.owners:
                     self.assertEqual(owner.mock_calls, [])
 
+    def test_pg_stop_secondary_preserves_immediate_error(self) -> None:
+        expected = [
+            "initial_pid", "startup_wait", "live", "stop_pid", "stop", "job_terminate",
+            "root_poll", "root_kill", "job_drain", "job_close", "root_wait", "final_pid",
+        ]
+        for error_type in (RuntimeError, OSError, KeyboardInterrupt):
+            inputs = self.cleanup_inputs()
+            primary = RuntimeError("inert original live failure")
+            stop_owner = self.run_owner_inputs()
+            stop_error = error_type("inert original stop failure")
+            stop_error.primary = stop_owner.shared
+            original_args, original_cause = stop_error.args, stop_error.__cause__
+
+            def direct_run(command, *args, **kwargs):
+                stage = "stop" if command[1] == "stop" else "live"
+                inputs.events.append(stage)
+                raise stop_error if stage == "stop" else primary
+
+            with self.subTest(error_type=error_type.__name__), self.cleanup_scope(inputs), \
+                 patch.object(FIXTURE.BOUNDS.threading, "Thread", side_effect=AssertionError("no real secondary threads")), \
+                 patch.object(FIXTURE.socket, "socket", side_effect=AssertionError("no real secondary sockets")), \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=AssertionError("direct contract forbids commands")) as bounded, \
+                 patch.object(FIXTURE.time, "monotonic", side_effect=[100.0, 102.0]):
+                inputs.run.side_effect = direct_run
+                with self.assertRaises(FIXTURE.BOUNDS.CleanupFailure) as raised:
+                    FIXTURE.verify(inputs.args)
+                failure = raised.exception
+                # Establish the old primary/cleanup/fence contract before the
+                # new assertion, so an unrelated failure cannot stand in for RED.
+                self.assertIs(failure.primary, primary)
+                self.assertIs(failure.__cause__, primary)
+                self.assertEqual(failure.cleanup_summary, f"PostgreSQL stop ({error_type.__name__})")
+                self.assertEqual(inputs.events, expected)
+                self.assertEqual(inputs.run.call_count, 2)
+                bounded.assert_not_called()
+                inputs.popen.assert_called_once()
+                inputs.tree.assert_called_once_with(inputs.process, inputs.job)
+                inputs.numeric.assert_not_called()
+                inputs.job.terminate.assert_called_once_with()
+                inputs.job.wait_empty.assert_called_once_with(105.0)
+                inputs.job.close.assert_called_once_with()
+                inputs.process.kill.assert_called_once_with()
+                self.assertEqual(inputs.process.wait.call_args_list, [call(timeout=25), call(timeout=3.0)])
+                self.assertIs(failure.job, inputs.job)
+                self.assertIs(failure.process, inputs.process)
+                self.assertIs(failure.fixture_root, inputs.args.fixture)
+                inputs.active.path.unlink.assert_not_called()
+                inputs.lock.path.unlink.assert_not_called()
+                self.assertTrue(inputs.active.state.present)
+                self.assertTrue(inputs.lock.state.present)
+                self.assertFalse(inputs.state["record_present"])
+                inputs.lock.path.replace.assert_not_called()
+                inputs.record.open.assert_not_called()
+                inputs.paths["live-test.log"].open.assert_not_called()
+                self.assertEqual(stop_error.args, original_args)
+                self.assertIs(stop_error.__cause__, original_cause)
+                self.assertIs(stop_error.primary, stop_owner.shared)
+                self.assertIsNot(stop_owner.job, inputs.job)
+                self.assertIsNot(stop_owner.process, inputs.process)
+                for owner in stop_owner.owners:
+                    self.assertEqual(owner.mock_calls, [])
+                # Do not erase implicit context: this is an explicit-reference
+                # contract, not a claim that the previous code leaked a handle.
+                self.assertIs(getattr(failure, "pg_stop_error", None), stop_error,
+                              "verify must explicitly retain the immediate stop secondary")
+
+    def test_pg_stop_secondary_preserves_bounded_command_chain(self) -> None:
+        real_run = FIXTURE.run
+        original_timeout = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        inputs = self.cleanup_inputs()
+        live_owner = self.run_owner_inputs("live failed: inert-contract-password")
+        stop_owner = self.run_owner_inputs("stop failed: inert-contract-password")
+        adapters = []
+        expected = [
+            "initial_pid", "startup_wait", "live", "stop_pid", "stop", "job_terminate",
+            "root_poll", "root_kill", "job_drain", "job_close", "root_wait", "final_pid",
+        ]
+
+        def delegate_run(*args, **kwargs):
+            try:
+                return real_run(*args, **kwargs)
+            except RuntimeError as error:
+                adapters.append(error)
+                raise
+
+        def bounded_command(command, cwd, label):
+            if label == "live PostgreSQL query acceptance":
+                self.assertEqual(command[1:], ["--exact", "native_pg_query_poller_live_loopback_roundtrip",
+                                              "--ignored", "--nocapture", "--test-threads=1"])
+                self.assertIs(cwd, FIXTURE.REPO)
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 90)
+                inputs.events.append("live")
+                raise live_owner.shared
+            self.assertEqual(label, "stop isolated PostgreSQL cluster")
+            self.assertEqual(command[1:], ["stop", "-D", str(inputs.args.fixture / "data"),
+                                          "-m", "immediate", "-w", "-t", "20"])
+            self.assertIs(cwd, inputs.args.fixture)
+            self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 25)
+            inputs.events.append("stop")
+            raise stop_owner.shared
+
+        # The real adapter sees only the two inert command failures. Server
+        # cleanup still uses the existing exact-owner mocks, never real Popen.
+        with self.cleanup_scope(inputs), \
+             patch.object(FIXTURE.BOUNDS.threading, "Thread", side_effect=AssertionError("no real secondary threads")), \
+             patch.object(FIXTURE.socket, "socket", side_effect=AssertionError("no real secondary sockets")), \
+             patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=bounded_command) as bounded, \
+             patch.object(FIXTURE.time, "monotonic", side_effect=[100.0, 102.0]), \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            inputs.run.side_effect = delegate_run
+            try:
+                FIXTURE.verify(inputs.args)
+            except FIXTURE.BOUNDS.CleanupFailure as error:
+                failure = error
+                rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            else:
+                self.fail("two inert command failures must not report verification success")
+            self.assertEqual(len(adapters), 2)
+            live_adapter, stop_adapter = adapters
+            self.assertIs(failure.primary, live_adapter)
+            self.assertIs(failure.__cause__, live_adapter)
+            self.assertEqual(failure.cleanup_summary, "PostgreSQL stop (RuntimeError)")
+            self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original_timeout)
+            self.assertEqual(bounded.call_count, 2)
+            self.assertEqual(inputs.events, expected)
+            inputs.popen.assert_called_once()
+            inputs.tree.assert_called_once_with(inputs.process, inputs.job)
+            inputs.numeric.assert_not_called()
+            inputs.job.terminate.assert_called_once_with()
+            inputs.job.wait_empty.assert_called_once_with(105.0)
+            inputs.job.close.assert_called_once_with()
+            inputs.process.kill.assert_called_once_with()
+            self.assertEqual(inputs.process.wait.call_args_list, [call(timeout=25), call(timeout=3.0)])
+            self.assertIs(failure.job, inputs.job)
+            self.assertIs(failure.process, inputs.process)
+            self.assertIs(failure.fixture_root, inputs.args.fixture)
+            inputs.active.path.unlink.assert_not_called()
+            inputs.lock.path.unlink.assert_not_called()
+            self.assertTrue(inputs.active.state.present)
+            self.assertTrue(inputs.lock.state.present)
+            self.assertFalse(inputs.state["record_present"])
+            inputs.lock.path.replace.assert_not_called()
+            inputs.record.open.assert_not_called()
+            inputs.paths["live-test.log"].open.assert_not_called()
+            for output in (str(failure), str(live_adapter), str(stop_adapter), rendered,
+                           sys.stdout.getvalue(), stderr.getvalue()):
+                self.assertNotIn("inert-contract-password", output)
+            self.assertIsNot(live_owner.job, stop_owner.job)
+            self.assertIsNot(live_owner.process, stop_owner.process)
+            self.assertIsNot(live_owner.readers, stop_owner.readers)
+            for adapter, command_owner in ((live_adapter, live_owner), (stop_adapter, stop_owner)):
+                self.assertIs(adapter.primary, command_owner.shared)
+                self.assertIs(adapter.__context__, command_owner.shared)
+                self.assertTrue(adapter.__suppress_context__)
+                self.assertIsNone(adapter.__cause__)
+                for attribute in ("job", "process", "readers", "toolhelp_handles"):
+                    self.assertFalse(hasattr(adapter, attribute), "server/command owners must not be flattened")
+                self.assertIsNot(command_owner.job, inputs.job)
+                self.assertIsNot(command_owner.process, inputs.process)
+                self.assertIs(command_owner.shared.job, command_owner.job)
+                self.assertIs(command_owner.shared.process, command_owner.process)
+                self.assertIs(command_owner.shared.readers, command_owner.readers)
+                self.assertIs(command_owner.shared.__cause__, command_owner.cleanup)
+                self.assertIs(command_owner.cleanup.primary, command_owner.toolhelp)
+                self.assertIs(command_owner.cleanup.__cause__, command_owner.toolhelp)
+                self.assertIs(command_owner.toolhelp.toolhelp_handles, command_owner.handles)
+                for owner in command_owner.owners:
+                    self.assertEqual(owner.mock_calls, [])
+            self.assertIs(getattr(failure, "pg_stop_error", None), stop_adapter,
+                          "verify must retain the stop adapter, not its text or flattened owners")
+
+    def test_pg_stop_secondary_pid_check_retains_error_without_stop(self) -> None:
+        inputs = self.cleanup_inputs()
+        primary = RuntimeError("inert original live failure")
+        stop_error = OSError("inert stop PID metadata failure")
+        # An inert payload checks original-node identity; this does not imply
+        # that the real metadata operation allocates a new handle.
+        stop_error.retained_owner = MagicMock(spec=("close",))
+        original_args = stop_error.args
+        original_pid_exists = inputs.pid.exists.side_effect
+        expected = [
+            "initial_pid", "startup_wait", "live", "stop_pid", "job_terminate",
+            "root_poll", "root_kill", "job_drain", "job_close", "root_wait", "final_pid",
+        ]
+
+        def pid_exists():
+            exists = original_pid_exists()
+            if exists:
+                raise stop_error
+            return exists
+
+        def live_run(command, *args, **kwargs):
+            self.assertNotEqual(command[1], "stop", "failed stop metadata must prevent the stop command")
+            inputs.events.append("live")
+            raise primary
+
+        inputs.pid.exists.side_effect = pid_exists
+        with self.cleanup_scope(inputs), \
+             patch.object(FIXTURE.BOUNDS.threading, "Thread", side_effect=AssertionError("no real secondary threads")), \
+             patch.object(FIXTURE.socket, "socket", side_effect=AssertionError("no real secondary sockets")), \
+             patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=AssertionError("metadata contract forbids commands")) as bounded, \
+             patch.object(FIXTURE.time, "monotonic", side_effect=[100.0, 102.0]):
+            inputs.run.side_effect = live_run
+            with self.assertRaises(FIXTURE.BOUNDS.CleanupFailure) as raised:
+                FIXTURE.verify(inputs.args)
+            failure = raised.exception
+            self.assertIs(failure.primary, primary)
+            self.assertIs(failure.__cause__, primary)
+            self.assertEqual(failure.cleanup_summary, "PostgreSQL stop PID check (OSError)")
+            self.assertEqual(inputs.events, expected)
+            self.assertEqual(inputs.pid.exists.call_count, 3)
+            inputs.run.assert_called_once()
+            self.assertEqual(inputs.run.call_args.args[2], "live PostgreSQL query acceptance")
+            self.assertNotIn("stop", inputs.events)
+            bounded.assert_not_called()
+            inputs.popen.assert_called_once()
+            inputs.tree.assert_called_once_with(inputs.process, inputs.job)
+            inputs.numeric.assert_not_called()
+            inputs.job.terminate.assert_called_once_with()
+            inputs.job.wait_empty.assert_called_once_with(105.0)
+            inputs.job.close.assert_called_once_with()
+            inputs.process.kill.assert_called_once_with()
+            self.assertEqual(inputs.process.wait.call_args_list, [call(timeout=25), call(timeout=3.0)])
+            self.assertIs(failure.job, inputs.job)
+            self.assertIs(failure.process, inputs.process)
+            self.assertIs(failure.fixture_root, inputs.args.fixture)
+            inputs.active.path.unlink.assert_not_called()
+            inputs.lock.path.unlink.assert_not_called()
+            self.assertTrue(inputs.active.state.present)
+            self.assertTrue(inputs.lock.state.present)
+            self.assertFalse(inputs.state["record_present"])
+            inputs.lock.path.replace.assert_not_called()
+            inputs.record.open.assert_not_called()
+            inputs.paths["live-test.log"].open.assert_not_called()
+            self.assertEqual(stop_error.args, original_args)
+            self.assertEqual(stop_error.retained_owner.mock_calls, [])
+            self.assertIs(getattr(failure, "pg_stop_error", None), stop_error,
+                          "stop-stage metadata errors need the same immediate secondary reference")
+
+    def test_pg_stop_secondary_survives_later_cleanup_failures(self) -> None:
+        expected = [
+            "initial_pid", "startup_wait", "live", "stop_pid", "stop", "job_terminate",
+            "root_poll", "root_kill", "job_drain", "job_close", "root_wait", "final_pid",
+        ]
+        later_summaries = {
+            "job_close": "PostgreSQL Job close (OSError)",
+            "job_drain": "PostgreSQL Job drain (OSError); PostgreSQL Job drain unconfirmed (unconfirmed)",
+            "drain_none": "PostgreSQL Job drain unconfirmed (unconfirmed)",
+        }
+        for later, summary in later_summaries.items():
+            inputs = self.cleanup_inputs(None if later == "drain_none" else later)
+            primary, stop_error = RuntimeError("inert live failure"), RuntimeError("inert stop failure")
+            stop_owner = self.run_owner_inputs()
+            stop_error.primary = stop_owner.shared
+            if later == "drain_none":
+                inputs.job.wait_empty.side_effect = lambda deadline: inputs.events.append("job_drain")
+
+            def direct_run(command, *args, **kwargs):
+                inputs.live_run(command, *args, **kwargs)
+                raise stop_error if command[1] == "stop" else primary
+
+            with self.subTest(later=later), self.cleanup_scope(inputs), \
+                 patch.object(FIXTURE.BOUNDS.threading, "Thread", side_effect=AssertionError("no real secondary threads")), \
+                 patch.object(FIXTURE.socket, "socket", side_effect=AssertionError("no real secondary sockets")), \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=AssertionError("direct contract forbids commands")) as bounded, \
+                 patch.object(FIXTURE.time, "monotonic", side_effect=[100.0, 102.0]):
+                inputs.run.side_effect = direct_run
+                with self.assertRaises(FIXTURE.BOUNDS.CleanupFailure) as raised:
+                    FIXTURE.verify(inputs.args)
+                failure = raised.exception
+                self.assertIs(failure.primary, primary)
+                self.assertIs(failure.__cause__, primary)
+                self.assertEqual(failure.cleanup_summary, "PostgreSQL stop (RuntimeError); " + summary)
+                self.assertIs(failure.pg_stop_error, stop_error)
+                self.assertIs(stop_error.primary, stop_owner.shared)
+                self.assertEqual(inputs.events, expected)
+                self.assertEqual(inputs.run.call_count, 2)
+                inputs.popen.assert_called_once()
+                inputs.tree.assert_called_once_with(inputs.process, inputs.job)
+                inputs.numeric.assert_not_called()
+                bounded.assert_not_called()
+                inputs.job.terminate.assert_called_once_with()
+                inputs.job.wait_empty.assert_called_once_with(105.0)
+                inputs.job.close.assert_called_once_with()
+                inputs.process.kill.assert_called_once_with()
+                self.assertEqual(inputs.process.wait.call_args_list, [call(timeout=25), call(timeout=3.0)])
+                self.assertIs(failure.job, inputs.job)
+                self.assertIs(failure.process, inputs.process)
+                self.assertIs(failure.fixture_root, inputs.args.fixture)
+                inputs.active.path.unlink.assert_not_called()
+                inputs.lock.path.unlink.assert_not_called()
+                self.assertTrue(inputs.active.state.present)
+                self.assertTrue(inputs.lock.state.present)
+                self.assertFalse(inputs.state["record_present"])
+                inputs.lock.path.replace.assert_not_called()
+                inputs.record.open.assert_not_called()
+                for owner in stop_owner.owners:
+                    self.assertEqual(owner.mock_calls, [])
+                # Only the stop node gains an explicit slot. These later
+                # categories are not proof of retaining every cleanup exception.
+
+    def test_pg_stop_secondary_main_redacts_default_traceback(self) -> None:
+        real_run, real_verify = FIXTURE.run, FIXTURE.verify
+        original_timeout = FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS
+        secret = "pg-stop-private-" + "s" * 2048 + "-private-stop-tail"
+        for close_failure in (False, True):
+            inputs = self.cleanup_inputs("job_close" if close_failure else None)
+            inputs.args.command = "verify"
+            inputs.paths["password.txt"].read_text.return_value = secret
+            live_owner = self.run_owner_inputs(f"live failed: {secret}")
+            stop_owner = self.run_owner_inputs(f"stop failed: {secret}; repeated: {secret}")
+            adapters, verify_errors = [], []
+
+            def delegate_run(*args, **kwargs):
+                try:
+                    return real_run(*args, **kwargs)
+                except RuntimeError as error:
+                    adapters.append(error)
+                    raise
+
+            def delegate_verify(args):
+                try:
+                    return real_verify(args)
+                except FIXTURE.BOUNDS.CleanupFailure as error:
+                    verify_errors.append(error)
+                    raise
+
+            def bounded_command(command, cwd, label):
+                is_stop = label == "stop isolated PostgreSQL cluster"
+                self.assertEqual(label, "stop isolated PostgreSQL cluster" if is_stop else "live PostgreSQL query acceptance")
+                self.assertEqual(command[1], "stop" if is_stop else "--exact")
+                self.assertIs(cwd, inputs.args.fixture if is_stop else FIXTURE.REPO)
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, 25 if is_stop else 90)
+                inputs.events.append("stop" if is_stop else "live")
+                raise stop_owner.shared if is_stop else live_owner.shared
+
+            with self.subTest(close_failure=close_failure), self.cleanup_scope(inputs), \
+                 patch.object(FIXTURE.BOUNDS.threading, "Thread", side_effect=AssertionError("no real secondary threads")), \
+                 patch.object(FIXTURE.socket, "socket", side_effect=AssertionError("no real secondary sockets")), \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=bounded_command) as bounded, \
+                 patch.object(FIXTURE, "verify", side_effect=delegate_verify) as verify, \
+                 patch.object(FIXTURE.argparse.ArgumentParser, "parse_args", return_value=inputs.args) as parse_args, \
+                 patch.object(FIXTURE.time, "monotonic", side_effect=[100.0, 102.0]), \
+                 patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                inputs.run.side_effect = delegate_run
+                try:
+                    FIXTURE.main()
+                except SystemExit as error:
+                    wrapped = error
+                    rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+                else:
+                    self.fail("main must report the inert live and stop failures")
+                parse_args.assert_called_once_with()
+                verify.assert_called_once_with(inputs.args)
+                self.assertEqual(len(adapters), 2)
+                self.assertEqual(len(verify_errors), 1)
+                live_adapter, stop_adapter = adapters
+                failure = verify_errors[0]
+                self.assertIs(type(wrapped), SystemExit)
+                self.assertIs(wrapped.primary, failure)
+                self.assertIs(wrapped.__context__, failure)
+                self.assertTrue(wrapped.__suppress_context__)
+                self.assertIsNone(wrapped.__cause__)
+                self.assertFalse(hasattr(wrapped, "pg_stop_error"), "main must retain, not flatten, the verify node")
+                self.assertIs(failure.primary, live_adapter)
+                self.assertIs(failure.__cause__, live_adapter)
+                self.assertIs(failure.pg_stop_error, stop_adapter)
+                self.assertEqual(FIXTURE.BOUNDS.COMMAND_TIMEOUT_SECONDS, original_timeout)
+                self.assertEqual(bounded.call_count, 2)
+                expected_summary = "PostgreSQL stop (RuntimeError)"
+                if close_failure:
+                    expected_summary += "; PostgreSQL Job close (OSError)"
+                self.assertEqual(failure.cleanup_summary, expected_summary)
+                self.assertTrue(str(wrapped).startswith("PG loopback fixture failed: "))
+                self.assertIn("<redacted>", str(wrapped))
+                for output in (str(wrapped), str(failure), str(live_adapter), str(stop_adapter),
+                               rendered, sys.stdout.getvalue(), stderr.getvalue()):
+                    for forbidden in (secret, "pg-stop-private-", "s" * 32, "-private-stop-tail"):
+                        self.assertNotIn(forbidden, output)
+                self.assertIs(failure.job, inputs.job)
+                self.assertIs(failure.process, inputs.process)
+                inputs.popen.assert_called_once()
+                inputs.tree.assert_called_once_with(inputs.process, inputs.job)
+                inputs.numeric.assert_not_called()
+                inputs.job.terminate.assert_called_once_with()
+                inputs.job.wait_empty.assert_called_once_with(105.0)
+                inputs.job.close.assert_called_once_with()
+                inputs.process.kill.assert_called_once_with()
+                self.assertEqual(inputs.process.wait.call_args_list, [call(timeout=25), call(timeout=3.0)])
+                self.assertEqual(inputs.events.count("final_pid"), 1)
+                inputs.active.path.unlink.assert_not_called()
+                inputs.lock.path.unlink.assert_not_called()
+                self.assertTrue(inputs.active.state.present)
+                self.assertTrue(inputs.lock.state.present)
+                self.assertFalse(inputs.state["record_present"])
+                inputs.lock.path.replace.assert_not_called()
+                inputs.record.open.assert_not_called()
+                for adapter, command_owner in ((live_adapter, live_owner), (stop_adapter, stop_owner)):
+                    self.assertIs(adapter.primary, command_owner.shared)
+                    self.assertIs(adapter.__context__, command_owner.shared)
+                    self.assertTrue(adapter.__suppress_context__)
+                    self.assertIsNone(adapter.__cause__)
+                    self.assertIs(command_owner.shared.job, command_owner.job)
+                    self.assertIs(command_owner.shared.process, command_owner.process)
+                    self.assertIs(command_owner.shared.readers, command_owner.readers)
+                    self.assertIs(command_owner.shared.__cause__, command_owner.cleanup)
+                    self.assertIs(command_owner.cleanup.primary, command_owner.toolhelp)
+                    self.assertIs(command_owner.toolhelp.toolhelp_handles, command_owner.handles)
+                    self.assertIn(secret, str(command_owner.shared))
+                    self.assertIsNot(command_owner.job, inputs.job)
+                    self.assertIsNot(command_owner.process, inputs.process)
+                    for attribute in ("job", "process", "readers", "toolhelp_handles"):
+                        self.assertFalse(hasattr(adapter, attribute))
+                    for owner in command_owner.owners:
+                        self.assertEqual(owner.mock_calls, [])
+
+    def test_pg_stop_secondary_preserves_first_error_controls(self) -> None:
+        for stop_first, close_failure in ((True, False), (True, True), (False, False)):
+            inputs = self.cleanup_inputs("job_close" if close_failure else None)
+            primary = RuntimeError("inert first stop failure" if stop_first else "inert first live failure")
+            command_owner = self.run_owner_inputs()
+            primary.primary = command_owner.shared
+
+            def direct_run(command, *args, **kwargs):
+                output = inputs.live_run(command, *args, **kwargs)
+                if (command[1] == "stop") == stop_first:
+                    raise primary
+                return output
+
+            with self.subTest(stop_first=stop_first, close_failure=close_failure), self.cleanup_scope(inputs), \
+                 patch.object(FIXTURE.BOUNDS.threading, "Thread", side_effect=AssertionError("no real secondary threads")), \
+                 patch.object(FIXTURE.socket, "socket", side_effect=AssertionError("no real secondary sockets")), \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=AssertionError("control contract forbids commands")) as bounded, \
+                 patch.object(FIXTURE.time, "monotonic", side_effect=[100.0, 102.0]):
+                inputs.run.side_effect = direct_run
+                with self.assertRaises(RuntimeError) as raised:
+                    FIXTURE.verify(inputs.args)
+                failure = raised.exception
+                if close_failure:
+                    self.assertIsInstance(failure, FIXTURE.BOUNDS.CleanupFailure)
+                    self.assertIs(failure.primary, primary)
+                    self.assertIs(failure.__cause__, primary)
+                    self.assertEqual(failure.cleanup_summary, "PostgreSQL Job close (OSError)")
+                else:
+                    self.assertIs(failure, primary)
+                self.assertFalse(hasattr(failure, "pg_stop_error"))
+                self.assertFalse(hasattr(primary, "pg_stop_error"))
+                self.assertIs(primary.primary, command_owner.shared)
+                self.assertEqual(inputs.run.call_count, 2)
+                bounded.assert_not_called()
+                inputs.popen.assert_called_once()
+                inputs.tree.assert_called_once_with(inputs.process, inputs.job)
+                inputs.numeric.assert_not_called()
+                inputs.job.terminate.assert_called_once_with()
+                inputs.job.wait_empty.assert_called_once_with(105.0)
+                inputs.job.close.assert_called_once_with()
+                inputs.process.kill.assert_called_once_with()
+                self.assertEqual(inputs.process.wait.call_args_list, [call(timeout=25), call(timeout=3.0)])
+                self.assertEqual(inputs.events.count("final_pid"), 1)
+                if stop_first:
+                    self.assertIs(failure.job, inputs.job)
+                    self.assertIs(failure.process, inputs.process)
+                    inputs.active.path.unlink.assert_not_called()
+                    inputs.lock.path.unlink.assert_not_called()
+                else:
+                    inputs.active.path.unlink.assert_called_once_with()
+                    inputs.lock.path.unlink.assert_called_once_with()
+                self.assertEqual(inputs.active.state.present, stop_first)
+                self.assertEqual(inputs.lock.state.present, stop_first)
+                self.assertFalse(inputs.state["record_present"])
+                inputs.lock.path.replace.assert_not_called()
+                inputs.record.open.assert_not_called()
+                for owner in command_owner.owners:
+                    self.assertEqual(owner.mock_calls, [])
+
+    def test_pg_stop_secondary_is_per_attempt_and_non_owning(self) -> None:
+        failures = []
+        # Two independent stop failures followed by a clean stop must neither
+        # replace a retained earlier node nor attach a stale node to the third.
+        for attempt in (0, 1, 2):
+            inputs = self.cleanup_inputs()
+            live_owner, stop_owner = self.run_owner_inputs(), self.run_owner_inputs()
+            primary, stop_error = RuntimeError(f"inert live {attempt}"), RuntimeError(f"inert stop {attempt}")
+            primary.primary, stop_error.primary = live_owner.shared, stop_owner.shared
+
+            def direct_run(command, *args, **kwargs):
+                output = inputs.live_run(command, *args, **kwargs)
+                if command[1] == "stop":
+                    if attempt == 2:
+                        return output
+                    raise stop_error
+                raise primary
+
+            with self.subTest(attempt=attempt), self.cleanup_scope(inputs), \
+                 patch.object(FIXTURE.BOUNDS.threading, "Thread", side_effect=AssertionError("no real secondary threads")), \
+                 patch.object(FIXTURE.socket, "socket", side_effect=AssertionError("no real secondary sockets")), \
+                 patch.object(FIXTURE.BOUNDS, "run_bounded", side_effect=AssertionError("isolation contract forbids commands")) as bounded, \
+                 patch.object(FIXTURE.time, "monotonic", side_effect=[100.0, 102.0]):
+                inputs.run.side_effect = direct_run
+                with self.assertRaises(RuntimeError) as raised:
+                    FIXTURE.verify(inputs.args)
+                failure = raised.exception
+                if attempt == 2:
+                    self.assertIs(failure, primary)
+                    self.assertFalse(hasattr(failure, "pg_stop_error"))
+                    inputs.active.path.unlink.assert_called_once_with()
+                    inputs.lock.path.unlink.assert_called_once_with()
+                else:
+                    self.assertIs(failure.primary, primary)
+                    self.assertIs(failure.__cause__, primary)
+                    self.assertIs(failure.pg_stop_error, stop_error)
+                    self.assertIs(failure.job, inputs.job)
+                    self.assertIs(failure.process, inputs.process)
+                    failures.append((failure, primary, stop_error, inputs))
+                    inputs.active.path.unlink.assert_not_called()
+                    inputs.lock.path.unlink.assert_not_called()
+                self.assertEqual(inputs.active.state.present, attempt != 2)
+                self.assertEqual(inputs.lock.state.present, attempt != 2)
+                self.assertFalse(inputs.state["record_present"])
+                inputs.lock.path.replace.assert_not_called()
+                inputs.record.open.assert_not_called()
+                self.assertEqual(inputs.run.call_count, 2)
+                bounded.assert_not_called()
+                inputs.popen.assert_called_once()
+                inputs.tree.assert_called_once_with(inputs.process, inputs.job)
+                inputs.numeric.assert_not_called()
+                inputs.job.terminate.assert_called_once_with()
+                inputs.job.wait_empty.assert_called_once_with(105.0)
+                inputs.job.close.assert_called_once_with()
+                inputs.process.kill.assert_called_once_with()
+                self.assertEqual(inputs.process.wait.call_args_list, [call(timeout=25), call(timeout=3.0)])
+                self.assertEqual(inputs.events.count("final_pid"), 1)
+                self.assertIs(primary.primary, live_owner.shared)
+                self.assertIs(stop_error.primary, stop_owner.shared)
+                # Strong-reference retention does not grant new resource actions.
+                for command_owner in (live_owner, stop_owner):
+                    self.assertIsNot(command_owner.job, inputs.job)
+                    self.assertIsNot(command_owner.process, inputs.process)
+                    for owner in command_owner.owners:
+                        self.assertEqual(owner.mock_calls, [])
+        self.assertEqual(len(failures), 2)
+        self.assertIsNot(failures[0][2], failures[1][2])
+        self.assertIsNot(failures[0][3].job, failures[1][3].job)
+        for failure, primary, stop_error, inputs in failures:
+            self.assertIs(failure.primary, primary)
+            self.assertIs(failure.pg_stop_error, stop_error)
+            self.assertIs(failure.job, inputs.job)
+            self.assertIs(failure.process, inputs.process)
+
     def test_live_requires_exactly_one_executed_test(self) -> None:
         success = b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n"
         self.assertIn("1 passed", FIXTURE.require_live_pass(success))
