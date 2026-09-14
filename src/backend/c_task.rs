@@ -85,6 +85,13 @@ struct FrameEmitter<'a> {
 
 impl<'a> FrameEmitter<'a> {
     fn new(function: &'a TaskFunction, frame: &'a TaskFunctionFrame) -> KuResult<Self> {
+        if !frame.scope_exits.operations.is_empty()
+            || !frame.scope_exits.state_operations.is_empty()
+        {
+            return Err(unsupported(
+                "scope-exit operation runtime is not implemented",
+            ));
+        }
         if function.slots.len() > MAX_FRAME_SLOTS {
             return Err(unsupported("native task frame exceeds its 64-slot bitmap"));
         }
@@ -729,6 +736,11 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
 
     fn emit_operation(&self, out: &mut COutput, operation: &TaskOp) -> KuResult<()> {
         match operation {
+            TaskOp::ScopeExitBegin { .. } | TaskOp::ScopeExitEnd { .. } => {
+                return Err(unsupported(
+                    "scope-exit operation runtime is not implemented",
+                ));
+            }
             // Verified lexical ownership annotation; no runtime stack or bits.
             TaskOp::ScopeEnter { .. } => {}
             TaskOp::Unary { dst, op, src } => match op {

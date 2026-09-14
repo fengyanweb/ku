@@ -581,6 +581,26 @@ primitive/单层 Result，不是任意 Owned payload、loop/finally 或完整 as
 真实 C、无副作用 raw 反例、sanitizer、精确 SHA 三系统
 结果分开验收；固定硬件性能、RSS、soak、M:N、netpoll 和事件 HTTP 仍未完成。
 
+### 内部 scope-exit 操作验证（运行时尚未接入）
+
+`ScopeExitBegin { exit, retain }` / `ScopeExitEnd { exit }` 目前仅是 typed Task IR
+的内部标记，不是 Ku 语法、取消信号或挂起点。每个稠密 exit ID 必须对应唯一的
+Begin 和 End，分别独占一个正常 Jump 状态；retain 必须是真实词法栈的严格祖先
+（None 表示 ROOT）。中间仅允许有限的 Jump/ScopeDrain 链和合法 Value drop，
+到 End 时必须恰好到达 retain。全部正常入边检查操作身份，禁止绕过 Begin、
+跳入另一操作、重叠或嵌套标记；取消清理图不允许这些标记。原有 Task 所有权、
+MUST/MAY 和 Suspend-only 循环进度检查不放宽。
+
+分析沿用原硬限和逐步预算，派生每个状态入口的活动操作 ID；没有标记时不分配
+新的操作/状态向量 buffer，也不执行该验证遍历。Rust 计划对象新增 Vec 描述符，
+不能因此声称编译器内存零增加。现有生成 C 的 Frame ABI 仍为 4、实例布局不变。
+带标记的原始 IR 经验证后，C emitter 仍明确返回 runtime not implemented；
+源码 native break/continue 继续拒绝。
+
+该静态验证不能代替后续运行时的一次非局部退出总期限、真实 ACK、取消优先级
+和最后 Owned drop 的闭环。不能把多次普通 drain 的独立新期限当成同一次退出
+的预算；在这些运行路径接入并验收前，不宣称 native 循环退出已支持。
+
 ### R5h.5 源码 if / else 接入（开发中）
 
 `task_lower.rs` 将 bool If 降成真实条件结束点上的 Branch。非空臂按词法出生槽生成

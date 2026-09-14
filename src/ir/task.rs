@@ -15,6 +15,8 @@ pub struct SlotId(pub usize);
 pub struct StateId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TaskScopeId(pub usize);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TaskScopeExitId(pub usize);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskProgram {
@@ -97,6 +99,14 @@ pub enum TaskBinaryOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOp {
+    /// Internal nonlocal cleanup boundary, not a deadline or suspension.
+    ScopeExitBegin {
+        exit: TaskScopeExitId,
+        retain: Option<TaskScopeId>,
+    },
+    ScopeExitEnd {
+        exit: TaskScopeExitId,
+    },
     /// Lexical owner declaration only: no initialization, allocation or deadline.
     ScopeEnter {
         scope: TaskScopeId,
@@ -241,6 +251,8 @@ pub struct TaskFunctionFrame {
     pub scope_task_mask: u64,
     /// Dense immutable descriptors; implicit ROOT uses scope_task_mask at Exit.
     pub scopes: Vec<TaskScopeFrame>,
+    /// Derived operation boundaries only. Runtime lowering remains gated.
+    pub scope_exits: TaskScopeExitPlan,
     /// Original dense SlotIds: parameters plus live values crossing suspension.
     pub slots: Vec<SlotId>,
     pub suspensions: Vec<TaskSuspensionLive>,
@@ -250,6 +262,22 @@ pub struct TaskFunctionFrame {
 pub struct TaskScopeFrame {
     pub scope: TaskScopeId,
     pub task_mask: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskScopeExitFrame {
+    pub exit: TaskScopeExitId,
+    pub begin: StateId,
+    pub end: StateId,
+    pub retain: Option<TaskScopeId>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskScopeExitPlan {
+    pub operations: Vec<TaskScopeExitFrame>,
+    /// Active operation on normal state entry; cleanup states are None.
+    /// Empty when no marker exists, avoiding a legacy-path allocation.
+    pub state_operations: Vec<Option<TaskScopeExitId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,6 +534,8 @@ struct SlotMasks {
     tasks: u64,
     exit_bridge: bool,
     scope_count: usize,
+    scope_exit_count: usize,
+    has_scope_exit: bool,
 }
 
 fn validate_shape(
@@ -531,6 +561,8 @@ fn validate_shape(
     let mut legacy_complete = false;
     let mut scope_count = 0;
     let mut has_scope_drain = false;
+    let mut scope_exit_count = 0;
+    let mut has_scope_exit = false;
     for (index, slot) in function.slots.iter().enumerate() {
         match &slot.ty {
             TaskSlotType::Value { borrowed: true, .. } => borrowed |= bit(SlotId(index)),
@@ -557,6 +589,11 @@ fn validate_shape(
         for operation in &state.operations {
             budget.spend()?;
             match operation {
+                TaskOp::ScopeExitBegin { .. } => {
+                    has_scope_exit = true;
+                    scope_exit_count += 1; // Preflight bounds all operations.
+                }
+                TaskOp::ScopeExitEnd { .. } => has_scope_exit = true,
                 TaskOp::ScopeEnter { tasks, .. } => {
                     scope_count += 1; // Already bounded by preflight operations.
                     budget.spend_many(tasks.len())?;
@@ -818,6 +855,8 @@ fn validate_shape(
         tasks,
         exit_bridge,
         scope_count,
+        scope_exit_count,
+        has_scope_exit,
     })
 }
 
@@ -884,6 +923,14 @@ fn validate_regions_and_progress(
             }
             if matches!(operation, TaskOp::ScopeEnter { .. }) {
                 return Err(invalid("cleanup cannot enter a scope"));
+            }
+            if matches!(
+                operation,
+                TaskOp::ScopeExitBegin { .. } | TaskOp::ScopeExitEnd { .. }
+            ) {
+                return Err(invalid(
+                    "cleanup cannot enter a normal scope-exit operation",
+                ));
             }
             if matches!(
                 operation,
@@ -998,6 +1045,9 @@ enum ScopeParent {
 
 struct ScopeLayout {
     descriptors: Vec<TaskScopeFrame>,
+    // Retain already-computed facts only for the marker-enabled path.
+    exit_parents: Vec<ScopeParent>,
+    exit_inputs: Vec<Option<ScopeTop>>,
 }
 
 impl ScopeLayout {
@@ -1018,6 +1068,8 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::Unary { dst, .. }
         | TaskOp::Binary { dst, .. } => Some(*dst),
         TaskOp::ScopeEnter { .. }
+        | TaskOp::ScopeExitBegin { .. }
+        | TaskOp::ScopeExitEnd { .. }
         | TaskOp::Read { .. }
         | TaskOp::Drop { .. }
         | TaskOp::DropIfInit { .. }
@@ -1029,12 +1081,15 @@ fn validate_scope_layout(
     function: &TaskFunction,
     count: usize,
     normal: &[bool],
+    capture_exits: bool,
     budget: &mut Budget,
 ) -> KuResult<ScopeLayout> {
     if count == 0 {
         // No new walk, allocation or analysis charge on the legacy path.
         return Ok(ScopeLayout {
             descriptors: Vec::new(),
+            exit_parents: Vec::new(),
+            exit_inputs: Vec::new(),
         });
     }
     budget.spend_many(count)?;
@@ -1151,7 +1206,178 @@ fn validate_scope_layout(
             }
         }
     }
-    Ok(ScopeLayout { descriptors })
+    Ok(ScopeLayout {
+        descriptors,
+        exit_parents: if capture_exits { parents } else { Vec::new() },
+        exit_inputs: if capture_exits { inputs } else { Vec::new() },
+    })
+}
+
+fn validate_scope_exits(
+    function: &TaskFunction,
+    masks: SlotMasks,
+    normal: &[bool],
+    scopes: &ScopeLayout,
+    budget: &mut Budget,
+) -> KuResult<TaskScopeExitPlan> {
+    if !masks.has_scope_exit {
+        return Ok(TaskScopeExitPlan::default());
+    }
+    let count = masks.scope_exit_count;
+    if count == 0 || scopes.exit_inputs.len() != function.states.len() {
+        return Err(invalid(
+            "scope-exit operation requires a Begin and active scope",
+        ));
+    }
+    budget.spend_many(count)?;
+    let mut begins = vec![None; count];
+    budget.spend_many(count)?;
+    let mut ends = vec![None; count];
+    for (id, state) in function.states.iter().enumerate() {
+        budget.spend()?;
+        for operation in &state.operations {
+            budget.spend()?;
+            let (exit, is_begin) = match operation {
+                TaskOp::ScopeExitBegin { exit, .. } => (*exit, true),
+                TaskOp::ScopeExitEnd { exit } => (*exit, false),
+                _ => continue,
+            };
+            if !normal[id]
+                || state.operations.len() != 1
+                || !matches!(state.terminator, TaskTerminator::Jump { .. })
+            {
+                return Err(invalid(
+                    "scope-exit marker requires a dedicated normal Jump state",
+                ));
+            }
+            let table = if is_begin { &mut begins } else { &mut ends };
+            let cell = table
+                .get_mut(exit.0)
+                .ok_or_else(|| invalid("scope-exit ids must be dense Begin indices"))?;
+            if cell.replace(StateId(id)).is_some() {
+                return Err(invalid("duplicate scope-exit marker"));
+            }
+        }
+    }
+    budget.spend_many(function.states.len())?;
+    let mut state_operations = vec![None; function.states.len()];
+    budget.spend_many(count)?;
+    let mut operations = Vec::with_capacity(count);
+    for index in 0..count {
+        budget.spend()?;
+        let begin = begins[index].ok_or_else(|| invalid("missing scope-exit Begin"))?;
+        let end = ends[index].ok_or_else(|| invalid("missing scope-exit End"))?;
+        let TaskOp::ScopeExitBegin { retain, .. } = function.states[begin.0].operations[0] else {
+            return Err(invalid("scope-exit Begin descriptor mismatch"));
+        };
+        if retain.is_some_and(|scope| scope.0 >= scopes.descriptors.len()) {
+            return Err(invalid("scope-exit retain references an unknown scope"));
+        }
+        let retained = retain.map_or(ScopeTop::Root, ScopeTop::Scope);
+        let mut top = scopes.exit_inputs[begin.0]
+            .ok_or_else(|| invalid("scope-exit Begin has no normal scope context"))?;
+        if top == retained {
+            return Err(invalid("scope-exit retain must be a proper ancestor"));
+        }
+        while top != retained {
+            budget.spend()?;
+            let ScopeTop::Scope(scope) = top else {
+                return Err(invalid("scope-exit retain must be a proper ancestor"));
+            };
+            let Some(ScopeParent::Bound(parent)) = scopes.exit_parents.get(scope.0) else {
+                return Err(invalid("scope-exit retain has no bound ancestor"));
+            };
+            top = *parent;
+        }
+        let TaskTerminator::Jump {
+            target: mut current,
+        } = function.states[begin.0].terminator
+        else {
+            return Err(invalid("scope-exit Begin must Jump"));
+        };
+        let exit = TaskScopeExitId(index);
+        loop {
+            budget.spend()?;
+            if !normal[current.0] || state_operations[current.0].replace(exit).is_some() {
+                return Err(invalid("overlapping or cyclic scope-exit operation"));
+            }
+            let state = &function.states[current.0];
+            if current == end {
+                if scopes.exit_inputs[current.0] != Some(retained) {
+                    return Err(invalid("scope-exit End has not reached its retained scope"));
+                }
+                break;
+            }
+            for operation in &state.operations {
+                budget.spend()?;
+                if !matches!(operation, TaskOp::Drop { .. } | TaskOp::DropIfInit { .. }) {
+                    return Err(invalid("scope-exit operation permits only Value drops"));
+                }
+            }
+            current = match state.terminator {
+                TaskTerminator::Jump { target } => target,
+                TaskTerminator::ScopeDrain { ready, .. } => ready,
+                _ => {
+                    return Err(invalid(
+                        "scope-exit operation requires a finite drain chain",
+                    ))
+                }
+            };
+        }
+        budget.spend()?;
+        operations.push(TaskScopeExitFrame {
+            exit,
+            begin,
+            end,
+            retain,
+        });
+    }
+    // Check every incoming normal edge; a raw producer cannot bypass Begin
+    // merely by targeting a state that was discovered by the linear walk.
+    if state_operations[function.entry.0].is_some() {
+        return Err(invalid("function entry bypasses scope-exit Begin"));
+    }
+    for (id, state) in function.states.iter().enumerate() {
+        budget.spend()?;
+        if !normal[id] {
+            continue;
+        }
+        let mut outgoing = state_operations[id];
+        match state.operations.as_slice() {
+            [TaskOp::ScopeExitBegin { exit, .. }] => {
+                if outgoing.is_some() {
+                    return Err(invalid("nested scope-exit Begin"));
+                }
+                outgoing = Some(*exit);
+            }
+            [TaskOp::ScopeExitEnd { exit }] => {
+                if outgoing != Some(*exit) {
+                    return Err(invalid("scope-exit End identity mismatch"));
+                }
+                outgoing = None;
+            }
+            _ => {}
+        }
+        let next = match state.terminator {
+            TaskTerminator::ScopeDrain { ready, .. } | TaskTerminator::Await { ready, .. } => {
+                [Some(ready), None]
+            }
+            TaskTerminator::Suspend { resume, .. } => [Some(resume), None],
+            ref term => successors(term),
+        };
+        for target in next.into_iter().flatten() {
+            budget.spend()?;
+            if state_operations[target.0] != outgoing {
+                return Err(invalid(
+                    "normal edge crosses a scope-exit operation boundary",
+                ));
+            }
+        }
+    }
+    Ok(TaskScopeExitPlan {
+        operations,
+        state_operations,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1187,7 +1413,11 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
             state.must = (state.must & !consumed) | bit(*dst);
             state.may = (state.may & !consumed) | bit(*dst);
         }
-        TaskOp::Read { .. } | TaskOp::Print { .. } | TaskOp::ScopeEnter { .. } => {}
+        TaskOp::Read { .. }
+        | TaskOp::Print { .. }
+        | TaskOp::ScopeEnter { .. }
+        | TaskOp::ScopeExitBegin { .. }
+        | TaskOp::ScopeExitEnd { .. } => {}
     }
     state
 }
@@ -1352,7 +1582,9 @@ fn live_states(
             for operation in state.operations.iter().rev() {
                 operation_work(operation, budget)?;
                 match operation {
-                    TaskOp::ScopeEnter { .. } => {}
+                    TaskOp::ScopeEnter { .. }
+                    | TaskOp::ScopeExitBegin { .. }
+                    | TaskOp::ScopeExitEnd { .. } => {}
                     TaskOp::Init { dst, .. } => live &= !bit(*dst),
                     TaskOp::Copy { dst, src }
                     | TaskOp::Move { dst, src }
@@ -1544,6 +1776,7 @@ fn validate_ownership_and_plan(
         exit_bridge: masks.exit_bridge,
         scope_task_mask: masks.tasks,
         scopes: scopes.descriptors,
+        scope_exits: TaskScopeExitPlan::default(),
         slots: slots(frame),
         suspensions,
     })
@@ -1619,17 +1852,20 @@ pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<Ta
     let mut functions = Vec::new();
     for (function, masks) in program.functions.iter().zip(masks) {
         let normal = validate_regions_and_progress(function, masks.scope_count != 0, &mut budget)?;
-        let scopes = validate_scope_layout(function, masks.scope_count, &normal, &mut budget)?;
+        let scopes = validate_scope_layout(
+            function,
+            masks.scope_count,
+            &normal,
+            masks.has_scope_exit,
+            &mut budget,
+        )?;
+        let scope_exits = validate_scope_exits(function, masks, &normal, &scopes, &mut budget)?;
         let inputs = initialized_states(function, masks, &scopes, &mut budget)?;
         let live = live_states(function, masks.tasks, &scopes, &mut budget)?;
-        functions.push(validate_ownership_and_plan(
-            function,
-            masks,
-            &inputs,
-            &live,
-            scopes,
-            &mut budget,
-        )?);
+        let mut frame =
+            validate_ownership_and_plan(function, masks, &inputs, &live, scopes, &mut budget)?;
+        frame.scope_exits = scope_exits;
+        functions.push(frame);
     }
     Ok(TaskFramePlan { functions })
 }
