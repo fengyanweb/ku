@@ -120,6 +120,8 @@ fn main(): null! {
         "stage3-named-import-success",
         "stage3-function-statements-success",
         "stage3-function-statements-failure",
+        "stage3-borrowed-parameters-success",
+        "stage3-borrowed-parameters-failure",
         "stage3-if-statements-success",
         "stage3-if-statements-failure",
         "stage3-while-statements-success",
@@ -414,6 +416,30 @@ static KuParserInput ku_stage3_function_statements_input(size_t statements, int 
   input.hash = ku_parser_fingerprint(input.data, input.len);
   return input;
 }
+static KuParserInput ku_stage3_borrowed_parameters_input(size_t parameters, int failure) {
+  static const char prefix[] = "fn f(";
+  static const char parameter[] = "&p00:str,";
+  const char* suffix = failure ? "{" : "{}";
+  size_t prefix_len = sizeof(prefix) - 1, parameter_len = sizeof(parameter) - 1;
+  size_t suffix_len = strlen(suffix);
+  KuParserInput input = {0};
+  if (!parameters || parameters > 32) return input;
+  input.len = prefix_len + parameters * parameter_len + suffix_len;
+  input.data = (uint8_t*)malloc(input.len);
+  if (!input.data) return input;
+  memcpy(input.data, prefix, prefix_len);
+  size_t cursor = prefix_len;
+  for (size_t i = 0; i < parameters; i++) {
+    memcpy(input.data + cursor, parameter, parameter_len);
+    input.data[cursor + 2] = (uint8_t)('0' + i / 10);
+    input.data[cursor + 3] = (uint8_t)('0' + i % 10);
+    cursor += parameter_len;
+  }
+  input.data[cursor - 1] = ')';
+  memcpy(input.data + cursor, suffix, suffix_len);
+  input.hash = ku_parser_fingerprint(input.data, input.len);
+  return input;
+}
 static KuParserInput ku_stage3_if_statements_input(size_t statements, int failure) {
   static const char prefix[] = "fn main(){if(true){\n";
   static const char statement[] = "x=1\n";
@@ -690,6 +716,16 @@ static int ku_measure_parser(
       CHECK(KU_STRING_IS_ZERO(parsed.error.domain)
           && KU_STRING_IS_ZERO(parsed.error.code)
           && KU_STRING_IS_ZERO(parsed.error.message));
+      if (input.len >= 7 && !memcmp(input.data, "fn f(&p", 7)) {
+        size_t parameters = 0;
+        for (size_t i = 0; i < parsed.value.arena.nodes.len; i++) {
+          if (ku_parser_string_equals(parsed.value.arena.nodes.data[i].kind, "Parameter")) {
+            CHECK(parsed.value.arena.nodes.data[i].int_value == 1);
+            parameters++;
+          }
+        }
+        CHECK(parameters == (input.len - 7) / 9);
+      }
     } else {
       CHECK(!parsed.ok && !parsed.value.root
           && KU_ARRAY_IS_ZERO(parsed.value.arena.nodes)
@@ -842,6 +878,19 @@ int main(void) {
   CHECK(ku_check_scale_bounded("stage3-function-statements-failure", @KU_STAGE3_PARSE@,
       ku_stage3_function_statements_input(32, 1),
       ku_stage3_function_statements_input(64, 1), 0,
+      "bootstrap.parser.stage3", "unexpected_eof",
+      "error|bootstrap.parser.stage3|unexpected_eof|<source>|expected '}' after function body|",
+      9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  /* 16/32 borrowed parameters preserve the one-bit mode in every Parameter
+     node. The failed forms allocate the same signature before missing the
+     body close; every round must drop both its partial arena and diagnostic. */
+  CHECK(ku_check_scale_bounded("stage3-borrowed-parameters-success", @KU_STAGE3_PARSE@,
+      ku_stage3_borrowed_parameters_input(16, 0),
+      ku_stage3_borrowed_parameters_input(32, 0), 1, "", "", "",
+      9, 4, 64, 16 * 1024, 8 * 1024) == 0);
+  CHECK(ku_check_scale_bounded("stage3-borrowed-parameters-failure", @KU_STAGE3_PARSE@,
+      ku_stage3_borrowed_parameters_input(16, 1),
+      ku_stage3_borrowed_parameters_input(32, 1), 0,
       "bootstrap.parser.stage3", "unexpected_eof",
       "error|bootstrap.parser.stage3|unexpected_eof|<source>|expected '}' after function body|",
       9, 4, 64, 16 * 1024, 8 * 1024) == 0);

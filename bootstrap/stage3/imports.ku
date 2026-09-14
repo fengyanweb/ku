@@ -17,13 +17,6 @@ struct ImportRead {
     work: int
 }
 
-fn ConsumedImportToken(tokens: [Token], index: int): Token {
-    if (tokens[index].kind == "Eof" && index > 0) {
-        return tokens[index - 1].clone()
-    }
-    return tokens[index].clone()
-}
-
 // The caller supplies one bounded import window ending at EOF or one token
 // after the first string. Every accepted grammar path therefore has the path
 // token and optional semicolon lookahead without copying the complete module.
@@ -68,7 +61,7 @@ fn ReadImport(tokens: [Token]): ImportRead! {
             }
             source = tokens[cursor].clone()
             if (source.kind != "Ident") {
-                RejectAt(ConsumedImportToken(tokens.clone(), cursor), "unexpected_token", "expected imported name")?
+                RejectAt(source.clone(), "unexpected_token", "expected imported name")?
             }
             cursor = cursor + 1
             alias = source.clone()
@@ -77,14 +70,10 @@ fn ReadImport(tokens: [Token]): ImportRead! {
                 cursor = cursor + 1
                 alias = tokens[cursor].clone()
                 if (alias.kind != "Ident") {
-                    if (alias.kind == "Eof" && cursor > 0) {
-                        alias = tokens[cursor - 1].clone()
-                    } else {
-                        RejectAt(alias.clone(), "unexpected_token", "expected import alias")?
-                    }
+                    RejectAt(alias.clone(), "unexpected_token", "expected import alias")?
                 }
                 has_alias = true
-                if (tokens[cursor].kind != "Eof") { cursor = cursor + 1 }
+                cursor = cursor + 1
             }
             import_name = ImportNameRead { source: source, alias: alias, has_alias: has_alias }
             names = names.push(import_name)
@@ -107,7 +96,7 @@ fn ReadImport(tokens: [Token]): ImportRead! {
     } else if (tokens[cursor].kind != "String") {
         namespace = tokens[cursor].clone()
         if (namespace.kind != "Ident") {
-            RejectAt(ConsumedImportToken(tokens.clone(), cursor), "unexpected_token", "expected import namespace or path")?
+            RejectAt(namespace.clone(), "unexpected_token", "expected import namespace or path")?
         }
         has_namespace = true
         cursor = cursor + 1
@@ -118,7 +107,7 @@ fn ReadImport(tokens: [Token]): ImportRead! {
     }
     path = tokens[cursor].clone()
     if (path.kind != "String") {
-        RejectAt(ConsumedImportToken(tokens.clone(), cursor), "unexpected_token", "expected import path string")?
+        RejectAt(path.clone(), "unexpected_token", "expected import path string")?
     }
     cursor = cursor + 1
     if (tokens[cursor].kind == "Semicolon") { cursor = cursor + 1 }

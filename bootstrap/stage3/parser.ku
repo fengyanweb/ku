@@ -48,8 +48,8 @@ fn ParseProgram(source: str): ParseOutput! {
         RejectAt(eof.clone(), "invalid_token_stream", "token stream is missing EOF")?
     }
 
-    // The source moves through the mapper and back; only the bounded token
-    // array is cloned once so the main parser can keep its cursor.
+    // The source moves through the mapper and back. Give the mapper one token
+    // copy; the separate callback snapshot below keeps the scanner unshared.
     mapped = MapTokenCharacters(source, tokens.clone())?
     token_char_starts: [int] = mapped.starts
     token_char_ends: [int] = mapped.ends
@@ -146,14 +146,17 @@ fn ParseProgram(source: str): ParseOutput! {
     }
     append_arena: fn(ParseOutput, Token): int! = AddArena
 
+    // After the 512-token/EOF preflight, keep one callback-owned snapshot so
+    // the outer scanner's tokens binding is not retained by this closure.
+    expression_tokens = tokens.clone()
     fn ParseExpressionWindow(start: int, end: int): ParseOutput! {
-        if (start > end || start < 0 || end > tokens.len() - 1) {
-            diagnostic_index = tokens.len() - 1
-            if (start >= 0 && start < tokens.len()) { diagnostic_index = start }
-            RejectAt(tokens[diagnostic_index].clone(), "invalid_expression_range", "statement expression token range is invalid")?
+        if (start > end || start < 0 || end > expression_tokens.len() - 1) {
+            diagnostic_index = expression_tokens.len() - 1
+            if (start >= 0 && start < expression_tokens.len()) { diagnostic_index = start }
+            RejectAt(expression_tokens[diagnostic_index].clone(), "invalid_expression_range", "statement expression token range is invalid")?
         }
-        origin = tokens[start].clone()
-        boundary = tokens[end].clone()
+        origin = expression_tokens[start].clone()
+        boundary = expression_tokens[end].clone()
         // string.slice may scan the complete source. Keep an explicit aggregate
         // budget so comment-heavy modules cannot multiply that scan by every
         // statement. This also avoids interpreter per-character concatenation.

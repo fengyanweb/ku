@@ -1,5 +1,8 @@
 use crate::span::Span;
 
+mod compiled;
+pub(crate) use compiled::{reject_compiled_async, reject_compiled_async_expression};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,

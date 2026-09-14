@@ -1,6 +1,30 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+#[path = "c_output.rs"]
+mod output;
+use output::COutput;
+
+#[path = "c_int.rs"]
+mod checked_int;
+#[path = "c_sync.rs"]
+mod sync;
+
+#[path = "c_task.rs"]
+mod task;
+#[path = "c_task_adapter.rs"]
+mod task_adapter;
+#[path = "c_task_control.rs"]
+mod task_control;
+#[path = "c_task_driver.rs"]
+mod task_driver;
+#[path = "c_task_root.rs"]
+mod task_root;
+
+// Whole generated-file bytes, including shared runtimes and all specializations.
+// This is independent of the checker's generic AST/type admission budget.
+const MAX_GENERATED_C_BYTES: usize = 64 * 1024 * 1024;
+
 use crate::{
     ast::{BinaryOp, ParamMode, UnaryOp},
     error::{KuError, KuResult},
@@ -202,7 +226,140 @@ pub fn generate_c_source_with_options(
     program: &IrProgram,
     options: &CBackendOptions,
 ) -> KuResult<String> {
+    generate_c_source_bounded(program, options, MAX_GENERATED_C_BYTES)
+}
+
+/// Compile verified internal task frames alongside the existing synchronous
+/// runtime helpers. This is not AST async lowering and is not a CLI capability.
+/// Its bounded worker-group driver is internal; no source Task handle, complete M:N scheduler
+/// or external I/O runtime is supplied by this entry point.
+pub fn generate_task_frame_c_source(
+    program: &IrProgram,
+    frames: &crate::ir::task::TaskProgram,
+) -> KuResult<String> {
+    let plan = crate::ir::task::verify_and_plan(frames, Default::default())?;
+    if !frames.functions.is_empty()
+        && program.functions.iter().any(|function| {
+            let name = c_symbol(&function.name);
+            name.starts_with("ku_task_frame_")
+                || name.starts_with("KuTaskFrame")
+                || name.starts_with("KU_TASK_FRAME_")
+                || name.starts_with("ku_task_control_")
+                || name.starts_with("KuTaskControl")
+                || name.starts_with("KU_TASK_CONTROL_")
+                || name.starts_with("ku_task_driver_")
+                || name.starts_with("KuTaskDriver")
+                || name.starts_with("KU_TASK_DRIVER_")
+                || name.starts_with("ku_task_adapter_")
+                || name.starts_with("KuTaskAdapter")
+                || name.starts_with("KU_TASK_ADAPTER_")
+                || name.starts_with("ku_task_value_")
+                || name.starts_with("KuTaskValue")
+                || name.starts_with("KU_TASK_VALUE_")
+                || name.starts_with("KU_TASK_EXIT_")
+                || name.starts_with("ku_task_outcome_")
+                || name.starts_with("ku_task_host_")
+                || name.starts_with("ku_task_root_")
+                || name.starts_with("ku_int_")
+                || name.starts_with("KU_INT_")
+                || name.starts_with("KuTaskInstance_")
+                || name.starts_with("KuTaskHandle_")
+                || name
+                    .strip_prefix("ku_task_")
+                    .and_then(|suffix| suffix.bytes().next())
+                    .is_some_and(|first| first.is_ascii_digit())
+        })
+    {
+        return Err(unsupported(
+            "synchronous function collides with internal task frame ABI",
+        ));
+    }
+    generate_c_source_with_frames_bounded(
+        program,
+        &CBackendOptions::default(),
+        MAX_GENERATED_C_BYTES,
+        Some((frames, &plan, None)),
+    )
+}
+
+/// Generate the verified, restricted Task program and its real external root.
+/// This is not a fallback through the interpreter or synchronous lowering.
+pub fn generate_native_task_c_source(
+    native: &crate::ir::task_lower::NativeTaskProgram,
+    options: &CBackendOptions,
+) -> KuResult<String> {
+    let plan = crate::ir::task::verify_and_plan(&native.tasks, Default::default())?;
+    let entry = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.id == native.entry)
+        .ok_or_else(|| unsupported("native Task entry is missing"))?;
+    if !entry.parameters.is_empty() || entry.result != IrType::Result(Box::new(IrType::Null)) {
+        return Err(unsupported(
+            "native Task entry must return null! without parameters",
+        ));
+    }
+    let sync = IrProgram {
+        functions: Vec::new(),
+        layouts: crate::ir::IrLayoutTable {
+            structs: Vec::new(),
+            enums: Vec::new(),
+        },
+    };
+    generate_c_source_with_frames_bounded(
+        &sync,
+        options,
+        MAX_GENERATED_C_BYTES,
+        Some((&native.tasks, &plan, Some(native.entry))),
+    )
+}
+
+fn generate_c_source_bounded(
+    program: &IrProgram,
+    options: &CBackendOptions,
+    byte_limit: usize,
+) -> KuResult<String> {
+    generate_c_source_with_frames_bounded(program, options, byte_limit, None)
+}
+
+fn generate_c_source_with_frames_bounded(
+    program: &IrProgram,
+    options: &CBackendOptions,
+    byte_limit: usize,
+    frames: Option<(
+        &crate::ir::task::TaskProgram,
+        &crate::ir::task::TaskFramePlan,
+        Option<crate::ir::task::TaskFunctionId>,
+    )>,
+) -> KuResult<String> {
     crate::ir::verify_borrow_contract(program)?;
+    sync::validate_program(program)?;
+    let checked_integer_runtime = sync::uses_checked_integer(program)
+        || frames.is_some_and(|(tasks, _, _)| task::uses_checked_integer(tasks));
+    sync::validate_identifiers(program, checked_integer_runtime)?;
+    let mut frame_result_types = Vec::new();
+    if let Some((frames, _, _)) = frames {
+        if !frames.functions.is_empty() {
+            // The fixed outcome union is shared by all typed Task dispatches.
+            for primitive in [IrType::Int, IrType::Bool, IrType::Null, IrType::Str] {
+                collect_result_type(
+                    &IrType::Result(Box::new(primitive)),
+                    &mut frame_result_types,
+                )?;
+            }
+        }
+        for function in &frames.functions {
+            collect_result_type(&function.result, &mut frame_result_types)?;
+            for slot in &function.slots {
+                let ty = match &slot.ty {
+                    crate::ir::task::TaskSlotType::Value { ty, .. } => ty,
+                    crate::ir::task::TaskSlotType::Task { result } => result,
+                };
+                collect_result_type(ty, &mut frame_result_types)?;
+            }
+        }
+    }
     for function in &program.functions {
         validate_cfg(function)?;
     }
@@ -215,7 +372,8 @@ pub fn generate_c_source_with_options(
             )));
         }
     }
-    let mut out = String::from(
+    let mut out = COutput::new(byte_limit);
+    out.push_str(
         "#if defined(__linux__) && !defined(_GNU_SOURCE)\n#define _GNU_SOURCE\n#endif\n\
          #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)\n#define _DARWIN_C_SOURCE\n#endif\n\
          #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)\n#define _POSIX_C_SOURCE 200809L\n#endif\n\
@@ -268,6 +426,7 @@ pub fn generate_c_source_with_options(
          static int64_t ku_time_elapsed(KuTime previous) {\n  ku_time_validate(previous);\n  int64_t now = ku_time_now_millis();\n  if ((previous.millis > 0 && now < INT64_MIN + previous.millis) ||\n      (previous.millis < 0 && now > INT64_MAX + previous.millis)) {\n    ku_time_fail(\"time.elapsed: elapsed milliseconds overflow\");\n  }\n  return now - previous.millis;\n}\n\
          static void ku_time_print(KuTime value) {\n  ku_time_validate(value);\n  printf(\"{ kind: time.time, millis: %lld }\", (long long)value.millis);\n}\n\n",
     );
+    out.check()?;
     // Socket headers shared by the native HTTP and Redis runtimes. `winsock2.h`
     // must precede any `windows.h`; on POSIX both runtimes use poll(2) rather
     // than select(2), so descriptors above FD_SETSIZE remain safe.
@@ -380,6 +539,14 @@ pub fn generate_c_source_with_options(
          \x20 return timed_out;\n\
          }\n\n",
     );
+    // Helpers precede synchronous functions and are shared with Task emission.
+    if checked_integer_runtime {
+        checked_int::emit_runtime(&mut out)?;
+        out.push_str("typedef char KuSyncStatusContract[(KU_INT_OK == 0u && KU_INT_OVERFLOW == 1u && KU_INT_DIV_ZERO == 2u) ? 1 : -1];\n");
+    }
+    if !program.functions.is_empty() {
+        sync::emit_runtime(&mut out)?;
+    }
     // Aggregate struct fields (e.g. `[Person]`) need a layered emission so the
     // struct↔array cycle resolves: forward-declare every struct tag, then emit all
     // array typedefs (a `KuArray_KuStruct_X` only needs the struct as a pointer),
@@ -390,7 +557,7 @@ pub fn generate_c_source_with_options(
     // complete) Result/closure tag is enough for `[T!]` and `[fn(...): T]`.
     // Their bodies/helpers are completed later, after their by-value
     // dependencies are available.
-    emit_result_forward_decls(&mut out, program)?;
+    emit_result_forward_decls(&mut out, program, &frame_result_types)?;
     emit_closure_forward_decls(&mut out, program)?;
     emit_array_typedefs(&mut out, program)?;
     emit_array_helper_prototypes(&mut out, program)?;
@@ -413,6 +580,8 @@ pub fn generate_c_source_with_options(
     if !closure_types_present.is_empty()
         || program_uses_object(program)
         || program_uses_http(program)
+        // Task controls reuse the atomic representation even with no closures.
+        || frames.is_some_and(|(frames, _, _)| !frames.functions.is_empty())
     {
         emit_closure_refcount_header(&mut out);
         closure_header_done = true;
@@ -433,7 +602,7 @@ pub fn generate_c_source_with_options(
     // their typed KuArray helper bodies call ku_object_{clone,drop,move}.
     emit_late_array_typedefs(&mut out, program)?;
     emit_http_types(&mut out, program)?;
-    emit_result_abi(&mut out, program)?;
+    emit_result_abi(&mut out, program, &frame_result_types)?;
     emit_closure_types(
         &mut out,
         program,
@@ -466,19 +635,27 @@ pub fn generate_c_source_with_options(
     emit_cell_types(&mut out, program)?;
     emit_env_types(&mut out, program)?;
     emit_array_map_helpers(&mut out, program)?;
-    emit_closure_body_prototypes(&mut out, program)?;
+    emit_function_prototypes(&mut out, program)?;
     emit_closure_thunk_prototypes(&mut out, program)?;
     emit_http_runtime(&mut out, program)?;
     emit_pg_runtime(&mut out, program);
     emit_redis_runtime(&mut out, program);
     emit_mysql_runtime(&mut out, program);
     for function in &program.functions {
+        out.check()?;
         emit_function(&mut out, function)?;
         out.push('\n');
     }
     emit_closure_thunks(&mut out, program)?;
-    emit_main_wrapper(&mut out, program, fs_usage, &options.fs_base)?;
-    Ok(out)
+    if let Some((frames, plan, _)) = frames {
+        task::emit_frames(&mut out, frames, plan)?;
+    }
+    if let Some((frames, _, Some(entry))) = frames {
+        task_root::emit(&mut out, frames, entry)?;
+    } else {
+        emit_main_wrapper(&mut out, program, fs_usage, &options.fs_base)?;
+    }
+    out.finish()
 }
 
 /// Record every function's `KuClosure` `invoke` symbol so MakeClosure codegen can
@@ -514,7 +691,8 @@ fn closure_signature_is_self_contained(params: &[IrType], ret: &IrType) -> bool 
 /// Declare every signature-specific closure tag before any array typedef. An
 /// array only stores `KuClosure_*` behind a pointer, so the tag may remain
 /// incomplete until its signature's aggregate types are available.
-fn emit_closure_forward_decls(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_closure_forward_decls(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut types = Vec::new();
     collect_closure_types_program(program, &mut types);
     let mut emitted = std::collections::HashSet::new();
@@ -549,7 +727,10 @@ fn emit_closure_forward_decls(out: &mut String, program: &IrProgram) -> KuResult
 /// Clang, and Zig use the C11 atomic API over a naturally aligned `size_t`.
 /// Retain only needs relaxed ordering; the final release is acquire/release so
 /// the unique 1 -> 0 thread observes prior writes before destroying the payload.
-fn emit_closure_refcount_header(out: &mut String) {
+fn emit_closure_refcount_header(out: &mut COutput) {
+    if out.failed() {
+        return;
+    }
     out.push_str(
         r#"#if defined(_MSC_VER)
 #include <intrin.h>
@@ -640,12 +821,13 @@ typedef struct KuEnvHeader {
 /// resolves `KuClosure_*`); the second pass (`false`) emits the remainder after
 /// those ABIs exist (so a closure returning e.g. `[int]` sees `KuArray_int`).
 fn emit_closure_types(
-    out: &mut String,
+    out: &mut COutput,
     program: &IrProgram,
     header_done: &mut bool,
     emitted: &mut std::collections::HashSet<String>,
     self_contained_only: bool,
 ) -> KuResult<()> {
+    out.check()?;
     let mut types = Vec::new();
     collect_closure_types_program(program, &mut types);
     let selected: Vec<&IrType> = types
@@ -710,7 +892,8 @@ fn emit_closure_types(
 
 /// Stage 6b: emit a `KuCell_{suffix}` box plus new/retain/release for every Copy
 /// payload type boxed anywhere in the program (discovered from `CellNew`).
-fn emit_cell_types(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_cell_types(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut inners: Vec<IrType> = Vec::new();
     for function in &program.functions {
         for block in &function.blocks {
@@ -747,12 +930,14 @@ fn emit_cell_types(out: &mut String, program: &IrProgram) -> KuResult<()> {
 /// Stage 6b: emit a `KuEnv_{id}` (with type-erased retain/release matching
 /// `KuEnvHeader`) for every capturing closure body. The env holds one reference
 /// per captured cell (retained on `new`, released on the env's final release).
-fn emit_env_types(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_env_types(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut emitted = false;
     for function in &program.functions {
         if !function.is_closure_body || function.captures.is_empty() {
             continue;
         }
+        out.check()?;
         let id = function.id.0;
         // Field declarations and the constructor parameter list.
         let mut fields = String::new();
@@ -795,35 +980,39 @@ fn emit_env_types(out: &mut String, program: &IrProgram) -> KuResult<()> {
     Ok(())
 }
 
-/// Forward-declare every lifted closure body so a `MakeClosure` can reference it
-/// regardless of where the body sits in the emitted function order.
-fn emit_closure_body_prototypes(out: &mut String, program: &IrProgram) -> KuResult<()> {
-    let mut emitted = false;
+/// Function order is not call order: imported functions, mutually recursive
+/// functions and monomorphized instances may follow their callers. Use the same
+/// signature for declarations and definitions, including borrowed parameters.
+fn emit_function_prototypes(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     for function in &program.functions {
-        if !function.is_closure_body {
-            continue;
-        }
-        out.push_str(&closure_body_signature(function)?);
+        out.push_str(&function_signature(function)?);
         out.push_str(";\n");
-        emitted = true;
     }
-    if emitted {
+    if !program.functions.is_empty() {
         out.push('\n');
     }
     Ok(())
 }
 
-/// The C signature of a lifted closure body (leading `void* __env`), matching
-/// what `emit_function` emits so the forward declaration and definition agree.
-fn closure_body_signature(function: &IrFunction) -> KuResult<String> {
-    let mut params = String::from("void* __env");
+fn function_signature(function: &IrFunction) -> KuResult<String> {
+    let mut params = if function.is_closure_body {
+        String::from("void* __env")
+    } else {
+        String::new()
+    };
     for param in &function.params {
-        params.push_str(", ");
+        if !params.is_empty() {
+            params.push_str(", ");
+        }
         params.push_str(&format!(
             "{} {}",
             c_param_type(&param.ty, param.mode)?,
             c_ident(&param.name)
         ));
+    }
+    if params.is_empty() {
+        params.push_str("void");
     }
     Ok(format!(
         "{} {}({})",
@@ -835,7 +1024,8 @@ fn closure_body_signature(function: &IrFunction) -> KuResult<String> {
 
 /// Forward-declare the adapter thunks so a `MakeClosure` for a top-level function
 /// can be emitted before that thunk's body (which follows all functions).
-fn emit_closure_thunk_prototypes(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_closure_thunk_prototypes(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let targets = closure_thunk_targets(program);
     if targets.is_empty() {
         return Ok(());
@@ -849,7 +1039,8 @@ fn emit_closure_thunk_prototypes(out: &mut String, program: &IrProgram) -> KuRes
 }
 
 /// Emit the adapter thunk bodies: `ret name__thunk(void* __env, params) { (void)__env; return name(args); }`.
-fn emit_closure_thunks(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_closure_thunks(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let targets = closure_thunk_targets(program);
     for function in &targets {
         out.push_str(&thunk_signature(function)?);
@@ -935,7 +1126,8 @@ fn collect_make_closure_ids_expr(expr: &IrExpr, ids: &mut Vec<FunctionId>) {
 /// parameter (== the input element type) and return type (== the result element
 /// type), so it uniquely names the helper. Runs after the array and closure ABIs
 /// so both `KuArray_*` and `KuClosure_*` are already defined.
-fn emit_array_map_helpers(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_array_map_helpers(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut calls = Vec::new();
     collect_array_map_calls_program(program, &mut calls);
     let mut emitted = std::collections::HashSet::new();
@@ -968,6 +1160,7 @@ fn emit_array_map_helpers(out: &mut String, program: &IrProgram) -> KuResult<()>
              \x20     if (__ku_handler_timeout_poll()) {{ timed_out = 1; break; }}\n\
              \x20     result.data[index] = mapper.invoke(mapper.env, {arg});\n\
              \x20     result.len = index + 1;\n\
+             \x20     if (__ku_sync_return_signal.kind != KU_SYNC_EXIT_NONE) {{ timed_out = 1; break; }}\n\
              \x20     if (__ku_handler_timeout_poll()) {{ timed_out = 1; break; }}\n\
              \x20   }}\n\
              \x20 }}\n\
@@ -1118,7 +1311,7 @@ fn walk_terminator_exprs(terminator: &IrTerminator, visit: &mut dyn FnMut(&IrExp
         | IrTerminator::Return(None)
         | IrTerminator::Unreachable => {}
         // A safepoint carries only CFG edges; it has no expression/type payload.
-        IrTerminator::Safepoint { .. } => {}
+        IrTerminator::Safepoint { .. } | IrTerminator::SyncGuard { .. } => {}
     }
 }
 
@@ -1294,7 +1487,8 @@ fn validate_layouts(program: &IrProgram) -> KuResult<()> {
 /// type). This lets a struct hold an enum field and an enum hold a struct payload
 /// in the same program. Array fields embed through a `KuArray_*` pointer, so they
 /// create no ordering dependency (their typedefs are emitted separately).
-fn emit_layouts(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_layouts(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let structs = &program.layouts.structs;
     let enums = &program.layouts.enums;
     let n_structs = structs.len();
@@ -1367,7 +1561,8 @@ fn emit_layouts(out: &mut String, program: &IrProgram) -> KuResult<()> {
     Ok(())
 }
 
-fn emit_struct_layout(out: &mut String, layout: &IrStructLayout) -> KuResult<()> {
+fn emit_struct_layout(out: &mut COutput, layout: &IrStructLayout) -> KuResult<()> {
+    out.check()?;
     // The tag was forward-declared (and typedef'd) by `emit_struct_forward_decls`,
     // so complete the body here rather than re-typedef the name.
     let name = c_struct_type(&layout.name);
@@ -1383,7 +1578,8 @@ fn emit_struct_layout(out: &mut String, layout: &IrStructLayout) -> KuResult<()>
     Ok(())
 }
 
-fn emit_enum_layout(out: &mut String, layout: &IrEnumLayout) -> KuResult<()> {
+fn emit_enum_layout(out: &mut COutput, layout: &IrEnumLayout) -> KuResult<()> {
+    out.check()?;
     let name = c_enum_type(&layout.name);
     out.push_str(&format!(
         "typedef struct {name} {{\n  int32_t tag;\n  union {{\n"
@@ -1484,7 +1680,10 @@ fn collect_all_array_elements(program: &IrProgram, element_types: &mut Vec<IrTyp
 /// a `KuStruct_X*` before the struct body is emitted. The struct body later completes
 /// the same tag (`struct KuStruct_X { ... };`), so `emit_struct_layout` must emit the
 /// body form, not another `typedef`.
-fn emit_struct_forward_decls(out: &mut String, program: &IrProgram) {
+fn emit_struct_forward_decls(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     for layout in &program.layouts.structs {
         let name = c_struct_type(&layout.name);
         out.push_str(&format!("typedef struct {name} {name};\n"));
@@ -1519,7 +1718,8 @@ fn is_early_array_element(element: &IrType, program: &IrProgram) -> bool {
 /// before the struct layouts, plus the shared bounds-fail helper (emitted whenever any
 /// array exists at all). Late-element typedefs are emitted by
 /// `emit_late_array_typedefs`.
-fn emit_array_typedefs(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_array_typedefs(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut element_types = Vec::new();
     collect_all_array_elements(program, &mut element_types);
     if element_types.is_empty() {
@@ -1545,7 +1745,8 @@ fn emit_array_typedefs(out: &mut String, program: &IrProgram) -> KuResult<()> {
 /// Forward-declare the early-element array helpers that the struct ownership pass
 /// calls (a struct's deep clone/drop invokes `ku_array_clone_*` / `ku_array_drop_*`
 /// for its array fields), so those uses resolve before the helper bodies are emitted.
-fn emit_array_helper_prototypes(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_array_helper_prototypes(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut element_types = Vec::new();
     collect_all_array_elements(program, &mut element_types);
     let mut any = false;
@@ -1571,7 +1772,8 @@ fn emit_array_helper_prototypes(out: &mut String, program: &IrProgram) -> KuResu
 /// declare clone/drop for them. Result helpers emitted in the next phase may
 /// own any array by value and therefore need these prototypes before the array
 /// helper bodies themselves are available.
-fn emit_late_array_typedefs(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_late_array_typedefs(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut element_types = Vec::new();
     collect_all_array_elements(program, &mut element_types);
     let mut any = false;
@@ -1606,7 +1808,8 @@ fn emit_late_array_typedefs(out: &mut String, program: &IrProgram) -> KuResult<(
 /// Emit all array ownership/access helper bodies after Result and closure types
 /// are complete. Collection order is inner-before-outer, so nested arrays also
 /// see the helper definitions they call.
-fn emit_array_helper_bodies(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_array_helper_bodies(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut element_types = Vec::new();
     collect_all_array_elements(program, &mut element_types);
     for element in &element_types {
@@ -1618,7 +1821,8 @@ fn emit_array_helper_bodies(out: &mut String, program: &IrProgram) -> KuResult<(
 /// Emit the `KuArray_<suffix>` helper bodies (make/clone/move/drop/get/at/len/
 /// is_empty/push/push_reuse) for one element type. The typedef is emitted separately by
 /// `emit_array_typedefs`.
-fn emit_array_helpers_for(out: &mut String, element: &IrType) -> KuResult<()> {
+fn emit_array_helpers_for(out: &mut COutput, element: &IrType) -> KuResult<()> {
+    out.check()?;
     let array_type = c_array_type(element)?;
     let suffix = c_type_suffix(element)?;
     let element_type = c_type(element)?;
@@ -1814,6 +2018,13 @@ fn validate_cfg(function: &IrFunction) -> KuResult<()> {
                 targets.push(*continue_block);
                 targets.push(*timeout_block);
             }
+            IrTerminator::SyncGuard {
+                continue_block,
+                cleanup_block,
+            } => {
+                targets.push(*continue_block);
+                targets.push(*cleanup_block);
+            }
             IrTerminator::JumpErr { target, .. } => targets.push(*target),
             IrTerminator::Next
             | IrTerminator::PropagateErr(_)
@@ -1833,30 +2044,12 @@ fn validate_cfg(function: &IrFunction) -> KuResult<()> {
     Ok(())
 }
 
-fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
+fn emit_function(out: &mut COutput, function: &IrFunction) -> KuResult<()> {
+    out.check()?;
     let for_each_states = collect_for_each_states(function)?;
     let owned_locals = collect_owned_locals(function, &for_each_states);
-    out.push_str(&format!(
-        "{} {}(",
-        c_type(&function.return_type)?,
-        c_symbol(&function.name)
-    ));
-    // A lifted closure body carries a leading `void* __env` (Stage 6a env is
-    // always NULL); the leading comma below then separates real parameters.
-    if function.is_closure_body {
-        out.push_str("void* __env");
-    }
-    for (index, param) in function.params.iter().enumerate() {
-        if index > 0 || function.is_closure_body {
-            out.push_str(", ");
-        }
-        out.push_str(&format!(
-            "{} {}",
-            c_param_type(&param.ty, param.mode)?,
-            c_ident(&param.name)
-        ));
-    }
-    out.push_str(") {\n");
+    out.push_str(&function_signature(function)?);
+    out.push_str(" {\n");
     out.push_str("  if (++__ku_call_depth > KU_MAX_CALL_DEPTH) { fprintf(stderr, \"maximum call depth exceeded: %d\\n\", KU_MAX_CALL_DEPTH); exit(1); }\n");
     // Set only when this frame itself takes a Safepoint timeout edge. While the
     // frame runs its finally route, TLS unwind_depth grants one bounded cleanup
@@ -1864,6 +2057,7 @@ fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
     // expires, the same frame may take another timeout edge, so the local flag
     // also keeps its unwind-depth contribution idempotent and balanced.
     out.push_str("  int __ku_timeout_unwind = 0;\n");
+    out.push_str("  KuSyncExitSignal __ku_sync_deferred = {0};\n");
     if function.is_closure_body {
         if function.captures.is_empty() {
             out.push_str("  (void)__env;\n");
@@ -1898,6 +2092,7 @@ fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
         }
     }
     for local in &owned_locals {
+        out.check()?;
         if local.is_param {
             continue;
         }
@@ -1918,22 +2113,25 @@ fn emit_function(out: &mut String, function: &IrFunction) -> KuResult<()> {
         )?;
     }
     if function.return_type == IrType::Void {
+        sync::emit_return_guard(out)?;
         emit_owned_cleanup(out, &owned_locals)?;
         out.push_str("  if (__ku_timeout_unwind) __ku_handler_timeout_leave();\n");
         out.push_str("  __ku_call_depth--;\n");
         out.push_str("  return;\n");
     }
+    sync::emit_epilogue(out, function, &owned_locals)?;
     out.push_str("}\n");
     Ok(())
 }
 
 fn emit_block(
-    out: &mut String,
+    out: &mut COutput,
     block: &IrBlock,
     return_type: &IrType,
     owned_locals: &[OwnedLocal],
     for_each_states: &[ForEachState],
 ) -> KuResult<()> {
+    out.check()?;
     if block.id.0 != 0 {
         out.push_str(&format!("block{}:;\n", block.id.0));
     }
@@ -1958,13 +2156,17 @@ fn emit_block(
 }
 
 fn emit_inst(
-    out: &mut String,
+    out: &mut COutput,
     inst: &IrInst,
     return_type: &IrType,
     owned_locals: &[OwnedLocal],
 ) -> KuResult<()> {
+    out.check()?;
     match inst {
         IrInst::Temp { id, ty, value } => {
+            if sync::emit_math_temp(out, *id, value)? {
+                return Ok(());
+            }
             if try_emit_object_construction(out, &format!("t{}", id.0), value)? {
                 return Ok(());
             }
@@ -2113,6 +2315,7 @@ fn emit_inst(
         IrInst::Print(value) => emit_print(out, value)?,
         IrInst::Expr(value) => emit_expr_statement(out, value)?,
         IrInst::Fail(value) => {
+            sync::emit_return_guard(out)?;
             let IrType::Result(inner) = return_type else {
                 return Err(unsupported("native C fail requires a Result return type"));
             };
@@ -2224,7 +2427,8 @@ fn emit_inst(
     Ok(())
 }
 
-fn emit_expr_statement(out: &mut String, value: &IrExpr) -> KuResult<()> {
+fn emit_expr_statement(out: &mut COutput, value: &IrExpr) -> KuResult<()> {
+    out.check()?;
     if let IrExprKind::Call {
         kind: IrCallKind::Intrinsic(name),
         args,
@@ -2245,7 +2449,8 @@ fn emit_expr_statement(out: &mut String, value: &IrExpr) -> KuResult<()> {
     Ok(())
 }
 
-fn emit_statement_intrinsic(out: &mut String, value: &IrExpr) -> KuResult<bool> {
+fn emit_statement_intrinsic(out: &mut COutput, value: &IrExpr) -> KuResult<bool> {
+    out.check()?;
     let IrExprKind::Call { args, kind, .. } = &value.kind else {
         return Ok(false);
     };
@@ -2265,7 +2470,8 @@ fn emit_statement_intrinsic(out: &mut String, value: &IrExpr) -> KuResult<bool> 
     }
 }
 
-fn emit_print(out: &mut String, value: &IrExpr) -> KuResult<()> {
+fn emit_print(out: &mut COutput, value: &IrExpr) -> KuResult<()> {
+    out.check()?;
     match value.ty {
         IrType::Int => {
             out.push_str(&format!(
@@ -2316,7 +2522,8 @@ fn emit_print(out: &mut String, value: &IrExpr) -> KuResult<()> {
     Ok(())
 }
 
-fn emit_for_each_cleanup(out: &mut String, state: &ForEachState) -> KuResult<()> {
+fn emit_for_each_cleanup(out: &mut COutput, state: &ForEachState) -> KuResult<()> {
+    out.check()?;
     let prefix = for_state_prefix(state.block_id);
     out.push_str(&format!("  if ({prefix}_initialized) {{\n"));
     if is_c_owned_type(&state.element_ty) {
@@ -2336,12 +2543,13 @@ fn emit_for_each_cleanup(out: &mut String, state: &ForEachState) -> KuResult<()>
 }
 
 fn emit_terminator(
-    out: &mut String,
+    out: &mut COutput,
     block_id: crate::ir::BlockId,
     terminator: &IrTerminator,
     return_type: &IrType,
     owned_locals: &[OwnedLocal],
 ) -> KuResult<()> {
+    out.check()?;
     match terminator {
         IrTerminator::Next => Ok(()),
         IrTerminator::Jump(target) => {
@@ -2434,6 +2642,7 @@ fn emit_terminator(
             Ok(())
         }
         IrTerminator::PropagateErr(value) => {
+            sync::emit_return_guard(out)?;
             let IrType::Result(return_inner) = return_type else {
                 return Err(unsupported(
                     "native C prototype can only propagate errors from Result functions",
@@ -2479,6 +2688,19 @@ fn emit_terminator(
             Ok(())
         }
         IrTerminator::Return(Some(value)) => {
+            // Internal unwind placeholders have no payload to evaluate or move.
+            // Sharing the existing cleanup exit also avoids a separate aggregate
+            // return scratch/compound literal for every checked-operation guard
+            // in unoptimized C builds. Source returns keep their move-before-drop
+            // path; applicable finally blocks have already been lowered into IR.
+            if is_native_zero(value) {
+                // Preserve the previous rejection of unsupported raw IR types,
+                // without emitting their per-edge compound initialization.
+                c_zero_initializer(&value.ty)?;
+                out.push_str("  goto __ku_sync_epilogue;\n");
+                return out.check();
+            }
+            sync::emit_return_guard(out)?;
             // A Copy payload can still live inside an owned cell. Read it
             // before cleanup releases that cell, just as owned returns must be
             // moved out before their source owner is dropped.
@@ -2502,11 +2724,24 @@ fn emit_terminator(
             Ok(())
         }
         IrTerminator::Return(None) => {
+            sync::emit_return_guard(out)?;
             emit_owned_cleanup(out, owned_locals)?;
             out.push_str("  if (__ku_timeout_unwind) __ku_handler_timeout_leave();\n");
             out.push_str("  __ku_call_depth--;\n");
             out.push_str("  return;\n");
             Ok(())
+        }
+        IrTerminator::SyncGuard {
+            continue_block,
+            cleanup_block,
+        } => {
+            // Take once before a finally/helper can run. An old frame-local
+            // suppressed failure must not poison healthy cleanup calls.
+            out.push_str(&format!(
+                "  {{ KuSyncExitSignal __ku_observed = __ku_sync_take();\n  if (__ku_observed.kind != KU_SYNC_EXIT_NONE) {{\n    if (__ku_sync_deferred.kind == KU_SYNC_EXIT_NONE) __ku_sync_deferred = __ku_observed;\n    if (__ku_observed.kind == KU_SYNC_EXIT_ARITHMETIC_FATAL) goto __ku_sync_epilogue;\n    if (!__ku_timeout_unwind) {{ __ku_handler_timeout_enter(); __ku_timeout_unwind = 1; }}\n    goto block{};\n  }} goto block{}; }}\n",
+                cleanup_block.0, continue_block.0,
+            ));
+            out.check()
         }
         IrTerminator::Unreachable => {
             out.push_str("  abort();\n");
@@ -2516,6 +2751,11 @@ fn emit_terminator(
 }
 
 fn c_expr(expr: &IrExpr) -> KuResult<String> {
+    if sync::checked_helper(expr).is_some() {
+        return Err(unsupported(
+            "native C dangerous integer expression was not normalized to a guarded Temp",
+        ));
+    }
     match &expr.kind {
         IrExprKind::Literal(value) => {
             if value == "<native-zero>" {
@@ -2524,6 +2764,8 @@ fn c_expr(expr: &IrExpr) -> KuResult<String> {
                 Ok("0".to_string())
             } else if expr.ty == IrType::Str {
                 c_str_literal_static(value)
+            } else if expr.ty == IrType::Int && value == "-9223372036854775808" {
+                Ok("INT64_MIN".to_string())
             } else {
                 Ok(value.clone())
             }
@@ -3015,7 +3257,8 @@ fn dynamic_object_store_target(target: &IrLValue) -> bool {
 /// RHS into a temp before this Store; materializing its KuValue before evaluating
 /// the receiver/key keeps the interpreter's RHS-before-target order. The table
 /// helper borrows the key and only clones it if inserting a new entry.
-fn emit_dynamic_object_store(out: &mut String, target: &IrLValue, value: &IrExpr) -> KuResult<()> {
+fn emit_dynamic_object_store(out: &mut COutput, target: &IrLValue, value: &IrExpr) -> KuResult<()> {
+    out.check()?;
     let (object, key) = match target {
         IrLValue::Index { target, index } => (c_expr(target)?, c_expr(index)?),
         IrLValue::Field { target, name } => (c_expr(target)?, c_static_utf8_string(name)),
@@ -3184,22 +3427,30 @@ fn c_type(ty: &IrType) -> KuResult<String> {
     }
 }
 
-fn emit_result_forward_decls(out: &mut String, program: &IrProgram) -> KuResult<()> {
-    emit_result_abi_phase(out, program, true)
+fn emit_result_forward_decls(
+    out: &mut COutput,
+    program: &IrProgram,
+    extra_types: &[IrType],
+) -> KuResult<()> {
+    out.check()?;
+    emit_result_abi_phase(out, program, true, extra_types)
 }
 
-fn emit_result_abi(out: &mut String, program: &IrProgram) -> KuResult<()> {
-    emit_result_abi_phase(out, program, false)
+fn emit_result_abi(out: &mut COutput, program: &IrProgram, extra_types: &[IrType]) -> KuResult<()> {
+    out.check()?;
+    emit_result_abi_phase(out, program, false, extra_types)
 }
 
 /// Collect Result types once per phase through the same path so the early tag
 /// declarations cannot drift from runtime-forced Result ABIs (fs/http/db).
 fn emit_result_abi_phase(
-    out: &mut String,
+    out: &mut COutput,
     program: &IrProgram,
     forward_decls_only: bool,
+    extra_types: &[IrType],
 ) -> KuResult<()> {
-    let mut result_types = Vec::new();
+    out.check()?;
+    let mut result_types = extra_types.to_vec();
     for function in &program.functions {
         collect_result_type(&function.return_type, &mut result_types)?;
         for param in &function.params {
@@ -3260,7 +3511,7 @@ fn emit_result_abi_phase(
                 | IrTerminator::Unreachable => {}
                 // The timeout and continuation targets do not introduce a Result
                 // ABI; any timeout return payload lives in its target block.
-                IrTerminator::Safepoint { .. } => {}
+                IrTerminator::Safepoint { .. } | IrTerminator::SyncGuard { .. } => {}
             }
         }
     }
@@ -3380,10 +3631,11 @@ fn emit_result_abi_phase(
 /// program actually uses dynamic objects. Depends on the KuString ABI already
 /// emitted in the header.
 fn emit_object_abi(
-    out: &mut String,
+    out: &mut COutput,
     program: &IrProgram,
     object_oom_fault_injection: bool,
 ) -> KuResult<()> {
+    out.check()?;
     if !program_uses_object(program) {
         return Ok(());
     }
@@ -4014,7 +4266,8 @@ static bool ku_value_equal(KuValue left, KuValue right) {
 /// types that actually reach a KuValue-wrapping call site are emitted; scanning
 /// every array in an object/HTTP program would make an unrelated `[Struct]` or
 /// `[Closure]` fail code generation even when it is never boxed.
-fn emit_kuvalue_array_wrappers(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_kuvalue_array_wrappers(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     if !program_uses_object(program) {
         return Ok(());
     }
@@ -4091,9 +4344,10 @@ fn emit_kuvalue_array_wrappers(out: &mut String, program: &IrProgram) -> KuResul
 /// intentionally separate from the consuming boxing bridge above: equality is
 /// a borrow and must leave both operands usable.
 fn emit_kuvalue_typed_array_equality_helpers(
-    out: &mut String,
+    out: &mut COutput,
     program: &IrProgram,
 ) -> KuResult<()> {
+    out.check()?;
     if !program_uses_object(program) {
         return Ok(());
     }
@@ -4245,7 +4499,8 @@ fn kuvalue_array_element_supported(ty: &IrType) -> bool {
 /// Emit `ku_object_get_result` (strict `obj[key]` -> Result&lt;KuValue&gt;) after the
 /// result ABI, since it depends on `KuResult_kuvalue`. Missing keys produce
 /// `Err{domain:"object", code:"missing_key", message:"missing object key: <key>"}`.
-fn emit_object_result_helpers(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_object_result_helpers(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     if !program_uses_object(program) {
         return Ok(());
     }
@@ -4497,7 +4752,8 @@ fn json_typed_write_call(
     }
 }
 
-fn emit_json_typed_writer(out: &mut String, ty: &IrType, program: &IrProgram) -> KuResult<()> {
+fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let suffix = c_type_suffix(ty)?;
     let value_type = c_type(ty)?;
     out.push_str(&format!(
@@ -4598,7 +4854,8 @@ fn emit_json_typed_writer(out: &mut String, ty: &IrType, program: &IrProgram) ->
 /// Emit non-consuming Result wrappers for every statically-typed JSON input.
 /// Reuse the borrowed writers for arrays as well as structs: boxing an array
 /// here would transfer its elements and free storage still owned by the caller.
-fn emit_json_typed_stringify_helpers(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_json_typed_stringify_helpers(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut roots = Vec::new();
     collect_json_stringify_root_types(program, &mut roots);
     let roots = roots
@@ -4650,7 +4907,10 @@ fn emit_json_typed_stringify_helpers(out: &mut String, program: &IrProgram) -> K
     Ok(())
 }
 
-fn emit_json_runtime(out: &mut String) {
+fn emit_json_runtime(out: &mut COutput) {
+    if out.failed() {
+        return;
+    }
     out.push_str(
         r#"
 #define KU_JSON_MAX_INPUT_BYTES ((size_t)1000000)
@@ -5810,7 +6070,8 @@ static KuResult_str ku_json_stringify(KuValue value) {
 /// is materialized into owned key/value locals before the fallible insertion;
 /// allocation failure therefore drops the uncommitted field and every field
 /// already committed to the partial object before the legacy hard-fail adapter.
-fn try_emit_object_construction(out: &mut String, target: &str, value: &IrExpr) -> KuResult<bool> {
+fn try_emit_object_construction(out: &mut COutput, target: &str, value: &IrExpr) -> KuResult<bool> {
+    out.check()?;
     let IrExprKind::Call {
         kind: IrCallKind::Intrinsic(name),
         args,
@@ -5934,7 +6195,8 @@ fn ku_value_borrow_wrap(ty: &IrType, expr: &str) -> KuResult<Option<String>> {
 /// Emit a `ku_v_closure_{suffix}` per closure signature that boxes a closure
 /// struct into a KU_FUNCTION `KuValue` (single-evaluation of its argument). Only
 /// emitted when the program uses dynamic objects, since it depends on `KuValue`.
-fn emit_closure_value_wrappers(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_closure_value_wrappers(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     if !program_uses_object(program) {
         return Ok(());
     }
@@ -6097,14 +6359,17 @@ fn program_fs_usage(program: &IrProgram) -> FsUsage {
                 | IrTerminator::Return(None)
                 | IrTerminator::Unreachable => {}
                 // Safepoint polling itself performs no filesystem operation.
-                IrTerminator::Safepoint { .. } => {}
+                IrTerminator::Safepoint { .. } | IrTerminator::SyncGuard { .. } => {}
             }
         }
     }
     usage
 }
 
-fn emit_fs_headers(out: &mut String, usage: FsUsage) {
+fn emit_fs_headers(out: &mut COutput, usage: FsUsage) {
+    if out.failed() {
+        return;
+    }
     if !usage.any() {
         return;
     }
@@ -6124,7 +6389,10 @@ fn emit_fs_headers(out: &mut String, usage: FsUsage) {
     );
 }
 
-fn emit_fs_runtime(out: &mut String, usage: FsUsage, fs_base: &NativeFsBase) {
+fn emit_fs_runtime(out: &mut COutput, usage: FsUsage, fs_base: &NativeFsBase) {
+    if out.failed() {
+        return;
+    }
     if !usage.any() {
         return;
     }
@@ -7163,7 +7431,10 @@ fn program_uses_mysql(program: &IrProgram) -> bool {
 /// Include libmysqlclient's public ABI before Result declarations. MYSQL_BIND is
 /// intentionally never redeclared by Ku: its layout differs between client
 /// releases, so a hand-written shadow struct would be memory-unsafe.
-fn emit_mysql_types(out: &mut String, program: &IrProgram) {
+fn emit_mysql_types(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_mysql(program) {
         return;
     }
@@ -7220,7 +7491,10 @@ fn emit_mysql_types(out: &mut String, program: &IrProgram) {
 /// Emit the pooled MySQL runtime. Every SQL operation uses MYSQL_STMT:
 /// parameters are never escaped into SQL text. Results are detached into
 /// Ku-owned, bounded buffers before the connection is returned to the pool.
-fn emit_mysql_runtime(out: &mut String, program: &IrProgram) {
+fn emit_mysql_runtime(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_mysql(program) {
         return;
     }
@@ -9366,7 +9640,10 @@ fn program_uses_net(program: &IrProgram) -> bool {
 /// Emit one process-level Winsock owner for the native transports that Ku owns
 /// directly. Net and Redis share the same successful WSAStartup reference; it is
 /// released once at normal process exit, never when an individual client closes.
-fn emit_windows_socket_runtime(out: &mut String, program: &IrProgram) {
+fn emit_windows_socket_runtime(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_net(program) && !program_uses_redis(program) {
         return;
     }
@@ -9427,7 +9704,10 @@ fn program_uses_bytes(program: &IrProgram) -> bool {
     program_uses_net(program) || program_uses_native_named(program, "__ku_bytes")
 }
 
-fn emit_bytes_types(out: &mut String, program: &IrProgram) {
+fn emit_bytes_types(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_bytes(program) {
         return;
     }
@@ -9440,7 +9720,10 @@ fn emit_bytes_types(out: &mut String, program: &IrProgram) {
     );
 }
 
-fn emit_net_types(out: &mut String, program: &IrProgram) {
+fn emit_net_types(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_net(program) {
         return;
     }
@@ -9452,7 +9735,10 @@ fn emit_net_types(out: &mut String, program: &IrProgram) {
     ));
 }
 
-fn emit_bytes_runtime(out: &mut String, program: &IrProgram) {
+fn emit_bytes_runtime(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_bytes(program) {
         return;
     }
@@ -9623,7 +9909,10 @@ static KuResult_bytes ku_bytes_from_array(KuArray_int values) {
     out.push('\n');
 }
 
-fn emit_net_runtime(out: &mut String, program: &IrProgram) {
+fn emit_net_runtime(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_net(program) {
         return;
     }
@@ -11054,7 +11343,10 @@ fn program_uses_redis(program: &IrProgram) -> bool {
 
 /// Forward-declare the opaque pooled client before the Result ABI, since
 /// `KuResult_redis_client` embeds a `KuRedisClient*`.
-fn emit_redis_types(out: &mut String, program: &IrProgram) {
+fn emit_redis_types(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_redis(program) {
         return;
     }
@@ -11072,7 +11364,10 @@ fn emit_redis_types(out: &mut String, program: &IrProgram) {
 /// transport failures poison the connection so a later command cannot consume a
 /// stale partial reply. Redis `-ERR` replies are application errors and keep the
 /// connection usable.
-fn emit_redis_runtime(out: &mut String, program: &IrProgram) {
+fn emit_redis_runtime(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_redis(program) {
         return;
     }
@@ -13027,7 +13322,10 @@ fn program_uses_pg_client(program: &IrProgram) -> bool {
 }
 
 /// Forward-declare the private libpq types and public client/result handles.
-fn emit_pg_types(out: &mut String, program: &IrProgram) {
+fn emit_pg_types(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_pg(program) {
         return;
     }
@@ -13054,7 +13352,10 @@ fn emit_pg_types(out: &mut String, program: &IrProgram) {
 /// single rows are validated before entering a bounded, independently owned result
 /// table. Each `result.value` returns a fresh owned copy. libpq still buffers a complete
 /// protocol message, so a single oversized row is not a process-memory hard bound.
-fn emit_pg_runtime(out: &mut String, program: &IrProgram) {
+fn emit_pg_runtime(out: &mut COutput, program: &IrProgram) {
+    if out.failed() {
+        return;
+    }
     if !program_uses_pg(program) {
         return;
     }
@@ -14234,10 +14535,14 @@ fn inst_uses_http(inst: &IrInst) -> bool {
 /// Result ABI and value-ownership paths pick them up automatically). Emitted
 /// before the Result ABI so `KuResult_struct___ku_http_response` can embed the
 /// response struct.
-fn emit_http_types(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_http_types(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     if !program_uses_http(program) {
         return Ok(());
     }
+    // Function prototypes and closure signatures may return/borrow the opaque
+    // server pointer before the socket runtime completes its private layout.
+    out.push_str("typedef struct KuHttpServer KuHttpServer;\n");
     out.push_str(
         "typedef struct { int64_t status; KuString content_type; KuString body; KuString location; } KuStruct___ku_http_response;\n\
          static KuStruct___ku_http_response ku_move_struct___ku_http_response(KuStruct___ku_http_response* v) { KuStruct___ku_http_response r = *v; *v = (KuStruct___ku_http_response){0}; return r; }\n\
@@ -14256,7 +14561,8 @@ fn emit_http_types(out: &mut String, program: &IrProgram) -> KuResult<()> {
 /// and after `KuEnvHeader` (route env release). Uppercase method + exact-path
 /// (query-stripped, segment-normalized) routing, 404/405 fallbacks matching the
 /// interpreter. `KU_HTTP_MAX_REQUESTS` (env) bounds the loop for leak/ASan runs.
-fn emit_http_runtime(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_http_runtime(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     if !program_uses_http(program) {
         return Ok(());
     }
@@ -14518,7 +14824,7 @@ typedef struct KuHttpNode {
    and `long` is 32-bit on Windows LLP64, which would silently truncate a limit
    above 2^31 (e.g. `max_body_bytes: 3_000_000_000` wrapping negative and
    disabling the 413 check). */
-typedef struct {
+struct KuHttpServer {
   KuHttpNode* root;
   long long max_connections;
   long long max_active_requests;
@@ -14530,7 +14836,7 @@ typedef struct {
   long long read_body_timeout_ms;
   long long write_timeout_ms;
   long long idle_timeout_ms;
-} KuHttpServer;
+};
 static void ku_http_normalize_path(const char* in, size_t in_len, char* out, size_t out_cap) {
   size_t oi = 0; size_t i = 0;
   if (out_cap == 0) return;
@@ -15412,6 +15718,8 @@ static void ku_http_handle_connection(KuHttpServer* server, KuHttpSocket cli) {
   if (route) {
     KuStruct___ku_http_response resp = (KuStruct___ku_http_response){0};
     int handler_timed_out = 0;
+    KuSyncExitSignal handler_signal = {0};
+    __ku_sync_reset();
     if (route->arity == 1) {
       KuObject* params = ku_object_new(0);
       for (size_t p = 0; p < route->nparams; p++) {
@@ -15429,34 +15737,35 @@ static void ku_http_handle_connection(KuHttpServer* server, KuHttpSocket cli) {
       if (route->returns_result) {
         __ku_handler_timeout_begin((unsigned long long)server->handler_timeout_ms);
         KuResult_struct___ku_http_response rr = ((KuResult_struct___ku_http_response(*)(void*, KuStruct___ku_http_request))route->invoke)(route->env, req);
-        handler_timed_out = __ku_handler_timeout_finish();
-        if (handler_timed_out) ku_result_drop_struct___ku_http_response(&rr);
+        handler_timed_out = __ku_sync_finish_request(&handler_signal);
+        if (handler_timed_out || handler_signal.kind != KU_SYNC_EXIT_NONE) ku_result_drop_struct___ku_http_response(&rr);
         else resp = ku_http_response_from_result(rr);
       } else {
         __ku_handler_timeout_begin((unsigned long long)server->handler_timeout_ms);
         resp = ((KuStruct___ku_http_response(*)(void*, KuStruct___ku_http_request))route->invoke)(route->env, req);
-        handler_timed_out = __ku_handler_timeout_finish();
+        handler_timed_out = __ku_sync_finish_request(&handler_signal);
       }
     } else {
       if (route->returns_result) {
         __ku_handler_timeout_begin((unsigned long long)server->handler_timeout_ms);
         KuResult_struct___ku_http_response rr = ((KuResult_struct___ku_http_response(*)(void*))route->invoke)(route->env);
-        handler_timed_out = __ku_handler_timeout_finish();
-        if (handler_timed_out) ku_result_drop_struct___ku_http_response(&rr);
+        handler_timed_out = __ku_sync_finish_request(&handler_signal);
+        if (handler_timed_out || handler_signal.kind != KU_SYNC_EXIT_NONE) ku_result_drop_struct___ku_http_response(&rr);
         else resp = ku_http_response_from_result(rr);
       } else {
         __ku_handler_timeout_begin((unsigned long long)server->handler_timeout_ms);
         resp = ((KuStruct___ku_http_response(*)(void*))route->invoke)(route->env);
-        handler_timed_out = __ku_handler_timeout_finish();
+        handler_timed_out = __ku_sync_finish_request(&handler_signal);
       }
     }
-    if (handler_timed_out) {
+    if (handler_timed_out || handler_signal.kind != KU_SYNC_EXIT_NONE) {
       /* The worker owns this socket and is the sole response writer. A plain
          handler may have completed just after its deadline with a real response;
-         drop it before replacing it with 504. A timed-out Result was dropped in
-         its branch above. */
+         drop it before replacing it with 504 (or 500 for arithmetic failure).
+         A failed Result transport was already dropped in its branch above. */
       if (!route->returns_result) ku_drop_struct___ku_http_response(&resp);
-      ku_http_write_status(cli, 504, "Gateway Timeout");
+      if (handler_timed_out) ku_http_write_status(cli, 504, "Gateway Timeout");
+      else ku_http_write_status(cli, 500, "Internal Server Error");
     } else {
       ku_http_write_response(cli, &resp);
       ku_drop_struct___ku_http_response(&resp);
@@ -15897,7 +16206,8 @@ static KuResult_null ku_http_listen(KuHttpServer* server, KuString address) {
 /// whenever the program calls `array.try_get`, which produces `Result<element>`.
 /// `nums[i]` stays a hard bounds abort; `nums.try_get(i)` is the recoverable read
 /// returning `Err{domain:"array", code:"index_out_of_bounds"}`.
-fn emit_array_try_get_helpers(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_array_try_get_helpers(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut array_elements = Vec::new();
     collect_array_elements_program(program, &mut array_elements);
     let mut result_inners = Vec::new();
@@ -15933,7 +16243,8 @@ fn emit_array_try_get_helpers(out: &mut String, program: &IrProgram) -> KuResult
 /// only emitted when the program produces a `Result<str>` — guaranteed whenever it
 /// calls `.slice`). Char-indexed like the interpreter: bounds errors carry the same
 /// domain/code/message so a caught error reads identically to `ku run`.
-fn emit_string_slice_helper(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_string_slice_helper(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let mut result_inners = Vec::new();
     collect_result_inners_program(program, &mut result_inners)?;
     if !result_inners.contains(&IrType::Str) {
@@ -15970,7 +16281,8 @@ fn emit_string_slice_helper(out: &mut String, program: &IrProgram) -> KuResult<(
 /// consumers. ASCII scalars use immortal static bytes; other scalars own their
 /// UTF-8 bytes. Neither representation borrows the input, so the array remains
 /// valid after the receiver is dropped and uses the ordinary array/string ABI.
-fn emit_string_chars_helper(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_string_chars_helper(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     if !program_uses_intrinsic(program, "string.chars") {
         return Ok(());
     }
@@ -16191,7 +16503,7 @@ fn collect_result_inners_program(program: &IrProgram, output: &mut Vec<IrType>) 
                 | IrTerminator::Unreachable => {}
                 // Result-bearing timeout returns are collected from the explicit
                 // timeout target block, not from this edge-only terminator.
-                IrTerminator::Safepoint { .. } => {}
+                IrTerminator::Safepoint { .. } | IrTerminator::SyncGuard { .. } => {}
             }
         }
     }
@@ -16230,11 +16542,12 @@ fn c_result_type(inner: &IrType) -> KuResult<String> {
 }
 
 fn emit_main_wrapper(
-    out: &mut String,
+    out: &mut COutput,
     program: &IrProgram,
     fs_usage: FsUsage,
     fs_base: &NativeFsBase,
 ) -> KuResult<()> {
+    out.check()?;
     let Some(function) = program
         .functions
         .iter()
@@ -16248,6 +16561,7 @@ fn emit_main_wrapper(
         ));
     }
     out.push_str("int main(void) {\n");
+    out.push_str("  __ku_sync_reset();\n");
     if fs_usage.any() && matches!(fs_base, NativeFsBase::ExecutableRelative(_)) {
         // Initialization is deliberately non-fatal. Absolute paths remain usable
         // even if the executable-relative source locator cannot be resolved.
@@ -16258,31 +16572,51 @@ fn emit_main_wrapper(
     } else {
         ""
     };
+    // Materialize first, then consume the mailbox before interpreting any
+    // result tag or output. Failed frames returned only a typed transport zero.
+    match &function.return_type {
+        IrType::Void => out.push_str("  ku_main();\n"),
+        IrType::Int | IrType::Bool | IrType::Str | IrType::Result(_) => out.push_str(&format!(
+            "  {} result = ku_main();\n",
+            c_type(&function.return_type)?,
+        )),
+        other => {
+            return Err(unsupported(format!(
+                "native C main wrapper does not support main return type {other}"
+            )))
+        }
+    }
+    out.push_str("  KuSyncExitSignal signal = __ku_sync_take();\n  if (signal.kind != KU_SYNC_EXIT_NONE) {\n");
+    if is_c_owned_type(&function.return_type) {
+        emit_drop_expr(out, &function.return_type, "result")?;
+    }
+    out.push_str(mysql_shutdown);
+    out.push_str(
+        "  fputs(__ku_sync_error_message(signal), stderr); fputc('\\n', stderr); return 1;\n  }\n",
+    );
     match &function.return_type {
         IrType::Void => {
-            out.push_str("  ku_main();\n");
             out.push_str(mysql_shutdown);
             out.push_str("  return 0;\n");
         }
         IrType::Int => {
-            out.push_str("  int exit_code = (int)ku_main();\n");
+            out.push_str("  int exit_code = (int)result;\n");
             out.push_str(mysql_shutdown);
             out.push_str("  return exit_code;\n");
         }
         IrType::Bool => {
-            out.push_str("  int exit_code = ku_main() ? 0 : 1;\n");
+            out.push_str("  int exit_code = result ? 0 : 1;\n");
             out.push_str(mysql_shutdown);
             out.push_str("  return exit_code;\n");
         }
         IrType::Str => {
-            out.push_str("  KuString result = ku_main();\n  ku_string_write(stdout, result);\n  fputc('\\n', stdout);\n  ku_string_drop(&result);\n");
+            out.push_str("  ku_string_write(stdout, result);\n  fputc('\\n', stdout);\n  ku_string_drop(&result);\n");
             out.push_str(mysql_shutdown);
             out.push_str("  return 0;\n");
         }
         IrType::Result(inner) => {
             out.push_str(&format!(
-                "  {} result = ku_main();\n  if (!result.ok) {{ ku_string_write(stderr, result.error.message); fputc('\\n', stderr); ku_result_drop_{}(&result);{}  return 1; }}\n  ku_result_drop_{}(&result);\n{}  return 0;\n",
-                c_type(&function.return_type)?,
+                "  if (!result.ok) {{ ku_string_write(stderr, result.error.message); fputc('\\n', stderr); ku_result_drop_{}(&result);{}  return 1; }}\n  ku_result_drop_{}(&result);\n{}  return 0;\n",
                 c_type_suffix(inner)?,
                 mysql_shutdown,
                 c_type_suffix(inner)?,
@@ -17584,7 +17918,8 @@ fn collect_owned_locals(
     locals
 }
 
-fn emit_owned_cleanup(out: &mut String, locals: &[OwnedLocal]) -> KuResult<()> {
+fn emit_owned_cleanup(out: &mut COutput, locals: &[OwnedLocal]) -> KuResult<()> {
+    out.check()?;
     for local in locals.iter().rev() {
         if local.borrowed {
             continue;
@@ -17594,7 +17929,8 @@ fn emit_owned_cleanup(out: &mut String, locals: &[OwnedLocal]) -> KuResult<()> {
     Ok(())
 }
 
-fn emit_drop_expr(out: &mut String, ty: &IrType, expression: &str) -> KuResult<()> {
+fn emit_drop_expr(out: &mut COutput, ty: &IrType, expression: &str) -> KuResult<()> {
+    out.check()?;
     match ty {
         IrType::Str => {
             out.push_str(&format!("  ku_string_drop(&{});\n", expression));
@@ -17646,7 +17982,8 @@ fn emit_drop_expr(out: &mut String, ty: &IrType, expression: &str) -> KuResult<(
             // env header). A NULL env (no captures, or a moved-from closure) is a
             // no-op. env release cascades into releasing each captured cell.
             out.push_str(&format!(
-                "  if (({expression}).env) ((KuEnvHeader*)({expression}).env)->release(({expression}).env);\n"
+                "  if (({expression}).env) ((KuEnvHeader*)({expression}).env)->release(({expression}).env);\n  {expression} = {};\n",
+                c_zero_value(ty)?,
             ));
             Ok(())
         }
@@ -17672,7 +18009,8 @@ fn is_copy_ir_type(ty: &IrType) -> bool {
     )
 }
 
-fn emit_named_ownership_helpers(out: &mut String, program: &IrProgram) -> KuResult<()> {
+fn emit_named_ownership_helpers(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+    out.check()?;
     let has_any = !program.layouts.structs.is_empty() || !program.layouts.enums.is_empty();
     // Forward-declare every clone/drop/move first: a struct/enum can hold a field
     // of another user struct/enum, so its deep clone/drop calls that type's
@@ -17695,7 +18033,8 @@ fn emit_named_ownership_helpers(out: &mut String, program: &IrProgram) -> KuResu
     Ok(())
 }
 
-fn emit_named_ownership_prototypes(out: &mut String, name: &str) -> KuResult<()> {
+fn emit_named_ownership_prototypes(out: &mut COutput, name: &str) -> KuResult<()> {
+    out.check()?;
     let c_ty = c_type(&IrType::Named(name.to_string()))?;
     out.push_str(&format!(
         "static {c_ty} {}({c_ty}* value);\nstatic {c_ty} {}({c_ty} value);\nstatic void {}({c_ty}* value);\n",
@@ -17706,7 +18045,8 @@ fn emit_named_ownership_prototypes(out: &mut String, name: &str) -> KuResult<()>
     Ok(())
 }
 
-fn emit_struct_ownership_helper(out: &mut String, layout: &IrStructLayout) -> KuResult<()> {
+fn emit_struct_ownership_helper(out: &mut COutput, layout: &IrStructLayout) -> KuResult<()> {
+    out.check()?;
     let name = &layout.name;
     let c_ty = c_type(&IrType::Named(name.clone()))?;
     let move_fn = c_named_move_function(name);
@@ -17736,7 +18076,8 @@ fn emit_struct_ownership_helper(out: &mut String, layout: &IrStructLayout) -> Ku
     Ok(())
 }
 
-fn emit_enum_ownership_helper(out: &mut String, layout: &IrEnumLayout) -> KuResult<()> {
+fn emit_enum_ownership_helper(out: &mut COutput, layout: &IrEnumLayout) -> KuResult<()> {
+    out.check()?;
     let name = format!("__ku_enum_type:{}", layout.name);
     let c_ty = c_type(&IrType::Named(name.clone()))?;
     let move_fn = c_named_move_function(&name);
@@ -17789,7 +18130,8 @@ fn emit_enum_ownership_helper(out: &mut String, layout: &IrEnumLayout) -> KuResu
 }
 
 #[allow(dead_code)]
-fn emit_named_ownership_helper(out: &mut String, name: &str, is_enum: bool) -> KuResult<()> {
+fn emit_named_ownership_helper(out: &mut COutput, name: &str, is_enum: bool) -> KuResult<()> {
+    out.check()?;
     let ty = IrType::Named(name.to_string());
     let c_ty = c_type(&ty)?;
     let move_fn = c_named_move_function(name);
@@ -17854,7 +18196,263 @@ fn c_named_drop_function(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::task as task_ir;
     use crate::ir::TempId;
+
+    fn task_adapter_output_fixture() -> task_ir::TaskProgram {
+        let result = IrType::Result(Box::new(IrType::Str));
+        task_ir::TaskProgram {
+            functions: vec![task_ir::TaskFunction {
+                id: task_ir::TaskFunctionId(0),
+                name: "OutputBudget".into(),
+                slots: [IrType::Str, result.clone()]
+                    .into_iter()
+                    .map(|ty| task_ir::TaskSlot {
+                        ty: task_ir::TaskSlotType::Value {
+                            ty,
+                            borrowed: false,
+                        },
+                    })
+                    .collect(),
+                parameters: vec![task_ir::SlotId(0)],
+                entry: task_ir::StateId(0),
+                states: vec![task_ir::TaskState {
+                    operations: vec![task_ir::TaskOp::WrapOk {
+                        dst: task_ir::SlotId(1),
+                        src: task_ir::SlotId(0),
+                    }],
+                    terminator: task_ir::TaskTerminator::Complete {
+                        value: task_ir::SlotId(1),
+                    },
+                }],
+                result,
+            }],
+        }
+    }
+
+    #[test]
+    fn native_c_output_whole_file_limit_counts_runtime_and_generated_code() {
+        for source in [
+            "fn main() { println(\"界\") }",
+            "fn Identity<T>(value: T): T { return value } fn main() { println(Identity(7)) }",
+        ] {
+            let program =
+                crate::parser::Parser::new(crate::lexer::Lexer::new(source).tokenize().unwrap())
+                    .parse_program()
+                    .unwrap();
+            let ir = crate::ir::lower_program(&program).unwrap();
+            let expected = generate_c_source(&ir).unwrap();
+            let options = CBackendOptions::default();
+            assert_eq!(
+                generate_c_source_bounded(&ir, &options, expected.len()).unwrap(),
+                expected,
+            );
+            let error = generate_c_source_bounded(&ir, &options, expected.len() - 1).unwrap_err();
+            assert!(
+                error.message.contains("native C output limit exceeded"),
+                "{error}"
+            );
+            let error = generate_c_source_bounded(&ir, &options, 1).unwrap_err();
+            assert!(error.message.contains("maximum 1 bytes"), "{error}");
+            assert_eq!(generate_c_source(&ir).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn native_c_output_stops_before_emitting_next_function_after_failure() {
+        let mut output = COutput::new(0);
+        output.push('x');
+        let function = IrFunction {
+            id: FunctionId(0),
+            name: "unvisited".into(),
+            params: Vec::new(),
+            // Without the early checkpoint this would produce an unrelated
+            // unsupported-type error, hiding the original output limit.
+            return_type: IrType::Unknown,
+            blocks: Vec::new(),
+            is_closure_body: false,
+            captures: Vec::new(),
+        };
+        let error = emit_function(&mut output, &function).unwrap_err();
+        assert!(
+            error.message.contains("native C output limit exceeded"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_c_output_task_adapter_artifact_obeys_exact_and_partial_limits() {
+        let ast = crate::parser::Parser::new(
+            crate::lexer::Lexer::new("fn main() {}").tokenize().unwrap(),
+        )
+        .parse_program()
+        .unwrap();
+        let ir = crate::ir::lower_program(&ast).unwrap();
+        let tasks = task_adapter_output_fixture();
+        let plan = task_ir::verify_and_plan(&tasks, Default::default()).unwrap();
+        let expected = generate_task_frame_c_source(&ir, &tasks).unwrap();
+        let options = CBackendOptions::default();
+        let bounded = |limit| {
+            generate_c_source_with_frames_bounded(&ir, &options, limit, Some((&tasks, &plan, None)))
+        };
+        assert_eq!(bounded(expected.len()).unwrap(), expected);
+
+        let instance = expected
+            .find("typedef struct KuTaskInstance_0 {")
+            .expect("adapter follows the shared ABI");
+        let factory = expected
+            .find("static uint32_t ku_task_0_try_start_impl(")
+            .expect("shared typed factory is part of the complete artifact");
+        assert_eq!(
+            expected
+                .matches(
+                    "KuTaskInstance_0* instance = (KuTaskInstance_0*)calloc(1, sizeof(*instance));"
+                )
+                .count(),
+            1,
+            "raw and hosted Start must share one instance allocation body"
+        );
+        let factory_middle = factory
+            + expected[factory..]
+                .find("KuTaskDriverTicketV1 ticket = {0};")
+                .expect("factory contains its admission transaction")
+            + "KuTaskDriverTicketV1".len();
+        assert!(instance < factory && factory < factory_middle);
+        assert!(factory_middle < expected.len() - 1);
+
+        // These small budgets fail after the ABI, inside the first factory,
+        // and at the final byte. No multi-megabyte stress fixture is needed.
+        for limit in [instance, factory_middle, expected.len() - 1] {
+            let error = bounded(limit).unwrap_err();
+            assert!(
+                error.message.contains("native C output limit exceeded")
+                    && error.message.contains(&format!("maximum {limit} bytes")),
+                "{error}"
+            );
+        }
+        assert_eq!(generate_task_frame_c_source(&ir, &tasks).unwrap(), expected);
+    }
+
+    #[test]
+    fn native_c_output_checked_integer_helper_keeps_exact_and_sticky_limits() {
+        let mut reference = COutput::new(16 * 1024);
+        checked_int::emit_runtime(&mut reference).unwrap();
+        let reference = reference.finish().unwrap();
+        let mut exact = COutput::new(reference.len());
+        checked_int::emit_runtime(&mut exact).unwrap();
+        assert_eq!(exact.finish().unwrap(), reference);
+        for limit in [0, reference.len() / 2, reference.len() - 1] {
+            let mut output = COutput::new(limit);
+            let error = checked_int::emit_runtime(&mut output).unwrap_err();
+            assert!(error.message.contains("native C output limit exceeded"));
+            assert_eq!(checked_int::emit_runtime(&mut output).unwrap_err(), error);
+            assert_eq!(output.finish().unwrap_err(), error);
+        }
+        let mut failed = COutput::new(0);
+        failed.push('x');
+        let original = failed.check().unwrap_err();
+        assert_eq!(
+            checked_int::emit_runtime(&mut failed).unwrap_err(),
+            original
+        );
+    }
+
+    #[test]
+    fn native_c_output_checked_integer_artifact_counts_helper_and_root() {
+        let ast = crate::parser::Parser::new(crate::lexer::Lexer::new(
+            "async fn Calc(a: int, b: int): int! { return ok(a * b) } async fn main(): null! { value = (await Calc(2, 3))? println(value) return ok(null) }"
+        ).tokenize().unwrap()).parse_program().unwrap();
+        crate::checker::Checker::new().check(&ast).unwrap();
+        let native = crate::ir::task_lower::lower_program(&ast).unwrap();
+        let plan = task_ir::verify_and_plan(&native.tasks, Default::default()).unwrap();
+        let sync = IrProgram {
+            functions: Vec::new(),
+            layouts: crate::ir::IrLayoutTable {
+                structs: Vec::new(),
+                enums: Vec::new(),
+            },
+        };
+        let options = CBackendOptions::default();
+        let expected = generate_native_task_c_source(&native, &options).unwrap();
+        let bounded = |limit| {
+            generate_c_source_with_frames_bounded(
+                &sync,
+                &options,
+                limit,
+                Some((&native.tasks, &plan, Some(native.entry))),
+            )
+        };
+        assert_eq!(bounded(expected.len()).unwrap(), expected);
+        let helper_start = expected
+            .find("/* Private checked int64_t computations.")
+            .unwrap();
+        let helper_middle = expected.find("static uint32_t ku_int_mul(").unwrap();
+        let root = expected
+            .find("static KuTaskDriverV1 ku_task_root_driver;")
+            .unwrap();
+        assert!(helper_start < helper_middle && helper_middle < root);
+        for limit in [0, helper_start, helper_middle, root, expected.len() - 1] {
+            let error = bounded(limit).unwrap_err();
+            assert!(
+                error.message.contains("native C output limit exceeded"),
+                "{error}"
+            );
+            assert!(
+                error.message.contains(&format!("maximum {limit} bytes")),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            generate_native_task_c_source(&native, &options).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn native_c_output_task_adapter_limit_precedes_later_type_errors() {
+        let tasks = task_adapter_output_fixture();
+        task_ir::verify_and_plan(&tasks, Default::default()).unwrap();
+        let mut reference = COutput::new(64 * 1024);
+        task_adapter::emit_adapters(&mut reference, &tasks).unwrap();
+        let reference = reference.finish().unwrap();
+        let instance = reference.find("typedef struct KuTaskInstance_0 {").unwrap();
+
+        // Deliberately bypass the public verifier ONLY to test emitter stop
+        // order. If visited, this second function has a distinct type error.
+        let mut invalid = tasks.functions[0].clone();
+        invalid.id = task_ir::TaskFunctionId(1);
+        invalid.result = IrType::Unknown;
+        let mut separate = COutput::new(64 * 1024);
+        let type_error = task_adapter::emit_adapters(
+            &mut separate,
+            &task_ir::TaskProgram {
+                functions: vec![invalid.clone()],
+            },
+        )
+        .unwrap_err();
+        assert!(type_error.message.contains("requires a primitive Result"));
+        let mut mixed = tasks;
+        mixed.functions.push(invalid);
+
+        for limit in [0, instance, instance + (reference.len() - instance) / 2] {
+            let mut output = COutput::new(limit);
+            let error = task_adapter::emit_adapters(&mut output, &mixed).unwrap_err();
+            assert!(
+                error.message.contains("native C output limit exceeded"),
+                "{error}"
+            );
+            assert_eq!(output.check().unwrap_err(), error);
+            assert_eq!(output.finish().unwrap_err(), error);
+        }
+
+        let mut failed = COutput::new(0);
+        failed.push('x');
+        let original = failed.check().unwrap_err();
+        assert_eq!(
+            task_adapter::emit_adapters(&mut failed, &mixed).unwrap_err(),
+            original
+        );
+    }
 
     #[test]
     fn collection_reuse_rejects_non_binding_places() {

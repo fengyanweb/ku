@@ -15,6 +15,7 @@ Fixtures are retained for reproducible reruns; this script never deletes trees.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import csv
 import hashlib
 import importlib.util
@@ -31,6 +32,7 @@ import sys
 import tarfile
 import time
 import uuid
+from typing import Iterator
 
 sys.dont_write_bytecode = True
 
@@ -45,6 +47,7 @@ REPO = Path(__file__).resolve().parents[2]
 TARGET = REPO / "target"
 PREFIX = "pg-loopback-17.10-"
 SECRET = ""
+MAX_RECEIPT_BYTES = 8192
 
 _spec = importlib.util.spec_from_file_location(
     "ku_native_bounds", Path(__file__).with_name("verify-native-three-os.py")
@@ -52,6 +55,80 @@ _spec = importlib.util.spec_from_file_location(
 assert _spec is not None and _spec.loader is not None
 BOUNDS = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(BOUNDS)
+
+
+def present(path: Path) -> bool:
+    # A dangling leaf or an inaccessible entry is not evidence of absence.
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def write_marker(path: Path, text: str, *, mode: str = "x") -> None:
+    """Write one bounded owned leaf; preserve the first error and close owner."""
+    if len(text.encode("utf-8")) > MAX_RECEIPT_BYTES:
+        raise ValueError("PostgreSQL operation marker exceeds its byte bound")
+    output = path.open(mode, encoding="utf-8", newline="\n")
+    primary = None
+    try:
+        if output.write(text) != len(text):
+            raise OSError("Incomplete PostgreSQL operation marker write")
+    except BaseException as error:
+        primary = error
+    cleanup = BOUNDS.CleanupErrors()
+    cleanup.attempt("PostgreSQL marker close", output.close)
+    try:
+        cleanup.raise_if_any(primary)
+    except BaseException as error:
+        # Failed close must not lose the actual stream to an exception wrapper.
+        error.marker_stream = output
+        raise
+
+
+class FixtureOperation:
+    def __init__(self) -> None:
+        self.uncertain = False
+        self.receipt: dict | None = None
+
+
+@contextmanager
+def operation(root: Path) -> Iterator[FixtureOperation]:
+    # Cooperative exclusive create: no PID authority, waiting, stealing, or
+    # automatic recovery. A losing caller has no right to touch any other leaf.
+    lock = root / "operation.lock"
+    write_marker(lock, "owned PostgreSQL operation in progress\n")
+    owned = FixtureOperation()
+    primary = None
+    try:
+        yield owned
+    except BaseException as error:
+        primary = error
+    cleanup = BOUNDS.CleanupErrors()
+    if not owned.uncertain:
+        if primary is None and owned.receipt is not None:
+            def commit_receipt() -> None:
+                text = json.dumps(owned.receipt, indent=2) + "\n"
+                if SECRET and SECRET in text:
+                    raise ValueError("Refusing a credential-bearing verification receipt")
+                write_marker(lock, text, mode="w")
+                # One same-directory rename commits the receipt AND releases
+                # admission. Never write success and then separately unlink the
+                # lease, or remove a target after an uncertain rename outcome.
+                lock.replace(root / "verification.json")
+
+            try:
+                commit_receipt()
+            except BaseException as error:
+                # Keep any failed-close stream owner carried by write_marker;
+                # reducing this first failure to a category would lose it.
+                primary = error
+        else:
+            cleanup.attempt("PostgreSQL operation release", lock.unlink)
+    elif primary is None:
+        cleanup.add("PostgreSQL operation cleanup remains unconfirmed")
+    cleanup.raise_if_any(primary)
 
 
 def run(
@@ -62,11 +139,14 @@ def run(
     try:
         completed = BOUNDS.run_bounded(command, cwd, label)
         return completed.stdout + completed.stderr if include_stderr else completed.stdout
-    except SystemExit as error:
+    except (SystemExit, RuntimeError, OSError) as error:
         message = str(error)
         if SECRET:
             message = message.replace(SECRET, "<redacted>")
-        raise RuntimeError(message) from None
+        failure = RuntimeError(message)
+        # Keep the immediate owner node private; default traceback stays redacted.
+        failure.primary = error
+        raise failure from None
     finally:
         BOUNDS.COMMAND_TIMEOUT_SECONDS = previous
 
@@ -183,7 +263,6 @@ def fixture_environment(portable: Path) -> None:
 
 
 def prepare(args: argparse.Namespace) -> Path:
-    global SECRET
     if os.name != "nt":
         raise ValueError("This minimal assembler reuses Windows PostgreSQL 17.10 binaries")
     installed = args.installed_root.resolve(strict=True)
@@ -192,6 +271,18 @@ def prepare(args: argparse.Namespace) -> Path:
     if version.decode("ascii").strip() != f"postgres (PostgreSQL) {VERSION}":
         raise ValueError("Installed PostgreSQL must exactly match the verified 17.10 sources")
     root = private_fixture()
+    with operation(root) as owned:
+        # Preparation has no reuse/cleanup mode. On any assembly failure retain
+        # the new private directory and lease, including unknown initdb cleanup.
+        owned.uncertain = True
+        prepare_owned(args, root, installed, perl)
+        owned.uncertain = False
+    print(f"Prepared (server not started): {root}", flush=True)
+    return root
+
+
+def prepare_owned(args: argparse.Namespace, root: Path, installed: Path, perl: Path) -> None:
+    global SECRET
     print(f"Preparing private fixture: {root}", flush=True)
     if args.source_archive:
         archive = validate_archive(args.source_archive)
@@ -271,8 +362,6 @@ def prepare(args: argparse.Namespace) -> Path:
     with (root / "fixture.json").open("x", encoding="utf-8", newline="\n") as output:
         json.dump(manifest, output, indent=2)
         output.write("\n")
-    print(f"Prepared (server not started): {root}", flush=True)
-    return root
 
 
 def require_live_pass(output: bytes) -> str:
@@ -284,12 +373,23 @@ def require_live_pass(output: bytes) -> str:
 
 
 def verify(args: argparse.Namespace) -> None:
-    global SECRET
     if os.name != "nt":
         raise ValueError("This isolated PostgreSQL fixture requires Windows")
     root = args.fixture.resolve(strict=True)
     if root.parent != TARGET.resolve() or not re.fullmatch(re.escape(PREFIX) + r"[0-9a-f]{32}", root.name):
         raise ValueError("Verification only accepts a dedicated fixture created under this repository target")
+    with operation(root) as owned:
+        # Preserve any previous receipt when admission is refused. Presence of
+        # either fence is sufficient; never interpret it as ownership authority.
+        owned.uncertain = True
+        if present(root / "server.active") or present(root / "data" / "postmaster.pid"):
+            raise ValueError("PostgreSQL fixture is active or already-running; preserve it for investigation")
+        owned.uncertain = False
+        verify_owned(args, root, owned)
+
+
+def verify_owned(args: argparse.Namespace, root: Path, owned: FixtureOperation) -> None:
+    global SECRET
     # A failed rerun must not leave the previous success marker. Only unlink
     # this leaf after checking the fixture root; do not resolve it or delete trees.
     (root / "verification.json").unlink(missing_ok=True)
@@ -297,8 +397,8 @@ def verify(args: argparse.Namespace) -> None:
     if manifest.get("format") != 1 or manifest.get("version") != VERSION or manifest.get("source_sha256") != SOURCE_SHA256:
         raise ValueError("Unexpected PostgreSQL fixture manifest")
     port = manifest.get("port")
-    if not isinstance(port, int) or not 1024 <= port <= 65535 or (root / "data" / "postmaster.pid").exists():
-        raise ValueError("Invalid fixture port or an already-running cluster")
+    if not isinstance(port, int) or not 1024 <= port <= 65535:
+        raise ValueError("Invalid fixture port")
     test_binary = args.test_binary.resolve(strict=True)
     ku_binary = args.ku_binary.resolve(strict=True)
     portable = root / "portable"
@@ -311,16 +411,31 @@ def verify(args: argparse.Namespace) -> None:
              "-o", f"-h 127.0.0.1 -p {port} -c shared_buffers=16MB -c max_connections=10 -c timezone=GMT -c log_timezone=GMT -c logging_collector=off"]
     windows_job = None
     process = None
+    launch_attempted = False
+    started_by_attempt = False
     succeeded = False
+    primary = None
+    owned.uncertain = True
+    write_marker(root / "server.active", "owned PostgreSQL startup in progress\n")
     try:
         with (root / "startup.log").open("ab", buffering=0) as log:
+            # Contain pg_ctl before it can launch CMD/postgres descendants.
+            launch_attempted = True
             process = subprocess.Popen(start, cwd=root, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW)
-            windows_job = BOUNDS.WindowsJob.attach(process)
+                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW | 0x00000004)
+            try:
+                windows_job = BOUNDS.WindowsJob.attach(process)
+            except BOUNDS.WindowsJobSetupError as error:
+                # Failed setup may still own a Job whose CloseHandle failed.
+                # Keep that exact owner; the child has not been resumed.
+                windows_job = error.job
+                raise
             if windows_job is None:
                 raise RuntimeError("Could not contain the temporary PostgreSQL server in a Windows Job")
+            BOUNDS.resume_suspended_windows_process(process)
             if process.wait(timeout=25) != 0:
                 raise RuntimeError("Temporary PostgreSQL startup failed; inspect its private startup/server log")
+            started_by_attempt = True
         print(f"Started isolated PostgreSQL 17.10 on 127.0.0.1:{port}", flush=True)
         output = run([str(test_binary), "--exact", "native_pg_query_poller_live_loopback_roundtrip",
                       "--ignored", "--nocapture", "--test-threads=1"], REPO,
@@ -330,23 +445,66 @@ def verify(args: argparse.Namespace) -> None:
             log.write(decoded)
         print(decoded, end="", flush=True)
         succeeded = True
+    except BaseException as error:
+        primary = error
     finally:
+        cleanup = BOUNDS.CleanupErrors()
+        stop_failed = False
+        stop_error = None
+        stop_stage = "PostgreSQL stop PID check"
         try:
-            if (root / "data" / "postmaster.pid").exists():
+            if started_by_attempt and present(root / "data" / "postmaster.pid"):
+                stop_stage = "PostgreSQL stop"
                 run([ctl, "stop", "-D", str(root / "data"), "-m", "immediate", "-w", "-t", "20"],
                     root, "stop isolated PostgreSQL cluster", 25)
-        finally:
-            if windows_job is not None:
-                windows_job.terminate()
-                windows_job.close()
-            if process is not None and process.poll() is None:
-                BOUNDS.kill_process_tree(process, None)
-                process.wait(timeout=5)
-        if (root / "data" / "postmaster.pid").exists():
-            raise RuntimeError("PostgreSQL shutdown was not confirmed; preserve fixture for investigation")
-        print("Confirmed isolated PostgreSQL stopped; fixture retained for reproducible reruns", flush=True)
+        except BaseException as error:
+            stop_failed = True
+            if primary is None:
+                primary = error
+            else:
+                stop_error = error
+                cleanup.add(stop_stage, error)
+        # Preserve the existing 25-second pg_ctl bound plus a single five-second
+        # fallback budget. Failure of one owner operation cannot skip another.
+        cleanup_deadline = time.monotonic() + 5
+        if process is not None:
+            cleanup.attempt("PostgreSQL process termination", lambda: BOUNDS.kill_process_tree(process, windows_job))
+        if windows_job is not None:
+            drained = cleanup.attempt("PostgreSQL Job drain", lambda: windows_job.wait_empty(cleanup_deadline))
+            if drained is not True:
+                cleanup.add("PostgreSQL Job drain unconfirmed")
+            cleanup.attempt("PostgreSQL Job close", windows_job.close)
+        if process is not None:
+            cleanup.attempt("PostgreSQL root wait", lambda: process.wait(
+                timeout=max(0.0, cleanup_deadline - time.monotonic()),
+            ))
+        if cleanup.attempt("PostgreSQL final PID check", lambda: present(root / "data" / "postmaster.pid")):
+            cleanup.add("PostgreSQL shutdown was not confirmed; preserve fixture for investigation")
+        if launch_attempted and process is None:
+            # A constructor exception need not prove that no process was ever
+            # created. Without its actual returned handle, retain both fences;
+            # never discover/adopt an owner by PID or infer safety from absence.
+            cleanup.add("PostgreSQL startup ownership was not confirmed")
+        if not cleanup.failed and not stop_failed:
+            cleanup.attempt("PostgreSQL active marker release", (root / "server.active").unlink)
+            if not cleanup.failed:
+                owned.uncertain = False
+        try:
+            cleanup.raise_if_any(primary)
+        except BaseException as error:
+            if stop_error is not None:
+                # Keep the stop command node separate from the server owners.
+                error.pg_stop_error = stop_error
+            if owned.uncertain:
+                error.job = windows_job
+                error.process = process
+                error.fixture_root = root
+            raise
+        # The contained Job was observed empty before close; this does not prove
+        # containment of processes outside the owned Job.
+        print("PostgreSQL fixture cleanup checks passed; fixture retained for reproducible reruns", flush=True)
     if succeeded:
-        result = {
+        owned.receipt = {
             "version": VERSION,
             "source_sha256": SOURCE_SHA256,
             "test_binary": str(test_binary),
@@ -355,9 +513,6 @@ def verify(args: argparse.Namespace) -> None:
             "live_test_passed": True,
             "server_stopped": True,
         }
-        with (root / "verification.json").open("w", encoding="utf-8", newline="\n") as output:
-            json.dump(result, output, indent=2)
-            output.write("\n")
 
 
 def main() -> None:
@@ -381,7 +536,9 @@ def main() -> None:
         message = str(error)
         if SECRET:
             message = message.replace(SECRET, "<redacted>")
-        raise SystemExit(f"PG loopback fixture failed: {message}") from None
+        failure = SystemExit(f"PG loopback fixture failed: {message}")
+        failure.primary = error
+        raise failure from None
 
 
 if __name__ == "__main__":

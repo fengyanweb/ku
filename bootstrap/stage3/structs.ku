@@ -18,9 +18,6 @@ fn ReadModule(start: Token, name: Token): ParseOutput! {
     if (start.kind != "Module") {
         RejectAt(start.clone(), "invalid_token_stream", "module reader must start with module")?
     }
-    if (name.kind == "Eof") {
-        RejectAt(start.clone(), "unexpected_token", "expected module name")?
-    }
     if (name.kind != "Ident") {
         RejectAt(name.clone(), "unexpected_token", "expected module name")?
     }
@@ -70,9 +67,6 @@ fn ReadStruct(tokens: [Token]): DeclarationRead! {
     start = tokens[0].clone()
     cursor = 1
     name = tokens[cursor].clone()
-    if (name.kind == "Eof") {
-        RejectAt(start.clone(), "unexpected_token", "expected struct name")?
-    }
     if (name.kind != "Ident") {
         RejectAt(name.clone(), "unexpected_token", "expected struct name")?
     }

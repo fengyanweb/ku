@@ -19,7 +19,9 @@ pub mod bounded_process;
 
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+#[cfg(not(unix))]
+use std::io::Read;
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -28,6 +30,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bounded_process::service::{spawn_bounded_service, BoundedService};
 use bounded_process::{run_bounded, BoundedOutput, OutputLimits};
 
 // HTTP native tests bind real ports; serialize them so concurrent servers do
@@ -102,6 +105,26 @@ fn unused_local_address() -> String {
 /// Compile `source` (with `__ADDRESS__` replaced) to a native binary and spawn
 /// it. Returns `None` when no C compiler is available (skip the test).
 fn spawn_native_server(name: &str, source: &str, address: &str) -> Option<NativeHttpServer> {
+    spawn_native_server_inner(name, source, address, false)
+}
+
+// Only the lexical positive currently opts into checked completion. Other
+// HTTP fixtures retain their old watchdog behavior and are not covered by its
+// stderr/exit receipt. This does not add a graceful shutdown API to Ku.
+fn spawn_observed_native_server(
+    name: &str,
+    source: &str,
+    address: &str,
+) -> Option<NativeHttpServer> {
+    spawn_native_server_inner(name, source, address, true)
+}
+
+fn spawn_native_server_inner(
+    name: &str,
+    source: &str,
+    address: &str,
+    observed: bool,
+) -> Option<NativeHttpServer> {
     let dir = unique_temp_dir(name);
     let entry = "server.ku";
     fs::write(dir.join(entry), source.replace("__ADDRESS__", address)).expect("write ku source");
@@ -133,6 +156,23 @@ fn spawn_native_server(name: &str, source: &str, address: &str) -> Option<Native
         .filter(|path| path.is_file())
         .unwrap_or_else(|| panic!("native HTTP build did not report C output:\n{combined}"));
     let exe = dir.join(&out);
+    if observed {
+        let mut command = Command::new(&exe);
+        command.current_dir(&dir);
+        let service = match spawn_bounded_service(command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS) {
+            Ok(service) => service,
+            Err(error) => {
+                fs::remove_dir_all(&dir).ok();
+                panic!("spawn native HTTP supervisor: {error}");
+            }
+        };
+        return Some(NativeHttpServer {
+            child: None,
+            service: Some(service),
+            dir: Some(dir),
+            c_source,
+        });
+    }
     let child = match Command::new(&exe)
         .current_dir(&dir)
         // The long-lived server is supervised by `NativeServerWatchdog` and
@@ -150,6 +190,7 @@ fn spawn_native_server(name: &str, source: &str, address: &str) -> Option<Native
     };
     Some(NativeHttpServer {
         child: Some(child),
+        service: None,
         dir: Some(dir),
         c_source,
     })
@@ -242,6 +283,7 @@ fn interpreter_run_output(name: &str, source: &str) -> BoundedOutput {
 
 struct NativeHttpServer {
     child: Option<Child>,
+    service: Option<BoundedService>,
     dir: Option<PathBuf>,
     c_source: PathBuf,
 }
@@ -274,6 +316,20 @@ impl Drop for NativeServerWatchdog {
 }
 
 impl NativeHttpServer {
+    fn finish_checked(mut self) {
+        let receipt = self
+            .service
+            .take()
+            .expect("observed native service")
+            .finish_checked()
+            .unwrap_or_else(|error| panic!("native HTTP checked stop failed: {error}"));
+        assert!(receipt.output.stderr.is_empty());
+        assert!(
+            !receipt.output.status.success(),
+            "forced stop is not natural success"
+        );
+    }
+
     fn dir(&self) -> &std::path::Path {
         self.dir.as_deref().expect("native server directory")
     }
@@ -325,6 +381,9 @@ impl NativeHttpServer {
 
 impl Drop for NativeHttpServer {
     fn drop(&mut self) {
+        // Drop the bounded service before attempting artifact cleanup, also on
+        // request-assertion panic. Only finish_checked validates its receipt.
+        drop(self.service.take());
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -360,23 +419,10 @@ fn read_http_stream_bytes_until(
     let mut header_parsed = false;
     let mut expected_total = None;
     loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "HTTP test response exceeded its absolute deadline",
-                )
-            })?;
-        let socket_timeout = remaining.min(Duration::from_millis(200));
-        if socket_timeout < Duration::from_millis(1) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "HTTP test response exceeded its absolute deadline",
-            ));
-        }
-        stream.set_read_timeout(Some(socket_timeout))?;
-        match stream.read(&mut buffer) {
+        // A per-read timeout is retryable, but the shared absolute deadline is
+        // not. Keep this check outside the retrying read-result match.
+        http_test_read_timeout(deadline)?;
+        match read_http_chunk_until(stream, &mut buffer, deadline) {
             Ok(0) => return Ok(response),
             Ok(read) => {
                 let previous_len = response.len();
@@ -414,6 +460,134 @@ fn read_http_stream_bytes_until(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn http_test_read_timeout(deadline: Instant) -> std::io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timeout = remaining.min(Duration::from_millis(200));
+    if timeout < Duration::from_millis(1) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "HTTP test response exceeded its absolute deadline",
+        ));
+    }
+    Ok(timeout)
+}
+
+#[cfg(not(unix))]
+fn read_http_chunk_until(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    stream
+        .set_read_timeout(Some(http_test_read_timeout(deadline)?))
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("HTTP test read timeout setup: {error}"),
+            )
+        })?;
+    stream.read(buffer).map_err(|error| {
+        std::io::Error::new(error.kind(), format!("HTTP test response read: {error}"))
+    })
+}
+
+#[cfg(unix)]
+fn poll_http_response(fd: std::os::fd::RawFd, timeout: Duration) -> std::io::Result<libc::c_short> {
+    // Floor rather than round up: waiting never gains time beyond the existing
+    // absolute budget. The caller rejects remaining durations below one ms.
+    let timeout_ms = i32::try_from(timeout.as_millis()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HTTP test poll timeout overflow",
+        )
+    })?;
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialized descriptor is live for the entire call. poll
+    // neither owns nor closes fd; the caller retains its TcpStream.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    if ready < 0 {
+        let error = std::io::Error::last_os_error();
+        // EINTR is retried against the absolute deadline. Other poll errors,
+        // including allocation-related EAGAIN, must not become busy retries.
+        let kind = if error.kind() == std::io::ErrorKind::Interrupted {
+            error.kind()
+        } else {
+            std::io::ErrorKind::Other
+        };
+        return Err(std::io::Error::new(
+            kind,
+            format!("HTTP test readiness poll: {error}"),
+        ));
+    }
+    if ready == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "HTTP test readiness wait expired",
+        ));
+    }
+    if descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HTTP test readiness poll reported an invalid descriptor",
+        ));
+    }
+    if descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+        return Err(std::io::Error::other(
+            "HTTP test readiness poll returned no readable event",
+        ));
+    }
+    Ok(descriptor.revents)
+}
+
+#[cfg(unix)]
+fn read_http_chunk_until(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    // Darwin rejects setsockopt once both halves are shut down, even when the
+    // receive buffer still contains an HTTP response. Readiness + per-call
+    // nonblocking recv needs no socket-option mutation on a disconnected peer.
+    let events = poll_http_response(stream.as_raw_fd(), http_test_read_timeout(deadline)?)?;
+    http_test_read_timeout(deadline)?;
+    // SAFETY: the stream remains owned, buffer is exclusively borrowed and its
+    // exact capacity is passed to recv. MSG_DONTWAIT also bounds spurious wakes.
+    let read = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if read < 0 {
+        let error = std::io::Error::last_os_error();
+        let kind = if error.kind() == std::io::ErrorKind::WouldBlock
+            && events & (libc::POLLHUP | libc::POLLERR) != 0
+        {
+            // A sticky terminal readiness event without readable data or EOF
+            // must fail, not spin until the deadline. Preserve the OS evidence.
+            std::io::ErrorKind::Other
+        } else {
+            error.kind()
+        };
+        return Err(std::io::Error::new(
+            kind,
+            format!("HTTP test response recv: {error}"),
+        ));
+    }
+    usize::try_from(read)
+        .ok()
+        .filter(|read| *read <= buffer.len())
+        .ok_or_else(|| std::io::Error::other("HTTP test response recv returned an invalid length"))
 }
 
 fn http_response_expected_total(
@@ -496,8 +670,8 @@ fn read_http_stream(mut stream: TcpStream, timeout: Duration) -> String {
 
 /// Connect (retrying until the server is up), send one complete HTTP request,
 /// then read the bounded response. Keep the write side open while reading:
-/// macOS rejects socket-option changes after a write-side shutdown, and HTTP
-/// request framing does not require a half-close.
+/// HTTP request framing does not require a half-close, and it can combine with
+/// peer shutdown to prohibit later socket-option changes on macOS.
 fn http_response(address: &str, request: &str, timeout: Duration) -> String {
     http_response_bytes(address, request.as_bytes(), timeout)
 }
@@ -590,6 +764,122 @@ fn native_http_test_reader_bounds_drip_time_and_response_size() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     drop(size_client);
     size_server.join().expect("join size server");
+}
+
+#[cfg(unix)]
+#[test]
+fn native_http_test_reader_drains_response_after_peer_shutdown() {
+    use std::os::fd::AsRawFd;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind shutdown fixture");
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect fixture");
+    let (mut peer, _) = listener.accept().expect("accept shutdown fixture");
+    peer.set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("finish request side");
+    let expected =
+        b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbye";
+    peer.write_all(expected)
+        .expect("buffer complete timeout response");
+    peer.shutdown(std::net::Shutdown::Write)
+        .expect("finish response side");
+    drop(peer);
+
+    // Wait for the actual TCP shutdown event, not a scheduling delay, without
+    // consuming the buffered response. Darwin's poll(events=0) does not install
+    // a read filter, so use its EOF event with a low-water mark above our data.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // SAFETY: kqueue has no arguments and returns a fresh owned descriptor.
+        let raw_queue = unsafe { libc::kqueue() };
+        assert!(raw_queue >= 0, "create shutdown event queue");
+        // SAFETY: the successful kqueue call transfers this sole fd ownership.
+        let queue = unsafe { OwnedFd::from_raw_fd(raw_queue) };
+        let change = libc::kevent {
+            ident: client.as_raw_fd() as usize,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_LOWAT,
+            data: (expected.len() + 1) as isize,
+            udata: std::ptr::null_mut(),
+        };
+        let mut event = libc::kevent {
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let wait = libc::timespec {
+            tv_sec: 2,
+            tv_nsec: 0,
+        };
+        // SAFETY: all descriptors and single-element event buffers remain live;
+        // the timeout bounds waiting and EOF is reported even with unread data.
+        let ready = unsafe { libc::kevent(queue.as_raw_fd(), &change, 1, &mut event, 1, &wait) };
+        assert_eq!(ready, 1, "peer shutdown was not observed");
+        let flags = event.flags;
+        assert_eq!(
+            flags & libc::EV_ERROR,
+            0,
+            "shutdown event registration failed"
+        );
+        assert_ne!(flags & libc::EV_EOF, 0, "expected peer EOF");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut descriptor = libc::pollfd {
+            fd: client.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        // SAFETY: descriptor and the owning client remain live; the wait is bounded.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 2000) };
+        assert_eq!(ready, 1, "peer shutdown was not observed");
+        assert_ne!(
+            descriptor.revents & libc::POLLHUP,
+            0,
+            "expected peer hangup"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // This proves the original reader's failure point on Darwin rather
+        // than accepting EINVAL as a successful or empty HTTP response.
+        let error = client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect_err("Darwin rejects socket options after both halves close");
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    }
+    let actual = read_http_stream_bytes_until(&mut client, Instant::now() + Duration::from_secs(2))
+        .expect("read buffered HTTP after peer shutdown without changing socket options");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn native_http_test_reader_rejects_expired_and_submillisecond_deadlines() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind deadline fixture");
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect fixture");
+    let (_peer, _) = listener.accept().expect("accept deadline fixture");
+    for remaining in [Duration::ZERO, Duration::from_micros(500)] {
+        let error = read_http_stream_bytes_until(&mut client, Instant::now() + remaining)
+            .expect_err("less than one ms must never become an unbounded socket wait");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_http_test_reader_rejects_invalid_poll_descriptor() {
+    let error = poll_http_response(i32::MAX, Duration::from_millis(1))
+        .expect_err("POLLNVAL must fail rather than become a readiness retry");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("invalid descriptor"));
 }
 
 fn assert_status(response: &str, status: &str) {
@@ -860,6 +1150,513 @@ fn native_http_route_retains_captured_handler_environment() {
     );
     assert_status(&response, "HTTP/1.1 200 OK");
     assert!(response.ends_with("\r\n\r\ncaptured-route"), "{response}");
+}
+
+const LEXICAL_CAPTURE_OWNED_RESPONSE_SOURCE: &str = r#"
+import "std.http"
+
+fn Echo(count: int): int { return count }
+
+fn main(): null! {
+    count = 0
+    read_count = () => { return count }
+    ordinary = () => { return 0 }
+    app = http.service({
+        max_connections: 4,
+        max_active_requests: 1,
+        max_pending_requests: 2
+    })
+    app.post("/capture", fn(req) {
+        count: str = req.body
+        observed = read_count() + Echo(0)
+        if (observed == 7) { return http.text(count) }
+        return http.text("wrong-lexical-capture")
+    })
+    ordinary = () => { return 7 }
+    count = ordinary()
+    handler = () => { return http.text("registered-direct-value") }
+    app.get("/direct", handler)
+    handler = () => { return http.text("unregistered-replacement") }
+    template_outer = 41
+    template_text = `{((x: int) => x + template_outer)(1)}`
+    if (template_text != "42") { fail "template closure lost its captured cell" }
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+
+#[test]
+fn native_http_lexical_capture_replay_preserves_local_owned_response() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let Some(server) = spawn_observed_native_server(
+        "lexical-capture-owned-response",
+        LEXICAL_CAPTURE_OWNED_RESPONSE_SOURCE,
+        &address,
+    ) else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a real native compiler"
+        );
+        return;
+    };
+    // A different owned request body on each call must reach the response
+    // without clone. That branch also requires the helper's outer int capture,
+    // not the same-named handler-local string. This is not a soak/leak proof.
+    for body in ["first-owned", "second-owned", "third-owned"] {
+        let request = format!(
+            "POST /capture HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let response = http_response(&address, &request, Duration::from_secs(5));
+        assert_status(&response, "HTTP/1.1 200 OK");
+        assert_eq!(
+            response.split_once("\r\n\r\n").expect("HTTP headers").1,
+            body,
+            "helper must read outer count=7 and move only the per-request string"
+        );
+    }
+    // Registration retains the current invoke/env value, not the caller's
+    // handler variable cell. Its later replacement must not change this route.
+    let response = http_response(
+        &address,
+        "GET /direct HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(5),
+    );
+    assert_status(&response, "HTTP/1.1 200 OK");
+    assert_eq!(
+        response.split_once("\r\n\r\n").expect("HTTP headers").1,
+        "registered-direct-value",
+        "direct handler values must not become aliases of the caller's variable cell"
+    );
+    server.finish_checked();
+}
+
+#[test]
+fn native_http_lexical_capture_replay_rejects_shadowed_write_before_c_emission() {
+    let dir = unique_temp_dir("lexical-capture-write-rejected");
+    let entry = "server.ku";
+    fs::write(
+        dir.join(entry),
+        r#"
+import "std.http"
+fn main(): null! {
+    count = 0
+    mutate = () => { count += 1; return null }
+    app = http.service()
+    app.get("/", fn() {
+        count: int = 0
+        mutate()
+        return http.text("bad")
+    })
+    return ok(null)
+}
+"#,
+    )
+    .expect("write rejected HTTP source");
+    let mut command = Command::new(ku_binary());
+    // No -o: the compatibility command stops at checker/C emission, without
+    // linking an executable or starting the rejected handler.
+    command.current_dir(&dir).args(["build", "--native", entry]);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, BUILD_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("HTTP rejection check was not bounded: {error}"));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "shadowed outer write was accepted: {combined}"
+    );
+    assert!(
+        combined.contains("http handler cannot modify captured variable 'count'"),
+        "expected lexical capture rejection, got: {combined}"
+    );
+    assert!(
+        !dir.join("server.c").exists(),
+        "rejected HTTP source emitted C in {}",
+        dir.display()
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_http_shared_callable_writes_reject_before_c_emission() {
+    for (label, body) in [
+        (
+            "direct",
+            r#"
+    app.get("/", fn() { render(); return http.text("ok") })
+    render = () => { count += 1; return null }
+"#,
+        ),
+        (
+            "alias-setter",
+            r#"
+    setter = () => { render = Other; return null }
+    alias = setter.clone()
+    app.get("/", fn() { render(); return http.text("ok") })
+    alias()
+"#,
+        ),
+        (
+            "loop",
+            r#"
+    turn = 0
+    while (turn < 2) {
+        render = Other
+        if (turn == 0) {
+            app.get("/", fn() { render(); return http.text("ok") })
+        }
+        turn += 1
+    }
+"#,
+        ),
+        (
+            "template-hidden-setter",
+            r#"
+    setter = () => { render = Other; return 0 }
+    hidden = () => { print(`{setter()}`); return null }
+    app.get("/", fn() { render(); return http.text("ok") })
+    hidden()
+"#,
+        ),
+        (
+            "installed-mutator",
+            r#"
+    fn Set(next: fn(): null): null { render = next.clone(); return null }
+    render = Noop
+    mutator = () => { count += 1; return null }
+    Set(mutator.clone())
+    app.get("/", fn() { render(); return http.text("ok") })
+"#,
+        ),
+        (
+            "factory-stale-body",
+            r#"
+    route_handler = () => { return http.text("safe") }
+    bad = () => { count += 1; return http.text("bad") }
+    install = () => {
+        route_handler = bad.clone()
+        marker = 0
+        return null
+    }
+    // Restore the initial value after definition-time checking. The marker
+    // keeps install outside the exact assignment/literal-null transfer rule.
+    route_handler = () => { return http.text("safe") }
+    app.get("/", After(install(), route_handler.clone()))
+"#,
+        ),
+        (
+            "destructure-stale-body",
+            r#"
+    route_handler = () => { return http.text("safe") }
+    bad = () => { count += 1; return http.text("bad") }
+    install = () => {
+        route_handler = bad.clone()
+        marker = 0
+        return null
+    }
+    route_handler = () => { return http.text("safe") }
+    _, chosen = install(), route_handler.clone()
+    app.get("/", chosen)
+"#,
+        ),
+        (
+            "destructure-hidden-setter",
+            r#"
+    op = Noop
+    setter = () => { render = Other; return null }
+    install = () => {
+        op = setter.clone()
+        marker = 0
+        return null
+    }
+    op = Noop
+    app.get("/", fn() { render(); return http.text("ok") })
+    _, selected = install(), op.clone()
+    selected()
+"#,
+        ),
+        (
+            "for-backedge-setter",
+            r#"
+    setter = () => { render = Other; return null }
+    for turn in [0, 1] {
+        setter()
+        if (turn == 0) {
+            app.get("/", fn() { render(); return http.text("ok") })
+        }
+    }
+"#,
+        ),
+        (
+            "for-continue-setter",
+            r#"
+    setter = () => { render = Other; return null }
+    for turn in [0, 1] {
+        setter()
+        if (turn == 0) {
+            app.get("/", fn() { render(); return http.text("ok") })
+            continue
+        }
+        break
+    }
+"#,
+        ),
+        (
+            "service-move-freeze",
+            r#"
+    app.get("/", fn() { render(); return http.text("ok") })
+    moved = app
+    render = Other
+"#,
+        ),
+        (
+            "service-scope-freeze",
+            r#"
+    if (true) {
+        app.get("/", fn() { render(); return http.text("ok") })
+        scoped = app
+    }
+    render = Other
+"#,
+        ),
+        (
+            "listener-close-freeze",
+            r#"
+    app.get("/", fn() { render(); return http.text("ok") })
+    listener = app.bind("127.0.0.1:0")?
+    listener.close()?
+    render = Other
+"#,
+        ),
+        (
+            "for-iterable-stale-body",
+            r#"
+    route_handler = () => { return http.text("safe") }
+    bad = () => { count += 1; return http.text("bad") }
+    install = () => {
+        route_handler = bad.clone()
+        marker = 0
+        return null
+    }
+    // Reset after definition-time checking, retaining the non-exact installer.
+    route_handler = () => { return http.text("safe") }
+    for chosen in [After(install(), route_handler.clone())] {
+        app.get("/", chosen)
+    }
+"#,
+        ),
+    ] {
+        let source = format!(
+            r#"
+import "std.http"
+fn Noop(): null {{ return null }}
+fn Other(): null {{ return null }}
+fn After<T>(ignored: null, value: T): T {{ return value }}
+fn Before<T>(value: T, ignored: null): T {{ return value }}
+fn main(): null! {{
+    count = 0
+    render = Noop
+    app = http.service()
+    {body}
+    return ok(null)
+}}
+"#
+        );
+        // Overall parser acceptance alone does not parse template expressions.
+        // Validate that call separately; neither preflight executes any source.
+        if label == "template-hidden-setter" {
+            let tokens = ku::lexer::Lexer::new("setter()")
+                .lex()
+                .expect("hidden setter expression must lex");
+            ku::parser::Parser::new(tokens)
+                .parse_expression_only()
+                .expect("hidden setter expression must parse");
+        }
+        let tokens = ku::lexer::Lexer::with_file(label, &source)
+            .lex()
+            .unwrap_or_else(|error| panic!("{label} must lex: {}", error.message));
+        ku::parser::Parser::new(tokens)
+            .parse_program()
+            .unwrap_or_else(|error| panic!("{label} must parse: {}", error.message));
+
+        // Remove only registration, preserving setter effects and lifecycle.
+        // These are checker-only controls: bind/close is not run or native-built.
+        if matches!(
+            label,
+            "for-backedge-setter"
+                | "for-continue-setter"
+                | "service-move-freeze"
+                | "service-scope-freeze"
+                | "listener-close-freeze"
+        ) {
+            let registration = r#"app.get("/", fn() { render(); return http.text("ok") })"#;
+            assert_eq!(source.matches(registration).count(), 1);
+            let control = source.replace(registration, "");
+            ku::cli::check_source(&format!("control-{label}"), &control).unwrap_or_else(|error| {
+                panic!("{label}: no-registration control rejected: {error}\n{control}")
+            });
+        }
+
+        // Destructuring and iterable rows get these paired checker preflights.
+        // Keep the installation and all evaluations in the no-route control.
+        // The reversed-order source still registers a route, but only the old
+        // safe value was copied; check_source never executes either program.
+        let evaluated_value_controls = match label {
+            "destructure-stale-body" => Some((
+                r#"app.get("/", chosen)"#,
+                "_, chosen = install(), route_handler.clone()",
+                "chosen, _ = route_handler.clone(), install()",
+            )),
+            "destructure-hidden-setter" => Some((
+                r#"app.get("/", fn() { render(); return http.text("ok") })"#,
+                "_, selected = install(), op.clone()",
+                "selected, _ = op.clone(), install()",
+            )),
+            "for-iterable-stale-body" => Some((
+                r#"app.get("/", chosen)"#,
+                "After(install(), route_handler.clone())",
+                "Before(route_handler.clone(), install())",
+            )),
+            _ => None,
+        };
+        if let Some((registration, later, earlier)) = evaluated_value_controls {
+            assert_eq!(source.matches(registration).count(), 1);
+            let control = source.replace(registration, "");
+            ku::cli::check_source(&format!("control-{label}"), &control).unwrap_or_else(|error| {
+                panic!("{label}: no-registration control rejected: {error}\n{control}")
+            });
+            assert_eq!(source.matches(later).count(), 1);
+            let reversed = source.replace(later, earlier);
+            assert_eq!(reversed.matches(registration).count(), 1);
+            ku::cli::check_source(&format!("reversed-{label}"), &reversed).unwrap_or_else(
+                |error| {
+                    panic!("{label}: old evaluated value must remain legal: {error}\n{reversed}")
+                },
+            );
+        }
+
+        let dir = unique_temp_dir(&format!("shared-callable-{label}"));
+        fs::write(dir.join("server.ku"), &source).expect("write rejected HTTP source");
+        for (entry, args) in [
+            ("check-json", &["check", "--json", "server.ku"][..]),
+            ("native", &["build", "--native", "server.ku"][..]),
+            ("backend-c", &["build", "--backend", "c", "server.ku"][..]),
+        ] {
+            let mut command = Command::new(ku_binary());
+            // No -o. --native is C-only, but --backend c normally links too.
+            // Empty KU_CC forbids compiler discovery if rejection regresses;
+            // that fallback error cannot satisfy the safety assertions below.
+            command.current_dir(&dir).env("KU_CC", "").args(args);
+            let output = run_bounded(&mut command, RUN_TIMEOUT, BUILD_OUTPUT_LIMITS)
+                .unwrap_or_else(|error| {
+                    panic!("{label}/{entry}: HTTP rejection was not bounded: {error}")
+                });
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !output.status.success(),
+                "{label}/{entry}: unsafe shared callable was accepted: {combined}"
+            );
+            // Assert both the compatibility artifact and the backend's actual
+            // default host/debug artifact, before interpreting diagnostics.
+            for artifact in ["server.c", ".ku/build/debug/c/server.c"] {
+                assert!(
+                    !dir.join(artifact).exists(),
+                    "{label}/{entry}: rejected HTTP source emitted {artifact} in {}",
+                    dir.display()
+                );
+            }
+            let diagnostic = if entry == "check-json" {
+                use ku::value::Value;
+
+                let stdout = std::str::from_utf8(&output.stdout).expect("JSON stdout is UTF-8");
+                let stderr = std::str::from_utf8(&output.stderr).expect("JSON stderr is UTF-8");
+                let lines = stdout
+                    .lines()
+                    .chain(stderr.lines())
+                    .filter(|line| !line.trim().is_empty())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    lines.len(),
+                    1,
+                    "{label}/{entry}: expected exactly one JSON diagnostic: {combined}"
+                );
+                let parsed = ku::stdlib::json::eval(
+                    "parse",
+                    &[Value::String(lines[0].to_string())],
+                    ku::span::Span::default(),
+                )
+                .expect("parse JSON diagnostic with the existing JSON parser");
+                let Some(Value::Result { ok: true, value }) = parsed else {
+                    panic!("{label}/{entry}: invalid JSON diagnostic: {combined}");
+                };
+                let Value::Object(fields) = *value else {
+                    panic!("{label}/{entry}: diagnostic must be a JSON object: {combined}");
+                };
+                let Some(Value::String(code)) = fields.get("code") else {
+                    panic!("{label}/{entry}: missing diagnostic code: {combined}");
+                };
+                let Some(Value::String(message)) = fields.get("message") else {
+                    panic!("{label}/{entry}: missing diagnostic message: {combined}");
+                };
+                assert!(
+                    matches!(fields.get("level"), Some(Value::String(level)) if level == "error"),
+                    "{label}/{entry}: expected error level: {combined}"
+                );
+                assert!(
+                    code == "E0704"
+                        || (matches!(
+                            label,
+                            "installed-mutator"
+                                | "factory-stale-body"
+                                | "destructure-stale-body"
+                                | "for-iterable-stale-body"
+                        ) && code == "E0703"),
+                    "{label}/{entry}: wrong structured diagnostic code: {combined}"
+                );
+                // Do not let notes or embedded source text satisfy the reason.
+                format!("{code}: {message}")
+            } else {
+                combined.clone()
+            };
+            let shared_reassignment = diagnostic.contains("E0704")
+                && diagnostic.contains("cannot reassign HTTP-shared function binding 'render'");
+            let unproved_shared_effect = diagnostic.contains("E0704")
+                && diagnostic.contains("cannot prove")
+                && diagnostic.contains("HTTP-shared");
+            let expected_reason = match label {
+                // Incomplete transitive/template/alias effects must fail closed,
+                // not be accepted because no concrete write could be recovered.
+                "template-hidden-setter" | "destructure-hidden-setter" => {
+                    shared_reassignment || unproved_shared_effect
+                }
+                // This write precedes registration: E0703 must describe the
+                // actual count mutation; E0704 must explicitly lack proof.
+                "installed-mutator"
+                | "factory-stale-body"
+                | "destructure-stale-body"
+                | "for-iterable-stale-body" => {
+                    (diagnostic.contains("E0703")
+                        && diagnostic
+                            .contains("http handler cannot modify captured variable 'count'"))
+                        || unproved_shared_effect
+                }
+                _ => shared_reassignment,
+            };
+            assert!(
+                expected_reason,
+                "{label}/{entry}: expected an HTTP shared-state safety rejection, not a syntax/type error: {combined}"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
 }
 
 // Field-assignment config form (`app.max_body_bytes = 4`) — the exact scenario 2
@@ -1891,4 +2688,175 @@ fn main(): null! {
             "HTTP program '{name}' must compile and link natively"
         );
     }
+}
+
+// Synchronous arithmetic through all four native HTTP dispatcher shapes.
+// Reuses the real compiler, socket reader, lock and child-process watchdog.
+const SYNC_ARITHMETIC_HTTP_SOURCE: &str = r#"
+import "std.http"
+import fs from "std.fs"
+
+fn Divide(left: int, right: int): int { return left / right }
+fn RecoverableShape(): int! {
+    owned = "fatal-" + "owner"
+    try {
+        return ok(Divide(7, 0))
+    } catch (err) {
+        fs.write("BAD-catch.txt", owned.clone())
+        return ok(99)
+    } finally {
+        fs.write("BAD-finally.txt", "ordinary fatal must skip user finally")
+    }
+    return ok(0)
+}
+fn Mark(): null! {
+    fs.write("cleanup-outer.txt", "healthy-after-failed-callee")?
+    return ok(null)
+}
+fn Timed() {
+    owner = "timed-" + "owner"
+    try { while (true) {} }
+    finally {
+        try {
+            value = Divide(9, 0)
+            fs.write("BAD-after-math.txt", str(value))
+        } finally {
+            Mark()
+            fs.write("cleanup-after-helper.txt", owner.clone())
+        }
+    }
+    return http.text("BAD timeout response")
+}
+fn main(): null! {
+    app = http.server({
+        handler_timeout_ms: 100,
+        read_header_timeout_ms: 2000,
+        max_connections: 8,
+        max_active_requests: 1,
+        max_pending_requests: 2
+    })
+    app.get("/plain-zero", fn() {
+        value = Divide(7, 0)
+        return http.text(str(value))
+    })
+    app.post("/plain-one", fn(req) {
+        owned = req.body.clone()
+        value = Divide(7, 0)
+        return http.text(owned + str(value))
+    })
+    app.get("/result-zero", fn() {
+        try {
+            value = RecoverableShape()?
+            return ok(http.text(str(value)))
+        } catch (err) { fs.write("BAD-handler-catch.txt", err.message.clone()) }
+        return ok(http.text("BAD-handler-fallback"))
+    })
+    app.post("/result-one", fn(req) {
+        owned = req.body.clone()
+        try {
+            value = RecoverableShape()?
+            return ok(http.text(owned + str(value)))
+        } catch (err) { fs.write("BAD-handler-catch.txt", err.message.clone()) }
+        return ok(http.text("BAD-handler-fallback"))
+    })
+    app.get("/timed", Timed)
+    app.get("/ok", fn() { return http.text("clean-worker") })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#;
+
+#[test]
+fn native_sync_arithmetic_http_failure_isolated_and_timeout_keeps_504() {
+    let _guard = HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let address = unused_local_address();
+    let Some(mut server) =
+        spawn_native_server("sync-arithmetic", SYNC_ARITHMETIC_HTTP_SOURCE, &address)
+    else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI requires a real native compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(server.c_source()).expect("generated C");
+    // Reject the old unchecked artifact before sending any arithmetic request.
+    assert_eq!(generated.matches("static uint32_t ku_int_div(").count(), 1);
+    let divide_body = generated
+        .split_once("int64_t Divide(int64_t left, int64_t right) {")
+        .expect("actual Divide definition")
+        .1
+        .split("\n}")
+        .next()
+        .unwrap();
+    assert!(
+        divide_body.contains("ku_int_div("),
+        "actual Divide must call checked helper before any request"
+    );
+    assert!(!generated.contains("run_source") && !generated.contains("const SOURCE"));
+    let directory = server.dir().to_path_buf();
+    // Existing HTTP harness has already started the server. This only verifies
+    // live source removal; cold-start source independence is a separate gate.
+    fs::remove_file(directory.join("server.ku")).unwrap();
+    fs::remove_file(server.c_source()).unwrap();
+    let watchdog = server.arm_kill_watchdog(Duration::from_secs(20));
+    let good_request = "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let ready = http_response(&address, good_request, Duration::from_secs(5));
+    assert_status(&ready, "HTTP/1.1 200 OK");
+    assert!(ready.ends_with("clean-worker"));
+    for _ in 0..3 {
+        for (method, path, body) in [
+            ("GET", "/plain-zero", ""),
+            ("POST", "/plain-one", "owned request"),
+            ("GET", "/result-zero", ""),
+            ("POST", "/result-one", "owned request"),
+        ] {
+            let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let failed = http_response(&address, &request, Duration::from_secs(3));
+            assert_status(&failed, "HTTP/1.1 500 Internal Server Error");
+            assert_eq!(
+                failed.split_once("\r\n\r\n").expect("HTTP headers").1,
+                "Internal Server Error"
+            );
+            let recovered = http_response(&address, good_request, Duration::from_secs(3));
+            assert_status(&recovered, "HTTP/1.1 200 OK");
+            assert!(recovered.ends_with("clean-worker"));
+            assert!(!watchdog.timed_out());
+        }
+    }
+    let timed = http_response(
+        &address,
+        "GET /timed HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(3),
+    );
+    assert_status(&timed, "HTTP/1.1 504 Gateway Timeout");
+    assert_eq!(
+        fs::read_to_string(directory.join("cleanup-outer.txt")).unwrap(),
+        "healthy-after-failed-callee"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.join("cleanup-after-helper.txt")).unwrap(),
+        "timed-owner"
+    );
+    for marker in [
+        "BAD-catch.txt",
+        "BAD-finally.txt",
+        "BAD-after-math.txt",
+        "BAD-handler-catch.txt",
+    ] {
+        assert!(
+            !directory.join(marker).exists(),
+            "unexpected continuation: {marker}"
+        );
+    }
+    let recovered = http_response(&address, good_request, Duration::from_secs(3));
+    assert_status(&recovered, "HTTP/1.1 200 OK");
+    assert!(recovered.ends_with("clean-worker"));
+    assert!(!watchdog.timed_out());
+    // max_active_requests=1 exercises one execution thread reused across roots
+    // (including the legacy inline acceptor fallback if worker creation fails).
+    // Marker writes prove actions occurred, not exactly-once counts or D values.
+    // This is not a multi-worker, allocation-ledger or production-soak claim.
 }

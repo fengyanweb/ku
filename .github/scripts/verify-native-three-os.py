@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
 import hashlib
+import math
 import os
 import platform
 import re
@@ -20,7 +21,7 @@ import tarfile
 import threading
 import time
 from pathlib import Path
-from typing import BinaryIO, Iterator, NoReturn
+from typing import BinaryIO, Callable, Iterator, NoReturn, TypeVar
 
 
 MAX_CAPTURE_BYTES = 1024 * 1024
@@ -32,6 +33,62 @@ CLEANUP_TIMEOUT_SECONDS = 10
 COMMAND_TIMEOUT_SECONDS = 300
 MAX_WINDOWS_THREAD_SCAN = 65536
 WINDOWS_PROCESS_SETUP_TIMEOUT_SECONDS = 5
+PROCESS_CLEANUP_TIMEOUT_SECONDS = 10
+MAX_WINDOWS_JOB_DRAIN_POLLS = 1024
+WINDOWS_JOB_DRAIN_POLL_SECONDS = 0.01
+_CleanupValue = TypeVar("_CleanupValue")
+
+
+class CleanupFailure(RuntimeError):
+    def __init__(self, summary: str, primary: BaseException | None = None) -> None:
+        self.primary = primary
+        self.cleanup_summary = summary
+        # Keep the primary intact for caller-side credential redaction. Cutting
+        # it through a password before redaction can expose a partial secret.
+        # Command output was already capped by MAX_CAPTURE_BYTES at capture.
+        prefix = f"{primary}; " if primary is not None else ""
+        super().__init__(f"{prefix}cleanup failed: {summary}")
+
+
+class CleanupErrors:
+    """Finite categorical diagnostics; no raw secondary exception/secret text."""
+
+    def __init__(self) -> None:
+        self._errors: list[str] = []
+
+    @property
+    def failed(self) -> bool:
+        return bool(self._errors)
+
+    def add(self, label: str, error: BaseException | None = None) -> None:
+        if len(self._errors) >= 12:
+            return
+        detail = type(error).__name__ if error is not None else "unconfirmed"
+        if isinstance(error, CleanupFailure):
+            detail += ": " + error.cleanup_summary[:160]
+        self._errors.append(f"{label[:80]} ({detail[:200]})")
+
+    def attempt(self, label: str, action: Callable[[], _CleanupValue]) -> _CleanupValue | None:
+        try:
+            return action()
+        except BaseException as error:
+            self.add(label, error)
+            return None
+
+    def summary(self) -> str:
+        return "; ".join(self._errors)
+
+    def raise_if_any(self, primary: BaseException | None = None) -> None:
+        if self.failed:
+            raise CleanupFailure(self.summary(), primary) from primary
+        if primary is not None:
+            raise primary
+
+
+class WindowsJobSetupError(RuntimeError):
+    def __init__(self, job: WindowsJob, cause: BaseException) -> None:
+        self.job = job
+        super().__init__(f"Windows Job setup failed ({type(cause).__name__}); owned Job retained")
 
 TARGET_HOSTS = {
     "x86_64-windows": ("Windows", {"AMD64", "x86_64"}),
@@ -41,6 +98,19 @@ TARGET_HOSTS = {
 
 
 if os.name == "nt":
+    class _JobBasicAccountingInformation(ctypes.Structure):
+        _fields_ = [
+            ("total_user_time", ctypes.c_longlong),
+            ("total_kernel_time", ctypes.c_longlong),
+            ("this_period_total_user_time", ctypes.c_longlong),
+            ("this_period_total_kernel_time", ctypes.c_longlong),
+            ("total_page_fault_count", wintypes.DWORD),
+            ("total_processes", wintypes.DWORD),
+            ("active_processes", wintypes.DWORD),
+            ("total_terminated_processes", wintypes.DWORD),
+        ]
+
+
     class _JobBasicLimitInformation(ctypes.Structure):
         _fields_ = [
             ("per_process_user_time_limit", ctypes.c_longlong),
@@ -97,6 +167,7 @@ class WindowsJob:
 
     def __init__(self, handle: int) -> None:
         self.handle = handle
+        self._lock = threading.Lock()
 
     @classmethod
     def attach(cls, process: subprocess.Popen[bytes]) -> WindowsJob | None:
@@ -117,39 +188,118 @@ class WindowsJob:
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
 
+        job = cls(0)
         handle = kernel32.CreateJobObjectW(None, None)
         if not handle:
             return None
-        information = _JobExtendedLimitInformation()
-        information.basic_limit_information.limit_flags = cls._KILL_ON_JOB_CLOSE
-        if not kernel32.SetInformationJobObject(
-            handle,
-            cls._EXTENDED_LIMIT_INFORMATION,
-            ctypes.byref(information),
-            ctypes.sizeof(information),
-        ) or not kernel32.AssignProcessToJobObject(
-            handle, wintypes.HANDLE(process._handle)  # type: ignore[attr-defined]
-        ):
-            kernel32.CloseHandle(handle)
-            return None
-        return cls(handle)
+        job.handle = handle
+        try:
+            information = _JobExtendedLimitInformation()
+            information.basic_limit_information.limit_flags = cls._KILL_ON_JOB_CLOSE
+            if not kernel32.SetInformationJobObject(
+                handle, cls._EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(information), ctypes.sizeof(information),
+            ):
+                raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+            if not kernel32.AssignProcessToJobObject(
+                handle, wintypes.HANDLE(process._handle)  # type: ignore[attr-defined]
+            ):
+                raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+        except BaseException as error:
+            # The caller owns both the suspended child and this allocated Job.
+            # Do not lose its handle through a failed close inside attach().
+            raise WindowsJobSetupError(job, error) from error
+        return job
 
     def terminate(self) -> None:
-        if os.name != "nt" or not self.handle:
-            return
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-        kernel32.TerminateJobObject.restype = wintypes.BOOL
-        kernel32.TerminateJobObject(self.handle, 1)
+        with self._lock:
+            if os.name != "nt" or not self.handle:
+                return
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            kernel32.TerminateJobObject.restype = wintypes.BOOL
+            if not kernel32.TerminateJobObject(self.handle, 1):
+                raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")
 
     def close(self) -> None:
-        if os.name != "nt" or not self.handle:
-            return
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle(self.handle)
-        self.handle = 0
+        with self._lock:
+            if os.name != "nt" or not self.handle:
+                return
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            if not kernel32.CloseHandle(self.handle):
+                raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+            self.handle = 0
+
+    def active_processes(self) -> int:
+        """Query this still-owned Job, never the caller's implicit/null Job."""
+        with self._lock:
+            if os.name != "nt" or not self.handle:
+                raise RuntimeError("Windows Job accounting requires an open owned Job")
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.QueryInformationJobObject.argtypes = [
+                wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+            ]
+            kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+            information = _JobBasicAccountingInformation()
+            returned = wintypes.DWORD(0xFFFFFFFF)
+            size = ctypes.sizeof(information)
+            if not kernel32.QueryInformationJobObject(
+                self.handle, 1, ctypes.byref(information), size, ctypes.byref(returned),
+            ):
+                raise OSError(ctypes.get_last_error(), "QueryInformationJobObject failed")
+            if returned.value != size:
+                raise RuntimeError("Windows Job accounting returned an invalid length")
+            return int(information.active_processes)
+
+    def wait_empty(self, deadline: float) -> bool:
+        """Observe zero before close under the caller's existing cleanup budget.
+
+        This observes contained processes, not arbitrary host process creation.
+        The deadline cannot preempt a synchronous kernel call that never returns.
+        No owner lock is held while sleeping, and query errors are never retried.
+        """
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError("Windows Job drain requires a finite deadline")
+        if type(MAX_WINDOWS_JOB_DRAIN_POLLS) is not int or MAX_WINDOWS_JOB_DRAIN_POLLS <= 0:
+            raise ValueError("Windows Job drain requires a positive poll bound")
+        for attempt in range(MAX_WINDOWS_JOB_DRAIN_POLLS):
+            now = time.monotonic()
+            if not math.isfinite(now) or now >= deadline:
+                raise RuntimeError("Windows Job drain exceeded its deadline")
+            count = self.active_processes()
+            now = time.monotonic()
+            if not math.isfinite(now) or now >= deadline:
+                raise RuntimeError("Windows Job drain exceeded its deadline")
+            if type(count) is not int or count < 0:
+                raise RuntimeError("Windows Job drain received an invalid active count")
+            if count == 0:
+                return True
+            if attempt + 1 < MAX_WINDOWS_JOB_DRAIN_POLLS:
+                time.sleep(min(WINDOWS_JOB_DRAIN_POLL_SECONDS, deadline - now))
+        raise RuntimeError("Windows Job drain exceeded its poll bound")
+
+
+class _ToolhelpHandles:
+    """Two temporary owners; uncertainty is retained, never automatically retried."""
+
+    __slots__ = ("_kernel32", "snapshot", "thread")
+
+    def __init__(self, kernel32: ctypes.CDLL) -> None:
+        self._kernel32 = kernel32
+        self.snapshot: int | None = None
+        self.thread: int | None = None
+
+    def close_slot(self, slot: str) -> None:
+        handle = getattr(self, slot)
+        if handle is not None:
+            if not self._kernel32.CloseHandle(handle):
+                raise OSError(ctypes.get_last_error(), "ToolHelp CloseHandle failed")
+            # Clear before any fallible post-close clock read. A raised close
+            # may have an uncertain post-effect outcome: retain, do not retry.
+            setattr(self, slot, None)
 
 
 def resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
@@ -183,19 +333,21 @@ def resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
     # this Python deadline.  Start the clock before the first call and fail
     # closed on both the entry bound and observed elapsed time after every
     # syscall returns.
+    handles = _ToolhelpHandles(kernel32)
+    cleanup = CleanupErrors()
     deadline = time.monotonic() + WINDOWS_PROCESS_SETUP_TIMEOUT_SECONDS
-    snapshot = kernel32.CreateToolhelp32Snapshot(snapshot_flag, 0)
-    if not snapshot or snapshot == invalid_handle:
-        raise RuntimeError(
-            f"could not enumerate suspended Windows child threads: {ctypes.get_last_error()}"
-        )
-    if time.monotonic() > deadline:
-        kernel32.CloseHandle(snapshot)
-        raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
-    thread_handle = None
+    primary = None
     thread_id = None
     scanned_threads = 0
     try:
+        snapshot = kernel32.CreateToolhelp32Snapshot(snapshot_flag, 0)
+        if not snapshot or snapshot == invalid_handle:
+            raise RuntimeError(
+                f"could not enumerate suspended Windows child threads: {ctypes.get_last_error()}"
+            )
+        handles.snapshot = snapshot
+        if time.monotonic() > deadline:
+            raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
         entry = _ThreadEntry32()
         entry.size = ctypes.sizeof(entry)
         has_entry = bool(kernel32.Thread32First(snapshot, ctypes.byref(entry)))
@@ -234,6 +386,7 @@ def resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
                 "could not open the suspended Windows child thread: "
                 f"{ctypes.get_last_error()}"
             )
+        handles.thread = thread_handle
         if time.monotonic() > deadline:
             raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
         owner_process_id = kernel32.GetProcessIdOfThread(thread_handle)
@@ -254,10 +407,34 @@ def resume_suspended_windows_process(process: subprocess.Popen[bytes]) -> None:
             raise RuntimeError(
                 "Windows child did not have the expected single CREATE_SUSPENDED count"
             )
-    finally:
-        if thread_handle:
-            kernel32.CloseHandle(thread_handle)
-        kernel32.CloseHandle(snapshot)
+    except BaseException as error:
+        primary = error
+    for slot in ("thread", "snapshot"):
+        if getattr(handles, slot) is None:
+            continue
+        try:
+            handles.close_slot(slot)
+        except BaseException as error:
+            if primary is None:
+                primary = error
+            else:
+                cleanup.add(f"ToolHelp {slot} close", error)
+        # Keep the original setup deadline, including time spent closing. A
+        # failed close/clock never skips the other independent acquired owner.
+        try:
+            if time.monotonic() > deadline:
+                raise RuntimeError("suspended Windows child thread lookup exceeded its bound")
+        except BaseException as error:
+            if primary is None:
+                primary = error
+            else:
+                cleanup.add(f"ToolHelp {slot} close deadline", error)
+    try:
+        cleanup.raise_if_any(primary)
+    except BaseException as error:
+        if handles.snapshot is not None or handles.thread is not None:
+            error.toolhelp_handles = handles
+        raise
 
 
 def fail(message: str) -> NoReturn:
@@ -278,34 +455,30 @@ def resolve_existing_file(raw: str, label: str) -> Path:
 def kill_process_tree(
     process: subprocess.Popen[bytes], windows_job: WindowsJob | None
 ) -> None:
+    errors = CleanupErrors()
     if os.name == "nt":
         if windows_job is not None:
-            windows_job.terminate()
-        elif process.poll() is None:
-            # Fallback for hosts whose outer Job Object rejects assignment.
-            # This reliably contains a still-running direct child; after that
-            # child has exited, Windows offers no process-group kill primitive.
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=10,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+            errors.attempt("Job termination", windows_job.terminate)
+        # Internal Windows callers create SUSPENDED and never resume without
+        # successful Job assignment. None therefore means only an unresumed
+        # retained root; use the held Popen handle below, never PID-tree lookup.
+        # A previously assigned Job stays non-None even after its handle closes.
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except OSError:
+        except ProcessLookupError:
             pass
-    if process.poll() is None:
+        except BaseException as error:
+            errors.add("process group termination", error)
+    # Unknown poll state still permits the independent exact-handle kill.
+    if errors.attempt("root poll", process.poll) is None:
         try:
             process.kill()
-        except OSError:
+        except ProcessLookupError:
             pass
+        except BaseException as error:
+            errors.add("root termination", error)
+    errors.raise_if_any()
 
 
 def close_finished_output_streams(
@@ -314,9 +487,14 @@ def close_finished_output_streams(
     # BufferedReader.close() can wait forever for a different thread's blocked
     # read lock. A daemon reader that still owns an inherited pipe must be left
     # for process teardown after the bounded failure, never closed synchronously.
-    for stream, reader in zip(streams, readers):
-        if not reader.is_alive():
-            stream.close()
+    errors = CleanupErrors()
+    for index, stream in enumerate(streams):
+        try:
+            if index >= len(readers) or not readers[index].is_alive():
+                errors.attempt(f"output {index} close", stream.close)
+        except BaseException as error:
+            errors.add(f"output {index} reader state", error)
+    errors.raise_if_any()
 
 
 def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.CompletedProcess[bytes]:
@@ -326,6 +504,12 @@ def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.Complet
         # Popen closes the initial thread handle, so resume it below through a
         # bounded ToolHelp lookup only after successful Job assignment.
         creation_flags = 0x00000200 | 0x00000004  # NEW_PROCESS_GROUP | SUSPENDED
+    output = [bytearray(), bytearray()]
+    output_bytes = 0
+    overflow = threading.Event()
+    output_lock = threading.Lock()
+    reader_errors = CleanupErrors()
+    errors = CleanupErrors()
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -336,26 +520,12 @@ def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.Complet
         creationflags=creation_flags,
         start_new_session=os.name != "nt",
     )
-    try:
-        windows_job = WindowsJob.attach(process)
-    except BaseException:
-        # Popen has already created the child.  On Windows it is still
-        # suspended here, so an unexpected ctypes/Job setup exception must not
-        # strand a process that never reaches the ordinary cleanup block.
-        kill_process_tree(process, None)
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        assert process.stdout is not None and process.stderr is not None
-        process.stdout.close()
-        process.stderr.close()
-        raise
-    output = [bytearray(), bytearray()]
-    output_bytes = 0
-    overflow = threading.Event()
-    output_lock = threading.Lock()
-    reader_errors: list[str] = []
+    windows_job = None
+    primary = None
+    return_code = None
+    # Entries exist before construction/start; a partial failure cannot lose
+    # the other pipe or cause join() on a thread that was never started.
+    readers: list[tuple[BinaryIO, threading.Thread | None, bool | None]] = []
 
     def drain(stream: BinaryIO, index: int) -> None:
         nonlocal output_bytes
@@ -377,77 +547,107 @@ def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.Complet
                     kill_process_tree(process, windows_job)
                 if overflow.is_set():
                     return
-        except (OSError, ValueError) as error:
+        except BaseException as error:
             with output_lock:
-                reader_errors.append(
-                    f"{'stdout' if index == 0 else 'stderr'} reader failed: {error}"
-                )
+                reader_errors.add(f"output {index} reader", error)
+            try:
+                kill_process_tree(process, windows_job)
+            except BaseException as cleanup_error:
+                with output_lock:
+                    reader_errors.add(f"output {index} reader termination", cleanup_error)
 
     assert process.stdout is not None and process.stderr is not None
-    readers = [
-        threading.Thread(target=drain, args=(process.stdout, 0), daemon=True),
-        threading.Thread(target=drain, args=(process.stderr, 1), daemon=True),
-    ]
-    for reader in readers:
-        reader.start()
+    streams = (process.stdout, process.stderr)
     try:
+        try:
+            windows_job = WindowsJob.attach(process)
+        except WindowsJobSetupError as error:
+            windows_job = error.job
+            raise
         if os.name == "nt":
             if windows_job is None:
                 fail("could not assign suspended Windows child to a Job Object")
+        for index, stream in enumerate(streams):
+            reader = threading.Thread(target=drain, args=(stream, index), daemon=True)
+            readers.append((stream, reader, False))
+            try:
+                reader.start()
+            except BaseException:
+                # OS creation can precede ident/_started registration. Until
+                # observed started, an interrupted start is unknown, not proof
+                # that no reader can ever own this pipe's buffered-read lock.
+                readers[index] = (stream, reader, None)
+                raise
+            readers[index] = (stream, reader, True)
+        if os.name == "nt":
             resume_suspended_windows_process(process)
         return_code = process.wait(timeout=COMMAND_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        kill_process_tree(process, windows_job)
-        if windows_job is not None:
-            windows_job.close()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            for reader in readers:
-                reader.join(timeout=2)
-            close_finished_output_streams((process.stdout, process.stderr), readers)
-            fail(f"{label} process tree did not terminate after timeout")
-        for reader in readers:
-            reader.join(timeout=2)
-        close_finished_output_streams((process.stdout, process.stderr), readers)
-        fail(f"{label} exceeded {COMMAND_TIMEOUT_SECONDS} seconds")
-    except BaseException:
-        kill_process_tree(process, windows_job)
-        if windows_job is not None:
-            windows_job.close()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        for reader in readers:
-            reader.join(timeout=2)
-        close_finished_output_streams((process.stdout, process.stderr), readers)
-        raise
-    # The direct child has exited, but a compiler or generated program may have
-    # left descendants behind. Kill the independent Unix process group or the
-    # Windows Job before waiting for inherited output handles to close.
-    kill_process_tree(process, windows_job)
+        primary = SystemExit(f"native CI verification failed: {label} exceeded {COMMAND_TIMEOUT_SECONDS} seconds")
+    except BaseException as error:
+        primary = error
+    # Even a naturally exited root can leave descendants holding output pipes.
+    # Each operation is independent and shares one existing-size cleanup bound;
+    # a failed syscall never skips exact-root wait, the Job close, or readers.
+    deadline = time.monotonic() + PROCESS_CLEANUP_TIMEOUT_SECONDS
+    errors.attempt("process tree termination", lambda: kill_process_tree(process, windows_job))
     if windows_job is not None:
-        windows_job.close()
-    for reader in readers:
-        reader.join(timeout=10)
-    if any(reader.is_alive() for reader in readers):
-        kill_process_tree(process, windows_job)
-        for reader in readers:
-            reader.join(timeout=2)
-        close_finished_output_streams((process.stdout, process.stderr), readers)
-        fail(f"{label} left a child process holding an output pipe")
-    close_finished_output_streams((process.stdout, process.stderr), readers)
-    stdout = bytes(output[0])
-    stderr = bytes(output[1])
-    if overflow.is_set():
-        fail(f"{label} produced more than {MAX_CAPTURE_BYTES} bytes of output")
-    if reader_errors:
-        fail(f"{label} output reader failed: {'; '.join(reader_errors)}")
-    if return_code != 0:
+        if errors.attempt("Job drain", lambda: windows_job.wait_empty(deadline)) is not True:
+            errors.add("Job drain not confirmed")
+        errors.attempt("Job close", windows_job.close)
+    errors.attempt("root wait", lambda: process.wait(timeout=max(0.0, deadline - time.monotonic())))
+    for index, stream in enumerate(streams):
+        reader = readers[index][1] if index < len(readers) else None
+        started = readers[index][2] if index < len(readers) else False
+        if reader is not None and started is None:
+            if reader.ident is not None:
+                started = True
+            else:
+                errors.add(f"output {index} reader start unconfirmed")
+                continue
+        if reader is not None and started:
+            def join_reader() -> bool:
+                reader.join(timeout=max(0.0, deadline - time.monotonic()))
+                return True
+            joined = errors.attempt(f"output {index} reader join", join_reader) is True
+            if not joined:
+                # A join interruption can itself invalidate thread-state
+                # bookkeeping. Do not authorize synchronous close from a later
+                # is_alive()==False after any failed join, even after start.
+                errors.add(f"output {index} reader join unconfirmed")
+                continue
+        try:
+            alive = reader is not None and reader.is_alive()
+        except BaseException as error:
+            errors.add(f"output {index} reader state", error)
+            alive = True
+        if alive:
+            errors.add(f"output {index} child process holding an output pipe")
+        else:
+            errors.attempt(f"output {index} close", stream.close)
+    with output_lock:
+        stdout, stderr = bytes(output[0]), bytes(output[1])
+        if reader_errors.failed:
+            errors.add("output reader failed", CleanupFailure(reader_errors.summary()))
+    if primary is None and overflow.is_set():
+        primary = SystemExit(f"native CI verification failed: {label} produced more than {MAX_CAPTURE_BYTES} bytes of output")
+    if primary is None and return_code != 0:
         stdout_text = stdout.decode("utf-8", errors="replace")
         stderr_text = stderr.decode("utf-8", errors="replace")
-        fail(f"{label} exited with {return_code}\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}")
+        primary = SystemExit(f"native CI verification failed: {label} exited with {return_code}\nstdout:\n{stdout_text}\nstderr:\n{stderr_text}")
+    if errors.failed:
+        # Normalize cleanup-only failures to the existing external fail contract.
+        failure = CleanupFailure(errors.summary(), primary)
+        exit_error = SystemExit(f"native CI verification failed: {failure}")
+        # Preserve actual owners for a catching caller; failed CloseHandle must
+        # not turn a still-owned Job into only a string diagnostic.
+        exit_error.job = windows_job
+        exit_error.process = process
+        exit_error.readers = readers
+        raise exit_error from failure
+    if primary is not None:
+        raise primary
+    assert return_code is not None
     return subprocess.CompletedProcess(command, return_code, stdout, stderr)
 
 
