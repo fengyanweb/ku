@@ -1380,6 +1380,59 @@ fn native_http_shared_callable_writes_reject_before_c_emission() {
 "#,
         ),
         (
+            "for-backedge-setter",
+            r#"
+    setter = () => { render = Other; return null }
+    for turn in [0, 1] {
+        setter()
+        if (turn == 0) {
+            app.get("/", fn() { render(); return http.text("ok") })
+        }
+    }
+"#,
+        ),
+        (
+            "for-continue-setter",
+            r#"
+    setter = () => { render = Other; return null }
+    for turn in [0, 1] {
+        setter()
+        if (turn == 0) {
+            app.get("/", fn() { render(); return http.text("ok") })
+            continue
+        }
+        break
+    }
+"#,
+        ),
+        (
+            "service-move-freeze",
+            r#"
+    app.get("/", fn() { render(); return http.text("ok") })
+    moved = app
+    render = Other
+"#,
+        ),
+        (
+            "service-scope-freeze",
+            r#"
+    if (true) {
+        app.get("/", fn() { render(); return http.text("ok") })
+        scoped = app
+    }
+    render = Other
+"#,
+        ),
+        (
+            "listener-close-freeze",
+            r#"
+    app.get("/", fn() { render(); return http.text("ok") })
+    listener = app.bind("127.0.0.1:0")?
+    listener.close()?
+    render = Other
+"#,
+        ),
+        (
             "for-iterable-stale-body",
             r#"
     route_handler = () => { return http.text("safe") }
@@ -1429,6 +1482,24 @@ fn main(): null! {{
         ku::parser::Parser::new(tokens)
             .parse_program()
             .unwrap_or_else(|error| panic!("{label} must parse: {}", error.message));
+
+        // Remove only registration, preserving setter effects and lifecycle.
+        // These are checker-only controls: bind/close is not run or native-built.
+        if matches!(
+            label,
+            "for-backedge-setter"
+                | "for-continue-setter"
+                | "service-move-freeze"
+                | "service-scope-freeze"
+                | "listener-close-freeze"
+        ) {
+            let registration = r#"app.get("/", fn() { render(); return http.text("ok") })"#;
+            assert_eq!(source.matches(registration).count(), 1);
+            let control = source.replace(registration, "");
+            ku::cli::check_source(&format!("control-{label}"), &control).unwrap_or_else(|error| {
+                panic!("{label}: no-registration control rejected: {error}\n{control}")
+            });
+        }
 
         // Destructuring and iterable rows get these paired checker preflights.
         // Keep the installation and all evaluations in the no-route control.
