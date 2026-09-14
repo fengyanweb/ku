@@ -1322,9 +1322,9 @@ impl Checker {
                         iterable.span,
                     ));
                 }
+                let iterable_type = self.check_expr(iterable)?;
                 let iterable_provenance = self.expression_closure_provenance(iterable);
-                let iterable = self.check_expr(iterable)?;
-                let element = match iterable {
+                let element = match iterable_type {
                     Type::Array(element) => *element,
                     Type::Int => Type::Int,
                     Type::Unknown => Type::Unknown,

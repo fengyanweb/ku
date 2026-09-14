@@ -222,3 +222,38 @@ fn http_shared_destructure_earlier_handler_keeps_evaluated_safe_value() {
         ),
     );
 }
+
+#[test]
+fn http_shared_for_iterable_later_handler_retains_installation_evidence() {
+    let name = "http-for-iterable-handler-after-install.ku";
+    let registration = r#"app.get("/", chosen)"#;
+    let registered = source(
+        r#"for chosen in [After(install(), handler.clone())] {
+        app.get("/", chosen)
+    }"#,
+        false,
+    );
+    assert_eq!(registered.matches(registration).count(), 1);
+    // Preserve the iterable, installation and loop; remove only registration.
+    // Existing helpers independently lex/parse the control and the negative.
+    let control = registered.replace(registration, "");
+    accepts(&format!("control-{name}"), &control);
+    rejects_registered(name, &registered);
+}
+
+#[test]
+fn http_shared_for_iterable_earlier_handler_keeps_evaluated_safe_value() {
+    let registered = source(
+        r#"for chosen in [After(install(), handler.clone())] {
+        app.get("/", chosen)
+    }"#,
+        false,
+    );
+    let later = "After(install(), handler.clone())";
+    assert_eq!(registered.matches(later).count(), 1);
+    // Change only argument evaluation order. Keep HTTP registration and the
+    // same installer; chosen receives the safe value cloned before install.
+    let earlier = registered.replace(later, "Before(handler.clone(), install())");
+    assert_eq!(earlier.matches(r#"app.get("/", chosen)"#).count(), 1);
+    accepts("http-for-iterable-handler-before-install.ku", &earlier);
+}
