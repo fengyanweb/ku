@@ -66,11 +66,21 @@ fn accepts(name: &str, body: &str) {
 }
 
 fn rejects_after_sharing(name: &str, body: &str, allow_unproven: bool) {
+    rejects_after_registration(name, body, REGISTER, allow_unproven, None);
+}
+
+fn rejects_after_registration(
+    name: &str,
+    body: &str,
+    registration: &str,
+    allow_unproven: bool,
+    expected_write: Option<&str>,
+) {
     assert_eq!(body.matches(SHARE).count(), 1, "one sharing boundary");
     // An unrelated syntax/type/ownership error must fail this control, not make
     // the negative test look successful. Keep every other statement unchanged.
     accepts(&format!("control-{name}"), &body.replace(SHARE, ""));
-    let source = program(&body.replace(SHARE, REGISTER));
+    let source = program(&body.replace(SHARE, registration));
     let error = check_raw(name, &source).expect_err("shared callable write must fail closed");
     assert_eq!(
         error.diagnostic_id(),
@@ -93,10 +103,93 @@ fn rejects_after_sharing(name: &str, body: &str, allow_unproven: bool) {
             "{name}: reassignment should retain registration evidence: {error}"
         );
     }
+    if let Some(write) = expected_write {
+        assert!(
+            reassignment,
+            "{name}: exact write needs a reassignment diagnostic"
+        );
+        assert_eq!(source.matches(write).count(), 1, "one expected assignment");
+        assert_eq!(source.matches(registration).count(), 1, "one registration");
+        let write_line = source
+            .lines()
+            .position(|line| line.contains(write))
+            .unwrap()
+            + 1;
+        let register_line = source
+            .lines()
+            .position(|line| line.contains(registration))
+            .unwrap()
+            + 1;
+        assert_eq!(error.span.start.line, write_line, "{name}: assignment site");
+        assert!(error.span.start.column > 0, "{name}: assignment column");
+        assert!(
+            error
+                .message
+                .contains(&format!("HTTP registration at line {register_line},")),
+            "{name}: missing registration evidence: {error}"
+        );
+    }
     let rendered = check_source(name, &source).expect_err("CLI must reject the same source");
     assert!(
         rendered.message.starts_with("error[E0704]:"),
         "{name}: CLI lost or changed the structured diagnostic: {rendered}"
+    );
+}
+
+#[test]
+fn http_shared_edges_for_callable_backedge_rechecks_captured_setter() {
+    rejects_after_registration(
+        "http-shared-for-callable-backedge.ku",
+        r#"
+    render = Noop
+    helper = () => { render(); return http.text("ok") }
+    setter = () => { render = Other; return null }
+    for chosen in [helper.clone(), helper.clone()] {
+        setter()
+        /* HTTP_SHARE_POINT */
+    }
+"#,
+        r#"app.get("/", chosen)"#,
+        false,
+        Some("render = Other"),
+    );
+}
+
+#[test]
+fn http_shared_edges_for_callable_continue_rechecks_captured_setter() {
+    rejects_after_registration(
+        "http-shared-for-callable-continue.ku",
+        r#"
+    render = Noop
+    helper = () => { render(); return http.text("ok") }
+    setter = () => { render = Other; return null }
+    for chosen in [helper.clone(), helper.clone()] {
+        setter()
+        /* HTTP_SHARE_POINT */
+        continue
+    }
+"#,
+        r#"app.get("/", chosen)"#,
+        false,
+        Some("render = Other"),
+    );
+}
+
+#[test]
+fn http_shared_edges_for_callable_break_keeps_prior_setter_legal() {
+    accepts(
+        "http-shared-for-callable-break.ku",
+        r#"
+    render = Noop
+    helper = () => { render(); return http.text("ok") }
+    setter = () => { render = Other; return null }
+    for chosen in [helper.clone(), helper.clone()] {
+        setter()
+        app.get("/", chosen)
+        break
+    }
+    render()
+"#,
     );
 }
 
