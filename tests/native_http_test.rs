@@ -1379,6 +1379,23 @@ fn native_http_shared_callable_writes_reject_before_c_emission() {
     selected()
 "#,
         ),
+        (
+            "for-iterable-stale-body",
+            r#"
+    route_handler = () => { return http.text("safe") }
+    bad = () => { count += 1; return http.text("bad") }
+    install = () => {
+        route_handler = bad.clone()
+        marker = 0
+        return null
+    }
+    // Reset after definition-time checking, retaining the non-exact installer.
+    route_handler = () => { return http.text("safe") }
+    for chosen in [After(install(), route_handler.clone())] {
+        app.get("/", chosen)
+    }
+"#,
+        ),
     ] {
         let source = format!(
             r#"
@@ -1386,6 +1403,7 @@ import "std.http"
 fn Noop(): null {{ return null }}
 fn Other(): null {{ return null }}
 fn After<T>(ignored: null, value: T): T {{ return value }}
+fn Before<T>(value: T, ignored: null): T {{ return value }}
 fn main(): null! {{
     count = 0
     render = Noop
@@ -1412,11 +1430,11 @@ fn main(): null! {{
             .parse_program()
             .unwrap_or_else(|error| panic!("{label} must parse: {}", error.message));
 
-        // Only the new destructuring rows get these paired checker preflights.
-        // Keep the installation and all RHS evaluations in the no-route control.
+        // Destructuring and iterable rows get these paired checker preflights.
+        // Keep the installation and all evaluations in the no-route control.
         // The reversed-order source still registers a route, but only the old
         // safe value was copied; check_source never executes either program.
-        let destructure_controls = match label {
+        let evaluated_value_controls = match label {
             "destructure-stale-body" => Some((
                 r#"app.get("/", chosen)"#,
                 "_, chosen = install(), route_handler.clone()",
@@ -1427,9 +1445,14 @@ fn main(): null! {{
                 "_, selected = install(), op.clone()",
                 "selected, _ = op.clone(), install()",
             )),
+            "for-iterable-stale-body" => Some((
+                r#"app.get("/", chosen)"#,
+                "After(install(), route_handler.clone())",
+                "Before(route_handler.clone(), install())",
+            )),
             _ => None,
         };
-        if let Some((registration, later, earlier)) = destructure_controls {
+        if let Some((registration, later, earlier)) = evaluated_value_controls {
             assert_eq!(source.matches(registration).count(), 1);
             let control = source.replace(registration, "");
             ku::cli::check_source(&format!("control-{label}"), &control).unwrap_or_else(|error| {
@@ -1437,6 +1460,7 @@ fn main(): null! {{
             });
             assert_eq!(source.matches(later).count(), 1);
             let reversed = source.replace(later, earlier);
+            assert_eq!(reversed.matches(registration).count(), 1);
             ku::cli::check_source(&format!("reversed-{label}"), &reversed).unwrap_or_else(
                 |error| {
                     panic!("{label}: old evaluated value must remain legal: {error}\n{reversed}")
@@ -1519,7 +1543,10 @@ fn main(): null! {{
                     code == "E0704"
                         || (matches!(
                             label,
-                            "installed-mutator" | "factory-stale-body" | "destructure-stale-body"
+                            "installed-mutator"
+                                | "factory-stale-body"
+                                | "destructure-stale-body"
+                                | "for-iterable-stale-body"
                         ) && code == "E0703"),
                     "{label}/{entry}: wrong structured diagnostic code: {combined}"
                 );
@@ -1541,7 +1568,10 @@ fn main(): null! {{
                 }
                 // This write precedes registration: E0703 must describe the
                 // actual count mutation; E0704 must explicitly lack proof.
-                "installed-mutator" | "factory-stale-body" | "destructure-stale-body" => {
+                "installed-mutator"
+                | "factory-stale-body"
+                | "destructure-stale-body"
+                | "for-iterable-stale-body" => {
                     (diagnostic.contains("E0703")
                         && diagnostic
                             .contains("http handler cannot modify captured variable 'count'"))

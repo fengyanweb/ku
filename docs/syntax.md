@@ -1889,6 +1889,8 @@ fn main(): null! {
 
 多值赋值的右侧仍从左到右求值，全部右侧求值完成后才写入左侧绑定。捕获与调用效果证据必须对应每一项求值时的函数值：`_, chosen = install(), handler.clone()` 不能沿用 `install()` 之前的 handler 证据；相反顺序 `chosen, _ = handler.clone(), install()` 保留先求得的函数值及其原有捕获关系。这里保存的是编译期检查证据，不是新增运行时快照、深拷贝或锁。
 
+`for` 的迭代来源同样先求值，再把结果携带的捕获证据传给循环变量。来源表达式中的调用替换了后续读取的函数时，不得给循环变量附上求值前的旧证据；先取得旧函数值的合法顺序仍保留该值的原有证据。这不改变数组借用/所有权规则，也不增加循环变量的隐式深拷贝。
+
 ### HTTP 与 native C 后端
 
 `ku build --native` 编译出的二进制与解释器跑同一套 HTTP 规则，可观测响应一致：路由（exact 优先于 `{param}`、404/405）、`req` 的 method/path/params/query/headers/body、`http.text/html/empty/redirect` 响应、有界接纳（`max_connections`/`max_active_requests`/`max_pending_requests` 超限返回 503）、以及请求级限制 400/413/414/431/408 都与解释器逐一对齐；命名函数 handler（`service.get("/x", index)`）和内联 `fn(req)` 都支持。native 用真 worker 线程并行跑 handler（解释器 handler 串行），并行只是内部实现差异，不改变单个请求的可观测响应。
