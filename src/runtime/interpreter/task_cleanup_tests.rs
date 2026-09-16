@@ -227,6 +227,21 @@ fn interpreter_http_timeout_temporary_argument_keeps_original_termination_contex
 
 #[test]
 fn interpreter_scope_exit_carries_one_deadline_without_cancelling_continuing_parent() {
+    assert_scope_exit_carries_one_deadline(Flow::returned(Value::Int(7)));
+}
+
+#[test]
+fn interpreter_break_carries_one_deadline_without_cancelling_continuing_parent() {
+    assert_scope_exit_carries_one_deadline(Flow::Break(None));
+}
+
+#[test]
+fn interpreter_loop_continue_carries_one_deadline_without_cancelling_continuing_parent() {
+    assert_scope_exit_carries_one_deadline(Flow::LoopContinue(None));
+}
+
+fn assert_scope_exit_carries_one_deadline(flow: Flow) {
+    let expected_flow = std::mem::discriminant(&flow);
     let _execution = ExecutionTerminationGuard::enter();
     let runtime = TaskRuntime::new();
     let mut interpreter = Interpreter::new();
@@ -240,15 +255,14 @@ fn interpreter_scope_exit_carries_one_deadline_without_cancelling_continuing_par
         env.define_owned("child".into(), Value::Task(task), false, Span::default())
             .unwrap();
     }
+    let started = Instant::now();
     let flow = interpreter
-        .finish_owned_scope(
-            &mut env,
-            Ok(Flow::returned(Value::Int(7))),
-            Span::default(),
-            true,
-        )
+        .finish_owned_scope(&mut env, Ok(flow), Span::default(), true)
         .unwrap();
     let original = cancellation::ScopeExit::cleanup_context(&flow).unwrap();
+    let finished = Instant::now();
+    assert!(original.cleanup_deadline >= started + Duration::from_secs(1));
+    assert!(original.cleanup_deadline <= finished + Duration::from_secs(1));
     let flow = interpreter
         .finish_owned_scope(&mut env, Ok(flow), Span::default(), true)
         .unwrap();
@@ -256,14 +270,414 @@ fn interpreter_scope_exit_carries_one_deadline_without_cancelling_continuing_par
         cancellation::ScopeExit::cleanup_context(&flow),
         Some(original)
     );
+    assert_eq!(std::mem::discriminant(&flow), expected_flow);
+    if let Flow::Return { value, .. } = &flow {
+        assert_eq!(value, &Value::Int(7));
+    }
+    assert!(!env.contains("child"));
     assert!(interpreter.termination.is_none());
+    assert!(current_cleanup_context().is_none());
+    assert!(current_task_cancellation().is_none());
     assert!(crate::runtime::task::current_execution_termination().is_none());
     interpreter
         .exec_block(&finally_tests::body("return 9"), &mut env, 0)
         .unwrap();
     let next = runtime.spawn(|| Ok(Value::Int(11))).unwrap();
     assert_eq!(next.await_result().unwrap(), Value::Int(11));
+    // The consumed loop flow must not cancel a later independent Task scope or
+    // shorten its newly created, unchanged one-second cleanup budget.
+    drop(flow);
+    env.push_scope();
+    let independent = runtime.spawn(|| Ok(Value::Null)).unwrap();
+    env.define_owned(
+        "independent".into(),
+        Value::Task(independent),
+        false,
+        Span::default(),
+    )
+    .unwrap();
+    let independent_started = Instant::now();
+    let independent_flow = interpreter
+        .finish_owned_scope(
+            &mut env,
+            Ok(Flow::returned(Value::Null)),
+            Span::default(),
+            true,
+        )
+        .unwrap();
+    let independent_finished = Instant::now();
+    let independent_context = cancellation::ScopeExit::cleanup_context(&independent_flow).unwrap();
+    assert!(independent_context.cleanup_deadline >= independent_started + Duration::from_secs(1));
+    assert!(independent_context.cleanup_deadline <= independent_finished + Duration::from_secs(1));
+    assert!(!env.contains("independent"));
+    assert!(interpreter.termination.is_none());
+    assert!(current_cleanup_context().is_none());
+    assert!(current_task_cancellation().is_none());
+    assert!(crate::runtime::task::current_execution_termination().is_none());
     runtime.cancel_all_and_wait(Duration::from_secs(2)).unwrap();
+}
+
+fn assert_expired_loop_exit_rejects_at_scope_boundary(is_continue: bool, has_owned_value: bool) {
+    // Seeded cleanup-boundary oracle, not a simulated or elapsed HTTP timeout.
+    let _execution = ExecutionTerminationGuard::enter();
+    let mut interpreter = Interpreter::new();
+    let mut env = Env::new();
+    env.push_scope();
+    if has_owned_value {
+        env.define_owned(
+            "owned".into(),
+            Value::String("outer owned value".into()),
+            false,
+            Span::default(),
+        )
+        .unwrap();
+    }
+    let expired = RuntimeTermination {
+        reason: TerminationReason::Cancelled,
+        cleanup_deadline: Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("test clock must support a past instant"),
+    };
+    let flow = if is_continue {
+        Flow::LoopContinue(Some(expired))
+    } else {
+        Flow::Break(Some(expired))
+    };
+    // No ambient cancellation or new Task supplies this context:
+    // only this single nonlocal exit carries the already-expired D.
+    assert!(interpreter.termination.is_none());
+    assert!(current_task_cancellation().is_none());
+    assert!(crate::runtime::task::current_cleanup_context().is_none());
+    assert!(crate::runtime::task::current_execution_termination().is_none());
+    let error = interpreter
+        .finish_owned_scope(&mut env, Ok(flow), Span::default(), true)
+        .err()
+        .expect("an expired nonlocal cleanup must not become successful loop flow");
+    assert_eq!(error.domain.as_deref(), Some("task"));
+    assert_eq!(error.code.as_deref(), Some("shutdown_timeout"));
+    assert_eq!(error.scope_cleanup(), Some(expired));
+    assert!(error.runtime_termination().is_none());
+    assert!(interpreter.termination.is_none());
+    assert!(current_task_cancellation().is_none());
+    assert!(crate::runtime::task::current_cleanup_context().is_none());
+    assert!(crate::runtime::task::current_execution_termination().is_none());
+
+    // A rejected local cleanup is not permanent parent cancellation.
+    // A new empty ordinary scope has no carried D and remains legal.
+    env.push_scope();
+    let next = interpreter
+        .finish_owned_scope(&mut env, Ok(Flow::Continue), Span::default(), true)
+        .unwrap();
+    assert!(matches!(next, Flow::Continue));
+}
+
+#[test]
+fn interpreter_expired_loop_exit_empty_break_rejects_at_scope_boundary() {
+    assert_expired_loop_exit_rejects_at_scope_boundary(false, false);
+}
+
+#[test]
+fn interpreter_expired_loop_exit_empty_continue_rejects_at_scope_boundary() {
+    assert_expired_loop_exit_rejects_at_scope_boundary(true, false);
+}
+
+#[test]
+fn interpreter_expired_loop_exit_owned_break_rejects_at_scope_boundary() {
+    assert_expired_loop_exit_rejects_at_scope_boundary(false, true);
+}
+
+#[test]
+fn interpreter_expired_loop_exit_owned_continue_rejects_at_scope_boundary() {
+    assert_expired_loop_exit_rejects_at_scope_boundary(true, true);
+}
+
+fn assert_single_cleanup_scope_was_popped(env: &mut Env) {
+    // Each caller starts with ROOT plus exactly one scope. If finish did not
+    // pop even the empty scope, this binding would disappear on the next pop.
+    assert!(!env.contains("owned"));
+    env.define_owned(
+        "root_after_cleanup".into(),
+        Value::Int(31),
+        false,
+        Span::default(),
+    )
+    .unwrap();
+    env.pop_scope();
+    assert_eq!(
+        env.get("root_after_cleanup", Span::default()).unwrap(),
+        Value::Int(31)
+    );
+}
+
+fn cleanup_scope_with_optional_owned_value(has_owned_value: bool) -> Env {
+    let mut env = Env::new();
+    env.push_scope();
+    if has_owned_value {
+        env.define_owned(
+            "owned".into(),
+            Value::String("bounded owned cleanup fixture".into()),
+            false,
+            Span::default(),
+        )
+        .unwrap();
+    }
+    env
+}
+
+fn assert_loop_exit_uses_minimum_context(carried_is_expired: bool) {
+    for is_continue in [false, true] {
+        for has_owned_value in [false, true] {
+            let _execution = ExecutionTerminationGuard::enter();
+            let mut interpreter = Interpreter::new();
+            let mut env = cleanup_scope_with_optional_owned_value(has_owned_value);
+            let now = Instant::now();
+            let expired = now.checked_sub(Duration::from_millis(1)).unwrap();
+            let future = now.checked_add(Duration::from_secs(1)).unwrap();
+            let carried = RuntimeTermination {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: if carried_is_expired { expired } else { future },
+            };
+            let ambient = RuntimeTermination {
+                reason: TerminationReason::TimedOut,
+                cleanup_deadline: if carried_is_expired { future } else { expired },
+            };
+            let guard = CleanupGuard::enter(ambient);
+            let flow = if is_continue {
+                Flow::LoopContinue(Some(carried))
+            } else {
+                Flow::Break(Some(carried))
+            };
+            let result = interpreter.finish_owned_scope(&mut env, Ok(flow), Span::default(), true);
+            assert_single_cleanup_scope_was_popped(&mut env);
+            let error = result.err().expect("minimum cleanup deadline is expired");
+            assert_eq!(error.domain.as_deref(), Some("task"));
+            assert_eq!(error.code.as_deref(), Some("shutdown_timeout"));
+            assert_eq!(
+                error.scope_cleanup(),
+                Some(RuntimeTermination {
+                    reason: carried.reason,
+                    cleanup_deadline: expired,
+                })
+            );
+            assert!(error.runtime_termination().is_none());
+            assert!(interpreter.termination.is_none());
+            assert!(current_task_cancellation().is_none());
+            assert!(crate::runtime::task::current_execution_termination().is_none());
+            // A nested cleanup guard may tighten its parent's deadline, but
+            // must neither replace the parent's reason nor remove its scope.
+            let remaining = current_cleanup_context().unwrap();
+            assert_eq!(remaining.reason, ambient.reason);
+            assert!(remaining.cleanup_deadline <= ambient.cleanup_deadline);
+            drop(guard);
+            assert!(current_cleanup_context().is_none());
+            env.push_scope();
+            let next = interpreter
+                .finish_owned_scope(&mut env, Ok(Flow::Continue), Span::default(), true)
+                .unwrap();
+            assert!(matches!(next, Flow::Continue));
+        }
+    }
+}
+
+#[test]
+fn interpreter_loop_exit_future_carried_uses_expired_ambient_deadline() {
+    assert_loop_exit_uses_minimum_context(false);
+}
+
+#[test]
+fn interpreter_loop_exit_expired_carried_is_not_extended_by_future_ambient() {
+    assert_loop_exit_uses_minimum_context(true);
+}
+
+#[test]
+fn interpreter_loop_exit_runtime_termination_keeps_primary_and_tightens_deadline() {
+    for reason in [TerminationReason::Cancelled, TerminationReason::TimedOut] {
+        for has_owned_value in [false, true] {
+            {
+                let _execution = ExecutionTerminationGuard::enter();
+                let mut interpreter = Interpreter::new();
+                let mut env = cleanup_scope_with_optional_owned_value(has_owned_value);
+                let now = Instant::now();
+                let expired = now.checked_sub(Duration::from_millis(1)).unwrap();
+                let original = RuntimeTermination {
+                    reason,
+                    cleanup_deadline: now.checked_add(Duration::from_secs(1)).unwrap(),
+                };
+                let ambient = RuntimeTermination {
+                    reason: if reason == TerminationReason::Cancelled {
+                        TerminationReason::TimedOut
+                    } else {
+                        TerminationReason::Cancelled
+                    },
+                    cleanup_deadline: expired,
+                };
+                let mut primary = KuError::termination(original, Span::default());
+                primary.message = "original typed runtime termination fixture".into();
+                let expected_code = primary.code.clone();
+                let expected_message = primary.message.clone();
+                let guard = CleanupGuard::enter(ambient);
+                let result: KuResult<Flow> =
+                    interpreter.finish_owned_scope(&mut env, Err(primary), Span::default(), true);
+                assert_single_cleanup_scope_was_popped(&mut env);
+                let error = result
+                    .err()
+                    .expect("runtime termination cannot become success");
+                assert_eq!(error.domain.as_deref(), Some("task"));
+                assert_eq!(error.code, expected_code);
+                assert_eq!(error.message, expected_message);
+                let expected = RuntimeTermination {
+                    reason,
+                    cleanup_deadline: expired,
+                };
+                assert_eq!(error.runtime_termination(), Some(expected));
+                assert_eq!(error.scope_cleanup(), Some(expected));
+                assert_eq!(interpreter.termination.unwrap().reason, reason);
+                assert!(current_task_cancellation().is_none());
+                assert_eq!(current_cleanup_context().unwrap().reason, ambient.reason);
+                drop(guard);
+                assert!(current_cleanup_context().is_none());
+                // Real termination remains latched inside this execution.
+                assert_eq!(
+                    crate::runtime::task::current_execution_termination()
+                        .unwrap()
+                        .reason,
+                    reason
+                );
+            }
+            // The execution boundary, not a local cleanup error, restores TLS.
+            assert!(crate::runtime::task::current_execution_termination().is_none());
+        }
+    }
+}
+
+#[test]
+fn interpreter_loop_exit_independent_empty_and_owned_scopes_need_no_context() {
+    let _execution = ExecutionTerminationGuard::enter();
+    let mut interpreter = Interpreter::new();
+    for has_owned_value in [false, true] {
+        let mut env = cleanup_scope_with_optional_owned_value(has_owned_value);
+        let flow = interpreter
+            .finish_owned_scope(&mut env, Ok(Flow::Continue), Span::default(), true)
+            .unwrap();
+        assert!(matches!(flow, Flow::Continue));
+        assert_single_cleanup_scope_was_popped(&mut env);
+        assert!(interpreter.termination.is_none());
+        assert!(current_cleanup_context().is_none());
+        assert!(current_task_cancellation().is_none());
+        assert!(crate::runtime::task::current_execution_termination().is_none());
+    }
+}
+
+#[test]
+fn interpreter_scope_exit_discard_drop_tightens_error_deadline_under_guard() {
+    use std::cell::Cell;
+
+    struct DropWitness<'a> {
+        cleanup: RuntimeTermination,
+        tighter: RuntimeTermination,
+        collections: &'a Cell<usize>,
+        drops: &'a Cell<usize>,
+        observed: &'a Cell<[Option<RuntimeTermination>; 3]>,
+    }
+
+    impl cancellation::ScopeExit for DropWitness<'_> {
+        fn cleanup_context(&self) -> Option<RuntimeTermination> {
+            Some(self.cleanup)
+        }
+
+        fn remember_cleanup(&mut self, context: RuntimeTermination) {
+            self.cleanup.cleanup_deadline =
+                self.cleanup.cleanup_deadline.min(context.cleanup_deadline);
+        }
+
+        fn collect_tasks(
+            &self,
+            _tasks: &mut Vec<crate::runtime::task::TaskHandle>,
+            _span: Span,
+        ) -> KuResult<()> {
+            self.collections.set(self.collections.get() + 1);
+            Ok(())
+        }
+    }
+
+    impl Drop for DropWitness<'_> {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            let before = current_cleanup_context();
+            let guard = CleanupGuard::enter(self.tighter);
+            let during = current_cleanup_context();
+            drop(guard);
+            self.observed
+                .set([before, during, current_cleanup_context()]);
+        }
+    }
+
+    // A test-only outgoing value exercises real discard_flow, not a physical
+    // caller Env/lease teardown or an elapsed HTTP/native timeout.
+    let _execution = ExecutionTerminationGuard::enter();
+    let mut interpreter = Interpreter::new();
+    let mut env = cleanup_scope_with_optional_owned_value(true);
+    let now = Instant::now();
+    let original = RuntimeTermination {
+        reason: TerminationReason::Cancelled,
+        cleanup_deadline: now.checked_sub(Duration::from_millis(1)).unwrap(),
+    };
+    let tighter = RuntimeTermination {
+        reason: TerminationReason::TimedOut,
+        cleanup_deadline: now.checked_sub(Duration::from_millis(2)).unwrap(),
+    };
+    let expected = RuntimeTermination {
+        reason: original.reason,
+        cleanup_deadline: tighter.cleanup_deadline,
+    };
+    let collections = Cell::new(0);
+    let drops = Cell::new(0);
+    let observed = Cell::new([None; 3]);
+    let witness = DropWitness {
+        cleanup: original,
+        tighter,
+        collections: &collections,
+        drops: &drops,
+        observed: &observed,
+    };
+    assert!(interpreter.termination.is_none());
+    assert!(current_cleanup_context().is_none());
+    assert!(current_task_cancellation().is_none());
+    assert!(crate::runtime::task::current_execution_termination().is_none());
+    let error = interpreter
+        .finish_owned_scope(&mut env, Ok(witness), Span::default(), true)
+        .err()
+        .expect("expired cleanup must discard the outgoing witness");
+    assert_single_cleanup_scope_was_popped(&mut env);
+    assert_eq!(
+        collections.get(),
+        1,
+        "discard_flow must inspect the payload"
+    );
+    assert_eq!(drops.get(), 1);
+    assert_eq!(
+        observed.get(),
+        [Some(original), Some(expected), Some(expected)]
+    );
+    assert_eq!(error.domain.as_deref(), Some("task"));
+    assert_eq!(error.code.as_deref(), Some("shutdown_timeout"));
+    assert_eq!(error.scope_cleanup(), Some(expected));
+    assert!(error.runtime_termination().is_none());
+    assert!(interpreter.termination.is_none());
+    assert!(current_cleanup_context().is_none());
+    assert!(current_task_cancellation().is_none());
+    assert!(crate::runtime::task::current_execution_termination().is_none());
+
+    env.push_scope();
+    let next = interpreter
+        .finish_owned_scope(&mut env, Ok(Flow::Continue), Span::default(), true)
+        .unwrap();
+    assert!(matches!(next, Flow::Continue));
+    assert_eq!(drops.get(), 1);
+    assert!(interpreter.termination.is_none());
+    assert!(current_cleanup_context().is_none());
+    assert!(current_task_cancellation().is_none());
+    assert!(crate::runtime::task::current_execution_termination().is_none());
 }
 
 fn service_fixture() -> Value {

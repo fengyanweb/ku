@@ -164,6 +164,27 @@ impl Interpreter {
         }
     }
 
+    fn scope_cleanup_context(
+        &self,
+        carried: Option<RuntimeTermination>,
+    ) -> Option<RuntimeTermination> {
+        // Preserve the existing cause precedence; every present context can
+        // tighten the budget, even when an earlier context supplied the cause.
+        [
+            self.termination,
+            carried,
+            current_task_cancellation(),
+            current_cleanup_context(),
+            crate::runtime::task::current_execution_termination(),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|mut first, next| {
+            first.cleanup_deadline = first.cleanup_deadline.min(next.cleanup_deadline);
+            first
+        })
+    }
+
     pub(super) fn finish_owned_scope<T: ScopeExit>(
         &mut self,
         env: &mut Env,
@@ -176,21 +197,25 @@ impl Interpreter {
             Ok(flow) => flow.cleanup_context(),
             Err(error) => error.scope_cleanup(),
         };
-        let mut cleanup_context = self
-            .termination
-            .or(carried)
-            .or_else(current_task_cancellation)
-            .or_else(current_cleanup_context);
+        let mut cleanup_context = self.scope_cleanup_context(carried);
         let handles = env.current_scope_owned_tasks(span);
-        let cleanup = match handles {
+        if cleanup_context.is_none() && matches!(&handles, Ok(handles) if !handles.is_empty()) {
+            cleanup_context = Some(CancellationContext::new(TerminationReason::Cancelled));
+        }
+        // A local cleanup is not parent cancellation. The temporary guard also
+        // covers nested owner/result drops and is restored on every return.
+        let _cleanup_guard = cleanup_context.map(CleanupGuard::enter);
+        let expired_before =
+            cleanup_context.is_some_and(|context| Instant::now() >= context.cleanup_deadline);
+        if let Some(context) = cleanup_context {
+            match &mut result {
+                Ok(flow) => flow.remember_cleanup(context),
+                Err(error) => error.remember_scope_cleanup(context),
+            }
+        }
+        let mut cleanup = match handles {
             Ok(handles) if !handles.is_empty() => {
-                let context = cleanup_context
-                    .unwrap_or_else(|| CancellationContext::new(TerminationReason::Cancelled));
-                cleanup_context = Some(context);
-                match &mut result {
-                    Ok(flow) => flow.remember_cleanup(context),
-                    Err(error) => error.remember_scope_cleanup(context),
-                }
+                let context = cleanup_context.expect("owned scope cleanup has a context");
                 // Request all visible children before waiting for any child.
                 // Cancelling this scope is not cancellation of its continuing
                 // parent; do not latch this context into the parent interpreter.
@@ -211,6 +236,10 @@ impl Interpreter {
                 // A readonly closure can retain a shared binding cell without
                 // inheriting this scope's cleanup ownership. Release the logical
                 // owner now; such observers may retain the ID, not the payload.
+                let context = self
+                    .scope_cleanup_context(Some(context))
+                    .expect("scope cleanup retains its context");
+                let _release_guard = CleanupGuard::enter(context);
                 for handle in &handles {
                     handle.release_scope_owner(context);
                 }
@@ -219,8 +248,22 @@ impl Interpreter {
             Ok(_) => Ok(()),
             Err(error) => Err(error),
         };
+        cleanup_context = self.scope_cleanup_context(cleanup_context);
         if pop {
+            let _pop_guard = cleanup_context.map(CleanupGuard::enter);
             env.pop_scope();
+        }
+        // A terminal Task or empty Task set does not prove its enclosing Value
+        // cleanup finished in time. Do not skip necessary drops on expiry.
+        cleanup_context = self.scope_cleanup_context(cleanup_context);
+        if let Some(context) = cleanup_context {
+            match &mut result {
+                Ok(flow) => flow.remember_cleanup(context),
+                Err(error) => error.remember_scope_cleanup(context),
+            }
+            if cleanup.is_ok() && (expired_before || Instant::now() >= context.cleanup_deadline) {
+                cleanup = Err(KuError::termination(context, span));
+            }
         }
         if matches!(&result, Err(error) if error.runtime_termination().is_some()) {
             if cleanup.is_err() {
@@ -228,16 +271,20 @@ impl Interpreter {
             }
             return result;
         }
-        if let Err(error) = cleanup {
+        if let Err(mut error) = cleanup {
             if let Some(context) = cleanup_context {
                 self.discard_flow(result, context, span);
+                cleanup_context = self.scope_cleanup_context(Some(context));
+            }
+            if let Some(context) = cleanup_context {
+                error.remember_scope_cleanup(context);
             }
             if error.runtime_termination().is_some() {
                 let mut error = KuError::structured(
                     crate::error::KuErrorKind::Runtime,
                     "task",
                     "shutdown_timeout",
-                    "owned child tasks did not finish before the bounded cleanup deadline",
+                    "scope cleanup did not finish before the bounded cleanup deadline",
                     span,
                 );
                 if let Some(context) = cleanup_context {
