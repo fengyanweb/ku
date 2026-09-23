@@ -49,6 +49,9 @@ mod cancellation;
 mod task_cleanup_tests;
 
 #[cfg(test)]
+mod stack_safety_tests;
+
+#[cfg(test)]
 mod match_task_tests;
 
 #[cfg(test)]
