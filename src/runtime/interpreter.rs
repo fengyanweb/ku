@@ -45,6 +45,11 @@ const HTTP_LISTENER_LEASE_FIELD: &str = "\0ku.http.listener.lease";
 
 mod cancellation;
 
+// The bounded execution core is an internal prototype until all calling,
+// waiting and cleanup paths have been migrated. No production fallback switch.
+#[cfg(test)]
+mod execution;
+
 #[cfg(test)]
 mod task_cleanup_tests;
 
