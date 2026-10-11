@@ -162,9 +162,96 @@ fn drop_owner_synchronously<T>(value: T) {
     // child must finish its ordinary depth-first drop before the next sibling;
     // a deferred LIFO/FIFO batch would change that observable order. Restore the
     // outer drain mode on both success and destructor panic. This deliberately
-    // retains host recursion for branched/wrapped payloads and queued captures.
+    // retains host recursion for unclassified Value trees and queued captures.
     let _synchronous = SynchronousOwnerDropGuard::enter();
     drop(value);
+}
+
+fn has_single_task_leaf(mut value: &Value) -> bool {
+    loop {
+        value = match value {
+            Value::Task(_) => return true,
+            Value::Result { value, .. } => value,
+            Value::Array(values) | Value::Enum { fields: values, .. } if values.len() == 1 => {
+                &values[0]
+            }
+            Value::Object(fields) | Value::Struct { fields, .. } if fields.len() == 1 => {
+                fields.values().next().expect("one field has one value")
+            }
+            // Do not inspect closure environments, weak borrowed roots, or a
+            // wider container even if it happens to contain only one Task.
+            _ => return false,
+        };
+    }
+}
+
+fn take_single_owner_field(fields: HashMap<String, Value>) -> Value {
+    let mut fields = fields.into_iter();
+    let (key, value) = fields
+        .next()
+        .expect("classified owner wrapper has one field");
+    drop(key);
+    drop(fields);
+    value
+}
+
+// Wrapper storage is consumed without a cleanup Vec or owner clones. Backing
+// allocations can be freed before the Task; exact allocator free order is not
+// preserved. Accepted metadata is only bool/String, never a sibling resource
+// lease or closure capture.
+fn drop_single_task_leaf(mut value: Value) {
+    loop {
+        value = match value {
+            Value::Task(task) => {
+                drop(task);
+                return;
+            }
+            Value::Result { value, .. } => *value,
+            Value::Array(mut values) if values.len() == 1 => {
+                let child = values
+                    .pop()
+                    .expect("classified owner wrapper has one child");
+                drop(values);
+                child
+            }
+            Value::Object(fields) if fields.len() == 1 => take_single_owner_field(fields),
+            Value::Struct { name, fields } if fields.len() == 1 => {
+                drop(name);
+                take_single_owner_field(fields)
+            }
+            Value::Enum {
+                name,
+                variant,
+                mut fields,
+            } if fields.len() == 1 => {
+                drop(name);
+                drop(variant);
+                let child = fields
+                    .pop()
+                    .expect("classified owner wrapper has one child");
+                drop(fields);
+                child
+            }
+            other => {
+                // Classification precedes mutation of an exclusively owned
+                // payload. Keep an ordinary ordered drop if another caller
+                // ever supplies a shape outside that contract.
+                drop_owner_synchronously(other);
+                return;
+            }
+        };
+    }
+}
+
+fn drop_owner_result_synchronously(result: KuResult<Value>) {
+    // Finish this discarded result before another payload or accounting step.
+    // The leaf Task may start its own iterative drain, but cannot defer its
+    // cleanup into an outer drain and overtake an ordered sibling or ACK.
+    let _synchronous = SynchronousOwnerDropGuard::enter();
+    match result {
+        Ok(value) if has_single_task_leaf(&value) => drop_single_task_leaf(value),
+        result => drop(result),
+    }
 }
 
 fn drain_owner_results() {
@@ -180,10 +267,10 @@ fn drain_owner_results() {
 
 fn flush_owner_results() {
     // A queued frame may capture completed owners while an outer result drain
-    // is active. Its ACK/accounting must not overtake detached direct-Task
-    // payloads. Re-entering this loop preserves that order. Only direct
-    // Ok(Value::Task) result chains are flat; containers, wrappers and queued
-    // captures keep their synchronous depth-first cleanup and recursion risks.
+    // is active. Its ACK/accounting must not overtake detached single-Task-leaf
+    // payloads. Re-entering this loop preserves that order. Only strict linear
+    // wrapper paths ending in a Task are flat; branches, other Value trees and
+    // queued captures keep their synchronous cleanup and recursion risks.
     let mut first_panic = None;
     loop {
         let Some(state) = OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow_mut().take()) else {
@@ -201,7 +288,10 @@ fn flush_owner_results() {
         // been allocated as part of its TaskState, even during OOM cleanup.
         let dropped = catch_unwind(AssertUnwindSafe(|| {
             let _cleanup = CleanupGuard::enter(work.context);
-            drop(work.result);
+            match work.result {
+                Ok(value) => drop_single_task_leaf(value),
+                Err(error) => drop_owner_synchronously(error),
+            }
         }));
         if let Err(panic) = dropped {
             if first_panic.is_none() {
@@ -1020,7 +1110,7 @@ impl TaskRuntime {
                     Ok(result) => {
                         if let Some(context) = current_task_cancellation() {
                             let _cleanup = CleanupGuard::enter(context);
-                            drop(result);
+                            drop_owner_result_synchronously(result);
                             break Err(KuError::termination(context, _span));
                         }
                         break result;
@@ -1037,7 +1127,7 @@ impl TaskRuntime {
                                 Ok(result) => {
                                     if let Some(context) = current_task_cancellation() {
                                         let _cleanup = CleanupGuard::enter(context);
-                                        drop(result);
+                                        drop_owner_result_synchronously(result);
                                         break Err(KuError::termination(context, _span));
                                     }
                                     break result;
@@ -1323,7 +1413,7 @@ impl TaskState {
         };
         let _cleanup = CleanupGuard::enter(context);
         match abandoned {
-            Some(result @ Ok(Value::Task(_))) => {
+            Some(result) if result.as_ref().is_ok_and(has_single_task_leaf) => {
                 OWNER_RESULT_RELEASE_HEAD.with(|head| {
                     let mut head = head.borrow_mut();
                     *self
@@ -1418,8 +1508,12 @@ impl TaskState {
             }
         }
         let _cleanup = discard_context.map(CleanupGuard::enter);
-        drop_owner_synchronously(uncommitted);
-        drop_owner_synchronously(abandoned);
+        if let Some(result) = uncommitted {
+            drop_owner_result_synchronously(result);
+        }
+        if let Some(result) = abandoned {
+            drop_owner_result_synchronously(result);
+        }
         flush_owner_results();
         if self.queue_consumed.load(Ordering::Acquire) {
             if let Some(runtime) = self.runtime.upgrade() {
@@ -1715,7 +1809,7 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                     .and_then(|state| state.cancellation())
                 {
                     let _cleanup = CleanupGuard::enter(context);
-                    drop(result);
+                    drop_owner_result_synchronously(result);
                     Err(KuError::termination(context, Span::default()))
                 } else {
                     result
@@ -1739,7 +1833,7 @@ fn send_blocking_result(
         let _cleanup = parent
             .and_then(TaskState::cancellation)
             .map(CleanupGuard::enter);
-        drop_owner_synchronously(unsent.0);
+        drop_owner_result_synchronously(unsent.0);
     }
 }
 
@@ -1916,6 +2010,118 @@ mod tests {
         let state = Arc::new(completion_state());
         state.complete(state.id, Ok(value));
         handle_for_state(runtime, &state)
+    }
+
+    fn single_task_leaf_wrapper(value: Value, kind: usize) -> Value {
+        match kind % 5 {
+            0 => Value::Result {
+                ok: kind < 5,
+                value: Box::new(value),
+            },
+            1 => Value::Array(vec![value]),
+            2 => Value::Object(HashMap::from([("payload".into(), value)])),
+            3 => Value::Struct {
+                name: "Holder".into(),
+                fields: HashMap::from([("payload".into(), value)]),
+            },
+            _ => Value::Enum {
+                name: "Choice".into(),
+                variant: "Only".into(),
+                fields: vec![value],
+            },
+        }
+    }
+
+    fn single_task_leaf_wrappers(mut value: Value, depth: usize) -> Value {
+        for kind in 0..depth {
+            value = single_task_leaf_wrapper(value, kind);
+        }
+        value
+    }
+
+    #[test]
+    fn owner_single_task_leaf_classifier_is_readonly_and_rejects_other_shapes() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let new_task = || Value::Task(handle_for_state(&runtime, &Arc::new(completion_state())));
+        for kind in 0..10 {
+            let leaf = Arc::new(completion_state());
+            let value =
+                single_task_leaf_wrapper(Value::Task(handle_for_state(&runtime, &leaf)), kind);
+            let strong = Arc::strong_count(&leaf);
+            assert!(has_single_task_leaf(&value));
+            assert_eq!(Arc::strong_count(&leaf), strong);
+            assert!(!leaf.owner_released.load(Ordering::Acquire));
+            drop_owner_result_synchronously(Ok(value));
+            assert!(leaf.owner_released.load(Ordering::Acquire));
+        }
+        let nested = single_task_leaf_wrappers(new_task(), 31);
+        assert!(has_single_task_leaf(&nested));
+        drop_owner_result_synchronously(Ok(nested));
+        let mut sparse = HashMap::with_capacity(4_096);
+        sparse.insert("only".into(), new_task());
+        let sparse = Value::Object(sparse);
+        assert!(has_single_task_leaf(&sparse));
+        drop_owner_result_synchronously(Ok(sparse));
+
+        let mut captures = crate::env::Env::new();
+        captures
+            .define_owned("captured".into(), new_task(), false, Span::default())
+            .unwrap();
+        let function = Value::Function {
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            body: Vec::new(),
+            captures,
+            self_name: None,
+            is_async: false,
+        };
+        let borrowed_root = Arc::new(new_task());
+        let borrowed = Value::Borrowed(crate::value::BorrowedValue::new(&borrowed_root));
+        for value in [
+            Value::Null,
+            Value::Int(1),
+            Value::Result {
+                ok: false,
+                value: Box::new(Value::String("plain error".into())),
+            },
+            Value::Array(Vec::new()),
+            Value::Array(vec![new_task(), Value::String("sibling".into())]),
+            Value::Object(HashMap::new()),
+            Value::Object(HashMap::from([
+                ("first".into(), new_task()),
+                ("second".into(), new_task()),
+            ])),
+            Value::Struct {
+                name: "Empty".into(),
+                fields: HashMap::new(),
+            },
+            Value::Struct {
+                name: "Pair".into(),
+                fields: HashMap::from([
+                    ("first".into(), new_task()),
+                    ("second".into(), Value::Int(0)),
+                ]),
+            },
+            Value::Enum {
+                name: "Choice".into(),
+                variant: "None".into(),
+                fields: Vec::new(),
+            },
+            Value::Enum {
+                name: "Choice".into(),
+                variant: "Pair".into(),
+                fields: vec![new_task(), new_task()],
+            },
+            single_task_leaf_wrappers(function, 7),
+            single_task_leaf_wrappers(borrowed, 7),
+            Value::HttpListenerLease(crate::runtime::value::HttpListenerLease::new(-1)),
+        ] {
+            assert!(!has_single_task_leaf(&value));
+            drop_owner_result_synchronously(Ok(value));
+        }
+        drop(borrowed_root);
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+        assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
     }
 
     fn ordered_completed_owner(
@@ -2146,81 +2352,95 @@ mod tests {
             }
         }
 
-        let runtime = TaskRuntime::with_limits(1, 4, 0, 0, 4);
+        // Both direct and wrapped variants leave two cancelled queue nodes
+        // each for the sole worker to retire after this parent returns.
+        let runtime = TaskRuntime::with_limits(1, 4, 0, 0, 5);
         let child_runtime = runtime.clone();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let job = spawn_task(&runtime, move || {
-            for release_path in 0..4 {
-                let inert = TaskRuntime::with_limits(0, 0, 0, 0, 0);
-                let leaf = Arc::new(completion_state());
-                let capture_pending = Arc::new(Mutex::new(None));
-                let capture_observed = Arc::new(AtomicBool::new(false));
-                if release_path == 3 {
-                    let probe = CaptureAckProbe {
-                        pending: Arc::clone(&capture_pending),
-                        observed: Arc::clone(&capture_observed),
-                    };
-                    leaf.install_run(Box::new(move || {
-                        drop(probe);
-                        Ok(Value::Null)
-                    }));
-                }
-                let mut owner = handle_for_state(&inert, &leaf);
-                let mut weak_states = Vec::with_capacity(16_384);
-                for _ in 0..16_384 {
-                    let state = Arc::new(completion_state());
-                    weak_states.push(Arc::downgrade(&state));
-                    state.complete(state.id, Ok(Value::Task(owner)));
-                    owner = handle_for_state(&inert, &state);
-                }
-                let context = CancellationContext {
-                    reason: TerminationReason::TimedOut,
-                    cleanup_deadline: Instant::now(),
-                };
-                if release_path >= 2 {
-                    // The only worker is this parent. Cancellation must drop
-                    // the queued capture before publishing its terminal ACK,
-                    // without running the child's continuation.
-                    let ran = Arc::new(AtomicBool::new(false));
-                    let child_ran = Arc::clone(&ran);
-                    let child = spawn_task(&child_runtime, move || {
-                        child_ran.store(true, Ordering::Release);
-                        Ok(Value::Task(owner))
-                    });
-                    let _cleanup = CleanupGuard::enter(context);
-                    let child_state = Arc::clone(&child.state);
+            for wrapped in [false, true] {
+                for release_path in 0..4 {
+                    let inert = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+                    let leaf = Arc::new(completion_state());
+                    let capture_pending = Arc::new(Mutex::new(None));
+                    let capture_observed = Arc::new(AtomicBool::new(false));
                     if release_path == 3 {
-                        *capture_pending.lock().unwrap() = Some(Arc::downgrade(&child_state));
-                        let outer = Arc::new(completion_state());
-                        outer.complete(outer.id, Ok(Value::Task(child)));
-                        drop(handle_for_state(&inert, &outer));
-                        assert!(capture_observed.load(Ordering::Acquire));
-                        assert!(outer.result().unwrap().is_none());
-                    } else {
-                        child.release_scope_owner(context);
-                        drop(child);
+                        let probe = CaptureAckProbe {
+                            pending: Arc::clone(&capture_pending),
+                            observed: Arc::clone(&capture_observed),
+                        };
+                        leaf.install_run(Box::new(move || {
+                            drop(probe);
+                            Ok(Value::Null)
+                        }));
                     }
-                    assert_eq!(child_state.status_name(), "timed_out");
-                    assert!(!ran.load(Ordering::Acquire));
+                    let mut owner = handle_for_state(&inert, &leaf);
+                    let mut weak_states = Vec::with_capacity(16_384);
+                    for _ in 0..16_384 {
+                        let state = Arc::new(completion_state());
+                        weak_states.push(Arc::downgrade(&state));
+                        let payload = if wrapped {
+                            single_task_leaf_wrapper(Value::Task(owner), weak_states.len())
+                        } else {
+                            Value::Task(owner)
+                        };
+                        state.complete(state.id, Ok(payload));
+                        owner = handle_for_state(&inert, &state);
+                    }
+                    let context = CancellationContext {
+                        reason: TerminationReason::TimedOut,
+                        cleanup_deadline: Instant::now(),
+                    };
+                    if release_path >= 2 {
+                        // The only worker is this parent. Cancellation must drop
+                        // the queued capture before publishing its terminal ACK,
+                        // without running the child's continuation.
+                        let ran = Arc::new(AtomicBool::new(false));
+                        let child_ran = Arc::clone(&ran);
+                        let child = spawn_task(&child_runtime, move || {
+                            child_ran.store(true, Ordering::Release);
+                            Ok(Value::Task(owner))
+                        });
+                        let _cleanup = CleanupGuard::enter(context);
+                        let child_state = Arc::clone(&child.state);
+                        if release_path == 3 {
+                            *capture_pending.lock().unwrap() = Some(Arc::downgrade(&child_state));
+                            let outer = Arc::new(completion_state());
+                            let payload = if wrapped {
+                                single_task_leaf_wrappers(Value::Task(child), 5)
+                            } else {
+                                Value::Task(child)
+                            };
+                            outer.complete(outer.id, Ok(payload));
+                            drop(handle_for_state(&inert, &outer));
+                            assert!(capture_observed.load(Ordering::Acquire));
+                            assert!(outer.result().unwrap().is_none());
+                        } else {
+                            child.release_scope_owner(context);
+                            drop(child);
+                        }
+                        assert_eq!(child_state.status_name(), "timed_out");
+                        assert!(!ran.load(Ordering::Acquire));
+                        assert!(weak_states.iter().all(|state| state.upgrade().is_none()));
+                    } else if release_path == 1 {
+                        let _cleanup = CleanupGuard::enter(context);
+                        let observer = owner.clone();
+                        owner.release_scope_owner(context);
+                        assert_eq!(observer.status(), "completed");
+                        assert!(observer.state.result().unwrap().is_none());
+                        drop(observer);
+                        drop(owner);
+                    } else {
+                        let _cleanup = CleanupGuard::enter(context);
+                        drop(owner);
+                    }
                     assert!(weak_states.iter().all(|state| state.upgrade().is_none()));
-                } else if release_path == 1 {
-                    let _cleanup = CleanupGuard::enter(context);
-                    let observer = owner.clone();
-                    owner.release_scope_owner(context);
-                    assert_eq!(observer.status(), "completed");
-                    assert!(observer.state.result().unwrap().is_none());
-                    drop(observer);
-                    drop(owner);
-                } else {
-                    let _cleanup = CleanupGuard::enter(context);
-                    drop(owner);
+                    assert!(leaf.owner_released.load(Ordering::Acquire));
+                    assert_eq!(leaf.cancellation(), Some(context));
+                    assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                    assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+                    assert_eq!(inert.snapshot().unwrap().active_tasks, 0);
                 }
-                assert!(weak_states.iter().all(|state| state.upgrade().is_none()));
-                assert!(leaf.owner_released.load(Ordering::Acquire));
-                assert_eq!(leaf.cancellation(), Some(context));
-                assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
-                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
-                assert_eq!(inert.snapshot().unwrap().active_tasks, 0);
             }
             done_tx.send(current_task_id()).unwrap();
             Ok(Value::Null)
@@ -2234,7 +2454,7 @@ mod tests {
         runtime.cancel_all_and_wait(Duration::from_secs(1)).unwrap();
         let snapshot = runtime.snapshot().unwrap();
         assert_eq!(snapshot.active_tasks, 0);
-        assert_eq!(snapshot.finished_tasks, 3);
+        assert_eq!(snapshot.finished_tasks, 5);
         assert_eq!(snapshot.wait_edges, 0);
         eprintln!("{COMPLETED}");
     }
@@ -2265,6 +2485,272 @@ mod tests {
             assert_eq!(state.status_name(), "completed");
             assert!(!state.request_cancel());
         }
+    }
+
+    #[test]
+    fn deep_single_task_leaf_wrappers_and_losing_results_drop_on_real_worker() {
+        const CHILD: &str = "KU_TASK_SINGLE_LEAF_WRAPPER_CHILD";
+        const COMPLETED: &str = "single Task leaf wrapper regression completed";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "runtime::task::tests::deep_single_task_leaf_wrappers_and_losing_results_drop_on_real_worker",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = owner_release_bounded_process::run_bounded(
+                &mut command,
+                Duration::from_secs(20),
+                owner_release_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("single leaf wrapper cleanup has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "single leaf wrapper subprocess failed: {:?}\n{}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "single leaf wrapper regression never reached its completion marker"
+            );
+            return;
+        }
+
+        struct DiscardProbe {
+            observed: Arc<Mutex<Vec<Option<CancellationContext>>>>,
+            parent: Option<Weak<TaskState>>,
+        }
+        impl Drop for DiscardProbe {
+            fn drop(&mut self) {
+                if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
+                    assert!(!parent.accounting_finished.load(Ordering::Acquire));
+                    let runtime = parent.runtime.upgrade().unwrap();
+                    assert_eq!(runtime.active_tasks.load(Ordering::Acquire), 1);
+                    assert_eq!(runtime.finished_tasks.load(Ordering::Acquire), 0);
+                }
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(current_cleanup_context());
+            }
+        }
+
+        let runtime = TaskRuntime::with_limits(1, 1, 0, 0, 1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let job = spawn_task(&runtime, move || {
+            assert!(thread::current().name().unwrap().starts_with("ku-task-"));
+            for discard_path in 0..7 {
+                let inert = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+                let tracks_accounting = matches!(discard_path, 2 | 4 | 6);
+                let mut parent = completion_state();
+                if tracks_accounting {
+                    parent.runtime = Arc::downgrade(&inert.inner);
+                    parent.queue_consumed.store(true, Ordering::Release);
+                    inert.inner.active_tasks.store(1, Ordering::Release);
+                }
+                let parent = Arc::new(parent);
+                if tracks_accounting {
+                    inert
+                        .inner
+                        .states
+                        .lock()
+                        .unwrap()
+                        .insert(parent.id, Arc::downgrade(&parent));
+                }
+                let leaf = Arc::new(completion_state());
+                let weak_leaf = Arc::downgrade(&leaf);
+                let observed = Arc::new(Mutex::new(Vec::with_capacity(1)));
+                let probe = DiscardProbe {
+                    observed: Arc::clone(&observed),
+                    parent: tracks_accounting.then(|| Arc::downgrade(&parent)),
+                };
+                let ran = Arc::new(AtomicBool::new(false));
+                let child_ran = Arc::clone(&ran);
+                leaf.install_run(Box::new(move || {
+                    child_ran.store(true, Ordering::Release);
+                    drop(probe);
+                    Ok(Value::Null)
+                }));
+                let payload =
+                    single_task_leaf_wrappers(Value::Task(handle_for_state(&inert, &leaf)), 16_384);
+                let context = CancellationContext {
+                    reason: TerminationReason::TimedOut,
+                    cleanup_deadline: Instant::now(),
+                };
+                let _cleanup = CleanupGuard::enter(context);
+                match discard_path {
+                    0 => {
+                        parent.complete(parent.id, Ok(payload));
+                        drop(handle_for_state(&inert, &parent));
+                        assert_eq!(parent.status_name(), "completed");
+                        assert!(parent.result().unwrap().is_none());
+                    }
+                    1 => {
+                        parent.complete(parent.id, Ok(payload));
+                        let owner = handle_for_state(&inert, &parent);
+                        let observer = owner.clone();
+                        owner.release_scope_owner(context);
+                        drop(owner);
+                        assert_eq!(observer.status(), "completed");
+                        assert!(parent.result().unwrap().is_none());
+                        drop(observer);
+                    }
+                    2 => {
+                        assert!(parent.request_cancel_with(context));
+                        parent.complete(parent.id, Ok(payload));
+                        assert_eq!(parent.status_name(), "timed_out");
+                        assert_eq!(parent.cancellation(), Some(context));
+                    }
+                    3 => {
+                        parent.complete(parent.id, Ok(Value::Int(7)));
+                        parent.complete_with_status(parent.id, Ok(payload), Some(TASK_PANICKED));
+                        assert_eq!(parent.status_name(), "completed");
+                        assert!(matches!(parent.result().unwrap(), Some(Ok(Value::Int(7)))));
+                    }
+                    4 => {
+                        let owner = handle_for_state(&inert, &parent);
+                        let observer = owner.clone();
+                        owner.release_scope_owner(context);
+                        parent.complete(parent.id, Ok(payload));
+                        assert_eq!(observer.status(), "timed_out");
+                        assert_eq!(parent.cancellation(), Some(context));
+                        assert!(parent.result().unwrap().is_none());
+                        drop(owner);
+                        drop(observer);
+                    }
+                    5 => {
+                        assert!(parent.request_cancel_with(context));
+                        let (send, receive) = mpsc::sync_channel(1);
+                        drop(receive);
+                        send_blocking_result(&send, Some(&parent), Ok(payload));
+                        assert_eq!(parent.cancellation(), Some(context));
+                    }
+                    _ => {
+                        // Reproduce release_owner's unlocked interval between
+                        // marking the owner released and requesting cancellation:
+                        // completion may win, but must discard the owned result.
+                        parent.owner_released.store(true, Ordering::Release);
+                        parent.complete(parent.id, Ok(payload));
+                        assert_eq!(parent.status_name(), "completed");
+                        assert!(!parent.request_cancel_with(context));
+                        assert!(parent.result().unwrap().is_none());
+                    }
+                }
+                assert_eq!(*observed.lock().unwrap(), [Some(context)]);
+                assert!(!ran.load(Ordering::Acquire));
+                assert!(leaf.owner_released.load(Ordering::Acquire));
+                assert_eq!(leaf.cancellation(), Some(context));
+                assert_eq!(leaf.status_name(), "timed_out");
+                assert!(parent.result.try_lock().is_ok());
+                if tracks_accounting {
+                    assert!(parent.accounting_finished.load(Ordering::Acquire));
+                    let snapshot = inert.snapshot().unwrap();
+                    assert_eq!(snapshot.active_tasks, 0);
+                    assert_eq!(snapshot.finished_tasks, 1);
+                    assert_eq!(snapshot.registered_tasks, 0);
+                }
+                drop(leaf);
+                assert!(weak_leaf.upgrade().is_none());
+                assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+            }
+            done_tx.send(current_task_id()).unwrap();
+            Ok(Value::Null)
+        });
+        // The parent cannot execute cleanup through await/help before success.
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            job.id()
+        );
+        assert_eq!(job.await_result().unwrap(), Value::Null);
+        runtime.cancel_all_and_wait(Duration::from_secs(1)).unwrap();
+        assert_eq!(runtime.snapshot().unwrap().active_tasks, 0);
+        eprintln!("{COMPLETED}");
+    }
+
+    #[test]
+    fn concurrent_single_task_leaf_scope_and_final_lease_release_detach_once() {
+        for _ in 0..32 {
+            let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+            let state = Arc::new(completion_state());
+            let owner = handle_for_state(&runtime, &state);
+            let events = Arc::new(Mutex::new(Vec::with_capacity(1)));
+            let leaf = ordered_completed_owner(&runtime, "leaf", &events, None, None);
+            state.complete(
+                state.id,
+                Ok(single_task_leaf_wrappers(Value::Task(leaf), 64)),
+            );
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let release_barrier = Arc::clone(&barrier);
+            let release_state = Arc::clone(&state);
+            let context = CancellationContext {
+                reason: TerminationReason::TimedOut,
+                cleanup_deadline: Instant::now(),
+            };
+            let release = thread::spawn(move || {
+                release_barrier.wait();
+                release_state.release_owner(context);
+                assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+            });
+            let _cleanup = CleanupGuard::enter(context);
+            barrier.wait();
+            drop(owner);
+            release.join().unwrap();
+            assert_eq!(*events.lock().unwrap(), ["leaf"]);
+            assert!(state.result().unwrap().is_none());
+            assert!(state.owner_result_release.lock().unwrap().is_none());
+            assert_eq!(state.status_name(), "completed");
+            assert!(!state.request_cancel());
+            assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+            assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+        }
+    }
+
+    #[test]
+    fn linear_discard_panic_restores_outer_drain_and_next_owner_cleanup() {
+        struct PanickingProbe {
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for PanickingProbe {
+            fn drop(&mut self) {
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+                self.events.lock().unwrap().push("panic");
+                panic!("intentional single-leaf discard destructor panic");
+            }
+        }
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let events = Arc::new(Mutex::new(Vec::with_capacity(2)));
+        let leaf = Arc::new(completion_state());
+        let probe = PanickingProbe {
+            events: Arc::clone(&events),
+        };
+        leaf.install_run(Box::new(move || {
+            drop(probe);
+            Ok(Value::Null)
+        }));
+        let payload = single_task_leaf_wrappers(Value::Task(handle_for_state(&runtime, &leaf)), 31);
+        let previous = OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.replace(true));
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            drop_owner_result_synchronously(Ok(payload));
+        }));
+        let restored_outer = OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get);
+        OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.set(previous));
+        assert!(panic.is_err());
+        assert!(restored_outer);
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+        drop(ordered_completed_owner(
+            &runtime, "next", &events, None, None,
+        ));
+        assert_eq!(*events.lock().unwrap(), ["panic", "next"]);
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+        assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
     }
 
     #[test]
