@@ -361,3 +361,195 @@ fn Entry(n: int): int {
     assert_eq!(machine.metrics.entered_calls, 2);
     assert_drained(&machine.metrics, 0);
 }
+
+fn production_interpreter(source: &str) -> Interpreter {
+    let mut interpreter = Interpreter::new();
+    interpreter.functions.extend(functions(source));
+    interpreter
+}
+
+#[test]
+fn production_named_calls_preserve_existing_depth_and_restore_it_on_rejection() {
+    let mut interpreter = production_interpreter(RECURSION);
+    interpreter.call_depth = 7;
+    assert_eq!(
+        interpreter
+            .call_function("Descend", vec![Value::Int(504)], Span::default(), 0)
+            .unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(interpreter.call_depth, 7);
+    assert!(interpreter.steps > 0, "production execution must poll tick");
+    assert_depth_error(interpreter.call_function(
+        "Descend",
+        vec![Value::Int(505)],
+        Span::default(),
+        0,
+    ));
+    assert_eq!(interpreter.call_depth, 7);
+    assert_depth_error(interpreter.call_function(
+        "Descend",
+        vec![Value::Int(1)],
+        Span::default(),
+        511,
+    ));
+    assert_eq!(interpreter.call_depth, 7);
+    assert_eq!(
+        interpreter
+            .call_function("Descend", vec![Value::Int(0)], Span::default(), 0)
+            .unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(interpreter.call_depth, 7);
+}
+
+#[test]
+fn production_scalar_tree_ignores_unrelated_owned_and_async_functions() {
+    let mut interpreter = production_interpreter(&format!(
+        "{RECURSION}\nfn Owned(): str {{ return \"kept\" }}\nasync fn Unused(): int! {{ return ok(1) }}"
+    ));
+    let entry = interpreter.functions.get("Descend").unwrap();
+    assert!(preflight(&interpreter.functions, Limits::default()).is_err());
+    preflight_tree(&interpreter.functions, Limits::default(), Some(entry)).unwrap();
+    assert_eq!(
+        interpreter
+            .call_function("Descend", vec![Value::Int(32)], Span::default(), 0)
+            .unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(
+        interpreter
+            .call_function("Owned", vec![], Span::default(), 0)
+            .unwrap(),
+        Value::String("kept".into())
+    );
+    assert_eq!(interpreter.call_depth, 0);
+}
+
+#[test]
+fn production_bare_global_function_values_keep_the_existing_callable_behavior() {
+    let mut interpreter = production_interpreter(&format!(
+        "{RECURSION}\nfn ReturnFunction() {{ return Descend }}\nfn Entry(): int {{ alias = Descend\nreturn alias(3) }}"
+    ));
+    for name in ["ReturnFunction", "Entry"] {
+        let entry = interpreter.functions.get(name).unwrap().clone();
+        assert!(preflight_tree(&interpreter.functions, Limits::default(), Some(&entry)).is_err());
+        assert!(try_execute(&mut interpreter, &entry, &[], 0).is_none());
+    }
+    assert_eq!(interpreter.steps, 0, "selection must have no body effects");
+    let value = interpreter
+        .call_function("ReturnFunction", vec![], Span::default(), 0)
+        .unwrap();
+    let Value::Function {
+        params,
+        param_modes,
+        is_async,
+        ..
+    } = value
+    else {
+        panic!("a bare global function must remain a first-class function value");
+    };
+    assert_eq!(params, ["n"]);
+    assert_eq!(param_modes, [ParamMode::Owned]);
+    assert!(!is_async);
+    assert_eq!(
+        interpreter
+            .call_function("Entry", vec![], Span::default(), 0)
+            .unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(interpreter.call_depth, 0);
+}
+
+#[test]
+fn production_unmigrated_loop_keeps_its_existing_legal_behavior() {
+    let mut interpreter = production_interpreter(
+        r#"
+fn Entry(): int {
+    value = 0
+    while (value < 3) { value = value + 1 }
+    return value
+}
+"#,
+    );
+    let entry = interpreter.functions.get("Entry").unwrap().clone();
+    assert!(try_execute(&mut interpreter, &entry, &[], 0).is_none());
+    assert_eq!(interpreter.steps, 0);
+    assert_eq!(
+        interpreter
+            .call_function("Entry", vec![], Span::default(), 0)
+            .unwrap(),
+        Value::Int(3)
+    );
+    assert_eq!(interpreter.call_depth, 0);
+}
+
+#[test]
+fn production_poll_propagates_cancellation_and_restores_existing_call_depth() {
+    let previous = crate::runtime::task::current_execution_termination();
+    {
+        let _execution = ExecutionTerminationGuard::enter();
+        let context = RuntimeTermination {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let mut interpreter = production_interpreter(RECURSION);
+        interpreter.call_depth = 9;
+        interpreter.termination = Some(context);
+        let error = interpreter
+            .call_function("Descend", vec![Value::Int(32)], Span::default(), 0)
+            .expect_err("the scalar production driver must execute cancellation safepoints");
+        assert_eq!(error.runtime_termination(), Some(context));
+        assert_eq!(interpreter.call_depth, 9);
+        assert_eq!(interpreter.steps, 0);
+        assert!(interpreter.pending_fail.is_none());
+        assert!(interpreter.caller_owners.is_empty());
+    }
+    assert_eq!(
+        crate::runtime::task::current_execution_termination(),
+        previous
+    );
+    let mut healthy = production_interpreter(RECURSION);
+    assert_eq!(
+        healthy
+            .call_function("Descend", vec![Value::Int(1)], Span::default(), 0)
+            .unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(healthy.call_depth, 0);
+}
+
+#[test]
+fn production_execution_does_not_apply_the_prototype_dispatch_fuel_limit() {
+    // A small, checker-valid static tree performs enough resumed calls to
+    // exceed test fuel without increasing simultaneous logical call depth.
+    let source = r#"
+fn Count(n: int): int {
+    if (n <= 0) { return 1 }
+    return Count(n - 1) + Count(n - 1)
+}
+"#;
+    let functions = functions(source);
+    let (prototype_result, metrics) = execute(
+        &functions,
+        "Count",
+        &[Value::Int(16)],
+        0,
+        0,
+        Limits::default(),
+    );
+    assert_eq!(
+        prototype_result.unwrap_err().message,
+        "internal execution prototype test fuel exhausted"
+    );
+    assert_drained(&metrics, 0);
+    let mut interpreter = production_interpreter(source);
+    assert_eq!(
+        interpreter
+            .call_function("Count", vec![Value::Int(16)], Span::default(), 0)
+            .unwrap(),
+        Value::Int(65536)
+    );
+    assert!(interpreter.steps > 0);
+    assert_eq!(interpreter.call_depth, 0);
+}

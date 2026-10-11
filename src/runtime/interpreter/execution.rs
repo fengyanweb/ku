@@ -1,16 +1,17 @@
-//! Private, test-only proof of flat interpreter call/return continuations.
+//! Flat, bounded interpreter call/return continuations.
 //!
-//! Not installed in the production evaluator. The entire source is checked
-//! before execution, and unsupported constructs never fall back to recursive
-//! eval/exec. Only scalar, synchronous, named calls are in this first slice.
-//! Owned values, borrows, waiting, cancellation and finally require the next
-//! slices; passing these tests is not a production stack-safety fix.
+//! The production slice admits a complete static scalar call tree before any
+//! body effects. Once admitted, every nested call stays in this dispatch loop.
+//! Other language constructs keep their existing evaluator; Owned, borrows,
+//! function values, waiting and finally still require later migration slices.
+//! This partial production integration does not close the full P0 contract.
 
 use super::*;
 use crate::ast::TypeName;
 use storage::{FrameLimits, FrameStack, ReserveError};
 
 mod storage;
+#[cfg(test)]
 mod tests;
 
 #[derive(Clone, Copy)]
@@ -101,6 +102,7 @@ enum Work<'a> {
 }
 
 enum Syntax<'a> {
+    Function(&'a FnDecl),
     Statement(&'a Stmt),
     Expression(&'a Expr),
 }
@@ -165,103 +167,138 @@ fn scalar_type(ty: &Option<TypeName>) -> bool {
 
 // The source walk itself is bounded and flat; no recursive preflight merely
 // moves the stack-overflow problem ahead of the execution loop.
+#[cfg(test)]
 fn preflight(source: &HashMap<String, FnDecl>, limits: Limits) -> KuResult<()> {
+    preflight_tree(source, limits, None)
+}
+
+fn preflight_tree(
+    source: &HashMap<String, FnDecl>,
+    limits: Limits,
+    entry: Option<&FnDecl>,
+) -> KuResult<()> {
     let mut pending = FrameStack::new(limits.syntax);
+    let mut checked = FrameStack::new(limits.syntax);
     let mut remaining = limits.syntax_steps;
-    for function in source.values() {
+    if let Some(function) = entry {
+        reserve(&mut pending, 1, function.span)?;
+        push(&mut pending, Syntax::Function(function));
+    } else {
+        reserve(&mut pending, source.len(), Span::default())?;
+        for function in source.values() {
+            push(&mut pending, Syntax::Function(function));
+        }
+    }
+    while let Some(node) = pending.pop() {
         remaining = remaining
             .checked_sub(1)
-            .ok_or_else(|| unsupported(function.span))?;
-        remaining = remaining
-            .checked_sub(function.params.len())
-            .ok_or_else(|| unsupported(function.span))?;
-        if function.is_async
-            || !function.type_params.is_empty()
-            || !scalar_type(&function.return_type)
-            || function
-                .params
-                .iter()
-                .any(|param| param.mode != ParamMode::Owned || !scalar_type(&param.ty))
-        {
-            return Err(unsupported(function.span));
-        }
-        reserve(&mut pending, function.body.len(), function.span)?;
-        for stmt in function.body.iter().rev() {
-            push(&mut pending, Syntax::Statement(stmt));
-        }
-        while let Some(node) = pending.pop() {
-            remaining = remaining
-                .checked_sub(1)
-                .ok_or_else(|| unsupported(function.span))?;
-            match node {
-                Syntax::Statement(stmt) => match stmt {
-                    Stmt::VarDecl {
-                        value, ty, span, ..
-                    } => {
-                        if !scalar_type(ty) {
-                            return Err(unsupported(*span));
-                        }
-                        reserve(&mut pending, 1, *span)?;
-                        push(&mut pending, Syntax::Expression(value));
-                    }
-                    Stmt::Assign { value, span, .. } | Stmt::Expr { expr: value, span } => {
-                        reserve(&mut pending, 1, *span)?;
-                        push(&mut pending, Syntax::Expression(value));
-                    }
-                    Stmt::Return { value, span } => {
-                        if let Some(value) = value {
-                            reserve(&mut pending, 1, *span)?;
-                            push(&mut pending, Syntax::Expression(value));
-                        }
-                    }
-                    Stmt::If {
-                        condition,
-                        then_branch,
-                        else_branch,
-                        span,
-                    } => {
-                        let count = then_branch
-                            .len()
-                            .checked_add(else_branch.len())
-                            .and_then(|n| n.checked_add(1))
-                            .ok_or_else(|| unsupported(*span))?;
-                        reserve(&mut pending, count, *span)?;
-                        for stmt in then_branch.iter().chain(else_branch).rev() {
-                            push(&mut pending, Syntax::Statement(stmt));
-                        }
-                        push(&mut pending, Syntax::Expression(condition));
-                    }
-                    _ => return Err(unsupported(stmt_span(stmt))),
-                },
-                Syntax::Expression(expr) => match &expr.kind {
-                    ExprKind::Literal(
-                        Literal::Int(_) | Literal::Float(_) | Literal::Bool(_) | Literal::Null,
-                    )
-                    | ExprKind::Variable(_) => {}
-                    ExprKind::Unary { expr, .. } => {
-                        reserve(&mut pending, 1, expr.span)?;
-                        push(&mut pending, Syntax::Expression(expr));
-                    }
-                    ExprKind::Binary { left, right, .. } => {
-                        reserve(&mut pending, 2, expr.span)?;
-                        push(&mut pending, Syntax::Expression(right));
-                        push(&mut pending, Syntax::Expression(left));
-                    }
-                    ExprKind::Call { callee, args } => {
-                        let ExprKind::Variable(name) = &callee.kind else {
-                            return Err(unsupported(callee.span));
-                        };
-                        if !source.contains_key(name) {
-                            return Err(unsupported(callee.span));
-                        }
-                        reserve(&mut pending, args.len(), expr.span)?;
-                        for arg in args.iter().rev() {
-                            push(&mut pending, Syntax::Expression(arg));
-                        }
-                    }
-                    _ => return Err(unsupported(expr.span)),
-                },
+            .ok_or_else(|| unsupported(Span::default()))?;
+        match node {
+            Syntax::Function(function) => {
+                if (0..checked.len())
+                    .any(|index| checked.get(index) == Some(&function.name.as_str()))
+                {
+                    continue;
+                }
+                remaining = remaining
+                    .checked_sub(function.params.len())
+                    .ok_or_else(|| unsupported(function.span))?;
+                if function.is_async
+                    || !function.type_params.is_empty()
+                    || !scalar_type(&function.return_type)
+                    || function
+                        .params
+                        .iter()
+                        .any(|param| param.mode != ParamMode::Owned || !scalar_type(&param.ty))
+                {
+                    return Err(unsupported(function.span));
+                }
+                reserve(&mut checked, 1, function.span)?;
+                push(&mut checked, function.name.as_str());
+                reserve(&mut pending, function.body.len(), function.span)?;
+                for stmt in function.body.iter().rev() {
+                    push(&mut pending, Syntax::Statement(stmt));
+                }
             }
+            Syntax::Statement(stmt) => match stmt {
+                Stmt::VarDecl {
+                    value, ty, span, ..
+                } => {
+                    if !scalar_type(ty) {
+                        return Err(unsupported(*span));
+                    }
+                    reserve(&mut pending, 1, *span)?;
+                    push(&mut pending, Syntax::Expression(value));
+                }
+                Stmt::Assign { value, span, .. } | Stmt::Expr { expr: value, span } => {
+                    reserve(&mut pending, 1, *span)?;
+                    push(&mut pending, Syntax::Expression(value));
+                }
+                Stmt::Return { value, span } => {
+                    if let Some(value) = value {
+                        reserve(&mut pending, 1, *span)?;
+                        push(&mut pending, Syntax::Expression(value));
+                    }
+                }
+                Stmt::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                    span,
+                } => {
+                    let count = then_branch
+                        .len()
+                        .checked_add(else_branch.len())
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or_else(|| unsupported(*span))?;
+                    reserve(&mut pending, count, *span)?;
+                    for stmt in then_branch.iter().chain(else_branch).rev() {
+                        push(&mut pending, Syntax::Statement(stmt));
+                    }
+                    push(&mut pending, Syntax::Expression(condition));
+                }
+                _ => return Err(unsupported(stmt_span(stmt))),
+            },
+            Syntax::Expression(expr) => match &expr.kind {
+                ExprKind::Literal(
+                    Literal::Int(_) | Literal::Float(_) | Literal::Bool(_) | Literal::Null,
+                ) => {}
+                ExprKind::Variable(name) => {
+                    // A bare global function is a first-class value in the
+                    // existing evaluator, not a scalar variable. Leave the
+                    // entire call tree there until function values migrate.
+                    if entry.is_some() && source.contains_key(name) {
+                        return Err(unsupported(expr.span));
+                    }
+                }
+                ExprKind::Unary { expr, .. } => {
+                    reserve(&mut pending, 1, expr.span)?;
+                    push(&mut pending, Syntax::Expression(expr));
+                }
+                ExprKind::Binary { left, right, .. } => {
+                    reserve(&mut pending, 2, expr.span)?;
+                    push(&mut pending, Syntax::Expression(right));
+                    push(&mut pending, Syntax::Expression(left));
+                }
+                ExprKind::Call { callee, args } => {
+                    let ExprKind::Variable(name) = &callee.kind else {
+                        return Err(unsupported(callee.span));
+                    };
+                    let function = source.get(name).ok_or_else(|| unsupported(callee.span))?;
+                    reserve(
+                        &mut pending,
+                        args.len()
+                            .checked_add(1)
+                            .ok_or_else(|| unsupported(expr.span))?,
+                        expr.span,
+                    )?;
+                    push(&mut pending, Syntax::Function(function));
+                    for arg in args.iter().rev() {
+                        push(&mut pending, Syntax::Expression(arg));
+                    }
+                }
+                _ => return Err(unsupported(expr.span)),
+            },
         }
     }
     Ok(())
@@ -602,7 +639,19 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn run(&mut self, entry: &str, args: &[Value], depth: usize) -> KuResult<Value> {
+        self.run_with_poll(entry, args, depth, true, |_| Ok(()))
+    }
+
+    fn run_with_poll(
+        &mut self,
+        entry: &str,
+        args: &[Value],
+        depth: usize,
+        test_fuel: bool,
+        mut poll: impl FnMut(Span) -> KuResult<()>,
+    ) -> KuResult<Value> {
         let result = (|| {
             let function = self.source.get(entry).ok_or_else(|| {
                 KuError::runtime(format!("undefined function '{entry}'"), Span::default())
@@ -618,13 +667,20 @@ impl<'a> Machine<'a> {
             // The sole dispatch loop: call entry/return only modify these flat
             // stacks; no recursive evaluator or child driver is invoked.
             while let Some(step) = self.work.pop() {
-                self.remaining_dispatches =
-                    self.remaining_dispatches.checked_sub(1).ok_or_else(|| {
-                        KuError::runtime(
-                            "internal execution prototype test fuel exhausted",
-                            function.span,
-                        )
-                    })?;
+                if test_fuel {
+                    self.remaining_dispatches =
+                        self.remaining_dispatches.checked_sub(1).ok_or_else(|| {
+                            KuError::runtime(
+                                "internal execution prototype test fuel exhausted",
+                                function.span,
+                            )
+                        })?;
+                }
+                match &step {
+                    Work::Statement(stmt) => poll(stmt_span(stmt))?,
+                    Work::Eval(expr) => poll(expr.span)?,
+                    _ => {}
+                }
                 self.metrics.dispatches += 1;
                 self.step(step)?;
             }
@@ -656,6 +712,7 @@ impl<'a> Machine<'a> {
     }
 }
 
+#[cfg(test)]
 fn execute(
     source: &HashMap<String, FnDecl>,
     entry: &str,
@@ -676,4 +733,31 @@ fn execute(
     let mut machine = Machine::new(source, limits, initial_depth);
     let result = machine.run(entry, args, depth);
     (result, machine.metrics)
+}
+
+pub(super) fn try_execute(
+    interpreter: &mut Interpreter,
+    function: &FnDecl,
+    args: &[Value],
+    depth: usize,
+) -> Option<KuResult<Value>> {
+    if args
+        .iter()
+        .any(|value| scalar(value, function.span).is_err())
+    {
+        return None;
+    }
+    let source = interpreter.functions.clone();
+    let limits = Limits::default();
+    // Selection has no user effects. A failed eligibility check preserves the
+    // complete old evaluator for this tree; there is no mid-execution fallback.
+    if preflight_tree(&source, limits, Some(function)).is_err() {
+        return None;
+    }
+    let mut machine = Machine::new(&source, limits, interpreter.call_depth);
+    Some(
+        machine.run_with_poll(&function.name, args, depth, false, |span| {
+            interpreter.tick(span)
+        }),
+    )
 }

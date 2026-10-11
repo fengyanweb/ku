@@ -45,9 +45,8 @@ const HTTP_LISTENER_LEASE_FIELD: &str = "\0ku.http.listener.lease";
 
 mod cancellation;
 
-// The bounded execution core is an internal prototype until all calling,
-// waiting and cleanup paths have been migrated. No production fallback switch.
-#[cfg(test)]
+// The flat core handles statically closed scalar call trees. Other calling,
+// waiting and cleanup paths still require migration; P0 is not yet complete.
 mod execution;
 
 #[cfg(test)]
@@ -146,8 +145,28 @@ struct FunctionValueCall<'a> {
     depth: usize,
 }
 
+// Code is immutable during execution. Sharing this internal source table lets
+// a continuation retain stable AST references while polling the interpreter,
+// without cloning user values or copying every function body at each call.
+#[derive(Clone, Default)]
+struct FunctionTable(Arc<HashMap<String, FnDecl>>);
+
+impl std::ops::Deref for FunctionTable {
+    type Target = HashMap<String, FnDecl>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FunctionTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 pub struct Interpreter {
-    functions: HashMap<String, FnDecl>,
+    functions: FunctionTable,
     structs: HashMap<String, HashSet<String>>,
     enums: HashMap<String, HashMap<String, usize>>,
     base_dir: PathBuf,
@@ -165,7 +184,7 @@ pub struct Interpreter {
 
 #[derive(Clone)]
 struct InterpreterTemplate {
-    functions: HashMap<String, FnDecl>,
+    functions: FunctionTable,
     structs: HashMap<String, HashSet<String>>,
     enums: HashMap<String, HashMap<String, usize>>,
     base_dir: PathBuf,
@@ -175,7 +194,7 @@ struct InterpreterTemplate {
 impl Interpreter {
     pub fn new() -> Self {
         Self {
-            functions: HashMap::new(),
+            functions: FunctionTable::default(),
             structs: HashMap::new(),
             enums: HashMap::new(),
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -301,6 +320,19 @@ impl Interpreter {
             return self
                 .spawn_async_function(function, args, span)
                 .map(Flow::returned);
+        }
+        if let Some(result) = execution::try_execute(self, &function, &args, depth) {
+            // This slice admits no Owned/borrow/Task payloads. Keep the existing
+            // call boundary's termination/deadline arbitration even for scalar
+            // returns, including calls made from cancellation finally code.
+            return self
+                .finish_call_scope(
+                    Env::new(),
+                    Vec::new(),
+                    result.map(Flow::returned),
+                    function.span,
+                )?
+                .into_call_flow(function.span, "function");
         }
         self.call_function_direct_flow(function, args, span, depth)
     }
