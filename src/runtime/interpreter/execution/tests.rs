@@ -1,5 +1,6 @@
 use super::*;
 
+mod chunk;
 mod code_handle;
 
 const RECURSION: &str = r#"

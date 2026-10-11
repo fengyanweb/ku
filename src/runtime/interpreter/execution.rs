@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::ast::{Param, TypeName};
+use std::num::NonZeroUsize;
 use storage::{FrameLimits, FrameStack, ReserveError};
 
 mod code;
@@ -392,6 +393,25 @@ enum Work {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MachineState {
+    Ready,
+    Running,
+    Finished,
+}
+
+// Private synchronous checkpoints, not scheduler yields. A protected finally
+// still owns its TLS guard between chunks and must stay on this caller's stack.
+enum ChunkProgress {
+    More {
+        popped: usize,
+    },
+    Finished {
+        popped: usize,
+        result: KuResult<Flow>,
+    },
+}
+
 struct Machine {
     code: CodeHandle,
     // Shared scalar cells, never copied user payloads. Each call still owns its
@@ -406,6 +426,10 @@ struct Machine {
     call_depth: usize,
     #[cfg(test)]
     remaining_dispatches: usize,
+    #[cfg(test)]
+    test_fuel: bool,
+    state: MachineState,
+    entry_span: Span,
     metrics: Metrics,
     pending: Option<KuResult<Flow>>,
     value_limits: FrameLimits,
@@ -514,6 +538,10 @@ impl Machine {
             call_depth: initial_depth,
             #[cfg(test)]
             remaining_dispatches: limits.prototype_dispatch_steps,
+            #[cfg(test)]
+            test_fuel: false,
+            state: MachineState::Ready,
+            entry_span: Span::default(),
             metrics,
             pending: None,
             value_limits: limits.values,
@@ -1435,13 +1463,77 @@ impl Machine {
         test_fuel: bool,
         hooks: &mut impl ExecutionHooks,
     ) -> KuResult<Flow> {
+        // Preserve the existing explicit independent-call reuse of this
+        // private synchronous wrapper. Continuation dispatch never restarts.
+        if self.state == MachineState::Finished {
+            self.prepare_next_run()?;
+        }
+        self.start_once(entry, args, depth, test_fuel)?;
+        let budget = NonZeroUsize::new(256).expect("positive internal dispatch chunk budget");
+        loop {
+            match self.dispatch_chunk(budget, hooks)? {
+                ChunkProgress::More { popped } => debug_assert_eq!(popped, budget.get()),
+                ChunkProgress::Finished { popped, result } => {
+                    debug_assert!(popped <= budget.get());
+                    return result;
+                }
+            }
+        }
+    }
+
+    fn lifecycle_error(&self, action: &str) -> KuError {
+        KuError::runtime(
+            format!(
+                "internal execution cannot {action} in {:?} state",
+                self.state
+            ),
+            self.entry_span,
+        )
+    }
+
+    fn prepare_next_run(&mut self) -> KuResult<()> {
+        if self.state != MachineState::Finished {
+            return Err(self.lifecycle_error("prepare next run"));
+        }
+        // Retain immutable code, allocated frame capacity, cumulative metrics
+        // and remaining test fuel only after actual resource arbitration.
+        if self.calls.len() != 0
+            || self.work.len() != 0
+            || self.values.len() != 0
+            || self.finally.frames.len() != 0
+            || self.pending.is_some()
+            || self.argument_capacity != 0
+            || self.argument_bytes != 0
+            || self.call_depth != self.initial_depth
+        {
+            return Err(self.lifecycle_error("prepare undrained next run"));
+        }
+        self.state = MachineState::Ready;
+        Ok(())
+    }
+
+    fn start_once(
+        &mut self,
+        entry: &str,
+        args: &[Value],
+        depth: usize,
+        test_fuel: bool,
+    ) -> KuResult<()> {
+        if self.state != MachineState::Ready {
+            return Err(self.lifecycle_error("start"));
+        }
         #[cfg(not(test))]
         let _ = test_fuel;
         let function = self.code.find_function(entry);
         let span = function
             .map(|id| self.code.span(self.code.function(id).span))
             .unwrap_or_default();
-        self.pending = None;
+        self.entry_span = span;
+        self.state = MachineState::Running;
+        #[cfg(test)]
+        {
+            self.test_fuel = test_fuel;
+        }
         let admission = (|| {
             let function = function
                 .ok_or_else(|| KuError::runtime(format!("undefined function '{entry}'"), span))?;
@@ -1454,9 +1546,28 @@ impl Machine {
         if let Err(error) = admission {
             self.pending = Some(Err(error));
         }
+        Ok(())
+    }
+
+    fn dispatch_chunk(
+        &mut self,
+        budget: NonZeroUsize,
+        hooks: &mut impl ExecutionHooks,
+    ) -> KuResult<ChunkProgress> {
+        if self.state != MachineState::Running {
+            return Err(self.lifecycle_error("dispatch"));
+        }
+        let mut popped = 0;
         // The sole dispatch loop also performs every exit on failure. There is
         // no clearing of markers, recursive evaluator or child execution driver.
-        while let Some(step) = self.work.pop() {
+        // Count loop pops even when pending skips a step or fuel has expired.
+        // Boundary arbitration remains atomic, including TryExit's existing
+        // removal of its preinstalled skipped FinallyExit marker.
+        while popped < budget.get() {
+            let Some(step) = self.work.pop() else {
+                break;
+            };
+            popped += 1;
             let boundary = matches!(
                 &step,
                 Work::ScopeExit { .. }
@@ -1475,11 +1586,11 @@ impl Machine {
             // Fuel belongs to the test harness alone. Its failure takes the
             // same flat resource exit path as a real tick or expression error.
             #[cfg(test)]
-            if test_fuel {
+            if self.test_fuel {
                 let Some(remaining) = self.remaining_dispatches.checked_sub(1) else {
                     self.pending = Some(Err(KuError::runtime(
                         "internal execution prototype test fuel exhausted",
-                        span,
+                        self.entry_span,
                     )));
                     if boundary {
                         self.finish_boundary(step, hooks);
@@ -1508,6 +1619,16 @@ impl Machine {
                 self.pending = Some(Err(error));
             }
         }
+        if self.work.len() != 0 {
+            return Ok(ChunkProgress::More { popped });
+        }
+        Ok(ChunkProgress::Finished {
+            popped,
+            result: self.finish_run(),
+        })
+    }
+
+    fn finish_run(&mut self) -> KuResult<Flow> {
         assert_eq!(self.calls.len(), 0);
         assert_eq!(self.values.len(), 0);
         assert_eq!(self.argument_capacity, 0);
@@ -1541,7 +1662,9 @@ impl Machine {
                     .metrics
                     .code_construction_peak_backing_bytes_upper_bound
         );
-        self.pending.take().expect("root call or admission outcome")
+        let result = self.pending.take().expect("root call or admission outcome");
+        self.state = MachineState::Finished;
+        result
     }
 }
 
