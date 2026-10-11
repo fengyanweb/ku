@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) enum FinallyMode {
+    Skip,
+    Ordinary,
+    Protected(RuntimeTermination),
+}
+
 pub(super) trait ScopeExit {
     fn cleanup_context(&self) -> Option<RuntimeTermination> {
         None
@@ -55,6 +62,78 @@ impl ScopeExit for Flow {
 }
 
 impl Interpreter {
+    /// Arbitration shared by the recursive evaluator and the flat driver.
+    /// This prepares cleanup only; the caller executes the actual finally body.
+    pub(super) fn prepare_finally(
+        &mut self,
+        env: &Env,
+        result: &KuResult<Flow>,
+        span: Span,
+    ) -> FinallyMode {
+        self.observe_termination(result);
+        let terminating = matches!(result, Err(error) if error.runtime_termination().is_some());
+        let cleanup_failure = result.is_err() && current_cleanup_context().is_some();
+        if result.is_err() && !terminating && !cleanup_failure {
+            // Ordinary fatal errors retain their existing boundary.
+            return FinallyMode::Skip;
+        }
+        if terminating || cleanup_failure {
+            let context = self
+                .termination
+                .or_else(current_cleanup_context)
+                .expect("terminating flow has a cancellation context");
+            if cleanup_failure && !terminating {
+                self.record_suppressed_cleanup();
+            }
+            self.cancel_visible_children(env, context, span);
+            FinallyMode::Protected(context)
+        } else {
+            FinallyMode::Ordinary
+        }
+    }
+
+    /// The caller retains its synchronous CleanupGuard through this arbitration.
+    /// Neither helper evaluates syntax or starts a nested execution machine.
+    pub(super) fn finish_finally(
+        &mut self,
+        result: KuResult<Flow>,
+        replacement: KuResult<Flow>,
+        mode: FinallyMode,
+        span: Span,
+    ) -> KuResult<Flow> {
+        match mode {
+            FinallyMode::Skip => unreachable!("skipped finally has no replacement"),
+            FinallyMode::Protected(context) => {
+                if !matches!(replacement, Ok(Flow::Continue)) {
+                    self.record_suppressed_cleanup();
+                }
+                self.discard_flow(replacement, context, span);
+                // No cleanup return, recoverable failure or panic may overwrite
+                // the original cancellation/timeout cause.
+                Err(self.termination_error(context, span))
+            }
+            FinallyMode::Ordinary => match replacement {
+                Ok(Flow::Continue) => result,
+                mut replacement => {
+                    self.observe_termination(&replacement);
+                    let context = self
+                        .termination
+                        .or_else(|| match &result {
+                            Ok(flow) => ScopeExit::cleanup_context(flow),
+                            Err(error) => error.scope_cleanup(),
+                        })
+                        .unwrap_or_else(|| CancellationContext::new(TerminationReason::Cancelled));
+                    match &mut replacement {
+                        Ok(flow) => ScopeExit::remember_cleanup(flow, context),
+                        Err(error) => error.remember_scope_cleanup(context),
+                    }
+                    self.discard_flow(result, context, span);
+                    replacement
+                }
+            },
+        }
+    }
+
     pub(super) fn observe_termination<T>(&mut self, result: &KuResult<T>) {
         if let Err(error) = result {
             if let Some(context) = error.runtime_termination() {

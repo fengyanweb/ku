@@ -2,9 +2,10 @@
 //!
 //! The production slice admits a complete static scalar call tree before any
 //! body effects. Once admitted, every nested call stays in this dispatch loop.
-//! Scope, call and argument exits use the evaluator's real resource arbitration.
+//! Scope, call, argument and scalar finally exits use the evaluator's real
+//! resource arbitration.
 //! Other language constructs keep their existing evaluator; Owned, borrows,
-//! general function values, waiting and finally require later migration slices.
+//! general function values, waiting and recoverable catch require later slices.
 //! This partial production integration does not close the full P0 contract.
 
 use super::*;
@@ -64,11 +65,16 @@ struct Metrics {
     remaining_calls: usize,
     remaining_work: usize,
     remaining_values: usize,
+    entered_finally_frames: usize,
+    retired_finally_frames: usize,
+    peak_finally_frames: usize,
+    remaining_finally_frames: usize,
     logical_depth: usize,
-    // Execution Vec backing only: calls/work/values and staged arguments,
-    // excluding the separate preflight syntax stack, source, Env/string keys,
-    // allocator overhead and Value payloads. Summed peaks are not a simultaneous
-    // RSS sample.
+    // Source execution frame Vec backing only: calls/work/finally/values and
+    // staged arguments. This is a frame budget, not a complete memory budget;
+    // it excludes preflight syntax storage, source, Env/string keys, allocator
+    // overhead and Value/Error payloads. Summed peaks are not a simultaneous RSS
+    // sample.
     retained_backing_bytes: usize,
     peak_backing_bytes_upper_bound: usize,
 }
@@ -115,6 +121,19 @@ trait ExecutionHooks {
         result: KuResult<Flow>,
         span: Span,
     ) -> KuResult<Flow>;
+    fn prepare_finally(
+        &mut self,
+        env: &Env,
+        primary: &KuResult<Flow>,
+        span: Span,
+    ) -> cancellation::FinallyMode;
+    fn finish_finally(
+        &mut self,
+        primary: KuResult<Flow>,
+        replacement: KuResult<Flow>,
+        mode: cancellation::FinallyMode,
+        span: Span,
+    ) -> KuResult<Flow>;
 }
 
 impl ExecutionHooks for Interpreter {
@@ -153,6 +172,25 @@ impl ExecutionHooks for Interpreter {
         span: Span,
     ) -> KuResult<Flow> {
         self.finish_call_arguments(env, leases, values, result, span)
+    }
+
+    fn prepare_finally(
+        &mut self,
+        env: &Env,
+        primary: &KuResult<Flow>,
+        span: Span,
+    ) -> cancellation::FinallyMode {
+        Interpreter::prepare_finally(self, env, primary, span)
+    }
+
+    fn finish_finally(
+        &mut self,
+        primary: KuResult<Flow>,
+        replacement: KuResult<Flow>,
+        mode: cancellation::FinallyMode,
+        span: Span,
+    ) -> KuResult<Flow> {
+        Interpreter::finish_finally(self, primary, replacement, mode, span)
     }
 }
 
@@ -199,6 +237,25 @@ impl<P: FnMut(Span) -> KuResult<()>> ExecutionHooks for PollHooks<P> {
     ) -> KuResult<Flow> {
         ExecutionHooks::finish_arguments(&mut self.host, env, leases, values, result, span)
     }
+
+    fn prepare_finally(
+        &mut self,
+        env: &Env,
+        primary: &KuResult<Flow>,
+        span: Span,
+    ) -> cancellation::FinallyMode {
+        ExecutionHooks::prepare_finally(&mut self.host, env, primary, span)
+    }
+
+    fn finish_finally(
+        &mut self,
+        primary: KuResult<Flow>,
+        replacement: KuResult<Flow>,
+        mode: cancellation::FinallyMode,
+        span: Span,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_finally(&mut self.host, primary, replacement, mode, span)
+    }
 }
 
 struct CallFrame<'a> {
@@ -223,6 +280,36 @@ struct ArgumentFrame<'a> {
     value_base: usize,
     leases: Vec<BorrowLease>,
     staged: Vec<Value>,
+}
+
+struct FinallyFrame<'a> {
+    body: &'a [Stmt],
+    span: &'a Span,
+    owner_call: usize,
+    // Kept out of Work so every continuation does not pay for a large outcome.
+    // This is the sole owner of the primary while finally syntax executes.
+    primary: Option<KuResult<Flow>>,
+    mode: cancellation::FinallyMode,
+    // Only this synchronous, no-await slice may hold a TLS guard. Future
+    // Pending execution must store context, releasing guards before yielding.
+    guard: Option<CleanupGuard>,
+}
+
+struct FinallyFrames<'a> {
+    frames: FrameStack<FinallyFrame<'a>>,
+}
+
+impl Drop for FinallyFrames<'_> {
+    fn drop(&mut self) {
+        // Restoring nested TLS guards has its own strict order, including a
+        // native panic leaving the production-local synchronous Machine. A
+        // private caller catching panic while retaining Machine must drop it
+        // before expecting TLS restoration; this is not a Pending/yield API.
+        // Do not change other FrameStack payload drop contracts.
+        while let Some(frame) = self.frames.pop() {
+            drop(frame);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -280,6 +367,8 @@ enum Work<'a> {
     Bind(&'a str, bool, bool, Span),
     Discard,
     Return,
+    TryExit(usize),
+    FinallyExit(usize),
     ScopeExit {
         span: Span,
         value_base: usize,
@@ -315,6 +404,9 @@ struct Machine<'a> {
     calls: FrameStack<CallFrame<'a>>,
     work: FrameStack<Work<'a>>,
     values: FrameStack<Value>,
+    // Declared after the ordinary scalar frames so their panic drops remain
+    // inside active synchronous cleanup before these guards restore TLS.
+    finally: FinallyFrames<'a>,
     initial_depth: usize,
     call_depth: usize,
     #[cfg(test)]
@@ -322,6 +414,7 @@ struct Machine<'a> {
     metrics: Metrics,
     pending: Option<KuResult<Flow>>,
     value_limits: FrameLimits,
+    work_limits: FrameLimits,
     argument_capacity: usize,
     argument_bytes: usize,
     peak_argument_bytes: usize,
@@ -507,6 +600,28 @@ fn preflight_tree_mode(
                         push(&mut pending, Syntax::Expression(condition));
                     }
                     Stmt::Break { .. } | Stmt::Continue { .. } => {}
+                    Stmt::Try {
+                        body,
+                        catch_name,
+                        catch_body,
+                        finally_body,
+                        span,
+                    } => {
+                        // Fail, Result propagation and catch-owned fields have
+                        // not migrated. Preserve the entire old evaluator for
+                        // any catch clause, including an unreachable one.
+                        if catch_name.is_some() || !catch_body.is_empty() {
+                            return Err(unsupported(*span));
+                        }
+                        let count = body
+                            .len()
+                            .checked_add(finally_body.len())
+                            .ok_or_else(|| unsupported(*span))?;
+                        reserve(&mut pending, count, *span)?;
+                        for stmt in body.iter().chain(finally_body).rev() {
+                            push(&mut pending, Syntax::Statement(stmt));
+                        }
+                    }
                     _ => return Err(unsupported(stmt_span(stmt))),
                 }
             }
@@ -568,6 +683,9 @@ impl<'a> Machine<'a> {
             calls: FrameStack::new(limits.calls),
             work: FrameStack::new(limits.work),
             values: FrameStack::new(limits.values),
+            finally: FinallyFrames {
+                frames: FrameStack::new(limits.work),
+            },
             initial_depth,
             call_depth: initial_depth,
             #[cfg(test)]
@@ -575,6 +693,7 @@ impl<'a> Machine<'a> {
             metrics: Metrics::default(),
             pending: None,
             value_limits: limits.values,
+            work_limits: limits.work,
             argument_capacity: 0,
             argument_bytes: 0,
             peak_argument_bytes: 0,
@@ -594,6 +713,39 @@ impl<'a> Machine<'a> {
         self.reserve_values(1, span)?;
         push(&mut self.values, value);
         Ok(())
+    }
+
+    fn reserve_work(&mut self, additional: usize, span: Span) -> KuResult<()> {
+        let frames = self
+            .work_limits
+            .max_frames
+            .checked_sub(self.finally.frames.len())
+            .ok_or_else(|| storage_error(ReserveError::FrameLimit, span))?;
+        let bytes = self
+            .work_limits
+            .max_storage_bytes
+            .checked_sub(self.finally.frames.charged_storage_bytes())
+            .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
+        self.work
+            .reserve_with_budget(additional, frames, bytes)
+            .map_err(|error| storage_error(error, span))
+    }
+
+    fn reserve_finally(&mut self, additional: usize, span: Span) -> KuResult<()> {
+        let frames = self
+            .work_limits
+            .max_frames
+            .checked_sub(self.work.len())
+            .ok_or_else(|| storage_error(ReserveError::FrameLimit, span))?;
+        let bytes = self
+            .work_limits
+            .max_storage_bytes
+            .checked_sub(self.work.charged_storage_bytes())
+            .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
+        self.finally
+            .frames
+            .reserve_with_budget(additional, frames, bytes)
+            .map_err(|error| storage_error(error, span))
     }
 
     fn reserve_values(&mut self, additional: usize, span: Span) -> KuResult<()> {
@@ -699,7 +851,7 @@ impl<'a> Machine<'a> {
             ));
         }
         reserve(&mut self.calls, 1, *span)?;
-        reserve(&mut self.work, 3, *span)?;
+        self.reserve_work(3, *span)?;
         // The result and all exit markers are admitted before parameter binding
         // or a scope effect. A later failure unwinds without new storage.
         self.reserve_values(1, *span)?;
@@ -769,7 +921,7 @@ impl<'a> Machine<'a> {
         };
         // No scope or iterator effect precedes admission of every continuation.
         // Binding failure still has its real ScopeExit and LoopBoundary live.
-        reserve(&mut self.work, 3, span)?;
+        self.reserve_work(3, span)?;
         push(
             &mut self.work,
             Work::LoopBoundary {
@@ -804,7 +956,7 @@ impl<'a> Machine<'a> {
                 body,
                 span,
             } => {
-                reserve(&mut self.work, 2, *span)?;
+                self.reserve_work(2, *span)?;
                 push(
                     &mut self.work,
                     Work::WhileCheck {
@@ -827,7 +979,7 @@ impl<'a> Machine<'a> {
                 // follows this private counter, as in the original evaluator.
                 let current = current + 1;
                 if current < limit {
-                    reserve(&mut self.work, 1, *span)?;
+                    self.reserve_work(1, *span)?;
                     push(
                         &mut self.work,
                         Work::LoopIteration(LoopState::ForInt {
@@ -844,11 +996,57 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    fn enter_try(
+        &mut self,
+        body: &'a [Stmt],
+        finally_body: &'a [Stmt],
+        span: &'a Span,
+    ) -> KuResult<()> {
+        // Reserve the outcome owner and every stage marker before body effects.
+        // Publishing an empty frame lets reserve_work charge its live count and
+        // retained bytes; failed admission drops only that empty metadata frame.
+        self.reserve_finally(1, *span)?;
+        let index = self.finally.frames.len();
+        push(
+            &mut self.finally.frames,
+            FinallyFrame {
+                body: finally_body,
+                span,
+                owner_call: self.calls.len(),
+                primary: None,
+                mode: cancellation::FinallyMode::Skip,
+                guard: None,
+            },
+        );
+        if let Err(error) = self.reserve_work(4, *span) {
+            drop(self.finally.frames.pop().expect("unentered finally frame"));
+            return Err(error);
+        }
+        self.metrics.entered_finally_frames += 1;
+        self.metrics.peak_finally_frames = self
+            .metrics
+            .peak_finally_frames
+            .max(self.finally.frames.len());
+        push(&mut self.work, Work::FinallyExit(index));
+        push(&mut self.work, Work::TryExit(index));
+        push(
+            &mut self.work,
+            Work::ScopeExit {
+                span: body.first().map(stmt_span).unwrap_or_default(),
+                value_base: self.values.len(),
+                fallthrough: ScopeFallthrough::Continue,
+            },
+        );
+        self.frame().env.push_scope();
+        push(&mut self.work, Work::Block { body, next: 0 });
+        Ok(())
+    }
+
     fn step(&mut self, step: Work<'a>) -> KuResult<()> {
         match step {
             Work::Block { body, next } => {
                 if let Some(stmt) = body.get(next) {
-                    reserve(&mut self.work, 2, stmt_span(stmt))?;
+                    self.reserve_work(2, stmt_span(stmt))?;
                     push(
                         &mut self.work,
                         Work::Block {
@@ -861,8 +1059,11 @@ impl<'a> Machine<'a> {
             }
             Work::Statement(stmt) => {
                 self.metrics.steps += 1;
-                if !matches!(stmt, Stmt::Break { .. } | Stmt::Continue { .. }) {
-                    reserve(&mut self.work, 2, stmt_span(stmt))?;
+                if !matches!(
+                    stmt,
+                    Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Try { .. }
+                ) {
+                    self.reserve_work(2, stmt_span(stmt))?;
                 }
                 match stmt {
                     Stmt::VarDecl {
@@ -923,6 +1124,12 @@ impl<'a> Machine<'a> {
                     }
                     Stmt::Break { .. } => self.pending = Some(Ok(Flow::Break(None))),
                     Stmt::Continue { .. } => self.pending = Some(Ok(Flow::LoopContinue(None))),
+                    Stmt::Try {
+                        body,
+                        finally_body,
+                        span,
+                        ..
+                    } => self.enter_try(body, finally_body, span)?,
                     Stmt::Return { value, span } => {
                         push(&mut self.work, Work::Return);
                         if let Some(value) = value {
@@ -956,12 +1163,12 @@ impl<'a> Machine<'a> {
                         self.emit(scalar(&value, expr.span)?, expr.span)?;
                     }
                     ExprKind::Unary { op, expr: operand } => {
-                        reserve(&mut self.work, 2, expr.span)?;
+                        self.reserve_work(2, expr.span)?;
                         push(&mut self.work, Work::Unary(*op, expr.span));
                         push(&mut self.work, Work::Eval(operand));
                     }
                     ExprKind::Binary { left, op, right } => {
-                        reserve(&mut self.work, 2, expr.span)?;
+                        self.reserve_work(2, expr.span)?;
                         push(&mut self.work, Work::BinaryLeft(*op, right, expr.span));
                         push(&mut self.work, Work::Eval(left));
                     }
@@ -970,11 +1177,7 @@ impl<'a> Machine<'a> {
                             unreachable!("preflight");
                         };
                         let function = self.source.get(name).expect("preflight checked callee");
-                        reserve(
-                            &mut self.work,
-                            if self.captures.is_some() { 2 } else { 1 },
-                            expr.span,
-                        )?;
+                        self.reserve_work(if self.captures.is_some() { 2 } else { 1 }, expr.span)?;
                         push(
                             &mut self.work,
                             Work::PrepareArguments {
@@ -1012,7 +1215,7 @@ impl<'a> Machine<'a> {
                 self.emit(value, span)?;
             }
             Work::BinaryLeft(op, right, span) => {
-                reserve(&mut self.work, 2, span)?;
+                self.reserve_work(2, span)?;
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     let left = expect_bool_condition(self.value(), span)?;
                     if (op == BinaryOp::And && !left) || (op == BinaryOp::Or && left) {
@@ -1041,7 +1244,7 @@ impl<'a> Machine<'a> {
                 } else {
                     else_body
                 };
-                reserve(&mut self.work, 2, span)?;
+                self.reserve_work(2, span)?;
                 push(
                     &mut self.work,
                     Work::ScopeExit {
@@ -1065,7 +1268,7 @@ impl<'a> Machine<'a> {
                 span,
             } => {
                 if expect_bool_condition(self.value(), *span)? {
-                    reserve(&mut self.work, 1, *span)?;
+                    self.reserve_work(1, *span)?;
                     push(
                         &mut self.work,
                         Work::LoopIteration(LoopState::While {
@@ -1096,7 +1299,7 @@ impl<'a> Machine<'a> {
                     }
                 };
                 if limit > 0 {
-                    reserve(&mut self.work, 1, *span)?;
+                    self.reserve_work(1, *span)?;
                     push(
                         &mut self.work,
                         Work::LoopIteration(LoopState::ForInt {
@@ -1137,7 +1340,7 @@ impl<'a> Machine<'a> {
                 // The argument boundary is installed before the first argument
                 // effect. Its actual buffer stays alive through the callee's
                 // scope/call exits and is consumed by the original arbiter.
-                reserve(&mut self.work, 2, *span)?;
+                self.reserve_work(2, *span)?;
                 let staged = self.argument_storage(args.len(), *span)?;
                 let exit_index = self.work.len();
                 push(
@@ -1181,7 +1384,7 @@ impl<'a> Machine<'a> {
                     arguments.staged.push(value);
                 }
                 if let Some(arg) = args.get(next) {
-                    reserve(&mut self.work, 2, *span)?;
+                    self.reserve_work(2, *span)?;
                     push(
                         &mut self.work,
                         Work::Arguments {
@@ -1221,7 +1424,9 @@ impl<'a> Machine<'a> {
             Work::ScopeExit { .. }
             | Work::CallExit
             | Work::ArgumentsExit(_)
-            | Work::LoopBoundary { .. } => {
+            | Work::LoopBoundary { .. }
+            | Work::TryExit(_)
+            | Work::FinallyExit(_) => {
                 unreachable!("exit markers run through resource arbitration");
             }
         }
@@ -1230,6 +1435,82 @@ impl<'a> Machine<'a> {
 
     fn finish_boundary(&mut self, boundary: Work<'a>, hooks: &mut impl ExecutionHooks) {
         match boundary {
+            Work::TryExit(index) => {
+                assert_eq!(index + 1, self.finally.frames.len(), "current try frame");
+                let (body, span, owner_call) = {
+                    let frame = self.finally.frames.get(index).expect("live try frame");
+                    (frame.body, *frame.span, frame.owner_call)
+                };
+                assert_eq!(owner_call, self.calls.len(), "try owns its call frame");
+                let primary = self.pending.take().unwrap_or(Ok(Flow::Continue));
+                let mode = hooks.prepare_finally(&self.frame().env, &primary, span);
+                if matches!(mode, cancellation::FinallyMode::Skip) {
+                    // Ordinary fatal errors skip finally in the existing
+                    // language. Retire its preinstalled exit with its owner.
+                    assert!(matches!(
+                        self.work.pop(),
+                        Some(Work::FinallyExit(saved)) if saved == index
+                    ));
+                    drop(self.finally.frames.pop().expect("skipped finally frame"));
+                    self.metrics.retired_finally_frames += 1;
+                    self.pending = Some(primary);
+                } else {
+                    let guard = match mode {
+                        cancellation::FinallyMode::Protected(context) => {
+                            Some(CleanupGuard::enter(context))
+                        }
+                        cancellation::FinallyMode::Ordinary => None,
+                        cancellation::FinallyMode::Skip => unreachable!("handled skip"),
+                    };
+                    let frame = self.finally.frames.get_mut(index).expect("live try frame");
+                    frame.primary = Some(primary);
+                    frame.mode = mode;
+                    frame.guard = guard;
+                    assert!(matches!(
+                        self.work.get(self.work.len() - 1),
+                        Some(Work::FinallyExit(saved)) if *saved == index
+                    ));
+                    // Try admission reserved four slots. Its body ScopeExit,
+                    // Block and TryExit have retired, leaving two guaranteed
+                    // slots above the already-installed FinallyExit. No unwind
+                    // allocation can prevent this finally body from entering.
+                    push(
+                        &mut self.work,
+                        Work::ScopeExit {
+                            span: body.first().map(stmt_span).unwrap_or_default(),
+                            value_base: self.values.len(),
+                            fallthrough: ScopeFallthrough::Continue,
+                        },
+                    );
+                    self.frame().env.push_scope();
+                    push(&mut self.work, Work::Block { body, next: 0 });
+                }
+            }
+            Work::FinallyExit(index) => {
+                assert_eq!(
+                    index + 1,
+                    self.finally.frames.len(),
+                    "current finally frame"
+                );
+                let replacement = self.pending.take().unwrap_or(Ok(Flow::Continue));
+                let mut frame = self.finally.frames.pop().expect("live finally frame");
+                assert_eq!(
+                    frame.owner_call,
+                    self.calls.len(),
+                    "finally owns its call frame"
+                );
+                let primary = frame.primary.take().expect("saved primary outcome");
+                let guard = frame.guard.take();
+                let result = hooks.finish_finally(primary, replacement, frame.mode, *frame.span);
+                // Keep the exact synchronous cleanup window through shared
+                // arbitration/discard, then restore its parent before resuming.
+                drop(guard);
+                drop(frame);
+                self.metrics.retired_finally_frames += 1;
+                if !matches!(&result, Ok(Flow::Continue)) {
+                    self.pending = Some(result);
+                }
+            }
             Work::LoopBoundary { state, owner_call } => {
                 // ScopeExit has already settled this iteration. CallExit must
                 // normalize a callee's escaped loop control before it can reach
@@ -1373,6 +1654,8 @@ impl<'a> Machine<'a> {
                     | Work::CallExit
                     | Work::ArgumentsExit(_)
                     | Work::LoopBoundary { .. }
+                    | Work::TryExit(_)
+                    | Work::FinallyExit(_)
             );
             if self.pending.is_some() {
                 if boundary {
@@ -1418,18 +1701,22 @@ impl<'a> Machine<'a> {
         assert_eq!(self.values.len(), 0);
         assert_eq!(self.argument_capacity, 0);
         assert_eq!(self.argument_bytes, 0);
+        assert_eq!(self.finally.frames.len(), 0);
         self.metrics.remaining_calls = self.calls.len();
         self.metrics.remaining_work = self.work.len();
         self.metrics.remaining_values = self.values.len();
+        self.metrics.remaining_finally_frames = self.finally.frames.len();
         self.metrics.logical_depth = self.call_depth;
         assert_eq!(self.call_depth, self.initial_depth);
         self.metrics.retained_backing_bytes = self.calls.charged_storage_bytes()
             + self.work.charged_storage_bytes()
             + self.values.charged_storage_bytes()
+            + self.finally.frames.charged_storage_bytes()
             + self.argument_bytes;
         self.metrics.peak_backing_bytes_upper_bound = self.calls.peak_storage_bytes()
             + self.work.peak_storage_bytes()
             + self.values.peak_storage_bytes()
+            + self.finally.frames.peak_storage_bytes()
             + self.peak_argument_bytes;
         self.pending.take().expect("root call or admission outcome")
     }

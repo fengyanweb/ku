@@ -30,6 +30,11 @@ fn assert_drained(metrics: &Metrics, initial_depth: usize) {
     assert_eq!(metrics.remaining_calls, 0, "{metrics:?}");
     assert_eq!(metrics.remaining_work, 0, "{metrics:?}");
     assert_eq!(metrics.remaining_values, 0, "{metrics:?}");
+    assert_eq!(
+        metrics.entered_finally_frames, metrics.retired_finally_frames,
+        "{metrics:?}"
+    );
+    assert_eq!(metrics.remaining_finally_frames, 0, "{metrics:?}");
     assert_eq!(metrics.logical_depth, initial_depth, "{metrics:?}");
     assert!(
         metrics.retained_backing_bytes <= metrics.peak_backing_bytes_upper_bound,
@@ -311,7 +316,7 @@ fn unsupported_unreachable_functions_are_rejected_before_any_execution() {
         "fn Unused(): str { return \"owned\" }",
         "fn Unused(&value: int): int { return value }",
         "async fn Unused(): int! { return ok(1) }",
-        "fn Unused() { try { marker = 1 } finally { marker = 2 } }",
+        "fn Unused() { try { marker = 1 } catch (err) { marker = 2 } finally { marker = 3 } }",
     ] {
         let source = functions(&format!("fn Entry(): int {{ return 7 }}\n{unsupported}"));
         let (result, metrics) = execute(&source, "Entry", &[], 0, 0, Limits::default());
@@ -492,16 +497,9 @@ fn Entry(): int {
     assert_eq!(interpreter.call_depth, 0);
 }
 
-#[test]
-fn production_recursive_while_and_for_preserve_512_call_boundary_on_real_workers() {
-    let (_, test_name) = concat!(
-        module_path!(),
-        "::production_recursive_while_and_for_preserve_512_call_boundary_on_real_workers"
-    )
-    .split_once("::")
-    .expect("worker regression must have a module-qualified test name");
-    const CHILD: &str = "KU_EXECUTION_LOOP_STACK_SAFETY_CHILD";
-    let completed = format!("loop worker regression completed: {test_name}");
+fn bounded_worker_child(test_name: &str) -> bool {
+    const CHILD: &str = "KU_EXECUTION_STACK_SAFETY_CHILD";
+    let completed = format!("worker regression completed: {test_name}");
     if std::env::var(CHILD).as_deref() != Ok(test_name) {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
@@ -512,7 +510,7 @@ fn production_recursive_while_and_for_preserve_512_call_boundary_on_real_workers
             Duration::from_secs(15),
             finally_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
         )
-        .expect("recursive loop regression must not hang its supervisor");
+        .expect("recursive worker regression must not hang its supervisor");
         assert!(
             output.status.success(),
             "worker child must exit normally: {:?}\n{}\n{}",
@@ -528,9 +526,65 @@ fn production_recursive_while_and_for_preserve_512_call_boundary_on_real_workers
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        return false;
+    }
+    true
+}
+
+fn assert_real_worker_depth_case(source: &str, argument: i64) {
+    let runtime = TaskRuntime::new();
+    let mut interpreter = production_interpreter(source);
+    interpreter.task_runtime = Some(runtime.clone());
+    interpreter.async_execution = true;
+    let parent_id = thread::current().id();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let task = runtime.spawn(move || {
+        let worker = thread::current();
+        let _ = ready_tx.send((worker.id(), worker.name().unwrap_or("").to_owned()));
+        let result =
+            interpreter.call_function("Descend", vec![Value::Int(argument)], Span::default(), 0);
+        let _ = result_tx.send((result, interpreter.call_depth));
+        Ok(Value::Null)
+    });
+    // Channel waits keep the caller from helping this job on its own
+    // stack. Abort remains a failing bounded child-process outcome.
+    let ready = ready_rx.recv_timeout(Duration::from_secs(3));
+    let outcome = result_rx.recv_timeout(Duration::from_secs(3));
+    let admission_error = task.as_ref().err().cloned();
+    drop(task);
+    let drained = runtime.cancel_all_and_wait(Duration::from_secs(2));
+    let snapshot = runtime.snapshot();
+    drained.unwrap();
+    let snapshot = snapshot.unwrap();
+    assert!(admission_error.is_none(), "{admission_error:?}");
+    let (worker_id, worker_name) = ready.expect("a real worker must report entry");
+    assert_ne!(worker_id, parent_id);
+    assert!(worker_name.starts_with("ku-task-"), "{worker_name}");
+    let (result, depth) = outcome.expect("the real worker must finish within the bound");
+    if argument == 511 {
+        assert_eq!(result.unwrap(), Value::Int(0));
+    } else {
+        assert_depth_error(result);
+    }
+    assert_eq!(depth, 0);
+    assert_eq!(snapshot.active_tasks, 0);
+    assert_eq!(snapshot.queued_tasks, 0);
+    assert_eq!(snapshot.queued_blocking_jobs, 0);
+    assert_eq!(snapshot.running_blocking_jobs, 0);
+}
+
+#[test]
+fn production_recursive_while_and_for_preserve_512_call_boundary_on_real_workers() {
+    let (_, test_name) = concat!(
+        module_path!(),
+        "::production_recursive_while_and_for_preserve_512_call_boundary_on_real_workers"
+    )
+    .split_once("::")
+    .expect("worker regression must have a module-qualified test name");
+    if !bounded_worker_child(test_name) {
         return;
     }
-
     assert_eq!(MAX_CALL_DEPTH, 512);
     for source in [
         r#"
@@ -548,53 +602,509 @@ fn Descend(n: int): int {
 "#,
     ] {
         for argument in [511, 512] {
-            let runtime = TaskRuntime::new();
-            let mut interpreter = production_interpreter(source);
-            interpreter.task_runtime = Some(runtime.clone());
-            interpreter.async_execution = true;
-            let parent_id = thread::current().id();
-            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-            let (result_tx, result_rx) = mpsc::sync_channel(1);
-            let task = runtime.spawn(move || {
-                let worker = thread::current();
-                let _ = ready_tx.send((worker.id(), worker.name().unwrap_or("").to_owned()));
-                let result = interpreter.call_function(
-                    "Descend",
-                    vec![Value::Int(argument)],
-                    Span::default(),
-                    0,
-                );
-                let _ = result_tx.send((result, interpreter.call_depth));
-                Ok(Value::Null)
-            });
-            // Channel waits keep the caller from helping this job on its own
-            // stack. Abort remains a failing bounded child-process outcome.
-            let ready = ready_rx.recv_timeout(Duration::from_secs(3));
-            let outcome = result_rx.recv_timeout(Duration::from_secs(3));
-            let admission_error = task.as_ref().err().cloned();
-            drop(task);
-            let drained = runtime.cancel_all_and_wait(Duration::from_secs(2));
-            let snapshot = runtime.snapshot();
-            drained.unwrap();
-            let snapshot = snapshot.unwrap();
-            assert!(admission_error.is_none(), "{admission_error:?}");
-            let (worker_id, worker_name) = ready.expect("a real worker must report entry");
-            assert_ne!(worker_id, parent_id);
-            assert!(worker_name.starts_with("ku-task-"), "{worker_name}");
-            let (result, depth) = outcome.expect("the real worker must finish within the bound");
-            if argument == 511 {
-                assert_eq!(result.unwrap(), Value::Int(0));
-            } else {
-                assert_depth_error(result);
-            }
-            assert_eq!(depth, 0);
-            assert_eq!(snapshot.active_tasks, 0);
-            assert_eq!(snapshot.queued_tasks, 0);
-            assert_eq!(snapshot.queued_blocking_jobs, 0);
-            assert_eq!(snapshot.running_blocking_jobs, 0);
+            assert_real_worker_depth_case(source, argument);
         }
     }
-    eprintln!("{completed}");
+    eprintln!("worker regression completed: {test_name}");
+}
+
+#[test]
+fn production_recursive_finally_preserves_512_call_boundary_on_real_workers() {
+    let (_, test_name) = concat!(
+        module_path!(),
+        "::production_recursive_finally_preserves_512_call_boundary_on_real_workers"
+    )
+    .split_once("::")
+    .expect("worker regression must have a module-qualified test name");
+    if !bounded_worker_child(test_name) {
+        return;
+    }
+    assert_eq!(MAX_CALL_DEPTH, 512);
+    let source = r#"
+fn Descend(n: int): int {
+    result = 0
+    try { if (n > 0) { result = Descend(n - 1) } }
+    finally { marker = 1 }
+    return result
+}
+"#;
+    for argument in [511, 512] {
+        assert_real_worker_depth_case(source, argument);
+    }
+    eprintln!("worker regression completed: {test_name}");
+}
+
+#[test]
+fn production_finally_control_results_and_ticks_match_the_original_engine() {
+    for (body, expected, fatal) in [
+        ("value = 0\ntry { value = Leaf(1) } finally { value = value + 10 }\nreturn value", 12, false),
+        ("value = 0\ntry { return Leaf(3) } finally { value = value + 10 }\nreturn value", 4, false),
+        ("value = 0\nfor index in 3 { try { value = Leaf(value)\nbreak } finally { value = value + 10 }\nvalue = 999 }\nreturn value", 11, false),
+        ("value = 0\nfor index in 3 { try { value = Leaf(value)\ncontinue } finally { value = value + 10 }\nvalue = 999 }\nreturn value", 33, false),
+        ("try { return Leaf(3) } finally { return 9 }\nreturn 0", 9, false),
+        ("try { return 1 / 0 } finally { return 9223372036854775807 + 1 }\nreturn 0", 0, true),
+    ] {
+        let source = format!(
+            "fn Leaf(n: int): int {{ return n + 1 }}\nfn Entry(): int {{ {body} }}"
+        );
+        let mut selected = production_interpreter(&source);
+        let entry = selected.functions.get("Entry").unwrap().clone();
+        let result = try_execute(&mut selected, &entry, &[], 0)
+            .expect("the complete scalar try/finally tree must be admitted")
+            .and_then(|flow| flow.into_call_value(Span::default(), "function"));
+        let mut original = production_interpreter(&source);
+        let old_result = original
+            .call_function_direct_flow(entry, vec![], Span::default(), 0)
+            .and_then(|flow| flow.into_call_value(Span::default(), "function"));
+        assert_eq!(result, old_result, "{body}");
+        if fatal {
+            // Overflow in finally would prove the ordinary fatal was replaced.
+            assert_eq!(result.unwrap_err().message, "division by zero");
+        } else {
+            assert_eq!(result.unwrap(), Value::Int(expected), "{body}");
+        }
+        assert_eq!(selected.steps, original.steps, "{body}");
+        assert_eq!(selected.call_depth, 0);
+        assert_eq!(original.call_depth, 0);
+    }
+}
+
+#[test]
+fn production_recursive_finally_updates_real_shared_captures_from_inner_to_outer() {
+    let runtime = TaskRuntime::new();
+    let task = runtime
+        .spawn(|| {
+            let mut interpreter = production_interpreter(
+                r#"
+fn Make() {
+    marker = 0
+    fn local(n: int): int {
+        result = 0
+        try { if (n > 0) { result = local(n - 1) } }
+        finally { marker = marker * 10 + n + 1 }
+        return result
+    }
+    return local.clone()
+}
+"#,
+            );
+            let value = interpreter.call_function("Make", vec![], Span::default(), 0)?;
+            let call = function_value_call(&value, 3, 0);
+            assert_ne!(crate::runtime::task::current_task_id(), 0);
+            assert!(call.captures.is_stable_scalar_binding("marker"));
+            assert_eq!(
+                try_execute_function_value(&mut interpreter, &call)
+                    .expect("real same-Task scalar finally captures must be selected")?
+                    .into_call_value(Span::default(), "function value")?,
+                Value::Int(0)
+            );
+            assert_eq!(
+                call.captures.get("marker", Span::default())?,
+                Value::Int(1234)
+            );
+            let mut shared = call.captures.clone();
+            shared.assign_owned("marker", Value::Int(0), Span::default())?;
+            let result = interpreter.call_function_value(call)?;
+            assert_eq!(interpreter.call_depth, 0);
+            Ok(Value::Array(vec![
+                result,
+                shared.get("marker", Span::default())?,
+            ]))
+        })
+        .unwrap();
+    let outcome = task.await_result();
+    drop(task);
+    let drained = runtime.cancel_all_and_wait(Duration::from_secs(2));
+    let snapshot = runtime.snapshot().unwrap();
+    drained.unwrap();
+    assert_eq!(snapshot.active_tasks, 0);
+    assert_eq!(snapshot.queued_tasks, 0);
+    assert_eq!(
+        outcome.unwrap(),
+        Value::Array(vec![Value::Int(0), Value::Int(1234)])
+    );
+}
+
+#[derive(Clone, Copy)]
+enum FinallyProbeAction {
+    Terminate(RuntimeTermination),
+    HttpTimeout,
+    Panic,
+}
+
+struct FinallyProbe<'a> {
+    host: &'a mut Interpreter,
+    // Each hit is an actual syntax safepoint, not a synthetic empty scope.
+    triggers: Vec<(Span, usize, FinallyProbeAction)>,
+    ticks: Vec<Span>,
+    protected: Vec<RuntimeTermination>,
+    markers: Vec<i64>,
+}
+
+impl<'a> FinallyProbe<'a> {
+    fn new(host: &'a mut Interpreter, triggers: Vec<(Span, usize, FinallyProbeAction)>) -> Self {
+        Self {
+            host,
+            triggers,
+            ticks: Vec::new(),
+            protected: Vec::new(),
+            markers: Vec::new(),
+        }
+    }
+}
+
+impl ExecutionHooks for FinallyProbe<'_> {
+    fn tick(&mut self, span: Span) -> KuResult<()> {
+        self.ticks.push(span);
+        if let Some((target, hits, _)) = self.triggers.first_mut() {
+            if *target == span {
+                *hits -= 1;
+                if *hits == 0 {
+                    match self.triggers.remove(0).2 {
+                        FinallyProbeAction::Terminate(context) => {
+                            return Err(KuError::termination(context, span));
+                        }
+                        FinallyProbeAction::HttpTimeout => {
+                            self.host.execution_deadline =
+                                Some(HttpHandlerDeadline::new(Instant::now()));
+                        }
+                        FinallyProbeAction::Panic => panic!("native finally probe panic"),
+                    }
+                }
+            }
+        }
+        ExecutionHooks::tick(self.host, span)
+    }
+
+    fn finish_scope(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<Flow>,
+        span: Span,
+        pop: bool,
+    ) -> KuResult<Flow> {
+        if let Ok(Value::Int(marker)) = env.get("marker", span) {
+            self.markers.push(marker);
+        }
+        ExecutionHooks::finish_scope(self.host, env, result, span, pop)
+    }
+
+    fn finish_call(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_call(self.host, env, leases, result, span, kind)
+    }
+
+    fn finish_arguments(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_arguments(self.host, env, leases, values, result, span)
+    }
+
+    fn prepare_finally(
+        &mut self,
+        env: &Env,
+        primary: &KuResult<Flow>,
+        span: Span,
+    ) -> cancellation::FinallyMode {
+        let mode = ExecutionHooks::prepare_finally(self.host, env, primary, span);
+        if let cancellation::FinallyMode::Protected(context) = mode {
+            self.protected.push(context);
+        }
+        mode
+    }
+
+    fn finish_finally(
+        &mut self,
+        primary: KuResult<Flow>,
+        replacement: KuResult<Flow>,
+        mode: cancellation::FinallyMode,
+        span: Span,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_finally(self.host, primary, replacement, mode, span)
+    }
+}
+
+#[test]
+fn production_finally_protects_original_cleanup_and_http_termination_contexts() {
+    for cleanup_failure in [false, true] {
+        for replacement in ["return 9", "return 1 / 0"] {
+            let body = if cleanup_failure {
+                "marker = 1"
+            } else {
+                "marker = 1\nwhile (true) {}"
+            };
+            let source = functions(&format!(
+                "fn Entry(): int {{ marker = 0\ntry {{ {body} }} finally {{ marker = marker * 10 + 2\n{replacement} }}\nreturn marker }}"
+            ));
+            let entry = source.get("Entry").unwrap();
+            preflight_tree(&source, Limits::default(), Some(entry)).unwrap();
+            let Stmt::Try { body, .. } = &entry.body[1] else {
+                panic!("real try fixture");
+            };
+            let original = RuntimeTermination {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: if cleanup_failure {
+                    Instant::now()
+                        .checked_sub(Duration::from_millis(1))
+                        .unwrap()
+                } else {
+                    Instant::now() + HTTP_HANDLER_CLEANUP_GRACE
+                },
+            };
+            let triggers = if cleanup_failure {
+                vec![]
+            } else {
+                vec![(
+                    stmt_span(&body[1]),
+                    1,
+                    FinallyProbeAction::Terminate(original),
+                )]
+            };
+            let execution = ExecutionTerminationGuard::enter();
+            let cleanup = cleanup_failure.then(|| CleanupGuard::enter(original));
+            let mut host = Interpreter::new();
+            let mut probe = FinallyProbe::new(&mut host, triggers);
+            let mut machine = Machine::new(&source, Limits::default(), 0);
+            let error = machine
+                .run_with_hooks("Entry", &[], 0, false, &mut probe)
+                .err()
+                .expect("finally replacement must not turn protected termination into success");
+            assert_eq!(error.runtime_termination(), Some(original));
+            assert_eq!(probe.protected, vec![original]);
+            assert!(
+                probe.markers.contains(&12),
+                "the real finite finally must execute"
+            );
+            assert!(probe.triggers.is_empty());
+            assert_drained(&machine.metrics, 0);
+            assert_eq!(machine.metrics.entered_finally_frames, 1);
+            drop(probe);
+            drop(cleanup);
+            drop(execution);
+            assert!(current_cleanup_context().is_none());
+            assert!(crate::runtime::task::current_execution_termination().is_none());
+        }
+    }
+
+    let source = functions(
+        r#"
+fn Entry(): int {
+    marker = 0
+    try {
+        try { while (true) { marker = 1 } }
+        finally { marker = marker * 10 + 2 }
+    } finally { marker = marker * 10 + 3 }
+    return marker
+}
+"#,
+    );
+    let entry = source.get("Entry").unwrap();
+    preflight_tree(&source, Limits::default(), Some(entry)).unwrap();
+    let Stmt::Try { body: outer, .. } = &entry.body[1] else {
+        panic!("outer try fixture");
+    };
+    let Stmt::Try { body: inner, .. } = &outer[0] else {
+        panic!("inner try fixture");
+    };
+    let Stmt::While { condition, .. } = &inner[0] else {
+        panic!("infinite while fixture");
+    };
+    let execution = ExecutionTerminationGuard::enter();
+    let mut host = Interpreter::new();
+    // The first true condition runs an actual iteration. The second installs
+    // the real HTTP deadline and lets Interpreter::tick create its one D.
+    let mut probe = FinallyProbe::new(
+        &mut host,
+        vec![(condition.span, 2, FinallyProbeAction::HttpTimeout)],
+    );
+    let mut machine = Machine::new(&source, Limits::default(), 0);
+    let error = machine
+        .run_with_hooks("Entry", &[], 0, false, &mut probe)
+        .err()
+        .expect("the infinite body must terminate through the real HTTP poll");
+    let original = error
+        .runtime_termination()
+        .expect("HTTP must keep its typed first cause");
+    assert_eq!(original.reason, TerminationReason::TimedOut);
+    assert_eq!(error.message, HTTP_HANDLER_TIMEOUT_MESSAGE);
+    assert_eq!(probe.protected, vec![original, original]);
+    assert!(probe.markers.contains(&1));
+    assert!(probe.markers.contains(&12));
+    assert!(probe.markers.contains(&123));
+    assert!(probe.triggers.is_empty());
+    let deadline = probe.host.execution_deadline.as_ref().unwrap();
+    assert!(deadline.timed_out);
+    assert_eq!(deadline.cleanup_deadline, Some(original.cleanup_deadline));
+    assert_drained(&machine.metrics, 0);
+    assert_eq!(machine.metrics.entered_finally_frames, 2);
+    drop(probe);
+    drop(execution);
+    assert!(current_cleanup_context().is_none());
+    assert!(crate::runtime::task::current_execution_termination().is_none());
+}
+
+#[test]
+fn production_nested_finally_native_panic_restores_synchronous_tls_guards() {
+    let source = functions(
+        r#"
+fn Entry(): int {
+    marker = 0
+    try { payload = 1
+        while (true) {} }
+    finally {
+        try { payload = 2
+            while (true) {} }
+        finally { payload = 3
+            return 9 }
+    }
+    return marker
+}
+"#,
+    );
+    let entry = source.get("Entry").unwrap();
+    preflight_tree(&source, Limits::default(), Some(entry)).unwrap();
+    let Stmt::Try {
+        body: outer,
+        finally_body,
+        ..
+    } = &entry.body[1]
+    else {
+        panic!("outer try fixture");
+    };
+    let Stmt::Try {
+        body: inner,
+        finally_body: inner_finally,
+        ..
+    } = &finally_body[0]
+    else {
+        panic!("inner try fixture");
+    };
+    let original = RuntimeTermination {
+        reason: TerminationReason::Cancelled,
+        cleanup_deadline: Instant::now() + HTTP_HANDLER_CLEANUP_GRACE,
+    };
+    let before_cleanup = current_cleanup_context();
+    let before_execution = crate::runtime::task::current_execution_termination();
+    let mut host = Interpreter::new();
+    let mut probe = FinallyProbe::new(
+        &mut host,
+        vec![
+            (
+                stmt_span(&outer[1]),
+                1,
+                FinallyProbeAction::Terminate(original),
+            ),
+            (
+                stmt_span(&inner[1]),
+                1,
+                FinallyProbeAction::Terminate(original),
+            ),
+            (stmt_span(&inner_finally[1]), 1, FinallyProbeAction::Panic),
+        ],
+    );
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _execution = ExecutionTerminationGuard::enter();
+        // Production owns this Machine locally. Panic leaves its scope and
+        // drops the live finally guards in their real lifetime and LIFO order.
+        let mut machine = Machine::new(&source, Limits::default(), 0);
+        let _ = machine.run_with_hooks("Entry", &[], 0, false, &mut probe);
+    }));
+    assert!(
+        panic.is_err(),
+        "the native panic must occur inside the innermost finally"
+    );
+    assert!(probe.triggers.is_empty());
+    assert_eq!(probe.protected, vec![original, original]);
+    assert_eq!(current_cleanup_context(), before_cleanup);
+    assert_eq!(
+        crate::runtime::task::current_execution_termination(),
+        before_execution
+    );
+}
+
+#[test]
+fn production_finally_aggregate_budgets_reject_before_body_and_retire_all_state() {
+    let source = functions("fn Entry() { try { entered = 1 } finally { exited = 2 } }");
+    let entry = source.get("Entry").unwrap();
+    let Stmt::Try {
+        body,
+        finally_body,
+        span,
+        ..
+    } = &entry.body[0]
+    else {
+        panic!("real try fixture");
+    };
+    let mut count = Limits::default();
+    // Root owns three pending work entries. A Try requires four more and
+    // one separate primary-outcome frame, so an aggregate allowance of seven
+    // rejects the entire Try before it publishes either body effect.
+    count.work.max_frames = 7;
+    let mut bytes = Limits::default();
+    bytes.work.max_storage_bytes =
+        7 * std::mem::size_of::<Work<'_>>() + std::mem::size_of::<FinallyFrame<'_>>();
+    for (limits, old_backing, reason) in
+        [(count, false, "FrameLimit"), (bytes, true, "StorageLimit")]
+    {
+        let mut host = Interpreter::new();
+        let mut probe = FinallyProbe::new(&mut host, vec![]);
+        let mut machine = Machine::new(&source, limits, 0);
+        if old_backing {
+            machine.work.reserve(4).unwrap();
+            // The final seven-slot buffer plus finally metadata would fit.
+            // Reallocation must still charge the retained old buffer as well.
+            assert!(
+                machine.work.charged_storage_bytes()
+                    + 7 * std::mem::size_of::<Work<'_>>()
+                    + std::mem::size_of::<FinallyFrame<'_>>()
+                    > limits.work.max_storage_bytes
+            );
+        }
+        let error = machine
+            .run_with_hooks("Entry", &[], 0, false, &mut probe)
+            .err()
+            .expect("aggregate continuation storage must reject this Try");
+        assert_eq!(
+            error.message,
+            format!("internal execution storage rejected: {reason}")
+        );
+        assert!(probe.ticks.contains(span));
+        assert!(!probe.ticks.contains(&stmt_span(&body[0])));
+        assert!(!probe.ticks.contains(&stmt_span(&finally_body[0])));
+        assert_eq!(machine.metrics.entered_calls, 1);
+        assert_eq!(machine.metrics.entered_finally_frames, 0);
+        assert_drained(&machine.metrics, 0);
+        assert!(
+            machine.work.charged_storage_bytes() + machine.finally.frames.charged_storage_bytes()
+                <= limits.work.max_storage_bytes
+        );
+    }
+}
+
+#[test]
+fn production_unmigrated_catch_and_owned_finally_remain_legal_without_partial_execution() {
+    for body in [
+        "value = 1\ntry { value = 2 } catch (err) { value = 9 } finally { value = value + 10 }\nreturn value",
+        "value = 1\ntry { value = 2 } finally { payload = \"owned\"\nvalue = value + 10 }\nreturn value",
+    ] {
+        let mut interpreter = production_interpreter(&format!("fn Entry(): int {{ {body} }}"));
+        let entry = interpreter.functions.get("Entry").unwrap().clone();
+        assert!(try_execute(&mut interpreter, &entry, &[], 0).is_none());
+        assert_eq!(interpreter.steps, 0);
+        assert_eq!(interpreter.call_function("Entry", vec![], Span::default(), 0).unwrap(), Value::Int(12));
+        assert_eq!(interpreter.call_depth, 0);
+    }
 }
 
 #[test]

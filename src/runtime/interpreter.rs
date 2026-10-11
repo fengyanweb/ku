@@ -902,56 +902,20 @@ impl Interpreter {
                         self.finish_owned_scope(env, caught, *span, true)
                     };
                 }
-                self.observe_termination(&result);
-                let terminating =
-                    matches!(&result, Err(error) if error.runtime_termination().is_some());
-                let cleanup_failure = result.is_err() && current_cleanup_context().is_some();
-                if result.is_err() && !terminating && !cleanup_failure {
-                    // Ordinary fatal errors retain their existing boundary.
+                let mode = self.prepare_finally(env, &result, *span);
+                if matches!(mode, cancellation::FinallyMode::Skip) {
                     return result;
                 }
-                if terminating || cleanup_failure {
-                    let context = self
-                        .termination
-                        .or_else(current_cleanup_context)
-                        .expect("terminating flow has a cancellation context");
-                    if cleanup_failure && !terminating {
-                        self.record_suppressed_cleanup();
+                let guard = match mode {
+                    cancellation::FinallyMode::Protected(context) => {
+                        Some(CleanupGuard::enter(context))
                     }
-                    self.cancel_visible_children(env, context, *span);
-                    let guard = CleanupGuard::enter(context);
-                    let finally_result = self.exec_block(finally_body, env, depth);
-                    if !matches!(finally_result, Ok(Flow::Continue)) {
-                        self.record_suppressed_cleanup();
-                    }
-                    self.discard_flow(finally_result, context, *span);
-                    drop(guard);
-                    // No cleanup return, recoverable failure or panic may
-                    // overwrite the original cancellation/timeout cause.
-                    return Err(self.termination_error(context, *span));
-                }
+                    _ => None,
+                };
                 let finally_result = self.exec_block(finally_body, env, depth);
-                match finally_result {
-                    Ok(Flow::Continue) => result,
-                    mut replacement => {
-                        self.observe_termination(&replacement);
-                        let context = self
-                            .termination
-                            .or_else(|| match &result {
-                                Ok(flow) => cancellation::ScopeExit::cleanup_context(flow),
-                                Err(error) => error.scope_cleanup(),
-                            })
-                            .unwrap_or_else(|| {
-                                CancellationContext::new(TerminationReason::Cancelled)
-                            });
-                        match &mut replacement {
-                            Ok(flow) => cancellation::ScopeExit::remember_cleanup(flow, context),
-                            Err(error) => error.remember_scope_cleanup(context),
-                        }
-                        self.discard_flow(result, context, *span);
-                        replacement
-                    }
-                }
+                let result = self.finish_finally(result, finally_result, mode, *span);
+                drop(guard);
+                result
             }
             Stmt::Fail { value, span } => {
                 let value = self.eval(value, env, depth)?;
