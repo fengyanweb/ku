@@ -182,6 +182,12 @@ impl RegistryServer {
             artifact_verifications: Arc::new(ArtifactVerificationCache::new(
                 MAX_ARTIFACT_VERIFICATION_CACHE_ENTRIES,
             )),
+            #[cfg(test)]
+            connection_evidence: Mutex::new(TestConnectionEvidence::new()),
+            #[cfg(test)]
+            connection_evidence_ready: Condvar::new(),
+            #[cfg(test)]
+            publish_body_gate: Mutex::new(None),
             _instance_lock: instance_lock,
         });
         audit_registry_storage(&state)?;
@@ -256,9 +262,17 @@ impl RegistryServer {
                     continue;
                 }
                 if Instant::now() >= queued.deadline {
+                    record_connection_failure(
+                        &state,
+                        ConnectionPhase::QueueDeadline,
+                        queued.accepted_at,
+                        queued.deadline,
+                        None,
+                        None,
+                    );
                     continue;
                 }
-                handle_connection(queued.stream, &state, queued.deadline);
+                handle_connection(queued.stream, &state, queued.accepted_at, queued.deadline);
             }));
         }
 
@@ -273,9 +287,11 @@ impl RegistryServer {
                         drop(stream);
                         continue;
                     }
+                    let accepted_at = Instant::now();
                     match sender.try_send(QueuedConnection {
                         stream,
-                        deadline: Instant::now() + self.state.request_timeout,
+                        accepted_at,
+                        deadline: accepted_at + self.state.request_timeout,
                     }) {
                         Ok(()) => {}
                         Err(TrySendError::Full(queued)) => drop(queued),
@@ -324,6 +340,12 @@ struct RegistryState {
     request_timeout: Duration,
     mutation_admission: MutationAdmission,
     artifact_verifications: Arc<ArtifactVerificationCache>,
+    #[cfg(test)]
+    connection_evidence: Mutex<TestConnectionEvidence>,
+    #[cfg(test)]
+    connection_evidence_ready: Condvar,
+    #[cfg(test)]
+    publish_body_gate: Mutex<Option<TestPublishBodyGate>>,
     _instance_lock: RegistryInstanceLock,
 }
 
@@ -391,6 +413,7 @@ impl ArtifactVerificationCache {
 
 struct QueuedConnection {
     stream: TcpStream,
+    accepted_at: Instant,
     deadline: Instant,
 }
 
@@ -687,11 +710,126 @@ impl HttpResponse {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionPhase {
+    QueueDeadline,
+    TlsOrFirstHead,
+    RequestHead,
+    Dispatch,
+    ResponseWrite,
+    CloseFlush,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectionEvidence {
+    phase: ConnectionPhase,
+    io_kind: Option<io::ErrorKind>,
+    elapsed_ms: u128,
+    deadline_expired: bool,
+    status: Option<u16>,
+}
+
+#[cfg(test)]
+const MAX_TEST_CONNECTION_EVIDENCE: usize = 16;
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestConnectionEvidence {
+    entries: [Option<ConnectionEvidence>; MAX_TEST_CONNECTION_EVIDENCE],
+    len: usize,
+    overflow: usize,
+}
+
+#[cfg(test)]
+impl TestConnectionEvidence {
+    fn new() -> Self {
+        Self {
+            entries: [None; MAX_TEST_CONNECTION_EVIDENCE],
+            len: 0,
+            overflow: 0,
+        }
+    }
+
+    fn push(&mut self, evidence: ConnectionEvidence) {
+        if self.len < self.entries.len() {
+            self.entries[self.len] = Some(evidence);
+            self.len += 1;
+        } else {
+            self.overflow = self.overflow.saturating_add(1);
+        }
+    }
+}
+
+#[cfg(test)]
+struct TestPublishBodyGate {
+    entered: mpsc::SyncSender<Instant>,
+    release: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl TestPublishBodyGate {
+    fn wait(self, deadline: Instant) {
+        let _ = self.entered.try_send(deadline);
+        // One-shot fixture only. Wait against the existing request D, without
+        // changing the socket deadline or assigning a new cleanup budget.
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match self.release.recv_timeout(remaining) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+}
+
+fn record_connection_failure(
+    state: &RegistryState,
+    phase: ConnectionPhase,
+    accepted_at: Instant,
+    deadline: Instant,
+    io_kind: Option<io::ErrorKind>,
+    status: Option<u16>,
+) {
+    let now = Instant::now();
+    let evidence = ConnectionEvidence {
+        phase,
+        io_kind,
+        elapsed_ms: now.saturating_duration_since(accepted_at).as_millis(),
+        deadline_expired: now >= deadline,
+        status,
+    };
+    // All fields are static classifications or numbers. Do not add a request
+    // path, credentials, body, underlying error string, or filesystem path.
+    eprintln!(
+        "ku-registry connection_failure phase={:?} io_kind={:?} elapsed_ms={} deadline_expired={} status={:?}",
+        evidence.phase,
+        evidence.io_kind,
+        evidence.elapsed_ms,
+        evidence.deadline_expired,
+        evidence.status,
+    );
+    #[cfg(test)]
+    {
+        let mut recorded = state
+            .connection_evidence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        recorded.push(evidence);
+        state.connection_evidence_ready.notify_all();
+    }
+    #[cfg(not(test))]
+    let _ = state;
+}
+
 #[derive(Debug)]
 struct RequestFailure {
     status: u16,
     public_message: &'static str,
     internal: Option<String>,
+    io_kind: Option<io::ErrorKind>,
 }
 
 impl RequestFailure {
@@ -700,6 +838,7 @@ impl RequestFailure {
             status,
             public_message,
             internal: None,
+            io_kind: None,
         }
     }
 
@@ -708,7 +847,13 @@ impl RequestFailure {
             status: 500,
             public_message: "internal registry error\n",
             internal: Some(message.into()),
+            io_kind: None,
         }
+    }
+
+    fn with_io_kind(mut self, kind: io::ErrorKind) -> Self {
+        self.io_kind = Some(kind);
+        self
     }
 
     fn response(&self) -> HttpResponse {
@@ -716,7 +861,12 @@ impl RequestFailure {
     }
 }
 
-fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant) {
+fn handle_connection(
+    stream: TcpStream,
+    state: &RegistryState,
+    accepted_at: Instant,
+    deadline: Instant,
+) {
     let connection = match ServerConnection::new(Arc::clone(&state.tls)) {
         Ok(connection) => connection,
         Err(_) => return,
@@ -724,8 +874,21 @@ fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant
     let stream = DeadlineTcpStream::new(stream, deadline);
     let tls = StreamOwned::new(connection, stream);
     let mut reader = BufReader::with_capacity(REGISTRY_TLS_INPUT_BUFFER_BYTES, tls);
+    let mut quiet_idle_close = false;
     for request_number in 1..=MAX_REQUESTS_PER_CONNECTION {
         if Instant::now() >= deadline {
+            record_connection_failure(
+                state,
+                if request_number == 1 {
+                    ConnectionPhase::TlsOrFirstHead
+                } else {
+                    ConnectionPhase::RequestHead
+                },
+                accepted_at,
+                deadline,
+                None,
+                None,
+            );
             break;
         }
         if request_number > 1 {
@@ -733,7 +896,38 @@ fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant
             reader.get_mut().sock.set_deadline(idle_deadline);
         }
         match reader.fill_buf() {
-            Ok([]) | Err(_) => break,
+            Ok([]) => {
+                quiet_idle_close = request_number > 1 && Instant::now() < deadline;
+                break;
+            }
+            Err(error) => {
+                quiet_idle_close = request_number > 1
+                    && Instant::now() < deadline
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                    );
+                if !quiet_idle_close {
+                    record_connection_failure(
+                        state,
+                        if request_number == 1 {
+                            ConnectionPhase::TlsOrFirstHead
+                        } else {
+                            ConnectionPhase::RequestHead
+                        },
+                        accepted_at,
+                        deadline,
+                        Some(error.kind()),
+                        None,
+                    );
+                }
+                break;
+            }
             Ok(_) => {}
         }
         let request = read_request_head(&mut reader);
@@ -742,7 +936,28 @@ fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant
             Ok(request) => request,
             Err(failure) => {
                 log_request_failure(&failure);
-                let _ = write_http_response(reader.get_mut(), failure.response(), deadline, 0);
+                if failure.io_kind.is_some() || Instant::now() >= deadline {
+                    record_connection_failure(
+                        state,
+                        ConnectionPhase::RequestHead,
+                        accepted_at,
+                        deadline,
+                        failure.io_kind,
+                        Some(failure.status),
+                    );
+                }
+                if let Err(error) =
+                    write_http_response(reader.get_mut(), failure.response(), deadline, 0)
+                {
+                    record_connection_failure(
+                        state,
+                        ConnectionPhase::ResponseWrite,
+                        accepted_at,
+                        deadline,
+                        Some(error.kind()),
+                        Some(failure.status),
+                    );
+                }
                 break;
             }
         };
@@ -751,7 +966,28 @@ fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant
             Ok(response) => response,
             Err(failure) => {
                 log_request_failure(&failure);
-                let _ = write_http_response(reader.get_mut(), failure.response(), deadline, 0);
+                if failure.io_kind.is_some() || Instant::now() >= deadline {
+                    record_connection_failure(
+                        state,
+                        ConnectionPhase::Dispatch,
+                        accepted_at,
+                        deadline,
+                        failure.io_kind,
+                        Some(failure.status),
+                    );
+                }
+                if let Err(error) =
+                    write_http_response(reader.get_mut(), failure.response(), deadline, 0)
+                {
+                    record_connection_failure(
+                        state,
+                        ConnectionPhase::ResponseWrite,
+                        accepted_at,
+                        deadline,
+                        Some(error.kind()),
+                        Some(failure.status),
+                    );
+                }
                 break;
             }
         };
@@ -763,15 +999,38 @@ fn handle_connection(stream: TcpStream, state: &RegistryState, deadline: Instant
         } else {
             0
         };
-        if write_http_response(reader.get_mut(), response, deadline, remaining_requests).is_err()
-            || remaining_requests == 0
+        let response_status = response.status;
+        if let Err(error) =
+            write_http_response(reader.get_mut(), response, deadline, remaining_requests)
         {
+            record_connection_failure(
+                state,
+                ConnectionPhase::ResponseWrite,
+                accepted_at,
+                deadline,
+                Some(error.kind()),
+                Some(response_status),
+            );
+            break;
+        }
+        if remaining_requests == 0 {
             break;
         }
     }
     reader.get_mut().sock.set_deadline(deadline);
     reader.get_mut().conn.send_close_notify();
-    let _ = reader.get_mut().flush();
+    if let Err(error) = reader.get_mut().flush() {
+        if !quiet_idle_close || Instant::now() >= deadline {
+            record_connection_failure(
+                state,
+                ConnectionPhase::CloseFlush,
+                accepted_at,
+                deadline,
+                Some(error.kind()),
+                None,
+            );
+        }
+    }
 }
 
 fn log_request_failure(failure: &RequestFailure) {
@@ -1052,9 +1311,9 @@ fn read_crlf_line(
 ) -> Result<Vec<u8>, RequestFailure> {
     let mut line = Vec::with_capacity(128);
     loop {
-        let available = reader
-            .fill_buf()
-            .map_err(|_| RequestFailure::public(400, "failed to read request\n"))?;
+        let available = reader.fill_buf().map_err(|error| {
+            RequestFailure::public(400, "failed to read request\n").with_io_kind(error.kind())
+        })?;
         if available.is_empty() {
             return Err(RequestFailure::public(400, "truncated request headers\n"));
         }
@@ -1261,15 +1520,27 @@ fn publish_request(
     let mut hasher = Sha256::new();
     let mut remaining = request.content_length;
     let mut buffer = [0u8; 64 * 1024];
+    #[cfg(test)]
+    {
+        let gate = state
+            .publish_body_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(gate) = gate {
+            gate.wait(deadline);
+        }
+    }
     while remaining > 0 {
         ensure_request_deadline(deadline)?;
         let read_len = remaining.min(buffer.len() as u64) as usize;
         let count = reader.read(&mut buffer[..read_len]).map_err(|err| {
-            if err.kind() == io::ErrorKind::TimedOut {
+            let failure = if err.kind() == io::ErrorKind::TimedOut {
                 RequestFailure::public(408, "request timed out\n")
             } else {
                 RequestFailure::public(400, "failed to read package body\n")
-            }
+            };
+            failure.with_io_kind(err.kind())
         })?;
         if count == 0 {
             return Err(RequestFailure::public(400, "truncated package body\n"));
@@ -1306,6 +1577,7 @@ fn publish_request(
             RequestFailure {
                 status: 400,
                 public_message: "invalid package archive\n",
+                io_kind: None,
                 internal: Some(format!(
                     "package validation rejected {package_name}@{version}: {err}"
                 )),
@@ -4215,6 +4487,8 @@ mod tests {
     use ureq::rustls::{ClientConfig, RootCertStore};
 
     use super::native_test_harness::{compile_harness, run_bounded, RUN_LIMITS, RUN_TIMEOUT};
+
+    mod connection_diagnostics;
 
     const TEST_HTTP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
     const MAX_TEST_HTTP_RESPONSE_HEADER_BYTES: usize = MAX_REQUEST_HEADER_BYTES;
