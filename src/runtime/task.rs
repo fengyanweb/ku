@@ -18,7 +18,11 @@ use crate::{
     value::Value,
 };
 
+mod cancel_batch;
 mod cancellation;
+use cancel_batch::{CancelBatchPoll, TaskCancelBatch};
+#[cfg(test)]
+mod cancel_batch_tests;
 pub(crate) use cancellation::{
     current_cleanup_context, current_execution_termination, ensure_task_operations_allowed,
     set_execution_termination, CancellationContext, CleanupGuard, ExecutionTerminationGuard,
@@ -1027,36 +1031,24 @@ impl TaskRuntime {
         context: CancellationContext,
     ) -> KuResult<()> {
         let _cleanup = CleanupGuard::enter(context);
-        let context = current_cleanup_context().expect("cleanup guard installs its context");
-        for handle in handles {
-            handle.request_cancel_with(context);
-        }
+        let mut batch = TaskCancelBatch::prepare(handles, context);
         loop {
-            let mut pending = 0;
-            let mut first = None;
-            for handle in handles.iter().filter(|handle| !handle.state.is_terminal()) {
-                pending += 1;
-                first.get_or_insert(handle);
-            }
-            let Some(first) = first else {
-                return Ok(());
-            };
             let now = Instant::now();
-            if now >= context.cleanup_deadline {
-                // One timeout observation per batch invocation, and the number
-                // of still-unfinished handles, not one fresh budget per child.
-                self.record_cleanup_timeout();
-                self.inner
-                    .cleanup_unfinished_tasks
-                    .fetch_add(pending, Ordering::Relaxed);
-                return Err(KuError::termination(context, Span::default()));
+            match batch.poll(self, now) {
+                CancelBatchPoll::TerminalObserved => return Ok(()),
+                CancelBatchPoll::TimedOut(context) => {
+                    return Err(KuError::termination(context, Span::default()));
+                }
+                CancelBatchPoll::Pending { first_index, .. } => {
+                    batch.handles()[first_index].state.wait(
+                        batch
+                            .context()
+                            .cleanup_deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(2)),
+                    )?;
+                }
             }
-            first.state.wait(
-                context
-                    .cleanup_deadline
-                    .saturating_duration_since(now)
-                    .min(Duration::from_millis(2)),
-            )?;
         }
     }
 
