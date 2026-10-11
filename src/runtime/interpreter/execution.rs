@@ -225,6 +225,30 @@ struct ArgumentFrame<'a> {
     staged: Vec<Value>,
 }
 
+#[derive(Clone, Copy)]
+enum LoopState<'a> {
+    While {
+        condition: &'a Expr,
+        body: &'a [Stmt],
+        span: &'a Span,
+    },
+    ForInt {
+        name: &'a str,
+        body: &'a [Stmt],
+        span: &'a Span,
+        current: i64,
+        limit: i64,
+    },
+}
+
+impl LoopState<'_> {
+    fn span(self) -> Span {
+        match self {
+            Self::While { span, .. } | Self::ForInt { span, .. } => *span,
+        }
+    }
+}
+
 enum Work<'a> {
     Block {
         body: &'a [Stmt],
@@ -238,6 +262,21 @@ enum Work<'a> {
     BinaryRight(BinaryOp, Span),
     Bool(Span),
     Choose(&'a [Stmt], &'a [Stmt], Span),
+    WhileCheck {
+        condition: &'a Expr,
+        body: &'a [Stmt],
+        span: &'a Span,
+    },
+    ForInit {
+        name: &'a str,
+        body: &'a [Stmt],
+        span: &'a Span,
+    },
+    LoopIteration(LoopState<'a>),
+    LoopBoundary {
+        state: LoopState<'a>,
+        owner_call: usize,
+    },
     Bind(&'a str, bool, bool, Span),
     Discard,
     Return,
@@ -403,7 +442,8 @@ fn preflight_tree_mode(
             }
             Syntax::Statement(stmt) => {
                 if local_self
-                    && matches!(stmt, Stmt::VarDecl { name, .. } | Stmt::Assign { name, .. }
+                    && matches!(stmt, Stmt::VarDecl { name, .. }
+                        | Stmt::Assign { name, .. } | Stmt::For { name, .. }
                         if entry.is_some_and(|function| name == &function.name))
                 {
                     return Err(unsupported(stmt_span(stmt)));
@@ -445,6 +485,28 @@ fn preflight_tree_mode(
                         }
                         push(&mut pending, Syntax::Expression(condition));
                     }
+                    Stmt::While {
+                        condition,
+                        body,
+                        span,
+                    }
+                    | Stmt::For {
+                        iterable: condition,
+                        body,
+                        span,
+                        ..
+                    } => {
+                        let count = body
+                            .len()
+                            .checked_add(1)
+                            .ok_or_else(|| unsupported(*span))?;
+                        reserve(&mut pending, count, *span)?;
+                        for stmt in body.iter().rev() {
+                            push(&mut pending, Syntax::Statement(stmt));
+                        }
+                        push(&mut pending, Syntax::Expression(condition));
+                    }
+                    Stmt::Break { .. } | Stmt::Continue { .. } => {}
                     _ => return Err(unsupported(stmt_span(stmt))),
                 }
             }
@@ -697,6 +759,91 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
+    fn enter_loop_iteration(&mut self, state: LoopState<'a>) -> KuResult<()> {
+        let span = state.span();
+        let (body, scope_span) = match state {
+            LoopState::While { body, .. } => {
+                (body, body.first().map(stmt_span).unwrap_or_default())
+            }
+            LoopState::ForInt { body, .. } => (body, span),
+        };
+        // No scope or iterator effect precedes admission of every continuation.
+        // Binding failure still has its real ScopeExit and LoopBoundary live.
+        reserve(&mut self.work, 3, span)?;
+        push(
+            &mut self.work,
+            Work::LoopBoundary {
+                state,
+                owner_call: self.calls.len(),
+            },
+        );
+        push(
+            &mut self.work,
+            Work::ScopeExit {
+                span: scope_span,
+                value_base: self.values.len(),
+                fallthrough: ScopeFallthrough::Continue,
+            },
+        );
+        self.frame().env.push_scope();
+        if let LoopState::ForInt { name, current, .. } = state {
+            // exec_for_iteration gives the mutable iterator and its body one
+            // shared scope, even when the iterator shadows an outer binding.
+            self.frame()
+                .env
+                .define_owned(name.to_string(), Value::Int(current), true, span)?;
+        }
+        push(&mut self.work, Work::Block { body, next: 0 });
+        Ok(())
+    }
+
+    fn resume_loop(&mut self, state: LoopState<'a>) -> KuResult<()> {
+        match state {
+            LoopState::While {
+                condition,
+                body,
+                span,
+            } => {
+                reserve(&mut self.work, 2, *span)?;
+                push(
+                    &mut self.work,
+                    Work::WhileCheck {
+                        condition,
+                        body,
+                        span,
+                    },
+                );
+                push(&mut self.work, Work::Eval(condition));
+            }
+            LoopState::ForInt {
+                name,
+                body,
+                span,
+                current,
+                limit,
+            } => {
+                // Only 0 <= current < limit <= i64::MAX is admitted. The
+                // iterator binding may be assigned in the body; advancement
+                // follows this private counter, as in the original evaluator.
+                let current = current + 1;
+                if current < limit {
+                    reserve(&mut self.work, 1, *span)?;
+                    push(
+                        &mut self.work,
+                        Work::LoopIteration(LoopState::ForInt {
+                            name,
+                            body,
+                            span,
+                            current,
+                            limit,
+                        }),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn step(&mut self, step: Work<'a>) -> KuResult<()> {
         match step {
             Work::Block { body, next } => {
@@ -714,7 +861,9 @@ impl<'a> Machine<'a> {
             }
             Work::Statement(stmt) => {
                 self.metrics.steps += 1;
-                reserve(&mut self.work, 2, stmt_span(stmt))?;
+                if !matches!(stmt, Stmt::Break { .. } | Stmt::Continue { .. }) {
+                    reserve(&mut self.work, 2, stmt_span(stmt))?;
+                }
                 match stmt {
                     Stmt::VarDecl {
                         name,
@@ -748,6 +897,32 @@ impl<'a> Machine<'a> {
                         );
                         push(&mut self.work, Work::Eval(condition));
                     }
+                    Stmt::While {
+                        condition,
+                        body,
+                        span,
+                    } => {
+                        push(
+                            &mut self.work,
+                            Work::WhileCheck {
+                                condition,
+                                body,
+                                span,
+                            },
+                        );
+                        push(&mut self.work, Work::Eval(condition));
+                    }
+                    Stmt::For {
+                        name,
+                        iterable,
+                        body,
+                        span,
+                    } => {
+                        push(&mut self.work, Work::ForInit { name, body, span });
+                        push(&mut self.work, Work::Eval(iterable));
+                    }
+                    Stmt::Break { .. } => self.pending = Some(Ok(Flow::Break(None))),
+                    Stmt::Continue { .. } => self.pending = Some(Ok(Flow::LoopContinue(None))),
                     Stmt::Return { value, span } => {
                         push(&mut self.work, Work::Return);
                         if let Some(value) = value {
@@ -884,6 +1059,60 @@ impl<'a> Machine<'a> {
                     },
                 );
             }
+            Work::WhileCheck {
+                condition,
+                body,
+                span,
+            } => {
+                if expect_bool_condition(self.value(), *span)? {
+                    reserve(&mut self.work, 1, *span)?;
+                    push(
+                        &mut self.work,
+                        Work::LoopIteration(LoopState::While {
+                            condition,
+                            body,
+                            span,
+                        }),
+                    );
+                }
+            }
+            Work::ForInit { name, body, span } => {
+                let limit = match self.value() {
+                    Value::Int(limit) if limit >= 0 => limit,
+                    Value::Int(_) => {
+                        return Err(KuError::runtime(
+                            "for int iterator expects a non-negative int",
+                            *span,
+                        ));
+                    }
+                    other => {
+                        return Err(KuError::runtime(
+                            format!(
+                                "type error: for expects array or int but got {}",
+                                other.type_name()
+                            ),
+                            *span,
+                        ));
+                    }
+                };
+                if limit > 0 {
+                    reserve(&mut self.work, 1, *span)?;
+                    push(
+                        &mut self.work,
+                        Work::LoopIteration(LoopState::ForInt {
+                            name,
+                            body,
+                            span,
+                            current: 0,
+                            limit,
+                        }),
+                    );
+                }
+            }
+            Work::LoopIteration(state) => {
+                self.metrics.steps += 1;
+                self.enter_loop_iteration(state)?;
+            }
             Work::Bind(name, mutable, declare, span) => {
                 let value = self.value();
                 let env = &mut self.frame().env;
@@ -989,7 +1218,10 @@ impl<'a> Machine<'a> {
                     result?;
                 }
             }
-            Work::ScopeExit { .. } | Work::CallExit | Work::ArgumentsExit(_) => {
+            Work::ScopeExit { .. }
+            | Work::CallExit
+            | Work::ArgumentsExit(_)
+            | Work::LoopBoundary { .. } => {
                 unreachable!("exit markers run through resource arbitration");
             }
         }
@@ -998,6 +1230,21 @@ impl<'a> Machine<'a> {
 
     fn finish_boundary(&mut self, boundary: Work<'a>, hooks: &mut impl ExecutionHooks) {
         match boundary {
+            Work::LoopBoundary { state, owner_call } => {
+                // ScopeExit has already settled this iteration. CallExit must
+                // normalize a callee's escaped loop control before it can reach
+                // any caller loop, and the owning frame must still be current.
+                assert_eq!(owner_call, self.calls.len(), "loop owns its call frame");
+                match self.pending.take() {
+                    None | Some(Ok(Flow::Continue | Flow::LoopContinue(_))) => {
+                        if let Err(error) = self.resume_loop(state) {
+                            self.pending = Some(Err(error));
+                        }
+                    }
+                    Some(Ok(Flow::Break(_))) => {}
+                    Some(result) => self.pending = Some(result),
+                }
+            }
             Work::ScopeExit {
                 span,
                 value_base,
@@ -1122,7 +1369,10 @@ impl<'a> Machine<'a> {
         while let Some(step) = self.work.pop() {
             let boundary = matches!(
                 &step,
-                Work::ScopeExit { .. } | Work::CallExit | Work::ArgumentsExit(_)
+                Work::ScopeExit { .. }
+                    | Work::CallExit
+                    | Work::ArgumentsExit(_)
+                    | Work::LoopBoundary { .. }
             );
             if self.pending.is_some() {
                 if boundary {
@@ -1155,6 +1405,7 @@ impl<'a> Machine<'a> {
                 Work::Statement(stmt) => hooks.tick(stmt_span(stmt)),
                 Work::Eval(expr) => hooks.tick(expr.span),
                 Work::SelfCallee(span) => hooks.tick(*span),
+                Work::LoopIteration(state) => hooks.tick(state.span()),
                 _ => Ok(()),
             };
             if let Err(error) = poll {

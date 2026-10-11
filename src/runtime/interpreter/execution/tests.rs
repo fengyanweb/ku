@@ -464,7 +464,7 @@ fn production_bare_global_function_values_keep_the_existing_callable_behavior() 
 }
 
 #[test]
-fn production_unmigrated_loop_keeps_its_existing_legal_behavior() {
+fn production_scalar_loop_selects_flat_execution_and_keeps_its_legal_behavior() {
     let mut interpreter = production_interpreter(
         r#"
 fn Entry(): int {
@@ -475,11 +475,321 @@ fn Entry(): int {
 "#,
     );
     let entry = interpreter.functions.get("Entry").unwrap().clone();
+    assert_eq!(
+        try_execute(&mut interpreter, &entry, &[], 0)
+            .expect("the complete scalar while tree must select the flat driver")
+            .unwrap()
+            .into_call_value(Span::default(), "function")
+            .unwrap(),
+        Value::Int(3)
+    );
+    assert_eq!(
+        interpreter
+            .call_function("Entry", vec![], Span::default(), 0)
+            .unwrap(),
+        Value::Int(3)
+    );
+    assert_eq!(interpreter.call_depth, 0);
+}
+
+#[test]
+fn production_recursive_while_and_for_preserve_512_call_boundary_on_real_workers() {
+    let (_, test_name) = concat!(
+        module_path!(),
+        "::production_recursive_while_and_for_preserve_512_call_boundary_on_real_workers"
+    )
+    .split_once("::")
+    .expect("worker regression must have a module-qualified test name");
+    const CHILD: &str = "KU_EXECUTION_LOOP_STACK_SAFETY_CHILD";
+    let completed = format!("loop worker regression completed: {test_name}");
+    if std::env::var(CHILD).as_deref() != Ok(test_name) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, test_name);
+        let output = finally_bounded_process::run_bounded(
+            &mut command,
+            Duration::from_secs(15),
+            finally_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+        )
+        .expect("recursive loop regression must not hang its supervisor");
+        assert!(
+            output.status.success(),
+            "worker child must exit normally: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line == completed),
+            "zero selected tests or an incomplete matrix cannot pass\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    assert_eq!(MAX_CALL_DEPTH, 512);
+    for source in [
+        r#"
+fn Descend(n: int): int {
+    while (n > 0) { return Descend(n - 1) }
+    return 0
+}
+"#,
+        r#"
+fn Descend(n: int): int {
+    if (n <= 0) { return 0 }
+    for index in 1 { return Descend(n - 1) }
+    return 0
+}
+"#,
+    ] {
+        for argument in [511, 512] {
+            let runtime = TaskRuntime::new();
+            let mut interpreter = production_interpreter(source);
+            interpreter.task_runtime = Some(runtime.clone());
+            interpreter.async_execution = true;
+            let parent_id = thread::current().id();
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            let task = runtime.spawn(move || {
+                let worker = thread::current();
+                let _ = ready_tx.send((worker.id(), worker.name().unwrap_or("").to_owned()));
+                let result = interpreter.call_function(
+                    "Descend",
+                    vec![Value::Int(argument)],
+                    Span::default(),
+                    0,
+                );
+                let _ = result_tx.send((result, interpreter.call_depth));
+                Ok(Value::Null)
+            });
+            // Channel waits keep the caller from helping this job on its own
+            // stack. Abort remains a failing bounded child-process outcome.
+            let ready = ready_rx.recv_timeout(Duration::from_secs(3));
+            let outcome = result_rx.recv_timeout(Duration::from_secs(3));
+            let admission_error = task.as_ref().err().cloned();
+            drop(task);
+            let drained = runtime.cancel_all_and_wait(Duration::from_secs(2));
+            let snapshot = runtime.snapshot();
+            drained.unwrap();
+            let snapshot = snapshot.unwrap();
+            assert!(admission_error.is_none(), "{admission_error:?}");
+            let (worker_id, worker_name) = ready.expect("a real worker must report entry");
+            assert_ne!(worker_id, parent_id);
+            assert!(worker_name.starts_with("ku-task-"), "{worker_name}");
+            let (result, depth) = outcome.expect("the real worker must finish within the bound");
+            if argument == 511 {
+                assert_eq!(result.unwrap(), Value::Int(0));
+            } else {
+                assert_depth_error(result);
+            }
+            assert_eq!(depth, 0);
+            assert_eq!(snapshot.active_tasks, 0);
+            assert_eq!(snapshot.queued_tasks, 0);
+            assert_eq!(snapshot.queued_blocking_jobs, 0);
+            assert_eq!(snapshot.running_blocking_jobs, 0);
+        }
+    }
+    eprintln!("{completed}");
+}
+
+#[test]
+fn production_nested_loop_controls_iterator_assignment_and_return_keep_scope_semantics() {
+    for (source, expected) in [
+        (
+            r#"
+fn Entry(): int {
+    total = 0
+    for outer in 3 {
+        for inner in 5 {
+            if (inner == 1) { continue }
+            if (inner == 3) { break }
+            inner = inner + 10
+            total = total + outer * 10 + inner
+        }
+        current = 0
+        while (current < 3) {
+            current = current + 1
+            if (current == 1) { continue }
+            total = total + 100
+            break
+        }
+    }
+    return total
+}
+"#,
+            426,
+        ),
+        (
+            r#"
+fn Entry(): int {
+    for outer in 3 { while (true) { return outer + 17 } }
+    return 0
+}
+"#,
+            17,
+        ),
+    ] {
+        let mut interpreter = production_interpreter(source);
+        let entry = interpreter.functions.get("Entry").unwrap().clone();
+        assert_eq!(
+            try_execute(&mut interpreter, &entry, &[], 0)
+                .expect("all nested loops must belong to the same selected tree")
+                .unwrap()
+                .into_call_value(Span::default(), "function")
+                .unwrap(),
+            Value::Int(expected)
+        );
+        assert_eq!(
+            interpreter
+                .call_function("Entry", vec![], Span::default(), 0)
+                .unwrap(),
+            Value::Int(expected)
+        );
+        assert_eq!(interpreter.call_depth, 0);
+    }
+}
+
+#[test]
+fn production_loop_results_and_ticks_match_the_same_ast_in_the_original_engine() {
+    for loop_kind in ["while", "for"] {
+        for (exit, argument, expected, message) in [
+            ("", Value::Int(0), Some(Value::Int(0)), None),
+            ("", Value::Int(1), Some(Value::Int(1)), None),
+            ("continue", Value::Int(3), Some(Value::Int(3)), None),
+            ("break", Value::Int(3), Some(Value::Int(1)), None),
+            (
+                "return value + 100",
+                Value::Int(3),
+                Some(Value::Int(101)),
+                None,
+            ),
+            (
+                "return 1 / 0",
+                Value::Int(1),
+                None,
+                Some("division by zero"),
+            ),
+        ] {
+            let loop_source = if loop_kind == "while" {
+                format!(
+                    "while (current < n) {{ current = current + 1\nvalue = Leaf(value)\n{exit} }}"
+                )
+            } else {
+                format!("for index in n {{ value = Leaf(value)\n{exit} }}")
+            };
+            let source = format!(
+                "fn Leaf(n: int): int {{ return n + 1 }}\nfn Entry(n: int): int {{\nvalue = 0\ncurrent = 0\n{loop_source}\nreturn value\n}}"
+            );
+            let mut selected = production_interpreter(&source);
+            let entry = selected.functions.get("Entry").unwrap().clone();
+            let result = try_execute(&mut selected, &entry, std::slice::from_ref(&argument), 0)
+                .expect("the complete scalar loop tree must be admitted")
+                .and_then(|flow| flow.into_call_value(Span::default(), "function"));
+            let mut original = production_interpreter(&source);
+            // Direct entry runs this identical top-level loop AST in the old
+            // evaluator. Its Leaf calls do not recurse or contain any loops.
+            let old_result = original
+                .call_function_direct_flow(entry, vec![argument], Span::default(), 0)
+                .and_then(|flow| flow.into_call_value(Span::default(), "function"));
+            assert_eq!(result, old_result, "{loop_kind}: {exit}");
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap(), expected, "{loop_kind}: {exit}");
+            } else {
+                assert_eq!(result.unwrap_err().message, message.unwrap());
+            }
+            assert_eq!(selected.steps, original.steps, "{loop_kind}: {exit}");
+            assert_eq!(selected.call_depth, 0);
+            assert_eq!(original.call_depth, 0);
+        }
+    }
+
+    // A checker-valid int parameter can still receive a scalar of another
+    // type at this runtime API boundary; retain the existing runtime errors.
+    let source = "fn Entry(n: int): int { for index in n {} return 0 }";
+    for (argument, message) in [
+        (
+            Value::Int(-1),
+            "for int iterator expects a non-negative int".to_owned(),
+        ),
+        (
+            Value::Bool(true),
+            "type error: for expects array or int but got bool".to_owned(),
+        ),
+        (
+            Value::Float(1.0),
+            "type error: for expects array or int but got float".to_owned(),
+        ),
+        (
+            Value::Null,
+            "type error: for expects array or int but got null".to_owned(),
+        ),
+    ] {
+        let mut selected = production_interpreter(source);
+        let entry = selected.functions.get("Entry").unwrap().clone();
+        let error = try_execute(&mut selected, &entry, std::slice::from_ref(&argument), 0)
+            .expect("the scalar iterable must use runtime type arbitration")
+            .err()
+            .expect("invalid scalar iterable must reject");
+        let mut original = production_interpreter(source);
+        let old_error = original
+            .call_function_direct_flow(entry, vec![argument], Span::default(), 0)
+            .err()
+            .expect("the original runtime must reject the same iterable");
+        assert_eq!(error, old_error);
+        assert_eq!(error.message, message);
+        assert_eq!(selected.steps, original.steps);
+        assert_eq!(selected.call_depth, 0);
+        assert_eq!(original.call_depth, 0);
+    }
+}
+
+#[test]
+fn production_owned_iterable_and_for_self_shadow_remain_legal_in_the_original_engine() {
+    let mut interpreter = production_interpreter(
+        r#"
+fn Entry(): int {
+    total = 0
+    for item in [1, 2, 3] { total = total + item }
+    return total
+}
+"#,
+    );
+    let entry = interpreter.functions.get("Entry").unwrap().clone();
     assert!(try_execute(&mut interpreter, &entry, &[], 0).is_none());
     assert_eq!(interpreter.steps, 0);
     assert_eq!(
         interpreter
             .call_function("Entry", vec![], Span::default(), 0)
+            .unwrap(),
+        Value::Int(6)
+    );
+
+    let mut interpreter = production_interpreter(
+        r#"
+fn Make() {
+    fn local(n: int): int {
+        total = 0
+        for local in n { total = total + 1 }
+        return total
+    }
+    return local.clone()
+}
+"#,
+    );
+    let value = interpreter
+        .call_function("Make", vec![], Span::default(), 0)
+        .unwrap();
+    assert!(
+        try_execute_function_value(&mut interpreter, &function_value_call(&value, 3, 0)).is_none()
+    );
+    assert_eq!(
+        interpreter
+            .call_function_value(function_value_call(&value, 3, 0))
             .unwrap(),
         Value::Int(3)
     );
@@ -823,6 +1133,104 @@ fn Make() {{
                 }
                 assert_eq!(interpreter.call_depth, 0);
                 assert!(interpreter.termination.is_none());
+            }
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let outcome = task.await_result();
+    drop(task);
+    let drained = runtime.cancel_all_and_wait(Duration::from_secs(2));
+    let snapshot = runtime.snapshot().unwrap();
+    drained.unwrap();
+    assert_eq!(snapshot.active_tasks, 0);
+    assert_eq!(snapshot.queued_tasks, 0);
+    assert_eq!(outcome.unwrap(), Value::Null);
+}
+
+#[test]
+fn production_expired_loop_controls_stop_following_capture_writes_at_original_deadline() {
+    let runtime = TaskRuntime::new();
+    let task = runtime
+        .spawn(|| {
+            assert_ne!(crate::runtime::task::current_task_id(), 0);
+            let original = RuntimeTermination {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("test clock must support a past instant"),
+            };
+            let assert_expired = |error: KuError| {
+                assert_eq!(error.domain.as_deref(), Some("task"));
+                assert_eq!(error.code.as_deref(), Some("shutdown_timeout"));
+                assert_eq!(error.scope_cleanup(), Some(original));
+                assert!(error.runtime_termination().is_none());
+            };
+            for loop_kind in ["while", "for"] {
+                for control in ["break", "continue"] {
+                    let body =
+                        format!("current = current + 1\npayload = true\ncaptured = 1\n{control}");
+                    let loop_source = if loop_kind == "while" {
+                        // Even a broken scope arbiter cannot turn this fixture
+                        // into an infinite continue loop: current advances first.
+                        format!("while (current < n) {{ {body} }}")
+                    } else {
+                        format!("for index in n {{ {body} }}")
+                    };
+                    let source = format!(
+                        r#"
+fn Make() {{
+    captured = 0
+    fn local(n: int): int {{
+        current = 0
+        {loop_source}
+        captured = 2
+        return captured
+    }}
+    return local.clone()
+}}
+"#,
+                    );
+                    let mut interpreter = production_interpreter(&source);
+                    let value = interpreter.call_function("Make", vec![], Span::default(), 0)?;
+                    let call = function_value_call(&value, 1, 0);
+                    assert!(call.captures.is_stable_scalar_binding("captured"));
+                    {
+                        let _execution = ExecutionTerminationGuard::enter();
+                        let _cleanup = CleanupGuard::enter(original);
+                        let error = match try_execute_function_value(&mut interpreter, &call)
+                            .expect("the complete scalar capture-writing loop must be admitted")
+                        {
+                            Err(error) => error,
+                            Ok(_) => {
+                                panic!("iteration scope expiry must reject {loop_kind} {control}")
+                            }
+                        };
+                        assert_expired(error);
+                        // The nonempty iteration's capture effect occurred,
+                        // but its scope failure precedes loop control handling
+                        // and therefore prevents the later captured = 2.
+                        assert_eq!(
+                            call.captures.get("captured", Span::default())?,
+                            Value::Int(1)
+                        );
+                    }
+                    assert_eq!(interpreter.call_depth, 0);
+                    assert!(interpreter.termination.is_none());
+                    let mut shared = call.captures.clone();
+                    shared.assign_owned("captured", Value::Int(0), Span::default())?;
+                    {
+                        let _execution = ExecutionTerminationGuard::enter();
+                        let _cleanup = CleanupGuard::enter(original);
+                        assert_expired(
+                            interpreter
+                                .call_function_value(call)
+                                .expect_err("public loop call must retain the expired scope error"),
+                        );
+                        assert_eq!(shared.get("captured", Span::default())?, Value::Int(1));
+                    }
+                    assert_eq!(interpreter.call_depth, 0);
+                    assert!(interpreter.termination.is_none());
+                }
             }
             Ok(Value::Null)
         })
