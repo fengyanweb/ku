@@ -27,6 +27,8 @@ mod cancel_batch_tests;
 mod cleanup_panic_tests;
 #[cfg(test)]
 mod help_panic_tests;
+#[cfg(test)]
+mod submission_panic_tests;
 pub(crate) use cancellation::{
     current_cleanup_context, current_execution_termination, ensure_task_operations_allowed,
     set_execution_termination, CancellationContext, CleanupGuard, ExecutionTerminationGuard,
@@ -155,6 +157,69 @@ struct TaskRuntimeInner {
     blocking_queue_limit: usize,
     task_workers: AtomicUsize,
     blocking_workers: AtomicUsize,
+}
+
+enum TaskRegistration {
+    Ready,
+    Closing,
+    Poisoned,
+}
+
+// Producer accounting before a queue node is accepted. No user payload or
+// logical owner is retained, and rollback never fabricates worker completion.
+struct TaskSubmissionReservation<'a> {
+    runtime: &'a TaskRuntime,
+    id: i64,
+    active_owned: bool,
+    queued_reserved: bool,
+}
+
+impl<'a> TaskSubmissionReservation<'a> {
+    fn new(runtime: &'a TaskRuntime, id: i64) -> Self {
+        Self {
+            runtime,
+            id,
+            active_owned: true,
+            queued_reserved: false,
+        }
+    }
+
+    fn reserve_queue(&mut self) {
+        self.queued_reserved = true;
+        self.runtime
+            .inner
+            .queued_tasks
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn commit_to_worker(&mut self) {
+        self.active_owned = false;
+        self.queued_reserved = false;
+    }
+
+    fn rollback(&mut self) {
+        // Relinquish each responsibility first; explicit rollback and Drop
+        // cannot decrement it twice even when a later stage unwinds.
+        if std::mem::take(&mut self.queued_reserved) {
+            self.runtime
+                .inner
+                .queued_tasks
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        if std::mem::take(&mut self.active_owned) {
+            self.runtime
+                .inner
+                .active_tasks
+                .fetch_sub(1, Ordering::AcqRel);
+            self.runtime.remove_state(self.id);
+        }
+    }
+}
+
+impl Drop for TaskSubmissionReservation<'_> {
+    fn drop(&mut self) {
+        self.rollback();
+    }
 }
 
 pub struct TaskHandle {
@@ -550,98 +615,123 @@ impl TaskRuntime {
             );
             return Ok(handle);
         }
-        if let Ok(mut states) = self.inner.states.lock() {
-            if self.inner.closing.load(Ordering::Acquire) {
-                self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-                self.inner
-                    .rejected_task_internal
-                    .fetch_add(1, Ordering::Relaxed);
-                state.complete(
-                    id,
-                    Ok(task_error(
-                        "runtime_stopped",
-                        "async task runtime is closing",
-                    )),
-                );
-                return Ok(handle);
+        let mut reservation = TaskSubmissionReservation::new(self, id);
+        // The sole producer handle stays outside this unwind boundary. It is
+        // dropped after rollback under the already established cleanup context.
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let registration = {
+                match self.inner.states.lock() {
+                    Ok(mut states) => {
+                        if self.inner.closing.load(Ordering::Acquire) {
+                            TaskRegistration::Closing
+                        } else {
+                            states.insert(id, Arc::downgrade(&state));
+                            TaskRegistration::Ready
+                        }
+                    }
+                    Err(_) => TaskRegistration::Poisoned,
+                }
+            };
+            // No rollback, completion, flush or user cleanup under the registry lock.
+            match registration {
+                TaskRegistration::Ready => {}
+                TaskRegistration::Closing => {
+                    reservation.rollback();
+                    self.inner
+                        .rejected_task_internal
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.complete(
+                        id,
+                        Ok(task_error(
+                            "runtime_stopped",
+                            "async task runtime is closing",
+                        )),
+                    );
+                    return;
+                }
+                TaskRegistration::Poisoned => {
+                    reservation.rollback();
+                    self.inner
+                        .rejected_task_internal
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.complete(
+                        id,
+                        Err(KuError::runtime(
+                            "async task registry is poisoned",
+                            Span::default(),
+                        )),
+                    );
+                    return;
+                }
             }
-            states.insert(id, Arc::downgrade(&state));
-        } else {
-            self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-            self.inner
-                .rejected_task_internal
-                .fetch_add(1, Ordering::Relaxed);
-            state.complete(
+            let run = match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(run) => run,
+                Err(_) => {
+                    reservation.rollback();
+                    self.inner
+                        .rejected_task_internal
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.complete(
+                        id,
+                        Ok(task_error(
+                            "spawn_panic",
+                            "async task construction panicked",
+                        )),
+                    );
+                    return;
+                }
+            };
+            state.install_run(Box::new(run));
+            reservation.reserve_queue();
+            match self.inner.task_tx.try_send(TaskJob {
                 id,
-                Err(KuError::runtime(
-                    "async task registry is poisoned",
-                    Span::default(),
-                )),
-            );
-            return Ok(handle);
-        }
-        let run = match catch_unwind(AssertUnwindSafe(build)) {
-            Ok(run) => run,
-            Err(_) => {
-                self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-                self.inner
-                    .rejected_task_internal
-                    .fetch_add(1, Ordering::Relaxed);
-                self.remove_state(id);
-                state.complete(
-                    id,
-                    Ok(task_error(
-                        "spawn_panic",
-                        "async task construction panicked",
-                    )),
-                );
-                return Ok(handle);
+                state: Arc::clone(&state),
+            }) {
+                Ok(()) => {
+                    // A worker may already own this accepted node. Transfer the
+                    // accounting responsibility before any subsequent operation.
+                    reservation.commit_to_worker();
+                    self.inner
+                        .accepted_submissions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(TrySendError::Full(_)) => {
+                    self.inner
+                        .rejected_task_queue
+                        .fetch_add(1, Ordering::Relaxed);
+                    reservation.rollback();
+                    state.reject_queued(
+                        id,
+                        Ok(task_error(
+                            "queue_full",
+                            format!(
+                                "async task queue limit {} reached",
+                                self.inner.task_queue_limit
+                            ),
+                        )),
+                    );
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.inner
+                        .rejected_task_internal
+                        .fetch_add(1, Ordering::Relaxed);
+                    reservation.rollback();
+                    state.reject_queued(
+                        id,
+                        Ok(task_error(
+                            "runtime_stopped",
+                            "async task runtime is stopped",
+                        )),
+                    );
+                }
             }
-        };
-        state.install_run(Box::new(run));
-        self.inner.queued_tasks.fetch_add(1, Ordering::AcqRel);
-        match self.inner.task_tx.try_send(TaskJob {
-            id,
-            state: Arc::clone(&state),
-        }) {
-            Ok(()) => {
-                self.inner
-                    .accepted_submissions
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            Err(TrySendError::Full(_)) => {
-                self.inner
-                    .rejected_task_queue
-                    .fetch_add(1, Ordering::Relaxed);
-                self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
-                self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-                self.remove_state(id);
-                state.reject_queued(
-                    id,
-                    Ok(task_error(
-                        "queue_full",
-                        format!(
-                            "async task queue limit {} reached",
-                            self.inner.task_queue_limit
-                        ),
-                    )),
-                );
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.inner
-                    .rejected_task_internal
-                    .fetch_add(1, Ordering::Relaxed);
-                self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
-                self.inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
-                self.remove_state(id);
-                state.reject_queued(
-                    id,
-                    Ok(task_error(
-                        "runtime_stopped",
-                        "async task runtime is stopped",
-                    )),
-                );
-            }
+        }));
+        if let Err(panic) = outcome {
+            let _cleanup = state.cancellation().map(CleanupGuard::enter);
+            let mut first_panic = Some(panic);
+            reservation.rollback();
+            state.catch_cleanup_panic(&mut first_panic, || drop(handle));
+            std::panic::resume_unwind(first_panic.expect("producer owns its first panic"));
         }
         Ok(handle)
     }
@@ -1372,6 +1462,21 @@ impl PartialEq for TaskHandle {
 }
 
 impl TaskState {
+    fn remember_cleanup_deadline(&self) {
+        let Some(cleanup) = current_cleanup_context() else {
+            return;
+        };
+        let mut cancellation = self
+            .cancellation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = cancellation.as_mut() {
+            // Actual TLS may have an earlier cause. Persist only its tighter D
+            // before the caller's cleanup guard restores its outer TLS window.
+            existing.cleanup_deadline = existing.cleanup_deadline.min(cleanup.cleanup_deadline);
+        }
+    }
+
     // Finish the remaining ordered cleanup stages before propagating the first
     // native destructor panic. The caller retains its original cleanup window.
     fn catch_cleanup_panic(&self, first: &mut Option<CleanupPanic>, cleanup: impl FnOnce()) {
@@ -1409,9 +1514,19 @@ impl TaskState {
             // Cancellation may arrive while the deferred frame is being built.
             // The builder, not a worker, owns cleanup of that not-yet-queued frame.
             let _cleanup = context.map(CleanupGuard::enter);
-            drop_owner_synchronously(uninstalled);
-            flush_owner_results();
-            self.complete(self.id, Ok(Value::Null));
+            let mut first_panic = None;
+            self.catch_cleanup_panic(&mut first_panic, || {
+                drop_owner_synchronously(uninstalled.take());
+            });
+            self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
+            self.remember_cleanup_deadline();
+            self.catch_cleanup_panic(&mut first_panic, || {
+                self.complete(self.id, Ok(Value::Null));
+            });
+            self.remember_cleanup_deadline();
+            if let Some(panic) = first_panic {
+                std::panic::resume_unwind(panic);
+            }
         }
     }
 
@@ -1449,10 +1564,18 @@ impl TaskState {
             (run, cancellation_owns_completion)
         };
         let _cleanup = self.cancellation().map(CleanupGuard::enter);
-        drop_owner_synchronously(run);
-        flush_owner_results();
+        let mut first_panic = None;
+        self.catch_cleanup_panic(&mut first_panic, || {
+            drop_owner_synchronously(run);
+        });
+        self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
+        self.remember_cleanup_deadline();
         if !cancellation_owns_completion {
-            self.complete(id, result);
+            self.catch_cleanup_panic(&mut first_panic, || self.complete(id, result));
+        }
+        self.remember_cleanup_deadline();
+        if let Some(panic) = first_panic {
+            std::panic::resume_unwind(panic);
         }
     }
 
