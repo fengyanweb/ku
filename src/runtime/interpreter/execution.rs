@@ -296,21 +296,19 @@ struct FinallyFrame {
     owner_call: usize,
     primary: Option<KuResult<Flow>>,
     mode: cancellation::FinallyMode,
-    // Synchronous only: future Pending must retain context instead of TLS guards.
-    guard: Option<CleanupGuard>,
+    // Persistent effective TLS cause/D, separate from arbitration metadata.
+    protection: Option<Protection>,
 }
 
 struct FinallyFrames {
     frames: FrameStack<FinallyFrame>,
+    active_protected: Option<usize>,
 }
 
 impl Drop for FinallyFrames {
     fn drop(&mut self) {
-        // Production owns this synchronous machine within the panic boundary.
-        // A test catching panic while retaining it must explicitly drop it to
-        // restore TLS. This ordering does not promise support across yielding.
-        while let Some(frame) = self.frames.pop() {
-            drop(frame);
+        if let Some(panic) = self.drain() {
+            std::panic::resume_unwind(panic);
         }
     }
 }
@@ -398,10 +396,11 @@ enum MachineState {
     Ready,
     Running,
     Finished,
+    Aborted,
 }
 
-// Private synchronous checkpoints, not scheduler yields. A protected finally
-// still owns its TLS guard between chunks and must stay on this caller's stack.
+// Private same-thread checkpoints, not scheduler await or worker migration.
+// Cleanup guards exist only in a synchronous dispatch or drop window.
 enum ChunkProgress {
     More {
         popped: usize,
@@ -413,15 +412,12 @@ enum ChunkProgress {
 }
 
 struct Machine {
-    code: CodeHandle,
-    // Shared scalar cells, never copied user payloads. Each call still owns its
-    // real parameter/body scopes and settles them through the existing hooks.
-    // Owning this Env removes source lifetimes, not the future Pending boundary.
-    captures: Option<Env>,
-    calls: FrameStack<CallFrame>,
-    work: FrameStack<Work>,
-    values: FrameStack<Value>,
+    resources: Option<MachineResources>,
     finally: FinallyFrames,
+    // A popped protected frame can panic in its real arbitration callback.
+    // Only an aborted machine needs this release context for its live prefix.
+    aborted_release: Option<RuntimeTermination>,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
     initial_depth: usize,
     call_depth: usize,
     #[cfg(test)]
@@ -526,14 +522,19 @@ impl Machine {
             ..Metrics::default()
         };
         Self {
-            code,
-            captures: None,
-            calls: FrameStack::new(limits.calls),
-            work: FrameStack::new(limits.work),
-            values: FrameStack::new(limits.values),
+            resources: Some(MachineResources {
+                code,
+                captures: None,
+                calls: FrameStack::new(limits.calls),
+                work: FrameStack::new(limits.work),
+                values: FrameStack::new(limits.values),
+            }),
             finally: FinallyFrames {
                 frames: FrameStack::new(limits.work),
+                active_protected: None,
             },
+            aborted_release: None,
+            _same_thread: std::marker::PhantomData,
             initial_depth,
             call_depth: initial_depth,
             #[cfg(test)]
@@ -718,18 +719,20 @@ impl Machine {
         } else {
             CallKind::Named
         };
+        let value_base = self.values.len();
+        let epilogue_span = if self.captures.is_some() {
+            span_id
+        } else {
+            function.span
+        };
         push(
             &mut self.calls,
             CallFrame {
                 env,
                 leases: Vec::new(),
                 depth,
-                value_base: self.values.len(),
-                epilogue_span: if self.captures.is_some() {
-                    span_id
-                } else {
-                    function.span
-                },
+                value_base,
+                epilogue_span,
                 kind,
             },
         );
@@ -746,11 +749,13 @@ impl Machine {
                 .env
                 .define_parameter(name, value, false, param_span)?;
         }
+        let body_span = self.code.block_span(function.body);
+        let value_base = self.values.len();
         push(
             &mut self.work,
             Work::ScopeExit {
-                span: self.code.block_span(function.body),
-                value_base: self.values.len(),
+                span: body_span,
+                value_base,
                 fallthrough: ScopeFallthrough::ReturnNull,
             },
         );
@@ -773,18 +778,14 @@ impl Machine {
             LoopState::ForInt { body, .. } => (body, span_id),
         };
         self.reserve_work(3, span)?;
-        push(
-            &mut self.work,
-            Work::LoopBoundary {
-                state,
-                owner_call: self.calls.len(),
-            },
-        );
+        let owner_call = self.calls.len();
+        let value_base = self.values.len();
+        push(&mut self.work, Work::LoopBoundary { state, owner_call });
         push(
             &mut self.work,
             Work::ScopeExit {
                 span: scope_span,
-                value_base: self.values.len(),
+                value_base,
                 fallthrough: ScopeFallthrough::Continue,
             },
         );
@@ -847,19 +848,20 @@ impl Machine {
         let source_span = self.code.span(span);
         self.reserve_finally(1, source_span)?;
         let index = self.finally.frames.len();
+        let owner_call = self.calls.len();
         push(
             &mut self.finally.frames,
             FinallyFrame {
                 body: finally_body,
                 span,
-                owner_call: self.calls.len(),
+                owner_call,
                 primary: None,
                 mode: cancellation::FinallyMode::Skip,
-                guard: None,
+                protection: None,
             },
         );
         if let Err(error) = self.reserve_work(4, source_span) {
-            drop(self.finally.frames.pop().expect("unentered finally frame"));
+            drop(self.finally.pop().expect("unentered finally frame"));
             return Err(error);
         }
         self.metrics.entered_finally_frames += 1;
@@ -869,11 +871,13 @@ impl Machine {
             .max(self.finally.frames.len());
         push(&mut self.work, Work::FinallyExit(index));
         push(&mut self.work, Work::TryExit(index));
+        let body_span = self.code.block_span(body);
+        let value_base = self.values.len();
         push(
             &mut self.work,
             Work::ScopeExit {
-                span: self.code.block_span(body),
-                value_base: self.values.len(),
+                span: body_span,
+                value_base,
                 fallthrough: ScopeFallthrough::Continue,
             },
         );
@@ -1074,11 +1078,13 @@ impl Machine {
                     else_body
                 };
                 self.reserve_work(2, span)?;
+                let selected_span = self.code.block_span(selected);
+                let value_base = self.values.len();
                 push(
                     &mut self.work,
                     Work::ScopeExit {
-                        span: self.code.block_span(selected),
-                        value_base: self.values.len(),
+                        span: selected_span,
+                        value_base,
                         fallthrough: ScopeFallthrough::Continue,
                     },
                 );
@@ -1174,11 +1180,12 @@ impl Machine {
                 self.reserve_work(2, source_span)?;
                 let staged = self.argument_storage(args.len, source_span)?;
                 let exit_index = self.work.len();
+                let value_base = self.values.len();
                 push(
                     &mut self.work,
                     Work::ArgumentsExit(ArgumentFrame {
                         span,
-                        value_base: self.values.len(),
+                        value_base,
                         leases: Vec::new(),
                         staged,
                     }),
@@ -1260,7 +1267,12 @@ impl Machine {
         Ok(())
     }
 
-    fn finish_boundary(&mut self, boundary: Work, hooks: &mut impl ExecutionHooks) {
+    fn finish_boundary(
+        &mut self,
+        boundary: Work,
+        hooks: &mut impl ExecutionHooks,
+        window: &mut DispatchWindow,
+    ) {
         match boundary {
             Work::TryExit(index) => {
                 assert_eq!(index + 1, self.finally.frames.len(), "current try frame");
@@ -1279,21 +1291,25 @@ impl Machine {
                         self.work.pop(),
                         Some(Work::FinallyExit(saved)) if saved == index
                     ));
-                    drop(self.finally.frames.pop().expect("skipped finally frame"));
+                    drop(self.finally.pop().expect("skipped finally frame"));
                     self.metrics.retired_finally_frames += 1;
                     self.pending = Some(primary);
                 } else {
-                    let guard = match mode {
-                        cancellation::FinallyMode::Protected(context) => {
-                            Some(CleanupGuard::enter(context))
-                        }
+                    let protection = match mode {
+                        cancellation::FinallyMode::Protected(context) => Some(Protection {
+                            parent: self.finally.active_protected,
+                            context: window.activate(context),
+                        }),
                         cancellation::FinallyMode::Ordinary => None,
                         cancellation::FinallyMode::Skip => unreachable!("handled skip"),
                     };
                     let frame = self.finally.frames.get_mut(index).expect("live try frame");
                     frame.primary = Some(primary);
                     frame.mode = mode;
-                    frame.guard = guard;
+                    frame.protection = protection;
+                    if protection.is_some() {
+                        self.finally.active_protected = Some(index);
+                    }
                     assert!(matches!(
                         self.work.get(self.work.len() - 1),
                         Some(Work::FinallyExit(saved)) if *saved == index
@@ -1302,11 +1318,13 @@ impl Machine {
                     // Block and TryExit have retired, leaving two guaranteed
                     // slots above the already-installed FinallyExit. No unwind
                     // allocation can prevent this finally body from entering.
+                    let body_span = self.code.block_span(body);
+                    let value_base = self.values.len();
                     push(
                         &mut self.work,
                         Work::ScopeExit {
-                            span: self.code.block_span(body),
-                            value_base: self.values.len(),
+                            span: body_span,
+                            value_base,
                             fallthrough: ScopeFallthrough::Continue,
                         },
                     );
@@ -1321,23 +1339,33 @@ impl Machine {
                     "current finally frame"
                 );
                 let replacement = self.pending.take().unwrap_or(Ok(Flow::Continue));
-                let mut frame = self.finally.frames.pop().expect("live finally frame");
+                let mut frame = self.finally.pop().expect("live finally frame");
                 assert_eq!(
                     frame.owner_call,
                     self.calls.len(),
                     "finally owns its call frame"
                 );
                 let primary = frame.primary.take().expect("saved primary outcome");
-                let guard = frame.guard.take();
-                let result = hooks.finish_finally(
+                let mut result = hooks.finish_finally(
                     primary,
                     replacement,
                     frame.mode,
                     self.code.span(frame.span),
                 );
-                // Keep the exact synchronous cleanup window through shared
-                // arbitration/discard, then restore its parent before resuming.
-                drop(guard);
+                if let cancellation::FinallyMode::Protected(mut metadata) = frame.mode {
+                    if let Some(observed) = current_cleanup_context()
+                        .or_else(|| frame.protection.map(|protection| protection.context))
+                    {
+                        metadata.cleanup_deadline =
+                            metadata.cleanup_deadline.min(observed.cleanup_deadline);
+                    }
+                    match &mut result {
+                        Ok(flow) => cancellation::ScopeExit::remember_cleanup(flow, metadata),
+                        Err(error) => error.remember_scope_cleanup(metadata),
+                    }
+                }
+                // This step's window keeps the pre-pop context through real
+                // arbitration and discard. The next step enters its parent.
                 drop(frame);
                 self.metrics.retired_finally_frames += 1;
                 if !matches!(&result, Ok(Flow::Continue)) {
@@ -1557,67 +1585,46 @@ impl Machine {
         if self.state != MachineState::Running {
             return Err(self.lifecycle_error("dispatch"));
         }
+        // One catch per chunk. The window stays outside it so native panic
+        // feedback occurs before its synchronous guards restore TLS.
+        let mut window = DispatchWindow::default();
+        let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.dispatch_chunk_inner(budget, hooks, &mut window)
+        }));
+        if dispatched.is_err() {
+            // Copy before restoring TLS: FinallyExit may already have popped
+            // the frame that owned this shorter effective context. Never keep
+            // a synchronous guard across the return to the host.
+            self.aborted_release = current_cleanup_context();
+        }
+        window.finish(&mut self.finally);
+        match dispatched {
+            Ok(result) => result,
+            Err(panic) => {
+                self.state = MachineState::Aborted;
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
+    fn dispatch_chunk_inner(
+        &mut self,
+        budget: NonZeroUsize,
+        hooks: &mut impl ExecutionHooks,
+        window: &mut DispatchWindow,
+    ) -> KuResult<ChunkProgress> {
         let mut popped = 0;
-        // The sole dispatch loop also performs every exit on failure. There is
-        // no clearing of markers, recursive evaluator or child execution driver.
-        // Count loop pops even when pending skips a step or fuel has expired.
-        // Boundary arbitration remains atomic, including TryExit's existing
-        // removal of its preinstalled skipped FinallyExit marker.
         while popped < budget.get() {
+            // Include pop and the skipped Work's actual destructor in the same
+            // saved cleanup window as tick, step and exit arbitration.
+            window.begin(self.finally.context());
             let Some(step) = self.work.pop() else {
+                window.finish(&mut self.finally);
                 break;
             };
             popped += 1;
-            let boundary = matches!(
-                &step,
-                Work::ScopeExit { .. }
-                    | Work::CallExit
-                    | Work::ArgumentsExit(_)
-                    | Work::LoopBoundary { .. }
-                    | Work::TryExit(_)
-                    | Work::FinallyExit(_)
-            );
-            if self.pending.is_some() {
-                if boundary {
-                    self.finish_boundary(step, hooks);
-                }
-                continue;
-            }
-            // Fuel belongs to the test harness alone. Its failure takes the
-            // same flat resource exit path as a real tick or expression error.
-            #[cfg(test)]
-            if self.test_fuel {
-                let Some(remaining) = self.remaining_dispatches.checked_sub(1) else {
-                    self.pending = Some(Err(KuError::runtime(
-                        "internal execution prototype test fuel exhausted",
-                        self.entry_span,
-                    )));
-                    if boundary {
-                        self.finish_boundary(step, hooks);
-                    }
-                    continue;
-                };
-                self.remaining_dispatches = remaining;
-            }
-            self.metrics.dispatches += 1;
-            if boundary {
-                self.finish_boundary(step, hooks);
-                continue;
-            }
-            let poll = match &step {
-                Work::Statement(stmt) => {
-                    hooks.tick(self.code.span(self.code.statement(*stmt).span))
-                }
-                Work::Eval(expr) => hooks.tick(self.code.span(self.code.expression(*expr).span)),
-                Work::SelfCallee(span) => hooks.tick(self.code.span(*span)),
-                Work::LoopIteration(state) => hooks.tick(self.code.span(state.span())),
-                _ => Ok(()),
-            };
-            if let Err(error) = poll {
-                self.pending = Some(Err(error));
-            } else if let Err(error) = self.step(step) {
-                self.pending = Some(Err(error));
-            }
+            self.dispatch_one(step, hooks, window);
+            window.finish(&mut self.finally);
         }
         if self.work.len() != 0 {
             return Ok(ChunkProgress::More { popped });
@@ -1626,6 +1633,62 @@ impl Machine {
             popped,
             result: self.finish_run(),
         })
+    }
+
+    fn dispatch_one(
+        &mut self,
+        step: Work,
+        hooks: &mut impl ExecutionHooks,
+        window: &mut DispatchWindow,
+    ) {
+        let boundary = matches!(
+            &step,
+            Work::ScopeExit { .. }
+                | Work::CallExit
+                | Work::ArgumentsExit(_)
+                | Work::LoopBoundary { .. }
+                | Work::TryExit(_)
+                | Work::FinallyExit(_)
+        );
+        if self.pending.is_some() {
+            if boundary {
+                self.finish_boundary(step, hooks, window);
+            }
+            return;
+        }
+        // Fuel belongs to the test harness alone. Its failure takes the
+        // same flat resource exit path as a real tick or expression error.
+        #[cfg(test)]
+        if self.test_fuel {
+            let Some(remaining) = self.remaining_dispatches.checked_sub(1) else {
+                self.pending = Some(Err(KuError::runtime(
+                    "internal execution prototype test fuel exhausted",
+                    self.entry_span,
+                )));
+                if boundary {
+                    self.finish_boundary(step, hooks, window);
+                }
+                return;
+            };
+            self.remaining_dispatches = remaining;
+        }
+        self.metrics.dispatches += 1;
+        if boundary {
+            self.finish_boundary(step, hooks, window);
+            return;
+        }
+        let poll = match &step {
+            Work::Statement(stmt) => hooks.tick(self.code.span(self.code.statement(*stmt).span)),
+            Work::Eval(expr) => hooks.tick(self.code.span(self.code.expression(*expr).span)),
+            Work::SelfCallee(span) => hooks.tick(self.code.span(*span)),
+            Work::LoopIteration(state) => hooks.tick(self.code.span(state.span())),
+            _ => Ok(()),
+        };
+        if let Err(error) = poll {
+            self.pending = Some(Err(error));
+        } else if let Err(error) = self.step(step) {
+            self.pending = Some(Err(error));
+        }
     }
 
     fn finish_run(&mut self) -> KuResult<Flow> {
@@ -1690,7 +1753,7 @@ fn execute(
         }
     };
     let result = machine.run(entry, args, depth);
-    (result, machine.metrics)
+    (result, std::mem::take(&mut machine.metrics))
 }
 
 pub(super) fn try_execute(
@@ -1770,4 +1833,168 @@ pub(super) fn try_execute_function_value(
     // clone any Value payload; actual per-call scopes still exit through hooks.
     machine.captures = Some(call.captures.clone());
     Some(machine.run_with_hooks(name, &call.args, call.depth, false, interpreter))
+}
+
+// Same-thread dispatch windows and the machine's original resource drop prefix.
+
+struct MachineResources {
+    code: CodeHandle,
+    captures: Option<Env>,
+    calls: FrameStack<CallFrame>,
+    work: FrameStack<Work>,
+    values: FrameStack<Value>,
+}
+
+impl std::ops::Deref for Machine {
+    type Target = MachineResources;
+    fn deref(&self) -> &Self::Target {
+        self.resources
+            .as_ref()
+            .expect("live execution resource prefix")
+    }
+}
+impl std::ops::DerefMut for Machine {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.resources
+            .as_mut()
+            .expect("live execution resource prefix")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Protection {
+    context: RuntimeTermination,
+    parent: Option<usize>,
+}
+
+impl FinallyFrames {
+    fn context(&self) -> Option<RuntimeTermination> {
+        self.active_protected.map(|index| {
+            self.frames
+                .get(index)
+                .expect("live protected finally")
+                .protection
+                .expect("active protection")
+                .context
+        })
+    }
+
+    fn tighten(&mut self, observed: Option<RuntimeTermination>) {
+        if let (Some(index), Some(observed)) = (self.active_protected, observed) {
+            let protection = self
+                .frames
+                .get_mut(index)
+                .expect("live protected finally")
+                .protection
+                .as_mut()
+                .expect("active protection");
+            protection.context.cleanup_deadline = protection
+                .context
+                .cleanup_deadline
+                .min(observed.cleanup_deadline);
+        }
+    }
+
+    fn pop(&mut self) -> Option<FinallyFrame> {
+        let index = self.frames.len().checked_sub(1)?;
+        let frame = self.frames.pop().expect("live finally frame");
+        if let Some(protection) = frame.protection {
+            assert_eq!(self.active_protected, Some(index));
+            self.active_protected = protection.parent;
+            self.tighten(Some(protection.context));
+        }
+        Some(frame)
+    }
+
+    fn drain(&mut self) -> Option<NativeCleanupPanic> {
+        let mut first = None;
+        while self.frames.len() != 0 {
+            // The context belongs to the state BEFORE retiring this frame.
+            let guard = self.context().map(CleanupGuard::enter);
+            let frame = self.pop().expect("live finally frame");
+            let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(frame)));
+            self.tighten(current_cleanup_context());
+            drop(guard);
+            if let Err(panic) = dropped {
+                retain_first_panic(&mut first, panic);
+            }
+        }
+        assert!(self.active_protected.is_none());
+        first
+    }
+}
+
+type NativeCleanupPanic = Box<dyn std::any::Any + Send + 'static>;
+
+fn retain_first_panic(first: &mut Option<NativeCleanupPanic>, panic: NativeCleanupPanic) {
+    if first.is_none() {
+        *first = Some(panic);
+    } else {
+        // The original native panic hook already recorded its diagnostic.
+        // Keep a static secondary marker without disclosing payload data.
+        eprintln!("ku interpreter suppressed secondary native cleanup panic");
+        drop(panic);
+    }
+}
+
+#[derive(Default)]
+struct DispatchWindow {
+    base: Option<CleanupGuard>,
+    activation: Option<CleanupGuard>,
+}
+
+impl DispatchWindow {
+    fn begin(&mut self, context: Option<RuntimeTermination>) {
+        assert!(self.base.is_none() && self.activation.is_none());
+        self.base = context.map(CleanupGuard::enter);
+    }
+
+    fn activate(&mut self, context: RuntimeTermination) -> RuntimeTermination {
+        assert!(self.activation.is_none());
+        self.activation = Some(CleanupGuard::enter(context));
+        current_cleanup_context().expect("new protected execution window")
+    }
+
+    fn finish(&mut self, frames: &mut FinallyFrames) {
+        frames.tighten(current_cleanup_context());
+        self.close();
+    }
+
+    fn close(&mut self) {
+        drop(self.activation.take());
+        drop(self.base.take());
+    }
+}
+
+impl Drop for DispatchWindow {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl Drop for Machine {
+    fn drop(&mut self) {
+        // The same original prefix order is preserved by Rust's drop glue:
+        // code, captures, calls, work, values. No user payload is cloned.
+        let release = match (self.aborted_release, self.finally.context()) {
+            (Some(mut saved), Some(active)) => {
+                saved.cleanup_deadline = saved.cleanup_deadline.min(active.cleanup_deadline);
+                Some(saved)
+            }
+            (saved, active) => saved.or(active),
+        };
+        let guard = release.map(CleanupGuard::enter);
+        let prefix = self.resources.take();
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(prefix)));
+        self.finally.tighten(current_cleanup_context());
+        // Restore before ordinary outer primary outcomes are retired.
+        drop(guard);
+        let mut first = dropped.err();
+        if let Some(panic) = self.finally.drain() {
+            retain_first_panic(&mut first, panic);
+        }
+        if let Some(panic) = first {
+            std::panic::resume_unwind(panic);
+        }
+    }
 }
