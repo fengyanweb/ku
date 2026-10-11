@@ -7,7 +7,7 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CancelBatchPoll {
+pub(crate) enum CancelBatchPoll {
     Pending {
         first_index: usize,
         unfinished: usize,
@@ -19,7 +19,7 @@ pub(super) enum CancelBatchPoll {
 /// The synchronous caller borrows its existing handles. A future exit owner can
 /// move an existing Vec into H without cloning user values or logical owners.
 /// No runtime, lock, or thread-local guard survives between calls to poll.
-pub(super) struct TaskCancelBatch<H: AsRef<[TaskHandle]>> {
+pub(crate) struct TaskCancelBatch<H: AsRef<[TaskHandle]>> {
     handles: Option<H>,
     // Preserve the old wait snapshot independently of shorter deadlines seen
     // during resource destruction. Neither field creates a new time budget.
@@ -29,7 +29,7 @@ pub(super) struct TaskCancelBatch<H: AsRef<[TaskHandle]>> {
 }
 
 impl<H: AsRef<[TaskHandle]>> TaskCancelBatch<H> {
-    pub(super) fn prepare(handles: H, context: CancellationContext) -> Self {
+    pub(crate) fn prepare(handles: H, context: CancellationContext) -> Self {
         let _cleanup = CleanupGuard::enter(context);
         // Match the original wait: select one effective absolute deadline and
         // first cause before broadcasting. A nested synchronous owner drop may
@@ -57,11 +57,11 @@ impl<H: AsRef<[TaskHandle]>> TaskCancelBatch<H> {
         batch
     }
 
-    pub(super) fn context(&self) -> CancellationContext {
+    pub(crate) fn context(&self) -> CancellationContext {
         self.context
     }
 
-    pub(super) fn handles(&self) -> &[TaskHandle] {
+    pub(crate) fn handles(&self) -> &[TaskHandle] {
         self.handles
             .as_ref()
             .expect("live cancellation batch")
@@ -71,7 +71,7 @@ impl<H: AsRef<[TaskHandle]>> TaskCancelBatch<H> {
     /// `now` is a lower bound, useful for an explicit deadline observation.
     /// Real time is sampled after the terminal scan so a large batch cannot
     /// carry a stale pre-scan clock past the original absolute deadline.
-    pub(super) fn poll(&mut self, runtime: &TaskRuntime, now: Instant) -> CancelBatchPoll {
+    pub(crate) fn poll(&mut self, runtime: &TaskRuntime, now: Instant) -> CancelBatchPoll {
         if let Some(completed) = self.completed {
             return completed;
         }

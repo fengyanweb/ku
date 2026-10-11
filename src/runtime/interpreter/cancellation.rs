@@ -1,5 +1,11 @@
 use super::*;
 
+mod exit;
+#[cfg(test)]
+mod exit_tests;
+
+use exit::{DiscardState, ExitPhase, ExitState};
+
 #[derive(Clone, Copy)]
 pub(super) enum FinallyMode {
     Skip,
@@ -318,121 +324,41 @@ impl Interpreter {
     fn finish_owned_resources<T: ScopeExit>(
         &mut self,
         env: &mut Env,
-        mut result: KuResult<T>,
+        result: KuResult<T>,
         span: Span,
         handles: Vec<crate::runtime::task::TaskHandle>,
         collected: KuResult<()>,
         teardown: impl FnOnce(&mut Env),
     ) -> KuResult<T> {
-        self.observe_termination(&result);
-        let carried = match &result {
-            Ok(flow) => flow.cleanup_context(),
-            Err(error) => error.scope_cleanup(),
-        };
-        let mut cleanup_context = self.scope_cleanup_context(carried);
-        if cleanup_context.is_none() && !handles.is_empty() {
-            cleanup_context = Some(CancellationContext::new(TerminationReason::Cancelled));
-        }
-        // A local cleanup is not parent cancellation. The temporary guard also
-        // covers nested owner/result drops and is restored on every return.
-        let _cleanup_guard = cleanup_context.map(CleanupGuard::enter);
-        let expired_before =
-            cleanup_context.is_some_and(|context| Instant::now() >= context.cleanup_deadline);
-        if let Some(context) = cleanup_context {
-            match &mut result {
-                Ok(flow) => flow.remember_cleanup(context),
-                Err(error) => error.remember_scope_cleanup(context),
-            }
-        }
-        let settled = if !handles.is_empty() {
-            let context = cleanup_context.expect("owned scope cleanup has a context");
-            // Request all visible children before waiting for any child.
-            // Cancelling this scope is not cancellation of its continuing
-            // parent; do not latch this context into the parent interpreter.
-            if self.termination.is_some() {
-                self.cancel_visible_children(env, context, span);
-            }
-            let settled = match &self.task_runtime {
-                Some(runtime) => runtime
-                    .cancel_handles_and_wait(&handles, context)
-                    .map(|_| ()),
-                None => {
-                    for handle in &handles {
-                        handle.request_cancel_with(context);
-                    }
-                    Ok(())
+        // Declare the synchronous guard before the state: reverse local Drop
+        // order must destroy the state while this guard still exposes any
+        // tighter deadline left by a panicking native destructor. Constructor
+        // metadata selection still happens before installing the guard.
+        let _cleanup_guard;
+        let mut state = ExitState::new(self, result, span, handles, collected);
+        _cleanup_guard = state.context().map(CleanupGuard::enter);
+        // Move the FnOnce parameter before the first phase effect. An uncalled
+        // closure's leases/values then also unwind under the synchronous guard;
+        // they are not stored in the shared state or a resumable Task frame.
+        let mut teardown = Some(teardown);
+        state.begin();
+        loop {
+            match state.phase() {
+                ExitPhase::Prepare => unreachable!("prepared exit has begun"),
+                ExitPhase::WaitTerminal => state.wait_terminal(self, env),
+                ExitPhase::ReleaseOwners => state.release_owners(self),
+                ExitPhase::DropHandles => state.drop_handles(self),
+                ExitPhase::Teardown => {
+                    let _phase_guard = state.phase_guard();
+                    teardown.take().expect("exit teardown runs once")(env);
+                    state.finish_teardown(self);
                 }
-            };
-            // A readonly closure can retain a shared binding cell without
-            // inheriting this scope's cleanup ownership. Release the logical
-            // owner now; such observers may retain the ID, not the payload.
-            let context = self
-                .scope_cleanup_context(Some(context))
-                .expect("scope cleanup retains its context");
-            let _release_guard = CleanupGuard::enter(context);
-            for handle in &handles {
-                handle.release_scope_owner(context);
-            }
-            settled
-        } else {
-            Ok(())
-        };
-        // A later collection failure cannot skip the already-known owners.
-        // Preserve the first cleanup error, as in the existing scope policy.
-        if collected.is_err() && settled.is_err() {
-            self.record_suppressed_cleanup();
-        }
-        let mut cleanup = collected.and(settled);
-        // Even the final Task proxy/owner drop belongs to the cleanup window.
-        // Function parameters would otherwise drop after the local guard.
-        drop(handles);
-        cleanup_context = self.scope_cleanup_context(cleanup_context);
-        {
-            let _pop_guard = cleanup_context.map(CleanupGuard::enter);
-            teardown(env);
-        }
-        // A terminal Task or empty Task set does not prove its enclosing Value
-        // cleanup finished in time. Do not skip necessary drops on expiry.
-        cleanup_context = self.scope_cleanup_context(cleanup_context);
-        if let Some(context) = cleanup_context {
-            match &mut result {
-                Ok(flow) => flow.remember_cleanup(context),
-                Err(error) => error.remember_scope_cleanup(context),
-            }
-            if cleanup.is_ok() && (expired_before || Instant::now() >= context.cleanup_deadline) {
-                cleanup = Err(KuError::termination(context, span));
+                ExitPhase::DeadlineCheck => state.deadline_check(self),
+                ExitPhase::Arbitrate => state.arbitrate(self),
+                ExitPhase::Discard => state.discard(self),
+                ExitPhase::Done => return state.into_result(),
             }
         }
-        if matches!(&result, Err(error) if error.runtime_termination().is_some()) {
-            if cleanup.is_err() {
-                self.record_suppressed_cleanup();
-            }
-            return result;
-        }
-        if let Err(mut error) = cleanup {
-            if let Some(context) = cleanup_context {
-                self.discard_flow(result, context, span);
-                cleanup_context = self.scope_cleanup_context(Some(context));
-            }
-            if let Some(context) = cleanup_context {
-                error.remember_scope_cleanup(context);
-            }
-            if error.runtime_termination().is_some() {
-                let mut error = KuError::structured(
-                    crate::error::KuErrorKind::Runtime,
-                    "task",
-                    "shutdown_timeout",
-                    "scope cleanup did not finish before the bounded cleanup deadline",
-                    span,
-                );
-                if let Some(context) = cleanup_context {
-                    error.remember_scope_cleanup(context);
-                }
-                return Err(error);
-            }
-            return Err(error);
-        }
-        result
     }
 
     pub(super) fn discard_flow<T: ScopeExit>(
@@ -441,25 +367,11 @@ impl Interpreter {
         context: RuntimeTermination,
         span: Span,
     ) {
-        let guard = CleanupGuard::enter(context);
-        if let Ok(flow) = &result {
-            let mut tasks = Vec::new();
-            if flow.collect_tasks(&mut tasks, span).is_ok() {
-                if let Some(runtime) = &self.task_runtime {
-                    if runtime.cancel_handles_and_wait(&tasks, context).is_err() {
-                        self.record_suppressed_cleanup();
-                    }
-                } else {
-                    for task in &tasks {
-                        task.request_cancel_with(context);
-                    }
-                }
-            } else {
-                self.record_suppressed_cleanup();
-            }
-        }
-        drop(result);
-        drop(guard);
+        // State Drop precedes this synchronous guard on ordinary return and
+        // panic. Keep the distinct discard collection-error policy intact.
+        let _guard = CleanupGuard::enter(context);
+        let mut state = DiscardState::new(result, context, span);
+        state.run_sync(self);
     }
 
     pub(super) fn take_task_field(&self, expr: &Expr, env: &Env) -> KuResult<Option<Value>> {

@@ -20,7 +20,7 @@ use crate::{
 
 mod cancel_batch;
 mod cancellation;
-use cancel_batch::{CancelBatchPoll, TaskCancelBatch};
+pub(crate) use cancel_batch::{CancelBatchPoll, TaskCancelBatch};
 #[cfg(test)]
 mod cancel_batch_tests;
 pub(crate) use cancellation::{
@@ -1032,6 +1032,16 @@ impl TaskRuntime {
     ) -> KuResult<()> {
         let _cleanup = CleanupGuard::enter(context);
         let mut batch = TaskCancelBatch::prepare(handles, context);
+        self.wait_prepared_cancel_batch(&mut batch)
+    }
+
+    /// Drive the same terminal observation after an exit state has already
+    /// broadcast cancellation. The caller supplies its synchronous guard; this
+    /// helper neither rebroadcasts nor claims await or runs scheduler help.
+    pub(crate) fn wait_prepared_cancel_batch<H: AsRef<[TaskHandle]>>(
+        &self,
+        batch: &mut TaskCancelBatch<H>,
+    ) -> KuResult<()> {
         loop {
             let now = Instant::now();
             match batch.poll(self, now) {
