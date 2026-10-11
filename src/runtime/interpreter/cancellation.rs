@@ -188,9 +188,62 @@ impl Interpreter {
     pub(super) fn finish_owned_scope<T: ScopeExit>(
         &mut self,
         env: &mut Env,
-        mut result: KuResult<T>,
+        result: KuResult<T>,
         span: Span,
         pop: bool,
+    ) -> KuResult<T> {
+        self.observe_termination(&result);
+        let (handles, collected) = match env.current_scope_owned_tasks(span) {
+            Ok(handles) => (handles, Ok(())),
+            Err(error) => (Vec::new(), Err(error)),
+        };
+        self.finish_owned_resources(env, result, span, handles, collected, |env| {
+            if pop {
+                env.pop_scope();
+            }
+        })
+    }
+
+    pub(super) fn finish_call_scope(
+        &mut self,
+        mut env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+    ) -> KuResult<Flow> {
+        self.observe_termination(&result);
+        let (handles, collected) = call_owned_tasks(Some(&env), &leases, &[], span);
+        self.finish_owned_resources(&mut env, result, span, handles, collected, |env| {
+            env.clear_call_frame();
+            drop(leases);
+        })
+    }
+
+    pub(super) fn finish_call_arguments(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+    ) -> KuResult<Flow> {
+        self.observe_termination(&result);
+        let (handles, collected) = call_owned_tasks(None, &leases, &values, span);
+        self.finish_owned_resources(env, result, span, handles, collected, |_| {
+            // Restoring leases only restore the caller. No caller Env is dropped.
+            drop(values);
+            drop(leases);
+        })
+    }
+
+    fn finish_owned_resources<T: ScopeExit>(
+        &mut self,
+        env: &mut Env,
+        mut result: KuResult<T>,
+        span: Span,
+        handles: Vec<crate::runtime::task::TaskHandle>,
+        collected: KuResult<()>,
+        teardown: impl FnOnce(&mut Env),
     ) -> KuResult<T> {
         self.observe_termination(&result);
         let carried = match &result {
@@ -198,8 +251,7 @@ impl Interpreter {
             Err(error) => error.scope_cleanup(),
         };
         let mut cleanup_context = self.scope_cleanup_context(carried);
-        let handles = env.current_scope_owned_tasks(span);
-        if cleanup_context.is_none() && matches!(&handles, Ok(handles) if !handles.is_empty()) {
+        if cleanup_context.is_none() && !handles.is_empty() {
             cleanup_context = Some(CancellationContext::new(TerminationReason::Cancelled));
         }
         // A local cleanup is not parent cancellation. The temporary guard also
@@ -213,45 +265,52 @@ impl Interpreter {
                 Err(error) => error.remember_scope_cleanup(context),
             }
         }
-        let mut cleanup = match handles {
-            Ok(handles) if !handles.is_empty() => {
-                let context = cleanup_context.expect("owned scope cleanup has a context");
-                // Request all visible children before waiting for any child.
-                // Cancelling this scope is not cancellation of its continuing
-                // parent; do not latch this context into the parent interpreter.
-                if self.termination.is_some() {
-                    self.cancel_visible_children(env, context, span);
-                }
-                let settled = match &self.task_runtime {
-                    Some(runtime) => runtime
-                        .cancel_handles_and_wait(&handles, context)
-                        .map(|_| ()),
-                    None => {
-                        for handle in &handles {
-                            handle.request_cancel_with(context);
-                        }
-                        Ok(())
-                    }
-                };
-                // A readonly closure can retain a shared binding cell without
-                // inheriting this scope's cleanup ownership. Release the logical
-                // owner now; such observers may retain the ID, not the payload.
-                let context = self
-                    .scope_cleanup_context(Some(context))
-                    .expect("scope cleanup retains its context");
-                let _release_guard = CleanupGuard::enter(context);
-                for handle in &handles {
-                    handle.release_scope_owner(context);
-                }
-                settled
+        let settled = if !handles.is_empty() {
+            let context = cleanup_context.expect("owned scope cleanup has a context");
+            // Request all visible children before waiting for any child.
+            // Cancelling this scope is not cancellation of its continuing
+            // parent; do not latch this context into the parent interpreter.
+            if self.termination.is_some() {
+                self.cancel_visible_children(env, context, span);
             }
-            Ok(_) => Ok(()),
-            Err(error) => Err(error),
+            let settled = match &self.task_runtime {
+                Some(runtime) => runtime
+                    .cancel_handles_and_wait(&handles, context)
+                    .map(|_| ()),
+                None => {
+                    for handle in &handles {
+                        handle.request_cancel_with(context);
+                    }
+                    Ok(())
+                }
+            };
+            // A readonly closure can retain a shared binding cell without
+            // inheriting this scope's cleanup ownership. Release the logical
+            // owner now; such observers may retain the ID, not the payload.
+            let context = self
+                .scope_cleanup_context(Some(context))
+                .expect("scope cleanup retains its context");
+            let _release_guard = CleanupGuard::enter(context);
+            for handle in &handles {
+                handle.release_scope_owner(context);
+            }
+            settled
+        } else {
+            Ok(())
         };
+        // A later collection failure cannot skip the already-known owners.
+        // Preserve the first cleanup error, as in the existing scope policy.
+        if collected.is_err() && settled.is_err() {
+            self.record_suppressed_cleanup();
+        }
+        let mut cleanup = collected.and(settled);
+        // Even the final Task proxy/owner drop belongs to the cleanup window.
+        // Function parameters would otherwise drop after the local guard.
+        drop(handles);
         cleanup_context = self.scope_cleanup_context(cleanup_context);
-        if pop {
+        {
             let _pop_guard = cleanup_context.map(CleanupGuard::enter);
-            env.pop_scope();
+            teardown(env);
         }
         // A terminal Task or empty Task set does not prove its enclosing Value
         // cleanup finished in time. Do not skip necessary drops on expiry.
@@ -345,4 +404,28 @@ impl Interpreter {
         }
         Ok(None)
     }
+}
+
+fn call_owned_tasks(
+    env: Option<&Env>,
+    leases: &[BorrowLease],
+    values: &[Value],
+    span: Span,
+) -> (Vec<crate::runtime::task::TaskHandle>, KuResult<()>) {
+    let mut handles = Vec::new();
+    let collected = (|| {
+        if let Some(env) = env {
+            handles.extend(env.current_scope_owned_tasks(span)?);
+        }
+        for lease in leases {
+            lease.collect_temporary_owned_tasks(&mut handles, span)?;
+        }
+        for value in values {
+            value.collect_owned_tasks(&mut handles, span)?;
+        }
+        Ok(())
+    })();
+    handles.sort_unstable_by_key(crate::runtime::task::TaskHandle::id);
+    handles.dedup_by_key(|handle| handle.id());
+    (handles, collected)
 }

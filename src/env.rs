@@ -103,6 +103,20 @@ pub(crate) struct BorrowLease {
 }
 
 impl BorrowLease {
+    pub(crate) fn collect_temporary_owned_tasks(
+        &self,
+        tasks: &mut Vec<TaskHandle>,
+        span: Span,
+    ) -> KuResult<()> {
+        // A restoring lease borrows its caller's owner; it must not settle it.
+        if self.source.is_none() {
+            if let Some(root) = &self.root {
+                root.collect_owned_tasks(tasks, span)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn temporary(value: Value) -> (Value, Option<Self>) {
         if value.copy_value().is_some() || matches!(value, Value::Borrowed(_)) {
             return (value, None);
@@ -179,6 +193,12 @@ impl Env {
         if self.scopes.len() > 1 {
             self.scopes.pop();
         }
+    }
+
+    /// Used only by the final call-frame epilogue, after its owners settle.
+    /// The caller immediately drops this Env; it cannot be used as a frame again.
+    pub(crate) fn clear_call_frame(&mut self) {
+        self.scopes.clear();
     }
 
     pub fn define(

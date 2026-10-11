@@ -77,6 +77,27 @@ enum Flow {
 }
 
 impl Flow {
+    fn into_call_value(self, span: Span, kind: &str) -> KuResult<Value> {
+        match self {
+            Self::Continue => Ok(Value::Null),
+            Self::Return { value, .. } => Ok(value),
+            Self::Fail { value, .. } => Ok(Value::Result {
+                ok: false,
+                value: Box::new(value),
+            }),
+            Self::Break(_) | Self::LoopContinue(_) => Err(KuError::runtime(
+                format!("loop control escaped {kind}"),
+                span,
+            )),
+        }
+    }
+
+    fn into_call_flow(self, span: Span, kind: &str) -> KuResult<Self> {
+        let cleanup = cancellation::ScopeExit::cleanup_context(&self);
+        self.into_call_value(span, kind)
+            .map(|value| Self::Return { value, cleanup })
+    }
+
     fn fail(value: Value) -> Self {
         Self::Fail {
             value,
@@ -251,6 +272,17 @@ impl Interpreter {
         span: Span,
         depth: usize,
     ) -> KuResult<Value> {
+        self.call_function_flow(name, args, span, depth)?
+            .into_call_value(span, "function")
+    }
+
+    fn call_function_flow(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<Flow> {
         if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
             return Err(KuError::structured(
                 crate::error::KuErrorKind::Runtime,
@@ -266,20 +298,33 @@ impl Interpreter {
             .cloned()
             .ok_or_else(|| KuError::runtime(format!("undefined function '{name}'"), span))?;
         if function.is_async {
-            return self.spawn_async_function(function, args, span);
+            return self
+                .spawn_async_function(function, args, span)
+                .map(Flow::returned);
         }
-        self.call_function_direct(function, args, span, depth)
+        self.call_function_direct_flow(function, args, span, depth)
     }
 
     fn call_function_direct(
         &mut self,
         function: FnDecl,
         args: Vec<Value>,
-        _span: Span,
+        span: Span,
         depth: usize,
     ) -> KuResult<Value> {
+        self.call_function_direct_flow(function, args, span, depth)?
+            .into_call_value(span, "function")
+    }
+
+    fn call_function_direct_flow(
+        &mut self,
+        function: FnDecl,
+        args: Vec<Value>,
+        _span: Span,
+        depth: usize,
+    ) -> KuResult<Flow> {
         self.call_depth += 1;
-        let result = (|| -> KuResult<Value> {
+        let result = (|| -> KuResult<Flow> {
             if function.params.len() != args.len() {
                 return Err(KuError::runtime(
                     format!(
@@ -308,20 +353,14 @@ impl Interpreter {
                 env.define_parameter(param.name.clone(), value, false, param.span)?;
             }
 
-            let result = self.exec_block(&function.body, &mut env, depth);
-            match self.finish_owned_scope(&mut env, result, function.span, false) {
-                Ok(Flow::Continue) => Ok(Value::Null),
-                Ok(Flow::Return { value, .. }) => Ok(value),
-                Ok(Flow::Fail { value, .. }) => Ok(Value::Result {
-                    ok: false,
-                    value: Box::new(value),
-                }),
-                Ok(Flow::Break(_) | Flow::LoopContinue(_)) => Err(KuError::runtime(
-                    "loop control escaped function",
-                    function.span,
-                )),
-                Err(error) => Err(error),
-            }
+            let result = self.exec_block_with_fallthrough(
+                &function.body,
+                &mut env,
+                depth,
+                Flow::returned(Value::Null),
+            );
+            self.finish_call_scope(env, leases, result, function.span)?
+                .into_call_flow(function.span, "function")
         })();
         self.call_depth -= 1;
         result
@@ -393,6 +432,12 @@ impl Interpreter {
     }
 
     fn call_function_value(&mut self, call: FunctionValueCall<'_>) -> KuResult<Value> {
+        let span = call.span;
+        self.call_function_value_flow(call)?
+            .into_call_value(span, "function value")
+    }
+
+    fn call_function_value_flow(&mut self, call: FunctionValueCall<'_>) -> KuResult<Flow> {
         if call.is_async {
             self.reject_cleanup_submission(call.span)?;
             if call.param_modes.contains(&ParamMode::View) {
@@ -433,9 +478,9 @@ impl Interpreter {
                     true,
                 )
             })?;
-            return Ok(Value::Task(task));
+            return Ok(Flow::returned(Value::Task(task)));
         }
-        self.call_function_value_direct(call, false)
+        self.call_function_value_direct_flow(call, false)
     }
 
     fn call_function_value_direct(
@@ -443,6 +488,16 @@ impl Interpreter {
         call: FunctionValueCall<'_>,
         declared_async: bool,
     ) -> KuResult<Value> {
+        let span = call.span;
+        self.call_function_value_direct_flow(call, declared_async)?
+            .into_call_value(span, "function value")
+    }
+
+    fn call_function_value_direct_flow(
+        &mut self,
+        call: FunctionValueCall<'_>,
+        declared_async: bool,
+    ) -> KuResult<Flow> {
         let FunctionValueCall {
             params,
             param_modes,
@@ -464,7 +519,7 @@ impl Interpreter {
             ));
         }
         self.call_depth += 1;
-        let result = (|| -> KuResult<Value> {
+        let result = (|| -> KuResult<Flow> {
             if params.len() != args.len() || params.len() != param_modes.len() {
                 return Err(KuError::runtime(
                     format!(
@@ -508,26 +563,30 @@ impl Interpreter {
                 env.define_parameter(param.clone(), value, false, span)?;
             }
 
-            let result = self.exec_block(body, &mut env, depth);
-            match self.finish_owned_scope(&mut env, result, span, true) {
-                Ok(Flow::Continue) => Ok(Value::Null),
-                Ok(Flow::Return { value, .. }) => Ok(value),
-                Ok(Flow::Fail { value, .. }) => Ok(Value::Result {
-                    ok: false,
-                    value: Box::new(value),
-                }),
-                Ok(Flow::Break(_) | Flow::LoopContinue(_)) => Err(KuError::runtime(
-                    "loop control escaped function value",
-                    span,
-                )),
-                Err(error) => Err(error),
-            }
+            let result = self.exec_block_with_fallthrough(
+                body,
+                &mut env,
+                depth,
+                Flow::returned(Value::Null),
+            );
+            self.finish_call_scope(env, leases, result, span)?
+                .into_call_flow(span, "function value")
         })();
         self.call_depth -= 1;
         result
     }
 
     fn exec_block(&mut self, body: &[Stmt], env: &mut Env, depth: usize) -> KuResult<Flow> {
+        self.exec_block_with_fallthrough(body, env, depth, Flow::Continue)
+    }
+
+    fn exec_block_with_fallthrough(
+        &mut self,
+        body: &[Stmt],
+        env: &mut Env,
+        depth: usize,
+        fallthrough: Flow,
+    ) -> KuResult<Flow> {
         env.push_scope();
         let result = (|| {
             for stmt in body {
@@ -536,7 +595,7 @@ impl Interpreter {
                     return Ok(flow);
                 }
             }
-            Ok(Flow::Continue)
+            Ok(fallthrough)
         })();
         self.finish_owned_scope(
             env,
@@ -1044,7 +1103,8 @@ impl Interpreter {
         env: &mut Env,
         depth: usize,
         leases: &mut Vec<BorrowLease>,
-    ) -> KuResult<Vec<Value>> {
+        values: &mut Vec<Value>,
+    ) -> KuResult<()> {
         // Reject either argument order before evaluating effects. Paths are
         // deliberately conservative at the root, matching the checker contract.
         if modes.contains(&ParamMode::View) && modes.contains(&ParamMode::Owned) {
@@ -1071,7 +1131,6 @@ impl Interpreter {
                 }
             }
         }
-        let mut values = Vec::with_capacity(args.len());
         for (index, arg) in args.iter().enumerate() {
             let value = if modes.get(index) == Some(&ParamMode::View) {
                 self.eval_borrow_argument(arg, env, depth, leases)?
@@ -1085,7 +1144,19 @@ impl Interpreter {
                 break;
             }
         }
-        Ok(values)
+        Ok(())
+    }
+
+    fn call_argument_value(&mut self, result: KuResult<Flow>, span: Span) -> KuResult<Value> {
+        match result? {
+            // Only argument evaluation leaves Fail here. A callee's own Fail
+            // was already wrapped as a returned Result at its call boundary.
+            Flow::Fail { value, .. } => {
+                self.pending_fail = Some(value);
+                Ok(Value::Null)
+            }
+            flow => flow.into_call_value(span, "function"),
+        }
     }
 
     fn eval_readonly_call(
@@ -1527,12 +1598,29 @@ impl Interpreter {
                         if let Some(function) = self.functions.get(name) {
                             let modes = explicit_borrow_modes(function);
                             let mut leases = Vec::new();
-                            let values =
-                                self.eval_call_arguments(args, &modes, env, depth, &mut leases)?;
-                            if self.pending_fail.is_some() {
-                                return Ok(Value::Null);
-                            }
-                            return self.call_function(name, values, expr.span, depth + 1);
+                            let mut values = Vec::with_capacity(args.len());
+                            let result = (|| {
+                                self.eval_call_arguments(
+                                    args,
+                                    &modes,
+                                    env,
+                                    depth,
+                                    &mut leases,
+                                    &mut values,
+                                )?;
+                                if let Some(value) = self.take_pending_fail() {
+                                    return Ok(Flow::fail(value));
+                                }
+                                self.call_function_flow(
+                                    name,
+                                    std::mem::take(&mut values),
+                                    expr.span,
+                                    depth + 1,
+                                )
+                            })();
+                            let result =
+                                self.finish_call_arguments(env, leases, values, result, expr.span);
+                            return self.call_argument_value(result, expr.span);
                         }
                     }
                     if let ExprKind::Field { target, name } = &callee.kind {
@@ -1573,27 +1661,34 @@ impl Interpreter {
                                 ));
                             };
                             let mut leases = Vec::new();
-                            let values = self.eval_call_arguments(
-                                args,
-                                param_modes,
-                                env,
-                                depth,
-                                &mut leases,
-                            )?;
-                            if self.pending_fail.is_some() {
-                                return Ok(Value::Null);
-                            }
-                            self.call_function_value(FunctionValueCall {
-                                params,
-                                param_modes,
-                                body,
-                                captures,
-                                self_name,
-                                is_async: *is_async,
-                                args: values,
-                                span: expr.span,
-                                depth: depth + 1,
-                            })
+                            let mut values = Vec::with_capacity(args.len());
+                            let result = (|| {
+                                self.eval_call_arguments(
+                                    args,
+                                    param_modes,
+                                    env,
+                                    depth,
+                                    &mut leases,
+                                    &mut values,
+                                )?;
+                                if let Some(value) = self.take_pending_fail() {
+                                    return Ok(Flow::fail(value));
+                                }
+                                self.call_function_value_flow(FunctionValueCall {
+                                    params,
+                                    param_modes,
+                                    body,
+                                    captures,
+                                    self_name,
+                                    is_async: *is_async,
+                                    args: std::mem::take(&mut values),
+                                    span: expr.span,
+                                    depth: depth + 1,
+                                })
+                            })();
+                            let result =
+                                self.finish_call_arguments(env, leases, values, result, expr.span);
+                            self.call_argument_value(result, expr.span)
                         });
                     }
                     let mut values = Vec::with_capacity(args.len());
