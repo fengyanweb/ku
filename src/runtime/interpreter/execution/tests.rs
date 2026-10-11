@@ -553,3 +553,326 @@ fn Count(n: int): int {
     assert!(interpreter.steps > 0);
     assert_eq!(interpreter.call_depth, 0);
 }
+
+fn function_value_call(value: &Value, argument: i64, depth: usize) -> FunctionValueCall<'_> {
+    let Value::Function {
+        params,
+        param_modes,
+        body,
+        captures,
+        self_name,
+        is_async,
+    } = value
+    else {
+        panic!("checked factory must return a real function value");
+    };
+    FunctionValueCall {
+        params,
+        param_modes,
+        body,
+        captures,
+        self_name,
+        is_async: *is_async,
+        args: vec![Value::Int(argument)],
+        span: Span::default(),
+        depth,
+    }
+}
+
+#[test]
+fn production_local_non_tail_self_calls_read_stable_scalar_captures() {
+    let mut interpreter = production_interpreter(
+        r#"
+fn Make() {
+    OFFSET = 20
+    fn local(n: int): int {
+        if (n <= 0) { return OFFSET }
+        return n + local(n - 1)
+    }
+    return local.clone()
+}
+"#,
+    );
+    let value = interpreter
+        .call_function("Make", vec![], Span::default(), 0)
+        .unwrap();
+    assert_eq!(
+        try_execute_function_value(&mut interpreter, &function_value_call(&value, 3, 0))
+            .expect("stable read-only scalar captures should select the flat driver")
+            .unwrap(),
+        Value::Int(26)
+    );
+    assert_eq!(
+        interpreter
+            .call_function_value(function_value_call(&value, 3, 0))
+            .unwrap(),
+        Value::Int(26)
+    );
+    assert_eq!(interpreter.call_depth, 0);
+}
+
+#[test]
+fn production_shared_capture_writes_and_foreign_mutable_reads_keep_original_engine() {
+    let runtime = TaskRuntime::new();
+    let task = runtime
+        .spawn(|| {
+            let mut interpreter = production_interpreter(
+                r#"
+fn Make() {
+    captured = 10
+    fn local(n: int): int {
+        captured = captured + 1
+        if (n <= 0) { return captured }
+        return n + local(n - 1)
+    }
+    captured = 20
+    return local.clone()
+}
+"#,
+            );
+            let value = interpreter.call_function("Make", vec![], Span::default(), 0)?;
+            let call = function_value_call(&value, 3, 0);
+            assert_ne!(crate::runtime::task::current_task_id(), 0);
+            assert!(call.captures.is_stable_scalar_binding("captured"));
+            assert_eq!(
+                call.captures.get("captured", Span::default())?,
+                Value::Int(20)
+            );
+            assert!(try_execute_function_value(&mut interpreter, &call).is_none());
+            assert_eq!(
+                call.captures.get("captured", Span::default())?,
+                Value::Int(20)
+            );
+            let result = interpreter.call_function_value(function_value_call(&value, 3, 0))?;
+            assert_eq!(interpreter.call_depth, 0);
+            let updated = function_value_call(&value, 0, 0)
+                .captures
+                .get("captured", Span::default())?;
+            Ok(Value::Array(vec![result, updated]))
+        })
+        .unwrap();
+    // Drain before inspecting the semantic result, including ordinary failures.
+    let outcome = task.await_result();
+    drop(task);
+    let drained = runtime.cancel_all_and_wait(Duration::from_secs(2));
+    let snapshot = runtime.snapshot().unwrap();
+    drained.unwrap();
+    assert_eq!(snapshot.active_tasks, 0);
+    assert_eq!(snapshot.queued_tasks, 0);
+    assert_eq!(
+        outcome.unwrap(),
+        Value::Array(vec![Value::Int(30), Value::Int(24)])
+    );
+
+    let mut interpreter = production_interpreter(
+        r#"
+fn Make() {
+    captured = 10
+    fn local(n: int): int { return captured + n }
+    return local.clone()
+}
+"#,
+    );
+    let mut value = interpreter
+        .call_function("Make", vec![], Span::default(), 0)
+        .unwrap();
+    let (mut owner, foreign_capture) = thread::spawn(|| {
+        let mut owner = Env::new();
+        owner
+            .define_owned("captured".into(), Value::Int(10), true, Span::default())
+            .unwrap();
+        let capture = owner.capture(&HashSet::from(["captured".into()]));
+        (owner, capture)
+    })
+    .join()
+    .unwrap();
+    let Value::Function { captures, .. } = &mut value else {
+        panic!("checked factory must return a function");
+    };
+    *captures = foreign_capture;
+    let call = function_value_call(&value, 5, 0);
+    assert_eq!(
+        call.captures.get("captured", Span::default()).unwrap(),
+        Value::Int(10)
+    );
+    assert!(!call.captures.is_stable_scalar_binding("captured"));
+    assert!(try_execute_function_value(&mut interpreter, &call).is_none());
+    assert_eq!(
+        interpreter
+            .call_function_value(function_value_call(&value, 5, 0))
+            .unwrap(),
+        Value::Int(15)
+    );
+    owner
+        .assign_owned("captured", Value::Int(30), Span::default())
+        .unwrap();
+    assert!(
+        try_execute_function_value(&mut interpreter, &function_value_call(&value, 5, 0)).is_none()
+    );
+    assert_eq!(
+        interpreter
+            .call_function_value(function_value_call(&value, 5, 0))
+            .unwrap(),
+        Value::Int(35)
+    );
+    assert_eq!(interpreter.call_depth, 0);
+}
+
+#[test]
+fn production_self_callee_ticks_and_existing_512_call_budget_are_preserved() {
+    let mut named = production_interpreter(RECURSION);
+    assert_eq!(
+        named
+            .call_function("Descend", vec![Value::Int(3)], Span::default(), 0)
+            .unwrap(),
+        Value::Int(0)
+    );
+    let mut local = production_interpreter(&format!(
+        "fn Make() {{ {RECURSION}\nreturn Descend.clone() }}"
+    ));
+    let value = local
+        .call_function("Make", vec![], Span::default(), 0)
+        .unwrap();
+    local.steps = 0;
+    assert_eq!(
+        local
+            .call_function_value(function_value_call(&value, 3, 0))
+            .unwrap(),
+        Value::Int(0)
+    );
+    // Three recursive calls each evaluate their function-value callee once.
+    assert_eq!(local.steps, named.steps + 3);
+    assert_eq!(local.call_depth, 0);
+    local.call_depth = 510;
+    assert_eq!(
+        local
+            .call_function_value(function_value_call(&value, 1, 0))
+            .unwrap(),
+        Value::Int(0)
+    );
+    assert_eq!(local.call_depth, 510);
+    assert_depth_error(local.call_function_value(function_value_call(&value, 2, 0)));
+    assert_eq!(local.call_depth, 510);
+}
+
+#[test]
+fn production_local_self_name_shadowing_remains_legal_without_partial_selection() {
+    let mut interpreter = production_interpreter(
+        r#"
+fn Make() {
+    fn local(n: int): int {
+        if (n <= 0) { local: int = 7
+            return local }
+        return local(n - 1)
+    }
+    return local.clone()
+}
+"#,
+    );
+    let value = interpreter
+        .call_function("Make", vec![], Span::default(), 0)
+        .unwrap();
+    assert!(
+        try_execute_function_value(&mut interpreter, &function_value_call(&value, 2, 0)).is_none()
+    );
+    assert_eq!(
+        interpreter
+            .call_function_value(function_value_call(&value, 2, 0))
+            .unwrap(),
+        Value::Int(7)
+    );
+    assert_eq!(interpreter.call_depth, 0);
+}
+
+#[test]
+fn production_self_name_collision_retains_existing_global_call_precedence() {
+    let mut interpreter = production_interpreter(
+        r#"
+fn collide(n: int): int { return n + 100 }
+fn Make() {
+    fn collide(n: int): int {
+        if (n <= 0) { return 0 }
+        return collide(n - 1)
+    }
+    return collide.clone()
+}
+"#,
+    );
+    let value = interpreter
+        .call_function("Make", vec![], Span::default(), 0)
+        .unwrap();
+    assert!(
+        try_execute_function_value(&mut interpreter, &function_value_call(&value, 2, 0)).is_none()
+    );
+    assert_eq!(
+        interpreter
+            .call_function_value(function_value_call(&value, 2, 0))
+            .unwrap(),
+        Value::Int(101)
+    );
+    assert_eq!(interpreter.call_depth, 0);
+}
+
+#[test]
+fn production_unselected_owned_capture_global_call_and_self_alias_remain_supported() {
+    for (source, expected) in [
+        (
+            r#"
+fn Make() {
+    prefix = "kept"
+    fn local(n: int): int { return prefix.len() + n }
+    return local.clone()
+}
+"#,
+            6,
+        ),
+        (
+            r#"
+fn Add(n: int): int { return n + 10 }
+fn Make() {
+    fn local(n: int): int { return Add(n) + 1 }
+    return local.clone()
+}
+"#,
+            13,
+        ),
+        (
+            r#"
+fn Make() {
+    fn local(n: int): int {
+        alias = local.clone()
+        if (n <= 0) { return 0 }
+        return alias(n - 1)
+    }
+    return local.clone()
+}
+"#,
+            0,
+        ),
+    ] {
+        let mut interpreter = production_interpreter(source);
+        let value = interpreter
+            .call_function("Make", vec![], Span::default(), 0)
+            .unwrap();
+        assert!(
+            try_execute_function_value(&mut interpreter, &function_value_call(&value, 2, 0))
+                .is_none(),
+            "the entire unsuitable subtree must keep its original evaluator"
+        );
+        assert_eq!(
+            interpreter
+                .call_function_value(function_value_call(&value, 2, 0))
+                .unwrap(),
+            Value::Int(expected)
+        );
+        if let Value::Function { captures, .. } = &value {
+            if captures.contains("prefix") {
+                assert_eq!(
+                    captures.get("prefix", Span::default()).unwrap(),
+                    Value::String("kept".into())
+                );
+            }
+        }
+        assert_eq!(interpreter.call_depth, 0);
+    }
+}

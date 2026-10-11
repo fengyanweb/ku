@@ -530,6 +530,27 @@ impl Interpreter {
         call: FunctionValueCall<'_>,
         declared_async: bool,
     ) -> KuResult<Flow> {
+        if call.depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
+            return Err(KuError::structured(
+                crate::error::KuErrorKind::Runtime,
+                "runtime",
+                "call_depth_exceeded",
+                format!("maximum call depth exceeded: {MAX_CALL_DEPTH}"),
+                call.span,
+            ));
+        }
+        if !declared_async {
+            if let Some(result) = execution::try_execute_function_value(self, &call) {
+                return self
+                    .finish_call_scope(
+                        Env::new(),
+                        Vec::new(),
+                        result.map(Flow::returned),
+                        call.span,
+                    )?
+                    .into_call_flow(call.span, "function value");
+            }
+        }
         let FunctionValueCall {
             params,
             param_modes,
@@ -541,15 +562,6 @@ impl Interpreter {
             span,
             depth,
         } = call;
-        if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
-            return Err(KuError::structured(
-                crate::error::KuErrorKind::Runtime,
-                "runtime",
-                "call_depth_exceeded",
-                format!("maximum call depth exceeded: {MAX_CALL_DEPTH}"),
-                span,
-            ));
-        }
         self.call_depth += 1;
         let result = (|| -> KuResult<Flow> {
             if params.len() != args.len() || params.len() != param_modes.len() {

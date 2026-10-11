@@ -3,11 +3,11 @@
 //! The production slice admits a complete static scalar call tree before any
 //! body effects. Once admitted, every nested call stays in this dispatch loop.
 //! Other language constructs keep their existing evaluator; Owned, borrows,
-//! function values, waiting and finally still require later migration slices.
+//! general function values, waiting and finally require later migration slices.
 //! This partial production integration does not close the full P0 contract.
 
 use super::*;
-use crate::ast::TypeName;
+use crate::ast::{Param, TypeName};
 use storage::{FrameLimits, FrameStack, ReserveError};
 
 mod storage;
@@ -83,6 +83,7 @@ enum Work<'a> {
     },
     Statement(&'a Stmt),
     Eval(&'a Expr),
+    SelfCallee(Span),
     Unary(UnaryOp, Span),
     BinaryLeft(BinaryOp, &'a Expr, Span),
     BinaryRight(BinaryOp, Span),
@@ -109,6 +110,9 @@ enum Syntax<'a> {
 
 struct Machine<'a> {
     source: &'a HashMap<String, FnDecl>,
+    // Some only for one closed local self-recursive function. These shared
+    // binding cells contain stable scalar values, never a copied Owned payload.
+    captures: Option<&'a Env>,
     calls: FrameStack<CallFrame>,
     work: FrameStack<Work<'a>>,
     values: FrameStack<Value>,
@@ -177,6 +181,16 @@ fn preflight_tree(
     limits: Limits,
     entry: Option<&FnDecl>,
 ) -> KuResult<()> {
+    preflight_tree_mode(source, limits, entry, false, None)
+}
+
+fn preflight_tree_mode(
+    source: &HashMap<String, FnDecl>,
+    limits: Limits,
+    entry: Option<&FnDecl>,
+    local_self: bool,
+    captures: Option<&HashSet<String>>,
+) -> KuResult<()> {
     let mut pending = FrameStack::new(limits.syntax);
     let mut checked = FrameStack::new(limits.syntax);
     let mut remaining = limits.syntax_steps;
@@ -206,10 +220,11 @@ fn preflight_tree(
                 if function.is_async
                     || !function.type_params.is_empty()
                     || !scalar_type(&function.return_type)
-                    || function
-                        .params
-                        .iter()
-                        .any(|param| param.mode != ParamMode::Owned || !scalar_type(&param.ty))
+                    || function.params.iter().any(|param| {
+                        param.mode != ParamMode::Owned
+                            || !scalar_type(&param.ty)
+                            || (local_self && param.name == function.name)
+                    })
                 {
                     return Err(unsupported(function.span));
                 }
@@ -220,45 +235,61 @@ fn preflight_tree(
                     push(&mut pending, Syntax::Statement(stmt));
                 }
             }
-            Syntax::Statement(stmt) => match stmt {
-                Stmt::VarDecl {
-                    value, ty, span, ..
-                } => {
-                    if !scalar_type(ty) {
-                        return Err(unsupported(*span));
-                    }
-                    reserve(&mut pending, 1, *span)?;
-                    push(&mut pending, Syntax::Expression(value));
+            Syntax::Statement(stmt) => {
+                if local_self
+                    && matches!(stmt, Stmt::VarDecl { name, .. } | Stmt::Assign { name, .. }
+                        if entry.is_some_and(|function| name == &function.name))
+                {
+                    return Err(unsupported(stmt_span(stmt)));
                 }
-                Stmt::Assign { value, span, .. } | Stmt::Expr { expr: value, span } => {
-                    reserve(&mut pending, 1, *span)?;
-                    push(&mut pending, Syntax::Expression(value));
+                if matches!(stmt, Stmt::Assign { name, .. }
+                    if captures.is_some_and(|captures| captures.contains(name)))
+                {
+                    // Shared writes need the inner scope/call cleanup arbiter
+                    // before the parent resumes. Until those exits migrate,
+                    // keep the complete capture-writing tree in its old engine.
+                    return Err(unsupported(stmt_span(stmt)));
                 }
-                Stmt::Return { value, span } => {
-                    if let Some(value) = value {
+                match stmt {
+                    Stmt::VarDecl {
+                        value, ty, span, ..
+                    } => {
+                        if !scalar_type(ty) {
+                            return Err(unsupported(*span));
+                        }
                         reserve(&mut pending, 1, *span)?;
                         push(&mut pending, Syntax::Expression(value));
                     }
-                }
-                Stmt::If {
-                    condition,
-                    then_branch,
-                    else_branch,
-                    span,
-                } => {
-                    let count = then_branch
-                        .len()
-                        .checked_add(else_branch.len())
-                        .and_then(|n| n.checked_add(1))
-                        .ok_or_else(|| unsupported(*span))?;
-                    reserve(&mut pending, count, *span)?;
-                    for stmt in then_branch.iter().chain(else_branch).rev() {
-                        push(&mut pending, Syntax::Statement(stmt));
+                    Stmt::Assign { value, span, .. } | Stmt::Expr { expr: value, span } => {
+                        reserve(&mut pending, 1, *span)?;
+                        push(&mut pending, Syntax::Expression(value));
                     }
-                    push(&mut pending, Syntax::Expression(condition));
+                    Stmt::Return { value, span } => {
+                        if let Some(value) = value {
+                            reserve(&mut pending, 1, *span)?;
+                            push(&mut pending, Syntax::Expression(value));
+                        }
+                    }
+                    Stmt::If {
+                        condition,
+                        then_branch,
+                        else_branch,
+                        span,
+                    } => {
+                        let count = then_branch
+                            .len()
+                            .checked_add(else_branch.len())
+                            .and_then(|n| n.checked_add(1))
+                            .ok_or_else(|| unsupported(*span))?;
+                        reserve(&mut pending, count, *span)?;
+                        for stmt in then_branch.iter().chain(else_branch).rev() {
+                            push(&mut pending, Syntax::Statement(stmt));
+                        }
+                        push(&mut pending, Syntax::Expression(condition));
+                    }
+                    _ => return Err(unsupported(stmt_span(stmt))),
                 }
-                _ => return Err(unsupported(stmt_span(stmt))),
-            },
+            }
             Syntax::Expression(expr) => match &expr.kind {
                 ExprKind::Literal(
                     Literal::Int(_) | Literal::Float(_) | Literal::Bool(_) | Literal::Null,
@@ -285,6 +316,11 @@ fn preflight_tree(
                         return Err(unsupported(callee.span));
                     };
                     let function = source.get(name).ok_or_else(|| unsupported(callee.span))?;
+                    if local_self && args.len() != function.params.len() {
+                        // Preserve the existing function-value argument error
+                        // and its priority by leaving this complete tree there.
+                        return Err(unsupported(expr.span));
+                    }
                     reserve(
                         &mut pending,
                         args.len()
@@ -308,6 +344,7 @@ impl<'a> Machine<'a> {
     fn new(source: &'a HashMap<String, FnDecl>, limits: Limits, initial_depth: usize) -> Self {
         Self {
             source,
+            captures: None,
             calls: FrameStack::new(limits.calls),
             work: FrameStack::new(limits.work),
             values: FrameStack::new(limits.values),
@@ -370,7 +407,13 @@ impl<'a> Machine<'a> {
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?
             .saturating_sub(self.values.len());
         reserve(&mut self.values, return_slot, span)?;
-        let mut env = Env::new();
+        let mut env = if let Some(captures) = self.captures {
+            let mut env = captures.clone();
+            env.push_scope();
+            env
+        } else {
+            Env::new()
+        };
         for (index, param) in function.params.iter().enumerate() {
             let value = std::mem::replace(
                 self.values.get_mut(base + index).expect("argument slot"),
@@ -521,7 +564,11 @@ impl<'a> Machine<'a> {
                             unreachable!("preflight");
                         };
                         let function = self.source.get(name).expect("preflight checked callee");
-                        reserve(&mut self.work, 1, expr.span)?;
+                        reserve(
+                            &mut self.work,
+                            if self.captures.is_some() { 2 } else { 1 },
+                            expr.span,
+                        )?;
                         push(
                             &mut self.work,
                             Work::Arguments {
@@ -532,10 +579,17 @@ impl<'a> Machine<'a> {
                                 span: expr.span,
                             },
                         );
+                        if self.captures.is_some() {
+                            // Function-value dispatch evaluates the callable
+                            // before its arguments. Keep that exact safepoint;
+                            // its self binding cannot be observed in this tree.
+                            push(&mut self.work, Work::SelfCallee(callee.span));
+                        }
                     }
                     _ => unreachable!("preflight rejected unsupported expression"),
                 }
             }
+            Work::SelfCallee(_) => self.metrics.steps += 1,
             Work::Unary(op, span) => {
                 let value = match (op, self.value()) {
                     (UnaryOp::Negate, Value::Int(value)) => value
@@ -679,6 +733,7 @@ impl<'a> Machine<'a> {
                 match &step {
                     Work::Statement(stmt) => poll(stmt_span(stmt))?,
                     Work::Eval(expr) => poll(expr.span)?,
+                    Work::SelfCallee(span) => poll(*span)?,
                     _ => {}
                 }
                 self.metrics.dispatches += 1;
@@ -757,6 +812,82 @@ pub(super) fn try_execute(
     let mut machine = Machine::new(&source, limits, interpreter.call_depth);
     Some(
         machine.run_with_poll(&function.name, args, depth, false, |span| {
+            interpreter.tick(span)
+        }),
+    )
+}
+
+pub(super) fn try_execute_function_value(
+    interpreter: &mut Interpreter,
+    call: &FunctionValueCall<'_>,
+) -> Option<KuResult<Value>> {
+    // Scope-exit deadline arbitration has not yet migrated into this scalar
+    // driver. In cleanup/finally code the whole tree keeps its original engine
+    // so no shared capture write can run past an inner epilogue failure.
+    if current_cleanup_context().is_some()
+        || interpreter.termination.is_some()
+        || crate::runtime::task::current_execution_termination().is_some()
+        || call.is_async
+        || call.params.len() != call.args.len()
+        || call.params.len() != call.param_modes.len()
+        || call
+            .param_modes
+            .iter()
+            .any(|mode| *mode != ParamMode::Owned)
+        || call
+            .args
+            .iter()
+            .any(|value| scalar(value, call.span).is_err())
+    {
+        return None;
+    }
+    let name = call.self_name.as_ref()?;
+    if interpreter.functions.contains_key(name) {
+        // Global named calls take precedence over same-name local bindings in
+        // the existing language, even inside a function value.
+        return None;
+    }
+    let mut parameter_names = HashSet::new();
+    if call.params.iter().any(|name| !parameter_names.insert(name)) {
+        return None;
+    }
+    let function = FnDecl {
+        name: name.clone(),
+        is_async: false,
+        type_params: Vec::new(),
+        params: call
+            .params
+            .iter()
+            .map(|name| Param {
+                mode: ParamMode::Owned,
+                name: name.clone(),
+                ty: None,
+                span: call.span,
+            })
+            .collect(),
+        return_type: None,
+        body: call.body.to_vec(),
+        span: call.span,
+    };
+    // Clone only immutable code metadata, once for the complete subtree. The
+    // recursive self binding is replaced by a static code reference only when
+    // no admitted operation can read, overwrite or export that binding.
+    let limits = Limits::default();
+    let source = HashMap::from([(name.clone(), function)]);
+    let entry = source.get(name).expect("local entry code");
+    let captures = function_capture_names(entry).ok()?;
+    if captures.iter().any(|name| {
+        interpreter.functions.contains_key(name) || !call.captures.is_stable_scalar_binding(name)
+    }) {
+        return None;
+    }
+    if preflight_tree_mode(&source, limits, Some(entry), true, Some(&captures)).is_err() {
+        return None;
+    }
+    let mut machine = Machine::new(&source, limits, interpreter.call_depth);
+    machine.captures = Some(call.captures);
+    Some(
+        machine.run_with_poll(name, &call.args, call.depth, false, |span| {
             interpreter.tick(span)
         }),
     )

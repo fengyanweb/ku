@@ -417,6 +417,25 @@ impl Env {
         self.with_value(name, span, |value| Ok(value.clone()))
     }
 
+    /// A synchronous scalar subtree may share this cell only while its type
+    /// cannot change on another task or ordinary host thread. Immutable cells
+    /// are stable; a mutable cell belongs to a unique running Ku task. Task id
+    /// zero is shared by ordinary host callers, so it proves no exclusivity.
+    pub(crate) fn is_stable_scalar_binding(&self, name: &str) -> bool {
+        let Some(cell) = self.find_cell(name) else {
+            return false;
+        };
+        let Ok(binding) = cell.lock() else {
+            return false;
+        };
+        matches!(
+            binding.value,
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null
+        ) && (!binding.mutable
+            || (binding.owner_task_id != 0
+                && binding.owner_task_id == crate::runtime::task::current_task_id()))
+    }
+
     /// Ku owning reads transfer Task-containing values instead of sharing an
     /// internal handle lease with a moved-from slot. Other values retain get's
     /// existing transparent snapshot/borrow behavior.
