@@ -322,17 +322,9 @@ impl Interpreter {
                 .map(Flow::returned);
         }
         if let Some(result) = execution::try_execute(self, &function, &args, depth) {
-            // This slice admits no Owned/borrow/Task payloads. Keep the existing
-            // call boundary's termination/deadline arbitration even for scalar
-            // returns, including calls made from cancellation finally code.
-            return self
-                .finish_call_scope(
-                    Env::new(),
-                    Vec::new(),
-                    result.map(Flow::returned),
-                    function.span,
-                )?
-                .into_call_flow(function.span, "function");
+            // The driver has completed the real scope/call epilogues and kept
+            // their carried cleanup context in this Flow.
+            return result;
         }
         self.call_function_direct_flow(function, args, span, depth)
     }
@@ -541,14 +533,7 @@ impl Interpreter {
         }
         if !declared_async {
             if let Some(result) = execution::try_execute_function_value(self, &call) {
-                return self
-                    .finish_call_scope(
-                        Env::new(),
-                        Vec::new(),
-                        result.map(Flow::returned),
-                        call.span,
-                    )?
-                    .into_call_flow(call.span, "function value");
+                return result;
             }
         }
         let FunctionValueCall {

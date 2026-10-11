@@ -2,6 +2,7 @@
 //!
 //! The production slice admits a complete static scalar call tree before any
 //! body effects. Once admitted, every nested call stays in this dispatch loop.
+//! Scope, call and argument exits use the evaluator's real resource arbitration.
 //! Other language constructs keep their existing evaluator; Owned, borrows,
 //! general function values, waiting and finally require later migration slices.
 //! This partial production integration does not close the full P0 contract.
@@ -23,6 +24,7 @@ struct Limits {
     syntax_steps: usize,
     // Test harness fuel, not a new language execution limit. Production
     // migration must use its existing cancellation/safepoint contract instead.
+    #[cfg(test)]
     prototype_dispatch_steps: usize,
 }
 
@@ -46,6 +48,7 @@ impl Default for Limits {
                 max_storage_bytes: 1024 * 1024,
             },
             syntax_steps: 1_000_000,
+            #[cfg(test)]
             prototype_dispatch_steps: 1_000_000,
         }
     }
@@ -62,18 +65,164 @@ struct Metrics {
     remaining_work: usize,
     remaining_values: usize,
     logical_depth: usize,
-    // Execution Vec backing only: calls/work/values, excluding the separate
-    // preflight syntax stack, source, Env/string keys, allocator overhead and
-    // Value payloads. Summed per-stack peaks are not a simultaneous RSS sample.
+    // Execution Vec backing only: calls/work/values and staged arguments,
+    // excluding the separate preflight syntax stack, source, Env/string keys,
+    // allocator overhead and Value payloads. Summed peaks are not a simultaneous
+    // RSS sample.
     retained_backing_bytes: usize,
     peak_backing_bytes_upper_bound: usize,
 }
 
-struct CallFrame {
+#[derive(Clone, Copy)]
+enum CallKind {
+    Named,
+    FunctionValue,
+}
+
+impl CallKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Named => "function",
+            Self::FunctionValue => "function value",
+        }
+    }
+}
+
+/// The evaluator supplies its existing resource and termination arbitration.
+/// These callbacks never evaluate Ku syntax or start another execution machine.
+trait ExecutionHooks {
+    fn tick(&mut self, span: Span) -> KuResult<()>;
+    fn finish_scope(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<Flow>,
+        span: Span,
+        pop: bool,
+    ) -> KuResult<Flow>;
+    fn finish_call(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+    ) -> KuResult<Flow>;
+    fn finish_arguments(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+    ) -> KuResult<Flow>;
+}
+
+impl ExecutionHooks for Interpreter {
+    fn tick(&mut self, span: Span) -> KuResult<()> {
+        Interpreter::tick(self, span)
+    }
+
+    fn finish_scope(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<Flow>,
+        span: Span,
+        pop: bool,
+    ) -> KuResult<Flow> {
+        self.finish_owned_scope(env, result, span, pop)
+    }
+
+    fn finish_call(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+    ) -> KuResult<Flow> {
+        self.finish_call_scope(env, leases, result, span)?
+            .into_call_flow(span, kind.label())
+    }
+
+    fn finish_arguments(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+    ) -> KuResult<Flow> {
+        self.finish_call_arguments(env, leases, values, result, span)
+    }
+}
+
+#[cfg(test)]
+struct PollHooks<P> {
+    host: Interpreter,
+    poll: P,
+}
+
+#[cfg(test)]
+impl<P: FnMut(Span) -> KuResult<()>> ExecutionHooks for PollHooks<P> {
+    fn tick(&mut self, span: Span) -> KuResult<()> {
+        (self.poll)(span)
+    }
+
+    fn finish_scope(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<Flow>,
+        span: Span,
+        pop: bool,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_scope(&mut self.host, env, result, span, pop)
+    }
+
+    fn finish_call(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_call(&mut self.host, env, leases, result, span, kind)
+    }
+
+    fn finish_arguments(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_arguments(&mut self.host, env, leases, values, result, span)
+    }
+}
+
+struct CallFrame<'a> {
     env: Env,
+    leases: Vec<BorrowLease>,
     depth: usize,
-    work_base: usize,
     value_base: usize,
+    // A borrowed syntax span keeps the admitted frame small. The immutable
+    // source tree outlives every frame, including its flat unwind.
+    epilogue_span: &'a Span,
+    kind: CallKind,
+}
+
+#[derive(Clone, Copy)]
+enum ScopeFallthrough {
+    Continue,
+    ReturnNull,
+}
+
+struct ArgumentFrame<'a> {
+    span: &'a Span,
+    value_base: usize,
+    leases: Vec<BorrowLease>,
+    staged: Vec<Value>,
 }
 
 enum Work<'a> {
@@ -92,13 +241,24 @@ enum Work<'a> {
     Bind(&'a str, bool, bool, Span),
     Discard,
     Return,
-    Fallthrough,
+    ScopeExit {
+        span: Span,
+        value_base: usize,
+        fallthrough: ScopeFallthrough,
+    },
+    CallExit,
+    PrepareArguments {
+        function: &'a FnDecl,
+        args: &'a [Expr],
+        span: &'a Span,
+    },
+    ArgumentsExit(ArgumentFrame<'a>),
     Arguments {
         function: &'a FnDecl,
         args: &'a [Expr],
         next: usize,
-        base: usize,
-        span: Span,
+        exit_index: usize,
+        span: &'a Span,
     },
 }
 
@@ -113,18 +273,24 @@ struct Machine<'a> {
     // Some only for one closed local self-recursive function. These shared
     // binding cells contain stable scalar values, never a copied Owned payload.
     captures: Option<&'a Env>,
-    calls: FrameStack<CallFrame>,
+    calls: FrameStack<CallFrame<'a>>,
     work: FrameStack<Work<'a>>,
     values: FrameStack<Value>,
     initial_depth: usize,
     call_depth: usize,
+    #[cfg(test)]
     remaining_dispatches: usize,
     metrics: Metrics,
+    pending: Option<KuResult<Flow>>,
+    value_limits: FrameLimits,
+    argument_capacity: usize,
+    argument_bytes: usize,
+    peak_argument_bytes: usize,
 }
 
 fn storage_error(error: ReserveError, span: Span) -> KuError {
-    // Prototype-only diagnostics. Existing runtime diagnoses are reused only
-    // for already-defined semantics, e.g. call_depth_exceeded below.
+    // Private storage diagnostics. Existing runtime diagnoses are reused for
+    // already-defined semantics, e.g. call_depth_exceeded below.
     KuError::runtime(
         format!("internal execution storage rejected: {error:?}"),
         span,
@@ -189,7 +355,7 @@ fn preflight_tree_mode(
     limits: Limits,
     entry: Option<&FnDecl>,
     local_self: bool,
-    captures: Option<&HashSet<String>>,
+    _captures: Option<&HashSet<String>>,
 ) -> KuResult<()> {
     let mut pending = FrameStack::new(limits.syntax);
     let mut checked = FrameStack::new(limits.syntax);
@@ -240,14 +406,6 @@ fn preflight_tree_mode(
                     && matches!(stmt, Stmt::VarDecl { name, .. } | Stmt::Assign { name, .. }
                         if entry.is_some_and(|function| name == &function.name))
                 {
-                    return Err(unsupported(stmt_span(stmt)));
-                }
-                if matches!(stmt, Stmt::Assign { name, .. }
-                    if captures.is_some_and(|captures| captures.contains(name)))
-                {
-                    // Shared writes need the inner scope/call cleanup arbiter
-                    // before the parent resumes. Until those exits migrate,
-                    // keep the complete capture-writing tree in its old engine.
                     return Err(unsupported(stmt_span(stmt)));
                 }
                 match stmt {
@@ -350,12 +508,18 @@ impl<'a> Machine<'a> {
             values: FrameStack::new(limits.values),
             initial_depth,
             call_depth: initial_depth,
+            #[cfg(test)]
             remaining_dispatches: limits.prototype_dispatch_steps,
             metrics: Metrics::default(),
+            pending: None,
+            value_limits: limits.values,
+            argument_capacity: 0,
+            argument_bytes: 0,
+            peak_argument_bytes: 0,
         }
     }
 
-    fn frame(&mut self) -> &mut CallFrame {
+    fn frame(&mut self) -> &mut CallFrame<'a> {
         let index = self.calls.len() - 1;
         self.calls.get_mut(index).expect("current call frame")
     }
@@ -365,17 +529,91 @@ impl<'a> Machine<'a> {
     }
 
     fn emit(&mut self, value: Value, span: Span) -> KuResult<()> {
-        reserve(&mut self.values, 1, span)?;
+        self.reserve_values(1, span)?;
         push(&mut self.values, value);
         Ok(())
+    }
+
+    fn reserve_values(&mut self, additional: usize, span: Span) -> KuResult<()> {
+        let frames = self
+            .value_limits
+            .max_frames
+            .checked_sub(self.argument_capacity)
+            .ok_or_else(|| storage_error(ReserveError::FrameLimit, span))?;
+        let bytes = self
+            .value_limits
+            .max_storage_bytes
+            .checked_sub(self.argument_bytes)
+            .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
+        self.values
+            .reserve_with_budget(additional, frames, bytes)
+            .map_err(|error| storage_error(error, span))
+    }
+
+    fn argument_storage(&mut self, count: usize, span: Span) -> KuResult<Vec<Value>> {
+        self.check_argument_capacity(count, span)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| storage_error(ReserveError::AllocationFailed, span))?;
+        // As with FrameStack, allocator overcapacity is checked before the
+        // candidate is published. This is retained backing accounting, not a
+        // pre-allocation hard cap on allocator metadata or process RSS.
+        let capacity = values.capacity();
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<Value>())
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let transient_bytes = self
+            .argument_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        self.peak_argument_bytes = self.peak_argument_bytes.max(transient_bytes);
+        self.check_argument_capacity(capacity, span)?;
+        self.argument_capacity += capacity;
+        self.argument_bytes += bytes;
+        Ok(values)
+    }
+
+    fn check_argument_capacity(&self, additional: usize, span: Span) -> KuResult<()> {
+        let capacity = self
+            .argument_capacity
+            .checked_add(additional)
+            .and_then(|total| total.checked_add(self.values.capacity()))
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        if capacity > self.value_limits.max_frames {
+            return Err(storage_error(ReserveError::FrameLimit, span));
+        }
+        let bytes = additional
+            .checked_mul(std::mem::size_of::<Value>())
+            .and_then(|bytes| bytes.checked_add(self.argument_bytes))
+            .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        if bytes > self.value_limits.max_storage_bytes {
+            return Err(storage_error(ReserveError::StorageLimit, span));
+        }
+        Ok(())
+    }
+
+    fn release_argument_capacity(&mut self, capacity: usize) {
+        // The corresponding buffer was consumed by a hook or already dropped.
+        self.argument_capacity -= capacity;
+        self.argument_bytes -= capacity * std::mem::size_of::<Value>();
+    }
+
+    fn discard_values_after(&mut self, base: usize) {
+        // Only scalar operands enter this slice. Future Owned migration must
+        // add its resource teardown rather than relying on this scalar pop.
+        while self.values.len() > base {
+            self.values.pop();
+        }
     }
 
     fn enter(
         &mut self,
         function: &'a FnDecl,
-        base: usize,
+        args: &[Value],
         depth: usize,
-        span: Span,
+        span: &'a Span,
     ) -> KuResult<()> {
         // Same two checks and same admission point as named call_function_flow.
         if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
@@ -384,60 +622,71 @@ impl<'a> Machine<'a> {
                 "runtime",
                 "call_depth_exceeded",
                 format!("maximum call depth exceeded: {MAX_CALL_DEPTH}"),
-                span,
+                *span,
             ));
         }
-        if self.values.len() - base != function.params.len() {
+        if args.len() != function.params.len() {
             return Err(KuError::runtime(
                 format!(
                     "function '{}' expects {} arguments but got {}",
                     function.name,
                     function.params.len(),
-                    self.values.len() - base
+                    args.len()
                 ),
                 function.span,
             ));
         }
-        reserve(&mut self.calls, 1, span)?;
-        reserve(&mut self.work, 2, span)?;
-        // A zero-argument return also needs an operand slot. Obtain it before
-        // entering the call so unwinding never has to allocate its result slot.
-        let return_slot = base
-            .checked_add(1)
-            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?
-            .saturating_sub(self.values.len());
-        reserve(&mut self.values, return_slot, span)?;
-        let mut env = if let Some(captures) = self.captures {
+        reserve(&mut self.calls, 1, *span)?;
+        reserve(&mut self.work, 3, *span)?;
+        // The result and all exit markers are admitted before parameter binding
+        // or a scope effect. A later failure unwinds without new storage.
+        self.reserve_values(1, *span)?;
+        let env = if let Some(captures) = self.captures {
             let mut env = captures.clone();
             env.push_scope();
             env
         } else {
             Env::new()
         };
-        for (index, param) in function.params.iter().enumerate() {
-            let value = std::mem::replace(
-                self.values.get_mut(base + index).expect("argument slot"),
-                Value::Null,
-            );
-            env.define_parameter(param.name.clone(), value, false, param.span)?;
-        }
-        while self.values.len() > base {
-            self.values.pop();
-        }
-        env.push_scope();
+        let kind = if self.captures.is_some() {
+            CallKind::FunctionValue
+        } else {
+            CallKind::Named
+        };
         push(
             &mut self.calls,
             CallFrame {
                 env,
+                leases: Vec::new(),
                 depth,
-                work_base: self.work.len(),
-                value_base: base,
+                value_base: self.values.len(),
+                epilogue_span: if self.captures.is_some() {
+                    span
+                } else {
+                    &function.span
+                },
+                kind,
             },
         );
         self.call_depth += 1;
         self.metrics.entered_calls += 1;
         self.metrics.peak_calls = self.metrics.peak_calls.max(self.calls.len());
-        push(&mut self.work, Work::Fallthrough);
+        push(&mut self.work, Work::CallExit);
+        for (param, value) in function.params.iter().zip(args) {
+            let value = scalar(value, *span)?;
+            self.frame()
+                .env
+                .define_parameter(param.name.clone(), value, false, param.span)?;
+        }
+        push(
+            &mut self.work,
+            Work::ScopeExit {
+                span: function.body.first().map(stmt_span).unwrap_or_default(),
+                value_base: self.values.len(),
+                fallthrough: ScopeFallthrough::ReturnNull,
+            },
+        );
+        self.frame().env.push_scope();
         push(
             &mut self.work,
             Work::Block {
@@ -446,22 +695,6 @@ impl<'a> Machine<'a> {
             },
         );
         Ok(())
-    }
-
-    fn leave(&mut self, value: Value) {
-        let frame = self.calls.pop().expect("return has an active call");
-        while self.work.len() > frame.work_base {
-            self.work.pop();
-        }
-        while self.values.len() > frame.value_base {
-            self.values.pop();
-        }
-        // Only scalar envs are admitted in this prototype. No task/lease/owned
-        // cleanup is claimed here; those require explicit unwind continuations.
-        drop(frame);
-        self.call_depth -= 1;
-        self.metrics.retired_calls += 1;
-        push(&mut self.values, value);
     }
 
     fn step(&mut self, step: Work<'a>) -> KuResult<()> {
@@ -477,8 +710,6 @@ impl<'a> Machine<'a> {
                         },
                     );
                     push(&mut self.work, Work::Statement(stmt));
-                } else {
-                    self.frame().env.pop_scope();
                 }
             }
             Work::Statement(stmt) => {
@@ -571,12 +802,10 @@ impl<'a> Machine<'a> {
                         )?;
                         push(
                             &mut self.work,
-                            Work::Arguments {
+                            Work::PrepareArguments {
                                 function,
                                 args,
-                                next: 0,
-                                base: self.values.len(),
-                                span: expr.span,
+                                span: &expr.span,
                             },
                         );
                         if self.captures.is_some() {
@@ -637,7 +866,15 @@ impl<'a> Machine<'a> {
                 } else {
                     else_body
                 };
-                reserve(&mut self.work, 1, span)?;
+                reserve(&mut self.work, 2, span)?;
+                push(
+                    &mut self.work,
+                    Work::ScopeExit {
+                        span: selected.first().map(stmt_span).unwrap_or_default(),
+                        value_base: self.values.len(),
+                        fallthrough: ScopeFallthrough::Continue,
+                    },
+                );
                 self.frame().env.push_scope();
                 push(
                     &mut self.work,
@@ -661,36 +898,172 @@ impl<'a> Machine<'a> {
             }
             Work::Return => {
                 let value = self.value();
-                self.leave(value);
+                self.pending = Some(Ok(Flow::returned(value)));
             }
-            Work::Fallthrough => self.leave(Value::Null),
+            Work::PrepareArguments {
+                function,
+                args,
+                span,
+            } => {
+                // The argument boundary is installed before the first argument
+                // effect. Its actual buffer stays alive through the callee's
+                // scope/call exits and is consumed by the original arbiter.
+                reserve(&mut self.work, 2, *span)?;
+                let staged = self.argument_storage(args.len(), *span)?;
+                let exit_index = self.work.len();
+                push(
+                    &mut self.work,
+                    Work::ArgumentsExit(ArgumentFrame {
+                        span,
+                        value_base: self.values.len(),
+                        leases: Vec::new(),
+                        staged,
+                    }),
+                );
+                push(
+                    &mut self.work,
+                    Work::Arguments {
+                        function,
+                        args,
+                        next: 0,
+                        exit_index,
+                        span,
+                    },
+                );
+            }
             Work::Arguments {
                 function,
                 args,
                 next,
-                base,
+                exit_index,
                 span,
             } => {
+                if next > 0 {
+                    let value = self.value();
+                    let Work::ArgumentsExit(arguments) = self
+                        .work
+                        .get_mut(exit_index)
+                        .expect("live argument exit marker")
+                    else {
+                        unreachable!("argument marker retains its stable stack index");
+                    };
+                    // Full arity capacity was reserved before argument effects.
+                    assert!(arguments.staged.len() < arguments.staged.capacity());
+                    arguments.staged.push(value);
+                }
                 if let Some(arg) = args.get(next) {
-                    reserve(&mut self.work, 2, span)?;
+                    reserve(&mut self.work, 2, *span)?;
                     push(
                         &mut self.work,
                         Work::Arguments {
                             function,
                             args,
                             next: next + 1,
-                            base,
+                            exit_index,
                             span,
                         },
                     );
                     push(&mut self.work, Work::Eval(arg));
                 } else {
                     let depth = self.frame().depth + 1;
-                    self.enter(function, base, depth, span)?;
+                    // Temporarily move the buffer, never clone its elements.
+                    // Stack growth may move the marker, but its index remains
+                    // stable until every continuation above it has retired.
+                    let Work::ArgumentsExit(arguments) = self
+                        .work
+                        .get_mut(exit_index)
+                        .expect("live argument exit marker")
+                    else {
+                        unreachable!("argument exit marker");
+                    };
+                    let staged = std::mem::take(&mut arguments.staged);
+                    let result = self.enter(function, &staged, depth, span);
+                    let Work::ArgumentsExit(arguments) = self
+                        .work
+                        .get_mut(exit_index)
+                        .expect("live argument exit marker")
+                    else {
+                        unreachable!("argument exit marker");
+                    };
+                    arguments.staged = staged;
+                    result?;
                 }
+            }
+            Work::ScopeExit { .. } | Work::CallExit | Work::ArgumentsExit(_) => {
+                unreachable!("exit markers run through resource arbitration");
             }
         }
         Ok(())
+    }
+
+    fn finish_boundary(&mut self, boundary: Work<'a>, hooks: &mut impl ExecutionHooks) {
+        match boundary {
+            Work::ScopeExit {
+                span,
+                value_base,
+                fallthrough,
+            } => {
+                let result = self.pending.take().unwrap_or_else(|| {
+                    Ok(match fallthrough {
+                        ScopeFallthrough::Continue => Flow::Continue,
+                        ScopeFallthrough::ReturnNull => Flow::returned(Value::Null),
+                    })
+                });
+                self.discard_values_after(value_base);
+                let result = hooks.finish_scope(&mut self.frame().env, result, span, true);
+                // Only a normally completed branch resumes its enclosing block.
+                // Return and error continue through every remaining exit marker.
+                if !matches!(&result, Ok(Flow::Continue)) {
+                    self.pending = Some(result);
+                }
+            }
+            Work::CallExit => {
+                let result = self.pending.take().expect("call body outcome");
+                let frame = self.calls.pop().expect("live call exit marker");
+                self.discard_values_after(frame.value_base);
+                let result = hooks.finish_call(
+                    frame.env,
+                    frame.leases,
+                    result,
+                    *frame.epilogue_span,
+                    frame.kind,
+                );
+                // Retire only after the real parameter Env/leases arbitration.
+                self.call_depth -= 1;
+                self.metrics.retired_calls += 1;
+                self.pending = Some(result);
+            }
+            Work::ArgumentsExit(arguments) => {
+                let result = self.pending.take().expect("argument or callee outcome");
+                self.discard_values_after(arguments.value_base);
+                let capacity = arguments.staged.capacity();
+                let span = *arguments.span;
+                let result = hooks.finish_arguments(
+                    &mut self.frame().env,
+                    arguments.leases,
+                    arguments.staged,
+                    result,
+                    span,
+                );
+                self.release_argument_capacity(capacity);
+                match result {
+                    // A callee's Fail has already been normalized at CallExit.
+                    // Keep any argument Fail in its original Flow form instead
+                    // of treating it as a callee Result value during unwinding.
+                    Ok(flow @ Flow::Fail { .. }) => self.pending = Some(Ok(flow)),
+                    Ok(flow) => match flow.into_call_value(span, "function") {
+                        Ok(value) => {
+                            // Callee admission reserved its return slot before
+                            // parameter/body effects. No allocation on unwind.
+                            push(&mut self.values, value);
+                        }
+                        Err(error) => self.pending = Some(Err(error)),
+                    },
+                    Err(error) => self.pending = Some(Err(error)),
+                }
+            }
+            _ => unreachable!("only exit markers use resource arbitration"),
+        }
     }
 
     #[cfg(test)]
@@ -698,60 +1071,102 @@ impl<'a> Machine<'a> {
         self.run_with_poll(entry, args, depth, true, |_| Ok(()))
     }
 
+    #[cfg(test)]
     fn run_with_poll(
         &mut self,
         entry: &str,
         args: &[Value],
         depth: usize,
         test_fuel: bool,
-        mut poll: impl FnMut(Span) -> KuResult<()>,
+        poll: impl FnMut(Span) -> KuResult<()>,
     ) -> KuResult<Value> {
-        let result = (|| {
-            let function = self.source.get(entry).ok_or_else(|| {
-                KuError::runtime(format!("undefined function '{entry}'"), Span::default())
-            })?;
-            reserve(&mut self.values, args.len(), function.span)?;
-            for arg in args {
-                scalar(arg, function.span)?;
-            }
-            for arg in args {
-                push(&mut self.values, scalar(arg, function.span)?);
-            }
-            self.enter(function, 0, depth, function.span)?;
-            // The sole dispatch loop: call entry/return only modify these flat
-            // stacks; no recursive evaluator or child driver is invoked.
-            while let Some(step) = self.work.pop() {
-                if test_fuel {
-                    self.remaining_dispatches =
-                        self.remaining_dispatches.checked_sub(1).ok_or_else(|| {
-                            KuError::runtime(
-                                "internal execution prototype test fuel exhausted",
-                                function.span,
-                            )
-                        })?;
-                }
-                match &step {
-                    Work::Statement(stmt) => poll(stmt_span(stmt))?,
-                    Work::Eval(expr) => poll(expr.span)?,
-                    Work::SelfCallee(span) => poll(*span)?,
-                    _ => {}
-                }
-                self.metrics.dispatches += 1;
-                self.step(step)?;
-            }
-            assert_eq!(self.calls.len(), 0);
-            assert_eq!(self.values.len(), 1);
-            Ok(self.value())
+        let span = self
+            .source
+            .get(entry)
+            .map(|function| function.span)
+            .unwrap_or_default();
+        let mut hooks = PollHooks {
+            host: Interpreter::new(),
+            poll,
+        };
+        self.run_with_hooks(entry, args, depth, test_fuel, &mut hooks)?
+            .into_call_value(span, "function")
+    }
+
+    fn run_with_hooks(
+        &mut self,
+        entry: &str,
+        args: &[Value],
+        depth: usize,
+        test_fuel: bool,
+        hooks: &mut impl ExecutionHooks,
+    ) -> KuResult<Flow> {
+        #[cfg(not(test))]
+        let _ = test_fuel;
+        let function = self.source.get(entry);
+        let span = function.map(|function| function.span).unwrap_or_default();
+        self.pending = None;
+        let admission = (|| {
+            let function = function
+                .ok_or_else(|| KuError::runtime(format!("undefined function '{entry}'"), span))?;
+            // Retain the existing entry argument budget admission even though
+            // this caller already owns those arguments outside the machine.
+            self.reserve_values(args.len(), function.span)?;
+            self.enter(function, args, depth, &function.span)
         })();
-        // Scalar-only rollback needs no allocations and no recursive frame
-        // links. Production ownership cleanup is explicitly not wired here.
-        while self.work.pop().is_some() {}
-        while self.values.pop().is_some() {}
-        while let Some(frame) = self.calls.pop() {
-            drop(frame);
-            self.call_depth -= 1;
-            self.metrics.retired_calls += 1;
+        if let Err(error) = admission {
+            self.pending = Some(Err(error));
         }
+        // The sole dispatch loop also performs every exit on failure. There is
+        // no clearing of markers, recursive evaluator or child execution driver.
+        while let Some(step) = self.work.pop() {
+            let boundary = matches!(
+                &step,
+                Work::ScopeExit { .. } | Work::CallExit | Work::ArgumentsExit(_)
+            );
+            if self.pending.is_some() {
+                if boundary {
+                    self.finish_boundary(step, hooks);
+                }
+                continue;
+            }
+            // Fuel belongs to the test harness alone. Its failure takes the
+            // same flat resource exit path as a real tick or expression error.
+            #[cfg(test)]
+            if test_fuel {
+                let Some(remaining) = self.remaining_dispatches.checked_sub(1) else {
+                    self.pending = Some(Err(KuError::runtime(
+                        "internal execution prototype test fuel exhausted",
+                        span,
+                    )));
+                    if boundary {
+                        self.finish_boundary(step, hooks);
+                    }
+                    continue;
+                };
+                self.remaining_dispatches = remaining;
+            }
+            self.metrics.dispatches += 1;
+            if boundary {
+                self.finish_boundary(step, hooks);
+                continue;
+            }
+            let poll = match &step {
+                Work::Statement(stmt) => hooks.tick(stmt_span(stmt)),
+                Work::Eval(expr) => hooks.tick(expr.span),
+                Work::SelfCallee(span) => hooks.tick(*span),
+                _ => Ok(()),
+            };
+            if let Err(error) = poll {
+                self.pending = Some(Err(error));
+            } else if let Err(error) = self.step(step) {
+                self.pending = Some(Err(error));
+            }
+        }
+        assert_eq!(self.calls.len(), 0);
+        assert_eq!(self.values.len(), 0);
+        assert_eq!(self.argument_capacity, 0);
+        assert_eq!(self.argument_bytes, 0);
         self.metrics.remaining_calls = self.calls.len();
         self.metrics.remaining_work = self.work.len();
         self.metrics.remaining_values = self.values.len();
@@ -759,11 +1174,13 @@ impl<'a> Machine<'a> {
         assert_eq!(self.call_depth, self.initial_depth);
         self.metrics.retained_backing_bytes = self.calls.charged_storage_bytes()
             + self.work.charged_storage_bytes()
-            + self.values.charged_storage_bytes();
+            + self.values.charged_storage_bytes()
+            + self.argument_bytes;
         self.metrics.peak_backing_bytes_upper_bound = self.calls.peak_storage_bytes()
             + self.work.peak_storage_bytes()
-            + self.values.peak_storage_bytes();
-        result
+            + self.values.peak_storage_bytes()
+            + self.peak_argument_bytes;
+        self.pending.take().expect("root call or admission outcome")
     }
 }
 
@@ -795,7 +1212,7 @@ pub(super) fn try_execute(
     function: &FnDecl,
     args: &[Value],
     depth: usize,
-) -> Option<KuResult<Value>> {
+) -> Option<KuResult<Flow>> {
     if args
         .iter()
         .any(|value| scalar(value, function.span).is_err())
@@ -810,24 +1227,14 @@ pub(super) fn try_execute(
         return None;
     }
     let mut machine = Machine::new(&source, limits, interpreter.call_depth);
-    Some(
-        machine.run_with_poll(&function.name, args, depth, false, |span| {
-            interpreter.tick(span)
-        }),
-    )
+    Some(machine.run_with_hooks(&function.name, args, depth, false, interpreter))
 }
 
 pub(super) fn try_execute_function_value(
     interpreter: &mut Interpreter,
     call: &FunctionValueCall<'_>,
-) -> Option<KuResult<Value>> {
-    // Scope-exit deadline arbitration has not yet migrated into this scalar
-    // driver. In cleanup/finally code the whole tree keeps its original engine
-    // so no shared capture write can run past an inner epilogue failure.
-    if current_cleanup_context().is_some()
-        || interpreter.termination.is_some()
-        || crate::runtime::task::current_execution_termination().is_some()
-        || call.is_async
+) -> Option<KuResult<Flow>> {
+    if call.is_async
         || call.params.len() != call.args.len()
         || call.params.len() != call.param_modes.len()
         || call
@@ -877,7 +1284,8 @@ pub(super) fn try_execute_function_value(
     let entry = source.get(name).expect("local entry code");
     let captures = function_capture_names(entry).ok()?;
     if captures.iter().any(|name| {
-        interpreter.functions.contains_key(name) || !call.captures.is_stable_scalar_binding(name)
+        interpreter.functions.contains_key(name)
+            || (call.captures.contains(name) && !call.captures.is_stable_scalar_binding(name))
     }) {
         return None;
     }
@@ -886,9 +1294,5 @@ pub(super) fn try_execute_function_value(
     }
     let mut machine = Machine::new(&source, limits, interpreter.call_depth);
     machine.captures = Some(call.captures);
-    Some(
-        machine.run_with_poll(name, &call.args, call.depth, false, |span| {
-            interpreter.tick(span)
-        }),
-    )
+    Some(machine.run_with_hooks(name, &call.args, call.depth, false, interpreter))
 }

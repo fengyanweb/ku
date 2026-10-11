@@ -220,7 +220,9 @@ fn Entry(): int { return 10 + 20 }
     let mut calls = Limits::default();
     calls.calls.max_frames = 3;
     let mut work = Limits::default();
-    work.work.max_frames = 2;
+    // Entry now reserves CallExit, its real body ScopeExit and the Block.
+    // Admit that first call, then reject its next continuation growth.
+    work.work.max_frames = 3;
     let mut values = Limits::default();
     values.values.max_frames = 1;
     for (limits, entry, args, entered) in [
@@ -599,6 +601,8 @@ fn Make() {
     assert_eq!(
         try_execute_function_value(&mut interpreter, &function_value_call(&value, 3, 0))
             .expect("stable read-only scalar captures should select the flat driver")
+            .unwrap()
+            .into_call_value(Span::default(), "function value")
             .unwrap(),
         Value::Int(26)
     );
@@ -612,7 +616,8 @@ fn Make() {
 }
 
 #[test]
-fn production_shared_capture_writes_and_foreign_mutable_reads_keep_original_engine() {
+fn production_shared_capture_writes_use_flat_epilogues_and_foreign_mutable_reads_keep_original_engine(
+) {
     let runtime = TaskRuntime::new();
     let task = runtime
         .spawn(|| {
@@ -638,7 +643,20 @@ fn Make() {
                 call.captures.get("captured", Span::default())?,
                 Value::Int(20)
             );
-            assert!(try_execute_function_value(&mut interpreter, &call).is_none());
+            assert_eq!(
+                try_execute_function_value(&mut interpreter, &call)
+                    .expect("same-Task mutable scalar captures should select the flat driver")?
+                    .into_call_value(Span::default(), "function value")?,
+                Value::Int(30)
+            );
+            assert_eq!(
+                call.captures.get("captured", Span::default())?,
+                Value::Int(24)
+            );
+            // Restore the actual shared cell so the independent public-entry
+            // assertion starts from the same state, rather than adding twice.
+            let mut shared = call.captures.clone();
+            shared.assign_owned("captured", Value::Int(20), Span::default())?;
             assert_eq!(
                 call.captures.get("captured", Span::default())?,
                 Value::Int(20)
@@ -716,6 +734,107 @@ fn Make() {
         Value::Int(35)
     );
     assert_eq!(interpreter.call_depth, 0);
+}
+
+#[test]
+fn production_expired_child_scope_stops_parent_capture_bind_without_resetting_deadline() {
+    let runtime = TaskRuntime::new();
+    let task = runtime
+        .spawn(|| {
+            assert_ne!(crate::runtime::task::current_task_id(), 0);
+            let original = RuntimeTermination {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("test clock must support a past instant"),
+            };
+            let assert_expired = |error: KuError| {
+                assert_eq!(error.domain.as_deref(), Some("task"));
+                assert_eq!(error.code.as_deref(), Some("shutdown_timeout"));
+                assert_eq!(error.scope_cleanup(), Some(original));
+                assert!(error.runtime_termination().is_none());
+            };
+            for (selected, return_expression) in [
+                (true, "payload"),
+                // The unselected complete tree has the same observable return:
+                // this Owned expression is never evaluated after true payload.
+                (false, "payload || (\"owned\" == \"owned\")"),
+            ] {
+                let mut interpreter = production_interpreter(&format!(
+                    r#"
+fn Make() {{
+    captured = true
+    fn local(active: bool): bool {{
+        payload = true
+        captured = active && local(false)
+        return {return_expression}
+    }}
+    return local.clone()
+}}
+"#,
+                ));
+                let value = interpreter.call_function("Make", vec![], Span::default(), 0)?;
+                let mut call = function_value_call(&value, 0, 0);
+                call.args = vec![Value::Bool(true)];
+                assert!(call.captures.is_stable_scalar_binding("captured"));
+                assert_eq!(
+                    call.captures.get("captured", Span::default())?,
+                    Value::Bool(true)
+                );
+                {
+                    let _execution = ExecutionTerminationGuard::enter();
+                    let _cleanup = CleanupGuard::enter(original);
+                    let result = try_execute_function_value(&mut interpreter, &call);
+                    if selected {
+                        let error = match result.expect("real scalar captures should be admitted") {
+                            Err(error) => error,
+                            Ok(_) => panic!("child scope expiry must stop the admitted tree"),
+                        };
+                        assert_expired(error);
+                        // Child(false) really binds false. Its body scope contains
+                        // payload and fails before parent can bind child(true).
+                        assert_eq!(
+                            call.captures.get("captured", Span::default())?,
+                            Value::Bool(false)
+                        );
+                    } else {
+                        assert!(result.is_none());
+                        assert_eq!(
+                            call.captures.get("captured", Span::default())?,
+                            Value::Bool(true)
+                        );
+                    }
+                }
+                assert_eq!(interpreter.call_depth, 0);
+                assert!(interpreter.termination.is_none());
+                let mut shared = call.captures.clone();
+                shared.assign_owned("captured", Value::Bool(true), Span::default())?;
+                {
+                    // Public routing must preserve exactly the same already
+                    // expired D for both the selected tree and legacy contrast.
+                    let _execution = ExecutionTerminationGuard::enter();
+                    let _cleanup = CleanupGuard::enter(original);
+                    assert_expired(
+                        interpreter
+                            .call_function_value(call)
+                            .expect_err("child scope expiry must stop the public function call"),
+                    );
+                    assert_eq!(shared.get("captured", Span::default())?, Value::Bool(false));
+                }
+                assert_eq!(interpreter.call_depth, 0);
+                assert!(interpreter.termination.is_none());
+            }
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let outcome = task.await_result();
+    drop(task);
+    let drained = runtime.cancel_all_and_wait(Duration::from_secs(2));
+    let snapshot = runtime.snapshot().unwrap();
+    drained.unwrap();
+    assert_eq!(snapshot.active_tasks, 0);
+    assert_eq!(snapshot.queued_tasks, 0);
+    assert_eq!(outcome.unwrap(), Value::Null);
 }
 
 #[test]

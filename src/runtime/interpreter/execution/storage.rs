@@ -45,20 +45,42 @@ impl<T> FrameStack<T> {
     /// values have moved. Admission therefore charges old + new capacity, not
     /// only the final capacity. Failed admission leaves the old stack intact.
     pub(super) fn reserve(&mut self, additional: usize) -> Result<(), ReserveError> {
+        self.reserve_with_budget(
+            additional,
+            self.limits.max_frames,
+            self.limits.max_storage_bytes,
+        )
+    }
+
+    /// Reserve within a shared operand budget after other live operands and
+    /// retained argument buffers have been charged. `available_*` are the total
+    /// allowance for this stack, including its current storage, not extra space.
+    /// A popped stack still owns its capacity even when no growth is needed.
+    pub(super) fn reserve_with_budget(
+        &mut self,
+        additional: usize,
+        available_frames: usize,
+        available_bytes: usize,
+    ) -> Result<(), ReserveError> {
+        let frame_limit = self.limits.max_frames.min(available_frames);
+        let byte_limit = self.limits.max_storage_bytes.min(available_bytes);
         let required = self
             .len()
             .checked_add(additional)
             .ok_or(ReserveError::ArithmeticOverflow)?;
-        if required > self.limits.max_frames {
+        if required > frame_limit {
             return Err(ReserveError::FrameLimit);
+        }
+        let old_bytes = self.charged_storage_bytes();
+        if old_bytes > byte_limit {
+            return Err(ReserveError::StorageLimit);
         }
         if required <= self.capacity() {
             return Ok(());
         }
 
-        let old_bytes = self.charged_storage_bytes();
         let minimum_peak = storage_peak::<T>(old_bytes, required)?;
-        if minimum_peak > self.limits.max_storage_bytes {
+        if minimum_peak > byte_limit {
             return Err(ReserveError::StorageLimit);
         }
 
@@ -67,11 +89,11 @@ impl<T> FrameStack<T> {
         let preferred = self
             .capacity()
             .checked_mul(2)
-            .unwrap_or(self.limits.max_frames)
-            .min(self.limits.max_frames)
+            .unwrap_or(frame_limit)
+            .min(frame_limit)
             .max(required);
         let target = match storage_peak::<T>(old_bytes, preferred) {
-            Ok(peak) if peak <= self.limits.max_storage_bytes => preferred,
+            Ok(peak) if peak <= byte_limit => preferred,
             _ => required,
         };
 
@@ -94,10 +116,10 @@ impl<T> FrameStack<T> {
         // The measured peak includes it; only admitted storage stays in budget.
         let actual_peak = storage_peak::<T>(old_bytes, replacement.capacity())?;
         self.peak_storage_bytes = self.peak_storage_bytes.max(actual_peak);
-        if actual_peak > self.limits.max_storage_bytes {
+        if actual_peak > byte_limit {
             return Err(ReserveError::StorageLimit);
         }
-        if replacement.capacity() > self.limits.max_frames {
+        if replacement.capacity() > frame_limit {
             return Err(ReserveError::FrameLimit);
         }
 
@@ -202,6 +224,71 @@ mod tests {
         assert_eq!(stack.len(), 1);
         assert_eq!(stack.pop(), Some(11));
         assert_eq!(stack.pop(), None);
+    }
+
+    #[test]
+    fn shared_count_and_retained_bytes_reject_without_losing_operands() {
+        let mut stack = FrameStack::new(limits(4, 64));
+        stack.reserve(2).unwrap();
+        stack.push_reserved(11_u64).unwrap();
+        stack.push_reserved(13).unwrap();
+        assert_eq!(
+            stack.reserve_with_budget(0, 1, 64),
+            Err(ReserveError::FrameLimit)
+        );
+        assert_eq!(stack.pop(), Some(13));
+        assert_eq!(stack.pop(), Some(11));
+        let retained = stack.charged_storage_bytes();
+        assert!(retained >= 16);
+        assert_eq!(
+            stack.reserve_with_budget(1, 4, retained - 1),
+            Err(ReserveError::StorageLimit)
+        );
+        assert_eq!(stack.len(), 0);
+        assert_eq!(stack.charged_storage_bytes(), retained);
+        stack.reserve_with_budget(1, 1, retained).unwrap();
+        stack.push_reserved(17).unwrap();
+        assert_eq!(stack.pop(), Some(17));
+    }
+
+    #[test]
+    fn shared_growth_charges_old_plus_new_and_avoids_unaffordable_spare() {
+        let mut stack = FrameStack::new(limits(8, 128));
+        stack.reserve(2).unwrap();
+        stack.push_reserved(11_u64).unwrap();
+        stack.push_reserved(13).unwrap();
+        let old = stack.charged_storage_bytes();
+        let minimum = old + 3 * size_of::<u64>();
+        assert_eq!(
+            stack.reserve_with_budget(1, 8, minimum - 1),
+            Err(ReserveError::StorageLimit)
+        );
+        assert_eq!(stack.get(0), Some(&11));
+        assert_eq!(stack.get(1), Some(&13));
+        assert_eq!(stack.charged_storage_bytes(), old);
+        stack.reserve_with_budget(1, 8, minimum).unwrap();
+        assert_eq!(stack.capacity(), 3);
+        assert_eq!(stack.peak_storage_bytes(), minimum);
+        stack.push_reserved(17).unwrap();
+        assert_eq!(stack.pop(), Some(17));
+        assert_eq!(stack.pop(), Some(13));
+        assert_eq!(stack.pop(), Some(11));
+    }
+
+    #[test]
+    fn shared_count_applies_to_live_frames_when_capacity_is_already_retained() {
+        let mut stack = FrameStack::<()>::new(limits(4, 0));
+        stack.reserve_with_budget(1, 1, 0).unwrap();
+        stack.push_reserved(()).unwrap();
+        assert_eq!(
+            stack.reserve_with_budget(1, 1, 0),
+            Err(ReserveError::FrameLimit)
+        );
+        assert_eq!(stack.pop(), Some(()));
+        stack.reserve_with_budget(1, 1, 0).unwrap();
+        stack.push_reserved(()).unwrap();
+        assert_eq!(stack.pop(), Some(()));
+        assert_eq!(stack.peak_storage_bytes(), 0);
     }
 
     #[test]
