@@ -311,22 +311,23 @@ impl Interpreter {
                 span,
             ));
         }
-        let function = self
-            .functions
+        // A private immutable table snapshot keeps selection independent of
+        // &mut self without recursively cloning the entry's AST first.
+        let source = self.functions.clone();
+        let function = source
             .get(name)
-            .cloned()
             .ok_or_else(|| KuError::runtime(format!("undefined function '{name}'"), span))?;
         if function.is_async {
             return self
-                .spawn_async_function(function, args, span)
+                .spawn_async_function(function.clone(), args, span)
                 .map(Flow::returned);
         }
-        if let Some(result) = execution::try_execute(self, &function, &args, depth) {
+        if let Some(result) = execution::try_execute(self, function, &args, depth) {
             // The driver has completed the real scope/call epilogues and kept
             // their carried cleanup context in this Flow.
             return result;
         }
-        self.call_function_direct_flow(function, args, span, depth)
+        self.call_function_direct_flow(function.clone(), args, span, depth)
     }
 
     fn call_function_direct(

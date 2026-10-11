@@ -12,7 +12,12 @@ use super::*;
 use crate::ast::{Param, TypeName};
 use storage::{FrameLimits, FrameStack, ReserveError};
 
+mod code;
 mod storage;
+use code::{
+    AdmissionError, BlockId, CodeHandle, ExprCode, ExprId, ExprRange, FnId, ScalarLiteral, SpanId,
+    StmtCode, StmtId, SymbolId,
+};
 #[cfg(test)]
 mod tests;
 
@@ -77,6 +82,10 @@ struct Metrics {
     // sample.
     retained_backing_bytes: usize,
     peak_backing_bytes_upper_bound: usize,
+    // Code backing has its separate original syntax budget. The construction
+    // upper bound also includes temporary visit/binding/function buffers.
+    code_retained_backing_bytes: usize,
+    code_construction_peak_backing_bytes_upper_bound: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -258,14 +267,12 @@ impl<P: FnMut(Span) -> KuResult<()>> ExecutionHooks for PollHooks<P> {
     }
 }
 
-struct CallFrame<'a> {
+struct CallFrame {
     env: Env,
     leases: Vec<BorrowLease>,
     depth: usize,
     value_base: usize,
-    // A borrowed syntax span keeps the admitted frame small. The immutable
-    // source tree outlives every frame, including its flat unwind.
-    epilogue_span: &'a Span,
+    epilogue_span: SpanId,
     kind: CallKind,
 }
 
@@ -275,37 +282,32 @@ enum ScopeFallthrough {
     ReturnNull,
 }
 
-struct ArgumentFrame<'a> {
-    span: &'a Span,
+struct ArgumentFrame {
+    span: SpanId,
     value_base: usize,
     leases: Vec<BorrowLease>,
     staged: Vec<Value>,
 }
 
-struct FinallyFrame<'a> {
-    body: &'a [Stmt],
-    span: &'a Span,
+struct FinallyFrame {
+    body: BlockId,
+    span: SpanId,
     owner_call: usize,
-    // Kept out of Work so every continuation does not pay for a large outcome.
-    // This is the sole owner of the primary while finally syntax executes.
     primary: Option<KuResult<Flow>>,
     mode: cancellation::FinallyMode,
-    // Only this synchronous, no-await slice may hold a TLS guard. Future
-    // Pending execution must store context, releasing guards before yielding.
+    // Synchronous only: future Pending must retain context instead of TLS guards.
     guard: Option<CleanupGuard>,
 }
 
-struct FinallyFrames<'a> {
-    frames: FrameStack<FinallyFrame<'a>>,
+struct FinallyFrames {
+    frames: FrameStack<FinallyFrame>,
 }
 
-impl Drop for FinallyFrames<'_> {
+impl Drop for FinallyFrames {
     fn drop(&mut self) {
-        // Restoring nested TLS guards has its own strict order, including a
-        // native panic leaving the production-local synchronous Machine. A
-        // private caller catching panic while retaining Machine must drop it
-        // before expecting TLS restoration; this is not a Pending/yield API.
-        // Do not change other FrameStack payload drop contracts.
+        // Production owns this synchronous machine within the panic boundary.
+        // A test catching panic while retaining it must explicitly drop it to
+        // restore TLS. This ordering does not promise support across yielding.
         while let Some(frame) = self.frames.pop() {
             drop(frame);
         }
@@ -313,100 +315,93 @@ impl Drop for FinallyFrames<'_> {
 }
 
 #[derive(Clone, Copy)]
-enum LoopState<'a> {
+enum LoopState {
     While {
-        condition: &'a Expr,
-        body: &'a [Stmt],
-        span: &'a Span,
+        condition: ExprId,
+        body: BlockId,
+        span: SpanId,
     },
     ForInt {
-        name: &'a str,
-        body: &'a [Stmt],
-        span: &'a Span,
+        name: SymbolId,
+        body: BlockId,
+        span: SpanId,
         current: i64,
         limit: i64,
     },
 }
 
-impl LoopState<'_> {
-    fn span(self) -> Span {
+impl LoopState {
+    fn span(self) -> SpanId {
         match self {
-            Self::While { span, .. } | Self::ForInt { span, .. } => *span,
+            Self::While { span, .. } | Self::ForInt { span, .. } => span,
         }
     }
 }
 
-enum Work<'a> {
+enum Work {
     Block {
-        body: &'a [Stmt],
+        body: BlockId,
         next: usize,
     },
-    Statement(&'a Stmt),
-    Eval(&'a Expr),
-    SelfCallee(Span),
-    Unary(UnaryOp, Span),
-    BinaryLeft(BinaryOp, &'a Expr, Span),
-    BinaryRight(BinaryOp, Span),
-    Bool(Span),
-    Choose(&'a [Stmt], &'a [Stmt], Span),
+    Statement(StmtId),
+    Eval(ExprId),
+    SelfCallee(SpanId),
+    Unary(UnaryOp, SpanId),
+    BinaryLeft(BinaryOp, ExprId, SpanId),
+    BinaryRight(BinaryOp, SpanId),
+    Bool(SpanId),
+    Choose(BlockId, BlockId, SpanId),
     WhileCheck {
-        condition: &'a Expr,
-        body: &'a [Stmt],
-        span: &'a Span,
+        condition: ExprId,
+        body: BlockId,
+        span: SpanId,
     },
     ForInit {
-        name: &'a str,
-        body: &'a [Stmt],
-        span: &'a Span,
+        name: SymbolId,
+        body: BlockId,
+        span: SpanId,
     },
-    LoopIteration(LoopState<'a>),
+    LoopIteration(LoopState),
     LoopBoundary {
-        state: LoopState<'a>,
+        state: LoopState,
         owner_call: usize,
     },
-    Bind(&'a str, bool, bool, Span),
+    Bind(SymbolId, bool, bool, SpanId),
     Discard,
     Return,
     TryExit(usize),
     FinallyExit(usize),
     ScopeExit {
-        span: Span,
+        span: SpanId,
         value_base: usize,
         fallthrough: ScopeFallthrough,
     },
     CallExit,
     PrepareArguments {
-        function: &'a FnDecl,
-        args: &'a [Expr],
-        span: &'a Span,
+        function: FnId,
+        args: ExprRange,
+        span: SpanId,
     },
-    ArgumentsExit(ArgumentFrame<'a>),
+    ArgumentsExit(ArgumentFrame),
     Arguments {
-        function: &'a FnDecl,
-        args: &'a [Expr],
+        function: FnId,
+        args: ExprRange,
         next: usize,
         exit_index: usize,
-        span: &'a Span,
+        span: SpanId,
     },
 }
 
-enum Syntax<'a> {
-    Function(&'a FnDecl),
-    Statement(&'a Stmt),
-    Expression(&'a Expr),
-}
-
-struct Machine<'a> {
-    source: &'a HashMap<String, FnDecl>,
-    // Some only for one closed local self-recursive function. These shared
-    // binding cells contain stable scalar values, never a copied Owned payload.
-    captures: Option<&'a Env>,
-    calls: FrameStack<CallFrame<'a>>,
-    work: FrameStack<Work<'a>>,
+struct Machine {
+    code: CodeHandle,
+    // Shared scalar cells, never copied user payloads. Each call still owns its
+    // real parameter/body scopes and settles them through the existing hooks.
+    // Owning this Env removes source lifetimes, not the future Pending boundary.
+    captures: Option<Env>,
+    calls: FrameStack<CallFrame>,
+    work: FrameStack<Work>,
     values: FrameStack<Value>,
-    // Declared after the ordinary scalar frames so their panic drops remain
-    // inside active synchronous cleanup before these guards restore TLS.
-    finally: FinallyFrames<'a>,
+    finally: FinallyFrames,
     initial_depth: usize,
     call_depth: usize,
     #[cfg(test)]
@@ -467,218 +462,47 @@ fn scalar_type(ty: &Option<TypeName>) -> bool {
     )
 }
 
-// The source walk itself is bounded and flat; no recursive preflight merely
-// moves the stack-overflow problem ahead of the execution loop.
+// Test adapters exercise the same owned-code admission as production.
 #[cfg(test)]
 fn preflight(source: &HashMap<String, FnDecl>, limits: Limits) -> KuResult<()> {
-    preflight_tree(source, limits, None)
+    CodeHandle::compile_all(source, limits)
+        .map(|_| ())
+        .map_err(AdmissionError::into_error)
 }
 
+#[cfg(test)]
 fn preflight_tree(
     source: &HashMap<String, FnDecl>,
     limits: Limits,
     entry: Option<&FnDecl>,
 ) -> KuResult<()> {
-    preflight_tree_mode(source, limits, entry, false, None)
+    match entry {
+        Some(entry) => CodeHandle::compile_named(source, entry, limits),
+        None => CodeHandle::compile_all(source, limits),
+    }
+    .map(|_| ())
+    .map_err(AdmissionError::into_error)
 }
 
-fn preflight_tree_mode(
-    source: &HashMap<String, FnDecl>,
-    limits: Limits,
-    entry: Option<&FnDecl>,
-    local_self: bool,
-    _captures: Option<&HashSet<String>>,
-) -> KuResult<()> {
-    let mut pending = FrameStack::new(limits.syntax);
-    let mut checked = FrameStack::new(limits.syntax);
-    let mut remaining = limits.syntax_steps;
-    if let Some(function) = entry {
-        reserve(&mut pending, 1, function.span)?;
-        push(&mut pending, Syntax::Function(function));
-    } else {
-        reserve(&mut pending, source.len(), Span::default())?;
-        for function in source.values() {
-            push(&mut pending, Syntax::Function(function));
-        }
+impl Machine {
+    #[cfg(test)]
+    fn new(
+        source: &HashMap<String, FnDecl>,
+        limits: Limits,
+        initial_depth: usize,
+    ) -> KuResult<Self> {
+        let code = CodeHandle::compile_all(source, limits).map_err(AdmissionError::into_error)?;
+        Ok(Self::from_code(code, limits, initial_depth))
     }
-    while let Some(node) = pending.pop() {
-        remaining = remaining
-            .checked_sub(1)
-            .ok_or_else(|| unsupported(Span::default()))?;
-        match node {
-            Syntax::Function(function) => {
-                if (0..checked.len())
-                    .any(|index| checked.get(index) == Some(&function.name.as_str()))
-                {
-                    continue;
-                }
-                remaining = remaining
-                    .checked_sub(function.params.len())
-                    .ok_or_else(|| unsupported(function.span))?;
-                if function.is_async
-                    || !function.type_params.is_empty()
-                    || !scalar_type(&function.return_type)
-                    || function.params.iter().any(|param| {
-                        param.mode != ParamMode::Owned
-                            || !scalar_type(&param.ty)
-                            || (local_self && param.name == function.name)
-                    })
-                {
-                    return Err(unsupported(function.span));
-                }
-                reserve(&mut checked, 1, function.span)?;
-                push(&mut checked, function.name.as_str());
-                reserve(&mut pending, function.body.len(), function.span)?;
-                for stmt in function.body.iter().rev() {
-                    push(&mut pending, Syntax::Statement(stmt));
-                }
-            }
-            Syntax::Statement(stmt) => {
-                if local_self
-                    && matches!(stmt, Stmt::VarDecl { name, .. }
-                        | Stmt::Assign { name, .. } | Stmt::For { name, .. }
-                        if entry.is_some_and(|function| name == &function.name))
-                {
-                    return Err(unsupported(stmt_span(stmt)));
-                }
-                match stmt {
-                    Stmt::VarDecl {
-                        value, ty, span, ..
-                    } => {
-                        if !scalar_type(ty) {
-                            return Err(unsupported(*span));
-                        }
-                        reserve(&mut pending, 1, *span)?;
-                        push(&mut pending, Syntax::Expression(value));
-                    }
-                    Stmt::Assign { value, span, .. } | Stmt::Expr { expr: value, span } => {
-                        reserve(&mut pending, 1, *span)?;
-                        push(&mut pending, Syntax::Expression(value));
-                    }
-                    Stmt::Return { value, span } => {
-                        if let Some(value) = value {
-                            reserve(&mut pending, 1, *span)?;
-                            push(&mut pending, Syntax::Expression(value));
-                        }
-                    }
-                    Stmt::If {
-                        condition,
-                        then_branch,
-                        else_branch,
-                        span,
-                    } => {
-                        let count = then_branch
-                            .len()
-                            .checked_add(else_branch.len())
-                            .and_then(|n| n.checked_add(1))
-                            .ok_or_else(|| unsupported(*span))?;
-                        reserve(&mut pending, count, *span)?;
-                        for stmt in then_branch.iter().chain(else_branch).rev() {
-                            push(&mut pending, Syntax::Statement(stmt));
-                        }
-                        push(&mut pending, Syntax::Expression(condition));
-                    }
-                    Stmt::While {
-                        condition,
-                        body,
-                        span,
-                    }
-                    | Stmt::For {
-                        iterable: condition,
-                        body,
-                        span,
-                        ..
-                    } => {
-                        let count = body
-                            .len()
-                            .checked_add(1)
-                            .ok_or_else(|| unsupported(*span))?;
-                        reserve(&mut pending, count, *span)?;
-                        for stmt in body.iter().rev() {
-                            push(&mut pending, Syntax::Statement(stmt));
-                        }
-                        push(&mut pending, Syntax::Expression(condition));
-                    }
-                    Stmt::Break { .. } | Stmt::Continue { .. } => {}
-                    Stmt::Try {
-                        body,
-                        catch_name,
-                        catch_body,
-                        finally_body,
-                        span,
-                    } => {
-                        // Fail, Result propagation and catch-owned fields have
-                        // not migrated. Preserve the entire old evaluator for
-                        // any catch clause, including an unreachable one.
-                        if catch_name.is_some() || !catch_body.is_empty() {
-                            return Err(unsupported(*span));
-                        }
-                        let count = body
-                            .len()
-                            .checked_add(finally_body.len())
-                            .ok_or_else(|| unsupported(*span))?;
-                        reserve(&mut pending, count, *span)?;
-                        for stmt in body.iter().chain(finally_body).rev() {
-                            push(&mut pending, Syntax::Statement(stmt));
-                        }
-                    }
-                    _ => return Err(unsupported(stmt_span(stmt))),
-                }
-            }
-            Syntax::Expression(expr) => match &expr.kind {
-                ExprKind::Literal(
-                    Literal::Int(_) | Literal::Float(_) | Literal::Bool(_) | Literal::Null,
-                ) => {}
-                ExprKind::Variable(name) => {
-                    // A bare global function is a first-class value in the
-                    // existing evaluator, not a scalar variable. Leave the
-                    // entire call tree there until function values migrate.
-                    if entry.is_some() && source.contains_key(name) {
-                        return Err(unsupported(expr.span));
-                    }
-                }
-                ExprKind::Unary { expr, .. } => {
-                    reserve(&mut pending, 1, expr.span)?;
-                    push(&mut pending, Syntax::Expression(expr));
-                }
-                ExprKind::Binary { left, right, .. } => {
-                    reserve(&mut pending, 2, expr.span)?;
-                    push(&mut pending, Syntax::Expression(right));
-                    push(&mut pending, Syntax::Expression(left));
-                }
-                ExprKind::Call { callee, args } => {
-                    let ExprKind::Variable(name) = &callee.kind else {
-                        return Err(unsupported(callee.span));
-                    };
-                    let function = source.get(name).ok_or_else(|| unsupported(callee.span))?;
-                    if local_self && args.len() != function.params.len() {
-                        // Preserve the existing function-value argument error
-                        // and its priority by leaving this complete tree there.
-                        return Err(unsupported(expr.span));
-                    }
-                    reserve(
-                        &mut pending,
-                        args.len()
-                            .checked_add(1)
-                            .ok_or_else(|| unsupported(expr.span))?,
-                        expr.span,
-                    )?;
-                    push(&mut pending, Syntax::Function(function));
-                    for arg in args.iter().rev() {
-                        push(&mut pending, Syntax::Expression(arg));
-                    }
-                }
-                _ => return Err(unsupported(expr.span)),
-            },
-        }
-    }
-    Ok(())
-}
 
-impl<'a> Machine<'a> {
-    fn new(source: &'a HashMap<String, FnDecl>, limits: Limits, initial_depth: usize) -> Self {
+    fn from_code(code: CodeHandle, limits: Limits, initial_depth: usize) -> Self {
+        let metrics = Metrics {
+            code_retained_backing_bytes: code.retained_bytes(),
+            code_construction_peak_backing_bytes_upper_bound: code.construction_peak_bytes(),
+            ..Metrics::default()
+        };
         Self {
-            source,
+            code,
             captures: None,
             calls: FrameStack::new(limits.calls),
             work: FrameStack::new(limits.work),
@@ -690,7 +514,7 @@ impl<'a> Machine<'a> {
             call_depth: initial_depth,
             #[cfg(test)]
             remaining_dispatches: limits.prototype_dispatch_steps,
-            metrics: Metrics::default(),
+            metrics,
             pending: None,
             value_limits: limits.values,
             work_limits: limits.work,
@@ -700,7 +524,7 @@ impl<'a> Machine<'a> {
         }
     }
 
-    fn frame(&mut self) -> &mut CallFrame<'a> {
+    fn frame(&mut self) -> &mut CallFrame {
         let index = self.calls.len() - 1;
         self.calls.get_mut(index).expect("current call frame")
     }
@@ -824,38 +648,37 @@ impl<'a> Machine<'a> {
 
     fn enter(
         &mut self,
-        function: &'a FnDecl,
+        function_id: FnId,
         args: &[Value],
         depth: usize,
-        span: &'a Span,
+        span_id: SpanId,
     ) -> KuResult<()> {
-        // Same two checks and same admission point as named call_function_flow.
+        let function = self.code.function(function_id);
+        let span = self.code.span(span_id);
         if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
             return Err(KuError::structured(
                 crate::error::KuErrorKind::Runtime,
                 "runtime",
                 "call_depth_exceeded",
                 format!("maximum call depth exceeded: {MAX_CALL_DEPTH}"),
-                *span,
+                span,
             ));
         }
-        if args.len() != function.params.len() {
+        if args.len() != function.arity() {
             return Err(KuError::runtime(
                 format!(
                     "function '{}' expects {} arguments but got {}",
-                    function.name,
-                    function.params.len(),
+                    self.code.symbol(function.name),
+                    function.arity(),
                     args.len()
                 ),
-                function.span,
+                self.code.span(function.span),
             ));
         }
-        reserve(&mut self.calls, 1, *span)?;
-        self.reserve_work(3, *span)?;
-        // The result and all exit markers are admitted before parameter binding
-        // or a scope effect. A later failure unwinds without new storage.
-        self.reserve_values(1, *span)?;
-        let env = if let Some(captures) = self.captures {
+        reserve(&mut self.calls, 1, span)?;
+        self.reserve_work(3, span)?;
+        self.reserve_values(1, span)?;
+        let env = if let Some(captures) = &self.captures {
             let mut env = captures.clone();
             env.push_scope();
             env
@@ -875,9 +698,9 @@ impl<'a> Machine<'a> {
                 depth,
                 value_base: self.values.len(),
                 epilogue_span: if self.captures.is_some() {
-                    span
+                    span_id
                 } else {
-                    &function.span
+                    function.span
                 },
                 kind,
             },
@@ -886,16 +709,19 @@ impl<'a> Machine<'a> {
         self.metrics.entered_calls += 1;
         self.metrics.peak_calls = self.metrics.peak_calls.max(self.calls.len());
         push(&mut self.work, Work::CallExit);
-        for (param, value) in function.params.iter().zip(args) {
-            let value = scalar(value, *span)?;
+        for (index, value) in args.iter().enumerate() {
+            let param = self.code.parameter(function, index);
+            let name = self.code.symbol(param.name).to_string();
+            let param_span = self.code.span(param.span);
+            let value = scalar(value, span)?;
             self.frame()
                 .env
-                .define_parameter(param.name.clone(), value, false, param.span)?;
+                .define_parameter(name, value, false, param_span)?;
         }
         push(
             &mut self.work,
             Work::ScopeExit {
-                span: function.body.first().map(stmt_span).unwrap_or_default(),
+                span: self.code.block_span(function.body),
                 value_base: self.values.len(),
                 fallthrough: ScopeFallthrough::ReturnNull,
             },
@@ -904,23 +730,20 @@ impl<'a> Machine<'a> {
         push(
             &mut self.work,
             Work::Block {
-                body: &function.body,
+                body: function.body,
                 next: 0,
             },
         );
         Ok(())
     }
 
-    fn enter_loop_iteration(&mut self, state: LoopState<'a>) -> KuResult<()> {
-        let span = state.span();
+    fn enter_loop_iteration(&mut self, state: LoopState) -> KuResult<()> {
+        let span_id = state.span();
+        let span = self.code.span(span_id);
         let (body, scope_span) = match state {
-            LoopState::While { body, .. } => {
-                (body, body.first().map(stmt_span).unwrap_or_default())
-            }
-            LoopState::ForInt { body, .. } => (body, span),
+            LoopState::While { body, .. } => (body, self.code.block_span(body)),
+            LoopState::ForInt { body, .. } => (body, span_id),
         };
-        // No scope or iterator effect precedes admission of every continuation.
-        // Binding failure still has its real ScopeExit and LoopBoundary live.
         self.reserve_work(3, span)?;
         push(
             &mut self.work,
@@ -939,24 +762,23 @@ impl<'a> Machine<'a> {
         );
         self.frame().env.push_scope();
         if let LoopState::ForInt { name, current, .. } = state {
-            // exec_for_iteration gives the mutable iterator and its body one
-            // shared scope, even when the iterator shadows an outer binding.
+            let name = self.code.symbol(name).to_string();
             self.frame()
                 .env
-                .define_owned(name.to_string(), Value::Int(current), true, span)?;
+                .define_owned(name, Value::Int(current), true, span)?;
         }
         push(&mut self.work, Work::Block { body, next: 0 });
         Ok(())
     }
 
-    fn resume_loop(&mut self, state: LoopState<'a>) -> KuResult<()> {
+    fn resume_loop(&mut self, state: LoopState) -> KuResult<()> {
         match state {
             LoopState::While {
                 condition,
                 body,
                 span,
             } => {
-                self.reserve_work(2, *span)?;
+                self.reserve_work(2, self.code.span(span))?;
                 push(
                     &mut self.work,
                     Work::WhileCheck {
@@ -974,12 +796,9 @@ impl<'a> Machine<'a> {
                 current,
                 limit,
             } => {
-                // Only 0 <= current < limit <= i64::MAX is admitted. The
-                // iterator binding may be assigned in the body; advancement
-                // follows this private counter, as in the original evaluator.
                 let current = current + 1;
                 if current < limit {
-                    self.reserve_work(1, *span)?;
+                    self.reserve_work(1, self.code.span(span))?;
                     push(
                         &mut self.work,
                         Work::LoopIteration(LoopState::ForInt {
@@ -996,16 +815,9 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
-    fn enter_try(
-        &mut self,
-        body: &'a [Stmt],
-        finally_body: &'a [Stmt],
-        span: &'a Span,
-    ) -> KuResult<()> {
-        // Reserve the outcome owner and every stage marker before body effects.
-        // Publishing an empty frame lets reserve_work charge its live count and
-        // retained bytes; failed admission drops only that empty metadata frame.
-        self.reserve_finally(1, *span)?;
+    fn enter_try(&mut self, body: BlockId, finally_body: BlockId, span: SpanId) -> KuResult<()> {
+        let source_span = self.code.span(span);
+        self.reserve_finally(1, source_span)?;
         let index = self.finally.frames.len();
         push(
             &mut self.finally.frames,
@@ -1018,7 +830,7 @@ impl<'a> Machine<'a> {
                 guard: None,
             },
         );
-        if let Err(error) = self.reserve_work(4, *span) {
+        if let Err(error) = self.reserve_work(4, source_span) {
             drop(self.finally.frames.pop().expect("unentered finally frame"));
             return Err(error);
         }
@@ -1032,7 +844,7 @@ impl<'a> Machine<'a> {
         push(
             &mut self.work,
             Work::ScopeExit {
-                span: body.first().map(stmt_span).unwrap_or_default(),
+                span: self.code.block_span(body),
                 value_base: self.values.len(),
                 fallthrough: ScopeFallthrough::Continue,
             },
@@ -1042,11 +854,11 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
-    fn step(&mut self, step: Work<'a>) -> KuResult<()> {
+    fn step(&mut self, step: Work) -> KuResult<()> {
         match step {
             Work::Block { body, next } => {
-                if let Some(stmt) = body.get(next) {
-                    self.reserve_work(2, stmt_span(stmt))?;
+                if let Some(stmt) = self.code.block_statement(body, next) {
+                    self.reserve_work(2, self.code.span(self.code.statement(stmt).span))?;
                     push(
                         &mut self.work,
                         Work::Block {
@@ -1059,145 +871,130 @@ impl<'a> Machine<'a> {
             }
             Work::Statement(stmt) => {
                 self.metrics.steps += 1;
+                let stmt = self.code.statement(stmt);
+                let span = self.code.span(stmt.span);
                 if !matches!(
-                    stmt,
-                    Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Try { .. }
+                    stmt.kind,
+                    StmtCode::Break | StmtCode::Continue | StmtCode::Try(..)
                 ) {
-                    self.reserve_work(2, stmt_span(stmt))?;
+                    self.reserve_work(2, span)?;
                 }
-                match stmt {
-                    Stmt::VarDecl {
-                        name,
-                        value,
-                        mutable,
-                        span,
-                        ..
-                    } => {
-                        push(
-                            &mut self.work,
-                            Work::Bind(name, *mutable && !is_constant_name(name), true, *span),
-                        );
+                match stmt.kind {
+                    StmtCode::VarDecl(name, value, mutable) => {
+                        let mutable = mutable && !is_constant_name(self.code.symbol(name));
+                        push(&mut self.work, Work::Bind(name, mutable, true, stmt.span));
                         push(&mut self.work, Work::Eval(value));
                     }
-                    Stmt::Assign { name, value, span } => {
-                        push(
-                            &mut self.work,
-                            Work::Bind(name, !is_constant_name(name), false, *span),
-                        );
+                    StmtCode::Assign(name, value) => {
+                        let mutable = !is_constant_name(self.code.symbol(name));
+                        push(&mut self.work, Work::Bind(name, mutable, false, stmt.span));
                         push(&mut self.work, Work::Eval(value));
                     }
-                    Stmt::If {
-                        condition,
-                        then_branch,
-                        else_branch,
-                        span,
-                    } => {
+                    StmtCode::If(condition, then_body, else_body) => {
                         push(
                             &mut self.work,
-                            Work::Choose(then_branch, else_branch, *span),
+                            Work::Choose(then_body, else_body, stmt.span),
                         );
                         push(&mut self.work, Work::Eval(condition));
                     }
-                    Stmt::While {
-                        condition,
-                        body,
-                        span,
-                    } => {
+                    StmtCode::While(condition, body) => {
                         push(
                             &mut self.work,
                             Work::WhileCheck {
                                 condition,
                                 body,
-                                span,
+                                span: stmt.span,
                             },
                         );
                         push(&mut self.work, Work::Eval(condition));
                     }
-                    Stmt::For {
-                        name,
-                        iterable,
-                        body,
-                        span,
-                    } => {
-                        push(&mut self.work, Work::ForInit { name, body, span });
+                    StmtCode::For(name, iterable, body) => {
+                        push(
+                            &mut self.work,
+                            Work::ForInit {
+                                name,
+                                body,
+                                span: stmt.span,
+                            },
+                        );
                         push(&mut self.work, Work::Eval(iterable));
                     }
-                    Stmt::Break { .. } => self.pending = Some(Ok(Flow::Break(None))),
-                    Stmt::Continue { .. } => self.pending = Some(Ok(Flow::LoopContinue(None))),
-                    Stmt::Try {
-                        body,
-                        finally_body,
-                        span,
-                        ..
-                    } => self.enter_try(body, finally_body, span)?,
-                    Stmt::Return { value, span } => {
+                    StmtCode::Break => self.pending = Some(Ok(Flow::Break(None))),
+                    StmtCode::Continue => self.pending = Some(Ok(Flow::LoopContinue(None))),
+                    StmtCode::Try(body, finally_body) => {
+                        self.enter_try(body, finally_body, stmt.span)?
+                    }
+                    StmtCode::Return(value) => {
                         push(&mut self.work, Work::Return);
                         if let Some(value) = value {
                             push(&mut self.work, Work::Eval(value));
                         } else {
-                            self.emit(Value::Null, *span)?;
+                            self.emit(Value::Null, span)?;
                         }
                     }
-                    Stmt::Expr { expr, .. } => {
+                    StmtCode::Expr(expr) => {
                         push(&mut self.work, Work::Discard);
                         push(&mut self.work, Work::Eval(expr));
                     }
-                    _ => unreachable!("preflight rejected unsupported statement"),
                 }
             }
             Work::Eval(expr) => {
                 self.metrics.steps += 1;
-                match &expr.kind {
-                    ExprKind::Literal(Literal::Int(value)) => {
-                        self.emit(Value::Int(*value), expr.span)?
+                let expr = self.code.expression(expr);
+                let span = self.code.span(expr.span);
+                match expr.kind {
+                    ExprCode::Literal(value) => self.emit(
+                        match value {
+                            ScalarLiteral::Int(value) => Value::Int(value),
+                            ScalarLiteral::Float(value) => Value::Float(value),
+                            ScalarLiteral::Bool(value) => Value::Bool(value),
+                            ScalarLiteral::Null => Value::Null,
+                        },
+                        span,
+                    )?,
+                    ExprCode::Variable(name) => {
+                        let name = self.code.symbol(name);
+                        let env = &self
+                            .calls
+                            .get(self.calls.len() - 1)
+                            .expect("current call frame")
+                            .env;
+                        let value = env.with_value(name, span, |value| scalar(value, span))?;
+                        self.emit(value, span)?;
                     }
-                    ExprKind::Literal(Literal::Float(value)) => {
-                        self.emit(Value::Float(*value), expr.span)?
-                    }
-                    ExprKind::Literal(Literal::Bool(value)) => {
-                        self.emit(Value::Bool(*value), expr.span)?
-                    }
-                    ExprKind::Literal(Literal::Null) => self.emit(Value::Null, expr.span)?,
-                    ExprKind::Variable(name) => {
-                        let value = self.frame().env.get(name, expr.span)?;
-                        self.emit(scalar(&value, expr.span)?, expr.span)?;
-                    }
-                    ExprKind::Unary { op, expr: operand } => {
-                        self.reserve_work(2, expr.span)?;
-                        push(&mut self.work, Work::Unary(*op, expr.span));
+                    ExprCode::Unary(op, operand) => {
+                        self.reserve_work(2, span)?;
+                        push(&mut self.work, Work::Unary(op, expr.span));
                         push(&mut self.work, Work::Eval(operand));
                     }
-                    ExprKind::Binary { left, op, right } => {
-                        self.reserve_work(2, expr.span)?;
-                        push(&mut self.work, Work::BinaryLeft(*op, right, expr.span));
+                    ExprCode::Binary(left, op, right) => {
+                        self.reserve_work(2, span)?;
+                        push(&mut self.work, Work::BinaryLeft(op, right, expr.span));
                         push(&mut self.work, Work::Eval(left));
                     }
-                    ExprKind::Call { callee, args } => {
-                        let ExprKind::Variable(name) = &callee.kind else {
-                            unreachable!("preflight");
-                        };
-                        let function = self.source.get(name).expect("preflight checked callee");
-                        self.reserve_work(if self.captures.is_some() { 2 } else { 1 }, expr.span)?;
+                    ExprCode::Call {
+                        function,
+                        args,
+                        callee_span,
+                    } => {
+                        self.reserve_work(if self.captures.is_some() { 2 } else { 1 }, span)?;
                         push(
                             &mut self.work,
                             Work::PrepareArguments {
                                 function,
                                 args,
-                                span: &expr.span,
+                                span: expr.span,
                             },
                         );
                         if self.captures.is_some() {
-                            // Function-value dispatch evaluates the callable
-                            // before its arguments. Keep that exact safepoint;
-                            // its self binding cannot be observed in this tree.
-                            push(&mut self.work, Work::SelfCallee(callee.span));
+                            push(&mut self.work, Work::SelfCallee(callee_span));
                         }
                     }
-                    _ => unreachable!("preflight rejected unsupported expression"),
                 }
             }
             Work::SelfCallee(_) => self.metrics.steps += 1,
-            Work::Unary(op, span) => {
+            Work::Unary(op, span_id) => {
+                let span = self.code.span(span_id);
                 let value = match (op, self.value()) {
                     (UnaryOp::Negate, Value::Int(value)) => value
                         .checked_neg()
@@ -1214,31 +1011,35 @@ impl<'a> Machine<'a> {
                 };
                 self.emit(value, span)?;
             }
-            Work::BinaryLeft(op, right, span) => {
+            Work::BinaryLeft(op, right, span_id) => {
+                let span = self.code.span(span_id);
                 self.reserve_work(2, span)?;
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
                     let left = expect_bool_condition(self.value(), span)?;
                     if (op == BinaryOp::And && !left) || (op == BinaryOp::Or && left) {
                         self.emit(Value::Bool(left), span)?;
                     } else {
-                        push(&mut self.work, Work::Bool(span));
+                        push(&mut self.work, Work::Bool(span_id));
                         push(&mut self.work, Work::Eval(right));
                     }
                 } else {
-                    push(&mut self.work, Work::BinaryRight(op, span));
+                    push(&mut self.work, Work::BinaryRight(op, span_id));
                     push(&mut self.work, Work::Eval(right));
                 }
             }
-            Work::BinaryRight(op, span) => {
+            Work::BinaryRight(op, span_id) => {
+                let span = self.code.span(span_id);
                 let right = self.value();
                 let left = self.value();
                 self.emit(eval_binary(op, left, right, span)?, span)?;
             }
-            Work::Bool(span) => {
+            Work::Bool(span_id) => {
+                let span = self.code.span(span_id);
                 let value = expect_bool_condition(self.value(), span)?;
                 self.emit(Value::Bool(value), span)?;
             }
-            Work::Choose(then_body, else_body, span) => {
+            Work::Choose(then_body, else_body, span_id) => {
+                let span = self.code.span(span_id);
                 let selected = if expect_bool_condition(self.value(), span)? {
                     then_body
                 } else {
@@ -1248,7 +1049,7 @@ impl<'a> Machine<'a> {
                 push(
                     &mut self.work,
                     Work::ScopeExit {
-                        span: selected.first().map(stmt_span).unwrap_or_default(),
+                        span: self.code.block_span(selected),
                         value_base: self.values.len(),
                         fallthrough: ScopeFallthrough::Continue,
                     },
@@ -1267,8 +1068,9 @@ impl<'a> Machine<'a> {
                 body,
                 span,
             } => {
-                if expect_bool_condition(self.value(), *span)? {
-                    self.reserve_work(1, *span)?;
+                let source_span = self.code.span(span);
+                if expect_bool_condition(self.value(), source_span)? {
+                    self.reserve_work(1, source_span)?;
                     push(
                         &mut self.work,
                         Work::LoopIteration(LoopState::While {
@@ -1280,13 +1082,14 @@ impl<'a> Machine<'a> {
                 }
             }
             Work::ForInit { name, body, span } => {
+                let source_span = self.code.span(span);
                 let limit = match self.value() {
                     Value::Int(limit) if limit >= 0 => limit,
                     Value::Int(_) => {
                         return Err(KuError::runtime(
                             "for int iterator expects a non-negative int",
-                            *span,
-                        ));
+                            source_span,
+                        ))
                     }
                     other => {
                         return Err(KuError::runtime(
@@ -1294,12 +1097,12 @@ impl<'a> Machine<'a> {
                                 "type error: for expects array or int but got {}",
                                 other.type_name()
                             ),
-                            *span,
-                        ));
+                            source_span,
+                        ))
                     }
                 };
                 if limit > 0 {
-                    self.reserve_work(1, *span)?;
+                    self.reserve_work(1, source_span)?;
                     push(
                         &mut self.work,
                         Work::LoopIteration(LoopState::ForInt {
@@ -1316,13 +1119,15 @@ impl<'a> Machine<'a> {
                 self.metrics.steps += 1;
                 self.enter_loop_iteration(state)?;
             }
-            Work::Bind(name, mutable, declare, span) => {
+            Work::Bind(name, mutable, declare, span_id) => {
                 let value = self.value();
+                let span = self.code.span(span_id);
+                let name = self.code.symbol(name).to_string();
                 let env = &mut self.frame().env;
-                if !declare && env.contains(name) {
-                    env.assign_owned(name, value, span)?;
+                if !declare && env.contains(&name) {
+                    env.assign_owned(&name, value, span)?;
                 } else {
-                    env.define_owned(name.to_string(), value, mutable, span)?;
+                    env.define_owned(name, value, mutable, span)?;
                 }
             }
             Work::Discard => {
@@ -1337,11 +1142,9 @@ impl<'a> Machine<'a> {
                 args,
                 span,
             } => {
-                // The argument boundary is installed before the first argument
-                // effect. Its actual buffer stays alive through the callee's
-                // scope/call exits and is consumed by the original arbiter.
-                self.reserve_work(2, *span)?;
-                let staged = self.argument_storage(args.len(), *span)?;
+                let source_span = self.code.span(span);
+                self.reserve_work(2, source_span)?;
+                let staged = self.argument_storage(args.len, source_span)?;
                 let exit_index = self.work.len();
                 push(
                     &mut self.work,
@@ -1377,14 +1180,13 @@ impl<'a> Machine<'a> {
                         .get_mut(exit_index)
                         .expect("live argument exit marker")
                     else {
-                        unreachable!("argument marker retains its stable stack index");
+                        unreachable!("argument marker stable stack index");
                     };
-                    // Full arity capacity was reserved before argument effects.
                     assert!(arguments.staged.len() < arguments.staged.capacity());
                     arguments.staged.push(value);
                 }
                 if let Some(arg) = args.get(next) {
-                    self.reserve_work(2, *span)?;
+                    self.reserve_work(2, self.code.span(span))?;
                     push(
                         &mut self.work,
                         Work::Arguments {
@@ -1398,9 +1200,6 @@ impl<'a> Machine<'a> {
                     push(&mut self.work, Work::Eval(arg));
                 } else {
                     let depth = self.frame().depth + 1;
-                    // Temporarily move the buffer, never clone its elements.
-                    // Stack growth may move the marker, but its index remains
-                    // stable until every continuation above it has retired.
                     let Work::ArgumentsExit(arguments) = self
                         .work
                         .get_mut(exit_index)
@@ -1433,17 +1232,18 @@ impl<'a> Machine<'a> {
         Ok(())
     }
 
-    fn finish_boundary(&mut self, boundary: Work<'a>, hooks: &mut impl ExecutionHooks) {
+    fn finish_boundary(&mut self, boundary: Work, hooks: &mut impl ExecutionHooks) {
         match boundary {
             Work::TryExit(index) => {
                 assert_eq!(index + 1, self.finally.frames.len(), "current try frame");
                 let (body, span, owner_call) = {
                     let frame = self.finally.frames.get(index).expect("live try frame");
-                    (frame.body, *frame.span, frame.owner_call)
+                    (frame.body, frame.span, frame.owner_call)
                 };
                 assert_eq!(owner_call, self.calls.len(), "try owns its call frame");
                 let primary = self.pending.take().unwrap_or(Ok(Flow::Continue));
-                let mode = hooks.prepare_finally(&self.frame().env, &primary, span);
+                let source_span = self.code.span(span);
+                let mode = hooks.prepare_finally(&self.frame().env, &primary, source_span);
                 if matches!(mode, cancellation::FinallyMode::Skip) {
                     // Ordinary fatal errors skip finally in the existing
                     // language. Retire its preinstalled exit with its owner.
@@ -1477,7 +1277,7 @@ impl<'a> Machine<'a> {
                     push(
                         &mut self.work,
                         Work::ScopeExit {
-                            span: body.first().map(stmt_span).unwrap_or_default(),
+                            span: self.code.block_span(body),
                             value_base: self.values.len(),
                             fallthrough: ScopeFallthrough::Continue,
                         },
@@ -1501,7 +1301,12 @@ impl<'a> Machine<'a> {
                 );
                 let primary = frame.primary.take().expect("saved primary outcome");
                 let guard = frame.guard.take();
-                let result = hooks.finish_finally(primary, replacement, frame.mode, *frame.span);
+                let result = hooks.finish_finally(
+                    primary,
+                    replacement,
+                    frame.mode,
+                    self.code.span(frame.span),
+                );
                 // Keep the exact synchronous cleanup window through shared
                 // arbitration/discard, then restore its parent before resuming.
                 drop(guard);
@@ -1538,7 +1343,8 @@ impl<'a> Machine<'a> {
                     })
                 });
                 self.discard_values_after(value_base);
-                let result = hooks.finish_scope(&mut self.frame().env, result, span, true);
+                let source_span = self.code.span(span);
+                let result = hooks.finish_scope(&mut self.frame().env, result, source_span, true);
                 // Only a normally completed branch resumes its enclosing block.
                 // Return and error continue through every remaining exit marker.
                 if !matches!(&result, Ok(Flow::Continue)) {
@@ -1553,7 +1359,7 @@ impl<'a> Machine<'a> {
                     frame.env,
                     frame.leases,
                     result,
-                    *frame.epilogue_span,
+                    self.code.span(frame.epilogue_span),
                     frame.kind,
                 );
                 // Retire only after the real parameter Env/leases arbitration.
@@ -1565,7 +1371,7 @@ impl<'a> Machine<'a> {
                 let result = self.pending.take().expect("argument or callee outcome");
                 self.discard_values_after(arguments.value_base);
                 let capacity = arguments.staged.capacity();
-                let span = *arguments.span;
+                let span = self.code.span(arguments.span);
                 let result = hooks.finish_arguments(
                     &mut self.frame().env,
                     arguments.leases,
@@ -1609,9 +1415,9 @@ impl<'a> Machine<'a> {
         poll: impl FnMut(Span) -> KuResult<()>,
     ) -> KuResult<Value> {
         let span = self
-            .source
-            .get(entry)
-            .map(|function| function.span)
+            .code
+            .find_function(entry)
+            .map(|id| self.code.span(self.code.function(id).span))
             .unwrap_or_default();
         let mut hooks = PollHooks {
             host: Interpreter::new(),
@@ -1631,16 +1437,19 @@ impl<'a> Machine<'a> {
     ) -> KuResult<Flow> {
         #[cfg(not(test))]
         let _ = test_fuel;
-        let function = self.source.get(entry);
-        let span = function.map(|function| function.span).unwrap_or_default();
+        let function = self.code.find_function(entry);
+        let span = function
+            .map(|id| self.code.span(self.code.function(id).span))
+            .unwrap_or_default();
         self.pending = None;
         let admission = (|| {
             let function = function
                 .ok_or_else(|| KuError::runtime(format!("undefined function '{entry}'"), span))?;
             // Retain the existing entry argument budget admission even though
             // this caller already owns those arguments outside the machine.
-            self.reserve_values(args.len(), function.span)?;
-            self.enter(function, args, depth, &function.span)
+            let function_span = self.code.function(function).span;
+            self.reserve_values(args.len(), self.code.span(function_span))?;
+            self.enter(function, args, depth, function_span)
         })();
         if let Err(error) = admission {
             self.pending = Some(Err(error));
@@ -1685,10 +1494,12 @@ impl<'a> Machine<'a> {
                 continue;
             }
             let poll = match &step {
-                Work::Statement(stmt) => hooks.tick(stmt_span(stmt)),
-                Work::Eval(expr) => hooks.tick(expr.span),
-                Work::SelfCallee(span) => hooks.tick(*span),
-                Work::LoopIteration(state) => hooks.tick(state.span()),
+                Work::Statement(stmt) => {
+                    hooks.tick(self.code.span(self.code.statement(*stmt).span))
+                }
+                Work::Eval(expr) => hooks.tick(self.code.span(self.code.expression(*expr).span)),
+                Work::SelfCallee(span) => hooks.tick(self.code.span(*span)),
+                Work::LoopIteration(state) => hooks.tick(self.code.span(state.span())),
                 _ => Ok(()),
             };
             if let Err(error) = poll {
@@ -1718,6 +1529,18 @@ impl<'a> Machine<'a> {
             + self.values.peak_storage_bytes()
             + self.finally.frames.peak_storage_bytes()
             + self.peak_argument_bytes;
+        // A completed run keeps the same immutable code owner. Code is shared
+        // by every call, so its retained backing cannot grow with call depth.
+        assert_eq!(
+            self.metrics.code_retained_backing_bytes,
+            self.code.retained_bytes()
+        );
+        assert!(
+            self.metrics.code_retained_backing_bytes
+                <= self
+                    .metrics
+                    .code_construction_peak_backing_bytes_upper_bound
+        );
         self.pending.take().expect("root call or admission outcome")
     }
 }
@@ -1731,16 +1554,18 @@ fn execute(
     initial_depth: usize,
     limits: Limits,
 ) -> (KuResult<Value>, Metrics) {
-    if let Err(error) = preflight(source, limits) {
-        return (
-            Err(error),
-            Metrics {
-                logical_depth: initial_depth,
-                ..Metrics::default()
-            },
-        );
-    }
-    let mut machine = Machine::new(source, limits, initial_depth);
+    let mut machine = match Machine::new(source, limits, initial_depth) {
+        Ok(machine) => machine,
+        Err(error) => {
+            return (
+                Err(error),
+                Metrics {
+                    logical_depth: initial_depth,
+                    ..Metrics::default()
+                },
+            )
+        }
+    };
     let result = machine.run(entry, args, depth);
     (result, machine.metrics)
 }
@@ -1759,12 +1584,29 @@ pub(super) fn try_execute(
     }
     let source = interpreter.functions.clone();
     let limits = Limits::default();
-    // Selection has no user effects. A failed eligibility check preserves the
-    // complete old evaluator for this tree; there is no mid-execution fallback.
-    if preflight_tree(&source, limits, Some(function)).is_err() {
+    // Unsupported or inconclusive bounded validation retains the whole legacy
+    // tree. Once fully selected, an arena rejection is a before-effects error;
+    // never bypass the admitted storage contract by restarting recursively.
+    if !code::eligible_named(&source, function, limits) {
         return None;
     }
-    let mut machine = Machine::new(&source, limits, interpreter.call_depth);
+    if function.params.len() != args.len() {
+        return Some(Err(KuError::runtime(
+            format!(
+                "function '{}' expects {} arguments but got {}",
+                function.name,
+                function.params.len(),
+                args.len()
+            ),
+            function.span,
+        )));
+    }
+    let code = match CodeHandle::compile_named(&source, function, limits) {
+        Ok(code) => code,
+        Err(AdmissionError::Unsupported(_)) => return None,
+        Err(error @ AdmissionError::Rejected(_)) => return Some(Err(error.into_error())),
+    };
+    let mut machine = Machine::from_code(code, limits, interpreter.call_depth);
     Some(machine.run_with_hooks(&function.name, args, depth, false, interpreter))
 }
 
@@ -1786,51 +1628,23 @@ pub(super) fn try_execute_function_value(
     {
         return None;
     }
-    let name = call.self_name.as_ref()?;
+    let name = call.self_name.as_deref()?;
     if interpreter.functions.contains_key(name) {
-        // Global named calls take precedence over same-name local bindings in
-        // the existing language, even inside a function value.
         return None;
     }
-    let mut parameter_names = HashSet::new();
-    if call.params.iter().any(|name| !parameter_names.insert(name)) {
-        return None;
-    }
-    let function = FnDecl {
-        name: name.clone(),
-        is_async: false,
-        type_params: Vec::new(),
-        params: call
-            .params
-            .iter()
-            .map(|name| Param {
-                mode: ParamMode::Owned,
-                name: name.clone(),
-                ty: None,
-                span: call.span,
-            })
-            .collect(),
-        return_type: None,
-        body: call.body.to_vec(),
-        span: call.span,
-    };
-    // Clone only immutable code metadata, once for the complete subtree. The
-    // recursive self binding is replaced by a static code reference only when
-    // no admitted operation can read, overwrite or export that binding.
+    let source = interpreter.functions.clone();
     let limits = Limits::default();
-    let source = HashMap::from([(name.clone(), function)]);
-    let entry = source.get(name).expect("local entry code");
-    let captures = function_capture_names(entry).ok()?;
-    if captures.iter().any(|name| {
-        interpreter.functions.contains_key(name)
-            || (call.captures.contains(name) && !call.captures.is_stable_scalar_binding(name))
-    }) {
+    if !code::eligible_local(&source, call, limits) {
         return None;
     }
-    if preflight_tree_mode(&source, limits, Some(entry), true, Some(&captures)).is_err() {
-        return None;
-    }
-    let mut machine = Machine::new(&source, limits, interpreter.call_depth);
-    machine.captures = Some(call.captures);
+    let code = match CodeHandle::compile_local(&source, call, limits) {
+        Ok(code) => code,
+        Err(AdmissionError::Unsupported(_)) => return None,
+        Err(error @ AdmissionError::Rejected(_)) => return Some(Err(error.into_error())),
+    };
+    let mut machine = Machine::from_code(code, limits, interpreter.call_depth);
+    // Env clone shares binding cells and clears owned_bindings. It does not
+    // clone any Value payload; actual per-call scopes still exit through hooks.
+    machine.captures = Some(call.captures.clone());
     Some(machine.run_with_hooks(name, &call.args, call.depth, false, interpreter))
 }

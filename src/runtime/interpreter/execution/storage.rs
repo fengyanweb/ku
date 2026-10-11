@@ -152,6 +152,10 @@ impl<T> FrameStack<T> {
         self.frames.get_mut(index)
     }
 
+    pub(super) fn as_slice(&self) -> &[T] {
+        &self.frames
+    }
+
     pub(super) fn len(&self) -> usize {
         self.frames.len()
     }

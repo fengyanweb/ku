@@ -1,5 +1,7 @@
 use super::*;
 
+mod code_handle;
+
 const RECURSION: &str = r#"
 fn Descend(n: int): int {
     if (n <= 0) { return 0 }
@@ -279,10 +281,7 @@ fn preflight_budgets_reject_without_starting_the_entry_function() {
     for (limits, message) in [
         (count, "internal execution storage rejected: FrameLimit"),
         (bytes, "internal execution storage rejected: StorageLimit"),
-        (
-            fuel,
-            "internal execution prototype does not support this source",
-        ),
+        (fuel, "internal execution storage rejected: FrameLimit"),
     ] {
         let (result, metrics) = execute(&source, "Entry", &[], 0, 7, limits);
         assert_eq!(result.unwrap_err().message, message);
@@ -352,7 +351,7 @@ fn Entry(n: int): int {
 }
 "#,
     );
-    let mut machine = Machine::new(&source, Limits::default(), 0);
+    let mut machine = Machine::new(&source, Limits::default(), 0).unwrap();
     assert_eq!(
         machine
             .run("Entry", &[Value::Int(1)], 0)
@@ -875,7 +874,7 @@ fn production_finally_protects_original_cleanup_and_http_termination_contexts() 
             let cleanup = cleanup_failure.then(|| CleanupGuard::enter(original));
             let mut host = Interpreter::new();
             let mut probe = FinallyProbe::new(&mut host, triggers);
-            let mut machine = Machine::new(&source, Limits::default(), 0);
+            let mut machine = Machine::new(&source, Limits::default(), 0).unwrap();
             let error = machine
                 .run_with_hooks("Entry", &[], 0, false, &mut probe)
                 .err()
@@ -928,7 +927,7 @@ fn Entry(): int {
         &mut host,
         vec![(condition.span, 2, FinallyProbeAction::HttpTimeout)],
     );
-    let mut machine = Machine::new(&source, Limits::default(), 0);
+    let mut machine = Machine::new(&source, Limits::default(), 0).unwrap();
     let error = machine
         .run_with_hooks("Entry", &[], 0, false, &mut probe)
         .err()
@@ -1017,7 +1016,7 @@ fn Entry(): int {
         let _execution = ExecutionTerminationGuard::enter();
         // Production owns this Machine locally. Panic leaves its scope and
         // drops the live finally guards in their real lifetime and LIFO order.
-        let mut machine = Machine::new(&source, Limits::default(), 0);
+        let mut machine = Machine::new(&source, Limits::default(), 0).unwrap();
         let _ = machine.run_with_hooks("Entry", &[], 0, false, &mut probe);
     }));
     assert!(
@@ -1053,21 +1052,21 @@ fn production_finally_aggregate_budgets_reject_before_body_and_retire_all_state(
     count.work.max_frames = 7;
     let mut bytes = Limits::default();
     bytes.work.max_storage_bytes =
-        7 * std::mem::size_of::<Work<'_>>() + std::mem::size_of::<FinallyFrame<'_>>();
+        7 * std::mem::size_of::<Work>() + std::mem::size_of::<FinallyFrame>();
     for (limits, old_backing, reason) in
         [(count, false, "FrameLimit"), (bytes, true, "StorageLimit")]
     {
         let mut host = Interpreter::new();
         let mut probe = FinallyProbe::new(&mut host, vec![]);
-        let mut machine = Machine::new(&source, limits, 0);
+        let mut machine = Machine::new(&source, limits, 0).unwrap();
         if old_backing {
             machine.work.reserve(4).unwrap();
             // The final seven-slot buffer plus finally metadata would fit.
             // Reallocation must still charge the retained old buffer as well.
             assert!(
                 machine.work.charged_storage_bytes()
-                    + 7 * std::mem::size_of::<Work<'_>>()
-                    + std::mem::size_of::<FinallyFrame<'_>>()
+                    + 7 * std::mem::size_of::<Work>()
+                    + std::mem::size_of::<FinallyFrame>()
                     > limits.work.max_storage_bytes
             );
         }
