@@ -23,6 +23,10 @@ mod cancellation;
 pub(crate) use cancel_batch::{CancelBatchPoll, TaskCancelBatch};
 #[cfg(test)]
 mod cancel_batch_tests;
+#[cfg(test)]
+mod cleanup_panic_tests;
+#[cfg(test)]
+mod help_panic_tests;
 pub(crate) use cancellation::{
     current_cleanup_context, current_execution_termination, ensure_task_operations_allowed,
     set_execution_termination, CancellationContext, CleanupGuard, ExecutionTerminationGuard,
@@ -55,6 +59,37 @@ thread_local! {
 
 type TaskFn = Box<dyn FnOnce() -> KuResult<Value> + Send + 'static>;
 type BlockingFn = Box<dyn FnOnce() -> KuResult<Value> + Send + 'static>;
+type CleanupPanic = Box<dyn std::any::Any + Send + 'static>;
+
+struct AwaitHelpDepthGuard {
+    previous: usize,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for AwaitHelpDepthGuard {
+    fn drop(&mut self) {
+        AWAIT_HELP_DEPTH.with(|depth| depth.set(self.previous));
+    }
+}
+
+struct TaskWaitGuard<'a> {
+    runtime: &'a TaskRuntime,
+    current: i64,
+    state: Option<Arc<TaskState>>,
+}
+
+impl Drop for TaskWaitGuard<'_> {
+    fn drop(&mut self) {
+        if self.current != 0 {
+            self.runtime.clear_wait(self.current);
+        }
+        if let Some(state) = &self.state {
+            if !state.is_cancelled() {
+                state.set_status(TASK_RUNNING);
+            }
+        }
+    }
+}
 
 struct TaskJob {
     id: i64,
@@ -890,7 +925,12 @@ impl TaskRuntime {
                 ));
             }
         }
-        if let Some(state) = &current_state {
+        let wait = TaskWaitGuard {
+            runtime: self,
+            current,
+            state: current_state,
+        };
+        if let Some(state) = &wait.state {
             state.set_status(TASK_WAITING);
         }
         let result = (|| loop {
@@ -935,14 +975,7 @@ impl TaskRuntime {
             }
             handle.state.wait(wait)?;
         })();
-        if current != 0 {
-            self.clear_wait(current);
-        }
-        if let Some(state) = current_state {
-            if !state.is_cancelled() {
-                state.set_status(TASK_RUNNING);
-            }
-        }
+        drop(wait);
         result
     }
 
@@ -1171,21 +1204,23 @@ impl TaskRuntime {
     }
 
     fn help_one_bounded(&self) -> KuResult<bool> {
-        let allowed = AWAIT_HELP_DEPTH.with(|depth| {
+        let previous = AWAIT_HELP_DEPTH.with(|depth| {
             let current = depth.get();
             if current >= MAX_AWAIT_DEPTH {
-                false
+                None
             } else {
                 depth.set(current + 1);
-                true
+                Some(current)
             }
         });
-        if !allowed {
+        let Some(previous) = previous else {
             return Ok(false);
-        }
-        let result = self.help_one();
-        AWAIT_HELP_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
-        result
+        };
+        let _depth = AwaitHelpDepthGuard {
+            previous,
+            _same_thread: std::marker::PhantomData,
+        };
+        self.help_one()
     }
 
     fn help_one(&self) -> KuResult<bool> {
@@ -1337,6 +1372,23 @@ impl PartialEq for TaskHandle {
 }
 
 impl TaskState {
+    // Finish the remaining ordered cleanup stages before propagating the first
+    // native destructor panic. The caller retains its original cleanup window.
+    fn catch_cleanup_panic(&self, first: &mut Option<CleanupPanic>, cleanup: impl FnOnce()) {
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(cleanup)) {
+            if first.is_none() {
+                *first = Some(panic);
+            } else {
+                if let Some(runtime) = self.runtime.upgrade() {
+                    runtime
+                        .suppressed_cleanup_outcomes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                drop(panic);
+            }
+        }
+    }
+
     fn install_run(&self, run: TaskFn) {
         let mut uninstalled = Some(run);
         let context = {
@@ -1510,17 +1562,25 @@ impl TaskState {
             }
         }
         let _cleanup = discard_context.map(CleanupGuard::enter);
-        if let Some(result) = uncommitted {
-            drop_owner_result_synchronously(result);
+        let mut first_panic = None;
+        if let Some(result) = uncommitted.take() {
+            self.catch_cleanup_panic(&mut first_panic, || {
+                drop_owner_result_synchronously(result);
+            });
         }
-        if let Some(result) = abandoned {
-            drop_owner_result_synchronously(result);
+        if let Some(result) = abandoned.take() {
+            self.catch_cleanup_panic(&mut first_panic, || {
+                drop_owner_result_synchronously(result);
+            });
         }
-        flush_owner_results();
+        self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
         if self.queue_consumed.load(Ordering::Acquire) {
             if let Some(runtime) = self.runtime.upgrade() {
                 finish_task_accounting(&runtime, self);
             }
+        }
+        if let Some(panic) = first_panic {
+            std::panic::resume_unwind(panic);
         }
     }
 
@@ -1557,9 +1617,19 @@ impl TaskState {
         self.ready.notify_all();
         if let Some(queued) = queued {
             let _cleanup = CleanupGuard::enter(context);
-            drop_owner_synchronously(queued);
-            flush_owner_results();
-            self.complete(self.id, Ok(Value::Null));
+            let mut first_panic = None;
+            // Real capture drop glue exits before terminal cancellation is
+            // published, even when a native destructor starts unwinding.
+            self.catch_cleanup_panic(&mut first_panic, || {
+                drop_owner_synchronously(queued);
+            });
+            self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
+            self.catch_cleanup_panic(&mut first_panic, || {
+                self.complete(self.id, Ok(Value::Null));
+            });
+            if let Some(panic) = first_panic {
+                std::panic::resume_unwind(panic);
+            }
         }
         true
     }
@@ -1684,19 +1754,45 @@ fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<T
                     return;
                 };
                 inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
-                execute_task_job(&inner, job)
+                if let Err(panic) = catch_unwind(AssertUnwindSafe(|| execute_task_job(&inner, job)))
+                {
+                    // Ordinary callback panics keep their existing task
+                    // classification. An escaping cleanup panic has already
+                    // retired its queue node; keep the winning terminal result
+                    // and the original panic-hook diagnostic, then serve again.
+                    inner
+                        .suppressed_cleanup_outcomes
+                        .fetch_add(1, Ordering::Relaxed);
+                    drop(panic);
+                }
             }
             Err(_) => return,
         }
     }
 }
 
+struct QueueRetirement<'a> {
+    inner: &'a TaskRuntimeInner,
+    state: &'a TaskState,
+}
+
+impl Drop for QueueRetirement<'_> {
+    fn drop(&mut self) {
+        // Primitive retirement only: no callback, payload cleanup, completion
+        // or wait is started by this destructor while another panic unwinds.
+        finish_task_job(self.inner, self.state);
+    }
+}
+
 fn execute_task_job(inner: &TaskRuntimeInner, job: TaskJob) {
     let _execution = ExecutionTerminationGuard::enter();
+    let _retirement = QueueRetirement {
+        inner,
+        state: &job.state,
+    };
     let Some(run) = job.state.claim_run() else {
         // A cancelled queued frame was already dropped by its canceller. Only
         // its queue node reaches this path; this worker alone retires accounting.
-        finish_task_job(inner, &job.state);
         return;
     };
     let previous = CURRENT_TASK_ID.with(|current| {
@@ -1719,7 +1815,6 @@ fn execute_task_job(inner: &TaskRuntimeInner, job: TaskJob) {
     CURRENT_TASK_ID.with(|current| current.set(previous));
     job.state
         .complete_with_status(job.id, result, panicked.then_some(TASK_PANICKED));
-    finish_task_job(inner, &job.state);
 }
 
 fn finish_task_job(inner: &TaskRuntimeInner, state: &TaskState) {
