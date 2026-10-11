@@ -475,8 +475,9 @@ manifest 是借用的稳定 instance 存储；完整集合、生命周期、唯�
 该存储；terminal 在释放 registry/执行租约前只注销元数据，不代表替调用方清完子树。
 父 D 缩短不扫描 manifest，adapter 对 pending issued child 调用 cancel_receipt；
 取消后向最终退出提升、外层 child 合并复用下述 driver 原语及内部 typed adapter。
-对应 TaskOp/verifier 和帧协议见 R5h.4；源码 If 分支按 R5h.5 复用该协议，source
-loop/finally 仍未接入，不放宽其余源码边界，不代表完整 async 或 M:N。
+对应 TaskOp/verifier 和帧协议见 R5h.4；源码 If 分支与 While 循环已复用该协议，
+并在真实作用域退出时 drain 子 Task。Task 源码的 for、break/continue 与
+try/catch/finally 仍未接入，不放宽其余源码边界，不代表完整 async 或 M:N。
 容量和重复检查最多64项/2016次比较，无新增堆分配、队列或 RC 边；测试与精确提交
 验收结果见工作日志，不从接口存在推断真实 C 或 sanitizer 已通过。
 
@@ -576,8 +577,9 @@ scope_end；全量 ACK 后异常 Pending 作为合同错误拒绝，不循环 YI
 两次有界 drain；Control ABI 2 在同一 poll 中还可进入一次取消 cleanup，而非循环重试。
 不递归 drive child、增加线程或重试环；新增实例字段继续通过 sizeof 计费。
 
-上述是内部合同和实现边界，不等于所有故障/竞态已实测。源码 If 只覆盖已接入的
-primitive/单层 Result，不是任意 Owned payload、loop/finally 或完整 async 实现。
+上述是内部合同和实现边界，不等于所有故障/竞态已实测。源码 If/While 只覆盖
+已接入的 primitive（含 str）/单层 Result；任意 Owned payload、for、break/continue、
+Task 源码 finally 与完整 async 仍未实现。
 真实 C、无副作用 raw 反例、sanitizer、精确 SHA 三系统
 结果分开验收；固定硬件性能、RSS、soak、M:N、netpoll 和事件 HTTP 仍未完成。
 
