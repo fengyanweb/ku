@@ -43,6 +43,10 @@ thread_local! {
     static CURRENT_TASK_ID: Cell<i64> = const { Cell::new(0) };
     static CURRENT_TASK_STATE: RefCell<Option<Weak<TaskState>>> = const { RefCell::new(None) };
     static AWAIT_HELP_DEPTH: Cell<usize> = const { Cell::new(0) };
+    // Released results can own other completed Tasks. Their final lease drops
+    // enqueue an existing state, instead of recursively destroying its result.
+    static OWNER_RESULT_RELEASE_HEAD: RefCell<Option<Arc<TaskState>>> = const { RefCell::new(None) };
+    static OWNER_RESULT_RELEASE_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 type TaskFn = Box<dyn FnOnce() -> KuResult<Value> + Send + 'static>;
@@ -115,14 +119,102 @@ struct TaskRuntimeInner {
 }
 
 pub struct TaskHandle {
+    // Rust drops fields in declaration order. The final owner lease must detach
+    // its payload while this handle still keeps TaskState alive; otherwise the
+    // state's Arc drop recursively destroys nested results before the lease can
+    // enter the iterative owner drain.
+    owner: Arc<TaskOwnerLease>,
     id: i64,
     state: Arc<TaskState>,
     runtime: TaskRuntime,
-    owner: Arc<TaskOwnerLease>,
 }
 
 struct TaskOwnerLease {
     state: Weak<TaskState>,
+}
+
+struct OwnerResultRelease {
+    result: KuResult<Value>,
+    context: CancellationContext,
+    next: Option<Arc<TaskState>>,
+}
+
+struct SynchronousOwnerDropGuard {
+    previous: bool,
+}
+
+impl SynchronousOwnerDropGuard {
+    fn enter() -> Self {
+        Self {
+            previous: OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.replace(false)),
+        }
+    }
+}
+
+impl Drop for SynchronousOwnerDropGuard {
+    fn drop(&mut self) {
+        OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.set(self.previous));
+    }
+}
+
+fn drop_owner_synchronously<T>(value: T) {
+    // A container/closure can own ordered siblings and non-Task resources. Each
+    // child must finish its ordinary depth-first drop before the next sibling;
+    // a deferred LIFO/FIFO batch would change that observable order. Restore the
+    // outer drain mode on both success and destructor panic. This deliberately
+    // retains host recursion for branched/wrapped payloads and queued captures.
+    let _synchronous = SynchronousOwnerDropGuard::enter();
+    drop(value);
+}
+
+fn drain_owner_results() {
+    if OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.replace(true)) {
+        return;
+    }
+    let drained = catch_unwind(AssertUnwindSafe(flush_owner_results));
+    OWNER_RESULT_RELEASE_ACTIVE.with(|active| active.set(false));
+    if let Err(panic) = drained {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn flush_owner_results() {
+    // A queued frame may capture completed owners while an outer result drain
+    // is active. Its ACK/accounting must not overtake detached direct-Task
+    // payloads. Re-entering this loop preserves that order. Only direct
+    // Ok(Value::Task) result chains are flat; containers, wrappers and queued
+    // captures keep their synchronous depth-first cleanup and recursion risks.
+    let mut first_panic = None;
+    loop {
+        let Some(state) = OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow_mut().take()) else {
+            break;
+        };
+        let mut work = state
+            .owner_result_release
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("only a unique detached owner result is queued");
+        OWNER_RESULT_RELEASE_HEAD.with(|head| *head.borrow_mut() = work.next.take());
+        // Neither the state mutex nor the TLS RefCell borrow survives a drop.
+        // A nested lease therefore only enqueues; every queued node has already
+        // been allocated as part of its TaskState, even during OOM cleanup.
+        let dropped = catch_unwind(AssertUnwindSafe(|| {
+            let _cleanup = CleanupGuard::enter(work.context);
+            drop(work.result);
+        }));
+        if let Err(panic) = dropped {
+            if first_panic.is_none() {
+                first_panic = Some(panic);
+            }
+        }
+    }
+    // A destructor panic must not leave TLS owning an undrained linked list or
+    // make a later independent release silently skip its cleanup. Keep the
+    // existing panic boundary, after draining all already-detached results.
+    if let Some(panic) = first_panic {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 impl Drop for TaskOwnerLease {
@@ -195,6 +287,7 @@ struct TaskState {
     // queued frame for cancellation must have one arbitration point.
     pending_run: Mutex<Option<TaskFn>>,
     owner_released: AtomicBool,
+    owner_result_release: Mutex<Option<OwnerResultRelease>>,
     ready: Condvar,
     cancelled: AtomicBool,
     cancellation: Mutex<Option<CancellationContext>>,
@@ -278,6 +371,7 @@ impl TaskRuntime {
             result: Mutex::new(None),
             pending_run: Mutex::new(None),
             owner_released: AtomicBool::new(false),
+            owner_result_release: Mutex::new(None),
             ready: Condvar::new(),
             cancelled: AtomicBool::new(false),
             cancellation: Mutex::new(None),
@@ -1171,7 +1265,8 @@ impl TaskState {
             // Cancellation may arrive while the deferred frame is being built.
             // The builder, not a worker, owns cleanup of that not-yet-queued frame.
             let _cleanup = context.map(CleanupGuard::enter);
-            drop(uninstalled);
+            drop_owner_synchronously(uninstalled);
+            flush_owner_results();
             self.complete(self.id, Ok(Value::Null));
         }
     }
@@ -1210,13 +1305,14 @@ impl TaskState {
             (run, cancellation_owns_completion)
         };
         let _cleanup = self.cancellation().map(CleanupGuard::enter);
-        drop(run);
+        drop_owner_synchronously(run);
+        flush_owner_results();
         if !cancellation_owns_completion {
             self.complete(id, result);
         }
     }
 
-    fn release_owner(&self, context: CancellationContext) {
+    fn release_owner(self: &Arc<Self>, context: CancellationContext) {
         let abandoned = {
             let mut slot = self
                 .result
@@ -1226,9 +1322,27 @@ impl TaskState {
             slot.take()
         };
         let _cleanup = CleanupGuard::enter(context);
-        // Scheduler/late blocking references must not retain an unawaited result.
-        // Dropping the payload can release other Task owners, so never hold a lock.
-        drop(abandoned);
+        match abandoned {
+            Some(result @ Ok(Value::Task(_))) => {
+                OWNER_RESULT_RELEASE_HEAD.with(|head| {
+                    let mut head = head.borrow_mut();
+                    *self
+                        .owner_result_release
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(OwnerResultRelease {
+                        result,
+                        context,
+                        next: head.take(),
+                    });
+                    *head = Some(Arc::clone(self));
+                });
+                drain_owner_results();
+            }
+            Some(result) => drop_owner_synchronously(result),
+            None => {}
+        }
+        // Keep queued-frame cancellation synchronous: its terminal ACK must
+        // still follow capture destruction, including a concurrent queue take.
         self.request_cancel_with(context);
     }
 
@@ -1304,8 +1418,9 @@ impl TaskState {
             }
         }
         let _cleanup = discard_context.map(CleanupGuard::enter);
-        drop(uncommitted);
-        drop(abandoned);
+        drop_owner_synchronously(uncommitted);
+        drop_owner_synchronously(abandoned);
+        flush_owner_results();
         if self.queue_consumed.load(Ordering::Acquire) {
             if let Some(runtime) = self.runtime.upgrade() {
                 finish_task_accounting(&runtime, self);
@@ -1346,7 +1461,8 @@ impl TaskState {
         self.ready.notify_all();
         if let Some(queued) = queued {
             let _cleanup = CleanupGuard::enter(context);
-            drop(queued);
+            drop_owner_synchronously(queued);
+            flush_owner_results();
             self.complete(self.id, Ok(Value::Null));
         }
         true
@@ -1623,7 +1739,7 @@ fn send_blocking_result(
         let _cleanup = parent
             .and_then(TaskState::cancellation)
             .map(CleanupGuard::enter);
-        drop(unsent.0);
+        drop_owner_synchronously(unsent.0);
     }
 }
 
@@ -1686,6 +1802,7 @@ fn task_error(code: &str, message: impl Into<String>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry_server::native_test_harness as owner_release_bounded_process;
 
     fn completion_state() -> TaskState {
         TaskState {
@@ -1696,6 +1813,7 @@ mod tests {
             result: Mutex::new(None),
             pending_run: Mutex::new(None),
             owner_released: AtomicBool::new(false),
+            owner_result_release: Mutex::new(None),
             ready: Condvar::new(),
             cancelled: AtomicBool::new(false),
             cancellation: Mutex::new(None),
@@ -1764,6 +1882,388 @@ mod tests {
             owner: Arc::new(TaskOwnerLease {
                 state: Arc::downgrade(state),
             }),
+        }
+    }
+
+    struct OrderedOwnerDrop {
+        label: &'static str,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        pending: Option<Weak<TaskState>>,
+        listener_address: Option<std::net::SocketAddr>,
+    }
+
+    impl Drop for OrderedOwnerDrop {
+        fn drop(&mut self) {
+            if let Some(parent) = self.pending.as_ref().and_then(Weak::upgrade) {
+                assert_eq!(parent.status_name(), "cancelling");
+                assert!(!parent.accounting_finished.load(Ordering::Acquire));
+                assert!(parent.result().unwrap().is_none());
+                let runtime = parent.runtime.upgrade().unwrap();
+                assert_eq!(runtime.active_tasks.load(Ordering::Acquire), 1);
+                assert_eq!(runtime.finished_tasks.load(Ordering::Acquire), 0);
+            }
+            if let Some(address) = self.listener_address {
+                assert!(
+                    std::net::TcpListener::bind(address).is_err(),
+                    "the following listener must remain open until this Task payload is dropped"
+                );
+            }
+            self.events.lock().unwrap().push(self.label);
+        }
+    }
+
+    fn completed_with_value(runtime: &TaskRuntime, value: Value) -> TaskHandle {
+        let state = Arc::new(completion_state());
+        state.complete(state.id, Ok(value));
+        handle_for_state(runtime, &state)
+    }
+
+    fn ordered_completed_owner(
+        runtime: &TaskRuntime,
+        label: &'static str,
+        events: &Arc<Mutex<Vec<&'static str>>>,
+        pending: Option<Weak<TaskState>>,
+        listener_address: Option<std::net::SocketAddr>,
+    ) -> TaskHandle {
+        let leaf = Arc::new(completion_state());
+        let probe = OrderedOwnerDrop {
+            label,
+            events: Arc::clone(events),
+            pending,
+            listener_address,
+        };
+        leaf.install_run(Box::new(move || {
+            drop(probe);
+            Ok(Value::Null)
+        }));
+        completed_with_value(runtime, Value::Task(handle_for_state(runtime, &leaf)))
+    }
+
+    fn ordered_completed_fork(
+        runtime: &TaskRuntime,
+        events: &Arc<Mutex<Vec<&'static str>>>,
+        pending: Option<Weak<TaskState>>,
+    ) -> Value {
+        let first = ordered_completed_owner(runtime, "A1", events, pending.clone(), None);
+        let second = ordered_completed_owner(runtime, "A2", events, pending.clone(), None);
+        let a = completed_with_value(
+            runtime,
+            Value::Array(vec![Value::Task(first), Value::Task(second)]),
+        );
+        let b = ordered_completed_owner(runtime, "B1", events, pending, None);
+        Value::Array(vec![Value::Task(a), Value::Task(b)])
+    }
+
+    #[test]
+    fn owner_result_fork_preserves_nested_vec_depth_first_drop_order() {
+        for wrapped in [false, true] {
+            for explicit in [false, true] {
+                let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let payload = ordered_completed_fork(&runtime, &events, None);
+                let payload = if wrapped {
+                    Value::Result {
+                        ok: true,
+                        value: Box::new(payload),
+                    }
+                } else {
+                    payload
+                };
+                let owner = completed_with_value(&runtime, payload);
+                let context = CancellationContext::new(TerminationReason::Cancelled);
+                let _cleanup = CleanupGuard::enter(context);
+                if explicit {
+                    owner.release_scope_owner(context);
+                }
+                drop(owner);
+                assert_eq!(*events.lock().unwrap(), ["A1", "A2", "B1"]);
+                assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+            }
+        }
+    }
+
+    #[test]
+    fn owner_result_fork_queued_capture_finishes_before_parent_ack() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+        let mut initial = completion_state();
+        initial.runtime = Arc::downgrade(&runtime.inner);
+        initial.queue_consumed.store(true, Ordering::Release);
+        let pending = Arc::new(initial);
+        runtime.inner.active_tasks.store(1, Ordering::Release);
+        runtime
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .insert(pending.id, Arc::downgrade(&pending));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captures = ordered_completed_fork(&runtime, &events, Some(Arc::downgrade(&pending)));
+        let ran = Arc::new(AtomicBool::new(false));
+        let child_ran = Arc::clone(&ran);
+        pending.install_run(Box::new(move || {
+            child_ran.store(true, Ordering::Release);
+            drop(captures);
+            Ok(Value::Null)
+        }));
+        let outer =
+            completed_with_value(&runtime, Value::Task(handle_for_state(&runtime, &pending)));
+        let context = CancellationContext {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: Instant::now(),
+        };
+        let _cleanup = CleanupGuard::enter(context);
+        drop(outer);
+        assert_eq!(*events.lock().unwrap(), ["A1", "A2", "B1"]);
+        assert!(!ran.load(Ordering::Acquire));
+        assert_eq!(pending.cancellation(), Some(context));
+        assert_eq!(pending.status_name(), "timed_out");
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+        assert_eq!(snapshot.registered_tasks, 0);
+    }
+
+    #[test]
+    fn owner_result_fork_preserves_task_before_listener_release() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener_id = crate::runtime::http_listener_registry::insert(listener).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let task = ordered_completed_owner(&runtime, "task", &events, None, Some(address));
+        let owner = completed_with_value(
+            &runtime,
+            Value::Array(vec![
+                Value::Task(task),
+                Value::HttpListenerLease(crate::runtime::value::HttpListenerLease::new(
+                    listener_id,
+                )),
+            ]),
+        );
+        drop(owner);
+        assert_eq!(*events.lock().unwrap(), ["task"]);
+        std::net::TcpListener::bind(address).expect("listener closes after the preceding Task");
+        assert!(
+            crate::runtime::http_listener_registry::take(listener_id, Span::default()).is_err()
+        );
+    }
+
+    #[test]
+    fn owner_result_fork_panic_restores_mode_and_allows_next_independent_release() {
+        struct PanickingCapture {
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for PanickingCapture {
+            fn drop(&mut self) {
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+                self.events.lock().unwrap().push("A");
+                panic!("intentional queued capture destructor panic");
+            }
+        }
+
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let leaf = Arc::new(completion_state());
+        let capture = PanickingCapture {
+            events: Arc::clone(&events),
+        };
+        leaf.install_run(Box::new(move || {
+            drop(capture);
+            Ok(Value::Null)
+        }));
+        let a = completed_with_value(&runtime, Value::Task(handle_for_state(&runtime, &leaf)));
+        let b = ordered_completed_owner(&runtime, "B", &events, None, None);
+        let outer =
+            completed_with_value(&runtime, Value::Array(vec![Value::Task(a), Value::Task(b)]));
+        let context = CancellationContext::new(TerminationReason::Cancelled);
+        let _cleanup = CleanupGuard::enter(context);
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(outer))).is_err());
+        assert_eq!(*events.lock().unwrap(), ["A", "B"]);
+        assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+        drop(ordered_completed_owner(&runtime, "C", &events, None, None));
+        assert_eq!(*events.lock().unwrap(), ["A", "B", "C"]);
+        assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+    }
+
+    #[test]
+    fn completed_owner_result_chain_drains_on_real_worker_without_recursive_drop() {
+        const CHILD: &str = "KU_TASK_OWNER_RESULT_CHAIN_CHILD";
+        const COMPLETED: &str = "completed owner result chain regression completed";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "runtime::task::tests::completed_owner_result_chain_drains_on_real_worker_without_recursive_drop",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = owner_release_bounded_process::run_bounded(
+                &mut command,
+                Duration::from_secs(20),
+                owner_release_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("completed owner cleanup has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "completed owner cleanup subprocess failed: {:?}\n{}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "completed owner cleanup subprocess did not finish its regression\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        struct CaptureAckProbe {
+            pending: Arc<Mutex<Option<Weak<TaskState>>>>,
+            observed: Arc<AtomicBool>,
+        }
+        impl Drop for CaptureAckProbe {
+            fn drop(&mut self) {
+                let pending = self
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap();
+                assert_eq!(pending.status_name(), "cancelling");
+                assert!(!pending.accounting_finished.load(Ordering::Acquire));
+                assert!(pending.result().unwrap().is_none());
+                self.observed.store(true, Ordering::Release);
+            }
+        }
+
+        let runtime = TaskRuntime::with_limits(1, 4, 0, 0, 4);
+        let child_runtime = runtime.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let job = spawn_task(&runtime, move || {
+            for release_path in 0..4 {
+                let inert = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+                let leaf = Arc::new(completion_state());
+                let capture_pending = Arc::new(Mutex::new(None));
+                let capture_observed = Arc::new(AtomicBool::new(false));
+                if release_path == 3 {
+                    let probe = CaptureAckProbe {
+                        pending: Arc::clone(&capture_pending),
+                        observed: Arc::clone(&capture_observed),
+                    };
+                    leaf.install_run(Box::new(move || {
+                        drop(probe);
+                        Ok(Value::Null)
+                    }));
+                }
+                let mut owner = handle_for_state(&inert, &leaf);
+                let mut weak_states = Vec::with_capacity(16_384);
+                for _ in 0..16_384 {
+                    let state = Arc::new(completion_state());
+                    weak_states.push(Arc::downgrade(&state));
+                    state.complete(state.id, Ok(Value::Task(owner)));
+                    owner = handle_for_state(&inert, &state);
+                }
+                let context = CancellationContext {
+                    reason: TerminationReason::TimedOut,
+                    cleanup_deadline: Instant::now(),
+                };
+                if release_path >= 2 {
+                    // The only worker is this parent. Cancellation must drop
+                    // the queued capture before publishing its terminal ACK,
+                    // without running the child's continuation.
+                    let ran = Arc::new(AtomicBool::new(false));
+                    let child_ran = Arc::clone(&ran);
+                    let child = spawn_task(&child_runtime, move || {
+                        child_ran.store(true, Ordering::Release);
+                        Ok(Value::Task(owner))
+                    });
+                    let _cleanup = CleanupGuard::enter(context);
+                    let child_state = Arc::clone(&child.state);
+                    if release_path == 3 {
+                        *capture_pending.lock().unwrap() = Some(Arc::downgrade(&child_state));
+                        let outer = Arc::new(completion_state());
+                        outer.complete(outer.id, Ok(Value::Task(child)));
+                        drop(handle_for_state(&inert, &outer));
+                        assert!(capture_observed.load(Ordering::Acquire));
+                        assert!(outer.result().unwrap().is_none());
+                    } else {
+                        child.release_scope_owner(context);
+                        drop(child);
+                    }
+                    assert_eq!(child_state.status_name(), "timed_out");
+                    assert!(!ran.load(Ordering::Acquire));
+                    assert!(weak_states.iter().all(|state| state.upgrade().is_none()));
+                } else if release_path == 1 {
+                    let _cleanup = CleanupGuard::enter(context);
+                    let observer = owner.clone();
+                    owner.release_scope_owner(context);
+                    assert_eq!(observer.status(), "completed");
+                    assert!(observer.state.result().unwrap().is_none());
+                    drop(observer);
+                    drop(owner);
+                } else {
+                    let _cleanup = CleanupGuard::enter(context);
+                    drop(owner);
+                }
+                assert!(weak_states.iter().all(|state| state.upgrade().is_none()));
+                assert!(leaf.owner_released.load(Ordering::Acquire));
+                assert_eq!(leaf.cancellation(), Some(context));
+                assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+                assert_eq!(inert.snapshot().unwrap().active_tasks, 0);
+            }
+            done_tx.send(current_task_id()).unwrap();
+            Ok(Value::Null)
+        });
+        // No await/help runs on the parent while the deep cleanup executes.
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            job.id()
+        );
+        assert_eq!(job.await_result().unwrap(), Value::Null);
+        runtime.cancel_all_and_wait(Duration::from_secs(1)).unwrap();
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 3);
+        assert_eq!(snapshot.wait_edges, 0);
+        eprintln!("{COMPLETED}");
+    }
+
+    #[test]
+    fn concurrent_scope_and_final_lease_release_detach_completed_result_once() {
+        for _ in 0..32 {
+            let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+            let state = Arc::new(completion_state());
+            let owner = handle_for_state(&runtime, &state);
+            let release_state = Arc::clone(&state);
+            let (payload, payload_state, payload_runtime) = tracked_owned_result();
+            state.complete(state.id, payload);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let release_barrier = Arc::clone(&barrier);
+            let context = CancellationContext::new(TerminationReason::Cancelled);
+            let release = thread::spawn(move || {
+                release_barrier.wait();
+                release_state.release_owner(context);
+            });
+            barrier.wait();
+            drop(owner);
+            release.join().unwrap();
+            assert!(payload_state.upgrade().is_none());
+            assert!(payload_runtime.upgrade().is_none());
+            assert!(state.result().unwrap().is_none());
+            assert!(state.owner_result_release.lock().unwrap().is_none());
+            assert_eq!(state.status_name(), "completed");
+            assert!(!state.request_cancel());
         }
     }
 
