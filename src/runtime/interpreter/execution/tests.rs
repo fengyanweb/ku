@@ -39,6 +39,19 @@ fn assert_drained(metrics: &Metrics, initial_depth: usize) {
         "{metrics:?}"
     );
     assert_eq!(metrics.remaining_finally_frames, 0, "{metrics:?}");
+    assert_eq!(
+        metrics.entered_exit_frames, metrics.retired_exit_frames,
+        "{metrics:?}"
+    );
+    assert_eq!(metrics.remaining_exit_frames, 0, "{metrics:?}");
+    assert_eq!(
+        metrics.entered_scope_exits, metrics.retired_scope_exits,
+        "{metrics:?}"
+    );
+    assert_eq!(
+        metrics.entered_call_exits, metrics.retired_call_exits,
+        "{metrics:?}"
+    );
     assert_eq!(metrics.logical_depth, initial_depth, "{metrics:?}");
     assert!(
         metrics.retained_backing_bytes <= metrics.peak_backing_bytes_upper_bound,
@@ -306,7 +319,11 @@ fn prototype_dispatch_fuel_exhaustion_rolls_back_live_calls() {
         result.unwrap_err().message,
         "internal execution prototype test fuel exhausted"
     );
-    assert_eq!(metrics.dispatches, 32);
+    assert_eq!(metrics.dispatches - metrics.exit_dispatches, 32);
+    assert!(
+        metrics.exit_dispatches > 0,
+        "fuel exhaustion cannot skip mandatory exits"
+    );
     assert!(metrics.entered_calls > 0);
     assert_drained(&metrics, 0);
 }

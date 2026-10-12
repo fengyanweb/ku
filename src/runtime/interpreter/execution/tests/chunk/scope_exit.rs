@@ -366,6 +366,28 @@ impl ExecutionHooks for ScopeHooks {
     ) -> KuResult<Flow> {
         self.trace.finish_call(env, leases, result, span, kind)
     }
+
+    fn finish_call_value(
+        &mut self,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+    ) -> KuResult<Flow> {
+        self.trace.finish_call_value(result, span, kind)
+    }
+
+    fn finish_call_with_feedback(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.trace
+            .finish_call_with_feedback(env, leases, result, span, kind, feedback)
+    }
     fn finish_arguments(
         &mut self,
         env: &mut Env,
@@ -554,8 +576,8 @@ fn pending_scope_keeps_real_env_and_parent_work_but_terminal_is_not_payload_reti
     assert!(!child.capture.ran.load(Ordering::Acquire));
     assert_eq!(
         (
-            machine.metrics.entered_exit_frames,
-            machine.metrics.retired_exit_frames,
+            machine.metrics.entered_scope_exits,
+            machine.metrics.retired_scope_exits,
             machine.metrics.remaining_exit_frames
         ),
         (1, 1, 0)
@@ -720,8 +742,8 @@ fn scope_frame_and_actual_handle_backing_rejection_leave_original_primary_and_en
             .contains("internal execution storage rejected"));
         assert_eq!(
             (
-                machine.metrics.entered_exit_frames,
-                machine.metrics.retired_exit_frames,
+                machine.metrics.entered_scope_exits,
+                machine.metrics.retired_scope_exits,
                 machine.metrics.remaining_exit_frames
             ),
             (0, 0, 0)
@@ -829,8 +851,8 @@ fn scope_continue_budget_fallback_keeps_feedback_after_normal_and_native_cleanup
                 None
             };
             let exit_metrics = (
-                machine.metrics.entered_exit_frames,
-                machine.metrics.retired_exit_frames,
+                machine.metrics.entered_scope_exits,
+                machine.metrics.retired_scope_exits,
                 machine.metrics.remaining_exit_frames,
             );
             let drained = machine.metrics.entered_calls == machine.metrics.retired_calls

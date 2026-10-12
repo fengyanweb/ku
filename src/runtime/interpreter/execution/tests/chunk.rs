@@ -3,6 +3,7 @@ use super::*;
 mod async_local;
 mod await_entry;
 mod await_fuel;
+mod call_exit;
 mod result_entry;
 mod scope_exit;
 
@@ -83,6 +84,39 @@ impl ExecutionHooks for TraceHooks {
         self.events
             .push(Event::Call(span, matches!(kind, CallKind::FunctionValue)));
         ExecutionHooks::finish_call(&mut self.host, env, leases, result, span, kind)
+    }
+
+    fn finish_call_with_feedback(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.events
+            .push(Event::Call(span, matches!(kind, CallKind::FunctionValue)));
+        ExecutionHooks::finish_call_with_feedback(
+            &mut self.host,
+            env,
+            leases,
+            result,
+            span,
+            kind,
+            feedback,
+        )
+    }
+
+    fn finish_call_value(
+        &mut self,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+    ) -> KuResult<Flow> {
+        self.events
+            .push(Event::Call(span, matches!(kind, CallKind::FunctionValue)));
+        ExecutionHooks::finish_call_value(&mut self.host, result, span, kind)
     }
 
     fn finish_arguments(
@@ -367,7 +401,14 @@ fn chunk_lifecycle_rejects_restarts_and_preserves_fuel_through_real_unwind_and_r
         more > 32,
         "fuel failure must still retire actual exit work across chunks"
     );
-    assert_eq!(machine.metrics.dispatches, 32);
+    assert_eq!(
+        machine.metrics.dispatches - machine.metrics.exit_dispatches,
+        32
+    );
+    assert!(
+        machine.metrics.exit_dispatches > 0,
+        "mandatory exits still dispatch after fuel exhaustion"
+    );
     assert_eq!(machine.remaining_dispatches, 0);
     assert_drained(&machine.metrics, 0);
     let before = invocation_snapshot(&machine);

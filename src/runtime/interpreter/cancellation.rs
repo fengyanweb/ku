@@ -397,17 +397,46 @@ impl Interpreter {
 
     pub(super) fn finish_call_scope(
         &mut self,
-        mut env: Env,
+        env: Env,
         leases: Vec<BorrowLease>,
         result: KuResult<Flow>,
         span: Span,
     ) -> KuResult<Flow> {
+        self.finish_call_scope_feedback(env, leases, result, span, None)
+    }
+
+    pub(super) fn finish_call_scope_with_feedback(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.finish_call_scope_feedback(env, leases, result, span, Some(feedback))
+    }
+
+    fn finish_call_scope_feedback(
+        &mut self,
+        mut env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        feedback: Option<&Cell<Option<RuntimeTermination>>>,
+    ) -> KuResult<Flow> {
         self.observe_termination(&result);
         let (handles, collected) = call_owned_tasks(Some(&env), &leases, &[], span);
-        self.finish_owned_resources(&mut env, result, span, handles, collected, |env| {
-            env.clear_call_frame();
-            drop(leases);
-        })
+        self.finish_owned_resources_feedback(
+            &mut env,
+            result,
+            span,
+            (handles, collected),
+            |env| {
+                env.clear_call_frame();
+                drop(leases);
+            },
+            feedback,
+        )
     }
 
     pub(super) fn finish_call_arguments(

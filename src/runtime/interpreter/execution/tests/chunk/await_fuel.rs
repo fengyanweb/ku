@@ -17,6 +17,24 @@ struct FuelHooks {
     observed_call: bool,
 }
 
+impl FuelHooks {
+    fn observe_call(&mut self, result: &KuResult<Flow>) {
+        assert!(self.observed_scope);
+        assert!(matches!(result, Err(error) if error.message == FUEL_ERROR));
+        let snapshot = self
+            .trace
+            .host
+            .task_runtime
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!((snapshot.wait_edges, snapshot.cancelled_tasks), (0, 1));
+        assert_eq!((snapshot.queued_tasks, snapshot.finished_tasks), (1, 0));
+        self.observed_call = true;
+    }
+}
+
 impl ExecutionHooks for FuelHooks {
     fn host(&mut self) -> &mut Interpreter {
         self.trace.host()
@@ -67,20 +85,18 @@ impl ExecutionHooks for FuelHooks {
         span: Span,
         kind: CallKind,
     ) -> KuResult<Flow> {
-        assert!(self.observed_scope);
-        assert!(matches!(&result, Err(error) if error.message == FUEL_ERROR));
-        let snapshot = self
-            .trace
-            .host
-            .task_runtime
-            .as_ref()
-            .unwrap()
-            .snapshot()
-            .unwrap();
-        assert_eq!((snapshot.wait_edges, snapshot.cancelled_tasks), (0, 1));
-        assert_eq!((snapshot.queued_tasks, snapshot.finished_tasks), (1, 0));
-        self.observed_call = true;
+        self.observe_call(&result);
         self.trace.finish_call(env, leases, result, span, kind)
+    }
+
+    fn finish_call_value(
+        &mut self,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+    ) -> KuResult<Flow> {
+        self.observe_call(&result);
+        self.trace.finish_call_value(result, span, kind)
     }
 
     fn finish_arguments(

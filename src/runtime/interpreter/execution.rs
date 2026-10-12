@@ -73,6 +73,7 @@ struct Metrics {
     peak_calls: usize,
     steps: usize,
     dispatches: usize,
+    exit_dispatches: usize,
     remaining_calls: usize,
     remaining_work: usize,
     remaining_values: usize,
@@ -84,6 +85,10 @@ struct Metrics {
     retired_exit_frames: usize,
     peak_exit_frames: usize,
     remaining_exit_frames: usize,
+    entered_scope_exits: usize,
+    retired_scope_exits: usize,
+    entered_call_exits: usize,
+    retired_call_exits: usize,
     logical_depth: usize,
     // Source execution frame Vec backing only: calls/work/finally/values and
     // staged arguments. This is a frame budget, not a complete memory budget;
@@ -98,7 +103,7 @@ struct Metrics {
     code_construction_peak_backing_bytes_upper_bound: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CallKind {
     Named,
     FunctionValue,
@@ -119,6 +124,10 @@ trait ExecutionHooks {
     fn host(&mut self) -> &mut Interpreter;
 
     fn prepare_scope_exit(&mut self, _env: &mut Env, _span: Span) -> KuResult<()> {
+        Ok(())
+    }
+
+    fn prepare_call_exit(&mut self, _env: &mut Env, _span: Span, _kind: CallKind) -> KuResult<()> {
         Ok(())
     }
 
@@ -148,6 +157,25 @@ trait ExecutionHooks {
         span: Span,
         kind: CallKind,
     ) -> KuResult<Flow>;
+    fn finish_call_with_feedback(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+        _feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.finish_call(env, leases, result, span, kind)
+    }
+    fn finish_call_value(
+        &mut self,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+    ) -> KuResult<Flow> {
+        result?.into_call_flow(span, kind.label())
+    }
     fn finish_arguments(
         &mut self,
         env: &mut Env,
@@ -210,6 +238,19 @@ impl ExecutionHooks for Interpreter {
         kind: CallKind,
     ) -> KuResult<Flow> {
         self.finish_call_scope(env, leases, result, span)?
+            .into_call_flow(span, kind.label())
+    }
+
+    fn finish_call_with_feedback(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.finish_call_scope_with_feedback(env, leases, result, span, feedback)?
             .into_call_flow(span, kind.label())
     }
 
@@ -516,6 +557,13 @@ struct PendingScopeExit {
     first_index: Option<usize>,
     handle_capacity: usize,
     span: SpanId,
+    completion: ExitCompletion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExitCompletion {
+    Scope,
+    Call(CallKind),
 }
 
 struct AwaitFrame {
@@ -931,9 +979,11 @@ impl Machine {
     fn scope_handles(
         &mut self,
         span: Span,
+        include_empty: bool,
     ) -> KuResult<Option<Vec<crate::runtime::task::TaskHandle>>> {
         let count = match self.frame().env.current_scope_simple_task_count(span) {
-            Ok(0) | Err(_) => return Ok(None),
+            Ok(0) if !include_empty => return Ok(None),
+            Err(_) => return Ok(None),
             Ok(count) => count,
         };
         self.reserve_exits(1, span)?;
@@ -981,7 +1031,7 @@ impl Machine {
         let source_span = self.code.span(span);
         let admitted = hooks
             .prepare_scope_exit(&mut self.frame().env, source_span)
-            .and_then(|()| self.scope_handles(source_span));
+            .and_then(|()| self.scope_handles(source_span, false));
         // Keep admission before taking the sole primary, and retain the
         // evaluator's original primary-then-temporary-values release order.
         let result = self.pending.take().unwrap_or_else(|| {
@@ -1011,9 +1061,11 @@ impl Machine {
                         first_index: None,
                         handle_capacity: capacity,
                         span,
+                        completion: ExitCompletion::Scope,
                     },
                 );
                 self.metrics.entered_exit_frames += 1;
+                self.metrics.entered_scope_exits += 1;
                 self.metrics.peak_exit_frames = self.metrics.peak_exit_frames.max(self.exits.len());
             }
             Err(mut error) => {
@@ -1104,6 +1156,156 @@ impl Machine {
         )
     }
 
+    fn begin_call_exit(&mut self, hooks: &mut impl ExecutionHooks) {
+        let (span, value_base, kind) = {
+            let frame = self
+                .calls
+                .get(self.calls.len() - 1)
+                .expect("live call exit marker");
+            (frame.epilogue_span, frame.value_base, frame.kind)
+        };
+        let source_span = self.code.span(span);
+        let admitted = hooks
+            .prepare_call_exit(&mut self.frame().env, source_span, kind)
+            .and_then(|()| {
+                // This slice has no lease backing. A retained empty Vec is
+                // still storage, so it also stays with the original adapter.
+                if self.frame().leases.capacity() != 0 {
+                    return Ok(None);
+                }
+                self.scope_handles(source_span, true)
+            });
+        let result = self.pending.take().expect("call body outcome");
+        match admitted {
+            Ok(Some(mut handles)) => {
+                assert!(self.awaiting.is_none() && self.exits.len() == 0);
+                // Call cleanup retains its original ordered, deduplicated
+                // proxy set; removing duplicates does not free Vec capacity.
+                handles.sort_unstable_by_key(crate::runtime::task::TaskHandle::id);
+                handles.dedup_by_key(|handle| handle.id());
+                self.discard_values_after(value_base);
+                let capacity = handles.capacity();
+                let state = cancellation::ExitState::new(
+                    hooks.host(),
+                    result,
+                    source_span,
+                    handles,
+                    Ok(()),
+                );
+                let owner_call = self.calls.len();
+                push(
+                    &mut self.exits,
+                    PendingScopeExit {
+                        owner_call,
+                        state,
+                        first_index: None,
+                        handle_capacity: capacity,
+                        span,
+                        completion: ExitCompletion::Call(kind),
+                    },
+                );
+                self.metrics.entered_exit_frames += 1;
+                self.metrics.entered_call_exits += 1;
+                self.metrics.peak_exit_frames = self.metrics.peak_exit_frames.max(self.exits.len());
+            }
+            Err(mut error) => {
+                let needs_context = !matches!(
+                    self.frame()
+                        .env
+                        .current_scope_simple_task_count(source_span),
+                    Ok(0),
+                ) || !self.frame().leases.is_empty();
+                let host = hooks.host();
+                host.observe_termination(&result);
+                let carried = match &result {
+                    Ok(flow) => cancellation::ScopeExit::cleanup_context(flow),
+                    Err(primary) => primary.scope_cleanup(),
+                };
+                let mut context = host
+                    .scope_cleanup_context(carried)
+                    .or(self.fallback_metadata);
+                if context.is_none() && needs_context {
+                    context = Some(CancellationContext::new(TerminationReason::Cancelled));
+                }
+                self.fallback_metadata = context;
+                self.fallback_release.set(merge_release_context(
+                    merge_release_context(current_cleanup_context(), context),
+                    self.fallback_release.get(),
+                ));
+                let _window = cancellation::PhaseWindow::enter(&self.fallback_release);
+                let frame = self
+                    .resources
+                    .as_mut()
+                    .expect("live prefix")
+                    .calls
+                    .pop()
+                    .expect("real rejected call frame");
+                while self.resources.as_ref().expect("live prefix").values.len() > frame.value_base
+                {
+                    self.resources.as_mut().expect("live prefix").values.pop();
+                }
+                let result = hooks.finish_call_with_feedback(
+                    frame.env,
+                    frame.leases,
+                    result,
+                    source_span,
+                    frame.kind,
+                    &self.fallback_release,
+                );
+                for release in [self.fallback_release.get(), current_cleanup_context()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(context) = &mut context {
+                        context.cleanup_deadline =
+                            context.cleanup_deadline.min(release.cleanup_deadline);
+                    }
+                }
+                let result = if matches!(&result, Err(primary) if primary.runtime_termination().is_some())
+                {
+                    result
+                } else {
+                    if let Some(context) = context {
+                        error.remember_scope_cleanup(context);
+                        hooks.host().discard_flow(result, context, source_span);
+                    } else {
+                        // The admitted outgoing payload is scalar. No Task
+                        // cleanup is needed and no new cancellation D is made.
+                        drop(result);
+                    }
+                    for release in [self.fallback_release.get(), current_cleanup_context()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(context) = &mut context {
+                            context.cleanup_deadline =
+                                context.cleanup_deadline.min(release.cleanup_deadline);
+                        }
+                    }
+                    if let Some(context) = context {
+                        error.remember_scope_cleanup(context);
+                    }
+                    Err(error)
+                };
+                self.fallback_metadata = context;
+                self.call_depth -= 1;
+                self.metrics.retired_calls += 1;
+                self.pending = Some(result);
+            }
+            Ok(None) => {
+                // General collectors and leases keep the whole original call
+                // adapter, including its actual Env and owner drop ordering.
+                let frame = self.calls.pop().expect("real legacy call frame");
+                self.discard_values_after(frame.value_base);
+                let result =
+                    hooks.finish_call(frame.env, frame.leases, result, source_span, frame.kind);
+                self.call_depth -= 1;
+                self.metrics.retired_calls += 1;
+                self.pending = Some(result);
+            }
+        }
+    }
+
     fn drive_scope_exit(&mut self, hooks: &mut impl ExecutionHooks) {
         assert!(self.awaiting.is_none() && self.exits.len() == 1);
         let exit = self.exits.get_mut(0).expect("one active scope exit");
@@ -1141,7 +1343,26 @@ impl Machine {
                 let capacity = std::mem::take(&mut exit.handle_capacity);
                 self.release_exit_handle_capacity(capacity);
             }
-            cancellation::ExitPhase::Teardown => exit.state.teardown(host, env, Env::pop_scope),
+            cancellation::ExitPhase::Teardown => match exit.completion {
+                ExitCompletion::Scope => exit.state.teardown(host, env, Env::pop_scope),
+                ExitCompletion::Call(_) => {
+                    // Env and leases are still the original CallFrame fields.
+                    // Clear the real environment before restoring its leases.
+                    {
+                        let _window = exit.state.phase_window();
+                        env.clear_call_frame();
+                        let frame = self
+                            .resources
+                            .as_mut()
+                            .expect("live prefix")
+                            .calls
+                            .get_mut(exit.owner_call - 1)
+                            .expect("retained call frame");
+                        drop(std::mem::take(&mut frame.leases));
+                    }
+                    exit.state.finish_teardown(host);
+                }
+            },
             cancellation::ExitPhase::DeadlineCheck => exit.state.deadline_check(host),
             cancellation::ExitPhase::Arbitrate => exit.state.arbitrate(host),
             cancellation::ExitPhase::Discard => exit.state.discard(host),
@@ -1154,35 +1375,62 @@ impl Machine {
                     .expect("live prefix")
                     .code
                     .span(exit.span);
+                let completion = exit.completion;
                 let result = exit.state.into_result();
-                self.metrics.retired_exit_frames += 1;
                 // Test-fuel failure can occur while the original primary is
                 // retained by this exit. Finish actual arbitration first,
                 // then retire that outgoing owner under the same context.
-                if self.pending.is_some() {
+                let result = if let Some(mut forced) = self.pending.take() {
                     let carried = match &result {
                         Ok(flow) => cancellation::ScopeExit::cleanup_context(flow),
                         Err(error) => error.scope_cleanup(),
                     };
-                    let mut context = host
-                        .scope_cleanup_context(carried)
-                        .unwrap_or_else(|| CancellationContext::new(TerminationReason::Cancelled));
-                    if let Some(Err(error)) = &mut self.pending {
+                    let mut context = host.scope_cleanup_context(carried);
+                    if let (Some(context), Err(error)) = (context, &mut forced) {
                         error.remember_scope_cleanup(context);
                     }
-                    host.discard_flow(result, context, source_span);
+                    if let Some(context) = context {
+                        host.discard_flow(result, context, source_span);
+                    } else {
+                        drop(result);
+                    }
                     if let Some(release) = current_cleanup_context() {
-                        context.cleanup_deadline =
-                            context.cleanup_deadline.min(release.cleanup_deadline);
+                        if let Some(context) = &mut context {
+                            context.cleanup_deadline =
+                                context.cleanup_deadline.min(release.cleanup_deadline);
+                        }
                     }
-                    if let Some(Err(error)) = &mut self.pending {
+                    if let (Some(context), Err(error)) = (context, &mut forced) {
                         error.remember_scope_cleanup(context);
                     }
-                    return;
+                    forced
+                } else {
+                    result
+                };
+                match completion {
+                    ExitCompletion::Scope => {
+                        self.metrics.retired_scope_exits += 1;
+                        if !matches!(&result, Ok(Flow::Continue)) {
+                            self.pending = Some(result);
+                        }
+                    }
+                    ExitCompletion::Call(kind) => {
+                        // Normalize once after the physical Env/leases exit,
+                        // before an enclosing loop or argument marker resumes.
+                        // Keep the completed callee as a real stack owner so a
+                        // native normalization panic releases it before the
+                        // parent's prefix, even though the header is settled.
+                        let frame = self.calls.pop().expect("completed real call frame");
+                        assert!(frame.leases.is_empty());
+                        let result = hooks.finish_call_value(result, source_span, kind);
+                        drop(frame);
+                        self.call_depth -= 1;
+                        self.metrics.retired_calls += 1;
+                        self.metrics.retired_call_exits += 1;
+                        self.pending = Some(result);
+                    }
                 }
-                if !matches!(&result, Ok(Flow::Continue)) {
-                    self.pending = Some(result);
-                }
+                self.metrics.retired_exit_frames += 1;
             }
         }
     }
@@ -2086,20 +2334,7 @@ impl Machine {
                 self.begin_scope_exit(span, value_base, fallthrough, hooks);
             }
             Work::CallExit => {
-                let result = self.pending.take().expect("call body outcome");
-                let frame = self.calls.pop().expect("live call exit marker");
-                self.discard_values_after(frame.value_base);
-                let result = hooks.finish_call(
-                    frame.env,
-                    frame.leases,
-                    result,
-                    self.code.span(frame.epilogue_span),
-                    frame.kind,
-                );
-                // Retire only after the real parameter Env/leases arbitration.
-                self.call_depth -= 1;
-                self.metrics.retired_calls += 1;
-                self.pending = Some(result);
+                self.begin_call_exit(hooks);
             }
             Work::ArgumentsExit(arguments) => {
                 let result = self.pending.take().expect("argument or callee outcome");
@@ -2386,6 +2621,7 @@ impl Machine {
                     }
                 }
                 self.metrics.dispatches += 1;
+                self.metrics.exit_dispatches += 1;
                 self.drive_scope_exit(hooks);
                 self.finally.tighten(self.scope_release_context());
                 window.finish(&mut self.finally);
@@ -3188,6 +3424,32 @@ impl Drop for Machine {
                 retain_first_panic(&mut first, panic);
             }
             release = merge_release_context(release, exit.state.release_context());
+            if matches!(exit.completion, ExitCompletion::Call(_)) {
+                // The old synchronous call adapter owned this callee Env on
+                // its Rust stack, so unwind released it before parent frames.
+                // Preserve that order despite retaining it in calls while the
+                // persistent exit was waiting. Do not retry a panicked phase.
+                let callee_guard = release.map(CleanupGuard::enter);
+                assert_eq!(
+                    self.resources.as_ref().expect("live prefix").calls.len(),
+                    exit.owner_call,
+                );
+                let frame = self
+                    .resources
+                    .as_mut()
+                    .expect("live prefix")
+                    .calls
+                    .pop()
+                    .expect("abandoned real callee frame");
+                let dropped =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(frame)));
+                release = merge_release_context(release, current_cleanup_context());
+                self.finally.tighten(current_cleanup_context());
+                drop(callee_guard);
+                if let Err(panic) = dropped {
+                    retain_first_panic(&mut first, panic);
+                }
+            }
             let capacity = exit.handle_capacity;
             let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(exit)));
             self.release_exit_handle_capacity(capacity);
