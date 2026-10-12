@@ -32,6 +32,8 @@ mod cleanup_panic_tests;
 #[cfg(test)]
 mod help_panic_tests;
 mod local_driver;
+#[cfg(test)]
+mod queue_retirement_tests;
 mod runner;
 pub(crate) use runner::{LocalTaskRunner, OnceTaskRunner};
 #[cfg(test)]
@@ -131,6 +133,31 @@ struct TaskJob {
     state: Arc<TaskState>,
 }
 
+// Inspecting a cancellation prefix can encounter an unrelated live job. Keep
+// that one node in place, ahead of the channel, rather than executing or
+// re-enqueuing it. Its original queue credit remains reserved while cached.
+struct TaskQueueReceiver {
+    // Keep the retained first node ahead of channel nodes on final Drop too.
+    head: Option<TaskJob>,
+    receiver: Receiver<TaskJob>,
+}
+
+impl TaskQueueReceiver {
+    fn recv(&mut self) -> Result<TaskJob, mpsc::RecvError> {
+        match self.head.take() {
+            Some(job) => Ok(job),
+            None => self.receiver.recv(),
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<TaskJob, TryRecvError> {
+        match self.head.take() {
+            Some(job) => Ok(job),
+            None => self.receiver.try_recv(),
+        }
+    }
+}
+
 struct BlockingJob {
     run: BlockingFn,
     response: SyncSender<KuResult<Value>>,
@@ -165,7 +192,7 @@ pub struct TaskRuntime {
 
 struct TaskRuntimeInner {
     task_tx: SyncSender<TaskJob>,
-    task_rx: Arc<Mutex<Receiver<TaskJob>>>,
+    task_rx: Arc<Mutex<TaskQueueReceiver>>,
     blocking_tx: SyncSender<BlockingJob>,
     states: Mutex<HashMap<i64, Weak<TaskState>>>,
     wait_edges: Mutex<HashMap<i64, i64>>,
@@ -217,12 +244,32 @@ impl<'a> TaskSubmissionReservation<'a> {
         }
     }
 
-    fn reserve_queue(&mut self) {
+    fn reserve_queue(&mut self) -> bool {
+        // A cached live head has vacated a physical channel slot without
+        // relinquishing its logical capacity. Count reservations and that
+        // retained head together so inspection cannot grow the bounded queue.
+        if self.runtime.inner.task_queue_limit != 0
+            && self
+                .runtime
+                .inner
+                .queued_tasks
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current < self.runtime.inner.task_queue_limit).then_some(current + 1)
+                })
+                .is_err()
+        {
+            return false;
+        }
         self.queued_reserved = true;
-        self.runtime
-            .inner
-            .queued_tasks
-            .fetch_add(1, Ordering::AcqRel);
+        if self.runtime.inner.task_queue_limit == 0 {
+            // Keep sync_channel(0)'s original rendezvous admission. A zero
+            // credit limit would reject even a waiting receiver's handoff.
+            self.runtime
+                .inner
+                .queued_tasks
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        true
     }
 
     fn commit_to_worker(&mut self) {
@@ -549,7 +596,10 @@ impl TaskRuntime {
         let (blocking_tx, blocking_rx) = mpsc::sync_channel(blocking_queue_limit);
         let inner = Arc::new(TaskRuntimeInner {
             task_tx,
-            task_rx: Arc::new(Mutex::new(task_rx)),
+            task_rx: Arc::new(Mutex::new(TaskQueueReceiver {
+                receiver: task_rx,
+                head: None,
+            })),
             blocking_tx,
             states: Mutex::new(HashMap::new()),
             wait_edges: Mutex::new(HashMap::new()),
@@ -739,7 +789,23 @@ impl TaskRuntime {
                 state.reject_queued(id, Err(local_driver::storage_error()));
                 return;
             }
-            reservation.reserve_queue();
+            if !reservation.reserve_queue() {
+                self.inner
+                    .rejected_task_queue
+                    .fetch_add(1, Ordering::Relaxed);
+                reservation.rollback();
+                state.reject_queued(
+                    id,
+                    Ok(task_error(
+                        "queue_full",
+                        format!(
+                            "async task queue limit {} reached",
+                            self.inner.task_queue_limit
+                        ),
+                    )),
+                );
+                return;
+            }
             match self.inner.task_tx.try_send(TaskJob {
                 id,
                 state: Arc::clone(&state),
@@ -1118,9 +1184,12 @@ impl TaskRuntime {
                     Span::default(),
                 ));
             }
+            if self.retire_cancelled_queue_prefix(context) {
+                continue;
+            }
             // Cleanup must not execute an unrelated queued user continuation.
-            // Existing worker threads drain cancellation; stackless scheduling
-            // and a non-polling shutdown notifier are a later checkpoint.
+            // A live head or busy receiver remains the existing workers'
+            // responsibility; cancellation does not invoke scheduler help.
             thread::sleep(
                 Duration::from_millis(2).min(
                     context
@@ -1130,6 +1199,56 @@ impl TaskRuntime {
             );
         }
         Ok(cancelled)
+    }
+
+    /// Retire at most one already-cleaned cancellation node without entering a
+    /// user body. A live head remains ahead of every later channel node, with
+    /// its original logical queue credit. This is progress, not a full owner
+    /// or runtime cleanup acknowledgement.
+    pub(crate) fn retire_cancelled_queue_prefix(&self, context: CancellationContext) -> bool {
+        let _cleanup = CleanupGuard::enter(context);
+        let context = current_cleanup_context().expect("cleanup guard installs its context");
+        if Instant::now() >= context.cleanup_deadline {
+            return false;
+        }
+        let job = {
+            let mut receiver = match self.inner.task_rx.try_lock() {
+                Ok(receiver) => receiver,
+                // A waiting worker already owns recv. Poison is still reported
+                // by ordinary consumers; cleanup must not claim retirement
+                // from a receiver it cannot safely inspect this turn.
+                Err(_) => return false,
+            };
+            if Instant::now() >= context.cleanup_deadline {
+                return false;
+            }
+            let job = match receiver.try_recv() {
+                Ok(job) => job,
+                Err(_) => return false,
+            };
+            if !job.state.is_terminal()
+                || !job.state.is_cancelled()
+                || !job.state.completion_cleanup_done.load(Ordering::SeqCst)
+            {
+                // try_recv took the only cached head, if present. Installing
+                // this same node neither drops it nor adds another queue slot.
+                receiver.head = Some(job);
+                return false;
+            }
+            self.inner.queued_tasks.fetch_sub(1, Ordering::AcqRel);
+            job
+        };
+        // Keep the internal state alive until the actual queue node is gone.
+        // The guard follows real Drop on normal return and native unwind; no
+        // payload destructor or registry update runs under the receiver lock.
+        let state = Arc::clone(&job.state);
+        let _retirement = QueueRetirement {
+            inner: &self.inner,
+            state: &state,
+        };
+        let job = job;
+        drop(job);
+        true
     }
 
     pub(crate) fn record_cleanup_suppressed(&self) {
@@ -1324,7 +1443,7 @@ impl TaskRuntime {
             // so an awaiting worker must not block behind it. When every worker is
             // busy (notably the one-worker nested-await case), the lock is free and
             // this helper can execute one queued child to avoid starvation.
-            let receiver = match self.inner.task_rx.try_lock() {
+            let mut receiver = match self.inner.task_rx.try_lock() {
                 Ok(receiver) => receiver,
                 Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
                 Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -1884,7 +2003,7 @@ fn spawn_task_workers(inner: &Arc<TaskRuntimeInner>, count: usize) {
     }
 }
 
-fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<TaskJob>>>) {
+fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<TaskQueueReceiver>>) {
     loop {
         let Some(shutdown) = weak
             .upgrade()
@@ -1896,7 +2015,7 @@ fn task_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiver<T
             return;
         }
         let job = {
-            let Ok(receiver) = receiver.lock() else {
+            let Ok(mut receiver) = receiver.lock() else {
                 return;
             };
             receiver.recv()
@@ -3321,9 +3440,9 @@ mod tests {
         assert!(!executed.load(Ordering::Acquire));
         assert!(payload_state.upgrade().is_none());
         assert!(payload_runtime.upgrade().is_none());
-        assert_eq!(snapshot.active_tasks, 2);
-        assert_eq!(snapshot.queued_tasks, 1);
-        assert_eq!(snapshot.finished_tasks, 0);
+        assert_eq!(snapshot.active_tasks, 1);
+        assert_eq!(snapshot.queued_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
         assert_eq!(snapshot.cleanup_timeouts, 0);
         release_tx.send(()).unwrap();
         assert_eq!(parent.await_result().unwrap(), Value::Null);

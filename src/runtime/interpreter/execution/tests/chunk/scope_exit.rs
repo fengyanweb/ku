@@ -899,9 +899,9 @@ fn scope_continue_budget_fallback_keeps_feedback_after_normal_and_native_cleanup
             );
             let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(machine)));
 
-            // The cancelled queue node is still real accounting, rather than
-            // a manufactured cleanup ACK. Release worker gates before checking
-            // outcomes, and await the healthy marker only after real retirement.
+            // Normal cleanup retired the cancelled prefix; native unwind did
+            // not run another poll. Release worker gates in both cases, then
+            // verify actual retirement before the healthy marker.
             blocked.release();
             let retired = until(|| runtime.snapshot().unwrap().finished_tasks == 3);
             let (tx, rx) = mpsc::sync_channel(1);
@@ -959,7 +959,11 @@ fn scope_continue_budget_fallback_keeps_feedback_after_normal_and_native_cleanup
                     before_retirement.queued_tasks,
                     before_retirement.finished_tasks
                 ),
-                (3, 1, 0)
+                if panics { (3, 1, 0) } else { (2, 0, 1) }
+            );
+            assert_eq!(
+                before_retirement.registered_tasks,
+                if panics { 3 } else { 2 }
             );
             assert!(dropped.is_ok());
             assert!(retired && marker_retired);

@@ -853,7 +853,11 @@ fn actual_call_capture_drop_saves_shorter_d_and_native_panic_restores_tls() {
                 before_retirement.queued_tasks,
                 before_retirement.finished_tasks
             ),
-            (2, 1, 0)
+            if panics { (2, 1, 0) } else { (1, 0, 1) }
+        );
+        assert_eq!(
+            before_retirement.registered_tasks,
+            if panics { 2 } else { 1 }
         );
         assert!(dropped.is_ok());
         if panics {

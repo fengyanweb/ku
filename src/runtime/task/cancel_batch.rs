@@ -72,6 +72,15 @@ impl<H: AsRef<[TaskHandle]>> TaskCancelBatch<H> {
     /// Real time is sampled after the terminal scan so a large batch cannot
     /// carry a stale pre-scan clock past the original absolute deadline.
     pub(crate) fn poll(&mut self, runtime: &TaskRuntime, now: Instant) -> CancelBatchPoll {
+        if let Some(completed @ CancelBatchPoll::TimedOut(_)) = self.completed {
+            return completed;
+        }
+        // Give even an already-terminal batch one finite queue-retirement
+        // opportunity. Its success predicate remains terminal observation;
+        // no unrelated body runs and an expired window takes no new node.
+        if now.max(Instant::now()) < self.release_context.cleanup_deadline {
+            runtime.retire_cancelled_queue_prefix(self.release_context);
+        }
         if let Some(completed) = self.completed {
             return completed;
         }

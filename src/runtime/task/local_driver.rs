@@ -343,7 +343,7 @@ impl Drop for Frames<'_> {
 }
 
 fn take_help(runtime: &TaskRuntime) -> KuResult<Option<TaskJob>> {
-    let receiver = match runtime.inner.task_rx.try_lock() {
+    let mut receiver = match runtime.inner.task_rx.try_lock() {
         Ok(receiver) => receiver,
         Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
         Err(std::sync::TryLockError::Poisoned(_)) => {

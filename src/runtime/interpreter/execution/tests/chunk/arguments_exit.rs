@@ -957,8 +957,9 @@ fn arguments_slot_handle_and_staged_budget_failures_cleanup_without_replaying_so
                 before.queued_tasks,
                 before.finished_tasks
             ),
-            (2, 1, 0)
+            (1, 0, 1)
         );
+        assert_eq!(before.registered_tasks, 1);
     }
 }
 
@@ -1404,8 +1405,9 @@ fn arguments_fuel_failure_discards_sole_async_task_under_one_deadline() {
             before_retirement.cancelled_tasks,
             before_retirement.finished_tasks
         ),
-        (2, 1, 1, 0)
+        (1, 0, 0, 1)
     );
+    assert_eq!(before_retirement.registered_tasks, 1);
     assert_eq!(
         (current_cleanup_context(), current_execution_termination()),
         (None, None)
