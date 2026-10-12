@@ -196,6 +196,9 @@ impl<'a> LocalJobFrame<'a> {
             }
             ControlFlow::Continue(()) => {
                 let waiting = runner.waiting().is_some();
+                if !waiting {
+                    runner.cleanup_wait_once();
+                }
                 self.runner = Some(runner);
                 waiting
             }

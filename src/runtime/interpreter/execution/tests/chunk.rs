@@ -4,6 +4,7 @@ mod async_local;
 mod await_entry;
 mod await_fuel;
 mod result_entry;
+mod scope_exit;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Event {

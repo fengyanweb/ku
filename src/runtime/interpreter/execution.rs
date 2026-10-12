@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::ast::{Param, TypeName};
+use std::cell::Cell;
 use std::num::NonZeroUsize;
 use storage::{FrameLimits, FrameStack, ReserveError};
 
@@ -79,6 +80,10 @@ struct Metrics {
     retired_finally_frames: usize,
     peak_finally_frames: usize,
     remaining_finally_frames: usize,
+    entered_exit_frames: usize,
+    retired_exit_frames: usize,
+    peak_exit_frames: usize,
+    remaining_exit_frames: usize,
     logical_depth: usize,
     // Source execution frame Vec backing only: calls/work/finally/values and
     // staged arguments. This is a frame budget, not a complete memory budget;
@@ -113,6 +118,10 @@ impl CallKind {
 trait ExecutionHooks {
     fn host(&mut self) -> &mut Interpreter;
 
+    fn prepare_scope_exit(&mut self, _env: &mut Env, _span: Span) -> KuResult<()> {
+        Ok(())
+    }
+
     fn tick(&mut self, span: Span) -> KuResult<()>;
     fn finish_scope(
         &mut self,
@@ -121,6 +130,16 @@ trait ExecutionHooks {
         span: Span,
         pop: bool,
     ) -> KuResult<Flow>;
+    fn finish_scope_with_feedback(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<Flow>,
+        span: Span,
+        pop: bool,
+        _feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.finish_scope(env, result, span, pop)
+    }
     fn finish_call(
         &mut self,
         env: Env,
@@ -169,6 +188,17 @@ impl ExecutionHooks for Interpreter {
         pop: bool,
     ) -> KuResult<Flow> {
         self.finish_owned_scope(env, result, span, pop)
+    }
+
+    fn finish_scope_with_feedback(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<Flow>,
+        span: Span,
+        pop: bool,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.finish_owned_scope_with_feedback(env, result, span, pop, feedback)
     }
 
     fn finish_call(
@@ -447,11 +477,16 @@ struct Machine {
     // The suspended expression owns its sole target before outer call/argument
     // resources. No synchronous TLS guard lives in this checkpoint.
     awaiting: Option<AwaitFrame>,
+    exits: FrameStack<PendingScopeExit>,
     resources: Option<MachineResources>,
     finally: FinallyFrames,
     // A popped protected frame can panic in its real arbitration callback.
     // Only an aborted machine needs this release context for its live prefix.
     aborted_release: Option<RuntimeTermination>,
+    // Budget rollback stays synchronous, but its actual release feedback
+    // must survive restoring its short TLS window on return or native panic.
+    fallback_release: Cell<Option<RuntimeTermination>>,
+    fallback_metadata: Option<RuntimeTermination>,
     _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
     initial_depth: usize,
     call_depth: usize,
@@ -468,11 +503,37 @@ struct Machine {
     argument_capacity: usize,
     argument_bytes: usize,
     peak_argument_bytes: usize,
+    exit_handle_capacity: usize,
+    exit_handle_bytes: usize,
+    peak_exit_handle_bytes: usize,
+}
+
+struct PendingScopeExit {
+    // The real Env stays in its original CallFrame. No borrowed Env or TLS
+    // guard crosses dispatch boundaries, and its owner cannot retire early.
+    owner_call: usize,
+    state: cancellation::ExitState<Flow>,
+    first_index: Option<usize>,
+    handle_capacity: usize,
+    span: SpanId,
 }
 
 struct AwaitFrame {
     ticket: crate::runtime::task::AwaitTicket,
     span: SpanId,
+}
+
+fn merge_release_context(
+    first: Option<RuntimeTermination>,
+    other: Option<RuntimeTermination>,
+) -> Option<RuntimeTermination> {
+    match (first, other) {
+        (Some(mut first), Some(other)) => {
+            first.cleanup_deadline = first.cleanup_deadline.min(other.cleanup_deadline);
+            Some(first)
+        }
+        (first, other) => first.or(other),
+    }
 }
 
 fn storage_error(error: ReserveError, span: Span) -> KuError {
@@ -563,6 +624,7 @@ impl Machine {
         };
         Self {
             awaiting: None,
+            exits: FrameStack::new(limits.work),
             resources: Some(MachineResources {
                 code,
                 captures: None,
@@ -575,6 +637,8 @@ impl Machine {
                 active_protected: None,
             },
             aborted_release: None,
+            fallback_release: Cell::new(None),
+            fallback_metadata: None,
             _same_thread: std::marker::PhantomData,
             initial_depth,
             call_depth: initial_depth,
@@ -591,6 +655,9 @@ impl Machine {
             argument_capacity: 0,
             argument_bytes: 0,
             peak_argument_bytes: 0,
+            exit_handle_capacity: 0,
+            exit_handle_bytes: 0,
+            peak_exit_handle_bytes: 0,
         }
     }
 
@@ -713,11 +780,13 @@ impl Machine {
             .work_limits
             .max_frames
             .checked_sub(self.finally.frames.len())
+            .and_then(|frames| frames.checked_sub(self.exits.len()))
             .ok_or_else(|| storage_error(ReserveError::FrameLimit, span))?;
         let bytes = self
             .work_limits
             .max_storage_bytes
             .checked_sub(self.finally.frames.charged_storage_bytes())
+            .and_then(|bytes| bytes.checked_sub(self.exits.charged_storage_bytes()))
             .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
         self.work
             .reserve_with_budget(additional, frames, bytes)
@@ -729,14 +798,34 @@ impl Machine {
             .work_limits
             .max_frames
             .checked_sub(self.work.len())
+            .and_then(|frames| frames.checked_sub(self.exits.len()))
             .ok_or_else(|| storage_error(ReserveError::FrameLimit, span))?;
         let bytes = self
             .work_limits
             .max_storage_bytes
             .checked_sub(self.work.charged_storage_bytes())
+            .and_then(|bytes| bytes.checked_sub(self.exits.charged_storage_bytes()))
             .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
         self.finally
             .frames
+            .reserve_with_budget(additional, frames, bytes)
+            .map_err(|error| storage_error(error, span))
+    }
+
+    fn reserve_exits(&mut self, additional: usize, span: Span) -> KuResult<()> {
+        let frames = self
+            .work_limits
+            .max_frames
+            .checked_sub(self.work.len())
+            .and_then(|frames| frames.checked_sub(self.finally.frames.len()))
+            .ok_or_else(|| storage_error(ReserveError::FrameLimit, span))?;
+        let bytes = self
+            .work_limits
+            .max_storage_bytes
+            .checked_sub(self.work.charged_storage_bytes())
+            .and_then(|bytes| bytes.checked_sub(self.finally.frames.charged_storage_bytes()))
+            .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
+        self.exits
             .reserve_with_budget(additional, frames, bytes)
             .map_err(|error| storage_error(error, span))
     }
@@ -746,11 +835,13 @@ impl Machine {
             .value_limits
             .max_frames
             .checked_sub(self.argument_capacity)
+            .and_then(|frames| frames.checked_sub(self.exit_handle_capacity))
             .ok_or_else(|| storage_error(ReserveError::FrameLimit, span))?;
         let bytes = self
             .value_limits
             .max_storage_bytes
             .checked_sub(self.argument_bytes)
+            .and_then(|bytes| bytes.checked_sub(self.exit_handle_bytes))
             .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
         self.values
             .reserve_with_budget(additional, frames, bytes)
@@ -786,6 +877,7 @@ impl Machine {
             .argument_capacity
             .checked_add(additional)
             .and_then(|total| total.checked_add(self.values.capacity()))
+            .and_then(|total| total.checked_add(self.exit_handle_capacity))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if capacity > self.value_limits.max_frames {
             return Err(storage_error(ReserveError::FrameLimit, span));
@@ -793,6 +885,7 @@ impl Machine {
         let bytes = additional
             .checked_mul(std::mem::size_of::<Value>())
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
+            .and_then(|bytes| bytes.checked_add(self.exit_handle_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if bytes > self.value_limits.max_storage_bytes {
@@ -805,6 +898,293 @@ impl Machine {
         // The corresponding buffer was consumed by a hook or already dropped.
         self.argument_capacity -= capacity;
         self.argument_bytes -= capacity * std::mem::size_of::<Value>();
+    }
+
+    fn check_exit_handle_capacity(&self, additional: usize, span: Span) -> KuResult<()> {
+        let count = self
+            .exit_handle_capacity
+            .checked_add(additional)
+            .and_then(|count| count.checked_add(self.argument_capacity))
+            .and_then(|count| count.checked_add(self.values.capacity()))
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        if count > self.value_limits.max_frames {
+            return Err(storage_error(ReserveError::FrameLimit, span));
+        }
+        let bytes = additional
+            .checked_mul(std::mem::size_of::<crate::runtime::task::TaskHandle>())
+            .and_then(|bytes| bytes.checked_add(self.exit_handle_bytes))
+            .and_then(|bytes| bytes.checked_add(self.argument_bytes))
+            .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        if bytes > self.value_limits.max_storage_bytes {
+            return Err(storage_error(ReserveError::StorageLimit, span));
+        }
+        Ok(())
+    }
+
+    fn release_exit_handle_capacity(&mut self, capacity: usize) {
+        self.exit_handle_capacity -= capacity;
+        self.exit_handle_bytes -=
+            capacity * std::mem::size_of::<crate::runtime::task::TaskHandle>();
+    }
+
+    fn scope_handles(
+        &mut self,
+        span: Span,
+    ) -> KuResult<Option<Vec<crate::runtime::task::TaskHandle>>> {
+        let count = match self.frame().env.current_scope_simple_task_count(span) {
+            Ok(0) | Err(_) => return Ok(None),
+            Ok(count) => count,
+        };
+        self.reserve_exits(1, span)?;
+        self.check_exit_handle_capacity(count, span)?;
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(count)
+            .map_err(|_| storage_error(ReserveError::AllocationFailed, span))?;
+        let capacity = handles.capacity();
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<crate::runtime::task::TaskHandle>())
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let peak = self
+            .exit_handle_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        self.peak_exit_handle_bytes = self.peak_exit_handle_bytes.max(peak);
+        // Empty candidates and allocator overcapacity are checked before any
+        // proxy or sole primary is published into a persistent exit header.
+        self.check_exit_handle_capacity(capacity, span)?;
+        self.exit_handle_capacity += capacity;
+        self.exit_handle_bytes += bytes;
+        if self
+            .frame()
+            .env
+            .collect_current_scope_simple_tasks_reserved(&mut handles, span)
+            .is_err()
+        {
+            drop(handles);
+            self.release_exit_handle_capacity(capacity);
+            // A general or changed scope retains the original collector and
+            // its original diagnostic/cleanup priority; it is not skipped.
+            return Ok(None);
+        }
+        Ok(Some(handles))
+    }
+
+    fn begin_scope_exit(
+        &mut self,
+        span: SpanId,
+        value_base: usize,
+        fallthrough: ScopeFallthrough,
+        hooks: &mut impl ExecutionHooks,
+    ) {
+        let source_span = self.code.span(span);
+        let admitted = hooks
+            .prepare_scope_exit(&mut self.frame().env, source_span)
+            .and_then(|()| self.scope_handles(source_span));
+        // Keep admission before taking the sole primary, and retain the
+        // evaluator's original primary-then-temporary-values release order.
+        let result = self.pending.take().unwrap_or_else(|| {
+            Ok(match fallthrough {
+                ScopeFallthrough::Continue => Flow::Continue,
+                ScopeFallthrough::ReturnNull => Flow::returned(Value::Null),
+            })
+        });
+        self.discard_values_after(value_base);
+        match admitted {
+            Ok(Some(handles)) => {
+                assert!(self.awaiting.is_none() && self.exits.len() == 0);
+                let capacity = handles.capacity();
+                let state = cancellation::ExitState::new(
+                    hooks.host(),
+                    result,
+                    source_span,
+                    handles,
+                    Ok(()),
+                );
+                let owner_call = self.calls.len();
+                push(
+                    &mut self.exits,
+                    PendingScopeExit {
+                        owner_call,
+                        state,
+                        first_index: None,
+                        handle_capacity: capacity,
+                        span,
+                    },
+                );
+                self.metrics.entered_exit_frames += 1;
+                self.metrics.peak_exit_frames = self.metrics.peak_exit_frames.max(self.exits.len());
+            }
+            Err(mut error) => {
+                // Select a single metadata context before scope cleanup can
+                // consume a Continue outcome's only visible cleanup cause.
+                // Reuse its D for real Env cleanup, outgoing-owner discard
+                // and the storage error; never start a second cleanup budget.
+                let host = hooks.host();
+                host.observe_termination(&result);
+                let carried = match &result {
+                    Ok(flow) => cancellation::ScopeExit::cleanup_context(flow),
+                    Err(primary) => primary.scope_cleanup(),
+                };
+                let mut context = host
+                    .scope_cleanup_context(carried)
+                    .or(self.fallback_metadata)
+                    .unwrap_or_else(|| CancellationContext::new(TerminationReason::Cancelled));
+                self.fallback_metadata = Some(context);
+                let release = merge_release_context(
+                    merge_release_context(current_cleanup_context(), Some(context)),
+                    self.fallback_release.get(),
+                );
+                self.fallback_release.set(release);
+                let _window = cancellation::PhaseWindow::enter(&self.fallback_release);
+                // Borrow disjoint fields: the saved Cell remains alive while
+                // the real scope and its native destructors are processed.
+                let calls = &mut self.resources.as_mut().expect("live prefix").calls;
+                let owner_call = calls.len() - 1;
+                let env = &mut calls.get_mut(owner_call).expect("current scope call").env;
+                let result = hooks.finish_scope_with_feedback(
+                    env,
+                    result,
+                    source_span,
+                    true,
+                    &self.fallback_release,
+                );
+                for release in [self.fallback_release.get(), current_cleanup_context()]
+                    .into_iter()
+                    .flatten()
+                {
+                    context.cleanup_deadline =
+                        context.cleanup_deadline.min(release.cleanup_deadline);
+                }
+                self.fallback_metadata = Some(context);
+                let result = {
+                    if matches!(&result, Err(primary) if primary.runtime_termination().is_some()) {
+                        result
+                    } else {
+                        let host = hooks.host();
+                        error.remember_scope_cleanup(context);
+                        host.discard_flow(result, context, source_span);
+                        // A losing owner's actual Drop can tighten D again.
+                        // Preserve metadata cause while carrying that final
+                        // deadline into the storage error and parent exits.
+                        for release in [self.fallback_release.get(), current_cleanup_context()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            context.cleanup_deadline =
+                                context.cleanup_deadline.min(release.cleanup_deadline);
+                        }
+                        self.fallback_metadata = Some(context);
+                        error.remember_scope_cleanup(context);
+                        Err(error)
+                    }
+                };
+                if !matches!(&result, Ok(Flow::Continue)) {
+                    self.pending = Some(result);
+                }
+            }
+            Ok(None) => {
+                // No Task or a general collector keeps the original adapter
+                // without adding a cancellation context to a successful scope.
+                let result = hooks.finish_scope(&mut self.frame().env, result, source_span, true);
+                if !matches!(&result, Ok(Flow::Continue)) {
+                    self.pending = Some(result);
+                }
+            }
+        }
+    }
+
+    fn scope_release_context(&self) -> Option<RuntimeTermination> {
+        merge_release_context(
+            self.exits
+                .get(0)
+                .and_then(|exit| exit.state.release_context()),
+            self.fallback_release.get(),
+        )
+    }
+
+    fn drive_scope_exit(&mut self, hooks: &mut impl ExecutionHooks) {
+        assert!(self.awaiting.is_none() && self.exits.len() == 1);
+        let exit = self.exits.get_mut(0).expect("one active scope exit");
+        assert_eq!(
+            exit.owner_call,
+            self.resources.as_ref().expect("live prefix").calls.len()
+        );
+        exit.first_index = None;
+        let host = hooks.host();
+        let env = &mut self
+            .resources
+            .as_mut()
+            .expect("live prefix")
+            .calls
+            .get_mut(exit.owner_call - 1)
+            .expect("scope retains its original call")
+            .env;
+        match exit.state.phase() {
+            cancellation::ExitPhase::Prepare => exit.state.begin(),
+            cancellation::ExitPhase::WaitTerminal => {
+                exit.state.prepare_terminal(host, env);
+                if exit.state.phase() == cancellation::ExitPhase::WaitTerminal {
+                    let runtime = host.task_runtime.as_ref().expect("prepared runtime batch");
+                    if let cancellation::TerminalProgress::Pending { first_index, .. } =
+                        exit.state.poll_terminal(runtime, Instant::now())
+                    {
+                        exit.first_index = Some(first_index);
+                        self.state = MachineState::Waiting;
+                    }
+                }
+            }
+            cancellation::ExitPhase::ReleaseOwners => exit.state.release_owners(host),
+            cancellation::ExitPhase::DropHandles => {
+                exit.state.drop_handles(host);
+                let capacity = std::mem::take(&mut exit.handle_capacity);
+                self.release_exit_handle_capacity(capacity);
+            }
+            cancellation::ExitPhase::Teardown => exit.state.teardown(host, env, Env::pop_scope),
+            cancellation::ExitPhase::DeadlineCheck => exit.state.deadline_check(host),
+            cancellation::ExitPhase::Arbitrate => exit.state.arbitrate(host),
+            cancellation::ExitPhase::Discard => exit.state.discard(host),
+            cancellation::ExitPhase::Done => {
+                let exit = self.exits.pop().expect("settled scope exit");
+                assert_eq!(exit.handle_capacity, 0);
+                let source_span = self
+                    .resources
+                    .as_ref()
+                    .expect("live prefix")
+                    .code
+                    .span(exit.span);
+                let result = exit.state.into_result();
+                self.metrics.retired_exit_frames += 1;
+                // Test-fuel failure can occur while the original primary is
+                // retained by this exit. Finish actual arbitration first,
+                // then retire that outgoing owner under the same context.
+                if self.pending.is_some() {
+                    let carried = match &result {
+                        Ok(flow) => cancellation::ScopeExit::cleanup_context(flow),
+                        Err(error) => error.scope_cleanup(),
+                    };
+                    let mut context = host
+                        .scope_cleanup_context(carried)
+                        .unwrap_or_else(|| CancellationContext::new(TerminationReason::Cancelled));
+                    if let Some(Err(error)) = &mut self.pending {
+                        error.remember_scope_cleanup(context);
+                    }
+                    host.discard_flow(result, context, source_span);
+                    if let Some(release) = current_cleanup_context() {
+                        context.cleanup_deadline =
+                            context.cleanup_deadline.min(release.cleanup_deadline);
+                    }
+                    if let Some(Err(error)) = &mut self.pending {
+                        error.remember_scope_cleanup(context);
+                    }
+                    return;
+                }
+                if !matches!(&result, Ok(Flow::Continue)) {
+                    self.pending = Some(result);
+                }
+            }
+        }
     }
 
     fn discard_values_after(&mut self, base: usize) {
@@ -845,6 +1225,10 @@ impl Machine {
             ));
         }
         reserve(&mut self.calls, 1, span)?;
+        // Reserve the persistent scope-exit header before this call creates
+        // its real Env or performs parameter/body effects. One active scope
+        // exit is sufficient because it settles before any parent work pops.
+        self.reserve_exits(1, span)?;
         self.reserve_work(3, span)?;
         self.reserve_values(1, span)?;
         let env = if let Some(captures) = &self.captures {
@@ -1699,20 +2083,7 @@ impl Machine {
                 value_base,
                 fallthrough,
             } => {
-                let result = self.pending.take().unwrap_or_else(|| {
-                    Ok(match fallthrough {
-                        ScopeFallthrough::Continue => Flow::Continue,
-                        ScopeFallthrough::ReturnNull => Flow::returned(Value::Null),
-                    })
-                });
-                self.discard_values_after(value_base);
-                let source_span = self.code.span(span);
-                let result = hooks.finish_scope(&mut self.frame().env, result, source_span, true);
-                // Only a normally completed branch resumes its enclosing block.
-                // Return and error continue through every remaining exit marker.
-                if !matches!(&result, Ok(Flow::Continue)) {
-                    self.pending = Some(result);
-                }
+                self.begin_scope_exit(span, value_base, fallthrough, hooks);
             }
             Work::CallExit => {
                 let result = self.pending.take().expect("call body outcome");
@@ -1814,7 +2185,7 @@ impl Machine {
         loop {
             match self.dispatch_chunk(budget, hooks)? {
                 ChunkProgress::More { popped } => debug_assert_eq!(popped, budget.get()),
-                ChunkProgress::Waiting { .. } => self.wait_synchronously(),
+                ChunkProgress::Waiting { .. } => self.wait_synchronously(hooks.host()),
                 ChunkProgress::Finished { popped, result } => {
                     debug_assert!(popped <= budget.get());
                     return result;
@@ -1823,22 +2194,34 @@ impl Machine {
         }
     }
 
-    fn wait_synchronously(&mut self) {
+    fn wait_synchronously(&mut self, host: &Interpreter) {
         // The legacy synchronous adapter cannot hand its Rust caller a pause.
         // It uses the same ticket, preserving its old bounded helper behavior.
         // Production runner callers instead expose waiting() to LocalJobFrames.
         assert_eq!(self.state, MachineState::Waiting);
         let guard = self.finally.context().map(CleanupGuard::enter);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.awaiting
-                .as_mut()
-                .expect("waiting expression retains its ticket")
-                .ticket
-                .drive_sync();
+            if let Some(awaiting) = &mut self.awaiting {
+                assert_eq!(self.exits.len(), 0);
+                awaiting.ticket.drive_sync();
+            } else {
+                let exit = self
+                    .exits
+                    .get_mut(0)
+                    .expect("waiting scope retains its exit");
+                if let Some(first_index) = exit.first_index {
+                    exit.state.wait_pending_once(
+                        host.task_runtime.as_ref().expect("pending scope runtime"),
+                        first_index,
+                    );
+                }
+            }
         }));
+        let release = self.scope_release_context();
+        self.finally.tighten(release);
         self.finally.tighten(current_cleanup_context());
         if result.is_err() {
-            self.aborted_release = current_cleanup_context();
+            self.aborted_release = merge_release_context(current_cleanup_context(), release);
             self.state = MachineState::Aborted;
         }
         drop(guard);
@@ -1869,13 +2252,18 @@ impl Machine {
             || self.finally.frames.len() != 0
             || self.pending.is_some()
             || self.awaiting.is_some()
+            || self.exits.len() != 0
             || self.argument_capacity != 0
             || self.argument_bytes != 0
+            || self.exit_handle_capacity != 0
+            || self.exit_handle_bytes != 0
             || self.call_depth != self.initial_depth
         {
             return Err(self.lifecycle_error("prepare undrained next run"));
         }
         self.state = MachineState::Ready;
+        self.fallback_release.set(None);
+        self.fallback_metadata = None;
         Ok(())
     }
 
@@ -1957,8 +2345,10 @@ impl Machine {
             // Copy before restoring TLS: FinallyExit may already have popped
             // the frame that owned this shorter effective context. Never keep
             // a synchronous guard across the return to the host.
-            self.aborted_release = current_cleanup_context();
+            self.aborted_release =
+                merge_release_context(current_cleanup_context(), self.scope_release_context());
         }
+        self.finally.tighten(self.scope_release_context());
         window.finish(&mut self.finally);
         match dispatched {
             Ok(result) => result,
@@ -1977,6 +2367,33 @@ impl Machine {
     ) -> KuResult<ChunkProgress> {
         let mut popped = 0;
         while popped < budget.get() {
+            if self.exits.len() != 0 {
+                window.begin(merge_release_context(
+                    self.finally.context(),
+                    self.scope_release_context(),
+                ));
+                popped += 1;
+                #[cfg(test)]
+                if self.test_fuel && self.pending.is_none() {
+                    match self.remaining_dispatches.checked_sub(1) {
+                        Some(remaining) => self.remaining_dispatches = remaining,
+                        None => {
+                            self.pending = Some(Err(KuError::runtime(
+                                "internal execution prototype test fuel exhausted",
+                                self.entry_span,
+                            )))
+                        }
+                    }
+                }
+                self.metrics.dispatches += 1;
+                self.drive_scope_exit(hooks);
+                self.finally.tighten(self.scope_release_context());
+                window.finish(&mut self.finally);
+                if self.state == MachineState::Waiting {
+                    return Ok(ChunkProgress::Waiting { popped });
+                }
+                continue;
+            }
             // Include pop and the skipped Work's actual destructor in the same
             // saved cleanup window as tick, step and exit arbitration.
             window.begin(self.finally.context());
@@ -1991,7 +2408,7 @@ impl Machine {
                 return Ok(ChunkProgress::Waiting { popped });
             }
         }
-        if self.work.len() != 0 {
+        if self.work.len() != 0 || self.exits.len() != 0 {
             return Ok(ChunkProgress::More { popped });
         }
         Ok(ChunkProgress::Finished {
@@ -2071,23 +2488,31 @@ impl Machine {
         assert_eq!(self.values.len(), 0);
         assert_eq!(self.argument_capacity, 0);
         assert_eq!(self.argument_bytes, 0);
+        assert_eq!(self.exits.len(), 0);
+        assert_eq!(self.exit_handle_capacity, 0);
+        assert_eq!(self.exit_handle_bytes, 0);
         assert_eq!(self.finally.frames.len(), 0);
         self.metrics.remaining_calls = self.calls.len();
         self.metrics.remaining_work = self.work.len();
         self.metrics.remaining_values = self.values.len();
         self.metrics.remaining_finally_frames = self.finally.frames.len();
+        self.metrics.remaining_exit_frames = self.exits.len();
         self.metrics.logical_depth = self.call_depth;
         assert_eq!(self.call_depth, self.initial_depth);
         self.metrics.retained_backing_bytes = self.calls.charged_storage_bytes()
             + self.work.charged_storage_bytes()
             + self.values.charged_storage_bytes()
             + self.finally.frames.charged_storage_bytes()
-            + self.argument_bytes;
+            + self.exits.charged_storage_bytes()
+            + self.argument_bytes
+            + self.exit_handle_bytes;
         self.metrics.peak_backing_bytes_upper_bound = self.calls.peak_storage_bytes()
             + self.work.peak_storage_bytes()
             + self.values.peak_storage_bytes()
             + self.finally.frames.peak_storage_bytes()
-            + self.peak_argument_bytes;
+            + self.exits.peak_storage_bytes()
+            + self.peak_argument_bytes
+            + self.peak_exit_handle_bytes;
         // A completed run keeps the same immutable code owner. Code is shared
         // by every call, so its retained backing cannot grow with call depth.
         assert_eq!(
@@ -2426,6 +2851,12 @@ impl crate::runtime::task::LocalTaskRunner for ClaimedFunctionValueTask {
             Self::Legacy { .. } | Self::Rejected { .. } => None,
         }
     }
+
+    fn cleanup_wait_once(&mut self) {
+        if let Self::Flat(runner) = self {
+            crate::runtime::task::LocalTaskRunner::cleanup_wait_once(runner);
+        }
+    }
 }
 
 // Created only by the already-claimed Task's Send factory. The runner and its
@@ -2589,6 +3020,15 @@ impl crate::runtime::task::LocalTaskRunner for ClaimedNamedTask {
             }
         })
     }
+
+    fn cleanup_wait_once(&mut self) {
+        if let Some(machine) = &mut self.machine {
+            if machine.state == MachineState::Waiting && machine.exits.len() != 0 {
+                assert!(machine.awaiting.is_none());
+                machine.wait_synchronously(&self.interpreter);
+            }
+        }
+    }
 }
 
 // Same-thread dispatch windows and the machine's original resource drop prefix.
@@ -2732,22 +3172,39 @@ impl Drop for Machine {
     fn drop(&mut self) {
         // The same original prefix order is preserved by Rust's drop glue:
         // code, captures, calls, work, values. No user payload is cloned.
-        let release = match (self.aborted_release, self.finally.context()) {
-            (Some(mut saved), Some(active)) => {
-                saved.cleanup_deadline = saved.cleanup_deadline.min(active.cleanup_deadline);
-                Some(saved)
-            }
-            (saved, active) => saved.or(active),
-        };
+        let mut release = merge_release_context(
+            merge_release_context(self.aborted_release, self.finally.context()),
+            self.scope_release_context(),
+        );
         let guard = release.map(CleanupGuard::enter);
         let awaiting = self.awaiting.take();
         let await_drop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(awaiting)));
+        let mut first = await_drop.err();
+        // Empty the actual header in place before destroying its saved Cell.
+        // A destructor's tighter D therefore reaches the following real Env
+        // prefix even when the header phase itself panicked or was abandoned.
+        while let Some(mut exit) = self.exits.pop() {
+            if let Some(panic) = exit.state.abort_release() {
+                retain_first_panic(&mut first, panic);
+            }
+            release = merge_release_context(release, exit.state.release_context());
+            let capacity = exit.handle_capacity;
+            let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(exit)));
+            self.release_exit_handle_capacity(capacity);
+            if let Err(panic) = dropped {
+                retain_first_panic(&mut first, panic);
+            }
+        }
+        release = merge_release_context(release, current_cleanup_context());
+        let exits = std::mem::replace(&mut self.exits, FrameStack::new(self.work_limits));
+        drop(exits);
+        let tightened = release.map(CleanupGuard::enter);
         let prefix = self.resources.take();
         let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(prefix)));
         self.finally.tighten(current_cleanup_context());
         // Restore before ordinary outer primary outcomes are retired.
+        drop(tightened);
         drop(guard);
-        let mut first = await_drop.err();
         if let Err(panic) = dropped {
             retain_first_panic(&mut first, panic);
         }

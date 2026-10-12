@@ -66,6 +66,36 @@ fn collect_binding_owned_tasks(
     }
 }
 
+fn simple_scope_task_count(value: &Value, span: Span) -> KuResult<usize> {
+    match value {
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => Ok(0),
+        Value::Task(_) => Ok(1),
+        _ => Err(KuError::runtime(
+            "internal execution simple scope task collection requires a scalar or plain Task",
+            span,
+        )),
+    }
+}
+
+fn simple_scope_task_proxy(
+    value: &Value,
+    available: bool,
+    span: Span,
+) -> KuResult<Option<TaskHandle>> {
+    match value {
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => Ok(None),
+        Value::Task(task) if available => Ok(Some(task.clone())),
+        Value::Task(_) => Err(KuError::runtime(
+            "internal execution storage rejected: reserved scope task capacity exhausted",
+            span,
+        )),
+        _ => Err(KuError::runtime(
+            "internal execution simple scope task collection requires a scalar or plain Task",
+            span,
+        )),
+    }
+}
+
 /// A call-scoped, non-owning view of caller binding cells. Values are inspected
 /// when cancellation is observed, not snapshotted before argument side effects.
 #[derive(Debug)]
@@ -557,6 +587,80 @@ impl Env {
         self.collect_scope_owned_tasks(index..self.scopes.len(), span)
     }
 
+    /// Count only the admitted Machine slice, without traversal scratch or
+    /// handle proxies. General Owned scopes keep their existing collector.
+    pub(crate) fn current_scope_simple_task_count(&self, span: Span) -> KuResult<usize> {
+        let scope = self.scopes.last().expect("environment always has a scope");
+        let mut tasks = 0usize;
+        for name in &scope.owned_bindings {
+            let Some(cell) = scope.bindings.get(name) else {
+                continue;
+            };
+            let binding = cell
+                .lock()
+                .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+            if binding.borrowed_parameter
+                || binding.match_probe
+                || binding.owner_task_id != crate::runtime::task::current_task_id()
+            {
+                continue;
+            }
+            let counted = match &binding.value {
+                Value::Borrowed(view) => view.with_source_read_locked(&binding, span, |root| {
+                    simple_scope_task_count(root, span)
+                }),
+                value => simple_scope_task_count(value, span),
+            };
+            drop(binding);
+            tasks = tasks.checked_add(counted?).ok_or_else(|| {
+                KuError::runtime(
+                    "internal execution storage rejected: scope task count overflow",
+                    span,
+                )
+            })?;
+        }
+        Ok(tasks)
+    }
+
+    /// Append real proxies using only the caller's existing capacity. Cells
+    /// are re-read because a prior count cannot freeze a shared binding.
+    /// Errors preserve the Env and any already-collected proxies for cleanup.
+    pub(crate) fn collect_current_scope_simple_tasks_reserved(
+        &self,
+        handles: &mut Vec<TaskHandle>,
+        span: Span,
+    ) -> KuResult<()> {
+        let scope = self.scopes.last().expect("environment always has a scope");
+        for name in &scope.owned_bindings {
+            let Some(cell) = scope.bindings.get(name) else {
+                continue;
+            };
+            let binding = cell
+                .lock()
+                .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+            if binding.borrowed_parameter
+                || binding.match_probe
+                || binding.owner_task_id != crate::runtime::task::current_task_id()
+            {
+                continue;
+            }
+            let available = handles.len() < handles.capacity();
+            let collected = match &binding.value {
+                Value::Borrowed(view) => view.with_source_read_locked(&binding, span, |root| {
+                    simple_scope_task_proxy(root, available, span)
+                }),
+                value => simple_scope_task_proxy(value, available, span),
+            };
+            drop(binding);
+            if let Some(handle) = collected? {
+                // The exclusive Vec borrow guarantees the capacity checked
+                // before proxy creation still holds; push cannot allocate.
+                handles.push(handle);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn all_owned_tasks(&self, span: Span) -> KuResult<Vec<TaskHandle>> {
         self.collect_scope_owned_tasks(0..self.scopes.len(), span)
     }
@@ -709,6 +813,107 @@ mod task_ownership_tests {
         let mut ids: Vec<_> = tasks.iter().map(TaskHandle::id).collect();
         ids.sort_unstable();
         ids
+    }
+
+    #[test]
+    fn simple_scope_collection_uses_reserved_real_proxies_and_preserves_general_cleanup() {
+        let span = Span::default();
+        let runtime = TaskRuntime::new();
+        let mut env = Env::new();
+        env.define_owned("source".into(), task(&runtime), false, span)
+            .unwrap();
+        env.define_owned("scalar".into(), Value::Int(3), false, span)
+            .unwrap();
+        assert_eq!(env.current_scope_simple_task_count(span).unwrap(), 1);
+        let mut handles = Vec::with_capacity(1);
+        let capacity = handles.capacity();
+        assert_eq!(capacity, 1);
+        env.collect_current_scope_simple_tasks_reserved(&mut handles, span)
+            .unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles.capacity(), capacity);
+        assert_eq!(
+            ids(handles),
+            ids(env.current_scope_owned_tasks(span).unwrap())
+        );
+
+        // A real source loan stays owned by its scope; the parameter receiving
+        // its weak view does not gain cleanup responsibility for that Task.
+        let (view, lease) = env.borrow("source", span).unwrap();
+        let mut parameters = Env::new();
+        parameters
+            .define_parameter("loan".into(), view, false, span)
+            .unwrap();
+        assert_eq!(env.current_scope_simple_task_count(span).unwrap(), 1);
+        assert_eq!(parameters.current_scope_simple_task_count(span).unwrap(), 0);
+        let mut borrowed = Vec::new();
+        parameters
+            .collect_current_scope_simple_tasks_reserved(&mut borrowed, span)
+            .unwrap();
+        assert_eq!((borrowed.len(), borrowed.capacity()), (0, 0));
+        let mut handles = Vec::with_capacity(1);
+        env.collect_current_scope_simple_tasks_reserved(&mut handles, span)
+            .unwrap();
+        assert_eq!(handles.len(), 1);
+        assert!(env.find_cell("source").unwrap().try_lock().is_ok());
+        handles.clear();
+        drop(parameters);
+        drop(lease);
+
+        // The scope changed after the first count. Filling may leave real
+        // proxies already gathered, but must neither expand nor clear the Env.
+        env.define_owned("late".into(), task(&runtime), false, span)
+            .unwrap();
+        let error = env
+            .collect_current_scope_simple_tasks_reserved(&mut handles, span)
+            .unwrap_err();
+        assert!(error
+            .message
+            .contains("reserved scope task capacity exhausted"));
+        assert_eq!((handles.len(), handles.capacity()), (1, 1));
+        assert_eq!(env.current_scope_simple_task_count(span).unwrap(), 2);
+        for name in ["source", "late"] {
+            assert!(env.find_cell(name).unwrap().try_lock().is_ok());
+        }
+        handles.clear();
+        handles.try_reserve_exact(2).unwrap();
+        env.collect_current_scope_simple_tasks_reserved(&mut handles, span)
+            .unwrap();
+        assert_eq!(handles.len(), 2);
+        assert_eq!(
+            ids(handles),
+            ids(env.current_scope_owned_tasks(span).unwrap())
+        );
+
+        let capture = env.capture(&HashSet::from(["source".into()]));
+        assert_eq!(capture.current_scope_simple_task_count(span).unwrap(), 0);
+        env.define_task_match_probe("probe".into(), task(&runtime), span)
+            .unwrap();
+        assert_eq!(env.current_scope_simple_task_count(span).unwrap(), 2);
+        env.define_owned(
+            "container".into(),
+            Value::Array(vec![task(&runtime)]),
+            false,
+            span,
+        )
+        .unwrap();
+        assert!(env.current_scope_simple_task_count(span).is_err());
+        let mut reserved = Vec::with_capacity(3);
+        let capacity = reserved.capacity();
+        assert!(env
+            .collect_current_scope_simple_tasks_reserved(&mut reserved, span)
+            .is_err());
+        assert_eq!(reserved.capacity(), capacity);
+        for name in ["source", "late", "container"] {
+            assert!(env.find_cell(name).unwrap().try_lock().is_ok());
+        }
+        assert_eq!(env.current_scope_owned_tasks(span).unwrap().len(), 3);
+        reserved.clear();
+        drop(capture);
+        drop(env);
+        runtime
+            .cancel_all_and_wait(std::time::Duration::from_secs(2))
+            .unwrap();
     }
 
     #[test]

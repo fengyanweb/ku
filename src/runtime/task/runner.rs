@@ -13,6 +13,10 @@ pub(crate) trait LocalTaskRunner {
     fn waiting(&mut self) -> Option<&mut AwaitTicket> {
         None
     }
+
+    // An admitted scope exit can pause without an await claim or scheduler
+    // help. Its own retained state performs one original bounded wait.
+    fn cleanup_wait_once(&mut self) {}
 }
 
 pub(crate) struct OnceTaskRunner<F> {

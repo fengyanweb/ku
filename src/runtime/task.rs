@@ -1159,16 +1159,26 @@ impl TaskRuntime {
                     return Err(KuError::termination(context, Span::default()));
                 }
                 CancelBatchPoll::Pending { first_index, .. } => {
-                    batch.handles()[first_index].state.wait(
-                        batch
-                            .context()
-                            .cleanup_deadline
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(2)),
-                    )?;
+                    self.wait_prepared_cancel_once(batch, first_index)?;
                 }
             }
         }
+    }
+
+    /// One original bounded Condvar wait. A persistent exit resumes its own
+    /// phase afterward; this never claims await or executes unrelated help.
+    pub(crate) fn wait_prepared_cancel_once<H: AsRef<[TaskHandle]>>(
+        &self,
+        batch: &TaskCancelBatch<H>,
+        first_index: usize,
+    ) -> KuResult<()> {
+        batch.handles()[first_index].state.wait(
+            batch
+                .context()
+                .cleanup_deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(2)),
+        )
     }
 
     pub fn run_blocking<F>(&self, run: F, _span: Span) -> KuResult<Value>

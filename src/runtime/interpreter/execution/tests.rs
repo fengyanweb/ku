@@ -1057,8 +1057,12 @@ fn production_finally_aggregate_budgets_reject_before_body_and_retire_all_state(
     // rejects the entire Try before it publishes either body effect.
     count.work.max_frames = 7;
     let mut bytes = Limits::default();
-    bytes.work.max_storage_bytes =
-        7 * std::mem::size_of::<Work>() + std::mem::size_of::<FinallyFrame>();
+    // Entry now retains one pre-reserved scope-exit header. Keep this test's
+    // failure at Try growth, after the original entry and Try tick, rather
+    // than accidentally rejecting that new header at call admission.
+    bytes.work.max_storage_bytes = 7 * std::mem::size_of::<Work>()
+        + std::mem::size_of::<FinallyFrame>()
+        + std::mem::size_of::<PendingScopeExit>();
     for (limits, old_backing, reason) in
         [(count, false, "FrameLimit"), (bytes, true, "StorageLimit")]
     {
@@ -1073,6 +1077,7 @@ fn production_finally_aggregate_budgets_reject_before_body_and_retire_all_state(
                 machine.work.charged_storage_bytes()
                     + 7 * std::mem::size_of::<Work>()
                     + std::mem::size_of::<FinallyFrame>()
+                    + std::mem::size_of::<PendingScopeExit>()
                     > limits.work.max_storage_bytes
             );
         }
@@ -1091,7 +1096,9 @@ fn production_finally_aggregate_budgets_reject_before_body_and_retire_all_state(
         assert_eq!(machine.metrics.entered_finally_frames, 0);
         assert_drained(&machine.metrics, 0);
         assert!(
-            machine.work.charged_storage_bytes() + machine.finally.frames.charged_storage_bytes()
+            machine.work.charged_storage_bytes()
+                + machine.finally.frames.charged_storage_bytes()
+                + machine.exits.charged_storage_bytes()
                 <= limits.work.max_storage_bytes
         );
     }

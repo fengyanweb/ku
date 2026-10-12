@@ -1,10 +1,12 @@
 use super::*;
+use std::cell::Cell;
 
 mod exit;
 #[cfg(test)]
 mod exit_tests;
 
-use exit::{DiscardState, ExitPhase, ExitState};
+use exit::DiscardState;
+pub(super) use exit::{ExitPhase, ExitState, PhaseWindow, TerminalProgress};
 
 #[derive(Clone, Copy)]
 pub(super) enum FinallyMode {
@@ -64,6 +66,81 @@ impl ScopeExit for Flow {
             value.collect_owned_tasks(tasks, span)?;
         }
         Ok(())
+    }
+}
+
+/// Stack-only feedback around a synchronous exit. The adapter still owns its
+/// physical Env and teardown closure; this owner adds neither a payload clone
+/// nor a persistent guard. Keep its Drop before the outer cleanup guard and
+/// after an uncalled teardown closure's real resource destruction.
+struct FeedbackExitState<'a, T: ScopeExit> {
+    state: Option<ExitState<T>>,
+    feedback: Option<&'a Cell<Option<RuntimeTermination>>>,
+}
+
+impl<T: ScopeExit> FeedbackExitState<'_, T> {
+    fn remember_feedback(&self, observed: Option<RuntimeTermination>) {
+        let (Some(feedback), Some(observed)) = (self.feedback, observed) else {
+            return;
+        };
+        feedback.set(Some(match feedback.get() {
+            Some(mut saved) => {
+                saved.cleanup_deadline = saved.cleanup_deadline.min(observed.cleanup_deadline);
+                saved
+            }
+            None => observed,
+        }));
+    }
+
+    fn into_result(mut self) -> KuResult<T> {
+        let state = self
+            .state
+            .as_ref()
+            .expect("synchronous exit owns its state");
+        self.remember_feedback(state.release_context());
+        self.state
+            .take()
+            .expect("synchronous exit moves its sole state")
+            .into_result()
+    }
+}
+
+impl<T: ScopeExit> std::ops::Deref for FeedbackExitState<'_, T> {
+    type Target = ExitState<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.state.as_ref().expect("live synchronous exit state")
+    }
+}
+
+impl<T: ScopeExit> std::ops::DerefMut for FeedbackExitState<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.state.as_mut().expect("live synchronous exit state")
+    }
+}
+
+impl<T: ScopeExit> Drop for FeedbackExitState<'_, T> {
+    fn drop(&mut self) {
+        let Some(mut state) = self.state.take() else {
+            return;
+        };
+        if self.feedback.is_none() {
+            // The existing adapters retain their original native Drop/panic
+            // boundary. Only the explicit feedback adapter catches cleanup.
+            drop(state);
+            return;
+        }
+        // Destroy real handles and the sole outcome while the state remains
+        // available to report its final D. abort_release preserves their tuple
+        // order and catches the first escaping native cleanup panic; no phase
+        // is retried, and no normal result is manufactured from that panic.
+        let panic = state.abort_release();
+        self.remember_feedback(state.release_context());
+        drop(state);
+        if let Some(panic) = panic {
+            // Native double-panic/drop-glue abort remains the Rust boundary.
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 
@@ -249,7 +326,7 @@ impl Interpreter {
         }
     }
 
-    fn scope_cleanup_context(
+    pub(super) fn scope_cleanup_context(
         &self,
         carried: Option<RuntimeTermination>,
     ) -> Option<RuntimeTermination> {
@@ -277,16 +354,45 @@ impl Interpreter {
         span: Span,
         pop: bool,
     ) -> KuResult<T> {
+        self.finish_owned_scope_feedback(env, result, span, pop, None)
+    }
+
+    pub(super) fn finish_owned_scope_with_feedback<T: ScopeExit>(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<T>,
+        span: Span,
+        pop: bool,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<T> {
+        self.finish_owned_scope_feedback(env, result, span, pop, Some(feedback))
+    }
+
+    fn finish_owned_scope_feedback<T: ScopeExit>(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<T>,
+        span: Span,
+        pop: bool,
+        feedback: Option<&Cell<Option<RuntimeTermination>>>,
+    ) -> KuResult<T> {
         self.observe_termination(&result);
         let (handles, collected) = match env.current_scope_owned_tasks(span) {
             Ok(handles) => (handles, Ok(())),
             Err(error) => (Vec::new(), Err(error)),
         };
-        self.finish_owned_resources(env, result, span, handles, collected, |env| {
-            if pop {
-                env.pop_scope();
-            }
-        })
+        self.finish_owned_resources_feedback(
+            env,
+            result,
+            span,
+            (handles, collected),
+            |env| {
+                if pop {
+                    env.pop_scope();
+                }
+            },
+            feedback,
+        )
     }
 
     pub(super) fn finish_call_scope(
@@ -330,12 +436,40 @@ impl Interpreter {
         collected: KuResult<()>,
         teardown: impl FnOnce(&mut Env),
     ) -> KuResult<T> {
+        self.finish_owned_resources_feedback(
+            env,
+            result,
+            span,
+            (handles, collected),
+            teardown,
+            None,
+        )
+    }
+
+    fn finish_owned_resources_feedback<T: ScopeExit>(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<T>,
+        span: Span,
+        known_tasks: (Vec<crate::runtime::task::TaskHandle>, KuResult<()>),
+        teardown: impl FnOnce(&mut Env),
+        feedback: Option<&Cell<Option<RuntimeTermination>>>,
+    ) -> KuResult<T> {
         // Declare the synchronous guard before the state: reverse local Drop
         // order must destroy the state while this guard still exposes any
         // tighter deadline left by a panicking native destructor. Constructor
         // metadata selection still happens before installing the guard.
         let _cleanup_guard;
-        let mut state = ExitState::new(self, result, span, handles, collected);
+        let mut state = FeedbackExitState {
+            state: Some(ExitState::new(
+                self,
+                result,
+                span,
+                known_tasks.0,
+                known_tasks.1,
+            )),
+            feedback,
+        };
         _cleanup_guard = state.context().map(CleanupGuard::enter);
         // Move the FnOnce parameter before the first phase effect. An uncalled
         // closure's leases/values then also unwind under the synchronous guard;
@@ -349,9 +483,7 @@ impl Interpreter {
                 ExitPhase::ReleaseOwners => state.release_owners(self),
                 ExitPhase::DropHandles => state.drop_handles(self),
                 ExitPhase::Teardown => {
-                    let _phase_guard = state.phase_guard();
-                    teardown.take().expect("exit teardown runs once")(env);
-                    state.finish_teardown(self);
+                    state.teardown(self, env, teardown.take().expect("exit teardown runs once"));
                 }
                 ExitPhase::DeadlineCheck => state.deadline_check(self),
                 ExitPhase::Arbitrate => state.arbitrate(self),
