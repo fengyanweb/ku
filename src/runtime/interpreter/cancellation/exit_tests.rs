@@ -54,7 +54,141 @@ fn wait_for_completed(task: &crate::runtime::task::TaskHandle) {
     }
 }
 
+#[test]
+fn foreign_runtime_same_number_preserves_both_real_cleanup_obligations() {
+    let _execution = ExecutionTerminationGuard::enter();
+    let left = TaskRuntime::with_limits(1, 2, 0, 0, 4);
+    let right = TaskRuntime::with_limits(1, 2, 0, 0, 4);
+    let (mut left_gate, left_wait) = ReleaseGate::pair();
+    let (mut right_gate, right_wait) = ReleaseGate::pair();
+    let (started, ready) = mpsc::sync_channel(2);
+    let (observed, cancellation) = mpsc::sync_channel(2);
+    let left_started = started.clone();
+    let left_observed = observed.clone();
+    let left_task = left
+        .spawn(move || {
+            left_started.send(()).unwrap();
+            left_wait
+                .recv_timeout(TEST_WAIT)
+                .expect("release left real worker");
+            let _ = left_observed.send(current_task_cancellation());
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let right_task = right
+        .spawn(move || {
+            started.send(()).unwrap();
+            right_wait
+                .recv_timeout(TEST_WAIT)
+                .expect("release right real worker");
+            let _ = observed.send(current_task_cancellation());
+            Ok(Value::Null)
+        })
+        .unwrap();
+    ready.recv_timeout(TEST_WAIT).unwrap();
+    ready.recv_timeout(TEST_WAIT).unwrap();
+    assert_eq!(left_task.id(), right_task.id());
+    assert_ne!(
+        left_task.internal_identity_key(),
+        right_task.internal_identity_key()
+    );
+    let span = Span::default();
+    let mut env = Env::new();
+    env.define_owned("left".into(), Value::Task(left_task), false, span)
+        .unwrap();
+    env.define_owned("right".into(), Value::Task(right_task), false, span)
+        .unwrap();
+    let (handles, collected) = call_owned_tasks(Some(&env), &[], &[], span);
+    collected.unwrap();
+    assert_eq!(
+        handles.len(),
+        2,
+        "both actual states survive internal deduplication"
+    );
+    let context = CancellationContext::new(TerminationReason::TimedOut);
+    let mut interpreter = Interpreter::new();
+    interpreter.task_runtime = Some(left.clone());
+    interpreter.cancel_visible_children(&env, context, span);
+    left_gate.release();
+    right_gate.release();
+    assert_eq!(cancellation.recv_timeout(TEST_WAIT).unwrap(), Some(context));
+    assert_eq!(cancellation.recv_timeout(TEST_WAIT).unwrap(), Some(context));
+    for task in &handles {
+        task.release_scope_owner(context);
+    }
+    drop((handles, env));
+    drain(&left, 1);
+    drain(&right, 1);
+    assert_eq!(current_cleanup_context(), None);
+    assert_eq!(crate::runtime::task::current_execution_termination(), None);
+}
+
 type ExitEvent = (&'static str, Option<RuntimeTermination>);
+
+#[test]
+fn actual_retired_child_does_not_make_an_expired_budgeted_exit_successful() {
+    let _execution = ExecutionTerminationGuard::enter();
+    let runtime = TaskRuntime::with_limits(1, 1, 0, 0, 1);
+    let task = runtime.spawn(|| Ok(Value::Null)).unwrap();
+    assert_eq!(task.await_result().unwrap(), Value::Null);
+    let deadline = Instant::now() + TEST_WAIT;
+    while runtime.snapshot().unwrap().finished_tasks != 1 {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    let span = Span::default();
+    let mut env = Env::new();
+    env.push_scope();
+    env.define_owned("child".into(), Value::Task(task), false, span)
+        .unwrap();
+    let handles = env.current_scope_owned_tasks(span).unwrap();
+    let mut witnesses = Vec::with_capacity(handles.len());
+    for handle in &handles {
+        witnesses.push(handle.retirement_witness());
+    }
+    let expired = CancellationContext {
+        reason: TerminationReason::Cancelled,
+        cleanup_deadline: Instant::now() - Duration::from_millis(1),
+    };
+    let mut interpreter = Interpreter::new();
+    interpreter.task_runtime = Some(runtime.clone());
+    let mut flow = Flow::returned(Value::Int(9));
+    flow.remember_cleanup(expired);
+    let mut state = ExitState::new_with_retirement(
+        &mut interpreter,
+        Ok(flow),
+        span,
+        handles,
+        Ok(()),
+        witnesses,
+    );
+    state.begin();
+    state.wait_terminal(&mut interpreter, &env);
+    state.release_owners(&mut interpreter);
+    state.drop_handles(&mut interpreter);
+    state.teardown(&mut interpreter, &mut env, Env::pop_scope);
+    assert!(!env.contains("child"));
+    assert_eq!(state.phase(), ExitPhase::WaitRetirement);
+    assert_eq!(
+        state.poll_retirement(&interpreter, Instant::now()),
+        TerminalProgress::Settled
+    );
+    assert_eq!(state.phase(), ExitPhase::DeadlineCheck);
+    assert_eq!(state.retirement_capacity(), 0);
+    state.deadline_check(&mut interpreter);
+    state.arbitrate(&mut interpreter);
+    assert_eq!(state.phase(), ExitPhase::Discard);
+    state.discard(&mut interpreter);
+    let error = state
+        .into_result()
+        .err()
+        .expect("expired exit must remain a failure");
+    assert_eq!(error.code.as_deref(), Some("shutdown_timeout"));
+    assert_eq!(error.scope_cleanup(), Some(expired));
+    drain(&runtime, 1);
+    assert_eq!(current_cleanup_context(), None);
+    assert_eq!(crate::runtime::task::current_execution_termination(), None);
+}
 
 struct ExitWitness {
     cleanup: RuntimeTermination,

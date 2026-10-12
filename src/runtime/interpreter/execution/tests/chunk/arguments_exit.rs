@@ -1198,6 +1198,13 @@ fn abandoned_arguments_header_releases_staged_before_async_primary_and_parent_pr
         let exit = machine.exits.get(0).unwrap();
         assert!(matches!(&exit.completion, ExitCompletion::Arguments { .. }));
         assert_eq!(exit.state.phase(), cancellation::ExitPhase::Prepare);
+        assert!(exit.retirement_capacity > 0);
+        assert_eq!(exit.retirement_capacity, exit.state.retirement_capacity());
+        assert_eq!(machine.retirement_capacity, exit.retirement_capacity);
+        assert_eq!(
+            machine.retirement_bytes,
+            machine.retirement_capacity * std::mem::size_of::<TaskRetirementWitness>()
+        );
         let metadata = exit.state.context();
         assert_eq!(
             drops.load(Ordering::Acquire),

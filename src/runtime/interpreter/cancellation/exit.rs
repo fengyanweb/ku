@@ -6,7 +6,10 @@
 //! terminal observation does not acknowledge its resource or queue retirement.
 
 use super::*;
-use crate::runtime::task::{CancelBatchPoll, TaskCancelBatch, TaskHandle};
+use crate::runtime::task::{
+    CancelBatchPoll, RetirementBatchPoll, TaskCancelBatch, TaskHandle, TaskRetirementBatch,
+    TaskRetirementWitness,
+};
 use std::cell::Cell;
 
 enum KnownTasks {
@@ -56,6 +59,7 @@ pub(in crate::runtime::interpreter) enum ExitPhase {
     ReleaseOwners,
     DropHandles,
     Teardown,
+    WaitRetirement,
     DeadlineCheck,
     Arbitrate,
     Discard,
@@ -78,6 +82,7 @@ pub(in crate::runtime::interpreter) struct ExitState<T: ScopeExit> {
     phase: ExitPhase,
     outcome: Option<KuResult<T>>,
     tasks: KnownTasks,
+    retirement: Option<TaskRetirementBatch>,
     collected: Option<KuResult<()>>,
     settled: Option<KuResult<()>>,
     cleanup: Option<KuResult<()>>,
@@ -218,6 +223,7 @@ impl<T: ScopeExit> ExitState<T> {
             phase: ExitPhase::Prepare,
             outcome: Some(result),
             tasks: KnownTasks::Collected(handles),
+            retirement: None,
             collected: Some(collected),
             settled: None,
             cleanup: None,
@@ -230,6 +236,33 @@ impl<T: ScopeExit> ExitState<T> {
 
     pub(in crate::runtime::interpreter) fn phase(&self) -> ExitPhase {
         self.phase
+    }
+
+    /// Only budgeted explicit Machine exits reserve these state witnesses.
+    /// Legacy adapters keep their original constructor and wait contract.
+    pub(in crate::runtime::interpreter) fn new_with_retirement(
+        interpreter: &mut Interpreter,
+        result: KuResult<T>,
+        span: Span,
+        handles: Vec<TaskHandle>,
+        collected: KuResult<()>,
+        witnesses: Vec<TaskRetirementWitness>,
+    ) -> Self {
+        let mut state = Self::new(interpreter, result, span, handles, collected);
+        if !witnesses.is_empty() {
+            let context = state
+                .release_context
+                .get()
+                .expect("retirement witnesses belong to a task exit context");
+            state.retirement = Some(TaskRetirementBatch::from_reserved(witnesses, context));
+        }
+        state
+    }
+
+    pub(in crate::runtime::interpreter) fn retirement_capacity(&self) -> usize {
+        self.retirement
+            .as_ref()
+            .map_or(0, TaskRetirementBatch::capacity)
     }
 
     pub(in crate::runtime::interpreter) fn context(&self) -> Option<RuntimeTermination> {
@@ -406,7 +439,101 @@ impl<T: ScopeExit> ExitState<T> {
         assert_eq!(self.phase, ExitPhase::Teardown);
         let _window = PhaseWindow::enter(&self.release_context);
         self.context = interpreter.scope_cleanup_context(self.context);
+        self.phase = if self.retirement.is_some() {
+            ExitPhase::WaitRetirement
+        } else {
+            ExitPhase::DeadlineCheck
+        };
+    }
+
+    fn remember_retirement_context(&mut self, context: RuntimeTermination) {
+        if let Some(mut saved) = self.release_context.get() {
+            saved.cleanup_deadline = saved.cleanup_deadline.min(context.cleanup_deadline);
+            self.release_context.set(Some(saved));
+        }
+        if let Some(saved) = &mut self.context {
+            // Metadata and ambient first causes remain separate. Only D joins.
+            saved.cleanup_deadline = saved.cleanup_deadline.min(context.cleanup_deadline);
+        }
+    }
+
+    fn finish_retirement(&mut self, interpreter: &Interpreter, result: KuResult<()>) {
+        let cleanup = self
+            .cleanup
+            .as_mut()
+            .expect("actual teardown precedes retirement");
+        if cleanup.is_err() && result.is_err() {
+            interpreter.record_suppressed_cleanup();
+        }
+        if cleanup.is_ok() {
+            *cleanup = result;
+        }
         self.phase = ExitPhase::DeadlineCheck;
+        // Releasing the final runtime Arc can destroy its real queue storage.
+        // Keep that actual Drop in the saved window, including native unwind.
+        let _window = PhaseWindow::enter(&self.release_context);
+        drop(self.retirement.take());
+        self.context = interpreter.scope_cleanup_context(self.context);
+    }
+
+    pub(in crate::runtime::interpreter) fn poll_retirement(
+        &mut self,
+        interpreter: &Interpreter,
+        now: Instant,
+    ) -> TerminalProgress {
+        assert_eq!(self.phase, ExitPhase::WaitRetirement);
+        self.context = interpreter.scope_cleanup_context(self.context);
+        if let Some(context) = self.context {
+            self.remember_retirement_context(context);
+        }
+        let progress;
+        let context;
+        {
+            let _window = PhaseWindow::enter(&self.release_context);
+            let retirement = self.retirement.as_mut().expect("budgeted retirement batch");
+            progress = retirement.poll(now);
+            context = retirement.context();
+        }
+        self.remember_retirement_context(context);
+        match progress {
+            RetirementBatchPoll::Pending {
+                first_index,
+                unfinished,
+            } => TerminalProgress::Pending {
+                first_index,
+                unfinished,
+            },
+            RetirementBatchPoll::Retired => {
+                self.finish_retirement(interpreter, Ok(()));
+                TerminalProgress::Settled
+            }
+            RetirementBatchPoll::TimedOut(context) => {
+                self.finish_retirement(interpreter, Err(KuError::termination(context, self.span)));
+                TerminalProgress::Settled
+            }
+        }
+    }
+
+    pub(in crate::runtime::interpreter) fn wait_retirement_once(
+        &mut self,
+        interpreter: &Interpreter,
+        first_index: usize,
+    ) {
+        assert_eq!(self.phase, ExitPhase::WaitRetirement);
+        self.context = interpreter.scope_cleanup_context(self.context);
+        if let Some(context) = self.context {
+            self.remember_retirement_context(context);
+        }
+        let (result, context) = {
+            let _window = PhaseWindow::enter(&self.release_context);
+            let retirement = self.retirement.as_mut().expect("budgeted retirement batch");
+            let result = retirement.wait_once(first_index, self.span);
+            (result, retirement.context())
+        };
+        self.remember_retirement_context(context);
+        if let Err(error) = result {
+            self.finish_retirement(interpreter, Err(error));
+        }
     }
 
     pub(in crate::runtime::interpreter) fn teardown(
@@ -504,6 +631,7 @@ impl<T: ScopeExit> ExitState<T> {
         let resources = (
             std::mem::replace(&mut self.tasks, KnownTasks::Empty),
             self.outcome.take(),
+            self.retirement.take(),
         );
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(resources))).err()
     }
@@ -522,6 +650,7 @@ impl<T: ScopeExit> Drop for ExitState<T> {
         drop((
             std::mem::replace(&mut self.tasks, KnownTasks::Empty),
             self.outcome.take(),
+            self.retirement.take(),
         ));
     }
 }

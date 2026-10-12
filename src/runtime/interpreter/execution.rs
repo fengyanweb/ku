@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::ast::{Param, TypeName};
+use crate::runtime::task::TaskRetirementWitness;
 use std::cell::Cell;
 use std::num::NonZeroUsize;
 use storage::{FrameLimits, FrameStack, ReserveError};
@@ -635,6 +636,9 @@ struct Machine {
     exit_handle_capacity: usize,
     exit_handle_bytes: usize,
     peak_exit_handle_bytes: usize,
+    retirement_capacity: usize,
+    retirement_bytes: usize,
+    peak_retirement_bytes: usize,
     // This slice cannot create a String: every buffer comes from the input,
     // moves between slots and is conservatively charged until final transfer.
     string_payload_bytes: usize,
@@ -654,8 +658,16 @@ struct PendingScopeExit {
     state: cancellation::ExitState<Flow>,
     first_index: Option<usize>,
     handle_capacity: usize,
+    retirement_capacity: usize,
     span: SpanId,
     completion: ExitCompletion,
+}
+
+// Both buffers are admitted before collecting proxies or moving an outcome.
+// Witnesses retain only actual state/runtime Arcs, never a Task owner lease.
+struct AdmittedExitHandles {
+    handles: Vec<crate::runtime::task::TaskHandle>,
+    retirement: Vec<TaskRetirementWitness>,
 }
 
 enum ExitCompletion {
@@ -853,6 +865,9 @@ impl Machine {
             exit_handle_capacity: 0,
             exit_handle_bytes: 0,
             peak_exit_handle_bytes: 0,
+            retirement_capacity: 0,
+            retirement_bytes: 0,
+            peak_retirement_bytes: 0,
             string_payload_bytes: 0,
             peak_string_payload_bytes: 0,
             lease_capacity: 0,
@@ -1039,6 +1054,7 @@ impl Machine {
             .max_frames
             .checked_sub(self.argument_capacity)
             .and_then(|frames| frames.checked_sub(self.exit_handle_capacity))
+            .and_then(|frames| frames.checked_sub(self.retirement_capacity))
             .and_then(|frames| frames.checked_sub(self.lease_capacity))
             .and_then(|frames| {
                 frames.checked_sub(self.lease_root_bytes / std::mem::size_of::<Value>())
@@ -1049,6 +1065,7 @@ impl Machine {
             .max_storage_bytes
             .checked_sub(self.argument_bytes)
             .and_then(|bytes| bytes.checked_sub(self.exit_handle_bytes))
+            .and_then(|bytes| bytes.checked_sub(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_sub(self.string_payload_bytes))
             .and_then(|bytes| bytes.checked_sub(self.lease_bytes))
             .and_then(|bytes| bytes.checked_sub(self.lease_root_bytes))
@@ -1088,6 +1105,7 @@ impl Machine {
             .checked_add(additional)
             .and_then(|total| total.checked_add(self.values.capacity()))
             .and_then(|total| total.checked_add(self.exit_handle_capacity))
+            .and_then(|total| total.checked_add(self.retirement_capacity))
             .and_then(|total| total.checked_add(self.lease_capacity))
             .and_then(|total| {
                 total.checked_add(self.lease_root_bytes / std::mem::size_of::<Value>())
@@ -1100,6 +1118,7 @@ impl Machine {
             .checked_mul(std::mem::size_of::<Value>())
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
             .and_then(|bytes| bytes.checked_add(self.exit_handle_bytes))
+            .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
@@ -1117,10 +1136,17 @@ impl Machine {
         self.argument_bytes -= capacity * std::mem::size_of::<Value>();
     }
 
-    fn check_exit_handle_capacity(&self, additional: usize, span: Span) -> KuResult<()> {
+    fn check_exit_storage_capacity(
+        &self,
+        handles: usize,
+        witnesses: usize,
+        span: Span,
+    ) -> KuResult<()> {
         let count = self
             .exit_handle_capacity
-            .checked_add(additional)
+            .checked_add(handles)
+            .and_then(|count| count.checked_add(self.retirement_capacity))
+            .and_then(|count| count.checked_add(witnesses))
             .and_then(|count| count.checked_add(self.argument_capacity))
             .and_then(|count| count.checked_add(self.values.capacity()))
             .and_then(|count| count.checked_add(self.lease_capacity))
@@ -1131,9 +1157,14 @@ impl Machine {
         if count > self.value_limits.max_frames {
             return Err(storage_error(ReserveError::FrameLimit, span));
         }
-        let bytes = additional
+        let witness_bytes = witnesses
+            .checked_mul(std::mem::size_of::<TaskRetirementWitness>())
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let bytes = handles
             .checked_mul(std::mem::size_of::<crate::runtime::task::TaskHandle>())
+            .and_then(|bytes| bytes.checked_add(witness_bytes))
             .and_then(|bytes| bytes.checked_add(self.exit_handle_bytes))
+            .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
@@ -1144,6 +1175,78 @@ impl Machine {
             return Err(storage_error(ReserveError::StorageLimit, span));
         }
         Ok(())
+    }
+
+    fn exit_storage(&mut self, count: usize, span: Span) -> KuResult<AdmittedExitHandles> {
+        self.reserve_exits(1, span)?;
+        self.check_exit_storage_capacity(count, count, span)?;
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(count)
+            .map_err(|_| storage_error(ReserveError::AllocationFailed, span))?;
+        let handle_bytes = handles
+            .capacity()
+            .checked_mul(std::mem::size_of::<crate::runtime::task::TaskHandle>())
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let handle_peak = self
+            .exit_handle_bytes
+            .checked_add(handle_bytes)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        self.peak_exit_handle_bytes = self.peak_exit_handle_bytes.max(handle_peak);
+        // The first actual candidate can exceed its requested capacity. Check
+        // it together with the still-unallocated witness request before more
+        // storage or any real Task proxy is created.
+        self.check_exit_storage_capacity(handles.capacity(), count, span)?;
+        let mut retirement = Vec::new();
+        retirement
+            .try_reserve_exact(count)
+            .map_err(|_| storage_error(ReserveError::AllocationFailed, span))?;
+        let witness_bytes = retirement
+            .capacity()
+            .checked_mul(std::mem::size_of::<TaskRetirementWitness>())
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let witness_peak = self
+            .retirement_bytes
+            .checked_add(witness_bytes)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        self.peak_retirement_bytes = self.peak_retirement_bytes.max(witness_peak);
+        // Charge both simultaneous actual capacities, including any retained
+        // old exit backing. Allocation metadata and RSS are not claimed here.
+        self.check_exit_storage_capacity(handles.capacity(), retirement.capacity(), span)?;
+        Ok(AdmittedExitHandles {
+            handles,
+            retirement,
+        })
+    }
+
+    fn finish_exit_storage(&mut self, mut storage: AdmittedExitHandles) -> AdmittedExitHandles {
+        storage
+            .handles
+            .sort_unstable_by_key(crate::runtime::task::TaskHandle::internal_identity_key);
+        storage
+            .handles
+            .dedup_by_key(|handle| handle.internal_identity_key());
+        for handle in &storage.handles {
+            assert!(storage.retirement.len() < storage.retirement.capacity());
+            storage.retirement.push(handle.retirement_witness());
+        }
+        if storage.retirement.is_empty() {
+            // A concurrently changed scope can collect no actual Task. Empty
+            // witness backing is physically gone before its zero charge.
+            storage.retirement = Vec::new();
+        }
+        let handles = storage.handles.capacity();
+        let witnesses = storage.retirement.capacity();
+        self.exit_handle_capacity += handles;
+        self.exit_handle_bytes += handles * std::mem::size_of::<crate::runtime::task::TaskHandle>();
+        self.retirement_capacity += witnesses;
+        self.retirement_bytes += witnesses * std::mem::size_of::<TaskRetirementWitness>();
+        storage
+    }
+
+    fn release_retirement_capacity(&mut self, capacity: usize) {
+        self.retirement_capacity -= capacity;
+        self.retirement_bytes -= capacity * std::mem::size_of::<TaskRetirementWitness>();
     }
 
     fn release_exit_handle_capacity(&mut self, capacity: usize) {
@@ -1168,6 +1271,7 @@ impl Machine {
             .and_then(|count| count.checked_add(total_roots / std::mem::size_of::<Value>()))
             .and_then(|count| count.checked_add(self.argument_capacity))
             .and_then(|count| count.checked_add(self.exit_handle_capacity))
+            .and_then(|count| count.checked_add(self.retirement_capacity))
             .and_then(|count| count.checked_add(self.values.capacity()))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if count > self.value_limits.max_frames {
@@ -1179,6 +1283,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(total_roots))
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
             .and_then(|bytes| bytes.checked_add(self.exit_handle_bytes))
+            .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
@@ -1241,52 +1346,32 @@ impl Machine {
         &mut self,
         span: Span,
         include_empty: bool,
-    ) -> KuResult<Option<Vec<crate::runtime::task::TaskHandle>>> {
+    ) -> KuResult<Option<AdmittedExitHandles>> {
         let count = match self.frame().env.current_scope_simple_task_count(span) {
             Ok(0) if !include_empty => return Ok(None),
             Err(_) => return Ok(None),
             Ok(count) => count,
         };
-        self.reserve_exits(1, span)?;
-        self.check_exit_handle_capacity(count, span)?;
-        let mut handles = Vec::new();
-        handles
-            .try_reserve_exact(count)
-            .map_err(|_| storage_error(ReserveError::AllocationFailed, span))?;
-        let capacity = handles.capacity();
-        let bytes = capacity
-            .checked_mul(std::mem::size_of::<crate::runtime::task::TaskHandle>())
-            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
-        let peak = self
-            .exit_handle_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
-        self.peak_exit_handle_bytes = self.peak_exit_handle_bytes.max(peak);
-        // Empty candidates and allocator overcapacity are checked before any
-        // proxy or sole primary is published into a persistent exit header.
-        self.check_exit_handle_capacity(capacity, span)?;
-        self.exit_handle_capacity += capacity;
-        self.exit_handle_bytes += bytes;
+        let mut storage = self.exit_storage(count, span)?;
         if self
             .frame()
             .env
-            .collect_current_scope_simple_tasks_reserved(&mut handles, span)
+            .collect_current_scope_simple_tasks_reserved(&mut storage.handles, span)
             .is_err()
         {
-            drop(handles);
-            self.release_exit_handle_capacity(capacity);
+            drop(storage);
             // A general or changed scope retains the original collector and
             // its original diagnostic/cleanup priority; it is not skipped.
             return Ok(None);
         }
-        Ok(Some(handles))
+        Ok(Some(self.finish_exit_storage(storage)))
     }
 
     fn argument_handles(
         &mut self,
         arguments: &ArgumentFrame,
         span: Span,
-    ) -> KuResult<Option<Vec<crate::runtime::task::TaskHandle>>> {
+    ) -> KuResult<Option<AdmittedExitHandles>> {
         // Only the proven String leaf lease and its already charged backing
         // enter this slice. General roots retain their original adapter.
         if !Self::admitted_string_leases(
@@ -1317,33 +1402,14 @@ impl Machine {
                 _ => return Ok(None),
             }
         }
-        self.reserve_exits(1, span)?;
-        self.check_exit_handle_capacity(count, span)?;
-        let mut handles = Vec::new();
-        handles
-            .try_reserve_exact(count)
-            .map_err(|_| storage_error(ReserveError::AllocationFailed, span))?;
-        let capacity = handles.capacity();
-        let bytes = capacity
-            .checked_mul(std::mem::size_of::<crate::runtime::task::TaskHandle>())
-            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
-        let peak = self
-            .exit_handle_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
-        self.peak_exit_handle_bytes = self.peak_exit_handle_bytes.max(peak);
-        self.check_exit_handle_capacity(capacity, span)?;
-        self.exit_handle_capacity += capacity;
-        self.exit_handle_bytes += bytes;
+        let mut storage = self.exit_storage(count, span)?;
         for value in &arguments.staged {
             if let Value::Task(task) = value {
-                assert!(handles.len() < capacity);
-                handles.push(task.clone());
+                assert!(storage.handles.len() < storage.handles.capacity());
+                storage.handles.push(task.clone());
             }
         }
-        handles.sort_unstable_by_key(crate::runtime::task::TaskHandle::id);
-        handles.dedup_by_key(|handle| handle.id());
-        Ok(Some(handles))
+        Ok(Some(self.finish_exit_storage(storage)))
     }
 
     fn begin_scope_exit(
@@ -1367,15 +1433,20 @@ impl Machine {
         });
         self.discard_values_after(value_base);
         match admitted {
-            Ok(Some(handles)) => {
+            Ok(Some(AdmittedExitHandles {
+                handles,
+                retirement,
+            })) => {
                 assert!(self.awaiting.is_none() && self.exits.len() == 0);
                 let capacity = handles.capacity();
-                let state = cancellation::ExitState::new(
+                let retirement_capacity = retirement.capacity();
+                let state = cancellation::ExitState::new_with_retirement(
                     hooks.host(),
                     result,
                     source_span,
                     handles,
                     Ok(()),
+                    retirement,
                 );
                 let owner_call = self.calls.len();
                 push(
@@ -1385,6 +1456,7 @@ impl Machine {
                         state,
                         first_index: None,
                         handle_capacity: capacity,
+                        retirement_capacity,
                         span,
                         completion: ExitCompletion::Scope,
                     },
@@ -1505,20 +1577,23 @@ impl Machine {
             });
         let result = self.pending.take().expect("call body outcome");
         match admitted {
-            Ok(Some(mut handles)) => {
+            Ok(Some(AdmittedExitHandles {
+                handles,
+                retirement,
+            })) => {
                 assert!(self.awaiting.is_none() && self.exits.len() == 0);
-                // Call cleanup retains its original ordered, deduplicated
-                // proxy set; removing duplicates does not free Vec capacity.
-                handles.sort_unstable_by_key(crate::runtime::task::TaskHandle::id);
-                handles.dedup_by_key(|handle| handle.id());
+                // Admission already retained a sorted actual identity set;
+                // equal public IDs from foreign runtimes remain distinct.
                 self.discard_values_after(value_base);
                 let capacity = handles.capacity();
-                let state = cancellation::ExitState::new(
+                let retirement_capacity = retirement.capacity();
+                let state = cancellation::ExitState::new_with_retirement(
                     hooks.host(),
                     result,
                     source_span,
                     handles,
                     Ok(()),
+                    retirement,
                 );
                 let owner_call = self.calls.len();
                 push(
@@ -1528,6 +1603,7 @@ impl Machine {
                         state,
                         first_index: None,
                         handle_capacity: capacity,
+                        retirement_capacity,
                         span,
                         completion: ExitCompletion::Call(kind),
                     },
@@ -1664,18 +1740,23 @@ impl Machine {
         // outcome. An async Return(Task) is never one of the exit handles.
         let result = self.pending.take().expect("argument or callee outcome");
         match admitted {
-            Ok(Some(handles)) => {
+            Ok(Some(AdmittedExitHandles {
+                handles,
+                retirement,
+            })) => {
                 assert!(self.awaiting.is_none() && self.exits.len() == 0);
                 self.discard_values_after(arguments.value_base);
                 let handle_capacity = handles.capacity();
                 let staged_capacity = arguments.staged.capacity();
                 let span = arguments.span;
-                let state = cancellation::ExitState::new(
+                let retirement_capacity = retirement.capacity();
+                let state = cancellation::ExitState::new_with_retirement(
                     hooks.host(),
                     result,
                     source_span,
                     handles,
                     Ok(()),
+                    retirement,
                 );
                 let owner_call = self.calls.len();
                 push(
@@ -1685,6 +1766,7 @@ impl Machine {
                         state,
                         first_index: None,
                         handle_capacity,
+                        retirement_capacity,
                         span,
                         completion: ExitCompletion::Arguments {
                             frame: arguments,
@@ -1933,12 +2015,28 @@ impl Machine {
                     exit.state.finish_teardown(host);
                 }
             },
+            cancellation::ExitPhase::WaitRetirement => {
+                if let cancellation::TerminalProgress::Pending { first_index, .. } =
+                    exit.state.poll_retirement(host, Instant::now())
+                {
+                    exit.first_index = Some(first_index);
+                    self.state = MachineState::Waiting;
+                } else {
+                    assert_eq!(exit.state.retirement_capacity(), 0);
+                    let capacity = std::mem::take(&mut exit.retirement_capacity);
+                    self.retirement_capacity -= capacity;
+                    self.retirement_bytes -=
+                        capacity * std::mem::size_of::<TaskRetirementWitness>();
+                }
+            }
             cancellation::ExitPhase::DeadlineCheck => exit.state.deadline_check(host),
             cancellation::ExitPhase::Arbitrate => exit.state.arbitrate(host),
             cancellation::ExitPhase::Discard => exit.state.discard(host),
             cancellation::ExitPhase::Done => {
                 let exit = self.exits.pop().expect("settled scope exit");
                 assert_eq!(exit.handle_capacity, 0);
+                assert_eq!(exit.retirement_capacity, 0);
+                assert_eq!(exit.state.retirement_capacity(), 0);
                 let source_span = self
                     .resources
                     .as_ref()
@@ -3224,10 +3322,28 @@ impl Machine {
                     .get_mut(0)
                     .expect("waiting scope retains its exit");
                 if let Some(first_index) = exit.first_index {
-                    exit.state.wait_pending_once(
-                        host.task_runtime.as_ref().expect("pending scope runtime"),
-                        first_index,
-                    );
+                    let retirement_wait =
+                        exit.state.phase() == cancellation::ExitPhase::WaitRetirement;
+                    match exit.state.phase() {
+                        cancellation::ExitPhase::WaitTerminal => exit.state.wait_pending_once(
+                            host.task_runtime.as_ref().expect("pending scope runtime"),
+                            first_index,
+                        ),
+                        cancellation::ExitPhase::WaitRetirement => {
+                            exit.state.wait_retirement_once(host, first_index)
+                        }
+                        _ => unreachable!("waiting exit has one actual pending phase"),
+                    }
+                    if retirement_wait
+                        && exit.state.phase() != cancellation::ExitPhase::WaitRetirement
+                        && exit.retirement_capacity != 0
+                    {
+                        assert_eq!(exit.state.retirement_capacity(), 0);
+                        let capacity = std::mem::take(&mut exit.retirement_capacity);
+                        self.retirement_capacity -= capacity;
+                        self.retirement_bytes -=
+                            capacity * std::mem::size_of::<TaskRetirementWitness>();
+                    }
                 }
             }
         }));
@@ -3271,6 +3387,8 @@ impl Machine {
             || self.argument_bytes != 0
             || self.exit_handle_capacity != 0
             || self.exit_handle_bytes != 0
+            || self.retirement_capacity != 0
+            || self.retirement_bytes != 0
             || self.entry_args.is_some()
             || self.string_payload_bytes != 0
             || self.lease_capacity != 0
@@ -3599,6 +3717,8 @@ impl Machine {
         assert_eq!(self.exits.len(), 0);
         assert_eq!(self.exit_handle_capacity, 0);
         assert_eq!(self.exit_handle_bytes, 0);
+        assert_eq!(self.retirement_capacity, 0);
+        assert_eq!(self.retirement_bytes, 0);
         assert_eq!(self.lease_capacity, 0);
         assert_eq!(self.lease_bytes, 0);
         assert_eq!(self.lease_root_bytes, 0);
@@ -3616,7 +3736,8 @@ impl Machine {
             + self.finally.frames.charged_storage_bytes()
             + self.exits.charged_storage_bytes()
             + self.argument_bytes
-            + self.exit_handle_bytes;
+            + self.exit_handle_bytes
+            + self.retirement_bytes;
         self.metrics.peak_backing_bytes_upper_bound = self.calls.peak_storage_bytes()
             + self.work.peak_storage_bytes()
             + self.values.peak_storage_bytes()
@@ -3624,6 +3745,7 @@ impl Machine {
             + self.exits.peak_storage_bytes()
             + self.peak_argument_bytes
             + self.peak_exit_handle_bytes
+            + self.peak_retirement_bytes
             + self.peak_string_payload_bytes
             + self.peak_lease_bytes
             + self.peak_lease_root_bytes;
@@ -4503,8 +4625,10 @@ impl Drop for Machine {
                 }
             }
             let capacity = exit.handle_capacity;
+            let retirement_capacity = exit.retirement_capacity;
             let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(exit)));
             self.release_exit_handle_capacity(capacity);
+            self.release_retirement_capacity(retirement_capacity);
             if let Err(panic) = dropped {
                 retain_first_panic(&mut first, panic);
             }

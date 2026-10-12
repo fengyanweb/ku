@@ -25,6 +25,8 @@ mod await_ticket_tests;
 mod cancel_batch;
 mod cancellation;
 pub(crate) use cancel_batch::{CancelBatchPoll, TaskCancelBatch};
+mod retirement;
+pub(crate) use retirement::{RetirementBatchPoll, TaskRetirementBatch, TaskRetirementWitness};
 #[cfg(test)]
 mod blocking_retirement_tests;
 #[cfg(test)]
@@ -40,6 +42,8 @@ mod owner_cleanup_ack_tests;
 mod producer_retirement_tests;
 #[cfg(test)]
 mod queue_retirement_tests;
+#[cfg(test)]
+mod retirement_tests;
 mod runner;
 pub(crate) use runner::{LocalTaskRunner, OnceTaskRunner};
 #[cfg(test)]
@@ -1799,6 +1803,16 @@ impl Drop for TaskRuntimeInner {
 impl TaskHandle {
     pub fn id(&self) -> i64 {
         self.id
+    }
+
+    pub(crate) fn internal_identity_key(&self) -> (i64, usize) {
+        // IDs are local to a runtime. This key is only compared while the
+        // handle/witness retains the actual state; it is never exposed to Ku.
+        (self.id, Arc::as_ptr(&self.state) as usize)
+    }
+
+    pub(crate) fn retirement_witness(&self) -> TaskRetirementWitness {
+        TaskRetirementWitness::new(Arc::clone(&self.state), self.runtime.clone())
     }
 
     pub fn await_result(&self) -> KuResult<Value> {

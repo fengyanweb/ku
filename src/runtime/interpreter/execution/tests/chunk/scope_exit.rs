@@ -107,6 +107,7 @@ struct NativeCapture {
     payload: Option<Value>,
     observer: Weak<HttpListenerLease>,
     shorter: Option<RuntimeTermination>,
+    late_shorter: Option<Arc<std::sync::Mutex<Option<RuntimeTermination>>>>,
     pause: Option<Receiver<()>>,
     started: SyncSender<Option<RuntimeTermination>>,
     finished: SyncSender<DropReceipt>,
@@ -115,7 +116,12 @@ struct NativeCapture {
 }
 impl Drop for NativeCapture {
     fn drop(&mut self) {
-        if let Some(shorter) = self.shorter {
+        let shorter = self.shorter.or_else(|| {
+            self.late_shorter
+                .as_ref()
+                .and_then(|slot| *slot.lock().unwrap())
+        });
+        if let Some(shorter) = shorter {
             drop(CleanupGuard::enter(shorter));
         }
         let _ = self.started.try_send(current_cleanup_context());
@@ -162,6 +168,7 @@ fn capture(
         payload: Some(Value::HttpListenerLease(lease)),
         observer: observer.clone(),
         shorter,
+        late_shorter: None,
         pause: pause.then_some(released),
         started: start_tx,
         finished: done_tx,
@@ -503,7 +510,7 @@ fn drain(runtime: &TaskRuntime, finished: usize) {
 }
 
 #[test]
-fn pending_scope_keeps_real_env_and_parent_work_but_terminal_is_not_payload_retirement() {
+fn scope_teardown_waits_for_actual_late_payload_retirement_before_parent_source() {
     let runtime = TaskRuntime::with_limits(2, 1024, 0, 0, 1024);
     let mut blocked = Blockers::start(&runtime, 1);
     let mut child = LateChild::start(&runtime, true);
@@ -577,12 +584,76 @@ fn pending_scope_keeps_real_env_and_parent_work_but_terminal_is_not_payload_reti
             _ => unreachable!(),
         })
         .unwrap();
-    let result = finish(&mut machine, &mut hooks);
+    let mut retirement_waiting = false;
+    for _ in 0..32 {
+        let progress = step(&mut machine, &mut hooks);
+        if matches!(progress, ChunkProgress::Waiting { .. })
+            && machine.exits.get(0).unwrap().state.phase()
+                == cancellation::ExitPhase::WaitRetirement
+        {
+            retirement_waiting = true;
+            break;
+        }
+    }
+    assert!(
+        retirement_waiting,
+        "terminal does not retire the actual losing payload"
+    );
+    let exit = machine.exits.get(0).unwrap();
+    let env = &machine.calls.get(owner - 1).unwrap().env;
+    assert!(!env.contains("marker") && !env.contains("held"));
+    assert_eq!(scalar_binding(env, "parent"), 0);
+    assert!(machine.pending.is_none());
+    assert_eq!(machine.metrics.retired_scope_exits, 0);
+    assert_eq!(
+        (machine.exit_handle_capacity, machine.exit_handle_bytes),
+        (0, 0)
+    );
+    assert!(machine.retirement_capacity > 0);
+    assert_eq!(exit.retirement_capacity, machine.retirement_capacity);
+    assert_eq!(
+        exit.state.retirement_capacity(),
+        machine.retirement_capacity
+    );
+    assert_eq!(
+        machine.retirement_bytes,
+        machine.retirement_capacity * std::mem::size_of::<TaskRetirementWitness>()
+    );
+    let frozen_after_teardown = (
+        machine.work.len(),
+        machine.call_depth,
+        hooks.trace.ticks.len(),
+    );
+    machine.wait_synchronously(&hooks.trace.host);
+    assert!(matches!(
+        step(&mut machine, &mut hooks),
+        ChunkProgress::Waiting { .. }
+    ));
+    assert_eq!(
+        (
+            machine.work.len(),
+            machine.call_depth,
+            hooks.trace.ticks.len()
+        ),
+        frozen_after_teardown
+    );
+    assert_eq!(
+        machine.exits.get(0).unwrap().state.phase(),
+        cancellation::ExitPhase::WaitRetirement
+    );
+    assert_eq!(current_cleanup_context(), None);
+    assert_eq!(current_execution_termination(), None);
     let before_release = runtime.snapshot().unwrap();
     let socket_still_held = child.capture.observer.strong_count() != 0;
     let drops_before = child.capture.drops.load(Ordering::Acquire);
     child.capture.release.release();
     let released = child.capture.finished.recv_timeout(WAIT);
+    let result = finish(&mut machine, &mut hooks);
+    assert_eq!(
+        (machine.retirement_capacity, machine.retirement_bytes),
+        (0, 0)
+    );
+    assert!(machine.peak_retirement_bytes >= std::mem::size_of::<TaskRetirementWitness>());
     blocked.release();
     drain(&runtime, 3);
     eprintln!("scope terminal={terminal} dropping={dropping:?} before_actual_payload_release={before_release:?} released={released:?} exit_header={} retained={} peak_handles={}", std::mem::size_of::<PendingScopeExit>(), machine.exits.charged_storage_bytes(), machine.peak_exit_handle_bytes);
@@ -728,8 +799,8 @@ fn scope_phase_panic_saves_minimum_d_separately_from_primary_cause_and_restores_
 }
 
 #[test]
-fn scope_frame_and_actual_handle_backing_rejection_leave_original_primary_and_env_for_cleanup() {
-    for handles in [false, true] {
+fn scope_frame_handle_and_retirement_backing_rejection_preserve_original_primary_and_env() {
+    for backing in ["frame", "handles", "witness-count", "witness-bytes"] {
         let runtime = TaskRuntime::with_limits(2, 1024, 0, 0, 1024);
         let mut blocked = Blockers::start(&runtime, 1);
         let mut child = LateChild::start(&runtime, false);
@@ -746,18 +817,31 @@ fn scope_frame_and_actual_handle_backing_rejection_leave_original_primary_and_en
                 ..
             }))
         ));
-        if handles {
-            machine.value_limits.max_storage_bytes =
-                machine.values.charged_storage_bytes() + machine.argument_bytes;
-        } else {
-            machine.work_limits.max_storage_bytes = machine.work.charged_storage_bytes()
-                + machine.finally.frames.charged_storage_bytes();
+        match backing {
+            "frame" => {
+                machine.work_limits.max_storage_bytes = machine.work.charged_storage_bytes()
+                    + machine.finally.frames.charged_storage_bytes()
+            }
+            "handles" => {
+                machine.value_limits.max_storage_bytes =
+                    machine.values.charged_storage_bytes() + machine.argument_bytes
+            }
+            "witness-count" => {
+                machine.value_limits.max_frames =
+                    machine.values.capacity() + machine.argument_capacity + 1
+            }
+            "witness-bytes" => {
+                machine.value_limits.max_storage_bytes = machine.values.charged_storage_bytes()
+                    + machine.argument_bytes
+                    + std::mem::size_of::<TaskHandle>()
+            }
+            _ => unreachable!(),
         }
         let result = finish(&mut machine, &mut hooks);
         let released = child.capture.finished.recv_timeout(WAIT);
         blocked.release();
         drain(&runtime, 3);
-        eprintln!("scope reject handles={handles} fallback={:?} result={result:?} frame_size={} frame_bytes={} peak_handles={}", hooks.fallback, std::mem::size_of::<PendingScopeExit>(), machine.exits.charged_storage_bytes(), machine.peak_exit_handle_bytes);
+        eprintln!("scope reject backing={backing} fallback={:?} result={result:?} frame_size={} frame_bytes={} peak_handles={}", hooks.fallback, std::mem::size_of::<PendingScopeExit>(), machine.exits.charged_storage_bytes(), machine.peak_exit_handle_bytes);
         assert_eq!(
             hooks.fallback,
             vec![(41, id, true)],
@@ -778,6 +862,14 @@ fn scope_frame_and_actual_handle_backing_rejection_leave_original_primary_and_en
         assert_eq!(
             (machine.exit_handle_capacity, machine.exit_handle_bytes),
             (0, 0)
+        );
+        assert_eq!(
+            (machine.retirement_capacity, machine.retirement_bytes),
+            (0, 0)
+        );
+        assert_eq!(
+            machine.peak_retirement_bytes, 0,
+            "reject before reserving witness storage"
         );
         assert_eq!(
             machine.peak_exit_handle_bytes, 0,
@@ -996,4 +1088,193 @@ fn scope_continue_budget_fallback_keeps_feedback_after_normal_and_native_cleanup
             }
         }
     }
+}
+
+#[test]
+fn scope_waits_for_real_blocking_retirement_and_receives_its_shorter_deadline() {
+    let runtime = TaskRuntime::with_limits(1, 1024, 1, 1024, 1024);
+    let child_runtime = TaskRuntime::with_limits(1, 1024, 0, 0, 1024);
+    let mut blocked = Blockers::start(&child_runtime, 1);
+    let (mut capture, mut probe) = capture(true, None, false);
+    let late_shorter = Arc::new(std::sync::Mutex::new(None));
+    probe.late_shorter = Some(Arc::clone(&late_shorter));
+    let ran = Arc::clone(&capture.ran);
+    let child = child_runtime
+        .spawn(move || {
+            ran.store(true, Ordering::Release);
+            std::hint::black_box(&probe);
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let (mut body_release, released) = Gate::pair();
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let blocking_runtime = runtime.clone();
+    let parent = runtime
+        .spawn(move || {
+            blocking_runtime.run_blocking(
+                move || {
+                    // Only the real FnOnce owns this child's existing lease. Its
+                    // implicit capture Drop occurs after the already-cancelled parent
+                    // has left run_blocking; no explicit release or fake state is used.
+                    std::hint::black_box(&child);
+                    started_tx
+                        .send((
+                            thread::current().id(),
+                            crate::runtime::task::current_task_id(),
+                            current_cleanup_context(),
+                        ))
+                        .unwrap();
+                    released
+                        .recv_timeout(WAIT)
+                        .expect("finite actual blocking body release");
+                    Ok(Value::Null)
+                },
+                Span::default(),
+            )?;
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let started = started_rx.recv_timeout(WAIT).unwrap();
+    assert_ne!(started.0, thread::current().id());
+    assert_eq!((started.1, started.2), (0, None));
+    let source = functions(NORMAL);
+    let mut hooks = ScopeHooks::new(&source, &runtime, parent);
+    let mut machine = machine(&source);
+    to_scope(&mut machine, &mut hooks);
+    let mut waiting = false;
+    for _ in 0..32 {
+        let progress = step(&mut machine, &mut hooks);
+        if matches!(progress, ChunkProgress::Waiting { .. }) {
+            if machine.exits.get(0).unwrap().state.phase()
+                == cancellation::ExitPhase::WaitRetirement
+            {
+                waiting = true;
+                break;
+            }
+            machine.wait_synchronously(&hooks.trace.host);
+        }
+    }
+    assert!(
+        waiting,
+        "the actual accepted BlockingJob outlives its parent G1"
+    );
+    let exit = machine.exits.get(0).unwrap();
+    let original = exit.state.context().unwrap();
+    let env = &machine.calls.get(0).unwrap().env;
+    assert!(!env.contains("marker") && !env.contains("held"));
+    assert_eq!(scalar_binding(env, "parent"), 0);
+    assert_eq!(
+        (machine.exit_handle_capacity, machine.exit_handle_bytes),
+        (0, 0)
+    );
+    assert_eq!(
+        exit.state.retirement_capacity(),
+        machine.retirement_capacity
+    );
+    assert!(machine.retirement_capacity > 0);
+    assert_eq!(
+        machine.retirement_bytes,
+        machine.retirement_capacity * std::mem::size_of::<TaskRetirementWitness>()
+    );
+    let before = runtime.snapshot().unwrap();
+    assert_eq!(
+        (
+            before.active_tasks,
+            before.queued_tasks,
+            before.finished_tasks
+        ),
+        (0, 0, 1)
+    );
+    assert_eq!(before.running_blocking_jobs, 1);
+    assert_eq!(capture.drops.load(Ordering::Acquire), 0);
+    assert!(capture.started.try_recv().is_err());
+    let frozen = (
+        machine.work.len(),
+        machine.call_depth,
+        hooks.trace.ticks.len(),
+    );
+    let shorter = RuntimeTermination {
+        reason: TerminationReason::TimedOut,
+        cleanup_deadline: original.cleanup_deadline - Duration::from_millis(100),
+    };
+    *late_shorter.lock().unwrap() = Some(shorter);
+    body_release.release();
+    let expected = RuntimeTermination {
+        reason: original.reason,
+        cleanup_deadline: shorter.cleanup_deadline,
+    };
+    let dropping = capture.started.recv_timeout(WAIT).unwrap();
+    assert_eq!(dropping, Some(expected));
+    assert_eq!(capture.drops.load(Ordering::Acquire), 0);
+    assert_eq!(runtime.snapshot().unwrap().running_blocking_jobs, 1);
+    machine.wait_synchronously(&hooks.trace.host);
+    assert!(matches!(
+        step(&mut machine, &mut hooks),
+        ChunkProgress::Waiting { .. }
+    ));
+    assert_eq!(
+        (
+            machine.work.len(),
+            machine.call_depth,
+            hooks.trace.ticks.len()
+        ),
+        frozen
+    );
+    assert_eq!(
+        machine.exits.get(0).unwrap().state.phase(),
+        cancellation::ExitPhase::WaitRetirement
+    );
+    assert_eq!(current_cleanup_context(), None);
+    assert_eq!(current_execution_termination(), None);
+    capture.release.release();
+    let receipt = capture.finished.recv_timeout(WAIT).unwrap();
+    assert_eq!(receipt.context, Some(expected));
+    assert!(receipt.socket_released);
+    let mut settled = false;
+    for _ in 0..32 {
+        let progress = step(&mut machine, &mut hooks);
+        if machine.exits.get(0).unwrap().state.phase() == cancellation::ExitPhase::DeadlineCheck {
+            settled = true;
+            break;
+        }
+        if matches!(progress, ChunkProgress::Waiting { .. }) {
+            machine.wait_synchronously(&hooks.trace.host);
+        }
+    }
+    assert!(
+        settled,
+        "the final actual Drop publishes retirement before D"
+    );
+    let exit = machine.exits.get(0).unwrap();
+    assert_eq!(exit.state.context(), Some(expected));
+    assert_eq!(exit.state.release_context(), Some(expected));
+    assert_eq!(
+        (exit.retirement_capacity, exit.state.retirement_capacity()),
+        (0, 0)
+    );
+    assert_eq!(
+        (machine.retirement_capacity, machine.retirement_bytes),
+        (0, 0)
+    );
+    assert_eq!(
+        (
+            machine.work.len(),
+            machine.call_depth,
+            hooks.trace.ticks.len()
+        ),
+        frozen
+    );
+    assert_eq!(finish(&mut machine, &mut hooks).unwrap(), Value::Int(1));
+    assert_eq!(capture.drops.load(Ordering::Acquire), 1);
+    assert_eq!(capture.observer.strong_count(), 0);
+    assert!(!capture.ran.load(Ordering::Acquire));
+    assert!(until(
+        || runtime.snapshot().unwrap().running_blocking_jobs == 0
+    ));
+    assert_drained(&machine.metrics, 0);
+    drain(&runtime, 1);
+    blocked.release();
+    drain(&child_runtime, 2);
+    assert_eq!(current_cleanup_context(), None);
+    assert_eq!(current_execution_termination(), None);
 }

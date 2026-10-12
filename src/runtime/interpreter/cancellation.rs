@@ -320,7 +320,7 @@ impl Interpreter {
         }
         let mut requested = HashSet::new();
         for handle in &handles {
-            if requested.insert(handle.id()) {
+            if requested.insert(handle.internal_identity_key()) {
                 handle.request_cancel_with(context);
             }
         }
@@ -547,6 +547,16 @@ impl Interpreter {
                 ExitPhase::Teardown => {
                     state.teardown(self, env, teardown.take().expect("exit teardown runs once"));
                 }
+                ExitPhase::WaitRetirement => {
+                    // The legacy constructor retains no witnesses. Drive any
+                    // explicit budgeted state with its real bounded predicate,
+                    // without rebroadcasting or running scheduler help.
+                    if let TerminalProgress::Pending { first_index, .. } =
+                        state.poll_retirement(self, Instant::now())
+                    {
+                        state.wait_retirement_once(self, first_index);
+                    }
+                }
                 ExitPhase::DeadlineCheck => state.deadline_check(self),
                 ExitPhase::Arbitrate => state.arbitrate(self),
                 ExitPhase::Discard => state.discard(self),
@@ -610,7 +620,7 @@ fn call_owned_tasks(
         }
         Ok(())
     })();
-    handles.sort_unstable_by_key(crate::runtime::task::TaskHandle::id);
-    handles.dedup_by_key(|handle| handle.id());
+    handles.sort_unstable_by_key(crate::runtime::task::TaskHandle::internal_identity_key);
+    handles.dedup_by_key(|handle| handle.internal_identity_key());
     (handles, collected)
 }
