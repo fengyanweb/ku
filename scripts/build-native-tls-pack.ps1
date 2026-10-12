@@ -185,6 +185,8 @@ namespace Ku.NativeTlsPack {
         public bool TimedOut { get; internal set; }
         public bool OutputLimitExceeded { get; internal set; }
         public bool DescendantHeldOutputPipe { get; internal set; }
+        public string SelfTestReadinessError { get; internal set; }
+        public string SelfTestCleanupError { get; internal set; }
     }
 
     public static class BoundedProcess {
@@ -338,6 +340,97 @@ namespace Ku.NativeTlsPack {
             int timeoutMilliseconds,
             long maximumOutputBytes
         ) {
+            return RunCore(fileName, arguments, workingDirectory, stdoutPath, stderrPath, startGatePath, groupReadyPath, timeoutMilliseconds, maximumOutputBytes, null, null);
+        }
+
+        // Only the process-cleanup self-test may separate fixture preparation
+        // from its unchanged execution deadline. Production Run has no gate.
+        public static BoundedProcessResult RunSelfTest(
+            string fileName, string[] arguments, string workingDirectory,
+            string stdoutPath, string stderrPath, string startGatePath,
+            string groupReadyPath, int timeoutMilliseconds, long maximumOutputBytes,
+            string readinessPidPath, string delayStartGatePath
+        ) {
+            // PowerShell can bind $null to an empty CLR string.
+            readinessPidPath = string.IsNullOrEmpty(readinessPidPath) ? null : readinessPidPath;
+            delayStartGatePath = string.IsNullOrEmpty(delayStartGatePath) ? null : delayStartGatePath;
+            return RunCore(fileName, arguments, workingDirectory, stdoutPath, stderrPath, startGatePath, groupReadyPath, timeoutMilliseconds, maximumOutputBytes, readinessPidPath, delayStartGatePath);
+        }
+
+        private static string WaitForSelfTestReadiness(Process process, string pidPath) {
+            var clock = Stopwatch.StartNew();
+            const int preparationMilliseconds = 10000;
+            while (true) {
+                if (clock.ElapsedMilliseconds >= preparationMilliseconds) {
+                    return "fixture did not become ready within the 10000-ms preparation bound";
+                }
+                if (File.Exists(pidPath) || Directory.Exists(pidPath)) {
+                    var attributes = File.GetAttributes(pidPath);
+                    if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0) {
+                        return "readiness PID must be a plain file";
+                    }
+                    var info = new FileInfo(pidPath);
+                    if (info.Length < 1 || info.Length > 10) return "readiness PID has an invalid size";
+                    byte[] bytes = File.ReadAllBytes(pidPath);
+                    if (bytes.Length < 1 || bytes.Length > 10) return "readiness PID has an invalid size";
+                    foreach (byte digit in bytes) {
+                        if (digit < 0x30 || digit > 0x39) return "readiness PID is not a positive integer";
+                    }
+                    string text = System.Text.Encoding.ASCII.GetString(bytes);
+                    if (!int.TryParse(text, System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture, out int childPid) || childPid <= 0) {
+                        return "readiness PID is not a positive integer";
+                    }
+                    try {
+                        using (var child = Process.GetProcessById(childPid)) {
+                            if (child.HasExited) return "readiness child already exited";
+                        }
+                    } catch (ArgumentException) { return "readiness child already exited"; }
+                    if (process.HasExited) return "fixture exited before the timeout phase";
+                    if (clock.ElapsedMilliseconds >= preparationMilliseconds) {
+                        return "fixture did not become ready within the 10000-ms preparation bound";
+                    }
+                    return null;
+                }
+                if (process.HasExited) return "fixture exited before publishing readiness";
+                long remaining = preparationMilliseconds - clock.ElapsedMilliseconds;
+                if (remaining <= 0) return "fixture did not become ready within the 10000-ms preparation bound";
+                process.WaitForExit((int)Math.Min(10, remaining));
+            }
+        }
+
+        private static void SignalSelfTestDelayStart(string path, long deadlineTimestamp) {
+            byte[] bytes = System.Text.Encoding.ASCII.GetBytes(deadlineTimestamp.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            string temporaryPath = path + ".tmp";
+            using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read)) {
+                stream.Write(bytes, 0, bytes.Length); stream.Flush(true);
+            }
+            File.Move(temporaryPath, path);
+        }
+
+        private static void AddSelfTestCleanupError(ref string errors, string message) {
+            errors = errors == null ? message : errors + "; " + message;
+        }
+
+        private static void KillSelfTestLeader(Process process, ref string errors) {
+            try { KillLeader(process); }
+            catch (Exception error) { AddSelfTestCleanupError(ref errors, "leader termination failed: " + error.Message); }
+        }
+
+        private static bool WaitSelfTestOutput(Task output, ref string errors) {
+            try { return output.Wait(10000); }
+            catch (AggregateException error) {
+                AddSelfTestCleanupError(ref errors, "output capture failed: " + error.GetBaseException().Message);
+                return output.IsCompleted;
+            }
+        }
+
+        private static BoundedProcessResult RunCore(
+            string fileName, string[] arguments, string workingDirectory,
+            string stdoutPath, string stderrPath, string startGatePath,
+            string groupReadyPath, int timeoutMilliseconds, long maximumOutputBytes,
+            string readinessPidPath, string delayStartGatePath
+        ) {
             if (timeoutMilliseconds <= 0 || maximumOutputBytes <= 0) {
                 throw new ArgumentOutOfRangeException();
             }
@@ -363,29 +456,105 @@ namespace Ku.NativeTlsPack {
                     var budget = new OutputBudget(process, maximumOutputBytes, groupReadyPath);
                     Task stdout = Pump(process.StandardOutput.BaseStream, stdoutPath, budget);
                     Task stderr = Pump(process.StandardError.BaseStream, stderrPath, budget);
-                    bool timedOut = !process.WaitForExit(timeoutMilliseconds);
+                    bool isSelfTest = delayStartGatePath != null || readinessPidPath != null;
+                    bool startupDeadlineMode = delayStartGatePath != null && readinessPidPath == null;
+                    long startupStartTimestamp = 0;
+                    string readinessError = null;
+                    string cleanupError = null;
+                    if (isSelfTest) {
+                        try {
+                            if (delayStartGatePath != null) {
+                                // Only the controlled startup fixture measures from gate release.
+                                // A delayed parent must never grant it another execution window.
+                                startupStartTimestamp = Stopwatch.GetTimestamp();
+                                long deadline = startupDeadlineMode
+                                    ? checked(startupStartTimestamp + (long)(timeoutMilliseconds * (double)Stopwatch.Frequency / 1000))
+                                    : 0;
+                                SignalSelfTestDelayStart(delayStartGatePath, deadline);
+                            }
+                            if (readinessPidPath != null) readinessError = WaitForSelfTestReadiness(process, readinessPidPath);
+                        } catch (Exception error) {
+                            readinessError = "fixture preparation failed: " + error.Message;
+                        }
+                    }
+                    int executionTimeoutMilliseconds = timeoutMilliseconds;
+                    if (startupDeadlineMode) {
+                        double elapsed = (Stopwatch.GetTimestamp() - startupStartTimestamp) * 1000.0 / Stopwatch.Frequency;
+                        executionTimeoutMilliseconds = (int)Math.Max(0, Math.Floor(timeoutMilliseconds - elapsed));
+                    }
+                    bool timedOut;
+                    if (isSelfTest) {
+                        timedOut = false;
+                        try {
+                            timedOut = readinessError == null &&
+                                ((startupDeadlineMode && executionTimeoutMilliseconds <= 0) || !process.WaitForExit(executionTimeoutMilliseconds));
+                        }
+                        catch (Exception error) { AddSelfTestCleanupError(ref cleanupError, "execution wait failed: " + error.Message); }
+                    }
+                    else { timedOut = !process.WaitForExit(timeoutMilliseconds); }
                     if (OperatingSystem.IsWindows()) { if (job != IntPtr.Zero) { CloseHandle(job); job = IntPtr.Zero; } }
+                    else if (isSelfTest) {
+                        try { KillUnixProcessGroup(process.Id, groupReadyPath); }
+                        catch (Exception error) {
+                            AddSelfTestCleanupError(ref cleanupError, "group termination failed: " + error.Message);
+                            // Still retire a live test fixture if group signalling fails.
+                            // The test's actual-child assertion remains authoritative.
+                            try { if (!process.HasExited) process.Kill(true); }
+                            catch (Exception fallbackError) { AddSelfTestCleanupError(ref cleanupError, "tree termination failed: " + fallbackError.Message); }
+                        }
+                    }
                     else { KillUnixProcessGroup(process.Id, groupReadyPath); }
-                    if (timedOut) KillLeader(process);
-                    if (!process.WaitForExit(10000)) {
-                        KillLeader(process);
-                        throw new TimeoutException("build subprocess tree cleanup was not confirmed");
+                    if (timedOut || readinessError != null || cleanupError != null) {
+                        if (isSelfTest) KillSelfTestLeader(process, ref cleanupError);
+                        else KillLeader(process);
+                    }
+                    bool leaderRetired;
+                    if (isSelfTest) {
+                        leaderRetired = false;
+                        try { leaderRetired = process.WaitForExit(10000); }
+                        catch (Exception error) { AddSelfTestCleanupError(ref cleanupError, "leader wait failed: " + error.Message); }
+                    }
+                    else { leaderRetired = process.WaitForExit(10000); }
+                    if (!leaderRetired) {
+                        if (isSelfTest) {
+                            AddSelfTestCleanupError(ref cleanupError, "subprocess tree cleanup was not confirmed");
+                            KillSelfTestLeader(process, ref cleanupError);
+                        }
+                        else {
+                            KillLeader(process);
+                            throw new TimeoutException("build subprocess tree cleanup was not confirmed");
+                        }
                     }
                     Task allOutput = Task.WhenAll(stdout, stderr);
-                    bool descendantHeldOutputPipe = !allOutput.Wait(10000);
+                    bool descendantHeldOutputPipe = !(isSelfTest ? WaitSelfTestOutput(allOutput, ref cleanupError) : allOutput.Wait(10000));
                     if (descendantHeldOutputPipe) {
                         Interlocked.Exchange(ref budget.StopPumps, 1);
-                        KillLeader(process);
-                        process.StandardOutput.Close();
-                        process.StandardError.Close();
-                        if (!allOutput.Wait(10000)) throw new TimeoutException("build subprocess output cleanup was not confirmed");
+                        if (isSelfTest) {
+                            KillSelfTestLeader(process, ref cleanupError);
+                            try { process.StandardOutput.Close(); }
+                            catch (Exception error) { AddSelfTestCleanupError(ref cleanupError, "stdout close failed: " + error.Message); }
+                            try { process.StandardError.Close(); }
+                            catch (Exception error) { AddSelfTestCleanupError(ref cleanupError, "stderr close failed: " + error.Message); }
+                            if (!WaitSelfTestOutput(allOutput, ref cleanupError)) AddSelfTestCleanupError(ref cleanupError, "subprocess output cleanup was not confirmed");
+                        }
+                        else {
+                            KillLeader(process);
+                            process.StandardOutput.Close();
+                            process.StandardError.Close();
+                            if (!allOutput.Wait(10000)) throw new TimeoutException("build subprocess output cleanup was not confirmed");
+                        }
                     }
-                    if (allOutput.IsFaulted) throw new IOException("build subprocess output capture failed", allOutput.Exception);
+                    if (allOutput.IsFaulted) {
+                        if (isSelfTest) AddSelfTestCleanupError(ref cleanupError, "subprocess output capture failed: " + allOutput.Exception.GetBaseException().Message);
+                        else throw new IOException("build subprocess output capture failed", allOutput.Exception);
+                    }
                     return new BoundedProcessResult {
-                        ExitCode = process.ExitCode,
+                        ExitCode = isSelfTest && !leaderRetired ? -1 : process.ExitCode,
                         TimedOut = timedOut,
                         OutputLimitExceeded = Volatile.Read(ref budget.Exceeded) != 0,
                         DescendantHeldOutputPipe = descendantHeldOutputPipe,
+                        SelfTestReadinessError = readinessError,
+                        SelfTestCleanupError = cleanupError,
                     };
                 } finally {
                     if (job != IntPtr.Zero) CloseHandle(job);
@@ -403,8 +572,16 @@ function Invoke-KuTlsBoundedProcess(
     [string]$WorkingDirectory,
     [string]$LogRoot,
     [string]$LogName,
-    [int]$TimeoutMilliseconds
+    [int]$TimeoutMilliseconds,
+    [string]$SelfTestReadinessPidPath = $null,
+    [int]$SelfTestStartupDelayMilliseconds = 0,
+    [switch]$SelfTestStderrDirectoryFault
 ) {
+    if (($SelfTestReadinessPidPath -or $SelfTestStartupDelayMilliseconds -ne 0 -or $SelfTestStderrDirectoryFault) -and -not $SelfTest) {
+        throw "native TLS fixture gates are restricted to -SelfTest"
+    }
+    if ($SelfTestStartupDelayMilliseconds -notin @(0, 2500)) { throw "invalid native TLS self-test startup delay" }
+    if ($SelfTestStderrDirectoryFault -and -not $SelfTestReadinessPidPath) { throw "native TLS log-fault self-test requires real fixture readiness" }
     $wrapperPath = Join-Path $LogRoot ".ku-invoke-tool.ps1"
     if (-not (Test-Path -LiteralPath $wrapperPath)) {
         $wrapperSource = @'
@@ -424,6 +601,18 @@ try {
         if ([KuTlsUnixGroup]::setpgid(0, 0) -ne 0) { throw "cannot create an isolated native TLS process group" }
         $ready = [IO.FileStream]::new([string]$item.groupReady, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
         try { $ready.WriteByte(1); $ready.Flush($true) } finally { $ready.Dispose() }
+    }
+    if ($item.PSObject.Properties.Name -contains "selfTestDelayStartGate") {
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not (Test-Path -LiteralPath ([string]$item.selfTestDelayStartGate) -PathType Leaf)) {
+            if ([DateTime]::UtcNow -ge $deadline) { throw "native TLS self-test delay gate timed out" }
+            Start-Sleep -Milliseconds 10
+        }
+        $startupDeadline = [long]([IO.File]::ReadAllText([string]$item.selfTestDelayStartGate, [Text.Encoding]::ASCII))
+        Start-Sleep -Milliseconds ([int]$item.selfTestStartupDelayMilliseconds)
+        if ($startupDeadline -gt 0 -and [Diagnostics.Stopwatch]::GetTimestamp() -ge $startupDeadline) {
+            throw "self-test startup fixture reached its original execution deadline"
+        }
     }
     & ([string]$item.tool) @([string[]]$item.arguments)
     if ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE }
@@ -447,28 +636,60 @@ catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
     $specPath = Join-Path $LogRoot "$LogName-$runId.json"
     $startGatePath = Join-Path $LogRoot "$runId.start"
     $groupReadyPath = Join-Path $LogRoot "$runId.group"
-    $spec = [ordered]@{
+    $delayStartGatePath = if ($SelfTestStartupDelayMilliseconds -ne 0) { Join-Path $LogRoot "$runId.delay-start" } else { $null }
+    $specItem = [ordered]@{
         tool = [string]$command.Source
         arguments = @($ArgumentList)
         startGate = $startGatePath
         groupReady = $groupReadyPath
-    } | ConvertTo-Json -Compress
+    }
+    if ($null -ne $delayStartGatePath) {
+        $specItem.selfTestDelayStartGate = $delayStartGatePath
+        $specItem.selfTestStartupDelayMilliseconds = $SelfTestStartupDelayMilliseconds
+    }
+    $spec = $specItem | ConvertTo-Json -Compress
     [System.IO.File]::WriteAllText($specPath, $spec, [System.Text.UTF8Encoding]::new($false))
     $stdoutPath = Join-Path $LogRoot "$LogName-$runId.stdout"
     $stderrPath = Join-Path $LogRoot "$LogName-$runId.stderr"
-    $result = [Ku.NativeTlsPack.BoundedProcess]::Run(
-        [string]$pwsh.Source,
-        @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $wrapperPath, "-Spec", $specPath),
-        $WorkingDirectory,
-        $stdoutPath,
-        $stderrPath,
-        $startGatePath,
-        $groupReadyPath,
-        $TimeoutMilliseconds,
-        $kuTlsProcessOutputLimit
-    )
-    $stdout = [System.IO.File]::ReadAllText($stdoutPath)
-    $stderr = [System.IO.File]::ReadAllText($stderrPath)
+    if ($SelfTestStderrDirectoryFault) { [IO.Directory]::CreateDirectory($stderrPath) | Out-Null }
+    if ($SelfTestReadinessPidPath -or $null -ne $delayStartGatePath) {
+        $readyPath = if ($SelfTestReadinessPidPath) { $SelfTestReadinessPidPath } else { $null }
+        $result = [Ku.NativeTlsPack.BoundedProcess]::RunSelfTest(
+            [string]$pwsh.Source,
+            @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $wrapperPath, "-Spec", $specPath),
+            $WorkingDirectory, $stdoutPath, $stderrPath, $startGatePath, $groupReadyPath,
+            $TimeoutMilliseconds, $kuTlsProcessOutputLimit, $readyPath, $delayStartGatePath
+        )
+    }
+    else {
+        $result = [Ku.NativeTlsPack.BoundedProcess]::Run(
+            [string]$pwsh.Source,
+            @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $wrapperPath, "-Spec", $specPath),
+            $WorkingDirectory,
+            $stdoutPath,
+            $stderrPath,
+            $startGatePath,
+            $groupReadyPath,
+            $TimeoutMilliseconds,
+            $kuTlsProcessOutputLimit
+        )
+    }
+    $cleanupDetails = $result.SelfTestCleanupError
+    if ($SelfTest) {
+        $logProblems = [Collections.Generic.List[string]]::new()
+        if ($cleanupDetails) { $logProblems.Add($cleanupDetails) }
+        $stdout = ""
+        $stderr = ""
+        try { $stdout = [System.IO.File]::ReadAllText($stdoutPath) }
+        catch { $logProblems.Add("stdout log read failed: $($_.Exception.Message)") }
+        try { $stderr = [System.IO.File]::ReadAllText($stderrPath) }
+        catch { $logProblems.Add("stderr log read failed: $($_.Exception.Message)") }
+        $cleanupDetails = $logProblems -join "; "
+    }
+    else {
+        $stdout = [System.IO.File]::ReadAllText($stdoutPath)
+        $stderr = [System.IO.File]::ReadAllText($stderrPath)
+    }
     $output = if ($stdout.Length -eq 0) {
         $stderr
     }
@@ -478,15 +699,21 @@ catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
     else {
         "$stdout`n$stderr"
     }
+    $cleanupSuffix = if ($cleanupDetails) { "; self-test cleanup failed: $cleanupDetails" } else { "" }
+    $terminationSuffix = if ($cleanupDetails) { "; process-tree cleanup could not be confirmed" } else { "; its process tree was terminated" }
     if ($result.OutputLimitExceeded) {
-        throw "$FileName output exceeded the $kuTlsProcessOutputLimit-byte limit; its process tree was terminated"
+        throw "$FileName output exceeded the $kuTlsProcessOutputLimit-byte limit$terminationSuffix$cleanupSuffix"
+    }
+    if ($result.SelfTestReadinessError) {
+        throw "$FileName self-test readiness failed: $($result.SelfTestReadinessError)$terminationSuffix$cleanupSuffix"
     }
     if ($result.TimedOut) {
-        throw "$FileName exceeded its $TimeoutMilliseconds-ms deadline; its process tree was terminated"
+        throw "$FileName exceeded its $TimeoutMilliseconds-ms deadline$terminationSuffix$cleanupSuffix"
     }
     if ($result.DescendantHeldOutputPipe) {
-        throw "$FileName left an inherited output pipe open after exit; the bounded build was rejected"
+        throw "$FileName left an inherited output pipe open after exit; the bounded build was rejected$cleanupSuffix"
     }
+    if ($cleanupDetails) { throw "self-test cleanup failed: $cleanupDetails" }
     return [pscustomobject]@{
         ExitCode = $result.ExitCode
         Output = $output
@@ -891,6 +1118,8 @@ function Invoke-KuTlsProcessSelfTest {
 
     $owner = [Guid]::NewGuid().ToString("N")
     $workRoot = New-KuTlsPrivateRoot $temporaryRoot ".ku-tls-process-selftest-" $owner
+    $recordedChildren = [Collections.Generic.List[string]]::new()
+    $primaryFailure = $null
     try {
         if (-not $IsWindows) {
             $modeDirectory = Join-Path $workRoot "public-mode-directory"; [System.IO.Directory]::CreateDirectory($modeDirectory) | Out-Null; Set-KuTlsPublicDirectoryMode $modeDirectory
@@ -920,6 +1149,7 @@ function Invoke-KuTlsProcessSelfTest {
         }
 
         $orphanPid = Join-Path $workRoot "orphan-child.pid"
+        $recordedChildren.Add($orphanPid)
         $orphanProgram = 'import subprocess,sys; p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"]); open(sys.argv[1],"w").write(str(p.pid))'
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $orphan = Invoke-KuTlsBoundedProcess ([string]$python.Source) @("-c", $orphanProgram, $orphanPid) $workRoot $workRoot "orphan-tree" 10000
@@ -929,6 +1159,7 @@ function Invoke-KuTlsProcessSelfTest {
         if ($clock.ElapsedMilliseconds -gt 15000) { throw "native TLS orphan self-test exceeded its cleanup bound" }
 
         $outputPid = Join-Path $workRoot "output-child.pid"
+        $recordedChildren.Add($outputPid)
         $outputProgram = 'import subprocess,sys; p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"]); open(sys.argv[1],"w").write(str(p.pid)); sys.stdout.buffer.write((b"x"*4095+b"\n")*512); sys.stdout.flush()'
         $outputRejected = $false
         $outputFailure = $null
@@ -943,16 +1174,124 @@ function Invoke-KuTlsProcessSelfTest {
         foreach ($log in Get-ChildItem -LiteralPath $workRoot -File | Where-Object Name -Like "output-budget-*.std*") { $captured += $log.Length }
         if ($captured -gt $kuTlsProcessOutputLimit) { throw "native TLS output-budget self-test captured more than its configured limit" }
 
+        # Every timeout fixture is a real child in the already isolated tree.
+        # Publish its own PID only after a flushed, atomic rename, never a fake PID.
+        $timeoutProgram = @'
+import subprocess, sys, time
+child = """
+import os, sys, time
+def publish(path, data):
+    with open(path + '.tmp', 'xb') as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(path + '.tmp', path)
+pid = str(os.getpid()).encode('ascii')
+publish(sys.argv[1], pid)
+if sys.argv[3] == 'bad':
+    publish(sys.argv[2], b'not-a-pid')
+elif sys.argv[3] == 'bom':
+    publish(sys.argv[2], bytes((239, 187, 191)) + pid)
+time.sleep(60)
+"""
+subprocess.Popen([sys.executable, '-c', child, sys.argv[1], sys.argv[2], sys.argv[3]])
+time.sleep(60)
+'@
+
+        # The gate starts this 2500-ms delay after the parent's pumps are ready.
+        # The ordinary 2000-ms execution window must stop the wrapper before it
+        # may launch Python. This does not stand in for the child-cleanup case.
+        $startupPid = Join-Path $workRoot "startup-child.pid"
+        $recordedChildren.Add($startupPid)
+        $startupRejected = $false
+        $startupFailure = "no rejection"
+        try { [void](Invoke-KuTlsBoundedProcess ([string]$python.Source) @("-c", $timeoutProgram, $startupPid, $startupPid, "plain") $workRoot $workRoot "startup-deadline" 2000 -SelfTestStartupDelayMilliseconds 2500) }
+        catch {
+            $startupFailure = $_.Exception.Message
+            $startupRejected = $startupFailure -like "*exceeded its 2000-ms deadline*" -and $startupFailure -notlike "*self-test cleanup failed*"
+        }
+        if (-not $startupRejected -or (Test-Path -LiteralPath $startupPid)) {
+            throw "native TLS startup self-test did not enforce its original 2000-ms window before fixture readiness ($startupFailure)"
+        }
+
         $timeoutPid = Join-Path $workRoot "timeout-child.pid"
-        $timeoutProgram = 'import subprocess,sys,time; p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"]); open(sys.argv[1],"w").write(str(p.pid)); time.sleep(60)'
+        $recordedChildren.Add($timeoutPid)
         $timeoutRejected = $false
-        try { [void](Invoke-KuTlsBoundedProcess ([string]$python.Source) @("-c", $timeoutProgram, $timeoutPid) $workRoot $workRoot "direct-timeout" 2000) }
-        catch { $timeoutRejected = $_.Exception.Message -like "*exceeded its 2000-ms deadline*" }
+        try { [void](Invoke-KuTlsBoundedProcess ([string]$python.Source) @("-c", $timeoutProgram, $timeoutPid, $timeoutPid, "plain") $workRoot $workRoot "direct-timeout" 2000 -SelfTestReadinessPidPath $timeoutPid -SelfTestStartupDelayMilliseconds 2500) }
+        catch { $timeoutRejected = $_.Exception.Message -like "*exceeded its 2000-ms deadline*" -and $_.Exception.Message -notlike "*self-test cleanup failed*" }
         if (-not $timeoutRejected) { throw "native TLS direct-timeout self-test was not rejected" }
         Assert-KuTlsSelfTestChildGone $timeoutPid "native TLS timeout"
+
+        # A real Pump open failure leaves stderr as a directory. Preserve the
+        # original timeout together with capture/read errors, then verify the child.
+        $logFaultPid = Join-Path $workRoot "log-fault-child.pid"
+        $recordedChildren.Add($logFaultPid)
+        $logFaultRejected = $false
+        $logFaultFailure = "no rejection"
+        try { [void](Invoke-KuTlsBoundedProcess ([string]$python.Source) @("-c", $timeoutProgram, $logFaultPid, $logFaultPid, "plain") $workRoot $workRoot "log-fault" 2000 -SelfTestReadinessPidPath $logFaultPid -SelfTestStderrDirectoryFault) }
+        catch {
+            $logFaultFailure = $_.Exception.Message
+            $logFaultRejected = $logFaultFailure -like "*exceeded its 2000-ms deadline*" -and
+                $logFaultFailure -like "*self-test cleanup failed:*output*capture*failed*" -and
+                $logFaultFailure -like "*stderr log read failed:*"
+        }
+        if (-not $logFaultRejected) { throw "native TLS log-fault self-test masked its primary timeout ($logFaultFailure)" }
+        Assert-KuTlsSelfTestChildGone $logFaultPid "native TLS log-fault"
+
+        # A missing/invalid readiness signal is a preparation failure, never a
+        # successful 2000-ms timeout. Both cases still own a genuine live child.
+        $noReadyPid = Join-Path $workRoot "no-ready-child.pid"
+        $noReadySignal = Join-Path $workRoot "never-published.pid"
+        $recordedChildren.Add($noReadyPid)
+        $noReadyRejected = $false
+        try { [void](Invoke-KuTlsBoundedProcess ([string]$python.Source) @("-c", $timeoutProgram, $noReadyPid, $noReadySignal, "plain") $workRoot $workRoot "no-ready" 2000 -SelfTestReadinessPidPath $noReadySignal) }
+        catch { $noReadyRejected = $_.Exception.Message -like "*self-test readiness failed:*10000-ms preparation bound*" -and $_.Exception.Message -notlike "*self-test cleanup failed*" }
+        if (-not $noReadyRejected) { throw "native TLS no-readiness self-test did not report its preparation bound" }
+        Assert-KuTlsSelfTestChildGone $noReadyPid "native TLS no-readiness"
+
+        foreach ($badMode in @("bad", "bom")) {
+            $badReadyPid = Join-Path $workRoot "$badMode-ready-child.pid"
+            $badReadySignal = Join-Path $workRoot "$badMode-invalid-ready.pid"
+            $recordedChildren.Add($badReadyPid)
+            $badReadyRejected = $false
+            $badReadyFailure = "no rejection"
+            try { [void](Invoke-KuTlsBoundedProcess ([string]$python.Source) @("-c", $timeoutProgram, $badReadyPid, $badReadySignal, $badMode) $workRoot $workRoot "$badMode-ready" 2000 -SelfTestReadinessPidPath $badReadySignal) }
+            catch {
+                $badReadyFailure = $_.Exception.Message
+                $badReadyRejected = $badReadyFailure -like "*self-test readiness failed:*readiness PID*" -and $badReadyFailure -notlike "*self-test cleanup failed*"
+            }
+            if (-not $badReadyRejected) { throw "native TLS invalid-readiness self-test did not reject $badMode PID ($badReadyFailure)" }
+            Assert-KuTlsSelfTestChildGone $badReadyPid "native TLS invalid-readiness $badMode"
+        }
+
+        $earlyExitSignal = Join-Path $workRoot "early-exit.pid"
+        $earlyExitRejected = $false
+        try { [void](Invoke-KuTlsBoundedProcess ([string]$python.Source) @("-c", "import sys; sys.exit(0)") $workRoot $workRoot "early-exit" 2000 -SelfTestReadinessPidPath $earlyExitSignal) }
+        catch { $earlyExitRejected = $_.Exception.Message -like "*self-test readiness failed:*fixture exited before publishing readiness*" -and $_.Exception.Message -notlike "*self-test cleanup failed*" }
+        if (-not $earlyExitRejected -or (Test-Path -LiteralPath $earlyExitSignal)) {
+            throw "native TLS early-exit self-test did not report the missing fixture"
+        }
     }
+    catch { $primaryFailure = $_; throw }
     finally {
-        Remove-KuTlsPrivateRoot $workRoot $temporaryRoot ".ku-tls-process-selftest-" $owner
+        $cleanupProblems = [Collections.Generic.List[string]]::new()
+        foreach ($recordedPid in $recordedChildren) {
+            try {
+                if (Test-Path -LiteralPath $recordedPid) { Assert-KuTlsSelfTestChildGone $recordedPid "native TLS final cleanup" }
+            }
+            catch { $cleanupProblems.Add("${recordedPid}: $($_.Exception.Message)") }
+        }
+        if ($cleanupProblems.Count -eq 0) {
+            try { Remove-KuTlsPrivateRoot $workRoot $temporaryRoot ".ku-tls-process-selftest-" $owner }
+            catch { $cleanupProblems.Add("private-root cleanup: $($_.Exception.Message)") }
+        }
+        if ($cleanupProblems.Count -ne 0) {
+            $cleanupMessage = "native TLS self-test cleanup failed: " + ($cleanupProblems -join "; ")
+            if ($null -ne $primaryFailure) {
+                throw [InvalidOperationException]::new($primaryFailure.Exception.Message + "; " + $cleanupMessage, $primaryFailure.Exception)
+            }
+            throw $cleanupMessage
+        }
     }
     if (Test-Path -LiteralPath $workRoot) {
         throw "native TLS process self-test root could not be removed immediately"
@@ -988,7 +1327,7 @@ function Invoke-KuTlsProcessSelfTest {
             throw "native TLS cleanup self-test could not retry an authenticated tree"
         }
     }
-    Write-Output "native TLS process self-test ok: orphan, output-budget, timeout, and retryable cleanup"
+    Write-Output "native TLS process self-test ok: orphan, output-budget, fixed 2000-ms startup/ready timeout, bounded invalid/missing readiness, early exit, and retryable cleanup"
 }
 
 $kuTlsScriptRoot = Split-Path -Parent $PSCommandPath
