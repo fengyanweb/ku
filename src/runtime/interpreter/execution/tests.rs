@@ -3,6 +3,7 @@ use super::*;
 mod borrowed_string;
 mod chunk;
 mod code_handle;
+mod owned_result_finally;
 mod owned_result_string;
 mod owned_string;
 mod windows;

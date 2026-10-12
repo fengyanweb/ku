@@ -573,8 +573,6 @@ fn unsupported_result_string_trees_and_other_selectors_leave_inputs_unmoved() {
         "fn Pass(value: str!): str! { return value }\nfn Entry(text: str): str! { return Pass(ok(text)) }",
         "fn Leaf(text: str): str! { return ok(text) }\nfn Entry(text: str): str! { return ok(Leaf(text)?) }",
         "fn Entry(text: str): str! { return err(text) }",
-        "fn Entry(text: str): str! { try { marker = 1 } finally { marker = 2 }\nreturn ok(text) }",
-        "fn Leaf(text: str): str! { try { marker = 1 } finally { marker = 2 }\nreturn ok(text) }\nfn Entry(text: str): str! { return Leaf(text) }",
         "fn Entry(text: str): str! { try { marker = 1 } catch (e) { marker = 2 }\nreturn ok(text) }",
         "fn Read(&text: str): int { return text.len() }\nfn Entry(text: str): str! { length = Read(text)\nreturn ok(text) }",
         "fn Entry(text: str): str! { fn Local(value: str): str! { return ok(value) }\nreturn Local(text) }",
@@ -705,4 +703,28 @@ fn Entry(text: str): str! { return ok(Keep(text)) }
     );
     assert_owned_drained(&machine);
     assert_eq!(host.call_depth, 0);
+}
+
+#[test]
+fn result_string_no_catch_finally_in_root_or_dependency_preserves_buffer() {
+    for source in [
+        "fn Entry(text: str): str! { try { marker = 1 } finally { marker = 2 }\nreturn ok(text) }",
+        "fn Leaf(text: str): str! { try { marker = 1 } finally { marker = 2 }\nreturn ok(text) }\nfn Entry(text: str): str! { return Leaf(text) }",
+    ] {
+        let source_functions = functions(source);
+        assert!(code::eligible_owned_named(&source_functions, &source_functions["Entry"], Limits::default()));
+        let mut machine = machine(source, "Entry", Limits::default());
+        let mut host = production_interpreter(source);
+        let (mut args, pointer, capacity) = input(0);
+        args.pop();
+        machine.start_owned_once("Entry", &mut args, 0, false).unwrap();
+        let result = finish(&mut machine, &mut host, 1, pointer, capacity).unwrap();
+        check_result(&result, pointer, capacity);
+        assert_eq!(machine.metrics.entered_finally_frames, 1);
+        assert_eq!(machine.metrics.retired_finally_frames, 1);
+        assert_eq!(machine.metrics.peak_string_payload_bytes, capacity);
+        assert_eq!(machine.metrics.peak_result_wrapper_capacity, 1);
+        assert_owned_drained(&machine);
+        assert_eq!(host.call_depth, 0);
+    }
 }

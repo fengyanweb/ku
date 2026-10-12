@@ -107,10 +107,10 @@ struct Metrics {
     lease_roots_created: usize,
     logical_depth: usize,
     // Source execution frame Vec backing only: calls/work/finally/values and
-    // staged arguments, selected input String buffers and the admitted sole
-    // Result<String> Box<Value>. Other Value/Error payloads remain outside
-    // this budget, as do syntax storage,
-    // source, Env/string keys and allocator overhead. Summed peaks are not a
+    // staged arguments, selected input String buffers and admitted
+    // Result<String> Box<Value> payloads. Other Value/Error payloads remain
+    // outside this budget, as do syntax storage, source, Env/string keys and
+    // allocator overhead. Summed peaks are not a
     // simultaneous RSS sample.
     retained_backing_bytes: usize,
     peak_backing_bytes_upper_bound: usize,
@@ -648,8 +648,8 @@ struct Machine {
     // moves between slots and is conservatively charged until final transfer.
     string_payload_bytes: usize,
     peak_string_payload_bytes: usize,
-    // A strict Result<String> tree constructs one actual Box<Value>, then
-    // moves that sole return through frames. No per-relay box or charge.
+    // Each direct ok(String) owns one actual Box<Value>. Saved finally
+    // primaries and replacements can coexist; relay moves create no box.
     result_wrapper_capacity: usize,
     result_wrapper_bytes: usize,
     peak_result_wrapper_capacity: usize,
@@ -2895,14 +2895,22 @@ impl Machine {
                 let span = self.code.span(span_id);
                 let value = self.value();
                 if owned_string {
-                    if !matches!(value, Value::String(_)) || self.result_wrapper_capacity != 0 {
+                    if !matches!(value, Value::String(_)) {
                         return Err(unsupported(span));
                     }
                     // The operand already followed its original evaluation
-                    // and move order. Admit both the actual Box backing and
-                    // the outgoing Value slot before constructing that Box.
-                    self.result_wrapper_capacity = 1;
-                    self.result_wrapper_bytes = std::mem::size_of::<Value>();
+                    // and move order. A saved finally primary can still own
+                    // its Box while this replacement is being constructed.
+                    let previous_count = self.result_wrapper_capacity;
+                    let previous_bytes = self.result_wrapper_bytes;
+                    let count = previous_count
+                        .checked_add(1)
+                        .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+                    let bytes = previous_bytes
+                        .checked_add(std::mem::size_of::<Value>())
+                        .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+                    self.result_wrapper_capacity = count;
+                    self.result_wrapper_bytes = bytes;
                     // Existing Vec backing remains retained after popping
                     // the operand. Check its full capacity together with the
                     // new Box before reserving the outgoing element.
@@ -2910,17 +2918,18 @@ impl Machine {
                         .check_argument_capacity(0, span)
                         .and_then(|_| self.reserve_values(1, span))
                     {
-                        self.result_wrapper_capacity = 0;
-                        self.result_wrapper_bytes = 0;
+                        // Only the unallocated candidate is rolled back.
+                        // Existing saved primaries retain their real charge.
+                        self.result_wrapper_capacity = previous_count;
+                        self.result_wrapper_bytes = previous_bytes;
                         return Err(error);
                     }
                     // Standard Box allocation keeps the original global OOM
                     // behavior; this backing budget is not OOM recovery.
                     let value = Box::new(value);
-                    self.peak_result_wrapper_capacity = self.peak_result_wrapper_capacity.max(1);
-                    self.peak_result_wrapper_bytes = self
-                        .peak_result_wrapper_bytes
-                        .max(std::mem::size_of::<Value>());
+                    self.peak_result_wrapper_capacity =
+                        self.peak_result_wrapper_capacity.max(count);
+                    self.peak_result_wrapper_bytes = self.peak_result_wrapper_bytes.max(bytes);
                     push(&mut self.values, Value::Result { ok: true, value });
                 } else {
                     // Original scalar Result roots retain their old operand
@@ -3791,8 +3800,8 @@ impl Machine {
         self.metrics.logical_depth = self.call_depth;
         assert_eq!(self.call_depth, self.initial_depth);
         let result = self.pending.take().expect("root call or admission outcome");
-        // The sole Box has actually moved into this outgoing Flow, or was
-        // already destroyed by real arbitration. It is no longer retained.
+        // The outgoing Box actually moves into this Flow. All saved finally
+        // primaries/replacements have already settled or been destroyed.
         self.result_wrapper_capacity = 0;
         self.result_wrapper_bytes = 0;
         self.metrics.retained_result_wrapper_capacity = 0;
@@ -3845,10 +3854,12 @@ impl Machine {
         if self.result_wrapper_capacity == 0 {
             return;
         }
-        // Admission forbids Result locals, parameters, captures, arguments
-        // and finally in Result-bearing functions. At a dispatch boundary the
-        // sole wrapper can only be an operand or the current outgoing primary.
-        // These reads neither allocate nor clone its owned String or Box.
+        // Admission forbids Result locals, parameters, captures and
+        // arguments. At a dispatch boundary each actual wrapper belongs to
+        // an operand, outgoing primary or saved FinallyFrame primary. Native
+        // unwind has already dropped operation-local primaries/replacements
+        // before the same scan runs in the outer catch. These reads neither
+        // allocate nor clone an owned String or Box.
         let value_has_wrapper = |value: &Value| matches!(value, Value::Result { value, .. } if matches!(value.as_ref(), Value::String(_)));
         let flow_has_wrapper = |result: &KuResult<Flow>| {
             matches!(result, Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })
@@ -3867,10 +3878,26 @@ impl Machine {
             .iter()
             .filter(|exit| exit.state.outcome().is_some_and(flow_has_wrapper))
             .count();
-        let retained = operands + pending + exits;
-        assert!(retained <= 1, "strict Result return retains one actual Box");
+        let primaries = self
+            .finally
+            .frames
+            .as_slice()
+            .iter()
+            .filter(|frame| frame.primary.as_ref().is_some_and(flow_has_wrapper))
+            .count();
+        // Each observed owner was admitted against the original finite value
+        // budget before its Box was constructed. Checked totals make that
+        // invariant explicit, without a saturating or guessed charge.
+        let retained = operands
+            .checked_add(pending)
+            .and_then(|count| count.checked_add(exits))
+            .and_then(|count| count.checked_add(primaries))
+            .expect("admitted Result wrapper count");
+        let bytes = retained
+            .checked_mul(std::mem::size_of::<Value>())
+            .expect("admitted Result wrapper backing");
         self.result_wrapper_capacity = retained;
-        self.result_wrapper_bytes = retained * std::mem::size_of::<Value>();
+        self.result_wrapper_bytes = bytes;
         self.metrics.retained_result_wrapper_capacity = self.result_wrapper_capacity;
         self.metrics.retained_result_wrapper_bytes = self.result_wrapper_bytes;
         self.metrics.peak_result_wrapper_capacity = self.peak_result_wrapper_capacity;

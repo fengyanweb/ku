@@ -1743,7 +1743,7 @@ impl<'a> Builder<'a> {
                 finally_body,
                 ..
             } => {
-                if spec.owns_result_string() || catch_name.is_some() || !catch_body.is_empty() {
+                if catch_name.is_some() || !catch_body.is_empty() {
                     return Err(AdmissionError::Unsupported(span));
                 }
                 let base = self.bound.len();
@@ -2106,10 +2106,7 @@ impl<'a> Eligibility<'a> {
                                 finally_body,
                                 ..
                             } => {
-                                if spec.owns_result_string()
-                                    || catch_name.is_some()
-                                    || !catch_body.is_empty()
-                                {
+                                if catch_name.is_some() || !catch_body.is_empty() {
                                     return Err(AdmissionError::Unsupported(span));
                                 }
                                 let base = self.bound.len();
