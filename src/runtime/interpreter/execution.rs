@@ -1,7 +1,9 @@
 //! Flat, bounded interpreter call/return continuations.
 //!
 //! The production slice admits a complete static scalar call tree before any
-//! body effects. Once admitted, every nested call stays in this dispatch loop.
+//! body effects, including terminal scalar Result roots. An async root enters
+//! only after its Task is claimed; static dependencies remain synchronous.
+//! Once admitted, every nested call stays in this dispatch loop.
 //! Scope, call, argument and scalar finally exits use the evaluator's real
 //! resource arbitration.
 //! Other language constructs keep their existing evaluator; Owned, borrows,
@@ -368,6 +370,7 @@ enum Work {
     Bind(SymbolId, bool, bool, SpanId),
     Discard,
     Return,
+    WrapTerminalOk(SpanId),
     TryExit(usize),
     FinallyExit(usize),
     ScopeExit {
@@ -999,6 +1002,11 @@ impl Machine {
                         push(&mut self.work, Work::Unary(op, expr.span));
                         push(&mut self.work, Work::Eval(operand));
                     }
+                    ExprCode::TerminalOk(operand) => {
+                        self.reserve_work(2, span)?;
+                        push(&mut self.work, Work::WrapTerminalOk(expr.span));
+                        push(&mut self.work, Work::Eval(operand));
+                    }
                     ExprCode::Binary(left, op, right) => {
                         self.reserve_work(2, span)?;
                         push(&mut self.work, Work::BinaryLeft(op, right, expr.span));
@@ -1170,6 +1178,21 @@ impl Machine {
             Work::Return => {
                 let value = self.value();
                 self.pending = Some(Ok(Flow::returned(value)));
+            }
+            Work::WrapTerminalOk(span_id) => {
+                let span = self.code.span(span_id);
+                let value = self.value();
+                // Admission allows this only in a Result root's terminal
+                // return, with a scalar operand. Result itself never becomes
+                // a copyable local, argument or nested scalar expression.
+                scalar(&value, span)?;
+                self.emit(
+                    Value::Result {
+                        ok: true,
+                        value: Box::new(value),
+                    },
+                    span,
+                )?;
             }
             Work::PrepareArguments {
                 function,
@@ -1833,6 +1856,98 @@ pub(super) fn try_execute_function_value(
     // clone any Value payload; actual per-call scopes still exit through hooks.
     machine.captures = Some(call.captures.clone());
     Some(machine.run_with_hooks(name, &call.args, call.depth, false, interpreter))
+}
+
+// Created only by the already-claimed Task's Send factory. The runner and its
+// owned Machine stay on that claimant thread beneath the original job catch.
+// More still continues immediately; this does not yet suspend an awaited Task.
+pub(super) struct ClaimedNamedTask {
+    // Preserve the execution prefix's Drop before its Interpreter host.
+    machine: Option<Machine>,
+    interpreter: Interpreter,
+    legacy: Option<(FnDecl, Vec<Value>)>,
+    outcome: Option<KuResult<Value>>,
+    span: Span,
+    task_id: i64,
+    finished: bool,
+}
+
+impl ClaimedNamedTask {
+    pub(super) fn new(
+        interpreter: Interpreter,
+        function: FnDecl,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Self {
+        let task_id = crate::runtime::task::current_task_id();
+        let mut runner = Self {
+            machine: None,
+            interpreter,
+            legacy: Some((function, args)),
+            outcome: None,
+            span,
+            task_id,
+            finished: false,
+        };
+        let (function, args) = runner.legacy.as_ref().expect("initial named task body");
+        let limits = Limits::default();
+        let source = runner.interpreter.functions.clone();
+        if args.iter().any(|value| scalar(value, span).is_err())
+            || !code::eligible_claimed_async_entry(&source, function, limits)
+        {
+            return runner;
+        }
+        let code = match CodeHandle::compile_claimed_async_entry(&source, function, limits) {
+            Ok(code) => code,
+            Err(AdmissionError::Unsupported(_)) => return runner,
+            Err(error @ AdmissionError::Rejected(_)) => {
+                runner.outcome = Some(Err(error.into_error()));
+                drop(runner.legacy.take());
+                return runner;
+            }
+        };
+        let mut machine = Machine::from_code(code, limits, runner.interpreter.call_depth);
+        if let Err(error) = machine.start_once(&function.name, args, 0, false) {
+            runner.outcome = Some(Err(error));
+        }
+        runner.machine = Some(machine);
+        // The admitted parameters are Copy scalars. No AST or borrowed source
+        // remains in the Machine, and no Owned argument is implicitly cloned.
+        drop(runner.legacy.take());
+        runner
+    }
+}
+
+impl crate::runtime::task::LocalTaskRunner for ClaimedNamedTask {
+    fn dispatch(&mut self, budget: NonZeroUsize) -> std::ops::ControlFlow<KuResult<Value>> {
+        assert!(!self.finished, "a finished named task runner cannot resume");
+        assert_eq!(
+            crate::runtime::task::current_task_id(),
+            self.task_id,
+            "named task resumes on its original Task"
+        );
+        let result = if let Some(outcome) = self.outcome.take() {
+            outcome
+        } else if let Some(machine) = &mut self.machine {
+            match machine.dispatch_chunk(budget, &mut self.interpreter) {
+                Ok(ChunkProgress::More { popped }) => {
+                    debug_assert_eq!(popped, budget.get());
+                    return std::ops::ControlFlow::Continue(());
+                }
+                Ok(ChunkProgress::Finished { popped, result }) => {
+                    debug_assert!(popped <= budget.get());
+                    result.and_then(|flow| flow.into_call_value(self.span, "function"))
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            let (function, args) = self.legacy.take().expect("one legacy task call");
+            self.interpreter
+                .call_function_direct(function, args, self.span, 0)
+        };
+        self.finished = true;
+        std::ops::ControlFlow::Break(result)
+    }
 }
 
 // Same-thread dispatch windows and the machine's original resource drop prefix.

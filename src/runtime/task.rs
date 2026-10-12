@@ -31,6 +31,10 @@ mod cancel_batch_tests;
 mod cleanup_panic_tests;
 #[cfg(test)]
 mod help_panic_tests;
+mod runner;
+pub(crate) use runner::{LocalTaskRunner, OnceTaskRunner};
+#[cfg(test)]
+mod runner_tests;
 #[cfg(test)]
 mod submission_panic_tests;
 pub(crate) use cancellation::{
@@ -738,6 +742,21 @@ impl TaskRuntime {
             std::panic::resume_unwind(first_panic.expect("producer owns its first panic"));
         }
         Ok(handle)
+    }
+
+    pub(crate) fn spawn_runner_deferred<B, F, R>(&self, build: B) -> KuResult<TaskHandle>
+    where
+        B: FnOnce() -> F,
+        F: FnOnce() -> R + Send + 'static,
+        R: LocalTaskRunner + 'static,
+    {
+        // Only the Send factory enters pending_run. The existing claimant
+        // installs Task identity before calling it; its !Send runner never
+        // enters a shared mutex, another worker, or the submission queue.
+        self.spawn_deferred(|| {
+            let factory = build();
+            move || runner::drive_local(factory())
+        })
     }
 
     pub(crate) fn has_task_submissions(&self) -> bool {

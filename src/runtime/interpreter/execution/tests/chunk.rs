@@ -1,5 +1,7 @@
 use super::*;
 
+mod result_entry;
+
 #[derive(Debug, PartialEq, Eq)]
 enum Event {
     Tick(Span),

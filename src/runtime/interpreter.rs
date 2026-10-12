@@ -420,12 +420,12 @@ impl Interpreter {
             .clone()
             .ok_or_else(|| KuError::runtime("async task runtime is not initialized", span))?;
         let child_runtime = runtime.clone();
-        let task = runtime.spawn_deferred(|| {
+        let task = runtime.spawn_runner_deferred(|| {
             let template = self.template();
             move || {
                 let mut interpreter = Interpreter::from_template(template, child_runtime);
                 interpreter.async_execution = true;
-                interpreter.call_function_direct(function, args, span, 0)
+                execution::ClaimedNamedTask::new(interpreter, function, args, span)
             }
         })?;
         Ok(Value::Task(task))
@@ -490,22 +490,26 @@ impl Interpreter {
             let self_name = call.self_name.clone();
             let args = call.args;
             let span = call.span;
-            let task = runtime.spawn(move || {
-                let mut interpreter = Interpreter::from_template(template, child_runtime);
-                interpreter.call_function_value_direct(
-                    FunctionValueCall {
-                        params: &params,
-                        param_modes: &param_modes,
-                        body: &body,
-                        captures: &captures,
-                        self_name: &self_name,
-                        is_async: true,
-                        args,
-                        span,
-                        depth: 0,
-                    },
-                    true,
-                )
+            let task = runtime.spawn_runner_deferred(|| {
+                move || {
+                    let mut interpreter = Interpreter::from_template(template, child_runtime);
+                    crate::runtime::task::OnceTaskRunner::new(move || {
+                        interpreter.call_function_value_direct(
+                            FunctionValueCall {
+                                params: &params,
+                                param_modes: &param_modes,
+                                body: &body,
+                                captures: &captures,
+                                self_name: &self_name,
+                                is_async: true,
+                                args,
+                                span,
+                                depth: 0,
+                            },
+                            true,
+                        )
+                    })
+                }
             })?;
             return Ok(Flow::returned(Value::Task(task)));
         }

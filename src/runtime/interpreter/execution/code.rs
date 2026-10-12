@@ -1,4 +1,4 @@
-//! Owned, flat syntax for the admitted synchronous scalar slice.
+//! Owned, flat syntax for scalar trees and terminal scalar Result entries.
 //!
 //! AST references exist only in the bounded builder. Arena edges are numeric
 //! IDs, so neither recursive syntax cloning nor recursive arena destruction is
@@ -79,6 +79,9 @@ pub(super) enum ExprCode {
     Variable(SymbolId),
     Unary(UnaryOp, ExprId),
     Binary(ExprId, BinaryOp, ExprId),
+    // Only a Result root's direct return can construct this builtin call.
+    // Its span is the original ok Call span; its operand stays scalar.
+    TerminalOk(ExprId),
     Call {
         function: FnId,
         args: ExprRange,
@@ -164,7 +167,17 @@ pub(super) fn eligible_named(
     limits: Limits,
 ) -> bool {
     Eligibility::new(source, None, limits)
-        .check(FunctionSpec::named(entry))
+        .check(FunctionSpec::named_root(entry))
+        .is_ok()
+}
+
+pub(super) fn eligible_claimed_async_entry(
+    source: &HashMap<String, FnDecl>,
+    entry: &FnDecl,
+    limits: Limits,
+) -> bool {
+    Eligibility::new(source, None, limits)
+        .check(FunctionSpec::claimed_async_entry(entry))
         .is_ok()
 }
 
@@ -183,6 +196,7 @@ pub(super) fn eligible_local(
             body: call.body,
             span: call.span,
             declaration: None,
+            role: FunctionRole::Scalar,
         })
         .is_ok()
 }
@@ -220,7 +234,15 @@ impl CodeHandle {
         entry: &FnDecl,
         limits: Limits,
     ) -> Admission<Self> {
-        Builder::new(source, None, limits).compile(Some(FunctionSpec::named(entry)))
+        Builder::new(source, None, limits).compile(Some(FunctionSpec::named_root(entry)))
+    }
+
+    pub(super) fn compile_claimed_async_entry(
+        source: &HashMap<String, FnDecl>,
+        entry: &FnDecl,
+        limits: Limits,
+    ) -> Admission<Self> {
+        Builder::new(source, None, limits).compile(Some(FunctionSpec::claimed_async_entry(entry)))
     }
 
     #[cfg(test)]
@@ -253,6 +275,7 @@ impl CodeHandle {
             body: call.body,
             span: call.span,
             declaration: None,
+            role: FunctionRole::Scalar,
         };
         Builder::new(source, Some((name, call.captures)), limits).compile(Some(spec))
     }
@@ -379,12 +402,20 @@ enum Parameters<'a> {
 }
 
 #[derive(Clone, Copy)]
+enum FunctionRole {
+    Scalar,
+    ResultRoot,
+    ClaimedAsyncResultRoot,
+}
+
+#[derive(Clone, Copy)]
 struct FunctionSpec<'a> {
     name: &'a str,
     params: Parameters<'a>,
     body: &'a [Stmt],
     span: Span,
     declaration: Option<&'a FnDecl>,
+    role: FunctionRole,
 }
 
 impl<'a> FunctionSpec<'a> {
@@ -395,8 +426,80 @@ impl<'a> FunctionSpec<'a> {
             body: &function.body,
             span: function.span,
             declaration: Some(function),
+            role: FunctionRole::Scalar,
         }
     }
+
+    fn named_root(function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        if scalar_result_type(&function.return_type) {
+            spec.role = FunctionRole::ResultRoot;
+        }
+        spec
+    }
+
+    fn claimed_async_entry(function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        spec.role = FunctionRole::ClaimedAsyncResultRoot;
+        spec
+    }
+
+    fn is_result_root(self) -> bool {
+        matches!(
+            self.role,
+            FunctionRole::ResultRoot | FunctionRole::ClaimedAsyncResultRoot
+        )
+    }
+
+    fn validate(self) -> Admission<()> {
+        let Some(function) = self.declaration else {
+            return Ok(());
+        };
+        let return_supported = match self.role {
+            FunctionRole::Scalar => !function.is_async && scalar_type(&function.return_type),
+            FunctionRole::ResultRoot => {
+                !function.is_async && scalar_result_type(&function.return_type)
+            }
+            FunctionRole::ClaimedAsyncResultRoot => {
+                function.is_async && scalar_result_type(&function.return_type)
+            }
+        };
+        if !function.type_params.is_empty() || !return_supported {
+            return Err(AdmissionError::Unsupported(self.span));
+        }
+        for param in &function.params {
+            if param.mode != ParamMode::Owned || !scalar_type(&param.ty) {
+                return Err(AdmissionError::Unsupported(param.span));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn scalar_result_type(ty: &Option<TypeName>) -> bool {
+    matches!(
+        ty,
+        Some(TypeName::Result(inner))
+            if matches!(inner.as_ref(), TypeName::Int | TypeName::Float | TypeName::Bool | TypeName::Null)
+    )
+}
+
+fn terminal_ok_argument<'a>(
+    expr: &'a Expr,
+    source: &HashMap<String, FnDecl>,
+    shadowed: bool,
+) -> Admission<&'a Expr> {
+    let ExprKind::Call { callee, args } = &expr.kind else {
+        return Err(AdmissionError::Unsupported(expr.span));
+    };
+    if !matches!(&callee.kind, ExprKind::Variable(name) if name == "ok")
+        || args.len() != 1
+        || source.contains_key("ok")
+        || shadowed
+    {
+        return Err(AdmissionError::Unsupported(expr.span));
+    }
+    Ok(&args[0])
 }
 
 enum Visit<'a> {
@@ -553,19 +656,14 @@ impl<'a> Builder<'a> {
     }
 
     fn ensure_function(&mut self, spec: FunctionSpec<'a>) -> Admission<FnId> {
+        // Validate the requested role before a cached root ID can be reused as
+        // a dependency. Result/async roots never become scalar static callees.
+        spec.validate()?;
         for index in 0..self.arena.functions.len() {
             self.spend(spec.name.len().saturating_add(1), spec.span)?;
             let function = self.arena.functions.get(index).expect("function slot");
             if self.arena.symbol(function.name) == spec.name {
                 return Ok(FnId(index));
-            }
-        }
-        if let Some(function) = spec.declaration {
-            if function.is_async
-                || !function.type_params.is_empty()
-                || !scalar_type(&function.return_type)
-            {
-                return Err(AdmissionError::Unsupported(spec.span));
             }
         }
         let name = self.symbol(spec.name, spec.span)?;
@@ -601,6 +699,28 @@ impl<'a> Builder<'a> {
             .expect("one expression");
         reserve_field!(self, pending, 1, expr.span);
         push(&mut self.pending, Visit::Expr(expr, id));
+        Ok(id)
+    }
+
+    fn terminal_ok(&mut self, expr: &'a Expr) -> Admission<ExprId> {
+        let argument = terminal_ok_argument(expr, self.source, self.is_bound("ok"))?;
+        // This direct lowering replaces the ordinary visit of the ok Call;
+        // charge that syntax step without storing a second visit buffer.
+        self.spend(1, expr.span)?;
+        let id = self
+            .expressions(1, expr.span)?
+            .get(0)
+            .expect("ok expression");
+        let span = self.span(expr.span)?;
+        let operand = self.expression(argument)?;
+        *self
+            .arena
+            .expressions
+            .get_mut(id.0)
+            .expect("terminal ok expression slot") = CodeExpr {
+            kind: ExprCode::TerminalOk(operand),
+            span,
+        };
         Ok(id)
     }
 
@@ -716,7 +836,7 @@ impl<'a> Builder<'a> {
             function.body = body;
             while let Some(visit) = self.pending.pop() {
                 self.spend(1, spec.span)?;
-                self.visit(visit)?;
+                self.visit(visit, spec.is_result_root())?;
             }
         }
         self.arena.construction_peak_backing_bytes_upper_bound = owner_bytes()
@@ -738,7 +858,7 @@ impl<'a> Builder<'a> {
         Ok(CodeHandle(Arc::new(self.arena)))
     }
 
-    fn visit(&mut self, visit: Visit<'a>) -> Admission<()> {
+    fn visit(&mut self, visit: Visit<'a>, result_root: bool) -> Admission<()> {
         match visit {
             Visit::Block {
                 body,
@@ -764,7 +884,7 @@ impl<'a> Builder<'a> {
                     },
                 );
                 let span_id = self.span(span)?;
-                let kind = self.statement(stmt)?;
+                let kind = self.statement(stmt, result_root)?;
                 let block = self.arena.blocks.get(id.0).expect("block slot");
                 *self
                     .arena
@@ -855,7 +975,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn statement(&mut self, stmt: &'a Stmt) -> Admission<StmtCode> {
+    fn statement(&mut self, stmt: &'a Stmt, result_root: bool) -> Admission<StmtCode> {
         let span = stmt_span(stmt);
         if self.local.is_some_and(|(self_name, _)| matches!(stmt,
             Stmt::VarDecl { name, .. } | Stmt::Assign { name, .. } | Stmt::For { name, .. } if name == self_name)) {
@@ -928,12 +1048,18 @@ impl<'a> Builder<'a> {
                 let finally = self.block(finally_body, base)?;
                 StmtCode::Try(self.block(body, base)?, finally)
             }
-            Stmt::Return { value, .. } => StmtCode::Return(
-                value
-                    .as_ref()
-                    .map(|value| self.expression(value))
-                    .transpose()?,
-            ),
+            Stmt::Return { value, .. } => {
+                let value = if result_root {
+                    let value = value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
+                    Some(self.terminal_ok(value)?)
+                } else {
+                    value
+                        .as_ref()
+                        .map(|value| self.expression(value))
+                        .transpose()?
+                };
+                StmtCode::Return(value)
+            }
             Stmt::Expr { expr, .. } => StmtCode::Expr(self.expression(expr)?),
             _ => return Err(AdmissionError::Unsupported(span)),
         })
@@ -1015,20 +1141,11 @@ impl<'a> Eligibility<'a> {
         Ok(())
     }
     fn function(&mut self, spec: FunctionSpec<'a>) -> Admission<()> {
+        // A previously checked Result root cannot bypass the scalar dependency
+        // contract merely because its name is already in this bounded cache.
+        spec.validate()?;
         if self.checked.as_slice().contains(&spec.name) {
             return Ok(());
-        }
-        if let Some(function) = spec.declaration {
-            if function.is_async
-                || !function.type_params.is_empty()
-                || !scalar_type(&function.return_type)
-                || function
-                    .params
-                    .iter()
-                    .any(|param| param.mode != ParamMode::Owned || !scalar_type(&param.ty))
-            {
-                return Err(AdmissionError::Unsupported(spec.span));
-            }
         }
         reserve_field!(self, checked, 1, spec.span);
         push(&mut self.checked, spec.name);
@@ -1117,7 +1234,14 @@ impl<'a> Eligibility<'a> {
                                 self.expression(value)?;
                             }
                             Stmt::Return { value, .. } => {
-                                if let Some(value) = value {
+                                if spec.is_result_root() {
+                                    let value =
+                                        value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
+                                    let argument =
+                                        terminal_ok_argument(value, self.source, self.bound("ok"))?;
+                                    self.spend(1, value.span)?;
+                                    self.expression(argument)?;
+                                } else if let Some(value) = value {
                                     self.expression(value)?;
                                 }
                             }
