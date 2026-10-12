@@ -74,6 +74,12 @@ const SUBMISSION_PENDING: u8 = 0;
 const SUBMISSION_ACCEPTED: u8 = 1;
 const SUBMISSION_PRODUCER_RETIRED: u8 = 2;
 
+// The same atomic word linearizes producer admission with global shutdown.
+// Closing is monotonic; the remaining bits count actual admitted submission
+// stacks, independently of active task/queue/registry accounting.
+const PRODUCER_CLOSED_BIT: usize = 1usize << (usize::BITS - 1);
+const PRODUCER_COUNT_MASK: usize = PRODUCER_CLOSED_BIT - 1;
+
 thread_local! {
     static CURRENT_TASK_ID: Cell<i64> = const { Cell::new(0) };
     static CURRENT_TASK_STATE: RefCell<Option<Weak<TaskState>>> = const { RefCell::new(None) };
@@ -317,6 +323,7 @@ struct TaskRuntimeInner {
     states: Mutex<HashMap<i64, Weak<TaskState>>>,
     wait_edges: Mutex<HashMap<i64, i64>>,
     active_tasks: AtomicUsize,
+    producer_gate: AtomicUsize,
     queued_tasks: AtomicUsize,
     queued_blocking_jobs: AtomicUsize,
     running_blocking_jobs: AtomicUsize,
@@ -337,6 +344,67 @@ struct TaskRuntimeInner {
     blocking_queue_limit: usize,
     task_workers: AtomicUsize,
     blocking_workers: AtomicUsize,
+}
+
+impl TaskRuntimeInner {
+    fn producer_count(&self) -> usize {
+        self.producer_gate.load(Ordering::Acquire) & PRODUCER_COUNT_MASK
+    }
+}
+
+// This admission owner stays outside the entire producer catch boundary.
+// It owns only a primitive responsibility, never a Task lease or user payload.
+// The enum retains that guard in its original, earliest local drop scope;
+// extracting it into a later local would retire before an early build Drop.
+enum ProducerAdmission<'a> {
+    Admitted {
+        _responsibility: ProducerResponsibility<'a>,
+    },
+    Closed,
+    Overflow,
+}
+
+impl<'a> ProducerAdmission<'a> {
+    fn begin(gate: &'a AtomicUsize) -> Self {
+        match gate.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            if current & PRODUCER_CLOSED_BIT != 0 {
+                None
+            } else {
+                current
+                    .checked_add(1)
+                    .filter(|next| *next & PRODUCER_CLOSED_BIT == 0)
+            }
+        }) {
+            Ok(_) => Self::Admitted {
+                _responsibility: ProducerResponsibility { gate },
+            },
+            Err(current) if current & PRODUCER_CLOSED_BIT != 0 => Self::Closed,
+            Err(_) => Self::Overflow,
+        }
+    }
+}
+
+struct ProducerResponsibility<'a> {
+    gate: &'a AtomicUsize,
+}
+
+impl Drop for ProducerResponsibility<'_> {
+    fn drop(&mut self) {
+        // Last in the real submission stack, after captures, rollback, per-state
+        // publication and native catch/drop(handle). No callback or new wait.
+        // Exactly one admitted guard owns this decrement; subtraction preserves
+        // the monotonic high closing bit, including the final retired producer.
+        self.gate.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn tighten_current_cleanup(mut context: CancellationContext) -> CancellationContext {
+    if let Some(actual) = current_cleanup_context() {
+        context.cleanup_deadline = context.cleanup_deadline.min(actual.cleanup_deadline);
+    }
+    // Keep the first reason supplied by the caller; only real TLS feedback
+    // tightens the same absolute D, without creating another grace interval.
+    context
 }
 
 enum TaskRegistration {
@@ -850,6 +918,7 @@ impl TaskRuntime {
             states: Mutex::new(HashMap::new()),
             wait_edges: Mutex::new(HashMap::new()),
             active_tasks: AtomicUsize::new(0),
+            producer_gate: AtomicUsize::new(0),
             queued_tasks: AtomicUsize::new(0),
             queued_blocking_jobs: AtomicUsize::new(0),
             running_blocking_jobs: AtomicUsize::new(0),
@@ -895,7 +964,18 @@ impl TaskRuntime {
     where
         B: FnOnce() -> TaskStart,
     {
+        let producer_admission = ProducerAdmission::begin(&self.inner.producer_gate);
+        // Parameters otherwise drop after all locals on an early `?`. Move the
+        // real constructor into this later local, so its unused captures retire
+        // before the earliest admission guard, including native field unwind.
+        let constructor = build;
         ensure_task_operations_allowed(Span::default())?;
+        if matches!(&producer_admission, ProducerAdmission::Overflow) {
+            return Err(KuError::runtime(
+                "internal task producer retirement counter overflow",
+                Span::default(),
+            ));
+        }
         self.inner.total_submissions.fetch_add(1, Ordering::Relaxed);
         let id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
         let state = Arc::new(TaskState {
@@ -933,14 +1013,15 @@ impl TaskRuntime {
         // dropped after the actual producer scope under its cleanup context.
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let mut producer = ProducerScope {
-                build: Some(build),
+                build: Some(constructor),
                 reservation: None,
                 retirement: ProducerRetirement {
                     state: Arc::clone(&state),
                     accepted: false,
                 },
             };
-            if self.inner.closing.load(Ordering::Acquire)
+            if matches!(&producer_admission, ProducerAdmission::Closed)
+                || self.inner.closing.load(Ordering::Acquire)
                 || self.inner.task_workers.load(Ordering::Acquire) == 0
             {
                 self.inner
@@ -1409,9 +1490,17 @@ impl TaskRuntime {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // Retain real Drop feedback across the batch even when the public
+        // cancel_all caller has no ambient cleanup context; restore it on exit.
+        let _cleanup = CleanupGuard::enter(context);
         states
             .into_iter()
-            .filter(|state| state.request_cancel_with(context))
+            .filter(|state| {
+                // An earlier real queued capture Drop can shorten the caller's
+                // TLS D. The next running or queued state receives that same
+                // tighter bound, with the original first cancellation reason.
+                state.request_cancel_with(tighten_current_cleanup(context))
+            })
             .count()
     }
 
@@ -1422,19 +1511,42 @@ impl TaskRuntime {
                 Span::default(),
             )
         })?;
+        // A real responsibility can finish while the cancellation snapshot
+        // blocks on its registry lock. Preserve having observed that work so a
+        // late last retirement cannot bypass the same absolute deadline.
+        let mut observed_outstanding = self.inner.producer_count() != 0
+            || self.inner.active_tasks.load(Ordering::Acquire) != 0
+            || self.inner.queued_blocking_jobs.load(Ordering::Acquire) != 0
+            || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0;
         self.inner.closing.store(true, Ordering::Release);
+        // Only the atomic close linearizes producer admission. An attempt
+        // that began earlier remains counted through its real final Drop;
+        // attempts after this point follow the old closing rejection without
+        // adding a responsibility to this shutdown's completed prefix.
+        let producers_at_close = self
+            .inner
+            .producer_gate
+            .fetch_or(PRODUCER_CLOSED_BIT, Ordering::AcqRel);
+        // Include admission between the initial observation and atomic close.
+        observed_outstanding |= producers_at_close & PRODUCER_COUNT_MASK != 0;
         let context = CancellationContext::new(TerminationReason::Cancelled);
-        let context = CancellationContext {
+        let mut context = CancellationContext {
             cleanup_deadline: context.cleanup_deadline.min(deadline),
             ..context
         };
         let _cleanup = CleanupGuard::enter(context);
         let cancelled = self.cancel_all_with(context);
-        while self.inner.active_tasks.load(Ordering::Acquire) != 0
-            || self.inner.queued_blocking_jobs.load(Ordering::Acquire) != 0
-            || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0
-        {
-            if Instant::now() >= context.cleanup_deadline {
+        context = tighten_current_cleanup(context);
+        loop {
+            let outstanding = self.inner.producer_count() != 0
+                || self.inner.active_tasks.load(Ordering::Acquire) != 0
+                || self.inner.queued_blocking_jobs.load(Ordering::Acquire) != 0
+                || self.inner.running_blocking_jobs.load(Ordering::Acquire) != 0;
+            observed_outstanding |= outstanding;
+            context = tighten_current_cleanup(context);
+            // An empty shutdown still succeeds at zero D. After actual work
+            // was observed, check its deadline even at the drained exit.
+            if observed_outstanding && Instant::now() >= context.cleanup_deadline {
                 self.record_cleanup_timeout();
                 self.inner.cleanup_unfinished_tasks.fetch_add(
                     self.inner.active_tasks.load(Ordering::Acquire),
@@ -1448,7 +1560,14 @@ impl TaskRuntime {
                     Span::default(),
                 ));
             }
-            if self.retire_cancelled_queue_prefix(context) {
+            if !outstanding {
+                break;
+            }
+            let retired = self.retire_cancelled_queue_prefix(context);
+            // The queue node's actual Drop may carry a smaller D back through
+            // its CleanupGuard. Observe it before continuing or sleeping.
+            context = tighten_current_cleanup(context);
+            if retired {
                 continue;
             }
             // Cleanup must not execute an unrelated queued user continuation.

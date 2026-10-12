@@ -95,6 +95,7 @@ fn error_code(value: &Value) -> Option<&str> {
 
 #[derive(Debug)]
 struct DropObservation {
+    cancellation: Option<CancellationContext>,
     submission: Option<u8>,
     accounting_done: bool,
     cleanup: Option<CancellationContext>,
@@ -114,6 +115,7 @@ impl Drop for Probe {
     fn drop(&mut self) {
         self.entered
             .send(DropObservation {
+                cancellation: self.state.as_ref().and_then(|state| state.cancellation()),
                 submission: self
                     .state
                     .as_ref()
@@ -154,6 +156,7 @@ fn assert_producer_retired(state: &TaskState) {
 
 fn assert_drained(runtime: &TaskRuntime, accepted: usize) {
     runtime.cancel_all_and_wait(WAIT).unwrap();
+    assert_eq!(runtime.inner.producer_count(), 0);
     let snapshot = runtime.snapshot().unwrap();
     assert_eq!(snapshot.active_tasks, 0);
     assert_eq!(snapshot.registered_tasks, 0);
@@ -164,11 +167,178 @@ fn assert_drained(runtime: &TaskRuntime, accepted: usize) {
 }
 
 #[test]
+fn global_shutdown_waits_for_unregistered_no_worker_producer_capture_drop() {
+    let _execution = ExecutionTerminationGuard::enter();
+    let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+    let (mut capture_release, capture_rx) = Release::pair();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (returned_tx, returned_rx) = mpsc::sync_channel(1);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let built = Arc::new(AtomicBool::new(false));
+    let ran = Arc::new(AtomicBool::new(false));
+    let build_ran = Arc::clone(&built);
+    let body_ran = Arc::clone(&ran);
+    let probe = Probe {
+        state: None,
+        entered: entered_tx,
+        release: Some(capture_rx),
+        drops: Arc::clone(&drops),
+        shorter: None,
+        panics: false,
+    };
+    let producer_runtime = runtime.clone();
+    let producer = thread::spawn(move || {
+        let task = producer_runtime.spawn_deferred(move || {
+            build_ran.store(true, Ordering::Release);
+            move || {
+                body_ran.store(true, Ordering::Release);
+                drop(probe);
+                Ok(Value::Null)
+            }
+        });
+        returned_tx.send(()).unwrap();
+        task
+    });
+    let during = entered_rx.recv_timeout(WAIT).unwrap();
+    let paused = runtime.snapshot().unwrap();
+    let drops_while_paused = drops.load(Ordering::Acquire);
+    let returned_while_paused = returned_rx.try_recv();
+    let shutdown_while_paused = runtime.cancel_all_and_wait(Duration::ZERO);
+    // Keep the safe old-API RED independent of the new producer gate. End the
+    // actual Drop/API before semantic assertions even on the old implementation.
+    capture_release.release();
+    let task = producer.join().unwrap().unwrap();
+    returned_rx.recv_timeout(WAIT).unwrap();
+    let outcome = task.await_result();
+    drop(task);
+    let second_shutdown = runtime.cancel_all_and_wait(WAIT);
+    let after = runtime.snapshot().unwrap();
+    assert!(during.submission.is_none());
+    assert_eq!(drops_while_paused, 0);
+    assert!(matches!(returned_while_paused, Err(TryRecvError::Empty)));
+    assert_eq!(
+        (
+            paused.active_tasks,
+            paused.registered_tasks,
+            paused.queued_tasks
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!((paused.accepted_submissions, paused.finished_tasks), (0, 0));
+    let error = shutdown_while_paused
+        .expect_err("global shutdown must wait for the actual unregistered producer capture Drop");
+    assert_eq!(error.domain.as_deref(), Some("task"));
+    assert_eq!(error.code.as_deref(), Some("shutdown_timeout"));
+    assert_eq!(error_code(&outcome.unwrap()), Some("runtime_stopped"));
+    assert!(!built.load(Ordering::Acquire));
+    assert!(!ran.load(Ordering::Acquire));
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(second_shutdown.unwrap(), 0);
+    assert_eq!(
+        (
+            after.active_tasks,
+            after.registered_tasks,
+            after.queued_tasks,
+            after.wait_edges
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!((after.accepted_submissions, after.finished_tasks), (0, 0));
+}
+
+#[test]
+fn shutdown_preserves_original_expired_deadline_when_observed_producer_retires_before_registry_unlock(
+) {
+    let _execution = ExecutionTerminationGuard::enter();
+    let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+    let (mut capture_release, capture_rx) = Release::pair();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let built = Arc::new(AtomicBool::new(false));
+    let build_ran = Arc::clone(&built);
+    let probe = Probe {
+        state: None,
+        entered: entered_tx,
+        release: Some(capture_rx),
+        drops: Arc::clone(&drops),
+        shorter: None,
+        panics: false,
+    };
+    let producer_runtime = runtime.clone();
+    let producer = thread::spawn(move || {
+        producer_runtime.spawn_deferred(move || {
+            build_ran.store(true, Ordering::Release);
+            move || {
+                drop(probe);
+                Ok(Value::Null)
+            }
+        })
+    });
+    let during = entered_rx.recv_timeout(WAIT).unwrap();
+    let paused = runtime.snapshot().unwrap();
+    // Hold the actual empty registry, not a surrogate shutdown gate. Closing
+    // becomes visible before cancel_all_with can acquire this real mutex.
+    let registry = runtime.inner.states.lock().unwrap();
+    let shutdown_runtime = runtime.clone();
+    let shutdown = thread::spawn(move || shutdown_runtime.cancel_all_and_wait(Duration::ZERO));
+    let closing_observed = until(|| runtime.inner.closing.load(Ordering::Acquire));
+    capture_release.release();
+    let task = producer.join().unwrap().unwrap();
+    // Keep this real owner alive until releasing the registry: last-owner
+    // cleanup may acquire it. No cleanup/ACK is manufactured by this fixture.
+    drop(registry);
+    let shutdown_after_producer_retired = shutdown.join().unwrap();
+    let outcome = task.await_result();
+    drop(task);
+    let second_shutdown = runtime.cancel_all_and_wait(WAIT);
+    let empty_zero_deadline_shutdown = runtime.cancel_all_and_wait(Duration::ZERO);
+    let after = runtime.snapshot().unwrap();
+    assert!(during.submission.is_none());
+    assert_eq!(
+        (
+            paused.active_tasks,
+            paused.registered_tasks,
+            paused.queued_tasks
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!((paused.accepted_submissions, paused.finished_tasks), (0, 0));
+    assert!(
+        closing_observed,
+        "bounded observation of the actual shutdown start"
+    );
+    assert_eq!(
+        shutdown_after_producer_retired.unwrap_err().code.as_deref(),
+        Some("shutdown_timeout")
+    );
+    assert_eq!(error_code(&outcome.unwrap()), Some("runtime_stopped"));
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert!(!built.load(Ordering::Acquire));
+    assert_eq!(second_shutdown.unwrap(), 0);
+    assert_eq!(empty_zero_deadline_shutdown.unwrap(), 0);
+    assert_eq!(
+        (
+            after.active_tasks,
+            after.registered_tasks,
+            after.queued_tasks,
+            after.wait_edges
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!((after.accepted_submissions, after.finished_tasks), (0, 0));
+}
+
+#[test]
 fn early_rejections_wait_for_uninvoked_builder_capture_drop_without_fake_admission() {
-    for kind in ["no_worker", "closing", "limit"] {
+    for kind in ["no_worker", "closing", "limit", "termination"] {
         let _execution = ExecutionTerminationGuard::enter();
-        let runtime = TaskRuntime::with_limits(usize::from(kind != "no_worker"), 2, 0, 0, 1);
-        let mut blocker = (kind != "no_worker").then(|| held_worker(&runtime));
+        let has_worker = matches!(kind, "closing" | "limit");
+        let runtime = TaskRuntime::with_limits(usize::from(has_worker), 2, 0, 0, 1);
+        let mut blocker = has_worker.then(|| held_worker(&runtime));
+        let original = CancellationContext {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: Instant::now(),
+        };
         if kind == "closing" {
             let error = runtime.cancel_all_and_wait(Duration::ZERO).unwrap_err();
             assert!(error.message.contains("bounded shutdown timeout"));
@@ -190,50 +360,114 @@ fn early_rejections_wait_for_uninvoked_builder_capture_drop_without_fake_admissi
         };
         let producer_runtime = runtime.clone();
         let producer = thread::spawn(move || {
-            let task = producer_runtime
-                .spawn_deferred(move || {
-                    build_ran.store(true, Ordering::Release);
-                    move || {
-                        drop(probe);
-                        Ok(Value::Null)
-                    }
-                })
-                .unwrap();
+            let execution = ExecutionTerminationGuard::enter();
+            if kind == "termination" {
+                set_execution_termination(original);
+            }
+            let task = producer_runtime.spawn_deferred(move || {
+                build_ran.store(true, Ordering::Release);
+                move || {
+                    drop(probe);
+                    Ok(Value::Null)
+                }
+            });
             returned_tx.send(()).unwrap();
             assert!(current_cleanup_context().is_none());
+            if kind == "termination" {
+                assert_eq!(current_execution_termination(), Some(original));
+            }
+            drop(execution);
             assert!(current_execution_termination().is_none());
             task
         });
         let during = entered_rx.recv_timeout(WAIT).unwrap();
         // These early states were never registered. Observe actual capture
         // destruction and API return, rather than creating a synthetic entry.
-        assert!(during.submission.is_none());
-        assert_eq!(drops.load(Ordering::Acquire), 0);
-        assert!(!built.load(Ordering::Acquire));
-        assert!(matches!(returned_rx.try_recv(), Err(TryRecvError::Empty)));
+        let drops_while_paused = drops.load(Ordering::Acquire);
+        let returned_while_paused = returned_rx.try_recv();
         let paused = runtime.snapshot().unwrap();
+        let producers_while_paused = runtime.inner.producer_count();
+        let held = blocker.take().map(|(task, mut release)| {
+            release.release();
+            let result = task.await_result();
+            let retired = until(|| task.state.accounting_done.load(Ordering::Acquire));
+            drop(task);
+            (result, retired)
+        });
+        let producer_only = runtime.snapshot().unwrap();
+        let shutdown_while_paused = runtime.cancel_all_and_wait(Duration::ZERO);
+        capture_release.release();
+        let task = producer.join().unwrap();
+        returned_rx.recv_timeout(WAIT).unwrap();
+        let (state, outcome, early_error) = match task {
+            Ok(task) => {
+                let state = Arc::clone(&task.state);
+                let outcome = task.await_result();
+                drop(task);
+                (Some(state), Some(outcome), None)
+            }
+            Err(error) => (None, None, Some(error)),
+        };
+        assert_drained(&runtime, before.accepted_submissions);
+        assert!(during.submission.is_none());
+        assert_eq!(drops_while_paused, 0);
+        assert!(matches!(returned_while_paused, Err(TryRecvError::Empty)));
         assert_eq!(paused.active_tasks, before.active_tasks);
         assert_eq!(paused.registered_tasks, before.registered_tasks);
         assert_eq!(paused.queued_tasks, before.queued_tasks);
         assert_eq!(paused.accepted_submissions, before.accepted_submissions);
-        capture_release.release();
-        let task = producer.join().unwrap();
-        returned_rx.recv_timeout(WAIT).unwrap();
-        assert_producer_retired(&task.state);
+        assert_eq!(
+            paused.total_submissions,
+            before.total_submissions + usize::from(kind != "termination")
+        );
+        assert_eq!(producers_while_paused, usize::from(kind != "closing"));
+        assert_eq!(
+            (
+                producer_only.active_tasks,
+                producer_only.registered_tasks,
+                producer_only.queued_tasks
+            ),
+            (0, 0, 0)
+        );
+        if kind == "closing" {
+            // This later API still destroys its captures before returning,
+            // but acquires no responsibility after the shutdown linearization.
+            assert_eq!(shutdown_while_paused.unwrap(), 0);
+        } else {
+            assert_eq!(
+                shutdown_while_paused.unwrap_err().code.as_deref(),
+                Some("shutdown_timeout")
+            );
+        }
+        if let Some((result, retired)) = held {
+            assert!(retired);
+            if kind == "closing" {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), Value::Null);
+            }
+        }
         assert_eq!(drops.load(Ordering::Acquire), 1);
         assert!(!built.load(Ordering::Acquire));
+        if kind == "termination" {
+            // Admission precedes ensure_task_operations_allowed's real early
+            // return. The uncalled constructor still owns its capture until
+            // this paused Drop finishes, without creating a Task submission.
+            assert!(state.is_none());
+            assert!(outcome.is_none());
+            assert_eq!(early_error.unwrap().runtime_termination(), Some(original));
+            assert_eq!(during.execution, Some(original));
+            assert_eq!(paused.total_submissions, 0);
+            continue;
+        }
+        assert!(early_error.is_none());
+        assert_producer_retired(&state.unwrap());
         let code = if kind == "limit" {
             "too_many_tasks"
         } else {
             "runtime_stopped"
         };
-        assert_eq!(error_code(&task.await_result().unwrap()), Some(code));
-        drop(task);
-        if let Some((task, release)) = blocker.as_mut() {
-            release.release();
-            let _ = task.await_result();
-        }
-        assert_drained(&runtime, before.accepted_submissions);
+        assert_eq!(error_code(&outcome.unwrap().unwrap()), Some(code));
     }
 }
 
@@ -283,31 +517,58 @@ fn queue_rejection_keeps_pending_until_real_factory_drop_for_positive_and_zero_c
         });
         let state = observer_rx.recv_timeout(WAIT).unwrap();
         let during = entered_rx.recv_timeout(WAIT).unwrap();
+        let paused_submission = state.submission.load(Ordering::Acquire);
+        let drops_while_paused = drops.load(Ordering::Acquire);
+        let paused = runtime.snapshot().unwrap();
+        let producers_while_paused = runtime.inner.producer_count();
+        worker_release.release();
+        let held_result = held.await_result();
+        let held_retired = until(|| held.state.accounting_done.load(Ordering::Acquire));
+        drop(held);
+        let queued_result = queued.map(|task| {
+            let result = task.await_result();
+            let retired = until(|| task.state.accounting_done.load(Ordering::Acquire));
+            drop(task);
+            (result, retired)
+        });
+        let producer_only = runtime.snapshot().unwrap();
+        let shutdown_while_paused = runtime.cancel_all_and_wait(Duration::ZERO);
+        capture_release.release();
+        let rejected = producer.join().unwrap();
+        let result = rejected.await_result();
+        drop(rejected);
+        assert_drained(&runtime, before.accepted_submissions);
         assert_eq!(during.submission, Some(SUBMISSION_PENDING));
         assert!(!during.accounting_done);
-        assert_eq!(state.submission.load(Ordering::Acquire), SUBMISSION_PENDING);
-        assert_eq!(drops.load(Ordering::Acquire), 0);
-        let paused = runtime.snapshot().unwrap();
+        assert_eq!(paused_submission, SUBMISSION_PENDING);
+        assert_eq!(drops_while_paused, 0);
+        assert_eq!(producers_while_paused, 1);
         assert_eq!(paused.active_tasks, before.active_tasks);
         assert_eq!(paused.registered_tasks, before.registered_tasks);
         assert_eq!(paused.queued_tasks, before.queued_tasks);
         assert_eq!(paused.accepted_submissions, before.accepted_submissions);
-        capture_release.release();
-        let rejected = producer.join().unwrap();
-        assert_producer_retired(&state);
         assert_eq!(
-            error_code(&rejected.await_result().unwrap()),
-            Some("queue_full")
+            (
+                producer_only.active_tasks,
+                producer_only.registered_tasks,
+                producer_only.queued_tasks
+            ),
+            (0, 0, 0)
         );
+        assert_eq!(
+            shutdown_while_paused.unwrap_err().code.as_deref(),
+            Some("shutdown_timeout")
+        );
+        assert_producer_retired(&state);
+        assert_eq!(error_code(&result.unwrap()), Some("queue_full"));
         assert_eq!(drops.load(Ordering::Acquire), 1);
         assert!(!ran.load(Ordering::Acquire));
-        drop(rejected);
-        worker_release.release();
-        held.await_result().unwrap();
-        if let Some(task) = queued {
-            assert_eq!(task.await_result().unwrap(), Value::Int(17));
+        assert!(held_retired);
+        assert_eq!(held_result.unwrap(), Value::Null);
+        if let Some((result, retired)) = queued_result {
+            assert!(retired);
+            assert_eq!(result.unwrap(), Value::Int(17));
         }
-        assert_drained(&runtime, before.accepted_submissions);
     }
 }
 
@@ -464,6 +725,339 @@ fn native_capture_panic_retires_tail_with_same_first_cause_and_shorter_deadline(
     assert_drained(&runtime, 1);
 }
 
+#[test]
+fn no_worker_native_capture_panic_keeps_global_responsibility_through_actual_tail_drop() {
+    let _execution = ExecutionTerminationGuard::enter();
+    let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+    let (mut first_release, first_rx) = Release::pair();
+    let (mut tail_release, tail_rx) = Release::pair();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+    let (returned_tx, returned_rx) = mpsc::sync_channel(1);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let built = Arc::new(AtomicBool::new(false));
+    let build_ran = Arc::clone(&built);
+    let captures = (
+        Probe {
+            state: None,
+            entered: entered_tx.clone(),
+            release: Some(first_rx),
+            drops: Arc::clone(&drops),
+            shorter: None,
+            panics: true,
+        },
+        Probe {
+            state: None,
+            entered: entered_tx,
+            release: Some(tail_rx),
+            drops: Arc::clone(&drops),
+            shorter: None,
+            panics: false,
+        },
+    );
+    let producer_runtime = runtime.clone();
+    let producer = thread::spawn(move || {
+        let execution = ExecutionTerminationGuard::enter();
+        let attempt = catch_unwind(AssertUnwindSafe(|| {
+            producer_runtime.spawn_deferred(move || {
+                build_ran.store(true, Ordering::Release);
+                move || {
+                    drop(captures);
+                    Ok(Value::Null)
+                }
+            })
+        }));
+        returned_tx.send(()).unwrap();
+        let message = attempt.err().and_then(|native| {
+            native
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| native.downcast_ref::<&str>().copied())
+                .map(str::to_owned)
+        });
+        let restored_cleanup = current_cleanup_context();
+        drop(execution);
+        (message, restored_cleanup, current_execution_termination())
+    });
+    let first = entered_rx.recv_timeout(WAIT).unwrap();
+    let first_count = runtime.inner.producer_count();
+    let first_shutdown = runtime.cancel_all_and_wait(Duration::ZERO);
+    first_release.release();
+    let tail = entered_rx.recv_timeout(WAIT).unwrap();
+    let tail_snapshot = runtime.snapshot().unwrap();
+    let tail_count = runtime.inner.producer_count();
+    let tail_drops = drops.load(Ordering::Acquire);
+    let returned_during_tail = returned_rx.try_recv();
+    let tail_shutdown = runtime.cancel_all_and_wait(Duration::ZERO);
+    // The native panic is real. Let Rust finish the remaining tuple field and
+    // the API's outer catch/handle cleanup before checking retirement.
+    tail_release.release();
+    let (message, cleanup, execution) = producer.join().unwrap();
+    returned_rx.recv_timeout(WAIT).unwrap();
+    let second_shutdown = runtime.cancel_all_and_wait(WAIT);
+    assert!(first.submission.is_none());
+    assert!(tail.submission.is_none());
+    assert!(first.cleanup.is_none());
+    assert!(tail.cleanup.is_none());
+    assert!(first.execution.is_none());
+    assert!(tail.execution.is_none());
+    assert_eq!((first_count, tail_count), (1, 1));
+    assert_eq!(tail_drops, 1);
+    assert!(matches!(returned_during_tail, Err(TryRecvError::Empty)));
+    assert_eq!(
+        (
+            tail_snapshot.active_tasks,
+            tail_snapshot.registered_tasks,
+            tail_snapshot.queued_tasks
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        (
+            tail_snapshot.accepted_submissions,
+            tail_snapshot.finished_tasks
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        first_shutdown.unwrap_err().code.as_deref(),
+        Some("shutdown_timeout")
+    );
+    assert_eq!(
+        tail_shutdown.unwrap_err().code.as_deref(),
+        Some("shutdown_timeout")
+    );
+    assert_eq!(message.as_deref(), Some(DROP_PANIC));
+    assert_eq!(drops.load(Ordering::Acquire), 2);
+    assert!(!built.load(Ordering::Acquire));
+    assert!(cleanup.is_none());
+    assert!(execution.is_none());
+    assert_eq!(second_shutdown.unwrap(), 0);
+    assert_drained(&runtime, 0);
+}
+
+#[test]
+fn producer_shutdown_is_runtime_local_and_closed_admission_does_not_reopen_the_prefix() {
+    let _execution = ExecutionTerminationGuard::enter();
+    let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+    let independent = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let built = Arc::new(AtomicBool::new(false));
+    let spawn_paused = |release_rx, entered_tx| {
+        let producer_runtime = runtime.clone();
+        let probe = Probe {
+            state: None,
+            entered: entered_tx,
+            release: Some(release_rx),
+            drops: Arc::clone(&drops),
+            shorter: None,
+            panics: false,
+        };
+        let build_ran = Arc::clone(&built);
+        thread::spawn(move || {
+            producer_runtime.spawn_deferred(move || {
+                build_ran.store(true, Ordering::Release);
+                move || {
+                    drop(probe);
+                    Ok(Value::Null)
+                }
+            })
+        })
+    };
+    let (mut admitted_release, admitted_rx) = Release::pair();
+    let (admitted_entered_tx, admitted_entered_rx) = mpsc::sync_channel(1);
+    let admitted = spawn_paused(admitted_rx, admitted_entered_tx);
+    let first_drop = admitted_entered_rx.recv_timeout(WAIT).unwrap();
+    let independent_shutdown = independent.cancel_all_and_wait(Duration::ZERO);
+    let first_count = runtime.inner.producer_count();
+    let first_shutdown = runtime.cancel_all_and_wait(Duration::ZERO);
+    let (mut closed_release, closed_rx) = Release::pair();
+    let (closed_entered_tx, closed_entered_rx) = mpsc::sync_channel(1);
+    let closed = spawn_paused(closed_rx, closed_entered_tx);
+    let closed_drop = closed_entered_rx.recv_timeout(WAIT).unwrap();
+    let count_with_both_captures = runtime.inner.producer_count();
+    admitted_release.release();
+    let first_task = admitted.join().unwrap().unwrap();
+    let first_outcome = first_task.await_result();
+    drop(first_task);
+    let count_with_only_post_close_capture = runtime.inner.producer_count();
+    let drops_with_only_post_close_capture = drops.load(Ordering::Acquire);
+    // A shutdown covers its admitted prefix. This later API remains blocked
+    // in its own capture Drop, but cannot retroactively reopen that prefix.
+    let completed_prefix_shutdown = runtime.cancel_all_and_wait(Duration::ZERO);
+    closed_release.release();
+    let closed_task = closed.join().unwrap().unwrap();
+    let closed_outcome = closed_task.await_result();
+    drop(closed_task);
+    assert_drained(&runtime, 0);
+    assert_drained(&independent, 0);
+    assert!(first_drop.submission.is_none());
+    assert!(closed_drop.submission.is_none());
+    assert_eq!(independent_shutdown.unwrap(), 0);
+    assert_eq!(
+        first_shutdown.unwrap_err().code.as_deref(),
+        Some("shutdown_timeout")
+    );
+    assert_eq!((first_count, count_with_both_captures), (1, 1));
+    assert_eq!(count_with_only_post_close_capture, 0);
+    assert_eq!(drops_with_only_post_close_capture, 1);
+    assert_eq!(completed_prefix_shutdown.unwrap(), 0);
+    assert_eq!(error_code(&first_outcome.unwrap()), Some("runtime_stopped"));
+    assert_eq!(
+        error_code(&closed_outcome.unwrap()),
+        Some("runtime_stopped")
+    );
+    assert_eq!(drops.load(Ordering::Acquire), 2);
+    assert!(!built.load(Ordering::Acquire));
+    assert!(current_cleanup_context().is_none());
+    assert!(current_execution_termination().is_none());
+}
+
+#[test]
+fn queued_capture_feedback_broadcasts_actual_minimum_deadline_without_replacing_first_cause() {
+    for with_outer in [true, false] {
+        let _execution = ExecutionTerminationGuard::enter();
+        assert!(current_cleanup_context().is_none());
+        let runtime = TaskRuntime::with_limits(1, 2, 0, 0, 4);
+        let (held, mut worker_release) = held_worker(&runtime);
+        let supplied = CancellationContext {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: Instant::now() + WAIT,
+        };
+        let shorter = CancellationContext {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: Instant::now(),
+        };
+        let drops = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+        let mut old_ids = vec![held.id()];
+        let mut queued = Vec::new();
+        for _ in 0..2 {
+            let body_count = Arc::clone(&bodies);
+            let task = runtime
+                .spawn_deferred(|| {
+                    let probe = Probe {
+                        state: Some(building_state(&runtime, &old_ids)),
+                        entered: entered_tx.clone(),
+                        release: None,
+                        drops: Arc::clone(&drops),
+                        shorter: Some(shorter),
+                        panics: false,
+                    };
+                    move || {
+                        body_count.fetch_add(1, Ordering::AcqRel);
+                        drop(probe);
+                        Ok(Value::Null)
+                    }
+                })
+                .unwrap();
+            old_ids.push(task.id());
+            queued.push(task);
+        }
+        let before = runtime.snapshot().unwrap();
+        let cleanup = with_outer.then(|| CleanupGuard::enter(supplied));
+        let cancelled = if with_outer {
+            runtime.cancel_all_with(supplied)
+        } else {
+            runtime.cancel_all()
+        };
+        let first = entered_rx.recv_timeout(WAIT).unwrap();
+        let second = entered_rx.recv_timeout(WAIT).unwrap();
+        let effective_cleanup = current_cleanup_context();
+        let queued_contexts = queued
+            .iter()
+            .map(|task| task.state.cancellation())
+            .collect::<Vec<_>>();
+        // For bare public cancel_all, measure its actual initial context instead
+        // of inventing that API's deadline. All source-state receipts above were
+        // collected before installing any private wait context below.
+        let original = first
+            .cancellation
+            .expect("the real first queued request installed cancellation");
+        let expected = CancellationContext {
+            reason: original.reason,
+            cleanup_deadline: original.cleanup_deadline.min(shorter.cleanup_deadline),
+        };
+        // Both Drop probes tighten the same real batch TLS D. HashMap ordering
+        // may choose either Task first; the later actual Drop must see that D.
+        // The first Drop begins with its original state context; real cleanup
+        // feedback tightens that state before completion, so both final states
+        // have the minimum D. Observe the second state before its own Drop
+        // tightens anything, independently of CleanupGuard merging caller TLS.
+        // This guard only controls the bounded cleanup part of this private
+        // fixture. Bare cancel_all must restore the caller's original absent TLS;
+        // it is not expected to keep a batch deadline in the caller afterward.
+        let wait_cleanup = CleanupGuard::enter(expected);
+        let shutdown_with_shorter_tls = runtime.cancel_all_and_wait(WAIT);
+        let held_context = held.state.cancellation();
+        drop(wait_cleanup);
+        drop(cleanup);
+        worker_release.release();
+        let held_outcome = held.await_result();
+        let all_retired = until(|| {
+            std::iter::once(&held).chain(queued.iter()).all(|task| {
+                task.state.accounting_done.load(Ordering::Acquire)
+                    && task.state.execution_queue_retired.load(Ordering::Acquire)
+                    && task.state.completion_cleanup_done.load(Ordering::Acquire)
+            })
+        });
+        let queued_outcomes = queued
+            .iter()
+            .map(TaskHandle::await_result)
+            .collect::<Vec<_>>();
+        drop(queued);
+        drop(held);
+        let second_shutdown = runtime.cancel_all_and_wait(WAIT);
+        assert_eq!(
+            (
+                before.active_tasks,
+                before.registered_tasks,
+                before.queued_tasks
+            ),
+            (3, 3, 2)
+        );
+        assert_eq!(cancelled, 3);
+        assert_eq!(first.submission, Some(SUBMISSION_ACCEPTED));
+        assert_eq!(second.submission, Some(SUBMISSION_ACCEPTED));
+        assert!(!first.accounting_done);
+        assert!(!second.accounting_done);
+        assert_eq!(first.cleanup, Some(original));
+        assert_eq!(second.cleanup, Some(expected));
+        assert_eq!(first.cancellation, Some(original));
+        assert_eq!(second.cancellation, Some(expected));
+        assert!(first.execution.is_none());
+        assert!(second.execution.is_none());
+        if with_outer {
+            assert_eq!(original, supplied);
+            assert_eq!(effective_cleanup, Some(expected));
+        } else {
+            assert_eq!(original.reason, TerminationReason::Cancelled);
+            assert!(effective_cleanup.is_none());
+        }
+        assert!(original.cleanup_deadline > shorter.cleanup_deadline);
+        assert_eq!(queued_contexts, vec![Some(expected); 2]);
+        assert_eq!(
+            shutdown_with_shorter_tls.unwrap_err().code.as_deref(),
+            Some("shutdown_timeout")
+        );
+        assert_eq!(held_context, Some(expected));
+        assert_eq!(
+            held_outcome.unwrap_err().runtime_termination(),
+            Some(expected)
+        );
+        for (outcome, context) in queued_outcomes.into_iter().zip(queued_contexts) {
+            assert_eq!(outcome.unwrap_err().runtime_termination(), context);
+        }
+        assert!(all_retired);
+        assert_eq!(drops.load(Ordering::Acquire), 2);
+        assert_eq!(bodies.load(Ordering::Acquire), 0);
+        assert_eq!(second_shutdown.unwrap(), 0);
+        assert!(current_cleanup_context().is_none());
+        assert!(current_execution_termination().is_none());
+        assert_drained(&runtime, 3);
+    }
+}
+
 struct OversizedRunner {
     _header: [u8; local_driver::MAX_TYPED_RUNNER_HEADER + 1],
     _capture: Probe,
@@ -523,27 +1117,18 @@ fn poisoned_after_registration_rolls_back_actual_weak_before_producer_retirement
     });
     let state = observer_rx.recv_timeout(WAIT).unwrap();
     let during = entered_rx.recv_timeout(WAIT).unwrap();
-    assert_eq!(during.submission, Some(SUBMISSION_PENDING));
-    assert!(!during.accounting_done);
-    assert!(runtime.inner.states.is_poisoned());
-    assert!(!runtime
+    let registry_poisoned = runtime.inner.states.is_poisoned();
+    let rejected_registered = runtime
         .inner
         .states
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .contains_key(&state.id));
-    assert_eq!(runtime.inner.active_tasks.load(Ordering::Acquire), 1);
-    assert_eq!(drops.load(Ordering::Acquire), 0);
-    capture_release.release();
-    let rejected = producer.join().unwrap();
-    assert_producer_retired(&state);
-    assert!(rejected
-        .await_result()
-        .unwrap_err()
-        .message
-        .contains("frame/header budget"));
-    assert!(!constructed.load(Ordering::Acquire));
-    assert_eq!(drops.load(Ordering::Acquire), 1);
+        .contains_key(&state.id);
+    let active_while_paused = runtime.inner.active_tasks.load(Ordering::Acquire);
+    let drops_while_paused = drops.load(Ordering::Acquire);
+    let producers_while_paused = runtime.inner.producer_count();
+    // Preserve the old poisoned-registry rejection before closing admission.
+    // A subsequent post-close call would correctly return runtime_stopped.
     let next_built = Arc::new(AtomicBool::new(false));
     let next_builder = Arc::clone(&next_built);
     let next = runtime
@@ -552,25 +1137,65 @@ fn poisoned_after_registration_rolls_back_actual_weak_before_producer_retirement
             || Ok(Value::Null)
         })
         .unwrap();
-    assert!(next
-        .await_result()
-        .unwrap_err()
-        .message
-        .contains("registry is poisoned"));
-    assert!(!next_built.load(Ordering::Acquire));
-    assert_producer_retired(&next.state);
-    assert!(runtime.inner.states.is_poisoned());
-    assert!(!runtime
+    let next_state = Arc::clone(&next.state);
+    let next_error = next.await_result();
+    let next_registered = runtime
         .inner
         .states
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .contains_key(&next.id()));
+        .contains_key(&next.id());
     drop(next);
-    drop(rejected);
     worker_release.release();
-    held.await_result().unwrap();
-    assert!(until(|| held.state.accounting_done.load(Ordering::Acquire)));
+    let held_result = held.await_result();
+    let held_retired = until(|| held.state.accounting_done.load(Ordering::Acquire));
+    drop(held);
+    let producer_only_active = runtime.inner.active_tasks.load(Ordering::Acquire);
+    let producer_only_queued = runtime.inner.queued_tasks.load(Ordering::Acquire);
+    let producer_only_registry_empty = runtime
+        .inner
+        .states
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .is_empty();
+    let shutdown_while_paused = runtime.cancel_all_and_wait(Duration::ZERO);
+    capture_release.release();
+    let rejected = producer.join().unwrap();
+    let rejected_error = rejected.await_result();
+    drop(rejected);
+    let second_shutdown = runtime.cancel_all_and_wait(WAIT);
+    assert_eq!(during.submission, Some(SUBMISSION_PENDING));
+    assert!(!during.accounting_done);
+    assert!(registry_poisoned);
+    assert!(!rejected_registered);
+    assert_eq!(active_while_paused, 1);
+    assert_eq!(drops_while_paused, 0);
+    assert_eq!(producers_while_paused, 1);
+    assert!(held_retired);
+    assert_eq!(held_result.unwrap(), Value::Null);
+    assert_eq!((producer_only_active, producer_only_queued), (0, 0));
+    assert!(producer_only_registry_empty);
+    assert_eq!(
+        shutdown_while_paused.unwrap_err().code.as_deref(),
+        Some("shutdown_timeout")
+    );
+    assert_producer_retired(&state);
+    assert!(rejected_error
+        .unwrap_err()
+        .message
+        .contains("frame/header budget"));
+    assert_producer_retired(&next_state);
+    assert!(next_error
+        .unwrap_err()
+        .message
+        .contains("registry is poisoned"));
+    assert!(!next_built.load(Ordering::Acquire));
+    assert!(!next_registered);
+    assert!(!constructed.load(Ordering::Acquire));
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert!(runtime.inner.states.is_poisoned());
+    assert_eq!(second_shutdown.unwrap(), 0);
+    assert_eq!(runtime.inner.producer_count(), 0);
     assert_eq!(runtime.inner.active_tasks.load(Ordering::Acquire), 0);
     assert_eq!(runtime.inner.queued_tasks.load(Ordering::Acquire), 0);
     assert_eq!(runtime.inner.finished_tasks.load(Ordering::Acquire), 1);
@@ -580,7 +1205,6 @@ fn poisoned_after_registration_rolls_back_actual_weak_before_producer_retirement
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .is_empty());
-    runtime.cancel_all_and_wait(WAIT).unwrap();
 }
 
 struct NullRunner;
