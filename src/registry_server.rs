@@ -4549,7 +4549,7 @@ mod tests {
                     .with_root_certificates(roots)
                     .with_no_client_auth(),
             );
-            let agent = test_registry_agent(Arc::clone(&client_config), address);
+            let agent = test_registry_agent(Arc::clone(&client_config), address, 0);
             let shutdown = Arc::new(AtomicBool::new(false));
             let thread_shutdown = Arc::clone(&shutdown);
             let thread = thread::spawn(move || server.serve_until(thread_shutdown));
@@ -4568,7 +4568,7 @@ mod tests {
         }
 
         fn fresh_agent(&self) -> ureq::Agent {
-            test_registry_agent(Arc::clone(&self.client_config), self.address)
+            test_registry_agent(Arc::clone(&self.client_config), self.address, 1)
         }
 
         fn stop(&mut self) {
@@ -4609,8 +4609,15 @@ mod tests {
         }
     }
 
-    fn test_registry_agent(client_config: Arc<ClientConfig>, address: SocketAddr) -> ureq::Agent {
+    fn test_registry_agent(
+        client_config: Arc<ClientConfig>,
+        address: SocketAddr,
+        idle_connections: usize,
+    ) -> ureq::Agent {
+        // Independent fixture operations cannot inherit another connection's
+        // absolute deadline. Real package operations explicitly keep one pool.
         ureq::AgentBuilder::new()
+            .max_idle_connections(idle_connections)
             .tls_config(client_config)
             .resolver(test_registry_resolver(address))
             .timeout_connect(Duration::from_secs(2))
@@ -5473,6 +5480,7 @@ mod tests {
         response_status(
             agent
                 .put(&url)
+                .set("Connection", "close")
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Content-Type", PACKAGE_CONTENT_TYPE)
                 .set("Content-Length", &artifact.size.to_string())
@@ -5497,6 +5505,7 @@ mod tests {
         let url = format!("{base_url}packages/{name}/{version}/yank");
         let mut request = agent
             .put(&url)
+            .set("Connection", "close")
             .set("Authorization", &format!("Bearer {token}"));
         if let Some(idempotency_key) = idempotency_key {
             request = request.set("Idempotency-Key", idempotency_key);
@@ -6773,6 +6782,7 @@ mod tests {
         fs::remove_dir(&lock_path).expect("remove the exact invalid lock fixture");
 
         for expected in [201, 200] {
+            let accepted_before = server.accepted_connections.load(Ordering::Acquire);
             assert_eq!(
                 put_artifact(
                     &server.agent,
@@ -6782,6 +6792,11 @@ mod tests {
                     &artifact.checksum
                 ),
                 expected
+            );
+            assert_eq!(
+                server.accepted_connections.load(Ordering::Acquire),
+                accepted_before + 1,
+                "independent mutation attempts must not share a connection deadline"
             );
             wait_for_mutation_names(&server, &[]);
             assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
@@ -8152,9 +8167,8 @@ mod tests {
             201
         );
 
-        // The seed publish uses the same persistent protocol as real clients. Let its
-        // one-second idle lease expire so it cannot consume a load-gate worker.
-        thread::sleep(KEEP_ALIVE_IDLE_TIMEOUT + Duration::from_millis(50));
+        // The independent seed publish closes its TLS connection. The raw
+        // clients below retain the real bounded keep-alive protocol.
         let accepted_before_load = server.accepted_connections.load(Ordering::Acquire);
         let load_started = Instant::now();
         let total_deadline = load_started + TOTAL_GATE_TIMEOUT;
