@@ -1,7 +1,8 @@
 //! Flat, bounded interpreter call/return continuations.
 //!
 //! The production slice admits a complete static scalar call tree before any
-//! body effects, including scalar Result roots and static async dependencies.
+//! body effects, including scalar Result roots, static async dependencies and
+//! local named async self calls with immutable scalar captures.
 //! An async root enters only after its Task is claimed. Await checkpoints own
 //! the original ticket and hand helper execution to the claimant-local driver.
 //! Once admitted, every nested call stays in this dispatch loop.
@@ -398,7 +399,7 @@ enum Work {
         function: FnId,
         args: ExprRange,
         span: SpanId,
-        async_start: bool,
+        dispatch: ArgumentDispatch,
     },
     ArgumentsExit(ArgumentFrame),
     Arguments {
@@ -407,8 +408,15 @@ enum Work {
         next: usize,
         exit_index: usize,
         span: SpanId,
-        async_start: bool,
+        dispatch: ArgumentDispatch,
     },
+}
+
+#[derive(Clone, Copy)]
+enum ArgumentDispatch {
+    Synchronous,
+    NamedAsync,
+    LocalAsync,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -629,6 +637,7 @@ impl Machine {
         args: Vec<Value>,
         depth: usize,
         span: SpanId,
+        local: bool,
         hooks: &mut impl ExecutionHooks,
     ) -> KuResult<()> {
         let source_span = self.code.span(span);
@@ -652,12 +661,34 @@ impl Machine {
         })?;
         let child_runtime = runtime.clone();
         let code = self.code.clone();
+        let captures = if local {
+            Some(
+                self.captures
+                    .as_ref()
+                    .expect("local async code has captures")
+                    .clone(),
+            )
+        } else {
+            None
+        };
         let task = runtime.spawn_runner_deferred(|| {
             let template = host.template();
             move || {
                 let mut interpreter = Interpreter::from_template(template, child_runtime);
                 interpreter.async_execution = true;
-                ClaimedNamedTask::from_code(interpreter, code, function, args, source_span)
+                match captures {
+                    Some(captures) => ClaimedNamedTask::from_local_code(
+                        interpreter,
+                        code,
+                        function,
+                        captures,
+                        args,
+                        span,
+                    ),
+                    None => {
+                        ClaimedNamedTask::from_code(interpreter, code, function, args, source_span)
+                    }
+                }
             }
         })?;
         // A synchronous call reaches ArgumentsExit through CallExit. Async
@@ -852,7 +883,13 @@ impl Machine {
         for (index, value) in args.iter().enumerate() {
             let param = self.code.parameter(function, index);
             let name = self.code.symbol(param.name).to_string();
-            let param_span = self.code.span(param.span);
+            let param_span = if self.captures.is_some() {
+                // Function-value parameters belong to this invocation, rather
+                // than the producer's first call used to compile the code.
+                span
+            } else {
+                self.code.span(param.span)
+            };
             let value = scalar(value, span)?;
             self.frame()
                 .env
@@ -1128,9 +1165,28 @@ impl Machine {
                                 function,
                                 args,
                                 span: expr.span,
-                                async_start: true,
+                                dispatch: ArgumentDispatch::NamedAsync,
                             },
                         );
+                    }
+                    ExprCode::AsyncSelfStart {
+                        function,
+                        args,
+                        callee_span,
+                    } => {
+                        self.reserve_work(2, span)?;
+                        push(
+                            &mut self.work,
+                            Work::PrepareArguments {
+                                function,
+                                args,
+                                span: expr.span,
+                                dispatch: ArgumentDispatch::LocalAsync,
+                            },
+                        );
+                        // Function-value calls evaluate the self callable before
+                        // their arguments. Its original tick remains observable.
+                        push(&mut self.work, Work::SelfCallee(callee_span));
                     }
                     ExprCode::Unary(op, operand) => {
                         self.reserve_work(2, span)?;
@@ -1159,7 +1215,7 @@ impl Machine {
                                 function,
                                 args,
                                 span: expr.span,
-                                async_start: false,
+                                dispatch: ArgumentDispatch::Synchronous,
                             },
                         );
                         if self.captures.is_some() {
@@ -1395,7 +1451,7 @@ impl Machine {
                 function,
                 args,
                 span,
-                async_start,
+                dispatch,
             } => {
                 let source_span = self.code.span(span);
                 self.reserve_work(2, source_span)?;
@@ -1429,7 +1485,7 @@ impl Machine {
                         next: 0,
                         exit_index,
                         span,
-                        async_start,
+                        dispatch,
                     },
                 );
             }
@@ -1439,7 +1495,7 @@ impl Machine {
                 next,
                 exit_index,
                 span,
-                async_start,
+                dispatch,
             } => {
                 if next > 0 {
                     let value = self.value();
@@ -1463,7 +1519,7 @@ impl Machine {
                             next: next + 1,
                             exit_index,
                             span,
-                            async_start,
+                            dispatch,
                         },
                     );
                     push(&mut self.work, Work::Eval(arg));
@@ -1477,9 +1533,16 @@ impl Machine {
                         unreachable!("argument exit marker");
                     };
                     let staged = std::mem::take(&mut arguments.staged);
-                    if async_start {
+                    if !matches!(dispatch, ArgumentDispatch::Synchronous) {
                         let capacity = staged.capacity();
-                        let result = self.start_async(function, staged, depth, span, hooks);
+                        let result = self.start_async(
+                            function,
+                            staged,
+                            depth,
+                            span,
+                            matches!(dispatch, ArgumentDispatch::LocalAsync),
+                            hooks,
+                        );
                         // The original argument buffer moved into the child
                         // factory (or was actually dropped by failed admission).
                         // Its parent marker now owns an empty buffer.
@@ -1823,15 +1886,37 @@ impl Machine {
         depth: usize,
         test_fuel: bool,
     ) -> KuResult<()> {
+        let function = self.code.find_function(entry);
+        let span_id = function.map(|id| self.code.function(id).span);
+        self.start_selected_once(function, args, depth, test_fuel, span_id, entry)
+    }
+
+    fn start_function_once(
+        &mut self,
+        function: FnId,
+        args: &[Value],
+        depth: usize,
+        test_fuel: bool,
+        span: SpanId,
+    ) -> KuResult<()> {
+        self.start_selected_once(Some(function), args, depth, test_fuel, Some(span), "")
+    }
+
+    fn start_selected_once(
+        &mut self,
+        function: Option<FnId>,
+        args: &[Value],
+        depth: usize,
+        test_fuel: bool,
+        span_id: Option<SpanId>,
+        entry: &str,
+    ) -> KuResult<()> {
         if self.state != MachineState::Ready {
             return Err(self.lifecycle_error("start"));
         }
         #[cfg(not(test))]
         let _ = test_fuel;
-        let function = self.code.find_function(entry);
-        let span = function
-            .map(|id| self.code.span(self.code.function(id).span))
-            .unwrap_or_default();
+        let span = span_id.map(|id| self.code.span(id)).unwrap_or_default();
         self.entry_span = span;
         self.state = MachineState::Running;
         #[cfg(test)]
@@ -1843,9 +1928,9 @@ impl Machine {
                 .ok_or_else(|| KuError::runtime(format!("undefined function '{entry}'"), span))?;
             // Retain the existing entry argument budget admission even though
             // this caller already owns those arguments outside the machine.
-            let function_span = self.code.function(function).span;
-            self.reserve_values(args.len(), self.code.span(function_span))?;
-            self.enter(function, args, depth, function_span)
+            let invocation_span = span_id.expect("admitted entry has an invocation span");
+            self.reserve_values(args.len(), span)?;
+            self.enter(function, args, depth, invocation_span)
         })();
         if let Err(error) = admission {
             self.pending = Some(Err(error));
@@ -2125,6 +2210,224 @@ pub(super) fn try_execute_function_value(
     Some(machine.run_with_hooks(name, &call.args, call.depth, false, interpreter))
 }
 
+// Prepared while the producer still owns the callable. Eligible code borrows
+// its source during compilation and keeps only shared flat code afterward.
+// Legacy AST copies retain their original producer-side panic boundary.
+pub(super) struct PreparedAsyncFunctionValue(PreparedAsyncFunctionValueKind);
+
+enum PreparedAsyncFunctionValueKind {
+    Flat {
+        code: CodeHandle,
+        function: FnId,
+        captures: Env,
+        args: Vec<Value>,
+        span: SpanId,
+    },
+    Legacy(OwnedFunctionValueCall),
+    Rejected {
+        error: KuError,
+        captures: Env,
+        args: Vec<Value>,
+    },
+}
+
+pub(super) struct OwnedFunctionValueCall {
+    params: Vec<String>,
+    param_modes: Vec<ParamMode>,
+    body: Vec<Stmt>,
+    captures: Env,
+    self_name: Option<String>,
+    args: Vec<Value>,
+    span: Span,
+}
+
+pub(super) struct ClaimedLegacyFunctionValue {
+    // With the project's Rust 1.89, the original one-shot closure drops its
+    // Interpreter before params/modes/body/captures/self metadata. Keep that
+    // observed order in one owner; destructuring locals would reverse it.
+    interpreter: Interpreter,
+    call: OwnedFunctionValueCall,
+}
+
+pub(super) struct ClaimedRejectedFunctionValue {
+    // A selected admission error still owns its child-side release window.
+    // Its argument buffer is consumed first; the retained host then precedes
+    // the capture template in the same order as the original callable owner.
+    _interpreter: Interpreter,
+    _captures: Env,
+    args: Vec<Value>,
+    error: Option<KuError>,
+}
+
+pub(super) fn prepare_async_function_value(
+    interpreter: &Interpreter,
+    call: FunctionValueCall<'_>,
+) -> PreparedAsyncFunctionValue {
+    let limits = Limits::default();
+    if code::eligible_claimed_async_local(&interpreter.functions, &call, limits) {
+        match CodeHandle::compile_claimed_async_local(&interpreter.functions, &call, limits) {
+            Ok(code) => {
+                let function = code
+                    .find_function(call.self_name.as_deref().expect("admitted self name"))
+                    .expect("compiled local async entry");
+                let span = code.function(function).span;
+                return PreparedAsyncFunctionValue(PreparedAsyncFunctionValueKind::Flat {
+                    code,
+                    function,
+                    captures: call.captures.clone(),
+                    args: call.args,
+                    span,
+                });
+            }
+            Err(error @ AdmissionError::Rejected(_)) => {
+                // Selection is complete. Its admission error belongs to the
+                // original deferred child; restarting the legacy body would
+                // bypass the selected storage budget.
+                return PreparedAsyncFunctionValue(PreparedAsyncFunctionValueKind::Rejected {
+                    error: error.into_error(),
+                    captures: call.captures.clone(),
+                    args: call.args,
+                });
+            }
+            Err(AdmissionError::Unsupported(_)) => {}
+        }
+    }
+    PreparedAsyncFunctionValue(PreparedAsyncFunctionValueKind::Legacy(
+        OwnedFunctionValueCall {
+            params: call.params.to_vec(),
+            param_modes: call.param_modes.to_vec(),
+            body: call.body.to_vec(),
+            captures: call.captures.clone(),
+            self_name: call.self_name.clone(),
+            args: call.args,
+            span: call.span,
+        },
+    ))
+}
+
+// Keep the flat runner inline: its actual typed header is charged by the
+// claimant-local driver. Boxing the larger variant would hide that backing
+// from the header budget. The legacy variant owns the original one-shot call.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum ClaimedFunctionValueTask {
+    Flat(ClaimedNamedTask),
+    Legacy {
+        call: Option<ClaimedLegacyFunctionValue>,
+        task_id: i64,
+        finished: bool,
+    },
+    Rejected {
+        call: Option<ClaimedRejectedFunctionValue>,
+        task_id: i64,
+        finished: bool,
+    },
+}
+
+impl ClaimedFunctionValueTask {
+    pub(super) fn new(interpreter: Interpreter, prepared: PreparedAsyncFunctionValue) -> Self {
+        match prepared.0 {
+            PreparedAsyncFunctionValueKind::Flat {
+                code,
+                function,
+                captures,
+                args,
+                span,
+            } => Self::Flat(ClaimedNamedTask::from_local_code(
+                interpreter,
+                code,
+                function,
+                captures,
+                args,
+                span,
+            )),
+            PreparedAsyncFunctionValueKind::Legacy(call) => Self::Legacy {
+                call: Some(ClaimedLegacyFunctionValue { interpreter, call }),
+                task_id: crate::runtime::task::current_task_id(),
+                finished: false,
+            },
+            PreparedAsyncFunctionValueKind::Rejected {
+                error,
+                captures,
+                args,
+            } => Self::Rejected {
+                call: Some(ClaimedRejectedFunctionValue {
+                    _interpreter: interpreter,
+                    _captures: captures,
+                    args,
+                    error: Some(error),
+                }),
+                task_id: crate::runtime::task::current_task_id(),
+                finished: false,
+            },
+        }
+    }
+}
+
+impl crate::runtime::task::LocalTaskRunner for ClaimedFunctionValueTask {
+    fn dispatch(&mut self, budget: NonZeroUsize) -> std::ops::ControlFlow<KuResult<Value>> {
+        match self {
+            Self::Flat(runner) => crate::runtime::task::LocalTaskRunner::dispatch(runner, budget),
+            Self::Legacy {
+                call,
+                task_id,
+                finished,
+            } => {
+                assert!(!*finished, "a finished function-value runner cannot resume");
+                assert_eq!(
+                    crate::runtime::task::current_task_id(),
+                    *task_id,
+                    "function-value task resumes on its original Task"
+                );
+                *finished = true;
+                let legacy = call.take().expect("one legacy function-value call");
+                let mut once = crate::runtime::task::OnceTaskRunner::new(move || {
+                    let mut legacy = legacy;
+                    let args = std::mem::take(&mut legacy.call.args);
+                    legacy.interpreter.call_function_value_direct(
+                        FunctionValueCall {
+                            params: &legacy.call.params,
+                            param_modes: &legacy.call.param_modes,
+                            body: &legacy.call.body,
+                            captures: &legacy.call.captures,
+                            self_name: &legacy.call.self_name,
+                            is_async: true,
+                            args,
+                            span: legacy.call.span,
+                            depth: 0,
+                        },
+                        true,
+                    )
+                });
+                crate::runtime::task::LocalTaskRunner::dispatch(&mut once, budget)
+            }
+            Self::Rejected {
+                call,
+                task_id,
+                finished,
+            } => {
+                assert!(!*finished, "a finished rejected runner cannot resume");
+                assert_eq!(
+                    crate::runtime::task::current_task_id(),
+                    *task_id,
+                    "rejected function-value task resumes on its original Task"
+                );
+                *finished = true;
+                let mut rejected = call.take().expect("one selected admission error");
+                let error = rejected.error.take().expect("sole child admission error");
+                drop(std::mem::take(&mut rejected.args));
+                std::ops::ControlFlow::Break(Err(error))
+            }
+        }
+    }
+
+    fn waiting(&mut self) -> Option<&mut crate::runtime::task::AwaitTicket> {
+        match self {
+            Self::Flat(runner) => crate::runtime::task::LocalTaskRunner::waiting(runner),
+            Self::Legacy { .. } | Self::Rejected { .. } => None,
+        }
+    }
+}
+
 // Created only by the already-claimed Task's Send factory. The runner and its
 // owned Machine stay on that claimant thread beneath the original job catch.
 // More continues immediately; Waiting exposes the retained ticket to its driver.
@@ -2160,6 +2463,33 @@ impl ClaimedNamedTask {
             legacy: None,
             outcome,
             span,
+            task_id: crate::runtime::task::current_task_id(),
+            finished: false,
+        }
+    }
+
+    fn from_local_code(
+        interpreter: Interpreter,
+        code: CodeHandle,
+        function: FnId,
+        captures: Env,
+        args: Vec<Value>,
+        span: SpanId,
+    ) -> Self {
+        let mut machine = Machine::from_code(code, Limits::default(), interpreter.call_depth);
+        machine.captures = Some(captures);
+        let source_span = machine.code.span(span);
+        let outcome = machine
+            .start_function_once(function, &args, 0, false, span)
+            .err()
+            .map(Err);
+        drop(args);
+        Self {
+            machine: Some(machine),
+            interpreter,
+            legacy: None,
+            outcome,
+            span: source_span,
             task_id: crate::runtime::task::current_task_id(),
             finished: false,
         }
@@ -2232,7 +2562,12 @@ impl crate::runtime::task::LocalTaskRunner for ClaimedNamedTask {
                 }
                 Ok(ChunkProgress::Finished { popped, result }) => {
                     debug_assert!(popped <= budget.get());
-                    result.and_then(|flow| flow.into_call_value(self.span, "function"))
+                    let kind = if machine.captures.is_some() {
+                        CallKind::FunctionValue
+                    } else {
+                        CallKind::Named
+                    };
+                    result.and_then(|flow| flow.into_call_value(self.span, kind.label()))
                 }
                 Err(error) => Err(error),
             }

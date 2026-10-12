@@ -1,5 +1,6 @@
 use super::*;
 
+mod async_local;
 mod await_entry;
 mod await_fuel;
 mod result_entry;

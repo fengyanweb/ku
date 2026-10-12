@@ -436,6 +436,24 @@ impl Env {
                 && binding.owner_task_id == crate::runtime::task::current_task_id()))
     }
 
+    /// An async child shares the original capture cell, but has another Task
+    /// identity. Only an immutable plain scalar stays stable across that
+    /// boundary; the producer's ownership of a mutable cell is insufficient.
+    /// Inspect the real representation without copying any Value payload.
+    pub(crate) fn is_immutable_scalar_binding(&self, name: &str) -> bool {
+        let Some(cell) = self.find_cell(name) else {
+            return false;
+        };
+        let Ok(binding) = cell.lock() else {
+            return false;
+        };
+        !binding.mutable
+            && matches!(
+                binding.value,
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null
+            )
+    }
+
     /// Ku owning reads transfer Task-containing values instead of sharing an
     /// internal handle lease with a moved-from slot. Other values retain get's
     /// existing transparent snapshot/borrow behavior.

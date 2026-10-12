@@ -95,6 +95,11 @@ pub(super) enum ExprCode {
         function: FnId,
         args: ExprRange,
     },
+    AsyncSelfStart {
+        function: FnId,
+        args: ExprRange,
+        callee_span: SpanId,
+    },
     Await(ExprId),
     Propagate(ExprId),
 }
@@ -199,15 +204,36 @@ pub(super) fn eligible_local(
     let Some(name) = call.self_name.as_deref() else {
         return false;
     };
-    Eligibility::new(source, Some((name, call.captures)), limits)
-        .check(FunctionSpec {
+    Eligibility::new(
+        source,
+        Some(LocalContext {
             name,
-            params: Parameters::Local(call.params),
-            body: call.body,
-            span: call.span,
-            declaration: None,
-            role: FunctionRole::Scalar,
-        })
+            captures: call.captures,
+            is_async: false,
+        }),
+        limits,
+    )
+    .check(FunctionSpec {
+        name,
+        params: Parameters::Local(call.params),
+        body: call.body,
+        span: call.span,
+        declaration: None,
+        role: FunctionRole::Scalar,
+    })
+    .is_ok()
+}
+
+pub(super) fn eligible_claimed_async_local(
+    source: &HashMap<String, FnDecl>,
+    call: &FunctionValueCall<'_>,
+    limits: Limits,
+) -> bool {
+    let Ok((local, spec)) = claimed_async_local_spec(source, call) else {
+        return false;
+    };
+    Eligibility::new(source, Some(local), limits)
+        .check(spec)
         .is_ok()
 }
 
@@ -287,7 +313,25 @@ impl CodeHandle {
             declaration: None,
             role: FunctionRole::Scalar,
         };
-        Builder::new(source, Some((name, call.captures)), limits).compile(Some(spec))
+        Builder::new(
+            source,
+            Some(LocalContext {
+                name,
+                captures: call.captures,
+                is_async: false,
+            }),
+            limits,
+        )
+        .compile(Some(spec))
+    }
+
+    pub(super) fn compile_claimed_async_local(
+        source: &HashMap<String, FnDecl>,
+        call: &FunctionValueCall<'_>,
+        limits: Limits,
+    ) -> Admission<Self> {
+        let (local, spec) = claimed_async_local_spec(source, call)?;
+        Builder::new(source, Some(local), limits).compile(Some(spec))
     }
 
     pub(super) fn function(&self, id: FnId) -> CodeFn {
@@ -417,6 +461,26 @@ enum FunctionRole {
     ResultRoot,
     ClaimedAsyncResultRoot,
     AsyncResultDependency,
+    ClaimedLocalAsyncResultRoot,
+}
+
+#[derive(Clone, Copy)]
+struct LocalContext<'a> {
+    name: &'a str,
+    captures: &'a Env,
+    is_async: bool,
+}
+
+impl LocalContext<'_> {
+    fn stable_capture(self, name: &str) -> bool {
+        if self.is_async {
+            // The producer's mutable cell becomes foreign to every child.
+            // Its same-Task synchronous stability cannot prove async safety.
+            self.captures.is_immutable_scalar_binding(name)
+        } else {
+            self.captures.is_stable_scalar_binding(name)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -427,6 +491,52 @@ struct FunctionSpec<'a> {
     span: Span,
     declaration: Option<&'a FnDecl>,
     role: FunctionRole,
+}
+
+fn claimed_async_local_spec<'a>(
+    source: &HashMap<String, FnDecl>,
+    call: &'a FunctionValueCall<'_>,
+) -> Admission<(LocalContext<'a>, FunctionSpec<'a>)> {
+    let name = call
+        .self_name
+        .as_deref()
+        .ok_or(AdmissionError::Unsupported(call.span))?;
+    if !call.is_async
+        || source.contains_key(name)
+        || call.params.len() != call.args.len()
+        || call.params.len() != call.param_modes.len()
+        || call
+            .param_modes
+            .iter()
+            .any(|mode| *mode != ParamMode::Owned)
+        || call.args.iter().any(|value| {
+            !matches!(
+                value,
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null
+            )
+        })
+    {
+        return Err(AdmissionError::Unsupported(call.span));
+    }
+    // Borrow params/body/self metadata while the producer still owns its real
+    // callable. The builder copies only flat syntax; it never clones that AST,
+    // an argument, or a capture payload. Unsupported admission remains whole
+    // legacy, including its original child-side arity and error timing.
+    Ok((
+        LocalContext {
+            name,
+            captures: call.captures,
+            is_async: true,
+        },
+        FunctionSpec {
+            name,
+            params: Parameters::Local(call.params),
+            body: call.body,
+            span: call.span,
+            declaration: None,
+            role: FunctionRole::ClaimedLocalAsyncResultRoot,
+        },
+    ))
 }
 
 impl<'a> FunctionSpec<'a> {
@@ -466,7 +576,9 @@ impl<'a> FunctionSpec<'a> {
     fn is_async(self) -> bool {
         matches!(
             self.role,
-            FunctionRole::ClaimedAsyncResultRoot | FunctionRole::AsyncResultDependency
+            FunctionRole::ClaimedAsyncResultRoot
+                | FunctionRole::AsyncResultDependency
+                | FunctionRole::ClaimedLocalAsyncResultRoot
         )
     }
 
@@ -476,12 +588,16 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::ResultRoot
                 | FunctionRole::ClaimedAsyncResultRoot
                 | FunctionRole::AsyncResultDependency
+                | FunctionRole::ClaimedLocalAsyncResultRoot
         )
     }
 
     fn validate(self) -> Admission<()> {
         let Some(function) = self.declaration else {
-            return Ok(());
+            return match self.role {
+                FunctionRole::Scalar | FunctionRole::ClaimedLocalAsyncResultRoot => Ok(()),
+                _ => Err(AdmissionError::Unsupported(self.span)),
+            };
         };
         let return_supported = match self.role {
             FunctionRole::Scalar => !function.is_async && scalar_type(&function.return_type),
@@ -491,6 +607,7 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::ClaimedAsyncResultRoot | FunctionRole::AsyncResultDependency => {
                 function.is_async && scalar_result_type(&function.return_type)
             }
+            FunctionRole::ClaimedLocalAsyncResultRoot => false,
         };
         if !function.type_params.is_empty() || !return_supported {
             return Err(AdmissionError::Unsupported(self.span));
@@ -539,7 +656,7 @@ fn binding_kind(bound: &[Binding<'_>], name: &str) -> Option<ValueKind> {
 fn expression_kind(
     expr: &Expr,
     source: &HashMap<String, FnDecl>,
-    local_name: Option<&str>,
+    local: Option<LocalContext<'_>>,
     bound: &[Binding<'_>],
 ) -> Admission<ValueKind> {
     Ok(match &expr.kind {
@@ -555,8 +672,12 @@ fn expression_kind(
             let ExprKind::Variable(name) = &callee.kind else {
                 return Err(AdmissionError::Unsupported(callee.span));
             };
-            if local_name == Some(name.as_str()) {
-                ValueKind::Scalar
+            if let Some(local) = local.filter(|local| local.name == name.as_str()) {
+                if local.is_async {
+                    ValueKind::Task
+                } else {
+                    ValueKind::Scalar
+                }
             } else if let Some(function) = source.get(name) {
                 if function.is_async {
                     ValueKind::Task
@@ -614,7 +735,7 @@ enum Visit<'a> {
 
 struct Builder<'a> {
     source: &'a HashMap<String, FnDecl>,
-    local: Option<(&'a str, &'a Env)>,
+    local: Option<LocalContext<'a>>,
     arena: CodeArena,
     functions: FrameStack<(FunctionSpec<'a>, FnId)>,
     pending: FrameStack<Visit<'a>>,
@@ -679,7 +800,7 @@ fn rejected(error: ReserveError, span: Span) -> AdmissionError {
 impl<'a> Builder<'a> {
     fn new(
         source: &'a HashMap<String, FnDecl>,
-        local: Option<(&'a str, &'a Env)>,
+        local: Option<LocalContext<'a>>,
         limits: Limits,
     ) -> Self {
         Self {
@@ -804,7 +925,11 @@ impl<'a> Builder<'a> {
     }
 
     fn terminal_ok(&mut self, expr: &'a Expr) -> Admission<ExprId> {
-        let argument = terminal_ok_argument(expr, self.source, self.is_bound("ok"))?;
+        let shadowed = self.is_bound("ok")
+            || self
+                .local
+                .is_some_and(|local| local.captures.contains("ok"));
+        let argument = terminal_ok_argument(expr, self.source, shadowed)?;
         expect_kind(self.kind(argument)?, ValueKind::Scalar, argument.span)?;
         // This direct lowering replaces the ordinary visit of the ok Call;
         // charge that syntax step without storing a second visit buffer.
@@ -868,19 +993,14 @@ impl<'a> Builder<'a> {
     }
 
     fn kind(&self, expr: &Expr) -> Admission<ValueKind> {
-        expression_kind(
-            expr,
-            self.source,
-            self.local.map(|(name, _)| name),
-            self.bound.as_slice(),
-        )
+        expression_kind(expr, self.source, self.local, self.bound.as_slice())
     }
 
     fn check_free(&self, name: &str, span: Span) -> Admission<()> {
-        if let Some((_, captures)) = self.local {
+        if let Some(local) = self.local {
             if !self.is_bound(name)
                 && (self.source.contains_key(name)
-                    || (captures.contains(name) && !captures.is_stable_scalar_binding(name)))
+                    || (local.captures.contains(name) && !local.stable_capture(name)))
             {
                 return Err(AdmissionError::Unsupported(span));
             }
@@ -1027,7 +1147,7 @@ impl<'a> Builder<'a> {
                     ExprKind::Literal(Literal::Null) => ExprCode::Literal(ScalarLiteral::Null),
                     ExprKind::Variable(name) => {
                         if (self.local.is_none() && self.source.contains_key(name))
-                            || self.local.is_some_and(|(self_name, _)| name == self_name)
+                            || self.local.is_some_and(|local| name == local.name)
                         {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
@@ -1067,8 +1187,8 @@ impl<'a> Builder<'a> {
                         let ExprKind::Variable(name) = &callee.kind else {
                             return Err(AdmissionError::Unsupported(callee.span));
                         };
-                        let function = if let Some((self_name, _)) = self.local {
-                            if name != self_name {
+                        let function = if let Some(local) = self.local {
+                            if name != local.name {
                                 return Err(AdmissionError::Unsupported(callee.span));
                             }
                             let function = *self.arena.functions.get(0).expect("local function");
@@ -1101,9 +1221,17 @@ impl<'a> Builder<'a> {
                             .expect("callee slot")
                             .is_async
                         {
-                            ExprCode::AsyncStart {
-                                function,
-                                args: range,
+                            if self.local.is_some() {
+                                ExprCode::AsyncSelfStart {
+                                    function,
+                                    args: range,
+                                    callee_span: self.span(callee.span)?,
+                                }
+                            } else {
+                                ExprCode::AsyncStart {
+                                    function,
+                                    args: range,
+                                }
                             }
                         } else {
                             ExprCode::Call {
@@ -1127,8 +1255,8 @@ impl<'a> Builder<'a> {
 
     fn statement(&mut self, stmt: &'a Stmt, result_root: bool) -> Admission<StmtCode> {
         let span = stmt_span(stmt);
-        if self.local.is_some_and(|(self_name, _)| matches!(stmt,
-            Stmt::VarDecl { name, .. } | Stmt::Assign { name, .. } | Stmt::For { name, .. } if name == self_name)) {
+        if self.local.is_some_and(|local| matches!(stmt,
+            Stmt::VarDecl { name, .. } | Stmt::Assign { name, .. } | Stmt::For { name, .. } if name == local.name)) {
             return Err(AdmissionError::Unsupported(span));
         }
         Ok(match stmt {
@@ -1248,7 +1376,7 @@ enum Scan<'a> {
 
 struct Eligibility<'a> {
     source: &'a HashMap<String, FnDecl>,
-    local: Option<(&'a str, &'a Env)>,
+    local: Option<LocalContext<'a>>,
     functions: FrameStack<FunctionSpec<'a>>,
     checked: FrameStack<&'a str>,
     pending: FrameStack<Scan<'a>>,
@@ -1260,7 +1388,7 @@ struct Eligibility<'a> {
 impl<'a> Eligibility<'a> {
     fn new(
         source: &'a HashMap<String, FnDecl>,
-        local: Option<(&'a str, &'a Env)>,
+        local: Option<LocalContext<'a>>,
         limits: Limits,
     ) -> Self {
         Self {
@@ -1300,18 +1428,13 @@ impl<'a> Eligibility<'a> {
         Ok(())
     }
     fn kind(&self, expr: &Expr) -> Admission<ValueKind> {
-        expression_kind(
-            expr,
-            self.source,
-            self.local.map(|(name, _)| name),
-            self.bound.as_slice(),
-        )
+        expression_kind(expr, self.source, self.local, self.bound.as_slice())
     }
     fn free(&self, name: &str, span: Span) -> Admission<()> {
-        if let Some((_, captures)) = self.local {
+        if let Some(local) = self.local {
             if !self.bound(name)
                 && (self.source.contains_key(name)
-                    || (captures.contains(name) && !captures.is_stable_scalar_binding(name)))
+                    || (local.captures.contains(name) && !local.stable_capture(name)))
             {
                 return Err(AdmissionError::Unsupported(span));
             }
@@ -1391,8 +1514,8 @@ impl<'a> Eligibility<'a> {
                                 base,
                             },
                         );
-                        if self.local.is_some_and(|(self_name, _)| matches!(stmt,
-                            Stmt::VarDecl { name, .. } | Stmt::Assign { name, .. } | Stmt::For { name, .. } if name == self_name)) {
+                        if self.local.is_some_and(|local| matches!(stmt,
+                            Stmt::VarDecl { name, .. } | Stmt::Assign { name, .. } | Stmt::For { name, .. } if name == local.name)) {
                             return Err(AdmissionError::Unsupported(span));
                         }
                         match stmt {
@@ -1423,8 +1546,12 @@ impl<'a> Eligibility<'a> {
                                 if spec.is_result_root() {
                                     let value =
                                         value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
+                                    let shadowed = self.bound("ok")
+                                        || self
+                                            .local
+                                            .is_some_and(|local| local.captures.contains("ok"));
                                     let argument =
-                                        terminal_ok_argument(value, self.source, self.bound("ok"))?;
+                                        terminal_ok_argument(value, self.source, shadowed)?;
                                     expect_kind(
                                         self.kind(argument)?,
                                         ValueKind::Scalar,
@@ -1514,7 +1641,7 @@ impl<'a> Eligibility<'a> {
                         ) => {}
                         ExprKind::Variable(name) => {
                             if (self.local.is_none() && self.source.contains_key(name))
-                                || self.local.is_some_and(|(self_name, _)| name == self_name)
+                                || self.local.is_some_and(|local| name == local.name)
                             {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
@@ -1548,8 +1675,8 @@ impl<'a> Eligibility<'a> {
                             let ExprKind::Variable(name) = &callee.kind else {
                                 return Err(AdmissionError::Unsupported(callee.span));
                             };
-                            if let Some((self_name, _)) = self.local {
-                                if name != self_name || args.len() != count {
+                            if let Some(local) = self.local {
+                                if name != local.name || args.len() != count {
                                     return Err(AdmissionError::Unsupported(expr.span));
                                 }
                             } else {

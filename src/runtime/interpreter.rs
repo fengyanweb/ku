@@ -468,47 +468,28 @@ impl Interpreter {
 
     fn call_function_value_flow(&mut self, call: FunctionValueCall<'_>) -> KuResult<Flow> {
         if call.is_async {
-            self.reject_cleanup_submission(call.span)?;
+            let span = call.span;
+            self.reject_cleanup_submission(span)?;
             if call.param_modes.contains(&ParamMode::View) {
                 return Err(KuError::runtime(
                     "async functions cannot declare borrowed parameters",
-                    call.span,
+                    span,
                 ));
             }
             for value in &call.args {
-                value.require_owned_root(call.span)?;
+                value.require_owned_root(span)?;
             }
-            let runtime = self.task_runtime.clone().ok_or_else(|| {
-                KuError::runtime("async task runtime is not initialized", call.span)
-            })?;
+            let runtime = self
+                .task_runtime
+                .clone()
+                .ok_or_else(|| KuError::runtime("async task runtime is not initialized", span))?;
             let template = self.template();
             let child_runtime = runtime.clone();
-            let params = call.params.to_vec();
-            let param_modes = call.param_modes.to_vec();
-            let body = call.body.to_vec();
-            let captures = call.captures.clone();
-            let self_name = call.self_name.clone();
-            let args = call.args;
-            let span = call.span;
+            let prepared = execution::prepare_async_function_value(self, call);
             let task = runtime.spawn_runner_deferred(|| {
                 move || {
-                    let mut interpreter = Interpreter::from_template(template, child_runtime);
-                    crate::runtime::task::OnceTaskRunner::new(move || {
-                        interpreter.call_function_value_direct(
-                            FunctionValueCall {
-                                params: &params,
-                                param_modes: &param_modes,
-                                body: &body,
-                                captures: &captures,
-                                self_name: &self_name,
-                                is_async: true,
-                                args,
-                                span,
-                                depth: 0,
-                            },
-                            true,
-                        )
-                    })
+                    let interpreter = Interpreter::from_template(template, child_runtime);
+                    execution::ClaimedFunctionValueTask::new(interpreter, prepared)
                 }
             })?;
             return Ok(Flow::returned(Value::Task(task)));
