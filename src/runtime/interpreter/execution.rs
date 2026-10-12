@@ -4494,6 +4494,50 @@ impl ClaimedNamedTask {
         let (function, args) = runner.legacy.as_ref().expect("initial named task body");
         let limits = Limits::default();
         let source = runner.interpreter.functions.clone();
+        let owned_string_result = function.is_async
+            && matches!(&function.return_type,
+                Some(TypeName::Result(inner)) if matches!(inner.as_ref(), TypeName::String));
+        let owned_shape = owned_string_result
+            && args.len() == function.params.len()
+            && args
+                .iter()
+                .all(|value| matches!(value, Value::String(_)) || scalar(value, span).is_ok())
+            && args.iter().zip(&function.params).all(|(value, param)| {
+                if matches!(param.ty, Some(TypeName::String)) {
+                    matches!(value, Value::String(_))
+                } else {
+                    scalar(value, span).is_ok()
+                }
+            });
+        if owned_shape
+            && code::eligible_claimed_async_owned_result_string_entry(&source, function, limits)
+        {
+            let code = match CodeHandle::compile_claimed_async_owned_result_string_entry(
+                &source, function, limits,
+            ) {
+                Ok(code) => code,
+                Err(AdmissionError::Unsupported(_)) => return runner,
+                Err(error @ AdmissionError::Rejected(_)) => {
+                    runner.outcome = Some(Err(error.into_error()));
+                    drop(runner.legacy.take());
+                    return runner;
+                }
+            };
+            // Whole-tree selection and code construction precede taking the
+            // original FnDecl/Vec. Unsupported admission keeps both intact.
+            let (function, mut args) = runner.legacy.take().expect("selected owned task input");
+            let mut machine = Machine::from_code(code, limits, runner.interpreter.call_depth);
+            if let Err(error) = machine.start_owned_once(&function.name, &mut args, 0, false) {
+                runner.outcome = Some(Err(error));
+            }
+            runner.machine = Some(machine);
+            // start_owned_once admits the actual input Vec/String capacities
+            // before entering parameters/body, and moves each Owned root. Its
+            // real entry buffer (or rejected original input) retires here.
+            drop(function);
+            drop(args);
+            return runner;
+        }
         if args.iter().any(|value| scalar(value, span).is_err())
             || !code::eligible_claimed_async_entry(&source, function, limits)
         {

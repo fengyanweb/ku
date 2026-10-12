@@ -1,5 +1,6 @@
 use super::*;
 
+mod async_result_string;
 mod borrowed_result;
 mod borrowed_string;
 mod chunk;

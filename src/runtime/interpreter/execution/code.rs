@@ -233,6 +233,16 @@ pub(super) fn eligible_claimed_async_entry(
         .is_ok()
 }
 
+pub(super) fn eligible_claimed_async_owned_result_string_entry(
+    source: &HashMap<String, FnDecl>,
+    entry: &FnDecl,
+    limits: Limits,
+) -> bool {
+    Eligibility::new(source, None, limits)
+        .check(FunctionSpec::claimed_async_owned_result_string_entry(entry))
+        .is_ok()
+}
+
 pub(super) fn eligible_local(
     source: &HashMap<String, FnDecl>,
     call: &FunctionValueCall<'_>,
@@ -332,6 +342,16 @@ impl CodeHandle {
         limits: Limits,
     ) -> Admission<Self> {
         Builder::new(source, None, limits).compile(Some(FunctionSpec::claimed_async_entry(entry)))
+    }
+
+    pub(super) fn compile_claimed_async_owned_result_string_entry(
+        source: &HashMap<String, FnDecl>,
+        entry: &FnDecl,
+        limits: Limits,
+    ) -> Admission<Self> {
+        Builder::new(source, None, limits).compile(Some(
+            FunctionSpec::claimed_async_owned_result_string_entry(entry),
+        ))
     }
 
     #[cfg(test)]
@@ -517,6 +537,7 @@ enum FunctionRole {
     BorrowedScalarResultNamed,
     ResultRoot,
     ClaimedAsyncResultRoot,
+    ClaimedAsyncOwnedResultStringRoot,
     AsyncResultDependency,
     ClaimedLocalAsyncResultRoot,
 }
@@ -637,7 +658,10 @@ impl<'a> FunctionSpec<'a> {
     }
 
     fn owns_result_string(self) -> bool {
-        matches!(self.role, FunctionRole::OwnedResultStringNamed)
+        matches!(
+            self.role,
+            FunctionRole::OwnedResultStringNamed | FunctionRole::ClaimedAsyncOwnedResultStringRoot
+        )
     }
 
     fn borrowed_string_named(function: &'a FnDecl) -> Self {
@@ -670,6 +694,22 @@ impl<'a> FunctionSpec<'a> {
         spec
     }
 
+    fn claimed_async_owned_result_string_entry(function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        spec.role = FunctionRole::ClaimedAsyncOwnedResultStringRoot;
+        spec
+    }
+
+    fn is_claimed_async_owned_result_string(self) -> bool {
+        matches!(self.role, FunctionRole::ClaimedAsyncOwnedResultStringRoot)
+    }
+
+    fn allows_await(self) -> bool {
+        // The new root records its async declaration for the claimant, but
+        // its selected body and all dependencies are strictly synchronous.
+        self.is_async() && !self.is_claimed_async_owned_result_string()
+    }
+
     fn dependency(function: &'a FnDecl) -> Self {
         let mut spec = Self::named(function);
         if function.is_async {
@@ -682,6 +722,7 @@ impl<'a> FunctionSpec<'a> {
         matches!(
             self.role,
             FunctionRole::ClaimedAsyncResultRoot
+                | FunctionRole::ClaimedAsyncOwnedResultStringRoot
                 | FunctionRole::AsyncResultDependency
                 | FunctionRole::ClaimedLocalAsyncResultRoot
         )
@@ -692,6 +733,7 @@ impl<'a> FunctionSpec<'a> {
             self.role,
             FunctionRole::OwnedNamed
                 | FunctionRole::OwnedResultStringNamed
+                | FunctionRole::ClaimedAsyncOwnedResultStringRoot
                 | FunctionRole::BorrowedStringNamed
                 | FunctionRole::BorrowedScalarResultNamed
         )
@@ -763,6 +805,9 @@ impl<'a> FunctionSpec<'a> {
             }
             FunctionRole::OwnedResultStringNamed => {
                 !function.is_async && string_result_type(&function.return_type)
+            }
+            FunctionRole::ClaimedAsyncOwnedResultStringRoot => {
+                function.is_async && string_result_type(&function.return_type)
             }
             FunctionRole::ResultRoot => {
                 !function.is_async && scalar_result_type(&function.return_type)
@@ -1505,13 +1550,16 @@ impl<'a> Builder<'a> {
                         ExprCode::Binary(left, *op, right)
                     }
                     ExprKind::Await(task) => {
-                        if !spec.is_async() {
+                        if !spec.allows_await() {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
                         expect_kind(self.kind(task)?, ValueKind::Task, task.span)?;
                         ExprCode::Await(self.expression(task, true)?)
                     }
                     ExprKind::TryUnwrap { expr: inner } => {
+                        if spec.is_claimed_async_owned_result_string() {
+                            return Err(AdmissionError::Unsupported(expr.span));
+                        }
                         expect_kind(self.kind(inner)?, ValueKind::Result, inner.span)?;
                         let operand = if spec.borrows_scalar_result() {
                             self.expression_with_mode(
@@ -2239,13 +2287,16 @@ impl<'a> Eligibility<'a> {
                             self.expression_with_mode(left, operand_mode)?;
                         }
                         ExprKind::Await(task) => {
-                            if !spec.is_async() {
+                            if !spec.allows_await() {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
                             expect_kind(self.kind(task)?, ValueKind::Task, task.span)?;
                             self.expression(task, true)?;
                         }
                         ExprKind::TryUnwrap { expr: inner } => {
+                            if spec.is_claimed_async_owned_result_string() {
+                                return Err(AdmissionError::Unsupported(expr.span));
+                            }
                             expect_kind(self.kind(inner)?, ValueKind::Result, inner.span)?;
                             if spec.borrows_scalar_result() {
                                 self.expression_with_mode(
