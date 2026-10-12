@@ -35,6 +35,8 @@ mod local_driver;
 #[cfg(test)]
 mod owner_cleanup_ack_tests;
 #[cfg(test)]
+mod producer_retirement_tests;
+#[cfg(test)]
 mod queue_retirement_tests;
 mod runner;
 pub(crate) use runner::{LocalTaskRunner, OnceTaskRunner};
@@ -61,6 +63,10 @@ const TASK_CANCELLED: u8 = 5;
 const TASK_CANCELLING: u8 = 6;
 const TASK_PANICKED: u8 = 7;
 const TASK_TIMED_OUT: u8 = 8;
+
+const SUBMISSION_PENDING: u8 = 0;
+const SUBMISSION_ACCEPTED: u8 = 1;
+const SUBMISSION_PRODUCER_RETIRED: u8 = 2;
 
 thread_local! {
     static CURRENT_TASK_ID: Cell<i64> = const { Cell::new(0) };
@@ -306,6 +312,37 @@ impl<'a> TaskSubmissionReservation<'a> {
 impl Drop for TaskSubmissionReservation<'_> {
     fn drop(&mut self) {
         self.rollback();
+    }
+}
+
+// Field Drop order is part of producer retirement: an uncalled constructor's
+// actual captures go first, then reservation rollback, then the primitive
+// publication. This scope adds no heap allocation or logical Task owner.
+struct ProducerScope<'a, B> {
+    build: Option<B>,
+    reservation: Option<TaskSubmissionReservation<'a>>,
+    retirement: ProducerRetirement,
+}
+
+struct ProducerRetirement {
+    state: Arc<TaskState>,
+    accepted: bool,
+}
+
+impl Drop for ProducerRetirement {
+    fn drop(&mut self) {
+        // Accepted execution can already have finished on another worker.
+        // This only classifies the producer's actual settled responsibility;
+        // it neither fabricates execution/accounting ACK nor starts cleanup.
+        self.state.submission.store(
+            if self.accepted {
+                SUBMISSION_ACCEPTED
+            } else {
+                SUBMISSION_PRODUCER_RETIRED
+            },
+            Ordering::Release,
+        );
+        self.state.ready.notify_all();
     }
 }
 
@@ -634,6 +671,7 @@ pub struct TaskStressReport {
 struct TaskState {
     id: i64,
     runtime: Weak<TaskRuntimeInner>,
+    submission: AtomicU8,
     queue_consumed: AtomicBool,
     // Execution/queue retirement and completion cleanup are independent of
     // public terminal result delivery and of the accounting once-claim.
@@ -741,6 +779,7 @@ impl TaskRuntime {
         let state = Arc::new(TaskState {
             id,
             runtime: Arc::downgrade(&self.inner),
+            submission: AtomicU8::new(SUBMISSION_PENDING),
             queue_consumed: AtomicBool::new(false),
             execution_queue_retired: AtomicBool::new(false),
             completion_cleanup_done: AtomicBool::new(false),
@@ -767,45 +806,57 @@ impl TaskRuntime {
                 state: Arc::downgrade(&state),
             }),
         };
-        if self.inner.closing.load(Ordering::Acquire)
-            || self.inner.task_workers.load(Ordering::Acquire) == 0
-        {
-            self.inner
-                .rejected_task_internal
-                .fetch_add(1, Ordering::Relaxed);
-            state.complete(
-                id,
-                Ok(task_error(
-                    "runtime_stopped",
-                    "async task runtime has no available workers",
-                )),
-            );
-            return Ok(handle);
-        }
-        if self
-            .inner
-            .active_tasks
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < self.inner.max_tasks).then_some(current + 1)
-            })
-            .is_err()
-        {
-            self.inner
-                .rejected_task_limit
-                .fetch_add(1, Ordering::Relaxed);
-            state.complete(
-                id,
-                Ok(task_error(
-                    "too_many_tasks",
-                    format!("async task limit {} reached", self.inner.max_tasks),
-                )),
-            );
-            return Ok(handle);
-        }
-        let mut reservation = TaskSubmissionReservation::new(self, id);
         // The sole producer handle stays outside this unwind boundary. It is
-        // dropped after rollback under the already established cleanup context.
+        // dropped after the actual producer scope under its cleanup context.
         let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let mut producer = ProducerScope {
+                build: Some(build),
+                reservation: None,
+                retirement: ProducerRetirement {
+                    state: Arc::clone(&state),
+                    accepted: false,
+                },
+            };
+            if self.inner.closing.load(Ordering::Acquire)
+                || self.inner.task_workers.load(Ordering::Acquire) == 0
+            {
+                self.inner
+                    .rejected_task_internal
+                    .fetch_add(1, Ordering::Relaxed);
+                state.complete(
+                    id,
+                    Ok(task_error(
+                        "runtime_stopped",
+                        "async task runtime has no available workers",
+                    )),
+                );
+                return;
+            }
+            if self
+                .inner
+                .active_tasks
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current < self.inner.max_tasks).then_some(current + 1)
+                })
+                .is_err()
+            {
+                self.inner
+                    .rejected_task_limit
+                    .fetch_add(1, Ordering::Relaxed);
+                state.complete(
+                    id,
+                    Ok(task_error(
+                        "too_many_tasks",
+                        format!("async task limit {} reached", self.inner.max_tasks),
+                    )),
+                );
+                return;
+            }
+            producer.reservation = Some(TaskSubmissionReservation::new(self, id));
+            let reservation = producer
+                .reservation
+                .as_mut()
+                .expect("admitted producer owns its reservation");
             let registration = {
                 match self.inner.states.lock() {
                     Ok(mut states) => {
@@ -851,6 +902,7 @@ impl TaskRuntime {
                     return;
                 }
             }
+            let build = producer.build.take().expect("constructor is consumed once");
             let run = match catch_unwind(AssertUnwindSafe(build)) {
                 Ok(run) => run,
                 Err(_) => {
@@ -903,6 +955,7 @@ impl TaskRuntime {
                     // A worker may already own this accepted node. Transfer the
                     // accounting responsibility before any subsequent operation.
                     reservation.commit_to_worker();
+                    producer.retirement.accepted = true;
                     self.inner
                         .accepted_submissions
                         .fetch_add(1, Ordering::Relaxed);
@@ -936,12 +989,11 @@ impl TaskRuntime {
                         )),
                     );
                 }
-            }
+            }; // End the Rust 2021 tail temporary before producer retirement.
         }));
         if let Err(panic) = outcome {
             let _cleanup = state.cancellation().map(CleanupGuard::enter);
             let mut first_panic = Some(panic);
-            reservation.rollback();
             state.catch_cleanup_panic(&mut first_panic, || drop(handle));
             std::panic::resume_unwind(first_panic.expect("producer owns its first panic"));
         }
@@ -1571,9 +1623,14 @@ impl TaskRuntime {
     }
 
     fn remove_state(&self, id: i64) {
-        if let Ok(mut states) = self.inner.states.lock() {
-            states.remove(&id);
-        }
+        // Cleanup must retire its actual Weak registration even after another
+        // native panic poisoned this lock. New registration still rejects the
+        // poison above; recovery here grants no new admission or user effect.
+        self.inner
+            .states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id);
     }
 
     fn register_wait(&self, current: i64, target: i64) -> KuResult<Option<&'static str>> {
@@ -2402,6 +2459,7 @@ mod tests {
         TaskState {
             id: 41,
             runtime: Weak::new(),
+            submission: AtomicU8::new(SUBMISSION_PENDING),
             queue_consumed: AtomicBool::new(false),
             execution_queue_retired: AtomicBool::new(false),
             completion_cleanup_done: AtomicBool::new(false),
