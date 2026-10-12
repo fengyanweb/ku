@@ -110,6 +110,10 @@ impl BorrowedValue {
         }
     }
 
+    pub(crate) fn is_root_view(&self) -> bool {
+        self.path.is_empty()
+    }
+
     pub(crate) fn is_current_owner(&self) -> bool {
         self.owner_thread == std::thread::current().id()
             && self.owner_task_id == crate::runtime::task::current_task_id()

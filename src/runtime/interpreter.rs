@@ -326,6 +326,11 @@ impl Interpreter {
                 .spawn_async_function(function.clone(), args, span)
                 .map(Flow::returned);
         }
+        if let Some(result) =
+            execution::try_execute_borrowed_string(self, function, &mut args, depth)
+        {
+            return result;
+        }
         if let Some(result) = execution::try_execute_owned(self, function, &mut args, depth) {
             // Unsupported selection leaves the original argument Vec intact.
             // A selected owner or rejection returns directly without replay.

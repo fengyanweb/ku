@@ -93,6 +93,13 @@ struct Metrics {
     retired_arguments_exits: usize,
     retained_string_payload_bytes: usize,
     peak_string_payload_bytes: usize,
+    retained_lease_capacity: usize,
+    peak_lease_capacity: usize,
+    retained_lease_bytes: usize,
+    peak_lease_bytes: usize,
+    retained_lease_root_bytes: usize,
+    peak_lease_root_bytes: usize,
+    lease_roots_created: usize,
     logical_depth: usize,
     // Source execution frame Vec backing only: calls/work/finally/values and
     // staged arguments, plus the selected input String buffers below. Other
@@ -430,6 +437,8 @@ impl<P: FnMut(Span) -> KuResult<()>> ExecutionHooks for PollHooks<P> {
 struct CallFrame {
     env: Env,
     leases: Vec<BorrowLease>,
+    charged_lease_capacity: usize,
+    charged_lease_root_bytes: usize,
     depth: usize,
     value_base: usize,
     epilogue_span: SpanId,
@@ -446,6 +455,8 @@ struct ArgumentFrame {
     span: SpanId,
     value_base: usize,
     leases: Vec<BorrowLease>,
+    charged_lease_capacity: usize,
+    charged_lease_root_bytes: usize,
     staged: Vec<Value>,
     previous_observers: usize,
 }
@@ -628,6 +639,12 @@ struct Machine {
     // moves between slots and is conservatively charged until final transfer.
     string_payload_bytes: usize,
     peak_string_payload_bytes: usize,
+    lease_capacity: usize,
+    lease_bytes: usize,
+    lease_root_bytes: usize,
+    peak_lease_capacity: usize,
+    peak_lease_bytes: usize,
+    peak_lease_root_bytes: usize,
 }
 
 struct PendingScopeExit {
@@ -739,6 +756,20 @@ fn owned_parameter_value(param: code::CodeParam, value: &mut Value, span: Span) 
     }
 }
 
+fn string_view_root_bytes(value: &Value, span: Span) -> KuResult<usize> {
+    match value {
+        Value::String(_) => Ok(std::mem::size_of::<Value>()),
+        Value::Borrowed(view) if view.is_root_view() => view.with_read(span, |root| {
+            if matches!(root, Value::String(_)) {
+                Ok(0)
+            } else {
+                Err(unsupported(span))
+            }
+        }),
+        _ => Err(unsupported(span)),
+    }
+}
+
 fn scalar_type(ty: &Option<TypeName>) -> bool {
     matches!(
         ty,
@@ -824,6 +855,12 @@ impl Machine {
             peak_exit_handle_bytes: 0,
             string_payload_bytes: 0,
             peak_string_payload_bytes: 0,
+            lease_capacity: 0,
+            lease_bytes: 0,
+            lease_root_bytes: 0,
+            peak_lease_capacity: 0,
+            peak_lease_bytes: 0,
+            peak_lease_root_bytes: 0,
         }
     }
 
@@ -1002,6 +1039,10 @@ impl Machine {
             .max_frames
             .checked_sub(self.argument_capacity)
             .and_then(|frames| frames.checked_sub(self.exit_handle_capacity))
+            .and_then(|frames| frames.checked_sub(self.lease_capacity))
+            .and_then(|frames| {
+                frames.checked_sub(self.lease_root_bytes / std::mem::size_of::<Value>())
+            })
             .ok_or_else(|| storage_error(ReserveError::FrameLimit, span))?;
         let bytes = self
             .value_limits
@@ -1009,6 +1050,8 @@ impl Machine {
             .checked_sub(self.argument_bytes)
             .and_then(|bytes| bytes.checked_sub(self.exit_handle_bytes))
             .and_then(|bytes| bytes.checked_sub(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_sub(self.lease_bytes))
+            .and_then(|bytes| bytes.checked_sub(self.lease_root_bytes))
             .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
         self.values
             .reserve_with_budget(additional, frames, bytes)
@@ -1045,6 +1088,10 @@ impl Machine {
             .checked_add(additional)
             .and_then(|total| total.checked_add(self.values.capacity()))
             .and_then(|total| total.checked_add(self.exit_handle_capacity))
+            .and_then(|total| total.checked_add(self.lease_capacity))
+            .and_then(|total| {
+                total.checked_add(self.lease_root_bytes / std::mem::size_of::<Value>())
+            })
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if capacity > self.value_limits.max_frames {
             return Err(storage_error(ReserveError::FrameLimit, span));
@@ -1055,6 +1102,8 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.exit_handle_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(self.lease_bytes))
+            .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if bytes > self.value_limits.max_storage_bytes {
             return Err(storage_error(ReserveError::StorageLimit, span));
@@ -1074,6 +1123,10 @@ impl Machine {
             .checked_add(additional)
             .and_then(|count| count.checked_add(self.argument_capacity))
             .and_then(|count| count.checked_add(self.values.capacity()))
+            .and_then(|count| count.checked_add(self.lease_capacity))
+            .and_then(|count| {
+                count.checked_add(self.lease_root_bytes / std::mem::size_of::<Value>())
+            })
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if count > self.value_limits.max_frames {
             return Err(storage_error(ReserveError::FrameLimit, span));
@@ -1084,6 +1137,8 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(self.lease_bytes))
+            .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if bytes > self.value_limits.max_storage_bytes {
             return Err(storage_error(ReserveError::StorageLimit, span));
@@ -1095,6 +1150,91 @@ impl Machine {
         self.exit_handle_capacity -= capacity;
         self.exit_handle_bytes -=
             capacity * std::mem::size_of::<crate::runtime::task::TaskHandle>();
+    }
+
+    fn check_lease_capacity(
+        &self,
+        additional: usize,
+        root_bytes: usize,
+        span: Span,
+    ) -> KuResult<()> {
+        let total_roots = self
+            .lease_root_bytes
+            .checked_add(root_bytes)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let count = self
+            .lease_capacity
+            .checked_add(additional)
+            .and_then(|count| count.checked_add(total_roots / std::mem::size_of::<Value>()))
+            .and_then(|count| count.checked_add(self.argument_capacity))
+            .and_then(|count| count.checked_add(self.exit_handle_capacity))
+            .and_then(|count| count.checked_add(self.values.capacity()))
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        if count > self.value_limits.max_frames {
+            return Err(storage_error(ReserveError::FrameLimit, span));
+        }
+        let bytes = additional
+            .checked_mul(std::mem::size_of::<BorrowLease>())
+            .and_then(|bytes| bytes.checked_add(self.lease_bytes))
+            .and_then(|bytes| bytes.checked_add(total_roots))
+            .and_then(|bytes| bytes.checked_add(self.argument_bytes))
+            .and_then(|bytes| bytes.checked_add(self.exit_handle_bytes))
+            .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
+            .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        if bytes > self.value_limits.max_storage_bytes {
+            return Err(storage_error(ReserveError::StorageLimit, span));
+        }
+        Ok(())
+    }
+
+    fn lease_storage(&mut self, count: usize, span: Span) -> KuResult<Vec<BorrowLease>> {
+        self.check_lease_capacity(count, 0, span)?;
+        let mut leases = Vec::new();
+        leases
+            .try_reserve_exact(count)
+            .map_err(|_| storage_error(ReserveError::AllocationFailed, span))?;
+        let capacity = leases.capacity();
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<BorrowLease>())
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let peak_capacity = self
+            .lease_capacity
+            .checked_add(capacity)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let peak_bytes = self
+            .lease_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        self.peak_lease_capacity = self.peak_lease_capacity.max(peak_capacity);
+        self.peak_lease_bytes = self.peak_lease_bytes.max(peak_bytes);
+        self.check_lease_capacity(capacity, 0, span)?;
+        self.lease_capacity += capacity;
+        self.lease_bytes += bytes;
+        Ok(leases)
+    }
+
+    fn charge_string_lease(&mut self, lease: &BorrowLease, span: Span) -> usize {
+        assert!(lease.is_string_root());
+        let bytes = lease
+            .string_root_value_bytes()
+            .expect("admitted String lease root");
+        self.check_lease_capacity(0, bytes, span)
+            .expect("reserved before the real borrow");
+        self.lease_root_bytes += bytes;
+        self.peak_lease_root_bytes = self.peak_lease_root_bytes.max(self.lease_root_bytes);
+        self.metrics.lease_roots_created += 1;
+        bytes
+    }
+
+    fn release_lease_capacity(&mut self, capacity: usize, root_bytes: usize) {
+        self.lease_capacity -= capacity;
+        self.lease_bytes -= capacity * std::mem::size_of::<BorrowLease>();
+        self.lease_root_bytes -= root_bytes;
+    }
+
+    fn admitted_string_leases(leases: &[BorrowLease], capacity: usize, charged: usize) -> bool {
+        capacity == charged && leases.iter().all(BorrowLease::is_string_root)
     }
 
     fn scope_handles(
@@ -1147,9 +1287,13 @@ impl Machine {
         arguments: &ArgumentFrame,
         span: Span,
     ) -> KuResult<Option<Vec<crate::runtime::task::TaskHandle>>> {
-        // Borrowed/general calls retain their original whole adapter. Even an
-        // empty retained lease allocation is outside this selected slice.
-        if arguments.leases.capacity() != 0 {
+        // Only the proven String leaf lease and its already charged backing
+        // enter this slice. General roots retain their original adapter.
+        if !Self::admitted_string_leases(
+            &arguments.leases,
+            arguments.leases.capacity(),
+            arguments.charged_lease_capacity,
+        ) {
             return Ok(None);
         }
         let mut count = 0usize;
@@ -1160,6 +1304,11 @@ impl Machine {
                 | Value::Bool(_)
                 | Value::String(_)
                 | Value::Null => {}
+                Value::Borrowed(view)
+                    if view.is_root_view()
+                        && view
+                            .with_read(span, |root| Ok(matches!(root, Value::String(_))))
+                            .unwrap_or(false) => {}
                 Value::Task(_) => {
                     count = count
                         .checked_add(1)
@@ -1344,9 +1493,12 @@ impl Machine {
         let admitted = hooks
             .prepare_call_exit(&mut self.frame().env, source_span, kind)
             .and_then(|()| {
-                // This slice has no lease backing. A retained empty Vec is
-                // still storage, so it also stays with the original adapter.
-                if self.frame().leases.capacity() != 0 {
+                let frame = self.frame();
+                if !Self::admitted_string_leases(
+                    &frame.leases,
+                    frame.leases.capacity(),
+                    frame.charged_lease_capacity,
+                ) {
                     return Ok(None);
                 }
                 self.scope_handles(source_span, true)
@@ -1390,7 +1542,11 @@ impl Machine {
                         .env
                         .current_scope_simple_task_count(source_span),
                     Ok(0),
-                ) || !self.frame().leases.is_empty();
+                ) || self
+                    .frame()
+                    .leases
+                    .iter()
+                    .any(|lease| !lease.is_string_root());
                 let host = hooks.host();
                 host.observe_termination(&result);
                 let carried = match &result {
@@ -1416,6 +1572,8 @@ impl Machine {
                     .calls
                     .pop()
                     .expect("real rejected call frame");
+                let lease_capacity = frame.charged_lease_capacity;
+                let lease_root_bytes = frame.charged_lease_root_bytes;
                 while self.resources.as_ref().expect("live prefix").values.len() > frame.value_base
                 {
                     self.resources.as_mut().expect("live prefix").values.pop();
@@ -1428,6 +1586,9 @@ impl Machine {
                     frame.kind,
                     &self.fallback_release,
                 );
+                self.lease_capacity -= lease_capacity;
+                self.lease_bytes -= lease_capacity * std::mem::size_of::<BorrowLease>();
+                self.lease_root_bytes -= lease_root_bytes;
                 for release in [self.fallback_release.get(), current_cleanup_context()]
                     .into_iter()
                     .flatten()
@@ -1473,8 +1634,11 @@ impl Machine {
                 // adapter, including its actual Env and owner drop ordering.
                 let frame = self.calls.pop().expect("real legacy call frame");
                 self.discard_values_after(frame.value_base);
+                let capacity = frame.charged_lease_capacity;
+                let root_bytes = frame.charged_lease_root_bytes;
                 let result =
                     hooks.finish_call(frame.env, frame.leases, result, source_span, frame.kind);
+                self.release_lease_capacity(capacity, root_bytes);
                 self.call_depth -= 1;
                 self.metrics.retired_calls += 1;
                 self.pending = Some(result);
@@ -1534,16 +1698,18 @@ impl Machine {
             }
             Err(mut error) => {
                 let needs_context = outgoing_needs_cleanup(&result)
-                    || !arguments.leases.is_empty()
+                    || arguments.leases.iter().any(|lease| !lease.is_string_root())
                     || arguments.staged.iter().any(|value| {
-                        !matches!(
+                        !(matches!(
                             value,
                             Value::Int(_)
                                 | Value::Float(_)
                                 | Value::Bool(_)
                                 | Value::String(_)
                                 | Value::Null,
-                        )
+                        ) || matches!(value, Value::Borrowed(view) if view.is_root_view()
+                            && view.with_read(source_span, |root| Ok(matches!(root, Value::String(_))))
+                                .unwrap_or(false)))
                     });
                 let host = hooks.host();
                 host.observe_termination(&result);
@@ -1570,6 +1736,8 @@ impl Machine {
                         self.resources.as_mut().expect("live prefix").values.pop();
                     }
                     let capacity = arguments.staged.capacity();
+                    let lease_capacity = arguments.charged_lease_capacity;
+                    let lease_root_bytes = arguments.charged_lease_root_bytes;
                     let owner_call = self.resources.as_ref().expect("live prefix").calls.len() - 1;
                     let env = &mut self
                         .resources
@@ -1587,6 +1755,9 @@ impl Machine {
                         source_span,
                         &self.fallback_release,
                     );
+                    self.lease_capacity -= lease_capacity;
+                    self.lease_bytes -= lease_capacity * std::mem::size_of::<BorrowLease>();
+                    self.lease_root_bytes -= lease_root_bytes;
                     hooks
                         .host()
                         .caller_owners
@@ -1636,6 +1807,8 @@ impl Machine {
             Ok(None) => {
                 self.discard_values_after(arguments.value_base);
                 let capacity = arguments.staged.capacity();
+                let lease_capacity = arguments.charged_lease_capacity;
+                let lease_root_bytes = arguments.charged_lease_root_bytes;
                 let owner_call = self.resources.as_ref().expect("live prefix").calls.len() - 1;
                 let env = &mut self
                     .resources
@@ -1658,6 +1831,7 @@ impl Machine {
                     .caller_owners
                     .truncate(arguments.previous_observers);
                 self.release_argument_capacity(capacity);
+                self.release_lease_capacity(lease_capacity, lease_root_bytes);
                 self.emit_arguments_result(result, source_span);
             }
         }
@@ -1729,6 +1903,11 @@ impl Machine {
                             .get_mut(exit.owner_call - 1)
                             .expect("retained call frame");
                         drop(std::mem::take(&mut frame.leases));
+                        let capacity = std::mem::take(&mut frame.charged_lease_capacity);
+                        let root_bytes = std::mem::take(&mut frame.charged_lease_root_bytes);
+                        self.lease_capacity -= capacity;
+                        self.lease_bytes -= capacity * std::mem::size_of::<BorrowLease>();
+                        self.lease_root_bytes -= root_bytes;
                     }
                     exit.state.finish_teardown(host);
                 }
@@ -1745,6 +1924,11 @@ impl Machine {
                         self.argument_capacity -= capacity;
                         self.argument_bytes -= capacity * std::mem::size_of::<Value>();
                         drop(std::mem::take(&mut frame.leases));
+                        let capacity = std::mem::take(&mut frame.charged_lease_capacity);
+                        let root_bytes = std::mem::take(&mut frame.charged_lease_root_bytes);
+                        self.lease_capacity -= capacity;
+                        self.lease_bytes -= capacity * std::mem::size_of::<BorrowLease>();
+                        self.lease_root_bytes -= root_bytes;
                     }
                     exit.state.finish_teardown(host);
                 }
@@ -1894,6 +2078,11 @@ impl Machine {
         self.reserve_exits(1, span)?;
         self.reserve_work(3, span)?;
         self.reserve_values(1, span)?;
+        let view_count = (0..function.arity())
+            .filter(|index| self.code.parameter(function, *index).view_string)
+            .count();
+        let leases = self.lease_storage(view_count, span)?;
+        let charged_lease_capacity = leases.capacity();
         let env = if let Some(captures) = &self.captures {
             let mut env = captures.clone();
             env.push_scope();
@@ -1916,7 +2105,9 @@ impl Machine {
             &mut self.calls,
             CallFrame {
                 env,
-                leases: Vec::new(),
+                leases,
+                charged_lease_capacity,
+                charged_lease_root_bytes: 0,
                 depth,
                 value_base,
                 epilogue_span,
@@ -1970,7 +2161,14 @@ impl Machine {
         for (index, value) in args.iter_mut().enumerate() {
             let param = self.code.parameter(function, index);
             let name = self.code.symbol(param.name).to_string();
-            let value = owned_parameter_value(param, value, span)?;
+            let value = if param.view_string {
+                let bytes = string_view_root_bytes(value, span)?;
+                self.check_lease_capacity(0, bytes, span)?;
+                let value = std::mem::replace(value, Value::Null);
+                self.temporary_string_parameter(value, span)
+            } else {
+                owned_parameter_value(param, value, span)?
+            };
             let param_span = self.code.span(param.span);
             self.frame()
                 .env
@@ -1992,11 +2190,24 @@ impl Machine {
         for index in 0..count {
             let param = self.code.parameter(function, index);
             let name = self.code.symbol(param.name).to_string();
-            let value = owned_parameter_value(
-                param,
-                &mut self.entry_args.as_mut().expect("live owned entry input")[index],
-                span,
-            )?;
+            let value = if param.view_string {
+                let bytes = string_view_root_bytes(
+                    &self.entry_args.as_ref().expect("live owned entry input")[index],
+                    span,
+                )?;
+                self.check_lease_capacity(0, bytes, span)?;
+                let value = std::mem::replace(
+                    &mut self.entry_args.as_mut().expect("live owned entry input")[index],
+                    Value::Null,
+                );
+                self.temporary_string_parameter(value, span)
+            } else {
+                owned_parameter_value(
+                    param,
+                    &mut self.entry_args.as_mut().expect("live owned entry input")[index],
+                    span,
+                )?
+            };
             let param_span = self.code.span(param.span);
             self.frame()
                 .env
@@ -2004,6 +2215,51 @@ impl Machine {
         }
         self.enter_body(function);
         Ok(())
+    }
+
+    fn temporary_string_parameter(&mut self, value: Value, span: Span) -> Value {
+        let (view, lease) = BorrowLease::temporary(value);
+        if let Some(lease) = lease {
+            let bytes = self.charge_string_lease(&lease, span);
+            let frame = self.frame();
+            assert!(frame.leases.len() < frame.leases.capacity());
+            frame.charged_lease_root_bytes += bytes;
+            frame.leases.push(lease);
+        }
+        view
+    }
+
+    fn borrow_string_argument(&mut self, symbol: SymbolId, span: Span) -> KuResult<()> {
+        let exit_index = match self
+            .work
+            .get(self.work.len() - 1)
+            .expect("String view argument continuation")
+        {
+            Work::Arguments { exit_index, .. } => *exit_index,
+            _ => unreachable!("StringBorrow belongs only to a direct view argument"),
+        };
+        self.reserve_values(1, span)?;
+        let name = self.code.symbol(symbol).to_string();
+        let root_bytes = self
+            .frame()
+            .env
+            .with_value(&name, span, |value| string_view_root_bytes(value, span))?;
+        self.check_lease_capacity(0, root_bytes, span)?;
+        let (view, lease) = self.frame().env.borrow(&name, span)?;
+        if let Some(lease) = lease {
+            let bytes = self.charge_string_lease(&lease, span);
+            let Work::ArgumentsExit(arguments) = self
+                .work
+                .get_mut(exit_index)
+                .expect("real String view argument marker")
+            else {
+                unreachable!("stable argument marker owns the restoring lease");
+            };
+            assert!(arguments.leases.len() < arguments.leases.capacity());
+            arguments.charged_lease_root_bytes += bytes;
+            arguments.leases.push(lease);
+        }
+        self.emit(view, span)
     }
 
     fn enter_body(&mut self, function: code::CodeFn) {
@@ -2260,6 +2516,29 @@ impl Machine {
                         self.reserve_values(1, span)?;
                         let symbol = self.code.symbol(name).to_string();
                         let value = self.frame().env.take_owned_string(&symbol, span)?;
+                        self.emit(value, span)?;
+                    }
+                    ExprCode::StringBorrow(symbol) => self.borrow_string_argument(symbol, span)?,
+                    ExprCode::StringLength {
+                        symbol,
+                        byte_len,
+                        target_span,
+                    } => {
+                        let name = self.code.symbol(symbol);
+                        let target = self.code.span(target_span);
+                        let frame = self
+                            .calls
+                            .get(self.calls.len() - 1)
+                            .expect("String length caller");
+                        let value = frame.env.with_value(name, target, |value| {
+                            value.with_read(span, |value| {
+                                readonly_length(value, if byte_len { "byte_len" } else { "len" })
+                                    .ok_or_else(|| unsupported(span))
+                            })
+                        })?;
+                        // The old read-only helper obtains the real length
+                        // before ticking the target, after the outer Call tick.
+                        hooks.tick(target)?;
                         self.emit(value, span)?;
                     }
                     ExprCode::Await(operand) => {
@@ -2577,12 +2856,28 @@ impl Machine {
                 // any parameter expression. Failure never restarts effects.
                 self.reserve_exits(1, source_span)?;
                 let staged = self.argument_storage(args.len, source_span)?;
+                let declaration = self.code.function(function);
+                let view_count = (0..declaration.arity())
+                    .filter(|index| self.code.parameter(declaration, *index).view_string)
+                    .count();
+                let leases = match self.lease_storage(view_count, source_span) {
+                    Ok(leases) => leases,
+                    Err(error) => {
+                        let capacity = staged.capacity();
+                        drop(staged);
+                        self.release_argument_capacity(capacity);
+                        return Err(error);
+                    }
+                };
+                let charged_lease_capacity = leases.capacity();
                 let previous_observers = match self.register_call_observer(hooks, source_span) {
                     Ok(previous) => previous,
                     Err(error) => {
                         let capacity = staged.capacity();
                         drop(staged);
                         self.release_argument_capacity(capacity);
+                        drop(leases);
+                        self.release_lease_capacity(charged_lease_capacity, 0);
                         return Err(error);
                     }
                 };
@@ -2593,7 +2888,9 @@ impl Machine {
                     Work::ArgumentsExit(ArgumentFrame {
                         span,
                         value_base,
-                        leases: Vec::new(),
+                        leases,
+                        charged_lease_capacity,
+                        charged_lease_root_bytes: 0,
                         staged,
                         previous_observers,
                     }),
@@ -2976,6 +3273,9 @@ impl Machine {
             || self.exit_handle_bytes != 0
             || self.entry_args.is_some()
             || self.string_payload_bytes != 0
+            || self.lease_capacity != 0
+            || self.lease_bytes != 0
+            || self.lease_root_bytes != 0
             || self.call_depth != self.initial_depth
         {
             return Err(self.lifecycle_error("prepare undrained next run"));
@@ -3018,6 +3318,15 @@ impl Machine {
                             .checked_add(text.capacity())
                             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?
                     }
+                    Value::Borrowed(view) if view.is_root_view() => {
+                        let capacity = view.with_read(span, |root| match root {
+                            Value::String(text) => Ok(text.capacity()),
+                            _ => Err(unsupported(span)),
+                        })?;
+                        payload = payload
+                            .checked_add(capacity)
+                            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+                    }
                     Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => {}
                     _ => return Err(unsupported(span)),
                 }
@@ -3052,6 +3361,7 @@ impl Machine {
             self.release_entry_args();
             self.pending = Some(Err(error));
         }
+        self.snapshot_lease_metrics();
         Ok(())
     }
 
@@ -3145,6 +3455,7 @@ impl Machine {
         }
         self.finally.tighten(self.scope_release_context());
         window.finish(&mut self.finally);
+        self.snapshot_lease_metrics();
         match dispatched {
             Ok(result) => result,
             Err(panic) => {
@@ -3288,6 +3599,9 @@ impl Machine {
         assert_eq!(self.exits.len(), 0);
         assert_eq!(self.exit_handle_capacity, 0);
         assert_eq!(self.exit_handle_bytes, 0);
+        assert_eq!(self.lease_capacity, 0);
+        assert_eq!(self.lease_bytes, 0);
+        assert_eq!(self.lease_root_bytes, 0);
         assert_eq!(self.finally.frames.len(), 0);
         self.metrics.remaining_calls = self.calls.len();
         self.metrics.remaining_work = self.work.len();
@@ -3310,7 +3624,9 @@ impl Machine {
             + self.exits.peak_storage_bytes()
             + self.peak_argument_bytes
             + self.peak_exit_handle_bytes
-            + self.peak_string_payload_bytes;
+            + self.peak_string_payload_bytes
+            + self.peak_lease_bytes
+            + self.peak_lease_root_bytes;
         // A completed run keeps the same immutable code owner. Code is shared
         // by every call, so its retained backing cannot grow with call depth.
         assert_eq!(
@@ -3331,6 +3647,15 @@ impl Machine {
         self.metrics.peak_string_payload_bytes = self.peak_string_payload_bytes;
         self.state = MachineState::Finished;
         result
+    }
+
+    fn snapshot_lease_metrics(&mut self) {
+        self.metrics.retained_lease_capacity = self.lease_capacity;
+        self.metrics.peak_lease_capacity = self.peak_lease_capacity;
+        self.metrics.retained_lease_bytes = self.lease_bytes;
+        self.metrics.peak_lease_bytes = self.peak_lease_bytes;
+        self.metrics.retained_lease_root_bytes = self.lease_root_bytes;
+        self.metrics.peak_lease_root_bytes = self.peak_lease_root_bytes;
     }
 }
 
@@ -3398,6 +3723,79 @@ pub(super) fn try_execute_owned(
         Err(AdmissionError::Unsupported(_)) => return None,
         Err(error @ AdmissionError::Rejected(_)) => return Some(Err(error.into_error())),
     };
+    let mut machine = Machine::from_code(code, limits, interpreter.call_depth);
+    Some(machine.run_owned_with_hooks(&function.name, args, depth, false, interpreter))
+}
+
+pub(super) fn try_execute_borrowed_string(
+    interpreter: &mut Interpreter,
+    function: &FnDecl,
+    args: &mut Vec<Value>,
+    depth: usize,
+) -> Option<KuResult<Flow>> {
+    // Scalar and unrelated actual shapes retain their original selectors.
+    // Borrowed roots are inspected only after whole-tree selection; an expired
+    // or foreign root then returns its actual error without replaying a body.
+    if !args
+        .iter()
+        .any(|value| matches!(value, Value::String(_) | Value::Borrowed(_)))
+        || args.iter().any(|value| {
+            !matches!(
+                value,
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null | Value::String(_)
+            ) && !matches!(value, Value::Borrowed(view) if view.is_root_view())
+        })
+    {
+        return None;
+    }
+    let source = interpreter.functions.clone();
+    let limits = Limits::default();
+    if !code::eligible_borrowed_string_named(&source, function, limits) {
+        return None;
+    }
+    if function.params.len() != args.len() {
+        return Some(Err(KuError::runtime(
+            format!(
+                "function '{}' expects {} arguments but got {}",
+                function.name,
+                function.params.len(),
+                args.len()
+            ),
+            function.span,
+        )));
+    }
+    let code = match CodeHandle::compile_borrowed_string_named(&source, function, limits) {
+        Ok(code) => code,
+        Err(AdmissionError::Unsupported(_)) => return None,
+        Err(error @ AdmissionError::Rejected(_)) => return Some(Err(error.into_error())),
+    };
+    let declaration = code.function(
+        code.find_function(&function.name)
+            .expect("selected String entry"),
+    );
+    for (index, value) in args.iter().enumerate() {
+        let param = code.parameter(declaration, index);
+        if param.view_string {
+            match value {
+                Value::String(_) => {}
+                Value::Borrowed(view) if view.is_root_view() => {
+                    match view.with_read(function.span, |root| Ok(matches!(root, Value::String(_))))
+                    {
+                        Ok(true) => {}
+                        Ok(false) => return None,
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+                _ => return None,
+            }
+        } else if param.owned_string {
+            if !matches!(value, Value::String(_)) {
+                return None;
+            }
+        } else if scalar(value, function.span).is_err() {
+            return None;
+        }
+    }
     let mut machine = Machine::from_code(code, limits, interpreter.call_depth);
     Some(machine.run_owned_with_hooks(&function.name, args, depth, false, interpreter))
 }
@@ -4065,6 +4463,9 @@ impl Drop for Machine {
                 }
                 let capacity = std::mem::take(staged_capacity);
                 self.release_argument_capacity(capacity);
+                let capacity = std::mem::take(&mut frame.charged_lease_capacity);
+                let root_bytes = std::mem::take(&mut frame.charged_lease_root_bytes);
+                self.release_lease_capacity(capacity, root_bytes);
                 release = merge_release_context(release, exit.state.release_context());
                 self.finally.tighten(exit.state.release_context());
             }
@@ -4089,8 +4490,11 @@ impl Drop for Machine {
                     .calls
                     .pop()
                     .expect("abandoned real callee frame");
+                let capacity = frame.charged_lease_capacity;
+                let root_bytes = frame.charged_lease_root_bytes;
                 let dropped =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(frame)));
+                self.release_lease_capacity(capacity, root_bytes);
                 release = merge_release_context(release, current_cleanup_context());
                 self.finally.tighten(current_cleanup_context());
                 drop(callee_guard);
@@ -4111,6 +4515,12 @@ impl Drop for Machine {
         let tightened = release.map(CleanupGuard::enter);
         let prefix = self.resources.take();
         let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(prefix)));
+        // Remaining inactive call/argument owners belong to this actual
+        // prefix. Their buffers and String root objects have now been dropped,
+        // including Rust's remaining-field glue after a caught native panic.
+        self.lease_capacity = 0;
+        self.lease_bytes = 0;
+        self.lease_root_bytes = 0;
         self.finally.tighten(current_cleanup_context());
         // Restore before ordinary outer primary outcomes are retired.
         drop(tightened);

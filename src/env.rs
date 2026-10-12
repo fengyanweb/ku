@@ -133,6 +133,18 @@ pub(crate) struct BorrowLease {
 }
 
 impl BorrowLease {
+    // Leaf classification only; never traverses captures or clones owners.
+    pub(crate) fn is_string_root(&self) -> bool {
+        self.root
+            .as_deref()
+            .is_some_and(|value| matches!(value, Value::String(_)))
+    }
+
+    pub(crate) fn string_root_value_bytes(&self) -> Option<usize> {
+        self.is_string_root()
+            .then_some(std::mem::size_of::<Value>())
+    }
+
     pub(crate) fn collect_temporary_owned_tasks(
         &self,
         tasks: &mut Vec<TaskHandle>,
