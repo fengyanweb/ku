@@ -33,6 +33,8 @@ mod cleanup_panic_tests;
 mod help_panic_tests;
 mod local_driver;
 #[cfg(test)]
+mod owner_cleanup_ack_tests;
+#[cfg(test)]
 mod queue_retirement_tests;
 mod runner;
 pub(crate) use runner::{LocalTaskRunner, OnceTaskRunner};
@@ -67,6 +69,11 @@ thread_local! {
     // Released results can own other completed Tasks. Their final lease drops
     // enqueue an existing state, instead of recursively destroying its result.
     static OWNER_RESULT_RELEASE_HEAD: RefCell<Option<Arc<TaskState>>> = const { RefCell::new(None) };
+    // Completed nodes reuse their original inline slot until the outermost
+    // drain has really destroyed every detached descendant. No new node or
+    // backing allocation is needed to retain these acknowledgement owners.
+    static OWNER_RESULT_FINISHED_HEAD: RefCell<Option<Arc<TaskState>>> = const { RefCell::new(None) };
+    static OWNER_RESULT_FLUSH_DEPTH: Cell<usize> = const { Cell::new(0) };
     static OWNER_RESULT_RELEASE_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -317,10 +324,41 @@ struct TaskOwnerLease {
     state: Weak<TaskState>,
 }
 
-struct OwnerResultRelease {
-    result: KuResult<Value>,
-    context: CancellationContext,
-    next: Option<Arc<TaskState>>,
+enum OwnerResultRelease {
+    Pending {
+        result: KuResult<Value>,
+        context: CancellationContext,
+        next: Option<Arc<TaskState>>,
+    },
+    Finished {
+        next: Option<Arc<TaskState>>,
+    },
+}
+
+struct OwnerResultFlushGuard {
+    previous: usize,
+}
+
+impl OwnerResultFlushGuard {
+    fn enter() -> Self {
+        Self {
+            previous: OWNER_RESULT_FLUSH_DEPTH.with(|depth| {
+                let previous = depth.get();
+                depth.set(previous + 1);
+                previous
+            }),
+        }
+    }
+
+    fn is_outermost(&self) -> bool {
+        self.previous == 0
+    }
+}
+
+impl Drop for OwnerResultFlushGuard {
+    fn drop(&mut self) {
+        OWNER_RESULT_FLUSH_DEPTH.with(|depth| depth.set(self.previous));
+    }
 }
 
 struct SynchronousOwnerDropGuard {
@@ -455,24 +493,33 @@ fn flush_owner_results() {
     // payloads. Re-entering this loop preserves that order. Only strict linear
     // wrapper paths ending in a Task are flat; branches, other Value trees and
     // queued captures keep their synchronous cleanup and recursion risks.
+    let flush = OwnerResultFlushGuard::enter();
     let mut first_panic = None;
     loop {
         let Some(state) = OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow_mut().take()) else {
             break;
         };
-        let mut work = state
+        let work = state
             .owner_result_release
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
             .expect("only a unique detached owner result is queued");
-        OWNER_RESULT_RELEASE_HEAD.with(|head| *head.borrow_mut() = work.next.take());
+        let OwnerResultRelease::Pending {
+            result,
+            context,
+            next,
+        } = work
+        else {
+            unreachable!("pending drain owns only pending payload nodes");
+        };
+        OWNER_RESULT_RELEASE_HEAD.with(|head| *head.borrow_mut() = next);
         // Neither the state mutex nor the TLS RefCell borrow survives a drop.
         // A nested lease therefore only enqueues; every queued node has already
         // been allocated as part of its TaskState, even during OOM cleanup.
         let dropped = catch_unwind(AssertUnwindSafe(|| {
-            let _cleanup = CleanupGuard::enter(work.context);
-            match work.result {
+            let _cleanup = CleanupGuard::enter(context);
+            match result {
                 Ok(value) => drop_single_task_leaf(value),
                 Err(error) => drop_owner_synchronously(error),
             }
@@ -481,6 +528,39 @@ fn flush_owner_results() {
             if first_panic.is_none() {
                 first_panic = Some(panic);
             }
+        }
+        OWNER_RESULT_FINISHED_HEAD.with(|head| {
+            let mut head = head.borrow_mut();
+            *state
+                .owner_result_release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                Some(OwnerResultRelease::Finished { next: head.take() });
+            *head = Some(state);
+        });
+    }
+    if flush.is_outermost() {
+        // A nested single-Task leaf drop may only have enqueued its child.
+        // Reentrant flushes can also finish nodes while an enclosing native
+        // destructor is still live. Publish nothing until the actual outer
+        // pending drain has reached quiescence, including panic cleanup.
+        loop {
+            let Some(state) = OWNER_RESULT_FINISHED_HEAD.with(|head| head.borrow_mut().take())
+            else {
+                break;
+            };
+            let finished = state
+                .owner_result_release
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .expect("finished drain owns its original inline node");
+            let OwnerResultRelease::Finished { next } = finished else {
+                unreachable!("finished drain owns only destroyed payload nodes");
+            };
+            OWNER_RESULT_FINISHED_HEAD.with(|head| *head.borrow_mut() = next);
+            state.owner_payload_done.store(true, Ordering::SeqCst);
+            state.finish_owner_cleanup();
         }
     }
     // A destructor panic must not leave TLS owning an undrained linked list or
@@ -566,6 +646,12 @@ struct TaskState {
     // queued frame for cancellation must have one arbitration point.
     pending_run: Mutex<Option<TaskStart>>,
     owner_released: AtomicBool,
+    // Release arbitration is not acknowledgement. The first release call
+    // and its detached payload drain can finish on different threads; both
+    // actual obligations must finish before owner cleanup is published.
+    owner_call_done: AtomicBool,
+    owner_payload_done: AtomicBool,
+    owner_cleanup_done: AtomicBool,
     owner_result_release: Mutex<Option<OwnerResultRelease>>,
     ready: Condvar,
     cancelled: AtomicBool,
@@ -663,6 +749,9 @@ impl TaskRuntime {
             result: Mutex::new(None),
             pending_run: Mutex::new(None),
             owner_released: AtomicBool::new(false),
+            owner_call_done: AtomicBool::new(false),
+            owner_payload_done: AtomicBool::new(false),
+            owner_cleanup_done: AtomicBool::new(false),
             owner_result_release: Mutex::new(None),
             ready: Condvar::new(),
             cancelled: AtomicBool::new(false),
@@ -1721,37 +1810,93 @@ impl TaskState {
     }
 
     fn release_owner(self: &Arc<Self>, context: CancellationContext) {
-        let abandoned = {
+        let (first_release, abandoned) = {
             let mut slot = self
                 .result
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            self.owner_released.store(true, Ordering::Release);
-            slot.take()
+            // Scope release and the final logical lease can race. The loser
+            // must not acknowledge the winner's detached, still-live payload.
+            let first_release = !self.owner_released.swap(true, Ordering::AcqRel);
+            (first_release, slot.take())
         };
         let _cleanup = CleanupGuard::enter(context);
+        let mut first_panic = None;
+        let mut deferred_payload = false;
         match abandoned {
             Some(result) if result.as_ref().is_ok_and(has_single_task_leaf) => {
+                assert!(
+                    first_release,
+                    "only the first owner release detaches a result"
+                );
+                deferred_payload = true;
                 OWNER_RESULT_RELEASE_HEAD.with(|head| {
                     let mut head = head.borrow_mut();
                     *self
                         .owner_result_release
                         .lock()
-                        .unwrap_or_else(|error| error.into_inner()) = Some(OwnerResultRelease {
-                        result,
-                        context,
-                        next: head.take(),
-                    });
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        Some(OwnerResultRelease::Pending {
+                            result,
+                            context,
+                            next: head.take(),
+                        });
                     *head = Some(Arc::clone(self));
                 });
-                drain_owner_results();
+                self.catch_cleanup_panic(&mut first_panic, drain_owner_results);
             }
-            Some(result) => drop_owner_synchronously(result),
+            Some(result) => {
+                assert!(
+                    first_release,
+                    "only the first owner release detaches a result"
+                );
+                self.catch_cleanup_panic(&mut first_panic, || drop_owner_synchronously(result));
+            }
             None => {}
         }
         // Keep queued-frame cancellation synchronous: its terminal ACK must
         // still follow capture destruction, including a concurrent queue take.
-        self.request_cancel_with(context);
+        // A native payload panic must not skip that remaining obligation.
+        // Duplicate calls retain cancellation/deadline tightening, but do not
+        // publish either obligation on behalf of the first release call.
+        self.catch_cleanup_panic(&mut first_panic, || {
+            let mut cancellation = context;
+            if let Some(cleanup) = current_cleanup_context() {
+                cancellation.cleanup_deadline =
+                    cancellation.cleanup_deadline.min(cleanup.cleanup_deadline);
+            }
+            self.request_cancel_with(cancellation);
+        });
+        self.remember_cleanup_deadline();
+        if first_release {
+            // During an active deferred drain, a nested release may return
+            // after merely enqueuing its descendants. Its payload publication
+            // belongs exclusively to the outermost real drain above.
+            if !OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get) {
+                self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
+            }
+            if !deferred_payload {
+                self.owner_payload_done.store(true, Ordering::SeqCst);
+            }
+            self.owner_call_done.store(true, Ordering::SeqCst);
+            self.finish_owner_cleanup();
+        }
+        if let Some(panic) = first_panic {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn finish_owner_cleanup(&self) {
+        // Sequentially consistent obligation publications prevent concurrent
+        // release/drain finishers from both missing the other completed stage.
+        // This acknowledges owner cleanup only, never execution retirement,
+        // result delivery, scope teardown or registry accounting.
+        if self.owner_call_done.load(Ordering::SeqCst)
+            && self.owner_payload_done.load(Ordering::SeqCst)
+            && !self.owner_cleanup_done.swap(true, Ordering::AcqRel)
+        {
+            self.ready.notify_all();
+        }
     }
 
     fn complete(&self, id: i64, result: KuResult<Value>) {
@@ -2265,6 +2410,9 @@ mod tests {
             result: Mutex::new(None),
             pending_run: Mutex::new(None),
             owner_released: AtomicBool::new(false),
+            owner_call_done: AtomicBool::new(false),
+            owner_payload_done: AtomicBool::new(false),
+            owner_cleanup_done: AtomicBool::new(false),
             owner_result_release: Mutex::new(None),
             ready: Condvar::new(),
             cancelled: AtomicBool::new(false),
