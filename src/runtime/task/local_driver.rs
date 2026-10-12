@@ -48,7 +48,6 @@ impl std::ops::Deref for RuntimeRef<'_> {
 }
 
 struct LocalJobFrame<'a> {
-    inner: RuntimeRef<'a>,
     job: TaskJob,
     start: Option<TaskStart>,
     runner: Option<Box<dyn LocalTaskRunner>>,
@@ -63,6 +62,20 @@ struct LocalJobFrame<'a> {
     execution: Option<CancellationContext>,
     inherited_cleanup: bool,
     header_bytes: usize,
+    // Last field: actual start/runner/result/job fields retire before this
+    // primitive guard publishes, on normal retirement and native unwind.
+    _retirement: FrameRetirement<'a>,
+}
+
+struct FrameRetirement<'a> {
+    inner: RuntimeRef<'a>,
+    state: Arc<TaskState>,
+}
+
+impl Drop for FrameRetirement<'_> {
+    fn drop(&mut self) {
+        finish_task_job(&self.inner, &self.state);
+    }
 }
 
 fn tighten(saved: &mut Option<CancellationContext>, observed: Option<CancellationContext>) {
@@ -76,7 +89,7 @@ fn tighten(saved: &mut Option<CancellationContext>, observed: Option<Cancellatio
     }
 }
 
-// No guard lives in LocalJobFrame. Each operation restores its physical caller
+// No TLS guard lives in LocalJobFrame. Each operation restores its physical caller
 // before a child is pushed, keeping unrelated helper termination out of parents.
 struct Window {
     execution: ExecutionTerminationGuard,
@@ -153,8 +166,11 @@ impl<'a> LocalJobFrame<'a> {
             Stage::Retire
         };
         let header_bytes = start.as_ref().map_or(0, TaskStart::runner_header_bytes);
-        Self {
+        let retirement = FrameRetirement {
             inner,
+            state: Arc::clone(&job.state),
+        };
+        Self {
             job,
             start,
             runner: None,
@@ -169,6 +185,7 @@ impl<'a> LocalJobFrame<'a> {
             execution: None,
             header_bytes,
             inherited_cleanup: cleanup.is_some(),
+            _retirement: retirement,
         }
     }
 
@@ -354,11 +371,16 @@ pub(super) fn execute(inner: &TaskRuntimeInner, job: TaskJob) {
     let mut stack = Frames::new(base_depth);
     if let Err(error) = stack.reserve_next() {
         let _execution = ExecutionTerminationGuard::enter();
+        let state = Arc::clone(&job.state);
         let _retirement = QueueRetirement {
             inner,
-            state: &job.state,
+            state: &state,
         };
+        // This local is declared after the guard, so native unwind also drops
+        // the real queue node before the guard acknowledges its retirement.
+        let job = job;
         job.state.reject_queued(job.id, Err(error));
+        drop(job);
         return;
     }
     let caller = current_task_id();
@@ -449,9 +471,6 @@ pub(super) fn execute(inner: &TaskRuntimeInner, job: TaskJob) {
                 drop(window);
             }
             Stage::Retire => {
-                let window = Window::enter(&stack.frames[top], false);
-                finish_task_job(&stack.frames[top].inner, &stack.frames[top].job.state);
-                drop(window);
                 let mut frame = stack.frames.pop().expect("retired frame");
                 stack.header_bytes -= frame.header_bytes;
                 RUNNER_HEADER_BYTES.with(|bytes| bytes.set(bytes.get() - frame.header_bytes));

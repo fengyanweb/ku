@@ -508,7 +508,12 @@ struct TaskState {
     id: i64,
     runtime: Weak<TaskRuntimeInner>,
     queue_consumed: AtomicBool,
+    // Execution/queue retirement and completion cleanup are independent of
+    // public terminal result delivery and of the accounting once-claim.
+    execution_queue_retired: AtomicBool,
+    completion_cleanup_done: AtomicBool,
     accounting_finished: AtomicBool,
+    accounting_done: AtomicBool,
     result: Mutex<Option<KuResult<Value>>>,
     // Always acquire result before pending_run. Claiming execution and taking a
     // queued frame for cancellation must have one arbitration point.
@@ -601,7 +606,10 @@ impl TaskRuntime {
             id,
             runtime: Arc::downgrade(&self.inner),
             queue_consumed: AtomicBool::new(false),
+            execution_queue_retired: AtomicBool::new(false),
+            completion_cleanup_done: AtomicBool::new(false),
             accounting_finished: AtomicBool::new(false),
+            accounting_done: AtomicBool::new(false),
             result: Mutex::new(None),
             pending_run: Mutex::new(None),
             owner_released: AtomicBool::new(false),
@@ -1638,6 +1646,7 @@ impl TaskState {
         let mut uncommitted = Some(result);
         let mut abandoned = None;
         let mut discard_context = None;
+        let mut published = false;
         if let Ok(mut slot) = self.result.lock() {
             if slot.is_none() && !self.is_terminal() {
                 let incoming = uncommitted
@@ -1695,6 +1704,7 @@ impl TaskState {
                     *slot = Some(result);
                 }
                 self.status.store(status, Ordering::Release);
+                published = true;
                 self.ready.notify_all();
             }
         }
@@ -1711,10 +1721,16 @@ impl TaskState {
             });
         }
         self.catch_cleanup_panic(&mut first_panic, flush_owner_results);
-        if self.queue_consumed.load(Ordering::Acquire) {
-            if let Some(runtime) = self.runtime.upgrade() {
-                finish_task_accounting(&runtime, self);
-            }
+        if published {
+            // Losing and abandoned payloads, including their real native drop
+            // glue, have finished before accounting may acknowledge this task.
+            // A duplicate completion must not acknowledge the winning cleanup.
+            // Sequentially consistent obligation publications prevent the two
+            // finishing threads from both missing the other completed stage.
+            self.completion_cleanup_done.store(true, Ordering::SeqCst);
+        }
+        if let Some(runtime) = self.runtime.upgrade() {
+            finish_task_accounting(&runtime, self);
         }
         if let Some(panic) = first_panic {
             std::panic::resume_unwind(panic);
@@ -1927,20 +1943,35 @@ fn execute_task_job(inner: &TaskRuntimeInner, job: TaskJob) {
 
 fn finish_task_job(inner: &TaskRuntimeInner, state: &TaskState) {
     state.queue_consumed.store(true, Ordering::Release);
+    // Call only after the claimant frame/queue node has actually been dropped.
+    // This says nothing about retained result ownership or scope teardown.
+    state.execution_queue_retired.store(true, Ordering::SeqCst);
     finish_task_accounting(inner, state);
 }
 
 fn finish_task_accounting(inner: &TaskRuntimeInner, state: &TaskState) {
-    // A worker may consume a cancelled queue node while its canceller is still
-    // dropping the frame. Keep it active until both obligations are complete.
-    if !state.is_terminal() || state.accounting_finished.swap(true, Ordering::AcqRel) {
+    // Terminal publication can precede discarded payload cleanup. A cancelled
+    // queue consumer and the completion thread may finish in either order;
+    // neither can acknowledge work still owned by the other.
+    if !state.execution_queue_retired.load(Ordering::SeqCst)
+        || !state.completion_cleanup_done.load(Ordering::SeqCst)
+        || !state.is_terminal()
+        || state.accounting_finished.swap(true, Ordering::AcqRel)
+    {
         return;
     }
-    if let Ok(mut states) = inner.states.lock() {
-        states.remove(&state.id);
-    }
+    // Poison rejects new registration elsewhere, but existing retirement
+    // must actually remove its Weak entry before publishing accounting_done.
+    inner
+        .states
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&state.id);
     inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
     inner.finished_tasks.fetch_add(1, Ordering::Relaxed);
+    // accounting_finished above is a once-claim, not proof of these updates.
+    state.accounting_done.store(true, Ordering::Release);
+    state.ready.notify_all();
 }
 
 fn spawn_blocking_workers(
@@ -2108,7 +2139,10 @@ mod tests {
             id: 41,
             runtime: Weak::new(),
             queue_consumed: AtomicBool::new(false),
+            execution_queue_retired: AtomicBool::new(false),
+            completion_cleanup_done: AtomicBool::new(false),
             accounting_finished: AtomicBool::new(false),
+            accounting_done: AtomicBool::new(false),
             result: Mutex::new(None),
             pending_run: Mutex::new(None),
             owner_released: AtomicBool::new(false),
@@ -2400,6 +2434,10 @@ mod tests {
         let mut initial = completion_state();
         initial.runtime = Arc::downgrade(&runtime.inner);
         initial.queue_consumed.store(true, Ordering::Release);
+        // This kernel fixture represents an already-retired claimant node.
+        initial
+            .execution_queue_retired
+            .store(true, Ordering::SeqCst);
         let pending = Arc::new(initial);
         runtime.inner.active_tasks.store(1, Ordering::Release);
         runtime
@@ -2757,6 +2795,8 @@ mod tests {
                 if tracks_accounting {
                     parent.runtime = Arc::downgrade(&inert.inner);
                     parent.queue_consumed.store(true, Ordering::Release);
+                    // The fixture has no live runner or physical queue node.
+                    parent.execution_queue_retired.store(true, Ordering::SeqCst);
                     inert.inner.active_tasks.store(1, Ordering::Release);
                 }
                 let parent = Arc::new(parent);
@@ -3441,6 +3481,9 @@ mod tests {
         assert_eq!(runtime.snapshot().unwrap().active_tasks, 1);
         assert_eq!(runtime.snapshot().unwrap().finished_tasks, 0);
         assert_eq!(state.status_name(), "cancelling");
+        assert!(state.execution_queue_retired.load(Ordering::Acquire));
+        assert!(!state.completion_cleanup_done.load(Ordering::Acquire));
+        assert!(!state.accounting_done.load(Ordering::Acquire));
         release_tx.send(()).unwrap();
         assert!(done_rx.recv_timeout(timeout).unwrap());
         canceller.join().unwrap();
@@ -3448,6 +3491,8 @@ mod tests {
         assert_eq!(snapshot.active_tasks, 0);
         assert_eq!(snapshot.finished_tasks, 1);
         assert_eq!(snapshot.registered_tasks, 0);
+        assert!(state.completion_cleanup_done.load(Ordering::Acquire));
+        assert!(state.accounting_done.load(Ordering::Acquire));
         finish_task_job(&runtime.inner, &state);
         state.complete(state.id, Ok(Value::Null));
         assert_eq!(runtime.snapshot().unwrap().finished_tasks, 1);
@@ -4255,5 +4300,173 @@ mod tests {
             report.demand as f64 / (report.submit_ms.max(1) as f64 / 1000.0),
             report.accepted as f64 / (report.total_ms.max(1) as f64 / 1000.0)
         );
+    }
+
+    #[test]
+    fn terminal_completion_cleanup_does_not_acknowledge_execution_queue_retirement() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+        let mut initial = completion_state();
+        initial.runtime = Arc::downgrade(&runtime.inner);
+        let state = Arc::new(initial);
+        runtime.inner.active_tasks.store(1, Ordering::Release);
+        runtime
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .insert(state.id, Arc::downgrade(&state));
+
+        state.complete(state.id, Ok(Value::Int(17)));
+        assert!(state.is_terminal());
+        assert!(state.completion_cleanup_done.load(Ordering::Acquire));
+        assert!(!state.execution_queue_retired.load(Ordering::Acquire));
+        finish_task_accounting(&runtime.inner, &state);
+        assert!(!state.accounting_finished.load(Ordering::Acquire));
+        assert!(!state.accounting_done.load(Ordering::Acquire));
+        assert_eq!(runtime.snapshot().unwrap().active_tasks, 1);
+
+        // Kernel reproduction of the real claimant's post-frame-drop callback.
+        finish_task_job(&runtime.inner, &state);
+        assert!(state.execution_queue_retired.load(Ordering::Acquire));
+        assert!(state.accounting_done.load(Ordering::Acquire));
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.registered_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+        finish_task_job(&runtime.inner, &state);
+        state.complete(state.id, Ok(Value::Null));
+        assert_eq!(runtime.snapshot().unwrap().finished_tasks, 1);
+        // A successful retained result remains owned by the caller; this is
+        // execution/accounting evidence, never a full owner-resource ACK.
+        assert!(!state.owner_released.load(Ordering::Acquire));
+        assert_eq!(state.result().unwrap(), Some(Ok(Value::Int(17))));
+    }
+
+    #[test]
+    fn accounting_claim_is_not_the_post_registry_and_counter_witness() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+        let mut initial = completion_state();
+        initial.runtime = Arc::downgrade(&runtime.inner);
+        let state = Arc::new(initial);
+        runtime.inner.active_tasks.store(1, Ordering::Release);
+        runtime
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .insert(state.id, Arc::downgrade(&state));
+        state.complete(state.id, Ok(Value::Null));
+
+        let registry = runtime.inner.states.lock().unwrap();
+        let inner = Arc::clone(&runtime.inner);
+        let retiring = Arc::clone(&state);
+        let worker = thread::spawn(move || finish_task_job(&inner, &retiring));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.accounting_finished.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let claimed = state.accounting_finished.load(Ordering::Acquire);
+        let done_before_unlock = state.accounting_done.load(Ordering::Acquire);
+        let active_before_unlock = runtime.inner.active_tasks.load(Ordering::Acquire);
+        let finished_before_unlock = runtime.inner.finished_tasks.load(Ordering::Acquire);
+        let registered_before_unlock = registry.contains_key(&state.id);
+        // Unlock before assertions and join even on a failed observation.
+        drop(registry);
+        worker
+            .join()
+            .expect("retirement thread exits after registry unlock");
+
+        assert!(claimed);
+        assert!(!done_before_unlock);
+        assert_eq!(active_before_unlock, 1);
+        assert_eq!(finished_before_unlock, 0);
+        assert!(registered_before_unlock);
+        assert!(state.accounting_done.load(Ordering::Acquire));
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.registered_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+    }
+
+    #[test]
+    fn poisoned_registry_retirement_removes_the_real_weak_entry_before_done() {
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+        let mut initial = completion_state();
+        initial.runtime = Arc::downgrade(&runtime.inner);
+        let state = Arc::new(initial);
+        runtime.inner.active_tasks.store(1, Ordering::Release);
+        runtime
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .insert(state.id, Arc::downgrade(&state));
+        let poison = catch_unwind(AssertUnwindSafe(|| {
+            let _registry = runtime.inner.states.lock().unwrap();
+            panic!("formal poisoned registry retirement probe");
+        }));
+        assert!(poison.is_err());
+        assert!(runtime.inner.states.is_poisoned());
+        state.complete(state.id, Ok(Value::Null));
+        finish_task_job(&runtime.inner, &state);
+
+        assert!(state.accounting_done.load(Ordering::Acquire));
+        assert_eq!(runtime.inner.active_tasks.load(Ordering::Acquire), 0);
+        assert_eq!(runtime.inner.finished_tasks.load(Ordering::Acquire), 1);
+        assert!(runtime
+            .inner
+            .states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
+        // Cleanup recovery does not unpoison the registration API.
+        assert!(runtime.inner.states.is_poisoned());
+        finish_task_job(&runtime.inner, &state);
+        assert_eq!(runtime.inner.finished_tasks.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn concurrent_completion_and_execution_retirement_never_lose_the_accounting_trigger() {
+        for _ in 0..64 {
+            let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+            let mut initial = completion_state();
+            initial.runtime = Arc::downgrade(&runtime.inner);
+            let state = Arc::new(initial);
+            runtime.inner.active_tasks.store(1, Ordering::Release);
+            runtime
+                .inner
+                .states
+                .lock()
+                .unwrap()
+                .insert(state.id, Arc::downgrade(&state));
+            let (complete_tx, complete_rx) = mpsc::sync_channel(1);
+            let (retire_tx, retire_rx) = mpsc::sync_channel(1);
+            let completing = Arc::clone(&state);
+            let completion = thread::spawn(move || {
+                complete_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("bounded completion start");
+                completing.complete(completing.id, Ok(Value::Int(17)));
+            });
+            let retiring = Arc::clone(&state);
+            let inner = Arc::clone(&runtime.inner);
+            let execution = thread::spawn(move || {
+                retire_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("bounded retirement start");
+                finish_task_job(&inner, &retiring);
+            });
+            complete_tx.send(()).expect("release completion start");
+            retire_tx.send(()).expect("release retirement start");
+            completion.join().expect("completion thread exits");
+            execution.join().expect("retirement thread exits");
+            assert!(state.completion_cleanup_done.load(Ordering::Acquire));
+            assert!(state.execution_queue_retired.load(Ordering::Acquire));
+            assert!(state.accounting_done.load(Ordering::Acquire));
+            let snapshot = runtime.snapshot().unwrap();
+            assert_eq!(snapshot.active_tasks, 0);
+            assert_eq!(snapshot.registered_tasks, 0);
+            assert_eq!(snapshot.finished_tasks, 1);
+        }
     }
 }

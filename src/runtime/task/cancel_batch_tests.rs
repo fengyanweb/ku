@@ -305,6 +305,11 @@ fn terminal_observed_does_not_acknowledge_a_real_child_destructor_or_parent_acco
     let drop_context = entered_rx.recv_timeout(TEST_WAIT);
     let status_at_drop = top.status();
     let parent_accounting_at_drop = top.state.accounting_finished.load(Ordering::Acquire);
+    let parent_completion_cleanup_at_drop =
+        top.state.completion_cleanup_done.load(Ordering::Acquire);
+    let parent_execution_retired_at_drop =
+        top.state.execution_queue_retired.load(Ordering::Acquire);
+    let parent_accounting_done_at_drop = top.state.accounting_done.load(Ordering::Acquire);
     let child_accounting_at_drop = child_state.accounting_finished.load(Ordering::Acquire);
     let child_status_at_drop = child_state.status_name();
     let observed = batch.poll(&runtime, Instant::now());
@@ -325,6 +330,12 @@ fn terminal_observed_does_not_acknowledge_a_real_child_destructor_or_parent_acco
     assert_eq!(drop_context.unwrap(), Some(context));
     assert_eq!(status_at_drop, "cancelled");
     assert!(!parent_accounting_at_drop);
+    assert!(!parent_completion_cleanup_at_drop);
+    assert!(!parent_execution_retired_at_drop);
+    assert!(!parent_accounting_done_at_drop);
+    assert!(top.state.completion_cleanup_done.load(Ordering::Acquire));
+    assert!(top.state.execution_queue_retired.load(Ordering::Acquire));
+    assert!(top.state.accounting_done.load(Ordering::Acquire));
     assert!(!child_accounting_at_drop);
     assert_eq!(child_status_at_drop, "cancelling");
     assert_eq!(observed, CancelBatchPoll::TerminalObserved);

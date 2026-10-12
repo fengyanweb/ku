@@ -508,3 +508,94 @@ fn real_flat_helper_cleanup_panic_retires_child_then_aborts_parent_ticket_under_
     assert_eq!(snapshot.queued_tasks, 0);
     assert_eq!(snapshot.finished_tasks, 4);
 }
+
+#[test]
+fn real_runner_drop_precedes_completion_and_retirement_witnesses_on_return_and_native_panic() {
+    struct Release(Option<SyncSender<()>>);
+    impl Release {
+        fn release(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.try_send(());
+            }
+        }
+    }
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+    struct RunnerDrop {
+        observed: SyncSender<(i64, bool, bool, bool)>,
+        release: Receiver<()>,
+        native: bool,
+    }
+    impl LocalTaskRunner for RunnerDrop {
+        fn dispatch(&mut self, _: NonZeroUsize) -> ControlFlow<KuResult<Value>> {
+            ControlFlow::Break(Ok(Value::Int(17)))
+        }
+    }
+    impl Drop for RunnerDrop {
+        fn drop(&mut self) {
+            let state = CURRENT_TASK_STATE.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .expect("real runner task")
+            });
+            self.observed
+                .send((
+                    state.id,
+                    state.completion_cleanup_done.load(Ordering::Acquire),
+                    state.execution_queue_retired.load(Ordering::Acquire),
+                    state.accounting_done.load(Ordering::Acquire),
+                ))
+                .unwrap();
+            self.release
+                .recv_timeout(WAIT)
+                .expect("bounded runner drop release");
+            if self.native {
+                panic!("formal native runner retirement probe");
+            }
+        }
+    }
+    for native in [false, true] {
+        let runtime = TaskRuntime::with_limits(1, 1, 0, 0, 1);
+        let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut release = Release(Some(release_tx));
+        let task = runtime
+            .spawn_runner_deferred(|| {
+                move || RunnerDrop {
+                    observed: observed_tx,
+                    release: release_rx,
+                    native,
+                }
+            })
+            .unwrap();
+        let at_drop = observed_rx.recv_timeout(WAIT);
+        let at_drop_status = task.status();
+        let at_drop_active = runtime.inner.active_tasks.load(Ordering::Acquire);
+        release.release();
+        let retired = until(|| task.state.accounting_done.load(Ordering::Acquire));
+        let result = task.await_result();
+        let shutdown = runtime.cancel_all_and_wait(WAIT);
+        let snapshot = runtime.snapshot().unwrap();
+
+        assert_eq!(at_drop.unwrap(), (task.id(), false, false, false));
+        assert_eq!(at_drop_status, "running");
+        assert_eq!(at_drop_active, 1);
+        assert!(retired);
+        assert!(task.state.completion_cleanup_done.load(Ordering::Acquire));
+        assert!(task.state.execution_queue_retired.load(Ordering::Acquire));
+        if native {
+            assert_eq!(code(&result.unwrap()), Some("panic"));
+        } else {
+            assert_eq!(result.unwrap(), Value::Int(17));
+        }
+        shutdown.unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.registered_tasks, 0);
+        assert_eq!(snapshot.queued_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+    }
+}
