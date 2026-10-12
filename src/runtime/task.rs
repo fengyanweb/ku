@@ -26,6 +26,8 @@ mod cancel_batch;
 mod cancellation;
 pub(crate) use cancel_batch::{CancelBatchPoll, TaskCancelBatch};
 #[cfg(test)]
+mod blocking_retirement_tests;
+#[cfg(test)]
 mod cancel_batch_tests;
 #[cfg(test)]
 mod cleanup_panic_tests;
@@ -174,7 +176,43 @@ impl TaskQueueReceiver {
 struct BlockingJob {
     run: BlockingFn,
     response: SyncSender<KuResult<Value>>,
-    cancelled: Option<Arc<TaskState>>,
+    // Actual run/response destruction precedes this final field on success,
+    // queue rejection, cancellation and native unwind. Response delivery and
+    // the public parent Task's terminal status do not retire this obligation.
+    retirement: BlockingRetirement,
+}
+
+struct BlockingRetirement {
+    // Reuse the internal parent state previously retained for cancellation;
+    // this neither creates another logical Task owner nor allocates a node.
+    state: Option<Arc<TaskState>>,
+}
+
+impl BlockingRetirement {
+    fn new(state: Option<Arc<TaskState>>, span: Span) -> KuResult<Self> {
+        if let Some(state) = &state {
+            state
+                .pending_blocking
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    pending.checked_add(1)
+                })
+                .map_err(|_| {
+                    KuError::runtime("internal blocking retirement counter overflow", span)
+                })?;
+        }
+        Ok(Self { state })
+    }
+}
+
+impl Drop for BlockingRetirement {
+    fn drop(&mut self) {
+        // Primitive retirement only, after the actual job's earlier fields.
+        // Never enter a user destructor, scheduler help or cancellation here.
+        if let Some(state) = &self.state {
+            state.pending_blocking.fetch_sub(1, Ordering::AcqRel);
+            state.ready.notify_all();
+        }
+    }
 }
 
 struct RunningBlockingJob<'a> {
@@ -672,6 +710,7 @@ struct TaskState {
     id: i64,
     runtime: Weak<TaskRuntimeInner>,
     submission: AtomicU8,
+    pending_blocking: AtomicUsize,
     queue_consumed: AtomicBool,
     // Execution/queue retirement and completion cleanup are independent of
     // public terminal result delivery and of the accounting once-claim.
@@ -780,6 +819,7 @@ impl TaskRuntime {
             id,
             runtime: Arc::downgrade(&self.inner),
             submission: AtomicU8::new(SUBMISSION_PENDING),
+            pending_blocking: AtomicUsize::new(0),
             queue_consumed: AtomicBool::new(false),
             execution_queue_retired: AtomicBool::new(false),
             completion_cleanup_done: AtomicBool::new(false),
@@ -1480,14 +1520,17 @@ impl TaskRuntime {
                 "blocking pool is closing",
             ));
         }
+        let retirement = BlockingRetirement::new(
+            CURRENT_TASK_STATE.with(|current| current.borrow().as_ref().and_then(Weak::upgrade)),
+            _span,
+        )?;
         self.inner
             .queued_blocking_jobs
             .fetch_add(1, Ordering::AcqRel);
         let submitted = self.inner.blocking_tx.try_send(BlockingJob {
             run: Box::new(run),
             response: response_tx,
-            cancelled: CURRENT_TASK_STATE
-                .with(|current| current.borrow().as_ref().and_then(Weak::upgrade)),
+            retirement,
         });
         drop(admission);
         match submitted {
@@ -2339,7 +2382,8 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                 let _running = RunningBlockingJob::claim(&inner);
                 inner.queued_blocking_jobs.fetch_sub(1, Ordering::AcqRel);
                 let cancelled = job
-                    .cancelled
+                    .retirement
+                    .state
                     .as_ref()
                     .and_then(|state| state.cancellation());
                 let result = if let Some(context) = cancelled {
@@ -2361,7 +2405,8 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                     }
                 };
                 let result = if let Some(context) = job
-                    .cancelled
+                    .retirement
+                    .state
                     .as_ref()
                     .and_then(|state| state.cancellation())
                 {
@@ -2371,7 +2416,7 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                 } else {
                     result
                 };
-                send_blocking_result(&job.response, job.cancelled.as_deref(), result);
+                send_blocking_result(&job.response, job.retirement.state.as_deref(), result);
             }
             Err(_) => return,
         }
@@ -2460,6 +2505,7 @@ mod tests {
             id: 41,
             runtime: Weak::new(),
             submission: AtomicU8::new(SUBMISSION_PENDING),
+            pending_blocking: AtomicUsize::new(0),
             queue_consumed: AtomicBool::new(false),
             execution_queue_retired: AtomicBool::new(false),
             completion_cleanup_done: AtomicBool::new(false),
