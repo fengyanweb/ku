@@ -97,9 +97,9 @@ pub(super) enum ExprCode {
     },
     Unary(UnaryOp, ExprId),
     Binary(ExprId, BinaryOp, ExprId),
-    // Only a Result root's direct return can construct this builtin call.
-    // Its span is the original ok Call span; its operand stays scalar.
-    TerminalOk(ExprId),
+    // Only a direct Result return constructs this builtin. The String
+    // operand is enabled solely by the strict owned Result<String> role.
+    TerminalOk(ExprId, bool),
     Call {
         function: FnId,
         args: ExprRange,
@@ -509,6 +509,7 @@ enum Parameters<'a> {
 enum FunctionRole {
     Scalar,
     OwnedNamed,
+    OwnedResultStringNamed,
     BorrowedStringNamed,
     ResultRoot,
     ClaimedAsyncResultRoot,
@@ -613,8 +614,26 @@ impl<'a> FunctionSpec<'a> {
 
     fn owned_named(function: &'a FnDecl) -> Self {
         let mut spec = Self::named(function);
-        spec.role = FunctionRole::OwnedNamed;
+        spec.role = if string_result_type(&function.return_type) {
+            FunctionRole::OwnedResultStringNamed
+        } else {
+            FunctionRole::OwnedNamed
+        };
         spec
+    }
+
+    fn owned_dependency(self, function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        spec.role = if self.owns_result_string() && string_result_type(&function.return_type) {
+            FunctionRole::OwnedResultStringNamed
+        } else {
+            FunctionRole::OwnedNamed
+        };
+        spec
+    }
+
+    fn owns_result_string(self) -> bool {
+        matches!(self.role, FunctionRole::OwnedResultStringNamed)
     }
 
     fn borrowed_string_named(function: &'a FnDecl) -> Self {
@@ -649,7 +668,9 @@ impl<'a> FunctionSpec<'a> {
     fn owns_strings(self) -> bool {
         matches!(
             self.role,
-            FunctionRole::OwnedNamed | FunctionRole::BorrowedStringNamed
+            FunctionRole::OwnedNamed
+                | FunctionRole::OwnedResultStringNamed
+                | FunctionRole::BorrowedStringNamed
         )
     }
 
@@ -673,6 +694,9 @@ impl<'a> FunctionSpec<'a> {
     }
 
     fn return_kind(self) -> ValueKind {
+        if self.owns_result_string() {
+            return ValueKind::ResultString;
+        }
         if self.owns_strings()
             && self
                 .declaration
@@ -707,6 +731,9 @@ impl<'a> FunctionSpec<'a> {
                 !function.is_async
                     && (scalar_type(&function.return_type) || string_type(&function.return_type))
             }
+            FunctionRole::OwnedResultStringNamed => {
+                !function.is_async && string_result_type(&function.return_type)
+            }
             FunctionRole::ResultRoot => {
                 !function.is_async && scalar_result_type(&function.return_type)
             }
@@ -732,6 +759,10 @@ fn string_type(ty: &Option<TypeName>) -> bool {
     matches!(ty, Some(TypeName::String))
 }
 
+fn string_result_type(ty: &Option<TypeName>) -> bool {
+    matches!(ty, Some(TypeName::Result(inner)) if matches!(inner.as_ref(), TypeName::String))
+}
+
 fn scalar_result_type(ty: &Option<TypeName>) -> bool {
     matches!(
         ty,
@@ -747,6 +778,7 @@ enum ValueKind {
     ViewString,
     Task,
     Result,
+    ResultString,
 }
 
 #[derive(Clone, Copy)]
@@ -860,6 +892,8 @@ fn expression_kind(
             } else if let Some(function) = source.get(name) {
                 if function.is_async {
                     ValueKind::Task
+                } else if string_result_type(&function.return_type) {
+                    ValueKind::ResultString
                 } else if scalar_result_type(&function.return_type) {
                     ValueKind::Result
                 } else if scalar_type(&function.return_type) {
@@ -883,6 +917,11 @@ fn expect_kind(actual: ValueKind, expected: ValueKind, span: Span) -> Admission<
     } else {
         Err(AdmissionError::Unsupported(span))
     }
+}
+
+fn is_ok_call(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::Call { callee, .. }
+        if matches!(&callee.kind, ExprKind::Variable(name) if name == "ok"))
 }
 
 fn terminal_ok_argument<'a>(
@@ -910,6 +949,9 @@ struct ExpressionMode {
     // this slice. The flag travels through the existing bounded expression
     // visits, so nested move/mutation calls are rejected before body effects.
     forbid_call: bool,
+    // Only the root expression of a strict Result<String> relay return.
+    // Arguments and nested operands always clear this permission.
+    terminal_result: bool,
 }
 
 enum Visit<'a> {
@@ -1111,6 +1153,7 @@ impl<'a> Builder<'a> {
             ExpressionMode {
                 consuming,
                 forbid_call: false,
+                terminal_result: false,
             },
         )
     }
@@ -1125,13 +1168,21 @@ impl<'a> Builder<'a> {
         Ok(id)
     }
 
-    fn terminal_ok(&mut self, expr: &'a Expr) -> Admission<ExprId> {
+    fn terminal_ok(&mut self, expr: &'a Expr, owned_string: bool) -> Admission<ExprId> {
         let shadowed = self.is_bound("ok")
             || self
                 .local
                 .is_some_and(|local| local.captures.contains("ok"));
         let argument = terminal_ok_argument(expr, self.source, shadowed)?;
-        expect_kind(self.kind(argument)?, ValueKind::Scalar, argument.span)?;
+        expect_kind(
+            self.kind(argument)?,
+            if owned_string {
+                ValueKind::String
+            } else {
+                ValueKind::Scalar
+            },
+            argument.span,
+        )?;
         // This direct lowering replaces the ordinary visit of the ok Call;
         // charge that syntax step without storing a second visit buffer.
         self.spend(1, expr.span)?;
@@ -1146,7 +1197,7 @@ impl<'a> Builder<'a> {
             .expressions
             .get_mut(id.0)
             .expect("terminal ok expression slot") = CodeExpr {
-            kind: ExprCode::TerminalOk(operand),
+            kind: ExprCode::TerminalOk(operand, owned_string),
             span,
         };
         Ok(id)
@@ -1381,7 +1432,7 @@ impl<'a> Builder<'a> {
                             ValueKind::String | ValueKind::ViewString => {
                                 return Err(AdmissionError::Unsupported(expr.span))
                             }
-                            ValueKind::Result => {
+                            ValueKind::Result | ValueKind::ResultString => {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
                         }
@@ -1423,6 +1474,11 @@ impl<'a> Builder<'a> {
                     }
                     ExprKind::Call { callee, args } => {
                         if mode.forbid_call {
+                            return Err(AdmissionError::Unsupported(expr.span));
+                        }
+                        if self.kind(expr)? == ValueKind::ResultString
+                            && !(spec.owns_result_string() && mode.terminal_result)
+                        {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
                         if spec.borrows_strings() {
@@ -1469,7 +1525,7 @@ impl<'a> Builder<'a> {
                                 borrowed_string_arguments(function, args, expr.span)?;
                                 FunctionSpec::borrowed_string_named(function)
                             } else if spec.owns_strings() {
-                                FunctionSpec::owned_named(function)
+                                spec.owned_dependency(function)
                             } else {
                                 FunctionSpec::dependency(function)
                             })?
@@ -1535,6 +1591,7 @@ impl<'a> Builder<'a> {
                                     ExpressionMode {
                                         consuming: true,
                                         forbid_call: has_view,
+                                        terminal_result: false,
                                     },
                                 )
                             };
@@ -1597,8 +1654,10 @@ impl<'a> Builder<'a> {
                     return Err(AdmissionError::Unsupported(span));
                 }
                 let kind = self.kind(value)?;
-                if matches!(kind, ValueKind::Result | ValueKind::ViewString)
-                    || (kind == ValueKind::String && !spec.owns_strings())
+                if matches!(
+                    kind,
+                    ValueKind::Result | ValueKind::ResultString | ValueKind::ViewString
+                ) || (kind == ValueKind::String && !spec.owns_strings())
                 {
                     // Env::get_owning currently clones a scalar-only Result.
                     // Do not change that legal behavior or add a new implicit
@@ -1623,8 +1682,10 @@ impl<'a> Builder<'a> {
                     return Err(AdmissionError::Unsupported(span));
                 }
                 let kind = self.kind(value)?;
-                if matches!(kind, ValueKind::Result | ValueKind::ViewString)
-                    || (kind == ValueKind::String && !spec.owns_strings())
+                if matches!(
+                    kind,
+                    ValueKind::Result | ValueKind::ResultString | ValueKind::ViewString
+                ) || (kind == ValueKind::String && !spec.owns_strings())
                 {
                     return Err(AdmissionError::Unsupported(span));
                 }
@@ -1682,7 +1743,7 @@ impl<'a> Builder<'a> {
                 finally_body,
                 ..
             } => {
-                if catch_name.is_some() || !catch_body.is_empty() {
+                if spec.owns_result_string() || catch_name.is_some() || !catch_body.is_empty() {
                     return Err(AdmissionError::Unsupported(span));
                 }
                 let base = self.bound.len();
@@ -1690,9 +1751,24 @@ impl<'a> Builder<'a> {
                 StmtCode::Try(self.block(body, base)?, finally)
             }
             Stmt::Return { value, .. } => {
-                let value = if spec.is_result_root() {
+                let value = if spec.owns_result_string() {
                     let value = value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
-                    Some(self.terminal_ok(value)?)
+                    if is_ok_call(value) {
+                        Some(self.terminal_ok(value, true)?)
+                    } else {
+                        expect_kind(self.kind(value)?, ValueKind::ResultString, value.span)?;
+                        Some(self.expression_with_mode(
+                            value,
+                            ExpressionMode {
+                                consuming: true,
+                                forbid_call: false,
+                                terminal_result: true,
+                            },
+                        )?)
+                    }
+                } else if spec.is_result_root() {
+                    let value = value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
+                    Some(self.terminal_ok(value, false)?)
                 } else {
                     if let Some(value) = value {
                         expect_kind(self.kind(value)?, spec.return_kind(), value.span)?;
@@ -1807,6 +1883,7 @@ impl<'a> Eligibility<'a> {
             ExpressionMode {
                 consuming,
                 forbid_call: false,
+                terminal_result: false,
             },
         )
     }
@@ -1886,8 +1963,12 @@ impl<'a> Eligibility<'a> {
                                     return Err(AdmissionError::Unsupported(span));
                                 }
                                 let kind = self.kind(value)?;
-                                if matches!(kind, ValueKind::Result | ValueKind::ViewString)
-                                    || (kind == ValueKind::String && !spec.owns_strings())
+                                if matches!(
+                                    kind,
+                                    ValueKind::Result
+                                        | ValueKind::ResultString
+                                        | ValueKind::ViewString
+                                ) || (kind == ValueKind::String && !spec.owns_strings())
                                 {
                                     return Err(AdmissionError::Unsupported(span));
                                 }
@@ -1906,8 +1987,12 @@ impl<'a> Eligibility<'a> {
                                     return Err(AdmissionError::Unsupported(span));
                                 }
                                 let kind = self.kind(value)?;
-                                if matches!(kind, ValueKind::Result | ValueKind::ViewString)
-                                    || (kind == ValueKind::String && !spec.owns_strings())
+                                if matches!(
+                                    kind,
+                                    ValueKind::Result
+                                        | ValueKind::ResultString
+                                        | ValueKind::ViewString
+                                ) || (kind == ValueKind::String && !spec.owns_strings())
                                 {
                                     return Err(AdmissionError::Unsupported(span));
                                 }
@@ -1916,7 +2001,36 @@ impl<'a> Eligibility<'a> {
                                 self.expression(value, true)?;
                             }
                             Stmt::Return { value, .. } => {
-                                if spec.is_result_root() {
+                                if spec.owns_result_string() {
+                                    let value =
+                                        value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
+                                    if is_ok_call(value) {
+                                        let shadowed = self.bound("ok");
+                                        let argument =
+                                            terminal_ok_argument(value, self.source, shadowed)?;
+                                        expect_kind(
+                                            self.kind(argument)?,
+                                            ValueKind::String,
+                                            argument.span,
+                                        )?;
+                                        self.spend(1, value.span)?;
+                                        self.expression(argument, true)?;
+                                    } else {
+                                        expect_kind(
+                                            self.kind(value)?,
+                                            ValueKind::ResultString,
+                                            value.span,
+                                        )?;
+                                        self.expression_with_mode(
+                                            value,
+                                            ExpressionMode {
+                                                consuming: true,
+                                                forbid_call: false,
+                                                terminal_result: true,
+                                            },
+                                        )?;
+                                    }
+                                } else if spec.is_result_root() {
                                     let value =
                                         value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
                                     let shadowed = self.bound("ok")
@@ -1992,7 +2106,10 @@ impl<'a> Eligibility<'a> {
                                 finally_body,
                                 ..
                             } => {
-                                if catch_name.is_some() || !catch_body.is_empty() {
+                                if spec.owns_result_string()
+                                    || catch_name.is_some()
+                                    || !catch_body.is_empty()
+                                {
                                     return Err(AdmissionError::Unsupported(span));
                                 }
                                 let base = self.bound.len();
@@ -2027,9 +2144,11 @@ impl<'a> Eligibility<'a> {
                             }
                             self.free(name, expr.span)?;
                             let kind = self.kind(expr)?;
-                            if matches!(kind, ValueKind::Result | ValueKind::ViewString)
-                                || (kind == ValueKind::String
-                                    && !(spec.owns_strings() && mode.consuming))
+                            if matches!(
+                                kind,
+                                ValueKind::Result | ValueKind::ResultString | ValueKind::ViewString
+                            ) || (kind == ValueKind::String
+                                && !(spec.owns_strings() && mode.consuming))
                             {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
@@ -2069,6 +2188,11 @@ impl<'a> Eligibility<'a> {
                             if mode.forbid_call {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
+                            if self.kind(expr)? == ValueKind::ResultString
+                                && !(spec.owns_result_string() && mode.terminal_result)
+                            {
+                                return Err(AdmissionError::Unsupported(expr.span));
+                            }
                             if spec.borrows_strings() {
                                 if let Some((name, _, target_span)) =
                                     string_length_call(expr, self.bound.as_slice())
@@ -2094,7 +2218,7 @@ impl<'a> Eligibility<'a> {
                                     borrowed_string_arguments(function, args, expr.span)?;
                                     FunctionSpec::borrowed_string_named(function)
                                 } else if spec.owns_strings() {
-                                    FunctionSpec::owned_named(function)
+                                    spec.owned_dependency(function)
                                 } else {
                                     FunctionSpec::dependency(function)
                                 })?;
@@ -2158,6 +2282,7 @@ impl<'a> Eligibility<'a> {
                                         ExpressionMode {
                                             consuming: true,
                                             forbid_call: has_view,
+                                            terminal_result: false,
                                         },
                                     )
                                 };

@@ -94,6 +94,10 @@ struct Metrics {
     retired_arguments_exits: usize,
     retained_string_payload_bytes: usize,
     peak_string_payload_bytes: usize,
+    retained_result_wrapper_capacity: usize,
+    retained_result_wrapper_bytes: usize,
+    peak_result_wrapper_capacity: usize,
+    peak_result_wrapper_bytes: usize,
     retained_lease_capacity: usize,
     peak_lease_capacity: usize,
     retained_lease_bytes: usize,
@@ -103,8 +107,9 @@ struct Metrics {
     lease_roots_created: usize,
     logical_depth: usize,
     // Source execution frame Vec backing only: calls/work/finally/values and
-    // staged arguments, plus the selected input String buffers below. Other
-    // Value/Error payloads remain outside this budget, as do syntax storage,
+    // staged arguments, selected input String buffers and the admitted sole
+    // Result<String> Box<Value>. Other Value/Error payloads remain outside
+    // this budget, as do syntax storage,
     // source, Env/string keys and allocator overhead. Summed peaks are not a
     // simultaneous RSS sample.
     retained_backing_bytes: usize,
@@ -540,7 +545,7 @@ enum Work {
     Bind(SymbolId, bool, bool, SpanId),
     Discard,
     Return,
-    WrapTerminalOk(SpanId),
+    WrapTerminalOk(SpanId, bool),
     AwaitOperand(SpanId),
     AwaitResume,
     Propagate(SpanId),
@@ -643,6 +648,12 @@ struct Machine {
     // moves between slots and is conservatively charged until final transfer.
     string_payload_bytes: usize,
     peak_string_payload_bytes: usize,
+    // A strict Result<String> tree constructs one actual Box<Value>, then
+    // moves that sole return through frames. No per-relay box or charge.
+    result_wrapper_capacity: usize,
+    result_wrapper_bytes: usize,
+    peak_result_wrapper_capacity: usize,
+    peak_result_wrapper_bytes: usize,
     lease_capacity: usize,
     lease_bytes: usize,
     lease_root_bytes: usize,
@@ -870,6 +881,10 @@ impl Machine {
             peak_retirement_bytes: 0,
             string_payload_bytes: 0,
             peak_string_payload_bytes: 0,
+            result_wrapper_capacity: 0,
+            result_wrapper_bytes: 0,
+            peak_result_wrapper_capacity: 0,
+            peak_result_wrapper_bytes: 0,
             lease_capacity: 0,
             lease_bytes: 0,
             lease_root_bytes: 0,
@@ -1053,6 +1068,7 @@ impl Machine {
             .value_limits
             .max_frames
             .checked_sub(self.argument_capacity)
+            .and_then(|frames| frames.checked_sub(self.result_wrapper_capacity))
             .and_then(|frames| frames.checked_sub(self.exit_handle_capacity))
             .and_then(|frames| frames.checked_sub(self.retirement_capacity))
             .and_then(|frames| frames.checked_sub(self.lease_capacity))
@@ -1064,6 +1080,7 @@ impl Machine {
             .value_limits
             .max_storage_bytes
             .checked_sub(self.argument_bytes)
+            .and_then(|bytes| bytes.checked_sub(self.result_wrapper_bytes))
             .and_then(|bytes| bytes.checked_sub(self.exit_handle_bytes))
             .and_then(|bytes| bytes.checked_sub(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_sub(self.string_payload_bytes))
@@ -1103,6 +1120,7 @@ impl Machine {
         let capacity = self
             .argument_capacity
             .checked_add(additional)
+            .and_then(|total| total.checked_add(self.result_wrapper_capacity))
             .and_then(|total| total.checked_add(self.values.capacity()))
             .and_then(|total| total.checked_add(self.exit_handle_capacity))
             .and_then(|total| total.checked_add(self.retirement_capacity))
@@ -1121,6 +1139,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(self.result_wrapper_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
@@ -1148,6 +1167,7 @@ impl Machine {
             .and_then(|count| count.checked_add(self.retirement_capacity))
             .and_then(|count| count.checked_add(witnesses))
             .and_then(|count| count.checked_add(self.argument_capacity))
+            .and_then(|count| count.checked_add(self.result_wrapper_capacity))
             .and_then(|count| count.checked_add(self.values.capacity()))
             .and_then(|count| count.checked_add(self.lease_capacity))
             .and_then(|count| {
@@ -1168,6 +1188,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(self.result_wrapper_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
@@ -1270,6 +1291,7 @@ impl Machine {
             .checked_add(additional)
             .and_then(|count| count.checked_add(total_roots / std::mem::size_of::<Value>()))
             .and_then(|count| count.checked_add(self.argument_capacity))
+            .and_then(|count| count.checked_add(self.result_wrapper_capacity))
             .and_then(|count| count.checked_add(self.exit_handle_capacity))
             .and_then(|count| count.checked_add(self.retirement_capacity))
             .and_then(|count| count.checked_add(self.values.capacity()))
@@ -1286,6 +1308,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(self.result_wrapper_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if bytes > self.value_limits.max_storage_bytes {
             return Err(storage_error(ReserveError::StorageLimit, span));
@@ -2687,9 +2710,12 @@ impl Machine {
                         push(&mut self.work, Work::Unary(op, expr.span));
                         push(&mut self.work, Work::Eval(operand));
                     }
-                    ExprCode::TerminalOk(operand) => {
+                    ExprCode::TerminalOk(operand, owned_string) => {
                         self.reserve_work(2, span)?;
-                        push(&mut self.work, Work::WrapTerminalOk(expr.span));
+                        push(
+                            &mut self.work,
+                            Work::WrapTerminalOk(expr.span, owned_string),
+                        );
                         push(&mut self.work, Work::Eval(operand));
                     }
                     ExprCode::Binary(left, op, right) => {
@@ -2865,20 +2891,49 @@ impl Machine {
                 let value = self.value();
                 self.pending = Some(Ok(Flow::returned(value)));
             }
-            Work::WrapTerminalOk(span_id) => {
+            Work::WrapTerminalOk(span_id, owned_string) => {
                 let span = self.code.span(span_id);
                 let value = self.value();
-                // Admission allows this only in a Result root's terminal
-                // return, with a scalar operand. Result itself never becomes
-                // a copyable local, argument or nested scalar expression.
-                scalar(&value, span)?;
-                self.emit(
-                    Value::Result {
-                        ok: true,
-                        value: Box::new(value),
-                    },
-                    span,
-                )?;
+                if owned_string {
+                    if !matches!(value, Value::String(_)) || self.result_wrapper_capacity != 0 {
+                        return Err(unsupported(span));
+                    }
+                    // The operand already followed its original evaluation
+                    // and move order. Admit both the actual Box backing and
+                    // the outgoing Value slot before constructing that Box.
+                    self.result_wrapper_capacity = 1;
+                    self.result_wrapper_bytes = std::mem::size_of::<Value>();
+                    // Existing Vec backing remains retained after popping
+                    // the operand. Check its full capacity together with the
+                    // new Box before reserving the outgoing element.
+                    if let Err(error) = self
+                        .check_argument_capacity(0, span)
+                        .and_then(|_| self.reserve_values(1, span))
+                    {
+                        self.result_wrapper_capacity = 0;
+                        self.result_wrapper_bytes = 0;
+                        return Err(error);
+                    }
+                    // Standard Box allocation keeps the original global OOM
+                    // behavior; this backing budget is not OOM recovery.
+                    let value = Box::new(value);
+                    self.peak_result_wrapper_capacity = self.peak_result_wrapper_capacity.max(1);
+                    self.peak_result_wrapper_bytes = self
+                        .peak_result_wrapper_bytes
+                        .max(std::mem::size_of::<Value>());
+                    push(&mut self.values, Value::Result { ok: true, value });
+                } else {
+                    // Original scalar Result roots retain their old operand
+                    // and payload accounting contract.
+                    scalar(&value, span)?;
+                    self.emit(
+                        Value::Result {
+                            ok: true,
+                            value: Box::new(value),
+                        },
+                        span,
+                    )?;
+                }
             }
             Work::AwaitOperand(span) => {
                 let source_span = self.code.span(span);
@@ -3391,6 +3446,8 @@ impl Machine {
             || self.retirement_bytes != 0
             || self.entry_args.is_some()
             || self.string_payload_bytes != 0
+            || self.result_wrapper_capacity != 0
+            || self.result_wrapper_bytes != 0
             || self.lease_capacity != 0
             || self.lease_bytes != 0
             || self.lease_root_bytes != 0
@@ -3573,6 +3630,7 @@ impl Machine {
         }
         self.finally.tighten(self.scope_release_context());
         window.finish(&mut self.finally);
+        self.synchronize_result_wrapper_charge();
         self.snapshot_lease_metrics();
         match dispatched {
             Ok(result) => result,
@@ -3612,6 +3670,7 @@ impl Machine {
                 self.metrics.dispatches += 1;
                 self.metrics.exit_dispatches += 1;
                 self.drive_scope_exit(hooks);
+                self.synchronize_result_wrapper_charge();
                 self.finally.tighten(self.scope_release_context());
                 window.finish(&mut self.finally);
                 if self.state == MachineState::Waiting {
@@ -3628,6 +3687,7 @@ impl Machine {
             };
             popped += 1;
             self.dispatch_one(step, hooks, window);
+            self.synchronize_result_wrapper_charge();
             window.finish(&mut self.finally);
             if self.state == MachineState::Waiting {
                 return Ok(ChunkProgress::Waiting { popped });
@@ -3730,6 +3790,15 @@ impl Machine {
         self.metrics.remaining_exit_frames = self.exits.len();
         self.metrics.logical_depth = self.call_depth;
         assert_eq!(self.call_depth, self.initial_depth);
+        let result = self.pending.take().expect("root call or admission outcome");
+        // The sole Box has actually moved into this outgoing Flow, or was
+        // already destroyed by real arbitration. It is no longer retained.
+        self.result_wrapper_capacity = 0;
+        self.result_wrapper_bytes = 0;
+        self.metrics.retained_result_wrapper_capacity = 0;
+        self.metrics.retained_result_wrapper_bytes = 0;
+        self.metrics.peak_result_wrapper_capacity = self.peak_result_wrapper_capacity;
+        self.metrics.peak_result_wrapper_bytes = self.peak_result_wrapper_bytes;
         self.metrics.retained_backing_bytes = self.calls.charged_storage_bytes()
             + self.work.charged_storage_bytes()
             + self.values.charged_storage_bytes()
@@ -3737,7 +3806,8 @@ impl Machine {
             + self.exits.charged_storage_bytes()
             + self.argument_bytes
             + self.exit_handle_bytes
-            + self.retirement_bytes;
+            + self.retirement_bytes
+            + self.result_wrapper_bytes;
         self.metrics.peak_backing_bytes_upper_bound = self.calls.peak_storage_bytes()
             + self.work.peak_storage_bytes()
             + self.values.peak_storage_bytes()
@@ -3747,6 +3817,7 @@ impl Machine {
             + self.peak_exit_handle_bytes
             + self.peak_retirement_bytes
             + self.peak_string_payload_bytes
+            + self.peak_result_wrapper_bytes
             + self.peak_lease_bytes
             + self.peak_lease_root_bytes;
         // A completed run keeps the same immutable code owner. Code is shared
@@ -3761,7 +3832,6 @@ impl Machine {
                     .metrics
                     .code_construction_peak_backing_bytes_upper_bound
         );
-        let result = self.pending.take().expect("root call or admission outcome");
         // Input-derived buffers have either been destroyed or moved into this
         // sole outgoing Flow. They are no longer retained by the Machine.
         self.string_payload_bytes = 0;
@@ -3769,6 +3839,42 @@ impl Machine {
         self.metrics.peak_string_payload_bytes = self.peak_string_payload_bytes;
         self.state = MachineState::Finished;
         result
+    }
+
+    fn synchronize_result_wrapper_charge(&mut self) {
+        if self.result_wrapper_capacity == 0 {
+            return;
+        }
+        // Admission forbids Result locals, parameters, captures, arguments
+        // and finally in Result-bearing functions. At a dispatch boundary the
+        // sole wrapper can only be an operand or the current outgoing primary.
+        // These reads neither allocate nor clone its owned String or Box.
+        let value_has_wrapper = |value: &Value| matches!(value, Value::Result { value, .. } if matches!(value.as_ref(), Value::String(_)));
+        let flow_has_wrapper = |result: &KuResult<Flow>| {
+            matches!(result, Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })
+                if value_has_wrapper(value))
+        };
+        let operands = self
+            .values
+            .as_slice()
+            .iter()
+            .filter(|value| value_has_wrapper(value))
+            .count();
+        let pending = usize::from(self.pending.as_ref().is_some_and(flow_has_wrapper));
+        let exits = self
+            .exits
+            .as_slice()
+            .iter()
+            .filter(|exit| exit.state.outcome().is_some_and(flow_has_wrapper))
+            .count();
+        let retained = operands + pending + exits;
+        assert!(retained <= 1, "strict Result return retains one actual Box");
+        self.result_wrapper_capacity = retained;
+        self.result_wrapper_bytes = retained * std::mem::size_of::<Value>();
+        self.metrics.retained_result_wrapper_capacity = self.result_wrapper_capacity;
+        self.metrics.retained_result_wrapper_bytes = self.result_wrapper_bytes;
+        self.metrics.peak_result_wrapper_capacity = self.peak_result_wrapper_capacity;
+        self.metrics.peak_result_wrapper_bytes = self.peak_result_wrapper_bytes;
     }
 
     fn snapshot_lease_metrics(&mut self) {
@@ -4655,6 +4761,20 @@ impl Drop for Machine {
         if let Some(panic) = self.finally.drain() {
             retain_first_panic(&mut first, panic);
         }
+        if self.result_wrapper_capacity != 0
+            && matches!(self.pending.as_ref(), Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. }))
+                if matches!(value, Value::Result { value, .. } if matches!(value.as_ref(), Value::String(_))))
+        {
+            let pending = self.pending.take();
+            let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(pending)));
+            if let Err(panic) = dropped {
+                retain_first_panic(&mut first, panic);
+            }
+        }
+        self.result_wrapper_capacity = 0;
+        self.result_wrapper_bytes = 0;
+        self.metrics.retained_result_wrapper_capacity = 0;
+        self.metrics.retained_result_wrapper_bytes = 0;
         if let Some(panic) = first {
             std::panic::resume_unwind(panic);
         }

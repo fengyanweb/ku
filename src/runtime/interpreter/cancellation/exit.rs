@@ -203,6 +203,12 @@ fn install_cleanup_error<T: ScopeExit>(
 }
 
 impl<T: ScopeExit> ExitState<T> {
+    /// Read the sole retained primary without cloning or transferring it.
+    /// The execution budget uses this only at stable dispatch boundaries.
+    pub(in crate::runtime::interpreter) fn outcome(&self) -> Option<&KuResult<T>> {
+        self.outcome.as_ref()
+    }
+
     pub(in crate::runtime::interpreter) fn new(
         interpreter: &mut Interpreter,
         result: KuResult<T>,
