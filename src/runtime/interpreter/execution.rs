@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::ast::{Param, TypeName};
-use crate::runtime::task::TaskRetirementWitness;
+use crate::runtime::task::{AwaitPayloadCharge, AwaitPayloadPolicy, TaskRetirementWitness};
 use std::cell::Cell;
 use std::num::NonZeroUsize;
 use storage::{FrameLimits, FrameStack, ReserveError};
@@ -98,6 +98,10 @@ struct Metrics {
     retained_result_wrapper_bytes: usize,
     peak_result_wrapper_capacity: usize,
     peak_result_wrapper_bytes: usize,
+    retained_error_leaf_capacity: usize,
+    retained_error_leaf_bytes: usize,
+    peak_error_leaf_capacity: usize,
+    peak_error_leaf_bytes: usize,
     retained_lease_capacity: usize,
     peak_lease_capacity: usize,
     retained_lease_bytes: usize,
@@ -108,7 +112,8 @@ struct Metrics {
     logical_depth: usize,
     // Source execution frame Vec backing only: calls/work/finally/values and
     // staged arguments, selected input String buffers and admitted
-    // selected Result leaf Box<Value> payloads. Other Value/Error payloads remain
+    // selected Result leaf Box<Value> payloads and selected await ErrorObject
+    // public Map slots/key/value buffers. Other Value/Error payloads remain
     // outside this budget, as do syntax storage, source, Env/string keys and
     // allocator overhead. Summed peaks are not a
     // simultaneous RSS sample.
@@ -548,6 +553,7 @@ enum Work {
     WrapTerminalOk(SpanId, bool),
     WrapBorrowedTerminalOk(SpanId),
     AwaitOperand(SpanId),
+    AwaitOwnedStringOperand(SpanId),
     AwaitResume,
     Propagate(SpanId),
     TryExit(usize),
@@ -655,6 +661,17 @@ struct Machine {
     result_wrapper_bytes: usize,
     peak_result_wrapper_capacity: usize,
     peak_result_wrapper_bytes: usize,
+    // Selected await failures retain their original ErrorObject Map/Strings.
+    error_leaf_capacity: usize,
+    error_leaf_bytes: usize,
+    peak_error_leaf_capacity: usize,
+    peak_error_leaf_bytes: usize,
+    // A ticket can be polled directly by the local driver between dispatches.
+    // Replace this cached ticket/escrow subtotal with the current real owners
+    // at every capacity admission, instead of relying on a dispatch snapshot.
+    await_payload_snapshot: AwaitPayloadCharge,
+    await_payload_escrow: AwaitPayloadCharge,
+    owned_await_payloads: bool,
     lease_capacity: usize,
     lease_bytes: usize,
     lease_root_bytes: usize,
@@ -696,6 +713,22 @@ enum ExitCompletion {
 struct AwaitFrame {
     ticket: crate::runtime::task::AwaitTicket,
     span: SpanId,
+    owned_payload: bool,
+}
+
+fn sum_payload_charge(left: AwaitPayloadCharge, right: AwaitPayloadCharge) -> AwaitPayloadCharge {
+    let add = |left: usize, right: usize| {
+        left.checked_add(right)
+            .expect("admitted selected payload backing")
+    };
+    AwaitPayloadCharge {
+        count: add(left.count, right.count),
+        bytes: add(left.bytes, right.bytes),
+        box_count: add(left.box_count, right.box_count),
+        box_bytes: add(left.box_bytes, right.box_bytes),
+        error_leaf_count: add(left.error_leaf_count, right.error_leaf_count),
+        error_leaf_bytes: add(left.error_leaf_bytes, right.error_leaf_bytes),
+    }
 }
 
 fn merge_release_context(
@@ -897,6 +930,13 @@ impl Machine {
             result_wrapper_bytes: 0,
             peak_result_wrapper_capacity: 0,
             peak_result_wrapper_bytes: 0,
+            error_leaf_capacity: 0,
+            error_leaf_bytes: 0,
+            peak_error_leaf_capacity: 0,
+            peak_error_leaf_bytes: 0,
+            await_payload_snapshot: AwaitPayloadCharge::default(),
+            await_payload_escrow: AwaitPayloadCharge::default(),
+            owned_await_payloads: false,
             lease_capacity: 0,
             lease_bytes: 0,
             lease_root_bytes: 0,
@@ -1056,6 +1096,78 @@ impl Machine {
         Ok(())
     }
 
+    fn live_await_payload_charge(&self) -> AwaitPayloadCharge {
+        let ticket = self
+            .awaiting
+            .as_ref()
+            .map_or_else(AwaitPayloadCharge::default, |frame| {
+                frame.ticket.retained_payload_charge()
+            });
+        sum_payload_charge(ticket, self.await_payload_escrow)
+    }
+
+    fn live_payload_storage(&self, span: Span) -> KuResult<(usize, usize)> {
+        let live = self.live_await_payload_charge();
+        // Stable totals contain the last observed ephemeral subtotal. Direct
+        // LocalDriver poll can change ticket ownership without dispatching the
+        // Machine, so substitute the current ticket/operation-local escrow.
+        let count = self
+            .result_wrapper_capacity
+            .checked_add(self.error_leaf_capacity)
+            .and_then(|count| count.checked_sub(self.await_payload_snapshot.count))
+            .and_then(|count| count.checked_add(live.count))
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let bytes = self
+            .result_wrapper_bytes
+            .checked_add(self.error_leaf_bytes)
+            .and_then(|bytes| bytes.checked_sub(self.await_payload_snapshot.bytes))
+            .and_then(|bytes| bytes.checked_add(live.bytes))
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        Ok((count, bytes))
+    }
+
+    fn await_payload_policy(&self, span: Span) -> KuResult<AwaitPayloadPolicy> {
+        self.check_argument_capacity(0, span)?;
+        let (payload_count, payload_bytes) = self.live_payload_storage(span)?;
+        let count = self
+            .argument_capacity
+            .checked_add(payload_count)
+            .and_then(|count| count.checked_add(self.values.capacity()))
+            .and_then(|count| count.checked_add(self.exit_handle_capacity))
+            .and_then(|count| count.checked_add(self.retirement_capacity))
+            .and_then(|count| count.checked_add(self.lease_capacity))
+            .and_then(|count| {
+                count.checked_add(self.lease_root_bytes / std::mem::size_of::<Value>())
+            })
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let bytes = self
+            .argument_bytes
+            .checked_add(payload_bytes)
+            .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
+            .and_then(|bytes| bytes.checked_add(self.exit_handle_bytes))
+            .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
+            .and_then(|bytes| bytes.checked_add(self.lease_bytes))
+            .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
+            .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        Ok(AwaitPayloadPolicy {
+            max_count: self
+                .value_limits
+                .max_frames
+                .checked_sub(count)
+                .ok_or_else(|| storage_error(ReserveError::FrameLimit, span))?,
+            max_bytes: self
+                .value_limits
+                .max_storage_bytes
+                .checked_sub(bytes)
+                .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?,
+            // Every admitted String comes from this original input. Moving it
+            // through static children does not add a second buffer reservation.
+            input_string_capacity: self.string_payload_bytes,
+            span,
+        })
+    }
+
     fn reserve_work(&mut self, additional: usize, span: Span) -> KuResult<()> {
         let frames = self
             .work_limits
@@ -1112,11 +1224,12 @@ impl Machine {
     }
 
     fn reserve_values(&mut self, additional: usize, span: Span) -> KuResult<()> {
+        let (payload_count, payload_bytes) = self.live_payload_storage(span)?;
         let frames = self
             .value_limits
             .max_frames
             .checked_sub(self.argument_capacity)
-            .and_then(|frames| frames.checked_sub(self.result_wrapper_capacity))
+            .and_then(|frames| frames.checked_sub(payload_count))
             .and_then(|frames| frames.checked_sub(self.exit_handle_capacity))
             .and_then(|frames| frames.checked_sub(self.retirement_capacity))
             .and_then(|frames| frames.checked_sub(self.lease_capacity))
@@ -1128,7 +1241,7 @@ impl Machine {
             .value_limits
             .max_storage_bytes
             .checked_sub(self.argument_bytes)
-            .and_then(|bytes| bytes.checked_sub(self.result_wrapper_bytes))
+            .and_then(|bytes| bytes.checked_sub(payload_bytes))
             .and_then(|bytes| bytes.checked_sub(self.exit_handle_bytes))
             .and_then(|bytes| bytes.checked_sub(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_sub(self.string_payload_bytes))
@@ -1165,10 +1278,11 @@ impl Machine {
     }
 
     fn check_argument_capacity(&self, additional: usize, span: Span) -> KuResult<()> {
+        let (payload_count, payload_bytes) = self.live_payload_storage(span)?;
         let capacity = self
             .argument_capacity
             .checked_add(additional)
-            .and_then(|total| total.checked_add(self.result_wrapper_capacity))
+            .and_then(|total| total.checked_add(payload_count))
             .and_then(|total| total.checked_add(self.values.capacity()))
             .and_then(|total| total.checked_add(self.exit_handle_capacity))
             .and_then(|total| total.checked_add(self.retirement_capacity))
@@ -1187,7 +1301,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
-            .and_then(|bytes| bytes.checked_add(self.result_wrapper_bytes))
+            .and_then(|bytes| bytes.checked_add(payload_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
@@ -1209,13 +1323,14 @@ impl Machine {
         witnesses: usize,
         span: Span,
     ) -> KuResult<()> {
+        let (payload_count, payload_bytes) = self.live_payload_storage(span)?;
         let count = self
             .exit_handle_capacity
             .checked_add(handles)
             .and_then(|count| count.checked_add(self.retirement_capacity))
             .and_then(|count| count.checked_add(witnesses))
             .and_then(|count| count.checked_add(self.argument_capacity))
-            .and_then(|count| count.checked_add(self.result_wrapper_capacity))
+            .and_then(|count| count.checked_add(payload_count))
             .and_then(|count| count.checked_add(self.values.capacity()))
             .and_then(|count| count.checked_add(self.lease_capacity))
             .and_then(|count| {
@@ -1236,7 +1351,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
-            .and_then(|bytes| bytes.checked_add(self.result_wrapper_bytes))
+            .and_then(|bytes| bytes.checked_add(payload_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
@@ -1330,6 +1445,7 @@ impl Machine {
         root_bytes: usize,
         span: Span,
     ) -> KuResult<()> {
+        let (payload_count, payload_bytes) = self.live_payload_storage(span)?;
         let total_roots = self
             .lease_root_bytes
             .checked_add(root_bytes)
@@ -1339,7 +1455,7 @@ impl Machine {
             .checked_add(additional)
             .and_then(|count| count.checked_add(total_roots / std::mem::size_of::<Value>()))
             .and_then(|count| count.checked_add(self.argument_capacity))
-            .and_then(|count| count.checked_add(self.result_wrapper_capacity))
+            .and_then(|count| count.checked_add(payload_count))
             .and_then(|count| count.checked_add(self.exit_handle_capacity))
             .and_then(|count| count.checked_add(self.retirement_capacity))
             .and_then(|count| count.checked_add(self.values.capacity()))
@@ -1356,7 +1472,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
-            .and_then(|bytes| bytes.checked_add(self.result_wrapper_bytes))
+            .and_then(|bytes| bytes.checked_add(payload_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if bytes > self.value_limits.max_storage_bytes {
             return Err(storage_error(ReserveError::StorageLimit, span));
@@ -2717,6 +2833,12 @@ impl Machine {
                         push(&mut self.work, Work::AwaitOperand(expr.span));
                         push(&mut self.work, Work::Eval(operand));
                     }
+                    ExprCode::TerminalAwaitOwnedString(operand) => {
+                        hooks.host().reject_cleanup_submission(span)?;
+                        self.reserve_work(2, span)?;
+                        push(&mut self.work, Work::AwaitOwnedStringOperand(expr.span));
+                        push(&mut self.work, Work::Eval(operand));
+                    }
                     ExprCode::Propagate(operand) => {
                         self.reserve_work(2, span)?;
                         push(&mut self.work, Work::Propagate(expr.span));
@@ -2990,6 +3112,35 @@ impl Machine {
                 self.awaiting = Some(AwaitFrame {
                     ticket: crate::runtime::task::AwaitTicket::begin(task),
                     span,
+                    owned_payload: false,
+                });
+                push(&mut self.work, Work::AwaitResume);
+            }
+            Work::AwaitOwnedStringOperand(span) => {
+                let source_span = self.code.span(span);
+                self.reserve_work(1, source_span)?;
+                // Reserve the eventual operand slot before deriving the extra
+                // payload quota or transferring the sole Task owner.
+                self.reserve_values(1, source_span)?;
+                let policy = self.await_payload_policy(source_span)?;
+                let value = self.value();
+                let Value::Task(task) = value else {
+                    return Err(KuError::runtime(
+                        format!("await expects task but got {}", value.type_name()),
+                        source_span,
+                    ));
+                };
+                assert!(
+                    self.awaiting.is_none(),
+                    "one active await expression per machine"
+                );
+                self.owned_await_payloads = true;
+                self.awaiting = Some(AwaitFrame {
+                    ticket: crate::runtime::task::AwaitTicket::begin_with_payload_policy(
+                        task, policy,
+                    ),
+                    span,
+                    owned_payload: true,
                 });
                 push(&mut self.work, Work::AwaitResume);
             }
@@ -3003,11 +3154,30 @@ impl Machine {
                         self.state = MachineState::Waiting;
                     }
                     crate::runtime::task::AwaitPoll::Ready => {
-                        let AwaitFrame { ticket, span } =
+                        let owned_payload = awaiting.owned_payload;
+                        if owned_payload {
+                            // The ticket is consumed by finish_with. Its real
+                            // outcome remains operation-local through target
+                            // retirement and emission, including native unwind.
+                            self.await_payload_escrow = awaiting.ticket.retained_payload_charge();
+                        }
+                        let AwaitFrame { ticket, span, .. } =
                             self.awaiting.take().expect("one await transfer");
                         let result =
                             ticket.finish_with(|result| hooks.host().observe_termination(result));
-                        self.emit(result?, self.code.span(span))?;
+                        if owned_payload {
+                            let emitted = match result {
+                                Ok(value) => self.emit(value, self.code.span(span)),
+                                Err(error) => Err(error),
+                            };
+                            // emit consumed the actual outcome into the stable
+                            // operand slot or dropped it before returning Err.
+                            self.await_payload_escrow = AwaitPayloadCharge::default();
+                            self.synchronize_result_wrapper_charge();
+                            emitted?;
+                        } else {
+                            self.emit(result?, self.code.span(span))?;
+                        }
                     }
                 }
             }
@@ -3502,6 +3672,10 @@ impl Machine {
             || self.string_payload_bytes != 0
             || self.result_wrapper_capacity != 0
             || self.result_wrapper_bytes != 0
+            || self.error_leaf_capacity != 0
+            || self.error_leaf_bytes != 0
+            || self.await_payload_snapshot != AwaitPayloadCharge::default()
+            || self.await_payload_escrow != AwaitPayloadCharge::default()
             || self.lease_capacity != 0
             || self.lease_bytes != 0
             || self.lease_root_bytes != 0
@@ -3510,6 +3684,7 @@ impl Machine {
             return Err(self.lifecycle_error("prepare undrained next run"));
         }
         self.state = MachineState::Ready;
+        self.owned_await_payloads = false;
         self.fallback_release.set(None);
         self.fallback_metadata = None;
         Ok(())
@@ -3682,6 +3857,11 @@ impl Machine {
             self.aborted_release =
                 merge_release_context(current_cleanup_context(), self.scope_release_context());
         }
+        if dispatched.is_err() {
+            // finish_with/emission locals have physically unwound before this
+            // catch boundary; their escrow no longer represents a live owner.
+            self.await_payload_escrow = AwaitPayloadCharge::default();
+        }
         self.finally.tighten(self.scope_release_context());
         window.finish(&mut self.finally);
         self.synchronize_result_wrapper_charge();
@@ -3849,10 +4029,18 @@ impl Machine {
         // primaries/replacements have already settled or been destroyed.
         self.result_wrapper_capacity = 0;
         self.result_wrapper_bytes = 0;
+        self.error_leaf_capacity = 0;
+        self.error_leaf_bytes = 0;
+        self.await_payload_snapshot = AwaitPayloadCharge::default();
+        self.await_payload_escrow = AwaitPayloadCharge::default();
+        self.metrics.retained_error_leaf_capacity = 0;
+        self.metrics.retained_error_leaf_bytes = 0;
         self.metrics.retained_result_wrapper_capacity = 0;
         self.metrics.retained_result_wrapper_bytes = 0;
         self.metrics.peak_result_wrapper_capacity = self.peak_result_wrapper_capacity;
         self.metrics.peak_result_wrapper_bytes = self.peak_result_wrapper_bytes;
+        self.metrics.peak_error_leaf_capacity = self.peak_error_leaf_capacity;
+        self.metrics.peak_error_leaf_bytes = self.peak_error_leaf_bytes;
         self.metrics.retained_backing_bytes = self.calls.charged_storage_bytes()
             + self.work.charged_storage_bytes()
             + self.values.charged_storage_bytes()
@@ -3861,7 +4049,8 @@ impl Machine {
             + self.argument_bytes
             + self.exit_handle_bytes
             + self.retirement_bytes
-            + self.result_wrapper_bytes;
+            + self.result_wrapper_bytes
+            + self.error_leaf_bytes;
         self.metrics.peak_backing_bytes_upper_bound = self.calls.peak_storage_bytes()
             + self.work.peak_storage_bytes()
             + self.values.peak_storage_bytes()
@@ -3872,6 +4061,7 @@ impl Machine {
             + self.peak_retirement_bytes
             + self.peak_string_payload_bytes
             + self.peak_result_wrapper_bytes
+            + self.peak_error_leaf_bytes
             + self.peak_lease_bytes
             + self.peak_lease_root_bytes;
         // A completed run keeps the same immutable code owner. Code is shared
@@ -3896,62 +4086,86 @@ impl Machine {
     }
 
     fn synchronize_result_wrapper_charge(&mut self) {
-        if self.result_wrapper_capacity == 0 {
+        let ephemeral = self.live_await_payload_charge();
+        if self.result_wrapper_capacity == 0
+            && self.error_leaf_capacity == 0
+            && ephemeral.count == 0
+            && !self.owned_await_payloads
+        {
             return;
         }
-        // Admission forbids Result locals, parameters, captures and
-        // arguments. At a dispatch boundary each actual wrapper belongs to
-        // an operand, outgoing primary or saved FinallyFrame primary. Native
-        // unwind has already dropped operation-local primaries/replacements
-        // before the same scan runs in the outer catch. These reads neither
-        // allocate nor clone an owned String or Box. Both selected function
-        // graphs forbid uncharged scalar Result dependencies before cache
-        // reuse, so primitive leaves here cannot mix with legacy wrappers.
-        let value_has_wrapper = |value: &Value| {
-            matches!(value, Value::Result { value, .. }
-            if matches!(value.as_ref(), Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null))
+        // Admission forbids Result locals/parameters/captures/arguments and
+        // uncharged scalar Result dependencies, before cached ID reuse. Every
+        // real selected owner at a stable boundary is an operand, outgoing
+        // primary, saved finally primary, or ticket. Only finish_with owns an
+        // operation-local outcome; its sole charge stays in escrow until emit
+        // or physical Drop, including the outer native catch boundary.
+        let value_charge = |value: &Value| match value {
+            Value::Result { value: inner, .. }
+                if matches!(
+                    inner.as_ref(),
+                    Value::String(_)
+                        | Value::Int(_)
+                        | Value::Float(_)
+                        | Value::Bool(_)
+                        | Value::Null
+                ) =>
+            {
+                let bytes = std::mem::size_of::<Value>();
+                AwaitPayloadCharge {
+                    count: 1,
+                    bytes,
+                    box_count: 1,
+                    box_bytes: bytes,
+                    ..AwaitPayloadCharge::default()
+                }
+            }
+            Value::Result { ok: false, .. } if self.owned_await_payloads => {
+                AwaitPayloadCharge::for_value(value, self.string_payload_bytes)
+                    .expect("admitted owned await ErrorObject")
+            }
+            _ => AwaitPayloadCharge::default(),
         };
-        let flow_has_wrapper = |result: &KuResult<Flow>| {
-            matches!(result, Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })
-                if value_has_wrapper(value))
+        let flow_charge = |result: &KuResult<Flow>| match result {
+            Ok(Flow::Return { value, .. } | Flow::Fail { value, .. }) => value_charge(value),
+            _ => AwaitPayloadCharge::default(),
         };
-        let operands = self
-            .values
-            .as_slice()
-            .iter()
-            .filter(|value| value_has_wrapper(value))
-            .count();
-        let pending = usize::from(self.pending.as_ref().is_some_and(flow_has_wrapper));
-        let exits = self
-            .exits
-            .as_slice()
-            .iter()
-            .filter(|exit| exit.state.outcome().is_some_and(flow_has_wrapper))
-            .count();
-        let primaries = self
-            .finally
-            .frames
-            .as_slice()
-            .iter()
-            .filter(|frame| frame.primary.as_ref().is_some_and(flow_has_wrapper))
-            .count();
-        // Each observed owner was admitted against the original finite value
-        // budget before its Box was constructed. Checked totals make that
-        // invariant explicit, without a saturating or guessed charge.
-        let retained = operands
-            .checked_add(pending)
-            .and_then(|count| count.checked_add(exits))
-            .and_then(|count| count.checked_add(primaries))
-            .expect("admitted Result wrapper count");
-        let bytes = retained
-            .checked_mul(std::mem::size_of::<Value>())
-            .expect("admitted Result wrapper backing");
-        self.result_wrapper_capacity = retained;
-        self.result_wrapper_bytes = bytes;
+        let mut retained = ephemeral;
+        for value in self.values.as_slice() {
+            retained = sum_payload_charge(retained, value_charge(value));
+        }
+        if let Some(result) = &self.pending {
+            retained = sum_payload_charge(retained, flow_charge(result));
+        }
+        for exit in self.exits.as_slice() {
+            if let Some(result) = exit.state.outcome() {
+                retained = sum_payload_charge(retained, flow_charge(result));
+            }
+        }
+        for frame in self.finally.frames.as_slice() {
+            if let Some(result) = &frame.primary {
+                retained = sum_payload_charge(retained, flow_charge(result));
+            }
+        }
+        self.result_wrapper_capacity = retained.box_count;
+        self.result_wrapper_bytes = retained.box_bytes;
+        self.error_leaf_capacity = retained.error_leaf_count;
+        self.error_leaf_bytes = retained.error_leaf_bytes;
+        self.await_payload_snapshot = ephemeral;
+        self.peak_result_wrapper_capacity =
+            self.peak_result_wrapper_capacity.max(retained.box_count);
+        self.peak_result_wrapper_bytes = self.peak_result_wrapper_bytes.max(retained.box_bytes);
+        self.peak_error_leaf_capacity =
+            self.peak_error_leaf_capacity.max(retained.error_leaf_count);
+        self.peak_error_leaf_bytes = self.peak_error_leaf_bytes.max(retained.error_leaf_bytes);
         self.metrics.retained_result_wrapper_capacity = self.result_wrapper_capacity;
         self.metrics.retained_result_wrapper_bytes = self.result_wrapper_bytes;
         self.metrics.peak_result_wrapper_capacity = self.peak_result_wrapper_capacity;
         self.metrics.peak_result_wrapper_bytes = self.peak_result_wrapper_bytes;
+        self.metrics.retained_error_leaf_capacity = self.error_leaf_capacity;
+        self.metrics.retained_error_leaf_bytes = self.error_leaf_bytes;
+        self.metrics.peak_error_leaf_capacity = self.peak_error_leaf_capacity;
+        self.metrics.peak_error_leaf_bytes = self.peak_error_leaf_bytes;
     }
 
     fn snapshot_lease_metrics(&mut self) {
@@ -4432,7 +4646,25 @@ impl ClaimedNamedTask {
     ) -> Self {
         let mut machine = Machine::from_code(code, Limits::default(), interpreter.call_depth);
         let entry_code = machine.code.clone();
-        let entry = entry_code.symbol(entry_code.function(function).name);
+        let function_code = entry_code.function(function);
+        let entry = entry_code.symbol(function_code.name);
+        if function_code.owned_async_string {
+            let mut args = args;
+            let outcome = machine
+                .start_owned_once(entry, &mut args, 0, false)
+                .err()
+                .map(Err);
+            drop(args);
+            return Self {
+                machine: Some(machine),
+                interpreter,
+                legacy: None,
+                outcome,
+                span,
+                task_id: crate::runtime::task::current_task_id(),
+                finished: false,
+            };
+        }
         let outcome = machine.start_once(entry, &args, 0, false).err().map(Err);
         // Scalar arguments have entered the actual child Env; release the
         // transferred factory buffer before the first dispatch, as before.
@@ -4885,7 +5117,8 @@ impl Drop for Machine {
         if self.result_wrapper_capacity != 0
             && matches!(self.pending.as_ref(), Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. }))
                 if matches!(value, Value::Result { value, .. }
-                    if matches!(value.as_ref(), Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null)))
+                    if matches!(value.as_ref(), Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null)
+                        || (self.owned_await_payloads && matches!(value.as_ref(), Value::Object(_)))))
         {
             let pending = self.pending.take();
             let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(pending)));
@@ -4895,6 +5128,12 @@ impl Drop for Machine {
         }
         self.result_wrapper_capacity = 0;
         self.result_wrapper_bytes = 0;
+        self.error_leaf_capacity = 0;
+        self.error_leaf_bytes = 0;
+        self.await_payload_snapshot = AwaitPayloadCharge::default();
+        self.await_payload_escrow = AwaitPayloadCharge::default();
+        self.metrics.retained_error_leaf_capacity = 0;
+        self.metrics.retained_error_leaf_bytes = 0;
         self.metrics.retained_result_wrapper_capacity = 0;
         self.metrics.retained_result_wrapper_bytes = 0;
         if let Some(panic) = first {

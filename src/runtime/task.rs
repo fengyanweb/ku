@@ -19,7 +19,7 @@ use crate::{
 };
 
 mod await_ticket;
-pub(crate) use await_ticket::{AwaitPoll, AwaitTicket};
+pub(crate) use await_ticket::{AwaitPayloadCharge, AwaitPayloadPolicy, AwaitPoll, AwaitTicket};
 #[cfg(test)]
 mod await_ticket_tests;
 mod cancel_batch;
@@ -1801,6 +1801,19 @@ impl Drop for TaskRuntimeInner {
 }
 
 impl TaskHandle {
+    #[cfg(test)]
+    pub(crate) fn test_with_result_slot<T>(
+        &self,
+        observe: impl FnOnce(Option<&KuResult<Value>>) -> T,
+    ) -> KuResult<T> {
+        let slot = self
+            .state
+            .result
+            .lock()
+            .map_err(|_| KuError::runtime("task result mutex is poisoned", Span::default()))?;
+        Ok(observe(slot.as_ref()))
+    }
+
     pub fn id(&self) -> i64 {
         self.id
     }
@@ -2307,6 +2320,35 @@ impl TaskState {
         let terminal = self.is_terminal();
         let result = if consume { slot.take() } else { slot.clone() };
         Ok((result, terminal))
+    }
+
+    fn observe_result_admitted(
+        &self,
+        policy: await_ticket::AwaitPayloadPolicy,
+    ) -> Result<
+        (
+            Option<KuResult<Value>>,
+            bool,
+            await_ticket::AwaitPayloadCharge,
+        ),
+        await_ticket::AwaitObservationError,
+    > {
+        let mut slot = self
+            .result
+            .lock()
+            .map_err(|_| await_ticket::AwaitObservationError::Poisoned)?;
+        let terminal = self.is_terminal();
+        // Only immutable shape/capacity reads and checked integer arithmetic
+        // occur before take. Rejection leaves this sole payload in its real
+        // Task owner; no KuError/String allocation, Drop, wait or ACK occurs
+        // under this result lock. The caller formats rejection after unlock.
+        let charge = match slot.as_ref() {
+            Some(result) => policy
+                .admit(result)
+                .map_err(await_ticket::AwaitObservationError::Rejected)?,
+            None => await_ticket::AwaitPayloadCharge::default(),
+        };
+        Ok((slot.take(), terminal, charge))
     }
 
     #[cfg(test)]

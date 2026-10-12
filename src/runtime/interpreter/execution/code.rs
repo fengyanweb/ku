@@ -54,6 +54,7 @@ pub(super) struct CodeFn {
     pub(super) body: BlockId,
     pub(super) span: SpanId,
     pub(super) is_async: bool,
+    pub(super) owned_async_string: bool,
 }
 
 impl CodeFn {
@@ -118,6 +119,7 @@ pub(super) enum ExprCode {
         callee_span: SpanId,
     },
     Await(ExprId),
+    TerminalAwaitOwnedString(ExprId),
     Propagate(ExprId),
 }
 
@@ -538,6 +540,7 @@ enum FunctionRole {
     ResultRoot,
     ClaimedAsyncResultRoot,
     ClaimedAsyncOwnedResultStringRoot,
+    AsyncOwnedResultStringDependency,
     AsyncResultDependency,
     ClaimedLocalAsyncResultRoot,
 }
@@ -660,7 +663,9 @@ impl<'a> FunctionSpec<'a> {
     fn owns_result_string(self) -> bool {
         matches!(
             self.role,
-            FunctionRole::OwnedResultStringNamed | FunctionRole::ClaimedAsyncOwnedResultStringRoot
+            FunctionRole::OwnedResultStringNamed
+                | FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                | FunctionRole::AsyncOwnedResultStringDependency
         )
     }
 
@@ -701,12 +706,22 @@ impl<'a> FunctionSpec<'a> {
     }
 
     fn is_claimed_async_owned_result_string(self) -> bool {
-        matches!(self.role, FunctionRole::ClaimedAsyncOwnedResultStringRoot)
+        matches!(
+            self.role,
+            FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                | FunctionRole::AsyncOwnedResultStringDependency
+        )
+    }
+
+    fn owned_async_dependency(self, function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        spec.role = FunctionRole::AsyncOwnedResultStringDependency;
+        spec
     }
 
     fn allows_await(self) -> bool {
-        // The new root records its async declaration for the claimant, but
-        // its selected body and all dependencies are strictly synchronous.
+        // Owned async String roots/dependencies use only their separately
+        // checked direct terminal await, never the general scalar Await.
         self.is_async() && !self.is_claimed_async_owned_result_string()
     }
 
@@ -723,6 +738,7 @@ impl<'a> FunctionSpec<'a> {
             self.role,
             FunctionRole::ClaimedAsyncResultRoot
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                | FunctionRole::AsyncOwnedResultStringDependency
                 | FunctionRole::AsyncResultDependency
                 | FunctionRole::ClaimedLocalAsyncResultRoot
         )
@@ -734,6 +750,7 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::OwnedNamed
                 | FunctionRole::OwnedResultStringNamed
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                | FunctionRole::AsyncOwnedResultStringDependency
                 | FunctionRole::BorrowedStringNamed
                 | FunctionRole::BorrowedScalarResultNamed
         )
@@ -806,7 +823,8 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::OwnedResultStringNamed => {
                 !function.is_async && string_result_type(&function.return_type)
             }
-            FunctionRole::ClaimedAsyncOwnedResultStringRoot => {
+            FunctionRole::ClaimedAsyncOwnedResultStringRoot
+            | FunctionRole::AsyncOwnedResultStringDependency => {
                 function.is_async && string_result_type(&function.return_type)
             }
             FunctionRole::ResultRoot => {
@@ -1030,6 +1048,9 @@ struct ExpressionMode {
     // Only the direct Result operand of ? in the new borrowed Result role.
     // A helper or ordinary call site cannot reuse this callee permission.
     unwrap_borrowed_result: bool,
+    // Only the static Call immediately consumed by a terminal owned await.
+    // Nested argument/operand expressions never inherit this permission.
+    owned_async_call: bool,
 }
 
 enum Visit<'a> {
@@ -1208,6 +1229,7 @@ impl<'a> Builder<'a> {
                 name,
                 span,
                 is_async: spec.is_async(),
+                owned_async_string: spec.is_claimed_async_owned_result_string(),
                 ..CodeFn::default()
             },
         );
@@ -1233,6 +1255,7 @@ impl<'a> Builder<'a> {
                 forbid_call: false,
                 terminal_result: false,
                 unwrap_borrowed_result: false,
+                owned_async_call: false,
             },
         )
     }
@@ -1550,11 +1573,28 @@ impl<'a> Builder<'a> {
                         ExprCode::Binary(left, *op, right)
                     }
                     ExprKind::Await(task) => {
-                        if !spec.allows_await() {
-                            return Err(AdmissionError::Unsupported(expr.span));
-                        }
                         expect_kind(self.kind(task)?, ValueKind::Task, task.span)?;
-                        ExprCode::Await(self.expression(task, true)?)
+                        if spec.is_claimed_async_owned_result_string() {
+                            if !mode.terminal_result || !matches!(task.kind, ExprKind::Call { .. })
+                            {
+                                return Err(AdmissionError::Unsupported(expr.span));
+                            }
+                            ExprCode::TerminalAwaitOwnedString(self.expression_with_mode(
+                                task,
+                                ExpressionMode {
+                                    consuming: true,
+                                    forbid_call: false,
+                                    terminal_result: false,
+                                    unwrap_borrowed_result: false,
+                                    owned_async_call: true,
+                                },
+                            )?)
+                        } else {
+                            if !spec.allows_await() {
+                                return Err(AdmissionError::Unsupported(expr.span));
+                            }
+                            ExprCode::Await(self.expression(task, true)?)
+                        }
                     }
                     ExprKind::TryUnwrap { expr: inner } => {
                         if spec.is_claimed_async_owned_result_string() {
@@ -1634,7 +1674,14 @@ impl<'a> Builder<'a> {
                                 borrowed_string_arguments(function, args, expr.span)?;
                                 spec.borrowed_dependency(function)
                             } else if spec.owns_strings() {
-                                spec.owned_dependency(function)
+                                if function.is_async
+                                    && spec.is_claimed_async_owned_result_string()
+                                    && mode.owned_async_call
+                                {
+                                    spec.owned_async_dependency(function)
+                                } else {
+                                    spec.owned_dependency(function)
+                                }
                             } else {
                                 FunctionSpec::dependency(function)
                             })?
@@ -1702,6 +1749,7 @@ impl<'a> Builder<'a> {
                                         forbid_call: has_view,
                                         terminal_result: false,
                                         unwrap_borrowed_result: false,
+                                        owned_async_call: false,
                                     },
                                 )
                             };
@@ -1866,7 +1914,11 @@ impl<'a> Builder<'a> {
                     if is_ok_call(value) {
                         Some(self.terminal_ok(value, true, false)?)
                     } else {
-                        expect_kind(self.kind(value)?, ValueKind::ResultString, value.span)?;
+                        if !(spec.is_claimed_async_owned_result_string()
+                            && matches!(value.kind, ExprKind::Await(_)))
+                        {
+                            expect_kind(self.kind(value)?, ValueKind::ResultString, value.span)?;
+                        }
                         Some(self.expression_with_mode(
                             value,
                             ExpressionMode {
@@ -1874,6 +1926,7 @@ impl<'a> Builder<'a> {
                                 forbid_call: false,
                                 terminal_result: true,
                                 unwrap_borrowed_result: false,
+                                owned_async_call: false,
                             },
                         )?)
                     }
@@ -1996,6 +2049,7 @@ impl<'a> Eligibility<'a> {
                 forbid_call: false,
                 terminal_result: false,
                 unwrap_borrowed_result: false,
+                owned_async_call: false,
             },
         )
     }
@@ -2128,11 +2182,15 @@ impl<'a> Eligibility<'a> {
                                         self.spend(1, value.span)?;
                                         self.expression(argument, true)?;
                                     } else {
-                                        expect_kind(
-                                            self.kind(value)?,
-                                            ValueKind::ResultString,
-                                            value.span,
-                                        )?;
+                                        if !(spec.is_claimed_async_owned_result_string()
+                                            && matches!(value.kind, ExprKind::Await(_)))
+                                        {
+                                            expect_kind(
+                                                self.kind(value)?,
+                                                ValueKind::ResultString,
+                                                value.span,
+                                            )?;
+                                        }
                                         self.expression_with_mode(
                                             value,
                                             ExpressionMode {
@@ -2140,6 +2198,7 @@ impl<'a> Eligibility<'a> {
                                                 forbid_call: false,
                                                 terminal_result: true,
                                                 unwrap_borrowed_result: false,
+                                                owned_async_call: false,
                                             },
                                         )?;
                                     }
@@ -2287,11 +2346,29 @@ impl<'a> Eligibility<'a> {
                             self.expression_with_mode(left, operand_mode)?;
                         }
                         ExprKind::Await(task) => {
-                            if !spec.allows_await() {
-                                return Err(AdmissionError::Unsupported(expr.span));
-                            }
                             expect_kind(self.kind(task)?, ValueKind::Task, task.span)?;
-                            self.expression(task, true)?;
+                            if spec.is_claimed_async_owned_result_string() {
+                                if !mode.terminal_result
+                                    || !matches!(task.kind, ExprKind::Call { .. })
+                                {
+                                    return Err(AdmissionError::Unsupported(expr.span));
+                                }
+                                self.expression_with_mode(
+                                    task,
+                                    ExpressionMode {
+                                        consuming: true,
+                                        forbid_call: false,
+                                        terminal_result: false,
+                                        unwrap_borrowed_result: false,
+                                        owned_async_call: true,
+                                    },
+                                )?;
+                            } else {
+                                if !spec.allows_await() {
+                                    return Err(AdmissionError::Unsupported(expr.span));
+                                }
+                                self.expression(task, true)?;
+                            }
                         }
                         ExprKind::TryUnwrap { expr: inner } => {
                             if spec.is_claimed_async_owned_result_string() {
@@ -2351,7 +2428,14 @@ impl<'a> Eligibility<'a> {
                                     borrowed_string_arguments(function, args, expr.span)?;
                                     spec.borrowed_dependency(function)
                                 } else if spec.owns_strings() {
-                                    spec.owned_dependency(function)
+                                    if function.is_async
+                                        && spec.is_claimed_async_owned_result_string()
+                                        && mode.owned_async_call
+                                    {
+                                        spec.owned_async_dependency(function)
+                                    } else {
+                                        spec.owned_dependency(function)
+                                    }
                                 } else {
                                     FunctionSpec::dependency(function)
                                 })?;
@@ -2417,6 +2501,7 @@ impl<'a> Eligibility<'a> {
                                             forbid_call: has_view,
                                             terminal_result: false,
                                             unwrap_borrowed_result: false,
+                                            owned_async_call: false,
                                         },
                                     )
                                 };

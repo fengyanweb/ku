@@ -13,6 +13,180 @@ pub(crate) enum AwaitPoll {
     Ready,
 }
 
+/// A selected String-result await receives only this unused part of its
+/// caller's existing value budget. The caller keeps its input String
+/// reservation: every admitted success buffer originates in that input pool.
+#[derive(Clone, Copy)]
+pub(crate) struct AwaitPayloadPolicy {
+    pub(crate) max_count: usize,
+    pub(crate) max_bytes: usize,
+    pub(crate) input_string_capacity: usize,
+    pub(crate) span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AwaitPayloadCharge {
+    pub(crate) count: usize,
+    pub(crate) bytes: usize,
+    pub(crate) box_count: usize,
+    pub(crate) box_bytes: usize,
+    // Actual public Map capacity: one Value slot per Map entry. String key
+    // headers are included in slot bytes, not counted as extra Value slots.
+    pub(crate) error_leaf_count: usize,
+    // Map slot backing plus all three actual key and value String buffers.
+    pub(crate) error_leaf_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AwaitPayloadRejection {
+    ArithmeticOverflow,
+    FrameLimit,
+    StorageLimit,
+    UnclassifiedPayload,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum AwaitObservationError {
+    Poisoned,
+    Rejected(AwaitPayloadRejection),
+}
+
+impl AwaitPayloadRejection {
+    fn into_error(self, span: Span) -> KuError {
+        // This is called only after the result lock has been released. The
+        // locked observation returns primitive metadata, never an allocation.
+        KuError::runtime(
+            format!("internal execution storage rejected: {self:?}"),
+            span,
+        )
+    }
+}
+
+impl AwaitPayloadCharge {
+    fn boxed(
+        error_leaf_count: usize,
+        error_leaf_bytes: usize,
+    ) -> Result<Self, AwaitPayloadRejection> {
+        let box_bytes = std::mem::size_of::<Value>();
+        Ok(Self {
+            count: error_leaf_count
+                .checked_add(1)
+                .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?,
+            bytes: error_leaf_bytes
+                .checked_add(box_bytes)
+                .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?,
+            box_count: 1,
+            box_bytes,
+            error_leaf_count,
+            error_leaf_bytes,
+        })
+    }
+
+    fn error_object(value: &Value) -> Result<Self, AwaitPayloadRejection> {
+        let Value::Object(fields) = value else {
+            return Err(AwaitPayloadRejection::UnclassifiedPayload);
+        };
+        let names = ["domain", "code", "message"];
+        if fields.len() != names.len() {
+            return Err(AwaitPayloadRejection::UnclassifiedPayload);
+        }
+        // Charge the actual public HashMap capacity, including spare slots,
+        // and every actual key/value String buffer. Opaque raw hash-table
+        // bucket/control layout and allocator overhead are not exposed by
+        // this API and are not represented as an RSS measurement.
+        let count = fields.capacity();
+        let mut bytes = count
+            .checked_mul(std::mem::size_of::<(String, Value)>())
+            .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
+        // Three fixed lookups avoid an O(capacity) iteration through a sparse
+        // Map. No clone, allocation, payload Drop or caller callback runs here.
+        for name in names {
+            let Some((key, Value::String(text))) = fields.get_key_value(name) else {
+                return Err(AwaitPayloadRejection::UnclassifiedPayload);
+            };
+            bytes = bytes
+                .checked_add(key.capacity())
+                .and_then(|bytes| bytes.checked_add(text.capacity()))
+                .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
+        }
+        Self::boxed(count, bytes)
+    }
+
+    /// Describe a real selected leaf without allocating or cloning. A failure
+    /// Object contributes its public Map capacity as Value slots, the tuple
+    /// backing for those slots, and every actual key/value String capacity.
+    /// A success String remains covered by the caller's input reservation.
+    pub(crate) fn for_value(
+        value: &Value,
+        input_string_capacity: usize,
+    ) -> Result<Self, AwaitPayloadRejection> {
+        match value {
+            Value::Result { ok: true, value } => match value.as_ref() {
+                Value::String(text) if text.capacity() <= input_string_capacity => {
+                    Self::boxed(0, 0)
+                }
+                Value::String(_) => Err(AwaitPayloadRejection::StorageLimit),
+                _ => Err(AwaitPayloadRejection::UnclassifiedPayload),
+            },
+            Value::Result { ok: false, value } => Self::error_object(value),
+            // A checked source returns Result, but retain the existing null
+            // fallthrough of direct Interpreter callers that bypass checking.
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => Ok(Self::default()),
+            _ => Err(AwaitPayloadRejection::UnclassifiedPayload),
+        }
+    }
+}
+
+impl AwaitPayloadPolicy {
+    fn check_charge(
+        self,
+        charge: AwaitPayloadCharge,
+    ) -> Result<AwaitPayloadCharge, AwaitPayloadRejection> {
+        if charge.count > self.max_count {
+            return Err(AwaitPayloadRejection::FrameLimit);
+        }
+        if charge.bytes > self.max_bytes {
+            return Err(AwaitPayloadRejection::StorageLimit);
+        }
+        Ok(charge)
+    }
+
+    pub(super) fn admit(
+        self,
+        result: &KuResult<Value>,
+    ) -> Result<AwaitPayloadCharge, AwaitPayloadRejection> {
+        let charge = match result {
+            Ok(value) => AwaitPayloadCharge::for_value(value, self.input_string_capacity)?,
+            Err(_) => AwaitPayloadCharge::default(),
+        };
+        self.check_charge(charge)
+    }
+
+    fn planned_task_error(
+        self,
+        code: &str,
+        message_capacity: usize,
+    ) -> Result<(), AwaitPayloadRejection> {
+        let names = ["domain", "code", "message"];
+        let mut bytes = names
+            .len()
+            .checked_mul(std::mem::size_of::<(String, Value)>())
+            .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
+        for name in names {
+            bytes = bytes
+                .checked_add(name.len())
+                .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
+        }
+        bytes = bytes
+            .checked_add("task".len())
+            .and_then(|bytes| bytes.checked_add(code.len()))
+            .and_then(|bytes| bytes.checked_add(message_capacity))
+            .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
+        self.check_charge(AwaitPayloadCharge::boxed(names.len(), bytes)?)?;
+        Ok(())
+    }
+}
+
 pub(super) enum AwaitMode {
     Ordinary,
     Diagnostic(Duration),
@@ -72,6 +246,10 @@ struct AwaitCore<H: AwaitTarget> {
     aborted: bool,
     // Ready stays latched until the sole result is transferred by finish.
     outcome: Option<KuResult<Value>>,
+    // This policy travels with the Ticket, including LocalDriver's direct
+    // polls outside the Machine. Charge describes only its actual outcome.
+    payload_policy: Option<AwaitPayloadPolicy>,
+    payload_charge: AwaitPayloadCharge,
     // Actual resource-release cause is independent of the result's metadata.
     // Only its deadline tightens; no TLS guard survives a poll boundary.
     release_context: Option<CancellationContext>,
@@ -80,6 +258,15 @@ struct AwaitCore<H: AwaitTarget> {
 
 impl<H: AwaitTarget> AwaitCore<H> {
     fn begin(runtime: TaskRuntime, target: H, mode: AwaitMode) -> Self {
+        Self::begin_with_policy(runtime, target, mode, None)
+    }
+
+    fn begin_with_policy(
+        runtime: TaskRuntime,
+        target: H,
+        mode: AwaitMode,
+        payload_policy: Option<AwaitPayloadPolicy>,
+    ) -> Self {
         // Install the owner before admission: every failure still reaches the
         // observer before an owned target is released.
         let mut core = Self {
@@ -91,6 +278,8 @@ impl<H: AwaitTarget> AwaitCore<H> {
             consume: true,
             aborted: false,
             outcome: None,
+            payload_policy,
+            payload_charge: AwaitPayloadCharge::default(),
             release_context: visible_context(),
             _same_thread: PhantomData,
         };
@@ -113,10 +302,10 @@ impl<H: AwaitTarget> AwaitCore<H> {
             AwaitMode::Ordinary => {
                 ensure_task_operations_allowed(Span::default())?;
                 if !self.target().state.claim_await() {
-                    self.ready(Ok(task_error(
+                    self.ready_task_error(
                         "already_awaited",
                         format!("task {} has already been awaited", self.target().id),
-                    )));
+                    );
                     return Ok(());
                 }
             }
@@ -138,10 +327,10 @@ impl<H: AwaitTarget> AwaitCore<H> {
             }
         }
         if self.current == self.target().id {
-            self.ready(Ok(task_error(
+            self.ready_task_error(
                 "self_await",
                 format!("task {} cannot await itself", self.target().id),
-            )));
+            );
             return Ok(());
         }
         let state = if self.current == 0 {
@@ -151,14 +340,14 @@ impl<H: AwaitTarget> AwaitCore<H> {
         };
         if self.current != 0 {
             if let Some(code) = self.runtime.register_wait(self.current, self.target().id)? {
-                self.ready(Ok(task_error(
+                self.ready_task_error(
                     code,
                     format!(
                         "task {} cannot await task {}",
                         self.current,
                         self.target().id
                     ),
-                )));
+                );
                 return Ok(());
             }
         }
@@ -190,15 +379,73 @@ impl<H: AwaitTarget> AwaitCore<H> {
     }
 
     fn ready(&mut self, result: KuResult<Value>) {
+        let charge = match self.payload_policy {
+            Some(policy) => match policy.admit(&result) {
+                Ok(charge) => charge,
+                Err(rejection) => {
+                    self.reject_payload(result, rejection, policy.span);
+                    return;
+                }
+            },
+            None => AwaitPayloadCharge::default(),
+        };
+        self.ready_admitted(result, charge);
+    }
+
+    fn ready_admitted(&mut self, result: KuResult<Value>, charge: AwaitPayloadCharge) {
         assert!(self.outcome.is_none(), "await outcome transfers once");
         self.remember_release();
         if let Err(error) = &result {
             tighten(&mut self.release_context, error.scope_cleanup());
         }
+        self.payload_charge = charge;
         self.outcome = Some(result);
         // Original await_task_until retired this before returning to the
         // Interpreter observer. Keep target and outcome owned after retirement.
         drop(self.wait.take());
+    }
+
+    fn reject_payload<T>(&mut self, payload: T, rejection: AwaitPayloadRejection, span: Span) {
+        self.remember_release();
+        let guard = self.release_context.map(CleanupGuard::enter);
+        drop(payload);
+        self.remember_release();
+        drop(guard);
+        self.ready_admitted(
+            Err(rejection.into_error(span)),
+            AwaitPayloadCharge::default(),
+        );
+    }
+
+    fn ready_task_error(&mut self, code: &str, message: String) {
+        let Some(policy) = self.payload_policy else {
+            self.ready(Ok(task_error(code, message)));
+            return;
+        };
+        // Check the requested three-slot schema before constructing it, then
+        // check its real allocator-reported capacities before constructing its
+        // Box. This mirrors candidate-capacity admission for other backing.
+        if let Err(rejection) = policy.planned_task_error(code, message.capacity()) {
+            self.reject_payload(message, rejection, policy.span);
+            return;
+        }
+        let object = errors::error_object("task", code, message);
+        let charge = match AwaitPayloadCharge::error_object(&object)
+            .and_then(|charge| policy.check_charge(charge))
+        {
+            Ok(charge) => charge,
+            Err(rejection) => {
+                self.reject_payload(object, rejection, policy.span);
+                return;
+            }
+        };
+        self.ready_admitted(
+            Ok(Value::Result {
+                ok: false,
+                value: Box::new(object),
+            }),
+            charge,
+        );
     }
 
     fn poll(&mut self) -> AwaitPoll {
@@ -239,31 +486,47 @@ impl<H: AwaitTarget> AwaitCore<H> {
         }
         // Payload and terminal are observed under the same result lock. This
         // is a move for ordinary await, never a peek clone of an Owned value.
-        let observed = self.target().state.observe_result(self.consume);
+        let observed = match self.payload_policy {
+            Some(policy) => match self.target().state.observe_result_admitted(policy) {
+                Ok(observed) => Ok(observed),
+                Err(AwaitObservationError::Poisoned) => Err(KuError::runtime(
+                    "async task state is poisoned",
+                    Span::default(),
+                )),
+                Err(AwaitObservationError::Rejected(rejection)) => {
+                    Err(rejection.into_error(policy.span))
+                }
+            },
+            None => self
+                .target()
+                .state
+                .observe_result(self.consume)
+                .map(|(result, terminal)| (result, terminal, AwaitPayloadCharge::default())),
+        };
         match observed {
             Err(error) => self.ready(Err(error)),
-            Ok((Some(result), _)) => self.ready(result),
-            Ok((None, true)) => self.ready(Ok(task_error(
+            Ok((Some(result), _, charge)) => self.ready_admitted(result, charge),
+            Ok((None, true, _)) => self.ready_task_error(
                 "already_awaited",
                 format!("task {} has already been awaited", self.target().id),
-            ))),
-            Ok((None, false)) => {
+            ),
+            Ok((None, false, _)) => {
                 if self
                     .deadline
                     .is_some_and(|deadline| Instant::now() >= deadline)
                 {
-                    self.ready(Ok(task_error(
+                    self.ready_task_error(
                         "timeout",
                         format!("timed out waiting for task {}", self.target().id),
-                    )));
+                    );
                 } else if await_help_depth() >= MAX_AWAIT_DEPTH {
-                    self.ready(Ok(task_error(
+                    self.ready_task_error(
                         "await_depth",
                         format!(
                             "task {} exceeded await depth {MAX_AWAIT_DEPTH}",
                             self.current
                         ),
-                    )));
+                    );
                 } else {
                     self.remember_release();
                     return AwaitPoll::Pending;
@@ -450,6 +713,29 @@ impl AwaitTicket {
         Self {
             core: AwaitCore::begin(runtime, handle, AwaitMode::Ordinary),
         }
+    }
+
+    pub(crate) fn begin_with_payload_policy(
+        handle: TaskHandle,
+        policy: AwaitPayloadPolicy,
+    ) -> Self {
+        let runtime = handle.runtime.clone();
+        Self {
+            core: AwaitCore::begin_with_policy(runtime, handle, AwaitMode::Ordinary, Some(policy)),
+        }
+    }
+
+    pub(crate) fn retained_payload_charge(&self) -> AwaitPayloadCharge {
+        if self.core.outcome.is_some() {
+            self.core.payload_charge
+        } else {
+            AwaitPayloadCharge::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_outcome(&self) -> Option<&KuResult<Value>> {
+        self.core.outcome.as_ref()
     }
 
     pub(crate) fn poll(&mut self) -> AwaitPoll {

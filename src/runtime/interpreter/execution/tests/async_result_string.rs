@@ -5,6 +5,8 @@ use std::sync::mpsc;
 
 const WAIT: Duration = Duration::from_secs(3);
 
+mod await_string;
+
 const TEXT: &str = "\u{4fdd}\u{7559}\0async";
 const SIMPLE: &str = "async fn Entry(text: str): str! { return ok(text) }";
 const RELAY: &str = r#"
@@ -51,13 +53,23 @@ fn result_buffer(value: &Value, buffers: &[Buffer]) -> (usize, usize) {
 
 fn observe(machine: &Machine, buffers: &[Buffer], boxes: &mut [Option<usize>]) -> usize {
     let mut pointers = Vec::new();
+    let mut error_count = 0;
+    let mut error_bytes = 0;
     let mut observe = |value: &Value| {
-        if matches!(value, Value::Result { .. }) {
-            let (index, pointer) = result_buffer(value, buffers);
-            if let Some(previous) = boxes[index] {
-                assert_eq!(pointer, previous, "an actual saved Box must move intact");
+        if let Value::Result { ok, value: leaf } = value {
+            let pointer = leaf.as_ref() as *const Value as usize;
+            if *ok {
+                let (index, actual) = result_buffer(value, buffers);
+                assert_eq!(actual, pointer);
+                if let Some(previous) = boxes[index] {
+                    assert_eq!(pointer, previous, "an actual saved Box must move intact");
+                } else {
+                    boxes[index] = Some(pointer);
+                }
             } else {
-                boxes[index] = Some(pointer);
+                let (count, bytes) = error_backing(leaf);
+                error_count += count;
+                error_bytes += bytes;
             }
             assert!(
                 !pointers.contains(&pointer),
@@ -84,6 +96,17 @@ fn observe(machine: &Machine, buffers: &[Buffer], boxes: &mut [Option<usize>]) -
             observe(value);
         }
     }
+    if let Some(frame) = &machine.awaiting {
+        if let Some(Ok(value)) = frame.ticket.test_outcome() {
+            observe(value);
+        }
+    }
+    // Stable dispatch boundaries have no operation-local result. Escrow is
+    // observed separately by the S2 kernel probes inside finish_with.
+    assert_eq!(
+        machine.await_payload_escrow,
+        crate::runtime::task::AwaitPayloadCharge::default()
+    );
     let count = pointers.len();
     assert_eq!(machine.result_wrapper_capacity, count);
     assert_eq!(
@@ -95,7 +118,36 @@ fn observe(machine: &Machine, buffers: &[Buffer], boxes: &mut [Option<usize>]) -
         machine.metrics.retained_result_wrapper_bytes,
         count * std::mem::size_of::<Value>()
     );
+    assert_eq!(
+        (machine.error_leaf_capacity, machine.error_leaf_bytes),
+        (error_count, error_bytes)
+    );
+    assert_eq!(
+        (
+            machine.metrics.retained_error_leaf_capacity,
+            machine.metrics.retained_error_leaf_bytes
+        ),
+        (error_count, error_bytes)
+    );
     count
+}
+
+fn error_backing(value: &Value) -> (usize, usize) {
+    let Value::Object(fields) = value else {
+        panic!("an awaited task failure retains its actual ErrorObject")
+    };
+    assert_eq!(fields.len(), 3);
+    let mut bytes = fields.capacity() * std::mem::size_of::<(String, Value)>();
+    for name in ["domain", "code", "message"] {
+        let (key, Value::String(text)) = fields
+            .get_key_value(name)
+            .expect("the existing task ErrorObject schema")
+        else {
+            panic!("the actual ErrorObject values are Strings")
+        };
+        bytes += key.capacity() + text.capacity();
+    }
+    (fields.capacity(), bytes)
 }
 
 fn drained(machine: &Machine) {
@@ -112,6 +164,25 @@ fn drained(machine: &Machine) {
     assert_eq!(machine.metrics.retained_string_payload_bytes, 0);
     assert_eq!(machine.metrics.retained_result_wrapper_capacity, 0);
     assert_eq!(machine.metrics.retained_result_wrapper_bytes, 0);
+    assert_eq!(
+        (machine.error_leaf_capacity, machine.error_leaf_bytes),
+        (0, 0)
+    );
+    assert_eq!(
+        (
+            machine.metrics.retained_error_leaf_capacity,
+            machine.metrics.retained_error_leaf_bytes
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        machine.await_payload_snapshot,
+        crate::runtime::task::AwaitPayloadCharge::default()
+    );
+    assert_eq!(
+        machine.await_payload_escrow,
+        crate::runtime::task::AwaitPayloadCharge::default()
+    );
     assert_eq!((machine.lease_capacity, machine.lease_root_bytes), (0, 0));
     assert!(machine.entry_args.is_none());
 }
@@ -160,6 +231,8 @@ struct Finished {
     peak_box_bytes: usize,
     peak_strings: usize,
     peak_args: usize,
+    peak_errors: usize,
+    peak_error_bytes: usize,
     outgoing: Option<(usize, usize)>,
 }
 
@@ -338,6 +411,8 @@ impl LocalTaskRunner for SourceRunner {
                     peak_box_bytes: machine.map_or(0, |m| m.metrics.peak_result_wrapper_bytes),
                     peak_strings: machine.map_or(0, |m| m.metrics.peak_string_payload_bytes),
                     peak_args: machine.map_or(0, |m| m.peak_argument_bytes),
+                    peak_errors: machine.map_or(0, |m| m.metrics.peak_error_leaf_capacity),
+                    peak_error_bytes: machine.map_or(0, |m| m.metrics.peak_error_leaf_bytes),
                     outgoing,
                 }))
                 .unwrap();
@@ -1041,8 +1116,6 @@ fn actual_async_native_box_abandonment_releases_real_task_and_restores_claimant_
 #[test]
 fn async_string_result_whole_tree_rejections_preserve_original_legacy_inputs_and_cache_roles() {
     for source in [
-        "async fn Child(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { return await Child(text) }",
-        "async fn Entry(text: str): str! { return await Entry(text) }",
         // The root is already cached as async: its first child call must
         // reject a synchronous dependency role before the later await node.
         "async fn Entry(text: str): str! { child = Entry(text)\nreturn await child }",
