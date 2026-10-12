@@ -447,15 +447,48 @@ impl Interpreter {
         result: KuResult<Flow>,
         span: Span,
     ) -> KuResult<Flow> {
-        self.observe_termination(&result);
-        let (handles, collected) = call_owned_tasks(None, &leases, &values, span);
-        self.finish_owned_resources(env, result, span, handles, collected, |_| {
-            // Restoring leases only restore the caller. No caller Env is dropped.
-            drop(values);
-            drop(leases);
-        })
+        self.finish_call_arguments_feedback(env, leases, values, result, span, None)
     }
 
+    pub(super) fn finish_call_arguments_with_feedback(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.finish_call_arguments_feedback(env, leases, values, result, span, Some(feedback))
+    }
+
+    fn finish_call_arguments_feedback(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+        feedback: Option<&Cell<Option<RuntimeTermination>>>,
+    ) -> KuResult<Flow> {
+        self.observe_termination(&result);
+        let (handles, collected) = call_owned_tasks(None, &leases, &values, span);
+        self.finish_owned_resources_feedback(
+            env,
+            result,
+            span,
+            (handles, collected),
+            |_| {
+                // Restore borrowed places after destroying staged values;
+                // the caller Env remains live across the whole argument exit.
+                drop(values);
+                drop(leases);
+            },
+            feedback,
+        )
+    }
+
+    #[cfg(test)]
     fn finish_owned_resources<T: ScopeExit>(
         &mut self,
         env: &mut Env,

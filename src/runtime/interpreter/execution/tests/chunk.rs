@@ -1,5 +1,6 @@
 use super::*;
 
+mod arguments_exit;
 mod async_local;
 mod await_entry;
 mod await_fuel;
@@ -24,6 +25,7 @@ struct TraceHooks {
     timeout_at: Option<Span>,
     assert_cancelled_at: Option<Span>,
     observed_queued_cancel: bool,
+    pending_arguments: Option<(Span, usize, usize)>,
 }
 
 impl TraceHooks {
@@ -35,6 +37,7 @@ impl TraceHooks {
             timeout_at: None,
             assert_cancelled_at: None,
             observed_queued_cancel: false,
+            pending_arguments: None,
         }
     }
 }
@@ -130,6 +133,43 @@ impl ExecutionHooks for TraceHooks {
         self.events
             .push(Event::Arguments(span, leases.len(), values.len()));
         ExecutionHooks::finish_arguments(&mut self.host, env, leases, values, result, span)
+    }
+
+    fn prepare_arguments_exit(
+        &mut self,
+        _env: &mut Env,
+        leases: &[BorrowLease],
+        values: &mut [Value],
+        span: Span,
+    ) -> KuResult<()> {
+        assert!(self.pending_arguments.is_none());
+        self.pending_arguments = Some((span, leases.len(), values.len()));
+        Ok(())
+    }
+
+    fn finish_arguments_with_feedback(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        let observed = self.pending_arguments.take().expect("prepared arguments");
+        assert_eq!(observed.0, span);
+        self.events
+            .push(Event::Arguments(span, leases.len(), values.len()));
+        self.host
+            .finish_call_arguments_with_feedback(env, leases, values, result, span, feedback)
+    }
+
+    fn finish_arguments_value(&mut self, result: KuResult<Flow>, span: Span) -> KuResult<Flow> {
+        let (observed_span, leases, values) =
+            self.pending_arguments.take().expect("prepared arguments");
+        assert_eq!(observed_span, span);
+        self.events.push(Event::Arguments(span, leases, values));
+        result
     }
 
     fn prepare_finally(

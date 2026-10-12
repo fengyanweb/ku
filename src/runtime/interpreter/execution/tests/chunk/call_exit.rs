@@ -225,6 +225,33 @@ impl ExecutionHooks for CallHooks {
         self.trace
             .finish_arguments(env, leases, values, result, span)
     }
+    fn prepare_arguments_exit(
+        &mut self,
+        env: &mut Env,
+        leases: &[BorrowLease],
+        values: &mut [Value],
+        span: Span,
+    ) -> KuResult<()> {
+        self.trace.prepare_arguments_exit(env, leases, values, span)
+    }
+
+    fn finish_arguments_with_feedback(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.trace
+            .finish_arguments_with_feedback(env, leases, values, result, span, feedback)
+    }
+
+    fn finish_arguments_value(&mut self, result: KuResult<Flow>, span: Span) -> KuResult<Flow> {
+        self.trace.finish_arguments_value(result, span)
+    }
+
     fn prepare_finally(
         &mut self,
         env: &Env,

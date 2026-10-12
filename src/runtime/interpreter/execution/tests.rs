@@ -52,6 +52,10 @@ fn assert_drained(metrics: &Metrics, initial_depth: usize) {
         metrics.entered_call_exits, metrics.retired_call_exits,
         "{metrics:?}"
     );
+    assert_eq!(
+        metrics.entered_arguments_exits, metrics.retired_arguments_exits,
+        "{metrics:?}"
+    );
     assert_eq!(metrics.logical_depth, initial_depth, "{metrics:?}");
     assert!(
         metrics.retained_backing_bytes <= metrics.peak_backing_bytes_upper_bound,
@@ -831,6 +835,19 @@ impl ExecutionHooks for FinallyProbe<'_> {
         span: Span,
     ) -> KuResult<Flow> {
         ExecutionHooks::finish_arguments(self.host, env, leases, values, result, span)
+    }
+
+    fn finish_arguments_with_feedback(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.host
+            .finish_call_arguments_with_feedback(env, leases, values, result, span, feedback)
     }
 
     fn prepare_finally(

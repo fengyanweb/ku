@@ -89,6 +89,8 @@ struct Metrics {
     retired_scope_exits: usize,
     entered_call_exits: usize,
     retired_call_exits: usize,
+    entered_arguments_exits: usize,
+    retired_arguments_exits: usize,
     logical_depth: usize,
     // Source execution frame Vec backing only: calls/work/finally/values and
     // staged arguments. This is a frame budget, not a complete memory budget;
@@ -128,6 +130,16 @@ trait ExecutionHooks {
     }
 
     fn prepare_call_exit(&mut self, _env: &mut Env, _span: Span, _kind: CallKind) -> KuResult<()> {
+        Ok(())
+    }
+
+    fn prepare_arguments_exit(
+        &mut self,
+        _env: &mut Env,
+        _leases: &[BorrowLease],
+        _values: &mut [Value],
+        _span: Span,
+    ) -> KuResult<()> {
         Ok(())
     }
 
@@ -184,6 +196,20 @@ trait ExecutionHooks {
         result: KuResult<Flow>,
         span: Span,
     ) -> KuResult<Flow>;
+    fn finish_arguments_with_feedback(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+        _feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.finish_arguments(env, leases, values, result, span)
+    }
+    fn finish_arguments_value(&mut self, result: KuResult<Flow>, _span: Span) -> KuResult<Flow> {
+        result
+    }
     fn prepare_finally(
         &mut self,
         env: &Env,
@@ -265,6 +291,18 @@ impl ExecutionHooks for Interpreter {
         self.finish_call_arguments(env, leases, values, result, span)
     }
 
+    fn finish_arguments_with_feedback(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        self.finish_call_arguments_with_feedback(env, leases, values, result, span, feedback)
+    }
+
     fn prepare_finally(
         &mut self,
         env: &Env,
@@ -331,6 +369,40 @@ impl<P: FnMut(Span) -> KuResult<()>> ExecutionHooks for PollHooks<P> {
         span: Span,
     ) -> KuResult<Flow> {
         ExecutionHooks::finish_arguments(&mut self.host, env, leases, values, result, span)
+    }
+
+    fn prepare_arguments_exit(
+        &mut self,
+        env: &mut Env,
+        leases: &[BorrowLease],
+        values: &mut [Value],
+        span: Span,
+    ) -> KuResult<()> {
+        ExecutionHooks::prepare_arguments_exit(&mut self.host, env, leases, values, span)
+    }
+
+    fn finish_arguments_with_feedback(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_arguments_with_feedback(
+            &mut self.host,
+            env,
+            leases,
+            values,
+            result,
+            span,
+            feedback,
+        )
+    }
+
+    fn finish_arguments_value(&mut self, result: KuResult<Flow>, span: Span) -> KuResult<Flow> {
+        ExecutionHooks::finish_arguments_value(&mut self.host, result, span)
     }
 
     fn prepare_finally(
@@ -560,10 +632,15 @@ struct PendingScopeExit {
     completion: ExitCompletion,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExitCompletion {
     Scope,
     Call(CallKind),
+    Arguments {
+        frame: ArgumentFrame,
+        // Taking the Vec during Teardown must not lose its charge if an
+        // actual value destructor panics before the phase retires it.
+        staged_capacity: usize,
+    },
 }
 
 struct AwaitFrame {
@@ -581,6 +658,22 @@ fn merge_release_context(
             Some(first)
         }
         (first, other) => first.or(other),
+    }
+}
+
+fn outgoing_needs_cleanup(result: &KuResult<Flow>) -> bool {
+    let mut value = match result {
+        Ok(Flow::Return { value, .. } | Flow::Fail { value, .. }) => value,
+        _ => return false,
+    };
+    loop {
+        match value {
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => return false,
+            Value::Result { value: inner, .. } => value = inner,
+            // The admitted async outcome is a plain Task. Other Owned values
+            // retain real cleanup if a private hook exposes a legacy outcome.
+            _ => return true,
+        }
     }
 }
 
@@ -1021,6 +1114,57 @@ impl Machine {
         Ok(Some(handles))
     }
 
+    fn argument_handles(
+        &mut self,
+        arguments: &ArgumentFrame,
+        span: Span,
+    ) -> KuResult<Option<Vec<crate::runtime::task::TaskHandle>>> {
+        // Borrowed/general calls retain their original whole adapter. Even an
+        // empty retained lease allocation is outside this selected slice.
+        if arguments.leases.capacity() != 0 {
+            return Ok(None);
+        }
+        let mut count = 0usize;
+        for value in &arguments.staged {
+            match value {
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => {}
+                Value::Task(_) => {
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?
+                }
+                _ => return Ok(None),
+            }
+        }
+        self.reserve_exits(1, span)?;
+        self.check_exit_handle_capacity(count, span)?;
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(count)
+            .map_err(|_| storage_error(ReserveError::AllocationFailed, span))?;
+        let capacity = handles.capacity();
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<crate::runtime::task::TaskHandle>())
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let peak = self
+            .exit_handle_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        self.peak_exit_handle_bytes = self.peak_exit_handle_bytes.max(peak);
+        self.check_exit_handle_capacity(capacity, span)?;
+        self.exit_handle_capacity += capacity;
+        self.exit_handle_bytes += bytes;
+        for value in &arguments.staged {
+            if let Value::Task(task) = value {
+                assert!(handles.len() < capacity);
+                handles.push(task.clone());
+            }
+        }
+        handles.sort_unstable_by_key(crate::runtime::task::TaskHandle::id);
+        handles.dedup_by_key(|handle| handle.id());
+        Ok(Some(handles))
+    }
+
     fn begin_scope_exit(
         &mut self,
         span: SpanId,
@@ -1306,6 +1450,196 @@ impl Machine {
         }
     }
 
+    fn begin_arguments_exit(
+        &mut self,
+        mut arguments: ArgumentFrame,
+        hooks: &mut impl ExecutionHooks,
+    ) {
+        let source_span = self.code.span(arguments.span);
+        let admitted = hooks
+            .prepare_arguments_exit(
+                &mut self.frame().env,
+                &arguments.leases,
+                &mut arguments.staged,
+                source_span,
+            )
+            .and_then(|()| self.argument_handles(&arguments, source_span));
+        // Admission and real proxy collection precede moving this sole
+        // outcome. An async Return(Task) is never one of the exit handles.
+        let result = self.pending.take().expect("argument or callee outcome");
+        match admitted {
+            Ok(Some(handles)) => {
+                assert!(self.awaiting.is_none() && self.exits.len() == 0);
+                self.discard_values_after(arguments.value_base);
+                let handle_capacity = handles.capacity();
+                let staged_capacity = arguments.staged.capacity();
+                let span = arguments.span;
+                let state = cancellation::ExitState::new(
+                    hooks.host(),
+                    result,
+                    source_span,
+                    handles,
+                    Ok(()),
+                );
+                let owner_call = self.calls.len();
+                push(
+                    &mut self.exits,
+                    PendingScopeExit {
+                        owner_call,
+                        state,
+                        first_index: None,
+                        handle_capacity,
+                        span,
+                        completion: ExitCompletion::Arguments {
+                            frame: arguments,
+                            staged_capacity,
+                        },
+                    },
+                );
+                self.metrics.entered_exit_frames += 1;
+                self.metrics.entered_arguments_exits += 1;
+                self.metrics.peak_exit_frames = self.metrics.peak_exit_frames.max(self.exits.len());
+            }
+            Err(mut error) => {
+                let needs_context = outgoing_needs_cleanup(&result)
+                    || !arguments.leases.is_empty()
+                    || arguments.staged.iter().any(|value| {
+                        !matches!(
+                            value,
+                            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null,
+                        )
+                    });
+                let host = hooks.host();
+                host.observe_termination(&result);
+                let carried = match &result {
+                    Ok(flow) => cancellation::ScopeExit::cleanup_context(flow),
+                    Err(primary) => primary.scope_cleanup(),
+                };
+                let mut context = host
+                    .scope_cleanup_context(carried)
+                    .or(self.fallback_metadata);
+                if context.is_none() && needs_context {
+                    context = Some(CancellationContext::new(TerminationReason::Cancelled));
+                }
+                self.fallback_metadata = context;
+                self.fallback_release.set(merge_release_context(
+                    merge_release_context(current_cleanup_context(), context),
+                    self.fallback_release.get(),
+                ));
+                let result = {
+                    let _window = cancellation::PhaseWindow::enter(&self.fallback_release);
+                    while self.resources.as_ref().expect("live prefix").values.len()
+                        > arguments.value_base
+                    {
+                        self.resources.as_mut().expect("live prefix").values.pop();
+                    }
+                    let capacity = arguments.staged.capacity();
+                    let owner_call = self.resources.as_ref().expect("live prefix").calls.len() - 1;
+                    let env = &mut self
+                        .resources
+                        .as_mut()
+                        .expect("live prefix")
+                        .calls
+                        .get_mut(owner_call)
+                        .expect("real arguments caller")
+                        .env;
+                    let result = hooks.finish_arguments_with_feedback(
+                        env,
+                        arguments.leases,
+                        arguments.staged,
+                        result,
+                        source_span,
+                        &self.fallback_release,
+                    );
+                    hooks
+                        .host()
+                        .caller_owners
+                        .truncate(arguments.previous_observers);
+                    for release in [self.fallback_release.get(), current_cleanup_context()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(context) = &mut context {
+                            context.cleanup_deadline =
+                                context.cleanup_deadline.min(release.cleanup_deadline);
+                        }
+                    }
+                    let result = if matches!(&result, Err(primary) if primary.runtime_termination().is_some())
+                    {
+                        result
+                    } else {
+                        if let Some(context) = context {
+                            error.remember_scope_cleanup(context);
+                            hooks.host().discard_flow(result, context, source_span);
+                        } else {
+                            drop(result);
+                        }
+                        for release in [self.fallback_release.get(), current_cleanup_context()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Some(context) = &mut context {
+                                context.cleanup_deadline =
+                                    context.cleanup_deadline.min(release.cleanup_deadline);
+                            }
+                        }
+                        if let Some(context) = context {
+                            error.remember_scope_cleanup(context);
+                        }
+                        Err(error)
+                    };
+                    // The actual staged Vec was consumed by the adapter, not
+                    // transferred to a replacement or a fresh callee run.
+                    self.argument_capacity -= capacity;
+                    self.argument_bytes -= capacity * std::mem::size_of::<Value>();
+                    result
+                };
+                self.fallback_metadata = context;
+                self.emit_arguments_result(result, source_span);
+            }
+            Ok(None) => {
+                self.discard_values_after(arguments.value_base);
+                let capacity = arguments.staged.capacity();
+                let owner_call = self.resources.as_ref().expect("live prefix").calls.len() - 1;
+                let env = &mut self
+                    .resources
+                    .as_mut()
+                    .expect("live prefix")
+                    .calls
+                    .get_mut(owner_call)
+                    .expect("real legacy arguments caller")
+                    .env;
+                let result = hooks.finish_arguments_with_feedback(
+                    env,
+                    arguments.leases,
+                    arguments.staged,
+                    result,
+                    source_span,
+                    &self.fallback_release,
+                );
+                hooks
+                    .host()
+                    .caller_owners
+                    .truncate(arguments.previous_observers);
+                self.release_argument_capacity(capacity);
+                self.emit_arguments_result(result, source_span);
+            }
+        }
+    }
+
+    fn emit_arguments_result(&mut self, result: KuResult<Flow>, span: Span) {
+        match result {
+            // Only the callee's Fail was normalized by CallExit. A failure
+            // during argument evaluation still unwinds in its original form.
+            Ok(flow @ Flow::Fail { .. }) => self.pending = Some(Ok(flow)),
+            Ok(flow) => match flow.into_call_value(span, "function") {
+                Ok(value) => push(&mut self.values, value),
+                Err(error) => self.pending = Some(Err(error)),
+            },
+            Err(error) => self.pending = Some(Err(error)),
+        }
+    }
+
     fn drive_scope_exit(&mut self, hooks: &mut impl ExecutionHooks) {
         assert!(self.awaiting.is_none() && self.exits.len() == 1);
         let exit = self.exits.get_mut(0).expect("one active scope exit");
@@ -1343,7 +1677,7 @@ impl Machine {
                 let capacity = std::mem::take(&mut exit.handle_capacity);
                 self.release_exit_handle_capacity(capacity);
             }
-            cancellation::ExitPhase::Teardown => match exit.completion {
+            cancellation::ExitPhase::Teardown => match &mut exit.completion {
                 ExitCompletion::Scope => exit.state.teardown(host, env, Env::pop_scope),
                 ExitCompletion::Call(_) => {
                     // Env and leases are still the original CallFrame fields.
@@ -1358,6 +1692,22 @@ impl Machine {
                             .calls
                             .get_mut(exit.owner_call - 1)
                             .expect("retained call frame");
+                        drop(std::mem::take(&mut frame.leases));
+                    }
+                    exit.state.finish_teardown(host);
+                }
+                ExitCompletion::Arguments {
+                    frame,
+                    staged_capacity,
+                } => {
+                    {
+                        let _window = exit.state.phase_window();
+                        // Parameter cleanup restores only the caller's leases.
+                        // The real caller Env and observer remain alive.
+                        drop(std::mem::take(&mut frame.staged));
+                        let capacity = std::mem::take(staged_capacity);
+                        self.argument_capacity -= capacity;
+                        self.argument_bytes -= capacity * std::mem::size_of::<Value>();
                         drop(std::mem::take(&mut frame.leases));
                     }
                     exit.state.finish_teardown(host);
@@ -1386,15 +1736,26 @@ impl Machine {
                         Err(error) => error.scope_cleanup(),
                     };
                     let mut context = host.scope_cleanup_context(carried);
+                    if context.is_none() && outgoing_needs_cleanup(&result) {
+                        context = Some(CancellationContext::new(TerminationReason::Cancelled));
+                    }
                     if let (Some(context), Err(error)) = (context, &mut forced) {
                         error.remember_scope_cleanup(context);
                     }
                     if let Some(context) = context {
+                        self.fallback_release.set(merge_release_context(
+                            merge_release_context(current_cleanup_context(), Some(context)),
+                            self.fallback_release.get(),
+                        ));
+                        let _window = cancellation::PhaseWindow::enter(&self.fallback_release);
                         host.discard_flow(result, context, source_span);
                     } else {
                         drop(result);
                     }
-                    if let Some(release) = current_cleanup_context() {
+                    for release in [self.fallback_release.get(), current_cleanup_context()]
+                        .into_iter()
+                        .flatten()
+                    {
                         if let Some(context) = &mut context {
                             context.cleanup_deadline =
                                 context.cleanup_deadline.min(release.cleanup_deadline);
@@ -1428,6 +1789,23 @@ impl Machine {
                         self.metrics.retired_calls += 1;
                         self.metrics.retired_call_exits += 1;
                         self.pending = Some(result);
+                    }
+                    ExitCompletion::Arguments {
+                        frame,
+                        staged_capacity,
+                    } => {
+                        assert_eq!(staged_capacity, 0);
+                        assert!(frame.staged.is_empty() && frame.leases.is_empty());
+                        // This stack owner also covers a native completion
+                        // callback panic after the header has been settled.
+                        let result = hooks.finish_arguments_value(result, source_span);
+                        hooks
+                            .host()
+                            .caller_owners
+                            .truncate(frame.previous_observers);
+                        drop(frame);
+                        self.metrics.retired_arguments_exits += 1;
+                        self.emit_arguments_result(result, source_span);
                     }
                 }
                 self.metrics.retired_exit_frames += 1;
@@ -2087,6 +2465,10 @@ impl Machine {
             } => {
                 let source_span = self.code.span(span);
                 self.reserve_work(2, source_span)?;
+                // Reserve the real Arguments exit header before allocating
+                // its staged backing, registering observation or evaluating
+                // any parameter expression. Failure never restarts effects.
+                self.reserve_exits(1, source_span)?;
                 let staged = self.argument_storage(args.len, source_span)?;
                 let previous_observers = match self.register_call_observer(hooks, source_span) {
                     Ok(previous) => previous,
@@ -2337,39 +2719,7 @@ impl Machine {
                 self.begin_call_exit(hooks);
             }
             Work::ArgumentsExit(arguments) => {
-                let result = self.pending.take().expect("argument or callee outcome");
-                self.discard_values_after(arguments.value_base);
-                let capacity = arguments.staged.capacity();
-                let span = self.code.span(arguments.span);
-                let result = hooks.finish_arguments(
-                    &mut self.frame().env,
-                    arguments.leases,
-                    arguments.staged,
-                    result,
-                    span,
-                );
-                // Observation must span the callee's actual scope/finally and
-                // the full argument epilogue, as in the original eval(Call).
-                hooks
-                    .host()
-                    .caller_owners
-                    .truncate(arguments.previous_observers);
-                self.release_argument_capacity(capacity);
-                match result {
-                    // A callee's Fail has already been normalized at CallExit.
-                    // Keep any argument Fail in its original Flow form instead
-                    // of treating it as a callee Result value during unwinding.
-                    Ok(flow @ Flow::Fail { .. }) => self.pending = Some(Ok(flow)),
-                    Ok(flow) => match flow.into_call_value(span, "function") {
-                        Ok(value) => {
-                            // Callee admission reserved its return slot before
-                            // parameter/body effects. No allocation on unwind.
-                            push(&mut self.values, value);
-                        }
-                        Err(error) => self.pending = Some(Err(error)),
-                    },
-                    Err(error) => self.pending = Some(Err(error)),
-                }
+                self.begin_arguments_exit(arguments, hooks);
             }
             _ => unreachable!("only exit markers use resource arbitration"),
         }
@@ -3420,11 +3770,41 @@ impl Drop for Machine {
         // A destructor's tighter D therefore reaches the following real Env
         // prefix even when the header phase itself panicked or was abandoned.
         while let Some(mut exit) = self.exits.pop() {
+            if let ExitCompletion::Arguments {
+                frame,
+                staged_capacity,
+            } = &mut exit.completion
+            {
+                // The original adapter declares its owning teardown after
+                // FeedbackExitState, so native unwind drops the remaining
+                // values/leases before the handles and sole primary. Only the
+                // owner moved into this exit uses that adapter order; old Work
+                // markers retain their original Rust field Drop order.
+                {
+                    let _window = exit.state.phase_window();
+                    let values = std::mem::take(&mut frame.staged);
+                    let dropped =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(values)));
+                    if let Err(panic) = dropped {
+                        retain_first_panic(&mut first, panic);
+                    }
+                    let leases = std::mem::take(&mut frame.leases);
+                    let dropped =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(leases)));
+                    if let Err(panic) = dropped {
+                        retain_first_panic(&mut first, panic);
+                    }
+                }
+                let capacity = std::mem::take(staged_capacity);
+                self.release_argument_capacity(capacity);
+                release = merge_release_context(release, exit.state.release_context());
+                self.finally.tighten(exit.state.release_context());
+            }
             if let Some(panic) = exit.state.abort_release() {
                 retain_first_panic(&mut first, panic);
             }
             release = merge_release_context(release, exit.state.release_context());
-            if matches!(exit.completion, ExitCompletion::Call(_)) {
+            if matches!(&exit.completion, ExitCompletion::Call(_)) {
                 // The old synchronous call adapter owned this callee Env on
                 // its Rust stack, so unwind released it before parent frames.
                 // Preserve that order despite retaining it in calls while the
