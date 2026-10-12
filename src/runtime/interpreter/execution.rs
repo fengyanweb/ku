@@ -108,7 +108,7 @@ struct Metrics {
     logical_depth: usize,
     // Source execution frame Vec backing only: calls/work/finally/values and
     // staged arguments, selected input String buffers and admitted
-    // Result<String> Box<Value> payloads. Other Value/Error payloads remain
+    // selected Result leaf Box<Value> payloads. Other Value/Error payloads remain
     // outside this budget, as do syntax storage, source, Env/string keys and
     // allocator overhead. Summed peaks are not a
     // simultaneous RSS sample.
@@ -546,6 +546,7 @@ enum Work {
     Discard,
     Return,
     WrapTerminalOk(SpanId, bool),
+    WrapBorrowedTerminalOk(SpanId),
     AwaitOperand(SpanId),
     AwaitResume,
     Propagate(SpanId),
@@ -648,7 +649,7 @@ struct Machine {
     // moves between slots and is conservatively charged until final transfer.
     string_payload_bytes: usize,
     peak_string_payload_bytes: usize,
-    // Each direct ok(String) owns one actual Box<Value>. Saved finally
+    // Each selected direct ok owns one actual Box<Value>. Saved finally
     // primaries and replacements can coexist; relay moves create no box.
     result_wrapper_capacity: usize,
     result_wrapper_bytes: usize,
@@ -766,6 +767,17 @@ fn scalar(value: &Value, span: Span) -> KuResult<Value> {
         Value::Null => Ok(Value::Null),
         _ => Err(unsupported(span)),
     }
+}
+
+// Consume an already allocated Result wrapper. Its Box allocation is freed
+// before this call returns, so the caller can retire that backing charge before
+// reserving another operand slot. Passing the payload alone loses this boundary.
+#[allow(clippy::boxed_local)]
+fn into_result_payload(value: Box<Value>) -> Value {
+    // This is the existing wrapper allocation, passed by sole ownership.
+    // Move out its payload; the parameter's Box drop scope ends before this
+    // helper returns, freeing the backing before a caller's next admission.
+    *value
 }
 
 fn owned_parameter_value(param: code::CodeParam, value: &mut Value, span: Span) -> KuResult<Value> {
@@ -1005,6 +1017,42 @@ impl Machine {
     fn emit(&mut self, value: Value, span: Span) -> KuResult<()> {
         self.reserve_values(1, span)?;
         push(&mut self.values, value);
+        Ok(())
+    }
+
+    fn emit_budgeted_ok(&mut self, value: Value, span: Span) -> KuResult<()> {
+        // Callers have evaluated and moved the actual operand. Existing
+        // wrapper owners (including Q's saved finally primaries) retain their
+        // charge while this one physical Box is admitted and constructed.
+        let previous_count = self.result_wrapper_capacity;
+        let previous_bytes = self.result_wrapper_bytes;
+        let count = previous_count
+            .checked_add(1)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let bytes = previous_bytes
+            .checked_add(std::mem::size_of::<Value>())
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        self.result_wrapper_capacity = count;
+        self.result_wrapper_bytes = bytes;
+        // Existing Vec backing remains retained after popping
+        // the operand. Check its full capacity together with the
+        // new Box before reserving the outgoing element.
+        if let Err(error) = self
+            .check_argument_capacity(0, span)
+            .and_then(|_| self.reserve_values(1, span))
+        {
+            // Only the unallocated candidate is rolled back.
+            // Existing saved primaries retain their real charge.
+            self.result_wrapper_capacity = previous_count;
+            self.result_wrapper_bytes = previous_bytes;
+            return Err(error);
+        }
+        // Standard Box allocation keeps the original global OOM
+        // behavior; this backing budget is not OOM recovery.
+        let value = Box::new(value);
+        self.peak_result_wrapper_capacity = self.peak_result_wrapper_capacity.max(count);
+        self.peak_result_wrapper_bytes = self.peak_result_wrapper_bytes.max(bytes);
+        push(&mut self.values, Value::Result { ok: true, value });
         Ok(())
     }
 
@@ -2718,6 +2766,11 @@ impl Machine {
                         );
                         push(&mut self.work, Work::Eval(operand));
                     }
+                    ExprCode::TerminalBorrowedOk(operand) => {
+                        self.reserve_work(2, span)?;
+                        push(&mut self.work, Work::WrapBorrowedTerminalOk(expr.span));
+                        push(&mut self.work, Work::Eval(operand));
+                    }
                     ExprCode::Binary(left, op, right) => {
                         self.reserve_work(2, span)?;
                         push(&mut self.work, Work::BinaryLeft(op, right, expr.span));
@@ -2898,39 +2951,7 @@ impl Machine {
                     if !matches!(value, Value::String(_)) {
                         return Err(unsupported(span));
                     }
-                    // The operand already followed its original evaluation
-                    // and move order. A saved finally primary can still own
-                    // its Box while this replacement is being constructed.
-                    let previous_count = self.result_wrapper_capacity;
-                    let previous_bytes = self.result_wrapper_bytes;
-                    let count = previous_count
-                        .checked_add(1)
-                        .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
-                    let bytes = previous_bytes
-                        .checked_add(std::mem::size_of::<Value>())
-                        .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
-                    self.result_wrapper_capacity = count;
-                    self.result_wrapper_bytes = bytes;
-                    // Existing Vec backing remains retained after popping
-                    // the operand. Check its full capacity together with the
-                    // new Box before reserving the outgoing element.
-                    if let Err(error) = self
-                        .check_argument_capacity(0, span)
-                        .and_then(|_| self.reserve_values(1, span))
-                    {
-                        // Only the unallocated candidate is rolled back.
-                        // Existing saved primaries retain their real charge.
-                        self.result_wrapper_capacity = previous_count;
-                        self.result_wrapper_bytes = previous_bytes;
-                        return Err(error);
-                    }
-                    // Standard Box allocation keeps the original global OOM
-                    // behavior; this backing budget is not OOM recovery.
-                    let value = Box::new(value);
-                    self.peak_result_wrapper_capacity =
-                        self.peak_result_wrapper_capacity.max(count);
-                    self.peak_result_wrapper_bytes = self.peak_result_wrapper_bytes.max(bytes);
-                    push(&mut self.values, Value::Result { ok: true, value });
+                    self.emit_budgeted_ok(value, span)?;
                 } else {
                     // Original scalar Result roots retain their old operand
                     // and payload accounting contract.
@@ -2943,6 +2964,12 @@ impl Machine {
                         span,
                     )?;
                 }
+            }
+            Work::WrapBorrowedTerminalOk(span_id) => {
+                let span = self.code.span(span_id);
+                let value = self.value();
+                scalar(&value, span)?;
+                self.emit_budgeted_ok(value, span)?;
             }
             Work::AwaitOperand(span) => {
                 let source_span = self.code.span(span);
@@ -2993,9 +3020,27 @@ impl Machine {
                             source_span,
                         ));
                     }
-                    Value::Result { ok: true, value } => self.emit(*value, source_span)?,
+                    Value::Result { ok: true, value } => {
+                        if self.result_wrapper_capacity != 0 {
+                            // The consuming helper frees the actual Box
+                            // before the next operand-slot budget check.
+                            let value = into_result_payload(value);
+                            self.synchronize_result_wrapper_charge();
+                            self.emit(value, source_span)?;
+                        } else {
+                            // Original uncharged scalar/async Result paths
+                            // retain their existing move and timing contract.
+                            self.emit(*value, source_span)?;
+                        }
+                    }
                     Value::Result { ok: false, value } => {
-                        self.pending = Some(Ok(Flow::fail(*value)));
+                        if self.result_wrapper_capacity != 0 {
+                            let value = into_result_payload(value);
+                            self.synchronize_result_wrapper_charge();
+                            self.pending = Some(Ok(Flow::fail(value)));
+                        } else {
+                            self.pending = Some(Ok(Flow::fail(*value)));
+                        }
                     }
                     other => {
                         return Err(KuError::runtime(
@@ -3859,8 +3904,13 @@ impl Machine {
         // an operand, outgoing primary or saved FinallyFrame primary. Native
         // unwind has already dropped operation-local primaries/replacements
         // before the same scan runs in the outer catch. These reads neither
-        // allocate nor clone an owned String or Box.
-        let value_has_wrapper = |value: &Value| matches!(value, Value::Result { value, .. } if matches!(value.as_ref(), Value::String(_)));
+        // allocate nor clone an owned String or Box. Both selected function
+        // graphs forbid uncharged scalar Result dependencies before cache
+        // reuse, so primitive leaves here cannot mix with legacy wrappers.
+        let value_has_wrapper = |value: &Value| {
+            matches!(value, Value::Result { value, .. }
+            if matches!(value.as_ref(), Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null))
+        };
         let flow_has_wrapper = |result: &KuResult<Flow>| {
             matches!(result, Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })
                 if value_has_wrapper(value))
@@ -4790,7 +4840,8 @@ impl Drop for Machine {
         }
         if self.result_wrapper_capacity != 0
             && matches!(self.pending.as_ref(), Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. }))
-                if matches!(value, Value::Result { value, .. } if matches!(value.as_ref(), Value::String(_))))
+                if matches!(value, Value::Result { value, .. }
+                    if matches!(value.as_ref(), Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null)))
         {
             let pending = self.pending.take();
             let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(pending)));

@@ -1,5 +1,6 @@
 use super::*;
 
+mod borrowed_result;
 mod borrowed_string;
 mod chunk;
 mod code_handle;
