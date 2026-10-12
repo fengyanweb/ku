@@ -215,6 +215,34 @@ impl Drop for BlockingRetirement {
     }
 }
 
+/// Persist a real cancelled blocking cleanup's smaller deadline before its
+/// TLS guard restores the worker and before the job's retirement publication.
+/// This window is never installed around an uncancelled callback body.
+struct BlockingCleanupWindow<'a> {
+    parent: Option<&'a TaskState>,
+    guard: Option<CleanupGuard>,
+}
+
+impl<'a> BlockingCleanupWindow<'a> {
+    fn enter(parent: Option<&'a TaskState>, context: Option<CancellationContext>) -> Self {
+        Self {
+            parent,
+            guard: context.map(CleanupGuard::enter),
+        }
+    }
+}
+
+impl Drop for BlockingCleanupWindow<'_> {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            if let Some(parent) = self.parent {
+                parent.remember_cleanup_deadline();
+            }
+        }
+        drop(self.guard.take());
+    }
+}
+
 struct RunningBlockingJob<'a> {
     inner: &'a TaskRuntimeInner,
 }
@@ -2387,7 +2415,10 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                     .as_ref()
                     .and_then(|state| state.cancellation());
                 let result = if let Some(context) = cancelled {
-                    let _cleanup = CleanupGuard::enter(context);
+                    let _cleanup = BlockingCleanupWindow::enter(
+                        job.retirement.state.as_deref(),
+                        Some(context),
+                    );
                     drop(job.run);
                     Err(KuError::termination(context, Span::default()))
                 } else {
@@ -2410,7 +2441,10 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                     .as_ref()
                     .and_then(|state| state.cancellation())
                 {
-                    let _cleanup = CleanupGuard::enter(context);
+                    let _cleanup = BlockingCleanupWindow::enter(
+                        job.retirement.state.as_deref(),
+                        Some(context),
+                    );
                     drop_owner_result_synchronously(result);
                     Err(KuError::termination(context, Span::default()))
                 } else {
@@ -2432,9 +2466,8 @@ fn send_blocking_result(
         // The parent can terminate after the worker's post-operation check and
         // drop its receiver before send. Re-read here so nested Task owners in
         // the undeliverable payload keep that first cause and absolute deadline.
-        let _cleanup = parent
-            .and_then(TaskState::cancellation)
-            .map(CleanupGuard::enter);
+        let _cleanup =
+            BlockingCleanupWindow::enter(parent, parent.and_then(TaskState::cancellation));
         drop_owner_result_synchronously(unsent.0);
     }
 }
