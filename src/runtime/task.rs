@@ -73,6 +73,9 @@ const SUBMISSION_PRODUCER_RETIRED: u8 = 2;
 thread_local! {
     static CURRENT_TASK_ID: Cell<i64> = const { Cell::new(0) };
     static CURRENT_TASK_STATE: RefCell<Option<Weak<TaskState>>> = const { RefCell::new(None) };
+    // This observes owner cleanup in a delegated blocking callback only; it
+    // never supplies public Task identity or marks an uncancelled body cleanup.
+    static BLOCKING_OWNER_PARENT: RefCell<Option<Weak<TaskState>>> = const { RefCell::new(None) };
     static AWAIT_HELP_DEPTH: Cell<usize> = const { Cell::new(0) };
     // Released results can own other completed Tasks. Their final lease drops
     // enqueue an existing state, instead of recursively destroying its result.
@@ -241,6 +244,40 @@ impl Drop for BlockingCleanupWindow<'_> {
         }
         drop(self.guard.take());
     }
+}
+
+struct BlockingOwnerParentGuard {
+    previous: Option<Weak<TaskState>>,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl BlockingOwnerParentGuard {
+    fn enter(parent: Option<&Arc<TaskState>>) -> Self {
+        Self {
+            previous: BLOCKING_OWNER_PARENT.with(|slot| {
+                std::mem::replace(&mut *slot.borrow_mut(), parent.map(Arc::downgrade))
+            }),
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for BlockingOwnerParentGuard {
+    fn drop(&mut self) {
+        BLOCKING_OWNER_PARENT.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+fn blocking_owner_cancellation() -> Option<(Arc<TaskState>, CancellationContext)> {
+    // Actual scheduler work keeps its own cancellation tree, including a
+    // currently uncancelled Task. Do not fall through from it to this observer.
+    if CURRENT_TASK_STATE.with(|slot| slot.borrow().is_some()) {
+        return None;
+    }
+    let parent =
+        BLOCKING_OWNER_PARENT.with(|slot| slot.borrow().as_ref().and_then(Weak::upgrade))?;
+    let context = parent.cancellation()?;
+    Some((parent, context))
 }
 
 struct RunningBlockingJob<'a> {
@@ -677,12 +714,26 @@ fn flush_owner_results() {
 impl Drop for TaskOwnerLease {
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
-            state.release_owner(
-                current_cleanup_context()
-                    .or_else(current_execution_termination)
-                    .or_else(current_task_cancellation)
-                    .unwrap_or_else(|| CancellationContext::new(TerminationReason::Cancelled)),
-            );
+            let blocking_parent = blocking_owner_cancellation();
+            let mut context = current_cleanup_context()
+                .or_else(current_execution_termination)
+                .or_else(current_task_cancellation)
+                .or_else(|| blocking_parent.as_ref().map(|(_, context)| *context))
+                .unwrap_or_else(|| CancellationContext::new(TerminationReason::Cancelled));
+            if let Some((_, parent_context)) = &blocking_parent {
+                // Earlier ambient metadata keeps its cause, but cannot give
+                // this child a later D than its already-cancelled real parent.
+                context.cleanup_deadline = context
+                    .cleanup_deadline
+                    .min(parent_context.cleanup_deadline);
+            }
+            // Only an already-cancelled real blocking parent creates this
+            // outer window. Nested owner cleanup can tighten it on return or
+            // native unwind, before the short-lived internal parent Arc drops.
+            let _blocking_cleanup = blocking_parent.as_ref().map(|(parent, _)| {
+                BlockingCleanupWindow::enter(Some(parent.as_ref()), Some(context))
+            });
+            state.release_owner(context);
         }
     }
 }
@@ -2330,6 +2381,9 @@ impl Drop for QueueRetirement<'_> {
 }
 
 fn execute_task_job(inner: &TaskRuntimeInner, job: TaskJob) {
+    // Cover helper admission rejection and completion as well as dispatch's
+    // Task window; those real cleanup phases can run with caller_state=None.
+    let _blocking_parent = BlockingOwnerParentGuard::enter(None);
     local_driver::execute(inner, job);
 }
 
@@ -2422,6 +2476,8 @@ fn blocking_worker_loop(weak: Weak<TaskRuntimeInner>, receiver: Arc<Mutex<Receiv
                     drop(job.run);
                     Err(KuError::termination(context, Span::default()))
                 } else {
+                    let _blocking_parent =
+                        BlockingOwnerParentGuard::enter(job.retirement.state.as_ref());
                     match catch_unwind(AssertUnwindSafe(job.run)).map_err(|_| {
                         KuError::structured(
                             crate::error::KuErrorKind::Runtime,

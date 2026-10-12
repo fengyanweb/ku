@@ -155,6 +155,11 @@ struct Observation {
     owner_done: bool,
     cleanup: Option<CancellationContext>,
     execution: Option<CancellationContext>,
+    thread: thread::ThreadId,
+    task_id: i64,
+    task_cancelled: bool,
+    task_cancellation: Option<CancellationContext>,
+    task_state_present: bool,
 }
 
 struct Probe {
@@ -186,11 +191,20 @@ impl Drop for Probe {
             owner_done: parent.owner_cleanup_done.load(Ordering::Acquire),
             cleanup: current_cleanup_context(),
             execution: current_execution_termination(),
+            thread: thread::current().id(),
+            task_id: current_task_id(),
+            task_cancelled: current_task_cancelled(),
+            task_cancellation: current_task_cancellation(),
+            task_state_present: has_current_task_state(),
         });
         if let Some(release) = self.release.take() {
-            release
-                .recv_timeout(WAIT)
-                .expect("release actual blocking capture Drop");
+            let released = release.recv_timeout(WAIT).is_ok();
+            // The fixture's Release guard runs if the receiving assertion
+            // fails. A lost diagnostic handshake must not manufacture a
+            // second native panic while the real callback body is unwinding.
+            if !released && !thread::panicking() {
+                panic!("release actual blocking capture Drop");
+            }
         }
         if let Some(shorter) = self.shorter {
             drop(CleanupGuard::enter(shorter));
@@ -218,6 +232,501 @@ fn error_code(value: &Value) -> Option<&str> {
         Some(Value::String(code)) => Some(code),
         _ => None,
     }
+}
+
+fn has_current_task_state() -> bool {
+    CURRENT_TASK_STATE.with(|slot| slot.borrow().is_some())
+}
+
+#[derive(Debug)]
+struct BodyObservation {
+    thread: thread::ThreadId,
+    task_id: i64,
+    task_cancelled: bool,
+    task_cancellation: Option<CancellationContext>,
+    cleanup: Option<CancellationContext>,
+    execution: Option<CancellationContext>,
+    task_state_present: bool,
+}
+
+impl BodyObservation {
+    fn current() -> Self {
+        Self {
+            thread: thread::current().id(),
+            task_id: current_task_id(),
+            task_cancelled: current_task_cancelled(),
+            task_cancellation: current_task_cancellation(),
+            cleanup: current_cleanup_context(),
+            execution: current_execution_termination(),
+            task_state_present: has_current_task_state(),
+        }
+    }
+
+    fn assert_ordinary_blocking_identity(&self) {
+        assert_eq!(self.task_id, 0);
+        assert!(!self.task_cancelled);
+        assert!(self.task_cancellation.is_none());
+        assert!(self.cleanup.is_none());
+        assert!(self.execution.is_none());
+        assert!(!self.task_state_present);
+    }
+}
+
+fn assert_blocking_probe_identity(observation: &Observation) {
+    assert_eq!(observation.task_id, 0);
+    assert!(!observation.task_cancelled);
+    assert!(observation.task_cancellation.is_none());
+    assert!(observation.execution.is_none());
+    assert!(!observation.task_state_present);
+}
+
+fn running_implicit_child_owner_case(
+    panic_in_body: bool,
+    panic_in_capture: bool,
+    ambient_owner_drop: bool,
+) {
+    assert!(!(panic_in_body && panic_in_capture));
+    assert!(!ambient_owner_drop || !(panic_in_body || panic_in_capture));
+    let _execution = ExecutionTerminationGuard::enter();
+    let runtime = TaskRuntime::with_limits(1, 2, 1, 2, 3);
+    let child_runtime = TaskRuntime::with_limits(1, 2, 0, 0, 3);
+    let (blocker, mut child_worker_release) = held_task(&child_runtime);
+    let observer: ParentObserver = Arc::new(Mutex::new(None));
+    let (mut capture_release, capture_rx) = Release::pair();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let ran_child = Arc::new(AtomicBool::new(false));
+    let child_ran = Arc::clone(&ran_child);
+    let original = saved_context();
+    let shorter = CancellationContext {
+        reason: TerminationReason::Cancelled,
+        cleanup_deadline: original.cleanup_deadline - Duration::from_millis(100),
+    };
+    let expected = CancellationContext {
+        reason: TerminationReason::TimedOut,
+        cleanup_deadline: shorter.cleanup_deadline,
+    };
+    let first_child_context = CancellationContext {
+        reason: if ambient_owner_drop {
+            TerminationReason::Cancelled
+        } else {
+            TerminationReason::TimedOut
+        },
+        cleanup_deadline: original.cleanup_deadline,
+    };
+    let expected_child_context = CancellationContext {
+        cleanup_deadline: shorter.cleanup_deadline,
+        ..first_child_context
+    };
+    let payload = (
+        Probe {
+            parent: Arc::clone(&observer),
+            entered: entered_tx.clone(),
+            release: Some(capture_rx),
+            drops: Arc::clone(&drops),
+            shorter: Some(shorter),
+            panics: panic_in_capture,
+        },
+        Probe {
+            parent: Arc::clone(&observer),
+            entered: entered_tx,
+            release: None,
+            drops: Arc::clone(&drops),
+            shorter: None,
+            panics: false,
+        },
+    );
+    let child = child_runtime
+        .spawn(move || {
+            child_ran.store(true, Ordering::Release);
+            std::hint::black_box(&payload);
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let child_state = Arc::clone(&child.state);
+    let child_owner = Arc::downgrade(&child.owner);
+    let (mut begin, begin_rx) = Release::pair();
+    let (mut run_release, run_release_rx) = Release::pair();
+    let (body_tx, body_rx) = mpsc::sync_channel(2);
+    let pool = runtime.clone();
+    let parent = runtime
+        .spawn(move || {
+            begin_rx
+                .recv_timeout(WAIT)
+                .map_err(|_| KuError::runtime("bind implicit owner parent", Span::default()))?;
+            pool.run_blocking(
+                move || {
+                    // The three implicit cases only borrow the sole logical
+                    // owner; return/unwind drop glue releases it. The separate
+                    // ambient case below deliberately releases it in a guard.
+                    std::hint::black_box(&child);
+                    let _ = body_tx.send(BodyObservation::current());
+                    run_release_rx.recv_timeout(WAIT).map_err(|_| {
+                        KuError::runtime(
+                            "release actual implicit-owner blocking body",
+                            Span::default(),
+                        )
+                    })?;
+                    let _ = body_tx.send(BodyObservation::current());
+                    assert!(!panic_in_body, "actual implicit-owner blocking body panic");
+                    if ambient_owner_drop {
+                        // A later ambient candidate must preserve its own
+                        // first cause while using the already-cancelled real
+                        // parent's earlier D. This fixture does not extend
+                        // the parent or the production cleanup allowance.
+                        let _ambient = CleanupGuard::enter(CancellationContext {
+                            reason: TerminationReason::Cancelled,
+                            cleanup_deadline: original.cleanup_deadline + Duration::from_secs(1),
+                        });
+                        drop(child);
+                    }
+                    Ok(Value::Int(41))
+                },
+                Span::default(),
+            )
+        })
+        .unwrap();
+    let state = bind(&observer, &parent);
+    let parent_owner = Arc::downgrade(&parent.owner);
+    begin.release();
+    let body = body_rx.recv_timeout(WAIT).unwrap();
+    body.assert_ordinary_blocking_identity();
+    assert_eq!(state.pending_blocking.load(Ordering::Acquire), 1);
+    assert!(state.cancellation().is_none());
+    parent.release_scope_owner(original);
+    drop(parent);
+    assert!(until(|| parent_finished(&state)));
+    assert_eq!(parent_owner.strong_count(), 0);
+    assert_eq!(state.cancellation(), Some(original));
+    assert_eq!(state.pending_blocking.load(Ordering::Acquire), 1);
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    run_release.release();
+    let leaving_body = body_rx.recv_timeout(WAIT).unwrap();
+    leaving_body.assert_ordinary_blocking_identity();
+    assert_eq!(leaving_body.thread, body.thread);
+    let first = entered_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(first.thread, body.thread);
+    assert_eq!(first.pending, 1);
+    assert_all_parent_stages(&first);
+    assert_blocking_probe_identity(&first);
+    assert_eq!(first.cleanup, Some(first_child_context));
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    assert_eq!(state.pending_blocking.load(Ordering::Acquire), 1);
+    capture_release.release();
+    let tail = entered_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(tail.thread, body.thread);
+    assert_eq!(tail.pending, 1);
+    assert_all_parent_stages(&tail);
+    assert_blocking_probe_identity(&tail);
+    assert_eq!(tail.cleanup, Some(expected_child_context));
+    assert!(until(|| state.pending_blocking.load(Ordering::Acquire)
+        == 0
+        && runtime.inner.running_blocking_jobs.load(Ordering::Acquire)
+            == 0));
+    assert_eq!(drops.load(Ordering::Acquire), 2);
+    assert!(!ran_child.load(Ordering::Acquire));
+    assert_eq!(child_owner.strong_count(), 0);
+    assert_eq!(state.cancellation(), Some(expected));
+    assert_eq!(child_state.cancellation(), Some(expected_child_context));
+
+    // There is one actual blocking worker. Its next uncancelled callback also
+    // releases a sole queued child implicitly, proving both catch recovery and
+    // restoration of the private observer, beyond an empty callback check.
+    let (mut next_release, next_rx) = Release::pair();
+    let (next_entered_tx, next_entered_rx) = mpsc::sync_channel(2);
+    let next_drops = Arc::new(AtomicUsize::new(0));
+    let next_ran = Arc::new(AtomicBool::new(false));
+    let next_child_ran = Arc::clone(&next_ran);
+    let next_payload = (
+        Probe {
+            parent: Arc::clone(&observer),
+            entered: next_entered_tx.clone(),
+            release: Some(next_rx),
+            drops: Arc::clone(&next_drops),
+            shorter: None,
+            panics: false,
+        },
+        Probe {
+            parent: Arc::clone(&observer),
+            entered: next_entered_tx,
+            release: None,
+            drops: Arc::clone(&next_drops),
+            shorter: None,
+            panics: false,
+        },
+    );
+    let next_child = child_runtime
+        .spawn(move || {
+            next_child_ran.store(true, Ordering::Release);
+            std::hint::black_box(&next_payload);
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let next_child_state = Arc::clone(&next_child.state);
+    let next_child_owner = Arc::downgrade(&next_child.owner);
+    let (next_body_tx, next_body_rx) = mpsc::sync_channel(1);
+    let next_pool = runtime.clone();
+    let next = thread::spawn(move || {
+        next_pool.run_blocking(
+            move || {
+                std::hint::black_box(&next_child);
+                let _ = next_body_tx.send(BodyObservation::current());
+                Ok(Value::Int(43))
+            },
+            Span::default(),
+        )
+    });
+    let next_body = next_body_rx.recv_timeout(WAIT).unwrap();
+    next_body.assert_ordinary_blocking_identity();
+    assert_eq!(next_body.thread, body.thread);
+    let next_first = next_entered_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(next_first.thread, body.thread);
+    assert_eq!(next_first.pending, 0);
+    assert_all_parent_stages(&next_first);
+    assert_blocking_probe_identity(&next_first);
+    let next_context = next_first.cleanup.expect("new child owner cleanup context");
+    assert_eq!(next_context.reason, TerminationReason::Cancelled);
+    assert!(next_context.cleanup_deadline > expected.cleanup_deadline);
+    assert_eq!(state.cancellation(), Some(expected));
+    assert_eq!(next_drops.load(Ordering::Acquire), 0);
+    next_release.release();
+    let next_tail = next_entered_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(next_tail.thread, body.thread);
+    assert_eq!(next_tail.pending, 0);
+    assert_all_parent_stages(&next_tail);
+    assert_blocking_probe_identity(&next_tail);
+    assert_eq!(next_tail.cleanup, Some(next_context));
+    assert_eq!(next.join().unwrap().unwrap(), Value::Int(43));
+    assert_eq!(next_drops.load(Ordering::Acquire), 2);
+    assert!(!next_ran.load(Ordering::Acquire));
+    assert_eq!(next_child_owner.strong_count(), 0);
+    assert_eq!(next_child_state.cancellation(), Some(next_context));
+    assert_eq!(state.cancellation(), Some(expected));
+    assert_eq!(state.pending_blocking.load(Ordering::Acquire), 0);
+    assert!(current_cleanup_context().is_none());
+    assert!(current_execution_termination().is_none());
+    assert!(!has_current_task_state());
+    child_worker_release.release();
+    blocker.await_result().unwrap();
+    child_runtime.cancel_all_and_wait(WAIT).unwrap();
+    runtime.cancel_all_and_wait(WAIT).unwrap();
+    assert!(until(|| child_state
+        .accounting_done
+        .load(Ordering::Acquire)
+        && next_child_state.accounting_done.load(Ordering::Acquire)));
+    let snapshot = runtime.snapshot().unwrap();
+    assert_eq!(snapshot.active_tasks, 0);
+    assert_eq!(snapshot.registered_tasks, 0);
+    assert_eq!(snapshot.queued_blocking_jobs, 0);
+    assert_eq!(snapshot.running_blocking_jobs, 0);
+    assert_eq!(child_runtime.snapshot().unwrap().active_tasks, 0);
+}
+
+#[test]
+fn actual_running_fn_once_implicit_child_owner_keeps_first_cause_and_restores_worker() {
+    for (panic_in_body, panic_in_capture) in [(false, false), (false, true), (true, false)] {
+        running_implicit_child_owner_case(panic_in_body, panic_in_capture, false);
+    }
+}
+
+#[test]
+fn actual_running_owner_cleanup_preserves_ambient_cause_and_minimum_parent_deadline() {
+    running_implicit_child_owner_case(false, false, true);
+}
+
+struct HelperPanicRunner;
+
+impl LocalTaskRunner for HelperPanicRunner {
+    fn dispatch(
+        &mut self,
+        _budget: std::num::NonZeroUsize,
+    ) -> std::ops::ControlFlow<KuResult<Value>> {
+        std::ops::ControlFlow::Break(Ok(Value::Null))
+    }
+}
+
+#[test]
+fn actual_helped_runner_constructor_panic_isolates_blocking_parent_and_restores_observer() {
+    let _execution = ExecutionTerminationGuard::enter();
+    let runtime = TaskRuntime::with_limits(1, 2, 1, 2, 2);
+    let helper_runtime = TaskRuntime::with_limits(1, 2, 0, 0, 3);
+    let child_runtime = TaskRuntime::with_limits(1, 2, 0, 0, 2);
+    // Occupy both real Task workers, so only the actual blocking body can
+    // claim the queued runner constructor through help_one.
+    let (helper_blocker, mut helper_worker_release) = held_task(&helper_runtime);
+    let (child_blocker, mut child_worker_release) = held_task(&child_runtime);
+    let observer: ParentObserver = Arc::new(Mutex::new(None));
+    let (mut capture_release, capture_rx) = Release::pair();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(2);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let ran_child = Arc::new(AtomicBool::new(false));
+    let child_ran = Arc::clone(&ran_child);
+    let original = saved_context();
+    let payload = (
+        Probe {
+            parent: Arc::clone(&observer),
+            entered: entered_tx.clone(),
+            release: Some(capture_rx),
+            drops: Arc::clone(&drops),
+            shorter: None,
+            panics: false,
+        },
+        Probe {
+            parent: Arc::clone(&observer),
+            entered: entered_tx,
+            release: None,
+            drops: Arc::clone(&drops),
+            shorter: None,
+            panics: false,
+        },
+    );
+    let child = child_runtime
+        .spawn(move || {
+            child_ran.store(true, Ordering::Release);
+            std::hint::black_box(&payload);
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let child_state = Arc::clone(&child.state);
+    let child_owner = Arc::downgrade(&child.owner);
+    let (constructor_tx, constructor_rx) = mpsc::sync_channel(1);
+    let helper = helper_runtime
+        .spawn_runner_deferred(move || {
+            move || -> HelperPanicRunner {
+                // The factory's genuine unwind releases this sole child
+                // owner while the real helper identity is installed.
+                std::hint::black_box(&child);
+                let _ = constructor_tx.send(BodyObservation::current());
+                panic!("actual helped runner constructor panic");
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        helper.state.submission.load(Ordering::Acquire),
+        SUBMISSION_ACCEPTED
+    );
+    assert!(!helper.state.execution_queue_retired.load(Ordering::Acquire));
+    let helper_id = helper.id();
+    let (mut begin, begin_rx) = Release::pair();
+    let (mut run_release, run_release_rx) = Release::pair();
+    let (body_tx, body_rx) = mpsc::sync_channel(2);
+    let pool = runtime.clone();
+    let work_helper = helper_runtime.clone();
+    let parent = runtime
+        .spawn(move || {
+            begin_rx
+                .recv_timeout(WAIT)
+                .expect("bind actual helper parent");
+            pool.run_blocking(
+                move || {
+                    let _ = body_tx.send(BodyObservation::current());
+                    run_release_rx
+                        .recv_timeout(WAIT)
+                        .expect("release actual blocking helper caller");
+                    assert!(
+                        work_helper.help_one().unwrap(),
+                        "claim actual queued helper"
+                    );
+                    let _ = body_tx.send(BodyObservation::current());
+                    Ok(Value::Int(47))
+                },
+                Span::default(),
+            )
+        })
+        .unwrap();
+    let state = bind(&observer, &parent);
+    let parent_owner = Arc::downgrade(&parent.owner);
+    begin.release();
+    let body = body_rx.recv_timeout(WAIT).unwrap();
+    body.assert_ordinary_blocking_identity();
+    parent.release_scope_owner(original);
+    drop(parent);
+    assert!(until(|| parent_finished(&state)));
+    assert_eq!(parent_owner.strong_count(), 0);
+    assert_eq!(state.pending_blocking.load(Ordering::Acquire), 1);
+    assert_eq!(state.cancellation(), Some(original));
+    run_release.release();
+    let constructor = constructor_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(constructor.thread, body.thread);
+    assert_eq!(constructor.task_id, helper_id);
+    assert!(!constructor.task_cancelled);
+    assert!(constructor.task_cancellation.is_none());
+    assert!(constructor.cleanup.is_none());
+    assert!(constructor.execution.is_none());
+    assert!(constructor.task_state_present);
+    let first = entered_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(first.thread, body.thread);
+    assert_eq!(first.pending, 1);
+    assert_all_parent_stages(&first);
+    assert_eq!(first.task_id, helper_id);
+    assert!(!first.task_cancelled);
+    assert!(first.task_cancellation.is_none());
+    assert!(first.execution.is_none());
+    assert!(first.task_state_present);
+    let helper_child_context = first.cleanup.expect("actual helper child cleanup");
+    assert_eq!(helper_child_context.reason, TerminationReason::Cancelled);
+    assert!(helper_child_context.cleanup_deadline > original.cleanup_deadline);
+    assert_eq!(state.cancellation(), Some(original));
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    capture_release.release();
+    let tail = entered_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(tail.thread, body.thread);
+    assert_eq!(tail.pending, 1);
+    assert_all_parent_stages(&tail);
+    assert_eq!(tail.task_id, helper_id);
+    assert!(!tail.task_cancelled);
+    assert!(tail.task_cancellation.is_none());
+    assert!(tail.execution.is_none());
+    assert!(tail.task_state_present);
+    assert_eq!(tail.cleanup, Some(helper_child_context));
+    let after_helper = body_rx.recv_timeout(WAIT).unwrap();
+    after_helper.assert_ordinary_blocking_identity();
+    assert_eq!(after_helper.thread, body.thread);
+    assert!(until(|| state.pending_blocking.load(Ordering::Acquire)
+        == 0
+        && runtime.inner.running_blocking_jobs.load(Ordering::Acquire)
+            == 0));
+    assert_eq!(state.cancellation(), Some(original));
+    assert_eq!(child_state.cancellation(), Some(helper_child_context));
+    assert_eq!(child_owner.strong_count(), 0);
+    assert_eq!(drops.load(Ordering::Acquire), 2);
+    assert!(!ran_child.load(Ordering::Acquire));
+    assert!(helper.state.cancellation().is_none());
+    assert_eq!(helper.status(), "panicked");
+    assert_eq!(error_code(&helper.await_result().unwrap()), Some("panic"));
+    assert!(helper.state.execution_queue_retired.load(Ordering::Acquire));
+    assert!(helper.state.completion_cleanup_done.load(Ordering::Acquire));
+    assert!(helper.state.accounting_done.load(Ordering::Acquire));
+    assert_eq!(helper.state.pending_blocking.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime
+            .run_blocking(
+                || {
+                    BodyObservation::current().assert_ordinary_blocking_identity();
+                    Ok(Value::Int(49))
+                },
+                Span::default(),
+            )
+            .unwrap(),
+        Value::Int(49)
+    );
+    assert!(current_cleanup_context().is_none());
+    assert!(current_execution_termination().is_none());
+    assert!(!has_current_task_state());
+    drop(helper);
+    helper_worker_release.release();
+    child_worker_release.release();
+    helper_blocker.await_result().unwrap();
+    child_blocker.await_result().unwrap();
+    helper_runtime.cancel_all_and_wait(WAIT).unwrap();
+    child_runtime.cancel_all_and_wait(WAIT).unwrap();
+    runtime.cancel_all_and_wait(WAIT).unwrap();
+    assert!(until(|| child_state
+        .accounting_done
+        .load(Ordering::Acquire)));
+    assert_eq!(runtime.snapshot().unwrap().active_tasks, 0);
+    assert_eq!(helper_runtime.snapshot().unwrap().active_tasks, 0);
+    assert_eq!(child_runtime.snapshot().unwrap().active_tasks, 0);
 }
 
 fn running_late_result_case(foreign: bool, panics: bool) {
