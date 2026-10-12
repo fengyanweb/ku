@@ -1,13 +1,14 @@
 //! Flat, bounded interpreter call/return continuations.
 //!
 //! The production slice admits a complete static scalar call tree before any
-//! body effects, including terminal scalar Result roots. An async root enters
-//! only after its Task is claimed; static dependencies remain synchronous.
+//! body effects, including scalar Result roots and static async dependencies.
+//! An async root enters only after its Task is claimed. Await checkpoints own
+//! the original ticket and hand helper execution to the claimant-local driver.
 //! Once admitted, every nested call stays in this dispatch loop.
 //! Scope, call, argument and scalar finally exits use the evaluator's real
 //! resource arbitration.
 //! Other language constructs keep their existing evaluator; Owned, borrows,
-//! general function values, waiting and recoverable catch require later slices.
+//! general function values and recoverable catch require later slices.
 //! This partial production integration does not close the full P0 contract.
 
 use super::*;
@@ -107,8 +108,10 @@ impl CallKind {
 }
 
 /// The evaluator supplies its existing resource and termination arbitration.
-/// These callbacks never evaluate Ku syntax or start another execution machine.
+/// A child task receives shared code; its machine is constructed by its claimant.
 trait ExecutionHooks {
+    fn host(&mut self) -> &mut Interpreter;
+
     fn tick(&mut self, span: Span) -> KuResult<()>;
     fn finish_scope(
         &mut self,
@@ -149,6 +152,10 @@ trait ExecutionHooks {
 }
 
 impl ExecutionHooks for Interpreter {
+    fn host(&mut self) -> &mut Interpreter {
+        self
+    }
+
     fn tick(&mut self, span: Span) -> KuResult<()> {
         Interpreter::tick(self, span)
     }
@@ -214,6 +221,10 @@ struct PollHooks<P> {
 
 #[cfg(test)]
 impl<P: FnMut(Span) -> KuResult<()>> ExecutionHooks for PollHooks<P> {
+    fn host(&mut self) -> &mut Interpreter {
+        &mut self.host
+    }
+
     fn tick(&mut self, span: Span) -> KuResult<()> {
         (self.poll)(span)
     }
@@ -290,6 +301,7 @@ struct ArgumentFrame {
     value_base: usize,
     leases: Vec<BorrowLease>,
     staged: Vec<Value>,
+    previous_observers: usize,
 }
 
 struct FinallyFrame {
@@ -371,6 +383,9 @@ enum Work {
     Discard,
     Return,
     WrapTerminalOk(SpanId),
+    AwaitOperand(SpanId),
+    AwaitResume,
+    Propagate(SpanId),
     TryExit(usize),
     FinallyExit(usize),
     ScopeExit {
@@ -383,6 +398,7 @@ enum Work {
         function: FnId,
         args: ExprRange,
         span: SpanId,
+        async_start: bool,
     },
     ArgumentsExit(ArgumentFrame),
     Arguments {
@@ -391,6 +407,7 @@ enum Work {
         next: usize,
         exit_index: usize,
         span: SpanId,
+        async_start: bool,
     },
 }
 
@@ -398,14 +415,18 @@ enum Work {
 enum MachineState {
     Ready,
     Running,
+    Waiting,
     Finished,
     Aborted,
 }
 
-// Private same-thread checkpoints, not scheduler await or worker migration.
+// Private same-thread checkpoints, including retained await, not worker migration.
 // Cleanup guards exist only in a synchronous dispatch or drop window.
 enum ChunkProgress {
     More {
+        popped: usize,
+    },
+    Waiting {
         popped: usize,
     },
     Finished {
@@ -415,6 +436,9 @@ enum ChunkProgress {
 }
 
 struct Machine {
+    // The suspended expression owns its sole target before outer call/argument
+    // resources. No synchronous TLS guard lives in this checkpoint.
+    awaiting: Option<AwaitFrame>,
     resources: Option<MachineResources>,
     finally: FinallyFrames,
     // A popped protected frame can panic in its real arbitration callback.
@@ -436,6 +460,11 @@ struct Machine {
     argument_capacity: usize,
     argument_bytes: usize,
     peak_argument_bytes: usize,
+}
+
+struct AwaitFrame {
+    ticket: crate::runtime::task::AwaitTicket,
+    span: SpanId,
 }
 
 fn storage_error(error: ReserveError, span: Span) -> KuError {
@@ -525,6 +554,7 @@ impl Machine {
             ..Metrics::default()
         };
         Self {
+            awaiting: None,
             resources: Some(MachineResources {
                 code,
                 captures: None,
@@ -559,6 +589,82 @@ impl Machine {
     fn frame(&mut self) -> &mut CallFrame {
         let index = self.calls.len() - 1;
         self.calls.get_mut(index).expect("current call frame")
+    }
+
+    fn frame_owned_value(&mut self, name: SymbolId, span: Span) -> KuResult<Value> {
+        let name = self.code.symbol(name);
+        self.calls
+            .get(self.calls.len() - 1)
+            .expect("current call frame")
+            .env
+            .get_owning(name, span)
+    }
+
+    fn register_call_observer(
+        &mut self,
+        hooks: &mut impl ExecutionHooks,
+        span: Span,
+    ) -> KuResult<usize> {
+        let host = hooks.host();
+        let previous = host.caller_owners.len();
+        if host
+            .task_runtime
+            .as_ref()
+            .is_some_and(TaskRuntime::has_task_submissions)
+        {
+            let observer = self.frame().env.observe_owned_bindings(span)?;
+            if !observer.is_empty() {
+                host.caller_owners.try_reserve(1).map_err(|_| {
+                    KuError::runtime("caller task ownership observation out of memory", span)
+                })?;
+                host.caller_owners.push(observer);
+            }
+        }
+        Ok(previous)
+    }
+
+    fn start_async(
+        &mut self,
+        function: FnId,
+        args: Vec<Value>,
+        depth: usize,
+        span: SpanId,
+        hooks: &mut impl ExecutionHooks,
+    ) -> KuResult<()> {
+        let source_span = self.code.span(span);
+        self.reserve_values(1, source_span)?;
+        if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
+            return Err(KuError::structured(
+                crate::error::KuErrorKind::Runtime,
+                "runtime",
+                "call_depth_exceeded",
+                format!("maximum call depth exceeded: {MAX_CALL_DEPTH}"),
+                source_span,
+            ));
+        }
+        let host = hooks.host();
+        host.reject_cleanup_submission(source_span)?;
+        for value in &args {
+            value.require_owned_root(source_span)?;
+        }
+        let runtime = host.task_runtime.clone().ok_or_else(|| {
+            KuError::runtime("async task runtime is not initialized", source_span)
+        })?;
+        let child_runtime = runtime.clone();
+        let code = self.code.clone();
+        let task = runtime.spawn_runner_deferred(|| {
+            let template = host.template();
+            move || {
+                let mut interpreter = Interpreter::from_template(template, child_runtime);
+                interpreter.async_execution = true;
+                ClaimedNamedTask::from_code(interpreter, code, function, args, source_span)
+            }
+        })?;
+        // A synchronous call reaches ArgumentsExit through CallExit. Async
+        // submission returns immediately, so install that same sole outcome
+        // here; ArgumentsExit performs the actual returned-value emission.
+        self.pending = Some(Ok(Flow::returned(Value::Task(task))));
+        Ok(())
     }
 
     fn value(&mut self) -> Value {
@@ -889,7 +995,7 @@ impl Machine {
         Ok(())
     }
 
-    fn step(&mut self, step: Work) -> KuResult<()> {
+    fn step(&mut self, step: Work, hooks: &mut impl ExecutionHooks) -> KuResult<()> {
         match step {
             Work::Block { body, next } => {
                 if let Some(stmt) = self.code.block_statement(body, next) {
@@ -997,6 +1103,35 @@ impl Machine {
                         let value = env.with_value(name, span, |value| scalar(value, span))?;
                         self.emit(value, span)?;
                     }
+                    ExprCode::VariableOwning(name) => {
+                        self.reserve_values(1, span)?;
+                        let value = self.frame_owned_value(name, span)?;
+                        self.emit(value, span)?;
+                    }
+                    ExprCode::Await(operand) => {
+                        // Admission precedes operand effects, as in eval(Await).
+                        hooks.host().reject_cleanup_submission(span)?;
+                        self.reserve_work(2, span)?;
+                        push(&mut self.work, Work::AwaitOperand(expr.span));
+                        push(&mut self.work, Work::Eval(operand));
+                    }
+                    ExprCode::Propagate(operand) => {
+                        self.reserve_work(2, span)?;
+                        push(&mut self.work, Work::Propagate(expr.span));
+                        push(&mut self.work, Work::Eval(operand));
+                    }
+                    ExprCode::AsyncStart { function, args } => {
+                        self.reserve_work(1, span)?;
+                        push(
+                            &mut self.work,
+                            Work::PrepareArguments {
+                                function,
+                                args,
+                                span: expr.span,
+                                async_start: true,
+                            },
+                        );
+                    }
                     ExprCode::Unary(op, operand) => {
                         self.reserve_work(2, span)?;
                         push(&mut self.work, Work::Unary(op, expr.span));
@@ -1024,6 +1159,7 @@ impl Machine {
                                 function,
                                 args,
                                 span: expr.span,
+                                async_start: false,
                             },
                         );
                         if self.captures.is_some() {
@@ -1194,14 +1330,85 @@ impl Machine {
                     span,
                 )?;
             }
+            Work::AwaitOperand(span) => {
+                let source_span = self.code.span(span);
+                // Reserve before moving the operand owner into its ticket.
+                self.reserve_work(1, source_span)?;
+                self.reserve_values(1, source_span)?;
+                let value = self.value();
+                let Value::Task(task) = value else {
+                    return Err(KuError::runtime(
+                        format!("await expects task but got {}", value.type_name()),
+                        source_span,
+                    ));
+                };
+                assert!(
+                    self.awaiting.is_none(),
+                    "one active await expression per machine"
+                );
+                self.awaiting = Some(AwaitFrame {
+                    ticket: crate::runtime::task::AwaitTicket::begin(task),
+                    span,
+                });
+                push(&mut self.work, Work::AwaitResume);
+            }
+            Work::AwaitResume => {
+                let awaiting = self.awaiting.as_mut().expect("retained await expression");
+                match awaiting.ticket.poll() {
+                    crate::runtime::task::AwaitPoll::Pending => {
+                        // This marker has just vacated one reserved slot. Poll
+                        // does not repeat the expression tick or claim.
+                        push(&mut self.work, Work::AwaitResume);
+                        self.state = MachineState::Waiting;
+                    }
+                    crate::runtime::task::AwaitPoll::Ready => {
+                        let AwaitFrame { ticket, span } =
+                            self.awaiting.take().expect("one await transfer");
+                        let result =
+                            ticket.finish_with(|result| hooks.host().observe_termination(result));
+                        self.emit(result?, self.code.span(span))?;
+                    }
+                }
+            }
+            Work::Propagate(span) => {
+                let source_span = self.code.span(span);
+                match self.value() {
+                    Value::Borrowed(_) => {
+                        return Err(KuError::runtime(
+                            "cannot unwrap a borrowed Result; clone to create an owned value",
+                            source_span,
+                        ));
+                    }
+                    Value::Result { ok: true, value } => self.emit(*value, source_span)?,
+                    Value::Result { ok: false, value } => {
+                        self.pending = Some(Ok(Flow::fail(*value)));
+                    }
+                    other => {
+                        return Err(KuError::runtime(
+                            format!("'?' expects result but got {}", other.type_name()),
+                            source_span,
+                        ));
+                    }
+                }
+            }
             Work::PrepareArguments {
                 function,
                 args,
                 span,
+                async_start,
             } => {
                 let source_span = self.code.span(span);
                 self.reserve_work(2, source_span)?;
                 let staged = self.argument_storage(args.len, source_span)?;
+                let previous_observers = match self.register_call_observer(hooks, source_span) {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        let capacity = staged.capacity();
+                        drop(staged);
+                        self.release_argument_capacity(capacity);
+                        return Err(error);
+                    }
+                };
                 let exit_index = self.work.len();
                 let value_base = self.values.len();
                 push(
@@ -1211,6 +1418,7 @@ impl Machine {
                         value_base,
                         leases: Vec::new(),
                         staged,
+                        previous_observers,
                     }),
                 );
                 push(
@@ -1221,6 +1429,7 @@ impl Machine {
                         next: 0,
                         exit_index,
                         span,
+                        async_start,
                     },
                 );
             }
@@ -1230,6 +1439,7 @@ impl Machine {
                 next,
                 exit_index,
                 span,
+                async_start,
             } => {
                 if next > 0 {
                     let value = self.value();
@@ -1253,6 +1463,7 @@ impl Machine {
                             next: next + 1,
                             exit_index,
                             span,
+                            async_start,
                         },
                     );
                     push(&mut self.work, Work::Eval(arg));
@@ -1266,16 +1477,26 @@ impl Machine {
                         unreachable!("argument exit marker");
                     };
                     let staged = std::mem::take(&mut arguments.staged);
-                    let result = self.enter(function, &staged, depth, span);
-                    let Work::ArgumentsExit(arguments) = self
-                        .work
-                        .get_mut(exit_index)
-                        .expect("live argument exit marker")
-                    else {
-                        unreachable!("argument exit marker");
-                    };
-                    arguments.staged = staged;
-                    result?;
+                    if async_start {
+                        let capacity = staged.capacity();
+                        let result = self.start_async(function, staged, depth, span, hooks);
+                        // The original argument buffer moved into the child
+                        // factory (or was actually dropped by failed admission).
+                        // Its parent marker now owns an empty buffer.
+                        self.release_argument_capacity(capacity);
+                        result?;
+                    } else {
+                        let result = self.enter(function, &staged, depth, span);
+                        let Work::ArgumentsExit(arguments) = self
+                            .work
+                            .get_mut(exit_index)
+                            .expect("live argument exit marker")
+                        else {
+                            unreachable!("argument exit marker");
+                        };
+                        arguments.staged = staged;
+                        result?;
+                    }
                 }
             }
             Work::ScopeExit { .. }
@@ -1458,6 +1679,12 @@ impl Machine {
                     result,
                     span,
                 );
+                // Observation must span the callee's actual scope/finally and
+                // the full argument epilogue, as in the original eval(Call).
+                hooks
+                    .host()
+                    .caller_owners
+                    .truncate(arguments.previous_observers);
                 self.release_argument_capacity(capacity);
                 match result {
                     // A callee's Fail has already been normalized at CallExit.
@@ -1524,11 +1751,36 @@ impl Machine {
         loop {
             match self.dispatch_chunk(budget, hooks)? {
                 ChunkProgress::More { popped } => debug_assert_eq!(popped, budget.get()),
+                ChunkProgress::Waiting { .. } => self.wait_synchronously(),
                 ChunkProgress::Finished { popped, result } => {
                     debug_assert!(popped <= budget.get());
                     return result;
                 }
             }
+        }
+    }
+
+    fn wait_synchronously(&mut self) {
+        // The legacy synchronous adapter cannot hand its Rust caller a pause.
+        // It uses the same ticket, preserving its old bounded helper behavior.
+        // Production runner callers instead expose waiting() to LocalJobFrames.
+        assert_eq!(self.state, MachineState::Waiting);
+        let guard = self.finally.context().map(CleanupGuard::enter);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.awaiting
+                .as_mut()
+                .expect("waiting expression retains its ticket")
+                .ticket
+                .drive_sync();
+        }));
+        self.finally.tighten(current_cleanup_context());
+        if result.is_err() {
+            self.aborted_release = current_cleanup_context();
+            self.state = MachineState::Aborted;
+        }
+        drop(guard);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
         }
     }
 
@@ -1553,6 +1805,7 @@ impl Machine {
             || self.values.len() != 0
             || self.finally.frames.len() != 0
             || self.pending.is_some()
+            || self.awaiting.is_some()
             || self.argument_capacity != 0
             || self.argument_bytes != 0
             || self.call_depth != self.initial_depth
@@ -1605,9 +1858,10 @@ impl Machine {
         budget: NonZeroUsize,
         hooks: &mut impl ExecutionHooks,
     ) -> KuResult<ChunkProgress> {
-        if self.state != MachineState::Running {
+        if !matches!(self.state, MachineState::Running | MachineState::Waiting) {
             return Err(self.lifecycle_error("dispatch"));
         }
+        self.state = MachineState::Running;
         // One catch per chunk. The window stays outside it so native panic
         // feedback occurs before its synchronous guards restore TLS.
         let mut window = DispatchWindow::default();
@@ -1648,6 +1902,9 @@ impl Machine {
             popped += 1;
             self.dispatch_one(step, hooks, window);
             window.finish(&mut self.finally);
+            if self.state == MachineState::Waiting {
+                return Ok(ChunkProgress::Waiting { popped });
+            }
         }
         if self.work.len() != 0 {
             return Ok(ChunkProgress::More { popped });
@@ -1674,6 +1931,9 @@ impl Machine {
                 | Work::FinallyExit(_)
         );
         if self.pending.is_some() {
+            if matches!(&step, Work::AwaitResume) {
+                drop(self.awaiting.take());
+            }
             if boundary {
                 self.finish_boundary(step, hooks, window);
             }
@@ -1688,6 +1948,9 @@ impl Machine {
                     "internal execution prototype test fuel exhausted",
                     self.entry_span,
                 )));
+                if matches!(&step, Work::AwaitResume) {
+                    drop(self.awaiting.take());
+                }
                 if boundary {
                     self.finish_boundary(step, hooks, window);
                 }
@@ -1709,12 +1972,16 @@ impl Machine {
         };
         if let Err(error) = poll {
             self.pending = Some(Err(error));
-        } else if let Err(error) = self.step(step) {
+        } else if let Err(error) = self.step(step, hooks) {
             self.pending = Some(Err(error));
         }
     }
 
     fn finish_run(&mut self) -> KuResult<Flow> {
+        assert!(
+            self.awaiting.is_none(),
+            "finished execution retired its await"
+        );
         assert_eq!(self.calls.len(), 0);
         assert_eq!(self.values.len(), 0);
         assert_eq!(self.argument_capacity, 0);
@@ -1860,7 +2127,7 @@ pub(super) fn try_execute_function_value(
 
 // Created only by the already-claimed Task's Send factory. The runner and its
 // owned Machine stay on that claimant thread beneath the original job catch.
-// More still continues immediately; this does not yet suspend an awaited Task.
+// More continues immediately; Waiting exposes the retained ticket to its driver.
 pub(super) struct ClaimedNamedTask {
     // Preserve the execution prefix's Drop before its Interpreter host.
     machine: Option<Machine>,
@@ -1873,6 +2140,31 @@ pub(super) struct ClaimedNamedTask {
 }
 
 impl ClaimedNamedTask {
+    fn from_code(
+        interpreter: Interpreter,
+        code: CodeHandle,
+        function: FnId,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Self {
+        let mut machine = Machine::from_code(code, Limits::default(), interpreter.call_depth);
+        let entry_code = machine.code.clone();
+        let entry = entry_code.symbol(entry_code.function(function).name);
+        let outcome = machine.start_once(entry, &args, 0, false).err().map(Err);
+        // Scalar arguments have entered the actual child Env; release the
+        // transferred factory buffer before the first dispatch, as before.
+        drop(args);
+        Self {
+            machine: Some(machine),
+            interpreter,
+            legacy: None,
+            outcome,
+            span,
+            task_id: crate::runtime::task::current_task_id(),
+            finished: false,
+        }
+    }
+
     pub(super) fn new(
         interpreter: Interpreter,
         function: FnDecl,
@@ -1934,6 +2226,10 @@ impl crate::runtime::task::LocalTaskRunner for ClaimedNamedTask {
                     debug_assert_eq!(popped, budget.get());
                     return std::ops::ControlFlow::Continue(());
                 }
+                Ok(ChunkProgress::Waiting { popped }) => {
+                    debug_assert!(popped <= budget.get());
+                    return std::ops::ControlFlow::Continue(());
+                }
                 Ok(ChunkProgress::Finished { popped, result }) => {
                     debug_assert!(popped <= budget.get());
                     result.and_then(|flow| flow.into_call_value(self.span, "function"))
@@ -1947,6 +2243,16 @@ impl crate::runtime::task::LocalTaskRunner for ClaimedNamedTask {
         };
         self.finished = true;
         std::ops::ControlFlow::Break(result)
+    }
+
+    fn waiting(&mut self) -> Option<&mut crate::runtime::task::AwaitTicket> {
+        self.machine.as_mut().and_then(|machine| {
+            if machine.state == MachineState::Waiting {
+                machine.awaiting.as_mut().map(|frame| &mut frame.ticket)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -2099,12 +2405,17 @@ impl Drop for Machine {
             (saved, active) => saved.or(active),
         };
         let guard = release.map(CleanupGuard::enter);
+        let awaiting = self.awaiting.take();
+        let await_drop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(awaiting)));
         let prefix = self.resources.take();
         let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(prefix)));
         self.finally.tighten(current_cleanup_context());
         // Restore before ordinary outer primary outcomes are retired.
         drop(guard);
-        let mut first = dropped.err();
+        let mut first = await_drop.err();
+        if let Err(panic) = dropped {
+            retain_first_panic(&mut first, panic);
+        }
         if let Some(panic) = self.finally.drain() {
             retain_first_panic(&mut first, panic);
         }

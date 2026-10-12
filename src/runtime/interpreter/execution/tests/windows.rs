@@ -90,6 +90,10 @@ fn observation(
 }
 
 impl ExecutionHooks for WindowHooks {
+    fn host(&mut self) -> &mut Interpreter {
+        &mut self.host
+    }
+
     fn tick(&mut self, span: Span) -> KuResult<()> {
         self.ticks.push((span, current_cleanup_context()));
         if self
@@ -192,6 +196,7 @@ fn checkpoint(
             .dispatch_chunk(NonZeroUsize::new(1).unwrap(), hooks)
             .unwrap()
         {
+            ChunkProgress::Waiting { .. } => panic!("this scalar fixture has no await"),
             ChunkProgress::More { popped } => {
                 assert_eq!(popped, 1);
                 if reached(hooks) {
@@ -210,6 +215,7 @@ fn finish(machine: &mut Machine, hooks: &mut WindowHooks) -> KuResult<Flow> {
             .dispatch_chunk(NonZeroUsize::new(1).unwrap(), hooks)
             .unwrap()
         {
+            ChunkProgress::Waiting { .. } => panic!("this scalar fixture has no await"),
             ChunkProgress::More { popped } => assert_eq!(popped, 1),
             ChunkProgress::Finished { result, .. } => return result,
         }

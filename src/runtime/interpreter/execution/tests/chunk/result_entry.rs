@@ -15,7 +15,7 @@ async fn AsyncCalc(n: int): int! {
 }
 "#;
 
-fn install(host: &mut Interpreter, source: &HashMap<String, FnDecl>) {
+pub(super) fn install(host: &mut Interpreter, source: &HashMap<String, FnDecl>) {
     for (name, function) in source {
         host.functions.insert(name.clone(), function.clone());
     }
@@ -90,7 +90,7 @@ fn result_roots_preserve_whole_tree_boundaries_and_budget_rejection() {
         "fn Entry(): int! { value = ok(3)\n return value }",
         "fn Entry(n: int): int! { if (n > 0) { return Entry(n - 1) }\n return ok(0) }",
         "fn ok(value: int): int! { fail(\"shadow\") }\nfn Entry(): int! { return ok(3) }",
-        "async fn Child(): int! { return ok(1) }\nasync fn Entry(): int! { child = Child()\n return ok((await child)?) }",
+        "async fn Child(): int! { return ok(1) }\nasync fn Entry(): int! { result = await Child()\n return result }",
     ] {
         let source = functions(text);
         let function = &source["Entry"];

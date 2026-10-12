@@ -755,6 +755,10 @@ impl<'a> FinallyProbe<'a> {
 }
 
 impl ExecutionHooks for FinallyProbe<'_> {
+    fn host(&mut self) -> &mut Interpreter {
+        self.host
+    }
+
     fn tick(&mut self, span: Span) -> KuResult<()> {
         self.ticks.push(span);
         if let Some((target, hits, _)) = self.triggers.first_mut() {

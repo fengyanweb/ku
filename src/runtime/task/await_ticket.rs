@@ -300,6 +300,10 @@ impl<H: AwaitTarget> AwaitCore<H> {
             }
             Ok(false) => {}
         }
+        self.wait_target_once();
+    }
+
+    fn wait_target_once(&mut self) {
         let wait = self
             .deadline
             .map(|deadline| {
@@ -425,6 +429,22 @@ pub(crate) struct AwaitTicket {
 }
 
 impl AwaitTicket {
+    pub(super) fn runtime(&self) -> &TaskRuntime {
+        &self.core.runtime
+    }
+
+    pub(super) fn wait_once(&mut self) {
+        self.core.wait_target_once();
+    }
+
+    pub(super) fn helper_error(&mut self, error: KuError) {
+        self.core.ready(Err(error));
+    }
+
+    pub(super) fn abort_native(&mut self, panic: CleanupPanic) -> ! {
+        self.core.abort_native(panic)
+    }
+
     pub(crate) fn begin(handle: TaskHandle) -> Self {
         let runtime = handle.runtime.clone();
         Self {

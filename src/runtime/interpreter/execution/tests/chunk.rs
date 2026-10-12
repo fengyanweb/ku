@@ -1,5 +1,7 @@
 use super::*;
 
+mod await_entry;
+mod await_fuel;
 mod result_entry;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -16,6 +18,9 @@ struct TraceHooks {
     host: Interpreter,
     ticks: Vec<Span>,
     events: Vec<Event>,
+    timeout_at: Option<Span>,
+    assert_cancelled_at: Option<Span>,
+    observed_queued_cancel: bool,
 }
 
 impl TraceHooks {
@@ -24,14 +29,33 @@ impl TraceHooks {
             host: Interpreter::new(),
             ticks: Vec::new(),
             events: Vec::new(),
+            timeout_at: None,
+            assert_cancelled_at: None,
+            observed_queued_cancel: false,
         }
     }
 }
 
 impl ExecutionHooks for TraceHooks {
+    fn host(&mut self) -> &mut Interpreter {
+        &mut self.host
+    }
+
     fn tick(&mut self, span: Span) -> KuResult<()> {
         self.ticks.push(span);
         self.events.push(Event::Tick(span));
+        if self.timeout_at == Some(span) {
+            self.host.execution_deadline = Some(HttpHandlerDeadline::new(Instant::now()));
+            self.timeout_at = None;
+        }
+        if self.assert_cancelled_at == Some(span) {
+            let snapshot = self.host.task_runtime.as_ref().unwrap().snapshot().unwrap();
+            // The inherited cause is TimedOut, so the target's state is
+            // timed_out rather than the cancelled bucket. It is terminal but
+            // its genuine queue node still awaits worker retirement.
+            assert_eq!((snapshot.pending_tasks, snapshot.queued_tasks), (0, 1));
+            self.observed_queued_cancel = true;
+        }
         ExecutionHooks::tick(&mut self.host, span)
     }
 
@@ -103,6 +127,7 @@ fn drive_chunks(
     // A finite fixture containment bound, independent of production semantics.
     for _ in 0..100_000 {
         match machine.dispatch_chunk(budget, hooks).unwrap() {
+            ChunkProgress::Waiting { .. } => panic!("this scalar fixture has no await"),
             ChunkProgress::More { popped } => {
                 assert_eq!(popped, budget.get());
                 assert_eq!(machine.state, MachineState::Running);
@@ -218,6 +243,7 @@ fn Entry(): int { return Target(First(), Second(), Third(0)) }
             .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut hooks)
             .unwrap()
         {
+            ChunkProgress::Waiting { .. } => panic!("this scalar fixture has no await"),
             ChunkProgress::More { popped } => {
                 assert_eq!(popped, 1);
                 assert_eq!(machine.state, MachineState::Running);
@@ -322,6 +348,7 @@ fn chunk_lifecycle_rejects_restarts_and_preserves_fuel_through_real_unwind_and_r
         .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut hooks)
         .unwrap()
     {
+        ChunkProgress::Waiting { .. } => panic!("this scalar fixture has no await"),
         ChunkProgress::More { popped } => assert_eq!(popped, 1),
         ChunkProgress::Finished { .. } => panic!("recursion must retain its continuation"),
     }

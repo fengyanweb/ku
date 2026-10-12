@@ -19,7 +19,7 @@ use crate::{
 };
 
 mod await_ticket;
-pub(crate) use await_ticket::AwaitTicket;
+pub(crate) use await_ticket::{AwaitPoll, AwaitTicket};
 #[cfg(test)]
 mod await_ticket_tests;
 mod cancel_batch;
@@ -31,6 +31,7 @@ mod cancel_batch_tests;
 mod cleanup_panic_tests;
 #[cfg(test)]
 mod help_panic_tests;
+mod local_driver;
 mod runner;
 pub(crate) use runner::{LocalTaskRunner, OnceTaskRunner};
 #[cfg(test)]
@@ -68,6 +69,30 @@ thread_local! {
 }
 
 type TaskFn = Box<dyn FnOnce() -> KuResult<Value> + Send + 'static>;
+type RunnerFactory = Box<dyn FnOnce() -> Box<dyn LocalTaskRunner> + Send + 'static>;
+
+enum TaskStart {
+    Callback(TaskFn),
+    Runner {
+        factory: RunnerFactory,
+        header_bytes: usize,
+    },
+}
+
+impl<F: FnOnce() -> KuResult<Value> + Send + 'static> From<Box<F>> for TaskStart {
+    fn from(run: Box<F>) -> Self {
+        Self::Callback(run)
+    }
+}
+
+impl TaskStart {
+    fn runner_header_bytes(&self) -> usize {
+        match self {
+            Self::Callback(_) => 0,
+            Self::Runner { header_bytes, .. } => *header_bytes,
+        }
+    }
+}
 type BlockingFn = Box<dyn FnOnce() -> KuResult<Value> + Send + 'static>;
 type CleanupPanic = Box<dyn std::any::Any + Send + 'static>;
 
@@ -487,7 +512,7 @@ struct TaskState {
     result: Mutex<Option<KuResult<Value>>>,
     // Always acquire result before pending_run. Claiming execution and taking a
     // queued frame for cancellation must have one arbitration point.
-    pending_run: Mutex<Option<TaskFn>>,
+    pending_run: Mutex<Option<TaskStart>>,
     owner_released: AtomicBool,
     owner_result_release: Mutex<Option<OwnerResultRelease>>,
     ready: Condvar,
@@ -508,7 +533,7 @@ impl TaskRuntime {
         )
     }
 
-    fn with_limits(
+    pub(crate) fn with_limits(
         task_workers: usize,
         task_queue_limit: usize,
         blocking_workers: usize,
@@ -561,6 +586,13 @@ impl TaskRuntime {
     where
         B: FnOnce() -> F,
         F: FnOnce() -> KuResult<Value> + Send + 'static,
+    {
+        self.spawn_start_deferred(|| TaskStart::Callback(Box::new(build())))
+    }
+
+    fn spawn_start_deferred<B>(&self, build: B) -> KuResult<TaskHandle>
+    where
+        B: FnOnce() -> TaskStart,
     {
         ensure_task_operations_allowed(Span::default())?;
         self.inner.total_submissions.fetch_add(1, Ordering::Relaxed);
@@ -689,7 +721,16 @@ impl TaskRuntime {
                     return;
                 }
             };
-            state.install_run(Box::new(run));
+            let header_overflow = run.runner_header_bytes() > local_driver::MAX_TYPED_RUNNER_HEADER;
+            state.install_run(run);
+            if header_overflow {
+                reservation.rollback();
+                self.inner
+                    .rejected_task_internal
+                    .fetch_add(1, Ordering::Relaxed);
+                state.reject_queued(id, Err(local_driver::storage_error()));
+                return;
+            }
             reservation.reserve_queue();
             match self.inner.task_tx.try_send(TaskJob {
                 id,
@@ -750,12 +791,12 @@ impl TaskRuntime {
         F: FnOnce() -> R + Send + 'static,
         R: LocalTaskRunner + 'static,
     {
-        // Only the Send factory enters pending_run. The existing claimant
-        // installs Task identity before calling it; its !Send runner never
-        // enters a shared mutex, another worker, or the submission queue.
-        self.spawn_deferred(|| {
+        self.spawn_start_deferred(|| {
             let factory = build();
-            move || runner::drive_local(factory())
+            TaskStart::Runner {
+                factory: Box::new(move || Box::new(factory())),
+                header_bytes: std::mem::size_of::<R>(),
+            }
         })
     }
 
@@ -1457,8 +1498,8 @@ impl TaskState {
         }
     }
 
-    fn install_run(&self, run: TaskFn) {
-        let mut uninstalled = Some(run);
+    fn install_run(&self, run: impl Into<TaskStart>) {
+        let mut uninstalled = Some(run.into());
         let context = {
             let slot = self
                 .result
@@ -1493,7 +1534,7 @@ impl TaskState {
         }
     }
 
-    fn claim_run(&self) -> Option<TaskFn> {
+    fn claim_run(&self) -> Option<TaskStart> {
         let _slot = self
             .result
             .lock()
@@ -1871,36 +1912,7 @@ impl Drop for QueueRetirement<'_> {
 }
 
 fn execute_task_job(inner: &TaskRuntimeInner, job: TaskJob) {
-    let _execution = ExecutionTerminationGuard::enter();
-    let _retirement = QueueRetirement {
-        inner,
-        state: &job.state,
-    };
-    let Some(run) = job.state.claim_run() else {
-        // A cancelled queued frame was already dropped by its canceller. Only
-        // its queue node reaches this path; this worker alone retires accounting.
-        return;
-    };
-    let previous = CURRENT_TASK_ID.with(|current| {
-        let previous = current.get();
-        current.set(job.id);
-        previous
-    });
-    let previous_state =
-        CURRENT_TASK_STATE.with(|current| current.replace(Some(Arc::downgrade(&job.state))));
-    let result =
-        catch_unwind(AssertUnwindSafe(run)).map_err(|_| task_error("panic", "async task panicked"));
-    let panicked = result.is_err();
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => Ok(error),
-    };
-    CURRENT_TASK_STATE.with(|current| {
-        current.replace(previous_state);
-    });
-    CURRENT_TASK_ID.with(|current| current.set(previous));
-    job.state
-        .complete_with_status(job.id, result, panicked.then_some(TASK_PANICKED));
+    local_driver::execute(inner, job);
 }
 
 fn finish_task_job(inner: &TaskRuntimeInner, state: &TaskState) {
@@ -3331,6 +3343,9 @@ mod tests {
             let worker = thread::spawn(move || {
                 worker_start_rx.recv_timeout(timeout).unwrap();
                 if let Some(run) = worker_state.claim_run() {
+                    let TaskStart::Callback(run) = run else {
+                        panic!("this callback race fixture must claim its callback start");
+                    };
                     worker_state.complete(worker_state.id, run());
                 }
                 worker_done_tx.send(()).unwrap();

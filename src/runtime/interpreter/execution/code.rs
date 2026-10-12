@@ -1,4 +1,4 @@
-//! Owned, flat syntax for scalar trees and terminal scalar Result entries.
+//! Owned, flat syntax for scalar trees and static scalar async dependencies.
 //!
 //! AST references exist only in the bounded builder. Arena edges are numeric
 //! IDs, so neither recursive syntax cloning nor recursive arena destruction is
@@ -50,6 +50,7 @@ pub(super) struct CodeFn {
     params: ParamRange,
     pub(super) body: BlockId,
     pub(super) span: SpanId,
+    pub(super) is_async: bool,
 }
 
 impl CodeFn {
@@ -77,6 +78,9 @@ pub(super) enum ScalarLiteral {
 pub(super) enum ExprCode {
     Literal(ScalarLiteral),
     Variable(SymbolId),
+    // Only admitted Task bindings use the evaluator's owning read. Scalar
+    // reads retain their original Copy path; Result locals remain legacy.
+    VariableOwning(SymbolId),
     Unary(UnaryOp, ExprId),
     Binary(ExprId, BinaryOp, ExprId),
     // Only a Result root's direct return can construct this builtin call.
@@ -87,6 +91,12 @@ pub(super) enum ExprCode {
         args: ExprRange,
         callee_span: SpanId,
     },
+    AsyncStart {
+        function: FnId,
+        args: ExprRange,
+    },
+    Await(ExprId),
+    Propagate(ExprId),
 }
 
 #[derive(Clone, Copy)]
@@ -406,6 +416,7 @@ enum FunctionRole {
     Scalar,
     ResultRoot,
     ClaimedAsyncResultRoot,
+    AsyncResultDependency,
 }
 
 #[derive(Clone, Copy)]
@@ -444,10 +455,27 @@ impl<'a> FunctionSpec<'a> {
         spec
     }
 
+    fn dependency(function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        if function.is_async {
+            spec.role = FunctionRole::AsyncResultDependency;
+        }
+        spec
+    }
+
+    fn is_async(self) -> bool {
+        matches!(
+            self.role,
+            FunctionRole::ClaimedAsyncResultRoot | FunctionRole::AsyncResultDependency
+        )
+    }
+
     fn is_result_root(self) -> bool {
         matches!(
             self.role,
-            FunctionRole::ResultRoot | FunctionRole::ClaimedAsyncResultRoot
+            FunctionRole::ResultRoot
+                | FunctionRole::ClaimedAsyncResultRoot
+                | FunctionRole::AsyncResultDependency
         )
     }
 
@@ -460,7 +488,7 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::ResultRoot => {
                 !function.is_async && scalar_result_type(&function.return_type)
             }
-            FunctionRole::ClaimedAsyncResultRoot => {
+            FunctionRole::ClaimedAsyncResultRoot | FunctionRole::AsyncResultDependency => {
                 function.is_async && scalar_result_type(&function.return_type)
             }
         };
@@ -482,6 +510,77 @@ fn scalar_result_type(ty: &Option<TypeName>) -> bool {
         Some(TypeName::Result(inner))
             if matches!(inner.as_ref(), TypeName::Int | TypeName::Float | TypeName::Bool | TypeName::Null)
     )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValueKind {
+    Scalar,
+    Task,
+    Result,
+}
+
+#[derive(Clone, Copy)]
+struct Binding<'a> {
+    name: &'a str,
+    kind: ValueKind,
+}
+
+fn binding_kind(bound: &[Binding<'_>], name: &str) -> Option<ValueKind> {
+    bound
+        .iter()
+        .rev()
+        .find_map(|binding| (binding.name == name).then_some(binding.kind))
+}
+
+// This is a bounded syntax projection, not another type checker. Child
+// expressions are validated by the existing flat visit. Knowing their root
+// kind is enough to keep Task reads on the move path and Result locals out of
+// this slice, without recursively walking or cloning the expression tree.
+fn expression_kind(
+    expr: &Expr,
+    source: &HashMap<String, FnDecl>,
+    local_name: Option<&str>,
+    bound: &[Binding<'_>],
+) -> Admission<ValueKind> {
+    Ok(match &expr.kind {
+        ExprKind::Literal(
+            Literal::Int(_) | Literal::Float(_) | Literal::Bool(_) | Literal::Null,
+        )
+        | ExprKind::Unary { .. }
+        | ExprKind::Binary { .. }
+        | ExprKind::TryUnwrap { .. } => ValueKind::Scalar,
+        ExprKind::Variable(name) => binding_kind(bound, name).unwrap_or(ValueKind::Scalar),
+        ExprKind::Await(_) => ValueKind::Result,
+        ExprKind::Call { callee, .. } => {
+            let ExprKind::Variable(name) = &callee.kind else {
+                return Err(AdmissionError::Unsupported(callee.span));
+            };
+            if local_name == Some(name.as_str()) {
+                ValueKind::Scalar
+            } else if let Some(function) = source.get(name) {
+                if function.is_async {
+                    ValueKind::Task
+                } else if scalar_result_type(&function.return_type) {
+                    ValueKind::Result
+                } else if scalar_type(&function.return_type) {
+                    ValueKind::Scalar
+                } else {
+                    return Err(AdmissionError::Unsupported(expr.span));
+                }
+            } else {
+                return Err(AdmissionError::Unsupported(callee.span));
+            }
+        }
+        _ => return Err(AdmissionError::Unsupported(expr.span)),
+    })
+}
+
+fn expect_kind(actual: ValueKind, expected: ValueKind, span: Span) -> Admission<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(AdmissionError::Unsupported(span))
+    }
 }
 
 fn terminal_ok_argument<'a>(
@@ -510,7 +609,7 @@ enum Visit<'a> {
         bound_base: usize,
     },
     Expr(&'a Expr, ExprId),
-    Bind(&'a str, bool, Span),
+    Bind(&'a str, bool, ValueKind, Span),
 }
 
 struct Builder<'a> {
@@ -519,7 +618,7 @@ struct Builder<'a> {
     arena: CodeArena,
     functions: FrameStack<(FunctionSpec<'a>, FnId)>,
     pending: FrameStack<Visit<'a>>,
-    bound: FrameStack<&'a str>,
+    bound: FrameStack<Binding<'a>>,
     limits: FrameLimits,
     remaining: usize,
 }
@@ -657,7 +756,8 @@ impl<'a> Builder<'a> {
 
     fn ensure_function(&mut self, spec: FunctionSpec<'a>) -> Admission<FnId> {
         // Validate the requested role before a cached root ID can be reused as
-        // a dependency. Result/async roots never become scalar static callees.
+        // a dependency. An async root may be a new AsyncStart dependency, but
+        // Result/async roots never become scalar synchronous callees.
         spec.validate()?;
         for index in 0..self.arena.functions.len() {
             self.spend(spec.name.len().saturating_add(1), spec.span)?;
@@ -675,6 +775,7 @@ impl<'a> Builder<'a> {
             CodeFn {
                 name,
                 span,
+                is_async: spec.is_async(),
                 ..CodeFn::default()
             },
         );
@@ -704,6 +805,7 @@ impl<'a> Builder<'a> {
 
     fn terminal_ok(&mut self, expr: &'a Expr) -> Admission<ExprId> {
         let argument = terminal_ok_argument(expr, self.source, self.is_bound("ok"))?;
+        expect_kind(self.kind(argument)?, ValueKind::Scalar, argument.span)?;
         // This direct lowering replaces the ordinary visit of the ok Call;
         // charge that syntax step without storing a second visit buffer.
         self.spend(1, expr.span)?;
@@ -755,14 +857,23 @@ impl<'a> Builder<'a> {
         Ok(id)
     }
 
-    fn bind(&mut self, name: &'a str, span: Span) -> Admission<()> {
+    fn bind(&mut self, name: &'a str, kind: ValueKind, span: Span) -> Admission<()> {
         reserve_field!(self, bound, 1, span);
-        push(&mut self.bound, name);
+        push(&mut self.bound, Binding { name, kind });
         Ok(())
     }
 
     fn is_bound(&self, name: &str) -> bool {
-        self.bound.as_slice().contains(&name)
+        binding_kind(self.bound.as_slice(), name).is_some()
+    }
+
+    fn kind(&self, expr: &Expr) -> Admission<ValueKind> {
+        expression_kind(
+            expr,
+            self.source,
+            self.local.map(|(name, _)| name),
+            self.bound.as_slice(),
+        )
     }
 
     fn check_free(&self, name: &str, span: Span) -> Admission<()> {
@@ -793,7 +904,7 @@ impl<'a> Builder<'a> {
             self.spend(1, spec.span)?;
             assert_eq!(self.pending.len(), 0);
             assert_eq!(self.bound.len(), 0);
-            self.bind(spec.name, spec.span)?;
+            self.bind(spec.name, ValueKind::Scalar, spec.span)?;
             let start = self.arena.params.len();
             let count = match spec.params {
                 Parameters::Named(params) => params.len(),
@@ -828,7 +939,7 @@ impl<'a> Builder<'a> {
                     name: symbol,
                     span: span_id,
                 };
-                self.bind(name, span)?;
+                self.bind(name, ValueKind::Scalar, span)?;
             }
             let body = self.block(spec.body, 0)?;
             let function = self.arena.functions.get_mut(id.0).expect("function slot");
@@ -836,7 +947,7 @@ impl<'a> Builder<'a> {
             function.body = body;
             while let Some(visit) = self.pending.pop() {
                 self.spend(1, spec.span)?;
-                self.visit(visit, spec.is_result_root())?;
+                self.visit(visit, spec.is_result_root(), spec.is_async())?;
             }
         }
         self.arena.construction_peak_backing_bytes_upper_bound = owner_bytes()
@@ -858,7 +969,7 @@ impl<'a> Builder<'a> {
         Ok(CodeHandle(Arc::new(self.arena)))
     }
 
-    fn visit(&mut self, visit: Visit<'a>, result_root: bool) -> Admission<()> {
+    fn visit(&mut self, visit: Visit<'a>, result_root: bool, async_context: bool) -> Admission<()> {
         match visit {
             Visit::Block {
                 body,
@@ -895,11 +1006,11 @@ impl<'a> Builder<'a> {
                     span: span_id,
                 };
             }
-            Visit::Bind(name, assignment, span) => {
+            Visit::Bind(name, assignment, kind, span) => {
                 if assignment {
                     self.check_free(name, span)?;
                 }
-                self.bind(name, span)?;
+                self.bind(name, kind, span)?;
             }
             Visit::Expr(expr, id) => {
                 let span = self.span(expr.span)?;
@@ -921,13 +1032,36 @@ impl<'a> Builder<'a> {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
                         self.check_free(name, expr.span)?;
-                        ExprCode::Variable(self.symbol(name, expr.span)?)
+                        let symbol = self.symbol(name, expr.span)?;
+                        match self.kind(expr)? {
+                            ValueKind::Scalar => ExprCode::Variable(symbol),
+                            ValueKind::Task => ExprCode::VariableOwning(symbol),
+                            ValueKind::Result => {
+                                return Err(AdmissionError::Unsupported(expr.span));
+                            }
+                        }
                     }
-                    ExprKind::Unary { op, expr } => ExprCode::Unary(*op, self.expression(expr)?),
+                    ExprKind::Unary { op, expr } => {
+                        expect_kind(self.kind(expr)?, ValueKind::Scalar, expr.span)?;
+                        ExprCode::Unary(*op, self.expression(expr)?)
+                    }
                     ExprKind::Binary { left, op, right } => {
+                        expect_kind(self.kind(left)?, ValueKind::Scalar, left.span)?;
+                        expect_kind(self.kind(right)?, ValueKind::Scalar, right.span)?;
                         let right = self.expression(right)?;
                         let left = self.expression(left)?;
                         ExprCode::Binary(left, *op, right)
+                    }
+                    ExprKind::Await(task) => {
+                        if !async_context {
+                            return Err(AdmissionError::Unsupported(expr.span));
+                        }
+                        expect_kind(self.kind(task)?, ValueKind::Task, task.span)?;
+                        ExprCode::Await(self.expression(task)?)
+                    }
+                    ExprKind::TryUnwrap { expr: inner } => {
+                        expect_kind(self.kind(inner)?, ValueKind::Result, inner.span)?;
+                        ExprCode::Propagate(self.expression(inner)?)
                     }
                     ExprKind::Call { callee, args } => {
                         let ExprKind::Variable(name) = &callee.kind else {
@@ -947,8 +1081,11 @@ impl<'a> Builder<'a> {
                                 .source
                                 .get(name)
                                 .ok_or(AdmissionError::Unsupported(callee.span))?;
-                            self.ensure_function(FunctionSpec::named(function))?
+                            self.ensure_function(FunctionSpec::dependency(function))?
                         };
+                        for arg in args {
+                            expect_kind(self.kind(arg)?, ValueKind::Scalar, arg.span)?;
+                        }
                         let range = self.expressions(args.len(), expr.span)?;
                         reserve_field!(self, pending, args.len(), expr.span);
                         for (index, arg) in args.iter().enumerate().rev() {
@@ -957,10 +1094,23 @@ impl<'a> Builder<'a> {
                                 Visit::Expr(arg, range.get(index).expect("argument ID")),
                             );
                         }
-                        ExprCode::Call {
-                            function,
-                            args: range,
-                            callee_span: self.span(callee.span)?,
+                        if self
+                            .arena
+                            .functions
+                            .get(function.0)
+                            .expect("callee slot")
+                            .is_async
+                        {
+                            ExprCode::AsyncStart {
+                                function,
+                                args: range,
+                            }
+                        } else {
+                            ExprCode::Call {
+                                function,
+                                args: range,
+                                callee_span: self.span(callee.span)?,
+                            }
                         }
                     }
                     _ => return Err(AdmissionError::Unsupported(expr.span)),
@@ -992,13 +1142,24 @@ impl<'a> Builder<'a> {
                 if !scalar_type(ty) {
                     return Err(AdmissionError::Unsupported(span));
                 }
+                let kind = self.kind(value)?;
+                if kind == ValueKind::Result {
+                    // Env::get_owning currently clones a scalar-only Result.
+                    // Do not change that legal behavior or add a new implicit
+                    // Owned clone in the continuation slice.
+                    return Err(AdmissionError::Unsupported(span));
+                }
                 reserve_field!(self, pending, 1, span);
-                push(&mut self.pending, Visit::Bind(name, false, span));
+                push(&mut self.pending, Visit::Bind(name, false, kind, span));
                 StmtCode::VarDecl(self.symbol(name, span)?, self.expression(value)?, *mutable)
             }
             Stmt::Assign { name, value, .. } => {
+                let kind = self.kind(value)?;
+                if kind == ValueKind::Result {
+                    return Err(AdmissionError::Unsupported(span));
+                }
                 reserve_field!(self, pending, 1, span);
-                push(&mut self.pending, Visit::Bind(name, true, span));
+                push(&mut self.pending, Visit::Bind(name, true, kind, span));
                 StmtCode::Assign(self.symbol(name, span)?, self.expression(value)?)
             }
             Stmt::If {
@@ -1007,6 +1168,7 @@ impl<'a> Builder<'a> {
                 else_branch,
                 ..
             } => {
+                expect_kind(self.kind(condition)?, ValueKind::Scalar, condition.span)?;
                 let base = self.bound.len();
                 let else_body = self.block(else_branch, base)?;
                 let then_body = self.block(then_branch, base)?;
@@ -1015,6 +1177,7 @@ impl<'a> Builder<'a> {
             Stmt::While {
                 condition, body, ..
             } => {
+                expect_kind(self.kind(condition)?, ValueKind::Scalar, condition.span)?;
                 let body = self.block(body, self.bound.len())?;
                 StmtCode::While(self.expression(condition)?, body)
             }
@@ -1024,12 +1187,16 @@ impl<'a> Builder<'a> {
                 body,
                 ..
             } => {
+                expect_kind(self.kind(iterable)?, ValueKind::Scalar, iterable.span)?;
                 // The iterator exists only in the body, never the iterable.
                 // Bind is deferred until that iterable has been inspected.
                 let base = self.bound.len();
                 let body = self.block(body, base)?;
                 reserve_field!(self, pending, 1, span);
-                push(&mut self.pending, Visit::Bind(name, false, span));
+                push(
+                    &mut self.pending,
+                    Visit::Bind(name, false, ValueKind::Scalar, span),
+                );
                 StmtCode::For(self.symbol(name, span)?, self.expression(iterable)?, body)
             }
             Stmt::Break { .. } => StmtCode::Break,
@@ -1053,6 +1220,9 @@ impl<'a> Builder<'a> {
                     let value = value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
                     Some(self.terminal_ok(value)?)
                 } else {
+                    if let Some(value) = value {
+                        expect_kind(self.kind(value)?, ValueKind::Scalar, value.span)?;
+                    }
                     value
                         .as_ref()
                         .map(|value| self.expression(value))
@@ -1073,7 +1243,7 @@ enum Scan<'a> {
         base: usize,
     },
     Expr(&'a Expr),
-    Bind(&'a str, bool, Span),
+    Bind(&'a str, bool, ValueKind, Span),
 }
 
 struct Eligibility<'a> {
@@ -1082,7 +1252,7 @@ struct Eligibility<'a> {
     functions: FrameStack<FunctionSpec<'a>>,
     checked: FrameStack<&'a str>,
     pending: FrameStack<Scan<'a>>,
-    bound: FrameStack<&'a str>,
+    bound: FrameStack<Binding<'a>>,
     limits: FrameLimits,
     remaining: usize,
 }
@@ -1122,12 +1292,20 @@ impl<'a> Eligibility<'a> {
         Ok(())
     }
     fn bound(&self, name: &str) -> bool {
-        self.bound.as_slice().contains(&name)
+        binding_kind(self.bound.as_slice(), name).is_some()
     }
-    fn bind(&mut self, name: &'a str, span: Span) -> Admission<()> {
+    fn bind(&mut self, name: &'a str, kind: ValueKind, span: Span) -> Admission<()> {
         reserve_field!(self, bound, 1, span);
-        push(&mut self.bound, name);
+        push(&mut self.bound, Binding { name, kind });
         Ok(())
+    }
+    fn kind(&self, expr: &Expr) -> Admission<ValueKind> {
+        expression_kind(
+            expr,
+            self.source,
+            self.local.map(|(name, _)| name),
+            self.bound.as_slice(),
+        )
     }
     fn free(&self, name: &str, span: Span) -> Admission<()> {
         if let Some((_, captures)) = self.local {
@@ -1176,7 +1354,7 @@ impl<'a> Eligibility<'a> {
         while let Some(spec) = self.functions.pop() {
             self.spend(1, spec.span)?;
             assert_eq!(self.bound.len(), 0);
-            self.bind(spec.name, spec.span)?;
+            self.bind(spec.name, ValueKind::Scalar, spec.span)?;
             let count = match spec.params {
                 Parameters::Named(params) => params.len(),
                 Parameters::Local(params) => params.len(),
@@ -1190,7 +1368,7 @@ impl<'a> Eligibility<'a> {
                 if self.local.is_some() && (name == spec.name || self.bound(name)) {
                     return Err(AdmissionError::Unsupported(spec.span));
                 }
-                self.bind(name, spec.span)?;
+                self.bind(name, ValueKind::Scalar, spec.span)?;
             }
             self.block(spec.body, 0)?;
             while let Some(scan) = self.pending.pop() {
@@ -1224,13 +1402,21 @@ impl<'a> Eligibility<'a> {
                                 if !scalar_type(ty) {
                                     return Err(AdmissionError::Unsupported(span));
                                 }
+                                let kind = self.kind(value)?;
+                                if kind == ValueKind::Result {
+                                    return Err(AdmissionError::Unsupported(span));
+                                }
                                 reserve_field!(self, pending, 1, span);
-                                push(&mut self.pending, Scan::Bind(name, false, span));
+                                push(&mut self.pending, Scan::Bind(name, false, kind, span));
                                 self.expression(value)?;
                             }
                             Stmt::Assign { name, value, .. } => {
+                                let kind = self.kind(value)?;
+                                if kind == ValueKind::Result {
+                                    return Err(AdmissionError::Unsupported(span));
+                                }
                                 reserve_field!(self, pending, 1, span);
-                                push(&mut self.pending, Scan::Bind(name, true, span));
+                                push(&mut self.pending, Scan::Bind(name, true, kind, span));
                                 self.expression(value)?;
                             }
                             Stmt::Return { value, .. } => {
@@ -1239,9 +1425,15 @@ impl<'a> Eligibility<'a> {
                                         value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
                                     let argument =
                                         terminal_ok_argument(value, self.source, self.bound("ok"))?;
+                                    expect_kind(
+                                        self.kind(argument)?,
+                                        ValueKind::Scalar,
+                                        argument.span,
+                                    )?;
                                     self.spend(1, value.span)?;
                                     self.expression(argument)?;
                                 } else if let Some(value) = value {
+                                    expect_kind(self.kind(value)?, ValueKind::Scalar, value.span)?;
                                     self.expression(value)?;
                                 }
                             }
@@ -1252,6 +1444,11 @@ impl<'a> Eligibility<'a> {
                                 else_branch,
                                 ..
                             } => {
+                                expect_kind(
+                                    self.kind(condition)?,
+                                    ValueKind::Scalar,
+                                    condition.span,
+                                )?;
                                 let base = self.bound.len();
                                 self.block(else_branch, base)?;
                                 self.block(then_branch, base)?;
@@ -1260,6 +1457,11 @@ impl<'a> Eligibility<'a> {
                             Stmt::While {
                                 condition, body, ..
                             } => {
+                                expect_kind(
+                                    self.kind(condition)?,
+                                    ValueKind::Scalar,
+                                    condition.span,
+                                )?;
                                 self.block(body, self.bound.len())?;
                                 self.expression(condition)?;
                             }
@@ -1269,9 +1471,17 @@ impl<'a> Eligibility<'a> {
                                 body,
                                 ..
                             } => {
+                                expect_kind(
+                                    self.kind(iterable)?,
+                                    ValueKind::Scalar,
+                                    iterable.span,
+                                )?;
                                 self.block(body, self.bound.len())?;
                                 reserve_field!(self, pending, 1, span);
-                                push(&mut self.pending, Scan::Bind(name, false, span));
+                                push(
+                                    &mut self.pending,
+                                    Scan::Bind(name, false, ValueKind::Scalar, span),
+                                );
                                 self.expression(iterable)?;
                             }
                             Stmt::Break { .. } | Stmt::Continue { .. } => {}
@@ -1292,11 +1502,11 @@ impl<'a> Eligibility<'a> {
                             _ => return Err(AdmissionError::Unsupported(span)),
                         }
                     }
-                    Scan::Bind(name, assignment, span) => {
+                    Scan::Bind(name, assignment, kind, span) => {
                         if assignment {
                             self.free(name, span)?;
                         }
-                        self.bind(name, span)?;
+                        self.bind(name, kind, span)?;
                     }
                     Scan::Expr(expr) => match &expr.kind {
                         ExprKind::Literal(
@@ -1309,11 +1519,30 @@ impl<'a> Eligibility<'a> {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
                             self.free(name, expr.span)?;
+                            if self.kind(expr)? == ValueKind::Result {
+                                return Err(AdmissionError::Unsupported(expr.span));
+                            }
                         }
-                        ExprKind::Unary { expr, .. } => self.expression(expr)?,
+                        ExprKind::Unary { expr, .. } => {
+                            expect_kind(self.kind(expr)?, ValueKind::Scalar, expr.span)?;
+                            self.expression(expr)?;
+                        }
                         ExprKind::Binary { left, right, .. } => {
+                            expect_kind(self.kind(left)?, ValueKind::Scalar, left.span)?;
+                            expect_kind(self.kind(right)?, ValueKind::Scalar, right.span)?;
                             self.expression(right)?;
                             self.expression(left)?;
+                        }
+                        ExprKind::Await(task) => {
+                            if !spec.is_async() {
+                                return Err(AdmissionError::Unsupported(expr.span));
+                            }
+                            expect_kind(self.kind(task)?, ValueKind::Task, task.span)?;
+                            self.expression(task)?;
+                        }
+                        ExprKind::TryUnwrap { expr: inner } => {
+                            expect_kind(self.kind(inner)?, ValueKind::Result, inner.span)?;
+                            self.expression(inner)?;
                         }
                         ExprKind::Call { callee, args } => {
                             let ExprKind::Variable(name) = &callee.kind else {
@@ -1328,7 +1557,10 @@ impl<'a> Eligibility<'a> {
                                     .source
                                     .get(name)
                                     .ok_or(AdmissionError::Unsupported(callee.span))?;
-                                self.function(FunctionSpec::named(function))?;
+                                self.function(FunctionSpec::dependency(function))?;
+                            }
+                            for arg in args {
+                                expect_kind(self.kind(arg)?, ValueKind::Scalar, arg.span)?;
                             }
                             reserve_field!(self, pending, args.len(), expr.span);
                             for arg in args.iter().rev() {

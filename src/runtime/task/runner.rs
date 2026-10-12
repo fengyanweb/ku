@@ -4,23 +4,15 @@
 //! Submission, helper depth, cancellation, completion and queue retirement
 //! retain their existing production arbitration and panic boundaries.
 
-use super::{KuResult, Value};
+use super::{AwaitTicket, KuResult, Value};
 use std::{marker::PhantomData, num::NonZeroUsize, ops::ControlFlow, rc::Rc};
 
 pub(crate) trait LocalTaskRunner {
     fn dispatch(&mut self, budget: NonZeroUsize) -> ControlFlow<KuResult<Value>>;
-}
 
-pub(super) fn drive_local(mut runner: impl LocalTaskRunner) -> KuResult<Value> {
-    let budget = NonZeroUsize::new(256).expect("positive internal dispatch chunk budget");
-    loop {
-        match runner.dispatch(budget) {
-            ControlFlow::Continue(()) => {}
-            ControlFlow::Break(result) => return result,
-        }
+    fn waiting(&mut self) -> Option<&mut AwaitTicket> {
+        None
     }
-    // The local runner drops before returning to execute_task_job's original
-    // callback catch, while its Task identity and execution context are live.
 }
 
 pub(crate) struct OnceTaskRunner<F> {
