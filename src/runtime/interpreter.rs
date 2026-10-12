@@ -302,7 +302,7 @@ impl Interpreter {
     fn call_function_flow(
         &mut self,
         name: &str,
-        args: Vec<Value>,
+        mut args: Vec<Value>,
         span: Span,
         depth: usize,
     ) -> KuResult<Flow> {
@@ -325,6 +325,11 @@ impl Interpreter {
             return self
                 .spawn_async_function(function.clone(), args, span)
                 .map(Flow::returned);
+        }
+        if let Some(result) = execution::try_execute_owned(self, function, &mut args, depth) {
+            // Unsupported selection leaves the original argument Vec intact.
+            // A selected owner or rejection returns directly without replay.
+            return result;
         }
         if let Some(result) = execution::try_execute(self, function, &args, depth) {
             // The driver has completed the real scope/call epilogues and kept

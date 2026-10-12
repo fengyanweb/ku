@@ -2,6 +2,7 @@ use super::*;
 
 mod chunk;
 mod code_handle;
+mod owned_string;
 mod windows;
 
 const RECURSION: &str = r#"

@@ -91,12 +91,14 @@ struct Metrics {
     retired_call_exits: usize,
     entered_arguments_exits: usize,
     retired_arguments_exits: usize,
+    retained_string_payload_bytes: usize,
+    peak_string_payload_bytes: usize,
     logical_depth: usize,
     // Source execution frame Vec backing only: calls/work/finally/values and
-    // staged arguments. This is a frame budget, not a complete memory budget;
-    // it excludes preflight syntax storage, source, Env/string keys, allocator
-    // overhead and Value/Error payloads. Summed peaks are not a simultaneous RSS
-    // sample.
+    // staged arguments, plus the selected input String buffers below. Other
+    // Value/Error payloads remain outside this budget, as do syntax storage,
+    // source, Env/string keys and allocator overhead. Summed peaks are not a
+    // simultaneous RSS sample.
     retained_backing_bytes: usize,
     peak_backing_bytes_upper_bound: usize,
     // Code backing has its separate original syntax budget. The construction
@@ -590,6 +592,9 @@ struct Machine {
     // The suspended expression owns its sole target before outer call/argument
     // resources. No synchronous TLS guard lives in this checkpoint.
     awaiting: Option<AwaitFrame>,
+    // The selected owned entry retains the actual incoming Vec and every
+    // not-yet-bound value. It never reconstructs an Owned argument on failure.
+    entry_args: Option<Vec<Value>>,
     exits: FrameStack<PendingScopeExit>,
     resources: Option<MachineResources>,
     finally: FinallyFrames,
@@ -619,6 +624,10 @@ struct Machine {
     exit_handle_capacity: usize,
     exit_handle_bytes: usize,
     peak_exit_handle_bytes: usize,
+    // This slice cannot create a String: every buffer comes from the input,
+    // moves between slots and is conservatively charged until final transfer.
+    string_payload_bytes: usize,
+    peak_string_payload_bytes: usize,
 }
 
 struct PendingScopeExit {
@@ -668,7 +677,9 @@ fn outgoing_needs_cleanup(result: &KuResult<Flow>) -> bool {
     };
     loop {
         match value {
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => return false,
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) | Value::Null => {
+                return false
+            }
             Value::Result { value: inner, .. } => value = inner,
             // The admitted async outcome is a plain Task. Other Owned values
             // retain real cleanup if a private hook exposes a legacy outcome.
@@ -714,6 +725,17 @@ fn scalar(value: &Value, span: Span) -> KuResult<Value> {
         Value::Bool(value) => Ok(Value::Bool(*value)),
         Value::Null => Ok(Value::Null),
         _ => Err(unsupported(span)),
+    }
+}
+
+fn owned_parameter_value(param: code::CodeParam, value: &mut Value, span: Span) -> KuResult<Value> {
+    if param.owned_string {
+        if !matches!(value, Value::String(_)) {
+            return Err(unsupported(span));
+        }
+        Ok(std::mem::replace(value, Value::Null))
+    } else {
+        scalar(value, span)
     }
 }
 
@@ -765,6 +787,7 @@ impl Machine {
         };
         Self {
             awaiting: None,
+            entry_args: None,
             exits: FrameStack::new(limits.work),
             resources: Some(MachineResources {
                 code,
@@ -799,6 +822,8 @@ impl Machine {
             exit_handle_capacity: 0,
             exit_handle_bytes: 0,
             peak_exit_handle_bytes: 0,
+            string_payload_bytes: 0,
+            peak_string_payload_bytes: 0,
         }
     }
 
@@ -983,6 +1008,7 @@ impl Machine {
             .max_storage_bytes
             .checked_sub(self.argument_bytes)
             .and_then(|bytes| bytes.checked_sub(self.exit_handle_bytes))
+            .and_then(|bytes| bytes.checked_sub(self.string_payload_bytes))
             .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
         self.values
             .reserve_with_budget(additional, frames, bytes)
@@ -1028,6 +1054,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
             .and_then(|bytes| bytes.checked_add(self.exit_handle_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
+            .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if bytes > self.value_limits.max_storage_bytes {
             return Err(storage_error(ReserveError::StorageLimit, span));
@@ -1056,6 +1083,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.exit_handle_bytes))
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
+            .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if bytes > self.value_limits.max_storage_bytes {
             return Err(storage_error(ReserveError::StorageLimit, span));
@@ -1127,7 +1155,11 @@ impl Machine {
         let mut count = 0usize;
         for value in &arguments.staged {
             match value {
-                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => {}
+                Value::Int(_)
+                | Value::Float(_)
+                | Value::Bool(_)
+                | Value::String(_)
+                | Value::Null => {}
                 Value::Task(_) => {
                     count = count
                         .checked_add(1)
@@ -1506,7 +1538,11 @@ impl Machine {
                     || arguments.staged.iter().any(|value| {
                         !matches!(
                             value,
-                            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null,
+                            Value::Int(_)
+                                | Value::Float(_)
+                                | Value::Bool(_)
+                                | Value::String(_)
+                                | Value::Null,
                         )
                     });
                 let host = hooks.host();
@@ -1814,20 +1850,21 @@ impl Machine {
     }
 
     fn discard_values_after(&mut self, base: usize) {
-        // Only scalar operands enter this slice. Future Owned migration must
-        // add its resource teardown rather than relying on this scalar pop.
+        // Admitted primitive and input-derived String operands have no Task
+        // owners or recursive payloads. General Owned still needs its real
+        // resource teardown rather than being widened into this leaf pop.
         while self.values.len() > base {
             self.values.pop();
         }
     }
 
-    fn enter(
+    fn prepare_call_entry(
         &mut self,
         function_id: FnId,
-        args: &[Value],
+        argument_count: usize,
         depth: usize,
         span_id: SpanId,
-    ) -> KuResult<()> {
+    ) -> KuResult<code::CodeFn> {
         let function = self.code.function(function_id);
         let span = self.code.span(span_id);
         if depth >= MAX_CALL_DEPTH || self.call_depth >= MAX_CALL_DEPTH {
@@ -1839,13 +1876,13 @@ impl Machine {
                 span,
             ));
         }
-        if args.len() != function.arity() {
+        if argument_count != function.arity() {
             return Err(KuError::runtime(
                 format!(
                     "function '{}' expects {} arguments but got {}",
                     self.code.symbol(function.name),
                     function.arity(),
-                    args.len()
+                    argument_count
                 ),
                 self.code.span(function.span),
             ));
@@ -1890,6 +1927,18 @@ impl Machine {
         self.metrics.entered_calls += 1;
         self.metrics.peak_calls = self.metrics.peak_calls.max(self.calls.len());
         push(&mut self.work, Work::CallExit);
+        Ok(function)
+    }
+
+    fn enter(
+        &mut self,
+        function_id: FnId,
+        args: &[Value],
+        depth: usize,
+        span_id: SpanId,
+    ) -> KuResult<()> {
+        let function = self.prepare_call_entry(function_id, args.len(), depth, span_id)?;
+        let span = self.code.span(span_id);
         for (index, value) in args.iter().enumerate() {
             let param = self.code.parameter(function, index);
             let name = self.code.symbol(param.name).to_string();
@@ -1905,6 +1954,59 @@ impl Machine {
                 .env
                 .define_parameter(name, value, false, param_span)?;
         }
+        self.enter_body(function);
+        Ok(())
+    }
+
+    fn enter_owned(
+        &mut self,
+        function_id: FnId,
+        args: &mut [Value],
+        depth: usize,
+        span_id: SpanId,
+    ) -> KuResult<()> {
+        let function = self.prepare_call_entry(function_id, args.len(), depth, span_id)?;
+        let span = self.code.span(span_id);
+        for (index, value) in args.iter_mut().enumerate() {
+            let param = self.code.parameter(function, index);
+            let name = self.code.symbol(param.name).to_string();
+            let value = owned_parameter_value(param, value, span)?;
+            let param_span = self.code.span(param.span);
+            self.frame()
+                .env
+                .define_parameter(name, value, false, param_span)?;
+        }
+        self.enter_body(function);
+        Ok(())
+    }
+
+    fn enter_owned_entry(
+        &mut self,
+        function_id: FnId,
+        depth: usize,
+        span_id: SpanId,
+    ) -> KuResult<()> {
+        let count = self.entry_args.as_ref().expect("owned entry input").len();
+        let function = self.prepare_call_entry(function_id, count, depth, span_id)?;
+        let span = self.code.span(span_id);
+        for index in 0..count {
+            let param = self.code.parameter(function, index);
+            let name = self.code.symbol(param.name).to_string();
+            let value = owned_parameter_value(
+                param,
+                &mut self.entry_args.as_mut().expect("live owned entry input")[index],
+                span,
+            )?;
+            let param_span = self.code.span(param.span);
+            self.frame()
+                .env
+                .define_parameter(name, value, false, param_span)?;
+        }
+        self.enter_body(function);
+        Ok(())
+    }
+
+    fn enter_body(&mut self, function: code::CodeFn) {
         let body_span = self.code.block_span(function.body);
         let value_base = self.values.len();
         push(
@@ -1923,7 +2025,6 @@ impl Machine {
                 next: 0,
             },
         );
-        Ok(())
     }
 
     fn enter_loop_iteration(&mut self, state: LoopState) -> KuResult<()> {
@@ -2153,6 +2254,12 @@ impl Machine {
                     ExprCode::VariableOwning(name) => {
                         self.reserve_values(1, span)?;
                         let value = self.frame_owned_value(name, span)?;
+                        self.emit(value, span)?;
+                    }
+                    ExprCode::VariableStringOwning(name) => {
+                        self.reserve_values(1, span)?;
+                        let symbol = self.code.symbol(name).to_string();
+                        let value = self.frame().env.take_owned_string(&symbol, span)?;
                         self.emit(value, span)?;
                     }
                     ExprCode::Await(operand) => {
@@ -2546,7 +2653,7 @@ impl Machine {
                     else {
                         unreachable!("argument exit marker");
                     };
-                    let staged = std::mem::take(&mut arguments.staged);
+                    let mut staged = std::mem::take(&mut arguments.staged);
                     if !matches!(dispatch, ArgumentDispatch::Synchronous) {
                         let capacity = staged.capacity();
                         let result = self.start_async(
@@ -2563,7 +2670,7 @@ impl Machine {
                         self.release_argument_capacity(capacity);
                         result?;
                     } else {
-                        let result = self.enter(function, &staged, depth, span);
+                        let result = self.enter_owned(function, &mut staged, depth, span);
                         let Work::ArgumentsExit(arguments) = self
                             .work
                             .get_mut(exit_index)
@@ -2779,6 +2886,31 @@ impl Machine {
         }
     }
 
+    fn run_owned_with_hooks(
+        &mut self,
+        entry: &str,
+        args: &mut Vec<Value>,
+        depth: usize,
+        test_fuel: bool,
+        hooks: &mut impl ExecutionHooks,
+    ) -> KuResult<Flow> {
+        if self.state == MachineState::Finished {
+            self.prepare_next_run()?;
+        }
+        self.start_owned_once(entry, args, depth, test_fuel)?;
+        let budget = NonZeroUsize::new(256).expect("positive internal dispatch chunk budget");
+        loop {
+            match self.dispatch_chunk(budget, hooks)? {
+                ChunkProgress::More { popped } => debug_assert_eq!(popped, budget.get()),
+                ChunkProgress::Waiting { .. } => self.wait_synchronously(hooks.host()),
+                ChunkProgress::Finished { popped, result } => {
+                    debug_assert!(popped <= budget.get());
+                    return result;
+                }
+            }
+        }
+    }
+
     fn wait_synchronously(&mut self, host: &Interpreter) {
         // The legacy synchronous adapter cannot hand its Rust caller a pause.
         // It uses the same ticket, preserving its old bounded helper behavior.
@@ -2842,6 +2974,8 @@ impl Machine {
             || self.argument_bytes != 0
             || self.exit_handle_capacity != 0
             || self.exit_handle_bytes != 0
+            || self.entry_args.is_some()
+            || self.string_payload_bytes != 0
             || self.call_depth != self.initial_depth
         {
             return Err(self.lifecycle_error("prepare undrained next run"));
@@ -2850,6 +2984,82 @@ impl Machine {
         self.fallback_release.set(None);
         self.fallback_metadata = None;
         Ok(())
+    }
+
+    fn start_owned_once(
+        &mut self,
+        entry: &str,
+        args: &mut Vec<Value>,
+        depth: usize,
+        test_fuel: bool,
+    ) -> KuResult<()> {
+        if self.state != MachineState::Ready {
+            return Err(self.lifecycle_error("start owned"));
+        }
+        #[cfg(not(test))]
+        let _ = test_fuel;
+        let function = self.code.find_function(entry);
+        let span_id = function.map(|id| self.code.function(id).span);
+        let span = span_id.map(|id| self.code.span(id)).unwrap_or_default();
+        self.entry_span = span;
+        self.state = MachineState::Running;
+        #[cfg(test)]
+        {
+            self.test_fuel = test_fuel;
+        }
+        let admission = (|| {
+            let function = function
+                .ok_or_else(|| KuError::runtime(format!("undefined function '{entry}'"), span))?;
+            let mut payload = 0usize;
+            for value in args.iter() {
+                match value {
+                    Value::String(text) => {
+                        payload = payload
+                            .checked_add(text.capacity())
+                            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?
+                    }
+                    Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => {}
+                    _ => return Err(unsupported(span)),
+                }
+            }
+            // Include the original input Vec's actual capacity and all String
+            // buffer capacity before transferring either into the Machine.
+            self.string_payload_bytes = payload;
+            if let Err(error) = self.check_argument_capacity(args.capacity(), span) {
+                self.string_payload_bytes = 0;
+                return Err(error);
+            }
+            let capacity = args.capacity();
+            self.argument_capacity += capacity;
+            self.argument_bytes += capacity * std::mem::size_of::<Value>();
+            self.peak_argument_bytes = self.peak_argument_bytes.max(self.argument_bytes);
+            self.peak_string_payload_bytes = self.peak_string_payload_bytes.max(payload);
+            self.entry_args = Some(std::mem::take(args));
+            let count = self
+                .entry_args
+                .as_ref()
+                .expect("admitted original input")
+                .len();
+            self.reserve_values(count, span)?;
+            let entered =
+                self.enter_owned_entry(function, depth, span_id.expect("owned entry span"));
+            // The remaining input precedes a partially initialized callee's
+            // epilogue on failure, just as the original parameter iterator.
+            self.release_entry_args();
+            entered
+        })();
+        if let Err(error) = admission {
+            self.release_entry_args();
+            self.pending = Some(Err(error));
+        }
+        Ok(())
+    }
+
+    fn release_entry_args(&mut self) {
+        let args = self.entry_args.take();
+        let capacity = args.as_ref().map_or(0, Vec::capacity);
+        drop(args);
+        self.release_argument_capacity(capacity);
     }
 
     fn start_once(
@@ -3074,6 +3284,7 @@ impl Machine {
         assert_eq!(self.values.len(), 0);
         assert_eq!(self.argument_capacity, 0);
         assert_eq!(self.argument_bytes, 0);
+        assert!(self.entry_args.is_none());
         assert_eq!(self.exits.len(), 0);
         assert_eq!(self.exit_handle_capacity, 0);
         assert_eq!(self.exit_handle_bytes, 0);
@@ -3098,7 +3309,8 @@ impl Machine {
             + self.finally.frames.peak_storage_bytes()
             + self.exits.peak_storage_bytes()
             + self.peak_argument_bytes
-            + self.peak_exit_handle_bytes;
+            + self.peak_exit_handle_bytes
+            + self.peak_string_payload_bytes;
         // A completed run keeps the same immutable code owner. Code is shared
         // by every call, so its retained backing cannot grow with call depth.
         assert_eq!(
@@ -3112,6 +3324,11 @@ impl Machine {
                     .code_construction_peak_backing_bytes_upper_bound
         );
         let result = self.pending.take().expect("root call or admission outcome");
+        // Input-derived buffers have either been destroyed or moved into this
+        // sole outgoing Flow. They are no longer retained by the Machine.
+        self.string_payload_bytes = 0;
+        self.metrics.retained_string_payload_bytes = 0;
+        self.metrics.peak_string_payload_bytes = self.peak_string_payload_bytes;
         self.state = MachineState::Finished;
         result
     }
@@ -3140,6 +3357,49 @@ fn execute(
     };
     let result = machine.run(entry, args, depth);
     (result, std::mem::take(&mut machine.metrics))
+}
+
+pub(super) fn try_execute_owned(
+    interpreter: &mut Interpreter,
+    function: &FnDecl,
+    args: &mut Vec<Value>,
+    depth: usize,
+) -> Option<KuResult<Flow>> {
+    if !args.iter().any(|value| matches!(value, Value::String(_))) {
+        return None;
+    }
+    if args.iter().zip(&function.params).any(|(value, param)| {
+        if matches!(param.ty, Some(TypeName::String)) {
+            !matches!(value, Value::String(_))
+        } else {
+            scalar(value, function.span).is_err()
+        }
+    }) {
+        return None;
+    }
+    let source = interpreter.functions.clone();
+    let limits = Limits::default();
+    if !code::eligible_owned_named(&source, function, limits) {
+        return None;
+    }
+    if function.params.len() != args.len() {
+        return Some(Err(KuError::runtime(
+            format!(
+                "function '{}' expects {} arguments but got {}",
+                function.name,
+                function.params.len(),
+                args.len()
+            ),
+            function.span,
+        )));
+    }
+    let code = match CodeHandle::compile_owned_named(&source, function, limits) {
+        Ok(code) => code,
+        Err(AdmissionError::Unsupported(_)) => return None,
+        Err(error @ AdmissionError::Rejected(_)) => return Some(Err(error.into_error())),
+    };
+    let mut machine = Machine::from_code(code, limits, interpreter.call_depth);
+    Some(machine.run_owned_with_hooks(&function.name, args, depth, false, interpreter))
 }
 
 pub(super) fn try_execute(
@@ -3766,6 +4026,14 @@ impl Drop for Machine {
         let awaiting = self.awaiting.take();
         let await_drop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(awaiting)));
         let mut first = await_drop.err();
+        // A selected entry can stop while some original parameters remain
+        // unbound. Retire that real iterator buffer before its partial callee.
+        let entry_drop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.release_entry_args();
+        }));
+        if let Err(panic) = entry_drop {
+            retain_first_panic(&mut first, panic);
+        }
         // Empty the actual header in place before destroying its saved Cell.
         // A destructor's tighter D therefore reaches the following real Env
         // prefix even when the header phase itself panicked or was abandoned.

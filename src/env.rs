@@ -68,10 +68,10 @@ fn collect_binding_owned_tasks(
 
 fn simple_scope_task_count(value: &Value, span: Span) -> KuResult<usize> {
     match value {
-        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => Ok(0),
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) | Value::Null => Ok(0),
         Value::Task(_) => Ok(1),
         _ => Err(KuError::runtime(
-            "internal execution simple scope task collection requires a scalar or plain Task",
+            "internal execution simple scope task collection requires a scalar, String or plain Task",
             span,
         )),
     }
@@ -83,14 +83,14 @@ fn simple_scope_task_proxy(
     span: Span,
 ) -> KuResult<Option<TaskHandle>> {
     match value {
-        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => Ok(None),
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) | Value::Null => Ok(None),
         Value::Task(task) if available => Ok(Some(task.clone())),
         Value::Task(_) => Err(KuError::runtime(
             "internal execution storage rejected: reserved scope task capacity exhausted",
             span,
         )),
         _ => Err(KuError::runtime(
-            "internal execution simple scope task collection requires a scalar or plain Task",
+            "internal execution simple scope task collection requires a scalar, String or plain Task",
             span,
         )),
     }
@@ -525,6 +525,47 @@ impl Env {
         ))
     }
 
+    /// Selected flat execution uses this only at a statically consuming String
+    /// position. Keep ordinary snapshot reads unchanged; transfer the actual
+    /// buffer and leave a moved-from slot without cloning an Owned payload.
+    pub(crate) fn take_owned_string(&self, name: &str, span: Span) -> KuResult<Value> {
+        for scope in self.scopes.iter().rev() {
+            let Some(cell) = scope.bindings.get(name) else {
+                continue;
+            };
+            let mut binding = cell
+                .lock()
+                .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+            if binding.match_probe {
+                return Err(KuError::runtime(
+                    format!("cannot consume tentative String binding '{name}' in a match guard"),
+                    span,
+                ));
+            }
+            if !scope.owned_bindings.contains(name)
+                || binding.borrowed_parameter
+                || binding.owner_task_id != crate::runtime::task::current_task_id()
+                || matches!(binding.value, Value::Borrowed(_))
+            {
+                return Err(KuError::runtime(
+                    format!("cannot move String from captured or borrowed variable '{name}'"),
+                    span,
+                ));
+            }
+            if !matches!(binding.value, Value::String(_)) {
+                return Err(KuError::runtime(
+                    format!("internal execution expected an owned String in '{name}'"),
+                    span,
+                ));
+            }
+            return Ok(std::mem::replace(&mut binding.value, Value::Null));
+        }
+        Err(KuError::runtime(
+            format!("undefined variable '{name}'"),
+            span,
+        ))
+    }
+
     fn check_task_move(binding: &Binding, owned: bool, name: &str, span: Span) -> KuResult<()> {
         if binding.match_probe {
             return Err(KuError::runtime(
@@ -797,6 +838,72 @@ impl Env {
 impl Default for Env {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod owned_string_tests {
+    use super::*;
+
+    #[test]
+    fn consuming_string_read_transfers_the_buffer_and_leaves_null() {
+        let span = Span::default();
+        let mut text = String::with_capacity(1024);
+        text.push_str("kept\0payload");
+        let pointer = text.as_ptr();
+        let capacity = text.capacity();
+        let mut env = Env::new();
+        env.define_owned("text".into(), Value::String(text), false, span)
+            .unwrap();
+        assert_eq!(env.current_scope_simple_task_count(span).unwrap(), 0);
+        let mut handles = Vec::new();
+        env.collect_current_scope_simple_tasks_reserved(&mut handles, span)
+            .unwrap();
+        assert!(handles.is_empty() && handles.capacity() == 0);
+        let Value::String(text) = env.take_owned_string("text", span).unwrap() else {
+            panic!("actual owner must transfer");
+        };
+        assert_eq!(text.as_ptr(), pointer);
+        assert_eq!(text.capacity(), capacity);
+        assert_eq!(text, "kept\0payload");
+        assert!(env
+            .with_value("text", span, |value| Ok(matches!(value, Value::Null)))
+            .unwrap());
+        assert!(env.take_owned_string("text", span).is_err());
+    }
+
+    #[test]
+    fn consuming_string_read_preserves_captured_borrowed_foreign_and_probe_sources() {
+        let span = Span::default();
+        let mut env = Env::new();
+        env.define_owned("text".into(), Value::String("kept".into()), true, span)
+            .unwrap();
+        let pointer = env
+            .with_value("text", span, |value| match value {
+                Value::String(text) => Ok(text.as_ptr()),
+                _ => unreachable!(),
+            })
+            .unwrap();
+        let captured = env.clone();
+        assert!(captured.take_owned_string("text", span).is_err());
+        drop(captured);
+        let (view, lease) = env.borrow("text", span).unwrap();
+        assert!(env.take_owned_string("text", span).is_err());
+        drop(view);
+        drop(lease);
+        let cell = env.find_cell("text").unwrap();
+        let owner = crate::runtime::task::current_task_id();
+        cell.lock().unwrap().owner_task_id = owner.wrapping_add(1);
+        assert!(env.take_owned_string("text", span).is_err());
+        cell.lock().unwrap().owner_task_id = owner;
+        cell.lock().unwrap().match_probe = true;
+        assert!(env.take_owned_string("text", span).is_err());
+        cell.lock().unwrap().match_probe = false;
+        let Value::String(text) = env.take_owned_string("text", span).unwrap() else {
+            panic!("all rejected attempts must preserve the original source");
+        };
+        assert_eq!(text.as_ptr(), pointer);
+        assert_eq!(text, "kept");
     }
 }
 
