@@ -18,6 +18,10 @@ use crate::{
     value::Value,
 };
 
+mod await_ticket;
+pub(crate) use await_ticket::AwaitTicket;
+#[cfg(test)]
+mod await_ticket_tests;
 mod cancel_batch;
 mod cancellation;
 pub(crate) use cancel_batch::{CancelBatchPoll, TaskCancelBatch};
@@ -74,13 +78,13 @@ impl Drop for AwaitHelpDepthGuard {
     }
 }
 
-struct TaskWaitGuard<'a> {
-    runtime: &'a TaskRuntime,
+struct TaskWaitGuard {
+    runtime: TaskRuntime,
     current: i64,
     state: Option<Arc<TaskState>>,
 }
 
-impl Drop for TaskWaitGuard<'_> {
+impl Drop for TaskWaitGuard {
     fn drop(&mut self) {
         if self.current != 0 {
             self.runtime.clear_wait(self.current);
@@ -966,107 +970,29 @@ impl TaskRuntime {
     }
 
     pub fn await_task(&self, handle: &TaskHandle) -> KuResult<Value> {
-        ensure_task_operations_allowed(Span::default())?;
-        if !handle.state.claim_await() {
-            return Ok(task_error(
-                "already_awaited",
-                format!("task {} has already been awaited", handle.id),
-            ));
-        }
-        self.await_task_until(handle, None, true)
+        await_ticket::await_borrowed(self.clone(), handle, await_ticket::AwaitMode::Ordinary)
     }
 
     pub fn await_task_timeout(&self, handle: &TaskHandle, timeout: Duration) -> KuResult<Value> {
-        ensure_task_operations_allowed(Span::default())?;
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            KuError::runtime(
-                "task timeout is too large for this platform",
-                Span::default(),
-            )
-        })?;
-        // Internal diagnostics may peek. Ku does not expose await_timeout and
-        // ordinary await above always moves its one-shot result out of the slot.
-        self.await_task_until(handle, Some(deadline), false)
+        await_ticket::await_borrowed(
+            self.clone(),
+            handle,
+            await_ticket::AwaitMode::Diagnostic(timeout),
+        )
     }
 
+    #[cfg(test)]
     fn await_task_until(
         &self,
         handle: &TaskHandle,
         deadline: Option<Instant>,
         consume: bool,
     ) -> KuResult<Value> {
-        let current = current_task_id();
-        if current == handle.id {
-            return Ok(task_error(
-                "self_await",
-                format!("task {} cannot await itself", handle.id),
-            ));
-        }
-        let current_state = if current == 0 {
-            None
-        } else {
-            self.state(current)?
-        };
-        if current != 0 {
-            if let Some(code) = self.register_wait(current, handle.id)? {
-                return Ok(task_error(
-                    code,
-                    format!("task {current} cannot await task {}", handle.id),
-                ));
-            }
-        }
-        let wait = TaskWaitGuard {
-            runtime: self,
-            current,
-            state: current_state,
-        };
-        if let Some(state) = &wait.state {
-            state.set_status(TASK_WAITING);
-        }
-        let result = (|| loop {
-            if let Some(context) = current_task_cancellation() {
-                handle.request_cancel_with(context);
-                return Err(KuError::termination(context, Span::default()));
-            }
-            let (result, terminal) = handle.state.observe_result(consume)?;
-            if let Some(result) = result {
-                return result;
-            }
-            if terminal {
-                return Ok(task_error(
-                    "already_awaited",
-                    format!("task {} has already been awaited", handle.id),
-                ));
-            }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Ok(task_error(
-                    "timeout",
-                    format!("timed out waiting for task {}", handle.id),
-                ));
-            }
-            if await_help_depth() >= MAX_AWAIT_DEPTH {
-                return Ok(task_error(
-                    "await_depth",
-                    format!("task {current} exceeded await depth {MAX_AWAIT_DEPTH}"),
-                ));
-            }
-            if self.help_one_bounded()? {
-                continue;
-            }
-            let wait = deadline
-                .map(|deadline| {
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(2))
-                })
-                .unwrap_or(Duration::from_millis(2));
-            if wait.is_zero() {
-                continue;
-            }
-            handle.state.wait(wait)?;
-        })();
-        drop(wait);
-        result
+        await_ticket::await_borrowed(
+            self.clone(),
+            handle,
+            await_ticket::AwaitMode::AlreadyClaimed { deadline, consume },
+        )
     }
 
     pub fn cancel_all(&self) -> usize {
@@ -1466,6 +1392,12 @@ impl TaskState {
         let Some(cleanup) = current_cleanup_context() else {
             return;
         };
+        // Match completion/cancellation's result -> cancellation lock order.
+        // Only metadata is touched here; no user payload drops under a lock.
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut cancellation = self
             .cancellation
             .lock()
@@ -1474,13 +1406,25 @@ impl TaskState {
             // Actual TLS may have an earlier cause. Persist only its tighter D
             // before the caller's cleanup guard restores its outer TLS window.
             existing.cleanup_deadline = existing.cleanup_deadline.min(cleanup.cleanup_deadline);
+            if let Some(Err(error)) = slot.as_mut() {
+                if error.runtime_termination().is_some() {
+                    // A terminal error may already be published while losing
+                    // payloads are being released. Tighten its existing D too;
+                    // keep the first cause and all public diagnostic fields.
+                    error.remember_scope_cleanup(*existing);
+                }
+            }
         }
     }
 
     // Finish the remaining ordered cleanup stages before propagating the first
     // native destructor panic. The caller retains its original cleanup window.
     fn catch_cleanup_panic(&self, first: &mut Option<CleanupPanic>, cleanup: impl FnOnce()) {
-        if let Err(panic) = catch_unwind(AssertUnwindSafe(cleanup)) {
+        let outcome = catch_unwind(AssertUnwindSafe(cleanup));
+        // Nested native Drop guards have restored the caller's live window,
+        // carrying their smaller D. Persist it before continuing or unwinding.
+        self.remember_cleanup_deadline();
+        if let Err(panic) = outcome {
             if first.is_none() {
                 *first = Some(panic);
             } else {

@@ -258,7 +258,11 @@ impl Interpreter {
         let result = (|| -> KuResult<Value> {
             let result = self.call_function("main", Vec::new(), entry_span(), 0)?;
             match result {
-                Value::Task(task) => task.await_result(),
+                Value::Task(task) => {
+                    let mut ticket = crate::runtime::task::AwaitTicket::begin(task);
+                    ticket.drive_sync();
+                    ticket.finish_with(|result| self.observe_termination(result))
+                }
                 value => Ok(value),
             }
         })();
@@ -1499,9 +1503,9 @@ impl Interpreter {
                         expr.span,
                     ));
                 };
-                let result = task.await_result();
-                self.observe_termination(&result);
-                result
+                let mut ticket = crate::runtime::task::AwaitTicket::begin(task);
+                ticket.drive_sync();
+                ticket.finish_with(|result| self.observe_termination(result))
             }
             ExprKind::Unary { op, expr: right } => {
                 let value = self.eval(right, env, depth)?;
