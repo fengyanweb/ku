@@ -129,6 +129,8 @@ pub(super) enum ExprCode {
         callee_span: SpanId,
     },
     Await(ExprId),
+    // Shared terminal await opcode for charged owned String and primitive
+    // Results. The selected ticket admits its real payload before transfer.
     TerminalAwaitOwnedString(ExprId),
     Propagate(ExprId),
 }
@@ -203,8 +205,9 @@ type Admission<T> = Result<T, AdmissionError>;
 // Selection is deliberately separate from arena allocation. A legal legacy
 // construct near the end of a large body must not become a storage error just
 // because a partially projected arena filled first. This streaming validation
-// uses borrowed metadata only; an exhausted validation budget means selection
-// is unknown, and production retains its existing evaluator for the whole tree.
+// uses borrowed metadata only. Existing generic selectors treat exhausted
+// validation as unknown selection. Strict owned async Result admission keeps
+// Unsupported separate from a controlled budget Rejected outcome.
 pub(super) fn eligible_named(
     source: &HashMap<String, FnDecl>,
     entry: &FnDecl,
@@ -245,14 +248,13 @@ pub(super) fn eligible_claimed_async_entry(
         .is_ok()
 }
 
-pub(super) fn eligible_claimed_async_owned_result_string_entry(
+pub(super) fn admit_claimed_async_owned_result_string_entry(
     source: &HashMap<String, FnDecl>,
     entry: &FnDecl,
     limits: Limits,
-) -> bool {
+) -> Admission<()> {
     Eligibility::new(source, None, limits)
         .check(FunctionSpec::claimed_async_owned_result_string_entry(entry))
-        .is_ok()
 }
 
 pub(super) fn eligible_local(
@@ -281,6 +283,33 @@ pub(super) fn eligible_local(
         role: FunctionRole::Scalar,
     })
     .is_ok()
+}
+
+pub(super) fn admit_claimed_async_owned_scalar_result_entry(
+    source: &HashMap<String, FnDecl>,
+    entry: &FnDecl,
+    limits: Limits,
+) -> Admission<()> {
+    Eligibility::new(source, None, limits)
+        .check(FunctionSpec::claimed_async_owned_scalar_result_entry(entry))
+}
+
+#[cfg(test)]
+pub(super) fn eligible_claimed_async_owned_result_string_entry(
+    source: &HashMap<String, FnDecl>,
+    entry: &FnDecl,
+    limits: Limits,
+) -> bool {
+    admit_claimed_async_owned_result_string_entry(source, entry, limits).is_ok()
+}
+
+#[cfg(test)]
+pub(super) fn eligible_claimed_async_owned_scalar_result_entry(
+    source: &HashMap<String, FnDecl>,
+    entry: &FnDecl,
+    limits: Limits,
+) -> bool {
+    admit_claimed_async_owned_scalar_result_entry(source, entry, limits).is_ok()
 }
 
 pub(super) fn eligible_claimed_async_local(
@@ -363,6 +392,16 @@ impl CodeHandle {
     ) -> Admission<Self> {
         Builder::new(source, None, limits).compile(Some(
             FunctionSpec::claimed_async_owned_result_string_entry(entry),
+        ))
+    }
+
+    pub(super) fn compile_claimed_async_owned_scalar_result_entry(
+        source: &HashMap<String, FnDecl>,
+        entry: &FnDecl,
+        limits: Limits,
+    ) -> Admission<Self> {
+        Builder::new(source, None, limits).compile(Some(
+            FunctionSpec::claimed_async_owned_scalar_result_entry(entry),
         ))
     }
 
@@ -552,6 +591,8 @@ enum FunctionRole {
     ClaimedAsyncResultRoot,
     ClaimedAsyncOwnedResultStringRoot,
     AsyncOwnedResultStringDependency,
+    ClaimedAsyncOwnedScalarResultRoot,
+    AsyncOwnedScalarResultDependency,
     AsyncResultDependency,
     ClaimedLocalAsyncResultRoot,
 }
@@ -705,7 +746,12 @@ impl<'a> FunctionSpec<'a> {
     }
 
     fn owns_scalar_result(self) -> bool {
-        matches!(self.role, FunctionRole::OwnedScalarResultNamed)
+        matches!(
+            self.role,
+            FunctionRole::OwnedScalarResultNamed
+                | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
+                | FunctionRole::AsyncOwnedScalarResultDependency
+        )
     }
 
     fn owned_scalar_result_kind(self) -> Option<PrimitiveResultKind> {
@@ -768,6 +814,12 @@ impl<'a> FunctionSpec<'a> {
         spec
     }
 
+    fn claimed_async_owned_scalar_result_entry(function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        spec.role = FunctionRole::ClaimedAsyncOwnedScalarResultRoot;
+        spec
+    }
+
     fn is_claimed_async_owned_result_string(self) -> bool {
         matches!(
             self.role,
@@ -776,16 +828,60 @@ impl<'a> FunctionSpec<'a> {
         )
     }
 
-    fn owned_async_dependency(self, function: &'a FnDecl) -> Self {
+    fn is_claimed_async_owned_result(self) -> bool {
+        self.is_claimed_async_owned_result_string()
+            || matches!(
+                self.role,
+                FunctionRole::ClaimedAsyncOwnedScalarResultRoot
+                    | FunctionRole::AsyncOwnedScalarResultDependency
+            )
+    }
+
+    fn check_owned_async_target(self, function: &FnDecl) -> Admission<()> {
+        let same_result = if let Some(kind) = self.owned_scalar_result_kind() {
+            primitive_result_kind(&function.return_type) == Some(kind)
+        } else {
+            self.owns_result_string() && string_result_type(&function.return_type)
+        };
+        if function.is_async && same_result {
+            Ok(())
+        } else {
+            Err(AdmissionError::Unsupported(function.span))
+        }
+    }
+
+    fn check_terminal_owned_await(
+        self,
+        task: &Expr,
+        source: &HashMap<String, FnDecl>,
+    ) -> Admission<()> {
+        let ExprKind::Call { callee, .. } = &task.kind else {
+            return Err(AdmissionError::Unsupported(task.span));
+        };
+        let ExprKind::Variable(name) = &callee.kind else {
+            return Err(AdmissionError::Unsupported(callee.span));
+        };
+        let function = source
+            .get(name)
+            .ok_or(AdmissionError::Unsupported(callee.span))?;
+        self.check_owned_async_target(function)
+    }
+
+    fn owned_async_dependency(self, function: &'a FnDecl) -> Admission<Self> {
+        self.check_owned_async_target(function)?;
         let mut spec = Self::named(function);
-        spec.role = FunctionRole::AsyncOwnedResultStringDependency;
-        spec
+        spec.role = if self.owns_scalar_result() {
+            FunctionRole::AsyncOwnedScalarResultDependency
+        } else {
+            FunctionRole::AsyncOwnedResultStringDependency
+        };
+        Ok(spec)
     }
 
     fn allows_await(self) -> bool {
-        // Owned async String roots/dependencies use only their separately
+        // Charged owned async Result roots/dependencies use only their separately
         // checked direct terminal await, never the general scalar Await.
-        self.is_async() && !self.is_claimed_async_owned_result_string()
+        self.is_async() && !self.is_claimed_async_owned_result()
     }
 
     fn dependency(function: &'a FnDecl) -> Self {
@@ -802,6 +898,8 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::ClaimedAsyncResultRoot
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
                 | FunctionRole::AsyncOwnedResultStringDependency
+                | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
+                | FunctionRole::AsyncOwnedScalarResultDependency
                 | FunctionRole::AsyncResultDependency
                 | FunctionRole::ClaimedLocalAsyncResultRoot
         )
@@ -815,6 +913,8 @@ impl<'a> FunctionSpec<'a> {
                 | FunctionRole::OwnedScalarResultNamed
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
                 | FunctionRole::AsyncOwnedResultStringDependency
+                | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
+                | FunctionRole::AsyncOwnedScalarResultDependency
                 | FunctionRole::BorrowedStringNamed
                 | FunctionRole::BorrowedScalarResultNamed
         )
@@ -896,6 +996,10 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::ClaimedAsyncOwnedResultStringRoot
             | FunctionRole::AsyncOwnedResultStringDependency => {
                 function.is_async && string_result_type(&function.return_type)
+            }
+            FunctionRole::ClaimedAsyncOwnedScalarResultRoot
+            | FunctionRole::AsyncOwnedScalarResultDependency => {
+                function.is_async && scalar_result_type(&function.return_type)
             }
             FunctionRole::ResultRoot => {
                 !function.is_async && scalar_result_type(&function.return_type)
@@ -1148,7 +1252,7 @@ struct ExpressionMode {
     // Only the direct Result operand of ? in the new borrowed Result role.
     // A helper or ordinary call site cannot reuse this callee permission.
     unwrap_borrowed_result: bool,
-    // Only the static Call immediately consumed by a terminal owned await.
+    // Only the static Call immediately consumed by a charged terminal await.
     // Nested argument/operand expressions never inherit this permission.
     owned_async_call: bool,
 }
@@ -1717,11 +1821,12 @@ impl<'a> Builder<'a> {
                     }
                     ExprKind::Await(task) => {
                         expect_kind(self.kind(task)?, ValueKind::Task, task.span)?;
-                        if spec.is_claimed_async_owned_result_string() {
+                        if spec.is_claimed_async_owned_result() {
                             if !mode.terminal_result || !matches!(task.kind, ExprKind::Call { .. })
                             {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
+                            spec.check_terminal_owned_await(task, self.source)?;
                             ExprCode::TerminalAwaitOwnedString(self.expression_with_mode(
                                 task,
                                 ExpressionMode {
@@ -1740,8 +1845,7 @@ impl<'a> Builder<'a> {
                         }
                     }
                     ExprKind::TryUnwrap { expr: inner } => {
-                        if spec.is_claimed_async_owned_result_string() || spec.owns_scalar_result()
-                        {
+                        if spec.is_claimed_async_owned_result() || spec.owns_scalar_result() {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
                         expect_scalar_result(self.kind(inner)?, inner.span)?;
@@ -1828,10 +1932,10 @@ impl<'a> Builder<'a> {
                                 spec.borrowed_dependency(function)
                             } else if spec.owns_strings() {
                                 if function.is_async
-                                    && spec.is_claimed_async_owned_result_string()
+                                    && spec.is_claimed_async_owned_result()
                                     && mode.owned_async_call
                                 {
-                                    spec.owned_async_dependency(function)
+                                    spec.owned_async_dependency(function)?
                                 } else {
                                     spec.owned_dependency(function)
                                 }
@@ -2080,7 +2184,7 @@ impl<'a> Builder<'a> {
                     } else if is_err_call(value) {
                         Some(self.terminal_err(value)?)
                     } else {
-                        if !(spec.is_claimed_async_owned_result_string()
+                        if !(spec.is_claimed_async_owned_result()
                             && matches!(value.kind, ExprKind::Await(_)))
                         {
                             expect_kind(self.kind(value)?, spec.return_kind(), value.span)?;
@@ -2384,7 +2488,7 @@ impl<'a> Eligibility<'a> {
                                         self.spend(1, value.span)?;
                                         self.expression(argument, true)?;
                                     } else {
-                                        if !(spec.is_claimed_async_owned_result_string()
+                                        if !(spec.is_claimed_async_owned_result()
                                             && matches!(value.kind, ExprKind::Await(_)))
                                         {
                                             expect_kind(
@@ -2556,12 +2660,13 @@ impl<'a> Eligibility<'a> {
                         }
                         ExprKind::Await(task) => {
                             expect_kind(self.kind(task)?, ValueKind::Task, task.span)?;
-                            if spec.is_claimed_async_owned_result_string() {
+                            if spec.is_claimed_async_owned_result() {
                                 if !mode.terminal_result
                                     || !matches!(task.kind, ExprKind::Call { .. })
                                 {
                                     return Err(AdmissionError::Unsupported(expr.span));
                                 }
+                                spec.check_terminal_owned_await(task, self.source)?;
                                 self.expression_with_mode(
                                     task,
                                     ExpressionMode {
@@ -2580,9 +2685,7 @@ impl<'a> Eligibility<'a> {
                             }
                         }
                         ExprKind::TryUnwrap { expr: inner } => {
-                            if spec.is_claimed_async_owned_result_string()
-                                || spec.owns_scalar_result()
-                            {
+                            if spec.is_claimed_async_owned_result() || spec.owns_scalar_result() {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
                             expect_scalar_result(self.kind(inner)?, inner.span)?;
@@ -2646,10 +2749,10 @@ impl<'a> Eligibility<'a> {
                                     spec.borrowed_dependency(function)
                                 } else if spec.owns_strings() {
                                     if function.is_async
-                                        && spec.is_claimed_async_owned_result_string()
+                                        && spec.is_claimed_async_owned_result()
                                         && mode.owned_async_call
                                     {
-                                        spec.owned_async_dependency(function)
+                                        spec.owned_async_dependency(function)?
                                     } else {
                                         spec.owned_dependency(function)
                                     }
@@ -2759,9 +2862,9 @@ mod typed_result_cache_tests {
     #[test]
     fn same_name_requires_the_same_typed_result_charging_contract() {
         let source = functions(
-            "fn Shared(n: int): int! { return ok(n) }\nfn Scalar(n: int): int { return n }",
+            "fn Shared(n: int): int! { return ok(n) }\nfn Scalar(n: int): int { return n }\nasync fn AsyncShared(n: int): int! { return ok(n) }",
         );
-        let other = functions("fn Shared(n: int): bool! { return ok(true) }");
+        let other = functions("fn Shared(n: int): bool! { return ok(true) }\nasync fn AsyncShared(n: int): bool! { return ok(true) }");
         let source_before = source.clone();
         let result = &source["Shared"];
         let scalar = &source["Scalar"];
@@ -2771,11 +2874,28 @@ mod typed_result_cache_tests {
         let other_owned = FunctionSpec::owned_named(&other["Shared"]);
         let plain = FunctionSpec::named(scalar);
         let owned_plain = FunctionSpec::owned_named(scalar);
+        let async_result = &source["AsyncShared"];
+        let old_async = FunctionSpec::claimed_async_entry(async_result);
+        let owned_async = FunctionSpec::claimed_async_owned_scalar_result_entry(async_result);
+        let owned_async_dependency = owned_async.owned_async_dependency(async_result).unwrap();
+        let other_owned_async =
+            FunctionSpec::claimed_async_owned_scalar_result_entry(&other["AsyncShared"]);
         let limits = Limits::default();
         // Complete validation of each real declaration/body happens before
         // testing reuse. No input Value or source binding is mutated and no
         // body is executed by these selection/build operations.
-        for spec in [old, owned, borrowed, other_owned, plain, owned_plain] {
+        for spec in [
+            old,
+            owned,
+            borrowed,
+            other_owned,
+            plain,
+            owned_plain,
+            old_async,
+            owned_async,
+            owned_async_dependency,
+            other_owned_async,
+        ] {
             spec.validate().unwrap();
             assert!(Eligibility::new(&source, None, limits).check(spec).is_ok());
             assert!(Builder::new(&source, None, limits)
@@ -2791,6 +2911,12 @@ mod typed_result_cache_tests {
             (other_owned, owned, false),
             (plain, owned_plain, true),
             (owned_plain, plain, true),
+            (old_async, owned_async, false),
+            (owned_async, old_async, false),
+            (owned_async, owned_async_dependency, true),
+            (owned_async_dependency, owned_async, true),
+            (owned_async, other_owned_async, false),
+            (other_owned_async, owned_async, false),
         ] {
             let mut builder = Builder::new(&source, None, limits);
             let id = builder.ensure_function(first).unwrap();

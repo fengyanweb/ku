@@ -13,9 +13,10 @@ pub(crate) enum AwaitPoll {
     Ready,
 }
 
-/// A selected String-result await receives only this unused part of its
+/// A selected charged Result await receives only this unused part of its
 /// caller's existing value budget. The caller keeps its input String
-/// reservation: every admitted success buffer originates in that input pool.
+/// reservation: every admitted success String buffer originates in that pool;
+/// an actual primitive success owns only its separately charged Result Box.
 #[derive(Clone, Copy)]
 pub(crate) struct AwaitPayloadPolicy {
     pub(crate) max_count: usize,
@@ -141,13 +142,15 @@ impl AwaitPayloadCharge {
     /// Describe a real selected leaf without allocating or cloning. A failure
     /// Object contributes its public Map capacity as Value slots, the tuple
     /// backing for those slots, and every actual key/value String capacity.
-    /// A success String remains covered by the caller's input reservation.
+    /// A success String remains covered by the caller's input reservation;
+    /// an actual primitive success adds only its real Box backing.
     pub(crate) fn for_value(
         value: &Value,
         input_string_capacity: usize,
     ) -> Result<Self, AwaitPayloadRejection> {
         match value {
             Value::Result { ok: true, value } => match value.as_ref() {
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => Self::boxed(0, 0),
                 Value::String(text) if text.capacity() <= input_string_capacity => {
                     Self::boxed(0, 0)
                 }

@@ -81,6 +81,150 @@ pub(super) fn error_payload(value: &Value) -> Option<ErrorPayload> {
     Some(actual)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScalarLeaf {
+    Int(i64),
+    Float(u64),
+    Bool(bool),
+    Null,
+}
+
+fn scalar_leaf(value: &Value) -> Option<ScalarLeaf> {
+    match value {
+        Value::Int(value) => Some(ScalarLeaf::Int(*value)),
+        Value::Float(value) => Some(ScalarLeaf::Float(value.to_bits())),
+        Value::Bool(value) => Some(ScalarLeaf::Bool(*value)),
+        Value::Null => Some(ScalarLeaf::Null),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrimitivePayload {
+    boxed: usize,
+    scalar: Option<ScalarLeaf>,
+    error: Option<ErrorPayload>,
+}
+
+fn primitive_payload(value: &Value) -> Option<PrimitivePayload> {
+    let Value::Result { ok, value: leaf } = value else {
+        return None;
+    };
+    let boxed = leaf.as_ref() as *const Value as usize;
+    if *ok {
+        Some(PrimitivePayload {
+            boxed,
+            scalar: Some(scalar_leaf(leaf)?),
+            error: None,
+        })
+    } else {
+        Some(PrimitivePayload {
+            boxed,
+            scalar: None,
+            error: Some(error_payload(value)?),
+        })
+    }
+}
+
+fn observe_primitives(
+    machine: &Machine,
+    seen: &mut Vec<PrimitivePayload>,
+) -> Option<PrimitivePayload> {
+    // Only a newly allocated candidate on the real value stack can replace
+    // this witness. Later arbitration cannot rewrite it from a counter.
+    let fresh = machine
+        .values
+        .as_slice()
+        .last()
+        .and_then(primitive_payload)
+        .filter(|actual| !seen.iter().any(|old| old.boxed == actual.boxed));
+    let mut live = Vec::new();
+    let mut read = |value: &Value| {
+        if let Some(actual) = primitive_payload(value) {
+            assert!(
+                !live.contains(&actual.boxed),
+                "one actual owner per primitive Box"
+            );
+            live.push(actual.boxed);
+            if let Some(old) = seen.iter().find(|old| old.boxed == actual.boxed) {
+                assert_eq!(
+                    *old, actual,
+                    "real primitive Box and false Map backing move intact"
+                );
+            } else {
+                seen.push(actual);
+            }
+        }
+    };
+    for value in machine.values.as_slice() {
+        read(value);
+    }
+    if let Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })) = &machine.pending {
+        read(value);
+    }
+    for exit in machine.exits.as_slice() {
+        if let Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })) =
+            exit.state.outcome()
+        {
+            read(value);
+        }
+    }
+    for frame in machine.finally.frames.as_slice() {
+        if let Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })) = &frame.primary {
+            read(value);
+        }
+    }
+    if let Some(Ok(value)) = machine
+        .awaiting
+        .as_ref()
+        .and_then(|frame| frame.ticket.test_outcome())
+    {
+        read(value);
+    }
+    fresh
+}
+
+fn primitive_budget_entries(machine: &mut Machine) {
+    let span = Span::default();
+    let count = machine.values.capacity()
+        + machine.argument_capacity
+        + machine.exit_handle_capacity
+        + machine.retirement_capacity
+        + machine.lease_capacity
+        + machine.lease_root_bytes / std::mem::size_of::<Value>()
+        + machine.result_wrapper_capacity
+        + machine.error_leaf_capacity;
+    let bytes = machine.values.charged_storage_bytes()
+        + machine.argument_bytes
+        + machine.exit_handle_bytes
+        + machine.retirement_bytes
+        + machine.string_payload_bytes
+        + machine.lease_bytes
+        + machine.lease_root_bytes
+        + machine.result_wrapper_bytes
+        + machine.error_leaf_bytes;
+    let saved = machine.value_limits;
+    for rejection in [None, Some("FrameLimit"), Some("StorageLimit")] {
+        machine.value_limits.max_frames = count - usize::from(rejection == Some("FrameLimit"));
+        machine.value_limits.max_storage_bytes =
+            bytes - usize::from(rejection == Some("StorageLimit"));
+        let spare = machine.values.capacity() - machine.values.len();
+        for result in [
+            machine.reserve_values(spare, span),
+            machine.check_argument_capacity(0, span),
+            machine.check_exit_storage_capacity(0, 0, span),
+            machine.check_lease_capacity(0, 0, span),
+        ] {
+            if let Some(reason) = rejection {
+                assert!(result.unwrap_err().message.contains(reason));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+    machine.value_limits = saved;
+}
+
 fn err_input_index(value: &Value, buffers: &[Buffer]) -> Option<usize> {
     let Value::Result { ok: false, value } = value else {
         return None;
@@ -140,12 +284,14 @@ pub(super) fn observe(
         if let Value::Result { ok, value: leaf } = value {
             let pointer = leaf.as_ref() as *const Value as usize;
             if *ok {
-                let (index, actual) = result_buffer(value, buffers);
-                assert_eq!(actual, pointer);
-                if let Some(previous) = boxes[index] {
-                    assert_eq!(pointer, previous, "an actual saved Box must move intact");
-                } else {
-                    boxes[index] = Some(pointer);
+                if scalar_leaf(leaf).is_none() {
+                    let (index, actual) = result_buffer(value, buffers);
+                    assert_eq!(actual, pointer);
+                    if let Some(previous) = boxes[index] {
+                        assert_eq!(pointer, previous, "an actual saved Box must move intact");
+                    } else {
+                        boxes[index] = Some(pointer);
+                    }
                 }
             } else {
                 let (count, bytes) = error_backing(leaf);
@@ -298,6 +444,8 @@ enum Fault {
     WrapperCount,
     WrapperBytes,
     NativeBox,
+    FuelBefore,
+    FuelAfter,
 }
 
 #[derive(Clone, Copy)]
@@ -334,6 +482,9 @@ struct Finished {
     outgoing: Option<(usize, usize)>,
     outgoing_error: Option<ErrorPayload>,
     error_owners: Vec<ErrorPayload>,
+    outgoing_primitive: Option<PrimitivePayload>,
+    primitive_owners: Vec<PrimitivePayload>,
+    last_primitive_candidate: Option<PrimitivePayload>,
 }
 
 #[derive(Debug)]
@@ -368,6 +519,8 @@ struct SourceRunner {
     buffers: Vec<Buffer>,
     boxes: Vec<Option<usize>>,
     errors: Vec<ErrorPayload>,
+    primitives: Vec<PrimitivePayload>,
+    last_primitive_candidate: Option<PrimitivePayload>,
     witness: mpsc::Sender<Witness>,
     release: Option<mpsc::Receiver<()>>,
     paused: bool,
@@ -415,18 +568,31 @@ impl LocalTaskRunner for SourceRunner {
                             .len()
                             .checked_sub(1)
                             .and_then(|i| machine.work.get(i)),
-                        Some(Work::WrapTerminalOk(_, true) | Work::WrapTerminalErr(_))
+                        Some(
+                            Work::WrapTerminalOk(_, true)
+                                | Work::WrapTerminalErr(_)
+                                | Work::WrapOwnedScalarResult(_, _)
+                        )
                     );
                 if at_wrap && matches!(self.plan.fault, Fault::WrapperCount | Fault::WrapperBytes) {
-                    let Value::String(text) = machine.values.get(machine.values.len() - 1).unwrap()
-                    else {
-                        panic!("the actual operand has already moved before wrapper admission")
-                    };
-                    let input = self.buffers[0];
-                    assert_eq!(
-                        (text.as_ptr() as usize, text.capacity()),
-                        (input.pointer, input.capacity)
-                    );
+                    primitive_budget_entries(machine);
+                    let operand = machine.values.get(machine.values.len() - 1).unwrap();
+                    let input = self.buffers.first().copied().unwrap_or(Buffer {
+                        pointer: 0,
+                        capacity: 0,
+                        text: "",
+                    });
+                    if let Value::String(text) = operand {
+                        assert_eq!(
+                            (text.as_ptr() as usize, text.capacity()),
+                            (input.pointer, input.capacity)
+                        );
+                    } else {
+                        assert!(
+                            scalar_leaf(operand).is_some(),
+                            "the real primitive operand is ready before Box admission"
+                        );
+                    }
                     assert_eq!(machine.result_wrapper_capacity, 0);
                     assert!(self.inner.interpreter.steps > 0);
                     self.witness
@@ -460,13 +626,42 @@ impl LocalTaskRunner for SourceRunner {
                     }
                     self.faulted = true;
                 }
+                if (self.plan.fault == Fault::FuelBefore && at_wrap)
+                    || (self.plan.fault == Fault::FuelAfter && machine.result_wrapper_capacity > 0)
+                {
+                    machine.test_fuel = true;
+                    machine.remaining_dispatches = 0;
+                    self.faulted = true;
+                }
+                if self.plan.fault == Fault::FuelBefore
+                    && machine.pending.is_none()
+                    && matches!(
+                        machine.work.as_slice().last(),
+                        Some(Work::AwaitOwnedStringOperand(_))
+                    )
+                {
+                    machine.test_fuel = true;
+                    machine.remaining_dispatches = 0;
+                    self.faulted = true;
+                }
                 if self.plan.fault == Fault::NativeBox && machine.result_wrapper_capacity > 0 {
                     let count = observe(machine, &self.buffers, &mut self.boxes, &mut self.errors);
                     assert_eq!(count, 1);
+                    primitive_budget_entries(machine);
+                    if let Some(actual) = observe_primitives(machine, &mut self.primitives) {
+                        self.last_primitive_candidate = Some(actual);
+                    }
                     self.witness
                         .send(Witness::Native {
-                            input: self.buffers[0],
-                            boxed: self.boxes[0].unwrap(),
+                            input: self.buffers.first().copied().unwrap_or(Buffer {
+                                pointer: 0,
+                                capacity: 0,
+                                text: "",
+                            }),
+                            boxed: self
+                                .primitives
+                                .last()
+                                .map_or_else(|| self.boxes[0].unwrap(), |actual| actual.boxed),
                         })
                         .unwrap();
                     // A real native runner abandonment, not a source destructor
@@ -482,11 +677,24 @@ impl LocalTaskRunner for SourceRunner {
             .inner
             .dispatch(NonZeroUsize::new(self.plan.chunk).unwrap());
         if let Some(machine) = self.inner.machine.as_ref() {
+            if machine.state != MachineState::Finished {
+                assert_eq!(
+                    machine.string_payload_bytes,
+                    self.buffers
+                        .iter()
+                        .map(|buffer| buffer.capacity)
+                        .sum::<usize>(),
+                    "the original input pool remains reserved until this actual run finishes"
+                );
+            }
             observe(machine, &self.buffers, &mut self.boxes, &mut self.errors);
+            if let Some(actual) = observe_primitives(machine, &mut self.primitives) {
+                self.last_primitive_candidate = Some(actual);
+            }
         }
         if let ControlFlow::Break(outcome) = &result {
             let outgoing = outcome.as_ref().ok().and_then(|value| {
-                if matches!(value, Value::Result { ok: true, .. })
+                if matches!(value, Value::Result { ok: true, value } if scalar_leaf(value).is_none())
                     || err_input_index(value, &self.buffers).is_some()
                 {
                     let outgoing = result_buffer(value, &self.buffers);
@@ -502,6 +710,19 @@ impl LocalTaskRunner for SourceRunner {
                 }
             });
             let outgoing_error = outcome.as_ref().ok().and_then(error_payload);
+            let outgoing_primitive = outcome.as_ref().ok().and_then(primitive_payload);
+            if let Some(actual) = outgoing_primitive {
+                if self.plan.chunk == 1 {
+                    assert_eq!(
+                        self.primitives
+                            .iter()
+                            .find(|old| old.boxed == actual.boxed)
+                            .copied(),
+                        Some(actual),
+                        "one-step claimant independently observes its outgoing primitive Box"
+                    );
+                }
+            }
             if let Some(actual) = outgoing_error {
                 if let Some(previous) = self
                     .errors
@@ -534,6 +755,9 @@ impl LocalTaskRunner for SourceRunner {
                     outgoing,
                     outgoing_error,
                     error_owners: self.errors.clone(),
+                    outgoing_primitive,
+                    primitive_owners: self.primitives.clone(),
+                    last_primitive_candidate: self.last_primitive_candidate,
                 })))
                 .unwrap();
             if self.plan.pause == Pause::Produced && !self.paused {
@@ -620,6 +844,8 @@ fn spawn_source(
                     plan,
                     boxes: vec![None; buffers.len()],
                     errors: Vec::new(),
+                    primitives: Vec::new(),
+                    last_primitive_candidate: None,
                     buffers,
                     witness: tx,
                     release: Some(release_rx),
@@ -1739,4 +1965,787 @@ fn terminal_err_queued_and_running_cancellation_retire_input_before_result_alloc
         (0, 0, 0)
     );
     assert!(proof.outgoing_error.is_none());
+}
+
+const ASYNC_PRIMITIVES: [(code::PrimitiveResultKind, &str, &str); 4] = [
+    (code::PrimitiveResultKind::Int, "int", "7"),
+    (code::PrimitiveResultKind::Float, "float", "1.25"),
+    (code::PrimitiveResultKind::Bool, "bool", "true"),
+    (code::PrimitiveResultKind::Null, "null", "null"),
+];
+
+fn expected_scalar(kind: code::PrimitiveResultKind) -> ScalarLeaf {
+    match kind {
+        code::PrimitiveResultKind::Int => ScalarLeaf::Int(7),
+        code::PrimitiveResultKind::Float => ScalarLeaf::Float(1.25_f64.to_bits()),
+        code::PrimitiveResultKind::Bool => ScalarLeaf::Bool(true),
+        code::PrimitiveResultKind::Null => ScalarLeaf::Null,
+    }
+}
+
+fn assert_primitive_source(
+    value: &Value,
+    proof: &Finished,
+    expected: ScalarLeaf,
+    chunk: usize,
+) -> PrimitivePayload {
+    let actual = primitive_payload(value).expect("the real outgoing scalar success Box");
+    assert_eq!(actual.scalar, Some(expected));
+    assert_eq!(actual.error, None);
+    assert_eq!(proof.outgoing_primitive, Some(actual));
+    assert_eq!(
+        (
+            proof.peak_boxes,
+            proof.peak_box_bytes,
+            proof.peak_errors,
+            proof.peak_error_bytes
+        ),
+        (1, std::mem::size_of::<Value>(), 0, 0)
+    );
+    if chunk == 1 {
+        assert!(proof.primitive_owners.contains(&actual));
+    }
+    actual
+}
+
+#[test]
+fn claimed_async_primitive_actual_leaves_helpers_and_sync_relays_keep_512_and_first_513() {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        let read = match kind {
+            code::PrimitiveResultKind::Int => "text.len()",
+            code::PrimitiveResultKind::Bool => "text.byte_len() > 0",
+            _ => literal,
+        };
+        let read_expected = if kind == code::PrimitiveResultKind::Int {
+            ScalarLeaf::Int(TEXT.chars().count() as i64)
+        } else {
+            expected_scalar(kind)
+        };
+        for (body, helper, expected) in [
+            (
+                format!("ok({literal})"),
+                String::new(),
+                expected_scalar(kind),
+            ),
+            (
+                "ok(Produce(text))".to_string(),
+                format!("fn Produce(text: str): {ty} {{ return {read} }}\n"),
+                read_expected,
+            ),
+            (
+                "Leaf(text)".to_string(),
+                format!("fn Leaf(text: str): {ty}! {{ return ok({read}) }}\n"),
+                read_expected,
+            ),
+        ] {
+            let source = format!("{helper}async fn Entry(text: str): {ty}! {{ return {body} }}");
+            for chunk in [1, 7, 256] {
+                let (text, buffer) = string_input(TEXT, 4096);
+                let (proof, events, result) =
+                    err_source_receipt(&source, vec![text], vec![buffer], Plan::normal(chunk));
+                assert!(events.is_empty());
+                assert_primitive_source(&result.unwrap(), &proof, expected, chunk);
+                assert_eq!(proof.peak_strings, buffer.capacity);
+            }
+        }
+        for error in [false, true] {
+            let leaf = if error {
+                "err(text)".to_string()
+            } else {
+                format!("ok({read})")
+            };
+            for mutual in [false, true] {
+                let helper = if mutual {
+                    format!("fn Other(text: str, n: int): {ty}! {{ if (n <= 0) {{ return {leaf} }}\nreturn Relay(text, n - 1) }}\n")
+                } else {
+                    String::new()
+                };
+                let next = if mutual { "Other" } else { "Relay" };
+                let source = format!("{helper}fn Relay(text: str, n: int): {ty}! {{ if (n <= 0) {{ return {leaf} }}\nreturn {next}(text, n - 1) }}\nasync fn Entry(text: str, n: int): {ty}! {{ return Relay(text, n) }}");
+                for n in [510, 511] {
+                    let (text, buffer) = string_input(TEXT, 4096);
+                    let (proof, _, result) = err_source_receipt(
+                        &source,
+                        vec![text, Value::Int(n)],
+                        vec![buffer],
+                        Plan::normal(1),
+                    );
+                    assert_eq!(proof.peak_calls, 512);
+                    if n == 510 {
+                        let result = result.unwrap();
+                        if error {
+                            assert_source_error(&result, &proof, &[buffer]);
+                        } else {
+                            assert_primitive_source(&result, &proof, read_expected, 1);
+                        }
+                        assert_eq!(proof.calls, 512);
+                    } else {
+                        assert_eq!(
+                            result.unwrap_err().code.as_deref(),
+                            Some("call_depth_exceeded")
+                        );
+                        assert_eq!(
+                            (proof.calls, proof.peak_boxes, proof.peak_errors),
+                            (512, 0, 0)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn claimed_async_primitive_input_capacity_and_four_budget_entries_reject_before_box() {
+    for (_, ty, literal) in ASYNC_PRIMITIVES {
+        let source = format!("async fn Entry(text: str): {ty}! {{ return ok({literal}) }}");
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        let (text, buffer) = string_input(TEXT, Limits::default().values.max_storage_bytes + 1);
+        let (task, rx, _) =
+            spawn_source(&runtime, &source, vec![text], vec![buffer], Plan::normal(1));
+        let constructor = rx.recv_timeout(WAIT).unwrap();
+        let completion = rx.recv_timeout(WAIT).unwrap();
+        let result = task.await_result();
+        release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+        close(&runtime);
+        assert!(matches!(
+            constructor,
+            Witness::Entered {
+                selected: true,
+                pending_error: true,
+                steps: 0,
+                calls: 0,
+                ..
+            }
+        ));
+        let Witness::Finished(proof) = completion else {
+            panic!("rejected real entry drains")
+        };
+        assert!(result.unwrap_err().message.contains("StorageLimit"));
+        assert_eq!(
+            (
+                proof.steps,
+                proof.calls,
+                proof.peak_boxes,
+                proof.peak_errors
+            ),
+            (0, 0, 0, 0)
+        );
+        for fault in [Fault::WrapperCount, Fault::WrapperBytes] {
+            let (text, buffer) = string_input(TEXT, 4096);
+            let mut plan = Plan::normal(1);
+            plan.fault = fault;
+            let (proof, events, result) =
+                err_source_receipt(&source, vec![text], vec![buffer], plan);
+            assert!(
+                matches!(events.as_slice(), [Witness::Wrap { steps, input }] if *steps > 0 && input.pointer == buffer.pointer && input.capacity == buffer.capacity)
+            );
+            assert!(result
+                .unwrap_err()
+                .message
+                .contains(if fault == Fault::WrapperCount {
+                    "FrameLimit"
+                } else {
+                    "StorageLimit"
+                }));
+            assert_eq!((proof.peak_boxes, proof.peak_errors), (0, 0));
+            assert_eq!(proof.peak_strings, buffer.capacity);
+        }
+    }
+}
+
+#[test]
+fn claimed_async_primitive_err_clones_real_message_and_charges_box_map_and_six_buffers() {
+    for (_, ty, _) in ASYNC_PRIMITIVES {
+        let source = format!("fn Keep(text: str): str {{ try {{ marker = 0 }} finally {{ marker = 1 }}\nreturn text }}\nasync fn Entry(text: str): {ty}! {{ return err(Keep(text)) }}");
+        let source_functions = functions(&source);
+        code::admit_claimed_async_owned_scalar_result_entry(
+            &source_functions,
+            &source_functions["Entry"],
+            Limits::default(),
+        )
+        .unwrap();
+        CodeHandle::compile_claimed_async_owned_scalar_result_entry(
+            &source_functions,
+            &source_functions["Entry"],
+            Limits::default(),
+        )
+        .unwrap();
+        for chunk in [1, 7, 256] {
+            let (text, buffer) = string_input(TEXT, 4096);
+            let (proof, _, result) =
+                err_source_receipt(&source, vec![text], vec![buffer], Plan::normal(chunk));
+            let result = result.unwrap();
+            let actual = assert_source_error(&result, &proof, &[buffer]);
+            assert_eq!(
+                (
+                    proof.peak_boxes,
+                    proof.peak_box_bytes,
+                    proof.peak_errors,
+                    proof.peak_error_bytes
+                ),
+                (1, std::mem::size_of::<Value>(), actual.count, actual.bytes)
+            );
+            assert_eq!(proof.finally, 1);
+            if chunk == 1 {
+                assert!(proof
+                    .primitive_owners
+                    .contains(&primitive_payload(&result).unwrap()));
+            }
+        }
+        for fault in [Fault::WrapperCount, Fault::WrapperBytes] {
+            let (text, buffer) = string_input(TEXT, 4096);
+            let mut plan = Plan::normal(1);
+            plan.fault = fault;
+            let (proof, _, result) = err_source_receipt(&source, vec![text], vec![buffer], plan);
+            assert!(result.is_err());
+            assert_eq!(
+                (proof.peak_boxes, proof.peak_errors, proof.peak_error_bytes),
+                (0, 0, 0)
+            );
+        }
+    }
+}
+
+#[test]
+fn claimed_async_primitive_q2_q3_return_the_last_independently_observed_finally_box() {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        for (errors, owners) in [
+            ([false, false, false], 2),
+            ([true, true, false], 2),
+            ([true, false, false], 2),
+            ([false, true, false], 2),
+            ([true, false, true], 3),
+        ] {
+            let leaf = |index: usize| {
+                if errors[index] {
+                    format!("err({})", ["first", "second", "third"][index])
+                } else {
+                    format!("ok({literal})")
+                }
+            };
+            let replacement = if owners == 2 {
+                format!("return {}", leaf(1))
+            } else {
+                format!(
+                    "try {{ return {} }} finally {{ return {} }}",
+                    leaf(1),
+                    leaf(2)
+                )
+            };
+            let source = format!("async fn Entry(first: str, second: str, third: str): {ty}! {{ try {{ return {} }} finally {{ {replacement} }}\nreturn ok({literal}) }}", leaf(0));
+            for chunk in [1, 7, 256] {
+                let (a, first) = string_input("中\0primary", 1024);
+                let (b, second) = string_input("é\0replacement", 4096);
+                let (c, third) = string_input(TEXT, 2048);
+                let buffers = [first, second, third];
+                let (proof, _, result) = err_source_receipt(
+                    &source,
+                    vec![a, b, c],
+                    buffers.to_vec(),
+                    Plan::normal(chunk),
+                );
+                let result = result.unwrap();
+                let actual = primitive_payload(&result).unwrap();
+                if errors[owners - 1] {
+                    assert_eq!(result_buffer(&result, &buffers).0, owners - 1);
+                } else {
+                    assert_eq!(actual.scalar, Some(expected_scalar(kind)));
+                }
+                assert_eq!(
+                    (proof.peak_boxes, proof.peak_box_bytes, proof.finally),
+                    (owners, owners * std::mem::size_of::<Value>(), owners - 1)
+                );
+                assert_eq!(
+                    proof.peak_strings,
+                    buffers.iter().map(|buffer| buffer.capacity).sum::<usize>()
+                );
+                if chunk == 1 {
+                    assert_eq!(proof.primitive_owners.len(), owners);
+                    assert_eq!(
+                        proof.last_primitive_candidate,
+                        Some(actual),
+                        "the last real finally candidate wins with the same Box and full snapshot"
+                    );
+                    assert_eq!(
+                        (proof.peak_errors, proof.peak_error_bytes),
+                        (
+                            proof.error_owners.iter().map(|e| e.count).sum::<usize>(),
+                            proof.error_owners.iter().map(|e| e.bytes).sum::<usize>()
+                        )
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn claimed_async_primitive_later_argument_fuel_native_tls_and_same_worker_reuse() {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        let source = format!("async fn Entry(text: str): {ty}! {{ return ok({literal}) }}");
+        let failure = format!("fn Leaf(text: str, ignored: int): {ty}! {{ return ok({literal}) }}\nasync fn Entry(text: str): {ty}! {{ return Leaf(text, 1 / 0) }}");
+        let (text, buffer) = string_input(TEXT, 4096);
+        let (proof, _, result) =
+            err_source_receipt(&failure, vec![text], vec![buffer], Plan::normal(1));
+        assert_eq!(result.unwrap_err().message, "division by zero");
+        assert_eq!(
+            (proof.calls, proof.peak_boxes, proof.peak_errors),
+            (1, 0, 0)
+        );
+        for fault in [Fault::FuelBefore, Fault::FuelAfter] {
+            let (text, buffer) = string_input(TEXT, 4096);
+            let mut plan = Plan::normal(1);
+            plan.fault = fault;
+            let (proof, _, result) = err_source_receipt(&source, vec![text], vec![buffer], plan);
+            assert_eq!(
+                result.unwrap_err().message,
+                "internal execution prototype test fuel exhausted"
+            );
+            assert_eq!(proof.peak_boxes, usize::from(fault == Fault::FuelAfter));
+        }
+        for error in [false, true] {
+            let failing = if error {
+                format!("async fn Entry(text: str): {ty}! {{ return err(text) }}")
+            } else {
+                source.clone()
+            };
+            let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+            let (text, buffer) = string_input(TEXT, 4096);
+            let mut plan = Plan::normal(1);
+            plan.fault = Fault::NativeBox;
+            let (task, rx, _) = spawn_source(&runtime, &failing, vec![text], vec![buffer], plan);
+            let constructor = rx.recv_timeout(WAIT).unwrap();
+            let native = rx.recv_timeout(WAIT).unwrap();
+            let failed = task.await_result();
+            release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+            let (text, buffer) = string_input(TEXT, 4096);
+            let (healthy, healthy_rx, _) =
+                spawn_source(&runtime, &source, vec![text], vec![buffer], Plan::normal(1));
+            let healthy_constructor = healthy_rx.recv_timeout(WAIT).unwrap();
+            let healthy_completion = healthy_rx.recv_timeout(WAIT).unwrap();
+            let healthy_result = healthy.await_result();
+            release_task(
+                healthy,
+                CancellationContext::new(TerminationReason::Cancelled),
+            );
+            close(&runtime);
+            assert!(matches!(
+                constructor,
+                Witness::Entered {
+                    selected: true,
+                    legacy: false,
+                    ..
+                }
+            ));
+            assert!(matches!(native, Witness::Native { boxed, .. } if boxed != 0));
+            assert!(matches!(
+                healthy_constructor,
+                Witness::Entered {
+                    selected: true,
+                    legacy: false,
+                    ..
+                }
+            ));
+            let Witness::Finished(proof) = healthy_completion else {
+                panic!("same worker finishes its healthy next claimant")
+            };
+            let Value::Result { ok: false, value } = failed.unwrap() else {
+                panic!("native task panic remains a false Result")
+            };
+            let Value::Object(fields) = *value else {
+                unreachable!()
+            };
+            assert!(matches!(fields.get("code"), Some(Value::String(code)) if code == "panic"));
+            assert_primitive_source(&healthy_result.unwrap(), &proof, expected_scalar(kind), 1);
+        }
+    }
+}
+
+#[test]
+fn claimed_async_primitive_roles_unknown_actuals_and_queued_running_produced_retirement() {
+    for (_, ty, literal) in ASYNC_PRIMITIVES {
+        let supported = functions(&format!(
+            "async fn Entry(text: str): {ty}! {{ return ok({literal}) }}"
+        ));
+        for stage in 0..3 {
+            let mut limits = Limits::default();
+            match stage {
+                0 => limits.syntax_steps = 0,
+                1 => limits.syntax.max_frames = 0,
+                _ => limits.syntax.max_storage_bytes = 0,
+            }
+            assert!(matches!(
+                code::admit_claimed_async_owned_scalar_result_entry(
+                    &supported,
+                    &supported["Entry"],
+                    limits
+                ),
+                Err(AdmissionError::Rejected(_))
+            ));
+            assert!(matches!(
+                CodeHandle::compile_claimed_async_owned_scalar_result_entry(
+                    &supported,
+                    &supported["Entry"],
+                    limits
+                ),
+                Err(AdmissionError::Rejected(_))
+            ));
+        }
+        let wrong_ty = if ty == "float" { "int" } else { "float" };
+        let wrong_literal = if wrong_ty == "int" { "7" } else { "1.25" };
+        let invalid = format!("fn Wrong(text: str): {wrong_ty}! {{ return ok({wrong_literal}) }}\nasync fn Entry(text: str): {ty}! {{ return ok({literal})\nreturn Wrong(text) }}\nfn main() {{}}");
+        let program = Parser::new(Lexer::new(&invalid).tokenize().unwrap())
+            .parse_program()
+            .unwrap();
+        let error = crate::checker::Checker::new()
+            .check(&program)
+            .expect_err("even dead typed cross-kind returns are checker-invalid");
+        assert!(
+            error
+                .message
+                .contains(&format!("expected {ty}! but got {wrong_ty}!")),
+            "{error:?}"
+        );
+        let fresh_literal = format!("fn Keep(text: str): str {{ try {{ return text }} finally {{ marker = 1 }}\nreturn \"fallback\" }}\nasync fn Entry(text: str): {ty}! {{ return err(Keep(text)) }}");
+        for source in [
+            format!("async fn Entry(text: str): {ty}! {{ result = ok({literal})\nreturn result }}"),
+            format!("fn Leaf(text: str): {ty}! {{ return ok({literal}) }}\nasync fn Entry(text: str): {ty}! {{ return ok(Leaf(text)?) }}"),
+            format!("async fn Entry(text: str): {ty}! {{ try {{ marker = 1 }} catch (e) {{ marker = 2 }}\nreturn ok({literal}) }}"),
+            // A legal dead expression statement is outside this strict slice;
+            // it is not a substitute for the same-arena cache contract.
+            format!("fn Wrong(text: str): {wrong_ty}! {{ return ok({wrong_literal}) }}\nasync fn Entry(text: str): {ty}! {{ return ok({literal})\nWrong(text) }}"),
+            // Whole-tree strict admission also rejects an unreachable fresh
+            // String literal; the public legacy body remains legal below.
+            fresh_literal.clone(),
+        ] {
+            let functions = functions(&source);
+            assert!(!code::eligible_claimed_async_owned_scalar_result_entry(&functions, &functions["Entry"], Limits::default()));
+            assert!(matches!(CodeHandle::compile_claimed_async_owned_scalar_result_entry(&functions, &functions["Entry"], Limits::default()), Err(AdmissionError::Unsupported(_))));
+            let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+            let (text, buffer) = string_input(TEXT, 4096);
+            let mut plan = Plan::normal(1); plan.selection_only = true;
+            let (task, rx, _) = spawn_source(&runtime, &source, vec![text], vec![buffer], plan);
+            let constructor = rx.recv_timeout(WAIT).unwrap();
+            let result = task.await_result();
+            release_task(task, CancellationContext::new(TerminationReason::Cancelled)); close(&runtime);
+            assert!(matches!(constructor, Witness::Entered { selected: false, legacy: true, steps: 0, .. }));
+            assert_eq!(result.unwrap(), Value::Null);
+        }
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        let mut host = production_interpreter(&fresh_literal);
+        host.task_runtime = Some(runtime.clone());
+        let (text, _) = string_input(TEXT, 4096);
+        let Value::Task(task) = host
+            .call_function("Entry", vec![text], Span::default(), 0)
+            .unwrap()
+        else {
+            panic!("the existing public async fallback creates its real Task")
+        };
+        let result = task.await_result();
+        release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+        close(&runtime);
+        let Value::Result { ok: false, value } = result.unwrap() else {
+            panic!("the existing legal body still returns its source err")
+        };
+        let Value::Object(fields) = *value else {
+            unreachable!()
+        };
+        assert!(matches!(fields.get("domain"), Some(Value::String(domain)) if domain == "ku"));
+        assert!(matches!(fields.get("code"), Some(Value::String(code)) if code == "err"));
+        assert!(matches!(fields.get("message"), Some(Value::String(message)) if message == TEXT));
+        let source = format!("async fn Entry(text: str): {ty}! {{ return ok({literal}) }}");
+        for stage in [Pause::Running, Pause::Produced] {
+            let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+            let (text, buffer) = string_input(TEXT, 4096);
+            let mut plan = Plan::normal(1);
+            plan.pause = stage;
+            let (task, rx, release) =
+                spawn_source(&runtime, &source, vec![text], vec![buffer], plan);
+            let constructor = rx.recv_timeout(WAIT).unwrap();
+            let before = if stage == Pause::Produced {
+                Some(rx.recv_timeout(WAIT).unwrap())
+            } else {
+                None
+            };
+            let paused = rx.recv_timeout(WAIT).unwrap();
+            let original = CancellationContext::new(TerminationReason::TimedOut);
+            let shorter = CancellationContext {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: original.cleanup_deadline - Duration::from_millis(100),
+            };
+            let accepted = task.request_cancel_with(original);
+            let second = task.request_cancel_with(shorter);
+            let expected = CancellationContext {
+                reason: original.reason,
+                cleanup_deadline: shorter.cleanup_deadline,
+            };
+            release.send(()).unwrap();
+            let completion = if stage == Pause::Running {
+                Some(rx.recv_timeout(WAIT).unwrap())
+            } else {
+                None
+            };
+            let result = task.await_result();
+            release_task(task, expected);
+            close(&runtime);
+            assert!(matches!(
+                constructor,
+                Witness::Entered {
+                    selected: true,
+                    legacy: false,
+                    ..
+                }
+            ));
+            assert!(matches!(paused, Witness::Paused { stage: actual, .. } if actual == stage));
+            assert!(accepted && !second);
+            assert_eq!(result.unwrap_err().runtime_termination(), Some(expected));
+            let Witness::Finished(proof) = before.or(completion).unwrap() else {
+                panic!("actual source retirement proof")
+            };
+            assert_eq!(proof.peak_boxes, usize::from(stage == Pause::Produced));
+            if stage == Pause::Produced {
+                assert!(proof.outgoing_primitive.is_some());
+            }
+        }
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let held = runtime
+            .spawn(move || {
+                ready_tx.send(()).unwrap();
+                held_rx.recv_timeout(WAIT).unwrap();
+                Ok(Value::Null)
+            })
+            .unwrap();
+        ready_rx.recv_timeout(WAIT).unwrap();
+        let (text, buffer) = string_input(TEXT, 4096);
+        let (task, rx, _) =
+            spawn_source(&runtime, &source, vec![text], vec![buffer], Plan::normal(1));
+        let queued = runtime.snapshot().unwrap().queued_tasks;
+        let context = CancellationContext::new(TerminationReason::TimedOut);
+        let accepted = task.request_cancel_with(context);
+        let result = task.await_result();
+        release_task(task, context);
+        let abandoned = rx.recv_timeout(WAIT);
+        let after = runtime.snapshot().unwrap().queued_tasks;
+        held_tx.send(()).unwrap();
+        let held_result = held.await_result();
+        release_task(held, CancellationContext::new(TerminationReason::Cancelled));
+        close(&runtime);
+        assert!(accepted);
+        assert_eq!((queued, after), (1, 0));
+        assert!(matches!(
+            abandoned,
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert_eq!(result.unwrap_err().runtime_termination(), Some(context));
+        assert_eq!(held_result.unwrap(), Value::Null);
+    }
+    // Declared Float is metadata, not coercion: a legal Unknown leaf can be
+    // actual Null, while opaque Unknown inputs must stay wholly legacy.
+    let source = "async fn Entry(text: str, value: float): float! { return ok(value) }";
+    let (text, buffer) = string_input(TEXT, 4096);
+    let unknown = crate::stdlib::array::eval("first", &[Value::Array(Vec::new())], Span::default())
+        .unwrap()
+        .expect("registered array.first intrinsic");
+    let (proof, _, result) =
+        err_source_receipt(source, vec![text, unknown], vec![buffer], Plan::normal(1));
+    assert_primitive_source(&result.unwrap(), &proof, ScalarLeaf::Null, 1);
+    let complete_null = format!("{source}\nfn RequireNull(value): null! {{ if (value == null) {{ return ok(null) }}\nreturn err(\"Unknown primitive changed\") }}\nasync fn main(): null! {{ items = []\nunknown = array.first(items)\nactual = (await Entry(\"text\", unknown))?\nRequireNull(actual)?\nreturn ok(null) }}");
+    let program = Parser::new(Lexer::new(&complete_null).tokenize().unwrap())
+        .parse_program()
+        .unwrap();
+    crate::checker::Checker::new().check(&program).unwrap();
+    crate::cli::run_source("async-primitive-unknown-null.ku", &complete_null).unwrap();
+    for syntax in ["[1, 2]", "{answer: 7}"] {
+        let complete = format!("{source}\nasync fn main(): null! {{ items = []\nitems = array.push(items, {syntax})\nunknown = array.first(items)\nresult = await Entry(\"text\", unknown)\nreturn ok(null) }}");
+        let program = Parser::new(Lexer::new(&complete).tokenize().unwrap())
+            .parse_program()
+            .unwrap();
+        crate::checker::Checker::new().check(&program).unwrap();
+        let opaque = if syntax.starts_with('[') {
+            Value::Array(vec![Value::Int(1), Value::Int(2)])
+        } else {
+            Value::Object(HashMap::from([("answer".to_string(), Value::Int(7))]))
+        };
+        let unknown =
+            crate::stdlib::array::eval("first", &[Value::Array(vec![opaque])], Span::default())
+                .unwrap()
+                .expect("registered array.first intrinsic");
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        let mut host = production_interpreter(source);
+        host.task_runtime = Some(runtime.clone());
+        host.async_execution = true;
+        let (text, buffer) = string_input(TEXT, 4096);
+        let shape = opaque_identity(&unknown);
+        let inner = ClaimedNamedTask::new(
+            host,
+            functions(source)["Entry"].clone(),
+            vec![text, unknown],
+            Span::default(),
+        );
+        let selected = inner.machine.is_some();
+        let (_, args) = inner
+            .legacy
+            .as_ref()
+            .expect("opaque Unknown retains complete legacy arguments");
+        let actual_shape = opaque_identity(&args[1]);
+        let string_untouched = matches!(&args[0], Value::String(text) if text.as_ptr() as usize == buffer.pointer && text.capacity() == buffer.capacity);
+        let effects = (inner.interpreter.steps, inner.interpreter.call_depth);
+        drop(inner);
+        close(&runtime);
+        assert!(!selected);
+        assert_eq!(actual_shape, shape);
+        assert!(string_untouched);
+        assert_eq!(effects, (0, 0));
+        crate::cli::run_source("async-primitive-unknown-opaque.ku", &complete).unwrap();
+    }
+}
+
+fn opaque_identity(value: &Value) -> (usize, usize) {
+    match value {
+        Value::Array(values) => (values.as_ptr() as usize, values.capacity()),
+        Value::Object(fields) => (
+            fields.get_key_value("answer").unwrap().0 as *const String as usize,
+            fields.capacity(),
+        ),
+        _ => panic!("the real opaque Unknown owner"),
+    }
+}
+
+fn spawn_primitive_child(
+    runtime: &TaskRuntime,
+    source: &str,
+    code: Option<(CodeHandle, FnId)>,
+    args: Vec<Value>,
+    plan: Plan,
+) -> (TaskHandle, mpsc::Receiver<Witness>) {
+    let mut producer = production_interpreter(source);
+    producer.task_runtime = Some(runtime.clone());
+    let function = producer.functions["Child"].clone();
+    let child_runtime = runtime.clone();
+    let (tx, rx) = mpsc::channel();
+    let (_release, release_rx) = mpsc::channel();
+    let task = runtime
+        .spawn_runner_deferred(|| {
+            let template = producer.template();
+            move || {
+                assert!(crate::runtime::task::current_cleanup_context().is_none());
+                assert!(crate::runtime::task::current_execution_termination().is_none());
+                let mut host = Interpreter::from_template(template, child_runtime);
+                host.async_execution = true;
+                let inner = if let Some((code, function)) = code {
+                    ClaimedNamedTask::from_code(host, code, function, args, Span::default())
+                } else {
+                    ClaimedNamedTask::new(host, function, args, Span::default())
+                };
+                tx.send(Witness::Entered {
+                    task: crate::runtime::task::current_task_id(),
+                    selected: inner.machine.is_some(),
+                    legacy: inner.legacy.is_some(),
+                    pending_error: false,
+                    steps: inner.interpreter.steps,
+                    calls: inner
+                        .machine
+                        .as_ref()
+                        .map_or(0, |m| m.metrics.entered_calls),
+                })
+                .unwrap();
+                SourceRunner {
+                    inner,
+                    plan,
+                    buffers: Vec::new(),
+                    boxes: Vec::new(),
+                    errors: Vec::new(),
+                    primitives: Vec::new(),
+                    last_primitive_candidate: None,
+                    witness: tx,
+                    release: Some(release_rx),
+                    paused: false,
+                    faulted: false,
+                    dispatches: 0,
+                    thread: std::thread::current().id(),
+                }
+            }
+        })
+        .unwrap();
+    (task, rx)
+}
+
+#[test]
+fn pure_scalar_fresh_child_uses_charged_root_and_real_box_budget() {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        for zero_args in [false, true] {
+            let params = if zero_args { "" } else { "n: int" };
+            let operand = if zero_args { "" } else { "0" };
+            let source = format!("async fn Child({params}): {ty}! {{ return ok({literal}) }}\nasync fn Entry(text: str): {ty}! {{ return await Child({operand}) }}");
+            let functions = functions(&source);
+            let code = CodeHandle::compile_claimed_async_owned_scalar_result_entry(
+                &functions,
+                &functions["Entry"],
+                Limits::default(),
+            )
+            .unwrap();
+            let child = code.find_function("Child").unwrap();
+            assert_eq!(code.function(child).owned_scalar_result, Some(kind));
+            for from_code in [true, false] {
+                for fault in [Fault::None, Fault::WrapperCount, Fault::WrapperBytes] {
+                    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+                    let args = if zero_args {
+                        vec![]
+                    } else {
+                        vec![Value::Int(0)]
+                    };
+                    let mut plan = Plan::normal(1);
+                    plan.fault = fault;
+                    let (task, rx) = spawn_primitive_child(
+                        &runtime,
+                        &source,
+                        from_code.then(|| (code.clone(), child)),
+                        args,
+                        plan,
+                    );
+                    let constructor = rx.recv_timeout(WAIT).unwrap();
+                    let mut events = Vec::new();
+                    let proof = loop {
+                        match rx.recv_timeout(WAIT).unwrap() {
+                            Witness::Finished(proof) => break *proof,
+                            event => events.push(event),
+                        }
+                    };
+                    let result = task.await_result();
+                    release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+                    close(&runtime);
+                    assert!(matches!(
+                        constructor,
+                        Witness::Entered {
+                            selected: true,
+                            legacy: false,
+                            steps: 0,
+                            calls: 1,
+                            ..
+                        }
+                    ));
+                    assert_eq!(proof.peak_strings, 0);
+                    if fault == Fault::None {
+                        assert_primitive_source(&result.unwrap(), &proof, expected_scalar(kind), 1);
+                        assert!(events.is_empty());
+                    } else {
+                        assert_eq!(proof.peak_boxes, 0);
+                        assert!(
+                            matches!(events.as_slice(), [Witness::Wrap { input, .. }] if input.capacity == 0)
+                        );
+                        assert!(result.unwrap_err().message.contains(
+                            if fault == Fault::WrapperCount {
+                                "FrameLimit"
+                            } else {
+                                "StorageLimit"
+                            }
+                        ));
+                    }
+                }
+            }
+        }
+    }
 }

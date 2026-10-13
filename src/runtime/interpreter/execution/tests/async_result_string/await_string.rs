@@ -12,6 +12,7 @@ struct Payload {
     map_entries: [usize; 3],
     error_count: usize,
     error_bytes: usize,
+    scalar: Option<ScalarLeaf>,
 }
 
 fn payload_opt(value: &Value) -> Option<Payload> {
@@ -20,12 +21,15 @@ fn payload_opt(value: &Value) -> Option<Payload> {
     };
     let boxed = value.as_ref() as *const Value as usize;
     if *ok {
-        let Value::String(text) = value.as_ref() else {
-            return None;
+        let (string, scalar) = if let Value::String(text) = value.as_ref() {
+            (Some((text.as_ptr() as usize, text.capacity())), None)
+        } else {
+            (None, Some(scalar_leaf(value)?))
         };
         Some(Payload {
             boxed,
-            string: Some((text.as_ptr() as usize, text.capacity())),
+            string,
+            scalar,
             map_buffers: [(0, 0); 6],
             map_entries: [0; 3],
             error_count: 0,
@@ -54,6 +58,7 @@ fn payload_opt(value: &Value) -> Option<Payload> {
         Some(Payload {
             boxed,
             string: None,
+            scalar: None,
             map_buffers,
             map_entries,
             error_count,
@@ -100,6 +105,7 @@ enum AwaitFault {
 enum AwaitPause {
     None,
     Waiting,
+    Ready,
 }
 
 struct AwaitOptions {
@@ -107,6 +113,7 @@ struct AwaitOptions {
     fault: AwaitFault,
     pause: AwaitPause,
     replacement: Option<TaskHandle>,
+    source_fault: Fault,
 }
 
 impl AwaitOptions {
@@ -116,6 +123,7 @@ impl AwaitOptions {
             fault: AwaitFault::None,
             pause: AwaitPause::None,
             replacement: None,
+            source_fault: Fault::None,
         }
     }
 }
@@ -129,6 +137,7 @@ enum AwaitWitness {
     FreshRetired,
     Child(crate::runtime::task::TaskRetirementWitness),
     ReadyNative(Payload),
+    ReadyPaused(Payload),
     CancelTargetReleased(CancellationContext),
 }
 
@@ -276,6 +285,17 @@ impl LocalTaskRunner for AwaitRunner {
                 .and_then(|frame| frame.ticket.test_outcome())
             {
                 let actual = payload(value);
+                if let Some(owner) = primitive_payload(value) {
+                    if !self
+                        .inner
+                        .primitives
+                        .iter()
+                        .any(|old| old.boxed == owner.boxed)
+                    {
+                        self.inner.last_primitive_candidate = Some(owner);
+                        self.inner.primitives.push(owner);
+                    }
+                }
                 let measured = charge(actual);
                 let ticket = &machine.awaiting.as_ref().unwrap().ticket;
                 assert_eq!(
@@ -293,6 +313,15 @@ impl LocalTaskRunner for AwaitRunner {
                 let stable_bytes =
                     machine.result_wrapper_bytes + machine.error_leaf_bytes - cached.bytes;
                 let saved = machine.value_limits;
+                machine.value_limits.max_frames = base_count + stable_count + measured.count;
+                machine.value_limits.max_storage_bytes = base_bytes + stable_bytes + measured.bytes;
+                let spare = machine.values.capacity() - machine.values.len();
+                machine.reserve_values(spare, Span::default()).unwrap();
+                machine.check_argument_capacity(0, Span::default()).unwrap();
+                machine
+                    .check_exit_storage_capacity(0, 0, Span::default())
+                    .unwrap();
+                machine.check_lease_capacity(0, 0, Span::default()).unwrap();
                 machine.value_limits.max_frames = base_count + stable_count + measured.count - 1;
                 reject_all_value_budget_entries(machine, "FrameLimit");
                 machine.value_limits = saved;
@@ -303,6 +332,13 @@ impl LocalTaskRunner for AwaitRunner {
                 self.events
                     .send(AwaitWitness::Ticket { actual, cached })
                     .unwrap();
+                if self.options.pause == AwaitPause::Ready && !self.paused {
+                    self.paused = true;
+                    self.events.send(AwaitWitness::ReadyPaused(actual)).unwrap();
+                    self.release
+                        .recv_timeout(WAIT)
+                        .expect("finite actual Ready ticket checkpoint");
+                }
                 if self.options.fault == AwaitFault::NativeReady {
                     self.events.send(AwaitWitness::ReadyNative(actual)).unwrap();
                     let _cleanup =
@@ -402,9 +438,14 @@ fn spawn_await(
                 AwaitRunner {
                     inner: SourceRunner {
                         inner,
-                        plan: Plan::normal(options.chunk),
+                        plan: Plan {
+                            fault: options.source_fault,
+                            ..Plan::normal(options.chunk)
+                        },
                         boxes: vec![None; buffers.len()],
                         errors: Vec::new(),
+                        primitives: Vec::new(),
+                        last_primitive_candidate: None,
                         buffers,
                         witness: tx,
                         release: Some(inner_release),
@@ -1368,4 +1409,625 @@ fn terminal_err_ready_native_and_late_cancel_retire_actual_child_maps_without_ow
         (proof.peak_boxes, proof.peak_errors, proof.peak_error_bytes),
         (0, 0, 0)
     );
+}
+
+#[test]
+fn primitive_terminal_await_fresh_child_preserves_actual_scalar_or_false_map_across_chunks() {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        for error in [false, true] {
+            let leaf = if error {
+                "err(text)".to_string()
+            } else {
+                format!("ok({literal})")
+            };
+            let source = format!("fn Leaf(text: str): {ty}! {{ return {leaf} }}\nasync fn Child(text: str): {ty}! {{ return Leaf(text) }}\nasync fn Entry(text: str): {ty}! {{ return await Child(text) }}");
+            let functions = functions(&source);
+            assert!(code::eligible_claimed_async_owned_scalar_result_entry(
+                &functions,
+                &functions["Entry"],
+                Limits::default()
+            ));
+            let code = CodeHandle::compile_claimed_async_owned_scalar_result_entry(
+                &functions,
+                &functions["Entry"],
+                Limits::default(),
+            )
+            .unwrap();
+            for name in ["Entry", "Child", "Leaf"] {
+                assert_eq!(
+                    code.function(code.find_function(name).unwrap())
+                        .owned_scalar_result,
+                    Some(kind)
+                );
+            }
+            for chunk in [1, 7, 256] {
+                let (text, buffer) = string_input(TEXT, 4096);
+                let (proof, tickets, result) =
+                    err_await_receipt(&source, vec![text], vec![buffer], chunk);
+                let result = result.unwrap();
+                let actual = payload(&result);
+                assert_eq!(tickets.as_slice(), &[actual]);
+                assert_eq!(
+                    (proof.calls, proof.peak_calls, proof.peak_strings),
+                    (1, 1, buffer.capacity)
+                );
+                if error {
+                    let backing = assert_source_error(&result, &proof, &[buffer]);
+                    assert_eq!(
+                        (actual.map_entries, actual.map_buffers),
+                        (backing.entries, backing.buffers)
+                    );
+                    assert_eq!(
+                        charge(actual).bytes,
+                        std::mem::size_of::<Value>() + backing.bytes
+                    );
+                } else {
+                    let boxed =
+                        assert_primitive_source(&result, &proof, expected_scalar(kind), chunk);
+                    assert_eq!(actual.boxed, boxed.boxed);
+                    assert_eq!(actual.scalar, Some(expected_scalar(kind)));
+                    assert_eq!(
+                        (charge(actual).count, charge(actual).bytes),
+                        (1, std::mem::size_of::<Value>())
+                    );
+                }
+            }
+        }
+    }
+    let source = "async fn Child(text: str, value: float): float! { return ok(value) }\nasync fn Entry(text: str, value: float): float! { return await Child(text, value) }";
+    let (text, buffer) = string_input(TEXT, 4096);
+    let actual_null =
+        crate::stdlib::array::eval("first", &[Value::Array(Vec::new())], Span::default())
+            .unwrap()
+            .expect("registered array.first intrinsic");
+    let (proof, tickets, result) =
+        err_await_receipt(source, vec![text, actual_null], vec![buffer], 1);
+    let result = result.unwrap();
+    assert_primitive_source(&result, &proof, ScalarLeaf::Null, 1);
+    assert_eq!(tickets.as_slice(), &[payload(&result)]);
+    assert_eq!(
+        (tickets[0].scalar, charge(tickets[0]).bytes),
+        (Some(ScalarLeaf::Null), std::mem::size_of::<Value>())
+    );
+}
+
+#[test]
+fn primitive_terminal_await_single_worker_keeps_64_65_fresh_child_edge_and_sync_512_513() {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        for mutual in [false, true] {
+            let other = if mutual {
+                format!("async fn Other(text: str, n: int): {ty}! {{ if (n <= 0) {{ return ok({literal}) }}\nreturn await Entry(text, n - 1) }}\n")
+            } else {
+                String::new()
+            };
+            let next = if mutual { "Other" } else { "Entry" };
+            let source = format!("{other}async fn Entry(text: str, n: int): {ty}! {{ if (n <= 0) {{ return ok({literal}) }}\nreturn await {next}(text, n - 1) }}");
+            for n in [64, 65] {
+                let (text, buffer) = string_input(TEXT, 4096);
+                let (proof, tickets, result) =
+                    err_await_receipt(&source, vec![text, Value::Int(n)], vec![buffer], 1);
+                let result = result.unwrap();
+                assert_eq!(tickets.as_slice(), &[payload(&result)]);
+                if n == 64 {
+                    assert_primitive_source(&result, &proof, expected_scalar(kind), 1);
+                } else {
+                    assert_await_depth(&result, n);
+                    assert_eq!(proof.peak_boxes, 1);
+                }
+                assert_eq!((proof.calls, proof.peak_calls), (1, 1));
+            }
+        }
+        let source = format!("async fn Child(text: str): {ty}! {{ return ok({literal}) }}\nasync fn Entry(text: str, n: int): {ty}! {{ if (n <= 0) {{ return await Child(text) }}\nreturn await Entry(text, n - 1) }}");
+        for n in [63, 64] {
+            let (text, buffer) = string_input(TEXT, 4096);
+            let (proof, tickets, result) =
+                err_await_receipt(&source, vec![text, Value::Int(n)], vec![buffer], 1);
+            let result = result.unwrap();
+            assert_eq!(tickets.as_slice(), &[payload(&result)]);
+            if n == 63 {
+                assert_primitive_source(&result, &proof, expected_scalar(kind), 1);
+            } else {
+                assert_await_depth(&result, n);
+            }
+        }
+        let source = format!("fn Relay(text: str, n: int): {ty}! {{ if (n <= 0) {{ return ok({literal}) }}\nreturn Relay(text, n - 1) }}\nasync fn Child(text: str, n: int): {ty}! {{ return Relay(text, n) }}\nasync fn Entry(text: str, n: int): {ty}! {{ return await Child(text, n) }}");
+        for n in [510, 511] {
+            let (text, buffer) = string_input(TEXT, 4096);
+            let (proof, tickets, result) =
+                err_await_receipt(&source, vec![text, Value::Int(n)], vec![buffer], 1);
+            if n == 510 {
+                let result = result.unwrap();
+                assert_primitive_source(&result, &proof, expected_scalar(kind), 1);
+                assert_eq!(tickets.as_slice(), &[payload(&result)]);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code.as_deref(),
+                    Some("call_depth_exceeded")
+                );
+                assert_eq!(proof.peak_boxes, 0);
+                assert!(tickets.is_empty());
+            }
+        }
+    }
+}
+
+fn assert_await_depth(value: &Value, depth: i64) {
+    let Value::Result { ok: false, value } = value else {
+        panic!("the original first await-depth rejection is a false Result at source depth {depth}")
+    };
+    let Value::Object(fields) = value.as_ref() else {
+        unreachable!()
+    };
+    assert!(
+        matches!(fields.get("domain"), Some(Value::String(domain)) if domain == "task"),
+        "depth={depth}, fields={fields:?}"
+    );
+    assert!(
+        matches!(fields.get("code"), Some(Value::String(code)) if code == "await_depth"),
+        "depth={depth}, limit={}, fields={fields:?}",
+        crate::runtime::task::MAX_AWAIT_DEPTH
+    );
+}
+
+#[test]
+fn primitive_terminal_await_real_slot_pre_take_rejections_preserve_box_and_four_budget_entries() {
+    for (_, ty, literal) in ASYNC_PRIMITIVES {
+        for error in [false, true] {
+            let leaf = if error {
+                "err(text)".to_string()
+            } else {
+                format!("ok({literal})")
+            };
+            let child_source = format!("async fn Entry(text: str): {ty}! {{ return {leaf} }}");
+            let parent = format!("async fn Child(text: str): {ty}! {{ return ok({literal}) }}\nasync fn Entry(text: str): {ty}! {{ return await Child(text) }}");
+            for fault in [AwaitFault::CountBeforeTake, AwaitFault::BytesBeforeTake] {
+                let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
+                let (child, original) = completed_target_source(&runtime, &child_source, false);
+                // This explicit diagnostic owner is limited to slot metadata;
+                // the cancellation/last-owner tests retain no such clone.
+                let diagnostic = child.clone();
+                let (text, buffer) = string_input(TEXT, 4096);
+                let mut options = AwaitOptions::normal(1);
+                options.replacement = Some(child);
+                options.fault = fault;
+                let (task, rx, events, _) =
+                    spawn_await(&runtime, &parent, vec![text], vec![buffer], options);
+                let constructor = rx.recv_timeout(WAIT).unwrap();
+                let completion = rx.recv_timeout(WAIT).unwrap();
+                let result = task.await_result();
+                let retained = slot_payload(&diagnostic);
+                release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+                release_task(
+                    diagnostic,
+                    CancellationContext::new(TerminationReason::Cancelled),
+                );
+                close(&runtime);
+                let tickets = ticket_events(&events);
+                assert!(matches!(
+                    constructor,
+                    Witness::Entered {
+                        selected: true,
+                        legacy: false,
+                        ..
+                    }
+                ));
+                let Witness::Finished(proof) = completion else {
+                    panic!("pre-take rejection drains real parent")
+                };
+                assert_eq!(retained, Some(original), "the rejected real child slot preserves Box, actual scalar or Map and all six buffers");
+                assert!(result.unwrap_err().message.contains(
+                    if fault == AwaitFault::CountBeforeTake {
+                        "FrameLimit"
+                    } else {
+                        "StorageLimit"
+                    }
+                ));
+                assert_eq!(
+                    (proof.peak_boxes, proof.peak_errors, proof.peak_error_bytes),
+                    (0, 0, 0)
+                );
+                assert!(tickets.is_empty());
+                if !error {
+                    assert_eq!(
+                        (charge(original).count, charge(original).bytes),
+                        (1, std::mem::size_of::<Value>())
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn primitive_terminal_await_q2_q3_saved_primaries_return_last_real_ticket_box() {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        for (errors, owners) in [
+            ([false, false, false], 2),
+            ([true, true, false], 2),
+            ([true, false, false], 2),
+            ([false, true, false], 2),
+            ([true, false, true], 3),
+        ] {
+            let mut children = String::new();
+            for (index, name) in ["First", "Second", "Third"].into_iter().enumerate() {
+                let leaf = if errors[index] {
+                    "err(text)".to_string()
+                } else {
+                    format!("ok({literal})")
+                };
+                children.push_str(&format!(
+                    "async fn {name}(text: str): {ty}! {{ return {leaf} }}\n"
+                ));
+            }
+            let replacement = if owners == 2 {
+                "return await Second(second)"
+            } else {
+                "try { return await Second(second) } finally { return await Third(third) }"
+            };
+            let source = format!("{children}async fn Entry(first: str, second: str, third: str): {ty}! {{ try {{ return await First(first) }} finally {{ {replacement} }}\nreturn ok({literal}) }}");
+            for chunk in [1, 7, 256] {
+                let (a, first) = string_input("中\0primary", 1024);
+                let (b, second) = string_input("é\0replacement", 4096);
+                let (c, third) = string_input(TEXT, 2048);
+                let buffers = [first, second, third];
+                let (proof, tickets, result) =
+                    err_await_receipt(&source, vec![a, b, c], buffers.to_vec(), chunk);
+                let result = result.unwrap();
+                let actual = payload(&result);
+                assert_eq!(tickets.len(), owners);
+                assert_eq!(tickets.last(), Some(&actual));
+                assert_eq!(
+                    (proof.peak_boxes, proof.peak_box_bytes, proof.finally),
+                    (owners, owners * std::mem::size_of::<Value>(), owners - 1)
+                );
+                assert_eq!(
+                    proof.peak_strings,
+                    buffers.iter().map(|buffer| buffer.capacity).sum::<usize>()
+                );
+                if errors[owners - 1] {
+                    assert_eq!(result_buffer(&result, &buffers).0, owners - 1);
+                } else {
+                    assert_eq!(actual.scalar, Some(expected_scalar(kind)));
+                }
+                if chunk == 1 {
+                    assert_eq!(proof.primitive_owners.len(), owners);
+                    assert_eq!(
+                        proof.last_primitive_candidate,
+                        primitive_payload(&result),
+                        "the last independently read Ready ticket is the final actual Box"
+                    );
+                    assert_eq!(
+                        (proof.peak_errors, proof.peak_error_bytes),
+                        (
+                            tickets.iter().map(|p| p.error_count).sum::<usize>(),
+                            tickets.iter().map(|p| p.error_bytes).sum::<usize>()
+                        )
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn primitive_terminal_await_later_argument_fuel_ready_native_waiting_and_late_cancel_retire() {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        let source = format!("async fn Child(text: str): {ty}! {{ return ok({literal}) }}\nasync fn Entry(text: str): {ty}! {{ return await Child(text) }}");
+        let later = format!("async fn Child(text: str, ignored: int): {ty}! {{ return ok({literal}) }}\nasync fn Entry(text: str): {ty}! {{ return await Child(text, 1 / 0) }}");
+        let (text, buffer) = string_input(TEXT, 4096);
+        let (proof, tickets, result) = err_await_receipt(&later, vec![text], vec![buffer], 1);
+        assert_eq!(result.unwrap_err().message, "division by zero");
+        assert_eq!(proof.peak_boxes, 0);
+        assert!(tickets.is_empty());
+        for fault in [Fault::FuelBefore, Fault::FuelAfter] {
+            let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
+            let (text, buffer) = string_input(TEXT, 4096);
+            let mut options = AwaitOptions::normal(1);
+            options.source_fault = fault;
+            let (task, rx, events, _) =
+                spawn_await(&runtime, &source, vec![text], vec![buffer], options);
+            let constructor = rx.recv_timeout(WAIT).unwrap();
+            let completion = rx.recv_timeout(WAIT).unwrap();
+            let result = task.await_result();
+            release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+            close(&runtime);
+            let tickets = ticket_events(&events);
+            assert!(matches!(
+                constructor,
+                Witness::Entered { selected: true, .. }
+            ));
+            let Witness::Finished(proof) = completion else {
+                panic!("actual fuel parent drain")
+            };
+            assert_eq!(
+                result.unwrap_err().message,
+                "internal execution prototype test fuel exhausted"
+            );
+            assert_eq!(proof.peak_boxes, usize::from(fault == Fault::FuelAfter));
+            if fault == Fault::FuelBefore {
+                assert!(tickets.is_empty());
+            }
+        }
+        let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
+        let (text, buffer) = string_input(TEXT, 4096);
+        let mut options = AwaitOptions::normal(1);
+        options.fault = AwaitFault::NativeReady;
+        let (task, rx, events, _) =
+            spawn_await(&runtime, &source, vec![text], vec![buffer], options);
+        let constructor = rx.recv_timeout(WAIT).unwrap();
+        let mut observed = Vec::new();
+        loop {
+            let event = events.recv_timeout(WAIT).unwrap();
+            let ready = matches!(event, AwaitWitness::ReadyNative(_));
+            observed.push(event);
+            if ready {
+                break;
+            }
+        }
+        let result = task.await_result();
+        release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+        let (text, buffer) = string_input(TEXT, 4096);
+        let (healthy, healthy_rx, healthy_events, _) = spawn_await(
+            &runtime,
+            &source,
+            vec![text],
+            vec![buffer],
+            AwaitOptions::normal(1),
+        );
+        let healthy_constructor = healthy_rx.recv_timeout(WAIT).unwrap();
+        let healthy_completion = healthy_rx.recv_timeout(WAIT).unwrap();
+        let healthy_result = healthy.await_result();
+        release_task(
+            healthy,
+            CancellationContext::new(TerminationReason::Cancelled),
+        );
+        close(&runtime);
+        assert!(matches!(
+            constructor,
+            Witness::Entered { selected: true, .. }
+        ));
+        assert!(matches!(
+            healthy_constructor,
+            Witness::Entered { selected: true, .. }
+        ));
+        let Witness::Finished(proof) = healthy_completion else {
+            panic!("same worker remains healthy after actual Ready abandonment")
+        };
+        let healthy_result = healthy_result.unwrap();
+        assert_primitive_source(&healthy_result, &proof, expected_scalar(kind), 1);
+        assert_eq!(
+            ticket_events(&healthy_events).as_slice(),
+            &[payload(&healthy_result)]
+        );
+        let mut ticket = None;
+        let mut ready = None;
+        for event in observed.into_iter().chain(events.try_iter()) {
+            match event {
+                AwaitWitness::Ticket { actual, .. } => ticket = Some(actual),
+                AwaitWitness::ReadyNative(actual) => ready = Some(actual),
+                AwaitWitness::Child(witness) => retired(TaskRetirementBatch::from_reserved(
+                    vec![witness],
+                    CancellationContext::new(TerminationReason::Cancelled),
+                )),
+                _ => panic!("actual Ready ownership events"),
+            }
+        }
+        assert_eq!(ticket, ready);
+        assert_eq!(ready.unwrap().scalar, Some(expected_scalar(kind)));
+        let Value::Result { ok: false, value } = result.unwrap() else {
+            panic!("native panic Result")
+        };
+        let Value::Object(fields) = *value else {
+            unreachable!()
+        };
+        assert!(matches!(fields.get("code"), Some(Value::String(code)) if code == "panic"));
+
+        let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
+        let (text, buffer) = string_input(TEXT, 4096);
+        let mut options = AwaitOptions::normal(1);
+        options.pause = AwaitPause::Ready;
+        let (task, rx, events, release) =
+            spawn_await(&runtime, &source, vec![text], vec![buffer], options);
+        let constructor = rx.recv_timeout(WAIT).unwrap();
+        let mut ready_events = Vec::new();
+        loop {
+            let event = events.recv_timeout(WAIT).unwrap();
+            let ready = matches!(event, AwaitWitness::ReadyPaused(_));
+            ready_events.push(event);
+            if ready {
+                break;
+            }
+        }
+        let original = CancellationContext::new(TerminationReason::TimedOut);
+        let shorter = CancellationContext {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: original.cleanup_deadline - Duration::from_millis(100),
+        };
+        let accepted = task.request_cancel_with(original);
+        let second = task.request_cancel_with(shorter);
+        let expected = CancellationContext {
+            reason: original.reason,
+            cleanup_deadline: shorter.cleanup_deadline,
+        };
+        release.send(()).unwrap();
+        let completion = rx.recv_timeout(WAIT).unwrap();
+        let result = task.await_result();
+        release_task(task, expected);
+        close(&runtime);
+        assert!(matches!(
+            constructor,
+            Witness::Entered { selected: true, .. }
+        ));
+        assert!(matches!(completion, Witness::Finished(_)));
+        assert!(accepted && !second);
+        assert_eq!(result.unwrap_err().runtime_termination(), Some(expected));
+        let mut ticket = None;
+        let mut ready = None;
+        for event in ready_events.into_iter().chain(events.try_iter()) {
+            match event {
+                AwaitWitness::Ticket { actual, .. } => ticket = Some(actual),
+                AwaitWitness::ReadyPaused(actual) => ready = Some(actual),
+                AwaitWitness::Child(witness) => {
+                    retired(TaskRetirementBatch::from_reserved(vec![witness], expected))
+                }
+                AwaitWitness::CancelTargetReleased(context) => assert_eq!(context, expected),
+                _ => panic!("actual Ready cancellation events"),
+            }
+        }
+        assert_eq!(ticket, ready);
+        assert_eq!(ready.unwrap().scalar, Some(expected_scalar(kind)));
+
+        // A real produced child remains on its runner stack. No diagnostic
+        // Task clone survives the sole target transfer or cancellation.
+        let runtime = TaskRuntime::with_limits(2, 128, 0, 0, 128);
+        let child_source = format!("async fn Entry(text: str): {ty}! {{ return ok({literal}) }}");
+        let (text, child_buffer) = string_input(TEXT, 4096);
+        let mut plan = Plan::normal(1);
+        plan.pause = Pause::Produced;
+        let (child, child_rx, child_release) = spawn_source(
+            &runtime,
+            &child_source,
+            vec![text],
+            vec![child_buffer],
+            plan,
+        );
+        let child_constructor = child_rx.recv_timeout(WAIT).unwrap();
+        let child_completion = child_rx.recv_timeout(WAIT).unwrap();
+        let child_pause = child_rx.recv_timeout(WAIT).unwrap();
+        let witness = child.retirement_witness();
+        let (text, buffer) = string_input(TEXT, 4096);
+        let mut options = AwaitOptions::normal(1);
+        options.replacement = Some(child);
+        options.pause = AwaitPause::Waiting;
+        let (task, rx, events, release) =
+            spawn_await(&runtime, &source, vec![text], vec![buffer], options);
+        let constructor = rx.recv_timeout(WAIT).unwrap();
+        let fresh_retired = events.recv_timeout(WAIT).unwrap();
+        let waiting = events.recv_timeout(WAIT).unwrap();
+        let original = CancellationContext::new(TerminationReason::TimedOut);
+        let shorter = CancellationContext {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: original.cleanup_deadline - Duration::from_millis(100),
+        };
+        let accepted = task.request_cancel_with(original);
+        let second = task.request_cancel_with(shorter);
+        let expected = CancellationContext {
+            reason: original.reason,
+            cleanup_deadline: shorter.cleanup_deadline,
+        };
+        release.send(()).unwrap();
+        let target_released = events.recv_timeout(WAIT).unwrap();
+        child_release.send(()).unwrap();
+        let completion = rx.recv_timeout(WAIT).unwrap();
+        let result = task.await_result();
+        release_task(task, expected);
+        retired(TaskRetirementBatch::from_reserved(vec![witness], expected));
+        close(&runtime);
+        assert!(matches!(
+            child_constructor,
+            Witness::Entered { selected: true, .. }
+        ));
+        assert!(matches!(
+            child_pause,
+            Witness::Paused {
+                stage: Pause::Produced,
+                ..
+            }
+        ));
+        let Witness::Finished(child_proof) = child_completion else {
+            panic!("produced real child")
+        };
+        assert!(child_proof.outgoing_primitive.is_some());
+        assert!(matches!(
+            constructor,
+            Witness::Entered { selected: true, .. }
+        ));
+        assert!(matches!(fresh_retired, AwaitWitness::FreshRetired));
+        assert!(matches!(waiting, AwaitWitness::Waiting));
+        assert!(
+            matches!(target_released, AwaitWitness::CancelTargetReleased(context) if context == expected)
+        );
+        assert!(accepted && !second);
+        let Witness::Finished(proof) = completion else {
+            panic!("cancelled real parent drains")
+        };
+        assert_eq!(proof.peak_boxes, 0);
+        assert_eq!(result.unwrap_err().runtime_termination(), Some(expected));
+    }
+}
+
+#[test]
+fn primitive_terminal_await_legal_whole_tree_and_cached_kind_rejections_keep_legacy_inputs() {
+    for (_, ty, literal) in ASYNC_PRIMITIVES {
+        let wrong_ty = if ty == "float" { "int" } else { "float" };
+        let wrong_literal = if wrong_ty == "int" { "7" } else { "1.25" };
+        let invalid = format!("async fn Wrong(text: str): {wrong_ty}! {{ return ok({wrong_literal}) }}\nasync fn Entry(text: str): {ty}! {{ return ok({literal})\nreturn await Wrong(text) }}\nfn main() {{}}");
+        let program = Parser::new(Lexer::new(&invalid).tokenize().unwrap())
+            .parse_program()
+            .unwrap();
+        let error = crate::checker::Checker::new()
+            .check(&program)
+            .expect_err("typed cross-kind terminal await return is checker-invalid even when dead");
+        assert!(
+            error
+                .message
+                .contains(&format!("expected {ty}! but got {wrong_ty}!")),
+            "{error:?}"
+        );
+        for source in [
+            format!("async fn Child(text: str): {ty}! {{ return ok({literal}) }}\nasync fn Entry(text: str): {ty}! {{ task = Child(text)\nreturn await task }}"),
+            format!("async fn Child(text: str): {ty}! {{ result = ok({literal})\nreturn result }}\nasync fn Entry(text: str): {ty}! {{ return await Child(text) }}"),
+            format!("async fn Child(text: str): {ty}! {{ return ok({literal}) }}\nasync fn Entry(text: str): {ty}! {{ return ok((await Child(text))?) }}"),
+            format!("async fn Wrong(text: str): {wrong_ty}! {{ return ok({wrong_literal}) }}\nasync fn Entry(text: str): {ty}! {{ return ok({literal})\nawait Wrong(text) }}"),
+        ] {
+            let functions = functions(&source); let entry = &functions["Entry"];
+            assert!(!code::eligible_claimed_async_owned_scalar_result_entry(&functions, entry, Limits::default()), "{source}");
+            assert!(matches!(CodeHandle::compile_claimed_async_owned_scalar_result_entry(&functions, entry, Limits::default()), Err(AdmissionError::Unsupported(_))), "{source}");
+            let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8); let (text, buffer) = string_input(TEXT, 4096); let mut plan = Plan::normal(1); plan.selection_only = true;
+            let (task, rx, _) = spawn_source(&runtime, &source, vec![text], vec![buffer], plan); let constructor = rx.recv_timeout(WAIT).unwrap(); let result = task.await_result();
+            release_task(task, CancellationContext::new(TerminationReason::Cancelled)); close(&runtime);
+            assert!(matches!(constructor, Witness::Entered { selected: false, legacy: true, steps: 0, .. })); assert_eq!(result.unwrap(), Value::Null);
+        }
+    }
+    // Strict Unsupported must preserve the previously admitted scalar-only
+    // Machine slice, including its legal nested Result unwrap capability.
+    let source = "async fn Child(n: int): int! { return ok(n) }\nasync fn Entry(n: int): int! { return ok((await Child(n))?) }";
+    let functions = functions(source);
+    assert!(matches!(
+        code::admit_claimed_async_owned_scalar_result_entry(
+            &functions,
+            &functions["Entry"],
+            Limits::default()
+        ),
+        Err(AdmissionError::Unsupported(_))
+    ));
+    let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
+    let mut host = production_interpreter(source);
+    host.task_runtime = Some(runtime.clone());
+    host.async_execution = true;
+    let inner = ClaimedNamedTask::new(
+        host,
+        functions["Entry"].clone(),
+        vec![Value::Int(7)],
+        Span::default(),
+    );
+    let machine = inner
+        .machine
+        .as_ref()
+        .expect("strict Unsupported preserves the admitted old scalar Machine");
+    let legacy = inner.legacy.is_some();
+    let entry = machine.code.find_function("Entry").unwrap();
+    let declared = machine.code.function(entry).owned_scalar_result;
+    let effects = (inner.interpreter.steps, inner.interpreter.call_depth);
+    drop(inner);
+    close(&runtime);
+    assert!(!legacy);
+    assert_eq!(declared, None);
+    assert_eq!(effects, (0, 0));
+    let complete = format!("{source}\nasync fn main(): null! {{ value = (await Entry(7))?\nif (value != 7) {{ return err(\"old scalar result changed\") }}\nreturn ok(null) }}");
+    let program = Parser::new(Lexer::new(&complete).tokenize().unwrap())
+        .parse_program()
+        .unwrap();
+    crate::checker::Checker::new().check(&program).unwrap();
+    crate::cli::run_source("async-primitive-strict-unsupported-legacy.ku", &complete).unwrap();
 }

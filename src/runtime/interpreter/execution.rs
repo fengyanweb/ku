@@ -4783,7 +4783,9 @@ impl ClaimedNamedTask {
         let entry_code = machine.code.clone();
         let function_code = entry_code.function(function);
         let entry = entry_code.symbol(function_code.name);
-        if function_code.owned_async_string {
+        if function_code.owned_async_string
+            || (function_code.is_async && function_code.owned_scalar_result.is_some())
+        {
             let mut args = args;
             let outcome = machine
                 .start_owned_once(entry, &mut args, 0, false)
@@ -4864,7 +4866,11 @@ impl ClaimedNamedTask {
         let owned_string_result = function.is_async
             && matches!(&function.return_type,
                 Some(TypeName::Result(inner)) if matches!(inner.as_ref(), TypeName::String));
-        let owned_shape = owned_string_result
+        let owned_scalar_result = function.is_async
+            && matches!(&function.return_type,
+                Some(TypeName::Result(inner)) if matches!(inner.as_ref(),
+                    TypeName::Int | TypeName::Float | TypeName::Bool | TypeName::Null));
+        let owned_shape = (owned_string_result || owned_scalar_result)
             && args.len() == function.params.len()
             && args
                 .iter()
@@ -4876,34 +4882,65 @@ impl ClaimedNamedTask {
                     scalar(value, span).is_ok()
                 }
             });
-        if owned_shape
-            && code::eligible_claimed_async_owned_result_string_entry(&source, function, limits)
-        {
-            let code = match CodeHandle::compile_claimed_async_owned_result_string_entry(
-                &source, function, limits,
-            ) {
-                Ok(code) => code,
-                Err(AdmissionError::Unsupported(_)) => return runner,
+        let owned_eligible = if owned_shape {
+            let admitted = if owned_scalar_result {
+                code::admit_claimed_async_owned_scalar_result_entry(&source, function, limits)
+            } else {
+                code::admit_claimed_async_owned_result_string_entry(&source, function, limits)
+            };
+            match admitted {
+                Ok(()) => true,
+                Err(AdmissionError::Unsupported(_)) => false,
+                // Eligibility can exhaust its real syntax budget before
+                // construction. Retain that controlled rejection instead of
+                // replaying the same selected tree in the old evaluator.
+                Err(error @ AdmissionError::Rejected(_)) => {
+                    runner.outcome = Some(Err(error.into_error()));
+                    drop(runner.legacy.take());
+                    return runner;
+                }
+            }
+        } else {
+            false
+        };
+        if owned_eligible {
+            let compiled = if owned_scalar_result {
+                CodeHandle::compile_claimed_async_owned_scalar_result_entry(
+                    &source, function, limits,
+                )
+            } else {
+                CodeHandle::compile_claimed_async_owned_result_string_entry(
+                    &source, function, limits,
+                )
+            };
+            let code = match compiled {
+                Ok(code) => Some(code),
+                // Keep both original owners and continue the existing scalar
+                // selector. An unsupported strict await/? tree may still be
+                // a legal old scalar Machine tree; no body has executed.
+                Err(AdmissionError::Unsupported(_)) => None,
                 Err(error @ AdmissionError::Rejected(_)) => {
                     runner.outcome = Some(Err(error.into_error()));
                     drop(runner.legacy.take());
                     return runner;
                 }
             };
-            // Whole-tree selection and code construction precede taking the
-            // original FnDecl/Vec. Unsupported admission keeps both intact.
-            let (function, mut args) = runner.legacy.take().expect("selected owned task input");
-            let mut machine = Machine::from_code(code, limits, runner.interpreter.call_depth);
-            if let Err(error) = machine.start_owned_once(&function.name, &mut args, 0, false) {
-                runner.outcome = Some(Err(error));
+            if let Some(code) = code {
+                // Whole-tree selection and code construction precede taking the
+                // original FnDecl/Vec. Unsupported admission keeps both intact.
+                let (function, mut args) = runner.legacy.take().expect("selected owned task input");
+                let mut machine = Machine::from_code(code, limits, runner.interpreter.call_depth);
+                if let Err(error) = machine.start_owned_once(&function.name, &mut args, 0, false) {
+                    runner.outcome = Some(Err(error));
+                }
+                runner.machine = Some(machine);
+                // start_owned_once admits the actual input Vec/String capacities
+                // before entering parameters/body, and moves each Owned root. Its
+                // real entry buffer (or rejected original input) retires here.
+                drop(function);
+                drop(args);
+                return runner;
             }
-            runner.machine = Some(machine);
-            // start_owned_once admits the actual input Vec/String capacities
-            // before entering parameters/body, and moves each Owned root. Its
-            // real entry buffer (or rejected original input) retires here.
-            drop(function);
-            drop(args);
-            return runner;
         }
         if args.iter().any(|value| scalar(value, span).is_err())
             || !code::eligible_claimed_async_entry(&source, function, limits)
