@@ -23,8 +23,8 @@ use storage::{FrameLimits, FrameStack, ReserveError};
 mod code;
 mod storage;
 use code::{
-    AdmissionError, BlockId, CodeHandle, ExprCode, ExprId, ExprRange, FnId, ScalarLiteral, SpanId,
-    StmtCode, StmtId, SymbolId,
+    AdmissionError, BlockId, CodeHandle, ExprCode, ExprId, ExprRange, FnId, PrimitiveResultKind,
+    ScalarLiteral, SpanId, StmtCode, StmtId, SymbolId,
 };
 #[cfg(test)]
 mod tests;
@@ -552,6 +552,7 @@ enum Work {
     Discard,
     Return,
     WrapTerminalOk(SpanId, bool),
+    WrapOwnedScalarResult(SpanId, PrimitiveResultKind),
     WrapTerminalErr(SpanId),
     WrapBorrowedTerminalOk(SpanId),
     AwaitOperand(SpanId),
@@ -2997,6 +2998,11 @@ impl Machine {
                         );
                         push(&mut self.work, Work::Eval(operand));
                     }
+                    ExprCode::TerminalOwnedScalarOk(operand, kind) => {
+                        self.reserve_work(2, span)?;
+                        push(&mut self.work, Work::WrapOwnedScalarResult(expr.span, kind));
+                        push(&mut self.work, Work::Eval(operand));
+                    }
                     ExprCode::TerminalErr(operand) => {
                         self.reserve_work(2, span)?;
                         push(&mut self.work, Work::WrapTerminalErr(expr.span));
@@ -3204,6 +3210,16 @@ impl Machine {
             Work::WrapBorrowedTerminalOk(span_id) => {
                 let span = self.code.span(span_id);
                 let value = self.value();
+                scalar(&value, span)?;
+                self.emit_budgeted_ok(value, span)?;
+            }
+            Work::WrapOwnedScalarResult(span_id, _declared_kind) => {
+                let span = self.code.span(span_id);
+                let value = self.value();
+                // The declaration constrains static relay/cache selection,
+                // not dynamic value coercion. Checker accepts Unknown actual
+                // arguments, and the existing builtin preserves their real
+                // primitive variant (e.g. empty array.first yields Null).
                 scalar(&value, span)?;
                 self.emit_budgeted_ok(value, span)?;
             }

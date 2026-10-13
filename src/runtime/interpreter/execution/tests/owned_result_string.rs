@@ -1136,3 +1136,1071 @@ fn terminal_err_q2_q3_keep_distinct_real_maps_until_arbitration_and_native_drop(
         }
     }
 }
+
+use code::PrimitiveResultKind;
+
+const PRIMITIVE_CASES: [(PrimitiveResultKind, &str, &str); 4] = [
+    (PrimitiveResultKind::Int, "int", "7"),
+    (PrimitiveResultKind::Float, "float", "1.25"),
+    (PrimitiveResultKind::Bool, "bool", "true"),
+    (PrimitiveResultKind::Null, "null", "null"),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimitiveLeaf {
+    Int(i64),
+    Float(u64),
+    Bool(bool),
+    Null,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrimitiveBox {
+    address: usize,
+    leaf: PrimitiveLeaf,
+    error: Option<ErrorPayload>,
+}
+
+fn expected_primitive(kind: PrimitiveResultKind) -> PrimitiveLeaf {
+    match kind {
+        PrimitiveResultKind::Int => PrimitiveLeaf::Int(7),
+        PrimitiveResultKind::Float => PrimitiveLeaf::Float(1.25_f64.to_bits()),
+        PrimitiveResultKind::Bool => PrimitiveLeaf::Bool(true),
+        PrimitiveResultKind::Null => PrimitiveLeaf::Null,
+    }
+}
+
+fn primitive_snapshot(
+    value: &Value,
+    kind: PrimitiveResultKind,
+    buffers: &[Buffer],
+) -> Option<PrimitiveBox> {
+    let Value::Result { ok, value: leaf } = value else {
+        return None;
+    };
+    let address = leaf.as_ref() as *const Value as usize;
+    let (leaf, error) = if *ok {
+        let actual = match leaf.as_ref() {
+            Value::Int(value) if kind == PrimitiveResultKind::Int => PrimitiveLeaf::Int(*value),
+            Value::Float(value) if kind == PrimitiveResultKind::Float => PrimitiveLeaf::Float(value.to_bits()),
+            Value::Bool(value) if kind == PrimitiveResultKind::Bool => PrimitiveLeaf::Bool(*value),
+            Value::Null if kind == PrimitiveResultKind::Null => PrimitiveLeaf::Null,
+            value => panic!("this fixture's actual primitive payload must match its expected variant: {kind:?}/{value:?}"),
+        };
+        (actual, None)
+    } else {
+        let actual =
+            error_payload(value).expect("a selected primitive err retains the real ErrorObject");
+        let Value::Object(fields) = leaf.as_ref() else {
+            unreachable!()
+        };
+        assert!(matches!(fields.get("domain"), Some(Value::String(domain)) if domain == "ku"));
+        assert!(matches!(fields.get("code"), Some(Value::String(code)) if code == "err"));
+        let Some(Value::String(message)) = fields.get("message") else {
+            unreachable!()
+        };
+        let input = buffers
+            .iter()
+            .find(|buffer| buffer.text == message.as_str())
+            .expect("the error message comes from one real input");
+        if !message.is_empty() {
+            assert_ne!(
+                message.as_ptr() as usize,
+                input.pointer,
+                "primitive err retains the existing message.clone contract"
+            );
+        }
+        assert_eq!(actual.boxed, address);
+        (PrimitiveLeaf::Error, Some(actual))
+    };
+    Some(PrimitiveBox {
+        address,
+        leaf,
+        error,
+    })
+}
+
+fn observe_primitive(
+    machine: &Machine,
+    kind: PrimitiveResultKind,
+    buffers: &[Buffer],
+    seen: &mut Vec<PrimitiveBox>,
+) -> usize {
+    let mut live = Vec::new();
+    let mut observe = |value: &Value| {
+        if let Some(actual) = primitive_snapshot(value, kind, buffers) {
+            assert!(
+                live.iter()
+                    .all(|owner: &PrimitiveBox| owner.address != actual.address),
+                "one actual owning location per primitive Box"
+            );
+            if let Some(previous) = seen.iter().find(|owner| owner.address == actual.address) {
+                assert_eq!(
+                    *previous, actual,
+                    "relays and saved primaries move the same real Box and ErrorObject backing"
+                );
+            } else {
+                seen.push(actual);
+            }
+            live.push(actual);
+        }
+    };
+    for value in machine.values.as_slice() {
+        observe(value);
+    }
+    if let Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })) = &machine.pending {
+        observe(value);
+    }
+    for exit in machine.exits.as_slice() {
+        if let Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })) =
+            exit.state.outcome()
+        {
+            observe(value);
+        }
+    }
+    for frame in machine.finally.frames.as_slice() {
+        if let Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })) = &frame.primary {
+            observe(value);
+        }
+    }
+    assert!(
+        machine.awaiting.is_none(),
+        "S5 remains a synchronous source tree"
+    );
+    let count = live.len();
+    let bytes = count * std::mem::size_of::<Value>();
+    let error_count = live
+        .iter()
+        .filter_map(|owner| owner.error)
+        .map(|error| error.count)
+        .sum::<usize>();
+    let error_bytes = live
+        .iter()
+        .filter_map(|owner| owner.error)
+        .map(|error| error.bytes)
+        .sum::<usize>();
+    assert_eq!(
+        (
+            machine.result_wrapper_capacity,
+            machine.result_wrapper_bytes
+        ),
+        (count, bytes)
+    );
+    assert_eq!(
+        (
+            machine.metrics.retained_result_wrapper_capacity,
+            machine.metrics.retained_result_wrapper_bytes
+        ),
+        (count, bytes)
+    );
+    assert_eq!(
+        (machine.error_leaf_capacity, machine.error_leaf_bytes),
+        (error_count, error_bytes)
+    );
+    assert_eq!(
+        (
+            machine.metrics.retained_error_leaf_capacity,
+            machine.metrics.retained_error_leaf_bytes
+        ),
+        (error_count, error_bytes)
+    );
+    count
+}
+
+fn finish_primitive(
+    machine: &mut Machine,
+    host: &mut Interpreter,
+    chunk: usize,
+    kind: PrimitiveResultKind,
+    buffers: &[Buffer],
+    seen: &mut Vec<PrimitiveBox>,
+) -> KuResult<Value> {
+    let pool = buffers.iter().map(|buffer| buffer.capacity).sum::<usize>();
+    let budget = NonZeroUsize::new(chunk).unwrap();
+    for _ in 0..100_000 {
+        match machine.dispatch_chunk(budget, host).unwrap() {
+            ChunkProgress::More { popped } => {
+                assert_eq!(popped, chunk);
+                assert_eq!(
+                    machine.string_payload_bytes, pool,
+                    "the original input capacity stays conservatively reserved for the whole run"
+                );
+                observe_primitive(machine, kind, buffers, seen);
+            }
+            ChunkProgress::Waiting { .. } => {
+                panic!("a selected synchronous primitive tree cannot await")
+            }
+            ChunkProgress::Finished { popped, result } => {
+                assert!(popped <= chunk);
+                let result =
+                    result.and_then(|flow| flow.into_call_value(Span::default(), "function"));
+                if let Ok(value) = &result {
+                    let actual = primitive_snapshot(value, kind, buffers)
+                        .expect("the actual outgoing typed primitive Result");
+                    let previous = seen.iter().find(|owner| owner.address == actual.address);
+                    if chunk == 1 {
+                        assert_eq!(
+                            *previous.expect(
+                                "one-step dispatch must independently observe the outgoing Box"
+                            ),
+                            actual
+                        );
+                    } else if let Some(previous) = previous {
+                        assert_eq!(*previous, actual);
+                    }
+                }
+                return result;
+            }
+        }
+    }
+    panic!("the finite primitive Result source did not finish");
+}
+
+fn at_primitive_wrap(machine: &Machine) -> bool {
+    machine.pending.is_none()
+        && machine.exits.len() == 0
+        && matches!(
+            machine
+                .work
+                .len()
+                .checked_sub(1)
+                .and_then(|index| machine.work.get(index)),
+            Some(Work::WrapOwnedScalarResult(_, _))
+        )
+}
+
+fn primitive_budget_entries(machine: &mut Machine, rejection: Option<&str>) {
+    let span = Span::default();
+    let spare = machine.values.capacity() - machine.values.len();
+    let results = [
+        machine.reserve_values(spare, span),
+        machine.check_argument_capacity(0, span),
+        machine.check_exit_storage_capacity(0, 0, span),
+        machine.check_lease_capacity(0, 0, span),
+    ];
+    for result in results {
+        if let Some(reason) = rejection {
+            assert!(result.unwrap_err().message.contains(reason));
+        } else {
+            result.unwrap();
+        }
+    }
+}
+
+fn check_primitive_live_budget(machine: &mut Machine) {
+    let saved = machine.value_limits;
+    let count = live_value_count(machine);
+    let bytes = live_value_bytes(machine);
+    machine.value_limits.max_frames = count;
+    machine.value_limits.max_storage_bytes = bytes;
+    primitive_budget_entries(machine, None);
+    machine.value_limits.max_frames = count - 1;
+    primitive_budget_entries(machine, Some("FrameLimit"));
+    machine.value_limits.max_frames = count;
+    machine.value_limits.max_storage_bytes = bytes - 1;
+    primitive_budget_entries(machine, Some("StorageLimit"));
+    machine.value_limits = saved;
+}
+
+#[test]
+fn owned_primitive_four_kinds_helpers_and_same_kind_relays_keep_512_and_first_513() {
+    for (kind, ty, literal) in PRIMITIVE_CASES {
+        let direct = format!("fn Entry(text: str, n: int): {ty}! {{ return ok({literal}) }}");
+        let plain_operand = match kind {
+            PrimitiveResultKind::Int => "text.len()",
+            PrimitiveResultKind::Bool => "text.len() > 0",
+            _ => literal,
+        };
+        let helper = format!("fn Produce(text: str): {ty} {{ return {plain_operand} }}\nfn Entry(text: str, n: int): {ty}! {{ return ok(Produce(text)) }}");
+        let typed_operand = match kind {
+            PrimitiveResultKind::Int => "text.len()",
+            PrimitiveResultKind::Bool => "text.byte_len() > 0",
+            _ => literal,
+        };
+        let typed_helper = format!("fn Leaf(text: str): {ty}! {{ return ok({typed_operand}) }}\nfn Entry(text: str, n: int): {ty}! {{ return Leaf(text) }}");
+        let error_helper = format!("fn Keep(text: str): str {{ try {{ marker = 1 }} finally {{ marker = 2 }}\nreturn text }}\nfn Entry(text: str, n: int): {ty}! {{ return err(Keep(text)) }}");
+        let read_expected = match kind {
+            PrimitiveResultKind::Int => PrimitiveLeaf::Int(PAYLOAD.chars().count() as i64),
+            PrimitiveResultKind::Bool => PrimitiveLeaf::Bool(true),
+            _ => expected_primitive(kind),
+        };
+        let byte_helper = "fn ByteLength(text: str): int { return text.byte_len() }\nfn Entry(text: str, n: int): int! { return ok(ByteLength(text)) }".to_owned();
+        let byte_result_helper = "fn ByteLength(text: str): int! { return ok(text.byte_len()) }\nfn Entry(text: str, n: int): int! { return ByteLength(text) }".to_owned();
+        let mut shallow_sources = vec![
+            (&direct, 1, 0, expected_primitive(kind)),
+            (&helper, 2, 0, read_expected),
+            (&typed_helper, 2, 0, read_expected),
+            (&error_helper, 2, 1, PrimitiveLeaf::Error),
+        ];
+        if kind == PrimitiveResultKind::Int {
+            let byte_expected = PrimitiveLeaf::Int(PAYLOAD.len() as i64);
+            shallow_sources.push((&byte_helper, 2, 0, byte_expected));
+            shallow_sources.push((&byte_result_helper, 2, 0, byte_expected));
+        }
+        for (source, calls, finalies, expected) in shallow_sources {
+            for chunk in [1, 7, 256] {
+                let mut machine = machine(source, "Entry", Limits::default());
+                let mut host = production_interpreter(source);
+                let (text, buffer) = string_input(PAYLOAD, 4096);
+                let mut args = vec![text, Value::Int(0)];
+                let mut seen = Vec::new();
+                machine
+                    .start_owned_once("Entry", &mut args, 0, false)
+                    .unwrap();
+                let result =
+                    finish_primitive(&mut machine, &mut host, chunk, kind, &[buffer], &mut seen)
+                        .unwrap();
+                let actual = primitive_snapshot(&result, kind, &[buffer]).unwrap();
+                assert_eq!(actual.leaf, expected);
+                assert_eq!(
+                    (
+                        machine.metrics.entered_calls,
+                        machine.metrics.peak_calls,
+                        machine.metrics.entered_finally_frames,
+                        machine.metrics.retired_finally_frames
+                    ),
+                    (calls, calls, finalies, finalies)
+                );
+                assert_eq!(machine.metrics.peak_result_wrapper_capacity, 1);
+                assert!(args.is_empty() && args.capacity() == 0);
+                errors_drained(&machine);
+                assert_eq!(host.call_depth, 0);
+            }
+        }
+        let mut leaves = vec![(format!("ok({literal})"), expected_primitive(kind))];
+        if kind == PrimitiveResultKind::Int {
+            leaves.push((
+                "ok(text.len())".to_owned(),
+                PrimitiveLeaf::Int(PAYLOAD.chars().count() as i64),
+            ));
+            leaves.push((
+                "ok(text.byte_len())".to_owned(),
+                PrimitiveLeaf::Int(PAYLOAD.len() as i64),
+            ));
+        } else if kind == PrimitiveResultKind::Bool {
+            leaves.push(("ok(text.len() > 0)".to_owned(), PrimitiveLeaf::Bool(true)));
+            leaves.push((
+                "ok(text.byte_len() > 0)".to_owned(),
+                PrimitiveLeaf::Bool(true),
+            ));
+        }
+        leaves.push(("err(text)".to_owned(), PrimitiveLeaf::Error));
+        for (leaf, expected) in leaves {
+            let relay = format!("fn Entry(text: str, n: int): {ty}! {{ if (n <= 0) {{ return {leaf} }}\nreturn Entry(text, n - 1) }}");
+            let mutual = format!("fn Other(text: str, n: int): {ty}! {{ if (n <= 0) {{ return {leaf} }}\nreturn Entry(text, n - 1) }}\nfn Entry(text: str, n: int): {ty}! {{ if (n <= 0) {{ return {leaf} }}\nreturn Other(text, n - 1) }}");
+            for source in [&relay, &mutual] {
+                for chunk in [1, 7, 256] {
+                    for n in [511, 512] {
+                        let mut machine = machine(source, "Entry", Limits::default());
+                        let mut host = production_interpreter(source);
+                        let (text, buffer) = string_input(PAYLOAD, 4096);
+                        let mut args = vec![text, Value::Int(n)];
+                        let mut seen = Vec::new();
+                        machine
+                            .start_owned_once("Entry", &mut args, 0, false)
+                            .unwrap();
+                        let result = finish_primitive(
+                            &mut machine,
+                            &mut host,
+                            chunk,
+                            kind,
+                            &[buffer],
+                            &mut seen,
+                        );
+                        assert_eq!(
+                            (machine.metrics.entered_calls, machine.metrics.peak_calls),
+                            (512, 512)
+                        );
+                        if n == 511 {
+                            let actual =
+                                primitive_snapshot(&result.unwrap(), kind, &[buffer]).unwrap();
+                            assert_eq!(actual.leaf, expected);
+                            assert_eq!(machine.metrics.peak_result_wrapper_capacity, 1);
+                            if chunk == 1 {
+                                assert_eq!(
+                                    seen.len(),
+                                    1,
+                                    "every real relay boundary was physically observed"
+                                );
+                            }
+                        } else {
+                            assert_eq!(
+                                result.unwrap_err().code.as_deref(),
+                                Some("call_depth_exceeded")
+                            );
+                            assert_eq!(
+                                (
+                                    machine.metrics.peak_result_wrapper_capacity,
+                                    machine.metrics.peak_error_leaf_capacity
+                                ),
+                                (0, 0)
+                            );
+                        }
+                        assert_eq!(machine.metrics.peak_string_payload_bytes, buffer.capacity);
+                        errors_drained(&machine);
+                        assert_eq!(host.call_depth, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn owned_primitive_input_pool_and_four_budget_entries_reject_before_real_box_and_reuse() {
+    for (kind, ty, literal) in PRIMITIVE_CASES {
+        let source = format!("fn Entry(text: str): {ty}! {{ return ok({literal}) }}");
+        let (text, buffer) = string_input(PAYLOAD, 4096);
+        let mut args = vec![text];
+        let mut limits = Limits::default();
+        limits.values.max_storage_bytes = buffer.capacity - 1;
+        let mut rejected = machine(&source, "Entry", limits);
+        let mut host = production_interpreter(&source);
+        let error = rejected
+            .run_owned_with_hooks("Entry", &mut args, 0, false, &mut host)
+            .err()
+            .expect("the original input pool must be admitted before body entry");
+        assert!(error.message.contains("StorageLimit"));
+        assert_eq!((host.steps, rejected.metrics.entered_calls), (0, 0));
+        let Value::String(text) = &args[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            (text.as_ptr() as usize, text.capacity()),
+            (buffer.pointer, buffer.capacity)
+        );
+        errors_drained(&rejected);
+        for boundary in [None, Some("FrameLimit"), Some("StorageLimit")] {
+            let mut machine = machine(&source, "Entry", Limits::default());
+            let mut host = production_interpreter(&source);
+            let (text, buffer) = string_input(PAYLOAD, 4096);
+            let mut args = vec![text];
+            let mut seen = Vec::new();
+            machine
+                .start_owned_once("Entry", &mut args, 0, false)
+                .unwrap();
+            pause_at(&mut machine, &mut host, at_primitive_wrap);
+            assert_eq!(machine.string_payload_bytes, buffer.capacity);
+            assert_eq!(machine.result_wrapper_capacity, 0);
+            check_primitive_live_budget(&mut machine);
+            machine.reserve_values(1, Span::default()).unwrap();
+            let count = live_value_count(&machine);
+            let bytes = live_value_bytes(&machine);
+            machine.value_limits.max_frames = count + usize::from(boundary != Some("FrameLimit"));
+            machine.value_limits.max_storage_bytes = bytes + std::mem::size_of::<Value>()
+                - usize::from(boundary == Some("StorageLimit"));
+            machine
+                .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut host)
+                .unwrap();
+            if let Some(reason) = boundary {
+                assert!(
+                    matches!(&machine.pending, Some(Err(error)) if error.message.contains(reason))
+                );
+                assert_eq!(observe_primitive(&machine, kind, &[buffer], &mut seen), 0);
+                assert_eq!(
+                    machine.metrics.peak_result_wrapper_capacity, 0,
+                    "the failed candidate never allocates its Box"
+                );
+            } else {
+                assert_eq!(observe_primitive(&machine, kind, &[buffer], &mut seen), 1);
+                assert_eq!(seen[0].leaf, expected_primitive(kind));
+                check_primitive_live_budget(&mut machine);
+            }
+            machine.value_limits = Limits::default().values;
+            let result = finish_primitive(&mut machine, &mut host, 1, kind, &[buffer], &mut seen);
+            assert_eq!(result.is_err(), boundary.is_some());
+            errors_drained(&machine);
+            machine.prepare_next_run().unwrap();
+            let (text, buffer) = string_input(PAYLOAD, 4096);
+            let mut args = vec![text];
+            seen.clear();
+            machine
+                .start_owned_once("Entry", &mut args, 0, false)
+                .unwrap();
+            let result =
+                finish_primitive(&mut machine, &mut host, 7, kind, &[buffer], &mut seen).unwrap();
+            assert_eq!(
+                primitive_snapshot(&result, kind, &[buffer]).unwrap().leaf,
+                expected_primitive(kind)
+            );
+            errors_drained(&machine);
+        }
+    }
+}
+
+#[test]
+fn owned_primitive_err_charges_real_box_map_and_six_cloned_buffers_beyond_input_pool() {
+    for (kind, ty, _) in PRIMITIVE_CASES {
+        let source = format!("fn Keep(text: str): str {{ try {{ marker = 1 }} finally {{ marker = 2 }}\nreturn text }}\nfn Entry(text: str): {ty}! {{ return err(Keep(text)) }}");
+        for chunk in [1, 7, 256] {
+            let mut machine = machine(&source, "Entry", Limits::default());
+            let mut host = production_interpreter(&source);
+            let (text, buffer) = string_input(PAYLOAD, 4096);
+            let mut args = vec![text];
+            let mut seen = Vec::new();
+            machine
+                .start_owned_once("Entry", &mut args, 0, false)
+                .unwrap();
+            pause_at(&mut machine, &mut host, at_error_wrap);
+            let Value::String(original) = machine.values.get(machine.values.len() - 1).unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                (original.as_ptr() as usize, original.capacity()),
+                (buffer.pointer, buffer.capacity)
+            );
+            assert_eq!(
+                (machine.result_wrapper_capacity, machine.error_leaf_capacity),
+                (0, 0)
+            );
+            machine
+                .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut host)
+                .unwrap();
+            assert_eq!(observe_primitive(&machine, kind, &[buffer], &mut seen), 1);
+            let actual = seen[0].error.unwrap();
+            assert_eq!(
+                (machine.error_leaf_capacity, machine.error_leaf_bytes),
+                (actual.count, actual.bytes)
+            );
+            assert_eq!(machine.string_payload_bytes, buffer.capacity);
+            check_primitive_live_budget(&mut machine);
+            let result =
+                finish_primitive(&mut machine, &mut host, chunk, kind, &[buffer], &mut seen)
+                    .unwrap();
+            assert_eq!(
+                primitive_snapshot(&result, kind, &[buffer]).unwrap().error,
+                Some(actual)
+            );
+            assert_eq!(
+                (
+                    machine.metrics.peak_result_wrapper_capacity,
+                    machine.metrics.peak_error_leaf_capacity,
+                    machine.metrics.peak_error_leaf_bytes
+                ),
+                (1, actual.count, actual.bytes)
+            );
+            assert_eq!(
+                (
+                    machine.metrics.entered_calls,
+                    machine.metrics.entered_finally_frames,
+                    machine.metrics.retired_finally_frames
+                ),
+                (2, 1, 1)
+            );
+            errors_drained(&machine);
+        }
+    }
+}
+
+#[test]
+fn owned_primitive_q2_q3_arbitrate_real_saved_boxes_with_chunk_one_owner_evidence() {
+    for (kind, ty, literal) in PRIMITIVE_CASES {
+        for (errors, owners) in [
+            ([false, false, false], 2),
+            ([true, true, false], 2),
+            ([true, false, false], 2),
+            ([false, true, false], 2),
+            ([true, false, true], 3),
+        ] {
+            let outcome = |error: bool, input: &str| {
+                if error {
+                    format!("err({input})")
+                } else {
+                    format!("ok({literal})")
+                }
+            };
+            let first = outcome(errors[0], "first");
+            let second = outcome(errors[1], "second");
+            let third = outcome(errors[2], "third");
+            let finally = if owners == 2 {
+                format!("return {second}")
+            } else {
+                format!("try {{ return {second} }} finally {{ return {third} }}")
+            };
+            let source = format!("fn Entry(first: str, second: str, third: str): {ty}! {{ try {{ return {first} }} finally {{ {finally} }}\nreturn ok({literal}) }}");
+            for chunk in [1, 7, 256] {
+                let mut machine = machine(&source, "Entry", Limits::default());
+                let mut host = production_interpreter(&source);
+                let (first, a) = string_input("中\0primary", 1024);
+                let (second, b) = string_input("é\0replacement", 4096);
+                let (third, c) = string_input(PAYLOAD, 2048);
+                let buffers = [a, b, c];
+                let mut args = vec![first, second, third];
+                let mut seen = Vec::new();
+                machine
+                    .start_owned_once("Entry", &mut args, 0, false)
+                    .unwrap();
+                let mut finally_candidate = None;
+                if chunk == 1 {
+                    // Only this actual one-step prefix claims physical
+                    // intermediate owner evidence. Other chunks run intact.
+                    pause_at(&mut machine, &mut host, |m| {
+                        m.result_wrapper_capacity == owners
+                    });
+                    assert_eq!(
+                        observe_primitive(&machine, kind, &buffers, &mut seen),
+                        owners
+                    );
+                    let candidate = primitive_snapshot(
+                        machine.values.as_slice().last().expect(
+                            "the newly wrapped finally candidate is on the real value stack",
+                        ),
+                        kind,
+                        &buffers,
+                    )
+                    .expect("the final finally candidate is a real Result Box");
+                    assert!(seen.contains(&candidate));
+                    finally_candidate = Some(candidate);
+                    assert_eq!(machine.finally.frames.len(), owners - 1);
+                    check_primitive_live_budget(&mut machine);
+                    let physical_errors = seen
+                        .iter()
+                        .filter_map(|owner| owner.error)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        (machine.error_leaf_capacity, machine.error_leaf_bytes),
+                        (
+                            physical_errors
+                                .iter()
+                                .map(|error| error.count)
+                                .sum::<usize>(),
+                            physical_errors
+                                .iter()
+                                .map(|error| error.bytes)
+                                .sum::<usize>()
+                        )
+                    );
+                }
+                let result =
+                    finish_primitive(&mut machine, &mut host, chunk, kind, &buffers, &mut seen)
+                        .unwrap();
+                let actual = primitive_snapshot(&result, kind, &buffers).unwrap();
+                if let Some(candidate) = finally_candidate {
+                    assert_eq!(
+                        actual.address, candidate.address,
+                        "the last actual finally candidate Box wins arbitration"
+                    );
+                    assert_eq!(
+                        actual, candidate,
+                        "the winning Box keeps its independently observed payload backing"
+                    );
+                }
+                if errors[owners - 1] {
+                    assert_eq!(outcome_buffer(&result, &buffers).0, owners - 1);
+                }
+                assert_eq!(
+                    actual.leaf,
+                    if errors[owners - 1] {
+                        PrimitiveLeaf::Error
+                    } else {
+                        expected_primitive(kind)
+                    }
+                );
+                assert_eq!(
+                    (
+                        machine.metrics.peak_result_wrapper_capacity,
+                        machine.metrics.peak_result_wrapper_bytes
+                    ),
+                    (owners, owners * std::mem::size_of::<Value>())
+                );
+                assert_eq!(
+                    (
+                        machine.metrics.entered_finally_frames,
+                        machine.metrics.retired_finally_frames
+                    ),
+                    (owners - 1, owners - 1)
+                );
+                if chunk == 1 {
+                    assert_eq!(seen.len(), owners);
+                    assert_eq!(
+                        (
+                            machine.metrics.peak_error_leaf_capacity,
+                            machine.metrics.peak_error_leaf_bytes
+                        ),
+                        (
+                            seen.iter()
+                                .filter_map(|owner| owner.error)
+                                .map(|error| error.count)
+                                .sum::<usize>(),
+                            seen.iter()
+                                .filter_map(|owner| owner.error)
+                                .map(|error| error.bytes)
+                                .sum::<usize>()
+                        )
+                    );
+                }
+                assert_eq!(
+                    machine.metrics.peak_string_payload_bytes,
+                    buffers.iter().map(|buffer| buffer.capacity).sum::<usize>()
+                );
+                errors_drained(&machine);
+            }
+        }
+    }
+}
+
+#[test]
+fn owned_primitive_later_argument_fuel_and_actual_native_unwind_restore_tls_and_health() {
+    for (kind, ty, literal) in PRIMITIVE_CASES {
+        let source = format!("fn Entry(text: str): {ty}! {{ return ok({literal}) }}");
+        let failure = format!("fn Leaf(text: str, ignored: int): {ty}! {{ return ok({literal}) }}\nfn Entry(text: str): {ty}! {{ return Leaf(text, 1 / 0) }}");
+        let mut failed_machine = machine(&failure, "Entry", Limits::default());
+        let mut host = production_interpreter(&failure);
+        let (text, buffer) = string_input(PAYLOAD, 4096);
+        let mut args = vec![text];
+        let mut seen = Vec::new();
+        failed_machine
+            .start_owned_once("Entry", &mut args, 0, false)
+            .unwrap();
+        let error = finish_primitive(
+            &mut failed_machine,
+            &mut host,
+            1,
+            kind,
+            &[buffer],
+            &mut seen,
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "division by zero");
+        assert_eq!(
+            (
+                failed_machine.metrics.entered_calls,
+                failed_machine.metrics.peak_result_wrapper_capacity,
+                failed_machine.metrics.peak_error_leaf_capacity
+            ),
+            (1, 0, 0)
+        );
+        errors_drained(&failed_machine);
+        for after_wrap in [false, true] {
+            let mut machine = machine(&source, "Entry", Limits::default());
+            let mut host = production_interpreter(&source);
+            let (text, buffer) = string_input(PAYLOAD, 4096);
+            let mut args = vec![text];
+            let mut seen = Vec::new();
+            machine
+                .start_owned_once("Entry", &mut args, 0, true)
+                .unwrap();
+            pause_at(&mut machine, &mut host, at_primitive_wrap);
+            if after_wrap {
+                machine
+                    .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut host)
+                    .unwrap();
+                assert_eq!(observe_primitive(&machine, kind, &[buffer], &mut seen), 1);
+            }
+            machine.remaining_dispatches = 0;
+            let error = finish_primitive(&mut machine, &mut host, 1, kind, &[buffer], &mut seen)
+                .unwrap_err();
+            assert_eq!(
+                error.message,
+                "internal execution prototype test fuel exhausted"
+            );
+            assert_eq!(
+                machine.metrics.peak_result_wrapper_capacity,
+                usize::from(after_wrap)
+            );
+            errors_drained(&machine);
+        }
+        for (error, after_wrap) in [(false, false), (false, true), (true, true)] {
+            let source = if error {
+                format!("fn Entry(text: str): {ty}! {{ return err(text) }}")
+            } else {
+                source.clone()
+            };
+            let now = Instant::now();
+            let original = RuntimeTermination {
+                reason: TerminationReason::TimedOut,
+                cleanup_deadline: now,
+            };
+            let shorter = RuntimeTermination {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: now.checked_sub(Duration::from_millis(1)).unwrap(),
+            };
+            let native = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _cleanup = CleanupGuard::enter(original);
+                let mut machine = machine(&source, "Entry", Limits::default());
+                let mut host = production_interpreter(&source);
+                let (text, buffer) = string_input(PAYLOAD, 4096);
+                let mut args = vec![text];
+                let mut seen = Vec::new();
+                machine
+                    .start_owned_once("Entry", &mut args, 0, false)
+                    .unwrap();
+                pause_at(
+                    &mut machine,
+                    &mut host,
+                    if error {
+                        at_error_wrap
+                    } else {
+                        at_primitive_wrap
+                    },
+                );
+                if after_wrap {
+                    machine
+                        .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut host)
+                        .unwrap();
+                }
+                assert_eq!(
+                    observe_primitive(&machine, kind, &[buffer], &mut seen),
+                    usize::from(after_wrap)
+                );
+                drop(CleanupGuard::enter(shorter));
+                let actual = current_cleanup_context().unwrap();
+                assert_eq!(
+                    (actual.reason, actual.cleanup_deadline),
+                    (original.reason, shorter.cleanup_deadline)
+                );
+                panic!("actual owned primitive Result kernel abandonment");
+            }));
+            assert_eq!(
+                native
+                    .expect_err("the real native panic must escape")
+                    .downcast_ref::<&str>()
+                    .copied(),
+                Some("actual owned primitive Result kernel abandonment")
+            );
+            assert!(current_cleanup_context().is_none());
+            assert!(crate::runtime::task::current_execution_termination().is_none());
+            let healthy_source = format!("fn Entry(text: str): {ty}! {{ return ok({literal}) }}");
+            let mut healthy = production_interpreter(&healthy_source);
+            let (text, buffer) = string_input(PAYLOAD, 4096);
+            let result = healthy
+                .call_function("Entry", vec![text], Span::default(), 0)
+                .unwrap();
+            assert_eq!(
+                primitive_snapshot(&result, kind, &[buffer]).unwrap().leaf,
+                expected_primitive(kind)
+            );
+            assert_eq!(healthy.call_depth, 0);
+        }
+    }
+}
+
+#[test]
+fn owned_primitive_exact_arena_descriptors_and_legal_whole_tree_rejections_keep_fallback_inputs() {
+    for (kind, ty, literal) in PRIMITIVE_CASES {
+        let source = format!("fn Leaf(text: str): {ty}! {{ return ok({literal}) }}\nfn Entry(text: str): {ty}! {{ return Leaf(text) }}");
+        let source_functions = functions(&source);
+        let entry = &source_functions["Entry"];
+        assert!(code::eligible_owned_named(
+            &source_functions,
+            entry,
+            Limits::default()
+        ));
+        let code =
+            CodeHandle::compile_owned_named(&source_functions, entry, Limits::default()).unwrap();
+        for name in ["Entry", "Leaf"] {
+            assert_eq!(
+                code.function(code.find_function(name).unwrap())
+                    .owned_scalar_result,
+                Some(kind)
+            );
+        }
+        // Both descriptors above belong to this single admitted arena. The
+        // Builder's private cached-ID role checks are tested in code.rs.
+        let (wrong_ty, wrong_literal) = if kind == PrimitiveResultKind::Float {
+            ("int", "7")
+        } else {
+            ("float", "1.25")
+        };
+        let cross_kind_return = format!("fn Wrong(text: str): {wrong_ty}! {{ return ok({wrong_literal}) }}\nfn Entry(text: str): {ty}! {{ return ok({literal})\nreturn Wrong(text) }}\nfn main() {{}}");
+        let program = Parser::new(Lexer::new(&cross_kind_return).tokenize().unwrap())
+            .parse_program()
+            .unwrap();
+        let error = crate::checker::Checker::new()
+            .check(&program)
+            .expect_err("the checker rejects different-kind returns even after an earlier return");
+        assert!(
+            error
+                .message
+                .contains(&format!("type error: expected {ty}! but got {wrong_ty}!")),
+            "{error:?}"
+        );
+        // This legal dead expression statement is outside the strict Result
+        // slice. The private same-arena typed-call contract is tested in code.rs.
+        let cross_kind = format!("fn Wrong(text: str): {wrong_ty}! {{ return ok({wrong_literal}) }}\nfn Entry(text: str): {ty}! {{ return ok({literal})\nWrong(text) }}");
+        let stored =
+            format!("fn Entry(text: str): {ty}! {{ result = ok({literal})\nreturn result }}");
+        let nested = format!("fn Leaf(text: str): {ty}! {{ return ok({literal}) }}\nfn Entry(text: str): {ty}! {{ return ok(Leaf(text)?) }}");
+        let caught = format!("fn Entry(text: str): {ty}! {{ try {{ marker = 1 }} catch (e) {{ marker = 2 }}\nreturn ok({literal}) }}");
+        let async_entry = format!("async fn Entry(text: str): {ty}! {{ return ok({literal}) }}");
+        let async_dependency = format!("async fn Child(text: str): {ty}! {{ return ok({literal}) }}\nfn Entry(text: str): {ty}! {{ task = Child(text)\nreturn ok({literal}) }}");
+        for source in [
+            &cross_kind,
+            &stored,
+            &nested,
+            &caught,
+            &async_entry,
+            &async_dependency,
+        ] {
+            let source_functions = functions(source);
+            let entry = &source_functions["Entry"];
+            assert!(
+                !code::eligible_owned_named(&source_functions, entry, Limits::default()),
+                "{source}"
+            );
+            assert!(
+                matches!(
+                    CodeHandle::compile_owned_named(&source_functions, entry, Limits::default()),
+                    Err(AdmissionError::Unsupported(_))
+                ),
+                "{source}"
+            );
+            let mut host = production_interpreter(source);
+            let (text, buffer) = string_input(PAYLOAD, 4096);
+            let mut args = vec![text];
+            assert!(try_execute_owned(&mut host, entry, &mut args, 0).is_none());
+            assert_eq!((host.steps, host.call_depth), (0, 0));
+            let Value::String(text) = &args[0] else {
+                unreachable!()
+            };
+            assert_eq!(
+                (text.as_ptr() as usize, text.capacity()),
+                (buffer.pointer, buffer.capacity)
+            );
+        }
+        let mismatch = format!("fn Entry(text: str, spare: str): {ty}! {{ return ok({literal}) }}");
+        let source_functions = functions(&mismatch);
+        let mut host = production_interpreter(&mismatch);
+        let (spare, buffer) = string_input(PAYLOAD, 4096);
+        let mut args = vec![Value::Int(1), spare];
+        assert!(try_execute_owned(&mut host, &source_functions["Entry"], &mut args, 0).is_none());
+        assert_eq!((host.steps, host.call_depth), (0, 0));
+        let Value::String(spare) = &args[1] else {
+            unreachable!()
+        };
+        assert_eq!(
+            (spare.as_ptr() as usize, spare.capacity()),
+            (buffer.pointer, buffer.capacity)
+        );
+        let scalar_source = functions(&format!(
+            "fn Entry(n: int): {ty}! {{ return ok({literal}) }}"
+        ));
+        let legacy =
+            CodeHandle::compile_named(&scalar_source, &scalar_source["Entry"], Limits::default())
+                .unwrap();
+        assert_eq!(
+            legacy
+                .function(legacy.find_function("Entry").unwrap())
+                .owned_scalar_result,
+            None,
+            "the old scalar selector retains its separate role"
+        );
+    }
+
+    // array.first has an existing Unknown checker result. An empty array
+    // yields a real Null, which the old evaluator preserves despite float
+    // declaration metadata. Compare that direct old call to the complete
+    // checked ordinary source path, without inventing coercion or replay.
+    let declaration = "fn Entry(text: str, value: float): float! { marker = 1\nreturn ok(value) }";
+    let source_functions = functions(declaration);
+    let mut old = production_interpreter(declaration);
+    let unknown = crate::stdlib::array::eval("first", &[Value::Array(Vec::new())], Span::default())
+        .unwrap()
+        .unwrap();
+    let (text, buffer) = string_input(PAYLOAD, 4096);
+    let legacy = old
+        .call_function_direct_flow(
+            source_functions["Entry"].clone(),
+            vec![text, unknown],
+            Span::default(),
+            0,
+        )
+        .unwrap()
+        .into_call_value(Span::default(), "function")
+        .unwrap();
+    let complete = format!("{declaration}\nfn RequireNull(value): null! {{ if (value == null) {{ return ok(null) }}\nreturn err(\"Unknown primitive was changed\") }}\nfn main(): null! {{ items = []\nunknown = array.first(items)\nactual = Entry(\"{PAYLOAD}\", unknown)?\nRequireNull(actual)?\nreturn ok(null) }}");
+    let program = Parser::new(Lexer::new(&complete).tokenize().unwrap())
+        .parse_program()
+        .unwrap();
+    crate::checker::Checker::new().check(&program).unwrap();
+    crate::cli::run_source("owned-primitive-unknown-null.ku", &complete).unwrap();
+    assert_eq!(
+        primitive_snapshot(&legacy, PrimitiveResultKind::Null, &[buffer])
+            .unwrap()
+            .leaf,
+        PrimitiveLeaf::Null
+    );
+    assert_eq!(old.call_depth, 0);
+    let code = CodeHandle::compile_owned_named(
+        &source_functions,
+        &source_functions["Entry"],
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        code.function(code.find_function("Entry").unwrap())
+            .owned_scalar_result,
+        Some(PrimitiveResultKind::Float),
+        "declared kind remains the static relay contract, rather than coercion of the actual Null"
+    );
+
+    for (element, syntax) in [
+        (Value::Array(vec![Value::Int(1), Value::Int(2)]), "[1, 2]"),
+        (
+            Value::Object(HashMap::from([("answer".to_owned(), Value::Int(7))])),
+            "{ answer: 7 }",
+        ),
+    ] {
+        let complete = format!("{declaration}\nfn main(): null! {{ items = []\nitems = array.push(items, {syntax})\nunknown = array.first(items)\nactual = Entry(\"{PAYLOAD}\", unknown)?\nreturn ok(null) }}");
+        let program = Parser::new(Lexer::new(&complete).tokenize().unwrap())
+            .parse_program()
+            .unwrap();
+        crate::checker::Checker::new().check(&program).unwrap();
+        let mut host = production_interpreter(declaration);
+        // This is the real existing builtin conversion used by the legal
+        // source above. No test clones a Value to manufacture an owner.
+        let unknown =
+            crate::stdlib::array::eval("first", &[Value::Array(vec![element])], Span::default())
+                .unwrap()
+                .unwrap();
+        let opaque = |value: &Value| match value {
+            Value::Array(values) => vec![values.as_ptr() as usize, values.capacity()],
+            Value::Object(fields) => {
+                let (key, _) = fields.get_key_value("answer").unwrap();
+                vec![
+                    fields.capacity(),
+                    key as *const String as usize,
+                    key.as_ptr() as usize,
+                    key.capacity(),
+                ]
+            }
+            value => panic!("the actual Unknown conversion must remain opaque: {value:?}"),
+        };
+        let before = opaque(&unknown);
+        let (text, buffer) = string_input(PAYLOAD, 4096);
+        let mut args = vec![text, unknown];
+        assert!(try_execute_owned(&mut host, &source_functions["Entry"], &mut args, 0).is_none());
+        assert_eq!(
+            (host.steps, host.call_depth),
+            (0, 0),
+            "opaque actual parameters select whole legacy before body effects"
+        );
+        let Value::String(text) = &args[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            (text.as_ptr() as usize, text.capacity()),
+            (buffer.pointer, buffer.capacity)
+        );
+        assert_eq!(
+            opaque(&args[1]),
+            before,
+            "the sole actual Array/Map argument has not moved or been cloned by selection"
+        );
+        let result = host
+            .call_function("Entry", args, Span::default(), 0)
+            .unwrap();
+        let Value::Result { ok: true, value } = &result else {
+            panic!("the original opaque legacy Result contract")
+        };
+        match value.as_ref() {
+            Value::Array(values) => assert_eq!(values.as_slice(), &[Value::Int(1), Value::Int(2)]),
+            Value::Object(fields) => assert_eq!(fields.get("answer"), Some(&Value::Int(7))),
+            value => panic!("whole fallback must preserve the actual opaque payload: {value:?}"),
+        }
+        assert_eq!(host.call_depth, 0);
+        crate::cli::run_source("owned-primitive-unknown-opaque.ku", &complete).unwrap();
+    }
+}

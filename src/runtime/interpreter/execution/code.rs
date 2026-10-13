@@ -14,6 +14,7 @@ macro_rules! id {
         pub(super) struct $name(pub(super) usize);
     };
 }
+
 id!(FnId);
 id!(StmtId);
 id!(ExprId);
@@ -55,6 +56,8 @@ pub(super) struct CodeFn {
     pub(super) span: SpanId,
     pub(super) is_async: bool,
     pub(super) owned_async_string: bool,
+    pub(super) owned_scalar_result: Option<PrimitiveResultKind>,
+    result_contract: ResultContract,
 }
 
 impl CodeFn {
@@ -101,8 +104,12 @@ pub(super) enum ExprCode {
     // Only a direct Result return constructs this builtin. The String
     // operand is enabled solely by the strict owned Result<String> role.
     TerminalOk(ExprId, bool),
-    // Only an unshadowed direct return in the strict owned Result<String>
-    // role. The builtin keeps its original String clone conversion.
+    // Synchronous Owned String inputs may return one charged primitive
+    // Result. The declared kind constrains static relay/cache contracts;
+    // actual scalar variants retain the existing Unknown-call behavior.
+    TerminalOwnedScalarOk(ExprId, PrimitiveResultKind),
+    // Only an unshadowed direct return in a charged owned String or primitive
+    // Result role. The builtin keeps its original String clone conversion.
     TerminalErr(ExprId),
     // Synchronous borrowed primitive Result returns use their own charged
     // wrapper; old scalar Result roots retain their original contract.
@@ -538,6 +545,7 @@ enum FunctionRole {
     Scalar,
     OwnedNamed,
     OwnedResultStringNamed,
+    OwnedScalarResultNamed,
     BorrowedStringNamed,
     BorrowedScalarResultNamed,
     ResultRoot,
@@ -547,6 +555,26 @@ enum FunctionRole {
     AsyncResultDependency,
     ClaimedLocalAsyncResultRoot,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PrimitiveResultKind {
+    Int,
+    Float,
+    Bool,
+    Null,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ResultContract {
+    #[default]
+    None,
+    UnchargedScalar(Option<PrimitiveResultKind>),
+    BorrowedScalar(PrimitiveResultKind),
+    OwnedScalar,
+    OwnedString,
+}
+
+type FunctionContract = (bool, ResultContract, Option<PrimitiveResultKind>);
 
 #[derive(Clone, Copy)]
 struct LocalContext<'a> {
@@ -647,6 +675,8 @@ impl<'a> FunctionSpec<'a> {
         let mut spec = Self::named(function);
         spec.role = if string_result_type(&function.return_type) {
             FunctionRole::OwnedResultStringNamed
+        } else if scalar_result_type(&function.return_type) {
+            FunctionRole::OwnedScalarResultNamed
         } else {
             FunctionRole::OwnedNamed
         };
@@ -657,6 +687,8 @@ impl<'a> FunctionSpec<'a> {
         let mut spec = Self::named(function);
         spec.role = if self.owns_result_string() && string_result_type(&function.return_type) {
             FunctionRole::OwnedResultStringNamed
+        } else if self.owns_scalar_result() && scalar_result_type(&function.return_type) {
+            FunctionRole::OwnedScalarResultNamed
         } else {
             FunctionRole::OwnedNamed
         };
@@ -670,6 +702,34 @@ impl<'a> FunctionSpec<'a> {
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
                 | FunctionRole::AsyncOwnedResultStringDependency
         )
+    }
+
+    fn owns_scalar_result(self) -> bool {
+        matches!(self.role, FunctionRole::OwnedScalarResultNamed)
+    }
+
+    fn owned_scalar_result_kind(self) -> Option<PrimitiveResultKind> {
+        self.declaration
+            .filter(|_| self.owns_scalar_result())
+            .and_then(|function| primitive_result_kind(&function.return_type))
+    }
+
+    fn cache_contract(self) -> FunctionContract {
+        let primitive = self
+            .declaration
+            .and_then(|function| primitive_result_kind(&function.return_type));
+        let result = if self.owns_result_string() {
+            ResultContract::OwnedString
+        } else if self.owns_scalar_result() {
+            ResultContract::OwnedScalar
+        } else if self.borrows_scalar_result() {
+            ResultContract::BorrowedScalar(primitive.expect("validated borrowed Result"))
+        } else if self.is_result_root() {
+            ResultContract::UnchargedScalar(primitive)
+        } else {
+            ResultContract::None
+        };
+        (self.is_async(), result, self.owned_scalar_result_kind())
     }
 
     fn borrowed_string_named(function: &'a FnDecl) -> Self {
@@ -752,6 +812,7 @@ impl<'a> FunctionSpec<'a> {
             self.role,
             FunctionRole::OwnedNamed
                 | FunctionRole::OwnedResultStringNamed
+                | FunctionRole::OwnedScalarResultNamed
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
                 | FunctionRole::AsyncOwnedResultStringDependency
                 | FunctionRole::BorrowedStringNamed
@@ -784,6 +845,9 @@ impl<'a> FunctionSpec<'a> {
     fn return_kind(self) -> ValueKind {
         if self.owns_result_string() {
             return ValueKind::ResultString;
+        }
+        if let Some(kind) = self.owned_scalar_result_kind() {
+            return ValueKind::ScalarResult(kind);
         }
         if self.owns_strings()
             && self
@@ -826,6 +890,9 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::OwnedResultStringNamed => {
                 !function.is_async && string_result_type(&function.return_type)
             }
+            FunctionRole::OwnedScalarResultNamed => {
+                !function.is_async && scalar_result_type(&function.return_type)
+            }
             FunctionRole::ClaimedAsyncOwnedResultStringRoot
             | FunctionRole::AsyncOwnedResultStringDependency => {
                 function.is_async && string_result_type(&function.return_type)
@@ -860,11 +927,20 @@ fn string_result_type(ty: &Option<TypeName>) -> bool {
 }
 
 fn scalar_result_type(ty: &Option<TypeName>) -> bool {
-    matches!(
-        ty,
-        Some(TypeName::Result(inner))
-            if matches!(inner.as_ref(), TypeName::Int | TypeName::Float | TypeName::Bool | TypeName::Null)
-    )
+    primitive_result_kind(ty).is_some()
+}
+
+fn primitive_result_kind(ty: &Option<TypeName>) -> Option<PrimitiveResultKind> {
+    let Some(TypeName::Result(inner)) = ty else {
+        return None;
+    };
+    Some(match inner.as_ref() {
+        TypeName::Int => PrimitiveResultKind::Int,
+        TypeName::Float => PrimitiveResultKind::Float,
+        TypeName::Bool => PrimitiveResultKind::Bool,
+        TypeName::Null => PrimitiveResultKind::Null,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -874,7 +950,14 @@ enum ValueKind {
     ViewString,
     Task,
     Result,
+    ScalarResult(PrimitiveResultKind),
     ResultString,
+}
+
+impl ValueKind {
+    fn is_scalar_result(self) -> bool {
+        matches!(self, Self::Result | Self::ScalarResult(_))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -990,8 +1073,8 @@ fn expression_kind(
                     ValueKind::Task
                 } else if string_result_type(&function.return_type) {
                     ValueKind::ResultString
-                } else if scalar_result_type(&function.return_type) {
-                    ValueKind::Result
+                } else if let Some(kind) = primitive_result_kind(&function.return_type) {
+                    ValueKind::ScalarResult(kind)
                 } else if scalar_type(&function.return_type) {
                     ValueKind::Scalar
                 } else if string_type(&function.return_type) {
@@ -1009,6 +1092,14 @@ fn expression_kind(
 
 fn expect_kind(actual: ValueKind, expected: ValueKind, span: Span) -> Admission<()> {
     if actual == expected {
+        Ok(())
+    } else {
+        Err(AdmissionError::Unsupported(span))
+    }
+}
+
+fn expect_scalar_result(actual: ValueKind, span: Span) -> Admission<()> {
+    if actual.is_scalar_result() {
         Ok(())
     } else {
         Err(AdmissionError::Unsupported(span))
@@ -1051,7 +1142,7 @@ struct ExpressionMode {
     // this slice. The flag travels through the existing bounded expression
     // visits, so nested move/mutation calls are rejected before body effects.
     forbid_call: bool,
-    // Only the root expression of a strict Result<String> relay return.
+    // Only the root expression of a charged owned Result terminal relay.
     // Arguments and nested operands always clear this permission.
     terminal_result: bool,
     // Only the direct Result operand of ? in the new borrowed Result role.
@@ -1219,12 +1310,23 @@ impl<'a> Builder<'a> {
     fn ensure_function(&mut self, spec: FunctionSpec<'a>) -> Admission<FnId> {
         // Validate the requested role before a cached root ID can be reused as
         // a dependency. An async root may be a new AsyncStart dependency, but
-        // Result/async roots never become scalar synchronous callees.
+        // Result/async roots never become scalar synchronous callees. Only
+        // compatible type/charging contracts share a name, so old Result roots
+        // cannot impersonate charged roots. Plain scalar helpers retain their
+        // compatible Scalar/OwnedNamed reuse.
         spec.validate()?;
         for index in 0..self.arena.functions.len() {
             self.spend(spec.name.len().saturating_add(1), spec.span)?;
             let function = self.arena.functions.get(index).expect("function slot");
             if self.arena.symbol(function.name) == spec.name {
+                if (
+                    function.is_async,
+                    function.result_contract,
+                    function.owned_scalar_result,
+                ) != spec.cache_contract()
+                {
+                    return Err(AdmissionError::Unsupported(spec.span));
+                }
                 return Ok(FnId(index));
             }
         }
@@ -1239,6 +1341,8 @@ impl<'a> Builder<'a> {
                 span,
                 is_async: spec.is_async(),
                 owned_async_string: spec.is_claimed_async_owned_result_string(),
+                owned_scalar_result: spec.owned_scalar_result_kind(),
+                result_contract: spec.cache_contract().1,
                 ..CodeFn::default()
             },
         );
@@ -1284,6 +1388,7 @@ impl<'a> Builder<'a> {
         expr: &'a Expr,
         owned_string: bool,
         borrowed_result: bool,
+        owned_scalar: Option<PrimitiveResultKind>,
     ) -> Admission<ExprId> {
         let shadowed = self.is_bound("ok")
             || self
@@ -1313,7 +1418,9 @@ impl<'a> Builder<'a> {
             .expressions
             .get_mut(id.0)
             .expect("terminal ok expression slot") = CodeExpr {
-            kind: if borrowed_result {
+            kind: if let Some(kind) = owned_scalar {
+                ExprCode::TerminalOwnedScalarOk(operand, kind)
+            } else if borrowed_result {
                 ExprCode::TerminalBorrowedOk(operand)
             } else {
                 ExprCode::TerminalOk(operand, owned_string)
@@ -1577,7 +1684,9 @@ impl<'a> Builder<'a> {
                             ValueKind::String | ValueKind::ViewString => {
                                 return Err(AdmissionError::Unsupported(expr.span))
                             }
-                            ValueKind::Result | ValueKind::ResultString => {
+                            ValueKind::Result
+                            | ValueKind::ScalarResult(_)
+                            | ValueKind::ResultString => {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
                         }
@@ -1631,10 +1740,11 @@ impl<'a> Builder<'a> {
                         }
                     }
                     ExprKind::TryUnwrap { expr: inner } => {
-                        if spec.is_claimed_async_owned_result_string() {
+                        if spec.is_claimed_async_owned_result_string() || spec.owns_scalar_result()
+                        {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
-                        expect_kind(self.kind(inner)?, ValueKind::Result, inner.span)?;
+                        expect_scalar_result(self.kind(inner)?, inner.span)?;
                         let operand = if spec.borrows_scalar_result() {
                             self.expression_with_mode(
                                 inner,
@@ -1658,13 +1768,22 @@ impl<'a> Builder<'a> {
                         {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
+                        if spec.owns_scalar_result() && self.kind(expr)?.is_scalar_result() {
+                            if !mode.terminal_result {
+                                return Err(AdmissionError::Unsupported(expr.span));
+                            }
+                            expect_kind(self.kind(expr)?, spec.return_kind(), expr.span)?;
+                        }
                         if spec.borrows_strings()
-                            && self.kind(expr)? == ValueKind::Result
+                            && self.kind(expr)?.is_scalar_result()
                             && !(spec.borrows_scalar_result() && mode.unwrap_borrowed_result)
                         {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
-                        if spec.borrows_strings() {
+                        // Owned inputs and their static scalar helpers use
+                        // the same real Env read and original length tick as
+                        // String loans. This creates no new String or owner.
+                        if spec.owns_strings() {
                             if let Some((name, byte_len, target_span)) =
                                 string_length_call(expr, self.bound.as_slice())
                             {
@@ -1848,7 +1967,10 @@ impl<'a> Builder<'a> {
                 let kind = self.kind(value)?;
                 if matches!(
                     kind,
-                    ValueKind::Result | ValueKind::ResultString | ValueKind::ViewString
+                    ValueKind::Result
+                        | ValueKind::ScalarResult(_)
+                        | ValueKind::ResultString
+                        | ValueKind::ViewString
                 ) || (kind == ValueKind::String && !spec.owns_strings())
                 {
                     // Env::get_owning currently clones a scalar-only Result.
@@ -1876,7 +1998,10 @@ impl<'a> Builder<'a> {
                 let kind = self.kind(value)?;
                 if matches!(
                     kind,
-                    ValueKind::Result | ValueKind::ResultString | ValueKind::ViewString
+                    ValueKind::Result
+                        | ValueKind::ScalarResult(_)
+                        | ValueKind::ResultString
+                        | ValueKind::ViewString
                 ) || (kind == ValueKind::String && !spec.owns_strings())
                 {
                     return Err(AdmissionError::Unsupported(span));
@@ -1943,17 +2068,22 @@ impl<'a> Builder<'a> {
                 StmtCode::Try(self.block(body, base)?, finally)
             }
             Stmt::Return { value, .. } => {
-                let value = if spec.owns_result_string() {
+                let value = if spec.owns_result_string() || spec.owns_scalar_result() {
                     let value = value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
                     if is_ok_call(value) {
-                        Some(self.terminal_ok(value, true, false)?)
+                        Some(self.terminal_ok(
+                            value,
+                            spec.owns_result_string(),
+                            false,
+                            spec.owned_scalar_result_kind(),
+                        )?)
                     } else if is_err_call(value) {
                         Some(self.terminal_err(value)?)
                     } else {
                         if !(spec.is_claimed_async_owned_result_string()
                             && matches!(value.kind, ExprKind::Await(_)))
                         {
-                            expect_kind(self.kind(value)?, ValueKind::ResultString, value.span)?;
+                            expect_kind(self.kind(value)?, spec.return_kind(), value.span)?;
                         }
                         Some(self.expression_with_mode(
                             value,
@@ -1968,7 +2098,7 @@ impl<'a> Builder<'a> {
                     }
                 } else if spec.is_result_root() {
                     let value = value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
-                    Some(self.terminal_ok(value, false, spec.borrows_scalar_result())?)
+                    Some(self.terminal_ok(value, false, spec.borrows_scalar_result(), None)?)
                 } else {
                     if let Some(value) = value {
                         expect_kind(self.kind(value)?, spec.return_kind(), value.span)?;
@@ -2001,7 +2131,7 @@ struct Eligibility<'a> {
     source: &'a HashMap<String, FnDecl>,
     local: Option<LocalContext<'a>>,
     functions: FrameStack<FunctionSpec<'a>>,
-    checked: FrameStack<&'a str>,
+    checked: FrameStack<(&'a str, FunctionContract)>,
     pending: FrameStack<Scan<'a>>,
     bound: FrameStack<Binding<'a>>,
     limits: FrameLimits,
@@ -2066,13 +2196,21 @@ impl<'a> Eligibility<'a> {
     }
     fn function(&mut self, spec: FunctionSpec<'a>) -> Admission<()> {
         // A previously checked Result root cannot bypass the scalar dependency
-        // contract merely because its name is already in this bounded cache.
+        // contract or change its Box charging merely by sharing a name.
         spec.validate()?;
-        if self.checked.as_slice().contains(&spec.name) {
+        if let Some((_, contract)) = self
+            .checked
+            .as_slice()
+            .iter()
+            .find(|(name, _)| *name == spec.name)
+        {
+            if *contract != spec.cache_contract() {
+                return Err(AdmissionError::Unsupported(spec.span));
+            }
             return Ok(());
         }
         reserve_field!(self, checked, 1, spec.span);
-        push(&mut self.checked, spec.name);
+        push(&mut self.checked, (spec.name, spec.cache_contract()));
         reserve_field!(self, functions, 1, spec.span);
         push(&mut self.functions, spec);
         Ok(())
@@ -2168,6 +2306,7 @@ impl<'a> Eligibility<'a> {
                                 if matches!(
                                     kind,
                                     ValueKind::Result
+                                        | ValueKind::ScalarResult(_)
                                         | ValueKind::ResultString
                                         | ValueKind::ViewString
                                 ) || (kind == ValueKind::String && !spec.owns_strings())
@@ -2192,6 +2331,7 @@ impl<'a> Eligibility<'a> {
                                 if matches!(
                                     kind,
                                     ValueKind::Result
+                                        | ValueKind::ScalarResult(_)
                                         | ValueKind::ResultString
                                         | ValueKind::ViewString
                                 ) || (kind == ValueKind::String && !spec.owns_strings())
@@ -2203,7 +2343,7 @@ impl<'a> Eligibility<'a> {
                                 self.expression(value, true)?;
                             }
                             Stmt::Return { value, .. } => {
-                                if spec.owns_result_string() {
+                                if spec.owns_result_string() || spec.owns_scalar_result() {
                                     let value =
                                         value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
                                     if is_ok_call(value) {
@@ -2216,7 +2356,11 @@ impl<'a> Eligibility<'a> {
                                         )?;
                                         expect_kind(
                                             self.kind(argument)?,
-                                            ValueKind::String,
+                                            if spec.owns_result_string() {
+                                                ValueKind::String
+                                            } else {
+                                                ValueKind::Scalar
+                                            },
                                             argument.span,
                                         )?;
                                         self.spend(1, value.span)?;
@@ -2245,7 +2389,7 @@ impl<'a> Eligibility<'a> {
                                         {
                                             expect_kind(
                                                 self.kind(value)?,
-                                                ValueKind::ResultString,
+                                                spec.return_kind(),
                                                 value.span,
                                             )?;
                                         }
@@ -2380,7 +2524,10 @@ impl<'a> Eligibility<'a> {
                             let kind = self.kind(expr)?;
                             if matches!(
                                 kind,
-                                ValueKind::Result | ValueKind::ResultString | ValueKind::ViewString
+                                ValueKind::Result
+                                    | ValueKind::ScalarResult(_)
+                                    | ValueKind::ResultString
+                                    | ValueKind::ViewString
                             ) || (kind == ValueKind::String
                                 && !(spec.owns_strings() && mode.consuming))
                             {
@@ -2433,10 +2580,12 @@ impl<'a> Eligibility<'a> {
                             }
                         }
                         ExprKind::TryUnwrap { expr: inner } => {
-                            if spec.is_claimed_async_owned_result_string() {
+                            if spec.is_claimed_async_owned_result_string()
+                                || spec.owns_scalar_result()
+                            {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
-                            expect_kind(self.kind(inner)?, ValueKind::Result, inner.span)?;
+                            expect_scalar_result(self.kind(inner)?, inner.span)?;
                             if spec.borrows_scalar_result() {
                                 self.expression_with_mode(
                                     inner,
@@ -2459,13 +2608,19 @@ impl<'a> Eligibility<'a> {
                             {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
+                            if spec.owns_scalar_result() && self.kind(expr)?.is_scalar_result() {
+                                if !mode.terminal_result {
+                                    return Err(AdmissionError::Unsupported(expr.span));
+                                }
+                                expect_kind(self.kind(expr)?, spec.return_kind(), expr.span)?;
+                            }
                             if spec.borrows_strings()
-                                && self.kind(expr)? == ValueKind::Result
+                                && self.kind(expr)?.is_scalar_result()
                                 && !(spec.borrows_scalar_result() && mode.unwrap_borrowed_result)
                             {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
-                            if spec.borrows_strings() {
+                            if spec.owns_strings() {
                                 if let Some((name, _, target_span)) =
                                     string_length_call(expr, self.bound.as_slice())
                                 {
@@ -2576,5 +2731,104 @@ impl<'a> Eligibility<'a> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod typed_result_cache_tests {
+    use super::*;
+
+    fn functions(source: &str) -> HashMap<String, FnDecl> {
+        let source = format!("{source}\nfn main() {{}}\n");
+        let program = Parser::new(Lexer::new(&source).tokenize().unwrap())
+            .parse_program()
+            .unwrap();
+        crate::checker::Checker::new().check(&program).unwrap();
+        program
+            .items
+            .into_iter()
+            .map(|item| {
+                let Item::Function(function) = item else {
+                    panic!("cache fixtures contain only named functions");
+                };
+                (function.name.clone(), function)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn same_name_requires_the_same_typed_result_charging_contract() {
+        let source = functions(
+            "fn Shared(n: int): int! { return ok(n) }\nfn Scalar(n: int): int { return n }",
+        );
+        let other = functions("fn Shared(n: int): bool! { return ok(true) }");
+        let source_before = source.clone();
+        let result = &source["Shared"];
+        let scalar = &source["Scalar"];
+        let old = FunctionSpec::named_root(result);
+        let owned = FunctionSpec::owned_named(result);
+        let borrowed = FunctionSpec::borrowed_string_named(result);
+        let other_owned = FunctionSpec::owned_named(&other["Shared"]);
+        let plain = FunctionSpec::named(scalar);
+        let owned_plain = FunctionSpec::owned_named(scalar);
+        let limits = Limits::default();
+        // Complete validation of each real declaration/body happens before
+        // testing reuse. No input Value or source binding is mutated and no
+        // body is executed by these selection/build operations.
+        for spec in [old, owned, borrowed, other_owned, plain, owned_plain] {
+            spec.validate().unwrap();
+            assert!(Eligibility::new(&source, None, limits).check(spec).is_ok());
+            assert!(Builder::new(&source, None, limits)
+                .compile(Some(spec))
+                .is_ok());
+        }
+        for (first, second, compatible) in [
+            (old, owned, false),
+            (owned, old, false),
+            (borrowed, owned, false),
+            (owned, borrowed, false),
+            (owned, other_owned, false),
+            (other_owned, owned, false),
+            (plain, owned_plain, true),
+            (owned_plain, plain, true),
+        ] {
+            let mut builder = Builder::new(&source, None, limits);
+            let id = builder.ensure_function(first).unwrap();
+            let original = builder.arena.functions.get(id.0).unwrap();
+            let contract = (
+                original.is_async,
+                original.result_contract,
+                original.owned_scalar_result,
+            );
+            let reused = builder.ensure_function(second);
+            if compatible {
+                assert_eq!(reused.unwrap(), id);
+            } else {
+                assert!(matches!(reused, Err(AdmissionError::Unsupported(_))));
+            }
+            assert_eq!(builder.arena.functions.len(), 1);
+            assert_eq!(builder.functions.len(), 1);
+            let retained = builder.arena.functions.get(id.0).unwrap();
+            assert!(
+                (
+                    retained.is_async,
+                    retained.result_contract,
+                    retained.owned_scalar_result
+                ) == contract
+            );
+
+            let mut eligibility = Eligibility::new(&source, None, limits);
+            eligibility.function(first).unwrap();
+            let reused = eligibility.function(second);
+            if compatible {
+                reused.unwrap();
+            } else {
+                assert!(matches!(reused, Err(AdmissionError::Unsupported(_))));
+            }
+            assert_eq!(eligibility.checked.len(), 1);
+            assert_eq!(eligibility.functions.len(), 1);
+            assert!(eligibility.checked.get(0).unwrap().1 == contract);
+        }
+        assert_eq!(source, source_before);
     }
 }
