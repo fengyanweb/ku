@@ -448,6 +448,10 @@ impl<P: FnMut(Span) -> KuResult<()>> ExecutionHooks for PollHooks<P> {
 
 struct CallFrame {
     env: Env,
+    // Result parameters/captures remain excluded by admission. Only Bind can
+    // introduce a selected Result owner; avoid locking every scalar/String
+    // Env on each dispatch. Keep true conservatively until this frame drops.
+    has_selected_result_bindings: bool,
     leases: Vec<BorrowLease>,
     charged_lease_capacity: usize,
     charged_lease_root_bytes: usize,
@@ -527,6 +531,7 @@ enum Work {
     },
     Statement(StmtId),
     Eval(ExprId),
+    CloneSelectedScalarResult(SymbolId, SpanId),
     SelfCallee(SpanId),
     Unary(UnaryOp, SpanId),
     BinaryLeft(BinaryOp, ExprId, SpanId),
@@ -676,8 +681,8 @@ struct Machine {
     // at every capacity admission, instead of relying on a dispatch snapshot.
     await_payload_snapshot: AwaitPayloadCharge,
     await_payload_escrow: AwaitPayloadCharge,
-    // Direct synchronous err must enable the same stable-owner scanner and
-    // native-drop path even when this machine has never awaited a payload.
+    // Direct synchronous err and selected Result locals keep the stable-owner
+    // scanner/native-drop path active even without an awaited payload.
     selected_error_payloads: bool,
     lease_capacity: usize,
     lease_bytes: usize,
@@ -807,6 +812,88 @@ fn scalar(value: &Value, span: Span) -> KuResult<Value> {
         Value::Null => Ok(Value::Null),
         _ => Err(unsupported(span)),
     }
+}
+
+fn check_selected_clone_charge(
+    charge: AwaitPayloadCharge,
+    policy: AwaitPayloadPolicy,
+) -> KuResult<()> {
+    if charge.count > policy.max_count {
+        return Err(storage_error(ReserveError::FrameLimit, policy.span));
+    }
+    if charge.bytes > policy.max_bytes {
+        return Err(storage_error(ReserveError::StorageLimit, policy.span));
+    }
+    Ok(())
+}
+
+// Runs synchronously beneath the original source Env lock. Only the already
+// copied quota enters: no Machine, scheduler, admission callback or second
+// Env lock is reachable here. Preserve Value's real Result clone conversion.
+fn clone_selected_scalar_result(
+    source: &Value,
+    policy: AwaitPayloadPolicy,
+    observed: &mut AwaitPayloadCharge,
+) -> KuResult<(Value, AwaitPayloadCharge)> {
+    *observed = AwaitPayloadCharge::default();
+    let Value::Result { ok, value: inner } = source else {
+        return Err(unsupported(policy.span));
+    };
+    if *ok {
+        let payload = scalar(inner, policy.span)?;
+        let charge = AwaitPayloadCharge::for_value(source, 0)
+            .map_err(|rejection| rejection.into_error(policy.span))?;
+        check_selected_clone_charge(charge, policy)?;
+        let cloned = Value::Result {
+            ok: true,
+            value: Box::new(payload),
+        };
+        *observed = charge;
+        return Ok((cloned, charge));
+    }
+    AwaitPayloadCharge::error_object(inner)
+        .map_err(|rejection| rejection.into_error(policy.span))?;
+    let Value::Object(fields) = inner.as_ref() else {
+        return Err(unsupported(policy.span));
+    };
+    let text = |name| match fields.get(name) {
+        Some(Value::String(text)) => text,
+        _ => unreachable!("classified selected ErrorObject String field"),
+    };
+    let planned = AwaitPayloadCharge::planned_error_object(
+        text("domain"),
+        text("code"),
+        text("message").len(),
+    )
+    .map_err(|rejection| rejection.into_error(policy.span))?;
+    check_selected_clone_charge(planned, policy)?;
+    let object = Value::Object(fields.clone());
+    let actual = match AwaitPayloadCharge::error_object(&object) {
+        Ok(charge) => charge,
+        Err(rejection) => {
+            drop(object);
+            return Err(rejection.into_error(policy.span));
+        }
+    };
+    // The real Map exists, but its Result Box does not. Preserve this
+    // operation-local peak even when actual capacity exceeds the quota.
+    *observed = AwaitPayloadCharge {
+        count: actual.error_leaf_count,
+        bytes: actual.error_leaf_bytes,
+        error_leaf_count: actual.error_leaf_count,
+        error_leaf_bytes: actual.error_leaf_bytes,
+        ..AwaitPayloadCharge::default()
+    };
+    if let Err(error) = check_selected_clone_charge(actual, policy) {
+        drop(object);
+        return Err(error);
+    }
+    let cloned = Value::Result {
+        ok: false,
+        value: Box::new(object),
+    };
+    *observed = actual;
+    Ok((cloned, actual))
 }
 
 // Consume an already allocated Result wrapper. Its Box allocation is freed
@@ -1134,6 +1221,18 @@ impl Machine {
         // every stable saved primary and that current ephemeral subtotal.
         self.check_argument_capacity(0, span)
             .and_then(|_| self.reserve_values(1, span))
+    }
+
+    fn record_selected_clone_peak(
+        &mut self,
+        previous: AwaitPayloadCharge,
+        observed: AwaitPayloadCharge,
+    ) {
+        let peak = sum_payload_charge(previous, observed);
+        self.peak_result_wrapper_capacity = self.peak_result_wrapper_capacity.max(peak.box_count);
+        self.peak_result_wrapper_bytes = self.peak_result_wrapper_bytes.max(peak.box_bytes);
+        self.peak_error_leaf_capacity = self.peak_error_leaf_capacity.max(peak.error_leaf_count);
+        self.peak_error_leaf_bytes = self.peak_error_leaf_bytes.max(peak.error_leaf_bytes);
     }
 
     fn restore_error_candidate(&mut self, previous: AwaitPayloadCharge) {
@@ -1717,9 +1816,13 @@ impl Machine {
         hooks: &mut impl ExecutionHooks,
     ) {
         let source_span = self.code.span(span);
+        // Selected Result locals need the explicit taskless teardown too:
+        // the legacy collector cannot inspect a poisoned Result cell. Other
+        // zero-Task scopes retain their original adapter and priority.
+        let include_empty = self.frame().has_selected_result_bindings;
         let admitted = hooks
             .prepare_scope_exit(&mut self.frame().env, source_span)
-            .and_then(|()| self.scope_handles(source_span, false));
+            .and_then(|()| self.scope_handles(source_span, include_empty));
         // Keep admission before taking the sole primary, and retain the
         // evaluator's original primary-then-temporary-values release order.
         let result = self.pending.take().unwrap_or_else(|| {
@@ -2500,6 +2603,7 @@ impl Machine {
             &mut self.calls,
             CallFrame {
                 env,
+                has_selected_result_bindings: false,
                 leases,
                 charged_lease_capacity,
                 charged_lease_root_bytes: 0,
@@ -2913,6 +3017,13 @@ impl Machine {
                         let value = self.frame().env.take_owned_string(&symbol, span)?;
                         self.emit(value, span)?;
                     }
+                    ExprCode::VariableSelectedScalarResultClone(name) => {
+                        self.reserve_work(1, span)?;
+                        push(
+                            &mut self.work,
+                            Work::CloneSelectedScalarResult(name, expr.span),
+                        );
+                    }
                     ExprCode::StringBorrow(symbol) => self.borrow_string_argument(symbol, span)?,
                     ExprCode::StringLength {
                         symbol,
@@ -3170,6 +3281,12 @@ impl Machine {
             }
             Work::Bind(name, mutable, declare, span_id) => {
                 let value = self.value();
+                if matches!(value, Value::Result { .. }) {
+                    // A sole remaining owner can now be in its Env cell.
+                    // Keep the census active even after operand fees retire.
+                    self.selected_error_payloads = true;
+                    self.frame().has_selected_result_bindings = true;
+                }
                 let span = self.code.span(span_id);
                 let name = self.code.symbol(name).to_string();
                 let env = &mut self.frame().env;
@@ -3178,6 +3295,45 @@ impl Machine {
                 } else {
                     env.define_owned(name, value, mutable, span)?;
                 }
+            }
+            Work::CloneSelectedScalarResult(name, span_id) => {
+                let span = self.code.span(span_id);
+                // All source Env owners contribute before reserving the
+                // outgoing slot and deriving the clone's additional quota.
+                self.synchronize_result_wrapper_charge();
+                self.reserve_values(1, span)?;
+                let policy = self.await_payload_policy(span)?;
+                let previous = AwaitPayloadCharge {
+                    box_count: self.result_wrapper_capacity,
+                    box_bytes: self.result_wrapper_bytes,
+                    error_leaf_count: self.error_leaf_capacity,
+                    error_leaf_bytes: self.error_leaf_bytes,
+                    ..AwaitPayloadCharge::default()
+                };
+                let frame = self
+                    .calls
+                    .get(self.calls.len() - 1)
+                    .expect("Result clone source frame");
+                let mut observed = AwaitPayloadCharge::default();
+                let cloned = frame
+                    .env
+                    .with_value(self.code.symbol(name), span, |source| {
+                        clone_selected_scalar_result(source, policy, &mut observed)
+                    });
+                // Copy-only metadata leaves the source lock. A rejected
+                // actual Map has already dropped, but its physical peak must
+                // remain visible without charging an unallocated Result Box.
+                self.record_selected_clone_peak(previous, observed);
+                let (value, charge) = cloned?;
+                // The source lock is gone. The actual clone is one local
+                // owner until publication; failures drop it before restoring
+                // its fee, and native unwind settles it before the census.
+                if let Err(error) = self.reserve_error_candidate(previous, charge, span) {
+                    drop(value);
+                    self.restore_error_candidate(previous);
+                    return Err(error);
+                }
+                push(&mut self.values, value);
             }
             Work::Discard => {
                 self.value();
@@ -4229,8 +4385,9 @@ impl Machine {
         {
             return;
         }
-        // Admission forbids Result locals/parameters/captures/arguments and
-        // uncharged scalar Result dependencies, before cached ID reuse. Every
+        // Admission permits only synchronous selected scalar Result locals;
+        // Result parameters/captures/arguments and uncharged dependencies stay
+        // excluded before cached ID reuse. Every
         // real selected owner at a stable boundary is an operand, outgoing
         // primary, saved finally primary, or ticket. Only finish_with owns an
         // operation-local outcome; its sole charge stays in escrow until emit
@@ -4266,6 +4423,11 @@ impl Machine {
             _ => AwaitPayloadCharge::default(),
         };
         let mut retained = ephemeral;
+        for frame in self.calls.as_slice() {
+            if frame.has_selected_result_bindings {
+                retained = sum_payload_charge(retained, frame.env.selected_scalar_result_charge());
+            }
+        }
         for value in self.values.as_slice() {
             retained = sum_payload_charge(retained, value_charge(value));
         }

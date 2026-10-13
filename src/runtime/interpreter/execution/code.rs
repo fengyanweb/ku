@@ -91,6 +91,9 @@ pub(super) enum ExprCode {
     // A checked consuming use of a named String binding. This move never
     // broadens scalar Copy reads or the existing Task owning-read contract.
     VariableStringOwning(SymbolId),
+    // Non-consuming reads of a synchronous selected primitive Result local
+    // retain the original Env clone contract, with pre-allocation admission.
+    VariableSelectedScalarResultClone(SymbolId),
     // Root-only synchronous String loans; the real lease is owned by the
     // surrounding argument frame, rather than this shared syntax owner.
     StringBorrow(SymbolId),
@@ -760,6 +763,18 @@ impl<'a> FunctionSpec<'a> {
             .and_then(|function| primitive_result_kind(&function.return_type))
     }
 
+    fn stores_scalar_result(self) -> bool {
+        matches!(self.role, FunctionRole::OwnedScalarResultNamed)
+    }
+
+    fn check_scalar_local_kind(self, kind: PrimitiveResultKind, span: Span) -> Admission<()> {
+        if self.stores_scalar_result() && self.owned_scalar_result_kind() == Some(kind) {
+            Ok(())
+        } else {
+            Err(AdmissionError::Unsupported(span))
+        }
+    }
+
     fn cache_contract(self) -> FunctionContract {
         let primitive = self
             .declaration
@@ -1249,6 +1264,9 @@ struct ExpressionMode {
     // Only the root expression of a charged owned Result terminal relay.
     // Arguments and nested operands always clear this permission.
     terminal_result: bool,
+    // Only a synchronous selected local's complete RHS. Arguments and nested
+    // builtin operands clear this permission; it is not a Result parameter.
+    local_scalar_result: Option<PrimitiveResultKind>,
     // Only the direct Result operand of ? in the new borrowed Result role.
     // A helper or ordinary call site cannot reuse this callee permission.
     unwrap_borrowed_result: bool,
@@ -1471,6 +1489,7 @@ impl<'a> Builder<'a> {
                 consuming,
                 forbid_call: false,
                 terminal_result: false,
+                local_scalar_result: None,
                 unwrap_borrowed_result: false,
                 owned_async_call: false,
             },
@@ -1557,6 +1576,31 @@ impl<'a> Builder<'a> {
             span,
         };
         Ok(id)
+    }
+
+    fn local_scalar_result_expression(
+        &mut self,
+        expr: &'a Expr,
+        kind: PrimitiveResultKind,
+    ) -> Admission<ExprId> {
+        if is_ok_call(expr) {
+            self.terminal_ok(expr, false, false, Some(kind))
+        } else if is_err_call(expr) {
+            self.terminal_err(expr)
+        } else {
+            expect_kind(self.kind(expr)?, ValueKind::ScalarResult(kind), expr.span)?;
+            self.expression_with_mode(
+                expr,
+                ExpressionMode {
+                    consuming: true,
+                    forbid_call: false,
+                    terminal_result: false,
+                    local_scalar_result: Some(kind),
+                    unwrap_borrowed_result: false,
+                    owned_async_call: false,
+                },
+            )
+        }
     }
 
     fn block(&mut self, body: &'a [Stmt], bound_base: usize) -> Admission<BlockId> {
@@ -1788,6 +1832,10 @@ impl<'a> Builder<'a> {
                             ValueKind::String | ValueKind::ViewString => {
                                 return Err(AdmissionError::Unsupported(expr.span))
                             }
+                            ValueKind::ScalarResult(kind) if spec.stores_scalar_result() => {
+                                spec.check_scalar_local_kind(kind, expr.span)?;
+                                ExprCode::VariableSelectedScalarResultClone(symbol)
+                            }
                             ValueKind::Result
                             | ValueKind::ScalarResult(_)
                             | ValueKind::ResultString => {
@@ -1833,6 +1881,7 @@ impl<'a> Builder<'a> {
                                     consuming: true,
                                     forbid_call: false,
                                     terminal_result: false,
+                                    local_scalar_result: None,
                                     unwrap_borrowed_result: false,
                                     owned_async_call: true,
                                 },
@@ -1873,7 +1922,10 @@ impl<'a> Builder<'a> {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
                         if spec.owns_scalar_result() && self.kind(expr)?.is_scalar_result() {
-                            if !mode.terminal_result {
+                            if !(mode.terminal_result
+                                || spec.stores_scalar_result()
+                                    && mode.local_scalar_result == spec.owned_scalar_result_kind())
+                            {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
                             expect_kind(self.kind(expr)?, spec.return_kind(), expr.span)?;
@@ -2005,6 +2057,7 @@ impl<'a> Builder<'a> {
                                         consuming: true,
                                         forbid_call: has_view,
                                         terminal_result: false,
+                                        local_scalar_result: None,
                                         unwrap_borrowed_result: false,
                                         owned_async_call: false,
                                     },
@@ -2065,6 +2118,29 @@ impl<'a> Builder<'a> {
                 ty,
                 ..
             } => {
+                let local_kind = primitive_result_kind(ty).or_else(|| {
+                    if ty.is_none() {
+                        match self.kind(value).ok()? {
+                            ValueKind::ScalarResult(kind) => Some(kind),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some(kind) = local_kind {
+                    spec.check_scalar_local_kind(kind, span)?;
+                    reserve_field!(self, pending, 1, span);
+                    push(
+                        &mut self.pending,
+                        Visit::Bind(name, false, ValueKind::ScalarResult(kind), span),
+                    );
+                    return Ok(StmtCode::VarDecl(
+                        self.symbol(name, span)?,
+                        self.local_scalar_result_expression(value, kind)?,
+                        *mutable,
+                    ));
+                }
                 if !(scalar_type(ty) || (spec.owns_strings() && string_type(ty))) {
                     return Err(AdmissionError::Unsupported(span));
                 }
@@ -2094,6 +2170,25 @@ impl<'a> Builder<'a> {
                 )
             }
             Stmt::Assign { name, value, .. } => {
+                let local_kind = match binding_kind(self.bound.as_slice(), name) {
+                    Some(ValueKind::ScalarResult(kind)) => Some(kind),
+                    _ => match self.kind(value).ok() {
+                        Some(ValueKind::ScalarResult(kind)) => Some(kind),
+                        _ => None,
+                    },
+                };
+                if let Some(kind) = local_kind {
+                    spec.check_scalar_local_kind(kind, span)?;
+                    reserve_field!(self, pending, 1, span);
+                    push(
+                        &mut self.pending,
+                        Visit::Bind(name, true, ValueKind::ScalarResult(kind), span),
+                    );
+                    return Ok(StmtCode::Assign(
+                        self.symbol(name, span)?,
+                        self.local_scalar_result_expression(value, kind)?,
+                    ));
+                }
                 if spec.borrows_strings()
                     && binding_kind(self.bound.as_slice(), name) == Some(ValueKind::ViewString)
                 {
@@ -2195,6 +2290,7 @@ impl<'a> Builder<'a> {
                                 consuming: true,
                                 forbid_call: false,
                                 terminal_result: true,
+                                local_scalar_result: None,
                                 unwrap_borrowed_result: false,
                                 owned_async_call: false,
                             },
@@ -2326,6 +2422,7 @@ impl<'a> Eligibility<'a> {
                 consuming,
                 forbid_call: false,
                 terminal_result: false,
+                local_scalar_result: None,
                 unwrap_borrowed_result: false,
                 owned_async_call: false,
             },
@@ -2336,6 +2433,43 @@ impl<'a> Eligibility<'a> {
         reserve_field!(self, pending, 1, expr.span);
         push(&mut self.pending, Scan::Expr(expr, mode));
         Ok(())
+    }
+
+    fn local_scalar_result_expression(
+        &mut self,
+        expr: &'a Expr,
+        kind: PrimitiveResultKind,
+    ) -> Admission<()> {
+        let builtin = if is_ok_call(expr) {
+            Some(("ok", ValueKind::Scalar))
+        } else if is_err_call(expr) {
+            Some(("err", ValueKind::String))
+        } else {
+            None
+        };
+        if let Some((name, expected)) = builtin {
+            let shadowed = self.bound(name)
+                || self
+                    .local
+                    .is_some_and(|local| local.captures.contains(name));
+            let argument = terminal_builtin_argument(expr, self.source, shadowed, name)?;
+            expect_kind(self.kind(argument)?, expected, argument.span)?;
+            self.spend(1, expr.span)?;
+            self.expression(argument, true)
+        } else {
+            expect_kind(self.kind(expr)?, ValueKind::ScalarResult(kind), expr.span)?;
+            self.expression_with_mode(
+                expr,
+                ExpressionMode {
+                    consuming: true,
+                    forbid_call: false,
+                    terminal_result: false,
+                    local_scalar_result: Some(kind),
+                    unwrap_borrowed_result: false,
+                    owned_async_call: false,
+                },
+            )
+        }
     }
     fn block(&mut self, body: &'a [Stmt], base: usize) -> Admission<()> {
         let span = body.first().map(stmt_span).unwrap_or_default();
@@ -2403,6 +2537,31 @@ impl<'a> Eligibility<'a> {
                             Stmt::VarDecl {
                                 name, ty, value, ..
                             } => {
+                                let local_kind = primitive_result_kind(ty).or_else(|| {
+                                    if ty.is_none() {
+                                        match self.kind(value).ok()? {
+                                            ValueKind::ScalarResult(kind) => Some(kind),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                });
+                                if let Some(kind) = local_kind {
+                                    spec.check_scalar_local_kind(kind, span)?;
+                                    reserve_field!(self, pending, 1, span);
+                                    push(
+                                        &mut self.pending,
+                                        Scan::Bind(
+                                            name,
+                                            false,
+                                            ValueKind::ScalarResult(kind),
+                                            span,
+                                        ),
+                                    );
+                                    self.local_scalar_result_expression(value, kind)?;
+                                    continue;
+                                }
                                 if !(scalar_type(ty) || (spec.owns_strings() && string_type(ty))) {
                                     return Err(AdmissionError::Unsupported(span));
                                 }
@@ -2425,6 +2584,23 @@ impl<'a> Eligibility<'a> {
                                 self.expression(value, true)?;
                             }
                             Stmt::Assign { name, value, .. } => {
+                                let local_kind = match binding_kind(self.bound.as_slice(), name) {
+                                    Some(ValueKind::ScalarResult(kind)) => Some(kind),
+                                    _ => match self.kind(value).ok() {
+                                        Some(ValueKind::ScalarResult(kind)) => Some(kind),
+                                        _ => None,
+                                    },
+                                };
+                                if let Some(kind) = local_kind {
+                                    spec.check_scalar_local_kind(kind, span)?;
+                                    reserve_field!(self, pending, 1, span);
+                                    push(
+                                        &mut self.pending,
+                                        Scan::Bind(name, true, ValueKind::ScalarResult(kind), span),
+                                    );
+                                    self.local_scalar_result_expression(value, kind)?;
+                                    continue;
+                                }
                                 if spec.borrows_strings()
                                     && binding_kind(self.bound.as_slice(), name)
                                         == Some(ValueKind::ViewString)
@@ -2503,6 +2679,7 @@ impl<'a> Eligibility<'a> {
                                                 consuming: true,
                                                 forbid_call: false,
                                                 terminal_result: true,
+                                                local_scalar_result: None,
                                                 unwrap_borrowed_result: false,
                                                 owned_async_call: false,
                                             },
@@ -2626,6 +2803,10 @@ impl<'a> Eligibility<'a> {
                             }
                             self.free(name, expr.span)?;
                             let kind = self.kind(expr)?;
+                            if let ValueKind::ScalarResult(kind) = kind {
+                                spec.check_scalar_local_kind(kind, expr.span)?;
+                                continue;
+                            }
                             if matches!(
                                 kind,
                                 ValueKind::Result
@@ -2673,6 +2854,7 @@ impl<'a> Eligibility<'a> {
                                         consuming: true,
                                         forbid_call: false,
                                         terminal_result: false,
+                                        local_scalar_result: None,
                                         unwrap_borrowed_result: false,
                                         owned_async_call: true,
                                     },
@@ -2712,7 +2894,11 @@ impl<'a> Eligibility<'a> {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
                             if spec.owns_scalar_result() && self.kind(expr)?.is_scalar_result() {
-                                if !mode.terminal_result {
+                                if !(mode.terminal_result
+                                    || spec.stores_scalar_result()
+                                        && mode.local_scalar_result
+                                            == spec.owned_scalar_result_kind())
+                                {
                                     return Err(AdmissionError::Unsupported(expr.span));
                                 }
                                 expect_kind(self.kind(expr)?, spec.return_kind(), expr.span)?;
@@ -2820,6 +3006,7 @@ impl<'a> Eligibility<'a> {
                                             consuming: true,
                                             forbid_call: has_view,
                                             terminal_result: false,
+                                            local_scalar_result: None,
                                             unwrap_borrowed_result: false,
                                             owned_async_call: false,
                                         },

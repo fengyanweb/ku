@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::error::{KuError, KuResult};
-use crate::runtime::task::TaskHandle;
+use crate::runtime::task::{AwaitPayloadCharge, TaskHandle};
 use crate::span::Span;
 use crate::value::{BorrowedValue, Value, ValueProjection};
 
@@ -70,6 +70,7 @@ fn simple_scope_task_count(value: &Value, span: Span) -> KuResult<usize> {
     match value {
         Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) | Value::Null => Ok(0),
         Value::Task(_) => Ok(1),
+        value if selected_scalar_result_charge(value).is_some() => Ok(0),
         _ => Err(KuError::runtime(
             "internal execution simple scope task collection requires a scalar, String or plain Task",
             span,
@@ -89,10 +90,52 @@ fn simple_scope_task_proxy(
             "internal execution storage rejected: reserved scope task capacity exhausted",
             span,
         )),
+        value if selected_scalar_result_charge(value).is_some() => Ok(None),
         _ => Err(KuError::runtime(
             "internal execution simple scope task collection requires a scalar, String or plain Task",
             span,
         )),
+    }
+}
+
+fn selected_scalar_result_charge(value: &Value) -> Option<AwaitPayloadCharge> {
+    match value {
+        Value::Result {
+            ok: true,
+            value: inner,
+        } if matches!(
+            inner.as_ref(),
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null
+        ) =>
+        {
+            AwaitPayloadCharge::for_value(value, 0).ok()
+        }
+        Value::Result {
+            ok: false,
+            value: inner,
+        } => AwaitPayloadCharge::error_object(inner).ok(),
+        _ => None,
+    }
+}
+
+// Cleanup metadata may recover a poisoned cell only after the real value is
+// proven to be a strict taskless selected Result. Keep the poison bit and all
+// ordinary read/assignment failures; opaque or Task-bearing cells still fail.
+fn lock_simple_task_binding(
+    cell: &BindingCell,
+    span: Span,
+) -> KuResult<std::sync::MutexGuard<'_, Binding>> {
+    match cell.lock() {
+        Ok(binding) => Ok(binding),
+        Err(poisoned) => {
+            let binding = poisoned.into_inner();
+            if selected_scalar_result_charge(&binding.value).is_some() {
+                Ok(binding)
+            } else {
+                drop(binding);
+                Err(KuError::runtime("environment binding is poisoned", span))
+            }
+        }
     }
 }
 
@@ -649,9 +692,7 @@ impl Env {
             let Some(cell) = scope.bindings.get(name) else {
                 continue;
             };
-            let binding = cell
-                .lock()
-                .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+            let binding = lock_simple_task_binding(cell, span)?;
             if binding.borrowed_parameter
                 || binding.match_probe
                 || binding.owner_task_id != crate::runtime::task::current_task_id()
@@ -688,9 +729,7 @@ impl Env {
             let Some(cell) = scope.bindings.get(name) else {
                 continue;
             };
-            let binding = cell
-                .lock()
-                .map_err(|_| KuError::runtime("environment binding is poisoned", span))?;
+            let binding = lock_simple_task_binding(cell, span)?;
             if binding.borrowed_parameter
                 || binding.match_probe
                 || binding.owner_task_id != crate::runtime::task::current_task_id()
@@ -788,6 +827,49 @@ impl Env {
             format!("undefined variable '{}'", name),
             span,
         ))
+    }
+
+    /// Read-only payload census of this Env's real owned cells. Captured Env
+    /// copies have empty owned sets. The callback may copy metadata only: no
+    /// allocation, payload clone/drop, exported reference, code evaluation or
+    /// another binding lock. Poison recovery is confined to metadata census
+    /// and strict taskless selected Result cleanup classification, so a native
+    /// unwind does not erase fees; ordinary reads/assignment retain poison.
+    pub(crate) fn fold_owned_values<T: Copy>(
+        &self,
+        mut census: T,
+        mut fold: impl FnMut(T, &Value) -> T,
+    ) -> T {
+        for scope in &self.scopes {
+            for name in &scope.owned_bindings {
+                let Some(cell) = scope.bindings.get(name) else {
+                    continue;
+                };
+                let binding = cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                census = fold(census, &binding.value);
+            }
+        }
+        census
+    }
+
+    pub(crate) fn selected_scalar_result_charge(&self) -> AwaitPayloadCharge {
+        self.fold_owned_values(AwaitPayloadCharge::default(), |total, value| {
+            let Some(charge) = selected_scalar_result_charge(value) else {
+                return total;
+            };
+            let add = |left: usize, right: usize| {
+                left.checked_add(right)
+                    .expect("admitted Env Result payload backing")
+            };
+            AwaitPayloadCharge {
+                count: add(total.count, charge.count),
+                bytes: add(total.bytes, charge.bytes),
+                box_count: add(total.box_count, charge.box_count),
+                box_bytes: add(total.box_bytes, charge.box_bytes),
+                error_leaf_count: add(total.error_leaf_count, charge.error_leaf_count),
+                error_leaf_bytes: add(total.error_leaf_bytes, charge.error_leaf_bytes),
+            }
+        })
     }
 
     /// An unshared binding cannot be changed through a closure or another task
