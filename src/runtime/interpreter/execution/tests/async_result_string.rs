@@ -9,6 +9,14 @@ mod await_string;
 
 const TEXT: &str = "\u{4fdd}\u{7559}\0async";
 const SIMPLE: &str = "async fn Entry(text: str): str! { return ok(text) }";
+const ERR_SIMPLE: &str = "async fn Entry(text: str): str! { return err(text) }";
+const ERR_RELAY: &str = r#"
+fn Relay(text: str, n: int): str! {
+    if (n <= 0) { return err(text) }
+    return Relay(text, n - 1)
+}
+async fn Entry(text: str, n: int): str! { return Relay(text, n) }
+"#;
 const RELAY: &str = r#"
 fn Relay(text: str, n: int): str! {
     if (n <= 0) { return ok(text) }
@@ -18,13 +26,13 @@ async fn Entry(text: str, n: int): str! { return Relay(text, n) }
 "#;
 
 #[derive(Clone, Copy, Debug)]
-struct Buffer {
-    pointer: usize,
-    capacity: usize,
-    text: &'static str,
+pub(super) struct Buffer {
+    pub(super) pointer: usize,
+    pub(super) capacity: usize,
+    pub(super) text: &'static str,
 }
 
-fn string_input(text: &'static str, capacity: usize) -> (Value, Buffer) {
+pub(super) fn string_input(text: &'static str, capacity: usize) -> (Value, Buffer) {
     let mut value = String::with_capacity(capacity);
     value.push_str(text);
     let buffer = Buffer {
@@ -35,7 +43,75 @@ fn string_input(text: &'static str, capacity: usize) -> (Value, Buffer) {
     (Value::String(value), buffer)
 }
 
-fn result_buffer(value: &Value, buffers: &[Buffer]) -> (usize, usize) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ErrorPayload {
+    pub(super) boxed: usize,
+    pub(super) entries: [usize; 3],
+    pub(super) buffers: [(usize, usize); 6],
+    pub(super) count: usize,
+    pub(super) bytes: usize,
+}
+
+pub(super) fn error_payload(value: &Value) -> Option<ErrorPayload> {
+    let Value::Result { ok: false, value } = value else {
+        return None;
+    };
+    let Value::Object(fields) = value.as_ref() else {
+        return None;
+    };
+    if fields.len() != 3 {
+        return None;
+    }
+    let mut actual = ErrorPayload {
+        boxed: value.as_ref() as *const Value as usize,
+        entries: [0; 3],
+        buffers: [(0, 0); 6],
+        count: fields.capacity(),
+        bytes: fields.capacity() * std::mem::size_of::<(String, Value)>(),
+    };
+    for (index, name) in ["domain", "code", "message"].into_iter().enumerate() {
+        let (key, Value::String(text)) = fields.get_key_value(name)? else {
+            return None;
+        };
+        actual.entries[index] = key as *const String as usize;
+        actual.buffers[index * 2] = (key.as_ptr() as usize, key.capacity());
+        actual.buffers[index * 2 + 1] = (text.as_ptr() as usize, text.capacity());
+        actual.bytes += key.capacity() + text.capacity();
+    }
+    Some(actual)
+}
+
+fn err_input_index(value: &Value, buffers: &[Buffer]) -> Option<usize> {
+    let Value::Result { ok: false, value } = value else {
+        return None;
+    };
+    let Value::Object(fields) = value.as_ref() else {
+        return None;
+    };
+    if !matches!(fields.get("domain"), Some(Value::String(domain)) if domain == "ku")
+        || !matches!(fields.get("code"), Some(Value::String(code)) if code == "err")
+    {
+        return None;
+    }
+    let Value::String(message) = fields.get("message")? else {
+        return None;
+    };
+    buffers
+        .iter()
+        .position(|buffer| buffer.text == message.as_str())
+}
+
+pub(super) fn result_buffer(value: &Value, buffers: &[Buffer]) -> (usize, usize) {
+    if let Some(index) = err_input_index(value, buffers) {
+        let actual = error_payload(value).expect("the source err has its actual ErrorObject");
+        if !buffers[index].text.is_empty() {
+            assert_ne!(
+                actual.buffers[5].0, buffers[index].pointer,
+                "source err preserves its existing message.clone contract"
+            );
+        }
+        return (index, actual.boxed);
+    }
     let Value::Result { ok: true, value } = value else {
         panic!("the admitted outcome must be a real success Result: {value:?}");
     };
@@ -51,7 +127,12 @@ fn result_buffer(value: &Value, buffers: &[Buffer]) -> (usize, usize) {
     (index, value.as_ref() as *const Value as usize)
 }
 
-fn observe(machine: &Machine, buffers: &[Buffer], boxes: &mut [Option<usize>]) -> usize {
+pub(super) fn observe(
+    machine: &Machine,
+    buffers: &[Buffer],
+    boxes: &mut [Option<usize>],
+    errors: &mut Vec<ErrorPayload>,
+) -> usize {
     let mut pointers = Vec::new();
     let mut error_count = 0;
     let mut error_bytes = 0;
@@ -70,6 +151,23 @@ fn observe(machine: &Machine, buffers: &[Buffer], boxes: &mut [Option<usize>]) -
                 let (count, bytes) = error_backing(leaf);
                 error_count += count;
                 error_bytes += bytes;
+                let actual = error_payload(value).expect("the real false Result backing");
+                if let Some(previous) = errors.iter().find(|previous| previous.boxed == pointer) {
+                    assert_eq!(
+                        actual, *previous,
+                        "the same Box, Map entries and six String buffers move intact"
+                    );
+                } else {
+                    errors.push(actual);
+                }
+                if let Some(index) = err_input_index(value, buffers) {
+                    assert_eq!(result_buffer(value, buffers), (index, pointer));
+                    if let Some(previous) = boxes[index] {
+                        assert_eq!(pointer, previous, "a source err relay moves its actual Box");
+                    } else {
+                        boxes[index] = Some(pointer);
+                    }
+                }
             }
             assert!(
                 !pointers.contains(&pointer),
@@ -132,7 +230,7 @@ fn observe(machine: &Machine, buffers: &[Buffer], boxes: &mut [Option<usize>]) -
     count
 }
 
-fn error_backing(value: &Value) -> (usize, usize) {
+pub(super) fn error_backing(value: &Value) -> (usize, usize) {
     let Value::Object(fields) = value else {
         panic!("an awaited task failure retains its actual ErrorObject")
     };
@@ -150,7 +248,7 @@ fn error_backing(value: &Value) -> (usize, usize) {
     (fields.capacity(), bytes)
 }
 
-fn drained(machine: &Machine) {
+pub(super) fn drained(machine: &Machine) {
     assert_drained(&machine.metrics, 0);
     assert_eq!((machine.argument_capacity, machine.argument_bytes), (0, 0));
     assert_eq!(
@@ -234,6 +332,8 @@ struct Finished {
     peak_errors: usize,
     peak_error_bytes: usize,
     outgoing: Option<(usize, usize)>,
+    outgoing_error: Option<ErrorPayload>,
+    error_owners: Vec<ErrorPayload>,
 }
 
 #[derive(Debug)]
@@ -259,7 +359,7 @@ enum Witness {
         input: Buffer,
         boxed: usize,
     },
-    Finished(Finished),
+    Finished(Box<Finished>),
 }
 
 struct SourceRunner {
@@ -267,6 +367,7 @@ struct SourceRunner {
     plan: Plan,
     buffers: Vec<Buffer>,
     boxes: Vec<Option<usize>>,
+    errors: Vec<ErrorPayload>,
     witness: mpsc::Sender<Witness>,
     release: Option<mpsc::Receiver<()>>,
     paused: bool,
@@ -314,7 +415,7 @@ impl LocalTaskRunner for SourceRunner {
                             .len()
                             .checked_sub(1)
                             .and_then(|i| machine.work.get(i)),
-                        Some(Work::WrapTerminalOk(_, true))
+                        Some(Work::WrapTerminalOk(_, true) | Work::WrapTerminalErr(_))
                     );
                 if at_wrap && matches!(self.plan.fault, Fault::WrapperCount | Fault::WrapperBytes) {
                     let Value::String(text) = machine.values.get(machine.values.len() - 1).unwrap()
@@ -342,6 +443,7 @@ impl LocalTaskRunner for SourceRunner {
                             + machine.lease_capacity
                             + machine.lease_root_bytes / std::mem::size_of::<Value>()
                             + machine.result_wrapper_capacity;
+                        machine.value_limits.max_frames += machine.error_leaf_capacity;
                     } else {
                         machine.value_limits.max_storage_bytes =
                             machine.values.charged_storage_bytes()
@@ -352,13 +454,14 @@ impl LocalTaskRunner for SourceRunner {
                                 + machine.lease_bytes
                                 + machine.lease_root_bytes
                                 + machine.result_wrapper_bytes
+                                + machine.error_leaf_bytes
                                 + std::mem::size_of::<Value>()
                                 - 1;
                     }
                     self.faulted = true;
                 }
                 if self.plan.fault == Fault::NativeBox && machine.result_wrapper_capacity > 0 {
-                    let count = observe(machine, &self.buffers, &mut self.boxes);
+                    let count = observe(machine, &self.buffers, &mut self.boxes, &mut self.errors);
                     assert_eq!(count, 1);
                     self.witness
                         .send(Witness::Native {
@@ -379,11 +482,13 @@ impl LocalTaskRunner for SourceRunner {
             .inner
             .dispatch(NonZeroUsize::new(self.plan.chunk).unwrap());
         if let Some(machine) = self.inner.machine.as_ref() {
-            observe(machine, &self.buffers, &mut self.boxes);
+            observe(machine, &self.buffers, &mut self.boxes, &mut self.errors);
         }
         if let ControlFlow::Break(outcome) = &result {
             let outgoing = outcome.as_ref().ok().and_then(|value| {
-                if matches!(value, Value::Result { ok: true, .. }) {
+                if matches!(value, Value::Result { ok: true, .. })
+                    || err_input_index(value, &self.buffers).is_some()
+                {
                     let outgoing = result_buffer(value, &self.buffers);
                     if let Some(previous) = self.boxes[outgoing.0] {
                         assert_eq!(
@@ -396,13 +501,26 @@ impl LocalTaskRunner for SourceRunner {
                     None
                 }
             });
+            let outgoing_error = outcome.as_ref().ok().and_then(error_payload);
+            if let Some(actual) = outgoing_error {
+                if let Some(previous) = self
+                    .errors
+                    .iter()
+                    .find(|previous| previous.boxed == actual.boxed)
+                {
+                    assert_eq!(
+                        actual, *previous,
+                        "the published false Result keeps its Box, Map and String backing"
+                    );
+                }
+            }
             let machine = self.inner.machine.as_ref();
             if let Some(machine) = machine {
                 drained(machine);
             }
             assert_eq!(self.inner.interpreter.call_depth, 0);
             self.witness
-                .send(Witness::Finished(Finished {
+                .send(Witness::Finished(Box::new(Finished {
                     steps: self.inner.interpreter.steps,
                     calls: machine.map_or(0, |m| m.metrics.entered_calls),
                     peak_calls: machine.map_or(0, |m| m.metrics.peak_calls),
@@ -414,7 +532,9 @@ impl LocalTaskRunner for SourceRunner {
                     peak_errors: machine.map_or(0, |m| m.metrics.peak_error_leaf_capacity),
                     peak_error_bytes: machine.map_or(0, |m| m.metrics.peak_error_leaf_bytes),
                     outgoing,
-                }))
+                    outgoing_error,
+                    error_owners: self.errors.clone(),
+                })))
                 .unwrap();
             if self.plan.pause == Pause::Produced && !self.paused {
                 self.pause(Pause::Produced, outgoing);
@@ -499,6 +619,7 @@ fn spawn_source(
                     inner,
                     plan,
                     boxes: vec![None; buffers.len()],
+                    errors: Vec::new(),
                     buffers,
                     witness: tx,
                     release: Some(release_rx),
@@ -538,7 +659,7 @@ fn finished(rx: &mpsc::Receiver<Witness>) -> Finished {
     let Witness::Finished(finished) = rx.recv_timeout(WAIT).unwrap() else {
         panic!("the actual runner must finish and drain its source machine")
     };
-    finished
+    *finished
 }
 
 fn retired(mut batch: TaskRetirementBatch) {
@@ -1121,8 +1242,9 @@ fn async_string_result_whole_tree_rejections_preserve_original_legacy_inputs_and
         "async fn Entry(text: str): str! { child = Entry(text)\nreturn await child }",
         "fn Leaf(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { return ok(Leaf(text)?) }",
         "async fn Entry(text: str): str! { result = ok(text)\nreturn result }",
+        "async fn Entry(text: str): str! { result = err(text)\nreturn result }",
+        "fn err(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { return err(text) }",
         "fn Pass(value: str!): str! { return value }\nasync fn Entry(text: str): str! { return Pass(ok(text)) }",
-        "async fn Entry(text: str): str! { return err(text) }",
         "async fn Entry(text: str): str! { try { marker = 1 } catch (e) { marker = 2 }\nreturn ok(text) }",
         "fn Read(&text: str): int { return text.len() }\nasync fn Entry(text: str): str! { length = Read(text)\nreturn ok(text) }",
         "async fn Entry(text: str): str! { fn Local(value: str): str! { return ok(value) }\nreturn Local(text) }",
@@ -1196,4 +1318,425 @@ fn async_string_result_whole_tree_rejections_preserve_original_legacy_inputs_and
         &source["Entry"],
         Limits::default()
     ));
+}
+
+fn err_source_receipt(
+    source: &str,
+    args: Vec<Value>,
+    buffers: Vec<Buffer>,
+    plan: Plan,
+) -> (Finished, Vec<Witness>, KuResult<Value>) {
+    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+    let (task, rx, _release) = spawn_source(&runtime, source, args, buffers, plan);
+    let id = task.id();
+    let constructor = rx.recv_timeout(WAIT).unwrap();
+    let mut proof = None;
+    let mut other = Vec::new();
+    for _ in 0..4 {
+        match rx.recv_timeout(WAIT).unwrap() {
+            Witness::Finished(actual) => {
+                proof = Some(*actual);
+                break;
+            }
+            event => other.push(event),
+        }
+    }
+    let result = task.await_result();
+    release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+    close(&runtime);
+    // All actual factory/queue/completion owners have retired before the
+    // caller makes semantic assertions about the source and its payload.
+    let Witness::Entered {
+        task,
+        selected,
+        legacy,
+        pending_error,
+        steps,
+        calls,
+    } = constructor
+    else {
+        panic!("the retired claimant must report its actual constructor");
+    };
+    assert_eq!(task, id);
+    assert!(selected && !legacy && !pending_error);
+    assert_eq!((steps, calls), (0, 1));
+    (
+        proof.expect("the real source machine finished"),
+        other,
+        result,
+    )
+}
+
+fn assert_source_error(result: &Value, proof: &Finished, buffers: &[Buffer]) -> ErrorPayload {
+    let actual = error_payload(result).expect("the source returns a false ErrorObject Result");
+    assert_eq!(proof.outgoing, Some(result_buffer(result, buffers)));
+    assert_eq!(proof.outgoing_error, Some(actual));
+    assert_eq!(
+        proof.peak_strings,
+        buffers.iter().map(|buffer| buffer.capacity).sum::<usize>()
+    );
+    actual
+}
+
+#[test]
+fn terminal_err_real_claimant_input_helper_and_sync_relay_keep_512_and_first_513() {
+    const HELPER: &str = "fn Keep(text: str): str { try { marker = 1 } finally { marker = 2 }\nreturn text }\nasync fn Entry(text: str): str! { return err(Keep(text)) }";
+    const FAILURE: &str = "fn Keep(text: str, ignored: int): str { return text }\nasync fn Entry(text: str): str! { return err(Keep(text, 1 / 0)) }";
+    for chunk in [1, 7, 256] {
+        for (source, n, calls, finalies) in [
+            (ERR_SIMPLE, None, 1, 0),
+            (HELPER, None, 2, 1),
+            (ERR_RELAY, Some(510), 512, 0),
+            (ERR_RELAY, Some(511), 512, 0),
+            (FAILURE, None, 1, 0),
+        ] {
+            let source_functions = functions(source);
+            assert!(code::eligible_claimed_async_owned_result_string_entry(
+                &source_functions,
+                &source_functions["Entry"],
+                Limits::default()
+            ));
+            CodeHandle::compile_claimed_async_owned_result_string_entry(
+                &source_functions,
+                &source_functions["Entry"],
+                Limits::default(),
+            )
+            .unwrap();
+            let (text, buffer) = string_input(TEXT, 4096);
+            let mut args = vec![text];
+            if let Some(n) = n {
+                args.push(Value::Int(n));
+            }
+            let (proof, events, result) =
+                err_source_receipt(source, args, vec![buffer], Plan::normal(chunk));
+            assert!(events.is_empty());
+            assert_eq!(
+                (proof.calls, proof.peak_calls, proof.finally),
+                (calls, calls, finalies)
+            );
+            if n == Some(511) || source == FAILURE {
+                let error = result.unwrap_err();
+                if source == FAILURE {
+                    assert_eq!(error.message, "division by zero");
+                } else {
+                    assert_eq!(error.code.as_deref(), Some("call_depth_exceeded"));
+                }
+                assert_eq!((proof.peak_boxes, proof.peak_errors), (0, 0));
+            } else {
+                let actual = assert_source_error(&result.unwrap(), &proof, &[buffer]);
+                assert_eq!(
+                    (proof.peak_boxes, proof.peak_box_bytes),
+                    (1, std::mem::size_of::<Value>())
+                );
+                assert_eq!(
+                    (proof.peak_errors, proof.peak_error_bytes),
+                    (actual.count, actual.bytes)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_err_real_claimant_preallocation_budgets_never_publish_candidate_box_or_map() {
+    for fault in [Fault::WrapperCount, Fault::WrapperBytes] {
+        let (text, buffer) = string_input(TEXT, 4096);
+        let mut plan = Plan::normal(1);
+        plan.fault = fault;
+        let (proof, events, result) =
+            err_source_receipt(ERR_SIMPLE, vec![text], vec![buffer], plan);
+        let [Witness::Wrap { steps, input }] = events.as_slice() else {
+            panic!("one actual preallocation checkpoint")
+        };
+        assert!(*steps > 0);
+        assert_eq!(
+            (input.pointer, input.capacity),
+            (buffer.pointer, buffer.capacity)
+        );
+        assert!(result
+            .unwrap_err()
+            .message
+            .contains(if fault == Fault::WrapperCount {
+                "FrameLimit"
+            } else {
+                "StorageLimit"
+            }));
+        assert_eq!(
+            (
+                proof.peak_boxes,
+                proof.peak_box_bytes,
+                proof.peak_errors,
+                proof.peak_error_bytes
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(proof.peak_strings, buffer.capacity);
+        assert!(proof.outgoing.is_none() && proof.outgoing_error.is_none());
+    }
+}
+
+#[test]
+fn terminal_err_real_claimant_q2_q3_charge_each_saved_map_and_six_buffers() {
+    const Q2: &str = "async fn Entry(first: str, second: str, third: str, fallback: str): str! { try { return err(first) } finally { return err(second) }\nreturn ok(fallback) }";
+    const Q3: &str = "async fn Entry(first: str, second: str, third: str, fallback: str): str! { try { return err(first) } finally { try { return err(second) } finally { return err(third) } }\nreturn ok(fallback) }";
+    for (source, owners) in [(Q2, 2), (Q3, 3)] {
+        for chunk in [1, 7, 256] {
+            let (first, a) = string_input("中\0primary", 1024);
+            let (second, b) = string_input("é\0replacement", 4096);
+            let (third, c) = string_input(TEXT, 2048);
+            let (fallback, d) = string_input("\0fallback", 512);
+            let buffers = [a, b, c, d];
+            let (proof, events, result) = err_source_receipt(
+                source,
+                vec![first, second, third, fallback],
+                buffers.to_vec(),
+                Plan::normal(chunk),
+            );
+            assert!(events.is_empty());
+            let result = result.unwrap();
+            let actual = assert_source_error(&result, &proof, &buffers);
+            assert_eq!(result_buffer(&result, &buffers).0, owners - 1);
+            assert_eq!((proof.peak_boxes, proof.finally), (owners, owners - 1));
+            assert_eq!(proof.peak_box_bytes, owners * std::mem::size_of::<Value>());
+            // Single-work dispatches expose every real saved primary. A
+            // larger chunk can create and retire those owners before the
+            // next boundary, so it proves output/cleanup and reported peaks,
+            // while the one-work run supplies independent physical evidence.
+            if chunk != 1 {
+                assert!(proof.peak_errors >= actual.count);
+                assert!(proof.peak_error_bytes >= actual.bytes);
+                continue;
+            }
+            assert_eq!(proof.error_owners.len(), owners);
+            assert_eq!(
+                (proof.peak_errors, proof.peak_error_bytes),
+                (
+                    proof.error_owners.iter().map(|p| p.count).sum::<usize>(),
+                    proof.error_owners.iter().map(|p| p.bytes).sum::<usize>()
+                )
+            );
+            for (index, owner) in proof.error_owners.iter().enumerate() {
+                for other in &proof.error_owners[..index] {
+                    assert_ne!(owner.boxed, other.boxed);
+                    assert!(owner
+                        .entries
+                        .iter()
+                        .all(|entry| !other.entries.contains(entry)));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_err_uncommitted_late_result_keeps_actual_completion_and_queue_receipts() {
+    for cancel in [false, true] {
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        let (text, buffer) = string_input(TEXT, 4096);
+        let mut plan = Plan::normal(1);
+        plan.pause = Pause::Produced;
+        let (task, rx, release) =
+            spawn_source(&runtime, ERR_SIMPLE, vec![text], vec![buffer], plan);
+        let initial = (0..3)
+            .map(|_| rx.recv_timeout(WAIT).unwrap())
+            .collect::<Vec<_>>();
+        let context = CancellationContext::new(TerminationReason::TimedOut);
+        let shorter = CancellationContext {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: context.cleanup_deadline - Duration::from_millis(1),
+        };
+        let expected = CancellationContext {
+            reason: context.reason,
+            cleanup_deadline: shorter.cleanup_deadline,
+        };
+        let accepted = cancel.then(|| task.request_cancel_with(context));
+        let tightened = cancel.then(|| task.request_cancel_with(shorter));
+        let witness = task.retirement_witness();
+        let mut owner = Some(task);
+        let mut batch = TaskRetirementBatch::from_reserved(
+            vec![witness],
+            if cancel { expected } else { context },
+        );
+        let before = if cancel {
+            None
+        } else {
+            drop(owner.take());
+            Some(batch.poll(Instant::now()))
+        };
+        release.send(()).unwrap();
+        let result = if cancel {
+            let task = owner.take().unwrap();
+            let result = task.await_result();
+            drop(task);
+            Some(result)
+        } else {
+            None
+        };
+        retired(batch);
+        close(&runtime);
+        let [Witness::Entered {
+            selected: true,
+            legacy: false,
+            ..
+        }, Witness::Finished(proof), Witness::Paused {
+            stage: Pause::Produced,
+            outgoing,
+            ..
+        }] = initial.as_slice()
+        else {
+            panic!("actual produced false Result checkpoint")
+        };
+        assert!(proof.outgoing_error.is_some());
+        assert_eq!(*outgoing, proof.outgoing);
+        assert_eq!(proof.peak_boxes, 1);
+        if cancel {
+            assert_eq!((accepted, tightened), (Some(true), Some(false)));
+            assert_eq!(
+                result.unwrap().unwrap_err().runtime_termination(),
+                Some(expected)
+            );
+        } else {
+            assert!(
+                matches!(before, Some(RetirementBatchPoll::Pending { .. })),
+                "last owner release cannot acknowledge the held real err Map or running queue node"
+            );
+        }
+    }
+}
+
+#[test]
+fn terminal_err_native_map_abandonment_restores_the_same_real_worker_for_next_claimant() {
+    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+    let (text, buffer) = string_input(TEXT, 4096);
+    let mut plan = Plan::normal(1);
+    plan.fault = Fault::NativeBox;
+    let (task, rx, _release) = spawn_source(&runtime, ERR_SIMPLE, vec![text], vec![buffer], plan);
+    let native_constructor = rx.recv_timeout(WAIT).unwrap();
+    let native_checkpoint = rx.recv_timeout(WAIT).unwrap();
+    let result = task.await_result();
+    release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+    let mut native_events = vec![native_constructor, native_checkpoint];
+    native_events.extend(rx);
+    let (text, healthy_buffer) = string_input(TEXT, 4096);
+    let (healthy, healthy_rx, _release) = spawn_source(
+        &runtime,
+        ERR_SIMPLE,
+        vec![text],
+        vec![healthy_buffer],
+        Plan::normal(1),
+    );
+    let healthy_constructor = healthy_rx.recv_timeout(WAIT).unwrap();
+    let healthy_completion = healthy_rx.recv_timeout(WAIT).unwrap();
+    let healthy_result = healthy.await_result();
+    release_task(
+        healthy,
+        CancellationContext::new(TerminationReason::Cancelled),
+    );
+    close(&runtime);
+    let result = result.unwrap();
+    let healthy_result = healthy_result.unwrap();
+    let mut healthy_events = vec![healthy_constructor, healthy_completion];
+    healthy_events.extend(healthy_rx);
+    let [Witness::Entered { selected: true, .. }, Witness::Native { input, boxed }] =
+        native_events.as_slice()
+    else {
+        panic!("the native kernel abandoned its real false Result")
+    };
+    assert_eq!(
+        (input.pointer, input.capacity),
+        (buffer.pointer, buffer.capacity)
+    );
+    assert_ne!(*boxed, 0);
+    let Value::Result { ok: false, value } = result else {
+        panic!("existing native panic classification")
+    };
+    let Value::Object(fields) = *value else {
+        unreachable!()
+    };
+    assert!(matches!(fields.get("code"), Some(Value::String(code)) if code == "panic"));
+    let [Witness::Entered { selected: true, .. }, Witness::Finished(proof)] =
+        healthy_events.as_slice()
+    else {
+        panic!("the same fixed worker starts healthy with restored TLS")
+    };
+    assert_source_error(&healthy_result, proof, &[healthy_buffer]);
+}
+
+#[test]
+fn terminal_err_queued_and_running_cancellation_retire_input_before_result_allocation() {
+    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (held_tx, held_rx) = mpsc::channel();
+    let held = runtime
+        .spawn(move || {
+            ready_tx.send(()).unwrap();
+            held_rx.recv_timeout(WAIT).expect("finite held worker");
+            Ok(Value::Null)
+        })
+        .unwrap();
+    ready_rx.recv_timeout(WAIT).unwrap();
+    let (text, buffer) = string_input(TEXT, 4096);
+    let (task, rx, _release) = spawn_source(
+        &runtime,
+        ERR_SIMPLE,
+        vec![text],
+        vec![buffer],
+        Plan::normal(1),
+    );
+    let queued_before = runtime.snapshot().unwrap().queued_tasks;
+    let context = CancellationContext::new(TerminationReason::TimedOut);
+    let accepted = task.request_cancel_with(context);
+    let result = task.await_result();
+    release_task(task, context);
+    let abandoned_factory = rx.recv_timeout(WAIT);
+    let queued_after = runtime.snapshot().unwrap().queued_tasks;
+    held_tx.send(()).unwrap();
+    let held_result = held.await_result();
+    release_task(held, CancellationContext::new(TerminationReason::Cancelled));
+    close(&runtime);
+    assert_eq!((queued_before, queued_after), (1, 0));
+    assert!(accepted);
+    assert!(matches!(
+        abandoned_factory,
+        Err(mpsc::RecvTimeoutError::Disconnected)
+    ));
+    assert_eq!(result.unwrap_err().runtime_termination(), Some(context));
+    assert_eq!(held_result.unwrap(), Value::Null);
+
+    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+    let (text, buffer) = string_input(TEXT, 4096);
+    let mut plan = Plan::normal(1);
+    plan.pause = Pause::Running;
+    let (task, rx, release) = spawn_source(&runtime, ERR_SIMPLE, vec![text], vec![buffer], plan);
+    let constructor = rx.recv_timeout(WAIT).unwrap();
+    let paused = rx.recv_timeout(WAIT).unwrap();
+    let accepted = task.request_cancel_with(context);
+    release.send(()).unwrap();
+    let result = task.await_result();
+    release_task(task, context);
+    close(&runtime);
+    let proof = finished(&rx);
+    assert!(matches!(
+        constructor,
+        Witness::Entered {
+            selected: true,
+            legacy: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        paused,
+        Witness::Paused {
+            stage: Pause::Running,
+            outgoing: None,
+            ..
+        }
+    ));
+    assert!(accepted);
+    assert_eq!(result.unwrap_err().runtime_termination(), Some(context));
+    assert_eq!(
+        (proof.peak_boxes, proof.peak_errors, proof.peak_error_bytes),
+        (0, 0, 0)
+    );
+    assert!(proof.outgoing_error.is_none());
 }

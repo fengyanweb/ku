@@ -101,6 +101,9 @@ pub(super) enum ExprCode {
     // Only a direct Result return constructs this builtin. The String
     // operand is enabled solely by the strict owned Result<String> role.
     TerminalOk(ExprId, bool),
+    // Only an unshadowed direct return in the strict owned Result<String>
+    // role. The builtin keeps its original String clone conversion.
+    TerminalErr(ExprId),
     // Synchronous borrowed primitive Result returns use their own charged
     // wrapper; old scalar Result roots retain their original contract.
     TerminalBorrowedOk(ExprId),
@@ -1017,17 +1020,23 @@ fn is_ok_call(expr: &Expr) -> bool {
         if matches!(&callee.kind, ExprKind::Variable(name) if name == "ok"))
 }
 
-fn terminal_ok_argument<'a>(
+fn is_err_call(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::Call { callee, .. }
+        if matches!(&callee.kind, ExprKind::Variable(name) if name == "err"))
+}
+
+fn terminal_builtin_argument<'a>(
     expr: &'a Expr,
     source: &HashMap<String, FnDecl>,
     shadowed: bool,
+    builtin: &str,
 ) -> Admission<&'a Expr> {
     let ExprKind::Call { callee, args } = &expr.kind else {
         return Err(AdmissionError::Unsupported(expr.span));
     };
-    if !matches!(&callee.kind, ExprKind::Variable(name) if name == "ok")
+    if !matches!(&callee.kind, ExprKind::Variable(name) if name == builtin)
         || args.len() != 1
-        || source.contains_key("ok")
+        || source.contains_key(builtin)
         || shadowed
     {
         return Err(AdmissionError::Unsupported(expr.span));
@@ -1280,7 +1289,7 @@ impl<'a> Builder<'a> {
             || self
                 .local
                 .is_some_and(|local| local.captures.contains("ok"));
-        let argument = terminal_ok_argument(expr, self.source, shadowed)?;
+        let argument = terminal_builtin_argument(expr, self.source, shadowed, "ok")?;
         expect_kind(
             self.kind(argument)?,
             if owned_string {
@@ -1309,6 +1318,31 @@ impl<'a> Builder<'a> {
             } else {
                 ExprCode::TerminalOk(operand, owned_string)
             },
+            span,
+        };
+        Ok(id)
+    }
+
+    fn terminal_err(&mut self, expr: &'a Expr) -> Admission<ExprId> {
+        let shadowed = self.is_bound("err")
+            || self
+                .local
+                .is_some_and(|local| local.captures.contains("err"));
+        let argument = terminal_builtin_argument(expr, self.source, shadowed, "err")?;
+        expect_kind(self.kind(argument)?, ValueKind::String, argument.span)?;
+        self.spend(1, expr.span)?;
+        let id = self
+            .expressions(1, expr.span)?
+            .get(0)
+            .expect("err expression");
+        let span = self.span(expr.span)?;
+        let operand = self.expression(argument, true)?;
+        *self
+            .arena
+            .expressions
+            .get_mut(id.0)
+            .expect("terminal err expression slot") = CodeExpr {
+            kind: ExprCode::TerminalErr(operand),
             span,
         };
         Ok(id)
@@ -1913,6 +1947,8 @@ impl<'a> Builder<'a> {
                     let value = value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
                     if is_ok_call(value) {
                         Some(self.terminal_ok(value, true, false)?)
+                    } else if is_err_call(value) {
+                        Some(self.terminal_err(value)?)
                     } else {
                         if !(spec.is_claimed_async_owned_result_string()
                             && matches!(value.kind, ExprKind::Await(_)))
@@ -2172,8 +2208,30 @@ impl<'a> Eligibility<'a> {
                                         value.as_ref().ok_or(AdmissionError::Unsupported(span))?;
                                     if is_ok_call(value) {
                                         let shadowed = self.bound("ok");
-                                        let argument =
-                                            terminal_ok_argument(value, self.source, shadowed)?;
+                                        let argument = terminal_builtin_argument(
+                                            value,
+                                            self.source,
+                                            shadowed,
+                                            "ok",
+                                        )?;
+                                        expect_kind(
+                                            self.kind(argument)?,
+                                            ValueKind::String,
+                                            argument.span,
+                                        )?;
+                                        self.spend(1, value.span)?;
+                                        self.expression(argument, true)?;
+                                    } else if is_err_call(value) {
+                                        let shadowed = self.bound("err")
+                                            || self.local.is_some_and(|local| {
+                                                local.captures.contains("err")
+                                            });
+                                        let argument = terminal_builtin_argument(
+                                            value,
+                                            self.source,
+                                            shadowed,
+                                            "err",
+                                        )?;
                                         expect_kind(
                                             self.kind(argument)?,
                                             ValueKind::String,
@@ -2209,8 +2267,12 @@ impl<'a> Eligibility<'a> {
                                         || self
                                             .local
                                             .is_some_and(|local| local.captures.contains("ok"));
-                                    let argument =
-                                        terminal_ok_argument(value, self.source, shadowed)?;
+                                    let argument = terminal_builtin_argument(
+                                        value,
+                                        self.source,
+                                        shadowed,
+                                        "ok",
+                                    )?;
                                     expect_kind(
                                         self.kind(argument)?,
                                         ValueKind::Scalar,

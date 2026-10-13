@@ -15,6 +15,7 @@
 use super::*;
 use crate::ast::{Param, TypeName};
 use crate::runtime::task::{AwaitPayloadCharge, AwaitPayloadPolicy, TaskRetirementWitness};
+use crate::stdlib::errors;
 use std::cell::Cell;
 use std::num::NonZeroUsize;
 use storage::{FrameLimits, FrameStack, ReserveError};
@@ -551,6 +552,7 @@ enum Work {
     Discard,
     Return,
     WrapTerminalOk(SpanId, bool),
+    WrapTerminalErr(SpanId),
     WrapBorrowedTerminalOk(SpanId),
     AwaitOperand(SpanId),
     AwaitOwnedStringOperand(SpanId),
@@ -651,8 +653,9 @@ struct Machine {
     retirement_capacity: usize,
     retirement_bytes: usize,
     peak_retirement_bytes: usize,
-    // This slice cannot create a String: every buffer comes from the input,
-    // moves between slots and is conservatively charged until final transfer.
+    // Input buffers move between slots and remain conservatively reserved
+    // until final transfer. Terminal err's additional clone belongs to its
+    // separately charged ErrorObject, never to this original input pool.
     string_payload_bytes: usize,
     peak_string_payload_bytes: usize,
     // Each selected direct ok owns one actual Box<Value>. Saved finally
@@ -661,7 +664,8 @@ struct Machine {
     result_wrapper_bytes: usize,
     peak_result_wrapper_capacity: usize,
     peak_result_wrapper_bytes: usize,
-    // Selected await failures retain their original ErrorObject Map/Strings.
+    // Selected await failures and terminal err own their ErrorObject
+    // Map/Strings. The original input reservation remains independent.
     error_leaf_capacity: usize,
     error_leaf_bytes: usize,
     peak_error_leaf_capacity: usize,
@@ -671,7 +675,9 @@ struct Machine {
     // at every capacity admission, instead of relying on a dispatch snapshot.
     await_payload_snapshot: AwaitPayloadCharge,
     await_payload_escrow: AwaitPayloadCharge,
-    owned_await_payloads: bool,
+    // Direct synchronous err must enable the same stable-owner scanner and
+    // native-drop path even when this machine has never awaited a payload.
+    selected_error_payloads: bool,
     lease_capacity: usize,
     lease_bytes: usize,
     lease_root_bytes: usize,
@@ -936,7 +942,7 @@ impl Machine {
             peak_error_leaf_bytes: 0,
             await_payload_snapshot: AwaitPayloadCharge::default(),
             await_payload_escrow: AwaitPayloadCharge::default(),
-            owned_await_payloads: false,
+            selected_error_payloads: false,
             lease_capacity: 0,
             lease_bytes: 0,
             lease_root_bytes: 0,
@@ -1093,6 +1099,109 @@ impl Machine {
         self.peak_result_wrapper_capacity = self.peak_result_wrapper_capacity.max(count);
         self.peak_result_wrapper_bytes = self.peak_result_wrapper_bytes.max(bytes);
         push(&mut self.values, Value::Result { ok: true, value });
+        Ok(())
+    }
+
+    fn reserve_error_candidate(
+        &mut self,
+        previous: AwaitPayloadCharge,
+        candidate: AwaitPayloadCharge,
+        span: Span,
+    ) -> KuResult<()> {
+        let box_count = previous
+            .box_count
+            .checked_add(candidate.box_count)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let box_bytes = previous
+            .box_bytes
+            .checked_add(candidate.box_bytes)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let leaf_count = previous
+            .error_leaf_count
+            .checked_add(candidate.error_leaf_count)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        let leaf_bytes = previous
+            .error_leaf_bytes
+            .checked_add(candidate.error_leaf_bytes)
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+        self.result_wrapper_capacity = box_count;
+        self.result_wrapper_bytes = box_bytes;
+        self.error_leaf_capacity = leaf_count;
+        self.error_leaf_bytes = leaf_bytes;
+        // All four value-budget entry points observe real ticket/escrow
+        // owners through live_payload_storage. A candidate is additional to
+        // every stable saved primary and that current ephemeral subtotal.
+        self.check_argument_capacity(0, span)
+            .and_then(|_| self.reserve_values(1, span))
+    }
+
+    fn restore_error_candidate(&mut self, previous: AwaitPayloadCharge) {
+        self.result_wrapper_capacity = previous.box_count;
+        self.result_wrapper_bytes = previous.box_bytes;
+        self.error_leaf_capacity = previous.error_leaf_count;
+        self.error_leaf_bytes = previous.error_leaf_bytes;
+    }
+
+    fn emit_budgeted_err(&mut self, value: Value, span: Span) -> KuResult<()> {
+        let Value::String(message) = &value else {
+            return Err(unsupported(span));
+        };
+        self.selected_error_payloads = true;
+        let previous = AwaitPayloadCharge {
+            box_count: self.result_wrapper_capacity,
+            box_bytes: self.result_wrapper_bytes,
+            error_leaf_count: self.error_leaf_capacity,
+            error_leaf_bytes: self.error_leaf_bytes,
+            ..AwaitPayloadCharge::default()
+        };
+        // String::clone has at least len bytes, but neither its actual
+        // capacity nor the Map's capacity is assumed from this minimum.
+        let planned = AwaitPayloadCharge::planned_error_object("ku", "err", message.len())
+            .map_err(|rejection| rejection.into_error(span))?;
+        if let Err(error) = self.reserve_error_candidate(previous, planned, span) {
+            self.restore_error_candidate(previous);
+            return Err(error);
+        }
+        // Preserve the builtin's real message.clone conversion. Both this
+        // original operand and its new buffer survive until operand cleanup.
+        // Construct only the candidate Map before the actual-capacity check;
+        // errors::err would allocate its Box too early for this admission.
+        let object = errors::error_object("ku", "err", message.clone());
+        let actual = match AwaitPayloadCharge::error_object(&object) {
+            Ok(charge) => charge,
+            Err(rejection) => {
+                drop(object);
+                self.restore_error_candidate(previous);
+                return Err(rejection.into_error(span));
+            }
+        };
+        let admitted = self.reserve_error_candidate(previous, actual, span);
+        self.peak_error_leaf_capacity = self.peak_error_leaf_capacity.max(self.error_leaf_capacity);
+        self.peak_error_leaf_bytes = self.peak_error_leaf_bytes.max(self.error_leaf_bytes);
+        if let Err(error) = admitted {
+            // The candidate owns each newly cloned/allocated buffer once.
+            // Release it physically before restoring only its temporary fee.
+            drop(object);
+            self.restore_error_candidate(previous);
+            return Err(error);
+        }
+        let boxed = Box::new(object);
+        self.peak_result_wrapper_capacity = self
+            .peak_result_wrapper_capacity
+            .max(self.result_wrapper_capacity);
+        self.peak_result_wrapper_bytes = self
+            .peak_result_wrapper_bytes
+            .max(self.result_wrapper_bytes);
+        push(
+            &mut self.values,
+            Value::Result {
+                ok: false,
+                value: boxed,
+            },
+        );
+        // The original input is dropped at this operand cleanup boundary;
+        // its conservative reservation is kept for the whole run.
+        drop(value);
         Ok(())
     }
 
@@ -2888,6 +2997,11 @@ impl Machine {
                         );
                         push(&mut self.work, Work::Eval(operand));
                     }
+                    ExprCode::TerminalErr(operand) => {
+                        self.reserve_work(2, span)?;
+                        push(&mut self.work, Work::WrapTerminalErr(expr.span));
+                        push(&mut self.work, Work::Eval(operand));
+                    }
                     ExprCode::TerminalBorrowedOk(operand) => {
                         self.reserve_work(2, span)?;
                         push(&mut self.work, Work::WrapBorrowedTerminalOk(expr.span));
@@ -3093,6 +3207,11 @@ impl Machine {
                 scalar(&value, span)?;
                 self.emit_budgeted_ok(value, span)?;
             }
+            Work::WrapTerminalErr(span_id) => {
+                let span = self.code.span(span_id);
+                let value = self.value();
+                self.emit_budgeted_err(value, span)?;
+            }
             Work::AwaitOperand(span) => {
                 let source_span = self.code.span(span);
                 // Reserve before moving the operand owner into its ticket.
@@ -3134,7 +3253,7 @@ impl Machine {
                     self.awaiting.is_none(),
                     "one active await expression per machine"
                 );
-                self.owned_await_payloads = true;
+                self.selected_error_payloads = true;
                 self.awaiting = Some(AwaitFrame {
                     ticket: crate::runtime::task::AwaitTicket::begin_with_payload_policy(
                         task, policy,
@@ -3684,7 +3803,7 @@ impl Machine {
             return Err(self.lifecycle_error("prepare undrained next run"));
         }
         self.state = MachineState::Ready;
-        self.owned_await_payloads = false;
+        self.selected_error_payloads = false;
         self.fallback_release.set(None);
         self.fallback_metadata = None;
         Ok(())
@@ -4090,7 +4209,7 @@ impl Machine {
         if self.result_wrapper_capacity == 0
             && self.error_leaf_capacity == 0
             && ephemeral.count == 0
-            && !self.owned_await_payloads
+            && !self.selected_error_payloads
         {
             return;
         }
@@ -4120,9 +4239,9 @@ impl Machine {
                     ..AwaitPayloadCharge::default()
                 }
             }
-            Value::Result { ok: false, .. } if self.owned_await_payloads => {
+            Value::Result { ok: false, .. } if self.selected_error_payloads => {
                 AwaitPayloadCharge::for_value(value, self.string_payload_bytes)
-                    .expect("admitted owned await ErrorObject")
+                    .expect("admitted selected ErrorObject")
             }
             _ => AwaitPayloadCharge::default(),
         };
@@ -5118,7 +5237,7 @@ impl Drop for Machine {
             && matches!(self.pending.as_ref(), Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. }))
                 if matches!(value, Value::Result { value, .. }
                     if matches!(value.as_ref(), Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null)
-                        || (self.owned_await_payloads && matches!(value.as_ref(), Value::Object(_)))))
+                        || (self.selected_error_payloads && matches!(value.as_ref(), Value::Object(_)))))
         {
             let pending = self.pending.take();
             let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(pending)));

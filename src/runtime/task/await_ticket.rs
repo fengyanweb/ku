@@ -52,7 +52,7 @@ pub(super) enum AwaitObservationError {
 }
 
 impl AwaitPayloadRejection {
-    fn into_error(self, span: Span) -> KuError {
+    pub(crate) fn into_error(self, span: Span) -> KuError {
         // This is called only after the result lock has been released. The
         // locked observation returns primitive metadata, never an allocation.
         KuError::runtime(
@@ -82,7 +82,33 @@ impl AwaitPayloadCharge {
         })
     }
 
-    fn error_object(value: &Value) -> Result<Self, AwaitPayloadRejection> {
+    pub(crate) fn planned_error_object(
+        domain: &str,
+        code: &str,
+        message_capacity: usize,
+    ) -> Result<Self, AwaitPayloadRejection> {
+        // A requested three-entry schema is only a pre-allocation minimum.
+        // The actual Map and every String capacity must be checked separately
+        // before constructing its Result Box or publishing the payload.
+        let names = ["domain", "code", "message"];
+        let mut bytes = names
+            .len()
+            .checked_mul(std::mem::size_of::<(String, Value)>())
+            .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
+        for name in names {
+            bytes = bytes
+                .checked_add(name.len())
+                .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
+        }
+        bytes = bytes
+            .checked_add(domain.len())
+            .and_then(|bytes| bytes.checked_add(code.len()))
+            .and_then(|bytes| bytes.checked_add(message_capacity))
+            .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
+        Self::boxed(names.len(), bytes)
+    }
+
+    pub(crate) fn error_object(value: &Value) -> Result<Self, AwaitPayloadRejection> {
         let Value::Object(fields) = value else {
             return Err(AwaitPayloadRejection::UnclassifiedPayload);
         };
@@ -167,22 +193,11 @@ impl AwaitPayloadPolicy {
         code: &str,
         message_capacity: usize,
     ) -> Result<(), AwaitPayloadRejection> {
-        let names = ["domain", "code", "message"];
-        let mut bytes = names
-            .len()
-            .checked_mul(std::mem::size_of::<(String, Value)>())
-            .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
-        for name in names {
-            bytes = bytes
-                .checked_add(name.len())
-                .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
-        }
-        bytes = bytes
-            .checked_add("task".len())
-            .and_then(|bytes| bytes.checked_add(code.len()))
-            .and_then(|bytes| bytes.checked_add(message_capacity))
-            .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
-        self.check_charge(AwaitPayloadCharge::boxed(names.len(), bytes)?)?;
+        self.check_charge(AwaitPayloadCharge::planned_error_object(
+            "task",
+            code,
+            message_capacity,
+        )?)?;
         Ok(())
     }
 }
