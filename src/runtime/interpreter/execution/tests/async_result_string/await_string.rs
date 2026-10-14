@@ -339,8 +339,14 @@ impl LocalTaskRunner for AwaitRunner {
                         "the real parent keep is live while the child ticket is ready"
                     );
                     assert_eq!(census.ticket, Some(primitive_from_ticket(actual)));
-                    self.local_tickets
-                        .push((primitive_from_ticket(actual), false));
+                    // Only one-step dispatch can observe the actual Bind
+                    // before later reads/assignment drop this ticket's Box.
+                    // Coarser chunks still verify Ready and all live budgets;
+                    // they cannot retain an address as an owner identity.
+                    if self.options.chunk == 1 {
+                        self.local_tickets
+                            .push((primitive_from_ticket(actual), false));
+                    }
                     local_source_budget_entries(machine, &self.inner.buffers);
                     self.inner.locals.as_mut().unwrap().budget_checks += 1;
                     self.events
@@ -429,6 +435,9 @@ impl LocalTaskRunner for AwaitRunner {
             {
                 let census = observe_source_locals(machine, &self.inner.buffers, proof);
                 for (ticket, bound) in &mut self.local_tickets {
+                    if *bound {
+                        continue;
+                    }
                     if let Some(actual) =
                         census.env.iter().find(|owner| owner.boxed == ticket.boxed)
                     {
