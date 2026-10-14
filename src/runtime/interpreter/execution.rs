@@ -5387,7 +5387,7 @@ impl ClaimedNamedTask {
         {
             let mut args = args;
             let outcome = machine
-                .start_owned_once(entry, &mut args, 0, false)
+                .start_owned_once_with_hooks(entry, &mut args, 0, false, &interpreter)
                 .err()
                 .map(Err);
             drop(args);
@@ -5529,11 +5529,17 @@ impl ClaimedNamedTask {
                 // original FnDecl/Vec. Unsupported admission keeps both intact.
                 let (function, mut args) = runner.legacy.take().expect("selected owned task input");
                 let mut machine = Machine::from_code(code, limits, runner.interpreter.call_depth);
-                if let Err(error) = machine.start_owned_once(&function.name, &mut args, 0, false) {
+                if let Err(error) = machine.start_owned_once_with_hooks(
+                    &function.name,
+                    &mut args,
+                    0,
+                    false,
+                    &runner.interpreter,
+                ) {
                     runner.outcome = Some(Err(error));
                 }
                 runner.machine = Some(machine);
-                // start_owned_once admits the actual input Vec/String capacities
+                // The authorized start admits the actual input Vec/String capacities
                 // before entering parameters/body, and moves each Owned root. Its
                 // real entry buffer (or rejected original input) retires here.
                 drop(function);

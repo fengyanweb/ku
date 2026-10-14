@@ -2695,81 +2695,85 @@ fn finish_deep_local(
 
 #[test]
 fn selected_scalar_locals_charge_every_live_call_at_512_reject_first_513_and_reuse() {
-    for (kind, ty, literal) in PRIMITIVE_CASES {
-        for error in [false, true] {
-            let leaf = if error {
-                "err(text)".to_string()
-            } else {
-                format!("ok({literal})")
-            };
-            let source = format!("fn Entry(text: str, n: int): {ty}! {{ keep: {ty}! = ok({literal})\nif (n <= 0) {{ r: {ty}! = {leaf}\nr\nr\nr = r\nreturn r }}\nr: {ty}! = Entry(text, n - 1)\nr\nr\nr = r\nreturn r }}");
-            let mut machine = local_machine(&source, kind);
-            let mut host = production_interpreter(&source);
-            for n in [511, 512, 0] {
-                if n != 511 {
-                    machine.prepare_next_run().unwrap();
-                }
-                let entered_before = machine.metrics.entered_calls;
-                let retired_before = machine.metrics.retired_calls;
-                let error_peak_before = (
-                    machine.metrics.peak_error_leaf_capacity,
-                    machine.metrics.peak_error_leaf_bytes,
-                );
-                let (text, buffer) = string_input(PAYLOAD, 4096);
-                let mut args = vec![text, Value::Int(n)];
-                let mut proof = LocalProof::default();
-                machine
-                    .start_owned_once("Entry", &mut args, 0, false)
-                    .unwrap();
-                let result =
-                    finish_deep_local(&mut machine, &mut host, kind, n, &[buffer], &mut proof);
-                if n == 512 {
-                    assert_eq!(
-                        result.unwrap_err().code.as_deref(),
-                        Some("call_depth_exceeded")
-                    );
-                    assert_eq!(
-                        (
-                            machine.metrics.entered_calls - entered_before,
-                            machine.metrics.peak_calls,
-                            proof.peak_env
-                        ),
-                        (512, 512, 512)
-                    );
-                    assert_eq!(
-                        (
+    std::thread::scope(|scope| {
+        for (kind, ty, literal) in PRIMITIVE_CASES {
+            for error in [false, true] {
+                scope.spawn(move || {
+                    let leaf = if error {
+                        "err(text)".to_string()
+                    } else {
+                        format!("ok({literal})")
+                    };
+                    let source = format!("fn Entry(text: str, n: int): {ty}! {{ keep: {ty}! = ok({literal})\nif (n <= 0) {{ r: {ty}! = {leaf}\nr\nr\nr = r\nreturn r }}\nr: {ty}! = Entry(text, n - 1)\nr\nr\nr = r\nreturn r }}");
+                    let mut machine = local_machine(&source, kind);
+                    let mut host = production_interpreter(&source);
+                    for n in [511, 512, 0] {
+                        if n != 511 {
+                            machine.prepare_next_run().unwrap();
+                        }
+                        let entered_before = machine.metrics.entered_calls;
+                        let retired_before = machine.metrics.retired_calls;
+                        let error_peak_before = (
                             machine.metrics.peak_error_leaf_capacity,
                             machine.metrics.peak_error_leaf_bytes,
-                        ),
-                        error_peak_before,
-                        "rejecting the first 513th call cannot replay the real err leaf or increase its cumulative peak"
-                    );
-                } else {
-                    let result = result.unwrap();
-                    if error {
-                        outcome_buffer(&result, &[buffer]);
-                    } else {
-                        assert_eq!(
-                            local_metadata(&result, &[buffer]).unwrap().owner.leaf,
-                            expected_primitive(kind)
                         );
+                        let (text, buffer) = string_input(PAYLOAD, 4096);
+                        let mut args = vec![text, Value::Int(n)];
+                        let mut proof = LocalProof::default();
+                        machine
+                            .start_owned_once("Entry", &mut args, 0, false)
+                            .unwrap();
+                        let result =
+                            finish_deep_local(&mut machine, &mut host, kind, n, &[buffer], &mut proof);
+                        if n == 512 {
+                            assert_eq!(
+                                result.unwrap_err().code.as_deref(),
+                                Some("call_depth_exceeded")
+                            );
+                            assert_eq!(
+                                (
+                                    machine.metrics.entered_calls - entered_before,
+                                    machine.metrics.peak_calls,
+                                    proof.peak_env
+                                ),
+                                (512, 512, 512)
+                            );
+                            assert_eq!(
+                                (
+                                    machine.metrics.peak_error_leaf_capacity,
+                                    machine.metrics.peak_error_leaf_bytes,
+                                ),
+                                error_peak_before,
+                                "rejecting the first 513th call cannot replay the real err leaf or increase its cumulative peak"
+                            );
+                        } else {
+                            let result = result.unwrap();
+                            if error {
+                                outcome_buffer(&result, &[buffer]);
+                            } else {
+                                assert_eq!(
+                                    local_metadata(&result, &[buffer]).unwrap().owner.leaf,
+                                    expected_primitive(kind)
+                                );
+                            }
+                            assert_eq!(
+                                machine.metrics.entered_calls - entered_before,
+                                (n + 1) as usize
+                            );
+                            assert!(proof.peak_env >= (n + 1) as usize);
+                        }
+                        assert_eq!(
+                            machine.metrics.retired_calls - retired_before,
+                            machine.metrics.entered_calls - entered_before
+                        );
+                        assert_eq!(machine.metrics.retired_calls, machine.metrics.entered_calls);
+                        errors_drained(&machine);
+                        assert_eq!(host.call_depth, 0);
                     }
-                    assert_eq!(
-                        machine.metrics.entered_calls - entered_before,
-                        (n + 1) as usize
-                    );
-                    assert!(proof.peak_env >= (n + 1) as usize);
-                }
-                assert_eq!(
-                    machine.metrics.retired_calls - retired_before,
-                    machine.metrics.entered_calls - entered_before
-                );
-                assert_eq!(machine.metrics.retired_calls, machine.metrics.entered_calls);
-                errors_drained(&machine);
-                assert_eq!(host.call_depth, 0);
+                });
             }
         }
-    }
+    });
 }
 
 fn unlimited_local_clone_policy() -> AwaitPayloadPolicy {
@@ -4867,8 +4871,15 @@ fn selected_string_locals_leave_charged_async_and_other_whole_tree_boundaries_un
         assert!(matches!(CodeHandle::compile_owned_named(&source_functions, entry, Limits::default()),
             Err(AdmissionError::Unsupported(_))), "{source}");
         if entry.is_async {
-            assert!(matches!(CodeHandle::compile_claimed_async_owned_result_string_entry(&source_functions, entry, Limits::default()),
-                Err(AdmissionError::Unsupported(_))), "S9 does not admit async String locals: {source}");
+            let claimed = CodeHandle::compile_claimed_async_owned_result_string_entry(
+                &source_functions, entry, Limits::default());
+            if source == "async fn Entry(text: str): str! { r: str! = ok(text)\nreturn r }" {
+                assert!(claimed.unwrap().has_actual_string_result_locals(),
+                    "S10 admits only this no-await async local root");
+            } else {
+                assert!(matches!(claimed, Err(AdmissionError::Unsupported(_))),
+                    "await remains outside the S10 String local role: {source}");
+            }
         }
         let mut host = production_interpreter(source);
         let (value, buffer) = string_input(PAYLOAD, 4096);
@@ -5565,4 +5576,1168 @@ fn selected_string_local_native_drop_keeps_the_same_worker_next_task_healthy() {
     assert_ne!(abandoned.1, next.1);
     assert!(abandoned.2 && abandoned.3 && next.3 && next.4);
     assert_eq!(next.2, 0);
+}
+
+// The claimant stays on its actual Task worker. S9's private census is reused
+// unchanged: it reads every real Env, operand, argument exit, Q primary and
+// transferring outcome. This wrapper never constructs a substitute Value.
+const S10_WAIT: Duration = Duration::from_secs(3);
+
+fn s10_wait_result(task: &crate::runtime::task::TaskHandle) -> KuResult<Value> {
+    let deadline = Instant::now() + S10_WAIT;
+    loop {
+        // Only Copy readiness crosses the existing result lock. This fixture
+        // holds the sole consumer/owner, so the published slot cannot be taken
+        // between this observation and the original ordinary consuming await.
+        // Do not use Diagnostic await_timeout: it would clone without consuming.
+        if task.test_with_result_slot(|slot| slot.is_some())? {
+            return task.await_result();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bounded actual result publication"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum S10Pause {
+    None,
+    Running,
+    Produced,
+    Protected(Span),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum S10Fault {
+    None,
+    CloneCount,
+    CloneBytes,
+    NativeClone,
+}
+
+#[derive(Clone, Copy)]
+struct S10Plan {
+    chunk: usize,
+    deep: bool,
+    from_code: bool,
+    selection_only: bool,
+    pause: S10Pause,
+    fault: S10Fault,
+}
+
+impl S10Plan {
+    fn normal(chunk: usize) -> Self {
+        Self {
+            chunk,
+            deep: false,
+            from_code: false,
+            selection_only: false,
+            pause: S10Pause::None,
+            fault: S10Fault::None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct S10Finished {
+    thread: std::thread::ThreadId,
+    task: i64,
+    calls: usize,
+    retired: usize,
+    peak_calls: usize,
+    finally: usize,
+    retired_finally: usize,
+    peak_boxes: usize,
+    peak_clones: usize,
+    peak_errors: usize,
+    observed_peak_boxes: usize,
+    observed_peak_clones: usize,
+    distinct_clones: usize,
+    checked_budgets: usize,
+    max_saved: usize,
+    original_retired: bool,
+    depth_512: bool,
+    outgoing: Option<S9Owner>,
+    rejected_source: bool,
+}
+
+#[derive(Debug)]
+struct S10Native {
+    task: i64,
+    thread: std::thread::ThreadId,
+    source: S9Owner,
+    clone: S9Owner,
+    first: RuntimeTermination,
+    observed: RuntimeTermination,
+}
+
+#[derive(Debug)]
+enum S10Witness {
+    Entered {
+        task: i64,
+        thread: std::thread::ThreadId,
+        selected: bool,
+        legacy: bool,
+        steps: usize,
+        calls: usize,
+    },
+    Progress {
+        dispatches: usize,
+        depth: usize,
+    },
+    Paused {
+        stage: S10Pause,
+        owner: Option<Box<S9Owner>>,
+    },
+    Native(Box<S10Native>),
+    Finished(Box<S10Finished>),
+}
+
+struct S10Runner {
+    inner: ClaimedNamedTask,
+    plan: S10Plan,
+    input: Buffer,
+    proof: S9Proof,
+    tx: mpsc::Sender<S10Witness>,
+    release: Option<mpsc::Receiver<()>>,
+    thread: std::thread::ThreadId,
+    dispatches: usize,
+    distinct_clones: usize,
+    checked_budgets: usize,
+    max_saved: usize,
+    depth_512: bool,
+    faulted: bool,
+    paused: bool,
+    rejected_source: bool,
+}
+
+fn s10_budget_totals(machine: &mut Machine, actual: &S9Census, input: Buffer) -> (usize, usize) {
+    s9_budget(machine, actual, input);
+    let count = machine.values.capacity()
+        + machine.argument_capacity
+        + machine.exit_handle_capacity
+        + machine.retirement_capacity
+        + machine.lease_capacity
+        + machine.lease_root_bytes / std::mem::size_of::<Value>()
+        + actual.owners.len()
+        + actual
+            .owners
+            .iter()
+            .filter_map(|owner| owner.error)
+            .map(|error| error.count)
+            .sum::<usize>();
+    let bytes = machine.values.charged_storage_bytes()
+        + machine.argument_bytes
+        + machine.exit_handle_bytes
+        + machine.retirement_bytes
+        + machine.lease_bytes
+        + machine.lease_root_bytes
+        + input.capacity
+        + actual.clone_bytes
+        + actual.owners.len() * std::mem::size_of::<Value>()
+        + actual
+            .owners
+            .iter()
+            .filter_map(|owner| owner.error)
+            .map(|error| error.bytes)
+            .sum::<usize>();
+    (count, bytes)
+}
+
+impl S10Runner {
+    fn pause(&mut self, stage: S10Pause, owner: Option<S9Owner>) {
+        self.paused = true;
+        self.tx
+            .send(S10Witness::Paused {
+                stage,
+                owner: owner.map(Box::new),
+            })
+            .unwrap();
+        self.release
+            .take()
+            .expect("one real claimant pause")
+            .recv_timeout(S10_WAIT)
+            .expect("finite checkpoint release");
+    }
+}
+
+impl crate::runtime::task::LocalTaskRunner for S10Runner {
+    fn dispatch(&mut self, _driver_budget: NonZeroUsize) -> std::ops::ControlFlow<KuResult<Value>> {
+        use std::ops::ControlFlow;
+        self.dispatches += 1;
+        assert!(self.dispatches <= 100_000, "the source has finite work");
+        assert_eq!(std::thread::current().id(), self.thread);
+        assert_eq!(crate::runtime::task::current_task_id(), self.inner.task_id);
+        if self.plan.selection_only {
+            return ControlFlow::Break(Ok(Value::Null));
+        }
+        let mut chunk = self.plan.chunk;
+        let mut clone_source = None;
+        let mut saved_limits = None;
+        let machine = self
+            .inner
+            .machine
+            .as_mut()
+            .expect("real selected S10 claimant");
+        assert!(self.inner.legacy.is_none());
+        assert!(machine.awaiting.is_none());
+        let depth = machine.calls.len();
+        // Deep terminal relays cannot contain a String Result local above the
+        // root. Their previous completed chunk already had a full census, and
+        // this no-await Machine has no foreign writer between dispatches. Keep
+        // every post-dispatch census; do not repeat it on the stable empty
+        // middle prefix. Shallow/clone and exact-512 checkpoints stay fresh.
+        let before =
+            if !self.plan.deep || depth <= 32 || depth == MAX_CALL_DEPTH || self.dispatches == 1 {
+                Some(s9_observe(machine, self.input, &mut self.proof))
+            } else {
+                assert!(
+                    !s9_at_clone(machine),
+                    "deep middle relays have no local clone"
+                );
+                assert_eq!(self.plan.pause, S10Pause::None);
+                assert_eq!(self.plan.fault, S10Fault::None);
+                assert!(machine.captures.is_none());
+                None
+            };
+        if self.plan.deep {
+            assert!(depth <= MAX_CALL_DEPTH);
+            if depth == MAX_CALL_DEPTH && !self.depth_512 {
+                let before = before.as_ref().expect("fresh exact-512 physical census");
+                assert!(
+                    before.env.len() <= 1,
+                    "terminal relays install no artificial keepers"
+                );
+                s10_budget_totals(machine, before, self.input);
+                self.checked_budgets += 1;
+                self.depth_512 = true;
+            }
+            chunk = if depth == MAX_CALL_DEPTH {
+                // Keep every actual Work at 512 observable until its leaf
+                // completes or the first real 513th enter is rejected.
+                1
+            } else if !self.depth_512 {
+                chunk.min((MAX_CALL_DEPTH - depth).max(1))
+            } else if depth <= 32 {
+                1
+            } else {
+                chunk
+            };
+        }
+        if chunk == 1 && s9_at_clone(machine) {
+            let before = before
+                .as_ref()
+                .expect("deep terminal middle frames contain no selected local clone");
+            let Work::CloneSelectedStringResult(name, span) =
+                machine.work.as_slice().last().unwrap()
+            else {
+                unreachable!()
+            };
+            clone_source = Some(
+                machine
+                    .calls
+                    .as_slice()
+                    .last()
+                    .unwrap()
+                    .env
+                    .with_value(
+                        machine.code.symbol(*name),
+                        machine.code.span(*span),
+                        |value| Ok(s9_owner(value, self.input.text).unwrap()),
+                    )
+                    .unwrap(),
+            );
+            assert!(before.env.contains(&clone_source.unwrap()));
+            if self.checked_budgets == 0 {
+                machine.reserve_values(1, Span::default()).unwrap();
+                let actual = s9_observe(machine, self.input, &mut self.proof);
+                s10_budget_totals(machine, &actual, self.input);
+                self.checked_budgets += 1;
+            }
+            if !self.faulted
+                && matches!(self.plan.fault, S10Fault::CloneCount | S10Fault::CloneBytes)
+            {
+                machine.reserve_values(1, Span::default()).unwrap();
+                let actual = s9_observe(machine, self.input, &mut self.proof);
+                let (count, bytes) = s10_budget_totals(machine, &actual, self.input);
+                self.checked_budgets += 1;
+                let source = clone_source.unwrap();
+                saved_limits = Some(machine.value_limits);
+                if self.plan.fault == S10Fault::CloneCount {
+                    // A new Result always needs a Box, before any String/Map
+                    // allocation. The current count is independently folded.
+                    machine.value_limits.max_frames = count;
+                } else {
+                    // A nonempty success buffer or real false Map cannot fit
+                    // into a lone additional Box. This is pre-allocation
+                    // minimum rejection; no clone capacity is fabricated.
+                    assert!(!self.input.text.is_empty());
+                    assert!(source.string.is_some() || source.error.is_some());
+                    machine.value_limits.max_storage_bytes = bytes + std::mem::size_of::<Value>();
+                }
+                self.faulted = true;
+            }
+        }
+        let protected_ready = match self.plan.pause {
+            S10Pause::Protected(target) if !self.paused => {
+                matches!(machine.work.as_slice().last(), Some(Work::Statement(stmt))
+                    if machine.code.span(machine.code.statement(*stmt).span) == target)
+            }
+            _ => false,
+        };
+        if protected_ready {
+            assert!(!machine.finally.frames.as_slice().is_empty());
+            self.pause(self.plan.pause, None);
+        }
+        // Only the actual named task performs normal dispatch/finish conversion.
+        // Interpreter step counts are not a substitute for popped Work receipts.
+        let result = self.inner.dispatch(NonZeroUsize::new(chunk).unwrap());
+        let machine = self.inner.machine.as_mut().unwrap();
+        if let Some(saved) = saved_limits {
+            machine.value_limits = saved;
+        }
+        if matches!(result, ControlFlow::Continue(())) {
+            let actual = s9_observe(machine, self.input, &mut self.proof);
+            if let Some(source) = clone_source {
+                let before = before.as_ref().expect("fresh clone source census");
+                assert!(
+                    actual.env.contains(&source),
+                    "real clone leaves its complete source unchanged"
+                );
+                if self.faulted
+                    && matches!(self.plan.fault, S10Fault::CloneCount | S10Fault::CloneBytes)
+                {
+                    let diagnostic = if self.plan.fault == S10Fault::CloneCount {
+                        "FrameLimit"
+                    } else {
+                        "StorageLimit"
+                    };
+                    assert!(
+                        matches!(&machine.pending, Some(Err(error)) if error.message.contains(diagnostic))
+                    );
+                    assert_eq!(actual.owners, before.owners);
+                    assert_eq!(actual.clone_bytes, before.clone_bytes);
+                    assert_eq!(
+                        machine.metrics.peak_result_wrapper_capacity,
+                        before.owners.len()
+                    );
+                    assert_eq!(
+                        machine.metrics.peak_cloned_string_payload_bytes,
+                        before.clone_bytes
+                    );
+                    self.rejected_source = true;
+                } else {
+                    let cloned =
+                        s9_owner(machine.values.as_slice().last().unwrap(), self.input.text)
+                            .unwrap();
+                    assert!(actual.owners.contains(&cloned));
+                    s9_assert_distinct(source, cloned);
+                    self.proof.final_clone = Some(cloned);
+                    self.distinct_clones += 1;
+                    s10_budget_totals(machine, &actual, self.input);
+                    self.checked_budgets += 1;
+                    if self.plan.fault == S10Fault::NativeClone && !self.faulted {
+                        self.faulted = true;
+                        let first = RuntimeTermination {
+                            reason: TerminationReason::TimedOut,
+                            cleanup_deadline: Instant::now() + HTTP_HANDLER_CLEANUP_GRACE,
+                        };
+                        let shorter = RuntimeTermination {
+                            reason: TerminationReason::Cancelled,
+                            cleanup_deadline: first
+                                .cleanup_deadline
+                                .checked_sub(Duration::from_millis(1))
+                                .unwrap(),
+                        };
+                        let _cleanup = CleanupGuard::enter(first);
+                        drop(CleanupGuard::enter(shorter));
+                        let observed = current_cleanup_context().unwrap();
+                        assert_eq!(observed.reason, first.reason);
+                        assert_eq!(observed.cleanup_deadline, shorter.cleanup_deadline);
+                        self.tx
+                            .send(S10Witness::Native(Box::new(S10Native {
+                                task: self.inner.task_id,
+                                thread: self.thread,
+                                source,
+                                clone: cloned,
+                                first,
+                                observed,
+                            })))
+                            .unwrap();
+                        panic!("S10 actual claimant native clone abandonment");
+                    }
+                }
+            }
+            let saved = machine.finally.frames.as_slice().iter().filter(|frame|
+                matches!(&frame.primary, Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. }))
+                    if matches!(value, Value::Result { .. }))).count();
+            if saved > self.max_saved {
+                s10_budget_totals(machine, &actual, self.input);
+                self.checked_budgets += 1;
+                self.max_saved = saved;
+            }
+            self.tx
+                .send(S10Witness::Progress {
+                    dispatches: self.dispatches,
+                    depth: machine.calls.len(),
+                })
+                .unwrap();
+            if self.plan.pause == S10Pause::Running && !self.paused && !actual.env.is_empty() {
+                self.pause(S10Pause::Running, None);
+            }
+        } else if let ControlFlow::Break(outcome) = &result {
+            let outgoing = outcome
+                .as_ref()
+                .ok()
+                .and_then(|value| s9_owner(value, self.input.text));
+            if let Some(actual) = outgoing {
+                if chunk == 1 {
+                    assert!(
+                        self.proof.live.contains(&actual),
+                        "outgoing owner was observed before real teardown"
+                    );
+                    if self.proof.final_clone.is_some() {
+                        assert_eq!(self.proof.final_clone, Some(actual));
+                    }
+                }
+            }
+            s9_drained(machine);
+            assert_eq!(self.inner.interpreter.call_depth, 0);
+            let report = S10Finished {
+                thread: self.thread,
+                task: self.inner.task_id,
+                calls: machine.metrics.entered_calls,
+                retired: machine.metrics.retired_calls,
+                peak_calls: machine.metrics.peak_calls,
+                finally: machine.metrics.entered_finally_frames,
+                retired_finally: machine.metrics.retired_finally_frames,
+                peak_boxes: machine.metrics.peak_result_wrapper_capacity,
+                peak_clones: machine.metrics.peak_cloned_string_payload_bytes,
+                peak_errors: machine.metrics.peak_error_leaf_capacity,
+                observed_peak_boxes: self.proof.peak_live,
+                observed_peak_clones: self.proof.peak_clone_bytes,
+                distinct_clones: self.distinct_clones,
+                checked_budgets: self.checked_budgets,
+                max_saved: self.max_saved,
+                original_retired: !self.proof.original_live,
+                depth_512: self.depth_512,
+                outgoing,
+                rejected_source: self.rejected_source,
+            };
+            self.tx
+                .send(S10Witness::Finished(Box::new(report)))
+                .unwrap();
+            if self.plan.pause == S10Pause::Produced && !self.paused {
+                self.pause(S10Pause::Produced, outgoing);
+            }
+        }
+        result
+    }
+
+    fn waiting(&mut self) -> Option<&mut crate::runtime::task::AwaitTicket> {
+        self.inner.waiting()
+    }
+
+    fn cleanup_wait_once(&mut self) {
+        self.inner.cleanup_wait_once();
+    }
+}
+
+fn s10_spawn(
+    runtime: &TaskRuntime,
+    source: &str,
+    args: Vec<Value>,
+    buffers: Vec<Buffer>,
+    plan: S10Plan,
+) -> (
+    crate::runtime::task::TaskHandle,
+    mpsc::Receiver<S10Witness>,
+    mpsc::Sender<()>,
+) {
+    let program = Parser::new(
+        Lexer::new(&format!("{source}\nfn main() {{}}"))
+            .tokenize()
+            .unwrap(),
+    )
+    .parse_program()
+    .unwrap();
+    crate::checker::Checker::new().check(&program).unwrap();
+    let mut producer = production_interpreter(source);
+    producer.task_runtime = Some(runtime.clone());
+    let function = producer.functions["Entry"].clone();
+    let code = plan.from_code.then(|| {
+        CodeHandle::compile_claimed_async_owned_result_string_entry(
+            &producer.functions,
+            &function,
+            Limits::default(),
+        )
+        .unwrap()
+    });
+    let child_runtime = runtime.clone();
+    let (tx, rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let task = runtime
+        .spawn_runner_deferred(|| {
+            let template = producer.template();
+            move || {
+                assert!(current_cleanup_context().is_none());
+                assert!(crate::runtime::task::current_execution_termination().is_none());
+                let mut host = Interpreter::from_template(template, child_runtime);
+                host.async_execution = true;
+                let inner = if let Some(code) = code {
+                    let function_id = code.find_function("Entry").unwrap();
+                    ClaimedNamedTask::from_code(host, code, function_id, args, Span::default())
+                } else {
+                    ClaimedNamedTask::new(host, function, args, Span::default())
+                };
+                if let Some((_, args)) = &inner.legacy {
+                    let strings = args
+                        .iter()
+                        .filter_map(|value| match value {
+                            Value::String(text) => Some(text),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(strings.len(), buffers.len());
+                    for (actual, original) in strings.iter().zip(&buffers) {
+                        assert_eq!(
+                            (actual.as_ptr() as usize, actual.capacity()),
+                            (original.pointer, original.capacity)
+                        );
+                        assert_eq!(actual.as_str(), original.text);
+                    }
+                }
+                assert_eq!(inner.interpreter.steps, 0);
+                assert!(
+                    inner.outcome.is_none(),
+                    "valid fixture construction has no pending failure"
+                );
+                if !plan.selection_only {
+                    let machine = inner
+                        .machine
+                        .as_ref()
+                        .expect("new local role selected before any dispatch");
+                    assert!(inner.legacy.is_none());
+                    assert!(machine.code.has_actual_string_result_locals());
+                    assert!(machine.string_origin_authorized);
+                    assert_eq!(machine.metrics.entered_calls, 1);
+                    assert_eq!(machine.metrics.dispatches, 0);
+                }
+                tx.send(S10Witness::Entered {
+                    task: inner.task_id,
+                    thread: std::thread::current().id(),
+                    selected: inner.machine.is_some(),
+                    legacy: inner.legacy.is_some(),
+                    steps: inner.interpreter.steps,
+                    calls: inner
+                        .machine
+                        .as_ref()
+                        .map_or(0, |machine| machine.metrics.entered_calls),
+                })
+                .unwrap();
+                let input = buffers[0];
+                S10Runner {
+                    inner,
+                    plan,
+                    input,
+                    proof: S9Proof::new(input),
+                    tx,
+                    release: Some(release_rx),
+                    thread: std::thread::current().id(),
+                    dispatches: 0,
+                    distinct_clones: 0,
+                    checked_budgets: 0,
+                    max_saved: 0,
+                    depth_512: false,
+                    faulted: false,
+                    paused: false,
+                    rejected_source: false,
+                }
+            }
+        })
+        .unwrap();
+    (task, rx, release_tx)
+}
+
+fn s10_entered(
+    task: &crate::runtime::task::TaskHandle,
+    rx: &mpsc::Receiver<S10Witness>,
+    selected: bool,
+) -> std::thread::ThreadId {
+    let S10Witness::Entered {
+        task: id,
+        thread,
+        selected: actual,
+        legacy,
+        steps,
+        calls,
+    } = rx.recv_timeout(S10_WAIT).unwrap()
+    else {
+        panic!("actual claimant constructor witness")
+    };
+    assert_ne!(id, 0);
+    assert_eq!(id, task.id());
+    assert_eq!(actual, selected);
+    assert_eq!(legacy, !selected);
+    assert_eq!(steps, 0);
+    assert_eq!(calls, usize::from(selected));
+    thread
+}
+
+fn s10_next(rx: &mpsc::Receiver<S10Witness>) -> S10Witness {
+    let mut last = 0;
+    for _ in 0..100_000 {
+        match rx.recv_timeout(S10_WAIT).unwrap() {
+            S10Witness::Progress { dispatches, depth } => {
+                assert!(dispatches > last);
+                assert!(depth <= MAX_CALL_DEPTH);
+                last = dispatches;
+            }
+            event => return event,
+        }
+    }
+    panic!("finite claimant message stream");
+}
+
+fn s10_finished(rx: &mpsc::Receiver<S10Witness>) -> S10Finished {
+    let S10Witness::Finished(report) = s10_next(rx) else {
+        panic!("actual completed claimant witness")
+    };
+    assert_eq!(report.calls, report.retired);
+    assert_eq!(report.finally, report.retired_finally);
+    *report
+}
+
+fn s10_retire(task: crate::runtime::task::TaskHandle, context: RuntimeTermination) {
+    use crate::runtime::task::{RetirementBatchPoll, TaskRetirementBatch};
+    let witness = task.retirement_witness();
+    drop(task);
+    let mut batch = TaskRetirementBatch::from_reserved(vec![witness], context);
+    assert_eq!(batch.context(), context);
+    let end = Instant::now() + S10_WAIT;
+    loop {
+        match batch.poll(Instant::now()) {
+            RetirementBatchPoll::Retired => break,
+            RetirementBatchPoll::TimedOut(actual) => {
+                panic!("G1/G2 exceeded original D: {actual:?}")
+            }
+            RetirementBatchPoll::Pending { .. } => {
+                assert!(Instant::now() < end);
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+fn s10_close(runtime: &TaskRuntime) {
+    runtime.cancel_all_and_wait(S10_WAIT).unwrap();
+    let snapshot = runtime.snapshot().unwrap();
+    assert_eq!(
+        (
+            snapshot.active_tasks,
+            snapshot.queued_tasks,
+            snapshot.registered_tasks,
+            snapshot.wait_edges
+        ),
+        (0, 0, 0, 0)
+    );
+}
+
+fn s10_completed(
+    runtime: &TaskRuntime,
+    source: &str,
+    args: Vec<Value>,
+    input: Buffer,
+    plan: S10Plan,
+) -> (S10Finished, Value) {
+    let (task, rx, _) = s10_spawn(runtime, source, args, vec![input], plan);
+    let thread = s10_entered(&task, &rx, true);
+    let proof = s10_finished(&rx);
+    assert_eq!(proof.thread, thread);
+    assert_eq!(proof.task, task.id());
+    let returned = s10_wait_result(&task).unwrap();
+    // The ordinary await moves the sole published result. Compare against
+    // the actual worker Break witness; no Diagnostic clone supplies identity.
+    assert_eq!(s9_owner(&returned, input.text), proof.outgoing);
+    s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
+    (proof, returned)
+}
+
+#[test]
+fn claimed_async_string_locals_construct_real_new_and_from_code_clones_across_chunks() {
+    for error in [false, true] {
+        let leaf = if error { "err(text)" } else { "ok(text)" };
+        let direct = format!(
+            "async fn Entry(text: str): str! {{ r: str! = {leaf}\nr\nr = r\nreturn r.clone() }}"
+        );
+        let helper = format!("fn Leaf(text: str, marker: int): str! {{ local: str! = {leaf}\nlocal\nreturn local.clone() }}\nasync fn Entry(text: str): str! {{ r: str! = Leaf(text, 7)\nr\nr = r\nreturn r.clone() }}");
+        // The second actual typed local is never read. Its real clone and
+        // teardown remain charged, and construction still needs S9 authority.
+        let unread = format!("async fn Entry(text: str): str! {{ r: str! = {leaf}\nunused: str! = r.clone()\nreturn r.clone() }}");
+        for source in [&direct, &helper, &unread] {
+            for from_code in [false, true] {
+                for chunk in [1, 7, 256] {
+                    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+                    let (text, buffer) = string_input(PAYLOAD, 4096);
+                    let mut plan = S10Plan::normal(chunk);
+                    plan.from_code = from_code;
+                    let (proof, returned) =
+                        s10_completed(&runtime, source, vec![text], buffer, plan);
+                    let actual = s9_owner(&returned, PAYLOAD).unwrap();
+                    assert_eq!(actual.error.is_some(), error);
+                    assert_eq!(proof.outgoing.unwrap().error.is_some(), error);
+                    assert_eq!(proof.calls, 1 + usize::from(source == &helper));
+                    assert!(proof.peak_boxes >= 2);
+                    if chunk == 1 {
+                        assert!(proof.distinct_clones >= 2);
+                        assert!(proof.checked_budgets >= 2);
+                        assert_eq!(proof.peak_boxes, proof.observed_peak_boxes);
+                        assert_eq!(proof.peak_clones, proof.observed_peak_clones);
+                    }
+                    if error {
+                        assert_eq!(proof.peak_clones, 0);
+                        assert!(proof.peak_errors >= 6);
+                    } else {
+                        assert!(proof.peak_clones >= PAYLOAD.len());
+                    }
+                    s10_close(&runtime);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn claimed_async_string_locals_real_terminal_relays_keep_512_first_513_and_same_worker_reuse() {
+    std::thread::scope(|scope| {
+        for error in [false, true] {
+            scope.spawn(move || {
+                let leaf = if error { "err(text)" } else { "ok(text)" };
+                let entry = "async fn Entry(text: str, n: int): str! { r: str! = Relay(text, n)\nr\nr = r\nreturn r.clone() }";
+                let self_source = format!("fn Relay(text: str, n: int): str! {{ if (n <= 0) {{ return {leaf} }}\nreturn Relay(text, n - 1) }}\n{entry}");
+                let mutual_source = format!("fn Relay(text: str, n: int): str! {{ if (n <= 0) {{ return {leaf} }}\nreturn Other(text, n - 1) }}\nfn Other(text: str, n: int): str! {{ if (n <= 0) {{ return {leaf} }}\nreturn Relay(text, n - 1) }}\n{entry}");
+                let fresh_source = format!("fn Relay(text: str, n: int): str! {{ return Bridge(text, n) }}\nfn Bridge(text: str, n: int): str! {{ if (n <= 0) {{ return {leaf} }}\nreturn Bridge(text, n - 1) }}\n{entry}");
+                for (source, extra, chunk) in [(&self_source, 0, 1), (&mutual_source, 0, 7), (&fresh_source, 1, 256)] {
+                    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+                    let mut worker = None;
+                    for n in [510 - extra, 511 - extra, 0] {
+                        let (text, buffer) = string_input(PAYLOAD, 4096);
+                        let mut plan = S10Plan::normal(chunk);
+                        plan.deep = n != 0;
+                        plan.from_code = n == 0;
+                        let (task, rx, _) = s10_spawn(&runtime, source, vec![text, Value::Int(n)], vec![buffer], plan);
+                        let actual_worker = s10_entered(&task, &rx, true);
+                        if let Some(worker) = worker { assert_eq!(actual_worker, worker); }
+                        worker = Some(actual_worker);
+                        let proof = s10_finished(&rx);
+                        assert_eq!(proof.thread, actual_worker);
+                        let result = s10_wait_result(&task);
+                        if n == 511 - extra {
+                            assert_eq!(result.unwrap_err().code.as_deref(), Some("call_depth_exceeded"));
+                            assert_eq!(proof.calls, MAX_CALL_DEPTH);
+                            assert_eq!(proof.peak_calls, MAX_CALL_DEPTH);
+                            assert!(proof.outgoing.is_none());
+                        } else {
+                            assert_eq!(s9_owner(&result.unwrap(), PAYLOAD).unwrap().error.is_some(), error);
+                            assert_eq!(proof.calls, (n + 2 + extra) as usize);
+                            assert_eq!(proof.outgoing.unwrap().error.is_some(), error);
+                        }
+                        if n != 0 {
+                            assert!(proof.depth_512, "the exact real 512 checkpoint was exposed");
+                            assert!(proof.checked_budgets != 0);
+                        }
+                        s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
+                    }
+                    s10_close(&runtime);
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn claimed_async_string_local_clone_minimum_quotas_preserve_real_source_and_four_budgets() {
+    for error in [false, true] {
+        let leaf = if error { "err(text)" } else { "ok(text)" };
+        let source = format!("async fn Entry(text: str): str! {{ r: str! = {leaf}\nr\nreturn r }}");
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        let mut worker = None;
+        for fault in [S10Fault::CloneCount, S10Fault::CloneBytes, S10Fault::None] {
+            let (text, buffer) = string_input(PAYLOAD, 4096);
+            let mut plan = S10Plan::normal(1);
+            plan.fault = fault;
+            let (task, rx, _) = s10_spawn(&runtime, &source, vec![text], vec![buffer], plan);
+            let actual_worker = s10_entered(&task, &rx, true);
+            if let Some(worker) = worker {
+                assert_eq!(actual_worker, worker);
+            }
+            worker = Some(actual_worker);
+            let proof = s10_finished(&rx);
+            let result = s10_wait_result(&task);
+            if fault == S10Fault::None {
+                assert_eq!(
+                    s9_owner(&result.unwrap(), PAYLOAD).unwrap().error.is_some(),
+                    error
+                );
+                assert!(proof.distinct_clones >= 2);
+                assert_eq!(proof.peak_boxes, proof.observed_peak_boxes);
+                assert_eq!(proof.peak_clones, proof.observed_peak_clones);
+            } else {
+                let diagnostic = if fault == S10Fault::CloneCount {
+                    "FrameLimit"
+                } else {
+                    "StorageLimit"
+                };
+                assert!(result.unwrap_err().message.contains(diagnostic));
+                assert!(proof.rejected_source);
+                assert_eq!(proof.peak_boxes, 1);
+                assert_eq!(proof.peak_clones, 0);
+                assert_eq!(proof.distinct_clones, 0);
+                assert!(proof.outgoing.is_none());
+            }
+            assert!(proof.checked_budgets >= 2);
+            s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
+        }
+        s10_close(&runtime);
+    }
+    // S9's unchanged sparse real ErrorObject clone regression also exercises
+    // actual Map-capacity rejection and its buffer-only peak before a Box.
+    // This claimant fixture does not fake a String::clone capacity to force
+    // a path the current allocator does not take for these source Strings.
+}
+
+#[test]
+fn claimed_async_string_local_origin_tombstone_counts_empty_and_reserved_empty_inputs() {
+    const SOURCE: &str =
+        "async fn Entry(text: str): str! { r: str! = ok(text)\nr = r\nr\nreturn r.clone() }";
+    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+    for (text, capacity) in [(PAYLOAD, 4096), ("", 0), ("", 4096)] {
+        let (value, buffer) = string_input(text, capacity);
+        let (proof, returned) =
+            s10_completed(&runtime, SOURCE, vec![value], buffer, S10Plan::normal(1));
+        assert!(
+            proof.original_retired,
+            "assignment destroyed the original credit permanently"
+        );
+        assert!(proof.distinct_clones >= 3);
+        assert!(proof.checked_budgets >= 3);
+        assert_eq!(proof.peak_clones, proof.observed_peak_clones);
+        assert_eq!(
+            s9_owner(&returned, text).unwrap().string.unwrap().len,
+            text.len()
+        );
+        if text.is_empty() {
+            assert_eq!(proof.peak_clones, 0);
+        } else {
+            assert!(proof.peak_clones >= text.len());
+        }
+    }
+    s10_close(&runtime);
+}
+
+#[test]
+fn claimed_async_string_local_scopes_q2_q3_and_protected_first_cause_keep_real_owners() {
+    for error in [false, true] {
+        let leaf = if error { "err(text)" } else { "ok(text)" };
+        let scoped = format!("async fn Entry(text: str): str! {{ r: str! = {leaf}\nif (true) {{ inner: str! = r.clone()\ninner }}\nreturn r.clone() }}");
+        let q2 = format!("async fn Entry(text: str): str! {{ r: str! = {leaf}\ntry {{ return r.clone() }} finally {{ r\nr = r\nreturn r.clone() }}\nreturn r.clone() }}");
+        let q3 = format!("async fn Entry(text: str): str! {{ r: str! = {leaf}\ntry {{ return r.clone() }} finally {{ try {{ return r.clone() }} finally {{ r\nr = r\nreturn r.clone() }} }}\nreturn r.clone() }}");
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        for (source, saved) in [(&scoped, 0), (&q2, 1), (&q3, 2)] {
+            let (text, buffer) = string_input(PAYLOAD, 4096);
+            let (proof, returned) =
+                s10_completed(&runtime, source, vec![text], buffer, S10Plan::normal(1));
+            assert_eq!(s9_owner(&returned, PAYLOAD).unwrap().error.is_some(), error);
+            assert_eq!(proof.max_saved, saved);
+            assert_eq!(proof.finally, saved);
+            assert!(proof.distinct_clones > saved);
+            assert_eq!(proof.peak_boxes, proof.observed_peak_boxes);
+            assert_eq!(proof.peak_clones, proof.observed_peak_clones);
+        }
+        s10_close(&runtime);
+    }
+    const PROTECTED: &str = "async fn Entry(text: str): str! { r: str! = ok(text)\ntry { marker = 1\nmarker = 2 } finally { r\nr = r }\nreturn r }";
+    let source = functions(PROTECTED);
+    let Stmt::Try { body, .. } = &source["Entry"].body[1] else {
+        panic!("actual try fixture")
+    };
+    let target = stmt_span(&body[1]);
+    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+    let (text, buffer) = string_input(PAYLOAD, 4096);
+    let mut plan = S10Plan::normal(1);
+    plan.pause = S10Pause::Protected(target);
+    let (task, rx, release) = s10_spawn(&runtime, PROTECTED, vec![text], vec![buffer], plan);
+    s10_entered(&task, &rx, true);
+    assert!(
+        matches!(s10_next(&rx), S10Witness::Paused { stage: S10Pause::Protected(actual), owner: None } if actual == target)
+    );
+    let first = RuntimeTermination::new(TerminationReason::Cancelled);
+    let shorter = RuntimeTermination {
+        reason: TerminationReason::TimedOut,
+        cleanup_deadline: first
+            .cleanup_deadline
+            .checked_sub(Duration::from_millis(1))
+            .unwrap(),
+    };
+    assert!(task.request_cancel_with(first));
+    assert!(!task.request_cancel_with(shorter));
+    let expected = RuntimeTermination {
+        reason: first.reason,
+        cleanup_deadline: shorter.cleanup_deadline,
+    };
+    release.send(()).unwrap();
+    let proof = s10_finished(&rx);
+    assert_eq!(
+        s10_wait_result(&task).unwrap_err().runtime_termination(),
+        Some(expected)
+    );
+    assert_eq!(proof.finally, 1);
+    assert_eq!(proof.retired_finally, 1);
+    assert!(
+        proof.distinct_clones >= 2,
+        "protected finally genuinely read and assigned r"
+    );
+    assert!(proof.peak_clones != 0);
+    assert!(proof.outgoing.is_none());
+    s10_retire(task, expected);
+    s10_close(&runtime);
+}
+
+#[test]
+fn claimed_async_string_local_queued_running_produced_cancel_and_owner_release_retire_g1_g2() {
+    const SOURCE: &str =
+        "async fn Entry(text: str): str! { r: str! = ok(text)\nr\nr = r\nreturn r.clone() }";
+    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (held_tx, held_rx) = mpsc::channel();
+    let held = runtime
+        .spawn(move || {
+            ready_tx.send(()).unwrap();
+            held_rx.recv_timeout(S10_WAIT).unwrap();
+            Ok(Value::Null)
+        })
+        .unwrap();
+    ready_rx.recv_timeout(S10_WAIT).unwrap();
+    let (text, buffer) = string_input(PAYLOAD, 4096);
+    let (task, rx, _) = s10_spawn(
+        &runtime,
+        SOURCE,
+        vec![text],
+        vec![buffer],
+        S10Plan::normal(1),
+    );
+    assert_eq!(runtime.snapshot().unwrap().queued_tasks, 1);
+    let first = RuntimeTermination::new(TerminationReason::TimedOut);
+    assert!(task.request_cancel_with(first));
+    assert!(
+        matches!(
+            rx.recv_timeout(S10_WAIT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ),
+        "queued factory and original String are released without construction"
+    );
+    assert_eq!(
+        s10_wait_result(&task).unwrap_err().runtime_termination(),
+        Some(first)
+    );
+    s10_retire(task, first);
+    assert_eq!(runtime.snapshot().unwrap().queued_tasks, 0);
+    held_tx.send(()).unwrap();
+    assert_eq!(s10_wait_result(&held).unwrap(), Value::Null);
+    s10_retire(held, RuntimeTermination::new(TerminationReason::Cancelled));
+    for stage in [S10Pause::Running, S10Pause::Produced] {
+        let (text, buffer) = string_input(PAYLOAD, 4096);
+        let mut plan = S10Plan::normal(1);
+        plan.pause = stage;
+        let (task, rx, release) = s10_spawn(&runtime, SOURCE, vec![text], vec![buffer], plan);
+        s10_entered(&task, &rx, true);
+        let completed = if stage == S10Pause::Produced {
+            Some(s10_finished(&rx))
+        } else {
+            None
+        };
+        let S10Witness::Paused {
+            stage: actual,
+            owner,
+        } = s10_next(&rx)
+        else {
+            panic!("real cancel checkpoint")
+        };
+        assert_eq!(actual, stage);
+        if let Some(proof) = completed {
+            assert_eq!(owner.as_deref().copied(), proof.outgoing);
+            assert!(owner.is_some());
+        } else {
+            assert!(owner.is_none());
+        }
+        let first = RuntimeTermination::new(TerminationReason::TimedOut);
+        let shorter = RuntimeTermination {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: first
+                .cleanup_deadline
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+        };
+        assert!(task.request_cancel_with(first));
+        assert!(!task.request_cancel_with(shorter));
+        let expected = RuntimeTermination {
+            reason: first.reason,
+            cleanup_deadline: shorter.cleanup_deadline,
+        };
+        release.send(()).unwrap();
+        if stage == S10Pause::Running {
+            let proof = s10_finished(&rx);
+            assert!(proof.outgoing.is_none());
+        }
+        assert_eq!(
+            s10_wait_result(&task).unwrap_err().runtime_termination(),
+            Some(expected)
+        );
+        s10_retire(task, expected);
+    }
+    let (text, buffer) = string_input(PAYLOAD, 4096);
+    let mut plan = S10Plan::normal(1);
+    plan.pause = S10Pause::Produced;
+    let (task, rx, release) = s10_spawn(&runtime, SOURCE, vec![text], vec![buffer], plan);
+    s10_entered(&task, &rx, true);
+    let proof = s10_finished(&rx);
+    assert!(proof.outgoing.is_some());
+    assert!(matches!(
+        s10_next(&rx),
+        S10Witness::Paused {
+            stage: S10Pause::Produced,
+            owner: Some(_)
+        }
+    ));
+    let witness = task.retirement_witness();
+    drop(task);
+    let context = RuntimeTermination::new(TerminationReason::Cancelled);
+    let mut batch =
+        crate::runtime::task::TaskRetirementBatch::from_reserved(vec![witness], context);
+    assert_eq!(batch.context(), context);
+    assert!(
+        matches!(
+            batch.poll(Instant::now()),
+            crate::runtime::task::RetirementBatchPoll::Pending { .. }
+        ),
+        "real uncommitted incoming owner and running queue node still require both receipts"
+    );
+    release.send(()).unwrap();
+    let end = Instant::now() + S10_WAIT;
+    loop {
+        match batch.poll(Instant::now()) {
+            crate::runtime::task::RetirementBatchPoll::Retired => break,
+            crate::runtime::task::RetirementBatchPoll::TimedOut(actual) => {
+                panic!("original retirement D expired: {actual:?}")
+            }
+            crate::runtime::task::RetirementBatchPoll::Pending { .. } => {
+                assert!(Instant::now() < end);
+                std::thread::yield_now();
+            }
+        }
+    }
+    s10_close(&runtime);
+}
+
+#[test]
+fn claimed_async_string_local_actual_native_clone_drop_restores_tls_and_same_worker_health() {
+    for error in [false, true] {
+        let leaf = if error { "err(text)" } else { "ok(text)" };
+        let source =
+            format!("async fn Entry(text: str): str! {{ r: str! = {leaf}\nr\nreturn r.clone() }}");
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        let (text, buffer) = string_input(PAYLOAD, 4096);
+        let mut plan = S10Plan::normal(1);
+        plan.fault = S10Fault::NativeClone;
+        let (task, rx, _) = s10_spawn(&runtime, &source, vec![text], vec![buffer], plan);
+        let worker = s10_entered(&task, &rx, true);
+        let S10Witness::Native(native) = s10_next(&rx) else {
+            panic!("real source and clone before native unwind")
+        };
+        let S10Native {
+            task: id,
+            thread,
+            source: actual_source,
+            clone,
+            first,
+            observed,
+        } = *native;
+        assert_eq!(id, task.id());
+        assert_eq!(thread, worker);
+        s9_assert_distinct(actual_source, clone);
+        assert_eq!(observed.reason, first.reason);
+        assert!(observed.cleanup_deadline < first.cleanup_deadline);
+        let Value::Result { ok: false, value } = s10_wait_result(&task).unwrap() else {
+            panic!("existing task panic classification")
+        };
+        let Value::Object(fields) = *value else {
+            panic!("real driver panic object")
+        };
+        assert!(matches!(fields.get("code"), Some(Value::String(code)) if code == "panic"));
+        s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
+        let (text, buffer) = string_input(PAYLOAD, 4096);
+        let (proof, returned) =
+            s10_completed(&runtime, &source, vec![text], buffer, S10Plan::normal(1));
+        assert_eq!(proof.thread, worker);
+        assert_ne!(proof.task, id);
+        assert_eq!(s9_owner(&returned, PAYLOAD).unwrap().error.is_some(), error);
+        s10_close(&runtime);
+    }
+}
+
+#[test]
+fn claimed_async_string_local_whole_graph_noawait_boundaries_preserve_original_factory_inputs() {
+    for source in [
+        "async fn Child(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { r: str! = await Child(text)\nreturn r }",
+        "async fn Child(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { r: str! = ok(text)\nreturn r.clone()\nlater = await Child(\"later\") }",
+        "async fn Child(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { task = Child(text)\nr: str! = err(\"later\")\nreturn r }",
+        "fn Pass(value: str!): str! { return value }\nasync fn Entry(text: str): str! { r: str! = ok(text)\nreturn Pass(r) }",
+        "async fn Entry(text: str): str! { r: str! = ok(text.clone())\nreturn r }",
+        "async fn Entry(text: str): str! { r: str! = ok(text)\nreturn r.clone().clone() }",
+        "async fn Entry(text: str): str! { r: str! = ok(text)\nreturn ok(r?) }",
+        "async fn Entry(text: str): str! { r: str! = ok(text)\ntry { marker = 1 } catch (e) { marker = 2 }\nreturn r }",
+    ] {
+        let source_functions = functions(source);
+        let entry = &source_functions["Entry"];
+        assert!(!code::eligible_owned_named(&source_functions, entry, Limits::default()));
+        assert!(matches!(CodeHandle::compile_claimed_async_owned_result_string_entry(&source_functions, entry, Limits::default()), Err(AdmissionError::Unsupported(_))), "{source}");
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        let (text, buffer) = string_input(PAYLOAD, 4096);
+        let mut plan = S10Plan::normal(1);
+        plan.selection_only = true;
+        let (task, rx, _) = s10_spawn(&runtime, source, vec![text], vec![buffer], plan);
+        s10_entered(&task, &rx, false);
+        assert_eq!(s10_wait_result(&task).unwrap(), Value::Null);
+        s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
+        s10_close(&runtime);
+    }
+    const MULTI: &str =
+        "async fn Entry(text: str, other: str): str! { r: str! = ok(text)\nreturn r }";
+    let functions = functions(MULTI);
+    assert!(matches!(
+        CodeHandle::compile_claimed_async_owned_result_string_entry(
+            &functions,
+            &functions["Entry"],
+            Limits::default()
+        ),
+        Err(AdmissionError::Unsupported(_))
+    ));
+    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+    let (text, first) = string_input(PAYLOAD, 4096);
+    let (other, second) = string_input("unmoved", 8192);
+    let mut plan = S10Plan::normal(1);
+    plan.selection_only = true;
+    let (task, rx, _) = s10_spawn(
+        &runtime,
+        MULTI,
+        vec![text, other],
+        vec![first, second],
+        plan,
+    );
+    s10_entered(&task, &rx, false);
+    assert_eq!(s10_wait_result(&task).unwrap(), Value::Null);
+    s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
+    s10_close(&runtime);
 }

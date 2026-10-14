@@ -262,8 +262,16 @@ pub(super) fn admit_claimed_async_owned_result_string_entry(
     entry: &FnDecl,
     limits: Limits,
 ) -> Admission<()> {
-    Eligibility::new(source, None, limits)
+    // Preserve the original terminal/await graph and its charging contract.
+    // Only unsupported syntax may try the separate no-await local contract.
+    match Eligibility::new(source, None, limits)
         .check(FunctionSpec::claimed_async_owned_result_string_entry(entry))
+    {
+        Err(AdmissionError::Unsupported(_)) => Eligibility::new(source, None, limits).check(
+            FunctionSpec::claimed_async_owned_local_result_string_entry(entry),
+        ),
+        admitted => admitted,
+    }
 }
 
 pub(super) fn eligible_local(
@@ -402,9 +410,16 @@ impl CodeHandle {
         entry: &FnDecl,
         limits: Limits,
     ) -> Admission<Self> {
-        Builder::new(source, None, limits).compile(Some(
+        match Builder::new(source, None, limits).compile(Some(
             FunctionSpec::claimed_async_owned_result_string_entry(entry),
-        ))
+        )) {
+            Err(AdmissionError::Unsupported(_)) => {
+                Builder::new(source, None, limits).compile(Some(
+                    FunctionSpec::claimed_async_owned_local_result_string_entry(entry),
+                ))
+            }
+            compiled => compiled,
+        }
     }
 
     pub(super) fn compile_claimed_async_owned_scalar_result_entry(
@@ -612,6 +627,7 @@ enum FunctionRole {
     ResultRoot,
     ClaimedAsyncResultRoot,
     ClaimedAsyncOwnedResultStringRoot,
+    ClaimedAsyncOwnedLocalResultStringRoot,
     AsyncOwnedResultStringDependency,
     ClaimedAsyncOwnedScalarResultRoot,
     AsyncOwnedScalarResultDependency,
@@ -758,7 +774,11 @@ impl<'a> FunctionSpec<'a> {
             // dependencies too. Otherwise a multi-String relay back to this
             // root would conflict with its already cached charging contract.
             // Actual local storage still requires one owned String parameter.
-            if matches!(self.role, FunctionRole::OwnedLocalResultStringNamed) {
+            if matches!(
+                self.role,
+                FunctionRole::OwnedLocalResultStringNamed
+                    | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
+            ) {
                 FunctionRole::OwnedLocalResultStringNamed
             } else {
                 FunctionRole::OwnedResultStringNamed
@@ -777,6 +797,7 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::OwnedResultStringNamed
                 | FunctionRole::OwnedLocalResultStringNamed
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
                 | FunctionRole::AsyncOwnedResultStringDependency
         )
     }
@@ -797,10 +818,13 @@ impl<'a> FunctionSpec<'a> {
     }
 
     fn stores_string_result(self) -> bool {
-        matches!(self.role, FunctionRole::OwnedLocalResultStringNamed)
-            && self
-                .declaration
-                .is_some_and(has_single_owned_string_parameter)
+        matches!(
+            self.role,
+            FunctionRole::OwnedLocalResultStringNamed
+                | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
+        ) && self
+            .declaration
+            .is_some_and(has_single_owned_string_parameter)
     }
 
     fn check_string_local(self, span: Span) -> Admission<()> {
@@ -832,7 +856,11 @@ impl<'a> FunctionSpec<'a> {
         let primitive = self
             .declaration
             .and_then(|function| primitive_result_kind(&function.return_type));
-        let result = if matches!(self.role, FunctionRole::OwnedLocalResultStringNamed) {
+        let result = if matches!(
+            self.role,
+            FunctionRole::OwnedLocalResultStringNamed
+                | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
+        ) {
             ResultContract::OwnedStringLocals
         } else if self.owns_result_string() {
             ResultContract::OwnedString
@@ -884,6 +912,12 @@ impl<'a> FunctionSpec<'a> {
         spec
     }
 
+    fn claimed_async_owned_local_result_string_entry(function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        spec.role = FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot;
+        spec
+    }
+
     fn claimed_async_owned_scalar_result_entry(function: &'a FnDecl) -> Self {
         let mut spec = Self::named(function);
         spec.role = FunctionRole::ClaimedAsyncOwnedScalarResultRoot;
@@ -894,6 +928,7 @@ impl<'a> FunctionSpec<'a> {
         matches!(
             self.role,
             FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
                 | FunctionRole::AsyncOwnedResultStringDependency
         )
     }
@@ -925,6 +960,14 @@ impl<'a> FunctionSpec<'a> {
         task: &Expr,
         source: &HashMap<String, FnDecl>,
     ) -> Admission<()> {
+        if matches!(
+            self.role,
+            FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
+        ) {
+            // A String clone cannot inherit the terminal await input credit.
+            // This separate local contract admits no await anywhere in its graph.
+            return Err(AdmissionError::Unsupported(task.span));
+        }
         let ExprKind::Call { callee, .. } = &task.kind else {
             return Err(AdmissionError::Unsupported(task.span));
         };
@@ -938,6 +981,12 @@ impl<'a> FunctionSpec<'a> {
     }
 
     fn owned_async_dependency(self, function: &'a FnDecl) -> Admission<Self> {
+        if matches!(
+            self.role,
+            FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
+        ) {
+            return Err(AdmissionError::Unsupported(function.span));
+        }
         self.check_owned_async_target(function)?;
         let mut spec = Self::named(function);
         spec.role = if self.owns_scalar_result() {
@@ -967,6 +1016,7 @@ impl<'a> FunctionSpec<'a> {
             self.role,
             FunctionRole::ClaimedAsyncResultRoot
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
                 | FunctionRole::AsyncOwnedResultStringDependency
                 | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
                 | FunctionRole::AsyncOwnedScalarResultDependency
@@ -983,6 +1033,7 @@ impl<'a> FunctionSpec<'a> {
                 | FunctionRole::OwnedLocalResultStringNamed
                 | FunctionRole::OwnedScalarResultNamed
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
                 | FunctionRole::AsyncOwnedResultStringDependency
                 | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
                 | FunctionRole::AsyncOwnedScalarResultDependency
@@ -1067,6 +1118,11 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::ClaimedAsyncOwnedResultStringRoot
             | FunctionRole::AsyncOwnedResultStringDependency => {
                 function.is_async && string_result_type(&function.return_type)
+            }
+            FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot => {
+                function.is_async
+                    && string_result_type(&function.return_type)
+                    && has_single_owned_string_parameter(function)
             }
             FunctionRole::ClaimedAsyncOwnedScalarResultRoot
             | FunctionRole::AsyncOwnedScalarResultDependency => {
@@ -3469,5 +3525,223 @@ mod typed_result_cache_tests {
             eligibility.check(root).unwrap();
             assert_eq!(locals, before);
         }
+    }
+
+    #[test]
+    fn async_string_local_cache_and_selector_keep_separate_whole_graph_contracts() {
+        let source = functions("async fn Shared(text: str): str! { return ok(text) }");
+        let same_name_sync = functions("fn Shared(text: str): str! { return ok(text) }");
+        let invalid_local =
+            functions("async fn Shared(text: str, spare: str): str! { return ok(text) }");
+        let before = source.clone();
+        let limits = Limits::default();
+        let old = FunctionSpec::claimed_async_owned_result_string_entry(&source["Shared"]);
+        let local = FunctionSpec::claimed_async_owned_local_result_string_entry(&source["Shared"]);
+        let sync = FunctionSpec::owned_named(&same_name_sync["Shared"]);
+        let dependency = local.owned_dependency(&same_name_sync["Shared"]);
+        let invalid =
+            FunctionSpec::claimed_async_owned_local_result_string_entry(&invalid_local["Shared"]);
+        assert!(old.cache_contract() == (true, ResultContract::OwnedString, None));
+        assert!(local.cache_contract() == (true, ResultContract::OwnedStringLocals, None));
+        assert!(sync.cache_contract() == (false, ResultContract::OwnedStringLocals, None));
+        for spec in [old, local, sync, dependency] {
+            spec.validate().unwrap();
+            Eligibility::new(&source, None, limits).check(spec).unwrap();
+            Builder::new(&source, None, limits)
+                .compile(Some(spec))
+                .unwrap();
+        }
+        assert!(matches!(
+            invalid.validate(),
+            Err(AdmissionError::Unsupported(_))
+        ));
+        for (first, second, compatible) in [
+            (old, local, false),
+            (local, old, false),
+            (local, sync, false),
+            (sync, local, false),
+            (sync, dependency, true),
+            (dependency, sync, true),
+            (local, invalid, false),
+        ] {
+            let mut builder = Builder::new(&source, None, limits);
+            let id = builder.ensure_function(first).unwrap();
+            let original = builder.arena.functions.get(id.0).unwrap();
+            let contract = (
+                original.is_async,
+                original.result_contract,
+                original.owned_scalar_result,
+            );
+            let storage = (builder.count(), builder.bytes());
+            let reused = builder.ensure_function(second);
+            if compatible {
+                assert_eq!(reused.unwrap(), id);
+            } else {
+                assert!(matches!(reused, Err(AdmissionError::Unsupported(_))));
+            }
+            assert_eq!(builder.arena.functions.len(), 1);
+            assert_eq!(builder.functions.len(), 1);
+            assert_eq!((builder.count(), builder.bytes()), storage);
+            let retained = builder.arena.functions.get(id.0).unwrap();
+            assert!(
+                (
+                    retained.is_async,
+                    retained.result_contract,
+                    retained.owned_scalar_result
+                ) == contract
+            );
+            assert_eq!(builder.ensure_function(first).unwrap(), id);
+
+            let mut eligibility = Eligibility::new(&source, None, limits);
+            eligibility.function(first).unwrap();
+            let contract = eligibility.checked.get(0).unwrap().1;
+            let storage = (eligibility.count(), eligibility.bytes());
+            let reused = eligibility.function(second);
+            if compatible {
+                reused.unwrap();
+            } else {
+                assert!(matches!(reused, Err(AdmissionError::Unsupported(_))));
+            }
+            assert_eq!(eligibility.checked.len(), 1);
+            assert_eq!(eligibility.functions.len(), 1);
+            assert!(eligibility.checked.get(0).unwrap().1 == contract);
+            assert_eq!((eligibility.count(), eligibility.bytes()), storage);
+            eligibility.function(first).unwrap();
+            assert_eq!(eligibility.checked.len(), 1);
+        }
+        assert_eq!(source, before);
+
+        let locals = functions(
+            "fn Relay(text: str): str! { r: str! = ok(text)\nr\nr = r\nreturn r }\nasync fn Entry(text: str): str! { r: str! = Relay(text)\nr\nr = r\nreturn r.clone() }",
+        );
+        let before = locals.clone();
+        let entry = &locals["Entry"];
+        let old = FunctionSpec::claimed_async_owned_result_string_entry(entry);
+        let local = FunctionSpec::claimed_async_owned_local_result_string_entry(entry);
+        assert!(matches!(
+            Eligibility::new(&locals, None, limits).check(old),
+            Err(AdmissionError::Unsupported(_))
+        ));
+        assert!(matches!(
+            Builder::new(&locals, None, limits).compile(Some(old)),
+            Err(AdmissionError::Unsupported(_))
+        ));
+        Eligibility::new(&locals, None, limits)
+            .check(local)
+            .unwrap();
+        let direct = Builder::new(&locals, None, limits)
+            .compile(Some(local))
+            .unwrap();
+        admit_claimed_async_owned_result_string_entry(&locals, entry, limits).unwrap();
+        let selected =
+            CodeHandle::compile_claimed_async_owned_result_string_entry(&locals, entry, limits)
+                .unwrap();
+        for code in [direct, selected] {
+            assert_eq!(code.0.functions.len(), 2);
+            assert!(code.has_actual_string_result_locals());
+            for (name, is_async) in [("Entry", true), ("Relay", false)] {
+                let function = code.function(code.find_function(name).unwrap());
+                assert_eq!(function.is_async, is_async);
+                assert!(function.result_contract == ResultContract::OwnedStringLocals);
+            }
+        }
+        assert_eq!(locals, before);
+
+        // Original terminal await stays wholly on its old contract. The new
+        // role must reject the same checker-legal await graph before execution.
+        let terminal = functions(
+            "async fn Child(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { return await Child(text) }",
+        );
+        let before = terminal.clone();
+        let entry = &terminal["Entry"];
+        admit_claimed_async_owned_result_string_entry(&terminal, entry, limits).unwrap();
+        let code =
+            CodeHandle::compile_claimed_async_owned_result_string_entry(&terminal, entry, limits)
+                .unwrap();
+        assert!(!code.has_actual_string_result_locals());
+        for name in ["Entry", "Child"] {
+            assert!(
+                code.function(code.find_function(name).unwrap())
+                    .result_contract
+                    == ResultContract::OwnedString
+            );
+        }
+        let local = FunctionSpec::claimed_async_owned_local_result_string_entry(entry);
+        assert!(matches!(
+            local.owned_async_dependency(&terminal["Child"]),
+            Err(AdmissionError::Unsupported(_))
+        ));
+        assert!(matches!(
+            Eligibility::new(&terminal, None, limits).check(local),
+            Err(AdmissionError::Unsupported(_))
+        ));
+        assert!(matches!(
+            Builder::new(&terminal, None, limits).compile(Some(local)),
+            Err(AdmissionError::Unsupported(_))
+        ));
+        assert_eq!(terminal, before);
+
+        // Checker-legal direct local await, dead await after a local return,
+        // and async dependencies with/without their own await are all rejected.
+        // Selection/construction only reads syntax, never executes a body or
+        // creates a Task; the unchanged source declarations are also checked.
+        for syntax in [
+            "async fn Child(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { r: str! = await Child(text)\nreturn r }",
+            "async fn Child(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { r: str! = ok(text)\nreturn r\nawait Child(\"dead\") }",
+            "async fn Child(text: str): str! { return ok(text) }\nasync fn Entry(text: str, n: int): str! { if (n < 0) { task = Child(text)\nreturn err(\"dead\") }\nr: str! = ok(text)\nreturn r }",
+            "async fn Child(text: str): str! { return ok(text) }\nasync fn Helper(text: str): str! { return await Child(text) }\nasync fn Entry(text: str, n: int): str! { if (n < 0) { task = Helper(text)\nreturn err(\"dead\") }\nr: str! = ok(text)\nreturn r }",
+        ] {
+            let rejected = functions(syntax);
+            let before = rejected.clone();
+            let entry = &rejected["Entry"];
+            let local = FunctionSpec::claimed_async_owned_local_result_string_entry(entry);
+            assert!(matches!(Eligibility::new(&rejected, None, limits).check(local), Err(AdmissionError::Unsupported(_))), "{syntax}");
+            assert!(matches!(Builder::new(&rejected, None, limits).compile(Some(local)), Err(AdmissionError::Unsupported(_))), "{syntax}");
+            assert!(matches!(admit_claimed_async_owned_result_string_entry(&rejected, entry, limits), Err(AdmissionError::Unsupported(_))), "{syntax}");
+            assert!(matches!(CodeHandle::compile_claimed_async_owned_result_string_entry(&rejected, entry, limits), Err(AdmissionError::Unsupported(_))), "{syntax}");
+            assert_eq!(rejected, before);
+        }
+
+        // The real two-String old terminal role is valid, but exhausts the
+        // original syntax budget. The new role rejects that declaration before
+        // spending. Public selectors must preserve the first controlled reject
+        // rather than replace it with the fallback's Unsupported classification.
+        let entry = &invalid_local["Shared"];
+        let old = FunctionSpec::claimed_async_owned_result_string_entry(entry);
+        let local = FunctionSpec::claimed_async_owned_local_result_string_entry(entry);
+        let before = invalid_local.clone();
+        let exhausted = Limits {
+            syntax_steps: 0,
+            ..limits
+        };
+        assert!(matches!(
+            Eligibility::new(&invalid_local, None, exhausted).check(old),
+            Err(AdmissionError::Rejected(_))
+        ));
+        assert!(matches!(
+            Builder::new(&invalid_local, None, exhausted).compile(Some(old)),
+            Err(AdmissionError::Rejected(_))
+        ));
+        assert!(matches!(
+            Eligibility::new(&invalid_local, None, exhausted).check(local),
+            Err(AdmissionError::Unsupported(_))
+        ));
+        assert!(matches!(
+            Builder::new(&invalid_local, None, exhausted).compile(Some(local)),
+            Err(AdmissionError::Unsupported(_))
+        ));
+        assert!(matches!(
+            admit_claimed_async_owned_result_string_entry(&invalid_local, entry, exhausted),
+            Err(AdmissionError::Rejected(_))
+        ));
+        assert!(matches!(
+            CodeHandle::compile_claimed_async_owned_result_string_entry(
+                &invalid_local,
+                entry,
+                exhausted
+            ),
+            Err(AdmissionError::Rejected(_))
+        ));
+        assert_eq!(invalid_local, before);
     }
 }
