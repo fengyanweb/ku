@@ -225,6 +225,283 @@ fn primitive_budget_entries(machine: &mut Machine) {
     machine.value_limits = saved;
 }
 
+#[derive(Default, Debug)]
+struct LocalSourceProof {
+    live: Vec<PrimitivePayload>,
+    last_candidate: Option<PrimitivePayload>,
+    peak_env: usize,
+    peak_live: usize,
+    distinct_clones: usize,
+    budget_checks: usize,
+    clone_source: Option<PrimitivePayload>,
+    clone_source_unchanged: bool,
+    full_depth_observed: bool,
+    popped: usize,
+}
+
+struct LocalSourceCensus {
+    env: Vec<PrimitivePayload>,
+    live: Vec<PrimitivePayload>,
+    ticket: Option<PrimitivePayload>,
+    count: usize,
+    bytes: usize,
+}
+
+fn primitive_charge(owner: PrimitivePayload) -> AwaitPayloadCharge {
+    let (error_leaf_count, error_leaf_bytes) = owner.error.map_or((0, 0), |e| (e.count, e.bytes));
+    let box_bytes = std::mem::size_of::<Value>();
+    AwaitPayloadCharge {
+        count: 1 + error_leaf_count,
+        bytes: box_bytes + error_leaf_bytes,
+        box_count: 1,
+        box_bytes,
+        error_leaf_count,
+        error_leaf_bytes,
+    }
+}
+
+fn primitive_totals(owners: &[PrimitivePayload]) -> AwaitPayloadCharge {
+    owners
+        .iter()
+        .copied()
+        .fold(AwaitPayloadCharge::default(), |total, owner| {
+            sum_payload_charge(total, primitive_charge(owner))
+        })
+}
+
+fn planned_local_clone_charge(source: &Value) -> Option<AwaitPayloadCharge> {
+    let actual = primitive_payload(source)?;
+    if actual.error.is_none() {
+        return Some(primitive_charge(actual));
+    }
+    let Value::Result { value, .. } = source else {
+        return None;
+    };
+    let Value::Object(fields) = value.as_ref() else {
+        return None;
+    };
+    let Value::String(domain) = fields.get("domain")? else {
+        return None;
+    };
+    let Value::String(code) = fields.get("code")? else {
+        return None;
+    };
+    let Value::String(message) = fields.get("message")? else {
+        return None;
+    };
+    AwaitPayloadCharge::planned_error_object(domain, code, message.len()).ok()
+}
+
+fn local_source_census(machine: &Machine) -> LocalSourceCensus {
+    // Each source in this mode has at most four Result locals per frame.
+    // Allocate and initialize the Copy-only observation slots before taking
+    // a binding lock: the callback never allocates, clones, asserts or keeps
+    // a reference, Arc, source Value or guard alive beyond that lock.
+    let mut metadata = vec![None; machine.calls.len() * 4];
+    let mut used = 0;
+    let mut env_charge = AwaitPayloadCharge::default();
+    for frame in machine.calls.as_slice() {
+        let (has_result, overflow) =
+            frame
+                .env
+                .fold_owned_values((false, false), |(has, overflow), value| {
+                    let mut overflow = overflow;
+                    if let Some(actual) = primitive_payload(value) {
+                        if let Some(slot) = metadata.get_mut(used) {
+                            *slot = Some(actual);
+                            used += 1;
+                        } else {
+                            overflow = true;
+                        }
+                    }
+                    (has || matches!(value, Value::Result { .. }), overflow)
+                });
+        assert!(
+            !overflow,
+            "preallocated Copy observation slots cover the fixture's real bindings"
+        );
+        assert!(
+            !has_result || frame.has_selected_result_bindings,
+            "every real Result local activates the production frame census"
+        );
+        env_charge = sum_payload_charge(env_charge, frame.env.selected_scalar_result_charge());
+    }
+    let env = metadata.into_iter().flatten().collect::<Vec<_>>();
+    assert_eq!(env_charge, primitive_totals(&env));
+    let mut live = env.clone();
+    let mut read = |value: &Value| {
+        if let Some(actual) = primitive_payload(value) {
+            live.push(actual);
+        }
+    };
+    for value in machine.values.as_slice() {
+        read(value);
+    }
+    if let Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })) = &machine.pending {
+        read(value);
+    }
+    for exit in machine.exits.as_slice() {
+        if let Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })) =
+            exit.state.outcome()
+        {
+            read(value);
+        }
+    }
+    for frame in machine.finally.frames.as_slice() {
+        if let Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })) = &frame.primary {
+            read(value);
+        }
+    }
+    let physical = primitive_totals(&live);
+    let ticket = machine
+        .awaiting
+        .as_ref()
+        .and_then(|frame| frame.ticket.test_outcome())
+        .and_then(|outcome| outcome.as_ref().ok())
+        .and_then(primitive_payload);
+    let ticket_charge = ticket.map_or_else(AwaitPayloadCharge::default, primitive_charge);
+    if let Some(frame) = &machine.awaiting {
+        assert_eq!(
+            frame.ticket.retained_payload_charge(),
+            ticket_charge,
+            "actual Ready ticket backing is measured independently of its cached subtotal"
+        );
+    }
+    if let Some(ticket) = ticket {
+        live.push(ticket);
+    }
+    let mut unique = std::collections::HashSet::with_capacity(live.len());
+    for owner in &live {
+        assert!(
+            unique.insert(owner.boxed),
+            "one physical owning location per Result Box"
+        );
+    }
+    assert_eq!(
+        machine.await_payload_escrow,
+        AwaitPayloadCharge::default(),
+        "operation-local escrow is checked inside the existing finish_with probes"
+    );
+    let stable = sum_payload_charge(physical, machine.await_payload_snapshot);
+    assert_eq!(
+        (
+            machine.result_wrapper_capacity,
+            machine.result_wrapper_bytes,
+            machine.error_leaf_capacity,
+            machine.error_leaf_bytes
+        ),
+        (
+            stable.box_count,
+            stable.box_bytes,
+            stable.error_leaf_count,
+            stable.error_leaf_bytes
+        )
+    );
+    assert_eq!(
+        (
+            machine.metrics.retained_result_wrapper_capacity,
+            machine.metrics.retained_result_wrapper_bytes,
+            machine.metrics.retained_error_leaf_capacity,
+            machine.metrics.retained_error_leaf_bytes
+        ),
+        (
+            stable.box_count,
+            stable.box_bytes,
+            stable.error_leaf_count,
+            stable.error_leaf_bytes
+        )
+    );
+    let current = sum_payload_charge(physical, ticket_charge);
+    let count = machine.values.capacity()
+        + machine.argument_capacity
+        + machine.exit_handle_capacity
+        + machine.retirement_capacity
+        + machine.lease_capacity
+        + machine.lease_root_bytes / std::mem::size_of::<Value>()
+        + current.count;
+    let bytes = machine.values.charged_storage_bytes()
+        + machine.argument_bytes
+        + machine.exit_handle_bytes
+        + machine.retirement_bytes
+        + machine.string_payload_bytes
+        + machine.lease_bytes
+        + machine.lease_root_bytes
+        + current.bytes;
+    LocalSourceCensus {
+        env,
+        live,
+        ticket,
+        count,
+        bytes,
+    }
+}
+
+fn observe_source_locals(
+    machine: &Machine,
+    _buffers: &[Buffer],
+    proof: &mut LocalSourceProof,
+) -> LocalSourceCensus {
+    let census = local_source_census(machine);
+    // This is an instantaneous census. An owner may retire and an allocator
+    // may reuse its address between observations, including across several
+    // Work items in a coarse chunk. Clone identity is established separately
+    // around the actual one-step clone while source and candidate coexist.
+    proof.peak_env = proof.peak_env.max(census.env.len());
+    proof.peak_live = proof.peak_live.max(census.live.len());
+    proof.live = census.live.clone();
+    census
+}
+
+fn local_source_budget_entries(machine: &mut Machine, _buffers: &[Buffer]) -> (usize, usize) {
+    let census = local_source_census(machine);
+    let saved = machine.value_limits;
+    for reason in [None, Some("FrameLimit"), Some("StorageLimit")] {
+        machine.value_limits.max_frames = census.count - usize::from(reason == Some("FrameLimit"));
+        machine.value_limits.max_storage_bytes =
+            census.bytes - usize::from(reason == Some("StorageLimit"));
+        let spare = machine.values.capacity() - machine.values.len();
+        for result in [
+            machine.reserve_values(spare, Span::default()),
+            machine.check_argument_capacity(0, Span::default()),
+            machine.check_exit_storage_capacity(0, 0, Span::default()),
+            machine.check_lease_capacity(0, 0, Span::default()),
+        ] {
+            if let Some(reason) = reason {
+                assert!(result.unwrap_err().message.contains(reason));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+    machine.value_limits = saved;
+    (census.count, census.bytes)
+}
+
+fn distinct_local_source_clone(source: PrimitivePayload, candidate: PrimitivePayload) {
+    assert_ne!(
+        source.boxed, candidate.boxed,
+        "Result local reads clone rather than consume the resident source"
+    );
+    assert_eq!(source.scalar, candidate.scalar);
+    match (source.error, candidate.error) {
+        (Some(a), Some(b)) => {
+            for index in 0..3 {
+                assert_ne!(a.entries[index], b.entries[index]);
+            }
+            for index in 0..6 {
+                if a.buffers[index].1 > 0 && b.buffers[index].1 > 0 {
+                    assert_ne!(
+                        a.buffers[index].0, b.buffers[index].0,
+                        "each nonempty error key/value buffer is physically cloned"
+                    );
+                }
+            }
+        }
+        (None, None) => {}
+        _ => panic!("clone retains the selected Result shape"),
+    }
+}
+
 fn err_input_index(value: &Value, buffers: &[Buffer]) -> Option<usize> {
     let Value::Result { ok: false, value } = value else {
         return None;
@@ -446,6 +723,8 @@ enum Fault {
     NativeBox,
     FuelBefore,
     FuelAfter,
+    LocalCloneCount,
+    LocalCloneBytes,
 }
 
 #[derive(Clone, Copy)]
@@ -454,6 +733,8 @@ struct Plan {
     pause: Pause,
     fault: Fault,
     selection_only: bool,
+    local_mode: bool,
+    pressure_mode: bool,
 }
 
 impl Plan {
@@ -463,6 +744,22 @@ impl Plan {
             pause: Pause::None,
             fault: Fault::None,
             selection_only: false,
+            local_mode: false,
+            pressure_mode: false,
+        }
+    }
+
+    fn local(chunk: usize) -> Self {
+        Self {
+            local_mode: true,
+            ..Self::normal(chunk)
+        }
+    }
+
+    fn local_pressure(chunk: usize) -> Self {
+        Self {
+            pressure_mode: true,
+            ..Self::local(chunk)
         }
     }
 }
@@ -485,10 +782,16 @@ struct Finished {
     outgoing_primitive: Option<PrimitivePayload>,
     primitive_owners: Vec<PrimitivePayload>,
     last_primitive_candidate: Option<PrimitivePayload>,
+    locals: Option<LocalSourceProof>,
 }
 
 #[derive(Debug)]
 enum Witness {
+    LocalProgress {
+        popped: usize,
+        calls: usize,
+        boxes: usize,
+    },
     Entered {
         task: i64,
         selected: bool,
@@ -521,6 +824,7 @@ struct SourceRunner {
     errors: Vec<ErrorPayload>,
     primitives: Vec<PrimitivePayload>,
     last_primitive_candidate: Option<PrimitivePayload>,
+    locals: Option<LocalSourceProof>,
     witness: mpsc::Sender<Witness>,
     release: Option<mpsc::Receiver<()>>,
     paused: bool,
@@ -530,6 +834,50 @@ struct SourceRunner {
 }
 
 impl SourceRunner {
+    fn dispatch_pressure(&mut self, budget: NonZeroUsize) -> ControlFlow<KuResult<Value>> {
+        // A pending first failure can physically pop skipped Work without
+        // incrementing metrics.dispatches. Observe the real kernel receipt
+        // instead, while retaining the claimant's task/finish conversion.
+        // This fixture has no await; every Continue is an actual More receipt.
+        assert!(
+            !self.inner.finished,
+            "a finished pressure claimant cannot resume"
+        );
+        assert_eq!(crate::runtime::task::current_task_id(), self.inner.task_id);
+        let result = if let Some(outcome) = self.inner.outcome.take() {
+            outcome
+        } else {
+            let machine = self
+                .inner
+                .machine
+                .as_mut()
+                .expect("the selected pressure machine");
+            match machine.dispatch_chunk(budget, &mut self.inner.interpreter) {
+                Ok(ChunkProgress::More { popped }) => {
+                    assert_eq!(popped, budget.get());
+                    self.locals.as_mut().unwrap().popped += popped;
+                    return ControlFlow::Continue(());
+                }
+                Ok(ChunkProgress::Waiting { .. }) => {
+                    panic!("the synchronous Relay pressure fixture has no await")
+                }
+                Ok(ChunkProgress::Finished { popped, result }) => {
+                    assert!(popped <= budget.get());
+                    self.locals.as_mut().unwrap().popped += popped;
+                    let kind = if machine.captures.is_some() {
+                        CallKind::FunctionValue
+                    } else {
+                        CallKind::Named
+                    };
+                    result.and_then(|flow| flow.into_call_value(self.inner.span, kind.label()))
+                }
+                Err(error) => Err(error),
+            }
+        };
+        self.inner.finished = true;
+        ControlFlow::Break(result)
+    }
+
     fn pause(&mut self, stage: Pause, outgoing: Option<(usize, usize)>) {
         self.paused = true;
         self.witness
@@ -557,6 +905,105 @@ impl LocalTaskRunner for SourceRunner {
         assert_eq!(std::thread::current().id(), self.thread);
         if self.plan.selection_only {
             return ControlFlow::Break(Ok(Value::Null));
+        }
+        let mut clone_source = None;
+        let mut saved_local_limits = None;
+        if let (Some(machine), Some(proof)) = (self.inner.machine.as_mut(), self.locals.as_mut()) {
+            if self.plan.pressure_mode {
+                let depth = machine.calls.len();
+                assert!(depth <= MAX_CALL_DEPTH);
+                if !proof.full_depth_observed
+                    && depth != 0
+                    && (depth >= proof.peak_env + 64 || depth == MAX_CALL_DEPTH)
+                    && machine
+                        .calls
+                        .as_slice()
+                        .last()
+                        .unwrap()
+                        .has_selected_result_bindings
+                {
+                    let census = observe_source_locals(machine, &self.buffers, proof);
+                    assert_eq!(
+                        census.env.len(),
+                        depth,
+                        "one genuine keep Result in every live call at this checkpoint"
+                    );
+                    if depth == MAX_CALL_DEPTH {
+                        local_source_budget_entries(machine, &self.buffers);
+                        proof.budget_checks += 1;
+                        proof.full_depth_observed = true;
+                    }
+                }
+                if proof.full_depth_observed && depth > 32 {
+                    self.plan.chunk = 256;
+                    proof.live.clear();
+                    proof.last_candidate = None;
+                } else if !proof.full_depth_observed {
+                    // One real Work can enter at most one call. This budget
+                    // cannot cross 512; at 512 it remains one step until the
+                    // first keep Bind is observable, before a 513th attempt or
+                    // leaf effects. Only outer dispatch observation is batched.
+                    self.plan.chunk = (MAX_CALL_DEPTH - depth).clamp(1, 256);
+                } else {
+                    self.plan.chunk = 1;
+                }
+            }
+            if !self.plan.pressure_mode || (proof.full_depth_observed && machine.calls.len() <= 32)
+            {
+                observe_source_locals(machine, &self.buffers, proof);
+                if self.plan.chunk == 1 && machine.pending.is_none() {
+                    if let Some(Work::CloneSelectedScalarResult(name, _)) =
+                        machine.work.as_slice().last()
+                    {
+                        let name = *name;
+                        clone_source = machine
+                            .calls
+                            .as_slice()
+                            .last()
+                            .unwrap()
+                            .env
+                            .with_value(machine.code.symbol(name), Span::default(), |value| {
+                                Ok(primitive_payload(value))
+                            })
+                            .unwrap();
+                        if proof.budget_checks == 0 {
+                            machine.reserve_values(1, Span::default()).unwrap();
+                            local_source_budget_entries(machine, &self.buffers);
+                            proof.budget_checks += 1;
+                        }
+                        if !self.faulted
+                            && matches!(
+                                self.plan.fault,
+                                Fault::LocalCloneCount | Fault::LocalCloneBytes
+                            )
+                        {
+                            machine.reserve_values(1, Span::default()).unwrap();
+                            let (count, bytes) =
+                                local_source_budget_entries(machine, &self.buffers);
+                            let minimum = machine
+                                .calls
+                                .as_slice()
+                                .last()
+                                .unwrap()
+                                .env
+                                .with_value(machine.code.symbol(name), Span::default(), |value| {
+                                    Ok(planned_local_clone_charge(value))
+                                })
+                                .unwrap()
+                                .unwrap();
+                            proof.budget_checks += 1;
+                            saved_local_limits = Some(machine.value_limits);
+                            if self.plan.fault == Fault::LocalCloneCount {
+                                machine.value_limits.max_frames = count + minimum.count - 1;
+                            } else {
+                                machine.value_limits.max_storage_bytes = bytes + minimum.bytes - 1;
+                            }
+                            proof.clone_source = clone_source;
+                            self.faulted = true;
+                        }
+                    }
+                }
+            }
         }
         if !self.faulted {
             if let Some(machine) = self.inner.machine.as_mut() {
@@ -645,12 +1092,23 @@ impl LocalTaskRunner for SourceRunner {
                     self.faulted = true;
                 }
                 if self.plan.fault == Fault::NativeBox && machine.result_wrapper_capacity > 0 {
-                    let count = observe(machine, &self.buffers, &mut self.boxes, &mut self.errors);
-                    assert_eq!(count, 1);
-                    primitive_budget_entries(machine);
-                    if let Some(actual) = observe_primitives(machine, &mut self.primitives) {
-                        self.last_primitive_candidate = Some(actual);
-                    }
+                    let boxed = if let Some(proof) = &mut self.locals {
+                        let census = observe_source_locals(machine, &self.buffers, proof);
+                        local_source_budget_entries(machine, &self.buffers);
+                        proof.budget_checks += 1;
+                        census.env.first().or(census.live.first()).unwrap().boxed
+                    } else {
+                        let count =
+                            observe(machine, &self.buffers, &mut self.boxes, &mut self.errors);
+                        assert_eq!(count, 1);
+                        primitive_budget_entries(machine);
+                        if let Some(actual) = observe_primitives(machine, &mut self.primitives) {
+                            self.last_primitive_candidate = Some(actual);
+                        }
+                        self.primitives
+                            .last()
+                            .map_or_else(|| self.boxes[0].unwrap(), |actual| actual.boxed)
+                    };
                     self.witness
                         .send(Witness::Native {
                             input: self.buffers.first().copied().unwrap_or(Buffer {
@@ -658,10 +1116,7 @@ impl LocalTaskRunner for SourceRunner {
                                 capacity: 0,
                                 text: "",
                             }),
-                            boxed: self
-                                .primitives
-                                .last()
-                                .map_or_else(|| self.boxes[0].unwrap(), |actual| actual.boxed),
+                            boxed,
                         })
                         .unwrap();
                     // A real native runner abandonment, not a source destructor
@@ -673,9 +1128,15 @@ impl LocalTaskRunner for SourceRunner {
                 }
             }
         }
-        let result = self
-            .inner
-            .dispatch(NonZeroUsize::new(self.plan.chunk).unwrap());
+        let budget = NonZeroUsize::new(self.plan.chunk).unwrap();
+        let result = if self.plan.pressure_mode {
+            self.dispatch_pressure(budget)
+        } else {
+            self.inner.dispatch(budget)
+        };
+        if let Some(saved) = saved_local_limits {
+            self.inner.machine.as_mut().unwrap().value_limits = saved;
+        }
         if let Some(machine) = self.inner.machine.as_ref() {
             if machine.state != MachineState::Finished {
                 assert_eq!(
@@ -687,9 +1148,59 @@ impl LocalTaskRunner for SourceRunner {
                     "the original input pool remains reserved until this actual run finishes"
                 );
             }
-            observe(machine, &self.buffers, &mut self.boxes, &mut self.errors);
-            if let Some(actual) = observe_primitives(machine, &mut self.primitives) {
-                self.last_primitive_candidate = Some(actual);
+            if let Some(proof) = &mut self.locals {
+                if machine.state != MachineState::Finished
+                    && (!self.plan.pressure_mode
+                        || (proof.full_depth_observed && machine.calls.len() <= 32))
+                {
+                    let census = observe_source_locals(machine, &self.buffers, proof);
+                    if let Some(source) = clone_source {
+                        assert!(
+                            census.env.contains(&source),
+                            "the real clone leaves its original source owner intact"
+                        );
+                        proof.clone_source_unchanged = true;
+                        if let Some(candidate) =
+                            machine.values.as_slice().last().and_then(primitive_payload)
+                        {
+                            distinct_local_source_clone(source, candidate);
+                            // Record the actual completed clone, while its
+                            // independently measured source is still resident.
+                            // Never infer a new candidate from address history.
+                            proof.last_candidate = Some(candidate);
+                            proof.distinct_clones += 1;
+                        } else {
+                            assert!(
+                                saved_local_limits.is_some(),
+                                "only the controlled quota rejection omits publication"
+                            );
+                            assert_eq!(census.live.len(), census.env.len());
+                            proof.clone_source_unchanged = true;
+                        }
+                    }
+                }
+            } else {
+                observe(machine, &self.buffers, &mut self.boxes, &mut self.errors);
+                if let Some(actual) = observe_primitives(machine, &mut self.primitives) {
+                    self.last_primitive_candidate = Some(actual);
+                }
+            }
+        }
+        if matches!(result, ControlFlow::Continue(())) && self.plan.pressure_mode {
+            if let (Some(machine), Some(proof)) =
+                (self.inner.machine.as_ref(), self.locals.as_mut())
+            {
+                // Every real More receipt advances popped, including skipped
+                // Work after the first failure. Depth-only milestones can be
+                // separated by substantial genuine work and do not prove a
+                // stalled receiver or a stalled worker.
+                self.witness
+                    .send(Witness::LocalProgress {
+                        popped: proof.popped,
+                        calls: machine.calls.len(),
+                        boxes: machine.result_wrapper_capacity,
+                    })
+                    .unwrap();
             }
         }
         if let ControlFlow::Break(outcome) = &result {
@@ -713,14 +1224,23 @@ impl LocalTaskRunner for SourceRunner {
             let outgoing_primitive = outcome.as_ref().ok().and_then(primitive_payload);
             if let Some(actual) = outgoing_primitive {
                 if self.plan.chunk == 1 {
-                    assert_eq!(
-                        self.primitives
-                            .iter()
-                            .find(|old| old.boxed == actual.boxed)
-                            .copied(),
-                        Some(actual),
-                        "one-step claimant independently observes its outgoing primitive Box"
-                    );
+                    if let Some(proof) = &self.locals {
+                        assert_eq!(proof.last_candidate, Some(actual),
+                            "one-step local claimant publishes its independently observed final candidate");
+                        assert!(
+                            proof.live.contains(&actual),
+                            "the outgoing physical owner existed before teardown"
+                        );
+                    } else {
+                        assert_eq!(
+                            self.primitives
+                                .iter()
+                                .find(|old| old.boxed == actual.boxed)
+                                .copied(),
+                            Some(actual),
+                            "one-step claimant independently observes its outgoing primitive Box"
+                        );
+                    }
                 }
             }
             if let Some(actual) = outgoing_error {
@@ -758,6 +1278,7 @@ impl LocalTaskRunner for SourceRunner {
                     outgoing_primitive,
                     primitive_owners: self.primitives.clone(),
                     last_primitive_candidate: self.last_primitive_candidate,
+                    locals: self.locals.take(),
                 })))
                 .unwrap();
             if self.plan.pause == Pause::Produced && !self.paused {
@@ -766,6 +1287,8 @@ impl LocalTaskRunner for SourceRunner {
         } else if self.plan.pause == Pause::Running
             && !self.paused
             && self.inner.interpreter.steps > 0
+            && (!self.plan.local_mode
+                || self.locals.as_ref().is_some_and(|proof| proof.peak_env > 0))
         {
             self.pause(Pause::Running, None);
         }
@@ -846,6 +1369,7 @@ fn spawn_source(
                     errors: Vec::new(),
                     primitives: Vec::new(),
                     last_primitive_candidate: None,
+                    locals: plan.local_mode.then(LocalSourceProof::default),
                     buffers,
                     witness: tx,
                     release: Some(release_rx),
@@ -1558,11 +2082,25 @@ fn err_source_receipt(
     let constructor = rx.recv_timeout(WAIT).unwrap();
     let mut proof = None;
     let mut other = Vec::new();
-    for _ in 0..4 {
+    let mut progress_popped = 0;
+    for _ in 0..if plan.pressure_mode { 100_000 } else { 4 } {
         match rx.recv_timeout(WAIT).unwrap() {
             Witness::Finished(actual) => {
                 proof = Some(*actual);
                 break;
+            }
+            Witness::LocalProgress {
+                popped,
+                calls,
+                boxes,
+            } => {
+                assert!(
+                    plan.pressure_mode && popped > progress_popped,
+                    "pressure progress comes only from real completed dispatch work"
+                );
+                assert!(calls <= MAX_CALL_DEPTH);
+                assert!(boxes <= calls * 4 + 3);
+                progress_popped = popped;
             }
             event => other.push(event),
         }
@@ -2660,6 +3198,7 @@ fn spawn_primitive_child(
                     errors: Vec::new(),
                     primitives: Vec::new(),
                     last_primitive_candidate: None,
+                    locals: plan.local_mode.then(LocalSourceProof::default),
                     witness: tx,
                     release: Some(release_rx),
                     paused: false,
@@ -2747,5 +3286,343 @@ fn pure_scalar_fresh_child_uses_charged_root_and_real_box_budget() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn claimed_async_scalar_locals_clone_actual_resident_boxes_and_false_buffers_across_chunks() {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        for error in [false, true] {
+            let leaf = if error {
+                "err(text)".to_string()
+            } else {
+                format!("ok({literal})")
+            };
+            for helper in [false, true] {
+                let dependency = if helper {
+                    format!("fn Child(text: str): {ty}! {{ r: {ty}! = {leaf}\nr\nr\nr = r\nreturn r }}\n")
+                } else {
+                    String::new()
+                };
+                let rhs = if helper {
+                    "Child(text)".to_string()
+                } else {
+                    leaf.clone()
+                };
+                let source = format!("{dependency}async fn Entry(text: str): {ty}! {{ r: {ty}! = {rhs}\nr\nr\nr = r\nreturn r }}");
+                let declarations = functions(&source);
+                assert!(code::eligible_claimed_async_owned_scalar_result_entry(
+                    &declarations,
+                    &declarations["Entry"],
+                    Limits::default()
+                ));
+                CodeHandle::compile_claimed_async_owned_scalar_result_entry(
+                    &declarations,
+                    &declarations["Entry"],
+                    Limits::default(),
+                )
+                .unwrap();
+                for chunk in [1, 7, 256] {
+                    let (text, buffer) = string_input(TEXT, 4096);
+                    let (proof, events, result) =
+                        err_source_receipt(&source, vec![text], vec![buffer], Plan::local(chunk));
+                    assert!(events.is_empty());
+                    let result = result.unwrap();
+                    let actual = primitive_payload(&result).unwrap();
+                    if error {
+                        let Value::Result { value, .. } = &result else {
+                            unreachable!()
+                        };
+                        let Value::Object(fields) = value.as_ref() else {
+                            unreachable!()
+                        };
+                        assert!(
+                            matches!(fields.get("domain"), Some(Value::String(domain)) if domain == "ku")
+                        );
+                        assert!(
+                            matches!(fields.get("code"), Some(Value::String(code)) if code == "err")
+                        );
+                        assert!(
+                            matches!(fields.get("message"), Some(Value::String(message)) if message == TEXT)
+                        );
+                        assert_ne!(
+                            actual.error.unwrap().buffers[5].0,
+                            buffer.pointer,
+                            "source err clones the original message before local clones"
+                        );
+                    } else {
+                        assert_eq!(actual.scalar, Some(expected_scalar(kind)));
+                    }
+                    assert_eq!(proof.outgoing_primitive, Some(actual));
+                    assert_eq!(proof.calls, if helper { 2 } else { 1 });
+                    assert_eq!(proof.peak_strings, buffer.capacity);
+                    assert_eq!(proof.peak_boxes, 2);
+                    assert_eq!(proof.peak_box_bytes, 2 * std::mem::size_of::<Value>());
+                    let local = proof.locals.as_ref().unwrap();
+                    if chunk == 1 {
+                        assert!(local.peak_env >= 1 && local.peak_live >= 1);
+                        assert_eq!(local.last_candidate, Some(actual));
+                        assert_eq!(local.distinct_clones, if helper { 8 } else { 4 });
+                        assert_eq!(local.peak_live, 2);
+                        assert!(local.budget_checks > 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn unlimited_source_local_policy() -> AwaitPayloadPolicy {
+    AwaitPayloadPolicy {
+        max_count: usize::MAX,
+        max_bytes: usize::MAX,
+        input_string_capacity: 0,
+        span: Span::default(),
+    }
+}
+
+#[test]
+fn claimed_async_scalar_local_clone_exact_budgets_one_short_and_actual_map_peak_preserve_source() {
+    for (_, ty, literal) in ASYNC_PRIMITIVES {
+        for error in [false, true] {
+            let leaf = if error {
+                "err(text)".to_string()
+            } else {
+                format!("ok({literal})")
+            };
+            let source =
+                format!("async fn Entry(text: str): {ty}! {{ r: {ty}! = {leaf}\nreturn r }}");
+            for fault in [Fault::None, Fault::LocalCloneCount, Fault::LocalCloneBytes] {
+                let (text, buffer) = string_input(TEXT, 4096);
+                let mut plan = Plan::local(1);
+                plan.fault = fault;
+                let (proof, events, result) =
+                    err_source_receipt(&source, vec![text], vec![buffer], plan);
+                assert!(events.is_empty());
+                let local = proof.locals.as_ref().unwrap();
+                assert!(local.budget_checks > 0);
+                assert_eq!(proof.calls, 1);
+                assert_eq!(proof.peak_strings, buffer.capacity);
+                if fault != Fault::None {
+                    assert!(result.unwrap_err().message.contains(
+                        if fault == Fault::LocalCloneCount {
+                            "FrameLimit"
+                        } else {
+                            "StorageLimit"
+                        }
+                    ));
+                    assert_eq!(
+                        proof.peak_boxes, 1,
+                        "failed clone admission never allocates its Result Box"
+                    );
+                    assert!(proof.outgoing_primitive.is_none());
+                    assert!(local.clone_source.is_some() && local.clone_source_unchanged);
+                    continue;
+                }
+                let source_value = result.unwrap();
+                let original = primitive_payload(&source_value).unwrap();
+                let mut observed = AwaitPayloadCharge::default();
+                let (candidate, fee) = clone_selected_scalar_result(
+                    &source_value,
+                    unlimited_source_local_policy(),
+                    &mut observed,
+                )
+                .unwrap();
+                let actual = primitive_payload(&candidate).unwrap();
+                distinct_local_source_clone(original, actual);
+                assert_eq!(fee, AwaitPayloadCharge::for_value(&candidate, 0).unwrap());
+                assert_eq!(observed, fee);
+                drop(candidate);
+                for reason in [None, Some("FrameLimit"), Some("StorageLimit")] {
+                    let policy = AwaitPayloadPolicy {
+                        max_count: fee.count - usize::from(reason == Some("FrameLimit")),
+                        max_bytes: fee.bytes - usize::from(reason == Some("StorageLimit")),
+                        ..unlimited_source_local_policy()
+                    };
+                    let mut observed = AwaitPayloadCharge::default();
+                    let cloned = clone_selected_scalar_result(&source_value, policy, &mut observed);
+                    if let Some(reason) = reason {
+                        assert!(cloned
+                            .expect_err("one-short real clone quota rejects")
+                            .message
+                            .contains(reason));
+                        assert_eq!(observed.box_count, 0);
+                    } else {
+                        let (candidate, charge) = cloned.unwrap();
+                        distinct_local_source_clone(
+                            original,
+                            primitive_payload(&candidate).unwrap(),
+                        );
+                        assert_eq!(charge, fee);
+                        assert_eq!(observed, fee);
+                        drop(candidate);
+                    }
+                    assert_eq!(primitive_payload(&source_value), Some(original),
+                        "successful, rejected and dropped actual candidates preserve the resident source");
+                }
+            }
+        }
+    }
+    // A private genuine sparse Map exercises actual capacity after its clone.
+    // This does not claim source err naturally allocates this sparse shape.
+    let mut fields = HashMap::with_capacity(128);
+    fields.insert("domain".to_string(), Value::String("ku".to_string()));
+    fields.insert("code".to_string(), Value::String("err".to_string()));
+    fields.insert("message".to_string(), Value::String(TEXT.to_string()));
+    let source = Value::Result {
+        ok: false,
+        value: Box::new(Value::Object(fields)),
+    };
+    let original = primitive_payload(&source).unwrap();
+    let minimum = planned_local_clone_charge(&source).unwrap();
+    let mut observed = AwaitPayloadCharge::default();
+    let (candidate, actual) =
+        clone_selected_scalar_result(&source, unlimited_source_local_policy(), &mut observed)
+            .unwrap();
+    distinct_local_source_clone(original, primitive_payload(&candidate).unwrap());
+    assert!(actual.count > minimum.count && actual.bytes > minimum.bytes);
+    drop(candidate);
+    for (count, bytes, reason) in [
+        (minimum.count, usize::MAX, "FrameLimit"),
+        (usize::MAX, minimum.bytes, "StorageLimit"),
+    ] {
+        let mut observed = AwaitPayloadCharge::default();
+        let result = clone_selected_scalar_result(
+            &source,
+            AwaitPayloadPolicy {
+                max_count: count,
+                max_bytes: bytes,
+                ..unlimited_source_local_policy()
+            },
+            &mut observed,
+        );
+        assert!(result
+            .expect_err("the actual cloned Map exceeds its planned minimum")
+            .message
+            .contains(reason));
+        assert_eq!((observed.box_count, observed.box_bytes), (0, 0));
+        assert_eq!(
+            (observed.error_leaf_count, observed.error_leaf_bytes),
+            (actual.error_leaf_count, actual.error_leaf_bytes),
+            "a rejected real Map records its peak without inventing a Result Box"
+        );
+        assert_eq!(primitive_payload(&source), Some(original));
+    }
+}
+
+#[test]
+fn claimed_async_scalar_local_unknown_null_and_whole_tree_fallback_keep_original_ability() {
+    let source = "async fn Entry(text: str, value: float): float! { r: float! = ok(value)\nr\nr\nr = r\nreturn r }";
+    let unknown = crate::stdlib::array::eval("first", &[Value::Array(Vec::new())], Span::default())
+        .unwrap()
+        .expect("registered array.first yields its real Unknown Null");
+    let (text, buffer) = string_input(TEXT, 4096);
+    let (proof, _, result) =
+        err_source_receipt(source, vec![text, unknown], vec![buffer], Plan::local(1));
+    let actual = primitive_payload(&result.unwrap()).unwrap();
+    assert_eq!(
+        actual.scalar,
+        Some(ScalarLeaf::Null),
+        "declared Float never coerces an actual Unknown Null"
+    );
+    assert_eq!(proof.locals.as_ref().unwrap().distinct_clones, 4);
+    assert_eq!(proof.locals.as_ref().unwrap().last_candidate, Some(actual));
+    let complete = format!("{source}\nfn RequireNull(value): null! {{ if (value == null) {{ return ok(null) }}\nreturn err(\"Unknown local changed\") }}\nasync fn main(): null! {{ items = []\nunknown = array.first(items)\nactual = (await Entry(\"text\", unknown))?\nRequireNull(actual)?\nreturn ok(null) }}");
+    let program = Parser::new(Lexer::new(&complete).tokenize().unwrap())
+        .parse_program()
+        .unwrap();
+    crate::checker::Checker::new().check(&program).unwrap();
+    crate::cli::run_source("claimed-async-local-unknown-null.ku", &complete).unwrap();
+    for (_, ty, literal) in ASYNC_PRIMITIVES {
+        for negative in [
+            format!("fn Pass(value: {ty}!): {ty}! {{ return value }}\nasync fn Entry(text: str): {ty}! {{ r: {ty}! = ok({literal})\nreturn Pass(r) }}"),
+            format!("async fn Entry(text: str): {ty}! {{ r: {ty}! = ok({literal})\nreturn ok(r?) }}"),
+            format!("async fn Entry(text: str): {ty}! {{ r: {ty}! = ok({literal})\ntry {{ marker = 1 }} catch (e) {{ marker = 2 }}\nreturn r }}"),
+            format!("async fn Entry(text: str): {ty}! {{ r: {ty}! = ok({literal})\nfn Local(): {ty}! {{ return r.clone() }}\nreturn Local() }}"),
+            format!("async fn Child(text: str): {ty}! {{ return ok({literal}) }}\nasync fn Entry(text: str): {ty}! {{ r: {ty}! = ok({literal})\nchild = Child(text)\nreturn await child }}"),
+            format!("async fn Entry(text: str): {ty}! {{ r: {ty}! = ok({literal})\nother: str! = ok(text)\nreturn r }}"),
+        ] {
+            let declarations = functions(&negative);
+            assert!(!code::eligible_claimed_async_owned_scalar_result_entry(&declarations,
+                &declarations["Entry"], Limits::default()), "{negative}");
+            assert!(matches!(CodeHandle::compile_claimed_async_owned_scalar_result_entry(&declarations,
+                &declarations["Entry"], Limits::default()), Err(AdmissionError::Unsupported(_))), "{negative}");
+            let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+            let (text, buffer) = string_input(TEXT, 4096);
+            let mut plan = Plan::local(1);
+            plan.selection_only = true;
+            let (task, rx, _) = spawn_source(&runtime, &negative, vec![text], vec![buffer], plan);
+            entered(&task, &rx, false, false);
+            assert_eq!(task.await_result().unwrap(), Value::Null);
+            release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+            close(&runtime);
+        }
+        // An ordinary legal fallback executes the complete body, rather than
+        // returning the selection-only fixture's intentional Null sentinel.
+        let legacy_source = format!("async fn Entry(text: str): {ty}! {{ r: {ty}! = ok({literal})\ntry {{ marker = 1 }} catch (e) {{ marker = 2 }}\nr\nr = r\nreturn r }}");
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        let mut host = production_interpreter(&legacy_source);
+        host.task_runtime = Some(runtime.clone());
+        let (text, _) = string_input(TEXT, 4096);
+        let Value::Task(task) = host
+            .call_function("Entry", vec![text], Span::default(), 0)
+            .unwrap()
+        else {
+            panic!("ordinary async fallback creates its real Task")
+        };
+        let result = task.await_result().unwrap();
+        assert_eq!(
+            primitive_payload(&result).unwrap().scalar,
+            Some(expected_scalar(
+                ASYNC_PRIMITIVES
+                    .iter()
+                    .find(|(_, name, _)| *name == ty)
+                    .unwrap()
+                    .0
+            ))
+        );
+        release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+        close(&runtime);
+    }
+    for syntax in ["[1, 2]", "{answer: 7}"] {
+        let opaque = if syntax.starts_with('[') {
+            Value::Array(vec![Value::Int(1), Value::Int(2)])
+        } else {
+            Value::Object(HashMap::from([("answer".to_string(), Value::Int(7))]))
+        };
+        let unknown =
+            crate::stdlib::array::eval("first", &[Value::Array(vec![opaque])], Span::default())
+                .unwrap()
+                .expect("registered array.first preserves its opaque Unknown owner");
+        let original = opaque_identity(&unknown);
+        let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+        let mut host = production_interpreter(source);
+        host.task_runtime = Some(runtime.clone());
+        host.async_execution = true;
+        let (text, buffer) = string_input(TEXT, 4096);
+        let inner = ClaimedNamedTask::new(
+            host,
+            functions(source)["Entry"].clone(),
+            vec![text, unknown],
+            Span::default(),
+        );
+        assert!(inner.machine.is_none());
+        let (_, args) = inner.legacy.as_ref().unwrap();
+        assert_eq!(opaque_identity(&args[1]), original);
+        assert!(
+            matches!(&args[0], Value::String(text) if text.as_ptr() as usize == buffer.pointer && text.capacity() == buffer.capacity)
+        );
+        assert_eq!(
+            (inner.interpreter.steps, inner.interpreter.call_depth),
+            (0, 0)
+        );
+        drop(inner);
+        close(&runtime);
+        let complete = format!("{source}\nasync fn main(): null! {{ items = []\nitems = array.push(items, {syntax})\nunknown = array.first(items)\nactual = await Entry(\"text\", unknown)\nreturn ok(null) }}");
+        let program = Parser::new(Lexer::new(&complete).tokenize().unwrap())
+            .parse_program()
+            .unwrap();
+        crate::checker::Checker::new().check(&program).unwrap();
+        crate::cli::run_source("claimed-async-local-unknown-opaque.ku", &complete).unwrap();
     }
 }

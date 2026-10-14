@@ -4385,13 +4385,13 @@ impl Machine {
         {
             return;
         }
-        // Admission permits only synchronous selected scalar Result locals;
-        // Result parameters/captures/arguments and uncharged dependencies stay
-        // excluded before cached ID reuse. Every
-        // real selected owner at a stable boundary is an operand, outgoing
-        // primary, saved finally primary, or ticket. Only finish_with owns an
-        // operation-local outcome; its sole charge stays in escrow until emit
-        // or physical Drop, including the outer native catch boundary.
+        // Admission permits selected scalar Result locals in synchronous and
+        // charged async functions. Result parameters/captures/arguments and
+        // uncharged dependencies stay excluded before cached ID reuse. Every
+        // real selected owner at a stable boundary is an Env binding, operand,
+        // outgoing primary, saved finally primary, or ticket. Only finish_with
+        // owns an operation-local outcome; its sole charge stays in escrow
+        // until emit or physical Drop, including the outer native catch boundary.
         let value_charge = |value: &Value| match value {
             Value::Result { value: inner, .. }
                 if matches!(

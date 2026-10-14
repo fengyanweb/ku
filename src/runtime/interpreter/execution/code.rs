@@ -764,7 +764,12 @@ impl<'a> FunctionSpec<'a> {
     }
 
     fn stores_scalar_result(self) -> bool {
-        matches!(self.role, FunctionRole::OwnedScalarResultNamed)
+        matches!(
+            self.role,
+            FunctionRole::OwnedScalarResultNamed
+                | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
+                | FunctionRole::AsyncOwnedScalarResultDependency
+        )
     }
 
     fn check_scalar_local_kind(self, kind: PrimitiveResultKind, span: Span) -> Admission<()> {
@@ -1264,13 +1269,15 @@ struct ExpressionMode {
     // Only the root expression of a charged owned Result terminal relay.
     // Arguments and nested operands always clear this permission.
     terminal_result: bool,
-    // Only a synchronous selected local's complete RHS. Arguments and nested
-    // builtin operands clear this permission; it is not a Result parameter.
+    // Only a selected scalar Result local's complete RHS. A direct await is
+    // checked against the current charged async declaration and static callee.
+    // Arguments and nested builtin operands clear this permission.
     local_scalar_result: Option<PrimitiveResultKind>,
     // Only the direct Result operand of ? in the new borrowed Result role.
     // A helper or ordinary call site cannot reuse this callee permission.
     unwrap_borrowed_result: bool,
-    // Only the static Call immediately consumed by a charged terminal await.
+    // Only the static Call immediately consumed by a charged terminal await
+    // or the complete RHS of a selected scalar Result local.
     // Nested argument/operand expressions never inherit this permission.
     owned_async_call: bool,
 }
@@ -1582,13 +1589,22 @@ impl<'a> Builder<'a> {
         &mut self,
         expr: &'a Expr,
         kind: PrimitiveResultKind,
+        spec: FunctionSpec<'a>,
     ) -> Admission<ExprId> {
         if is_ok_call(expr) {
             self.terminal_ok(expr, false, false, Some(kind))
         } else if is_err_call(expr) {
             self.terminal_err(expr)
         } else {
-            expect_kind(self.kind(expr)?, ValueKind::ScalarResult(kind), expr.span)?;
+            if let ExprKind::Await(task) = &expr.kind {
+                if !spec.is_claimed_async_owned_result() {
+                    return Err(AdmissionError::Unsupported(expr.span));
+                }
+                spec.check_scalar_local_kind(kind, expr.span)?;
+                spec.check_terminal_owned_await(task, self.source)?;
+            } else {
+                expect_kind(self.kind(expr)?, ValueKind::ScalarResult(kind), expr.span)?;
+            }
             self.expression_with_mode(
                 expr,
                 ExpressionMode {
@@ -1870,7 +1886,10 @@ impl<'a> Builder<'a> {
                     ExprKind::Await(task) => {
                         expect_kind(self.kind(task)?, ValueKind::Task, task.span)?;
                         if spec.is_claimed_async_owned_result() {
-                            if !mode.terminal_result || !matches!(task.kind, ExprKind::Call { .. })
+                            let selected_local = spec.stores_scalar_result()
+                                && mode.local_scalar_result == spec.owned_scalar_result_kind();
+                            if !(mode.terminal_result || selected_local)
+                                || !matches!(task.kind, ExprKind::Call { .. })
                             {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
@@ -2137,7 +2156,7 @@ impl<'a> Builder<'a> {
                     );
                     return Ok(StmtCode::VarDecl(
                         self.symbol(name, span)?,
-                        self.local_scalar_result_expression(value, kind)?,
+                        self.local_scalar_result_expression(value, kind, spec)?,
                         *mutable,
                     ));
                 }
@@ -2186,7 +2205,7 @@ impl<'a> Builder<'a> {
                     );
                     return Ok(StmtCode::Assign(
                         self.symbol(name, span)?,
-                        self.local_scalar_result_expression(value, kind)?,
+                        self.local_scalar_result_expression(value, kind, spec)?,
                     ));
                 }
                 if spec.borrows_strings()
@@ -2439,6 +2458,7 @@ impl<'a> Eligibility<'a> {
         &mut self,
         expr: &'a Expr,
         kind: PrimitiveResultKind,
+        spec: FunctionSpec<'a>,
     ) -> Admission<()> {
         let builtin = if is_ok_call(expr) {
             Some(("ok", ValueKind::Scalar))
@@ -2457,7 +2477,15 @@ impl<'a> Eligibility<'a> {
             self.spend(1, expr.span)?;
             self.expression(argument, true)
         } else {
-            expect_kind(self.kind(expr)?, ValueKind::ScalarResult(kind), expr.span)?;
+            if let ExprKind::Await(task) = &expr.kind {
+                if !spec.is_claimed_async_owned_result() {
+                    return Err(AdmissionError::Unsupported(expr.span));
+                }
+                spec.check_scalar_local_kind(kind, expr.span)?;
+                spec.check_terminal_owned_await(task, self.source)?;
+            } else {
+                expect_kind(self.kind(expr)?, ValueKind::ScalarResult(kind), expr.span)?;
+            }
             self.expression_with_mode(
                 expr,
                 ExpressionMode {
@@ -2559,7 +2587,7 @@ impl<'a> Eligibility<'a> {
                                             span,
                                         ),
                                     );
-                                    self.local_scalar_result_expression(value, kind)?;
+                                    self.local_scalar_result_expression(value, kind, spec)?;
                                     continue;
                                 }
                                 if !(scalar_type(ty) || (spec.owns_strings() && string_type(ty))) {
@@ -2598,7 +2626,7 @@ impl<'a> Eligibility<'a> {
                                         &mut self.pending,
                                         Scan::Bind(name, true, ValueKind::ScalarResult(kind), span),
                                     );
-                                    self.local_scalar_result_expression(value, kind)?;
+                                    self.local_scalar_result_expression(value, kind, spec)?;
                                     continue;
                                 }
                                 if spec.borrows_strings()
@@ -2842,7 +2870,9 @@ impl<'a> Eligibility<'a> {
                         ExprKind::Await(task) => {
                             expect_kind(self.kind(task)?, ValueKind::Task, task.span)?;
                             if spec.is_claimed_async_owned_result() {
-                                if !mode.terminal_result
+                                let selected_local = spec.stores_scalar_result()
+                                    && mode.local_scalar_result == spec.owned_scalar_result_kind();
+                                if !(mode.terminal_result || selected_local)
                                     || !matches!(task.kind, ExprKind::Call { .. })
                                 {
                                     return Err(AdmissionError::Unsupported(expr.span));
@@ -3143,5 +3173,54 @@ mod typed_result_cache_tests {
             assert!(eligibility.checked.get(0).unwrap().1 == contract);
         }
         assert_eq!(source, source_before);
+
+        for (ty, literal) in [
+            ("int", "17"),
+            ("float", "2.5"),
+            ("bool", "true"),
+            ("null", "null"),
+        ] {
+            let locals = functions(&format!(
+                "fn Shared(n: int): {ty}! {{ r: {ty}! = ok({literal})\nr\nr = r\nreturn r }}\nasync fn Child(n: int): {ty}! {{ r: {ty}! = ok({literal})\nr\nr = r\nreturn r }}\nasync fn AsyncShared(n: int): {ty}! {{ saved: {ty}! = Shared(n)\nr: {ty}! = await Child(n)\nr\nr = r\nreturn r }}"
+            ));
+            let before = locals.clone();
+            let root =
+                FunctionSpec::claimed_async_owned_scalar_result_entry(&locals["AsyncShared"]);
+            let dependency = root.owned_async_dependency(&locals["AsyncShared"]).unwrap();
+            let old = FunctionSpec::claimed_async_entry(&locals["AsyncShared"]);
+            let mut builder = Builder::new(&locals, None, limits);
+            let id = builder.ensure_function(root).unwrap();
+            assert_eq!(builder.ensure_function(dependency).unwrap(), id);
+            assert_eq!(builder.arena.functions.len(), 1);
+            assert!(matches!(
+                builder.ensure_function(old),
+                Err(AdmissionError::Unsupported(_))
+            ));
+            assert_eq!(builder.arena.functions.len(), 1);
+            // Registration has queued only this root. Compile its real body
+            // before asserting that the synchronous and async dependencies
+            // were discovered, while retaining the cached root identity.
+            let compiled = builder.compile(Some(root)).unwrap();
+            assert_eq!(compiled.0.functions.len(), 3);
+            assert_eq!(compiled.find_function("AsyncShared"), Some(id));
+            for name in ["AsyncShared", "Shared", "Child"] {
+                let function = compiled.function(compiled.find_function(name).unwrap());
+                assert_eq!(
+                    function.owned_scalar_result,
+                    root.owned_scalar_result_kind()
+                );
+            }
+            let mut eligibility = Eligibility::new(&locals, None, limits);
+            eligibility.function(root).unwrap();
+            eligibility.function(dependency).unwrap();
+            assert_eq!(eligibility.checked.len(), 1);
+            assert!(matches!(
+                eligibility.function(old),
+                Err(AdmissionError::Unsupported(_))
+            ));
+            assert_eq!(eligibility.checked.len(), 1);
+            eligibility.check(root).unwrap();
+            assert_eq!(locals, before);
+        }
     }
 }

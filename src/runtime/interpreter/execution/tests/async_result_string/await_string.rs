@@ -114,6 +114,7 @@ struct AwaitOptions {
     pause: AwaitPause,
     replacement: Option<TaskHandle>,
     source_fault: Fault,
+    local_mode: bool,
 }
 
 impl AwaitOptions {
@@ -124,6 +125,14 @@ impl AwaitOptions {
             pause: AwaitPause::None,
             replacement: None,
             source_fault: Fault::None,
+            local_mode: false,
+        }
+    }
+
+    fn local(chunk: usize) -> Self {
+        Self {
+            local_mode: true,
+            ..Self::normal(chunk)
         }
     }
 }
@@ -139,6 +148,14 @@ enum AwaitWitness {
     ReadyNative(Payload),
     ReadyPaused(Payload),
     CancelTargetReleased(CancellationContext),
+    LocalReady {
+        env: Vec<PrimitivePayload>,
+        live: Vec<PrimitivePayload>,
+        ticket: PrimitivePayload,
+        cached: AwaitPayloadCharge,
+        stable: AwaitPayloadCharge,
+    },
+    LocalBound(PrimitivePayload),
 }
 
 struct AwaitRunner {
@@ -149,6 +166,7 @@ struct AwaitRunner {
     paused: bool,
     adjusted: bool,
     yielded_span: Option<SpanId>,
+    local_tickets: Vec<(PrimitivePayload, bool)>,
 }
 
 fn base_storage(machine: &Machine) -> (usize, usize) {
@@ -270,7 +288,19 @@ impl LocalTaskRunner for AwaitRunner {
                     // production operation does, so failure reaches the ticket
                     // pre-take policy rather than an earlier Vec reservation.
                     machine.reserve_values(1, Span::default()).unwrap();
-                    let (count, bytes) = base_storage(machine);
+                    let (mut count, mut bytes) = base_storage(machine);
+                    if self.options.local_mode {
+                        // The actual parent Env remains live; the child slot is
+                        // still child-owned and is not yet a parent payload.
+                        observe_source_locals(
+                            machine,
+                            &self.inner.buffers,
+                            self.inner.locals.as_mut().unwrap(),
+                        );
+                        local_source_budget_entries(machine, &self.inner.buffers);
+                        count += machine.result_wrapper_capacity + machine.error_leaf_capacity;
+                        bytes += machine.result_wrapper_bytes + machine.error_leaf_bytes;
+                    }
                     if self.options.fault == AwaitFault::CountBeforeTake {
                         machine.value_limits.max_frames = count;
                     } else {
@@ -285,16 +315,51 @@ impl LocalTaskRunner for AwaitRunner {
                 .and_then(|frame| frame.ticket.test_outcome())
             {
                 let actual = payload(value);
-                if let Some(owner) = primitive_payload(value) {
-                    if !self
-                        .inner
-                        .primitives
-                        .iter()
-                        .any(|old| old.boxed == owner.boxed)
-                    {
-                        self.inner.last_primitive_candidate = Some(owner);
-                        self.inner.primitives.push(owner);
+                if !self.options.local_mode {
+                    if let Some(owner) = primitive_payload(value) {
+                        if !self
+                            .inner
+                            .primitives
+                            .iter()
+                            .any(|old| old.boxed == owner.boxed)
+                        {
+                            self.inner.last_primitive_candidate = Some(owner);
+                            self.inner.primitives.push(owner);
+                        }
                     }
+                }
+                if self.options.local_mode {
+                    let census = observe_source_locals(
+                        machine,
+                        &self.inner.buffers,
+                        self.inner.locals.as_mut().unwrap(),
+                    );
+                    assert!(
+                        !census.env.is_empty(),
+                        "the real parent keep is live while the child ticket is ready"
+                    );
+                    assert_eq!(census.ticket, Some(primitive_from_ticket(actual)));
+                    self.local_tickets
+                        .push((primitive_from_ticket(actual), false));
+                    local_source_budget_entries(machine, &self.inner.buffers);
+                    self.inner.locals.as_mut().unwrap().budget_checks += 1;
+                    self.events
+                        .send(AwaitWitness::LocalReady {
+                            env: census.env,
+                            live: census.live,
+                            ticket: primitive_from_ticket(actual),
+                            cached: machine.await_payload_snapshot,
+                            stable: AwaitPayloadCharge {
+                                count: machine.result_wrapper_capacity
+                                    + machine.error_leaf_capacity,
+                                bytes: machine.result_wrapper_bytes + machine.error_leaf_bytes,
+                                box_count: machine.result_wrapper_capacity,
+                                box_bytes: machine.result_wrapper_bytes,
+                                error_leaf_count: machine.error_leaf_capacity,
+                                error_leaf_bytes: machine.error_leaf_bytes,
+                            },
+                        })
+                        .unwrap();
                 }
                 let measured = charge(actual);
                 let ticket = &machine.awaiting.as_ref().unwrap().ticket;
@@ -358,6 +423,29 @@ impl LocalTaskRunner for AwaitRunner {
             .and_then(|outcome| outcome.as_ref().err())
             .and_then(KuError::runtime_termination);
         let result = self.inner.dispatch(budget);
+        if self.options.local_mode {
+            if let (Some(machine), Some(proof)) =
+                (&self.inner.inner.machine, self.inner.locals.as_mut())
+            {
+                let census = observe_source_locals(machine, &self.inner.buffers, proof);
+                for (ticket, bound) in &mut self.local_tickets {
+                    if let Some(actual) =
+                        census.env.iter().find(|owner| owner.boxed == ticket.boxed)
+                    {
+                        if !*bound {
+                            assert_eq!(*actual, *ticket,
+                                "the actual child slot/Ready payload moves through the operand into the parent's real Env without changing its Box or backing");
+                            *bound = true;
+                            self.events.send(AwaitWitness::LocalBound(*actual)).unwrap();
+                        }
+                    }
+                }
+            }
+            if self.options.chunk == 1 && matches!(&result, ControlFlow::Break(Ok(_))) {
+                assert!(self.local_tickets.iter().all(|(_, bound)| *bound),
+                    "every normally accepted local-await ticket was independently read from its real Env binding");
+            }
+        }
         if let Some(context) = cancelled_ticket {
             if self
                 .inner
@@ -440,12 +528,17 @@ fn spawn_await(
                         inner,
                         plan: Plan {
                             fault: options.source_fault,
-                            ..Plan::normal(options.chunk)
+                            ..if options.local_mode {
+                                Plan::local(options.chunk)
+                            } else {
+                                Plan::normal(options.chunk)
+                            }
                         },
                         boxes: vec![None; buffers.len()],
                         errors: Vec::new(),
                         primitives: Vec::new(),
                         last_primitive_candidate: None,
+                        locals: options.local_mode.then(LocalSourceProof::default),
                         buffers,
                         witness: tx,
                         release: Some(inner_release),
@@ -460,6 +553,7 @@ fn spawn_await(
                     paused: false,
                     adjusted: false,
                     yielded_span: None,
+                    local_tickets: Vec::new(),
                 }
             }
         })
@@ -486,6 +580,17 @@ fn ticket_events(rx: &mpsc::Receiver<AwaitWitness>) -> Vec<Payload> {
                 None
             }
             AwaitWitness::FreshRetired => None,
+            AwaitWitness::LocalReady {
+                env,
+                live,
+                ticket,
+                cached,
+                stable,
+            } => {
+                assert_local_ready_snapshot(&env, &live, ticket, cached, stable);
+                None
+            }
+            AwaitWitness::LocalBound(_) => None,
             _ => panic!("unexpected controlled await event"),
         })
         .collect()
@@ -2030,4 +2135,671 @@ fn primitive_terminal_await_legal_whole_tree_and_cached_kind_rejections_keep_leg
         .unwrap();
     crate::checker::Checker::new().check(&program).unwrap();
     crate::cli::run_source("async-primitive-strict-unsupported-legacy.ku", &complete).unwrap();
+}
+
+fn local_await_receipt(
+    source: &str,
+    args: Vec<Value>,
+    buffers: Vec<Buffer>,
+    chunk: usize,
+) -> (Finished, Vec<Payload>, KuResult<Value>) {
+    let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
+    let (task, rx, events, _) =
+        spawn_await(&runtime, source, args, buffers, AwaitOptions::local(chunk));
+    // Receive the real worker's constructor and completion before host await
+    // can help the task. This is the actual selected claimant, not a helper
+    // that runs an equivalent source on the test thread.
+    entered(&task, &rx, true, false);
+    let proof = finished(&rx);
+    let result = task.await_result();
+    release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+    close(&runtime);
+    (proof, ticket_events(&events), result)
+}
+
+fn primitive_from_ticket(actual: Payload) -> PrimitivePayload {
+    PrimitivePayload {
+        boxed: actual.boxed,
+        scalar: actual.scalar,
+        error: (actual.error_count > 0).then_some(ErrorPayload {
+            boxed: actual.boxed,
+            entries: actual.map_entries,
+            buffers: actual.map_buffers,
+            count: actual.error_count,
+            bytes: actual.error_bytes,
+        }),
+    }
+}
+
+fn assert_local_ready_snapshot(
+    env: &[PrimitivePayload],
+    live: &[PrimitivePayload],
+    ticket: PrimitivePayload,
+    cached: AwaitPayloadCharge,
+    stable: AwaitPayloadCharge,
+) -> AwaitPayloadCharge {
+    assert!(live.contains(&ticket));
+    assert!(env.iter().all(|owner| live.contains(owner)));
+    assert!(
+        env.iter().all(|owner| owner.boxed != ticket.boxed),
+        "the unconsumed Ready ticket and real Env bindings own different simultaneously live boxes"
+    );
+    let physical = live
+        .iter()
+        .filter(|owner| owner.boxed != ticket.boxed)
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(stable, sum_payload_charge(primitive_totals(&physical), cached),
+        "raw fields and metrics keep their cached ticket subtotal while the independent physical census sees Ready");
+    let actual = primitive_totals(live);
+    assert_eq!(actual, sum_payload_charge(primitive_totals(&physical), primitive_charge(ticket)),
+        "the four live budget entrypoints substitute the real Ready Box/map fee for the cached subtotal");
+    actual
+}
+
+fn local_body(ty: &str, rhs: &str, name: &str) -> String {
+    format!("{name}: {ty}! = {rhs}\n{name}\n{name}\n{name} = {name}\nreturn {name}")
+}
+
+fn local_child_source(ty: &str, literal: &str, error: bool) -> String {
+    let leaf = if error {
+        "err(text)".to_string()
+    } else {
+        format!("ok({literal})")
+    };
+    format!(
+        "async fn Child(text: str): {ty}! {{ {} }}\nasync fn Entry(text: str): {ty}! {{ keep: {ty}! = ok({literal})\n{} }}",
+        local_body(ty, &leaf, "child"),
+        local_body(ty, "await Child(text)", "result")
+    )
+}
+
+fn assert_local_leaf(result: &Value, expected: ScalarLeaf, error: bool, message: &str) {
+    let actual = payload(result);
+    if error {
+        let Value::Result { ok: false, value } = result else {
+            panic!("the typed local preserves the source false Result")
+        };
+        let Value::Object(fields) = value.as_ref() else {
+            unreachable!()
+        };
+        assert!(matches!(fields.get("domain"), Some(Value::String(value)) if value == "ku"));
+        assert!(matches!(fields.get("code"), Some(Value::String(value)) if value == "err"));
+        assert!(matches!(fields.get("message"), Some(Value::String(value)) if value == message));
+        assert!(actual.scalar.is_none());
+        assert!(actual.error_count >= 3 && actual.error_bytes > 0);
+    } else {
+        assert_eq!(actual.scalar, Some(expected));
+        assert_eq!((actual.error_count, actual.error_bytes), (0, 0));
+    }
+}
+
+fn assert_local_publication(proof: &Finished, result: &Value, chunk: usize) {
+    let locals = proof
+        .locals
+        .as_ref()
+        .expect("the independent local owner census");
+    assert!(locals.peak_env > 0);
+    assert!(locals.peak_live >= 2);
+    assert!(locals.budget_checks > 0);
+    if chunk == 1 {
+        assert!(locals.clone_source_unchanged);
+        assert_eq!(
+            locals.last_candidate,
+            primitive_payload(result),
+            "the last separately observed value-stack clone is the published Box; no outgoing-value backfill"
+        );
+        assert!(locals.distinct_clones >= 3);
+    }
+}
+
+#[test]
+fn async_primitive_locals_fresh_await_pre_take_and_finally_keep_actual_env_and_ticket_owners() {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        for error in [false, true] {
+            let source = local_child_source(ty, literal, error);
+            for chunk in [1, 7, 256] {
+                let (text, buffer) = string_input(TEXT, 4096);
+                let (proof, tickets, result) =
+                    local_await_receipt(&source, vec![text], vec![buffer], chunk);
+                let result = result.unwrap();
+                assert_local_leaf(&result, expected_scalar(kind), error, TEXT);
+                assert_eq!(tickets.len(), 1);
+                assert_local_publication(&proof, &result, chunk);
+                if chunk == 1 {
+                    assert!(
+                        proof.locals.as_ref().unwrap().peak_env >= 2,
+                        "keep and the actual awaited local coexist in the parent Env"
+                    );
+                }
+            }
+
+            // Retain only this explicit diagnostic slot owner for pre-take
+            // refusal; cancellation/retirement probes below use no Task clone.
+            let child_leaf = if error {
+                "err(text)".to_string()
+            } else {
+                format!("ok({literal})")
+            };
+            let child_source = format!(
+                "async fn Entry(text: str): {ty}! {{ {} }}",
+                local_body(ty, &child_leaf, "result")
+            );
+            for fault in [AwaitFault::CountBeforeTake, AwaitFault::BytesBeforeTake] {
+                let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
+                let (text, buffer) = string_input(TEXT, 4096);
+                let (child, child_rx, _) = spawn_source(
+                    &runtime,
+                    &child_source,
+                    vec![text],
+                    vec![buffer],
+                    Plan::local(1),
+                );
+                entered(&child, &child_rx, true, false);
+                finished(&child_rx);
+                let end = Instant::now() + WAIT;
+                while !matches!(child.status(), "completed" | "panicked") {
+                    assert!(
+                        Instant::now() < end,
+                        "finite actual local child publication"
+                    );
+                    std::thread::yield_now();
+                }
+                let original = slot_payload(&child).unwrap();
+                let diagnostic = child.clone();
+                let (text, buffer) = string_input(TEXT, 4096);
+                let mut options = AwaitOptions::local(1);
+                options.replacement = Some(child);
+                options.fault = fault;
+                let (task, rx, events, _) =
+                    spawn_await(&runtime, &source, vec![text], vec![buffer], options);
+                entered(&task, &rx, true, false);
+                let proof = finished(&rx);
+                let result = task.await_result();
+                let retained = slot_payload(&diagnostic);
+                release_task(task, CancellationContext::new(TerminationReason::Cancelled));
+                release_task(
+                    diagnostic,
+                    CancellationContext::new(TerminationReason::Cancelled),
+                );
+                close(&runtime);
+                assert_eq!(retained, Some(original),
+                    "pre-take refusal preserves the exact child Box, scalar/Map capacity and all six buffers");
+                assert!(result.unwrap_err().message.contains(
+                    if fault == AwaitFault::CountBeforeTake {
+                        "FrameLimit"
+                    } else {
+                        "StorageLimit"
+                    }
+                ));
+                assert_eq!(proof.locals.as_ref().unwrap().peak_env, 1);
+                assert_eq!(proof.peak_boxes, 1,
+                    "the real parent keep is charged while the unaccepted child slot remains child-owned");
+                assert!(ticket_events(&events).is_empty());
+            }
+        }
+
+        for (errors, owners) in [
+            ([false, false, false], 2),
+            ([true, false, true], 3),
+            ([true, true, false], 2),
+            ([false, true, false], 2),
+        ] {
+            let mut children = String::new();
+            for (index, name) in ["First", "Second", "Third"].into_iter().enumerate() {
+                let leaf = if errors[index] {
+                    "err(text)".to_string()
+                } else {
+                    format!("ok({literal})")
+                };
+                children.push_str(&format!(
+                    "async fn {name}(text: str): {ty}! {{ {} }}\n",
+                    local_body(ty, &leaf, "child")
+                ));
+            }
+            let second = local_body(ty, "await Second(second)", "replacement");
+            let replacement = if owners == 2 {
+                format!("keep_second: {ty}! = ok({literal})\n{second}")
+            } else {
+                format!("keep_second: {ty}! = ok({literal})\ntry {{ {second} }} finally {{ keep_third: {ty}! = ok({literal})\n{} }}",
+                    local_body(ty, "await Third(third)", "last"))
+            };
+            let source = format!("{children}async fn Entry(first: str, second: str, third: str): {ty}! {{ keep: {ty}! = ok({literal})\ntry {{ {} }} finally {{ {replacement} }}\nreturn ok({literal}) }}",
+                local_body(ty, "await First(first)", "primary"));
+            for chunk in [1, 7, 256] {
+                let (a, first) = string_input("中\0primary", 1024);
+                let (b, second) = string_input("é\0replacement", 4096);
+                let (c, third) = string_input(TEXT, 2048);
+                let (proof, tickets, result) =
+                    local_await_receipt(&source, vec![a, b, c], vec![first, second, third], chunk);
+                let result = result.unwrap();
+                assert_eq!(tickets.len(), owners);
+                assert_eq!(proof.finally, owners - 1);
+                assert_local_leaf(
+                    &result,
+                    expected_scalar(kind),
+                    errors[owners - 1],
+                    [first.text, second.text, third.text][owners - 1],
+                );
+                assert_local_publication(&proof, &result, chunk);
+                if chunk == 1 {
+                    assert!(proof.locals.as_ref().unwrap().peak_env >= 2);
+                    assert!(proof.locals.as_ref().unwrap().peak_live >= owners + 2,
+                        "real Env locals, saved Q primaries and replacement ticket/candidate coexist");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn async_primitive_locals_single_worker_real_64_65_and_512_513_keep_all_four_kinds() {
+    assert_eq!(crate::runtime::task::MAX_AWAIT_DEPTH, 64);
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        for error in [false, true] {
+            let leaf = if error {
+                "err(text)".to_string()
+            } else {
+                format!("ok({literal})")
+            };
+            for mutual in [false, true] {
+                let branch = |next: &str| {
+                    format!(
+                        "keep: {ty}! = ok({literal})\nif (n <= 0) {{ {} }}\n{}",
+                        local_body(ty, &leaf, "terminal"),
+                        local_body(ty, &format!("await {next}(text, n - 1)"), "result")
+                    )
+                };
+                let other = if mutual {
+                    format!(
+                        "async fn Other(text: str, n: int): {ty}! {{ {} }}\n",
+                        branch("Entry")
+                    )
+                } else {
+                    String::new()
+                };
+                let source = format!(
+                    "{other}async fn Entry(text: str, n: int): {ty}! {{ {} }}",
+                    branch(if mutual { "Other" } else { "Entry" })
+                );
+                for n in [64, 65] {
+                    let (text, buffer) = string_input(TEXT, 4096);
+                    let (proof, tickets, result) =
+                        local_await_receipt(&source, vec![text, Value::Int(n)], vec![buffer], 1);
+                    let result = result.unwrap();
+                    assert_eq!(tickets.len(), 1);
+                    assert_eq!((proof.calls, proof.peak_calls), (1, 1));
+                    if n == 64 {
+                        assert_local_leaf(&result, expected_scalar(kind), error, TEXT);
+                    } else {
+                        assert_await_depth(&result, n);
+                    }
+                    assert_local_publication(&proof, &result, 1);
+                    assert!(proof.locals.as_ref().unwrap().peak_env >= 2);
+                }
+            }
+            let source = format!(
+                "async fn Child(text: str): {ty}! {{ {} }}\nasync fn Entry(text: str, n: int): {ty}! {{ keep: {ty}! = ok({literal})\nif (n <= 0) {{ {} }}\n{} }}",
+                local_body(ty, &leaf, "child"), local_body(ty, "await Child(text)", "terminal"),
+                local_body(ty, "await Entry(text, n - 1)", "result"));
+            for n in [63, 64] {
+                let (text, buffer) = string_input(TEXT, 4096);
+                let (proof, tickets, result) =
+                    local_await_receipt(&source, vec![text, Value::Int(n)], vec![buffer], 1);
+                let result = result.unwrap();
+                assert_eq!(tickets.len(), 1);
+                if n == 63 {
+                    assert_local_leaf(&result, expected_scalar(kind), error, TEXT);
+                } else {
+                    assert_await_depth(&result, n);
+                }
+                assert_local_publication(&proof, &result, 1);
+            }
+
+            // Entry contributes one real call, so Relay(n=510) contributes
+            // the remaining 511 calls. Every call retains its own actual
+            // success keep Box before descending; the leaf is reached only
+            // after all 512 boxes are simultaneously resident in real Envs.
+            let source = format!(
+                "fn Relay(text: str, n: int): {ty}! {{ keep: {ty}! = ok({literal})\nif (n <= 0) {{ {} }}\n{} }}\nasync fn Entry(text: str, n: int): {ty}! {{ keep: {ty}! = ok({literal})\n{} }}",
+                local_body(ty, &leaf, "terminal"), local_body(ty, "Relay(text, n - 1)", "result"),
+                local_body(ty, "Relay(text, n)", "result"));
+            for n in [510, 511] {
+                let (text, buffer) = string_input(TEXT, 4096);
+                let (proof, events, result) = err_source_receipt(
+                    &source,
+                    vec![text, Value::Int(n)],
+                    vec![buffer],
+                    Plan::local_pressure(1),
+                );
+                assert!(events.is_empty());
+                assert_eq!((proof.calls, proof.peak_calls), (512, 512));
+                let locals = proof.locals.as_ref().unwrap();
+                assert!(
+                    locals.peak_env >= 512,
+                    "the independent census sees 512 real resident keep owners"
+                );
+                assert!(locals.budget_checks > 0);
+                if n == 510 {
+                    let result = result.unwrap();
+                    assert_local_leaf(&result, expected_scalar(kind), error, TEXT);
+                    assert_local_publication(&proof, &result, 1);
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().code.as_deref(),
+                        Some("call_depth_exceeded")
+                    );
+                    assert_eq!(
+                        proof.peak_errors, 0,
+                        "the rejected first 513th call never executes err(text)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn async_primitive_locals_waiting_ready_late_and_native_preserve_first_cause_and_retire_real_owners(
+) {
+    for (kind, ty, literal) in ASYNC_PRIMITIVES {
+        for error in [false, true] {
+            let source = local_child_source(ty, literal, error);
+            // A queued factory owns real producer inputs but has not entered
+            // the function body, so it cannot yet own an Env Result. Hold the
+            // sole worker and verify actual factory destruction and G1/G2
+            // retirement before releasing it for the healthy next claimant.
+            let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+            let (held_tx, held_rx) = mpsc::channel();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let held = runtime
+                .spawn(move || {
+                    ready_tx.send(()).unwrap();
+                    held_rx.recv_timeout(WAIT).expect("finite real held worker");
+                    Ok(Value::Null)
+                })
+                .unwrap();
+            ready_rx.recv_timeout(WAIT).unwrap();
+            let (text, buffer) = string_input(TEXT, 4096);
+            let (queued, queued_rx, _) =
+                spawn_source(&runtime, &source, vec![text], vec![buffer], Plan::local(1));
+            assert_eq!(runtime.snapshot().unwrap().queued_tasks, 1);
+            let original = CancellationContext::new(TerminationReason::TimedOut);
+            assert!(queued.request_cancel_with(original));
+            assert!(
+                !queued.request_cancel_with(CancellationContext {
+                    reason: TerminationReason::Cancelled,
+                    cleanup_deadline: original.cleanup_deadline - Duration::from_millis(100),
+                }),
+                "the queued owner has already synchronously retired and cannot restart"
+            );
+            assert!(matches!(queued_rx.recv_timeout(WAIT), Err(mpsc::RecvTimeoutError::Disconnected)),
+                "the original queued source factory and its producer inputs physically drop with zero constructor/body effects");
+            assert_eq!(
+                queued.await_result().unwrap_err().runtime_termination(),
+                Some(original)
+            );
+            release_task(queued, original);
+            assert_eq!(runtime.snapshot().unwrap().queued_tasks, 0);
+            held_tx.send(()).unwrap();
+            assert_eq!(held.await_result().unwrap(), Value::Null);
+            release_task(held, CancellationContext::new(TerminationReason::Cancelled));
+            let (text, buffer) = string_input(TEXT, 4096);
+            let (healthy, healthy_rx, healthy_events, _) = spawn_await(
+                &runtime,
+                &source,
+                vec![text],
+                vec![buffer],
+                AwaitOptions::local(1),
+            );
+            entered(&healthy, &healthy_rx, true, false);
+            let proof = finished(&healthy_rx);
+            let result = healthy.await_result().unwrap();
+            assert_local_leaf(&result, expected_scalar(kind), error, TEXT);
+            assert_local_publication(&proof, &result, 1);
+            release_task(
+                healthy,
+                CancellationContext::new(TerminationReason::Cancelled),
+            );
+            assert_eq!(ticket_events(&healthy_events).len(), 1);
+            close(&runtime);
+            for fault in [AwaitFault::NativeReady, AwaitFault::None] {
+                let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
+                let (text, buffer) = string_input(TEXT, 4096);
+                let mut options = AwaitOptions::local(1);
+                options.fault = fault;
+                if fault == AwaitFault::None {
+                    options.pause = AwaitPause::Ready;
+                }
+                let (task, rx, events, release) =
+                    spawn_await(&runtime, &source, vec![text], vec![buffer], options);
+                entered(&task, &rx, true, false);
+                let mut observed = Vec::new();
+                let mut checkpoint = None;
+                for _ in 0..4 {
+                    let event = events.recv_timeout(WAIT).unwrap();
+                    let ready = match &event {
+                        AwaitWitness::ReadyNative(actual) | AwaitWitness::ReadyPaused(actual) => {
+                            Some(*actual)
+                        }
+                        _ => None,
+                    };
+                    observed.push(event);
+                    if ready.is_some() {
+                        checkpoint = ready;
+                        break;
+                    }
+                }
+                let checkpoint =
+                    checkpoint.expect("finite actual Ready checkpoint with a live parent keep");
+                if error {
+                    assert!(checkpoint.error_count >= 3);
+                } else {
+                    assert_eq!(checkpoint.scalar, Some(expected_scalar(kind)));
+                }
+                let original = CancellationContext::new(TerminationReason::TimedOut);
+                let shorter = CancellationContext {
+                    reason: TerminationReason::Cancelled,
+                    cleanup_deadline: original.cleanup_deadline - Duration::from_millis(100),
+                };
+                let expected = CancellationContext {
+                    reason: original.reason,
+                    cleanup_deadline: shorter.cleanup_deadline,
+                };
+                let cancelled_proof = if fault == AwaitFault::None {
+                    assert!(task.request_cancel_with(original));
+                    assert!(!task.request_cancel_with(shorter));
+                    release.send(()).unwrap();
+                    Some(finished(&rx))
+                } else {
+                    None
+                };
+                let result = task.await_result();
+                release_task(
+                    task,
+                    if fault == AwaitFault::None {
+                        expected
+                    } else {
+                        original
+                    },
+                );
+                let mut ticket = None;
+                let mut ready_env = None;
+                let mut ready_charge = None;
+                let mut bound = Vec::new();
+                for event in observed.into_iter().chain(events.try_iter()) {
+                    match event {
+                        AwaitWitness::Ticket { actual, cached } => {
+                            assert_eq!(cached, AwaitPayloadCharge::default());
+                            ticket = Some(actual);
+                        }
+                        AwaitWitness::Child(witness) => {
+                            retired(TaskRetirementBatch::from_reserved(
+                                vec![witness],
+                                if fault == AwaitFault::None {
+                                    expected
+                                } else {
+                                    original
+                                },
+                            ))
+                        }
+                        AwaitWitness::ReadyNative(_) | AwaitWitness::ReadyPaused(_) => {}
+                        AwaitWitness::LocalReady {
+                            env,
+                            live,
+                            ticket,
+                            cached,
+                            stable,
+                        } => {
+                            let actual =
+                                assert_local_ready_snapshot(&env, &live, ticket, cached, stable);
+                            assert_eq!(env.len(), 1, "the independent Env census reads the source's one actual keep before Ready transfer");
+                            assert_eq!(env[0].scalar, Some(expected_scalar(kind)));
+                            assert_eq!(primitive_from_ticket(checkpoint), ticket);
+                            assert_eq!(actual.box_count, env.len() + 1,
+                                "the independent physical census charges keep and the separate Ready Box");
+                            ready_env = Some(env);
+                            ready_charge = Some(actual);
+                        }
+                        AwaitWitness::LocalBound(actual) => bound.push(actual),
+                        AwaitWitness::CancelTargetReleased(context) => {
+                            assert_eq!(context, expected)
+                        }
+                        _ => panic!("only actual Ready native/cancellation events"),
+                    }
+                }
+                assert_eq!(ticket, Some(checkpoint));
+                let ready_env = ready_env
+                    .expect("the real Ready checkpoint includes an independent parent Env census");
+                let ready_charge = ready_charge.unwrap();
+                if fault == AwaitFault::None {
+                    assert_eq!(bound.as_slice(), &[primitive_from_ticket(checkpoint)],
+                        "Ready cancellation observes the same actual child payload entering the real result local before teardown");
+                    let proof = cancelled_proof.unwrap();
+                    assert_eq!(
+                        proof.locals.as_ref().unwrap().peak_env,
+                        ready_env.len() + bound.len(),
+                        "the measured keep and actual bound Ready owner explain the Env peak"
+                    );
+                    assert!(proof.peak_boxes >= ready_charge.box_count);
+                    assert!(proof.peak_box_bytes >= ready_charge.box_bytes);
+                    assert!(proof.peak_errors >= ready_charge.error_leaf_count);
+                    assert!(proof.peak_error_bytes >= ready_charge.error_leaf_bytes);
+                    assert_eq!(result.unwrap_err().runtime_termination(), Some(expected));
+                } else {
+                    assert!(bound.is_empty(), "native Ready abandonment drops the actual ticket before any binding transfer");
+                    let Value::Result { ok: false, value } = result.unwrap() else {
+                        panic!("native task panic Result")
+                    };
+                    let Value::Object(fields) = *value else {
+                        unreachable!()
+                    };
+                    assert!(
+                        matches!(fields.get("code"), Some(Value::String(code)) if code == "panic")
+                    );
+                }
+                // The next claimant runs on this same sole actual worker.
+                let (text, buffer) = string_input(TEXT, 4096);
+                let (healthy, healthy_rx, healthy_events, _) = spawn_await(
+                    &runtime,
+                    &source,
+                    vec![text],
+                    vec![buffer],
+                    AwaitOptions::local(1),
+                );
+                entered(&healthy, &healthy_rx, true, false);
+                let proof = finished(&healthy_rx);
+                let healthy_result = healthy.await_result().unwrap();
+                assert_local_leaf(&healthy_result, expected_scalar(kind), error, TEXT);
+                assert_local_publication(&proof, &healthy_result, 1);
+                release_task(
+                    healthy,
+                    CancellationContext::new(TerminationReason::Cancelled),
+                );
+                assert_eq!(ticket_events(&healthy_events).len(), 1);
+                close(&runtime);
+            }
+
+            // A real local-owning child is paused either while its Env is
+            // running or after its result is produced on its runner stack.
+            // Transfer its sole Task owner; retain only retirement metadata.
+            for stage in [Pause::Running, Pause::Produced] {
+                let runtime = TaskRuntime::with_limits(2, 128, 0, 0, 128);
+                let leaf = if error {
+                    "err(text)".to_string()
+                } else {
+                    format!("ok({literal})")
+                };
+                let child_source = format!(
+                    "async fn Entry(text: str): {ty}! {{ {} }}",
+                    local_body(ty, &leaf, "result")
+                );
+                let (text, child_buffer) = string_input(TEXT, 4096);
+                let mut plan = Plan::local(1);
+                plan.pause = stage;
+                let (child, child_rx, child_release) = spawn_source(
+                    &runtime,
+                    &child_source,
+                    vec![text],
+                    vec![child_buffer],
+                    plan,
+                );
+                entered(&child, &child_rx, true, false);
+                let child_proof = if stage == Pause::Produced {
+                    Some(finished(&child_rx))
+                } else {
+                    None
+                };
+                assert!(
+                    matches!(child_rx.recv_timeout(WAIT).unwrap(), Witness::Paused { stage: actual, .. } if actual == stage)
+                );
+                if let Some(proof) = &child_proof {
+                    assert!(proof.locals.as_ref().unwrap().peak_env > 0);
+                }
+                let witness = child.retirement_witness();
+                let (text, buffer) = string_input(TEXT, 4096);
+                let mut options = AwaitOptions::local(1);
+                options.replacement = Some(child);
+                options.pause = AwaitPause::Waiting;
+                let (task, rx, events, release) =
+                    spawn_await(&runtime, &source, vec![text], vec![buffer], options);
+                entered(&task, &rx, true, false);
+                assert!(matches!(
+                    events.recv_timeout(WAIT).unwrap(),
+                    AwaitWitness::FreshRetired
+                ));
+                assert!(matches!(
+                    events.recv_timeout(WAIT).unwrap(),
+                    AwaitWitness::Waiting
+                ));
+                let original = CancellationContext::new(TerminationReason::TimedOut);
+                let shorter = CancellationContext {
+                    reason: TerminationReason::Cancelled,
+                    cleanup_deadline: original.cleanup_deadline - Duration::from_millis(100),
+                };
+                let expected = CancellationContext {
+                    reason: original.reason,
+                    cleanup_deadline: shorter.cleanup_deadline,
+                };
+                assert!(task.request_cancel_with(original));
+                assert!(!task.request_cancel_with(shorter));
+                release.send(()).unwrap();
+                assert!(
+                    matches!(events.recv_timeout(WAIT).unwrap(), AwaitWitness::CancelTargetReleased(actual) if actual == expected)
+                );
+                child_release.send(()).unwrap();
+                let proof = finished(&rx);
+                let result = task.await_result();
+                release_task(task, expected);
+                retired(TaskRetirementBatch::from_reserved(vec![witness], expected));
+                close(&runtime);
+                assert_eq!(result.unwrap_err().runtime_termination(), Some(expected));
+                assert_eq!(proof.locals.as_ref().unwrap().peak_env, 1);
+                assert_eq!(
+                    proof.peak_boxes, 1,
+                    "late child payload never becomes an extra parent-owned Box"
+                );
+            }
+        }
+    }
 }

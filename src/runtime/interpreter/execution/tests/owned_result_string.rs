@@ -3765,7 +3765,15 @@ fn selected_scalar_local_operation_clone_native_poison_first_cause_tls_and_unkno
         ] {
             let functions = functions(&negative); let entry = &functions["Entry"];
             assert!(matches!(CodeHandle::compile_owned_named(&functions, entry, Limits::default()), Err(AdmissionError::Unsupported(_))), "{negative}");
-            if entry.is_async { assert!(matches!(CodeHandle::compile_claimed_async_owned_scalar_result_entry(&functions, entry, Limits::default()), Err(AdmissionError::Unsupported(_)))); }
+            if entry.is_async {
+                // Charged async locals are now admitted by S8. The same tree
+                // must still reject the synchronous and uncharged roles.
+                let charged = CodeHandle::compile_claimed_async_owned_scalar_result_entry(&functions, entry, Limits::default()).unwrap();
+                let function = charged.function(charged.find_function("Entry").unwrap());
+                assert!(function.is_async);
+                assert_eq!(function.owned_scalar_result, Some(kind));
+                assert!(matches!(CodeHandle::compile_claimed_async_entry(&functions, entry, Limits::default()), Err(AdmissionError::Unsupported(_))));
+            }
             let mut host = production_interpreter(&negative); let (text, buffer) = string_input(PAYLOAD, 4096); let mut args = vec![text];
             assert!(try_execute_owned(&mut host, entry, &mut args, 0).is_none()); assert_eq!((host.steps, host.call_depth), (0, 0));
             assert!(matches!(&args[0], Value::String(text) if text.as_ptr() as usize == buffer.pointer && text.capacity() == buffer.capacity));
