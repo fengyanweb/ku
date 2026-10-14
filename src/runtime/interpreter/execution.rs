@@ -95,6 +95,8 @@ struct Metrics {
     retired_arguments_exits: usize,
     retained_string_payload_bytes: usize,
     peak_string_payload_bytes: usize,
+    retained_cloned_string_payload_bytes: usize,
+    peak_cloned_string_payload_bytes: usize,
     retained_result_wrapper_capacity: usize,
     retained_result_wrapper_bytes: usize,
     peak_result_wrapper_capacity: usize,
@@ -112,8 +114,9 @@ struct Metrics {
     lease_roots_created: usize,
     logical_depth: usize,
     // Source execution frame Vec backing only: calls/work/finally/values and
-    // staged arguments, selected input String buffers and admitted
-    // selected Result leaf Box<Value> payloads and selected await ErrorObject
+    // staged arguments, selected input String buffers, separately charged
+    // selected String Result clone buffers, admitted selected Result leaf
+    // Box<Value> payloads and selected await ErrorObject
     // public Map slots/key/value buffers. Other Value/Error payloads remain
     // outside this budget, as do syntax storage, source, Env/string keys and
     // allocator overhead. Summed peaks are not a
@@ -145,6 +148,14 @@ impl CallKind {
 /// A child task receives shared code; its machine is constructed by its claimant.
 trait ExecutionHooks {
     fn host(&mut self) -> &mut Interpreter;
+
+    // A private kernel capability, not a language or embedding API.
+    // The String-local slice relies on real fixed arbitration moving/dropping
+    // its incoming String, never replacing it with a freshly allocated one.
+    // Arbitrary hooks remain unsupported for this new slice.
+    fn supports_selected_string_origin_moves(&self) -> bool {
+        false
+    }
 
     fn prepare_scope_exit(&mut self, _env: &mut Env, _span: Span) -> KuResult<()> {
         Ok(())
@@ -247,6 +258,10 @@ trait ExecutionHooks {
 }
 
 impl ExecutionHooks for Interpreter {
+    fn supports_selected_string_origin_moves(&self) -> bool {
+        true
+    }
+
     fn host(&mut self) -> &mut Interpreter {
         self
     }
@@ -452,6 +467,12 @@ struct CallFrame {
     // introduce a selected Result owner; avoid locking every scalar/String
     // Env on each dispatch. Keep true conservatively until this frame drops.
     has_selected_result_bindings: bool,
+    // S9 alone admits successful String Result locals. The old simple
+    // collector and its poison contract stay active for every other frame.
+    has_selected_string_result_bindings: bool,
+    // False means a full census confirmed no bare/success String owner.
+    // Every possible owned String write sets true before transferring value.
+    may_have_string_owner_bindings: bool,
     leases: Vec<BorrowLease>,
     charged_lease_capacity: usize,
     charged_lease_root_bytes: usize,
@@ -532,6 +553,7 @@ enum Work {
     Statement(StmtId),
     Eval(ExprId),
     CloneSelectedScalarResult(SymbolId, SpanId),
+    CloneSelectedStringResult(SymbolId, SpanId),
     SelfCallee(SpanId),
     Unary(UnaryOp, SpanId),
     BinaryLeft(BinaryOp, ExprId, SpanId),
@@ -620,6 +642,62 @@ enum ChunkProgress {
     },
 }
 
+#[derive(Clone, Copy)]
+struct OriginalString {
+    pointer: usize,
+    capacity: usize,
+    // Absence from eligible bare/success String owners permanently ends credit.
+    // False ErrorMap buffers are charged independently.
+    // Zero-capacity Strings have no allocated buffer and need no origin exemption.
+    still_live: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct StringOwnerCensus {
+    original_seen: bool,
+    cloned_bytes: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct StringCloneCharge {
+    payload: AwaitPayloadCharge,
+    string_bytes: usize,
+}
+
+fn selected_string_leaf(value: &Value) -> Option<&String> {
+    match value {
+        Value::String(text) => Some(text),
+        Value::Result { ok: true, value } => match value.as_ref() {
+            Value::String(text) => Some(text),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn selected_string_owner(
+    mut census: StringOwnerCensus,
+    value: &Value,
+    original: OriginalString,
+) -> StringOwnerCensus {
+    let Some(text) = selected_string_leaf(value) else {
+        return census;
+    };
+    if original.still_live
+        && original.capacity != 0
+        && text.as_ptr() as usize == original.pointer
+        && text.capacity() == original.capacity
+    {
+        census.original_seen = true;
+    } else {
+        census.cloned_bytes = census
+            .cloned_bytes
+            .checked_add(text.capacity())
+            .expect("admitted selected String payload backing");
+    }
+    census
+}
+
 struct Machine {
     // The suspended expression owns its sole target before outer call/argument
     // resources. No synchronous TLS guard lives in this checkpoint.
@@ -664,6 +742,10 @@ struct Machine {
     // separately charged ErrorObject, never to this original input pool.
     string_payload_bytes: usize,
     peak_string_payload_bytes: usize,
+    original_string: Option<OriginalString>,
+    string_origin_authorized: bool,
+    cloned_string_payload_bytes: usize,
+    peak_cloned_string_payload_bytes: usize,
     // Each selected direct ok owns one actual Box<Value>. Saved finally
     // primaries and replacements can coexist; relay moves create no box.
     result_wrapper_capacity: usize,
@@ -896,6 +978,77 @@ fn clone_selected_scalar_result(
     Ok((cloned, actual))
 }
 
+fn check_selected_string_clone_charge(
+    payload: AwaitPayloadCharge,
+    string_bytes: usize,
+    policy: AwaitPayloadPolicy,
+) -> KuResult<()> {
+    let bytes = payload
+        .bytes
+        .checked_add(string_bytes)
+        .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, policy.span))?;
+    check_selected_clone_charge(AwaitPayloadCharge { bytes, ..payload }, policy)
+}
+
+// Only the read-only source Value and copied quota enter the Env lock.
+// The new buffer is independently charged even while the original input
+// reservation has unused capacity. Its Box is allocated only after checking
+// the clone's real capacity.
+fn clone_selected_string_result(
+    source: &Value,
+    policy: AwaitPayloadPolicy,
+    observed: &mut StringCloneCharge,
+) -> KuResult<(Value, StringCloneCharge)> {
+    *observed = StringCloneCharge::default();
+    let Value::Result { ok, value: inner } = source else {
+        return Err(unsupported(policy.span));
+    };
+    if !*ok {
+        let mut payload = AwaitPayloadCharge::default();
+        let cloned = clone_selected_scalar_result(source, policy, &mut payload);
+        observed.payload = payload;
+        return cloned.map(|(value, payload)| {
+            let charge = StringCloneCharge {
+                payload,
+                string_bytes: 0,
+            };
+            (value, charge)
+        });
+    }
+    let Value::String(text) = inner.as_ref() else {
+        return Err(unsupported(policy.span));
+    };
+    let box_bytes = std::mem::size_of::<Value>();
+    let payload = AwaitPayloadCharge {
+        count: 1,
+        bytes: box_bytes,
+        box_count: 1,
+        box_bytes,
+        ..AwaitPayloadCharge::default()
+    };
+    // A clone has at least len bytes, but capacity is not guessed from it.
+    check_selected_string_clone_charge(payload, text.len(), policy)?;
+    let cloned = text.clone();
+    let string_bytes = cloned.capacity();
+    // Record the actual buffer even when its real capacity is rejected.
+    // No new Result Box exists at this point.
+    observed.string_bytes = string_bytes;
+    if let Err(error) = check_selected_string_clone_charge(payload, string_bytes, policy) {
+        drop(cloned);
+        return Err(error);
+    }
+    let value = Value::Result {
+        ok: true,
+        value: Box::new(Value::String(cloned)),
+    };
+    let charge = StringCloneCharge {
+        payload,
+        string_bytes,
+    };
+    *observed = charge;
+    Ok((value, charge))
+}
+
 // Consume an already allocated Result wrapper. Its Box allocation is freed
 // before this call returns, so the caller can retire that backing charge before
 // reserving another operand slot. Passing the payload alone loses this boundary.
@@ -1020,6 +1173,10 @@ impl Machine {
             peak_retirement_bytes: 0,
             string_payload_bytes: 0,
             peak_string_payload_bytes: 0,
+            original_string: None,
+            string_origin_authorized: false,
+            cloned_string_payload_bytes: 0,
+            peak_cloned_string_payload_bytes: 0,
             result_wrapper_capacity: 0,
             result_wrapper_bytes: 0,
             peak_result_wrapper_capacity: 0,
@@ -1358,6 +1515,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(self.cloned_string_payload_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         Ok(AwaitPayloadPolicy {
             max_count: self
@@ -1370,8 +1528,9 @@ impl Machine {
                 .max_storage_bytes
                 .checked_sub(bytes)
                 .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?,
-            // Every admitted String comes from this original input. Moving it
-            // through static children does not add a second buffer reservation.
+            // Await admission still accepts only original input-derived
+            // Strings. S9 disallows await; its local clone buffers are charged
+            // separately above and cannot borrow credit from this input pool.
             input_string_capacity: self.string_payload_bytes,
             span,
         })
@@ -1454,6 +1613,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_sub(self.exit_handle_bytes))
             .and_then(|bytes| bytes.checked_sub(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_sub(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_sub(self.cloned_string_payload_bytes))
             .and_then(|bytes| bytes.checked_sub(self.lease_bytes))
             .and_then(|bytes| bytes.checked_sub(self.lease_root_bytes))
             .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
@@ -1510,6 +1670,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(self.cloned_string_payload_bytes))
             .and_then(|bytes| bytes.checked_add(payload_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
@@ -1560,6 +1721,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(self.cloned_string_payload_bytes))
             .and_then(|bytes| bytes.checked_add(payload_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
@@ -1681,6 +1843,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(self.cloned_string_payload_bytes))
             .and_then(|bytes| bytes.checked_add(payload_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if bytes > self.value_limits.max_storage_bytes {
@@ -1743,18 +1906,28 @@ impl Machine {
         span: Span,
         include_empty: bool,
     ) -> KuResult<Option<AdmittedExitHandles>> {
-        let count = match self.frame().env.current_scope_simple_task_count(span) {
+        let frame = self.frame();
+        let count = match if frame.has_selected_string_result_bindings {
+            frame.env.current_scope_selected_string_task_count(span)
+        } else {
+            frame.env.current_scope_simple_task_count(span)
+        } {
             Ok(0) if !include_empty => return Ok(None),
             Err(_) => return Ok(None),
             Ok(count) => count,
         };
         let mut storage = self.exit_storage(count, span)?;
-        if self
-            .frame()
-            .env
-            .collect_current_scope_simple_tasks_reserved(&mut storage.handles, span)
-            .is_err()
-        {
+        let frame = self.frame();
+        let collected = if frame.has_selected_string_result_bindings {
+            frame
+                .env
+                .collect_current_scope_selected_string_tasks_reserved(&mut storage.handles, span)
+        } else {
+            frame
+                .env
+                .collect_current_scope_simple_tasks_reserved(&mut storage.handles, span)
+        };
+        if collected.is_err() {
             drop(storage);
             // A general or changed scope retains the original collector and
             // its original diagnostic/cleanup priority; it is not skipped.
@@ -1819,7 +1992,9 @@ impl Machine {
         // Selected Result locals need the explicit taskless teardown too:
         // the legacy collector cannot inspect a poisoned Result cell. Other
         // zero-Task scopes retain their original adapter and priority.
-        let include_empty = self.frame().has_selected_result_bindings;
+        let frame = self.frame();
+        let include_empty =
+            frame.has_selected_result_bindings || frame.has_selected_string_result_bindings;
         let admitted = hooks
             .prepare_scope_exit(&mut self.frame().env, source_span)
             .and_then(|()| self.scope_handles(source_span, include_empty));
@@ -2014,9 +2189,16 @@ impl Machine {
             }
             Err(mut error) => {
                 let needs_context = !matches!(
-                    self.frame()
-                        .env
-                        .current_scope_simple_task_count(source_span),
+                    {
+                        let frame = self.frame();
+                        if frame.has_selected_string_result_bindings {
+                            frame
+                                .env
+                                .current_scope_selected_string_task_count(source_span)
+                        } else {
+                            frame.env.current_scope_simple_task_count(source_span)
+                        }
+                    },
                     Ok(0),
                 ) || self
                     .frame()
@@ -2604,6 +2786,8 @@ impl Machine {
             CallFrame {
                 env,
                 has_selected_result_bindings: false,
+                has_selected_string_result_bindings: false,
+                may_have_string_owner_bindings: false,
                 leases,
                 charged_lease_capacity,
                 charged_lease_root_bytes: 0,
@@ -2669,6 +2853,9 @@ impl Machine {
                 owned_parameter_value(param, value, span)?
             };
             let param_span = self.code.span(param.span);
+            if self.original_string.is_some() && selected_string_leaf(&value).is_some() {
+                self.frame().may_have_string_owner_bindings = true;
+            }
             self.frame()
                 .env
                 .define_parameter(name, value, false, param_span)?;
@@ -2708,6 +2895,9 @@ impl Machine {
                 )?
             };
             let param_span = self.code.span(param.span);
+            if self.original_string.is_some() && selected_string_leaf(&value).is_some() {
+                self.frame().may_have_string_owner_bindings = true;
+            }
             self.frame()
                 .env
                 .define_parameter(name, value, false, param_span)?;
@@ -3024,6 +3214,17 @@ impl Machine {
                             Work::CloneSelectedScalarResult(name, expr.span),
                         );
                     }
+                    ExprCode::VariableSelectedStringResultClone(name) => {
+                        self.reserve_work(1, span)?;
+                        push(
+                            &mut self.work,
+                            Work::CloneSelectedStringResult(name, expr.span),
+                        );
+                    }
+                    ExprCode::SelectedStringResultCloneCall(target) => {
+                        self.reserve_work(1, span)?;
+                        push(&mut self.work, Work::Eval(target));
+                    }
                     ExprCode::StringBorrow(symbol) => self.borrow_string_argument(symbol, span)?,
                     ExprCode::StringLength {
                         symbol,
@@ -3281,11 +3482,20 @@ impl Machine {
             }
             Work::Bind(name, mutable, declare, span_id) => {
                 let value = self.value();
+                if self.original_string.is_some() && selected_string_leaf(&value).is_some() {
+                    self.frame().may_have_string_owner_bindings = true;
+                }
                 if matches!(value, Value::Result { .. }) {
                     // A sole remaining owner can now be in its Env cell.
                     // Keep the census active even after operand fees retire.
                     self.selected_error_payloads = true;
                     self.frame().has_selected_result_bindings = true;
+                    if self.original_string.is_some()
+                        && matches!(&value, Value::Result { ok: true, value }
+                            if matches!(value.as_ref(), Value::String(_)))
+                    {
+                        self.frame().has_selected_string_result_bindings = true;
+                    }
                 }
                 let span = self.code.span(span_id);
                 let name = self.code.symbol(name).to_string();
@@ -3331,6 +3541,52 @@ impl Machine {
                 if let Err(error) = self.reserve_error_candidate(previous, charge, span) {
                     drop(value);
                     self.restore_error_candidate(previous);
+                    return Err(error);
+                }
+                push(&mut self.values, value);
+            }
+            Work::CloneSelectedStringResult(name, span_id) => {
+                let span = self.code.span(span_id);
+                // This census runs before allocation and before taking the
+                // source lock. The source therefore remains alive throughout
+                // the only admitted new successful String allocation.
+                self.synchronize_result_wrapper_charge();
+                self.reserve_values(1, span)?;
+                let policy = self.await_payload_policy(span)?;
+                let previous = AwaitPayloadCharge {
+                    box_count: self.result_wrapper_capacity,
+                    box_bytes: self.result_wrapper_bytes,
+                    error_leaf_count: self.error_leaf_capacity,
+                    error_leaf_bytes: self.error_leaf_bytes,
+                    ..AwaitPayloadCharge::default()
+                };
+                let previous_strings = self.cloned_string_payload_bytes;
+                let frame = self
+                    .calls
+                    .get(self.calls.len() - 1)
+                    .expect("String Result clone source frame");
+                let mut observed = StringCloneCharge::default();
+                let cloned = frame
+                    .env
+                    .with_value(self.code.symbol(name), span, |source| {
+                        clone_selected_string_result(source, policy, &mut observed)
+                    });
+                // The actual rejected buffer/Map has already physically
+                // dropped. The source lock cannot reach Machine callbacks.
+                self.record_selected_clone_peak(previous, observed.payload);
+                self.peak_cloned_string_payload_bytes = self.peak_cloned_string_payload_bytes.max(
+                    previous_strings
+                        .checked_add(observed.string_bytes)
+                        .expect("admitted operation-local String clone backing"),
+                );
+                let (value, charge) = cloned?;
+                self.cloned_string_payload_bytes = previous_strings
+                    .checked_add(charge.string_bytes)
+                    .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+                if let Err(error) = self.reserve_error_candidate(previous, charge.payload, span) {
+                    drop(value);
+                    self.restore_error_candidate(previous);
+                    self.cloned_string_payload_bytes = previous_strings;
                     return Err(error);
                 }
                 push(&mut self.values, value);
@@ -3862,7 +4118,7 @@ impl Machine {
         if self.state == MachineState::Finished {
             self.prepare_next_run()?;
         }
-        self.start_owned_once(entry, args, depth, test_fuel)?;
+        self.start_owned_once_with_hooks(entry, args, depth, test_fuel, hooks)?;
         let budget = NonZeroUsize::new(256).expect("positive internal dispatch chunk budget");
         loop {
             match self.dispatch_chunk(budget, hooks)? {
@@ -3961,6 +4217,8 @@ impl Machine {
             || self.retirement_bytes != 0
             || self.entry_args.is_some()
             || self.string_payload_bytes != 0
+            || self.cloned_string_payload_bytes != 0
+            || self.original_string.is_some()
             || self.result_wrapper_capacity != 0
             || self.result_wrapper_bytes != 0
             || self.error_leaf_capacity != 0
@@ -3976,9 +4234,34 @@ impl Machine {
         }
         self.state = MachineState::Ready;
         self.selected_error_payloads = false;
+        self.string_origin_authorized = false;
         self.fallback_release.set(None);
         self.fallback_metadata = None;
         Ok(())
+    }
+
+    fn start_owned_once_with_hooks(
+        &mut self,
+        entry: &str,
+        args: &mut Vec<Value>,
+        depth: usize,
+        test_fuel: bool,
+        hooks: &impl ExecutionHooks,
+    ) -> KuResult<()> {
+        if self.code.has_actual_string_result_locals() {
+            // Validate before changing state or consuming any actual input.
+            // A failed opt-in leaves the caller's original Vec untouched.
+            if !hooks.supports_selected_string_origin_moves() {
+                let span = self
+                    .code
+                    .find_function(entry)
+                    .map(|id| self.code.span(self.code.function(id).span))
+                    .unwrap_or_default();
+                return Err(unsupported(span));
+            }
+            self.string_origin_authorized = true;
+        }
+        self.start_owned_once(entry, args, depth, test_fuel)
     }
 
     fn start_owned_once(
@@ -3990,6 +4273,14 @@ impl Machine {
     ) -> KuResult<()> {
         if self.state != MachineState::Ready {
             return Err(self.lifecycle_error("start owned"));
+        }
+        if self.code.has_actual_string_result_locals() && !self.string_origin_authorized {
+            let span = self
+                .code
+                .find_function(entry)
+                .map(|id| self.code.span(self.code.function(id).span))
+                .unwrap_or_default();
+            return Err(unsupported(span));
         }
         #[cfg(not(test))]
         let _ = test_fuel;
@@ -4005,15 +4296,30 @@ impl Machine {
         let admission = (|| {
             let function = function
                 .ok_or_else(|| KuError::runtime(format!("undefined function '{entry}'"), span))?;
+            let selected_strings = self.code.has_actual_string_result_locals();
+            if selected_strings && !self.code.uses_local_string_results(function) {
+                return Err(unsupported(span));
+            }
+            let mut original_string = None;
             let mut payload = 0usize;
             for value in args.iter() {
                 match value {
                     Value::String(text) => {
+                        if selected_strings {
+                            if original_string.is_some() {
+                                return Err(unsupported(span));
+                            }
+                            original_string = Some(OriginalString {
+                                pointer: text.as_ptr() as usize,
+                                capacity: text.capacity(),
+                                still_live: text.capacity() != 0,
+                            });
+                        }
                         payload = payload
                             .checked_add(text.capacity())
                             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?
                     }
-                    Value::Borrowed(view) if view.is_root_view() => {
+                    Value::Borrowed(view) if view.is_root_view() && !selected_strings => {
                         let capacity = view.with_read(span, |root| match root {
                             Value::String(text) => Ok(text.capacity()),
                             _ => Err(unsupported(span)),
@@ -4026,6 +4332,9 @@ impl Machine {
                     _ => return Err(unsupported(span)),
                 }
             }
+            if selected_strings && original_string.is_none() {
+                return Err(unsupported(span));
+            }
             // Include the original input Vec's actual capacity and all String
             // buffer capacity before transferring either into the Machine.
             self.string_payload_bytes = payload;
@@ -4033,6 +4342,7 @@ impl Machine {
                 self.string_payload_bytes = 0;
                 return Err(error);
             }
+            self.original_string = original_string;
             let capacity = args.capacity();
             self.argument_capacity += capacity;
             self.argument_bytes += capacity * std::mem::size_of::<Value>();
@@ -4056,6 +4366,7 @@ impl Machine {
             self.release_entry_args();
             self.pending = Some(Err(error));
         }
+        self.synchronize_result_wrapper_charge();
         self.snapshot_lease_metrics();
         Ok(())
     }
@@ -4102,6 +4413,14 @@ impl Machine {
         if self.state != MachineState::Ready {
             return Err(self.lifecycle_error("start"));
         }
+        if self.code.has_actual_string_result_locals() {
+            // This new graph needs an actual sole owned String input and
+            // pre-transfer hook authorization. Scalar/function-value starts
+            // cannot bypass that contract, even with the real Interpreter.
+            return Err(unsupported(
+                span_id.map(|id| self.code.span(id)).unwrap_or_default(),
+            ));
+        }
         #[cfg(not(test))]
         let _ = test_fuel;
         let span = span_id.map(|id| self.code.span(id)).unwrap_or_default();
@@ -4133,6 +4452,13 @@ impl Machine {
     ) -> KuResult<ChunkProgress> {
         if !matches!(self.state, MachineState::Running | MachineState::Waiting) {
             return Err(self.lifecycle_error("dispatch"));
+        }
+        if self.code.has_actual_string_result_locals()
+            && (!self.string_origin_authorized || !hooks.supports_selected_string_origin_moves())
+        {
+            // Prevent switching to an arbitrary replacement hook after a
+            // correctly authorized start. No Work/tick/destructor runs here.
+            return Err(unsupported(self.entry_span));
         }
         self.state = MachineState::Running;
         // One catch per chunk. The window stays outside it so native panic
@@ -4351,6 +4677,7 @@ impl Machine {
             + self.peak_exit_handle_bytes
             + self.peak_retirement_bytes
             + self.peak_string_payload_bytes
+            + self.peak_cloned_string_payload_bytes
             + self.peak_result_wrapper_bytes
             + self.peak_error_leaf_bytes
             + self.peak_lease_bytes
@@ -4370,13 +4697,97 @@ impl Machine {
         // Input-derived buffers have either been destroyed or moved into this
         // sole outgoing Flow. They are no longer retained by the Machine.
         self.string_payload_bytes = 0;
+        self.original_string = None;
+        self.cloned_string_payload_bytes = 0;
+        self.metrics.retained_cloned_string_payload_bytes = 0;
+        self.metrics.peak_cloned_string_payload_bytes = self.peak_cloned_string_payload_bytes;
         self.metrics.retained_string_payload_bytes = 0;
         self.metrics.peak_string_payload_bytes = self.peak_string_payload_bytes;
         self.state = MachineState::Finished;
         result
     }
 
+    fn synchronize_cloned_string_charge(&mut self) {
+        let Some(mut original) = self.original_string else {
+            return;
+        };
+        // The S9 graph has no captured Owned String/Result, borrow or await.
+        // Env folds copy metadata only, under one binding lock at a time.
+        let fold = |census, value: &Value| selected_string_owner(census, value, original);
+        let mut census = StringOwnerCensus::default();
+        for index in 0..self.calls.len() {
+            let frame = self.calls.get_mut(index).expect("live String owner frame");
+            if frame.may_have_string_owner_bindings {
+                let (actual, has_string) =
+                    frame
+                        .env
+                        .fold_owned_values((census, false), |(census, found), value| {
+                            (
+                                fold(census, value),
+                                found || selected_string_leaf(value).is_some(),
+                            )
+                        });
+                census = actual;
+                // Scan all owned scopes before clearing; zero-capacity
+                // Strings remain owners. Move/drop never clears eagerly.
+                frame.may_have_string_owner_bindings = has_string;
+            }
+        }
+        if let Some(args) = &self.entry_args {
+            for value in args {
+                census = fold(census, value);
+            }
+        }
+        for value in self.values.as_slice() {
+            census = fold(census, value);
+        }
+        for step in self.work.as_slice() {
+            if let Work::ArgumentsExit(arguments) = step {
+                for value in &arguments.staged {
+                    census = fold(census, value);
+                }
+            }
+        }
+        fn flow_value(result: &KuResult<Flow>) -> Option<&Value> {
+            match result {
+                Ok(Flow::Return { value, .. } | Flow::Fail { value, .. }) => Some(value),
+                _ => None,
+            }
+        }
+        if let Some(value) = self.pending.as_ref().and_then(flow_value) {
+            census = fold(census, value);
+        }
+        for exit in self.exits.as_slice() {
+            if let Some(value) = exit.state.outcome().and_then(flow_value) {
+                census = fold(census, value);
+            }
+            if let ExitCompletion::Arguments { frame, .. } = &exit.completion {
+                for value in &frame.staged {
+                    census = fold(census, value);
+                }
+            }
+        }
+        for frame in self.finally.frames.as_slice() {
+            if let Some(value) = frame.primary.as_ref().and_then(flow_value) {
+                census = fold(census, value);
+            }
+        }
+        // Under the explicitly authorized fixed move/drop hooks, the only
+        // new successful buffer allocation is the clone continuation above,
+        // whose immediately preceding census proves the source is alive.
+        // Allocation inside arbitrary replacement hooks is not admitted.
+        original.still_live &= census.original_seen;
+        self.original_string = Some(original);
+        self.cloned_string_payload_bytes = census.cloned_bytes;
+        self.peak_cloned_string_payload_bytes = self
+            .peak_cloned_string_payload_bytes
+            .max(census.cloned_bytes);
+        self.metrics.retained_cloned_string_payload_bytes = census.cloned_bytes;
+        self.metrics.peak_cloned_string_payload_bytes = self.peak_cloned_string_payload_bytes;
+    }
+
     fn synchronize_result_wrapper_charge(&mut self) {
+        self.synchronize_cloned_string_charge();
         let ephemeral = self.live_await_payload_charge();
         if self.result_wrapper_capacity == 0
             && self.error_leaf_capacity == 0
@@ -4425,11 +4836,30 @@ impl Machine {
         let mut retained = ephemeral;
         for frame in self.calls.as_slice() {
             if frame.has_selected_result_bindings {
-                retained = sum_payload_charge(retained, frame.env.selected_scalar_result_charge());
+                let charge = if frame.has_selected_string_result_bindings {
+                    frame.env.selected_string_result_charge()
+                } else {
+                    frame.env.selected_scalar_result_charge()
+                };
+                retained = sum_payload_charge(retained, charge);
             }
         }
         for value in self.values.as_slice() {
             retained = sum_payload_charge(retained, value_charge(value));
+        }
+        if self.original_string.is_some() {
+            if let Some(args) = &self.entry_args {
+                for value in args {
+                    retained = sum_payload_charge(retained, value_charge(value));
+                }
+            }
+            for step in self.work.as_slice() {
+                if let Work::ArgumentsExit(arguments) = step {
+                    for value in &arguments.staged {
+                        retained = sum_payload_charge(retained, value_charge(value));
+                    }
+                }
+            }
         }
         if let Some(result) = &self.pending {
             retained = sum_payload_charge(retained, flow_charge(result));
@@ -4437,6 +4867,13 @@ impl Machine {
         for exit in self.exits.as_slice() {
             if let Some(result) = exit.state.outcome() {
                 retained = sum_payload_charge(retained, flow_charge(result));
+            }
+            if self.original_string.is_some() {
+                if let ExitCompletion::Arguments { frame, .. } = &exit.completion {
+                    for value in &frame.staged {
+                        retained = sum_payload_charge(retained, value_charge(value));
+                    }
+                }
             }
         }
         for frame in self.finally.frames.as_slice() {
@@ -5470,6 +5907,10 @@ impl Drop for Machine {
         self.metrics.retained_error_leaf_bytes = 0;
         self.metrics.retained_result_wrapper_capacity = 0;
         self.metrics.retained_result_wrapper_bytes = 0;
+        self.original_string = None;
+        self.cloned_string_payload_bytes = 0;
+        self.metrics.retained_cloned_string_payload_bytes = 0;
+        self.metrics.peak_cloned_string_payload_bytes = self.peak_cloned_string_payload_bytes;
         if let Some(panic) = first {
             std::panic::resume_unwind(panic);
         }

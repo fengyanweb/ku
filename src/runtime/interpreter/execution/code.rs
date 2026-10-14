@@ -94,6 +94,12 @@ pub(super) enum ExprCode {
     // Non-consuming reads of a synchronous selected primitive Result local
     // retain the original Env clone contract, with pre-allocation admission.
     VariableSelectedScalarResultClone(SymbolId),
+    // Non-consuming reads of the synchronous one-input String Result slice.
+    // The runtime admits the real clone buffer and Box before publication.
+    VariableSelectedStringResultClone(SymbolId),
+    // Explicit zero-argument clone on the same selected local keeps both
+    // the method-call tick and target-variable tick, with one real copy.
+    SelectedStringResultCloneCall(ExprId),
     // Root-only synchronous String loans; the real lease is owned by the
     // surrounding argument frame, rather than this shared syntax owner.
     StringBorrow(SymbolId),
@@ -340,6 +346,9 @@ pub(super) struct CodeArena {
     // code frame. No String capacity or hidden hash table is left uncharged.
     names: FrameStack<u8>,
     construction_peak_backing_bytes_upper_bound: usize,
+    // A private whole-graph fact, distinct from a function cache contract.
+    // Terminal-only old source keeps its original runtime path and hooks.
+    has_actual_string_result_locals: bool,
 }
 
 #[derive(Clone)]
@@ -465,6 +474,14 @@ impl CodeHandle {
         *self.0.functions.get(id.0).expect("admitted function ID")
     }
 
+    pub(super) fn has_actual_string_result_locals(&self) -> bool {
+        self.0.has_actual_string_result_locals
+    }
+
+    pub(super) fn uses_local_string_results(&self, id: FnId) -> bool {
+        self.function(id).result_contract == ResultContract::OwnedStringLocals
+    }
+
     pub(super) fn find_function(&self, name: &str) -> Option<FnId> {
         (0..self.0.functions.len()).find_map(|index| {
             (self.symbol(self.function(FnId(index)).name) == name).then_some(FnId(index))
@@ -533,6 +550,7 @@ impl CodeArena {
                 max_storage_bytes: limits.max_storage_bytes,
             }),
             construction_peak_backing_bytes_upper_bound: 0,
+            has_actual_string_result_locals: false,
         }
     }
 
@@ -587,6 +605,7 @@ enum FunctionRole {
     Scalar,
     OwnedNamed,
     OwnedResultStringNamed,
+    OwnedLocalResultStringNamed,
     OwnedScalarResultNamed,
     BorrowedStringNamed,
     BorrowedScalarResultNamed,
@@ -616,6 +635,7 @@ enum ResultContract {
     BorrowedScalar(PrimitiveResultKind),
     OwnedScalar,
     OwnedString,
+    OwnedStringLocals,
 }
 
 type FunctionContract = (bool, ResultContract, Option<PrimitiveResultKind>);
@@ -718,7 +738,11 @@ impl<'a> FunctionSpec<'a> {
     fn owned_named(function: &'a FnDecl) -> Self {
         let mut spec = Self::named(function);
         spec.role = if string_result_type(&function.return_type) {
-            FunctionRole::OwnedResultStringNamed
+            if has_single_owned_string_parameter(function) {
+                FunctionRole::OwnedLocalResultStringNamed
+            } else {
+                FunctionRole::OwnedResultStringNamed
+            }
         } else if scalar_result_type(&function.return_type) {
             FunctionRole::OwnedScalarResultNamed
         } else {
@@ -730,7 +754,15 @@ impl<'a> FunctionSpec<'a> {
     fn owned_dependency(self, function: &'a FnDecl) -> Self {
         let mut spec = Self::named(function);
         spec.role = if self.owns_result_string() && string_result_type(&function.return_type) {
-            FunctionRole::OwnedResultStringNamed
+            // Keep the one-input Machine capability through terminal-only
+            // dependencies too. Otherwise a multi-String relay back to this
+            // root would conflict with its already cached charging contract.
+            // Actual local storage still requires one owned String parameter.
+            if matches!(self.role, FunctionRole::OwnedLocalResultStringNamed) {
+                FunctionRole::OwnedLocalResultStringNamed
+            } else {
+                FunctionRole::OwnedResultStringNamed
+            }
         } else if self.owns_scalar_result() && scalar_result_type(&function.return_type) {
             FunctionRole::OwnedScalarResultNamed
         } else {
@@ -743,6 +775,7 @@ impl<'a> FunctionSpec<'a> {
         matches!(
             self.role,
             FunctionRole::OwnedResultStringNamed
+                | FunctionRole::OwnedLocalResultStringNamed
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
                 | FunctionRole::AsyncOwnedResultStringDependency
         )
@@ -761,6 +794,21 @@ impl<'a> FunctionSpec<'a> {
         self.declaration
             .filter(|_| self.owns_scalar_result())
             .and_then(|function| primitive_result_kind(&function.return_type))
+    }
+
+    fn stores_string_result(self) -> bool {
+        matches!(self.role, FunctionRole::OwnedLocalResultStringNamed)
+            && self
+                .declaration
+                .is_some_and(has_single_owned_string_parameter)
+    }
+
+    fn check_string_local(self, span: Span) -> Admission<()> {
+        if self.stores_string_result() {
+            Ok(())
+        } else {
+            Err(AdmissionError::Unsupported(span))
+        }
     }
 
     fn stores_scalar_result(self) -> bool {
@@ -784,7 +832,9 @@ impl<'a> FunctionSpec<'a> {
         let primitive = self
             .declaration
             .and_then(|function| primitive_result_kind(&function.return_type));
-        let result = if self.owns_result_string() {
+        let result = if matches!(self.role, FunctionRole::OwnedLocalResultStringNamed) {
+            ResultContract::OwnedStringLocals
+        } else if self.owns_result_string() {
             ResultContract::OwnedString
         } else if self.owns_scalar_result() {
             ResultContract::OwnedScalar
@@ -930,6 +980,7 @@ impl<'a> FunctionSpec<'a> {
             self.role,
             FunctionRole::OwnedNamed
                 | FunctionRole::OwnedResultStringNamed
+                | FunctionRole::OwnedLocalResultStringNamed
                 | FunctionRole::OwnedScalarResultNamed
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
                 | FunctionRole::AsyncOwnedResultStringDependency
@@ -1007,7 +1058,7 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::BorrowedScalarResultNamed => {
                 !function.is_async && scalar_result_type(&function.return_type)
             }
-            FunctionRole::OwnedResultStringNamed => {
+            FunctionRole::OwnedResultStringNamed | FunctionRole::OwnedLocalResultStringNamed => {
                 !function.is_async && string_result_type(&function.return_type)
             }
             FunctionRole::OwnedScalarResultNamed => {
@@ -1048,6 +1099,20 @@ fn string_type(ty: &Option<TypeName>) -> bool {
 
 fn string_result_type(ty: &Option<TypeName>) -> bool {
     matches!(ty, Some(TypeName::Result(inner)) if matches!(inner.as_ref(), TypeName::String))
+}
+
+fn has_single_owned_string_parameter(function: &FnDecl) -> bool {
+    function
+        .params
+        .iter()
+        .filter(|param| string_type(&param.ty))
+        .count()
+        == 1
+        && function
+            .params
+            .iter()
+            .filter(|param| string_type(&param.ty))
+            .all(|param| param.mode == ParamMode::Owned)
 }
 
 fn scalar_result_type(ty: &Option<TypeName>) -> bool {
@@ -1136,6 +1201,28 @@ fn borrow_string_variable<'a>(expr: &'a Expr, bound: &[Binding<'_>]) -> Admissio
     Ok(name)
 }
 
+fn selected_string_result_clone_target<'a>(
+    expr: &'a Expr,
+    bound: &[Binding<'_>],
+) -> Option<&'a Expr> {
+    let ExprKind::Call { callee, args } = &expr.kind else {
+        return None;
+    };
+    let ExprKind::Field { target, name } = &callee.kind else {
+        return None;
+    };
+    let ExprKind::Variable(symbol) = &target.kind else {
+        return None;
+    };
+    if name != "clone"
+        || !args.is_empty()
+        || binding_kind(bound, symbol) != Some(ValueKind::ResultString)
+    {
+        return None;
+    }
+    Some(target)
+}
+
 fn mixed_string_parameter_modes(function: &FnDecl) -> bool {
     let has_view = function
         .params
@@ -1180,6 +1267,9 @@ fn expression_kind(
         ExprKind::Variable(name) => binding_kind(bound, name).unwrap_or(ValueKind::Scalar),
         ExprKind::Await(_) => ValueKind::Result,
         ExprKind::Call { callee, .. } => {
+            if selected_string_result_clone_target(expr, bound).is_some() {
+                return Ok(ValueKind::ResultString);
+            }
             if string_length_call(expr, bound).is_some() {
                 return Ok(ValueKind::Scalar);
             }
@@ -1273,6 +1363,9 @@ struct ExpressionMode {
     // checked against the current charged async declaration and static callee.
     // Arguments and nested builtin operands clear this permission.
     local_scalar_result: Option<PrimitiveResultKind>,
+    // Only a typed String Result local's complete synchronous RHS. This
+    // permission never reaches arguments, awaits or nested builtin operands.
+    local_string_result: bool,
     // Only the direct Result operand of ? in the new borrowed Result role.
     // A helper or ordinary call site cannot reuse this callee permission.
     unwrap_borrowed_result: bool,
@@ -1497,6 +1590,7 @@ impl<'a> Builder<'a> {
                 forbid_call: false,
                 terminal_result: false,
                 local_scalar_result: None,
+                local_string_result: false,
                 unwrap_borrowed_result: false,
                 owned_async_call: false,
             },
@@ -1585,6 +1679,33 @@ impl<'a> Builder<'a> {
         Ok(id)
     }
 
+    fn local_string_result_expression(
+        &mut self,
+        expr: &'a Expr,
+        spec: FunctionSpec<'a>,
+    ) -> Admission<ExprId> {
+        spec.check_string_local(expr.span)?;
+        if is_ok_call(expr) {
+            self.terminal_ok(expr, true, false, None)
+        } else if is_err_call(expr) {
+            self.terminal_err(expr)
+        } else {
+            expect_kind(self.kind(expr)?, ValueKind::ResultString, expr.span)?;
+            self.expression_with_mode(
+                expr,
+                ExpressionMode {
+                    consuming: true,
+                    forbid_call: false,
+                    terminal_result: false,
+                    local_scalar_result: None,
+                    local_string_result: true,
+                    unwrap_borrowed_result: false,
+                    owned_async_call: false,
+                },
+            )
+        }
+    }
+
     fn local_scalar_result_expression(
         &mut self,
         expr: &'a Expr,
@@ -1612,6 +1733,7 @@ impl<'a> Builder<'a> {
                     forbid_call: false,
                     terminal_result: false,
                     local_scalar_result: Some(kind),
+                    local_string_result: false,
                     unwrap_borrowed_result: false,
                     owned_async_call: false,
                 },
@@ -1848,6 +1970,9 @@ impl<'a> Builder<'a> {
                             ValueKind::String | ValueKind::ViewString => {
                                 return Err(AdmissionError::Unsupported(expr.span))
                             }
+                            ValueKind::ResultString if spec.stores_string_result() => {
+                                ExprCode::VariableSelectedStringResultClone(symbol)
+                            }
                             ValueKind::ScalarResult(kind) if spec.stores_scalar_result() => {
                                 spec.check_scalar_local_kind(kind, expr.span)?;
                                 ExprCode::VariableSelectedScalarResultClone(symbol)
@@ -1901,6 +2026,7 @@ impl<'a> Builder<'a> {
                                     forbid_call: false,
                                     terminal_result: false,
                                     local_scalar_result: None,
+                                    local_string_result: false,
                                     unwrap_borrowed_result: false,
                                     owned_async_call: true,
                                 },
@@ -1935,8 +2061,25 @@ impl<'a> Builder<'a> {
                         if mode.forbid_call {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
+                        if let Some(target) =
+                            selected_string_result_clone_target(expr, self.bound.as_slice())
+                        {
+                            spec.check_string_local(expr.span)?;
+                            let target = self.expression(target, false)?;
+                            *self
+                                .arena
+                                .expressions
+                                .get_mut(id.0)
+                                .expect("clone call expression slot") = CodeExpr {
+                                kind: ExprCode::SelectedStringResultCloneCall(target),
+                                span,
+                            };
+                            return Ok(());
+                        }
                         if self.kind(expr)? == ValueKind::ResultString
-                            && !(spec.owns_result_string() && mode.terminal_result)
+                            && !(spec.owns_result_string()
+                                && (mode.terminal_result
+                                    || spec.stores_string_result() && mode.local_string_result))
                         {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
@@ -2077,6 +2220,7 @@ impl<'a> Builder<'a> {
                                         forbid_call: has_view,
                                         terminal_result: false,
                                         local_scalar_result: None,
+                                        local_string_result: false,
                                         unwrap_borrowed_result: false,
                                         owned_async_call: false,
                                     },
@@ -2137,6 +2281,18 @@ impl<'a> Builder<'a> {
                 ty,
                 ..
             } => {
+                if string_result_type(ty) {
+                    spec.check_string_local(span)?;
+                    reserve_field!(self, pending, 1, span);
+                    push(
+                        &mut self.pending,
+                        Visit::Bind(name, false, ValueKind::ResultString, span),
+                    );
+                    let symbol = self.symbol(name, span)?;
+                    let value = self.local_string_result_expression(value, spec)?;
+                    self.arena.has_actual_string_result_locals = true;
+                    return Ok(StmtCode::VarDecl(symbol, value, *mutable));
+                }
                 let local_kind = primitive_result_kind(ty).or_else(|| {
                     if ty.is_none() {
                         match self.kind(value).ok()? {
@@ -2189,6 +2345,18 @@ impl<'a> Builder<'a> {
                 )
             }
             Stmt::Assign { name, value, .. } => {
+                if binding_kind(self.bound.as_slice(), name) == Some(ValueKind::ResultString) {
+                    spec.check_string_local(span)?;
+                    reserve_field!(self, pending, 1, span);
+                    push(
+                        &mut self.pending,
+                        Visit::Bind(name, true, ValueKind::ResultString, span),
+                    );
+                    let symbol = self.symbol(name, span)?;
+                    let value = self.local_string_result_expression(value, spec)?;
+                    self.arena.has_actual_string_result_locals = true;
+                    return Ok(StmtCode::Assign(symbol, value));
+                }
                 let local_kind = match binding_kind(self.bound.as_slice(), name) {
                     Some(ValueKind::ScalarResult(kind)) => Some(kind),
                     _ => match self.kind(value).ok() {
@@ -2310,6 +2478,7 @@ impl<'a> Builder<'a> {
                                 forbid_call: false,
                                 terminal_result: true,
                                 local_scalar_result: None,
+                                local_string_result: false,
                                 unwrap_borrowed_result: false,
                                 owned_async_call: false,
                             },
@@ -2442,6 +2611,7 @@ impl<'a> Eligibility<'a> {
                 forbid_call: false,
                 terminal_result: false,
                 local_scalar_result: None,
+                local_string_result: false,
                 unwrap_borrowed_result: false,
                 owned_async_call: false,
             },
@@ -2452,6 +2622,45 @@ impl<'a> Eligibility<'a> {
         reserve_field!(self, pending, 1, expr.span);
         push(&mut self.pending, Scan::Expr(expr, mode));
         Ok(())
+    }
+
+    fn local_string_result_expression(
+        &mut self,
+        expr: &'a Expr,
+        spec: FunctionSpec<'a>,
+    ) -> Admission<()> {
+        spec.check_string_local(expr.span)?;
+        let builtin = if is_ok_call(expr) {
+            Some("ok")
+        } else if is_err_call(expr) {
+            Some("err")
+        } else {
+            None
+        };
+        if let Some(name) = builtin {
+            let shadowed = self.bound(name)
+                || self
+                    .local
+                    .is_some_and(|local| local.captures.contains(name));
+            let argument = terminal_builtin_argument(expr, self.source, shadowed, name)?;
+            expect_kind(self.kind(argument)?, ValueKind::String, argument.span)?;
+            self.spend(1, expr.span)?;
+            self.expression(argument, true)
+        } else {
+            expect_kind(self.kind(expr)?, ValueKind::ResultString, expr.span)?;
+            self.expression_with_mode(
+                expr,
+                ExpressionMode {
+                    consuming: true,
+                    forbid_call: false,
+                    terminal_result: false,
+                    local_scalar_result: None,
+                    local_string_result: true,
+                    unwrap_borrowed_result: false,
+                    owned_async_call: false,
+                },
+            )
+        }
     }
 
     fn local_scalar_result_expression(
@@ -2493,6 +2702,7 @@ impl<'a> Eligibility<'a> {
                     forbid_call: false,
                     terminal_result: false,
                     local_scalar_result: Some(kind),
+                    local_string_result: false,
                     unwrap_borrowed_result: false,
                     owned_async_call: false,
                 },
@@ -2565,6 +2775,16 @@ impl<'a> Eligibility<'a> {
                             Stmt::VarDecl {
                                 name, ty, value, ..
                             } => {
+                                if string_result_type(ty) {
+                                    spec.check_string_local(span)?;
+                                    reserve_field!(self, pending, 1, span);
+                                    push(
+                                        &mut self.pending,
+                                        Scan::Bind(name, false, ValueKind::ResultString, span),
+                                    );
+                                    self.local_string_result_expression(value, spec)?;
+                                    continue;
+                                }
                                 let local_kind = primitive_result_kind(ty).or_else(|| {
                                     if ty.is_none() {
                                         match self.kind(value).ok()? {
@@ -2612,6 +2832,18 @@ impl<'a> Eligibility<'a> {
                                 self.expression(value, true)?;
                             }
                             Stmt::Assign { name, value, .. } => {
+                                if binding_kind(self.bound.as_slice(), name)
+                                    == Some(ValueKind::ResultString)
+                                {
+                                    spec.check_string_local(span)?;
+                                    reserve_field!(self, pending, 1, span);
+                                    push(
+                                        &mut self.pending,
+                                        Scan::Bind(name, true, ValueKind::ResultString, span),
+                                    );
+                                    self.local_string_result_expression(value, spec)?;
+                                    continue;
+                                }
                                 let local_kind = match binding_kind(self.bound.as_slice(), name) {
                                     Some(ValueKind::ScalarResult(kind)) => Some(kind),
                                     _ => match self.kind(value).ok() {
@@ -2708,6 +2940,7 @@ impl<'a> Eligibility<'a> {
                                                 forbid_call: false,
                                                 terminal_result: true,
                                                 local_scalar_result: None,
+                                                local_string_result: false,
                                                 unwrap_borrowed_result: false,
                                                 owned_async_call: false,
                                             },
@@ -2831,6 +3064,9 @@ impl<'a> Eligibility<'a> {
                             }
                             self.free(name, expr.span)?;
                             let kind = self.kind(expr)?;
+                            if kind == ValueKind::ResultString && spec.stores_string_result() {
+                                continue;
+                            }
                             if let ValueKind::ScalarResult(kind) = kind {
                                 spec.check_scalar_local_kind(kind, expr.span)?;
                                 continue;
@@ -2885,6 +3121,7 @@ impl<'a> Eligibility<'a> {
                                         forbid_call: false,
                                         terminal_result: false,
                                         local_scalar_result: None,
+                                        local_string_result: false,
                                         unwrap_borrowed_result: false,
                                         owned_async_call: true,
                                     },
@@ -2918,8 +3155,17 @@ impl<'a> Eligibility<'a> {
                             if mode.forbid_call {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
+                            if let Some(target) =
+                                selected_string_result_clone_target(expr, self.bound.as_slice())
+                            {
+                                spec.check_string_local(expr.span)?;
+                                self.expression(target, false)?;
+                                continue;
+                            }
                             if self.kind(expr)? == ValueKind::ResultString
-                                && !(spec.owns_result_string() && mode.terminal_result)
+                                && !(spec.owns_result_string()
+                                    && (mode.terminal_result
+                                        || spec.stores_string_result() && mode.local_string_result))
                             {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
@@ -3037,6 +3283,7 @@ impl<'a> Eligibility<'a> {
                                             forbid_call: has_view,
                                             terminal_result: false,
                                             local_scalar_result: None,
+                                            local_string_result: false,
                                             unwrap_borrowed_result: false,
                                             owned_async_call: false,
                                         },

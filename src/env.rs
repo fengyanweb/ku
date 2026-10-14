@@ -118,6 +118,40 @@ fn selected_scalar_result_charge(value: &Value) -> Option<AwaitPayloadCharge> {
     }
 }
 
+// Only the admitted String-local slice opts into this sibling classifier.
+// String buffer accounting belongs to its Machine owner census; this copies
+// only the actual Result Box backing, and retains the old strict error shape.
+fn selected_string_result_charge(value: &Value) -> Option<AwaitPayloadCharge> {
+    if let Value::Result {
+        ok: true,
+        value: inner,
+    } = value
+    {
+        if let Value::String(text) = inner.as_ref() {
+            return AwaitPayloadCharge::for_value(value, text.capacity()).ok();
+        }
+    }
+    selected_scalar_result_charge(value)
+}
+
+fn lock_selected_string_task_binding(
+    cell: &BindingCell,
+    span: Span,
+) -> KuResult<std::sync::MutexGuard<'_, Binding>> {
+    match cell.lock() {
+        Ok(binding) => Ok(binding),
+        Err(poisoned) => {
+            let binding = poisoned.into_inner();
+            if selected_string_result_charge(&binding.value).is_some() {
+                Ok(binding)
+            } else {
+                drop(binding);
+                Err(KuError::runtime("environment binding is poisoned", span))
+            }
+        }
+    }
+}
+
 // Cleanup metadata may recover a poisoned cell only after the real value is
 // proven to be a strict taskless selected Result. Keep the poison bit and all
 // ordinary read/assignment failures; opaque or Task-bearing cells still fail.
@@ -686,13 +720,29 @@ impl Env {
     /// Count only the admitted Machine slice, without traversal scratch or
     /// handle proxies. General Owned scopes keep their existing collector.
     pub(crate) fn current_scope_simple_task_count(&self, span: Span) -> KuResult<usize> {
+        self.current_scope_simple_task_count_in(span, false)
+    }
+
+    pub(crate) fn current_scope_selected_string_task_count(&self, span: Span) -> KuResult<usize> {
+        self.current_scope_simple_task_count_in(span, true)
+    }
+
+    fn current_scope_simple_task_count_in(
+        &self,
+        span: Span,
+        selected_strings: bool,
+    ) -> KuResult<usize> {
         let scope = self.scopes.last().expect("environment always has a scope");
         let mut tasks = 0usize;
         for name in &scope.owned_bindings {
             let Some(cell) = scope.bindings.get(name) else {
                 continue;
             };
-            let binding = lock_simple_task_binding(cell, span)?;
+            let binding = if selected_strings {
+                lock_selected_string_task_binding(cell, span)?
+            } else {
+                lock_simple_task_binding(cell, span)?
+            };
             if binding.borrowed_parameter
                 || binding.match_probe
                 || binding.owner_task_id != crate::runtime::task::current_task_id()
@@ -703,6 +753,9 @@ impl Env {
                 Value::Borrowed(view) => view.with_source_read_locked(&binding, span, |root| {
                     simple_scope_task_count(root, span)
                 }),
+                value if selected_strings && selected_string_result_charge(value).is_some() => {
+                    Ok(0)
+                }
                 value => simple_scope_task_count(value, span),
             };
             drop(binding);
@@ -724,12 +777,33 @@ impl Env {
         handles: &mut Vec<TaskHandle>,
         span: Span,
     ) -> KuResult<()> {
+        self.collect_current_scope_simple_tasks_reserved_in(handles, span, false)
+    }
+
+    pub(crate) fn collect_current_scope_selected_string_tasks_reserved(
+        &self,
+        handles: &mut Vec<TaskHandle>,
+        span: Span,
+    ) -> KuResult<()> {
+        self.collect_current_scope_simple_tasks_reserved_in(handles, span, true)
+    }
+
+    fn collect_current_scope_simple_tasks_reserved_in(
+        &self,
+        handles: &mut Vec<TaskHandle>,
+        span: Span,
+        selected_strings: bool,
+    ) -> KuResult<()> {
         let scope = self.scopes.last().expect("environment always has a scope");
         for name in &scope.owned_bindings {
             let Some(cell) = scope.bindings.get(name) else {
                 continue;
             };
-            let binding = lock_simple_task_binding(cell, span)?;
+            let binding = if selected_strings {
+                lock_selected_string_task_binding(cell, span)?
+            } else {
+                lock_simple_task_binding(cell, span)?
+            };
             if binding.borrowed_parameter
                 || binding.match_probe
                 || binding.owner_task_id != crate::runtime::task::current_task_id()
@@ -741,6 +815,9 @@ impl Env {
                 Value::Borrowed(view) => view.with_source_read_locked(&binding, span, |root| {
                     simple_scope_task_proxy(root, available, span)
                 }),
+                value if selected_strings && selected_string_result_charge(value).is_some() => {
+                    Ok(None)
+                }
                 value => simple_scope_task_proxy(value, available, span),
             };
             drop(binding);
@@ -853,8 +930,21 @@ impl Env {
     }
 
     pub(crate) fn selected_scalar_result_charge(&self) -> AwaitPayloadCharge {
+        self.selected_result_charge_in(false)
+    }
+
+    pub(crate) fn selected_string_result_charge(&self) -> AwaitPayloadCharge {
+        self.selected_result_charge_in(true)
+    }
+
+    fn selected_result_charge_in(&self, selected_strings: bool) -> AwaitPayloadCharge {
         self.fold_owned_values(AwaitPayloadCharge::default(), |total, value| {
-            let Some(charge) = selected_scalar_result_charge(value) else {
+            let charge = if selected_strings {
+                selected_string_result_charge(value)
+            } else {
+                selected_scalar_result_charge(value)
+            };
+            let Some(charge) = charge else {
                 return total;
             };
             let add = |left: usize, right: usize| {

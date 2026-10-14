@@ -3860,7 +3860,7 @@ fn selected_scalar_local_operation_clone_native_poison_first_cause_tls_and_unkno
             (0, 0, 0, 0)
         );
     }
-    let string_local = "fn Entry(text: str): str! { r: str! = ok(text)\nreturn r }";
+    let string_local = "fn Entry(text: str, unused: str): str! { r: str! = ok(text)\nreturn r }";
     let strings = functions(string_local);
     assert!(matches!(
         CodeHandle::compile_owned_named(&strings, &strings["Entry"], Limits::default()),
@@ -3955,4 +3955,1614 @@ fn selected_scalar_local_operation_clone_native_poison_first_cause_tls_and_unkno
         assert!(matches!(value.as_ref(), Value::Array(_) | Value::Object(_)));
         crate::cli::run_source("selected-local-unknown-opaque.ku", &complete).unwrap();
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct S9String {
+    pointer: usize,
+    len: usize,
+    capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct S9Owner {
+    boxed: usize,
+    string: Option<S9String>,
+    error: Option<ErrorPayload>,
+}
+
+fn s9_owner(value: &Value, text: &'static str) -> Option<S9Owner> {
+    let Value::Result { ok, value: leaf } = value else {
+        return None;
+    };
+    let boxed = leaf.as_ref() as *const Value as usize;
+    if *ok {
+        let Value::String(actual) = leaf.as_ref() else {
+            panic!("the selected String success retains its real String leaf");
+        };
+        assert_eq!(actual, text);
+        Some(S9Owner {
+            boxed,
+            string: Some(S9String {
+                pointer: actual.as_ptr() as usize,
+                len: actual.len(),
+                capacity: actual.capacity(),
+            }),
+            error: None,
+        })
+    } else {
+        let error = error_payload(value).expect("the real selected ErrorObject");
+        let Value::Object(fields) = leaf.as_ref() else {
+            unreachable!()
+        };
+        assert!(matches!(fields.get("domain"), Some(Value::String(value)) if value == "ku"));
+        assert!(matches!(fields.get("code"), Some(Value::String(value)) if value == "err"));
+        assert!(matches!(fields.get("message"), Some(Value::String(value)) if value == text));
+        Some(S9Owner {
+            boxed,
+            string: None,
+            error: Some(error),
+        })
+    }
+}
+
+struct S9Census {
+    env: Vec<S9Owner>,
+    owners: Vec<S9Owner>,
+    original_seen: bool,
+    clone_bytes: usize,
+}
+
+// Fixture-owned metadata is allocated before any BindingCell lock. The fold
+// copies real addresses/lengths/capacities and never clones or takes a Value.
+// Besides Result owners, bare Strings in arguments/operands must be counted.
+fn s9_census(
+    machine: &Machine,
+    input: Buffer,
+    original_live: bool,
+    strings: &mut Vec<S9String>,
+) -> S9Census {
+    let staged = machine
+        .work
+        .as_slice()
+        .iter()
+        .filter_map(|work| match work {
+            Work::ArgumentsExit(frame) => Some(frame.staged.len()),
+            _ => None,
+        })
+        .sum::<usize>();
+    let capacity = machine.calls.len() * 8
+        + staged
+        + machine.values.len()
+        + machine.exits.len() * 8
+        + machine.finally.frames.len() * 4
+        + 128;
+    // These fixed fixtures have at most two local Result cells, two saved
+    // Q primaries and one transferring outcome. Deep parents move their
+    // only bare String down before binding r; they install no keepers.
+    // This independent fixture bound is not a runtime resource limit. The
+    // spare-backing assertion still fails if a future fixture exceeds it.
+    let mut env = Vec::with_capacity(8);
+    let mut owners = Vec::with_capacity(8);
+    strings.clear();
+    // Reserve the complete independent String upper bound outside locks;
+    // reuse its backing without retaining any previous live-owner record.
+    strings.reserve(capacity);
+    let mut record = |value: &Value, in_env: bool| {
+        let owner = s9_owner(value, input.text);
+        if let Some(owner) = owner {
+            assert!(
+                owners.len() < owners.capacity(),
+                "fixture metadata has spare backing"
+            );
+            owners.push(owner);
+            if in_env {
+                assert!(env.len() < env.capacity());
+                env.push(owner);
+            }
+        }
+        let actual = match value {
+            Value::String(actual) => Some(actual),
+            Value::Result { ok: true, value } => match value.as_ref() {
+                Value::String(actual) => Some(actual),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(actual) = actual {
+            assert_eq!(actual, input.text);
+            assert!(strings.len() < strings.capacity());
+            strings.push(S9String {
+                pointer: actual.as_ptr() as usize,
+                len: actual.len(),
+                capacity: actual.capacity(),
+            });
+        }
+    };
+    for frame in machine.calls.as_slice() {
+        let mut has_result = false;
+        let mut has_string_success = false;
+        let mut has_string = false;
+        frame.env.fold_owned_values((), |(), value| {
+            has_result |= matches!(value, Value::Result { .. });
+            has_string_success |= matches!(value, Value::Result { ok: true, value }
+                if matches!(value.as_ref(), Value::String(_)));
+            has_string |= matches!(value, Value::String(_))
+                || matches!(value, Value::Result { ok: true, value }
+                    if matches!(value.as_ref(), Value::String(_)));
+            record(value, true);
+        });
+        if has_string {
+            assert!(frame.may_have_string_owner_bindings);
+        }
+        if has_result {
+            assert!(frame.has_selected_result_bindings);
+        }
+        if has_string_success {
+            assert!(frame.has_selected_string_result_bindings);
+        }
+    }
+    if let Some(args) = &machine.entry_args {
+        for value in args {
+            record(value, false);
+        }
+    }
+    for value in machine.values.as_slice() {
+        record(value, false);
+    }
+    for work in machine.work.as_slice() {
+        if let Work::ArgumentsExit(frame) = work {
+            for value in &frame.staged {
+                record(value, false);
+            }
+        }
+    }
+    let mut record_flow = |result: &KuResult<Flow>| {
+        if let Ok(Flow::Return { value, .. } | Flow::Fail { value, .. }) = result {
+            record(value, false);
+        }
+    };
+    if let Some(result) = &machine.pending {
+        record_flow(result);
+    }
+    for exit in machine.exits.as_slice() {
+        if let Some(result) = exit.state.outcome() {
+            record_flow(result);
+        }
+    }
+    for frame in machine.finally.frames.as_slice() {
+        if let Some(result) = &frame.primary {
+            record_flow(result);
+        }
+    }
+    for exit in machine.exits.as_slice() {
+        if let ExitCompletion::Arguments { frame, .. } = &exit.completion {
+            for value in &frame.staged {
+                record(value, false);
+            }
+        }
+    }
+    assert!(machine.awaiting.is_none(), "the S9 slice cannot await");
+    let mut boxes = std::collections::HashSet::with_capacity(owners.len());
+    for owner in &owners {
+        assert!(boxes.insert(owner.boxed), "one real owner per Result Box");
+    }
+    let original_seen = strings.iter().any(|actual| {
+        original_live
+            && input.capacity != 0
+            && actual.pointer == input.pointer
+            && actual.capacity == input.capacity
+    });
+    let clone_bytes = strings
+        .iter()
+        .filter(|actual| {
+            !(original_live
+                && input.capacity != 0
+                && actual.pointer == input.pointer
+                && actual.capacity == input.capacity)
+        })
+        .map(|actual| actual.capacity)
+        .sum();
+    let errors: usize = owners
+        .iter()
+        .filter_map(|owner| owner.error)
+        .map(|error| error.count)
+        .sum();
+    let error_bytes: usize = owners
+        .iter()
+        .filter_map(|owner| owner.error)
+        .map(|error| error.bytes)
+        .sum();
+    assert_eq!(machine.result_wrapper_capacity, owners.len());
+    assert_eq!(
+        machine.result_wrapper_bytes,
+        owners.len() * std::mem::size_of::<Value>()
+    );
+    assert_eq!(machine.error_leaf_capacity, errors);
+    assert_eq!(machine.error_leaf_bytes, error_bytes);
+    assert_eq!(
+        machine.metrics.retained_result_wrapper_capacity,
+        owners.len()
+    );
+    assert_eq!(
+        machine.metrics.retained_result_wrapper_bytes,
+        machine.result_wrapper_bytes
+    );
+    assert_eq!(machine.metrics.retained_error_leaf_capacity, errors);
+    assert_eq!(machine.metrics.retained_error_leaf_bytes, error_bytes);
+    assert_eq!(machine.cloned_string_payload_bytes, clone_bytes);
+    assert_eq!(
+        machine.metrics.retained_cloned_string_payload_bytes,
+        clone_bytes
+    );
+    assert_eq!(
+        machine.string_payload_bytes, input.capacity,
+        "unused input reservation is never refunded"
+    );
+    // The original input metric is finalized at finish/drop. The live input
+    // reservation above, unlike that cached metric, is authoritative here.
+    let original = machine
+        .original_string
+        .expect("selected owned entry installs real origin metadata");
+    assert_eq!(
+        (original.pointer, original.capacity),
+        (input.pointer, input.capacity)
+    );
+    assert_eq!(
+        original.still_live, original_seen,
+        "absence from eligible bare/success String owners permanently ends the original credit"
+    );
+    S9Census {
+        env,
+        owners,
+        original_seen,
+        clone_bytes,
+    }
+}
+
+struct S9Proof {
+    original_live: bool,
+    live: Vec<S9Owner>,
+    string_scratch: Vec<S9String>,
+    final_clone: Option<S9Owner>,
+    peak_live: usize,
+    peak_clone_bytes: usize,
+}
+
+impl S9Proof {
+    fn new(input: Buffer) -> Self {
+        Self {
+            original_live: input.capacity != 0,
+            live: Vec::new(),
+            string_scratch: Vec::new(),
+            final_clone: None,
+            peak_live: 0,
+            peak_clone_bytes: 0,
+        }
+    }
+}
+
+fn s9_observe(machine: &Machine, input: Buffer, proof: &mut S9Proof) -> S9Census {
+    let actual = s9_census(
+        machine,
+        input,
+        proof.original_live,
+        &mut proof.string_scratch,
+    );
+    proof.original_live &= actual.original_seen;
+    proof.live.clone_from(&actual.owners); // Copy-only metadata; no Value clone.
+    proof.peak_live = proof.peak_live.max(actual.owners.len());
+    proof.peak_clone_bytes = proof.peak_clone_bytes.max(actual.clone_bytes);
+    actual
+}
+
+fn s9_machine(source: &str) -> Machine {
+    let source_functions = functions(source);
+    let entry = &source_functions["Entry"];
+    assert!(code::eligible_owned_named(
+        &source_functions,
+        entry,
+        Limits::default()
+    ));
+    let code =
+        CodeHandle::compile_owned_named(&source_functions, entry, Limits::default()).unwrap();
+    assert!(code.has_actual_string_result_locals());
+    Machine::from_code(code, Limits::default(), 0)
+}
+
+fn s9_at_clone(machine: &Machine) -> bool {
+    machine.pending.is_none()
+        && matches!(
+            machine.work.as_slice().last(),
+            Some(Work::CloneSelectedStringResult(_, _))
+        )
+}
+
+fn s9_explicit_clone_ticks(
+    machine: &mut Machine,
+    host: &mut Interpreter,
+    input: Buffer,
+    proof: &mut S9Proof,
+) -> bool {
+    if machine.pending.is_some() {
+        return false;
+    }
+    let Some(Work::Eval(id)) = machine.work.as_slice().last() else {
+        return false;
+    };
+    let code::ExprCode::SelectedStringResultCloneCall(target) = machine.code.expression(*id).kind
+    else {
+        return false;
+    };
+    let steps = host.steps;
+    let kernel_steps = machine.metrics.steps;
+    let before = s9_observe(machine, input, proof);
+    for delta in 1..=2 {
+        assert!(matches!(
+            machine
+                .dispatch_chunk(NonZeroUsize::new(1).unwrap(), host)
+                .unwrap(),
+            ChunkProgress::More { popped: 1 }
+        ));
+        assert_eq!(host.steps, steps + delta);
+        assert_eq!(machine.metrics.steps, kernel_steps + delta);
+        let after = s9_observe(machine, input, proof);
+        assert_eq!(
+            after.owners, before.owners,
+            "ticks do not copy or move owners"
+        );
+        if delta == 1 {
+            assert!(
+                matches!(machine.work.as_slice().last(), Some(Work::Eval(id)) if *id == target)
+            );
+        }
+    }
+    assert!(
+        s9_at_clone(machine),
+        "the sole real clone follows both ticks"
+    );
+    true
+}
+
+fn s9_assert_distinct(source: S9Owner, cloned: S9Owner) {
+    assert_ne!(
+        source.boxed, cloned.boxed,
+        "source and clone Boxes are simultaneously alive"
+    );
+    match (source.string, cloned.string, source.error, cloned.error) {
+        (Some(a), Some(b), None, None) => {
+            assert_eq!(a.len, b.len);
+            if a.len != 0 {
+                assert_ne!(a.pointer, b.pointer);
+            }
+        }
+        (None, None, Some(a), Some(b)) => {
+            for index in 0..3 {
+                assert_ne!(a.entries[index], b.entries[index]);
+            }
+            for index in 0..6 {
+                if a.buffers[index].1 != 0 && b.buffers[index].1 != 0 {
+                    assert_ne!(a.buffers[index].0, b.buffers[index].0);
+                }
+            }
+        }
+        _ => panic!("a clone preserves its actual success/failure shape"),
+    }
+}
+
+// At chunk one, copy the actual source metadata before the sole clone Work.
+// The next census sees both real owners alive. No dead-address history or
+// outgoing outcome is used to manufacture an earlier ownership witness.
+fn s9_clone_step(
+    machine: &mut Machine,
+    host: &mut Interpreter,
+    input: Buffer,
+    proof: &mut S9Proof,
+) {
+    let before = s9_observe(machine, input, proof);
+    let Some(Work::CloneSelectedStringResult(name, span)) = machine.work.as_slice().last() else {
+        panic!("the real clone continuation");
+    };
+    let source = machine
+        .calls
+        .as_slice()
+        .last()
+        .unwrap()
+        .env
+        .with_value(
+            machine.code.symbol(*name),
+            machine.code.span(*span),
+            |value| Ok(s9_owner(value, input.text).unwrap()),
+        )
+        .unwrap();
+    assert!(before.env.contains(&source));
+    assert!(matches!(
+        machine
+            .dispatch_chunk(NonZeroUsize::new(1).unwrap(), host)
+            .unwrap(),
+        ChunkProgress::More { popped: 1 }
+    ));
+    let after = s9_observe(machine, input, proof);
+    assert!(
+        after.env.contains(&source),
+        "the complete source metadata is unchanged under clone"
+    );
+    let cloned = s9_owner(machine.values.as_slice().last().unwrap(), input.text).unwrap();
+    assert!(after.owners.contains(&cloned));
+    s9_assert_distinct(source, cloned);
+    proof.final_clone = Some(cloned);
+}
+
+fn s9_budget(machine: &mut Machine, census: &S9Census, input: Buffer) {
+    let saved = machine.value_limits;
+    let count = machine.values.capacity()
+        + machine.argument_capacity
+        + machine.exit_handle_capacity
+        + machine.retirement_capacity
+        + machine.lease_capacity
+        + machine.lease_root_bytes / std::mem::size_of::<Value>()
+        + census.owners.len()
+        + census
+            .owners
+            .iter()
+            .filter_map(|owner| owner.error)
+            .map(|error| error.count)
+            .sum::<usize>();
+    let bytes = machine.values.charged_storage_bytes()
+        + machine.argument_bytes
+        + machine.exit_handle_bytes
+        + machine.retirement_bytes
+        + machine.lease_bytes
+        + machine.lease_root_bytes
+        + input.capacity
+        + census.clone_bytes
+        + census.owners.len() * std::mem::size_of::<Value>()
+        + census
+            .owners
+            .iter()
+            .filter_map(|owner| owner.error)
+            .map(|error| error.bytes)
+            .sum::<usize>();
+    machine.value_limits.max_frames = count;
+    machine.value_limits.max_storage_bytes = bytes;
+    primitive_budget_entries(machine, None);
+    machine.value_limits.max_frames = count - 1;
+    primitive_budget_entries(machine, Some("FrameLimit"));
+    machine.value_limits.max_frames = count;
+    machine.value_limits.max_storage_bytes = bytes - 1;
+    primitive_budget_entries(machine, Some("StorageLimit"));
+    machine.value_limits = saved;
+}
+
+fn s9_drained(machine: &Machine) {
+    errors_drained(machine);
+    assert!(machine.original_string.is_none());
+    assert_eq!(machine.cloned_string_payload_bytes, 0);
+    assert_eq!(machine.metrics.retained_cloned_string_payload_bytes, 0);
+}
+
+fn s9_finish(
+    machine: &mut Machine,
+    host: &mut Interpreter,
+    chunk: usize,
+    input: Buffer,
+    proof: &mut S9Proof,
+) -> KuResult<Value> {
+    for _ in 0..100_000 {
+        if chunk == 1 && s9_at_clone(machine) {
+            s9_clone_step(machine, host, input, proof);
+            continue;
+        }
+        match machine
+            .dispatch_chunk(NonZeroUsize::new(chunk).unwrap(), host)
+            .unwrap()
+        {
+            ChunkProgress::More { popped } => {
+                assert_eq!(popped, chunk);
+                s9_observe(machine, input, proof);
+            }
+            ChunkProgress::Waiting { .. } => {
+                panic!("synchronous selected String locals cannot wait")
+            }
+            ChunkProgress::Finished { popped, result } => {
+                assert!(popped <= chunk);
+                let result =
+                    result.and_then(|flow| flow.into_call_value(Span::default(), "function"));
+                if let Ok(value) = &result {
+                    let actual = s9_owner(value, input.text).unwrap();
+                    if chunk == 1 {
+                        assert!(
+                            proof.live.contains(&actual),
+                            "final owner was observed before teardown"
+                        );
+                        assert_eq!(
+                            proof.final_clone,
+                            Some(actual),
+                            "the real final local read wins"
+                        );
+                    }
+                }
+                s9_drained(machine);
+                return result;
+            }
+        }
+    }
+    panic!("the finite S9 fixture did not finish");
+}
+
+#[test]
+fn selected_string_locals_clone_source_and_actual_success_or_error_owners_across_chunks() {
+    for error in [false, true] {
+        for helper in [false, true] {
+            let leaf = if error { "err(text)" } else { "ok(text)" };
+            let prefix = if helper {
+                format!("fn Leaf(text: str, marker: int): str! {{ return {leaf} }}\n")
+            } else {
+                String::new()
+            };
+            let rhs = if helper { "Leaf(text, 7)" } else { leaf };
+            let source = format!(
+                "{prefix}fn Entry(text: str): str! {{ r: str! = {rhs}\nr\nr\nr = r\nreturn r }}"
+            );
+            for chunk in [1, 7, 256] {
+                let mut machine = s9_machine(&source);
+                let mut host = production_interpreter(&source);
+                let (value, buffer) = string_input(PAYLOAD, 4096);
+                let mut args = vec![value];
+                let mut proof = S9Proof::new(buffer);
+                machine
+                    .start_owned_once_with_hooks("Entry", &mut args, 0, false, &host)
+                    .unwrap();
+                assert!(args.is_empty());
+                s9_observe(&machine, buffer, &mut proof);
+                if chunk == 1 {
+                    pause_at(&mut machine, &mut host, s9_at_clone);
+                    let before = s9_observe(&machine, buffer, &mut proof);
+                    assert_eq!(before.env.len(), 1);
+                    assert_eq!(before.clone_bytes, 0);
+                    s9_budget(&mut machine, &before, buffer);
+                    s9_clone_step(&mut machine, &mut host, buffer, &mut proof);
+                    let after = s9_observe(&machine, buffer, &mut proof);
+                    assert_eq!((after.env.len(), after.owners.len()), (1, 2));
+                    s9_budget(&mut machine, &after, buffer);
+                }
+                let value = s9_finish(&mut machine, &mut host, chunk, buffer, &mut proof).unwrap();
+                let result = s9_owner(&value, PAYLOAD).unwrap();
+                assert_eq!(result.error.is_some(), error);
+                if let Some(actual) = result.string {
+                    assert_eq!(actual.len, PAYLOAD.len());
+                    assert!(machine.metrics.peak_cloned_string_payload_bytes >= actual.capacity);
+                } else {
+                    assert_eq!(machine.metrics.peak_cloned_string_payload_bytes, 0);
+                }
+                assert_eq!(machine.metrics.peak_string_payload_bytes, buffer.capacity);
+                if chunk == 1 {
+                    assert_eq!(
+                        machine.metrics.peak_cloned_string_payload_bytes,
+                        proof.peak_clone_bytes
+                    );
+                    assert_eq!(
+                        machine.metrics.peak_result_wrapper_capacity,
+                        proof.peak_live
+                    );
+                }
+                assert_eq!(host.call_depth, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_string_local_clone_minimum_rejection_preserves_source_and_original_reservation() {
+    const SOURCE: &str = "fn Entry(text: str): str! { r: str! = ok(text)\nr\nreturn r }";
+    for count_rejection in [false, true] {
+        let mut machine = s9_machine(SOURCE);
+        let mut host = production_interpreter(SOURCE);
+        let (value, buffer) = string_input(PAYLOAD, 4096);
+        let mut args = vec![value];
+        let mut proof = S9Proof::new(buffer);
+        machine
+            .start_owned_once_with_hooks("Entry", &mut args, 0, false, &host)
+            .unwrap();
+        pause_at(&mut machine, &mut host, s9_at_clone);
+        let before = s9_observe(&machine, buffer, &mut proof);
+        let source = before.env[0];
+        machine.reserve_values(1, Span::default()).unwrap();
+        let saved = machine.value_limits;
+        if count_rejection {
+            machine.value_limits.max_frames = live_value_count(&machine);
+        } else {
+            // Exactly enough for a new Box but no independent nonempty buffer.
+            machine.value_limits.max_storage_bytes = live_value_bytes(&machine)
+                + machine.cloned_string_payload_bytes
+                + std::mem::size_of::<Value>();
+        }
+        machine
+            .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut host)
+            .unwrap();
+        assert!(
+            matches!(&machine.pending, Some(Err(error)) if error.message.contains(
+            if count_rejection { "FrameLimit" } else { "StorageLimit" }))
+        );
+        let after = s9_observe(&machine, buffer, &mut proof);
+        assert_eq!(after.env, before.env);
+        assert!(after.owners.contains(&source));
+        assert_eq!(machine.metrics.peak_result_wrapper_capacity, 1);
+        assert_eq!(
+            machine.metrics.peak_cloned_string_payload_bytes, 0,
+            "minimum rejection allocates no new buffer"
+        );
+        machine.value_limits = saved;
+        s9_finish(&mut machine, &mut host, 1, buffer, &mut proof).unwrap_err();
+        machine.prepare_next_run().unwrap();
+        let (value, buffer) = string_input(PAYLOAD, 4096);
+        let mut args = vec![value];
+        let mut proof = S9Proof::new(buffer);
+        machine
+            .start_owned_once_with_hooks("Entry", &mut args, 0, false, &host)
+            .unwrap();
+        s9_finish(&mut machine, &mut host, 1, buffer, &mut proof).unwrap();
+    }
+}
+
+fn s9_deep_finish(
+    machine: &mut Machine,
+    host: &mut Interpreter,
+    input: Buffer,
+    proof: &mut S9Proof,
+    budget_chunk: usize,
+) -> KuResult<Value> {
+    let mut deepest = false;
+    for _ in 0..100_000 {
+        if machine.calls.len() == 512 && !deepest {
+            // One input moves down the 512 real call frames. No artificial
+            // success keeper is installed in an outer Env to multiply owners.
+            let actual = s9_observe(machine, input, proof);
+            assert!(actual.env.len() <= 1);
+            s9_budget(machine, &actual, input);
+            deepest = true;
+        }
+        if deepest && machine.calls.len() <= 32 {
+            // Establish an independent continuous final witness; previous
+            // large chunks never assert identity across destroyed addresses.
+            proof.live.clear();
+            proof.final_clone = None;
+            return s9_finish(machine, host, 1, input, proof);
+        }
+        let chunk = if deepest {
+            budget_chunk
+        } else {
+            // Each Work/exit enters at most one call. This exposes the exact
+            // first depth-512 checkpoint without loosening its 512 limit.
+            budget_chunk.min((512 - machine.calls.len()).max(1))
+        };
+        match machine
+            .dispatch_chunk(NonZeroUsize::new(chunk).unwrap(), host)
+            .unwrap()
+        {
+            ChunkProgress::More { popped } => {
+                assert_eq!(popped, chunk);
+                if deepest || machine.calls.len() % 64 == 0 {
+                    s9_observe(machine, input, proof);
+                }
+            }
+            ChunkProgress::Waiting { .. } => panic!("S9 has no await"),
+            ChunkProgress::Finished { .. } => {
+                panic!("the exact deep checkpoint and final owner must be exposed")
+            }
+        }
+    }
+    panic!("the finite S9 deep source did not finish");
+}
+
+#[test]
+fn selected_string_local_self_mutual_and_fresh_graphs_keep_real_512_first_513_and_reuse() {
+    // The success/error fixtures share no Machine, Env, clock or TLS state.
+    // Keep each complete proof on its construction thread, then join both;
+    // this changes fixture scheduling only, with default stack sizes.
+    std::thread::scope(|scope| {
+        for error in [false, true] {
+            scope.spawn(move || {
+        let leaf = if error { "err(text)" } else { "ok(text)" };
+        let body = format!("if (n <= 0) {{ r: str! = {leaf}\nr\nr = r\nreturn r }}\nr: str! = NEXT(text, n - 1)\nr\nr = r\nreturn r");
+        let self_source = format!(
+            "fn Entry(text: str, n: int): str! {{ {} }}",
+            body.replace("NEXT", "Entry")
+        );
+        let mutual_source = format!("fn Entry(text: str, n: int): str! {{ {} }}\nfn Other(text: str, n: int): str! {{ {} }}",
+            body.replace("NEXT", "Other"), body.replace("NEXT", "Entry"));
+        let fresh_source = format!("fn Entry(text: str, n: int): str! {{ r: str! = Bridge(text, n)\nr\nr = r\nreturn r }}\nfn Bridge(text: str, n: int): str! {{ {} }}", body.replace("NEXT", "Bridge"));
+        // Distribute deep chunks across the three actual call graphs.
+        // The shallow direct/helper clone group covers all chunk sizes
+        // and both success/failure outcomes.
+        for (source, extra, deep_chunk) in [
+            (&self_source, 0, 1),
+            (&mutual_source, 0, 7),
+            (&fresh_source, 1, 256),
+        ] {
+            let chunk = deep_chunk;
+            let mut machine = s9_machine(source);
+            let mut host = production_interpreter(source);
+            for n in [511 - extra, 512 - extra, 0] {
+                if machine.state != MachineState::Ready {
+                    machine.prepare_next_run().unwrap();
+                }
+                let entered = machine.metrics.entered_calls;
+                let retired = machine.metrics.retired_calls;
+                let (value, buffer) = string_input(PAYLOAD, 4096);
+                let mut args = vec![value, Value::Int(n)];
+                let mut proof = S9Proof::new(buffer);
+                machine
+                    .start_owned_once_with_hooks("Entry", &mut args, 0, false, &host)
+                    .unwrap();
+                let result = if n == 0 {
+                    s9_finish(&mut machine, &mut host, chunk, buffer, &mut proof)
+                } else {
+                    s9_deep_finish(&mut machine, &mut host, buffer, &mut proof, chunk)
+                };
+                if n == 512 - extra {
+                    assert_eq!(
+                        result.unwrap_err().code.as_deref(),
+                        Some("call_depth_exceeded")
+                    );
+                    assert_eq!(machine.metrics.entered_calls - entered, 512);
+                    assert_eq!(machine.metrics.peak_calls, 512);
+                } else {
+                    let value = result.unwrap();
+                    assert_eq!(s9_owner(&value, PAYLOAD).unwrap().error.is_some(), error);
+                    assert_eq!(
+                        machine.metrics.entered_calls - entered,
+                        (n + 1 + extra) as usize
+                    );
+                }
+                assert_eq!(
+                    machine.metrics.retired_calls - retired,
+                    machine.metrics.entered_calls - entered
+                );
+                assert_eq!(machine.metrics.retired_calls, machine.metrics.entered_calls);
+                assert_eq!(machine.metrics.peak_string_payload_bytes, buffer.capacity);
+                assert_eq!(host.call_depth, 0);
+                s9_drained(&machine);
+            }
+        }
+        });
+        }
+    });
+}
+
+#[test]
+fn selected_string_local_scopes_and_saved_q_primaries_keep_actual_clone_fees_until_teardown() {
+    for error in [false, true] {
+        let leaf = if error { "err(text)" } else { "ok(text)" };
+        let scoped = format!("fn Entry(text: str): str! {{ r: str! = {leaf}\nif (true) {{ inner: str! = r.clone()\ninner }}\nr\nr = r\nreturn r.clone() }}");
+        let q2 = format!("fn Entry(text: str): str! {{ r: str! = {leaf}\ntry {{ return r.clone() }} finally {{ r\nr = r\nreturn r.clone() }}\nreturn r.clone() }}");
+        let q3 = format!("fn Entry(text: str): str! {{ r: str! = {leaf}\ntry {{ return r.clone() }} finally {{ try {{ return r.clone() }} finally {{ r\nr = r\nreturn r.clone() }} }}\nreturn r.clone() }}");
+        for (source, saved) in [(&scoped, 0), (&q2, 1), (&q3, 2)] {
+            let mut machine = s9_machine(source);
+            let mut host = production_interpreter(source);
+            let (value, buffer) = string_input(PAYLOAD, 4096);
+            let mut args = vec![value];
+            let mut proof = S9Proof::new(buffer);
+            machine
+                .start_owned_once_with_hooks("Entry", &mut args, 0, false, &host)
+                .unwrap();
+            let mut saved_observed = false;
+            let mut explicit_clones = 0;
+            let mut final_value = None;
+            for _ in 0..100_000 {
+                if s9_explicit_clone_ticks(&mut machine, &mut host, buffer, &mut proof) {
+                    explicit_clones += 1;
+                } else if s9_at_clone(&machine) {
+                    s9_clone_step(&mut machine, &mut host, buffer, &mut proof);
+                } else {
+                    match machine
+                        .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut host)
+                        .unwrap()
+                    {
+                        ChunkProgress::More { popped: 1 } => {
+                            s9_observe(&machine, buffer, &mut proof);
+                        }
+                        ChunkProgress::Finished { result, .. } => {
+                            let value = result
+                                .unwrap()
+                                .into_call_value(Span::default(), "function")
+                                .unwrap();
+                            let actual = s9_owner(&value, PAYLOAD).unwrap();
+                            assert!(
+                                proof.live.contains(&actual),
+                                "Q winner was physically observed before teardown"
+                            );
+                            assert_eq!(proof.final_clone, Some(actual));
+                            final_value = Some(value);
+                            break;
+                        }
+                        _ => panic!("a synchronous single-step Q fixture cannot wait"),
+                    }
+                }
+                let actual_saved = machine.finally.frames.as_slice().iter()
+                    .filter(|frame| matches!(&frame.primary, Some(Ok(Flow::Return { value, .. } | Flow::Fail { value, .. })) if matches!(value, Value::Result { .. })))
+                    .count();
+                if actual_saved >= saved {
+                    saved_observed = true;
+                    let actual = s9_observe(&machine, buffer, &mut proof);
+                    s9_budget(&mut machine, &actual, buffer);
+                }
+            }
+            assert!(saved_observed);
+            assert!(explicit_clones > saved);
+            assert!(final_value.is_some(), "the bounded fixture completes");
+            assert_eq!(machine.metrics.entered_finally_frames, saved);
+            assert_eq!(machine.metrics.retired_finally_frames, saved);
+            assert_eq!(host.call_depth, 0);
+            s9_drained(&machine);
+        }
+    }
+}
+
+#[test]
+fn selected_string_local_assignment_tombstones_original_and_never_spends_unused_input_pool() {
+    const SOURCE: &str = "fn Entry(text: str): str! { r: str! = ok(text)\nr = r\nr\nreturn r }";
+    for (text, capacity) in [(PAYLOAD, 4096), ("", 0), ("", 4096)] {
+        let mut machine = s9_machine(SOURCE);
+        let mut host = production_interpreter(SOURCE);
+        let (value, buffer) = string_input(text, capacity);
+        let mut args = vec![value];
+        let mut proof = S9Proof::new(buffer);
+        machine
+            .start_owned_once_with_hooks("Entry", &mut args, 0, false, &host)
+            .unwrap();
+        pause_at(&mut machine, &mut host, s9_at_clone);
+        let before = s9_observe(&machine, buffer, &mut proof);
+        s9_clone_step(&mut machine, &mut host, buffer, &mut proof);
+        let candidate = proof.final_clone.unwrap();
+        if buffer.capacity != 0 {
+            assert!(before.original_seen);
+            let after = s9_observe(&machine, buffer, &mut proof);
+            assert!(after.original_seen);
+            assert_eq!(after.clone_bytes, candidate.string.unwrap().capacity);
+        }
+        // Execute the real Assign continuation that destroys the original r.
+        let Some(Work::Bind(name, _, false, _)) = machine.work.as_slice().last() else {
+            panic!("the actual assignment continuation follows its RHS clone");
+        };
+        assert_eq!(machine.code.symbol(*name), "r");
+        assert!(matches!(
+            machine
+                .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut host)
+                .unwrap(),
+            ChunkProgress::More { popped: 1 }
+        ));
+        let assigned = s9_observe(&machine, buffer, &mut proof);
+        assert!(!assigned.original_seen);
+        assert!(!proof.original_live);
+        assert_eq!(assigned.env, vec![candidate]);
+        assert_eq!(assigned.clone_bytes, candidate.string.unwrap().capacity);
+        assert_eq!(machine.string_payload_bytes, buffer.capacity);
+        s9_budget(&mut machine, &assigned, buffer);
+        let result = s9_finish(&mut machine, &mut host, 1, buffer, &mut proof).unwrap();
+        let outgoing = s9_owner(&result, text).unwrap().string.unwrap();
+        assert_eq!(outgoing.len, text.len());
+        assert!(machine.metrics.peak_cloned_string_payload_bytes >= outgoing.capacity);
+        assert_eq!(host.call_depth, 0);
+    }
+}
+
+#[test]
+fn selected_string_locals_leave_charged_async_and_other_whole_tree_boundaries_unmoved() {
+    for source in [
+        "async fn Entry(text: str): str! { r: str! = ok(text)\nreturn r }",
+        "async fn Child(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { r: str! = await Child(text)\nreturn r }",
+        "fn Pass(value: str!): str! { return value }\nfn Entry(text: str): str! { r: str! = ok(text)\nreturn Pass(r) }",
+        "fn Entry(text: str): str! { r: str! = ok(text.clone())\nreturn r }",
+        "fn Entry(text: str): str! { r: str! = ok(text)\nreturn r.clone().clone() }",
+        "fn Entry(text: str): str! { r: str! = ok(text)\nreturn ok(r?) }",
+        "fn Entry(text: str): str! { r: str! = ok(text)\ntry { marker = 1 } catch (e) { marker = 2 }\nreturn r }",
+    ] {
+        let program = Parser::new(Lexer::new(&format!("{source}\nfn main() {{}}")).tokenize().unwrap())
+            .parse_program().unwrap();
+        crate::checker::Checker::new().check(&program).unwrap();
+        let source_functions = functions(source);
+        let entry = &source_functions["Entry"];
+        assert!(!code::eligible_owned_named(&source_functions, entry, Limits::default()), "{source}");
+        assert!(matches!(CodeHandle::compile_owned_named(&source_functions, entry, Limits::default()),
+            Err(AdmissionError::Unsupported(_))), "{source}");
+        if entry.is_async {
+            assert!(matches!(CodeHandle::compile_claimed_async_owned_result_string_entry(&source_functions, entry, Limits::default()),
+                Err(AdmissionError::Unsupported(_))), "S9 does not admit async String locals: {source}");
+        }
+        let mut host = production_interpreter(source);
+        let (value, buffer) = string_input(PAYLOAD, 4096);
+        let mut args = vec![value];
+        let vector = (args.as_ptr(), args.len(), args.capacity());
+        assert!(try_execute_owned(&mut host, entry, &mut args, 0).is_none());
+        assert_eq!((args.as_ptr(), args.len(), args.capacity()), vector);
+        assert_eq!((host.steps, host.call_depth), (0, 0));
+        assert!(matches!(&args[0], Value::String(actual) if actual.as_ptr() as usize == buffer.pointer
+            && actual.capacity() == buffer.capacity && actual == PAYLOAD));
+    }
+}
+// Keep FinallyProbe unchanged and therefore unauthorized for S9. This wrapper
+// permits only the real Interpreter's move/drop arbitration. Its fault injection
+// changes control flow/TLS only; it does not construct or replace a String Value.
+struct S9StringFaultProbe<'a> {
+    inner: FinallyProbe<'a>,
+    tighten_at: Option<(Span, RuntimeTermination)>,
+    observed_cleanup: Option<RuntimeTermination>,
+}
+
+impl<'a> S9StringFaultProbe<'a> {
+    fn new(
+        host: &'a mut Interpreter,
+        triggers: Vec<(Span, usize, FinallyProbeAction)>,
+        tighten_at: Option<(Span, RuntimeTermination)>,
+    ) -> Self {
+        Self {
+            inner: FinallyProbe::new(host, triggers),
+            tighten_at,
+            observed_cleanup: None,
+        }
+    }
+}
+
+impl ExecutionHooks for S9StringFaultProbe<'_> {
+    fn supports_selected_string_origin_moves(&self) -> bool {
+        true
+    }
+    fn host(&mut self) -> &mut Interpreter {
+        self.inner.host
+    }
+
+    fn prepare_scope_exit(&mut self, env: &mut Env, span: Span) -> KuResult<()> {
+        ExecutionHooks::prepare_scope_exit(self.inner.host, env, span)
+    }
+    fn prepare_call_exit(&mut self, env: &mut Env, span: Span, kind: CallKind) -> KuResult<()> {
+        ExecutionHooks::prepare_call_exit(self.inner.host, env, span, kind)
+    }
+    fn prepare_arguments_exit(
+        &mut self,
+        env: &mut Env,
+        leases: &[BorrowLease],
+        values: &mut [Value],
+        span: Span,
+    ) -> KuResult<()> {
+        ExecutionHooks::prepare_arguments_exit(self.inner.host, env, leases, values, span)
+    }
+
+    fn tick(&mut self, span: Span) -> KuResult<()> {
+        if self
+            .tighten_at
+            .as_ref()
+            .is_some_and(|(target, _)| *target == span)
+        {
+            let (_, context) = self.tighten_at.take().unwrap();
+            drop(CleanupGuard::enter(context));
+            self.observed_cleanup = current_cleanup_context();
+        }
+        ExecutionHooks::tick(&mut self.inner, span)
+    }
+
+    fn finish_scope(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<Flow>,
+        span: Span,
+        pop: bool,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_scope(self.inner.host, env, result, span, pop)
+    }
+    fn finish_scope_with_feedback(
+        &mut self,
+        env: &mut Env,
+        result: KuResult<Flow>,
+        span: Span,
+        pop: bool,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_scope_with_feedback(
+            self.inner.host,
+            env,
+            result,
+            span,
+            pop,
+            feedback,
+        )
+    }
+    fn finish_call(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_call(self.inner.host, env, leases, result, span, kind)
+    }
+    fn finish_call_with_feedback(
+        &mut self,
+        env: Env,
+        leases: Vec<BorrowLease>,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_call_with_feedback(
+            self.inner.host,
+            env,
+            leases,
+            result,
+            span,
+            kind,
+            feedback,
+        )
+    }
+    fn finish_call_value(
+        &mut self,
+        result: KuResult<Flow>,
+        span: Span,
+        kind: CallKind,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_call_value(self.inner.host, result, span, kind)
+    }
+    fn finish_arguments(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_arguments(self.inner.host, env, leases, values, result, span)
+    }
+    fn finish_arguments_with_feedback(
+        &mut self,
+        env: &mut Env,
+        leases: Vec<BorrowLease>,
+        values: Vec<Value>,
+        result: KuResult<Flow>,
+        span: Span,
+        feedback: &Cell<Option<RuntimeTermination>>,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_arguments_with_feedback(
+            self.inner.host,
+            env,
+            leases,
+            values,
+            result,
+            span,
+            feedback,
+        )
+    }
+    fn finish_arguments_value(&mut self, result: KuResult<Flow>, span: Span) -> KuResult<Flow> {
+        ExecutionHooks::finish_arguments_value(self.inner.host, result, span)
+    }
+    fn prepare_finally(
+        &mut self,
+        env: &Env,
+        primary: &KuResult<Flow>,
+        span: Span,
+    ) -> cancellation::FinallyMode {
+        ExecutionHooks::prepare_finally(&mut self.inner, env, primary, span)
+    }
+    fn finish_finally(
+        &mut self,
+        primary: KuResult<Flow>,
+        replacement: KuResult<Flow>,
+        mode: cancellation::FinallyMode,
+        span: Span,
+    ) -> KuResult<Flow> {
+        ExecutionHooks::finish_finally(&mut self.inner, primary, replacement, mode, span)
+    }
+}
+
+// This has one owned String parameter, two real typed local Result cells, and
+// no await/Task/borrow/Result parameter. The only String allocation after entry
+// is the admitted clone Work.
+const S9_FAULT_SOURCE: &str =
+    "fn Entry(text: str): str! { r: str! = ok(text)\ns: str! = r\nreturn s }";
+
+fn s9_input_identity(
+    args: &[Value],
+    capacity: usize,
+) -> (usize, usize, usize, usize, usize, usize) {
+    let Value::String(text) = &args[0] else {
+        panic!("one real String input")
+    };
+    assert_eq!(text.as_str(), PAYLOAD);
+    (
+        args.as_ptr() as usize,
+        capacity,
+        args.len(),
+        text.as_ptr() as usize,
+        text.capacity(),
+        text.len(),
+    )
+}
+
+// Snapshot only metadata. In particular, neither the source Value nor a Work
+// carrying Values is cloned by the fixture.
+fn s9_pause_identity(machine: &Machine) -> String {
+    format!(
+        "{:?}|{}:{}|{}:{}|{}:{}|{}:{}|{}:{}:{}:{}:{}|{:?}|{:?}",
+        machine.state,
+        machine.work.as_slice().as_ptr() as usize,
+        machine.work.len(),
+        machine.calls.as_slice().as_ptr() as usize,
+        machine.calls.len(),
+        machine.values.as_slice().as_ptr() as usize,
+        machine.values.len(),
+        machine.exits.as_slice().as_ptr() as usize,
+        machine.exits.len(),
+        machine.argument_bytes,
+        machine.string_payload_bytes,
+        machine.cloned_string_payload_bytes,
+        machine.result_wrapper_bytes,
+        machine.error_leaf_bytes,
+        machine
+            .original_string
+            .map(|value| (value.pointer, value.capacity, value.still_live)),
+        machine.metrics
+    )
+}
+
+#[test]
+fn selected_string_local_default_hooks_and_old_starts_preserve_inputs_then_resume() {
+    let mut kernel = s9_machine(S9_FAULT_SOURCE);
+    let mut host = production_interpreter(S9_FAULT_SOURCE);
+    let (text, buffer) = string_input(PAYLOAD, 4096);
+    let mut args = vec![text];
+    let input_before = s9_input_identity(&args, args.capacity());
+    let ready_before = s9_pause_identity(&kernel);
+    assert!(!kernel.string_origin_authorized);
+
+    let old_error = kernel
+        .start_owned_once("Entry", &mut args, 0, false)
+        .unwrap_err();
+    assert!(old_error.message.contains("does not support this source"));
+    assert_eq!(s9_input_identity(&args, args.capacity()), input_before);
+    assert_eq!(s9_pause_identity(&kernel), ready_before);
+    {
+        let probe = FinallyProbe::new(&mut host, vec![]);
+        let error = kernel
+            .start_owned_once_with_hooks("Entry", &mut args, 0, false, &probe)
+            .unwrap_err();
+        assert!(error.message.contains("does not support this source"));
+        assert!(probe.ticks.is_empty());
+    }
+    assert_eq!(s9_input_identity(&args, args.capacity()), input_before);
+    assert_eq!(s9_pause_identity(&kernel), ready_before);
+    assert_eq!((host.steps, host.call_depth), (0, 0));
+    assert!(!kernel.string_origin_authorized);
+
+    // The scalar/function-value starts must not bypass ownership authorization.
+    let error = kernel.start_once("Entry", &args, 0, false).unwrap_err();
+    assert!(error.message.contains("does not support this source"));
+    assert_eq!(s9_input_identity(&args, args.capacity()), input_before);
+    assert_eq!(s9_pause_identity(&kernel), ready_before);
+
+    let function = kernel.code.find_function("Entry").unwrap();
+    let span = kernel.code.function(function).span;
+    let error = kernel
+        .start_function_once(function, &args, 0, false, span)
+        .unwrap_err();
+    assert!(error.message.contains("does not support this source"));
+    assert_eq!(s9_input_identity(&args, args.capacity()), input_before);
+    assert_eq!(s9_pause_identity(&kernel), ready_before);
+
+    kernel
+        .start_owned_once_with_hooks("Entry", &mut args, 0, false, &host)
+        .unwrap();
+    assert!(args.is_empty() && args.capacity() == 0);
+    pause_at(&mut kernel, &mut host, s9_at_clone);
+    let mut proof = S9Proof::new(buffer);
+    let before = s9_observe(&kernel, buffer, &mut proof);
+    assert_eq!(before.env.len(), 1);
+    let paused = s9_pause_identity(&kernel);
+    let steps = host.steps;
+    {
+        let mut probe = FinallyProbe::new(&mut host, vec![]);
+        let error = kernel
+            .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut probe)
+            .err()
+            .unwrap();
+        assert!(error.message.contains("does not support this source"));
+        assert!(probe.ticks.is_empty());
+    }
+    assert_eq!(host.steps, steps);
+    assert_eq!(s9_pause_identity(&kernel), paused);
+    let after = s9_observe(&kernel, buffer, &mut proof);
+    assert_eq!(after.env, before.env);
+    assert_eq!(after.owners, before.owners);
+    assert_eq!(after.clone_bytes, before.clone_bytes);
+    let value = s9_finish(&mut kernel, &mut host, 1, buffer, &mut proof).unwrap();
+    assert!(s9_owner(&value, buffer.text).unwrap().string.is_some());
+    s9_drained(&kernel);
+
+    // Original terminal-only String graphs still admit their old API and the
+    // default-false probe. Do not turn generic string contract into authorization.
+    let mut legacy_machine = machine(RELAY, "Relay", Limits::default());
+    let mut legacy_host = production_interpreter(RELAY);
+    assert!(!legacy_machine.code.has_actual_string_result_locals());
+    let (mut args, pointer, capacity) = input(0);
+    legacy_machine
+        .start_owned_once("Relay", &mut args, 0, false)
+        .unwrap();
+    {
+        let mut probe = FinallyProbe::new(&mut legacy_host, vec![]);
+        assert!(matches!(
+            legacy_machine
+                .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut probe)
+                .unwrap(),
+            ChunkProgress::More { popped: 1 }
+        ));
+    }
+    check_result(
+        &finish(&mut legacy_machine, &mut legacy_host, 1, pointer, capacity).unwrap(),
+        pointer,
+        capacity,
+    );
+    assert_owned_drained(&legacy_machine);
+}
+
+fn s9_native_abandonment_proof() {
+    let source = functions(S9_FAULT_SOURCE);
+    let target = stmt_span(&source["Entry"].body[2]);
+    let mut machine = s9_machine(S9_FAULT_SOURCE);
+    let mut host = production_interpreter(S9_FAULT_SOURCE);
+    let (text, buffer) = string_input(PAYLOAD, 4096);
+    let mut args = vec![text];
+    machine
+        .start_owned_once_with_hooks("Entry", &mut args, 0, false, &host)
+        .unwrap();
+    let mut proof = S9Proof::new(buffer);
+    pause_at(&mut machine, &mut host, s9_at_clone);
+    s9_clone_step(&mut machine, &mut host, buffer, &mut proof);
+    assert!(matches!(
+        machine.work.as_slice().last(),
+        Some(Work::Bind(..))
+    ));
+    assert!(matches!(
+        machine
+            .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut host)
+            .unwrap(),
+        ChunkProgress::More { popped: 1 }
+    ));
+    let before = s9_observe(&machine, buffer, &mut proof);
+    assert_eq!(before.env.len(), 2);
+    assert_eq!(before.owners.len(), 2);
+    s9_assert_distinct(before.env[0], before.env[1]);
+
+    let now = Instant::now();
+    let original = RuntimeTermination {
+        reason: TerminationReason::TimedOut,
+        cleanup_deadline: now,
+    };
+    let shorter = RuntimeTermination {
+        reason: TerminationReason::Cancelled,
+        cleanup_deadline: now.checked_sub(Duration::from_millis(1)).unwrap(),
+    };
+    let before_cleanup = current_cleanup_context();
+    let before_execution = crate::runtime::task::current_execution_termination();
+    let mut probe = S9StringFaultProbe::new(
+        &mut host,
+        vec![(target, 1, FinallyProbeAction::Panic)],
+        Some((target, shorter)),
+    );
+    let native = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _execution = ExecutionTerminationGuard::enter();
+        let _cleanup = CleanupGuard::enter(original);
+        for _ in 0..100_000 {
+            assert!(matches!(
+                machine
+                    .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut probe)
+                    .unwrap(),
+                ChunkProgress::More { popped: 1 }
+            ));
+        }
+        panic!("the bounded real return safepoint was not reached");
+    }));
+    assert_eq!(
+        native.unwrap_err().downcast_ref::<&str>().copied(),
+        Some("native finally probe panic")
+    );
+    assert!(probe.inner.triggers.is_empty());
+    assert_eq!(
+        probe.observed_cleanup,
+        Some(RuntimeTermination {
+            reason: original.reason,
+            cleanup_deadline: shorter.cleanup_deadline,
+        })
+    );
+    assert_eq!(machine.state, MachineState::Aborted);
+    assert_eq!(machine.aborted_release, probe.observed_cleanup);
+    drop(probe);
+    // The dispatch catch settles operation locals. Both real Env owners are
+    // still alive and separately charged before the actual Machine Drop.
+    let after = s9_observe(&machine, buffer, &mut proof);
+    assert_eq!(after.env, before.env);
+    assert_eq!(after.owners, before.owners);
+    assert_eq!(after.clone_bytes, before.clone_bytes);
+    assert_eq!(current_cleanup_context(), before_cleanup);
+    assert_eq!(
+        crate::runtime::task::current_execution_termination(),
+        before_execution
+    );
+    drop(machine);
+    assert_eq!(current_cleanup_context(), before_cleanup);
+    assert_eq!(
+        crate::runtime::task::current_execution_termination(),
+        before_execution
+    );
+    assert_eq!(host.call_depth, 0);
+}
+
+// Physical Drop limitation: String and Box have no user destructor. Do not add
+// a synthetic Task or fabricated Drop callback into this strict taskless graph.
+// This draft validates real retained owner fees before Drop and TLS after Drop;
+// it does not claim allocator-level post-free observation.
+//
+// Existing old terminal-only/old scalar poison tests remain unchanged.
+
+#[test]
+fn selected_string_local_poison_uses_only_new_taskless_classifier_and_drains_real_source() {
+    let mut machine = s9_machine(S9_FAULT_SOURCE);
+    let mut host = production_interpreter(S9_FAULT_SOURCE);
+    let (text, buffer) = string_input(PAYLOAD, 4096);
+    let mut args = vec![text];
+    machine
+        .start_owned_once_with_hooks("Entry", &mut args, 0, false, &host)
+        .unwrap();
+    pause_at(&mut machine, &mut host, s9_at_clone);
+    let mut proof = S9Proof::new(buffer);
+    let before = s9_observe(&machine, buffer, &mut proof);
+    assert_eq!(before.env.len(), 1);
+    let original_charge = machine.frame().env.selected_string_result_charge();
+
+    // The fault takes the actual source binding lock, obtains a genuine clone
+    // from the private clone operation, then abandons that owner on unwind.
+    // This is an operation-layer native fault, not a fabricated Machine Work.
+    let mut candidate = None;
+    let mut returned_charge = None;
+    let now = Instant::now();
+    let first = RuntimeTermination {
+        reason: TerminationReason::TimedOut,
+        cleanup_deadline: now,
+    };
+    let shorter = RuntimeTermination {
+        reason: TerminationReason::Cancelled,
+        cleanup_deadline: now.checked_sub(Duration::from_millis(1)).unwrap(),
+    };
+    let mut observed_cleanup = None;
+    let native = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cleanup = CleanupGuard::enter(first);
+        machine
+            .frame()
+            .env
+            .with_value::<()>("r", Span::default(), |source| {
+                let mut observed = StringCloneCharge::default();
+                let (value, charge) = clone_selected_string_result(
+                    source,
+                    unlimited_local_clone_policy(),
+                    &mut observed,
+                )?;
+                let source_metadata = s9_owner(source, buffer.text).unwrap();
+                let candidate_metadata = s9_owner(&value, buffer.text).unwrap();
+                assert_eq!(source_metadata, before.env[0]);
+                s9_assert_distinct(source_metadata, candidate_metadata);
+                // Both actual source and clone are alive at the comparison above.
+                candidate = Some(candidate_metadata);
+                returned_charge = Some(charge);
+                drop(CleanupGuard::enter(shorter));
+                observed_cleanup = current_cleanup_context();
+                let _operation_owner = value;
+                panic!("actual selected String clone abandonment under source lock");
+            })
+            .unwrap();
+    }));
+    assert_eq!(
+        native.unwrap_err().downcast_ref::<&str>().copied(),
+        Some("actual selected String clone abandonment under source lock")
+    );
+    let candidate = candidate.unwrap();
+    let fee = returned_charge.unwrap();
+    assert_eq!(fee.string_bytes, candidate.string.unwrap().capacity);
+    assert_eq!(fee.payload.box_count, 1);
+    assert_eq!(fee.payload.box_bytes, std::mem::size_of::<Value>());
+    assert_eq!(
+        observed_cleanup,
+        Some(RuntimeTermination {
+            reason: first.reason,
+            cleanup_deadline: shorter.cleanup_deadline,
+        })
+    );
+    assert!(current_cleanup_context().is_none());
+
+    // The original public/scalar poison contract still rejects this success
+    // String. S9 uses only its separately gated strict taskless APIs.
+    assert_poison_simple_contract(&mut machine.frame().env, "r", false);
+    let span = Span::default();
+    assert_eq!(
+        machine
+            .frame()
+            .env
+            .current_scope_selected_string_task_count(span)
+            .unwrap(),
+        0
+    );
+    let mut proxies = Vec::new();
+    machine
+        .frame()
+        .env
+        .collect_current_scope_selected_string_tasks_reserved(&mut proxies, span)
+        .unwrap();
+    assert_eq!((proxies.len(), proxies.capacity()), (0, 0));
+    assert_eq!(
+        machine.frame().env.selected_string_result_charge(),
+        original_charge
+    );
+    machine.synchronize_result_wrapper_charge();
+    let after = s9_observe(&machine, buffer, &mut proof);
+    assert_eq!(after.env, before.env);
+    assert_eq!(after.owners, before.owners);
+    assert_eq!(
+        after.clone_bytes, 0,
+        "the operation-local clone physically unwound"
+    );
+    // No Machine peak claim is inferred from the abandoned external operation.
+    // Drive the poisoned clone Work directly: the independent normal-clone
+    // observer intentionally uses ordinary with_value and must not unwrap a
+    // poisoned source before the runtime can report its own genuine error.
+    assert!(s9_at_clone(&machine));
+    assert!(matches!(
+        machine
+            .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut host)
+            .unwrap(),
+        ChunkProgress::More { popped: 1 }
+    ));
+    assert!(
+        matches!(machine.pending.as_ref(), Some(Err(error)) if error.message.contains("poisoned"))
+    );
+    let error = s9_finish(&mut machine, &mut host, 1, buffer, &mut proof).unwrap_err();
+    assert!(error.message.contains("poisoned"));
+    s9_drained(&machine);
+    assert!(current_cleanup_context().is_none());
+    assert!(crate::runtime::task::current_execution_termination().is_none());
+    assert_eq!(host.call_depth, 0);
+}
+
+#[test]
+fn selected_string_local_real_native_panic_drop_preserves_first_cleanup_cause_and_tls() {
+    s9_native_abandonment_proof();
+}
+
+#[test]
+fn selected_string_local_protected_cancel_drains_real_finally_clones_without_replacing_first_cause()
+{
+    const SOURCE: &str = "fn Entry(text: str): str! { r: str! = ok(text)\ntry { marker = 1\nmarker = 2 } finally { r\nr = r }\nreturn r }";
+    let source = functions(SOURCE);
+    let Stmt::Try { body, .. } = &source["Entry"].body[1] else {
+        panic!("the real protected fixture")
+    };
+    let target = stmt_span(&body[1]);
+    let first = RuntimeTermination {
+        reason: TerminationReason::Cancelled,
+        cleanup_deadline: Instant::now() + HTTP_HANDLER_CLEANUP_GRACE,
+    };
+    let mut kernel = s9_machine(SOURCE);
+    let mut host = production_interpreter(SOURCE);
+    let (value, buffer) = string_input(PAYLOAD, 4096);
+    let mut args = vec![value];
+    kernel
+        .start_owned_once_with_hooks("Entry", &mut args, 0, false, &host)
+        .unwrap();
+    let mut proof = S9Proof::new(buffer);
+    let before_cleanup = current_cleanup_context();
+    let before_execution = crate::runtime::task::current_execution_termination();
+    let execution = ExecutionTerminationGuard::enter();
+    let mut probe = S9StringFaultProbe::new(
+        &mut host,
+        vec![(target, 1, FinallyProbeAction::Terminate(first))],
+        None,
+    );
+    let mut finished = None;
+    for _ in 0..100_000 {
+        match kernel
+            .dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut probe)
+            .unwrap()
+        {
+            ChunkProgress::More { popped: 1 } => {
+                s9_observe(&kernel, buffer, &mut proof);
+            }
+            ChunkProgress::Finished { result, .. } => {
+                finished = Some(match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("the protected cancellation must preserve its real error"),
+                });
+                break;
+            }
+            _ => panic!("the bounded synchronous protected fixture cannot wait"),
+        }
+    }
+    let error = finished.expect("protected cleanup completes under its original deadline");
+    assert_eq!(error.runtime_termination(), Some(first));
+    assert_eq!(probe.inner.protected, vec![first]);
+    assert!(probe.inner.triggers.is_empty());
+    assert!(
+        proof.peak_clone_bytes != 0,
+        "the protected finally really cloned the selected success"
+    );
+    assert_eq!(kernel.metrics.entered_finally_frames, 1);
+    assert_eq!(kernel.metrics.retired_finally_frames, 1);
+    s9_drained(&kernel);
+    drop(probe);
+    drop(execution);
+    assert_eq!(host.call_depth, 0);
+    assert_eq!(current_cleanup_context(), before_cleanup);
+    assert_eq!(
+        crate::runtime::task::current_execution_termination(),
+        before_execution
+    );
+}
+
+#[test]
+fn selected_string_local_native_drop_keeps_the_same_worker_next_task_healthy() {
+    let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
+    let (tx, rx) = mpsc::channel();
+    let first = runtime
+        .spawn(move || {
+            s9_native_abandonment_proof();
+            tx.send((
+                std::thread::current().id(),
+                crate::runtime::task::current_task_id(),
+                current_cleanup_context().is_none(),
+                crate::runtime::task::current_execution_termination().is_none(),
+            ))
+            .unwrap();
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let abandoned = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(first.await_result().unwrap(), Value::Null);
+    retire_s7_task(first);
+    let (tx, rx) = mpsc::channel();
+    let healthy = runtime
+        .spawn(move || {
+            let mut host = production_interpreter(S9_FAULT_SOURCE);
+            let (value, buffer) = string_input(PAYLOAD, 4096);
+            let result = host.call_function("Entry", vec![value], Span::default(), 0)?;
+            let actual = s9_owner(&result, buffer.text).unwrap();
+            assert!(actual.string.is_some());
+            tx.send((
+                std::thread::current().id(),
+                crate::runtime::task::current_task_id(),
+                host.call_depth,
+                current_cleanup_context().is_none(),
+                crate::runtime::task::current_execution_termination().is_none(),
+            ))
+            .unwrap();
+            Ok(result)
+        })
+        .unwrap();
+    let next = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let returned = healthy.await_result().unwrap();
+    // await_result follows its existing clone contract. Check its content,
+    // never infer that its Box/buffer is the earlier worker-owned allocation.
+    assert!(s9_owner(&returned, PAYLOAD).unwrap().string.is_some());
+    retire_s7_task(healthy);
+    runtime.cancel_all_and_wait(Duration::from_secs(3)).unwrap();
+    let retired = runtime.snapshot().unwrap();
+    assert_eq!(
+        (
+            retired.active_tasks,
+            retired.queued_tasks,
+            retired.registered_tasks,
+            retired.wait_edges
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(abandoned.0, next.0);
+    assert_ne!(abandoned.1, 0);
+    assert_ne!(abandoned.1, next.1);
+    assert!(abandoned.2 && abandoned.3 && next.3 && next.4);
+    assert_eq!(next.2, 0);
 }
