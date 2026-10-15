@@ -5914,6 +5914,129 @@ impl ClaimedNamedTask {
         };
         let (function, args) = runner.legacy.as_ref().expect("initial named task body");
         let limits = Limits::default();
+        // This independent async parameter contract inspects the actual input
+        // while the original FnDecl/Vec still belong to the legacy candidate.
+        // Its existing String/scalar selectors below retain their precedence
+        // for every shape they already supported.
+        if code::single_async_owned_scalar_result_parameter_kind(function).is_some() {
+            let input = (|| {
+                if args.len() != function.params.len() {
+                    return None;
+                }
+                for (value, param) in args.iter().zip(&function.params) {
+                    if let Some(kind) = code::primitive_result_kind(&param.ty) {
+                        let supported = match value {
+                            Value::Result { ok: true, value } => {
+                                primitive_result_payload_matches(value, kind)
+                            }
+                            Value::Result { ok: false, value } => {
+                                matches!(value.as_ref(), Value::Object(fields)
+                                    if fields.len() == 3
+                                        && ["domain", "code", "message"].iter().all(|name|
+                                            matches!(fields.get(*name), Some(Value::String(_)))))
+                            }
+                            _ => false,
+                        };
+                        if !supported {
+                            return None;
+                        }
+                    } else if !code::primitive_type_kind(&param.ty)
+                        .is_some_and(|kind| primitive_result_payload_matches(value, kind))
+                    {
+                        return None;
+                    }
+                }
+                // Shape validation is complete before arithmetic admission.
+                // Preserve a real capacity/arithmetic rejection as Rejected;
+                // do not erase it into Unsupported and replay the body.
+                let payload = args
+                    .iter()
+                    .zip(&function.params)
+                    .find_map(|(value, param)| {
+                        code::primitive_result_kind(&param.ty)
+                            .map(|kind| scalar_result_parameter_charge(value, kind, span))
+                    })
+                    .expect("one validated async Result parameter");
+                Some(payload.and_then(|payload| {
+                    let count = args
+                        .capacity()
+                        .checked_add(payload.count)
+                        .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+                    let bytes = args
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<Value>())
+                        .and_then(|bytes| bytes.checked_add(payload.bytes))
+                        .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
+                    if count > limits.values.max_frames {
+                        return Err(storage_error(ReserveError::FrameLimit, span));
+                    }
+                    if bytes > limits.values.max_storage_bytes {
+                        return Err(storage_error(ReserveError::StorageLimit, span));
+                    }
+                    Ok(())
+                }))
+            })();
+            if let Some(input) = input {
+                // Borrow the immutable source for whole-tree validation first.
+                // Unsupported must preserve both original owners even when a
+                // candidate input would exceed this private budget.
+                let admission = code::admit_claimed_async_owned_scalar_result_parameter_entry(
+                    &runner.interpreter.functions,
+                    function,
+                    limits,
+                );
+                let selected = match admission {
+                    Ok(()) => true,
+                    Err(AdmissionError::Unsupported(_)) => false,
+                    Err(error @ AdmissionError::Rejected(_)) => {
+                        runner.outcome = Some(Err(error.into_error()));
+                        drop(runner.legacy.take());
+                        return runner;
+                    }
+                };
+                if selected {
+                    if let Err(error) = input {
+                        runner.outcome = Some(Err(error));
+                        drop(runner.legacy.take());
+                        return runner;
+                    }
+                    // Only a fully supported, capacity-admitted input reaches
+                    // this first FunctionTable clone. No argument was cloned.
+                    let source = runner.interpreter.functions.clone();
+                    match CodeHandle::compile_claimed_async_owned_scalar_result_parameter_entry(
+                        &source, function, limits,
+                    ) {
+                        Err(AdmissionError::Unsupported(_)) => {}
+                        Err(error @ AdmissionError::Rejected(_)) => {
+                            runner.outcome = Some(Err(error.into_error()));
+                            drop(runner.legacy.take());
+                            return runner;
+                        }
+                        Ok(code) => {
+                            let (function, mut args) = runner
+                                .legacy
+                                .take()
+                                .expect("selected async Result parameter input");
+                            let mut machine =
+                                Machine::from_code(code, limits, runner.interpreter.call_depth);
+                            if let Err(error) = machine.start_owned_once_with_hooks(
+                                &function.name,
+                                &mut args,
+                                0,
+                                false,
+                                &runner.interpreter,
+                            ) {
+                                runner.outcome = Some(Err(error));
+                            }
+                            runner.machine = Some(machine);
+                            drop(function);
+                            drop(args);
+                            return runner;
+                        }
+                    }
+                }
+            }
+        }
         let source = runner.interpreter.functions.clone();
         let owned_string_result = function.is_async
             && matches!(&function.return_type,
