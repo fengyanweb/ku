@@ -58,7 +58,7 @@ enum Type {
     },
     /// A tagged dynamic value read out of a dynamic object (`obj[key]?`,
     /// `get_or`). A first-class type, NOT `Unknown`: only println /
-    /// json.stringify / object-array nesting / `==` `!=` / explicit
+    /// json.stringify/encode / object-array nesting / `==` `!=` / explicit
     /// `.as_int()` / `.as_str()` accept it; arithmetic is rejected.
     KuValue,
     Unknown,

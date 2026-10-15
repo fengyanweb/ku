@@ -632,7 +632,7 @@ native 支持调用函数数组元素，并保留其参数模式。struct 函数
 - 第一版禁止 `async fn` 直接声明 `&` 参数，也禁止闭包捕获 borrowed 参数。async 函数内部仍可调用同步借用函数，借用不会进入 task frame。
 - 当前明确拒绝 borrowed array 的 `for`、borrowed match 的 owned payload binding，以及 fallible object lookup；可先显式 `.clone()` 再执行。match 的 tag 检查与 Copy payload 不因此获得 owned 子值。消费式对象解构与 borrowed Result 的 `?` 也需要先显式 `.clone()`。
 
-首批接受用户 borrowed 参数的标准库包括 `len`、`str`、`print`、`println`、字符串 `len` / `byte_len` / `contains` / `starts_with` / `ends_with`、数组 `len` / `is_empty` 和 `json.stringify`。例如 `text.len()` 和 `items.len()` 的 receiver 不消费来源。这不是所有标准库 API 都能接收 borrowed 参数的承诺：`string.chars`、`array.first`、`array.map` 等尚未迁移的路径会明确拒绝，不能隐式 clone；已有普通 owned 调用按原合同处理。容器插入、Task/await、transaction、`listen` 等操作仍按各自的所有权合同处理。`&` 只约束直接读写和所有权，不表示纯函数，也不禁止 opaque client 在内部更新连接池状态。
+首批接受用户 borrowed 参数的标准库包括 `len`、`str`、`print`、`println`、字符串 `len` / `byte_len` / `contains` / `starts_with` / `ends_with`、数组 `len` / `is_empty` 和 `json.stringify` / `json.encode`。例如 `text.len()` 和 `items.len()` 的 receiver 不消费来源。这不是所有标准库 API 都能接收 borrowed 参数的承诺：`string.chars`、`array.first`、`array.map` 等尚未迁移的路径会明确拒绝，不能隐式 clone；已有普通 owned 调用按原合同处理。容器插入、Task/await、transaction、`listen` 等操作仍按各自的所有权合同处理。`&` 只约束直接读写和所有权，不表示纯函数，也不禁止 opaque client 在内部更新连接池状态。
 
 已迁移的 `contains` 等读取方法也执行同次调用的借用冲突检查：`text.contains(ChangeText())` 若后一个表达式修改 `text`，会被拒绝。需要修改前快照时先显式保存独立副本，再调用：
 
@@ -645,7 +645,7 @@ fn main() {
 }
 ```
 
-未迁移的 `array.push` 普通 owned 调用仍保留既有参数求值快照语义，不能据此推导用户 borrowed array 已可传入。`json.stringify(value)` 只读取输入并返回新的 owned 字符串 Result；生成 C 对 typed array 直接使用只读 writer，调用后原数组仍有效，输出 buffer 的分配不属于输入 clone。
+未迁移的 `array.push` 普通 owned 调用仍保留既有参数求值快照语义，不能据此推导用户 borrowed array 已可传入。`json.stringify(value)` / `json.encode(value)` 只读取输入并返回新的 owned 字符串 Result；生成 C 对 typed array 直接使用只读 writer，调用后原数组仍有效，输出 buffer 的分配不属于输入 clone。
 
 不支持 `inspect(&user)`、`value: &User`、`[&User]`、`&mut`、地址获取或一等引用。`view` 仍是普通 identifier；`fn f(view value: User)` 和 `fn f(ref value: User)` 都不是参数语法。规范格式固定为 `&name: Type` / `fn(&Type): R`，`&` 后不加空格。
 
@@ -1076,7 +1076,7 @@ fn read(user): str! {
 
 `obj["key"]?` 缺键返回 `Err` 而非 `null`——因为 `?` 在 Ku 统一表示 Result 错误传播，不重载为“缺失即 null”。`obj["key"]`（不带 `?`）缺键是 runtime panic。数组/字符串索引越界同样是 panic（数组可恢复读取用 `arr.try_get(i)`）。
 
-`obj["key"]?` 解包出的是 **KuValue**——一个一等的 tagged 动态值（不是 `Unknown`/`any`）。KuValue 只能用于 `println`、`json.stringify`、object/array 嵌套、`==` / `!=`，以及显式转换 `.as_int()` / `.as_str()`；**不允许直接算术**（`obj["age"]? + 1` 编译报错）。要当具体类型用必须显式转换（返回 `T!`，tag 不匹配则 `Err`）：
+`obj["key"]?` 解包出的是 **KuValue**——一个一等的 tagged 动态值（不是 `Unknown`/`any`）。KuValue 只能用于 `println`、`json.stringify` / `json.encode`、object/array 嵌套、`==` / `!=`，以及显式转换 `.as_int()` / `.as_str()`；**不允许直接算术**（`obj["age"]? + 1` 编译报错）。要当具体类型用必须显式转换（返回 `T!`，tag 不匹配则 `Err`）：
 
 ```ku
 fn read(obj): int! {
@@ -1495,12 +1495,22 @@ obj.get_or(key:str, default:any): any
 ### 12.7 json
 
 ```txt
+json.encode(&value:any): str!
+json.decode(text:str): KuValue!
 json.stringify(&value:any): str!
 json.parse(text:str): KuValue!
 json.try_parse(text:str): KuValue!
 ```
 
-`json.parse` 和 `json.stringify` 失败时返回 `Err(Error)`。`json.try_parse` 是 `json.parse` 的同类型兼容别名。解析结果是 tagged `KuValue`，可以承载 JSON object、array、string、number、bool 和 null；使用具体类型前需显式转换。
+`encode` 与 `stringify` 共用编码入口，`decode` 与 `parse/try_parse` 共用解析入口，旧名称保持兼容。两端使用固定的 [yyjson 0.13.0](https://github.com/ibireme/yyjson/tree/0.13.0)，MIT 许可证保存在 [vendor/yyjson/LICENSE](../vendor/yyjson/LICENSE)，来源与校验信息见 [UPSTREAM.json](../vendor/yyjson/UPSTREAM.json)。解释器、默认打包 runner 和同步 native C 路径支持这些接口；受限 native Task 子集与 LLVM 尚不支持 JSON。
+
+编码默认紧凑输出，只读输入，不移动、修改或释放原对象；支持 str、bool、int、有限 float、null、嵌套数组、字符串键对象和可表示的 struct。中文、emoji、引号、反斜杠、换行和内嵌 NUL 按 JSON 转义规则处理。对象键按 UTF-8 字节序稳定排序，解码时重复键保留最后一个值。函数、Task、资源句柄、Result 和 enum 不能编码；循环引用明确拒绝，过深嵌套按预算返回错误，不会无限展开。
+
+整数使用 Ku 的有符号 64 位范围 `[-9223372036854775808, 9223372036854775807]`，越界整数报错，不降成 float。float 使用有限 IEEE 754 binary64，沿用 Ku 的最短固定小数输出；JSON 小数读取遵循 binary64 舍入，不保证保留原始数字文本或 int/float 文本形式。NaN、Infinity 以及数值溢出均报错。
+
+解析默认严格 JSON，拒绝注释、尾逗号、非法转义、无效 Unicode 与多余尾部内容。失败返回 `Err(Error)`，`domain` 为 `json`，常见 `code` 为 `parse_error`、`stringify_error` 或 `out_of_memory`；语法解析错误消息包含从 0 开始的 UTF-8 `byte N` 位置。用 `?` 传播，或在 `try/catch` 中处理。输入与输出各限 1,000,000 字节，深度检查为 `depth > 32`：根值从 0 计，保留 33 层空容器可接受、34 层拒绝的旧边界；非空子值仍占下一层。
+
+解析结果为 tagged `KuValue`，独立持有 Ku 字符串与容器；yyjson 文档释放后仍可使用，由正常 Ku 所有权与作用域规则释放。数组与对象可索引、比较、嵌套和再次编码；具体运算先显式转换，例如 `decoded["count"]?.as_int()? + 1`，字符串读取使用 `.as_str()?`，不能把动态值直接参与算术。完整的正常与非法输入示例见 [examples/json.ku](../examples/json.ku)，可运行 `ku run examples/json.ku`。
 
 ### 12.8 time
 
@@ -2263,7 +2273,7 @@ compiler builtin 最大 token 数: 100000
 parser.parse 最大输出: 1000000 bytes
 json 最大输入: 1000000 bytes
 json 最大嵌套深度: 32
-json.stringify 最大输出: 1000000 bytes
+json.encode / json.stringify 最大输出: 1000000 bytes
 http response 最大 body: 1000000 bytes
 http 默认超时: 5 秒
 async active task 上限: 1024

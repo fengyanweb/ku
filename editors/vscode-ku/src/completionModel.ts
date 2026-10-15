@@ -61,6 +61,8 @@ export const stdFunctions = [
   "array.push",
   "array.concat",
   "object.get_or",
+  "json.encode",
+  "json.decode",
   "json.parse",
   "json.try_parse",
   "json.stringify",
@@ -141,7 +143,7 @@ export const namespaceMembers: Record<string, string[]> = {
   string: ["len", "byte_len", "chars", "contains", "starts_with", "ends_with", "trim", "lower", "upper", "replace", "slice"],
   array: ["len", "try_get", "push", "concat"],
   object: ["get_or"],
-  json: ["parse", "try_parse", "stringify"],
+  json: ["encode", "decode", "parse", "try_parse", "stringify"],
   config: ["env", "env_file", "yaml"],
   time: [
     "now",

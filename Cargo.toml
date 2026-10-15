@@ -21,6 +21,9 @@ url = "2.5"
 zeroize = "1"
 zstd = "0.13"
 
+[build-dependencies]
+cc = "=1.2.64"
+
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 

@@ -3254,6 +3254,36 @@ fn native_json_parse_read_and_convert() {
 }
 
 #[test]
+fn native_json_encode_decode_example_keeps_values_usable() {
+    let dir = unique_temp_dir("json-encode-decode");
+    fs::write(dir.join("main.ku"), include_str!("../examples/json.ku"))
+        .expect("write JSON encode/decode example");
+    let c = native_emit_c(&dir, "main.ku");
+    assert!(c.contains("yyjson_read_opts("));
+    assert!(c.contains("yyjson_mut_write_opts("));
+    assert!(c.contains("yyjson_doc_free("));
+    assert!(c.contains("yyjson_mut_doc_free("));
+    let Some(exe) = native_build(&dir, "main.ku", "jsonencodedecode") else {
+        fs::remove_dir_all(&dir).ok();
+        return;
+    };
+    let (stdout, code) = run_binary(&exe);
+    let stdout = stdout.replace('\r', "");
+    assert!(stdout.contains("\"name\":\"中文😀\""), "{stdout}");
+    assert!(
+        stdout.contains("\"embedded_nul\":\"left\\u0000right\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\nroundtrip ok\njson/parse_error\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("byte 7"), "{stdout}");
+    assert_eq!(code, Some(0));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_kuvalue_equality_is_structural_borrowed_and_array_aware() {
     let dir = unique_temp_dir("kuvalue-equality");
     fs::write(
@@ -3468,6 +3498,7 @@ fn main(): null! {
     ExpectReject("1e")?
     ExpectReject("1e+")?
     ExpectReject("9223372036854775808")?
+    ExpectReject("-9223372036854775809")?
     ExpectReject("1e400")?
     println("done")
     return ok(null)
@@ -3482,7 +3513,8 @@ fn main(): null! {
     let c = native_emit_c(&dir, "main.ku");
     assert!(c.contains("static KuResult_kuvalue ku_json_try_parse("));
     assert!(c.contains("unexpected trailing characters"));
-    assert!(c.contains("ku_json_parse_number"));
+    assert!(c.contains("yyjson_read_opts("));
+    assert!(c.contains("YYJSON_READ_BIGNUM_AS_RAW"));
 
     let Some(exe) = native_build(&dir, "main.ku", "jsonstrictgrammar") else {
         fs::remove_dir_all(&dir).ok();
@@ -3506,6 +3538,10 @@ fn main(): null! {
     println(json.parse("1.5")?)
     println(json.stringify(json.parse("-0.25")?)?)
     println(json.stringify([1.5, 2.25])?)
+    println(json.encode(json.decode("9223372036854775807")?)?)
+    println(json.encode(json.decode("-9223372036854775808")?)?)
+    duplicate = json.decode("{\"value\":1,\"value\":2}")?
+    println(duplicate["value"]?.as_int()? + 1)
     return ok(null)
 }
 "#,
@@ -3517,7 +3553,10 @@ fn main(): null! {
         return;
     };
     let (stdout, code) = run_binary(&exe);
-    assert_eq!(stdout.replace('\r', ""), "1.5\n-0.25\n[1.5,2.25]\n");
+    assert_eq!(
+        stdout.replace('\r', ""),
+        "1.5\n-0.25\n[1.5,2.25]\n9223372036854775807\n-9223372036854775808\n3\n"
+    );
     assert_eq!(code, Some(0));
 
     fs::write(
@@ -3895,9 +3934,10 @@ fn main(): null! {
     .expect("write json cleanup source");
 
     let c = native_emit_c(&dir, "main.ku");
-    assert!(c.contains("ku_json_buffer_drop(&buffer);"));
-    assert!(c.contains("ku_value_array_drop(array);"));
-    assert!(c.contains("ku_object_drop(object);"));
+    assert!(c.contains("yyjson_doc_free("));
+    assert!(c.contains("ku_json_decode_value("));
+    assert!(c.contains("ku_string_drop(&frames[index].key);"));
+    assert!(c.contains("ku_value_drop(&frames[index].value);"));
     assert!(c.contains("ku_value_drop(&value);"));
 
     let Some(exe) = native_build(&dir, "main.ku", "jsoncleanup") else {
@@ -3940,9 +3980,9 @@ fn main(): null! {
     let ordinary_c = native_emit_c(&dir, "main.ku");
     assert!(ordinary_c.contains("#define KU_NATIVE_TEST_OBJECT_OOM 0"));
     assert!(ordinary_c.contains("#define ku_object_malloc(site, bytes) malloc(bytes)"));
-    assert!(ordinary_c.contains("ku_value_drop(&element);"));
-    assert!(ordinary_c.contains("ku_string_drop(&key);"));
-    assert!(ordinary_c.contains("ku_object_drop(object);"));
+    assert!(ordinary_c.contains("ku_value_drop(&frames[index].value);"));
+    assert!(ordinary_c.contains("ku_string_drop(&frames[index].key);"));
+    assert!(ordinary_c.contains("yyjson_doc_free(doc);"));
 
     let Some(exe) = native_build_with_object_oom_hook(&dir, "main.ku", "jsoncontaineroom") else {
         fs::remove_dir_all(&dir).ok();
@@ -4065,9 +4105,9 @@ fn main(): null! {
     .expect("write nested struct JSON source");
 
     let c = native_emit_c(&dir, "main.ku");
-    assert!(c.contains("static bool ku_json_write_typed_struct_Leaf("));
-    assert!(c.contains("static bool ku_json_write_typed_array_struct_Leaf("));
-    assert!(c.contains("static bool ku_json_write_typed_struct_Branch("));
+    assert!(c.contains("static yyjson_mut_val* ku_json_write_typed_struct_Leaf("));
+    assert!(c.contains("static yyjson_mut_val* ku_json_write_typed_array_struct_Leaf("));
+    assert!(c.contains("static yyjson_mut_val* ku_json_write_typed_struct_Branch("));
     assert!(c.contains("static KuResult_str ku_json_stringify_typed_struct_Branch("));
     assert!(
         !c.contains("ku_try_v_typed_array_struct_Leaf"),

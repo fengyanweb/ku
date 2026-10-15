@@ -6,6 +6,17 @@
 ku run examples/hello.ku
 ```
 
+## JSON 编码与解析
+
+`json.ku` 是真实可运行的 `std.json` 示例，包含中文、emoji、引号、反斜杠、换行、内嵌 NUL、数字、bool、null 与嵌套数组；编码后继续使用原对象，解码后读取字段并参与整数运算，再捕获非法 JSON 的错误与 UTF-8 字节位置。
+
+```bash
+ku run examples/json.ku
+ku build --backend c -o json-example examples/json.ku
+```
+
+输出包含紧凑 JSON、`roundtrip ok`、`json/parse_error` 和从 0 开始的 `byte 7` 位置。`json.encode` / `decode` 与旧 `stringify` / `parse/try_parse` 共用入口；底层固定 yyjson 0.13.0（MIT）。默认打包 runner 和同步 native C 使用同一接口，受限 native Task 与 LLVM 尚不支持 JSON。接口、精度、所有权和资源边界见 [JSON 规则](../docs/syntax.md#127-json)。
+
 ## Package 示例
 
 `examples/package` 是可确定性打包的最小 package：

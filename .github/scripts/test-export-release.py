@@ -47,6 +47,9 @@ class ReleaseExportTests(unittest.TestCase):
         self.put(self.package / "LICENSE-MIT", b"original license bytes\r\nCopyright sample\r\n")
         self.put(self.package / "NOTICE", b"original NOTICE bytes\n")
         self.put(self.repo / "Cargo.toml", b"workspace manifest\n")
+        yyjson = Path(__file__).resolve().parents[2] / "vendor" / "yyjson"
+        for name in ("LICENSE", "UPSTREAM.json"):
+            self.put(self.repo / "vendor" / "yyjson" / name, (yyjson / name).read_bytes())
         self.data = {
             "workspace_members": ["ku"],
             "packages": [
@@ -110,6 +113,11 @@ class ReleaseExportTests(unittest.TestCase):
         self.assertEqual(license_path.read_bytes(), (self.package / "LICENSE-MIT").read_bytes())
         third_party = json.loads((extracted / "THIRD_PARTY.json").read_text(encoding="utf-8"))
         self.assertEqual([package["name"] for package in third_party["cargo"]], ["sample"])
+        self.assertEqual(third_party["vendored"][0]["name"], "yyjson")
+        self.assertEqual(third_party["vendored"][0]["version"], "0.13.0")
+        self.assertEqual(
+            (extracted / third_party["vendored"][0]["materials"][0]).read_bytes(),
+            (self.repo / "vendor/yyjson/LICENSE").read_bytes())
         self.assertNotIn(str(self.root), json.dumps(third_party))
         sums = (extracted / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(sums), len(manifest["files"]) - 1)

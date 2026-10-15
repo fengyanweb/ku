@@ -332,6 +332,20 @@ def collect_licenses(stage: Stager, metadata_path: Path, repo: Path, sysroot: Pa
         records.append({"name": name, "version": version, "license": package.get("license"),
                         "source": package.get("source"), "materials": paths})
 
+    # yyjson is compiled into Ku/rlib outside Cargo's crate graph. Preserve its
+    # original MIT text in binary archives as well as standalone generated C.
+    yyjson = repo / "vendor" / "yyjson"
+    upstream = json.loads(read_bounded(yyjson / "UPSTREAM.json", MAX_LICENSE))
+    if (upstream.get("project") != "https://github.com/ibireme/yyjson"
+            or upstream.get("license") != "MIT"
+            or not PACKAGE.fullmatch(upstream.get("version", ""))):
+        raise ExportError("invalid vendored yyjson attribution")
+    yyjson_material = f"THIRD_PARTY/vendor/yyjson-{upstream['version']}/LICENSE"
+    add_license(yyjson / "LICENSE", yyjson_material)
+    vendored = [{"name": "yyjson", "version": upstream["version"], "license": "MIT",
+                 "source": upstream["project"], "commit": upstream["commit"],
+                 "materials": [yyjson_material]}]
+
     rust_doc = sysroot / "share" / "doc" / "rust"
     rust_paths = []
     licenses = rust_doc / "licenses"
@@ -353,6 +367,7 @@ def collect_licenses(stage: Stager, metadata_path: Path, repo: Path, sysroot: Pa
         "scope": "Non-dev dependency closure of workspace roots from caller-supplied cargo metadata --filter-platform TARGET. Includes build dependencies as a conservative superset, not a minimal linked-dependency list.",
         "ku_license": "No open-source license grant for Ku's own code is included in this release.",
         "cargo": records,
+        "vendored": vendored,
         "rust": {"required_toolchain": "1.89.0", "materials": rust_paths},
     }
 

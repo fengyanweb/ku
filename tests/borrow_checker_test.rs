@@ -235,6 +235,7 @@ fn borrow_checker_read_operations_and_required_stdlib_preserve_values() {
 import { json } from "std"
 fn Greet(&name: str): str { return "Hello " + name }
 fn Render(&name: str): str { return `name: {name}` }
+fn Encode(&values: [int]): str! { return json.encode(values) }
 fn Read(&name: str, &values: [int]): str! {
     println(name)
     println(str(name))
@@ -251,6 +252,8 @@ fn Read(&name: str, &values: [int]): str! {
 fn main(): null! {
     value = { name: "Ku" }
     text = json.stringify(value)?
+    alias = json.encode(value)?
+    if (text != alias || Encode([1, 2])? != "[1,2]") { panic("JSON alias") }
     println(value)
     println(text)
     return ok(null)

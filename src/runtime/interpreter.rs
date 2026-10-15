@@ -3261,6 +3261,7 @@ fn readonly_dotted_name(module: &str, method: &str) -> Option<&'static str> {
         ("array", "len") => "array.len",
         ("array", "is_empty") => "array.is_empty",
         ("json", "stringify") => "json.stringify",
+        ("json", "encode") => "json.encode",
         _ => return None,
     })
 }
@@ -3313,7 +3314,7 @@ fn eval_readonly_builtin(name: &str, values: &[Value], span: Span) -> KuResult<O
         if let Some(method) = name.strip_prefix("array.") {
             return stdlib::array::eval(method, std::slice::from_ref(first), span);
         }
-        if name == "json.stringify" {
+        if matches!(name, "json.stringify" | "json.encode") {
             return stdlib::json::eval("stringify", std::slice::from_ref(first), span);
         }
         if name == "print" {
@@ -6348,6 +6349,7 @@ mod collection_tests {
                 "starts_with",
                 "ends_with",
                 "stringify",
+                "encode",
                 "push",
             ] {
                 assert_eq!(

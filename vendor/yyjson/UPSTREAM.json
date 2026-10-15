@@ -1,0 +1,23 @@
+{
+  "project": "https://github.com/ibireme/yyjson",
+  "version": "0.13.0",
+  "commit": "6447536015f3d600f3d65323b10976103b337ca7",
+  "license": "MIT",
+  "files": {
+    "yyjson.h": {
+      "upstream": "src/yyjson.h",
+      "bytes": 330896,
+      "sha256": "ef803cda5c06b8962face6dfa39c3284b3bcf3e73f4d7317664690cc779679ca"
+    },
+    "yyjson.c": {
+      "upstream": "src/yyjson.c",
+      "bytes": 424765,
+      "sha256": "d2d58ef0a3b2267862dc363832c4f3185fd375aea933d5d3419d1a940d6ece2e"
+    },
+    "LICENSE": {
+      "upstream": "LICENSE",
+      "bytes": 1084,
+      "sha256": "45e384d3d52c73cba3a64d6e6c25d47cd738cd8a55c30629e3201046eda62947"
+    }
+  }
+}

@@ -95,8 +95,10 @@ pub(crate) fn argument_modes(name: &str, count: usize) -> Vec<crate::ast::ParamM
             | "kuvalue.as_int"
             | "kuvalue.as_str"
             | "json.parse"
+            | "json.decode"
             | "json.try_parse"
             | "json.stringify"
+            | "json.encode"
             | "config.env"
             | "config.env_file"
             | "config.yaml"
@@ -190,6 +192,7 @@ pub(crate) fn supports_borrowed_call(name: &str) -> bool {
             | "array.len"
             | "array.is_empty"
             | "json.stringify"
+            | "json.encode"
     )
 }
 
@@ -244,8 +247,8 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
             ArgRule::Is(TypePattern::Any),
         ],
         ("kuvalue", "as_int" | "as_str") => vec![ArgRule::Is(TypePattern::Any)],
-        ("json", "parse" | "try_parse") => vec![str_arg()],
-        ("json", "stringify") => vec![ArgRule::Is(TypePattern::Any)],
+        ("json", "parse" | "try_parse" | "decode") => vec![str_arg()],
+        ("json", "stringify" | "encode") => vec![ArgRule::Is(TypePattern::Any)],
         ("config", "env") => vec![],
         ("config", "env_file") => vec![str_arg()],
         ("config", "yaml") => vec![str_arg()],
@@ -328,9 +331,9 @@ pub(crate) fn dotted_signature(module: &str, function: &str) -> Option<Signature
         ("object", "get_or") => TypePattern::Unknown,
         ("kuvalue", "as_int") => TypePattern::ResultOf(Box::new(TypePattern::Int)),
         ("kuvalue", "as_str") => TypePattern::ResultOf(Box::new(TypePattern::String)),
-        ("json", "parse") => TypePattern::ResultOf(Box::new(TypePattern::KuValue)),
+        ("json", "parse" | "decode") => TypePattern::ResultOf(Box::new(TypePattern::KuValue)),
         ("json", "try_parse") => TypePattern::ResultOf(Box::new(TypePattern::KuValue)),
-        ("json", "stringify") => TypePattern::ResultOf(Box::new(TypePattern::String)),
+        ("json", "stringify" | "encode") => TypePattern::ResultOf(Box::new(TypePattern::String)),
         ("config", "env" | "env_file") => TypePattern::ObjectAny,
         ("config", "yaml") => TypePattern::ResultOf(Box::new(TypePattern::ObjectAny)),
         ("time", "instant" | "date" | "from_unix" | "from_millis") => TypePattern::ObjectAny,
@@ -559,7 +562,7 @@ fn dotted_failure_mode(module: &str, function: &str) -> FailureMode {
         | ("string", "slice")
         | ("array", "try_get")
         | ("kuvalue", "as_int" | "as_str")
-        | ("json", "parse" | "try_parse" | "stringify")
+        | ("json", "parse" | "try_parse" | "decode" | "stringify" | "encode")
         | ("config", "yaml")
         | ("time", "days_in_month" | "sleep")
         | ("http", "get" | "post" | "request")
@@ -735,7 +738,7 @@ mod borrow_tests {
                 &["len", "byte_len", "contains", "starts_with", "ends_with"][..],
             ),
             ("array", &["len", "is_empty"][..]),
-            ("json", &["stringify"][..]),
+            ("json", &["stringify", "encode"][..]),
         ] {
             for function in functions {
                 let signature = dotted_signature(module, function).unwrap();

@@ -24,6 +24,12 @@ assert.deepStrictEqual(model.memberCompletionLabels("router", "g"), ["get"]);
 assert.deepStrictEqual(model.memberCompletionLabels("app", "listen"), ["listen"]);
 assert.deepStrictEqual(model.memberCompletionLabels("values", ""), ["len", "try_get", "push", "concat", "map"]);
 assert.deepStrictEqual(model.memberCompletionLabels("time", "d"), ["date", "datetime", "duration", "diff", "days_in_month"]);
+assert.deepStrictEqual(model.memberCompletionLabels("json", "e"), ["encode"]);
+assert.deepStrictEqual(model.memberCompletionLabels("json", "d"), ["decode"]);
+for (const name of ["encode", "decode", "parse", "try_parse", "stringify"]) {
+  assert(model.memberCompletionLabels("json", "").includes(name));
+  assert(model.globalCompletionLabels().includes(`json.${name}`));
+}
 assert.deepStrictEqual(model.memberCompletionLabels("object", ""), ["get_or"]);
 assert.deepStrictEqual(model.memberCompletionLabels("string", "ch"), ["chars"]);
 assert.deepStrictEqual(model.memberCompletionLabels("text", "ch"), ["chars"]);

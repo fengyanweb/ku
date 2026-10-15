@@ -206,7 +206,7 @@ fn borrow_native_nested_reads_allocate_nothing_and_temporaries_drop_after_call()
 }
 
 const JSON_FAILURE_HOOK: &str = r#"
-static size_t ku_borrow_realloc_calls = 0, ku_borrow_fail_realloc = 0;
+static size_t ku_borrow_json_allocation_calls = 0, ku_borrow_fail_json_allocation = 0;
 static size_t ku_borrow_abort_baseline_live = 0, ku_borrow_abort_baseline_bytes = 0;
 static size_t ku_borrow_abort_caught = 0, ku_borrow_abort_finalized = 0;
 static size_t ku_borrow_abort_target_calls = 0;
@@ -219,12 +219,27 @@ static void ku_borrow_check_abort(int64_t stage) {
   else if (stage == 2) ku_borrow_abort_finalized++;
   else { fputs("invalid abort checkpoint\n", stderr); exit(2); }
 }
+#undef malloc
+#undef calloc
 #undef realloc
-static void* ku_borrow_realloc(void* data, size_t size) {
-  if (++ku_borrow_realloc_calls == ku_borrow_fail_realloc) return NULL;
+static int ku_borrow_json_should_fail(void) {
+  return ++ku_borrow_json_allocation_calls == ku_borrow_fail_json_allocation;
+}
+static void* ku_borrow_json_malloc(size_t size) {
+  if (ku_borrow_json_should_fail()) return NULL;
+  return ku_perf_malloc(size);
+}
+static void* ku_borrow_json_calloc(size_t count, size_t size) {
+  if (ku_borrow_json_should_fail()) return NULL;
+  return ku_perf_calloc(count, size);
+}
+static void* ku_borrow_json_realloc(void* data, size_t size) {
+  if (ku_borrow_json_should_fail()) return NULL;
   return ku_perf_realloc(data, size);
 }
-#define realloc ku_borrow_realloc
+#define malloc ku_borrow_json_malloc
+#define calloc ku_borrow_json_calloc
+#define realloc ku_borrow_json_realloc
 "#;
 
 const TIMEOUT_HOOK: &str = r#"
@@ -397,16 +412,29 @@ static int measure(size_t bytes) {
     printf("borrow timeout bytes=%zu mode=%zu target_calls=%zu extra_peak=%zu\n", bytes, mode, ku_borrow_timeout_target_calls, ku_perf_peak_bytes - baseline_bytes);
   }
   ku_borrow_timeout_mode = 0;
-  for (size_t failure = 1; failure <= (bytes > 16 ? 3 : 1); failure++) {
-    ku_borrow_realloc_calls = 0; ku_borrow_fail_realloc = failure;
+  /* Measure this serializer's actual allocation sites before injecting one
+     failure at each ordinal. yyjson's DOM and output allocations are required;
+     they must neither clone the borrowed input nor survive the returned Result. */
+  ku_borrow_json_allocation_calls = 0;
+  KuResult_str successful = Encode(&users);
+  const size_t json_allocations = ku_borrow_json_allocation_calls;
+  CHECK(successful.ok && successful.value.len > bytes);
+  CHECK(json_allocations > 0 && json_allocations <= 256);
+  ku_result_drop_str(&successful);
+  CHECK(ku_perf_live_allocations == baseline_live && ku_perf_live_bytes == baseline_bytes);
+  CHECK(fingerprint(users.data[0].name.ptr, bytes) == expected_hash);
+  for (size_t failure = 1; failure <= json_allocations; failure++) {
+    ku_borrow_json_allocation_calls = 0; ku_borrow_fail_json_allocation = failure;
     KuResult_str encoded = Encode(&users);
+    ku_borrow_fail_json_allocation = 0;
+    CHECK(ku_borrow_json_allocation_calls >= failure);
     CHECK(!encoded.ok && encoded.error.code.len == 13);
     CHECK(!memcmp(encoded.error.code.ptr, "out_of_memory", 13));
     ku_result_drop_str(&encoded);
     CHECK(ku_perf_live_allocations == baseline_live && ku_perf_live_bytes == baseline_bytes);
     CHECK(fingerprint(users.data[0].name.ptr, bytes) == expected_hash);
   }
-  ku_borrow_fail_realloc = 0;
+  printf("borrow JSON bytes=%zu allocation_failure_sites=%zu\n", bytes, json_allocations);
   for (size_t round = 0; round < 2; round++) {
     KuResult_str encoded = Encode(&users);
     CHECK(encoded.ok && encoded.value.len > bytes);

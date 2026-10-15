@@ -1,0 +1,59 @@
+import json from "std.json"
+
+fn main(): null! {
+    nul_value = json.decode("\"left\\u0000right\"")?
+    nul_text = nul_value.as_str()?
+    value = {
+        name: "中文😀",
+        count: 7,
+        ratio: 1.5,
+        active: true,
+        absent: null,
+        escaped: "引号\"反斜杠\\换行\n",
+        embedded_nul: nul_text,
+        nested: { numbers: [[1, 2], [3]] }
+    }
+
+    text = json.encode(value)?
+    if (value["name"]?.as_str()? != "中文😀" || value["count"]?.as_int()? != 7) {
+        panic("JSON encoding changed its input")
+    }
+    println(text)
+
+    decoded = json.decode(text)?
+    name = decoded["name"]?.as_str()?
+    count = decoded["count"]?.as_int()?
+    embedded_nul = decoded["embedded_nul"]?.as_str()?
+    nested = decoded["nested"]?
+    matrix = nested["numbers"]?
+    first = matrix[0]?
+    if (name != "中文😀" || first[1]?.as_int()? + count != 9) {
+        panic("decoded JSON cannot be used normally")
+    }
+    if (decoded["active"]? != true || decoded["absent"]? != null) {
+        panic("decoded JSON changed bool or null")
+    }
+    if (embedded_nul.byte_len() != 10 || !text.contains("\\u0000")) {
+        panic("JSON lost an embedded NUL")
+    }
+    if (json.encode(decoded)? != text || json.stringify(value)? != text) {
+        panic("JSON aliases disagree")
+    }
+    println("roundtrip ok")
+
+    rejected = false
+    try {
+        json.decode("[\"中\",x]")?
+    } catch (error) {
+        rejected = error.domain == "json" && error.code == "parse_error"
+        if (!error.message.contains("byte 7")) {
+            panic("JSON error lost its UTF-8 byte position")
+        }
+        println(error.domain + "/" + error.code)
+        println(error.message)
+    }
+    if (!rejected) {
+        panic("invalid JSON should return an error")
+    }
+    return ok(null)
+}
