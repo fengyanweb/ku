@@ -427,13 +427,15 @@ ACK/error 必须在有界 quantum 内处理，不能在耗尽预算后用 Pendin
 `ku build --backend c` / `ku build --native` 对显式 `async fn main(): null!` 选择独立
 AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包含 runner。
 展开后所有顶层 item 必须是非泛型 async 函数；参数和返回限 primitive/单层 Result。
-支持局部绑定、源码 `if` / `else` / `while` 及词法作用域、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
+支持局部绑定、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
 以及静态字符串；R5e 追加 Copy 表达式，源码 If 见 R5h.5。已有 int/bool/null 局部的
 普通赋值在 RHS 成功端点 Copy 回原槽；自赋值发 Read，保留 IR 的别名/初始化检查。
 源码 while 的回边指向条件求值入口，而非 Await.ready 或旧 bool Branch；本轮正常
 ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不能省略让出。
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
-Owned/Task 重赋值、复合赋值与自增/自减、for、break/continue、递归、跨词法作用域 Task move、try/catch/finally、闭包、同步调用、
+整数 for 先快照上限，以只读 `CheckForLimit` 拒绝负数；隐藏计数器独立于本轮
+可赋值的词法绑定。循环体复用相同 ScopeDrain/drop/Suspend 路径；上限只求值一次。
+Owned/Task 重赋值、复合赋值与自增/自减、数组 for、break/continue、递归、跨词法作用域 Task move、try/catch/finally、闭包、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -476,7 +478,7 @@ manifest 是借用的稳定 instance 存储；完整集合、生命周期、唯�
 父 D 缩短不扫描 manifest，adapter 对 pending issued child 调用 cancel_receipt；
 取消后向最终退出提升、外层 child 合并复用下述 driver 原语及内部 typed adapter。
 对应 TaskOp/verifier 和帧协议见 R5h.4；源码 If 分支与 While 循环已复用该协议，
-并在真实作用域退出时 drain 子 Task。Task 源码的 for、break/continue 与
+并在真实作用域退出时 drain 子 Task。Task 源码的数组 for、break/continue 与
 try/catch/finally 仍未接入，不放宽其余源码边界，不代表完整 async 或 M:N。
 容量和重复检查最多64项/2016次比较，无新增堆分配、队列或 RC 边；测试与精确提交
 验收结果见工作日志，不从接口存在推断真实 C 或 sanitizer 已通过。
@@ -577,8 +579,8 @@ scope_end；全量 ACK 后异常 Pending 作为合同错误拒绝，不循环 YI
 两次有界 drain；Control ABI 2 在同一 poll 中还可进入一次取消 cleanup，而非循环重试。
 不递归 drive child、增加线程或重试环；新增实例字段继续通过 sizeof 计费。
 
-上述是内部合同和实现边界，不等于所有故障/竞态已实测。源码 If/While 只覆盖
-已接入的 primitive（含 str）/单层 Result；任意 Owned payload、for、break/continue、
+上述是内部合同和实现边界，不等于所有故障/竞态已实测。源码 If/While/整数 For 只覆盖
+已接入的 primitive（含 str）/单层 Result；任意 Owned payload、数组 for、break/continue、
 Task 源码 finally 与完整 async 仍未实现。
 真实 C、无副作用 raw 反例、sanitizer、精确 SHA 三系统
 结果分开验收；固定硬件性能、RSS、soak、M:N、netpoll 和事件 HTTP 仍未完成。

@@ -143,6 +143,11 @@ pub enum TaskOp {
     Read {
         slot: SlotId,
     },
+    /// Reject a negative, already materialized integer iteration bound.
+    /// This is a read-only runtime guard, not a new loop or scheduling ABI.
+    CheckForLimit {
+        slot: SlotId,
+    },
     Drop {
         slot: SlotId,
     },
@@ -704,6 +709,11 @@ fn validate_shape(
                 TaskOp::Read { slot } => {
                     get_slot(*slot)?;
                 }
+                TaskOp::CheckForLimit { slot } => {
+                    if slot_type(get_slot(*slot)?)?.0 != &IrType::Int {
+                        return Err(invalid("CheckForLimit requires an int Value slot"));
+                    }
+                }
                 TaskOp::WrapOk { dst, src } => {
                     let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
                     let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
@@ -950,6 +960,9 @@ fn validate_regions_and_progress(
                 // original cancellation/timeout with a normal runtime exit.
                 return Err(invalid("cleanup cannot perform trapping arithmetic"));
             }
+            if matches!(operation, TaskOp::CheckForLimit { .. }) {
+                return Err(invalid("cleanup cannot validate a for iteration bound"));
+            }
         }
         match &function.states[id.0].terminator {
             TaskTerminator::Jump { .. }
@@ -1071,6 +1084,7 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::ScopeExitBegin { .. }
         | TaskOp::ScopeExitEnd { .. }
         | TaskOp::Read { .. }
+        | TaskOp::CheckForLimit { .. }
         | TaskOp::Drop { .. }
         | TaskOp::DropIfInit { .. }
         | TaskOp::Print { .. } => None,
@@ -1414,6 +1428,7 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
             state.may = (state.may & !consumed) | bit(*dst);
         }
         TaskOp::Read { .. }
+        | TaskOp::CheckForLimit { .. }
         | TaskOp::Print { .. }
         | TaskOp::ScopeEnter { .. }
         | TaskOp::ScopeExitBegin { .. }
@@ -1593,9 +1608,10 @@ fn live_states(
                     TaskOp::Binary {
                         dst, left, right, ..
                     } => live = (live & !bit(*dst)) | bit(*left) | bit(*right),
-                    TaskOp::Read { slot } | TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
-                        live |= bit(*slot)
-                    }
+                    TaskOp::Read { slot }
+                    | TaskOp::CheckForLimit { slot }
+                    | TaskOp::Drop { slot }
+                    | TaskOp::DropIfInit { slot } => live |= bit(*slot),
                     TaskOp::Print { value, .. } => live |= bit(*value),
                     TaskOp::Start { dst, arguments, .. } => {
                         live &= !bit(*dst);
@@ -1644,7 +1660,9 @@ fn validate_ownership_and_plan(
                 | TaskOp::Move { src, .. }
                 | TaskOp::WrapOk { src, .. }
                 | TaskOp::Unary { src, .. } => Some(*src),
-                TaskOp::Read { slot } | TaskOp::Drop { slot } => Some(*slot),
+                TaskOp::Read { slot } | TaskOp::CheckForLimit { slot } | TaskOp::Drop { slot } => {
+                    Some(*slot)
+                }
                 TaskOp::Print { value, .. } => Some(*value),
                 _ => None,
             };

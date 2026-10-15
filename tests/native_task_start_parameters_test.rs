@@ -78,9 +78,10 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                     map(left);
                     map(right);
                 }
-                TaskOp::Read { slot } | TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
-                    map(slot)
-                }
+                TaskOp::Read { slot }
+                | TaskOp::CheckForLimit { slot }
+                | TaskOp::Drop { slot }
+                | TaskOp::DropIfInit { slot } => map(slot),
                 TaskOp::Start { dst, arguments, .. } => {
                     map(dst);
                     for argument in arguments {

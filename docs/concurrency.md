@@ -43,7 +43,7 @@ LLVM、`ku ir` 和 `--emit-ir` 的同步 IR 路径仍拒绝 async。
 
 import 展开后只能有顶层、非泛型 async 函数；入口必须是无参数的
 `async fn main(): null!`。函数参数为 `int/bool/null/str` 或对应单层 Result，
-返回类型必须显式为 primitive `T!`。函数体支持局部绑定、源码 `if` / `else` / `while` 及词法作用域、直接 async 调用、
+返回类型必须显式为 primitive `T!`。函数体支持局部绑定、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、直接 async 调用、
 Task move、Await、`ok`、`?`、primitive print/println、显式 return，以及字符串常量 fail。
 Copy 表达式支持 int 的一元 `-`、`+ - * / %`、`== != < <= > >=`，以及 bool 的
 `!`、`== !=`、`&& ||`；不做 bool/int 隐式转换。整数运算先检查边界，溢出和除/余零
@@ -80,6 +80,12 @@ body 内 typed shadow 不替代外层值。Owned/Task 的逐轮重复消费仍�
 原始 IR MUST/MAY 双重检查；原生尚不支持它们的重赋值。有限用例的实际运行、内部
 Scope 两轮取消与完整发布门禁分别记录，不推断任意循环终止、公平时限或性能。
 
+整数 `for item in limit` 在进入循环前只求值并保存一次上限，依次绑定 `0` 到
+`limit - 1`；修改 `item` 或原上限变量不改变迭代次数，退出后恢复外层同名变量。
+上限与循环体可使用当前子集的 Await；负上限经原 runtime-failure 清理路径报告
+`for int iterator expects a non-negative int`。每轮仍先 drain 子 Task、释放局部
+Owned Value，再 Suspend 回到独立计数器；提前退出沿用最终清理。
+
 ```ku
 async fn Child(value: int): int! { return ok(value) }
 async fn main(): null! {
@@ -94,7 +100,7 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝 for、break/continue、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、try/catch/finally、闭包/函数值、
+仍拒绝数组 for、break/continue、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、try/catch/finally、闭包/函数值、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
 float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及异步标准库 I/O。
 未支持形式在生成 artifact 前明确报错。

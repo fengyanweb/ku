@@ -832,6 +832,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             TaskOp::Read { slot } => {
                 out.push_str(&format!("  (void)({});\n", self.place(*slot)));
             }
+            TaskOp::CheckForLimit { slot } => {
+                out.push_str(&format!("  if ({} < 0) {{\n", self.place(*slot)));
+                self.emit_runtime_error(out,
+                    "ku_error_make((KuString){0},(KuString){0},ku_string_static((const uint8_t*)\"for int iterator expects a non-negative int\",43))")?;
+                out.push_str("  }\n");
+            }
             TaskOp::WrapOk { dst, src } => {
                 let payload = if self.owns_slot(*src) {
                     c_move_value(self.slot_type(*src)?, &self.place(*src))?

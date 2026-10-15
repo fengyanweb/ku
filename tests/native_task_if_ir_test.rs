@@ -245,7 +245,7 @@ fn native_task_copy_assignment_raw_type_owned_task_and_declaration_gates_remain(
     for body in [
         "value = 1 value += 1",
         "value = 1 value++",
-        "for item in 0 {}",
+        "while (false) { break }",
     ] {
         let source = format!("async fn main(): null! {{ {body} return ok(null) }}");
         let error = task_lower::lower_program(&checked(&source)).unwrap_err();
@@ -939,11 +939,11 @@ async fn main(): null! { return ok(null) }
 }
 
 #[test]
-fn native_task_if_owned_reassignment_cross_scope_task_moves_and_for_stay_gated() {
+fn native_task_if_owned_reassignment_cross_scope_task_moves_and_array_for_stay_gated() {
     for source in [
         "async fn main(): null! { value = \"first\" if (true) { value = \"second\" } return ok(null) }",
         "async fn Child(): int! { return ok(1) } async fn main(): null! { outer = Child() if (true) { inner = outer } return ok(null) }",
-        "async fn main(): null! { for item in 1 { println(item) } return ok(null) }",
+        "async fn main(): null! { for item in [1, 2] { println(item) } return ok(null) }",
     ] {
         let error = task_lower::lower_program(&checked(source)).expect_err("outside the admitted slice");
         assert!(error.to_string().contains("native async subset"), "{error}");

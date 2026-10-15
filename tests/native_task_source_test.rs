@@ -446,7 +446,7 @@ async fn main(): null! { return ok(null) }
 #[test]
 fn native_task_source_subset_rejects_unimplemented_constructs() {
     let sources = [
-        "async fn main(): null! { for item in 0 {} return ok(null) }",
+        "async fn main(): null! { for item in [1, 2] {} return ok(null) }",
         "async fn main(): null! { try { println(1) } finally { println(2) } return ok(null) }",
         "fn Sync(): int { return 1 } async fn main(): null! { return ok(null) }",
         "async fn main(): null! { value = \"first\" value = \"second\" return ok(null) }",

@@ -397,6 +397,64 @@ async fn main(): null! {
 }
 
 #[test]
+fn native_task_integer_for_matches_interpreter_and_closes_allocations() {
+    let cases = [
+        (
+            r#"
+async fn Child(value: int): int! { return ok(value) }
+async fn main(): null! {
+    item = 90
+    limit = 3
+    total = 0
+    for item in 0 { println(999) }
+    for item in 1 { println(item) }
+    for item in limit {
+        limit = 0
+        total = total + item
+        item = 99
+        println((await Child(item))?)
+    }
+    println(total)
+    println(limit)
+    println(item)
+    return ok(null)
+}
+"#,
+            "0\n99\n99\n99\n3\n0\n90\n",
+            None,
+        ),
+        (
+            "async fn main(): null! { for item in 2 { for item in 2 { println(item) } println(item) } return ok(null) }",
+            "0\n1\n0\n0\n1\n1\n",
+            None,
+        ),
+        (
+            "async fn Bound(): int! { println(\"bound\") return ok(3) } async fn main(): null! { for item in (await Bound())? { println(item) } return ok(null) }",
+            "bound\n0\n1\n2\n",
+            None,
+        ),
+        (
+            "async fn Pick(limit: int): int! { for item in limit { if (item == 2) { return ok(item) } } return ok(-1) } async fn main(): null! { println((await Pick(5))?) println((await Pick(0))?) return ok(null) }",
+            "2\n-1\n",
+            None,
+        ),
+        (
+            "async fn Bound(): int! { return ok(-1) } async fn main(): null! { for item in (await Bound())? { println(999) } return ok(null) }",
+            "",
+            Some("for int iterator expects a non-negative int"),
+        ),
+        (
+            "async fn Child(value: str): str! { return ok(value) } async fn main(): null! { for item in 3 { held = \"body\" pending = Child(\"discarded\") unused = ok(\"local\") println(held) } println(\"done\") return ok(null) }",
+            "body\nbody\nbody\ndone\n",
+            None,
+        ),
+    ];
+    for (index, (source, stdout, failure)) in cases.into_iter().enumerate() {
+        run_case(400 + index, source, stdout, failure);
+    }
+}
+
+#[test]
 fn native_task_if_real_source_branches_match_interpreter_and_close_runtime_allocations() {
     let cases = [
         (
@@ -704,8 +762,8 @@ fn native_task_if_cli_rejects_unsupported_and_ownership_before_either_artifact_p
             "task 'grand' has already been awaited",
         ),
         (
-            "async fn main(): null! { if (false) { for item in 0 {} } return ok(null) }",
-            "native async subset does not support this statement",
+            "async fn main(): null! { if (false) { for item in [1, 2] {} } return ok(null) }",
+            "native async subset does not support this expression",
         ),
         (
             "async fn main(): null! { while (false) { break } return ok(null) }",

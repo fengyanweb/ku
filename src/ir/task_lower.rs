@@ -758,7 +758,7 @@ impl<'a> FunctionLowerer<'a> {
 
     fn lower_block(&mut self, body: &[Stmt], depth: usize) -> KuResult<()> {
         // Charge before traversal; width is not recursion depth. No new AST is
-        // cloned; lower_if/lower_while check before each recursive descent.
+        // cloned; structured statements check before each recursive descent.
         if body.len() > TaskLimits::default().max_operations {
             return Err(unsupported("statements beyond the Task budget", self.span));
         }
@@ -784,6 +784,12 @@ impl<'a> FunctionLowerer<'a> {
                     body,
                     span,
                 } => self.lower_while(condition, body, *span, depth)?,
+                Stmt::For {
+                    name,
+                    iterable,
+                    body,
+                    span,
+                } => self.lower_for(name, iterable, body, *span, depth)?,
                 Stmt::Assign { name, value, span } => {
                     self.bind(name, None, value, *span, false, depth)?
                 }
@@ -843,14 +849,81 @@ impl<'a> FunctionLowerer<'a> {
                         self.emit(TaskOp::Read { slot: value })?;
                     }
                 }
-                _ => {
-                    return Err(unsupported(
-                        "this statement; for/break/continue and try/catch/finally remain gated",
-                        self.span,
-                    ))
-                }
+                _ => return Err(unsupported(
+                    "this statement; array for/break/continue and try/catch/finally remain gated",
+                    self.span,
+                )),
             }
         }
+        Ok(())
+    }
+
+    fn lower_for(
+        &mut self,
+        name: &str,
+        iterable: &Expr,
+        body: &[Stmt],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<()> {
+        if depth >= 32 {
+            return Err(unsupported("statement nesting beyond 32 Task levels", span));
+        }
+        // Evaluate once in the outer lexical environment. Keep a distinct
+        // snapshot even when the expression is an existing mutable local.
+        let source = self.expression(iterable, depth + 1)?;
+        if self.function.slots[source.0].ty != value_slot(IrType::Int) {
+            return Err(unsupported("for iterables other than int", span));
+        }
+        let limit = self.copy_or_move(source)?;
+        self.emit(TaskOp::CheckForLimit { slot: limit })?;
+        let counter = self.constant(TaskConstant::Int(0), IrType::Int)?;
+        let one = self.constant(TaskConstant::Int(1), IrType::Int)?;
+        let header = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::Jump { target: header })?;
+        self.current = Some(header);
+        let condition = self.slot(value_slot(IrType::Bool))?;
+        self.emit(TaskOp::Binary {
+            dst: condition,
+            op: TaskBinaryOp::Less,
+            left: counter,
+            right: limit,
+        })?;
+        let body_entry = self.state(TaskTerminator::Terminate)?;
+        let after = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::Branch {
+            condition,
+            then_state: body_entry,
+            else_state: after,
+        })?;
+        if let Some(end) =
+            self.lower_bound_arm(body, body_entry, depth + 1, Some((name, counter)))?
+        {
+            self.current = Some(end);
+            // The lexical body has already drained its Tasks and dropped its
+            // owned locals. Reassigning its visible variable never changes
+            // this hidden counter or the captured bound. Since counter < limit
+            // and limit <= INT64_MAX, this increment cannot overflow.
+            let next = self.slot(value_slot(IrType::Int))?;
+            self.emit(TaskOp::Binary {
+                dst: next,
+                op: TaskBinaryOp::Add,
+                left: counter,
+                right: one,
+            })?;
+            self.emit(TaskOp::Copy {
+                dst: counter,
+                src: next,
+            })?;
+            let cleanup = self.state(TaskTerminator::Terminate)?;
+            self.budget.analysis(1, span)?;
+            self.cleanup_exits.push(cleanup);
+            self.terminate(TaskTerminator::Suspend {
+                resume: header,
+                cleanup,
+            })?;
+        }
+        self.current = Some(after);
         Ok(())
     }
 
@@ -941,8 +1014,18 @@ impl<'a> FunctionLowerer<'a> {
         entry: StateId,
         depth: usize,
     ) -> KuResult<Option<StateId>> {
+        self.lower_bound_arm(body, entry, depth, None)
+    }
+
+    fn lower_bound_arm(
+        &mut self,
+        body: &[Stmt],
+        entry: StateId,
+        depth: usize,
+        binding: Option<(&str, SlotId)>,
+    ) -> KuResult<Option<StateId>> {
         self.current = Some(entry);
-        if body.is_empty() {
+        if body.is_empty() && binding.is_none() {
             return Ok(self.current.take());
         }
         // IDs are dense declaration order, not the slot interval of an arm:
@@ -957,6 +1040,14 @@ impl<'a> FunctionLowerer<'a> {
             scope,
             tasks: Vec::new(),
         })?;
+        if let Some((name, source)) = binding {
+            self.budget.text(name.len(), self.span)?;
+            let destination = self.copy_or_move(source)?;
+            self.locals
+                .last_mut()
+                .expect("body scope exists")
+                .insert(name.to_owned(), destination);
+        }
         self.lower_block(body, depth)?;
         // Finish membership from already-lowered slot provenance. Reserve work
         // before every possible push; never evaluate a statement a second time.
