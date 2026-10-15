@@ -46,6 +46,10 @@ pub(super) struct CodeParam {
     pub(super) span: SpanId,
     pub(super) owned_string: bool,
     pub(super) view_string: bool,
+    // Exact private slot metadata; an actual Result must never identify its own declaration.
+    pub(super) scalar_result: Option<PrimitiveResultKind>,
+    // Only the strict Result-parameter role records exact primitive companion kinds.
+    pub(super) scalar_primitive: Option<PrimitiveResultKind>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -100,6 +104,9 @@ pub(super) enum ExprCode {
     // Explicit zero-argument clone on the same selected local keeps both
     // the method-call tick and target-variable tick, with one real copy.
     SelectedStringResultCloneCall(ExprId),
+    // The synchronous single-primitive-Result parameter role admits the same
+    // two-tick explicit clone, reusing its charged scalar Result read.
+    SelectedScalarResultCloneCall(ExprId),
     // Root-only synchronous String loans; the real lease is owned by the
     // surrounding argument frame, rather than this shared syntax owner.
     StringBorrow(SymbolId),
@@ -237,6 +244,39 @@ pub(super) fn eligible_owned_named(
     Eligibility::new(source, None, limits)
         .check(FunctionSpec::owned_named(entry))
         .is_ok()
+}
+
+pub(super) fn admit_owned_scalar_result_parameter_named(
+    source: &HashMap<String, FnDecl>,
+    entry: &FnDecl,
+    limits: Limits,
+) -> Admission<()> {
+    Eligibility::new(source, None, limits)
+        .check(FunctionSpec::owned_scalar_result_parameter_named(entry))
+}
+
+pub(super) fn single_owned_scalar_result_parameter_kind(
+    function: &FnDecl,
+) -> Option<PrimitiveResultKind> {
+    let kind = primitive_result_kind(&function.return_type)?;
+    if function.is_async || !function.type_params.is_empty() {
+        return None;
+    }
+    let mut results = 0usize;
+    for param in &function.params {
+        if param.mode != ParamMode::Owned {
+            return None;
+        }
+        if primitive_result_kind(&param.ty) == Some(kind) {
+            results += 1;
+        } else if !matches!(
+            param.ty,
+            Some(TypeName::Int | TypeName::Float | TypeName::Bool | TypeName::Null)
+        ) {
+            return None;
+        }
+    }
+    (results == 1).then_some(kind)
 }
 
 pub(super) fn eligible_borrowed_string_named(
@@ -400,6 +440,16 @@ impl CodeHandle {
         Builder::new(source, None, limits).compile(Some(FunctionSpec::owned_named(entry)))
     }
 
+    pub(super) fn compile_owned_scalar_result_parameter_named(
+        source: &HashMap<String, FnDecl>,
+        entry: &FnDecl,
+        limits: Limits,
+    ) -> Admission<Self> {
+        Builder::new(source, None, limits).compile(Some(
+            FunctionSpec::owned_scalar_result_parameter_named(entry),
+        ))
+    }
+
     pub(super) fn compile_borrowed_string_named(
         source: &HashMap<String, FnDecl>,
         entry: &FnDecl,
@@ -508,6 +558,15 @@ impl CodeHandle {
 
     pub(super) fn has_actual_string_result_locals(&self) -> bool {
         self.0.has_actual_string_result_locals
+    }
+
+    pub(super) fn has_owned_scalar_result_parameters(&self) -> bool {
+        self.0.functions.as_slice().first().is_some_and(|function| {
+            matches!(
+                function.result_contract,
+                ResultContract::OwnedScalarParameter(_)
+            )
+        })
     }
 
     pub(super) fn uses_local_string_results(&self, id: FnId) -> bool {
@@ -642,6 +701,7 @@ enum FunctionRole {
     OwnedResultStringNamed,
     OwnedLocalResultStringNamed,
     OwnedScalarResultNamed,
+    OwnedScalarResultParameterNamed,
     BorrowedStringNamed,
     BorrowedScalarResultNamed,
     ResultRoot,
@@ -672,6 +732,7 @@ enum ResultContract {
     UnchargedScalar(Option<PrimitiveResultKind>),
     BorrowedScalar(PrimitiveResultKind),
     OwnedScalar,
+    OwnedScalarParameter(PrimitiveResultKind),
     OwnedString,
     OwnedStringLocals,
     OwnedStringAwaitLocals,
@@ -790,6 +851,24 @@ impl<'a> FunctionSpec<'a> {
         spec
     }
 
+    fn owned_scalar_result_parameter_named(function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        spec.role = FunctionRole::OwnedScalarResultParameterNamed;
+        spec
+    }
+
+    fn owns_scalar_result_parameters(self) -> bool {
+        matches!(self.role, FunctionRole::OwnedScalarResultParameterNamed)
+    }
+
+    fn scalar_result_parameter_dependency(self, function: &'a FnDecl) -> Admission<Self> {
+        if single_owned_scalar_result_parameter_kind(function) == self.owned_scalar_result_kind() {
+            Ok(Self::owned_scalar_result_parameter_named(function))
+        } else {
+            Err(AdmissionError::Unsupported(function.span))
+        }
+    }
+
     fn owned_dependency(self, function: &'a FnDecl) -> Self {
         let mut spec = Self::named(function);
         spec.role = if self.owns_result_string() && string_result_type(&function.return_type) {
@@ -833,6 +912,7 @@ impl<'a> FunctionSpec<'a> {
         matches!(
             self.role,
             FunctionRole::OwnedScalarResultNamed
+                | FunctionRole::OwnedScalarResultParameterNamed
                 | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
                 | FunctionRole::AsyncOwnedScalarResultDependency
         )
@@ -868,6 +948,7 @@ impl<'a> FunctionSpec<'a> {
         matches!(
             self.role,
             FunctionRole::OwnedScalarResultNamed
+                | FunctionRole::OwnedScalarResultParameterNamed
                 | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
                 | FunctionRole::AsyncOwnedScalarResultDependency
         )
@@ -885,7 +966,11 @@ impl<'a> FunctionSpec<'a> {
         let primitive = self
             .declaration
             .and_then(|function| primitive_result_kind(&function.return_type));
-        let result = if self.has_await_string_local_contract() {
+        let result = if self.owns_scalar_result_parameters() {
+            ResultContract::OwnedScalarParameter(
+                primitive.expect("validated owned Result parameter"),
+            )
+        } else if self.has_await_string_local_contract() {
             ResultContract::OwnedStringAwaitLocals
         } else if matches!(
             self.role,
@@ -1108,6 +1193,14 @@ impl<'a> FunctionSpec<'a> {
 
     fn parameter_kind(self, param: &Param) -> Admission<ValueKind> {
         if param.mode == ParamMode::Owned {
+            if self.owns_scalar_result_parameters() {
+                if let Some(kind) = primitive_result_kind(&param.ty) {
+                    if self.owned_scalar_result_kind() == Some(kind) {
+                        return Ok(ValueKind::ScalarResult(kind));
+                    }
+                    return Err(AdmissionError::Unsupported(param.span));
+                }
+            }
             if scalar_type(&param.ty) {
                 return Ok(ValueKind::Scalar);
             }
@@ -1172,6 +1265,9 @@ impl<'a> FunctionSpec<'a> {
             FunctionRole::OwnedScalarResultNamed => {
                 !function.is_async && scalar_result_type(&function.return_type)
             }
+            FunctionRole::OwnedScalarResultParameterNamed => {
+                single_owned_scalar_result_parameter_kind(function).is_some()
+            }
             FunctionRole::ClaimedAsyncOwnedResultStringRoot
             | FunctionRole::AsyncOwnedResultStringDependency => {
                 function.is_async && string_result_type(&function.return_type)
@@ -1234,7 +1330,17 @@ fn scalar_result_type(ty: &Option<TypeName>) -> bool {
     primitive_result_kind(ty).is_some()
 }
 
-fn primitive_result_kind(ty: &Option<TypeName>) -> Option<PrimitiveResultKind> {
+pub(super) fn primitive_type_kind(ty: &Option<TypeName>) -> Option<PrimitiveResultKind> {
+    Some(match ty.as_ref()? {
+        TypeName::Int => PrimitiveResultKind::Int,
+        TypeName::Float => PrimitiveResultKind::Float,
+        TypeName::Bool => PrimitiveResultKind::Bool,
+        TypeName::Null => PrimitiveResultKind::Null,
+        _ => return None,
+    })
+}
+
+pub(super) fn primitive_result_kind(ty: &Option<TypeName>) -> Option<PrimitiveResultKind> {
     let Some(TypeName::Result(inner)) = ty else {
         return None;
     };
@@ -1338,6 +1444,28 @@ fn selected_string_result_clone_target<'a>(
     Some(target)
 }
 
+fn selected_scalar_result_clone_target<'a>(
+    expr: &'a Expr,
+    bound: &[Binding<'_>],
+) -> Option<(&'a Expr, PrimitiveResultKind)> {
+    let ExprKind::Call { callee, args } = &expr.kind else {
+        return None;
+    };
+    let ExprKind::Field { target, name } = &callee.kind else {
+        return None;
+    };
+    let ExprKind::Variable(symbol) = &target.kind else {
+        return None;
+    };
+    if name != "clone" || !args.is_empty() {
+        return None;
+    }
+    let Some(ValueKind::ScalarResult(kind)) = binding_kind(bound, symbol) else {
+        return None;
+    };
+    Some((target, kind))
+}
+
 fn mixed_string_parameter_modes(function: &FnDecl) -> bool {
     let has_view = function
         .params
@@ -1384,6 +1512,11 @@ fn expression_kind(
         ExprKind::Call { callee, .. } => {
             if selected_string_result_clone_target(expr, bound).is_some() {
                 return Ok(ValueKind::ResultString);
+            }
+            if let Some((_, kind)) = selected_scalar_result_clone_target(expr, bound) {
+                // Classification does not admit a role; both flat visitors
+                // enforce the single-Result-parameter contract below.
+                return Ok(ValueKind::ScalarResult(kind));
             }
             if string_length_call(expr, bound).is_some() {
                 return Ok(ValueKind::Scalar);
@@ -1972,6 +2105,22 @@ impl<'a> Builder<'a> {
                     span: span_id,
                     owned_string: kind == ValueKind::String,
                     view_string: kind == ValueKind::ViewString,
+                    scalar_result: if spec.owns_scalar_result_parameters() {
+                        match kind {
+                            ValueKind::ScalarResult(kind) => Some(kind),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    },
+                    scalar_primitive: if spec.owns_scalar_result_parameters() {
+                        match spec.params {
+                            Parameters::Named(params) => primitive_type_kind(&params[index].ty),
+                            Parameters::Local(_) => None,
+                        }
+                    } else {
+                        None
+                    },
                 };
                 self.bind(name, kind, span)?;
             }
@@ -2191,6 +2340,24 @@ impl<'a> Builder<'a> {
                         if mode.forbid_call {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
+                        if let Some((target, kind)) =
+                            selected_scalar_result_clone_target(expr, self.bound.as_slice())
+                        {
+                            if !spec.owns_scalar_result_parameters() {
+                                return Err(AdmissionError::Unsupported(expr.span));
+                            }
+                            spec.check_scalar_local_kind(kind, expr.span)?;
+                            let target = self.expression(target, false)?;
+                            *self
+                                .arena
+                                .expressions
+                                .get_mut(id.0)
+                                .expect("scalar Result clone call expression slot") = CodeExpr {
+                                kind: ExprCode::SelectedScalarResultCloneCall(target),
+                                span,
+                            };
+                            return Ok(());
+                        }
                         if let Some(target) =
                             selected_string_result_clone_target(expr, self.bound.as_slice())
                         {
@@ -2271,7 +2438,9 @@ impl<'a> Builder<'a> {
                                 .source
                                 .get(name)
                                 .ok_or(AdmissionError::Unsupported(callee.span))?;
-                            self.ensure_function(if spec.borrows_strings() {
+                            self.ensure_function(if spec.owns_scalar_result_parameters() {
+                                spec.scalar_result_parameter_dependency(function)?
+                            } else if spec.borrows_strings() {
                                 borrowed_string_arguments(function, args, expr.span)?;
                                 spec.borrowed_dependency(function)
                             } else if spec.owns_strings() {
@@ -2288,7 +2457,15 @@ impl<'a> Builder<'a> {
                             })?
                         };
                         for (index, arg) in args.iter().enumerate() {
-                            let expected = if spec.owns_strings() {
+                            let expected = if spec.owns_scalar_result_parameters() {
+                                let declaration =
+                                    self.source.get(name).expect("validated Result callee");
+                                let param = declaration
+                                    .params
+                                    .get(index)
+                                    .ok_or(AdmissionError::Unsupported(expr.span))?;
+                                spec.parameter_kind(param)?
+                            } else if spec.owns_strings() {
                                 let declaration =
                                     self.source.get(name).expect("validated named callee");
                                 let param = declaration
@@ -2309,7 +2486,7 @@ impl<'a> Builder<'a> {
                             };
                             expect_kind(self.kind(arg)?, expected, arg.span)?;
                         }
-                        if spec.owns_strings()
+                        if (spec.owns_strings() || spec.owns_scalar_result_parameters())
                             && args.len()
                                 != self
                                     .source
@@ -3294,6 +3471,16 @@ impl<'a> Eligibility<'a> {
                             if mode.forbid_call {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
+                            if let Some((target, kind)) =
+                                selected_scalar_result_clone_target(expr, self.bound.as_slice())
+                            {
+                                if !spec.owns_scalar_result_parameters() {
+                                    return Err(AdmissionError::Unsupported(expr.span));
+                                }
+                                spec.check_scalar_local_kind(kind, expr.span)?;
+                                self.expression(target, false)?;
+                                continue;
+                            }
                             if let Some(target) =
                                 selected_string_result_clone_target(expr, self.bound.as_slice())
                             {
@@ -3345,7 +3532,9 @@ impl<'a> Eligibility<'a> {
                                     .source
                                     .get(name)
                                     .ok_or(AdmissionError::Unsupported(callee.span))?;
-                                self.function(if spec.borrows_strings() {
+                                self.function(if spec.owns_scalar_result_parameters() {
+                                    spec.scalar_result_parameter_dependency(function)?
+                                } else if spec.borrows_strings() {
                                     borrowed_string_arguments(function, args, expr.span)?;
                                     spec.borrowed_dependency(function)
                                 } else if spec.owns_strings() {
@@ -3362,7 +3551,15 @@ impl<'a> Eligibility<'a> {
                                 })?;
                             }
                             for (index, arg) in args.iter().enumerate() {
-                                let expected = if spec.owns_strings() {
+                                let expected = if spec.owns_scalar_result_parameters() {
+                                    let declaration =
+                                        self.source.get(name).expect("validated Result callee");
+                                    let param = declaration
+                                        .params
+                                        .get(index)
+                                        .ok_or(AdmissionError::Unsupported(expr.span))?;
+                                    spec.parameter_kind(param)?
+                                } else if spec.owns_strings() {
                                     let declaration =
                                         self.source.get(name).expect("validated named callee");
                                     let param = declaration
@@ -3383,7 +3580,7 @@ impl<'a> Eligibility<'a> {
                                 };
                                 expect_kind(self.kind(arg)?, expected, arg.span)?;
                             }
-                            if spec.owns_strings()
+                            if (spec.owns_strings() || spec.owns_scalar_result_parameters())
                                 && args.len()
                                     != self
                                         .source
@@ -4249,5 +4446,241 @@ mod typed_result_cache_tests {
         assert!(eligibility_rejected);
         assert!(builder_rejected);
         assert_eq!(local_source, before);
+    }
+
+    #[test]
+    fn scalar_result_parameter_cache_metadata_whole_graph_and_first_rejection_stay_separate() {
+        let limits = Limits::default();
+        for (kind, ty, literal) in [
+            (PrimitiveResultKind::Int, "int", "7"),
+            (PrimitiveResultKind::Float, "float", "1.25"),
+            (PrimitiveResultKind::Bool, "bool", "true"),
+            (PrimitiveResultKind::Null, "null", "null"),
+        ] {
+            let source = functions(&format!("fn Shared(prior: {ty}!, n: int): {ty}! {{ if (n <= 0) {{ return prior }}\nreturn Shared(prior, n - 1) }}"));
+            let old_source = functions(&format!(
+                "fn Shared(n: int): {ty}! {{ return ok({literal}) }}"
+            ));
+            let owned_source = functions(&format!(
+                "fn Shared(text: str): {ty}! {{ return ok({literal}) }}"
+            ));
+            let other_source = functions(if kind == PrimitiveResultKind::Float {
+                "fn Shared(prior: int!, n: int): int! { return prior }"
+            } else {
+                "fn Shared(prior: float!, n: int): float! { return prior }"
+            });
+            let before = source.clone();
+            let selected = FunctionSpec::owned_scalar_result_parameter_named(&source["Shared"]);
+            let dependency = selected
+                .scalar_result_parameter_dependency(&source["Shared"])
+                .unwrap();
+            let old = FunctionSpec::named_root(&old_source["Shared"]);
+            let owned = FunctionSpec::owned_named(&owned_source["Shared"]);
+            let other = FunctionSpec::owned_scalar_result_parameter_named(&other_source["Shared"]);
+            assert!(
+                selected.cache_contract()
+                    == (
+                        false,
+                        ResultContract::OwnedScalarParameter(kind),
+                        Some(kind)
+                    )
+            );
+            assert!(selected.cache_contract() == dependency.cache_contract());
+            for (first, second, compatible) in [
+                (selected, dependency, true),
+                (dependency, selected, true),
+                (selected, old, false),
+                (old, selected, false),
+                (selected, owned, false),
+                (owned, selected, false),
+                (selected, other, false),
+                (other, selected, false),
+            ] {
+                first.validate().unwrap();
+                second.validate().unwrap();
+                let mut builder = Builder::new(&source, None, limits);
+                let id = builder.ensure_function(first).unwrap();
+                let storage = (builder.count(), builder.bytes());
+                let reused = builder.ensure_function(second);
+                if compatible {
+                    assert_eq!(reused.unwrap(), id);
+                } else {
+                    assert!(matches!(reused, Err(AdmissionError::Unsupported(_))));
+                }
+                assert_eq!((builder.count(), builder.bytes()), storage);
+                assert_eq!(builder.arena.functions.len(), 1);
+                assert_eq!(builder.functions.len(), 1);
+                let retained = builder.arena.functions.get(id.0).unwrap();
+                assert!(
+                    (
+                        retained.is_async,
+                        retained.result_contract,
+                        retained.owned_scalar_result
+                    ) == first.cache_contract()
+                );
+                assert_eq!(builder.ensure_function(first).unwrap(), id);
+                let mut eligibility = Eligibility::new(&source, None, limits);
+                eligibility.function(first).unwrap();
+                let storage = (eligibility.count(), eligibility.bytes());
+                let reused = eligibility.function(second);
+                if compatible {
+                    reused.unwrap();
+                } else {
+                    assert!(matches!(reused, Err(AdmissionError::Unsupported(_))));
+                }
+                assert_eq!((eligibility.count(), eligibility.bytes()), storage);
+                assert_eq!(eligibility.checked.len(), 1);
+                assert_eq!(eligibility.functions.len(), 1);
+                assert!(eligibility.checked.get(0).unwrap().1 == first.cache_contract());
+            }
+            for (declaration, spec) in [
+                (&source, selected),
+                (&old_source, old),
+                (&owned_source, owned),
+            ] {
+                let code = Builder::new(declaration, None, limits)
+                    .compile(Some(spec))
+                    .unwrap();
+                let function = code.function(code.find_function("Shared").unwrap());
+                for index in 0..function.arity() {
+                    let parameter = code.parameter(function, index);
+                    if spec.owns_scalar_result_parameters() {
+                        assert_eq!(
+                            parameter.scalar_result,
+                            if index == 0 { Some(kind) } else { None }
+                        );
+                        assert_eq!(
+                            parameter.scalar_primitive,
+                            if index == 1 {
+                                Some(PrimitiveResultKind::Int)
+                            } else {
+                                None
+                            }
+                        );
+                    } else {
+                        assert_eq!(parameter.scalar_result, None);
+                        assert_eq!(parameter.scalar_primitive, None);
+                    }
+                }
+            }
+            for syntax in [
+                format!("fn Right(prior: {ty}!, n: int): {ty}! {{ if (n <= 0) {{ return prior }}\nreturn Left(prior, n - 1) }}\nfn Left(prior: {ty}!, n: int): {ty}! {{ if (n <= 0) {{ return prior }}\nreturn Right(prior, n - 1) }}\nfn Entry(prior: {ty}!, n: int): {ty}! {{ return Left(prior, n) }}"),
+                format!("fn Leaf(prior: {ty}!, n: int): {ty}! {{ return prior }}\nfn Entry(prior: {ty}!, n: int): {ty}! {{ r: {ty}! = Leaf(prior, n)\nr = r\nreturn r }}"),
+                format!("fn Entry(prior: {ty}!): {ty}! {{ return prior.clone() }}"),
+                format!("fn Entry(prior: {ty}!): {ty}! {{ r: {ty}! = prior.clone()\nreturn r }}"),
+                format!("fn Leaf(prior: {ty}!, n: int): {ty}! {{ return prior }}\nfn Entry(prior: {ty}!, n: int): {ty}! {{ return Leaf(prior.clone(), n) }}"),
+            ] {
+                let graph = functions(&syntax);
+                let graph_before = graph.clone();
+                admit_owned_scalar_result_parameter_named(&graph, &graph["Entry"], limits).unwrap();
+                let code = CodeHandle::compile_owned_scalar_result_parameter_named(&graph, &graph["Entry"], limits).unwrap();
+                let mut clone_calls = 0;
+                for expression in code.0.expressions.as_slice() {
+                    if let ExprCode::SelectedScalarResultCloneCall(target) = expression.kind {
+                        clone_calls += 1;
+                        assert!(matches!(code.expression(target).kind,
+                            ExprCode::VariableSelectedScalarResultClone(_)));
+                    }
+                }
+                assert_eq!(clone_calls, syntax.matches(".clone()").count());
+                for function in code.0.functions.as_slice() {
+                    assert!(function.result_contract == ResultContract::OwnedScalarParameter(kind));
+                    assert_eq!(function.owned_scalar_result, Some(kind));
+                }
+                assert_eq!(graph, graph_before);
+            }
+            let legacy_clone = functions(&format!(
+                "fn Entry(text: str): {ty}! {{ r: {ty}! = ok({literal})\nreturn r.clone() }}"
+            ));
+            let legacy_before = legacy_clone.clone();
+            let legacy_entry = &legacy_clone["Entry"];
+            let legacy_spec = FunctionSpec::owned_named(legacy_entry);
+            assert!(matches!(
+                legacy_spec.role,
+                FunctionRole::OwnedScalarResultNamed
+            ));
+            assert!(matches!(
+                Eligibility::new(&legacy_clone, None, limits).check(legacy_spec),
+                Err(AdmissionError::Unsupported(_))
+            ));
+            assert!(matches!(
+                CodeHandle::compile_owned_named(&legacy_clone, legacy_entry, limits),
+                Err(AdmissionError::Unsupported(_))
+            ));
+            assert_eq!(legacy_clone, legacy_before);
+
+            let other_ty = if kind == PrimitiveResultKind::Float {
+                "int"
+            } else {
+                "float"
+            };
+            for syntax in [
+                format!("fn Entry(prior: {ty}!): {ty}! {{ if (true) {{ return prior }}\nitems = []\nreturn prior }}"),
+                format!("fn Entry(prior: {ty}!, spare: {ty}!): {ty}! {{ return prior }}"),
+                format!("fn Entry(prior: {ty}!, value): {ty}! {{ return prior }}"),
+                format!("async fn Entry(prior: {ty}!): {ty}! {{ return prior }}"),
+                format!("fn Entry(prior: {ty}!): {ty}! {{ return ok(prior?) }}"),
+                format!("fn Entry(prior: {other_ty}!): {ty}! {{ prior.clone()\nreturn ok({literal}) }}"),
+                format!("fn Entry(prior: {ty}!): {ty}! {{ return prior.clone().clone() }}"),
+                format!("async fn Entry(prior: {ty}!): {ty}! {{ return prior.clone() }}"),
+            ] {
+                let rejected = functions(&syntax);
+                let rejected_before = rejected.clone();
+                assert!(matches!(admit_owned_scalar_result_parameter_named(&rejected, &rejected["Entry"], limits), Err(AdmissionError::Unsupported(_))), "{syntax}");
+                assert!(matches!(CodeHandle::compile_owned_scalar_result_parameter_named(&rejected, &rejected["Entry"], limits), Err(AdmissionError::Unsupported(_))), "{syntax}");
+                assert_eq!(rejected, rejected_before);
+            }
+            // clone(1) is rejected by the checker itself. Keep that fact
+            // explicit while checking both projection defenses on its AST.
+            let syntax = format!(
+                "fn Entry(prior: {ty}!): {ty}! {{ return prior.clone(1) }}\nfn main() {{}}"
+            );
+            let program = Parser::new(Lexer::new(&syntax).tokenize().unwrap())
+                .parse_program()
+                .unwrap();
+            assert!(crate::checker::Checker::new().check(&program).is_err());
+            let malformed: HashMap<_, _> = program
+                .items
+                .into_iter()
+                .map(|item| {
+                    let Item::Function(function) = item else {
+                        panic!("named clone fixture")
+                    };
+                    (function.name.clone(), function)
+                })
+                .collect();
+            let malformed_before = malformed.clone();
+            assert!(matches!(
+                admit_owned_scalar_result_parameter_named(&malformed, &malformed["Entry"], limits),
+                Err(AdmissionError::Unsupported(_))
+            ));
+            assert!(matches!(
+                CodeHandle::compile_owned_scalar_result_parameter_named(
+                    &malformed,
+                    &malformed["Entry"],
+                    limits
+                ),
+                Err(AdmissionError::Unsupported(_))
+            ));
+            assert_eq!(malformed, malformed_before);
+
+            let exhausted = Limits {
+                syntax_steps: 0,
+                ..limits
+            };
+            assert!(matches!(
+                admit_owned_scalar_result_parameter_named(&source, &source["Shared"], exhausted),
+                Err(AdmissionError::Rejected(_))
+            ));
+            assert!(matches!(
+                CodeHandle::compile_owned_scalar_result_parameter_named(
+                    &source,
+                    &source["Shared"],
+                    exhausted
+                ),
+                Err(AdmissionError::Rejected(_))
+            ));
+            assert_eq!(source, before);
+        }
     }
 }
