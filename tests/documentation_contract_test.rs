@@ -70,7 +70,7 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
             "有界 worker 组",
             "async fn main(): null!",
             "单层 Result",
-            "源码 `if` / `else` / `while` 及词法作用域",
+            "源码 `if` / `else` / `while`、整数 `for` 及词法作用域",
             "try/catch/finally",
             "M:N",
             "netpoll",

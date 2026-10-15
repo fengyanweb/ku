@@ -1350,6 +1350,7 @@ function Invoke-ReleaseSelfTest([string]$Repo, [string]$BuilderPath, [string]$He
 
     $processOwner = [Guid]::NewGuid().ToString('N'); $processRoot = New-OwnedDirectory $temporaryRoot '.ku-release-process-selftest-' $processOwner
     $recordedChildren = [Collections.Generic.List[string]]::new()
+    $confirmedChildren = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $primaryFailure = $null
     try {
         function Assert-SelfTestChildGone([string]$PidPath, [string]$Case) {
@@ -1360,6 +1361,8 @@ function Invoke-ReleaseSelfTest([string]$Repo, [string]$BuilderPath, [string]$He
                 if ($alive) { Start-Sleep -Milliseconds 20 }
             } while ($alive -and [DateTime]::UtcNow -lt $deadline)
             if ($alive) { throw "$Case self-test left child PID $childPid alive" }
+            # A confirmed exit is final; the OS may later reuse this numeric PID.
+            [void]$confirmedChildren.Add($PidPath)
         }
 
         $wrapper = New-ToolWrapper $processRoot; $pidFile = Join-Path $processRoot 'child.pid'
@@ -1485,6 +1488,7 @@ time.sleep(60)
     finally {
         $cleanupProblems = [Collections.Generic.List[string]]::new()
         foreach ($recordedPid in $recordedChildren) {
+            if ($confirmedChildren.Contains($recordedPid)) { continue }
             try {
                 if (Test-Path -LiteralPath $recordedPid) { Assert-SelfTestChildGone $recordedPid "release final cleanup" }
             }

@@ -1176,6 +1176,17 @@ fn scope_waits_for_real_blocking_retirement_and_receives_its_shorter_deadline() 
         machine.retirement_bytes,
         machine.retirement_capacity * std::mem::size_of::<TaskRetirementWitness>()
     );
+    // WaitRetirement owns a real witness, but G1 accounting is published by
+    // the worker after terminal notification. Observe that publication before
+    // comparing it with the still-gated BlockingJob; keep the original WAIT.
+    assert!(until(|| {
+        let snapshot = runtime.snapshot().unwrap();
+        (
+            snapshot.active_tasks,
+            snapshot.queued_tasks,
+            snapshot.finished_tasks,
+        ) == (0, 0, 1)
+    }));
     let before = runtime.snapshot().unwrap();
     assert_eq!(
         (
