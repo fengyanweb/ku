@@ -43,9 +43,9 @@ fn main(): null! {
 }
 ```
 
-`json.encode(&value:any): str!` 只读输入，默认紧凑输出；`json.decode(text:str): KuValue!` 返回自持有的 Ku 字符串、数组和对象，释放 yyjson 文档不影响后续索引、显式转换和运算。`stringify` 与 `encode`、`parse/try_parse` 与 `decode` 分别共用入口，旧接口继续兼容。
+`json.encode(&value:any): str!` 只读输入，默认紧凑输出；`json.decode(text:str): KuValue!` 返回自持有的 Ku 字符串、数组和对象，不引用输入的临时存储，可以继续索引、显式转换和运算。`stringify` 与 `encode`、`parse/try_parse` 与 `decode` 分别共用入口，旧接口继续兼容。
 
-固定依赖 [yyjson 0.13.0](https://github.com/ibireme/yyjson/tree/0.13.0)，按 MIT 保留许可证。支持中文、emoji、转义与内嵌 NUL；对象键稳定排序，重复键解码保留最后一个值。整数严格限于 signed 64-bit，越界不会转成 float；float 使用有限 binary64，保持 Ku 最短固定小数输出。NaN、Infinity、函数、Task、资源句柄等返回错误。
+当前底层恢复 Ku 原有的直接解析与编码实现。支持中文、emoji、转义与内嵌 NUL；对象键稳定排序，重复键解码保留最后一个值。整数严格限于 signed 64-bit，越界不会转成 float；float 使用有限 binary64，保持 Ku 最短固定小数输出。NaN、Infinity、函数、Task、资源句柄等返回错误。
 
 默认严格 JSON，错误为 `Err(Error)`，使用 `?` 或 `try/catch`；解析消息包含从 0 开始的 UTF-8 `byte N`。输入、输出各限 1,000,000 字节；深度预算为 32，保留 33 层空容器允许、34 层拒绝的旧边界。解释器、默认打包 runner、同步 native C 已接入；受限 native Task 子集与 LLVM 不支持 JSON。完整规则见 仓库 `docs/syntax.md` 的 JSON 接口章节，正常及错误处理示例见仓库 `examples/json.ku`。
 

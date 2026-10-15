@@ -15,7 +15,7 @@ ku run examples/json.ku
 ku build --backend c -o json-example examples/json.ku
 ```
 
-输出包含紧凑 JSON、`roundtrip ok`、`json/parse_error` 和从 0 开始的 `byte 7` 位置。`json.encode` / `decode` 与旧 `stringify` / `parse/try_parse` 共用入口；底层固定 yyjson 0.13.0（MIT）。默认打包 runner 和同步 native C 使用同一接口，受限 native Task 与 LLVM 尚不支持 JSON。接口、精度、所有权和资源边界见 [JSON 规则](../docs/syntax.md#127-json)。
+输出包含紧凑 JSON、`roundtrip ok`、`json/parse_error` 和从 0 开始的 `byte 7` 位置。`json.encode` / `decode` 与旧 `stringify` / `parse/try_parse` 共用入口；底层恢复 Ku 原有的直接编解码实现。默认打包 runner 和同步 native C 使用同一接口，受限 native Task 与 LLVM 尚不支持 JSON。接口、精度、所有权和资源边界见 [JSON 规则](../docs/syntax.md#127-json)。
 
 ## Package 示例
 

@@ -1502,7 +1502,7 @@ json.parse(text:str): KuValue!
 json.try_parse(text:str): KuValue!
 ```
 
-`encode` 与 `stringify` 共用编码入口，`decode` 与 `parse/try_parse` 共用解析入口，旧名称保持兼容。两端使用固定的 [yyjson 0.13.0](https://github.com/ibireme/yyjson/tree/0.13.0)，MIT 许可证保存在 [vendor/yyjson/LICENSE](../vendor/yyjson/LICENSE)，来源与校验信息见 [UPSTREAM.json](../vendor/yyjson/UPSTREAM.json)。解释器、默认打包 runner 和同步 native C 路径支持这些接口；受限 native Task 子集与 LLVM 尚不支持 JSON。
+`encode` 与 `stringify` 共用编码入口，`decode` 与 `parse/try_parse` 共用解析入口，旧名称保持兼容。当前底层恢复 Ku 原有的直接解析与编码实现。解释器、默认打包 runner 和同步 native C 路径支持这些接口；受限 native Task 子集与 LLVM 尚不支持 JSON。
 
 编码默认紧凑输出，只读输入，不移动、修改或释放原对象；支持 str、bool、int、有限 float、null、嵌套数组、字符串键对象和可表示的 struct。中文、emoji、引号、反斜杠、换行和内嵌 NUL 按 JSON 转义规则处理。对象键按 UTF-8 字节序稳定排序，解码时重复键保留最后一个值。函数、Task、资源句柄、Result 和 enum 不能编码；循环引用明确拒绝，过深嵌套按预算返回错误，不会无限展开。
 
@@ -1510,7 +1510,7 @@ json.try_parse(text:str): KuValue!
 
 解析默认严格 JSON，拒绝注释、尾逗号、非法转义、无效 Unicode 与多余尾部内容。失败返回 `Err(Error)`，`domain` 为 `json`，常见 `code` 为 `parse_error`、`stringify_error` 或 `out_of_memory`；语法解析错误消息包含从 0 开始的 UTF-8 `byte N` 位置。用 `?` 传播，或在 `try/catch` 中处理。输入与输出各限 1,000,000 字节，深度检查为 `depth > 32`：根值从 0 计，保留 33 层空容器可接受、34 层拒绝的旧边界；非空子值仍占下一层。
 
-解析结果为 tagged `KuValue`，独立持有 Ku 字符串与容器；yyjson 文档释放后仍可使用，由正常 Ku 所有权与作用域规则释放。数组与对象可索引、比较、嵌套和再次编码；具体运算先显式转换，例如 `decoded["count"]?.as_int()? + 1`，字符串读取使用 `.as_str()?`，不能把动态值直接参与算术。完整的正常与非法输入示例见 [examples/json.ku](../examples/json.ku)，可运行 `ku run examples/json.ku`。
+解析结果为 tagged `KuValue`，独立持有 Ku 字符串与容器，不引用输入字符串的临时存储；输入离开作用域后仍可使用，由正常 Ku 所有权与作用域规则释放。数组与对象可索引、比较、嵌套和再次编码；具体运算先显式转换，例如 `decoded["count"]?.as_int()? + 1`，字符串读取使用 `.as_str()?`，不能把动态值直接参与算术。完整的正常与非法输入示例见 [examples/json.ku](../examples/json.ku)，可运行 `ku run examples/json.ku`。
 
 ### 12.8 time
 

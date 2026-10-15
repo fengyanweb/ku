@@ -4708,58 +4708,57 @@ fn json_typed_write_call(
     expression: &str,
     depth: &str,
     output: &str,
+    error: &str,
     program: &IrProgram,
 ) -> KuResult<String> {
     match ty {
         IrType::Int => Ok(format!(
-            "ku_json_build_value({output}, ku_v_int({expression}), {depth})"
+            "ku_json_write_value({output}, ku_v_int({expression}), {depth}, {error})"
         )),
         IrType::Float => Ok(format!(
-            "ku_json_build_value({output}, ku_v_float({expression}), {depth})"
+            "ku_json_write_value({output}, ku_v_float({expression}), {depth}, {error})"
         )),
         IrType::Bool => Ok(format!(
-            "ku_json_build_value({output}, ku_v_bool({expression}), {depth})"
+            "ku_json_write_value({output}, ku_v_bool({expression}), {depth}, {error})"
         )),
         IrType::Str => Ok(format!(
-            "ku_json_build_value({output}, ku_v_str({expression}), {depth})"
+            "ku_json_write_value({output}, ku_v_str({expression}), {depth}, {error})"
         )),
         IrType::Null => Ok(format!(
-            "ku_json_build_value({output}, ku_v_null(), {depth})"
+            "ku_json_write_value({output}, ku_v_null(), {depth}, {error})"
         )),
         IrType::Array(_) => Ok(format!(
-            "ku_json_write_typed_{}({output}, {expression}, {depth})",
+            "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
             c_type_suffix(ty)?
         )),
         IrType::Named(name) if name == "__ku_object" => Ok(format!(
-            "ku_json_build_value({output}, ku_v_object({expression}), {depth})"
+            "ku_json_write_value({output}, ku_v_object({expression}), {depth}, {error})"
         )),
         IrType::Named(name) if name == "__ku_value" => Ok(format!(
-            "ku_json_build_value({output}, {expression}, {depth})"
+            "ku_json_write_value({output}, {expression}, {depth}, {error})"
         )),
         IrType::Named(name) if name == "__ku_time" || name == "__ku_error_type" => Ok(format!(
-            "ku_json_write_typed_{}({output}, {expression}, {depth})",
+            "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
             c_type_suffix(ty)?
         )),
         IrType::Named(name) if json_struct_layout(program, name).is_some() => Ok(format!(
-            "ku_json_write_typed_{}({output}, {expression}, {depth})",
+            "ku_json_write_typed_{}({output}, {expression}, {depth}, {error})",
             c_type_suffix(ty)?
         )),
         _ => Ok(format!(
-            "ku_json_write_unsupported({output}, {depth}, \"json.stringify does not support {}\")",
+            "ku_json_write_unsupported({depth}, {error}, \"json.stringify does not support {}\")",
             json_unsupported_type_name(ty)
         )),
     }
 }
 
-/// Typed adapters construct nodes in the same bounded yyjson document as
-/// dynamic values. Every array/struct argument is borrowed for the whole call.
 fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -> KuResult<()> {
     out.check()?;
     let suffix = c_type_suffix(ty)?;
     let value_type = c_type(ty)?;
     out.push_str(&format!(
-        "static yyjson_mut_val* ku_json_write_typed_{suffix}(KuJsonBuild* output, {value_type} value, size_t depth) {{\n\
-         \x20 if (!ku_json_build_depth(output, depth)) return NULL;\n"
+        "static bool ku_json_write_typed_{suffix}(KuJsonBuffer* output, {value_type} value, size_t depth, KuError* error) {{\n\
+         \x20 if (depth > KU_JSON_MAX_DEPTH) return ku_json_fail(error, \"stringify_error\", \"json value nesting is too deep\");\n"
     ));
 
     match ty {
@@ -4769,75 +4768,79 @@ fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -
                 "value.data[index]",
                 "depth + 1",
                 "output",
+                "error",
                 program,
             )?;
             out.push_str(
-                "  if (value.len && !value.data) { ku_json_build_fail(output, \"invalid native array\"); return NULL; }\n\
-                 \x20 if (!ku_json_build_enter(output, value.data, KU_ARRAY, depth)) return NULL;\n\
-                 \x20 yyjson_mut_val* array = ku_json_build_array(output, value.len);\n\
-                 \x20 if (!array) return NULL;\n\
-                 \x20 for (size_t index = 0; index < value.len; index++) {\n",
+                "  if (value.len && !value.data) return ku_json_fail(error, \"stringify_error\", \"invalid native array\");\n\
+                 \x20 if (!ku_json_write_byte(output, '[', error)) return false;\n\
+                 \x20 for (size_t index = 0; index < value.len; index++) {\n\
+                 \x20   if (index != 0 && !ku_json_write_byte(output, ',', error)) return false;\n",
             );
-            out.push_str(&format!(
-                "    yyjson_mut_val* element = {element_call};\n\
-                 \x20   if (!ku_json_build_array_add(output, array, element)) return NULL;\n"
-            ));
-            out.push_str("  }\n  ku_json_build_leave(output, depth);\n  return array;\n}\n");
+            out.push_str(&format!("    if (!{element_call}) return false;\n"));
+            out.push_str("  }\n  return ku_json_write_byte(output, ']', error);\n}\n");
+        }
+        IrType::Named(name) if name == "__ku_time" => {
+            out.push_str(
+                "  ku_time_validate(value);\n\
+                 \x20 if (!ku_json_write_byte(output, '{', error)\n\
+                 \x20     || !ku_json_write_string(output, ku_string_static((const uint8_t*)\"kind\", 4), error)\n\
+                 \x20     || !ku_json_write_byte(output, ':', error)\n\
+                 \x20     || !ku_json_write_value(output, ku_v_str(ku_time_kind(value)), depth + 1, error)\n\
+                 \x20     || !ku_json_write_byte(output, ',', error)\n\
+                 \x20     || !ku_json_write_string(output, ku_string_static((const uint8_t*)\"millis\", 6), error)\n\
+                 \x20     || !ku_json_write_byte(output, ':', error)\n\
+                 \x20     || !ku_json_write_value(output, ku_v_int(value.millis), depth + 1, error)) return false;\n\
+                 \x20 return ku_json_write_byte(output, '}', error);\n}\n",
+            );
+        }
+        IrType::Named(name) if name == "__ku_error_type" => {
+            out.push_str(
+                "  if (!ku_json_write_byte(output, '{', error)\n\
+                 \x20     || !ku_json_write_string(output, ku_string_static((const uint8_t*)\"code\", 4), error)\n\
+                 \x20     || !ku_json_write_byte(output, ':', error)\n\
+                 \x20     || !ku_json_write_value(output, ku_v_str(value.code), depth + 1, error)\n\
+                 \x20     || !ku_json_write_byte(output, ',', error)\n\
+                 \x20     || !ku_json_write_string(output, ku_string_static((const uint8_t*)\"domain\", 6), error)\n\
+                 \x20     || !ku_json_write_byte(output, ':', error)\n\
+                 \x20     || !ku_json_write_value(output, ku_v_str(value.domain), depth + 1, error)\n\
+                 \x20     || !ku_json_write_byte(output, ',', error)\n\
+                 \x20     || !ku_json_write_string(output, ku_string_static((const uint8_t*)\"message\", 7), error)\n\
+                 \x20     || !ku_json_write_byte(output, ':', error)\n\
+                 \x20     || !ku_json_write_value(output, ku_v_str(value.message), depth + 1, error)) return false;\n\
+                 \x20 return ku_json_write_byte(output, '}', error);\n}\n",
+            );
         }
         IrType::Named(name) => {
-            let mut fields = if name == "__ku_time" {
-                out.push_str("  ku_time_validate(value);\n");
-                vec![
-                    (
-                        "kind".to_string(),
-                        IrType::Str,
-                        "ku_time_kind(value)".to_string(),
-                    ),
-                    (
-                        "millis".to_string(),
-                        IrType::Int,
-                        "value.millis".to_string(),
-                    ),
-                ]
-            } else if name == "__ku_error_type" {
-                ["code", "domain", "message"]
-                    .into_iter()
-                    .map(|field| (field.to_string(), IrType::Str, format!("value.{field}")))
-                    .collect()
-            } else {
-                let layout = json_struct_layout(program, name).ok_or_else(|| {
-                    unsupported(format!(
-                        "native JSON writer cannot find struct layout '{name}'"
-                    ))
-                })?;
-                layout
-                    .fields
-                    .iter()
-                    .map(|field| {
-                        (
-                            field.name.clone(),
-                            field.ty.clone(),
-                            format!("value.{}", c_ident(&field.name)),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            };
-            fields.sort_by(|left, right| left.0.cmp(&right.0));
-            out.push_str(&format!(
-                "  yyjson_mut_val* object = ku_json_build_object(output, {});\n\
-                 \x20 if (!object) return NULL;\n",
-                fields.len()
-            ));
-            for (index, (name, field_type, expression)) in fields.iter().enumerate() {
-                let key = c_static_utf8_string(name);
-                let field_call =
-                    json_typed_write_call(field_type, expression, "depth + 1", "output", program)?;
+            let layout = json_struct_layout(program, name).ok_or_else(|| {
+                unsupported(format!(
+                    "native JSON writer cannot find struct layout '{name}'"
+                ))
+            })?;
+            let mut fields = layout.fields.iter().collect::<Vec<_>>();
+            fields.sort_by(|left, right| left.name.cmp(&right.name));
+            out.push_str("  if (!ku_json_write_byte(output, '{', error)) return false;\n");
+            for (index, field) in fields.iter().enumerate() {
+                if index != 0 {
+                    out.push_str("  if (!ku_json_write_byte(output, ',', error)) return false;\n");
+                }
+                let key = c_static_utf8_string(&field.name);
+                let field_expression = format!("value.{}", c_ident(&field.name));
+                let field_call = json_typed_write_call(
+                    &field.ty,
+                    &field_expression,
+                    "depth + 1",
+                    "output",
+                    "error",
+                    program,
+                )?;
                 out.push_str(&format!(
-                    "  yyjson_mut_val* field_{index} = {field_call};\n\
-                     \x20 if (!ku_json_build_object_add(output, object, {key}, field_{index})) return NULL;\n"
+                    "  if (!ku_json_write_string(output, {key}, error)\n\
+                     \x20     || !ku_json_write_byte(output, ':', error)\n\
+                     \x20     || !{field_call}) return false;\n"
                 ));
             }
-            out.push_str("  return object;\n}\n");
+            out.push_str("  return ku_json_write_byte(output, '}', error);\n}\n");
         }
         _ => {
             return Err(unsupported(format!(
@@ -4848,8 +4851,9 @@ fn emit_json_typed_writer(out: &mut COutput, ty: &IrType, program: &IrProgram) -
     Ok(())
 }
 
-/// Result wrappers do not consume their input. yyjson owns its DOM until the
-/// shared finish helper writes the independent KuString and frees the document.
+/// Emit non-consuming Result wrappers for every statically-typed JSON input.
+/// Reuse the borrowed writers for arrays as well as structs: boxing an array
+/// here would transfer its elements and free storage still owned by the caller.
 fn emit_json_typed_stringify_helpers(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
     out.check()?;
     let mut roots = Vec::new();
@@ -4868,7 +4872,7 @@ fn emit_json_typed_stringify_helpers(out: &mut COutput, program: &IrProgram) -> 
     }
     for ty in &writer_types {
         out.push_str(&format!(
-            "static yyjson_mut_val* ku_json_write_typed_{}(KuJsonBuild*, {}, size_t);\n",
+            "static bool ku_json_write_typed_{}(KuJsonBuffer*, {}, size_t, KuError*);\n",
             c_type_suffix(ty)?,
             c_type(ty)?
         ));
@@ -4883,14 +4887,19 @@ fn emit_json_typed_stringify_helpers(out: &mut COutput, program: &IrProgram) -> 
     for root in &roots {
         let suffix = c_type_suffix(root)?;
         let value_type = c_type(root)?;
-        let write_call = json_typed_write_call(root, "value", "0", "&output", program)?;
+        let write_call = json_typed_write_call(root, "value", "0", "&output", "&error", program)?;
         out.push_str(&format!(
             "static KuResult_str ku_json_stringify_typed_{suffix}({value_type} value) {{\n\
-             \x20 KuJsonBuild output = {{0}};\n\
-             \x20 output.doc = yyjson_mut_doc_new(NULL);\n\
-             \x20 if (!output.doc) ku_json_build_oom(&output);\n\
-             \x20 yyjson_mut_val* root = output.doc ? {write_call} : NULL;\n\
-             \x20 return ku_json_build_finish(&output, root);\n\
+             \x20 KuJsonBuffer output = {{0}};\n\
+             \x20 KuError error = (KuError){{0}};\n\
+             \x20 bool ok = {write_call};\n\
+             \x20 if (!ok) {{\n\
+             \x20   ku_json_buffer_drop(&output);\n\
+             \x20   if (!error.code.ptr) error = ku_json_error(\"stringify_error\", \"json stringify failed\");\n\
+             \x20   return (KuResult_str){{ false, (KuString){{0}}, error }};\n\
+             \x20 }}\n\
+             \x20 ku_error_drop(&error);\n\
+             \x20 return (KuResult_str){{ true, ku_json_buffer_take_string(&output), (KuError){{0}} }};\n\
              }}\n"
         ));
     }
@@ -4902,29 +4911,24 @@ fn emit_json_runtime(out: &mut COutput) {
     if out.failed() {
         return;
     }
-    // Embed unmodified upstream sources into the standalone C artifact, after
-    // KuString so the existing native allocation ledger covers yyjson as well.
     out.push_str(
-        "\n#define YYJSON_DISABLE_FILE 1\n#define YYJSON_READER_DEPTH_LIMIT 33\n#define YYJSON_WRITER_DEPTH_LIMIT 33\n\
-         #if defined(__clang__)\n#pragma clang diagnostic push\n\
-         #elif defined(__GNUC__)\n#pragma GCC diagnostic push\n\
-         #elif defined(_MSC_VER)\n#pragma warning(push)\n#endif\n",
-    );
-    out.push_str(include_str!("../../vendor/yyjson/yyjson.h"));
-    let source = include_str!("../../vendor/yyjson/yyjson.c");
-    let (before, after) = source
-        .split_once("#include \"yyjson.h\"")
-        .expect("pinned yyjson source includes its public header exactly once");
-    out.push_str(before);
-    out.push_str(after);
-    out.push_str(
-        "\n#if defined(__clang__)\n#pragma clang diagnostic pop\n\
-         #elif defined(__GNUC__)\n#pragma GCC diagnostic pop\n\
-         #elif defined(_MSC_VER)\n#pragma warning(pop)\n#endif\n",
-    );
-    // Keep Ku's established finite binary64 spelling across interpreter/native.
-    out.push_str(
-        r#"/*
+        r#"
+#define KU_JSON_MAX_INPUT_BYTES ((size_t)1000000)
+#define KU_JSON_MAX_OUTPUT_BYTES ((size_t)1000000)
+#define KU_JSON_MAX_DEPTH ((size_t)32)
+
+typedef struct KuJsonBuffer {
+  uint8_t* data;
+  size_t len;
+  size_t cap;
+} KuJsonBuffer;
+
+typedef struct KuJsonParser {
+  const uint8_t* current;
+  const uint8_t* end;
+} KuJsonParser;
+
+/*
  * Finite binary64 -> Rust `f64::to_string()` decimal.
  *
  * This is a bounded Dragon4-style interval search: it constructs the exact
@@ -5330,9 +5334,758 @@ static bool ku_dtoa_format_finite(
   return true;
 }
 
+static KuError ku_json_error(const char* code, const char* message) {
+  return ku_error_make(
+      ku_string_static((const uint8_t*)"json", 4),
+      ku_string_static((const uint8_t*)code, strlen(code)),
+      ku_string_static((const uint8_t*)message, strlen(message)));
+}
+
+static bool ku_json_fail(KuError* error, const char* code, const char* message) {
+  if (error && !error->code.ptr) *error = ku_json_error(code, message);
+  return false;
+}
+
+static bool ku_json_write_unsupported(
+    size_t depth, KuError* error, const char* message) {
+  if (depth > KU_JSON_MAX_DEPTH) {
+    return ku_json_fail(error, "stringify_error", "json value nesting is too deep");
+  }
+  return ku_json_fail(error, "stringify_error", message);
+}
+
+static void ku_json_buffer_drop(KuJsonBuffer* buffer) {
+  if (!buffer) return;
+  free(buffer->data);
+  *buffer = (KuJsonBuffer){0};
+}
+
+static bool ku_json_buffer_append(
+    KuJsonBuffer* buffer,
+    const uint8_t* bytes,
+    size_t len,
+    size_t limit,
+    KuError* error,
+    const char* limit_message) {
+  if (buffer->len > limit || len > limit - buffer->len) {
+    return ku_json_fail(error, "stringify_error", limit_message);
+  }
+  size_t needed = buffer->len + len;
+  if (needed > buffer->cap) {
+    size_t next = buffer->cap ? buffer->cap : 64;
+    while (next < needed) {
+      size_t grown = next > limit / 2 ? limit : next * 2;
+      if (grown <= next) {
+        return ku_json_fail(error, "stringify_error", limit_message);
+      }
+      next = grown;
+    }
+    uint8_t* data = (uint8_t*)realloc(buffer->data, next ? next : 1);
+    if (!data) return ku_json_fail(error, "out_of_memory", "json allocation failed");
+    buffer->data = data;
+    buffer->cap = next;
+  }
+  if (len) memcpy(buffer->data + buffer->len, bytes, len);
+  buffer->len = needed;
+  return true;
+}
+
+static bool ku_json_buffer_byte(
+    KuJsonBuffer* buffer,
+    uint8_t byte,
+    size_t limit,
+    KuError* error,
+    const char* limit_message) {
+  return ku_json_buffer_append(buffer, &byte, 1, limit, error, limit_message);
+}
+
+static KuString ku_json_buffer_take_string(KuJsonBuffer* buffer) {
+  if (!buffer->data) return ku_string_static((const uint8_t*)"", 0);
+  KuString value = (KuString){ buffer->data, buffer->len, buffer->cap, KU_STRING_OWNED };
+  *buffer = (KuJsonBuffer){0};
+  return value;
+}
+
+static bool ku_json_utf8_scalar(
+    const uint8_t* current,
+    const uint8_t* end,
+    size_t* width,
+    uint32_t* scalar) {
+  if (!current || current >= end) return false;
+  uint8_t first = current[0];
+  if (first < 0x80) {
+    *width = 1;
+    *scalar = first;
+    return true;
+  }
+  size_t remaining = (size_t)(end - current);
+  if (first >= 0xC2 && first <= 0xDF) {
+    if (remaining < 2 || (current[1] & 0xC0) != 0x80) return false;
+    *width = 2;
+    *scalar = ((uint32_t)(first & 0x1F) << 6) | (uint32_t)(current[1] & 0x3F);
+    return true;
+  }
+  if (first >= 0xE0 && first <= 0xEF) {
+    if (remaining < 3 || (current[1] & 0xC0) != 0x80 || (current[2] & 0xC0) != 0x80) return false;
+    if (first == 0xE0 && current[1] < 0xA0) return false;
+    if (first == 0xED && current[1] >= 0xA0) return false;
+    *width = 3;
+    *scalar = ((uint32_t)(first & 0x0F) << 12)
+        | ((uint32_t)(current[1] & 0x3F) << 6)
+        | (uint32_t)(current[2] & 0x3F);
+    return true;
+  }
+  if (first >= 0xF0 && first <= 0xF4) {
+    if (remaining < 4 || (current[1] & 0xC0) != 0x80
+        || (current[2] & 0xC0) != 0x80 || (current[3] & 0xC0) != 0x80) return false;
+    if (first == 0xF0 && current[1] < 0x90) return false;
+    if (first == 0xF4 && current[1] > 0x8F) return false;
+    *width = 4;
+    *scalar = ((uint32_t)(first & 0x07) << 18)
+        | ((uint32_t)(current[1] & 0x3F) << 12)
+        | ((uint32_t)(current[2] & 0x3F) << 6)
+        | (uint32_t)(current[3] & 0x3F);
+    return *scalar <= 0x10FFFF;
+  }
+  return false;
+}
+
+static size_t ku_json_encode_utf8(uint32_t scalar, uint8_t bytes[4]) {
+  if (scalar <= 0x7F) {
+    bytes[0] = (uint8_t)scalar;
+    return 1;
+  }
+  if (scalar <= 0x7FF) {
+    bytes[0] = (uint8_t)(0xC0 | (scalar >> 6));
+    bytes[1] = (uint8_t)(0x80 | (scalar & 0x3F));
+    return 2;
+  }
+  if (scalar <= 0xFFFF) {
+    bytes[0] = (uint8_t)(0xE0 | (scalar >> 12));
+    bytes[1] = (uint8_t)(0x80 | ((scalar >> 6) & 0x3F));
+    bytes[2] = (uint8_t)(0x80 | (scalar & 0x3F));
+    return 3;
+  }
+  bytes[0] = (uint8_t)(0xF0 | (scalar >> 18));
+  bytes[1] = (uint8_t)(0x80 | ((scalar >> 12) & 0x3F));
+  bytes[2] = (uint8_t)(0x80 | ((scalar >> 6) & 0x3F));
+  bytes[3] = (uint8_t)(0x80 | (scalar & 0x3F));
+  return 4;
+}
+
+static void ku_json_skip_ws(KuJsonParser* parser) {
+  while (parser->current < parser->end) {
+    uint8_t byte = *parser->current;
+    if (byte != ' ' && byte != '\t' && byte != '\n' && byte != '\r') break;
+    parser->current++;
+  }
+}
+
+static bool ku_json_parse_value(
+    KuJsonParser* parser,
+    size_t depth,
+    KuValue* value,
+    KuError* error);
+
+static bool ku_json_parse_string(
+    KuJsonParser* parser,
+    KuString* value,
+    KuError* error) {
+  *value = (KuString){0};
+  if (parser->current >= parser->end || *parser->current != '"') {
+    return ku_json_fail(error, "parse_error", "expected json string");
+  }
+  parser->current++;
+  KuJsonBuffer buffer = {0};
+  while (parser->current < parser->end) {
+    uint8_t byte = *parser->current++;
+    if (byte == '"') {
+      *value = ku_json_buffer_take_string(&buffer);
+      return true;
+    }
+    if (byte == '\\') {
+      if (parser->current >= parser->end) {
+        ku_json_buffer_drop(&buffer);
+        return ku_json_fail(error, "parse_error", "unterminated json escape");
+      }
+      uint8_t escaped = *parser->current++;
+      uint8_t decoded = 0;
+      bool one_byte = true;
+      switch (escaped) {
+        case '"': decoded = '"'; break;
+        case '\\': decoded = '\\'; break;
+        case '/': decoded = '/'; break;
+        case 'b': decoded = 8; break;
+        case 'f': decoded = 12; break;
+        case 'n': decoded = '\n'; break;
+        case 'r': decoded = '\r'; break;
+        case 't': decoded = '\t'; break;
+        case 'u': {
+          one_byte = false;
+          uint32_t scalar = 0;
+          for (size_t index = 0; index < 4; index++) {
+            if (parser->current >= parser->end) {
+              ku_json_buffer_drop(&buffer);
+              return ku_json_fail(error, "parse_error", "unterminated unicode escape");
+            }
+            uint8_t hex = *parser->current++;
+            uint32_t digit;
+            if (hex >= '0' && hex <= '9') digit = (uint32_t)(hex - '0');
+            else if (hex >= 'a' && hex <= 'f') digit = (uint32_t)(hex - 'a' + 10);
+            else if (hex >= 'A' && hex <= 'F') digit = (uint32_t)(hex - 'A' + 10);
+            else {
+              ku_json_buffer_drop(&buffer);
+              return ku_json_fail(error, "parse_error", "invalid unicode escape");
+            }
+            scalar = scalar * 16 + digit;
+          }
+          if (scalar >= 0xD800 && scalar <= 0xDBFF) {
+            if ((size_t)(parser->end - parser->current) < 6
+                || parser->current[0] != '\\' || parser->current[1] != 'u') {
+              ku_json_buffer_drop(&buffer);
+              return ku_json_fail(error, "parse_error",
+                  "high surrogate must be followed by a low surrogate");
+            }
+            parser->current += 2;
+            uint32_t low = 0;
+            for (size_t index = 0; index < 4; index++) {
+              uint8_t hex = *parser->current++;
+              uint32_t digit;
+              if (hex >= '0' && hex <= '9') digit = (uint32_t)(hex - '0');
+              else if (hex >= 'a' && hex <= 'f') digit = (uint32_t)(hex - 'a' + 10);
+              else if (hex >= 'A' && hex <= 'F') digit = (uint32_t)(hex - 'A' + 10);
+              else {
+                ku_json_buffer_drop(&buffer);
+                return ku_json_fail(error, "parse_error", "invalid unicode escape");
+              }
+              low = low * 16 + digit;
+            }
+            if (low < 0xDC00 || low > 0xDFFF) {
+              ku_json_buffer_drop(&buffer);
+              return ku_json_fail(error, "parse_error",
+                  "high surrogate must be followed by a low surrogate");
+            }
+            scalar = 0x10000 + ((scalar - 0xD800) << 10) + (low - 0xDC00);
+          } else if (scalar >= 0xDC00 && scalar <= 0xDFFF) {
+            ku_json_buffer_drop(&buffer);
+            return ku_json_fail(error, "parse_error", "unexpected low surrogate");
+          }
+          uint8_t encoded[4];
+          size_t encoded_len = ku_json_encode_utf8(scalar, encoded);
+          if (!ku_json_buffer_append(&buffer, encoded, encoded_len,
+                  KU_JSON_MAX_INPUT_BYTES, error, "json string is too large")) {
+            ku_json_buffer_drop(&buffer);
+            return false;
+          }
+          break;
+        }
+        default:
+          ku_json_buffer_drop(&buffer);
+          return ku_json_fail(error, "parse_error", "invalid json escape");
+      }
+      if (one_byte && !ku_json_buffer_byte(&buffer, decoded,
+              KU_JSON_MAX_INPUT_BYTES, error, "json string is too large")) {
+        ku_json_buffer_drop(&buffer);
+        return false;
+      }
+      continue;
+    }
+    if (byte < 0x20) {
+      ku_json_buffer_drop(&buffer);
+      return ku_json_fail(error, "parse_error", "control character in json string");
+    }
+    if (byte < 0x80) {
+      if (!ku_json_buffer_byte(&buffer, byte, KU_JSON_MAX_INPUT_BYTES,
+              error, "json string is too large")) {
+        ku_json_buffer_drop(&buffer);
+        return false;
+      }
+      continue;
+    }
+    parser->current--;
+    size_t width = 0;
+    uint32_t scalar = 0;
+    if (!ku_json_utf8_scalar(parser->current, parser->end, &width, &scalar)) {
+      ku_json_buffer_drop(&buffer);
+      return ku_json_fail(error, "parse_error", "invalid utf-8 in json string");
+    }
+    if (!ku_json_buffer_append(&buffer, parser->current, width,
+            KU_JSON_MAX_INPUT_BYTES, error, "json string is too large")) {
+      ku_json_buffer_drop(&buffer);
+      return false;
+    }
+    parser->current += width;
+  }
+  ku_json_buffer_drop(&buffer);
+  return ku_json_fail(error, "parse_error", "unterminated json string");
+}
+
+static bool ku_json_parse_literal(
+    KuJsonParser* parser,
+    const char* literal,
+    KuValue result,
+    KuValue* value,
+    KuError* error) {
+  size_t len = strlen(literal);
+  if ((size_t)(parser->end - parser->current) < len
+      || memcmp(parser->current, literal, len) != 0) {
+    return ku_json_fail(error, "parse_error", "invalid json literal");
+  }
+  parser->current += len;
+  *value = result;
+  return true;
+}
+
+static bool ku_json_parse_number(
+    KuJsonParser* parser,
+    KuValue* value,
+    KuError* error) {
+  const uint8_t* start = parser->current;
+  bool negative = false;
+  if (parser->current < parser->end && *parser->current == '-') {
+    negative = true;
+    parser->current++;
+  }
+  if (parser->current >= parser->end) {
+    return ku_json_fail(error, "parse_error", "expected digit in json number");
+  }
+  if (*parser->current == '0') {
+    parser->current++;
+    if (parser->current < parser->end
+        && *parser->current >= '0' && *parser->current <= '9') {
+      return ku_json_fail(error, "parse_error", "leading zero in json number");
+    }
+  } else if (*parser->current >= '1' && *parser->current <= '9') {
+    while (parser->current < parser->end
+        && *parser->current >= '0' && *parser->current <= '9') parser->current++;
+  } else {
+    return ku_json_fail(error, "parse_error", "expected digit in json number");
+  }
+
+  bool is_float = false;
+  if (parser->current < parser->end && *parser->current == '.') {
+    is_float = true;
+    parser->current++;
+    const uint8_t* digits = parser->current;
+    while (parser->current < parser->end
+        && *parser->current >= '0' && *parser->current <= '9') parser->current++;
+    if (parser->current == digits) {
+      return ku_json_fail(error, "parse_error", "expected digit after decimal point");
+    }
+  }
+  if (parser->current < parser->end
+      && (*parser->current == 'e' || *parser->current == 'E')) {
+    is_float = true;
+    parser->current++;
+    if (parser->current < parser->end
+        && (*parser->current == '+' || *parser->current == '-')) parser->current++;
+    const uint8_t* digits = parser->current;
+    while (parser->current < parser->end
+        && *parser->current >= '0' && *parser->current <= '9') parser->current++;
+    if (parser->current == digits) {
+      return ku_json_fail(error, "parse_error", "expected digit in exponent");
+    }
+  }
+
+  size_t len = (size_t)(parser->current - start);
+  if (is_float) {
+    if (len == SIZE_MAX) return ku_json_fail(error, "parse_error", "invalid json number");
+    char* text = (char*)malloc(len + 1);
+    if (!text) return ku_json_fail(error, "out_of_memory", "json allocation failed");
+    memcpy(text, start, len);
+    text[len] = '\0';
+    char* parsed_end = NULL;
+    errno = 0;
+    double number = strtod(text, &parsed_end);
+    bool valid = parsed_end == text + len && isfinite(number);
+    free(text);
+    if (!valid) return ku_json_fail(error, "parse_error", "json number must be finite");
+    *value = ku_v_float(number);
+    return true;
+  }
+
+  const uint8_t* digit = start + (negative ? 1 : 0);
+  uint64_t magnitude = 0;
+  uint64_t limit = negative ? ((uint64_t)INT64_MAX + 1u) : (uint64_t)INT64_MAX;
+  while (digit < parser->current) {
+    uint64_t next = (uint64_t)(*digit - '0');
+    if (magnitude > (limit - next) / 10u) {
+      return ku_json_fail(error, "parse_error", "invalid json number");
+    }
+    magnitude = magnitude * 10u + next;
+    digit++;
+  }
+  int64_t number;
+  if (negative && magnitude == ((uint64_t)INT64_MAX + 1u)) number = INT64_MIN;
+  else if (negative) number = -(int64_t)magnitude;
+  else number = (int64_t)magnitude;
+  *value = ku_v_int(number);
+  return true;
+}
+
+static bool ku_json_parse_array(
+    KuJsonParser* parser,
+    size_t depth,
+    KuValue* value,
+    KuError* error) {
+  parser->current++;
+  KuValueArray* array = NULL;
+  if (!ku_value_array_try_new(0, &array)) {
+    return ku_json_fail(error, "out_of_memory", "json allocation failed");
+  }
+  ku_json_skip_ws(parser);
+  if (parser->current < parser->end && *parser->current == ']') {
+    parser->current++;
+    *value = ku_v_array(array);
+    return true;
+  }
+  while (true) {
+    KuValue element = ku_v_null();
+    if (!ku_json_parse_value(parser, depth, &element, error)) {
+      ku_value_drop(&element);
+      ku_value_array_drop(array);
+      return false;
+    }
+    if (!ku_value_array_try_push_owned(array, &element)) {
+      ku_value_drop(&element);
+      ku_value_array_drop(array);
+      return ku_json_fail(error, "out_of_memory", "json allocation failed");
+    }
+    ku_json_skip_ws(parser);
+    if (parser->current < parser->end && *parser->current == ']') {
+      parser->current++;
+      *value = ku_v_array(array);
+      return true;
+    }
+    if (parser->current >= parser->end || *parser->current != ',') {
+      ku_value_array_drop(array);
+      return ku_json_fail(error, "parse_error", "expected ','");
+    }
+    parser->current++;
+  }
+}
+
+static bool ku_json_parse_object(
+    KuJsonParser* parser,
+    size_t depth,
+    KuValue* value,
+    KuError* error) {
+  parser->current++;
+  KuObject* object = NULL;
+  if (!ku_object_try_new(0, &object)) {
+    return ku_json_fail(error, "out_of_memory", "json allocation failed");
+  }
+  ku_json_skip_ws(parser);
+  if (parser->current < parser->end && *parser->current == '}') {
+    parser->current++;
+    *value = ku_v_object(object);
+    return true;
+  }
+  while (true) {
+    ku_json_skip_ws(parser);
+    KuString key = (KuString){0};
+    if (!ku_json_parse_string(parser, &key, error)) {
+      ku_object_drop(object);
+      return false;
+    }
+    ku_json_skip_ws(parser);
+    if (parser->current >= parser->end || *parser->current != ':') {
+      ku_string_drop(&key);
+      ku_object_drop(object);
+      return ku_json_fail(error, "parse_error", "expected ':'");
+    }
+    parser->current++;
+    KuValue field = ku_v_null();
+    if (!ku_json_parse_value(parser, depth, &field, error)) {
+      ku_string_drop(&key);
+      ku_value_drop(&field);
+      ku_object_drop(object);
+      return false;
+    }
+    if (!ku_object_try_set_owned(object, &key, &field)) {
+      ku_string_drop(&key);
+      ku_value_drop(&field);
+      ku_object_drop(object);
+      return ku_json_fail(error, "out_of_memory", "json allocation failed");
+    }
+    ku_json_skip_ws(parser);
+    if (parser->current < parser->end && *parser->current == '}') {
+      parser->current++;
+      *value = ku_v_object(object);
+      return true;
+    }
+    if (parser->current >= parser->end || *parser->current != ',') {
+      ku_object_drop(object);
+      return ku_json_fail(error, "parse_error", "expected ','");
+    }
+    parser->current++;
+  }
+}
+
+static bool ku_json_parse_value(
+    KuJsonParser* parser,
+    size_t depth,
+    KuValue* value,
+    KuError* error) {
+  *value = ku_v_null();
+  if (depth > KU_JSON_MAX_DEPTH) {
+    return ku_json_fail(error, "parse_error", "json nesting is too deep");
+  }
+  ku_json_skip_ws(parser);
+  if (parser->current >= parser->end) {
+    return ku_json_fail(error, "parse_error", "unexpected end of json");
+  }
+  switch (*parser->current) {
+    case '"': {
+      KuString string = (KuString){0};
+      if (!ku_json_parse_string(parser, &string, error)) return false;
+      *value = ku_v_str(string);
+      return true;
+    }
+    case 'n': return ku_json_parse_literal(parser, "null", ku_v_null(), value, error);
+    case 't': return ku_json_parse_literal(parser, "true", ku_v_bool(true), value, error);
+    case 'f': return ku_json_parse_literal(parser, "false", ku_v_bool(false), value, error);
+    case '[': return ku_json_parse_array(parser, depth + 1, value, error);
+    case '{': return ku_json_parse_object(parser, depth + 1, value, error);
+    default:
+      if (*parser->current == '-'
+          || (*parser->current >= '0' && *parser->current <= '9')) {
+        return ku_json_parse_number(parser, value, error);
+      }
+      return ku_json_fail(error, "parse_error", "expected json value");
+  }
+}
+
+/* Parser pointers always address the original UTF-8 bytes. Preserve the
+ * structured error while making syntax locations zero-based byte offsets. */
+static KuError ku_json_parse_error_at(KuError error, size_t position) {
+  if (!ku_string_equal(error.code,
+          ku_string_static((const uint8_t*)"parse_error", 11))) return error;
+  char suffix[48];
+  int length = snprintf(suffix, sizeof(suffix), " at byte %zu", position);
+  if (length < 0 || (size_t)length >= sizeof(suffix)) return error;
+  KuString message = (KuString){0};
+  if (!ku_object_string_try_concat(error.message,
+          ku_string_static((const uint8_t*)suffix, (size_t)length), &message)) {
+    ku_error_drop(&error);
+    return ku_json_error("out_of_memory", "json allocation failed");
+  }
+  ku_string_drop(&error.message);
+  error.message = message;
+  return error;
+}
+
+static KuResult_kuvalue ku_json_try_parse(KuString text) {
+  if (text.len > KU_JSON_MAX_INPUT_BYTES) {
+    return (KuResult_kuvalue){ false, ku_v_null(),
+        ku_json_error("parse_error", "json input is too large") };
+  }
+  if (text.len && !text.ptr) {
+    return (KuResult_kuvalue){ false, ku_v_null(),
+        ku_json_error("parse_error", "invalid utf-8 in json input") };
+  }
+  const uint8_t* begin = text.ptr ? text.ptr : (const uint8_t*)"";
+  KuJsonParser parser = { begin, begin + text.len };
+  KuValue value = ku_v_null();
+  KuError error = (KuError){0};
+  if (!ku_json_parse_value(&parser, 0, &value, &error)) {
+    ku_value_drop(&value);
+    if (!error.code.ptr) error = ku_json_error("parse_error", "invalid json");
+    error = ku_json_parse_error_at(error, (size_t)(parser.current - begin));
+    return (KuResult_kuvalue){ false, ku_v_null(), error };
+  }
+  ku_json_skip_ws(&parser);
+  if (parser.current != parser.end) {
+    ku_value_drop(&value);
+    return (KuResult_kuvalue){ false, ku_v_null(),
+        ku_json_parse_error_at(
+            ku_json_error("parse_error", "unexpected trailing characters"),
+            (size_t)(parser.current - begin)) };
+  }
+  return (KuResult_kuvalue){ true, value, (KuError){0} };
+}
+
+static KuResult_kuvalue ku_json_parse(KuString text) {
+  return ku_json_try_parse(text);
+}
+
+static int ku_json_entry_compare(const void* left_ptr, const void* right_ptr) {
+  const KuEntry* left = *(const KuEntry* const*)left_ptr;
+  const KuEntry* right = *(const KuEntry* const*)right_ptr;
+  size_t shared = left->key.len < right->key.len ? left->key.len : right->key.len;
+  int order = shared ? memcmp(left->key.ptr, right->key.ptr, shared) : 0;
+  if (order != 0) return order;
+  if (left->key.len < right->key.len) return -1;
+  if (left->key.len > right->key.len) return 1;
+  return 0;
+}
+
+static bool ku_json_write_value(
+    KuJsonBuffer* output,
+    KuValue value,
+    size_t depth,
+    KuError* error);
+
+static bool ku_json_write_bytes(
+    KuJsonBuffer* output,
+    const char* bytes,
+    size_t len,
+    KuError* error) {
+  return ku_json_buffer_append(output, (const uint8_t*)bytes, len,
+      KU_JSON_MAX_OUTPUT_BYTES, error, "json.stringify output is too large");
+}
+
+static bool ku_json_write_byte(
+    KuJsonBuffer* output,
+    uint8_t byte,
+    KuError* error) {
+  return ku_json_buffer_byte(output, byte, KU_JSON_MAX_OUTPUT_BYTES,
+      error, "json.stringify output is too large");
+}
+
+static bool ku_json_write_string(
+    KuJsonBuffer* output,
+    KuString string,
+    KuError* error) {
+  if (string.len && !string.ptr) {
+    return ku_json_fail(error, "stringify_error", "invalid utf-8 in json string");
+  }
+  if (!ku_json_write_byte(output, '"', error)) return false;
+  const uint8_t* current = string.ptr ? string.ptr : (const uint8_t*)"";
+  const uint8_t* end = current + string.len;
+  while (current < end) {
+    size_t width = 0;
+    uint32_t scalar = 0;
+    if (!ku_json_utf8_scalar(current, end, &width, &scalar)) {
+      return ku_json_fail(error, "stringify_error", "invalid utf-8 in json string");
+    }
+    if (scalar == '"' || scalar == '\\') {
+      uint8_t escaped[2] = { '\\', (uint8_t)scalar };
+      if (!ku_json_buffer_append(output, escaped, 2, KU_JSON_MAX_OUTPUT_BYTES,
+              error, "json.stringify output is too large")) return false;
+    } else if (scalar == '\n' || scalar == '\r' || scalar == '\t') {
+      uint8_t escaped[2] = { '\\', scalar == '\n' ? 'n' : (scalar == '\r' ? 'r' : 't') };
+      if (!ku_json_buffer_append(output, escaped, 2, KU_JSON_MAX_OUTPUT_BYTES,
+              error, "json.stringify output is too large")) return false;
+    } else if (scalar < 0x20) {
+      char escaped[7];
+      int len = snprintf(escaped, sizeof(escaped), "\\u%04x", (unsigned)scalar);
+      if (len != 6 || !ku_json_write_bytes(output, escaped, 6, error)) return false;
+    } else if (!ku_json_buffer_append(output, current, width, KU_JSON_MAX_OUTPUT_BYTES,
+                   error, "json.stringify output is too large")) {
+      return false;
+    }
+    current += width;
+  }
+  return ku_json_write_byte(output, '"', error);
+}
+
+static bool ku_json_write_object(
+    KuJsonBuffer* output,
+    KuObject* object,
+    size_t depth,
+    KuError* error) {
+  if (!ku_json_write_byte(output, '{', error)) return false;
+  size_t count = object ? object->len : 0;
+  if (count == 0) return ku_json_write_byte(output, '}', error);
+  if (count > SIZE_MAX / sizeof(KuEntry*)) {
+    return ku_json_fail(error, "stringify_error", "json object is too large");
+  }
+  KuEntry** entries = (KuEntry**)malloc(count * sizeof(KuEntry*));
+  if (!entries) return ku_json_fail(error, "out_of_memory", "json allocation failed");
+  size_t found = 0;
+  for (size_t index = 0; index < object->cap && found < count; index++) {
+    if (object->entries[index].used) entries[found++] = &object->entries[index];
+  }
+  qsort(entries, found, sizeof(KuEntry*), ku_json_entry_compare);
+  for (size_t index = 0; index < found; index++) {
+    bool ok = (index == 0 || ku_json_write_byte(output, ',', error))
+        && ku_json_write_string(output, entries[index]->key, error)
+        && ku_json_write_byte(output, ':', error)
+        && ku_json_write_value(output, entries[index]->value, depth + 1, error);
+    if (!ok) {
+      free(entries);
+      return false;
+    }
+  }
+  free(entries);
+  return ku_json_write_byte(output, '}', error);
+}
+
+static bool ku_json_write_value(
+    KuJsonBuffer* output,
+    KuValue value,
+    size_t depth,
+    KuError* error) {
+  if (depth > KU_JSON_MAX_DEPTH) {
+    return ku_json_fail(error, "stringify_error", "json value nesting is too deep");
+  }
+  char number[KU_DTOA_TEXT_CAP];
+  switch (value.tag) {
+    case KU_NULL:
+      return ku_json_write_bytes(output, "null", 4, error);
+    case KU_INT: {
+      int len = snprintf(number, sizeof(number), "%lld", (long long)value.as.i);
+      return len > 0 && (size_t)len < sizeof(number)
+          && ku_json_write_bytes(output, number, (size_t)len, error);
+    }
+    case KU_FLOAT: {
+      if (!isfinite(value.as.f)) {
+        return ku_json_fail(error, "stringify_error",
+            "json.stringify does not support non-finite float");
+      }
+      size_t len = 0;
+      if (!ku_dtoa_format_finite(value.as.f, number, sizeof(number), &len)) {
+        return ku_json_fail(error, "stringify_error",
+            "json float formatting failed");
+      }
+      return ku_json_write_bytes(output, number, len, error);
+    }
+    case KU_BOOL:
+      return value.as.b
+          ? ku_json_write_bytes(output, "true", 4, error)
+          : ku_json_write_bytes(output, "false", 5, error);
+    case KU_STR:
+      return ku_json_write_string(output, value.as.s, error);
+    case KU_OBJECT:
+      return ku_json_write_object(output, value.as.o, depth, error);
+    case KU_ARRAY: {
+      if (!ku_json_write_byte(output, '[', error)) return false;
+      KuValueArray* array = value.as.arr;
+      if (array) {
+        for (size_t index = 0; index < array->len; index++) {
+          if ((index != 0 && !ku_json_write_byte(output, ',', error))
+              || !ku_json_write_value(output, array->data[index], depth + 1, error)) {
+            return false;
+          }
+        }
+      }
+      return ku_json_write_byte(output, ']', error);
+    }
+    case KU_FUNCTION:
+      return ku_json_fail(error, "stringify_error",
+          "json.stringify does not support function");
+    default:
+      return ku_json_fail(error, "stringify_error",
+          "json.stringify does not support value");
+  }
+}
+
+static KuResult_str ku_json_stringify(KuValue value) {
+  KuJsonBuffer output = {0};
+  KuError error = (KuError){0};
+  bool ok = ku_json_write_value(&output, value, 0, &error);
+  if (!ok) {
+    ku_json_buffer_drop(&output);
+    if (!error.code.ptr) error = ku_json_error("stringify_error", "json stringify failed");
+    return (KuResult_str){ false, (KuString){0}, error };
+  }
+  ku_error_drop(&error);
+  return (KuResult_str){ true, ku_json_buffer_take_string(&output), (KuError){0} };
+}
+
 "#,
     );
-    out.push_str(include_str!("json_runtime.c"));
 }
 
 /// Emit a dynamic object literal as statements building a KuObject*. Each field

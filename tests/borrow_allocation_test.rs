@@ -413,7 +413,7 @@ static int measure(size_t bytes) {
   }
   ku_borrow_timeout_mode = 0;
   /* Measure this serializer's actual allocation sites before injecting one
-     failure at each ordinal. yyjson's DOM and output allocations are required;
+     failure at each ordinal. Serializer output allocations are required;
      they must neither clone the borrowed input nor survive the returned Result. */
   ku_borrow_json_allocation_calls = 0;
   KuResult_str successful = Encode(&users);
