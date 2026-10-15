@@ -1200,17 +1200,13 @@ fn primitive_snapshot(
         let Some(Value::String(message)) = fields.get("message") else {
             unreachable!()
         };
-        let input = buffers
-            .iter()
-            .find(|buffer| buffer.text == message.as_str())
-            .expect("the error message comes from one real input");
-        if !message.is_empty() {
-            assert_ne!(
-                message.as_ptr() as usize,
-                input.pointer,
-                "primitive err retains the existing message.clone contract"
-            );
-        }
+        assert!(
+            buffers.iter().any(|buffer| buffer.text == message.as_str()),
+            "the error message comes from one real input"
+        );
+        // The original operand can already be retired. Its historical input
+        // pointer cannot establish clone separation for this live descendant;
+        // source and candidate are compared while both physically coexist.
         assert_eq!(actual.boxed, address);
         (PrimitiveLeaf::Error, Some(actual))
     };

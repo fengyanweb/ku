@@ -1452,7 +1452,27 @@ impl Machine {
         // original operand and its new buffer survive until operand cleanup.
         // Construct only the candidate Map before the actual-capacity check;
         // errors::err would allocate its Box too early for this admission.
+        #[cfg(test)]
+        let original_buffer = (message.as_ptr(), message.capacity());
         let object = errors::error_object("ku", "err", message.clone());
+        #[cfg(test)]
+        {
+            let Value::Object(fields) = &object else {
+                unreachable!("real source err constructor keeps its Object");
+            };
+            let Some(Value::String(cloned)) = fields.get("message") else {
+                unreachable!("real source err constructor keeps its message String");
+            };
+            assert_eq!(cloned, message);
+            assert_eq!((message.as_ptr(), message.capacity()), original_buffer);
+            if !message.is_empty() {
+                assert_ne!(
+                    cloned.as_ptr(),
+                    message.as_ptr(),
+                    "real source err clones while original operand and candidate coexist"
+                );
+            }
+        }
         let actual = match AwaitPayloadCharge::error_object(&object) {
             Ok(charge) => charge,
             Err(rejection) => {
