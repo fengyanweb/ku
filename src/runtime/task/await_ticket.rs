@@ -205,6 +205,57 @@ impl AwaitPayloadPolicy {
     }
 }
 
+/// A separate conservative charge for the await-local String contract.
+/// No origin credit is inferred from pointer reuse or the old input quota.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AwaitStringPayloadCharge {
+    pub(crate) bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AwaitStringPayloadPolicy {
+    payload: AwaitPayloadPolicy,
+}
+
+impl AwaitStringPayloadPolicy {
+    pub(crate) fn new(payload: AwaitPayloadPolicy) -> Self {
+        Self { payload }
+    }
+
+    pub(super) fn admit(
+        self,
+        result: &KuResult<Value>,
+    ) -> Result<(AwaitPayloadCharge, AwaitStringPayloadCharge), AwaitPayloadRejection> {
+        let (charge, string) = match result {
+            Ok(Value::Result { ok: true, value }) => match value.as_ref() {
+                Value::String(text) => (
+                    AwaitPayloadCharge::boxed(0, 0)?,
+                    AwaitStringPayloadCharge {
+                        bytes: text.capacity(),
+                    },
+                ),
+                _ => (
+                    self.payload.admit(result)?,
+                    AwaitStringPayloadCharge::default(),
+                ),
+            },
+            _ => (
+                self.payload.admit(result)?,
+                AwaitStringPayloadCharge::default(),
+            ),
+        };
+        self.payload.check_charge(charge)?;
+        let total = charge
+            .bytes
+            .checked_add(string.bytes)
+            .ok_or(AwaitPayloadRejection::ArithmeticOverflow)?;
+        if total > self.payload.max_bytes {
+            return Err(AwaitPayloadRejection::StorageLimit);
+        }
+        Ok((charge, string))
+    }
+}
+
 pub(super) enum AwaitMode {
     Ordinary,
     Diagnostic(Duration),
@@ -268,6 +319,8 @@ struct AwaitCore<H: AwaitTarget> {
     // polls outside the Machine. Charge describes only its actual outcome.
     payload_policy: Option<AwaitPayloadPolicy>,
     payload_charge: AwaitPayloadCharge,
+    string_payload_policy: Option<AwaitStringPayloadPolicy>,
+    string_payload_charge: AwaitStringPayloadCharge,
     // Actual resource-release cause is independent of the result's metadata.
     // Only its deadline tightens; no TLS guard survives a poll boundary.
     release_context: Option<CancellationContext>,
@@ -285,6 +338,16 @@ impl<H: AwaitTarget> AwaitCore<H> {
         mode: AwaitMode,
         payload_policy: Option<AwaitPayloadPolicy>,
     ) -> Self {
+        Self::begin_with_policies(runtime, target, mode, payload_policy, None)
+    }
+
+    fn begin_with_policies(
+        runtime: TaskRuntime,
+        target: H,
+        mode: AwaitMode,
+        payload_policy: Option<AwaitPayloadPolicy>,
+        string_payload_policy: Option<AwaitStringPayloadPolicy>,
+    ) -> Self {
         // Install the owner before admission: every failure still reaches the
         // observer before an owned target is released.
         let mut core = Self {
@@ -298,6 +361,8 @@ impl<H: AwaitTarget> AwaitCore<H> {
             outcome: None,
             payload_policy,
             payload_charge: AwaitPayloadCharge::default(),
+            string_payload_policy,
+            string_payload_charge: AwaitStringPayloadCharge::default(),
             release_context: visible_context(),
             _same_thread: PhantomData,
         };
@@ -397,26 +462,43 @@ impl<H: AwaitTarget> AwaitCore<H> {
     }
 
     fn ready(&mut self, result: KuResult<Value>) {
-        let charge = match self.payload_policy {
-            Some(policy) => match policy.admit(&result) {
-                Ok(charge) => charge,
+        let (charge, string_charge) = if let Some(policy) = self.string_payload_policy {
+            match policy.admit(&result) {
+                Ok(charges) => charges,
                 Err(rejection) => {
-                    self.reject_payload(result, rejection, policy.span);
+                    self.reject_payload(result, rejection, policy.payload.span);
                     return;
                 }
-            },
-            None => AwaitPayloadCharge::default(),
+            }
+        } else {
+            let charge = match self.payload_policy {
+                Some(policy) => match policy.admit(&result) {
+                    Ok(charge) => charge,
+                    Err(rejection) => {
+                        self.reject_payload(result, rejection, policy.span);
+                        return;
+                    }
+                },
+                None => AwaitPayloadCharge::default(),
+            };
+            (charge, AwaitStringPayloadCharge::default())
         };
-        self.ready_admitted(result, charge);
+        self.ready_admitted(result, charge, string_charge);
     }
 
-    fn ready_admitted(&mut self, result: KuResult<Value>, charge: AwaitPayloadCharge) {
+    fn ready_admitted(
+        &mut self,
+        result: KuResult<Value>,
+        charge: AwaitPayloadCharge,
+        string_charge: AwaitStringPayloadCharge,
+    ) {
         assert!(self.outcome.is_none(), "await outcome transfers once");
         self.remember_release();
         if let Err(error) = &result {
             tighten(&mut self.release_context, error.scope_cleanup());
         }
         self.payload_charge = charge;
+        self.string_payload_charge = string_charge;
         self.outcome = Some(result);
         // Original await_task_until retired this before returning to the
         // Interpreter observer. Keep target and outcome owned after retirement.
@@ -432,11 +514,15 @@ impl<H: AwaitTarget> AwaitCore<H> {
         self.ready_admitted(
             Err(rejection.into_error(span)),
             AwaitPayloadCharge::default(),
+            AwaitStringPayloadCharge::default(),
         );
     }
 
     fn ready_task_error(&mut self, code: &str, message: String) {
-        let Some(policy) = self.payload_policy else {
+        let Some(policy) = self
+            .payload_policy
+            .or_else(|| self.string_payload_policy.map(|policy| policy.payload))
+        else {
             self.ready(Ok(task_error(code, message)));
             return;
         };
@@ -463,6 +549,7 @@ impl<H: AwaitTarget> AwaitCore<H> {
                 value: Box::new(object),
             }),
             charge,
+            AwaitStringPayloadCharge::default(),
         );
     }
 
@@ -504,31 +591,53 @@ impl<H: AwaitTarget> AwaitCore<H> {
         }
         // Payload and terminal are observed under the same result lock. This
         // is a move for ordinary await, never a peek clone of an Owned value.
-        let observed = match self.payload_policy {
-            Some(policy) => match self.target().state.observe_result_admitted(policy) {
+        let observed = if let Some(policy) = self.string_payload_policy {
+            match self.target().state.observe_result_string_admitted(policy) {
                 Ok(observed) => Ok(observed),
                 Err(AwaitObservationError::Poisoned) => Err(KuError::runtime(
                     "async task state is poisoned",
                     Span::default(),
                 )),
                 Err(AwaitObservationError::Rejected(rejection)) => {
-                    Err(rejection.into_error(policy.span))
+                    Err(rejection.into_error(policy.payload.span))
                 }
-            },
-            None => self
-                .target()
-                .state
-                .observe_result(self.consume)
-                .map(|(result, terminal)| (result, terminal, AwaitPayloadCharge::default())),
+            }
+        } else {
+            let observed =
+                match self.payload_policy {
+                    Some(policy) => match self.target().state.observe_result_admitted(policy) {
+                        Ok(observed) => Ok(observed),
+                        Err(AwaitObservationError::Poisoned) => Err(KuError::runtime(
+                            "async task state is poisoned",
+                            Span::default(),
+                        )),
+                        Err(AwaitObservationError::Rejected(rejection)) => {
+                            Err(rejection.into_error(policy.span))
+                        }
+                    },
+                    None => self.target().state.observe_result(self.consume).map(
+                        |(result, terminal)| (result, terminal, AwaitPayloadCharge::default()),
+                    ),
+                };
+            observed.map(|(result, terminal, charge)| {
+                (
+                    result,
+                    terminal,
+                    charge,
+                    AwaitStringPayloadCharge::default(),
+                )
+            })
         };
         match observed {
             Err(error) => self.ready(Err(error)),
-            Ok((Some(result), _, charge)) => self.ready_admitted(result, charge),
-            Ok((None, true, _)) => self.ready_task_error(
+            Ok((Some(result), _, charge, string_charge)) => {
+                self.ready_admitted(result, charge, string_charge)
+            }
+            Ok((None, true, _, _)) => self.ready_task_error(
                 "already_awaited",
                 format!("task {} has already been awaited", self.target().id),
             ),
-            Ok((None, false, _)) => {
+            Ok((None, false, _, _)) => {
                 if self
                     .deadline
                     .is_some_and(|deadline| Instant::now() >= deadline)
@@ -741,6 +850,39 @@ impl AwaitTicket {
         Self {
             core: AwaitCore::begin_with_policy(runtime, handle, AwaitMode::Ordinary, Some(policy)),
         }
+    }
+
+    pub(crate) fn begin_with_string_payload_policy(
+        handle: TaskHandle,
+        policy: AwaitStringPayloadPolicy,
+    ) -> Self {
+        let runtime = handle.runtime.clone();
+        Self {
+            core: AwaitCore::begin_with_policies(
+                runtime,
+                handle,
+                AwaitMode::Ordinary,
+                None,
+                Some(policy),
+            ),
+        }
+    }
+
+    pub(crate) fn retained_string_payload_charge(&self) -> AwaitStringPayloadCharge {
+        // Capacity admissions read the live immutable owner even when the
+        // LocalDriver latched Ready outside Machine dispatch. The admitted
+        // metadata is an invariant check, never the live charging oracle.
+        let actual = match (&self.core.string_payload_policy, &self.core.outcome) {
+            (Some(_), Some(Ok(Value::Result { ok: true, value }))) => match value.as_ref() {
+                Value::String(text) => AwaitStringPayloadCharge {
+                    bytes: text.capacity(),
+                },
+                _ => AwaitStringPayloadCharge::default(),
+            },
+            _ => AwaitStringPayloadCharge::default(),
+        };
+        debug_assert_eq!(actual, self.core.string_payload_charge);
+        actual
     }
 
     pub(crate) fn retained_payload_charge(&self) -> AwaitPayloadCharge {

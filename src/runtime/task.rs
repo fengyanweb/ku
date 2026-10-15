@@ -19,7 +19,10 @@ use crate::{
 };
 
 mod await_ticket;
-pub(crate) use await_ticket::{AwaitPayloadCharge, AwaitPayloadPolicy, AwaitPoll, AwaitTicket};
+pub(crate) use await_ticket::{
+    AwaitPayloadCharge, AwaitPayloadPolicy, AwaitPoll, AwaitStringPayloadCharge,
+    AwaitStringPayloadPolicy, AwaitTicket,
+};
 #[cfg(test)]
 mod await_ticket_tests;
 mod cancel_batch;
@@ -856,6 +859,14 @@ pub struct TaskStressReport {
     pub task_workers: usize,
     pub blocking_workers: usize,
 }
+
+// The owned result is moved once after admission under its result lock.
+type StringAwaitObservation = (
+    Option<KuResult<Value>>,
+    bool,
+    await_ticket::AwaitPayloadCharge,
+    await_ticket::AwaitStringPayloadCharge,
+);
 
 struct TaskState {
     id: i64,
@@ -2468,6 +2479,30 @@ impl TaskState {
             None => await_ticket::AwaitPayloadCharge::default(),
         };
         Ok((slot.take(), terminal, charge))
+    }
+
+    fn observe_result_string_admitted(
+        &self,
+        policy: await_ticket::AwaitStringPayloadPolicy,
+    ) -> Result<StringAwaitObservation, await_ticket::AwaitObservationError> {
+        let mut slot = self
+            .result
+            .lock()
+            .map_err(|_| await_ticket::AwaitObservationError::Poisoned)?;
+        let terminal = self.is_terminal();
+        // Same lock, before take: real buffer capacity, immutable fixed-shape
+        // metadata, and checked integer quota arithmetic only. Rejected
+        // payloads remain owned by the original Task result slot unchanged.
+        let (charge, string_charge) = match slot.as_ref() {
+            Some(result) => policy
+                .admit(result)
+                .map_err(await_ticket::AwaitObservationError::Rejected)?,
+            None => (
+                await_ticket::AwaitPayloadCharge::default(),
+                await_ticket::AwaitStringPayloadCharge::default(),
+            ),
+        };
+        Ok((slot.take(), terminal, charge, string_charge))
     }
 
     #[cfg(test)]

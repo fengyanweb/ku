@@ -14,7 +14,10 @@
 
 use super::*;
 use crate::ast::{Param, TypeName};
-use crate::runtime::task::{AwaitPayloadCharge, AwaitPayloadPolicy, TaskRetirementWitness};
+use crate::runtime::task::{
+    AwaitPayloadCharge, AwaitPayloadPolicy, AwaitStringPayloadCharge, AwaitStringPayloadPolicy,
+    TaskRetirementWitness,
+};
 use crate::stdlib::errors;
 use std::cell::Cell;
 use std::num::NonZeroUsize;
@@ -144,10 +147,28 @@ impl CallKind {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AwaitOwnedHandoffPhase {
+    Observer,
+    Emit,
+}
+
 /// The evaluator supplies its existing resource and termination arbitration.
 /// A child task receives shared code; its machine is constructed by its claimant.
 trait ExecutionHooks {
     fn host(&mut self) -> &mut Interpreter;
+
+    // Formal regressions inspect the actual operation-local outcome through
+    // a safe, synchronous reborrow. No observer exists in ordinary builds.
+    #[cfg(test)]
+    fn observe_await_owned_handoff(
+        &mut self,
+        _machine: &mut Machine,
+        _result: &KuResult<Value>,
+        _phase: AwaitOwnedHandoffPhase,
+    ) {
+    }
 
     // A private kernel capability, not a language or embedding API.
     // The String-local slice relies on real fixed arbitration moving/dropping
@@ -584,6 +605,7 @@ enum Work {
     WrapBorrowedTerminalOk(SpanId),
     AwaitOperand(SpanId),
     AwaitOwnedStringOperand(SpanId),
+    AwaitLocalOwnedStringOperand(SpanId),
     AwaitResume,
     Propagate(SpanId),
     TryExit(usize),
@@ -763,6 +785,11 @@ struct Machine {
     // at every capacity admission, instead of relying on a dispatch snapshot.
     await_payload_snapshot: AwaitPayloadCharge,
     await_payload_escrow: AwaitPayloadCharge,
+    // Kept separate from Box/ErrorObject snapshots. The String census below
+    // includes this exact observed subtotal; budget entries substitute live
+    // direct-poll Ticket/operation-local escrow owners before admission.
+    await_string_payload_snapshot: AwaitStringPayloadCharge,
+    await_string_payload_escrow: AwaitStringPayloadCharge,
     // Direct synchronous err and selected Result locals keep the stable-owner
     // scanner/native-drop path active even without an awaited payload.
     selected_error_payloads: bool,
@@ -1187,6 +1214,8 @@ impl Machine {
             peak_error_leaf_bytes: 0,
             await_payload_snapshot: AwaitPayloadCharge::default(),
             await_payload_escrow: AwaitPayloadCharge::default(),
+            await_string_payload_snapshot: AwaitStringPayloadCharge::default(),
+            await_string_payload_escrow: AwaitStringPayloadCharge::default(),
             selected_error_payloads: false,
             lease_capacity: 0,
             lease_bytes: 0,
@@ -1472,6 +1501,40 @@ impl Machine {
         sum_payload_charge(ticket, self.await_payload_escrow)
     }
 
+    fn drop_awaiting_with_escrow(&mut self) {
+        if let Some(frame) = self.awaiting.as_ref().filter(|frame| frame.owned_payload) {
+            self.await_payload_escrow = frame.ticket.retained_payload_charge();
+            self.await_string_payload_escrow = frame.ticket.retained_string_payload_charge();
+        }
+        // Ticket Drop may execute native target release. Keep both real fees
+        // until its payload's ordinary Drop/unwind has physically completed.
+        drop(self.awaiting.take());
+        self.await_payload_escrow = AwaitPayloadCharge::default();
+        self.await_string_payload_escrow = AwaitStringPayloadCharge::default();
+    }
+
+    fn live_await_string_payload_charge(&self) -> AwaitStringPayloadCharge {
+        let ticket = self
+            .awaiting
+            .as_ref()
+            .map_or_else(AwaitStringPayloadCharge::default, |frame| {
+                frame.ticket.retained_string_payload_charge()
+            });
+        AwaitStringPayloadCharge {
+            bytes: ticket
+                .bytes
+                .checked_add(self.await_string_payload_escrow.bytes)
+                .expect("admitted selected await String backing"),
+        }
+    }
+
+    fn live_cloned_string_payload_bytes(&self, span: Span) -> KuResult<usize> {
+        self.cloned_string_payload_bytes
+            .checked_sub(self.await_string_payload_snapshot.bytes)
+            .and_then(|bytes| bytes.checked_add(self.live_await_string_payload_charge().bytes))
+            .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))
+    }
+
     fn live_payload_storage(&self, span: Span) -> KuResult<(usize, usize)> {
         let live = self.live_await_payload_charge();
         // Stable totals contain the last observed ephemeral subtotal. Direct
@@ -1495,6 +1558,7 @@ impl Machine {
     fn await_payload_policy(&self, span: Span) -> KuResult<AwaitPayloadPolicy> {
         self.check_argument_capacity(0, span)?;
         let (payload_count, payload_bytes) = self.live_payload_storage(span)?;
+        let cloned_string_bytes = self.live_cloned_string_payload_bytes(span)?;
         let count = self
             .argument_capacity
             .checked_add(payload_count)
@@ -1515,7 +1579,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
-            .and_then(|bytes| bytes.checked_add(self.cloned_string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(cloned_string_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         Ok(AwaitPayloadPolicy {
             max_count: self
@@ -1528,12 +1592,47 @@ impl Machine {
                 .max_storage_bytes
                 .checked_sub(bytes)
                 .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?,
-            // Await admission still accepts only original input-derived
-            // Strings. S9 disallows await; its local clone buffers are charged
-            // separately above and cannot borrow credit from this input pool.
+            // The old terminal await policy retains its input reservation
+            // contract. The independent await-local policy ignores this credit
+            // and adds every actual success String capacity to max_bytes.
             input_string_capacity: self.string_payload_bytes,
             span,
         })
+    }
+
+    fn begin_owned_string_await(&mut self, span: SpanId, full_string_charge: bool) -> KuResult<()> {
+        let source_span = self.code.span(span);
+        self.reserve_work(1, source_span)?;
+        // Reserve the eventual operand slot before deriving the extra
+        // payload quota or transferring the sole Task owner.
+        self.reserve_values(1, source_span)?;
+        let policy = self.await_payload_policy(source_span)?;
+        let value = self.value();
+        let Value::Task(task) = value else {
+            return Err(KuError::runtime(
+                format!("await expects task but got {}", value.type_name()),
+                source_span,
+            ));
+        };
+        assert!(
+            self.awaiting.is_none(),
+            "one active await expression per machine"
+        );
+        self.selected_error_payloads = true;
+        self.awaiting = Some(AwaitFrame {
+            ticket: if full_string_charge {
+                crate::runtime::task::AwaitTicket::begin_with_string_payload_policy(
+                    task,
+                    AwaitStringPayloadPolicy::new(policy),
+                )
+            } else {
+                crate::runtime::task::AwaitTicket::begin_with_payload_policy(task, policy)
+            },
+            span,
+            owned_payload: true,
+        });
+        push(&mut self.work, Work::AwaitResume);
+        Ok(())
     }
 
     fn reserve_work(&mut self, additional: usize, span: Span) -> KuResult<()> {
@@ -1593,6 +1692,7 @@ impl Machine {
 
     fn reserve_values(&mut self, additional: usize, span: Span) -> KuResult<()> {
         let (payload_count, payload_bytes) = self.live_payload_storage(span)?;
+        let cloned_string_bytes = self.live_cloned_string_payload_bytes(span)?;
         let frames = self
             .value_limits
             .max_frames
@@ -1613,7 +1713,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_sub(self.exit_handle_bytes))
             .and_then(|bytes| bytes.checked_sub(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_sub(self.string_payload_bytes))
-            .and_then(|bytes| bytes.checked_sub(self.cloned_string_payload_bytes))
+            .and_then(|bytes| bytes.checked_sub(cloned_string_bytes))
             .and_then(|bytes| bytes.checked_sub(self.lease_bytes))
             .and_then(|bytes| bytes.checked_sub(self.lease_root_bytes))
             .ok_or_else(|| storage_error(ReserveError::StorageLimit, span))?;
@@ -1648,6 +1748,7 @@ impl Machine {
 
     fn check_argument_capacity(&self, additional: usize, span: Span) -> KuResult<()> {
         let (payload_count, payload_bytes) = self.live_payload_storage(span)?;
+        let cloned_string_bytes = self.live_cloned_string_payload_bytes(span)?;
         let capacity = self
             .argument_capacity
             .checked_add(additional)
@@ -1670,7 +1771,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
-            .and_then(|bytes| bytes.checked_add(self.cloned_string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(cloned_string_bytes))
             .and_then(|bytes| bytes.checked_add(payload_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
@@ -1694,6 +1795,7 @@ impl Machine {
         span: Span,
     ) -> KuResult<()> {
         let (payload_count, payload_bytes) = self.live_payload_storage(span)?;
+        let cloned_string_bytes = self.live_cloned_string_payload_bytes(span)?;
         let count = self
             .exit_handle_capacity
             .checked_add(handles)
@@ -1721,7 +1823,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.argument_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
-            .and_then(|bytes| bytes.checked_add(self.cloned_string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(cloned_string_bytes))
             .and_then(|bytes| bytes.checked_add(payload_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_bytes))
             .and_then(|bytes| bytes.checked_add(self.lease_root_bytes))
@@ -1817,6 +1919,7 @@ impl Machine {
         span: Span,
     ) -> KuResult<()> {
         let (payload_count, payload_bytes) = self.live_payload_storage(span)?;
+        let cloned_string_bytes = self.live_cloned_string_payload_bytes(span)?;
         let total_roots = self
             .lease_root_bytes
             .checked_add(root_bytes)
@@ -1843,7 +1946,7 @@ impl Machine {
             .and_then(|bytes| bytes.checked_add(self.retirement_bytes))
             .and_then(|bytes| bytes.checked_add(self.values.charged_storage_bytes()))
             .and_then(|bytes| bytes.checked_add(self.string_payload_bytes))
-            .and_then(|bytes| bytes.checked_add(self.cloned_string_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(cloned_string_bytes))
             .and_then(|bytes| bytes.checked_add(payload_bytes))
             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
         if bytes > self.value_limits.max_storage_bytes {
@@ -3261,6 +3364,15 @@ impl Machine {
                         push(&mut self.work, Work::AwaitOwnedStringOperand(expr.span));
                         push(&mut self.work, Work::Eval(operand));
                     }
+                    ExprCode::AwaitLocalOwnedString(operand) => {
+                        hooks.host().reject_cleanup_submission(span)?;
+                        self.reserve_work(2, span)?;
+                        push(
+                            &mut self.work,
+                            Work::AwaitLocalOwnedStringOperand(expr.span),
+                        );
+                        push(&mut self.work, Work::Eval(operand));
+                    }
                     ExprCode::Propagate(operand) => {
                         self.reserve_work(2, span)?;
                         push(&mut self.work, Work::Propagate(expr.span));
@@ -3664,32 +3776,10 @@ impl Machine {
                 push(&mut self.work, Work::AwaitResume);
             }
             Work::AwaitOwnedStringOperand(span) => {
-                let source_span = self.code.span(span);
-                self.reserve_work(1, source_span)?;
-                // Reserve the eventual operand slot before deriving the extra
-                // payload quota or transferring the sole Task owner.
-                self.reserve_values(1, source_span)?;
-                let policy = self.await_payload_policy(source_span)?;
-                let value = self.value();
-                let Value::Task(task) = value else {
-                    return Err(KuError::runtime(
-                        format!("await expects task but got {}", value.type_name()),
-                        source_span,
-                    ));
-                };
-                assert!(
-                    self.awaiting.is_none(),
-                    "one active await expression per machine"
-                );
-                self.selected_error_payloads = true;
-                self.awaiting = Some(AwaitFrame {
-                    ticket: crate::runtime::task::AwaitTicket::begin_with_payload_policy(
-                        task, policy,
-                    ),
-                    span,
-                    owned_payload: true,
-                });
-                push(&mut self.work, Work::AwaitResume);
+                self.begin_owned_string_await(span, false)?;
+            }
+            Work::AwaitLocalOwnedStringOperand(span) => {
+                self.begin_owned_string_await(span, true)?;
             }
             Work::AwaitResume => {
                 let awaiting = self.awaiting.as_mut().expect("retained await expression");
@@ -3707,12 +3797,29 @@ impl Machine {
                             // outcome remains operation-local through target
                             // retirement and emission, including native unwind.
                             self.await_payload_escrow = awaiting.ticket.retained_payload_charge();
+                            self.await_string_payload_escrow =
+                                awaiting.ticket.retained_string_payload_charge();
                         }
                         let AwaitFrame { ticket, span, .. } =
                             self.awaiting.take().expect("one await transfer");
-                        let result =
-                            ticket.finish_with(|result| hooks.host().observe_termination(result));
+                        let result = ticket.finish_with(|result| {
+                            #[cfg(test)]
+                            if owned_payload {
+                                hooks.observe_await_owned_handoff(
+                                    self,
+                                    result,
+                                    AwaitOwnedHandoffPhase::Observer,
+                                );
+                            }
+                            hooks.host().observe_termination(result);
+                        });
                         if owned_payload {
+                            #[cfg(test)]
+                            hooks.observe_await_owned_handoff(
+                                self,
+                                &result,
+                                AwaitOwnedHandoffPhase::Emit,
+                            );
                             let emitted = match result {
                                 Ok(value) => self.emit(value, self.code.span(span)),
                                 Err(error) => Err(error),
@@ -3720,6 +3827,7 @@ impl Machine {
                             // emit consumed the actual outcome into the stable
                             // operand slot or dropped it before returning Err.
                             self.await_payload_escrow = AwaitPayloadCharge::default();
+                            self.await_string_payload_escrow = AwaitStringPayloadCharge::default();
                             self.synchronize_result_wrapper_charge();
                             emitted?;
                         } else {
@@ -4225,6 +4333,8 @@ impl Machine {
             || self.error_leaf_bytes != 0
             || self.await_payload_snapshot != AwaitPayloadCharge::default()
             || self.await_payload_escrow != AwaitPayloadCharge::default()
+            || self.await_string_payload_snapshot != AwaitStringPayloadCharge::default()
+            || self.await_string_payload_escrow != AwaitStringPayloadCharge::default()
             || self.lease_capacity != 0
             || self.lease_bytes != 0
             || self.lease_root_bytes != 0
@@ -4478,6 +4588,7 @@ impl Machine {
             // finish_with/emission locals have physically unwound before this
             // catch boundary; their escrow no longer represents a live owner.
             self.await_payload_escrow = AwaitPayloadCharge::default();
+            self.await_string_payload_escrow = AwaitStringPayloadCharge::default();
         }
         self.finally.tighten(self.scope_release_context());
         window.finish(&mut self.finally);
@@ -4570,7 +4681,7 @@ impl Machine {
         );
         if self.pending.is_some() {
             if matches!(&step, Work::AwaitResume) {
-                drop(self.awaiting.take());
+                self.drop_awaiting_with_escrow();
             }
             if boundary {
                 self.finish_boundary(step, hooks, window);
@@ -4587,7 +4698,7 @@ impl Machine {
                     self.entry_span,
                 )));
                 if matches!(&step, Work::AwaitResume) {
-                    drop(self.awaiting.take());
+                    self.drop_awaiting_with_escrow();
                 }
                 if boundary {
                     self.finish_boundary(step, hooks, window);
@@ -4650,6 +4761,8 @@ impl Machine {
         self.error_leaf_bytes = 0;
         self.await_payload_snapshot = AwaitPayloadCharge::default();
         self.await_payload_escrow = AwaitPayloadCharge::default();
+        self.await_string_payload_snapshot = AwaitStringPayloadCharge::default();
+        self.await_string_payload_escrow = AwaitStringPayloadCharge::default();
         self.metrics.retained_error_leaf_capacity = 0;
         self.metrics.retained_error_leaf_bytes = 0;
         self.metrics.retained_result_wrapper_capacity = 0;
@@ -4711,7 +4824,9 @@ impl Machine {
         let Some(mut original) = self.original_string else {
             return;
         };
-        // The S9 graph has no captured Owned String/Result, borrow or await.
+        // The selected graph has no captured Owned String/Result or borrow.
+        // A submitted child removes the parent's origin permanently. A later
+        // await success pays full real capacity, including a returned original.
         // Env folds copy metadata only, under one binding lock at a time.
         let fold = |census, value: &Value| selected_string_owner(census, value, original);
         let mut census = StringOwnerCensus::default();
@@ -4778,11 +4893,16 @@ impl Machine {
         // Allocation inside arbitrary replacement hooks is not admitted.
         original.still_live &= census.original_seen;
         self.original_string = Some(original);
-        self.cloned_string_payload_bytes = census.cloned_bytes;
+        let ephemeral = self.live_await_string_payload_charge();
+        self.cloned_string_payload_bytes = census
+            .cloned_bytes
+            .checked_add(ephemeral.bytes)
+            .expect("admitted selected String and await backing");
+        self.await_string_payload_snapshot = ephemeral;
         self.peak_cloned_string_payload_bytes = self
             .peak_cloned_string_payload_bytes
-            .max(census.cloned_bytes);
-        self.metrics.retained_cloned_string_payload_bytes = census.cloned_bytes;
+            .max(self.cloned_string_payload_bytes);
+        self.metrics.retained_cloned_string_payload_bytes = self.cloned_string_payload_bytes;
         self.metrics.peak_cloned_string_payload_bytes = self.peak_cloned_string_payload_bytes;
     }
 
@@ -5779,8 +5899,13 @@ impl Drop for Machine {
             self.scope_release_context(),
         );
         let guard = release.map(CleanupGuard::enter);
-        let awaiting = self.awaiting.take();
-        let await_drop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(awaiting)));
+        let await_drop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.drop_awaiting_with_escrow();
+        }));
+        // The Ticket and every operation-local payload field have actually
+        // unwound before this catch returns, including native release panic.
+        self.await_payload_escrow = AwaitPayloadCharge::default();
+        self.await_string_payload_escrow = AwaitStringPayloadCharge::default();
         let mut first = await_drop.err();
         // A selected entry can stop while some original parameters remain
         // unbound. Retire that real iterator buffer before its partial callee.
@@ -5909,6 +6034,8 @@ impl Drop for Machine {
         self.error_leaf_bytes = 0;
         self.await_payload_snapshot = AwaitPayloadCharge::default();
         self.await_payload_escrow = AwaitPayloadCharge::default();
+        self.await_string_payload_snapshot = AwaitStringPayloadCharge::default();
+        self.await_string_payload_escrow = AwaitStringPayloadCharge::default();
         self.metrics.retained_error_leaf_capacity = 0;
         self.metrics.retained_error_leaf_bytes = 0;
         self.metrics.retained_result_wrapper_capacity = 0;

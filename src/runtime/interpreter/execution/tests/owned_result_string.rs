@@ -4024,8 +4024,21 @@ fn s9_census(
     machine: &Machine,
     input: Buffer,
     original_live: bool,
+    payload_text: &'static str,
+    task_errors: bool,
+    allow_await_ticket: bool,
     strings: &mut Vec<S9String>,
 ) -> S9Census {
+    if !allow_await_ticket {
+        assert!(machine.awaiting.is_none(), "the S9 slice cannot await");
+        assert_eq!(
+            machine.await_payload_snapshot,
+            AwaitPayloadCharge::default()
+        );
+        assert_eq!(machine.await_string_payload_snapshot.bytes, 0);
+        assert_eq!(machine.await_payload_escrow, AwaitPayloadCharge::default());
+        assert_eq!(machine.await_string_payload_escrow.bytes, 0);
+    }
     let staged = machine
         .work
         .as_slice()
@@ -4053,7 +4066,7 @@ fn s9_census(
     // reuse its backing without retaining any previous live-owner record.
     strings.reserve(capacity);
     let mut record = |value: &Value, in_env: bool| {
-        let owner = s9_owner(value, input.text);
+        let owner = s11_measured_owner(value, payload_text, task_errors);
         if let Some(owner) = owner {
             assert!(
                 owners.len() < owners.capacity(),
@@ -4074,7 +4087,7 @@ fn s9_census(
             _ => None,
         };
         if let Some(actual) = actual {
-            assert_eq!(actual, input.text);
+            assert!(actual == input.text || actual == payload_text);
             assert!(strings.len() < strings.capacity());
             strings.push(S9String {
                 pointer: actual.as_ptr() as usize,
@@ -4146,19 +4159,54 @@ fn s9_census(
             }
         }
     }
-    assert!(machine.awaiting.is_none(), "the S9 slice cannot await");
+    let physical_owners = owners.len();
+    let physical_strings = strings.len();
+    let ticket = machine.awaiting.as_ref().and_then(|frame| {
+        frame
+            .ticket
+            .test_outcome()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|value| s11_measured_owner(value, payload_text, task_errors))
+    });
+    let mut ticket_string_bytes = 0;
+    if let Some(frame) = &machine.awaiting {
+        // The S11 callers supply actual Ready metadata; the existing S9/S10
+        // fixtures never reach this branch. This does not revive input credit.
+        let measured = ticket.map_or_else(AwaitPayloadCharge::default, s11_box_error_charge);
+        assert_eq!(frame.ticket.retained_payload_charge(), measured);
+        ticket_string_bytes = ticket
+            .and_then(|owner| owner.string)
+            .map_or(0, |text| text.capacity);
+        assert_eq!(
+            frame.ticket.retained_string_payload_charge().bytes,
+            ticket_string_bytes,
+            "the independent local-await policy charges all real success capacity"
+        );
+        assert_eq!(machine.await_payload_escrow, AwaitPayloadCharge::default());
+        assert_eq!(
+            machine.await_string_payload_escrow.bytes, 0,
+            "operation-local escrow is tested inside the actual operation, not stable census"
+        );
+    }
+    if let Some(ticket) = ticket {
+        owners.push(ticket);
+        if let Some(text) = ticket.string {
+            strings.push(text);
+        }
+    }
     let mut boxes = std::collections::HashSet::with_capacity(owners.len());
     for owner in &owners {
         assert!(boxes.insert(owner.boxed), "one real owner per Result Box");
     }
-    let original_seen = strings.iter().any(|actual| {
+    let original_seen = strings.iter().take(physical_strings).any(|actual| {
         original_live
             && input.capacity != 0
             && actual.pointer == input.pointer
             && actual.capacity == input.capacity
     });
-    let clone_bytes = strings
+    let physical_clone_bytes: usize = strings
         .iter()
+        .take(physical_strings)
         .filter(|actual| {
             !(original_live
                 && input.capacity != 0
@@ -4167,37 +4215,47 @@ fn s9_census(
         })
         .map(|actual| actual.capacity)
         .sum();
+    let clone_bytes = physical_clone_bytes + ticket_string_bytes;
     let errors: usize = owners
         .iter()
+        .take(physical_owners)
         .filter_map(|owner| owner.error)
         .map(|error| error.count)
         .sum();
     let error_bytes: usize = owners
         .iter()
+        .take(physical_owners)
         .filter_map(|owner| owner.error)
         .map(|error| error.bytes)
         .sum();
-    assert_eq!(machine.result_wrapper_capacity, owners.len());
+    let stable_boxes = physical_owners + machine.await_payload_snapshot.box_count;
+    let stable_errors = errors + machine.await_payload_snapshot.error_leaf_count;
+    let stable_error_bytes = error_bytes + machine.await_payload_snapshot.error_leaf_bytes;
+    let stable_clones = physical_clone_bytes + machine.await_string_payload_snapshot.bytes;
+    assert_eq!(machine.result_wrapper_capacity, stable_boxes);
     assert_eq!(
         machine.result_wrapper_bytes,
-        owners.len() * std::mem::size_of::<Value>()
+        stable_boxes * std::mem::size_of::<Value>()
     );
-    assert_eq!(machine.error_leaf_capacity, errors);
-    assert_eq!(machine.error_leaf_bytes, error_bytes);
+    assert_eq!(machine.error_leaf_capacity, stable_errors);
+    assert_eq!(machine.error_leaf_bytes, stable_error_bytes);
     assert_eq!(
         machine.metrics.retained_result_wrapper_capacity,
-        owners.len()
+        stable_boxes
     );
     assert_eq!(
         machine.metrics.retained_result_wrapper_bytes,
         machine.result_wrapper_bytes
     );
-    assert_eq!(machine.metrics.retained_error_leaf_capacity, errors);
-    assert_eq!(machine.metrics.retained_error_leaf_bytes, error_bytes);
-    assert_eq!(machine.cloned_string_payload_bytes, clone_bytes);
+    assert_eq!(machine.metrics.retained_error_leaf_capacity, stable_errors);
+    assert_eq!(
+        machine.metrics.retained_error_leaf_bytes,
+        stable_error_bytes
+    );
+    assert_eq!(machine.cloned_string_payload_bytes, stable_clones);
     assert_eq!(
         machine.metrics.retained_cloned_string_payload_bytes,
-        clone_bytes
+        stable_clones
     );
     assert_eq!(
         machine.string_payload_bytes, input.capacity,
@@ -4226,6 +4284,9 @@ fn s9_census(
 
 struct S9Proof {
     original_live: bool,
+    payload_text: &'static str,
+    task_errors: bool,
+    allow_await_ticket: bool,
     live: Vec<S9Owner>,
     string_scratch: Vec<S9String>,
     final_clone: Option<S9Owner>,
@@ -4237,6 +4298,9 @@ impl S9Proof {
     fn new(input: Buffer) -> Self {
         Self {
             original_live: input.capacity != 0,
+            payload_text: input.text,
+            task_errors: false,
+            allow_await_ticket: false,
             live: Vec::new(),
             string_scratch: Vec::new(),
             final_clone: None,
@@ -4251,6 +4315,9 @@ fn s9_observe(machine: &Machine, input: Buffer, proof: &mut S9Proof) -> S9Census
         machine,
         input,
         proof.original_live,
+        proof.payload_text,
+        proof.task_errors,
+        proof.allow_await_ticket,
         &mut proof.string_scratch,
     );
     proof.original_live &= actual.original_seen;
@@ -4873,13 +4940,8 @@ fn selected_string_locals_leave_charged_async_and_other_whole_tree_boundaries_un
         if entry.is_async {
             let claimed = CodeHandle::compile_claimed_async_owned_result_string_entry(
                 &source_functions, entry, Limits::default());
-            if source == "async fn Entry(text: str): str! { r: str! = ok(text)\nreturn r }" {
-                assert!(claimed.unwrap().has_actual_string_result_locals(),
-                    "S10 admits only this no-await async local root");
-            } else {
-                assert!(matches!(claimed, Err(AdmissionError::Unsupported(_))),
-                    "await remains outside the S10 String local role: {source}");
-            }
+            assert!(claimed.unwrap().has_actual_string_result_locals(),
+                "S10 no-await and S11 separately charged await locals are deliberate positives");
         }
         let mut host = production_interpreter(source);
         let (value, buffer) = string_input(PAYLOAD, 4096);
@@ -4899,6 +4961,7 @@ struct S9StringFaultProbe<'a> {
     inner: FinallyProbe<'a>,
     tighten_at: Option<(Span, RuntimeTermination)>,
     observed_cleanup: Option<RuntimeTermination>,
+    handoff: Option<S11HandoffState>,
 }
 
 impl<'a> S9StringFaultProbe<'a> {
@@ -4911,11 +4974,102 @@ impl<'a> S9StringFaultProbe<'a> {
             inner: FinallyProbe::new(host, triggers),
             tighten_at,
             observed_cleanup: None,
+            handoff: None,
         }
     }
 }
 
 impl ExecutionHooks for S9StringFaultProbe<'_> {
+    fn observe_await_owned_handoff(
+        &mut self,
+        machine: &mut Machine,
+        result: &KuResult<Value>,
+        phase: AwaitOwnedHandoffPhase,
+    ) {
+        let Some(state) = self.handoff.as_mut() else {
+            return;
+        };
+        let owner = result
+            .as_ref()
+            .ok()
+            .and_then(s11_copy_owner)
+            .expect("actual operation-local selected child result");
+        let shape = s11_box_error_charge(owner);
+        let string_bytes = owner.string.map_or(0, |string| string.capacity);
+        assert!(
+            machine.awaiting.is_none(),
+            "actual ticket ownership has transferred into finish/emission locals"
+        );
+        assert_eq!(machine.await_payload_escrow, shape);
+        assert_eq!(machine.await_string_payload_escrow.bytes, string_bytes);
+        let mut census = s9_observe(machine, state.input, &mut state.proof);
+        assert!(
+            !census
+                .owners
+                .iter()
+                .any(|physical| physical.boxed == owner.boxed),
+            "operation-local owner occurs in no stable Env/operand/staged/pending/exit/Q location"
+        );
+        assert!(
+            !state.proof.original_live,
+            "child-returned backing receives no revived origin credit"
+        );
+        census.owners.push(owner); // Copy metadata, never another Value owner.
+        census.clone_bytes += string_bytes;
+        let (count, bytes) = s10_budget_totals(machine, &census, state.input);
+        s11_check_await_quota(machine, count, bytes);
+        let observer = matches!(phase, AwaitOwnedHandoffPhase::Observer);
+        state.receipts.push(S11HandoffReceipt {
+            observer,
+            owner,
+            shape,
+            string_bytes,
+            count,
+            bytes,
+        });
+        if observer && state.fault == S11HandoffFault::NativeObserver {
+            let first = RuntimeTermination::new(TerminationReason::TimedOut);
+            let shorter = RuntimeTermination {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: first.cleanup_deadline - Duration::from_millis(1),
+            };
+            // Existing Interpreter/Task arbitration latches the actual first
+            // cause, and the real cleanup window retains its shortened D.
+            let first_error: KuResult<Value> = Err(KuError::termination(first, Span::default()));
+            self.inner.host.observe_termination(&first_error);
+            let later_error: KuResult<Value> = Err(KuError::termination(shorter, Span::default()));
+            self.inner.host.observe_termination(&later_error);
+            let _cleanup = CleanupGuard::enter(first);
+            drop(CleanupGuard::enter(shorter));
+            let actual = current_cleanup_context().unwrap();
+            assert_eq!(actual.reason, first.reason);
+            assert_eq!(actual.cleanup_deadline, shorter.cleanup_deadline);
+            state.native_context = Some(actual);
+            panic!("S11 actual observer native panic while both escrow fees remain live");
+        }
+        if !observer
+            && matches!(
+                state.fault,
+                S11HandoffFault::EmitCount | S11HandoffFault::EmitBytes
+            )
+        {
+            state.saved_limits = Some(machine.value_limits);
+            if state.fault == S11HandoffFault::EmitCount {
+                let spare = machine.values.capacity() - machine.values.len();
+                assert!(spare >= 1, "begin await reserved the actual emit slot");
+                // FrameStack's frame limit checks required logical elements;
+                // the full retained-capacity one-short checks above remain.
+                // Leave exactly the current logical length, so the following
+                // actual emit rejects its single additional element.
+                machine.value_limits.max_frames = count - spare;
+            } else {
+                machine.value_limits.max_storage_bytes = bytes - 1;
+            }
+            // The following production emit consumes/drops the same actual
+            // outcome and reports the original count/storage rejection.
+        }
+    }
+
     fn supports_selected_string_origin_moves(&self) -> bool {
         true
     }
@@ -5607,6 +5761,8 @@ enum S10Pause {
     Running,
     Produced,
     Protected(Span),
+    AwaitWaiting,
+    AwaitReady,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5615,6 +5771,7 @@ enum S10Fault {
     CloneCount,
     CloneBytes,
     NativeClone,
+    NativeReady,
 }
 
 #[derive(Clone, Copy)]
@@ -5623,6 +5780,9 @@ struct S10Plan {
     deep: bool,
     from_code: bool,
     selection_only: bool,
+    await_locals: bool,
+    payload_text: Option<&'static str>,
+    task_errors: bool,
     pause: S10Pause,
     fault: S10Fault,
 }
@@ -5634,6 +5794,9 @@ impl S10Plan {
             deep: false,
             from_code: false,
             selection_only: false,
+            await_locals: false,
+            payload_text: None,
+            task_errors: false,
             pause: S10Pause::None,
             fault: S10Fault::None,
         }
@@ -5693,6 +5856,10 @@ enum S10Witness {
     },
     Native(Box<S10Native>),
     Finished(Box<S10Finished>),
+    AwaitWaiting,
+    AwaitChild(Box<S11ChildWitness>),
+    AwaitReady(Box<S11Ready>),
+    AwaitBound(S9Owner),
 }
 
 struct S10Runner {
@@ -5711,6 +5878,7 @@ struct S10Runner {
     faulted: bool,
     paused: bool,
     rejected_source: bool,
+    await_probe: S11Probe,
 }
 
 fn s10_budget_totals(machine: &mut Machine, actual: &S9Census, input: Buffer) -> (usize, usize) {
@@ -5782,7 +5950,103 @@ impl crate::runtime::task::LocalTaskRunner for S10Runner {
             .as_mut()
             .expect("real selected S10 claimant");
         assert!(self.inner.legacy.is_none());
-        assert!(machine.awaiting.is_none());
+        if !self.plan.await_locals {
+            assert!(
+                machine.awaiting.is_none(),
+                "all original S10 fixtures remain no-await"
+            );
+        } else {
+            if !self.await_probe.child_seen {
+                // Observe the actual initial Task ownership transfer, rather
+                // than comparing a task or payload that coarse chunks retired.
+                chunk = 1;
+            }
+            if !self.await_probe.child_seen
+                && machine.pending.is_none()
+                && matches!(
+                    machine.work.as_slice().last(),
+                    Some(Work::AwaitLocalOwnedStringOperand(_))
+                )
+            {
+                if let Some(Value::Task(child)) = machine.values.as_slice().last() {
+                    self.await_probe.child_seen = true;
+                    self.tx
+                        .send(S10Witness::AwaitChild(Box::new(S11ChildWitness(
+                            child.retirement_witness(),
+                        ))))
+                        .unwrap();
+                }
+            }
+        }
+        if self.plan.await_locals {
+            if let Some(frame) = machine.awaiting.as_ref() {
+                if machine.state == MachineState::Waiting
+                    && frame.ticket.test_outcome().is_none()
+                    && self.await_probe.yielded_span != Some(frame.span)
+                {
+                    // The existing LocalDriver polls the real ticket next. The
+                    // fixture adds no Work tick and does not inject an outcome.
+                    self.await_probe.yielded_span = Some(frame.span);
+                    return ControlFlow::Continue(());
+                }
+                if let Some(Ok(value)) = frame.ticket.test_outcome() {
+                    let owner =
+                        s11_measured_owner(value, self.proof.payload_text, self.proof.task_errors)
+                            .unwrap();
+                    let before = s9_observe(machine, self.input, &mut self.proof);
+                    assert!(before.owners.contains(&owner));
+                    let (count, bytes) = s10_budget_totals(machine, &before, self.input);
+                    s11_check_await_quota(machine, count, bytes);
+                    self.checked_budgets += 1;
+                    if !self.await_probe.ready_seen {
+                        self.await_probe.ready_seen = true;
+                        if self.plan.chunk == 1 {
+                            self.await_probe.first_bind = Some(owner);
+                        }
+                        self.tx
+                            .send(S10Witness::AwaitReady(Box::new(S11Ready {
+                                owner,
+                                input_capacity: self.input.capacity,
+                                current_clone_bytes: before.clone_bytes,
+                                cached_string_bytes: machine.await_string_payload_snapshot.bytes,
+                                stable_clone_bytes: machine.cloned_string_payload_bytes,
+                                count,
+                                bytes,
+                                origin_live: self.proof.original_live,
+                            })))
+                            .unwrap();
+                    }
+                    if self.plan.pause == S10Pause::AwaitReady && !self.paused {
+                        self.paused = true;
+                        self.tx
+                            .send(S10Witness::Paused {
+                                stage: S10Pause::AwaitReady,
+                                owner: Some(Box::new(owner)),
+                            })
+                            .unwrap();
+                        self.release
+                            .take()
+                            .expect("one await pause")
+                            .recv_timeout(S10_WAIT)
+                            .unwrap();
+                    }
+                    if self.plan.fault == S10Fault::NativeReady && !self.faulted {
+                        self.faulted = true;
+                        let first = RuntimeTermination::new(TerminationReason::TimedOut);
+                        let _cleanup = CleanupGuard::enter(first);
+                        self.tx
+                            .send(S10Witness::Paused {
+                                stage: S10Pause::AwaitReady,
+                                owner: Some(Box::new(owner)),
+                            })
+                            .unwrap();
+                        // The real runner / Machine / ticket unwind on this worker;
+                        // no payload copy or fake outgoing witness survives it.
+                        panic!("S11 actual Ready await local native abandonment");
+                    }
+                }
+            }
+        }
         let depth = machine.calls.len();
         // Deep terminal relays cannot contain a String Result local above the
         // root. Their previous completed chunk already had a full census, and
@@ -5845,7 +6109,14 @@ impl crate::runtime::task::LocalTaskRunner for S10Runner {
                     .with_value(
                         machine.code.symbol(*name),
                         machine.code.span(*span),
-                        |value| Ok(s9_owner(value, self.input.text).unwrap()),
+                        |value| {
+                            Ok(s11_measured_owner(
+                                value,
+                                self.proof.payload_text,
+                                self.proof.task_errors,
+                            )
+                            .unwrap())
+                        },
                     )
                     .unwrap(),
             );
@@ -5900,6 +6171,42 @@ impl crate::runtime::task::LocalTaskRunner for S10Runner {
         }
         if matches!(result, ControlFlow::Continue(())) {
             let actual = s9_observe(machine, self.input, &mut self.proof);
+            if self.plan.await_locals {
+                if machine.state == MachineState::Waiting
+                    && machine
+                        .awaiting
+                        .as_ref()
+                        .is_some_and(|frame| frame.ticket.test_outcome().is_none())
+                    && !self.await_probe.waiting_seen
+                {
+                    self.await_probe.waiting_seen = true;
+                    self.tx.send(S10Witness::AwaitWaiting).unwrap();
+                    if self.plan.pause == S10Pause::AwaitWaiting && !self.paused {
+                        self.paused = true;
+                        self.tx
+                            .send(S10Witness::Paused {
+                                stage: S10Pause::AwaitWaiting,
+                                owner: None,
+                            })
+                            .unwrap();
+                        self.release
+                            .take()
+                            .expect("one true Waiting pause")
+                            .recv_timeout(S10_WAIT)
+                            .unwrap();
+                    }
+                }
+                if let Some(ticket) = self.await_probe.first_bind {
+                    if actual.env.contains(&ticket) {
+                        assert_eq!(
+                            self.plan.chunk, 1,
+                            "identity is compared only at the first real Bind, before reads/drop"
+                        );
+                        self.await_probe.first_bind = None;
+                        self.tx.send(S10Witness::AwaitBound(ticket)).unwrap();
+                    }
+                }
+            }
             if let Some(source) = clone_source {
                 let before = before.as_ref().expect("fresh clone source census");
                 assert!(
@@ -5929,9 +6236,12 @@ impl crate::runtime::task::LocalTaskRunner for S10Runner {
                     );
                     self.rejected_source = true;
                 } else {
-                    let cloned =
-                        s9_owner(machine.values.as_slice().last().unwrap(), self.input.text)
-                            .unwrap();
+                    let cloned = s11_measured_owner(
+                        machine.values.as_slice().last().unwrap(),
+                        self.proof.payload_text,
+                        self.proof.task_errors,
+                    )
+                    .unwrap();
                     assert!(actual.owners.contains(&cloned));
                     s9_assert_distinct(source, cloned);
                     self.proof.final_clone = Some(cloned);
@@ -5988,10 +6298,9 @@ impl crate::runtime::task::LocalTaskRunner for S10Runner {
                 self.pause(S10Pause::Running, None);
             }
         } else if let ControlFlow::Break(outcome) = &result {
-            let outgoing = outcome
-                .as_ref()
-                .ok()
-                .and_then(|value| s9_owner(value, self.input.text));
+            let outgoing = outcome.as_ref().ok().and_then(|value| {
+                s11_measured_owner(value, self.proof.payload_text, self.proof.task_errors)
+            });
             if let Some(actual) = outgoing {
                 if chunk == 1 {
                     assert!(
@@ -6138,11 +6447,17 @@ fn s10_spawn(
                 })
                 .unwrap();
                 let input = buffers[0];
+                let mut proof = S9Proof::new(input);
+                proof.task_errors = plan.task_errors;
+                proof.allow_await_ticket = plan.await_locals;
+                if let Some(text) = plan.payload_text {
+                    proof.payload_text = text;
+                }
                 S10Runner {
                     inner,
                     plan,
                     input,
-                    proof: S9Proof::new(input),
+                    proof,
                     tx,
                     release: Some(release_rx),
                     thread: std::thread::current().id(),
@@ -6154,6 +6469,7 @@ fn s10_spawn(
                     faulted: false,
                     paused: false,
                     rejected_source: false,
+                    await_probe: S11Probe::default(),
                 }
             }
         })
@@ -6702,13 +7018,20 @@ fn claimed_async_string_local_whole_graph_noawait_boundaries_preserve_original_f
         let source_functions = functions(source);
         let entry = &source_functions["Entry"];
         assert!(!code::eligible_owned_named(&source_functions, entry, Limits::default()));
-        assert!(matches!(CodeHandle::compile_claimed_async_owned_result_string_entry(&source_functions, entry, Limits::default()), Err(AdmissionError::Unsupported(_))), "{source}");
+        let new_await_local = source == "async fn Child(text: str): str! { return ok(text) }\nasync fn Entry(text: str): str! { r: str! = await Child(text)\nreturn r }";
+        let admission = CodeHandle::compile_claimed_async_owned_result_string_entry(&source_functions, entry, Limits::default());
+        if new_await_local {
+            assert!(admission.unwrap().has_actual_string_result_locals(),
+                "S11 admits this precise awaited typed local");
+        } else {
+            assert!(matches!(admission, Err(AdmissionError::Unsupported(_))), "{source}");
+        }
         let runtime = TaskRuntime::with_limits(1, 8, 0, 0, 8);
         let (text, buffer) = string_input(PAYLOAD, 4096);
         let mut plan = S10Plan::normal(1);
         plan.selection_only = true;
         let (task, rx, _) = s10_spawn(&runtime, source, vec![text], vec![buffer], plan);
-        s10_entered(&task, &rx, false);
+        s10_entered(&task, &rx, new_await_local);
         assert_eq!(s10_wait_result(&task).unwrap(), Value::Null);
         s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
         s10_close(&runtime);
@@ -6739,5 +7062,1561 @@ fn claimed_async_string_local_whole_graph_noawait_boundaries_preserve_original_f
     s10_entered(&task, &rx, false);
     assert_eq!(s10_wait_result(&task).unwrap(), Value::Null);
     s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
+    s10_close(&runtime);
+}
+
+// S11 adds only real ticket observation to the existing physical-owner oracle.
+// Production dispatch and all task lifecycle operations remain the old runner's.
+#[derive(Default)]
+struct S11Probe {
+    yielded_span: Option<SpanId>,
+    ready_seen: bool,
+    waiting_seen: bool,
+    first_bind: Option<S9Owner>,
+    child_seen: bool,
+}
+
+#[derive(Debug)]
+struct S11Ready {
+    owner: S9Owner,
+    input_capacity: usize,
+    current_clone_bytes: usize,
+    cached_string_bytes: usize,
+    stable_clone_bytes: usize,
+    count: usize,
+    bytes: usize,
+    origin_live: bool,
+}
+
+fn s11_box_error_charge(owner: S9Owner) -> AwaitPayloadCharge {
+    let error = owner.error;
+    let box_bytes = std::mem::size_of::<Value>();
+    AwaitPayloadCharge {
+        count: 1 + error.map_or(0, |error| error.count),
+        bytes: box_bytes + error.map_or(0, |error| error.bytes),
+        box_count: 1,
+        box_bytes,
+        error_leaf_count: error.map_or(0, |error| error.count),
+        error_leaf_bytes: error.map_or(0, |error| error.bytes),
+    }
+}
+
+fn s11_plan(chunk: usize, from_code: bool) -> S10Plan {
+    let mut plan = S10Plan::normal(chunk);
+    plan.await_locals = true;
+    plan.from_code = from_code;
+    plan
+}
+
+fn s11_receipt(
+    runtime: &TaskRuntime,
+    source: &str,
+    args: Vec<Value>,
+    input: Buffer,
+    plan: S10Plan,
+) -> (S10Finished, KuResult<Value>, Vec<S11Ready>, usize) {
+    let (task, rx, _) = s10_spawn(runtime, source, args, vec![input], plan);
+    let worker = s10_entered(&task, &rx, true);
+    let mut ready = Vec::new();
+    let mut bound = 0;
+    let mut children = Vec::new();
+    let mut steps = 0;
+    let proof = loop {
+        steps += 1;
+        assert!(
+            steps <= 100_000,
+            "finite actual stable-dispatch receipt stream"
+        );
+        match rx.recv_timeout(S10_WAIT).unwrap() {
+            S10Witness::Finished(proof) => break *proof,
+            S10Witness::Progress { dispatches, depth } => {
+                assert!(dispatches > 0 && depth <= MAX_CALL_DEPTH);
+            }
+            S10Witness::AwaitWaiting => {}
+            S10Witness::AwaitChild(witness) => children.push(witness.0),
+            S10Witness::AwaitReady(receipt) => ready.push(*receipt),
+            S10Witness::AwaitBound(owner) => {
+                assert!(ready.iter().any(|receipt| receipt.owner == owner));
+                bound += 1;
+            }
+            other => panic!("unexpected normal actual await claimant event: {other:?}"),
+        }
+    };
+    assert_eq!(proof.thread, worker);
+    assert_eq!(proof.task, task.id());
+    assert_eq!(proof.calls, proof.retired);
+    assert_eq!(proof.finally, proof.retired_finally);
+    let result = s10_wait_result(&task);
+    let payload_text = plan.payload_text.unwrap_or(input.text);
+    assert_eq!(
+        result.as_ref().ok().and_then(|value| s11_measured_owner(
+            value,
+            payload_text,
+            plan.task_errors
+        )),
+        proof.outgoing,
+        "ordinary consuming result returns the actual final Box and backing"
+    );
+    if plan.chunk == 1 {
+        assert_eq!(
+            bound,
+            ready.len(),
+            "each actual ticket reaches the first real parent Env binding"
+        );
+    } else {
+        assert_eq!(
+            bound, 0,
+            "coarse chunks compare no possibly retired historical addresses"
+        );
+    }
+    assert_eq!(
+        children.len(),
+        1,
+        "the fixture observes the actual child Task operand once"
+    );
+    let context = RuntimeTermination::new(TerminationReason::Cancelled);
+    s10_retire(task, context);
+    s11_retire_children(children, context);
+    (proof, result, ready, bound)
+}
+
+#[test]
+fn claimed_async_await_string_local_real_new_from_code_ready_and_clone_census_across_chunks() {
+    for chunk in [1, 7, 256] {
+        for from_code in [false, true] {
+            for error in [false, true] {
+                let source = format!(
+                    "async fn Child(text: str): str! {{ r: str! = {}(text)\nreturn r.clone() }}\n\
+                     async fn Entry(text: str): str! {{ r: str! = await Child(text)\nr\nr = r.clone()\nreturn r.clone() }}",
+                    if error { "err" } else { "ok" });
+                let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+                let mut same_worker = None;
+                for _ in 0..2 {
+                    let (text, input) = string_input(PAYLOAD, 4096);
+                    let (proof, value, ready, bound) = s11_completed(
+                        &runtime,
+                        &source,
+                        vec![text],
+                        input,
+                        s11_plan(chunk, from_code),
+                    );
+                    if let Some(worker) = same_worker {
+                        assert_eq!(worker, proof.thread);
+                    }
+                    same_worker = Some(proof.thread);
+                    assert_eq!(ready.len(), 1);
+                    assert_eq!(ready[0].input_capacity, input.capacity);
+                    assert!(
+                        !ready[0].origin_live,
+                        "the parent input credit was permanently tombstoned on child transfer"
+                    );
+                    assert_eq!(
+                        ready[0].cached_string_bytes, 0,
+                        "driver Ready occurred before Machine snapshot refresh"
+                    );
+                    assert_eq!(ready[0].stable_clone_bytes, 0);
+                    assert_eq!(
+                        ready[0].current_clone_bytes,
+                        ready[0].owner.string.map_or(0, |text| text.capacity)
+                    );
+                    assert!(ready[0].count >= s11_box_error_charge(ready[0].owner).count);
+                    assert!(
+                        ready[0].bytes
+                            >= input.capacity
+                                + s11_box_error_charge(ready[0].owner).bytes
+                                + ready[0].current_clone_bytes
+                    );
+                    assert_eq!(matches!(value, Value::Result { ok: false, .. }), error);
+                    assert_eq!(ready[0].owner.error.is_some(), error);
+                    if !error {
+                        let child = ready[0].owner.string.unwrap();
+                        assert_eq!(child.len, PAYLOAD.len());
+                        assert!(child.capacity < input.capacity,
+                            "the actual child Result clone has smaller capacity than the parent pool");
+                    }
+                    if chunk == 1 {
+                        assert_eq!(bound, 1);
+                        assert!(proof.distinct_clones >= 3);
+                        assert!(proof.checked_budgets >= 4);
+                        assert_eq!(proof.peak_boxes, proof.observed_peak_boxes);
+                        assert_eq!(proof.peak_clones, proof.observed_peak_clones);
+                    }
+                    assert!(proof.original_retired);
+                }
+                s10_close(&runtime);
+            }
+        }
+    }
+}
+
+#[test]
+fn claimed_async_await_string_local_original_buffer_and_empty_capacity_are_fully_charged() {
+    const SOURCE: &str = "async fn Child(text: str): str! { return ok(text) }\n\
+        async fn Entry(text: str): str! { r: str! = await Child(text)\nreturn r.clone() }";
+    let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+    for (text, capacity) in [("", 0), ("", 4096), (PAYLOAD, 4096)] {
+        let (value, input) = string_input(text, capacity);
+        let (proof, _, ready, bound) =
+            s11_completed(&runtime, SOURCE, vec![value], input, s11_plan(1, false));
+        assert_eq!(ready.len(), 1);
+        assert_eq!(bound, 1);
+        let actual = ready[0].owner.string.unwrap();
+        assert_eq!(
+            (actual.pointer, actual.capacity),
+            (input.pointer, input.capacity)
+        );
+        assert_eq!(
+            ready[0].current_clone_bytes, input.capacity,
+            "an original buffer returned from the child receives the full additional await fee"
+        );
+        assert!(
+            !ready[0].origin_live,
+            "input pointer equality after transfer never revives origin authority"
+        );
+        assert!(proof.original_retired);
+    }
+    s10_close(&runtime);
+}
+
+#[test]
+fn claimed_async_await_string_local_whole_graph_literal_boundary_preserves_original_factory_inputs()
+{
+    // This checker-legal literal remains whole Unsupported. Construction must
+    // retain the actual original inputs and execute no body or legacy step.
+    const SOURCE: &str = "async fn Child(text: str): str! { return ok(text) }\n\
+        async fn Entry(text: str): str! { r: str! = await Child(\"中é\0kept\")\nreturn r.clone() }";
+    let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+    let source = functions(SOURCE);
+    let before = source.clone();
+    assert!(matches!(
+        CodeHandle::compile_claimed_async_owned_result_string_entry(
+            &source,
+            &source["Entry"],
+            Limits::default(),
+        ),
+        Err(AdmissionError::Unsupported(_))
+    ));
+    assert_eq!(source, before);
+    let (value, input) = string_input("", 0);
+    let mut plan = s11_plan(1, false);
+    plan.selection_only = true;
+    let (task, rx, _) = s10_spawn(&runtime, SOURCE, vec![value], vec![input], plan);
+    s10_entered(&task, &rx, false);
+    assert!(matches!(s10_wait_result(&task), Ok(Value::Null)));
+    s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
+    s10_close(&runtime);
+}
+
+fn s11_copy_owner(candidate: &Value) -> Option<S9Owner> {
+    // Immutable primitive metadata only; safe to call under the actual result
+    // mutex. No assertion, clone, allocation, callback or owner drop occurs.
+    let Value::Result { ok, value } = candidate else {
+        return None;
+    };
+    let boxed = value.as_ref() as *const Value as usize;
+    if *ok {
+        let Value::String(text) = value.as_ref() else {
+            return None;
+        };
+        Some(S9Owner {
+            boxed,
+            string: Some(S9String {
+                pointer: text.as_ptr() as usize,
+                len: text.len(),
+                capacity: text.capacity(),
+            }),
+            error: None,
+        })
+    } else {
+        Some(S9Owner {
+            boxed,
+            string: None,
+            error: Some(error_payload(candidate)?),
+        })
+    }
+}
+
+fn s11_slot_owner(task: &crate::runtime::task::TaskHandle) -> Option<S9Owner> {
+    task.test_with_result_slot(|slot| {
+        slot.and_then(|result| result.as_ref().ok())
+            .and_then(s11_copy_owner)
+    })
+    .unwrap()
+}
+
+fn s11_rejected_ordinary_slot_keeps_claim_and_payload(
+    task: &crate::runtime::task::TaskHandle,
+    original: S9Owner,
+) {
+    assert_eq!(
+        s11_slot_owner(task),
+        Some(original),
+        "policy rejection and ticket release preserve the original real slot"
+    );
+    let repeated = s10_wait_result(task).unwrap();
+    let repeated_owner = s11_copy_owner(&repeated).unwrap();
+    assert_ne!(
+        repeated_owner.boxed, original.boxed,
+        "both actual owners are live; the second await returns a separate diagnostic"
+    );
+    let Value::Result { ok: false, value } = &repeated else {
+        panic!("ordinary await claim remains consumed after payload admission rejection");
+    };
+    let Value::Object(fields) = value.as_ref() else {
+        panic!("actual second ordinary await has the existing task ErrorObject");
+    };
+    assert!(matches!(fields.get("domain"), Some(Value::String(value)) if value == "task"));
+    assert!(matches!(fields.get("code"), Some(Value::String(value)) if value == "already_awaited"));
+    assert!(matches!(fields.get("message"), Some(Value::String(value))
+        if value == &format!("task {} has already been awaited", task.id())));
+    assert_eq!(
+        s11_slot_owner(task),
+        Some(original),
+        "the second ordinary await never consumes or clones the retained payload"
+    );
+}
+
+fn s11_wait_published(task: &crate::runtime::task::TaskHandle) {
+    let deadline = Instant::now() + S10_WAIT;
+    while !task.test_with_result_slot(|slot| slot.is_some()).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "absolute bounded real slot publication"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn claimed_async_await_string_local_compound_quotas_admit_once_or_leave_real_child_slot_intact() {
+    use crate::runtime::task::{AwaitStringPayloadPolicy, AwaitTicket};
+    for error in [false, true] {
+        let source = format!(
+            "async fn Entry(text: str): str! {{ r: str! = {}(text)\nreturn r.clone() }}",
+            if error { "err" } else { "ok" }
+        );
+        let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+        let mut worker = None;
+        for (reason, zero_input_capacity) in [Some("FrameLimit"), Some("StorageLimit"), None]
+            .into_iter()
+            .flat_map(|reason| [false, true].map(|zero| (reason, zero)))
+        {
+            let (value, input) = string_input(PAYLOAD, 4096);
+            let (child, rx, _) = s10_spawn(
+                &runtime,
+                &source,
+                vec![value],
+                vec![input],
+                S10Plan::normal(1),
+            );
+            let current = s10_entered(&child, &rx, true);
+            if let Some(old) = worker {
+                assert_eq!(old, current);
+            }
+            worker = Some(current);
+            let proof = s10_finished(&rx);
+            assert!(
+                proof.distinct_clones >= 1,
+                "candidate was observed simultaneously with the real child source"
+            );
+            s11_wait_published(&child);
+            let original = s11_slot_owner(&child).unwrap();
+            assert_eq!(Some(original), proof.outgoing);
+            let shape = s11_box_error_charge(original);
+            let string_bytes = original.string.map_or(0, |string| string.capacity);
+            let full_bytes = shape.bytes + string_bytes;
+            let policy_input_capacity = if zero_input_capacity {
+                0
+            } else {
+                input.capacity
+            };
+            if !error && zero_input_capacity {
+                assert!(string_bytes > policy_input_capacity);
+            }
+            if error {
+                assert_eq!(string_bytes, 0);
+            }
+            let mut ticket = AwaitTicket::begin_with_string_payload_policy(
+                child.clone(),
+                AwaitStringPayloadPolicy::new(AwaitPayloadPolicy {
+                    max_count: shape.count - usize::from(reason == Some("FrameLimit")),
+                    max_bytes: full_bytes - usize::from(reason == Some("StorageLimit")),
+                    // Both larger original reservation and zero reservation variants
+                    // must charge the actual independently produced child payload.
+                    input_string_capacity: policy_input_capacity,
+                    span: Span::default(),
+                }),
+            );
+            s11_poll_ready(&mut ticket);
+            if let Some(reason) = reason {
+                assert_eq!(
+                    s11_slot_owner(&child),
+                    Some(original),
+                    "preTake rejection retains the exact original real slot payload"
+                );
+                assert_eq!(
+                    ticket.retained_payload_charge(),
+                    AwaitPayloadCharge::default()
+                );
+                assert_eq!(ticket.retained_string_payload_charge().bytes, 0);
+                assert!(ticket
+                    .finish_with(|_| {})
+                    .unwrap_err()
+                    .message
+                    .contains(reason));
+                s11_rejected_ordinary_slot_keeps_claim_and_payload(&child, original);
+            } else {
+                assert!(
+                    s11_slot_owner(&child).is_none(),
+                    "successful Ordinary observation takes the sole real payload exactly once"
+                );
+                assert_eq!(
+                    s11_copy_owner(ticket.test_outcome().unwrap().as_ref().unwrap()),
+                    Some(original)
+                );
+                assert_eq!(
+                    ticket.retained_payload_charge(),
+                    shape,
+                    "old Box/error charge excludes separate String bytes"
+                );
+                assert_eq!(ticket.retained_string_payload_charge().bytes, string_bytes);
+                let mut observed = None;
+                let returned = ticket
+                    .finish_with(|outcome| {
+                        observed = outcome.as_ref().ok().and_then(s11_copy_owner);
+                    })
+                    .unwrap();
+                assert_eq!(observed, Some(original));
+                assert_eq!(
+                    s9_owner(&returned, PAYLOAD),
+                    Some(original),
+                    "observer and ordinary transfer keep the actual Box/backing intact"
+                );
+            }
+            s10_retire(child, RuntimeTermination::new(TerminationReason::Cancelled));
+        }
+        s10_close(&runtime);
+    }
+}
+
+#[test]
+fn claimed_async_await_string_local_actual_finish_observer_native_unwind_and_same_worker_reuse() {
+    use crate::runtime::task::{AwaitStringPayloadPolicy, AwaitTicket};
+    const SOURCE: &str = "async fn Entry(text: str): str! { r: str! = ok(text)\nreturn r.clone() }";
+    let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+    let (value, input) = string_input(PAYLOAD, 4096);
+    let (child, rx, _) = s10_spawn(
+        &runtime,
+        SOURCE,
+        vec![value],
+        vec![input],
+        S10Plan::normal(1),
+    );
+    let worker = s10_entered(&child, &rx, true);
+    let proof = s10_finished(&rx);
+    s11_wait_published(&child);
+    let owner = s11_slot_owner(&child).unwrap();
+    assert_eq!(Some(owner), proof.outgoing);
+    let shape = s11_box_error_charge(owner);
+    let string_bytes = owner.string.unwrap().capacity;
+    let child_for_actor = child.clone();
+    let (observer_tx, observer_rx) = mpsc::sync_channel(1);
+    let actor = runtime
+        .spawn(move || {
+            assert_eq!(std::thread::current().id(), worker);
+            let mut ticket = AwaitTicket::begin_with_string_payload_policy(
+                child_for_actor,
+                AwaitStringPayloadPolicy::new(AwaitPayloadPolicy {
+                    max_count: shape.count,
+                    max_bytes: shape.bytes + string_bytes,
+                    input_string_capacity: 0,
+                    span: Span::default(),
+                }),
+            );
+            s11_poll_ready(&mut ticket);
+            assert_eq!(ticket.retained_string_payload_charge().bytes, string_bytes);
+            let first = RuntimeTermination::new(TerminationReason::TimedOut);
+            let shorter = RuntimeTermination {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: first.cleanup_deadline - Duration::from_millis(1),
+            };
+            let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ticket.finish_with(|result| {
+                    assert_eq!(
+                        result.as_ref().ok().and_then(s11_copy_owner),
+                        Some(owner),
+                        "the real operation observer borrows the sole actual owned result"
+                    );
+                    let _cleanup = CleanupGuard::enter(first);
+                    drop(CleanupGuard::enter(shorter));
+                    let actual = current_cleanup_context().unwrap();
+                    assert_eq!(actual.reason, first.reason);
+                    assert_eq!(actual.cleanup_deadline, shorter.cleanup_deadline);
+                    observer_tx.send((owner, actual)).unwrap();
+                    panic!("S11 actual finish observer native unwind");
+                })
+            }));
+            assert!(observed.is_err());
+            assert!(
+                current_cleanup_context().is_none(),
+                "physical operation-local unwind restores cleanup TLS"
+            );
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let (observed_owner, context) = observer_rx.recv_timeout(S10_WAIT).unwrap();
+    assert_eq!(observed_owner, owner);
+    assert_eq!(s10_wait_result(&actor).unwrap(), Value::Null);
+    s10_retire(actor, RuntimeTermination::new(TerminationReason::Cancelled));
+    assert!(s11_slot_owner(&child).is_none());
+    s10_retire(child, context);
+    let (value, input) = string_input(PAYLOAD, 4096);
+    let (healthy, _) = s10_completed(&runtime, SOURCE, vec![value], input, S10Plan::normal(1));
+    assert_eq!(healthy.thread, worker);
+    s10_close(&runtime);
+}
+
+#[test]
+fn claimed_async_await_string_local_saved_q2_q3_and_scopes_keep_every_real_owner_fee() {
+    for error in [false, true] {
+        let child = format!(
+            "async fn Child(text: str): str! {{ r: str! = {}(text)\nreturn r.clone() }}\n",
+            if error { "err" } else { "ok" }
+        );
+        let scoped = format!(
+            "{child}async fn Entry(text: str): str! {{ r: str! = await Child(text)\n\
+            if (true) {{ inner: str! = r.clone()\ninner }}\nreturn r.clone() }}"
+        );
+        let q2 = format!("{child}async fn Entry(text: str): str! {{ r: str! = await Child(text)\n\
+            try {{ return r.clone() }} finally {{ r\nr = r\nreturn r.clone() }}\nreturn r.clone() }}");
+        let q3 = format!(
+            "{child}async fn Entry(text: str): str! {{ r: str! = await Child(text)\n\
+            try {{ return r.clone() }} finally {{ try {{ return r.clone() }} finally {{ r\nr = r\n\
+            return r.clone() }} }}\nreturn r.clone() }}"
+        );
+        let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+        for (source, saved) in [(&scoped, 0), (&q2, 1), (&q3, 2)] {
+            let (value, input) = string_input(PAYLOAD, 4096);
+            let (proof, result, ready, bound) =
+                s11_completed(&runtime, source, vec![value], input, s11_plan(1, false));
+            assert_eq!(ready.len(), 1);
+            assert_eq!(bound, 1);
+            assert_eq!(proof.max_saved, saved);
+            assert_eq!(proof.finally, saved);
+            assert_eq!(proof.retired_finally, saved);
+            assert_eq!(proof.peak_boxes, proof.observed_peak_boxes);
+            assert_eq!(proof.peak_clones, proof.observed_peak_clones);
+            assert!(proof.distinct_clones > saved);
+            assert_eq!(s9_owner(&result, PAYLOAD).unwrap().error.is_some(), error);
+        }
+        s10_close(&runtime);
+    }
+}
+
+struct S11ChildWitness(crate::runtime::task::TaskRetirementWitness);
+
+impl std::fmt::Debug for S11ChildWitness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("actual state-only child retirement witness")
+    }
+}
+
+fn s11_retire_children(
+    children: Vec<crate::runtime::task::TaskRetirementWitness>,
+    context: RuntimeTermination,
+) {
+    use crate::runtime::task::{RetirementBatchPoll, TaskRetirementBatch};
+    let mut batch = TaskRetirementBatch::from_reserved(children, context);
+    let deadline = Instant::now() + S10_WAIT;
+    loop {
+        match batch.poll(Instant::now()) {
+            RetirementBatchPoll::Retired => break,
+            RetirementBatchPoll::TimedOut(actual) => {
+                panic!("actual child G1/G2 exceeded D: {actual:?}")
+            }
+            RetirementBatchPoll::Pending { .. } => {
+                assert!(Instant::now() < deadline, "finite real child retirement");
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+fn s11_poll_ready(ticket: &mut crate::runtime::task::AwaitTicket) {
+    use crate::runtime::task::AwaitPoll;
+    let deadline = Instant::now() + S10_WAIT;
+    while ticket.poll() == AwaitPoll::Pending {
+        assert!(
+            Instant::now() < deadline,
+            "finite actual ordinary ticket poll"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn claimed_async_await_string_local_waiting_ready_running_produced_cancel_keep_first_cause_and_g1_g2(
+) {
+    const SOURCE: &str =
+        "async fn Child(text: str): str! { r: str! = ok(text)\nreturn r.clone() }\n\
+        async fn Entry(text: str): str! { r: str! = await Child(text)\nr\nreturn r.clone() }";
+    for stage in [
+        S10Pause::AwaitWaiting,
+        S10Pause::AwaitReady,
+        S10Pause::Running,
+        S10Pause::Produced,
+    ] {
+        let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+        let (value, input) = string_input(PAYLOAD, 4096);
+        let mut plan = s11_plan(1, false);
+        plan.pause = stage;
+        let (task, rx, release) = s10_spawn(&runtime, SOURCE, vec![value], vec![input], plan);
+        let worker = s10_entered(&task, &rx, true);
+        let mut children = Vec::new();
+        let mut proof = None;
+        let mut ready = None;
+        let paused_owner = loop {
+            match rx.recv_timeout(S10_WAIT).unwrap() {
+                S10Witness::AwaitChild(witness) => children.push(witness.0),
+                S10Witness::AwaitWaiting
+                | S10Witness::Progress { .. }
+                | S10Witness::AwaitBound(_) => {}
+                S10Witness::AwaitReady(actual) => ready = Some(actual.owner),
+                S10Witness::Finished(actual) => proof = Some(*actual),
+                S10Witness::Paused {
+                    stage: actual,
+                    owner,
+                } => {
+                    assert_eq!(actual, stage);
+                    break owner.as_deref().copied();
+                }
+                other => panic!("unexpected actual cancel checkpoint: {other:?}"),
+            }
+        };
+        assert_eq!(children.len(), 1);
+        if stage == S10Pause::AwaitReady {
+            assert_eq!(paused_owner, ready);
+            assert!(
+                paused_owner.is_some(),
+                "pause retains the real sole ticket owner"
+            );
+        } else if stage == S10Pause::Produced {
+            assert_eq!(paused_owner, proof.as_ref().unwrap().outgoing);
+            assert!(
+                paused_owner.is_some(),
+                "real Break payload exists before publication"
+            );
+        } else {
+            assert!(paused_owner.is_none());
+        }
+        let first = RuntimeTermination::new(TerminationReason::TimedOut);
+        let shorter = RuntimeTermination {
+            reason: TerminationReason::Cancelled,
+            cleanup_deadline: first.cleanup_deadline - Duration::from_millis(1),
+        };
+        assert!(task.request_cancel_with(first));
+        assert!(!task.request_cancel_with(shorter));
+        let expected = RuntimeTermination {
+            reason: first.reason,
+            cleanup_deadline: shorter.cleanup_deadline,
+        };
+        release.send(()).unwrap();
+        if proof.is_none() {
+            loop {
+                match rx.recv_timeout(S10_WAIT).unwrap() {
+                    S10Witness::Finished(actual) => {
+                        proof = Some(*actual);
+                        break;
+                    }
+                    S10Witness::AwaitReady(_)
+                    | S10Witness::AwaitBound(_)
+                    | S10Witness::AwaitWaiting
+                    | S10Witness::Progress { .. } => {}
+                    other => panic!("unexpected cancelled actual claimant event: {other:?}"),
+                }
+            }
+        }
+        let proof = proof.unwrap();
+        assert_eq!(proof.thread, worker);
+        assert_eq!(proof.calls, proof.retired);
+        assert_eq!(proof.finally, proof.retired_finally);
+        if stage != S10Pause::Produced {
+            assert!(proof.outgoing.is_none());
+        }
+        assert_eq!(
+            s10_wait_result(&task).unwrap_err().runtime_termination(),
+            Some(expected)
+        );
+        s10_retire(task, expected);
+        s11_retire_children(children, expected);
+        let (value, input) = string_input(PAYLOAD, 4096);
+        let (healthy, _, _, _) =
+            s11_completed(&runtime, SOURCE, vec![value], input, s11_plan(1, true));
+        assert_eq!(healthy.thread, worker);
+        s10_close(&runtime);
+    }
+}
+
+#[test]
+fn claimed_async_await_string_local_real_ready_native_abandonment_retires_then_reuses_worker() {
+    const SOURCE: &str =
+        "async fn Child(text: str): str! { r: str! = ok(text)\nreturn r.clone() }\n\
+        async fn Entry(text: str): str! { r: str! = await Child(text)\nreturn r.clone() }";
+    let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+    let (value, input) = string_input(PAYLOAD, 4096);
+    let mut plan = s11_plan(1, false);
+    plan.fault = S10Fault::NativeReady;
+    let (task, rx, _) = s10_spawn(&runtime, SOURCE, vec![value], vec![input], plan);
+    let worker = s10_entered(&task, &rx, true);
+    let mut children = Vec::new();
+    let mut ready = None;
+    loop {
+        match rx.recv_timeout(S10_WAIT).unwrap() {
+            S10Witness::AwaitChild(witness) => children.push(witness.0),
+            S10Witness::AwaitReady(actual) => ready = Some(actual.owner),
+            S10Witness::AwaitWaiting | S10Witness::Progress { .. } => {}
+            S10Witness::Paused {
+                stage: S10Pause::AwaitReady,
+                owner,
+            } => {
+                assert_eq!(owner.as_deref().copied(), ready);
+                assert!(
+                    ready.is_some(),
+                    "native unwind starts with the actual Ready payload"
+                );
+                break;
+            }
+            other => panic!("unexpected actual Ready native event: {other:?}"),
+        }
+    }
+    let Value::Result { ok: false, value } = s10_wait_result(&task).unwrap() else {
+        panic!("existing Task driver native classification");
+    };
+    let Value::Object(fields) = *value else {
+        panic!("actual Task panic ErrorObject");
+    };
+    assert!(matches!(fields.get("code"), Some(Value::String(code)) if code == "panic"));
+    let context = RuntimeTermination::new(TerminationReason::Cancelled);
+    s10_retire(task, context);
+    s11_retire_children(children, context);
+    let (value, input) = string_input(PAYLOAD, 4096);
+    let (healthy, _, _, _) = s11_completed(&runtime, SOURCE, vec![value], input, s11_plan(1, true));
+    assert_eq!(healthy.thread, worker);
+    s10_close(&runtime);
+}
+
+fn s11_check_await_quota(machine: &mut Machine, count: usize, bytes: usize) {
+    let saved = machine.value_limits;
+    machine.value_limits.max_frames = count;
+    machine.value_limits.max_storage_bytes = bytes;
+    let exact = machine.await_payload_policy(Span::default()).unwrap();
+    assert_eq!(
+        (exact.max_count, exact.max_bytes),
+        (0, 0),
+        "compound current owner totals leave no fictitious unused await quota"
+    );
+    machine.value_limits.max_frames = count - 1;
+    assert!(machine
+        .await_payload_policy(Span::default())
+        .err()
+        .unwrap()
+        .message
+        .contains("FrameLimit"));
+    machine.value_limits.max_frames = count;
+    machine.value_limits.max_storage_bytes = bytes - 1;
+    assert!(machine
+        .await_payload_policy(Span::default())
+        .err()
+        .unwrap()
+        .message
+        .contains("StorageLimit"));
+    machine.value_limits = saved;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum S11HandoffFault {
+    None,
+    NativeObserver,
+    EmitCount,
+    EmitBytes,
+}
+
+struct S11HandoffState {
+    input: Buffer,
+    proof: S9Proof,
+    fault: S11HandoffFault,
+    receipts: Vec<S11HandoffReceipt>,
+    saved_limits: Option<FrameLimits>,
+    native_context: Option<RuntimeTermination>,
+}
+
+#[derive(Debug)]
+struct S11HandoffReceipt {
+    observer: bool,
+    owner: S9Owner,
+    shape: AwaitPayloadCharge,
+    string_bytes: usize,
+    count: usize,
+    bytes: usize,
+}
+
+struct S11HandoffReport {
+    task: i64,
+    worker: std::thread::ThreadId,
+    receipts: Vec<S11HandoffReceipt>,
+    native_context: Option<RuntimeTermination>,
+    outgoing: Option<S9Owner>,
+    children: Vec<crate::runtime::task::TaskRetirementWitness>,
+}
+
+#[test]
+fn claimed_async_await_string_local_actual_observer_emit_escrow_quotas_native_and_drop_phases() {
+    // This operation probe uses the actual production Machine and Interpreter
+    // arbitration on the actual Task worker. The normal runner / from_code
+    // path is independently covered above; it is not replaced by this probe.
+    for error in [false, true] {
+        for fault in [
+            S11HandoffFault::None,
+            S11HandoffFault::NativeObserver,
+            S11HandoffFault::EmitCount,
+            S11HandoffFault::EmitBytes,
+        ] {
+            let source = format!("async fn Child(text: str): str! {{ r: str! = {}(text)\nreturn r.clone() }}\n\
+                async fn Entry(text: str): str! {{ r: str! = await Child(text)\nreturn r.clone() }}",
+                if error { "err" } else { "ok" });
+            let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+            let mut producer = production_interpreter(&source);
+            producer.task_runtime = Some(runtime.clone());
+            let template = producer.template();
+            let function = producer.functions["Entry"].clone();
+            let child_runtime = runtime.clone();
+            let (value, input) = string_input(PAYLOAD, 4096);
+            let (tx, rx) = mpsc::sync_channel(1);
+            let actor = runtime.spawn(move || {
+                assert!(current_cleanup_context().is_none());
+                assert!(crate::runtime::task::current_execution_termination().is_none());
+                let task = crate::runtime::task::current_task_id();
+                let worker = std::thread::current().id();
+                let mut host = Interpreter::from_template(template, child_runtime);
+                host.async_execution = true;
+                let mut claimant = ClaimedNamedTask::new(host, function, vec![value], Span::default());
+                assert_eq!(claimant.task_id, task);
+                assert!(claimant.legacy.is_none());
+                assert_eq!(claimant.interpreter.steps, 0);
+                let mut machine = claimant.machine.take().expect("real selected claimant machine");
+                let mut hooks = S9StringFaultProbe::new(&mut claimant.interpreter, Vec::new(), None);
+                let mut proof = S9Proof::new(input);
+                proof.allow_await_ticket = true;
+                hooks.handoff = Some(S11HandoffState {
+                    input, proof, fault,
+                    receipts: Vec::new(), saved_limits: None, native_context: None,
+                });
+                let mut children = Vec::new();
+                let mut outgoing = None;
+                let mut dispatches = 0;
+                let result = loop {
+                    dispatches += 1;
+                    assert!(dispatches <= 100_000, "finite real operation probe work");
+                    let state = hooks.handoff.as_mut().unwrap();
+                    s9_observe(&machine, input, &mut state.proof);
+                    if children.is_empty() && matches!(machine.work.as_slice().last(),
+                        Some(Work::AwaitLocalOwnedStringOperand(_)))
+                    {
+                        if let Some(Value::Task(child)) = machine.values.as_slice().last() {
+                            children.push(child.retirement_witness());
+                        }
+                    }
+                    let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        machine.dispatch_chunk(NonZeroUsize::new(1).unwrap(), &mut hooks)
+                    }));
+                    if let Some(saved) = hooks.handoff.as_mut().unwrap().saved_limits.take() {
+                        machine.value_limits = saved;
+                    }
+                    match step {
+                        Err(_) => {
+                            assert_eq!(fault, S11HandoffFault::NativeObserver);
+                            assert_eq!(machine.state, MachineState::Aborted);
+                            assert_eq!(machine.await_payload_escrow, AwaitPayloadCharge::default());
+                            assert_eq!(machine.await_string_payload_escrow.bytes, 0,
+                                "outer catch clears only after real operation-local payload unwind");
+                            assert!(machine.awaiting.is_none());
+                            let context = hooks.handoff.as_ref().unwrap().native_context.unwrap();
+                            assert_eq!(crate::runtime::task::current_execution_termination(), Some(context));
+                            break Err(KuError::termination(context, Span::default()));
+                        }
+                        Ok(Err(error)) => break Err(error),
+                        Ok(Ok(ChunkProgress::More { popped })) => {
+                            assert_eq!(popped, 1);
+                            assert_eq!(machine.await_payload_escrow, AwaitPayloadCharge::default());
+                            assert_eq!(machine.await_string_payload_escrow.bytes, 0);
+                        }
+                        Ok(Ok(ChunkProgress::Waiting { popped })) => {
+                            assert_eq!(popped, 1);
+                            machine.wait_synchronously(hooks.host());
+                        }
+                        Ok(Ok(ChunkProgress::Finished { popped, result })) => {
+                            assert!(popped <= 1);
+                            let result = result.and_then(|flow| flow.into_call_value(Span::default(), "function"));
+                            outgoing = result.as_ref().ok().and_then(s11_copy_owner);
+                            s9_drained(&machine);
+                            assert_eq!(machine.await_string_payload_snapshot.bytes, 0);
+                            assert_eq!(machine.await_string_payload_escrow.bytes, 0);
+                            assert_eq!(machine.metrics.entered_calls, machine.metrics.retired_calls);
+                            break result;
+                        }
+                    }
+                };
+                let state = hooks.handoff.take().unwrap();
+                assert_eq!(children.len(), 1);
+                drop(hooks);
+                // Every native payload and its ticket has already unwound. The
+                // remaining actual Machine prefix drops under its first cause
+                // and the same shortened D, without reading freed metrics.
+                if let Some(context) = state.native_context {
+                    let release = CleanupGuard::enter(context);
+                    drop(machine);
+                    drop(release);
+                } else {
+                    drop(machine);
+                }
+                assert!(current_cleanup_context().is_none());
+                tx.send(S11HandoffReport {
+                    task, worker, receipts: state.receipts, native_context: state.native_context,
+                    outgoing, children,
+                }).unwrap();
+                result
+            }).unwrap();
+            let report = rx.recv_timeout(S10_WAIT).unwrap();
+            assert_eq!(report.task, actor.id());
+            assert_eq!(
+                report.receipts.len(),
+                if fault == S11HandoffFault::NativeObserver {
+                    1
+                } else {
+                    2
+                }
+            );
+            assert!(report.receipts[0].observer);
+            if report.receipts.len() == 2 {
+                assert!(!report.receipts[1].observer);
+                assert_eq!(
+                    report.receipts[0].owner, report.receipts[1].owner,
+                    "actual Observer -> target release -> Emit keeps one unchanged owned outcome"
+                );
+            }
+            for phase in &report.receipts {
+                assert_eq!(phase.shape, s11_box_error_charge(phase.owner));
+                assert_eq!(
+                    phase.string_bytes,
+                    phase.owner.string.map_or(0, |text| text.capacity)
+                );
+                assert!(phase.count >= phase.shape.count);
+                assert!(phase.bytes >= input.capacity + phase.shape.bytes + phase.string_bytes);
+            }
+            let result = s10_wait_result(&actor);
+            match fault {
+                S11HandoffFault::None => {
+                    let value = result.unwrap();
+                    assert_eq!(s11_copy_owner(&value), report.outgoing);
+                    assert_eq!(s9_owner(&value, PAYLOAD).unwrap().error.is_some(), error);
+                }
+                S11HandoffFault::NativeObserver => {
+                    assert_eq!(
+                        result.unwrap_err().runtime_termination(),
+                        report.native_context
+                    );
+                }
+                S11HandoffFault::EmitCount => {
+                    assert!(result.unwrap_err().message.contains("FrameLimit"))
+                }
+                S11HandoffFault::EmitBytes => {
+                    assert!(result.unwrap_err().message.contains("StorageLimit"))
+                }
+            }
+            let context = report
+                .native_context
+                .unwrap_or_else(|| RuntimeTermination::new(TerminationReason::Cancelled));
+            s10_retire(actor, context);
+            s11_retire_children(report.children, context);
+            let (value, input) = string_input(PAYLOAD, 4096);
+            let (healthy, _, _, _) =
+                s11_completed(&runtime, &source, vec![value], input, s11_plan(1, true));
+            assert_eq!(healthy.thread, report.worker);
+            s10_close(&runtime);
+        }
+    }
+}
+
+fn s11_measured_owner(value: &Value, text: &'static str, task_errors: bool) -> Option<S9Owner> {
+    if task_errors && matches!(value, Value::Result { ok: false, .. }) {
+        // Only S11 task-depth fixtures opt in. They assert the actual runtime
+        // code/message after ordinary consuming publication; old source err
+        // shape/text assertions continue to run through the unchanged helper.
+        s11_copy_owner(value)
+    } else {
+        s9_owner(value, text)
+    }
+}
+
+fn s11_completed(
+    runtime: &TaskRuntime,
+    source: &str,
+    args: Vec<Value>,
+    input: Buffer,
+    plan: S10Plan,
+) -> (S10Finished, Value, Vec<S11Ready>, usize) {
+    let (proof, result, ready, bound) = s11_receipt(runtime, source, args, input, plan);
+    (proof, result.unwrap(), ready, bound)
+}
+
+#[test]
+fn claimed_async_await_string_local_real_self_mutual_fresh_64_first_65_and_worker_reuse() {
+    assert_eq!(crate::runtime::task::MAX_AWAIT_DEPTH, 64);
+    for error in [false, true] {
+        let leaf = if error { "err(text)" } else { "ok(text)" };
+        let branch = |next: &str| {
+            format!(
+                "if (n <= 0) {{ return {leaf} }}\n\
+            r: str! = await {next}(text, n - 1)\nreturn r.clone()"
+            )
+        };
+        let own = format!(
+            "async fn Entry(text: str, n: int): str! {{ {} }}",
+            branch("Entry")
+        );
+        let mutual = format!(
+            "async fn Other(text: str, n: int): str! {{ {} }}\n\
+            async fn Entry(text: str, n: int): str! {{ {} }}",
+            branch("Entry"),
+            branch("Other")
+        );
+        let fresh = format!(
+            "async fn Child(text: str): str! {{ r: str! = {leaf}\nreturn r.clone() }}\n\
+            async fn Entry(text: str, n: int): str! {{ if (n <= 0) {{ r: str! = await Child(text)\n\
+            return r.clone() }}\nr: str! = await Entry(text, n - 1)\nreturn r.clone() }}"
+        );
+        for (source, extra, chunk) in [(&own, 0, 1), (&mutual, 0, 7), (&fresh, 1, 256)] {
+            let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
+            let mut worker = None;
+            for n in [64 - extra, 65 - extra, 1] {
+                let (value, input) = string_input(PAYLOAD, 4096);
+                let mut plan = s11_plan(chunk, n == 1);
+                plan.task_errors = true;
+                let (proof, result, ready, bound) =
+                    s11_receipt(&runtime, source, vec![value, Value::Int(n)], input, plan);
+                if let Some(old) = worker {
+                    assert_eq!(old, proof.thread);
+                }
+                worker = Some(proof.thread);
+                assert_eq!(
+                    (proof.calls, proof.peak_calls),
+                    (1, 1),
+                    "logical source calls and actual Task await depth remain distinct"
+                );
+                assert_eq!(ready.len(), 1);
+                assert_eq!(bound, usize::from(chunk == 1));
+                let result = result.unwrap();
+                if n == 65 - extra {
+                    let Value::Result { ok: false, value } = result else {
+                        panic!("first actual 65th await preserves the existing controlled error");
+                    };
+                    let Value::Object(fields) = *value else {
+                        panic!("real runtime depth ErrorObject");
+                    };
+                    assert!(
+                        matches!(fields.get("code"), Some(Value::String(code)) if code == "await_depth")
+                    );
+                    assert!(matches!(fields.get("message"), Some(Value::String(message))
+                        if message.contains("64")));
+                } else {
+                    assert_eq!(s9_owner(&result, PAYLOAD).unwrap().error.is_some(), error);
+                }
+            }
+            s10_close(&runtime);
+        }
+    }
+}
+
+#[test]
+fn claimed_async_await_string_local_child_sync_512_first_513_preserves_controlled_error_and_reuse()
+{
+    for error in [false, true] {
+        let leaf = if error { "err(text)" } else { "ok(text)" };
+        let source = format!("fn Relay(text: str, n: int): str! {{ if (n <= 0) {{ return {leaf} }}\n\
+            return Relay(text, n - 1) }}\n\
+            async fn Child(text: str, n: int): str! {{ return Relay(text, n) }}\n\
+            async fn Entry(text: str, n: int): str! {{ r: str! = await Child(text, n)\nreturn r.clone() }}");
+        let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+        let mut worker = None;
+        for n in [510, 511, 0] {
+            let (value, input) = string_input(PAYLOAD, 4096);
+            let (proof, result, ready, bound) = s11_receipt(
+                &runtime,
+                &source,
+                vec![value, Value::Int(n)],
+                input,
+                s11_plan(1, n == 0),
+            );
+            if let Some(old) = worker {
+                assert_eq!(old, proof.thread);
+            }
+            worker = Some(proof.thread);
+            assert_eq!((proof.calls, proof.retired), (1, 1));
+            if n == 511 {
+                assert_eq!(
+                    result.unwrap_err().code.as_deref(),
+                    Some("call_depth_exceeded")
+                );
+                assert!(
+                    ready.is_empty(),
+                    "raw child failure transfers no invented Result payload"
+                );
+                assert_eq!(bound, 0);
+                assert!(proof.outgoing.is_none());
+            } else {
+                assert_eq!(ready.len(), 1);
+                assert_eq!(bound, 1);
+                assert_eq!(
+                    s9_owner(&result.unwrap(), PAYLOAD).unwrap().error.is_some(),
+                    error
+                );
+            }
+        }
+        s10_close(&runtime);
+    }
+}
+
+#[test]
+fn claimed_async_await_string_local_queued_factory_cancel_and_last_owner_release_retire_real_prefixes(
+) {
+    const SOURCE: &str =
+        "async fn Child(text: str): str! { r: str! = ok(text)\nreturn r.clone() }\n\
+        async fn Entry(text: str): str! { r: str! = await Child(text)\nr\nreturn r.clone() }";
+    let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (held_tx, held_rx) = mpsc::sync_channel(1);
+    let held = runtime
+        .spawn(move || {
+            ready_tx.send(()).unwrap();
+            held_rx.recv_timeout(S10_WAIT).unwrap();
+            Ok(Value::Null)
+        })
+        .unwrap();
+    ready_rx.recv_timeout(S10_WAIT).unwrap();
+    let (value, input) = string_input(PAYLOAD, 4096);
+    let (queued, rx, _) = s10_spawn(
+        &runtime,
+        SOURCE,
+        vec![value],
+        vec![input],
+        s11_plan(1, true),
+    );
+    assert_eq!(runtime.snapshot().unwrap().queued_tasks, 1);
+    let first = RuntimeTermination::new(TerminationReason::TimedOut);
+    assert!(queued.request_cancel_with(first));
+    assert!(matches!(rx.recv_timeout(S10_WAIT), Err(mpsc::RecvTimeoutError::Disconnected)),
+        "the actual deferred S11 factory and original argument drop before any constructor dispatch");
+    // The queued cancellation has already published its terminal outcome.
+    // A later request cannot rewrite that published first cause or deadline.
+    assert!(!queued.request_cancel_with(RuntimeTermination {
+        reason: TerminationReason::Cancelled,
+        cleanup_deadline: first.cleanup_deadline - Duration::from_millis(1),
+    }));
+    assert_eq!(
+        s10_wait_result(&queued).unwrap_err().runtime_termination(),
+        Some(first)
+    );
+    s10_retire(queued, first);
+    held_tx.send(()).unwrap();
+    assert_eq!(s10_wait_result(&held).unwrap(), Value::Null);
+    s10_retire(held, RuntimeTermination::new(TerminationReason::Cancelled));
+
+    let (value, input) = string_input(PAYLOAD, 4096);
+    let mut plan = s11_plan(1, false);
+    plan.pause = S10Pause::Produced;
+    let (task, rx, release) = s10_spawn(&runtime, SOURCE, vec![value], vec![input], plan);
+    let worker = s10_entered(&task, &rx, true);
+    let mut children = Vec::new();
+    let mut proof = None;
+    loop {
+        match rx.recv_timeout(S10_WAIT).unwrap() {
+            S10Witness::AwaitChild(witness) => children.push(witness.0),
+            S10Witness::Finished(actual) => proof = Some(*actual),
+            S10Witness::AwaitWaiting
+            | S10Witness::AwaitReady(_)
+            | S10Witness::AwaitBound(_)
+            | S10Witness::Progress { .. } => {}
+            S10Witness::Paused {
+                stage: S10Pause::Produced,
+                owner,
+            } => {
+                assert_eq!(owner.as_deref().copied(), proof.as_ref().unwrap().outgoing);
+                assert!(
+                    owner.is_some(),
+                    "actual unpublished Break owner remains on the real worker"
+                );
+                break;
+            }
+            other => panic!("unexpected last-owner actual checkpoint: {other:?}"),
+        }
+    }
+    assert_eq!(children.len(), 1);
+    let proof = proof.unwrap();
+    assert_eq!(proof.thread, worker);
+    let witness = task.retirement_witness();
+    let context = RuntimeTermination::new(TerminationReason::Cancelled);
+    let window = CleanupGuard::enter(context);
+    drop(task);
+    drop(window);
+    let mut batch =
+        crate::runtime::task::TaskRetirementBatch::from_reserved(vec![witness], context);
+    assert!(
+        matches!(
+            batch.poll(Instant::now()),
+            crate::runtime::task::RetirementBatchPoll::Pending { .. }
+        ),
+        "last owner release cannot acknowledge the still-live incoming payload and running node"
+    );
+    release.send(()).unwrap();
+    let deadline = Instant::now() + S10_WAIT;
+    loop {
+        match batch.poll(Instant::now()) {
+            crate::runtime::task::RetirementBatchPoll::Retired => break,
+            crate::runtime::task::RetirementBatchPoll::TimedOut(actual) => {
+                panic!("actual last owner D expired: {actual:?}")
+            }
+            crate::runtime::task::RetirementBatchPoll::Pending { .. } => {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
+    }
+    assert_eq!(batch.context(), context);
+    s11_retire_children(children, context);
+    let (value, input) = string_input(PAYLOAD, 4096);
+    let (healthy, _, _, _) = s11_completed(&runtime, SOURCE, vec![value], input, s11_plan(1, true));
+    assert_eq!(healthy.thread, worker);
+    s10_close(&runtime);
+}
+
+#[test]
+fn claimed_async_await_string_local_post_await_protected_finally_cancellation_keeps_actual_owners_and_d(
+) {
+    for error in [false, true] {
+        let source = format!(
+            "async fn Child(text: str): str! {{ r: str! = {}(text)\nreturn r.clone() }}\n\
+            async fn Entry(text: str): str! {{ r: str! = await Child(text)\n\
+            try {{ marker = 1\nmarker = 2 }} finally {{ r\nr = r }}\nreturn r.clone() }}",
+            if error { "err" } else { "ok" }
+        );
+        let declared = functions(&source);
+        let Stmt::Try { body, .. } = &declared["Entry"].body[1] else {
+            panic!("actual post-await protected source");
+        };
+        let target = stmt_span(&body[1]);
+        let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+        let (value, input) = string_input(PAYLOAD, 4096);
+        let mut plan = s11_plan(1, false);
+        plan.pause = S10Pause::Protected(target);
+        let (task, rx, release) = s10_spawn(&runtime, &source, vec![value], vec![input], plan);
+        let worker = s10_entered(&task, &rx, true);
+        let mut children = Vec::new();
+        let mut ready = 0;
+        let mut bound = 0;
+        loop {
+            match rx.recv_timeout(S10_WAIT).unwrap() {
+                S10Witness::AwaitChild(witness) => children.push(witness.0),
+                S10Witness::AwaitReady(_) => ready += 1,
+                S10Witness::AwaitBound(_) => bound += 1,
+                S10Witness::AwaitWaiting | S10Witness::Progress { .. } => {}
+                S10Witness::Paused {
+                    stage: S10Pause::Protected(actual),
+                    owner: None,
+                } => {
+                    assert_eq!(actual, target);
+                    break;
+                }
+                other => panic!("unexpected real protected post-await checkpoint: {other:?}"),
+            }
+        }
+        assert_eq!((children.len(), ready, bound), (1, 1, 1));
+        let first = RuntimeTermination::new(TerminationReason::Cancelled);
+        let shorter = RuntimeTermination {
+            reason: TerminationReason::TimedOut,
+            cleanup_deadline: first.cleanup_deadline - Duration::from_millis(1),
+        };
+        assert!(task.request_cancel_with(first));
+        assert!(!task.request_cancel_with(shorter));
+        let expected = RuntimeTermination {
+            reason: first.reason,
+            cleanup_deadline: shorter.cleanup_deadline,
+        };
+        release.send(()).unwrap();
+        let proof = loop {
+            match rx.recv_timeout(S10_WAIT).unwrap() {
+                S10Witness::Finished(actual) => break *actual,
+                S10Witness::Progress { .. } => {}
+                other => panic!("unexpected real protected cleanup event: {other:?}"),
+            }
+        };
+        assert_eq!(
+            s10_wait_result(&task).unwrap_err().runtime_termination(),
+            Some(expected)
+        );
+        assert_eq!(proof.thread, worker);
+        assert_eq!((proof.finally, proof.retired_finally), (1, 1));
+        assert!(
+            proof.distinct_clones >= 2,
+            "actual protected r read/assignment ran after the completed child await"
+        );
+        assert_eq!(proof.peak_boxes, proof.observed_peak_boxes);
+        assert_eq!(proof.peak_clones, proof.observed_peak_clones);
+        assert!(proof.outgoing.is_none());
+        s10_retire(task, expected);
+        s11_retire_children(children, expected);
+        let (value, input) = string_input(PAYLOAD, 4096);
+        let (healthy, _, _, _) =
+            s11_completed(&runtime, &source, vec![value], input, s11_plan(1, true));
+        assert_eq!(healthy.thread, worker);
+        s10_close(&runtime);
+    }
+}
+
+#[test]
+fn claimed_async_await_string_local_new_policy_private_sparse_error_slot_charges_actual_capacity() {
+    use crate::runtime::task::{AwaitStringPayloadPolicy, AwaitTicket};
+    // This is deliberately a private real-slot capacity fixture, as in the
+    // existing await_string sparse Map test. It claims no source-level Object
+    // construction or String cloning capability in the admitted language slice.
+    let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+    for reason in [Some("FrameLimit"), Some("StorageLimit"), None] {
+        let mut fields = HashMap::with_capacity(128);
+        for (name, text, capacity) in [
+            ("domain", "task", 128),
+            ("code", "sparse", 512),
+            ("message", "retained sparse error", 4096),
+        ] {
+            let mut key = String::with_capacity(64);
+            key.push_str(name);
+            let mut value = String::with_capacity(capacity);
+            value.push_str(text);
+            fields.insert(key, Value::String(value));
+        }
+        let child = runtime
+            .spawn(move || {
+                Ok(Value::Result {
+                    ok: false,
+                    value: Box::new(Value::Object(fields)),
+                })
+            })
+            .unwrap();
+        s11_wait_published(&child);
+        let actual = s11_slot_owner(&child).unwrap();
+        let error = actual.error.unwrap();
+        assert!(error.count > 3);
+        let measured = s11_box_error_charge(actual);
+        assert_eq!(measured.error_leaf_count, error.count);
+        assert_eq!(measured.error_leaf_bytes, error.bytes);
+        let mut ticket = AwaitTicket::begin_with_string_payload_policy(
+            child.clone(),
+            AwaitStringPayloadPolicy::new(AwaitPayloadPolicy {
+                max_count: measured.count - usize::from(reason == Some("FrameLimit")),
+                max_bytes: measured.bytes - usize::from(reason == Some("StorageLimit")),
+                input_string_capacity: 0,
+                span: Span::default(),
+            }),
+        );
+        s11_poll_ready(&mut ticket);
+        assert_eq!(ticket.retained_string_payload_charge().bytes, 0,
+            "six actual error key/value buffers belong to error charge, never success String charge");
+        if let Some(reason) = reason {
+            assert_eq!(s11_slot_owner(&child), Some(actual));
+            assert_eq!(
+                ticket.retained_payload_charge(),
+                AwaitPayloadCharge::default()
+            );
+            assert!(ticket
+                .finish_with(|_| {})
+                .unwrap_err()
+                .message
+                .contains(reason));
+            s11_rejected_ordinary_slot_keeps_claim_and_payload(&child, actual);
+        } else {
+            assert!(s11_slot_owner(&child).is_none());
+            assert_eq!(ticket.retained_payload_charge(), measured);
+            let mut observer = None;
+            let returned = ticket
+                .finish_with(|result| {
+                    observer = result.as_ref().ok().and_then(s11_copy_owner);
+                })
+                .unwrap();
+            assert_eq!(observer, Some(actual));
+            assert_eq!(s11_copy_owner(&returned), Some(actual));
+        }
+        s10_retire(child, RuntimeTermination::new(TerminationReason::Cancelled));
+    }
+    s10_close(&runtime);
+}
+
+struct S11NativeTargetCapture {
+    observer_ran: Arc<std::sync::atomic::AtomicBool>,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+    shorter: RuntimeTermination,
+    tx: mpsc::SyncSender<(
+        bool,
+        Option<RuntimeTermination>,
+        Option<RuntimeTermination>,
+        std::thread::ThreadId,
+    )>,
+}
+
+impl Drop for S11NativeTargetCapture {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let before = current_cleanup_context();
+        drop(CleanupGuard::enter(self.shorter));
+        let after = current_cleanup_context();
+        assert_eq!(self.drops.fetch_add(1, Ordering::AcqRel), 0);
+        self.tx
+            .send((
+                self.observer_ran.load(Ordering::Acquire),
+                before,
+                after,
+                std::thread::current().id(),
+            ))
+            .unwrap();
+        panic!("S11 actual owned target release capture destructor panic");
+    }
+}
+
+#[test]
+fn claimed_async_await_string_local_new_policy_actual_target_release_native_drop_preserves_first_d()
+{
+    use crate::runtime::task::{AwaitStringPayloadPolicy, AwaitTicket};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+    let child_runtime = runtime.clone();
+    let (report_tx, report_rx) = mpsc::sync_channel(1);
+    let actor = runtime
+        .spawn(move || {
+            assert!(current_cleanup_context().is_none());
+            assert!(crate::runtime::task::current_execution_termination().is_none());
+            let task = crate::runtime::task::current_task_id();
+            let worker = std::thread::current().id();
+            let observer_ran = Arc::new(AtomicBool::new(false));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let child_ran = Arc::new(AtomicBool::new(false));
+            let first = RuntimeTermination::new(TerminationReason::TimedOut);
+            let observer_shorter = RuntimeTermination {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: first.cleanup_deadline - Duration::from_millis(1),
+            };
+            let target_shorter = RuntimeTermination {
+                reason: TerminationReason::Cancelled,
+                cleanup_deadline: observer_shorter.cleanup_deadline - Duration::from_millis(1),
+            };
+            let (drop_tx, drop_rx) = mpsc::sync_channel(1);
+            let capture = S11NativeTargetCapture {
+                observer_ran: Arc::clone(&observer_ran),
+                drops: Arc::clone(&drops),
+                shorter: target_shorter,
+                tx: drop_tx,
+            };
+            let ran = Arc::clone(&child_ran);
+            // This actual actor occupies the only worker. Its actual child keeps
+            // the native captured owner queued until unique target release below.
+            let child = child_runtime
+                .spawn(move || {
+                    ran.store(true, Ordering::Release);
+                    drop(capture);
+                    Ok(Value::Null)
+                })
+                .unwrap();
+            let witness = child.retirement_witness();
+            let ambient = CleanupGuard::enter(first);
+            let mut ticket = AwaitTicket::begin_with_string_payload_policy(
+                child,
+                AwaitStringPayloadPolicy::new(AwaitPayloadPolicy {
+                    max_count: usize::MAX,
+                    max_bytes: usize::MAX,
+                    input_string_capacity: 0,
+                    span: Span::default(),
+                }),
+            );
+            // Admission rejects the actual operation before taking its queued
+            // target. The Ready outcome is termination with no String owner; this
+            // native target test therefore makes no nonzero-String escrow claim.
+            s11_poll_ready(&mut ticket);
+            assert_eq!(drops.load(Ordering::Acquire), 0);
+            assert_eq!(
+                ticket.retained_payload_charge(),
+                AwaitPayloadCharge::default()
+            );
+            assert_eq!(ticket.retained_string_payload_charge().bytes, 0);
+            drop(ambient);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ticket.finish_with(|result| {
+                    assert_eq!(
+                        result.as_ref().err().unwrap().runtime_termination(),
+                        Some(first)
+                    );
+                    observer_ran.store(true, Ordering::Release);
+                    drop(CleanupGuard::enter(observer_shorter));
+                })
+            }))
+            .expect_err("the actual target destructor, after the normal observer, must panic");
+            assert_eq!(
+                panic.downcast_ref::<&str>().copied(),
+                Some("S11 actual owned target release capture destructor panic")
+            );
+            let (observed, before, after, drop_worker) = drop_rx.recv_timeout(S10_WAIT).unwrap();
+            let expected_before = RuntimeTermination {
+                reason: first.reason,
+                cleanup_deadline: observer_shorter.cleanup_deadline,
+            };
+            let expected_after = RuntimeTermination {
+                reason: first.reason,
+                cleanup_deadline: target_shorter.cleanup_deadline,
+            };
+            assert!(
+                observed,
+                "normal observer completed before actual unique target owner release"
+            );
+            assert_eq!(
+                drop_worker, worker,
+                "native destructor runs on this actual sole claimant worker"
+            );
+            assert_eq!(before, Some(expected_before));
+            assert_eq!(after, Some(expected_after));
+            assert_eq!(drops.load(Ordering::Acquire), 1);
+            assert!(!child_ran.load(Ordering::Acquire));
+            assert!(current_cleanup_context().is_none());
+            assert!(crate::runtime::task::current_execution_termination().is_none());
+            // Retire its real cancelled queue node while the actor still owns the
+            // worker. The state-only receipt neither invokes nor invents a body.
+            s11_retire_children(vec![witness], expected_after);
+            report_tx.send((task, worker, expected_after)).unwrap();
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let (task, worker, _actual_first_context) = report_rx.recv_timeout(S10_WAIT).unwrap();
+    assert_eq!(task, actor.id());
+    assert_eq!(s10_wait_result(&actor).unwrap(), Value::Null);
+    s10_retire(actor, RuntimeTermination::new(TerminationReason::Cancelled));
+    let (healthy_tx, healthy_rx) = mpsc::sync_channel(1);
+    let healthy = runtime
+        .spawn(move || {
+            assert!(current_cleanup_context().is_none());
+            assert!(crate::runtime::task::current_execution_termination().is_none());
+            healthy_tx.send(std::thread::current().id()).unwrap();
+            Ok(Value::Null)
+        })
+        .unwrap();
+    assert_eq!(healthy_rx.recv_timeout(S10_WAIT).unwrap(), worker);
+    assert_eq!(s10_wait_result(&healthy).unwrap(), Value::Null);
+    s10_retire(
+        healthy,
+        RuntimeTermination::new(TerminationReason::Cancelled),
+    );
     s10_close(&runtime);
 }
