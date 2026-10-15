@@ -8616,3 +8616,151 @@ fn claimed_async_await_string_local_new_policy_actual_target_release_native_drop
     );
     s10_close(&runtime);
 }
+
+#[test]
+fn string_result_parameter_real_worker_recursion_is_bounded_and_reusable() {
+    let (_, test_name) = concat!(
+        module_path!(),
+        "::string_result_parameter_real_worker_recursion_is_bounded_and_reusable"
+    )
+    .split_once("::")
+    .unwrap();
+    if !bounded_worker_child(test_name) {
+        return;
+    }
+    const RELAY: &str = "fn Relay(value: str!, n: int): str! { if (n <= 0) { return value }\nreturn Relay(value, n - 1) }";
+    for error in [false, true] {
+        let constructor = if error { "err" } else { "ok" };
+        // Preserve the checked ordinary async entry that originally aborted
+        // at 127 calls, including its existing business-error catch path.
+        for n in [0, 127] {
+            let source = format!("{RELAY}\nasync fn Worker(): str! {{ return Relay({constructor}(\"owned payload\"), {n}) }}\nasync fn main(): null! {{ try {{ print((await Worker())?) }} catch (e) {{ print(e.domain)\nprint(e.code)\nprint(e.message) }}\nreturn ok(null) }}");
+            crate::cli::run_source("string-result-parameter-worker.ku", &source).unwrap();
+        }
+        let source =
+            format!("{RELAY}\nfn Seed(): str! {{ return {constructor}(\"owned payload\") }}");
+        let runtime = TaskRuntime::with_limits(1, 16, 0, 0, 16);
+        let mut previous_worker = None;
+        for n in [511, 512, 0] {
+            let mut host = production_interpreter(&source);
+            let (tx, rx) = mpsc::sync_channel(1);
+            let task = runtime
+                .spawn(move || {
+                    let input = host.call_function("Seed", vec![], Span::default(), 0)?;
+                    let result =
+                        host.call_function("Relay", vec![input, Value::Int(n)], Span::default(), 0);
+                    tx.send((std::thread::current().id(), result, host.call_depth))
+                        .unwrap();
+                    Ok(Value::Null)
+                })
+                .unwrap();
+            // A channel wait cannot help the job on the caller's larger stack.
+            let (worker, result, depth) = rx.recv_timeout(S10_WAIT).unwrap();
+            assert_ne!(worker, std::thread::current().id());
+            if let Some(previous) = previous_worker {
+                assert_eq!(worker, previous);
+            }
+            previous_worker = Some(worker);
+            if n == 512 {
+                assert_eq!(
+                    result.unwrap_err().code.as_deref(),
+                    Some("call_depth_exceeded")
+                );
+            } else {
+                assert_eq!(
+                    s9_owner(&result.unwrap(), "owned payload")
+                        .unwrap()
+                        .error
+                        .is_some(),
+                    error
+                );
+            }
+            assert_eq!(depth, 0);
+            assert_eq!(s10_wait_result(&task).unwrap(), Value::Null);
+            s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
+        }
+        s10_close(&runtime);
+    }
+    eprintln!("worker regression completed: {test_name}");
+}
+
+#[test]
+fn string_result_parameter_compound_capacity_rejection_preserves_original_owners() {
+    const SOURCE: &str = "fn Entry(value: str!, n: int): str! { return value }";
+    let source = functions(SOURCE);
+    let code = CodeHandle::compile_owned_string_result_parameter_named(
+        &source,
+        &source["Entry"],
+        Limits::default(),
+    )
+    .unwrap();
+    for error in [false, true] {
+        for count_rejection in [false, true] {
+            let value = if error {
+                let mut fields = HashMap::with_capacity(128);
+                for (name, text) in [("domain", "ku"), ("code", "err"), ("message", PAYLOAD)] {
+                    let mut key = String::with_capacity(64);
+                    key.push_str(name);
+                    let (value, _) = string_input(text, 4096);
+                    fields.insert(key, value);
+                }
+                Value::Result {
+                    ok: false,
+                    value: Box::new(Value::Object(fields)),
+                }
+            } else {
+                let (value, _) = string_input(PAYLOAD, 4096);
+                Value::Result {
+                    ok: true,
+                    value: Box::new(value),
+                }
+            };
+            let original = s9_owner(&value, PAYLOAD).unwrap();
+            let mut args = Vec::with_capacity(64);
+            args.extend([value, Value::Int(0)]);
+            let original_vec = (args.as_ptr(), args.capacity());
+            // Independent arithmetic uses actual spare Map/Vec capacity and
+            // all six error buffers, rather than the three-entry schema size.
+            let box_bytes = std::mem::size_of::<Value>();
+            let (owner_count, owner_bytes) = original.error.map_or_else(
+                || (1, box_bytes + original.string.unwrap().capacity),
+                |actual| (1 + actual.count, box_bytes + actual.bytes),
+            );
+            let mut limits = Limits::default();
+            if count_rejection {
+                limits.values.max_frames = args.capacity() + owner_count - 1;
+            } else {
+                limits.values.max_storage_bytes = args.capacity() * box_bytes + owner_bytes - 1;
+            }
+            let mut machine = Machine::from_code(code.clone(), limits, 0);
+            let mut host = production_interpreter(SOURCE);
+            let failure = machine
+                .run_owned_with_hooks("Entry", &mut args, 0, false, &mut host)
+                .err()
+                .expect("compound capacity must reject before transferring input");
+            assert!(failure.message.contains(if count_rejection {
+                "FrameLimit"
+            } else {
+                "StorageLimit"
+            }));
+            assert_eq!((args.as_ptr(), args.capacity()), original_vec);
+            assert_eq!(args.len(), 2);
+            assert_eq!(s9_owner(&args[0], PAYLOAD), Some(original));
+            assert_eq!((host.steps, machine.metrics.entered_calls), (0, 0));
+            s9_drained(&machine);
+            // The exact retained input and Machine remain usable after the
+            // failed admission; the legacy transparent clone need not keep
+            // the same Box or String backing in the returned result.
+            machine.value_limits = Limits::default().values;
+            let result = machine
+                .run_owned_with_hooks("Entry", &mut args, 0, false, &mut host)
+                .unwrap()
+                .into_call_value(Span::default(), "function")
+                .unwrap();
+            assert_eq!(s9_owner(&result, PAYLOAD).unwrap().error.is_some(), error);
+            assert!(args.is_empty() && args.capacity() == 0);
+            assert_eq!(host.call_depth, 0);
+            s9_drained(&machine);
+        }
+    }
+}

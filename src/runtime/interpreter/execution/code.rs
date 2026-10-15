@@ -48,6 +48,7 @@ pub(super) struct CodeParam {
     pub(super) view_string: bool,
     // Exact private slot metadata; an actual Result must never identify its own declaration.
     pub(super) scalar_result: Option<PrimitiveResultKind>,
+    pub(super) string_result: bool,
     // Only the strict Result-parameter role records exact primitive companion kinds.
     pub(super) scalar_primitive: Option<PrimitiveResultKind>,
 }
@@ -253,6 +254,36 @@ pub(super) fn admit_owned_scalar_result_parameter_named(
 ) -> Admission<()> {
     Eligibility::new(source, None, limits)
         .check(FunctionSpec::owned_scalar_result_parameter_named(entry))
+}
+
+pub(super) fn admit_owned_string_result_parameter_named(
+    source: &HashMap<String, FnDecl>,
+    entry: &FnDecl,
+    limits: Limits,
+) -> Admission<()> {
+    Eligibility::new(source, None, limits)
+        .check(FunctionSpec::owned_string_result_parameter_named(entry))
+}
+
+pub(super) fn single_owned_string_result_parameter(function: &FnDecl) -> bool {
+    if function.is_async
+        || !function.type_params.is_empty()
+        || !string_result_type(&function.return_type)
+    {
+        return false;
+    }
+    let mut results = 0usize;
+    for param in &function.params {
+        if param.mode != ParamMode::Owned {
+            return false;
+        }
+        if string_result_type(&param.ty) {
+            results += 1;
+        } else if primitive_type_kind(&param.ty).is_none() {
+            return false;
+        }
+    }
+    results == 1
 }
 
 pub(super) fn admit_claimed_async_owned_scalar_result_parameter_entry(
@@ -475,6 +506,16 @@ impl CodeHandle {
         ))
     }
 
+    pub(super) fn compile_owned_string_result_parameter_named(
+        source: &HashMap<String, FnDecl>,
+        entry: &FnDecl,
+        limits: Limits,
+    ) -> Admission<Self> {
+        Builder::new(source, None, limits).compile(Some(
+            FunctionSpec::owned_string_result_parameter_named(entry),
+        ))
+    }
+
     pub(super) fn compile_claimed_async_owned_scalar_result_parameter_entry(
         source: &HashMap<String, FnDecl>,
         entry: &FnDecl,
@@ -603,6 +644,16 @@ impl CodeHandle {
                     | ResultContract::OwnedAsyncScalarParameter(_)
             )
         })
+    }
+
+    pub(super) fn has_owned_string_result_parameters(&self) -> bool {
+        self.0.functions.as_slice().first().is_some_and(|function| {
+            function.result_contract == ResultContract::OwnedStringParameter
+        })
+    }
+
+    pub(super) fn has_owned_result_parameters(&self) -> bool {
+        self.has_owned_scalar_result_parameters() || self.has_owned_string_result_parameters()
     }
 
     pub(super) fn uses_local_string_results(&self, id: FnId) -> bool {
@@ -738,6 +789,7 @@ enum FunctionRole {
     OwnedLocalResultStringNamed,
     OwnedScalarResultNamed,
     OwnedScalarResultParameterNamed,
+    OwnedStringResultParameterNamed,
     ClaimedAsyncOwnedScalarResultParameterRoot,
     AsyncOwnedScalarResultParameterDependency,
     BorrowedStringNamed,
@@ -772,6 +824,7 @@ enum ResultContract {
     OwnedScalar,
     OwnedScalarParameter(PrimitiveResultKind),
     OwnedAsyncScalarParameter(PrimitiveResultKind),
+    OwnedStringParameter,
     OwnedString,
     OwnedStringLocals,
     OwnedStringAwaitLocals,
@@ -896,6 +949,28 @@ impl<'a> FunctionSpec<'a> {
         spec
     }
 
+    fn owned_string_result_parameter_named(function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        spec.role = FunctionRole::OwnedStringResultParameterNamed;
+        spec
+    }
+
+    fn owns_string_result_parameters(self) -> bool {
+        matches!(self.role, FunctionRole::OwnedStringResultParameterNamed)
+    }
+
+    fn owns_result_parameters(self) -> bool {
+        self.owns_scalar_result_parameters() || self.owns_string_result_parameters()
+    }
+
+    fn string_result_parameter_dependency(self, function: &'a FnDecl) -> Admission<Self> {
+        if single_owned_string_result_parameter(function) {
+            Ok(Self::owned_string_result_parameter_named(function))
+        } else {
+            Err(AdmissionError::Unsupported(function.span))
+        }
+    }
+
     fn claimed_async_owned_scalar_result_parameter_entry(function: &'a FnDecl) -> Self {
         let mut spec = Self::named(function);
         spec.role = FunctionRole::ClaimedAsyncOwnedScalarResultParameterRoot;
@@ -981,6 +1056,7 @@ impl<'a> FunctionSpec<'a> {
             self.role,
             FunctionRole::OwnedResultStringNamed
                 | FunctionRole::OwnedLocalResultStringNamed
+                | FunctionRole::OwnedStringResultParameterNamed
                 | FunctionRole::ClaimedAsyncOwnedResultStringRoot
                 | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
                 | FunctionRole::ClaimedAsyncAwaitLocalResultStringRoot
@@ -1051,7 +1127,9 @@ impl<'a> FunctionSpec<'a> {
         let primitive = self
             .declaration
             .and_then(|function| primitive_result_kind(&function.return_type));
-        let result = if self.owns_async_scalar_result_parameters() {
+        let result = if self.owns_string_result_parameters() {
+            ResultContract::OwnedStringParameter
+        } else if self.owns_async_scalar_result_parameters() {
             ResultContract::OwnedAsyncScalarParameter(
                 primitive.expect("validated owned async Result parameter"),
             )
@@ -1293,6 +1371,9 @@ impl<'a> FunctionSpec<'a> {
 
     fn parameter_kind(self, param: &Param) -> Admission<ValueKind> {
         if param.mode == ParamMode::Owned {
+            if self.owns_string_result_parameters() && string_result_type(&param.ty) {
+                return Ok(ValueKind::ResultString);
+            }
             if self.owns_scalar_result_parameters() {
                 if let Some(kind) = primitive_result_kind(&param.ty) {
                     if self.owned_scalar_result_kind() == Some(kind) {
@@ -1364,6 +1445,9 @@ impl<'a> FunctionSpec<'a> {
             }
             FunctionRole::OwnedScalarResultNamed => {
                 !function.is_async && scalar_result_type(&function.return_type)
+            }
+            FunctionRole::OwnedStringResultParameterNamed => {
+                single_owned_string_result_parameter(function)
             }
             FunctionRole::OwnedScalarResultParameterNamed => {
                 single_owned_scalar_result_parameter_kind(function).is_some()
@@ -2211,6 +2295,8 @@ impl<'a> Builder<'a> {
                     span: span_id,
                     owned_string: kind == ValueKind::String,
                     view_string: kind == ValueKind::ViewString,
+                    string_result: spec.owns_string_result_parameters()
+                        && kind == ValueKind::ResultString,
                     scalar_result: if spec.owns_scalar_result_parameters() {
                         match kind {
                             ValueKind::ScalarResult(kind) => Some(kind),
@@ -2219,7 +2305,7 @@ impl<'a> Builder<'a> {
                     } else {
                         None
                     },
-                    scalar_primitive: if spec.owns_scalar_result_parameters() {
+                    scalar_primitive: if spec.owns_result_parameters() {
                         match spec.params {
                             Parameters::Named(params) => primitive_type_kind(&params[index].ty),
                             Parameters::Local(_) => None,
@@ -2348,7 +2434,10 @@ impl<'a> Builder<'a> {
                             ValueKind::String | ValueKind::ViewString => {
                                 return Err(AdmissionError::Unsupported(expr.span))
                             }
-                            ValueKind::ResultString if spec.stores_string_result() => {
+                            ValueKind::ResultString
+                                if spec.stores_string_result()
+                                    || spec.owns_string_result_parameters() =>
+                            {
                                 ExprCode::VariableSelectedStringResultClone(symbol)
                             }
                             ValueKind::ScalarResult(kind) if spec.stores_scalar_result() => {
@@ -2545,7 +2634,9 @@ impl<'a> Builder<'a> {
                                 .source
                                 .get(name)
                                 .ok_or(AdmissionError::Unsupported(callee.span))?;
-                            self.ensure_function(if spec.owns_scalar_result_parameters() {
+                            self.ensure_function(if spec.owns_string_result_parameters() {
+                                spec.string_result_parameter_dependency(function)?
+                            } else if spec.owns_scalar_result_parameters() {
                                 if spec.owns_async_scalar_result_parameters() {
                                     spec.scalar_result_parameter_dependency_with_mode(
                                         function,
@@ -2571,7 +2662,7 @@ impl<'a> Builder<'a> {
                             })?
                         };
                         for (index, arg) in args.iter().enumerate() {
-                            let expected = if spec.owns_scalar_result_parameters() {
+                            let expected = if spec.owns_result_parameters() {
                                 let declaration =
                                     self.source.get(name).expect("validated Result callee");
                                 let param = declaration
@@ -2600,7 +2691,7 @@ impl<'a> Builder<'a> {
                             };
                             expect_kind(self.kind(arg)?, expected, arg.span)?;
                         }
-                        if (spec.owns_strings() || spec.owns_scalar_result_parameters())
+                        if (spec.owns_strings() || spec.owns_result_parameters())
                             && args.len()
                                 != self
                                     .source
@@ -3494,7 +3585,10 @@ impl<'a> Eligibility<'a> {
                             }
                             self.free(name, expr.span)?;
                             let kind = self.kind(expr)?;
-                            if kind == ValueKind::ResultString && spec.stores_string_result() {
+                            if kind == ValueKind::ResultString
+                                && (spec.stores_string_result()
+                                    || spec.owns_string_result_parameters())
+                            {
                                 continue;
                             }
                             if let ValueKind::ScalarResult(kind) = kind {
@@ -3649,7 +3743,9 @@ impl<'a> Eligibility<'a> {
                                     .source
                                     .get(name)
                                     .ok_or(AdmissionError::Unsupported(callee.span))?;
-                                self.function(if spec.owns_scalar_result_parameters() {
+                                self.function(if spec.owns_string_result_parameters() {
+                                    spec.string_result_parameter_dependency(function)?
+                                } else if spec.owns_scalar_result_parameters() {
                                     if spec.owns_async_scalar_result_parameters() {
                                         spec.scalar_result_parameter_dependency_with_mode(
                                             function,
@@ -3675,7 +3771,7 @@ impl<'a> Eligibility<'a> {
                                 })?;
                             }
                             for (index, arg) in args.iter().enumerate() {
-                                let expected = if spec.owns_scalar_result_parameters() {
+                                let expected = if spec.owns_result_parameters() {
                                     let declaration =
                                         self.source.get(name).expect("validated Result callee");
                                     let param = declaration
@@ -3704,7 +3800,7 @@ impl<'a> Eligibility<'a> {
                                 };
                                 expect_kind(self.kind(arg)?, expected, arg.span)?;
                             }
-                            if (spec.owns_strings() || spec.owns_scalar_result_parameters())
+                            if (spec.owns_strings() || spec.owns_result_parameters())
                                 && args.len()
                                     != self
                                         .source

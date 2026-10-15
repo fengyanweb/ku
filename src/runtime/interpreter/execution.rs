@@ -711,16 +711,17 @@ fn selected_string_leaf(value: &Value) -> Option<&String> {
 fn selected_string_owner(
     mut census: StringOwnerCensus,
     value: &Value,
-    original: OriginalString,
+    original: Option<OriginalString>,
 ) -> StringOwnerCensus {
     let Some(text) = selected_string_leaf(value) else {
         return census;
     };
-    if original.still_live
-        && original.capacity != 0
-        && text.as_ptr() as usize == original.pointer
-        && text.capacity() == original.capacity
-    {
+    if original.is_some_and(|original| {
+        original.still_live
+            && original.capacity != 0
+            && text.as_ptr() as usize == original.pointer
+            && text.capacity() == original.capacity
+    }) {
         census.original_seen = true;
     } else {
         census.cloned_bytes = census
@@ -808,6 +809,9 @@ struct Machine {
     // fixed-size subtotal owns no payload and allocates no backing. It covers
     // suspended call Envs, excluding the current real frame.
     frozen_result_ancestor_charge: AwaitPayloadCharge,
+    // Strict String Result parameters have no origin credit. This fixed-size
+    // subtotal retains only actual bare/success String buffer capacities.
+    frozen_string_ancestor_bytes: usize,
     result_ancestor_census_authorized: bool,
     // A replacement hook may retain cells beyond its dispatch. Once exposed,
     // this Machine never re-enables the cache, including across run reuse.
@@ -1134,8 +1138,28 @@ fn scalar_result_parameter_charge(
     }
 }
 
+fn string_result_parameter_charge(value: &Value, span: Span) -> KuResult<AwaitPayloadCharge> {
+    let Value::Result { ok, value: inner } = value else {
+        return Err(unsupported(span));
+    };
+    if *ok {
+        let Value::String(text) = inner.as_ref() else {
+            return Err(unsupported(span));
+        };
+        // Observe the wrapper only. Its real buffer is admitted separately
+        // in the same compound budget before the original Vec moves.
+        AwaitPayloadCharge::for_value(value, text.capacity())
+            .map_err(|error| error.into_error(span))
+    } else {
+        AwaitPayloadCharge::error_object(inner).map_err(|error| error.into_error(span))
+    }
+}
+
 fn owned_parameter_value(param: code::CodeParam, value: &mut Value, span: Span) -> KuResult<Value> {
-    if let Some(kind) = param.scalar_result {
+    if param.string_result {
+        string_result_parameter_charge(value, span)?;
+        Ok(std::mem::replace(value, Value::Null))
+    } else if let Some(kind) = param.scalar_result {
         scalar_result_parameter_charge(value, kind, span)?;
         Ok(std::mem::replace(value, Value::Null))
     } else if let Some(kind) = param.scalar_primitive {
@@ -1273,6 +1297,7 @@ impl Machine {
             await_string_payload_escrow: AwaitStringPayloadCharge::default(),
             selected_error_payloads: false,
             frozen_result_ancestor_charge: AwaitPayloadCharge::default(),
+            frozen_string_ancestor_bytes: 0,
             result_ancestor_census_authorized: false,
             result_ancestor_census_untrusted: false,
             lease_capacity: 0,
@@ -1291,6 +1316,39 @@ impl Machine {
             frame.env.selected_string_result_charge()
         } else {
             frame.env.selected_scalar_result_charge()
+        }
+    }
+
+    fn selected_frame_string_bytes(frame: &CallFrame) -> usize {
+        if !frame.may_have_string_owner_bindings {
+            return 0;
+        }
+        frame.env.fold_owned_values(0usize, |bytes, value| {
+            bytes
+                .checked_add(selected_string_leaf(value).map_or(0, String::capacity))
+                .expect("admitted selected String ancestor backing")
+        })
+    }
+
+    fn adjust_string_ancestor_bytes(
+        authorized: &mut bool,
+        ancestors: &mut usize,
+        bytes: usize,
+        add: bool,
+    ) {
+        if !*authorized {
+            return;
+        }
+        let updated = if add {
+            ancestors.checked_add(bytes)
+        } else {
+            ancestors.checked_sub(bytes)
+        };
+        if let Some(updated) = updated {
+            *ancestors = updated;
+        } else {
+            *authorized = false;
+            *ancestors = 0;
         }
     }
 
@@ -1331,7 +1389,7 @@ impl Machine {
     }
 
     fn authorize_result_ancestor_census(&mut self, fixed_hooks: bool) {
-        if !self.code.has_owned_scalar_result_parameters() {
+        if !self.code.has_owned_result_parameters() {
             return;
         }
         if !fixed_hooks {
@@ -1342,6 +1400,7 @@ impl Machine {
         if self.result_ancestor_census_untrusted {
             self.result_ancestor_census_authorized = false;
             self.frozen_result_ancestor_charge = AwaitPayloadCharge::default();
+            self.frozen_string_ancestor_bytes = 0;
             return;
         }
         if self.result_ancestor_census_authorized {
@@ -1349,6 +1408,7 @@ impl Machine {
         }
         self.result_ancestor_census_authorized = true;
         self.frozen_result_ancestor_charge = AwaitPayloadCharge::default();
+        self.frozen_string_ancestor_bytes = 0;
         // A fresh Machine has encountered only fixed hooks. Read any actual
         // live ancestors before the first authorized dispatch; no old cache
         // can cross an arbitrary hook or a previously completed run.
@@ -1360,6 +1420,12 @@ impl Machine {
                 Self::selected_frame_result_charge(frame),
                 true,
             );
+            Self::adjust_string_ancestor_bytes(
+                &mut self.result_ancestor_census_authorized,
+                &mut self.frozen_string_ancestor_bytes,
+                Self::selected_frame_string_bytes(frame),
+                true,
+            );
         }
     }
 
@@ -1367,6 +1433,7 @@ impl Machine {
         resources: &mut MachineResources,
         authorized: &mut bool,
         ancestors: &mut AwaitPayloadCharge,
+        string_ancestors: &mut usize,
     ) -> Option<CallFrame> {
         if *authorized {
             // The child is still physically owned here. The unchanged parent
@@ -1379,7 +1446,15 @@ impl Machine {
                 .and_then(|index| resources.calls.get(index))
                 .map(Self::selected_frame_result_charge)
                 .unwrap_or_default();
+            let parent_strings = resources
+                .calls
+                .len()
+                .checked_sub(2)
+                .and_then(|index| resources.calls.get(index))
+                .map(Self::selected_frame_string_bytes)
+                .unwrap_or_default();
             Self::adjust_result_ancestor_charge(authorized, ancestors, parent_charge, false);
+            Self::adjust_string_ancestor_bytes(authorized, string_ancestors, parent_strings, false);
         }
         resources.calls.pop()
     }
@@ -2245,8 +2320,10 @@ impl Machine {
                             .with_read(span, |root| Ok(matches!(root, Value::String(_))))
                             .unwrap_or(false) => {}
                 Value::Result { .. }
-                    if self.code.has_owned_scalar_result_parameters()
-                        && AwaitPayloadCharge::for_value(value, 0).is_ok() => {}
+                    if (self.code.has_owned_scalar_result_parameters()
+                        && AwaitPayloadCharge::for_value(value, 0).is_ok())
+                        || (self.code.has_owned_string_result_parameters()
+                            && string_result_parameter_charge(value, span).is_ok()) => {}
                 Value::Task(_) => {
                     count = count
                         .checked_add(1)
@@ -2511,6 +2588,7 @@ impl Machine {
                     self.resources.as_mut().expect("live prefix"),
                     &mut self.result_ancestor_census_authorized,
                     &mut self.frozen_result_ancestor_charge,
+                    &mut self.frozen_string_ancestor_bytes,
                 )
                 .expect("real rejected call frame");
                 let lease_capacity = frame.charged_lease_capacity;
@@ -2577,6 +2655,7 @@ impl Machine {
                     self.resources.as_mut().expect("live prefix"),
                     &mut self.result_ancestor_census_authorized,
                     &mut self.frozen_result_ancestor_charge,
+                    &mut self.frozen_string_ancestor_bytes,
                 )
                 .expect("real legacy call frame");
                 self.discard_values_after(frame.value_base);
@@ -2973,6 +3052,7 @@ impl Machine {
                             self.resources.as_mut().expect("live prefix"),
                             &mut self.result_ancestor_census_authorized,
                             &mut self.frozen_result_ancestor_charge,
+                            &mut self.frozen_string_ancestor_bytes,
                         )
                         .expect("completed real call frame");
                         assert!(frame.leases.is_empty());
@@ -3083,6 +3163,15 @@ impl Machine {
         } else {
             AwaitPayloadCharge::default()
         };
+        let parent_string_bytes = if self.result_ancestor_census_authorized {
+            self.calls
+                .as_slice()
+                .last()
+                .map(Self::selected_frame_string_bytes)
+                .unwrap_or_default()
+        } else {
+            0
+        };
         push(
             &mut self.calls,
             CallFrame {
@@ -3105,6 +3194,12 @@ impl Machine {
             &mut self.result_ancestor_census_authorized,
             &mut self.frozen_result_ancestor_charge,
             parent_result_charge,
+            true,
+        );
+        Self::adjust_string_ancestor_bytes(
+            &mut self.result_ancestor_census_authorized,
+            &mut self.frozen_string_ancestor_bytes,
+            parent_string_bytes,
             true,
         );
         self.call_depth += 1;
@@ -3148,7 +3243,7 @@ impl Machine {
         args: &[Value],
         span: Span,
     ) -> KuResult<AwaitPayloadCharge> {
-        if !self.code.has_owned_scalar_result_parameters() {
+        if !self.code.has_owned_result_parameters() {
             return Ok(AwaitPayloadCharge::default());
         }
         if function.arity() != args.len() {
@@ -3157,7 +3252,9 @@ impl Machine {
         let mut charge = AwaitPayloadCharge::default();
         for (index, value) in args.iter().enumerate() {
             let param = self.code.parameter(function, index);
-            if let Some(kind) = param.scalar_result {
+            if param.string_result {
+                charge = sum_payload_charge(charge, string_result_parameter_charge(value, span)?);
+            } else if let Some(kind) = param.scalar_result {
                 charge =
                     sum_payload_charge(charge, scalar_result_parameter_charge(value, kind, span)?);
             } else if !param
@@ -3192,11 +3289,18 @@ impl Machine {
                 owned_parameter_value(param, value, span)?
             };
             let param_span = self.code.span(param.span);
-            if param.scalar_result.is_some() {
+            if param.scalar_result.is_some() || param.string_result {
                 self.selected_error_payloads = true;
                 self.frame().has_selected_result_bindings = true;
             }
-            if self.original_string.is_some() && selected_string_leaf(&value).is_some() {
+            if param.string_result {
+                // False entry independently activates the String Result Env
+                // classifier; no successful input or origin is required.
+                self.frame().has_selected_string_result_bindings = true;
+            }
+            if (self.original_string.is_some() || self.code.has_owned_string_result_parameters())
+                && selected_string_leaf(&value).is_some()
+            {
                 self.frame().may_have_string_owner_bindings = true;
             }
             self.frame()
@@ -3243,11 +3347,18 @@ impl Machine {
                 )?
             };
             let param_span = self.code.span(param.span);
-            if param.scalar_result.is_some() {
+            if param.scalar_result.is_some() || param.string_result {
                 self.selected_error_payloads = true;
                 self.frame().has_selected_result_bindings = true;
             }
-            if self.original_string.is_some() && selected_string_leaf(&value).is_some() {
+            if param.string_result {
+                // False entry independently activates the String Result Env
+                // classifier; no successful input or origin is required.
+                self.frame().has_selected_string_result_bindings = true;
+            }
+            if (self.original_string.is_some() || self.code.has_owned_string_result_parameters())
+                && selected_string_leaf(&value).is_some()
+            {
                 self.frame().may_have_string_owner_bindings = true;
             }
             self.frame()
@@ -3844,7 +3955,10 @@ impl Machine {
             }
             Work::Bind(name, mutable, declare, span_id) => {
                 let value = self.value();
-                if self.original_string.is_some() && selected_string_leaf(&value).is_some() {
+                if (self.original_string.is_some()
+                    || self.code.has_owned_string_result_parameters())
+                    && selected_string_leaf(&value).is_some()
+                {
                     self.frame().may_have_string_owner_bindings = true;
                 }
                 if matches!(value, Value::Result { .. }) {
@@ -3852,7 +3966,8 @@ impl Machine {
                     // Keep the census active even after operand fees retire.
                     self.selected_error_payloads = true;
                     self.frame().has_selected_result_bindings = true;
-                    if self.original_string.is_some()
+                    if (self.original_string.is_some()
+                        || self.code.has_owned_string_result_parameters())
                         && matches!(&value, Value::Result { ok: true, value }
                             if matches!(value.as_ref(), Value::String(_)))
                     {
@@ -4588,6 +4703,7 @@ impl Machine {
             || self.error_leaf_capacity != 0
             || self.error_leaf_bytes != 0
             || self.frozen_result_ancestor_charge != AwaitPayloadCharge::default()
+            || self.frozen_string_ancestor_bytes != 0
             || self.result_ancestor_census_authorized
             || self.await_payload_snapshot != AwaitPayloadCharge::default()
             || self.await_payload_escrow != AwaitPayloadCharge::default()
@@ -4669,7 +4785,8 @@ impl Machine {
             if selected_strings && !self.code.uses_local_string_results(function) {
                 return Err(unsupported(span));
             }
-            let selected_parameters = self.code.has_owned_scalar_result_parameters();
+            let selected_parameters = self.code.has_owned_result_parameters();
+            let string_parameters = self.code.has_owned_string_result_parameters();
             let input_charge =
                 self.check_scalar_result_parameters(self.code.function(function), args, span)?;
             let mut original_string = None;
@@ -4701,7 +4818,16 @@ impl Machine {
                             .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
                     }
                     Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => {}
-                    Value::Result { .. } if selected_parameters => {}
+                    Value::Result { .. } if selected_parameters => {
+                        if string_parameters {
+                            if let Some(text) = selected_string_leaf(value) {
+                                payload =
+                                    payload.checked_add(text.capacity()).ok_or_else(|| {
+                                        storage_error(ReserveError::ArithmeticOverflow, span)
+                                    })?;
+                            }
+                        }
+                    }
                     _ => return Err(unsupported(span)),
                 }
             }
@@ -4710,7 +4836,11 @@ impl Machine {
             }
             // Include the original input Vec's actual capacity and all String
             // buffer capacity before transferring either into the Machine.
-            self.string_payload_bytes = payload;
+            if string_parameters {
+                self.cloned_string_payload_bytes = payload;
+            } else {
+                self.string_payload_bytes = payload;
+            }
             let previous = AwaitPayloadCharge {
                 box_count: self.result_wrapper_capacity,
                 box_bytes: self.result_wrapper_bytes,
@@ -4726,6 +4856,9 @@ impl Machine {
             }
             if let Err(error) = self.check_argument_capacity(args.capacity(), span) {
                 self.string_payload_bytes = 0;
+                if string_parameters {
+                    self.cloned_string_payload_bytes = 0;
+                }
                 self.restore_error_candidate(previous);
                 return Err(error);
             }
@@ -4738,7 +4871,12 @@ impl Machine {
             self.argument_capacity += capacity;
             self.argument_bytes += capacity * std::mem::size_of::<Value>();
             self.peak_argument_bytes = self.peak_argument_bytes.max(self.argument_bytes);
-            self.peak_string_payload_bytes = self.peak_string_payload_bytes.max(payload);
+            if string_parameters {
+                self.peak_cloned_string_payload_bytes =
+                    self.peak_cloned_string_payload_bytes.max(payload);
+            } else {
+                self.peak_string_payload_bytes = self.peak_string_payload_bytes.max(payload);
+            }
             self.entry_args = Some(std::mem::take(args));
             let count = self
                 .entry_args
@@ -5044,6 +5182,7 @@ impl Machine {
         // The original calls.len() == 0 assertion above proves no Env remains.
         // Clear metadata without a new fallible operation during completion.
         self.frozen_result_ancestor_charge = AwaitPayloadCharge::default();
+        self.frozen_string_ancestor_bytes = 0;
         self.result_ancestor_census_authorized = false;
         self.await_payload_snapshot = AwaitPayloadCharge::default();
         self.await_payload_escrow = AwaitPayloadCharge::default();
@@ -5107,16 +5246,24 @@ impl Machine {
     }
 
     fn synchronize_cloned_string_charge(&mut self) {
-        let Some(mut original) = self.original_string else {
+        let original = self.original_string;
+        let string_parameters = self.code.has_owned_string_result_parameters();
+        if original.is_none() && !string_parameters {
             return;
-        };
+        }
         // The selected graph has no captured Owned String/Result or borrow.
         // A submitted child removes the parent's origin permanently. A later
         // await success pays full real capacity, including a returned original.
         // Env folds copy metadata only, under one binding lock at a time.
         let fold = |census, value: &Value| selected_string_owner(census, value, original);
         let mut census = StringOwnerCensus::default();
-        for index in 0..self.calls.len() {
+        let first = if string_parameters && self.result_ancestor_census_authorized {
+            census.cloned_bytes = self.frozen_string_ancestor_bytes;
+            self.calls.len().saturating_sub(1)
+        } else {
+            0
+        };
+        for index in first..self.calls.len() {
             let frame = self.calls.get_mut(index).expect("live String owner frame");
             if frame.may_have_string_owner_bindings {
                 let (actual, has_string) =
@@ -5177,8 +5324,10 @@ impl Machine {
         // new successful buffer allocation is the clone continuation above,
         // whose immediately preceding census proves the source is alive.
         // Allocation inside arbitrary replacement hooks is not admitted.
-        original.still_live &= census.original_seen;
-        self.original_string = Some(original);
+        if let Some(mut original) = original {
+            original.still_live &= census.original_seen;
+            self.original_string = Some(original);
+        }
         let ephemeral = self.live_await_string_payload_charge();
         self.cloned_string_payload_bytes = census
             .cloned_bytes
@@ -5260,7 +5409,7 @@ impl Machine {
         for value in self.values.as_slice() {
             retained = sum_payload_charge(retained, value_charge(value));
         }
-        if self.original_string.is_some() || self.code.has_owned_scalar_result_parameters() {
+        if self.original_string.is_some() || self.code.has_owned_result_parameters() {
             if let Some(args) = &self.entry_args {
                 for value in args {
                     retained = sum_payload_charge(retained, value_charge(value));
@@ -5281,7 +5430,7 @@ impl Machine {
             if let Some(result) = exit.state.outcome() {
                 retained = sum_payload_charge(retained, flow_charge(result));
             }
-            if self.original_string.is_some() || self.code.has_owned_scalar_result_parameters() {
+            if self.original_string.is_some() || self.code.has_owned_result_parameters() {
                 if let ExitCompletion::Arguments { frame, .. } = &exit.completion {
                     for value in &frame.staged {
                         retained = sum_payload_charge(retained, value_charge(value));
@@ -5387,6 +5536,45 @@ fn try_execute_owned_scalar_result_parameter(
     Some(machine.run_owned_with_hooks(&function.name, args, depth, false, interpreter))
 }
 
+fn try_execute_owned_string_result_parameter(
+    interpreter: &mut Interpreter,
+    function: &FnDecl,
+    args: &mut Vec<Value>,
+    depth: usize,
+) -> Option<KuResult<Flow>> {
+    // Inspect every original position before transfer. Unsupported source is
+    // whole legacy; a resource rejection never replays the function body.
+    if args.len() != function.params.len()
+        || args.iter().zip(&function.params).any(|(value, param)| {
+            if matches!(&param.ty, Some(TypeName::Result(inner))
+                if matches!(inner.as_ref(), TypeName::String))
+            {
+                string_result_parameter_charge(value, function.span).is_err()
+            } else {
+                !code::primitive_type_kind(&param.ty)
+                    .is_some_and(|kind| primitive_result_payload_matches(value, kind))
+            }
+        })
+    {
+        return None;
+    }
+    let source = interpreter.functions.clone();
+    let limits = Limits::default();
+    match code::admit_owned_string_result_parameter_named(&source, function, limits) {
+        Ok(()) => {}
+        Err(AdmissionError::Unsupported(_)) => return None,
+        Err(error @ AdmissionError::Rejected(_)) => return Some(Err(error.into_error())),
+    }
+    let code =
+        match CodeHandle::compile_owned_string_result_parameter_named(&source, function, limits) {
+            Ok(code) => code,
+            Err(AdmissionError::Unsupported(_)) => return None,
+            Err(error @ AdmissionError::Rejected(_)) => return Some(Err(error.into_error())),
+        };
+    let mut machine = Machine::from_code(code, limits, interpreter.call_depth);
+    Some(machine.run_owned_with_hooks(&function.name, args, depth, false, interpreter))
+}
+
 pub(super) fn try_execute_owned(
     interpreter: &mut Interpreter,
     function: &FnDecl,
@@ -5395,6 +5583,9 @@ pub(super) fn try_execute_owned(
 ) -> Option<KuResult<Flow>> {
     if code::single_owned_scalar_result_parameter_kind(function).is_some() {
         return try_execute_owned_scalar_result_parameter(interpreter, function, args, depth);
+    }
+    if code::single_owned_string_result_parameter(function) {
+        return try_execute_owned_string_result_parameter(interpreter, function, args, depth);
     }
     if !args.iter().any(|value| matches!(value, Value::String(_))) {
         return None;
@@ -6352,6 +6543,7 @@ impl Drop for Machine {
         // physical teardown and first-panic boundary below unchanged.
         self.result_ancestor_census_authorized = false;
         self.frozen_result_ancestor_charge = AwaitPayloadCharge::default();
+        self.frozen_string_ancestor_bytes = 0;
         // The same original prefix order is preserved by Rust's drop glue:
         // code, captures, calls, work, values. No user payload is cloned.
         let mut release = merge_release_context(
