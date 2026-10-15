@@ -595,7 +595,9 @@ def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.Complet
         if errors.attempt("Job drain", lambda: windows_job.wait_empty(deadline)) is not True:
             errors.add("Job drain not confirmed")
         errors.attempt("Job close", windows_job.close)
-    errors.attempt("root wait", lambda: process.wait(timeout=max(0.0, deadline - time.monotonic())))
+    errors.attempt("root wait", lambda: process.wait(timeout=min(
+        PROCESS_CLEANUP_TIMEOUT_SECONDS, max(0.0, deadline - time.monotonic()),
+    )))
     for index, stream in enumerate(streams):
         reader = readers[index][1] if index < len(readers) else None
         started = readers[index][2] if index < len(readers) else False
@@ -607,7 +609,9 @@ def run_bounded(command: list[str], cwd: Path, label: str) -> subprocess.Complet
                 continue
         if reader is not None and started:
             def join_reader() -> bool:
-                reader.join(timeout=max(0.0, deadline - time.monotonic()))
+                reader.join(timeout=min(
+                    PROCESS_CLEANUP_TIMEOUT_SECONDS, max(0.0, deadline - time.monotonic()),
+                ))
                 return True
             joined = errors.attempt(f"output {index} reader join", join_reader) is True
             if not joined:

@@ -1083,6 +1083,9 @@ class PgFixtureTests(unittest.TestCase):
         inputs.record.open.assert_not_called()
 
     def test_pg_failed_setup_retains_actual_job_owner_without_resuming(self) -> None:
+        # Equal monotonic readings can round (start + 5) - start above five.
+        cleanup_started = 251.1
+        self.assertGreater((cleanup_started + 5) - cleanup_started, 5)
         for failure in (None, "terminate", "wait_empty", "close"):
             with self.subTest(failure=failure):
                 inputs = self.startup_inputs()
@@ -1098,18 +1101,20 @@ class PgFixtureTests(unittest.TestCase):
                      patch.object(FIXTURE.subprocess, "Popen", return_value=process), \
                      patch.object(FIXTURE.BOUNDS.WindowsJob, "attach", side_effect=primary), \
                      patch.object(FIXTURE.BOUNDS, "resume_suspended_windows_process") as resume, \
+                     patch.object(FIXTURE.time, "monotonic", side_effect=[cleanup_started, cleanup_started]), \
                      self.assertRaisesRegex(RuntimeError, "Windows Job setup failed"):
                     FIXTURE.verify(inputs.args)
                 resume.assert_not_called()
                 inputs.run.assert_not_called()
                 inputs.tree.assert_called_once_with(process, job)
                 job.terminate.assert_called_once_with()
-                job.wait_empty.assert_called_once()
+                job.wait_empty.assert_called_once_with(cleanup_started + 5)
                 job.close.assert_called_once_with()
                 process.kill.assert_called_once_with()
                 self.assertEqual(1, process.wait.call_count)
                 self.assertGreater(process.wait.call_args.kwargs["timeout"], 0)
                 self.assertLessEqual(process.wait.call_args.kwargs["timeout"], 5)
+                self.assertEqual(5.0, process.wait.call_args.kwargs["timeout"])
                 inputs.numeric.assert_not_called()
                 inputs.record.open.assert_not_called()
 

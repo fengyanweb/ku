@@ -476,7 +476,7 @@ def verify_owned(args: argparse.Namespace, root: Path, owned: FixtureOperation) 
             cleanup.attempt("PostgreSQL Job close", windows_job.close)
         if process is not None:
             cleanup.attempt("PostgreSQL root wait", lambda: process.wait(
-                timeout=max(0.0, cleanup_deadline - time.monotonic()),
+                timeout=min(5.0, max(0.0, cleanup_deadline - time.monotonic())),
             ))
         if cleanup.attempt("PostgreSQL final PID check", lambda: present(root / "data" / "postmaster.pid")):
             cleanup.add("PostgreSQL shutdown was not confirmed; preserve fixture for investigation")

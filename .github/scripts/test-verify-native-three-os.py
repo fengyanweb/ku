@@ -818,12 +818,21 @@ class BoundedProcessTests(unittest.TestCase):
             run.process.stderr.close.assert_called_once_with()
 
     def test_cleanup_wait_and_both_joins_share_one_deadline(self) -> None:
-        with self.inert_runner() as run, \
-             mock.patch.object(VERIFIER.time, "monotonic", side_effect=[100.0, 100.0, 110.0, 110.0]):
-            VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "cleanup budget")
-        self.assertEqual(mock.call(timeout=10.0), run.process.wait.call_args_list[-1])
-        for reader in run.readers:
-            reader.join.assert_called_once_with(timeout=0.0)
+        # Equal readings can round the remaining budget above the original cap.
+        cleanup_started = 251.1
+        self.assertGreater((cleanup_started + 10) - cleanup_started, 10)
+        for readings, remaining in (
+            ([100.0, 100.0, 110.0, 110.0], [10.0, 0.0, 0.0]),
+            ([cleanup_started] * 4, [10.0, 10.0, 10.0]),
+        ):
+            with self.subTest(readings=readings), self.inert_runner() as run, \
+                 mock.patch.object(VERIFIER.time, "monotonic", side_effect=readings) as clock:
+                VERIFIER.run_bounded(["never executed"], SCRIPT.parent, "cleanup budget")
+            self.assertEqual(mock.call(timeout=remaining[0]), run.process.wait.call_args_list[-1])
+            for reader, timeout in zip(run.readers, remaining[1:]):
+                reader.join.assert_called_once_with(timeout=timeout)
+            run.job.wait_empty.assert_called_once_with(readings[0] + 10)
+            self.assertEqual(4, clock.call_count)
 
     def test_reader_termination_failure_cannot_be_erased_by_later_cleanup(self) -> None:
         with self.inert_runner() as run:
