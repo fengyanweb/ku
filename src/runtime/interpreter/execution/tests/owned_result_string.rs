@@ -8764,3 +8764,241 @@ fn string_result_parameter_compound_capacity_rejection_preserves_original_owners
         }
     }
 }
+
+#[test]
+fn flat_result_parameters_real_workers_keep_mixed_payloads_and_await_depth() {
+    let (_, test_name) = concat!(
+        module_path!(),
+        "::flat_result_parameters_real_workers_keep_mixed_payloads_and_await_depth"
+    )
+    .split_once("::")
+    .unwrap();
+    if !bounded_worker_child(test_name) {
+        return;
+    }
+    // These reconstruct the four recorded next-group cases by their public
+    // contract. Their former temporary source files were already removed.
+    for asynchronous in [false, true] {
+        for error in [false, true] {
+            let constructor = if error { "err" } else { "ok" };
+            let expected_error = if error { "true" } else { "false" };
+            let source = if asynchronous {
+                format!(
+                    "async fn Relay(text: str!, n: int): str! {{ if (n <= 0) {{ return text }}\n\
+                     return await Relay(text, n - 1) }}\n\
+                     async fn Worker(): str! {{ return await Relay({constructor}(\"owned payload\"), 127) }}"
+                )
+            } else {
+                format!(
+                    "fn Relay(number: int!, flag: bool!, text: str!, n: int): str! {{\n\
+                     if (n <= 0) {{ return text }}\nreturn Relay(number, flag, text, n - 1) }}\n\
+                     async fn Worker(): str! {{ return Relay(ok(7), ok(true), {constructor}(\"owned payload\"), 127) }}"
+                )
+            };
+            let source = format!(
+                "{source}\nasync fn main(): null! {{\n\
+                 seen = false\ntry {{ text = (await Worker())?\n\
+                 if ({expected_error} || text != \"owned payload\") {{ panic(\"unexpected successful payload\") }}\n\
+                 seen = true }} catch (e) {{\n\
+                 if (!{expected_error} || e.domain != \"ku\" || e.code != \"err\" || e.message != \"owned payload\") {{ panic(\"unexpected error payload\") }}\n\
+                 seen = true }}\nif (!seen) {{ panic(\"missing outcome\") }}\nreturn ok(null) }}"
+            );
+            crate::cli::run_source("flat-result-parameter-worker.ku", &source).unwrap();
+        }
+    }
+
+    // A sole worker gives these actual terminal await chains the same 64/65
+    // boundary as the existing async regressions; the observer never helps.
+    const SOURCE: &str = "async fn Entry(text: str!, n: int): str! { if (n <= 0) { return text }\nreturn await Entry(text, n - 1) }";
+    assert_eq!(crate::runtime::task::MAX_AWAIT_DEPTH, 64);
+    for error in [false, true] {
+        let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
+        let mut previous_worker = None;
+        for n in [64, 65, 0] {
+            let mut producer = production_interpreter(SOURCE);
+            producer.task_runtime = Some(runtime.clone());
+            let function = producer.functions["Entry"].clone();
+            let mut seed = production_interpreter(if error {
+                "fn Seed(): str! { return err(\"owned payload\") }"
+            } else {
+                "fn Seed(): str! { return ok(\"owned payload\") }"
+            });
+            let value = seed
+                .call_function("Seed", vec![], Span::default(), 0)
+                .unwrap();
+            let args = vec![value, Value::Int(n)];
+            let child_runtime = runtime.clone();
+            let (tx, rx) = mpsc::sync_channel(1);
+            let task = runtime
+                .spawn_runner_deferred(|| {
+                    let template = producer.template();
+                    move || {
+                        let mut host = Interpreter::from_template(template, child_runtime);
+                        host.async_execution = true;
+                        let inner = ClaimedNamedTask::new(host, function, args, Span::default());
+                        assert!(inner.machine.is_some() && inner.legacy.is_none());
+                        tx.send(std::thread::current().id()).unwrap();
+                        inner
+                    }
+                })
+                .unwrap();
+            let worker = rx.recv_timeout(S10_WAIT).unwrap();
+            assert_ne!(worker, std::thread::current().id());
+            if let Some(previous) = previous_worker {
+                assert_eq!(worker, previous);
+            }
+            previous_worker = Some(worker);
+            let result = s10_wait_result(&task).unwrap();
+            if n == 65 {
+                let Value::Result { ok: false, value } = result else {
+                    panic!("the first excessive await must return its existing error");
+                };
+                let Value::Object(fields) = *value else {
+                    panic!("the await depth failure must retain its ErrorObject");
+                };
+                assert!(
+                    matches!(fields.get("code"), Some(Value::String(code)) if code == "await_depth")
+                );
+            } else {
+                assert_eq!(
+                    s9_owner(&result, "owned payload").unwrap().error.is_some(),
+                    error
+                );
+            }
+            s10_retire(task, RuntimeTermination::new(TerminationReason::Cancelled));
+        }
+        s10_close(&runtime);
+    }
+    eprintln!("worker regression completed: {test_name}");
+}
+
+#[test]
+fn flat_result_parameters_compound_rejection_keeps_every_input_and_reuses_machine() {
+    const SOURCE: &str = "fn Entry(number: int!, flag: bool!, good: str!, bad: str!, bare: str, n: int): str! { return good }";
+    let source = functions(SOURCE);
+    let code = CodeHandle::compile_flat_owned_result_parameters(
+        &source,
+        &source["Entry"],
+        Limits::default(),
+    )
+    .unwrap();
+    for count_rejection in [false, true] {
+        let mut fields = HashMap::with_capacity(128);
+        for (name, text) in [("domain", "ku"), ("code", "err"), ("message", PAYLOAD)] {
+            let mut key = String::with_capacity(64);
+            key.push_str(name);
+            let (value, _) = string_input(text, 4096);
+            fields.insert(key, value);
+        }
+        let (good, _) = string_input(PAYLOAD, 4096);
+        let (bare, bare_buffer) = string_input(PAYLOAD, 2048);
+        let mut args = Vec::with_capacity(64);
+        args.extend([
+            Value::Result {
+                ok: true,
+                value: Box::new(Value::Int(7)),
+            },
+            Value::Result {
+                ok: true,
+                value: Box::new(Value::Bool(true)),
+            },
+            Value::Result {
+                ok: true,
+                value: Box::new(good),
+            },
+            Value::Result {
+                ok: false,
+                value: Box::new(Value::Object(fields)),
+            },
+            bare,
+            Value::Int(0),
+        ]);
+        let original_vec = (args.as_ptr(), args.capacity());
+        let scalar_boxes = args[..2]
+            .iter()
+            .map(|value| {
+                let Value::Result { value, .. } = value else {
+                    unreachable!()
+                };
+                value.as_ref() as *const Value as usize
+            })
+            .collect::<Vec<_>>();
+        let good = s9_owner(&args[2], PAYLOAD).unwrap();
+        let bad = s9_owner(&args[3], PAYLOAD).unwrap();
+        let error = bad.error.unwrap();
+        // Sum actual spare backing independently of production admission:
+        // four Boxes, one ErrorObject Map and six buffers, two String buffers.
+        let box_bytes = std::mem::size_of::<Value>();
+        let count = args.capacity() + 4 + error.count;
+        let bytes = args.capacity() * box_bytes
+            + 4 * box_bytes
+            + error.bytes
+            + good.string.unwrap().capacity
+            + bare_buffer.capacity;
+        let mut limits = Limits::default();
+        if count_rejection {
+            limits.values.max_frames = count - 1;
+        } else {
+            limits.values.max_storage_bytes = bytes - 1;
+        }
+        let input_failure =
+            flat_owned_parameter_input(&source["Entry"], &args, limits, Span::default())
+                .expect("the typed input must select the flat parameter contract")
+                .unwrap_err();
+        assert!(input_failure.message.contains(if count_rejection {
+            "FrameLimit"
+        } else {
+            "StorageLimit"
+        }));
+        let mut machine = Machine::from_code(code.clone(), limits, 0);
+        let mut host = production_interpreter(SOURCE);
+        let failure = machine
+            .run_owned_with_hooks("Entry", &mut args, 0, false, &mut host)
+            .err()
+            .expect("the combined actual backing must reject before input transfer");
+        assert!(failure.message.contains(if count_rejection {
+            "FrameLimit"
+        } else {
+            "StorageLimit"
+        }));
+        assert_eq!((args.as_ptr(), args.capacity()), original_vec);
+        assert_eq!(args.len(), 6);
+        for (index, pointer) in scalar_boxes.into_iter().enumerate() {
+            let Value::Result { ok: true, value } = &args[index] else {
+                panic!("primitive Result input changed")
+            };
+            assert_eq!(value.as_ref() as *const Value as usize, pointer);
+            assert_eq!(
+                value.as_ref(),
+                if index == 0 {
+                    &Value::Int(7)
+                } else {
+                    &Value::Bool(true)
+                }
+            );
+        }
+        assert_eq!(s9_owner(&args[2], PAYLOAD), Some(good));
+        assert_eq!(s9_owner(&args[3], PAYLOAD), Some(bad));
+        let Value::String(bare) = &args[4] else {
+            panic!("bare String input changed")
+        };
+        assert_eq!(
+            (bare.as_ptr() as usize, bare.capacity(), bare.as_str()),
+            (bare_buffer.pointer, bare_buffer.capacity, PAYLOAD)
+        );
+        assert_eq!(args[5], Value::Int(0));
+        assert_eq!((host.steps, machine.metrics.entered_calls), (0, 0));
+        s9_drained(&machine);
+
+        machine.value_limits = Limits::default().values;
+        let result = machine
+            .run_owned_with_hooks("Entry", &mut args, 0, false, &mut host)
+            .unwrap()
+            .into_call_value(Span::default(), "function")
+            .unwrap();
+        assert!(s9_owner(&result, PAYLOAD).unwrap().string.is_some());
+        assert!(args.is_empty() && args.capacity() == 0);
+        assert_eq!(host.call_depth, 0);
+        s9_drained(&machine);
+    }
+}

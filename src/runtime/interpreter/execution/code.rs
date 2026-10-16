@@ -335,6 +335,36 @@ fn single_scalar_result_parameter_kind(function: &FnDecl) -> Option<PrimitiveRes
     (results == 1).then_some(kind)
 }
 
+// A separate contract for explicitly typed flat Owned slots. Old one-input
+// contracts keep priority and their original charging/cache identities.
+pub(super) fn flat_owned_result_parameter_function(function: &FnDecl) -> bool {
+    flat_owned_result_function(function)
+        && function.params.iter().any(|param| {
+            string_result_type(&param.ty) || primitive_result_kind(&param.ty).is_some()
+        })
+}
+
+fn flat_owned_result_function(function: &FnDecl) -> bool {
+    function.type_params.is_empty()
+        && (string_result_type(&function.return_type)
+            || primitive_result_kind(&function.return_type).is_some())
+        && function.params.iter().all(|param| {
+            param.mode == ParamMode::Owned
+                && (string_type(&param.ty)
+                    || string_result_type(&param.ty)
+                    || primitive_type_kind(&param.ty).is_some()
+                    || primitive_result_kind(&param.ty).is_some())
+        })
+}
+
+pub(super) fn admit_flat_owned_result_parameters(
+    source: &HashMap<String, FnDecl>,
+    entry: &FnDecl,
+    limits: Limits,
+) -> Admission<()> {
+    Eligibility::new(source, None, limits).check(FunctionSpec::flat_owned_result_parameters(entry))
+}
+
 pub(super) fn eligible_borrowed_string_named(
     source: &HashMap<String, FnDecl>,
     entry: &FnDecl,
@@ -526,6 +556,15 @@ impl CodeHandle {
         ))
     }
 
+    pub(super) fn compile_flat_owned_result_parameters(
+        source: &HashMap<String, FnDecl>,
+        entry: &FnDecl,
+        limits: Limits,
+    ) -> Admission<Self> {
+        Builder::new(source, None, limits)
+            .compile(Some(FunctionSpec::flat_owned_result_parameters(entry)))
+    }
+
     pub(super) fn compile_borrowed_string_named(
         source: &HashMap<String, FnDecl>,
         entry: &FnDecl,
@@ -642,13 +681,17 @@ impl CodeHandle {
                 function.result_contract,
                 ResultContract::OwnedScalarParameter(_)
                     | ResultContract::OwnedAsyncScalarParameter(_)
+                    | ResultContract::OwnedFlatParameters
             )
         })
     }
 
     pub(super) fn has_owned_string_result_parameters(&self) -> bool {
         self.0.functions.as_slice().first().is_some_and(|function| {
-            function.result_contract == ResultContract::OwnedStringParameter
+            matches!(
+                function.result_contract,
+                ResultContract::OwnedStringParameter | ResultContract::OwnedFlatParameters
+            )
         })
     }
 
@@ -792,6 +835,9 @@ enum FunctionRole {
     OwnedStringResultParameterNamed,
     ClaimedAsyncOwnedScalarResultParameterRoot,
     AsyncOwnedScalarResultParameterDependency,
+    FlatOwnedResultParametersNamed,
+    FlatOwnedResultParametersAsyncRoot,
+    FlatOwnedResultParametersAsyncDependency,
     BorrowedStringNamed,
     BorrowedScalarResultNamed,
     ResultRoot,
@@ -825,6 +871,7 @@ enum ResultContract {
     OwnedScalarParameter(PrimitiveResultKind),
     OwnedAsyncScalarParameter(PrimitiveResultKind),
     OwnedStringParameter,
+    OwnedFlatParameters,
     OwnedString,
     OwnedStringLocals,
     OwnedStringAwaitLocals,
@@ -955,12 +1002,68 @@ impl<'a> FunctionSpec<'a> {
         spec
     }
 
+    fn flat_owned_result_parameters(function: &'a FnDecl) -> Self {
+        let mut spec = Self::named(function);
+        spec.role = if function.is_async {
+            FunctionRole::FlatOwnedResultParametersAsyncRoot
+        } else {
+            FunctionRole::FlatOwnedResultParametersNamed
+        };
+        spec
+    }
+
+    fn owns_flat_result_parameters(self) -> bool {
+        matches!(
+            self.role,
+            FunctionRole::FlatOwnedResultParametersNamed
+                | FunctionRole::FlatOwnedResultParametersAsyncRoot
+                | FunctionRole::FlatOwnedResultParametersAsyncDependency
+        )
+    }
+
+    fn flat_result_parameter_dependency(
+        self,
+        function: &'a FnDecl,
+        terminal_async_call: bool,
+    ) -> Admission<Self> {
+        if !flat_owned_result_function(function)
+            || (function.is_async && !(self.is_async() && terminal_async_call))
+        {
+            return Err(AdmissionError::Unsupported(function.span));
+        }
+        let mut spec = Self::flat_owned_result_parameters(function);
+        if function.is_async {
+            spec.role = FunctionRole::FlatOwnedResultParametersAsyncDependency;
+        }
+        Ok(spec)
+    }
+
+    fn check_scalar_read_kind(self, kind: PrimitiveResultKind, span: Span) -> Admission<()> {
+        if self.owns_flat_result_parameters() {
+            // Only declared parameter bindings can have this kind: the flat
+            // contract separately rejects Result local creation/assignment.
+            Ok(())
+        } else {
+            self.check_scalar_local_kind(kind, span)
+        }
+    }
+
+    fn check_string_read(self, span: Span) -> Admission<()> {
+        if self.owns_flat_result_parameters() {
+            Ok(())
+        } else {
+            self.check_string_local(span)
+        }
+    }
+
     fn owns_string_result_parameters(self) -> bool {
         matches!(self.role, FunctionRole::OwnedStringResultParameterNamed)
     }
 
     fn owns_result_parameters(self) -> bool {
-        self.owns_scalar_result_parameters() || self.owns_string_result_parameters()
+        self.owns_flat_result_parameters()
+            || self.owns_scalar_result_parameters()
+            || self.owns_string_result_parameters()
     }
 
     fn string_result_parameter_dependency(self, function: &'a FnDecl) -> Admission<Self> {
@@ -1052,29 +1155,37 @@ impl<'a> FunctionSpec<'a> {
     }
 
     fn owns_result_string(self) -> bool {
-        matches!(
-            self.role,
-            FunctionRole::OwnedResultStringNamed
-                | FunctionRole::OwnedLocalResultStringNamed
-                | FunctionRole::OwnedStringResultParameterNamed
-                | FunctionRole::ClaimedAsyncOwnedResultStringRoot
-                | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
-                | FunctionRole::ClaimedAsyncAwaitLocalResultStringRoot
-                | FunctionRole::AsyncAwaitLocalResultStringDependency
-                | FunctionRole::AsyncOwnedResultStringDependency
-        )
+        (self.owns_flat_result_parameters()
+            && self
+                .declaration
+                .is_some_and(|function| string_result_type(&function.return_type)))
+            || matches!(
+                self.role,
+                FunctionRole::OwnedResultStringNamed
+                    | FunctionRole::OwnedLocalResultStringNamed
+                    | FunctionRole::OwnedStringResultParameterNamed
+                    | FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                    | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
+                    | FunctionRole::ClaimedAsyncAwaitLocalResultStringRoot
+                    | FunctionRole::AsyncAwaitLocalResultStringDependency
+                    | FunctionRole::AsyncOwnedResultStringDependency
+            )
     }
 
     fn owns_scalar_result(self) -> bool {
-        matches!(
-            self.role,
-            FunctionRole::OwnedScalarResultNamed
-                | FunctionRole::OwnedScalarResultParameterNamed
-                | FunctionRole::ClaimedAsyncOwnedScalarResultParameterRoot
-                | FunctionRole::AsyncOwnedScalarResultParameterDependency
-                | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
-                | FunctionRole::AsyncOwnedScalarResultDependency
-        )
+        (self.owns_flat_result_parameters()
+            && self
+                .declaration
+                .is_some_and(|function| primitive_result_kind(&function.return_type).is_some()))
+            || matches!(
+                self.role,
+                FunctionRole::OwnedScalarResultNamed
+                    | FunctionRole::OwnedScalarResultParameterNamed
+                    | FunctionRole::ClaimedAsyncOwnedScalarResultParameterRoot
+                    | FunctionRole::AsyncOwnedScalarResultParameterDependency
+                    | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
+                    | FunctionRole::AsyncOwnedScalarResultDependency
+            )
     }
 
     fn owned_scalar_result_kind(self) -> Option<PrimitiveResultKind> {
@@ -1127,7 +1238,9 @@ impl<'a> FunctionSpec<'a> {
         let primitive = self
             .declaration
             .and_then(|function| primitive_result_kind(&function.return_type));
-        let result = if self.owns_string_result_parameters() {
+        let result = if self.owns_flat_result_parameters() {
+            ResultContract::OwnedFlatParameters
+        } else if self.owns_string_result_parameters() {
             ResultContract::OwnedStringParameter
         } else if self.owns_async_scalar_result_parameters() {
             ResultContract::OwnedAsyncScalarParameter(
@@ -1222,18 +1335,20 @@ impl<'a> FunctionSpec<'a> {
     }
 
     fn is_claimed_async_owned_result_string(self) -> bool {
-        matches!(
-            self.role,
-            FunctionRole::ClaimedAsyncOwnedResultStringRoot
-                | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
-                | FunctionRole::ClaimedAsyncAwaitLocalResultStringRoot
-                | FunctionRole::AsyncAwaitLocalResultStringDependency
-                | FunctionRole::AsyncOwnedResultStringDependency
-        )
+        (self.owns_flat_result_parameters() && self.is_async() && self.owns_result_string())
+            || matches!(
+                self.role,
+                FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                    | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
+                    | FunctionRole::ClaimedAsyncAwaitLocalResultStringRoot
+                    | FunctionRole::AsyncAwaitLocalResultStringDependency
+                    | FunctionRole::AsyncOwnedResultStringDependency
+            )
     }
 
     fn is_claimed_async_owned_result(self) -> bool {
-        self.is_claimed_async_owned_result_string()
+        (self.owns_flat_result_parameters() && self.is_async())
+            || self.is_claimed_async_owned_result_string()
             || matches!(
                 self.role,
                 FunctionRole::ClaimedAsyncOwnedScalarResultRoot
@@ -1283,6 +1398,9 @@ impl<'a> FunctionSpec<'a> {
             .get(name)
             .ok_or(AdmissionError::Unsupported(callee.span))?;
         self.check_owned_async_target(function)?;
+        if self.owns_flat_result_parameters() && !flat_owned_result_function(function) {
+            return Err(AdmissionError::Unsupported(function.span));
+        }
         if self.owns_async_scalar_result_parameters()
             && single_async_owned_scalar_result_parameter_kind(function)
                 != self.owned_scalar_result_kind()
@@ -1340,26 +1458,29 @@ impl<'a> FunctionSpec<'a> {
                 | FunctionRole::AsyncOwnedScalarResultParameterDependency
                 | FunctionRole::AsyncResultDependency
                 | FunctionRole::ClaimedLocalAsyncResultRoot
+                | FunctionRole::FlatOwnedResultParametersAsyncRoot
+                | FunctionRole::FlatOwnedResultParametersAsyncDependency
         )
     }
 
     fn owns_strings(self) -> bool {
-        matches!(
-            self.role,
-            FunctionRole::OwnedNamed
-                | FunctionRole::OwnedResultStringNamed
-                | FunctionRole::OwnedLocalResultStringNamed
-                | FunctionRole::OwnedScalarResultNamed
-                | FunctionRole::ClaimedAsyncOwnedResultStringRoot
-                | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
-                | FunctionRole::ClaimedAsyncAwaitLocalResultStringRoot
-                | FunctionRole::AsyncAwaitLocalResultStringDependency
-                | FunctionRole::AsyncOwnedResultStringDependency
-                | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
-                | FunctionRole::AsyncOwnedScalarResultDependency
-                | FunctionRole::BorrowedStringNamed
-                | FunctionRole::BorrowedScalarResultNamed
-        )
+        self.owns_flat_result_parameters()
+            || matches!(
+                self.role,
+                FunctionRole::OwnedNamed
+                    | FunctionRole::OwnedResultStringNamed
+                    | FunctionRole::OwnedLocalResultStringNamed
+                    | FunctionRole::OwnedScalarResultNamed
+                    | FunctionRole::ClaimedAsyncOwnedResultStringRoot
+                    | FunctionRole::ClaimedAsyncOwnedLocalResultStringRoot
+                    | FunctionRole::ClaimedAsyncAwaitLocalResultStringRoot
+                    | FunctionRole::AsyncAwaitLocalResultStringDependency
+                    | FunctionRole::AsyncOwnedResultStringDependency
+                    | FunctionRole::ClaimedAsyncOwnedScalarResultRoot
+                    | FunctionRole::AsyncOwnedScalarResultDependency
+                    | FunctionRole::BorrowedStringNamed
+                    | FunctionRole::BorrowedScalarResultNamed
+            )
     }
 
     fn borrows_strings(self) -> bool {
@@ -1371,6 +1492,19 @@ impl<'a> FunctionSpec<'a> {
 
     fn parameter_kind(self, param: &Param) -> Admission<ValueKind> {
         if param.mode == ParamMode::Owned {
+            if self.owns_flat_result_parameters() {
+                return if string_result_type(&param.ty) {
+                    Ok(ValueKind::ResultString)
+                } else if let Some(kind) = primitive_result_kind(&param.ty) {
+                    Ok(ValueKind::ScalarResult(kind))
+                } else if primitive_type_kind(&param.ty).is_some() {
+                    Ok(ValueKind::Scalar)
+                } else if string_type(&param.ty) {
+                    Ok(ValueKind::String)
+                } else {
+                    Err(AdmissionError::Unsupported(param.span))
+                };
+            }
             if self.owns_string_result_parameters() && string_result_type(&param.ty) {
                 return Ok(ValueKind::ResultString);
             }
@@ -1476,6 +1610,11 @@ impl<'a> FunctionSpec<'a> {
             }
             FunctionRole::ClaimedAsyncResultRoot | FunctionRole::AsyncResultDependency => {
                 function.is_async && scalar_result_type(&function.return_type)
+            }
+            FunctionRole::FlatOwnedResultParametersNamed
+            | FunctionRole::FlatOwnedResultParametersAsyncRoot
+            | FunctionRole::FlatOwnedResultParametersAsyncDependency => {
+                flat_owned_result_function(function) && function.is_async == self.is_async()
             }
             FunctionRole::ClaimedLocalAsyncResultRoot => false,
         };
@@ -2295,9 +2434,12 @@ impl<'a> Builder<'a> {
                     span: span_id,
                     owned_string: kind == ValueKind::String,
                     view_string: kind == ValueKind::ViewString,
-                    string_result: spec.owns_string_result_parameters()
+                    string_result: (spec.owns_string_result_parameters()
+                        || spec.owns_flat_result_parameters())
                         && kind == ValueKind::ResultString,
-                    scalar_result: if spec.owns_scalar_result_parameters() {
+                    scalar_result: if spec.owns_scalar_result_parameters()
+                        || spec.owns_flat_result_parameters()
+                    {
                         match kind {
                             ValueKind::ScalarResult(kind) => Some(kind),
                             _ => None,
@@ -2424,6 +2566,9 @@ impl<'a> Builder<'a> {
                             return Err(AdmissionError::Unsupported(expr.span));
                         }
                         self.check_free(name, expr.span)?;
+                        if spec.owns_flat_result_parameters() && !self.is_bound(name) {
+                            return Err(AdmissionError::Unsupported(expr.span));
+                        }
                         let symbol = self.symbol(name, expr.span)?;
                         match self.kind(expr)? {
                             ValueKind::Scalar => ExprCode::Variable(symbol),
@@ -2436,12 +2581,16 @@ impl<'a> Builder<'a> {
                             }
                             ValueKind::ResultString
                                 if spec.stores_string_result()
-                                    || spec.owns_string_result_parameters() =>
+                                    || spec.owns_string_result_parameters()
+                                    || spec.owns_flat_result_parameters() =>
                             {
                                 ExprCode::VariableSelectedStringResultClone(symbol)
                             }
-                            ValueKind::ScalarResult(kind) if spec.stores_scalar_result() => {
-                                spec.check_scalar_local_kind(kind, expr.span)?;
+                            ValueKind::ScalarResult(kind)
+                                if spec.stores_scalar_result()
+                                    || spec.owns_flat_result_parameters() =>
+                            {
+                                spec.check_scalar_read_kind(kind, expr.span)?;
                                 ExprCode::VariableSelectedScalarResultClone(symbol)
                             }
                             ValueKind::Result
@@ -2501,7 +2650,11 @@ impl<'a> Builder<'a> {
                                     owned_async_call: true,
                                 },
                             )?;
-                            if spec.has_await_string_local_contract() {
+                            if spec.has_await_string_local_contract()
+                                || spec.owns_flat_result_parameters()
+                            {
+                                // The flat contract has no String-origin credit, even
+                                // when this String exists only in a dependency.
                                 ExprCode::AwaitLocalOwnedString(operand)
                             } else {
                                 ExprCode::TerminalAwaitOwnedString(operand)
@@ -2539,10 +2692,12 @@ impl<'a> Builder<'a> {
                         if let Some((target, kind)) =
                             selected_scalar_result_clone_target(expr, self.bound.as_slice())
                         {
-                            if !spec.owns_scalar_result_parameters() {
+                            if !spec.owns_scalar_result_parameters()
+                                && !spec.owns_flat_result_parameters()
+                            {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
-                            spec.check_scalar_local_kind(kind, expr.span)?;
+                            spec.check_scalar_read_kind(kind, expr.span)?;
                             let target = self.expression(target, false)?;
                             *self
                                 .arena
@@ -2557,7 +2712,7 @@ impl<'a> Builder<'a> {
                         if let Some(target) =
                             selected_string_result_clone_target(expr, self.bound.as_slice())
                         {
-                            spec.check_string_local(expr.span)?;
+                            spec.check_string_read(expr.span)?;
                             let target = self.expression(target, false)?;
                             *self
                                 .arena
@@ -2634,7 +2789,12 @@ impl<'a> Builder<'a> {
                                 .source
                                 .get(name)
                                 .ok_or(AdmissionError::Unsupported(callee.span))?;
-                            self.ensure_function(if spec.owns_string_result_parameters() {
+                            self.ensure_function(if spec.owns_flat_result_parameters() {
+                                spec.flat_result_parameter_dependency(
+                                    function,
+                                    mode.owned_async_call,
+                                )?
+                            } else if spec.owns_string_result_parameters() {
                                 spec.string_result_parameter_dependency(function)?
                             } else if spec.owns_scalar_result_parameters() {
                                 if spec.owns_async_scalar_result_parameters() {
@@ -3584,15 +3744,19 @@ impl<'a> Eligibility<'a> {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
                             self.free(name, expr.span)?;
+                            if spec.owns_flat_result_parameters() && !self.bound(name) {
+                                return Err(AdmissionError::Unsupported(expr.span));
+                            }
                             let kind = self.kind(expr)?;
                             if kind == ValueKind::ResultString
                                 && (spec.stores_string_result()
-                                    || spec.owns_string_result_parameters())
+                                    || spec.owns_string_result_parameters()
+                                    || spec.owns_flat_result_parameters())
                             {
                                 continue;
                             }
                             if let ValueKind::ScalarResult(kind) = kind {
-                                spec.check_scalar_local_kind(kind, expr.span)?;
+                                spec.check_scalar_read_kind(kind, expr.span)?;
                                 continue;
                             }
                             if matches!(
@@ -3685,17 +3849,19 @@ impl<'a> Eligibility<'a> {
                             if let Some((target, kind)) =
                                 selected_scalar_result_clone_target(expr, self.bound.as_slice())
                             {
-                                if !spec.owns_scalar_result_parameters() {
+                                if !spec.owns_scalar_result_parameters()
+                                    && !spec.owns_flat_result_parameters()
+                                {
                                     return Err(AdmissionError::Unsupported(expr.span));
                                 }
-                                spec.check_scalar_local_kind(kind, expr.span)?;
+                                spec.check_scalar_read_kind(kind, expr.span)?;
                                 self.expression(target, false)?;
                                 continue;
                             }
                             if let Some(target) =
                                 selected_string_result_clone_target(expr, self.bound.as_slice())
                             {
-                                spec.check_string_local(expr.span)?;
+                                spec.check_string_read(expr.span)?;
                                 self.expression(target, false)?;
                                 continue;
                             }
@@ -3743,7 +3909,12 @@ impl<'a> Eligibility<'a> {
                                     .source
                                     .get(name)
                                     .ok_or(AdmissionError::Unsupported(callee.span))?;
-                                self.function(if spec.owns_string_result_parameters() {
+                                self.function(if spec.owns_flat_result_parameters() {
+                                    spec.flat_result_parameter_dependency(
+                                        function,
+                                        mode.owned_async_call,
+                                    )?
+                                } else if spec.owns_string_result_parameters() {
                                     spec.string_result_parameter_dependency(function)?
                                 } else if spec.owns_scalar_result_parameters() {
                                     if spec.owns_async_scalar_result_parameters() {

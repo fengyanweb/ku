@@ -495,8 +495,8 @@ impl<P: FnMut(Span) -> KuResult<()>> ExecutionHooks for PollHooks<P> {
 
 struct CallFrame {
     env: Env,
-    // Result parameters/captures remain excluded by admission. Only Bind can
-    // introduce a selected Result owner; avoid locking every scalar/String
+    // Selected Result parameters and locals set this before binding an owner.
+    // Captures remain excluded by admission; avoid locking every scalar/String
     // Env on each dispatch. Keep true conservatively until this frame drops.
     has_selected_result_bindings: bool,
     // S9 alone admits successful String Result locals. The old simple
@@ -805,8 +805,8 @@ struct Machine {
     // Direct synchronous err and selected Result locals keep the stable-owner
     // scanner/native-drop path active even without an awaited payload.
     selected_error_payloads: bool,
-    // Only the synchronous owned scalar Result-parameter role opts in. This
-    // fixed-size subtotal owns no payload and allocates no backing. It covers
+    // Selected owned Result-parameter roles opt in. This fixed-size subtotal
+    // owns no payload and allocates no backing. It covers
     // suspended call Envs, excluding the current real frame.
     frozen_result_ancestor_charge: AwaitPayloadCharge,
     // Strict String Result parameters have no origin credit. This fixed-size
@@ -1153,6 +1153,75 @@ fn string_result_parameter_charge(value: &Value, span: Span) -> KuResult<AwaitPa
     } else {
         AwaitPayloadCharge::error_object(inner).map_err(|error| error.into_error(span))
     }
+}
+
+// Validate every original slot without cloning or moving any owner. Shape
+// Unsupported remains distinct from an arithmetic/capacity rejection.
+fn flat_owned_parameter_input(
+    function: &FnDecl,
+    args: &Vec<Value>,
+    limits: Limits,
+    span: Span,
+) -> Option<KuResult<()>> {
+    if args.len() != function.params.len() {
+        return None;
+    }
+    for (value, param) in args.iter().zip(&function.params) {
+        let result_inner = match (&param.ty, value) {
+            (Some(TypeName::Result(declared)), Value::Result { ok: true, value }) => {
+                if matches!(declared.as_ref(), TypeName::String) {
+                    matches!(value.as_ref(), Value::String(_))
+                } else {
+                    code::primitive_result_kind(&param.ty)
+                        .is_some_and(|kind| primitive_result_payload_matches(value, kind))
+                }
+            }
+            (Some(TypeName::Result(_)), Value::Result { ok: false, value }) => {
+                matches!(value.as_ref(), Value::Object(fields)
+                    if fields.len() == 3
+                        && ["domain", "code", "message"].iter().all(|name|
+                            matches!(fields.get(*name), Some(Value::String(_)))))
+            }
+            (Some(TypeName::String), Value::String(_)) => true,
+            _ => code::primitive_type_kind(&param.ty)
+                .is_some_and(|kind| primitive_result_payload_matches(value, kind)),
+        };
+        if !result_inner {
+            return None;
+        }
+    }
+    Some((|| {
+        let overflow = || storage_error(ReserveError::ArithmeticOverflow, span);
+        let mut count = args.capacity();
+        let mut bytes = count
+            .checked_mul(std::mem::size_of::<Value>())
+            .ok_or_else(overflow)?;
+        for (value, param) in args.iter().zip(&function.params) {
+            let payload = if matches!(&param.ty, Some(TypeName::Result(inner))
+                if matches!(inner.as_ref(), TypeName::String))
+            {
+                string_result_parameter_charge(value, span)?
+            } else if let Some(kind) = code::primitive_result_kind(&param.ty) {
+                scalar_result_parameter_charge(value, kind, span)?
+            } else {
+                AwaitPayloadCharge::default()
+            };
+            count = count.checked_add(payload.count).ok_or_else(overflow)?;
+            bytes = bytes.checked_add(payload.bytes).ok_or_else(overflow)?;
+            // Successful Result<String> Box charging intentionally excludes
+            // the buffer; add every real bare/success String capacity here.
+            if let Some(text) = selected_string_leaf(value) {
+                bytes = bytes.checked_add(text.capacity()).ok_or_else(overflow)?;
+            }
+        }
+        if count > limits.values.max_frames {
+            return Err(storage_error(ReserveError::FrameLimit, span));
+        }
+        if bytes > limits.values.max_storage_bytes {
+            return Err(storage_error(ReserveError::StorageLimit, span));
+        }
+        Ok(())
+    })())
 }
 
 fn owned_parameter_value(param: code::CodeParam, value: &mut Value, span: Span) -> KuResult<Value> {
@@ -3257,6 +3326,9 @@ impl Machine {
             } else if let Some(kind) = param.scalar_result {
                 charge =
                     sum_payload_charge(charge, scalar_result_parameter_charge(value, kind, span)?);
+            } else if param.owned_string && matches!(value, Value::String(_)) {
+                // New flat parameter contracts admit ordinary String companions;
+                // their buffers join the same dynamic String owner census.
             } else if !param
                 .scalar_primitive
                 .is_some_and(|kind| primitive_result_payload_matches(value, kind))
@@ -5351,9 +5423,9 @@ impl Machine {
         {
             return;
         }
-        // Admission permits selected scalar Result locals and a separate
-        // synchronous one-Result-parameter contract. Captures, general Result
-        // arguments and uncharged dependencies stay excluded before ID reuse.
+        // Admission permits selected Result locals and explicitly typed flat
+        // Result parameters. Captures, nested Result arguments and uncharged
+        // dependencies stay excluded before ID reuse.
         // Every real selected owner at a stable boundary is an Env binding, operand,
         // outgoing primary, saved finally primary, or ticket. Only finish_with
         // owns an operation-local outcome; its sole charge stays in escrow
@@ -5575,6 +5647,34 @@ fn try_execute_owned_string_result_parameter(
     Some(machine.run_owned_with_hooks(&function.name, args, depth, false, interpreter))
 }
 
+fn try_execute_flat_owned_result_parameters(
+    interpreter: &mut Interpreter,
+    function: &FnDecl,
+    args: &mut Vec<Value>,
+    depth: usize,
+) -> Option<KuResult<Flow>> {
+    let limits = Limits::default();
+    let input = flat_owned_parameter_input(function, args, limits, function.span)?;
+    // Whole-graph Unsupported leaves original owners untouched, even if the
+    // input would have exceeded this private contract's actual backing budget.
+    match code::admit_flat_owned_result_parameters(&interpreter.functions, function, limits) {
+        Ok(()) => {}
+        Err(AdmissionError::Unsupported(_)) => return None,
+        Err(error @ AdmissionError::Rejected(_)) => return Some(Err(error.into_error())),
+    }
+    if let Err(error) = input {
+        return Some(Err(error));
+    }
+    let source = interpreter.functions.clone();
+    let code = match CodeHandle::compile_flat_owned_result_parameters(&source, function, limits) {
+        Ok(code) => code,
+        Err(AdmissionError::Unsupported(_)) => return None,
+        Err(error @ AdmissionError::Rejected(_)) => return Some(Err(error.into_error())),
+    };
+    let mut machine = Machine::from_code(code, limits, interpreter.call_depth);
+    Some(machine.run_owned_with_hooks(&function.name, args, depth, false, interpreter))
+}
+
 pub(super) fn try_execute_owned(
     interpreter: &mut Interpreter,
     function: &FnDecl,
@@ -5582,10 +5682,21 @@ pub(super) fn try_execute_owned(
     depth: usize,
 ) -> Option<KuResult<Flow>> {
     if code::single_owned_scalar_result_parameter_kind(function).is_some() {
-        return try_execute_owned_scalar_result_parameter(interpreter, function, args, depth);
+        if let Some(result) =
+            try_execute_owned_scalar_result_parameter(interpreter, function, args, depth)
+        {
+            return Some(result);
+        }
     }
     if code::single_owned_string_result_parameter(function) {
-        return try_execute_owned_string_result_parameter(interpreter, function, args, depth);
+        if let Some(result) =
+            try_execute_owned_string_result_parameter(interpreter, function, args, depth)
+        {
+            return Some(result);
+        }
+    }
+    if !function.is_async && code::flat_owned_result_parameter_function(function) {
+        return try_execute_flat_owned_result_parameters(interpreter, function, args, depth);
     }
     if !args.iter().any(|value| matches!(value, Value::String(_))) {
         return None;
@@ -6110,63 +6221,7 @@ impl ClaimedNamedTask {
         // Its existing String/scalar selectors below retain their precedence
         // for every shape they already supported.
         if code::single_async_owned_scalar_result_parameter_kind(function).is_some() {
-            let input = (|| {
-                if args.len() != function.params.len() {
-                    return None;
-                }
-                for (value, param) in args.iter().zip(&function.params) {
-                    if let Some(kind) = code::primitive_result_kind(&param.ty) {
-                        let supported = match value {
-                            Value::Result { ok: true, value } => {
-                                primitive_result_payload_matches(value, kind)
-                            }
-                            Value::Result { ok: false, value } => {
-                                matches!(value.as_ref(), Value::Object(fields)
-                                    if fields.len() == 3
-                                        && ["domain", "code", "message"].iter().all(|name|
-                                            matches!(fields.get(*name), Some(Value::String(_)))))
-                            }
-                            _ => false,
-                        };
-                        if !supported {
-                            return None;
-                        }
-                    } else if !code::primitive_type_kind(&param.ty)
-                        .is_some_and(|kind| primitive_result_payload_matches(value, kind))
-                    {
-                        return None;
-                    }
-                }
-                // Shape validation is complete before arithmetic admission.
-                // Preserve a real capacity/arithmetic rejection as Rejected;
-                // do not erase it into Unsupported and replay the body.
-                let payload = args
-                    .iter()
-                    .zip(&function.params)
-                    .find_map(|(value, param)| {
-                        code::primitive_result_kind(&param.ty)
-                            .map(|kind| scalar_result_parameter_charge(value, kind, span))
-                    })
-                    .expect("one validated async Result parameter");
-                Some(payload.and_then(|payload| {
-                    let count = args
-                        .capacity()
-                        .checked_add(payload.count)
-                        .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
-                    let bytes = args
-                        .capacity()
-                        .checked_mul(std::mem::size_of::<Value>())
-                        .and_then(|bytes| bytes.checked_add(payload.bytes))
-                        .ok_or_else(|| storage_error(ReserveError::ArithmeticOverflow, span))?;
-                    if count > limits.values.max_frames {
-                        return Err(storage_error(ReserveError::FrameLimit, span));
-                    }
-                    if bytes > limits.values.max_storage_bytes {
-                        return Err(storage_error(ReserveError::StorageLimit, span));
-                    }
-                    Ok(())
-                }))
-            })();
+            let input = flat_owned_parameter_input(function, args, limits, span);
             if let Some(input) = input {
                 // Borrow the immutable source for whole-tree validation first.
                 // Unsupported must preserve both original owners even when a
@@ -6208,6 +6263,62 @@ impl ClaimedNamedTask {
                                 .legacy
                                 .take()
                                 .expect("selected async Result parameter input");
+                            let mut machine =
+                                Machine::from_code(code, limits, runner.interpreter.call_depth);
+                            if let Err(error) = machine.start_owned_once_with_hooks(
+                                &function.name,
+                                &mut args,
+                                0,
+                                false,
+                                &runner.interpreter,
+                            ) {
+                                runner.outcome = Some(Err(error));
+                            }
+                            runner.machine = Some(machine);
+                            drop(function);
+                            drop(args);
+                            return runner;
+                        }
+                    }
+                }
+            }
+        }
+        if function.is_async && code::flat_owned_result_parameter_function(function) {
+            if let Some(input) = flat_owned_parameter_input(function, args, limits, span) {
+                let selected = match code::admit_flat_owned_result_parameters(
+                    &runner.interpreter.functions,
+                    function,
+                    limits,
+                ) {
+                    Ok(()) => true,
+                    Err(AdmissionError::Unsupported(_)) => false,
+                    Err(error @ AdmissionError::Rejected(_)) => {
+                        runner.outcome = Some(Err(error.into_error()));
+                        drop(runner.legacy.take());
+                        return runner;
+                    }
+                };
+                if selected {
+                    if let Err(error) = input {
+                        runner.outcome = Some(Err(error));
+                        drop(runner.legacy.take());
+                        return runner;
+                    }
+                    let source = runner.interpreter.functions.clone();
+                    match CodeHandle::compile_flat_owned_result_parameters(
+                        &source, function, limits,
+                    ) {
+                        Err(AdmissionError::Unsupported(_)) => {}
+                        Err(error @ AdmissionError::Rejected(_)) => {
+                            runner.outcome = Some(Err(error.into_error()));
+                            drop(runner.legacy.take());
+                            return runner;
+                        }
+                        Ok(code) => {
+                            let (function, mut args) = runner
+                                .legacy
+                                .take()
+                                .expect("selected flat Owned parameter input");
                             let mut machine =
                                 Machine::from_code(code, limits, runner.interpreter.call_depth);
                             if let Err(error) = machine.start_owned_once_with_hooks(
