@@ -196,6 +196,14 @@ pub enum TaskTerminator {
         ready: StateId,
         cleanup: StateId,
     },
+    /// Wait for one integer-millisecond std.time.sleep call. The argument is
+    /// already materialized; only ready initializes the null Result destination.
+    Timer {
+        millis: SlotId,
+        dst: SlotId,
+        ready: StateId,
+        cleanup: StateId,
+    },
     TryResult {
         src: SlotId,
         ok_value: SlotId,
@@ -523,6 +531,7 @@ fn successors(term: &TaskTerminator) -> [Option<StateId>; 2] {
         } => [Some(*then_state), Some(*else_state)],
         TaskTerminator::Suspend { resume, cleanup } => [Some(*resume), Some(*cleanup)],
         TaskTerminator::Await { ready, cleanup, .. }
+        | TaskTerminator::Timer { ready, cleanup, .. }
         | TaskTerminator::ScopeDrain { ready, cleanup, .. } => [Some(*ready), Some(*cleanup)],
         TaskTerminator::TryResult { ok, err, .. } => [Some(*ok), Some(*err)],
         TaskTerminator::Complete { .. }
@@ -541,6 +550,7 @@ struct SlotMasks {
     scope_count: usize,
     scope_exit_count: usize,
     has_scope_exit: bool,
+    has_timer: bool,
 }
 
 fn validate_shape(
@@ -568,6 +578,7 @@ fn validate_shape(
     let mut has_scope_drain = false;
     let mut scope_exit_count = 0;
     let mut has_scope_exit = false;
+    let mut has_timer = false;
     for (index, slot) in function.slots.iter().enumerate() {
         match &slot.ty {
             TaskSlotType::Value { borrowed: true, .. } => borrowed |= bit(SlotId(index)),
@@ -813,6 +824,20 @@ fn validate_shape(
                     return Err(invalid("Exit must move the matching owned Result"));
                 }
             }
+            TaskTerminator::Timer { millis, dst, .. } => {
+                has_timer = true;
+                let (argument, argument_borrowed) = slot_type(get_slot(*millis)?)?;
+                let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                if argument != &IrType::Int
+                    || argument_borrowed
+                    || destination_borrowed
+                    || destination != &IrType::Result(Box::new(IrType::Null))
+                {
+                    return Err(invalid(
+                        "Timer requires an owned int and owned null Result destination",
+                    ));
+                }
+            }
             TaskTerminator::Await { task, dst, .. } => {
                 let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
                 if borrowed
@@ -867,6 +892,7 @@ fn validate_shape(
         scope_count,
         scope_exit_count,
         has_scope_exit,
+        has_timer,
     })
 }
 
@@ -886,7 +912,9 @@ fn validate_regions_and_progress(
         normal[id.0] = true;
         match &function.states[id.0].terminator {
             TaskTerminator::Suspend { resume, .. } => pending.push(*resume),
-            TaskTerminator::Await { ready, .. } => pending.push(*ready),
+            TaskTerminator::Await { ready, .. } | TaskTerminator::Timer { ready, .. } => {
+                pending.push(*ready)
+            }
             TaskTerminator::ScopeDrain { ready, .. } => {
                 budget.spend()?;
                 pending.push(*ready);
@@ -905,6 +933,9 @@ fn validate_regions_and_progress(
             cleanup: target, ..
         }
         | TaskTerminator::Await {
+            cleanup: target, ..
+        }
+        | TaskTerminator::Timer {
             cleanup: target, ..
         }
         | TaskTerminator::ScopeDrain {
@@ -996,7 +1027,12 @@ fn validate_regions_and_progress(
             continue;
         }
         for target in successors(&state.terminator).into_iter().flatten() {
-            if scoped || matches!(state.terminator, TaskTerminator::Await { .. }) {
+            if scoped
+                || matches!(
+                    state.terminator,
+                    TaskTerminator::Await { .. } | TaskTerminator::Timer { .. }
+                )
+            {
                 budget.spend()?;
             }
             incoming[target.0] += 1;
@@ -1024,7 +1060,12 @@ fn validate_regions_and_progress(
             .into_iter()
             .flatten()
         {
-            if scoped || matches!(function.states[id].terminator, TaskTerminator::Await { .. }) {
+            if scoped
+                || matches!(
+                    function.states[id].terminator,
+                    TaskTerminator::Await { .. } | TaskTerminator::Timer { .. }
+                )
+            {
                 budget.spend()?;
             }
             incoming[target.0] -= 1;
@@ -1202,7 +1243,9 @@ fn validate_scope_layout(
                 [Some(ready), None]
             }
             TaskTerminator::Suspend { resume, .. } => [Some(resume), None],
-            TaskTerminator::Await { ready, .. } => [Some(ready), None],
+            TaskTerminator::Await { ready, .. } | TaskTerminator::Timer { ready, .. } => {
+                [Some(ready), None]
+            }
             ref term => successors(term),
         };
         for target in next.into_iter().flatten() {
@@ -1373,9 +1416,9 @@ fn validate_scope_exits(
             _ => {}
         }
         let next = match state.terminator {
-            TaskTerminator::ScopeDrain { ready, .. } | TaskTerminator::Await { ready, .. } => {
-                [Some(ready), None]
-            }
+            TaskTerminator::ScopeDrain { ready, .. }
+            | TaskTerminator::Await { ready, .. }
+            | TaskTerminator::Timer { ready, .. } => [Some(ready), None],
             TaskTerminator::Suspend { resume, .. } => [Some(resume), None],
             ref term => successors(term),
         };
@@ -1470,6 +1513,15 @@ fn edge_states(
         TaskTerminator::Suspend { resume, cleanup } => {
             [Some((*resume, input)), Some((*cleanup, changed(tasks, 0)))]
         }
+        TaskTerminator::Timer {
+            dst,
+            ready,
+            cleanup,
+            ..
+        } => [
+            Some((*ready, changed(0, bit(*dst)))),
+            Some((*cleanup, changed(tasks, 0))),
+        ],
         TaskTerminator::Await {
             task,
             dst,
@@ -1570,6 +1622,12 @@ fn live_states(
                     ready,
                     cleanup,
                     ..
+                }
+                | TaskTerminator::Timer {
+                    dst,
+                    ready,
+                    cleanup,
+                    ..
                 } => (live_in[ready.0] & !bit(dst)) | (live_in[cleanup.0] & !tasks),
                 TaskTerminator::TryResult {
                     ok_value,
@@ -1590,6 +1648,7 @@ fn live_states(
                     live |= bit(value)
                 }
                 TaskTerminator::Await { task, .. } => live |= bit(task),
+                TaskTerminator::Timer { millis, .. } => live |= bit(millis),
                 TaskTerminator::ScopeDrain { scope, .. } => live |= scopes.mask(scope),
                 TaskTerminator::TryResult { src, .. } => live |= bit(src),
                 _ => {}
@@ -1642,7 +1701,7 @@ fn validate_ownership_and_plan(
     // Exit can return to the adapter even when the function has no Task slots.
     // Preserve every Owned Value for runtime-error and staged-result cleanup;
     // ordinary dead Copy temporaries still need no persistent storage.
-    let hosted = masks.tasks != 0 || masks.exit_bridge;
+    let hosted = masks.tasks != 0 || masks.exit_bridge || masks.has_timer;
     let mut frame = masks.parameters | masks.tasks;
     if hosted {
         frame |= masks.owned;
@@ -1747,6 +1806,7 @@ fn validate_ownership_and_plan(
             }
             TaskTerminator::Suspend { .. }
             | TaskTerminator::Await { .. }
+            | TaskTerminator::Timer { .. }
             | TaskTerminator::ScopeDrain { .. } => {
                 if let TaskTerminator::Await { task, dst, .. } = block.terminator {
                     if state.must & bit(task) == 0 {
@@ -1760,12 +1820,29 @@ fn validate_ownership_and_plan(
                         ));
                     }
                 }
+                if let TaskTerminator::Timer { millis, dst, .. } = block.terminator {
+                    if state.must & bit(millis) == 0 {
+                        return Err(invalid(
+                            "Timer reads milliseconds that are not definitely initialized",
+                        ));
+                    }
+                    if state.may & bit(dst) != 0 {
+                        return Err(invalid(
+                            "Timer overwrites a possibly initialized Result destination",
+                        ));
+                    }
+                }
                 if matches!(block.terminator, TaskTerminator::ScopeDrain { .. })
                     && state.may & masks.borrowed != 0
                 {
                     return Err(invalid("borrowed value cannot cross ScopeDrain boundary"));
                 }
-                let saved = (live_out[id] | if hosted { masks.owned } else { 0 }) & state.may;
+                let timer_argument = match block.terminator {
+                    TaskTerminator::Timer { millis, .. } => bit(millis),
+                    _ => 0,
+                };
+                let saved = (live_out[id] | timer_argument | if hosted { masks.owned } else { 0 })
+                    & state.may;
                 if saved & masks.borrowed != 0 {
                     return Err(invalid("borrowed value cannot cross suspension"));
                 }

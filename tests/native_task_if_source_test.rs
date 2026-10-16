@@ -22,6 +22,16 @@ fn normalized(bytes: &[u8]) -> String {
 }
 
 fn run_case(index: usize, source: &str, stdout: &str, failure: Option<&str>) {
+    run_case_with_workers(index, source, stdout, failure, None);
+}
+
+fn run_case_with_workers(
+    index: usize,
+    source: &str,
+    stdout: &str,
+    failure: Option<&str>,
+    workers: Option<usize>,
+) {
     let directory = TempDir::new(&format!("native-task-if-source-{index}"));
     let ku_path = directory.path().join("program.ku");
     fs::write(&ku_path, source).unwrap();
@@ -59,12 +69,29 @@ fn run_case(index: usize, source: &str, stdout: &str, failure: Option<&str>) {
             normalized(&interpreted.stderr)
         );
     }
-    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+    let mut ast = Parser::new(Lexer::new(source).lex().unwrap())
         .parse_program()
         .unwrap();
+    // The CLI materializes this standard-module capability before checking.
+    // Real import expansion is independently exercised by the source CLI case.
+    for item in &mut ast.items {
+        if let ku::ast::Item::Import(import) = item {
+            if import.path == "std.time" {
+                *item = ku::ast::Item::Module(ku::ast::ModuleDecl {
+                    name: "std:time".into(),
+                    span: import.span,
+                });
+            }
+        }
+    }
     Checker::new().check(&ast).unwrap();
     let native = task_lower::lower_program(&ast).unwrap();
-    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let mut generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    if let Some(workers) = workers {
+        let original = "ku_task_root_worker_count(), startup_deadline);";
+        assert_eq!(generated.matches(original).count(), 1);
+        generated = generated.replacen(original, &format!("{workers}u, startup_deadline);"), 1);
+    }
     for forbidden in ["run_source", "const SOURCE", "Task.new", "task.spawn"] {
         assert!(!generated.contains(forbidden));
     }
@@ -866,5 +893,38 @@ fn native_task_if_cli_rejects_unsupported_and_ownership_before_either_artifact_p
             // Includes --backend c's output-digest subtree, not only main.c.
             assert_no_native_artifacts(directory.path(), &binary);
         }
+    }
+}
+
+#[test]
+fn native_task_sleep_uses_driver_wait_and_keeps_single_worker_available() {
+    let cases = [
+        (
+            "import time from \"std.time\"\nasync fn main(): null! { wait = 1 time.sleep(wait)? time.sleep(0)? println(7) return ok(null) }",
+            "7\n", None,
+        ),
+        (
+            "import time from \"std.time\"\nasync fn Bound(): int! { println(3) return ok(1) } async fn main(): null! { time.sleep((await Bound())?)? println(4) return ok(null) }",
+            "3\n4\n", None,
+        ),
+        (
+            "import time from \"std.time\"\nasync fn main(): null! { time.sleep(-1)? println(999) return ok(null) }",
+            "", Some("duration must be >= 0"),
+        ),
+        (
+            "import time from \"std.time\"\nasync fn Slow(): null! { time.sleep(250)? println(2) return ok(null) } async fn Fast(): null! { time.sleep(0)? println(1) return ok(null) } async fn main(): null! { slow = Slow() fast = Fast(); (await slow)?; (await fast)?; return ok(null) }",
+            "1\n2\n", None,
+        ),
+        (
+            "import time from \"std.time\"\nasync fn Child(): null! { time.sleep(250)? println(999) return ok(null) } async fn main(): null! { child = Child() time.sleep(20)? println(8) return ok(null) }",
+            "8\n", None,
+        ),
+        (
+            "import time from \"std.time\"\nasync fn main(): null! { for item in 3 { time.sleep(1)? if (item == 1) { continue } println(item) } time.sleep(-1) println(5) return ok(null) }",
+            "0\n2\n5\n", None,
+        ),
+    ];
+    for (index, (source, stdout, failure)) in cases.into_iter().enumerate() {
+        run_case_with_workers(900 + index, source, stdout, failure, Some(1));
     }
 }

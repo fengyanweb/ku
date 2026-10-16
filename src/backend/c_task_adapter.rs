@@ -505,6 +505,7 @@ typedef struct KuTaskInstance_@ID@ {
   uint64_t drain_published_deadline;
   KuTaskDriverCleanupReceiptV1 receipts[@RECEIPT_SIZE@];
   KuTaskDriverWaitTokenV1 wait;
+  KuTaskDriverTimerTokenV1 timer;
 @SCOPE_FIELDS@
 } KuTaskInstance_@ID@;
 typedef struct KuTaskHandle_@ID@ {
@@ -528,7 +529,12 @@ static uint32_t ku_task_@ID@_take_frame_payload(KuTaskInstance_@ID@* instance) {
 }
 
 static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reason, KuTaskControlV1* budget) {
-  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance)};
+  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance),&instance->timer};
+  if (instance->timer.driver) {
+    uint32_t timer_status=ku_task_driver_timer_detach(&instance->timer);
+    if (timer_status!=KU_TASK_DRIVER_OK && timer_status!=KU_TASK_DRIVER_STALE) return timer_status;
+    if (timer_status==KU_TASK_DRIVER_STALE) instance->timer=(KuTaskDriverTimerTokenV1){0};
+  }
   if (instance->wait.driver) {
     KuTaskDriverWaitSnapshotV1 snapshot={0};
     uint32_t status=ku_task_driver_wait_read(&instance->wait,&snapshot);
@@ -638,7 +644,7 @@ static uint32_t ku_task_@ID@_resume(void* raw) {
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)raw;
   if (!instance->frame_initialized) return KU_TASK_CONTROL_INVALID_STATE;
   KuTaskAdapterClockV1 bridge = { instance->ticket.driver, NULL };
-  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance)};
+  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance),&instance->timer};
   KuTaskFrameClockV1 clock = { ku_task_adapter_now, &bridge, &host };
   uint32_t status=KU_TASK_FRAME_READY;
   if (!instance->payload_initialized) {
@@ -737,6 +743,12 @@ static void ku_task_@ID@_dispose(KuTaskControlV1* control, void* raw) {
   (void)control;
   KuTaskDriverTicketV1 ticket = instance->ticket;
   bool registered = instance->registered;
+  if (instance->timer.driver) {
+    uint32_t status=ku_task_driver_timer_detach(&instance->timer);
+    if (status!=KU_TASK_DRIVER_OK && status!=KU_TASK_DRIVER_STALE) {
+      ku_task_adapter_fault(ticket.driver,0); return;
+    }
+  }
   free(instance);
   /* Last access to the instance was BEFORE free. Slot/bytes remain reserved
    * until this separate ticket acknowledgement, including late observer refs. */

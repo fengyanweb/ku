@@ -80,7 +80,7 @@ fn native_task_scope_sessions_complete_manifest_and_linearization_execute_in_c()
         assert!(!generated.contains(forbidden));
     }
     for required in [
-        "#define KU_TASK_DRIVER_ABI_VERSION 7u",
+        "#define KU_TASK_DRIVER_ABI_VERSION 8u",
         "ku_task_driver_scope_begin(",
         "ku_task_driver_scope_end(",
         "ku_task_driver_scope_promote_final(",
@@ -303,17 +303,17 @@ static void fixture_init(FixtureDriver* runtime,size_t capacity) {
   runtime->ring=(size_t*)calloc(capacity,sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
   size_t fixed=sizeof(*runtime->driver)+capacity*(sizeof(*runtime->slots)+sizeof(*runtime->ring));
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==7u && KU_TASK_FRAME_ABI_VERSION==4u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==8u && KU_TASK_FRAME_ABI_VERSION==4u);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now<UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
-  for (uint32_t old=1;old<7;old++) {
+  for (uint32_t old=1;old<KU_TASK_DRIVER_ABI_VERSION;old++) {
     CHECK(ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),old,runtime->slots,capacity,runtime->ring,capacity,fixed+1048576u,1u,startup_deadline)==KU_TASK_DRIVER_ABI_MISMATCH);
     CHECK(ku_task_frame_zero_bytes(runtime->driver,sizeof(*runtime->driver)));
     CHECK(ku_task_frame_zero_bytes(runtime->slots,capacity*sizeof(*runtime->slots)));
     CHECK(ku_task_frame_zero_bytes(runtime->ring,capacity*sizeof(*runtime->ring)));
   }
-  CHECK(!ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),7u,runtime->slots,capacity,runtime->ring,capacity,fixed+1048576u,1u,startup_deadline));
+  CHECK(!ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),KU_TASK_DRIVER_ABI_VERSION,runtime->slots,capacity,runtime->ring,capacity,fixed+1048576u,1u,startup_deadline));
   fixture_idle(runtime);
 }
 static void fixture_start(FixtureDriver* runtime,size_t i) {

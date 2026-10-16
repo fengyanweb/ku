@@ -122,6 +122,14 @@ root 使用最多 1024 个固定驻留槽；字节接纳按固定存储和生成
 1,000,000 字面量字节/分析工作量上限。Parser/Checker 的语句体嵌套限制为32层；Task
 lower 对已构造 AST 的 If 另限32层，表达式仍受 `depth > 64` 拒绝与共同资源预算约束。
 这些是分别拒绝的边界，不是复杂源码必定能达到32层或源码可写64层的承诺。
+整数毫秒的 `std.time.sleep(ms)` 已接入该 Task 路径，沿用 `null!` 返回；
+无需增加 `await`，`time.sleep(ms)?` 即可。仅识别实际标准库导入，参数先求值和快照一次；
+负数返回原 `time/invalid_duration`，零毫秒可以立即完成。正数使用 driver 的固定 timer
+记录与原条件等待，同一 worker 可以继续执行其它就绪 Task，不创建新的线程。
+每个实例同时最多一项 timer 登记，计入固定存储和 instance 大小；取消、退出及槽复用
+都会撤销登记，旧 token 不能影响后来的等待。清理体仍不能提交新的 sleep。
+这不包含 duration 对象、异步网络 I/O、用户 finally 或 native blocking pool。
+
 print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
 M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成；
 真实双 worker 重叠执行的定向测试不等于吞吐、扩展性或长期低 CPU 占用验收。

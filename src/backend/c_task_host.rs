@@ -78,7 +78,49 @@ typedef struct KuTaskAdapterHostV1 {
   KuTaskControlV1* control;
   KuTaskDriverWaitTokenV1* wait;
   size_t minimum_charge; /* Generated sizeof(parent instance), not user input. */
+  KuTaskDriverTimerTokenV1* timer;
 } KuTaskAdapterHostV1;
+static void ku_task_adapter_fault(KuTaskDriverV1* driver, int clock_fault);
+enum { KU_TASK_HOST_TIMER_OVERFLOW = 97u };
+/* One fixed registration is owned by the executing instance. A pending poll
+ * reads its token, so neither the argument nor absolute deadline is renewed. */
+static uint32_t ku_task_host_timer(KuTaskAdapterHostV1* host, int64_t millis,
+    KuResult_null* output) {
+  if (!host || !host->ticket || !host->control || !host->timer || !output)
+    return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if (ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE)
+    return KU_TASK_CONTROL_PENDING;
+  uint32_t status;
+  if (host->timer->driver) {
+    status=ku_task_driver_timer_read(host->timer);
+  } else {
+    if (millis<0) {
+      *output=(KuResult_null){false,0,ku_error_make(
+        ku_string_static((const uint8_t*)"time",4),
+        ku_string_static((const uint8_t*)"invalid_duration",16),
+        ku_string_static((const uint8_t*)"duration must be >= 0",21))};
+      return KU_TASK_CONTROL_OK;
+    }
+    uint64_t now=ku_task_driver_now_ms();
+    if (now==UINT64_MAX) {
+      ku_task_adapter_fault(host->ticket->driver,1);
+      return KU_TASK_CONTROL_INVALID_STATE;
+    }
+    if ((uint64_t)millis>=UINT64_MAX-now) return KU_TASK_HOST_TIMER_OVERFLOW;
+    status=ku_task_driver_timer_arm(host->ticket,now+(uint64_t)millis,host->timer);
+  }
+  if (status==KU_TASK_DRIVER_PENDING) {
+    if (ku_task_driver_set_intent(host->ticket,KU_TASK_DRIVER_WAIT)!=KU_TASK_DRIVER_OK)
+      return KU_TASK_CONTROL_INVALID_STATE;
+    return KU_TASK_CONTROL_PENDING;
+  }
+  if (status==KU_TASK_DRIVER_WAIT_ABORTED) return KU_TASK_CONTROL_PENDING;
+  if (status!=KU_TASK_DRIVER_WAIT_READY) return KU_TASK_CONTROL_INVALID_STATE;
+  if (ku_task_driver_timer_detach(host->timer)!=KU_TASK_DRIVER_OK)
+    return KU_TASK_CONTROL_INVALID_STATE;
+  *output=(KuResult_null){true,0,{0}};
+  return KU_TASK_CONTROL_OK;
+}
 static uint32_t ku_task_value_check(KuTaskValueV1* value);
 static void ku_task_adapter_fault(KuTaskDriverV1* driver, int clock_fault);
 static int ku_task_outcome_empty_string(KuString value) {

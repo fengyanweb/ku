@@ -97,6 +97,10 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 map(task);
                 map(dst);
             }
+            TaskTerminator::Timer { millis, dst, .. } => {
+                map(millis);
+                map(dst);
+            }
             TaskTerminator::TryResult {
                 src,
                 ok_value,

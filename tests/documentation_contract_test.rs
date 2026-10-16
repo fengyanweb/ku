@@ -87,7 +87,7 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         assert!(!document.contains("仍拒绝 if/循环/递归"));
         assert!(!document.contains("if/循环/递归、重复赋值、嵌套 scope"));
     }
-    assert!(ir.contains("Frame ABI 4、Control ABI 2、Driver ABI 7"));
+    assert!(ir.contains("Frame ABI 4、Control ABI 2、Driver ABI 8"));
     for boundary in [
         "worker 数与 slot 容量独立",
         "ACTIVE 包括锁外 lease/dispose 尾部",

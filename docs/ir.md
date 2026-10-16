@@ -255,7 +255,7 @@ R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 
 升为版本 4，R5h 正常作用域登记字段升为版本 5，单向 FINAL 标记升为版本 6；
 R6 的有界 worker 组、双条件和显式 join 生命周期升为版本 7。
 内部 C 类型名中的 `V1` 不是旧布局兼容承诺，初始化明确拒绝旧版本（包括6）。
-当前 Frame ABI 4、Control ABI 2、Driver ABI 7。
+当前 Frame ABI 4、Control ABI 2、Driver ABI 8。
 普通同步输出和空 Task IR 不附带该实现。私有 init 显式接收 1..32 个真实 OS worker
 及有限 startup_deadline；worker 数与 slot 容量独立，使用调用方提供的固定 slot/ring。
 源码 root 在执行目标上按 min(32, max(4, OS 报告的逻辑处理器数)) 选择 worker 数，
@@ -454,8 +454,23 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 
 源码与两种 CLI native 构建、表达式和清理测试的实际结果按精确提交记录在工作日志。
 定向验证、完整本机门禁和三系统 CI/sanitizer 分开记录，历史失败及修复结果也分列，
-不从旧 SHA 的通过结果外推。Frame ABI 4、Control ABI 2、Driver ABI 7 不等于稳定外部 C FFI。
+不从旧 SHA 的通过结果外推。Frame ABI 4、Control ABI 2、Driver ABI 8 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
+
+### 源码 sleep 与 Driver8 timer
+
+`Timer { millis, dst, ready, cleanup }` 要求 owned int 参数和 `null!` 目标。
+参数槽在 Pending 期间显式持久化，只有 Ready 初始化目标；零毫秒不能作为无条件
+让出执行的证明。源码只接受实际 std.time 导入下未被遮蔽的 `sleep(int)`。
+Host 首次登记绝对到期点，Pending 重入读取原 token；Ready 先 detach 再产生结果，
+负数沿用普通错误。取消/退出先撤掉 timer，再进入原 scope/receipt 清理。
+
+Driver8 每个固定槽包含一条独立 timer 记录，token 携带 slot generation 和 timer epoch；
+旧 token 对复用槽返回 STALE。到期复用原最早期限、条件等待与 ready 队列，不增加
+轮询线程。固定存储及 adapter token 均计入实际 sizeof 费用。snapshot 新增当前/峰值
+`timers`、`peak_timers` 和容量 `timer_limit`，以及 resident/queued/running/reserved_bytes
+峰值。READY/ABORTED 登记在 detach 或 terminal 前仍占用 timer 计数。
+这是内部 ABI 更新，旧生成 C 需重新编译；不扩展稳定外部 FFI。
 
 ### R5h 正常作用域 session（源码 if 复用的内部协议）
 
@@ -599,7 +614,7 @@ Jump/ScopeDrain 链和合法 Value drop，到 End 时必须恰好到达 retain�
 
 分析沿用原硬限和逐步预算；没有标记时不分配新增操作/状态向量 buffer。
 仅含标记的生成函数帧保存退出身份和原始绝对期限，公共 Frame ABI 4、Control ABI 2、
-Driver ABI 7 不变，实际实例 sizeof 仍计入原 frame 预算。逐层 normal scope session
+Driver ABI 8 不变，实际实例 sizeof 仍计入原 frame 预算。逐层 normal scope session
 各自真实结束，但同一次退出的期限持续到最后 Value drop 和 End，不逐层重建。
 超期转原 runtime-failure 退出桥；取消和更短期限继续沿用既有移交与实际 ACK 协议。
 没有标记的函数维持原实例布局。定向运行与精确 SHA 三系统 CI 分别记录，不能据

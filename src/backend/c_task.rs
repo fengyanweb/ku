@@ -143,7 +143,13 @@ impl<'a> FrameEmitter<'a> {
         }
         if frame.scope_task_mask != task_mask
             || frame.exit_bridge != exit_bridge
-            || frame.hosted != (task_mask != 0 || exit_bridge)
+            || frame.hosted
+                != (task_mask != 0
+                    || exit_bridge
+                    || function
+                        .states
+                        .iter()
+                        .any(|state| matches!(state.terminator, TaskTerminator::Timer { .. })))
         {
             return Err(unsupported(
                 "native task frame plan has inconsistent exit ownership",
@@ -729,6 +735,22 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     out.push_str(&format!("    frame->header.state={}u;\n  }} else {{\n    {}.error=ku_error_move(&taken.error);\n",ok.0,self.place(*err_result)));
                     self.set_init(out, *err_result, true);
                     out.push_str(&format!("    frame->header.state={}u;\n  }}\n  ku_result_drop_{suffix}(&taken); }}\n  goto ku_task_dispatch;\n",err.0));
+                }
+                TaskTerminator::Timer {
+                    millis,
+                    dst,
+                    ready,
+                    cleanup,
+                } => {
+                    out.push_str("  if (cleanup) goto ku_task_terminated;\n");
+                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t timer_status=ku_task_host_timer((KuTaskAdapterHostV1*)clock->host,{},&{});\n  if (timer_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (timer_status==KU_TASK_HOST_TIMER_OVERFLOW) {{\n", cleanup.0, self.place(*millis), self.place(*dst)));
+                    self.emit_runtime_error(out, "ku_error_make(ku_string_static((const uint8_t*)\"time\",4),ku_string_static((const uint8_t*)\"invalid_duration\",16),ku_string_static((const uint8_t*)\"time.sleep duration is too large for this platform\",50))")?;
+                    out.push_str("  }\n  if (timer_status!=KU_TASK_CONTROL_OK) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n");
+                    self.set_init(out, *dst, true);
+                    out.push_str(&format!(
+                        "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
+                        ready.0
+                    ));
                 }
                 TaskTerminator::Await {
                     task,

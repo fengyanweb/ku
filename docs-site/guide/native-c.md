@@ -4,7 +4,7 @@ native build 管线会先展开完整 import graph，再生成 C；链接模式�
 
 当前 native ABI 已覆盖正式 `KuString`（长度输出、static/owned storage、clone/move/drop/concat/equal）、带边界检查和 `push`/`len` 的 array、开放寻址 dynamic object 与 tagged `KuValue`、统一 `KuError` 和复杂 `Result<T>`、`?` / `try/catch/finally`、函数值及带引用计数环境的捕获 closure。`std.fs`、`std.json` 和 `std.time` 也有 native 实现及运行测试。
 
-native 另有受限的 Task 源码路径：入口为 `async fn main(): null!`，支持 `int`/`bool`/`null`/`str`、单层 `Result`、Task start/move/await、`if`/`else`、`while` 与整数 `for`，使用内部 Task 帧与 driver 合同；这不代表完整 async/await 或稳定的外部 Task FFI。该 Task 路径的数组 `for`、`break`/`continue`、`try/catch/finally`、函数值及其他 Owned payload 仍未接入。IR/native 还会明确拒绝递归 value struct/enum 布局、object 解构、optional chaining、break/continue、捕获 `for` 循环绑定以及尚未进入 C runtime 的标准库能力；字符串 `trim`/`lower`/`upper` 也还没有 native Unicode 实现。遇到这些边界必须 fail closed，不允许静默换语义。
+native 另有受限的 Task 源码路径：入口为 `async fn main(): null!`，支持 `int`/`bool`/`null`/`str`、单层 `Result`、Task start/move/await、`if`/`else`、`while` 与整数 `for`，使用内部 Task 帧与 driver 合同；这不代表完整 async/await 或稳定的外部 Task FFI。该 Task 路径支持循环内 `break`/`continue` 和整数毫秒 `std.time.sleep(ms)`；数组 `for`、`try/catch/finally`、函数值及其他 Owned payload 仍未接入。IR/native 还会明确拒绝递归 value struct/enum 布局、object 解构、optional chaining、break/continue、捕获 `for` 循环绑定以及尚未进入 C runtime 的标准库能力；字符串 `trim`/`lower`/`upper` 也还没有 native Unicode 实现。遇到这些边界必须 fail closed，不允许静默换语义。
 
 跨系统发布按目标分别构建，不存在一个二进制同时运行于三个系统。唯一推荐命令是：
 

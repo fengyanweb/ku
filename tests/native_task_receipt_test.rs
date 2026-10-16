@@ -810,7 +810,7 @@ static void fixture_corrupt_ack_process(void) {
   puts("task-receipt-corruption-quarantined-not-drained");
 }
 int main(int argc, char** argv) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 7u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 8u);
   CHECK(KU_TASK_FRAME_ABI_VERSION == 4u);
   ku_task_control_atomic_init(&fixture_bad_clock, 0);
   if (argc == 2 && !strcmp(argv[1], "--corrupt-ack")) { fixture_corrupt_ack_process(); return 0; }

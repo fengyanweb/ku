@@ -222,7 +222,7 @@ static uint64_t ku_task_driver_now_ms(void) {
 
 const C_MAIN: &str = r#"
 #define ROLE_COUNT 12u
-enum { MODE_FINISH, MODE_HOLD, MODE_WAIT, MODE_PROBE };
+enum { MODE_FINISH, MODE_HOLD, MODE_WAIT, MODE_PROBE, MODE_TIMER };
 enum { PROBE_HEADERS, PROBE_SELF_ACK, PROBE_CYCLE_ACK, PROBE_FAILURE, PROBE_FIRST_ACK };
 typedef struct FixtureDriver { KuTaskDriverV1* driver; KuTaskDriverSlotV1* slots; size_t* ring; size_t capacity; } FixtureDriver;
 typedef struct FixtureRole {
@@ -230,6 +230,7 @@ typedef struct FixtureRole {
   KuTaskDriverTicketV1 ticket;
   KuTaskDriverCleanupReceiptV1 receipt, target_receipt;
   KuTaskDriverWaitTokenV1 wait, old_wait;
+  KuTaskDriverTimerTokenV1 timer, old_timer;
   KuTestEvent entered, proceed, armed, finished, cleanup_entered, acked, disposed;
   KuTestEvent take_entered, take_proceed, stored, store_proceed;
   KuTestEvent publishing, publish_proceed;
@@ -239,8 +240,10 @@ typedef struct FixtureRole {
   size_t target;
   int initialized, done, entry_gate, after_arm_gate, hold_latch, cleanup_hold, wait_cleanup;
   int take_gate, take_reject, store_gate, corrupt_ack, queue_full, publishing_gate;
+  int timer_cycles, timer_preflight, timer_keep_for_terminal;
 } FixtureRole;
 static FixtureRole roles[ROLE_COUNT];
+static const char* fixture_case = "existing ACK cases";
 /* The fault subprocess explicitly retains this root. Reachability is not drain. */
 static FixtureDriver fixture_quarantined_driver;
 static size_t fixture_count(KuAtomicRefcount* p) { return ku_task_control_atomic_load(p); }
@@ -269,11 +272,29 @@ static void fixture_role_init(size_t i, uint32_t mode) {
 static KuTaskDriverSnapshotV1 fixture_snapshot(FixtureDriver* runtime, uint32_t fault) {
   KuTaskDriverSnapshotV1 s = {0}; CHECK(ku_task_driver_snapshot(runtime->driver, &s) == KU_TASK_DRIVER_OK);
   CHECK(s.fault == fault && s.running <= 1 && s.resident <= runtime->capacity);
+  CHECK(s.peak_resident >= s.resident && s.peak_resident <= runtime->capacity);
+  CHECK(s.peak_queued >= s.queued && s.peak_queued <= runtime->capacity);
+  CHECK(s.peak_running >= s.running && s.peak_running <= 1u);
+  CHECK(s.peak_reserved_bytes >= s.reserved_bytes && s.peak_reserved_bytes <= s.byte_limit - s.fixed_bytes);
+  CHECK(s.timers <= s.resident && s.peak_timers >= s.timers && s.peak_timers <= runtime->capacity);
+  CHECK(s.timer_limit == runtime->capacity);
   CHECK(s.worker_target == 1u && s.workers_created == 1u); return s;
 }
 static void fixture_idle(FixtureDriver* runtime, uint32_t fault) {
-  CHECK(ku_task_driver_wait_idle(runtime->driver, fixture_deadline()) == fault);
+  uint32_t observed = ku_task_driver_wait_idle(runtime->driver, fixture_deadline());
+  if (observed != fault) {
+    KuTaskDriverSnapshotV1 failure = {0};
+    CHECK(ku_task_driver_snapshot(runtime->driver, &failure) == KU_TASK_DRIVER_OK);
+    fprintf(stderr, "case %s: idle returned %u, expected %u; fault=%u closing=%u timers=%zu resident=%zu queued=%zu running=%zu polls=%llu\n",
+        fixture_case, observed, fault, failure.fault, failure.closing, failure.timers,
+        failure.resident, failure.queued, failure.running, (unsigned long long)failure.polls);
+  }
+  CHECK(observed == fault);
   KuTaskDriverSnapshotV1 s = fixture_snapshot(runtime, fault);
+  if (s.queued || s.running || s.workers_waiting + s.workers_exited != s.workers_created)
+    fprintf(stderr, "case %s: post-idle snapshot queued=%zu running=%zu waiting=%zu exited=%zu created=%zu timers=%zu polls=%llu\n",
+        fixture_case, s.queued, s.running, s.workers_waiting, s.workers_exited, s.workers_created,
+        s.timers, (unsigned long long)s.polls);
   CHECK(!s.queued && !s.running && s.workers_waiting + s.workers_exited == s.workers_created);
 }
 static void fixture_driver_init(FixtureDriver* runtime, size_t capacity) {
@@ -285,12 +306,15 @@ static void fixture_driver_init(FixtureDriver* runtime, size_t capacity) {
   uint64_t startup_now = ku_task_driver_now_ms();
   CHECK(startup_now != UINT64_MAX && startup_now < UINT64_MAX - 1000u);
   uint64_t startup_deadline = startup_now + 1000u;
-  for (uint32_t old = 1; old <= 6; ++old) {
+  for (uint32_t old = 1; old <= 7; ++old) {
     CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), old, runtime->slots, capacity, runtime->ring, capacity, fixed + 1048576u, 1u, startup_deadline) == KU_TASK_DRIVER_ABI_MISMATCH);
     CHECK(ku_task_frame_zero_bytes(runtime->driver, sizeof(*runtime->driver)));
     CHECK(ku_task_frame_zero_bytes(runtime->slots, capacity * sizeof(*runtime->slots)));
     CHECK(ku_task_frame_zero_bytes(runtime->ring, capacity * sizeof(*runtime->ring)));
   }
+  CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), KU_TASK_DRIVER_ABI_VERSION,
+      runtime->slots, capacity, runtime->ring, capacity, fixed - 1u, 1u, startup_deadline) == KU_TASK_DRIVER_LIMIT);
+  CHECK(ku_task_frame_zero_bytes(runtime->driver, sizeof(*runtime->driver)));
   CHECK(ku_task_driver_init(runtime->driver, sizeof(*runtime->driver), KU_TASK_DRIVER_ABI_VERSION, runtime->slots, capacity, runtime->ring, capacity, fixed + 1048576u, 1u, startup_deadline) == KU_TASK_DRIVER_OK);
   fixture_idle(runtime, 0); CHECK(fixture_snapshot(runtime, 0).fixed_bytes == fixed);
 }
@@ -370,7 +394,7 @@ static void fixture_state_wait_real(KuTaskDriverV1* driver, uint64_t observation
   timeout.tv_nsec = (long)((remaining % 1000u) * 1000000u);
   int waited = pthread_cond_timedwait_relative_np(&driver->condition, &driver->mutex, &timeout);
 #else
-  /* ABI7 initializes this native condition with CLOCK_MONOTONIC. Convert the
+  /* ABI8 initializes this native condition with CLOCK_MONOTONIC. Convert the
    * original real observation D directly, never the synthetic runtime D. */
   timeout.tv_sec = (time_t)(observation_deadline / 1000u);
   CHECK((uint64_t)timeout.tv_sec == observation_deadline / 1000u);
@@ -404,6 +428,7 @@ static void fixture_driver_stop(FixtureDriver* runtime, uint32_t expected) {
   CHECK(runtime->driver->shutdown_deadline == cleanup_deadline);
   CHECK(runtime->driver->worker_target == 1u && runtime->driver->workers_created == 1u);
   CHECK(!runtime->driver->resident && !runtime->driver->reserved_bytes && !runtime->driver->building);
+  CHECK(!runtime->driver->timers);
   CHECK(!runtime->driver->queued && !runtime->driver->running);
   /* INTERNAL from the injected clock can precede the final unlocked worker
    * tail. Wait on the actual state predicate, not the broken clock API. */
@@ -460,6 +485,59 @@ static void fixture_finish(FixtureDriver* runtime, uint32_t fault) {
   FixtureLedger ledger = fixture_ledger(); CHECK(!ledger.allocations && !ledger.bytes && !ledger.overflow);
 }
 static void fixture_probe(FixtureRole*, KuTaskInstance_0*);
+static uint32_t fixture_timer_step(FixtureRole* r, KuTaskInstance_0* instance) {
+  if (r->done) return UINT32_MAX;
+  uint32_t outcome;
+  if (!r->timer.driver) {
+    KuTaskDriverTimerTokenV1 invalid = {0};
+    size_t calls = fixture_ledger().calls;
+    if (r->timer_preflight) {
+      CHECK(ku_task_driver_timer_arm(&instance->ticket, UINT64_MAX, &invalid) == KU_TASK_DRIVER_INVALID_ARGUMENT);
+      CHECK(!invalid.driver && !invalid.epoch);
+      CHECK(ku_task_driver_timer_arm(&instance->ticket, r->deadline,
+          (KuTaskDriverTimerTokenV1*)&instance->control) == KU_TASK_DRIVER_INVALID_ARGUMENT);
+      CHECK(ku_task_driver_timer_arm(&instance->ticket, r->deadline,
+          (KuTaskDriverTimerTokenV1*)&instance->ticket) == KU_TASK_DRIVER_INVALID_ARGUMENT);
+      CHECK(!ku_task_driver_lock(instance->ticket.driver));
+      KuTaskDriverSlotV1* slot = &instance->ticket.driver->slots[instance->ticket.slot];
+      uint64_t epoch = slot->timer_epoch; slot->timer_epoch = UINT64_MAX;
+      CHECK(!ku_task_driver_unlock(instance->ticket.driver));
+      CHECK(ku_task_driver_timer_arm(&instance->ticket, r->deadline, &invalid) == KU_TASK_DRIVER_LIMIT);
+      CHECK(!invalid.driver && !invalid.epoch);
+      CHECK(!ku_task_driver_lock(instance->ticket.driver)); slot->timer_epoch = epoch;
+      CHECK(!ku_task_driver_unlock(instance->ticket.driver));
+    }
+    outcome = ku_task_driver_timer_arm(&instance->ticket, r->deadline, &r->timer);
+    CHECK(fixture_ledger().calls == calls);
+    CHECK(outcome == KU_TASK_DRIVER_PENDING || outcome == KU_TASK_DRIVER_WAIT_READY);
+    r->arm_status = outcome;
+    CHECK(ku_task_driver_timer_arm(&instance->ticket, r->deadline, &invalid) == KU_TASK_DRIVER_INVALID_STATE);
+    if (r->old_timer.driver) {
+      CHECK(ku_task_driver_timer_read(&r->old_timer) == KU_TASK_DRIVER_STALE);
+      CHECK(ku_task_driver_timer_detach(&r->old_timer) == KU_TASK_DRIVER_STALE);
+    }
+    KuTaskDriverTimerTokenV1 stale = r->timer; stale.generation++;
+    CHECK(ku_task_driver_timer_read(&stale) == KU_TASK_DRIVER_STALE);
+    CHECK(ku_task_driver_timer_detach(&stale) == KU_TASK_DRIVER_STALE);
+    CHECK(ku_test_event_set(&r->armed));
+    if (r->after_arm_gate) { CHECK(ku_test_event_set(&r->entered)); CHECK(ku_test_event_wait(&r->proceed, 2000)); }
+  } else outcome = ku_task_driver_timer_read(&r->timer);
+  if (outcome == KU_TASK_DRIVER_PENDING || r->hold_latch) {
+    CHECK(ku_task_driver_set_intent(&instance->ticket, KU_TASK_DRIVER_WAIT) == KU_TASK_DRIVER_OK);
+    return KU_TASK_CONTROL_PENDING;
+  }
+  CHECK(outcome == KU_TASK_DRIVER_WAIT_READY);
+  r->old_timer = r->timer;
+  CHECK(ku_task_driver_timer_detach(&r->timer) == KU_TASK_DRIVER_OK);
+  CHECK(!r->timer.driver && !r->timer.epoch);
+  CHECK(ku_task_driver_timer_read(&r->old_timer) == KU_TASK_DRIVER_STALE);
+  if (r->timer_cycles > 1) {
+    r->timer_cycles--; r->deadline += 100u;
+    return KU_TASK_CONTROL_PENDING; /* detach supplied the original YIELD. */
+  }
+  r->outcome = outcome; r->done = 1; fixture_inc(&r->continuations);
+  CHECK(ku_test_event_set(&r->finished)); return UINT32_MAX;
+}
 static uint32_t fixture_wait_step(FixtureRole* r, KuTaskInstance_0* instance, int cleanup) {
   if (r->done) return UINT32_MAX;
   uint32_t outcome;
@@ -503,6 +581,7 @@ static uint32_t fixture_resume(void* raw) {
   if (r->entry_gate) { r->entry_gate = 0; CHECK(ku_test_event_set(&r->entered)); CHECK(ku_test_event_wait(&r->proceed, 2000)); }
   if (r->mode == MODE_PROBE && !r->done) { fixture_probe(r, instance); r->done = 1; CHECK(ku_test_event_set(&r->finished)); }
   if (r->mode == MODE_WAIT && !r->done) return fixture_wait_step(r, instance, 0);
+  if (r->mode == MODE_TIMER && !r->done) return fixture_timer_step(r, instance);
   if (r->mode == MODE_HOLD) { CHECK(ku_task_driver_set_intent(&instance->ticket, KU_TASK_DRIVER_WAIT) == KU_TASK_DRIVER_OK); return KU_TASK_CONTROL_PENDING; }
   return UINT32_MAX;
 }
@@ -510,6 +589,14 @@ static uint32_t fixture_cleanup(void* raw, uint32_t reason) {
   FixtureRole* r = fixture_role(raw); KuTaskInstance_0* instance = (KuTaskInstance_0*)raw;
   fixture_inc(&r->cleanups); r->reason = reason; CHECK(ku_test_event_set(&r->cleanup_entered));
   if (r->cleanup_hold) { CHECK(ku_task_driver_set_intent(&instance->ticket, KU_TASK_DRIVER_WAIT) == KU_TASK_DRIVER_OK); return KU_TASK_CONTROL_PENDING; }
+  if (r->timer.driver) {
+    CHECK(ku_task_driver_timer_read(&r->timer) == KU_TASK_DRIVER_WAIT_ABORTED);
+    if (!r->timer_keep_for_terminal) CHECK(ku_task_driver_timer_detach(&r->timer) == KU_TASK_DRIVER_OK);
+    KuTaskDriverTimerTokenV1 rejected = {0};
+    CHECK(ku_task_driver_timer_arm(&instance->ticket, r->deadline, &rejected)
+        == (r->timer_keep_for_terminal ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_WAIT_ABORTED));
+    CHECK(!rejected.driver);
+  }
   if (r->mode == MODE_PROBE && !r->done) { fixture_probe(r, instance); r->done = 1; CHECK(ku_test_event_set(&r->finished)); }
   if (r->wait_cleanup && !r->done) return fixture_wait_step(r, instance, 1);
   if (r->wait.driver) CHECK(ku_task_driver_wait_detach(&r->wait) == KU_TASK_DRIVER_OK);
@@ -813,6 +900,126 @@ static void fixture_real_timer(void) {
   fixture_completed_parent(&runtime, 1, KU_TASK_DRIVER_CLEANUP_TIMEOUT, 0);
   fixture_child_release(&runtime, 0); fixture_disposed_wait(0); fixture_finish(&runtime, 0);
 }
+/* General source-call timers use the original group and ready ring. The
+ * injected clock selects races; the separate real-clock case tests OS wake. */
+static void fixture_timer_start(FixtureDriver* runtime, size_t i, uint64_t deadline) {
+  fixture_role_init(i, MODE_TIMER); roles[i].deadline = deadline;
+  roles[i].timer_cycles = 1; fixture_start(runtime, i);
+}
+static void fixture_timer_armed(FixtureDriver* runtime, size_t i) {
+  CHECK(ku_test_event_wait(&roles[i].armed, 2000)); fixture_idle(runtime, 0);
+  CHECK(ku_task_driver_timer_read(&roles[i].timer) == KU_TASK_DRIVER_PENDING);
+}
+static void fixture_timer_completed(FixtureDriver* runtime, size_t i) {
+  CHECK(ku_test_event_wait(&roles[i].finished, 2000)); fixture_idle(runtime, 0);
+  CHECK(roles[i].outcome == KU_TASK_DRIVER_WAIT_READY && fixture_count(&roles[i].continuations) == 1u);
+  KuTaskAdapterOutcomeV1 value = {0}; KuTaskAdapterTakeRequestV1 request = {&value, NULL};
+  CHECK(ku_task_driver_take_result(&roles[i].ticket, &roles[i].handle.owner.lease, &request) == KU_TASK_CONTROL_OK);
+  CHECK(value.result_kind == 4u && value.value.string.ok && value.value.string.value.len == 7u);
+  ku_task_outcome_drop(&value); fixture_transfer(i, fixture_deadline()); fixture_disposed_wait(i);
+}
+static void fixture_timer_rearm_and_reuse(void) {
+  fixture_clock_begin(); FixtureDriver runtime; fixture_driver_init(&runtime, 3);
+  uint64_t first = ku_task_driver_now_ms() + 100u;
+  fixture_role_init(0, MODE_TIMER); roles[0].deadline = first; roles[0].timer_cycles = 2;
+  roles[0].timer_preflight = 1; roles[0].hold_latch = 1; fixture_start(&runtime, 0); fixture_timer_armed(&runtime, 0);
+  KuTaskDriverTimerTokenV1 old = roles[0].timer;
+  CHECK(fixture_snapshot(&runtime, 0).timers == 1u); fixture_stable(&runtime, 0);
+  fixture_timer_start(&runtime, 1, first); fixture_timer_armed(&runtime, 1);
+  fixture_role_init(2, MODE_FINISH); fixture_start(&runtime, 2); fixture_idle(&runtime, 0);
+  CHECK(ku_task_control_atomic_load(&roles[2].handle.owner.lease.control->phase) == KU_TASK_CONTROL_COMPLETED);
+  CHECK(fixture_snapshot(&runtime, 0).timers == 2u && fixture_snapshot(&runtime, 0).peak_timers == 2u);
+  fixture_transfer(2, fixture_deadline()); fixture_disposed_wait(2);
+  fixture_advance(&runtime, first); fixture_idle(&runtime, 0);
+  fixture_timer_completed(&runtime, 1);
+  CHECK(ku_task_driver_timer_read(&roles[0].timer) == KU_TASK_DRIVER_WAIT_READY);
+  CHECK(!fixture_count(&roles[0].continuations) && fixture_snapshot(&runtime, 0).timers == 1u);
+  fixture_stable(&runtime, 0); /* notified timer does not periodically repoll. */
+  CHECK(!ku_task_driver_lock(runtime.driver)); roles[0].hold_latch = 0; CHECK(!ku_task_driver_unlock(runtime.driver));
+  CHECK(ku_task_driver_wake(&roles[0].ticket) == KU_TASK_DRIVER_OK); fixture_idle(&runtime, 0);
+  CHECK(roles[0].timer.epoch == old.epoch + 1u && roles[0].timer.generation == old.generation);
+  CHECK(ku_task_driver_timer_read(&old) == KU_TASK_DRIVER_STALE);
+  CHECK(ku_task_driver_timer_detach(&old) == KU_TASK_DRIVER_STALE);
+  fixture_advance(&runtime, first + 100u); fixture_timer_completed(&runtime, 0);
+  CHECK(fixture_snapshot(&runtime, 0).timers == 0u);
+  /* Reusing the same fixed slot rejects the old generation without touching
+   * the newer timer, even when its old absolute deadline is scanned again. */
+  fixture_timer_start(&runtime, 3, first + 300u); fixture_timer_armed(&runtime, 3);
+  CHECK(roles[3].timer.slot == old.slot && roles[3].timer.generation > old.generation);
+  CHECK(ku_task_driver_timer_read(&old) == KU_TASK_DRIVER_STALE);
+  fixture_advance(&runtime, first + 200u); fixture_stable(&runtime, 0);
+  CHECK(ku_task_driver_timer_read(&roles[3].timer) == KU_TASK_DRIVER_PENDING);
+  fixture_advance(&runtime, first + 300u); fixture_timer_completed(&runtime, 3);
+  KuTaskDriverSnapshotV1 s = fixture_snapshot(&runtime, 0);
+  CHECK(!s.timers && s.peak_timers == 2u && s.peak_running == 1u && s.peak_reserved_bytes);
+  fixture_finish(&runtime, 0);
+}
+static void fixture_timer_ready_ring_capacity(void) {
+  fixture_clock_begin(); FixtureDriver runtime; fixture_driver_init(&runtime, 3);
+  uint64_t deadline = ku_task_driver_now_ms() + 100u;
+  fixture_role_init(0, MODE_TIMER); roles[0].deadline = deadline; roles[0].timer_cycles = 1; roles[0].after_arm_gate = 1;
+  fixture_start(&runtime, 0); CHECK(ku_test_event_wait(&roles[0].entered, 2000));
+  fixture_role_init(1, MODE_FINISH); fixture_start(&runtime, 1);
+  fixture_role_init(2, MODE_FINISH); fixture_start(&runtime, 2);
+  CHECK(!ku_task_driver_lock(runtime.driver));
+  CHECK(runtime.driver->queued == 2u && runtime.driver->resident == 3u && runtime.driver->running == 1u);
+  CHECK(!ku_task_driver_unlock(runtime.driver));
+  fixture_advance(&runtime, deadline); CHECK(ku_test_event_set(&roles[0].proceed));
+  fixture_timer_completed(&runtime, 0); fixture_idle(&runtime, 0);
+  for (size_t i = 1; i < 3; i++) { fixture_transfer(i, fixture_deadline()); fixture_disposed_wait(i); }
+  KuTaskDriverSnapshotV1 s = fixture_snapshot(&runtime, 0);
+  CHECK(!s.timers && s.peak_timers == 1u && s.peak_queued == 3u && s.peak_resident == 3u);
+  fixture_finish(&runtime, 0);
+}
+static void fixture_timer_cancel(int after_due, int keep_for_terminal) {
+  fixture_clock_begin(); FixtureDriver runtime; fixture_driver_init(&runtime, 1);
+  uint64_t deadline = ku_task_driver_now_ms() + 100u;
+  fixture_role_init(0, MODE_TIMER); roles[0].deadline = deadline; roles[0].timer_cycles = 1;
+  roles[0].hold_latch = 1; roles[0].cleanup_hold = 1; roles[0].timer_keep_for_terminal = keep_for_terminal;
+  fixture_start(&runtime, 0); fixture_timer_armed(&runtime, 0); KuTaskDriverTimerTokenV1 old = roles[0].timer;
+  if (after_due) { fixture_advance(&runtime, deadline); fixture_idle(&runtime, 0); }
+  CHECK(ku_task_driver_request_cancel(&roles[0].ticket, &roles[0].handle.owner.lease,
+      KU_TASK_CONTROL_TIMED_OUT, deadline + 500u) == KU_TASK_CONTROL_OK);
+  CHECK(ku_test_event_wait(&roles[0].cleanup_entered, 2000)); fixture_idle(&runtime, 0);
+  CHECK(ku_task_driver_timer_read(&old) == KU_TASK_DRIVER_WAIT_ABORTED);
+  CHECK(fixture_snapshot(&runtime, 0).timers == 1u && !fixture_count(&roles[0].continuations));
+  fixture_advance(&runtime, deadline + 1u); fixture_stable(&runtime, 0);
+  fixture_child_release(&runtime, 0); fixture_idle(&runtime, 0);
+  CHECK(ku_task_driver_timer_read(&old) == KU_TASK_DRIVER_STALE && !fixture_snapshot(&runtime, 0).timers);
+  CHECK(ku_task_control_atomic_load(&roles[0].handle.owner.lease.control->phase) == KU_TASK_CONTROL_TIMED_OUT);
+  CHECK(!fixture_count(&roles[0].continuations));
+  fixture_transfer(0, fixture_deadline()); fixture_disposed_wait(0); fixture_finish(&runtime, 0);
+}
+static void fixture_timer_shutdown_and_clock_fault(int clock_fault) {
+  fixture_clock_begin(); FixtureDriver runtime; fixture_driver_init(&runtime, 1);
+  fixture_role_init(0, MODE_TIMER); roles[0].deadline = ku_task_driver_now_ms() + 10000u;
+  roles[0].timer_cycles = 1; roles[0].timer_keep_for_terminal = 1;
+  fixture_start(&runtime, 0); fixture_timer_armed(&runtime, 0); KuTaskDriverTimerTokenV1 old = roles[0].timer;
+  if (clock_fault) ku_task_control_deadline_store(&fixture_clock, UINT64_MAX);
+  CHECK(ku_task_driver_shutdown(runtime.driver, 0)
+      == (clock_fault ? KU_TASK_DRIVER_INTERNAL : KU_TASK_DRIVER_SHUTDOWN_TIMEOUT));
+  /* wait_idle deliberately reports a broken clock before waiting: INTERNAL
+   * is an error observation, not a retirement witness. Follow the original
+   * clock-fault fixture: transfer the actual owner and wait for real disposal,
+   * then let fixture_driver_stop observe the worker tail on its real clock. */
+  if (clock_fault) CHECK(ku_task_driver_wait_idle(runtime.driver, 0) == KU_TASK_DRIVER_INTERNAL);
+  fixture_transfer(0, 0); fixture_disposed_wait(0);
+  if (!clock_fault) fixture_idle(&runtime, 0);
+  CHECK(!fixture_snapshot(&runtime, clock_fault ? KU_TASK_DRIVER_INTERNAL : 0).timers);
+  CHECK(ku_task_driver_timer_read(&old) == KU_TASK_DRIVER_STALE && !fixture_count(&roles[0].continuations));
+  fixture_finish(&runtime, clock_fault ? KU_TASK_DRIVER_INTERNAL : 0);
+}
+static void fixture_timer_real_clock_and_zero(void) {
+  CHECK(!ku_task_control_deadline_load(&fixture_clock)); FixtureDriver runtime; fixture_driver_init(&runtime, 1);
+  fixture_timer_start(&runtime, 0, ku_task_driver_now_ms() + 100u);
+  /* No manual wake, clock advance, polling loop or sleeping test thread. */
+  fixture_timer_completed(&runtime, 0);
+  CHECK(!fixture_snapshot(&runtime, 0).timers); fixture_finish(&runtime, 0);
+  fixture_driver_init(&runtime, 1); fixture_timer_start(&runtime, 0, 0);
+  fixture_timer_completed(&runtime, 0); CHECK(roles[0].arm_status == KU_TASK_DRIVER_WAIT_READY);
+  CHECK(!fixture_snapshot(&runtime, 0).timers && fixture_snapshot(&runtime, 0).peak_timers == 1u);
+  fixture_finish(&runtime, 0);
+}
 
 typedef struct FixtureTake { KuTaskDriverTicketV1 ticket; KuTaskControlLeaseV1 lease; KuTaskAdapterOutcomeV1 value; uint32_t status; } FixtureTake;
 static int fixture_take_thread(void* raw) {
@@ -989,7 +1196,7 @@ static void fixture_corrupt_ack_process(void) {
   puts("task-cleanup-wait-quarantined-not-drained");
 }
 int main(int argc, char** argv) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 7u); CHECK(KU_TASK_FRAME_ABI_VERSION == 4u); ku_task_control_deadline_init(&fixture_clock);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 8u); CHECK(KU_TASK_FRAME_ABI_VERSION == 4u); ku_task_control_deadline_init(&fixture_clock);
   if (argc == 2 && !strcmp(argv[1], "--corrupt-ack")) { fixture_corrupt_ack_process(); return 0; }
   CHECK(argc == 1);
   fixture_basic_wait(0, 0); fixture_basic_wait(0, 1); fixture_basic_wait(1, 0);
@@ -999,6 +1206,13 @@ int main(int argc, char** argv) {
   fixture_preflight_and_epoch(); fixture_self_cycle(); fixture_cycle(); fixture_failure_rearm(); fixture_real_timer();
   fixture_taking(0); fixture_taking(1); fixture_full_resources(); fixture_publishing_parent();
   fixture_shutdown_tightens(); fixture_clock_fault(0); fixture_clock_fault(1); fixture_damaged_pair();
+  fixture_case = "timer rearm and reuse"; fixture_timer_rearm_and_reuse();
+  fixture_case = "timer ready ring capacity"; fixture_timer_ready_ring_capacity();
+  fixture_case = "timer cancellation";
+  for (int due = 0; due < 2; ++due) for (int keep = 0; keep < 2; ++keep) fixture_timer_cancel(due, keep);
+  fixture_case = "timer shutdown"; fixture_timer_shutdown_and_clock_fault(0);
+  fixture_case = "timer clock fault"; fixture_timer_shutdown_and_clock_fault(1);
+  fixture_case = "timer real clock and zero"; fixture_timer_real_clock_and_zero();
   puts("task-cleanup-wait-v1-ok"); return 0;
 }
 "#;

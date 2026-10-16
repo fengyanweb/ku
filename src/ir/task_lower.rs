@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use crate::{
     ast::{
-        BinaryOp, Expr, ExprKind, FnDecl, Item, Literal, ParamMode, Program, Stmt, TypeName,
-        UnaryOp,
+        BinaryOp, Expr, ExprKind, FnDecl, ImportKind, Item, Literal, ParamMode, Program, Stmt,
+        TypeName, UnaryOp,
     },
     error::{KuError, KuResult},
     span::Span,
@@ -142,7 +142,14 @@ impl Budget {
 /// this internal API. No source runtime/runner is included in the result.
 pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
     let limits = TaskLimits::default();
-    if program.items.len() > limits.max_functions {
+    if program.items.len() > limits.max_functions + 1
+        || program
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::Function(_)))
+            .count()
+            > limits.max_functions
+    {
         return Err(unsupported(
             "more than 64 expanded top-level functions",
             Span::default(),
@@ -156,7 +163,31 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
     let mut signatures = HashMap::new();
     let mut declarations = Vec::new();
     let mut entry = None;
+    let mut std_time = false;
     for item in &program.items {
+        match item {
+            Item::Module(module) if module.name == "std:time" => {
+                std_time = true;
+                continue;
+            }
+            Item::Import(import)
+                if import.path == "std.time"
+                    && (matches!(&import.kind, ImportKind::Glob)
+                        || matches!(&import.kind, ImportKind::Namespace(name) if name == "time")) =>
+            {
+                std_time = true;
+                continue;
+            }
+            Item::Import(import)
+                if import.path == "std"
+                    && matches!(&import.kind, ImportKind::Named(names) if names.len() == 1 && names[0].source == "time" && names[0].alias.is_none()) =>
+            {
+                std_time = true;
+                continue;
+            }
+            _ => {}
+        }
+
         let Item::Function(function) = item else {
             return Err(unsupported(
                 "non-function items after import expansion",
@@ -232,8 +263,10 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
         .ok_or_else(|| unsupported("a program without async fn main(): null!", Span::default()))?;
     let mut functions = Vec::new();
     for declaration in declarations {
-        functions
-            .push(FunctionLowerer::new(declaration, &signatures, &mut budget)?.lower(declaration)?);
+        functions.push(
+            FunctionLowerer::new(declaration, &signatures, &mut budget, std_time)?
+                .lower(declaration)?,
+        );
     }
     let tasks = TaskProgram { functions };
     task::verify_and_plan(&tasks, limits)?;
@@ -242,6 +275,7 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
 
 struct FunctionLowerer<'a> {
     signatures: &'a HashMap<String, Signature>,
+    std_time: bool,
     budget: &'a mut Budget,
     function: TaskFunction,
     locals: Vec<HashMap<String, SlotId>>,
@@ -273,10 +307,12 @@ impl<'a> FunctionLowerer<'a> {
         declaration: &FnDecl,
         signatures: &'a HashMap<String, Signature>,
         budget: &'a mut Budget,
+        std_time: bool,
     ) -> KuResult<Self> {
         let signature = &signatures[&declaration.name];
         let mut lowerer = Self {
             signatures,
+            std_time,
             budget,
             function: TaskFunction {
                 id: signature.id,
@@ -510,6 +546,48 @@ impl<'a> FunctionLowerer<'a> {
                 )
             }),
             ExprKind::Call { callee, args } => {
+                if let ExprKind::Field {
+                    target: object,
+                    name,
+                } = &callee.kind
+                {
+                    if matches!(&object.kind, ExprKind::Variable(module) if module == "time")
+                        && name == "sleep"
+                        && self.std_time
+                        && self.local("time").is_none()
+                        && !self.signatures.contains_key("time")
+                    {
+                        if args.len() != 1 {
+                            return Err(unsupported(
+                                "time.sleep with other than one argument",
+                                expression.span,
+                            ));
+                        }
+                        let source = self.expression(&args[0], depth + 1)?;
+                        if self.function.slots[source.0].ty != value_slot(IrType::Int) {
+                            return Err(unsupported(
+                                "time.sleep arguments other than integer milliseconds",
+                                args[0].span,
+                            ));
+                        }
+                        let millis = self.copy_or_move(source)?;
+                        let destination =
+                            self.slot(value_slot(IrType::Result(Box::new(IrType::Null))))?;
+                        let poll = self.state(TaskTerminator::Terminate)?;
+                        let ready = self.state(TaskTerminator::Terminate)?;
+                        let cleanup = self.state(TaskTerminator::Terminate)?;
+                        self.terminate(TaskTerminator::Jump { target: poll })?;
+                        self.function.states[poll.0].terminator = TaskTerminator::Timer {
+                            millis,
+                            dst: destination,
+                            ready,
+                            cleanup,
+                        };
+                        self.cleanup_exits.push(cleanup);
+                        self.current = Some(ready);
+                        return Ok(destination);
+                    }
+                }
                 let ExprKind::Variable(name) = &callee.kind else {
                     return Err(unsupported("indirect or method calls", expression.span));
                 };

@@ -491,7 +491,7 @@ fn native_task_source_cli_imports_build_and_run_after_source_graph_moves() {
         fs::create_dir(&sources).unwrap();
         fs::write(
             sources.join("worker.ku"),
-            "async fn Text(value: str): str! { return ok(value) }",
+            "import time from \"std.time\"\nasync fn Text(value: str): str! { time.sleep(1)? return ok(value) }",
         )
         .unwrap();
         let main = sources.join("main.ku");
@@ -703,4 +703,53 @@ static size_t ku_fixture_write(const void* data, size_t size, size_t count, FILE
         String::from_utf8(output.stderr).unwrap().replace('\r', ""),
         "\n"
     );
+}
+
+#[test]
+fn native_task_sleep_recognizes_only_imported_unshadowed_std_time_integer_calls() {
+    use ku::ir::task::{SlotId, TaskTerminator};
+    for import in [
+        "import time from \"std.time\"",
+        "import \"std.time\"",
+        "import { time } from \"std\"",
+    ] {
+        // Exercise the lowerer's import boundary directly as well as the CLI's
+        // separately covered synthetic std:time capability after expansion.
+        let source = format!(
+            "{import}\nasync fn main(): null! {{ ms = 1 time.sleep(ms)? return ok(null) }}"
+        );
+        let ast = Parser::new(Lexer::new(&source).lex().unwrap())
+            .parse_program()
+            .unwrap();
+        let lowered = task_lower::lower_program(&ast).expect("supported standard time import");
+        let function = &lowered.tasks.functions[0];
+        let waits: Vec<_> = function
+            .states
+            .iter()
+            .filter_map(|state| match state.terminator {
+                TaskTerminator::Timer { millis, dst, .. } => Some((millis, dst)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waits.len(), 1);
+        assert_ne!(
+            waits[0].0,
+            SlotId(0),
+            "milliseconds use an immutable materialized snapshot"
+        );
+        assert_ne!(waits[0].0, waits[0].1);
+    }
+    for source in [
+        "async fn main(): null! { time.sleep(0)? return ok(null) }",
+        "import time from \"./time.ku\"\nasync fn main(): null! { time.sleep(0)? return ok(null) }",
+        "import clock from \"std.time\"\nasync fn main(): null! { clock.sleep(0)? return ok(null) }",
+        "import time from \"std.time\"\nasync fn main(): null! { time = 1 time.sleep(0)? return ok(null) }",
+        "import time from \"std.time\"\nasync fn Child(time: int): null! { time.sleep(0)? return ok(null) } async fn main(): null! { return ok(null) }",
+        "import time from \"std.time\"\nasync fn main(): null! { time.now() return ok(null) }",
+        "import time from \"std.time\"\nasync fn main(): null! { time.sleep(true)? return ok(null) }",
+        "import time from \"std.time\"\nasync fn main(): null! { time.sleep({ milliseconds: 1 })? return ok(null) }",
+    ] {
+        let ast=Parser::new(Lexer::new(source).lex().unwrap()).parse_program().unwrap();
+        assert!(task_lower::lower_program(&ast).is_err(),"must preserve rejected module/type boundary: {source}");
+    }
 }

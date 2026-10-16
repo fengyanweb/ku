@@ -1034,3 +1034,83 @@ fn native_task_frame_ir_wrap_ok_moves_stack_local_strings_before_suspension() {
     assert_eq!(plan.functions[0].slots, vec![SlotId(0), SlotId(2)]);
     assert_eq!(plan.functions[0].suspensions[0].slots, vec![SlotId(2)]);
 }
+
+#[test]
+fn native_task_timer_ir_persists_argument_and_initializes_only_ready_result() {
+    let fixture = program(
+        vec![IrType::Int, result(IrType::Null)],
+        &[],
+        vec![
+            state(vec![init(0, TaskConstant::Int(1))], jump(1)),
+            state(
+                vec![],
+                TaskTerminator::Timer {
+                    millis: SlotId(0),
+                    dst: SlotId(1),
+                    ready: StateId(2),
+                    cleanup: StateId(3),
+                },
+            ),
+            state(vec![], complete(1)),
+            state(vec![drop_if(1)], TaskTerminator::Terminate),
+        ],
+    );
+    let plan = accepted(&fixture);
+    assert!(plan.functions[0].hosted);
+    assert!(
+        plan.functions[0].slots.contains(&SlotId(0)),
+        "Pending must retain the once-evaluated argument"
+    );
+    assert!(plan.functions[0].slots.contains(&SlotId(1)));
+    assert!(plan.functions[0]
+        .suspensions
+        .iter()
+        .any(|boundary| boundary.state == StateId(1)));
+
+    let mut bad = fixture.clone();
+    bad.functions[0].slots[0].ty = TaskSlotType::Value {
+        ty: IrType::Bool,
+        borrowed: false,
+    };
+    bad.functions[0].states[0].operations[0] = init(0, TaskConstant::Bool(true));
+    rejected(&bad, "non-int milliseconds");
+    bad = fixture.clone();
+    bad.functions[0].slots[1].ty = TaskSlotType::Value {
+        ty: result(IrType::Int),
+        borrowed: false,
+    };
+    rejected(&bad, "non-null Result destination");
+    bad = fixture.clone();
+    bad.functions[0].states[0].operations.clear();
+    rejected(&bad, "uninitialized milliseconds");
+    bad = fixture.clone();
+    bad.functions[0].states[0]
+        .operations
+        .push(init(1, TaskConstant::Ok(Box::new(TaskConstant::Null))));
+    rejected(&bad, "overwriting an existing Result");
+    bad = fixture.clone();
+    bad.functions[0].slots[0].ty = TaskSlotType::Value {
+        ty: IrType::Int,
+        borrowed: true,
+    };
+    rejected(&bad, "borrowed milliseconds");
+    bad = fixture.clone();
+    bad.functions[0].states[2] = state(vec![drop_slot(1)], jump(1));
+    rejected(&bad, "zero timer is not guaranteed progress in a raw cycle");
+    bad = fixture.clone();
+    bad.functions[0].states[3].terminator = TaskTerminator::Timer {
+        millis: SlotId(0),
+        dst: SlotId(1),
+        ready: StateId(2),
+        cleanup: StateId(3),
+    };
+    rejected(&bad, "cleanup cannot start another timer");
+    bad = fixture.clone();
+    bad.functions[0].states[1].terminator = TaskTerminator::Timer {
+        millis: SlotId(0),
+        dst: SlotId(1),
+        ready: StateId(99),
+        cleanup: StateId(3),
+    };
+    rejected(&bad, "missing ready state");
+}
