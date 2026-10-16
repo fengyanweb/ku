@@ -1334,13 +1334,13 @@ impl Interpreter {
             expect_runtime_arg_count("clone", args.len(), 0, span)?;
             if matches!(target_value, Value::Borrowed(_)) {
                 return target_value.with_read(span, |value| {
-                    if value_contains_task(value) {
+                    if value_contains_task(value, span)? {
                         return Err(KuError::runtime("task values cannot be cloned", span));
                     }
                     Ok(Some(value.clone()))
                 });
             }
-            if value_contains_task(&target_value) {
+            if value_contains_task(&target_value, span)? {
                 return Err(KuError::runtime("task values cannot be cloned", span));
             }
             return Ok(Some(target_value));
@@ -5044,18 +5044,8 @@ fn value_from_literal(literal: &Literal) -> Value {
     }
 }
 
-fn value_contains_task(value: &Value) -> bool {
-    match value {
-        Value::Task(_) => true,
-        Value::Array(values) | Value::Enum { fields: values, .. } => {
-            values.iter().any(value_contains_task)
-        }
-        Value::Object(fields) | Value::Struct { fields, .. } => {
-            fields.values().any(value_contains_task)
-        }
-        Value::Result { value, .. } => value_contains_task(value),
-        _ => false,
-    }
+fn value_contains_task(value: &Value, span: Span) -> KuResult<bool> {
+    value.contains_owned_task(span)
 }
 
 fn std_module_object_value(module: &str, span: Span) -> KuResult<Value> {

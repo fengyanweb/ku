@@ -622,6 +622,28 @@ fn has_single_task_leaf(mut value: &Value) -> bool {
     }
 }
 
+// Plain leaves carry no observable resource destructor or sibling. Keep their
+// classification separate from Task leaves: they never enter the deferred
+// owner queue, and wider containers, captures and borrowed roots keep their
+// original ordered drop.
+fn has_single_plain_leaf(mut value: &Value) -> bool {
+    loop {
+        value = match value {
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::String(_) | Value::Null => {
+                return true;
+            }
+            Value::Result { value, .. } => value,
+            Value::Array(values) | Value::Enum { fields: values, .. } if values.len() == 1 => {
+                &values[0]
+            }
+            Value::Object(fields) | Value::Struct { fields, .. } if fields.len() == 1 => {
+                fields.values().next().expect("one field has one value")
+            }
+            _ => return false,
+        };
+    }
+}
+
 fn take_single_owner_field(fields: HashMap<String, Value>) -> Value {
     let mut fields = fields.into_iter();
     let (key, value) = fields
@@ -633,14 +655,22 @@ fn take_single_owner_field(fields: HashMap<String, Value>) -> Value {
 }
 
 // Wrapper storage is consumed without a cleanup Vec or owner clones. Backing
-// allocations can be freed before the Task; exact allocator free order is not
+// allocations can be freed before the leaf; exact allocator free order is not
 // preserved. Accepted metadata is only bool/String, never a sibling resource
 // lease or closure capture.
-fn drop_single_task_leaf(mut value: Value) {
+fn drop_single_owner_leaf(mut value: Value) {
     loop {
         value = match value {
             Value::Task(task) => {
                 drop(task);
+                return;
+            }
+            plain @ (Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::String(_)
+            | Value::Null) => {
+                drop(plain);
                 return;
             }
             Value::Result { value, .. } => *value,
@@ -686,7 +716,9 @@ fn drop_owner_result_synchronously(result: KuResult<Value>) {
     // cleanup into an outer drain and overtake an ordered sibling or ACK.
     let _synchronous = SynchronousOwnerDropGuard::enter();
     match result {
-        Ok(value) if has_single_task_leaf(&value) => drop_single_task_leaf(value),
+        Ok(value) if has_single_task_leaf(&value) || has_single_plain_leaf(&value) => {
+            drop_single_owner_leaf(value);
+        }
         result => drop(result),
     }
 }
@@ -706,8 +738,8 @@ fn flush_owner_results() {
     // A queued frame may capture completed owners while an outer result drain
     // is active. Its ACK/accounting must not overtake detached single-Task-leaf
     // payloads. Re-entering this loop preserves that order. Only strict linear
-    // wrapper paths ending in a Task are flat; branches, other Value trees and
-    // queued captures keep their synchronous cleanup and recursion risks.
+    // Task paths are queued here; plain leaf chains are released synchronously.
+    // Branches, other Value trees and queued captures keep their original drop.
     let flush = OwnerResultFlushGuard::enter();
     let mut first_panic = None;
     loop {
@@ -735,7 +767,7 @@ fn flush_owner_results() {
         let dropped = catch_unwind(AssertUnwindSafe(|| {
             let _cleanup = CleanupGuard::enter(context);
             match result {
-                Ok(value) => drop_single_task_leaf(value),
+                Ok(value) => drop_single_owner_leaf(value),
                 Err(error) => drop_owner_synchronously(error),
             }
         }));
@@ -2186,7 +2218,9 @@ impl TaskState {
                     first_release,
                     "only the first owner release detaches a result"
                 );
-                self.catch_cleanup_panic(&mut first_panic, || drop_owner_synchronously(result));
+                self.catch_cleanup_panic(&mut first_panic, || {
+                    drop_owner_result_synchronously(result);
+                });
             }
             None => {}
         }
@@ -3033,6 +3067,75 @@ mod tests {
         assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
     }
 
+    #[test]
+    fn plain_owner_leaf_classification_keeps_buffers_and_task_queue_contract() {
+        fn string_backing(mut value: &Value) -> Option<(usize, usize)> {
+            loop {
+                value = match value {
+                    Value::String(text) => return Some((text.as_ptr() as usize, text.capacity())),
+                    Value::Result { value, .. } => value,
+                    Value::Array(values) | Value::Enum { fields: values, .. } => &values[0],
+                    Value::Object(fields) | Value::Struct { fields, .. } => {
+                        fields.values().next().unwrap()
+                    }
+                    _ => return None,
+                };
+            }
+        }
+
+        for leaf in [
+            Value::Int(i64::MIN),
+            Value::Float(f64::from_bits(1)),
+            Value::Bool(true),
+            Value::Null,
+            Value::String(String::with_capacity(4_096)),
+        ] {
+            let value = single_task_leaf_wrappers(leaf, 31);
+            let before = string_backing(&value);
+            assert!(has_single_plain_leaf(&value));
+            assert!(!has_single_task_leaf(&value));
+            // Classification borrows the original allocation; it neither
+            // takes the sole result nor creates a logical Task owner.
+            assert!(has_single_plain_leaf(&value));
+            assert_eq!(string_backing(&value), before);
+            drop_owner_result_synchronously(Ok(value));
+            assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+            assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+        }
+        let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+        let task = handle_for_state(&runtime, &Arc::new(completion_state()));
+        let root = Arc::new(Value::Int(7));
+        let mut captures = crate::env::Env::new();
+        captures
+            .define_owned("captured".into(), Value::Int(3), false, Span::default())
+            .unwrap();
+        for value in [
+            Value::Array(Vec::new()),
+            Value::Array(vec![Value::Int(1), Value::Int(2)]),
+            Value::Object(HashMap::from([
+                ("first".into(), Value::Int(1)),
+                ("second".into(), Value::Int(2)),
+            ])),
+            Value::Task(task),
+            Value::Borrowed(crate::value::BorrowedValue::new(&root)),
+            Value::HttpListenerLease(crate::runtime::value::HttpListenerLease::new(-1)),
+            Value::Function {
+                params: Vec::new(),
+                param_modes: Vec::new(),
+                body: Vec::new(),
+                captures,
+                self_name: None,
+                is_async: false,
+            },
+        ] {
+            let value = single_task_leaf_wrappers(value, 7);
+            assert!(!has_single_plain_leaf(&value));
+            drop_owner_result_synchronously(Ok(value));
+        }
+        assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+        assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+    }
+
     fn ordered_completed_owner(
         runtime: &TaskRuntime,
         label: &'static str,
@@ -3586,6 +3689,149 @@ mod tests {
         assert_eq!(job.await_result().unwrap(), Value::Null);
         runtime.cancel_all_and_wait(Duration::from_secs(1)).unwrap();
         assert_eq!(runtime.snapshot().unwrap().active_tasks, 0);
+        eprintln!("{COMPLETED}");
+    }
+
+    #[test]
+    fn deep_plain_owner_results_drop_on_worker_and_reuse_same_worker() {
+        const CHILD: &str = "KU_TASK_PLAIN_OWNER_LEAF_CHILD";
+        const COMPLETED: &str = "plain owner leaf regression completed";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "runtime::task::tests::deep_plain_owner_results_drop_on_worker_and_reuse_same_worker",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = owner_release_bounded_process::run_bounded(
+                &mut command,
+                Duration::from_secs(20),
+                owner_release_bounded_process::OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("plain leaf cleanup has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "plain leaf cleanup subprocess failed: {:?}\n{}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == COMPLETED),
+                "plain leaf cleanup never reached its completion marker"
+            );
+            return;
+        }
+
+        let runtime = TaskRuntime::with_limits(1, 1, 0, 0, 2);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let job = spawn_task(&runtime, move || {
+            assert!(thread::current().name().unwrap().starts_with("ku-task-"));
+            for kind in 0..5 {
+                for release_path in 0..6 {
+                    let leaf = match kind {
+                        0 => Value::String("plain owned buffer 中文\0".repeat(256)),
+                        1 => Value::Int(i64::MIN),
+                        2 => Value::Float(f64::from_bits(1)),
+                        3 => Value::Bool(true),
+                        _ => Value::Null,
+                    };
+                    let payload = single_task_leaf_wrappers(leaf, 16_384);
+                    assert!(!has_single_task_leaf(&payload));
+                    let inert = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+                    let state = Arc::new(completion_state());
+                    let weak_state = Arc::downgrade(&state);
+                    let mut owner = Some(handle_for_state(&inert, &state));
+                    let context = CancellationContext {
+                        reason: TerminationReason::TimedOut,
+                        cleanup_deadline: Instant::now(),
+                    };
+                    {
+                        let _cleanup = CleanupGuard::enter(context);
+                        match release_path {
+                            0 => {
+                                state.complete(state.id, Ok(payload));
+                                drop(owner.take());
+                                assert_eq!(state.status_name(), "completed");
+                                assert!(state.result().unwrap().is_none());
+                            }
+                            1 => {
+                                state.complete(state.id, Ok(payload));
+                                owner.as_ref().unwrap().release_scope_owner(context);
+                                assert!(state.result().unwrap().is_none());
+                            }
+                            2 => {
+                                assert!(state.request_cancel_with(context));
+                                state.complete(state.id, Ok(payload));
+                                assert_eq!(state.status_name(), "timed_out");
+                                assert_eq!(state.cancellation(), Some(context));
+                            }
+                            3 => {
+                                state.complete(state.id, Ok(Value::Int(7)));
+                                state.complete_with_status(
+                                    state.id,
+                                    Ok(payload),
+                                    Some(TASK_PANICKED),
+                                );
+                                assert_eq!(state.status_name(), "completed");
+                                assert!(matches!(state.result().unwrap(), Some(Ok(Value::Int(7)))));
+                            }
+                            4 => {
+                                owner.as_ref().unwrap().release_scope_owner(context);
+                                state.complete(state.id, Ok(payload));
+                                assert_eq!(state.status_name(), "timed_out");
+                                assert_eq!(state.cancellation(), Some(context));
+                                assert!(state.result().unwrap().is_none());
+                            }
+                            _ => {
+                                assert!(state.request_cancel_with(context));
+                                let (send, receive) = mpsc::sync_channel(1);
+                                drop(receive);
+                                send_blocking_result(&send, Some(&state), Ok(payload));
+                                assert_eq!(state.cancellation(), Some(context));
+                            }
+                        }
+                        drop(owner.take());
+                        assert!(state.owner_cleanup_done.load(Ordering::Acquire));
+                        assert!(state.owner_result_release.lock().unwrap().is_none());
+                        assert!(state.result.try_lock().is_ok());
+                        assert_eq!(current_cleanup_context(), Some(context));
+                    }
+                    assert_eq!(current_cleanup_context(), None);
+                    drop(state);
+                    assert!(weak_state.upgrade().is_none());
+                    assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+                    assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+                }
+            }
+            done_tx.send(thread::current().id()).unwrap();
+            Ok(Value::Null)
+        });
+        // Host receipt waiting does not let await/help execute either body.
+        let worker = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(job.await_result().unwrap(), Value::Null);
+        let (healthy_tx, healthy_rx) = mpsc::sync_channel(1);
+        let healthy = spawn_task(&runtime, move || {
+            assert_eq!(current_cleanup_context(), None);
+            assert!(OWNER_RESULT_RELEASE_HEAD.with(|head| head.borrow().is_none()));
+            assert!(!OWNER_RESULT_RELEASE_ACTIVE.with(Cell::get));
+            healthy_tx.send(thread::current().id()).unwrap();
+            Ok(Value::Int(19))
+        });
+        assert_eq!(
+            healthy_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            worker
+        );
+        assert_eq!(healthy.await_result().unwrap(), Value::Int(19));
+        runtime.cancel_all_and_wait(Duration::from_secs(1)).unwrap();
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.active_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 2);
+        assert_eq!(snapshot.wait_edges, 0);
         eprintln!("{COMPLETED}");
     }
 

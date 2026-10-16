@@ -8,6 +8,23 @@ const MAX_TYPE_DEPTH: usize = 32;
 const MAX_STATEMENT_DEPTH: usize = 32;
 const MAX_TOKENS: usize = 100_000;
 
+mod expression_tree;
+
+fn expression_tree_error(span: Span) -> KuError {
+    KuError::parse(
+        "maximum expression tree depth exceeded; expression is too deeply nested",
+        span,
+    )
+}
+
+fn check_expression_chain(count: &mut usize, limit: usize, span: Span) -> KuResult<()> {
+    if *count >= limit {
+        return Err(expression_tree_error(span));
+    }
+    *count += 1;
+    Ok(())
+}
+
 #[cfg(test)]
 mod statement_depth_tests;
 
@@ -986,14 +1003,22 @@ impl Parser {
 
     fn expression(&mut self) -> KuResult<Expr> {
         self.enter_parse_depth()?;
-        let result = self.or();
+        let result = self.or().and_then(|expr| {
+            if expression_tree::expression_tree_fits(&expr) {
+                Ok(expr)
+            } else {
+                Err(expression_tree_error(expr.span))
+            }
+        });
         self.leave_parse_depth();
         result
     }
 
     fn or(&mut self) -> KuResult<Expr> {
         let mut expr = self.and()?;
+        let mut chain = 0;
         while self.match_kind(&TokenKind::OrOr) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let right = self.and()?;
             let span = expr.span.merge(right.span);
             expr = Expr::new(
@@ -1010,7 +1035,9 @@ impl Parser {
 
     fn and(&mut self) -> KuResult<Expr> {
         let mut expr = self.equality()?;
+        let mut chain = 0;
         while self.match_kind(&TokenKind::AndAnd) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let right = self.equality()?;
             let span = expr.span.merge(right.span);
             expr = Expr::new(
@@ -1027,7 +1054,9 @@ impl Parser {
 
     fn equality(&mut self) -> KuResult<Expr> {
         let mut expr = self.comparison()?;
+        let mut chain = 0;
         while self.match_any(&[TokenKind::BangEqual, TokenKind::EqualEqual]) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let op = match self.previous().kind {
                 TokenKind::BangEqual => BinaryOp::NotEqual,
                 _ => BinaryOp::Equal,
@@ -1048,12 +1077,14 @@ impl Parser {
 
     fn comparison(&mut self) -> KuResult<Expr> {
         let mut expr = self.term()?;
+        let mut chain = 0;
         while self.match_any(&[
             TokenKind::Less,
             TokenKind::LessEqual,
             TokenKind::Greater,
             TokenKind::GreaterEqual,
         ]) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let op = match self.previous().kind {
                 TokenKind::Less => BinaryOp::Less,
                 TokenKind::LessEqual => BinaryOp::LessEqual,
@@ -1076,7 +1107,9 @@ impl Parser {
 
     fn term(&mut self) -> KuResult<Expr> {
         let mut expr = self.factor()?;
+        let mut chain = 0;
         while self.match_any(&[TokenKind::Minus, TokenKind::Plus]) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let op = match self.previous().kind {
                 TokenKind::Minus => BinaryOp::Subtract,
                 _ => BinaryOp::Add,
@@ -1097,7 +1130,9 @@ impl Parser {
 
     fn factor(&mut self) -> KuResult<Expr> {
         let mut expr = self.unary()?;
+        let mut chain = 0;
         while self.match_any(&[TokenKind::Slash, TokenKind::Star, TokenKind::Percent]) {
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH, self.previous().span)?;
             let op = match self.previous().kind {
                 TokenKind::Slash => BinaryOp::Divide,
                 TokenKind::Percent => BinaryOp::Remainder,
@@ -1156,6 +1191,7 @@ impl Parser {
     // Do not retain postfix construction scratch while primary recursively
     // parses a function body. The grammar and postfix loop are unchanged.
     fn finish_call(&mut self, mut expr: Expr) -> KuResult<Expr> {
+        let mut chain = 0;
         loop {
             if self.match_kind(&TokenKind::LParen) {
                 let mut args = Vec::new();
@@ -1249,6 +1285,7 @@ impl Parser {
             } else {
                 break;
             }
+            check_expression_chain(&mut chain, MAX_PARSE_DEPTH * 2, expr.span)?;
         }
         Ok(expr)
     }
