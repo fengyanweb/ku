@@ -1623,7 +1623,7 @@ task.stats(): object
 task.stress(demand:int, producers:int, hold_ms:int): object
 ```
 
-`task.stats()` 返回当前 runtime 的 active/registered/queued task、等待边、blocking job、worker 数以及累计 accepted/rejected/finished。
+`task.stats()` 返回当前 runtime 的 active/registered/queued task、等待边、blocking job、worker 数以及累计 accepted/rejected/finished。累计 `finished_cancelled_tasks` / `finished_timed_out_tasks` 分别统计已经实际退休的取消/超时终态，包含于 `finished_tasks`；重复取消只计一次，首个终止原因决定分类。诊断式 `await_timeout` 不取消目标，因此本身不增加这些计数。清理尚未结束的任务不计为 finished；snapshot 各字段是并发观测值，不保证整份快照是同一时刻。
 
 `task.stress` 用多个生产者并发提交指定数量的 task demand。runtime 仍执行默认 `max_tasks = 1024`，超出的需求立即按 `too_many_tasks` 计入拒绝，不会扩大上限或无限排队。参数边界：
 

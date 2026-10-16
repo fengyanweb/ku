@@ -5525,6 +5525,14 @@ fn task_runtime_snapshot_value(snapshot: TaskRuntimeSnapshot) -> Value {
             usize_value(snapshot.finished_tasks),
         ),
         (
+            "finished_cancelled_tasks".to_string(),
+            usize_value(snapshot.finished_cancelled_tasks),
+        ),
+        (
+            "finished_timed_out_tasks".to_string(),
+            usize_value(snapshot.finished_timed_out_tasks),
+        ),
+        (
             "suppressed_cleanup_outcomes".to_string(),
             usize_value(snapshot.suppressed_cleanup_outcomes),
         ),

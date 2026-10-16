@@ -1599,6 +1599,9 @@ fn main() {
     print(report.peak_active)
     print(report.accepted + report.rejected_limit + report.rejected_queue + report.rejected_internal)
     print(after.finished_tasks - before.finished_tasks)
+    if (after.finished_cancelled_tasks < before.finished_cancelled_tasks || after.finished_timed_out_tasks < before.finished_timed_out_tasks) {
+        panic("retired cancellation and timeout counters must be monotonic")
+    }
     if (after.suppressed_cleanup_outcomes < 0 || after.cleanup_timeouts < 0 || after.cleanup_unfinished_tasks < 0) {
         panic("cleanup statistics must be nonnegative")
     }

@@ -336,6 +336,8 @@ struct TaskRuntimeInner {
     rejected_task_queue: AtomicUsize,
     rejected_task_internal: AtomicUsize,
     finished_tasks: AtomicUsize,
+    finished_cancelled_tasks: AtomicUsize,
+    finished_timed_out_tasks: AtomicUsize,
     suppressed_cleanup_outcomes: AtomicUsize,
     cleanup_timeouts: AtomicUsize,
     cleanup_unfinished_tasks: AtomicUsize,
@@ -870,6 +872,10 @@ pub struct TaskRuntimeSnapshot {
     pub rejected_task_queue: usize,
     pub rejected_task_internal: usize,
     pub finished_tasks: usize,
+    /// Cumulative cancelled outcomes after execution/accounting retirement.
+    pub finished_cancelled_tasks: usize,
+    /// Cumulative timed-out outcomes after execution/accounting retirement.
+    pub finished_timed_out_tasks: usize,
     pub suppressed_cleanup_outcomes: usize,
     pub cleanup_timeouts: usize,
     pub cleanup_unfinished_tasks: usize,
@@ -971,6 +977,8 @@ impl TaskRuntime {
             rejected_task_queue: AtomicUsize::new(0),
             rejected_task_internal: AtomicUsize::new(0),
             finished_tasks: AtomicUsize::new(0),
+            finished_cancelled_tasks: AtomicUsize::new(0),
+            finished_timed_out_tasks: AtomicUsize::new(0),
             suppressed_cleanup_outcomes: AtomicUsize::new(0),
             cleanup_timeouts: AtomicUsize::new(0),
             cleanup_unfinished_tasks: AtomicUsize::new(0),
@@ -1298,6 +1306,8 @@ impl TaskRuntime {
             rejected_task_queue: self.inner.rejected_task_queue.load(Ordering::Relaxed),
             rejected_task_internal: self.inner.rejected_task_internal.load(Ordering::Relaxed),
             finished_tasks: self.inner.finished_tasks.load(Ordering::Relaxed),
+            finished_cancelled_tasks: self.inner.finished_cancelled_tasks.load(Ordering::Relaxed),
+            finished_timed_out_tasks: self.inner.finished_timed_out_tasks.load(Ordering::Relaxed),
             suppressed_cleanup_outcomes: self
                 .inner
                 .suppressed_cleanup_outcomes
@@ -2659,6 +2669,22 @@ fn finish_task_accounting(inner: &TaskRuntimeInner, state: &TaskState) {
         .remove(&state.id);
     inner.active_tasks.fetch_sub(1, Ordering::AcqRel);
     inner.finished_tasks.fetch_add(1, Ordering::Relaxed);
+    // Count the winning terminal outcome only after the same real retirement
+    // gates as finished_tasks; cancellation requests and diagnostic waits do
+    // not themselves retire a task. The once-claim above excludes retries.
+    match state.status.load(Ordering::Acquire) {
+        TASK_CANCELLED => {
+            inner
+                .finished_cancelled_tasks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        TASK_TIMED_OUT => {
+            inner
+                .finished_timed_out_tasks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
     // accounting_finished above is a once-claim, not proof of these updates.
     state.accounting_done.store(true, Ordering::Release);
     state.ready.notify_all();
@@ -4839,6 +4865,13 @@ mod tests {
             Value::Int(7)
         );
         assert_eq!(task.status(), "completed");
+        runtime
+            .cancel_all_and_wait(Duration::from_secs(1))
+            .expect("diagnostic timeout target should retire normally");
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.finished_tasks, 1);
+        assert_eq!(snapshot.finished_cancelled_tasks, 0);
+        assert_eq!(snapshot.finished_timed_out_tasks, 0);
     }
 
     #[test]
@@ -4906,6 +4939,11 @@ mod tests {
             .expect_err("cancelled task should wake waiters with internal termination");
         assert_cancelled(error);
         assert_eq!(task.status(), "cancelled");
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.cancelled_tasks, 0);
+        assert_eq!(snapshot.finished_tasks, 1);
+        assert_eq!(snapshot.finished_cancelled_tasks, 1);
+        assert_eq!(snapshot.finished_timed_out_tasks, 0);
     }
 
     #[test]
@@ -5256,6 +5294,84 @@ mod tests {
         // execution/accounting evidence, never a full owner-resource ACK.
         assert!(!state.owner_released.load(Ordering::Acquire));
         assert_eq!(state.result().unwrap(), Some(Ok(Value::Int(17))));
+    }
+
+    #[test]
+    fn finished_termination_counters_require_real_retirement_and_count_first_cause_once() {
+        for first_reason in [TerminationReason::Cancelled, TerminationReason::TimedOut] {
+            for execution_first in [false, true] {
+                let runtime = TaskRuntime::with_limits(0, 0, 0, 0, 1);
+                let mut initial = completion_state();
+                initial.runtime = Arc::downgrade(&runtime.inner);
+                let state = Arc::new(initial);
+                runtime.inner.active_tasks.store(1, Ordering::Release);
+                runtime
+                    .inner
+                    .states
+                    .lock()
+                    .unwrap()
+                    .insert(state.id, Arc::downgrade(&state));
+
+                let now = Instant::now();
+                assert!(state.request_cancel_with(CancellationContext {
+                    reason: first_reason,
+                    cleanup_deadline: now + Duration::from_secs(1),
+                }));
+                let losing_reason = match first_reason {
+                    TerminationReason::Cancelled => TerminationReason::TimedOut,
+                    TerminationReason::TimedOut => TerminationReason::Cancelled,
+                };
+                assert!(!state.request_cancel_with(CancellationContext {
+                    reason: losing_reason,
+                    cleanup_deadline: now,
+                }));
+                if execution_first {
+                    finish_task_job(&runtime.inner, &state);
+                }
+                let requested = runtime.snapshot().unwrap();
+                assert_eq!(requested.finished_tasks, 0);
+                assert_eq!(requested.finished_cancelled_tasks, 0);
+                assert_eq!(requested.finished_timed_out_tasks, 0);
+
+                state.complete(state.id, Ok(Value::Null));
+                assert_eq!(
+                    state.cancellation(),
+                    Some(CancellationContext {
+                        reason: first_reason,
+                        cleanup_deadline: now,
+                    })
+                );
+                if !execution_first {
+                    let terminal = runtime.snapshot().unwrap();
+                    assert_eq!(terminal.finished_tasks, 0);
+                    assert_eq!(terminal.finished_cancelled_tasks, 0);
+                    assert_eq!(terminal.finished_timed_out_tasks, 0);
+                    assert_eq!(
+                        terminal.cancelled_tasks,
+                        usize::from(first_reason == TerminationReason::Cancelled)
+                    );
+                    finish_task_job(&runtime.inner, &state);
+                }
+                let retired = runtime.snapshot().unwrap();
+                assert_eq!(retired.active_tasks, 0);
+                assert_eq!(retired.registered_tasks, 0);
+                assert_eq!(retired.cancelled_tasks, 0);
+                assert_eq!(retired.finished_tasks, 1);
+                assert_eq!(
+                    retired.finished_cancelled_tasks,
+                    usize::from(first_reason == TerminationReason::Cancelled)
+                );
+                assert_eq!(
+                    retired.finished_timed_out_tasks,
+                    usize::from(first_reason == TerminationReason::TimedOut)
+                );
+                assert!(!state.request_cancel());
+                state.complete(state.id, Ok(Value::Null));
+                finish_task_job(&runtime.inner, &state);
+                finish_task_accounting(&runtime.inner, &state);
+                assert_eq!(runtime.snapshot().unwrap(), retired);
+            }
+        }
     }
 
     #[test]
