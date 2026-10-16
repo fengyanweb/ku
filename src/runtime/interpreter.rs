@@ -31,7 +31,7 @@ use crate::{
     },
     span::{Position, Span},
     stdlib,
-    value::{BorrowProjection, HttpListenerLease, Value, ValueProjection},
+    value::{BorrowProjection, BorrowedValue, HttpListenerLease, Value, ValueProjection},
 };
 
 const MAX_CALL_DEPTH: usize = 512;
@@ -4946,6 +4946,77 @@ fn match_pattern(
     Ok(Some(task_bindings))
 }
 
+const MATCH_SCRATCH_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum MatchInput<'a> {
+    Direct(&'a Value),
+    View {
+        root: &'a BorrowedValue,
+        path_base: usize,
+    },
+}
+
+enum MatchFields<'a> {
+    Direct(&'a [Value]),
+    View {
+        root: &'a BorrowedValue,
+        path_base: usize,
+    },
+}
+
+struct MatchFrame<'a> {
+    patterns: &'a [MatchPattern],
+    fields: MatchFields<'a>,
+    next: usize,
+    path_len: usize,
+}
+
+// The two scratch buffers coexist. A replacement also coexists with its old
+// backing until its iterators move; account for both visible capacities before
+// accepting it. Output bindings remain their existing separately owned output.
+fn reserve_match_scratch<T>(values: &mut Vec<T>, other_bytes: usize, span: Span) -> KuResult<()> {
+    let error = || KuError::runtime("match traversal scratch budget exhausted", span);
+    let bytes = std::mem::size_of::<T>();
+    let available_bytes = MATCH_SCRATCH_BYTES
+        .checked_sub(other_bytes)
+        .ok_or_else(error)?;
+    let limit = available_bytes / bytes;
+    let required = values.len().checked_add(1).ok_or_else(error)?;
+    if values.capacity() > limit || required > limit {
+        return Err(error());
+    }
+    if required <= values.capacity() {
+        return Ok(());
+    }
+    let available = limit - values.capacity();
+    if required > available {
+        return Err(error());
+    }
+    let target = values
+        .capacity()
+        .saturating_mul(2)
+        .max(required)
+        .min(available);
+    let mut replacement = Vec::new();
+    replacement
+        .try_reserve_exact(target)
+        .map_err(|_| KuError::runtime("match traversal scratch out of memory", span))?;
+    if replacement.capacity() > available {
+        return Err(error());
+    }
+    replacement.append(values);
+    *values = replacement;
+    Ok(())
+}
+
+fn match_scratch_bytes<T>(values: &Vec<T>, span: Span) -> KuResult<usize> {
+    values
+        .capacity()
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| KuError::runtime("match traversal scratch budget exhausted", span))
+}
+
 fn collect_match_bindings(
     pattern: &MatchPattern,
     value: &Value,
@@ -4953,83 +5024,190 @@ fn collect_match_bindings(
     path: &mut Vec<ValueProjection>,
     span: Span,
 ) -> KuResult<bool> {
-    if let Value::Borrowed(view) = value {
-        match pattern {
-            MatchPattern::Wildcard => return Ok(true),
-            MatchPattern::Literal(literal) => return Ok(value == &value_from_literal(literal)),
-            MatchPattern::Binding(_) => return Err(KuError::runtime("binding an owned borrowed match payload is not supported; clone to create an owned value", span)),
-            MatchPattern::EnumVariant { enum_name, variant, fields: patterns } => {
-                let matched = view.with_read(span, |value| match value {
-                    Value::Enum { name, variant: actual, fields } if name == enum_name && actual == variant => {
-                        if fields.len() != patterns.len() { return Err(KuError::runtime("match pattern field count mismatch", span)); }
-                        Ok(true)
-                    }
-                    _ => Ok(false),
-                })?;
-                if !matched { return Ok(false); }
-                let snapshot = bindings.len();
-                for (index, pattern) in patterns.iter().enumerate() {
-                    let value = view.project(BorrowProjection::EnumField(index), span)?;
-                    path.push(ValueProjection::EnumField(index));
-                    let matched = collect_match_bindings(pattern, &value, bindings, path, span);
-                    path.pop();
-                    if !matched? {
-                        bindings.truncate(snapshot);
+    let path_base = path.len();
+    let snapshot = bindings.len();
+    let result = collect_match_bindings_inner(pattern, value, bindings, path, span);
+    // False rolls back this whole pattern; Err retains earlier bindings, just
+    // like the recursive calls did. Neither outcome may leak its path suffix.
+    path.truncate(path_base);
+    if matches!(result, Ok(false)) {
+        bindings.truncate(snapshot);
+    }
+    result
+}
+
+fn collect_match_bindings_inner<'a>(
+    pattern: &'a MatchPattern,
+    value: &'a Value,
+    bindings: &mut Vec<MatchBinding>,
+    path: &mut Vec<ValueProjection>,
+    span: Span,
+) -> KuResult<bool> {
+    let mut ancestors: Vec<MatchFrame<'a>> = Vec::new();
+    let mut next = Some((pattern, MatchInput::Direct(value)));
+    loop {
+        if let Some((pattern, input)) = next.take() {
+            let input = match input {
+                MatchInput::Direct(Value::Borrowed(root)) => MatchInput::View {
+                    root,
+                    path_base: path.len(),
+                },
+                input => input,
+            };
+            let frame = match (pattern, input) {
+                (MatchPattern::Wildcard, MatchInput::Direct(_)) => None,
+                (MatchPattern::Binding(name), MatchInput::Direct(value)) => {
+                    bindings.push(MatchBinding {
+                        name: name.clone(),
+                        value: value.clone(),
+                        task_path: value.contains_owned_task(span)?.then(|| path.clone()),
+                    });
+                    None
+                }
+                (MatchPattern::Literal(literal), MatchInput::Direct(value)) => {
+                    if value != &value_from_literal(literal) {
                         return Ok(false);
                     }
+                    None
                 }
-                return Ok(true);
-            }
-        }
-    }
-    match pattern {
-        MatchPattern::Wildcard => Ok(true),
-        MatchPattern::Binding(name) => {
-            bindings.push(MatchBinding {
-                name: name.clone(),
-                value: value.clone(),
-                task_path: value.contains_owned_task(span)?.then(|| path.clone()),
-            });
-            Ok(true)
-        }
-        MatchPattern::Literal(literal) => Ok(value == &value_from_literal(literal)),
-        MatchPattern::EnumVariant {
-            enum_name,
-            variant,
-            fields: patterns,
-        } => {
-            let Value::Enum {
-                name,
-                variant: actual_variant,
-                fields,
-            } = value
-            else {
-                return Ok(false);
+                (
+                    MatchPattern::EnumVariant {
+                        enum_name,
+                        variant,
+                        fields: patterns,
+                    },
+                    MatchInput::Direct(value),
+                ) => {
+                    let Value::Enum {
+                        name,
+                        variant: actual,
+                        fields,
+                    } = value
+                    else {
+                        return Ok(false);
+                    };
+                    if name != enum_name || actual != variant {
+                        return Ok(false);
+                    }
+                    if patterns.len() != fields.len() {
+                        return Err(KuError::runtime(
+                            format!("match pattern '{enum_name}.{variant}' expects {} fields but got {}", fields.len(), patterns.len()),
+                            span,
+                        ));
+                    }
+                    Some(MatchFrame {
+                        patterns,
+                        fields: MatchFields::Direct(fields),
+                        next: 0,
+                        path_len: path.len(),
+                    })
+                }
+                (pattern, MatchInput::View { root, path_base }) => {
+                    let projected = path.len() > path_base;
+                    match pattern {
+                        MatchPattern::Wildcard => {
+                            if projected {
+                                root.with_projection_read(&path[path_base..], span, |_| Ok(()))?;
+                            }
+                            None
+                        }
+                        MatchPattern::Binding(name) => {
+                            let copied = if projected {
+                                root.with_projection_read(&path[path_base..], span, |value| {
+                                    Ok(value.copy_value())
+                                })?
+                            } else {
+                                None
+                            };
+                            let Some(value) = copied else {
+                                return Err(KuError::runtime("binding an owned borrowed match payload is not supported; clone to create an owned value", span));
+                            };
+                            bindings.push(MatchBinding {
+                                name: name.clone(),
+                                value,
+                                task_path: None,
+                            });
+                            None
+                        }
+                        MatchPattern::Literal(literal) => {
+                            let matched =
+                                root.with_projection_read(&path[path_base..], span, |value| {
+                                    Ok(value == &value_from_literal(literal))
+                                });
+                            let matched = if projected {
+                                matched?
+                            } else {
+                                matched.unwrap_or(false)
+                            };
+                            if !matched {
+                                return Ok(false);
+                            }
+                            None
+                        }
+                        MatchPattern::EnumVariant {
+                            enum_name,
+                            variant,
+                            fields: patterns,
+                        } => {
+                            let matched =
+                                root.with_projection_read(&path[path_base..], span, |value| {
+                                    match value {
+                                        Value::Enum {
+                                            name,
+                                            variant: actual,
+                                            fields,
+                                        } if name == enum_name && actual == variant => {
+                                            if fields.len() != patterns.len() {
+                                                return Err(KuError::runtime(
+                                                    "match pattern field count mismatch",
+                                                    span,
+                                                ));
+                                            }
+                                            Ok(true)
+                                        }
+                                        _ => Ok(false),
+                                    }
+                                })?;
+                            if !matched {
+                                return Ok(false);
+                            }
+                            Some(MatchFrame {
+                                patterns,
+                                fields: MatchFields::View { root, path_base },
+                                next: 0,
+                                path_len: path.len(),
+                            })
+                        }
+                    }
+                }
             };
-            if name != enum_name || actual_variant != variant {
-                return Ok(false);
-            }
-            if patterns.len() != fields.len() {
-                return Err(KuError::runtime(
-                    format!(
-                        "match pattern '{enum_name}.{variant}' expects {} fields but got {}",
-                        fields.len(),
-                        patterns.len()
-                    ),
-                    span,
-                ));
-            }
-            let snapshot = bindings.len();
-            for (index, (pattern, field)) in patterns.iter().zip(fields.iter()).enumerate() {
-                path.push(ValueProjection::EnumField(index));
-                let matched = collect_match_bindings(pattern, field, bindings, path, span);
-                path.pop();
-                if !matched? {
-                    bindings.truncate(snapshot);
-                    return Ok(false);
+            if let Some(frame) = frame {
+                if !frame.patterns.is_empty() {
+                    let path_bytes = match_scratch_bytes(path, span)?;
+                    reserve_match_scratch(&mut ancestors, path_bytes, span)?;
+                    ancestors.push(frame);
                 }
             }
-            Ok(true)
+        }
+        loop {
+            let Some(frame) = ancestors.last_mut() else {
+                return Ok(true);
+            };
+            path.truncate(frame.path_len);
+            let index = frame.next;
+            if let Some(pattern) = frame.patterns.get(index) {
+                frame.next += 1;
+                let input = match frame.fields {
+                    MatchFields::Direct(fields) => MatchInput::Direct(&fields[index]),
+                    MatchFields::View { root, path_base } => MatchInput::View { root, path_base },
+                };
+                let frame_bytes = match_scratch_bytes(&ancestors, span)?;
+                reserve_match_scratch(path, frame_bytes, span)?;
+                path.push(ValueProjection::EnumField(index));
+                next = Some((pattern, input));
+                break;
+            }
+            ancestors.pop();
         }
     }
 }
@@ -5930,19 +6108,34 @@ fn bind_match_pattern_names(
     depth: usize,
     span: Span,
 ) -> KuResult<()> {
-    budget.enter(depth, span)?;
-    match pattern {
-        MatchPattern::Binding(name) => {
-            bound.insert(name.clone());
-        }
-        MatchPattern::EnumVariant { fields, .. } => {
-            for field in fields {
-                bind_match_pattern_names(field, bound, budget, depth + 1, span)?;
+    let mut ancestors: Vec<(std::slice::Iter<'_, MatchPattern>, usize)> = Vec::new();
+    let mut next = Some((pattern, depth));
+    loop {
+        if let Some((pattern, depth)) = next.take() {
+            // Preserve the old preorder work charge and exact semantic depth.
+            budget.enter(depth, span)?;
+            match pattern {
+                MatchPattern::Binding(name) => {
+                    bound.insert(name.clone());
+                }
+                MatchPattern::EnumVariant { fields, .. } if !fields.is_empty() => {
+                    reserve_match_scratch(&mut ancestors, 0, span)?;
+                    ancestors.push((fields.iter(), depth + 1));
+                }
+                _ => {}
             }
         }
-        MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
+        loop {
+            let Some((children, depth)) = ancestors.last_mut() else {
+                return Ok(());
+            };
+            if let Some(child) = children.next() {
+                next = Some((child, *depth));
+                break;
+            }
+            ancestors.pop();
+        }
     }
-    Ok(())
 }
 
 impl Default for Interpreter {
@@ -6086,8 +6279,8 @@ mod template_capture_tests {
 
     #[test]
     fn template_capture_visitor_rejects_deep_generated_ast_before_callback() {
-        // Flat sums bypass Parser's recursive expression guard. Stay below the
-        // token cap to exercise capture-depth validation rather than that cap.
+        // Flat sums now fail during construction, before capture validation.
+        // Keep that source and require the earlier, specific parse error.
         let raw = format!("{{{}0}}", "0+".repeat(MAX_CAPTURE_SCAN_DEPTH + 1));
         let mut calls = 0;
         let error = visit_template_capture_expressions(&raw, Span::default(), |_| {
@@ -6095,7 +6288,31 @@ mod template_capture_tests {
             Ok(())
         })
         .expect_err("deep generated AST must be rejected");
-        assert!(error.message.contains("nesting depth exceeded"));
+        assert_eq!(error.kind, crate::error::KuErrorKind::Parse);
+        assert_eq!(
+            error.message,
+            "maximum expression tree depth exceeded; expression is too deeply nested"
+        );
+        assert_eq!(calls, 0);
+
+        // Parentheses split local binary loops. Exactly 128 structural nodes
+        // fit Parser; interpolation's additional capture depth must still
+        // reject before the callback using the unchanged capture limit.
+        let mut expression = "0".to_owned();
+        for additions in [32, 32, 32, 31] {
+            expression = format!("({expression}){}", "+0".repeat(additions));
+        }
+        let raw = format!("{{{expression}}}");
+        let error = visit_template_capture_expressions(&raw, Span::default(), |_| {
+            calls += 1;
+            Ok(())
+        })
+        .expect_err("capture depth remains bounded after parser admission");
+        assert_eq!(error.kind, crate::error::KuErrorKind::Runtime);
+        assert_eq!(
+            error.message,
+            "capture analysis limit: nesting depth exceeded"
+        );
         assert_eq!(calls, 0);
     }
 

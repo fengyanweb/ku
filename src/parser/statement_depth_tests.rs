@@ -132,3 +132,66 @@ fn expression_tree_guard_preserves_legal_method_depth_width_and_precedence() {
     assert!(error.message.contains("expression tree depth"));
     assert_eq!(parser.parse_depth, 0);
 }
+
+#[test]
+fn deep_match_patterns_preserve_production_source_and_error_cleanup() {
+    const CHILD: &str = "KU_PARSER_DEEP_PATTERN_CHILD";
+    const COMPLETED: &str = "deep pattern source regression completed";
+    if std::env::var_os(CHILD).is_none() {
+        use crate::registry_server::native_test_harness::{run_bounded, OutputLimits};
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact", "parser::statement_depth_tests::deep_match_patterns_preserve_production_source_and_error_cleanup", "--nocapture",
+        ]).env(CHILD, "1");
+        let output = run_bounded(
+            &mut command,
+            std::time::Duration::from_secs(15),
+            OutputLimits::new(64 * 1024, 128 * 1024),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == COMPLETED));
+        return;
+    }
+    for depth in [1_000, 4_000] {
+        let mut source = "enum E0 { End }\n".to_owned();
+        for index in 1..=depth {
+            source.push_str(&format!(
+                "enum E{index} {{ Empty, Wrap(value: E{}) }}\n",
+                index - 1
+            ));
+        }
+        let mut pattern = String::new();
+        for index in (1..=depth).rev() {
+            pattern.push_str(&format!("E{index}.Wrap("));
+        }
+        pattern.push_str("E0.End");
+        pattern.push_str(&")".repeat(depth));
+        source.push_str(&format!("fn main() {{ value = E{depth}.Empty\n answer = match value {{ {pattern} => 1\n _ => 0 }}\n print(answer) }}\n"));
+        crate::cli::run_source("deep-pattern.ku", &source).unwrap();
+    }
+    // Failure after a complete deep child must release both that child and
+    // the unfinished parent frames without resetting semantic parse counters.
+    let invalid = format!(
+        "fn main() {{ answer = match 0 {{ {}0{} => 1 }} }}",
+        "Node.Next(".repeat(4_000),
+        ")".repeat(3_999)
+    );
+    let mut parser = Parser::new(Lexer::new(&invalid).tokenize().unwrap());
+    let error = match parser.parse_program() {
+        Err(error) => error,
+        Ok(_) => panic!("missing pattern delimiter must fail"),
+    };
+    assert_eq!(error.message, "expected ')' after payload patterns");
+    assert_eq!(parser.parse_depth, 0);
+    assert_eq!(parser.statement_depth, 0);
+    eprintln!("{COMPLETED}");
+}

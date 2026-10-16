@@ -138,6 +138,34 @@ impl BorrowedValue {
         self.read_root(span, read)
     }
 
+    /// Read another projection while the original weak root and owner checks
+    /// remain active. Match traversal keeps one shared relative path instead
+    /// of cloning a longer BorrowedValue for every ancestor.
+    pub(crate) fn with_projection_read<T>(
+        &self,
+        path: &[ValueProjection],
+        span: Span,
+        read: impl FnOnce(&Value) -> KuResult<T>,
+    ) -> KuResult<T> {
+        self.with_read(span, |mut value| {
+            for projection in path {
+                value = match (projection, value) {
+                    (
+                        ValueProjection::Field(name),
+                        Value::Object(fields) | Value::Struct { fields, .. },
+                    ) => fields.get(name),
+                    (ValueProjection::Index(index), Value::Array(values)) => values.get(*index),
+                    (ValueProjection::EnumField(index), Value::Enum { fields, .. }) => {
+                        fields.get(*index)
+                    }
+                    _ => None,
+                }
+                .ok_or_else(|| KuError::runtime("invalid borrowed projection", span))?;
+            }
+            read(value)
+        })
+    }
+
     /// Only Env may use this for an ordinary read of the caller's owned source
     /// while another task has an active loan. Its source binding mutex MUST
     /// remain held throughout the callback, serializing with lease restoration.

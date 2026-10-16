@@ -441,3 +441,338 @@ fn interpreter_match_arm_and_residual_tasks_share_exact_cleanup_context() {
     }
     assert!(env.all_owned_tasks(Span::default()).unwrap().is_empty());
 }
+
+fn nested_pattern_fixture(
+    depth: usize,
+    mut pattern: MatchPattern,
+    mut value: Value,
+) -> (MatchPattern, Value) {
+    for _ in 0..depth {
+        pattern = MatchPattern::EnumVariant {
+            enum_name: "Nested".into(),
+            variant: "Only".into(),
+            fields: vec![pattern],
+        };
+        value = Value::Enum {
+            name: "Nested".into(),
+            variant: "Only".into(),
+            fields: vec![value],
+        };
+    }
+    (pattern, value)
+}
+
+fn drop_nested_match_value(mut value: Value) {
+    loop {
+        match value {
+            Value::Enum { mut fields, .. } if fields.len() == 1 => {
+                value = fields.pop().unwrap();
+            }
+            value => {
+                drop(value);
+                return;
+            }
+        }
+    }
+}
+
+fn bounded_pattern_child(test_name: &str) -> bool {
+    const CHILD: &str = "KU_RUNTIME_MATCH_PATTERN_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(test_name) {
+        return true;
+    }
+    use crate::registry_server::native_test_harness::{run_bounded, OutputLimits};
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD, test_name);
+    let output = run_bounded(
+        &mut command,
+        Duration::from_secs(20),
+        OutputLimits::new(64 * 1024, 128 * 1024),
+    )
+    .expect("match pattern regression has a bounded subprocess");
+    assert!(
+        output.status.success(),
+        "{:?}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let completed = format!("match pattern regression completed: {test_name}");
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .any(|line| line == completed));
+    false
+}
+
+#[test]
+fn interpreter_deep_match_pattern_runs_on_worker_with_direct_and_borrowed_inputs() {
+    const CHILD: &str = "KU_RUNTIME_DEEP_MATCH_PATTERN_CHILD";
+    const COMPLETED: &str = "runtime deep match pattern regression completed";
+    if std::env::var_os(CHILD).is_none() {
+        use crate::registry_server::native_test_harness::{run_bounded, OutputLimits};
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "runtime::interpreter::match_task_tests::interpreter_deep_match_pattern_runs_on_worker_with_direct_and_borrowed_inputs",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+        let output = run_bounded(
+            &mut command,
+            Duration::from_secs(20),
+            OutputLimits::new(64 * 1024, 128 * 1024),
+        )
+        .expect("deep match pattern has a bounded subprocess");
+        assert!(
+            output.status.success(),
+            "deep match pattern subprocess failed: {:?}\n{}{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == COMPLETED));
+        return;
+    }
+    let runtime = TaskRuntime::with_limits(1, 1, 0, 0, 2);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let job = runtime
+        .spawn(move || {
+            assert!(thread::current().name().unwrap().starts_with("ku-task-"));
+            let span = Span::default();
+            for borrowed in [false, true] {
+                let (pattern, value) = nested_pattern_fixture(
+                    4_000,
+                    MatchPattern::Binding("selected".into()),
+                    Value::Int(7),
+                );
+                let root = Arc::new(value);
+                let view = Value::Borrowed(BorrowedValue::new(&root));
+                let input = if borrowed { &view } else { root.as_ref() };
+                let mut env = Env::new();
+                assert!(match_pattern(&pattern, input, &mut env, span)?.is_some());
+                assert_eq!(env.get("selected", span)?, Value::Int(7));
+                assert!(env.all_owned_tasks(span)?.is_empty());
+                assert_eq!(Arc::strong_count(&root), 1);
+                drop(view);
+                let value = match Arc::try_unwrap(root) {
+                    Ok(value) => value,
+                    Err(_) => panic!("match projection retained its source"),
+                };
+                drop_nested_match_value(value);
+                drop(pattern);
+            }
+            done_tx.send(thread::current().id()).unwrap();
+            Ok(Value::Null)
+        })
+        .unwrap();
+    let worker = done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(job.await_result().unwrap(), Value::Null);
+    let (healthy_tx, healthy_rx) = mpsc::sync_channel(1);
+    let healthy = runtime
+        .spawn(move || {
+            assert_eq!(current_cleanup_context(), None);
+            healthy_tx.send(thread::current().id()).unwrap();
+            Ok(Value::Int(19))
+        })
+        .unwrap();
+    assert_eq!(
+        healthy_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        worker
+    );
+    assert_eq!(healthy.await_result().unwrap(), Value::Int(19));
+    runtime.cancel_all_and_wait(Duration::from_secs(1)).unwrap();
+    assert_eq!(runtime.snapshot().unwrap().active_tasks, 0);
+    eprintln!("{COMPLETED}");
+}
+
+#[test]
+fn interpreter_match_pattern_false_and_error_restore_path_with_original_binding_rules() {
+    let test_name = "runtime::interpreter::match_task_tests::interpreter_match_pattern_false_and_error_restore_path_with_original_binding_rules";
+    if !bounded_pattern_child(test_name) {
+        return;
+    }
+    let span = Span::default();
+    for error in [false, true] {
+        let (leaf_pattern, leaf_value) = if error {
+            (
+                MatchPattern::EnumVariant {
+                    enum_name: "Tail".into(),
+                    variant: "Only".into(),
+                    fields: vec![MatchPattern::Wildcard, MatchPattern::Wildcard],
+                },
+                Value::Enum {
+                    name: "Tail".into(),
+                    variant: "Only".into(),
+                    fields: vec![Value::Int(7)],
+                },
+            )
+        } else {
+            (MatchPattern::Literal(Literal::Int(8)), Value::Int(7))
+        };
+        let (nested, nested_value) = nested_pattern_fixture(4_000, leaf_pattern, leaf_value);
+        let pattern = MatchPattern::EnumVariant {
+            enum_name: "Pair".into(),
+            variant: "Both".into(),
+            fields: vec![MatchPattern::Binding("first".into()), nested],
+        };
+        let value = Value::Enum {
+            name: "Pair".into(),
+            variant: "Both".into(),
+            fields: vec![Value::Int(3), nested_value],
+        };
+        let mut bindings = vec![MatchBinding {
+            name: "original".into(),
+            value: Value::Int(42),
+            task_path: None,
+        }];
+        let mut path = vec![ValueProjection::Field("original-path".into())];
+        let result = collect_match_bindings(&pattern, &value, &mut bindings, &mut path, span);
+        if error {
+            assert!(result
+                .unwrap_err()
+                .message
+                .contains("expects 1 fields but got 2"));
+            assert_eq!(bindings.len(), 2);
+            assert_eq!(bindings[1].name, "first");
+            assert_eq!(bindings[1].value, Value::Int(3));
+        } else {
+            assert!(!result.unwrap());
+            assert_eq!(bindings.len(), 1);
+        }
+        assert_eq!(bindings[0].name, "original");
+        assert_eq!(bindings[0].value, Value::Int(42));
+        assert!(matches!(&path[..], [ValueProjection::Field(name)] if name == "original-path"));
+        let Value::Enum { mut fields, .. } = value else {
+            unreachable!()
+        };
+        drop_nested_match_value(fields.pop().unwrap());
+    }
+
+    // A borrowed root remains a view even when its source is a scalar. Only
+    // an enum child projection was converted to Copy by the previous matcher.
+    let root = Arc::new(Value::Int(7));
+    let view = Value::Borrowed(BorrowedValue::new(&root));
+    let mut bindings = Vec::new();
+    let mut path = Vec::new();
+    assert!(collect_match_bindings(
+        &MatchPattern::Binding("root".into()),
+        &view,
+        &mut bindings,
+        &mut path,
+        span,
+    )
+    .unwrap_err()
+    .message
+    .contains("owned borrowed match payload"));
+    drop(root);
+    assert!(!collect_match_bindings(
+        &MatchPattern::Literal(Literal::Int(7)),
+        &view,
+        &mut bindings,
+        &mut path,
+        span,
+    )
+    .unwrap());
+    assert!(collect_match_bindings(
+        &MatchPattern::Wildcard,
+        &view,
+        &mut bindings,
+        &mut path,
+        span,
+    )
+    .unwrap());
+    assert!(bindings.is_empty());
+    assert!(path.is_empty());
+
+    let root = Arc::new(Value::Enum {
+        name: "Pair".into(),
+        variant: "Both".into(),
+        fields: vec![Value::Int(3), Value::String("owned".into())],
+    });
+    let view = Value::Borrowed(BorrowedValue::new(&root));
+    let pattern = MatchPattern::EnumVariant {
+        enum_name: "Pair".into(),
+        variant: "Both".into(),
+        fields: vec![
+            MatchPattern::Binding("first".into()),
+            MatchPattern::Binding("second".into()),
+        ],
+    };
+    assert!(
+        collect_match_bindings(&pattern, &view, &mut bindings, &mut path, span)
+            .unwrap_err()
+            .message
+            .contains("owned borrowed match payload")
+    );
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].name, "first");
+    assert_eq!(bindings[0].value, Value::Int(3));
+    assert!(path.is_empty());
+    assert_eq!(Arc::strong_count(&root), 1);
+    eprintln!("match pattern regression completed: {test_name}");
+}
+
+#[test]
+fn interpreter_match_pattern_capture_cost_and_scratch_rejection_keep_original_owners() {
+    let test_name = "runtime::interpreter::match_task_tests::interpreter_match_pattern_capture_cost_and_scratch_rejection_keep_original_owners";
+    if !bounded_pattern_child(test_name) {
+        return;
+    }
+    let span = Span::default();
+    let (pattern, value) =
+        nested_pattern_fixture(40_000, MatchPattern::Binding("leaf".into()), Value::Int(7));
+    let mut bindings = Vec::new();
+    let mut path = vec![ValueProjection::Field("kept".into())];
+    let error =
+        collect_match_bindings(&pattern, &value, &mut bindings, &mut path, span).unwrap_err();
+    assert!(error
+        .message
+        .contains("match traversal scratch budget exhausted"));
+    assert!(bindings.is_empty());
+    assert!(matches!(&path[..], [ValueProjection::Field(name)] if name == "kept"));
+    // Failure did not move the borrowed input tree. Its complete original
+    // chain and scalar remain available, then retire iteratively in this test.
+    let mut current = &value;
+    let mut depth = 0;
+    while let Value::Enum { fields, .. } = current {
+        assert_eq!(fields.len(), 1);
+        depth += 1;
+        current = &fields[0];
+    }
+    assert_eq!(depth, 40_000);
+    assert_eq!(current, &Value::Int(7));
+    let mut budget = CaptureScanBudget::new();
+    let mut bound = HashSet::new();
+    let error = bind_match_pattern_names(&pattern, &mut bound, &mut budget, 7, span).unwrap_err();
+    assert!(error.message.contains("nesting depth exceeded"));
+    assert_eq!(
+        budget.remaining_work,
+        MAX_CAPTURE_SCAN_WORK - (MAX_CAPTURE_SCAN_DEPTH - 7)
+    );
+    assert!(bound.is_empty());
+    drop_nested_match_value(value);
+    drop(pattern);
+
+    let pattern = MatchPattern::EnumVariant {
+        enum_name: "Pair".into(),
+        variant: "Both".into(),
+        fields: vec![
+            MatchPattern::Binding("first".into()),
+            MatchPattern::EnumVariant {
+                enum_name: "Inner".into(),
+                variant: "Only".into(),
+                fields: vec![MatchPattern::Binding("second".into())],
+            },
+        ],
+    };
+    let mut budget = CaptureScanBudget::new();
+    bind_match_pattern_names(&pattern, &mut bound, &mut budget, 0, span).unwrap();
+    assert_eq!(bound, HashSet::from(["first".into(), "second".into()]));
+    assert_eq!(budget.remaining_work, MAX_CAPTURE_SCAN_WORK - 4);
+    eprintln!("match pattern regression completed: {test_name}");
+}

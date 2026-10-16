@@ -8808,14 +8808,10 @@ impl UnusedAnalyzer {
     }
 
     fn define_match_pattern(&mut self, pattern: &MatchPattern) {
-        match pattern {
-            MatchPattern::Binding(name) => self.define(name, Span::default(), true),
-            MatchPattern::EnumVariant { fields, .. } => {
-                for field in fields {
-                    self.define_match_pattern(field);
-                }
+        for node in pattern.preorder() {
+            if let MatchPattern::Binding(name) = node {
+                self.define(name, Span::default(), true);
             }
-            MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
         }
     }
 }
@@ -9073,13 +9069,9 @@ fn collect_expr_references(expr: &Expr, used: &mut HashSet<String>) {
 }
 
 fn collect_match_pattern_references(pattern: &MatchPattern, used: &mut HashSet<String>) {
-    if let MatchPattern::EnumVariant {
-        enum_name, fields, ..
-    } = pattern
-    {
-        collect_name_reference(enum_name, used);
-        for field in fields {
-            collect_match_pattern_references(field, used);
+    for node in pattern.preorder() {
+        if let MatchPattern::EnumVariant { enum_name, .. } = node {
+            collect_name_reference(enum_name, used);
         }
     }
 }
@@ -10544,21 +10536,35 @@ impl<'a> TopLevelReferenceRewriter<'a> {
     }
 
     fn rewrite_match_pattern(&mut self, pattern: &mut MatchPattern) {
-        match pattern {
-            MatchPattern::Binding(name) => self.define(name),
-            MatchPattern::EnumVariant {
-                enum_name, fields, ..
-            } => {
-                if let Some(renamed) = self.rename_map.get(enum_name).cloned() {
-                    *enum_name = renamed;
-                } else if let Some(renamed) = namespace_lookup(enum_name, self.namespaces) {
-                    *enum_name = renamed;
+        let mut ancestors: Vec<std::slice::IterMut<'_, MatchPattern>> = Vec::new();
+        let mut current = Some(pattern);
+        while let Some(pattern) = current.take() {
+            match pattern {
+                MatchPattern::Binding(name) => self.define(name),
+                MatchPattern::EnumVariant {
+                    enum_name, fields, ..
+                } => {
+                    if let Some(renamed) = self.rename_map.get(enum_name).cloned() {
+                        *enum_name = renamed;
+                    } else if let Some(renamed) = namespace_lookup(enum_name, self.namespaces) {
+                        *enum_name = renamed;
+                    }
+                    let mut children = fields.iter_mut();
+                    if let Some(field) = children.next() {
+                        ancestors.push(children);
+                        current = Some(field);
+                        continue;
+                    }
                 }
-                for field in fields {
-                    self.rewrite_match_pattern(field);
-                }
+                MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
             }
-            MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
+            while let Some(children) = ancestors.last_mut() {
+                if let Some(field) = children.next() {
+                    current = Some(field);
+                    break;
+                }
+                ancestors.pop();
+            }
         }
     }
 }
@@ -10571,6 +10577,107 @@ fn namespace_lookup(path: &str, namespaces: &NamespaceMaps) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_match_patterns_preserve_import_references_rewrites_and_bindings() {
+        const CHILD: &str = "KU_CLI_DEEP_MATCH_PATTERN_CHILD";
+        const COMPLETED: &str = "cli deep match pattern completed";
+        if env::var_os(CHILD).is_none() {
+            use crate::registry_server::native_test_harness::{run_bounded, OutputLimits};
+            let mut command = Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "cli::tests::deep_match_patterns_preserve_import_references_rewrites_and_bindings",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = run_bounded(
+                &mut command,
+                Duration::from_secs(15),
+                OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("deep pattern rewrite has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "deep pattern child failed: {:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line == COMPLETED));
+            return;
+        }
+
+        const DEPTH: usize = 16_384;
+        let mut pattern = MatchPattern::Binding("leaf".into());
+        for _ in 0..DEPTH {
+            pattern = MatchPattern::EnumVariant {
+                enum_name: "mod.Node".into(),
+                variant: "Next".into(),
+                fields: vec![pattern],
+            };
+        }
+        let mut pattern = MatchPattern::EnumVariant {
+            enum_name: "Alias".into(),
+            variant: "Pair".into(),
+            fields: vec![pattern, MatchPattern::Binding("tail".into())],
+        };
+        let mut used = HashSet::new();
+        collect_match_pattern_references(&pattern, &mut used);
+        assert_eq!(
+            used,
+            HashSet::from(["Alias".into(), "mod.Node".into(), "mod".into()])
+        );
+
+        let rename_map = HashMap::from([
+            ("Alias".into(), "RenamedAlias".into()),
+            ("leaf".into(), "TopLevelLeaf".into()),
+        ]);
+        let namespaces = NamespaceMaps::from([(
+            "mod".into(),
+            BTreeMap::from([("Node".into(), "RenamedNode".into())]),
+        )]);
+        let mut rewriter = TopLevelReferenceRewriter::new(&rename_map, &namespaces);
+        rewriter.push_scope();
+        rewriter.rewrite_match_pattern(&mut pattern);
+        assert!(rewriter.is_local("leaf"));
+        assert!(rewriter.is_local("tail"));
+        assert!(!rewriter.is_local("TopLevelLeaf"));
+        let mut enums = pattern.preorder().filter_map(|node| match node {
+            MatchPattern::EnumVariant { enum_name, .. } => Some(enum_name.as_str()),
+            _ => None,
+        });
+        assert_eq!(enums.next(), Some("RenamedAlias"));
+        let mut count = 0;
+        for name in enums {
+            assert_eq!(name, "RenamedNode");
+            count += 1;
+        }
+        assert_eq!(count, DEPTH);
+        used.clear();
+        collect_match_pattern_references(&pattern, &mut used);
+        assert_eq!(
+            used,
+            HashSet::from(["RenamedAlias".into(), "RenamedNode".into()])
+        );
+
+        let mut unused = UnusedAnalyzer::new();
+        unused.define_match_pattern(&pattern);
+        let names = unused.scopes[0]
+            .bindings
+            .iter()
+            .map(|binding| binding.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["leaf", "tail"]);
+        unused.use_name("leaf");
+        unused.use_name("tail");
+        unused.finish().expect("both pattern bindings are used");
+        drop(pattern);
+        eprintln!("{COMPLETED}");
+    }
 
     #[test]
     fn import_type_rewriting_preserves_lexical_generic_parameters() {

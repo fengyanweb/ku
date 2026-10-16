@@ -3557,54 +3557,73 @@ impl Checker {
         expected: &Type,
         span: Span,
     ) -> KuResult<()> {
-        match pattern {
-            MatchPattern::Wildcard => Ok(()),
-            MatchPattern::Binding(name) => self.define(name.clone(), expected.clone(), false, span),
-            MatchPattern::Literal(literal) => {
-                let actual = type_of_literal(literal);
-                if type_matches(expected, &actual) {
-                    Ok(())
-                } else {
-                    Err(type_error(span, expected, &actual))
+        // Each ancestor retains a cursor over siblings, rather than a Rust call
+        // frame or one pending entry per field. Keep the original preorder so
+        // definitions and the first diagnostic still follow source order.
+        let mut ancestors: Vec<
+            std::iter::Zip<std::slice::Iter<'_, MatchPattern>, std::vec::IntoIter<Type>>,
+        > = Vec::new();
+        let mut current = Some((pattern, std::borrow::Cow::Borrowed(expected)));
+        while let Some((pattern, expected)) = current.take() {
+            match pattern {
+                MatchPattern::Wildcard => {}
+                MatchPattern::Binding(name) => {
+                    self.define(name.clone(), expected.as_ref().clone(), false, span)?;
+                }
+                MatchPattern::Literal(literal) => {
+                    let actual = type_of_literal(literal);
+                    if !type_matches(expected.as_ref(), &actual) {
+                        return Err(type_error(span, expected.as_ref(), &actual));
+                    }
+                }
+                MatchPattern::EnumVariant {
+                    enum_name,
+                    variant,
+                    fields,
+                } => {
+                    let expected_enum = Type::Enum(enum_name.clone());
+                    if !type_matches(expected.as_ref(), &expected_enum) {
+                        return Err(type_error(span, expected.as_ref(), &expected_enum));
+                    }
+                    let Some(enum_type) = self.enums.get(enum_name) else {
+                        return Err(KuError::runtime(
+                            format!("undefined enum '{enum_name}'"),
+                            span,
+                        ));
+                    };
+                    let Some(payload) = enum_type.variants.get(variant).cloned() else {
+                        return Err(KuError::runtime(
+                            format!("enum '{enum_name}' has no variant '{variant}'"),
+                            span,
+                        ));
+                    };
+                    if payload.len() != fields.len() {
+                        return Err(KuError::runtime(
+                            format!(
+                                "match pattern '{enum_name}.{variant}' expects {} fields but got {}",
+                                payload.len(),
+                                fields.len()
+                            ),
+                            span,
+                        ));
+                    }
+                    let mut children = fields.iter().zip(payload);
+                    if let Some((field, ty)) = children.next() {
+                        ancestors.push(children);
+                        current = Some((field, std::borrow::Cow::Owned(ty)));
+                        continue;
+                    }
                 }
             }
-            MatchPattern::EnumVariant {
-                enum_name,
-                variant,
-                fields,
-            } => {
-                let expected_enum = Type::Enum(enum_name.clone());
-                if !type_matches(expected, &expected_enum) {
-                    return Err(type_error(span, expected, &expected_enum));
+            while let Some(children) = ancestors.last_mut() {
+                if let Some((field, ty)) = children.next() {
+                    current = Some((field, std::borrow::Cow::Owned(ty)));
+                    break;
                 }
-                let Some(enum_type) = self.enums.get(enum_name) else {
-                    return Err(KuError::runtime(
-                        format!("undefined enum '{enum_name}'"),
-                        span,
-                    ));
-                };
-                let Some(payload) = enum_type.variants.get(variant).cloned() else {
-                    return Err(KuError::runtime(
-                        format!("enum '{enum_name}' has no variant '{variant}'"),
-                        span,
-                    ));
-                };
-                if payload.len() != fields.len() {
-                    return Err(KuError::runtime(
-                        format!(
-                            "match pattern '{enum_name}.{variant}' expects {} fields but got {}",
-                            payload.len(),
-                            fields.len()
-                        ),
-                        span,
-                    ));
-                }
-                for (field, ty) in fields.iter().zip(payload.iter()) {
-                    self.check_match_pattern(field, ty, span)?;
-                }
-                Ok(())
+                ancestors.pop();
             }
         }
+        Ok(())
     }
 
     fn check_dotted_builtin_call(
@@ -7259,71 +7278,76 @@ impl Checker {
     }
 
     fn type_may_contain_function_value(&self, ty: &Type) -> bool {
-        self.type_may_contain_function_value_inner(ty, &mut HashSet::new(), &mut HashSet::new())
+        self.type_graph_any(ty, |ty| {
+            matches!(
+                ty,
+                Type::FunctionValue { .. }
+                    | Type::DynamicObject
+                    | Type::KuValue
+                    | Type::Generic(_)
+                    | Type::Unknown
+            )
+        })
     }
 
-    fn type_may_contain_function_value_inner(
-        &self,
-        ty: &Type,
-        visiting_structs: &mut HashSet<String>,
-        visiting_enums: &mut HashSet<String>,
-    ) -> bool {
-        match ty {
-            Type::FunctionValue { .. }
-            | Type::DynamicObject
-            | Type::KuValue
-            | Type::Generic(_)
-            | Type::Unknown => true,
-            Type::Array(inner) | Type::Result(inner) | Type::Task(inner) => {
-                self.type_may_contain_function_value_inner(inner, visiting_structs, visiting_enums)
-            }
-            Type::Union(types) => types.iter().any(|ty| {
-                self.type_may_contain_function_value_inner(ty, visiting_structs, visiting_enums)
-            }),
-            Type::Object(fields) => fields.values().any(|ty| {
-                self.type_may_contain_function_value_inner(ty, visiting_structs, visiting_enums)
-            }),
-            Type::Struct(name) => {
-                if !visiting_structs.insert(name.clone()) {
-                    return false;
-                }
-                let contains = self.structs.get(name).is_some_and(|layout| {
-                    layout.fields.values().any(|field| {
-                        self.type_may_contain_function_value_inner(
-                            field,
-                            visiting_structs,
-                            visiting_enums,
-                        )
-                    })
-                });
-                visiting_structs.remove(name);
-                contains
-            }
-            Type::Enum(name) => {
-                if !visiting_enums.insert(name.clone()) {
-                    return false;
-                }
-                let contains = self.enums.get(name).is_some_and(|layout| {
-                    layout.variants.values().flatten().any(|field| {
-                        self.type_may_contain_function_value_inner(
-                            field,
-                            visiting_structs,
-                            visiting_enums,
-                        )
-                    })
-                });
-                visiting_enums.remove(name);
-                contains
-            }
-            Type::Int
-            | Type::Float
-            | Type::Bool
-            | Type::String
-            | Type::Null
-            | Type::StringMap
-            | Type::Native(_)
-            | Type::Void => false,
+    /// Query owned payload types without following Rust call frames. Named
+    /// layouts form a graph, so visit each struct/enum once per query; their
+    /// namespaces stay separate even when the names happen to be identical.
+    /// Function signatures are not payload edges and remain leaves.
+    fn type_graph_any<'a>(&'a self, root: &'a Type, matches_leaf: impl Fn(&Type) -> bool) -> bool {
+        enum Children<'a> {
+            Sequence(std::slice::Iter<'a, Type>),
+            Fields(std::collections::hash_map::Values<'a, String, Type>),
+            Variants(std::iter::Flatten<std::collections::hash_map::Values<'a, String, Vec<Type>>>),
         }
+        impl<'a> Iterator for Children<'a> {
+            type Item = &'a Type;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                match self {
+                    Self::Sequence(types) => types.next(),
+                    Self::Fields(types) => types.next(),
+                    Self::Variants(types) => types.next(),
+                }
+            }
+        }
+
+        let mut ancestors = Vec::new();
+        let mut structs = HashSet::new();
+        let mut enums = HashSet::new();
+        let mut current = Some(root);
+        while let Some(ty) = current.take() {
+            if matches_leaf(ty) {
+                return true;
+            }
+            match ty {
+                Type::Array(inner) | Type::Result(inner) | Type::Task(inner) => {
+                    current = Some(inner.as_ref());
+                    continue;
+                }
+                Type::Union(types) => ancestors.push(Children::Sequence(types.iter())),
+                Type::Object(fields) => ancestors.push(Children::Fields(fields.values())),
+                Type::Struct(name) if structs.insert(name.as_str()) => {
+                    if let Some(layout) = self.structs.get(name) {
+                        ancestors.push(Children::Fields(layout.fields.values()));
+                    }
+                }
+                Type::Enum(name) if enums.insert(name.as_str()) => {
+                    if let Some(layout) = self.enums.get(name) {
+                        ancestors.push(Children::Variants(layout.variants.values().flatten()));
+                    }
+                }
+                _ => {}
+            }
+            while let Some(children) = ancestors.last_mut() {
+                if let Some(ty) = children.next() {
+                    current = Some(ty);
+                    break;
+                }
+                ancestors.pop();
+            }
+        }
+        false
     }
 
     fn mark_initialized(&mut self, name: &str) {
@@ -7942,112 +7966,50 @@ impl Checker {
     }
 
     fn is_owned_type(&self, ty: &Type) -> bool {
-        match ty {
-            Type::String
-            | Type::Array(_)
-            | Type::Object(_)
-            | Type::StringMap
-            | Type::DynamicObject
-            | Type::KuValue
-            // A native handle owns a C resource; it must be move-tracked and dropped.
-            | Type::Native(_) => true,
-            Type::Struct(name) => {
-                self.structs.get(name).is_some_and(|layout| {
-                    layout
-                        .fields
-                        .values()
-                        .any(|field| self.is_owned_type(field))
-                }) || self.structs.contains_key(name)
+        let mut ancestors: Vec<std::slice::Iter<'_, Type>> = Vec::new();
+        let mut current = Some(ty);
+        while let Some(ty) = current.take() {
+            match ty {
+                Type::String
+                | Type::Array(_)
+                | Type::Object(_)
+                | Type::StringMap
+                | Type::DynamicObject
+                | Type::KuValue
+                // A native handle owns a C resource; it must be move-tracked and dropped.
+                | Type::Native(_)
+                | Type::Result(_)
+                | Type::Task(_)
+                // Calling a function value reads it; passing it follows its parameter mode.
+                | Type::FunctionValue { .. } => return true,
+                // A defined aggregate already owns storage regardless of its
+                // payload types. Walking those types first cannot alter the
+                // answer and used to recurse through long named enum chains.
+                Type::Struct(name) if self.structs.contains_key(name) => return true,
+                Type::Enum(name) if self.enums.contains_key(name) => return true,
+                Type::Union(types) if !types.is_empty() => ancestors.push(types.iter()),
+                _ => {}
             }
-            Type::Enum(name) => {
-                self.enums.get(name).is_some_and(|layout| {
-                    layout
-                        .variants
-                        .values()
-                        .flatten()
-                        .any(|field| self.is_owned_type(field))
-                }) || self.enums.contains_key(name)
+            while let Some(types) = ancestors.last_mut() {
+                if let Some(ty) = types.next() {
+                    current = Some(ty);
+                    break;
+                }
+                ancestors.pop();
             }
-            Type::Result(_) | Type::Task(_) => true,
-            // Calling a function value reads it; passing it follows its parameter mode.
-            Type::FunctionValue { .. } => true,
-            Type::Union(types) => types.iter().any(|ty| self.is_owned_type(ty)),
-            _ => false,
         }
+        false
     }
 
     /// Native handles are move-only even when nested inside another owned value.
-    /// Walk named layouts recursively, but break cycles so an invalid/self-recursive
-    /// user type cannot overflow the checker while clone eligibility is decided.
     fn type_contains_native_resource(&self, ty: &Type) -> bool {
-        self.type_contains_native_resource_inner(ty, &mut HashSet::new(), &mut HashSet::new())
-    }
-
-    fn type_contains_native_resource_inner(
-        &self,
-        ty: &Type,
-        visiting_structs: &mut HashSet<String>,
-        visiting_enums: &mut HashSet<String>,
-    ) -> bool {
-        match ty {
-            // `bytes` is an ordinary cloneable owned value. Other native types
-            // carry external resource identity and remain move-only, including
-            // when nested inside arrays/results/user aggregates.
-            Type::Native(name) => name != metadata::BYTES,
-            Type::Array(inner) | Type::Result(inner) | Type::Task(inner) => {
-                self.type_contains_native_resource_inner(inner, visiting_structs, visiting_enums)
-            }
-            Type::Union(types) => types.iter().any(|ty| {
-                self.type_contains_native_resource_inner(ty, visiting_structs, visiting_enums)
-            }),
-            Type::Object(fields) => fields.values().any(|ty| {
-                self.type_contains_native_resource_inner(ty, visiting_structs, visiting_enums)
-            }),
-            Type::Struct(name) => {
-                if !visiting_structs.insert(name.clone()) {
-                    return false;
-                }
-                let contains = self.structs.get(name).is_some_and(|layout| {
-                    layout.fields.values().any(|ty| {
-                        self.type_contains_native_resource_inner(
-                            ty,
-                            visiting_structs,
-                            visiting_enums,
-                        )
-                    })
-                });
-                visiting_structs.remove(name);
-                contains
-            }
-            Type::Enum(name) => {
-                if !visiting_enums.insert(name.clone()) {
-                    return false;
-                }
-                let contains = self.enums.get(name).is_some_and(|layout| {
-                    layout.variants.values().flatten().any(|ty| {
-                        self.type_contains_native_resource_inner(
-                            ty,
-                            visiting_structs,
-                            visiting_enums,
-                        )
-                    })
-                });
-                visiting_enums.remove(name);
-                contains
-            }
-            Type::Int
-            | Type::Float
-            | Type::Bool
-            | Type::String
-            | Type::Null
-            | Type::StringMap
-            | Type::DynamicObject
-            | Type::Generic(_)
-            | Type::Void
-            | Type::FunctionValue { .. }
-            | Type::KuValue
-            | Type::Unknown => false,
-        }
+        // `bytes` is an ordinary cloneable owned value. Other native types
+        // carry external resource identity and remain move-only, including
+        // when nested inside arrays/results/user aggregates.
+        self.type_graph_any(
+            ty,
+            |ty| matches!(ty, Type::Native(name) if name != metadata::BYTES),
+        )
     }
 
     /// The move state after a loop, joining every way it can exit: running zero
@@ -8817,19 +8779,44 @@ fn enum_pattern_covers_all_payload(pattern: &MatchPattern) -> bool {
 }
 
 fn pattern_key(pattern: &MatchPattern) -> String {
-    match pattern {
-        MatchPattern::Wildcard => "_".to_string(),
-        MatchPattern::Binding(_) => "$binding".to_string(),
-        MatchPattern::Literal(literal) => literal_key(literal),
-        MatchPattern::EnumVariant {
-            enum_name,
-            variant,
-            fields,
-        } => {
-            let fields = fields.iter().map(pattern_key).collect::<Vec<_>>().join(",");
-            format!("enum:{enum_name}.{variant}({fields})")
+    let mut key = String::new();
+    let mut ancestors: Vec<std::slice::Iter<'_, MatchPattern>> = Vec::new();
+    let mut current = Some(pattern);
+    while let Some(pattern) = current.take() {
+        match pattern {
+            MatchPattern::Wildcard => key.push('_'),
+            MatchPattern::Binding(_) => key.push_str("$binding"),
+            MatchPattern::Literal(literal) => key.push_str(&literal_key(literal)),
+            MatchPattern::EnumVariant {
+                enum_name,
+                variant,
+                fields,
+            } => {
+                key.push_str("enum:");
+                key.push_str(enum_name);
+                key.push('.');
+                key.push_str(variant);
+                key.push('(');
+                let mut children = fields.iter();
+                if let Some(field) = children.next() {
+                    ancestors.push(children);
+                    current = Some(field);
+                    continue;
+                }
+                key.push(')');
+            }
+        }
+        while let Some(children) = ancestors.last_mut() {
+            if let Some(field) = children.next() {
+                key.push(',');
+                current = Some(field);
+                break;
+            }
+            key.push(')');
+            ancestors.pop();
         }
     }
+    key
 }
 
 fn enum_variant_path(expr: &Expr) -> Option<(String, String)> {
@@ -9003,13 +8990,9 @@ fn expr_uses_name(expr: &Expr, name: &str, shadowed: bool) -> bool {
 }
 
 fn pattern_binds_name(pattern: &MatchPattern, name: &str) -> bool {
-    match pattern {
-        MatchPattern::Binding(binding) => binding == name,
-        MatchPattern::EnumVariant { fields, .. } => {
-            fields.iter().any(|field| pattern_binds_name(field, name))
-        }
-        MatchPattern::Wildcard | MatchPattern::Literal(_) => false,
-    }
+    pattern
+        .preorder()
+        .any(|node| matches!(node, MatchPattern::Binding(binding) if binding == name))
 }
 
 fn reject_http_side_effect_response_calls(body: &[Stmt], span: Span) -> KuResult<()> {
@@ -9695,16 +9678,10 @@ fn collect_checker_capture_expr(
 }
 
 fn bind_match_pattern_names(pattern: &MatchPattern, bound: &mut HashSet<String>) {
-    match pattern {
-        MatchPattern::Binding(name) => {
+    for node in pattern.preorder() {
+        if let MatchPattern::Binding(name) = node {
             bound.insert(name.clone());
         }
-        MatchPattern::EnumVariant { fields, .. } => {
-            for field in fields {
-                bind_match_pattern_names(field, bound);
-            }
-        }
-        MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
     }
 }
 
@@ -9763,16 +9740,10 @@ fn bind_match_pattern_closure_provenance(
     selected: &ClosureProvenance,
     symbolic: &mut HashMap<String, ClosureProvenance>,
 ) {
-    match pattern {
-        MatchPattern::Binding(name) => {
+    for node in pattern.preorder() {
+        if let MatchPattern::Binding(name) = node {
             symbolic.insert(name.clone(), selected.clone());
         }
-        MatchPattern::EnumVariant { fields, .. } => {
-            for field in fields {
-                bind_match_pattern_closure_provenance(field, selected, symbolic);
-            }
-        }
-        MatchPattern::Wildcard | MatchPattern::Literal(_) => {}
     }
 }
 
@@ -10905,7 +10876,218 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deep_match_patterns_keep_type_binding_capture_and_key_behavior() {
+        const CHILD: &str = "KU_CHECKER_DEEP_MATCH_PATTERN_CHILD";
+        const COMPLETED: &str = "checker deep match pattern completed";
+        if std::env::var_os(CHILD).is_none() {
+            use crate::registry_server::native_test_harness::{run_bounded, OutputLimits};
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "checker::tests::deep_match_patterns_keep_type_binding_capture_and_key_behavior",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = run_bounded(
+                &mut command,
+                std::time::Duration::from_secs(15),
+                OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("deep pattern check has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "deep pattern child failed: {:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line == COMPLETED));
+            return;
+        }
+
+        const DEPTH: usize = 16_384;
+        let mut pattern = MatchPattern::EnumVariant {
+            enum_name: "Node".into(),
+            variant: "End".into(),
+            fields: vec![MatchPattern::Binding("leaf".into())],
+        };
+        for _ in 0..DEPTH {
+            pattern = MatchPattern::EnumVariant {
+                enum_name: "Node".into(),
+                variant: "Next".into(),
+                fields: vec![pattern],
+            };
+        }
+        let pattern = MatchPattern::EnumVariant {
+            enum_name: "Pair".into(),
+            variant: "Both".into(),
+            fields: vec![pattern, MatchPattern::Binding("tail".into())],
+        };
+        let mut checker = Checker::new();
+        checker.enums.insert(
+            "Node".into(),
+            EnumType {
+                variants: HashMap::from([
+                    ("Next".into(), vec![Type::Enum("Node".into())]),
+                    ("End".into(), vec![Type::Int]),
+                ]),
+            },
+        );
+        checker.enums.insert(
+            "Pair".into(),
+            EnumType {
+                variants: HashMap::from([(
+                    "Both".into(),
+                    vec![Type::Enum("Node".into()), Type::Bool],
+                )]),
+            },
+        );
+        checker
+            .check_match_pattern(&pattern, &Type::Enum("Pair".into()), Span::default())
+            .expect("deep match remains valid without a new pattern depth limit");
+        assert_eq!(checker.get("leaf", Span::default()).unwrap().ty, Type::Int);
+        assert_eq!(checker.get("tail", Span::default()).unwrap().ty, Type::Bool);
+        assert!(pattern_binds_name(&pattern, "leaf"));
+        assert!(pattern_binds_name(&pattern, "tail"));
+        assert!(!pattern_binds_name(&pattern, "missing"));
+        let mut bound = HashSet::from(["outer".into()]);
+        bind_match_pattern_names(&pattern, &mut bound);
+        assert_eq!(
+            bound,
+            HashSet::from(["outer".into(), "leaf".into(), "tail".into()])
+        );
+        let mut selected = ClosureProvenance::empty();
+        selected.dependencies.extend([7, 11]);
+        let mut symbolic = HashMap::from([("outer".into(), ClosureProvenance::unknown())]);
+        bind_match_pattern_closure_provenance(&pattern, &selected, &mut symbolic);
+        assert_eq!(symbolic.get("leaf"), Some(&selected));
+        assert_eq!(symbolic.get("tail"), Some(&selected));
+        assert!(!symbolic.get("outer").unwrap().complete);
+        let expected_key = format!(
+            "enum:Pair.Both({}enum:Node.End($binding){},$binding)",
+            "enum:Node.Next(".repeat(DEPTH),
+            ")".repeat(DEPTH)
+        );
+        assert_eq!(pattern_key(&pattern), expected_key);
+        drop(pattern);
+        eprintln!("{COMPLETED}");
+    }
+
+    #[test]
+    fn match_pattern_keys_and_first_error_still_follow_field_order() {
+        let pattern = MatchPattern::EnumVariant {
+            enum_name: "Mod.Tree".into(),
+            variant: "Branch".into(),
+            fields: vec![
+                MatchPattern::Wildcard,
+                MatchPattern::Binding("ignored_name".into()),
+                MatchPattern::Literal(Literal::Int(-3)),
+                MatchPattern::Literal(Literal::Float(0.5)),
+                MatchPattern::Literal(Literal::Bool(true)),
+                MatchPattern::Literal(Literal::String("中,(文)".into())),
+                MatchPattern::Literal(Literal::TemplateString("模板".into())),
+                MatchPattern::Literal(Literal::Null),
+                MatchPattern::EnumVariant {
+                    enum_name: "Empty".into(),
+                    variant: "Unit".into(),
+                    fields: vec![],
+                },
+            ],
+        };
+        assert_eq!(
+            pattern_key(&pattern),
+            "enum:Mod.Tree.Branch(_,$binding,int:-3,float:0.5,bool:true,str:中,(文),str:模板,null,enum:Empty.Unit())"
+        );
+
+        let mut checker = Checker::new();
+        checker.enums.insert(
+            "Pair".into(),
+            EnumType {
+                variants: HashMap::from([("Both".into(), vec![Type::Int, Type::Bool])]),
+            },
+        );
+        let mismatch_before_binding = MatchPattern::EnumVariant {
+            enum_name: "Pair".into(),
+            variant: "Both".into(),
+            fields: vec![
+                MatchPattern::Literal(Literal::Bool(true)),
+                MatchPattern::Binding("later".into()),
+            ],
+        };
+        let error = checker
+            .check_match_pattern(
+                &mismatch_before_binding,
+                &Type::Enum("Pair".into()),
+                Span::default(),
+            )
+            .expect_err("first payload has the wrong type");
+        assert_eq!(
+            error.message,
+            type_error(Span::default(), &Type::Int, &Type::Bool).message
+        );
+        assert!(!checker.contains("later"));
+
+        let binding_before_mismatch = MatchPattern::EnumVariant {
+            enum_name: "Pair".into(),
+            variant: "Both".into(),
+            fields: vec![
+                MatchPattern::Binding("earlier".into()),
+                MatchPattern::Literal(Literal::Int(1)),
+            ],
+        };
+        let error = checker
+            .check_match_pattern(
+                &binding_before_mismatch,
+                &Type::Enum("Pair".into()),
+                Span::default(),
+            )
+            .expect_err("second payload has the wrong type");
+        assert_eq!(
+            error.message,
+            type_error(Span::default(), &Type::Bool, &Type::Int).message
+        );
+        assert_eq!(
+            checker.get("earlier", Span::default()).unwrap().ty,
+            Type::Int
+        );
+    }
+
+    #[test]
     fn native_resource_detection_is_recursive_and_cycle_safe() {
+        const CHILD: &str = "KU_CHECKER_NAMED_TYPE_GRAPH_CHILD";
+        const COMPLETED: &str = "checker named type graph completed";
+        if std::env::var_os(CHILD).is_none() {
+            use crate::registry_server::native_test_harness::{run_bounded, OutputLimits};
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "checker::tests::native_resource_detection_is_recursive_and_cycle_safe",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1");
+            let output = run_bounded(
+                &mut command,
+                std::time::Duration::from_secs(15),
+                OutputLimits::new(64 * 1024, 128 * 1024),
+            )
+            .expect("named type graph check has a bounded subprocess");
+            assert!(
+                output.status.success(),
+                "named type graph child failed: {:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line == COMPLETED));
+            return;
+        }
+
         let mut checker = Checker::new();
         checker.structs.insert(
             "Recursive".to_string(),
@@ -10953,5 +11135,94 @@ mod tests {
             ))))),
         ]);
         assert!(checker.type_contains_native_resource(&nested));
+
+        // The struct and enum intentionally share a name. A single visited
+        // namespace would incorrectly suppress the enum payload below it.
+        checker.structs.insert(
+            "Shared".into(),
+            StructType {
+                fields: HashMap::from([("child".into(), Type::Enum("Shared".into()))]),
+            },
+        );
+        checker.enums.insert(
+            "Shared".into(),
+            EnumType {
+                variants: HashMap::from([
+                    ("Cycle".into(), vec![Type::Struct("Shared".into())]),
+                    ("End".into(), vec![Type::Int]),
+                ]),
+            },
+        );
+        const DEPTH: usize = 4_000;
+        for index in 0..DEPTH {
+            let previous = if index == 0 {
+                Type::Struct("Shared".into())
+            } else {
+                Type::Enum(format!("Deep{}", index - 1))
+            };
+            checker.enums.insert(
+                format!("Deep{index}"),
+                EnumType {
+                    variants: HashMap::from([("Next".into(), vec![previous.clone(), previous])]),
+                },
+            );
+        }
+        let root = Type::Enum(format!("Deep{}", DEPTH - 1));
+        let function = Type::FunctionValue {
+            params: vec![FunctionValueParam {
+                name: "handle".into(),
+                mode: ParamMode::Owned,
+                ty: Some(Type::Native(metadata::PG_RESULT.into())),
+            }],
+            return_type: Some(Box::new(Type::Native(metadata::MYSQL_CLIENT.into()))),
+            body: vec![],
+            body_id: None,
+            is_async: false,
+        };
+        for (leaf, contains_function, contains_native) in [
+            (Type::Int, false, false),
+            (function, true, false),
+            (Type::Unknown, true, false),
+            (Type::Generic("T".into()), true, false),
+            (Type::DynamicObject, true, false),
+            (Type::KuValue, true, false),
+            (Type::Native(metadata::BYTES.into()), false, false),
+            (Type::Native(metadata::PG_RESULT.into()), false, true),
+        ] {
+            let payload = Type::Result(Box::new(Type::Task(Box::new(Type::Array(Box::new(
+                Type::Object(HashMap::from([(
+                    "payload".into(),
+                    Type::Union(vec![Type::Bool, leaf]),
+                )])),
+            ))))));
+            checker
+                .enums
+                .get_mut("Shared")
+                .unwrap()
+                .variants
+                .insert("End".into(), vec![payload]);
+            assert_eq!(
+                checker.type_may_contain_function_value(&root),
+                contains_function
+            );
+            assert_eq!(
+                checker.type_contains_native_resource(&root),
+                contains_native
+            );
+        }
+
+        // A deep diamond DAG has exponentially many paths but only linearly
+        // many nodes/edges. Each named layout is expanded once per query.
+        let visited = std::cell::Cell::new(0usize);
+        assert!(!checker.type_graph_any(&root, |_| {
+            visited.set(visited.get() + 1);
+            false
+        }));
+        assert!(visited.get() <= DEPTH * 3 + 32);
+        for absent in [Type::Struct("Missing".into()), Type::Enum("Missing".into())] {
+            assert!(!checker.type_may_contain_function_value(&absent));
+            assert!(!checker.type_contains_native_resource(&absent));
+        }
+        eprintln!("{COMPLETED}");
     }
 }

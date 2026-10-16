@@ -9,6 +9,7 @@ const MAX_STATEMENT_DEPTH: usize = 32;
 const MAX_TOKENS: usize = 100_000;
 
 mod expression_tree;
+mod match_pattern;
 
 fn expression_tree_error(span: Span) -> KuError {
     KuError::parse(
@@ -1616,51 +1617,7 @@ impl Parser {
     }
 
     fn match_pattern(&mut self) -> KuResult<MatchPattern> {
-        let token = self.advance().clone();
-        match token.kind {
-            TokenKind::Ident(name) if name == "_" => Ok(MatchPattern::Wildcard),
-            TokenKind::Int(value) => Ok(MatchPattern::Literal(Literal::Int(value))),
-            TokenKind::Float(value) => Ok(MatchPattern::Literal(Literal::Float(value))),
-            TokenKind::String(value) => Ok(MatchPattern::Literal(Literal::String(value))),
-            TokenKind::True => Ok(MatchPattern::Literal(Literal::Bool(true))),
-            TokenKind::False => Ok(MatchPattern::Literal(Literal::Bool(false))),
-            TokenKind::Null => Ok(MatchPattern::Literal(Literal::Null)),
-            TokenKind::Ident(enum_name) => {
-                if !self.match_kind(&TokenKind::Dot) {
-                    return Ok(MatchPattern::Binding(enum_name));
-                }
-                let (mut variant, _) =
-                    self.consume_ident("expected enum variant in match pattern")?;
-                let enum_name = if self.match_kind(&TokenKind::Dot) {
-                    let namespace = enum_name;
-                    let enum_type = variant;
-                    let (actual_variant, _) =
-                        self.consume_ident("expected enum variant in match pattern")?;
-                    variant = actual_variant;
-                    format!("{namespace}.{enum_type}")
-                } else {
-                    enum_name
-                };
-                let mut fields = Vec::new();
-                if self.match_kind(&TokenKind::LParen) {
-                    if !self.check(&TokenKind::RParen) {
-                        loop {
-                            fields.push(self.match_pattern()?);
-                            if !self.match_kind(&TokenKind::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    self.consume(&TokenKind::RParen, "expected ')' after payload patterns")?;
-                }
-                Ok(MatchPattern::EnumVariant {
-                    enum_name,
-                    variant,
-                    fields,
-                })
-            }
-            _ => Err(KuError::parse("expected match pattern", token.span)),
-        }
+        match_pattern::parse(self)
     }
 
     fn is_arrow_function_start(&self) -> KuResult<bool> {
