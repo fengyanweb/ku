@@ -1488,6 +1488,158 @@ fn Make() {
 }
 
 #[test]
+fn production_readonly_string_captures_use_real_worker_frames_without_copying() {
+    let (_, test_name) = concat!(
+        module_path!(),
+        "::production_readonly_string_captures_use_real_worker_frames_without_copying"
+    )
+    .split_once("::")
+    .unwrap();
+    if !bounded_worker_child(test_name) {
+        return;
+    }
+    let runtime = TaskRuntime::new();
+    let child_runtime = runtime.clone();
+    let parent = thread::current().id();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let task = runtime.spawn(move || {
+        let worker = thread::current();
+        let _ = ready_tx.send((worker.id(), worker.name().unwrap_or("").to_owned()));
+        let result = (|| -> KuResult<()> {
+            let mut host = production_interpreter(
+                r#"
+fn Make(): fn(int): int {
+    PREFIX = "中🙂"
+    fn Descend(n: int): int {
+        if (n <= 0) { return PREFIX.len() * 100 + PREFIX.byte_len() }
+        return 1 + Descend(n - 1)
+    }
+    return Descend.clone()
+}
+"#,
+            );
+            host.task_runtime = Some(child_runtime);
+            let value = host.call_function("Make", vec![], Span::default(), 0)?;
+            let call = function_value_call(&value, 0, 0);
+            let metadata = || {
+                call.captures
+                    .with_value("PREFIX", Span::default(), |value| {
+                        let Value::String(text) = value else {
+                            panic!("the original capture must stay a String")
+                        };
+                        assert_eq!(text, "中🙂");
+                        Ok((text.as_ptr() as usize, text.len(), text.capacity()))
+                    })
+            };
+            let original = metadata()?;
+            assert_eq!(
+                try_execute_function_value(&mut host, &call)
+                    .expect("the public selector must choose flat captured String queries")?
+                    .into_call_value(Span::default(), "function value")?,
+                Value::Int(207)
+            );
+            let code = CodeHandle::compile_local(&host.functions, &call, Limits::default())
+                .expect("the whole local call tree must compile without the old evaluator");
+            let mut machine = Machine::from_code(code, Limits::default(), 0);
+            machine.captures = Some(call.captures.clone());
+            let mut peak = 0;
+            for argument in [510, 511, 512, 1] {
+                let result = machine
+                    .run_with_hooks("Descend", &[Value::Int(argument)], 0, false, &mut host)
+                    .and_then(|flow| flow.into_call_value(Span::default(), "function value"));
+                if argument == 512 {
+                    assert_depth_error(result);
+                } else {
+                    assert_eq!(result?, Value::Int(207 + argument));
+                }
+                peak = peak.max((argument + 1).min(512) as usize);
+                assert_eq!(machine.metrics.peak_calls, peak);
+                assert_drained(&machine.metrics, 0);
+                assert_eq!(host.call_depth, 0);
+                assert_eq!(metadata()?, original);
+            }
+            let bytes = machine.value_limits.max_storage_bytes;
+            machine.value_limits.max_storage_bytes = 0;
+            assert!(machine
+                .run_with_hooks("Descend", &[Value::Int(1)], 0, false, &mut host)
+                .is_err());
+            assert_drained(&machine.metrics, 0);
+            assert_eq!(metadata()?, original);
+            machine.value_limits.max_storage_bytes = bytes;
+            assert_eq!(
+                machine
+                    .run_with_hooks("Descend", &[Value::Int(1)], 0, false, &mut host)?
+                    .into_call_value(Span::default(), "function value")?,
+                Value::Int(208)
+            );
+            assert_drained(&machine.metrics, 0);
+            assert_eq!(metadata()?, original);
+
+            // An active source loan cannot be mistaken for this String-only
+            // admission. The existing shallow callable still reads its source.
+            let (_, lease) = call.captures.borrow("PREFIX", Span::default())?;
+            assert!(try_execute_function_value(&mut host, &call).is_none());
+            assert_eq!(
+                host.call_function_value(function_value_call(&value, 1, 0))?,
+                Value::Int(208)
+            );
+            drop(lease);
+            assert_eq!(metadata()?, original);
+
+            let mut shadow = production_interpreter(
+                r#"
+fn Make() {
+    PREFIX = "kept"
+    fn local(n: int): int {
+        if (n > 0) { PREFIX: int = 77
+return PREFIX }
+        return PREFIX.len()
+    }
+    return local.clone()
+}
+"#,
+            );
+            let shadow_value = shadow.call_function("Make", vec![], Span::default(), 0)?;
+            for (argument, expected) in [(1, 77), (0, 4)] {
+                assert_eq!(
+                    try_execute_function_value(
+                        &mut shadow,
+                        &function_value_call(&shadow_value, argument, 0),
+                    )
+                    .expect("a block-local scalar must shadow the capture only in that block")?
+                    .into_call_value(Span::default(), "function value")?,
+                    Value::Int(expected)
+                );
+            }
+            Ok(())
+        })();
+        let _ = result_tx.send(result);
+        Ok(Value::Null)
+    });
+    let ready = ready_rx.recv_timeout(Duration::from_secs(3));
+    let outcome = result_rx.recv_timeout(Duration::from_secs(3));
+    let admission = task.as_ref().err().cloned();
+    drop(task);
+    let drained = runtime.cancel_all_and_wait(Duration::from_secs(2));
+    let snapshot = runtime.snapshot();
+    drained.unwrap();
+    let snapshot = snapshot.unwrap();
+    assert!(admission.is_none(), "{admission:?}");
+    let (worker, name) = ready.expect("the real worker must report entry");
+    assert_ne!(worker, parent);
+    assert!(name.starts_with("ku-task-"), "{name}");
+    outcome
+        .expect("the real worker must finish the matrix")
+        .unwrap();
+    assert_eq!(snapshot.active_tasks, 0);
+    assert_eq!(snapshot.queued_tasks, 0);
+    assert_eq!(snapshot.queued_blocking_jobs, 0);
+    assert_eq!(snapshot.running_blocking_jobs, 0);
+    eprintln!("worker regression completed: {test_name}");
+}
+
+#[test]
 fn production_shared_capture_writes_use_flat_epilogues_and_foreign_mutable_reads_keep_original_engine(
 ) {
     let runtime = TaskRuntime::new();
@@ -1910,6 +2062,17 @@ fn production_unselected_owned_capture_global_call_and_self_alias_remain_support
 fn Make() {
     prefix = "kept"
     fn local(n: int): int { return prefix.len() + n }
+    return local.clone()
+}
+"#,
+            6,
+        ),
+        (
+            r#"
+fn PREFIX(): int { return 99 }
+fn Make() {
+    PREFIX = "kept"
+    fn local(n: int): int { return PREFIX.len() + n }
     return local.clone()
 }
 "#,

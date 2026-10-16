@@ -573,6 +573,18 @@ impl Env {
             )
     }
 
+    /// A flat synchronous closure may query this shared String in place. The
+    /// immutable binding cannot change its type or buffer through another Env.
+    pub(crate) fn is_immutable_string_binding(&self, name: &str) -> bool {
+        let Some(cell) = self.find_cell(name) else {
+            return false;
+        };
+        let Ok(binding) = cell.lock() else {
+            return false;
+        };
+        !binding.mutable && matches!(binding.value, Value::String(_))
+    }
+
     /// Ku owning reads transfer Task-containing values instead of sharing an
     /// internal handle lease with a moved-from slot. Other values retain get's
     /// existing transparent snapshot/borrow behavior.

@@ -1711,6 +1711,15 @@ fn binding_kind(bound: &[Binding<'_>], name: &str) -> Option<ValueKind> {
 }
 
 fn string_length_call<'a>(expr: &'a Expr, bound: &[Binding<'_>]) -> Option<(&'a str, bool, Span)> {
+    let (symbol, byte_len, span) = string_length_target(expr)?;
+    matches!(
+        binding_kind(bound, symbol),
+        Some(ValueKind::String | ValueKind::ViewString)
+    )
+    .then_some((symbol, byte_len, span))
+}
+
+fn string_length_target(expr: &Expr) -> Option<(&str, bool, Span)> {
     let ExprKind::Call { callee, args } = &expr.kind else {
         return None;
     };
@@ -1720,12 +1729,7 @@ fn string_length_call<'a>(expr: &'a Expr, bound: &[Binding<'_>]) -> Option<(&'a 
     let ExprKind::Variable(symbol) = &target.kind else {
         return None;
     };
-    if !args.is_empty()
-        || !matches!(
-            binding_kind(bound, symbol),
-            Some(ValueKind::String | ValueKind::ViewString)
-        )
-    {
+    if !args.is_empty() {
         return None;
     }
     let byte_len = match name.as_str() {
@@ -1734,6 +1738,25 @@ fn string_length_call<'a>(expr: &'a Expr, bound: &[Binding<'_>]) -> Option<(&'a 
         _ => return None,
     };
     Some((symbol, byte_len, target.span))
+}
+
+fn captured_string_length_call<'a>(
+    expr: &'a Expr,
+    source: &HashMap<String, FnDecl>,
+    local: Option<LocalContext<'_>>,
+    bound: &[Binding<'_>],
+) -> Option<(&'a str, bool, Span)> {
+    let local = local?;
+    let (name, byte_len, span) = string_length_target(expr)?;
+    if local.is_async
+        || binding_kind(bound, name).is_some()
+        || name == local.name
+        || source.contains_key(name)
+        || !local.captures.is_immutable_string_binding(name)
+    {
+        return None;
+    }
+    Some((name, byte_len, span))
 }
 
 fn borrow_string_variable<'a>(expr: &'a Expr, bound: &[Binding<'_>]) -> Admission<&'a str> {
@@ -1837,6 +1860,9 @@ fn expression_kind(
         ExprKind::Variable(name) => binding_kind(bound, name).unwrap_or(ValueKind::Scalar),
         ExprKind::Await(_) => ValueKind::Result,
         ExprKind::Call { callee, .. } => {
+            if captured_string_length_call(expr, source, local, bound).is_some() {
+                return Ok(ValueKind::Scalar);
+            }
             if selected_string_result_clone_target(expr, bound).is_some() {
                 return Ok(ValueKind::ResultString);
             }
@@ -2749,28 +2775,37 @@ impl<'a> Builder<'a> {
                         // Owned inputs and their static scalar helpers use
                         // the same real Env read and original length tick as
                         // String loans. This creates no new String or owner.
-                        if spec.owns_strings() {
-                            if let Some((name, byte_len, target_span)) =
-                                string_length_call(expr, self.bound.as_slice())
-                            {
+                        let captured_length = captured_string_length_call(
+                            expr,
+                            self.source,
+                            self.local,
+                            self.bound.as_slice(),
+                        );
+                        let length = captured_length.or_else(|| {
+                            spec.owns_strings()
+                                .then(|| string_length_call(expr, self.bound.as_slice()))
+                                .flatten()
+                        });
+                        if let Some((name, byte_len, target_span)) = length {
+                            if captured_length.is_none() {
                                 self.check_free(name, target_span)?;
-                                self.spend(1, target_span)?;
-                                let symbol = self.symbol(name, target_span)?;
-                                let target_span = self.span(target_span)?;
-                                *self
-                                    .arena
-                                    .expressions
-                                    .get_mut(id.0)
-                                    .expect("length expression slot") = CodeExpr {
-                                    kind: ExprCode::StringLength {
-                                        symbol,
-                                        byte_len,
-                                        target_span,
-                                    },
-                                    span,
-                                };
-                                return Ok(());
                             }
+                            self.spend(1, target_span)?;
+                            let symbol = self.symbol(name, target_span)?;
+                            let target_span = self.span(target_span)?;
+                            *self
+                                .arena
+                                .expressions
+                                .get_mut(id.0)
+                                .expect("length expression slot") = CodeExpr {
+                                kind: ExprCode::StringLength {
+                                    symbol,
+                                    byte_len,
+                                    target_span,
+                                },
+                                span,
+                            };
+                            return Ok(());
                         }
                         let ExprKind::Variable(name) = &callee.kind else {
                             return Err(AdmissionError::Unsupported(callee.span));
@@ -3888,14 +3923,23 @@ impl<'a> Eligibility<'a> {
                             {
                                 return Err(AdmissionError::Unsupported(expr.span));
                             }
-                            if spec.owns_strings() {
-                                if let Some((name, _, target_span)) =
-                                    string_length_call(expr, self.bound.as_slice())
-                                {
+                            let captured_length = captured_string_length_call(
+                                expr,
+                                self.source,
+                                self.local,
+                                self.bound.as_slice(),
+                            );
+                            let length = captured_length.or_else(|| {
+                                spec.owns_strings()
+                                    .then(|| string_length_call(expr, self.bound.as_slice()))
+                                    .flatten()
+                            });
+                            if let Some((name, _, target_span)) = length {
+                                if captured_length.is_none() {
                                     self.free(name, target_span)?;
-                                    self.spend(1, target_span)?;
-                                    continue;
                                 }
+                                self.spend(1, target_span)?;
+                                continue;
                             }
                             let ExprKind::Variable(name) = &callee.kind else {
                                 return Err(AdmissionError::Unsupported(callee.span));
