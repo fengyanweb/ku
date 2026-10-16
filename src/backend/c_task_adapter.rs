@@ -235,6 +235,12 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             .iter()
             .any(|op| matches!(op, TaskOp::ScopeEnter { .. }))
     });
+    let scope_exits = function.states.iter().any(|state| {
+        state
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, TaskOp::ScopeExitBegin { .. }))
+    });
     let mut scope_preflight = String::new();
     for (index, slot) in function.slots.iter().enumerate() {
         if matches!(slot.ty, TaskSlotType::Task { .. }) {
@@ -261,6 +267,8 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@SCOPE_REGISTER@", if scoped { SCOPE_REGISTER } else { "" })
         .replace("@SCOPE_RESUME_HELPER@", if scoped { SCOPE_RESUME_HELPER } else { "" })
         .replace("@SCOPE_RESUME@", if scoped { SCOPE_RESUME } else { "" })
+        .replace("@EXIT_DEADLINE@", if scope_exits { EXIT_DEADLINE } else { "" })
+        .replace("@EXIT_EMPTY_STARTED@", if scope_exits { "(instance->drain_started && !instance->frame.scope_exit_active)" } else { "instance->drain_started" })
         .replace("@DRAIN_HAS_OWNERS@", if scoped { "scope_live_mask || instance->receipt_mask" } else { "(instance->frame.header.initialized & UINT64_C(@TASK_MASK@)) || instance->receipt_mask" })
         .replace("@ID@", &id)
         .replace("@RESULT@", &result_type)
@@ -419,6 +427,17 @@ const SCOPE_REGISTER: &str = r#"
     instance->scope_mode=2u; instance->drain_deadline=effective;
   }
 "#;
+// A multi-scope exit owns a single absolute budget in private frame storage.
+// Session close still retires its receipts normally. The next session imports
+// this same (possibly tightened) D; even an empty scope cannot renew it.
+const EXIT_DEADLINE: &str = r#"
+  if (instance->frame.scope_exit_active) {
+    uint64_t deadline=ku_task_host_deadline(&host,instance->frame.scope_exit_deadline,0);
+    if (instance->drain_started) deadline=ku_task_driver_min(deadline,instance->drain_deadline);
+    instance->drain_deadline=deadline; instance->drain_started=1;
+    instance->frame.scope_exit_deadline=deadline;
+  }
+"#;
 const SCOPE_RESUME_HELPER: &str = r#"
 static uint32_t ku_task_@ID@_scope_resume(KuTaskInstance_@ID@* instance) {
   const KuTaskFrameScopeDescriptorV1* descriptor=NULL;
@@ -447,7 +466,7 @@ static uint32_t ku_task_@ID@_scope_resume(KuTaskInstance_@ID@* instance) {
     /* Explicit empty/INLINE_FAILED witness: all selected headers were checked
      * and cleared without a receipt, session or new D. This is not scope_end.
      * A concurrent cancellation still must pass R2 before any ready user code. */
-    if (instance->drain_started || instance->scope_expected_mask || instance->scope_issued_mask
+    if (@EXIT_EMPTY_STARTED@ || instance->scope_expected_mask || instance->scope_issued_mask
         || instance->receipt_mask || instance->wait.driver
         || (instance->frame.header.initialized & descriptor->task_mask)) return KU_TASK_FRAME_INVALID_STATE;
     if (ku_task_control_atomic_load(&instance->control.phase)!=KU_TASK_CONTROL_LIVE) return KU_TASK_FRAME_PENDING;
@@ -532,6 +551,7 @@ static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reaso
    * R2 retries reconciliation if its pre-callback snapshot subsequently changes. */
   if (reason && budget && instance->drain_started)
     instance->drain_deadline=ku_task_driver_min(instance->drain_deadline,ku_task_control_cleanup_deadline(budget));
+@EXIT_DEADLINE@
 @SCOPE_REGISTER@
 @TRANSFERS@
   /* Every sibling was durably transferred before any Value cleanup/ACK wait. */

@@ -427,7 +427,7 @@ ACK/error 必须在有界 quantum 内处理，不能在耗尽预算后用 Pendin
 `ku build --backend c` / `ku build --native` 对显式 `async fn main(): null!` 选择独立
 AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包含 runner。
 展开后所有顶层 item 必须是非泛型 async 函数；参数和返回限 primitive/单层 Result。
-支持局部绑定、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
+支持局部绑定、源码 `if` / `else` / `while`、整数 `for` 及词法作用域、循环内的 `break` / `continue`、已知 async 调用、Move/Await、ok/?、print/println、return、字符串常量 fail，
 以及静态字符串；R5e 追加 Copy 表达式，源码 If 见 R5h.5。已有 int/bool/null 局部的
 普通赋值在 RHS 成功端点 Copy 回原槽；自赋值发 Read，保留 IR 的别名/初始化检查。
 源码 while 的回边指向条件求值入口，而非 Await.ready 或旧 bool Branch；本轮正常
@@ -435,7 +435,7 @@ ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不�
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
 整数 for 先快照上限，以只读 `CheckForLimit` 拒绝负数；隐藏计数器独立于本轮
 可赋值的词法绑定。循环体复用相同 ScopeDrain/drop/Suspend 路径；上限只求值一次。
-Owned/Task 重赋值、复合赋值与自增/自减、数组 for、break/continue、递归、跨词法作用域 Task move、try/catch/finally、闭包、同步调用、
+Owned/Task 重赋值、复合赋值与自增/自减、数组 for、递归、跨词法作用域 Task move、try/catch/finally、闭包、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -478,7 +478,7 @@ manifest 是借用的稳定 instance 存储；完整集合、生命周期、唯�
 父 D 缩短不扫描 manifest，adapter 对 pending issued child 调用 cancel_receipt；
 取消后向最终退出提升、外层 child 合并复用下述 driver 原语及内部 typed adapter。
 对应 TaskOp/verifier 和帧协议见 R5h.4；源码 If 分支与 While 循环已复用该协议，
-并在真实作用域退出时 drain 子 Task。Task 源码的数组 for、break/continue 与
+并在真实作用域退出时 drain 子 Task。Task 源码的数组 for 与
 try/catch/finally 仍未接入，不放宽其余源码边界，不代表完整 async 或 M:N。
 容量和重复检查最多64项/2016次比较，无新增堆分配、队列或 RC 边；测试与精确提交
 验收结果见工作日志，不从接口存在推断真实 C 或 sanitizer 已通过。
@@ -580,30 +580,30 @@ scope_end；全量 ACK 后异常 Pending 作为合同错误拒绝，不循环 YI
 不递归 drive child、增加线程或重试环；新增实例字段继续通过 sizeof 计费。
 
 上述是内部合同和实现边界，不等于所有故障/竞态已实测。源码 If/While/整数 For 只覆盖
-已接入的 primitive（含 str）/单层 Result；任意 Owned payload、数组 for、break/continue、
+已接入的 primitive（含 str）/单层 Result；任意 Owned payload、数组 for、
 Task 源码 finally 与完整 async 仍未实现。
 真实 C、无副作用 raw 反例、sanitizer、精确 SHA 三系统
 结果分开验收；固定硬件性能、RSS、soak、M:N、netpoll 和事件 HTTP 仍未完成。
 
-### 内部 scope-exit 操作验证（运行时尚未接入）
+### 内部 scope-exit 操作与源码循环退出
 
-`ScopeExitBegin { exit, retain }` / `ScopeExitEnd { exit }` 目前仅是 typed Task IR
-的内部标记，不是 Ku 语法、取消信号或挂起点。每个稠密 exit ID 必须对应唯一的
-Begin 和 End，分别独占一个正常 Jump 状态；retain 必须是真实词法栈的严格祖先
-（None 表示 ROOT）。中间仅允许有限的 Jump/ScopeDrain 链和合法 Value drop，
-到 End 时必须恰好到达 retain。全部正常入边检查操作身份，禁止绕过 Begin、
-跳入另一操作、重叠或嵌套标记；取消清理图不允许这些标记。原有 Task 所有权、
-MUST/MAY 和 Suspend-only 循环进度检查不放宽。
+`ScopeExitBegin { exit, retain }` / `ScopeExitEnd { exit }` 是 typed Task IR 的
+内部标记，不是 Ku 语法、取消信号或挂起点。源码 `break` / `continue` 使用此边界；
+每个稠密 exit ID 对应唯一 Begin 和 End，分别独占一个正常 Jump 状态。
+retain 必须是真实词法栈的严格祖先（None 表示 ROOT）。中间只允许有限的
+Jump/ScopeDrain 链和合法 Value drop，到 End 时必须恰好到达 retain。
+全部正常入边检查操作身份，禁止绕过 Begin、跳入另一操作、重叠或嵌套标记；
+取消清理图不允许这些标记。原 Task 所有权、MUST/MAY 和 Suspend-only 循环
+进度检查保持。for 的 continue 经过隐藏计数器更新，while 的 continue 回到完整
+条件入口；两者先 drain/drop，再经过 Suspend。break 连接最近循环的 after 状态。
 
-分析沿用原硬限和逐步预算，派生每个状态入口的活动操作 ID；没有标记时不分配
-新的操作/状态向量 buffer，也不执行该验证遍历。Rust 计划对象新增 Vec 描述符，
-不能因此声称编译器内存零增加。现有生成 C 的 Frame ABI 仍为 4、实例布局不变。
-带标记的原始 IR 经验证后，C emitter 仍明确返回 runtime not implemented；
-源码 native break/continue 继续拒绝。
-
-该静态验证不能代替后续运行时的一次非局部退出总期限、真实 ACK、取消优先级
-和最后 Owned drop 的闭环。不能把多次普通 drain 的独立新期限当成同一次退出
-的预算；在这些运行路径接入并验收前，不宣称 native 循环退出已支持。
+分析沿用原硬限和逐步预算；没有标记时不分配新增操作/状态向量 buffer。
+仅含标记的生成函数帧保存退出身份和原始绝对期限，公共 Frame ABI 4、Control ABI 2、
+Driver ABI 7 不变，实际实例 sizeof 仍计入原 frame 预算。逐层 normal scope session
+各自真实结束，但同一次退出的期限持续到最后 Value drop 和 End，不逐层重建。
+超期转原 runtime-failure 退出桥；取消和更短期限继续沿用既有移交与实际 ACK 协议。
+没有标记的函数维持原实例布局。定向运行与精确 SHA 三系统 CI 分别记录，不能据
+内部 IR 或局部用例推断完整 async、性能或整版发布门禁已完成。
 
 ### R5h.5 源码 if / else 接入（开发中）
 

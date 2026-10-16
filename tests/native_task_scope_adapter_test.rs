@@ -1502,3 +1502,289 @@ int main(void) {
   loop_case(0u); loop_case(1u); puts("task-scope-loop-ok"); return 0;
 }
 "#;
+
+fn scope_exit_frames() -> TaskProgram {
+    let mut program = frames();
+    let parent = &mut program.functions[0];
+    parent.slots = vec![
+        value(result(IrType::Null)),
+        value(IrType::Str),
+        value(IrType::Str),
+        task(),
+        task(),
+        value(IrType::Int),
+        value(IrType::Int),
+    ];
+    parent.parameters = vec![SlotId(0), SlotId(1), SlotId(2)];
+    parent.result = result(IrType::Null);
+    parent.states = vec![
+        state(
+            vec![
+                init(5, 0),
+                init(6, 1),
+                TaskOp::ScopeEnter {
+                    scope: TaskScopeId(0),
+                    tasks: vec![SlotId(3)],
+                },
+                start(3, 5),
+                TaskOp::ScopeEnter {
+                    scope: TaskScopeId(1),
+                    tasks: vec![SlotId(4)],
+                },
+                start(4, 6),
+            ],
+            TaskTerminator::Jump { target: StateId(1) },
+        ),
+        state(
+            vec![TaskOp::ScopeExitBegin {
+                exit: TaskScopeExitId(0),
+                retain: None,
+            }],
+            TaskTerminator::Jump { target: StateId(2) },
+        ),
+        state(
+            vec![],
+            TaskTerminator::ScopeDrain {
+                scope: TaskScopeId(1),
+                ready: StateId(3),
+                cleanup: StateId(8),
+            },
+        ),
+        state(
+            vec![TaskOp::Drop { slot: SlotId(1) }],
+            TaskTerminator::Jump { target: StateId(4) },
+        ),
+        state(
+            vec![],
+            TaskTerminator::ScopeDrain {
+                scope: TaskScopeId(0),
+                ready: StateId(5),
+                cleanup: StateId(8),
+            },
+        ),
+        state(
+            vec![TaskOp::Drop { slot: SlotId(2) }],
+            TaskTerminator::Jump { target: StateId(6) },
+        ),
+        state(
+            vec![TaskOp::ScopeExitEnd {
+                exit: TaskScopeExitId(0),
+            }],
+            TaskTerminator::Jump { target: StateId(7) },
+        ),
+        state(vec![], TaskTerminator::Exit { value: SlotId(0) }),
+        state(
+            [0, 1, 2]
+                .map(|slot| TaskOp::DropIfInit { slot: SlotId(slot) })
+                .to_vec(),
+            TaskTerminator::Terminate,
+        ),
+    ];
+    program
+}
+
+#[test]
+fn native_task_scope_exit_reuses_deadline_through_nested_ack_and_last_value_drop() {
+    let ast = Parser::new(
+        Lexer::new("fn main(): null! { return ok(null) }")
+            .lex()
+            .unwrap(),
+    )
+    .parse_program()
+    .unwrap();
+    let sync = ir::lower_program(&ast).unwrap();
+    let tasks = scope_exit_frames();
+    verify_and_plan(&tasks, TaskLimits::default()).unwrap();
+    let mut generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
+    let instrumentation = format!("{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic void exit_string_drop(void*);\nstatic uint32_t exit_child_hold(void*,int);\nstatic void exit_parent(void*);\n");
+    generated = replace_once(
+        generated,
+        "typedef struct KuString {",
+        &format!("{instrumentation}typedef struct KuString {{"),
+    );
+    generated = replace_once(
+        generated,
+        "static uint64_t ku_task_driver_now_ms(void) {",
+        &format!("{CLOCK_HOOK}\nstatic uint64_t fixture_original_now(void) {{"),
+    );
+    generated = replace_once(
+        generated,
+        "static void ku_string_drop(KuString* value) {",
+        "static void ku_string_drop(KuString* value) {\n  exit_string_drop(value);",
+    );
+    let parent = "static uint32_t ku_task_0_resume(void* raw) {";
+    generated = replace_once(generated, parent, &format!("{parent}\n  exit_parent(raw);"));
+    for (entry, cleanup) in [
+        ("static uint32_t ku_task_1_resume(void* raw) {", 0),
+        ("static uint32_t ku_task_1_cleanup(void* raw, uint32_t reason, KuTaskControlV1* budget) {", 1),
+    ] {
+        generated = replace_once(generated,entry,&format!("{entry}\n  uint32_t held=exit_child_hold(raw,{cleanup});\n  if (held!=UINT32_MAX) return held;"));
+    }
+    generated = replace_once(
+        generated,
+        "int main(void) {",
+        "static int exit_original_main(void) {",
+    );
+    generated.push_str(SCOPE_EXIT_C_MAIN);
+    let directory = TempDir::new("native-task-scope-exit");
+    let path = directory.path().join("program.c");
+    fs::write(&path, generated).unwrap();
+    let Some(executable) = compile_harness(directory.path(), &path, "program") else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must run scope-exit adapter"
+        );
+        return;
+    };
+    fs::remove_file(path).unwrap();
+    let output = run_bounded(
+        Command::new(executable).current_dir(directory.path()),
+        RUN_TIMEOUT,
+        RUN_LIMITS,
+    )
+    .expect("scope exit must finish within the existing real watchdog");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        "task-scope-exit-ok\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+const SCOPE_EXIT_C_MAIN: &str = r#"
+/* Time is virtual only for deterministic D comparisons. Real ACKs, callbacks,
+ * driver waits and the existing process watchdog remain in force. */
+static unsigned exit_mode,exit_dropped[2];
+static uint64_t exit_base,exit_deadline;
+static KuTaskInstance_0* exit_instance;
+static KuTaskDriverTicketV1 exit_children[2];
+static KuTaskControlLeaseV1 exit_observers[2];
+static KuAtomicRefcount exit_release;
+static KuTestEvent exit_parked[2];
+static void exit_parent(void* raw) {
+  if (!exit_instance) exit_instance=(KuTaskInstance_0*)raw;
+  CHECK(raw==exit_instance);
+}
+static uint32_t exit_child_hold(void* raw,int cleanup) {
+  KuTaskInstance_1* child=(KuTaskInstance_1*)raw;
+  unsigned index=(unsigned)child->frame.s_0; CHECK(index<2u);
+  if (!exit_children[index].driver) {
+    exit_children[index]=child->ticket;
+    CHECK(!ku_task_driver_lock(child->ticket.driver));
+    KuTaskDriverSlotV1* registered=ku_task_driver_find(&child->ticket); CHECK(registered);
+    CHECK(ku_task_control_lease_retain(&registered->driver_lease,&exit_observers[index])==KU_TASK_CONTROL_OK);
+    CHECK(!ku_task_driver_unlock(child->ticket.driver));
+  }
+  if (cleanup && (ku_task_control_atomic_load(&exit_release)&((size_t)1u<<index))) return UINT32_MAX;
+  CHECK(ku_task_driver_set_intent(&child->ticket,KU_TASK_DRIVER_WAIT)==KU_TASK_DRIVER_OK);
+  if (cleanup) CHECK(ku_test_event_set(&exit_parked[index]));
+  return KU_TASK_CONTROL_PENDING;
+}
+static void exit_string_drop(void* raw) {
+  if (!exit_instance) return;
+  for (unsigned index=0;index<2u;index++) {
+    KuString* value=index ? &exit_instance->frame.s_2 : &exit_instance->frame.s_1;
+    if (raw!=value || !value->storage) continue;
+    CHECK(!exit_dropped[index]++);
+    if (exit_mode==2u) continue; /* R2 owns the real reason on cancellation. */
+    CHECK(exit_instance->frame.scope_exit_active && exit_instance->frame.scope_exit_deadline==exit_deadline);
+    unsigned child=index ? 0u : 1u;
+    CHECK(exit_observers[child].control->frame_destroyed);
+    CHECK(ku_task_control_atomic_load(&exit_observers[child].control->phase)==KU_TASK_CONTROL_CANCELLED);
+    if (!index) ku_task_control_deadline_store(&fixture_clock,exit_base+600u);
+    else if (exit_mode==1u) ku_task_control_deadline_store(&fixture_clock,exit_deadline+1u);
+  }
+}
+static void exit_idle(KuTaskDriverV1* driver) {
+  CHECK(ku_task_driver_wait_idle(driver,ku_task_driver_now_ms()+2000u)==KU_TASK_DRIVER_OK);
+  KuTaskDriverSnapshotV1 snapshot={0}; CHECK(ku_task_driver_snapshot(driver,&snapshot)==KU_TASK_DRIVER_OK);
+  CHECK(!snapshot.running && !snapshot.queued && !snapshot.building && !snapshot.fault && !snapshot.clock_fault);
+}
+static void exit_release_child(unsigned index) {
+  ku_task_control_atomic_store(&exit_release,ku_task_control_atomic_load(&exit_release)|((size_t)1u<<index));
+  CHECK(ku_task_driver_wake(&exit_children[index])==KU_TASK_DRIVER_OK);
+}
+static KuString exit_owned(const char* text) {
+  size_t length=strlen(text); uint8_t* pointer=(uint8_t*)malloc(length); CHECK(pointer);
+  memcpy(pointer,text,length); return (KuString){pointer,length,length,KU_STRING_OWNED};
+}
+static void exit_case(unsigned mode) {
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
+  exit_mode=mode; exit_instance=NULL; memset(exit_dropped,0,sizeof(exit_dropped));
+  memset(exit_children,0,sizeof(exit_children)); memset(exit_observers,0,sizeof(exit_observers));
+  ku_task_control_atomic_store(&exit_release,0);
+  for (unsigned i=0;i<2u;i++) CHECK(ku_test_event_init(&exit_parked[i]));
+  exit_base=ku_test_real_now_ms()+100000u; exit_deadline=exit_base+1000u;
+  ku_task_control_deadline_store(&fixture_clock,exit_base);
+  KuTaskDriverV1* driver=(KuTaskDriverV1*)calloc(1,sizeof(*driver));
+  KuTaskDriverSlotV1* slots=(KuTaskDriverSlotV1*)calloc(3,sizeof(*slots));
+  size_t* ring=(size_t*)calloc(3,sizeof(*ring)); CHECK(driver && slots && ring);
+  size_t fixed=sizeof(*driver)+3u*(sizeof(*slots)+sizeof(*ring));
+  CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,slots,3,ring,3,
+      fixed+sizeof(KuTaskInstance_0)+2u*sizeof(KuTaskInstance_1)+64u,1u,exit_deadline)==KU_TASK_DRIVER_OK);
+  KuResult_null returned={0}; returned.ok=true;
+  KuString first=exit_owned("inner"),last=exit_owned("outer"); KuTaskValueV1 root={0};
+  CHECK(ku_task_0_start_value(driver,&returned,&first,&last,&root)==KU_TASK_DRIVER_OK);
+  CHECK(root.tag==KU_TASK_VALUE_LIVE && !returned.ok && !first.ptr && !last.ptr);
+  CHECK(ku_test_event_wait(&exit_parked[1],2000u)); exit_idle(driver);
+  CHECK(exit_instance->drain_deadline==exit_deadline && !exit_dropped[0] && !exit_dropped[1]);
+  CHECK(!exit_observers[1].control->frame_destroyed);
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(&root,NULL,&output)==KU_TASK_CONTROL_PENDING);
+  ku_task_control_deadline_store(&fixture_clock,exit_base+400u); exit_release_child(1u);
+  CHECK(ku_test_event_wait(&exit_parked[0],2000u)); exit_idle(driver);
+  CHECK(exit_dropped[0]==1u && !exit_dropped[1]);
+  CHECK(exit_instance->drain_deadline==exit_deadline && exit_instance->frame.scope_exit_deadline==exit_deadline);
+  CHECK(ku_task_control_cleanup_deadline(exit_observers[0].control)==exit_deadline);
+  CHECK(ku_task_value_take(&root,NULL,&output)==KU_TASK_CONTROL_PENDING);
+  if (mode==2u) {
+    CHECK(ku_task_driver_request_cancel(&root.ticket,&root.owner.lease,KU_TASK_CONTROL_CANCELLED,exit_base+800u)==KU_TASK_CONTROL_OK);
+    exit_idle(driver);
+    CHECK(ku_task_driver_request_cancel(&root.ticket,&root.owner.lease,KU_TASK_CONTROL_TIMED_OUT,exit_base+750u)==KU_TASK_CONTROL_OK);
+    exit_idle(driver);
+    CHECK(exit_instance->drain_deadline==exit_base+750u);
+    CHECK(ku_task_control_atomic_load(&root.owner.lease.control->phase)==KU_TASK_CONTROL_REQUESTED_CANCEL);
+    CHECK(ku_task_control_cleanup_deadline(exit_observers[0].control)==exit_base+750u);
+  }
+  exit_release_child(0u); exit_idle(driver);
+  if (mode==2u) {
+    CHECK(ku_task_value_take(&root,NULL,&output)==KU_TASK_CONTROL_CANCELLED);
+    CHECK(ku_task_outcome_empty(&output,3u));
+  } else {
+    CHECK(ku_task_value_take(&root,NULL,&output)==KU_TASK_CONTROL_OK && output.result_kind==3u);
+    if (!mode) CHECK(output.exit_class==KU_TASK_EXIT_USER_RESULT && output.value.null_value.ok && !output.has_cleanup_deadline);
+    else {
+      CHECK(output.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE && !output.value.null_value.ok);
+      CHECK(output.has_cleanup_deadline && output.cleanup_deadline==exit_deadline);
+      CHECK(output.value.null_value.error.code.len==16u && !memcmp(output.value.null_value.error.code.ptr,"shutdown_timeout",16u));
+    }
+  }
+  CHECK(exit_dropped[0]==1u && exit_dropped[1]==1u && root.owner.lease.control->frame_destroyed);
+  for (unsigned i=0;i<2u;i++) {
+    CHECK(exit_observers[i].control->frame_destroyed);
+    CHECK(ku_task_control_lease_release(&exit_observers[i])==KU_TASK_CONTROL_OK);
+  }
+  ku_task_outcome_drop(&output); exit_instance=NULL;
+  uint64_t finish=ku_task_driver_now_ms()+1000u;
+  CHECK(ku_task_value_drop(&root,finish)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_shutdown(driver,finish)==KU_TASK_DRIVER_OK); exit_idle(driver);
+#if !defined(_WIN32)
+  alarm(2);
+#endif
+  CHECK(ku_task_driver_join(driver,finish)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_destroy(driver)==KU_TASK_DRIVER_OK);
+#if !defined(_WIN32)
+  alarm(0);
+#endif
+  free(ring); free(slots); free(driver);
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
+  for (unsigned i=0;i<2u;i++) CHECK(ku_test_event_destroy(&exit_parked[i]));
+}
+int main(void) {
+  ku_task_control_deadline_init(&fixture_clock); ku_task_control_atomic_init(&exit_release,0);
+  exit_case(0u); exit_case(1u); exit_case(2u); puts("task-scope-exit-ok"); return 0;
+}
+"#;

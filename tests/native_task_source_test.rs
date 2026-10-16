@@ -495,7 +495,7 @@ fn native_task_source_cli_imports_build_and_run_after_source_graph_moves() {
         )
         .unwrap();
         let main = sources.join("main.ku");
-        fs::write(&main, "import { Text } from \"./worker.ku\"\nasync fn main(): null! { result = (await Text(\"import 世界\"))? println(result) return ok(null) }").unwrap();
+        fs::write(&main, "import { Text } from \"./worker.ku\"\nasync fn main(): null! { for item in 3 { if (item == 0) { continue } result = (await Text(\"import 世界\"))? println(result) break } return ok(null) }").unwrap();
         let binary = directory
             .path()
             .join(if cfg!(windows) { "app.exe" } else { "app" });
@@ -585,7 +585,7 @@ fn native_task_source_cli_imports_build_and_run_after_source_graph_moves() {
 #[test]
 fn native_task_source_cli_rejects_unsupported_and_moved_values_before_artifacts() {
     let sources = [
-        "async fn main(): null! { while (false) { break } return ok(null) }",
+        "async fn main(): null! { while (false) { try { break } finally { println(0) } } return ok(null) }",
         "async fn Child(): str! { return ok(\"child\") } async fn main(): null! { child = Child() moved = child value = await child return ok(null) }",
         "async fn Child(value: str): str! { return ok(value) } async fn main(): null! { value = \"owned\" child = Child(value) println(value) return ok(null) }",
     ];

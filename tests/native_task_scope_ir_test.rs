@@ -426,7 +426,7 @@ fn native_task_scope_exit_ir_rejects_cleanup_marker_and_tight_budget() {
 }
 
 #[test]
-fn native_task_scope_exit_ir_does_not_enable_c_runtime() {
+fn native_task_scope_exit_ir_enables_verified_c_runtime() {
     let program = scope_exit_program();
     accepted(&program);
     let ast = ku::parser::Parser::new(
@@ -437,10 +437,16 @@ fn native_task_scope_exit_ir_does_not_enable_c_runtime() {
     .parse_program()
     .unwrap();
     let sync = ku::ir::lower_program(&ast).unwrap();
-    let error = ku::backend::c::generate_task_frame_c_source(&sync, &program).unwrap_err();
-    assert!(error
-        .message
-        .contains("scope-exit operation runtime is not implemented"));
+    let generated = ku::backend::c::generate_task_frame_c_source(&sync, &program).unwrap();
+    assert!(generated.contains("uint64_t scope_exit_id, scope_exit_deadline;"));
+    assert!(generated.contains("frame->scope_exit_active=1u;"));
+    assert!(generated.contains("scope exit cleanup deadline expired"));
+    assert!(generated.contains("instance->frame.scope_exit_deadline=deadline;"));
+    let mut changed = program;
+    changed.functions[0].states[5].operations[0] = TaskOp::ScopeExitEnd {
+        exit: TaskScopeExitId(1),
+    };
+    assert!(ku::backend::c::generate_task_frame_c_source(&sync, &changed).is_err());
 }
 
 fn sibling_branches() -> TaskProgram {

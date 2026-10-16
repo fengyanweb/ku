@@ -10,7 +10,8 @@ use std::collections::HashSet;
 use crate::error::KuResult;
 use crate::ir::task::{
     SlotId, TaskBinaryOp, TaskConstant, TaskFramePlan, TaskFunction, TaskFunctionFrame, TaskLimits,
-    TaskOp, TaskProgram, TaskScopeFrame, TaskSlotType, TaskTerminator, TaskUnaryOp,
+    TaskOp, TaskProgram, TaskScopeExitPlan, TaskScopeFrame, TaskSlotType, TaskTerminator,
+    TaskUnaryOp,
 };
 use crate::ir::IrType;
 
@@ -81,17 +82,11 @@ struct FrameEmitter<'a> {
     hosted: bool,
     exit_bridge: bool,
     scopes: &'a [TaskScopeFrame],
+    scope_exits: &'a TaskScopeExitPlan,
 }
 
 impl<'a> FrameEmitter<'a> {
     fn new(function: &'a TaskFunction, frame: &'a TaskFunctionFrame) -> KuResult<Self> {
-        if !frame.scope_exits.operations.is_empty()
-            || !frame.scope_exits.state_operations.is_empty()
-        {
-            return Err(unsupported(
-                "scope-exit operation runtime is not implemented",
-            ));
-        }
         if function.slots.len() > MAX_FRAME_SLOTS {
             return Err(unsupported("native task frame exceeds its 64-slot bitmap"));
         }
@@ -165,6 +160,7 @@ impl<'a> FrameEmitter<'a> {
             hosted: frame.hosted,
             exit_bridge,
             scopes: &frame.scopes,
+            scope_exits: &frame.scope_exits,
         })
     }
 
@@ -174,6 +170,38 @@ impl<'a> FrameEmitter<'a> {
         task_mask: u64,
         exit_bridge: bool,
     ) -> KuResult<()> {
+        let exits = &frame.scope_exits;
+        let has_markers = function.states.iter().any(|state| {
+            state.operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    TaskOp::ScopeExitBegin { .. } | TaskOp::ScopeExitEnd { .. }
+                )
+            })
+        });
+        if exits.operations.is_empty() == has_markers
+            || (!has_markers && !exits.state_operations.is_empty())
+            || (has_markers && exits.state_operations.len() != function.states.len())
+            || exits.operations.len() > TaskLimits::default().max_operations
+        {
+            return Err(unsupported(
+                "native task scope-exit plan has invalid dimensions",
+            ));
+        }
+        for (index, descriptor) in exits.operations.iter().enumerate() {
+            let begin = function.states.get(descriptor.begin.0);
+            let end = function.states.get(descriptor.end.0);
+            if descriptor.exit.0 != index
+                || !begin.is_some_and(|state| matches!(state.operations.as_slice(),
+                    [TaskOp::ScopeExitBegin { exit, retain }] if *exit == descriptor.exit && *retain == descriptor.retain))
+                || !end.is_some_and(|state| matches!(state.operations.as_slice(),
+                    [TaskOp::ScopeExitEnd { exit }] if *exit == descriptor.exit))
+                || exits.state_operations.get(descriptor.begin.0) != Some(&None)
+                || exits.state_operations.get(descriptor.end.0) != Some(&Some(descriptor.exit))
+            {
+                return Err(unsupported("native task scope-exit plan disagrees with its markers"));
+            }
+        }
         // The verifier already bounded these lists. Recheck exported descriptors
         // before indexing or allocating from a hand-supplied internal plan.
         if frame.scopes.len() > TaskLimits::default().max_operations {
@@ -316,6 +344,12 @@ impl<'a> FrameEmitter<'a> {
         out.push_str(&format!(
             "typedef struct {frame_type} {{\n  KuTaskFrameHeaderV1 header;\n"
         ));
+        if !self.scope_exits.operations.is_empty() {
+            // Private generated frame storage; the shared frame ABI is unchanged.
+            out.push_str(
+                "  uint32_t scope_exit_active;\n  uint64_t scope_exit_id, scope_exit_deadline;\n",
+            );
+        }
         for (index, slot) in self.function.slots.iter().enumerate() {
             out.check()?;
             if self.persistent.contains(&index) {
@@ -476,6 +510,11 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                  }}"
             )
         };
+        let scope_exit_check = if self.scope_exits.operations.is_empty() {
+            String::new()
+        } else {
+            format!("if (frame->scope_exit_active > 1u || (!frame->scope_exit_active && (frame->scope_exit_id || frame->scope_exit_deadline)) || (frame->scope_exit_active && (frame->scope_exit_id >= {}u || frame->scope_exit_deadline == UINT64_MAX))) return KU_TASK_FRAME_INVALID_STATE;", self.scope_exits.operations.len())
+        };
         out.push_str(&format!(
             "static uint32_t {prefix}_check(void* storage, size_t bytes, uint32_t abi) {{\n\
                if (abi != KU_TASK_FRAME_ABI_VERSION) return KU_TASK_FRAME_ABI_MISMATCH;\n\
@@ -488,6 +527,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                if (frame->header.status == KU_TASK_FRAME_EXIT_STAGED && (!{exit_bridge} || frame->header.result_initialized != 1u || frame->header.cleanup_state != UINT32_MAX || (frame->header.exit_class != KU_TASK_EXIT_USER_RESULT && frame->header.exit_class != KU_TASK_EXIT_RUNTIME_FAILURE) || frame->header.has_exit_deadline > 1u || (!frame->header.has_exit_deadline && frame->header.exit_deadline) || (frame->header.has_exit_deadline && frame->header.exit_deadline == UINT64_MAX) || (frame->header.exit_class == KU_TASK_EXIT_USER_RESULT && (frame->header.has_exit_deadline || frame->header.exit_deadline)))) return KU_TASK_FRAME_INVALID_STATE;\n\
                if (frame->header.state >= {states}u || (frame->header.cleanup_state != UINT32_MAX && frame->header.cleanup_state >= {states}u)) return KU_TASK_FRAME_INVALID_STATE;\n\
                {scope_check}\n\
+               {scope_exit_check}\n\
                return KU_TASK_FRAME_OK;\n\
              }}\n",
             id = self.function.id.0,
@@ -736,10 +776,20 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
 
     fn emit_operation(&self, out: &mut COutput, operation: &TaskOp) -> KuResult<()> {
         match operation {
-            TaskOp::ScopeExitBegin { .. } | TaskOp::ScopeExitEnd { .. } => {
-                return Err(unsupported(
-                    "scope-exit operation runtime is not implemented",
+            TaskOp::ScopeExitBegin { exit, .. } => {
+                out.push_str(&format!(
+                    "  if (cleanup || frame->scope_exit_active) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  frame->scope_exit_active=1u;\n  frame->scope_exit_id=UINT64_C({});\n  frame->scope_exit_deadline=ku_task_host_deadline((KuTaskAdapterHostV1*)clock->host,UINT64_MAX,1);\n",
+                    exit.0
                 ));
+            }
+            TaskOp::ScopeExitEnd { exit } => {
+                out.push_str(&format!(
+                    "  if (cleanup || !frame->scope_exit_active || frame->scope_exit_id!=UINT64_C({})) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  frame->scope_exit_deadline=ku_task_host_deadline((KuTaskAdapterHostV1*)clock->host,frame->scope_exit_deadline,0);\n  if (clock->now_ms(clock->context)>=frame->scope_exit_deadline) {{\n    frame->header.has_exit_deadline=1u; frame->header.exit_deadline=frame->scope_exit_deadline;\n",
+                    exit.0
+                ));
+                self.emit_runtime_error(out,
+                    "ku_error_make(ku_string_static((const uint8_t*)\"task\",4),ku_string_static((const uint8_t*)\"shutdown_timeout\",16),ku_string_static((const uint8_t*)\"scope exit cleanup deadline expired\",35))")?;
+                out.push_str("  }\n  frame->scope_exit_active=0; frame->scope_exit_id=0; frame->scope_exit_deadline=0;\n");
             }
             // Verified lexical ownership annotation; no runtime stack or bits.
             TaskOp::ScopeEnter { .. } => {}

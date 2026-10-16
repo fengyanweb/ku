@@ -217,6 +217,11 @@ fn native_task_source_while_returns_two_polls_before_real_cancellation() {
             false,
         ),
         (
+            "async fn main(): null! { while (true) { continue } return ok(null) }",
+            "native-source-while-continue-cancel",
+            false,
+        ),
+        (
             "async fn main(): null! { index = 0 while (index < 4) { index = index + 1 } return ok(null) }",
             "native-source-while-copy-cancel",
             true,

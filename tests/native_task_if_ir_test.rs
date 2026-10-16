@@ -245,7 +245,7 @@ fn native_task_copy_assignment_raw_type_owned_task_and_declaration_gates_remain(
     for body in [
         "value = 1 value += 1",
         "value = 1 value++",
-        "while (false) { break }",
+        "while (false) { try { break } finally { println(0) } }",
     ] {
         let source = format!("async fn main(): null! {{ {body} return ok(null) }}");
         let error = task_lower::lower_program(&checked(&source)).unwrap_err();
@@ -328,7 +328,11 @@ async fn main(): null! {
         TaskTerminator::ScopeDrain { ready, cleanup, .. } => (ready, cleanup),
         ref other => panic!("body must request scope drain, got {other:?}"),
     };
-    let (header, latch_cleanup) = match main.states[ready.0].terminator {
+    let latch = match main.states[ready.0].terminator {
+        TaskTerminator::Jump { target } => target,
+        ref other => panic!("post-drain endpoint must reach latch, got {other:?}"),
+    };
+    let (header, latch_cleanup) = match main.states[latch.0].terminator {
         TaskTerminator::Suspend { resume, cleanup } => (resume, cleanup),
         ref other => panic!("post-drain endpoint must force Suspend, got {other:?}"),
     };
@@ -379,10 +383,107 @@ async fn main(): null! {
         assert_eq!(main.states[cleanup.0].terminator, TaskTerminator::Terminate);
     }
     let mut no_yield = native.tasks.clone();
-    no_yield.functions[native.entry.0].states[ready.0].terminator =
+    no_yield.functions[native.entry.0].states[latch.0].terminator =
         TaskTerminator::Jump { target: header };
     let error = task::verify_and_plan(&no_yield, TaskLimits::default()).unwrap_err();
     assert!(error.message.contains("cycle"), "{error}");
+}
+
+#[test]
+fn native_task_loop_exits_drain_to_nearest_loop_parent_and_continue_through_latch() {
+    let native = task_lower::lower_program(&checked(
+        r#"
+async fn main(): null! {
+    outer = 0
+    while (outer < 2) {
+        kept = "outer"
+        for item in 3 {
+            local = "inner"
+            if (item == 0) { continue }
+            if (item == 1) { break }
+            println(local)
+        }
+        println(kept)
+        outer = outer + 1
+    }
+    return ok(null)
+}
+"#,
+    ))
+    .unwrap();
+    let main = &native.tasks.functions[native.entry.0];
+    let plan = task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    let frame = &plan.functions[native.entry.0];
+    assert_eq!(frame.scope_exits.operations.len(), 2);
+    for exit in &frame.scope_exits.operations {
+        assert_eq!(exit.retain, Some(task::TaskScopeId(0)));
+        let mut state = match main.states[exit.begin.0].terminator {
+            TaskTerminator::Jump { target } => target,
+            ref other => panic!("dedicated Begin must jump: {other:?}"),
+        };
+        let mut drained = Vec::new();
+        let mut drops = 0;
+        for _ in 0..main.states.len() {
+            assert_eq!(frame.scope_exits.state_operations[state.0], Some(exit.exit));
+            if state == exit.end {
+                break;
+            }
+            drops += main.states[state.0]
+                .operations
+                .iter()
+                .filter(|op| matches!(op, TaskOp::DropIfInit { .. }))
+                .count();
+            state = match main.states[state.0].terminator {
+                TaskTerminator::ScopeDrain { scope, ready, .. } => {
+                    drained.push(scope);
+                    ready
+                }
+                TaskTerminator::Jump { target } => target,
+                ref other => panic!("exit must only drain/drop before End: {other:?}"),
+            };
+        }
+        assert_eq!(state, exit.end);
+        assert_eq!(drained.len(), 2, "if arm and innermost for body");
+        assert_eq!(drained[1], task::TaskScopeId(1));
+        assert!(drained.iter().all(|scope| Some(*scope) != exit.retain));
+        assert_eq!(drops, 2, "inner literal and its local are dropped");
+        let target = match main.states[exit.end.0].terminator {
+            TaskTerminator::Jump { target } => target,
+            ref other => panic!("End must jump: {other:?}"),
+        };
+        assert_eq!(frame.scope_exits.state_operations[target.0], None);
+        if exit.exit.0 == 0 {
+            assert!(main.states[target.0].operations.iter().any(|op| matches!(
+                op,
+                TaskOp::Binary {
+                    op: task::TaskBinaryOp::Add,
+                    ..
+                }
+            )));
+            assert!(matches!(
+                main.states[target.0].terminator,
+                TaskTerminator::Suspend { .. }
+            ));
+        } else {
+            assert!(
+                main.states[target.0]
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op, TaskOp::Print { .. })),
+                "break resumes after the inner loop"
+            );
+        }
+    }
+    for body in ["break", "continue"] {
+        let ast = parsed(&format!(
+            "async fn main(): null! {{ {body} return ok(null) }}"
+        ));
+        assert!(Checker::new().check(&ast).is_err());
+        assert!(task_lower::lower_program(&ast)
+            .unwrap_err()
+            .message
+            .contains("outside a loop"));
+    }
 }
 
 #[test]

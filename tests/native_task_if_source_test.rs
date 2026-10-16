@@ -455,6 +455,43 @@ async fn main(): null! {
 }
 
 #[test]
+fn native_task_break_continue_match_interpreter_and_close_each_exited_scope() {
+    let cases = [
+        (
+            "async fn main(): null! { for item in 5 { if (item == 1) { continue } if (item == 3) { break } println(item) } println(\"done\") return ok(null) }",
+            "0\n2\ndone\n",
+        ),
+        (
+            "async fn Before(index: int): bool! { println(index) return ok(index < 5) } async fn main(): null! { index = 0 while ((await Before(index))?) { index = index + 1 if (index == 1) { continue } if (index == 3) { break } println(index) } println(index) return ok(null) }",
+            "0\n1\n2\n2\n3\n",
+        ),
+        (
+            "async fn main(): null! { outer = 90 total = 0 for outer in 3 { for inner in 3 { if (inner == 0) { continue } if (inner == 2) { break } total = total + outer + inner } println(outer) } println(total) println(outer) return ok(null) }",
+            "0\n1\n2\n6\n90\n",
+        ),
+        (
+            "async fn Child(value: str): str! { return ok(value) } async fn main(): null! { root = Child(\"kept\") for item in 3 { text = \"body\" pending = Child(\"discarded\") unused = ok(\"local\") if (item == 0) { continue } else { break } } println((await root)?) return ok(null) }",
+            "kept\n",
+        ),
+        (
+            "async fn main(): null! { limit = 3 for item in limit { limit = 0 println(item) item = 99 continue } println(limit) return ok(null) }",
+            "0\n1\n2\n0\n",
+        ),
+        (
+            "async fn main(): null! { for item in 3 { if (item == 0) { continue } text = \"later\" println(text) if (item == 1) { continue } break } return ok(null) }",
+            "later\nlater\n",
+        ),
+        (
+            "async fn main(): null! { while (true) { break } println(\"after\") while (false) { continue } return ok(null) }",
+            "after\n",
+        ),
+    ];
+    for (index, (source, stdout)) in cases.into_iter().enumerate() {
+        run_case(500 + index, source, stdout, None);
+    }
+}
+
+#[test]
 fn native_task_if_real_source_branches_match_interpreter_and_close_runtime_allocations() {
     let cases = [
         (
@@ -766,11 +803,11 @@ fn native_task_if_cli_rejects_unsupported_and_ownership_before_either_artifact_p
             "native async subset does not support this expression",
         ),
         (
-            "async fn main(): null! { while (false) { break } return ok(null) }",
+            "async fn main(): null! { while (false) { try { break } finally { println(0) } } return ok(null) }",
             "native async subset does not support this statement",
         ),
         (
-            "async fn main(): null! { while (false) { continue } return ok(null) }",
+            "async fn main(): null! { while (false) { try { continue } finally { println(0) } } return ok(null) }",
             "native async subset does not support this statement",
         ),
         (

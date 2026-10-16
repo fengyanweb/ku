@@ -17,8 +17,8 @@ use crate::{
 use super::{
     task::{
         self, SlotId, StateId, TaskBinaryOp, TaskConstant, TaskFunction, TaskFunctionId,
-        TaskLimits, TaskOp, TaskProgram, TaskScopeId, TaskSlot, TaskSlotType, TaskState,
-        TaskTerminator, TaskUnaryOp,
+        TaskLimits, TaskOp, TaskProgram, TaskScopeExitId, TaskScopeId, TaskSlot, TaskSlotType,
+        TaskState, TaskTerminator, TaskUnaryOp,
     },
     IrType,
 };
@@ -250,12 +250,22 @@ struct FunctionLowerer<'a> {
     slot_owners: [Option<TaskScopeId>; 64],
     scopes: Vec<TaskScopeId>,
     next_scope: usize,
+    loops: Vec<LoopContext>,
+    next_scope_exit: usize,
+    scope_drop_states: Vec<(StateId, TaskScopeId)>,
     current: Option<StateId>,
     // Suspend/Await/ScopeDrain exits receive synthetic Value cleanup. Normal
     // Exit leaves its current owners for generated all-Task handoff/finish glue.
     // Fill these finite cleanup regions after every slot is known.
     cleanup_exits: Vec<StateId>,
     span: Span,
+}
+
+struct LoopContext {
+    break_target: StateId,
+    continue_target: StateId,
+    retained_depth: usize,
+    has_continue: bool,
 }
 
 impl<'a> FunctionLowerer<'a> {
@@ -281,6 +291,9 @@ impl<'a> FunctionLowerer<'a> {
             slot_owners: [None; 64],
             scopes: Vec::new(),
             next_scope: 0,
+            loops: Vec::new(),
+            next_scope_exit: 0,
+            scope_drop_states: Vec::new(),
             current: None,
             cleanup_exits: Vec::new(),
             span: declaration.span,
@@ -790,6 +803,8 @@ impl<'a> FunctionLowerer<'a> {
                     body,
                     span,
                 } => self.lower_for(name, iterable, body, *span, depth)?,
+                Stmt::Break { span } => self.lower_loop_exit(false, *span)?,
+                Stmt::Continue { span } => self.lower_loop_exit(true, *span)?,
                 Stmt::Assign { name, value, span } => {
                     self.bind(name, None, value, *span, false, depth)?
                 }
@@ -849,12 +864,66 @@ impl<'a> FunctionLowerer<'a> {
                         self.emit(TaskOp::Read { slot: value })?;
                     }
                 }
-                _ => return Err(unsupported(
-                    "this statement; array for/break/continue and try/catch/finally remain gated",
-                    self.span,
-                )),
+                _ => {
+                    return Err(unsupported(
+                        "this statement; array for and try/catch/finally remain gated",
+                        self.span,
+                    ))
+                }
             }
         }
+        Ok(())
+    }
+
+    fn drain_scope(&mut self, scope: TaskScopeId) -> KuResult<()> {
+        let ready = self.state(TaskTerminator::Terminate)?;
+        let cleanup = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::ScopeDrain {
+            scope,
+            ready,
+            cleanup,
+        })?;
+        self.budget.analysis(1, self.span)?;
+        self.cleanup_exits.push(cleanup);
+        self.scope_drop_states.push((ready, scope));
+        self.current = Some(ready);
+        Ok(())
+    }
+
+    fn lower_loop_exit(&mut self, is_continue: bool, span: Span) -> KuResult<()> {
+        let context = self
+            .loops
+            .last_mut()
+            .ok_or_else(|| unsupported("break or continue outside a loop", span))?;
+        context.has_continue |= is_continue;
+        let retained_depth = context.retained_depth;
+        let target = if is_continue {
+            context.continue_target
+        } else {
+            context.break_target
+        };
+        let exit = TaskScopeExitId(self.next_scope_exit);
+        self.next_scope_exit += 1; // Each ID consumes two bounded states.
+        let begin = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::Jump { target: begin })?;
+        self.current = Some(begin);
+        self.emit(TaskOp::ScopeExitBegin {
+            exit,
+            retain: retained_depth.checked_sub(1).map(|i| self.scopes[i]),
+        })?;
+        let first_drain = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::Jump {
+            target: first_drain,
+        })?;
+        self.current = Some(first_drain);
+        for index in (retained_depth..self.scopes.len()).rev() {
+            self.drain_scope(self.scopes[index])?;
+        }
+        let end = self.state(TaskTerminator::Jump { target })?;
+        self.terminate(TaskTerminator::Jump { target: end })?;
+        self.emit_at(end, TaskOp::ScopeExitEnd { exit })?;
+        // The compiler's lexical stack remains active for the other branch;
+        // this generated path alone has drained down to the loop's parent.
         Ok(())
     }
 
@@ -891,15 +960,25 @@ impl<'a> FunctionLowerer<'a> {
         })?;
         let body_entry = self.state(TaskTerminator::Terminate)?;
         let after = self.state(TaskTerminator::Terminate)?;
+        let latch = self.state(TaskTerminator::Terminate)?;
         self.terminate(TaskTerminator::Branch {
             condition,
             then_state: body_entry,
             else_state: after,
         })?;
-        if let Some(end) =
-            self.lower_bound_arm(body, body_entry, depth + 1, Some((name, counter)))?
-        {
-            self.current = Some(end);
+        self.loops.push(LoopContext {
+            break_target: after,
+            continue_target: latch,
+            retained_depth: self.scopes.len(),
+            has_continue: false,
+        });
+        let end = self.lower_bound_arm(body, body_entry, depth + 1, Some((name, counter)))?;
+        let context = self.loops.pop().expect("loop context exists");
+        if let Some(end) = end {
+            self.function.states[end.0].terminator = TaskTerminator::Jump { target: latch };
+        }
+        if end.is_some() || context.has_continue {
+            self.current = Some(latch);
             // The lexical body has already drained its Tasks and dropped its
             // owned locals. Reassigning its visible variable never changes
             // this hidden counter or the captured bound. Since counter < limit
@@ -948,6 +1027,7 @@ impl<'a> FunctionLowerer<'a> {
         }
         let body_entry = self.state(TaskTerminator::Terminate)?;
         let after = self.state(TaskTerminator::Terminate)?;
+        let latch = self.state(TaskTerminator::Terminate)?;
         // Await, ? and short circuit may have replaced current. Only their
         // actual successful endpoint decides whether this iteration enters.
         self.terminate(TaskTerminator::Branch {
@@ -955,13 +1035,24 @@ impl<'a> FunctionLowerer<'a> {
             then_state: body_entry,
             else_state: after,
         })?;
-        if let Some(end) = self.lower_arm(body, body_entry, depth + 1)? {
+        self.loops.push(LoopContext {
+            break_target: after,
+            continue_target: latch,
+            retained_depth: self.scopes.len(),
+            has_continue: false,
+        });
+        let end = self.lower_arm(body, body_entry, depth + 1)?;
+        let context = self.loops.pop().expect("loop context exists");
+        if let Some(end) = end {
+            self.function.states[end.0].terminator = TaskTerminator::Jump { target: latch };
+        }
+        if end.is_some() || context.has_continue {
             // A nonempty body's endpoint follows its real ScopeDrain and
             // local Value drops. An empty body still needs this forced yield.
             let cleanup = self.state(TaskTerminator::Terminate)?;
             self.budget.analysis(1, span)?;
             self.cleanup_exits.push(cleanup);
-            self.function.states[end.0].terminator = TaskTerminator::Suspend {
+            self.function.states[latch.0].terminator = TaskTerminator::Suspend {
                 resume: header,
                 cleanup,
             };
@@ -1063,26 +1154,7 @@ impl<'a> FunctionLowerer<'a> {
         }
         self.function.states[entry.0].operations[enter_op] = TaskOp::ScopeEnter { scope, tasks };
         if self.current.is_some() {
-            let ready = self.state(TaskTerminator::Terminate)?;
-            let cleanup = self.state(TaskTerminator::Terminate)?;
-            self.terminate(TaskTerminator::ScopeDrain {
-                scope,
-                ready,
-                cleanup,
-            })?;
-            self.budget.analysis(1, self.span)?;
-            self.cleanup_exits.push(cleanup);
-            self.current = Some(ready);
-            self.budget.analysis(self.function.slots.len(), self.span)?;
-            for index in (0..self.function.slots.len()).rev() {
-                if self.slot_owners[index] == Some(scope)
-                    && owned_value(&self.function.slots[index].ty)
-                {
-                    self.emit(TaskOp::DropIfInit {
-                        slot: SlotId(index),
-                    })?;
-                }
-            }
+            self.drain_scope(scope)?;
         }
         self.locals.pop();
         self.scopes.pop();
@@ -1096,6 +1168,25 @@ impl<'a> FunctionLowerer<'a> {
                 "an async body without an explicit Result return or fail",
                 declaration.span,
             ));
+        }
+        // A nonlocal exit may precede another arm's local declarations. Finish
+        // each lexical drop mask only after all slots and birth scopes exist.
+        for (state, scope) in std::mem::take(&mut self.scope_drop_states) {
+            let following = std::mem::take(&mut self.function.states[state.0].operations);
+            self.budget.analysis(self.function.slots.len(), self.span)?;
+            for index in (0..self.function.slots.len()).rev() {
+                if self.slot_owners[index] == Some(scope)
+                    && owned_value(&self.function.slots[index].ty)
+                {
+                    self.emit_at(
+                        state,
+                        TaskOp::DropIfInit {
+                            slot: SlotId(index),
+                        },
+                    )?;
+                }
+            }
+            self.function.states[state.0].operations.extend(following);
         }
         for state in std::mem::take(&mut self.cleanup_exits) {
             for index in (0..self.function.slots.len()).rev() {
