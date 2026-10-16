@@ -912,11 +912,11 @@ fn native_task_sleep_uses_driver_wait_and_keeps_single_worker_available() {
             "", Some("duration must be >= 0"),
         ),
         (
-            "import time from \"std.time\"\nasync fn Slow(): null! { time.sleep(250)? println(2) return ok(null) } async fn Fast(): null! { time.sleep(0)? println(1) return ok(null) } async fn main(): null! { slow = Slow() fast = Fast(); (await slow)?; (await fast)?; return ok(null) }",
+            "import time from \"std.time\"\nasync fn Slow(): int! { time.sleep(250)? return ok(2) } async fn Fast(): int! { time.sleep(0)? return ok(1) } async fn main(): null! { slow = Slow() fast = Fast(); first = (await fast)? println(first) second = (await slow)? println(second) return ok(null) }",
             "1\n2\n", None,
         ),
         (
-            "import time from \"std.time\"\nasync fn Child(): null! { time.sleep(250)? println(999) return ok(null) } async fn main(): null! { child = Child() time.sleep(20)? println(8) return ok(null) }",
+            "import time from \"std.time\"\nasync fn Child(): null! { time.sleep(250)? return ok(null) } async fn main(): null! { child = Child() time.sleep(20)? println(8) return ok(null) }",
             "8\n", None,
         ),
         (

@@ -130,6 +130,20 @@ lower 对已构造 AST 的 If 另限32层，表达式仍受 `depth > 64` 拒绝�
 都会撤销登记，旧 token 不能影响后来的等待。清理体仍不能提交新的 sleep。
 这不包含 duration 对象、异步网络 I/O、用户 finally 或 native blocking pool。
 
+```ku
+import time from "std.time"
+
+async fn Later(): int! { time.sleep(10)? return ok(42) }
+async fn main(): null! {
+    pending = Later()
+    time.sleep(0)?
+    value = (await pending)?
+    println(value)
+    return ok(null)
+}
+```
+
+
 print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
 M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成；
 真实双 worker 重叠执行的定向测试不等于吞吐、扩展性或长期低 CPU 占用验收。
