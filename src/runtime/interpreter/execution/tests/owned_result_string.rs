@@ -8786,7 +8786,7 @@ fn flat_result_parameters_real_workers_keep_mixed_payloads_and_await_depth() {
                 format!(
                     "async fn Relay(text: str!, n: int): str! {{ if (n <= 0) {{ return text }}\n\
                      return await Relay(text, n - 1) }}\n\
-                     async fn Worker(): str! {{ return await Relay({constructor}(\"owned payload\"), 127) }}"
+                     async fn Worker(): str! {{ return await Relay({constructor}(\"owned payload\"), 32) }}"
                 )
             } else {
                 format!(
@@ -8800,21 +8800,22 @@ fn flat_result_parameters_real_workers_keep_mixed_payloads_and_await_depth() {
                  seen = false\ntry {{ text = (await Worker())?\n\
                  if ({expected_error} || text != \"owned payload\") {{ panic(\"unexpected successful payload\") }}\n\
                  seen = true }} catch (e) {{\n\
-                 if (!{expected_error} || e.domain != \"ku\" || e.code != \"err\" || e.message != \"owned payload\") {{ panic(\"unexpected error payload\") }}\n\
+                 if (!{expected_error} || e.domain != \"ku\" || e.code != \"err\" || e.message != \"owned payload\") {{ panic(\"unexpected error payload: \" + e.code) }}\n\
                  seen = true }}\nif (!seen) {{ panic(\"missing outcome\") }}\nreturn ok(null) }}"
             );
             crate::cli::run_source("flat-result-parameter-worker.ku", &source).unwrap();
         }
     }
 
-    // A sole worker gives these actual terminal await chains the same 64/65
-    // boundary as the existing async regressions; the observer never helps.
+    // Payload checks above stay inside the await budget regardless of worker
+    // scheduling. One worker makes the existing 64/65 boundary deterministic;
+    // retain the original deep 127 input as an explicit depth-error case.
     const SOURCE: &str = "async fn Entry(text: str!, n: int): str! { if (n <= 0) { return text }\nreturn await Entry(text, n - 1) }";
     assert_eq!(crate::runtime::task::MAX_AWAIT_DEPTH, 64);
     for error in [false, true] {
         let runtime = TaskRuntime::with_limits(1, 128, 0, 0, 128);
         let mut previous_worker = None;
-        for n in [64, 65, 0] {
+        for n in [64, 65, 127, 0] {
             let mut producer = production_interpreter(SOURCE);
             producer.task_runtime = Some(runtime.clone());
             let function = producer.functions["Entry"].clone();
@@ -8849,7 +8850,7 @@ fn flat_result_parameters_real_workers_keep_mixed_payloads_and_await_depth() {
             }
             previous_worker = Some(worker);
             let result = s10_wait_result(&task).unwrap();
-            if n == 65 {
+            if n > 64 {
                 let Value::Result { ok: false, value } = result else {
                     panic!("the first excessive await must return its existing error");
                 };
@@ -8859,6 +8860,8 @@ fn flat_result_parameters_real_workers_keep_mixed_payloads_and_await_depth() {
                 assert!(
                     matches!(fields.get("code"), Some(Value::String(code)) if code == "await_depth")
                 );
+                assert!(matches!(fields.get("message"), Some(Value::String(message))
+                    if message.contains("64")));
             } else {
                 assert_eq!(
                     s9_owner(&result, "owned payload").unwrap().error.is_some(),
