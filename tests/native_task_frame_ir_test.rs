@@ -1962,3 +1962,106 @@ fn native_task_flat_array_ir_validates_owned_elements_and_parameter_boundary() {
     };
     assert!(verify_and_plan(&nested, TaskLimits::default()).is_err());
 }
+
+#[test]
+fn native_task_array_try_get_ir_preserves_inputs_and_owns_only_the_result() {
+    for element in [IrType::Int, IrType::Bool, IrType::Str] {
+        let array = IrType::Array(Box::new(element.clone()));
+        let fixture = program(
+            vec![
+                array.clone(),
+                IrType::Int,
+                result(element),
+                result(IrType::Null),
+            ],
+            &[0, 1],
+            vec![
+                state(
+                    vec![TaskOp::ArrayTryGet {
+                        dst: SlotId(2),
+                        array: SlotId(0),
+                        index: SlotId(1),
+                    }],
+                    suspend(1, 2),
+                ),
+                state(
+                    vec![
+                        read(0),
+                        read(1),
+                        read(2),
+                        drop_slot(2),
+                        drop_slot(0),
+                        init(3, TaskConstant::Ok(Box::new(TaskConstant::Null))),
+                    ],
+                    complete(3),
+                ),
+                state(vec![drop_if(2), drop_if(0)], TaskTerminator::Terminate),
+            ],
+        );
+        let plan = accepted(&fixture);
+        let frame = &plan.functions[0];
+        assert!(frame.hosted);
+        for slot in [SlotId(0), SlotId(1), SlotId(2)] {
+            assert!(frame.slots.contains(&slot));
+            assert!(frame
+                .suspensions
+                .iter()
+                .any(|suspension| suspension.slots.contains(&slot)));
+        }
+        let mut invalid = fixture.clone();
+        invalid.functions[0].parameters.push(SlotId(2));
+        rejected(&invalid, "try_get must not overwrite an initialized Result");
+        for missing in [SlotId(0), SlotId(1)] {
+            let mut invalid = fixture.clone();
+            invalid.functions[0]
+                .parameters
+                .retain(|slot| *slot != missing);
+            rejected(
+                &invalid,
+                "both try_get inputs must be definitely initialized",
+            );
+        }
+        for slot in [0usize, 1, 2] {
+            let mut invalid = fixture.clone();
+            invalid.functions[0].slots[slot].ty = TaskSlotType::Value {
+                ty: IrType::Bool,
+                borrowed: false,
+            };
+            rejected(
+                &invalid,
+                "try_get source, index and Result types must match",
+            );
+            let mut invalid = fixture.clone();
+            if let TaskSlotType::Value { borrowed, .. } = &mut invalid.functions[0].slots[slot].ty {
+                *borrowed = true;
+            }
+            rejected(
+                &invalid,
+                "try_get cannot retain borrowed input or Result slots",
+            );
+        }
+        let mut invalid = fixture.clone();
+        invalid.functions[0].states[0]
+            .operations
+            .push(TaskOp::ArrayTryGet {
+                dst: SlotId(2),
+                array: SlotId(0),
+                index: SlotId(1),
+            });
+        rejected(
+            &invalid,
+            "a second try_get cannot overwrite the first Owned Result",
+        );
+        let mut invalid = fixture.clone();
+        invalid.functions[0].states[0]
+            .operations
+            .insert(0, drop_slot(0));
+        rejected(&invalid, "try_get cannot read an already dropped source");
+        let mut invalid = fixture;
+        invalid.functions[0].slots[0].ty = TaskSlotType::Value {
+            ty: IrType::Array(Box::new(array)),
+            borrowed: false,
+        };
+        rejected(&invalid, "try_get does not open nested arrays");
+    }
+}

@@ -173,6 +173,13 @@ pub enum TaskOp {
         left: SlotId,
         right: SlotId,
     },
+    /// Recoverable read: primitive payloads copy, strings become independent owners.
+    /// Neither the array nor the materialized integer index is consumed.
+    ArrayTryGet {
+        dst: SlotId,
+        array: SlotId,
+        index: SlotId,
+    },
     /// Internal loop extraction: primitives copy, strings move and zero a leaf.
     ArrayTake {
         dst: SlotId,
@@ -473,9 +480,14 @@ fn copy_type(ty: &IrType) -> bool {
 /// These operations need the current allocation host even in a leaf Task.
 /// Share this selection with C frame validation and adapter charge projection.
 pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
+    // A valid ArrayTryGet already has a flat array slot requiring hosted storage.
+    // Only its str branch clones; int/bool branches neither clone nor allocate.
     matches!(
         operation,
-        TaskOp::ErrorField { .. } | TaskOp::StringClone { .. } | TaskOp::StringConcat { .. }
+        TaskOp::ErrorField { .. }
+            | TaskOp::StringClone { .. }
+            | TaskOp::StringConcat { .. }
+            | TaskOp::ArrayTryGet { .. }
     )
 }
 
@@ -970,6 +982,24 @@ fn validate_shape(
                     let (ty, borrowed) = slot_type(get_slot(*dst)?)?;
                     if borrowed || ty != &IrType::Str {
                         return Err(invalid("StringConcat requires an owned str destination"));
+                    }
+                }
+                TaskOp::ArrayTryGet { dst, array, index } => {
+                    has_error_projection |= requires_string_allocation_host(operation);
+                    budget.spend_many(2)?;
+                    let (source, source_borrowed) = slot_type(get_slot(*array)?)?;
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                    let (index_type, index_borrowed) = slot_type(get_slot(*index)?)?;
+                    if dst == array
+                        || dst == index
+                        || source_borrowed
+                        || destination_borrowed
+                        || index_borrowed
+                        || !flat_array(source)
+                        || index_type != &IrType::Int
+                        || !matches!((source,destination), (IrType::Array(element),IrType::Result(inner)) if element==inner)
+                    {
+                        return Err(invalid("ArrayTryGet requires a flat owned array, int index and matching Result destination"));
                     }
                 }
                 TaskOp::ArrayTake { dst, array, index } => {
@@ -1698,6 +1728,7 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::StringClone { dst, .. }
         | TaskOp::StringConcat { dst, .. }
         | TaskOp::ArrayTake { dst, .. }
+        | TaskOp::ArrayTryGet { dst, .. }
         | TaskOp::Copy { dst, .. }
         | TaskOp::Move { dst, .. }
         | TaskOp::WrapOk { dst, .. }
@@ -2051,6 +2082,7 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         | TaskOp::StringClone { dst, .. }
         | TaskOp::StringConcat { dst, .. }
         | TaskOp::ArrayTake { dst, .. }
+        | TaskOp::ArrayTryGet { dst, .. }
         | TaskOp::Copy { dst, .. }
         | TaskOp::Unary { dst, .. }
         | TaskOp::ErrorField { dst, .. }
@@ -2109,7 +2141,9 @@ fn operation_work(operation: &TaskOp, budget: &mut Budget) -> KuResult<()> {
         | TaskOp::Start { arguments, .. }
         | TaskOp::StartIndirect { arguments, .. } => budget.spend_many(arguments.len())?,
         TaskOp::Unary { .. } => budget.spend()?,
-        TaskOp::Binary { .. } | TaskOp::StringConcat { .. } => budget.spend_many(2)?,
+        TaskOp::Binary { .. } | TaskOp::StringConcat { .. } | TaskOp::ArrayTryGet { .. } => {
+            budget.spend_many(2)?
+        }
         _ => {}
     }
     Ok(())
@@ -2368,6 +2402,11 @@ fn live_states(
                         array: left,
                         index: right,
                     }
+                    | TaskOp::ArrayTryGet {
+                        dst,
+                        array: left,
+                        index: right,
+                    }
                     | TaskOp::Binary {
                         dst, left, right, ..
                     }
@@ -2487,6 +2526,11 @@ fn validate_ownership_and_plan(
             }
             if let TaskOp::Binary { left, right, .. }
             | TaskOp::StringConcat { left, right, .. }
+            | TaskOp::ArrayTryGet {
+                array: left,
+                index: right,
+                ..
+            }
             | TaskOp::ArrayTake {
                 array: left,
                 index: right,

@@ -1251,6 +1251,39 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 out.push_str(&format!("  {}={value};\n", self.place(*dst)));
                 self.set_init(out, *dst, true);
             }
+            TaskOp::ArrayTryGet { dst, array, index } => {
+                let IrType::Array(element) = self.slot_type(*array)? else {
+                    return Err(unsupported("ArrayTryGet source"));
+                };
+                if !matches!(element.as_ref(), IrType::Int | IrType::Bool | IrType::Str)
+                    || self.slot_type(*index)? != &IrType::Int
+                    || self.slot_type(*dst)? != &IrType::Result(element.clone())
+                {
+                    return Err(unsupported("ArrayTryGet value types"));
+                }
+                let source = self.place(*array);
+                let index = self.place(*index);
+                let destination = self.place(*dst);
+                let result_type = c_type(self.slot_type(*dst)?)?;
+                out.push_str(&format!(
+                    "  if ({index}<0 || (uint64_t){index}>={source}.len) {{\n  {destination}=({result_type}){{false,{},ku_error_make({},{},{})}};\n  }} else {{\n",
+                    c_zero_initializer(element)?,
+                    c_static_utf8_string("array"),
+                    c_static_utf8_string("index_out_of_bounds"),
+                    c_static_utf8_string("array index out of bounds")
+                ));
+                let value = if element.as_ref() == &IrType::Str {
+                    out.push_str(&format!("  KuString copied={{0}}; uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source}.data[(size_t){index}],&copied);\n"));
+                    self.emit_string_allocation_check(out, "allocated")?;
+                    "copied".to_string()
+                } else {
+                    format!("{source}.data[(size_t){index}]")
+                };
+                out.push_str(&format!(
+                    "  {destination}=({result_type}){{true,{value},(KuError){{0}}}};\n  }}\n"
+                ));
+                self.set_init(out, *dst, true);
+            }
             TaskOp::Copy { dst, src } => {
                 out.push_str(&format!("  {} = {};\n", self.place(*dst), self.place(*src)));
                 self.set_init(out, *dst, true);

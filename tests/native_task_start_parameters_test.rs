@@ -90,7 +90,8 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                     map(dst);
                     map(src);
                 }
-                TaskOp::ArrayTake { dst, array, index } => {
+                TaskOp::ArrayTake { dst, array, index }
+                | TaskOp::ArrayTryGet { dst, array, index } => {
                     map(dst);
                     map(array);
                     map(index);

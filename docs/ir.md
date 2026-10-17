@@ -485,7 +485,7 @@ fixed_bytes。global_queued仅表示ring，queued为所有队列总和，容量�
 
 ### 平面数组的局部帧与运行期 for
 
-ArrayMake、ArrayClone、ArrayLen、ArrayTake 支持局部 flat int/bool/str vector。
+ArrayMake、ArrayClone、ArrayLen、ArrayTryGet、ArrayTake 支持局部 flat int/bool/str vector。
 direct/indirect Start 与 raw IR 接通这些 flat array 及其单层 Result 参数；
 顶层无捕获 Callable 使用相同参数合同。参数 guard 的 Ok 分支先登记完整 vector，Err
 分支只登记 Error 的三个字符串；所有基础范围完成后再访问 str 叶子，不读取失活字段。
@@ -495,6 +495,12 @@ direct/indirect Start 与 raw IR 接通这些 flat array 及其单层 Result 参
 hosted Start 沿原 commit 原子转交父子费用，try_start 失败保留或恢复来源 header/init 位。
 Task slot 的元素类型加入原 C typedef/prototype/body 收集，复用 KuArray_T 表示和 drop，
 构造/快照使用 Task 可失败分配入口，不调用同步 make/clone 的直接 exit 路径。
+
+ArrayTryGet 读取 array/index 两个已初始化槽，成功写入对应的单层 Result；输入仍保留。
+int/bool 复制元素，str 走原 budgeted clone host，失败不发布结果初始化位；越界是带静态
+array/index_out_of_bounds 的普通 Err，不等同于分配失败。下标求值可能移动命名接收者时
+先 ArrayClone，明确有界的只读表达式不创建该快照；匿名接收者及专用快照在读取后 Drop。
+原类型、初始化、活跃性和工作预算检查覆盖新操作，不改变 Frame/Control/Driver 或 host ABI。
 
 ArrayClone 的目标槽持久化，预付 capacity*sizeof(T) 后 malloc；先登记 len=0 的
 部分 owner 与初始化位，再逐个复制叶子并提交 len。下一次 typed reconcile 能看到

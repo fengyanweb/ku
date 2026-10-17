@@ -563,3 +563,126 @@ async fn main(): null! { (await Cloned())?; (await RightJoined())?; (await LeftJ
         );
     }
 }
+
+#[test]
+fn native_task_array_try_get_source_keeps_pure_indices_free_of_receiver_copies() {
+    for (element, index) in [
+        ("int", "0"),
+        ("bool", "index"),
+        ("str", "index + values.len() - 1"),
+        ("str", "text.byte_len() - text.len()"),
+        ("int", "-1"),
+        ("int", "9223372036854775807"),
+    ] {
+        let source = format!("async fn Probe(values: [{element}], index: int, text: str): {element}! {{ return values.try_get({index}) }} async fn main(): null! {{ return ok(null) }}");
+        let native = lowered(&source);
+        let probe = &native.tasks.functions[0];
+        let reads = probe
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .filter_map(|op| match op {
+                TaskOp::ArrayTryGet { dst, array, index } => Some((*dst, *array, *index)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 1, "{source}");
+        assert_eq!(
+            reads[0].1, probe.parameters[0],
+            "pure index keeps the original View"
+        );
+        assert!(!probe
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .any(|op| matches!(op, TaskOp::ArrayClone { .. })));
+        task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+    }
+    fn sum(leaves: usize) -> String {
+        if leaves == 1 {
+            "values.len()".into()
+        } else {
+            format!("({}+{})", sum(leaves / 2), sum(leaves - leaves / 2))
+        }
+    }
+    // These sources remain below the original slot/depth limits. The bounded
+    // purity precheck falls back rather than extending its 64-node worklist.
+    for (leaves, snapshots) in [(16usize, 0usize), (17, 1)] {
+        let source = format!("async fn Probe(values: [int]): int! {{ return values.try_get({}) }} async fn main(): null! {{ return ok(null) }}",sum(leaves));
+        let native = lowered(&source);
+        let actual = native.tasks.functions[0]
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .filter(|op| matches!(op, TaskOp::ArrayClone { .. }))
+            .count();
+        assert_eq!(actual, snapshots, "{leaves} read-only calls");
+        task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+    }
+}
+
+#[test]
+fn native_task_array_try_get_freezes_effectful_indices_and_drops_anonymous_receivers() {
+    for (receiver, argument, snapshots) in [
+        ("values", "values", 1usize),
+        ("values", "values.clone()", 2),
+        ("values.clone()", "values", 1),
+    ] {
+        let source = format!("async fn Consume(values: [int]): int! {{ return ok(values.len()-1) }} async fn Probe(values: [int]): int! {{ return {receiver}.try_get((await Consume({argument}))?) }} async fn main(): null! {{ return ok(null) }}");
+        let native = lowered(&source);
+        let probe = &native.tasks.functions[1];
+        let (array, dst) = probe
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .find_map(|op| match op {
+                TaskOp::ArrayTryGet { dst, array, .. } => Some((*array, *dst)),
+                _ => None,
+            })
+            .unwrap();
+        let entry = &probe.states[probe.entry.0].operations;
+        let (cloned, clone_position) = entry
+            .iter()
+            .enumerate()
+            .find_map(|(position, op)| match op {
+                TaskOp::ArrayClone { dst, src } if *src == probe.parameters[0] => {
+                    Some((*dst, position))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(cloned, array, "{source}");
+        let start = entry
+            .iter()
+            .position(|op| matches!(op, TaskOp::Start { .. }))
+            .unwrap();
+        assert!(
+            clone_position < start,
+            "receiver finishes before the index starts"
+        );
+        assert_eq!(
+            probe
+                .states
+                .iter()
+                .flat_map(|state| &state.operations)
+                .filter(|op| matches!(op, TaskOp::ArrayClone { .. }))
+                .count(),
+            snapshots
+        );
+        assert!(probe.states.iter().any(|state| state.operations.windows(2).any(|pair| matches!((&pair[0],&pair[1]),(TaskOp::ArrayTryGet{dst:actual,..},TaskOp::Drop{slot}) if *actual==dst && *slot==array))));
+        let plan = task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+        assert!(plan.functions[1]
+            .suspensions
+            .iter()
+            .any(|suspension| suspension.slots.contains(&array)));
+    }
+    let native = lowered("async fn main(): null! { index=0 while (index<2 && ([10,20].try_get(0))?>0) { index=index+1 } return ok(null) }");
+    let main = &native.tasks.functions[native.entry.0];
+    assert!(!main
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .any(|op| matches!(op, TaskOp::ArrayClone { .. })));
+    assert!(main.states.iter().any(|state|state.operations.windows(2).any(|pair|matches!((&pair[0],&pair[1]),(TaskOp::ArrayTryGet{array,..},TaskOp::Drop{slot}) if array==slot))));
+    task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+}

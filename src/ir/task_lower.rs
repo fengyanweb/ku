@@ -1067,6 +1067,130 @@ impl<'a> FunctionLowerer<'a> {
         Ok(None)
     }
 
+    // This precheck never recursively walks the source or grows its worklist.
+    // Unknown/effectful syntax and the 64-node boundary conservatively snapshot.
+    #[inline(never)]
+    fn pure_array_index(&mut self, expression: &Expr) -> KuResult<bool> {
+        let mut pending = [None; 64];
+        pending[0] = Some(expression);
+        let mut count = 1usize;
+        let mut visited = 0usize;
+        while count != 0 {
+            if visited == pending.len() {
+                return Ok(false);
+            }
+            count -= 1;
+            let expression = pending[count].take().expect("bounded index worklist");
+            visited += 1;
+            self.budget.analysis(1, expression.span)?;
+            match &expression.kind {
+                ExprKind::Literal(_) | ExprKind::Variable(_) => {}
+                ExprKind::Unary { expr, .. } => {
+                    if count == pending.len() {
+                        return Ok(false);
+                    }
+                    pending[count] = Some(expr.as_ref());
+                    count += 1;
+                }
+                ExprKind::Binary { left, right, .. } => {
+                    if count + 2 > pending.len() {
+                        return Ok(false);
+                    }
+                    pending[count] = Some(right.as_ref());
+                    pending[count + 1] = Some(left.as_ref());
+                    count += 2;
+                }
+                ExprKind::Call { callee, args } if args.is_empty() => {
+                    let ExprKind::Field { target, name } = &callee.kind else {
+                        return Ok(false);
+                    };
+                    let ExprKind::Variable(binding) = &target.kind else {
+                        return Ok(false);
+                    };
+                    let Some(source) = self.local(binding) else {
+                        return Ok(false);
+                    };
+                    let TaskSlotType::Value {
+                        ty,
+                        borrowed: false,
+                    } = &self.function.slots[source.0].ty
+                    else {
+                        return Ok(false);
+                    };
+                    let readonly = match name.as_str() {
+                        "len" => ty == &IrType::Str || task::flat_array(ty),
+                        "byte_len" => ty == &IrType::Str,
+                        "is_empty" => task::flat_array(ty),
+                        _ => false,
+                    };
+                    if !readonly || visited + 2 > pending.len() {
+                        return Ok(false);
+                    }
+                    // The direct Field and Variable nodes are known without
+                    // visiting another subtree, but still pay for their work.
+                    self.budget.analysis(2, expression.span)?;
+                    visited += 2;
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    #[inline(never)]
+    fn array_try_get_expression(
+        &mut self,
+        object: &Expr,
+        index: &Expr,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let source = self.expression(object, depth + 1)?;
+        let TaskSlotType::Value {
+            ty,
+            borrowed: false,
+        } = &self.function.slots[source.0].ty
+        else {
+            return Err(unsupported("try_get on a non-owned flat array", span));
+        };
+        let IrType::Array(element) = ty else {
+            return Err(unsupported("try_get on a non-array value", span));
+        };
+        if !task::flat_array(ty) {
+            return Err(unsupported(
+                "try_get on a nested or unsupported array",
+                span,
+            ));
+        }
+        let array_type = ty.clone();
+        let result_type = IrType::Result(element.clone());
+        let temporary = !matches!(&object.kind, ExprKind::Variable(_));
+        let array = if !temporary && !self.pure_array_index(index)? {
+            let snapshot = self.slot(value_slot(array_type))?;
+            self.emit(TaskOp::ArrayClone {
+                dst: snapshot,
+                src: source,
+            })?;
+            snapshot
+        } else {
+            source
+        };
+        let index = self.expression(index, depth + 1)?;
+        if self.function.slots[index.0].ty != value_slot(IrType::Int) {
+            return Err(unsupported("try_get with a non-int index", span));
+        }
+        let destination = self.slot(value_slot(result_type))?;
+        self.emit(TaskOp::ArrayTryGet {
+            dst: destination,
+            array,
+            index,
+        })?;
+        if temporary || array != source {
+            self.emit(TaskOp::Drop { slot: array })?;
+        }
+        Ok(destination)
+    }
+
     #[inline(never)]
     fn string_or_callable_method_expression(
         &mut self,
@@ -1179,6 +1303,15 @@ impl<'a> FunctionLowerer<'a> {
             };
             self.current = Some(ready);
             return Ok(destination);
+        }
+        if name == "try_get" {
+            if args.len() != 1 {
+                return Err(unsupported(
+                    "try_get with other than one index argument",
+                    span,
+                ));
+            }
+            return self.array_try_get_expression(object, &args[0], span, depth);
         }
         if args.is_empty() && matches!(name, "len" | "is_empty" | "clone") {
             if let Some(destination) = self.array_method_expression(object, name)? {

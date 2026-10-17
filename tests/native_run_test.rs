@@ -3613,6 +3613,44 @@ async fn StringJoins(): null! {
     catch (err) { println(err.code) }
     return ok(null)
 }
+async fn GetterNumbers(): null! {
+    values = [7, 9]
+    println(values.try_get(values.len()-1)?)
+    println(values.try_get(0)?)
+    flags = [true, false]
+    println(flags.try_get(1)?)
+    println(values.len())
+    try { missing = values.try_get(-1)? println(missing) }
+    catch (err) { println(err.domain) println(err.code) }
+    try { missing = values.try_get(values.len())? println(missing) }
+    catch (err) { println(err.code) }
+    return ok(null)
+}
+async fn GetterTexts(): null! {
+    rows = [fs.read("first.txt")?, fs.read("second.txt")?]
+    selected = rows.try_get(0)?
+    println(rows.len())
+    rows = []
+    println(selected)
+    println(selected.len())
+    println(selected.byte_len())
+    return ok(null)
+}
+async fn GetterIndex(rows: [str]): int! { time.sleep(0)? return ok(rows.len()-1) }
+async fn GetterSnapshots(): null! {
+    rows = [fs.read("first.txt")?, fs.read("second.txt")?]
+    println(rows.try_get((await GetterIndex(rows))?)?)
+    index = 0
+    while (index < 2 && (["循环"].try_get(0)?).len() > 0) { index = index + 1 }
+    println(index)
+    return ok(null)
+}
+async fn UseGetters(): null! {
+    (await GetterNumbers())?;
+    (await GetterTexts())?;
+    (await GetterSnapshots())?;
+    return ok(null)
+}
 async fn CheckErrors(): null! {
     try {
         unexpected = (await MissingRows())?
@@ -3639,11 +3677,12 @@ async fn main(): null! {
     (await StringJoins())?;
     (await UseArrayResultParameters())?;
     (await UseArrayCallableParameters())?;
+    (await UseGetters())?;
     return ok(null)
 }
 "#;
     fs::write(dir.join("main.ku"), program).unwrap();
-    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n{first}\nread_failed\n{first}\n乙\n{first}\ntexts-finally\n0\ntexts-finally\n2\ntrue\n{first}\n乙\ntexts-finally\n{first}\n乙\n2\nnew-error\n5\n12\n{first}\n{first}\n0\n0\n\n{first}\n{first}乙\n{first}{first}\nread_failed\ntexts-finally\n{first}\n乙\narray-failed\nnumbers-finally\ntrue\nnumbers-finally\n2\n8\n9\ntrue\nfalse\n");
+    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n{first}\nread_failed\n{first}\n乙\n{first}\ntexts-finally\n0\ntexts-finally\n2\ntrue\n{first}\n乙\ntexts-finally\n{first}\n乙\n2\nnew-error\n5\n12\n{first}\n{first}\n0\n0\n\n{first}\n{first}乙\n{first}{first}\nread_failed\ntexts-finally\n{first}\n乙\narray-failed\nnumbers-finally\ntrue\nnumbers-finally\n2\n8\n9\ntrue\nfalse\n9\n7\nfalse\n2\narray\nindex_out_of_bounds\nindex_out_of_bounds\n2\n{first}\n5\n12\n乙\n2\n");
     let mut interpreter = Command::new(ku_binary());
     interpreter.current_dir(dir).args(["run", "main.ku"]);
     let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)

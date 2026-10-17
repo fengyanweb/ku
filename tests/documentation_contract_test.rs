@@ -159,6 +159,8 @@ fn native_task_docs_limit_source_support_and_separate_error_layers() {
         "len 计 Unicode 标量，byte_len 读取 UTF-8 字节数",
         "clone 左侧快照",
         "没有新增字符串 is_empty 方法",
+        "try_get(index) 返回对应的 T!，不消费原数组",
+        "负数或越界返回 array/index_out_of_bounds",
         "直接 async 和顶层无捕获 Callable 都接收平面数组及其单层 Result 参数",
         "失活分支不读取",
         "源码 `while` 每轮从条件表达式入口重新求值",

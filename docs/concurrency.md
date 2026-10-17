@@ -219,10 +219,15 @@ async fn main(): null! {
 
 ### Native 平面数组与 for
 
-局部数组支持 `[int]`、`[bool]`、`[str]` 的字面量、move、显式 clone、len/is_empty 与
+局部数组支持 `[int]`、`[bool]`、`[str]` 的字面量、move、显式 clone、len/is_empty、try_get(index) 与
 真实运行期 for。直接 async 调用也接受这三类 owned 参数，默认 move，保留来源需显式 clone；
 多跳转交沿原 Start 移交费用。元素从左到右只求值一次，可包含已有支持的 Await；
 空局部数组需显式注解，直接调用的空数组实参可用已声明的形参元素类型。
+try_get(index) 返回对应的 T!，不消费原数组；负数或越界返回 array/index_out_of_bounds，
+可用 ? 或 try/catch 处理。成功的 str 为独立结果：STATIC 叶子复用，Owned 叶子按实际
+长度复制，真实空 Owned 字符串仍分配1字节。接收者和下标各求值一次；可确认只读的
+普通下标直接读取，可能移动接收者的下标先保留快照。快照和结果同时存活时均计入原预算。
+native 错误消息沿用同步实现，不承诺与解释器的错误消息逐字相同，domain/code 保持一致。
 for 创建独立 snapshot，来源仍可再次遍历。int/bool 按值读取，str 从 snapshot 移入
 本轮 Owned 变量，因此循环体可 Await 或把文本传给另一个 async 函数。
 
@@ -234,6 +239,9 @@ async fn ShowWords(words: [str]): null! {
 }
 async fn main(): null! {
     words = ["甲", "乙"];
+    first = words.try_get(0)?
+    println(first)
+    try { words.try_get(-1)? } catch (err) { println(err.code) }
     (await ShowWords(words.clone()))?;
     for word in words { println(word) }
     empty: [int] = []

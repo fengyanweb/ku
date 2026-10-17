@@ -3434,3 +3434,319 @@ int main(void) {
   puts("string-operation-owners-ok"); return 0;
 }
 "#;
+
+#[test]
+fn native_task_array_try_get_preserves_views_and_cleans_real_owned_results() {
+    let source = r#"
+async fn Pick(values: [str], index: int): str! {
+    selected=values.try_get(index)
+    if (values.len()!=2) { fail "source consumed" }
+    return selected
+}
+async fn PickInt(values: [int], index: int): int! {
+    selected=values.try_get(index)
+    if (values.len()!=2) { fail "source consumed" }
+    return selected
+}
+async fn PickBool(values: [bool], index: int): bool! {
+    selected=values.try_get(index)
+    if (values.len()!=2) { fail "source consumed" }
+    return selected
+}
+async fn Index(values: [str], stop: bool): int! {
+    println("rhs")
+    if (stop) { fail "getter index failed" }
+    return ok(values.len()-1)
+}
+async fn Pending(values: [str], stop: bool): str! {
+    try { return ok(values.try_get((await Index(values,stop))?)?) }
+    finally { println("done") }
+    fail "unreachable"
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    Checker::new().check(&ast).unwrap();
+    let native = ir::task_lower::lower_program(&ast).unwrap();
+    assert_eq!(native.tasks.functions.len(), 6);
+    for function in &native.tasks.functions[..3] {
+        assert_eq!(
+            function
+                .states
+                .iter()
+                .flat_map(|state| &state.operations)
+                .filter(|op| matches!(op, TaskOp::ArrayTryGet { .. }))
+                .count(),
+            1
+        );
+        assert!(function
+            .states
+            .iter()
+            .flat_map(|state| &state.operations)
+            .all(|op| !matches!(op, TaskOp::ArrayClone { .. })));
+    }
+    let parent = &native.tasks.functions[4];
+    let snapshots: Vec<_> = parent
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|op| match op {
+            TaskOp::ArrayClone { dst, src } if *src == parent.parameters[0] => Some(*dst),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 1);
+    let hooks = r#"
+static KuTestEvent assignment_entered,assignment_proceed;
+static void *assignment_parent,*assignment_child,*getter_runtime;
+static uintptr_t assignment_pointers[5];
+static size_t assignment_frees[5];
+static unsigned assignment_gate_calls,getter_finally_calls;
+static void assignment_free(void*);
+static size_t assignment_write(const void*,size_t,size_t,FILE*);
+static size_t getter_write(const void*,size_t,size_t,FILE*);
+static void* getter_allocate(size_t);
+#undef free
+#define free assignment_free
+#define fwrite getter_write
+"#;
+    let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+    let instrumentation = format!(
+        "{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{}\n{ALLOCATION_HOOK}\n{}\n{hooks}",
+        native_task_ledger::LEDGER_LOCK,
+        native_task_ledger::LOCKED_ALLOCATIONS
+    );
+    assert_eq!(generated.matches("typedef struct KuString {").count(), 1);
+    let generated = generated.replacen(
+        "typedef struct KuString {",
+        &format!("{instrumentation}typedef struct KuString {{"),
+        1,
+    );
+    assert_eq!(generated.matches("int main(void) {").count(), 1);
+    let mut generated = generated.replacen(
+        "int main(void) {",
+        "static int fixture_unmodified_getter_main(void) {",
+        1,
+    );
+    // Reuse the existing finally fixture's logical-clock wrapper. Only the
+    // within-D cancellation case freezes time; the process watchdog stays real.
+    let now = "static uint64_t ku_task_driver_now_ms(void) {";
+    assert_eq!(generated.matches(now).count(), 1);
+    generated = generated.replacen(
+        now,
+        "static uint64_t ku_task_driver_now_ms(void);\nstatic uint64_t getter_real_now(void) {",
+        1,
+    );
+    let allocation = "uint8_t* bytes=(uint8_t*)malloc(capacity);";
+    assert_eq!(generated.matches(allocation).count(), 2);
+    generated = generated.replace(
+        allocation,
+        "uint8_t* bytes=(uint8_t*)getter_allocate(capacity);",
+    );
+    for (id, name) in [(3, "child"), (4, "parent")] {
+        let resume = format!("static uint32_t ku_task_{id}_resume(void* raw) {{");
+        assert_eq!(generated.matches(&resume).count(), 1);
+        generated = generated.replacen(&resume, &format!("{resume}\n  assignment_{name}=raw;"), 1);
+    }
+    // Keep the existing ledger, exact original-D reaping and thread/event
+    // protocol. Only this fixture receives its own input-dependent budget.
+    let common = OWNED_ASSIGNMENT_MAIN
+        .split_once("static KuString assignment_string(")
+        .unwrap()
+        .0;
+    let budget = "fixed+sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1)\n      +sizeof(KuTaskInstance_2)+sizeof(KuTaskInstance_3)+4096u";
+    assert_eq!(common.matches(budget).count(), 1);
+    generated.push_str(
+        &common
+            .replace(
+                "static void assignment_init(AssignmentRuntime* runtime)",
+                "static void assignment_init(AssignmentRuntime* runtime,size_t budget)",
+            )
+            .replace(budget, "fixed+budget"),
+    );
+    generated.push_str(&ARRAY_TRY_GET_MAIN.replace("@SNAPSHOT@", &snapshots[0].0.to_string()));
+    run_finally_adapter_generated(
+        generated,
+        "native-task-array-try-get",
+        "\n\n\n\n\n\n\narray-try-get-owners-ok\n",
+    );
+}
+
+const ARRAY_TRY_GET_MAIN: &str = r#"
+static const uint8_t getter_text[12]={0xe4,0xb8,0xad,0xe6,0x96,0x87,0xf0,0x9f,0x99,0x82,0,0x41};
+static size_t getter_calls,getter_fail_at,getter_peak;
+static void* getter_allocations[4];
+static KuAtomicRefcount getter_clock_frozen;
+static uint64_t getter_frozen_now;
+static uint64_t ku_task_driver_now_ms(void) {
+  return ku_task_control_atomic_load(&getter_clock_frozen) ? getter_frozen_now : getter_real_now();
+}
+static size_t getter_write(const void* bytes,size_t size,size_t count,FILE* stream) {
+  if (size==1u&&count==4u&&!memcmp(bytes,"done",4u)) { getter_finally_calls++; return count; }
+  return assignment_write(bytes,size,count,stream);
+}
+static void getter_init(AssignmentRuntime* runtime,size_t budget) {
+  ku_task_control_atomic_store(&getter_clock_frozen,0u);
+  assignment_init(runtime,budget); getter_runtime=runtime; getter_calls=0; getter_fail_at=0; getter_peak=0;
+  getter_finally_calls=0; memset(getter_allocations,0,sizeof(getter_allocations));
+}
+static void* getter_allocate(size_t capacity) {
+  CHECK(getter_calls<4u); size_t index=getter_calls++;
+  KuTaskDriverSnapshotV1 snapshot=assignment_snapshot((AssignmentRuntime*)getter_runtime);
+  if (snapshot.reserved_bytes>getter_peak) getter_peak=snapshot.reserved_bytes;
+  void* pointer=getter_fail_at==index+1u ? NULL : fixture_malloc(capacity);
+  getter_allocations[index]=pointer; return pointer;
+}
+static KuArray_str getter_input(unsigned immutable) {
+  KuString* data=(KuString*)malloc(3u*sizeof(KuString)); CHECK(data); memset(data,0,3u*sizeof(KuString));
+  assignment_track(2u,data);
+  if (immutable) {
+    data[0]=ku_string_static(getter_text,sizeof(getter_text)); data[1]=ku_string_static((const uint8_t*)"",0);
+  } else {
+    uint8_t* text=(uint8_t*)malloc(31u); CHECK(text); memcpy(text,getter_text,sizeof(getter_text));
+    uint8_t* empty=(uint8_t*)malloc(1u); CHECK(empty); empty[0]=0;
+    assignment_track(0u,text); assignment_track(1u,empty);
+    data[0]=(KuString){text,12u,31u,KU_STRING_OWNED};
+    // A real one-byte allocation with the canonical zero-capacity owned header.
+    data[1]=(KuString){empty,0u,0u,KU_STRING_OWNED};
+  }
+  return (KuArray_str){.len=2u,.data=data,.capacity=3u};
+}
+static void getter_bounds(KuError error) {
+  CHECK(error.domain.len==5u&&!memcmp(error.domain.ptr,"array",5u));
+  CHECK(error.code.len==19u&&!memcmp(error.code.ptr,"index_out_of_bounds",19u));
+  CHECK(error.message.len==25u&&!memcmp(error.message.ptr,"array index out of bounds",25u));
+  CHECK(error.domain.storage==KU_STRING_STATIC&&error.code.storage==KU_STRING_STATIC&&error.message.storage==KU_STRING_STATIC);
+}
+static void getter_string_case(int64_t index,unsigned immutable,unsigned failure) {
+  AssignmentRuntime runtime; size_t frame=sizeof(KuTaskInstance_0),input=3u*sizeof(KuString)+(immutable ? 0u : 32u);
+  size_t copy=index==0 ? 12u : 1u;
+  getter_init(&runtime,frame+input+(failure==1u ? copy-1u : 4096u));
+  getter_fail_at=failure==2u ? 1u : 0u;
+  KuArray_str values=getter_input(immutable); KuTaskValueV1 task={0};
+  CHECK(ku_task_0_start_value(&runtime.driver,&values,&index,&task)==KU_TASK_DRIVER_OK&&!values.data);
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,assignment_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  assignment_idle(&runtime);
+  bool bounds=index<0||index>=2; size_t output_charge=(!bounds&&!failure&&!immutable) ? copy : 0u;
+  CHECK(assignment_freed(2u)==1u&&assignment_freed(0u)==(immutable ? 0u : 1u)&&assignment_freed(1u)==(immutable ? 0u : 1u));
+  CHECK(!getter_finally_calls&&!assignment_gate_calls);
+  CHECK(getter_calls==((bounds||immutable||failure==1u) ? 0u : 1u));
+  // Pure indices have no array/vector clone. Only the selected Owned leaf is
+  // prepaid, so this peak includes the original vector and both source leaves.
+  CHECK(getter_peak==(!getter_calls ? 0u : frame+input+copy));
+  CHECK(assignment_snapshot(&runtime).reserved_bytes==frame+output_charge&&fixture_ledger().bytes==frame+output_charge);
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(&task,NULL,&output)==KU_TASK_CONTROL_OK);
+  CHECK(assignment_snapshot(&runtime).reserved_bytes==frame&&output.result_kind==4u);
+  if (failure) {
+    CHECK(!output.value.string.ok&&output.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE);
+    const char* code=failure==1u ? "memory_limit" : "out_of_memory";
+    CHECK(output.value.string.error.code.len==strlen(code)&&!memcmp(output.value.string.error.code.ptr,code,strlen(code)));
+  } else if (bounds) {
+    CHECK(!output.value.string.ok&&output.exit_class==KU_TASK_EXIT_USER_RESULT); getter_bounds(output.value.string.error);
+  } else {
+    KuString selected=output.value.string.value;
+    CHECK(output.value.string.ok&&selected.len==(index==0 ? 12u : 0u));
+    CHECK(selected.storage==(immutable ? KU_STRING_STATIC : KU_STRING_OWNED));
+    CHECK(selected.capacity==output_charge);
+    CHECK(immutable||selected.ptr==getter_allocations[0]);
+    CHECK(index!=0||!memcmp(selected.ptr,getter_text,sizeof(getter_text)));
+  }
+  ku_task_outcome_drop(&output); CHECK(fixture_ledger().bytes==frame);
+  CHECK(ku_task_value_drop(&task,assignment_deadline())==KU_TASK_DRIVER_OK); assignment_finish(&runtime);
+}
+static void getter_primitive_case(unsigned boolean,int64_t index) {
+  AssignmentRuntime runtime; size_t frame=boolean ? sizeof(KuTaskInstance_2) : sizeof(KuTaskInstance_1);
+  getter_init(&runtime,frame+4096u); KuTaskValueV1 task={0};
+  if (boolean) {
+    bool* data=(bool*)malloc(4u*sizeof(bool)); CHECK(data); data[0]=true; data[1]=false; assignment_track(2u,data);
+    KuArray_bool values={.len=2u,.data=data,.capacity=4u};
+    CHECK(ku_task_2_start_value(&runtime.driver,&values,&index,&task)==KU_TASK_DRIVER_OK&&!values.data);
+  } else {
+    int64_t* data=(int64_t*)malloc(4u*sizeof(int64_t)); CHECK(data); data[0]=7; data[1]=9; assignment_track(2u,data);
+    KuArray_int values={.len=2u,.data=data,.capacity=4u};
+    CHECK(ku_task_1_start_value(&runtime.driver,&values,&index,&task)==KU_TASK_DRIVER_OK&&!values.data);
+  }
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,assignment_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  assignment_idle(&runtime); CHECK(!getter_calls&&assignment_freed(2u)==1u);
+  CHECK(assignment_snapshot(&runtime).reserved_bytes==frame&&fixture_ledger().bytes==frame);
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(&task,NULL,&output)==KU_TASK_CONTROL_OK);
+  CHECK(output.exit_class==KU_TASK_EXIT_USER_RESULT);
+  if (boolean) {
+    CHECK(output.result_kind==2u);
+    if (index<0||index>=2) { CHECK(!output.value.boolean.ok); getter_bounds(output.value.boolean.error); }
+    else CHECK(output.value.boolean.ok&&output.value.boolean.value==(index==0));
+  } else {
+    CHECK(output.result_kind==1u);
+    if (index<0||index>=2) { CHECK(!output.value.integer.ok); getter_bounds(output.value.integer.error); }
+    else CHECK(output.value.integer.ok&&output.value.integer.value==(index==0 ? 7 : 9));
+  }
+  ku_task_outcome_drop(&output); CHECK(ku_task_value_drop(&task,assignment_deadline())==KU_TASK_DRIVER_OK); assignment_finish(&runtime);
+}
+static void getter_pending_case(unsigned mode) {
+  AssignmentRuntime runtime; size_t frames=sizeof(KuTaskInstance_3)+sizeof(KuTaskInstance_4);
+  getter_init(&runtime,frames+4096u); KuArray_str values=getter_input(0u); bool stop=mode==1u; KuTaskValueV1 task={0};
+  CHECK(ku_task_4_start_value(&runtime.driver,&values,&stop,&task)==KU_TASK_DRIVER_OK&&!values.data);
+  CHECK(ku_test_event_wait(&assignment_entered,2000));
+  KuTaskInstance_4* parent=(KuTaskInstance_4*)assignment_parent;
+  CHECK(parent&&parent->frame.header.status==KU_TASK_FRAME_PENDING&&getter_calls==2u&&!getter_finally_calls);
+  KuArray_str snapshot=parent->frame.s_@SNAPSHOT@;
+  CHECK(snapshot.len==2u&&snapshot.capacity==2u&&(uintptr_t)snapshot.data!=assignment_pointers[2]);
+  CHECK(snapshot.data[0].ptr==getter_allocations[0]&&snapshot.data[1].ptr==getter_allocations[1]);
+  CHECK(!memcmp(snapshot.data[0].ptr,getter_text,sizeof(getter_text))&&snapshot.data[1].capacity==1u);
+  CHECK(!assignment_freed(0u)&&!assignment_freed(1u)&&!assignment_freed(2u)&&!assignment_freed(4u));
+  size_t pending=frames+5u*sizeof(KuString)+45u;
+  CHECK(assignment_snapshot(&runtime).reserved_bytes==pending&&fixture_ledger().bytes==pending);
+  if (mode==2u||mode==3u) {
+    KuTaskControlLeaseV1 late={0}; CHECK(ku_task_control_lease_retain(&task.owner.lease,&late)==KU_TASK_CONTROL_OK);
+    if (mode==3u) {
+      getter_frozen_now=ku_task_driver_now_ms();
+      ku_task_control_atomic_store(&getter_clock_frozen,1u);
+    }
+    uint64_t deadline=ku_task_driver_now_ms()+30u; KuTaskDriverCleanupReceiptV1 receipt={0};
+    CHECK(ku_task_driver_owner_drop_receipt(&task.ticket,&task.owner,deadline,&receipt)==KU_TASK_DRIVER_OK); task=(KuTaskValueV1){0};
+    // Late retirement deliberately exhausts the real original D. The other
+    // case releases the real child while its unchanged logical D is still live.
+    if (mode==2u) CHECK(ku_task_driver_shutdown(&runtime.driver,deadline)==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
+    CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_PENDING&&ku_task_control_cleanup_deadline(late.control)==deadline);
+    CHECK(fixture_ledger().bytes==pending&&!getter_finally_calls);
+    CHECK(ku_test_event_set(&assignment_proceed)); assignment_idle(&runtime);
+    CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_CLEANUP_ACK&&ku_task_control_cleanup_deadline(late.control)==deadline);
+    CHECK(getter_calls==2u&&getter_finally_calls==(mode==3u ? 1u : 0u));
+    CHECK(ku_task_control_status(&late)==KU_TASK_CONTROL_CANCELLED);
+    CHECK(assignment_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_4)&&fixture_ledger().bytes==sizeof(KuTaskInstance_4));
+    CHECK(assignment_freed(0u)==1u&&assignment_freed(1u)==1u&&assignment_freed(2u)==1u&&assignment_freed(4u)==1u);
+    CHECK(ku_task_control_lease_release(&late)==KU_TASK_CONTROL_OK);
+    if (mode==3u) {
+      CHECK(ku_task_driver_now_ms()==getter_frozen_now&&getter_frozen_now<deadline);
+      CHECK(ku_task_driver_shutdown(&runtime.driver,deadline)==KU_TASK_DRIVER_OK);
+      CHECK(runtime.driver.shutdown_deadline==deadline);
+      ku_task_control_atomic_store(&getter_clock_frozen,0u);
+    }
+    assignment_finish(&runtime); return;
+  }
+  CHECK(ku_test_event_set(&assignment_proceed));
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,assignment_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  assignment_idle(&runtime);
+  CHECK(getter_calls==(mode ? 2u : 3u)&&getter_finally_calls==1u);
+  CHECK(assignment_freed(0u)==1u&&assignment_freed(1u)==1u&&assignment_freed(2u)==1u&&assignment_freed(4u)==1u);
+  CHECK(assignment_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_4)+(mode ? 0u : 1u));
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_4)+(mode ? 0u : 1u));
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(&task,NULL,&output)==KU_TASK_CONTROL_OK);
+  if (mode) CHECK(!output.value.string.ok&&output.value.string.error.message.len==19u&&!memcmp(output.value.string.error.message.ptr,"getter index failed",19u));
+  else CHECK(output.value.string.ok&&output.value.string.value.ptr==getter_allocations[2]&&!output.value.string.value.len&&output.value.string.value.capacity==1u);
+  ku_task_outcome_drop(&output); CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_4));
+  CHECK(ku_task_value_drop(&task,assignment_deadline())==KU_TASK_DRIVER_OK); assignment_finish(&runtime);
+}
+int main(void) {
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u&&KU_TASK_CONTROL_ABI_VERSION==2u&&KU_TASK_DRIVER_ABI_VERSION==10u);
+  getter_string_case(0,0u,0u); getter_string_case(1,0u,0u); getter_string_case(0,1u,0u);
+  getter_string_case(-1,0u,0u); getter_string_case(2,0u,0u);
+  getter_string_case(0,0u,1u); getter_string_case(0,0u,2u);
+  getter_primitive_case(0u,1); getter_primitive_case(0u,-1);
+  getter_primitive_case(1u,1); getter_primitive_case(1u,2);
+  for (unsigned mode=0;mode<4u;mode++) getter_pending_case(mode);
+  puts("array-try-get-owners-ok"); return 0;
+}
+"#;
