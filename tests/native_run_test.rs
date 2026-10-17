@@ -3522,6 +3522,33 @@ async fn ReassignResults(): null! {
     }
     return ok(null)
 }
+async fn RelayRowsResult(values: [str]!): [str]! { time.sleep(0)? return values }
+async fn UseArrayResultParameters(): null! {
+    relay: async fn([str]!): [str]! = RelayRowsResult
+    saved: [str]! = await TextRows()
+    rows = (await relay(saved))?
+    for row in rows { println(row) }
+    try {
+        failed: [str]! = await MissingRows()
+        unused = (await relay(failed))?
+        println("unexpected")
+    } catch (err) { println(err.message) }
+    return ok(null)
+}
+async fn RelayFlagResult(values: [bool]!): [bool]! { return values }
+async fn UseArrayCallableParameters(): null! {
+    selected: async fn([int]): [int]! = ArrayNumbers
+    empty = (await selected([]))?
+    println(empty.is_empty())
+    input = [8, 9]
+    copied = (await selected(input.clone()))?
+    println(input.len())
+    for number in copied { println(number) }
+    stored: [bool]! = await ArrayFlags()
+    flags = (await RelayFlagResult(stored))?
+    for flag in flags { println(flag) }
+    return ok(null)
+}
 async fn EchoText(value: str): str! { time.sleep(0)? return ok(value) }
 async fn StringBasics(): null! {
     text = fs.read("first.txt")?
@@ -3571,11 +3598,13 @@ async fn main(): null! {
     (await ReassignResults())?;
     (await StringBasics())?;
     (await StringJoins())?;
+    (await UseArrayResultParameters())?;
+    (await UseArrayCallableParameters())?;
     return ok(null)
 }
 "#;
     fs::write(dir.join("main.ku"), program).unwrap();
-    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n{first}\nread_failed\n{first}\n乙\n{first}\ntexts-finally\n0\ntexts-finally\n2\ntrue\n{first}\n乙\ntexts-finally\n{first}\n乙\n2\nnew-error\n5\n12\n{first}\n{first}\n0\n0\n\n{first}\n{first}乙\n{first}{first}\nread_failed\n");
+    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n{first}\nread_failed\n{first}\n乙\n{first}\ntexts-finally\n0\ntexts-finally\n2\ntrue\n{first}\n乙\ntexts-finally\n{first}\n乙\n2\nnew-error\n5\n12\n{first}\n{first}\n0\n0\n\n{first}\n{first}乙\n{first}{first}\nread_failed\ntexts-finally\n{first}\n乙\narray-failed\nnumbers-finally\ntrue\nnumbers-finally\n2\n8\n9\ntrue\nfalse\n");
     let mut interpreter = Command::new(ku_binary());
     interpreter.current_dir(dir).args(["run", "main.ku"]);
     let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)

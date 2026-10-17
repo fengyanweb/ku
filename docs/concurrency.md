@@ -172,7 +172,7 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝嵌套数组、数组 Result 形参与 Callable 数组形参、递归、Task/Callable 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、返回函数值、高阶 helper 的函数值绑定、
+仍拒绝嵌套数组、递归、Task/Callable 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、返回函数值、高阶 helper 的函数值绑定、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
 float/混合类型算术、str/null/Result/Task 比较、下述平面数组以外的动态堆表达式，以及下述 sleep/文件读写与 exists 以外的异步标准库 I/O。
 finally 体只接有限 primitive/字符串/Error 操作、Copy 与现有 Owned 值赋值、输出、分支与局部
@@ -246,7 +246,7 @@ vector 按实际 capacity 而非 len 计费；Owned 字符串叶子另外按实�
 快照部分构造即登记到持久 frame，复制失败只释放已完成叶子和 vector，不能提前退款。
 continue 保留快照进入原 latch；break/正常结束释放快照；return/fail/取消沿原清理顺序
 与绝对 D 处理当前元素、快照及来源。循环回边仍有 Suspend，原64槽/16KB frame、分析及
-总字节预算不提高。数组宽度受既有槽位限制；数组 Result 形参、Callable 数组形参、嵌套、push、
+总字节预算不提高。数组宽度受既有槽位限制；嵌套、push、
 索引写入与捕获尚未开放，finally 体中的循环也仍拒绝。参数准入先检查 header、vector
 及活跃字符串叶子的范围与已知别名，再一次累计实际容量；失败不留下部分所有权移交。
 
@@ -288,8 +288,13 @@ async fn main(): null! {
 }
 ```
 
+直接 async 和顶层无捕获 Callable 都接收平面数组及其单层 Result 参数。
+Result 成功分支先验证完整 vector 并计入实际容量，错误分支只处理三个 Error 字符串；
+失活分支不读取。全部参数的基础范围登记后才读取字符串叶子。裸 `[]` 在直接或
+间接数组实参位置使用签名元素类型；`ok([])` 仍需先建立有类型的空数组局部。
+
 函数值参数默认 move；要继续使用原绑定需显式 clone。接收者可 clone、多次只读调用或
-再传给另一直接 async 调用；参数本身的签名限 primitive/对应 Result 形参，允许 primitive
+再传给另一直接 async 调用；参数本身的签名限 primitive、平面数组及各自单层 Result 形参，允许 primitive
 或平面数组 Result 返回。把这种高阶 helper 本身再绑定成函数值、返回函数值或捕获 closure 仍明确拒绝。
 参数之间有 Await 时，前面已选中的函数身份只求值一次，使用原活跃值保存。
 

@@ -273,7 +273,14 @@ fn native_task_frame_ir_wrap_ok_copies_scalars_and_moves_owned_strings_and_array
             accepted(&fixture);
             fixture.functions[0].states[0].operations.clear();
             fixture.functions[0].parameters.push(SlotId(1));
-            rejected(&fixture, "Result<Array> parameters remain outside the ABI");
+            accepted(&fixture);
+            if let TaskSlotType::Value { borrowed, .. } = &mut fixture.functions[0].slots[1].ty {
+                *borrowed = true;
+            }
+            rejected(
+                &fixture,
+                "Result<Array> parameters must own their active payload",
+            );
         }
     }
 }

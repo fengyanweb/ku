@@ -625,9 +625,7 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
                 TaskSlotType::Task { result } => result_type(result),
                 TaskSlotType::Callable { parameters, result } => {
                     parameters.len() <= limits.max_slots
-                        && parameters
-                            .iter()
-                            .all(|ty| value_type(ty) && !flat_array(ty) && !array_result(ty))
+                        && parameters.iter().all(value_type)
                         && result_type(result)
                 }
             };
@@ -831,9 +829,6 @@ fn validate_shape(
     }
     for &parameter in &function.parameters {
         match &get_slot(parameter)?.ty {
-            TaskSlotType::Value { ty, .. } if array_result(ty) => {
-                return Err(invalid("Result of array parameters are unsupported"));
-            }
             TaskSlotType::Value {
                 borrowed: false, ..
             } => {}

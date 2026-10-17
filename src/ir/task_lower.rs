@@ -68,7 +68,7 @@ fn result_payload(ty: &TypeName) -> Option<IrType> {
 }
 
 fn value_type(ty: &TypeName, span: Span) -> KuResult<IrType> {
-    if let Some(ty) = primitive(ty) {
+    if let Some(ty) = result_payload(ty) {
         return Ok(ty);
     }
     if let TypeName::Result(inner) = ty {
@@ -119,23 +119,10 @@ fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
         return Ok(TaskSlotType::Callable {
             parameters: params
                 .iter()
-                .map(|ty| {
-                    let ty = value_type(ty, span)?;
-                    if task::array_result(&ty) {
-                        return Err(unsupported("Result of array callable parameters", span));
-                    }
-                    Ok(ty)
-                })
+                .map(|ty| value_type(ty, span))
                 .collect::<KuResult<_>>()?,
             result,
         });
-    }
-    if let TypeName::Array(inner) = ty {
-        if let Some(element) =
-            primitive(inner).filter(|ty| matches!(ty, IrType::Int | IrType::Bool | IrType::Str))
-        {
-            return Ok(value_slot(IrType::Array(Box::new(element))));
-        }
     }
     Ok(value_slot(value_type(ty, span)?))
 }
@@ -303,9 +290,6 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
                     .ok_or_else(|| unsupported("untyped async parameters", parameter.span))?,
                 parameter.span,
             )?;
-            if matches!(&parameter_type, TaskSlotType::Value { ty, .. } if task::array_result(ty)) {
-                return Err(unsupported("Result of array parameters", parameter.span));
-            }
             parameters.push(parameter_type);
         }
         let id = TaskFunctionId(declarations.len());
@@ -1032,9 +1016,6 @@ impl<'a> FunctionLowerer<'a> {
                     span,
                 ));
             };
-            if task::flat_array(&ty) || task::array_result(&ty) {
-                return Err(unsupported("array parameters in a callable value", span));
-            }
             parameters.push(ty);
         }
         let slot = self.slot(TaskSlotType::Callable {
@@ -1507,8 +1488,9 @@ impl<'a> FunctionLowerer<'a> {
         }
         let mut arguments = Vec::new();
         for (argument, expected) in args.iter().zip(parameters) {
-            let value = self.expression(argument, depth + 1)?;
-            if self.function.slots[value.0].ty != value_slot(expected.clone()) {
+            let expected = value_slot(expected.clone());
+            let value = self.direct_argument_expression(argument, &expected, depth + 1)?;
+            if self.function.slots[value.0].ty != expected {
                 return Err(unsupported(
                     "mismatched async argument types",
                     argument.span,

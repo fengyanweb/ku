@@ -446,14 +446,124 @@ fn native_task_start_await_ir_start_checks_signatures_duplicates_and_empty_desti
 
 #[test]
 fn native_task_start_await_ir_single_result_arguments_are_owned_even_when_ok_is_copy() {
-    let ty = result(IrType::Int);
-    let mut program = signature_program(ty.clone(), &[0, 1]);
-    program.functions[0].slots.insert(1, value(ty));
-    program.functions[0].parameters = vec![SlotId(0), SlotId(1)];
-    program.functions[0].states[0] = state(vec![start(2, 9, &[0, 1]), null_result(3)], done(3));
-    accepted(&program);
-    program.functions[0].states[0].operations.insert(1, read(0));
-    rejected(&program, "not definitely initialized");
+    for ty in [
+        result(IrType::Int),
+        IrType::Array(Box::new(IrType::Int)),
+        IrType::Array(Box::new(IrType::Bool)),
+        IrType::Array(Box::new(IrType::Str)),
+        result(IrType::Array(Box::new(IrType::Int))),
+        result(IrType::Array(Box::new(IrType::Bool))),
+        result(IrType::Array(Box::new(IrType::Str))),
+    ] {
+        let mut program = signature_program(ty.clone(), &[0, 1]);
+        program.functions[0].slots.insert(1, value(ty));
+        program.functions[0].parameters = vec![SlotId(0), SlotId(1)];
+        program.functions[0].states[0] = state(vec![start(2, 9, &[0, 1]), null_result(3)], done(3));
+        accepted(&program);
+        program.functions[0].states[0].operations.insert(1, read(0));
+        rejected(&program, "not definitely initialized");
+    }
+}
+
+#[test]
+fn native_task_start_await_ir_array_callable_signatures_keep_exact_targets_and_owned_moves() {
+    for element in [IrType::Int, IrType::Bool, IrType::Str] {
+        for wrapped in [false, true] {
+            let array = IrType::Array(Box::new(element.clone()));
+            let ty = if wrapped { result(array) } else { array };
+            let mut program = TaskProgram {
+                functions: vec![
+                    TaskFunction {
+                        id: TaskFunctionId(0),
+                        name: "ArrayCaller".into(),
+                        slots: vec![
+                            value(ty.clone()),
+                            TaskSlot {
+                                ty: TaskSlotType::Callable {
+                                    parameters: vec![ty.clone()],
+                                    result: result(IrType::Null),
+                                },
+                            },
+                            task(IrType::Null),
+                            value(result(IrType::Null)),
+                        ],
+                        parameters: vec![SlotId(0)],
+                        entry: StateId(0),
+                        result: result(IrType::Null),
+                        states: vec![state(
+                            vec![
+                                TaskOp::InitCallable {
+                                    dst: SlotId(1),
+                                    function: TaskFunctionId(9),
+                                },
+                                TaskOp::StartIndirect {
+                                    dst: SlotId(2),
+                                    callee: SlotId(1),
+                                    arguments: vec![SlotId(0)],
+                                },
+                                drop(1),
+                                null_result(3),
+                            ],
+                            done(3),
+                        )],
+                    },
+                    TaskFunction {
+                        id: TaskFunctionId(9),
+                        name: "ArrayCallee".into(),
+                        slots: vec![value(ty.clone()), value(result(IrType::Null))],
+                        parameters: vec![SlotId(0)],
+                        entry: StateId(0),
+                        result: result(IrType::Null),
+                        states: vec![state(vec![drop(0), null_result(1)], done(1))],
+                    },
+                ],
+            };
+            let plan = accepted(&program);
+            assert_eq!(
+                plan.functions[0].indirect_calls[0].targets,
+                vec![TaskFunctionId(9)]
+            );
+            assert_eq!(plan.functions[0].scope_task_mask, 1u64 << 2);
+            let mut invalid = program.clone();
+            invalid.functions[0].states[0].operations.insert(2, read(0));
+            rejected(&invalid, "not definitely initialized");
+            let mut invalid = program.clone();
+            if let TaskSlotType::Callable { parameters, .. } = &mut invalid.functions[0].slots[1].ty
+            {
+                parameters[0] = IrType::Int;
+            }
+            assert!(
+                verify_and_plan(&invalid, TaskLimits::default()).is_err(),
+                "array Callable target must match the complete signature"
+            );
+            let mut invalid = program.clone();
+            invalid.functions[0].states[0].operations[0] = TaskOp::InitCallable {
+                dst: SlotId(1),
+                function: TaskFunctionId(555),
+            };
+            assert!(
+                verify_and_plan(&invalid, TaskLimits::default()).is_err(),
+                "a supported array signature must not admit an unknown ID"
+            );
+            let mut invalid = program.clone();
+            if let TaskOp::StartIndirect { arguments, .. } =
+                &mut invalid.functions[0].states[0].operations[1]
+            {
+                arguments.clear();
+            }
+            assert!(
+                verify_and_plan(&invalid, TaskLimits::default()).is_err(),
+                "indirect array calls retain exact arity"
+            );
+            if let TaskSlotType::Value { borrowed, .. } = &mut program.functions[0].slots[0].ty {
+                *borrowed = true;
+            }
+            assert!(
+                verify_and_plan(&program, TaskLimits::default()).is_err(),
+                "array arguments cannot carry borrowed headers into a child"
+            );
+        }
+    }
 }
 
 #[test]

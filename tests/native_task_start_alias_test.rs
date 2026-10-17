@@ -35,13 +35,17 @@ async fn Parent(value: str): str! { child = Child(value) return await child }
 async fn Child(value: str): str! { return ok(value) }
 async fn Number(value: int): int! { return ok(value) }
 async fn main(): null! { return ok(null) }
+async fn Wrapped(value: [str]!): [str]! { return value }
 "#;
     let ast = Parser::new(Lexer::new(source).lex().unwrap())
         .parse_program()
         .unwrap();
     Checker::new().check(&ast).unwrap();
     let native = task_lower::lower_program(&ast).unwrap();
-    for (index, name) in ["Parent", "Child", "Number", "main"].iter().enumerate() {
+    for (index, name) in ["Parent", "Child", "Number", "main", "Wrapped"]
+        .iter()
+        .enumerate()
+    {
         assert_eq!(native.tasks.functions[index].name, *name);
     }
     let awaits: Vec<_> = native.tasks.functions[0]
@@ -167,6 +171,37 @@ static void fixture_value_empty(KuTaskValueV1* output) {
   CHECK(!output->tag && !output->result_kind && !output->function_id && !output->rejection_code);
   CHECK(!output->owner.lease.control); fixture_ticket_empty(&output->ticket);
 }
+static void fixture_result_array_aliases(KuTaskInstance_0* instance) {
+  KuTaskDriverV1* driver=instance->ticket.driver;
+  uint8_t* pointer=instance->frame.s_0.ptr;
+  for (unsigned variant=0;variant<5u;variant++) {
+    KuString vector[2]={{pointer,1u,1u,KU_STRING_OWNED},{0}};
+    KuString poison={(uint8_t*)(uintptr_t)1u,SIZE_MAX,SIZE_MAX,KU_STRING_OWNED};
+    KuResult_array_str input={true,{1u,vector,2u},{poison,poison,poison}};
+    KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance)};
+    KuTaskValueV1 output={0}; KuTaskValueV1* destination=&output;
+    if (variant==0u) input.value=(KuArray_str){1u,(KuString*)&instance->ticket,1u};
+    else if (variant==1u) host.ticket=(const KuTaskDriverTicketV1*)pointer;
+    else if (variant==3u) destination=(KuTaskValueV1*)&vector[1];
+    else if (variant==4u) {
+      input.ok=false; input.value=(KuArray_str){SIZE_MAX,(KuString*)(uintptr_t)1u,SIZE_MAX};
+      input.error=(KuError){vector[0],ku_string_static((const uint8_t*)"c",1u),ku_string_static((const uint8_t*)"m",1u)};
+      host.ticket=(const KuTaskDriverTicketV1*)pointer;
+    }
+    KuResult_array_str saved; memcpy(&saved,&input,sizeof(saved));
+    KuString saved_vector[2]; memcpy(saved_vector,vector,sizeof(vector));
+    KuTaskAdapterHostV1 saved_host; memcpy(&saved_host,&host,sizeof(host));
+    FixtureAccount before=fixture_account(driver); FixtureLedger ledger=fixture_ledger();
+    // Vector/ticket overlap must reject before reading a KuString from the
+    // smaller mapped ticket. The other probes use the real one-byte owner.
+    CHECK(ku_task_4_start_hosted(variant==2u ? (const KuTaskAdapterHostV1*)vector : &host,
+        &input,destination)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+    CHECK(!memcmp(&input,&saved,sizeof(saved))&&!memcmp(vector,saved_vector,sizeof(vector)));
+    CHECK(!memcmp(&host,&saved_host,sizeof(host))); fixture_value_empty(&output);
+    FixtureLedger after=fixture_ledger(); CHECK(after.calls==ledger.calls&&after.allocations==ledger.allocations&&after.bytes==ledger.bytes);
+    fixture_same(driver,&before,0); fixture_string_unchanged(&instance->frame.s_0,pointer);
+  }
+}
 static void fixture_start_aliases(KuTaskInstance_0* instance) {
   KuTaskDriverV1* driver=instance->ticket.driver;
   KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance)};
@@ -209,6 +244,7 @@ static void fixture_start_aliases(KuTaskInstance_0* instance) {
   CHECK(ku_task_1_start_value_impl(driver,(const KuTaskDriverStartChargeV1*)driver,input,&output)==KU_TASK_DRIVER_INVALID_ARGUMENT);
   fixture_same(driver,&before,0); fixture_string_unchanged(input,pointer);
   fixture_value_empty(&output);
+  fixture_result_array_aliases(instance);
 }
 static void fixture_reserve_rejections(KuTaskInstance_0* instance) {
   KuTaskDriverV1* driver=instance->ticket.driver;

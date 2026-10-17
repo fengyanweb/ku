@@ -104,13 +104,27 @@ fn native_task_start_charge_multihop_active_results_and_late_observers_execute_i
             "string_array",
             3,
         ),
+        (
+            9,
+            "[str]!",
+            "[str]!",
+            "return value",
+            "KuResult_array_str",
+            "string_array",
+            2,
+        ),
     ] {
         let parent_return = if index >= 6 {
             "return ok((await child)?)"
         } else {
             "return await child"
         };
-        let source = format!("async fn Parent(value: {parameter}): {result} {{ child = Child(value) {parent_return} }}\nasync fn Child(value: {parameter}): {result} {{ child = Grandchild(value) return await child }}\nasync fn Grandchild(value: {parameter}): {result} {{ {leaf} }}\nasync fn main(): null! {{ return ok(null) }}");
+        let child_start = if index == 9 {
+            "target: async fn([str]!): [str]! = Child; child=target(value)"
+        } else {
+            "child=Child(value)"
+        };
+        let source = format!("async fn Parent(value: {parameter}): {result} {{ {child_start} {parent_return} }}\nasync fn Child(value: {parameter}): {result} {{ child = Grandchild(value) return await child }}\nasync fn Grandchild(value: {parameter}): {result} {{ {leaf} }}\nasync fn main(): null! {{ return ok(null) }}");
         let ast = Parser::new(Lexer::new(&source).lex().unwrap())
             .parse_program()
             .unwrap();
@@ -206,7 +220,14 @@ static uint32_t ku_task_driver_commit_child(const KuTaskDriverTicketV1* ticket,
   CHECK(parent->state==KU_TASK_DRIVER_RUNNING && child->state==KU_TASK_DRIVER_BUILDING);
   CHECK(source->owned_bytes==fixture_expected_charge && child->charged_bytes==instance_bytes);
   CHECK(parent->charged_bytes==source->minimum_parent_bytes+fixture_expected_charge);
-#if FIXTURE_KIND>=3
+#if FIXTURE_KIND==9
+  const KuResult_array_str* parameter=fixture_starts ? &((KuTaskInstance_2*)owner->lease.control)->frame.s_0
+      : &((KuTaskInstance_1*)owner->lease.control)->frame.s_0;
+  CHECK(parameter->ok==!fixture_mode);
+  if (parameter->ok) CHECK((uintptr_t)parameter->value.data==fixture_vector);
+  else CHECK(parameter->error.domain.ptr==fixture_buffers[0]&&parameter->error.code.ptr==fixture_buffers[1]
+      &&parameter->error.message.ptr==fixture_buffers[2]);
+#elif FIXTURE_KIND>=3
   CHECK((uintptr_t)(fixture_starts ? ((KuTaskInstance_2*)owner->lease.control)->frame.s_0.data
       : ((KuTaskInstance_1*)owner->lease.control)->frame.s_0.data)==fixture_vector);
 #endif
@@ -349,23 +370,33 @@ static FixtureInput fixture_input(int mode) {
   memset(fixture_buffers,0,sizeof(fixture_buffers));
 #if FIXTURE_KIND>=3
   FixtureInput input={0};
+#if FIXTURE_KIND==9
+  input.ok=mode==0; input.error=fixture_error(!input.ok);
+  if (!input.ok) {
+    input.value=(KuArray_str){SIZE_MAX,(KuString*)(uintptr_t)1u,SIZE_MAX};
+    return input;
+  }
+  KuArray_str* array=&input.value;
+#else
   if (mode==1) return input;
-  input.capacity=4u; input.len=(FIXTURE_KIND==5 || FIXTURE_KIND==8) ? 3u : 2u;
-  input.data=calloc(input.capacity,sizeof(*input.data)); CHECK(input.data);
-  fixture_vector=(uintptr_t)input.data;
-  fixture_buffers[0]=(uint8_t*)input.data; fixture_buffers_count=1u;
-  fixture_expected_charge=input.capacity*sizeof(*input.data);
+  FixtureInput* array=&input;
+#endif
+  array->capacity=4u; array->len=(FIXTURE_KIND==5 || FIXTURE_KIND==8 || FIXTURE_KIND==9) ? 3u : 2u;
+  array->data=calloc(array->capacity,sizeof(*array->data)); CHECK(array->data);
+  fixture_vector=(uintptr_t)array->data;
+  fixture_buffers[0]=(uint8_t*)array->data; fixture_buffers_count=1u;
+  fixture_expected_charge=array->capacity*sizeof(*array->data);
 #if FIXTURE_KIND==3 || FIXTURE_KIND==6
-  input.data[0]=17; input.data[1]=-9;
+  array->data[0]=17; array->data[1]=-9;
 #elif FIXTURE_KIND==4 || FIXTURE_KIND==7
-  input.data[0]=true; input.data[1]=false;
+  array->data[0]=true; array->data[1]=false;
 #else
   if (mode==2) {
-    input.len=2u; input.data[0]=ku_string_static((const uint8_t*)"static",6u); input.data[1]=input.data[0];
+    array->len=2u; array->data[0]=ku_string_static((const uint8_t*)"static",6u); array->data[1]=array->data[0];
   } else {
-    input.data[0]=fixture_owned(1,31u,"payload");
-    input.data[1]=fixture_owned(2,0u,"");
-    input.data[2]=ku_string_static((const uint8_t*)"\xe4\xb8\xad",3u);
+    array->data[0]=fixture_owned(1,31u,"payload");
+    array->data[1]=fixture_owned(2,0u,"");
+    array->data[2]=ku_string_static((const uint8_t*)"\xe4\xb8\xad",3u);
   }
 #endif
   return input;
@@ -386,16 +417,30 @@ static FixtureInput fixture_input(int mode) {
 }
 static void fixture_validate(KuTaskAdapterOutcomeV1* output,int mode) {
   CHECK(output->exit_class==KU_TASK_EXIT_USER_RESULT && !output->has_cleanup_deadline && !output->cleanup_deadline);
+#if FIXTURE_KIND==9
+  if (mode) {
+    KuError error=output->value.string_array.error;
+    CHECK(output->result_kind==7u&&!output->value.string_array.ok);
+    CHECK(error.domain.ptr==fixture_buffers[0]&&error.code.ptr==fixture_buffers[1]&&error.message.ptr==fixture_buffers[2]);
+    CHECK(error.domain.capacity==7u&&error.code.capacity==11u&&error.message.capacity==13u);
+    CHECK(error.domain.ptr[0]=='d'&&error.code.ptr[0]=='c'&&error.message.ptr[0]=='m');
+    return;
+  }
+#endif
 #if FIXTURE_KIND>=6
-  CHECK(output->result_kind==FIXTURE_KIND-1u && output->value.@OUTPUT@.ok);
+  CHECK(output->result_kind==(FIXTURE_KIND==9 ? 7u : FIXTURE_KIND-1u) && output->value.@OUTPUT@.ok);
 #elif FIXTURE_KIND==2 || FIXTURE_KIND>=3
   CHECK(output->result_kind==1u);
 #else
   CHECK(output->result_kind==4u);
 #endif
 #if FIXTURE_KIND>=6
+#if FIXTURE_KIND==9
+  KuArray_str value=output->value.@OUTPUT@.value;
+#else
   FixtureInput value=output->value.@OUTPUT@.value;
-  CHECK(value.len==(mode==1 ? 0u : FIXTURE_KIND==8 && mode==0 ? 3u : 2u));
+#endif
+  CHECK(value.len==(mode==1 ? 0u : (FIXTURE_KIND==8 || FIXTURE_KIND==9) && mode==0 ? 3u : 2u));
   CHECK((uintptr_t)value.data==fixture_vector && value.capacity==(mode==1 ? 0u : 4u));
   if (mode!=1) {
 #if FIXTURE_KIND==6
@@ -464,7 +509,10 @@ static void fixture_case(int mode) {
   KuTaskValueV1 root={0};
   size_t before_calls=fixture_ledger().calls;
   CHECK(ku_task_0_start_value(driver,&input,&root)==KU_TASK_DRIVER_OK && root.tag==KU_TASK_VALUE_LIVE);
-#if FIXTURE_KIND>=3
+#if FIXTURE_KIND==9
+  CHECK(!input.ok&&!input.value.data&&!input.value.len&&!input.value.capacity);
+  CHECK(!input.error.domain.ptr&&!input.error.code.ptr&&!input.error.message.ptr);
+#elif FIXTURE_KIND>=3
   CHECK(!input.data && !input.len && !input.capacity);
 #elif FIXTURE_KIND==0
   CHECK(!input.ptr && !input.len && !input.capacity && !input.storage);

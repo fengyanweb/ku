@@ -1192,6 +1192,56 @@ async fn main(): null! {
     ] {
         run_case_with_workers(1500 + index, source, output, None, Some(1));
     }
+    for (index, element, literal, printed) in [
+        (0, "int", "7,9", "7\n9"),
+        (1, "bool", "true,false", "true\nfalse"),
+        (2, "str", "\"中\",\"😀\"", "中\n😀"),
+    ] {
+        let source = format!(
+            r#"
+async fn Keep(values: [{element}]): [{element}]! {{ return ok(values) }}
+async fn Leaf(values: [{element}]!): [{element}]! {{ return values }}
+async fn Forward(values: [{element}]!): [{element}]! {{ return await Leaf(values) }}
+async fn Broken(): [{element}]! {{ fail "array input failed" }}
+async fn Okay(): null! {{
+    values=[{literal}]
+    selected: async fn([{element}]): [{element}]! = Keep
+    echoed=(await selected(values.clone()))?
+    println(values.len())
+    forward: async fn([{element}]!): [{element}]! = Forward
+    saved=ok(echoed)
+    received=(await forward(saved))?
+    for item in received {{ println(item) }}
+    return ok(null)
+}}
+async fn Empty(): null! {{
+    selected: async fn([{element}]): [{element}]! = Keep
+    bare=(await selected([]))?
+    println(bare.len())
+    typed: [{element}]=[]
+    saved=ok(typed)
+    empty=(await Forward(saved))?
+    println(empty.len())
+    return ok(null)
+}}
+async fn Failure(): null! {{
+    selected: async fn([{element}]!): [{element}]! = Forward
+    saved=await Broken()
+    try {{ values=(await selected(saved))? println(values.len()) }}
+    catch (problem) {{ println(problem.message) }}
+    return ok(null)
+}}
+async fn main(): null! {{
+    (await Okay())?;
+    (await Empty())?;
+    (await Failure())?;
+    return ok(null)
+}}
+"#
+        );
+        let output = format!("2\n{printed}\n0\n0\narray input failed\n");
+        run_case_with_workers(1520 + index, &source, &output, None, Some(1));
+    }
 }
 
 #[test]

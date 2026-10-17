@@ -1648,6 +1648,13 @@ async fn main(): null! { total=(await Inspect())? return ok(null) }
             .iter()
             .flat_map(|function| &function.states)
             .any(|state| matches!(state.terminator, TaskTerminator::TryResult { .. })));
+        let source=format!("async fn Lift(values: [{element}]): [{element}]! {{ return ok(values) }} async fn Forward(values: [{element}]!): [{element}]! {{ return values }} async fn main(): null! {{ bare: async fn([{element}]): [{element}]! = Lift wrapped: async fn([{element}]!): [{element}]! = Forward empty=(await bare([]))? values=[{literal}] received=(await wrapped(ok(values.clone())))? println(values.len()) println(received.len()+empty.len()) return ok(null) }}");
+        let admitted = task_lower::lower_program(&checked(&source)).unwrap();
+        let plan = task::verify_and_plan(&admitted.tasks, TaskLimits::default()).unwrap();
+        let calls = &plan.functions[admitted.entry.0].indirect_calls;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].targets, vec![task::TaskFunctionId(0)]);
+        assert_eq!(calls[1].targets, vec![task::TaskFunctionId(1)]);
     }
     let indirect = checked("async fn Text(flag: bool): [str]! { if (flag) { return ok([\"Ku\"]) } empty: [str]=[] return ok(empty) } async fn main(): null! { selected: async fn(bool): [str]! = Text values=(await selected(true))? for value in values { println(value) } return ok(null) }");
     let indirect = task_lower::lower_program(&indirect).unwrap();
@@ -1661,11 +1668,11 @@ async fn main(): null! { total=(await Inspect())? return ok(null) }
         .any(|op| matches!(op, TaskOp::StartIndirect { .. })));
     for source in [
         "async fn Bad(values: [[int]]): int! { return ok(1) } async fn main(): null! { return ok(null) }",
-        "async fn Bad(call: async fn([int]): int!): int! { return ok(1) } async fn main(): null! { return ok(null) }",
+        "async fn Bad(call: async fn([[int]]): int!): int! { return ok(1) } async fn main(): null! { return ok(null) }",
         "async fn Bad(): [[int]]! { return ok([[1]]) } async fn main(): null! { return ok(null) }",
-        "async fn Bad(values: [int]!): int! { return ok(1) } async fn main(): null! { return ok(null) }",
+        "async fn Bad(values: [[int]]!): int! { return ok(1) } async fn main(): null! { return ok(null) }",
         "async fn main(): null! { values=[[1]] return ok(null) }",
-        "async fn Child(values: [int]): int! { return ok(values.len()) } async fn main(): null! { selected=Child total=(await selected([1]))? println(total) return ok(null) }",
+        "async fn Child(values: [[int]]): int! { return ok(values.len()) } async fn main(): null! { selected=Child total=(await selected([[1]]))? println(total) return ok(null) }",
     ] { assert!(task_lower::lower_program(&checked(source)).is_err()); }
     let borrowed = parsed("async fn Bad(&values: [int]): int! { return ok(values.len()) } async fn main(): null! { return ok(null) }");
     assert!(task_lower::lower_program(&borrowed).is_err());

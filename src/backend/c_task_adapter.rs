@@ -204,6 +204,28 @@ fn parameter_drop(ty: &TaskSlotType, place: &str) -> KuResult<String> {
     }
 }
 
+// Parameter arrays have one fixed vector layer, optionally behind one Result.
+// The bool describes the generated active-branch guard, not another traversal.
+fn parameter_array(ty: &TaskSlotType) -> Option<(&IrType, bool)> {
+    let TaskSlotType::Value {
+        ty,
+        borrowed: false,
+    } = ty
+    else {
+        return None;
+    };
+    match ty {
+        IrType::Array(element) if crate::ir::task::flat_array(ty) => Some((element, false)),
+        IrType::Result(inner) if crate::ir::task::flat_array(inner) => {
+            let IrType::Array(element) = inner.as_ref() else {
+                unreachable!()
+            };
+            Some((element, true))
+        }
+        _ => None,
+    }
+}
+
 fn array_input_guard(
     id: &str,
     parameters: &[(usize, &TaskSlotType)],
@@ -225,7 +247,11 @@ fn array_input_guard(
         })
         .sum::<usize>()
         .max(1);
-    let vector_capacity=parameters.iter().filter(|(_,ty)|matches!(ty,TaskSlotType::Value {ty:IrType::Array(inner),..} if inner.as_ref()==&IrType::Str)).count().max(1);
+    let vector_capacity = parameters
+        .iter()
+        .filter(|(_, ty)| parameter_array(ty).is_some_and(|(element, _)| element == &IrType::Str))
+        .count()
+        .max(1);
     let mut code=format!("static uint32_t ku_task_{id}_inputs(KuTaskDriverV1* driver,const KuTaskAdapterBufferV1* extra,size_t extra_count,int read_leaves{declarations},size_t* owned_bytes) {{\n  KuTaskAdapterBufferV1 base[{range_capacity}]={{0}},headers[{}]={{0}};\n  KuTaskAdapterStringVectorV1 vectors[{vector_capacity}]={{0}};\n  size_t base_count=0,vector_count=0,total=0; uint32_t checked=KU_TASK_DRIVER_OK;\n",parameters.len().max(1));
     for index in 0..parameters.len() {
         code.push_str(&format!(
@@ -234,19 +260,37 @@ fn array_input_guard(
     }
     let validate_base=format!("  checked=ku_task_adapter_buffer_excludes(base[base_count-1u],headers,{}u,extra,extra_count,driver); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  for (size_t prior=0;prior+1u<base_count;prior++) if (ku_task_adapter_buffers_overlap(base[base_count-1u],base[prior])) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n",parameters.len());
     for (index, (_, ty)) in parameters.iter().enumerate() {
-        if let TaskSlotType::Value {
-            ty: IrType::Array(element),
-            ..
-        } = ty
-        {
+        let register_string = |leaf: &str| {
+            format!("  checked=ku_task_adapter_string_charge({leaf},&total); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  base[base_count++]=ku_task_adapter_string_buffer({leaf});\n{validate_base}")
+        };
+        if let Some((element, result)) = parameter_array(ty) {
             let element_c = c_type(element)?;
-            code.push_str(&format!("  checked=ku_task_adapter_array_buffer(arg_{index}->data,arg_{index}->len,arg_{index}->capacity,sizeof({element_c}),KU_TASK_FRAME_ALIGNOF({element_c}),&base[base_count]); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  if (base[base_count].bytes>SIZE_MAX-total) return KU_TASK_DRIVER_LIMIT; total+=base[base_count++].bytes;\n"));
+            let place = if result {
+                code.push_str(&format!("  if (arg_{index}->ok) {{\n"));
+                format!("arg_{index}->value")
+            } else {
+                format!("(*arg_{index})")
+            };
+            // Read only the active vector header. Its complete allocation is
+            // excluded from known ranges before any string leaf is inspected.
+            code.push_str(&format!("  checked=ku_task_adapter_array_buffer(({place}).data,({place}).len,({place}).capacity,sizeof({element_c}),KU_TASK_FRAME_ALIGNOF({element_c}),&base[base_count]); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  if (base[base_count].bytes>SIZE_MAX-total) return KU_TASK_DRIVER_LIMIT; total+=base[base_count++].bytes;\n"));
             code.push_str(&validate_base);
-            if element.as_ref() == &IrType::Str {
-                code.push_str(&format!("  vectors[vector_count++]=(KuTaskAdapterStringVectorV1){{arg_{index}->data,arg_{index}->len}};\n"));
+            if element == &IrType::Str {
+                code.push_str(&format!("  vectors[vector_count++]=(KuTaskAdapterStringVectorV1){{({place}).data,({place}).len}};\n"));
+            }
+            if result {
+                code.push_str("  } else {\n");
+                for field in ["domain", "code", "message"] {
+                    code.push_str(&register_string(&format!("arg_{index}->error.{field}")));
+                }
+                code.push_str("  }\n");
             }
         } else {
-            code.push_str(&parameter_strings(ty,&format!("(*arg_{index})"),&|leaf|format!("  checked=ku_task_adapter_string_charge({leaf},&total); if (checked!=KU_TASK_DRIVER_OK) return checked;\n  base[base_count++]=ku_task_adapter_string_buffer({leaf});\n{validate_base}")));
+            code.push_str(&parameter_strings(
+                ty,
+                &format!("(*arg_{index})"),
+                &register_string,
+            ));
         }
     }
     code.push_str(&format!("  for (size_t i=0;i<base_count;i++) {{\n    checked=ku_task_adapter_buffer_excludes(base[i],headers,{}u,extra,extra_count,driver); if (checked!=KU_TASK_DRIVER_OK) return checked;\n    for (size_t j=0;j<i;j++) if (ku_task_adapter_buffers_overlap(base[i],base[j])) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  }}\n",parameters.len()));
@@ -276,8 +320,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             TaskSlotType::Value {
                 ty,
                 borrowed: false,
-            } if (supported_type(ty) && !crate::ir::task::array_result(ty))
-                || crate::ir::task::flat_array(ty) => {}
+            } if supported_type(ty) || crate::ir::task::flat_array(ty) => {}
             TaskSlotType::Callable { .. } => {}
             _ => return Err(unsupported("native task adapter parameter is unsupported")),
         }
@@ -459,7 +502,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     }
     let has_array_parameters = parameters
         .iter()
-        .any(|(_, ty)| matches!(ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty)));
+        .any(|(_, ty)| parameter_array(ty).is_some());
     let mut hosted_runtime_inputs = String::new();
     if has_array_parameters {
         out.push_str(&array_input_guard(&id, &parameters, &declarations)?);

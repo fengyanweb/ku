@@ -185,6 +185,7 @@ async fn Inspect(numbers: [int], flags: [bool], texts: [str]): int! {
     return ok(numbers.len()+flags.len()+texts.len())
 }
 async fn main(): null! { return ok(null) }
+async fn Wrapped(value: [str]!): [str]! { return value }
 "#;
     let ast = Parser::new(Lexer::new(source).lex().unwrap())
         .parse_program()
@@ -192,8 +193,10 @@ async fn main(): null! { return ok(null) }
     Checker::new().check(&ast).unwrap();
     let mut native = task_lower::lower_program(&ast).unwrap();
     move_to_slot_63(&mut native.tasks.functions[0], SlotId(2));
+    move_to_slot_63(&mut native.tasks.functions[2], SlotId(0));
     let plan = task::verify_and_plan(&native.tasks, Default::default()).unwrap();
     assert!(plan.functions[0].slots.contains(&SlotId(63)));
+    assert!(plan.functions[2].slots.contains(&SlotId(63)));
     let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
     assert!(!generated.contains("run_source") && !generated.contains("const SOURCE"));
     let instrumentation = format!("{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic int array_fail_calloc;\nstatic void* array_calloc(size_t count,size_t bytes) {{ if (array_fail_calloc) {{ array_fail_calloc=0; return NULL; }} return fixture_calloc(count,bytes); }}\n#undef calloc\n#define calloc array_calloc\n");
@@ -686,6 +689,20 @@ static ArrayParameterInputs array_expected;
 static ArrayParameterInputs* array_source;
 static unsigned array_fail_commit,array_commits,array_rejections;
 static uintptr_t array_leaf[2];
+static unsigned array_wrapped;
+static KuResult_array_str array_wrapped_expected,*array_wrapped_source;
+static size_t array_wrapped_charge;
+static void array_wrapped_same(const KuResult_array_str* value,const KuResult_array_str* expected) {
+  CHECK(value->ok==expected->ok&&value->value.data==expected->value.data
+      &&value->value.len==expected->value.len&&value->value.capacity==expected->value.capacity);
+  const KuString actual[3]={value->error.domain,value->error.code,value->error.message};
+  const KuString wanted[3]={expected->error.domain,expected->error.code,expected->error.message};
+  for (unsigned i=0;i<3u;i++) CHECK(actual[i].ptr==wanted[i].ptr&&actual[i].len==wanted[i].len
+      &&actual[i].capacity==wanted[i].capacity&&actual[i].storage==wanted[i].storage);
+}
+static void array_wrapped_empty(const KuResult_array_str* value) {
+  KuResult_array_str empty={0}; array_wrapped_same(value,&empty);
+}
 static uint64_t array_deadline(void) {
   uint64_t now=ku_task_driver_now_ms(); CHECK(now!=UINT64_MAX && now<UINT64_MAX-2000u);
   return now+2000u;
@@ -747,6 +764,15 @@ static void array_finish(ArrayParameterRuntime* runtime) {
 static uint32_t ku_task_driver_commit(const KuTaskDriverTicketV1* ticket,
     KuTaskControlOwnerV1* owner,uint32_t mode,uint64_t deadline) {
   CHECK(mode==KU_TASK_DRIVER_START); array_commits++;
+  if (array_wrapped) {
+    KuTaskInstance_2* instance=(KuTaskInstance_2*)owner->lease.control;
+    CHECK(instance->frame.header.initialized==(UINT64_C(1)<<63));
+    array_wrapped_same(&instance->frame.s_63,&array_wrapped_expected); array_wrapped_empty(array_wrapped_source);
+    CHECK(!ku_task_driver_lock(ticket->driver)); KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+    CHECK(slot&&slot->charged_bytes==sizeof(*instance)+array_wrapped_charge); CHECK(!ku_task_driver_unlock(ticket->driver));
+    KuTaskDriverTicketV1 stale=*ticket; stale.generation++;
+    return array_real_commit(array_fail_commit ? &stale : ticket,owner,mode,deadline);
+  }
   KuTaskInstance_0* instance=(KuTaskInstance_0*)owner->lease.control;
   CHECK(instance->frame.header.initialized==(UINT64_C(3)|(UINT64_C(1)<<63)));
   CHECK(instance->frame.s_0.data==array_expected.numbers.data && instance->frame.s_0.capacity==4u);
@@ -895,9 +921,102 @@ static void array_rejected_value(unsigned mode) {
   CHECK(ku_task_value_drop(&value,array_deadline())==KU_TASK_DRIVER_OK);
   array_finish(&runtime);
 }
+static KuResult_array_str array_wrapped_input(unsigned error) {
+  KuResult_array_str value={0}; value.ok=!error;
+  if (!error) {
+    ArrayParameterInputs bare=array_input(); value.value=bare.texts;
+    ku_array_drop_int(&bare.numbers); ku_array_drop_bool(&bare.flags);
+    KuString poison={(uint8_t*)(uintptr_t)1u,SIZE_MAX,SIZE_MAX,KU_STRING_OWNED};
+    value.error=(KuError){poison,poison,poison};
+    array_wrapped_charge=value.value.capacity*sizeof(*value.value.data)+32u;
+  } else {
+    KuString fields[3]; const size_t capacity[3]={7u,11u,13u};
+    for (unsigned i=0;i<3u;i++) {
+      uint8_t* pointer=(uint8_t*)malloc(capacity[i]); CHECK(pointer); pointer[0]=(uint8_t)('d'+i);
+      fields[i]=(KuString){pointer,1u,capacity[i],KU_STRING_OWNED};
+    }
+    value.error=(KuError){fields[0],fields[1],fields[2]};
+    value.value=(KuArray_str){SIZE_MAX,(KuString*)(uintptr_t)1u,SIZE_MAX};
+    array_wrapped_charge=31u;
+  }
+  return value;
+}
+static void array_wrapped_reject(ArrayParameterRuntime* runtime,KuResult_array_str* source,unsigned variant) {
+  KuResult_array_str input=*source;
+  if (variant==0u) input.value.len=5u;
+  else if (variant==1u) input.value.capacity=65u;
+  else if (variant==2u) input.value=(KuArray_str){1u,(KuString*)&input,1u};
+  else if (variant==5u) input.error.code=input.error.domain;
+  KuResult_array_str saved; memcpy(&saved,&input,sizeof(saved));
+  KuString vector[4]; if (source->ok) memcpy(vector,source->value.data,sizeof(vector));
+  FixtureLedger ledger=fixture_ledger(); KuTaskDriverSnapshotV1 before=array_snapshot(runtime);
+  KuTaskHandle_2 output={0}; KuTaskHandle_2* destination=&output;
+  if (variant==3u) destination=(KuTaskHandle_2*)&source->value.data[3];
+  else if (variant==4u) destination=(KuTaskHandle_2*)source->value.data[1].ptr;
+  else if (variant==6u) destination=(KuTaskHandle_2*)source->error.message.ptr;
+  CHECK(ku_task_2_try_start(&runtime->driver,&input,destination)==KU_TASK_DRIVER_INVALID_ARGUMENT);
+  array_wrapped_same(&input,&saved);
+  if (source->ok) CHECK(!memcmp(vector,source->value.data,sizeof(vector)));
+  CHECK(!output.owner.lease.control&&!output.ticket.driver);
+  FixtureLedger after=fixture_ledger(); KuTaskDriverSnapshotV1 snapshot=array_snapshot(runtime);
+  CHECK(after.calls==ledger.calls&&after.allocations==ledger.allocations&&after.bytes==ledger.bytes);
+  CHECK(snapshot.resident==before.resident&&snapshot.building==before.building&&snapshot.reserved_bytes==before.reserved_bytes
+      &&snapshot.queued==before.queued&&snapshot.running==before.running&&snapshot.fault==before.fault);
+  CHECK(!runtime->slots[0].generation&&runtime->slots[0].state==KU_TASK_DRIVER_FREE);
+}
+static void array_wrapped_case(unsigned mode) {
+  CHECK(!fixture_ledger().allocations&&!fixture_ledger().bytes);
+  array_wrapped=1u; array_fail_calloc=array_fail_commit=array_commits=0u;
+  unsigned error=mode==2u||mode==3u;
+  KuResult_array_str input=array_wrapped_input(error); array_wrapped_expected=input; array_wrapped_source=&input;
+  ArrayParameterRuntime runtime; array_init(&runtime,sizeof(KuTaskInstance_2)+array_wrapped_charge-(mode==4u ? 1u : 0u));
+  if (!mode) for (unsigned variant=0;variant<5u;variant++) array_wrapped_reject(&runtime,&input,variant);
+  if (mode==2u) { array_wrapped_reject(&runtime,&input,5u); array_wrapped_reject(&runtime,&input,6u); }
+  if (mode==1u) array_fail_calloc=1u;
+  if (mode==2u) array_fail_commit=1u;
+  FixtureLedger before=fixture_ledger(); KuTaskHandle_2 handle={0};
+  uint32_t status=ku_task_2_try_start(&runtime.driver,&input,&handle);
+  CHECK(!array_fail_calloc); array_fail_commit=0u;
+  if (mode==1u||mode==2u||mode==4u) {
+    CHECK(status==(mode==1u ? KU_TASK_ADAPTER_OUT_OF_MEMORY : mode==2u ? KU_TASK_DRIVER_STALE : KU_TASK_DRIVER_LIMIT));
+    array_wrapped_same(&input,&array_wrapped_expected); CHECK(!handle.owner.lease.control&&!handle.ticket.driver);
+    FixtureLedger after=fixture_ledger(); CHECK(after.allocations==before.allocations&&after.bytes==before.bytes);
+    CHECK(after.calls==before.calls+(mode==2u ? 1u : 0u));
+    CHECK(array_commits==(mode==2u ? 1u : 0u)); ku_result_drop_array_str(&input);
+  } else {
+    CHECK(status==KU_TASK_DRIVER_OK&&array_commits==1u); array_wrapped_empty(&input);
+    CHECK(ku_task_driver_wait_result(&handle.ticket,&handle.owner.lease,array_deadline())==KU_TASK_DRIVER_WAIT_READY);
+    CHECK(ku_task_driver_wait_idle(&runtime.driver,array_deadline())==KU_TASK_DRIVER_OK);
+    CHECK(array_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_2)+array_wrapped_charge);
+    KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_2_take(&handle,&output)==KU_TASK_CONTROL_OK);
+    CHECK(output.result_kind==7u&&output.value.string_array.ok==!error);
+    array_wrapped_same(&output.value.string_array,&array_wrapped_expected);
+    CHECK(array_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_2));
+    ku_task_outcome_drop(&output); CHECK(ku_task_2_drop(&handle,array_deadline())==KU_TASK_DRIVER_OK);
+  }
+  array_finish(&runtime); array_wrapped=0u;
+}
+static void array_wrapped_inline(unsigned mode) {
+  CHECK(!fixture_ledger().allocations&&!fixture_ledger().bytes);
+  array_wrapped=1u; array_fail_calloc=array_fail_commit=array_commits=0u;
+  KuResult_array_str input=array_wrapped_input(mode==1u);
+  ArrayParameterRuntime runtime; array_init(&runtime,sizeof(KuTaskInstance_2)+array_wrapped_charge-(mode==0u ? 1u : 0u));
+  if (mode==1u) CHECK(ku_task_driver_shutdown(&runtime.driver,array_deadline())==KU_TASK_DRIVER_OK);
+  if (mode==2u) array_fail_calloc=1u;
+  FixtureLedger before=fixture_ledger(); KuTaskValueV1 output={0};
+  CHECK(ku_task_2_start_value(&runtime.driver,&input,&output)==KU_TASK_DRIVER_OK);
+  CHECK(!array_fail_calloc&&!array_commits); array_wrapped_empty(&input);
+  CHECK(output.tag==KU_TASK_VALUE_INLINE_FAILED&&output.result_kind==7u&&output.function_id==2u
+      &&output.rejection_code==(mode==0u ? KU_TASK_DRIVER_LIMIT : mode==1u ? KU_TASK_DRIVER_CLOSED : KU_TASK_ADAPTER_OUT_OF_MEMORY));
+  CHECK(!output.owner.lease.control&&!output.ticket.driver);
+  CHECK(fixture_ledger().calls==before.calls&&!fixture_ledger().allocations&&!fixture_ledger().bytes);
+  CHECK(ku_task_value_drop(&output,array_deadline())==KU_TASK_DRIVER_OK); array_finish(&runtime); array_wrapped=0u;
+}
 int main(void) {
   for (unsigned mode=0;mode<3u;mode++) array_case(mode);
   for (unsigned mode=0;mode<3u;mode++) array_rejected_value(mode);
+  for (unsigned mode=0;mode<5u;mode++) array_wrapped_case(mode);
+  for (unsigned mode=0;mode<3u;mode++) array_wrapped_inline(mode);
   puts("task-array-parameters-ok"); return 0;
 }
 "#;
