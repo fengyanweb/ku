@@ -128,10 +128,21 @@ async fn main(): null! { return ok(null) }
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8(output.stdout).unwrap().replace('\r', "");
+    let lines = stdout.lines().collect::<Vec<_>>();
+    // The unawaited first child may be cancelled before its body runs. Its
+    // actual Start, owner transfer and final release are checked by C above.
+    // Awaiting second guarantees its output; final ACK precedes the marker.
+    assert!(lines.iter().filter(|line| **line == "first").count() <= 1);
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
-        "first\nsecond\ntask-conditional-owner-ok\n"
+        lines
+            .iter()
+            .copied()
+            .filter(|line| *line != "first")
+            .collect::<Vec<_>>(),
+        ["second", "task-conditional-owner-ok"]
     );
+    assert!(stdout.ends_with("task-conditional-owner-ok\n"), "{stdout}");
     assert!(output.stderr.is_empty());
 }
 
@@ -244,7 +255,7 @@ static void fixture_init(FixtureDriver* runtime,size_t capacity,size_t input_byt
   CHECK(startup_now<=UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
   CHECK(startup_deadline!=UINT64_MAX);
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==8u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==9u);
   CHECK(ku_task_driver_init(runtime->driver,sizeof(*runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
       runtime->slots,capacity,runtime->ring,capacity,fixed+tasks,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   fixture_idle(runtime);

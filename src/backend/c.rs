@@ -354,7 +354,8 @@ fn generate_c_source_with_frames_bounded(
             for slot in &function.slots {
                 let ty = match &slot.ty {
                     crate::ir::task::TaskSlotType::Value { ty, .. } => ty,
-                    crate::ir::task::TaskSlotType::Task { result } => result,
+                    crate::ir::task::TaskSlotType::Task { result }
+                    | crate::ir::task::TaskSlotType::Callable { result, .. } => result,
                 };
                 collect_result_type(ty, &mut frame_result_types)?;
             }

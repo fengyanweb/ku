@@ -846,7 +846,7 @@ static void fixture_headers_and_damaged_pair(void) {
 }
 
 int main(void) {
-  CHECK(KU_TASK_DRIVER_ABI_VERSION == 8u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION == 9u);
   CHECK(KU_TASK_FRAME_ABI_VERSION == 4u);
   fixture_ready_before_arm();
   fixture_parked_and_late_child();

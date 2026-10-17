@@ -50,6 +50,11 @@ pub enum TaskSlotType {
     Task {
         result: IrType,
     },
+    /// A top-level async function identity. No synchronous closure ABI or env.
+    Callable {
+        parameters: Vec<IrType>,
+        result: IrType,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +121,15 @@ pub enum TaskOp {
         dst: SlotId,
         value: TaskConstant,
     },
+    InitCallable {
+        dst: SlotId,
+        function: TaskFunctionId,
+    },
+    /// Explicit clone or read-only call snapshot; the fixed identity allocates nothing.
+    CloneCallable {
+        dst: SlotId,
+        src: SlotId,
+    },
     Copy {
         dst: SlotId,
         src: SlotId,
@@ -173,6 +187,11 @@ pub enum TaskOp {
     Start {
         dst: SlotId,
         function: TaskFunctionId,
+        arguments: Vec<SlotId>,
+    },
+    StartIndirect {
+        dst: SlotId,
+        callee: SlotId,
         arguments: Vec<SlotId>,
     },
     Print {
@@ -285,6 +304,15 @@ pub struct TaskFunctionFrame {
     /// Original dense SlotIds: parameters plus live values crossing suspension.
     pub slots: Vec<SlotId>,
     pub suspensions: Vec<TaskSuspensionLive>,
+    /// Verified reaching identities for each indirect Start, in source CFG order.
+    pub indirect_calls: Vec<TaskIndirectCallPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskIndirectCallPlan {
+    pub state: StateId,
+    pub operation: usize,
+    pub targets: Vec<TaskFunctionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,6 +373,9 @@ fn slot_type(slot: &TaskSlot) -> KuResult<(&IrType, bool)> {
     match &slot.ty {
         TaskSlotType::Value { ty, borrowed } => Ok((ty, *borrowed)),
         TaskSlotType::Task { .. } => Err(invalid("operation requires a Value slot, not a Task")),
+        TaskSlotType::Callable { .. } => {
+            Err(invalid("operation requires a Value slot, not a callable"))
+        }
     }
 }
 
@@ -464,6 +495,11 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
             let supported = match &slot.ty {
                 TaskSlotType::Value { ty, .. } => value_type(ty),
                 TaskSlotType::Task { result } => result_type(result),
+                TaskSlotType::Callable { parameters, result } => {
+                    parameters.len() <= limits.max_slots
+                        && parameters.iter().all(value_type)
+                        && result_type(result)
+                }
             };
             if !supported {
                 return Err(invalid("unsupported slot payload type"));
@@ -488,7 +524,9 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
                         "operation limit exceeded",
                     )?;
                 }
-                if let TaskOp::Start { arguments, .. } = operation {
+                if let TaskOp::Start { arguments, .. } | TaskOp::StartIndirect { arguments, .. } =
+                    operation
+                {
                     if arguments.len() > limits.max_slots {
                         return Err(invalid("Start argument limit exceeded"));
                     }
@@ -566,12 +604,32 @@ struct SlotMasks {
     owned: u64,
     borrowed: u64,
     tasks: u64,
+    callables: u64,
     exit_bridge: bool,
     scope_count: usize,
     scope_exit_count: usize,
     has_scope_exit: bool,
     has_timer: bool,
     has_error_projection: bool,
+}
+
+fn callable_matches(slot: &TaskSlot, target: &TaskFunction, budget: &mut Budget) -> KuResult<bool> {
+    let TaskSlotType::Callable { parameters, result } = &slot.ty else {
+        return Ok(false);
+    };
+    if result != &target.result || parameters.len() != target.parameters.len() {
+        return Ok(false);
+    }
+    for (expected, parameter) in parameters.iter().zip(&target.parameters) {
+        budget.spend()?;
+        if !matches!(target.slots.get(parameter.0), Some(TaskSlot {
+            ty: TaskSlotType::Value { ty, borrowed: false }
+        }) if ty == expected)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_shape(
@@ -593,6 +651,7 @@ fn validate_shape(
     let mut owned = 0;
     let mut borrowed = 0;
     let mut tasks = 0;
+    let mut callables = 0;
     let mut exit_bridge = false;
     let mut legacy_complete = false;
     let mut scope_count = 0;
@@ -602,12 +661,19 @@ fn validate_shape(
     let mut has_timer = false;
     let mut has_error_projection = false;
     for (index, slot) in function.slots.iter().enumerate() {
+        if let TaskSlotType::Callable { parameters, .. } = &slot.ty {
+            budget.spend_many(parameters.len())?;
+        }
         match &slot.ty {
             TaskSlotType::Value { borrowed: true, .. } => borrowed |= bit(SlotId(index)),
             TaskSlotType::Value { ty, .. } if !copy_type(ty) => owned |= bit(SlotId(index)),
             TaskSlotType::Task { .. } => {
                 tasks |= bit(SlotId(index));
                 owned |= bit(SlotId(index));
+            }
+            TaskSlotType::Callable { .. } => {
+                owned |= bit(SlotId(index));
+                callables |= bit(SlotId(index));
             }
             _ => {}
         }
@@ -646,9 +712,47 @@ fn validate_shape(
                         return Err(invalid("initializer type does not match slot"));
                     }
                 }
+                TaskOp::InitCallable {
+                    dst,
+                    function: callee,
+                } => {
+                    let Some(&index) = functions.get(callee) else {
+                        return Err(invalid("callable references an unknown function"));
+                    };
+                    if callee.0 > u32::MAX as usize
+                        || !callable_matches(get_slot(*dst)?, &program.functions[index], budget)?
+                    {
+                        return Err(invalid(
+                            "callable identity does not match its complete signature",
+                        ));
+                    }
+                }
+                TaskOp::CloneCallable { dst, src } => {
+                    if dst == src
+                        || !matches!(&get_slot(*src)?.ty, TaskSlotType::Callable { .. })
+                        || get_slot(*dst)?.ty != get_slot(*src)?.ty
+                    {
+                        return Err(invalid(
+                            "callable clone requires distinct matching callable slots",
+                        ));
+                    }
+                }
                 TaskOp::Copy { dst, src } | TaskOp::Move { dst, src } => {
                     let destination_slot = get_slot(*dst)?;
                     let source_slot = get_slot(*src)?;
+                    if matches!(&destination_slot.ty, TaskSlotType::Callable { .. })
+                        || matches!(&source_slot.ty, TaskSlotType::Callable { .. })
+                    {
+                        if dst == src
+                            || destination_slot.ty != source_slot.ty
+                            || !matches!(operation, TaskOp::Move { .. })
+                        {
+                            return Err(invalid(
+                                "callable move requires distinct matching owned slots",
+                            ));
+                        }
+                        continue;
+                    }
                     if let (
                         TaskSlotType::Task {
                             result: destination,
@@ -805,6 +909,9 @@ fn validate_shape(
                     }
                 }
                 TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => {
+                    if matches!(&get_slot(*slot)?.ty, TaskSlotType::Callable { .. }) {
+                        continue;
+                    }
                     if slot_type(get_slot(*slot)?)?.1 {
                         return Err(invalid("cannot drop a borrowed slot"));
                     }
@@ -854,6 +961,44 @@ fn validate_shape(
                             if moved & bit(argument) != 0 {
                                 return Err(invalid(
                                     "Start cannot consume an owned argument twice",
+                                ));
+                            }
+                            moved |= bit(argument);
+                        }
+                    }
+                }
+                TaskOp::StartIndirect {
+                    dst,
+                    callee,
+                    arguments,
+                } => {
+                    let TaskSlotType::Callable { parameters, result } = &get_slot(*callee)?.ty
+                    else {
+                        return Err(invalid("indirect Start requires a callable identity"));
+                    };
+                    if !matches!(&get_slot(*dst)?.ty, TaskSlotType::Task { result: actual } if actual == result)
+                        || arguments.len() != parameters.len()
+                    {
+                        return Err(invalid(
+                            "indirect Start destination or argument count does not match callable",
+                        ));
+                    }
+                    let mut moved = 0u64;
+                    for (&argument, expected) in arguments.iter().zip(parameters) {
+                        budget.spend()?;
+                        let (actual, borrowed) = slot_type(get_slot(argument)?)?;
+                        if actual != expected
+                            || argument == *dst
+                            || (borrowed && !copy_type(actual))
+                        {
+                            return Err(invalid(
+                                "indirect Start argument type or ownership does not match callable",
+                            ));
+                        }
+                        if !copy_type(actual) {
+                            if moved & bit(argument) != 0 {
+                                return Err(invalid(
+                                    "indirect Start cannot consume an owned argument twice",
                                 ));
                             }
                             moved |= bit(argument);
@@ -953,6 +1098,7 @@ fn validate_shape(
         owned,
         borrowed,
         tasks,
+        callables,
         exit_bridge,
         scope_count,
         scope_exit_count,
@@ -1025,7 +1171,10 @@ fn validate_regions_and_progress(
         cleanup[id.0] = true;
         for operation in &function.states[id.0].operations {
             budget.spend()?;
-            if matches!(operation, TaskOp::Start { .. }) {
+            if matches!(
+                operation,
+                TaskOp::Start { .. } | TaskOp::StartIndirect { .. }
+            ) {
                 return Err(invalid("cleanup cannot Start a task"));
             }
             if matches!(operation, TaskOp::ScopeEnter { .. }) {
@@ -1181,6 +1330,8 @@ impl ScopeLayout {
 fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
     match operation {
         TaskOp::Init { dst, .. }
+        | TaskOp::InitCallable { dst, .. }
+        | TaskOp::CloneCallable { dst, .. }
         | TaskOp::Copy { dst, .. }
         | TaskOp::Move { dst, .. }
         | TaskOp::WrapOk { dst, .. }
@@ -1188,6 +1339,7 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::WrapError { dst, .. }
         | TaskOp::ErrorField { dst, .. }
         | TaskOp::Start { dst, .. }
+        | TaskOp::StartIndirect { dst, .. }
         | TaskOp::Unary { dst, .. }
         | TaskOp::Binary { dst, .. } => Some(*dst),
         TaskOp::ScopeEnter { .. }
@@ -1515,6 +1667,8 @@ struct Initialized {
 fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initialized {
     match operation {
         TaskOp::Init { dst, .. }
+        | TaskOp::InitCallable { dst, .. }
+        | TaskOp::CloneCallable { dst, .. }
         | TaskOp::Copy { dst, .. }
         | TaskOp::Unary { dst, .. }
         | TaskOp::ErrorField { dst, .. }
@@ -1539,7 +1693,7 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
             state.must &= !bit(*slot);
             state.may &= !bit(*slot);
         }
-        TaskOp::Start { dst, arguments, .. } => {
+        TaskOp::Start { dst, arguments, .. } | TaskOp::StartIndirect { dst, arguments, .. } => {
             let consumed = arguments.iter().fold(0, |mask, slot| mask | bit(*slot)) & owned;
             state.must = (state.must & !consumed) | bit(*dst);
             state.may = (state.may & !consumed) | bit(*dst);
@@ -1557,7 +1711,9 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
 fn operation_work(operation: &TaskOp, budget: &mut Budget) -> KuResult<()> {
     budget.spend()?;
     match operation {
-        TaskOp::Start { arguments, .. } => budget.spend_many(arguments.len())?,
+        TaskOp::Start { arguments, .. } | TaskOp::StartIndirect { arguments, .. } => {
+            budget.spend_many(arguments.len())?
+        }
         TaskOp::Unary { .. } => budget.spend()?,
         TaskOp::Binary { .. } => budget.spend_many(2)?,
         _ => {}
@@ -1733,8 +1889,11 @@ fn live_states(
                     TaskOp::ScopeEnter { .. }
                     | TaskOp::ScopeExitBegin { .. }
                     | TaskOp::ScopeExitEnd { .. } => {}
-                    TaskOp::Init { dst, .. } => live &= !bit(*dst),
+                    TaskOp::Init { dst, .. } | TaskOp::InitCallable { dst, .. } => {
+                        live &= !bit(*dst)
+                    }
                     TaskOp::Copy { dst, src }
+                    | TaskOp::CloneCallable { dst, src }
                     | TaskOp::Move { dst, src }
                     | TaskOp::WrapOk { dst, src }
                     | TaskOp::WrapError { dst, src }
@@ -1751,6 +1910,16 @@ fn live_states(
                     TaskOp::Print { value, .. } => live |= bit(*value),
                     TaskOp::Start { dst, arguments, .. } => {
                         live &= !bit(*dst);
+                        for argument in arguments {
+                            live |= bit(*argument);
+                        }
+                    }
+                    TaskOp::StartIndirect {
+                        dst,
+                        callee,
+                        arguments,
+                    } => {
+                        live = (live & !bit(*dst)) | bit(*callee);
                         for argument in arguments {
                             live |= bit(*argument);
                         }
@@ -1780,7 +1949,7 @@ fn validate_ownership_and_plan(
     // ordinary dead Copy temporaries still need no persistent storage.
     let hosted =
         masks.tasks != 0 || masks.exit_bridge || masks.has_timer || masks.has_error_projection;
-    let mut frame = masks.parameters | masks.tasks;
+    let mut frame = masks.parameters | masks.tasks | masks.callables;
     if hosted {
         frame |= masks.owned;
     }
@@ -1794,6 +1963,8 @@ fn validate_ownership_and_plan(
             operation_work(operation, budget)?;
             let source = match operation {
                 TaskOp::Copy { src, .. }
+                | TaskOp::CloneCallable { src, .. }
+                | TaskOp::StartIndirect { callee: src, .. }
                 | TaskOp::Move { src, .. }
                 | TaskOp::WrapOk { src, .. }
                 | TaskOp::WrapError { src, .. }
@@ -1818,7 +1989,9 @@ fn validate_ownership_and_plan(
                     ));
                 }
             }
-            if let TaskOp::Start { arguments, .. } = operation {
+            if let TaskOp::Start { arguments, .. } | TaskOp::StartIndirect { arguments, .. } =
+                operation
+            {
                 // Initialization checking and the consuming transfer each walk
                 // the bounded argument list; account for both visits.
                 budget.spend_many(arguments.len())?;
@@ -1955,12 +2128,117 @@ fn validate_ownership_and_plan(
         scope_exits: TaskScopeExitPlan::default(),
         slots: slots(frame),
         suspensions,
+        indirect_calls: Vec::new(),
     })
+}
+
+fn callable_call_plan(
+    function: &TaskFunction,
+    program: &TaskProgram,
+    ids: &HashMap<TaskFunctionId, usize>,
+    budget: &mut Budget,
+) -> KuResult<Vec<TaskIndirectCallPlan>> {
+    let callable_slots: Vec<_> = function
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            matches!(slot.ty, TaskSlotType::Callable { .. }).then_some(index)
+        })
+        .collect();
+    if callable_slots.is_empty() {
+        return Ok(Vec::new());
+    }
+    budget.spend_many(function.slots.len())?;
+    // Each cell is a subset of at most 64 verified program functions. The
+    // work-list charges every visited op and merged cell to the shared budget.
+    let mut inputs = vec![None::<[u64; 64]>; function.states.len()];
+    inputs[function.entry.0] = Some([0; 64]);
+    let mut queued = vec![false; function.states.len()];
+    queued[function.entry.0] = true;
+    let mut pending = VecDeque::from([function.entry]);
+    let transfer = |facts: &mut [u64; 64], operation: &TaskOp| match operation {
+        TaskOp::InitCallable { dst, function } => facts[dst.0] = 1u64 << ids[function],
+        TaskOp::CloneCallable { dst, src } => facts[dst.0] = facts[src.0],
+        TaskOp::Move { dst, src }
+            if matches!(function.slots[src.0].ty, TaskSlotType::Callable { .. }) =>
+        {
+            facts[dst.0] = facts[src.0];
+            facts[src.0] = 0;
+        }
+        TaskOp::Drop { slot } | TaskOp::DropIfInit { slot } => facts[slot.0] = 0,
+        _ => {}
+    };
+    while let Some(id) = pending.pop_front() {
+        budget.spend()?;
+        queued[id.0] = false;
+        let mut output = inputs[id.0].expect("queued callable state");
+        for operation in &function.states[id.0].operations {
+            budget.spend()?;
+            transfer(&mut output, operation);
+        }
+        for target in successors(&function.states[id.0].terminator)
+            .into_iter()
+            .flatten()
+        {
+            budget.spend_many(callable_slots.len())?;
+            let merged = if let Some(mut old) = inputs[target.0] {
+                for &slot in &callable_slots {
+                    old[slot] |= output[slot];
+                }
+                old
+            } else {
+                output
+            };
+            if inputs[target.0] != Some(merged) {
+                inputs[target.0] = Some(merged);
+                if !queued[target.0] {
+                    queued[target.0] = true;
+                    pending.push_back(target);
+                }
+            }
+        }
+    }
+    let mut calls = Vec::new();
+    for (state_id, state) in function.states.iter().enumerate() {
+        budget.spend()?;
+        let reachable = inputs[state_id].is_some();
+        let mut facts = inputs[state_id].unwrap_or([0; 64]);
+        for (operation_id, operation) in state.operations.iter().enumerate() {
+            budget.spend()?;
+            if let TaskOp::StartIndirect { callee, .. } = operation {
+                let targets = if reachable { facts[callee.0] } else { 0 };
+                if reachable && targets == 0 {
+                    return Err(invalid("indirect Start has no reaching callable identity"));
+                }
+                let mut values = Vec::new();
+                for (index, target) in program.functions.iter().enumerate() {
+                    budget.spend()?;
+                    if targets & (1u64 << index) != 0 {
+                        if !callable_matches(&function.slots[callee.0], target, budget)? {
+                            return Err(invalid(
+                                "indirect Start reaches a mismatched callable signature",
+                            ));
+                        }
+                        values.push(target.id);
+                    }
+                }
+                calls.push(TaskIndirectCallPlan {
+                    state: StateId(state_id),
+                    operation: operation_id,
+                    targets: values,
+                });
+            }
+            transfer(&mut facts, operation);
+        }
+    }
+    Ok(calls)
 }
 
 fn validate_start_graph(
     program: &TaskProgram,
     functions: &HashMap<TaskFunctionId, usize>,
+    plans: &[TaskFunctionFrame],
     budget: &mut Budget,
 ) -> KuResult<()> {
     // A bounded adjacency graph, not recursive specialization or source calls.
@@ -1979,6 +2257,14 @@ fn validate_start_graph(
                     edges[index].push(target);
                     incoming[target] += 1;
                 }
+            }
+        }
+        for call in &plans[index].indirect_calls {
+            for target in &call.targets {
+                budget.spend()?;
+                let target = functions[target];
+                edges[index].push(target);
+                incoming[target] += 1;
             }
         }
     }
@@ -2024,7 +2310,6 @@ pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<Ta
         .iter()
         .map(|function| validate_shape(function, program, &ids, &mut budget))
         .collect::<KuResult<_>>()?;
-    validate_start_graph(program, &ids, &mut budget)?;
     let mut functions = Vec::new();
     for (function, masks) in program.functions.iter().zip(masks) {
         let normal = validate_regions_and_progress(function, masks.scope_count != 0, &mut budget)?;
@@ -2041,7 +2326,11 @@ pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<Ta
         let mut frame =
             validate_ownership_and_plan(function, masks, &inputs, &live, scopes, &mut budget)?;
         frame.scope_exits = scope_exits;
+        if masks.callables != 0 {
+            frame.indirect_calls = callable_call_plan(function, program, &ids, &mut budget)?;
+        }
         functions.push(frame);
     }
+    validate_start_graph(program, &ids, &functions, &mut budget)?;
     Ok(TaskFramePlan { functions })
 }

@@ -1321,3 +1321,69 @@ fn native_task_if_raw_state_budget_rejects_flat_branch_growth() {
         "{error}"
     );
 }
+
+#[test]
+fn native_task_callable_source_freezes_callee_before_awaiting_arguments() {
+    let source = r#"async fn Pair(left: int, right: int): int! { return ok(left + right) }
+async fn One(): int! { return ok(1) }
+async fn main(): null! {
+    selected: async fn(int, int): int! = Pair
+    value = (await selected((await One())?, (await One())?))?
+    println(value)
+    return ok(null)
+}"#;
+    let native = task_lower::lower_program(&checked(source)).unwrap();
+    let main = &native.tasks.functions[2];
+    let plan = task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+    let call = plan.functions[2].indirect_calls.first().unwrap();
+    assert_eq!(call.targets, [native.tasks.functions[0].id]);
+    let TaskOp::StartIndirect {
+        callee, arguments, ..
+    } = &main.states[call.state.0].operations[call.operation]
+    else {
+        panic!("indirect call plan")
+    };
+    let frozen = *callee;
+    assert_eq!(arguments.len(), 2);
+    let (snapshot_state, snapshot_operation) = main
+        .states
+        .iter()
+        .enumerate()
+        .find_map(|(state, body)| {
+            body.operations
+                .iter()
+                .enumerate()
+                .find_map(|(operation, op)| {
+                    matches!(op, TaskOp::CloneCallable { dst, .. } if *dst == frozen)
+                        .then_some((state, operation))
+                })
+        })
+        .unwrap();
+    assert_eq!(snapshot_state, main.entry.0);
+    let first_start = main.states[main.entry.0]
+        .operations
+        .iter()
+        .position(|op| matches!(op, TaskOp::Start { .. }))
+        .unwrap();
+    assert!(snapshot_operation < first_start);
+    assert!(plan.functions[2].slots.contains(&frozen));
+    assert!(plan.functions[2]
+        .suspensions
+        .iter()
+        .filter(|suspension| suspension.state.0 < call.state.0)
+        .any(|suspension| suspension.slots.contains(&frozen)));
+
+    for source in [
+        "async fn F(): int! { return ok(1) } async fn main(): null! { selected = F selected = F return ok(null) }",
+        "async fn F(op: async fn(): int!): int! { return (await op()) } async fn main(): null! { return ok(null) }",
+        "async fn main(): null! { captured = 1 selected = (): int => captured return ok(null) }",
+    ] {
+        let error = task_lower::lower_program(&checked(source)).expect_err("outside the bounded callable group");
+        assert!(error.to_string().contains("native async subset"), "{error}");
+    }
+    let moved = parsed("async fn F(): int! { return ok(1) } async fn main(): null! { selected = F moved = selected value = selected() return ok(null) }");
+    assert!(
+        Checker::new().check(&moved).is_err(),
+        "function binding assignment keeps ordinary Owned move behavior"
+    );
+}

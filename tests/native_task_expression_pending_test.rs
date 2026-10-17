@@ -442,7 +442,7 @@ async fn main(): null! { return ok(null) }
     for required in [
         "#define KU_TASK_FRAME_ABI_VERSION 4u",
         "#define KU_TASK_CONTROL_ABI_VERSION 2u",
-        "#define KU_TASK_DRIVER_ABI_VERSION 8u",
+        "#define KU_TASK_DRIVER_ABI_VERSION 9u",
     ] {
         assert!(generated.contains(required));
     }
@@ -885,10 +885,24 @@ static void if_case(unsigned mode) {
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==8u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==9u);
   ku_task_control_atomic_init(&if_release_ready,0); ku_task_control_atomic_init(&if_release_child,0);
   ku_task_control_atomic_init(&if_release_parent,0);
   if_case(IF_FALSE); if_case(IF_NORMAL); if_case(IF_CANCEL);
   puts("source-if-owned-pending-ok"); return 0;
 }
 "#;
+
+#[test]
+fn native_task_callable_repeated_pending_starts_the_selected_child_once() {
+    run_repeated_pending_expression(
+        r#"
+async fn Parent(base: int): int! {
+    selected = Right
+    return ok(base + (await selected())?)
+}
+async fn Right(): int! { return ok(5) }
+async fn main(): null! { return ok(null) }
+"#,
+    );
+}

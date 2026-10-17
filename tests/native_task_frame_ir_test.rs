@@ -1196,3 +1196,263 @@ fn native_task_timer_ir_persists_argument_and_initializes_only_ready_result() {
     };
     rejected(&bad, "missing ready state");
 }
+
+fn callable_fixture() -> TaskProgram {
+    let value = |ty| TaskSlot {
+        ty: TaskSlotType::Value {
+            ty,
+            borrowed: false,
+        },
+    };
+    let callable = || TaskSlot {
+        ty: TaskSlotType::Callable {
+            parameters: vec![IrType::Int],
+            result: result(IrType::Int),
+        },
+    };
+    let child = |id| TaskFunction {
+        id: TaskFunctionId(id),
+        name: format!("Child{id}"),
+        slots: vec![value(IrType::Int), value(result(IrType::Int))],
+        parameters: vec![SlotId(0)],
+        entry: StateId(0),
+        states: vec![state(
+            vec![TaskOp::WrapOk {
+                dst: SlotId(1),
+                src: SlotId(0),
+            }],
+            complete(1),
+        )],
+        result: result(IrType::Int),
+    };
+    TaskProgram {
+        functions: vec![
+            TaskFunction {
+                id: TaskFunctionId(0),
+                name: "Caller".into(),
+                slots: vec![
+                    callable(),
+                    callable(),
+                    value(IrType::Int),
+                    TaskSlot {
+                        ty: TaskSlotType::Task {
+                            result: result(IrType::Int),
+                        },
+                    },
+                    value(result(IrType::Int)),
+                    value(result(IrType::Null)),
+                    value(IrType::Bool),
+                ],
+                parameters: vec![SlotId(6)],
+                entry: StateId(0),
+                result: result(IrType::Null),
+                states: vec![
+                    state(
+                        vec![
+                            TaskOp::InitCallable {
+                                dst: SlotId(0),
+                                function: TaskFunctionId(1),
+                            },
+                            TaskOp::CloneCallable {
+                                dst: SlotId(1),
+                                src: SlotId(0),
+                            },
+                            drop_slot(0),
+                            init(2, TaskConstant::Int(7)),
+                        ],
+                        branch(6, 1, 2),
+                    ),
+                    state(
+                        vec![
+                            drop_slot(1),
+                            TaskOp::InitCallable {
+                                dst: SlotId(1),
+                                function: TaskFunctionId(1),
+                            },
+                        ],
+                        jump(3),
+                    ),
+                    state(
+                        vec![
+                            drop_slot(1),
+                            TaskOp::InitCallable {
+                                dst: SlotId(1),
+                                function: TaskFunctionId(2),
+                            },
+                        ],
+                        jump(3),
+                    ),
+                    state(
+                        vec![
+                            TaskOp::StartIndirect {
+                                dst: SlotId(3),
+                                callee: SlotId(1),
+                                arguments: vec![SlotId(2)],
+                            },
+                            drop_slot(1),
+                        ],
+                        TaskTerminator::Await {
+                            task: SlotId(3),
+                            dst: SlotId(4),
+                            ready: StateId(4),
+                            cleanup: StateId(5),
+                        },
+                    ),
+                    state(
+                        vec![
+                            drop_slot(4),
+                            init(5, TaskConstant::Ok(Box::new(TaskConstant::Null))),
+                        ],
+                        complete(5),
+                    ),
+                    state(
+                        vec![drop_if(0), drop_if(1), drop_if(4), drop_if(5)],
+                        TaskTerminator::Terminate,
+                    ),
+                ],
+            },
+            child(1),
+            child(2),
+        ],
+    }
+}
+
+fn indirect_child(id: usize, target: usize) -> TaskFunction {
+    let value = |ty| TaskSlot {
+        ty: TaskSlotType::Value {
+            ty,
+            borrowed: false,
+        },
+    };
+    TaskFunction {
+        id: TaskFunctionId(id),
+        name: format!("Indirect{id}"),
+        parameters: vec![SlotId(0)],
+        entry: StateId(0),
+        result: result(IrType::Int),
+        slots: vec![
+            value(IrType::Int),
+            TaskSlot {
+                ty: TaskSlotType::Callable {
+                    parameters: vec![IrType::Int],
+                    result: result(IrType::Int),
+                },
+            },
+            TaskSlot {
+                ty: TaskSlotType::Task {
+                    result: result(IrType::Int),
+                },
+            },
+            value(result(IrType::Int)),
+        ],
+        states: vec![
+            state(
+                vec![
+                    TaskOp::InitCallable {
+                        dst: SlotId(1),
+                        function: TaskFunctionId(target),
+                    },
+                    TaskOp::StartIndirect {
+                        dst: SlotId(2),
+                        callee: SlotId(1),
+                        arguments: vec![SlotId(0)],
+                    },
+                    drop_slot(1),
+                ],
+                TaskTerminator::Await {
+                    task: SlotId(2),
+                    dst: SlotId(3),
+                    ready: StateId(1),
+                    cleanup: StateId(2),
+                },
+            ),
+            state(vec![], complete(3)),
+            state(vec![drop_if(1), drop_if(3)], TaskTerminator::Terminate),
+        ],
+    }
+}
+
+#[test]
+fn native_task_callable_ir_tracks_exact_targets_and_rejects_invalid_ownership() {
+    let fixture = callable_fixture();
+    let plan = accepted(&fixture);
+    assert_eq!(plan.functions[0].indirect_calls.len(), 1);
+    let call = &plan.functions[0].indirect_calls[0];
+    assert_eq!((call.state, call.operation), (StateId(3), 0));
+    assert_eq!(call.targets, [TaskFunctionId(1), TaskFunctionId(2)]);
+    assert!(plan.functions[0].slots.contains(&SlotId(0)));
+    assert!(plan.functions[0].slots.contains(&SlotId(1)));
+
+    let mut bad = fixture.clone();
+    bad.functions[0].states[0].operations[0] = TaskOp::InitCallable {
+        dst: SlotId(0),
+        function: TaskFunctionId(99),
+    };
+    rejected(&bad, "unknown callable identity");
+    let mut bad = fixture.clone();
+    bad.functions[0].states[0].operations[1] = TaskOp::Copy {
+        dst: SlotId(1),
+        src: SlotId(0),
+    };
+    rejected(&bad, "implicit callable copy");
+    let mut bad = fixture.clone();
+    bad.functions[0].states[0].operations.remove(0);
+    rejected(&bad, "clone of uninitialized callable");
+    let mut bad = fixture.clone();
+    bad.functions[0].states[0].operations.insert(
+        2,
+        TaskOp::CloneCallable {
+            dst: SlotId(1),
+            src: SlotId(0),
+        },
+    );
+    rejected(&bad, "clone overwrites live callable owner");
+    let mut bad = fixture.clone();
+    bad.functions[0].states[3].operations[0] = TaskOp::StartIndirect {
+        dst: SlotId(3),
+        callee: SlotId(0),
+        arguments: vec![SlotId(2)],
+    };
+    rejected(&bad, "callable has already been dropped");
+    let mut bad = fixture.clone();
+    bad.functions[0].parameters.push(SlotId(0));
+    rejected(&bad, "callable parameters remain unsupported");
+    let mut bad = fixture.clone();
+    bad.functions[0].slots[0].ty = TaskSlotType::Callable {
+        parameters: vec![IrType::Bool],
+        result: result(IrType::Int),
+    };
+    rejected(&bad, "complete signature includes argument types");
+    let mut bad = fixture.clone();
+    bad.functions[0].states[3].operations[0] = TaskOp::StartIndirect {
+        dst: SlotId(3),
+        callee: SlotId(1),
+        arguments: vec![SlotId(6)],
+    };
+    rejected(&bad, "indirect argument type differs");
+    let mut bad = fixture.clone();
+    bad.functions[0].states[5]
+        .operations
+        .push(TaskOp::StartIndirect {
+            dst: SlotId(3),
+            callee: SlotId(1),
+            arguments: vec![SlotId(2)],
+        });
+    rejected(&bad, "cleanup cannot start an indirect task");
+    let mut chain = fixture.clone();
+    chain.functions[1] = indirect_child(1, 2);
+    accepted(&chain);
+    chain.functions[2] = indirect_child(2, 1);
+    rejected(
+        &chain,
+        "indirect edges participate in recursive Start detection",
+    );
+    let limits = TaskLimits {
+        max_analysis_work: 1,
+        ..TaskLimits::default()
+    };
+    assert!(verify_and_plan(&fixture, limits)
+        .unwrap_err()
+        .to_string()
+        .contains("analysis work limit exceeded"));
+}

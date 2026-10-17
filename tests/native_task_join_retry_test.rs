@@ -255,7 +255,7 @@ static void fixture_live_storage(KuTaskDriverV1* driver, size_t fixed) {
   fixture_fixed_ledger(fixed);
 }
 int main(void) {
-  RETRY_CHECK(KU_TASK_DRIVER_ABI_VERSION == 8u);
+  RETRY_CHECK(KU_TASK_DRIVER_ABI_VERSION == 9u);
   RETRY_CHECK(KU_TASK_FRAME_ABI_VERSION == 4u && KU_TASK_CONTROL_ABI_VERSION == 2u);
   KuTaskDriverV1* driver = (KuTaskDriverV1*)calloc(1, sizeof(*driver));
   KuTaskDriverSlotV1* slots = (KuTaskDriverSlotV1*)calloc(2u, sizeof(*slots));

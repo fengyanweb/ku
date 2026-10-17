@@ -255,7 +255,7 @@ R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 
 升为版本 4，R5h 正常作用域登记字段升为版本 5，单向 FINAL 标记升为版本 6；
 R6 的有界 worker 组、双条件和显式 join 生命周期升为版本 7。
 内部 C 类型名中的 `V1` 不是旧布局兼容承诺，初始化明确拒绝旧版本（包括6）。
-当前 Frame ABI 4、Control ABI 2、Driver ABI 8。
+当前 Frame ABI 4、Control ABI 2、Driver ABI 9。
 普通同步输出和空 Task IR 不附带该实现。私有 init 显式接收 1..32 个真实 OS worker
 及有限 startup_deadline；worker 数与 slot 容量独立，使用调用方提供的固定 slot/ring。
 源码 root 在执行目标上按 min(32, max(4, OS 报告的逻辑处理器数)) 选择 worker 数，
@@ -435,7 +435,7 @@ ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不�
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
 整数 for 先快照上限，以只读 `CheckForLimit` 拒绝负数；隐藏计数器独立于本轮
 可赋值的词法绑定。循环体复用相同 ScopeDrain/drop/Suspend 路径；上限只求值一次。
-Owned/Task 重赋值、复合赋值与自增/自减、数组 for、递归、跨词法作用域 Task move、非空用户 finally、闭包、同步调用、
+Owned/Task 重赋值、复合赋值与自增/自减、数组 for、递归、跨词法作用域 Task move、非空用户 finally、捕获闭包、函数值参数/返回、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -454,8 +454,25 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 
 源码与两种 CLI native 构建、表达式和清理测试的实际结果按精确提交记录在工作日志。
 定向验证、完整本机门禁和三系统 CI/sanitizer 分开记录，历史失败及修复结果也分列，
-不从旧 SHA 的通过结果外推。Frame ABI 4、Control ABI 2、Driver ABI 8 不等于稳定外部 C FFI。
+不从旧 SHA 的通过结果外推。Frame ABI 4、Control ABI 2、Driver ABI 9 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
+
+### 顶层 async 函数值与 Driver9 本地队列
+
+`Callable { parameters, result }` 槽保存固定 uint32 函数ID，不借用同步 Closure ABI。
+`InitCallable`、`CloneCallable`、`StartIndirect` 分别建立身份、显式clone或只读调用
+快照、实际hosted Start。默认赋值保持Owned move；每个调用点只从已初始化且尚未
+移走的callee派生有限目标集，CFG合流取并集，全部实际可能边参加原无环检查。
+位图不超过64函数并沿用原分析预算；没有callable的旧函数跳过新定点分析。C只按
+验证后计划分派，未知ID在参数move之前失败；不静默变成同步函数调用。
+callee与参数跨Await持久化，实际frame sizeof继续计费；函数ID无新堆分配。
+
+Driver9新增slot本地链、executor/queue worker身份和固定worker队列头尾；这些都进
+fixed_bytes。global_queued仅表示ring，queued为所有队列总和，容量仍只有一份。
+真实worker内创建的child与普通Yield进入本地FIFO，空闲者偷其它tail；外部唤醒、
+取消和timer进入全局，已在本地的queued槽可原位提升，保持一个queue credit。
+全局优先并在连续8次全局选择后提供一次本地机会；原Marker进展断言未放宽。
+仍使用一个mutex，不宣称锁竞争或性能已改善；Frame4/Control2保持，旧C需重编译。
 
 ### 源码 try/catch 与 Error 字段计费
 
@@ -469,7 +486,7 @@ ErrorField 的 STATIC 字符串复用头；OWNED 字段在 malloc 前向当前 R
 预留实际 clone 容量，失败先退款。仅含这种投影的函数启用有界 typed 活跃头扫描，
 最多64槽，覆盖 frame、暂存 Result 和 adapter payload；drop/移交后只收缩已释放
 的收费，成功 hosted take 沿用原转移账本。没有逐次递归树遍历或改动通用 Value。
-私有生成 host 的分配扩展有独立 ABI1/sizeof 门槛；Frame4/Control2/Driver8保持。
+私有生成 host 的分配扩展有独立 ABI1/sizeof 门槛；Frame4/Control2不变，当前Driver9另见本地队列协议。
 这只覆盖新增 Error-field 分配，不代表外部库、网络或进程内存都已受控。
 
 ### 源码 sleep 与 Driver8 timer
@@ -629,7 +646,7 @@ Jump/ScopeDrain 链和合法 Value drop，到 End 时必须恰好到达 retain�
 
 分析沿用原硬限和逐步预算；没有标记时不分配新增操作/状态向量 buffer。
 仅含标记的生成函数帧保存退出身份和原始绝对期限，公共 Frame ABI 4、Control ABI 2、
-Driver ABI 8 不变，实际实例 sizeof 仍计入原 frame 预算。逐层 normal scope session
+Driver ABI 9 不变，实际实例 sizeof 仍计入原 frame 预算。逐层 normal scope session
 各自真实结束，但同一次退出的期限持续到最后 Value drop 和 End，不逐层重建。
 超期转原 runtime-failure 退出桥；取消和更短期限继续沿用既有移交与实际 ACK 协议。
 没有标记的函数维持原实例布局。定向运行与精确 SHA 三系统 CI 分别记录，不能据

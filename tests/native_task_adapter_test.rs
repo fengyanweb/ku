@@ -1157,7 +1157,7 @@ static void fixture_owned_error_projection_budget(void) {
   }
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION == 4u && KU_TASK_DRIVER_ABI_VERSION == 8u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION == 4u && KU_TASK_DRIVER_ABI_VERSION == 9u);
   fixture_primitives(); fixture_strings(); fixture_results();
   fixture_budget_and_oom(); fixture_sparse_and_preflight(); fixture_header_shape_and_empty_output();
   fixture_private_failure_rollback(); fixture_sparse_postmove_rollback(); fixture_move_and_late_lease();

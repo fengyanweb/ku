@@ -45,7 +45,7 @@ Stage 3 的解释器差分按输入窗口合同、语法和资源/深度边界�
 2. 编译器数据模型：Token、span、bootstrap Diagnostic schema 以及固定上限的 NodeId/edge arena 已落地，但 Diagnostic 仍缺少跨 Rust checker、CLI、编辑器与 native sidecar 的 typed transport；节点 payload 也仍是首阶段的通用字段，完整 AST 类型模型和后续 checker 所需的语义标注尚未冻结。
 3. 构建性能：当前 lexer 收集路径已消除整表/前缀的重复复制，但不等于所有 Ku 容器操作均为 O(1)。字符串 `.len()` 仍按 Unicode 字符扫描；有捕获或副作用的 self-push 保留原复制语义；尚无完整编译器管线的生产规模内存、吞吐和跨平台基准。
 4. 泛型与编译器常用容器仍不完整；package/registry 的 native 联网闭环也尚未进入自举路径。
-5. native 已有受限的 Task 源码路径与内部 Frame ABI 4 / Control ABI 2 / Driver ABI 8；完整 async、稳定外部 Task FFI 与 async 自举仍未完成。自举不能据此依赖尚未稳定的 task/runtime 能力。
+5. native 已有受限的 Task 源码路径与内部 Frame ABI 4 / Control ABI 2 / Driver ABI 9；完整 async、稳定外部 Task FFI 与 async 自举仍未完成。自举不能据此依赖尚未稳定的 task/runtime 能力。
 
 ## 后续顺序
 

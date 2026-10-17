@@ -9,9 +9,9 @@ use std::collections::HashSet;
 
 use crate::error::KuResult;
 use crate::ir::task::{
-    SlotId, TaskBinaryOp, TaskConstant, TaskFramePlan, TaskFunction, TaskFunctionFrame, TaskLimits,
-    TaskOp, TaskProgram, TaskScopeExitPlan, TaskScopeFrame, TaskSlotType, TaskTerminator,
-    TaskUnaryOp,
+    SlotId, TaskBinaryOp, TaskConstant, TaskFramePlan, TaskFunction, TaskFunctionFrame,
+    TaskIndirectCallPlan, TaskLimits, TaskOp, TaskProgram, TaskScopeExitPlan, TaskScopeFrame,
+    TaskSlotType, TaskTerminator, TaskUnaryOp,
 };
 use crate::ir::IrType;
 
@@ -83,6 +83,7 @@ struct FrameEmitter<'a> {
     exit_bridge: bool,
     scopes: &'a [TaskScopeFrame],
     scope_exits: &'a TaskScopeExitPlan,
+    indirect_calls: &'a [TaskIndirectCallPlan],
 }
 
 impl<'a> FrameEmitter<'a> {
@@ -140,6 +141,17 @@ impl<'a> FrameEmitter<'a> {
                         return Err(unsupported("Task slots must be persistent"));
                     }
                 }
+                TaskSlotType::Callable { parameters, result } => {
+                    if !persistent.contains(&index) || parameters.len() > MAX_FRAME_SLOTS {
+                        return Err(unsupported(
+                            "callable identities must remain in bounded native frame storage",
+                        ));
+                    }
+                    require_result_type(result)?;
+                    for parameter in parameters {
+                        require_slot_type(parameter)?;
+                    }
+                }
             }
         }
         if frame.scope_task_mask != task_mask
@@ -171,6 +183,7 @@ impl<'a> FrameEmitter<'a> {
             exit_bridge,
             scopes: &frame.scopes,
             scope_exits: &frame.scope_exits,
+            indirect_calls: &frame.indirect_calls,
         })
     }
 
@@ -303,12 +316,16 @@ impl<'a> FrameEmitter<'a> {
         match &slot.ty {
             TaskSlotType::Value { ty, .. } => Ok(ty),
             TaskSlotType::Task { result } => Ok(result),
+            TaskSlotType::Callable { .. } => {
+                Err(unsupported("callable identity is not an ordinary Value"))
+            }
         }
     }
 
     fn owns_slot(&self, slot: SlotId) -> bool {
         match &self.function.slots[slot.0].ty {
             TaskSlotType::Task { .. } => true,
+            TaskSlotType::Callable { .. } => true,
             TaskSlotType::Value { ty, borrowed } => {
                 !*borrowed
                     && (matches!(ty, IrType::Str | IrType::Result(_))
@@ -368,6 +385,7 @@ impl<'a> FrameEmitter<'a> {
                 let ty = match &slot.ty {
                     TaskSlotType::Value { ty, .. } => c_type(ty)?,
                     TaskSlotType::Task { .. } => "KuTaskValueV1".to_string(),
+                    TaskSlotType::Callable { .. } => "uint32_t".to_string(),
                 };
                 out.push_str(&format!("  {ty} s_{index};\n"));
             }
@@ -644,9 +662,9 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         for (index, state) in self.function.states.iter().enumerate() {
             out.check()?;
             out.push_str(&format!("ku_task_state_{index}:;\n"));
-            for operation in &state.operations {
+            for (operation_id, operation) in state.operations.iter().enumerate() {
                 out.check()?;
-                self.emit_operation(out, operation)?;
+                self.emit_operation(out, operation, index, operation_id)?;
             }
             match &state.terminator {
                 TaskTerminator::Jump { target } => {
@@ -807,7 +825,13 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         Ok(())
     }
 
-    fn emit_operation(&self, out: &mut COutput, operation: &TaskOp) -> KuResult<()> {
+    fn emit_operation(
+        &self,
+        out: &mut COutput,
+        operation: &TaskOp,
+        state: usize,
+        operation_id: usize,
+    ) -> KuResult<()> {
         match operation {
             TaskOp::ScopeExitBegin { exit, .. } => {
                 out.push_str(&format!(
@@ -893,11 +917,30 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 ));
                 self.set_init(out, *dst, true);
             }
+            TaskOp::InitCallable { dst, function } => {
+                out.push_str(&format!("  {} = {}u;\n", self.place(*dst), function.0));
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::CloneCallable { dst, src } => {
+                out.push_str(&format!("  {} = {};\n", self.place(*dst), self.place(*src)));
+                self.set_init(out, *dst, true);
+            }
             TaskOp::Copy { dst, src } => {
                 out.push_str(&format!("  {} = {};\n", self.place(*dst), self.place(*src)));
                 self.set_init(out, *dst, true);
             }
             TaskOp::Move { dst, src } => {
+                if matches!(self.function.slots[src.0].ty, TaskSlotType::Callable { .. }) {
+                    out.push_str(&format!(
+                        "  {} = {}; {} = 0;\n",
+                        self.place(*dst),
+                        self.place(*src),
+                        self.place(*src)
+                    ));
+                    self.set_init(out, *src, false);
+                    self.set_init(out, *dst, true);
+                    return Ok(());
+                }
                 if self.task_slot(*src) {
                     out.push_str(&format!("  if (ku_task_value_move(&{}, &{}) != KU_TASK_DRIVER_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",self.place(*dst),self.place(*src)));
                     self.set_init(out, *src, false);
@@ -980,6 +1023,37 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     out.push_str(&format!(", &{}", self.place(*argument)));
                 }
                 out.push_str(&format!(", &{});\n  if (started!=KU_TASK_DRIVER_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }} }}\n",self.place(*dst)));
+                for argument in arguments {
+                    if self.owns_slot(*argument) {
+                        self.set_init(out, *argument, false);
+                    }
+                }
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::StartIndirect {
+                dst,
+                callee,
+                arguments,
+            } => {
+                let index = self
+                    .indirect_calls
+                    .binary_search_by_key(&(state, operation_id), |call| {
+                        (call.state.0, call.operation)
+                    })
+                    .map_err(|_| unsupported("indirect Start has no verified target plan"))?;
+                out.push_str(&format!(
+                    "  {{ uint32_t started; switch ({}) {{\n",
+                    self.place(*callee)
+                ));
+                for target in &self.indirect_calls[index].targets {
+                    out.push_str(&format!("  case {}u: started=ku_task_{}_start_hosted((const KuTaskAdapterHostV1*)clock->host", target.0, target.0));
+                    for argument in arguments {
+                        out.push_str(&format!(", &{}", self.place(*argument)));
+                    }
+                    out.push_str(&format!(", &{}); break;\n", self.place(*dst)));
+                }
+                // Invalid identities must fail before any owned input moves.
+                out.push_str("  default: frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE;\n  }\n  if (started!=KU_TASK_DRIVER_OK) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; } }\n");
                 for argument in arguments {
                     if self.owns_slot(*argument) {
                         self.set_init(out, *argument, false);
@@ -1071,7 +1145,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         // their header too; neither an error path nor later frame destruction
         // can become a second owner of the same payload.
         self.set_init(out, slot, false);
-        if self.owns_slot(slot) {
+        if matches!(
+            self.function.slots[slot.0].ty,
+            TaskSlotType::Callable { .. }
+        ) {
+            out.push_str(&format!("  {} = 0;\n", self.place(slot)));
+        } else if self.owns_slot(slot) {
             out.push_str(&format!(
                 "  {}\n",
                 drop_statement(self.slot_type(slot)?, &self.place(slot))?

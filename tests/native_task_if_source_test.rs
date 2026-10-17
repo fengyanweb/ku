@@ -1042,3 +1042,83 @@ fn native_task_recoverable_catch_routes_errors_and_drains_owned_scopes() {
         run_case_with_workers(1000 + index, source, stdout, failure, Some(1));
     }
 }
+
+#[test]
+fn native_task_callable_values_move_clone_and_invoke_real_tasks() {
+    for (index, source, output) in [
+        (
+            0,
+            r#"async fn Add(value: int): int! { return ok(value + 1) }
+async fn main(): null! {
+    selected: async fn(int): int! = Add
+    println((await selected(4))?)
+    println((await selected(8))?)
+    cloned = selected.clone()
+    moved = cloned
+    println((await moved(12))?)
+    println((await selected.clone()(15))?)
+    return ok(null)
+}"#,
+            "5\n9\n13\n16\n",
+        ),
+        (
+            1,
+            r#"async fn Emit(): null! { println("actual child") return ok(null) }
+async fn main(): null! {
+    selected = Emit;
+    (await selected())?;
+    (await selected())?;
+    return ok(null)
+}"#,
+            "actual child\nactual child\n",
+        ),
+        (
+            2,
+            r#"async fn Left(): int! { println("left") return ok(2) }
+async fn Right(): int! { println("right") return ok(3) }
+async fn Add(left: int, right: int): int! { println("target") return ok(left + right) }
+async fn main(): null! {
+    selected = Add
+    println((await selected((await Left())?, (await Right())?))?)
+    return ok(null)
+}"#,
+            "left\nright\ntarget\n5\n",
+        ),
+        (
+            3,
+            r#"async fn Identity(value: str!, extra: str): str! { return value }
+async fn main(): null! {
+    selected = Identity
+    text = "中文🙂"
+    println((await selected(ok(text), "extra"))?)
+    println((await selected(ok("again"), "unused"))?)
+    return ok(null)
+}"#,
+            "中文🙂\nagain\n",
+        ),
+        (
+            4,
+            r#"async fn Broken(): int! { fail "selected failure" }
+async fn main(): null! {
+    selected = Broken
+    try { (await selected())? } catch(error) { println(error.message) }
+    try { (await selected())? } catch(error) { println(error.code) }
+    return ok(null)
+}"#,
+            "selected failure\nfail\n",
+        ),
+        (
+            5,
+            r#"async fn Child(value: int): int! { return ok(value) }
+async fn main(): null! {
+    selected = Child
+    if (true) { inner = selected.clone() println((await inner(7))?) }
+    println((await selected(9))?)
+    return ok(null)
+}"#,
+            "7\n9\n",
+        ),
+    ] {
+        run_case_with_workers(1500 + index, source, output, None, Some(1));
+    }
+}

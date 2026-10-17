@@ -125,13 +125,34 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝数组 for、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、非空用户 finally、闭包/函数值、
+顶层无捕获 async 函数可作为局部函数值，支持完整注解、默认 move、显式 clone 和
+重复调用。调用仍创建真实 Task；先保存 callee，再按从左到右的顺序求值参数，参数
+中的 Await 不会改变选择或重复执行已求值部分。只检查实际可能调用的目标集合，
+函数值别名也不能绕过无递归限制。捕获、函数值参数/返回及原绑定重赋值仍未开放。
+
+```ku
+async fn Add(value: int): int! { return ok(value + 1) }
+async fn main(): null! {
+    selected: async fn(int): int! = Add
+    println((await selected(4))?)
+    copied = selected.clone()
+    moved = copied
+    println((await moved(8))?)
+    return ok(null)
+}
+```
+
+仍拒绝数组 for、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、非空用户 finally、捕获闭包、函数值参数/返回、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
 float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及异步标准库 I/O。
 未支持形式在生成 artifact 前明确报错。
 用户 cleanup 仍不能 Await；内部 ACK continuation 不是新的用户语法。
-该子集使用有界 worker 组与共享固定队列，不递归 poll child；不同 Task 可以由不同
-OS worker 同时执行，同一 Task 的 RUNNING/executor 仍互斥。源码 root 在执行目标上按
+该子集使用有界 worker 组及共享容量的全局/本地固定队列，不递归 poll child；不同 Task
+可以由不同 OS worker 同时执行，同一 Task 的 RUNNING/executor 仍互斥。本地 owner
+按 FIFO 取任务，空闲 worker 从其它本地队列尾部窃取；外部恢复/取消优先进入全局，
+连续最多8个全局选择后给一个本地机会，防止持续外部流量饿死本地任务。全部队列仍
+共用原 mutex 和同一 capacity/字节接纳，没有每 worker 扩一份容量或新增 Task owner。
+内部 Driver ABI9，旧生成 C 须重编译；这不代表完整 M:N 或已测得吞吐提升。源码 root 在执行目标上按
 `min(32, max(4, OS 报告的逻辑处理器数))` 选择 worker 数，不读取编译宿主的 CPU 配置。
 这不是对进程 affinity/cgroup 配额的完整识别，也不是最优性能配置承诺。
 工作条件与状态观察条件分离，停车/退出状态通知不再唤醒其他空闲 worker。

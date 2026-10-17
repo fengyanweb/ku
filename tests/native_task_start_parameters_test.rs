@@ -63,8 +63,9 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                         map(task);
                     }
                 }
-                TaskOp::Init { dst, .. } => map(dst),
+                TaskOp::Init { dst, .. } | TaskOp::InitCallable { dst, .. } => map(dst),
                 TaskOp::Copy { dst, src }
+                | TaskOp::CloneCallable { dst, src }
                 | TaskOp::Move { dst, src }
                 | TaskOp::WrapOk { dst, src }
                 | TaskOp::WrapError { dst, src }
@@ -87,6 +88,17 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 | TaskOp::DropIfInit { slot } => map(slot),
                 TaskOp::Start { dst, arguments, .. } => {
                     map(dst);
+                    for argument in arguments {
+                        map(argument);
+                    }
+                }
+                TaskOp::StartIndirect {
+                    dst,
+                    callee,
+                    arguments,
+                } => {
+                    map(dst);
+                    map(callee);
                     for argument in arguments {
                         map(argument);
                     }
@@ -125,6 +137,15 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
 
 #[test]
 fn native_task_start_multiple_owned_sparse_slot63_restore_and_owner_release_execute_in_c() {
+    run_owned_sparse_start(false);
+}
+
+#[test]
+fn native_task_indirect_start_owned_inputs_restore_and_invalid_identity_do_not_consume() {
+    run_owned_sparse_start(true);
+}
+
+fn run_owned_sparse_start(indirect: bool) {
     let source = r#"
 async fn Parent(value: str!, extra: str, count: int, flag: bool): str! {
     child = Child(value, extra, count, flag)
@@ -133,7 +154,15 @@ async fn Parent(value: str!, extra: str, count: int, flag: bool): str! {
 async fn Child(value: str!, extra: str, count: int, flag: bool): str! { return value }
 async fn main(): null! { return ok(null) }
 "#;
-    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+    let source = if indirect {
+        source.replace(
+            "child = Child(value, extra, count, flag)",
+            "selected = Child\n    child = selected(value, extra, count, flag)",
+        )
+    } else {
+        source.into()
+    };
+    let ast = Parser::new(Lexer::new(&source).lex().unwrap())
         .parse_program()
         .unwrap();
     Checker::new().check(&ast).unwrap();
@@ -145,7 +174,9 @@ async fn main(): null! { return ok(null) }
         .iter()
         .flat_map(|state| &state.operations)
         .filter_map(|operation| match operation {
-            TaskOp::Start { arguments, .. } => Some(arguments.clone()),
+            TaskOp::Start { arguments, .. } | TaskOp::StartIndirect { arguments, .. } => {
+                Some(arguments.clone())
+            }
             _ => None,
         })
         .collect();
@@ -164,7 +195,7 @@ async fn main(): null! { return ok(null) }
     let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
     assert!(!generated.contains("run_source") && !generated.contains("const SOURCE"));
     assert!(generated.contains("(UINT64_C(1) << 63)"));
-    let instrumentation = format!("{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic void fixture_record_free(void*);\nstatic void fixture_child_cleanup(void*);\nstatic void fixture_child_dispose(void*);\n#undef free\nstatic void fixture_counted_free(void* p) {{ fixture_record_free(p); fixture_free(p); }}\n#define free fixture_counted_free\n");
+    let instrumentation = format!("static unsigned fixture_invalid_identity;\n{NATIVE_THREAD_LIFECYCLE_HARNESS}\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic void fixture_record_free(void*);\nstatic void fixture_child_cleanup(void*);\nstatic void fixture_child_dispose(void*);\n#undef free\nstatic void fixture_counted_free(void* p) {{ fixture_record_free(p); fixture_free(p); }}\n#define free fixture_counted_free\n");
     let mut generated = replace_once(
         generated,
         "typedef struct KuString {",
@@ -190,7 +221,32 @@ async fn main(): null! { return ok(null) }
         "int main(void) {",
         "static int fixture_unmodified_source_main(void) {",
     );
-    generated.push_str(&C_MAIN.replace("@EXTRA@", &format!("s_{}", original_arguments[0][1].0)));
+    let mut fixture_main = C_MAIN.replace("@EXTRA@", &format!("s_{}", original_arguments[0][1].0));
+    if indirect {
+        let call = &verified.functions[0].indirect_calls[0];
+        let TaskOp::StartIndirect { callee, .. } =
+            native.tasks.functions[0].states[call.state.0].operations[call.operation]
+        else {
+            panic!("verified indirect call")
+        };
+        let selector = format!("switch (frame->s_{})", callee.0);
+        generated = replace_once(
+            generated,
+            &selector,
+            &format!(
+                "switch (fixture_invalid_identity ? UINT32_MAX : frame->s_{})",
+                callee.0
+            ),
+        );
+        let probe =
+            INVALID_ID_CASE.replace("@EXTRA@", &format!("s_{}", original_arguments[0][1].0));
+        fixture_main = replace_once(
+            fixture_main,
+            "int main(void) {",
+            &format!("{probe}\nint main(void) {{\n  fixture_invalid_id_case();"),
+        );
+    }
+    generated.push_str(&fixture_main);
     let directory = TempDir::new("native-task-start-parameters");
     let path = directory.path().join("program.c");
     fs::write(&path, generated).unwrap();
@@ -481,5 +537,43 @@ static void fixture_case(unsigned mode,int error) {
 int main(void) {
   for (int error=0;error<2;error++) for (unsigned mode=FIXTURE_NORMAL;mode<=FIXTURE_RELEASE_OWNER;mode++) fixture_case(mode,error);
   puts("task-start-parameters-ok"); return 0;
+}
+"#;
+
+const INVALID_ID_CASE: &str = r#"
+static uint64_t fixture_actual_now(void* context) {
+  (void)context; return ku_task_driver_now_ms();
+}
+static void fixture_invalid_id_case(void) {
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
+  fixture_buffers=0; fixture_reserves=fixture_commits=fixture_restores=fixture_takes=0;
+  memset(fixture_frees,0,sizeof(fixture_frees)); memset(fixture_buffer,0,sizeof(fixture_buffer));
+  KuResult_str value={0}; value.ok=true; value.value=fixture_owned(31,"payload");
+  KuString extra=fixture_owned(17,"extra");
+  KuResult_str expected_value=value; KuString expected_extra=extra; /* Non-owning observations. */
+  int64_t count=37; bool flag=true;
+  KuTaskFrame_0 frame={0};
+  CHECK(ku_task_frame_0_init(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,&value,&extra,&count,&flag)==KU_TASK_FRAME_OK);
+  CHECK(fixture_empty_result(value) && fixture_empty_string(extra));
+  KuTaskControlV1 control={0}; ku_task_control_atomic_init(&control.phase,KU_TASK_CONTROL_LIVE);
+  KuTaskAdapterHostV1 host={0}; host.control=&control;
+  KuTaskFrameClockV1 clock={fixture_actual_now,NULL,&host};
+  size_t calls=fixture_ledger().calls;
+  /* Fault only the already materialized dispatch selector. No Start, Await,
+   * argument move, allocation, or result is replaced by this unit probe. */
+  fixture_invalid_identity=1;
+  CHECK(ku_task_frame_0_resume(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,&clock)==KU_TASK_FRAME_INVALID_STATE);
+  fixture_invalid_identity=0;
+  fixture_same_result(frame.s_63,expected_value);
+  fixture_same_string(frame.@EXTRA@,expected_extra);
+  CHECK(frame.header.initialized & (UINT64_C(1)<<63));
+  CHECK(!frame.header.running && !fixture_reserves && !fixture_commits && !fixture_restores && !fixture_takes);
+  CHECK(fixture_ledger().calls==calls && fixture_ledger().allocations==2u && fixture_ledger().bytes==48u);
+  uint64_t now=ku_task_driver_now_ms(); CHECK(now!=UINT64_MAX && now<UINT64_MAX-1000u);
+  CHECK(ku_task_frame_0_terminate(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,KU_TASK_FRAME_CANCELLED,now+1000u,&clock)==KU_TASK_FRAME_CANCELLED);
+  CHECK(!frame.header.initialized);
+  CHECK(ku_task_frame_0_destroy(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION)==KU_TASK_FRAME_OK);
+  CHECK(fixture_frees[0]==1u && fixture_frees[1]==1u);
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
 "#;

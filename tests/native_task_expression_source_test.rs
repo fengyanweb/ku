@@ -308,6 +308,41 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
             .contains("expressions beyond the Task analysis budget"),
         "{error}"
     );
+    // The internal API must reject deeply nested call inputs without exhausting
+    // the unchanged worker stack, even when the checker was bypassed.
+    let mut nested_calls = budget_ast(0, false);
+    let ku::ast::Item::Function(function) = &mut nested_calls.items[0] else {
+        unreachable!()
+    };
+    let ku::ast::Stmt::Return {
+        value: Some(value), ..
+    } = &mut function.body[0]
+    else {
+        unreachable!()
+    };
+    let ku::ast::ExprKind::Call { args, .. } = &mut value.kind else {
+        unreachable!()
+    };
+    let mut nested = args[0].clone();
+    for _ in 0..63 {
+        let span = nested.span;
+        nested = ku::ast::Expr::new(
+            ku::ast::ExprKind::Call {
+                callee: Box::new(ku::ast::Expr::new(
+                    ku::ast::ExprKind::Variable("Probe".into()),
+                    span,
+                )),
+                args: vec![nested],
+            },
+            span,
+        );
+    }
+    args[0] = nested;
+    let error = task_lower::lower_program(&nested_calls).unwrap_err();
+    assert!(
+        error.message.contains("mismatched async argument types"),
+        "{error}"
+    );
 }
 
 fn existing_task_short_circuit_source(expression: &str, continuation: &str) -> String {

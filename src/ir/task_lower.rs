@@ -73,8 +73,44 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 }
 
 fn owned_value(ty: &TaskSlotType) -> bool {
-    matches!(ty, TaskSlotType::Value { ty, borrowed: false }
+    matches!(ty, TaskSlotType::Callable { .. })
+        || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
         if matches!(ty, IrType::Str | IrType::Result(_)) || task::error_type(ty))
+}
+
+fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
+    if let TypeName::Function {
+        params,
+        param_modes,
+        return_type,
+        is_async: true,
+    } = ty
+    {
+        if params.len() != param_modes.len()
+            || params.len() > 64
+            || param_modes.iter().any(|mode| *mode != ParamMode::Owned)
+        {
+            return Err(unsupported(
+                "borrowed or oversized async callable signatures",
+                span,
+            ));
+        }
+        let result = value_type(return_type, span)?;
+        if !matches!(result, IrType::Result(_)) {
+            return Err(unsupported(
+                "async callable signatures without a Result return",
+                span,
+            ));
+        }
+        return Ok(TaskSlotType::Callable {
+            parameters: params
+                .iter()
+                .map(|ty| value_type(ty, span))
+                .collect::<KuResult<_>>()?,
+            result,
+        });
+    }
+    Ok(value_slot(value_type(ty, span)?))
 }
 
 fn copy_value(ty: &TaskSlotType) -> bool {
@@ -563,12 +599,7 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 _ => Err(unsupported("this literal in a Task frame", expression.span)),
             },
-            ExprKind::Variable(name) => self.local(name).ok_or_else(|| {
-                unsupported(
-                    "an unknown local or first-class function value",
-                    expression.span,
-                )
-            }),
+            ExprKind::Variable(name) => self.variable_expression(name, expression.span),
             ExprKind::Field { target, name } => {
                 let source = self.expression(target, depth + 1)?;
                 if !matches!(&self.function.slots[source.0].ty,
@@ -586,132 +617,7 @@ impl<'a> FunctionLowerer<'a> {
                 Ok(destination)
             }
             ExprKind::Call { callee, args } => {
-                if let ExprKind::Field {
-                    target: object,
-                    name,
-                } = &callee.kind
-                {
-                    if matches!(&object.kind, ExprKind::Variable(module) if module == "time")
-                        && name == "sleep"
-                        && self.std_time
-                        && self.local("time").is_none()
-                        && !self.signatures.contains_key("time")
-                    {
-                        if args.len() != 1 {
-                            return Err(unsupported(
-                                "time.sleep with other than one argument",
-                                expression.span,
-                            ));
-                        }
-                        let source = self.expression(&args[0], depth + 1)?;
-                        if self.function.slots[source.0].ty != value_slot(IrType::Int) {
-                            return Err(unsupported(
-                                "time.sleep arguments other than integer milliseconds",
-                                args[0].span,
-                            ));
-                        }
-                        let millis = self.copy_or_move(source)?;
-                        let destination =
-                            self.slot(value_slot(IrType::Result(Box::new(IrType::Null))))?;
-                        let poll = self.state(TaskTerminator::Terminate)?;
-                        let ready = self.state(TaskTerminator::Terminate)?;
-                        let cleanup = self.state(TaskTerminator::Terminate)?;
-                        self.terminate(TaskTerminator::Jump { target: poll })?;
-                        self.function.states[poll.0].terminator = TaskTerminator::Timer {
-                            millis,
-                            dst: destination,
-                            ready,
-                            cleanup,
-                        };
-                        self.cleanup_exits.push(cleanup);
-                        self.current = Some(ready);
-                        return Ok(destination);
-                    }
-                }
-                let ExprKind::Variable(name) = &callee.kind else {
-                    return Err(unsupported("indirect or method calls", expression.span));
-                };
-                if self.local(name).is_some() {
-                    return Err(unsupported("a call through a local value", expression.span));
-                }
-                // The ordinary checker resolves declared functions before
-                // builtin fallback. Native lowering must preserve that choice.
-                let declared_function = self.signatures.contains_key(name);
-                if !declared_function && name == "ok" {
-                    if args.len() != 1 {
-                        return Err(unsupported(
-                            "ok with other than one argument",
-                            expression.span,
-                        ));
-                    }
-                    let source = self.expression(&args[0], depth + 1)?;
-                    let TaskSlotType::Value { ty, .. } = &self.function.slots[source.0].ty else {
-                        return Err(unsupported("Task payloads inside Result", expression.span));
-                    };
-                    if !matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) {
-                        return Err(unsupported("nested Result values", expression.span));
-                    }
-                    let destination =
-                        self.slot(value_slot(IrType::Result(Box::new(ty.clone()))))?;
-                    self.emit(TaskOp::WrapOk {
-                        dst: destination,
-                        src: source,
-                    })?;
-                    return Ok(destination);
-                }
-                if !declared_function && (name == "println" || name == "print") {
-                    if args.len() != 1 {
-                        return Err(unsupported(
-                            "print with other than one argument",
-                            expression.span,
-                        ));
-                    }
-                    let value = self.expression(&args[0], depth + 1)?;
-                    self.emit(TaskOp::Print {
-                        value,
-                        newline: name == "println",
-                    })?;
-                    if !matches!(&args[0].kind, ExprKind::Variable(_))
-                        && owned_value(&self.function.slots[value.0].ty)
-                    {
-                        self.emit(TaskOp::Drop { slot: value })?;
-                    }
-                    return self.constant(TaskConstant::Null, IrType::Null);
-                }
-                let signature = self.signatures.get(name).cloned().ok_or_else(|| {
-                    unsupported(
-                        "a call other than a known top-level async function",
-                        expression.span,
-                    )
-                })?;
-                if args.len() != signature.parameters.len() || args.len() > 64 {
-                    return Err(unsupported(
-                        "mismatched async call arguments",
-                        expression.span,
-                    ));
-                }
-                let mut arguments = Vec::new();
-                for (argument, expected) in args.iter().zip(&signature.parameters) {
-                    let source = self.expression(argument, depth + 1)?;
-                    if self.function.slots[source.0].ty != value_slot(expected.clone()) {
-                        return Err(unsupported(
-                            "mismatched async argument types",
-                            argument.span,
-                        ));
-                    }
-                    // Snapshot each argument before evaluating the next one,
-                    // including when that later expression itself awaits.
-                    arguments.push(self.copy_or_move(source)?);
-                }
-                let destination = self.slot(TaskSlotType::Task {
-                    result: signature.result,
-                })?;
-                self.emit(TaskOp::Start {
-                    dst: destination,
-                    function: signature.id,
-                    arguments,
-                })?;
-                Ok(destination)
+                self.call_expression(callee, args, expression.span, depth)
             }
             ExprKind::Await(expression) => {
                 let source = self.expression(expression, depth + 1)?;
@@ -782,6 +688,224 @@ impl<'a> FunctionLowerer<'a> {
                 expression.span,
             )),
         }
+    }
+
+    // Keep function signatures and Callable temporaries outside each recursive
+    // expression frame. Even a Unary-only AST must fit the original depth gate.
+    #[inline(never)]
+    fn variable_expression(&mut self, name: &str, span: Span) -> KuResult<SlotId> {
+        if let Some(local) = self.local(name) {
+            return Ok(local);
+        }
+        let Some(signature) = self.signatures.get(name).cloned() else {
+            return Err(unsupported(
+                "an unknown local or first-class function value",
+                span,
+            ));
+        };
+        let slot = self.slot(TaskSlotType::Callable {
+            parameters: signature.parameters,
+            result: signature.result,
+        })?;
+        self.emit(TaskOp::InitCallable {
+            dst: slot,
+            function: signature.id,
+        })?;
+        Ok(slot)
+    }
+
+    // Calls carry signatures, argument vectors and ownership temporaries. Do
+    // not reserve that storage on every recursive Unary/Binary expression.
+    #[inline(never)]
+    fn call_expression(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if let ExprKind::Field {
+            target: object,
+            name,
+        } = &callee.kind
+        {
+            if matches!(&object.kind, ExprKind::Variable(module) if module == "time")
+                && name == "sleep"
+                && self.std_time
+                && self.local("time").is_none()
+                && !self.signatures.contains_key("time")
+            {
+                if args.len() != 1 {
+                    return Err(unsupported("time.sleep with other than one argument", span));
+                }
+                let source = self.expression(&args[0], depth + 1)?;
+                if self.function.slots[source.0].ty != value_slot(IrType::Int) {
+                    return Err(unsupported(
+                        "time.sleep arguments other than integer milliseconds",
+                        args[0].span,
+                    ));
+                }
+                let millis = self.copy_or_move(source)?;
+                let destination = self.slot(value_slot(IrType::Result(Box::new(IrType::Null))))?;
+                let poll = self.state(TaskTerminator::Terminate)?;
+                let ready = self.state(TaskTerminator::Terminate)?;
+                let cleanup = self.state(TaskTerminator::Terminate)?;
+                self.terminate(TaskTerminator::Jump { target: poll })?;
+                self.function.states[poll.0].terminator = TaskTerminator::Timer {
+                    millis,
+                    dst: destination,
+                    ready,
+                    cleanup,
+                };
+                self.cleanup_exits.push(cleanup);
+                self.current = Some(ready);
+                return Ok(destination);
+            }
+            if name == "clone" && args.is_empty() {
+                let source = self.expression(object, depth + 1)?;
+                let ty = self.function.slots[source.0].ty.clone();
+                if !matches!(ty, TaskSlotType::Callable { .. }) {
+                    return Err(unsupported(
+                        "clone of a non-callable value in a Task frame",
+                        span,
+                    ));
+                }
+                let destination = self.slot(ty)?;
+                self.emit(TaskOp::CloneCallable {
+                    dst: destination,
+                    src: source,
+                })?;
+                return Ok(destination);
+            }
+        }
+        let ExprKind::Variable(name) = &callee.kind else {
+            return self.indirect_call(callee, args, span, depth);
+        };
+        if let Some(local) = self.local(name) {
+            if matches!(
+                self.function.slots[local.0].ty,
+                TaskSlotType::Callable { .. }
+            ) {
+                return self.indirect_call(callee, args, span, depth);
+            }
+            return Err(unsupported("a call through a local value", span));
+        }
+        // The ordinary checker resolves declared functions before
+        // builtin fallback. Native lowering must preserve that choice.
+        let declared_function = self.signatures.contains_key(name);
+        if !declared_function && name == "ok" {
+            if args.len() != 1 {
+                return Err(unsupported("ok with other than one argument", span));
+            }
+            let source = self.expression(&args[0], depth + 1)?;
+            let TaskSlotType::Value { ty, .. } = &self.function.slots[source.0].ty else {
+                return Err(unsupported("Task payloads inside Result", span));
+            };
+            if !matches!(ty, IrType::Int | IrType::Bool | IrType::Null | IrType::Str) {
+                return Err(unsupported("nested Result values", span));
+            }
+            let destination = self.slot(value_slot(IrType::Result(Box::new(ty.clone()))))?;
+            self.emit(TaskOp::WrapOk {
+                dst: destination,
+                src: source,
+            })?;
+            return Ok(destination);
+        }
+        if !declared_function && (name == "println" || name == "print") {
+            if args.len() != 1 {
+                return Err(unsupported("print with other than one argument", span));
+            }
+            let value = self.expression(&args[0], depth + 1)?;
+            self.emit(TaskOp::Print {
+                value,
+                newline: name == "println",
+            })?;
+            if !matches!(&args[0].kind, ExprKind::Variable(_))
+                && owned_value(&self.function.slots[value.0].ty)
+            {
+                self.emit(TaskOp::Drop { slot: value })?;
+            }
+            return self.constant(TaskConstant::Null, IrType::Null);
+        }
+        let signature = self.signatures.get(name).cloned().ok_or_else(|| {
+            unsupported("a call other than a known top-level async function", span)
+        })?;
+        if args.len() != signature.parameters.len() || args.len() > 64 {
+            return Err(unsupported("mismatched async call arguments", span));
+        }
+        let mut arguments = Vec::new();
+        for (argument, expected) in args.iter().zip(&signature.parameters) {
+            let source = self.expression(argument, depth + 1)?;
+            if self.function.slots[source.0].ty != value_slot(expected.clone()) {
+                return Err(unsupported(
+                    "mismatched async argument types",
+                    argument.span,
+                ));
+            }
+            // Snapshot each argument before evaluating the next one,
+            // including when that later expression itself awaits.
+            arguments.push(self.copy_or_move(source)?);
+        }
+        let destination = self.slot(TaskSlotType::Task {
+            result: signature.result,
+        })?;
+        self.emit(TaskOp::Start {
+            dst: destination,
+            function: signature.id,
+            arguments,
+        })?;
+        Ok(destination)
+    }
+
+    fn indirect_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        // Retain the chosen identity before the first argument can suspend.
+        // Calls read the binding; assigning the same value still moves it.
+        let source = self.expression(callee, depth + 1)?;
+        let ty = self.function.slots[source.0].ty.clone();
+        let TaskSlotType::Callable { parameters, result } = &ty else {
+            return Err(unsupported(
+                "indirect or method calls through a non-callable",
+                span,
+            ));
+        };
+        if args.len() != parameters.len() || args.len() > 64 {
+            return Err(unsupported("mismatched async call arguments", span));
+        }
+        let frozen = self.slot(ty.clone())?;
+        self.emit(TaskOp::CloneCallable {
+            dst: frozen,
+            src: source,
+        })?;
+        if !matches!(callee.kind, ExprKind::Variable(_)) {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
+        let mut arguments = Vec::new();
+        for (argument, expected) in args.iter().zip(parameters) {
+            let value = self.expression(argument, depth + 1)?;
+            if self.function.slots[value.0].ty != value_slot(expected.clone()) {
+                return Err(unsupported(
+                    "mismatched async argument types",
+                    argument.span,
+                ));
+            }
+            arguments.push(self.copy_or_move(value)?);
+        }
+        let destination = self.slot(TaskSlotType::Task {
+            result: result.clone(),
+        })?;
+        self.emit(TaskOp::StartIndirect {
+            dst: destination,
+            callee: frozen,
+            arguments,
+        })?;
+        self.emit(TaskOp::Drop { slot: frozen })?;
+        Ok(destination)
     }
 
     fn logical_expression(
@@ -888,7 +1012,7 @@ impl<'a> FunctionLowerer<'a> {
         self.budget.text(name.len(), span)?;
         let source = self.expression(value, depth)?;
         if let Some(annotation) = annotation {
-            if self.function.slots[source.0].ty != value_slot(value_type(annotation, span)?) {
+            if self.function.slots[source.0].ty != local_type(annotation, span)? {
                 return Err(unsupported("a mismatched local annotation", span));
             }
         }
