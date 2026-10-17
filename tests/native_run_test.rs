@@ -5,6 +5,8 @@
 
 #[path = "support/bounded_process.rs"]
 pub mod bounded_process;
+#[path = "support/native_allocation_harness.rs"]
+mod native_allocation_harness;
 
 use std::env;
 use std::fs;
@@ -546,6 +548,43 @@ fn compile_c_harness(dir: &Path, source: &Path, out_stem: &str) -> Option<PathBu
         eprintln!("skip: no C compiler available for generated C harness");
         None
     }
+}
+
+fn run_array_capacity_c_harness(dir: &Path, generated: &str, stem: &str, checks: &str) {
+    let declaration = "typedef struct KuString {";
+    assert!(generated.contains(declaration));
+    let generated = generated.replacen(
+        declaration,
+        &format!(
+            "{}{declaration}",
+            native_allocation_harness::ALLOCATION_HOOK
+        ),
+        1,
+    );
+    let assertions = r#"
+#define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "array capacity check failed at line %d: %s\n", __LINE__, #condition); return 1; } } while (0)
+#define VECTOR_MATCHES(value) ((value).data ? ((value).capacity >= (value).len && (((KuPerfAllocation*)(value).data) - 1)->record.size == (value).capacity * sizeof(*(value).data)) : (!(value).len && !(value).capacity))
+#define NO_LIVE_ALLOCATIONS() (!ku_perf_overflow && !ku_perf_live_allocations && !ku_perf_live_bytes)
+"#;
+    let harness = dir.join(format!("{stem}-harness.c"));
+    fs::write(
+        &harness,
+        format!("#define main ku_fixture_main\n{generated}\n#undef main\n{assertions}\n{checks}"),
+    )
+    .expect("write array capacity C harness");
+    let Some(exe) = compile_c_harness(dir, &harness, stem) else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command.current_dir(dir);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("{stem} C harness was not bounded: {error}"));
+    assert!(
+        output.status.success(),
+        "{stem} C harness failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn run_binary(exe: &Path) -> (String, Option<i32>) {
@@ -3853,7 +3892,14 @@ fn native_fs_result_intrinsics_compile_and_run_independently() {
 
 #[test]
 fn native_fs_unicode_paths_nul_content_exists_and_sorted_read_dir() {
-    let dir = unique_temp_dir("fs-unicode");
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("fs-unicode"));
+    let dir = &cleanup.0;
     let listing = dir.join("目录");
     fs::create_dir_all(&listing).expect("create unicode directory");
     let first = listing.join("a.txt");
@@ -3885,15 +3931,158 @@ fn main(): null! {{
     );
     fs::write(dir.join("main.ku"), source).expect("write unicode fs source");
 
-    let Some(exe) = native_build(&dir, "main.ku", "fsunicode") else {
-        fs::remove_dir_all(&dir).ok();
+    let Some(exe) = native_build(dir, "main.ku", "fsunicode") else {
         return;
     };
     let (stdout, code) = run_binary_bytes(&exe);
     let normalized: Vec<u8> = stdout.into_iter().filter(|byte| *byte != b'\r').collect();
     assert_eq!(normalized, b"sorted\na\0b");
     assert_eq!(code, Some(0));
-    fs::remove_dir_all(&dir).ok();
+
+    let empty = dir.join("capacity-empty");
+    let one = dir.join("capacity-one");
+    let many = dir.join("capacity-many");
+    for directory in [&empty, &one, &many] {
+        fs::create_dir(directory).expect("create directory capacity fixture");
+    }
+    fs::write(one.join("entry-00.txt"), b"").expect("write single directory entry");
+    for index in (0..17).rev() {
+        fs::write(many.join(format!("entry-{index:02}.txt")), b"")
+            .expect("write directory growth entry");
+    }
+    let generated = native_emit_c(dir, "main.ku");
+    let allocation_hook = format!(
+        r#"{}
+static size_t ku_fs_fixture_realloc_calls, ku_fs_fixture_fail_realloc_at;
+static void* ku_fs_fixture_realloc(void* value, size_t bytes) {{
+  ku_fs_fixture_realloc_calls++;
+  if (ku_fs_fixture_fail_realloc_at == ku_fs_fixture_realloc_calls) return NULL;
+  return ku_perf_realloc(value, bytes);
+}}
+typedef struct KuString {{"#,
+        native_allocation_harness::ALLOCATION_HOOK
+    );
+    assert!(generated.contains("typedef struct KuString {"));
+    let generated = generated.replacen("typedef struct KuString {", &allocation_hook, 1);
+    let vector_allocation =
+        "KuString* grown = (KuString*)realloc(builder->values.data, next * sizeof(KuString));";
+    assert!(generated.contains(vector_allocation));
+    let generated = generated.replacen(
+        vector_allocation,
+        "KuString* grown = (KuString*)ku_fs_fixture_realloc(builder->values.data, next * sizeof(KuString));",
+        1,
+    );
+    let c_path = |path: &Path| {
+        let path = path.to_str().expect("UTF-8 fixture path");
+        let escaped = path
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\x{byte:02x}"))
+            .collect::<String>();
+        format!(
+            "ku_string_static((const uint8_t*)\"{escaped}\", {}u)",
+            path.len()
+        )
+    };
+    let checks = r#"
+#define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "directory capacity check failed at line %d: %s\n", __LINE__, #condition); return 1; } } while (0)
+static int ku_fs_fixture_empty(void) {
+  CHECK(!ku_perf_overflow && !ku_perf_live_allocations && !ku_perf_live_bytes);
+  return 0;
+}
+static int ku_fs_fixture_listing(KuString path, size_t count, size_t capacity) {
+  KuResult_array_str result = ku_fs_read_dir(path);
+  CHECK(result.ok && result.value.len == count && result.value.capacity == capacity);
+  size_t bytes = capacity * sizeof(KuString);
+  if (!count) CHECK(!result.value.data && !capacity);
+  else {
+    CHECK(result.value.data && (((KuPerfAllocation*)result.value.data) - 1)->record.size == bytes);
+    for (size_t i = 0; i < count; i++) {
+      KuString value = result.value.data[i];
+      char name[32];
+      int length = snprintf(name, sizeof(name), "entry-%02u.txt", (unsigned)i);
+      CHECK(length > 0 && value.len >= (size_t)length && value.storage == KU_STRING_OWNED);
+      CHECK(memcmp(value.ptr + value.len - (size_t)length, name, (size_t)length) == 0);
+      CHECK((((KuPerfAllocation*)value.ptr) - 1)->record.size == value.capacity);
+      bytes += value.capacity;
+      if (i) CHECK(ku_fs_path_compare(&result.value.data[i - 1], &value) < 0);
+    }
+  }
+  CHECK(ku_perf_live_allocations == count + (count ? 1u : 0u) && ku_perf_live_bytes == bytes);
+  ku_result_drop_array_str(&result);
+  CHECK(!result.value.data && !result.value.len && !result.value.capacity);
+  return ku_fs_fixture_empty();
+}
+static int ku_fs_fixture_failure(KuString path, size_t fail_at) {
+  ku_fs_fixture_realloc_calls = 0;
+  ku_fs_fixture_fail_realloc_at = fail_at;
+  KuResult_array_str result = ku_fs_read_dir(path);
+  CHECK(!result.ok && ku_fs_fixture_realloc_calls == fail_at);
+  CHECK(!result.value.data && !result.value.len && !result.value.capacity);
+  const char* message = "failed to read directory: out of memory";
+  CHECK(result.error.message.len == strlen(message) && !memcmp(result.error.message.ptr, message, strlen(message)));
+  ku_result_drop_array_str(&result);
+  ku_fs_fixture_fail_realloc_at = 0;
+  return ku_fs_fixture_empty();
+}
+static int ku_fs_fixture_growth_failure(void) {
+  KuFsDirBuilder builder = {0};
+  KuError error = {0};
+  KuString leaf = ku_string_static((const uint8_t*)"x", 1);
+  CHECK(ku_fs_dir_builder_push(&builder, leaf, &error));
+  size_t capacity = builder.values.capacity;
+  CHECK(capacity == 16u && (((KuPerfAllocation*)builder.values.data) - 1)->record.size == capacity * sizeof(KuString));
+  for (size_t i = builder.values.len; i < capacity; i++) CHECK(ku_fs_dir_builder_push(&builder, leaf, &error));
+  KuString* original = builder.values.data;
+  size_t bytes = ku_perf_live_bytes, output_bytes = builder.output_bytes;
+  uint8_t* input = (uint8_t*)malloc(7u);
+  CHECK(input);
+  memcpy(input, "pending", 7u);
+  ku_fs_fixture_fail_realloc_at = ku_fs_fixture_realloc_calls + 1u;
+  CHECK(!ku_fs_dir_builder_push(&builder, (KuString){input, 7u, 7u, KU_STRING_OWNED}, &error));
+  CHECK(ku_fs_fixture_realloc_calls == ku_fs_fixture_fail_realloc_at);
+  CHECK(builder.values.data == original && builder.values.len == capacity && builder.values.capacity == capacity);
+  CHECK(builder.output_bytes == output_bytes && ku_perf_live_allocations == 1u && ku_perf_live_bytes == bytes);
+  CHECK((((KuPerfAllocation*)original) - 1)->record.size == capacity * sizeof(KuString));
+  ku_fs_fixture_fail_realloc_at = 0;
+  ku_error_drop(&error);
+  ku_fs_dir_builder_drop(&builder);
+  CHECK(!builder.values.data && !builder.values.len && !builder.values.capacity && !builder.output_bytes);
+  return ku_fs_fixture_empty();
+}
+int main(void) {
+  CHECK(!ku_fs_fixture_listing(@EMPTY@, 0u, 0u));
+  CHECK(!ku_fs_fixture_listing(@ONE@, 1u, 16u));
+  CHECK(!ku_fs_fixture_listing(@MANY@, 17u, 32u));
+  CHECK(!ku_fs_fixture_failure(@ONE@, 1u));
+  CHECK(!ku_fs_fixture_failure(@MANY@, 2u));
+  CHECK(!ku_fs_fixture_growth_failure());
+  CHECK(!ku_fs_fixture_listing(@MANY@, 17u, 32u));
+  return 0;
+}
+"#
+    .replace("@EMPTY@", &c_path(&empty))
+    .replace("@ONE@", &c_path(&one))
+    .replace("@MANY@", &c_path(&many));
+    let harness = dir.join("fs-directory-capacity-harness.c");
+    fs::write(
+        &harness,
+        format!("#define main ku_fixture_main\n{generated}\n#undef main\n{checks}"),
+    )
+    .expect("write directory capacity C harness");
+    let Some(exe) = compile_c_harness(dir, &harness, "fs-directory-capacity") else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command.current_dir(dir);
+    let output = run_bounded(&mut command, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .unwrap_or_else(|error| panic!("directory capacity C harness was not bounded: {error}"));
+    assert!(
+        output.status.success(),
+        "directory capacity C harness failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -5774,7 +5963,14 @@ fn native_string_methods_match_interpreter() {
     // non-overlapping all-occurrences swap, and slice is char-indexed and returns
     // a Result. byte_len counts UTF-8 bytes without changing len or consuming its
     // input; its edge cases share this executable to avoid another C build.
-    let dir = unique_temp_dir("string-methods");
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("string-methods"));
+    let dir = &cleanup.0;
     fs::write(
         dir.join("main.ku"),
         concat!(
@@ -5832,11 +6028,11 @@ fn native_string_methods_match_interpreter() {
     )
     .expect("write main.ku");
 
-    let c = native_emit_c(&dir, "main.ku");
+    let c = native_emit_c(dir, "main.ku");
     assert!(c.contains("static KuArray_str ku_string_chars(KuString s)"));
     assert!(c.contains("result.data[index] = ku_string_alloc(len)"));
 
-    let Some(exe) = native_build(&dir, "main.ku", "strmethods") else {
+    let Some(exe) = native_build(dir, "main.ku", "strmethods") else {
         return;
     };
 
@@ -5847,7 +6043,55 @@ fn native_string_methods_match_interpreter() {
     );
     assert_eq!(code, Some(0));
 
-    fs::remove_dir_all(&dir).ok();
+    run_array_capacity_c_harness(
+        dir,
+        &c,
+        "string-chars-capacity",
+        r#"
+int main(void) {
+  KuArray_str empty = ku_string_chars(ku_string_static((const uint8_t*)"", 0u));
+  CHECK(!empty.len && !empty.capacity && VECTOR_MATCHES(empty));
+  KuArray_str empty_clone = ku_array_clone_str(empty);
+  CHECK(VECTOR_MATCHES(empty_clone) && NO_LIVE_ALLOCATIONS());
+  ku_array_drop_str(&empty);
+  ku_array_drop_str(&empty_clone);
+
+  const uint8_t sample[] = {0x41, 0x00, 0xe7, 0x95, 0x8c, 0xf0, 0x9f, 0x98, 0x80};
+  const size_t lengths[] = {1u, 1u, 3u, 4u};
+  uint8_t* bytes = (uint8_t*)malloc(13u);
+  CHECK(bytes);
+  memcpy(bytes, sample, sizeof(sample));
+  KuString input = {bytes, sizeof(sample), 13u, KU_STRING_OWNED};
+  KuArray_str chars = ku_string_chars(input);
+  CHECK(chars.len == 4u && chars.capacity == 4u && VECTOR_MATCHES(chars));
+  CHECK(input.ptr == bytes && input.len == sizeof(sample) && !memcmp(input.ptr, sample, sizeof(sample)));
+  ku_string_drop(&input);
+  size_t offset = 0;
+  for (size_t i = 0; i < chars.len; i++) {
+    KuString value = chars.data[i];
+    CHECK(value.len == lengths[i] && !memcmp(value.ptr, sample + offset, value.len));
+    if (i < 2u) CHECK(value.storage == KU_STRING_STATIC);
+    else CHECK(value.storage == KU_STRING_OWNED && (((KuPerfAllocation*)value.ptr) - 1)->record.size == value.capacity);
+    offset += value.len;
+  }
+  CHECK(offset == sizeof(sample) && ku_perf_live_allocations == 3u);
+  KuArray_str clone = ku_array_clone_str(chars);
+  CHECK(clone.len == 4u && clone.capacity == 4u && VECTOR_MATCHES(clone) && clone.data != chars.data);
+  CHECK(clone.data[2].ptr != chars.data[2].ptr && clone.data[3].ptr != chars.data[3].ptr);
+  CHECK(ku_perf_live_allocations == 6u && ku_perf_live_bytes == 2u * (4u * sizeof(KuString) + 7u));
+  ku_array_drop_str(&chars);
+  offset = 0;
+  for (size_t i = 0; i < clone.len; i++) {
+    CHECK(clone.data[i].len == lengths[i] && !memcmp(clone.data[i].ptr, sample + offset, lengths[i]));
+    offset += lengths[i];
+  }
+  ku_array_drop_str(&clone);
+  CHECK(!chars.data && !chars.len && !chars.capacity && !clone.data && !clone.len && !clone.capacity);
+  CHECK(NO_LIVE_ALLOCATIONS());
+  return 0;
+}
+"#,
+    );
 }
 
 #[test]
@@ -7208,14 +7452,33 @@ fn native_array_map_matches_interpreter() {
     // annotation, so its type is propagated from the array's element type (the
     // checker infers it, so the interpreter accepts `map(x => x*2)`; native must
     // too — rule 8). The result array is built by invoking the mapper per element.
-    let dir = unique_temp_dir("array-map-basic");
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("array-map-basic"));
+    let dir = &cleanup.0;
     fs::write(
         dir.join("main.ku"),
-        "fn main(): null! {\n    r = [1, 2, 3].map(x => x * 2)\n    println(r[0])\n    println(r[1])\n    println(r[2])\n    return ok(null)\n}\n",
+        concat!(
+            "fn main(): null! {\n",
+            "    r = [1, 2, 3].map(x => x * 2)\n",
+            "    println(r[0])\n",
+            "    println(r[1])\n",
+            "    println(r[2])\n",
+            "    flags = [1, 2, 3].map(x => x > 1)\n",
+            "    labels = [1, 2, 3].map(x => str(x))\n",
+            "    if (flags[0] || !flags[1] || !flags[2]) panic(\"bool map output changed\")\n",
+            "    if (labels[0] != \"1\" || labels[1] != \"2\" || labels[2] != \"3\") panic(\"string map output changed\")\n",
+            "    return ok(null)\n",
+            "}\n",
+        ),
     )
     .expect("write main.ku");
 
-    let Some(exe) = native_build(&dir, "main.ku", "mapbasic") else {
+    let Some(exe) = native_build(dir, "main.ku", "mapbasic") else {
         return;
     };
 
@@ -7223,7 +7486,69 @@ fn native_array_map_matches_interpreter() {
     assert_eq!(stdout.replace('\r', ""), "2\n4\n6\n");
     assert_eq!(code, Some(0));
 
-    fs::remove_dir_all(&dir).ok();
+    let generated = native_emit_c(dir, "main.ku");
+    run_array_capacity_c_harness(
+        dir,
+        &generated,
+        "array-map-capacity",
+        r#"
+static size_t fixture_calls;
+static int64_t fixture_int(void* env, int64_t value) { (void)env; fixture_calls++; return value * 2; }
+static bool fixture_bool(void* env, int64_t value) { (void)env; fixture_calls++; return value > 1; }
+static KuString fixture_string(void* env, int64_t value) { (void)env; fixture_calls++; return ku_string_from_int(value); }
+int main(void) {
+  KuArray_int empty = {0};
+  KuArray_int empty_int = ku_array_map_fn_int__to_int(empty, (KuClosure_fn_int__to_int){fixture_int, NULL});
+  KuArray_bool empty_bool = ku_array_map_fn_int__to_bool(empty, (KuClosure_fn_int__to_bool){fixture_bool, NULL});
+  KuArray_str empty_str = ku_array_map_fn_int__to_str(empty, (KuClosure_fn_int__to_str){fixture_string, NULL});
+  CHECK(!fixture_calls && VECTOR_MATCHES(empty_int) && VECTOR_MATCHES(empty_bool) && VECTOR_MATCHES(empty_str));
+  ku_array_drop_int(&empty_int);
+  ku_array_drop_bool(&empty_bool);
+  ku_array_drop_str(&empty_str);
+  CHECK(NO_LIVE_ALLOCATIONS());
+
+  int64_t values[] = {1, 2, 3};
+  KuArray_int input = {3u, values, 3u};
+  KuArray_int ints = ku_array_map_fn_int__to_int(input, (KuClosure_fn_int__to_int){fixture_int, NULL});
+  CHECK(fixture_calls == 3u && ints.len == 3u && ints.capacity == 3u && VECTOR_MATCHES(ints));
+  KuArray_int ints_clone = ku_array_clone_int(ints);
+  CHECK(ints_clone.data != ints.data && ints_clone.capacity == 3u && VECTOR_MATCHES(ints_clone));
+  for (size_t i = 0; i < 3u; i++) CHECK(ints.data[i] == values[i] * 2 && ints_clone.data[i] == ints.data[i]);
+  CHECK(ku_perf_live_allocations == 2u && ku_perf_live_bytes == 6u * sizeof(int64_t));
+  ku_array_drop_int(&ints);
+  CHECK(ints_clone.data[0] == 2 && ints_clone.data[2] == 6);
+  ku_array_drop_int(&ints_clone);
+  CHECK(NO_LIVE_ALLOCATIONS());
+
+  KuArray_bool bools = ku_array_map_fn_int__to_bool(input, (KuClosure_fn_int__to_bool){fixture_bool, NULL});
+  CHECK(fixture_calls == 6u && bools.len == 3u && bools.capacity == 3u && VECTOR_MATCHES(bools));
+  KuArray_bool bools_clone = ku_array_clone_bool(bools);
+  CHECK(bools_clone.data != bools.data && bools_clone.capacity == 3u && VECTOR_MATCHES(bools_clone));
+  for (size_t i = 0; i < 3u; i++) CHECK(bools.data[i] == (values[i] > 1) && bools_clone.data[i] == bools.data[i]);
+  CHECK(ku_perf_live_allocations == 2u && ku_perf_live_bytes == 6u * sizeof(bool));
+  ku_array_drop_bool(&bools);
+  CHECK(!bools_clone.data[0] && bools_clone.data[1] && bools_clone.data[2]);
+  ku_array_drop_bool(&bools_clone);
+  CHECK(NO_LIVE_ALLOCATIONS());
+
+  KuArray_str strings = ku_array_map_fn_int__to_str(input, (KuClosure_fn_int__to_str){fixture_string, NULL});
+  CHECK(fixture_calls == 9u && strings.len == 3u && strings.capacity == 3u && VECTOR_MATCHES(strings));
+  KuArray_str strings_clone = ku_array_clone_str(strings);
+  CHECK(strings_clone.data != strings.data && strings_clone.capacity == 3u && VECTOR_MATCHES(strings_clone));
+  for (size_t i = 0; i < 3u; i++) {
+    CHECK(strings.data[i].len == 1u && strings.data[i].ptr[0] == (uint8_t)('1' + i));
+    CHECK(strings.data[i].storage == KU_STRING_OWNED && strings_clone.data[i].storage == KU_STRING_OWNED);
+    CHECK(strings_clone.data[i].ptr != strings.data[i].ptr && strings_clone.data[i].len == 1u);
+  }
+  CHECK(ku_perf_live_allocations == 8u && ku_perf_live_bytes == 2u * (3u * sizeof(KuString) + 3u));
+  ku_array_drop_str(&strings);
+  for (size_t i = 0; i < 3u; i++) CHECK(strings_clone.data[i].ptr[0] == (uint8_t)('1' + i) && values[i] == (int64_t)i + 1);
+  ku_array_drop_str(&strings_clone);
+  CHECK(NO_LIVE_ALLOCATIONS());
+  return 0;
+}
+"#,
+    );
 }
 
 #[test]

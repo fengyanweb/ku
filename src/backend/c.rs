@@ -1186,6 +1186,7 @@ fn emit_array_map_helpers(out: &mut COutput, program: &IrProgram) -> KuResult<()
              \x20   if (array.len > SIZE_MAX / sizeof({out_type})) {{ fprintf(stderr, \"array allocation is too large\\n\"); exit(1); }}\n\
              \x20   result.data = ({out_type}*)malloc(array.len * sizeof({out_type}));\n\
              \x20   if (!result.data) {{ fprintf(stderr, \"array allocation failed\\n\"); exit(1); }}\n\
+             \x20   result.capacity = array.len;\n\
              \x20   for (size_t index = 0; index < array.len; index++) {{\n\
              \x20     if (__ku_handler_timeout_poll()) {{ timed_out = 1; break; }}\n\
              \x20     result.data[index] = mapper.invoke(mapper.env, {arg});\n\
@@ -7147,7 +7148,6 @@ static bool ku_fs_exists(KuString path) {
         out.push_str(
             r#"typedef struct KuFsDirBuilder {
   KuArray_str values;
-  size_t capacity;
   size_t output_bytes;
 } KuFsDirBuilder;
 
@@ -7169,8 +7169,8 @@ static bool ku_fs_dir_builder_push(KuFsDirBuilder* builder, KuString value, KuEr
     ku_fs_set_error(error, "read_dir_failed", "failed to read directory: directory listing is too large");
     return false;
   }
-  if (builder->values.len == builder->capacity) {
-    size_t next = builder->capacity == 0 ? 16 : builder->capacity * 2;
+  if (builder->values.len == builder->values.capacity) {
+    size_t next = builder->values.capacity == 0 ? 16 : builder->values.capacity * 2;
     if (next > KU_FS_MAX_DIRECTORY_ENTRIES) next = KU_FS_MAX_DIRECTORY_ENTRIES;
     KuString* grown = (KuString*)realloc(builder->values.data, next * sizeof(KuString));
     if (!grown) {
@@ -7179,7 +7179,7 @@ static bool ku_fs_dir_builder_push(KuFsDirBuilder* builder, KuString value, KuEr
       return false;
     }
     builder->values.data = grown;
-    builder->capacity = next;
+    builder->values.capacity = next;
   }
   builder->values.data[builder->values.len++] = value;
   builder->output_bytes += value.len;
@@ -16428,6 +16428,7 @@ fn emit_string_chars_helper(out: &mut COutput, program: &IrProgram) -> KuResult<
          \x20 if (result.len > SIZE_MAX / sizeof(KuString)) { fprintf(stderr, \"string.chars result is too large\\n\"); exit(1); }\n\
          \x20 result.data = (KuString*)calloc(result.len, sizeof(KuString));\n\
          \x20 if (!result.data) { fprintf(stderr, \"string.chars allocation failed\\n\"); exit(1); }\n\
+         \x20 result.capacity = result.len;\n\
          \x20 size_t byte = 0, index = 0;\n\
          \x20 while (byte < s.len) {\n\
          \x20   size_t next = byte + 1;\n\
