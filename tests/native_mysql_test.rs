@@ -2799,6 +2799,12 @@ int mysql_stmt_fetch_column(MYSQL_STMT* s, MYSQL_BIND* b, unsigned int col, unsi
   return 0;
 }
 my_bool mysql_stmt_free_result(MYSQL_STMT* s) {
+  /* MariaDB Connector/C reports CR_STMT_NO_RESULT for execute-only
+     statements; the connection is still healthy and must remain reusable. */
+  if (s && s->field_count == 0) {
+    s->error_code = 5025;
+    return 1;
+  }
   if (fake_atomic_exchange(&ku_fake_fail_stmt_free_result, 0)) {
     if (s && s->connection) s->connection->broken = 1;
     return 1;

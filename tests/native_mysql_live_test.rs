@@ -1,4 +1,4 @@
-//! Opt-in Oracle MySQL acceptance against mysql-loopback-fixture.py only.
+//! Opt-in MySQL acceptance against a newly created private loopback fixture.
 //!
 //! This is not a service discovery test: absent/foreign configuration fails
 //! before compilation or connection. Credentials remain in the private fixture
@@ -167,6 +167,10 @@ fn private_fixture() -> (PathBuf, String) {
 #[ignore = "requires a newly created private mysql-loopback-fixture.py instance"]
 fn native_mysql_client_live_loopback_roundtrip() {
     let (root, password) = private_fixture();
+    run_live_fixture(root, password, None);
+}
+
+fn run_live_fixture(root: PathBuf, password: String, expected_version: Option<&str>) {
     let directory = TempDir::new("mysql-live");
     let source = directory.path().join("main.ku");
     let executable = directory.path().join("mysql-live.exe");
@@ -178,7 +182,22 @@ fn native_mysql_client_live_loopback_roundtrip() {
         !config_path.chars().any(char::is_control),
         "private fixture path contains control characters"
     );
-    let rendered = LIVE_SOURCE.replace("__KU_PRIVATE_CONFIG__", &config_path.replace('"', "\\\""));
+    let mut rendered = LIVE_SOURCE
+        .replace("__KU_PRIVATE_CONFIG__", &config_path.replace('"', "\\\""))
+        .replace("__KU_MYSQL_NUL__", "\0");
+    if let Some(version) = expected_version {
+        // VERSION() comes from the actual server, not the connector library.
+        // The supervisor supplies a bounded ASCII value, so this adds neither
+        // credentials nor an arbitrary Ku source fragment to the program.
+        let marker = "    initial = client.query(\"SELECT CONNECTION_ID()\", [])?";
+        assert_eq!(rendered.matches(marker).count(), 1);
+        rendered = rendered.replace(
+            marker,
+            &format!(
+                "    identity = client.query(\"SELECT VERSION()\", [])?\n    if (identity.value(0, 0)? != \"{version}\") panic(\"unexpected server identity\")\n{marker}"
+            ),
+        );
+    }
     fs::write(&source, rendered).expect("write non-secret MySQL native fixture source");
     let ku = PathBuf::from(env::var_os("KU_BIN").expect("fixture must supply the Ku CLI"));
     plain(&ku, false);
@@ -199,6 +218,13 @@ fn native_mysql_client_live_loopback_roundtrip() {
         String::from_utf8_lossy(&built.stdout).replace(&password, "<redacted>"),
         String::from_utf8_lossy(&built.stderr).replace(&password, "<redacted>")
     );
+    // The runtime reads only the private JSON file. It cannot accidentally
+    // succeed by finding credentials in generated source files.
+    fs::remove_file(&source).expect("remove generated MySQL Ku source");
+    let c_source = directory.path().join("main.c");
+    if c_source.exists() {
+        fs::remove_file(c_source).expect("remove generated MySQL C source");
+    }
     let mut command = Command::new(executable);
     command.current_dir(&root);
     let output = run_bounded(
@@ -234,6 +260,155 @@ fn native_mysql_client_live_loopback_roundtrip() {
     );
 }
 
+#[cfg(target_os = "macos")]
+fn private_macos_fixture() -> (PathBuf, String, String) {
+    use std::os::unix::fs::MetadataExt;
+
+    let config = PathBuf::from(
+        env::var_os("KU_MYSQL_TEST_CONFIG_FILE")
+            .expect("supply a newly created private macOS loopback fixture"),
+    );
+    plain(&config, false);
+    assert_eq!(config.file_name().and_then(|v| v.to_str()), Some("db.json"));
+    let root = config.parent().expect("private loopback fixture directory");
+    plain(root, true);
+    let temp = env::temp_dir()
+        .canonicalize()
+        .expect("canonical temporary directory");
+    assert_eq!(root.parent(), Some(temp.as_path()));
+    let name = root.file_name().and_then(|v| v.to_str()).unwrap_or("");
+    let kind = ["mysql", "mariadb"]
+        .into_iter()
+        .find(|kind| {
+            name.strip_prefix(&format!("ku-{kind}-live-"))
+                .is_some_and(|suffix| lower_hex(suffix, 32))
+        })
+        .expect("configuration is not a newly named loopback fixture");
+    let private_owner = TempDir::new("mysql-owner");
+    let uid = fs::metadata(private_owner.path())
+        .expect("current fixture owner")
+        .uid();
+    for (path, directory) in [(root, true), (config.as_path(), false)] {
+        let metadata = fs::metadata(path).expect("private loopback fixture metadata");
+        assert_eq!(
+            metadata.uid(),
+            uid,
+            "fixture must belong to the current user"
+        );
+        assert_eq!(
+            metadata.mode() & 0o777,
+            if directory { 0o700 } else { 0o600 },
+            "fixture permissions must exclude other users"
+        );
+    }
+    for name in [
+        "operation.lock",
+        "server.active",
+        "server.pid",
+        "fixture.txt",
+    ] {
+        plain(&root.join(name), false);
+    }
+    let bounded_text = |path: &Path| {
+        let mut bytes = Vec::new();
+        File::open(path)
+            .expect("open private loopback fixture file")
+            .take(CONFIG_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .expect("read bounded private loopback fixture file");
+        assert!(
+            bytes.len() <= CONFIG_LIMIT as usize,
+            "fixture file exceeds byte bound"
+        );
+        String::from_utf8(bytes).expect("UTF-8 private fixture file")
+    };
+    let metadata = bounded_text(&root.join("fixture.txt"));
+    let fields: Vec<_> = metadata.lines().collect();
+    assert_eq!(fields.len(), 3, "unexpected fixture metadata shape");
+    assert_eq!(fields[0], kind, "fixture product identity mismatch");
+    let version = fields[1];
+    assert!(
+        !version.is_empty()
+            && version.len() <= 128
+            && version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
+        "invalid fixture server version"
+    );
+    assert_eq!(version.contains("MariaDB"), kind == "mariadb");
+    let sdk = Path::new(fields[2]);
+    plain(sdk, true);
+    for (variable, leaf) in [("KU_MYSQL_LIB", "lib"), ("KU_MYSQL_INCLUDE", "include")] {
+        let expected = sdk.join(leaf);
+        plain(&expected, true);
+        let actual = PathBuf::from(env::var_os(variable).expect("explicit matching client SDK"));
+        plain(&actual, true);
+        assert_eq!(actual, expected, "SDK must match the supervising fixture");
+    }
+    let config_text = bounded_text(&config);
+    let password = private_config_password(&config_text)
+        .expect("invalid private loopback configuration; no connection attempted")
+        .to_owned();
+    let port = config_text
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .split(',')
+        .find_map(|item| {
+            let (key, value) = item.split_once(':')?;
+            (key.trim() == "\"port\"").then(|| value.trim().parse::<u16>().ok())?
+        })
+        .expect("validated private loopback port");
+    let pid_text = bounded_text(&root.join("server.pid"));
+    let pid: u32 = pid_text.trim().parse().expect("owned server PID");
+    assert!(pid > 1, "invalid owned server PID");
+    assert_eq!(
+        bounded_text(&root.join("server.active")).trim(),
+        pid.to_string(),
+        "server markers disagree"
+    );
+    let mut inspect = Command::new("/bin/ps");
+    inspect.args(["-p", &pid.to_string(), "-o", "command="]);
+    let process = run_bounded(
+        &mut inspect,
+        Duration::from_secs(5),
+        OutputLimits::new(8192, 8192),
+    )
+    .expect("bounded owned-server inspection");
+    assert!(process.status.success(), "owned server is not running");
+    let command = String::from_utf8(process.stdout).expect("UTF-8 owned server command");
+    let arguments: Vec<_> = command.split_ascii_whitespace().collect();
+    let server_name = if kind == "mysql" {
+        "mysqld"
+    } else {
+        "mariadbd"
+    };
+    assert_eq!(
+        arguments
+            .first()
+            .and_then(|arg| Path::new(arg).file_name())
+            .and_then(|v| v.to_str()),
+        Some(server_name),
+        "owned process is not the expected server"
+    );
+    assert!(
+        arguments.contains(&format!("--datadir={}", root.join("data").display()).as_str())
+            && arguments.contains(&"--bind-address=127.0.0.1")
+            && arguments.contains(&format!("--port={port}").as_str())
+            && arguments.contains(&"--skip-name-resolve"),
+        "owned server must use this fixture's data and loopback binding"
+    );
+    (root.to_path_buf(), password, version.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires a newly created private macOS MySQL or MariaDB loopback instance"]
+fn native_mysql_client_live_macos_loopback_roundtrip() {
+    let (root, password, version) = private_macos_fixture();
+    run_live_fixture(root, password, Some(&version));
+}
+
 const LIVE_SOURCE: &str = r#"import mysql from "std.mysql"
 import fs from "std.fs"
 import json from "std.json"
@@ -258,15 +433,23 @@ fn main(): null! {
     if (reused.value(0, 0)? != initial_id) panic("single-slot pool did not reuse connection")
 
     client.execute("DROP TABLE IF EXISTS ku_live_values", [])?
+    after_drop = client.query("SELECT CONNECTION_ID()", [])?
+    if (after_drop.value(0, 0)? != initial_id) panic("no-result DROP discarded pooled connection")
     client.execute("CREATE TABLE ku_live_values (id INT PRIMARY KEY, value TEXT NOT NULL) CHARACTER SET utf8mb4", [])?
+    after_create = client.query("SELECT CONNECTION_ID()", [])?
+    if (after_create.value(0, 0)? != initial_id) panic("no-result CREATE discarded pooled connection")
     payload = "x'; DROP TABLE ku_live_values; --"
-    inserted = client.execute("INSERT INTO ku_live_values (id, value) VALUES (1, ?), (2, ?), (3, ?)", [payload.clone(), "", "你好🌍"])?
-    if (inserted != 3) panic("prepared insert affected rows")
+    binary_payload = "头__KU_MYSQL_NUL__尾"
+    inserted = client.execute("INSERT INTO ku_live_values (id, value) VALUES (1, ?), (2, ?), (3, ?), (4, ?)", [payload.clone(), "", "你好🌍", binary_payload.clone()])?
+    if (inserted != 4) panic("prepared insert affected rows")
+    after_insert = client.query("SELECT CONNECTION_ID()", [])?
+    if (after_insert.value(0, 0)? != initial_id) panic("no-result INSERT discarded pooled connection")
     values = client.query("SELECT value FROM ku_live_values ORDER BY id", [])?
-    if (values.rows() != 3 || values.cols() != 1) panic("prepared result shape")
+    if (values.rows() != 4 || values.cols() != 1) panic("prepared result shape")
     if (values.value(0, 0)? != payload) panic("prepared parameter injection")
     if (values.value(1, 0)? != "") panic("empty string result")
     if (values.value(2, 0)? != "你好🌍") panic("UTF-8 result")
+    if (values.value(3, 0)? != binary_payload || binary_payload.byte_len() != 7) panic("embedded NUL result or consumed parameter")
     nullable = client.query("SELECT NULL, CAST(? AS CHAR CHARACTER SET utf8mb4), REPEAT('z', 300)", [""])?
     if (!nullable.is_null(0, 0)? || nullable.is_null(0, 1)?) panic("SQL NULL versus empty string")
     // Parenthesize Result unwrap before field access; ?. is optional access.
@@ -329,6 +512,7 @@ fn main(): null! {
     client.close()
     // Detached result ownership outlives the consumed client.
     if (values.value(0, 0)? != payload || values.value(2, 0)? != "你好🌍") panic("close invalidated detached results")
+    if (values.value(3, 0)? != binary_payload) panic("close invalidated embedded NUL result")
 
     // Blocking MySQL APIs currently have a soft deadline, not hard async
     // interruption. A finite two-second query plus the outer 20-second

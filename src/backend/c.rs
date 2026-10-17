@@ -8772,7 +8772,10 @@ static void ku_mysql_statement_close_checked(
   if (!statement || !*statement) return;
   MYSQL_STMT* owned = *statement;
   *statement = NULL;
-  if (free_result && mysql_stmt_free_result(owned) != 0) *broken = true;
+  /* No-result statements have no result storage to release. MariaDB reports
+     CR_STMT_NO_RESULT for that call; it does not mean the connection broke. */
+  if (free_result && mysql_stmt_field_count(owned) != 0
+      && mysql_stmt_free_result(owned) != 0) *broken = true;
   if (mysql_stmt_close(owned) != 0) *broken = true;
 }
 
