@@ -73,6 +73,20 @@ async fn main(): null! {{ return ok(null) }}
     }
 }
 
+#[test]
+fn native_task_string_concat_repeated_pending_keeps_snapshot_and_starts_rhs_once() {
+    for right in ["return ok(\"new\")", "fail \"owned RHS failed\""] {
+        let source = format!(
+            r#"
+async fn Parent(base: int): str! {{ current="old" return ok(current+(await Right())?) }}
+async fn Right(): str! {{ {right} }}
+async fn main(): null! {{ return ok(null) }}
+"#
+        );
+        run_repeated_pending_expression(&source);
+    }
+}
+
 fn run_repeated_pending_expression(source: &str) {
     let ast = Parser::new(Lexer::new(source).lex().unwrap())
         .parse_program()
@@ -92,6 +106,17 @@ fn run_repeated_pending_expression(source: &str) {
         )
     });
     let failure = owned && source.contains("owned RHS failed");
+    let concat_left: Vec<_> = parent
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .filter_map(|op| match op {
+            TaskOp::StringConcat { left, .. } => Some(*left),
+            _ => None,
+        })
+        .collect();
+    let concat = !concat_left.is_empty();
+    assert!(concat_left.len() <= 1);
     let replacements: Vec<_> = parent
         .states
         .iter()
@@ -116,7 +141,11 @@ fn run_repeated_pending_expression(source: &str) {
             _ => None,
         })
         .collect();
-    let lhs = if owned {
+    let lhs = if concat {
+        assert!(replacements.is_empty());
+        assert!(lhs.is_empty());
+        concat_left[0]
+    } else if owned {
         assert_eq!(replacements.len(), 1);
         assert!(lhs.is_empty());
         replacements[0].0
@@ -130,9 +159,12 @@ fn run_repeated_pending_expression(source: &str) {
         .flat_map(|state| &state.operations)
         .filter_map(|op| match op {
             TaskOp::Copy { dst, src } if !owned && *dst == lhs => Some(*src),
-            TaskOp::Move { dst, src } if owned && *dst == lhs && *src != replacements[0].1 => {
+            TaskOp::Move { dst, src }
+                if owned && !concat && *dst == lhs && *src != replacements[0].1 =>
+            {
                 Some(*src)
             }
+            TaskOp::StringClone { dst, src } if concat && *dst == lhs => Some(*src),
             _ => None,
         })
         .collect();
@@ -168,7 +200,9 @@ fn run_repeated_pending_expression(source: &str) {
     } else {
         format!("slot_{}", frozen_source.0)
     };
-    let lhs_assignment = if owned {
+    let lhs_assignment = if concat {
+        format!("  {{ uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source_place},&frame->s_{});\n",lhs.0)
+    } else if owned {
         format!("  frame->s_{} = ku_string_move(&{source_place});\n", lhs.0)
     } else {
         format!("  frame->s_{} = {source_place};\n", lhs.0)
@@ -178,7 +212,10 @@ fn run_repeated_pending_expression(source: &str) {
         &lhs_assignment,
         &format!("  fixture_lhs();\n{lhs_assignment}"),
     );
-    if owned {
+    if concat {
+        let anchor="static uint32_t ku_task_host_concat_string(KuTaskAdapterHostV1* host,\n    KuString left, KuString right, KuString* output) {";
+        generated=replace_once(generated,anchor,"static uint32_t ku_task_host_concat_string(KuTaskAdapterHostV1*,KuString,KuString,KuString*);\nstatic uint32_t fixture_real_concat_string(KuTaskAdapterHostV1* host,\n    KuString left, KuString right, KuString* output) {");
+    } else if owned {
         let assignment = format!(
             "  frame->s_{} = ku_string_move(&frame->s_{});\n",
             lhs.0, replacements[0].1 .0
@@ -210,13 +247,15 @@ fn run_repeated_pending_expression(source: &str) {
         "static int fixture_unmodified_source_main(void) {",
     );
     generated.push_str(&format!(
-        "\n#define FIXTURE_OWNED {}\n#define FIXTURE_FAILURE {}\n",
+        "\n#define FIXTURE_OWNED {}\n#define FIXTURE_FAILURE {}\n#define FIXTURE_CONCAT {}\n",
         usize::from(owned),
-        usize::from(failure)
+        usize::from(failure),
+        usize::from(concat)
     ));
     generated.push_str(
         &C_MAIN
             .replace("@LHS@", &lhs.0.to_string())
+            .replace("@ORIGINAL@", &frozen_source.0.to_string())
             .replace("@CHILD@", &child_slot.0.to_string())
             .replace("@ENTRY@", &parent.entry.0.to_string())
             .replace("@AWAIT@", &await_state.to_string()),
@@ -257,6 +296,11 @@ static unsigned fixture_lhs_count,fixture_start_count,fixture_drive_count,fixtur
 static unsigned fixture_commit_count;
 static void fixture_lhs(void) { CHECK(!fixture_lhs_count++); }
 static void fixture_commit(void) { CHECK(!fixture_commit_count++); }
+#if FIXTURE_CONCAT
+static uint32_t ku_task_host_concat_string(KuTaskAdapterHostV1* host,KuString left,KuString right,KuString* output) {
+  fixture_commit(); return fixture_real_concat_string(host,left,right,output);
+}
+#endif
 static void fixture_start(void) { CHECK(!fixture_start_count++); }
 static void fixture_drive(uint32_t state) {
   CHECK(state==(fixture_drive_count ? @AWAIT@u : @ENTRY@u));
@@ -298,6 +342,10 @@ static void fixture_wait(KuTaskInstance_0* parent,const KuTaskDriverWaitTokenV1*
 #if FIXTURE_OWNED
   CHECK(parent->frame.s_@LHS@.ptr&&parent->frame.s_@LHS@.len==3u&&parent->frame.s_@LHS@.storage==KU_STRING_STATIC);
   CHECK(!memcmp(parent->frame.s_@LHS@.ptr,"old",3u)&&!fixture_commit_count);
+#if FIXTURE_CONCAT
+  CHECK(parent->frame.header.initialized&(UINT64_C(1)<<@ORIGINAL@));
+  CHECK(parent->frame.s_@ORIGINAL@.ptr==parent->frame.s_@LHS@.ptr&&parent->frame.s_@ORIGINAL@.len==3u);
+#endif
 #else
   CHECK(parent->frame.s_@LHS@==37);
 #endif
@@ -315,16 +363,17 @@ int main(void) {
   size_t* ring=(size_t*)calloc(2,sizeof(*ring)); CHECK(driver && slots && ring);
   size_t fixed=sizeof(*driver)+2u*(sizeof(*slots)+sizeof(*ring));
   size_t instances=sizeof(KuTaskInstance_0)+sizeof(KuTaskInstance_1);
+  size_t output_bytes=FIXTURE_CONCAT&&!FIXTURE_FAILURE ? 6u : 0u;
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now!=UINT64_MAX && startup_now<UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;
   CHECK(ku_task_driver_init(driver,sizeof(*driver),6u,
-      slots,2,ring,2,fixed+instances,1u,startup_deadline)==KU_TASK_DRIVER_ABI_MISMATCH);
+      slots,2,ring,2,fixed+instances+output_bytes,1u,startup_deadline)==KU_TASK_DRIVER_ABI_MISMATCH);
   CHECK(ku_task_frame_zero_bytes(driver,sizeof(*driver))
       && ku_task_frame_zero_bytes(slots,(2)*sizeof(*slots))
       && ku_task_frame_zero_bytes(ring,(2)*sizeof(*ring)));
   CHECK(ku_task_driver_init(driver,sizeof(*driver),KU_TASK_DRIVER_ABI_VERSION,
-      slots,2,ring,2,fixed+instances,1u,startup_deadline)==KU_TASK_DRIVER_OK);
+      slots,2,ring,2,fixed+instances+output_bytes,1u,startup_deadline)==KU_TASK_DRIVER_OK);
   int64_t base=37; KuTaskValueV1 root={0};
   uint64_t deadline=ku_task_driver_now_ms()+2000u;
   CHECK(ku_task_0_start_value(driver,&base,&root)==KU_TASK_DRIVER_OK && base==37);
@@ -364,7 +413,7 @@ int main(void) {
   CHECK(ku_task_driver_wake(&child)==KU_TASK_DRIVER_OK);
   CHECK(ku_task_driver_wait_result(&root.ticket,&root.owner.lease,deadline)==KU_TASK_DRIVER_WAIT_READY);
   KuTaskDriverSnapshotV1 ready=fixture_idle(driver,deadline);
-  CHECK(ready.resident==2u && ready.reserved_bytes==instances);
+  CHECK(ready.resident==2u && ready.reserved_bytes==instances+output_bytes);
   CHECK(fixture_drive_count==5u && fixture_lhs_count==1u && fixture_start_count==1u && fixture_right_count==2u);
   CHECK(fixture_commit_count==(FIXTURE_OWNED&&!FIXTURE_FAILURE ? 1u : 0u));
   CHECK(!parent->wait.driver && !parent->frame.header.initialized && parent->control.frame_destroyed);
@@ -377,7 +426,7 @@ int main(void) {
   CHECK(child_phase==expected_phase);
   CHECK(ku_task_control_atomic_load(&observer.control->payload)==KU_TASK_CONTROL_PAYLOAD_TAKEN);
   CHECK(observer.control->frame_destroyed && !ku_task_control_atomic_load(&observer.control->lifecycle_pin));
-  CHECK(fixture_ledger().calls==before.calls);
+  CHECK(fixture_ledger().calls==before.calls+(output_bytes ? 1u : 0u));
   KuTaskAdapterOutcomeV1 outcome={0};
   CHECK(ku_task_value_take(&root,NULL,&outcome)==KU_TASK_CONTROL_OK);
   CHECK(outcome.exit_class==KU_TASK_EXIT_USER_RESULT);
@@ -386,7 +435,11 @@ int main(void) {
   if (FIXTURE_FAILURE) {
     KuString message=outcome.value.string.error.message;
     CHECK(message.len==strlen("owned RHS failed")&&!memcmp(message.ptr,"owned RHS failed",message.len));
-  } else CHECK(outcome.value.string.value.len==3u&&!memcmp(outcome.value.string.value.ptr,"new",3u));
+  } else {
+    KuString text=outcome.value.string.value;
+    CHECK(text.len==(FIXTURE_CONCAT ? 6u : 3u)&&!memcmp(text.ptr,FIXTURE_CONCAT ? "oldnew" : "new",text.len));
+    if (FIXTURE_CONCAT) CHECK(text.storage==KU_STRING_OWNED&&text.capacity==6u);
+  }
 #else
   CHECK(outcome.result_kind==1u && outcome.value.integer.ok && outcome.value.integer.value==42);
 #endif

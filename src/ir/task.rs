@@ -156,6 +156,23 @@ pub enum TaskOp {
         dst: SlotId,
         src: SlotId,
     },
+    /// Read-only Unicode scalar count, or stored UTF-8 byte length.
+    StringLen {
+        dst: SlotId,
+        src: SlotId,
+        bytes: bool,
+    },
+    /// Independent string owner; static strings retain their immutable storage.
+    StringClone {
+        dst: SlotId,
+        src: SlotId,
+    },
+    /// Read both completed operands without consuming either input owner.
+    StringConcat {
+        dst: SlotId,
+        left: SlotId,
+        right: SlotId,
+    },
     /// Internal loop extraction: primitives copy, strings move and zero a leaf.
     ArrayTake {
         dst: SlotId,
@@ -451,6 +468,15 @@ fn result_type(ty: &IrType) -> bool {
 
 fn copy_type(ty: &IrType) -> bool {
     matches!(ty, IrType::Int | IrType::Bool | IrType::Null)
+}
+
+/// These operations need the current allocation host even in a leaf Task.
+/// Share this selection with C frame validation and adapter charge projection.
+pub(crate) fn requires_string_allocation_host(operation: &TaskOp) -> bool {
+    matches!(
+        operation,
+        TaskOp::ErrorField { .. } | TaskOp::StringClone { .. } | TaskOp::StringConcat { .. }
+    )
 }
 
 /// The source lowering commits an owned replacement through this exact pair.
@@ -915,6 +941,40 @@ fn validate_shape(
                             && destination != &IrType::Int)
                     {
                         return Err(invalid("array operation has invalid source or destination"));
+                    }
+                }
+                TaskOp::StringLen { dst, src, .. } | TaskOp::StringClone { dst, src } => {
+                    has_error_projection |= requires_string_allocation_host(operation);
+                    let (source, source_borrowed) = slot_type(get_slot(*src)?)?;
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                    let expected = if matches!(operation, TaskOp::StringLen { .. }) {
+                        &IrType::Int
+                    } else {
+                        &IrType::Str
+                    };
+                    if dst == src
+                        || source_borrowed
+                        || destination_borrowed
+                        || source != &IrType::Str
+                        || destination != expected
+                    {
+                        return Err(invalid(
+                            "string operation has invalid source or destination",
+                        ));
+                    }
+                }
+                TaskOp::StringConcat { dst, left, right } => {
+                    has_error_projection |= requires_string_allocation_host(operation);
+                    budget.spend_many(2)?;
+                    for source in [left, right] {
+                        let (ty, borrowed) = slot_type(get_slot(*source)?)?;
+                        if source == dst || borrowed || ty != &IrType::Str {
+                            return Err(invalid("StringConcat requires distinct owned str destination and str inputs"));
+                        }
+                    }
+                    let (ty, borrowed) = slot_type(get_slot(*dst)?)?;
+                    if borrowed || ty != &IrType::Str {
+                        return Err(invalid("StringConcat requires an owned str destination"));
                     }
                 }
                 TaskOp::ArrayTake { dst, array, index } => {
@@ -1639,6 +1699,9 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::CloneCallable { dst, .. }
         | TaskOp::ArrayClone { dst, .. }
         | TaskOp::ArrayLen { dst, .. }
+        | TaskOp::StringLen { dst, .. }
+        | TaskOp::StringClone { dst, .. }
+        | TaskOp::StringConcat { dst, .. }
         | TaskOp::ArrayTake { dst, .. }
         | TaskOp::Copy { dst, .. }
         | TaskOp::Move { dst, .. }
@@ -1989,6 +2052,9 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         | TaskOp::CloneCallable { dst, .. }
         | TaskOp::ArrayClone { dst, .. }
         | TaskOp::ArrayLen { dst, .. }
+        | TaskOp::StringLen { dst, .. }
+        | TaskOp::StringClone { dst, .. }
+        | TaskOp::StringConcat { dst, .. }
         | TaskOp::ArrayTake { dst, .. }
         | TaskOp::Copy { dst, .. }
         | TaskOp::Unary { dst, .. }
@@ -2048,7 +2114,7 @@ fn operation_work(operation: &TaskOp, budget: &mut Budget) -> KuResult<()> {
         | TaskOp::Start { arguments, .. }
         | TaskOp::StartIndirect { arguments, .. } => budget.spend_many(arguments.len())?,
         TaskOp::Unary { .. } => budget.spend()?,
-        TaskOp::Binary { .. } => budget.spend_many(2)?,
+        TaskOp::Binary { .. } | TaskOp::StringConcat { .. } => budget.spend_many(2)?,
         _ => {}
     }
     Ok(())
@@ -2294,6 +2360,8 @@ fn live_states(
                     | TaskOp::CloneCallable { dst, src }
                     | TaskOp::ArrayClone { dst, src }
                     | TaskOp::ArrayLen { dst, src }
+                    | TaskOp::StringLen { dst, src, .. }
+                    | TaskOp::StringClone { dst, src }
                     | TaskOp::Move { dst, src }
                     | TaskOp::WrapOk { dst, src }
                     | TaskOp::WrapError { dst, src }
@@ -2307,7 +2375,10 @@ fn live_states(
                     }
                     | TaskOp::Binary {
                         dst, left, right, ..
-                    } => live = (live & !bit(*dst)) | bit(*left) | bit(*right),
+                    }
+                    | TaskOp::StringConcat { dst, left, right } => {
+                        live = (live & !bit(*dst)) | bit(*left) | bit(*right)
+                    }
                     TaskOp::Read { slot }
                     | TaskOp::CheckForLimit { slot }
                     | TaskOp::Drop { slot }
@@ -2399,6 +2470,8 @@ fn validate_ownership_and_plan(
                 | TaskOp::CloneCallable { src, .. }
                 | TaskOp::ArrayClone { src, .. }
                 | TaskOp::ArrayLen { src, .. }
+                | TaskOp::StringLen { src, .. }
+                | TaskOp::StringClone { src, .. }
                 | TaskOp::StartIndirect { callee: src, .. }
                 | TaskOp::Move { src, .. }
                 | TaskOp::WrapOk { src, .. }
@@ -2418,6 +2491,7 @@ fn validate_ownership_and_plan(
                 ));
             }
             if let TaskOp::Binary { left, right, .. }
+            | TaskOp::StringConcat { left, right, .. }
             | TaskOp::ArrayTake {
                 array: left,
                 index: right,

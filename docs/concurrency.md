@@ -56,7 +56,26 @@ Copy 表达式支持 int 的一元 `-`、`+ - * / %`、`== != < <= > >=`，以�
 都不执行，但右侧仍受静态类型与预算检查。若 Task 在逻辑表达式前已经创建，短路
 跳过它的 await 不免除当前 scope 的最终清理责任，也不会撤销它的立即启动；
 该 Task 可能在 scope 发起取消前已经执行，不能据短路推断它没有产生副作用。
-新字符串表达式目前仅支持静态字面量；内部 ABI 仍负责 owned 参数/结果的 move/drop。
+字符串接通 `text.len()`、`text.byte_len()`、`text.clone()` 和 `left + right`。
+len 计 Unicode 标量，byte_len 读取 UTF-8 字节数，均不消费输入；静态 clone 共享
+只读正文，Owned clone 独立复制（非空指针的空串计真实 1 字节）。拼接在右侧求值前
+clone 左侧快照；右侧 Await 或显式 move 原值不会破坏它。成功后释放专用快照；
+失败、提前退出或取消沿原初始化位清理。快照、输入和新结果同时存活时都计入原预算，
+分配不足为外层 memory_limit/out_of_memory，不变成普通业务 Err。长度溢出在分配前
+拒绝。没有新增字符串 is_empty 方法，判断空串可用 `text.byte_len() == 0`。
+
+```ku
+async fn Suffix(text: str): str! { return ok(text) }
+async fn main(): null! {
+    text = "中😀"
+    println(text.len())       // 2
+    println(text.byte_len())  // 7
+    joined = text + (await Suffix("!"))?
+    println(text)             // 原值仍可读取
+    println(joined)
+    return ok(null)
+}
+```
 接纳/OOM 拒绝仍消费源码已经移动的实参，返回可 await 的失败 Task，错误不再申请内存。
 
 If 包括嵌套 `else if`，条件必须是 bool，可使用当前子集的 Await、`?` 和短路表达式。

@@ -211,7 +211,7 @@ impl<'a> FrameEmitter<'a> {
                         ) || state
                             .operations
                             .iter()
-                            .any(|op| matches!(op, TaskOp::ErrorField { .. }))
+                            .any(crate::ir::task::requires_string_allocation_host)
                             || state.operations.windows(2).any(|pair| {
                                 crate::ir::task::replaces_owned_value(
                                     function,
@@ -1205,6 +1205,28 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 ));
                 self.set_init(out, *dst, true);
             }
+            TaskOp::StringLen { dst, src, bytes } => {
+                let source = self.place(*src);
+                let length = if *bytes {
+                    format!("{source}.len")
+                } else {
+                    format!("ku_string_char_len({source})")
+                };
+                out.push_str(&format!("  {}=(int64_t)({length});\n", self.place(*dst)));
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::StringClone { dst, src } => {
+                out.push_str(&format!("  {{ uint32_t allocated=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{},&{});\n",self.place(*src),self.place(*dst)));
+                self.emit_string_allocation_check(out, "allocated")?;
+                out.push_str("  }\n");
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::StringConcat { dst, left, right } => {
+                out.push_str(&format!("  {{ uint32_t allocated=ku_task_host_concat_string((KuTaskAdapterHostV1*)clock->host,{},{},&{});\n",self.place(*left),self.place(*right),self.place(*dst)));
+                self.emit_string_allocation_check(out, "allocated")?;
+                out.push_str("  }\n");
+                self.set_init(out, *dst, true);
+            }
             TaskOp::ArrayTake { dst, array, index } => {
                 let source = self.place(*array);
                 let index = self.place(*index);
@@ -1402,6 +1424,13 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             "ku_error_make((KuString){0},(KuString){0},arithmetic_status==KU_INT_DIV_ZERO ? ku_string_static((const uint8_t*)\"division by zero\",16) : ku_string_static((const uint8_t*)\"integer overflow\",16))")?;
         out.push_str("  } }\n");
         self.set_init(out, dst, true);
+        Ok(())
+    }
+
+    fn emit_string_allocation_check(&self, out: &mut COutput, status: &str) -> KuResult<()> {
+        out.push_str(&format!("  if ({status}==KU_TASK_DRIVER_LIMIT || {status}==KU_TASK_HOST_ALLOCATION_FAILED) {{\n"));
+        self.emit_runtime_error(out,&format!("ku_error_make({},{status}==KU_TASK_DRIVER_LIMIT ? {} : {},{status}==KU_TASK_DRIVER_LIMIT ? {} : {})",c_static_utf8_string("task"),c_static_utf8_string("memory_limit"),c_static_utf8_string("out_of_memory"),c_static_utf8_string("native Task allocation budget exceeded"),c_static_utf8_string("native Task allocation failed")))?;
+        out.push_str(&format!("  }}\n  if ({status}!=KU_TASK_DRIVER_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n"));
         Ok(())
     }
 

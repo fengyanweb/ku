@@ -168,6 +168,59 @@ fn native_task_copy_expression_lhs_snapshot_crosses_rhs_await() {
 }
 
 #[test]
+fn native_task_string_concat_snapshots_before_rhs_move_and_await() {
+    let native=lowered("async fn Right(value: str): str! { return ok(value) } async fn main(): null! { value=\"中\0😀\" joined=value+(await Right(value))? println(joined) return ok(null) }");
+    let main = &native.tasks.functions[native.entry.0];
+    let (concat_state, concat_position, left) = main
+        .states
+        .iter()
+        .enumerate()
+        .find_map(|(state, body)| {
+            body.operations
+                .iter()
+                .enumerate()
+                .find_map(|(position, op)| match op {
+                    TaskOp::StringConcat { left, .. } => Some((state, position, *left)),
+                    _ => None,
+                })
+        })
+        .unwrap();
+    let (start_state, start_position) = main
+        .states
+        .iter()
+        .enumerate()
+        .find_map(|(state, body)| {
+            body.operations
+                .iter()
+                .position(|op| matches!(op,TaskOp::Start {function,..} if function.0==0))
+                .map(|position| (state, position))
+        })
+        .unwrap();
+    let snapshot = main.states[start_state].operations[..start_position]
+        .iter()
+        .position(|op| matches!(op,TaskOp::StringClone {dst,..} if *dst==left))
+        .unwrap();
+    let source = match main.states[start_state].operations[snapshot] {
+        TaskOp::StringClone { src, .. } => src,
+        _ => unreachable!(),
+    };
+    assert_ne!(source, left);
+    assert!(
+        main.states[start_state].operations[snapshot + 1..start_position]
+            .iter()
+            .any(|op| matches!(op,TaskOp::Move {src,..} if *src==source))
+    );
+    assert!(
+        matches!(main.states[concat_state].operations[concat_position+1],TaskOp::Drop {slot} if slot==left)
+    );
+    let plan = task::verify_and_plan(&native.tasks, Default::default()).unwrap();
+    assert!(plan.functions[native.entry.0]
+        .suspensions
+        .iter()
+        .any(|suspension| suspension.slots.contains(&left)));
+}
+
+#[test]
 fn native_task_short_circuit_nested_rhs_joins_from_its_actual_final_state() {
     let native = lowered("async fn Flag(): bool! { return ok(true) } async fn main(): null! { value = false || ((await Flag())? && true) println(value) return ok(null) }");
     let main = &native.tasks.functions[native.entry.0];
@@ -225,7 +278,7 @@ fn native_task_copy_expression_type_and_skipped_rhs_budget_gates_remain_strict()
         "1 == true",
         "true < false",
         "null == null",
-        "\"a\" + \"b\"",
+        "\"a\" + 1",
         "\"a\" == \"b\"",
         "ok(1) == ok(1)",
         "Child() == Child()",
@@ -449,7 +502,15 @@ fn native_task_copy_expression_order_and_short_circuit_execute_without_source() 
     let existing_and = existing_task_short_circuit_source("false &&", "println(value)");
     let existing_or = existing_task_short_circuit_source("true ||", "println(value)");
     let observed_error = existing_task_short_circuit_source("true &&", "println(\"BAD\")");
+    let nul_methods = r#"async fn main(): null! { text="中\0😀" println(text.len()) println(text.byte_len()) copy=text.clone() println(copy.len()) println(text.byte_len()) owned=text+"!" again=owned.clone() println(again.len()) println(owned.byte_len()) empty=""+"" copied=empty.clone() println(copied.len()) println(empty.byte_len()) return ok(null) }"#.replace("\\0", "\0");
+    let nul_await = r#"async fn Right(value: str): str! { println("R") return ok(value) } async fn main(): null! { text="中\0😀" joined=text+(await Right(text))? println(joined.len()) println(joined.byte_len()) println(joined) return ok(null) }"#.replace("\\0", "\0");
     let cases = [
+        (r#"
+async fn Cloned(): null! { text="x" index=0 while (index<2 && text.clone().len()>0) { index=index+1 } println(index) return ok(null) }
+async fn RightJoined(): null! { text="x" index=0 while (index<2 && (text+"x").len()>0) { index=index+1 } println(index) return ok(null) }
+async fn LeftJoined(): null! { text="x" index=0 while (index<2 && ("x"+text).len()>0) { index=index+1 } println(index) return ok(null) }
+async fn main(): null! { (await Cloned())?; (await RightJoined())?; (await LeftJoined())?; return ok(null) }
+"#, "2\n2\n2\n", "", true),
         ("async fn Left(): int! { println(\"L\") return ok(7) } async fn Right(): int! { println(\"R\") return ok(2) } async fn Combine(a: int, b: int): int! { println(\"C\") return ok(a + b) } async fn main(): null! { value = (await Combine((await Left())? + 1, (await Right())? * 3))? println(value) return ok(null) }", "L\nR\nC\n14\n", "", true),
         ("async fn Flag(value: bool): bool! { println(\"R\") return ok(value) } async fn main(): null! { a = false && (await Flag(true))? println(a) b = true || (await Flag(false))? println(b) c = true && (await Flag(true))? println(c) d = false || (await Flag(false))? println(d) return ok(null) }", "false\ntrue\nR\ntrue\nR\nfalse\n", "", true),
         ("async fn Broken(): bool! { println(\"BAD\") fail \"boom\" } async fn main(): null! { a = false && (await Broken())? println(a) b = true || ((await Broken())? && ((1 / 0) == 0)) println(b) c = false && ((1 / 0) == 0) println(c) return ok(null) }", "false\ntrue\nfalse\n", "", true),
@@ -459,6 +520,9 @@ fn native_task_copy_expression_order_and_short_circuit_execute_without_source() 
         (existing_and.as_str(), "false\n", "", true),
         (existing_or.as_str(), "true\n", "", true),
         (observed_error.as_str(), "", "boom\n", false),
+        (nul_methods.as_str(), "3\n8\n3\n8\n4\n9\n0\n0\n", "", true),
+        (nul_await.as_str(), "R\n6\n16\n中\0😀中\0😀\n", "", true),
+        (r#"async fn Broken(value: str): str! { println(value) fail "concat RHS failed" } async fn main(): null! { text="owned"+" left" result=text+(await Broken(text))? println(result) return ok(null) }"#, "owned left\n", "concat RHS failed\n", false),
     ];
     for (index, (source, stdout, stderr, success)) in cases.into_iter().enumerate() {
         let native = lowered(source);

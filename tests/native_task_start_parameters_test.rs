@@ -79,6 +79,8 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 | TaskOp::CloneCallable { dst, src }
                 | TaskOp::ArrayClone { dst, src }
                 | TaskOp::ArrayLen { dst, src }
+                | TaskOp::StringLen { dst, src, .. }
+                | TaskOp::StringClone { dst, src }
                 | TaskOp::Move { dst, src }
                 | TaskOp::WrapOk { dst, src }
                 | TaskOp::WrapError { dst, src }
@@ -95,7 +97,8 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 }
                 TaskOp::Binary {
                     dst, left, right, ..
-                } => {
+                }
+                | TaskOp::StringConcat { dst, left, right } => {
                     map(dst);
                     map(left);
                     map(right);

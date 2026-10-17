@@ -435,6 +435,10 @@ AST→Task IR 路径，沿用 import graph 展开和 C artifact/options，不包
 保留原清理来源。RHS 失败不执行这次替换，但不撤销 RHS 自身的显式 move；求值期间
 旧新 owner 的真实峰值仍计费。裸 `[]` 仅从已有平面数组赋值目标推断，入口消耗原
 表达式预算一次。原 raw IR 的直接覆盖拒绝和初始化/别名检查保持不变。
+StringLen 只读来源；StringClone/StringConcat 产生新 owner 并共用原 allocation-host。
+str+ 先 StringClone 保存左侧，再 lower 右侧；成功拼接后 Drop 专用快照。新操作补齐
+初始化、活跃槽、只读输入与目的别名检查。需分配 host 的选择由 IR、C 帧校验和
+adapter 共用，即使没有子 Task 的纯字符串函数也持久保存 Owned 槽并准确核对容量。
 源码 while 的回边指向条件求值入口，而非 Await.ready 或旧 bool Branch；本轮正常
 ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不能省略让出。
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。

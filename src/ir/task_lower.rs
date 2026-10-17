@@ -710,6 +710,17 @@ impl<'a> FunctionLowerer<'a> {
             }
             ExprKind::Binary { left, op, right } => {
                 let source = self.expression(left, depth + 1)?;
+                if *op == BinaryOp::Add
+                    && self.function.slots[source.0].ty == value_slot(IrType::Str)
+                {
+                    return self.string_concat_expression(
+                        source,
+                        !matches!(&left.kind, ExprKind::Variable(_)),
+                        right,
+                        expression.span,
+                        depth,
+                    );
+                }
                 let equality = matches!(op, BinaryOp::Equal | BinaryOp::NotEqual);
                 let input_type = match &self.function.slots[source.0].ty {
                     TaskSlotType::Value {
@@ -876,6 +887,48 @@ impl<'a> FunctionLowerer<'a> {
         }
     }
 
+    // String owners and allocation temporaries stay outside ordinary recursive
+    // expression frames. Preserve the completed left value before RHS effects.
+    #[inline(never)]
+    fn string_concat_expression(
+        &mut self,
+        source: SlotId,
+        temporary_left: bool,
+        right: &Expr,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let left = self.slot(value_slot(IrType::Str))?;
+        self.emit(TaskOp::StringClone {
+            dst: left,
+            src: source,
+        })?;
+        if temporary_left {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
+        let temporary_right = !matches!(&right.kind, ExprKind::Variable(_));
+        let right = self.expression(right, depth + 1)?;
+        if self.function.slots[right.0].ty != value_slot(IrType::Str) {
+            return Err(unsupported(
+                "mixed string concatenation operand types",
+                span,
+            ));
+        }
+        let destination = self.slot(value_slot(IrType::Str))?;
+        self.emit(TaskOp::StringConcat {
+            dst: destination,
+            left,
+            right,
+        })?;
+        // This owner is a lowering-only snapshot. Both input expressions retain
+        // their ordinary ownership, including any explicit move in the RHS.
+        self.emit(TaskOp::Drop { slot: left })?;
+        if temporary_right {
+            self.emit(TaskOp::Drop { slot: right })?;
+        }
+        Ok(destination)
+    }
+
     // Keep the large Option<IrType> argument out of every recursive Unary
     // frame, including frames which never evaluate an array expression.
     #[inline(never)]
@@ -1033,6 +1086,56 @@ impl<'a> FunctionLowerer<'a> {
         Ok(None)
     }
 
+    #[inline(never)]
+    fn string_or_callable_method_expression(
+        &mut self,
+        object: &Expr,
+        name: &str,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        let source = self.expression(object, depth + 1)?;
+        let ty = self.function.slots[source.0].ty.clone();
+        if ty == value_slot(IrType::Str) {
+            let destination = self.slot(value_slot(if name == "clone" {
+                IrType::Str
+            } else {
+                IrType::Int
+            }))?;
+            self.emit(if name == "clone" {
+                TaskOp::StringClone {
+                    dst: destination,
+                    src: source,
+                }
+            } else {
+                TaskOp::StringLen {
+                    dst: destination,
+                    src: source,
+                    bytes: name == "byte_len",
+                }
+            })?;
+            // Anonymous receivers have completed their last View use. Clear
+            // them here, including in a loop condition reusing the same slots.
+            // Named variables retain their existing owner and lexical lifetime.
+            if !matches!(&object.kind, ExprKind::Variable(_)) {
+                self.emit(TaskOp::Drop { slot: source })?;
+            }
+            return Ok(destination);
+        }
+        if name == "clone" && matches!(ty, TaskSlotType::Callable { .. }) {
+            let destination = self.slot(ty)?;
+            self.emit(TaskOp::CloneCallable {
+                dst: destination,
+                src: source,
+            })?;
+            return Ok(destination);
+        }
+        Err(unsupported(
+            "this receiver for a Task string or callable method",
+            span,
+        ))
+    }
+
     // Ordinary nested calls do not reserve the field-call branch's type,
     // timer and ownership temporaries on every recursive frame.
     #[inline(never)]
@@ -1101,21 +1204,8 @@ impl<'a> FunctionLowerer<'a> {
                 return Ok(destination);
             }
         }
-        if name == "clone" && args.is_empty() {
-            let source = self.expression(object, depth + 1)?;
-            let ty = self.function.slots[source.0].ty.clone();
-            if !matches!(ty, TaskSlotType::Callable { .. }) {
-                return Err(unsupported(
-                    "clone of a non-callable value in a Task frame",
-                    span,
-                ));
-            }
-            let destination = self.slot(ty)?;
-            self.emit(TaskOp::CloneCallable {
-                dst: destination,
-                src: source,
-            })?;
-            return Ok(destination);
+        if args.is_empty() && matches!(name, "len" | "byte_len" | "clone") {
+            return self.string_or_callable_method_expression(object, name, span, depth);
         }
         self.indirect_call(callee, args, span, depth)
     }

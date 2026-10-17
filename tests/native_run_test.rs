@@ -3522,6 +3522,31 @@ async fn ReassignResults(): null! {
     }
     return ok(null)
 }
+async fn EchoText(value: str): str! { time.sleep(0)? return ok(value) }
+async fn StringBasics(): null! {
+    text = fs.read("first.txt")?
+    println(text.len())
+    println(text.byte_len())
+    duplicate = text.clone()
+    println(text)
+    println(duplicate)
+    blank = ""
+    println(blank.len())
+    println(blank.byte_len())
+    println(blank.clone())
+    return ok(null)
+}
+async fn StringJoins(): null! {
+    text = fs.read("first.txt")?
+    joined = text + (await EchoText("乙"))?
+    println(text)
+    println(joined)
+    moved = text + (await EchoText(text))?
+    println(moved)
+    try { unused = "prefix" + fs.read("missing.txt")? }
+    catch (err) { println(err.code) }
+    return ok(null)
+}
 async fn CheckErrors(): null! {
     try {
         unexpected = (await MissingRows())?
@@ -3544,11 +3569,13 @@ async fn main(): null! {
     (await ReassignText())?;
     (await ReassignArrays())?;
     (await ReassignResults())?;
+    (await StringBasics())?;
+    (await StringJoins())?;
     return ok(null)
 }
 "#;
     fs::write(dir.join("main.ku"), program).unwrap();
-    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n{first}\nread_failed\n{first}\n乙\n{first}\ntexts-finally\n0\ntexts-finally\n2\ntrue\n{first}\n乙\ntexts-finally\n{first}\n乙\n2\nnew-error\n");
+    let expected = format!("numbers-finally\n1\n2\n3\nnumbers-finally\ntrue\ntrue\nfalse\ntexts-finally\n{first}\n乙\ntexts-finally\n{first}\n乙\narray-failed\nreplaced-array\nread_failed\n{first}\nread_failed\n{first}\n乙\n{first}\ntexts-finally\n0\ntexts-finally\n2\ntrue\n{first}\n乙\ntexts-finally\n{first}\n乙\n2\nnew-error\n5\n12\n{first}\n{first}\n0\n0\n\n{first}\n{first}乙\n{first}{first}\nread_failed\n");
     let mut interpreter = Command::new(ku_binary());
     interpreter.current_dir(dir).args(["run", "main.ku"]);
     let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)

@@ -156,6 +156,38 @@ static uint32_t ku_task_host_clone_string(KuTaskAdapterHostV1* host,
   *output=(KuString){bytes,source.len,capacity,KU_STRING_OWNED};
   return KU_TASK_DRIVER_OK;
 }
+/* Both operands are already completed stable frame owners. Do not consume
+ * either header or publish the result before its allocation is complete. */
+static uint32_t ku_task_host_concat_string(KuTaskAdapterHostV1* host,
+    KuString left, KuString right, KuString* output) {
+  if (!host || !output || host->allocation_host_bytes!=sizeof(*host)
+      || host->allocation_host_abi!=KU_TASK_ALLOCATION_HOST_ABI_VERSION
+      || !host->allocation_context || !host->reconcile_charge
+      || !host->ticket || !host->control) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  KuString inputs[2]={left,right};
+  for (size_t i=0;i<2u;i++) {
+    KuString source=inputs[i];
+    if (source.storage==KU_STRING_STATIC) {
+      if (source.capacity || (source.len && !source.ptr)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+    } else if (source.storage!=KU_STRING_OWNED || source.len>source.capacity
+        || (!source.ptr && (source.len || source.capacity))) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  }
+  if (right.len>SIZE_MAX-left.len) return KU_TASK_DRIVER_LIMIT;
+  size_t length=left.len+right.len,capacity=length ? length : 1u;
+  uint32_t status=host->reconcile_charge(host->allocation_context);
+  if (status!=KU_TASK_DRIVER_OK) return status;
+  status=ku_task_driver_grow_charge(host->ticket,capacity);
+  if (status!=KU_TASK_DRIVER_OK) return status;
+  uint8_t* bytes=(uint8_t*)malloc(capacity);
+  if (!bytes) {
+    status=host->reconcile_charge(host->allocation_context);
+    return status==KU_TASK_DRIVER_OK ? KU_TASK_HOST_ALLOCATION_FAILED : status;
+  }
+  if (left.len) memcpy(bytes,left.ptr,left.len);
+  if (right.len) memcpy(bytes+left.len,right.ptr,right.len);
+  *output=(KuString){bytes,length,capacity,KU_STRING_OWNED};
+  return KU_TASK_DRIVER_OK;
+}
 /* Flat local arrays share the existing typed vector ABI. The caller registers
  * the returned vector in its persistent slot before cloning any string leaf. */
 static uint32_t ku_task_host_allocate_array(KuTaskAdapterHostV1* host,

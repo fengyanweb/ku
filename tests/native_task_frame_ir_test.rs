@@ -426,6 +426,38 @@ fn native_task_frame_ir_owned_replacement_hosts_plain_complete_and_preserves_own
 }
 
 #[test]
+fn native_task_frame_ir_string_clone_hosts_plain_complete_and_preserves_owned_slots() {
+    let mut fixture = program(
+        vec![IrType::Str, IrType::Str, result(IrType::Str)],
+        &[0],
+        vec![state(
+            vec![
+                TaskOp::StringClone {
+                    dst: SlotId(1),
+                    src: SlotId(0),
+                },
+                read(0),
+                drop_slot(0),
+                TaskOp::WrapOk {
+                    dst: SlotId(2),
+                    src: SlotId(1),
+                },
+            ],
+            complete(2),
+        )],
+    );
+    fixture.functions[0].result = result(IrType::Str);
+    let plan = accepted(&fixture);
+    assert!(plan.functions[0].hosted && !plan.functions[0].exit_bridge);
+    assert_eq!(plan.functions[0].scope_task_mask, 0);
+    assert_eq!(
+        plan.functions[0].slots,
+        vec![SlotId(0), SlotId(1), SlotId(2)]
+    );
+    assert!(plan.functions[0].suspensions.is_empty());
+}
+
+#[test]
 fn native_task_frame_ir_rejects_unknown_ids_without_index_allocation() {
     accepted(&minimal());
     let mut fixture = minimal();

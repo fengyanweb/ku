@@ -612,6 +612,123 @@ fn native_task_expression_ir_only_copy_operations_do_not_require_a_host() {
 }
 
 #[test]
+fn native_task_string_expression_ir_view_types_aliases_and_initialization_remain_strict() {
+    for operation in [
+        TaskOp::StringLen {
+            dst: SlotId(2),
+            src: SlotId(0),
+            bytes: false,
+        },
+        TaskOp::StringLen {
+            dst: SlotId(2),
+            src: SlotId(0),
+            bytes: true,
+        },
+        TaskOp::StringClone {
+            dst: SlotId(2),
+            src: SlotId(0),
+        },
+        TaskOp::StringConcat {
+            dst: SlotId(2),
+            left: SlotId(0),
+            right: SlotId(1),
+        },
+    ] {
+        let allocating = !matches!(operation, TaskOp::StringLen { .. });
+        let mut fixture = TaskProgram {
+            functions: vec![TaskFunction {
+                id: TaskFunctionId(0),
+                name: "StringView".into(),
+                slots: vec![
+                    value(IrType::Str),
+                    value(IrType::Str),
+                    value(if allocating { IrType::Str } else { IrType::Int }),
+                    value(result(IrType::Null)),
+                ],
+                parameters: vec![SlotId(0), SlotId(1)],
+                entry: StateId(0),
+                result: result(IrType::Null),
+                states: vec![state(
+                    vec![
+                        operation,
+                        read(0),
+                        read(1),
+                        read(2),
+                        TaskOp::Drop { slot: SlotId(2) },
+                        TaskOp::Drop { slot: SlotId(1) },
+                        TaskOp::Drop { slot: SlotId(0) },
+                        null_result(3),
+                    ],
+                    done(3),
+                )],
+            }],
+        };
+        let plan = accepted(&fixture);
+        assert_eq!(plan.functions[0].hosted, allocating);
+        assert_eq!(plan.functions[0].scope_task_mask, 0);
+        let mut invalid = fixture.clone();
+        invalid.functions[0].parameters.remove(0);
+        rejected(&invalid, "not definitely initialized");
+        let mut invalid = fixture.clone();
+        invalid.functions[0].parameters.push(SlotId(2));
+        if allocating {
+            rejected(
+                &invalid,
+                "overwriting a possibly initialized owned slot without drop",
+            );
+        } else {
+            accepted(&invalid); // Existing Copy output slots may be assigned again.
+        }
+        let mut invalid = fixture.clone();
+        invalid.functions[0].slots[0] = value(IrType::Int);
+        assert!(
+            verify_and_plan(&invalid, TaskLimits::default()).is_err(),
+            "string inputs must keep their type"
+        );
+        let mut invalid = fixture.clone();
+        invalid.functions[0].slots[2] = value(IrType::Bool);
+        assert!(
+            verify_and_plan(&invalid, TaskLimits::default()).is_err(),
+            "string output type is exact"
+        );
+        let mut invalid = fixture.clone();
+        if let TaskSlotType::Value { borrowed, .. } = &mut invalid.functions[0].slots[2].ty {
+            *borrowed = true;
+        }
+        assert!(
+            verify_and_plan(&invalid, TaskLimits::default()).is_err(),
+            "outputs cannot borrow persistent storage"
+        );
+        let mut invalid = fixture.clone();
+        match &mut invalid.functions[0].states[0].operations[0] {
+            TaskOp::StringLen { src, .. } | TaskOp::StringClone { src, .. } => {
+                *src = SlotId(usize::MAX)
+            }
+            TaskOp::StringConcat { right, .. } => *right = SlotId(usize::MAX),
+            _ => unreachable!(),
+        }
+        rejected(&invalid, "unknown slot");
+        let mut invalid = fixture.clone();
+        match &mut invalid.functions[0].states[0].operations[0] {
+            TaskOp::StringLen { dst, .. }
+            | TaskOp::StringClone { dst, .. }
+            | TaskOp::StringConcat { dst, .. } => *dst = SlotId(0),
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_and_plan(&invalid, TaskLimits::default()).is_err(),
+            "output cannot alias a View input"
+        );
+        if let TaskOp::StringConcat { right, .. } =
+            &mut fixture.functions[0].states[0].operations[0]
+        {
+            *right = SlotId(0);
+            accepted(&fixture); // Two read-only inputs may refer to one string.
+        }
+    }
+}
+
+#[test]
 fn native_task_expression_ir_slot_63_is_valid_but_slot_65_is_not() {
     let mut program = binary(TaskBinaryOp::Less, IrType::Int, IrType::Int, IrType::Bool);
     program.functions[0].slots = (0..64).map(|_| value(IrType::Int)).collect();

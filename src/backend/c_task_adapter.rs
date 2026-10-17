@@ -303,7 +303,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             state
                 .operations
                 .iter()
-                .any(|op| matches!(op, TaskOp::ErrorField { .. }))
+                .any(crate::ir::task::requires_string_allocation_host)
         })
         || function.states.iter().any(|state| {
             state.operations.windows(2).any(|pair| {
