@@ -33,6 +33,16 @@ pub(super) fn emit_adapters(out: &mut COutput, tasks: &TaskProgram) -> KuResult<
     }
     out.check()?;
     out.push_str(ADAPTER_ABI);
+    if tasks.functions.iter().any(|function| {
+        function.states.iter().any(|state| {
+            state
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, TaskOp::FinallyEnter { .. }))
+        })
+    }) {
+        out.push_str(FINALLY_CLOCK);
+    }
     for function in &tasks.functions {
         out.check()?;
         emit_function(out, function)?;
@@ -281,6 +291,25 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
             .iter()
             .any(|operation| matches!(operation, TaskOp::ScopeExitBegin { .. }))
     });
+    let finally = function.states.iter().any(|state| {
+        state
+            .operations
+            .iter()
+            .any(|op| matches!(op, TaskOp::FinallyEnter { .. }))
+    });
+    let mut exit_deadline = String::new();
+    if scope_exits {
+        exit_deadline.push_str(EXIT_DEADLINE);
+    }
+    if finally {
+        exit_deadline.push_str(FINALLY_DEADLINE);
+    }
+    let empty_started = match (scope_exits, finally) {
+        (true, true) => "(instance->drain_started && !instance->frame.scope_exit_active && !instance->frame.finally_unwind_active)",
+        (true, false) => "(instance->drain_started && !instance->frame.scope_exit_active)",
+        (false, true) => "(instance->drain_started && !instance->frame.finally_unwind_active)",
+        (false, false) => "instance->drain_started",
+    };
     let mut scope_preflight = String::new();
     for (index, slot) in function.slots.iter().enumerate() {
         if matches!(slot.ty, TaskSlotType::Task { .. }) {
@@ -314,8 +343,10 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@SCOPE_REGISTER@", if scoped { SCOPE_REGISTER } else { "" })
         .replace("@SCOPE_RESUME_HELPER@", if scoped { SCOPE_RESUME_HELPER } else { "" })
         .replace("@SCOPE_RESUME@", if scoped { SCOPE_RESUME } else { "" })
-        .replace("@EXIT_DEADLINE@", if scope_exits { EXIT_DEADLINE } else { "" })
-        .replace("@EXIT_EMPTY_STARTED@", if scope_exits { "(instance->drain_started && !instance->frame.scope_exit_active)" } else { "instance->drain_started" })
+        .replace("@EXIT_DEADLINE@", &exit_deadline)
+        .replace("@FINALLY_FINISH@", if finally { FINALLY_FINISH } else { "" })
+        .replace("@CLEANUP_CLOCK@", if finally { "ku_task_adapter_finally_now" } else { "ku_task_adapter_now" })
+        .replace("@EXIT_EMPTY_STARTED@", empty_started)
         .replace("@DRAIN_HAS_OWNERS@", if scoped { "scope_live_mask || instance->receipt_mask" } else { "(instance->frame.header.initialized & UINT64_C(@TASK_MASK@)) || instance->receipt_mask" })
         .replace("@ID@", &id)
         .replace("@RESULT@", &result_type)
@@ -485,6 +516,39 @@ const EXIT_DEADLINE: &str = r#"
     instance->frame.scope_exit_deadline=deadline;
   }
 "#;
+const FINALLY_DEADLINE: &str = r#"
+  if (instance->frame.finally_unwind_active) {
+    uint64_t deadline=ku_task_host_deadline(&host,instance->frame.finally_unwind_deadline,0);
+    if (instance->drain_started) deadline=ku_task_driver_min(deadline,instance->drain_deadline);
+    instance->drain_deadline=deadline; instance->drain_started=1;
+    instance->frame.finally_unwind_deadline=deadline;
+  }
+"#;
+const FINALLY_CLOCK: &str = r#"
+/* A protected body cannot renew its inherited D. Read a later control or
+ * driver-close minimum at every dispatch, including staged timeout cleanup. */
+static uint64_t ku_task_adapter_finally_now(void* raw) {
+  KuTaskAdapterClockV1* clock=(KuTaskAdapterClockV1*)raw;
+  uint64_t now=ku_task_adapter_now(raw);
+  if (now==UINT64_MAX) return now;
+  if (ku_task_driver_lock(clock->driver)) {
+    ku_task_adapter_fault(clock->driver,0); return UINT64_MAX;
+  }
+  uint64_t deadline=clock->driver->closing ? clock->driver->shutdown_deadline : UINT64_MAX;
+  ku_task_driver_unlock(clock->driver);
+  return now>=deadline ? UINT64_MAX : now;
+}
+"#;
+const FINALLY_FINISH: &str = r#"
+    if (instance->frame.header.cleanup_state!=UINT32_MAX) {
+      KuTaskAdapterClockV1 bridge={instance->ticket.driver,&instance->control};
+      KuTaskFrameClockV1 clock={ku_task_adapter_finally_now,&bridge,&host};
+      uint64_t deadline=instance->frame.header.exit_deadline;
+      if (instance->drain_started) deadline=ku_task_driver_min(deadline,instance->drain_deadline);
+      uint32_t finished=ku_task_frame_@ID@_finish_finally(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION,deadline,&clock);
+      if (finished!=KU_TASK_FRAME_OK) return KU_TASK_DRIVER_INTERNAL;
+    }
+"#;
 const SCOPE_RESUME_HELPER: &str = r#"
 static uint32_t ku_task_@ID@_scope_resume(KuTaskInstance_@ID@* instance) {
   const KuTaskFrameScopeDescriptorV1* descriptor=NULL;
@@ -623,6 +687,7 @@ static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reaso
 @TRANSFERS@
   /* Every sibling was durably transferred before any Value cleanup/ACK wait. */
   if (!reason && instance->frame.header.status==KU_TASK_FRAME_EXIT_STAGED) {
+@FINALLY_FINISH@
     uint32_t status=ku_task_frame_@ID@_finish_exit_values(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION);
     if (status!=KU_TASK_FRAME_OK) return KU_TASK_DRIVER_INTERNAL;
     instance->values_cleaned=1;
@@ -657,7 +722,7 @@ static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reaso
   }
   if (reason && !instance->values_cleaned && instance->frame_initialized) {
     KuTaskAdapterClockV1 bridge={instance->ticket.driver,budget};
-    KuTaskFrameClockV1 clock={ku_task_adapter_now,&bridge,&host};
+    KuTaskFrameClockV1 clock={@CLEANUP_CLOCK@,&bridge,&host};
     uint32_t status;
     if (instance->frame.header.status==KU_TASK_FRAME_READY) {
       status=ku_task_frame_@ID@_destroy(&instance->frame,sizeof(instance->frame),KU_TASK_FRAME_ABI_VERSION);

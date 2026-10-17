@@ -1456,3 +1456,128 @@ fn native_task_callable_ir_tracks_exact_targets_and_rejects_invalid_ownership() 
         .to_string()
         .contains("analysis work limit exceeded"));
 }
+
+#[test]
+fn native_task_finally_ir_checks_dispatch_live_values_markers_and_unwind_pairs() {
+    let fixture = program(
+        vec![IrType::Int, result(IrType::Null)],
+        &[],
+        vec![
+            state(vec![init(0, TaskConstant::Int(37))], jump(1)),
+            state(
+                vec![TaskOp::FinallyEnter {
+                    cleanup: StateId(5),
+                }],
+                jump(2),
+            ),
+            state(vec![], suspend(3, 5)),
+            state(
+                vec![TaskOp::FinallyLeave {
+                    cleanup: StateId(5),
+                }],
+                jump(4),
+            ),
+            state(
+                vec![init(1, TaskConstant::Ok(Box::new(TaskConstant::Null)))],
+                TaskTerminator::Exit { value: SlotId(1) },
+            ),
+            state(vec![read(0), drop_if(1)], TaskTerminator::Terminate),
+        ],
+    );
+    let plan = accepted(&fixture);
+    assert_eq!(plan.functions[0].finally.state_cleanup[2], Some(StateId(5)));
+    assert!(plan.functions[0].slots.contains(&SlotId(0)));
+    let mut wrong_leave = fixture.clone();
+    wrong_leave.functions[0].states[3].operations[0] = TaskOp::FinallyLeave {
+        cleanup: StateId(4),
+    };
+    rejected(&wrong_leave, "Leave must match the active finally");
+    let mut early_read = fixture.clone();
+    early_read.functions[0].states[0].operations.clear();
+    early_read.functions[0].states[2]
+        .operations
+        .push(init(0, TaskConstant::Int(37)));
+    rejected(
+        &early_read,
+        "cancellation before state operations still reads initialized values",
+    );
+    let mut unmatched_end = fixture.clone();
+    unmatched_end.functions[0].states[0]
+        .operations
+        .push(TaskOp::FinallyUnwindEnd);
+    rejected(&unmatched_end, "ordinary unwind End requires Begin");
+    let mut nested_begin = fixture.clone();
+    nested_begin.functions[0].states[0]
+        .operations
+        .extend([TaskOp::FinallyUnwindBegin, TaskOp::FinallyUnwindBegin]);
+    rejected(&nested_begin, "ordinary unwind Begin cannot nest");
+    let mut no_entry = minimal();
+    no_entry.functions[0].states[0]
+        .operations
+        .push(TaskOp::FinallyUnwindBegin);
+    no_entry.functions[0].states[0].terminator = TaskTerminator::Exit { value: SlotId(0) };
+    rejected(
+        &no_entry,
+        "ordinary unwind cannot manufacture a finally declaration",
+    );
+    let mut protected_unwind = fixture.clone();
+    protected_unwind.functions[0].states[5]
+        .operations
+        .insert(0, TaskOp::FinallyUnwindBegin);
+    rejected(
+        &protected_unwind,
+        "protected cleanup cannot replace its original deadline",
+    );
+
+    let mut projected = fixture.clone();
+    let function = &mut projected.functions[0];
+    function.slots = vec![
+        TaskSlot {
+            ty: TaskSlotType::Value {
+                ty: result(IrType::Str),
+                borrowed: false,
+            },
+        },
+        TaskSlot {
+            ty: TaskSlotType::Value {
+                ty: IrType::Str,
+                borrowed: false,
+            },
+        },
+        TaskSlot {
+            ty: TaskSlotType::Value {
+                ty: result(IrType::Null),
+                borrowed: false,
+            },
+        },
+        TaskSlot {
+            ty: TaskSlotType::Value {
+                ty: IrType::Named("__ku_error_type".into()),
+                borrowed: false,
+            },
+        },
+    ];
+    function.parameters = vec![SlotId(0)];
+    function.states[0].operations.clear();
+    function.states[4].operations = vec![init(2, TaskConstant::Ok(Box::new(TaskConstant::Null)))];
+    function.states[4].terminator = TaskTerminator::Exit { value: SlotId(2) };
+    function.states[5].operations.clear();
+    function.states[5].terminator = TaskTerminator::TryResult {
+        src: SlotId(0),
+        ok_value: SlotId(1),
+        err_result: SlotId(3),
+        ok: StateId(6),
+        err: StateId(7),
+    };
+    for _ in 0..2 {
+        function.states.push(state(
+            vec![drop_if(0), drop_if(1), drop_if(2), drop_if(3)],
+            TaskTerminator::Terminate,
+        ));
+    }
+    let plan = accepted(&projected);
+    assert_eq!(
+        plan.functions[0].finally.region_slots[5],
+        (1u64 << 1) | (1u64 << 3)
+    );
+}

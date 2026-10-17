@@ -318,6 +318,14 @@ struct FunctionLowerer<'a> {
     loops: Vec<LoopContext>,
     handlers: Vec<ErrorHandler>,
     next_scope_exit: usize,
+    finalies: Vec<FinallyContext<'a>>,
+    protected: bool,
+    in_finally_body: bool,
+    statement_depth: usize,
+    finally_body_handler_depth: usize,
+    pending_primaries: Vec<SlotId>,
+    protected_finish: Option<StateId>,
+    unwinding: bool,
     scope_drop_states: Vec<(StateId, TaskScopeId)>,
     current: Option<StateId>,
     // Suspend/Await/ScopeDrain exits receive synthetic Value cleanup. Normal
@@ -332,6 +340,7 @@ struct LoopContext {
     continue_target: StateId,
     retained_depth: usize,
     has_continue: bool,
+    finally_depth: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -340,11 +349,27 @@ struct ErrorHandler {
     error: SlotId,
     retained_depth: usize,
     used: bool,
+    finally_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FinallyContext<'a> {
+    body: &'a [Stmt],
+    cleanup: StateId,
+    locals_depth: usize,
+    scope_depth: usize,
+    handlers_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+enum FinallyExit {
+    Return(SlotId),
+    Jump(StateId),
 }
 
 impl<'a> FunctionLowerer<'a> {
     fn new(
-        declaration: &FnDecl,
+        declaration: &'a FnDecl,
         signatures: &'a HashMap<String, Signature>,
         budget: &'a mut Budget,
         std_time: bool,
@@ -370,6 +395,14 @@ impl<'a> FunctionLowerer<'a> {
             loops: Vec::new(),
             handlers: Vec::new(),
             next_scope_exit: 0,
+            finalies: Vec::new(),
+            protected: false,
+            in_finally_body: false,
+            statement_depth: 0,
+            finally_body_handler_depth: 0,
+            pending_primaries: Vec::new(),
+            protected_finish: None,
+            unwinding: false,
             scope_drop_states: Vec::new(),
             current: None,
             cleanup_exits: Vec::new(),
@@ -450,6 +483,12 @@ impl<'a> FunctionLowerer<'a> {
 
     fn copy_or_move(&mut self, source: SlotId) -> KuResult<SlotId> {
         let ty = self.function.slots[source.0].ty.clone();
+        if self.in_finally_body && matches!(ty, TaskSlotType::Task { .. }) {
+            return Err(unsupported(
+                "moving a Task inside a native Task finally body",
+                self.span,
+            ));
+        }
         if matches!(ty, TaskSlotType::Task { .. })
             && self.slot_owners[source.0] != self.scopes.last().copied()
         {
@@ -480,19 +519,101 @@ impl<'a> FunctionLowerer<'a> {
                 self.span,
             ));
         }
-        self.terminate(TaskTerminator::Exit { value })?;
+        if self.in_finally_body && !self.protected {
+            self.discard_finally_primaries()?;
+        }
+        if self.protected {
+            self.terminate(TaskTerminator::Jump {
+                target: self
+                    .protected_finish
+                    .expect("protected finally continuation"),
+            })?;
+        } else if !self.finalies.is_empty() {
+            // A saved return must survive the lexical drops before finally.
+            let saved = self.slot(value_slot(self.function.result.clone()))?;
+            self.slot_owners[saved.0] = None;
+            self.emit(TaskOp::Move {
+                dst: saved,
+                src: value,
+            })?;
+            self.pending_primaries.push(saved);
+            self.lower_finally_exit(FinallyExit::Return(saved), 0, 0, self.statement_depth)?;
+            self.pending_primaries.pop();
+        } else {
+            self.terminate(TaskTerminator::Exit { value })?;
+        }
+        Ok(())
+    }
+
+    fn discard_finally_primaries(&mut self) -> KuResult<()> {
+        for index in (0..self.pending_primaries.len()).rev() {
+            self.emit(TaskOp::DropIfInit {
+                slot: self.pending_primaries[index],
+            })?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_state(&mut self) -> KuResult<StateId> {
+        if let Some(context) = self.finalies.last() {
+            return Ok(context.cleanup);
+        }
+        let state = self.state(TaskTerminator::Terminate)?;
+        self.cleanup_exits.push(state);
+        Ok(state)
+    }
+
+    fn marker(&mut self, operation: TaskOp) -> KuResult<()> {
+        let entry = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::Jump { target: entry })?;
+        self.current = Some(entry);
+        self.emit(operation)?;
+        let after = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::Jump { target: after })?;
+        self.current = Some(after);
         Ok(())
     }
 
     fn raise_error(&mut self, error: SlotId) -> KuResult<()> {
-        if let Some(handler) = self.handlers.last_mut() {
-            handler.used = true;
-            let handler = *handler;
+        let leaves_finally =
+            self.in_finally_body && self.handlers.len() <= self.finally_body_handler_depth;
+        if leaves_finally && !self.protected {
+            self.discard_finally_primaries()?;
+        }
+        if let Some(handler) = self.handlers.last().copied() {
             self.emit(TaskOp::Move {
                 dst: handler.error,
                 src: error,
             })?;
-            self.lower_scoped_jump(handler.target, handler.retained_depth)
+            if self.protected {
+                self.handlers.last_mut().expect("active handler").used = true;
+                self.terminate(TaskTerminator::Jump {
+                    target: handler.target,
+                })?;
+                Ok(())
+            } else if self.finalies.len() > handler.finally_depth
+                || (self.unwinding && leaves_finally)
+            {
+                self.pending_primaries.push(handler.error);
+                let result = self.lower_finally_exit(
+                    FinallyExit::Jump(handler.target),
+                    handler.finally_depth,
+                    handler.retained_depth,
+                    self.statement_depth,
+                );
+                self.pending_primaries.pop();
+                result
+            } else {
+                self.handlers.last_mut().expect("active handler").used = true;
+                self.lower_scoped_jump(handler.target, handler.retained_depth)
+            }
+        } else if self.protected {
+            self.terminate(TaskTerminator::Jump {
+                target: self
+                    .protected_finish
+                    .expect("protected finally continuation"),
+            })?;
+            Ok(())
         } else {
             let result = self.slot(value_slot(self.function.result.clone()))?;
             self.emit(TaskOp::WrapError {
@@ -620,6 +741,12 @@ impl<'a> FunctionLowerer<'a> {
                 self.call_expression(callee, args, expression.span, depth)
             }
             ExprKind::Await(expression) => {
+                if self.in_finally_body {
+                    return Err(unsupported(
+                        "Await inside a native Task finally body",
+                        expression.span,
+                    ));
+                }
                 let source = self.expression(expression, depth + 1)?;
                 let TaskSlotType::Task { result } = &self.function.slots[source.0].ty else {
                     return Err(unsupported("await of a non-Task value", expression.span));
@@ -635,7 +762,7 @@ impl<'a> FunctionLowerer<'a> {
                 let destination = self.slot(value_slot(result))?;
                 let poll = self.state(TaskTerminator::Terminate)?;
                 let ready = self.state(TaskTerminator::Terminate)?;
-                let cleanup = self.state(TaskTerminator::Terminate)?;
+                let cleanup = self.cleanup_state()?;
                 self.terminate(TaskTerminator::Jump { target: poll })?;
                 self.function.states[poll.0].terminator = TaskTerminator::Await {
                     task: hidden,
@@ -643,7 +770,6 @@ impl<'a> FunctionLowerer<'a> {
                     ready,
                     cleanup,
                 };
-                self.cleanup_exits.push(cleanup);
                 self.current = Some(ready);
                 Ok(destination)
             }
@@ -658,13 +784,14 @@ impl<'a> FunctionLowerer<'a> {
                 };
                 let destination = self.slot(value_slot(inner.as_ref().clone()))?;
                 let catches_error = !self.handlers.is_empty();
+                let unwind_error = !self.finalies.is_empty() || self.protected;
                 let error = self.slot(value_slot(if catches_error {
                     super::error_ir_type()
                 } else {
                     self.function.result.clone()
                 }))?;
                 let ok = self.state(TaskTerminator::Terminate)?;
-                let err = self.state(if catches_error {
+                let err = self.state(if catches_error || unwind_error {
                     TaskTerminator::Terminate
                 } else {
                     TaskTerminator::Exit { value: error }
@@ -676,9 +803,13 @@ impl<'a> FunctionLowerer<'a> {
                     ok,
                     err,
                 })?;
-                if catches_error {
+                if catches_error || unwind_error {
                     self.current = Some(err);
-                    self.raise_error(error)?;
+                    if catches_error {
+                        self.raise_error(error)?;
+                    } else {
+                        self.exit_result(error)?;
+                    }
                 }
                 self.current = Some(ok);
                 Ok(destination)
@@ -735,6 +866,12 @@ impl<'a> FunctionLowerer<'a> {
                 && self.local("time").is_none()
                 && !self.signatures.contains_key("time")
             {
+                if self.in_finally_body {
+                    return Err(unsupported(
+                        "time.sleep inside a native Task finally body",
+                        span,
+                    ));
+                }
                 if args.len() != 1 {
                     return Err(unsupported("time.sleep with other than one argument", span));
                 }
@@ -749,7 +886,7 @@ impl<'a> FunctionLowerer<'a> {
                 let destination = self.slot(value_slot(IrType::Result(Box::new(IrType::Null))))?;
                 let poll = self.state(TaskTerminator::Terminate)?;
                 let ready = self.state(TaskTerminator::Terminate)?;
-                let cleanup = self.state(TaskTerminator::Terminate)?;
+                let cleanup = self.cleanup_state()?;
                 self.terminate(TaskTerminator::Jump { target: poll })?;
                 self.function.states[poll.0].terminator = TaskTerminator::Timer {
                     millis,
@@ -757,7 +894,6 @@ impl<'a> FunctionLowerer<'a> {
                     ready,
                     cleanup,
                 };
-                self.cleanup_exits.push(cleanup);
                 self.current = Some(ready);
                 return Ok(destination);
             }
@@ -827,6 +963,12 @@ impl<'a> FunctionLowerer<'a> {
             }
             return self.constant(TaskConstant::Null, IrType::Null);
         }
+        if self.in_finally_body {
+            return Err(unsupported(
+                "starting a Task inside a native Task finally body",
+                span,
+            ));
+        }
         let signature = self.signatures.get(name).cloned().ok_or_else(|| {
             unsupported("a call other than a known top-level async function", span)
         })?;
@@ -864,6 +1006,12 @@ impl<'a> FunctionLowerer<'a> {
         span: Span,
         depth: usize,
     ) -> KuResult<SlotId> {
+        if self.in_finally_body {
+            return Err(unsupported(
+                "starting a Task inside a native Task finally body",
+                span,
+            ));
+        }
         // Retain the chosen identity before the first argument can suspend.
         // Calls read the binding; assigning the same value still moves it.
         let source = self.expression(callee, depth + 1)?;
@@ -1024,7 +1172,9 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
-    fn lower_block(&mut self, body: &[Stmt], depth: usize) -> KuResult<()> {
+    fn lower_block(&mut self, body: &'a [Stmt], depth: usize) -> KuResult<()> {
+        let previous_depth = self.statement_depth;
+        self.statement_depth = depth;
         // Charge before traversal; width is not recursion depth. No new AST is
         // cloned; structured statements check before each recursive descent.
         if body.len() > TaskLimits::default().max_operations {
@@ -1051,13 +1201,29 @@ impl<'a> FunctionLowerer<'a> {
                     condition,
                     body,
                     span,
-                } => self.lower_while(condition, body, *span, depth)?,
+                } => {
+                    if self.in_finally_body {
+                        return Err(unsupported(
+                            "loops inside a native Task finally body",
+                            *span,
+                        ));
+                    }
+                    self.lower_while(condition, body, *span, depth)?;
+                }
                 Stmt::For {
                     name,
                     iterable,
                     body,
                     span,
-                } => self.lower_for(name, iterable, body, *span, depth)?,
+                } => {
+                    if self.in_finally_body {
+                        return Err(unsupported(
+                            "loops inside a native Task finally body",
+                            *span,
+                        ));
+                    }
+                    self.lower_for(name, iterable, body, *span, depth)?;
+                }
                 Stmt::Break { span } => self.lower_loop_exit(false, *span)?,
                 Stmt::Continue { span } => self.lower_loop_exit(true, *span)?,
                 Stmt::Try {
@@ -1166,40 +1332,65 @@ impl<'a> FunctionLowerer<'a> {
                 }
             }
         }
+        self.statement_depth = previous_depth;
         Ok(())
     }
 
     fn drain_scope(&mut self, scope: TaskScopeId) -> KuResult<()> {
         let ready = self.state(TaskTerminator::Terminate)?;
-        let cleanup = self.state(TaskTerminator::Terminate)?;
+        let cleanup = self.cleanup_state()?;
         self.terminate(TaskTerminator::ScopeDrain {
             scope,
             ready,
             cleanup,
         })?;
         self.budget.analysis(1, self.span)?;
-        self.cleanup_exits.push(cleanup);
         self.scope_drop_states.push((ready, scope));
         self.current = Some(ready);
         Ok(())
     }
 
     fn lower_loop_exit(&mut self, is_continue: bool, span: Span) -> KuResult<()> {
+        if self.in_finally_body && !self.protected {
+            self.discard_finally_primaries()?;
+        }
+        if self.protected {
+            self.terminate(TaskTerminator::Jump {
+                target: self
+                    .protected_finish
+                    .expect("protected finally continuation"),
+            })?;
+            return Ok(());
+        }
         let context = self
             .loops
             .last_mut()
             .ok_or_else(|| unsupported("break or continue outside a loop", span))?;
         context.has_continue |= is_continue;
         let retained_depth = context.retained_depth;
+        let finally_depth = context.finally_depth;
         let target = if is_continue {
             context.continue_target
         } else {
             context.break_target
         };
-        self.lower_scoped_jump(target, retained_depth)
+        if self.finalies.len() > finally_depth || self.unwinding {
+            self.lower_finally_exit(
+                FinallyExit::Jump(target),
+                finally_depth,
+                retained_depth,
+                self.statement_depth,
+            )
+        } else {
+            self.lower_scoped_jump(target, retained_depth)
+        }
     }
 
     fn lower_scoped_jump(&mut self, target: StateId, retained_depth: usize) -> KuResult<()> {
+        if retained_depth == self.scopes.len() {
+            self.terminate(TaskTerminator::Jump { target })?;
+            return Ok(());
+        }
         let exit = TaskScopeExitId(self.next_scope_exit);
         self.next_scope_exit += 1; // Each ID consumes two bounded states.
         let begin = self.state(TaskTerminator::Terminate)?;
@@ -1225,23 +1416,122 @@ impl<'a> FunctionLowerer<'a> {
         Ok(())
     }
 
+    fn lower_finally_exit(
+        &mut self,
+        action: FinallyExit,
+        retain_finally: usize,
+        retain_scopes: usize,
+        depth: usize,
+    ) -> KuResult<()> {
+        let saved_finalies = self.finalies.clone();
+        let saved_scopes = self.scopes.clone();
+        let names: usize = self.locals.iter().map(|scope| scope.len()).sum();
+        let name_bytes = self
+            .locals
+            .iter()
+            .flat_map(|scope| scope.keys())
+            .try_fold(0usize, |sum, name| sum.checked_add(name.len()))
+            .ok_or_else(|| unsupported("local name clone budget overflow", self.span))?;
+        self.budget.analysis(
+            names + self.finalies.len() + self.scopes.len() + self.handlers.len(),
+            self.span,
+        )?;
+        self.budget.text(name_bytes, self.span)?;
+        let saved_locals = self.locals.clone();
+        let saved_handlers = self.handlers.clone();
+        let saved_unwinding = self.unwinding;
+        let saved_body = self.in_finally_body;
+        let saved_handler_depth = self.finally_body_handler_depth;
+        if !self.unwinding {
+            self.marker(TaskOp::FinallyUnwindBegin)?;
+        }
+        self.unwinding = true;
+        while self.finalies.len() > retain_finally && self.current.is_some() {
+            let context = *self.finalies.last().expect("active finally");
+            let ready = self.state(TaskTerminator::Terminate)?;
+            self.lower_scoped_jump(ready, context.scope_depth)?;
+            self.current = Some(ready);
+            self.finalies.pop().expect("drained current finally");
+            self.scopes.truncate(context.scope_depth);
+            self.locals.truncate(context.locals_depth);
+            self.handlers.truncate(context.handlers_depth);
+            self.marker(TaskOp::FinallyLeave {
+                cleanup: context.cleanup,
+            })?;
+            self.in_finally_body = true;
+            self.finally_body_handler_depth = self.handlers.len();
+            let entry = self.current.take().expect("finally entry");
+            self.current = self.lower_arm(context.body, entry, depth + 1)?;
+            self.in_finally_body = saved_body;
+        }
+        if self.current.is_some() {
+            let ready = self.state(TaskTerminator::Terminate)?;
+            self.lower_scoped_jump(ready, retain_scopes)?;
+            self.current = Some(ready);
+            match action {
+                FinallyExit::Return(value) => {
+                    self.terminate(TaskTerminator::Exit { value })?;
+                }
+                FinallyExit::Jump(target) => {
+                    if let Some(handler) = self
+                        .handlers
+                        .iter_mut()
+                        .find(|handler| handler.target == target)
+                    {
+                        handler.used = true;
+                    }
+                    self.marker(TaskOp::FinallyUnwindEnd)?;
+                    self.terminate(TaskTerminator::Jump { target })?;
+                }
+            }
+        }
+        let used: Vec<_> = self.handlers.iter().map(|handler| handler.used).collect();
+        self.handlers = saved_handlers;
+        for (handler, used) in self.handlers.iter_mut().zip(used) {
+            handler.used |= used;
+        }
+        self.finalies = saved_finalies;
+        self.scopes = saved_scopes;
+        self.locals = saved_locals;
+        self.unwinding = saved_unwinding;
+        self.in_finally_body = saved_body;
+        self.finally_body_handler_depth = saved_handler_depth;
+        Ok(())
+    }
+
     fn lower_try(
         &mut self,
-        body: &[Stmt],
+        body: &'a [Stmt],
         catch_name: Option<&str>,
-        catch_body: &[Stmt],
-        finally_body: &[Stmt],
+        catch_body: &'a [Stmt],
+        finally_body: &'a [Stmt],
         span: Span,
         depth: usize,
     ) -> KuResult<()> {
         if depth >= 32 {
             return Err(unsupported("statement nesting beyond 32 Task levels", span));
         }
-        // User finally needs additional cancellation and timeout routes. Do not
-        // admit it until every exit can execute that body with the same budget.
-        if !finally_body.is_empty() {
-            return Err(unsupported("user finally in native Task source", span));
+        if self.in_finally_body && !finally_body.is_empty() {
+            return Err(unsupported(
+                "a nested finally inside a native Task finally body",
+                span,
+            ));
         }
+        let finally = if finally_body.is_empty() {
+            None
+        } else {
+            let cleanup = self.state(TaskTerminator::Terminate)?;
+            let context = FinallyContext {
+                body: finally_body,
+                cleanup,
+                locals_depth: self.locals.len(),
+                scope_depth: self.scopes.len(),
+                handlers_depth: self.handlers.len(),
+            };
+            self.marker(TaskOp::FinallyEnter { cleanup })?;
+            self.finalies.push(context);
+            Some(context)
+        };
         let has_catch = catch_name.is_some() || !catch_body.is_empty();
         let body_entry = self.state(TaskTerminator::Terminate)?;
         let catch_entry = self.state(TaskTerminator::Terminate)?;
@@ -1254,6 +1544,7 @@ impl<'a> FunctionLowerer<'a> {
                 error,
                 retained_depth: self.scopes.len(),
                 used: false,
+                finally_depth: self.finalies.len(),
             });
             Some(error)
         } else {
@@ -1274,21 +1565,81 @@ impl<'a> FunctionLowerer<'a> {
         let catch_end = if used {
             self.lower_bound_arm(catch_body, catch_entry, depth + 1, catch_name.zip(error))?
         } else {
-            // The checker already checked the unreachable catch. Do not create
-            // a lexical owner declaration with no incoming recoverable edge.
             None
         };
         if let Some(end) = catch_end {
             self.function.states[end.0].terminator = TaskTerminator::Jump { target: after };
         }
         if used && catch_name.is_none() {
-            // An unnamed catch still consumes its error before continuing.
-            // No Error local was introduced into the catch scope.
             if let Some(error) = error {
                 self.emit_at(catch_entry, TaskOp::DropIfInit { slot: error })?;
             }
         }
         self.current = (body_end.is_some() || catch_end.is_some()).then_some(after);
+        if let Some(context) = finally {
+            self.finalies.pop().expect("current finally");
+            if self.current.is_some() {
+                self.marker(TaskOp::FinallyLeave {
+                    cleanup: context.cleanup,
+                })?;
+                let entry = self.current.take().expect("ordinary finally entry");
+                let saved_body = self.in_finally_body;
+                let saved_handler_depth = self.finally_body_handler_depth;
+                self.in_finally_body = true;
+                self.finally_body_handler_depth = self.handlers.len();
+                self.current = self.lower_arm(context.body, entry, depth + 1)?;
+                self.in_finally_body = saved_body;
+                self.finally_body_handler_depth = saved_handler_depth;
+            }
+            self.lower_protected_finally(context, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn lower_protected_finally(
+        &mut self,
+        context: FinallyContext<'a>,
+        depth: usize,
+    ) -> KuResult<()> {
+        let saved_current = self.current;
+        let saved_protected = self.protected;
+        let saved_finish = self.protected_finish;
+        let saved_body = self.in_finally_body;
+        let saved_handlers = std::mem::take(&mut self.handlers);
+        let finish = self.state(TaskTerminator::Terminate)?;
+        self.protected = true;
+        self.in_finally_body = true;
+        self.protected_finish = Some(finish);
+        let first_slot = self.function.slots.len();
+        self.current = Some(context.cleanup);
+        let end = self.lower_arm(context.body, context.cleanup, depth)?;
+        if let Some(end) = end {
+            self.function.states[end.0].terminator = TaskTerminator::Jump { target: finish };
+        }
+        self.current = Some(finish);
+        let outer = self.finalies.last().map(|context| context.cleanup);
+        if outer.is_some() {
+            for index in (first_slot..self.function.slots.len()).rev() {
+                if owned_value(&self.function.slots[index].ty) {
+                    self.emit(TaskOp::DropIfInit {
+                        slot: SlotId(index),
+                    })?;
+                }
+            }
+        } else {
+            self.cleanup_exits.push(finish);
+        }
+        if let Some(outer) = outer {
+            self.marker(TaskOp::FinallyLeave { cleanup: outer })?;
+            self.terminate(TaskTerminator::Jump { target: outer })?;
+        } else {
+            self.terminate(TaskTerminator::Terminate)?;
+        }
+        self.handlers = saved_handlers;
+        self.current = saved_current;
+        self.protected = saved_protected;
+        self.protected_finish = saved_finish;
+        self.in_finally_body = saved_body;
         Ok(())
     }
 
@@ -1296,7 +1647,7 @@ impl<'a> FunctionLowerer<'a> {
         &mut self,
         name: &str,
         iterable: &Expr,
-        body: &[Stmt],
+        body: &'a [Stmt],
         span: Span,
         depth: usize,
     ) -> KuResult<()> {
@@ -1336,6 +1687,7 @@ impl<'a> FunctionLowerer<'a> {
             continue_target: latch,
             retained_depth: self.scopes.len(),
             has_continue: false,
+            finally_depth: self.finalies.len(),
         });
         let end = self.lower_bound_arm(body, body_entry, depth + 1, Some((name, counter)))?;
         let context = self.loops.pop().expect("loop context exists");
@@ -1359,9 +1711,8 @@ impl<'a> FunctionLowerer<'a> {
                 dst: counter,
                 src: next,
             })?;
-            let cleanup = self.state(TaskTerminator::Terminate)?;
+            let cleanup = self.cleanup_state()?;
             self.budget.analysis(1, span)?;
-            self.cleanup_exits.push(cleanup);
             self.terminate(TaskTerminator::Suspend {
                 resume: header,
                 cleanup,
@@ -1374,7 +1725,7 @@ impl<'a> FunctionLowerer<'a> {
     fn lower_while(
         &mut self,
         condition: &Expr,
-        body: &[Stmt],
+        body: &'a [Stmt],
         span: Span,
         depth: usize,
     ) -> KuResult<()> {
@@ -1405,6 +1756,7 @@ impl<'a> FunctionLowerer<'a> {
             continue_target: latch,
             retained_depth: self.scopes.len(),
             has_continue: false,
+            finally_depth: self.finalies.len(),
         });
         let end = self.lower_arm(body, body_entry, depth + 1)?;
         let context = self.loops.pop().expect("loop context exists");
@@ -1414,9 +1766,8 @@ impl<'a> FunctionLowerer<'a> {
         if end.is_some() || context.has_continue {
             // A nonempty body's endpoint follows its real ScopeDrain and
             // local Value drops. An empty body still needs this forced yield.
-            let cleanup = self.state(TaskTerminator::Terminate)?;
+            let cleanup = self.cleanup_state()?;
             self.budget.analysis(1, span)?;
-            self.cleanup_exits.push(cleanup);
             self.function.states[latch.0].terminator = TaskTerminator::Suspend {
                 resume: header,
                 cleanup,
@@ -1429,8 +1780,8 @@ impl<'a> FunctionLowerer<'a> {
     fn lower_if(
         &mut self,
         condition: &Expr,
-        then_branch: &[Stmt],
-        else_branch: &[Stmt],
+        then_branch: &'a [Stmt],
+        else_branch: &'a [Stmt],
         span: Span,
         depth: usize,
     ) -> KuResult<()> {
@@ -1466,7 +1817,7 @@ impl<'a> FunctionLowerer<'a> {
 
     fn lower_arm(
         &mut self,
-        body: &[Stmt],
+        body: &'a [Stmt],
         entry: StateId,
         depth: usize,
     ) -> KuResult<Option<StateId>> {
@@ -1475,13 +1826,26 @@ impl<'a> FunctionLowerer<'a> {
 
     fn lower_bound_arm(
         &mut self,
-        body: &[Stmt],
+        body: &'a [Stmt],
         entry: StateId,
         depth: usize,
         binding: Option<(&str, SlotId)>,
     ) -> KuResult<Option<StateId>> {
         self.current = Some(entry);
         if body.is_empty() && binding.is_none() {
+            return Ok(self.current.take());
+        }
+        if self.protected {
+            self.locals.push(HashMap::new());
+            if let Some((name, source)) = binding {
+                let destination = self.copy_or_move(source)?;
+                self.locals
+                    .last_mut()
+                    .expect("protected body scope")
+                    .insert(name.to_owned(), destination);
+            }
+            self.lower_block(body, depth)?;
+            self.locals.pop();
             return Ok(self.current.take());
         }
         // IDs are dense declaration order, not the slot interval of an arm:
@@ -1526,7 +1890,7 @@ impl<'a> FunctionLowerer<'a> {
         Ok(self.current.take())
     }
 
-    fn lower(mut self, declaration: &FnDecl) -> KuResult<TaskFunction> {
+    fn lower(mut self, declaration: &'a FnDecl) -> KuResult<TaskFunction> {
         self.lower_block(&declaration.body, 0)?;
         if self.current.is_some() {
             return Err(unsupported(

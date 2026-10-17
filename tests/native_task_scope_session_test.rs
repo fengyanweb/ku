@@ -303,7 +303,7 @@ static void fixture_init(FixtureDriver* runtime,size_t capacity) {
   runtime->ring=(size_t*)calloc(capacity,sizeof(*runtime->ring));
   CHECK(runtime->driver && runtime->slots && runtime->ring);
   size_t fixed=sizeof(*runtime->driver)+capacity*(sizeof(*runtime->slots)+sizeof(*runtime->ring));
-  CHECK(KU_TASK_DRIVER_ABI_VERSION==9u && KU_TASK_FRAME_ABI_VERSION==4u);
+  CHECK(KU_TASK_DRIVER_ABI_VERSION==9u && KU_TASK_FRAME_ABI_VERSION==5u);
   uint64_t startup_now=ku_task_driver_now_ms();
   CHECK(startup_now<UINT64_MAX-1000u);
   uint64_t startup_deadline=startup_now+1000u;

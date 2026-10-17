@@ -9,9 +9,9 @@ use std::collections::HashSet;
 
 use crate::error::KuResult;
 use crate::ir::task::{
-    SlotId, TaskBinaryOp, TaskConstant, TaskFramePlan, TaskFunction, TaskFunctionFrame,
-    TaskIndirectCallPlan, TaskLimits, TaskOp, TaskProgram, TaskScopeExitPlan, TaskScopeFrame,
-    TaskSlotType, TaskTerminator, TaskUnaryOp,
+    SlotId, TaskBinaryOp, TaskConstant, TaskFinallyPlan, TaskFramePlan, TaskFunction,
+    TaskFunctionFrame, TaskIndirectCallPlan, TaskLimits, TaskOp, TaskProgram, TaskScopeExitPlan,
+    TaskScopeFrame, TaskSlotType, TaskTerminator, TaskUnaryOp,
 };
 use crate::ir::IrType;
 
@@ -84,6 +84,7 @@ struct FrameEmitter<'a> {
     scopes: &'a [TaskScopeFrame],
     scope_exits: &'a TaskScopeExitPlan,
     indirect_calls: &'a [TaskIndirectCallPlan],
+    finally: &'a TaskFinallyPlan,
 }
 
 impl<'a> FrameEmitter<'a> {
@@ -184,6 +185,7 @@ impl<'a> FrameEmitter<'a> {
             scopes: &frame.scopes,
             scope_exits: &frame.scope_exits,
             indirect_calls: &frame.indirect_calls,
+            finally: &frame.finally,
         })
     }
 
@@ -379,6 +381,11 @@ impl<'a> FrameEmitter<'a> {
                 "  uint32_t scope_exit_active;\n  uint64_t scope_exit_id, scope_exit_deadline;\n",
             );
         }
+        if !self.finally.state_cleanup.is_empty() {
+            out.push_str(
+                "  uint32_t finally_unwind_active;\n  uint64_t finally_unwind_deadline;\n",
+            );
+        }
         for (index, slot) in self.function.slots.iter().enumerate() {
             out.check()?;
             if self.persistent.contains(&index) {
@@ -397,11 +404,13 @@ impl<'a> FrameEmitter<'a> {
             c_type(&self.function.result)?
         ));
         self.emit_scope_descriptors(out)?;
+        self.emit_finally_helpers(out)?;
         self.emit_check(out);
         self.emit_scope_helpers(out)?;
         self.emit_init(out)?;
         self.emit_drive(out)?;
         self.emit_resume(out);
+        self.emit_finish_finally(out)?;
         self.emit_finish_exit_values(out)?;
         self.emit_terminate(out)?;
         self.emit_take_result(out)?;
@@ -445,6 +454,34 @@ impl<'a> FrameEmitter<'a> {
         }
         out.push_str("    default: return NULL;\n  }\n}\n");
         out.check()
+    }
+
+    fn emit_finally_helpers(&self, out: &mut COutput) -> KuResult<()> {
+        if self.finally.state_cleanup.is_empty() {
+            return Ok(());
+        }
+        if self.finally.state_cleanup.len() != self.function.states.len()
+            || self.finally.regions.len() != self.function.states.len()
+            || self.finally.region_slots.len() != self.function.states.len()
+        {
+            return Err(unsupported("native finally plan has invalid dimensions"));
+        }
+        out.push_str(&format!(
+            "static uint32_t {}_finally_cleanup(uint32_t state) {{\n  switch (state) {{\n",
+            self.prefix
+        ));
+        for (state, cleanup) in self.finally.state_cleanup.iter().enumerate() {
+            if let Some(cleanup) = cleanup {
+                if cleanup.0 >= self.function.states.len() {
+                    return Err(unsupported(
+                        "native finally plan references a missing state",
+                    ));
+                }
+                out.push_str(&format!("  case {state}u: return {}u;\n", cleanup.0));
+            }
+        }
+        out.push_str("  default: return UINT32_MAX;\n  }\n}\n");
+        Ok(())
     }
 
     fn emit_scope_helpers(&self, out: &mut COutput) -> KuResult<()> {
@@ -540,6 +577,16 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                  }}"
             )
         };
+        let finally_check = if self.finally.state_cleanup.is_empty() {
+            String::new()
+        } else {
+            "if (frame->finally_unwind_active > 1u || (!frame->finally_unwind_active && frame->finally_unwind_deadline) || (frame->finally_unwind_active && frame->finally_unwind_deadline == UINT64_MAX)) return KU_TASK_FRAME_INVALID_STATE;".to_string()
+        };
+        let staged_cleanup_check = if self.finally.state_cleanup.is_empty() {
+            "frame->header.cleanup_state != UINT32_MAX".to_string()
+        } else {
+            format!("(frame->header.cleanup_state != UINT32_MAX && (frame->header.exit_class != KU_TASK_EXIT_RUNTIME_FAILURE || !frame->header.has_exit_deadline || frame->header.cleanup_state != {prefix}_finally_cleanup(frame->header.state)))")
+        };
         let scope_exit_check = if self.scope_exits.operations.is_empty() {
             String::new()
         } else {
@@ -554,10 +601,11 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                if (frame->header.abi_version != KU_TASK_FRAME_ABI_VERSION) return KU_TASK_FRAME_ABI_MISMATCH;\n\
                if (frame->header.storage_size != sizeof({frame_type}) || frame->header.function_id != UINT64_C({id})) return KU_TASK_FRAME_INVALID_STORAGE;\n\
                if (frame->header.running || (frame->header.status > KU_TASK_FRAME_TIMED_OUT && frame->header.status != KU_TASK_FRAME_EXIT_STAGED && frame->header.status != KU_TASK_FRAME_SCOPE_REQUEST)) return KU_TASK_FRAME_INVALID_STATE;\n\
-               if (frame->header.status == KU_TASK_FRAME_EXIT_STAGED && (!{exit_bridge} || frame->header.result_initialized != 1u || frame->header.cleanup_state != UINT32_MAX || (frame->header.exit_class != KU_TASK_EXIT_USER_RESULT && frame->header.exit_class != KU_TASK_EXIT_RUNTIME_FAILURE) || frame->header.has_exit_deadline > 1u || (!frame->header.has_exit_deadline && frame->header.exit_deadline) || (frame->header.has_exit_deadline && frame->header.exit_deadline == UINT64_MAX) || (frame->header.exit_class == KU_TASK_EXIT_USER_RESULT && (frame->header.has_exit_deadline || frame->header.exit_deadline)))) return KU_TASK_FRAME_INVALID_STATE;\n\
+               if (frame->header.status == KU_TASK_FRAME_EXIT_STAGED && (!{exit_bridge} || frame->header.result_initialized != 1u || {staged_cleanup_check} || (frame->header.exit_class != KU_TASK_EXIT_USER_RESULT && frame->header.exit_class != KU_TASK_EXIT_RUNTIME_FAILURE) || frame->header.has_exit_deadline > 1u || (!frame->header.has_exit_deadline && frame->header.exit_deadline) || (frame->header.has_exit_deadline && frame->header.exit_deadline == UINT64_MAX) || (frame->header.exit_class == KU_TASK_EXIT_USER_RESULT && (frame->header.has_exit_deadline || frame->header.exit_deadline)))) return KU_TASK_FRAME_INVALID_STATE;\n\
                if (frame->header.state >= {states}u || (frame->header.cleanup_state != UINT32_MAX && frame->header.cleanup_state >= {states}u)) return KU_TASK_FRAME_INVALID_STATE;\n\
                {scope_check}\n\
                {scope_exit_check}\n\
+               {finally_check}\n\
                return KU_TASK_FRAME_OK;\n\
              }}\n",
             id = self.function.id.0,
@@ -650,7 +698,14 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                }\n",
         );
         if self.hosted {
-            out.push_str("  if (!cleanup && ku_task_control_atomic_load(&((KuTaskAdapterHostV1*)clock->host)->control->phase)!=KU_TASK_CONTROL_LIVE) { /* Mid-drive facts need bitmap cleanup, not an older suspension CFG. */ frame->header.cleanup_state=UINT32_MAX; frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }\n");
+            if self.finally.state_cleanup.is_empty() {
+                out.push_str("  if (!cleanup && ku_task_control_atomic_load(&((KuTaskAdapterHostV1*)clock->host)->control->phase)!=KU_TASK_CONTROL_LIVE) { frame->header.cleanup_state=UINT32_MAX; frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }\n");
+            } else {
+                out.push_str(&format!("  if (!cleanup) {{ frame->header.cleanup_state={}_finally_cleanup(frame->header.state); if (ku_task_control_atomic_load(&((KuTaskAdapterHostV1*)clock->host)->control->phase)!=KU_TASK_CONTROL_LIVE) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }} }}\n",self.prefix));
+                out.push_str("  if (!cleanup && frame->finally_unwind_active && clock->now_ms(clock->context)>=frame->finally_unwind_deadline) { frame->header.has_exit_deadline=1u; frame->header.exit_deadline=frame->finally_unwind_deadline;\n");
+                self.emit_runtime_error(out,"ku_error_make(ku_string_static((const uint8_t*)\"task\",4),ku_string_static((const uint8_t*)\"shutdown_timeout\",16),ku_string_static((const uint8_t*)\"finally cleanup deadline expired\",32))")?;
+                out.push_str("  }\n");
+            }
         }
         out.push_str("  switch (frame->header.state) {\n");
         for index in 0..self.function.states.len() {
@@ -814,10 +869,37 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 }
             }
         }
+        if !self.finally.state_cleanup.is_empty() {
+            out.push_str("ku_task_protected_failure:;\n  switch (frame->header.state) {\n");
+            for (state, region) in self.finally.regions.iter().enumerate() {
+                if let Some(region) = region {
+                    out.push_str(&format!("  case {state}u:\n"));
+                    for index in (0..self.function.slots.len()).rev() {
+                        if self.finally.region_slots[region.0] & (1u64 << index) != 0
+                            && self.owns_slot(SlotId(index))
+                        {
+                            self.emit_slot_drop(out, SlotId(index))?;
+                        }
+                    }
+                    if let Some(outer) = self.finally.state_cleanup[state] {
+                        out.push_str(&format!(
+                            "  frame->header.state={}u; goto ku_task_dispatch;\n",
+                            outer.0
+                        ));
+                    } else {
+                        out.push_str("  goto ku_task_terminated;\n");
+                    }
+                }
+            }
+            out.push_str("  default: goto ku_task_terminated;\n  }\n");
+        }
         out.push_str(
             "ku_task_terminated:;\n  if (clock->now_ms(clock->context) >= frame->header.cleanup_deadline_ms) frame->header.cleanup_timed_out = 1;\n",
         );
         self.emit_all_slot_drops(out, true)?;
+        if !self.finally.state_cleanup.is_empty() {
+            out.push_str(&format!("  if ((frame->header.status==KU_TASK_FRAME_CANCELLED || frame->header.status==KU_TASK_FRAME_TIMED_OUT) && frame->header.result_initialized) {{ frame->header.result_initialized=0; {} }}\n",drop_statement(&self.function.result,"frame->result")?));
+        }
         out.push_str(
             "  frame->header.running = 0;\n\
                return frame->header.status;\n}\n",
@@ -833,11 +915,21 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         operation_id: usize,
     ) -> KuResult<()> {
         match operation {
+            TaskOp::FinallyEnter { .. } | TaskOp::FinallyLeave { .. } => {}
+            TaskOp::FinallyUnwindBegin => {
+                out.push_str("  if (cleanup) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n  if (!frame->finally_unwind_active) { frame->finally_unwind_active=1u; frame->finally_unwind_deadline=ku_task_host_deadline((KuTaskAdapterHostV1*)clock->host,UINT64_MAX,1); }\n");
+            }
+            TaskOp::FinallyUnwindEnd => {
+                out.push_str("  if (cleanup || !frame->finally_unwind_active) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n  frame->finally_unwind_active=0; frame->finally_unwind_deadline=0;\n");
+            }
             TaskOp::ScopeExitBegin { exit, .. } => {
                 out.push_str(&format!(
                     "  if (cleanup || frame->scope_exit_active) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  frame->scope_exit_active=1u;\n  frame->scope_exit_id=UINT64_C({});\n  frame->scope_exit_deadline=ku_task_host_deadline((KuTaskAdapterHostV1*)clock->host,UINT64_MAX,1);\n",
                     exit.0
                 ));
+                if !self.finally.state_cleanup.is_empty() {
+                    out.push_str("  if (frame->finally_unwind_active && frame->finally_unwind_deadline < frame->scope_exit_deadline) frame->scope_exit_deadline=frame->finally_unwind_deadline;\n");
+                }
             }
             TaskOp::ScopeExitEnd { exit } => {
                 out.push_str(&format!(
@@ -1108,7 +1200,11 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         if self.exit_bridge {
             // Cleanup already has a genuine R2 reason. Do not evaluate/consume
             // a new error expression or replace that reason with a staged exit.
-            out.push_str("    if (cleanup) goto ku_task_terminated;\n");
+            out.push_str(if self.finally.state_cleanup.is_empty() {
+                "    if (cleanup) goto ku_task_terminated;\n"
+            } else {
+                "    if (cleanup) goto ku_task_protected_failure;\n"
+            });
         }
         out.push_str(&format!("    frame->result=({}){{false,{}, {error}}};\n    frame->header.result_initialized=1;\n    frame->header.exit_class=KU_TASK_EXIT_RUNTIME_FAILURE;\n",c_type(&self.function.result)?,c_zero_initializer(inner)?));
         if self.exit_bridge {
@@ -1126,12 +1222,12 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         // The Result and current ownership bitmap no longer match any prior
         // Suspend/Await cleanup edge. Cancellation must use the bitmap fallback
         // after the adapter has durably handed off every remaining Task owner.
-        out.push_str(
-            "  frame->header.cleanup_state = UINT32_MAX;\n\
-               frame->header.status = KU_TASK_FRAME_EXIT_STAGED;\n\
-               frame->header.running = 0;\n\
-               return KU_TASK_FRAME_EXIT_STAGED;\n",
-        );
+        if self.finally.state_cleanup.is_empty() {
+            out.push_str("  frame->header.cleanup_state = UINT32_MAX;\n");
+        } else {
+            out.push_str(&format!("  frame->header.cleanup_state = frame->header.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE && frame->header.has_exit_deadline ? {}_finally_cleanup(frame->header.state) : UINT32_MAX;\n",self.prefix));
+        }
+        out.push_str("  frame->header.status=KU_TASK_FRAME_EXIT_STAGED; frame->header.running=0; return KU_TASK_FRAME_EXIT_STAGED;\n");
     }
 
     fn emit_slot_drop(&self, out: &mut COutput, slot: SlotId) -> KuResult<()> {
@@ -1205,10 +1301,16 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                frame->header.running = 1;\n",
             task_mask = self.task_mask
         ));
+        if !self.finally.state_cleanup.is_empty() {
+            out.push_str("  if (frame->header.cleanup_state!=UINT32_MAX) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n");
+        }
         // All owned Values are persistent in a bridge, including an empty
         // Task set. Typed drops cannot invoke Ku callbacks or fail halfway;
         // clear their bits once, retaining the independently staged Result.
         self.emit_all_slot_drops(out, false)?;
+        if !self.finally.state_cleanup.is_empty() {
+            out.push_str("  frame->finally_unwind_active=0; frame->finally_unwind_deadline=0;\n");
+        }
         out.push_str(
             "  frame->header.status = KU_TASK_FRAME_READY;\n\
                frame->header.running = 0;\n\
@@ -1217,9 +1319,41 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
         out.check()
     }
 
+    fn emit_finish_finally(&self, out: &mut COutput) -> KuResult<()> {
+        if self.finally.state_cleanup.is_empty() {
+            return Ok(());
+        }
+        let prefix = &self.prefix;
+        let frame_type = &self.frame_type;
+        out.push_str(&format!(r#"/* All Task headers were transferred before protected user code. The entry
+ * witness is consumed before drive, so receipt retries cannot replay finally. */
+static uint32_t {prefix}_finish_finally(void* storage, size_t bytes, uint32_t abi,
+    uint64_t absolute_deadline, const KuTaskFrameClockV1* clock) {{
+  uint32_t checked={prefix}_check(storage,bytes,abi);
+  if (checked!=KU_TASK_FRAME_OK) return checked;
+  {frame_type}* frame=({frame_type}*)storage;
+  if (frame->header.status!=KU_TASK_FRAME_EXIT_STAGED || (frame->header.initialized & UINT64_C({mask}))) return KU_TASK_FRAME_INVALID_STATE;
+  if (frame->header.cleanup_state==UINT32_MAX) return KU_TASK_FRAME_OK;
+  if (!clock || !clock->now_ms || !clock->host || absolute_deadline==UINT64_MAX) return KU_TASK_FRAME_INVALID_ARGUMENT;
+  frame->header.state=frame->header.cleanup_state;
+  frame->header.cleanup_state=UINT32_MAX;
+  frame->header.cleanup_deadline_ms=absolute_deadline;
+  frame->header.running=1;
+  checked={prefix}_drive(frame,clock,1);
+  return checked==KU_TASK_FRAME_EXIT_STAGED ? KU_TASK_FRAME_OK : KU_TASK_FRAME_INVALID_STATE;
+}}
+"#,mask=self.task_mask));
+        out.check()
+    }
+
     fn emit_terminate(&self, out: &mut COutput) -> KuResult<()> {
         let prefix = &self.prefix;
         let frame_type = &self.frame_type;
+        let finally_host = if self.finally.state_cleanup.is_empty() {
+            0
+        } else {
+            1
+        };
         out.push_str(&format!(
             "static uint32_t {prefix}_terminate(void* storage, size_t bytes, uint32_t abi, uint32_t reason, uint64_t absolute_cleanup_deadline_ms, const KuTaskFrameClockV1* clock) {{\n\
                uint32_t checked = {prefix}_check(storage, bytes, abi);\n\
@@ -1228,7 +1362,7 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                {frame_type}* frame = ({frame_type}*)storage;\n\
                if (frame->header.initialized & UINT64_C({task_mask})) return KU_TASK_FRAME_INVALID_STATE;\n\
                if (ku_task_frame_is_terminal(frame->header.status)) return frame->header.status;\n\
-               if (!clock || !clock->now_ms) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
+               if (!clock || !clock->now_ms || ({finally_host} && !clock->host)) return KU_TASK_FRAME_INVALID_ARGUMENT;\n\
                frame->header.status = reason;\n\
                frame->header.cleanup_deadline_ms = absolute_cleanup_deadline_ms;\n\
                frame->header.running = 1;\n\
@@ -1444,7 +1578,7 @@ const FRAME_ABI: &str = r#"
  * that CFG. Descriptor outputs are exclusive NULL-initialized pointer slots,
  * disjoint from frame and every Owned deep allocation; interval guards do not
  * authenticate arbitrary raw C storage. No helper changes R2 cancellation. */
-#define KU_TASK_FRAME_ABI_VERSION 4u
+#define KU_TASK_FRAME_ABI_VERSION 5u
 #if defined(_MSC_VER)
 #define KU_TASK_FRAME_ALIGNOF(T) __alignof(T)
 #else

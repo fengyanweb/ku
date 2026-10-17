@@ -85,7 +85,8 @@ fn run_case_with_workers(
         }
     }
     Checker::new().check(&ast).unwrap();
-    let native = task_lower::lower_program(&ast).unwrap();
+    let native =
+        task_lower::lower_program(&ast).unwrap_or_else(|error| panic!("case {index}: {error}"));
     let mut generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
     if let Some(workers) = workers {
         let original = "ku_task_root_worker_count(), startup_deadline);";
@@ -830,12 +831,12 @@ fn native_task_if_cli_rejects_unsupported_and_ownership_before_either_artifact_p
             "native async subset does not support this expression",
         ),
         (
-            "async fn main(): null! { while (false) { try { break } finally { println(0) } } return ok(null) }",
-            "native async subset does not support user finally",
+            "async fn main(): null! { try { println(1) } finally { while (false) { println(0) } } return ok(null) }",
+            "native async subset does not support loops inside a native Task finally body",
         ),
         (
-            "async fn main(): null! { while (false) { try { continue } finally { println(0) } } return ok(null) }",
-            "native async subset does not support user finally",
+            "async fn main(): null! { try { println(1) } finally { for item in 0 { println(item) } } return ok(null) }",
+            "native async subset does not support loops inside a native Task finally body",
         ),
         (
             "async fn Child(): int! { return ok(1) } async fn main(): null! { outer = Child() if (true) { inner = outer } return ok(null) }",
@@ -1120,5 +1121,172 @@ async fn main(): null! {
         ),
     ] {
         run_case_with_workers(1500 + index, source, output, None, Some(1));
+    }
+}
+
+#[test]
+fn native_task_finally_source_preserves_normal_nonlocal_and_error_routes() {
+    let cases = [
+        (
+            r#"async fn main(): null! {
+                marker = 0
+                try { marker = 1 } finally { marker = marker + 10 }
+                println(marker)
+                try { fail "caught" } catch (error) { println(error.message) }
+                finally { marker = marker + 100 }
+                println(marker) return ok(null)
+            }"#,
+            "11\ncaught\n111\n",
+            None,
+        ),
+        (
+            r#"async fn Probe(): str! {
+                text = "中文😀"
+                try { return ok(text) } finally { println("finished") }
+                return ok("unreachable")
+            }
+            async fn main(): null! { println((await Probe())?) return ok(null) }"#,
+            "finished\n中文😀\n",
+            None,
+        ),
+        (
+            r#"async fn Probe(): int! {
+                try { return ok(1) } finally { return ok(2) }
+                return ok(3)
+            }
+            async fn main(): null! { println((await Probe())?) return ok(null) }"#,
+            "2\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                try {
+                    try { fail "body" } catch (inner) { println(inner.message) }
+                    finally { fail "replacement" }
+                } catch (outer) { println(outer.message) }
+                return ok(null)
+            }"#,
+            "body\nreplacement\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                marker = 0
+                for item in 4 {
+                    try {
+                        if (item == 1) { continue }
+                        if (item == 3) { break }
+                        marker = marker + item
+                    } finally { marker = marker + 10 }
+                }
+                println(marker) return ok(null)
+            }"#,
+            "42\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                try { try { fail "primary" } finally { println(1) } }
+                finally { println(2) }
+                return ok(null)
+            }"#,
+            "1\n2\n",
+            Some("primary"),
+        ),
+        (
+            r#"async fn main(): null! {
+                bound = 9223372036854775807
+                try { println(bound + 1) } finally { println("must skip") }
+                return ok(null)
+            }"#,
+            "",
+            Some("integer overflow"),
+        ),
+        (
+            r#"import time from "std.time"
+            async fn Probe(): int! {
+                try { time.sleep(0)? return ok(7) } finally { println(9) }
+                return ok(0)
+            }
+            async fn main(): null! {
+                try { println((await Probe())?) } finally { println(10) }
+                return ok(null)
+            }"#,
+            "9\n7\n10\n",
+            None,
+        ),
+        (
+            r#"async fn Probe(): str! {
+                for item in 3 {
+                    try { return ok("discarded") } finally {
+                        if (item < 2) { continue }
+                        return ok("replacement")
+                    }
+                }
+                return ok("unreachable")
+            }
+            async fn main(): null! { println((await Probe())?) return ok(null) }"#,
+            "replacement\n",
+            None,
+        ),
+        (
+            r#"async fn Probe(): int! {
+                for item in 3 { try { return ok(1) } finally { break } }
+                return ok(2)
+            }
+            async fn main(): null! { println((await Probe())?) return ok(null) }"#,
+            "2\n",
+            None,
+        ),
+        (
+            r#"async fn Probe(): str! {
+                try { return ok("saved") } finally {
+                    try { fail "local" } catch (error) { println(error.message) }
+                    println(8)
+                }
+                return ok("unreachable")
+            }
+            async fn main(): null! { println((await Probe())?) return ok(null) }"#,
+            "local\n8\nsaved\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                try { try { fail "body" } finally { fail "replacement" } }
+                catch (error) { println(error.message) }
+                return ok(null)
+            }"#,
+            "replacement\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                for item in 3 {
+                    try {
+                        try { fail "body" } finally {
+                            if (item < 2) { continue }
+                            fail "replacement"
+                        }
+                    } catch (error) { println(error.message) }
+                }
+                return ok(null)
+            }"#,
+            "replacement\n",
+            None,
+        ),
+        (
+            r#"async fn main(): null! {
+                for item in 3 {
+                    try { try { fail "body" } finally { break } }
+                    catch (error) { println(error.message) }
+                }
+                println("after") return ok(null)
+            }"#,
+            "after\n",
+            None,
+        ),
+    ];
+    for (index, (source, stdout, failure)) in cases.into_iter().enumerate() {
+        run_case_with_workers(5000 + index, source, stdout, failure, Some(1));
     }
 }

@@ -108,8 +108,12 @@ async fn main(): null! {
 可恢复错误的 `try/catch` 可接收 `fail`、`?` 和 `await` 后的普通 Result 错误，
 先清理 try 内的局部和子 Task，再进入最近的 catch。Error 的 domain/code/message
 支持重复读取，也可 `fail problem` 保留原错误继续向外传播。取消、handler 超时和
-算术运行错误继续走外层退出，不会误进业务 catch。完整 `try/catch/finally` 尚未完成：
-非空用户 finally 仍在生成产物前明确拒绝，用户 cleanup 不能 Await。
+算术运行错误继续走外层退出，不会误进业务 catch。受限 `try/catch/finally` 已接入：
+普通完成、错误、return、break、continue 都经过对应 body，返回值先保存；finally
+中的新普通跳转可覆盖原跳转，旧 Owned 返回值随替换释放。取消和超时保留原原因，
+所有子任务移交后才执行 protected body，同一退出链的绝对截止只收紧、不续期。
+若取消首次发生在已经正常执行的 finally 中，停止当前 body 剩余语句并进入外层清理，
+不会从头重放当前 body；进入前已取消时则按 protected 规则执行。
 
 ```ku
 async fn Load(): int! { fail "读取失败" }
@@ -120,6 +124,8 @@ async fn main(): null! {
     } catch (problem) {
         println(problem.domain)
         println(problem.message)
+    } finally {
+        println("处理结束")
     }
     return ok(null)
 }
@@ -142,9 +148,12 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝数组 for、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、非空用户 finally、捕获闭包、函数值参数/返回、
+仍拒绝数组 for、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、函数值参数/返回、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
 float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及异步标准库 I/O。
+finally 体首版只接有限 primitive/字符串/Error 操作、Copy 赋值、输出、分支与局部
+try/catch；其中创建 Task、Await、sleep、循环及再次嵌入 finally 仍在生成 artifact 前
+明确拒绝。普通 try body 中的多层 finally 链支持由内向外退出。
 未支持形式在生成 artifact 前明确报错。
 用户 cleanup 仍不能 Await；内部 ACK continuation 不是新的用户语法。
 该子集使用有界 worker 组及共享容量的全局/本地固定队列，不递归 poll child；不同 Task
@@ -169,7 +178,7 @@ lower 对已构造 AST 的 If 另限32层，表达式仍受 `depth > 64` 拒绝�
 记录与原条件等待，同一 worker 可以继续执行其它就绪 Task，不创建新的线程。
 每个实例同时最多一项 timer 登记，计入固定存储和 instance 大小；取消、退出及槽复用
 都会撤销登记，旧 token 不能影响后来的等待。清理体仍不能提交新的 sleep。
-这不包含 duration 对象、异步网络 I/O、用户 finally 或 native blocking pool。
+这不包含 duration 对象、异步网络 I/O 或 native blocking pool。
 
 ```ku
 import time from "std.time"

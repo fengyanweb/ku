@@ -104,6 +104,18 @@ pub enum TaskBinaryOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOp {
+    /// Dedicated Jump marker. Cancellation enters cleanup with this marker's
+    /// parent chain, so the body cannot be replayed by a later cancellation.
+    FinallyEnter {
+        cleanup: StateId,
+    },
+    FinallyLeave {
+        cleanup: StateId,
+    },
+    /// A nonlocal ordinary exit carries one deadline through all its finally
+    /// bodies and intervening lexical Task drains. Nested overrides reuse it.
+    FinallyUnwindBegin,
+    FinallyUnwindEnd,
     /// Internal nonlocal cleanup boundary, not a deadline or suspension.
     ScopeExitBegin {
         exit: TaskScopeExitId,
@@ -306,6 +318,16 @@ pub struct TaskFunctionFrame {
     pub suspensions: Vec<TaskSuspensionLive>,
     /// Verified reaching identities for each indirect Start, in source CFG order.
     pub indirect_calls: Vec<TaskIndirectCallPlan>,
+    pub finally: TaskFinallyPlan,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskFinallyPlan {
+    /// Cancellation/failure continuation at each dispatch boundary.
+    pub state_cleanup: Vec<Option<StateId>>,
+    /// A protected body owns only the temporaries born in its own region.
+    pub regions: Vec<Option<StateId>>,
+    pub region_slots: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,6 +633,7 @@ struct SlotMasks {
     has_scope_exit: bool,
     has_timer: bool,
     has_error_projection: bool,
+    has_finally: bool,
 }
 
 fn callable_matches(slot: &TaskSlot, target: &TaskFunction, budget: &mut Budget) -> KuResult<bool> {
@@ -660,6 +683,7 @@ fn validate_shape(
     let mut has_scope_exit = false;
     let mut has_timer = false;
     let mut has_error_projection = false;
+    let mut has_finally = false;
     for (index, slot) in function.slots.iter().enumerate() {
         if let TaskSlotType::Callable { parameters, .. } = &slot.ty {
             budget.spend_many(parameters.len())?;
@@ -693,6 +717,15 @@ fn validate_shape(
         for operation in &state.operations {
             budget.spend()?;
             match operation {
+                TaskOp::FinallyEnter { cleanup } | TaskOp::FinallyLeave { cleanup } => {
+                    has_finally = true;
+                    if cleanup.0 >= function.states.len() {
+                        return Err(invalid(
+                            "finally marker references an unknown cleanup state",
+                        ));
+                    }
+                }
+                TaskOp::FinallyUnwindBegin | TaskOp::FinallyUnwindEnd => has_finally = true,
                 TaskOp::ScopeExitBegin { .. } => {
                     has_scope_exit = true;
                     scope_exit_count += 1; // Preflight bounds all operations.
@@ -1093,6 +1126,9 @@ fn validate_shape(
     if scope_count != 0 && !exit_bridge {
         return Err(invalid("scope graph requires typed Exit"));
     }
+    if has_finally && !exit_bridge {
+        return Err(invalid("finally graph requires typed Exit"));
+    }
     Ok(SlotMasks {
         parameters,
         owned,
@@ -1105,12 +1141,14 @@ fn validate_shape(
         has_scope_exit,
         has_timer,
         has_error_projection,
+        has_finally,
     })
 }
 
 fn validate_regions_and_progress(
     function: &TaskFunction,
     scoped: bool,
+    has_finally: bool,
     budget: &mut Budget,
 ) -> KuResult<Vec<bool>> {
     let count = function.states.len();
@@ -1141,6 +1179,14 @@ fn validate_regions_and_progress(
     }
     let mut cleanup = vec![false; count];
     for state in &function.states {
+        if has_finally {
+            for operation in &state.operations {
+                budget.spend()?;
+                if let TaskOp::FinallyEnter { cleanup } = operation {
+                    pending.push(*cleanup);
+                }
+            }
+        }
         if let TaskTerminator::Suspend {
             cleanup: target, ..
         }
@@ -1188,20 +1234,22 @@ fn validate_regions_and_progress(
                     "cleanup cannot enter a normal scope-exit operation",
                 ));
             }
-            if matches!(
-                operation,
-                TaskOp::Unary {
-                    op: TaskUnaryOp::Negate,
-                    ..
-                } | TaskOp::Binary {
-                    op: TaskBinaryOp::Add
-                        | TaskBinaryOp::Subtract
-                        | TaskBinaryOp::Multiply
-                        | TaskBinaryOp::Divide
-                        | TaskBinaryOp::Remainder,
-                    ..
-                }
-            ) {
+            if !has_finally
+                && matches!(
+                    operation,
+                    TaskOp::Unary {
+                        op: TaskUnaryOp::Negate,
+                        ..
+                    } | TaskOp::Binary {
+                        op: TaskBinaryOp::Add
+                            | TaskBinaryOp::Subtract
+                            | TaskBinaryOp::Multiply
+                            | TaskBinaryOp::Divide
+                            | TaskBinaryOp::Remainder,
+                        ..
+                    }
+                )
+            {
                 // A checked arithmetic failure must not replace the cleanup's
                 // original cancellation/timeout with a normal runtime exit.
                 return Err(invalid("cleanup cannot perform trapping arithmetic"));
@@ -1349,7 +1397,11 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         | TaskOp::CheckForLimit { .. }
         | TaskOp::Drop { .. }
         | TaskOp::DropIfInit { .. }
-        | TaskOp::Print { .. } => None,
+        | TaskOp::Print { .. }
+        | TaskOp::FinallyEnter { .. }
+        | TaskOp::FinallyLeave { .. }
+        | TaskOp::FinallyUnwindBegin
+        | TaskOp::FinallyUnwindEnd => None,
     }
 }
 
@@ -1703,7 +1755,11 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         | TaskOp::Print { .. }
         | TaskOp::ScopeEnter { .. }
         | TaskOp::ScopeExitBegin { .. }
-        | TaskOp::ScopeExitEnd { .. } => {}
+        | TaskOp::ScopeExitEnd { .. }
+        | TaskOp::FinallyEnter { .. }
+        | TaskOp::FinallyLeave { .. }
+        | TaskOp::FinallyUnwindBegin
+        | TaskOp::FinallyUnwindEnd => {}
     }
     state
 }
@@ -1779,6 +1835,7 @@ fn initialized_states(
     function: &TaskFunction,
     masks: SlotMasks,
     scopes: &ScopeLayout,
+    finally: &TaskFinallyPlan,
     budget: &mut Budget,
 ) -> KuResult<Vec<Option<Initialized>>> {
     let mut inputs = vec![None; function.states.len()];
@@ -1793,10 +1850,27 @@ fn initialized_states(
         budget.spend()?;
         queued[id.0] = false;
         let mut output = inputs[id.0].expect("queued states have input facts");
+        let cancellation_input = output;
         for operation in &function.states[id.0].operations {
             operation_work(operation, budget)?;
             output = transfer(output, operation, masks.owned);
         }
+        let cancellation = finally
+            .state_cleanup
+            .get(id.0)
+            .copied()
+            .flatten()
+            .map(|target| {
+                let removed = masks.tasks
+                    | finally.regions[id.0].map_or(0, |region| finally.region_slots[region.0]);
+                (
+                    target,
+                    Initialized {
+                        must: cancellation_input.must & !removed,
+                        may: cancellation_input.may & !removed,
+                    },
+                )
+            });
         for (target, output) in edge_states(
             &function.states[id.0].terminator,
             output,
@@ -1805,6 +1879,7 @@ fn initialized_states(
         )
         .into_iter()
         .flatten()
+        .chain(cancellation)
         {
             budget.spend()?;
             let merged = match inputs[target.0] {
@@ -1830,6 +1905,7 @@ fn live_states(
     function: &TaskFunction,
     tasks: u64,
     scopes: &ScopeLayout,
+    finally: &TaskFinallyPlan,
     budget: &mut Budget,
 ) -> KuResult<Vec<u64>> {
     let mut live_in = vec![0u64; function.states.len()];
@@ -1886,7 +1962,11 @@ fn live_states(
             for operation in state.operations.iter().rev() {
                 operation_work(operation, budget)?;
                 match operation {
-                    TaskOp::ScopeEnter { .. }
+                    TaskOp::FinallyEnter { .. }
+                    | TaskOp::FinallyLeave { .. }
+                    | TaskOp::FinallyUnwindBegin
+                    | TaskOp::FinallyUnwindEnd
+                    | TaskOp::ScopeEnter { .. }
                     | TaskOp::ScopeExitBegin { .. }
                     | TaskOp::ScopeExitEnd { .. } => {}
                     TaskOp::Init { dst, .. } | TaskOp::InitCallable { dst, .. } => {
@@ -1926,6 +2006,11 @@ fn live_states(
                     }
                 }
             }
+            if let Some(target) = finally.state_cleanup.get(id).copied().flatten() {
+                let removed =
+                    tasks | finally.regions[id].map_or(0, |region| finally.region_slots[region.0]);
+                live |= live_in[target.0] & !removed;
+            }
             changed |= live_in[id] != live;
             live_in[id] = live;
             live_out[id] = output;
@@ -1942,6 +2027,7 @@ fn validate_ownership_and_plan(
     inputs: &[Option<Initialized>],
     live_out: &[u64],
     scopes: ScopeLayout,
+    finally: &TaskFinallyPlan,
     budget: &mut Budget,
 ) -> KuResult<TaskFunctionFrame> {
     // Exit can return to the adapter even when the function has no Task slots.
@@ -1953,11 +2039,26 @@ fn validate_ownership_and_plan(
     if hosted {
         frame |= masks.owned;
     }
+    if !finally.state_cleanup.is_empty() {
+        // Cancellation is observable at every dispatch boundary. The fixed
+        // 64-slot frame keeps Copy temporaries too; no dynamic unwind stack.
+        let declared = if function.slots.len() == 64 {
+            u64::MAX
+        } else {
+            (1u64 << function.slots.len()) - 1
+        };
+        frame |= declared & !masks.borrowed;
+    }
     let mut suspensions = Vec::new();
     for (id, block) in function.states.iter().enumerate() {
         let Some(mut state) = inputs[id] else {
             continue;
         };
+        if finally.state_cleanup.get(id).copied().flatten().is_some() {
+            // A cancellation can return between any two states, including
+            // states without a suspension. Preserve Copy values read there.
+            frame |= live_out[id] & state.may;
+        }
         budget.spend()?;
         for operation in &block.operations {
             operation_work(operation, budget)?;
@@ -2129,6 +2230,7 @@ fn validate_ownership_and_plan(
         slots: slots(frame),
         suspensions,
         indirect_calls: Vec::new(),
+        finally: TaskFinallyPlan::default(),
     })
 }
 
@@ -2293,6 +2395,189 @@ fn validate_start_graph(
 
 /// Validate types, cancellation regions, cooperative progress and fixed-point
 /// ownership before deciding which values actually need persistent frame slots.
+fn finally_plan(
+    function: &TaskFunction,
+    normal: &[bool],
+    enabled: bool,
+    budget: &mut Budget,
+) -> KuResult<TaskFinallyPlan> {
+    if !enabled {
+        return Ok(TaskFinallyPlan::default());
+    }
+    let count = function.states.len();
+    budget.spend_many(
+        count
+            .checked_mul(5)
+            .ok_or_else(|| invalid("finally analysis overflow"))?,
+    )?;
+    let mut entries = vec![false; count];
+    for state in &function.states {
+        for op in &state.operations {
+            budget.spend()?;
+            if let TaskOp::FinallyEnter { cleanup } = op {
+                if std::mem::replace(&mut entries[cleanup.0], true) {
+                    return Err(invalid("duplicate finally cleanup declaration"));
+                }
+            }
+        }
+    }
+    let mut inputs: Vec<Option<Vec<StateId>>> = vec![None; count];
+    let mut regions: Vec<Option<StateId>> = vec![None; count];
+    let mut unwind_inputs = vec![false; count];
+    if !entries.iter().any(|entry| *entry) {
+        return Err(invalid("finally unwind requires a cleanup declaration"));
+    }
+    let mut pending = VecDeque::from([(function.entry, Vec::new(), None, false)]);
+    while let Some((id, incoming, region, mut unwind)) = pending.pop_front() {
+        budget.spend_many(incoming.len() + 1)?;
+        if let Some(existing) = &inputs[id.0] {
+            if existing != &incoming || regions[id.0] != region || unwind_inputs[id.0] != unwind {
+                return Err(invalid("finally join has different active cleanup chains"));
+            }
+            continue;
+        }
+        inputs[id.0] = Some(incoming.clone());
+        regions[id.0] = region;
+        unwind_inputs[id.0] = unwind;
+        if normal[id.0] != region.is_none() {
+            return Err(invalid("finally cleanup cannot reenter normal execution"));
+        }
+        let mut stack = incoming;
+        let state = &function.states[id.0];
+        for operation in &state.operations {
+            budget.spend()?;
+            match operation {
+                TaskOp::FinallyEnter { cleanup } => {
+                    if region.is_some()
+                        || stack.contains(cleanup)
+                        || state.operations.len() != 1
+                        || !matches!(state.terminator, TaskTerminator::Jump { .. })
+                    {
+                        return Err(invalid(
+                            "finally Enter requires a dedicated normal Jump state",
+                        ));
+                    }
+                    pending.push_back((*cleanup, stack.clone(), Some(*cleanup), false));
+                    stack.push(*cleanup);
+                }
+                TaskOp::FinallyLeave { cleanup } => {
+                    if state.operations.len() != 1
+                        || !matches!(state.terminator, TaskTerminator::Jump { .. })
+                        || stack.pop() != Some(*cleanup)
+                    {
+                        return Err(invalid("finally Leave must close the innermost cleanup"));
+                    }
+                }
+                TaskOp::FinallyUnwindBegin | TaskOp::FinallyUnwindEnd if region.is_some() => {
+                    return Err(invalid("protected finally cannot enter an ordinary unwind"))
+                }
+                TaskOp::FinallyUnwindBegin => {
+                    if unwind {
+                        return Err(invalid("nested finally unwind Begin"));
+                    }
+                    unwind = true;
+                }
+                TaskOp::FinallyUnwindEnd => {
+                    if !unwind {
+                        return Err(invalid("finally unwind End has no Begin"));
+                    }
+                    unwind = false;
+                }
+                _ => {}
+            }
+        }
+        let normal_next = match state.terminator {
+            TaskTerminator::Suspend { resume, cleanup } => {
+                if stack.last().is_some_and(|target| *target != cleanup)
+                    || (stack.is_empty() && entries[cleanup.0])
+                {
+                    return Err(invalid("suspension bypasses its active finally cleanup"));
+                }
+                pending.push_back((
+                    cleanup,
+                    stack[..stack.len().saturating_sub(1)].to_vec(),
+                    Some(cleanup),
+                    false,
+                ));
+                [Some(resume), None]
+            }
+            TaskTerminator::Await { ready, cleanup, .. }
+            | TaskTerminator::Timer { ready, cleanup, .. }
+            | TaskTerminator::ScopeDrain { ready, cleanup, .. } => {
+                if stack.last().is_some_and(|target| *target != cleanup)
+                    || (stack.is_empty() && entries[cleanup.0])
+                {
+                    return Err(invalid("suspension bypasses its active finally cleanup"));
+                }
+                pending.push_back((
+                    cleanup,
+                    stack[..stack.len().saturating_sub(1)].to_vec(),
+                    Some(cleanup),
+                    false,
+                ));
+                [Some(ready), None]
+            }
+            TaskTerminator::Complete { .. }
+            | TaskTerminator::Exit { .. }
+            | TaskTerminator::Terminate
+                if !stack.is_empty() =>
+            {
+                return Err(invalid("exit bypasses an active finally body"))
+            }
+            ref term => successors(term),
+        };
+        for target in normal_next.into_iter().flatten() {
+            let next_region = if !normal[target.0] && entries[target.0] {
+                Some(target)
+            } else {
+                region
+            };
+            pending.push_back((
+                target,
+                stack.clone(),
+                next_region,
+                if next_region.is_some() { false } else { unwind },
+            ));
+        }
+    }
+    let mut state_cleanup = Vec::with_capacity(count);
+    let mut region_slots = vec![0u64; count];
+    for (id, input) in inputs.iter().enumerate() {
+        budget.spend()?;
+        state_cleanup.push(input.as_ref().and_then(|stack| stack.last().copied()));
+        if let Some(region) = regions[id] {
+            for operation in &function.states[id].operations {
+                budget.spend()?;
+                if let Some(slot) = operation_destination(operation) {
+                    if !matches!(&function.slots[slot.0].ty, TaskSlotType::Value { ty, .. } if copy_type(ty))
+                    {
+                        region_slots[region.0] |= bit(slot);
+                    }
+                }
+            }
+            if let TaskTerminator::TryResult {
+                ok_value,
+                err_result,
+                ..
+            } = function.states[id].terminator
+            {
+                for slot in [ok_value, err_result] {
+                    budget.spend()?;
+                    if !matches!(&function.slots[slot.0].ty, TaskSlotType::Value { ty, .. } if copy_type(ty))
+                    {
+                        region_slots[region.0] |= bit(slot);
+                    }
+                }
+            }
+        }
+    }
+    Ok(TaskFinallyPlan {
+        state_cleanup,
+        regions,
+        region_slots,
+    })
+}
+
 pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<TaskFramePlan> {
     preflight(program, limits)?;
     let mut budget = Budget {
@@ -2312,7 +2597,13 @@ pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<Ta
         .collect::<KuResult<_>>()?;
     let mut functions = Vec::new();
     for (function, masks) in program.functions.iter().zip(masks) {
-        let normal = validate_regions_and_progress(function, masks.scope_count != 0, &mut budget)?;
+        let normal = validate_regions_and_progress(
+            function,
+            masks.scope_count != 0,
+            masks.has_finally,
+            &mut budget,
+        )?;
+        let finally = finally_plan(function, &normal, masks.has_finally, &mut budget)?;
         let scopes = validate_scope_layout(
             function,
             masks.scope_count,
@@ -2321,10 +2612,18 @@ pub fn verify_and_plan(program: &TaskProgram, limits: TaskLimits) -> KuResult<Ta
             &mut budget,
         )?;
         let scope_exits = validate_scope_exits(function, masks, &normal, &scopes, &mut budget)?;
-        let inputs = initialized_states(function, masks, &scopes, &mut budget)?;
-        let live = live_states(function, masks.tasks, &scopes, &mut budget)?;
-        let mut frame =
-            validate_ownership_and_plan(function, masks, &inputs, &live, scopes, &mut budget)?;
+        let inputs = initialized_states(function, masks, &scopes, &finally, &mut budget)?;
+        let live = live_states(function, masks.tasks, &scopes, &finally, &mut budget)?;
+        let mut frame = validate_ownership_and_plan(
+            function,
+            masks,
+            &inputs,
+            &live,
+            scopes,
+            &finally,
+            &mut budget,
+        )?;
+        frame.finally = finally;
         frame.scope_exits = scope_exits;
         if masks.callables != 0 {
             frame.indirect_calls = callable_call_plan(function, program, &ids, &mut budget)?;

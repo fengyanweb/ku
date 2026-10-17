@@ -57,7 +57,12 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
     for state in &mut function.states {
         for operation in &mut state.operations {
             match operation {
-                TaskOp::ScopeExitBegin { .. } | TaskOp::ScopeExitEnd { .. } => {}
+                TaskOp::ScopeExitBegin { .. }
+                | TaskOp::ScopeExitEnd { .. }
+                | TaskOp::FinallyEnter { .. }
+                | TaskOp::FinallyLeave { .. }
+                | TaskOp::FinallyUnwindBegin
+                | TaskOp::FinallyUnwindEnd => {}
                 TaskOp::ScopeEnter { tasks, .. } => {
                     for task in tasks {
                         map(task);

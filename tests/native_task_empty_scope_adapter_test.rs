@@ -157,7 +157,7 @@ fn native_task_empty_scope_adapter_without_tasks_and_with_unconsumed_root_task_i
         );
         let mut generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
         for required in [
-            "#define KU_TASK_FRAME_ABI_VERSION 4u",
+            "#define KU_TASK_FRAME_ABI_VERSION 5u",
             "#define KU_TASK_CONTROL_ABI_VERSION 2u",
             "#define KU_TASK_DRIVER_ABI_VERSION 9u",
             "KU_TASK_FRAME_SCOPE_REQUEST = 12u",
@@ -396,7 +396,7 @@ static void fixture_pending(KuTaskValueV1* root) {
   fixture_idle(root->ticket.driver);
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==9u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==9u);
   ku_task_control_atomic_init(&fixture_release_parent,0);
   ku_task_control_atomic_init(&fixture_release_child,0);
   CHECK(ku_test_event_init(&fixture_closed_event) && ku_test_event_init(&fixture_child_cleanup_event));

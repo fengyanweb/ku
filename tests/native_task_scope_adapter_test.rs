@@ -200,7 +200,7 @@ fn native_task_scope_adapter_normal_sessions_and_timeout_final_handoff_in_c() {
     assert!(plan.functions[0].slots.contains(&SlotId(11)));
     let mut generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
     for required in [
-        "#define KU_TASK_FRAME_ABI_VERSION 4u",
+        "#define KU_TASK_FRAME_ABI_VERSION 5u",
         "#define KU_TASK_DRIVER_ABI_VERSION 9u",
         "KU_TASK_FRAME_SCOPE_REQUEST = 12u",
     ] {
@@ -880,7 +880,7 @@ static void fixture_case(unsigned mode) {
   for (size_t i=0;i<FIXTURE_PUBLICATION_EVENTS;i++) CHECK(ku_test_event_destroy(&fixture_publication_events[i]));
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==9u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==9u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&fixture_release_children,0);
   ku_task_control_atomic_init(&fixture_release_continuations,0);
@@ -1053,7 +1053,7 @@ fn native_task_scope_adapter_same_scope_two_rounds_and_second_round_cancel_in_c(
         assert!(plan.functions[0].slots.contains(&SlotId(slot)));
     }
     let mut generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
-    assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 4u"));
+    assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 5u"));
     assert!(generated.contains("#define KU_TASK_DRIVER_ABI_VERSION 9u"));
     for forbidden in ["run_source", "const SOURCE"] {
         assert!(!generated.contains(forbidden));
@@ -1496,7 +1496,7 @@ static void loop_case(unsigned mode) {
   for (size_t i=0;i<2u;i++) CHECK(ku_test_event_destroy(&loop_closed_event[i]));
 }
 int main(void) {
-  CHECK(KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_DRIVER_ABI_VERSION==9u && KU_TASK_CONTROL_ABI_VERSION==2u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_DRIVER_ABI_VERSION==9u && KU_TASK_CONTROL_ABI_VERSION==2u);
   ku_task_control_deadline_init(&fixture_clock);
   ku_task_control_atomic_init(&loop_release,0); ku_task_control_atomic_init(&loop_allow,0);
   loop_case(0u); loop_case(1u); puts("task-scope-loop-ok"); return 0;

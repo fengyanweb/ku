@@ -53,7 +53,7 @@ ku ir examples\function.ku
 - `for` 已有 `ForEach` terminator。
 - `?` 会降成 `ResultBranch`，ok 分支用 `BindOk` 取值，err 分支用 `PropagateErr` 或 `JumpErr` 跳入 try handler。
 - `try/catch/finally` 已有 `BeginTry` / `EndTry` / `BindError` 标记；可恢复错误、普通完成和 return 使用独立 finally block，return value 先写入隐藏槽，再经过 finally 返回。return 选择最近具有 finally 的 handler 及其对应返回值槽；内层仅有 catch 不能屏蔽外层 finally。错误传播仍选择最近的错误 handler，不共用返回路径的筛选规则。
-- 同步 return-finally 使用每个 pending return 独立的隐藏原因槽：普通 return 为 false，已有 safepoint 选中的 timeout 为 true。只在跨出该清理尝试的 handler 边界时屏蔽新的 fail、`?` 或 return，丢弃新 Owned payload 并接回原 finish；清理内部局部 try/catch 仍按普通规则执行。void return 调用先执行副作用和既有 post-call 检查。保留三份 finally body，不增加第四份；嵌套清理不重置原绝对 deadline。同步整数算术另由下文 SyncGuard 接入；Panic/index/OOM/底层 helper 直接退出、传播所有 fatal 原因或 Task 用户 finally 仍不在已完成边界内。
+- 同步 return-finally 使用每个 pending return 独立的隐藏原因槽：普通 return 为 false，已有 safepoint 选中的 timeout 为 true。只在跨出该清理尝试的 handler 边界时屏蔽新的 fail、`?` 或 return，丢弃新 Owned payload 并接回原 finish；清理内部局部 try/catch 仍按普通规则执行。void return 调用先执行副作用和既有 post-call 检查。保留三份 finally body，不增加第四份；嵌套清理不重置原绝对 deadline。同步整数算术另由下文 SyncGuard 接入；Panic/index/OOM/底层 helper 直接退出及所有 fatal 原因传播仍不在本节同步边界内；Task 用户 finally 见独立协议。
 - struct / enum 会进入 layout table，enum variant 有稳定 tag 和 payload 字段顺序。
 - array literal/index/assignment 保留元素类型，native C 从 IR 生成带长度的 array ABI。
 - enum 构造、tag、payload 访问和 match 已降低为显式 CFG 与 intrinsic，不再使用 unsupported 占位。
@@ -255,7 +255,7 @@ R5a 固定等待字段采用版本 2，R5b.1 清理水位采用版本 3，R5b.2 
 升为版本 4，R5h 正常作用域登记字段升为版本 5，单向 FINAL 标记升为版本 6；
 R6 的有界 worker 组、双条件和显式 join 生命周期升为版本 7。
 内部 C 类型名中的 `V1` 不是旧布局兼容承诺，初始化明确拒绝旧版本（包括6）。
-当前 Frame ABI 4、Control ABI 2、Driver ABI 9。
+当前 Frame ABI 5、Control ABI 2、Driver ABI 9。
 普通同步输出和空 Task IR 不附带该实现。私有 init 显式接收 1..32 个真实 OS worker
 及有限 startup_deadline；worker 数与 slot 容量独立，使用调用方提供的固定 slot/ring。
 源码 root 在执行目标上按 min(32, max(4, OS 报告的逻辑处理器数)) 选择 worker 数，
@@ -435,7 +435,7 @@ ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不�
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
 整数 for 先快照上限，以只读 `CheckForLimit` 拒绝负数；隐藏计数器独立于本轮
 可赋值的词法绑定。循环体复用相同 ScopeDrain/drop/Suspend 路径；上限只求值一次。
-Owned/Task 重赋值、复合赋值与自增/自减、数组 for、递归、跨词法作用域 Task move、非空用户 finally、捕获闭包、函数值参数/返回、同步调用、
+Owned/Task 重赋值、复合赋值与自增/自减、数组 for、递归、跨词法作用域 Task move、捕获闭包、函数值参数/返回、同步调用、
 Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
@@ -454,7 +454,7 @@ Result 不携带已经成功结束的独立 scope 预算；这不改变可恢复
 
 源码与两种 CLI native 构建、表达式和清理测试的实际结果按精确提交记录在工作日志。
 定向验证、完整本机门禁和三系统 CI/sanitizer 分开记录，历史失败及修复结果也分列，
-不从旧 SHA 的通过结果外推。Frame ABI 4、Control ABI 2、Driver ABI 9 不等于稳定外部 C FFI。
+不从旧 SHA 的通过结果外推。Frame ABI 5、Control ABI 2、Driver ABI 9 不等于稳定外部 C FFI。
 M:N、netpoll、事件驱动 HTTP、native blocking、完整 RSS 预算、性能基准与 soak 未完成。
 
 ### 顶层 async 函数值与 Driver9 本地队列
@@ -472,24 +472,47 @@ fixed_bytes。global_queued仅表示ring，queued为所有队列总和，容量�
 真实worker内创建的child与普通Yield进入本地FIFO，空闲者偷其它tail；外部唤醒、
 取消和timer进入全局，已在本地的queued槽可原位提升，保持一个queue credit。
 全局优先并在连续8次全局选择后提供一次本地机会；原Marker进展断言未放宽。
-仍使用一个mutex，不宣称锁竞争或性能已改善；Frame4/Control2保持，旧C需重编译。
+仍使用一个mutex，不宣称锁竞争或性能已改善；Frame5/Control2保持，旧C需重编译。
 
 ### 源码 try/catch 与 Error 字段计费
 
 普通 `fail` 和 `?` 选择最近的 catch；ScopeExitBegin/End 先 drain try 内子 Task、
 释放局部，再把 bare Error 交给 catch。`MakeError`、`WrapError`、`ErrorField` 使用
 初始化/移动事实；重复字段读取保持原 Error。catch 的 fail 可向外层传播；取消、
-期限耗尽和算术 runtime-failure 不转成可恢复 Result。非空用户 finally 仍拒绝，
-不能把普通 try/catch 通过写成完整 try/catch/finally 已完成。
+期限耗尽和算术 runtime-failure 不转成可恢复 Result。受限 Task 用户 finally
+使用下节独立的取消 CFG；普通 try/catch 通过不替代该路径验证或完整 async 验收。
 
 ErrorField 的 STATIC 字符串复用头；OWNED 字段在 malloc 前向当前 RUNNING ticket
 预留实际 clone 容量，失败先退款。仅含这种投影的函数启用有界 typed 活跃头扫描，
 最多64槽，覆盖 frame、暂存 Result 和 adapter payload；drop/移交后只收缩已释放
 的收费，成功 hosted take 沿用原转移账本。没有逐次递归树遍历或改动通用 Value。
-私有生成 host 的分配扩展有独立 ABI1/sizeof 门槛；Frame4/Control2不变，当前Driver9另见本地队列协议。
+私有生成 host 的分配扩展有独立 ABI1/sizeof 门槛；Frame5/Control2不变，当前Driver9另见本地队列协议。
 这只覆盖新增 Error-field 分配，不代表外部库、网络或进程内存都已受控。
 
-### 源码 sleep 与 Driver8 timer
+### Task 用户 finally 与 Frame ABI 5
+
+`FinallyEnter/FinallyLeave` 是独立 Jump 状态的词法标记，verifier 建立逐状态取消入口、
+protected region 及其临时槽集合；取消边参与初始化与 liveness，Copy 读取也必须真实
+持久化。marker 不匹配、绕过内层清理、无 Enter 的 unwind 和 protected 中新建期限
+均明确拒绝。沿用原状态、槽位、表达式深度和分析工作预算。
+
+普通 return/fail/break/continue 的跨层退出使用函数内两个标量保存共享绝对 D，
+finally 自身覆盖退出时清掉原 pending Owned 值；局部 catch 恢复不丢原返回值。
+Frame ABI 因此升5，Control2/Driver9保持；旧生成C须整体重编译。没有运行时 finally
+堆栈或新增 Task owner。只含旧操作的函数保留原快速路径。
+
+取消/超时先把全部 Task owner 移交，再执行 protected finally。期限耗尽仍做实际
+Owned 释放，但不继续用户代码；本层算术、输出或分配失败结束当前尝试并转外层，
+原原因与 D 不变。普通 finally 内首次取消会停止本层剩余语句，不重放已执行部分。
+正常 scope timeout 使用 `finish_finally` 消费一次入口，再允许 `finish_exit_values`；
+重复 receipt/ACK 不能重跑 body，未消费入口不能跳过 body 提前完成值清理。
+
+body 首版支持有限 primitive/字符串/Error、Copy 赋值、输出、分支和局部 try/catch。
+其中创建新 Task、Await、sleep、循环或再次嵌 finally 仍拒绝；try body 中的多层
+finally 链可用。普通算术 fatal 仍跳过用户 finally。实际执行与精确提交CI结果见日志，
+这些能力不代表完整 async、I/O、M:N 或发布验收。
+
+### 源码 sleep 与当前 Driver timer
 
 `Timer { millis, dst, ready, cleanup }` 要求 owned int 参数和 `null!` 目标。
 参数槽在 Pending 期间显式持久化，只有 Ready 初始化目标；零毫秒不能作为无条件
@@ -497,7 +520,7 @@ ErrorField 的 STATIC 字符串复用头；OWNED 字段在 malloc 前向当前 R
 Host 首次登记绝对到期点，Pending 重入读取原 token；Ready 先 detach 再产生结果，
 负数沿用普通错误。取消/退出先撤掉 timer，再进入原 scope/receipt 清理。
 
-Driver8 每个固定槽包含一条独立 timer 记录，token 携带 slot generation 和 timer epoch；
+当前 Driver9 每个固定槽包含一条独立 timer 记录，token 携带 slot generation 和 timer epoch；
 旧 token 对复用槽返回 STALE。到期复用原最早期限、条件等待与 ready 队列，不增加
 轮询线程。固定存储及 adapter token 均计入实际 sizeof 费用。snapshot 新增当前/峰值
 `timers`、`peak_timers` 和容量 `timer_limit`，以及 resident/queued/running/reserved_bytes
@@ -525,8 +548,8 @@ manifest 是借用的稳定 instance 存储；完整集合、生命周期、唯�
 父 D 缩短不扫描 manifest，adapter 对 pending issued child 调用 cancel_receipt；
 取消后向最终退出提升、外层 child 合并复用下述 driver 原语及内部 typed adapter。
 对应 TaskOp/verifier 和帧协议见 R5h.4；源码 If 分支与 While 循环已复用该协议，
-并在真实作用域退出时 drain 子 Task。Task 源码的数组 for 与非空用户 finally
-仍未接入；try/catch 已复用此退出协议，不代表完整 async 或 M:N。
+并在真实作用域退出时 drain 子 Task。Task 源码数组 for 仍未接入；受限
+try/catch/finally 已复用此退出协议，不代表完整 async 或 M:N。
 容量和重复检查最多64项/2016次比较，无新增堆分配、队列或 RC 边；测试与精确提交
 验收结果见工作日志，不从接口存在推断真实 C 或 sanitizer 已通过。
 
@@ -552,7 +575,8 @@ parent cleanup_fault、非法 manifest/token/alias 仍拒绝，输出与原对�
 保留旧 outgoing ACK wait 和 incoming ancestor 关系，不新增分配、RC、队列、
 唤醒、等待或重试。生成 adapter 必须先移交全部 Task，再清理其余 Value；正常
 scope 超时和业务 return/Err 穿 If 作用域使用上述桥接；Owned/Pending、失败与竞态
-的执行证据分开记录，不从接口存在推断通过。async finally 的源码闭环仍未接入。
+的执行证据分开记录，不从接口存在推断通过。受限 async finally 的新路径见上节，
+不能由旧 promotion 测试替代。
 
 ### R5h.3 typed Exit 与当前源码子集
 
@@ -567,7 +591,7 @@ scope 超时和业务 return/Err 穿 If 作用域使用上述桥接；Owned/Pend
 不增加每值分配，16 KiB frame/64槽等上限不变。移除合成指令可减少实际 IR 工作，
 不承诺所有旧资源阈值输入仍在同一位置拒绝。
 
-`KU_TASK_FRAME_EXIT_STAGED` 是 Frame ABI 3 引入并在当前 ABI 4 保留的非终态。Result 先进入
+`KU_TASK_FRAME_EXIT_STAGED` 是 Frame ABI 3 引入并在当前 ABI 5 保留的非终态。Result 先进入
 独立退出槽，剩余 Value 尚不释放，旧 Suspend/Await 的 cleanup_state 清为无效。
 反复 resume 不重放用户状态；take/destroy 不能绕过这个非终态。bridge 的正常执行
 runtime error 也暂存退出，保留真实 Await 继承的绝对 D；已经进入取消 cleanup 的
@@ -583,7 +607,7 @@ staged/私有结果期间胜出，沿原 R2 首赢家裁决，结果只 drop 一
 本片不增加每值分配、线程、重试循环或用户 API；复用原 frame 位图、driver receipt
 与串行 executor。IR 反例、真实 C 退出顺序测试和 ABI 拒绝测试分别记录证据，不从
 artifact 文本存在推断执行通过。内部 normal ScopeEnter/ScopeDrain 与活动 session
-的 final promotion adapter 接入见下节，源码 If 接入见 R5h.5，while复用其body清理；source finally、
+的 final promotion adapter 接入见下节，源码 If 接入见 R5h.5，while复用其body清理；受限 source finally 另见上节，
 完整 native async 与高并发发布门禁仍未完成。具体测试结果以工作日志及精确提交 CI 为准。
 
 ### R5h.4 内部 ScopeEnter/ScopeDrain（源码 if 复用）
@@ -604,7 +628,7 @@ runtime 栈、不启动期限。Task 集合最多64槽且互不重叠；未声�
 新边界两侧所需 Copy 值真实持久化，任何可能初始化的 borrowed 槽不得跨界；成员、
 布局、图遍历和保存集扫描均先计入原分析预算，不扩大原硬限。
 
-Frame ABI 4 的 `KU_TASK_FRAME_SCOPE_REQUEST` 是停止但非终态的请求。只读静态
+Frame ABI 5 的 `KU_TASK_FRAME_SCOPE_REQUEST` 是停止但非终态的请求。只读静态
 descriptor 由真实 StateId 确定，包含 scope/mask/ready/cleanup；同一作用域可有多个
 互斥 drain 状态。重复 resume 不重放，take/destroy 拒绝。Continue 要求所选 Task 位
 为空，只改到 PENDING/ready，再返回调度器检查真实 phase，不能直接执行用户代码。
@@ -628,7 +652,7 @@ scope_end；全量 ACK 后异常 Pending 作为合同错误拒绝，不循环 YI
 
 上述是内部合同和实现边界，不等于所有故障/竞态已实测。源码 If/While/整数 For 只覆盖
 已接入的 primitive（含 str）/单层 Result；任意 Owned payload、数组 for、
-Task 源码 finally 与完整 async 仍未实现。
+Task 源码受限 finally 另见上节，完整 async 仍未实现。
 真实 C、无副作用 raw 反例、sanitizer、精确 SHA 三系统
 结果分开验收；固定硬件性能、RSS、soak、M:N、netpoll 和事件 HTTP 仍未完成。
 
@@ -645,7 +669,7 @@ Jump/ScopeDrain 链和合法 Value drop，到 End 时必须恰好到达 retain�
 条件入口；两者先 drain/drop，再经过 Suspend。break 连接最近循环的 after 状态。
 
 分析沿用原硬限和逐步预算；没有标记时不分配新增操作/状态向量 buffer。
-仅含标记的生成函数帧保存退出身份和原始绝对期限，公共 Frame ABI 4、Control ABI 2、
+仅含标记的生成函数帧保存退出身份和原始绝对期限，公共 Frame ABI 5、Control ABI 2、
 Driver ABI 9 不变，实际实例 sizeof 仍计入原 frame 预算。逐层 normal scope session
 各自真实结束，但同一次退出的期限持续到最后 Value drop 和 End，不逐层重建。
 超期转原 runtime-failure 退出桥；取消和更短期限继续沿用既有移交与实际 ACK 协议。
@@ -707,7 +731,8 @@ typed producer 后立即接 `SyncGuard { continue_block, cleanup_block }`；直�
 main 和 HTTP dispatcher 是消费信号的根：先取信号，再解释返回值。HTTP 普通算术
 失败为500，已经选中的 timeout 仍为504；不能由稍后的时钟检查把500升级为504。
 这不是事件驱动 HTTP、M:N 或完整 fatal 闭环。Panic/index/OOM、call-depth 的直接
-退出、foreign callback 重入、Task 用户 finally 仍未覆盖。LLVM 仅保留 SyncGuard
+退出与 foreign callback 重入仍未覆盖。Task 用户 finally 使用本文独立协议，
+不属于本节 SyncGuard 覆盖；LLVM 仅保留 SyncGuard
 两条 CFG 边的结构占位，不提供本片 native C 的 checked 算术与 Owned 清理保证。
 定向实测与失败记录见工作日志；本片完整 workspace、精确提交三系统 CI/sanitizer
 和打包门禁必须独立验收，不能以旧 SHA 的结果替代。

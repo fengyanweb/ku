@@ -246,8 +246,8 @@ fn native_task_copy_assignment_raw_type_owned_task_and_declaration_gates_remain(
         ("value = 1 value += 1", "this statement"),
         ("value = 1 value++", "this statement"),
         (
-            "while (false) { try { break } finally { println(0) } }",
-            "user finally in native Task source",
+            "try { println(1) } finally { while (false) { println(0) } }",
+            "loops inside a native Task finally body",
         ),
     ] {
         let source = format!("async fn main(): null! {{ {body} return ok(null) }}");
@@ -1385,5 +1385,35 @@ async fn main(): null! {
     assert!(
         Checker::new().check(&moved).is_err(),
         "function binding assignment keeps ordinary Owned move behavior"
+    );
+}
+
+#[test]
+fn native_task_finally_source_nesting_and_local_name_clones_keep_existing_limits() {
+    let mut body = "return ok(null)".to_owned();
+    for _ in 0..31 {
+        body = format!("try {{ {body} }} finally {{ if (true) {{ println(1) }} }}");
+    }
+    let source = format!("async fn main(): null! {{ {body} return ok(null) }}");
+    let error = task_lower::lower_program(&checked(&source)).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("statement nesting beyond 32 Task levels"),
+        "{error}"
+    );
+
+    let name = "local".repeat(20_000);
+    let mut body = "return ok(null)".to_owned();
+    for _ in 0..10 {
+        body = format!("try {{ {body} }} finally {{ println({name}) return ok(null) }}");
+    }
+    let source = format!("async fn main(): null! {{ {name} = 1 {body} return ok(null) }}");
+    let error = task_lower::lower_program(&checked(&source)).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("source text beyond the Task literal budget"),
+        "{error}"
     );
 }

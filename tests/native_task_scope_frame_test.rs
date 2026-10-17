@@ -194,7 +194,7 @@ fn native_task_scope_frame_request_continue_timeout_and_cleanup_execute_in_c() {
     assert!(plan.functions[1].scopes.is_empty());
 
     let generated = c::generate_task_frame_c_source(&sync, &tasks).unwrap();
-    assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 4u"));
+    assert!(generated.contains("#define KU_TASK_FRAME_ABI_VERSION 5u"));
     for state in [1, 2] {
         assert!(generated.contains(&format!(
             "static const KuTaskFrameScopeDescriptorV1 ku_task_frame_0_scope_{state} ="
@@ -502,5 +502,171 @@ int main(void) {
   CHECK(ku_task_control_owner_drop(&owner,2000u)==KU_TASK_CONTROL_OK && !owner.lease.control);
   CHECK(carrier.disposed==1u && carrier.cleanups==1u && carrier.drops==1u);
   fixture_all_freed(); puts("scope-frame-ok"); return 0;
+}
+"#;
+
+#[test]
+fn native_task_finally_frame_cancellation_errors_deadlines_and_single_execution() {
+    let cases = [
+        ("println(mark)", "while (true) {}", "37\nowned\n", 0),
+        (
+            "zero = 0 println(1 / zero)",
+            "while (true) {}",
+            "owned\n",
+            1,
+        ),
+        ("return ok(null)", "while (true) {}", "owned\n", 2),
+        ("fail \"replacement\"", "while (true) {}", "owned\n", 3),
+        (
+            "try { fail \"local\" } catch (error) { println(error.message) } println(mark)",
+            "while (true) {}",
+            "local\n37\nowned\n",
+            4,
+        ),
+        ("println(\"io-fail\")", "while (true) {}", "owned\n", 5),
+        ("println(mark)", "while (true) {}", "", 6),
+        (
+            "println(\"first\") if (true) { println(\"second\") }",
+            "",
+            "first\nowned\n",
+            7,
+        ),
+        ("println(mark)", "println(0)", "0\n37\nowned\n", 8),
+    ];
+    for (inner, body, expected, mode) in cases {
+        let source = format!(
+            "async fn Probe(value: str): null! {{ mark = 37 try {{ try {{ {body} }} finally {{ {inner} }} }} finally {{ println(value) }} return ok(null) }} async fn main(): null! {{ return ok(null) }}"
+        );
+        let ast = Parser::new(Lexer::new(&source).lex().unwrap())
+            .parse_program()
+            .unwrap();
+        Checker::new().check(&ast).unwrap();
+        let native = ku::ir::task_lower::lower_program(&ast).unwrap();
+        let generated = c::generate_native_task_c_source(&native, &Default::default()).unwrap();
+        let hooks = format!(
+            "#if defined(_WIN32)\n#include <windows.h>\n#else\n#include <pthread.h>\n#endif\n{LEDGER_LOCK}\n{ALLOCATION_HOOK}\n{LOCKED_ALLOCATIONS}\nstatic size_t fixture_finally_write(const void*,size_t,size_t,FILE*);\n#define fwrite fixture_finally_write\n"
+        );
+        let generated = replace_once(
+            generated,
+            "typedef struct KuString {",
+            &format!("{hooks}typedef struct KuString {{"),
+        );
+        let mut generated = replace_once(
+            generated,
+            "int main(void) {",
+            "static int fixture_unmodified_finally_main(void) {",
+        );
+        generated.push_str(&FINALLY_FRAME_MAIN.replace("@MODE@", &mode.to_string()));
+        let directory = TempDir::new(&format!("native-task-finally-frame-{mode}"));
+        let path = directory.path().join("program.c");
+        fs::write(&path, generated).unwrap();
+        let Some(executable) = compile_harness(directory.path(), &path, "program") else {
+            assert!(
+                std::env::var_os("GITHUB_ACTIONS").is_none(),
+                "CI must execute finally frame cases"
+            );
+            continue;
+        };
+        fs::remove_file(path).unwrap();
+        let output = run_bounded(
+            Command::new(executable).current_dir(directory.path()),
+            RUN_TIMEOUT,
+            RUN_LIMITS,
+        )
+        .expect("finally frame stays within the existing process watchdog");
+        assert!(
+            output.status.success(),
+            "mode {mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let wanted = if mode == 8 {
+            format!("{expected}finally-frame-ok\n")
+        } else {
+            format!("{expected}{expected}finally-frame-ok\n")
+        };
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+            wanted,
+            "mode {mode}"
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
+
+const FINALLY_FRAME_MAIN: &str = r#"
+#undef fwrite
+static KuTaskControlV1* fixture_finally_phase;
+static uint32_t fixture_finally_reason;
+static unsigned fixture_finally_writes,fixture_finally_failures;
+static size_t fixture_finally_write(const void* bytes,size_t size,size_t count,FILE* stream) {
+  fixture_finally_writes++;
+  if (@MODE@==5 && size==1u && count==7u && !memcmp(bytes,"io-fail",7u)) {
+    fixture_finally_failures++; return 0;
+  }
+  size_t written=fwrite(bytes,size,count,stream);
+  if (@MODE@==7 && size==1u && count==5u && !memcmp(bytes,"first",5u))
+    ku_task_control_atomic_store(&fixture_finally_phase->phase,fixture_finally_reason);
+  return written;
+}
+static uint64_t fixture_finally_now(void* raw) { (void)raw; return 100u; }
+static uint32_t fixture_finally_static_projection(void* raw) {
+  (void)raw; CHECK(0); return KU_TASK_DRIVER_INTERNAL;
+}
+static void fixture_finally_run(uint32_t reason) {
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes);
+  KuTaskFrame_0 frame={0}; KuTaskControlV1 phase={0};
+  ku_task_control_atomic_init(&phase.phase,KU_TASK_CONTROL_LIVE);
+  KuTaskDriverTicketV1 ticket={0};
+  KuTaskAdapterHostV1 host={0}; host.ticket=&ticket; host.control=&phase;
+  host.allocation_host_bytes=sizeof(host); host.allocation_host_abi=KU_TASK_ALLOCATION_HOST_ABI_VERSION;
+  host.allocation_context=&host; host.reconcile_charge=fixture_finally_static_projection;
+  KuTaskFrameClockV1 clock={fixture_finally_now,NULL,&host};
+  fixture_finally_phase=&phase; fixture_finally_reason=reason==KU_TASK_FRAME_CANCELLED ? KU_TASK_CONTROL_CANCELLED : KU_TASK_CONTROL_TIMED_OUT;
+  fixture_finally_writes=fixture_finally_failures=0;
+  uint8_t* bytes=(uint8_t*)malloc(31u); CHECK(bytes); memcpy(bytes,"owned",5u);
+  KuString owned={bytes,5u,31u,KU_STRING_OWNED};
+  CHECK(ku_task_frame_0_init(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,&owned)==KU_TASK_FRAME_OK && !owned.ptr);
+  CHECK(fixture_ledger().allocations==1u && fixture_ledger().bytes==31u);
+  uint32_t status=ku_task_frame_0_resume(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,&clock);
+  unsigned char initial[sizeof(frame)]; memcpy(initial,&frame,sizeof(frame));
+  KuTaskFrameClockV1 no_host=clock; no_host.host=NULL;
+  CHECK(ku_task_frame_0_terminate(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,reason,1000u,&no_host)==KU_TASK_FRAME_INVALID_ARGUMENT);
+  CHECK(!memcmp(initial,&frame,sizeof(frame)));
+  if (@MODE@==8) {
+    CHECK(status==KU_TASK_FRAME_SCOPE_REQUEST);
+    const KuTaskFrameScopeDescriptorV1* descriptor=NULL;
+    CHECK(ku_task_frame_0_scope_request(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,&descriptor)==KU_TASK_FRAME_OK && descriptor && !descriptor->task_mask);
+    CHECK(ku_task_frame_0_scope_timeout(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,descriptor->scope_id,1000u)==KU_TASK_FRAME_EXIT_STAGED);
+    CHECK(frame.header.cleanup_state!=UINT32_MAX && frame.header.result_initialized);
+    unsigned char before[sizeof(frame)]; memcpy(before,&frame,sizeof(frame));
+    CHECK(ku_task_frame_0_finish_exit_values(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION)==KU_TASK_FRAME_INVALID_STATE);
+    CHECK(!memcmp(before,&frame,sizeof(frame)));
+    CHECK(ku_task_frame_0_finish_finally(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,1000u,&clock)==KU_TASK_FRAME_OK);
+    unsigned writes=fixture_finally_writes;
+    CHECK(frame.header.cleanup_state==UINT32_MAX && frame.header.result_initialized && !frame.header.initialized);
+    CHECK(ku_task_frame_0_finish_finally(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,1000u,&clock)==KU_TASK_FRAME_OK && fixture_finally_writes==writes);
+    CHECK(ku_task_frame_0_finish_exit_values(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION)==KU_TASK_FRAME_OK);
+    KuResult_null result={0};
+    CHECK(ku_task_frame_0_take_result(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,&result)==KU_TASK_FRAME_OK && !result.ok);
+    CHECK(result.error.code.len==16u && !memcmp(result.error.code.ptr,"shutdown_timeout",16u));
+    ku_result_drop_null(&result);
+  } else {
+    CHECK(status==KU_TASK_FRAME_PENDING);
+    uint64_t deadline=@MODE@==6 ? 100u : 1000u;
+    CHECK(ku_task_frame_0_terminate(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,reason,deadline,&clock)==reason);
+    CHECK(frame.header.status==reason && frame.header.cleanup_deadline_ms==deadline && !frame.header.initialized && !frame.header.result_initialized && !frame.header.running);
+    CHECK(frame.header.cleanup_timed_out==(@MODE@==6));
+    unsigned writes=fixture_finally_writes;
+    CHECK(ku_task_frame_0_terminate(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION,reason,deadline,&clock)==reason && fixture_finally_writes==writes);
+    CHECK(fixture_finally_failures==(@MODE@==5));
+  }
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
+  CHECK(ku_task_frame_0_destroy(&frame,sizeof(frame),KU_TASK_FRAME_ABI_VERSION)==KU_TASK_FRAME_OK);
+  CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
+}
+int main(void) {
+  fixture_finally_run(KU_TASK_FRAME_CANCELLED);
+  if (@MODE@!=8) fixture_finally_run(KU_TASK_FRAME_TIMED_OUT);
+  puts("finally-frame-ok"); return 0;
 }
 "#;

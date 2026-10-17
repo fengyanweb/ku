@@ -811,7 +811,7 @@ static void held_unreaped(KuTaskDriverV1* driver,const KuTaskDriverSlotV1* slots
   HELD_CHECK(ku_task_driver_unlock(driver)==0);
 }
 int main(void) {
-  HELD_CHECK(KU_TASK_DRIVER_ABI_VERSION==9u && KU_TASK_FRAME_ABI_VERSION==4u && KU_TASK_CONTROL_ABI_VERSION==2u);
+  HELD_CHECK(KU_TASK_DRIVER_ABI_VERSION==9u && KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u);
   KuTaskDriverV1 driver={0}; KuTaskDriverSlotV1 slots[2]={0}; size_t ring[2]={0};
   size_t fixed=sizeof(driver)+sizeof(slots)+sizeof(ring);
   for (size_t i=0;i<2u;i++) HELD_CHECK(ku_test_event_init(&held_entered[i]));
@@ -1150,7 +1150,7 @@ static int fixture_driver_init_round(KuTaskDriverV1* driver,
 }
 int main(void) {
   INIT_CHECK(KU_TASK_DRIVER_ABI_VERSION == 9u);
-  INIT_CHECK(KU_TASK_FRAME_ABI_VERSION == 4u && KU_TASK_CONTROL_ABI_VERSION == 2u);
+  INIT_CHECK(KU_TASK_FRAME_ABI_VERSION == 5u && KU_TASK_CONTROL_ABI_VERSION == 2u);
   KuTaskDriverV1 driver = {0};
   KuTaskDriverSlotV1 slots[2] = {0};
   size_t ring[2] = {0};
@@ -1264,7 +1264,7 @@ static int fixture_owned_round(int mode) {
   KuTaskFrameClockV1 clock = { fixture_now, &now };
   CHECK(ku_task_frame_0_init(frame, sizeof(*frame), 0, &input, &cleanup) == KU_TASK_FRAME_ABI_MISMATCH);
   CHECK(ku_task_frame_0_init(frame, sizeof(*frame) - 1, KU_TASK_FRAME_ABI_VERSION, &input, &cleanup) == KU_TASK_FRAME_INVALID_STORAGE);
-  CHECK(KU_TASK_FRAME_ABI_VERSION == 4u);
+  CHECK(KU_TASK_FRAME_ABI_VERSION == 5u);
   for (uint32_t old=1u;old<KU_TASK_FRAME_ABI_VERSION;old++) {
     CHECK(ku_task_frame_0_init(frame, sizeof(*frame), old, &input, &cleanup) == KU_TASK_FRAME_ABI_MISMATCH);
     CHECK(ku_task_frame_zero_bytes(frame,sizeof(*frame)));

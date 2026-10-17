@@ -374,8 +374,8 @@ async fn main() {
 #[test]
 fn native_build_rejects_unsupported_async_control_before_artifacts() {
     for (index, source) in [
-        "async fn main(): null! { while (false) { try { break } finally { println(0) } } return ok(null) }",
-        "async fn main(): null! { try { println(1) } finally { println(2) } return ok(null) }",
+        "async fn main(): null! { try { println(1) } finally { while (false) { println(0) } } return ok(null) }",
+        "async fn main(): null! { try { println(1) } finally { for item in 0 { println(item) } } return ok(null) }",
     ]
     .into_iter()
     .enumerate()
@@ -399,7 +399,7 @@ fn native_build_rejects_unsupported_async_control_before_artifacts() {
             let error = run_cli(args).expect_err("unsupported control must not emit or link C");
             assert_eq!(
                 error.message,
-                "native async subset does not support user finally in native Task source"
+                "native async subset does not support loops inside a native Task finally body"
             );
             assert!(!file.with_extension("c").exists());
             assert!(!binary.exists());
