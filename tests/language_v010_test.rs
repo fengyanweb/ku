@@ -1611,6 +1611,43 @@ fn main() {
     check_source("inline.ku", source).expect("task stress API should check");
     run_source("inline.ku", source).expect("task stress API should run and drain");
 
+    let blocking_source = r#"
+import "std.task"
+import "std.time"
+
+async fn main(): null! {
+    before = task.stats()
+    time.sleep(1)
+    after = task.stats()
+    if (after.accepted_blocking_jobs != before.accepted_blocking_jobs + 1) {
+        panic("sleep must be charged as an accepted blocking job")
+    }
+    if (after.rejected_blocking_jobs != before.rejected_blocking_jobs || after.rejected_blocking_queue != before.rejected_blocking_queue) {
+        panic("one admitted sleep must not be counted as rejected")
+    }
+    if (after.peak_resident_blocking_jobs < 1 || after.peak_queued_blocking_jobs < 1 || after.peak_running_blocking_jobs < 1) {
+        panic("blocking peaks must retain the real sleep after response delivery")
+    }
+    if (after.resident_blocking_jobs < 0 || after.resident_blocking_jobs > 1 || after.finished_blocking_jobs < before.finished_blocking_jobs || after.finished_blocking_jobs > after.accepted_blocking_jobs) {
+        panic("blocking retirement observation must remain within the admitted job")
+    }
+    deadline = time.millis() + 3000
+    attempts = 0
+    drained = false
+    while (!drained && attempts < 10000 && time.millis() < deadline) {
+        retired = task.stats()
+        drained = retired.resident_blocking_jobs == 0 && retired.queued_blocking_jobs == 0 && retired.running_blocking_jobs == 0 && retired.accepted_blocking_jobs == retired.finished_blocking_jobs
+        attempts = attempts + 1
+    }
+    if (!drained) panic("actual blocking job must retire within the bounded observation")
+    return ok(null)
+}
+"#;
+    check_source("blocking-stats.ku", blocking_source)
+        .expect("blocking retirement fields should check");
+    run_source("blocking-stats.ku", blocking_source)
+        .expect("blocking statistics should observe the actual sleep job");
+
     let err = check_source(
         "inline.ku",
         r#"

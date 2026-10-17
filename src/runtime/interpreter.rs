@@ -5713,6 +5713,38 @@ fn task_runtime_snapshot_value(snapshot: TaskRuntimeSnapshot) -> Value {
             usize_value(snapshot.running_blocking_jobs),
         ),
         (
+            "resident_blocking_jobs".to_string(),
+            usize_value(snapshot.resident_blocking_jobs),
+        ),
+        (
+            "peak_resident_blocking_jobs".to_string(),
+            usize_value(snapshot.peak_resident_blocking_jobs),
+        ),
+        (
+            "peak_queued_blocking_jobs".to_string(),
+            usize_value(snapshot.peak_queued_blocking_jobs),
+        ),
+        (
+            "peak_running_blocking_jobs".to_string(),
+            usize_value(snapshot.peak_running_blocking_jobs),
+        ),
+        (
+            "accepted_blocking_jobs".to_string(),
+            usize_value(snapshot.accepted_blocking_jobs),
+        ),
+        (
+            "rejected_blocking_jobs".to_string(),
+            usize_value(snapshot.rejected_blocking_jobs),
+        ),
+        (
+            "rejected_blocking_queue".to_string(),
+            usize_value(snapshot.rejected_blocking_queue),
+        ),
+        (
+            "finished_blocking_jobs".to_string(),
+            usize_value(snapshot.finished_blocking_jobs),
+        ),
+        (
             "task_workers".to_string(),
             usize_value(snapshot.task_workers),
         ),
