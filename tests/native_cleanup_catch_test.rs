@@ -11,6 +11,8 @@ use native_harness::{compile_harness, run_bounded, TempDir, RUN_LIMITS, RUN_TIME
 use std::{fs, process::Command};
 
 const SOURCE: &str = r#"
+import fs from "std.fs"
+
 fn timed(): int! {
     owned = "before-" + "owner"
     try {
@@ -29,6 +31,28 @@ fn local_timed(): int! {
         println("after-local")
     }
     return ok(7)
+}
+fn Finish(path: str, content: str): null! {
+    fs.write(path, content)?
+    return ok(null)
+}
+fn spin(): int {
+    while (true) {}
+    return 0
+}
+fn finite_timed(): null! {
+    owned = "owned-" + "payload"
+    try {
+        spin()
+    } finally {
+        try {
+            Finish("finally-one.txt", owned.clone())?
+            fs.write("finally-two.txt", "after-helper")?
+        } catch (err) {
+            panic("finally write failed: " + err.message)
+        }
+    }
+    return ok(null)
 }
 fn main() {}
 "#;
@@ -54,6 +78,15 @@ const OBSERVE_PRINT: &str = r#"
 
 const C_MAIN: &str = r#"
 #define CHECK(c) do { if (!(c)) { fprintf(stderr,"cleanup catch check line %d: %s\n",__LINE__,#c); abort(); } } while (0)
+static void fixture_finish_enter(void) {
+  CHECK(fixture_finish_calls==0 && fixture_now==200);
+  CHECK(__ku_handler_timed_out && __ku_handler_unwind_depth>0);
+  CHECK(__ku_handler_deadline==200 && __ku_handler_cleanup_deadline==1200);
+  fixture_finish_calls++;
+  /* Advance only the clock, within the original D. A helper must not renew D
+   * to 1600, and its caller's real post-call poll must let the next write run. */
+  fixture_now=600;
+}
 int main(void) {
   for (unsigned round=0; round<16; ++round) {
     size_t before=ku_perf_calls;
@@ -76,26 +109,52 @@ int main(void) {
     CHECK(__ku_handler_timeout_finish()==1);
     CHECK(!__ku_handler_deadline && !__ku_handler_cleanup_deadline && !__ku_handler_timed_out && !__ku_handler_unwind_depth);
   }
+  size_t before=ku_perf_calls;
+  fixture_now=100; __ku_handler_timeout_begin(100); fixture_now=200;
+  KuResult_null finite=finite_timed();
+  CHECK(!finite.ok);
+  ku_result_drop_null(&finite);
+  CHECK(fixture_finish_calls==1 && fixture_now==600);
+  CHECK(__ku_handler_timed_out && __ku_handler_deadline==200 && __ku_handler_cleanup_deadline==1200);
+  CHECK(!__ku_call_depth && !__ku_handler_unwind_depth);
+  CHECK(ku_perf_calls>before && !ku_perf_live_allocations && !ku_perf_live_bytes && !ku_perf_overflow);
+  CHECK(__ku_handler_timeout_finish()==1);
+  CHECK(!__ku_handler_deadline && !__ku_handler_cleanup_deadline && !__ku_handler_timed_out && !__ku_handler_unwind_depth);
   return 0;
 }
 "#;
 
 #[test]
 fn native_cleanup_failed_finally_skips_outer_catch_but_preserves_local_recovery() {
-    let ast = Parser::new(Lexer::new(SOURCE).lex().unwrap())
+    let mut ast = Parser::new(Lexer::new(SOURCE).lex().unwrap())
         .parse_program()
         .unwrap();
+    // The CLI resolves this standard import before the direct checker runs.
+    for item in &mut ast.items {
+        if let ku::ast::Item::Import(import) = item {
+            assert_eq!(import.path, "std.fs");
+            *item = ku::ast::Item::Module(ku::ast::ModuleDecl {
+                name: "std:fs".into(),
+                span: import.span,
+            });
+        }
+    }
     Checker::new()
         .check(&ast)
         .expect("ordinary typed source is legal");
     let lowered = ir::lower_program(&ast).unwrap();
     let generated = c::generate_c_source(&ir::optimize_program(&lowered)).unwrap();
     let generated = replace_once(generated, "typedef struct KuString {", &format!(
-        "{ALLOCATION_HOOK}\nstatic unsigned long long fixture_now=100;\nstatic unsigned fixture_bad,fixture_inner,fixture_outer,fixture_local,fixture_after_local;\ntypedef struct KuString {{"));
+        "{ALLOCATION_HOOK}\nstatic unsigned long long fixture_now=100;\nstatic unsigned fixture_bad,fixture_inner,fixture_outer,fixture_local,fixture_after_local,fixture_finish_calls;\nstatic void fixture_finish_enter(void);\ntypedef struct KuString {{"));
     let generated = replace_once(
         generated,
         "static void ku_string_write(FILE* stream, KuString value) {",
         &format!("static void ku_string_write(FILE* stream, KuString value) {{{OBSERVE_PRINT}"),
+    );
+    let generated = replace_once(
+        generated,
+        "KuResult_null Finish(KuString path, KuString content) {",
+        "KuResult_null Finish(KuString path, KuString content) {\n  fixture_finish_enter();",
     );
     let start_marker = "static unsigned long long __ku_handler_now_ms(void) {";
     let end_marker = "static void __ku_handler_timeout_begin(";
@@ -144,5 +203,17 @@ fn native_cleanup_failed_finally_skips_outer_catch_but_preserves_local_recovery(
         output.stderr.is_empty(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    // A fresh directory prevents old marker files from satisfying this gate.
+    // The real helper and both real writes ran at known virtual times below D;
+    // a missing second marker remains a hard failure, independent of host I/O.
+    assert_eq!(
+        fs::read_to_string(directory.path().join("finally-one.txt")).expect("first finally marker"),
+        "owned-payload"
+    );
+    assert_eq!(
+        fs::read_to_string(directory.path().join("finally-two.txt"))
+            .expect("second finally marker"),
+        "after-helper"
     );
 }
