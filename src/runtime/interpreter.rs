@@ -38,6 +38,7 @@ const MAX_CALL_DEPTH: usize = 512;
 const HTTP_HANDLER_TIMEOUT_MESSAGE: &str = "http handler timeout";
 const HTTP_HANDLER_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const HTTP_ACCEPT_BATCH: usize = 64;
+const HTTP_HANDLER_BATCH: usize = 64;
 const HTTP_EVENT_LOOP_SLEEP: Duration = Duration::from_millis(1);
 const HTTP_MAX_METHOD_BYTES: usize = 32;
 
@@ -2566,15 +2567,27 @@ impl Interpreter {
         let (handler_tx, handler_rx) =
             mpsc::sync_channel::<HttpHandlerJob>(limits.max_active_requests);
         let worker_count = Arc::new(AtomicUsize::new(0));
+        let mut rejecting: Option<HttpRejection> = None;
 
         loop {
             self.poll_termination(span)?;
             let mut made_progress = false;
+            if let Some(rejection) = rejecting.as_mut() {
+                if rejection.poll() {
+                    rejecting = None;
+                    made_progress = true;
+                }
+            }
             for _ in 0..HTTP_ACCEPT_BATCH {
+                // Keep the acceptor's extra socket bounded to one. While it
+                // drains/writes, already admitted handler jobs still progress.
+                if rejecting.is_some() {
+                    break;
+                }
                 match tcp.accept() {
                     Ok((stream, _)) => {
                         made_progress = true;
-                        Self::enqueue_http_connection(
+                        rejecting = Self::enqueue_http_connection(
                             stream,
                             &connection_tx,
                             &shared_connection_rx,
@@ -2595,8 +2608,14 @@ impl Interpreter {
                 }
             }
 
-            loop {
+            for _ in 0..HTTP_HANDLER_BATCH {
                 self.poll_termination(span)?;
+                if let Some(rejection) = rejecting.as_mut() {
+                    if rejection.poll() {
+                        rejecting = None;
+                        made_progress = true;
+                    }
+                }
                 match handler_rx.try_recv() {
                     Ok(job) => {
                         made_progress = true;
@@ -2625,14 +2644,14 @@ impl Interpreter {
     }
 
     fn enqueue_http_connection(
-        mut stream: TcpStream,
+        stream: TcpStream,
         connection_tx: &SyncSender<PendingHttpConnection>,
         connection_rx: &Arc<Mutex<Receiver<PendingHttpConnection>>>,
         handler_tx: &SyncSender<HttpHandlerJob>,
         connection_count: &Arc<AtomicUsize>,
         worker_count: &Arc<AtomicUsize>,
         limits: HttpServerRuntimeLimits,
-    ) -> KuResult<()> {
+    ) -> KuResult<Option<HttpRejection>> {
         stream.set_nonblocking(false).map_err(|err| {
             KuError::runtime(
                 format!("http connection blocking setup failed: {err}"),
@@ -2642,24 +2661,27 @@ impl Interpreter {
         let Some(permit) =
             HttpConnectionPermit::try_acquire(Arc::clone(connection_count), limits.max_connections)
         else {
-            reject_http_connection(&mut stream, limits);
-            return Ok(());
+            return Ok(HttpRejection::new(stream, None, limits));
         };
         match connection_tx.try_send(PendingHttpConnection {
             stream,
             _permit: permit,
         }) {
-            Ok(()) => ensure_http_workers(
-                connection_rx,
-                handler_tx,
-                connection_count,
-                worker_count,
-                limits,
-            ),
-            Err(TrySendError::Full(mut pending)) => {
-                reject_http_connection(&mut pending.stream, limits);
-                Ok(())
+            Ok(()) => {
+                ensure_http_workers(
+                    connection_rx,
+                    handler_tx,
+                    connection_count,
+                    worker_count,
+                    limits,
+                )?;
+                Ok(None)
             }
+            Err(TrySendError::Full(pending)) => Ok(HttpRejection::new(
+                pending.stream,
+                Some(pending._permit),
+                limits,
+            )),
             Err(TrySendError::Disconnected(_)) => Err(KuError::runtime(
                 "http connection worker channel disconnected",
                 entry_span(),
@@ -3086,6 +3108,120 @@ mod finally_tests {
         let mut state = HttpHandlerDeadline::new(Instant::now() + Duration::from_secs(10));
         assert!(!state.poll(Instant::now()));
         assert!(!state.timed_out);
+    }
+
+    fn http_test_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    fn http_test_limits() -> HttpServerRuntimeLimits {
+        HttpServerRuntimeLimits {
+            read_header_timeout: Duration::from_secs(1),
+            read_body_timeout: Duration::from_secs(1),
+            write_timeout: Duration::from_millis(100),
+            idle_timeout: Duration::from_secs(1),
+            handler_timeout: Duration::from_millis(100),
+            max_header_bytes: 1024,
+            max_body_bytes: 1024,
+            max_connections: 1,
+            max_active_requests: 1,
+            max_pending_requests: 1,
+        }
+    }
+
+    #[test]
+    fn interpreter_http_full_handler_queue_rejects_without_waiting_for_capacity() {
+        let (mut client, server) = http_test_pair();
+        let (jobs, receiver) = mpsc::sync_channel(1);
+        let (response_tx, _) = mpsc::sync_channel(1);
+        jobs.send(HttpHandlerJob {
+            request: ParsedHttpRequest {
+                method: "GET".into(),
+                path: "/".into(),
+                query: HashMap::new(),
+                headers: HashMap::new(),
+                body: String::new(),
+            },
+            deadline: http_deadline(Duration::from_secs(1)),
+            response_tx,
+        })
+        .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let permit = HttpConnectionPermit::try_acquire(Arc::clone(&count), 1).unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let worker = thread::spawn(move || {
+            handle_http_connection(
+                PendingHttpConnection {
+                    stream: server,
+                    _permit: permit,
+                },
+                &jobs,
+                http_test_limits(),
+            );
+        });
+        let mut response = Vec::new();
+        let read = client.read_to_end(&mut response);
+        // Release a blocked old sender even when the regression fails.
+        drop(receiver);
+        worker.join().unwrap();
+        read.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503 "), "{response:?}");
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn interpreter_http_rejection_yields_for_fragments_and_returns_its_permit() {
+        let (mut client, server) = http_test_pair();
+        let count = Arc::new(AtomicUsize::new(0));
+        let permit = HttpConnectionPermit::try_acquire(Arc::clone(&count), 1).unwrap();
+        let mut rejection = HttpRejection::new(server, Some(permit), http_test_limits()).unwrap();
+        rejection.drain_deadline = Instant::now() + Duration::from_secs(60);
+        assert!(!rejection.poll());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let prefix = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r";
+        client.write_all(prefix).unwrap();
+        let watchdog = Instant::now() + Duration::from_secs(2);
+        while rejection.seen < prefix.len() {
+            assert!(!rejection.poll());
+            assert!(Instant::now() < watchdog);
+            thread::yield_now();
+        }
+        assert!(rejection.write_deadline.is_none());
+        client.write_all(b"\n").unwrap();
+        while !rejection.poll() {
+            assert!(Instant::now() < watchdog);
+            thread::yield_now();
+        }
+        drop(rejection);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, HttpRejection::RESPONSE);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn interpreter_http_rejection_expired_write_budget_is_not_restarted() {
+        let (_client, server) = http_test_pair();
+        let count = Arc::new(AtomicUsize::new(0));
+        let permit = HttpConnectionPermit::try_acquire(Arc::clone(&count), 1).unwrap();
+        let mut rejection = HttpRejection::new(server, Some(permit), http_test_limits()).unwrap();
+        rejection.drain_deadline = Instant::now() - Duration::from_secs(1);
+        let deadline = rejection.drain_deadline + rejection.write_timeout;
+        assert!(rejection.poll());
+        assert_eq!(rejection.write_deadline, Some(deadline));
+        assert!(rejection.poll());
+        assert_eq!(rejection.write_deadline, Some(deadline));
+        assert_eq!(rejection.sent, 0);
+        drop(rejection);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -4075,33 +4211,118 @@ fn http_worker_loop(
     }
 }
 
-fn reject_http_connection(stream: &mut TcpStream, limits: HttpServerRuntimeLimits) {
-    let drain_deadline = http_deadline(Duration::from_millis(50));
-    let mut buffer = [0_u8; 1024];
-    let mut received = Vec::new();
-    while received.len() < limits.max_header_bytes {
-        if set_http_read_deadline(stream, drain_deadline).is_err() {
-            break;
+// Exactly one over-limit socket may remain on the acceptor. Each poll performs
+// at most one bounded read and one write; it never parks the interpreter while
+// admitted requests are waiting to execute. Dropping this owner closes the
+// socket and returns a pending-queue permit, if it held one.
+struct HttpRejection {
+    stream: TcpStream,
+    _permit: Option<HttpConnectionPermit>,
+    drain_deadline: Instant,
+    write_deadline: Option<Instant>,
+    write_timeout: Duration,
+    remaining_header: usize,
+    tail: [u8; 4],
+    seen: usize,
+    sent: usize,
+}
+
+impl HttpRejection {
+    const RESPONSE: &'static [u8] = b"HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 19\r\nconnection: close\r\n\r\nService Unavailable";
+
+    fn new(
+        stream: TcpStream,
+        permit: Option<HttpConnectionPermit>,
+        limits: HttpServerRuntimeLimits,
+    ) -> Option<Self> {
+        if stream.set_nonblocking(true).is_err() {
+            return None;
         }
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                received.extend_from_slice(&buffer[..read]);
-                if received.windows(4).any(|window| window == b"\r\n\r\n")
-                    || received.windows(2).any(|window| window == b"\n\n")
-                {
-                    break;
+        Some(Self {
+            stream,
+            _permit: permit,
+            drain_deadline: http_deadline(Duration::from_millis(50)),
+            write_deadline: None,
+            write_timeout: limits.write_timeout,
+            remaining_header: limits.max_header_bytes,
+            tail: [0; 4],
+            seen: 0,
+            sent: 0,
+        })
+    }
+
+    fn begin_write(&mut self, now: Instant) {
+        let start = now.min(self.drain_deadline);
+        self.write_deadline = Some(start.checked_add(self.write_timeout).unwrap_or(start));
+    }
+
+    fn poll(&mut self) -> bool {
+        let now = Instant::now();
+        if self.write_deadline.is_none() {
+            if now >= self.drain_deadline || self.remaining_header == 0 {
+                self.begin_write(now);
+            } else {
+                let mut buffer = [0; 1024];
+                let count = buffer.len().min(self.remaining_header);
+                match self.stream.read(&mut buffer[..count]) {
+                    Ok(0) => self.begin_write(Instant::now()),
+                    Ok(read) => {
+                        self.remaining_header -= read;
+                        for byte in &buffer[..read] {
+                            self.tail.rotate_left(1);
+                            self.tail[3] = *byte;
+                            self.seen = self.seen.saturating_add(1);
+                            if (self.seen >= 4 && self.tail == *b"\r\n\r\n")
+                                || (self.seen >= 2 && self.tail[2..] == *b"\n\n")
+                            {
+                                self.begin_write(Instant::now());
+                                break;
+                            }
+                        }
+                        if self.remaining_header == 0 && self.write_deadline.is_none() {
+                            self.begin_write(Instant::now());
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        return false
+                    }
+                    Err(_) => return true,
                 }
             }
-            Err(_) => break,
+        }
+        let Some(deadline) = self.write_deadline else {
+            return false;
+        };
+        if Instant::now() >= deadline {
+            return true;
+        }
+        match self.stream.write(&Self::RESPONSE[self.sent..]) {
+            Ok(0) => true,
+            Ok(written) => {
+                self.sent += written;
+                if self.sent == Self::RESPONSE.len() {
+                    let _ = self.stream.shutdown(Shutdown::Write);
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                false
+            }
+            Err(_) => true,
         }
     }
-    let _ = write_http_response(
-        stream,
-        status_response(503, "Service Unavailable"),
-        limits.write_timeout,
-    );
-    let _ = stream.shutdown(Shutdown::Write);
 }
 
 fn handle_http_connection(
@@ -4117,21 +4338,32 @@ fn handle_http_connection(
             return;
         }
     };
-    let deadline = Instant::now() + limits.handler_timeout;
+    let deadline = http_deadline(limits.handler_timeout);
     let (response_tx, response_rx) = mpsc::sync_channel(1);
-    if handler_tx
-        .send(HttpHandlerJob {
-            request,
-            deadline,
-            response_tx,
-        })
-        .is_err()
-    {
-        let _ = pending.stream.shutdown(Shutdown::Write);
-        return;
+    match handler_tx.try_send(HttpHandlerJob {
+        request,
+        deadline,
+        response_tx,
+    }) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            let _ = write_http_response(
+                &mut pending.stream,
+                status_response(503, "Service Unavailable"),
+                limits.write_timeout,
+            );
+            let _ = pending.stream.shutdown(Shutdown::Write);
+            return;
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            let _ = pending.stream.shutdown(Shutdown::Write);
+            return;
+        }
     }
 
-    let response = match response_rx.recv_timeout(limits.handler_timeout) {
+    let response = match response_rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
         Ok(response) => response,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let _ = write_http_response(
@@ -4374,18 +4606,6 @@ fn read_http_body(
 fn http_deadline(timeout: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(timeout).unwrap_or(now)
-}
-
-fn set_http_read_deadline(stream: &TcpStream, deadline: Instant) -> Result<(), HttpWireResponse> {
-    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-        return Err(status_response(408, "Request Timeout"));
-    };
-    if remaining.is_zero() {
-        return Err(status_response(408, "Request Timeout"));
-    }
-    stream
-        .set_read_timeout(Some(remaining))
-        .map_err(|_| status_response(408, "Request Timeout"))
 }
 
 fn read_http_with_deadline(

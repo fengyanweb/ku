@@ -1151,6 +1151,113 @@ fn main(): null! {
 }
 
 #[test]
+fn run_http_service_executes_admitted_requests_while_rejecting_silent_peers() {
+    let _guard = HTTP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let address = unused_local_address();
+    let source = r#"
+import "std.http"
+
+fn main(): null! {
+    app = http.server({
+        idle_timeout_ms: 5000,
+        handler_timeout_ms: 1000,
+        read_header_timeout_ms: 10000,
+        read_body_timeout_ms: 10000,
+        write_timeout_ms: 500,
+        max_connections: 2,
+        max_active_requests: 1,
+        max_pending_requests: 2
+    })
+    app.get("/ok", fn() {
+        return http.text("ok")
+    })
+    app.post("/ok", fn() {
+        return http.text("ok")
+    })
+    app.listen("__ADDRESS__")?
+    return ok(null)
+}
+"#
+    .replace("__ADDRESS__", &address);
+    let mut server = Some(KuServerProcess::spawn(source));
+
+    // The first connection is also the startup probe: an extra readiness
+    // request must not briefly consume one of the two permits under test.
+    let mut active =
+        connect_with_read_timeout(&address, Duration::from_secs(5), Duration::from_secs(3));
+    active
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .expect("bound admitted request writes");
+    active
+        .write_all(b"POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n")
+        .expect("hold the active worker until its final body byte");
+    let mut pending =
+        connect_with_read_timeout(&address, Duration::from_secs(2), Duration::from_secs(3));
+    pending
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .expect("bound pending request writes");
+    pending
+        .write_all(b"POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n")
+        .expect("hold the second admitted connection");
+
+    // Receiving this complete rejection establishes admission of both earlier
+    // connections without guessing how long it takes a worker to start.
+    let mut probe =
+        connect_with_read_timeout(&address, Duration::from_secs(2), Duration::from_secs(3));
+    probe
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .expect("bound admission probe write");
+    probe
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write full admission probe");
+    assert_http_status(
+        &read_http_stream(probe, Duration::from_secs(3)),
+        "HTTP/1.1 503 Service Unavailable",
+    );
+    pending
+        .write_all(b"b")
+        .expect("complete the queued request before excess connections arrive");
+
+    let mut silent = Vec::with_capacity(32);
+    for _ in 0..32 {
+        silent.push(connect_with_read_timeout(
+            &address,
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+        ));
+    }
+    // Observe the first silent peer's 50ms rejection before releasing A. The
+    // remaining 31 peers stay open. The former synchronous acceptor drains all
+    // of them (about 1.55s), expiring A's unchanged 1000ms handler deadline.
+    assert_http_status(
+        &read_http_stream(silent.remove(0), Duration::from_secs(3)),
+        "HTTP/1.1 503 Service Unavailable",
+    );
+    active
+        .write_all(b"a")
+        .expect("release the active request while silent rejections remain");
+
+    let active_response = read_http_stream(active, Duration::from_secs(3));
+    let pending_response = read_http_stream(pending, Duration::from_secs(3));
+    assert_http_status(&active_response, "HTTP/1.1 200 OK");
+    assert!(active_response.ends_with("\r\n\r\nok"), "{active_response}");
+    assert_http_status(&pending_response, "HTTP/1.1 200 OK");
+    assert!(
+        pending_response.ends_with("\r\n\r\nok"),
+        "{pending_response}"
+    );
+    drop(silent);
+
+    let recovered = http_response_or_stop(
+        &mut server,
+        &address,
+        "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_http_status(&recovered, "HTTP/1.1 200 OK");
+    let _ = server.take().expect("server should exist").stop();
+}
+
+#[test]
 fn run_fib_prints_tenth_fibonacci_number() {
     let path = path_arg(&example("fib.ku"));
     let result = run_ku(&["run", &path]);
