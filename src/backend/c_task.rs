@@ -163,6 +163,7 @@ impl<'a> FrameEmitter<'a> {
                     if frame.hosted
                         && !*borrowed
                         && (matches!(ty, IrType::Str | IrType::Result(_))
+                            || crate::ir::task::flat_array(ty)
                             || crate::ir::task::error_type(ty))
                         && !persistent.contains(&index)
                     {
@@ -196,6 +197,7 @@ impl<'a> FrameEmitter<'a> {
             || frame.hosted
                 != (task_mask != 0
                     || exit_bridge
+                    || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty)))
                     || function.states.iter().any(|state| {
                         matches!(
                             state.terminator,
@@ -372,6 +374,7 @@ impl<'a> FrameEmitter<'a> {
             TaskSlotType::Value { ty, borrowed } => {
                 !*borrowed
                     && (matches!(ty, IrType::Str | IrType::Result(_))
+                        || crate::ir::task::flat_array(ty)
                         || crate::ir::task::error_type(ty))
             }
         }
@@ -1110,6 +1113,92 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 out.push_str(&format!("  {} = {};\n", self.place(*dst), self.place(*src)));
                 self.set_init(out, *dst, true);
             }
+            TaskOp::ArrayMake { dst, elements } => {
+                let IrType::Array(element) = self.slot_type(*dst)? else {
+                    return Err(unsupported("ArrayMake destination"));
+                };
+                let place = self.place(*dst);
+                out.push_str(&format!("  {{ void* data=NULL; uint32_t allocated=ku_task_host_allocate_array((KuTaskAdapterHostV1*)clock->host,{}u,sizeof({}),&data);\n",elements.len(),c_type(element)?));
+                self.emit_array_allocation_check(out, "allocated")?;
+                out.push_str(&format!(
+                    "  {place}=({}){{0,data,{}u}};\n",
+                    c_type(self.slot_type(*dst)?)?,
+                    elements.len()
+                ));
+                self.set_init(out, *dst, true);
+                for (index, source) in elements.iter().enumerate() {
+                    let value = if element.as_ref() == &IrType::Str {
+                        c_move_value(element, &self.place(*source))?
+                    } else {
+                        self.place(*source)
+                    };
+                    out.push_str(&format!(
+                        "  {place}.data[{index}]={value}; {place}.len++;\n"
+                    ));
+                    if element.as_ref() == &IrType::Str {
+                        self.set_init(out, *source, false);
+                    }
+                }
+                out.push_str("  }\n");
+            }
+            TaskOp::ArrayClone { dst, src } => {
+                let IrType::Array(element) = self.slot_type(*dst)? else {
+                    return Err(unsupported("ArrayClone destination"));
+                };
+                let source = self.place(*src);
+                let destination = self.place(*dst);
+                out.push_str(&format!("  {{ void* data=NULL; uint32_t allocated=ku_task_host_allocate_array((KuTaskAdapterHostV1*)clock->host,{source}.len,sizeof({}),&data);\n",c_type(element)?));
+                self.emit_array_allocation_check(out, "allocated")?;
+                out.push_str(&format!(
+                    "  {destination}=({}){{0,data,{source}.len}};\n",
+                    c_type(self.slot_type(*dst)?)?
+                ));
+                self.set_init(out, *dst, true);
+                out.push_str(&format!(
+                    "  for (size_t index=0;index<{source}.len;index++) {{\n"
+                ));
+                if element.as_ref() == &IrType::Str {
+                    out.push_str(&format!("    uint32_t cloned=ku_task_host_clone_string((KuTaskAdapterHostV1*)clock->host,{source}.data[index],&{destination}.data[index]);\n"));
+                    self.emit_array_allocation_check(out, "cloned")?;
+                } else {
+                    out.push_str(&format!(
+                        "    {destination}.data[index]={source}.data[index];\n"
+                    ));
+                }
+                out.push_str(&format!("    {destination}.len++;\n  }}\n  }}\n"));
+            }
+            TaskOp::ArrayLen { dst, src } => {
+                out.push_str(&format!(
+                    "  {}=(int64_t){}.len;\n",
+                    self.place(*dst),
+                    self.place(*src)
+                ));
+                self.set_init(out, *dst, true);
+            }
+            TaskOp::ArrayTake { dst, array, index } => {
+                let source = self.place(*array);
+                let index = self.place(*index);
+                out.push_str(&format!(
+                    "  if ({index}<0 || (uint64_t){index}>={source}.len) {{\n"
+                ));
+                self.emit_runtime_error(
+                    out,
+                    &format!(
+                        "ku_error_make({},{},{})",
+                        c_static_utf8_string("array"),
+                        c_static_utf8_string("index_out_of_bounds"),
+                        c_static_utf8_string("array loop index is out of bounds")
+                    ),
+                )?;
+                out.push_str("  }\n");
+                let value = if self.slot_type(*dst)? == &IrType::Str {
+                    c_move_value(&IrType::Str, &format!("{source}.data[{index}]"))?
+                } else {
+                    format!("{source}.data[{index}]")
+                };
+                out.push_str(&format!("  {}={value};\n", self.place(*dst)));
+                self.set_init(out, *dst, true);
+            }
             TaskOp::Copy { dst, src } => {
                 out.push_str(&format!("  {} = {};\n", self.place(*dst), self.place(*src)));
                 self.set_init(out, *dst, true);
@@ -1283,6 +1372,13 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
             "ku_error_make((KuString){0},(KuString){0},arithmetic_status==KU_INT_DIV_ZERO ? ku_string_static((const uint8_t*)\"division by zero\",16) : ku_string_static((const uint8_t*)\"integer overflow\",16))")?;
         out.push_str("  } }\n");
         self.set_init(out, dst, true);
+        Ok(())
+    }
+
+    fn emit_array_allocation_check(&self, out: &mut COutput, status: &str) -> KuResult<()> {
+        out.push_str(&format!("  if ({status}==KU_TASK_DRIVER_LIMIT || {status}==KU_TASK_HOST_ALLOCATION_FAILED) {{\n"));
+        self.emit_runtime_error(out,&format!("ku_error_make({},{status}==KU_TASK_DRIVER_LIMIT ? {} : {},{status}==KU_TASK_DRIVER_LIMIT ? {} : {})",c_static_utf8_string("task"),c_static_utf8_string("memory_limit"),c_static_utf8_string("out_of_memory"),c_static_utf8_string("native Task array allocation budget exceeded"),c_static_utf8_string("native Task array allocation failed")))?;
+        out.push_str(&format!("  }}\n  if ({status}!=KU_TASK_DRIVER_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n"));
         Ok(())
     }
 
@@ -1543,6 +1639,7 @@ fn require_slot_type(ty: &IrType) -> KuResult<()> {
     }
     match ty {
         IrType::Int | IrType::Bool | IrType::Null | IrType::Str => Ok(()),
+        IrType::Array(_) if crate::ir::task::flat_array(ty) => Ok(()),
         IrType::Result(_) => require_result_type(ty),
         _ => Err(unsupported(
             "native task frame R1 does not support this slot type",

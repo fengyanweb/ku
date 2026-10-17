@@ -124,6 +124,30 @@ static uint32_t ku_task_host_clone_string(KuTaskAdapterHostV1* host,
   *output=(KuString){bytes,source.len,capacity,KU_STRING_OWNED};
   return KU_TASK_DRIVER_OK;
 }
+/* Flat local arrays share the existing typed vector ABI. The caller registers
+ * the returned vector in its persistent slot before cloning any string leaf. */
+static uint32_t ku_task_host_allocate_array(KuTaskAdapterHostV1* host,
+    size_t count, size_t element_bytes, void** output) {
+  if (!host || !output || !element_bytes || count>64u
+      || host->allocation_host_bytes!=sizeof(*host)
+      || host->allocation_host_abi!=KU_TASK_ALLOCATION_HOST_ABI_VERSION
+      || !host->allocation_context || !host->reconcile_charge
+      || !host->ticket || !host->control) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  *output=NULL;
+  if (!count) return KU_TASK_DRIVER_OK;
+  if (count>SIZE_MAX/element_bytes) return KU_TASK_DRIVER_LIMIT;
+  uint32_t status=host->reconcile_charge(host->allocation_context);
+  if (status!=KU_TASK_DRIVER_OK) return status;
+  size_t bytes=count*element_bytes;
+  status=ku_task_driver_grow_charge(host->ticket,bytes);
+  if (status!=KU_TASK_DRIVER_OK) return status;
+  void* data=malloc(bytes);
+  if (!data) {
+    status=host->reconcile_charge(host->allocation_context);
+    return status==KU_TASK_DRIVER_OK ? KU_TASK_HOST_ALLOCATION_FAILED : status;
+  }
+  memset(data,0,bytes); *output=data; return KU_TASK_DRIVER_OK;
+}
 static void ku_task_adapter_fault(KuTaskDriverV1* driver, int clock_fault);
 enum { KU_TASK_HOST_TIMER_OVERFLOW = 97u };
 /* One fixed registration is owned by the executing instance. A pending poll

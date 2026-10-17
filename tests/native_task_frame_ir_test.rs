@@ -417,7 +417,7 @@ fn native_task_frame_ir_rejects_types_outside_the_r1_contract() {
         IrType::Unknown,
         IrType::Void,
         IrType::Function,
-        IrType::Array(Box::new(IrType::Int)),
+        IrType::Array(Box::new(IrType::Float)),
         IrType::Named("NotAFrameType".into()),
         IrType::Cell(Box::new(IrType::Int)),
         result(result(IrType::Int)),
@@ -1686,4 +1686,45 @@ fn blocking_read_preserves_view_and_initializes_only_ready_string_result() {
         borrowed: false,
     };
     assert!(verify_and_plan(&fixture, TaskLimits::default()).is_err());
+}
+
+#[test]
+fn native_task_flat_array_ir_validates_owned_elements_and_parameter_boundary() {
+    let fixture = program(
+        vec![
+            IrType::Str,
+            IrType::Array(Box::new(IrType::Str)),
+            result(IrType::Null),
+        ],
+        &[0],
+        vec![state(
+            vec![
+                TaskOp::ArrayMake {
+                    dst: SlotId(1),
+                    elements: vec![SlotId(0)],
+                },
+                drop_slot(1),
+                init(2, TaskConstant::Ok(Box::new(TaskConstant::Null))),
+            ],
+            complete(2),
+        )],
+    );
+    let plan = verify_and_plan(&fixture, TaskLimits::default()).unwrap();
+    assert!(plan.functions[0].hosted);
+    assert!(plan.functions[0].slots.contains(&SlotId(1)));
+    let mut duplicate = fixture.clone();
+    if let TaskOp::ArrayMake { elements, .. } = &mut duplicate.functions[0].states[0].operations[0]
+    {
+        elements.push(SlotId(0));
+    }
+    assert!(verify_and_plan(&duplicate, TaskLimits::default()).is_err());
+    let mut parameter = fixture.clone();
+    parameter.functions[0].parameters.push(SlotId(1));
+    assert!(verify_and_plan(&parameter, TaskLimits::default()).is_err());
+    let mut nested = fixture.clone();
+    nested.functions[0].slots[1].ty = TaskSlotType::Value {
+        ty: IrType::Array(Box::new(IrType::Array(Box::new(IrType::Str)))),
+        borrowed: false,
+    };
+    assert!(verify_and_plan(&nested, TaskLimits::default()).is_err());
 }

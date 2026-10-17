@@ -2241,3 +2241,153 @@ int main(void) {
   puts("callable-parameters-ok"); return 0;
 }
 "#;
+
+#[test]
+fn native_task_flat_array_snapshots_charge_partial_owners_and_release_each_failure() {
+    let source = r#"
+async fn Inspect(left: str, right: str, stop: bool): int! {
+    values=[left,right]
+    count=0
+    for text in values {
+        count=count+1
+        if (stop) { break }
+        if (count==1) { continue }
+    }
+    if (values.len()!=2) { fail "source lost" }
+    return ok(count)
+}
+async fn main(): null! { return ok(null) }
+"#;
+    let ast = Parser::new(Lexer::new(source).lex().unwrap())
+        .parse_program()
+        .unwrap();
+    Checker::new().check(&ast).unwrap();
+    let native = ir::task_lower::lower_program(&ast).unwrap();
+    let mut source_slot = None;
+    let mut snapshot_slot = None;
+    for operation in native.tasks.functions[0]
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+    {
+        if let TaskOp::ArrayClone { dst, src } = operation {
+            source_slot = Some(src.0);
+            snapshot_slot = Some(dst.0);
+        }
+    }
+    let hooks = r#"
+static KuTestEvent array_entered,array_proceed;
+static size_t array_calls,array_fail_at,array_gate_at;
+static void* array_malloc(size_t bytes) {
+  fixture_alloc_lock(); size_t call=++array_calls;
+  int fail=call==array_fail_at,gate=call==array_gate_at; fixture_alloc_unlock();
+  if (gate) { CHECK(ku_test_event_set(&array_entered)); CHECK(ku_test_event_wait(&array_proceed,2000)); }
+  return fail ? NULL : fixture_malloc(bytes);
+}
+"#;
+    let mut generated = finally_adapter_generated(source, hooks)
+        .replacen(
+            "void* data=malloc(bytes);",
+            "void* data=array_malloc(bytes);",
+            1,
+        )
+        .replacen(
+            "uint8_t* bytes=(uint8_t*)malloc(capacity);",
+            "uint8_t* bytes=(uint8_t*)array_malloc(capacity);",
+            1,
+        );
+    generated.push_str(
+        &ARRAY_SNAPSHOT_MAIN
+            .replace("@SOURCE@", &source_slot.unwrap().to_string())
+            .replace("@SNAPSHOT@", &snapshot_slot.unwrap().to_string()),
+    );
+    run_finally_adapter_generated(
+        generated,
+        "native-task-flat-array-owners",
+        "array-snapshot-owners-ok\n",
+    );
+}
+
+const ARRAY_SNAPSHOT_MAIN: &str = r#"
+typedef struct ArrayRuntime { KuTaskDriverV1 driver; KuTaskDriverSlotV1 slots[2]; size_t ring[2]; } ArrayRuntime;
+static uint64_t array_deadline(void) { return ku_task_driver_now_ms()+2000u; }
+static KuTaskDriverSnapshotV1 array_snapshot(ArrayRuntime* runtime) {
+  KuTaskDriverSnapshotV1 snapshot={0}; CHECK(ku_task_driver_snapshot(&runtime->driver,&snapshot)==KU_TASK_DRIVER_OK); return snapshot;
+}
+static void array_init(ArrayRuntime* runtime,size_t budget) {
+  memset(runtime,0,sizeof(*runtime)); array_calls=array_fail_at=array_gate_at=0;
+  CHECK(ku_test_event_init(&array_entered)); CHECK(ku_test_event_init(&array_proceed));
+  size_t fixed=sizeof(runtime->driver)+sizeof(runtime->slots)+sizeof(runtime->ring);
+  CHECK(ku_task_driver_init(&runtime->driver,sizeof(runtime->driver),KU_TASK_DRIVER_ABI_VERSION,
+      runtime->slots,2u,runtime->ring,2u,fixed+budget,1u,array_deadline())==KU_TASK_DRIVER_OK);
+}
+static void array_idle(ArrayRuntime* runtime) { CHECK(ku_task_driver_wait_idle(&runtime->driver,array_deadline())==KU_TASK_DRIVER_OK); }
+static KuTaskValueV1 array_start(ArrayRuntime* runtime,bool stop) {
+  uint8_t* first=(uint8_t*)fixture_malloc(31u); uint8_t* second=(uint8_t*)fixture_malloc(37u); CHECK(first&&second);
+  memcpy(first,"first",5u); memcpy(second,"second",6u);
+  KuString left={first,5u,31u,KU_STRING_OWNED},right={second,6u,37u,KU_STRING_OWNED}; KuTaskValueV1 task={0};
+  CHECK(ku_task_0_start_value(&runtime->driver,&left,&right,&stop,&task)==KU_TASK_DRIVER_OK);
+  CHECK(task.tag==KU_TASK_VALUE_LIVE&&!left.ptr&&!right.ptr); return task;
+}
+static void array_finish(ArrayRuntime* runtime) {
+  array_idle(runtime); CHECK(!array_snapshot(runtime).resident&&!array_snapshot(runtime).reserved_bytes);
+  uint64_t deadline=array_deadline(); CHECK(ku_task_driver_shutdown(&runtime->driver,deadline)==KU_TASK_DRIVER_OK);
+  CHECK(ku_task_driver_join(&runtime->driver,deadline)==KU_TASK_DRIVER_OK); CHECK(ku_task_driver_destroy(&runtime->driver)==KU_TASK_DRIVER_OK);
+  CHECK(ku_test_event_destroy(&array_entered)); CHECK(ku_test_event_destroy(&array_proceed));
+  CHECK(!fixture_ledger().allocations&&!fixture_ledger().bytes&&!fixture_ledger().overflow);
+}
+static void array_take(ArrayRuntime* runtime,KuTaskValueV1* task,int64_t expected,const char* error) {
+  CHECK(ku_task_driver_wait_result(&task->ticket,&task->owner.lease,array_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(task,NULL,&output)==KU_TASK_CONTROL_OK);
+  CHECK(output.result_kind==1u&&output.value.integer.ok==(error==NULL));
+  if (error) {
+    KuString code=output.value.integer.error.code; CHECK(code.len==strlen(error)&&!memcmp(code.ptr,error,code.len));
+    CHECK(output.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE);
+  } else CHECK(output.value.integer.value==expected);
+  CHECK(array_snapshot(runtime).reserved_bytes==sizeof(KuTaskInstance_0));
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_0)); ku_task_outcome_drop(&output);
+  CHECK(ku_task_value_drop(task,array_deadline())==KU_TASK_DRIVER_OK);
+}
+int main(void) {
+  CHECK(KU_TASK_FRAME_ABI_VERSION==5u&&KU_TASK_CONTROL_ABI_VERSION==2u&&KU_TASK_DRIVER_ABI_VERSION==10u);
+  for (unsigned mode=0;mode<7;mode++) {
+    ArrayRuntime runtime;
+    size_t budget=sizeof(KuTaskInstance_0)+68u+(mode==5 ? 2u*sizeof(KuString) : 4096u);
+    array_init(&runtime,budget);
+    if (mode>=1&&mode<=4) array_fail_at=mode;
+    if (mode==4) array_gate_at=4u;
+    KuTaskValueV1 task=array_start(&runtime,mode==6);
+    if (mode==4) {
+      CHECK(ku_test_event_wait(&array_entered,2000));
+      KuTaskInstance_0* instance=(KuTaskInstance_0*)task.owner.lease.control->context;
+      CHECK(instance->frame.header.initialized&(UINT64_C(1)<<@SNAPSHOT@));
+      CHECK(instance->frame.s_@SOURCE@.len==2u&&instance->frame.s_@SNAPSHOT@.len==1u);
+      CHECK(instance->frame.s_@SNAPSHOT@.capacity==2u);
+      CHECK(instance->frame.s_@SOURCE@.data[0].capacity==31u&&instance->frame.s_@SOURCE@.data[1].capacity==37u);
+      size_t actual=sizeof(KuTaskInstance_0)+68u+4u*sizeof(KuString)+5u;
+      CHECK(fixture_ledger().bytes==actual&&array_snapshot(&runtime).reserved_bytes==actual+6u);
+      CHECK(ku_test_event_set(&array_proceed));
+    }
+    array_take(&runtime,&task,mode==6 ? 1 : 2,mode==5 ? "memory_limit" : mode ? (mode==6 ? NULL : "out_of_memory") : NULL);
+    if (mode==5) CHECK(array_calls==1u); // Snapshot rejection precedes malloc.
+    array_finish(&runtime);
+  }
+  // Cancellation after a partial snapshot retains physical owners until the
+  // executing callback returns; the original cleanup deadline is not renewed.
+  ArrayRuntime runtime; array_init(&runtime,sizeof(KuTaskInstance_0)+4096u); array_gate_at=4u;
+  KuTaskValueV1 task=array_start(&runtime,false); CHECK(ku_test_event_wait(&array_entered,2000));
+  KuTaskControlLeaseV1 late={0}; CHECK(ku_task_control_lease_retain(&task.owner.lease,&late)==KU_TASK_CONTROL_OK);
+  uint64_t deadline=ku_task_driver_now_ms()+30u; KuTaskDriverCleanupReceiptV1 receipt={0};
+  CHECK(ku_task_driver_owner_drop_receipt(&task.ticket,&task.owner,deadline,&receipt)==KU_TASK_DRIVER_OK); task=(KuTaskValueV1){0};
+  CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_PENDING);
+  CHECK(ku_task_driver_shutdown(&runtime.driver,deadline)==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
+  CHECK(ku_task_control_cleanup_deadline(late.control)==deadline);
+  CHECK(ku_test_event_set(&array_proceed)); array_idle(&runtime);
+  CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_CLEANUP_ACK);
+  CHECK(ku_task_control_cleanup_deadline(late.control)==deadline);
+  CHECK(array_snapshot(&runtime).reserved_bytes==sizeof(KuTaskInstance_0));
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_0));
+  CHECK(ku_task_control_lease_release(&late)==KU_TASK_CONTROL_OK); array_finish(&runtime);
+  puts("array-snapshot-owners-ok"); return 0;
+}
+"#;

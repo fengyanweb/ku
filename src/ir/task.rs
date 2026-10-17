@@ -142,6 +142,26 @@ pub enum TaskOp {
         dst: SlotId,
         src: SlotId,
     },
+    /// Flat typed vector, moving Owned string elements only after allocation.
+    ArrayMake {
+        dst: SlotId,
+        elements: Vec<SlotId>,
+    },
+    /// Independent read-only snapshot; successful leaves become dst owners.
+    ArrayClone {
+        dst: SlotId,
+        src: SlotId,
+    },
+    ArrayLen {
+        dst: SlotId,
+        src: SlotId,
+    },
+    /// Internal loop extraction: primitives copy, strings move and zero a leaf.
+    ArrayTake {
+        dst: SlotId,
+        array: SlotId,
+        index: SlotId,
+    },
     Copy {
         dst: SlotId,
         src: SlotId,
@@ -402,7 +422,14 @@ fn primitive(ty: &IrType) -> bool {
 }
 
 fn value_type(ty: &IrType) -> bool {
-    primitive(ty) || error_type(ty) || matches!(ty, IrType::Result(inner) if primitive(inner))
+    primitive(ty)
+        || error_type(ty)
+        || flat_array(ty)
+        || matches!(ty, IrType::Result(inner) if primitive(inner))
+}
+
+pub(crate) fn flat_array(ty: &IrType) -> bool {
+    matches!(ty, IrType::Array(inner) if matches!(inner.as_ref(), IrType::Int | IrType::Bool | IrType::Str))
 }
 
 pub(crate) fn error_type(ty: &IrType) -> bool {
@@ -545,7 +572,9 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
                 TaskSlotType::Task { result } => result_type(result),
                 TaskSlotType::Callable { parameters, result } => {
                     parameters.len() <= limits.max_slots
-                        && parameters.iter().all(value_type)
+                        && parameters
+                            .iter()
+                            .all(|ty| value_type(ty) && !flat_array(ty))
                         && result_type(result)
                 }
             };
@@ -568,6 +597,17 @@ fn preflight(program: &TaskProgram, limits: TaskLimits) -> KuResult<()> {
                     add_bounded(
                         &mut operation_count,
                         tasks.len(),
+                        limits.max_operations,
+                        "operation limit exceeded",
+                    )?;
+                }
+                if let TaskOp::ArrayMake { elements, .. } = operation {
+                    if elements.len() > limits.max_slots {
+                        return Err(invalid("array element limit exceeded"));
+                    }
+                    add_bounded(
+                        &mut operation_count,
+                        elements.len(),
                         limits.max_operations,
                         "operation limit exceeded",
                     )?;
@@ -712,7 +752,10 @@ fn validate_shape(
     let mut has_scope_exit = false;
     let mut has_timer = false;
     let mut has_blocking = false;
-    let mut has_error_projection = false;
+    let mut has_error_projection = function
+        .slots
+        .iter()
+        .any(|slot| matches!(&slot.ty, TaskSlotType::Value { ty, .. } if flat_array(ty)));
     let mut has_finally = false;
     for (index, slot) in function.slots.iter().enumerate() {
         if let TaskSlotType::Callable { parameters, .. } = &slot.ty {
@@ -735,9 +778,13 @@ fn validate_shape(
     for &parameter in &function.parameters {
         match &get_slot(parameter)?.ty {
             TaskSlotType::Value {
+                ty,
+                borrowed: false,
+            } if !flat_array(ty) => {}
+            TaskSlotType::Value {
                 borrowed: false, ..
-            }
-            | TaskSlotType::Callable { .. } => {}
+            } => return Err(invalid("array parameters are unsupported")),
+            TaskSlotType::Callable { .. } => {}
             TaskSlotType::Value { borrowed: true, .. } => {
                 return Err(invalid("borrowed parameter cannot enter a task frame"));
             }
@@ -804,6 +851,57 @@ fn validate_shape(
                         return Err(invalid(
                             "callable clone requires distinct matching callable slots",
                         ));
+                    }
+                }
+                TaskOp::ArrayMake { dst, elements } => {
+                    let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
+                    let IrType::Array(element) = destination else {
+                        return Err(invalid("ArrayMake requires a flat array destination"));
+                    };
+                    if borrowed || !flat_array(destination) {
+                        return Err(invalid("ArrayMake requires an owned flat array"));
+                    }
+                    budget.spend_many(elements.len())?;
+                    let mut consumed = 0;
+                    for source in elements {
+                        let (ty, borrowed) = slot_type(get_slot(*source)?)?;
+                        if source == dst || borrowed || ty != element.as_ref() {
+                            return Err(invalid("ArrayMake element type mismatch"));
+                        }
+                        if !copy_type(ty) {
+                            if consumed & bit(*source) != 0 {
+                                return Err(invalid("ArrayMake consumes an Owned element twice"));
+                            }
+                            consumed |= bit(*source);
+                        }
+                    }
+                }
+                TaskOp::ArrayClone { dst, src } | TaskOp::ArrayLen { dst, src } => {
+                    let (source, borrowed) = slot_type(get_slot(*src)?)?;
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                    if dst == src
+                        || borrowed
+                        || destination_borrowed
+                        || !flat_array(source)
+                        || (matches!(operation, TaskOp::ArrayClone { .. }) && destination != source)
+                        || (matches!(operation, TaskOp::ArrayLen { .. })
+                            && destination != &IrType::Int)
+                    {
+                        return Err(invalid("array operation has invalid source or destination"));
+                    }
+                }
+                TaskOp::ArrayTake { dst, array, index } => {
+                    let (source, borrowed) = slot_type(get_slot(*array)?)?;
+                    let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                    if dst == array
+                        || dst == index
+                        || borrowed
+                        || destination_borrowed
+                        || !flat_array(source)
+                        || !matches!(source,IrType::Array(element) if element.as_ref()==destination)
+                        || slot_type(get_slot(*index)?)?.0 != &IrType::Int
+                    {
+                        return Err(invalid("ArrayTake requires a flat array, int index and matching element destination"));
                     }
                 }
                 TaskOp::Copy { dst, src } | TaskOp::Move { dst, src } => {
@@ -1478,12 +1576,16 @@ fn operation_destination(operation: &TaskOp) -> Option<SlotId> {
         TaskOp::Init { dst, .. }
         | TaskOp::InitCallable { dst, .. }
         | TaskOp::CloneCallable { dst, .. }
+        | TaskOp::ArrayClone { dst, .. }
+        | TaskOp::ArrayLen { dst, .. }
+        | TaskOp::ArrayTake { dst, .. }
         | TaskOp::Copy { dst, .. }
         | TaskOp::Move { dst, .. }
         | TaskOp::WrapOk { dst, .. }
         | TaskOp::MakeError { dst, .. }
         | TaskOp::WrapError { dst, .. }
         | TaskOp::ErrorField { dst, .. }
+        | TaskOp::ArrayMake { dst, .. }
         | TaskOp::Start { dst, .. }
         | TaskOp::StartIndirect { dst, .. }
         | TaskOp::Unary { dst, .. }
@@ -1822,6 +1924,9 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
         TaskOp::Init { dst, .. }
         | TaskOp::InitCallable { dst, .. }
         | TaskOp::CloneCallable { dst, .. }
+        | TaskOp::ArrayClone { dst, .. }
+        | TaskOp::ArrayLen { dst, .. }
+        | TaskOp::ArrayTake { dst, .. }
         | TaskOp::Copy { dst, .. }
         | TaskOp::Unary { dst, .. }
         | TaskOp::ErrorField { dst, .. }
@@ -1846,7 +1951,12 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
             state.must &= !bit(*slot);
             state.may &= !bit(*slot);
         }
-        TaskOp::Start { dst, arguments, .. } | TaskOp::StartIndirect { dst, arguments, .. } => {
+        TaskOp::ArrayMake {
+            dst,
+            elements: arguments,
+        }
+        | TaskOp::Start { dst, arguments, .. }
+        | TaskOp::StartIndirect { dst, arguments, .. } => {
             let consumed = arguments.iter().fold(0, |mask, slot| mask | bit(*slot)) & owned;
             state.must = (state.must & !consumed) | bit(*dst);
             state.may = (state.may & !consumed) | bit(*dst);
@@ -1868,9 +1978,12 @@ fn transfer(mut state: Initialized, operation: &TaskOp, owned: u64) -> Initializ
 fn operation_work(operation: &TaskOp, budget: &mut Budget) -> KuResult<()> {
     budget.spend()?;
     match operation {
-        TaskOp::Start { arguments, .. } | TaskOp::StartIndirect { arguments, .. } => {
-            budget.spend_many(arguments.len())?
+        TaskOp::ArrayMake {
+            elements: arguments,
+            ..
         }
+        | TaskOp::Start { arguments, .. }
+        | TaskOp::StartIndirect { arguments, .. } => budget.spend_many(arguments.len())?,
         TaskOp::Unary { .. } => budget.spend()?,
         TaskOp::Binary { .. } => budget.spend_many(2)?,
         _ => {}
@@ -2103,13 +2216,20 @@ fn live_states(
                     }
                     TaskOp::Copy { dst, src }
                     | TaskOp::CloneCallable { dst, src }
+                    | TaskOp::ArrayClone { dst, src }
+                    | TaskOp::ArrayLen { dst, src }
                     | TaskOp::Move { dst, src }
                     | TaskOp::WrapOk { dst, src }
                     | TaskOp::WrapError { dst, src }
                     | TaskOp::MakeError { dst, message: src }
                     | TaskOp::ErrorField { dst, src, .. }
                     | TaskOp::Unary { dst, src, .. } => live = (live & !bit(*dst)) | bit(*src),
-                    TaskOp::Binary {
+                    TaskOp::ArrayTake {
+                        dst,
+                        array: left,
+                        index: right,
+                    }
+                    | TaskOp::Binary {
                         dst, left, right, ..
                     } => live = (live & !bit(*dst)) | bit(*left) | bit(*right),
                     TaskOp::Read { slot }
@@ -2117,7 +2237,11 @@ fn live_states(
                     | TaskOp::Drop { slot }
                     | TaskOp::DropIfInit { slot } => live |= bit(*slot),
                     TaskOp::Print { value, .. } => live |= bit(*value),
-                    TaskOp::Start { dst, arguments, .. } => {
+                    TaskOp::ArrayMake {
+                        dst,
+                        elements: arguments,
+                    }
+                    | TaskOp::Start { dst, arguments, .. } => {
                         live &= !bit(*dst);
                         for argument in arguments {
                             live |= bit(*argument);
@@ -2197,6 +2321,8 @@ fn validate_ownership_and_plan(
             let source = match operation {
                 TaskOp::Copy { src, .. }
                 | TaskOp::CloneCallable { src, .. }
+                | TaskOp::ArrayClone { src, .. }
+                | TaskOp::ArrayLen { src, .. }
                 | TaskOp::StartIndirect { callee: src, .. }
                 | TaskOp::Move { src, .. }
                 | TaskOp::WrapOk { src, .. }
@@ -2215,15 +2341,25 @@ fn validate_ownership_and_plan(
                     "read, move or drop of a slot that is not definitely initialized",
                 ));
             }
-            if let TaskOp::Binary { left, right, .. } = operation {
+            if let TaskOp::Binary { left, right, .. }
+            | TaskOp::ArrayTake {
+                array: left,
+                index: right,
+                ..
+            } = operation
+            {
                 if state.must & bit(*left) == 0 || state.must & bit(*right) == 0 {
                     return Err(invalid(
                         "Binary reads a slot that is not definitely initialized",
                     ));
                 }
             }
-            if let TaskOp::Start { arguments, .. } | TaskOp::StartIndirect { arguments, .. } =
-                operation
+            if let TaskOp::ArrayMake {
+                elements: arguments,
+                ..
+            }
+            | TaskOp::Start { arguments, .. }
+            | TaskOp::StartIndirect { arguments, .. } = operation
             {
                 // Initialization checking and the consuming transfer each walk
                 // the bounded argument list; account for both visits.

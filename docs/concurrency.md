@@ -148,9 +148,9 @@ async fn main(): null! {
 }
 ```
 
-仍拒绝数组 for、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、
+仍拒绝嵌套数组、数组参数/返回、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
-float/混合类型算术、str/null/Result/Task 比较、动态堆表达式，以及下述 sleep/文件读写以外的异步标准库 I/O。
+float/混合类型算术、str/null/Result/Task 比较、下述平面数组以外的动态堆表达式，以及下述 sleep/文件读写以外的异步标准库 I/O。
 finally 体首版只接有限 primitive/字符串/Error 操作、Copy 赋值、输出、分支与局部
 try/catch；其中创建 Task、Await、sleep、循环及再次嵌入 finally 仍在生成 artifact 前
 明确拒绝。普通 try body 中的多层 finally 链支持由内向外退出。
@@ -192,6 +192,32 @@ async fn main(): null! {
     return ok(null)
 }
 ```
+
+### Native 平面数组与 for
+
+局部数组支持 `[int]`、`[bool]`、`[str]` 的字面量、move、显式 clone、len/is_empty 与
+真实运行期 for。元素从左到右只求值一次，可包含已有支持的 Await；空数组需显式注解。
+for 创建独立 snapshot，来源仍可再次遍历。int/bool 按值读取，str 从 snapshot 移入
+本轮 Owned 变量，因此循环体可 Await 或把文本传给另一个 async 函数。
+
+```ku
+async fn Show(text: str): null! { println(text) return ok(null) }
+async fn main(): null! {
+    words = ["甲", "乙"]
+    for word in words { (await Show(word))? }
+    for word in words { println(word) }
+    empty: [int] = []
+    println(empty.len())
+    return ok(null)
+}
+```
+
+vector 按实际 capacity 而非 len 计费；Owned 字符串叶子另外按实际容量计费。
+快照部分构造即登记到持久 frame，复制失败只释放已完成叶子和 vector，不能提前退款。
+continue 保留快照进入原 latch；break/正常结束释放快照；return/fail/取消沿原清理顺序
+与绝对 D 处理当前元素、快照及来源。循环回边仍有 Suspend，原64槽/16KB frame、分析及
+总字节预算不提高。数组宽度受既有槽位限制；数组参数、返回/Result、嵌套、push、索引
+写入与捕获尚未开放，finally 体中的循环也仍拒绝。
 
 ### Native 函数值参数
 

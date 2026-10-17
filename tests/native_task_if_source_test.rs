@@ -827,8 +827,8 @@ fn native_task_if_cli_rejects_unsupported_and_ownership_before_either_artifact_p
             "task 'grand' has already been awaited",
         ),
         (
-            "async fn main(): null! { if (false) { for item in [1, 2] {} } return ok(null) }",
-            "native async subset does not support this expression",
+            "async fn main(): null! { if (false) { for item in [[1], [2]] {} } return ok(null) }",
+            "native async subset does not support",
         ),
         (
             "async fn main(): null! { try { println(1) } finally { while (false) { println(0) } } return ok(null) }",

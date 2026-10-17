@@ -341,6 +341,7 @@ fn generate_c_source_with_frames_bounded(
         || frames.is_some_and(|(tasks, _, _)| task::uses_checked_integer(tasks));
     sync::validate_identifiers(program, checked_integer_runtime)?;
     let mut frame_result_types = Vec::new();
+    let mut frame_array_elements = Vec::new();
     if let Some((frames, _, _)) = frames {
         if !frames.functions.is_empty() {
             // The fixed outcome union is shared by all typed Task dispatches.
@@ -359,6 +360,11 @@ fn generate_c_source_with_frames_bounded(
                     crate::ir::task::TaskSlotType::Task { result }
                     | crate::ir::task::TaskSlotType::Callable { result, .. } => result,
                 };
+                if let IrType::Array(element) = ty {
+                    if !frame_array_elements.contains(element.as_ref()) {
+                        frame_array_elements.push(element.as_ref().clone());
+                    }
+                }
                 collect_result_type(ty, &mut frame_result_types)?;
             }
         }
@@ -566,8 +572,8 @@ fn generate_c_source_with_frames_bounded(
     // dependencies are available.
     emit_result_forward_decls(&mut out, program, &frame_result_types)?;
     emit_closure_forward_decls(&mut out, program)?;
-    emit_array_typedefs(&mut out, program)?;
-    emit_array_helper_prototypes(&mut out, program)?;
+    emit_array_typedefs(&mut out, program, &frame_array_elements)?;
+    emit_array_helper_prototypes(&mut out, program, &frame_array_elements)?;
     // Opaque libpq handle typedefs must precede the Result ABI.
     emit_pg_types(&mut out, program);
     emit_redis_types(&mut out, program);
@@ -620,7 +626,7 @@ fn generate_c_source_with_frames_bounded(
     // Array helper bodies use element sizeof/clone/drop. Result and aggregate-
     // signature closure elements are complete only at this point. Result helper
     // bodies can already refer to the earlier clone/drop prototypes.
-    emit_array_helper_bodies(&mut out, program)?;
+    emit_array_helper_bodies(&mut out, program, &frame_array_elements)?;
     emit_bytes_runtime(&mut out, program);
     emit_windows_socket_runtime(&mut out, program);
     emit_net_runtime(&mut out, program);
@@ -1734,10 +1740,15 @@ fn is_early_array_element(element: &IrType, program: &IrProgram) -> bool {
 /// before the struct layouts, plus the shared bounds-fail helper (emitted whenever any
 /// array exists at all). Late-element typedefs are emitted by
 /// `emit_late_array_typedefs`.
-fn emit_array_typedefs(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn emit_array_typedefs(out: &mut COutput, program: &IrProgram, extra: &[IrType]) -> KuResult<()> {
     out.check()?;
     let mut element_types = Vec::new();
     collect_all_array_elements(program, &mut element_types);
+    for element in extra {
+        if !element_types.contains(element) {
+            element_types.push(element.clone());
+        }
+    }
     if element_types.is_empty() {
         return Ok(());
     }
@@ -1761,10 +1772,19 @@ fn emit_array_typedefs(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
 /// Forward-declare the early-element array helpers that the struct ownership pass
 /// calls (a struct's deep clone/drop invokes `ku_array_clone_*` / `ku_array_drop_*`
 /// for its array fields), so those uses resolve before the helper bodies are emitted.
-fn emit_array_helper_prototypes(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn emit_array_helper_prototypes(
+    out: &mut COutput,
+    program: &IrProgram,
+    extra: &[IrType],
+) -> KuResult<()> {
     out.check()?;
     let mut element_types = Vec::new();
     collect_all_array_elements(program, &mut element_types);
+    for element in extra {
+        if !element_types.contains(element) {
+            element_types.push(element.clone());
+        }
+    }
     let mut any = false;
     for element in &element_types {
         if !is_early_array_element(element, program) {
@@ -1824,10 +1844,19 @@ fn emit_late_array_typedefs(out: &mut COutput, program: &IrProgram) -> KuResult<
 /// Emit all array ownership/access helper bodies after Result and closure types
 /// are complete. Collection order is inner-before-outer, so nested arrays also
 /// see the helper definitions they call.
-fn emit_array_helper_bodies(out: &mut COutput, program: &IrProgram) -> KuResult<()> {
+fn emit_array_helper_bodies(
+    out: &mut COutput,
+    program: &IrProgram,
+    extra: &[IrType],
+) -> KuResult<()> {
     out.check()?;
     let mut element_types = Vec::new();
     collect_all_array_elements(program, &mut element_types);
+    for element in extra {
+        if !element_types.contains(element) {
+            element_types.push(element.clone());
+        }
+    }
     for element in &element_types {
         emit_array_helpers_for(out, element)?;
     }

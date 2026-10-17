@@ -153,7 +153,7 @@ native C 当前覆盖 `Result<int|bool|str|null|array|object|struct|enum>` 的�
 及对应单层 Result、move-only `Task { result }` 与无捕获 `Callable` 槽。操作显式区分 Init、Copy、Move、
 WrapOk、Unary、Binary、Read、Drop、DropIfInit、Start、Print、ScopeEnter；控制边包括 Jump、Branch、Suspend
 （resume / cleanup）、Await、TryResult、ScopeDrain、Complete、内部 Exit 和 Terminate。
-array/object/struct/enum、Task 参数/返回或借用参数仍不支持进入 frame；Callable 的有限局部与形参扩展见下文。
+局部数组限平面 `[int]/[bool]/[str]`；object/struct/enum、数组与 Task 参数/返回或借用参数仍拒绝，Callable 的有限扩展见下文。
 
 `verify_and_plan` 先验证形状、类型、资源硬限，再计算跨分支和循环的 must/may
 初始化固定点及包括 cleanup/drop 用途的 liveness。普通 Value-only frame 保留原有按需
@@ -435,8 +435,8 @@ ScopeDrain.ready 与反序局部 Value drop 后强制 Suspend，空 body 也不�
 完全退出的 body 不生成回边；新增取消出口仍走既有全 Value 清理与Task移交合同。
 整数 for 先快照上限，以只读 `CheckForLimit` 拒绝负数；隐藏计数器独立于本轮
 可赋值的词法绑定。循环体复用相同 ScopeDrain/drop/Suspend 路径；上限只求值一次。
-Owned/Task 重赋值、复合赋值与自增/自减、数组 for、递归、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、同步调用、
-Task 参数/返回/容器/clone、未绑定 Task 临时和动态堆表达式仍拒绝。完整清单见
+Owned/Task 重赋值、复合赋值与自增/自减、嵌套数组/数组参数或返回、递归、跨词法作用域 Task move、捕获闭包、函数值返回、高阶 helper 的函数值绑定、同步调用、
+Task 参数/返回/容器/clone、未绑定 Task 临时和下述平面数组以外的动态堆表达式仍拒绝。完整清单见
 [并发文档](concurrency.md#当前-native-c-源码子集)。`ku ir` / `--emit-ir` / LLVM 仍拒绝 async。
 
 `KuTaskValueV1` 是 move-only 内部值；同 scope Await 的隐藏 owner 计入64槽和初始化分析。
@@ -473,6 +473,21 @@ fixed_bytes。global_queued仅表示ring，queued为所有队列总和，容量�
 取消和timer进入全局，已在本地的queued槽可原位提升，保持一个queue credit。
 全局优先并在连续8次全局选择后提供一次本地机会；原Marker进展断言未放宽。
 仍使用一个mutex，不宣称锁竞争或性能已改善；Frame5/Control2保持，旧C需重编译。
+
+### 平面数组的局部帧与运行期 for
+
+ArrayMake、ArrayClone、ArrayLen、ArrayTake 支持局部 flat int/bool/str vector。
+普通参数、Callable 签名、结果和 raw IR 的参数入口继续拒绝数组；不扩 outcome kinds。
+Task slot 的元素类型加入原 C typedef/prototype/body 收集，复用 KuArray_T 表示和 drop，
+构造/快照使用 Task 可失败分配入口，不调用同步 make/clone 的直接 exit 路径。
+
+ArrayClone 的目标槽持久化，预付 capacity*sizeof(T) 后 malloc；先登记 len=0 的
+部分 owner 与初始化位，再逐个复制叶子并提交 len。下一次 typed reconcile 能看到
+实际 vector 与已完成叶子，失败交回原 cleanup；来源未移动。计费使用实际 capacity
+加各 Owned string 容量，预算检查在实际分配前。空数组仍是正常已初始化的数组值。
+for 隐藏 loop scope 保留 snapshot，body 的 str 项从该快照移动；continue 仅退出 body，
+break/正常结束走共同 epilogue，return/fail/取消走原 drain/finally。latch 仍 Suspend。
+Frame5/Control2/Driver10、outcome1–4、原状态/槽/代码输出与总预算不增加。
 
 ### Callable 参数的精确入口集合
 

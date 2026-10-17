@@ -68,9 +68,17 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                         map(task);
                     }
                 }
+                TaskOp::ArrayMake { dst, elements } => {
+                    map(dst);
+                    for element in elements {
+                        map(element);
+                    }
+                }
                 TaskOp::Init { dst, .. } | TaskOp::InitCallable { dst, .. } => map(dst),
                 TaskOp::Copy { dst, src }
                 | TaskOp::CloneCallable { dst, src }
+                | TaskOp::ArrayClone { dst, src }
+                | TaskOp::ArrayLen { dst, src }
                 | TaskOp::Move { dst, src }
                 | TaskOp::WrapOk { dst, src }
                 | TaskOp::WrapError { dst, src }
@@ -79,6 +87,11 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 | TaskOp::Unary { dst, src, .. } => {
                     map(dst);
                     map(src);
+                }
+                TaskOp::ArrayTake { dst, array, index } => {
+                    map(dst);
+                    map(array);
+                    map(index);
                 }
                 TaskOp::Binary {
                     dst, left, right, ..

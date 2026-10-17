@@ -77,7 +77,9 @@ fn supported_type(ty: &IrType) -> bool {
 }
 
 fn owned(ty: &IrType) -> bool {
-    matches!(ty, IrType::Str | IrType::Result(_)) || crate::ir::task::error_type(ty)
+    matches!(ty, IrType::Str | IrType::Result(_))
+        || crate::ir::task::flat_array(ty)
+        || crate::ir::task::error_type(ty)
 }
 
 // The generated branch itself guards the access: inactive Result fields must
@@ -85,6 +87,15 @@ fn owned(ty: &IrType) -> bool {
 fn active_strings(ty: &IrType, place: &str, body: &impl Fn(&str) -> String) -> String {
     match ty {
         IrType::Str => body(place),
+        IrType::Array(inner) if crate::ir::task::flat_array(ty) => {
+            let element = super::c_type(inner).expect("flat array element C type");
+            let leaf = if inner.as_ref() == &IrType::Str {
+                format!("    for (size_t array_index=0;array_index<({place}).len;array_index++) {{\n{}    }}\n",body(&format!("({place}).data[array_index]")))
+            } else {
+                String::new()
+            };
+            format!("  if (({place}).len>({place}).capacity || ({place}).capacity>64u || (({place}).capacity && !({place}).data) || ({place}).capacity>SIZE_MAX/sizeof({element}) || ({place}).capacity*sizeof({element})>SIZE_MAX-bytes) return KU_TASK_DRIVER_INVALID_ARGUMENT;\n  bytes+=({place}).capacity*sizeof({element});\n{leaf}")
+        }
         IrType::Result(inner) => format!(
             "  if (({place}).ok) {{\n{}  }} else {{\n{}{}{}  }}\n",
             active_strings(inner, &format!("({place}).value"), body),
@@ -187,6 +198,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         )
     });
     let dynamic_projection = blocking
+        || function.slots.iter().any(|slot| matches!(&slot.ty,TaskSlotType::Value {ty,..} if crate::ir::task::flat_array(ty)))
         || function.states.iter().any(|state| {
             state
                 .operations

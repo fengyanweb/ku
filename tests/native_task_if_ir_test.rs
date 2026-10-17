@@ -1043,11 +1043,11 @@ async fn main(): null! { return ok(null) }
 }
 
 #[test]
-fn native_task_if_owned_reassignment_cross_scope_task_moves_and_array_for_stay_gated() {
+fn native_task_if_owned_reassignment_cross_scope_task_moves_and_nested_arrays_stay_gated() {
     for source in [
         "async fn main(): null! { value = \"first\" if (true) { value = \"second\" } return ok(null) }",
         "async fn Child(): int! { return ok(1) } async fn main(): null! { outer = Child() if (true) { inner = outer } return ok(null) }",
-        "async fn main(): null! { for item in [1, 2] { println(item) } return ok(null) }",
+        "async fn main(): null! { for item in [[1], [2]] { println(item) } return ok(null) }",
     ] {
         let error = task_lower::lower_program(&checked(source)).expect_err("outside the admitted slice");
         assert!(error.to_string().contains("native async subset"), "{error}");
@@ -1491,4 +1491,58 @@ async fn main(): null! {
     .unwrap_err()
     .message
     .contains("analysis work limit exceeded"));
+}
+
+#[test]
+fn native_task_flat_array_for_builds_a_snapshot_and_yielding_runtime_loop() {
+    let source = r#"
+async fn Number(value: int): int! { return ok(value) }
+async fn Inspect(): int! {
+    values=[(await Number(1))?,2,3]
+    count=0
+    for number in values {
+        if (number==1) { continue }
+        count=count+number
+        if (number==2) { break }
+    }
+    empty: [int]=[]
+    for number in empty { count=count+number }
+    return ok(count+values.len())
+}
+async fn Flags(): null! { flags=[true,false] for flag in flags { println(flag) } return ok(null) }
+async fn Texts(): null! { texts=["first","second"] for text in texts { println(text) } return ok(null) }
+async fn main(): null! { total=(await Inspect())? return ok(null) }
+"#;
+    let native = task_lower::lower_program(&checked(source)).unwrap();
+    task::verify_and_plan(&native.tasks, TaskLimits::default()).unwrap();
+    let function = native
+        .tasks
+        .functions
+        .iter()
+        .find(|function| function.name == "Inspect")
+        .unwrap();
+    assert!(function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .any(|op| matches!(op, TaskOp::ArrayMake { .. })));
+    assert!(function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .any(|op| matches!(op, TaskOp::ArrayClone { .. })));
+    assert!(function
+        .states
+        .iter()
+        .flat_map(|state| &state.operations)
+        .any(|op| matches!(op, TaskOp::ArrayTake { .. })));
+    assert!(function
+        .states
+        .iter()
+        .any(|state| matches!(state.terminator, TaskTerminator::Suspend { .. })));
+    for source in [
+        "async fn Bad(values: [int]): int! { return ok(1) } async fn main(): null! { return ok(null) }",
+        "async fn Bad(): [int]! { return ok([1]) } async fn main(): null! { return ok(null) }",
+        "async fn main(): null! { values=[[1]] return ok(null) }",
+    ] { assert!(task_lower::lower_program(&checked(source)).is_err()); }
 }

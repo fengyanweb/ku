@@ -3219,6 +3219,153 @@ async fn main(): null! {
     }
 }
 #[test]
+fn native_async_flat_array_for_preserves_sources_and_owned_iteration_across_await() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-flat-array-for"));
+    let dir = &cleanup.0;
+    let first = "数组🙂\0A";
+    fs::write(dir.join("first.txt"), first.as_bytes()).unwrap();
+    fs::write(dir.join("second.txt"), "乙").unwrap();
+    fs::write(dir.join("third.txt"), "未遍历").unwrap();
+    let program = r#"import fs from "std.fs"
+import time from "std.time"
+async fn Next(value: int): int! { println(value) return ok(value) }
+async fn Show(text: str): null! { time.sleep(0)? println(text) return ok(null) }
+async fn Numbers(): null! {
+    values = [(await Next(1))?, (await Next(2))?, (await Next(3))?]
+    total = 0
+    for value in values {
+        if (value == 2) { continue }
+        total = total + value
+        if (value == 3) { break }
+    }
+    println(total)
+    for value in values { println(value) }
+    return ok(null)
+}
+async fn Strings(): null! {
+    rows = [fs.read("first.txt")?, fs.try_read("second.txt")?, fs.read("third.txt")?]
+    values = rows
+    seen = 0
+    for text in values {
+        (await Show(text))?
+        seen = seen + 1
+        if (seen == 1) { continue }
+        break
+    }
+    for text in values { println(text) }
+    println(values.len())
+    return ok(null)
+}
+async fn EmptyAndBool(): null! {
+    empty: [str] = []
+    for text in empty { println(text) }
+    println(empty.is_empty())
+    flags = [true, false]
+    for flag in flags { time.sleep(0)? println(flag) }
+    return ok(null)
+}
+async fn Nested(): null! {
+    values = [1, 2]
+    total = 0
+    for outer in values {
+        for inner in values {
+            time.sleep(0)?
+            if (inner == 1) { continue }
+            total = total + outer
+            break
+        }
+    }
+    println(total)
+    return ok(null)
+}
+async fn Early(): str! {
+    values = [fs.read("first.txt")?, fs.read("second.txt")?]
+    try {
+        for text in values { return ok(text) }
+    } finally { println("early-finally") }
+    fail "empty"
+}
+async fn Recover(): null! {
+    values = [1, 2]
+    try {
+        for value in values {
+            if (value == 2) { fail "row" }
+            println(value)
+        }
+    } catch (err) { println(err.message) }
+      finally { println("error-finally") }
+    for value in values { println(value) }
+    return ok(null)
+}
+async fn main(): null! {
+    (await Numbers())?;
+    (await Strings())?;
+    (await EmptyAndBool())?;
+    (await Nested())?;
+    println((await Early())?);
+    (await Recover())?;
+    return ok(null)
+}
+"#;
+    fs::write(dir.join("main.ku"), program).unwrap();
+    let expected = format!("1\n2\n3\n4\n1\n2\n3\n{first}\n乙\n{first}\n乙\n未遍历\n3\ntrue\ntrue\nfalse\n3\nearly-finally\n{first}\n1\nrow\nerror-finally\n1\n2\n");
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(dir).args(["run", "main.ku"]);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded interpreter flat array comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    let Some(executable) = native_build(dir, "main.ku", "flatarrayfor") else {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    };
+    let generated = fs::read_to_string(native_generated_c(dir, "flatarrayfor")).unwrap();
+    assert!(generated.contains("KuArray_int"));
+    assert!(generated.contains("KuArray_bool"));
+    assert!(generated.contains("KuArray_str"));
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    fs::remove_file(dir.join("main.ku")).unwrap();
+    fs::remove_dir_all(dir.join(".ku")).unwrap();
+    let mut run = Command::new(executable);
+    run.current_dir(dir);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded native flat array execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    assert_eq!(fs::read(dir.join("first.txt")).unwrap(), first.as_bytes());
+    assert_eq!(fs::read_to_string(dir.join("second.txt")).unwrap(), "乙");
+}
+#[test]
 fn native_async_callable_parameters_preserve_exact_targets_and_cross_await_values() {
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {

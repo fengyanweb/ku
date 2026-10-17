@@ -75,7 +75,7 @@ fn value_slot(ty: IrType) -> TaskSlotType {
 fn owned_value(ty: &TaskSlotType) -> bool {
     matches!(ty, TaskSlotType::Callable { .. })
         || matches!(ty, TaskSlotType::Value { ty, borrowed: false }
-        if matches!(ty, IrType::Str | IrType::Result(_)) || task::error_type(ty))
+        if matches!(ty, IrType::Str | IrType::Result(_)) || task::flat_array(ty) || task::error_type(ty))
 }
 
 fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
@@ -109,6 +109,13 @@ fn local_type(ty: &TypeName, span: Span) -> KuResult<TaskSlotType> {
                 .collect::<KuResult<_>>()?,
             result,
         });
+    }
+    if let TypeName::Array(inner) = ty {
+        if let Some(element) =
+            primitive(inner).filter(|ty| matches!(ty, IrType::Int | IrType::Bool | IrType::Str))
+        {
+            return Ok(value_slot(IrType::Array(Box::new(element))));
+        }
     }
     Ok(value_slot(value_type(ty, span)?))
 }
@@ -269,6 +276,9 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
                 return Err(unsupported("borrowed async parameters", parameter.span));
             }
             budget.text(parameter.name.len(), parameter.span)?;
+            if matches!(parameter.ty.as_ref(), Some(TypeName::Array(_))) {
+                return Err(unsupported("array async parameters", parameter.span));
+            }
             parameters.push(local_type(
                 parameter
                     .ty
@@ -741,6 +751,9 @@ impl<'a> FunctionLowerer<'a> {
                 }
                 _ => Err(unsupported("this literal in a Task frame", expression.span)),
             },
+            ExprKind::Array(elements) => {
+                self.array_literal_expression(elements, expression.span, depth)
+            }
             ExprKind::Variable(name) => self.variable_expression(name, expression.span),
             ExprKind::Field { target, name } => {
                 let source = self.expression(target, depth + 1)?;
@@ -842,6 +855,69 @@ impl<'a> FunctionLowerer<'a> {
         }
     }
 
+    // Keep the large Option<IrType> argument out of every recursive Unary
+    // frame, including frames which never evaluate an array expression.
+    #[inline(never)]
+    fn array_literal_expression(
+        &mut self,
+        elements: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        self.array_expression(elements, None, span, depth)
+    }
+
+    #[inline(never)]
+    fn array_expression(
+        &mut self,
+        elements: &[Expr],
+        expected: Option<IrType>,
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if elements.len() > TaskLimits::default().max_slots {
+            return Err(unsupported(
+                "array elements beyond the Task slot limit",
+                span,
+            ));
+        }
+        self.budget.analysis(elements.len(), span)?;
+        let mut element_type = expected;
+        let mut sources = Vec::with_capacity(elements.len());
+        for expression in elements {
+            let value = self.expression(expression, depth + 1)?;
+            let TaskSlotType::Value {
+                ty,
+                borrowed: false,
+            } = &self.function.slots[value.0].ty
+            else {
+                return Err(unsupported(
+                    "array element other than int, bool or str",
+                    span,
+                ));
+            };
+            if !matches!(ty, IrType::Int | IrType::Bool | IrType::Str)
+                || element_type.as_ref().is_some_and(|expected| expected != ty)
+            {
+                return Err(unsupported("mixed or nested array elements", span));
+            }
+            element_type = Some(ty.clone());
+            sources.push(self.copy_or_move(value)?);
+        }
+        let ty = element_type.ok_or_else(|| {
+            unsupported(
+                "empty array without an explicit flat array annotation",
+                span,
+            )
+        })?;
+        let dst = self.slot(value_slot(IrType::Array(Box::new(ty))))?;
+        self.emit(TaskOp::ArrayMake {
+            dst,
+            elements: sources,
+        })?;
+        Ok(dst)
+    }
+
     // Keep function signatures and Callable temporaries outside each recursive
     // expression frame. Even a Unary-only AST must fit the original depth gate.
     #[inline(never)]
@@ -895,6 +971,129 @@ impl<'a> FunctionLowerer<'a> {
         Ok(slot)
     }
 
+    // Array type construction and slot temporaries must not enlarge every
+    // recursive ordinary-call frame on the original nested-call depth route.
+    #[inline(never)]
+    fn array_method_expression(&mut self, object: &Expr, name: &str) -> KuResult<Option<SlotId>> {
+        if let Some(source) = match &object.kind {
+            ExprKind::Variable(name) => self.local(name),
+            _ => None,
+        } {
+            if matches!(&self.function.slots[source.0].ty,TaskSlotType::Value {ty,..} if task::flat_array(ty))
+            {
+                let ty = if name == "clone" {
+                    self.function.slots[source.0].ty.clone()
+                } else {
+                    value_slot(IrType::Int)
+                };
+                let dst = self.slot(ty)?;
+                self.emit(if name == "clone" {
+                    TaskOp::ArrayClone { dst, src: source }
+                } else {
+                    TaskOp::ArrayLen { dst, src: source }
+                })?;
+                if name == "is_empty" {
+                    let zero = self.constant(TaskConstant::Int(0), IrType::Int)?;
+                    let empty = self.slot(value_slot(IrType::Bool))?;
+                    self.emit(TaskOp::Binary {
+                        dst: empty,
+                        op: TaskBinaryOp::Equal,
+                        left: dst,
+                        right: zero,
+                    })?;
+                    return Ok(Some(empty));
+                }
+                return Ok(Some(dst));
+            }
+        }
+        Ok(None)
+    }
+
+    // Ordinary nested calls do not reserve the field-call branch's type,
+    // timer and ownership temporaries on every recursive frame.
+    #[inline(never)]
+    fn field_call_expression(
+        &mut self,
+        object: &Expr,
+        name: &str,
+        callee: &Expr,
+        args: &[Expr],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<SlotId> {
+        if matches!(&object.kind, ExprKind::Variable(module) if module == "fs")
+            && matches!(name, "write" | "try_write" | "read" | "try_read")
+            && self.std_fs
+            && self.local("fs").is_none()
+            && !self.signatures.contains_key("fs")
+        {
+            return if matches!(name, "read" | "try_read") {
+                self.blocking_read(args, span, depth)
+            } else {
+                self.blocking_write(args, span, depth)
+            };
+        }
+        if matches!(&object.kind, ExprKind::Variable(module) if module == "time")
+            && name == "sleep"
+            && self.std_time
+            && self.local("time").is_none()
+            && !self.signatures.contains_key("time")
+        {
+            if self.in_finally_body {
+                return Err(unsupported(
+                    "time.sleep inside a native Task finally body",
+                    span,
+                ));
+            }
+            if args.len() != 1 {
+                return Err(unsupported("time.sleep with other than one argument", span));
+            }
+            let source = self.expression(&args[0], depth + 1)?;
+            if self.function.slots[source.0].ty != value_slot(IrType::Int) {
+                return Err(unsupported(
+                    "time.sleep arguments other than integer milliseconds",
+                    args[0].span,
+                ));
+            }
+            let millis = self.copy_or_move(source)?;
+            let destination = self.slot(value_slot(IrType::Result(Box::new(IrType::Null))))?;
+            let poll = self.state(TaskTerminator::Terminate)?;
+            let ready = self.state(TaskTerminator::Terminate)?;
+            let cleanup = self.cleanup_state()?;
+            self.terminate(TaskTerminator::Jump { target: poll })?;
+            self.function.states[poll.0].terminator = TaskTerminator::Timer {
+                millis,
+                dst: destination,
+                ready,
+                cleanup,
+            };
+            self.current = Some(ready);
+            return Ok(destination);
+        }
+        if args.is_empty() && matches!(name, "len" | "is_empty" | "clone") {
+            if let Some(destination) = self.array_method_expression(object, name)? {
+                return Ok(destination);
+            }
+        }
+        if name == "clone" && args.is_empty() {
+            let source = self.expression(object, depth + 1)?;
+            let ty = self.function.slots[source.0].ty.clone();
+            if !matches!(ty, TaskSlotType::Callable { .. }) {
+                return Err(unsupported(
+                    "clone of a non-callable value in a Task frame",
+                    span,
+                ));
+            }
+            let destination = self.slot(ty)?;
+            self.emit(TaskOp::CloneCallable {
+                dst: destination,
+                src: source,
+            })?;
+            return Ok(destination);
+        }
+        self.indirect_call(callee, args, span, depth)
+    }
+
     // Calls carry signatures, argument vectors and ownership temporaries. Do
     // not reserve that storage on every recursive Unary/Binary expression.
     #[inline(never)]
@@ -910,71 +1109,7 @@ impl<'a> FunctionLowerer<'a> {
             name,
         } = &callee.kind
         {
-            if matches!(&object.kind, ExprKind::Variable(module) if module == "fs")
-                && matches!(name.as_str(), "write" | "try_write" | "read" | "try_read")
-                && self.std_fs
-                && self.local("fs").is_none()
-                && !self.signatures.contains_key("fs")
-            {
-                return if matches!(name.as_str(), "read" | "try_read") {
-                    self.blocking_read(args, span, depth)
-                } else {
-                    self.blocking_write(args, span, depth)
-                };
-            }
-            if matches!(&object.kind, ExprKind::Variable(module) if module == "time")
-                && name == "sleep"
-                && self.std_time
-                && self.local("time").is_none()
-                && !self.signatures.contains_key("time")
-            {
-                if self.in_finally_body {
-                    return Err(unsupported(
-                        "time.sleep inside a native Task finally body",
-                        span,
-                    ));
-                }
-                if args.len() != 1 {
-                    return Err(unsupported("time.sleep with other than one argument", span));
-                }
-                let source = self.expression(&args[0], depth + 1)?;
-                if self.function.slots[source.0].ty != value_slot(IrType::Int) {
-                    return Err(unsupported(
-                        "time.sleep arguments other than integer milliseconds",
-                        args[0].span,
-                    ));
-                }
-                let millis = self.copy_or_move(source)?;
-                let destination = self.slot(value_slot(IrType::Result(Box::new(IrType::Null))))?;
-                let poll = self.state(TaskTerminator::Terminate)?;
-                let ready = self.state(TaskTerminator::Terminate)?;
-                let cleanup = self.cleanup_state()?;
-                self.terminate(TaskTerminator::Jump { target: poll })?;
-                self.function.states[poll.0].terminator = TaskTerminator::Timer {
-                    millis,
-                    dst: destination,
-                    ready,
-                    cleanup,
-                };
-                self.current = Some(ready);
-                return Ok(destination);
-            }
-            if name == "clone" && args.is_empty() {
-                let source = self.expression(object, depth + 1)?;
-                let ty = self.function.slots[source.0].ty.clone();
-                if !matches!(ty, TaskSlotType::Callable { .. }) {
-                    return Err(unsupported(
-                        "clone of a non-callable value in a Task frame",
-                        span,
-                    ));
-                }
-                let destination = self.slot(ty)?;
-                self.emit(TaskOp::CloneCallable {
-                    dst: destination,
-                    src: source,
-                })?;
-                return Ok(destination);
-            }
+            return self.field_call_expression(object, name, callee, args, span, depth);
         }
         let ExprKind::Variable(name) = &callee.kind else {
             return self.indirect_call(callee, args, span, depth);
@@ -1305,7 +1440,16 @@ impl<'a> FunctionLowerer<'a> {
             ));
         }
         self.budget.text(name.len(), span)?;
-        let source = self.expression(value, depth)?;
+        let source = if let (ExprKind::Array(elements), Some(TypeName::Array(inner))) =
+            (&value.kind, annotation)
+        {
+            // The annotated empty-array entry still consumes the ordinary
+            // expression depth/work budget before using its expected type.
+            self.budget.expression(depth, value.span)?;
+            self.array_expression(elements, primitive(inner), span, depth)?
+        } else {
+            self.expression(value, depth)?
+        };
         if let Some(annotation) = annotation {
             if self.function.slots[source.0].ty != local_type(annotation, span)? {
                 return Err(unsupported("a mismatched local annotation", span));
@@ -1471,12 +1615,7 @@ impl<'a> FunctionLowerer<'a> {
                         self.emit(TaskOp::Read { slot: value })?;
                     }
                 }
-                _ => {
-                    return Err(unsupported(
-                        "this statement; array for and user finally remain gated",
-                        self.span,
-                    ))
-                }
+                _ => return Err(unsupported("this statement in a native Task", self.span)),
             }
         }
         self.statement_depth = previous_depth;
@@ -1804,8 +1943,15 @@ impl<'a> FunctionLowerer<'a> {
         // Evaluate once in the outer lexical environment. Keep a distinct
         // snapshot even when the expression is an existing mutable local.
         let source = self.expression(iterable, depth + 1)?;
+        if matches!(&self.function.slots[source.0].ty,TaskSlotType::Value {ty,..} if task::flat_array(ty))
+        {
+            return self.lower_array_for(name, iterable, source, body, span, depth);
+        }
         if self.function.slots[source.0].ty != value_slot(IrType::Int) {
-            return Err(unsupported("for iterables other than int", span));
+            return Err(unsupported(
+                "for iterables other than int or flat array",
+                span,
+            ));
         }
         let limit = self.copy_or_move(source)?;
         self.emit(TaskOp::CheckForLimit { slot: limit })?;
@@ -1866,6 +2012,111 @@ impl<'a> FunctionLowerer<'a> {
             })?;
         }
         self.current = Some(after);
+        Ok(())
+    }
+
+    fn lower_array_for(
+        &mut self,
+        name: &str,
+        iterable: &Expr,
+        source: SlotId,
+        body: &'a [Stmt],
+        span: Span,
+        depth: usize,
+    ) -> KuResult<()> {
+        let TaskSlotType::Value {
+            ty: IrType::Array(element),
+            ..
+        } = &self.function.slots[source.0].ty
+        else {
+            unreachable!("validated flat array");
+        };
+        let element = element.as_ref().clone();
+        self.budget.analysis(1, span)?;
+        let scope = TaskScopeId(self.next_scope);
+        self.next_scope += 1;
+        self.scopes.push(scope);
+        self.locals.push(HashMap::new());
+        self.emit(TaskOp::ScopeEnter {
+            scope,
+            tasks: Vec::new(),
+        })?;
+        let snapshot = self.slot(self.function.slots[source.0].ty.clone())?;
+        self.emit(TaskOp::ArrayClone {
+            dst: snapshot,
+            src: source,
+        })?;
+        if !matches!(iterable.kind, ExprKind::Variable(_)) {
+            self.emit(TaskOp::Drop { slot: source })?;
+        }
+        let limit = self.slot(value_slot(IrType::Int))?;
+        self.emit(TaskOp::ArrayLen {
+            dst: limit,
+            src: snapshot,
+        })?;
+        let counter = self.constant(TaskConstant::Int(0), IrType::Int)?;
+        let one = self.constant(TaskConstant::Int(1), IrType::Int)?;
+        let header = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::Jump { target: header })?;
+        self.current = Some(header);
+        let condition = self.slot(value_slot(IrType::Bool))?;
+        self.emit(TaskOp::Binary {
+            dst: condition,
+            op: TaskBinaryOp::Less,
+            left: counter,
+            right: limit,
+        })?;
+        let body_entry = self.state(TaskTerminator::Terminate)?;
+        let after = self.state(TaskTerminator::Terminate)?;
+        let latch = self.state(TaskTerminator::Terminate)?;
+        self.terminate(TaskTerminator::Branch {
+            condition,
+            then_state: body_entry,
+            else_state: after,
+        })?;
+        self.current = Some(body_entry);
+        let item = self.slot(value_slot(element))?;
+        self.emit(TaskOp::ArrayTake {
+            dst: item,
+            array: snapshot,
+            index: counter,
+        })?;
+        self.loops.push(LoopContext {
+            break_target: after,
+            continue_target: latch,
+            retained_depth: self.scopes.len(),
+            has_continue: false,
+            finally_depth: self.finalies.len(),
+        });
+        let end = self.lower_bound_arm(body, body_entry, depth + 1, Some((name, item)))?;
+        let context = self.loops.pop().expect("loop context exists");
+        if let Some(end) = end {
+            self.function.states[end.0].terminator = TaskTerminator::Jump { target: latch };
+        }
+        if end.is_some() || context.has_continue {
+            self.current = Some(latch);
+            let next = self.slot(value_slot(IrType::Int))?;
+            self.emit(TaskOp::Binary {
+                dst: next,
+                op: TaskBinaryOp::Add,
+                left: counter,
+                right: one,
+            })?;
+            self.emit(TaskOp::Copy {
+                dst: counter,
+                src: next,
+            })?;
+            let cleanup = self.cleanup_state()?;
+            self.budget.analysis(1, span)?;
+            self.terminate(TaskTerminator::Suspend {
+                resume: header,
+                cleanup,
+            })?;
+        }
+        self.current = Some(after);
+        self.drain_scope(scope)?;
+        self.locals.pop();
+        self.scopes.pop();
         Ok(())
     }
 
