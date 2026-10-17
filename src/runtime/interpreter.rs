@@ -2707,7 +2707,7 @@ impl Interpreter {
         };
         match route {
             RouteLookup::Found(handler, params) => {
-                let req = http_request_value(&request, params);
+                let req = http_request_value(request, params);
                 match self.call_http_handler(handler, req, span, deadline) {
                     Ok(value) => value_to_http_response(value).unwrap_or_else(|| {
                         status_response(500, "handler did not return HttpResponse")
@@ -3197,6 +3197,88 @@ mod finally_tests {
             assert!(interpreter.pending_fail.is_none());
             assert_eq!(interpreter.call_depth, 0);
         }
+    }
+
+    #[test]
+    fn interpreter_http_request_transfer_preserves_owned_buffers() {
+        fn owned(text: &str) -> String {
+            let mut value = String::with_capacity(text.len() + 64);
+            value.push_str(text);
+            value
+        }
+
+        fn identity(value: &String) -> (usize, usize) {
+            (value.as_ptr() as usize, value.capacity())
+        }
+
+        fn assert_buffer(value: &String, expected: &str, original: (usize, usize)) {
+            assert_eq!(value, expected);
+            assert_eq!(
+                identity(value),
+                original,
+                "request buffer was copied: {expected:?}"
+            );
+        }
+
+        fn assert_field(
+            fields: &HashMap<String, Value>,
+            name: &str,
+            expected: &str,
+            original: (usize, usize),
+        ) {
+            let Some(Value::String(value)) = fields.get(name) else {
+                panic!("missing request string field {name}");
+            };
+            assert_buffer(value, expected, original);
+        }
+
+        fn assert_map_entry(
+            fields: &HashMap<String, Value>,
+            name: &str,
+            key: &str,
+            expected: &str,
+            original: ((usize, usize), (usize, usize)),
+        ) {
+            let Some(Value::Object(values)) = fields.get(name) else {
+                panic!("missing request object field {name}");
+            };
+            let Some((actual_key, Value::String(value))) = values.get_key_value(key) else {
+                panic!("missing request map entry {name}.{key}");
+            };
+            assert_buffer(actual_key, key, original.0);
+            assert_buffer(value, expected, original.1);
+        }
+
+        let request = ParsedHttpRequest {
+            method: owned("POST"),
+            path: owned("/echo"),
+            query: HashMap::from([(owned("term"), owned("中文🙂\0查询"))]),
+            headers: HashMap::from([(owned("x-title"), owned("中文🙂"))]),
+            body: owned("中文🙂\0正文"),
+        };
+        let params = HashMap::from([(owned("id"), owned("参数🙂"))]);
+        let method_buffer = identity(&request.method);
+        let path_buffer = identity(&request.path);
+        let body_buffer = identity(&request.body);
+        let (query_key, query_value) = request.query.iter().next().unwrap();
+        let query_buffers = (identity(query_key), identity(query_value));
+        let (header_key, header_value) = request.headers.iter().next().unwrap();
+        let header_buffers = (identity(header_key), identity(header_value));
+        let (param_key, param_value) = params.iter().next().unwrap();
+        let param_buffers = (identity(param_key), identity(param_value));
+
+        let value = http_request_value(request, params);
+        let Value::Object(fields) = &value else {
+            panic!("request must become a Ku object");
+        };
+        // Read through the final owner after the parsed-request owner is gone.
+        assert_field(fields, "body", "中文🙂\0正文", body_buffer);
+        assert_field(fields, "method", "POST", method_buffer);
+        assert_field(fields, "path", "/echo", path_buffer);
+        assert_map_entry(fields, "query", "term", "中文🙂\0查询", query_buffers);
+        assert_map_entry(fields, "headers", "x-title", "中文🙂", header_buffers);
+        assert_map_entry(fields, "params", "id", "参数🙂", param_buffers);
+        drop(value);
     }
 
     fn http_test_pair() -> (TcpStream, TcpStream) {
@@ -4974,17 +5056,14 @@ fn match_http_path(
     Ok(Some(params))
 }
 
-fn http_request_value(request: &ParsedHttpRequest, params: HashMap<String, String>) -> Value {
+fn http_request_value(request: ParsedHttpRequest, params: HashMap<String, String>) -> Value {
     Value::Object(HashMap::from([
-        ("method".to_string(), Value::String(request.method.clone())),
-        ("path".to_string(), Value::String(request.path.clone())),
+        ("method".to_string(), Value::String(request.method)),
+        ("path".to_string(), Value::String(request.path)),
         ("params".to_string(), string_map_value(params)),
-        ("query".to_string(), string_map_value(request.query.clone())),
-        (
-            "headers".to_string(),
-            string_map_value(request.headers.clone()),
-        ),
-        ("body".to_string(), Value::String(request.body.clone())),
+        ("query".to_string(), string_map_value(request.query)),
+        ("headers".to_string(), string_map_value(request.headers)),
+        ("body".to_string(), Value::String(request.body)),
     ]))
 }
 
