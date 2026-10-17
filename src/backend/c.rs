@@ -18550,7 +18550,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(type_error.message.contains("requires a primitive Result"));
+        assert!(type_error.message.contains("requires a supported Result"));
         let mut mixed = tasks;
         mixed.functions.push(invalid);
 
