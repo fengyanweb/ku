@@ -150,7 +150,7 @@ async fn main(): null! {
 
 仍拒绝嵌套数组、数组 Result 形参与 Callable 数组形参、递归、Owned/Task 重赋值、复合赋值与自增/自减、跨词法作用域 Task move、捕获闭包、返回函数值、高阶 helper 的函数值绑定、
 同步用户函数调用、借用 async 参数、Task 参数/返回/容器/clone、未绑定的 Task 临时、
-float/混合类型算术、str/null/Result/Task 比较、下述平面数组以外的动态堆表达式，以及下述 sleep/文件读写以外的异步标准库 I/O。
+float/混合类型算术、str/null/Result/Task 比较、下述平面数组以外的动态堆表达式，以及下述 sleep/文件读写与 exists 以外的异步标准库 I/O。
 finally 体首版只接有限 primitive/字符串/Error 操作、Copy 赋值、输出、分支与局部
 try/catch；其中创建 Task、Await、sleep、循环及再次嵌入 finally 仍在生成 artifact 前
 明确拒绝。普通 try body 中的多层 finally 链支持由内向外退出。
@@ -281,7 +281,7 @@ async fn main(): null! {
 调用本身可挂起，无需增加 await。View 输入不被消耗，参数按顺序求值一次，等待期间
 只持有原值和独立的后台副本。固定 worker 数沿用目标系统的
 `min(32, max(4, CPU 核心数))` 策略，job 表与队列上限1024，不新增公开配置。
-没有文件读写的程序不建立该池。read_dir、网络和其他阻塞操作不属于这一入口。
+没有上述文件调用的程序不建立该池。read_dir、网络和其他阻塞操作不属于这一入口。
 
 原生路径转换（包括 Windows 临时 UTF-16 缓冲）与内容复制在每次实际分配前计费；
 pool 固定存储按真实 sizeof 纳入 driver fixed_bytes。副本尚未退休时，finally 中的
@@ -293,7 +293,7 @@ worker 开始前观察取消/关闭，已取消的排队工作跳过文件操作
 后台 job 真正退出前不会给外层清理 ACK，也不释放实例或它仍依赖的驱动存储。
 超出原绝对 D 时报告尚未完成的清理并保留存储，晚完成与重试不续期。
 POSIX 在线程最后一次存储访问之后才 pthread_join；OS 返回尾部没有硬时长保证，
-沿用原 driver 的边界。finally 内提交新读写仍明确拒绝。
+沿用原 driver 的边界。finally 内提交这些文件操作仍明确拒绝。
 
 ```ku
 import fs from "std.fs"
@@ -302,6 +302,7 @@ async fn main(): null! {
     content = "中文🙂"
     fs.write("result.txt", content)?
     decoded = fs.read("result.txt")?
+    println(fs.exists("result.txt"))
     println(content)
     println(decoded)
     return ok(null)
@@ -313,6 +314,11 @@ async fn main(): null! {
 仍可能先返回 memory_limit，文件上限不是无条件接纳保证。worker 只持有 job 输出，
 不会写 frame 或 token；结果在实际读取、校验和关闭文件结束后移交给 Ku。成功结果可
 传参、重复读取及再次写入，取消时的迟到结果按原字符串释放规则清理。
+
+`fs.exists(path): bool` 同样使用此池并保留 View 输入；文件、目录或有效链接为 true，
+缺失、无效路径及 metadata 失败为 false。队列满、关闭、配额或分配失败保持 Task 运行错误，
+不能冒充不存在。它仅持有原生路径副本，不分配输出堆对象；真实查询和句柄关闭完成后
+才退休 job、释放费用并允许 ACK，取消与晚完成不续原 D。
 
 print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
 M:N、netpoll、事件驱动 HTTP、完整阻塞 I/O 覆盖、完整 RSS 预算及性能/soak 尚未完成；

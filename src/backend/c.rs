@@ -384,6 +384,7 @@ fn generate_c_source_with_frames_bounded(
     if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_io(tasks)) {
         fs_usage.write = true;
         fs_usage.read = true;
+        fs_usage.exists = true;
     }
     if fs_usage.any() {
         if let NativeFsBase::Unavailable(reason) = &options.fs_base {
@@ -7112,9 +7113,7 @@ static bool ku_fs_write_impl(KuString path, KuString content, KuError* error) {
 
     if usage.exists {
         out.push_str(
-            r#"static bool ku_fs_exists(KuString path) {
-  KuFsNativeChar* native = ku_fs_native_path(path, NULL, "", "");
-  if (!native) return false;
+            r#"static bool ku_fs_exists_native_impl(const KuFsNativeChar* native) {
 #if defined(_WIN32)
   HANDLE handle = CreateFileW(
       native,
@@ -7130,6 +7129,12 @@ static bool ku_fs_write_impl(KuString path, KuString content, KuError* error) {
   struct stat metadata;
   bool exists = stat(native, &metadata) == 0;
 #endif
+  return exists;
+}
+static bool ku_fs_exists(KuString path) {
+  KuFsNativeChar* native = ku_fs_native_path(path, NULL, "", "");
+  if (!native) return false;
+  bool exists = ku_fs_exists_native_impl(native);
   free(native);
   return exists;
 }

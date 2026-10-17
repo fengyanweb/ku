@@ -1586,6 +1586,10 @@ import time from "std.time"
 async fn Save(path: str, content: str): null! { fs.try_write(path, content)? return ok(null) }
 async fn Tick(): null! { time.sleep(1)? return ok(null) }
 async fn Load(path: str): str! { return fs.try_read(path) }
+async fn Probe(path: str): bool! {
+    present=fs.exists(path)
+    return ok(present)
+}
 async fn main(): null! { return ok(null) }
 "#;
     let mut ast = Parser::new(Lexer::new(source).lex().unwrap())
@@ -1623,6 +1627,11 @@ async fn main(): null! { return ok(null) }
         .replacen(
             "static bool ku_fs_read_native_impl(const KuFsNativeChar* native, KuString* value, KuError* error, KuFsAllocatorV1* allocator) {",
             "static bool ku_fs_read_native_impl(const KuFsNativeChar* native, KuString* value, KuError* error, KuFsAllocatorV1* allocator) {\n  fixture_io_gate();",
+            1,
+        )
+        .replacen(
+            "static bool ku_fs_exists_native_impl(const KuFsNativeChar* native) {",
+            "static bool ku_fs_exists_native_impl(const KuFsNativeChar* native) {\n  fixture_io_gate();",
             1,
         )
         .replacen("void* pointer=malloc(bytes);", "void* pointer=fixture_output_malloc(bytes);", 1)
@@ -2043,6 +2052,144 @@ static void blocking_rejections_have_no_file_effect(void) {
     blocking_finish(blocking_observation_deadline());
   }
 }
+static KuTaskValueV1 blocking_exists_start(KuString* path) {
+  KuTaskValueV1 task={0}; CHECK(ku_task_3_start_value(&blocking_driver,path,&task)==KU_TASK_DRIVER_OK);
+  CHECK(task.tag==KU_TASK_VALUE_LIVE&&!path->ptr&&!path->len&&!path->capacity); return task;
+}
+static KuTaskValueV1 blocking_exists_name(const char* name) {
+  KuString path=ku_string_static((const uint8_t*)name,strlen(name)); return blocking_exists_start(&path);
+}
+static KuTaskValueV1 blocking_exists_owned(void) {
+  uint8_t* bytes=(uint8_t*)malloc(31u); CHECK(bytes); memcpy(bytes,"exists-input.txt",16u);
+  fixture_original_path=bytes; KuString path={bytes,16u,31u,KU_STRING_OWNED}; return blocking_exists_start(&path);
+}
+static void blocking_exists_take(KuTaskValueV1* task,bool present,const char* error_code) {
+  CHECK(ku_task_driver_wait_result(&task->ticket,&task->owner.lease,blocking_observation_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  size_t calls=fixture_ledger().calls;
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(task,NULL,&output)==KU_TASK_CONTROL_OK);
+  CHECK(output.result_kind==2u&&output.value.boolean.ok==(error_code==NULL));
+  if (error_code) {
+    KuString code=output.value.boolean.error.code;
+    CHECK(code.len==strlen(error_code)&&!memcmp(code.ptr,error_code,code.len));
+    CHECK(output.exit_class==KU_TASK_EXIT_RUNTIME_FAILURE);
+  } else {
+    CHECK(output.value.boolean.value==present&&output.exit_class==KU_TASK_EXIT_USER_RESULT);
+    CHECK(!output.has_cleanup_deadline&&!output.cleanup_deadline);
+  }
+  CHECK(fixture_ledger().calls==calls&&!fixture_output_calls);
+  ku_task_outcome_drop(&output);
+}
+static void blocking_exists_values_and_infrastructure_errors(void) {
+  blocking_setup(1,sizeof(KuTaskInstance_3)+1024u);
+  blocking_read_file("exists-input.txt",1u);
+  for (unsigned mode=0;mode<6u;mode++) {
+    const uint8_t nul_path[]={'x',0,'y'},invalid_utf8[]={0xff};
+    KuTaskValueV1 task;
+    if (mode==0) task=blocking_exists_owned();
+    else if (mode<3u) task=blocking_exists_name(mode==1 ? "." : "exists-missing.txt");
+    else {
+      KuString path=ku_string_static(mode==3u ? nul_path : mode==4u ? invalid_utf8 : (const uint8_t*)"",
+          mode==3u ? sizeof(nul_path) : mode==4u ? sizeof(invalid_utf8) : 0u);
+      task=blocking_exists_start(&path);
+    }
+    // Ku resolves an empty path to the current/base directory.
+    blocking_exists_take(&task,mode<2u||mode==5u,NULL); blocking_idle();
+    CHECK(blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_3));
+    CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_3));
+    if (!mode) { CHECK(fixture_original_path_freed==1u); fixture_original_path=NULL; }
+    blocking_drop(&task); blocking_idle(); CHECK(!fixture_ledger().bytes&&!blocking_driver_snapshot().reserved_bytes);
+  }
+  CHECK(!fixture_output_calls&&fixture_io_calls>=3u);
+  CHECK(remove("exists-input.txt")==0); blocking_finish(blocking_observation_deadline());
+  // Exists has one native path allocation and no content/output allocation.
+  // Reuse the shared write/read fault hooks, without replaying their matrices.
+  for (unsigned mode=0;mode<2u;mode++) {
+    blocking_setup(1,sizeof(KuTaskInstance_3)+(mode ? 1024u : 0u));
+    if (mode) fixture_fail_blocking_in=0;
+    KuTaskValueV1 task=blocking_exists_name("exists-missing.txt");
+    blocking_exists_take(&task,false,mode ? "out_of_memory" : "memory_limit");
+    CHECK(!fixture_io_calls&&!fixture_output_calls&&fixture_ledger().allocations==1u);
+    CHECK(blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_3));
+    KuTaskBlockingSnapshotV1 snapshot=blocking_pool_snapshot();
+    CHECK(!snapshot.resident&&!snapshot.running&&!snapshot.queued&&!snapshot.accepted&&!snapshot.finished&&snapshot.rejected==1u);
+    blocking_drop(&task); blocking_idle(); blocking_finish(blocking_observation_deadline());
+  }
+}
+static void blocking_exists_real_job_does_not_block_timers_or_hide_queue_errors(void) {
+  blocking_setup(2,4u*(sizeof(KuTaskInstance_3)+sizeof(KuTaskInstance_1))+2048u);
+  blocking_read_file("exists-input.txt",1u); fixture_gate_io=1;
+  KuTaskValueV1 running=blocking_exists_owned(); CHECK(ku_test_event_wait(&fixture_io_entered,2000)); blocking_idle();
+  KuTaskInstance_3* instance=(KuTaskInstance_3*)running.owner.lease.control->context;
+  KuTaskBlockingTokenV1 token=instance->blocking;
+  CHECK(instance->frame.s_0.ptr==fixture_original_path&&instance->frame.s_0.len==16u&&instance->frame.s_0.capacity==31u);
+  CHECK(!fixture_original_path_freed&&token.pool&&token.charged_bytes);
+  CHECK(!ku_task_blocking_lock(&blocking_pool));
+  CHECK(blocking_pool.jobs[token.slot].kind==3u&&!blocking_pool.jobs[token.slot].output_charge);
+  ku_task_blocking_unlock(&blocking_pool);
+  CHECK(blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_3)+31u+token.charged_bytes);
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_3)+31u+token.charged_bytes);
+  KuTaskValueV1 timer={0}; CHECK(ku_task_1_start_value(&blocking_driver,&timer)==KU_TASK_DRIVER_OK);
+  blocking_take(&timer,NULL); blocking_drop(&timer); blocking_idle();
+  CHECK(blocking_pool_snapshot().running==1u&&!fixture_output_calls); // Sole ordinary worker ran the timer.
+  KuTaskValueV1 queued=blocking_exists_name("exists-missing.txt"); blocking_idle();
+  CHECK(blocking_pool_snapshot().running==1u&&blocking_pool_snapshot().queued==1u);
+  KuTaskValueV1 full=blocking_exists_name("exists-missing.txt"); blocking_exists_take(&full,false,"blocking_queue_full"); blocking_drop(&full);
+  CHECK(ku_task_blocking_close(&blocking_pool)==KU_TASK_DRIVER_OK);
+  KuTaskValueV1 closed=blocking_exists_name("exists-missing.txt"); blocking_exists_take(&closed,false,"blocking_pool_stopped"); blocking_drop(&closed);
+  CHECK(ku_test_event_set(&fixture_io_release));
+  blocking_exists_take(&running,true,NULL); blocking_exists_take(&queued,false,"blocking_pool_stopped");
+  blocking_drop(&running); blocking_drop(&queued); blocking_idle();
+  KuTaskBlockingSnapshotV1 snapshot=blocking_pool_snapshot();
+  CHECK(snapshot.accepted==2u&&snapshot.finished==2u&&snapshot.rejected==2u&&snapshot.rejected_queue==1u);
+  CHECK(!snapshot.resident&&!snapshot.running&&!snapshot.queued&&!snapshot.fault);
+  CHECK(fixture_io_calls==1u&&!fixture_output_calls&&fixture_original_path_freed==1u);
+  CHECK(!fixture_ledger().bytes&&!blocking_driver_snapshot().reserved_bytes);
+  CHECK(remove("exists-input.txt")==0); blocking_finish(blocking_observation_deadline());
+}
+static void blocking_exists_cancel_retires_actual_job_with_original_deadline(void) {
+  blocking_setup(1,2u*sizeof(KuTaskInstance_3)+1024u);
+  blocking_read_file("exists-input.txt",1u); fixture_gate_io=1;
+  KuTaskValueV1 task=blocking_exists_owned(); CHECK(ku_test_event_wait(&fixture_io_entered,2000)); blocking_idle();
+  KuTaskInstance_3* instance=(KuTaskInstance_3*)task.owner.lease.control->context;
+  size_t copies=instance->blocking.charged_bytes; CHECK(copies&&!fixture_original_path_freed&&!fixture_output_calls);
+  KuTaskControlLeaseV1 late={0}; CHECK(ku_task_control_lease_retain(&task.owner.lease,&late)==KU_TASK_CONTROL_OK);
+  uint64_t deadline=ku_task_driver_now_ms()+30u; KuTaskDriverCleanupReceiptV1 receipt={0};
+  CHECK(ku_task_driver_owner_drop_receipt(&task.ticket,&task.owner,deadline,&receipt)==KU_TASK_DRIVER_OK);
+  task=(KuTaskValueV1){0}; blocking_idle();
+  CHECK(fixture_original_path_freed==1u&&ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_PENDING);
+  CHECK(blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_3)+copies);
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_3)+copies);
+  CHECK(ku_task_driver_shutdown(&blocking_driver,deadline)==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
+  CHECK(ku_task_blocking_finish(&blocking_pool,deadline)==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
+  CHECK(ku_task_driver_destroy(&blocking_driver)==KU_TASK_DRIVER_PENDING);
+  CHECK(blocking_pool_snapshot().running==1u&&!blocking_pool_snapshot().finished);
+  CHECK(ku_task_control_cleanup_deadline(late.control)==deadline);
+  CHECK(ku_test_event_set(&fixture_io_release));
+  CHECK(!ku_task_blocking_lock(&blocking_pool)); uint64_t observer=blocking_observation_deadline();
+  while (blocking_pool.finished!=1u) CHECK(ku_task_blocking_wait(&blocking_pool,observer)==0);
+  ku_task_blocking_unlock(&blocking_pool); blocking_idle();
+  CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_CLEANUP_ACK);
+  CHECK(ku_task_control_status(&late)==KU_TASK_CONTROL_CANCELLED&&ku_task_control_cleanup_deadline(late.control)==deadline);
+  CHECK(!blocking_pool_snapshot().resident&&!fixture_output_calls&&fixture_io_calls==1u);
+  CHECK(blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_3)&&fixture_ledger().bytes==sizeof(KuTaskInstance_3));
+  CHECK(ku_task_control_lease_release(&late)==KU_TASK_CONTROL_OK); blocking_idle();
+  CHECK(!ku_task_blocking_lock(&blocking_pool)); observer=blocking_observation_deadline();
+  while (blocking_pool.workers_exited!=blocking_pool.workers_created) CHECK(ku_task_blocking_wait(&blocking_pool,observer)==0);
+  ku_task_blocking_unlock(&blocking_pool);
+  CHECK(!blocking_driver_snapshot().resident&&!blocking_driver_snapshot().reserved_bytes);
+  CHECK(remove("exists-input.txt")==0);
+#if defined(_WIN32)
+  // An expired D is never renewed to wait for the native OS-return tail.
+  CHECK(WaitForSingleObject(blocking_pool.workers[0].thread,2000)==WAIT_OBJECT_0);
+  CHECK(WaitForSingleObject(blocking_driver.workers[0].thread,2000)==WAIT_OBJECT_0);
+#else
+  alarm(2);
+#endif
+  blocking_finish(deadline);
+#if !defined(_WIN32)
+  alarm(0);
+#endif
+}
 int main(void) {
   CHECK(KU_TASK_FRAME_ABI_VERSION==5u && KU_TASK_CONTROL_ABI_VERSION==2u && KU_TASK_DRIVER_ABI_VERSION==10u);
   blocking_queue_and_generation(); blocking_late_retirement_keeps_original_deadline();
@@ -2050,6 +2197,9 @@ int main(void) {
   blocking_fault_is_reported_after_real_resource_cleanup();
   blocking_read_boundaries_and_failures(); blocking_read_cancel_holds_real_output_until_done();
   blocking_read_done_cancellation_drops_owned_output();
+  blocking_exists_values_and_infrastructure_errors();
+  blocking_exists_real_job_does_not_block_timers_or_hide_queue_errors();
+  blocking_exists_cancel_retires_actual_job_with_original_deadline();
   puts("blocking-write-ledger-ok"); return 0;
 }
 "#;

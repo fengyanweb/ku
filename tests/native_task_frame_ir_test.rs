@@ -1719,6 +1719,90 @@ fn blocking_read_preserves_view_and_initializes_only_ready_string_result() {
 }
 
 #[test]
+fn blocking_exists_preserves_view_and_initializes_only_ready_bool_at_slot_limit() {
+    let mut types = vec![IrType::Int; 64];
+    types[61] = result(IrType::Bool);
+    types[62] = IrType::Bool;
+    types[63] = IrType::Str;
+    let mut fixture = program(
+        types,
+        &[63],
+        vec![
+            state(
+                vec![],
+                TaskTerminator::BlockingExists {
+                    path: SlotId(63),
+                    dst: SlotId(62),
+                    ready: StateId(1),
+                    cleanup: StateId(2),
+                },
+            ),
+            state(
+                vec![
+                    read(63),
+                    read(62),
+                    drop_slot(63),
+                    TaskOp::WrapOk {
+                        dst: SlotId(61),
+                        src: SlotId(62),
+                    },
+                ],
+                complete(61),
+            ),
+            state(
+                vec![read(63), drop_if(63), drop_if(62), drop_if(61)],
+                TaskTerminator::Terminate,
+            ),
+        ],
+    );
+    fixture.functions[0].result = result(IrType::Bool);
+    let plan = accepted(&fixture);
+    assert!(plan.functions[0].hosted && plan.functions[0].slots.contains(&SlotId(63)));
+    for invalid_type in [IrType::Int, IrType::Null, result(IrType::Bool)] {
+        let mut invalid = fixture.clone();
+        invalid.functions[0].slots[62].ty = TaskSlotType::Value {
+            ty: invalid_type,
+            borrowed: false,
+        };
+        rejected(&invalid, "exists destination must be the Copy bool");
+    }
+    let mut invalid = fixture.clone();
+    invalid.functions[0].states[2]
+        .operations
+        .insert(0, read(62));
+    rejected(&invalid, "cleanup never initializes the exists destination");
+    let mut invalid = fixture.clone();
+    invalid.functions[0].parameters.clear();
+    rejected(&invalid, "exists must not read an uninitialized path");
+    let mut invalid = fixture.clone();
+    invalid.functions[0].slots[63].ty = TaskSlotType::Value {
+        ty: IrType::Str,
+        borrowed: true,
+    };
+    rejected(&invalid, "a borrowed path cannot persist in a task frame");
+    let mut invalid = fixture.clone();
+    invalid.functions[0].slots[63].ty = TaskSlotType::Value {
+        ty: IrType::Int,
+        borrowed: false,
+    };
+    rejected(&invalid, "exists requires a string path");
+    let mut invalid = fixture.clone();
+    invalid.functions[0].parameters.push(SlotId(62));
+    rejected(
+        &invalid,
+        "exists cannot overwrite an initialized destination",
+    );
+    let mut invalid = fixture;
+    invalid.functions[0].slots.push(TaskSlot {
+        ty: TaskSlotType::Value {
+            ty: IrType::Int,
+            borrowed: false,
+        },
+    });
+    rejected(&invalid, "exists preserves the 64-slot hard limit");
+}
+
+#[test]
 fn native_task_flat_array_ir_validates_owned_elements_and_parameter_boundary() {
     let fixture = program(
         vec![

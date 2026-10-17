@@ -291,7 +291,9 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     let blocking = function.states.iter().any(|state| {
         matches!(
             state.terminator,
-            TaskTerminator::BlockingWrite { .. } | TaskTerminator::BlockingRead { .. }
+            TaskTerminator::BlockingWrite { .. }
+                | TaskTerminator::BlockingRead { .. }
+                | TaskTerminator::BlockingExists { .. }
         )
     });
     let dynamic_projection = blocking

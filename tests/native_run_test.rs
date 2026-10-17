@@ -3082,6 +3082,7 @@ fn native_async_fs_read_preserves_owned_results_and_relocatable_paths() {
     fs::write(source.join("empty.bin"), b"").unwrap();
     fs::write(source.join("invalid.bin"), [0xff, 0xfe]).unwrap();
     fs::write(source.join("keep.txt"), b"keep").unwrap();
+    fs::write(source.join("pathname.txt"), "数据.bin").unwrap();
     let program = r#"import fs from "std.fs"
 async fn Pathname(): str! { println("path") return ok("数据.bin") }
 async fn Echo(text: str): str! { return ok(text) }
@@ -3102,6 +3103,17 @@ async fn Medium(): null! {
     fs.try_write("medium-copy.bin", text)?
     return ok(null)
 }
+async fn ExistsChecks(): null! {
+    path = fs.read("pathname.txt")?
+    println(fs.exists(path))
+    println(path)
+    println(fs.exists("."))
+    println(fs.exists("missing.bin"))
+    println(fs.exists(""))
+    println(fs.exists("keep.txt@NUL@ignored"))
+    println(fs.exists((await Pathname())?))
+    return ok(null)
+}
 async fn ReadFailure(path: str): null! {
     try {
         fs.read(path)?
@@ -3117,6 +3129,7 @@ async fn ReadFailure(path: str): null! {
 async fn main(): null! {
     (await Small())?;
     (await Medium())?;
+    (await ExistsChecks())?;
     (await ReadFailure("missing.bin"))?;
     (await ReadFailure("invalid.bin"))?;
     (await ReadFailure("keep.txt@NUL@ignored"))?;
@@ -3127,7 +3140,7 @@ async fn main(): null! {
     let entry = source.join("main.ku");
     fs::write(&entry, program).unwrap();
     let expected = format!(
-        "path\n数据.bin\n{text}\n{text}\npath\n{text}\n\nfs\nread_failed\ncleaned\nfs\nread_failed\ncleaned\nfs\nread_failed\ncleaned\n"
+        "path\n数据.bin\n{text}\n{text}\npath\n{text}\n\ntrue\n数据.bin\ntrue\nfalse\ntrue\nfalse\npath\ntrue\nfs\nread_failed\ncleaned\nfs\nread_failed\ncleaned\nfs\nread_failed\ncleaned\n"
     );
     let mut interpreter = Command::new(ku_binary());
     interpreter.current_dir(&build_cwd).arg("run").arg(&entry);

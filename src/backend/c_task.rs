@@ -29,7 +29,9 @@ pub(super) fn uses_blocking_io(tasks: &TaskProgram) -> bool {
         function.states.iter().any(|state| {
             matches!(
                 state.terminator,
-                TaskTerminator::BlockingWrite { .. } | TaskTerminator::BlockingRead { .. }
+                TaskTerminator::BlockingWrite { .. }
+                    | TaskTerminator::BlockingRead { .. }
+                    | TaskTerminator::BlockingExists { .. }
             )
         })
     })
@@ -205,6 +207,7 @@ impl<'a> FrameEmitter<'a> {
                             TaskTerminator::Timer { .. }
                                 | TaskTerminator::BlockingWrite { .. }
                                 | TaskTerminator::BlockingRead { .. }
+                                | TaskTerminator::BlockingExists { .. }
                         ) || state
                             .operations
                             .iter()
@@ -927,6 +930,25 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 } => {
                     out.push_str("  if (cleanup) goto ku_task_terminated;\n");
                     out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t read_status=ku_task_host_blocking_read((KuTaskAdapterHostV1*)clock->host,{}, &{});\n  if (read_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (read_status!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n", cleanup.0, self.place(*path), self.place(*dst)));
+                    self.set_init(out, *dst, true);
+                    out.push_str(&format!(
+                        "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
+                        ready.0
+                    ));
+                }
+                TaskTerminator::BlockingExists {
+                    path,
+                    dst,
+                    ready,
+                    cleanup,
+                } => {
+                    out.push_str("  if (cleanup) goto ku_task_terminated;\n");
+                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  KuResult_bool checked={{0}};\n  uint32_t exists_status=ku_task_host_blocking_exists((KuTaskAdapterHostV1*)clock->host,{}, &checked);\n  if (exists_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (exists_status!=KU_TASK_CONTROL_OK) {{ ku_result_drop_bool(&checked); frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n  if (!checked.ok) {{\n", cleanup.0, self.place(*path)));
+                    self.emit_runtime_error(out, "ku_error_move(&checked.error)")?;
+                    out.push_str(&format!(
+                        "  }}\n  {}=checked.value;\n  ku_result_drop_bool(&checked);\n",
+                        self.place(*dst)
+                    ));
                     self.set_init(out, *dst, true);
                     out.push_str(&format!(
                         "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",

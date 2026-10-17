@@ -1046,12 +1046,14 @@ impl<'a> FunctionLowerer<'a> {
         depth: usize,
     ) -> KuResult<SlotId> {
         if matches!(&object.kind, ExprKind::Variable(module) if module == "fs")
-            && matches!(name, "write" | "try_write" | "read" | "try_read")
+            && matches!(name, "write" | "try_write" | "read" | "try_read" | "exists")
             && self.std_fs
             && self.local("fs").is_none()
             && !self.signatures.contains_key("fs")
         {
-            return if matches!(name, "read" | "try_read") {
+            return if name == "exists" {
+                self.blocking_exists(args, span, depth)
+            } else if matches!(name, "read" | "try_read") {
                 self.blocking_read(args, span, depth)
             } else {
                 self.blocking_write(args, span, depth)
@@ -1334,6 +1336,39 @@ impl<'a> FunctionLowerer<'a> {
         let cleanup = self.cleanup_state()?;
         self.terminate(TaskTerminator::Jump { target: poll })?;
         self.function.states[poll.0].terminator = TaskTerminator::BlockingRead {
+            path,
+            dst,
+            ready,
+            cleanup,
+        };
+        self.current = Some(ready);
+        if !matches!(args[0].kind, ExprKind::Variable(_)) {
+            self.emit(TaskOp::Drop { slot: path })?;
+        }
+        Ok(dst)
+    }
+
+    #[inline(never)]
+    fn blocking_exists(&mut self, args: &[Expr], span: Span, depth: usize) -> KuResult<SlotId> {
+        if self.in_finally_body {
+            return Err(unsupported(
+                "fs.exists inside a native Task finally body",
+                span,
+            ));
+        }
+        if args.len() != 1 {
+            return Err(unsupported("fs.exists with other than one argument", span));
+        }
+        let path = self.expression(&args[0], depth + 1)?;
+        if self.function.slots[path.0].ty != value_slot(IrType::Str) {
+            return Err(unsupported("fs.exists argument other than string", span));
+        }
+        let dst = self.slot(value_slot(IrType::Bool))?;
+        let poll = self.state(TaskTerminator::Terminate)?;
+        let ready = self.state(TaskTerminator::Terminate)?;
+        let cleanup = self.cleanup_state()?;
+        self.terminate(TaskTerminator::Jump { target: poll })?;
+        self.function.states[poll.0].terminator = TaskTerminator::BlockingExists {
             path,
             dst,
             ready,

@@ -552,7 +552,7 @@ finally 链可用。普通算术 fatal 仍跳过用户 finally。实际执行与
 finally body 不允许这个挂起入口，其他既有函数/槽/深度/字面量预算保持。
 
 instance 的私有 token 保留 job generation 和实际副本收费。固定 pool 包含有界 job 表、
-ring 和固定 worker，只有使用文件读写的程序发射并启动它。pool attach 在首个 admission 前，
+ring 和固定 worker，只有使用文件读写或 exists 的程序发射并启动它。pool attach 在首个 admission 前，
 实际 sizeof 加入 fixed_bytes；输入、输出与字符串别名检查也排除这块固定存储。
 worker 不访问原 View/frame，文件操作在 pool/driver 两把锁外执行，通知只按 pool→driver
 顺序。发布 DONE 与最后一次唤醒完成后，consumer 才能清除 token、退回收费及登记。
@@ -569,6 +569,12 @@ blocking_pending 允许尚未退休的停放 job 预付扩容，取消/关闭后
 在 pool 锁内把实际 job 输出收费加入实例费用，再按 pool→driver 顺序核对，避免读取
 快照与 worker 扩容之间发生提前退款。DONE 后结果移交/丢弃，初始化的 Result_str
 接手容量计费。原总预算不增加，read_dir/其他阻塞标准库、netpoll 与完整 M:N仍未接通。
+
+`BlockingExists { path, dst, ready, cleanup }` 同样只读 string 输入，在 ready 才初始化
+`bool` 目标；cleanup 保留原路径责任。与读写共享 pool，内部 `KuResult_bool` 只用于
+区分正常 false 与准入/分配等运行错误。路径转换或 metadata 的原 false 规则保持，
+不将基础设施失败改成 false。worker 只持有路径副本和 Copy bool，没有输出堆对象，
+真实完成与句柄关闭、token 退场后才退款及 ACK。原 ABI、预算和锁顺序不变。
 
 ### 源码 sleep 与当前 Driver timer
 

@@ -42,6 +42,7 @@ typedef struct KuTaskBlockingJobV1 {
   KuString content;
   KuResult_null result;
   KuResult_str read_result;
+  bool exists_value;
 } KuTaskBlockingJobV1;
 typedef struct KuTaskBlockingWorkerV1 {
   KuTaskBlockingPoolV1* pool;
@@ -216,10 +217,15 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     KuString read_value={0};
     KuTaskBlockingOutputV1 allocation={pool,job,{NULL,NULL},{0,0},KU_TASK_DRIVER_OK};
     KuFsAllocatorV1 allocator={&allocation,ku_task_blocking_output_allocate,ku_task_blocking_output_release};
-    bool ok=false;
+    bool ok=false,exists_value=false;
     if (!cancelled) {
-      ok=kind==1u ? ku_fs_read_native_impl(path,&read_value,&error,&allocator)
-          : ku_fs_write_native_impl(path,content,&error);
+      if (kind==3u) {
+        exists_value=ku_fs_exists_native_impl(path);
+        ok=true;
+      } else {
+        ok=kind==1u ? ku_fs_read_native_impl(path,&read_value,&error,&allocator)
+            : ku_fs_write_native_impl(path,content,&error);
+      }
       if (allocation.status!=KU_TASK_DRIVER_OK) {
         if (read_value.ptr) { ku_task_blocking_output_release(&allocation,read_value.ptr); read_value=(KuString){0}; }
         ok=false;
@@ -236,6 +242,7 @@ static void ku_task_blocking_worker(KuTaskBlockingWorkerV1* worker) {
     job->path=NULL; job->content=(KuString){0};
     if (kind==1u) job->read_result=(KuResult_str){ok,read_value,error};
     else job->result=(KuResult_null){ok,0,error};
+    job->exists_value=exists_value;
     job->state=KU_TASK_BLOCKING_DONE; pool->running--;
     if (pool->finished!=UINT64_MAX) pool->finished++;
     /* The consumer takes this same mutex. It cannot clear/reuse the job until
@@ -510,6 +517,7 @@ static uint32_t ku_task_blocking_take(const KuTaskDriverTicketV1* ticket,
         if (job->kind==1u) ku_result_drop_str(&job->read_result);
         else ku_result_drop_null(&job->result);
       } else if (kind==1u) *(KuResult_str*)output=job->read_result;
+      else if (kind==3u) *(KuResult_bool*)output=(KuResult_bool){job->result.ok,job->exists_value,job->result.error};
       else *(KuResult_null*)output=job->result;
       uint64_t generation=job->generation;
       memset(job,0,sizeof(*job)); job->generation=generation;
@@ -533,6 +541,10 @@ static uint32_t ku_task_blocking_read_string(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token, KuResult_str* output) {
   return ku_task_blocking_take(ticket,token,0,1u,output);
 }
+static uint32_t ku_task_blocking_read_bool(const KuTaskDriverTicketV1* ticket,
+    KuTaskBlockingTokenV1* token, KuResult_bool* output) {
+  return ku_task_blocking_take(ticket,token,0,3u,output);
+}
 static uint32_t ku_task_blocking_discard(const KuTaskDriverTicketV1* ticket,
     KuTaskBlockingTokenV1* token) {
   uint32_t sentinel=0; return ku_task_blocking_take(ticket,token,1,2u,&sentinel);
@@ -541,7 +553,7 @@ static uint32_t ku_task_blocking_submit_impl(const KuTaskDriverTicketV1* ticket,
     KuTaskControlV1* control, KuTaskBlockingTokenV1* token,
     KuString path, KuString content, void* context,
     uint32_t (*reconcile)(void*), uint32_t kind, KuResult_null* output) {
-  if (!ticket || !control || !token || token->pool || token->charged_bytes || !output
+  if ((kind!=0u && kind!=1u && kind!=3u) || !ticket || !control || !token || token->pool || token->charged_bytes || !output
       || !context || !reconcile) return KU_TASK_DRIVER_INVALID_ARGUMENT;
   KuError error={0};
   if (!kind && !ku_fs_write_validate(content,&error)) { *output=(KuResult_null){false,0,error}; return KU_TASK_DRIVER_OK; }
@@ -624,7 +636,12 @@ ku_blocking_rejected:
   if (status!=KU_TASK_DRIVER_OK) error=ku_task_blocking_error(
       status==KU_TASK_DRIVER_LIMIT ? "memory_limit" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "out_of_memory" : "blocking_pool_stopped",
       status==KU_TASK_DRIVER_LIMIT ? "blocking input exceeds runtime byte budget" : status==KU_TASK_BLOCKING_OUT_OF_MEMORY ? "blocking input allocation failed" : "blocking pool is closing");
-  *output=(KuResult_null){false,0,error};
+  /* A valid exists call reports invalid native paths as false. Pool,
+   * allocation and accounting failures retain their Task error payload. */
+  if (kind==3u && status==KU_TASK_DRIVER_OK) {
+    ku_error_drop(&error);
+    *output=(KuResult_null){true,0,{0}};
+  } else *output=(KuResult_null){false,0,error};
   return KU_TASK_DRIVER_OK;
 }
 static uint32_t ku_task_blocking_submit(const KuTaskDriverTicketV1* ticket,
@@ -639,6 +656,15 @@ static uint32_t ku_task_blocking_submit_read(const KuTaskDriverTicketV1* ticket,
   KuResult_null submitted={0};
   uint32_t status=ku_task_blocking_submit_impl(ticket,control,token,path,(KuString){0},context,reconcile,1u,&submitted);
   if (status==KU_TASK_DRIVER_OK) *output=(KuResult_str){false,{0},submitted.error};
+  return status;
+}
+static uint32_t ku_task_blocking_submit_exists(const KuTaskDriverTicketV1* ticket,
+    KuTaskControlV1* control, KuTaskBlockingTokenV1* token,
+    KuString path, void* context, uint32_t (*reconcile)(void*), KuResult_bool* output) {
+  if (!output) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  KuResult_null submitted={0};
+  uint32_t status=ku_task_blocking_submit_impl(ticket,control,token,path,(KuString){0},context,reconcile,3u,&submitted);
+  if (status==KU_TASK_DRIVER_OK) *output=(KuResult_bool){submitted.ok,false,submitted.error};
   return status;
 }
 "#;

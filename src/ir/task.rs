@@ -288,6 +288,14 @@ pub enum TaskTerminator {
         ready: StateId,
         cleanup: StateId,
     },
+    /// A path check runs in the same fixed pool and initializes a Copy bool.
+    /// Missing or invalid paths are false; admission failures are runtime exits.
+    BlockingExists {
+        path: SlotId,
+        dst: SlotId,
+        ready: StateId,
+        cleanup: StateId,
+    },
     TryResult {
         src: SlotId,
         ok_value: SlotId,
@@ -681,6 +689,7 @@ fn successors(term: &TaskTerminator) -> [Option<StateId>; 2] {
         | TaskTerminator::Timer { ready, cleanup, .. }
         | TaskTerminator::BlockingWrite { ready, cleanup, .. }
         | TaskTerminator::BlockingRead { ready, cleanup, .. }
+        | TaskTerminator::BlockingExists { ready, cleanup, .. }
         | TaskTerminator::ScopeDrain { ready, cleanup, .. } => [Some(*ready), Some(*cleanup)],
         TaskTerminator::TryResult { ok, err, .. } => [Some(*ok), Some(*err)],
         TaskTerminator::Complete { .. }
@@ -1263,6 +1272,20 @@ fn validate_shape(
                     return Err(invalid("BlockingRead requires an owned string source and string Result destination"));
                 }
             }
+            TaskTerminator::BlockingExists { path, dst, .. } => {
+                has_blocking = true;
+                let (path_ty, path_borrowed) = slot_type(get_slot(*path)?)?;
+                let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                if path_ty != &IrType::Str
+                    || path_borrowed
+                    || destination_borrowed
+                    || destination != &IrType::Bool
+                {
+                    return Err(invalid(
+                        "BlockingExists requires an owned string source and bool destination",
+                    ));
+                }
+            }
             TaskTerminator::Await { task, dst, .. } => {
                 let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
                 if borrowed
@@ -1348,7 +1371,8 @@ fn validate_regions_and_progress(
             TaskTerminator::Await { ready, .. }
             | TaskTerminator::Timer { ready, .. }
             | TaskTerminator::BlockingWrite { ready, .. }
-            | TaskTerminator::BlockingRead { ready, .. } => pending.push(*ready),
+            | TaskTerminator::BlockingRead { ready, .. }
+            | TaskTerminator::BlockingExists { ready, .. } => pending.push(*ready),
             TaskTerminator::ScopeDrain { ready, .. } => {
                 budget.spend()?;
                 pending.push(*ready);
@@ -1384,6 +1408,9 @@ fn validate_regions_and_progress(
             cleanup: target, ..
         }
         | TaskTerminator::BlockingRead {
+            cleanup: target, ..
+        }
+        | TaskTerminator::BlockingExists {
             cleanup: target, ..
         }
         | TaskTerminator::ScopeDrain {
@@ -1487,6 +1514,7 @@ fn validate_regions_and_progress(
                         | TaskTerminator::Timer { .. }
                         | TaskTerminator::BlockingWrite { .. }
                         | TaskTerminator::BlockingRead { .. }
+                        | TaskTerminator::BlockingExists { .. }
                 )
             {
                 budget.spend()?;
@@ -1523,6 +1551,7 @@ fn validate_regions_and_progress(
                         | TaskTerminator::Timer { .. }
                         | TaskTerminator::BlockingWrite { .. }
                         | TaskTerminator::BlockingRead { .. }
+                        | TaskTerminator::BlockingExists { .. }
                 )
             {
                 budget.spend()?;
@@ -1719,7 +1748,8 @@ fn validate_scope_layout(
             TaskTerminator::Await { ready, .. }
             | TaskTerminator::Timer { ready, .. }
             | TaskTerminator::BlockingWrite { ready, .. }
-            | TaskTerminator::BlockingRead { ready, .. } => [Some(ready), None],
+            | TaskTerminator::BlockingRead { ready, .. }
+            | TaskTerminator::BlockingExists { ready, .. } => [Some(ready), None],
             ref term => successors(term),
         };
         for target in next.into_iter().flatten() {
@@ -1894,7 +1924,8 @@ fn validate_scope_exits(
             | TaskTerminator::Await { ready, .. }
             | TaskTerminator::Timer { ready, .. }
             | TaskTerminator::BlockingWrite { ready, .. }
-            | TaskTerminator::BlockingRead { ready, .. } => [Some(ready), None],
+            | TaskTerminator::BlockingRead { ready, .. }
+            | TaskTerminator::BlockingExists { ready, .. } => [Some(ready), None],
             TaskTerminator::Suspend { resume, .. } => [Some(resume), None],
             ref term => successors(term),
         };
@@ -2026,6 +2057,12 @@ fn edge_states(
             ..
         }
         | TaskTerminator::BlockingRead {
+            dst,
+            ready,
+            cleanup,
+            ..
+        }
+        | TaskTerminator::BlockingExists {
             dst,
             ready,
             cleanup,
@@ -2172,6 +2209,12 @@ fn live_states(
                     ready,
                     cleanup,
                     ..
+                }
+                | TaskTerminator::BlockingExists {
+                    dst,
+                    ready,
+                    cleanup,
+                    ..
                 } => (live_in[ready.0] & !bit(dst)) | (live_in[cleanup.0] & !tasks),
                 TaskTerminator::TryResult {
                     ok_value,
@@ -2196,7 +2239,8 @@ fn live_states(
                 TaskTerminator::BlockingWrite { path, content, .. } => {
                     live |= bit(path) | bit(content)
                 }
-                TaskTerminator::BlockingRead { path, .. } => live |= bit(path),
+                TaskTerminator::BlockingRead { path, .. }
+                | TaskTerminator::BlockingExists { path, .. } => live |= bit(path),
                 TaskTerminator::ScopeDrain { scope, .. } => live |= scopes.mask(scope),
                 TaskTerminator::TryResult { src, .. } => live |= bit(src),
                 _ => {}
@@ -2432,6 +2476,7 @@ fn validate_ownership_and_plan(
             | TaskTerminator::Timer { .. }
             | TaskTerminator::BlockingWrite { .. }
             | TaskTerminator::BlockingRead { .. }
+            | TaskTerminator::BlockingExists { .. }
             | TaskTerminator::ScopeDrain { .. } => {
                 if let TaskTerminator::Await { task, dst, .. } = block.terminator {
                     if state.must & bit(task) == 0 {
@@ -2481,10 +2526,19 @@ fn validate_ownership_and_plan(
                         return Err(invalid("BlockingRead overwrites an initialized Result"));
                     }
                 }
+                if let TaskTerminator::BlockingExists { path, dst, .. } = block.terminator {
+                    if state.must & bit(path) == 0 {
+                        return Err(invalid("BlockingExists reads an uninitialized source"));
+                    }
+                    if state.may & bit(dst) != 0 {
+                        return Err(invalid("BlockingExists overwrites an initialized bool"));
+                    }
+                }
                 let timer_argument = match block.terminator {
                     TaskTerminator::Timer { millis, .. } => bit(millis),
                     TaskTerminator::BlockingWrite { path, content, .. } => bit(path) | bit(content),
-                    TaskTerminator::BlockingRead { path, .. } => bit(path),
+                    TaskTerminator::BlockingRead { path, .. }
+                    | TaskTerminator::BlockingExists { path, .. } => bit(path),
                     _ => 0,
                 };
                 let saved = (live_out[id] | timer_argument | if hosted { masks.owned } else { 0 })
@@ -2965,6 +3019,7 @@ fn finally_plan(
             | TaskTerminator::Timer { ready, cleanup, .. }
             | TaskTerminator::BlockingWrite { ready, cleanup, .. }
             | TaskTerminator::BlockingRead { ready, cleanup, .. }
+            | TaskTerminator::BlockingExists { ready, cleanup, .. }
             | TaskTerminator::ScopeDrain { ready, cleanup, .. } => {
                 if stack.last().is_some_and(|target| *target != cleanup)
                     || (stack.is_empty() && entries[cleanup.0])
