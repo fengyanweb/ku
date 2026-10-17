@@ -1239,21 +1239,47 @@ fn main(): null! {
 
     let active_response = read_http_stream(active, Duration::from_secs(3));
     let pending_response = read_http_stream(pending, Duration::from_secs(3));
-    assert_http_status(&active_response, "HTTP/1.1 200 OK");
+    assert!(
+        active_response.starts_with("HTTP/1.1 200 OK"),
+        "active admitted request: {active_response}"
+    );
     assert!(active_response.ends_with("\r\n\r\nok"), "{active_response}");
-    assert_http_status(&pending_response, "HTTP/1.1 200 OK");
+    assert!(
+        pending_response.starts_with("HTTP/1.1 200 OK"),
+        "pending admitted request: {pending_response}"
+    );
     assert!(
         pending_response.ends_with("\r\n\r\nok"),
         "{pending_response}"
     );
     drop(silent);
 
-    let recovered = http_response_or_stop(
-        &mut server,
-        &address,
-        "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
-    assert_http_status(&recovered, "HTTP/1.1 200 OK");
+    // Closing client handles does not acknowledge server-side permit release.
+    // Only the recovery phase may observe transient overload while the already
+    // closed peers retire; both admitted requests above must still be 200.
+    let recovery_deadline = Instant::now() + Duration::from_secs(3);
+    let mut recovered = None;
+    for _ in 0..150 {
+        let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let response = wait_for_http_response(
+            &address,
+            "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            remaining,
+        )
+        .expect("HTTP recovery probe must finish within its original deadline");
+        if response.starts_with("HTTP/1.1 200 OK") {
+            recovered = Some(response);
+            break;
+        }
+        assert_http_status(&response, "HTTP/1.1 503 Service Unavailable");
+        let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+    let recovered = recovered.expect("HTTP did not recover within the original three seconds");
+    assert!(recovered.ends_with("\r\n\r\nok"), "{recovered}");
     let _ = server.take().expect("server should exist").stop();
 }
 
