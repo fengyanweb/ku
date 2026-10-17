@@ -2696,6 +2696,11 @@ impl Interpreter {
         span: Span,
         deadline: Instant,
     ) -> HttpWireResponse {
+        // Queueing spends the same handler deadline. Do not prepare an expired
+        // job or enter its handler/cleanup state after the original deadline.
+        if Instant::now() >= deadline {
+            return status_response(504, "Gateway Timeout");
+        }
         let route = match find_http_route(compiled_router, &request, span) {
             Ok(route) => route,
             Err(_) => return status_response(500, "Internal Server Error"),
@@ -3108,6 +3113,90 @@ mod finally_tests {
         let mut state = HttpHandlerDeadline::new(Instant::now() + Duration::from_secs(10));
         assert!(!state.poll(Instant::now()));
         assert!(!state.timed_out);
+    }
+
+    #[test]
+    fn interpreter_http_expired_job_stops_before_routing_and_preserves_state() {
+        let mut interpreter = Interpreter::new();
+        let span = Span::default();
+        let expired = Instant::now() - Duration::from_millis(1);
+        let request = |method: &str, path: &str| ParsedHttpRequest {
+            method: method.into(),
+            path: path.into(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+        // An invalid router proves the expired path does not even inspect it.
+        assert_eq!(
+            interpreter
+                .execute_http_handler_job(request("GET", "/"), &Value::Null, span, expired)
+                .status,
+            504
+        );
+        assert_eq!(
+            interpreter
+                .execute_http_handler_job(
+                    request("GET", "/"),
+                    &Value::Null,
+                    span,
+                    http_deadline(Duration::from_secs(10)),
+                )
+                .status,
+            500
+        );
+        let captures = marker_env();
+        let route = Value::Object(HashMap::from([
+            ("path".into(), Value::String("/".into())),
+            (
+                "handler".into(),
+                handler(
+                    "try { marker = 1 } finally { marker += 10 }\nreturn {status: 200, headers: {}, body: \"ok\"}",
+                    &captures,
+                ),
+            ),
+        ]));
+        let router = Value::Object(HashMap::from([(
+            "GET".into(),
+            Value::Object(HashMap::from([("/".into(), route)])),
+        )]));
+        for (method, path) in [("GET", "/"), ("GET", "/missing"), ("POST", "/")] {
+            assert_eq!(
+                interpreter
+                    .execute_http_handler_job(request(method, path), &router, span, expired)
+                    .status,
+                504
+            );
+            assert_eq!(marker(&captures), 0);
+            assert!(interpreter.execution_deadline.is_none());
+            assert!(interpreter.termination.is_none());
+            assert!(interpreter.pending_fail.is_none());
+            assert_eq!(interpreter.call_depth, 0);
+            assert!(current_cleanup_context().is_none());
+        }
+        for (method, path, status) in [
+            ("GET", "/missing", 404),
+            ("POST", "/", 405),
+            ("GET", "/", 200),
+        ] {
+            let response = interpreter.execute_http_handler_job(
+                request(method, path),
+                &router,
+                span,
+                http_deadline(Duration::from_secs(10)),
+            );
+            assert_eq!(response.status, status);
+            if status == 200 {
+                assert_eq!(response.body, "ok");
+                assert_eq!(marker(&captures), 11);
+            } else {
+                assert_eq!(marker(&captures), 0);
+            }
+            assert!(interpreter.execution_deadline.is_none());
+            assert!(interpreter.termination.is_none());
+            assert!(interpreter.pending_fail.is_none());
+            assert_eq!(interpreter.call_depth, 0);
+        }
     }
 
     fn http_test_pair() -> (TcpStream, TcpStream) {
