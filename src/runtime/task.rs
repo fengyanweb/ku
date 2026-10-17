@@ -202,10 +202,18 @@ struct BlockingRetirement {
     // Reuse the internal parent state previously retained for cancellation;
     // this neither creates another logical Task owner nor allocates a node.
     state: Option<Arc<TaskState>>,
+    // Only primitive counters live here. Retaining this independent block must
+    // not keep the pool, its channels or another logical Task owner alive.
+    metrics: Arc<BlockingPoolMetrics>,
+    accepted: bool,
 }
 
 impl BlockingRetirement {
-    fn new(state: Option<Arc<TaskState>>, span: Span) -> KuResult<Self> {
+    fn new(
+        state: Option<Arc<TaskState>>,
+        metrics: Arc<BlockingPoolMetrics>,
+        span: Span,
+    ) -> KuResult<Self> {
         if let Some(state) = &state {
             state
                 .pending_blocking
@@ -216,7 +224,30 @@ impl BlockingRetirement {
                     KuError::runtime("internal blocking retirement counter overflow", span)
                 })?;
         }
-        Ok(Self { state })
+        let resident =
+            match metrics
+                .resident
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(1)
+                }) {
+                Ok(previous) => previous + 1,
+                Err(_) => {
+                    if let Some(state) = &state {
+                        state.pending_blocking.fetch_sub(1, Ordering::AcqRel);
+                        state.ready.notify_all();
+                    }
+                    return Err(KuError::runtime(
+                        "internal blocking resident counter overflow",
+                        span,
+                    ));
+                }
+            };
+        metrics.peak_resident.fetch_max(resident, Ordering::Relaxed);
+        Ok(Self {
+            state,
+            metrics,
+            accepted: false,
+        })
     }
 }
 
@@ -224,11 +255,29 @@ impl Drop for BlockingRetirement {
     fn drop(&mut self) {
         // Primitive retirement only, after the actual job's earlier fields.
         // Never enter a user destructor, scheduler help or cancellation here.
+        if self.accepted {
+            self.metrics.finished.fetch_add(1, Ordering::Relaxed);
+        }
+        // This Release publication follows completion and precedes the parent
+        // obligation's notification. A delivered response alone never does it.
+        self.metrics.resident.fetch_sub(1, Ordering::AcqRel);
         if let Some(state) = &self.state {
             state.pending_blocking.fetch_sub(1, Ordering::AcqRel);
             state.ready.notify_all();
         }
     }
+}
+
+#[derive(Default)]
+struct BlockingPoolMetrics {
+    resident: AtomicUsize,
+    peak_resident: AtomicUsize,
+    peak_queued: AtomicUsize,
+    peak_running: AtomicUsize,
+    accepted: AtomicUsize,
+    rejected: AtomicUsize,
+    rejected_queue: AtomicUsize,
+    finished: AtomicUsize,
 }
 
 /// Persist a real cancelled blocking cleanup's smaller deadline before its
@@ -301,7 +350,11 @@ impl<'a> RunningBlockingJob<'a> {
     fn claim(inner: &'a TaskRuntimeInner) -> Self {
         // Publish running before removing queued. A shutdown that observes the
         // queue decrement with Acquire must also observe this earlier increment.
-        inner.running_blocking_jobs.fetch_add(1, Ordering::AcqRel);
+        let running = inner.running_blocking_jobs.fetch_add(1, Ordering::AcqRel) + 1;
+        inner
+            .blocking_metrics
+            .peak_running
+            .fetch_max(running, Ordering::Relaxed);
         Self { inner }
     }
 }
@@ -330,6 +383,7 @@ struct TaskRuntimeInner {
     queued_tasks: AtomicUsize,
     queued_blocking_jobs: AtomicUsize,
     running_blocking_jobs: AtomicUsize,
+    blocking_metrics: Arc<BlockingPoolMetrics>,
     total_submissions: AtomicUsize,
     accepted_submissions: AtomicUsize,
     rejected_task_limit: AtomicUsize,
@@ -847,6 +901,8 @@ impl Drop for TaskOwnerLease {
     }
 }
 
+/// Concurrent fields are separate observations, not an atomic multi-counter
+/// transaction. Blocking accepted/finished totals reconcile after job retirement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskRuntimeSnapshot {
     pub active_tasks: usize,
@@ -863,6 +919,19 @@ pub struct TaskRuntimeSnapshot {
     pub wait_edges: usize,
     pub queued_blocking_jobs: usize,
     pub running_blocking_jobs: usize,
+    /// Live final-retirement responsibilities, including rejected-job cleanup.
+    pub resident_blocking_jobs: usize,
+    pub peak_resident_blocking_jobs: usize,
+    /// Peak of queued_blocking_jobs, including its existing send reservations;
+    /// this is not the physical channel depth and may exceed its capacity.
+    pub peak_queued_blocking_jobs: usize,
+    pub peak_running_blocking_jobs: usize,
+    pub accepted_blocking_jobs: usize,
+    /// Rejected allowed submissions, including stopped/poisoned pool attempts.
+    pub rejected_blocking_jobs: usize,
+    pub rejected_blocking_queue: usize,
+    /// Accepted jobs whose actual captures/response/final guard have retired.
+    pub finished_blocking_jobs: usize,
     pub task_workers: usize,
     pub blocking_workers: usize,
     pub shutdown: bool,
@@ -971,6 +1040,7 @@ impl TaskRuntime {
             queued_tasks: AtomicUsize::new(0),
             queued_blocking_jobs: AtomicUsize::new(0),
             running_blocking_jobs: AtomicUsize::new(0),
+            blocking_metrics: Arc::new(BlockingPoolMetrics::default()),
             total_submissions: AtomicUsize::new(0),
             accepted_submissions: AtomicUsize::new(0),
             rejected_task_limit: AtomicUsize::new(0),
@@ -1296,6 +1366,30 @@ impl TaskRuntime {
             wait_edges: 0,
             queued_blocking_jobs: self.inner.queued_blocking_jobs.load(Ordering::Acquire),
             running_blocking_jobs: self.inner.running_blocking_jobs.load(Ordering::Acquire),
+            resident_blocking_jobs: self.inner.blocking_metrics.resident.load(Ordering::Acquire),
+            peak_resident_blocking_jobs: self
+                .inner
+                .blocking_metrics
+                .peak_resident
+                .load(Ordering::Relaxed),
+            peak_queued_blocking_jobs: self
+                .inner
+                .blocking_metrics
+                .peak_queued
+                .load(Ordering::Relaxed),
+            peak_running_blocking_jobs: self
+                .inner
+                .blocking_metrics
+                .peak_running
+                .load(Ordering::Relaxed),
+            accepted_blocking_jobs: self.inner.blocking_metrics.accepted.load(Ordering::Relaxed),
+            rejected_blocking_jobs: self.inner.blocking_metrics.rejected.load(Ordering::Relaxed),
+            rejected_blocking_queue: self
+                .inner
+                .blocking_metrics
+                .rejected_queue
+                .load(Ordering::Relaxed),
+            finished_blocking_jobs: self.inner.blocking_metrics.finished.load(Ordering::Relaxed),
             task_workers: self.inner.task_workers.load(Ordering::Acquire),
             blocking_workers: self.inner.blocking_workers.load(Ordering::Acquire),
             shutdown: self.inner.shutdown.load(Ordering::Acquire)
@@ -1750,12 +1844,20 @@ impl TaskRuntime {
     {
         ensure_task_operations_allowed(_span)?;
         if self.inner.closing.load(Ordering::Acquire) {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(task_error(
                 "blocking_pool_stopped",
                 "blocking pool is closing",
             ));
         }
         if self.inner.blocking_workers.load(Ordering::Acquire) == 0 {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(task_error(
                 "blocking_pool_stopped",
                 "blocking pool has no available workers",
@@ -1764,12 +1866,18 @@ impl TaskRuntime {
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         // Share the task admission lock with shutdown's registry snapshot. A
         // shutdown cannot observe an empty pool just before this submission.
-        let admission = self
-            .inner
-            .states
-            .lock()
-            .map_err(|_| KuError::runtime("async task registry is poisoned", _span))?;
+        let admission = self.inner.states.lock().map_err(|_| {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
+            KuError::runtime("async task registry is poisoned", _span)
+        })?;
         if self.inner.closing.load(Ordering::Acquire) {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(task_error(
                 "blocking_pool_stopped",
                 "blocking pool is closing",
@@ -1777,16 +1885,62 @@ impl TaskRuntime {
         }
         let retirement = BlockingRetirement::new(
             CURRENT_TASK_STATE.with(|current| current.borrow().as_ref().and_then(Weak::upgrade)),
+            Arc::clone(&self.inner.blocking_metrics),
             _span,
-        )?;
-        self.inner
+        )
+        .inspect_err(|_| {
+            self.inner
+                .blocking_metrics
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
+        })?;
+        let queued = self
+            .inner
             .queued_blocking_jobs
-            .fetch_add(1, Ordering::AcqRel);
-        let submitted = self.inner.blocking_tx.try_send(BlockingJob {
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        self.inner
+            .blocking_metrics
+            .peak_queued
+            .fetch_max(queued, Ordering::Relaxed);
+        let mut job = BlockingJob {
             run: Box::new(run),
             response: response_tx,
             retirement,
-        });
+        };
+        // A successful send can be consumed and retired before try_send returns.
+        // Mark the movable final guard first, then clear it on either rejection.
+        job.retirement.accepted = true;
+        let mut submitted = self.inner.blocking_tx.try_send(job);
+        match &mut submitted {
+            Ok(()) => {
+                self.inner
+                    .blocking_metrics
+                    .accepted
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Full(job)) => {
+                job.retirement.accepted = false;
+                self.inner
+                    .blocking_metrics
+                    .rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .blocking_metrics
+                    .rejected_queue
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(job)) => {
+                job.retirement.accepted = false;
+                self.inner
+                    .blocking_metrics
+                    .rejected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // No rejected captures/response fields are destroyed under admission.
+        // Snapshot fields are independent observations; only quiescent totals
+        // reconcile accepted and finished, never response delivery or Task state.
         drop(admission);
         match submitted {
             Ok(()) => loop {

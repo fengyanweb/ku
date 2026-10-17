@@ -816,10 +816,17 @@ fn running_late_result_case(foreign: bool, panics: bool) {
     run_ready.recv_timeout(WAIT).unwrap();
     assert_eq!(state.pending_blocking.load(Ordering::Acquire), 1);
     assert_eq!(pool.snapshot().unwrap().running_blocking_jobs, 1);
+    let live_metrics = pool.snapshot().unwrap();
+    assert_eq!(live_metrics.resident_blocking_jobs, 1);
+    assert_eq!(live_metrics.accepted_blocking_jobs, 1);
+    assert_eq!(live_metrics.finished_blocking_jobs, 0);
     if foreign {
         let own = parent_runtime.snapshot().unwrap();
         assert_eq!(own.queued_blocking_jobs, 0);
         assert_eq!(own.running_blocking_jobs, 0);
+        assert_eq!(own.resident_blocking_jobs, 0);
+        assert_eq!(own.accepted_blocking_jobs, 0);
+        assert_eq!(own.finished_blocking_jobs, 0);
         assert_eq!(pool.snapshot().unwrap().active_tasks, 0);
     }
     parent.release_scope_owner(original);
@@ -832,6 +839,8 @@ fn running_late_result_case(foreign: bool, panics: bool) {
     );
     assert_eq!(state.pending_blocking.load(Ordering::Acquire), 1);
     assert_eq!(parent_runtime.snapshot().unwrap().active_tasks, 0);
+    assert_eq!(pool.snapshot().unwrap().resident_blocking_jobs, 1);
+    assert_eq!(pool.snapshot().unwrap().finished_blocking_jobs, 0);
     run_release.release();
     let first = entered_rx.recv_timeout(WAIT).unwrap();
     assert_eq!(first.pending, 1);
@@ -847,6 +856,8 @@ fn running_late_result_case(foreign: bool, panics: bool) {
     assert_eq!(tail.cleanup, Some(expected));
     assert!(tail.execution.is_none());
     assert!(until(|| state.pending_blocking.load(Ordering::Acquire) == 0));
+    assert_eq!(pool.snapshot().unwrap().resident_blocking_jobs, 0);
+    assert_eq!(pool.snapshot().unwrap().finished_blocking_jobs, 1);
     assert_eq!(drops.load(Ordering::Acquire), 2);
     assert!(!ran_child.load(Ordering::Acquire));
     assert_eq!(child_owner.strong_count(), 0);
@@ -944,6 +955,7 @@ fn blocking_rejection_case(parent_runtime: &TaskRuntime, pool: &TaskRuntime, cod
         })
         .unwrap();
     let state = bind(&observer, &parent);
+    let metrics_before = pool.snapshot().unwrap();
     begin.release();
     let first = entered_rx.recv_timeout(WAIT).unwrap();
     assert_eq!(first.pending, 1);
@@ -954,6 +966,28 @@ fn blocking_rejection_case(parent_runtime: &TaskRuntime, pool: &TaskRuntime, cod
     assert_eq!(state.pending_blocking.load(Ordering::Acquire), 1);
     assert_eq!(drops.load(Ordering::Acquire), 0);
     assert!(!ran.load(Ordering::Acquire));
+    let rejecting = pool.snapshot().unwrap();
+    assert_eq!(
+        rejecting.resident_blocking_jobs,
+        metrics_before.resident_blocking_jobs + 1
+    );
+    assert_eq!(
+        rejecting.accepted_blocking_jobs,
+        metrics_before.accepted_blocking_jobs
+    );
+    assert_eq!(
+        rejecting.finished_blocking_jobs,
+        metrics_before.finished_blocking_jobs
+    );
+    assert_eq!(
+        rejecting.rejected_blocking_jobs,
+        metrics_before.rejected_blocking_jobs + 1
+    );
+    assert_eq!(
+        rejecting.rejected_blocking_queue,
+        metrics_before.rejected_blocking_queue + usize::from(code == "queue_full")
+    );
+    assert!(rejecting.peak_resident_blocking_jobs >= rejecting.resident_blocking_jobs);
     capture_release.release();
     let tail = entered_rx.recv_timeout(WAIT).unwrap();
     assert_eq!(tail.pending, 1);
@@ -967,6 +1001,19 @@ fn blocking_rejection_case(parent_runtime: &TaskRuntime, pool: &TaskRuntime, cod
     );
     assert_eq!(drops.load(Ordering::Acquire), 2);
     assert!(!ran.load(Ordering::Acquire));
+    let retired = pool.snapshot().unwrap();
+    assert_eq!(
+        retired.resident_blocking_jobs,
+        metrics_before.resident_blocking_jobs
+    );
+    assert_eq!(
+        retired.accepted_blocking_jobs,
+        metrics_before.accepted_blocking_jobs
+    );
+    assert_eq!(
+        retired.finished_blocking_jobs,
+        metrics_before.finished_blocking_jobs
+    );
     assert_eq!(Arc::strong_count(&parent.owner), 1);
     drop(parent);
     assert!(state.owner_cleanup_done.load(Ordering::Acquire));
@@ -1037,10 +1084,20 @@ fn queued_cancellation_keeps_count_through_capture_tail_and_native_worker_exit()
             state.pending_blocking.load(Ordering::Acquire) == 1
                 && pool.inner.queued_blocking_jobs.load(Ordering::Acquire) == 1
         }));
+        let queued_metrics = pool.snapshot().unwrap();
+        assert_eq!(queued_metrics.accepted_blocking_jobs, 2);
+        assert_eq!(queued_metrics.finished_blocking_jobs, 0);
+        assert_eq!(queued_metrics.resident_blocking_jobs, 2);
+        assert_eq!(queued_metrics.peak_resident_blocking_jobs, 2);
+        assert!(queued_metrics.peak_queued_blocking_jobs >= 1);
+        assert_eq!(queued_metrics.peak_running_blocking_jobs, 1);
         parent.release_scope_owner(original);
         drop(parent);
         assert!(until(|| parent_finished(&state)));
         assert_eq!(state.pending_blocking.load(Ordering::Acquire), 1);
+        let parent_retired = pool.snapshot().unwrap();
+        assert_eq!(parent_retired.resident_blocking_jobs, 2);
+        assert_eq!(parent_retired.finished_blocking_jobs, 0);
         worker_release.release();
         assert_eq!(occupier.join().unwrap().unwrap(), Value::Int(1));
         let first = entered_rx.recv_timeout(WAIT).unwrap();
@@ -1050,6 +1107,9 @@ fn queued_cancellation_keeps_count_through_capture_tail_and_native_worker_exit()
         assert!(first.execution.is_none());
         assert_eq!(drops.load(Ordering::Acquire), 0);
         assert_eq!(state.pending_blocking.load(Ordering::Acquire), 1);
+        let capture_held = pool.snapshot().unwrap();
+        assert_eq!(capture_held.resident_blocking_jobs, 1);
+        assert_eq!(capture_held.finished_blocking_jobs, 1);
         capture_release.release();
         let tail = entered_rx.recv_timeout(WAIT).unwrap();
         assert_eq!(tail.pending, 1);
@@ -1062,6 +1122,10 @@ fn queued_cancellation_keeps_count_through_capture_tail_and_native_worker_exit()
         assert_eq!(drops.load(Ordering::Acquire), 2);
         assert!(!ran.load(Ordering::Acquire));
         assert_eq!(state.cancellation(), Some(expected));
+        let retired_metrics = pool.snapshot().unwrap();
+        assert_eq!(retired_metrics.resident_blocking_jobs, 0);
+        assert_eq!(retired_metrics.accepted_blocking_jobs, 2);
+        assert_eq!(retired_metrics.finished_blocking_jobs, 2);
         if panics {
             // Preserve the existing uncaught cancellation-capture panic. The
             // unique real receiver is gone when this physical thread exits;
@@ -1347,5 +1411,105 @@ fn actual_blocking_body_and_capture_panics_retire_before_healthy_followup() {
         assert_eq!(snapshot.queued_blocking_jobs, 0);
         assert_eq!(snapshot.running_blocking_jobs, 0);
         assert_eq!(snapshot.finished_tasks, 2);
+        assert_eq!(snapshot.resident_blocking_jobs, 0);
+        assert_eq!(snapshot.accepted_blocking_jobs, 2);
+        assert_eq!(snapshot.finished_blocking_jobs, 2);
+        assert_eq!(snapshot.rejected_blocking_jobs, 0);
+        assert_eq!(snapshot.rejected_blocking_queue, 0);
+        assert_eq!(snapshot.peak_running_blocking_jobs, 1);
     }
+}
+
+#[test]
+fn blocking_metrics_reconcile_fast_consumers_and_stopped_rejections() {
+    let runtime = TaskRuntime::with_limits(0, 0, 2, 16, 0);
+    let mut callers = Vec::new();
+    let (done_tx, done_rx) = mpsc::sync_channel(8);
+    for producer in 0..8 {
+        let pool = runtime.clone();
+        let done = done_tx.clone();
+        callers.push(thread::spawn(move || {
+            for index in 0..32 {
+                let expected = producer * 32 + index;
+                assert_eq!(
+                    pool.run_blocking(move || Ok(Value::Int(expected)), Span::default())
+                        .unwrap(),
+                    Value::Int(expected)
+                );
+            }
+            done.send(()).unwrap();
+        }));
+    }
+    drop(done_tx);
+    for _ in 0..8 {
+        done_rx
+            .recv_timeout(WAIT)
+            .expect("fast blocking caller completed");
+    }
+    for caller in callers {
+        caller.join().unwrap();
+    }
+    assert!(until(|| {
+        let snapshot = runtime.snapshot().unwrap();
+        snapshot.resident_blocking_jobs == 0
+            && snapshot.queued_blocking_jobs == 0
+            && snapshot.running_blocking_jobs == 0
+    }));
+    let finished = runtime.snapshot().unwrap();
+    assert_eq!(finished.accepted_blocking_jobs, 256);
+    assert_eq!(finished.finished_blocking_jobs, 256);
+    assert_eq!(finished.rejected_blocking_jobs, 0);
+    assert_eq!(finished.rejected_blocking_queue, 0);
+    // Eight callers can begin their next jobs after delivery while the two
+    // workers still retire their previous jobs' final fields.
+    assert!((1..=10).contains(&finished.peak_resident_blocking_jobs));
+    assert!((1..=8).contains(&finished.peak_queued_blocking_jobs));
+    assert!((1..=2).contains(&finished.peak_running_blocking_jobs));
+    assert_eq!(finished.active_tasks, 0);
+    assert_eq!(finished.finished_tasks, 0);
+    runtime.cancel_all_and_wait(WAIT).unwrap();
+    assert_eq!(
+        error_code(
+            &runtime
+                .run_blocking(|| panic!("closed pool ran callback"), Span::default())
+                .unwrap()
+        ),
+        Some("blocking_pool_stopped")
+    );
+    let closed = runtime.snapshot().unwrap();
+    assert_eq!(closed.rejected_blocking_jobs, 1);
+    assert_eq!(closed.rejected_blocking_queue, 0);
+    assert_eq!(closed.resident_blocking_jobs, 0);
+    assert_eq!(closed.accepted_blocking_jobs, 256);
+    assert_eq!(closed.finished_blocking_jobs, 256);
+    assert_eq!(
+        closed.peak_resident_blocking_jobs,
+        finished.peak_resident_blocking_jobs
+    );
+    assert_eq!(
+        closed.peak_queued_blocking_jobs,
+        finished.peak_queued_blocking_jobs
+    );
+    assert_eq!(
+        closed.peak_running_blocking_jobs,
+        finished.peak_running_blocking_jobs
+    );
+
+    let empty = TaskRuntime::with_limits(0, 0, 0, 0, 0);
+    assert_eq!(
+        error_code(
+            &empty
+                .run_blocking(|| panic!("empty pool ran callback"), Span::default())
+                .unwrap()
+        ),
+        Some("blocking_pool_stopped")
+    );
+    let stopped = empty.snapshot().unwrap();
+    assert_eq!(stopped.rejected_blocking_jobs, 1);
+    assert_eq!(stopped.resident_blocking_jobs, 0);
+    assert_eq!(stopped.accepted_blocking_jobs, 0);
+    assert_eq!(stopped.finished_blocking_jobs, 0);
+    assert_eq!(stopped.peak_resident_blocking_jobs, 0);
+    assert_eq!(stopped.peak_queued_blocking_jobs, 0);
+    assert_eq!(stopped.peak_running_blocking_jobs, 0);
 }
