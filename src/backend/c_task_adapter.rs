@@ -180,10 +180,12 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     }
 
     let id = function.id.0.to_string();
-    let blocking = function
-        .states
-        .iter()
-        .any(|state| matches!(state.terminator, TaskTerminator::BlockingWrite { .. }));
+    let blocking = function.states.iter().any(|state| {
+        matches!(
+            state.terminator,
+            TaskTerminator::BlockingWrite { .. } | TaskTerminator::BlockingRead { .. }
+        )
+    });
     let dynamic_projection = blocking
         || function.states.iter().any(|state| {
             state
@@ -406,6 +408,7 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         .replace("@BLOCKING_CLEANUP@", if blocking { BLOCKING_CLEANUP } else { "" })
         .replace("@RECONCILE_HELPER@", if dynamic_projection { RECONCILE_HELPER } else { "" })
         .replace("@RECONCILE_FIELDS@", &reconcile_fields)
+        .replace("@RECONCILE_CALL@", if blocking { "ku_task_blocking_reconcile_charge(&instance->ticket,&instance->blocking,sizeof(*instance),bytes)" } else { "ku_task_driver_reconcile_charge(&instance->ticket,sizeof(*instance),bytes)" })
         .replace("@ALLOCATION_HOST@", if dynamic_projection { "sizeof(KuTaskAdapterHostV1),KU_TASK_ALLOCATION_HOST_ABI_VERSION,instance,ku_task_@ID@_reconcile_charge" } else { "0,0,NULL,NULL" })
         .replace("@RECONCILE_RETURN@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;" } else { "" })
         .replace("@RECONCILE_DRAIN@", if dynamic_projection { "if (ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK) return KU_TASK_DRIVER_INTERNAL;" } else { "" })
@@ -686,7 +689,7 @@ static uint32_t ku_task_@ID@_reconcile_charge(void* raw) {
   size_t bytes=0;
   uint32_t status=KU_TASK_DRIVER_OK;
 @RECONCILE_FIELDS@
-  return ku_task_driver_reconcile_charge(&instance->ticket,sizeof(*instance),bytes);
+  return @RECONCILE_CALL@;
 }
 "#;
 
@@ -1172,9 +1175,7 @@ static uint32_t ku_task_@ID@_start_hosted(const KuTaskAdapterHostV1* host@PARAM_
 // deadline. It does not postpone finally/Value cleanup or renew that deadline.
 const BLOCKING_CLEANUP: &str = r#"
   if (instance->blocking.pool) {
-    KuResult_null discarded={0};
-    uint32_t retired=ku_task_blocking_read(&instance->ticket,&instance->blocking,1,&discarded);
-    ku_result_drop_null(&discarded);
+    uint32_t retired=ku_task_blocking_discard(&instance->ticket,&instance->blocking);
     if (retired==KU_TASK_DRIVER_PENDING) return KU_TASK_CONTROL_PENDING;
     if (retired!=KU_TASK_DRIVER_OK
         || ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK)

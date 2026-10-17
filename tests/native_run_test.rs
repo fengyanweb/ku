@@ -3059,6 +3059,166 @@ async fn main(): null! {
 }
 
 #[test]
+fn native_async_fs_read_preserves_owned_results_and_relocatable_paths() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-fs-read-relocatable"));
+    let original = cleanup.0.join("original-tree");
+    let source = original.join("source");
+    let bin = original.join("bin");
+    let build_cwd = cleanup.0.join("build-cwd");
+    let launch_cwd = cleanup.0.join("launch-cwd");
+    for directory in [&source, &bin, &build_cwd, &launch_cwd] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let text = "中文🙂\0tail";
+    let medium = "多段🙂\0".repeat(4096);
+    fs::write(source.join("数据.bin"), text.as_bytes()).unwrap();
+    fs::write(source.join("medium.bin"), medium.as_bytes()).unwrap();
+    fs::write(source.join("empty.bin"), b"").unwrap();
+    fs::write(source.join("invalid.bin"), [0xff, 0xfe]).unwrap();
+    fs::write(source.join("keep.txt"), b"keep").unwrap();
+    let program = r#"import fs from "std.fs"
+async fn Pathname(): str! { println("path") return ok("数据.bin") }
+async fn Echo(text: str): str! { return ok(text) }
+async fn Small(): null! {
+    path = (await Pathname())?
+    text = fs.read(path)?
+    fs.write("roundtrip.bin", text)?
+    println(path)
+    println(text)
+    println(text)
+    echoed = (await Echo(fs.try_read((await Pathname())?)?))?
+    println(echoed)
+    println(fs.read("empty.bin")?)
+    return ok(null)
+}
+async fn Medium(): null! {
+    text = fs.try_read("medium.bin")?
+    fs.try_write("medium-copy.bin", text)?
+    return ok(null)
+}
+async fn ReadFailure(path: str): null! {
+    try {
+        fs.read(path)?
+        fail "read should fail"
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+    } finally {
+        println("cleaned")
+    }
+    return ok(null)
+}
+async fn main(): null! {
+    (await Small())?;
+    (await Medium())?;
+    (await ReadFailure("missing.bin"))?;
+    (await ReadFailure("invalid.bin"))?;
+    (await ReadFailure("keep.txt@NUL@ignored"))?;
+    return ok(null)
+}
+"#
+    .replace("@NUL@", "\0");
+    let entry = source.join("main.ku");
+    fs::write(&entry, program).unwrap();
+    let expected = format!(
+        "path\n数据.bin\n{text}\n{text}\npath\n{text}\n\nfs\nread_failed\ncleaned\nfs\nread_failed\ncleaned\nfs\nread_failed\ncleaned\n"
+    );
+    let mut interpreter = Command::new(ku_binary());
+    interpreter.current_dir(&build_cwd).arg("run").arg(&entry);
+    let interpreted = run_bounded(&mut interpreter, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded async fs read interpreter comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    assert_eq!(
+        fs::read(source.join("roundtrip.bin")).unwrap(),
+        text.as_bytes()
+    );
+    assert_eq!(
+        fs::read(source.join("medium-copy.bin")).unwrap(),
+        medium.as_bytes()
+    );
+    for file in ["roundtrip.bin", "medium-copy.bin"] {
+        fs::remove_file(source.join(file)).unwrap();
+    }
+    let executable = bin.join(exe_name("asyncfsread"));
+    let mut build = Command::new(ku_binary());
+    build
+        .current_dir(&build_cwd)
+        .args(["build", "--backend", "c"])
+        .arg(&entry)
+        .arg("-o")
+        .arg(&executable);
+    let built = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+        .expect("bounded native async fs read build");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let generated = fs::read_to_string(native_generated_c(&source, "asyncfsread")).unwrap();
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    assert!(!generated.contains(original.to_string_lossy().as_ref()));
+    fs::remove_file(&entry).unwrap();
+    fs::remove_dir_all(source.join(".ku")).unwrap();
+    let relocated = cleanup.0.join("relocated-tree");
+    fs::rename(original, &relocated).unwrap();
+    let mut run = Command::new(relocated.join("bin").join(exe_name("asyncfsread")));
+    run.current_dir(&launch_cwd);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded relocated native async fs read");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    let data = relocated.join("source");
+    assert_eq!(
+        fs::read(data.join("roundtrip.bin")).unwrap(),
+        text.as_bytes()
+    );
+    assert_eq!(
+        fs::read(data.join("medium-copy.bin")).unwrap(),
+        medium.as_bytes()
+    );
+    assert_eq!(fs::read(data.join("keep.txt")).unwrap(), b"keep");
+    for directory in [&launch_cwd, &relocated.join("bin")] {
+        assert!(!directory.join("roundtrip.bin").exists());
+        assert!(!directory.join("medium-copy.bin").exists());
+    }
+}
+#[test]
 fn native_async_callable_parameters_preserve_exact_targets_and_cross_await_values() {
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {

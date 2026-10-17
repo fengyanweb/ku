@@ -368,8 +368,9 @@ fn generate_c_source_with_frames_bounded(
     }
     validate_layouts(program)?;
     let mut fs_usage = program_fs_usage(program);
-    if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_write(tasks)) {
+    if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_io(tasks)) {
         fs_usage.write = true;
+        fs_usage.read = true;
     }
     if fs_usage.any() {
         if let NativeFsBase::Unavailable(reason) = &options.fs_base {
@@ -627,7 +628,7 @@ fn generate_c_source_with_frames_bounded(
     emit_kuvalue_array_wrappers(&mut out, program)?;
     emit_kuvalue_typed_array_equality_helpers(&mut out, program)?;
     emit_fs_runtime(&mut out, fs_usage, &options.fs_base);
-    if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_write(tasks)) {
+    if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_io(tasks)) {
         out.push_str(
             if matches!(options.fs_base, NativeFsBase::ExecutableRelative(_)) {
                 "static void ku_fs_prepare_blocking_base(void) { (void)ku_fs_init_base(); }\n"
@@ -6881,21 +6882,26 @@ static KuFsNativeChar* ku_fs_native_path_with_allocator(KuString path, KuError* 
 
     if usage.read || usage.try_read {
         out.push_str(
-            r#"static bool ku_fs_read_impl(KuString path, KuString* value, KuError* error) {
+            r#"static bool ku_fs_read_native_impl(const KuFsNativeChar*, KuString*, KuError*, KuFsAllocatorV1*);
+static bool ku_fs_read_impl(KuString path, KuString* value, KuError* error) {
   if (value) *value = (KuString){0};
   if (error) *error = (KuError){0};
   KuFsNativeChar* native = ku_fs_native_path(path, error, "read_failed", "failed to read: invalid path");
   if (!native) return false;
+  bool ok=ku_fs_read_native_impl(native,value,error,NULL);
+  free(native); return ok;
+}
+
+static bool ku_fs_read_native_impl(const KuFsNativeChar* native, KuString* value, KuError* error, KuFsAllocatorV1* allocator) {
 #if defined(_WIN32)
   FILE* file = _wfopen(native, L"rb");
 #else
   FILE* file = fopen(native, "rb");
 #endif
-  free(native);
   if (!file) { ku_fs_set_error(error, "read_failed", "failed to read file"); return false; }
 
   size_t capacity = 4096;
-  uint8_t* data = (uint8_t*)malloc(capacity);
+  uint8_t* data = (uint8_t*)ku_fs_allocate(allocator,capacity);
   if (!data) {
     (void)fclose(file);
     ku_fs_set_error(error, "read_failed", "failed to read: out of memory");
@@ -6923,7 +6929,11 @@ static KuFsNativeChar* ku_fs_native_path_with_allocator(KuString path, KuError* 
         failed = true;
         break;
       }
-      uint8_t* grown = (uint8_t*)realloc(data, next);
+      uint8_t* grown;
+      if (allocator) {
+        grown=(uint8_t*)ku_fs_allocate(allocator,next);
+        if (grown) { memcpy(grown,data,len); ku_fs_release(allocator,data); }
+      } else grown=(uint8_t*)realloc(data,next);
       if (!grown) {
         ku_fs_set_error(error, "read_failed", "failed to read: out of memory");
         failed = true;
@@ -6952,11 +6962,11 @@ static KuFsNativeChar* ku_fs_native_path_with_allocator(KuString path, KuError* 
     failed = true;
   }
   if (failed) {
-    free(data);
+    ku_fs_release(allocator,data);
     return false;
   }
   if (value) *value = (KuString){ data, len, capacity, KU_STRING_OWNED };
-  else free(data);
+  else ku_fs_release(allocator,data);
   return true;
 }
 

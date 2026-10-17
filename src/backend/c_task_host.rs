@@ -29,7 +29,7 @@ pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
 pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
     out.check()?;
     out.push_str(HOST_ABI);
-    if super::super::task::uses_blocking_write(tasks) {
+    if super::super::task::uses_blocking_io(tasks) {
         out.push_str(BLOCKING_HOST);
     }
     for function in &tasks.functions {
@@ -312,6 +312,21 @@ static uint32_t ku_task_host_blocking_write(KuTaskAdapterHostV1* host,
   if (status==KU_TASK_DRIVER_OK
       && host->reconcile_charge(host->allocation_context)!=KU_TASK_DRIVER_OK)
     return KU_TASK_CONTROL_INVALID_STATE;
+  return status==KU_TASK_DRIVER_PENDING ? KU_TASK_CONTROL_PENDING
+      : status==KU_TASK_DRIVER_OK ? KU_TASK_CONTROL_OK : KU_TASK_CONTROL_INVALID_STATE;
+}
+static uint32_t ku_task_host_blocking_read(KuTaskAdapterHostV1* host,
+    KuString path, KuResult_str* output) {
+  if (!host || !host->ticket || !host->control || !host->blocking || !output
+      || host->allocation_host_bytes!=sizeof(*host)
+      || host->allocation_host_abi!=KU_TASK_ALLOCATION_HOST_ABI_VERSION
+      || !host->allocation_context || !host->reconcile_charge) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if (ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE) return KU_TASK_CONTROL_PENDING;
+  uint32_t status=host->blocking->pool
+      ? ku_task_blocking_read_string(host->ticket,host->blocking,output)
+      : ku_task_blocking_submit_read(host->ticket,host->control,host->blocking,path,host->allocation_context,host->reconcile_charge,output);
+  /* Reconciliation follows the caller setting its Result initialization bit.
+   * Until then the physical reservation remains conservatively charged. */
   return status==KU_TASK_DRIVER_PENDING ? KU_TASK_CONTROL_PENDING
       : status==KU_TASK_DRIVER_OK ? KU_TASK_CONTROL_OK : KU_TASK_CONTROL_INVALID_STATE;
 }

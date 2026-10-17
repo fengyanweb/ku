@@ -525,7 +525,7 @@ body 首版支持有限 primitive/字符串/Error、Copy 赋值、输出、分�
 finally 链可用。普通算术 fatal 仍跳过用户 finally。实际执行与精确提交CI结果见日志，
 这些能力不代表完整 async、I/O、M:N 或发布验收。
 
-### 文件写入与 Driver ABI 10
+### 文件读写与 Driver ABI 10
 
 `BlockingWrite { path, content, dst, ready, cleanup }` 要求两个已初始化的 string
 槽与空的 `null!` 目标；ready 初始化结果，cleanup 保留两个输入的释放责任，两个 View
@@ -533,7 +533,7 @@ finally 链可用。普通算术 fatal 仍跳过用户 finally。实际执行与
 finally body 不允许这个挂起入口，其他既有函数/槽/深度/字面量预算保持。
 
 instance 的私有 token 保留 job generation 和实际副本收费。固定 pool 包含有界 job 表、
-ring 和固定 worker，只有使用写入的程序发射并启动它。pool attach 在首个 admission 前，
+ring 和固定 worker，只有使用文件读写的程序发射并启动它。pool attach 在首个 admission 前，
 实际 sizeof 加入 fixed_bytes；输入、输出与字符串别名检查也排除这块固定存储。
 worker 不访问原 View/frame，文件操作在 pool/driver 两把锁外执行，通知只按 pool→driver
 顺序。发布 DONE 与最后一次唤醒完成后，consumer 才能清除 token、退回收费及登记。
@@ -541,7 +541,15 @@ worker 不访问原 View/frame，文件操作在 pool/driver 两把锁外执行�
 Driver10 的 slot `blocking_pending` 阻止真实 job 未退时 ACK、disposed 和槽复用；
 父取消与清理 D 到期不抹去它。shutdown 在 driver 锁外关闭 pool，driver destroy 等待
 pool 实际 join/destroy；失败与超时保留真实状态。Frame5/Control2保持，旧生成 C 整体重编译。
-此处只接通 `std.fs.write/try_write`，不等于其他阻塞标准库、netpoll 或完整 M:N。
+`BlockingRead { path, dst, ready, cleanup }` 对应 `std.fs.read/try_read`，只读一个 string
+输入并在 ready 初始化 `str!`。与写入共享 job 表和 worker，不新建一套池。读取结果用
+普通 malloc 的 Owned KuString，不能把带前置分配头的输入副本直接交给 ku_string_drop。
+job 独立持有输出容量费用，worker 不修改 token/frame；真实 ticket、binding 与
+blocking_pending 允许尚未退休的停放 job 预付扩容，取消/关闭后不再接纳新扩容。
+每次分配前计入新旧缓冲同时存在的峰值，增长失败不丢掉已预留的责任。typed reconcile
+在 pool 锁内把实际 job 输出收费加入实例费用，再按 pool→driver 顺序核对，避免读取
+快照与 worker 扩容之间发生提前退款。DONE 后结果移交/丢弃，初始化的 Result_str
+接手容量计费。原总预算不增加，read_dir/其他阻塞标准库、netpoll 与完整 M:N仍未接通。
 
 ### 源码 sleep 与当前 Driver timer
 

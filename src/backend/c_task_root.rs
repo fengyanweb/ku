@@ -8,7 +8,7 @@ use crate::{
 
 pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram, entry: TaskFunctionId) -> KuResult<()> {
     out.check()?;
-    let blocking = super::task::uses_blocking_write(tasks);
+    let blocking = super::task::uses_blocking_io(tasks);
     out.push_str(
         &ROOT_PREFIX
             .replace(

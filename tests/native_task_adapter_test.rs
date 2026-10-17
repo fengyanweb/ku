@@ -1585,6 +1585,7 @@ import fs from "std.fs"
 import time from "std.time"
 async fn Save(path: str, content: str): null! { fs.try_write(path, content)? return ok(null) }
 async fn Tick(): null! { time.sleep(1)? return ok(null) }
+async fn Load(path: str): str! { return fs.try_read(path) }
 async fn main(): null! { return ok(null) }
 "#;
     let mut ast = Parser::new(Lexer::new(source).lex().unwrap())
@@ -1619,6 +1620,13 @@ async fn main(): null! { return ok(null) }
             "static bool ku_fs_write_native_impl(const KuFsNativeChar* native, KuString content, KuError* error) {\n  fixture_io_gate();",
             1,
         )
+        .replacen(
+            "static bool ku_fs_read_native_impl(const KuFsNativeChar* native, KuString* value, KuError* error, KuFsAllocatorV1* allocator) {",
+            "static bool ku_fs_read_native_impl(const KuFsNativeChar* native, KuString* value, KuError* error, KuFsAllocatorV1* allocator) {\n  fixture_io_gate();",
+            1,
+        )
+        .replacen("void* pointer=malloc(bytes);", "void* pointer=fixture_output_malloc(bytes);", 1)
+        .replacen("job->state=KU_TASK_BLOCKING_DONE; pool->running--;", "job->state=KU_TASK_BLOCKING_DONE; pool->running--; fixture_blocking_done(job->kind);", 1)
         .replacen(
             "static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {",
             "static void ku_task_blocking_signal(KuTaskBlockingPoolV1* pool) {\n  if (fixture_pool_signal_failure()) { pool->fault=KU_TASK_DRIVER_INTERNAL; return; }",
@@ -1673,6 +1681,22 @@ static void fixture_original_free(void* pointer) {
 }
 #undef free
 #define free fixture_original_free
+static void fixture_blocking_done(unsigned kind);
+static size_t fixture_fail_output_in=SIZE_MAX, fixture_output_calls;
+static int fixture_gate_output;
+static void* fixture_output_malloc(size_t bytes) {
+  fixture_alloc_lock();
+  fixture_output_calls++;
+  int fail=fixture_fail_output_in==0;
+  if (fixture_fail_output_in!=SIZE_MAX) {
+    if (fail) fixture_fail_output_in=SIZE_MAX; else fixture_fail_output_in--;
+  }
+  int gate=fixture_gate_output && fixture_output_calls==1u;
+  fixture_alloc_unlock();
+  void* pointer=fail ? NULL : fixture_malloc(bytes);
+  if (gate) { CHECK(ku_test_event_set(&fixture_io_entered)); CHECK(ku_test_event_wait(&fixture_io_release,2000)); }
+  return pointer;
+}
 static int fixture_fail_pool_signal;
 static int fixture_pool_signal_failure(void) {
   fixture_alloc_lock(); int fail=fixture_fail_pool_signal; fixture_fail_pool_signal=0;
@@ -1697,6 +1721,12 @@ static KuTaskDriverV1 blocking_driver;
 static KuTaskDriverSlotV1 blocking_slots[4];
 static size_t blocking_ring[4];
 static KuTaskBlockingPoolV1 blocking_pool;
+static KuTaskControlLeaseV1 fixture_read_done_lease;
+static uint64_t fixture_read_done_deadline;
+static void fixture_blocking_done(unsigned kind) {
+  if (kind==1u && fixture_read_done_lease.control)
+    CHECK(ku_task_control_request_cancel(&fixture_read_done_lease,KU_TASK_CONTROL_CANCELLED,fixture_read_done_deadline)==KU_TASK_CONTROL_OK);
+}
 static uint64_t blocking_observation_deadline(void) {
   uint64_t now=ku_task_driver_now_ms(); CHECK(now!=UINT64_MAX); return now+2000u;
 }
@@ -1715,6 +1745,8 @@ static void blocking_setup(size_t capacity,size_t dynamic_budget) {
   memset(&blocking_driver,0,sizeof(blocking_driver)); memset(blocking_slots,0,sizeof(blocking_slots));
   memset(blocking_ring,0,sizeof(blocking_ring)); memset(&blocking_pool,0,sizeof(blocking_pool));
   fixture_gate_io=0; fixture_io_calls=0; fixture_fail_blocking_in=SIZE_MAX; fixture_fail_pool_signal=0;
+  fixture_fail_output_in=SIZE_MAX; fixture_output_calls=0; fixture_gate_output=0;
+  fixture_read_done_lease=(KuTaskControlLeaseV1){0}; fixture_read_done_deadline=0;
   fixture_original_path=NULL; fixture_original_content=NULL;
   fixture_original_path_freed=0; fixture_original_content_freed=0;
   CHECK(ku_test_event_init(&fixture_io_entered)); CHECK(ku_test_event_init(&fixture_io_release));
@@ -1888,6 +1920,114 @@ static void blocking_fault_is_reported_after_real_resource_cleanup(void) {
   CHECK(ku_test_event_destroy(&fixture_io_entered)); CHECK(ku_test_event_destroy(&fixture_io_release));
   CHECK(!fixture_ledger().allocations && !fixture_ledger().bytes && !fixture_ledger().overflow);
 }
+static void blocking_read_file(const char* name,size_t bytes) {
+  FILE* file=fopen(name,"wb"); CHECK(file);
+  uint8_t buffer[4096]; memset(buffer,'a',sizeof(buffer));
+  while (bytes) { size_t part=bytes>sizeof(buffer) ? sizeof(buffer) : bytes; CHECK(fwrite(buffer,1,part,file)==part); bytes-=part; }
+  CHECK(fclose(file)==0);
+}
+static KuTaskValueV1 blocking_read_start(const char* name) {
+  KuString path=ku_string_static((const uint8_t*)name,strlen(name));
+  KuTaskValueV1 task={0};
+  CHECK(ku_task_2_start_value(&blocking_driver,&path,&task)==KU_TASK_DRIVER_OK);
+  CHECK(task.tag==KU_TASK_VALUE_LIVE); return task;
+}
+static void blocking_read_take(KuTaskValueV1* task,size_t bytes,const char* error_code) {
+  CHECK(ku_task_driver_wait_result(&task->ticket,&task->owner.lease,blocking_observation_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  KuTaskAdapterOutcomeV1 output={0}; CHECK(ku_task_value_take(task,NULL,&output)==KU_TASK_CONTROL_OK);
+  CHECK(output.result_kind==4u && output.value.string.ok==(error_code==NULL));
+  if (error_code) {
+    KuString code=output.value.string.error.code;
+    CHECK(code.len==strlen(error_code) && !memcmp(code.ptr,error_code,code.len));
+  } else {
+    KuString value=output.value.string.value;
+    CHECK(value.len==bytes && value.capacity>=bytes && value.storage==KU_STRING_OWNED);
+    for (size_t i=0;i<bytes;i++) CHECK(value.ptr[i]=='a');
+    CHECK(blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_2));
+  }
+  ku_task_outcome_drop(&output);
+}
+static void blocking_read_boundaries_and_failures(void) {
+  // Explicit test-only 3 MB dynamic allowance covers real old+new growth peaks;
+  // the executable root budget formula is unchanged.
+  blocking_setup(2,3u*1000000u+4u*sizeof(KuTaskInstance_2));
+  for (unsigned mode=0;mode<4;mode++) {
+    size_t length=mode==0 ? 0u : mode==1 ? 45000u : mode==2 ? 1000000u : 1000001u;
+    blocking_read_file("read-input.txt",length);
+    KuTaskValueV1 task=blocking_read_start("read-input.txt");
+    blocking_read_take(&task,length,mode==3 ? "file_too_large" : NULL);
+    blocking_drop(&task); blocking_idle();
+    CHECK(!blocking_driver_snapshot().reserved_bytes && !fixture_ledger().bytes);
+  }
+  CHECK(fixture_output_calls>4u);
+  // Driver accounting must track live old+new capacities, not their historical sum.
+  CHECK(blocking_driver_snapshot().peak_reserved_bytes<1600000u);
+  CHECK(remove("read-input.txt")==0); blocking_finish(blocking_observation_deadline());
+  for (size_t fail=0;fail<5;fail++) {
+    blocking_setup(1,3u*1000000u+2u*sizeof(KuTaskInstance_2));
+    blocking_read_file("read-fail.txt",45000u); fixture_fail_output_in=fail;
+    KuTaskValueV1 task=blocking_read_start("read-fail.txt"); blocking_read_take(&task,0,"out_of_memory");
+    blocking_drop(&task); blocking_idle(); CHECK(!fixture_ledger().bytes && !blocking_driver_snapshot().reserved_bytes);
+    CHECK(remove("read-fail.txt")==0); blocking_finish(blocking_observation_deadline());
+  }
+  blocking_setup(1,sizeof(KuTaskInstance_2)+1024u);
+  blocking_read_file("read-limit.txt",1u);
+  KuTaskValueV1 limited=blocking_read_start("read-limit.txt"); blocking_read_take(&limited,0,"memory_limit");
+  CHECK(!fixture_output_calls); blocking_drop(&limited); blocking_idle();
+  CHECK(remove("read-limit.txt")==0); blocking_finish(blocking_observation_deadline());
+}
+static void blocking_read_cancel_holds_real_output_until_done(void) {
+  blocking_setup(1,100000u+2u*sizeof(KuTaskInstance_2));
+  blocking_read_file("read-cancel.txt",45000u); fixture_gate_output=1;
+  KuTaskValueV1 task=blocking_read_start("read-cancel.txt");
+  CHECK(ku_test_event_wait(&fixture_io_entered,2000)); blocking_idle();
+  KuTaskInstance_2* instance=(KuTaskInstance_2*)task.owner.lease.control->context;
+  KuTaskBlockingTokenV1 token=instance->blocking;
+  CHECK(!ku_task_blocking_lock(&blocking_pool));
+  CHECK(blocking_pool.jobs[token.slot].output_charge==4096u);
+  ku_task_blocking_unlock(&blocking_pool);
+  KuTaskControlLeaseV1 late={0}; CHECK(ku_task_control_lease_retain(&task.owner.lease,&late)==KU_TASK_CONTROL_OK);
+  uint64_t deadline=ku_task_driver_now_ms()+30u;
+  KuTaskDriverCleanupReceiptV1 receipt={0};
+  CHECK(ku_task_driver_owner_drop_receipt(&task.ticket,&task.owner,deadline,&receipt)==KU_TASK_DRIVER_OK);
+  task=(KuTaskValueV1){0}; blocking_idle();
+  CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_PENDING);
+  CHECK(blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_2)+token.charged_bytes+4096u);
+  CHECK(ku_task_driver_shutdown(&blocking_driver,deadline)==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
+  CHECK(ku_task_blocking_finish(&blocking_pool,deadline)==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT);
+  CHECK(ku_task_control_cleanup_deadline(late.control)==deadline);
+  CHECK(ku_test_event_set(&fixture_io_release));
+  CHECK(!ku_task_blocking_lock(&blocking_pool));
+  uint64_t observer=blocking_observation_deadline();
+  while (blocking_pool.finished!=1u) CHECK(ku_task_blocking_wait(&blocking_pool,observer)==0);
+  ku_task_blocking_unlock(&blocking_pool); blocking_idle();
+  CHECK(ku_task_driver_cleanup_receipt_read(&receipt)==KU_TASK_DRIVER_CLEANUP_ACK);
+  CHECK(fixture_output_calls==1u); // Cancelled growth is rejected before malloc.
+  CHECK(blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_2));
+  CHECK(ku_task_control_cleanup_deadline(late.control)==deadline);
+  CHECK(ku_task_control_lease_release(&late)==KU_TASK_CONTROL_OK); blocking_idle();
+  CHECK(!ku_task_blocking_lock(&blocking_pool)); observer=blocking_observation_deadline();
+  while (blocking_pool.workers_exited!=blocking_pool.workers_created) CHECK(ku_task_blocking_wait(&blocking_pool,observer)==0);
+  ku_task_blocking_unlock(&blocking_pool);
+  CHECK(remove("read-cancel.txt")==0); blocking_finish(deadline);
+}
+static void blocking_read_done_cancellation_drops_owned_output(void) {
+  blocking_setup(1,100000u+2u*sizeof(KuTaskInstance_2));
+  blocking_read_file("read-done.txt",1u); fixture_gate_output=1;
+  KuTaskValueV1 task=blocking_read_start("read-done.txt");
+  CHECK(ku_test_event_wait(&fixture_io_entered,2000)); blocking_idle();
+  CHECK(ku_task_control_lease_retain(&task.owner.lease,&fixture_read_done_lease)==KU_TASK_CONTROL_OK);
+  fixture_read_done_deadline=blocking_observation_deadline();
+  CHECK(ku_test_event_set(&fixture_io_release));
+  CHECK(ku_task_driver_wait_result(&task.ticket,&task.owner.lease,blocking_observation_deadline())==KU_TASK_DRIVER_WAIT_READY);
+  CHECK(ku_task_control_status(&task.owner.lease)==KU_TASK_CONTROL_CANCELLED);
+  blocking_drop(&task); blocking_idle();
+  CHECK(!blocking_pool_snapshot().resident);
+  CHECK(blocking_driver_snapshot().reserved_bytes==sizeof(KuTaskInstance_2));
+  CHECK(fixture_ledger().bytes==sizeof(KuTaskInstance_2));
+  CHECK(ku_task_control_lease_release(&fixture_read_done_lease)==KU_TASK_CONTROL_OK); blocking_idle();
+  CHECK(remove("read-done.txt")==0); blocking_finish(blocking_observation_deadline());
+}
 static void blocking_rejections_have_no_file_effect(void) {
   for (unsigned mode=0;mode<4;mode++) {
     blocking_setup(1,sizeof(KuTaskInstance_0)+(mode ? 1024u : 0u));
@@ -1908,6 +2048,8 @@ int main(void) {
   blocking_queue_and_generation(); blocking_late_retirement_keeps_original_deadline();
   blocking_rejections_have_no_file_effect(); blocking_close_skips_queued_files();
   blocking_fault_is_reported_after_real_resource_cleanup();
+  blocking_read_boundaries_and_failures(); blocking_read_cancel_holds_real_output_until_done();
+  blocking_read_done_cancellation_drops_owned_output();
   puts("blocking-write-ledger-ok"); return 0;
 }
 "#;

@@ -911,12 +911,16 @@ impl<'a> FunctionLowerer<'a> {
         } = &callee.kind
         {
             if matches!(&object.kind, ExprKind::Variable(module) if module == "fs")
-                && matches!(name.as_str(), "write" | "try_write")
+                && matches!(name.as_str(), "write" | "try_write" | "read" | "try_read")
                 && self.std_fs
                 && self.local("fs").is_none()
                 && !self.signatures.contains_key("fs")
             {
-                return self.blocking_write(args, span, depth);
+                return if matches!(name.as_str(), "read" | "try_read") {
+                    self.blocking_read(args, span, depth)
+                } else {
+                    self.blocking_write(args, span, depth)
+                };
             }
             if matches!(&object.kind, ExprKind::Variable(module) if module == "time")
                 && name == "sleep"
@@ -1106,6 +1110,38 @@ impl<'a> FunctionLowerer<'a> {
             if !matches!(argument.kind, ExprKind::Variable(_)) {
                 self.emit(TaskOp::Drop { slot: source })?;
             }
+        }
+        Ok(dst)
+    }
+
+    fn blocking_read(&mut self, args: &[Expr], span: Span, depth: usize) -> KuResult<SlotId> {
+        if self.in_finally_body {
+            return Err(unsupported(
+                "fs.read inside a native Task finally body",
+                span,
+            ));
+        }
+        if args.len() != 1 {
+            return Err(unsupported("fs.read with other than one argument", span));
+        }
+        let path = self.expression(&args[0], depth + 1)?;
+        if self.function.slots[path.0].ty != value_slot(IrType::Str) {
+            return Err(unsupported("fs.read argument other than string", span));
+        }
+        let dst = self.slot(value_slot(IrType::Result(Box::new(IrType::Str))))?;
+        let poll = self.state(TaskTerminator::Terminate)?;
+        let ready = self.state(TaskTerminator::Terminate)?;
+        let cleanup = self.cleanup_state()?;
+        self.terminate(TaskTerminator::Jump { target: poll })?;
+        self.function.states[poll.0].terminator = TaskTerminator::BlockingRead {
+            path,
+            dst,
+            ready,
+            cleanup,
+        };
+        self.current = Some(ready);
+        if !matches!(args[0].kind, ExprKind::Variable(_)) {
+            self.emit(TaskOp::Drop { slot: path })?;
         }
         Ok(dst)
     }

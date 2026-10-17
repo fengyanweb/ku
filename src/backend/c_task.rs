@@ -24,12 +24,14 @@ use super::{
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_FRAME_SLOTS: usize = 64;
 
-pub(super) fn uses_blocking_write(tasks: &TaskProgram) -> bool {
+pub(super) fn uses_blocking_io(tasks: &TaskProgram) -> bool {
     tasks.functions.iter().any(|function| {
-        function
-            .states
-            .iter()
-            .any(|state| matches!(state.terminator, TaskTerminator::BlockingWrite { .. }))
+        function.states.iter().any(|state| {
+            matches!(
+                state.terminator,
+                TaskTerminator::BlockingWrite { .. } | TaskTerminator::BlockingRead { .. }
+            )
+        })
     })
 }
 
@@ -68,7 +70,7 @@ pub(super) fn emit_frames(
     out.push_str(FRAME_ABI);
     super::task_control::emit_runtime(out)?;
     super::task_driver::emit_runtime(out)?;
-    super::task_blocking::emit(out, uses_blocking_write(tasks))?;
+    super::task_blocking::emit(out, uses_blocking_io(tasks))?;
     super::task_adapter::emit_host(out, tasks)?;
     for function in &tasks.functions {
         out.check()?;
@@ -197,7 +199,9 @@ impl<'a> FrameEmitter<'a> {
                     || function.states.iter().any(|state| {
                         matches!(
                             state.terminator,
-                            TaskTerminator::Timer { .. } | TaskTerminator::BlockingWrite { .. }
+                            TaskTerminator::Timer { .. }
+                                | TaskTerminator::BlockingWrite { .. }
+                                | TaskTerminator::BlockingRead { .. }
                         ) || state
                             .operations
                             .iter()
@@ -905,6 +909,20 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                 } => {
                     out.push_str("  if (cleanup) goto ku_task_terminated;\n");
                     out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t written=ku_task_host_blocking_write((KuTaskAdapterHostV1*)clock->host,{}, {}, &{});\n  if (written==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (written!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",cleanup.0,self.place(*path),self.place(*content),self.place(*dst)));
+                    self.set_init(out, *dst, true);
+                    out.push_str(&format!(
+                        "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
+                        ready.0
+                    ));
+                }
+                TaskTerminator::BlockingRead {
+                    path,
+                    dst,
+                    ready,
+                    cleanup,
+                } => {
+                    out.push_str("  if (cleanup) goto ku_task_terminated;\n");
+                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t read_status=ku_task_host_blocking_read((KuTaskAdapterHostV1*)clock->host,{}, &{});\n  if (read_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (read_status!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n", cleanup.0, self.place(*path), self.place(*dst)));
                     self.set_init(out, *dst, true);
                     out.push_str(&format!(
                         "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",

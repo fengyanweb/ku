@@ -261,6 +261,13 @@ pub enum TaskTerminator {
         ready: StateId,
         cleanup: StateId,
     },
+    /// A read-only path produces an independently owned string Result.
+    BlockingRead {
+        path: SlotId,
+        dst: SlotId,
+        ready: StateId,
+        cleanup: StateId,
+    },
     TryResult {
         src: SlotId,
         ok_value: SlotId,
@@ -632,6 +639,7 @@ fn successors(term: &TaskTerminator) -> [Option<StateId>; 2] {
         TaskTerminator::Await { ready, cleanup, .. }
         | TaskTerminator::Timer { ready, cleanup, .. }
         | TaskTerminator::BlockingWrite { ready, cleanup, .. }
+        | TaskTerminator::BlockingRead { ready, cleanup, .. }
         | TaskTerminator::ScopeDrain { ready, cleanup, .. } => [Some(*ready), Some(*cleanup)],
         TaskTerminator::TryResult { ok, err, .. } => [Some(*ok), Some(*err)],
         TaskTerminator::Complete { .. }
@@ -1145,6 +1153,18 @@ fn validate_shape(
                     ));
                 }
             }
+            TaskTerminator::BlockingRead { path, dst, .. } => {
+                has_blocking = true;
+                let (path_ty, path_borrowed) = slot_type(get_slot(*path)?)?;
+                let (destination, destination_borrowed) = slot_type(get_slot(*dst)?)?;
+                if path_ty != &IrType::Str
+                    || path_borrowed
+                    || destination_borrowed
+                    || destination != &IrType::Result(Box::new(IrType::Str))
+                {
+                    return Err(invalid("BlockingRead requires an owned string source and string Result destination"));
+                }
+            }
             TaskTerminator::Await { task, dst, .. } => {
                 let (destination, borrowed) = slot_type(get_slot(*dst)?)?;
                 if borrowed
@@ -1229,7 +1249,8 @@ fn validate_regions_and_progress(
             TaskTerminator::Suspend { resume, .. } => pending.push(*resume),
             TaskTerminator::Await { ready, .. }
             | TaskTerminator::Timer { ready, .. }
-            | TaskTerminator::BlockingWrite { ready, .. } => pending.push(*ready),
+            | TaskTerminator::BlockingWrite { ready, .. }
+            | TaskTerminator::BlockingRead { ready, .. } => pending.push(*ready),
             TaskTerminator::ScopeDrain { ready, .. } => {
                 budget.spend()?;
                 pending.push(*ready);
@@ -1262,6 +1283,9 @@ fn validate_regions_and_progress(
             cleanup: target, ..
         }
         | TaskTerminator::BlockingWrite {
+            cleanup: target, ..
+        }
+        | TaskTerminator::BlockingRead {
             cleanup: target, ..
         }
         | TaskTerminator::ScopeDrain {
@@ -1364,6 +1388,7 @@ fn validate_regions_and_progress(
                     TaskTerminator::Await { .. }
                         | TaskTerminator::Timer { .. }
                         | TaskTerminator::BlockingWrite { .. }
+                        | TaskTerminator::BlockingRead { .. }
                 )
             {
                 budget.spend()?;
@@ -1399,6 +1424,7 @@ fn validate_regions_and_progress(
                     TaskTerminator::Await { .. }
                         | TaskTerminator::Timer { .. }
                         | TaskTerminator::BlockingWrite { .. }
+                        | TaskTerminator::BlockingRead { .. }
                 )
             {
                 budget.spend()?;
@@ -1590,7 +1616,8 @@ fn validate_scope_layout(
             TaskTerminator::Suspend { resume, .. } => [Some(resume), None],
             TaskTerminator::Await { ready, .. }
             | TaskTerminator::Timer { ready, .. }
-            | TaskTerminator::BlockingWrite { ready, .. } => [Some(ready), None],
+            | TaskTerminator::BlockingWrite { ready, .. }
+            | TaskTerminator::BlockingRead { ready, .. } => [Some(ready), None],
             ref term => successors(term),
         };
         for target in next.into_iter().flatten() {
@@ -1764,7 +1791,8 @@ fn validate_scope_exits(
             TaskTerminator::ScopeDrain { ready, .. }
             | TaskTerminator::Await { ready, .. }
             | TaskTerminator::Timer { ready, .. }
-            | TaskTerminator::BlockingWrite { ready, .. } => [Some(ready), None],
+            | TaskTerminator::BlockingWrite { ready, .. }
+            | TaskTerminator::BlockingRead { ready, .. } => [Some(ready), None],
             TaskTerminator::Suspend { resume, .. } => [Some(resume), None],
             ref term => successors(term),
         };
@@ -1879,6 +1907,12 @@ fn edge_states(
             ..
         }
         | TaskTerminator::BlockingWrite {
+            dst,
+            ready,
+            cleanup,
+            ..
+        }
+        | TaskTerminator::BlockingRead {
             dst,
             ready,
             cleanup,
@@ -2019,6 +2053,12 @@ fn live_states(
                     ready,
                     cleanup,
                     ..
+                }
+                | TaskTerminator::BlockingRead {
+                    dst,
+                    ready,
+                    cleanup,
+                    ..
                 } => (live_in[ready.0] & !bit(dst)) | (live_in[cleanup.0] & !tasks),
                 TaskTerminator::TryResult {
                     ok_value,
@@ -2043,6 +2083,7 @@ fn live_states(
                 TaskTerminator::BlockingWrite { path, content, .. } => {
                     live |= bit(path) | bit(content)
                 }
+                TaskTerminator::BlockingRead { path, .. } => live |= bit(path),
                 TaskTerminator::ScopeDrain { scope, .. } => live |= scopes.mask(scope),
                 TaskTerminator::TryResult { src, .. } => live |= bit(src),
                 _ => {}
@@ -2254,6 +2295,7 @@ fn validate_ownership_and_plan(
             | TaskTerminator::Await { .. }
             | TaskTerminator::Timer { .. }
             | TaskTerminator::BlockingWrite { .. }
+            | TaskTerminator::BlockingRead { .. }
             | TaskTerminator::ScopeDrain { .. } => {
                 if let TaskTerminator::Await { task, dst, .. } = block.terminator {
                     if state.must & bit(task) == 0 {
@@ -2295,9 +2337,18 @@ fn validate_ownership_and_plan(
                         return Err(invalid("BlockingWrite overwrites an initialized Result"));
                     }
                 }
+                if let TaskTerminator::BlockingRead { path, dst, .. } = block.terminator {
+                    if state.must & bit(path) == 0 {
+                        return Err(invalid("BlockingRead reads an uninitialized source"));
+                    }
+                    if state.may & bit(dst) != 0 {
+                        return Err(invalid("BlockingRead overwrites an initialized Result"));
+                    }
+                }
                 let timer_argument = match block.terminator {
                     TaskTerminator::Timer { millis, .. } => bit(millis),
                     TaskTerminator::BlockingWrite { path, content, .. } => bit(path) | bit(content),
+                    TaskTerminator::BlockingRead { path, .. } => bit(path),
                     _ => 0,
                 };
                 let saved = (live_out[id] | timer_argument | if hosted { masks.owned } else { 0 })
@@ -2777,6 +2828,7 @@ fn finally_plan(
             TaskTerminator::Await { ready, cleanup, .. }
             | TaskTerminator::Timer { ready, cleanup, .. }
             | TaskTerminator::BlockingWrite { ready, cleanup, .. }
+            | TaskTerminator::BlockingRead { ready, cleanup, .. }
             | TaskTerminator::ScopeDrain { ready, cleanup, .. } => {
                 if stack.last().is_some_and(|target| *target != cleanup)
                     || (stack.is_empty() && entries[cleanup.0])

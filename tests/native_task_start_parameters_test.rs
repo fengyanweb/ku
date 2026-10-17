@@ -128,6 +128,10 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 map(content);
                 map(dst);
             }
+            TaskTerminator::BlockingRead { path, dst, .. } => {
+                map(path);
+                map(dst);
+            }
             TaskTerminator::TryResult {
                 src,
                 ok_value,

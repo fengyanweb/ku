@@ -1786,6 +1786,47 @@ static uint32_t ku_task_driver_grow_charge(const KuTaskDriverTicketV1* ticket,
   ku_task_driver_unlock(driver);
   return result;
 }
+/* The pool mutex protects the job charge while this driver lock validates
+ * the same physical obligation. It grants no authority to unrelated tickets. */
+static uint32_t ku_task_driver_blocking_grow_charge(const KuTaskDriverTicketV1* ticket, size_t bytes) {
+  uint32_t checked=ku_task_driver_check_ticket(ticket);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  KuTaskDriverV1* driver=ticket->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+  uint32_t status=!slot ? KU_TASK_DRIVER_STALE
+      : !slot->binding || slot->binding!=slot->driver_lease.control || slot->blocking_pending!=1u
+        ? KU_TASK_DRIVER_INVALID_STATE
+      : driver->closing || slot->cancel_pending
+        || ku_task_control_atomic_load(&slot->driver_lease.control->phase)!=KU_TASK_CONTROL_LIVE
+        ? KU_TASK_DRIVER_CLOSED : slot->cleanup_fault ? slot->cleanup_fault : driver->fault;
+  if (status==KU_TASK_DRIVER_OK && (slot->charged_bytes>driver->reserved_bytes
+      || driver->fixed_bytes>driver->byte_limit
+      || driver->reserved_bytes>driver->byte_limit-driver->fixed_bytes)) status=KU_TASK_DRIVER_INTERNAL;
+  if (status==KU_TASK_DRIVER_OK && (bytes>SIZE_MAX-slot->charged_bytes
+      || bytes>driver->byte_limit-driver->fixed_bytes-driver->reserved_bytes)) status=KU_TASK_DRIVER_LIMIT;
+  if (status==KU_TASK_DRIVER_OK) {
+    slot->charged_bytes+=bytes; driver->reserved_bytes+=bytes;
+    if (driver->reserved_bytes>driver->peak_reserved_bytes) driver->peak_reserved_bytes=driver->reserved_bytes;
+  }
+  ku_task_driver_unlock(driver); return status;
+}
+/* Called under the pool mutex after actual output storage was freed.
+ * Cancellation forbids growth but must not prevent this real refund. */
+static uint32_t ku_task_driver_blocking_refund_charge(const KuTaskDriverTicketV1* ticket, size_t bytes) {
+  uint32_t checked=ku_task_driver_check_ticket(ticket);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  KuTaskDriverV1* driver=ticket->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+  uint32_t status=!slot ? KU_TASK_DRIVER_STALE
+      : !slot->binding || slot->binding!=slot->driver_lease.control || slot->blocking_pending!=1u
+        ? KU_TASK_DRIVER_INVALID_STATE
+      : bytes>slot->charged_bytes || slot->charged_bytes>driver->reserved_bytes
+        ? KU_TASK_DRIVER_INTERNAL : KU_TASK_DRIVER_OK;
+  if (status==KU_TASK_DRIVER_OK) { slot->charged_bytes-=bytes; driver->reserved_bytes-=bytes; }
+  ku_task_driver_unlock(driver); return status;
+}
 static uint32_t ku_task_driver_reconcile_charge(const KuTaskDriverTicketV1* ticket,
     size_t minimum_instance_bytes, size_t active_payload_bytes) {
   uint32_t checked=ku_task_driver_check_ticket(ticket);
