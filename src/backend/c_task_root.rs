@@ -8,7 +8,29 @@ use crate::{
 
 pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram, entry: TaskFunctionId) -> KuResult<()> {
     out.check()?;
-    out.push_str(ROOT_PREFIX);
+    let blocking = super::task::uses_blocking_write(tasks);
+    out.push_str(
+        &ROOT_PREFIX
+            .replace(
+                "@BLOCKING_STORAGE@",
+                if blocking {
+                    "static KuTaskBlockingPoolV1 ku_task_root_blocking;"
+                } else {
+                    ""
+                },
+            )
+            .replace("@BLOCKING_DIAGNOSTIC@", if blocking {
+                "    fputs(ku_task_root_blocking.initialized==KU_TASK_DRIVER_STORAGE_ZERO ? \"native blocking pool reported a runtime error after resource cleanup\\n\" : blocking==KU_TASK_DRIVER_SHUTDOWN_TIMEOUT ? \"native blocking jobs have not physically retired within the original deadline\\n\" : \"native blocking pool resources could not be fully reclaimed\\n\",stderr);"
+            } else { "" })
+            .replace(
+                "@BLOCKING_FINISH@",
+                if blocking {
+                    "  uint32_t blocking=ku_task_blocking_finish(&ku_task_root_blocking,deadline);"
+                } else {
+                    "  uint32_t blocking=KU_TASK_DRIVER_OK;"
+                },
+            ),
+    );
     for function in &tasks.functions {
         out.check()?;
         out.push_str(&format!(
@@ -16,7 +38,19 @@ pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram, entry: TaskFunctionId
             function.id.0, function.id.0,
         ));
     }
-    out.push_str(&ROOT_BODY.replace("@ENTRY@", &entry.0.to_string()));
+    out.push_str(
+        &ROOT_BODY
+            .replace(
+                "@BLOCKING_FIXED@",
+                if blocking {
+                    " + sizeof(ku_task_root_blocking)"
+                } else {
+                    ""
+                },
+            )
+            .replace("@BLOCKING_INIT@", if blocking { BLOCKING_INIT } else { "" })
+            .replace("@ENTRY@", &entry.0.to_string()),
+    );
     out.check()
 }
 
@@ -24,14 +58,16 @@ const ROOT_PREFIX: &str = r#"
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
-/* One external root, one bounded driver. The first source subset allocates no
- * dynamic value buffers: its finite byte limit covers fixed storage plus the
- * largest generated instance at each of the existing 1024 resident slots.
- * This is not an OS RSS limit or a budget for future I/O/allocator features.
+/* One external root, one bounded driver. Its finite byte limit covers fixed
+ * storage plus the largest generated instance at each of the existing 1024
+ * resident slots. Owned inputs/projections/blocking copies share that finite
+ * remainder; allocation rejects before a file operation when it is exhausted.
+ * This is not an OS RSS limit, a libc FILE-buffer or an OS-stack budget.
  * Static storage survives a diagnosed quarantine until process termination. */
 static KuTaskDriverV1 ku_task_root_driver;
 static KuTaskDriverSlotV1 ku_task_root_slots[KU_TASK_DRIVER_MAX_SLOTS];
 static size_t ku_task_root_ring[KU_TASK_DRIVER_MAX_SLOTS];
+@BLOCKING_STORAGE@
 /* Query the execution target, never the compiler host. This bounded default
  * follows the current runtime policy; OS stacks are not charged Task bytes. */
 static size_t ku_task_root_worker_count(void) {
@@ -60,6 +96,7 @@ static int ku_task_root_finish(uint64_t deadline) {
   uint32_t shutdown = KU_TASK_DRIVER_OK;
   if (ku_task_root_driver.initialized == KU_TASK_DRIVER_STORAGE_LIVE)
     shutdown = ku_task_driver_shutdown(&ku_task_root_driver, deadline);
+@BLOCKING_FINISH@
   uint32_t joined = ku_task_driver_join(&ku_task_root_driver, deadline);
   uint32_t destroyed = joined == KU_TASK_DRIVER_OK
       ? ku_task_driver_destroy(&ku_task_root_driver) : KU_TASK_DRIVER_PENDING;
@@ -67,12 +104,14 @@ static int ku_task_root_finish(uint64_t deadline) {
     fputs(shutdown == KU_TASK_DRIVER_SHUTDOWN_TIMEOUT
         ? "native Task cleanup did not finish within its original deadline\n"
         : "native Task cleanup reported a runtime error\n", stderr);
+  } else if (blocking != KU_TASK_DRIVER_OK) {
+@BLOCKING_DIAGNOSTIC@
   } else if (joined != KU_TASK_DRIVER_OK) {
     fputs("native Task workers could not be joined within their original deadline\n", stderr);
   } else if (destroyed != KU_TASK_DRIVER_OK) {
     fputs("native Task runtime could not be destroyed\n", stderr);
   }
-  return shutdown != KU_TASK_DRIVER_OK || joined != KU_TASK_DRIVER_OK
+  return shutdown != KU_TASK_DRIVER_OK || blocking != KU_TASK_DRIVER_OK || joined != KU_TASK_DRIVER_OK
       || destroyed != KU_TASK_DRIVER_OK;
 }
 int main(void) {
@@ -80,7 +119,7 @@ int main(void) {
 "#;
 
 const ROOT_BODY: &str = r#"
-  size_t fixed = sizeof(ku_task_root_driver) + sizeof(ku_task_root_slots) + sizeof(ku_task_root_ring);
+  size_t fixed = sizeof(ku_task_root_driver) + sizeof(ku_task_root_slots) + sizeof(ku_task_root_ring)@BLOCKING_FIXED@;
   if (maximum_instance > (SIZE_MAX - fixed) / KU_TASK_DRIVER_MAX_SLOTS) {
     fputs("native Task storage exceeds its bounded layout\n", stderr); return 1;
   }
@@ -95,6 +134,7 @@ const ROOT_BODY: &str = r#"
       (void)ku_task_root_finish(startup_deadline);
     return 1;
   }
+@BLOCKING_INIT@
   KuTaskValueV1 root = {0};
   KuTaskAdapterOutcomeV1 outcome = {0};
   uint64_t inherited_deadline = UINT64_MAX;
@@ -133,4 +173,17 @@ const ROOT_BODY: &str = r#"
   if (ku_task_root_finish(deadline)) exit_code = 1;
   return exit_code;
 }
+"#;
+
+const BLOCKING_INIT: &str = r#"
+  status=ku_task_blocking_init(&ku_task_root_blocking,KU_TASK_DRIVER_MAX_SLOTS,
+      ku_task_root_worker_count(),startup_deadline);
+  if (status==KU_TASK_DRIVER_OK)
+    status=ku_task_driver_attach_blocking(&ku_task_root_driver,&ku_task_root_blocking,
+        sizeof(ku_task_root_blocking),ku_task_blocking_close,ku_task_blocking_ready);
+  if (status!=KU_TASK_DRIVER_OK) {
+    fputs("native blocking pool initialization failed\n",stderr);
+    (void)ku_task_root_finish(startup_deadline);
+    return 1;
+  }
 "#;

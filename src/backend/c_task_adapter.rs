@@ -10,7 +10,7 @@
 //! RSS accounting remain outside this implementation.
 
 use crate::error::KuResult;
-use crate::ir::task::{TaskFunction, TaskOp, TaskProgram, TaskSlotType};
+use crate::ir::task::{TaskFunction, TaskOp, TaskProgram, TaskSlotType, TaskTerminator};
 use crate::ir::IrType;
 
 use super::output::COutput;
@@ -128,13 +128,22 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
     }
 
     let id = function.id.0.to_string();
-    let dynamic_projection = function.states.iter().any(|state| {
-        state
-            .operations
-            .iter()
-            .any(|op| matches!(op, TaskOp::ErrorField { .. }))
-    });
-    let mut reconcile_fields = String::new();
+    let blocking = function
+        .states
+        .iter()
+        .any(|state| matches!(state.terminator, TaskTerminator::BlockingWrite { .. }));
+    let dynamic_projection = blocking
+        || function.states.iter().any(|state| {
+            state
+                .operations
+                .iter()
+                .any(|op| matches!(op, TaskOp::ErrorField { .. }))
+        });
+    let mut reconcile_fields = if blocking {
+        "  bytes=instance->blocking.charged_bytes;\n".to_owned()
+    } else {
+        String::new()
+    };
     if dynamic_projection {
         reconcile_fields.push_str("  if (instance->frame_initialized) {\n");
         for (index, slot) in function.slots.iter().enumerate() {
@@ -330,6 +339,10 @@ fn emit_function(out: &mut COutput, function: &TaskFunction) -> KuResult<()> {
         }
     }
     let source = ADAPTER_FUNCTION
+        .replace("@BLOCKING_CANCEL@", if blocking { "  if (instance->blocking.pool && ku_task_blocking_cancel(&instance->ticket,&instance->blocking)!=KU_TASK_DRIVER_OK) return KU_TASK_CONTROL_INVALID_STATE;" } else { "" })
+        .replace("@BLOCKING_FIELD@", if blocking { "  KuTaskBlockingTokenV1 blocking;" } else { "" })
+        .replace("@BLOCKING_HOST@", if blocking { "&instance->blocking" } else { "NULL" })
+        .replace("@BLOCKING_CLEANUP@", if blocking { BLOCKING_CLEANUP } else { "" })
         .replace("@RECONCILE_HELPER@", if dynamic_projection { RECONCILE_HELPER } else { "" })
         .replace("@RECONCILE_FIELDS@", &reconcile_fields)
         .replace("@ALLOCATION_HOST@", if dynamic_projection { "sizeof(KuTaskAdapterHostV1),KU_TASK_ALLOCATION_HOST_ABI_VERSION,instance,ku_task_@ID@_reconcile_charge" } else { "0,0,NULL,NULL" })
@@ -430,7 +443,8 @@ static int ku_task_adapter_string_overlaps(KuString value, const void* pointer, 
 static int ku_task_adapter_string_overlaps_runtime(KuString value, KuTaskDriverV1* driver) {
   return ku_task_adapter_string_overlaps(value, driver, sizeof(*driver))
       || ku_task_adapter_string_overlaps(value, driver->slots, driver->capacity * sizeof(*driver->slots))
-      || ku_task_adapter_string_overlaps(value, driver->ring, driver->capacity * sizeof(*driver->ring));
+      || ku_task_adapter_string_overlaps(value, driver->ring, driver->capacity * sizeof(*driver->ring))
+      || (driver->blocking_pool && ku_task_adapter_string_overlaps(value,driver->blocking_pool,driver->blocking_pool_bytes));
 }
 static void ku_task_adapter_fault(KuTaskDriverV1* driver, int clock_fault) {
   /* Callbacks run outside the queue mutex. The registered task or BUILDING
@@ -630,6 +644,7 @@ typedef struct KuTaskInstance_@ID@ {
   KuTaskDriverCleanupReceiptV1 receipts[@RECEIPT_SIZE@];
   KuTaskDriverWaitTokenV1 wait;
   KuTaskDriverTimerTokenV1 timer;
+@BLOCKING_FIELD@
 @SCOPE_FIELDS@
 } KuTaskInstance_@ID@;
 typedef struct KuTaskHandle_@ID@ {
@@ -654,7 +669,7 @@ static uint32_t ku_task_@ID@_take_frame_payload(KuTaskInstance_@ID@* instance) {
 }
 
 static uint32_t ku_task_@ID@_drain(KuTaskInstance_@ID@* instance, uint32_t reason, KuTaskControlV1* budget) {
-  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance),&instance->timer,@ALLOCATION_HOST@};
+  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance),&instance->timer,@ALLOCATION_HOST@,@BLOCKING_HOST@};
   if (instance->timer.driver) {
     uint32_t timer_status=ku_task_driver_timer_detach(&instance->timer);
     if (timer_status!=KU_TASK_DRIVER_OK && timer_status!=KU_TASK_DRIVER_STALE) return timer_status;
@@ -771,7 +786,7 @@ static uint32_t ku_task_@ID@_resume(void* raw) {
   KuTaskInstance_@ID@* instance = (KuTaskInstance_@ID@*)raw;
   if (!instance->frame_initialized) return KU_TASK_CONTROL_INVALID_STATE;
   KuTaskAdapterClockV1 bridge = { instance->ticket.driver, NULL };
-  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance),&instance->timer,@ALLOCATION_HOST@};
+  KuTaskAdapterHostV1 host={&instance->ticket,&instance->control,&instance->wait,sizeof(*instance),&instance->timer,@ALLOCATION_HOST@,@BLOCKING_HOST@};
   KuTaskFrameClockV1 clock = { ku_task_adapter_now, &bridge, &host };
   uint32_t status=KU_TASK_FRAME_READY;
   if (!instance->payload_initialized) {
@@ -812,7 +827,9 @@ static uint32_t ku_task_@ID@_cleanup(void* raw, uint32_t reason, KuTaskControlV1
   uint32_t frame_reason = reason == KU_TASK_CONTROL_CANCELLED ? KU_TASK_FRAME_CANCELLED
       : reason == KU_TASK_CONTROL_TIMED_OUT ? KU_TASK_FRAME_TIMED_OUT : KU_TASK_FRAME_INVALID_ARGUMENT;
   if (frame_reason == KU_TASK_FRAME_INVALID_ARGUMENT) return KU_TASK_CONTROL_INVALID_ARGUMENT;
+@BLOCKING_CANCEL@
   uint32_t status=ku_task_@ID@_drain(instance,reason,budget);
+@BLOCKING_CLEANUP@
   if (status==KU_TASK_DRIVER_OK || status==KU_TASK_DRIVER_CLEANUP_TIMEOUT) return KU_TASK_CONTROL_OK;
   if (status==KU_TASK_DRIVER_PENDING) return KU_TASK_CONTROL_PENDING;
   /* READY is only possible when R2 already staged/dropped the frame itself;
@@ -1084,4 +1101,18 @@ static uint32_t ku_task_@ID@_start_hosted(const KuTaskAdapterHostV1* host@PARAM_
   source=(KuTaskDriverStartChargeV1){*parent,host->control,host->minimum_charge,charge};
   return ku_task_@ID@_start_value_impl(driver,&source@PARAM_ARGS@,output);
 }
+"#;
+
+// This gate precedes every R2 acknowledgement, including an expired child-drain
+// deadline. It does not postpone finally/Value cleanup or renew that deadline.
+const BLOCKING_CLEANUP: &str = r#"
+  if (instance->blocking.pool) {
+    KuResult_null discarded={0};
+    uint32_t retired=ku_task_blocking_read(&instance->ticket,&instance->blocking,1,&discarded);
+    ku_result_drop_null(&discarded);
+    if (retired==KU_TASK_DRIVER_PENDING) return KU_TASK_CONTROL_PENDING;
+    if (retired!=KU_TASK_DRIVER_OK
+        || ku_task_@ID@_reconcile_charge(instance)!=KU_TASK_DRIVER_OK)
+      return KU_TASK_CONTROL_INVALID_STATE;
+  }
 "#;

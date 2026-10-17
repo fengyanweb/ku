@@ -30,6 +30,7 @@ TARGETS = (
     ("native_task_expression_pending_test", "native_task_expression_repeated_pending_preserves_lhs_and_starts_rhs_once", False),
     ("native_task_publishing_deadline_test", "native_task_publishing_cancel_tightens_unacked_child_after_timeout_result_race", False),
     ("native_task_cleanup_commit_test", "native_task_requested_cancel_tightens_unacked_child_before_cleanup_commit", False),
+    ("native_task_adapter_test", "native_task_blocking_write_tracks_real_jobs_budget_and_original_cleanup_deadline", False),
 )
 TSAN_OPTIONS = "halt_on_error=1:exitcode=66"
 

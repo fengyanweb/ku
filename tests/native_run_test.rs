@@ -2909,6 +2909,156 @@ fn native_fs_write_read_roundtrip() {
 }
 
 #[test]
+fn native_async_fs_write_preserves_views_and_relocatable_paths() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let cleanup = Cleanup(unique_temp_dir("async-fs-relocatable"));
+    let original = cleanup.0.join("original-tree");
+    let source = original.join("source");
+    let bin = original.join("bin");
+    let build_cwd = cleanup.0.join("build-cwd");
+    let launch_cwd = cleanup.0.join("launch-cwd");
+    for directory in [&source, &bin, &build_cwd, &launch_cwd] {
+        fs::create_dir_all(directory).expect("create async fs test directory");
+    }
+    let text = "中文🙂\0tail";
+    let program = r#"import fs from "std.fs"
+async fn Pathname(): str! { println("path") return ok("数据.bin") }
+async fn Content(): str! { println("content") return ok("中文🙂@NUL@tail") }
+async fn Roundtrip(): null! {
+    path = (await Pathname())?
+    content = (await Content())?
+    fs.write(path, content)?
+    println(path)
+    println(content)
+    fs.try_write((await Pathname())?, (await Content())?)?
+    println(path)
+    println(content)
+    fs.write("empty.bin", "")?
+    return ok(null)
+}
+async fn MissingParent(): null! {
+    try {
+        fs.write("missing-parent/file.bin", "unchanged")?
+        fail "missing parent write should fail"
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+    } finally {
+        println("cleaned")
+    }
+    return ok(null)
+}
+async fn NulPath(): null! {
+    try {
+        fs.try_write("keep.txt@NUL@ignored", "unchanged")?
+        fail "NUL path write should fail"
+    } catch (err) {
+        println(err.domain)
+        println(err.code)
+    }
+    return ok(null)
+}
+async fn main(): null! {
+    (await Roundtrip())?;
+    (await MissingParent())?;
+    (await NulPath())?;
+    return ok(null)
+}
+"#
+    .replace("@NUL@", "\0");
+    fs::write(source.join("main.ku"), program).expect("write async fs program");
+    fs::write(source.join("keep.txt"), "keep").expect("write truncation sentinel");
+    let expected = format!(
+        "path\ncontent\n数据.bin\n{text}\npath\ncontent\n数据.bin\n{text}\nfs\nwrite_failed\ncleaned\nfs\nwrite_failed\n"
+    );
+    let entry = source.join("main.ku");
+    let mut interpreted = Command::new(ku_binary());
+    interpreted.current_dir(&build_cwd).arg("run").arg(&entry);
+    let interpreted = run_bounded(&mut interpreted, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded async fs interpreter comparison");
+    assert_eq!(
+        interpreted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert!(interpreted.stderr.is_empty(), "{:?}", interpreted.stderr);
+    assert_eq!(
+        String::from_utf8(interpreted.stdout)
+            .unwrap()
+            .replace('\r', ""),
+        expected
+    );
+    assert_eq!(fs::read(source.join("数据.bin")).unwrap(), text.as_bytes());
+    assert_eq!(fs::read(source.join("empty.bin")).unwrap(), b"");
+    assert_eq!(fs::read(source.join("keep.txt")).unwrap(), b"keep");
+    fs::remove_file(source.join("数据.bin")).unwrap();
+    fs::remove_file(source.join("empty.bin")).unwrap();
+
+    let executable = bin.join(exe_name("asyncfs"));
+    let mut build = Command::new(ku_binary());
+    build
+        .current_dir(&build_cwd)
+        .args(["build", "--backend", "c"])
+        .arg(&entry)
+        .arg("-o")
+        .arg(&executable);
+    let built = run_bounded(&mut build, BUILD_TIMEOUT, BUILD_OUTPUT_LIMITS)
+        .expect("bounded native async fs build");
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if !built.status.success() && diagnostic.contains("C compiler not found") {
+        assert!(
+            env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI needs a C compiler"
+        );
+        eprintln!("skip native async fs execution: no C compiler");
+        return;
+    }
+    assert!(built.status.success(), "{diagnostic}");
+    let generated = fs::read_to_string(native_generated_c(&source, "asyncfs")).unwrap();
+    assert!(!generated.contains("run_source"));
+    assert!(!generated.contains("const SOURCE"));
+    assert!(!generated.contains(original.to_string_lossy().as_ref()));
+    fs::remove_file(&entry).unwrap();
+    fs::remove_dir_all(source.join(".ku")).unwrap();
+    let relocated = cleanup.0.join("relocated-tree");
+    fs::rename(original, &relocated).unwrap();
+    let mut run = Command::new(relocated.join("bin").join(exe_name("asyncfs")));
+    run.current_dir(&launch_cwd);
+    let output = run_bounded(&mut run, RUN_TIMEOUT, RUN_OUTPUT_LIMITS)
+        .expect("bounded relocated native async fs execution");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+    let data = relocated.join("source");
+    assert_eq!(fs::read(data.join("数据.bin")).unwrap(), text.as_bytes());
+    assert_eq!(fs::read(data.join("empty.bin")).unwrap(), b"");
+    assert_eq!(fs::read(data.join("keep.txt")).unwrap(), b"keep");
+    for directory in [&launch_cwd, &relocated.join("bin")] {
+        assert!(!directory.join("数据.bin").exists());
+        assert!(!directory.join("empty.bin").exists());
+        assert!(!directory.join("keep.txt").exists());
+    }
+}
+
+#[test]
 fn native_fs_intrinsic_gates_emit_complete_cross_platform_helpers() {
     let dir = unique_temp_dir("fs-gates-c");
     let cases = [

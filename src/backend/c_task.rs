@@ -24,6 +24,15 @@ use super::{
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const MAX_FRAME_SLOTS: usize = 64;
 
+pub(super) fn uses_blocking_write(tasks: &TaskProgram) -> bool {
+    tasks.functions.iter().any(|function| {
+        function
+            .states
+            .iter()
+            .any(|state| matches!(state.terminator, TaskTerminator::BlockingWrite { .. }))
+    })
+}
+
 pub(super) fn uses_checked_integer(tasks: &TaskProgram) -> bool {
     tasks.functions.iter().any(|function| {
         function.states.iter().any(|state| {
@@ -59,6 +68,7 @@ pub(super) fn emit_frames(
     out.push_str(FRAME_ABI);
     super::task_control::emit_runtime(out)?;
     super::task_driver::emit_runtime(out)?;
+    super::task_blocking::emit(out, uses_blocking_write(tasks))?;
     super::task_adapter::emit_host(out, tasks)?;
     for function in &tasks.functions {
         out.check()?;
@@ -161,11 +171,13 @@ impl<'a> FrameEmitter<'a> {
                 != (task_mask != 0
                     || exit_bridge
                     || function.states.iter().any(|state| {
-                        matches!(state.terminator, TaskTerminator::Timer { .. })
-                            || state
-                                .operations
-                                .iter()
-                                .any(|op| matches!(op, TaskOp::ErrorField { .. }))
+                        matches!(
+                            state.terminator,
+                            TaskTerminator::Timer { .. } | TaskTerminator::BlockingWrite { .. }
+                        ) || state
+                            .operations
+                            .iter()
+                            .any(|op| matches!(op, TaskOp::ErrorField { .. }))
                     }))
         {
             return Err(unsupported(
@@ -830,6 +842,21 @@ static uint32_t {prefix}_scope_timeout(void* storage, size_t bytes, uint32_t abi
                     out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t timer_status=ku_task_host_timer((KuTaskAdapterHostV1*)clock->host,{},&{});\n  if (timer_status==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (timer_status==KU_TASK_HOST_TIMER_OVERFLOW) {{\n", cleanup.0, self.place(*millis), self.place(*dst)));
                     self.emit_runtime_error(out, "ku_error_make(ku_string_static((const uint8_t*)\"time\",4),ku_string_static((const uint8_t*)\"invalid_duration\",16),ku_string_static((const uint8_t*)\"time.sleep duration is too large for this platform\",50))")?;
                     out.push_str("  }\n  if (timer_status!=KU_TASK_CONTROL_OK) { frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }\n");
+                    self.set_init(out, *dst, true);
+                    out.push_str(&format!(
+                        "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",
+                        ready.0
+                    ));
+                }
+                TaskTerminator::BlockingWrite {
+                    path,
+                    content,
+                    dst,
+                    ready,
+                    cleanup,
+                } => {
+                    out.push_str("  if (cleanup) goto ku_task_terminated;\n");
+                    out.push_str(&format!("  {{\n  frame->header.cleanup_state={}u;\n  uint32_t written=ku_task_host_blocking_write((KuTaskAdapterHostV1*)clock->host,{}, {}, &{});\n  if (written==KU_TASK_CONTROL_PENDING) {{ frame->header.status=KU_TASK_FRAME_PENDING; frame->header.running=0; return KU_TASK_FRAME_PENDING; }}\n  if (written!=KU_TASK_CONTROL_OK) {{ frame->header.running=0; return KU_TASK_FRAME_INVALID_STATE; }}\n",cleanup.0,self.place(*path),self.place(*content),self.place(*dst)));
                     self.set_init(out, *dst, true);
                     out.push_str(&format!(
                         "  frame->header.state={}u;\n  goto ku_task_dispatch;\n  }}\n",

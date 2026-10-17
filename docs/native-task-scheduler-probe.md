@@ -2,7 +2,7 @@
 
 `examples/native_task_scheduler_probe.rs` 是内部固定工作量工具，不是 Ku 业务 API，
 也不是 v0.0.18 高并发验收通过的声明。它复用验证后的 Task IR、生成的 Frame 和
-实际 Driver9，提供一个专用 R2 适配器；不是源码 Start/Await 的端到端语言基准。
+实际 Driver10，提供一个专用 R2 适配器；不是源码 Start/Await 的端到端语言基准。
 
 ## 运行方式
 

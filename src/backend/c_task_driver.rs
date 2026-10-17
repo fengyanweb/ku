@@ -12,7 +12,7 @@ pub(super) fn emit_runtime(out: &mut COutput) -> KuResult<()> {
 }
 
 const DRIVER_ABI: &str = r#"
-/* Internal driver ABI 9, not a public Task API, netpoll, or complete M:N scheduler.
+/* Internal driver ABI 10, not a public Task API, netpoll, or complete M:N scheduler.
  * Private V1 type spellings are retained, not their old binary layout/version.
  * Caller-owned zero-filled driver/slot/ring storage remains live until destroy
  * succeeds. Every API caller protects that storage. Init, join and destroy are
@@ -171,7 +171,7 @@ const DRIVER_ABI: &str = r#"
  * and keep healthy workers for deterministic cleanup. Idle faulted workers wait only
  * for OS condition notifications, never retry a failed clock periodically.
  */
-#define KU_TASK_DRIVER_ABI_VERSION 9u
+#define KU_TASK_DRIVER_ABI_VERSION 10u
 #define KU_TASK_DRIVER_GLOBAL_BURST ((size_t)8u)
 #define KU_TASK_DRIVER_MAX_SLOTS ((size_t)1024u)
 #define KU_TASK_DRIVER_MAX_WORKERS ((size_t)32u)
@@ -284,6 +284,7 @@ typedef struct KuTaskDriverSlotV1 {
   uint64_t timer_epoch, timer_deadline;
   uint32_t timer_state;
   size_t wrapper_active;
+  uint32_t blocking_pending; /* Real job registration, cleared only after retirement. */
   KuTaskControlV1* binding;
   KuTaskControlLeaseV1 driver_lease;
   KuTaskControlLeaseV1 execution_lease;
@@ -334,6 +335,11 @@ struct KuTaskDriverV1 {
   size_t peak_resident, peak_queued, peak_running, peak_reserved_bytes;
   size_t timers, peak_timers;
   uint64_t polls, wakes, waits, shutdown_deadline, next_deadline;
+  /* Immutable while LIVE; close/ready callbacks are called without mutex. */
+  void* blocking_pool;
+  size_t blocking_pool_bytes;
+  uint32_t (*blocking_close)(void*);
+  uint32_t (*blocking_ready)(void*);
   KuTaskDriverSlotV1* slots;
   size_t* ring;
   KuTaskDriverMutexV1 mutex;
@@ -475,7 +481,30 @@ static int ku_task_driver_external_storage(
       && !ku_task_frame_ranges_overlap(pointer, size, driver->slots,
                                        driver->capacity * sizeof(*driver->slots))
       && !ku_task_frame_ranges_overlap(pointer, size, driver->ring,
-                                       driver->capacity * sizeof(*driver->ring));
+                                       driver->capacity * sizeof(*driver->ring))
+      && (!driver->blocking_pool || !ku_task_frame_ranges_overlap(pointer,size,
+          driver->blocking_pool,driver->blocking_pool_bytes));
+}
+/* Exclusive setup, before the first admission. Fixed pool storage remains
+ * protected through the driver's final destroy, including a timed-out close. */
+static uint32_t ku_task_driver_attach_blocking(KuTaskDriverV1* driver,
+    void* pool, size_t bytes, uint32_t (*close)(void*), uint32_t (*ready)(void*)) {
+  uint32_t checked=ku_task_driver_check(driver);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  if (!pool || !bytes || !close || !ready
+      || !ku_task_driver_external_storage(driver,pool,bytes,1)) return KU_TASK_DRIVER_INVALID_ARGUMENT;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  uint32_t status=driver->blocking_pool || driver->resident || driver->building || driver->closing
+      ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
+  if (status==KU_TASK_DRIVER_OK && (driver->fixed_bytes>driver->byte_limit
+      || bytes>driver->byte_limit-driver->fixed_bytes)) status=KU_TASK_DRIVER_LIMIT;
+  if (status==KU_TASK_DRIVER_OK) {
+    driver->blocking_pool=pool; driver->blocking_pool_bytes=bytes;
+    driver->blocking_close=close; driver->blocking_ready=ready;
+    driver->fixed_bytes+=bytes;
+  }
+  ku_task_driver_unlock(driver);
+  return status;
 }
 static uint32_t ku_task_driver_check_cleanup_receipt(const KuTaskDriverCleanupReceiptV1* receipt) {
   if (!ku_task_frame_storage_valid(receipt, sizeof(*receipt), sizeof(*receipt),
@@ -1683,6 +1712,49 @@ static uint32_t ku_task_driver_cancel_bound(
   ku_task_driver_unlock(driver);
   return result;
 }
+/* A compiler callback registers a real fixed-pool job before WAIT. Neither
+ * cancellation nor deadline expiry can erase this physical obligation. */
+static uint32_t ku_task_driver_blocking_register(const KuTaskDriverTicketV1* ticket) {
+  uint32_t checked=ku_task_driver_check_ticket(ticket);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  KuTaskDriverV1* driver=ticket->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+  uint32_t status=!slot ? KU_TASK_DRIVER_STALE
+      : slot->state!=KU_TASK_DRIVER_RUNNING || !slot->binding || slot->blocking_pending
+        ? KU_TASK_DRIVER_INVALID_STATE : driver->closing ? KU_TASK_DRIVER_CLOSED : KU_TASK_DRIVER_OK;
+  if (status==KU_TASK_DRIVER_OK) slot->blocking_pending=1;
+  ku_task_driver_unlock(driver); return status;
+}
+/* The pool holds its mutex before this bounded observation. This is the
+ * file-operation start decision: an already-published cancellation/close wins.
+ * Later cancellation cannot undo an OS operation which has already started. */
+static uint32_t ku_task_driver_blocking_can_start(const KuTaskDriverTicketV1* ticket) {
+  uint32_t checked=ku_task_driver_check_ticket(ticket);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  KuTaskDriverV1* driver=ticket->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+  uint32_t status=!slot ? KU_TASK_DRIVER_STALE
+      : !slot->binding || slot->binding!=slot->driver_lease.control || slot->blocking_pending!=1u
+        ? KU_TASK_DRIVER_INVALID_STATE
+      : driver->closing || slot->cancel_pending
+        || ku_task_control_atomic_load(&slot->driver_lease.control->phase)!=KU_TASK_CONTROL_LIVE
+        ? KU_TASK_DRIVER_CLOSED : KU_TASK_DRIVER_OK;
+  ku_task_driver_unlock(driver); return status;
+}
+static uint32_t ku_task_driver_blocking_retired(const KuTaskDriverTicketV1* ticket) {
+  uint32_t checked=ku_task_driver_check_ticket(ticket);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  KuTaskDriverV1* driver=ticket->driver;
+  if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
+  KuTaskDriverSlotV1* slot=ku_task_driver_find(ticket);
+  uint32_t status=!slot ? KU_TASK_DRIVER_STALE
+      : slot->state!=KU_TASK_DRIVER_RUNNING || slot->blocking_pending!=1u
+        ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
+  if (status==KU_TASK_DRIVER_OK) slot->blocking_pending=0;
+  ku_task_driver_unlock(driver); return status;
+}
 /* Generated allocation glue grows only the currently executing instance.
  * Reservation precedes malloc; the per-instance typed scan may only refund
  * bytes after owners were dropped or transferred. Neither operation allocates
@@ -2027,7 +2099,7 @@ static uint32_t ku_task_driver_return_slot(KuTaskDriverV1* driver, KuTaskDriverS
       || slot->cleanup_acked_generation > slot->generation || !slot->generation
       || !driver->resident || !slot->charged_bytes || slot->charged_bytes > driver->reserved_bytes
       || slot->binding || slot->driver_lease.control || slot->execution_lease.control
-      || slot->deferred_owner.lease.control || slot->wrapper_active
+      || slot->deferred_owner.lease.control || slot->wrapper_active || slot->blocking_pending
       || slot->queue_worker || slot->executor_worker || slot->ready_previous || slot->ready_next
       || (building && (!driver->building || slot->cleanup_acked_generation == slot->generation))
       || (!building && (slot->state != KU_TASK_DRIVER_RETIRING
@@ -2069,7 +2141,7 @@ static uint32_t ku_task_driver_disposed(KuTaskDriverTicketV1* ticket) {
   if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
   KuTaskDriverSlotV1* slot = ku_task_driver_find(ticket);
   uint32_t result = !slot ? KU_TASK_DRIVER_STALE : slot->state != KU_TASK_DRIVER_RETIRING
-      || slot->driver_lease.control || slot->execution_lease.control || slot->wrapper_active
+      || slot->driver_lease.control || slot->execution_lease.control || slot->wrapper_active || slot->blocking_pending
       ? KU_TASK_DRIVER_INVALID_STATE : KU_TASK_DRIVER_OK;
   if (result == KU_TASK_DRIVER_OK) {
     result = ku_task_driver_return_slot(driver, slot);
@@ -2142,7 +2214,7 @@ static uint32_t ku_task_driver_commit_impl(
           || driver->workers_exited >= driver->workers_created
           || !ku_task_driver_queue_shape(driver) || slot->cleanup_fault
           || slot->binding || slot->driver_lease.control || slot->execution_lease.control
-          || slot->deferred_owner.lease.control || slot->wrapper_active
+          || slot->deferred_owner.lease.control || slot->wrapper_active || slot->blocking_pending
           || slot->queue_worker || slot->executor_worker || slot->ready_previous || slot->ready_next
           || slot->wait_state != KU_TASK_DRIVER_WAIT_EMPTY || slot->waiter_epoch
           || slot->cleanup_acked_generation >= slot->generation
@@ -2288,7 +2360,7 @@ static uint32_t ku_task_driver_cleanup_ack_locked(
   if (!control || slot->binding != control || !slot->generation
       || slot->cleanup_acked_generation > slot->generation
       || slot->owner_location != KU_TASK_DRIVER_OWNER_RELEASED
-      || slot->deferred_owner.lease.control || slot->wrapper_active
+      || slot->deferred_owner.lease.control || slot->wrapper_active || slot->blocking_pending
       || !ku_task_control_is_terminal(outcome)
       || ku_task_control_atomic_load(&control->phase) != outcome
       || ku_task_control_atomic_load(&control->lifecycle_pin) || !control->frame_destroyed) {
@@ -2626,6 +2698,9 @@ static uint32_t ku_task_driver_wait_idle(KuTaskDriverV1* driver, uint64_t deadli
 static uint32_t ku_task_driver_shutdown(KuTaskDriverV1* driver, uint64_t deadline) {
   uint32_t checked = ku_task_driver_check(driver);
   if (checked != KU_TASK_DRIVER_OK) return checked;
+  /* Pool->driver is the notification lock order; never close it under ours. */
+  if (driver->blocking_pool && driver->blocking_close(driver->blocking_pool)!=KU_TASK_DRIVER_OK)
+    return KU_TASK_DRIVER_INTERNAL;
   if (ku_task_driver_lock(driver)) return KU_TASK_DRIVER_INTERNAL;
   uint64_t now = ku_task_driver_now_ms();
   if (now == UINT64_MAX) {
@@ -2767,7 +2842,11 @@ static uint32_t ku_task_driver_join(KuTaskDriverV1* driver, uint64_t deadline) {
   return KU_TASK_DRIVER_OK;
 }
 static uint32_t ku_task_driver_destroy(KuTaskDriverV1* driver) {
-  uint32_t checked = ku_task_driver_reap_ready(driver);
+  uint32_t checked=ku_task_driver_check_lifecycle(driver);
+  if (checked!=KU_TASK_DRIVER_OK) return checked;
+  if (driver->blocking_pool && driver->blocking_ready(driver->blocking_pool)!=KU_TASK_DRIVER_OK)
+    return KU_TASK_DRIVER_PENDING;
+  checked = ku_task_driver_reap_ready(driver);
   if (checked != KU_TASK_DRIVER_OK) return checked;
   if (driver->workers_joined != driver->workers_created) return KU_TASK_DRIVER_PENDING;
   for (size_t index = 0; index < driver->workers_created; index++)

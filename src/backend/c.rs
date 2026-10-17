@@ -14,6 +14,8 @@ mod sync;
 mod task;
 #[path = "c_task_adapter.rs"]
 mod task_adapter;
+#[path = "c_task_blocking.rs"]
+mod task_blocking;
 #[path = "c_task_control.rs"]
 mod task_control;
 #[path = "c_task_driver.rs"]
@@ -365,7 +367,10 @@ fn generate_c_source_with_frames_bounded(
         validate_cfg(function)?;
     }
     validate_layouts(program)?;
-    let fs_usage = program_fs_usage(program);
+    let mut fs_usage = program_fs_usage(program);
+    if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_write(tasks)) {
+        fs_usage.write = true;
+    }
     if fs_usage.any() {
         if let NativeFsBase::Unavailable(reason) = &options.fs_base {
             return Err(unsupported(format!(
@@ -622,6 +627,15 @@ fn generate_c_source_with_frames_bounded(
     emit_kuvalue_array_wrappers(&mut out, program)?;
     emit_kuvalue_typed_array_equality_helpers(&mut out, program)?;
     emit_fs_runtime(&mut out, fs_usage, &options.fs_base);
+    if frames.is_some_and(|(tasks, _, _)| task::uses_blocking_write(tasks)) {
+        out.push_str(
+            if matches!(options.fs_base, NativeFsBase::ExecutableRelative(_)) {
+                "static void ku_fs_prepare_blocking_base(void) { (void)ku_fs_init_base(); }\n"
+            } else {
+                "static void ku_fs_prepare_blocking_base(void) {}\n"
+            },
+        );
+    }
     emit_array_try_get_helpers(&mut out, program)?;
     emit_string_slice_helper(&mut out, program)?;
     emit_object_result_helpers(&mut out, program)?;
@@ -6425,6 +6439,18 @@ fn emit_fs_runtime(out: &mut COutput, usage: FsUsage, fs_base: &NativeFsBase) {
 #define KU_FS_MAX_DIRECTORY_ENTRIES ((size_t)10000)
 #define KU_FS_MAX_DIRECTORY_OUTPUT_BYTES ((size_t)1000000)
 
+typedef struct KuFsAllocatorV1 {
+  void* context;
+  void* (*allocate)(void*, size_t);
+  void (*release)(void*, void*);
+} KuFsAllocatorV1;
+static void* ku_fs_allocate(KuFsAllocatorV1* allocator, size_t bytes) {
+  return allocator ? allocator->allocate(allocator->context,bytes) : malloc(bytes);
+}
+static void ku_fs_release(KuFsAllocatorV1* allocator, void* pointer) {
+  if (allocator) allocator->release(allocator->context,pointer); else free(pointer);
+}
+
 static bool ku_fs_utf8_valid(const uint8_t* data, size_t len) {
   if (len != 0 && !data) return false;
   size_t i = 0;
@@ -6485,10 +6511,10 @@ static void ku_fs_set_error(KuError* error, const char* code, const char* messag
         NativeFsBase::CurrentWorkingDirectory => out.push_str(
             r#"#if defined(_WIN32)
 typedef wchar_t KuFsNativeChar;
-static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const char* code, const char* message) {
+static KuFsNativeChar* ku_fs_native_path_with_allocator(KuString path, KuError* error, const char* code, const char* message, KuFsAllocatorV1* allocator) {
   if (!ku_fs_path_valid(path)) { ku_fs_set_error(error, code, message); return NULL; }
   if (path.len == 0) {
-    wchar_t* empty = (wchar_t*)malloc(2 * sizeof(wchar_t));
+    wchar_t* empty = (wchar_t*)ku_fs_allocate(allocator,2 * sizeof(wchar_t));
     if (!empty) { ku_fs_set_error(error, code, message); return NULL; }
     empty[0] = L'.';
     empty[1] = L'\0';
@@ -6498,20 +6524,20 @@ static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const ch
   if (count <= 0 || (size_t)count > SIZE_MAX / sizeof(wchar_t) - 1) {
     ku_fs_set_error(error, code, message); return NULL;
   }
-  wchar_t* native = (wchar_t*)malloc(((size_t)count + 1) * sizeof(wchar_t));
+  wchar_t* native = (wchar_t*)ku_fs_allocate(allocator,((size_t)count + 1) * sizeof(wchar_t));
   if (!native) { ku_fs_set_error(error, code, message); return NULL; }
   if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)path.ptr, (int)path.len, native, count) != count) {
-    free(native); ku_fs_set_error(error, code, message); return NULL;
+    ku_fs_release(allocator,native); ku_fs_set_error(error, code, message); return NULL;
   }
   native[count] = L'\0';
   return native;
 }
 #else
 typedef char KuFsNativeChar;
-static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const char* code, const char* message) {
+static KuFsNativeChar* ku_fs_native_path_with_allocator(KuString path, KuError* error, const char* code, const char* message, KuFsAllocatorV1* allocator) {
   if (!ku_fs_path_valid(path)) { ku_fs_set_error(error, code, message); return NULL; }
   size_t capacity = path.len == 0 ? 2 : path.len + 1;
-  char* native = (char*)malloc(capacity);
+  char* native = (char*)ku_fs_allocate(allocator,capacity);
   if (!native) { ku_fs_set_error(error, code, message); return NULL; }
   if (path.len) {
     memcpy(native, path.ptr, path.len);
@@ -6539,23 +6565,27 @@ static size_t ku_fs_base_len = 0;
 static bool ku_fs_base_ready = false;
 static bool ku_fs_base_attempted = false;
 
-static wchar_t* ku_fs_utf8_to_wide(KuString path) {
+static wchar_t* ku_fs_utf8_to_wide_with_allocator(KuString path, KuFsAllocatorV1* allocator) {
   if (path.len == 0) {
-    wchar_t* empty = (wchar_t*)malloc(sizeof(wchar_t));
+    wchar_t* empty = (wchar_t*)ku_fs_allocate(allocator,sizeof(wchar_t));
     if (empty) empty[0] = L'\0';
     return empty;
   }
   if (path.len > (size_t)INT_MAX) return NULL;
   int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)path.ptr, (int)path.len, NULL, 0);
   if (count <= 0 || (size_t)count > KU_FS_MAX_PATH_BYTES || (size_t)count > SIZE_MAX / sizeof(wchar_t) - 1) return NULL;
-  wchar_t* native = (wchar_t*)malloc(((size_t)count + 1) * sizeof(wchar_t));
+  wchar_t* native = (wchar_t*)ku_fs_allocate(allocator,((size_t)count + 1) * sizeof(wchar_t));
   if (!native) return NULL;
   if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char*)path.ptr, (int)path.len, native, count) != count) {
-    free(native); return NULL;
+    ku_fs_release(allocator,native); return NULL;
   }
   native[count] = L'\0';
   return native;
 }
+static wchar_t* ku_fs_utf8_to_wide(KuString path) {
+  return ku_fs_utf8_to_wide_with_allocator(path,NULL);
+}
+
 
 static bool ku_fs_wide_separator(wchar_t value) {
   return value == L'\\' || value == L'/';
@@ -6670,9 +6700,9 @@ static bool ku_fs_init_base(void) {
   return true;
 }
 
-static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const char* code, const char* message) {
+static KuFsNativeChar* ku_fs_native_path_with_allocator(KuString path, KuError* error, const char* code, const char* message, KuFsAllocatorV1* allocator) {
   if (!ku_fs_path_valid(path)) { ku_fs_set_error(error, code, message); return NULL; }
-  wchar_t* native = ku_fs_utf8_to_wide(path);
+  wchar_t* native = ku_fs_utf8_to_wide_with_allocator(path,allocator);
   if (!native) { ku_fs_set_error(error, code, message); return NULL; }
   size_t native_len = wcslen(native);
   /* `C:\\foo` and UNC are fully qualified. `C:foo` is drive-relative and
@@ -6681,35 +6711,35 @@ static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const ch
   if (ku_fs_wide_fully_qualified(native, native_len) ||
       ku_fs_wide_drive_relative(native, native_len)) return native;
   if (!ku_fs_base_ready && !ku_fs_init_base()) {
-    free(native); ku_fs_set_error(error, code, message); return NULL;
+    ku_fs_release(allocator,native); ku_fs_set_error(error, code, message); return NULL;
   }
   if (ku_fs_wide_root_relative(native, native_len)) {
     size_t prefix_len = ku_fs_wide_base_prefix_len(ku_fs_base_path, ku_fs_base_len);
     if (prefix_len == 0 || native_len > KU_FS_MAX_PATH_BYTES - prefix_len) {
-      free(native); ku_fs_set_error(error, code, message); return NULL;
+      ku_fs_release(allocator,native); ku_fs_set_error(error, code, message); return NULL;
     }
     size_t joined_len = prefix_len + native_len;
-    wchar_t* joined = (wchar_t*)malloc((joined_len + 1) * sizeof(wchar_t));
-    if (!joined) { free(native); ku_fs_set_error(error, code, message); return NULL; }
+    wchar_t* joined = (wchar_t*)ku_fs_allocate(allocator,(joined_len + 1) * sizeof(wchar_t));
+    if (!joined) { ku_fs_release(allocator,native); ku_fs_set_error(error, code, message); return NULL; }
     memcpy(joined, ku_fs_base_path, prefix_len * sizeof(wchar_t));
     memcpy(joined + prefix_len, native, native_len * sizeof(wchar_t));
     joined[joined_len] = L'\0';
-    free(native);
+    ku_fs_release(allocator,native);
     return joined;
   }
   bool needs_separator = ku_fs_base_len != 0 && ku_fs_base_path[ku_fs_base_len - 1] != L'\\' && ku_fs_base_path[ku_fs_base_len - 1] != L'/';
   size_t separator_len = needs_separator ? 1 : 0;
   if (native_len > KU_FS_MAX_PATH_BYTES - ku_fs_base_len || separator_len > KU_FS_MAX_PATH_BYTES - ku_fs_base_len - native_len) {
-    free(native); ku_fs_set_error(error, code, message); return NULL;
+    ku_fs_release(allocator,native); ku_fs_set_error(error, code, message); return NULL;
   }
   size_t joined_len = ku_fs_base_len + separator_len + native_len;
-  wchar_t* joined = (wchar_t*)malloc((joined_len + 1) * sizeof(wchar_t));
-  if (!joined) { free(native); ku_fs_set_error(error, code, message); return NULL; }
+  wchar_t* joined = (wchar_t*)ku_fs_allocate(allocator,(joined_len + 1) * sizeof(wchar_t));
+  if (!joined) { ku_fs_release(allocator,native); ku_fs_set_error(error, code, message); return NULL; }
   memcpy(joined, ku_fs_base_path, ku_fs_base_len * sizeof(wchar_t));
   if (needs_separator) joined[ku_fs_base_len] = L'\\';
   if (native_len) memcpy(joined + ku_fs_base_len + separator_len, native, native_len * sizeof(wchar_t));
   joined[joined_len] = L'\0';
-  free(native);
+  ku_fs_release(allocator,native);
   return joined;
 }
 #else
@@ -6809,10 +6839,10 @@ static bool ku_fs_init_base(void) {
   return true;
 }
 
-static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const char* code, const char* message) {
+static KuFsNativeChar* ku_fs_native_path_with_allocator(KuString path, KuError* error, const char* code, const char* message, KuFsAllocatorV1* allocator) {
   if (!ku_fs_path_valid(path)) { ku_fs_set_error(error, code, message); return NULL; }
   if (path.len != 0 && path.ptr[0] == '/') {
-    char* absolute = (char*)malloc(path.len + 1);
+    char* absolute = (char*)ku_fs_allocate(allocator,path.len + 1);
     if (!absolute) { ku_fs_set_error(error, code, message); return NULL; }
     memcpy(absolute, path.ptr, path.len);
     absolute[path.len] = '\0';
@@ -6827,7 +6857,7 @@ static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const ch
     ku_fs_set_error(error, code, message); return NULL;
   }
   size_t joined_len = ku_fs_base_len + separator_len + path.len;
-  char* joined = (char*)malloc(joined_len + 1);
+  char* joined = (char*)ku_fs_allocate(allocator,joined_len + 1);
   if (!joined) { ku_fs_set_error(error, code, message); return NULL; }
   memcpy(joined, ku_fs_base_path, ku_fs_base_len);
   if (needs_separator) joined[ku_fs_base_len] = '/';
@@ -6842,6 +6872,12 @@ static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const ch
         }
         NativeFsBase::Unavailable(_) => unreachable!("fs usage was validated before emission"),
     }
+
+    out.push_str(r#"static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const char* code, const char* message) {
+  return ku_fs_native_path_with_allocator(path,error,code,message,NULL);
+}
+
+"#);
 
     if usage.read || usage.try_read {
         out.push_str(
@@ -6954,7 +6990,7 @@ static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const ch
 
     if usage.write || usage.try_write {
         out.push_str(
-            r#"static bool ku_fs_write_impl(KuString path, KuString content, KuError* error) {
+            r#"static bool ku_fs_write_validate(KuString content, KuError* error) {
   if (error) *error = (KuError){0};
   if (content.len > KU_FS_MAX_IO_BYTES) {
     ku_fs_set_error(error, "content_too_large", "failed to write: content is too large");
@@ -6964,14 +7000,15 @@ static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const ch
     ku_fs_set_error(error, "write_failed", "failed to write: content is not valid UTF-8");
     return false;
   }
-  KuFsNativeChar* native = ku_fs_native_path(path, error, "write_failed", "failed to write: invalid path");
-  if (!native) return false;
+  return true;
+}
+
+static bool ku_fs_write_native_impl(const KuFsNativeChar* native, KuString content, KuError* error) {
 #if defined(_WIN32)
   FILE* file = _wfopen(native, L"wb");
 #else
   FILE* file = fopen(native, "wb");
 #endif
-  free(native);
   if (!file) { ku_fs_set_error(error, "write_failed", "failed to open file for writing"); return false; }
 
   bool failed = false;
@@ -6990,6 +7027,15 @@ static KuFsNativeChar* ku_fs_native_path(KuString path, KuError* error, const ch
     failed = true;
   }
   return !failed;
+}
+
+static bool ku_fs_write_impl(KuString path, KuString content, KuError* error) {
+  if (!ku_fs_write_validate(content,error)) return false;
+  KuFsNativeChar* native=ku_fs_native_path(path,error,"write_failed","failed to write: invalid path");
+  if (!native) return false;
+  bool result=ku_fs_write_native_impl(native,content,error);
+  free(native);
+  return result;
 }
 
 "#,

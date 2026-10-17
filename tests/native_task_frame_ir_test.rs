@@ -1581,3 +1581,76 @@ fn native_task_finally_ir_checks_dispatch_live_values_markers_and_unwind_pairs()
         (1u64 << 1) | (1u64 << 3)
     );
 }
+
+#[test]
+fn blocking_write_preserves_both_view_sources_and_full_function_slot_limits() {
+    let mut types = vec![IrType::Int; 64];
+    types[61] = IrType::Str;
+    types[62] = result(IrType::Null);
+    types[63] = IrType::Str;
+    let fixture = program(
+        types,
+        &[63, 61],
+        vec![
+            state(
+                vec![],
+                TaskTerminator::BlockingWrite {
+                    path: SlotId(63),
+                    content: SlotId(61),
+                    dst: SlotId(62),
+                    ready: StateId(1),
+                    cleanup: StateId(2),
+                },
+            ),
+            state(
+                vec![read(63), read(61), drop_slot(63), drop_slot(61)],
+                complete(62),
+            ),
+            state(
+                vec![drop_if(63), drop_if(61), drop_if(62)],
+                TaskTerminator::Terminate,
+            ),
+        ],
+    );
+    let plan = verify_and_plan(&fixture, TaskLimits::default()).unwrap();
+    assert!(plan.functions[0].hosted);
+    assert!(plan.functions[0].slots.contains(&SlotId(63)));
+    assert!(plan.functions[0].slots.contains(&SlotId(61)));
+    let mut full = fixture.clone();
+    for index in 1..64 {
+        let mut function = fixture.functions[0].clone();
+        function.id = TaskFunctionId(index);
+        function.name = format!("Write{index}");
+        full.functions.push(function);
+    }
+    assert_eq!(
+        verify_and_plan(&full, TaskLimits::default())
+            .unwrap()
+            .functions
+            .len(),
+        64
+    );
+    for mode in 0..4 {
+        let mut invalid = fixture.clone();
+        match mode {
+            0 => {
+                invalid.functions[0].slots[63].ty = TaskSlotType::Value {
+                    ty: IrType::Int,
+                    borrowed: false,
+                }
+            }
+            1 => {
+                invalid.functions[0].slots[61].ty = TaskSlotType::Value {
+                    ty: IrType::Str,
+                    borrowed: true,
+                }
+            }
+            2 => invalid.functions[0].parameters.pop().map(|_| ()).unwrap(),
+            _ => invalid.functions[0].parameters.push(SlotId(62)),
+        }
+        assert!(
+            verify_and_plan(&invalid, TaskLimits::default()).is_err(),
+            "invalid blocking source {mode}"
+        );
+    }
+}

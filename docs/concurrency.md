@@ -161,7 +161,7 @@ try/catch；其中创建 Task、Await、sleep、循环及再次嵌入 finally �
 按 FIFO 取任务，空闲 worker 从其它本地队列尾部窃取；外部恢复/取消优先进入全局，
 连续最多8个全局选择后给一个本地机会，防止持续外部流量饿死本地任务。全部队列仍
 共用原 mutex 和同一 capacity/字节接纳，没有每 worker 扩一份容量或新增 Task owner。
-内部 Driver ABI9，旧生成 C 须重编译；这不代表完整 M:N 或已测得吞吐提升。源码 root 在执行目标上按
+内部 Driver ABI10，旧生成 C 须重编译；这不代表完整 M:N 或已测得吞吐提升。源码 root 在执行目标上按
 `min(32, max(4, OS 报告的逻辑处理器数))` 选择 worker 数，不读取编译宿主的 CPU 配置。
 这不是对进程 affinity/cgroup 配额的完整识别，也不是最优性能配置承诺。
 工作条件与状态观察条件分离，停车/退出状态通知不再唤醒其他空闲 worker。
@@ -178,7 +178,7 @@ lower 对已构造 AST 的 If 另限32层，表达式仍受 `depth > 64` 拒绝�
 记录与原条件等待，同一 worker 可以继续执行其它就绪 Task，不创建新的线程。
 每个实例同时最多一项 timer 登记，计入固定存储和 instance 大小；取消、退出及槽复用
 都会撤销登记，旧 token 不能影响后来的等待。清理体仍不能提交新的 sleep。
-这不包含 duration 对象、异步网络 I/O 或 native blocking pool。
+这不包含 duration 对象、异步网络 I/O 或其他尚未接通的阻塞操作。文件写入的固定池见下文。
 
 ```ku
 import time from "std.time"
@@ -193,9 +193,41 @@ async fn main(): null! {
 }
 ```
 
+### Native 文件写入的固定后台池
+
+`import fs from "std.fs"` 后，async 函数可直接使用 `fs.write(path, content)?` 或
+`fs.try_write(path, content)?`，返回类型仍为 `null!`。View 输入不被消耗，参数按顺序
+求值一次，等待期间只持有原值和独立的后台副本。固定 worker 数沿用目标系统的
+`min(32, max(4, CPU 核心数))` 策略，job 表与队列上限1024，不新增公开配置。
+没有文件写入的程序不建立该池。read/read_dir、网络和其他阻塞操作不属于这一入口。
+
+原生路径转换（包括 Windows 临时 UTF-16 缓冲）与内容复制在每次实际分配前计费；
+pool 固定存储按真实 sizeof 纳入 driver fixed_bytes。副本尚未退休时，finally 中的
+投影、原值释放或父 Task 终态都不能提前退回其额度；实际 job 完成并被消费后才退回。
+这些计数不覆盖 libc FILE 内部缓冲、OS 线程栈或整个进程 RSS。
+
+worker 开始前观察取消/关闭，已取消的排队工作跳过文件操作。已经开始的 OS 写入
+不能强行中断，取消也不能撤回已写数据。用户 finally 与原值释放可以先运行，但
+后台 job 真正退出前不会给外层清理 ACK，也不释放实例或它仍依赖的驱动存储。
+超出原绝对 D 时报告尚未完成的清理并保留存储，晚完成与重试不续期。
+POSIX 在线程最后一次存储访问之后才 pthread_join；OS 返回尾部没有硬时长保证，
+沿用原 driver 的边界。finally 内提交新写入仍明确拒绝。
+
+```ku
+import fs from "std.fs"
+
+async fn main(): null! {
+    content = "中文🙂"
+    fs.write("result.txt", content)?
+    println(content)
+    return ok(null)
+}
+```
+
+
 
 print/println 目前仍调用同步 stdio；阻塞输出不是已接入 netpoll 或 blocking pool 的 I/O。
-M:N、netpoll、事件驱动 HTTP、native blocking pool、完整 RSS 预算及性能/soak 尚未完成；
+M:N、netpoll、事件驱动 HTTP、完整阻塞 I/O 覆盖、完整 RSS 预算及性能/soak 尚未完成；
 真实双 worker 重叠执行的定向测试不等于吞吐、扩展性或长期低 CPU 占用验收。
 
 ## 同步只读借用与 async

@@ -121,6 +121,13 @@ fn move_to_slot_63(function: &mut TaskFunction, from: SlotId) {
                 map(millis);
                 map(dst);
             }
+            TaskTerminator::BlockingWrite {
+                path, content, dst, ..
+            } => {
+                map(path);
+                map(content);
+                map(dst);
+            }
             TaskTerminator::TryResult {
                 src,
                 ok_value,

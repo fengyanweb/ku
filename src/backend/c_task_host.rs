@@ -29,6 +29,9 @@ pub(super) fn kind(ty: &IrType) -> KuResult<u32> {
 pub(super) fn emit(out: &mut COutput, tasks: &TaskProgram) -> KuResult<()> {
     out.check()?;
     out.push_str(HOST_ABI);
+    if super::super::task::uses_blocking_write(tasks) {
+        out.push_str(BLOCKING_HOST);
+    }
     for function in &tasks.functions {
         out.check()?;
         for (entry, context) in [
@@ -86,6 +89,7 @@ typedef struct KuTaskAdapterHostV1 {
   uint32_t allocation_host_abi;
   void* allocation_context;
   uint32_t (*reconcile_charge)(void*);
+  KuTaskBlockingTokenV1* blocking;
 } KuTaskAdapterHostV1;
 #define KU_TASK_ALLOCATION_HOST_ABI_VERSION 1u
 enum { KU_TASK_HOST_ALLOCATION_FAILED = 98u };
@@ -284,5 +288,27 @@ static uint32_t ku_task_host_await(KuTaskAdapterHostV1* host, KuTaskValueV1* val
     if (dropped!=KU_TASK_DRIVER_OK) { ku_task_outcome_drop(output); return dropped; }
   }
   return result;
+}
+"#;
+
+const BLOCKING_HOST: &str = r#"
+static uint32_t ku_task_host_blocking_write(KuTaskAdapterHostV1* host,
+    KuString path, KuString content, KuResult_null* output) {
+  if (!host || !host->ticket || !host->control || !host->blocking || !output
+      || host->allocation_host_bytes!=sizeof(*host)
+      || host->allocation_host_abi!=KU_TASK_ALLOCATION_HOST_ABI_VERSION
+      || !host->allocation_context || !host->reconcile_charge)
+    return KU_TASK_CONTROL_INVALID_ARGUMENT;
+  if (ku_task_control_atomic_load(&host->control->phase)!=KU_TASK_CONTROL_LIVE)
+    return KU_TASK_CONTROL_PENDING;
+  uint32_t status=host->blocking->pool
+      ? ku_task_blocking_read(host->ticket,host->blocking,0,output)
+      : ku_task_blocking_submit(host->ticket,host->control,host->blocking,
+          path,content,host->allocation_context,host->reconcile_charge,output);
+  if (status==KU_TASK_DRIVER_OK
+      && host->reconcile_charge(host->allocation_context)!=KU_TASK_DRIVER_OK)
+    return KU_TASK_CONTROL_INVALID_STATE;
+  return status==KU_TASK_DRIVER_PENDING ? KU_TASK_CONTROL_PENDING
+      : status==KU_TASK_DRIVER_OK ? KU_TASK_CONTROL_OK : KU_TASK_CONTROL_INVALID_STATE;
 }
 "#;

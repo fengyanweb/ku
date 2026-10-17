@@ -173,13 +173,12 @@ impl Budget {
 /// this internal API. No source runtime/runner is included in the result.
 pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
     let limits = TaskLimits::default();
-    if program.items.len() > limits.max_functions + 1
-        || program
-            .items
-            .iter()
-            .filter(|item| matches!(item, Item::Function(_)))
-            .count()
-            > limits.max_functions
+    if program
+        .items
+        .iter()
+        .filter(|item| matches!(item, Item::Function(_)))
+        .count()
+        > limits.max_functions
     {
         return Err(unsupported(
             "more than 64 expanded top-level functions",
@@ -195,8 +194,24 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
     let mut declarations = Vec::new();
     let mut entry = None;
     let mut std_time = false;
+    let mut std_fs = false;
     for item in &program.items {
+        budget.analysis(1, Span::default())?;
         match item {
+            Item::Module(module) if module.name == "std:fs" => {
+                std_fs = true;
+                continue;
+            }
+            Item::Import(import)
+                if (import.path == "std.fs"
+                    && (matches!(&import.kind, ImportKind::Glob)
+                        || matches!(&import.kind, ImportKind::Namespace(name) if name == "fs")))
+                    || (import.path == "std"
+                        && matches!(&import.kind, ImportKind::Named(names) if names.len() == 1 && names[0].source == "fs" && names[0].alias.is_none())) =>
+            {
+                std_fs = true;
+                continue;
+            }
             Item::Module(module) if module.name == "std:time" => {
                 std_time = true;
                 continue;
@@ -295,7 +310,7 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
     let mut functions = Vec::new();
     for declaration in declarations {
         functions.push(
-            FunctionLowerer::new(declaration, &signatures, &mut budget, std_time)?
+            FunctionLowerer::new(declaration, &signatures, &mut budget, std_time, std_fs)?
                 .lower(declaration)?,
         );
     }
@@ -307,6 +322,7 @@ pub fn lower_program(program: &Program) -> KuResult<NativeTaskProgram> {
 struct FunctionLowerer<'a> {
     signatures: &'a HashMap<String, Signature>,
     std_time: bool,
+    std_fs: bool,
     budget: &'a mut Budget,
     function: TaskFunction,
     locals: Vec<HashMap<String, SlotId>>,
@@ -373,11 +389,13 @@ impl<'a> FunctionLowerer<'a> {
         signatures: &'a HashMap<String, Signature>,
         budget: &'a mut Budget,
         std_time: bool,
+        std_fs: bool,
     ) -> KuResult<Self> {
         let signature = &signatures[&declaration.name];
         let mut lowerer = Self {
             signatures,
             std_time,
+            std_fs,
             budget,
             function: TaskFunction {
                 id: signature.id,
@@ -860,6 +878,14 @@ impl<'a> FunctionLowerer<'a> {
             name,
         } = &callee.kind
         {
+            if matches!(&object.kind, ExprKind::Variable(module) if module == "fs")
+                && matches!(name.as_str(), "write" | "try_write")
+                && self.std_fs
+                && self.local("fs").is_none()
+                && !self.signatures.contains_key("fs")
+            {
+                return self.blocking_write(args, span, depth);
+            }
             if matches!(&object.kind, ExprKind::Variable(module) if module == "time")
                 && name == "sleep"
                 && self.std_time
@@ -997,6 +1023,47 @@ impl<'a> FunctionLowerer<'a> {
             arguments,
         })?;
         Ok(destination)
+    }
+
+    #[inline(never)]
+    fn blocking_write(&mut self, args: &[Expr], span: Span, depth: usize) -> KuResult<SlotId> {
+        if self.in_finally_body {
+            return Err(unsupported(
+                "fs.write inside a native Task finally body",
+                span,
+            ));
+        }
+        if args.len() != 2 {
+            return Err(unsupported("fs.write with other than two arguments", span));
+        }
+        // The ordinary checker rejects conflicting mutation/moves across View
+        // arguments. Neither source is consumed; the pool owns independent data.
+        let path = self.expression(&args[0], depth + 1)?;
+        let content = self.expression(&args[1], depth + 1)?;
+        if self.function.slots[path.0].ty != value_slot(IrType::Str)
+            || self.function.slots[content.0].ty != value_slot(IrType::Str)
+        {
+            return Err(unsupported("fs.write arguments other than strings", span));
+        }
+        let dst = self.slot(value_slot(IrType::Result(Box::new(IrType::Null))))?;
+        let poll = self.state(TaskTerminator::Terminate)?;
+        let ready = self.state(TaskTerminator::Terminate)?;
+        let cleanup = self.cleanup_state()?;
+        self.terminate(TaskTerminator::Jump { target: poll })?;
+        self.function.states[poll.0].terminator = TaskTerminator::BlockingWrite {
+            path,
+            content,
+            dst,
+            ready,
+            cleanup,
+        };
+        self.current = Some(ready);
+        for (argument, source) in args.iter().zip([path, content]) {
+            if !matches!(argument.kind, ExprKind::Variable(_)) {
+                self.emit(TaskOp::Drop { slot: source })?;
+            }
+        }
+        Ok(dst)
     }
 
     fn indirect_call(
